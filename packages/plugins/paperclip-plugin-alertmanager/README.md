@@ -253,7 +253,7 @@ Configured per-instance via the host's plugin settings UI. Schema lives in
 | `ownerMap`           | object  | no       | `{ <labelKey>: { <labelValue>: <email> } }`. |
 | `fallbackAgentName`  | string  | conditionally | Exact agent name used when no mapped owner or issue route resolves. Ownerless creation is refused if this is missing or ambiguous. |
 | `issueRouteMap`      | object  | no       | `{ <labelKey>: { <labelValue>: { projectId, goalId, assigneeAgentId, status } } }`. |
-| `alertmanagerApiUrl` | string  | no       | Base URL of the Alertmanager these webhooks come from, e.g. `http://alertmanager.monitoring.svc.cluster.local:9093`. Enables the escalation liveness read above. Unset = the ladder still runs but never claims liveness. |
+| `alertmanagerApiUrl` | string  | no       | Base URL of the Alertmanager these webhooks come from, e.g. `http://alertmanager.monitoring.svc.cluster.local:9093`. Enables the escalation liveness read above. If unset here, falls back to the host env var `PAPERCLIP_ALERTMANAGER_API_URL` (forwarded to plugin workers); a value set here always wins. Neither set = the ladder still runs but never claims liveness. |
 
 ### Example `AlertmanagerConfig` YAML
 
