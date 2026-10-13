@@ -790,6 +790,11 @@ export function createPluginWorkerHandle(
     return {};
   }
 
+  // `call()` scopes carry no TTL and are cleared when the RPC settles;
+  // `notify()` scopes have no settle signal, so they expire after a bounded
+  // TTL instead. Either way, a worker host call made after its originating RPC
+  // settles finds no scope and is denied — that is the documented contract
+  // (see `InvocationScopeDeniedError`), not a capability failure (BLO-31190).
   function registerInvocation(scope: PluginInvocationScope, ttlMs?: number): PluginInvocationContext {
     const invocation: PluginInvocationContext = {
       id: randomUUID(),
