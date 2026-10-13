@@ -338,6 +338,44 @@ describe("PEN-4023: a fired timeout names the bound that fired", () => {
     expect(timeoutCases).toBeGreaterThan(0);
   });
 
+  it("clears a stale millisecond bound instead of leaving it beside a null one", () => {
+    // `http` with `timeoutMs: 0` and a fired timeout: the bound cannot be
+    // named, so both halves must go to null together. Leaving the 30000 from
+    // an earlier merge would reproduce the defect one field over.
+    const stored = mergeHeartbeatRunStopMetadata(
+      { effectiveTimeoutSec: 30, effectiveTimeoutMs: 30_000 },
+      buildHeartbeatRunStopMetadata({
+        adapterType: "http",
+        adapterConfig: { timeoutMs: 0 },
+        outcome: "timed_out",
+        errorCode: "timeout",
+      }),
+    );
+
+    expect(stored).toMatchObject({
+      effectiveTimeoutSec: null,
+      effectiveTimeoutMs: null,
+      timeoutConfigured: true,
+      timeoutSource: "unknown",
+      timeoutFired: true,
+    });
+  });
+
+  it("still leaves the millisecond key absent for adapters that have none", () => {
+    // The non-http path carries no such key, and must keep not writing one.
+    expect(
+      mergeHeartbeatRunStopMetadata(
+        { summary: "x" },
+        buildHeartbeatRunStopMetadata({
+          adapterType: "claude_k8s",
+          adapterConfig: PEN_4016_CONFIG,
+          outcome: "timed_out",
+          errorCode: "timeout",
+        }),
+      ),
+    ).not.toHaveProperty("effectiveTimeoutMs");
+  });
+
   it("persists the reconciled pair through the resultJson merge", () => {
     // The pin above covers the builder. This one covers what is actually
     // stored: `mergeHeartbeatRunStopMetadata` is the writer, and it is the
