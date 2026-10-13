@@ -33,7 +33,11 @@ import type {
   PluginExecutionWorkspaceMetadata,
 } from "@paperclipai/plugin-sdk";
 import type { CreateIssueThreadInteraction, InviteJoinType, IssueDocumentSummary, PermissionKey, PrincipalType } from "@paperclipai/shared";
-import { isClosedExecutionWorkspace, pluginOperationIssueOriginKind } from "@paperclipai/shared";
+import {
+  isClosedExecutionWorkspace,
+  pluginOperationIssueOriginKind,
+  resolveCreateIssueStatusDefault,
+} from "@paperclipai/shared";
 import { companyService } from "./companies.js";
 import { recordPluginMetric } from "./metrics.js";
 import { agentService } from "./agents.js";
@@ -2088,6 +2092,11 @@ export function buildHostServices(
         );
         const issue = (await issues.create(companyId, {
           ...(issueInput as any),
+          // BLO-40673: apply the same omitted-status default as POST /api/issues
+          // (assigned => todo). Without it the insert falls to the column default
+          // `backlog`, which no inbox dispatches, so an assigned plugin row is
+          // tracked on every surface and woken by nothing.
+          status: resolveCreateIssueStatusDefault(issueInput as Record<string, unknown>).status,
           fencingPrecondition,
           originKind: normalizedOriginKind,
           originId: params.originId ?? null,
