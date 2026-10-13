@@ -11092,13 +11092,13 @@ describeEmbeddedPostgres("github-webhook route", () => {
   // that the ISSUE doesn't silently inherit the paused assignee merely
   // because the wake attempt happened to fail too.
   //
-  // BLO-43103 corrected where it lands instead. This filed *unassigned* on
-  // the premise that `allow_company_agent` would let any agent pick it up --
-  // but every inbox selects by assignee and ignores status, so an unassigned
-  // row is mutable by anyone and discoverable by nobody. The webhook has no
-  // creating agent, so the create now falls back to the company's default
-  // responsible user: still not the paused agent, and now reachable.
-  it("files a new dependabot alert issue to the company default when the configured agent is paused", async () => {
+  // BLO-43103: dependabot alerts are retrofit-owned. `resolveCreateIssueAssignee`
+  // (server/src/services/issues.ts) carves `github_dependabot_alert` out of the
+  // create-time company-default fallback along with `plugin:*` origins, so this
+  // row is deliberately left unassigned at create rather than pre-filled with
+  // the company default user. `issue-create-assignee-default.test.ts` pins the
+  // same outcome at the service layer.
+  it("files a new dependabot alert issue unassigned when the configured agent is paused", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
     await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agentId));
     const app = buildApp({ dependabotAgentId: agentId });
@@ -11114,7 +11114,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
       .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "github_dependabot_alert")));
     expect(issue).toBeTruthy();
     expect(issue!.assigneeAgentId).toBeNull();
-    expect(issue!.assigneeUserId).toBe("test-board-user");
+    expect(issue!.assigneeUserId).toBeNull();
     expect(issue!.status).toBe("todo");
   });
 
