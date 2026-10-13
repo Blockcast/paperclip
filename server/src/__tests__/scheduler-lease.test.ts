@@ -303,6 +303,25 @@ describeEmbeddedPostgres("scheduler lease (BLO-43292)", () => {
     expect(recoveredBy).toEqual([leader.identity.pod, survivor.identity.pod]);
   });
 
+  it("fires onAcquire again when the same holder re-wins after its own renewals lapsed", async () => {
+    let t = Date.now();
+    let fired = 0;
+    const holder = schedulerLeaseHolder(db, {
+      name: LEASE,
+      ttlMs: 45_000,
+      renewIntervalMs: 60_000,
+      identity: { pod: "pod-1", holderId: "pod-1#fixed" },
+      now: () => t,
+      onAcquire: () => { fired += 1; },
+    });
+    expect(await holder.tick()).toBe(true);
+    expect(await holder.tick()).toBe(true);
+    expect(fired).toBe(1);
+    t += 46_000; // a DB stall longer than the TTL
+    expect(await holder.tick()).toBe(true);
+    expect(fired).toBe(2);
+  });
+
   it("keeps the lease when onAcquire throws", async () => {
     const holder = schedulerLeaseHolder(db, {
       name: LEASE,
