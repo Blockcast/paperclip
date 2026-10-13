@@ -1184,7 +1184,33 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
       .set({
         status: input.status,
         outcome: input.outcome,
-        retiringBound: input.status === "cancelled" ? "cancelled" : "discharged",
+        // PEN-4013: `coalesce`, not a plain set, because this predicate matches
+        // `escalated` as well as `active` (`ACTIVE_RECOVERY_ACTION_STATUSES`). A manual
+        // discharge therefore lands on rows that have ALREADY been retired, and an
+        // unconditional write erased the bound that recorded the retirement —
+        // `timeout_horizon` and `attempt_budget` both became `discharged`.
+        //
+        // That erasure is unrecoverable and silent. `retiringBound` is the only field
+        // distinguishing HOW an action ended that the company-scoped recovery-actions
+        // route projects at all: `resolvedAt` and `resolutionNote` are not in that
+        // projection, and the discharge overwrites `updatedAt` on its way past. So every
+        // retrospective census of horizon expiries — the query PEN-3000 and PEN-3322 rest
+        // on — under-counted by exactly the rows someone had since discharged, with no
+        // indication that it had.
+        //
+        // The decision this encodes (PEN-4013): `retiringBound` means "how the action was
+        // RETIRED", not "how it ended". Preserving the prior bound costs the disposal
+        // record nothing, because the value this writes carries no information `status`
+        // does not already carry — `input.status` is `Extract<…, "resolved" | "cancelled">`
+        // and the mapping to `discharged`/`cancelled` is total and 1:1. Nothing routes on
+        // the field here either: every reader that routes on it is gated on
+        // `status IN ('active','escalated')`, and this statement moves the row to
+        // `resolved`/`cancelled` in the same write. On a terminal row the field is
+        // forensic only, which is what makes preserving it free of live consequence.
+        //
+        // This also makes the first-writer-wins invariant asserted in
+        // `recovery/service.ts` true of all FOUR writers rather than three.
+        retiringBound: sql`coalesce(${issueRecoveryActions.retiringBound}, ${input.status === "cancelled" ? "cancelled" : "discharged"})`,
         resolutionNote: input.resolutionNote ?? null,
         resolvedAt: now,
         updatedAt: now,

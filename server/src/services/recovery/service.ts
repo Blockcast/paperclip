@@ -6602,6 +6602,11 @@ export function recoveryService(
       // already `escalated`. The mislabel is unrecoverable, which is why it is discriminated
       // at the call site instead of being repaired downstream.
       //
+      // PEN-4013: that invariant holds across all four writers, but only since PEN-4013 —
+      // it was previously true of three. `resolveActiveForIssue` matches `escalated` as
+      // well as `active`, so a manual discharge used to overwrite an already-written bound
+      // with `discharged`. It now coalesces like the rest.
+      //
       // The comparison is `>`, not the backstop's `>=`, because this call site reads a row
       // whose attempt is ALREADY RESERVED (`attemptAlreadyReserved` defaults to true).
       // Using `>=` here would attribute the last legitimate wake to the budget.
