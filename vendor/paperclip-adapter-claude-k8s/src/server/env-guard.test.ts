@@ -1,4 +1,6 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -737,5 +739,122 @@ describe("block message resolves to the installed helper (BLO-29526)", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+/**
+ * BLO-29965. Two runs of one agent each opened a PR for the same issue. The
+ * guard must refuse a push / PR open when the server names a DIFFERENT run as
+ * the issue's lock holder, and stay out of the way in every other case.
+ * Async spawn, not spawnSync: the fake API lives in this process, and a
+ * synchronous child would block the event loop that has to answer it.
+ */
+describe("embedded guard: lock re-assertion before outward side effects (BLO-29965)", () => {
+  const ME = "run-mine";
+  const LOCK_VARS = ["PAPERCLIP_TASK_ID", "PAPERCLIP_RUN_ID", "PAPERCLIP_API_URL", "PAPERCLIP_API_KEY"];
+
+  async function withApi(
+    reply: { status: number; body?: unknown },
+    fn: (vars: Record<string, string>, hits: () => number) => Promise<void>,
+  ) {
+    let count = 0;
+    const server = createServer((req, res) => {
+      count += 1;
+      expect(req.url).toBe("/api/issues/task-1");
+      expect(req.headers.authorization).toBe("Bearer k");
+      res.writeHead(reply.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(reply.body ?? {}));
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const { port } = server.address() as AddressInfo;
+    try {
+      await fn(
+        {
+          PAPERCLIP_TASK_ID: "task-1",
+          PAPERCLIP_RUN_ID: ME,
+          PAPERCLIP_API_URL: `http://127.0.0.1:${port}/`,
+          PAPERCLIP_API_KEY: "k",
+        },
+        () => count,
+      );
+    } finally {
+      server.close();
+    }
+  }
+
+  async function run(command: string, vars: Record<string, string>) {
+    const dir = mkdtempSync(path.join(tmpdir(), "pc-guard-"));
+    const file = path.join(dir, "guard.mjs");
+    writeFileSync(file, ENV_GUARD_SCRIPT);
+    // Hermetic: never inherit a real run's lock vars (this suite may itself run in an agent pod).
+    const base = Object.fromEntries(
+      Object.entries(process.env).filter(([k]) => !LOCK_VARS.includes(k)),
+    );
+    try {
+      return await new Promise<{ status: number | null; stderr: string }>((resolve) => {
+        const child = spawn(process.execPath, [file], { env: { ...base, ...vars } });
+        let stderr = "";
+        child.stderr.on("data", (d) => (stderr += d));
+        child.on("close", (status) => resolve({ status, stderr }));
+        child.stdin.end(JSON.stringify({ tool_name: "Bash", tool_input: { command } }));
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  const foreign = { status: 200, body: { id: "task-1", identifier: "BLO-1", executionRunId: "run-other" } };
+
+  for (const cmd of [
+    "git push origin fix/x",
+    "cd /w && git -C /w push -u origin HEAD",
+    "git --no-pager push",
+    "gh pr create --title t --body b",
+  ]) {
+    it(`blocks ${JSON.stringify(cmd)} when another run holds the lock`, async () => {
+      await withApi(foreign, async (vars) => {
+        const { status, stderr } = await run(cmd, vars);
+        expect(status).toBe(2);
+        expect(stderr).toContain("BLO-29965");
+        expect(stderr).toContain("run-other");
+        expect(stderr).toContain("/api/issues/task-1/checkout");
+      });
+    });
+  }
+
+  it("allows the push when THIS run holds the lock", async () => {
+    await withApi({ status: 200, body: { executionRunId: ME } }, async (vars, hits) => {
+      expect((await run("git push", vars)).status).toBe(0);
+      expect(hits()).toBe(1);
+    });
+  });
+
+  it("allows the push when nobody holds the lock", async () => {
+    await withApi({ status: 200, body: { executionRunId: null } }, async (vars) => {
+      expect((await run("git push", vars)).status).toBe(0);
+    });
+  });
+
+  it("fails open when the API errors", async () => {
+    await withApi({ status: 500 }, async (vars) => {
+      expect((await run("git push", vars)).status).toBe(0);
+    });
+  });
+
+  it("never calls the API for commands that are not outward side effects", async () => {
+    await withApi(foreign, async (vars, hits) => {
+      for (const cmd of ["git status", "git commit -m push", "gh pr view 1", "echo pushing"]) {
+        expect((await run(cmd, vars)).status).toBe(0);
+      }
+      expect(hits()).toBe(0);
+    });
+  });
+
+  it("is out of scope (allows, no API call) when the run has no task id", async () => {
+    await withApi(foreign, async (vars, hits) => {
+      const { PAPERCLIP_TASK_ID: _omit, ...rest } = vars;
+      expect((await run("git push", rest)).status).toBe(0);
+      expect(hits()).toBe(0);
+    });
   });
 });
