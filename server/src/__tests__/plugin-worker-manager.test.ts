@@ -602,6 +602,68 @@ describe("plugin-worker-manager stderr failure context", () => {
     }
   });
 
+  it("denies a host call issued after its originating RPC settled, without capability wording (BLO-31190)", async () => {
+    const companiesGet = vi.fn(async (params: { companyId: string }) => ({ id: params.companyId }));
+    const handlers = createHostClientHandlers({
+      pluginId: "test.plugin",
+      capabilities: ["companies.read"],
+      services: {
+        companies: {
+          get: companiesGet,
+        },
+      } as unknown as HostServices,
+    });
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: INVOCATION_SCOPE_WORKER_ENTRYPOINT,
+      manifest: TEST_MANIFEST,
+      config: {},
+      instanceInfo: {
+        instanceId: "instance-1",
+        hostVersion: "1.0.0",
+      },
+      apiVersion: 1,
+      hostHandlers: handlers,
+    });
+    const actorContext = {
+      type: "agent",
+      userId: null,
+      agentId: "agent-1",
+      runId: "run-1",
+      companyId: "company-a",
+    };
+
+    try {
+      await handle.start();
+
+      // First RPC returns immediately; the worker keeps its invocation id.
+      await expect(handle.call("performAction", {
+        key: "probe",
+        params: { mode: "settle" },
+        actorContext,
+        renderEnvironment: null,
+      })).resolves.toEqual({ settled: true });
+
+      // The late continuation replays that settled id while another
+      // invocation is active — the production shape.
+      const late = handle.call("performAction", {
+        key: "probe",
+        params: { mode: "afterSettle", requestedCompanyId: "company-a" },
+        actorContext,
+        renderEnvironment: null,
+      });
+      await expect(late).rejects.toMatchObject({
+        code: (PLUGIN_RPC_ERROR_CODES as Record<string, number>).INVOCATION_SCOPE_DENIED,
+        message: expect.stringContaining("after the originating RPC settles"),
+      });
+      await expect(late).rejects.not.toMatchObject({
+        message: expect.stringContaining("not allowed to perform"),
+      });
+      expect(companiesGet).not.toHaveBeenCalled();
+    } finally {
+      await handle.stop().catch(() => undefined);
+    }
+  });
+
   it("rejects missing or unknown invocation ids while a company invocation is active", async () => {
     const companiesGet = vi.fn(async () => ({ id: "company-2" }));
     const hostHandlers = createHostClientHandlers({
