@@ -5190,6 +5190,188 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(settled).toMatchObject({ status: "escalated", retiringBound: "timeout_horizon" });
   });
 
+  // PEN-4013. `resolveActiveForIssue`'s predicate is `ACTIVE_RECOVERY_ACTION_STATUSES`,
+  // which is `["active", "escalated"]` — so a manual discharge matches rows that have
+  // ALREADY been retired, and the unconditional `.set()` it used to carry overwrote the
+  // bound recording that retirement. The `active` case is the one that always worked and
+  // is exactly what hid this, so each arm below is paired with its `active` control.
+  //
+  // The erasure is unrecoverable: `resolvedAt` and `resolutionNote` are not projected by
+  // the company-scoped route at all, and the discharge overwrites `updatedAt`. Measured
+  // company-wide before the fix: 0 surviving `timeout_horizon` / `attempt_budget` bounds
+  // across 1,695 rows, against 184 live-era rows whose horizon had demonstrably expired
+  // before the resolve landed.
+  async function seedRetiredActionForDischarge(bound: "timeout_horizon" | "attempt_budget") {
+    const fixture = await seedCompany();
+    const actionId = randomUUID();
+    await db.insert(issueRecoveryActions).values({
+      id: actionId,
+      companyId: fixture.companyId,
+      sourceIssueId: fixture.sourceIssueId,
+      kind: "stranded_assigned_issue",
+      status: "escalated",
+      ownerType: "agent",
+      ownerAgentId: fixture.managerId,
+      cause: "agent_not_invokable",
+      fingerprint: `retired:${actionId}`,
+      evidence: {},
+      nextAction: "Wake the recovery owner.",
+      attemptCount: 0,
+      maxAttempts: defaultRecoveryActionMaxAttempts,
+      timeoutAt: new Date(Date.now() - 60 * 60 * 1000),
+      retiringBound: bound,
+    });
+    return { ...fixture, actionId };
+  }
+
+  it("preserves a timeout_horizon retirement when an escalated action is discharged", async () => {
+    const { companyId, sourceIssueId, actionId } = await seedRetiredActionForDischarge("timeout_horizon");
+    const svc = issueRecoveryActionService(db);
+
+    const resolved = await svc.resolveActiveForIssue({
+      companyId,
+      sourceIssueId,
+      status: "resolved",
+      outcome: "restored",
+      resolutionNote: "Owner discharged the stale action.",
+    });
+
+    // The discharge must still land — this is not a refusal, the disposal is recorded in
+    // `status`/`outcome`/`resolvedAt` exactly as before. Only the retirement bound is kept.
+    expect(resolved).toMatchObject({ id: actionId, status: "resolved", retiringBound: "timeout_horizon" });
+    const [settled] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, actionId));
+    expect(settled).toMatchObject({ status: "resolved", outcome: "restored", retiringBound: "timeout_horizon" });
+    expect(settled!.resolvedAt).not.toBeNull();
+  });
+
+  it("preserves an attempt_budget retirement when an escalated action is discharged", async () => {
+    const { companyId, sourceIssueId } = await seedRetiredActionForDischarge("attempt_budget");
+    const svc = issueRecoveryActionService(db);
+
+    const resolved = await svc.resolveActiveForIssue({
+      companyId,
+      sourceIssueId,
+      status: "resolved",
+      outcome: "restored",
+    });
+
+    expect(resolved).toMatchObject({ status: "resolved", retiringBound: "attempt_budget" });
+  });
+
+  it("preserves a prior retirement bound when an escalated action is cancelled rather than discharged", async () => {
+    // The cancel arm writes a different literal (`cancelled`), so it needs its own
+    // coverage: a fix applied to only the discharge branch would pass the two above.
+    const { companyId, sourceIssueId, actionId } = await seedRetiredActionForDischarge("timeout_horizon");
+    const svc = issueRecoveryActionService(db);
+
+    const resolved = await svc.resolveActiveForIssue({
+      companyId,
+      sourceIssueId,
+      status: "cancelled",
+      outcome: "cancelled",
+    });
+
+    expect(resolved).toMatchObject({ status: "cancelled", retiringBound: "timeout_horizon" });
+    const [settled] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, actionId));
+    expect(settled).toMatchObject({ status: "cancelled", retiringBound: "timeout_horizon" });
+  });
+
+  it("still stamps discharged when an active action with no prior bound is resolved", async () => {
+    // Negative control. This arm already worked and must keep working: with nothing to
+    // preserve, `coalesce` has to fall through to the literal. A fix that simply stopped
+    // writing the field would pass the three tests above and fail here.
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const svc = issueRecoveryActionService(db);
+    const actionId = randomUUID();
+    await db.insert(issueRecoveryActions).values({
+      id: actionId,
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      status: "active",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "agent_not_invokable",
+      fingerprint: `live:${actionId}`,
+      evidence: {},
+      nextAction: "Wake the recovery owner.",
+      attemptCount: 0,
+      maxAttempts: defaultRecoveryActionMaxAttempts,
+      retiringBound: null,
+    });
+
+    const resolved = await svc.resolveActiveForIssue({
+      companyId,
+      sourceIssueId,
+      status: "resolved",
+      outcome: "restored",
+    });
+
+    expect(resolved).toMatchObject({ status: "resolved", retiringBound: "discharged" });
+  });
+
+  it("still stamps cancelled when an active action with no prior bound is cancelled", async () => {
+    // Second negative control, for the cancel literal rather than the discharge one.
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const svc = issueRecoveryActionService(db);
+    const actionId = randomUUID();
+    await db.insert(issueRecoveryActions).values({
+      id: actionId,
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      status: "active",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "agent_not_invokable",
+      fingerprint: `live:${actionId}`,
+      evidence: {},
+      nextAction: "Wake the recovery owner.",
+      attemptCount: 0,
+      maxAttempts: defaultRecoveryActionMaxAttempts,
+      retiringBound: null,
+    });
+
+    const resolved = await svc.resolveActiveForIssue({
+      companyId,
+      sourceIssueId,
+      status: "cancelled",
+      outcome: "cancelled",
+    });
+
+    expect(resolved).toMatchObject({ status: "cancelled", retiringBound: "cancelled" });
+  });
+
+  it("keeps a horizon-retired action countable through the recovery-actions projection after it is discharged", async () => {
+    // PEN-4013 "Done when", reproduced as a test: a retrospective census of horizon
+    // expiries must survive a discharge. This asserts through
+    // `recoveryObservabilityService.listActions` — the same projection the company-scoped
+    // `/companies/:id/recovery-actions` route serves — rather than against the table, so
+    // dropping `retiringBound` from that projection fails here too. That projection is the
+    // ONLY live-API route to this fact: it carries no `resolvedAt` and no `resolutionNote`,
+    // and `updatedAt` is overwritten by the discharge.
+    const { companyId, sourceIssueId, actionId } = await seedRetiredActionForDischarge("timeout_horizon");
+    const svc = issueRecoveryActionService(db);
+
+    await svc.resolveActiveForIssue({
+      companyId,
+      sourceIssueId,
+      status: "resolved",
+      outcome: "restored",
+    });
+
+    const listed = await recoveryObservabilityService(db).listActions(companyId, { limit: 500 });
+    const horizonRetired = listed.filter((action) => action.retiringBound === "timeout_horizon");
+    expect(horizonRetired).toHaveLength(1);
+    expect(horizonRetired[0]).toMatchObject({ id: actionId, status: "resolved" });
+  });
+
   it("does not refresh the handoff grant when recovery sweeps through its own owner churn", async () => {
     const companyId = randomUUID();
     const ceoId = randomUUID();
