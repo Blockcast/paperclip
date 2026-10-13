@@ -400,6 +400,49 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .toEqual({ status: "idle", errorReason: null });
   });
 
+  it("BLO-45251: disperses a pr_review 429 refusal floor instead of resuming the cohort in lockstep", async () => {
+    // Every pr_review run refused inside one 429 window carries the same raw
+    // `providerCapacityResetAt`. It has capacity provenance, but no resolver
+    // jittered it, so the scheduler must disperse it (PEN-2509).
+    const now = new Date("2030-04-22T20:00:00.000Z");
+    const resetAt = new Date("2030-04-22T21:00:00.000Z");
+    const resultJson = {
+      providerCapacityResetAt: resetAt.toISOString(),
+      providerCapacityResetProvenance: {
+        source: "server_parse_provider_capacity_horizon",
+        errorFamily: "rate_limit_exhausted",
+        observedStatusCode: 429,
+      },
+      externalLifecycleRecovery: {
+        reason: "job_failed",
+        jobReason: "BackoffLimitExceeded",
+        adapterInvocationStarted: true,
+        providerRefusalStatusCode: 429,
+        providerRefusalHorizon: "usable",
+        reviewEvidenceFound: false,
+      },
+    };
+    const dueAts: number[] = [];
+    for (const draw of [0.25, 0.75]) {
+      const runId = randomUUID();
+      await seedRetryFixture({
+        companyId: randomUUID(),
+        agentId: randomUUID(),
+        runId,
+        now,
+        errorCode: "job_failed",
+        resultJson,
+        contextSnapshot: { reviewKind: "pr_review" },
+      });
+      const scheduled = await heartbeat.scheduleBoundedRetry(runId, { now, random: () => draw });
+      expect(scheduled.outcome).toBe("scheduled");
+      if (scheduled.outcome !== "scheduled") return;
+      dueAts.push(scheduled.dueAt.getTime());
+    }
+    for (const ms of dueAts) expect(ms).toBeGreaterThanOrEqual(resetAt.getTime());
+    expect(dueAts[0]).not.toBe(dueAts[1]);
+  });
+
   it("coalesces bounded retries by agent, work identity, and reason", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
