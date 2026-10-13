@@ -2,6 +2,7 @@ const readline = require("node:readline");
 
 let nextRequestId = 1;
 const pendingNested = new Map();
+let settledInvocationId = null;
 
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -34,6 +35,10 @@ function sendNestedHostRequest(originalRequest, invocationId) {
 
   if (mode === "echo") {
     nestedRequest.paperclipInvocationId = invocationId;
+  } else if (mode === "afterSettle") {
+    // Replays the id of an invocation whose RPC already returned, i.e. a
+    // host call issued by an async continuation after the handler settled.
+    nestedRequest.paperclipInvocationId = settledInvocationId;
   } else if (mode === "unknown") {
     nestedRequest.paperclipInvocationId = "unknown-invocation";
   }
@@ -82,6 +87,12 @@ rl.on("line", (line) => {
         supportedMethods: ["getData", "performAction", "runJob"],
       },
     });
+    return;
+  }
+
+  if (method === "performAction" && message.params?.params?.mode === "settle") {
+    settledInvocationId = message.paperclipInvocation?.id ?? null;
+    send({ jsonrpc: "2.0", id: message.id, result: { settled: true } });
     return;
   }
 
