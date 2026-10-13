@@ -158,7 +158,9 @@ describe("heartbeat model profile application", () => {
 // last and accepts arbitrary keys, so without withAgentScopedEnvProvenance an
 // issue override reaches agent scope — the boundary BLO-18927 exists to draw.
 // GH_SEAT_TOKEN_VALUE selects the identity every `gh` invocation authenticates
-// as, so both introducing and dropping it are exploits, and both are asserted.
+// as, and SCCACHE_* selects the private compiler-cache writer identity. Both
+// introducing and dropping those credentials are exploits, and both are
+// asserted.
 describe("mergeModelProfileAdapterConfig agent-scope-only env boundary", () => {
   const noProfile = {
     requested: null,
@@ -207,6 +209,63 @@ describe("mergeModelProfileAdapterConfig agent-scope-only env boundary", () => {
 
     expect(blanked.env).toMatchObject({ GH_SEAT_TOKEN_VALUE: "agent-seat-token" });
     expect(displaced.env).toMatchObject({ GH_SEAT_TOKEN_VALUE: "agent-seat-token" });
+  });
+
+  it("does not let an issue adapter override introduce private compiler-cache credentials", () => {
+    const merged = mergeModelProfileAdapterConfig({
+      baseConfig: { env: { AGENT_ONLY: "agent-only" } },
+      modelProfile: { ...noProfile },
+      issueAdapterConfig: {
+        env: {
+          SCCACHE_ACCESS_KEY_ID: "issue-attacker-id",
+          SCCACHE_SECRET_ACCESS_KEY: "issue-attacker-secret",
+        },
+      },
+    });
+
+    expect(merged.env).not.toHaveProperty("SCCACHE_ACCESS_KEY_ID");
+    expect(merged.env).not.toHaveProperty("SCCACHE_SECRET_ACCESS_KEY");
+  });
+
+  it("does not let an issue adapter override replace or drop private compiler-cache credentials", () => {
+    const replaced = mergeModelProfileAdapterConfig({
+      baseConfig: {
+        env: {
+          SCCACHE_ACCESS_KEY_ID: "agent-cache-access",
+          SCCACHE_SECRET_ACCESS_KEY: "agent-cache-secret",
+        },
+      },
+      modelProfile: { ...noProfile },
+      issueAdapterConfig: {
+        env: {
+          SCCACHE_ACCESS_KEY_ID: "issue-attacker-id",
+          SCCACHE_SECRET_ACCESS_KEY: "issue-attacker-secret",
+        },
+      },
+    });
+    const displaced = mergeModelProfileAdapterConfig({
+      baseConfig: {
+        env: {
+          SCCACHE_ACCESS_KEY_ID: "agent-cache-access",
+          SCCACHE_SECRET_ACCESS_KEY: "agent-cache-secret",
+        },
+      },
+      modelProfile: { ...noProfile },
+      issueAdapterConfig: { env: { UNRELATED: "issue-only" } },
+    });
+
+    expect(replaced.env).toMatchObject({
+      SCCACHE_ACCESS_KEY_ID: "agent-cache-access",
+      SCCACHE_SECRET_ACCESS_KEY: "agent-cache-secret",
+    });
+    expect(replaced.env).not.toMatchObject({
+      SCCACHE_ACCESS_KEY_ID: "issue-attacker-id",
+      SCCACHE_SECRET_ACCESS_KEY: "issue-attacker-secret",
+    });
+    expect(displaced.env).toMatchObject({
+      SCCACHE_ACCESS_KEY_ID: "agent-cache-access",
+      SCCACHE_SECRET_ACCESS_KEY: "agent-cache-secret",
+    });
   });
 
   it("does not let a model profile overlay introduce a seat token", () => {
