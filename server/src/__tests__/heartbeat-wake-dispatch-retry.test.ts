@@ -107,16 +107,22 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
    *
    * `failures: 1` models a transient blip (first attempt fails, retry
    * succeeds); a large value models a hard outage that exhausts the chain.
+   *
+   * `transactionsOnly` fails only inserts made through a transaction's `tx`,
+   * leaving the outer db healthy. That is the fault where enqueueWakeup's
+   * transaction fails but wakeupWithDispatchRetry's safety-net insert (on the
+   * outer db) still lands; without it the safety net fails too.
    */
   function dbWithFailingInserts(
     target: typeof db,
     failures: number,
     makeError: () => unknown = () => new Error("simulated transient dispatch failure (BLO-18859)"),
+    { transactionsOnly = false }: { transactionsOnly?: boolean } = {},
   ) {
     let remaining = failures;
-    const wrap = (obj: object): typeof db => new Proxy(obj, {
+    const wrap = (obj: object, inTransaction: boolean): typeof db => new Proxy(obj, {
       get(rawTarget, prop) {
-        if (prop === "insert") {
+        if (prop === "insert" && (inTransaction || !transactionsOnly)) {
           return (...args: unknown[]) => {
             if (remaining > 0) {
               remaining -= 1;
@@ -128,7 +134,7 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
         if (prop === "transaction") {
           return (callback: (tx: unknown) => unknown, ...rest: unknown[]) =>
             (rawTarget as Record<string, (...a: unknown[]) => unknown>).transaction(
-              (tx: object) => callback(wrap(tx)),
+              (tx: object) => callback(wrap(tx, true)),
               ...rest,
             );
         }
@@ -138,7 +144,7 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
         return typeof value === "function" ? value.bind(rawTarget) : value;
       },
     }) as unknown as typeof db;
-    return wrap(target as unknown as object);
+    return wrap(target as unknown as object, false);
   }
 
   /**
@@ -781,13 +787,16 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
     it("records the driver SQLSTATE on the inline safety-net row's lastError", async () => {
       const { agentId } = await seedCompanyAndAgent();
       const failingHeartbeat = heartbeatService(
-        dbWithFailingInserts(db, Number.MAX_SAFE_INTEGER, makeDrizzlePgError),
+        dbWithFailingInserts(db, Number.MAX_SAFE_INTEGER, makeDrizzlePgError, { transactionsOnly: true }),
         { skipQueuedRunDispatch: true },
       );
 
-      // Every enqueue attempt fails, so the chain exhausts and falls through to
-      // the durable safety-net insert -- which is written through the *unwrapped*
-      // db below, because the proxy only fails the enqueue path's inserts.
+      // Every enqueue attempt fails inside enqueueWakeup's transaction, so the
+      // chain exhausts and falls through to the safety-net insert on the outer
+      // db, which `transactionsOnly` leaves healthy. wakeupWithDispatchRetry
+      // then rethrows the last dispatch error to its caller (the same contract
+      // the exhaustion tests above pin with `.rejects`), with the driver code
+      // still on `.cause`.
       await expect(
         failingHeartbeat.wakeup(agentId, {
           source: "automation",
@@ -795,7 +804,7 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
           reason: "github_pr_review_submitted",
           payload: GITHUB_REVIEW_PAYLOAD,
         }),
-      ).resolves.toBeNull();
+      ).rejects.toMatchObject({ cause: { code: "23503" } });
 
       const rows = await db
         .select()
