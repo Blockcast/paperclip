@@ -5558,17 +5558,25 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
         // probe of its own (the collector defers on `dirty` or `unverifiable`
         // before reaching here), so refuse when the tree is dirty or its state
         // cannot be verified. A clean tree with unpushed commits remains
-        // removable: its commits stay on the branch and branch deletion below
-        // already refuses to discard an unmerged branch.
+        // removable only while HEAD is on a branch: its commits stay on the
+        // branch and branch deletion below already refuses to discard an
+        // unmerged branch. On a detached HEAD (BLO-45957) nothing but the
+        // worktree's own HEAD reaches them, so removal would orphan them; a
+        // `symbolic-ref` that fails for any reason counts as detached.
         const operatorSafety = authorization.authorized && trigger === "operator"
           ? await inspectWorktreeReclaimSafety(workspacePath, { trigger, cleanupReason })
           : null;
-        if (operatorSafety?.reason === "dirty" || operatorSafety?.reason === "unverifiable") {
-          const safetyMessage = operatorSafety.reason === "dirty"
+        const detachedUnpushed = operatorSafety?.reason === "unpushed"
+          && !(await runGit(["symbolic-ref", "-q", "HEAD"], workspacePath, { timeoutMs: WORKTREE_RECLAIM_GIT_TIMEOUT_MS })
+            .then(() => true, () => false));
+        if (operatorSafety?.reason === "dirty" || operatorSafety?.reason === "unverifiable" || detachedUnpushed) {
+          const safetyMessage = operatorSafety?.reason === "dirty"
             ? "it has uncommitted changes"
-            : "its state could not be verified";
+            : detachedUnpushed
+              ? "its HEAD is detached with unpushed commits"
+              : "its state could not be verified";
           warnings.push(
-            `Refusing to remove git worktree "${workspacePath}": ${safetyMessage} (${operatorSafety.detail}).`,
+            `Refusing to remove git worktree "${workspacePath}": ${safetyMessage} (${operatorSafety?.detail}).`,
           );
         } else if (authorization.authorized) {
           // Monotonic, for the reason given at `inspectWorktreeReclaimSafety`.
