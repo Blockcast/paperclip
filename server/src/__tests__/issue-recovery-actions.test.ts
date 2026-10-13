@@ -7002,6 +7002,118 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         .expect(200);
 
       expect(resolved.body.recoveryAction.outcome).toBe("restored");
+
+      const [activity] = await db
+        .select()
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.entityId, sourceIssueId),
+            eq(activityLog.action, "issue.recovery_action_resolved"),
+          ),
+        );
+      expect(activity!.details).toMatchObject({
+        claimedOutcome: "restored",
+        claimDowngraded: false,
+        effectiveSourceIssueStatus: "in_review",
+      });
+    });
+
+    // Ally review on #2584. `claimDowngraded` was first written as
+    // `recordedOutcome !== requestedOutcome`, which is true for EVERY derived
+    // outcome — including the two routine, honest ones below. That would have
+    // polluted the new signal from its first row: a consumer counting
+    // contradicted claims would have counted every hand-back and every
+    // owner-completion. These two pin the narrow meaning.
+    it("does not flag a hand-back as a downgraded claim", async () => {
+      const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+      const recoveryActionSvc = issueRecoveryActionService(db);
+      const action = await recoveryActionSvc.upsertSourceScoped({
+        companyId,
+        sourceIssueId,
+        kind: "stranded_assigned_issue",
+        ownerType: "agent",
+        ownerAgentId: managerId,
+        // The hand-back arm only fires when a return owner is recorded.
+        returnOwnerAgentId: coderId,
+        cause: "stranded_assigned_issue",
+        fingerprint: "pen3991:handback",
+        evidence: {},
+        nextAction: "Re-home the stranded issue.",
+        wakePolicy: { type: "wake_owner" },
+      });
+      const app = createApp();
+
+      const resolved = await request(app)
+        .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+        .send({
+          actionId: action.id,
+          outcome: "restored",
+          sourceIssueStatus: "todo",
+          resolutionNote: "Strand cleared; back to the original owner.",
+        })
+        .expect(200);
+
+      // The outcome IS derived — and that is exactly why the old form misfired.
+      expect(resolved.body.recoveryAction.outcome).toBe("handed_back");
+
+      const [activity] = await db
+        .select()
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.entityId, sourceIssueId),
+            eq(activityLog.action, "issue.recovery_action_resolved"),
+          ),
+        );
+      expect(activity!.details).toMatchObject({
+        claimedOutcome: "restored",
+        claimDowngraded: false,
+      });
+    });
+
+    it("does not flag an owner-completion as a downgraded claim", async () => {
+      const { companyId, managerId, sourceIssueId } = await seedCompany();
+      const recoveryActionSvc = issueRecoveryActionService(db);
+      const action = await recoveryActionSvc.upsertSourceScoped({
+        companyId,
+        sourceIssueId,
+        kind: "stranded_assigned_issue",
+        ownerType: "agent",
+        ownerAgentId: managerId,
+        cause: "stranded_assigned_issue",
+        fingerprint: "pen3991:owner-completed",
+        evidence: {},
+        nextAction: "Re-home the stranded issue.",
+        wakePolicy: { type: "wake_owner" },
+      });
+      const app = createApp();
+
+      const resolved = await request(app)
+        .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+        .send({
+          actionId: action.id,
+          outcome: "restored",
+          sourceIssueStatus: "done",
+          resolutionNote: "Finished it myself.",
+        })
+        .expect(200);
+
+      expect(resolved.body.recoveryAction.outcome).toBe("owner_completed");
+
+      const [activity] = await db
+        .select()
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.entityId, sourceIssueId),
+            eq(activityLog.action, "issue.recovery_action_resolved"),
+          ),
+        );
+      expect(activity!.details).toMatchObject({
+        claimedOutcome: "restored",
+        claimDowngraded: false,
+      });
     });
 
     it("leaves PEN-2756's omitted-status backlog discharge recorded as restored", async () => {
@@ -7088,6 +7200,63 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       expect(typeof evidence.supersedesRestoredClaimResolvedAt).toBe("string");
       expect(evidence.supersedesRestoredClaimElapsedMs).toEqual(expect.any(Number));
       expect(evidence.supersedesRestoredClaimElapsedMs as number).toBeGreaterThanOrEqual(0);
+      // Ally review on #2584: the link is temporal adjacency, not proof the prior
+      // claim was false — most writers of `restored` are system discharges that
+      // are generally true. The prior claim's shape is recorded so a consumer can
+      // tell the measured loop shape (same kind, minutes apart) from a
+      // coincidence, rather than this code guessing on their behalf.
+      expect(evidence.supersedesRestoredClaimKind).toBe("stranded_assigned_issue");
+      expect(evidence.supersedesRestoredClaimCause).toBe("stranded_assigned_issue");
+      expect(evidence.supersedesRestoredClaimSameKind).toBe(true);
+    });
+
+    it("marks a different-kind prior claim as linked but not same-kind", async () => {
+      // The coincidence case the review named: a system discharge whose
+      // `restored` is generally true (a merged-PR `pr_review_non_convergence`
+      // beacon), followed within the window by an unrelated new strand. It is
+      // still linked — dropping the link would leave no trace to audit — but it
+      // must not read as the loop that same-kind adjacency indicates.
+      const { companyId, managerId, sourceIssueId } = await seedCompany();
+      const recoveryActionSvc = issueRecoveryActionService(db);
+      const prior = await recoveryActionSvc.upsertSourceScoped({
+        companyId,
+        sourceIssueId,
+        kind: "pr_review_non_convergence",
+        ownerType: "agent",
+        ownerAgentId: managerId,
+        cause: "self_review_pr_non_convergence",
+        fingerprint: "pen3991:different-kind:prior",
+        evidence: {},
+        nextAction: "Take over the PR.",
+        wakePolicy: { type: "wake_owner" },
+      });
+      await recoveryActionSvc.resolveActiveForIssue({
+        companyId,
+        sourceIssueId,
+        actionId: prior.id,
+        status: "resolved",
+        outcome: "restored",
+        resolutionNote: "PR merged, so the self-review loop ended.",
+      });
+
+      const replacement = await recoveryActionSvc.upsertSourceScoped({
+        companyId,
+        sourceIssueId,
+        kind: "stranded_assigned_issue",
+        ownerType: "agent",
+        ownerAgentId: managerId,
+        cause: "stranded_assigned_issue",
+        fingerprint: "pen3991:different-kind:replacement",
+        evidence: {},
+        nextAction: "Re-home the stranded issue.",
+        wakePolicy: { type: "wake_owner" },
+      });
+
+      const evidence = replacement.evidence as Record<string, unknown>;
+      expect(evidence.supersedesRestoredClaimActionId).toBe(prior.id);
+      expect(evidence.supersedesRestoredClaimKind).toBe("pr_review_non_convergence");
+      expect(evidence.supersedesRestoredClaimCause).toBe("self_review_pr_non_convergence");
+      expect(evidence.supersedesRestoredClaimSameKind).toBe(false);
     });
 
     it("does not attribute a first-ever action to anything", async () => {

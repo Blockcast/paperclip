@@ -10095,7 +10095,16 @@ export function issueRoutes(
         // place a contradicted claim is attributable to the principal that made
         // it — the action record itself holds no resolver identity.
         claimedOutcome: outcome,
-        claimDowngraded: result.recoveryAction.outcome !== outcome,
+        // Ally review on #2584: this is deliberately NOT
+        // `result.recoveryAction.outcome !== outcome`. Every derived outcome
+        // differs from the requested one, so that form is true for routine,
+        // honest resolutions too — `restored` + `todo` with a return owner
+        // records `handed_back`, `restored` + `done` records
+        // `owner_completed`. Neither is a contradicted claim, and counting
+        // them as one pollutes this signal from its first row. The flag means
+        // only the PEN-3991 downgrade; `claimedOutcome` above already carries
+        // the requested value for every other derivation.
+        claimDowngraded: contradictedRestoredClaim,
         sourceIssueStatus: sourceIssueStatus ?? null,
         // The status that actually applied. With `sourceIssueStatus` omitted
         // this is the issue's pre-existing status, which is the value the
