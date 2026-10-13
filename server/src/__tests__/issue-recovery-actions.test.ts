@@ -905,13 +905,16 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       maxAttempts: 5,
     });
 
-    await svc.retireAndReleaseWakeAttempt({
+    const retired = await svc.retireAndReleaseWakeAttempt({
       companyId,
       actionId: action.id,
       expectedOwnerAgentId: managerId,
       expectedAttemptCount: action.attemptCount,
       retiringBound: "attempt_budget",
     });
+    // PEN-3989 (Ally review of #2607): the return value is the UPDATE's row match, and it is
+    // the only evidence a caller has that this call did anything. See the CAS-miss test below.
+    expect(retired).toBe(true);
 
     const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
     const recovery = recoveryService(db, { enqueueWakeup });
@@ -929,6 +932,71 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       retiringBound: "attempt_budget",
       attemptCount: action.attemptCount - 1,
       nonDeliverySweepCount: 1,
+    });
+  });
+
+  /**
+   * PEN-3989 (Ally review of #2607): `retireAndReleaseWakeAttempt` resolves without error when
+   * its reservation CAS matches NOTHING, so "the call did not throw" is not evidence of a
+   * retirement. Its only caller used to read it that way and announced a retirement that had
+   * not happened — a `paperclip_recovery_horizon_expired_total` increment feeding PEN-3322's
+   * alert, a notice telling an operator a still-`active` row had moved to `escalated`, and a
+   * dedup marker that then makes the REAL retirement's notice look like a duplicate.
+   *
+   * Both arms are asserted. The `true` arm alone would still pass against a function that
+   * returned a hardcoded `true`, which is the shape this is guarding.
+   */
+  it("reports whether the retirement UPDATE matched a row", async () => {
+    const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+    await db.update(issues).set({ status: "blocked", assigneeAgentId: managerId }).where(eq(issues.id, sourceIssueId));
+    const svc = issueRecoveryActionService(db);
+    const action = await svc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: "retire-cas:fingerprint",
+      nextAction: "Wake the recovery owner.",
+      maxAttempts: 5,
+    });
+
+    // The miss: another sweep re-homed the action between the reserve and this call, which is
+    // what `isNewOwnerSequence` does on every ownership change.
+    const missed = await svc.retireAndReleaseWakeAttempt({
+      companyId,
+      actionId: action.id,
+      expectedOwnerAgentId: coderId,
+      expectedAttemptCount: action.attemptCount,
+      retiringBound: "timeout_horizon",
+    });
+    expect(missed).toBe(false);
+    // Nothing was written — the whole point. A caller that announced here would be describing
+    // a row that is still `active` with no bound.
+    const [untouched] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    expect(untouched).toMatchObject({
+      status: "active",
+      retiringBound: null,
+      ownerAgentId: managerId,
+      attemptCount: action.attemptCount,
+      nonDeliverySweepCount: 0,
+    });
+
+    // The hit, on the same row, differing only in the CAS inputs.
+    const matched = await svc.retireAndReleaseWakeAttempt({
+      companyId,
+      actionId: action.id,
+      expectedOwnerAgentId: managerId,
+      expectedAttemptCount: action.attemptCount,
+      retiringBound: "timeout_horizon",
+    });
+    expect(matched).toBe(true);
+    const [retiredRow] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    expect(retiredRow).toMatchObject({
+      status: "escalated",
+      retiringBound: "timeout_horizon",
+      attemptCount: action.attemptCount - 1,
     });
   });
 
