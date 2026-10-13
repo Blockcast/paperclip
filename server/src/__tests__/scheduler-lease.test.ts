@@ -196,27 +196,36 @@ describeEmbeddedPostgres("scheduler lease (BLO-43292)", () => {
     expect(holder.state().runsLoop).toBe(false);
   });
 
-  it("runs the loop unleased when it has NEVER reached the lease table", async () => {
-    // The lease subsystem being unavailable (table not yet migrated, no
-    // connection at boot) must not take fleet dispatch down: that is strictly
-    // worse than the single-replica status quo. Unknown is not "someone else
-    // has it".
-    const broken = { execute: () => Promise.reject(new Error("relation does not exist")) };
-    const holder = schedulerLeaseHolder(broken as never, {
+  it("stays a follower when it has NEVER reached the lease table, then takes over once it can (BLO-45763)", async () => {
+    // Unknown is not leadership. At `replicas: 2` a cold replica that ran the
+    // loop unleased (table not migrated, lease query erroring) would enqueue
+    // alongside a healthy leader. It must retry and run only once it wins.
+    let reachable = false;
+    const coldDb = {
+      execute: (query: unknown) => {
+        if (!reachable) return Promise.reject(new Error("relation does not exist"));
+        return (db as unknown as { execute: (q: unknown) => Promise<unknown> }).execute(query);
+      },
+    };
+    const holder = schedulerLeaseHolder(coldDb as never, {
       name: LEASE,
       ttlMs: 45_000,
       renewIntervalMs: 60_000,
       identity: { pod: "pod-1", holderId: "pod-1#fixed" },
     });
 
-    expect(await holder.tick()).toBe(true);
+    expect(await holder.tick()).toBe(false);
+    expect(await holder.tick()).toBe(false);
     expect(holder.isLeader()).toBe(false);
-    expect(holder.state()).toMatchObject({ everAcquired: false, runsLoop: true, lastRenewedAtMs: 0 });
+    expect(holder.state()).toMatchObject({ everAcquired: false, runsLoop: false, lastRenewedAtMs: 0 });
+
+    reachable = true;
+    expect(await holder.tick()).toBe(true);
+    expect(holder.state()).toMatchObject({ everAcquired: true, runsLoop: true });
   });
 
   it("does NOT run the loop when it cleanly loses to a live holder", async () => {
-    // The other half of the case above: a clean loss is evidence, not
-    // uncertainty, so there is nothing to fail open about.
+    // A clean loss and an error both leave this process a follower.
     await acquireSchedulerLease(db, { name: LEASE, holderId: "incumbent", ttlMs: 45_000 });
     const holder = schedulerLeaseHolder(db, {
       name: LEASE,
