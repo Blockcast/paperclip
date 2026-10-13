@@ -781,13 +781,30 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
       );
   }
 
+  /**
+   * Returns whether the UPDATE matched a row, i.e. whether the reservation CAS below still
+   * held when the statement ran.
+   *
+   * PEN-3989 (Ally review of #2607): this used to return `void`, and the only caller read
+   * "the call did not throw" as proof the row had been retired. It is not. The predicate is a
+   * compare-and-swap on `ownerAgentId` + `attemptCount`, so a sweep that re-homes the action
+   * between the reserve and this call (`isNewOwnerSequence` resets `attemptCount`) matches
+   * zero rows and still resolves with no error. The caller then announced a retirement that
+   * had not happened: a `paperclip_recovery_horizon_expired_total` increment feeding PEN-3322's
+   * alert, a source-row notice claiming a still-`active` row had moved to `escalated`, and a
+   * dedup marker that makes the REAL retirement's notice look like a duplicate later.
+   *
+   * `false` means "this call changed nothing"; it does NOT distinguish a matched row that the
+   * SQL-level idempotency below left untransitioned (a re-run) from one it transitioned. The
+   * caller supplies that half from the pre-state it already holds.
+   */
   async function retireAndReleaseWakeAttempt(input: {
     companyId: string;
     actionId: string;
     expectedOwnerAgentId: string;
     expectedAttemptCount: number;
     retiringBound: IssueRecoveryActionRetiringBound;
-  }): Promise<void> {
+  }): Promise<boolean> {
     // Retiring and refunding must share one statement. Splitting them lets a sweep observe a
     // row whose status advanced without its reserved attempt coming back, which reopens the
     // exhausted action.
@@ -804,7 +821,7 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
     // So the predicate keeps only the reservation CAS — owner plus attempt count, scoped to
     // active statuses — and the retirement writes are made idempotent in SQL instead. A
     // re-run refunds its own reserve and rewrites neither `status` nor `retiring_bound`.
-    await db
+    const matched = await db
       .update(issueRecoveryActions)
       .set({
         status: sql`case when ${issueRecoveryActions.retiringBound} is null and ${issueRecoveryActions.status} = 'active' then 'escalated' else ${issueRecoveryActions.status} end`,
@@ -819,7 +836,9 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
         eq(issueRecoveryActions.ownerAgentId, input.expectedOwnerAgentId),
         eq(issueRecoveryActions.attemptCount, input.expectedAttemptCount),
         inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
-      ));
+      ))
+      .returning({ id: issueRecoveryActions.id });
+    return matched.length > 0;
   }
 
   async function retireWakeAction(input: {

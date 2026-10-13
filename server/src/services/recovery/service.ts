@@ -6394,14 +6394,40 @@ export function recoveryService(
         expectedAttemptCount: reservedAttemptCount,
         retiringBound,
       });
+      // PEN-3989 (Ally review of #2607): this is the RETURN VALUE of the UPDATE, not "the
+      // call did not throw". `retireAndReleaseWakeAttempt`'s predicate is a CAS on owner +
+      // attempt count; a sweep that re-homes the action between the reserve above and this
+      // call matches zero rows and resolves with no error. Reading the absence of a throw as
+      // proof of retirement announced a retirement that had not happened — see that
+      // function's doc comment for the three consequences.
       let retirementCommitted = false;
       try {
-        await retireAndRefund();
-        retirementCommitted = true;
+        retirementCommitted = await retireAndRefund();
       } catch (firstError) {
         try {
-          await retireAndRefund();
-          retirementCommitted = true;
+          retirementCommitted = await retireAndRefund();
+          if (!retirementCommitted) {
+            // The retry is for a transient database blip, and a blip can land AFTER the
+            // commit — the statement succeeded, the client never saw the reply. The retry's
+            // CAS then misses because the first call already decremented `attemptCount`, and
+            // reading that as "nothing happened" would re-introduce exactly the silence this
+            // row exists to end: the row IS retired, and neither the horizon sweep (gated on
+            // `status = 'active'`) nor the backstop (gated on `retiring_bound IS NULL`) can
+            // pick it up afterwards.
+            //
+            // One read disambiguates. It cannot distinguish our own first call from a racer
+            // that retired the row in the same window — but it does not need to: the
+            // pre-state conjunct below still holds, and announcing under a race costs at most
+            // a duplicate counter increment that the marker dedup keeps to one notice. That
+            // is the tolerance this call site already accepts, and it is strictly better than
+            // dropping the only announcement the row will ever get.
+            const confirmed = await recoveryActionsSvc.getActiveForIssue(
+              input.issue.companyId,
+              input.issue.id,
+            );
+            retirementCommitted = confirmed?.id === input.action.id
+              && confirmed.retiringBound === retiringBound;
+          }
         } catch (secondError) {
           logger.warn(
             {
@@ -6421,13 +6447,21 @@ export function recoveryService(
       // either. Same cause as the backstop gate above — see
       // `announceRecoveryHorizonRetirement`.
       //
-      // Transition evidence here is the PRE-STATE read, not a return value:
-      // `retireAndReleaseWakeAttempt` is deliberately idempotent (`coalesce` on the bound, a
-      // `CASE` on the status) so that a re-run still refunds, which means a successful call
-      // does not by itself prove THIS call transitioned the row. `input.action.retiringBound
-      // === null` is that proof, read moments earlier in this same dispatch. A concurrent
-      // racer could make both paths announce; the marker dedup inside the helper keeps that to
-      // one notice, and a duplicate counter increment is harmless for a `> 0` alert.
+      // Transition evidence here is TWO conjuncts, because neither is sufficient alone:
+      //
+      //   - `retirementCommitted` — the UPDATE matched a row, so the reservation CAS (owner
+      //     plus attempt count) still held. Without it, a concurrent re-home silently makes
+      //     the statement a no-op and every announcement below is about a row that is still
+      //     `active`. This was the gap Ally found on #2607; see
+      //     `retireAndReleaseWakeAttempt`.
+      //   - `input.action.retiringBound === null` — the PRE-STATE read from moments earlier
+      //     in this same dispatch. Needed because the UPDATE is deliberately idempotent
+      //     (`coalesce` on the bound, a `CASE` on the status) so that a re-run still refunds:
+      //     a matched row does not by itself prove THIS call did the transition.
+      //
+      // A racer landing between the pre-state read and the UPDATE can still make both paths
+      // announce; the marker dedup inside the helper keeps that to one notice, and a
+      // duplicate counter increment is harmless for a `> 0` alert.
       //
       // `attemptCount` is adjusted because the refund has already landed: the row we are
       // describing carries `greatest(attemptCount - 1, 0)`, not the reserved count still held
@@ -13185,7 +13219,6 @@ export function recoveryService(
   ): Promise<{
     neverDelivered: boolean;
     neverDeliveredButWorked: boolean;
-    counted: boolean;
     announced: boolean;
   }> {
     // PEN-3000: `attemptCount` counts wakes that REACHED THE QUEUE, not sweeps — every
@@ -13199,6 +13232,13 @@ export function recoveryService(
     // sweep writes it from the issue's assignee on the first insert (see `upsertSourceScoped`
     // call above), so it is non-null on the un-churned rows this label exists to catch.
     const neverDelivered = action.attemptCount === 0;
+    // PEN-3989 (Ally review of #2607): the increment stays HERE, before the dedup check, and
+    // the return shape carries no `counted` flag. Moving it after the dedup would couple the
+    // counter to the notice, and the notice's marker is shared with
+    // `escalateStrandedAssignedIssue` — so an action whose notice that path had already
+    // posted would retire with no metric at all, which is exactly the silence this row
+    // exists to end. The cost of keeping it here is that two racing writers on one action
+    // increment twice; PEN-3322's alerts are `> 0` over a 1 d window, so that is harmless.
     recordRecoveryHorizonExpired(neverDelivered ? "never_delivered" : "delivered");
 
     // BLO-19124: only asked on the `neverDelivered` branch, because that is the only notice
@@ -13274,7 +13314,7 @@ export function recoveryService(
       .limit(1)
       .then((rows) => rows.length > 0);
     if (alreadyAnnounced) {
-      return { neverDelivered, neverDeliveredButWorked, counted: false, announced: false };
+      return { neverDelivered, neverDeliveredButWorked, announced: false };
     }
 
     await issuesSvc.addComment(
@@ -13317,7 +13357,7 @@ export function recoveryService(
       {},
       { authorType: "system" },
     );
-    return { neverDelivered, neverDeliveredButWorked, counted: true, announced: true };
+    return { neverDelivered, neverDeliveredButWorked, announced: true };
   }
 
 
