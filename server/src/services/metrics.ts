@@ -41,6 +41,7 @@ import {
   snapshotRoutineDispatchMetrics,
 } from "./routine-dispatch-metrics.js";
 import type { FdClassSnapshot } from "./fd-class-metrics.js";
+import type { NativeMemorySnapshot } from "./native-memory-metrics.js";
 
 export const CONCURRENT_RUN_BLOCKED_METRIC = "claude_k8s_concurrent_run_blocked_total";
 /**
@@ -1433,6 +1434,21 @@ export const DB_INHERITED_TIMEOUT_METRIC = "paperclip_db_inherited_timeout_secon
  * measurement that motivated it and for the cardinality bounds.
  */
 export const PROCESS_OPEN_FDS_BY_CLASS_METRIC = "paperclip_process_open_fds_by_class";
+
+/**
+ * Resident memory broken into the pools V8's own gauges do not report
+ * (PEN-3314). Companion to `process_resident_memory_bytes` /
+ * `nodejs_heap_size_total_bytes` / `nodejs_external_memory_bytes`, which say the
+ * process is growing but not which pool is growing — see
+ * `services/native-memory-metrics.ts` for the measurement that motivated it.
+ */
+export const PROCESS_MEMORY_COMPONENT_BYTES_METRIC = "paperclip_process_memory_component_bytes";
+
+/**
+ * V8 context counts (PEN-3314). `detached` is a leak signature whose healthy
+ * steady state is 0, which is why it is published at 0 rather than omitted.
+ */
+export const PROCESS_V8_CONTEXT_COUNT_METRIC = "paperclip_process_v8_context_count";
 
 /**
  * `setting` label of the series carrying the pool's OWN idle-in-transaction
@@ -3596,6 +3612,8 @@ let dbPoolConnections: Gauge<"state"> | null = null;
 let dbPoolWaitingQueries: Gauge | null = null;
 let dbInheritedTimeout: Gauge<"setting" | "source"> | null = null;
 let processOpenFdsByClass: Gauge<"fd_class"> | null = null;
+let processMemoryComponentBytes: Gauge<"component"> | null = null;
+let processV8ContextCount: Gauge<"kind"> | null = null;
 let pluginError: Gauge<"plugin_id" | "plugin_key"> | null = null;
 let crashRecoveryCandidateIndexPresent: Gauge<"index"> | null = null;
 let pluginMetric: Counter<
@@ -3754,6 +3772,8 @@ function ensureRegistry(): {
   dbPoolWaitingQueriesGauge: Gauge;
   dbInheritedTimeoutGauge: Gauge<"setting" | "source">;
   processOpenFdsByClassGauge: Gauge<"fd_class">;
+  processMemoryComponentBytesGauge: Gauge<"component">;
+  processV8ContextCountGauge: Gauge<"kind">;
   pluginErrorGauge: Gauge<"plugin_id" | "plugin_key">;
   crashRecoveryCandidateIndexPresentGauge: Gauge<"index">;
   pluginMetricCounter: Counter<
@@ -3863,6 +3883,8 @@ function ensureRegistry(): {
     || !dbPoolWaitingQueries
     || !dbInheritedTimeout
     || !processOpenFdsByClass
+    || !processMemoryComponentBytes
+    || !processV8ContextCount
     || !pluginError
     || !crashRecoveryCandidateIndexPresent
     || !pluginMetric
@@ -4218,6 +4240,42 @@ function ensureRegistry(): {
         + "broken rather than absent -- its value is always 0 and carries nothing; its presence "
         + "is the signal.",
       labelNames: ["fd_class"],
+      registers: [registry],
+    });
+    processMemoryComponentBytes = new Gauge({
+      name: PROCESS_MEMORY_COMPONENT_BYTES_METRIC,
+      help:
+        "Resident memory split into the pools V8's own gauges do not report (PEN-3314). "
+        + "native_unaccounted = rss - heapTotal - external, the headline residual: measured "
+        + "281 -> 2098 MB over 21h on the 2026-10-11 worker generation while "
+        + "nodejs_heap_size_used_bytes' floor slope was NEGATIVE (-3.5 MB/h), which is why the "
+        + "heap gauges stopped being evidence about this process. It is NOT clamped at zero -- a "
+        + "negative value means V8's committed heap holds pages that are not resident (normal "
+        + "shortly after start) and is distinct from 'no native memory'. "
+        + "array_buffers and external_other split nodejs_external_memory_bytes into its "
+        + "ArrayBuffer-backed and C++-bound-object halves; v8_malloced / v8_peak_malloced and "
+        + "v8_global_handles_total / v8_global_handles_used are V8 allocations OUTSIDE the heap "
+        + "it reports as heapTotal, so a native addon leaking persistent handles appears in "
+        + "v8_global_handles_total and in no other series this process emits. "
+        + "These components are NOT a partition of RSS and do not sum to it -- array_buffers and "
+        + "external_other are inside the external that native_unaccounted subtracts, and "
+        + "v8_malloced overlaps the residual. Read each on its own trend. "
+        + "NOT an alert source: it names which pool grows, it does not bound it. An absent "
+        + "component means this runtime does not report that field, deliberately distinct from a "
+        + "zero; absence of the whole metric means neither process.memoryUsage() nor "
+        + "v8.getHeapStatistics() could be read at all.",
+      labelNames: ["component"],
+      registers: [registry],
+    });
+    processV8ContextCount = new Gauge({
+      name: PROCESS_V8_CONTEXT_COUNT_METRIC,
+      help:
+        "V8 context counts (PEN-3314). kind=native is a steady-state value; growth means "
+        + "contexts are being retained. kind=detached counts contexts detached but not yet "
+        + "collected -- a leak signature whose healthy steady state is 0, so the series is "
+        + "published AT 0 rather than omitted, and an absent series means this runtime does not "
+        + "report the field.",
+      labelNames: ["kind"],
       registers: [registry],
     });
     agentStartLockHeldSeconds = new Gauge({
@@ -5481,6 +5539,8 @@ function ensureRegistry(): {
     dbPoolWaitingQueriesGauge: dbPoolWaitingQueries,
     dbInheritedTimeoutGauge: dbInheritedTimeout,
     processOpenFdsByClassGauge: processOpenFdsByClass,
+    processMemoryComponentBytesGauge: processMemoryComponentBytes,
+    processV8ContextCountGauge: processV8ContextCount,
     pluginErrorGauge: pluginError,
     crashRecoveryCandidateIndexPresentGauge: crashRecoveryCandidateIndexPresent,
     pluginMetricCounter: pluginMetric,
@@ -6381,6 +6441,36 @@ export function setFdClassMetrics(snapshot: FdClassSnapshot | null): void {
   if (!snapshot) return;
   for (const [fdClass, count] of snapshot.classes) {
     gauge.set({ fd_class: fdClass }, count);
+  }
+}
+
+/**
+ * PEN-3314: publish the native-memory accounting.
+ *
+ * Reset-then-set for the same reason as {@link setFdClassMetrics}: a component
+ * this runtime stops reporting must stop being published, or its last value
+ * freezes in place and reads as a pool that stopped growing.
+ *
+ * A `null` snapshot publishes nothing at all — see
+ * {@link collectNativeMemorySnapshot}, which returns `null` only when the
+ * readings could not be taken. "Cannot measure" and "measured zero" must not
+ * render identically, and that distinction is sharper here than anywhere else in
+ * this file: a flat zero line is exactly what the heap gauge was showing while
+ * this process leaked 87 MB/h.
+ *
+ * The loops must not skip zero values. `detached` contexts are 0 in the healthy
+ * state, and that 0 is the measurement.
+ */
+export function setNativeMemoryMetrics(snapshot: NativeMemorySnapshot | null): void {
+  const metrics = ensureRegistry();
+  metrics.processMemoryComponentBytesGauge.reset();
+  metrics.processV8ContextCountGauge.reset();
+  if (!snapshot) return;
+  for (const [component, bytes] of snapshot.components) {
+    metrics.processMemoryComponentBytesGauge.set({ component }, bytes);
+  }
+  for (const [kind, count] of snapshot.contexts) {
+    metrics.processV8ContextCountGauge.set({ kind }, count);
   }
 }
 
@@ -7744,6 +7834,8 @@ export function __resetMetricsForTest(): void {
   agentStartLockPhaseSeconds = null;
   agentStartLockAbortedTotal = null;
   processOpenFdsByClass = null;
+  processMemoryComponentBytes = null;
+  processV8ContextCount = null;
   processLostTotal = null;
   externalLifecycleRunningRuns = null;
   externalLifecycleRunSilenceGap = null;
