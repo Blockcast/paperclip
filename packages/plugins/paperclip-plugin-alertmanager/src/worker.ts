@@ -22,6 +22,7 @@ import {
   type PluginWebhookInput,
 } from "@paperclipai/plugin-sdk";
 import { handleWebhook, reconcileAbandonedAggregateFences } from "./webhook-handler.js";
+import { runCoverageCheck } from "./coverage.js";
 import { runAlertEscalationSweep } from "./escalation.js";
 import {
   authenticateWebhook,
@@ -70,6 +71,12 @@ export const plugin = definePlugin({
         );
       }
       await runAlertEscalationSweep(ctx, config);
+      try {
+        await runCoverageCheck(ctx, config);
+      } catch (err) {
+        // A detector failure must never fail the escalation job.
+        ctx.logger.warn(`alert-coverage: pass failed: ${String(err)}`);
+      }
     });
     ctx.logger.info("paperclip-plugin-alertmanager started");
   },

@@ -245,7 +245,7 @@ function q(ns: string, table: string): string {
   return `${ns}.${table}`;
 }
 
-async function findActiveAggregateIssue(
+export async function findActiveAggregateIssue(
   ctx: PluginContext,
   companyId: string,
   aggregateKey: string,
