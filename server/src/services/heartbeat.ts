@@ -476,6 +476,7 @@ import {
   resolveCcrotateCapacityRetry,
   clampTransientRetryHorizon,
   jitterTransientRetryFloor,
+  CCROTATE_CAPACITY_PARK_CLAMPED_FROM_KEY,
   isCapacityGovernedRetryFloor,
   applyCcrotateCapacityDecision,
   clearCcrotateCapacityDecision,
@@ -22412,11 +22413,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // Only the *verbatim, undispersed* floor is dispersed here. Two floors
     // reaching this point are already per-run and must be left exactly alone:
     //
-    //  - A capacity floor. Its instant is owned end-to-end by the capacity
-    //    arithmetic — the resolver arm jitters it, and both arms are bounded by
+    //  - A floor the capacity arithmetic COMPUTED. Its instant is owned
+    //    end-to-end there — the resolver jitters it and bounds it by
     //    `CCROTATE_CAPACITY_MAX_PARK_MS`. A second window here would stack on
-    //    the first and push the other arm past that ceiling, re-tuning another
+    //    the first and push the result past that ceiling, re-tuning another
     //    mechanism's bound as a side effect of dispersing ours.
+    //
+    //    PEN-2509 reopen: "capacity denial" and "capacity-computed floor" are
+    //    NOT the same set, and this exemption is only sound for the second. The
+    //    finalize path adopts the raw advertised instant whenever its clamp
+    //    lands no earlier than that instant, while still recording the denial's
+    //    provenance — so keying the exemption on provenance exempted a verbatim
+    //    whole-second floor and left the measured herd live (20.0% of post-fix
+    //    `transient_failure` parks on a whole second, 200x chance). The
+    //    predicate now requires positive evidence of the routing.
     //  - A horizon-clamped floor. That value is `now + MAX_TRANSIENT_RETRY_
     //    HORIZON_MS`, and `now` is each run's own park instant, so the cohort is
     //    dispersed by construction; jitter would buy nothing and would push
@@ -35706,7 +35716,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   ? {
                       // BLO-28919: same key the wake-gate writer uses, so a
                       // clamped floor reads identically whichever writer set it.
-                      penstockCapacityParkClampedFrom: advertisedRetryNotBefore,
+                      //
+                      // PEN-2509: this key is also the evidence
+                      // `isCapacityGovernedRetryFloor` reads to decide the floor
+                      // below was COMPUTED here rather than adopted verbatim —
+                      // see that predicate and
+                      // CCROTATE_CAPACITY_PARK_CLAMPED_FROM_KEY. It is written
+                      // under exactly the condition that makes
+                      // `effectiveRetryNotBefore` the resolver's output, so the
+                      // two must stay on the same conjunct. Writing it on a
+                      // wider condition would re-exempt a verbatim floor from
+                      // dispersion, which is the herd this ticket removes.
+                      [CCROTATE_CAPACITY_PARK_CLAMPED_FROM_KEY]: advertisedRetryNotBefore,
                     }
                   : {}),
                 ...(prReviewIncompleteOverride
