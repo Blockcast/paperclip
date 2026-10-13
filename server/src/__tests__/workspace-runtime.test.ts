@@ -5422,6 +5422,56 @@ describe("realizeExecutionWorkspace", () => {
     });
   });
 
+  it("refuses an operator archive's forced removal of a dirty owned worktree (BLO-45629)", async () => {
+    const repoRoot = await createTempRepo();
+    const realize = (identifier: string) => realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config: { workspaceStrategy: { type: "git_worktree", branchTemplate: "{{issue.identifier}}-{{slug}}" } },
+      issue: { id: `issue-${identifier}`, identifier, title: "Dirty operator archive" },
+      agent: { id: "agent-1", name: "Codex Coder", companyId: "company-1" },
+    });
+    const cleanupDirty = async (identifier: string, trigger?: "operator") => {
+      const workspace = await realize(identifier);
+      await fs.writeFile(path.join(workspace.cwd, "uncommitted.txt"), "live work\n");
+      const cleanup = await cleanupExecutionWorkspaceArtifacts({
+        trigger,
+        workspace: {
+          id: `execution-workspace-${identifier}`,
+          cwd: workspace.cwd,
+          providerType: "git_worktree",
+          providerRef: workspace.worktreePath,
+          branchName: workspace.branchName,
+          repoUrl: workspace.repoUrl,
+          baseRef: workspace.repoRef,
+          projectId: workspace.projectId,
+          projectWorkspaceId: workspace.workspaceId,
+          sourceIssueId: `issue-${identifier}`,
+          metadata: null,
+        },
+        projectWorkspace: { cwd: repoRoot, cleanupCommand: null },
+      });
+      return { workspace, cleanup };
+    };
+
+    const operator = await cleanupDirty("PAP-480", "operator");
+    expect(operator.cleanup.cleaned).toBe(false);
+    expect(operator.cleanup.warnings.join("\n")).toContain("uncommitted changes");
+    await expect(fs.readFile(path.join(operator.workspace.cwd, "uncommitted.txt"), "utf8")).resolves.toBe("live work\n");
+
+    // Control: without the operator trigger the same dirty tree IS force-removed, so the
+    // assertion above is the guard and not an artifact of the fixture.
+    const control = await cleanupDirty("PAP-481");
+    expect(control.cleanup.cleaned).toBe(true);
+    await expect(fs.stat(control.workspace.cwd)).rejects.toThrow();
+  }, 30_000);
+
   it("keeps an unmerged runtime-created branch and warns instead of force deleting it", async () => {
     const repoRoot = await createTempRepo();
 
@@ -7523,6 +7573,60 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
     });
     await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(actualBranch);
     await expect(readGit(worktreePath, ["status", "--porcelain", "--untracked-files=all"])).resolves.not.toBe("");
+  }, 20_000);
+
+  it("skips an idle claimant whose linked issues are all terminal (BLO-45629)", async () => {
+    const expectedBranch = "PAP-470-recorded";
+    const actualBranch = "PAP-470-live";
+    const { repoRoot, worktreePath } = await createDirtyMismatchRepo({ expectedBranch, actualBranch });
+    const ids = await seedDirtyQuarantineRecords({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      sourceIdentifier: "PAP-470",
+      claimant: "idle",
+    });
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, ids.claimant!.issueId));
+
+    const contention = await executionWorkspaceService(db).findGitWorktreeContention({
+      companyId: ids.companyId,
+      worktreePath,
+      liveBranchName: actualBranch,
+      excludingExecutionWorkspaceId: ids.sourceWorkspaceId,
+      excludingSourceIssueId: ids.sourceIssueId,
+    });
+
+    expect(contention).toBeNull();
+  }, 20_000);
+
+  it("still contends on an idle orphan claimant with no source issue (BLO-45629)", async () => {
+    const expectedBranch = "PAP-471-recorded";
+    const actualBranch = "PAP-471-live";
+    const { repoRoot, worktreePath } = await createDirtyMismatchRepo({ expectedBranch, actualBranch });
+    const ids = await seedDirtyQuarantineRecords({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      sourceIdentifier: "PAP-471",
+      claimant: "idle",
+    });
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, ids.claimant!.issueId));
+    await db
+      .update(executionWorkspaces)
+      .set({ sourceIssueId: null })
+      .where(eq(executionWorkspaces.id, ids.claimant!.workspaceId));
+
+    const contention = await executionWorkspaceService(db).findGitWorktreeContention({
+      companyId: ids.companyId,
+      worktreePath,
+      liveBranchName: actualBranch,
+      excludingExecutionWorkspaceId: ids.sourceWorkspaceId,
+      excludingSourceIssueId: ids.sourceIssueId,
+    });
+
+    expect(contention).toMatchObject({ claimedByWorkspaceId: ids.claimant!.workspaceId, activeRun: null });
   }, 20_000);
 
   it("does not treat the validating issue's own workspace as a rival claimant (BLO-33610)", async () => {
