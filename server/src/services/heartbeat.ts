@@ -7649,8 +7649,13 @@ export function stripK8sIsolationOwnedEnv(
 ): Record<string, unknown> {
   if (!isolation) return config;
   const env = parseObject(config.env);
+  const privatePodCache = isolation.storage.cache === "ephemeral"
+    && isolation.cacheRoot.startsWith("/runtime-cache/");
   const isolatedEnv = Object.fromEntries(
-    Object.entries(env).filter(([key]) => !K8S_ISOLATION_OWNED_ENV_KEYS.has(key)),
+    Object.entries(env).filter(([key, value]) => !K8S_ISOLATION_OWNED_ENV_KEYS.has(key)
+      // Fixed paths remain private to each Pod's emptyDir and let Rust dependency keys match.
+      || (privatePodCache && ((key === "CARGO_HOME" && value === "/runtime-cache/cargo")
+        || (key === "CARGO_TARGET_DIR" && value === "/runtime-cache/cargo-target")))),
   );
   return { ...config, env: isolatedEnv };
 }

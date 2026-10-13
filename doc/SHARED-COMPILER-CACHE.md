@@ -27,8 +27,8 @@ SCCACHE_S3_RW_MODE=READ_WRITE
 SCCACHE_IGNORE_SERVER_IO_ERROR=1
 ```
 
-Bind `PAPERCLIP_SCCACHE_ACCESS_KEY_ID` and
-`PAPERCLIP_SCCACHE_SECRET_ACCESS_KEY` to company Secrets. The wrapper exports
+Bind `SCCACHE_ACCESS_KEY_ID` and
+`SCCACHE_SECRET_ACCESS_KEY` to company Secrets. The wrapper exports
 AWS credentials only inside sccache; other S3 tools retain their own identity.
 The cache writer owns no buckets, has no administrative caps, and can read,
 write and list only `rust/`. Anonymous access and other companies are denied.
@@ -40,10 +40,10 @@ fresh containers with separate target directories. Require a cold miss/write,
 a warm hit, zero cache errors, anonymous read denial, outside-prefix denial,
 and denial against another bucket. Inspect `sccache --show-stats --stats-format=json`.
 Cargo still compiles uncached work such as linking binaries and procedural
-macros. A cache-service outage falls back to the compiler.
+macros. Missing cache credentials and cache-service outages fall back to the compiler.
 
 These fixed Cargo paths refer to separate emptyDirs in each Pod. Registry
 dependency source paths then match across jobs; sccache's Rust keys include
 the Cargo environment and compiler working directory. Different application
-checkout paths can still miss even when their dependencies hit. Keep existing
-operator overrides where a job needs them.
+checkout paths can still miss even when their dependencies hit. Runtime policy
+permits these two exact Cargo paths for a Pod's ephemeral cache volume.
