@@ -612,112 +612,23 @@ spec:
               MCP_FILE="${BASE}/.mcp.json"
               MCP_BRIDGE_JS="/app/packages/mcp-server/dist/stdio.js"
 
-              # gbrain endpoint selection. We mint a Bearer against
-              # admin-ui:3130/mcp by fetching the per-agent OAuth clients
-              # bundle from Penstock/Authbot and using the CEO agent's OAuth
-              # client at boot. Per-agent identity at the paperclip plugin
-              # layer is preserved via adapter_config.mcpServers.gbrain
-              # (refreshed by the gbrain-oauth-refresher CronJob in
-              # onprem-k8s/paperclip/).
+              # NOTE: the gbrain entry is deliberately ABSENT from this
+              # baseline and must not be reintroduced (PEN-2428 step 3).
+              # It used to mint a Bearer for the CEO agent's OAuth client
+              # and write it here, which gave EVERY agent in both companies
+              # the same `paperclip:Blockcast:CEO` identity on a
+              # world-readable file — read+write across ~37 federated gbrain
+              # sources with no per-agent attribution.
               #
-              # This previously defaulted to a second path —
-              # gbrain-mcp-internal:3131/gbrain, an UNAUTHENTICATED bridge —
-              # and fell back to it whenever the Authbot fetch, the CEO client
-              # lookup, or the /token mint failed. That fallback is removed
-              # (PEN-2428). Two reasons, in order of importance:
-              #
-              #   1. It was a fail-OPEN. Any transient Authbot or mint failure
-              #      silently swapped an OAuth-authenticated route for an
-              #      unauthenticated one, fleet-wide, with no signal.
-              #   2. As of 2026-08-28 it no longer resolves anyway: there is no
-              #      `gbrain-mcp-internal` Service, and the gbrain-mcp pod runs
-              #      only admin-ui (:3130) and auth-proxy (:9012) — the bridge
-              #      container is gone. So the "working gbrain MCP path on
-              #      first deploy / outage" the old comment promised had
-              #      already become a non-resolving entry that no probe caught.
-              #
-              # So: fail CLOSED. On any failure we emit `null` here, the key is
-              # dropped from mcp.json below, and the omission is logged loudly.
-              # Losing gbrain is the same availability outcome the dead bridge
-              # produced, but it is honest and greppable instead of silent.
-              #
-              # NOTE: the CEO client is a SHARED identity — every agent in both
-              # companies presents `paperclip:Blockcast:CEO` on this path, so
-              # gbrain-side audit cannot attribute a write to an agent. That is
-              # the open finding in PEN-2428; do not read the line above as a
-              # claim that it is fine. Removing this block entirely is the
-              # terminal state, but only AFTER every agent is covered by a
-              # per-agent client — today the bundle covers 7 Blockcast agents
-              # and no Penstock ones, so removing it now would drop gbrain for
-              # every uncovered agent.
-              GBRAIN_ENTRY='null'
-              GBRAIN_CLIENTS_FILE=""
-              GBRAIN_AUTHBOT_URL="${PAPERCLIP_GBRAIN_OAUTH_CLIENTS_URL:-https://api.penstock.run/v1/authbot/mcp-credentials/gbrain-plugin-oauth-clients}"
-              GBRAIN_AUTHBOT_KEY_FILE="${PAPERCLIP_GBRAIN_AUTHBOT_SERVICE_KEY_FILE:-/var/run/authbot/gbrain-plugin-service-key}"
-              if [ -r "${GBRAIN_AUTHBOT_KEY_FILE}" ]; then
-                GBRAIN_AUTHBOT_KEY="$(tr -d '\r\n' < "${GBRAIN_AUTHBOT_KEY_FILE}")"
-                if [ -n "${GBRAIN_AUTHBOT_KEY}" ]; then
-                  if curl -sf --max-time 5 \
-                    -H "accept: application/json" \
-                    -H "authorization: Bearer ${GBRAIN_AUTHBOT_KEY}" \
-                    -H "x-paperclip-consumer: paperclip-gbrain-plugin" \
-                    "${GBRAIN_AUTHBOT_URL}" \
-                    | jq -r '.credential.value // .value // empty' > /tmp/gbrain-clients.json; then
-                    if [ -s /tmp/gbrain-clients.json ] && jq -e 'type == "object"' /tmp/gbrain-clients.json >/dev/null 2>&1; then
-                      GBRAIN_CLIENTS_FILE="/tmp/gbrain-clients.json"
-                      echo "seed: loaded gbrain OAuth clients from Authbot"
-                    else
-                      echo "seed: Authbot gbrain clients response was empty or malformed"
-                    fi
-                  else
-                    echo "seed: Authbot gbrain clients fetch failed"
-                  fi
-                fi
-              fi
-              if [ -z "${GBRAIN_CLIENTS_FILE}" ] && [ -r /etc/paperclip-plugin-gbrain/clients.json ]; then
-                GBRAIN_CLIENTS_FILE="/etc/paperclip-plugin-gbrain/clients.json"
-                echo "seed: using legacy gbrain OAuth clients file"
-              fi
-              if [ -n "${GBRAIN_CLIENTS_FILE}" ]; then
-                CEO_ID=$(jq -r '."4eca1725-632f-45fa-97a2-8cf7e0430958".client_id // empty' "${GBRAIN_CLIENTS_FILE}" 2>/dev/null || true)
-                CEO_SEC=$(jq -r '."4eca1725-632f-45fa-97a2-8cf7e0430958".client_secret // empty' "${GBRAIN_CLIENTS_FILE}" 2>/dev/null || true)
-                if [ -n "${CEO_ID}" ] && [ -n "${CEO_SEC}" ]; then
-                  GBRAIN_BEARER=$(curl -sf --max-time 5 -X POST \
-                    http://gbrain-mcp-admin.paperclip.svc.cluster.local:3130/token \
-                    --data-urlencode "grant_type=client_credentials" \
-                    --data-urlencode "client_id=${CEO_ID}" \
-                    --data-urlencode "client_secret=${CEO_SEC}" 2>/dev/null \
-                    | jq -r '.access_token // empty' 2>/dev/null || true)
-                  if [ -n "${GBRAIN_BEARER}" ]; then
-                    GBRAIN_ENTRY=$(jq -nc \
-                      --arg url "http://gbrain-mcp-admin.paperclip.svc.cluster.local:3130/mcp" \
-                      --arg auth "Bearer ${GBRAIN_BEARER}" \
-                      '{type:"http", url:$url, headers:{Authorization:$auth}}')
-                    echo "seed: minted gbrain Bearer; routing claude direct MCP at admin-ui:3130/mcp"
-                  else
-                    echo "seed: FAIL-CLOSED gbrain — /token call failed; omitting gbrain from mcp.json"
-                  fi
-                else
-                  echo "seed: FAIL-CLOSED gbrain — CEO OAuth client absent from clients bundle; omitting gbrain from mcp.json"
-                fi
-              else
-                echo "seed: FAIL-CLOSED gbrain — no OAuth clients bundle available; omitting gbrain from mcp.json"
-              fi
-
+              # Agents now get gbrain through per-agent
+              # adapter_config.mcpServers.gbrain, minted by the
+              # gbrain-oauth-refresher CronJob in onprem-k8s/paperclip/ and
+              # merged over this baseline by name in the k8s adapter. That
+              # job's coverage gate re-derives the roster from the agents
+              # table on every 12h tick and exits non-zero while any live
+              # k8s agent is uncovered, so coverage is measured rather than
+              # assumed. claude_local agents never read this file at all.
               if [ -f "${MCP_BRIDGE_JS}" ]; then
-                # Emit the gbrain key ONLY when a Bearer was actually minted.
-                # Building the fragment here — rather than writing `"gbrain":
-                # null` and stripping it afterwards — means a null-valued entry
-                # is never written to the live file at any instant. The
-                # fail-closed invariant then holds by construction, instead of
-                # depending on a post-write jq pass that could itself fail and
-                # leave the null behind (the exact hole in the first cut of
-                # this change).
-                GBRAIN_JSON=""
-                if [ "${GBRAIN_ENTRY}" != "null" ]; then
-                  GBRAIN_JSON=",
-                  \"gbrain\": ${GBRAIN_ENTRY}"
-                fi
                 # Cluster-internal MCP servers (deployed via kubectl in the
                 # paperclip ns; see .planning/mcp-servers.yaml). All agents
                 # in this instance get the same baseline set:
@@ -832,13 +743,13 @@ spec:
                   "github": {
                     "command": "${LOCAL_BIN}/github-mcp-server",
                     "args": ["stdio"]
-                  }${GBRAIN_JSON}
+                  }
                 }
               }
               EOF
                 chown 1000:1000 "${MCP_FILE}" 2>/dev/null || true
                 # Report what actually landed rather than a hardcoded list, so
-                # a fail-closed gbrain omission is visible in this same line.
+                # this line stays correct if the heredoc above ever changes.
                 echo "seed: wrote ${MCP_FILE} with MCP servers: $(jq -r '.mcpServers | keys | join(", ")' "${MCP_FILE}" 2>/dev/null || echo '(unreadable)')"
                 {{- if .Values.runtimeConfig.enabled }}
                 # PEN-3714: the copy the adapter actually READS, on a volume no
