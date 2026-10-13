@@ -23,6 +23,7 @@ import {
   appendStderrExcerpt,
   createPluginWorkerHandle,
   formatWorkerFailureMessage,
+  pluginPassthroughEnv,
   shouldDropDroppableMessage,
   MAX_WORKER_STDIN_BACKLOG_BYTES,
 } from "../services/plugin-worker-manager.js";
@@ -915,5 +916,17 @@ describe("host-call denial logging", () => {
       reason: "host database handle is closed",
     });
     expect(faults[0]).not.toHaveProperty("err");
+  });
+});
+
+describe("pluginPassthroughEnv", () => {
+  it("forwards only allowlisted, non-empty keys", () => {
+    expect(
+      pluginPassthroughEnv({
+        PAPERCLIP_ALERTMANAGER_API_URL: "http://am:9093",
+        DATABASE_URL: "postgres://secret",
+      }),
+    ).toEqual({ PAPERCLIP_ALERTMANAGER_API_URL: "http://am:9093" });
+    expect(pluginPassthroughEnv({ PAPERCLIP_ALERTMANAGER_API_URL: "" })).toEqual({});
   });
 });

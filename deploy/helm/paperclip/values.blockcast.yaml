@@ -61,6 +61,12 @@ env:
         secretKeyRef:
           name: paperclip-database-url
           key: url
+    # BLO-42694: deploy-time default for the alertmanager plugin's
+    # `alertmanagerApiUrl`, so the escalation ladder reads real alert liveness
+    # instead of failing open. Not a secret; forwarded to plugin workers via
+    # pluginPassthroughEnv. A value set in the plugin's instance config wins.
+    - name: PAPERCLIP_ALERTMANAGER_API_URL
+      value: "http://alertmanager.monitoring.svc.cluster.local:9093"
     # Production PostgreSQL backups are owned by the paperclip-pg-backup
     # CronJob in Blockcast/onprem-k8s. It writes validated custom-format dumps
     # to the dedicated backup PVC and authoritative Azure Blob destination,
