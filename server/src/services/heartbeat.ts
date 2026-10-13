@@ -1307,6 +1307,8 @@ const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_CAUSE = "execution_review_participan
 const GITHUB_PR_WORKFLOW_SKILL_KEY = "paperclipai/bundled/software-development/github-pr-workflow";
 const GITHUB_PR_WORKFLOW_SKILL_SLUG = "github-pr-workflow";
 const GH_SEAT_TOKEN_ENV_KEY = "GH_SEAT_TOKEN_VALUE";
+const SCCACHE_ACCESS_KEY_ID_ENV_KEY = "SCCACHE_ACCESS_KEY_ID";
+const SCCACHE_SECRET_ACCESS_KEY_ENV_KEY = "SCCACHE_SECRET_ACCESS_KEY";
 const STANDARD_GITHUB_CREDENTIAL_ENV_KEYS = ["GH_TOKEN", "GITHUB_TOKEN"] as const;
 
 // GH_SEAT_TOKEN_VALUE is a first-class member of this contract, not an
@@ -2508,23 +2510,28 @@ function stripPaperclipRuntimeEnvFromAdapterConfig(config: Record<string, unknow
 // must therefore only ever be settable at agent scope.
 //
 // GH_SEAT_TOKEN_VALUE is read by scripts/gh-token-wrapper.sh in precedence
-// above the mounted App token, so any scope able to set it can swap the
-// identity every `gh` invocation runs as, or park whitespace there and fail
-// them all with exit 64. Environment, project and routine env are overlaid
-// *after* agent-scope resolution (see below), so without this filter the
-// lowest-trust writer would win, not the highest. The issue-level adapter
-// override reaches the same key by a second route, one overlay earlier — see
+// above the mounted App token, while the SCCACHE_* keys select the private
+// compiler-cache writer identity. Any lower-trust scope able to set one of
+// these keys can swap the identity or park whitespace there and fail the
+// invocation. Environment, project and routine env are overlaid *after*
+// agent-scope resolution (see below), so without this filter the lowest-trust
+// writer would win, not the highest. The issue-level adapter override reaches
+// the same keys by a second route, one overlay earlier — see
 // withAgentScopedEnvProvenance.
 //
 // Before BLO-18927 the `PAPERCLIP_` prefix gave this protection for free at
-// every scope. Renaming the key out of that namespace was necessary to reach
+// every scope. Renaming these keys out of that namespace was necessary to reach
 // agent scope at all — isPaperclipRuntimeEnvKey strips the prefix *before*
-// agent resolution — and this restores the protection for the scopes that
-// never needed the exemption.
+// agent resolution — and this restores the protection for the lower-trust
+// scopes that never needed the exemption.
 //
 // Deliberately NOT folded into isPaperclipRuntimeEnvKey: that guard strips at
 // every scope including agent, which is precisely what this key must escape.
-const AGENT_SCOPE_ONLY_ENV_KEYS = new Set([GH_SEAT_TOKEN_ENV_KEY]);
+const AGENT_SCOPE_ONLY_ENV_KEYS = new Set([
+  GH_SEAT_TOKEN_ENV_KEY,
+  SCCACHE_ACCESS_KEY_ID_ENV_KEY,
+  SCCACHE_SECRET_ACCESS_KEY_ENV_KEY,
+]);
 
 function isAgentScopeOnlyEnvKey(key: string) {
   return AGENT_SCOPE_ONLY_ENV_KEYS.has(key);
