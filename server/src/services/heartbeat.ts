@@ -30183,9 +30183,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // does not own the adapter lifecycle, so dispatching here resolves to the
     // process-fallback adapter and dies with "Process adapter missing command".
     // The workers tier (paperclipNodeRole !== "api") owns run execution; leave
-    // the run queued for it. Worker stays a singleton until an atomic per-run
-    // claim (FOR UPDATE SKIP LOCKED / leader election) is added — do NOT scale
-    // workers >1 before then, or N workers will double-dispatch.
+    // the run queued for it.
+    //
+    // Cross-replica exclusion (BLO-44457). `withAgentStartLock` below is
+    // in-process only, so with workers >1 two passes for one agent can run at
+    // once (timer leader + an HTTP wake on the other replica). What the
+    // DATABASE enforces regardless — pinned by dispatch-cross-process-claim.test.ts:
+    //  - per run: every queued->running transition is a CAS on
+    //    status='queued' (claimQueuedRun / claimRunWithExternalRuntimeSlotOutcome),
+    //    so no run is claimed twice;
+    //  - per agent, external-lifecycle adapters (claude_k8s, opencode_k8s):
+    //    maxConcurrentRuns is the partial unique index
+    //    external_runtime_reservations_active_slot_idx (agent_id, slot_id);
+    //  - exclusive PR-review task keys: pg_advisory_xact_lock in canClaimPrReviewTask.
+    // Still in-process only — read before raising workers >1:
+    //  - local adapters (claude_local, codex_local, ...): maxConcurrentRuns is
+    //    countRunsOccupyingSlots under the start lock, so N replicas can run up
+    //    to N x the cap for one agent (each run still claimed once);
+    //  - pre-claim side effects of a pass (orphan reap, duplicate/terminal-issue
+    //    pruning, claimQueuedRun's cancellations) run on per-replica snapshots
+    //    and can execute concurrently; their writes are status-CAS'd, not locked;
+    //  - resumeRunningExternalRuntimeRuns re-executes RUNNING runs guarded only
+    //    by activeRunExecutions (startup path — lease-gated under BLO-45212).
     if (paperclipNodeRole === "api") {
       logger.debug(
         { agentId, role: paperclipNodeRole },
