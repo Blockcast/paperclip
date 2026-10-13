@@ -85,6 +85,18 @@ export function chooseRun(runs, { headSha, headRef, repository }) {
 export function rerunDecision(run, lockJobs, manual = false) {
   if (run === null) return { rerun: false, reason: `no pull_request run of ${PR_WORKFLOW_FILE} at this head` };
   if (run.status !== "completed") {
+    // Live is only "covered" while the run's own hold has yet to read the
+    // verdict. Once it has concluded, the verdict is frozen out of this run;
+    // the workflow_run arm re-evaluates it on completion (BLO-45984).
+    const lock = lockJobs.find((job) => job?.name === LOCK_JOB_NAME);
+    if (typeof lock?.conclusion === "string" && lock.conclusion !== "success") {
+      return {
+        rerun: false,
+        reason:
+          `run ${run.id} is ${run.status} but its '${LOCK_JOB_NAME}' job already concluded ${lock.conclusion}, ` +
+          `so it cannot see this verdict; deferred to the workflow_run arm when the run completes`,
+      };
+    }
     return { rerun: false, reason: `run ${run.id} is ${run.status} (attempt ${run.run_attempt}); covered while live` };
   }
   if (manual && ['failure', 'cancelled', 'timed_out'].includes(run.conclusion)) {
@@ -259,9 +271,9 @@ async function resolve() {
     }
     return setOutputs({ pr_number: number, head_sha: head });
   }
-  if (event === "check_run") {
+  if (event === "check_run" || event === "workflow_run") {
     const head = process.env.CHECK_HEAD_SHA ?? "";
-    if (!FULL_SHA.test(head)) throw new Error(`check_run head_sha is not a full SHA: ${JSON.stringify(head)}`);
+    if (!FULL_SHA.test(head)) throw new Error(`${event} head_sha is not a full SHA: ${JSON.stringify(head)}`);
     const baseRef = process.env.DEFAULT_BRANCH ?? "";
     const pulls = await api.get(`/repos/${repository}/commits/${head}/pulls?per_page=100`);
     const numbers = pullsForHead(Array.isArray(pulls) ? pulls : [], { headSha: head, repository, baseRef });
@@ -298,7 +310,7 @@ async function unlock() {
     `/repos/${repository}/actions/workflows/${PR_WORKFLOW_FILE}/runs?head_sha=${headSha}&event=pull_request&per_page=100`,
   );
   const run = chooseRun(runs?.workflow_runs ?? [], { headSha, headRef: pull.head.ref, repository });
-  const jobs = run === null || run.status !== "completed" || run.run_attempt !== 1
+  const jobs = run === null || run.run_attempt !== 1
     ? []
     : (await api.get(`/repos/${repository}/actions/runs/${run.id}/jobs?filter=latest&per_page=100`))?.jobs ?? [];
   const decision = rerunDecision(run, jobs, manual);
