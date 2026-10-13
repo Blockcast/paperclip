@@ -3942,17 +3942,34 @@ function buildRecoveredStateRecord(
  *
  * Deliberately a mirrored literal and not an import: it lives in
  * `PROXY_REQUEST_TIMEOUT_MS` (server/src/routes/worker-tier-proxy.ts), which is
- * host-side code this plugin worker cannot import. Nothing here enforces it —
- * it is used to label a delivery that has already blown past it, so a drift
- * between the two values costs a mislabelled metric, never a behaviour change.
+ * host-side code this plugin worker cannot import. It labels a delivery that
+ * has already blown past it, and `DELIVERY_BUDGET_MS` is derived from it.
  */
 const WORKER_PROXY_DEADLINE_MS = 120_000;
 
 /**
+ * Elapsed time after which a delivery stops starting new alerts and fails
+ * itself, so Alertmanager retries the remainder (BLO-37485).
+ *
+ * Without it the API tier abandons the request at 120s while this loop keeps
+ * running: the invocation scope dies, every remaining alert throws a
+ * `state.get` scope denial (BLO-42749's error storm), and the orphaned handler
+ * competes with Alertmanager's retry of the same batch. Measured 2026-10-13: a
+ * 113-alert `MasterGateQueueWedged` group at ~1–6s/alert crossed 120s three
+ * times before converging. Processing is idempotent per fingerprint, so a
+ * retry resumes cheaply and the batch still converges — just without the
+ * abandoned tail.
+ *
+ * 30s of headroom covers the slowest single alert observed (~6s) plus
+ * transport and queueing ahead of handler entry, which this clock cannot see.
+ */
+const DELIVERY_BUDGET_MS = WORKER_PROXY_DEADLINE_MS - 30_000;
+
+/**
  * Elapsed wall-clock at which a single delivery logs which alert it is on.
  *
- * Half the proxy deadline, deliberately. This handler has no deadline of its
- * own — it always runs the whole batch to completion — so the 504 Alertmanager
+ * Half the proxy deadline, deliberately. Before `DELIVERY_BUDGET_MS` existed
+ * this handler always ran the whole batch to completion, so the 504 Alertmanager
  * sees is emitted by the *API tier* while this loop is still running, and the
  * worker has never recorded what it was doing at the time. That is why
  * BLO-37485 read as "invisible from the worker side": the evidence was not
@@ -4112,6 +4129,22 @@ export async function handleWebhook(
     // alert: a batch can be slow and then spend its last seconds on filtered
     // alerts, and that is still the delivery that gets abandoned.
     if (inFlight) reportIfSlow(inFlight);
+    if (performance.now() - deliveryStartedAt >= DELIVERY_BUDGET_MS) {
+      const remaining = body.alerts.slice(alertIndex);
+      ctx.logger.warn(
+        `paperclip-plugin-alertmanager: delivery budget ${DELIVERY_BUDGET_MS}ms exhausted after ${alertIndex} of ${body.alerts.length} alerts; failing the delivery so Alertmanager retries the remaining ${remaining.length}`,
+      );
+      failedFingerprints.push(...remaining.map((a) => a.fingerprint));
+      inFlight = undefined;
+      try {
+        await ctx.metrics.write("alertmanager.webhook.budget_exhausted", 1);
+      } catch (metricErr) {
+        ctx.logger.error(
+          `paperclip-plugin-alertmanager: failed to record budget_exhausted metric: ${String(metricErr)}`,
+        );
+      }
+      break;
+    }
     inFlight = { alertIndex, alert, startedAt: performance.now() };
 
     if (!alertMatchesLabelFilter(alert, config.acceptOnlyLabels)) {
