@@ -1323,9 +1323,35 @@ function isFullEnvDump(command) {
   if (SAFE_ENV_INSPECTION_RE.test(normalized)) return false;
   return containsDump(normalized, 0);
 }
+// BLO-29965. A git push or PR open is the side effect a duplicate run makes
+// visible to the world: two runs of one agent once each opened a PR for the
+// same issue, and one push collided with the other's. Inbox selection and
+// checkout can both be bypassed (a run that never calls checkout, or one that
+// lost the lock mid-run), so re-assert the lock HERE, at the moment of the
+// side effect. Only matching commands pay the network call. Every unknown
+// fails OPEN: no task id (PR-review runs carry none), no credentials, an
+// unreachable API, or a lock nobody holds all allow — this blocks only when
+// the server positively names a DIFFERENT run as the issue's lock holder.
+const OUTWARD_RE = /(?:^|[^\w-])git(?:\s+-[cC]\s+\S+|\s+--?[\w-]+(?:=\S+)?)*\s+push\b|(?:^|[^\w-])gh\s+pr\s+create\b/;
+async function foreignLockHolder(command) {
+  if (!OUTWARD_RE.test(command)) return null;
+  const env = process.env;
+  const task = env.PAPERCLIP_TASK_ID, run = env.PAPERCLIP_RUN_ID;
+  const api = env.PAPERCLIP_API_URL, key = env.PAPERCLIP_API_KEY;
+  if (!task || !run || !api || !key) return null;
+  const res = await fetch(api.replace(/\/+$/, "") + "/api/issues/" + encodeURIComponent(task), {
+    headers: { authorization: "Bearer " + key },
+    signal: AbortSignal.timeout(10000),
+  });
+  if (!res.ok) return null;
+  const issue = await res.json();
+  const holder = issue && issue.executionRunId;
+  if (!holder || holder === run) return null;
+  return { holder, run, issue: issue.identifier || task, id: issue.id || task };
+}
 let raw = "";
 process.stdin.on("data", (d) => { raw += d; });
-process.stdin.on("end", () => {
+process.stdin.on("end", async () => {
   try {
     const evt = JSON.parse(raw || "{}");
     const tool = evt.tool_name || evt.toolName || "";
@@ -1342,6 +1368,21 @@ process.stdin.on("end", () => {
           "because they leak secret-bearing runtime variables into the run transcript. " +
           "To inspect environment variable NAMES safely, run: node " +
           helperArg + "\n",
+      );
+      process.exit(2);
+    }
+    const foreign = /^(?:Bash|Shell)$/i.test(String(tool)) && command
+      ? await foreignLockHolder(String(command))
+      : null;
+    if (foreign) {
+      process.stderr.write(
+        "Blocked by Paperclip lock guard (BLO-29965): this command pushes to a git " +
+          "remote or opens a PR for " + foreign.issue + ", but that issue's execution " +
+          "lock is held by run " + foreign.holder + ", not this run (" + foreign.run +
+          "). Another run may be working the same issue. Re-assert the lock first " +
+          "(paperclipCheckoutIssue, or POST /api/issues/" + foreign.id + "/checkout " +
+          "with your agentId). If checkout returns 409, STOP: a live run owns this " +
+          "issue and your push would duplicate or collide with its work.\n",
       );
       process.exit(2);
     }
