@@ -192,17 +192,6 @@ const WORKER_ONLY_ENV_LITERALS = new Map([
     "PAPERCLIP_STRANDED_RECOVERY_HAND_BACK_DRAIN_ENABLED",
     "server-side scheduler flag; no agent-side reader",
   ],
-  [
-    // PEN-3631. Read once by config.ts and consulted only by the heap-snapshot
-    // poll in index.ts, which is gated on `paperclipNodeRole !== "api"`. An
-    // agent Job pod does not run the paperclip server process at all, so there
-    // is no reader there under any role — inheriting it could only ever be
-    // noise. It is also the wrong thing to spend allowlist budget on: the
-    // snapshot it enables serialises every string on the heap, so the one
-    // process that should act on this flag is the worker and nothing else.
-    "PAPERCLIP_HEAP_SNAPSHOT_ENABLED",
-    "worker-process diagnostic; agent Jobs run no paperclip server",
-  ],
 ]);
 
 test("every literal worker.extraEnv name is inheritable by agent Jobs", () => {
@@ -355,25 +344,34 @@ test("the hand-back drain flag is enabled on the scheduler tier only", () => {
   );
 });
 
-// PEN-3631. Same shape as the drain flag above, and same reason for asserting
-// placement rather than presence: index.ts builds the heap-snapshot poll inside
-// `if (config.paperclipNodeRole !== "api")`, so the flag on the API Deployment
-// is read, stored, and never consulted — a no-op that deploys green.
-test("the heap-snapshot flag is enabled on the worker tier only, with no threshold", () => {
+// PEN-3631. Capture is OFF again, which is config.ts's default, and this test
+// is the record that turning it back on is a decision rather than a default.
+//
+// This pins ABSENCE, which is normally a weak thing to assert — so note what
+// makes it load-bearing here: the file this flag enables is a credential.
+// `v8.writeHeapSnapshot()` serialises every reachable string, including the
+// GitHub App private key and `DATABASE_URL`, onto a ReadWriteMany claim that
+// every agent pod mounts as the same uid. Leaving capture enabled past the
+// investigation that needed it is how that exposure becomes permanent, and
+// nothing else in the tree would have noticed.
+//
+// Re-enabling is a one-line values change plus flipping this assertion back to
+// `'"true"'` (config.ts compares `=== "true"`, so the literal matters). Doing
+// both is the point: the second edit is where someone has to say why.
+test("heap-snapshot capture is disabled on both tiers, with no threshold", () => {
   const worker = render("templates/statefulset.yaml");
   assert.equal(
     effectiveEnv(worker, "PAPERCLIP_HEAP_SNAPSHOT_ENABLED"),
-    '"true"',
-    'worker must enable capture with the literal string "true" — config.ts compares === "true"',
+    undefined,
+    "capture must stay off unless an investigation is open — see PEN-3631",
   );
 
-  // The threshold must stay UNSET (config default 0 = automatic capture off),
-  // and this is a real invariant rather than a restatement of the values file.
-  // The deliverable is a deliberate pair of snapshots hours apart; `keep`
-  // defaults to 2, so an unattended threshold capture firing between them
-  // evicts half the pair, and that half cannot be retaken. Capture is driven by
-  // the sentinel file, which any pod on the shared claim can drop. Setting a
-  // threshold here without raising `keep` is the regression this pins.
+  // The threshold must stay UNSET (config default 0 = automatic capture off).
+  // This outlives the enablement above and is the invariant worth keeping: if
+  // capture is turned back on, the deliverable is a deliberate pair of
+  // snapshots hours apart, and `keep` defaults to 2 — so an unattended
+  // threshold capture firing between them evicts half the pair, which cannot
+  // be retaken. Setting a threshold without raising `keep` is that regression.
   assert.equal(
     effectiveEnv(worker, "PAPERCLIP_HEAP_SNAPSHOT_THRESHOLD_MB"),
     undefined,
