@@ -277,6 +277,7 @@ import {
 import {
   buildHeartbeatRunStopMetadata,
   mergeHeartbeatRunStopMetadata,
+  readObservedHeartbeatRunTimeout,
   normalizeMaxTurnStopReason,
 } from "./heartbeat-stop-metadata.js";
 import {
@@ -25238,6 +25239,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       outcome,
       errorCode: options?.errorCode ?? null,
       errorMessage: options?.errorMessage ?? null,
+      // PEN-4023: the adapter may have measured the bound that actually killed
+      // the run, which can be one `adapterConfig` knows nothing about — the
+      // k8s Job's `activeDeadlineSeconds`. It rides in on the adapter's own
+      // resultJson, which is this same object, so no new plumbing is needed.
+      observedTimeout: readObservedHeartbeatRunTimeout(options?.resultJson),
     });
     return mergeHeartbeatRunStopMetadata(options?.resultJson ?? null, stopMetadata);
   }
