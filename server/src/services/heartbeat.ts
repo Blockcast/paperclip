@@ -22394,10 +22394,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : null;
     // BLO-45251: a pr_review 429 park carries no transient family, so its floor
     // is the server-parsed reset instant (already bounded by the parser's cap).
+    const prReviewRefusalRetryNotBefore =
+      clampedTransientRetry || transientRetryNotBefore
+        ? null
+        : readPrReviewProviderCapacityRefusalRetryNotBefore(run);
     const effectiveRetryNotBefore =
-      clampedTransientRetry?.dueAt ??
-      transientRetryNotBefore ??
-      readPrReviewProviderCapacityRefusalRetryNotBefore(run);
+      clampedTransientRetry?.dueAt ?? transientRetryNotBefore ?? prReviewRefusalRetryNotBefore;
     // PEN-2509: the floor is adopted verbatim below, and an advertised floor is
     // an absolute instant shared by every run that saw the same denial — so
     // "adopt verbatim" is also "resume in lockstep". Disperse it forward before
@@ -22423,8 +22425,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // advertised instant, shared verbatim by every run that saw the same
     // denial, parked as `transient_failure`. That is the only floor that forms
     // a herd here, and the only one dispersed below.
+    //
+    // BLO-45251: the pr_review refusal floor is that same raw instant. It carries
+    // capacity provenance but never went through the resolver's jitter, so it
+    // must not inherit the capacity exemption. Its `over_horizon` park is
+    // `now + cap` at the reconciler pass, which runs refused in one pass share.
     const floorAlreadyDispersed =
-      clampedTransientRetry?.clampedFromIso != null || isCapacityGovernedRetryFloor(run.resultJson);
+      prReviewRefusalRetryNotBefore === null &&
+      (clampedTransientRetry?.clampedFromIso != null || isCapacityGovernedRetryFloor(run.resultJson));
     const flooredDueAt =
       effectiveRetryNotBefore && effectiveRetryNotBefore.getTime() > baseSchedule.dueAt.getTime()
         ? floorAlreadyDispersed
