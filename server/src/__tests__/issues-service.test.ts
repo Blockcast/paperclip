@@ -675,6 +675,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
         description: null,
         status,
         priority: "medium",
+        assigneeAgentId: agentId,
       });
       const runId = randomUUID();
       await db.insert(heartbeatRuns).values({
@@ -1252,7 +1253,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
       description: null,
       status: "todo",
       priority: "medium",
-      assigneeAgentId: null,
+      assigneeAgentId: agentId,
     });
 
     const checkedOut = await svc.checkout(issue.id, agentId, ["todo"], checkoutRunId);
@@ -9133,6 +9134,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -9863,6 +9865,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     await expect(svc.update(issue.id, {
       assigneeAgentId: agentId,
+      assigneeUserId: null,
       executionWorkspaceSettings: {
         mode: "isolated_workspace",
         workspaceStrategy: { type: "git_worktree" },
@@ -12256,6 +12259,7 @@ describeEmbeddedPostgres("issueService cross-company parentId (BLO-28635)", () =
     const companyId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name,
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
