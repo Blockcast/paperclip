@@ -167,11 +167,6 @@ const SEED_COVERAGE: Readonly<Record<string, Coverage>> = {
     ticket: "PEN-2737",
     why: "direct to tempo.monitoring; ASSESSED no-disclosure (PEN-2630) on contents — no instrumentation in this estate captures headers or bodies (headersToSpanAttributes, capture_headers, OTEL_INSTRUMENTATION_* all absent estate-wide; paperclip's tracer is unwired) — but the transport is still unscrubbed and nothing ENFORCES that verdict: no auth, no NetworkPolicy, no redaction processor, and any pod may write spans, so PEN-2737 tracks turning the observation into an invariant",
   },
-  gbrain: {
-    kind: "unscrubbed",
-    ticket: "PEN-2428",
-    why: "optional shell-interpolated entry; when OAuth minting succeeds the admin shape dials gbrain directly and carries a minted Authorization header for the shared paperclip:Blockcast:CEO OAuth client that PEN-2428 owns",
-  },
   "k8s-ro": {
     kind: "gateway-scrubbed",
   },
@@ -183,10 +178,16 @@ type SeedEntry = { type?: string; url?: string; command?: string; args?: string[
  * Extract the `mcpServers` JSON the init script heredocs into `.mcp.json`.
  *
  * The heredoc is shell, not JSON: it interpolates `${MCP_BRIDGE_JS}` inside a
- * string and `${GBRAIN_ENTRY}` in bare value position. Both are replaced with a
- * `<shell:NAME>` sentinel so the block parses, which keeps this test honest about
- * entries whose concrete value is only known at pod boot — they still have to be
- * classified.
+ * string, and a future entry may interpolate a whole value in bare position
+ * (`"name": ${VAR}`). Both are replaced with a `<shell:NAME>` sentinel so the
+ * block parses, which keeps this test honest about entries whose concrete value
+ * is only known at pod boot — they still have to be classified.
+ *
+ * The bare-value substitution is kept even though no seeded entry uses one
+ * today: gbrain was the last, and it was removed with the shared-identity
+ * baseline entry (PEN-2428 step 3). Dropping the substitution would make the
+ * next such entry a JSON parse error at best and a silently unclassified
+ * upstream at worst.
  */
 function readSeededMcpServers(): Record<string, SeedEntry | string> {
   const source = readFileSync(statefulSetPath, "utf8");
@@ -205,14 +206,7 @@ function readSeededMcpServers(): Record<string, SeedEntry | string> {
 
   const normalised = source
     .slice(bodyStart, bodyEnd)
-    // The seed builds the optional gbrain member as a structural shell
-    // fragment (`GBRAIN_JSON`), so replace that fragment with a sentinel member
-    // before parsing the surrounding JSON.
-    .replace(
-      /\$\{GBRAIN_JSON\}/g,
-      ',\n                  "gbrain": "<shell:GBRAIN_ENTRY_OPTIONAL>"',
-    )
-    // bare value position: `"gbrain": ${GBRAIN_ENTRY}` -> a quoted sentinel
+    // bare value position: `"name": ${VAR}` -> a quoted sentinel
     .replace(/:\s*\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, ': "<shell:$1>"')
     // remaining interpolations are already inside quotes
     .replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, "<shell:$1>");
@@ -291,14 +285,19 @@ type EntryShape = {
 /**
  * Expand a seeded entry into every concrete shape it can have at runtime.
  *
- * The seed is not static: `"gbrain": ${GBRAIN_ENTRY}` is one JSON key with *two*
- * possible expansions (a bridge fallback and a minted-Bearer admin URL), and the
- * heredoc normaliser above collapses both to a single `<shell:GBRAIN_ENTRY>`
- * sentinel. Any check that reads a host straight off the sentinel gets `null` and
- * then *passes vacuously* — which is how a shell-interpolated upstream could be
- * moved behind the gateway with this audit none the wiser. So resolve the
- * sentinel back through the init script's own assignments and return one shape
- * per assignment, so each is asserted on separately.
+ * The seed need not be static: an entry written as `"name": ${VAR}` can have
+ * several possible expansions, and the heredoc normaliser above collapses them
+ * all to a single `<shell:VAR>` sentinel. Any check that reads a host straight
+ * off the sentinel gets `null` and then *passes vacuously* — which is how a
+ * shell-interpolated upstream could be moved behind the gateway with this audit
+ * none the wiser. So resolve the sentinel back through the init script's own
+ * assignments and return one shape per assignment, so each is asserted on
+ * separately.
+ *
+ * No seeded entry uses this form today (gbrain was the last; PEN-2428 step 3
+ * removed it). The branch is retained rather than deleted because it is what
+ * makes the NEXT such entry fail closed instead of vacuously pass, and it is
+ * pinned by injection below rather than by whatever the seed happens to contain.
  */
 function resolveEntryShapes(
   name: string,
@@ -315,14 +314,9 @@ function resolveEntryShapes(
     typeof entry === "string" ? /^<shell:([A-Za-z_][A-Za-z0-9_]*)>$/.exec(entry) : null;
 
   if (wholeEntrySentinel) {
-    const varName = wholeEntrySentinel[1]!;
-    const optional = varName === "GBRAIN_ENTRY_OPTIONAL";
-    const assignmentVar = optional ? "GBRAIN_ENTRY" : varName;
-    const assignments = assignmentsOf(assignmentVar).filter((rhs) =>
-      optional ? urlsIn(rhs).hosts.length > 0 : true,
-    );
+    const assignmentVar = wholeEntrySentinel[1]!;
+    const assignments = assignmentsOf(assignmentVar);
     if (assignments.length === 0) {
-      if (optional) return [];
       throw new Error(
         `Upstream '${name}' is seeded as the shell variable ${assignmentVar}, but no '${assignmentVar}=' ` +
           `assignment could be found in ${path.relative(repoRoot, statefulSetPath)}. Its runtime ` +
@@ -564,18 +558,44 @@ describe("agent-facing MCP seed is audited for scrub coverage (PEN-2370 b1/b2)",
     }
   });
 
-  it("shell-interpolated entries are expanded to every shape they can boot as", () => {
-    // Guards the resolver that the test above depends on. `"gbrain": ${GBRAIN_ENTRY}`
-    // normalises to a bare sentinel, so `hostOf` returns null for it; a host check
-    // written against that would pass vacuously forever. Pin the expansion so that
-    // if the resolver ever silently stops resolving, it fails HERE — loudly and at
-    // the person who broke it — rather than quietly draining the assertions above.
-    const shapes = resolveEntryShapes("gbrain", seeded.gbrain!);
-    expect(shapes.length, "GBRAIN_ENTRY has an optional minted-Bearer admin form that must be audited.").toBeGreaterThanOrEqual(1);
+  it("a whole-entry shell sentinel is expanded to every shape it can boot as", () => {
+    // Guards the resolver branch the audit above depends on. An entry whose
+    // ENTIRE value is `${VAR}` normalises to a bare `<shell:VAR>` sentinel, so
+    // `hostOf` returns null for it and a host check written against it would pass
+    // vacuously forever.
+    //
+    // This used to be keyed to the real `gbrain` entry. That entry is gone
+    // (PEN-2428 step 3 removed the shared-identity baseline entry), so the guard
+    // is driven through the injection seam instead — matching the sibling
+    // regression below, and for the reason stated there: the shapes this must
+    // resolve are the ones nobody has written into the init script *yet*. A guard
+    // keyed to today's seed goes quiet exactly when the seed changes, which is
+    // the moment it is needed.
+    const shapes = resolveEntryShapes("probe", "<shell:PROBE_ENTRY>", (v) =>
+      v === "PROBE_ENTRY"
+        ? [
+            '{type:"http", url:"http://first.svc.cluster.local:3130/mcp"}',
+            '{type:"http", url:"http://second.svc.cluster.local:3130/mcp"}',
+          ]
+        : [],
+    );
 
+    expect(
+      shapes.length,
+      "Each assignment must surface as its own shape so each is asserted on separately; " +
+        "collapsing them lets one safe expansion vouch for an unsafe sibling.",
+    ).toBe(2);
     const hosts = shapes.flatMap((s) => s.hosts);
-    expect(hosts).toContain("gbrain-mcp-admin.paperclip.svc.cluster.local");
+    expect(hosts).toContain("first.svc.cluster.local");
+    expect(hosts).toContain("second.svc.cluster.local");
     expect(shapes.flatMap((s) => s.unresolved)).toEqual([]);
+
+    // And it must fail CLOSED when the variable cannot be found at all: a
+    // sentinel whose assignments have vanished means the runtime host is
+    // unknown, which must never read as "resolved cleanly".
+    expect(() => resolveEntryShapes("probe", "<shell:GONE>", () => [])).toThrow(
+      /no 'GONE=' assignment/,
+    );
   });
 
   it("a resolvable shape never vouches for an unresolvable one", () => {
