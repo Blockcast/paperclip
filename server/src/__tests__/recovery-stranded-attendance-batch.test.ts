@@ -69,6 +69,31 @@ describeEmbeddedPostgres("stranded attendance batch/single-issue equivalence (PE
     NonNullable<Parameters<typeof recoveryService>[1]["attendancePredicatesForTest"]>
   >[0];
 
+  /**
+   * The exhaustiveness the seam's own comment claims, which nothing else in this file
+   * supplies. `assertEquivalent` reaches the predicates by DESTRUCTURING three named
+   * fields, and destructuring a subset stays legal TypeScript however wide
+   * `AttendancePredicates` grows — so a fourth predicate joining the trio would compile
+   * here and silently get no equivalence coverage. That is the harmful direction for
+   * this sweep specifically: a term lost from the comparison reads as "unattended", and
+   * "unattended" ends in an escalation, which mutates state rather than deferring.
+   *
+   * `satisfies` turns that omission into a `tsc` failure at this literal — but ONLY
+   * because this file is listed in `server/tsconfig.tests.json`. Nothing else
+   * typechecks `src/__tests__/`: `tsconfig.json` excludes it, `tsconfig.typecheck.json`
+   * sees it but is documented as never gated on tsc's exit code (its consumer filters to
+   * TS2304/2552/2662/2663, and this is TS1360), and vitest strips types without checking
+   * them. Measured: with the allowlist entry removed, a fourth predicate added to the
+   * seam leaves `typecheck:tests` at exit 0 and zero errors. So dropping that entry
+   * retires this pin silently — which is exactly the failure mode that config's own
+   * "//ratchet-is-continuous" note warns about.
+   */
+  const COVERED_PREDICATES = {
+    hasActiveExecutionPath: true,
+    hasPendingWakeInteraction: true,
+    readStrandedAttendanceWindow: true,
+  } satisfies Record<keyof AttendancePredicates, true>;
+
   function attendancePredicates(): AttendancePredicates {
     const captured: AttendancePredicates[] = [];
     recoveryService(db, {
@@ -81,6 +106,13 @@ describeEmbeddedPostgres("stranded attendance batch/single-issue equivalence (PE
     if (!predicates) {
       throw new Error("recoveryService did not hand out the attendance predicates");
     }
+    // Runtime half of the same claim: `satisfies` above pins the key set of the TYPE,
+    // this pins the keys of the object actually handed out. Redundant while the seam
+    // passes an object literal — excess-property checking already covers that — and
+    // kept deliberately, because it is what makes COVERED_PREDICATES a READ rather than
+    // a dead declaration. Without it the pin is removable as unused and the compile
+    // error it buys disappears silently.
+    expect(Object.keys(predicates).sort()).toEqual(Object.keys(COVERED_PREDICATES).sort());
     return predicates;
   }
 

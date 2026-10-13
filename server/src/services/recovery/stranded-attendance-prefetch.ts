@@ -80,8 +80,9 @@
  * 3. `ttlMs` is bounded independently of pass duration, so a 51-minute pass cannot
  *    widen it.
  *
- * ⛔ A stronger mitigation was designed and is deliberately NOT built here, recorded so
- * the omission is a choice rather than an oversight: re-read `hasActiveExecutionPath`
+ * ⛔ A stronger mitigation was designed and is deliberately NOT built here. It is
+ * tracked as PEN-3978 rather than left as prose, so the omission is a choice with a
+ * successor rather than an oversight: re-read `hasActiveExecutionPath`
  * live **inside** `escalateStrandedAssignedIssue`'s transaction, after
  * `lockIssueOwnership`. That would be strictly SAFER than master — under the per-issue
  * advisory lock a concurrent checkout cannot interleave at all — and it is cheap,
