@@ -313,11 +313,52 @@ export function classifyRunLiveness(input: RunLivenessClassificationInput): RunL
   const planExempt = isPlanningOrDocumentTask(input.issue) || evidence.planDocumentRevisionsCreated > 0;
   const lastUsefulActionAt = concreteEvidence ? evidence.latestEvidenceAt : null;
 
+  // PEN-4035: the stamp is kept whenever concrete evidence exists, WHATEVER the
+  // terminal state. This used to be gated on `advanced | completed | blocked`,
+  // which deleted a value derived from real collected evidence one line after
+  // deriving it -- and `classifyAndPersistRunLiveness` writes the result
+  // unconditionally, so the null also OVERWROTE the live stamp that
+  // flushOutputProgress had already written during the run. The field did not
+  // merely fail to populate; it was destroyed at finalization.
+  //
+  // The gate was only ever load-bearing for the two states reachable WITH
+  // evidence: `failed` (any non-succeeded run status) and the `interrupted`
+  // -> `needs_followup` arm. Every other non-kept state is returned from a
+  // branch guarded by `!concreteEvidence`, so the stamp is null there on its
+  // own account and removing the gate cannot change it.
+  //
+  // Measured consequence of the gate (n=1000 runs, 2026-10-11 -> 2026-10-13):
+  // every fault class resolving to `failed` read 0% non-null -- rate_limit_
+  // exhausted 0/57, timed_out 0/9, claude_transient_upstream 0/9,
+  // acpx_turn_failed 0/7 -- while `cancelled` read 22/22. 8 of 63
+  // rate_limit_exhausted runs had authored a durable issue comment while the
+  // field read null, so the zero was manufactured here, not observed.
+  //
+  // Consumers, each re-checked rather than assumed (see PEN-4035 for the audit):
+  //  - agent-concurrency.ts `isRunOccupyingSlot`: Math.max of the three stamps,
+  //    so a newly non-null value can only move the answer toward "occupied",
+  //    which is the non-destructive direction BLO-20775 chose deliberately.
+  //  - heartbeat.ts `externalLifecycleRecentRefTime`, productivity-review.ts
+  //    `nonLiveExecutionHoldSince` / `runLiveInterval`, recovery/service.ts
+  //    `scanSilentActiveRuns` / `runningLockStaleBasis`: max/greatest, same.
+  //  - metrics.ts `computeExternalLifecycleSilenceGapSeconds` uses first-non-null
+  //    precedence and WOULD shift -- but all three of its call sites observe the
+  //    run row BEFORE this classification is persisted (heartbeat.ts, the
+  //    recordExternalLifecycleRunSilenceGap call above classifyAndPersistRun-
+  //    Liveness, and the two cancel paths), so the metric never reads a value
+  //    written here. Structurally unaffected, not merely unchanged in practice.
+  //  - issue-run-holding.ts `runLastSignalMs` also uses first-non-null, but
+  //    `isRunHoldingIssue` is status-only (`status === "running"`) and a
+  //    classified row is terminal by definition, so it is unaffected twice over.
+  //  - recovery/service.ts `hasPositiveRunEvidence` filters to
+  //    `livenessState in (completed, advanced)`, both already-kept states.
+  //  - external-runtime-reservation-strand-metrics.ts applies its first-non-null
+  //    COALESCE only to NON-terminal rows; terminal rows match the other arm.
   const output = (state: RunLivenessState, reason: string, nextAction: string | null = null): RunLivenessClassification => ({
     livenessState: state,
     livenessReason: compactReason(reason),
     continuationAttempt,
-    lastUsefulActionAt: state === "advanced" || state === "completed" || state === "blocked" ? lastUsefulActionAt : null,
+    lastUsefulActionAt,
     nextAction,
     actionability,
   });
