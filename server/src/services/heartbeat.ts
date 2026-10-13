@@ -26404,7 +26404,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // different paths, and on TERMINAL rows they do diverge exactly that way —
     // classifyAndPersistRunLiveness stamps lastUsefulActionAt to the last concrete
     // *evidence* time (comment/doc/work-product, often hours old) while leaving
-    // lastOutputAt fresh (run-liveness.ts:314,320).
+    // lastOutputAt fresh (see the `output` helper in run-liveness.ts
+    // classifyRunLiveness). PEN-4035 widened that from the three "good" terminal
+    // states to every state carrying concrete evidence, so the divergence this
+    // max() guards against is now reachable on `failed` rows too.
     //
     // On a RUNNING row consumed HERE they cannot diverge today, and no currently
     // reachable transition makes them: the only writer that touches a live run is
