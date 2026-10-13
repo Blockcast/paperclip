@@ -11566,6 +11566,190 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
 
     /**
+     * PEN-4024 (Ally review of #2588). The probe is scoped to the agent being woken, and this
+     * is the kill for that predicate: drop `eq(heartbeatRuns.agentId, agentId)` from
+     * `hasPendingWakeRunForRecoveryAction` and this test fails while the rest of the file
+     * still passes.
+     *
+     * Unscoped, the probe answers "is a wake for this action pending ANYWHERE" rather than
+     * "is THIS wake still on its way". The two come apart wherever the agent being woken is
+     * not the one the previous attempt woke — `assignee_fallback` wakes the assignee while the
+     * owner holds the park, and an owner change restarts `attemptCount` while the previous
+     * owner's pending run outlives the restart. In both the attempt stays charged for a wake
+     * that reached nobody.
+     *
+     * The fixture is that shape reduced to its mechanism: a pending `scheduled_retry` run
+     * carrying THIS action's `recoveryActionId`, owned by an agent other than the one this
+     * enqueue is waking, while the enqueue itself delivers nothing (a pause hold, a cooldown,
+     * heartbeat disabled). The foreign agent is derived from the agent actually passed in
+     * rather than hardcoded, so the test keeps testing the predicate rather than today's
+     * owner-routing choice.
+     */
+    it("refunds when the only pending wake for the action belongs to a different agent", async () => {
+      const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+      await seedStrandedJobMissingRun({
+        companyId,
+        agentId: coderId,
+        issueId: sourceIssueId,
+        refusedAt: null,
+      });
+      const parked: { runId: string; wokenAgentId: string; foreignAgentId: string }[] = [];
+      const enqueueWakeup = vi.fn(async (agentId: string, opts: any) => {
+        const snapshot = opts?.contextSnapshot ?? {};
+        if (snapshot.source === "issue_recovery_action") {
+          // Whichever agent recovery routed to, park under the OTHER one.
+          const foreignAgentId = agentId === managerId ? coderId : managerId;
+          const runId = randomUUID();
+          parked.push({ runId, wokenAgentId: agentId, foreignAgentId });
+          await db.insert(heartbeatRuns).values({
+            id: runId,
+            companyId,
+            agentId: foreignAgentId,
+            invocationSource: "assignment",
+            status: "scheduled_retry",
+            scheduledRetryAt: new Date("2026-09-07T18:00:00.000Z"),
+            scheduledRetryReason: "ccrotate_capacity",
+            errorCode: "rate_limit_exhausted",
+            contextSnapshot: snapshot,
+          });
+        }
+        return null;
+      });
+      const recovery = recoveryService(db, { enqueueWakeup });
+
+      await recovery.reconcileStrandedAssignedIssues();
+
+      const [action] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
+      // Positive control on the fixture: a row an UNSCOPED probe would have matched really was
+      // committed — right action id, pending status — and it belongs to a different agent.
+      // Without this the refund assertion below could pass because no row existed at all,
+      // which would prove nothing about the agent predicate.
+      expect(parked).toHaveLength(1);
+      expect(parked[0]!.foreignAgentId).not.toBe(parked[0]!.wokenAgentId);
+      const [parkedRun] = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, parked[0]!.runId));
+      expect(parkedRun).toMatchObject({
+        agentId: parked[0]!.foreignAgentId,
+        status: "scheduled_retry",
+      });
+      expect((parkedRun!.contextSnapshot as any).recoveryActionId).toBe(action.id);
+
+      // The agent actually being woken got nothing, so the attempt comes back.
+      expect(action.attemptCount).toBe(0);
+      expect(action.nonDeliverySweepCount).toBeGreaterThanOrEqual(1);
+    });
+
+    /**
+     * PEN-4024 (Ally review of #2588). Two attempts, ONE parked run — the case #2588's own
+     * test never reached, because its mock commits a fresh pending row on every call.
+     *
+     * In production the second wake does not commit a second row: `persistProviderCapacityRetry`
+     * coalesces a later same-task wake into the existing `scheduled_retry` row via
+     * `coalescePendingTaskScopeWake` and still returns `{coalesced: true, deferred: true}`, so
+     * `enqueueWakeup` returns null again against a park that already exists. The mock
+     * reproduces exactly that — park once, return null every time — which is what makes this a
+     * different assertion rather than a rerun of the test above.
+     *
+     * The behaviour pinned here is that BOTH attempts stay spent against that single parked
+     * run. That is deliberate, and this test exists so the next reader does not have to infer
+     * it from the absence of a test:
+     *
+     *   - Refunding the second attempt would be the PEN-3983 defect again. The wake IS still
+     *     on its way, and the coalesce merged this attempt's intent into it rather than
+     *     discarding it, so "never delivered" is exactly as false the second time as the first.
+     *   - The cost is bounded and legible. Worst case the whole budget is spent against one
+     *     park, so the action retires `retiringBound: "attempt_budget"` rather than
+     *     `"timeout_horizon"` — a distinguishable label, not a silent loss. Note that
+     *     `attempt_budget` is written by `retireAndReleaseWakeAttempt` at the exhaustion gate,
+     *     which consults no pending-wake evidence, so it does NOT take PEN-4006's horizon
+     *     deferral (that lives in `escalateExpiredWakeHorizons`, which only ever selects
+     *     `status = 'active'` rows and so cannot see a row this gate already escalated).
+     *
+     * It is also not every sweep. `shouldReuseStrandedRecoveryAction` returns
+     * `unchangedWithoutWakeBudget` for an unchanged action whose routed owner is unchanged, and
+     * the caller bails before reserving anything — so a repeat only reaches the refund site
+     * when the fingerprint, the owner, or the status changed. A fresh `latestRun` id per call
+     * moves the fingerprint, which is how the file's existing multi-attempt tests drive this
+     * and why the attempts here land rather than being reused away.
+     */
+    it("keeps both attempts when two attempts coalesce into one parked run", async () => {
+      const { companyId, coderId, sourceIssue, sourceIssueId } = await seedCompany();
+      const parkedRunIds: string[] = [];
+      const wokenAgentIds: string[] = [];
+      const enqueueWakeup = vi.fn(async (agentId: string, opts: any) => {
+        const snapshot = opts?.contextSnapshot ?? {};
+        if (snapshot.source === "issue_recovery_action") {
+          wokenAgentIds.push(agentId);
+          // Park on the FIRST recovery wake only. Every later one coalesces into that row and
+          // returns null without committing anything — the real gate's behaviour.
+          if (parkedRunIds.length === 0) {
+            const runId = randomUUID();
+            parkedRunIds.push(runId);
+            await db.insert(heartbeatRuns).values({
+              id: runId,
+              companyId,
+              agentId,
+              invocationSource: "assignment",
+              status: "scheduled_retry",
+              scheduledRetryAt: new Date("2026-09-07T18:00:00.000Z"),
+              scheduledRetryReason: "ccrotate_capacity",
+              errorCode: "rate_limit_exhausted",
+              contextSnapshot: snapshot,
+            });
+          }
+        }
+        return null;
+      });
+      const recovery = recoveryService(db, { enqueueWakeup });
+      const baseRun = {
+        agentId: coderId,
+        status: "failed",
+        error: "agent is not invokable",
+        errorCode: "agent_not_invokable",
+        contextSnapshot: { retryReason: "issue_continuation_needed" },
+        livenessState: "needs_followup",
+        resultJson: null,
+        usageJson: null,
+        createdAt: new Date(),
+      } as const;
+
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        await recovery.escalateStrandedAssignedIssue({
+          issue: sourceIssue,
+          previousStatus: "in_progress",
+          latestRun: { ...baseRun, id: randomUUID() },
+          comment: "Automatic continuation recovery failed.",
+        });
+      }
+
+      // Two attempts really did reach the enqueue, against exactly one committed run. Both
+      // halves matter: a second parked row would make this the one-park-per-attempt case the
+      // test above already covers, and a second attempt that never reached the enqueue would
+      // make the `attemptCount` assertion vacuous.
+      expect(parkedRunIds).toHaveLength(1);
+      expect(wokenAgentIds).toHaveLength(2);
+      // Same agent both times, which is why the agent-scoped probe still sees the park. The
+      // scoping added for PEN-4024 narrows the probe without blinding it here, because
+      // `enqueueWakeup` coalesces on `(companyId, agentId, taskKey)`.
+      expect(new Set(wokenAgentIds).size).toBe(1);
+      const [action] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
+      expect(action).toMatchObject({ attemptCount: 2, nonDeliverySweepCount: 0 });
+      const [parkedRun] = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, parkedRunIds[0]!));
+      expect((parkedRun!.contextSnapshot as any).recoveryActionId).toBe(action.id);
+    });
+
+    /**
      * PEN-3983 control. The refund still has to fire on the paths that genuinely queue
      * nothing — a pause hold, a cooldown, wake-on-demand disabled. Without this the fix
      * above could be "never refund", which would restore the unbounded budget BLO-18996

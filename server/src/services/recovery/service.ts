@@ -2571,16 +2571,36 @@ export function recoveryService(
    * `timeoutAt` bounds the row on wall-clock regardless of `attemptCount`, so this cannot
    * reopen the unbounded loop BLO-18996/BLO-19124 closed. Under-crediting is what produced
    * the incident.
+   *
+   * PEN-4024 (Ally review of #2588) narrows that over-crediting with `agentId`. Without it the
+   * question answered is "is a wake for this action pending ANYWHERE", not "is THIS wake still
+   * on its way", and the two come apart on exactly the paths where the woken agent is not the
+   * one the previous attempt woke:
+   *
+   *   - **`assignee_fallback`** wakes the ASSIGNEE while the action's owner is someone else.
+   *     An owner wake still parked on `ccrotate_capacity` would match an assignee enqueue that
+   *     genuinely delivered nothing (pause hold, cooldown, heartbeat disabled), keeping an
+   *     attempt charged for a wake that reached nobody.
+   *   - **Owner change** restarts `attemptCount` at 1 (see the BLO-18996 NOTE at the second
+   *     `enqueueOrRefundAttempt` call site), and the previous owner's pending run outlives
+   *     that restart.
+   *
+   * `agentId` is the correct scope rather than merely a tighter one, because it is the scope
+   * the thing being detected is itself keyed on: `enqueueWakeup` coalesces on
+   * `(companyId, agentId, taskKey)`, so the capacity park this probe exists to see is always
+   * committed against the agent now being woken. Narrowing cannot hide it.
    */
   async function hasPendingWakeRunForRecoveryAction(
     companyId: string,
     recoveryActionId: string,
+    agentId: string,
   ): Promise<boolean> {
     const [row] = await db
       .select({ id: heartbeatRuns.id })
       .from(heartbeatRuns)
       .where(and(
         eq(heartbeatRuns.companyId, companyId),
+        eq(heartbeatRuns.agentId, agentId),
         sql`${heartbeatRuns.contextSnapshot} ->> 'recoveryActionId' = ${recoveryActionId}`,
         inArray(heartbeatRuns.status, [...PENDING_HEARTBEAT_RUN_STATUSES]),
       ))
@@ -6842,6 +6862,7 @@ export function recoveryService(
           wakeIsStillPending = await hasPendingWakeRunForRecoveryAction(
             input.issue.companyId,
             input.action.id,
+            agentId,
           );
         } catch (error) {
           // Fall back to the pre-PEN-3983 behaviour and refund. Over-refunding costs at most
