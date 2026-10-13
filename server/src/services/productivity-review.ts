@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { and, asc, desc, eq, gt, gte, inArray, isNotNull, isNull, lt, lte, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db, DbTransaction } from "@paperclipai/db";
-import { clampIssueRequestDepth, ISSUE_PRODUCTIVITY_REVIEW_TRIGGERS } from "@paperclipai/shared";
+import { clampIssueRequestDepth, ISSUE_PRODUCTIVITY_REVIEW_TRIGGERS, NON_HUMAN_USER_SENTINEL_IDS } from "@paperclipai/shared";
 import type { IssueProductivityReviewTrigger } from "@paperclipai/shared";
 import {
   activityLog,
@@ -5507,6 +5507,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
           eq(companyMemberships.companyId, companyId),
           eq(companyMemberships.principalType, "user"),
           eq(companyMemberships.status, "active"),
+          notInArray(companyMemberships.principalId, [...NON_HUMAN_USER_SENTINEL_IDS]),
         ),
       )
       .orderBy(
