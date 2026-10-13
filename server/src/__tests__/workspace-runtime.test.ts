@@ -5472,6 +5472,82 @@ describe("realizeExecutionWorkspace", () => {
     await expect(fs.stat(control.workspace.cwd)).rejects.toThrow();
   }, 30_000);
 
+  it("refuses an operator archive when worktree cleanliness is unverifiable (BLO-45629)", async () => {
+    const repoRoot = await createTempRepo();
+    const realize = (identifier: string) => realizeExecutionWorkspace({
+      base: {
+        baseCwd: repoRoot,
+        source: "project_primary",
+        projectId: "project-1",
+        workspaceId: "workspace-1",
+        repoUrl: null,
+        repoRef: "HEAD",
+      },
+      config: { workspaceStrategy: { type: "git_worktree", branchTemplate: "{{issue.identifier}}-{{slug}}" } },
+      issue: { id: `issue-${identifier}`, identifier, title: "Unverifiable operator archive" },
+      agent: { id: "agent-1", name: "Codex Coder", companyId: "company-1" },
+    });
+    const cleanupWorktree = async (identifier: string, trigger?: "operator") => {
+      const workspace = await realize(identifier);
+      await fs.writeFile(path.join(workspace.cwd, "uncommitted.txt"), "live work\n");
+      const cleanup = await cleanupExecutionWorkspaceArtifacts({
+        trigger,
+        workspace: {
+          id: `execution-workspace-${identifier}`,
+          cwd: workspace.cwd,
+          providerType: "git_worktree",
+          providerRef: workspace.worktreePath,
+          branchName: workspace.branchName,
+          repoUrl: workspace.repoUrl,
+          baseRef: workspace.repoRef,
+          projectId: workspace.projectId,
+          projectWorkspaceId: workspace.workspaceId,
+          sourceIssueId: `issue-${identifier}`,
+          metadata: null,
+        },
+        projectWorkspace: { cwd: repoRoot, cleanupCommand: null },
+      });
+      return { workspace, cleanup };
+    };
+
+    const shimDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-status-fails-"));
+    const shimPath = path.join(shimDir, "git");
+    const realGit = (await execFileAsync("sh", ["-c", "command -v git"])).stdout.trim();
+    await fs.writeFile(
+      shimPath,
+      [
+        "#!/bin/sh",
+        'if [ "$1" = "status" ] && [ "$2" = "--porcelain" ]; then',
+        '  echo "simulated status failure" >&2',
+        "  exit 128",
+        "fi",
+        `exec ${JSON.stringify(realGit)} "$@"`,
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    await fs.chmod(shimPath, 0o755);
+    const previousServerGit = process.env.PAPERCLIP_SERVER_GIT;
+    process.env.PAPERCLIP_SERVER_GIT = shimPath;
+    try {
+      const operator = await cleanupWorktree("PAP-482", "operator");
+      expect(operator.cleanup.cleaned).toBe(false);
+      expect(operator.cleanup.warnings.join("\n")).toContain("state could not be verified");
+      expect(operator.cleanup.warnings.join("\n")).toContain("git status failed");
+      await expect(fs.readFile(path.join(operator.workspace.cwd, "uncommitted.txt"), "utf8"))
+        .resolves.toBe("live work\n");
+
+      // Control: the same unverifiable tree is still removed by the non-operator path.
+      const control = await cleanupWorktree("PAP-483");
+      expect(control.cleanup.cleaned).toBe(true);
+      await expect(fs.stat(control.workspace.cwd)).rejects.toThrow();
+    } finally {
+      if (previousServerGit === undefined) delete process.env.PAPERCLIP_SERVER_GIT;
+      else process.env.PAPERCLIP_SERVER_GIT = previousServerGit;
+      await fs.rm(shimDir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   it("keeps an unmerged runtime-created branch and warns instead of force deleting it", async () => {
     const repoRoot = await createTempRepo();
 
