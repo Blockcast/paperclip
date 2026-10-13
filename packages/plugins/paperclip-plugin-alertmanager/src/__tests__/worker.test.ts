@@ -736,9 +736,13 @@ describe("handleWebhook — delivery timing (BLO-37485)", () => {
         }),
       ],
     });
+    // The second alert finishes past halfway again without crossing a new
+    // mark, which is what pins the latch. The third starts inside the delivery
+    // budget and carries the delivery across the deadline.
+    const perAlertMs = [61_000, 20_000, 50_000];
     const clock = stubClock(1_000_000);
     mocks.issues.create.mockImplementation(async () => {
-      clock.advance(70_000);
+      clock.advance(perAlertMs.shift() ?? 0);
       return { id: "issue-1" };
     });
 
@@ -760,10 +764,63 @@ describe("handleWebhook — delivery timing (BLO-37485)", () => {
     // finishes past both marks here, so this genuinely pins the latch.
     expect(slow).toHaveLength(2);
     // The attribution AC1 asks for: which alert, and how far in.
-    expect(slow[0]).toContain("CiliumPolicyDropsHigh (9a3b1e4c5f6d7890) took 70000ms");
+    expect(slow[0]).toContain("CiliumPolicyDropsHigh (9a3b1e4c5f6d7890) took 61000ms");
     expect(slow[0]).toContain("1 of 3 alerts");
-    expect(slow[1]).toContain("ArcRunnerPoolSaturated (ffff0000ffff0000) took 70000ms");
-    expect(slow[1]).toContain("2 of 3 alerts");
+    expect(slow[1]).toContain("CiliumAgentRestarting (aaaa1111aaaa1111) took 50000ms");
+    expect(slow[1]).toContain("3 of 3 alerts");
+  });
+
+  it("stops starting alerts once the delivery budget is spent and fails the delivery", async () => {
+    const { ctx, mocks } = mkCtx();
+    const envelope = baseEnvelope({
+      alerts: [
+        baseAlert(),
+        baseAlert({
+          labels: { alertname: "ArcRunnerPoolSaturated", severity: "warning" },
+          fingerprint: "ffff0000ffff0000",
+        }),
+        baseAlert({
+          labels: { alertname: "CiliumAgentRestarting", severity: "warning" },
+          fingerprint: "aaaa1111aaaa1111",
+        }),
+      ],
+    });
+    const clock = stubClock(1_000_000);
+    // 45s each: the third alert would start at 90s, which is the budget.
+    mocks.issues.create.mockImplementation(async () => {
+      clock.advance(45_000);
+      return { id: "issue-1" };
+    });
+
+    let thrown: unknown;
+    try {
+      await handleWebhook(
+        ctx,
+        baseConfig(),
+        true,
+        baseInput({ parsedBody: envelope, rawBody: JSON.stringify(envelope) }),
+      );
+    } catch (err) {
+      thrown = err;
+    } finally {
+      clock.restore();
+    }
+
+    // Failing (not 200) is what makes Alertmanager retry the unstarted alert;
+    // returning normally would acknowledge an alert that was never processed.
+    expect(thrown).toBeInstanceOf(AlertDeliveryIncompleteError);
+    expect((thrown as AlertDeliveryIncompleteError).fingerprints).toEqual([
+      "aaaa1111aaaa1111",
+    ]);
+    expect(mocks.issues.create).toHaveBeenCalledTimes(2);
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.webhook.budget_exhausted",
+      1,
+    );
+    expect(mocks.metrics.write).not.toHaveBeenCalledWith(
+      "alertmanager.webhook.deadline_exceeded",
+      1,
+    );
   });
 
   it("stays silent on a delivery that never approaches the deadline", async () => {
