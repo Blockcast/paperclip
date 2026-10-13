@@ -30354,7 +30354,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // Cross-replica exclusion (BLO-44457). `withAgentStartLock` below is
     // in-process only, so with workers >1 two passes for one agent can run at
     // once (timer leader + an HTTP wake on the other replica). What the
-    // DATABASE enforces regardless — pinned by dispatch-cross-process-claim.test.ts:
+    // DATABASE enforces regardless (dispatch-cross-process-claim.test.ts pins the
+    // external-slot path only; the local CAS and advisory lock are untested here):
     //  - per run: every queued->running transition is a CAS on
     //    status='queued' (claimQueuedRun / claimRunWithExternalRuntimeSlotOutcome),
     //    so no run is claimed twice;
@@ -30366,11 +30367,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     //  - local adapters (claude_local, codex_local, ...): maxConcurrentRuns is
     //    countRunsOccupyingSlots under the start lock, so N replicas can run up
     //    to N x the cap for one agent (each run still claimed once);
-    //  - pre-claim side effects of a pass (orphan reap, duplicate/terminal-issue
-    //    pruning, claimQueuedRun's cancellations) run on per-replica snapshots
-    //    and can execute concurrently; their writes are status-CAS'd, not locked;
-    //  - resumeRunningExternalRuntimeRuns re-executes RUNNING runs guarded only
-    //    by activeRunExecutions (startup path — lease-gated under BLO-45212).
+    //  - pre-claim side effects of a pass (duplicate/terminal-issue pruning,
+    //    claimQueuedRun's cancellations) run on per-replica snapshots and can
+    //    execute concurrently; their writes are status-CAS'd, not locked;
+    //  - reapOrphanedRuns skips only runs in this process's activeRunExecutions
+    //    and probes pids on this host, so it can finalize another replica's LIVE
+    //    local-adapter run as lost — destructive, not merely racy;
+    //  - resumeRunningExternalRuntimeRuns runs at startup AND at the head of
+    //    every scheduler tick on the lease leader (index.ts periodic chain),
+    //    guarded only by activeRunExecutions. A run a follower claimed via an
+    //    HTTP wake is RUNNING but absent from the leader's set, so the leader
+    //    re-enters executeRun on it — for claude_k8s/opencode_k8s too. The
+    //    scheduler lease does NOT close this: the leader is exactly the replica
+    //    that cannot see the follower's execution. Harm on second attach to a
+    //    live Job is untraced (BLO-16537 abandonedForLiveOwnJob may bound it).
     if (paperclipNodeRole === "api") {
       logger.debug(
         { agentId, role: paperclipNodeRole },
