@@ -434,6 +434,7 @@ import {
   recordHeartbeatTimerTick,
   recordRetryScheduleOutcome,
   recordStartLockReapDisposition,
+  recordOrphanReapStage,
   recordConcurrentRunBlocked,
   recordAgentDispatchDeclined,
   recordHeartbeatRunFailed,
@@ -27516,6 +27517,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number; suppressDispatchAfterReap?: boolean }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
+    // BLO-42010: per-stage sweep timing. Start-lock waiters can wait ~2x a
+    // sweep, so the sweep's own duration sets the reap `timed_out` rate.
+    // ponytail: a sweep that throws records only the stages it finished, and no
+    // `total`; read the stage counts against `total` before trusting a mean.
+    const orphanReapStartedAt = Date.now();
+    let orphanReapLapAt = orphanReapStartedAt;
+    const lapOrphanReap = (stage: Parameters<typeof recordOrphanReapStage>[0]) => {
+      const at = Date.now();
+      recordOrphanReapStage(stage, (at - orphanReapLapAt) / 1000);
+      orphanReapLapAt = at;
+    };
 
     // Find all runs stuck in "running" state (queued runs are legitimately waiting; resumeQueuedRuns handles them)
     const activeRuns = await db
@@ -27551,6 +27563,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       ]),
     );
 
+    lapOrphanReap("load_runs");
     const reaped: string[] = [];
 
     // Query the kube API once for namespace-wide agent Job state. Active runs
@@ -27636,6 +27649,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .map((reservation) => reservation.runId),
     );
 
+    lapOrphanReap("list_jobs");
     // BLO-16184: emit the process_lost run-volume DENOMINATOR every reap cycle so
     // a "0 process_lost" reading can never be silently trusted at low run volume.
     // Set reset-then-set so a genuine drop to 0 is written explicitly, not stale.
@@ -27805,8 +27819,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
     }
 
+    lapOrphanReap("identity_stamp");
     const cleanedTerminalJobRunIds = await cleanupTerminalExternalLifecycleJobs(jobRunStatuses, now);
     reaped.push(...cleanedTerminalJobRunIds);
+    lapOrphanReap("terminal_job_cleanup");
     // BLO-21460: the two reconcilers below can throw (both reach the kube API
     // via confirmStaleKilledJobQuiesced). The backlog refresh must still run,
     // because prom-client gauges retain their last value: skipping it leaves
@@ -27870,6 +27886,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         );
       }
     }
+    lapOrphanReap("reconcile_reservations");
     const liveJobRunIds =
       jobRunStatuses !== null
         ? new Set(
@@ -27904,6 +27921,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       );
     }
 
+    lapOrphanReap("pod_cleanup");
     for (const { run, adapterType, adapterConfig } of activeRuns) {
       if (runningProcesses.has(run.id)) continue;
       if (ambiguousExternalRunIds.has(run.id)) continue;
@@ -28601,6 +28619,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     }
 
+    lapOrphanReap("per_run");
+    recordOrphanReapStage("total", (Date.now() - orphanReapStartedAt) / 1000);
     if (reaped.length > 0) {
       logger.warn({ reapedCount: reaped.length, runIds: reaped }, "reaped orphaned heartbeat runs");
     }

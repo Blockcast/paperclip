@@ -1149,6 +1149,32 @@ export const KNOWN_START_LOCK_REAP_DISPOSITIONS = [
   "error",
 ] as const;
 export type StartLockReapDispositionLabel = (typeof KNOWN_START_LOCK_REAP_DISPOSITIONS)[number];
+
+/**
+ * Seconds spent in each stage of one fleet-wide `reapOrphanedRuns` sweep
+ * (BLO-42010 AC3).
+ *
+ * A start-lock caller that arrives while a sweep is already reading waits out
+ * the rest of it AND the chained sweep after it, so its wait is up to ~2x the
+ * sweep. Measured 2026-10-13 06:xxZ: logged `ran` sweeps p50 55.8 s, max
+ * 115.4 s, over ~53 running runs. Any sweep past ~60 s therefore pushes chained
+ * waiters over the 120 s bound, and that is the `timed_out` rate. The lever is
+ * sweep duration, and the sweep had no internal timing. This splits it.
+ *
+ * No `agent_id`: the sweep is fleet-wide. `stage` is an allow-list.
+ */
+export const ORPHAN_REAP_STAGE_SECONDS_METRIC = "paperclip_orphan_reap_stage_seconds";
+export const KNOWN_ORPHAN_REAP_STAGES = [
+  "load_runs",
+  "list_jobs",
+  "identity_stamp",
+  "terminal_job_cleanup",
+  "reconcile_reservations",
+  "pod_cleanup",
+  "per_run",
+  "total",
+] as const;
+export type OrphanReapStageLabel = (typeof KNOWN_ORPHAN_REAP_STAGES)[number];
 /**
  * Overdue-parked-retry age gauge (BLO-22094). {@link QUEUED_RUN_OLDEST_AGE_METRIC}
  * deliberately excludes `status='scheduled_retry'` rows -- that exclusion is
@@ -3546,6 +3572,7 @@ let heartbeatRunFailed: Counter<HeartbeatRunFailedLabel> | null = null;
 let ccrotateCapacityDeferred: Counter<"adapter" | "provider"> | null = null;
 let retryScheduleOutcome: Counter<"outcome" | "retry_reason"> | null = null;
 let startLockReapDisposition: Counter<"disposition"> | null = null;
+let orphanReapStageSeconds: Histogram<"stage"> | null = null;
 let penstockGateProbe: Counter<"path" | "outcome" | "provider" | "model"> | null = null;
 let penstockGateProbeDuration: Histogram<"path" | "provider"> | null = null;
 let heartbeatTimerSchedulerExclusion: Counter<"reason"> | null = null;
@@ -3709,6 +3736,7 @@ function ensureRegistry(): {
   capacityDeferredCounter: Counter<"adapter" | "provider">;
   retryScheduleOutcomeCounter: Counter<"outcome" | "retry_reason">;
   startLockReapDispositionCounter: Counter<"disposition">;
+  orphanReapStageSecondsHistogram: Histogram<"stage">;
   penstockGateProbeCounter: Counter<"path" | "outcome" | "provider" | "model">;
   penstockGateProbeDurationHistogram: Histogram<"path" | "provider">;
   heartbeatTimerSchedulerExclusionCounter: Counter<"reason">;
@@ -3813,6 +3841,7 @@ function ensureRegistry(): {
     || !ccrotateCapacityDeferred
     || !retryScheduleOutcome
     || !startLockReapDisposition
+    || !orphanReapStageSeconds
     || !penstockGateProbe
     || !penstockGateProbeDuration
     || !heartbeatTimerSchedulerExclusion
@@ -4129,6 +4158,16 @@ function ensureRegistry(): {
         + "incremented, so pair any zero-abandon reading with a populated control series before "
         + "concluding no abandons occurred rather than no scrape.",
       labelNames: ["outcome", "retry_reason"],
+      registers: [registry],
+    });
+    orphanReapStageSeconds = new Histogram({
+      name: ORPHAN_REAP_STAGE_SECONDS_METRIC,
+      help:
+        "Seconds per stage of one fleet-wide orphan-reap sweep (BLO-42010). "
+        + "stage='total' is the whole sweep. Start-lock waiters can wait ~2x a sweep, "
+        + "so sweeps over ~60 s drive the reap disposition timed_out rate.",
+      labelNames: ["stage"],
+      buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 30, 45, 60, 90, 120, 180, 300],
       registers: [registry],
     });
     startLockReapDisposition = new Counter({
@@ -5429,6 +5468,7 @@ function ensureRegistry(): {
     capacityDeferredCounter: ccrotateCapacityDeferred,
     retryScheduleOutcomeCounter: retryScheduleOutcome,
     startLockReapDispositionCounter: startLockReapDisposition,
+    orphanReapStageSecondsHistogram: orphanReapStageSeconds,
     penstockGateProbeCounter: penstockGateProbe,
     penstockGateProbeDurationHistogram: penstockGateProbeDuration,
     heartbeatTimerSchedulerExclusionCounter: heartbeatTimerSchedulerExclusion,
@@ -5763,6 +5803,12 @@ export function recordRetryScheduleOutcome(
   };
   ensureRegistry().retryScheduleOutcomeCounter.inc(labels);
   return labels;
+}
+
+/** Observe one {@link ORPHAN_REAP_STAGE_SECONDS_METRIC} sample. Unknown stages are dropped. */
+export function recordOrphanReapStage(stage: OrphanReapStageLabel, seconds: number) {
+  if (!(KNOWN_ORPHAN_REAP_STAGES as readonly string[]).includes(stage) || !Number.isFinite(seconds)) return;
+  ensureRegistry().orphanReapStageSecondsHistogram.observe({ stage }, Math.max(0, seconds));
 }
 
 /**
@@ -7721,6 +7767,7 @@ export function __resetMetricsForTest(): void {
   ccrotateCapacityDeferred = null;
   retryScheduleOutcome = null;
   startLockReapDisposition = null;
+  orphanReapStageSeconds = null;
   penstockGateProbe = null;
   penstockGateProbeDuration = null;
   heartbeatTimerSchedulerExclusion = null;
