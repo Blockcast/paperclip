@@ -15,13 +15,63 @@ export type HeartbeatRunStopReason =
 export interface HeartbeatRunTimeoutPolicy {
   effectiveTimeoutSec: number | null;
   effectiveTimeoutMs?: number | null;
+  /**
+   * Whether a timeout bound was **in force** for this run — not whether the
+   * agent's `adapterConfig` happened to name one.
+   *
+   * PEN-4023: these are not the same question, and treating them as the same
+   * is what let this object contradict itself.  `timeoutFired` is derived from
+   * the *outcome* and `timeoutConfigured` from the *config*, computed
+   * independently and never reconciled, so a real kill persisted as
+   * `{ timeoutFired: true, timeoutSource: "config", timeoutConfigured: false,
+   * effectiveTimeoutSec: 0 }` — "a timeout fired, sourced from config" and "no
+   * timeout was configured" in one record.  Production agents run with
+   * `timeoutSec: 0` while their Kubernetes Job carries
+   * `activeDeadlineSeconds: 7200` written by something outside the adapter, so
+   * this was not an edge case: it was every 2-hour kill on the fleet, and it
+   * made 11 runs across two agents unreadable because the bound that fired was
+   * recorded nowhere (PEN-4016).
+   *
+   * A fired timeout proves a bound existed.  So when `timeoutFired` is true
+   * this is true, and `timeoutSource` carries where the number came from —
+   * including `"unknown"` when nothing could name it.  The pair
+   * `timeoutFired: true` with `timeoutConfigured: false` is unreachable by
+   * construction; `heartbeat-stop-metadata.test.ts` pins that.
+   */
   timeoutConfigured: boolean;
-  timeoutSource: "config" | "default" | "unknown";
+  /**
+   * Where `effectiveTimeoutSec` came from.
+   *
+   * - `config` — read from the agent's `adapterConfig`.
+   * - `default` — the adapter's built-in default; `adapterConfig` was silent.
+   * - `observed` — measured at runtime from the thing that actually enforced
+   *   the kill (the Job's `spec.activeDeadlineSeconds`, the adapter's own wait
+   *   budget), reported by the adapter rather than read from config.  This is
+   *   the only source that can name a bound nothing in config knows about.
+   * - `unknown` — a bound demonstrably fired and none of the above could name
+   *   it.  `effectiveTimeoutSec` is then null: unknown is recorded as unknown,
+   *   never as `0`.
+   *
+   * Gate paths in `heartbeat.ts` write their own gate name here directly
+   * (`dependency_gate`, `duplicate_dispatch_gate`, …) without going through
+   * this builder; those always pair with `timeoutFired: false`.
+   */
+  timeoutSource: "config" | "default" | "observed" | "unknown";
 }
 
 export interface HeartbeatRunStopMetadata extends HeartbeatRunTimeoutPolicy {
   stopReason: HeartbeatRunStopReason;
   timeoutFired: boolean;
+}
+
+/**
+ * A bound an adapter measured at runtime, as it reports it on the run result.
+ * `seconds` is null when the adapter knows a bound fired but could not read
+ * its value — which must stay distinguishable from "the bound was zero".
+ */
+export interface ObservedHeartbeatRunTimeout {
+  seconds: number | null;
+  source: string | null;
 }
 
 function readFiniteNumber(value: unknown): number | null {
@@ -100,19 +150,90 @@ export function inferHeartbeatRunStopReason(input: {
   return "adapter_failed";
 }
 
+/**
+ * Read the runtime-observed bound an adapter reported on its result.
+ *
+ * Deliberately tolerant about `source` and strict about `seconds`: a source
+ * string is provenance an unknown adapter may spell however it likes, whereas
+ * a bogus number here would be written into the record as the bound that
+ * killed the run. Anything not a finite positive number is treated as absent,
+ * which degrades to `timeoutSource: "unknown"` rather than to a wrong number.
+ *
+ * Zero counts as absent, not as a bound of zero seconds. Nothing fires after
+ * zero seconds, and writing `effectiveTimeoutSec: 0` beside `timeoutFired:
+ * true` is the record PEN-4016 could not read.
+ */
+export function readObservedHeartbeatRunTimeout(
+  resultJson: Record<string, unknown> | null | undefined,
+): ObservedHeartbeatRunTimeout | null {
+  if (!resultJson) return null;
+  const hasSeconds = hasOwn(resultJson, "observedTimeoutSec");
+  const hasSource = hasOwn(resultJson, "observedTimeoutSource");
+  if (!hasSeconds && !hasSource) return null;
+  const seconds = hasSeconds ? readFiniteNumber(resultJson.observedTimeoutSec) : null;
+  const source = hasSource && typeof resultJson.observedTimeoutSource === "string"
+    ? resultJson.observedTimeoutSource.trim() || null
+    : null;
+  return { seconds: seconds != null && seconds > 0 ? seconds : null, source };
+}
+
+/**
+ * Reconcile the configured timeout policy against what actually happened.
+ *
+ * Only reached when a timeout fired. The config half is left untouched on
+ * every other outcome, so a run that did not time out still reports its
+ * configuration exactly as before — this widens what a *fired* timeout
+ * records, and changes nothing else.
+ */
+function reconcileFiredTimeout(
+  policy: HeartbeatRunTimeoutPolicy,
+  observed: ObservedHeartbeatRunTimeout | null,
+): HeartbeatRunTimeoutPolicy {
+  if (observed?.seconds != null && observed.seconds > 0) {
+    return {
+      effectiveTimeoutSec: observed.seconds,
+      // Preserve the millisecond field only where the policy carries one (the
+      // `http` adapter), so the two never disagree about the same bound.
+      ...(policy.effectiveTimeoutMs != null ? { effectiveTimeoutMs: observed.seconds * 1000 } : {}),
+      timeoutConfigured: true,
+      timeoutSource: "observed",
+    };
+  }
+
+  // No observed bound. If config names a positive one it is the best available
+  // account of what fired, so keep it verbatim.
+  if (policy.timeoutConfigured) return policy;
+
+  // A timeout fired and nothing can name the bound. Record that, rather than
+  // the config's `0` — which is what `Timed out after 0s` was.
+  return {
+    effectiveTimeoutSec: null,
+    ...(policy.effectiveTimeoutMs != null ? { effectiveTimeoutMs: null } : {}),
+    timeoutConfigured: true,
+    timeoutSource: "unknown",
+  };
+}
+
 export function buildHeartbeatRunStopMetadata(input: {
   adapterType: string;
   adapterConfig: Record<string, unknown> | null | undefined;
   outcome: HeartbeatRunOutcome;
   errorCode?: string | null;
   errorMessage?: string | null;
+  /**
+   * The bound the adapter measured at runtime, when it reported one. Absent
+   * for adapters that do not, which is why `reconcileFiredTimeout` still has
+   * to handle a fired timeout with nothing to name it.
+   */
+  observedTimeout?: ObservedHeartbeatRunTimeout | null;
 }): HeartbeatRunStopMetadata {
   const timeoutPolicy = resolveHeartbeatRunTimeoutPolicy(input.adapterType, input.adapterConfig);
   const stopReason = inferHeartbeatRunStopReason(input);
+  const timeoutFired = stopReason === "timeout";
   return {
-    ...timeoutPolicy,
+    ...(timeoutFired ? reconcileFiredTimeout(timeoutPolicy, input.observedTimeout ?? null) : timeoutPolicy),
     stopReason,
-    timeoutFired: stopReason === "timeout",
+    timeoutFired,
   };
 }
 
