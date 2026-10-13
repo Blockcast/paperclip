@@ -2351,13 +2351,15 @@ export function recoveryService(
       blockedByIssueIds: string[];
     }) => Promise<void> | void;
     /**
-     * Test-only clock for the sweep's two per-pass memos (PEN-3636), threaded into the
-     * `now` seam both factories already expose. Production leaves this unset and both
-     * take `Date.now`.
+     * Test-only clock for the sweep's three per-pass caches (PEN-3636): the pause-hold
+     * prefilter and the agent-roster memo, both keyed by COMPANY and so true memos, plus
+     * the attendance prefetch, keyed by ISSUE and so a forward window over the candidate
+     * list rather than a memo. Threaded into the `now` seam each factory already exposes.
+     * Production leaves this unset and all three take `Date.now`.
      *
      * ⚠️ Why this exists: the call-site tests assert `liveReads === 1`, which is a claim
-     * about WIRING, but against the real clock it is also a claim about SPEED — the
-     * memos' 5 s TTL is wall-clock, so a DB-backed sweep that stalls >5 s between two
+     * about WIRING, but against the real clock it is also a claim about SPEED — their
+     * 5 s TTL is wall-clock, so a DB-backed sweep that stalls >5 s between two
      * candidates re-reads and the assertion goes red for a reason unrelated to what it
      * tests. Embedded Postgres under parallel vitest can do that, and this row's own
      * production figure (~787 ms–1.77 s per candidate) is the same order as the budget.
@@ -3110,8 +3112,15 @@ export function recoveryService(
   }
 
   // Handed out immediately after the three are defined, so a predicate added to this
-  // trio later is in scope here and its absence from the equivalence test is a compile
-  // error rather than a silent gap. Production leaves this unset; see the field's doc.
+  // trio later is in scope here. ⚠️ That adjacency alone does NOT make its absence from
+  // the equivalence test a compile error: the matrix reaches these by destructuring
+  // named fields, and destructuring a subset stays legal TypeScript however wide this
+  // object grows. The enforcement lives in the TEST —
+  // `recovery-stranded-attendance-batch.test.ts` pins the key set with
+  // `satisfies Record<keyof AttendancePredicates, true>`, so a fourth predicate added
+  // here fails `tsc` there until the matrix covers it. Adding one here without a line
+  // there is the silent gap; that literal is what closes it.
+  // Production leaves this unset; see the field's doc.
   deps.attendancePredicatesForTest?.({
     hasActiveExecutionPath,
     hasPendingWakeInteraction,

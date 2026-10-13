@@ -2808,9 +2808,11 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(updatedIssue?.monitorNextCheckAt === null).toBe(providerQuotaMonitored === 0);
   });
 
-  // PEN-3636: a frozen clock for the two per-pass memos, shared by the two call-site tests
+  // PEN-3636: a frozen clock for the sweep's three per-pass caches — the pause-hold
+  // prefilter, the agent-roster memo and the attendance prefetch, all of which the sweep
+  // constructs unconditionally off this one dep — shared by the two call-site tests
   // below. Both assert `liveReads === 1`, which is meant to be a claim about WIRING; against
-  // the real clock it is also a claim about SPEED, because the memos' TTL is wall-clock and
+  // the real clock it is also a claim about SPEED, because the TTL is wall-clock and
   // a sweep that stalls past it between two candidates re-reads. Embedded Postgres under
   // parallel vitest can stall that long, so the assertion could go red for a reason that has
   // nothing to do with what it tests. Frozen rather than a huge `ttlMs` on purpose: the
