@@ -27705,20 +27705,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             // finished Job is reclaimed by its own `ttlSecondsAfterFinished`
             // (agent Job manifests set it), not by the reaper:
             // cleanupTerminalExternalLifecycleJobs only considers phase=active
-            // Jobs, and this branch fires only for non-active ones.
-            // A still-active Job with no reservation is a real orphan and still
-            // falls through. Bookkeeping matches the catch so the sweep's
-            // liveness view is unchanged.
+            // Jobs. A still-active Job here is skipped only inside the stale
+            // window (see below); past it, it is a real orphan and still falls
+            // through. Bookkeeping matches the catch so the sweep's liveness
+            // view is unchanged.
             const reservationFinalizing = !reservation || reservation.state === "release_pending";
-            if (reservationFinalizing && jobStatus?.phase !== "active") {
+            const lastSignalRef = externalLifecycleRecentRefTime(run);
+            const finalizeOverdue = !lastSignalRef || now.getTime() - lastSignalRef >= EXTERNAL_LIFECYCLE_STALE_MS;
+            // The Job pod is frequently still `active` for a few seconds after
+            // the release starts (postRun/teardown still running): measured
+            // 2026-10-13, 99 of 102 post-fix mismatch lines were this, every
+            // one clearing within 28s. So an active Job is benign only inside
+            // the stale window; past it, it falls through to the catch and
+            // logs at ERROR, because an active Job outliving its reservation
+            // is a real orphan.
+            if (reservationFinalizing && (jobStatus?.phase !== "active" || !finalizeOverdue)) {
               // The same condition holds forever for a run whose row never
               // leaves `running` (postRun or workspace finalize died after the
               // release). Such a run is skipped by the reap loop below via
               // ambiguousExternalRunIds, so this line is its only trace: keep
               // the benign finalize window at debug, and escalate to warn once
               // the run has been silent past EXTERNAL_LIFECYCLE_STALE_MS.
-              const lastSignalRef = externalLifecycleRecentRefTime(run);
-              const finalizeOverdue = !lastSignalRef || now.getTime() - lastSignalRef >= EXTERNAL_LIFECYCLE_STALE_MS;
               const skipPayload = {
                 runId: run.id,
                 jobName,
@@ -27794,6 +27801,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 expectedJobName: reservation?.expectedJobName ?? null,
                 persistedJobName: reservation?.jobName ?? null,
                 persistedJobUid: reservation?.jobUid ?? null,
+                // `error` serializes to nothing in production (pino only
+                // applies its Error serializer to `err`); the message is what
+                // names the guard that threw.
+                errorMessage: error instanceof Error ? error.message : String(error),
                 error,
               },
               "external-runtime reservation Job identity mismatch",
