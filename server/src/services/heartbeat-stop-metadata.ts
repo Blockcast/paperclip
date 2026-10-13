@@ -249,6 +249,13 @@ export function mergeHeartbeatRunStopMetadata(
     timeoutConfigured: metadata.timeoutConfigured,
     timeoutSource: metadata.timeoutSource,
     timeoutFired: metadata.timeoutFired,
-    ...(metadata.effectiveTimeoutMs != null ? { effectiveTimeoutMs: metadata.effectiveTimeoutMs } : {}),
+    // PEN-4023: keyed on *presence*, not on non-nullness. Adapters other than
+    // `http` carry no millisecond field at all and must keep leaving the key
+    // untouched (unchanged behaviour). But `http` always carries one, and a
+    // fired timeout whose bound could not be named sets it to null — which the
+    // old `!= null` test dropped, leaving a stale `effectiveTimeoutMs` from an
+    // earlier merge beside `effectiveTimeoutSec: null`. That is the same shape
+    // of self-contradicting record this change exists to remove.
+    ...("effectiveTimeoutMs" in metadata ? { effectiveTimeoutMs: metadata.effectiveTimeoutMs } : {}),
   };
 }
