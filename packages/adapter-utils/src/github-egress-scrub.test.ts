@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 
 import { describe, expect, it } from "vitest";
 
@@ -624,7 +625,13 @@ describe("scrubGitHubEgressText", () => {
       // split landed a digit at the head of the second run, which the
       // per-segment shape refused on its own — so the test passed with the
       // dot conjunct deleted and pinned nothing.
-      const token = `/${SYNTHETIC_OPAQUE_VALUE.slice(0, 15)}/${SYNTHETIC_OPAQUE_VALUE.slice(15)}`;
+      //
+      // BLO-45605: and both runs are now letters-only and uppercase-initial,
+      // because #2633's method bound and this change's service bound each
+      // refused the old split by themselves — the dot was again pinning
+      // nothing. `Qx` only lifts the letters-only value past the length floor.
+      const letters = `${SYNTHETIC_OPAQUE_VALUE.replace(/[0-9]/g, "")}Qx`;
+      const token = `/S${letters.slice(1, 12)}/W${letters.slice(12)}`;
       const result = scrubGitHubEgressText(bind("method", token));
       expect(result.classes).toContain("high-entropy-assignment");
       expect(result.text).not.toContain(token);
@@ -658,6 +665,44 @@ describe("scrubGitHubEgressText", () => {
       const result = scrubGitHubEgressText(bind("method", token));
       expect(result.classes).toContain("high-entropy-assignment");
       expect(result.text).not.toContain(token);
+    });
+
+    it.each([
+      // Package cap: `.B` keeps the service legal, so only the cap refuses these.
+      `/${SYNTHETIC_OPAQUE_VALUE}.B/`,
+      `/${SYNTHETIC_OPAQUE_VALUE}.B/Get`,
+      // Service uppercase-initial: letters only, so only the case refuses it.
+      `/a.${SYNTHETIC_OPAQUE_VALUE.replace(/[0-9]/g, "")}/`,
+      // Service digits-as-tail: uppercase-initial, so only the interior digits refuse it.
+      `/a.S${SYNTHETIC_OPAQUE_VALUE.slice(1)}/`,
+    ])("still refuses %s: an opaque token in a package or service run (BLO-45605)", (token) => {
+      // Ally's shapes on #2633 were `/<opaque>.b/`, `/<opaque>.b/Get` and
+      // `/a.<opaque>/`. The service is written `B`, not `b`: with a lowercase
+      // service the service bound refuses the first two on its own, and they
+      // would pass with the package cap deleted. One case per conjunct.
+      const result = scrubGitHubEgressText(bind("method", token));
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(token);
+    });
+
+    it("passes the magma rpc corpus through byte-exact (BLO-45605)", () => {
+      // Every `/<package>.<Service>/<Method>` declared in Blockcast/magma's
+      // .proto files, and each one's service prefix. The two
+      // `tenants_beacon` paths are left out: the `_` already refused them
+      // before any of these bounds existed.
+      const corpus = readFileSync(
+        new URL("./github-egress-scrub.magma-rpcs.txt", import.meta.url),
+        "utf8",
+      )
+        .trim()
+        .split("\n");
+      expect(corpus.length).toBeGreaterThan(150);
+      const paths = [...new Set(corpus.flatMap((m) => [m, m.replace(/[^/]+$/, "")]))];
+      const flagged = paths.filter((p) => {
+        const text = bind("method", p);
+        return scrubGitHubEgressText(text).text !== text;
+      });
+      expect(flagged).toEqual([]);
     });
 
     it("still refuses a credential with a real method path appended", () => {
