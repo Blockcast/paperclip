@@ -381,8 +381,19 @@ function classIndex(value: string): number {
  * on purpose: real long method names (`GetGatewayDeviceInfoAndStatus`, 4.0
  * bits/char) clear the 3.5 threshold on their own.
  */
+/*
+ * BLO-45605: the same exoneration lived on in the other two runs, which only
+ * had to start with a letter — `/<token>.b/` and `/a.<token>/` passed whole.
+ * The service (the last dotted run) is now `[A-Z][A-Za-z]*[0-9]*`: proto
+ * service style, with digits allowed only as a tail for `Service303`. Package
+ * runs cannot take a shape bound — proto packages are lowercase and `orc8r`
+ * carries an interior digit — so each is capped at 16 characters instead,
+ * under the 24-character entropy floor; magma's longest is `configurator`
+ * (12). Both bounds hold the magma rpc corpus exactly where it was; the test
+ * file replays it.
+ */
 const GRPC_METHOD_PATH_RE =
-  /^\/[A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)+\/(?:[A-Z][A-Za-z]*)?$/;
+  /^\/(?:[A-Za-z][A-Za-z0-9]{0,15}\.)+[A-Z][A-Za-z]*[0-9]*\/(?:[A-Z][A-Za-z]*)?$/;
 
 /** A value is "opaque" when it is long, drawn from a token alphabet and from
  *  at least two character classes, is not a hyphenated identifier, and has
