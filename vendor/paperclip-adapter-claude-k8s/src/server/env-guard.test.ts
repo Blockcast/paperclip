@@ -8,6 +8,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   ENV_GUARD_SCRIPT,
+  GUARD_HOOK_MATCHER,
   SAFE_ENV_INSPECT_SCRIPT,
   buildEnvGuardSetupShell,
   classifyAgentShellCommand,
@@ -590,7 +591,7 @@ describe("buildEnvGuardSetupShell", () => {
       const pre = settings.hooks.PreToolUse;
       expect(Array.isArray(pre)).toBe(true);
       const guardEntries = pre.filter(
-        (g: { matcher?: string }) => g.matcher === "Bash",
+        (g: { matcher?: string }) => g.matcher === GUARD_HOOK_MATCHER,
       );
       expect(guardEntries).toHaveLength(1);
       expect(guardEntries[0].hooks[0].command).toBe(`node '${guardFile}'`);
@@ -599,6 +600,25 @@ describe("buildEnvGuardSetupShell", () => {
       expect(raw).not.toContain(`${path.join(dir, "paperclip-env-guard.mjs")}`);
       // Existing Stop hook survived.
       expect(settings.hooks.Stop[0].hooks[0].command).toBe("echo stop");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("re-registers a same-hash guard hook whose matcher is stale (BLO-46113)", () => {
+    const mergeScript = decodedBlobs(buildEnvGuardSetupShell())[2]!;
+    const dir = mkdtempSync(path.join(tmpdir(), "pc-settings-"));
+    try {
+      const guardFile = path.join(dir, "paperclip-env-guard.cccccccccccc.mjs");
+      const cmd = `node '${guardFile}'`;
+      writeFileSync(
+        path.join(dir, "settings.json"),
+        JSON.stringify({ hooks: { PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: cmd }] }] } }),
+      );
+      const env = { ...process.env, CLAUDE_CONFIG_DIR: dir, PAPERCLIP_GUARD_FILE: guardFile };
+      expect(spawnSync(process.execPath, ["-"], { input: mergeScript, env }).status).toBe(0);
+      const pre = JSON.parse(readFileSync(path.join(dir, "settings.json"), "utf8")).hooks.PreToolUse;
+      expect(pre).toEqual([{ matcher: GUARD_HOOK_MATCHER, hooks: [{ type: "command", command: cmd }] }]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -810,6 +830,15 @@ describe("embedded guard: lock re-assertion before outward side effects (BLO-299
     "cd /w && git -C /w push -u origin HEAD",
     "git --no-pager push",
     "gh pr create --title t --body b",
+    // BLO-46113: outward writes the text regex never matched.
+    "gh pr merge 12 --squash",
+    "gh api repos/O/R/pulls -X POST -f title=t",
+    "gh api --method POST repos/O/R/pulls",
+    "gh api repos/O/R/pulls -f head=x -f base=master",
+    "gh api -X PATCH repos/O/R/git/refs/heads/x -f sha=abc",
+    "gh api repos/O/R/merges -XPOST -f base=a -f head=b",
+    "bash -c 'git push origin HEAD'",
+    "ssh host 'cd /w && git push'",
   ]) {
     it(`blocks ${JSON.stringify(cmd)} when another run holds the lock`, async () => {
       await withApi(foreign, async (vars) => {
@@ -843,10 +872,48 @@ describe("embedded guard: lock re-assertion before outward side effects (BLO-299
 
   it("never calls the API for commands that are not outward side effects", async () => {
     await withApi(foreign, async (vars, hits) => {
-      for (const cmd of ["git status", "git commit -m push", "gh pr view 1", "echo pushing"]) {
+      for (const cmd of [
+        "git status",
+        "git commit -m push",
+        "gh pr view 1",
+        "echo pushing",
+        // BLO-46113: a push that is only quoted data, and gh api reads.
+        'echo "run git push later"',
+        "git commit -m 'fix: git push now re-asserts the lock'",
+        "gh api repos/O/R/pulls/12",
+        "gh api repos/O/R/pulls -X GET",
+      ]) {
         expect((await run(cmd, vars)).status).toBe(0);
       }
       expect(hits()).toBe(0);
+    });
+  });
+
+  async function runTool(tool_name: string, vars: Record<string, string>) {
+    const dir = mkdtempSync(path.join(tmpdir(), "pc-guard-"));
+    const file = path.join(dir, "guard.mjs");
+    writeFileSync(file, ENV_GUARD_SCRIPT);
+    const base = Object.fromEntries(Object.entries(process.env).filter(([k]) => !LOCK_VARS.includes(k)));
+    try {
+      return await new Promise<number | null>((resolve) => {
+        const child = spawn(process.execPath, [file], { env: { ...base, ...vars } });
+        child.on("close", resolve);
+        child.stdin.end(JSON.stringify({ tool_name, tool_input: { owner: "O", repo: "R" } }));
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  it("blocks GitHub MCP write tools on a foreign holder, and the hook matcher routes them (BLO-46113)", async () => {
+    await withApi(foreign, async (vars, hits) => {
+      for (const tool of ["mcp__github__create_pull_request", "mcp__github__push_files", "mcp__github__merge_pull_request"]) {
+        expect(new RegExp(`^(?:${GUARD_HOOK_MATCHER})$`).test(tool)).toBe(true);
+        expect(await runTool(tool, vars)).toBe(2);
+      }
+      expect(hits()).toBe(3);
+      expect(await runTool("mcp__github__get_me", vars)).toBe(0);
+      expect(hits()).toBe(3);
     });
   });
 
