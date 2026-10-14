@@ -561,13 +561,10 @@ export function probeApprovalGate(input: GateEvidenceInput): ProbeResult | null 
   // undecided branch below is reached unchanged, and drift has already
   // short-circuited above.
   if (granted.length > 0) {
-    // Counted, not ordered. This probe sorts nothing and reads no timestamp,
-    // so it cannot know whether an undecided card was filed before or after
-    // the grant; the previous wording ("a later card") asserted exactly the
-    // kind of unmeasured fact this module exists to keep an instrument from
-    // asserting, in the branch whose whole subject is that an instrument must
-    // not. It also said "card" in the singular while interpolating every
-    // undecided card on the row, so a two-card row read as one.
+    // Counted, not ordered, and agreeing in number with what it lists: this
+    // probe sorts nothing and reads no timestamp, so it cannot say whether a
+    // card was filed before or after the grant, and it interpolates every
+    // undecided card rather than one.
     const context =
       undecided.length > 0
         ? ` — ${undecided.length === 1 ? "another card is" : `${undecided.length} other cards are`} still undecided (${undecided.map(describeApproval).join(", ")}), ${undecided.length === 1 ? "a separate ask that does" : "separate asks that do"} not discharge the grant`
