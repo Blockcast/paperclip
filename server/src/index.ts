@@ -1313,6 +1313,29 @@ export async function startServer(): Promise<StartedServer> {
     }
   };
 
+  // Sentinel-triggered CPU profile (BLO-45336): attributes event-loop stalls
+  // that no log line names. Not behind heapSnapshotEnabled — a profile holds
+  // call frames, not heap values. See services/cpu-profile.ts. Registered
+  // before the heartbeat scheduler so the scheduler stays the last timer
+  // startServer registers (server-startup-feedback-export.test.ts relies on
+  // it); `unref?.()` because those tests stub setInterval to return a number.
+  if (config.paperclipNodeRole !== "api") {
+    setInterval(() => {
+      maybeTakeCpuProfile({ dir: config.heapSnapshotDir, durationMs: 60_000, keep: 3 })
+        .then((file) => {
+          if (file) logger.warn({ file }, "CPU profile written");
+        })
+        .catch((err) =>
+          logger.error(
+            // Fields, not path.join: a handler that throws would turn one
+            // failed capture into an unhandled rejection.
+            { err, dir: config.heapSnapshotDir, sentinel: CPU_PROFILE_SENTINEL_BASENAME },
+            "CPU profile capture failed",
+          ),
+        );
+    }, 60_000).unref?.();
+  }
+
   if (config.heartbeatSchedulerEnabled) {
     const heartbeat = heartbeatService(db as any, {
       pluginWorkerManager,
@@ -2874,22 +2897,6 @@ export async function startServer(): Promise<StartedServer> {
         );
       }
     }
-
-    // Sentinel-triggered CPU profile (BLO-45336): attributes event-loop stalls
-    // that no log line names. Not behind heapSnapshotEnabled — a profile holds
-    // call frames, not heap values. See services/cpu-profile.ts.
-    setInterval(() => {
-      maybeTakeCpuProfile({ dir: heapSnapshotConfig.dir, durationMs: 60_000, keep: 3 })
-        .then((file) => {
-          if (file) logger.warn({ file }, "CPU profile written");
-        })
-        .catch((err) =>
-          logger.error(
-            { err, sentinel: path.join(heapSnapshotConfig.dir, CPU_PROFILE_SENTINEL_BASENAME) },
-            "CPU profile capture failed",
-          ),
-        );
-    }, 60_000).unref();
 
     // Sweep once at startup, whether or not capture is enabled, then on every
     // poll. This is what makes "flag off" end the exposure rather than freeze it.
