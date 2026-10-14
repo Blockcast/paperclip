@@ -57,6 +57,10 @@ const migrationUpdatedAtUpdateAllowlist = new Map<string, ReadonlySet<string>>([
     "0157_repair_run_responsible_user_updated_at_sweep.sql",
     new Set(["companies", "heartbeat_runs", "issues", "routine_runs", "routines"]),
   ],
+  [
+    "0258_unbind_issues_from_collected_execution_workspaces.sql",
+    new Set(["issues"]),
+  ],
 ]);
 
 function findUserVisibleUpdatedAtBackfillViolations(
