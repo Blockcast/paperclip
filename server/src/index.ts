@@ -1237,6 +1237,14 @@ export async function startServer(): Promise<StartedServer> {
   // timeout: clearing the latch without cancelling the work would re-admit the
   // overlap the latch exists to remove, so this reports and does not act.
   let heartbeatRecoveryChainInFlight = false;
+  // BLO-35878: the periodic orphan reap, single-flighted across ticks. The reap
+  // is fleet-wide and costs per-run k8s reads; once one outlives the 30 s tick,
+  // the next tick's reap overlaps it, they contend on the one in-pod k8s client
+  // and DB pool, each gets slower, and overlap compounds. Measured 2026-10-14:
+  // ~6 sweeps in flight at once, mean sweep 2 s -> 50-77 s within 45 min of a
+  // restart, pinning start-lock callers at their 120 s reap wait bound. Only the
+  // reap step is latched: the rest of the dispatch chain still runs every tick.
+  let periodicOrphanReapInFlight = false;
   let heartbeatRecoveryChainStartedAt = 0;
   // PEN-3314: latches the stall COUNTER to once per stalled pass. A counter
   // that ticked with the log would conflate "how many passes stalled" with "how
@@ -2290,7 +2298,15 @@ export async function startServer(): Promise<StartedServer> {
           // their k8s Job was created").
           trackHeartbeatSchedulerWork(heartbeat
             .resumeRunningExternalRuntimeRuns()
-            .then(() => heartbeat.reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 }))
+            .then(async () => {
+              if (periodicOrphanReapInFlight) return;
+              periodicOrphanReapInFlight = true;
+              try {
+                await heartbeat.reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 });
+              } finally {
+                periodicOrphanReapInFlight = false;
+              }
+            })
             .then(() => heartbeat.promoteDueScheduledRetries())
             .then(async (promotion) => {
               await heartbeat.resumeQueuedRuns();
