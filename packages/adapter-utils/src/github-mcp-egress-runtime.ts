@@ -1,11 +1,16 @@
 // PEN-3152: process the MCP egress transform at the `github-mcp-server`
 // boundary, mirroring github-cli-egress-runtime.ts at the `gh` boundary.
 //
-// The Helm seed writes a shell launcher for this module into
-// /paperclip/.local/bin/github-mcp-server, which is what the seeded `.mcp.json`
-// names as the `github` upstream's command. So this sits between the agent's
-// MCP client and the real server, in the same position the CLI runtime occupies
-// in front of /usr/bin/gh.
+// A shell launcher for this module ships in the image at
+// /usr/local/libexec/paperclip/bin/github-mcp-server (PEN-3713), which is what
+// the seeded `.mcp.json` names as the `github` upstream's command. So this sits
+// between the agent's MCP client and the real server, in the same position the
+// CLI runtime occupies in front of /usr/bin/gh.
+//
+// That name is an ABSOLUTE path in `.mcp.json`, so unlike `gh` it gets none of
+// the PATH-ordering protection — it points at the root-owned copy directly.
+// It used to name the PVC copy at /paperclip/.local/bin/github-mcp-server;
+// that agent-writable generation was retired in PEN-3840.
 //
 // ## Only stdin is piped, and that is a security property
 //

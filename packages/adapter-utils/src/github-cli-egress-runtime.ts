@@ -1,6 +1,8 @@
 // PEN-2527: process adapter-utils' GitHub egress transform at the `gh` binary
-// boundary. The Helm seed writes a small shell launcher for this module into
-// /paperclip/.local/bin, which is first on every agent Job's PATH.
+// boundary. A small shell launcher for this module ships in the image at
+// /usr/local/libexec/paperclip/bin (PEN-3713), which leads every agent Job's
+// PATH. It used to be seeded onto the PVC at /paperclip/.local/bin; that
+// agent-writable generation was retired in PEN-3840.
 
 import { spawn } from "node:child_process";
 import {
