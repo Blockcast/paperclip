@@ -839,6 +839,7 @@ describe("embedded guard: lock re-assertion before outward side effects (BLO-299
     "gh api repos/O/R/merges -XPOST -f base=a -f head=b",
     "bash -c 'git push origin HEAD'",
     "ssh host 'cd /w && git push'",
+    "bash <<'EOF'\ngit push origin HEAD\nEOF",
   ]) {
     it(`blocks ${JSON.stringify(cmd)} when another run holds the lock`, async () => {
       await withApi(foreign, async (vars) => {
