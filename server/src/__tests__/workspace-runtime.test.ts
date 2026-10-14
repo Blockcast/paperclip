@@ -5548,6 +5548,57 @@ describe("realizeExecutionWorkspace", () => {
     }
   }, 30_000);
 
+  it("refuses an operator archive of a detached HEAD with unpushed commits (BLO-45957)", async () => {
+    const repoRoot = await createTempRepo();
+    const cleanupCommitted = async (identifier: string, detach: boolean) => {
+      const workspace = await realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-1",
+          workspaceId: "workspace-1",
+          repoUrl: null,
+          repoRef: "HEAD",
+        },
+        config: { workspaceStrategy: { type: "git_worktree", branchTemplate: "{{issue.identifier}}-{{slug}}" } },
+        issue: { id: `issue-${identifier}`, identifier, title: "Detached operator archive" },
+        agent: { id: "agent-1", name: "Codex Coder", companyId: "company-1" },
+      });
+      await fs.writeFile(path.join(workspace.cwd, "work.txt"), "unpushed\n");
+      await runGit(workspace.cwd, ["add", "work.txt"]);
+      await runGit(workspace.cwd, ["commit", "-m", "unpushed work"]);
+      const head = await readGit(workspace.cwd, ["rev-parse", "HEAD"]);
+      if (detach) await runGit(workspace.cwd, ["checkout", "--detach"]);
+      const cleanup = await cleanupExecutionWorkspaceArtifacts({
+        trigger: "operator",
+        workspace: {
+          id: `execution-workspace-${identifier}`,
+          cwd: workspace.cwd,
+          providerType: "git_worktree",
+          providerRef: workspace.worktreePath,
+          branchName: workspace.branchName,
+          repoUrl: workspace.repoUrl,
+          baseRef: workspace.repoRef,
+          projectId: workspace.projectId,
+          projectWorkspaceId: workspace.workspaceId,
+          sourceIssueId: `issue-${identifier}`,
+          metadata: null,
+        },
+        projectWorkspace: { cwd: repoRoot, cleanupCommand: null },
+      });
+      return { workspace, cleanup, head };
+    };
+
+    const detached = await cleanupCommitted("PAP-484", true);
+    expect(detached.cleanup.warnings.join("\n")).toContain("HEAD is detached with unpushed commits");
+    await expect(readGit(detached.workspace.cwd, ["rev-parse", "HEAD"])).resolves.toBe(detached.head);
+
+    // Control: the same unpushed commit on a branch is still removed — the branch keeps it.
+    const onBranch = await cleanupCommitted("PAP-485", false);
+    expect(onBranch.cleanup.warnings.join("\n")).not.toContain("Refusing to remove git worktree");
+    await expect(fs.stat(onBranch.workspace.cwd)).rejects.toThrow();
+  }, 30_000);
+
   it("keeps an unmerged runtime-created branch and warns instead of force deleting it", async () => {
     const repoRoot = await createTempRepo();
 
@@ -7675,6 +7726,67 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
 
     expect(contention).toBeNull();
   }, 20_000);
+
+  // BLO-45957: the source issue alone reads terminal; the linked row's status decides.
+  it.each([
+    [472, "uncapped", "in_progress", true],
+    [473, "hidden", "in_progress", true],
+    [474, "uncapped", "done", false],
+    [475, "hidden", "done", false],
+  ] as const)("PAP-%i: a %s linked issue that is %s contends=%s (BLO-45957)", async (n, variant, liveStatus, contends) => {
+    const expectedBranch = `PAP-${n}-recorded`;
+    const actualBranch = `PAP-${n}-live`;
+    const { repoRoot, worktreePath } = await createDirtyMismatchRepo({ expectedBranch, actualBranch });
+    const ids = await seedDirtyQuarantineRecords({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      sourceIdentifier: `PAP-${n}`,
+      claimant: "idle",
+    });
+    const base = Date.now();
+    // Newest, so the source issue stays inside the capped read.
+    await db
+      .update(issues)
+      .set({ status: "done", updatedAt: new Date(base + 60_000) })
+      .where(eq(issues.id, ids.claimant!.issueId));
+    const [claimantIssue] = await db.select().from(issues).where(eq(issues.id, ids.claimant!.issueId));
+    const linked = (i: number, status: "in_progress" | "done", updatedAt: Date, hiddenAt: Date | null = null) => ({
+      id: randomUUID(),
+      companyId: ids.companyId,
+      projectId: claimantIssue!.projectId,
+      projectWorkspaceId: claimantIssue!.projectWorkspaceId,
+      title: `Linked ${i}`,
+      status,
+      priority: "medium" as const,
+      identifier: `PAP-${n}-L${i}`,
+      executionWorkspaceId: ids.claimant!.workspaceId,
+      updatedAt,
+      hiddenAt,
+    });
+    if (variant === "uncapped") {
+      // 19 terminal rows fill the read with the source; the live row is the 21st, oldest.
+      await db.insert(issues).values([
+        ...Array.from({ length: 19 }, (_, i) => linked(i, "done", new Date(base + 30_000))),
+        linked(19, liveStatus, new Date(base - 60_000)),
+      ]);
+    } else {
+      await db.insert(issues).values(linked(0, liveStatus, new Date(base), new Date(base)));
+    }
+    const contention = await executionWorkspaceService(db).findGitWorktreeContention({
+      companyId: ids.companyId,
+      worktreePath,
+      liveBranchName: actualBranch,
+      excludingExecutionWorkspaceId: ids.sourceWorkspaceId,
+      excludingSourceIssueId: ids.sourceIssueId,
+    });
+    if (contends) {
+      expect(contention).toMatchObject({ claimedByWorkspaceId: ids.claimant!.workspaceId, activeRun: null });
+    } else {
+      expect(contention).toBeNull();
+    }
+  }, 30_000);
 
   it("still contends on an idle orphan claimant with no source issue (BLO-45629)", async () => {
     const expectedBranch = "PAP-471-recorded";
