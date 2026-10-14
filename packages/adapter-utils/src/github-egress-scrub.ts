@@ -181,9 +181,23 @@ const DIGEST_NAME_RE = /(?:^|[_.\-])(?:sha(?:1|224|256|384|512)|md5|digest|check
  *  hex digest pin above: neither half is safe alone. */
 const PNPM_PATCH_HASH_RE = /^[a-z2-7]{26}$/;
 
+/** BLO-46448: an Alertmanager/Prometheus alert name — `VaultTLSProbeUnreachable`
+ *  — in an `amtool silence add alertname=<name>` matcher, as written into the
+ *  alert rules' own runbook text on onprem-k8s. It scores 3.94 bits/char, and
+ *  every agent push touching a rules file carrying that line was refused.
+ *
+ *  UpperCamelCase words, optionally with an acronym run of up to 5 capitals
+ *  before the next word (`TLS`, `API`), no digits. Name-anchored on purpose,
+ *  like the patch_hash pin: shape alone was measured and declined. Through
+ *  the entropy floor, 500k random values per shape, the bare shape passes
+ *  ~22% of mixed-case letters-only tokens; adding lowercase-run and acronym
+ *  bounds still left ~1.4e-3 at 24 chars, above this file's accepted band. */
+const ALERT_NAME_RE = /^(?:[A-Z][a-z]+|[A-Z]{1,5}(?=[A-Z][a-z]))+$/;
+
 /** True when a NAME=VALUE pair is a content digest pin rather than a secret. */
 function isContentDigestAssignment(name: string, value: string): boolean {
   if (name === "patch_hash" && PNPM_PATCH_HASH_RE.test(value)) return true;
+  if (name === "alertname" && ALERT_NAME_RE.test(value)) return true;
   return DIGEST_NAME_RE.test(name) && HEX_DIGEST_RE.test(value);
 }
 
