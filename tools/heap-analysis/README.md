@@ -52,8 +52,18 @@ process generation — see the pid caveat below.
 In a `.heapsnapshot` a string node's **name is its contents**. `redact.mjs`
 reduces every string payload to `<type, Nch, #sha256-8>`, and any non-string name
 over 256 chars to `<redacted, Nch, #sha256-8>` — an over-long "identifier" is the
-shape a payload arrives in. Constructor and edge names below that are program
-identifiers and are kept, because they are what makes a path legible.
+shape a payload arrives in. Constructor names below that are program identifiers
+and are kept, because they are what makes a path legible.
+
+**Edge names are the exception, and `redactEdgeName()` is a separate test for
+them.** A `property` edge on a dictionary-mode object carries the *key string*,
+not an identifier, so a DSN or a token keyed into a plain object is short enough
+to pass every rule above — the measured `postgres://` URIs were 19–58 chars.
+`retainers.mjs` therefore runs `property` and `context` edge names through an
+identifier-shape test and hashes anything that fails it. That costs legibility on
+legitimate non-identifier keys (`content-type`); the hash still separates
+distinct paths. Every *other* edge type names a V8 slot (`internal source`,
+`bindings`) and is kept verbatim — those are what make a retainer path readable.
 
 **`summarize.mjs` applies it before anything reaches disk, and that placement is
 the fix for a real defect, not a style preference.** The original version redacted

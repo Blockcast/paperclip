@@ -14,15 +14,18 @@
 //   <name> may be a literal constructor name ("Map"), or for string-ish nodes
 //   the #hash8 printed by report.mjs ("#f4cd7070").
 //
-// SECURITY (same contract as report.mjs, see heap-tools/README.md): in this
-// format a string node's "name" IS its contents and the file holds the worker's
-// secrets in plaintext. Every string-ish payload is emitted as
-// <type, Nch, #sha256-8> and never verbatim. Edge names and constructor names
-// are program identifiers, not payloads, and are what make a path legible, so
-// those are kept — but any name over STRING_KEEP_MAX chars is redacted too,
-// because an over-long "identifier" is the shape a payload would arrive in.
+// SECURITY (same contract as report.mjs, see tools/heap-analysis/README.md): in
+// this format a string node's "name" IS its contents and the file holds the
+// worker's secrets in plaintext. The contract lives in ./redact.mjs and is
+// imported, never re-implemented: every string-ish payload is emitted as
+// <type, Nch, #sha256-8> and never verbatim, and any name over STRING_KEEP_MAX
+// chars is redacted too, because an over-long "identifier" is the shape a
+// payload would arrive in. Constructor names below that cap are program
+// identifiers and are kept. EDGE names are not: a `property` edge on a
+// dictionary-mode object carries the key STRING, so those go through
+// redactEdgeName() — see redact.mjs for why that is a separate test.
 import { open } from "node:fs/promises";
-import { createHash } from "node:crypto";
+import { h8, redactEdgeName, redactName, STRING_KEEP_MAX } from "./redact.mjs";
 
 const args = process.argv.slice(2);
 const file = args[0];
@@ -36,9 +39,7 @@ const SELECT = flag("select", null);
 const SAMPLES = Number(flag("samples", 300));
 const MAX_DEPTH = Number(flag("depth", 12));
 const TOP = Number(flag("top", 15));
-const STRING_KEEP_MAX = 256;
 
-const h8 = (s) => createHash("sha256").update(s).digest("hex").slice(0, 8);
 const mb = (b) => (b / 1048576).toFixed(1);
 
 // ---------- byte reader ----------
@@ -150,23 +151,27 @@ if (!(await seek('"strings":['))) throw new Error("no strings");
 }
 await fh.close();
 
-const STRINGY = new Set(["string", "concatenated string", "sliced string"]);
 function rawName(i) { const v = names.get(i); return typeof v === "string" ? v : null; }
 function safeNodeName(i, typeIdx) {
   const t = NODE_TYPES[typeIdx] ?? ("type" + typeIdx);
   const v = names.get(i);
   if (v === undefined) return "(anon)";
+  // Over-long names are already reduced to {len, hash} by the string-table
+  // reader above, so they never reach redactName() as a full string.
   if (typeof v !== "string") return `<${t}, ${v.len}ch, #${v.hash}>`;
-  if (STRINGY.has(t)) return `<${t}, ${v.length}ch, #${h8(v)}>`;
-  if (v.length > STRING_KEEP_MAX) return `<redacted, ${v.length}ch, #${h8(v)}>`;
-  return v || "(anon)";
+  return redactName(t, v) || "(anon)";
 }
 function edgeLabel(ei) {
   const t = eType[ei], tn = EDGE_TYPES[t] ?? ("etype" + t);
   if (!STR_EDGE.has(t)) return `[${eName[ei]}]`;         // element/hidden: numeric index
   const v = names.get(eName[ei]);
   if (typeof v !== "string") return v ? `<redacted #${v.hash}>` : "?";
-  return (tn === "property" || tn === "context") ? v : `${v}(${tn})`;
+  // property/context edge names are the only ones carrying PROGRAM data — on a
+  // dictionary-mode object a property edge's name IS the key string.
+  if (tn === "property" || tn === "context") return redactEdgeName(v);
+  // Every other type names a V8 slot ("internal source", "bindings"): keep it
+  // legible, but an over-long one is still payload-shaped.
+  return `${v.length > STRING_KEEP_MAX ? `<redacted, ${v.length}ch, #${h8(v)}>` : v}(${tn})`;
 }
 
 // ---------- CSR: forward offsets, then reverse index ----------

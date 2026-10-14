@@ -1,16 +1,21 @@
 // Baseline view of one summarised snapshot, or a diff of two.
 import { readFileSync } from "node:fs";
-import { h8, STRINGY, isRedacted } from "./redact.mjs";
+import { redactName } from "./redact.mjs";
 const mb = (b) => (b / 1048576).toFixed(1);
 const load = (p) => JSON.parse(readFileSync(p, "utf8"));
 // SECURITY: in a .heapsnapshot a string node's "name" IS its contents, and the
 // file holds the worker's secrets in plaintext. Never emit string payloads.
-// Summaries written by summarize.mjs are already redacted on disk; this keeps
-// working on a pre-PEN-3631 raw summary, and emits the same bytes for both.
+// Summaries written by summarize.mjs are already redacted on disk; redactName()
+// is idempotent, so this keeps working on a pre-PEN-3631 raw summary and emits
+// the same bytes for both.
+//
+// Redact BEFORE truncating. Truncation is cosmetic, not a control: on a raw
+// summary a non-string name over STRING_KEEP_MAX used to be printed as its
+// first 70 characters in plaintext, which is a partial payload AND breaks the
+// same-bytes property above — it held on the real snapshot only because no such
+// row reached the top 25.
 const safeName = (r) => {
-  if (isRedacted(r.name)) return r.name;
-  const n = r.name || "(anon)";
-  if (STRINGY.has(r.type)) return `<${r.type}, ${n.length}ch, #${h8(n)}>`;
+  const n = redactName(r.type, r.name || "(anon)");
   return n.length > 70 ? n.slice(0, 70) + "\u2026" : n;
 };
 const key = (r) => r.type + " | " + safeName(r);

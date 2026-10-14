@@ -871,6 +871,45 @@ What follows from that:
   multi-gigabyte credential-bearing partial. If you do set the override, quote it
   with the fallback inline — `"${PAPERCLIP_HEAP_SNAPSHOT_DIR:-<instance-root>/data/diagnostics/heap}"`.
 
+  A glob ending at `.heapsnapshot` reports an empty directory while a
+  multi-gigabyte credential-bearing partial sits in it. The startup warning
+  counts both and lists them separately; the periodic sweep deletes a partial
+  once it is past its abandonment window (10 minutes from its filename stamp),
+  which is also why a freshly stranded one keeps the poll armed rather than
+  arming nothing.
+- **Treat each capture as a credential-exposure event.** Decide on rotation of
+  the App private key and the agent JWT secret the same way you would for any
+  other disclosure, rather than filing it as a diagnostic. Delete the snapshot as
+  soon as it has been analysed rather than waiting for it to age out, and prefer
+  analysing it somewhere the volume is not shared.
+- Where the trade is acceptable, a `kubectl debug` ephemeral container against
+  `--heapsnapshot-signal` writes to `/proc/<pid>/cwd` (container-local, **not**
+  the shared claim) and is the safer option on this axis. It needs
+  `pods/ephemeralcontainers` and is a one-off manoeuvre rather than something
+  repeatable, which is why it is not the default here — but it is a real trade.
+
+Two more things to know before enabling it:
+
+- A snapshot is **stop-the-world**. Expect a pause of seconds on a multi-gigabyte
+  heap, during which the process answers nothing, health checks included.
+- A snapshot file is roughly 1.5-2x the live heap. The retention cap and the
+  free-space floor are what keep that from filling a shared volume, so do not
+  raise `KEEP` without checking what else lives there.
+
+If the volume is too full, the worker logs `Heap snapshot skipped` and writes
+nothing — **and retains the snapshots it would otherwise have pruned.** The
+free-space test already credits the bytes that prune would release
+(`reclaimableBytes` in the log line), so a refusal means deleting them would not
+have been enough. Snapshots of a past heap state cannot be retaken, so they are
+kept rather than spent on a write that cannot happen.
+
+One snapshot names what is on the heap. It takes **two, hours apart**, to name what
+is *accumulating* — load the pair into Chrome DevTools (Memory → Load) and use the
+"Objects allocated between snapshot 1 and 2" comparison view. Copy the pair off
+the volume before you disable the flag — see the security section above, where
+that ordering and the reason for it are spelled out — and delete both once the
+diff has been read.
+
 ### ⛔ Anything you DERIVE from a snapshot inherits the secrets — and nothing sweeps it
 
 Every control above governs one directory. `MAX_AGE_MINUTES`, the delete-on-disable
@@ -910,45 +949,6 @@ Two consequences for the operator ordering above:
 - **A grep, a `cut`, a scratch file, a pasted excerpt is the same object as the
   snapshot** for this purpose. The only safe thing to move off the claim is
   output that has been through `redactName()`.
-
-  A glob ending at `.heapsnapshot` reports an empty directory while a
-  multi-gigabyte credential-bearing partial sits in it. The startup warning
-  counts both and lists them separately; the periodic sweep deletes a partial
-  once it is past its abandonment window (10 minutes from its filename stamp),
-  which is also why a freshly stranded one keeps the poll armed rather than
-  arming nothing.
-- **Treat each capture as a credential-exposure event.** Decide on rotation of
-  the App private key and the agent JWT secret the same way you would for any
-  other disclosure, rather than filing it as a diagnostic. Delete the snapshot as
-  soon as it has been analysed rather than waiting for it to age out, and prefer
-  analysing it somewhere the volume is not shared.
-- Where the trade is acceptable, a `kubectl debug` ephemeral container against
-  `--heapsnapshot-signal` writes to `/proc/<pid>/cwd` (container-local, **not**
-  the shared claim) and is the safer option on this axis. It needs
-  `pods/ephemeralcontainers` and is a one-off manoeuvre rather than something
-  repeatable, which is why it is not the default here — but it is a real trade.
-
-Two more things to know before enabling it:
-
-- A snapshot is **stop-the-world**. Expect a pause of seconds on a multi-gigabyte
-  heap, during which the process answers nothing, health checks included.
-- A snapshot file is roughly 1.5-2x the live heap. The retention cap and the
-  free-space floor are what keep that from filling a shared volume, so do not
-  raise `KEEP` without checking what else lives there.
-
-If the volume is too full, the worker logs `Heap snapshot skipped` and writes
-nothing — **and retains the snapshots it would otherwise have pruned.** The
-free-space test already credits the bytes that prune would release
-(`reclaimableBytes` in the log line), so a refusal means deleting them would not
-have been enough. Snapshots of a past heap state cannot be retaken, so they are
-kept rather than spent on a write that cannot happen.
-
-One snapshot names what is on the heap. It takes **two, hours apart**, to name what
-is *accumulating* — load the pair into Chrome DevTools (Memory → Load) and use the
-"Objects allocated between snapshot 1 and 2" comparison view. Copy the pair off
-the volume before you disable the flag — see the security section above, where
-that ordering and the reason for it are spelled out — and delete both once the
-diff has been read.
 
 ## Secrets in Dev
 

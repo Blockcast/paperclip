@@ -34,3 +34,29 @@ export function redactName(type, name) {
   if (n.length > STRING_KEEP_MAX) return `<redacted, ${n.length}ch, #${h8(n)}>`;
   return n;
 }
+
+// An EDGE name is not reliably a program identifier, and that is the hole this
+// closes. On a dictionary-mode object a `property` edge's name IS the key
+// string, so a DSN or a token used as a plain-object key prints verbatim under
+// redactName() — it is under STRING_KEEP_MAX and is not a `string` NODE, so
+// neither arm fires. The measured postgres URIs were 19–58 chars; they would
+// have fit. `context` edges (closure variable names) are the same shape and are
+// treated the same way.
+//
+// The test is deliberately narrow: an optional `#` private-field marker and
+// then a JS identifier. A rejected name may well be a legitimate string key
+// ("content-type"), but nothing here can tell that from a credential, and the
+// hash keeps distinct paths distinct either way — legibility is the thing being
+// spent, not correctness.
+//
+// Apply it only to `property`/`context`. Every other edge type names a V8 slot
+// ("internal source", "bindings"), which is program-independent, fails this
+// test, and is what makes a retainer path readable.
+const IDENTIFIER_SHAPE = /^#?[A-Za-z_$][A-Za-z0-9_$]*$/;
+
+export function redactEdgeName(name) {
+  const n = name ?? "";
+  if (isRedacted(n)) return n;
+  if (n.length <= STRING_KEEP_MAX && IDENTIFIER_SHAPE.test(n)) return n;
+  return `<redacted, ${n.length}ch, #${h8(n)}>`;
+}
