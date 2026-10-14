@@ -256,28 +256,57 @@ agent pods on images predating the move. They are gone now that every agent
 Job pod is measured onto a post-`bb62073a` image.
 
 This is a SECURITY-ORDERED list, and it is NOT "the directories that belong on
-PATH". `<base>/bin` still belongs on PATH as ordinary tooling (kubectl, helm,
-yq, kyverno, google-chrome) and is added by `paperclip.runtimePath` from
-`paperclip.toolingBinDir` instead. Conflating the two is the trap: the render
-guard only validates directories this list *declares*, so folding tooling in
-here means dropping a wrapper directory silently takes unrelated tooling off
-PATH with it, and nothing fails.
+PATH". `<base>/bin` and `<base>/.local/bin` both still belong on PATH, and are
+added by `paperclip.runtimePath` from `paperclip.toolingBinDirs` instead.
+Conflating the two is the trap: the render guard only validates directories this
+list *declares*, so folding tooling in here means dropping a wrapper directory
+silently takes unrelated tooling off PATH with it, and nothing fails.
 */}}
 {{- define "paperclip.wrapperBinDirs" -}}
 {{- include "paperclip.imageWrapperBinDir" . -}}
 {{- end }}
 
 {{/*
-The PVC directory carrying general agent tooling (kubectl, helm, yq, kyverno,
-google-chrome).
+The PVC directories that must stay on PATH without being wrapper directories.
 
-Deliberately not a wrapper directory: it is agent-writable, so it must never
-carry anything security-relevant, and it sits *behind* the wrapper directory on
-PATH so it cannot shadow one. Derived from persistence.mountPath, like the seed
-that populates it, so a relocated PVC does not drop it off PATH.
+Two entries, each load-bearing for a different reason:
+
+  <base>/bin         General agent tooling — kubectl, helm, yq, kyverno,
+                     google-chrome. Purely functional. It is agent-writable, so
+                     nothing security-relevant may live here.
+
+  <base>/.local/bin  Agent-writable, and since PEN-3840 it holds no GitHub
+                     wrapper at all — only the `claude`/`codex` symlinks the
+                     seed still creates. It stays on PATH as a SECURITY
+                     control, which is the counter-intuitive part.
+
+                     The PVC dotfiles (`<base>/.zshenv`, `.bashrc`, `.profile`
+                     — fleet state, not in this repo) each run
+
+                         case ":$PATH:" in
+                           *":$HOME/.local/bin:"*) ;;
+                           *) PATH="$HOME/.local/bin:$PATH" ;;
+                         esac
+
+                     and the claude_k8s Job sets ZDOTDIR and BASH_ENV to stubs
+                     that chain them on EVERY shell start, not just login
+                     shells. So dropping this entry does not take the directory
+                     off PATH — it moves it to the FRONT, ahead of the
+                     root-owned wrapper directory. That is precisely the
+                     PEN-3713 defect, reopened by the change meant to close it.
+
+                     Measured in an agent pod 2026-10-14: with this entry
+                     absent, `gh`, `git` and `github-mcp-server` all resolve to
+                     `<base>/.local/bin`; with it present, all three resolve to
+                     the root-owned image directory.
+
+Both sit *behind* the wrapper directory on PATH, so neither can shadow a
+wrapper. Derived from persistence.mountPath, like the seed that populates them,
+so a relocated PVC does not drop them off PATH.
 */}}
-{{- define "paperclip.toolingBinDir" -}}
-{{- printf "%s/bin" (.Values.persistence.mountPath | trimSuffix "/") -}}
+{{- define "paperclip.toolingBinDirs" -}}
+{{- $base := .Values.persistence.mountPath | trimSuffix "/" -}}
+{{- printf "%s/.local/bin,%s/bin" $base $base -}}
 {{- end }}
 
 {{/*
@@ -304,7 +333,8 @@ Override with `env.path`. The override is validated rather than trusted.
 {{- fail "env.extra must not define PATH: a duplicate env var would silently override the chart-managed PATH that keeps the GitHub egress scrubber (PEN-2527) ahead of /usr/bin. Set env.path instead, which is validated." -}}
 {{- end -}}
 {{- end -}}
-{{- $path := .Values.env.path | default (printf "%s:%s:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" (join ":" $wrapperDirs) (include "paperclip.toolingBinDir" .)) -}}
+{{- $toolingDirs := splitList "," (include "paperclip.toolingBinDirs" .) -}}
+{{- $path := .Values.env.path | default (printf "%s:%s:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" (join ":" $wrapperDirs) (join ":" $toolingDirs)) -}}
 {{- $entries := splitList ":" $path -}}
 {{- $systemIdx := -1 -}}
 {{- range $i, $entry := $entries -}}
@@ -352,10 +382,22 @@ Override with `env.path`. The override is validated rather than trusted.
 {{- $prevIdx = $idx -}}
 {{- $prevDir = $dir -}}
 {{- end -}}
-{{- /* PEN-3840: the tooling directory is not security-ordered, but it must not
-       fall off PATH — kubectl/helm/yq/kyverno/google-chrome live there and the
-       render guard above cannot notice a directory nobody declares. */ -}}
-{{- $toolingDir := include "paperclip.toolingBinDir" . -}}
+{{- /* PEN-3840: the tooling directories are not security-ordered, but neither
+       may fall off PATH, and the guard above cannot notice a directory nobody
+       declares. The two have different failure modes:
+
+         <base>/bin        drops kubectl/helm/yq/kyverno/google-chrome.
+                           Functional breakage, nothing fails loudly.
+
+         <base>/.local/bin does NOT drop the directory. The PVC dotfiles
+                           re-add it at the FRONT (see
+                           `paperclip.toolingBinDirs`), ahead of the lead
+                           wrapper directory — so omitting it here is a
+                           silent PEN-3713 regression, not a missing path.
+                           The leading-entry check above cannot catch it:
+                           the reordering happens after the shell starts,
+                           downstream of anything this chart renders. */ -}}
+{{- range $toolingDir := $toolingDirs -}}
 {{- $toolingIdx := -1 -}}
 {{- range $i, $entry := $entries -}}
 {{- if and (eq $entry $toolingDir) (lt $toolingIdx 0) -}}
@@ -363,7 +405,8 @@ Override with `env.path`. The override is validated rather than trusted.
 {{- end -}}
 {{- end -}}
 {{- if lt $toolingIdx 0 -}}
-{{- fail (printf "env.path must include the Paperclip tooling directory %q, or kubectl/helm/yq/kyverno/google-chrome stop resolving in the server pod (PEN-3840)" $toolingDir) -}}
+{{- fail (printf "env.path must include the Paperclip tooling directory %q. Omitting <base>/bin stops kubectl/helm/yq/kyverno/google-chrome resolving in the server pod. Omitting <base>/.local/bin is worse than it looks: the PVC shell dotfiles prepend that directory whenever PATH lacks it, putting an agent-writable directory AHEAD of the root-owned wrappers and taking PEN-2527 egress scrubbing off the traffic path (PEN-3840)." $toolingDir) -}}
+{{- end -}}
 {{- end -}}
 {{- $path -}}
 {{- end }}

@@ -32,21 +32,26 @@ content, not of where the script is stored. The volume was only ever a
 convenient shared channel between two images; `COPY --from=server` is a better
 one, because it cannot be written at run time.
 
-## The duplicate copies, and when they go
+## The duplicate copies are gone (PEN-3840)
 
-The `seed` initContainer still writes its own copies, and the chart still keeps
-`<mountPath>/.local/bin` and `<mountPath>/bin` on PATH **behind** this directory.
-That is a deliberate rollout fallback: an agent pod on a pre-PEN-3713 image has
-no root-owned copy, and removing the PVC install in the same change would drop
-it straight through to the unscrubbed `/usr/bin/gh`. With both present, a new
-image wins outright and an old one still resolves something that scrubs, so
-neither rollout order has a window.
+This directory is now the only generation. The `seed` initContainer no longer
+writes wrapper copies onto the PVC, the seeded `.mcp.json` names
+`/usr/local/libexec/paperclip/bin/github-mcp-server` rather than the PVC copy,
+and `deploy/helm/paperclip/tests/agent-egress-path.test.mjs` asserts the chart
+writes no GitHub wrapper onto the volume at all.
 
-While both exist they are two copies of one rule, so
-`deploy/helm/paperclip/tests/agent-egress-path.test.mjs` compares them and fails
-on drift. Deleting the seed block, dropping the PVC entries from PATH, and
-removing the stale files from the volume is the PEN-3713 follow-up, gated on the
-fleet being on images that carry this directory.
+Retiring the PVC generation was deferred out of PEN-3713 and gated on a fleet
+census: an agent pod on a pre-PEN-3713 image had no root-owned copy, so removing
+the PVC install before every agent image carried this directory would have
+dropped it straight through to the unscrubbed `/usr/bin/gh`. That census was
+measured clean before the removal landed.
+
+One piece of the old arrangement deliberately survives: `<mountPath>/.local/bin`
+is still on PATH, **behind** this directory. It holds no wrapper any more. It
+stays because the PVC shell dotfiles prepend it whenever PATH lacks it — so
+removing the entry would not drop the directory, it would promote it ahead of
+this one. See `paperclip.toolingBinDirs` in the chart helpers for the mechanism
+and the measurement.
 
 ### `github-mcp-server` is the exception: it is still dialled on the PVC
 

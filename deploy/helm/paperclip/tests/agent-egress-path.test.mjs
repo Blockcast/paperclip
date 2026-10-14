@@ -160,28 +160,34 @@ function assertWrapperOrdering(pathValue, base) {
     `the root-owned ${IMAGE_WRAPPER_BIN} must be first on PATH, got ${pathValue}`,
   );
 
-  // The retired generation must be gone, not merely outranked: a PATH still
-  // carrying it would keep executing agent-writable copies wherever the files
-  // survive on the PVC.
-  assert.ok(
-    !entries.includes(`${base}/.local/bin`),
-    `the retired agent-writable ${base}/.local/bin must no longer be on PATH, got ${pathValue}`,
-  );
-
-  // ...and the tooling directory must survive the removal. Not a wrapper
-  // directory and not security-ordered, but kubectl/helm/yq/kyverno/chrome live
-  // there: dropping it alongside the wrapper entries is the silent collateral
-  // the wrapperBinDirs/toolingBinDir split exists to prevent.
-  const toolingIdx = entries.indexOf(`${base}/bin`);
-  assert.notEqual(
-    toolingIdx,
-    -1,
-    `the tooling directory ${base}/bin must stay on PATH, got ${pathValue}`,
-  );
-  assert.ok(
-    toolingIdx > 0 && toolingIdx < systemIdx,
-    `${base}/bin must sit behind the wrapper directory and ahead of /usr/bin, got ${pathValue}`,
-  );
+  // Both PVC directories must stay on PATH, behind the lead. Neither is a
+  // wrapper directory any more, and they are kept for different reasons:
+  //
+  //   <base>/bin        kubectl/helm/yq/kyverno/google-chrome live there, so
+  //                     dropping it alongside the wrapper entries is the
+  //                     silent collateral the wrapperBinDirs/toolingBinDirs
+  //                     split exists to prevent.
+  //
+  //   <base>/.local/bin no longer holds a wrapper, but the PVC shell dotfiles
+  //                     prepend it whenever PATH lacks it (see
+  //                     `paperclip.toolingBinDirs`). Asserting it is ABSENT —
+  //                     which the first draft of PEN-3840 did, as the
+  //                     intuitive reading of "retire the PVC generation" —
+  //                     pins the arrangement that puts an agent-writable
+  //                     directory FIRST in every agent shell. The property
+  //                     wanted is "present but outranked", not "gone".
+  for (const dir of [`${base}/.local/bin`, `${base}/bin`]) {
+    const idx = entries.indexOf(dir);
+    assert.notEqual(
+      idx,
+      -1,
+      `the tooling directory ${dir} must stay on PATH, got ${pathValue}`,
+    );
+    assert.ok(
+      idx > 0 && idx < systemIdx,
+      `${dir} must sit behind the wrapper directory and ahead of /usr/bin, got ${pathValue}`,
+    );
+  }
 }
 
 // --- The invariant, under the chart's own defaults ------------------------
@@ -285,6 +291,82 @@ test("a non-login shell resolves gh to the root-owned wrapper under the default-
 test("a non-login shell resolves git to the publish-guarding wrapper", () => {
   assert.equal(resolvesTo("git"), "scrubbing-wrapper");
 });
+
+// PEN-3840, the regression that nearly shipped: this chart's PATH is not the
+// PATH an agent command actually runs under. The PVC carries shell dotfiles
+// (`<base>/.zshenv`, `.bashrc`, `.profile` — fleet state, not in this repo),
+// each of which re-adds <base>/.local/bin to the FRONT when PATH lacks it:
+//
+//     case ":$PATH:" in
+//       *":$HOME/.local/bin:"*) ;;
+//       *) PATH="$HOME/.local/bin:$PATH" ;;
+//     esac
+//
+// and the claude_k8s Job sets ZDOTDIR/BASH_ENV to stubs that chain them on
+// every shell start, not just login shells. So "drop the retired PVC entry
+// from PATH" — the intuitive reading of this card — does not remove that
+// directory from the lookup. It promotes it past the root-owned wrappers.
+//
+// The render guards cannot see this: the reordering happens after the shell
+// starts, downstream of everything the chart controls. The only chart-side
+// defence is to keep the entry present so the guard stays a no-op, and the
+// only way to pin that is to run the stanza.
+//
+// Measured in an agent pod 2026-10-14 against the real dotfiles: with the
+// entry absent, gh/git/github-mcp-server all resolved to /paperclip/.local/bin;
+// with it present, all three resolved to the image directory.
+function resolvesThroughDotfile(tool) {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), `${tool}-dotfile-`));
+  const wrapperBin = path.join(base, "image-wrapper-bin");
+  const imageBin = path.join(base, "usr-bin");
+  const pvcLocalBin = path.join(base, ".local", "bin");
+  for (const dir of [wrapperBin, imageBin, pvcLocalBin]) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+
+  const rendered = render("templates/statefulset.yaml", {
+    set: [`persistence.mountPath=${base}`],
+  });
+
+  writeExecutable(wrapperBin, tool, "#!/bin/sh\necho scrubbing-wrapper\n");
+  writeExecutable(imageBin, tool, "#!/bin/sh\necho image-cli\n");
+  // The stale PVC copy this card deletes. It is written here on purpose: the
+  // assertion must hold because of PATH order, not because the file is gone.
+  // Step 4 removes these from the live PVC, but a chart that only works once
+  // they are gone is a chart that re-breaks the moment anything recreates one.
+  writeExecutable(pvcLocalBin, tool, "#!/bin/sh\necho agent-writable-pvc\n");
+
+  const testPath = containerPath(rendered)
+    .split(":")
+    .map((entry) => {
+      if (entry === "/usr/bin") return imageBin;
+      if (entry === IMAGE_WRAPPER_BIN) return wrapperBin;
+      return entry;
+    })
+    .join(":");
+
+  // Verbatim shape of the stanza the PVC dotfiles carry.
+  const script = [
+    'case ":$PATH:" in',
+    '  *":$HOME/.local/bin:"*) ;;',
+    '  *) PATH="$HOME/.local/bin:$PATH" ;;',
+    "esac",
+    `exec ${tool}`,
+  ].join("\n");
+
+  const result = spawnSync("/bin/sh", ["-c", script], {
+    encoding: "utf8",
+    env: { PATH: testPath, HOME: base },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  return result.stdout.trim();
+}
+
+for (const tool of ["gh", "git", "github-mcp-server"]) {
+  test(`${tool} still resolves to the root-owned wrapper after the PVC dotfile runs`, () => {
+    assert.equal(resolvesThroughDotfile(tool), "scrubbing-wrapper");
+  });
+}
 
 test("the git wrapper routes through the egress runtime, inside the token wrapper", () => {
   const body = wrapperBody("git");
@@ -400,10 +482,26 @@ test("an env.path override that prepends an agent-writable directory is rejected
 // and google-chrome.
 test("an env.path override that drops the tooling directory is rejected", () => {
   const stderr = renderExpectingFailure([
-    `env.path=${IMAGE_WRAPPER_BIN}:/usr/local/bin:/usr/bin:/bin`,
+    `env.path=${IMAGE_WRAPPER_BIN}:/paperclip/.local/bin:/usr/local/bin:/usr/bin:/bin`,
   ]);
   assert.match(stderr, /must include the Paperclip tooling directory/);
-  assert.match(stderr, /\/paperclip\/bin/);
+  assert.match(stderr, /"\/paperclip\/bin"/);
+});
+
+// The same guard, on the entry whose absence is a SECURITY regression rather
+// than a functional one. Dropping <base>/.local/bin does not take it off the
+// PATH an agent shell ends up with — the PVC dotfiles put it back at the
+// front, ahead of the root-owned wrappers. Nothing downstream of the chart can
+// catch that, so the chart has to refuse the render.
+test("an env.path override that drops the PVC .local/bin entry is rejected", () => {
+  const stderr = renderExpectingFailure([
+    `env.path=${IMAGE_WRAPPER_BIN}:/paperclip/bin:/usr/local/bin:/usr/bin:/bin`,
+  ]);
+  assert.match(stderr, /must include the Paperclip tooling directory/);
+  assert.match(stderr, /"\/paperclip\/\.local\/bin"/);
+  // The message has to explain the non-obvious half, or the next person
+  // "simplifies" the entry away again for exactly the reason it was added.
+  assert.match(stderr, /prepend/);
 });
 
 // A positive control for the rejections above: the validation has to
@@ -412,7 +510,7 @@ test("an env.path override that drops the tooling directory is rejected", () => 
 test("an env.path override that keeps the wrapper directory first is accepted", () => {
   const rendered = render("templates/statefulset.yaml", {
     set: [
-      `env.path=${IMAGE_WRAPPER_BIN}:/paperclip/bin:/opt/custom/bin:/usr/bin:/bin`,
+      `env.path=${IMAGE_WRAPPER_BIN}:/paperclip/.local/bin:/paperclip/bin:/opt/custom/bin:/usr/bin:/bin`,
     ],
   });
   const value = containerPath(rendered);
@@ -431,7 +529,7 @@ test("the Blockcast overlay renders the PATH the chart now derives", () => {
   });
   assert.equal(
     containerPath(rendered),
-    `${IMAGE_WRAPPER_BIN}:/paperclip/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`,
+    `${IMAGE_WRAPPER_BIN}:/paperclip/.local/bin:/paperclip/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`,
   );
 });
 
