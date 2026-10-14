@@ -27,11 +27,14 @@
 -- history survives the unbind.
 --
 -- Idempotent: a repaired row no longer matches the join.
+--
+-- Leaves `updated_at` alone: a backfill must not re-sort these rows, most of
+-- them closed, to the top of "recently updated". The guard in
+-- packages/db/src/client.test.ts refuses that unless allowlisted.
 -- paperclip:migration-safety-ignore full-table-mutation-large-table: the join restricts this to issues pointing at an already-collected workspace (137 production rows measured 2026-10-10), and `issues_company_execution_workspace_idx` serves the predicate.
 UPDATE "issues" AS "issue"
 SET
-	"execution_workspace_id" = NULL,
-	"updated_at" = now()
+	"execution_workspace_id" = NULL
 FROM "execution_workspaces" AS "workspace"
 WHERE "workspace"."id" = "issue"."execution_workspace_id"
 	AND "workspace"."cleanup_reason" = 'collected';
