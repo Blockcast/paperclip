@@ -4126,6 +4126,16 @@ describe("tool-child memory cap (BLO-34477)", () => {
 // pod, and every pod runs as uid 1000, so no file mode can separate one company
 // from another. These pin the mount-level boundary that replaces it: a read-only
 // parent with nested rw `subPath` re-mounts for exactly the trees a run writes.
+/** The mount a container sees `target` through: the deepest at or above it. */
+function deepestMount(mounts: k8s.V1VolumeMount[], target: string): k8s.V1VolumeMount | undefined {
+  let best: k8s.V1VolumeMount | undefined;
+  for (const m of mounts) {
+    if (target !== m.mountPath && !target.startsWith(`${m.mountPath}/`)) continue;
+    if (!best || m.mountPath.length > best.mountPath.length) best = m;
+  }
+  return best;
+}
+
 describe("scoped writable mounts (BLO-32734)", () => {
   const WORKSPACE_DESCRIPTOR = {
     isolationMode: "workspace",
@@ -4157,8 +4167,10 @@ describe("scoped writable mounts (BLO-32734)", () => {
     const parent = main.find((m) => m.mountPath === "/paperclip" && !m.subPath);
     expect(parent?.readOnly).toBe(true);
 
-    const scoped = main.filter((m) => m.name === "data" && m.subPath);
-    // Every nested re-mount is writable and scoped to a subtree, never the root.
+    // The company skills bind is the one read-only re-mount (Phase 2a).
+    const scoped = main.filter((m) => m.name === "data" && m.subPath && !m.readOnly);
+    expect(main.find((m) => m.mountPath === "/paperclip/instances/default/skills/co1")?.readOnly).toBe(true);
+    // Every nested rw re-mount is scoped to a subtree, never the root.
     for (const mount of scoped) {
       expect(mount.readOnly).toBeFalsy();
       expect(mount.subPath).toBeTruthy();
@@ -4193,14 +4205,75 @@ describe("scoped writable mounts (BLO-32734)", () => {
       "/paperclip/.local/lib/paperclip-k8s-runtimes/companies/co2/claude-code",
     ];
     for (const container of [main, init]) {
-      const writable = container.filter((m) => !m.readOnly);
       for (const target of foreign) {
-        const covering = writable.filter(
-          (m) => target === m.mountPath || target.startsWith(`${m.mountPath}/`),
-        );
-        expect(covering, `${target} must not be writable, covered by ${JSON.stringify(covering)}`).toEqual([]);
+        // What the pod sees at `target` is its deepest covering mount. The
+        // instance overlay is rw but holds no data, so it is not "writable" here.
+        const seen = deepestMount(container, target);
+        expect(seen?.name === "data" && !seen.readOnly, `${target} must not be writable, seen through ${JSON.stringify(seen)}`).toBe(false);
       }
     }
+  });
+
+  // Phase 2a: READ isolation. Under the instance root, anything that is not one
+  // of this run's own binds must resolve to the per-pod overlay, never to the
+  // shared volume — including the instance secrets the CTO ruled on.
+  it("hides foreign tenants and instance secrets behind the instance overlay", () => {
+    const ctx = isolatedCtx();
+    ctx.config = {
+      ...(ctx.config ?? {}),
+      instructionsFilePath: "/paperclip/instances/default/companies/co1/agents/agent-abc/instructions/AGENTS.md",
+    };
+    const { job, scopedWritableDirs } = buildJobManifest({ ctx, selfPod: makeSelfPod() });
+    const spec = job.spec?.template?.spec;
+    expect(spec?.volumes?.find((v) => v.name === "instance-overlay")?.emptyDir).toBeTruthy();
+    const unreachable = [
+      "/paperclip/instances/default/secrets/master.key",
+      "/paperclip/instances/default/data/backups/paperclip-20260628.sql",
+      "/paperclip/instances/default/.env",
+      "/paperclip/instances/default/config.json",
+      "/paperclip/instances/default/db/PG_VERSION",
+      "/paperclip/instances/default/data/run-logs/co2/agent-zzz/run.pod.ndjson",
+      "/paperclip/instances/default/data/run-logs/co3/agent-yyy/run.pod.ndjson",
+      "/paperclip/instances/default/projects/co2/proj-9/_default/README.md",
+      "/paperclip/instances/default/projects/co3/proj-8/_default/README.md",
+      "/paperclip/instances/default/companies/co2/agents/agent-zzz/instructions/AGENTS.md",
+      "/paperclip/instances/default/skills/co2/__runtime__/x/SKILL.md",
+      "/paperclip/instances/default/data/k8s-isolation/co2/agent-zzz/run-1/home",
+    ];
+    const own: Array<[string, boolean]> = [
+      ["/paperclip/instances/default/projects/co1/proj-1/_default/README.md", true],
+      ["/paperclip/instances/default/data/run-logs/co1/agent-abc/isolated/workspacews-1/r.pod.ndjson", true],
+      // CTO condition: the agent's own managed bundle is a rw bind (AC3).
+      ["/paperclip/instances/default/companies/co1/agents/agent-abc/instructions/AGENTS.md", true],
+      ["/paperclip/instances/default/companies/co1/agents/agent-abc/memory/x.md", true],
+      ["/paperclip/instances/default/skills/co1/__runtime__/x/SKILL.md", false],
+    ];
+    for (const container of [spec?.containers[0], spec?.initContainers?.[0]]) {
+      const mounts = container?.volumeMounts ?? [];
+      for (const target of unreachable) {
+        expect(deepestMount(mounts, target)?.name, target).toBe("instance-overlay");
+      }
+      for (const [target, writable] of own) {
+        const seen = deepestMount(mounts, target);
+        expect(seen?.name, target).toBe("data");
+        expect(!seen?.readOnly, target).toBe(writable);
+      }
+      // Documentation only — the runtime orders by depth; the live probe is the check.
+      const paths = mounts.map((m) => m.mountPath);
+      const overlayAt = paths.indexOf("/paperclip/instances/default");
+      for (const [i, p] of paths.entries()) {
+        if (p.startsWith("/paperclip/instances/default/")) expect(i, p).toBeGreaterThan(overlayAt);
+      }
+    }
+    // Pre-created by the server so the kubelet never makes it root:root.
+    expect(scopedWritableDirs).toContain("/paperclip/instances/default/skills/co1");
+  });
+
+  it("adds no instance overlay when the data mount stays broad", () => {
+    const { job } = buildJobManifest({ ctx: makeCtx(), selfPod: makeSelfPod() });
+    const spec = job.spec?.template?.spec;
+    expect(spec?.volumes?.some((v) => v.name === "instance-overlay")).toBe(false);
+    expect(spec?.containers[0]?.volumeMounts?.some((m) => m.mountPath.startsWith("/paperclip/instances/default"))).toBe(false);
   });
 
   it("company-scopes the shared scratch trees without moving their paths", () => {
