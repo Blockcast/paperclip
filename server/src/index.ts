@@ -1385,7 +1385,7 @@ export async function startServer(): Promise<StartedServer> {
         // running must not start a second one beside it.
         if (heartbeatStartupRecoveryPending || heartbeatSchedulerStopped) return;
         heartbeatStartupRecoveryPending = true;
-        trackHeartbeatSchedulerWork((async () => {
+        const startupHeartbeatRecovery = (async () => {
           // BLO-19722: finish any worker-crash recovery a previous crash could
           // not. These rows are already terminal (`interrupted` /
           // `worker_crashed`), so the orphan reaper below can never find them —
@@ -1426,8 +1426,14 @@ export async function startServer(): Promise<StartedServer> {
           }
 
           // Started at boot, not here; see `hotRestartAdoption` above. Awaited
-          // so the reap below still sees the runs this process adopted.
-          await hotRestartAdoption;
+          // so the reap below still sees the runs this process adopted. Keep
+          // this await isolated as well: the adoption promise is currently
+          // self-guarded, but a future change must not let it skip the reap.
+          try {
+            await hotRestartAdoption;
+          } catch (err) {
+            logger.error({ err }, "startup hot-restart adoption wait failed");
+          }
 
           for (let attempt = 1; attempt <= 2; attempt++) {
             try {
@@ -1666,7 +1672,8 @@ export async function startServer(): Promise<StartedServer> {
                 executionWorkspaceCollectorStartedAt = 0;
               }));
           }
-        })().catch((err) => {
+        })();
+        trackHeartbeatSchedulerWork(startupHeartbeatRecovery.catch((err) => {
           logger.error({ err }, "startup heartbeat recovery failed");
         }).finally(() => {
           heartbeatStartupRecoveryPending = false;
