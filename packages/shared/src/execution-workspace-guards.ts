@@ -4,6 +4,11 @@ type ExecutionWorkspaceGuardTarget = Pick<ExecutionWorkspace, "closedAt" | "mode
 
 const CLOSED_EXECUTION_WORKSPACE_STATUSES = new Set<ExecutionWorkspace["status"]>(["archived", "cleanup_failed"]);
 
+/** Does this status, on its own, mean "closed"? */
+export function isClosedExecutionWorkspaceStatus(status: ExecutionWorkspace["status"]): boolean {
+  return CLOSED_EXECUTION_WORKSPACE_STATUSES.has(status);
+}
+
 /**
  * Mode-independent: is this workspace closed, whatever kind it is?
  *
@@ -83,5 +88,8 @@ export function isExecutionWorkspaceDetachPatch(input: {
   if (!keys.every((key) => EXECUTION_WORKSPACE_DETACH_FIELDS.has(key))) return false;
   // Also covers the empty patch: `every` is vacuously true on no keys, and this rejects it.
   if (!Object.prototype.hasOwnProperty.call(input.body, "executionWorkspaceId")) return false;
-  return input.body.executionWorkspaceId !== input.closedExecutionWorkspaceId;
+  // UUIDs compare case-insensitively: the validator accepts an uppercase id, so a strict
+  // `!==` let an echo of the same workspace in upper case pass as a rebind.
+  const target = input.body.executionWorkspaceId;
+  return typeof target !== "string" || target.toLowerCase() !== input.closedExecutionWorkspaceId.toLowerCase();
 }
