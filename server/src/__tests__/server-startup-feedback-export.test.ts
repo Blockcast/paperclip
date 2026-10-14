@@ -240,13 +240,21 @@ vi.mock("@paperclipai/db", async (importOriginal) => ({
 // follower instead of failing open. The mocked db above never reaches it, so
 // the real holder would gate off every scheduler tick these tests drive. Pin it
 // to leader; lease semantics are scheduler-lease.test.ts's job.
+// BLO-46523: `start()` must fire `onAcquire` like the real holder does on
+// acquisition. Startup recovery runs from that callback (BLO-45212), and with
+// `isLeader()` already true the fail-open branch in index.ts never fires — so
+// a stub that only returns `true` silently skips recovery and every test that
+// waits on it fails.
 vi.mock("../services/scheduler-lease.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../services/scheduler-lease.js")>()),
-  schedulerLeaseHolder: vi.fn(() => ({
+  schedulerLeaseHolder: vi.fn((_db: unknown, opts: { onAcquire?: () => void }) => ({
     identity: { pod: "test-pod", holderId: "test-pod#leader" },
     isLeader: () => true,
     shouldRunLoop: () => true,
-    start: async () => true,
+    start: async () => {
+      opts.onAcquire?.();
+      return true;
+    },
     stop: async () => false,
   })),
 }));
