@@ -1,5 +1,5 @@
 diff --git a/cf/src/connection.js b/cf/src/connection.js
-index 8e79170aeb13efe8c3c77ccede0cd3a115b5e1b5..f75db792608fd6babc275b3b195e277e5ead26c0 100644
+index 8e79170aeb13efe8c3c77ccede0cd3a115b5e1b5..0f14eb7d65c247c2a22c4252f684b2e308972b32 100644
 --- a/cf/src/connection.js
 +++ b/cf/src/connection.js
 @@ -77,6 +77,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
@@ -10,7 +10,37 @@ index 8e79170aeb13efe8c3c77ccede0cd3a115b5e1b5..f75db792608fd6babc275b3b195e277e
  
    let socket = null
      , cancelMessage
-@@ -254,6 +255,17 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -165,14 +166,27 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+     if (q.cancelled)
+       return
+ 
++    // BLO-45336: build and serialise BEFORE enqueueing. Upstream enqueued
++    // first, so a throwing build() (UNDEFINED_VALUE, MAX_PARAMETERS_EXCEEDED)
++    // left the never-sent query in `sent` and the catch below rejected the
++    // in-flight `query` instead. Every later response on that connection was
++    // then attributed to the query before it -- a permanent off-by-one.
++    let buffer
++    try {
++      build(q)
++      buffer = toBuffer(q)
++    } catch (error) {
++      queryError(q, error)
++      return true
++    }
++
+     try {
+       q.state = backend
+       query
+         ? sent.push(q)
+         : (query = q, query.active = true)
+ 
+-      build(q)
+-      return write(toBuffer(q))
++      return write(buffer)
+         && !q.describeFirst
+         && !q.cursorFn
+         && sent.length < max_pipeline
+@@ -254,6 +268,17 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
    }
  
    function nextWrite(fn) {
@@ -28,7 +58,7 @@ index 8e79170aeb13efe8c3c77ccede0cd3a115b5e1b5..f75db792608fd6babc275b3b195e277e
      const x = socket.write(chunk, fn)
      nextWriteTimer !== null && clearImmediate(nextWriteTimer)
      chunk = nextWriteTimer = null
-@@ -417,16 +429,59 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -417,16 +442,59 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
        !connection.reserved && onend(connection),
        !connection.reserved && !initial && !query && sent.length === 0
          ? (terminate(), new Promise(r => socket && socket.readyState !== 'closed' ? socket.once('close', r) : r()))
@@ -90,7 +120,7 @@ index 8e79170aeb13efe8c3c77ccede0cd3a115b5e1b5..f75db792608fd6babc275b3b195e277e
      if (socket) {
        socket.removeListener('data', data)
        socket.removeListener('connect', connected)
-@@ -439,9 +494,17 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -439,9 +507,17 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
      incoming = Buffer.alloc(0)
      remaining = 0
      incomings = null
@@ -184,7 +214,7 @@ index 0d44a15cd9e42beaf11d4be6ccde60223e09508a..74e2d05eeabcd700df1e7ef7c56d992b
  
    simple() {
 diff --git a/cjs/src/connection.js b/cjs/src/connection.js
-index 07f6716702ac888215c86ad6e0071aaf55ae519c..9691d9f4bd1624ed680ef3d32a3ed6c2e0685c79 100644
+index 07f6716702ac888215c86ad6e0071aaf55ae519c..f1cdf164b4734ae82b931e4f6e1aec6e4df24cd9 100644
 --- a/cjs/src/connection.js
 +++ b/cjs/src/connection.js
 @@ -75,6 +75,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
@@ -195,7 +225,37 @@ index 07f6716702ac888215c86ad6e0071aaf55ae519c..9691d9f4bd1624ed680ef3d32a3ed6c2
  
    let socket = null
      , cancelMessage
-@@ -252,6 +253,17 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -163,14 +164,27 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+     if (q.cancelled)
+       return
+ 
++    // BLO-45336: build and serialise BEFORE enqueueing. Upstream enqueued
++    // first, so a throwing build() (UNDEFINED_VALUE, MAX_PARAMETERS_EXCEEDED)
++    // left the never-sent query in `sent` and the catch below rejected the
++    // in-flight `query` instead. Every later response on that connection was
++    // then attributed to the query before it -- a permanent off-by-one.
++    let buffer
++    try {
++      build(q)
++      buffer = toBuffer(q)
++    } catch (error) {
++      queryError(q, error)
++      return true
++    }
++
+     try {
+       q.state = backend
+       query
+         ? sent.push(q)
+         : (query = q, query.active = true)
+ 
+-      build(q)
+-      return write(toBuffer(q))
++      return write(buffer)
+         && !q.describeFirst
+         && !q.cursorFn
+         && sent.length < max_pipeline
+@@ -252,6 +266,17 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
    }
  
    function nextWrite(fn) {
@@ -213,7 +273,7 @@ index 07f6716702ac888215c86ad6e0071aaf55ae519c..9691d9f4bd1624ed680ef3d32a3ed6c2
      const x = socket.write(chunk, fn)
      nextWriteTimer !== null && clearImmediate(nextWriteTimer)
      chunk = nextWriteTimer = null
-@@ -415,16 +427,59 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -415,16 +440,59 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
        !connection.reserved && onend(connection),
        !connection.reserved && !initial && !query && sent.length === 0
          ? (terminate(), new Promise(r => socket && socket.readyState !== 'closed' ? socket.once('close', r) : r()))
@@ -275,7 +335,7 @@ index 07f6716702ac888215c86ad6e0071aaf55ae519c..9691d9f4bd1624ed680ef3d32a3ed6c2
      if (socket) {
        socket.removeListener('data', data)
        socket.removeListener('connect', connected)
-@@ -437,9 +492,17 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -437,9 +505,17 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
      incoming = Buffer.alloc(0)
      remaining = 0
      incomings = null
@@ -369,7 +429,7 @@ index 45327f2fabcdbf8f8ec5020675012c310c04fee6..5ebfa4c654d624333aafaf6738fb3297
  
    simple() {
 diff --git a/src/connection.js b/src/connection.js
-index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..58799f7ca06a5d801f4aa28b592e20d7b579810e 100644
+index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..16c6c109298561b2dc44d2b52b5b7f22a4428c38 100644
 --- a/src/connection.js
 +++ b/src/connection.js
 @@ -75,6 +75,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
@@ -380,7 +440,37 @@ index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..58799f7ca06a5d801f4aa28b592e20d7
  
    let socket = null
      , cancelMessage
-@@ -252,6 +253,17 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -163,14 +164,27 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+     if (q.cancelled)
+       return
+ 
++    // BLO-45336: build and serialise BEFORE enqueueing. Upstream enqueued
++    // first, so a throwing build() (UNDEFINED_VALUE, MAX_PARAMETERS_EXCEEDED)
++    // left the never-sent query in `sent` and the catch below rejected the
++    // in-flight `query` instead. Every later response on that connection was
++    // then attributed to the query before it -- a permanent off-by-one.
++    let buffer
++    try {
++      build(q)
++      buffer = toBuffer(q)
++    } catch (error) {
++      queryError(q, error)
++      return true
++    }
++
+     try {
+       q.state = backend
+       query
+         ? sent.push(q)
+         : (query = q, query.active = true)
+ 
+-      build(q)
+-      return write(toBuffer(q))
++      return write(buffer)
+         && !q.describeFirst
+         && !q.cursorFn
+         && sent.length < max_pipeline
+@@ -252,6 +266,17 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
    }
  
    function nextWrite(fn) {
@@ -398,7 +488,7 @@ index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..58799f7ca06a5d801f4aa28b592e20d7
      const x = socket.write(chunk, fn)
      nextWriteTimer !== null && clearImmediate(nextWriteTimer)
      chunk = nextWriteTimer = null
-@@ -415,16 +427,59 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -415,16 +440,59 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
        !connection.reserved && onend(connection),
        !connection.reserved && !initial && !query && sent.length === 0
          ? (terminate(), new Promise(r => socket && socket.readyState !== 'closed' ? socket.once('close', r) : r()))
@@ -460,7 +550,7 @@ index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..58799f7ca06a5d801f4aa28b592e20d7
      if (socket) {
        socket.removeListener('data', data)
        socket.removeListener('connect', connected)
-@@ -437,9 +492,17 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -437,9 +505,17 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
      incoming = Buffer.alloc(0)
      remaining = 0
      incomings = null
