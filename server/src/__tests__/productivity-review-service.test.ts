@@ -5912,6 +5912,44 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.description).toContain("Primary trigger: `long_active_duration`");
   });
 
+  // BLO-25722 (b), Ally review of #2727: a capacity park that has been PROMOTED
+  // but not yet dispatched. `promoteScheduledRetryRun` moves the row
+  // `scheduled_retry -> queued`, clears `errorCode`, and keeps
+  // `scheduledRetryReason`/`scheduledRetryAt`; `startedAt` stays null. That row
+  // is still waiting for a slot, so it must keep reading as an open
+  // `dispatch_backlog` block. If the widened capacity branch claims it instead,
+  // `resolved` drops it as the current block and the review fires on an issue
+  // whose run never got its turn.
+  it("keeps suppressing long_active_duration while a promoted capacity park waits for dispatch (BLO-25722 (b))", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const episodeStart = new Date(now.getTime() - 10 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStart });
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      status: "queued",
+      invocationSource: "automation",
+      triggerDetail: "system",
+      errorCode: null,
+      scheduledRetryAt: new Date(now.getTime() - 60 * 60 * 1000),
+      scheduledRetryAttempt: 0,
+      scheduledRetryReason: "ccrotate_capacity",
+      startedAt: null,
+      contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+      createdAt: episodeStart,
+      updatedAt: episodeStart,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
   // BLO-23624 review finding 2 (Ally, PR #1268): `noExecutableTurnBreakdown`
   // reverses `latestRuns`, which the query orders `desc(createdAt), desc(id)`.
   // On a `createdAt` tie, only a matching `id` tie-break recovers the correct
