@@ -574,6 +574,93 @@ export function serializeSweepInvocations<Args extends unknown[], Result>(
   };
 }
 
+/**
+ * The action-scoped recovery sweeps, in the order `reconcileIssueGraphLiveness` runs them.
+ * Also the label a sweep is reported under when it fails.
+ */
+export const ACTION_SCOPED_SWEEP_NAMES = [
+  "resolved_dependency_wake_backstop",
+  "stranded_recovery_wake_backstop",
+  "expired_recovery_wake_horizons",
+] as const;
+
+export type ActionScopedSweepName = (typeof ACTION_SCOPED_SWEEP_NAMES)[number];
+
+export interface ActionScopedSweepOutcome<Dependency, Stranded, Expired> {
+  /** `null` when that sweep threw; its roll-up fields then keep their initialized zeros. */
+  resolvedDependencyWakeBackstop: Dependency | null;
+  strandedRecoveryWakeBackstop: Stranded | null;
+  expiredRecoveryWakeHorizons: Expired | null;
+  failedSweeps: ActionScopedSweepName[];
+}
+
+/**
+ * Runs the action-scoped recovery sweeps so that one sweep's failure cannot skip the others
+ * on the same tick (PEN-4094).
+ *
+ * These sweeps were awaited in a bare sequence, so the first to throw abandoned every sweep
+ * after it. That inverts the point of a backstop twice over: each of these *is* a backstop,
+ * and the one that runs first is whichever was added most recently -- so the newest and
+ * least-proven sweep held the power to silence the oldest and most load-bearing ones.
+ *
+ * All three are isolated symmetrically rather than special-casing whichever is newest,
+ * because the argument applies to every pair and a sweep added later should inherit the
+ * isolation instead of having to remember to ask for it.
+ *
+ * A failing sweep yields `null`, which leaves its roll-up counters at the zeros the result
+ * was initialized with. Zero is already this result's "nothing to do" reading, so the
+ * failure would otherwise be indistinguishable from a quiet tick -- hence `failedSweeps`,
+ * which names what did not run, alongside the log line. Callers that must not continue past
+ * a failed sweep should read `failedSweeps` rather than relying on a throw.
+ *
+ * The sweeps stay sequential. They contend on the same recovery rows and carry the backstop
+ * cursors that `serializeSweepInvocations` exists to protect, so isolating them must not be
+ * taken as licence to run them concurrently.
+ */
+export async function runActionScopedRecoverySweeps<Dependency, Stranded, Expired>(sweeps: {
+  resolvedDependencyWakeBackstop: () => Promise<Dependency>;
+  strandedRecoveryWakeBackstop: () => Promise<Stranded>;
+  expiredRecoveryWakeHorizons: () => Promise<Expired>;
+}): Promise<ActionScopedSweepOutcome<Dependency, Stranded, Expired>> {
+  const failedSweeps: ActionScopedSweepName[] = [];
+
+  const isolate = async <T>(
+    sweep: ActionScopedSweepName,
+    impl: () => Promise<T>,
+  ): Promise<T | null> => {
+    try {
+      return await impl();
+    } catch (err) {
+      failedSweeps.push(sweep);
+      logger.error(
+        { err, sweep },
+        "action-scoped recovery sweep failed; continuing with its sibling sweeps",
+      );
+      return null;
+    }
+  };
+
+  const resolvedDependencyWakeBackstop = await isolate(
+    "resolved_dependency_wake_backstop",
+    sweeps.resolvedDependencyWakeBackstop,
+  );
+  const strandedRecoveryWakeBackstop = await isolate(
+    "stranded_recovery_wake_backstop",
+    sweeps.strandedRecoveryWakeBackstop,
+  );
+  const expiredRecoveryWakeHorizons = await isolate(
+    "expired_recovery_wake_horizons",
+    sweeps.expiredRecoveryWakeHorizons,
+  );
+
+  return {
+    resolvedDependencyWakeBackstop,
+    strandedRecoveryWakeBackstop,
+    expiredRecoveryWakeHorizons,
+    failedSweeps,
+  };
+}
+
 export function backstopSweepCompletionPath(input: {
   useCursor: boolean;
   cursorBeforeQuery: string | null;
@@ -14745,60 +14832,79 @@ export function recoveryService(
       issueIds: [] as string[],
       escalationIssueIds: [] as string[],
       retiredRecoveryIssueIds: obsoleteRecoveryCleanup.retiredIssueIds,
+      // Names the action-scoped sweeps that threw this tick (PEN-4094). Empty is the healthy
+      // reading; their counters above read zero either way, so this is what tells a failed
+      // sweep apart from a quiet one.
+      failedSweeps: [] as ActionScopedSweepName[],
     };
 
-    const dependencyWakeBackstop = await reconcileResolvedDependencyWakeBackstop({
-      runId: opts?.runId ?? null,
+    // PEN-4094: isolated, so a throw from any one of these three cannot skip the other two
+    // for this tick. Each is itself a recovery backstop; see `runActionScopedRecoverySweeps`.
+    const actionScopedSweeps = await runActionScopedRecoverySweeps({
+      resolvedDependencyWakeBackstop: () => reconcileResolvedDependencyWakeBackstop({
+        runId: opts?.runId ?? null,
+      }),
+      // This sibling backstop is independent of liveness findings and remains enabled even
+      // when automatic liveness escalation is disabled: it only redelivers an already-committed
+      // recovery action rather than creating or re-routing recovery work.
+      strandedRecoveryWakeBackstop: () => reconcileStrandedRecoveryWakeBackstop({
+        runId: opts?.runId ?? null,
+        now,
+      }),
+      // Also independent of liveness findings, and for the same reason: this only retires an
+      // already-committed action that has stopped waking anyone, so it must keep running when
+      // automatic liveness escalation is disabled. It is the pass that stops a spent recovery
+      // from reading as healthy (BLO-24662).
+      expiredRecoveryWakeHorizons: () => reconcileExpiredRecoveryWakeHorizons({
+        runId: opts?.runId ?? null,
+        now,
+      }),
     });
-    result.dependencyWakeBackstopChecked = dependencyWakeBackstop.checked;
-    result.dependencyWakesHealed = dependencyWakeBackstop.healed;
-    result.dependencyWakeExistingSkipped = dependencyWakeBackstop.existingWakeSkipped;
-    result.dependencyWakeLivePathSkipped = dependencyWakeBackstop.livePathSkipped;
-    result.dependencyWakeInteractionSkipped = dependencyWakeBackstop.interactionSkipped;
-    result.dependencyWakePauseHoldSkipped = dependencyWakeBackstop.pauseHoldSkipped;
-    result.dependencyWakeNotReadySkipped = dependencyWakeBackstop.notReadySkipped;
-    result.dependencyWakeCandidateLimitSkipped = dependencyWakeBackstop.candidateLimitSkipped;
-    result.dependencyWakeDeferredOrFailed = dependencyWakeBackstop.deferredOrFailed;
-    result.dependencyWakeEnqueueFailed = dependencyWakeBackstop.enqueueFailed;
-    result.dependencyWakeIssueIds = dependencyWakeBackstop.issueIds;
+    result.failedSweeps = actionScopedSweeps.failedSweeps;
 
-    // This sibling backstop is independent of liveness findings and remains enabled even
-    // when automatic liveness escalation is disabled: it only redelivers an already-committed
-    // recovery action rather than creating or re-routing recovery work.
-    const strandedRecoveryWakeBackstop = await reconcileStrandedRecoveryWakeBackstop({
-      runId: opts?.runId ?? null,
-      now,
-    });
-    result.strandedRecoveryWakeBackstopChecked = strandedRecoveryWakeBackstop.checked;
-    result.strandedRecoveryWakesHealed = strandedRecoveryWakeBackstop.healed;
-    result.strandedRecoveryWakeExhaustedSkipped = strandedRecoveryWakeBackstop.exhaustedSkipped;
-    result.strandedRecoveryWakeCooldownSkipped = strandedRecoveryWakeBackstop.cooldownSkipped;
-    // Stays the union total, which is what this field has always meant. The per-arm split
-    // lives on the sweep result and the metric; widening this roll-up would only add an
-    // unread field, while leaving it at the active-run arm alone would silently under-report.
-    result.strandedRecoveryWakeLivePathSkipped = strandedRecoveryWakeBackstop.livePathSkipped
-      + strandedRecoveryWakeBackstop.livePathQueuedWakeSkipped;
-    result.strandedRecoveryWakeDeferredOrFailed = strandedRecoveryWakeBackstop.deferredOrFailed;
-    result.strandedRecoveryWakeEnqueueFailed = strandedRecoveryWakeBackstop.enqueueFailed;
-    result.strandedRecoveryWakeIssueIds = strandedRecoveryWakeBackstop.issueIds;
+    const dependencyWakeBackstop = actionScopedSweeps.resolvedDependencyWakeBackstop;
+    if (dependencyWakeBackstop) {
+      result.dependencyWakeBackstopChecked = dependencyWakeBackstop.checked;
+      result.dependencyWakesHealed = dependencyWakeBackstop.healed;
+      result.dependencyWakeExistingSkipped = dependencyWakeBackstop.existingWakeSkipped;
+      result.dependencyWakeLivePathSkipped = dependencyWakeBackstop.livePathSkipped;
+      result.dependencyWakeInteractionSkipped = dependencyWakeBackstop.interactionSkipped;
+      result.dependencyWakePauseHoldSkipped = dependencyWakeBackstop.pauseHoldSkipped;
+      result.dependencyWakeNotReadySkipped = dependencyWakeBackstop.notReadySkipped;
+      result.dependencyWakeCandidateLimitSkipped = dependencyWakeBackstop.candidateLimitSkipped;
+      result.dependencyWakeDeferredOrFailed = dependencyWakeBackstop.deferredOrFailed;
+      result.dependencyWakeEnqueueFailed = dependencyWakeBackstop.enqueueFailed;
+      result.dependencyWakeIssueIds = dependencyWakeBackstop.issueIds;
+    }
 
-    // Also independent of liveness findings, and for the same reason: this only retires an
-    // already-committed action that has stopped waking anyone, so it must keep running when
-    // automatic liveness escalation is disabled. It is the pass that stops a spent recovery
-    // from reading as healthy (BLO-24662).
-    const expiredHorizons = await reconcileExpiredRecoveryWakeHorizons({
-      runId: opts?.runId ?? null,
-      now,
-    });
-    result.expiredRecoveryHorizonsEscalated = expiredHorizons.escalated;
-    result.expiredRecoveryHorizonsNeverDelivered = expiredHorizons.neverDelivered;
-    // BLO-19124: propagated, not just counted internally. Without it the sweep result cannot
-    // distinguish "the wake channel refused and nothing got done" from "the wake channel
-    // refused but the issue was worked anyway", which is the split that decides whether a
-    // never-delivered spike is a scheduler incident or a discharge-bookkeeping gap.
-    result.expiredRecoveryHorizonsNeverDeliveredButWorked = expiredHorizons.neverDeliveredButWorked;
-    result.expiredRecoveryHorizonsAnnounced = expiredHorizons.announced;
-    result.expiredRecoveryHorizonIssueIds = expiredHorizons.issueIds;
+    const strandedRecoveryWakeBackstop = actionScopedSweeps.strandedRecoveryWakeBackstop;
+    if (strandedRecoveryWakeBackstop) {
+      result.strandedRecoveryWakeBackstopChecked = strandedRecoveryWakeBackstop.checked;
+      result.strandedRecoveryWakesHealed = strandedRecoveryWakeBackstop.healed;
+      result.strandedRecoveryWakeExhaustedSkipped = strandedRecoveryWakeBackstop.exhaustedSkipped;
+      result.strandedRecoveryWakeCooldownSkipped = strandedRecoveryWakeBackstop.cooldownSkipped;
+      // Stays the union total, which is what this field has always meant. The per-arm split
+      // lives on the sweep result and the metric; widening this roll-up would only add an
+      // unread field, while leaving it at the active-run arm alone would silently under-report.
+      result.strandedRecoveryWakeLivePathSkipped = strandedRecoveryWakeBackstop.livePathSkipped
+        + strandedRecoveryWakeBackstop.livePathQueuedWakeSkipped;
+      result.strandedRecoveryWakeDeferredOrFailed = strandedRecoveryWakeBackstop.deferredOrFailed;
+      result.strandedRecoveryWakeEnqueueFailed = strandedRecoveryWakeBackstop.enqueueFailed;
+      result.strandedRecoveryWakeIssueIds = strandedRecoveryWakeBackstop.issueIds;
+    }
+
+    const expiredHorizons = actionScopedSweeps.expiredRecoveryWakeHorizons;
+    if (expiredHorizons) {
+      result.expiredRecoveryHorizonsEscalated = expiredHorizons.escalated;
+      result.expiredRecoveryHorizonsNeverDelivered = expiredHorizons.neverDelivered;
+      // BLO-19124: propagated, not just counted internally. Without it the sweep result cannot
+      // distinguish "the wake channel refused and nothing got done" from "the wake channel
+      // refused but the issue was worked anyway", which is the split that decides whether a
+      // never-delivered spike is a scheduler incident or a discharge-bookkeeping gap.
+      result.expiredRecoveryHorizonsNeverDeliveredButWorked = expiredHorizons.neverDeliveredButWorked;
+      result.expiredRecoveryHorizonsAnnounced = expiredHorizons.announced;
+      result.expiredRecoveryHorizonIssueIds = expiredHorizons.issueIds;
+    }
 
     if (!autoRecoveryEnabled) {
       result.skippedAutoRecoveryDisabled = findings.length;
