@@ -906,6 +906,12 @@ export interface GitPushFinding {
   where: "message" | "content" | "tag-message";
   /** Which scrub classes fired. */
   classes: GitHubEgressScrubClass[];
+  /**
+   * A `content` finding on a merge commit. The material is in the conflict
+   * resolution (nothing a parent carries is scanned), and the remedy differs:
+   * a plain `rebase -i` drops the merge rather than reaching it.
+   */
+  merge?: boolean;
 }
 
 /** Reads git. Returns stdout, or null when the command failed. */
@@ -1081,24 +1087,32 @@ export function commitsForRefUpdate(
  */
 export function addedLinesFromPatch(patch: string): string {
   const added: string[] = [];
-  let inHunk = false;
+  // Origin-marker columns per body line: 1 for an ordinary `@@` hunk, N for a
+  // combined (`--cc`) hunk of an N-parent merge, whose header opens with N+1
+  // `@`. 0 means "not in a hunk".
+  let width = 0;
   for (const line of patch.split("\n")) {
-    if (inHunk) {
-      if (line.startsWith("+")) {
-        added.push(line.slice(1));
+    if (width > 0) {
+      const marker = line.slice(0, width);
+      // Added relative to EVERY parent — the only lines a merge introduces.
+      // A combined line with any ` ` or `-` column is already on that parent,
+      // and every parent is either published or scanned on its own (BLO-46233).
+      if (marker === "+".repeat(width)) {
+        added.push(line.slice(width));
         continue;
       }
-      // The rest of a hunk body: context, removals, the no-newline marker, and
-      // the bare empty line git emits for an empty context line.
-      if (line === "" || line.startsWith(" ") || line.startsWith("-") || line.startsWith("\\")) {
+      // The rest of a hunk body: context, removals, mixed combined columns, the
+      // no-newline marker, and the bare empty line git emits for an empty
+      // context line.
+      if (/^[ +-]*$/.test(marker) || line.startsWith("\\")) {
         continue;
       }
       // Anything else has left the body — a `diff --git` for the next file, or
       // the next `@@`. Fall through to the out-of-hunk tests below.
-      inHunk = false;
+      width = 0;
     }
     if (line.startsWith("@@")) {
-      inHunk = true;
+      width = /^@+/.exec(line)![0].length - 1;
       continue;
     }
     if (line.startsWith("+++ ")) continue;
@@ -1149,7 +1163,14 @@ export function scanCommit(commit: string, runGit: GitReader): GitPushFinding[] 
 
   // `--format=` suppresses the commit header so the message is not scanned
   // twice and reported as two findings. `--no-color` keeps escape sequences out
-  // of the scrubbed text. `-m` makes merge commits emit a patch at all.
+  // of the scrubbed text. `--cc` makes a merge emit a COMBINED diff, whose
+  // all-`+` lines are exactly the content absent from every parent — i.e. the
+  // conflict resolution. BLO-46233: this was `-m`, which emits a patch against
+  // EACH parent, so "merge master into my branch" re-scanned every line master
+  // had added since the branch point and refused content already published.
+  // Every parent is either reachable from a remote or inside the scanned range,
+  // so narrowing the merge to what no parent carries drops nothing. A
+  // non-merge's `--cc` output is byte-identical to the plain patch.
   //
   // `--text` and `--no-textconv` are SECURITY flags, not formatting ones. Both
   // defeat a way for a file's real bytes never to reach this scanner, and each
@@ -1179,13 +1200,14 @@ export function scanCommit(commit: string, runGit: GitReader): GitPushFinding[] 
   // rest clean, which is worst exactly when the push is biggest.
   const patch = readGit(
     runGit,
-    ["show", "--format=", "--no-color", "-m", "--unified=0", "--text", "--no-textconv", commit],
+    ["show", "--format=", "--no-color", "--cc", "--unified=0", "--text", "--no-textconv", commit],
     commit,
   );
   if (patch) {
     const scrubbed = scrubGitHubEgressText(addedLinesFromPatch(patch));
     if (scrubbed.redacted) {
-      findings.push({ commit, shortCommit, subject, where: "content", classes: scrubbed.classes });
+      const merge = /^@@@/m.test(patch);
+      findings.push({ commit, shortCommit, subject, where: "content", classes: scrubbed.classes, ...(merge ? { merge } : {}) });
     }
   }
 
@@ -1369,6 +1391,11 @@ export function formatRefusal(findings: readonly GitPushFinding[]): string {
   } else if (oldest) {
     lines.push(
       `To fix: remove the material from each commit above. The oldest is ${oldest.shortCommit}, so \`git rebase -i ${oldest.shortCommit}~1\` reaches all of them.`,
+    );
+  }
+  if (commitFindings.some((finding) => finding.merge)) {
+    lines.push(
+      "A merge commit above carries the material in its own conflict resolution — content either branch already had is not reported. Fix the file and `git commit --amend` if the merge is the tip; otherwise use `git rebase -i --rebase-merges`, because a plain `rebase -i` drops the merge instead of reaching it.",
     );
   }
   if (tagFindings.length > 0) {
