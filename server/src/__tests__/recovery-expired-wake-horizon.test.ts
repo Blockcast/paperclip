@@ -1047,6 +1047,46 @@ describeEmbeddedPostgres("recovery wake horizon expiry (BLO-24662)", () => {
       expect(comments).toHaveLength(0);
     });
 
+    it("counts and announces a backstop retirement at the pending-wake ceiling (PEN-4006)", async () => {
+      // PEN-4006 gives the horizon a second, creation-anchored bound: while the action's own
+      // wake run is still pending, retirement is deferred up to `createdAt` +
+      // PENDING_RECOVERY_WAKE_CEILING_TIMEOUT_MULTIPLIER x timeoutMs, then the row retires as
+      // `pending_wake_ceiling`. That escalates the action exactly as `timeout_horizon` does,
+      // and writer 1 announces every row it returns, ceiling rows included. The backstop is
+      // the dominant writer, so if it alone stayed silent on this bound the observable would
+      // again depend on which writer won the race, the defect this block exists to pin.
+      __resetMetricsForTest();
+      const seeded = await seed();
+      const actionId = await insertAction(seeded, {
+        // Far past any configured ceiling, so the test does not depend on the timeout knob.
+        createdAt: new Date(now.getTime() - 30 * 24 * 60 * 60_000),
+      });
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId: seeded.companyId,
+        agentId: seeded.ownerAgentId,
+        status: "queued",
+        contextSnapshot: { issueId: seeded.sourceIssueId, recoveryActionId: actionId },
+      });
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn().mockResolvedValue(null) });
+
+      const result = await recovery.reconcileStrandedRecoveryWakeBackstop({ now });
+      expect(result).toMatchObject({ exhaustedSkipped: 1, pendingWakeSkipped: 0 });
+
+      const action = await readAction(actionId);
+      expect(action.status).toBe("escalated");
+      expect(action.retiringBound).toBe("pending_wake_ceiling");
+
+      const { body } = await renderMetrics();
+      expect(body).toContain(`${RECOVERY_HORIZON_EXPIRED_METRIC}{delivery="never_delivered"} 1`);
+      const comments = await db
+        .select({ body: issueComments.body })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, seeded.sourceIssueId));
+      expect(comments).toHaveLength(1);
+      expect(comments[0]!.body).toContain("Recovery wake horizon reached");
+    });
+
     it("announces exactly once when the horizon sweep runs after the backstop retired the row", async () => {
       // The two paths race the same condition in production. The backstop wins, which leaves
       // the row `escalated` and therefore invisible to writer 1 — so the horizon sweep must
@@ -1138,6 +1178,7 @@ describeEmbeddedPostgres("recovery wake horizon expiry (BLO-24662)", () => {
     async function dispatchOntoPastHorizon(
       database: typeof db,
       seeded: Awaited<ReturnType<typeof seed>>,
+      options: { pendingWakePastCeiling?: boolean } = {},
     ) {
       const issue = await db
         .select()
@@ -1186,6 +1227,22 @@ describeEmbeddedPostgres("recovery wake horizon expiry (BLO-24662)", () => {
           fingerprint: `stale:${seeded.sourceIssueId}`,
         })
         .where(eq(issueRecoveryActions.id, minted!.id));
+      if (options.pendingWakePastCeiling) {
+        // PEN-4006: the action's own wake run is still pending, and the row is far past the
+        // creation-anchored ceiling (writer 2 compares against the real clock), so the gate
+        // retires it as `pending_wake_ceiling` rather than deferring it.
+        await db
+          .update(issueRecoveryActions)
+          .set({ createdAt: new Date(Date.now() - 30 * 24 * 60 * 60_000) })
+          .where(eq(issueRecoveryActions.id, minted!.id));
+        await db.insert(heartbeatRuns).values({
+          id: randomUUID(),
+          companyId: seeded.companyId,
+          agentId: seeded.ownerAgentId,
+          status: "queued",
+          contextSnapshot: { issueId: seeded.sourceIssueId, recoveryActionId: minted!.id },
+        });
+      }
       // Clear the mint-time escalation comment and the mint-time metric reads, so what the
       // assertions see comes only from the dispatch under test.
       await db.delete(issueComments).where(eq(issueComments.issueId, seeded.sourceIssueId));
@@ -1252,6 +1309,20 @@ describeEmbeddedPostgres("recovery wake horizon expiry (BLO-24662)", () => {
         .where(eq(issueComments.issueId, seeded.sourceIssueId));
       const horizonNotices = comments.filter((row) => row.body.includes("Recovery wake horizon reached"));
       expect(horizonNotices).toHaveLength(1);
+    });
+
+    it("counts the dispatch retirement at the pending-wake ceiling (PEN-4006)", async () => {
+      // The writer-2 twin of the backstop ceiling test: a `pending_wake_ceiling` retirement is
+      // horizon-class, so the dispatch must count it and must persist and announce the same
+      // bound it wrote, not a hardcoded `timeout_horizon`.
+      const seeded = await seed();
+      await withManager(seeded);
+      const actionId = await dispatchOntoPastHorizon(db, seeded, { pendingWakePastCeiling: true });
+
+      const action = await readAction(actionId);
+      expect(action).toMatchObject({ status: "escalated", retiringBound: "pending_wake_ceiling" });
+      const { body } = await renderMetrics();
+      expect(body).toContain(`${RECOVERY_HORIZON_EXPIRED_METRIC}{delivery="never_delivered"} 1`);
     });
 
     /**
