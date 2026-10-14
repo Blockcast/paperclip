@@ -893,6 +893,36 @@ function liveSegmentStartedAt(executionRun: HeartbeatRunRow | null, now: Date): 
  * `resolved` marks that widening, so the *current-run* clause can keep reading
  * "still parked right now" — a park that ended is not a live block and must not
  * hold suppression open or be rendered as one.
+ *
+ * Reachability, because the widening is narrower than it first looks: a park
+ * that was PROMOTED writes its post-park claim to `startedAt` on this same row,
+ * so it becomes `max(startedAt)` and `activeStartedAt` re-anchors the episode to
+ * the moment the park ended. Such a park is then outside the attributable window
+ * and contributes zero however it is classified here. What this widening
+ * actually recovers is the park finalized WITHOUT promotion — `startedAt` still
+ * null, status now `failed`/`timed_out` — which the pre-BLO-25722 status gate
+ * dropped to zero, and which the `!run.startedAt && (queued || cancelled)`
+ * branch below does not catch either.
+ *
+ * BLO-25722 (c), asked and answered rather than assumed: the (b) defect is
+ * scoped to `long_active_duration` and does NOT reach `no_comment_streak` or
+ * `runtime_failure_streak`. Three independent reasons, each mechanical:
+ *   1. This function has one caller (`noExecutableTurnBreakdown`), whose output
+ *      reaches exactly two readers — the `longActive` bar (via
+ *      `noExecutableTurnDominantAndOpen`) and the evidence note. Neither
+ *      `noComment` nor `runtimeFailure` reads it, so no classification here can
+ *      move a streak verdict.
+ *   2. The streaks walk `terminalRuns`, so a park that is *still*
+ *      `scheduled_retry` is already outside their sample — there is no status
+ *      gate for the (b) bug to be wrong about. Their exclusions
+ *      (`isNeverExecutedRun`/`isNeverInvokedRun`/`isDependencyBlockedRun`) key
+ *      on `livenessState`/`usageJson`/`logBytes`/`errorCode` and never on
+ *      `status`, so the defective predicate shape has no analogue there.
+ *   3. More fundamentally, the streaks are counts over a run sample, not
+ *      durations over an episode. The whole misattribution class — park/queue
+ *      time re-absorbed as assignee-attributable elapsed — needs an elapsed
+ *      figure to corrupt, and they compute none. A promoted park that executed
+ *      a turn and stayed silent is genuine silence and correctly counts.
  */
 function classifyNoExecutableTurnRun(
   run: HeartbeatRunRow,
