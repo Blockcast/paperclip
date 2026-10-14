@@ -519,7 +519,18 @@ jobs:
       - name: Test vendored-provenance union-merge invariants (BLO-34872)
         if: ${{ !cancelled() }}
         run: node --test ./scripts/__tests__/provenance-union-merge.test.mjs
-        timeout-minutes: 1
+        # BLO-43484: fork-heavy — every case builds and rebases a real git repo,
+        # so wall time is bimodal (p50 11s, but 2 of 10 runs in one 6h window
+        # hit the cap). At 1m the kill landed AFTER the suite printed `fail 0`,
+        # failing `policy` and skipping every downstream lane.
+        #
+        # 5m, not the 3m floor, because every CI observation of the slow mode is
+        # CENSORED at the old 60s cap — the sample bounds nothing. The only
+        # uncensored measurements are two runs on a contended CephFS-backed
+        # agent pod: 162s and 192s. 5m clears those; 3m would not have.
+        # Held at or above the floor by CONTENTION_SENSITIVE_STEPS in
+        # policy-node-test-timeouts.test.mjs.
+        timeout-minutes: 5
 
       - name: Require vendored-adapter source changes to be logged (BLO-35109)
         # Replaces the stored 64-hex integrity manifest that used to live in
