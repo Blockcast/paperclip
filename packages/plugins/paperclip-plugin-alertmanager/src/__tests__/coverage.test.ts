@@ -73,6 +73,19 @@ describe("runCoverageCheck (BLO-40673 AC4)", () => {
     expect(write).toHaveBeenCalledWith("alertmanager.coverage.checked", 1);
   });
 
+  it("keeps per-severity counts separate for one alertname", async () => {
+    const { ctx, write } = harness({
+      records: { fp1: record(), fp2: record(), fp3: record() },
+      issues: { "issue-1": { id: "issue-1", status: "cancelled" } },
+    });
+    await runCoverageCheck(ctx, config, NOW, async () =>
+      [amAlert("fp1", "warning"), amAlert("fp2", "critical"), amAlert("fp3", "critical")]);
+    expect(uncoveredCalls(write)).toEqual([
+      ["alertmanager.coverage.uncovered", 1, { alertname: "Synthetic", severity: "warning" }],
+      ["alertmanager.coverage.uncovered", 2, { alertname: "Synthetic", severity: "critical" }],
+    ]);
+  });
+
   it("counts a missing tracked issue as uncovered", async () => {
     const { ctx, write } = harness({ records: { fp1: record() } });
     await runCoverageCheck(ctx, config, NOW, async () => [amAlert("fp1")]);
