@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import { runInNewContext } from "node:vm";
 
 const prWorkflowPath = ".github/workflows/pr.yml";
 const dockerWorkflowPath = ".github/workflows/docker.yml";
@@ -113,4 +114,39 @@ test("Refresh Lockfile populates the setup-node-compatible pnpm cache before sav
     orderedSteps,
     "the refreshed lockfile must be restored, fetched, and saved in order",
   );
+});
+
+
+test("shared image cache exports accept only default-branch sources", async () => {
+  const names = ["docker-agent", "docker-designer", "docker-mcp-external",
+    "docker-mcp-gateway", "docker-figma-bot", "docker-webflow-bot"];
+  for (const name of names) {
+    const workflow = await readFile(`.github/workflows/${name}.yml`, "utf8");
+    const blocks = [...workflow.matchAll(/cache-to: (\$\{\{.+?\}\}|\|\n(?: {12}.+\n)+)/g)];
+    const expressions = blocks.flatMap((block) =>
+      [...block[1].matchAll(/\$\{\{ (.+?) \}\}/g)].map((match) => match[1]));
+    assert.ok(expressions.length, `${name}: cache export declaration missing`);
+    assert.doesNotMatch(workflow, /cache-to: type=|^ {12}type=.+mode=(max|min)/m);
+    const events = [
+      ["push", "refs/heads/master", "", name !== "docker-agent"],
+      ["push", "refs/heads/feature/test", "", false],
+      ["push", "refs/tags/v1.0", "", false],
+      ["pull_request", "refs/pull/123/merge", "", false],
+      ["workflow_dispatch", "refs/heads/master", "", true],
+      ["workflow_dispatch", "refs/heads/feature/test", "", false],
+      ["workflow_run", "refs/heads/master", "master", name === "docker-agent"],
+      ["workflow_run", "refs/heads/master", "feature/test", false],
+    ];
+    for (const [event_name, ref, head_branch, allowed] of events) {
+      for (const expression of expressions) {
+        const result = runInNewContext(expression, {
+          github: { event_name, ref, event: { workflow_run: { head_branch } } },
+        }, { timeout: 100 });
+        assert.equal(Boolean(result), allowed, `${name}: ${event_name} ${ref} ${head_branch}`);
+      }
+    }
+    if (name === "docker-figma-bot" || name === "docker-webflow-bot") {
+      assert.match(workflow, /value=buildcache-inline,enable=\$\{\{ github\.ref == 'refs\/heads\/master'/);
+    }
+  }
 });

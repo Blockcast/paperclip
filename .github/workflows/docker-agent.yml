@@ -197,7 +197,7 @@ jobs:
           build-args: |
             RUNTIME_BASE_IMAGE=${{ steps.bases.outputs.runtime_base_image }}
           cache-from: type=registry,ref=harbor.blockcast.net/paperclip/paperclip-runtime:latest
-          cache-to: type=inline
+          cache-to: ${{ ((github.event_name == 'workflow_run' && github.event.workflow_run.head_branch == 'master') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master')) && 'type=inline' || '' }}
           tags: |
             ${{ steps.bases.outputs.runtime_image }}
             harbor.blockcast.net/paperclip/paperclip-runtime:latest
@@ -219,7 +219,7 @@ jobs:
           # uploading the 7 GB toolchain through image and cache exporters at
           # the same time, while :latest remains usable as cache-from.
           cache-from: type=registry,ref=harbor.blockcast.net/paperclip-agent/paperclip-agent-toolchain:latest
-          cache-to: type=inline
+          cache-to: ${{ ((github.event_name == 'workflow_run' && github.event.workflow_run.head_branch == 'master') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master')) && 'type=inline' || '' }}
           tags: |
             ${{ steps.bases.outputs.toolchain_image }}
             harbor.blockcast.net/paperclip-agent/paperclip-agent-toolchain:latest
@@ -267,7 +267,7 @@ jobs:
           # trip the same Ceph RGW zero-byte truncation that the FROM
           # blob hit).
           cache-from: type=registry,ref=harbor.blockcast.net/paperclip-agent/paperclip-agent:buildcache-v7
-          cache-to: type=registry,ref=harbor.blockcast.net/paperclip-agent/paperclip-agent:buildcache-v7,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true
+          cache-to: ${{ ((github.event_name == 'workflow_run' && github.event.workflow_run.head_branch == 'master') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master')) && 'type=registry,ref=harbor.blockcast.net/paperclip-agent/paperclip-agent:buildcache-v7,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true' || '' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
