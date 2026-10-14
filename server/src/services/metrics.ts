@@ -4870,7 +4870,7 @@ function ensureRegistry(): {
         + "tick from a live MAX(routine_runs.completed_at) WHERE status='completed' aggregate, "
         + "and reset-then-set every refresh (see setRoutineFireGapMetrics). Alert against its "
         + "companion " + ROUTINE_FIRE_INTERVAL_METRIC + " rather than a fixed threshold.",
-      labelNames: ["routine_id"],
+      labelNames: ["routine_id", "company_id"],
       registers: [registry],
     });
     routineFireInterval = new Gauge({
@@ -4889,7 +4889,7 @@ function ensureRegistry(): {
         + "vector match drops them, which is the correct behaviour rather than a special case. "
         + "Where several enabled schedule triggers exist the MINIMUM of their longest gaps wins: "
         + "fires arrive from all of them, so that is still an upper bound on any healthy gap.",
-      labelNames: ["routine_id"],
+      labelNames: ["routine_id", "company_id"],
       registers: [registry],
     });
     routineFireGapMetricsRefreshSuccess = new Gauge({
@@ -6329,6 +6329,14 @@ export function setQueuedRunAgeMetricsRefreshSuccess(success: boolean): void {
  * Publish the fire-gap pair for every active, schedule-triggered routine
  * (BLO-32638).
  *
+ * `company_id` rides along (BLO-46511) because the exporter reads the shared
+ * multi-tenant database: without it Alertmanager cannot route a routine's
+ * page to the tenant that owns it, and every tenant's gap files into the
+ * catch-all company -- whose seats 404 on another tenant's routine. It adds no
+ * cardinality: a routine belongs to exactly one company, so the series count is
+ * still one per routine. Contrast the per-tenant counters elsewhere in this
+ * file, where company_id WOULD multiply series and is deliberately omitted.
+ *
  * Reset-then-set for the usual reason, plus one specific to this pair: a
  * routine that is paused, or whose schedule trigger is disabled or deleted,
  * must DROP OUT of the interval gauge rather than keep a stale cadence. If it
@@ -6348,6 +6356,7 @@ export function setQueuedRunAgeMetricsRefreshSuccess(success: boolean): void {
 export function setRoutineFireGapMetrics(
   entries: ReadonlyArray<{
     routineId: string;
+    companyId: string;
     ageSeconds: number;
     intervalSeconds: number | null;
   }>,
@@ -6357,9 +6366,10 @@ export function setRoutineFireGapMetrics(
   metrics.routineFireIntervalGauge.reset();
   for (const entry of entries) {
     const ageSeconds = Number.isFinite(entry.ageSeconds) ? Math.max(0, entry.ageSeconds) : 0;
-    metrics.routineLastDoneFireAgeGauge.set({ routine_id: entry.routineId }, ageSeconds);
+    const labels = { routine_id: entry.routineId, company_id: entry.companyId };
+    metrics.routineLastDoneFireAgeGauge.set(labels, ageSeconds);
     if (entry.intervalSeconds !== null && Number.isFinite(entry.intervalSeconds) && entry.intervalSeconds > 0) {
-      metrics.routineFireIntervalGauge.set({ routine_id: entry.routineId }, entry.intervalSeconds);
+      metrics.routineFireIntervalGauge.set(labels, entry.intervalSeconds);
     }
   }
 }

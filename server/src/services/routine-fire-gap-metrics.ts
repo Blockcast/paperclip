@@ -36,6 +36,7 @@ function selectScheduledRoutinesWithLastCompletedFire(db: Db) {
   return db
     .select({
       routineId: routines.id,
+      companyId: routines.companyId,
       createdAt: routines.createdAt,
       triggerKind: routineTriggers.kind,
       cronExpression: routineTriggers.cronExpression,
@@ -95,7 +96,10 @@ export async function refreshRoutineFireGapMetrics(db: Db, now = new Date()): Pr
     // any single trigger's longest gap. The minimum over triggers is therefore
     // still an upper bound on the true gap (never a false page), and the
     // tightest one available.
-    const byRoutineId = new Map<string, { routineId: string; ageSeconds: number; intervalSeconds: number | null }>();
+    const byRoutineId = new Map<
+      string,
+      { routineId: string; companyId: string; ageSeconds: number; intervalSeconds: number | null }
+    >();
     for (const row of scheduledRoutines) {
       const gaps = deriveRoutineFireGapsMs(
         { kind: row.triggerKind, cronExpression: row.cronExpression, timezone: row.timezone },
@@ -120,6 +124,7 @@ export async function refreshRoutineFireGapMetrics(db: Db, now = new Date()): Pr
       const since = row.lastCompletedAt ?? row.createdAt;
       byRoutineId.set(row.routineId, {
         routineId: row.routineId,
+        companyId: row.companyId,
         ageSeconds: Math.max(0, (now.getTime() - new Date(since).getTime()) / 1000),
         intervalSeconds,
       });

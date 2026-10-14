@@ -104,7 +104,16 @@ snapshot, and the pre-aggregation collapses the join to 1:1 — a bare
 422 "found duplicate series for the match group" rather than firing
 ([BLO-23413]).
 
+**`company_id` rides through to the alert** ([BLO-46511]). The gauges are
+read from the shared multi-tenant database, so the alert names the owning
+tenant and Alertmanager's `company_id` tenant-guard route files it with that
+tenant. It is in both `by` clauses *and* in `on()`: a one-to-one match with
+`on(...)` keeps only the listed labels, so `on(routine_id)` alone would strip
+it. If you get paged for a routine your seat 404s on, read `company_id` off the
+alert — it is another tenant's, and its route is missing or mismatched.
+
 [BLO-23413]: https://paperclip.blockcast.net/BLO/issues/BLO-23413
+[BLO-46511]: https://paperclip.blockcast.net/BLO/issues/BLO-46511
 
 ## Why the threshold is relative
 
