@@ -17443,6 +17443,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * retry is a continuation of the same interrupted turn minutes later, and
    * starting cold re-burns a median 26.6 minutes of streamed work.
    *
+   * Note the precedence is wider than the config-freshness gate alone: dispatch
+   * builds `previousSessionParams` from the explicit resume first and only falls
+   * back to `taskSessionForRun`, so the override also outruns
+   * {@link shouldResetTaskSessionForWake} and any carried `forceFreshSession`.
+   * That is sound here only because the retry families are disjoint — a mint
+   * that would reset is never one that resolves a provider-death resume — but it
+   * is deliberate, not incidental, so do not narrow the stamp on the assumption
+   * that the freshness gate is the only thing it has to beat.
+   *
+   * The override may legitimately resolve to a bare `{ sessionId }` with no
+   * `cwd`: that happens when the dead run's session is not the one the task
+   * session currently holds, so there are no stored params to read a workspace
+   * from. Accepted — dispatch resolves the workspace independently via
+   * {@link resolveWorkspaceForRun}, and a bare id still resumes the right
+   * conversation, which is the whole point. The `cwd` is a bonus when the task
+   * session happens to still point at the same session, not a precondition.
+   *
    * Resolved per mint from the run being retried, so attempt 3 resumes attempt 2
    * rather than re-pointing at the original death.
    */
@@ -22520,14 +22537,37 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       workspaceValidationRetryPayload !== null &&
       Object.keys(workspaceValidationRetryPayload).length > 0;
     const carriedRetryContextSnapshot = carryRetryContextSnapshot(contextSnapshot);
-    // Resume markers are scoped to the run that resolved them. Drop any inherited
-    // from a previous attempt, so a mint that does NOT re-resolve one cannot ship a
-    // stale session pointer at the adapter. Deleted unconditionally rather than
-    // overwritten, because the stamp below is conditional and an `undefined` value
-    // would not reliably clear the key through the jsonb round-trip.
-    delete carriedRetryContextSnapshot.resumeFromRunId;
-    delete carriedRetryContextSnapshot.resumeSessionDisplayId;
-    delete carriedRetryContextSnapshot.resumeSessionParams;
+    // Resume markers are scoped to the run that resolved them, and this mint may
+    // not re-resolve one — only the rate-limit family does, above. Drop an
+    // inherited pointer ONLY once the run being retried has superseded it by
+    // producing a session of its own. `sessionIdAfter` is written in exactly one
+    // place, at completion from the adapter result, so it is durable proof the
+    // run reached the adapter and advanced the conversation past whatever it
+    // inherited; carrying the older pointer forward would rewind the retry.
+    //
+    // When it is unset the run never got that far — the vanished-Job reconciler
+    // reaches `scheduleBoundedRetryForRun` under `adapterInvocationStarted !==
+    // true`, and any family can die before dispatch — so the inherited pointer
+    // was never consumed and is still the correct one. (A `max_turns_continuation`
+    // retry is the ordinary case on the other side of this branch: it ran by
+    // definition, so it has its own `sessionIdAfter` and the clear fires.) A
+    // successful-run handoff stamps exactly these three keys, and clearing them
+    // there would push its retry onto the ordinary task-session lookup that
+    // `resolveTaskSessionConfigFreshness` discards ~98.7% of the time: this
+    // change's own failure mode, relocated onto another family.
+    //
+    // `sessionIdBefore` is deliberately NOT part of the test. It is stamped at
+    // mint time (including by this function, just above), so it proves only that
+    // a run was HANDED a pointer, never that it used one.
+    //
+    // Deleted rather than overwritten because the stamp below is conditional and
+    // an `undefined` value would not reliably clear the key through the jsonb
+    // round-trip.
+    if (run.sessionIdAfter) {
+      delete carriedRetryContextSnapshot.resumeFromRunId;
+      delete carriedRetryContextSnapshot.resumeSessionDisplayId;
+      delete carriedRetryContextSnapshot.resumeSessionParams;
+    }
     const retryContextSnapshot: Record<string, unknown> = withRecoveryModelProfileHint({
       ...carriedRetryContextSnapshot,
       retryOfRunId: run.id,
