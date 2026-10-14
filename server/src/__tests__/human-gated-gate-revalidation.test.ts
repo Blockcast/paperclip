@@ -269,6 +269,53 @@ describe("probeApprovalGate", () => {
     expect(result?.evidence).toContain("does not discharge the grant");
   });
 
+  it("counts the undecided siblings rather than ordering them (PEN-4061)", () => {
+    // The context clause used to read "a later card is still undecided".
+    // Nothing on this path sorts the approvals or reads a timestamp, so
+    // "later" was an unmeasured claim — in the one branch whose subject is
+    // that an instrument must not assert what it never checked. An undecided
+    // card filed *before* the grant rendered identically.
+    const result = probeApprovalGate(
+      evidence({
+        approvals: [
+          { approvalId: "a1", approvalType: "request_board_approval", approvalStatus: "approved" },
+          { approvalId: "a2", approvalType: "request_board_approval", approvalStatus: "pending" },
+        ],
+      }),
+    );
+    expect(result?.resolutionKind).toBe("approval-granted");
+    expect(result?.evidence).toContain("another card is still undecided");
+    // The specific regression: no ordering word may reach the rendered text.
+    expect(result?.evidence).not.toContain("later");
+  });
+
+  it("agrees in number when several siblings are undecided (PEN-4061)", () => {
+    // The same clause said "card" in the singular while interpolating *every*
+    // undecided card, so a row carrying two of them announced one and then
+    // listed both. The count and the list have to describe the same set.
+    const result = probeApprovalGate(
+      evidence({
+        approvals: [
+          { approvalId: "a1", approvalType: "request_board_approval", approvalStatus: "approved" },
+          { approvalId: "a2", approvalType: "request_board_approval", approvalStatus: "pending" },
+          {
+            approvalId: "a3",
+            approvalType: "request_board_approval",
+            approvalStatus: "revision_requested",
+          },
+        ],
+      }),
+    );
+    expect(result?.verdict).toBe("resolved-but-open");
+    expect(result?.resolutionKind).toBe("approval-granted");
+    expect(result?.evidence).toContain("2 other cards are still undecided");
+    // Both are named, and the trailing clause agrees with the count it follows.
+    expect(result?.evidence).toContain("a2=pending");
+    expect(result?.evidence).toContain("a3=revision_requested");
+    expect(result?.evidence).toContain("separate asks that do not discharge the grant");
+    expect(result?.evidence).not.toContain("later");
+  });
+
   it("still gates a row whose undecided card has no grant beside it (PEN-4061)", () => {
     // The guard on the reorder above: it must stay a narrowing. With no grant
     // on the row, an undecided card gates it exactly as it always did.
