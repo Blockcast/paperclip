@@ -66,7 +66,12 @@ import {
 import { logActivity } from "../activity-log.js";
 import { budgetService } from "../budgets.js";
 import { instanceSettingsService } from "../instance-settings.js";
-import { RECOVERY_HANDOFF_COMMENT_GRANT_TTL_MS, issueRecoveryActionService } from "../issue-recovery-actions.js";
+import {
+  PENDING_RECOVERY_WAKE_CEILING_TIMEOUT_MULTIPLIER,
+  PENDING_RECOVERY_WAKE_RUN_STATUSES,
+  RECOVERY_HANDOFF_COMMENT_GRANT_TTL_MS,
+  issueRecoveryActionService,
+} from "../issue-recovery-actions.js";
 import {
   isVerifiedIssueTreeControlInteractionWake,
   issueTreeControlService,
@@ -3302,6 +3307,21 @@ export function recoveryService(
       .then((rows) => Boolean(rows[0]));
   }
 
+  // PEN-4006: an action's wall-clock horizon must not retire the action while the
+  // wake it is meant to bound is still queued, parked for retry, or running. The
+  // recovery action id is the stable correlation key written into the run context.
+  async function hasPendingRecoveryWakeRun(actionId: string) {
+    const rows = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(and(
+        sql`${heartbeatRuns.contextSnapshot} ->> 'recoveryActionId' = ${actionId}`,
+        inArray(heartbeatRuns.status, [...PENDING_RECOVERY_WAKE_RUN_STATUSES]),
+      ))
+      .limit(1);
+    return Boolean(rows[0]);
+  }
+
   async function hasQueuedExecutionReviewParticipantRecoveryWake(
     companyId: string,
     issueId: string,
@@ -6429,12 +6449,28 @@ export function recoveryService(
       // Using `>=` here would attribute the last legitimate wake to the budget.
       const attemptBudgetReached = input.action.maxAttempts !== null &&
         input.action.attemptCount > input.action.maxAttempts;
+      const pendingWake = !attemptBudgetReached && await hasPendingRecoveryWakeRun(input.action.id);
+      const ceilingMs = recoveryActionBoundsConfig().timeoutMs
+        * PENDING_RECOVERY_WAKE_CEILING_TIMEOUT_MULTIPLIER;
+      const createdAt = input.action.createdAt instanceof Date
+        ? input.action.createdAt
+        : new Date(input.action.createdAt ?? NaN);
+      const ceilingReached = pendingWake && Number.isFinite(createdAt.getTime())
+        && createdAt.getTime() + ceilingMs <= Date.now();
+      if (pendingWake && !ceilingReached) {
+        await refundUnspentWakeAttempt("enqueue_not_delivered");
+        return;
+      }
       const retireAndRefund = () => recoveryActionsSvc.retireAndReleaseWakeAttempt({
         companyId: input.issue.companyId,
         actionId: input.action.id,
         expectedOwnerAgentId: reservedOwnerAgentId,
         expectedAttemptCount: reservedAttemptCount,
-        retiringBound: attemptBudgetReached ? "attempt_budget" : "timeout_horizon",
+        retiringBound: attemptBudgetReached
+          ? "attempt_budget"
+          : (pendingWake && ceilingReached
+            ? "pending_wake_ceiling"
+            : "timeout_horizon"),
       });
       try {
         await retireAndRefund();
@@ -13929,6 +13965,7 @@ export function recoveryService(
       causeSkipped: 0,
       exhaustedSkipped: 0,
       cooldownSkipped: 0,
+      pendingWakeSkipped: 0,
       livePathSkipped: 0,
       livePathQueuedWakeSkipped: 0,
       interactionSkipped: 0,
@@ -13969,6 +14006,7 @@ export function recoveryService(
           actionAttemptCount: issueRecoveryActions.attemptCount,
           actionMaxAttempts: issueRecoveryActions.maxAttempts,
           actionTimeoutAt: issueRecoveryActions.timeoutAt,
+          actionCreatedAt: issueRecoveryActions.createdAt,
           actionLastAttemptAt: issueRecoveryActions.lastAttemptAt,
           issueId: issues.id,
           issueStatus: issues.status,
@@ -14109,10 +14147,21 @@ export function recoveryService(
       }, now, false)) {
         const attemptBudgetReached = candidate.actionMaxAttempts !== null &&
           candidate.actionAttemptCount >= candidate.actionMaxAttempts;
+        const pendingWake = !attemptBudgetReached && await hasPendingRecoveryWakeRun(candidate.actionId);
+        const pendingWakeCeilingAt = new Date(
+          new Date(candidate.actionCreatedAt).getTime()
+          + recoveryActionBoundsConfig().timeoutMs * PENDING_RECOVERY_WAKE_CEILING_TIMEOUT_MULTIPLIER,
+        );
+        if (pendingWake && pendingWakeCeilingAt > now) {
+          result.pendingWakeSkipped += 1;
+          continue;
+        }
         await recoveryActionsSvc.retireWakeAction({
           companyId: candidate.companyId,
           actionId: candidate.actionId,
-          retiringBound: attemptBudgetReached ? "attempt_budget" : "timeout_horizon",
+          retiringBound: attemptBudgetReached
+            ? "attempt_budget"
+            : (pendingWake ? "pending_wake_ceiling" : "timeout_horizon"),
         });
         result.exhaustedSkipped += 1;
         continue;
@@ -14324,6 +14373,7 @@ export function recoveryService(
           noOwnerSkipped: result.noOwnerSkipped,
           causeSkipped: result.causeSkipped,
           exhaustedSkipped: result.exhaustedSkipped,
+          pendingWakeSkipped: result.pendingWakeSkipped,
           cooldownSkipped: result.cooldownSkipped,
           livePathSkipped: result.livePathSkipped,
           livePathQueuedWakeSkipped: result.livePathQueuedWakeSkipped,
@@ -14341,7 +14391,8 @@ export function recoveryService(
 
     for (const [reason, count] of [
       ["no_owner", result.noOwnerSkipped], ["cause", result.causeSkipped],
-      ["exhausted", result.exhaustedSkipped], ["cooldown", result.cooldownSkipped],
+      ["exhausted", result.exhaustedSkipped], ["pending_wake", result.pendingWakeSkipped],
+      ["cooldown", result.cooldownSkipped],
       ["live_path", result.livePathSkipped],
       ["live_path_queued_wake", result.livePathQueuedWakeSkipped],
       ["interaction", result.interactionSkipped],

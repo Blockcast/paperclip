@@ -535,7 +535,7 @@ export const BACKSTOP_SKIP_REASONS = [
   // Scope every query by `source`.
   "not_ready", "existing_wake", "live_path", "live_path_queued_wake", "pause_hold", "interaction",
   "no_owner", "cause", "exhausted", "cooldown", "claim_lost",
-  "deferred_or_failed", "enqueue_failed",
+  "pending_wake", "deferred_or_failed", "enqueue_failed",
 ] as const;
 export type BackstopSkipReason = (typeof BACKSTOP_SKIP_REASONS)[number];
 /**
