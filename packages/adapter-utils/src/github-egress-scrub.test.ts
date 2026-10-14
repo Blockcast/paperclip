@@ -388,7 +388,9 @@ describe("scrubGitHubEgressText", () => {
         "Vlan1MacvlanV6ProbeInstrumentBroken",
         "vlan1_macvlan_v6_listener",
       ]) {
-        expect(scrubGitHubEgressText(`alertname=${value}`).redacted).toBe(true);
+        // Bound to a neutral name: BLO-46448 since exonerates an UpperCamelCase
+        // value bound to `alertname` specifically, which is a different rule.
+        expect(scrubGitHubEgressText(`label=${value}`).redacted).toBe(true);
       }
     });
 
@@ -856,6 +858,42 @@ describe("scrubGitHubEgressText", () => {
       // Shape half: the name alone exonerates nothing.
       expectRedacted(`(${bind("patch_hash", T)})`);
     });
+  });
+
+  describe("BLO-46448 regression: an alert name in an amtool matcher is not a credential", () => {
+    // Derived, not embedded: until this fix deploys, the pre-push guard refuses the literal.
+    const pair = (value: string) => ["alertname", value].join("=");
+
+    it.each([
+      "VaultTLSProbeUnreachable",
+      "HarborDatabaseEndpointMissing",
+      "NodeFilesystemAlmostOutOfSpace",
+      "ArcRunnerPoolCeilingClipped",
+    ])(
+      "passes %s through byte-exact, quoted or not",
+      (name) => {
+        for (const text of [`    ${pair(name)}`, `    ${pair(`"${name}"`)}`]) {
+          expect(scrubGitHubEgressText(text).text).toBe(text);
+          expect(locateGitHubEgressMatches(text)).toEqual([]);
+        }
+      },
+    );
+
+    it("still refuses the same value under any other name", () => {
+      // Name half: the shape alone exonerates nothing.
+      const result = scrubGitHubEgressText(["password", "VaultTLSProbeUnreachable"].join("="));
+      expect(result.classes).toContain("high-entropy-assignment");
+    });
+
+    it.each(["Kq2Vt9Lm4Xb8Nd3Wp6Zc1Yr5", "KqVtLmXbNdWpZcYrHjTgPsQF", "Vlan1MacvlanV6ProbeInstrumentBroken"])(
+      "still refuses the opaque token %s bound to alertname",
+      (token) => {
+        // Shape half: a digit, or capitals not forming words, keep a token opaque.
+        const result = scrubGitHubEgressText(pair(token));
+        expect(result.classes).toContain("high-entropy-assignment");
+        expect(result.text).not.toContain(token);
+      },
+    );
   });
 
   describe("BLO-41262: locateGitHubEgressMatches names the line", () => {
