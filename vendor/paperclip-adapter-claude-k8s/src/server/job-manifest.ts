@@ -597,6 +597,21 @@ const RUNTIME_CACHE_ENV: Record<string, string> = {
  */
 const SHARED_PNPM_STORE_SUBPATH = "instances/default/data/k8s-isolation/pnpm";
 
+/**
+ * BLO-32734 Phase 2a. The read-only `data` mount closes cross-tenant WRITE but
+ * still grants READ of everything on the volume, because every pod runs as the
+ * uid that owns it. An `emptyDir` mounted over the instance root hides the whole
+ * tree — every foreign company's `companies/`, `run-logs/`, `projects/` and
+ * `k8s-isolation/`, plus `secrets/master.key`, `data/backups/` (DB dumps),
+ * `.env`, `config.json` and `db/` — and the run's own subPath binds are
+ * re-applied on top of it. Root-level toolchain dirs stay visible through the
+ * read-only parent. The overlay is rw only so the runtime can create mountpoint
+ * dirs inside it for those binds; nothing persists past the pod.
+ */
+const INSTANCE_ROOT_SUBPATH = "instances/default";
+const INSTANCE_OVERLAY_VOLUME_NAME = "instance-overlay";
+const INSTANCE_OVERLAY_SIZE_LIMIT = "16Mi";
+
 function sharedPnpmStorePath(rawCompanyId: string, dataMountPath: string): string {
   const companyId = sanitizeForK8sPath(rawCompanyId);
   assertSafePathComponent("companyId", companyId);
@@ -2645,6 +2660,16 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     mountPath: dataMountPath,
     ...(narrowWritableSurface ? { readOnly: true } : {}),
   });
+  // Declared right after its read-only parent and before every subPath bind
+  // under it, so the BLO-40401 backstop rejects any derived mount that would
+  // land on or above the instance root instead of silently hiding it.
+  const instanceOverlayMount: k8s.V1VolumeMount | null = narrowWritableSurface
+    ? { name: INSTANCE_OVERLAY_VOLUME_NAME, mountPath: path.posix.join(dataMountPath, INSTANCE_ROOT_SUBPATH) }
+    : null;
+  if (instanceOverlayMount) {
+    volumes.push({ name: INSTANCE_OVERLAY_VOLUME_NAME, emptyDir: { sizeLimit: INSTANCE_OVERLAY_SIZE_LIMIT } });
+    volumeMounts.push(instanceOverlayMount);
+  }
 
   // Mount secret volumes inherited from the Deployment pod
   //
@@ -2803,7 +2828,21 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // at SELF_POD_DATA_MOUNT_PATH whatever `workspaceMountPath` the pod uses.
   // Joining onto `dataMountPath` would, under a custom mount path, mkdir on the
   // server's own root filesystem and leave the Job's volume untouched.
-  const scopedWritableDirs = scopedWritableMounts.map((m) => path.posix.join(SELF_POD_DATA_MOUNT_PATH, m.subPath));
+  // The run's company skills, read-only. Prompt-bundle skill links point into
+  // `skills/<companyId>/` (or the image's `/app/skills`), which the instance
+  // overlay would otherwise hide; only this company's tree is re-exposed.
+  const companySkillsMount: k8s.V1VolumeMount | null = instanceOverlayMount
+    ? (() => {
+        const subPath = path.posix.join(INSTANCE_ROOT_SUBPATH, "skills", logPathCompanyId);
+        return { name: "data", mountPath: path.posix.join(dataMountPath, subPath), subPath, readOnly: true };
+      })()
+    : null;
+  const scopedWritableDirs = [
+    ...scopedWritableMounts.map((m) => m.subPath),
+    // Pre-created like the rw targets: a kubelet-created subPath dir is
+    // root:root and would EACCES the server's own skill materializer later.
+    ...(companySkillsMount?.subPath ? [companySkillsMount.subPath] : []),
+  ].map((subPath) => path.posix.join(SELF_POD_DATA_MOUNT_PATH, subPath));
   // Deliberately NOT checked against `claimedMountPaths` here. A scoped mount
   // landing exactly on an already-claimed path (an inherited secret mount under
   // the data mount) is a real hazard, but it is already caught by the
@@ -2814,6 +2853,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   for (const mount of scopedWritableMounts) {
     volumeMounts.push({ name: "data", mountPath: mount.mountPath, subPath: mount.subPath });
   }
+  if (companySkillsMount) volumeMounts.push(companySkillsMount);
   // Refresh OAuth credentials via ccrotate before invoking claude. The shared
   // /paperclip/.claude/.credentials.json on the RWX PVC may contain an expired
   // access token (claude OAuth tokens last ~30-60 min and the paperclip pod
@@ -3265,11 +3305,13 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     // Same nested rw re-mounts as the main container. The init container creates
     // the isolation roots and the Chrome profile dir INSIDE this mount, so
     // without these it would EACCES against the read-only parent on every run.
+    ...(instanceOverlayMount ? [instanceOverlayMount] : []),
     ...scopedWritableMounts.map((mount) => ({
       name: "data",
       mountPath: mount.mountPath,
       subPath: mount.subPath,
     })),
+    ...(companySkillsMount ? [companySkillsMount] : []),
   ];
   if (useLargePromptPath) {
     initVolumeMounts.push({
