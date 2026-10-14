@@ -24,6 +24,10 @@ import { decideRefire, findActiveAggregateIssue } from "./webhook-handler.js";
  * webhook uses, so this check and the re-fire path cannot disagree about
  * whether a closed row ought to be open: an operator close inside its
  * suppression window is exempt; `reopen` / `issue_missing` is the gap.
+ *
+ * Known limit: an operator-closed row whose state record carries no
+ * suppression anchor stays exempt, because `decideRefire` says so. That is the
+ * webhook's own verdict, so this check reports it the same way.
  */
 
 /** Once per this many minutes — well inside one Alertmanager `repeat_interval` (1h). */
@@ -94,7 +98,9 @@ export async function runCoverageCheck(
   if (!companyId || now.getUTCMinutes() % COVERAGE_CHECK_EVERY_MINUTES !== 0) return;
   const alerts = await readAlerts(config, ctx.logger);
   if (!alerts) return;
-  const uncovered = new Map<string, { severity: string; count: number }>();
+  // Keyed on alertname AND severity: one rule with severity tiers must not
+  // file its critical count under whichever tier was seen first.
+  const uncovered = new Map<string, { alertname: string; severity: string; count: number }>();
   for (const alert of alerts) {
     let verdict: CoverageVerdict;
     try {
@@ -106,12 +112,14 @@ export async function runCoverageCheck(
     }
     if (verdict !== "uncovered") continue;
     const alertname = alert.labels.alertname ?? "UnnamedAlert";
-    const entry = uncovered.get(alertname) ?? { severity: alert.labels.severity ?? "", count: 0 };
+    const severity = alert.labels.severity ?? "";
+    const key = JSON.stringify([alertname, severity]);
+    const entry = uncovered.get(key) ?? { alertname, severity, count: 0 };
     entry.count += 1;
-    uncovered.set(alertname, entry);
+    uncovered.set(key, entry);
     ctx.logger.warn(`alert-coverage: ${alertname} (${alert.fingerprint}) is active with no open tracking row`);
   }
-  for (const [alertname, { severity, count }] of uncovered) {
+  for (const { alertname, severity, count } of uncovered.values()) {
     await ctx.metrics.write("alertmanager.coverage.uncovered", count, { alertname, severity });
   }
   // Heartbeat: written only after a completed pass, so a dead or failing
