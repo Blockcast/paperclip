@@ -21,6 +21,11 @@ name: dispatch-ally-verdict-ci
 #            Actions creates, so Actions job check-runs never wake this.
 #   manual   workflow_dispatch with pr_number; also how review-gate-sweep.yml's
 #            hourly backstop re-fires a head whose event was lost.
+#   completed  workflow_run: an attempt-1 pull_request run of pr.yml concluded
+#            failure. A verdict landing after that run's `ally-verdict` job
+#            failed but before the run finished cannot be re-run then (the
+#            run is live) and the run cannot see it; this re-evaluates the
+#            head once the run completes (BLO-45984).
 # A non-matching check_run event gets no pod: the filter is on the job.
 #
 # Exactly once per head: only attempt 1 of the newest pull_request run at the
@@ -44,6 +49,9 @@ on:
   issue_comment:
     types: [created]
   check_run:
+    types: [completed]
+  workflow_run:
+    workflows: [PR]
     types: [completed]
   workflow_dispatch:
     inputs:
@@ -90,6 +98,8 @@ jobs:
       (github.event_name == 'check_run' && github.event.check_run.app.id == 3966421 &&
       github.event.check_run.conclusion == 'success' && (github.event.check_run.name ==
       'gate/ally-comment-findings' || github.event.check_run.name == 'ci/ally-head-attested'))
+      || (github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.run_attempt == 1 && github.event.workflow_run.conclusion == 'failure')
       || (github.event_name == 'workflow_dispatch')
       || (github.event_name == 'issue_comment' && needs.manual_request.outputs.manual == 'true'))
     runs-on: arc-light
@@ -103,7 +113,7 @@ jobs:
     # that head. On the job, not the workflow, so non-matching check_run events
     # (skipped by the `if:` above) never take or evict this slot.
     concurrency:
-      group: ally-verdict-dispatch-${{ github.event.check_run.pull_requests[0].number || github.event.issue.number || inputs.pr_number || github.run_id }}
+      group: ally-verdict-dispatch-${{ github.event.check_run.pull_requests[0].number || github.event.workflow_run.pull_requests[0].number || github.event.issue.number || inputs.pr_number || github.run_id }}
       cancel-in-progress: false
     permissions:
       # rerun-failed-jobs
@@ -129,7 +139,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           EVENT_NAME: ${{ github.event_name }}
-          CHECK_HEAD_SHA: ${{ github.event.check_run.head_sha }}
+          CHECK_HEAD_SHA: ${{ github.event.check_run.head_sha || github.event.workflow_run.head_sha }}
           INPUT_PR_NUMBER: ${{ inputs.pr_number }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: node scripts/ally-verdict-ci.mjs resolve

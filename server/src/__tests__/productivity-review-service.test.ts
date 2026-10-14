@@ -2561,6 +2561,56 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(reviews[0]?.description).not.toContain("the assignee was never given a chance to act.");
   });
 
+  // BLO-23040: the Manager Decision block offers "Block with an unblock
+  // owner", and executing that verdict means filing a board approval. The
+  // review run is stamped `status_only`, where
+  // `assertApprovalMutationAllowedByRunContext` permits exactly one approval
+  // write — creating a `request_board_approval` linked to the source issue —
+  // and refuses every follow-up on it.
+  //
+  // The template therefore has to name BOTH halves. It named only the first
+  // ("permitted to create that one approval type and no other"), which is a
+  // claim about the approval TYPE: a reviewer can satisfy it, file a thin
+  // card, and plan to append the evidence in a comment that is refused —
+  // leaving the card in front of a human with the finding missing and no
+  // agent-reachable route to add it. This pins the refusal and the
+  // alternative path, not just the permission.
+  it("tells the reviewer the escalation card cannot be followed up, and where the rest goes (BLO-23040)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+    });
+
+    await productivityReviewService(db).reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    const description = (await listProductivityReviews(seeded.companyId))[0]?.description ?? "";
+    // Control: this is the four-verdict branch, so the escalation paragraph is
+    // expected to be present at all. Without this, a rendering change that
+    // dropped the whole block would pass every assertion below.
+    expect(description).toContain("- Block with an unblock owner");
+    expect(description).toContain("create a `request_board_approval` approval");
+
+    // The permitted write, and the fact that it is the ONLY one.
+    expect(description).toContain("the only approval write this run has");
+    // Every follow-up operation the guard refuses is named. `creating` and
+    // `modifying` are deliberately absent from this list: creating is the
+    // carve-out being described, and there is no modify-approval route.
+    for (const refused of ["commenting on", "resubmitting", "withdrawing", "applying"]) {
+      expect(description).toContain(refused);
+    }
+    // ...including on the run's own card, which is the case a reader is most
+    // likely to assume is exempt.
+    expect(description).toContain("including on the card you just filed");
+    // The sanctioned alternative path, so the limit is not a bare prohibition.
+    expect(description).toContain("must be complete at creation");
+    expect(description).toContain("goes in a comment on this review issue");
+  });
+
   // BLO-22097 Ally follow-up: a streak that mixes an explicit measured zero
   // with missing-usage runs must report the "mixed" basis, and the
   // trigger/manager-facing claims must stay hedged (not the definitive

@@ -17,6 +17,7 @@ import { checkDedupSearch } from './check-pr-dedup-search.mjs';
 import { checkTestCoverage } from './check-pr-test-coverage.mjs';
 import { checkLockfile } from './check-pr-lockfile.mjs';
 import { checkDependencies } from './check-pr-dependencies.mjs';
+import { checkCommitTrailers, fetchAllPullRequestCommits } from './check-pr-commit-trailers.mjs';
 
 const COMMENT_SIGNATURE = '— commitperclip';
 const GRAPHIFY_REINDEX_AUTHOR = 'allyblockcast[bot]';
@@ -216,9 +217,10 @@ async function main() {
   }
 
   // Fetch PR data once — gates use this, no redundant API calls
-  const [pr, files] = await Promise.all([
+  const [pr, files, commits] = await Promise.all([
     gh(`/repos/${GH_REPO}/pulls/${prNumber}`, GH_TOKEN),
     fetchAllPullRequestFiles(gh, GH_REPO, prNumber, GH_TOKEN),
+    fetchAllPullRequestCommits(gh, GH_REPO, prNumber, GH_TOKEN),
   ]);
 
   const prBody = pr.body ?? '';
@@ -237,6 +239,7 @@ async function main() {
       Promise.resolve(checkLockfile(files, author, branch)),
       checkDependencies(files, GH_TOKEN, GH_REPO, prNumber, pr.base?.ref, gh),
     ]);
+  const trailerResult = checkCommitTrailers(commits);
 
   const allFailures = [
     ...templateResult.failures,
@@ -244,6 +247,7 @@ async function main() {
     ...dedupResult.failures,
     ...testResult.failures,
     ...lockfileResult.failures,
+    ...trailerResult.failures,
   ];
   const informational = depsResult.informational ?? [];
   const allPassed = allFailures.length === 0;

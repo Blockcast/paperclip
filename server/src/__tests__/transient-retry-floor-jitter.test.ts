@@ -28,6 +28,7 @@ import {
 } from "../services/heartbeat.js";
 import {
   CCROTATE_CAPACITY_FIRST_DEFERRED_AT_KEY,
+  CCROTATE_CAPACITY_PARK_CLAMPED_FROM_KEY,
   isCapacityGovernedRetryFloor,
   jitterTransientRetryFloor,
   TRANSIENT_RETRY_FLOOR_JITTER_MAX_MS,
@@ -154,17 +155,81 @@ describe("isCapacityGovernedRetryFloor", () => {
     ).toBe(true);
   });
 
-  it("recognises a floor written by the finalize path", () => {
-    // Shape taken from a live row: the finalize path writes no chain-origin
-    // key, so the provenance discriminator is the only marker present.
+  it("recognises a CLAMPED floor written by the finalize path", () => {
+    // Shape taken from a live row. The finalize path writes no chain-origin
+    // key, so the clamp marker is the only routing evidence present — and it is
+    // present precisely because `capacityFloorClampApplies` was true, i.e. the
+    // floor beside it is `resolveCcrotateCapacityRetry`'s output. The four
+    // exact-instant assertions in heartbeat-provider-capacity-horizon.test.ts
+    // depend on this staying true.
     expect(
       isCapacityGovernedRetryFloor({
         retryNotBefore: "2026-08-25T06:59:59.000Z",
         transientRetryNotBefore: "2026-08-25T06:59:59.000Z",
-        penstockCapacityParkClampedFrom: "2026-08-27T10:00:00.000Z",
+        [CCROTATE_CAPACITY_PARK_CLAMPED_FROM_KEY]: "2026-08-27T10:00:00.000Z",
         providerCapacityResetProvenance: { source: "server", errorFamily: "rate_limit_exhausted" },
       }),
     ).toBe(true);
+  });
+
+  // PEN-2509 reopen (2026-10-13). THE REGRESSION THIS PREDICATE WAS NARROWED
+  // FOR. The original fix exempted any row carrying
+  // `providerCapacityResetProvenance`, on the premise that a capacity denial's
+  // instant is owned by the capacity arithmetic. That premise is false for one
+  // of the three writers: the finalize path records the provenance of every
+  // reset it recovers, but only ROUTES the instant through
+  // `resolveCcrotateCapacityRetry` when the resolved value lands earlier than
+  // the advertised one. When it does not, `retryNotBefore` is the raw
+  // advertised instant — a whole second, shared verbatim by every agent that
+  // saw the same denial — and the exemption pinned the whole cohort to it.
+  //
+  // Measured consequence: 20.0% of 380 post-fix `transient_failure` parks
+  // landed on a whole second (~0.1% by chance), 76/76 of them on a 10-minute
+  // grid, across 8 agents. The jitter was deployed and unregressed throughout.
+  it("leaves a provenance-marked but UNCLAMPED finalize floor dispersible", () => {
+    expect(
+      isCapacityGovernedRetryFloor({
+        errorFamily: "rate_limit_exhausted",
+        retryNotBefore: "2026-10-12T21:59:59.000Z",
+        transientRetryNotBefore: "2026-10-12T21:59:59.000Z",
+        providerCapacityResetAt: "2026-10-12T21:59:59.000Z",
+        // Written by the finalize path for every recovered reset. It records
+        // WHERE the instant came from, not that anything recomputed it, so on
+        // its own it must not exempt.
+        providerCapacityResetProvenance: {
+          source: "server",
+          errorFamily: "rate_limit_exhausted",
+          observedStatusCode: 429,
+          horizonSource: "server_prose_parse",
+        },
+        // and crucially: no chain-origin key, no clamp marker.
+      }),
+    ).toBe(false);
+  });
+
+  it("exempts on the clamp marker ALONE, with no provenance beside it", () => {
+    // Positive control for the narrowed arm. The case above still passes under
+    // the OLD predicate (its row carries provenance too), so it cannot show the
+    // clamp marker is load-bearing. This row can: provenance is absent, so only
+    // the routing evidence is left to carry the exemption.
+    expect(
+      isCapacityGovernedRetryFloor({
+        retryNotBefore: "2026-08-25T06:59:59.000Z",
+        [CCROTATE_CAPACITY_PARK_CLAMPED_FROM_KEY]: "2026-08-27T10:00:00.000Z",
+      }),
+    ).toBe(true);
+  });
+
+  it("does not exempt on a blank or non-string clamp marker", () => {
+    // Fail-closed direction: an unusable marker means "disperse it". Exempting
+    // on a blank string would reinstate the herd through a corrupt field.
+    expect(isCapacityGovernedRetryFloor({ [CCROTATE_CAPACITY_PARK_CLAMPED_FROM_KEY]: "   " })).toBe(
+      false,
+    );
+    expect(isCapacityGovernedRetryFloor({ [CCROTATE_CAPACITY_PARK_CLAMPED_FROM_KEY]: 1 })).toBe(false);
+    expect(isCapacityGovernedRetryFloor({ [CCROTATE_CAPACITY_PARK_CLAMPED_FROM_KEY]: null })).toBe(
+      false,
+    );
   });
 
   it("leaves a raw advertised transient floor dispersible", () => {
@@ -250,6 +315,30 @@ const GATEWAY_503_RESULT_JSON = {
   error: "server_error",
 } as const;
 
+// PEN-2509 reopen (2026-10-13): the shape that actually herds in production.
+//
+// A 429 WITH a structured reset instant. That combination makes the finalize
+// path write `providerCapacityResetProvenance` (the marker the original fix
+// exempted on) while still adopting the advertised instant VERBATIM as the
+// floor, because its capacity clamp only applies when it resolves EARLIER than
+// what the provider advertised — and for a reset inside
+// CCROTATE_CAPACITY_MAX_PARK_MS it never does. So the row reads
+// "capacity-governed" and carries a raw shared instant at the same time.
+const RATE_LIMIT_429_TEST_ADAPTER = "pen2509_unclamped_capacity_floor_test_adapter";
+
+// `api_error_status: 429` satisfies both `isRateLimitExhausted` (giving the
+// rate_limit_exhausted family) and `readProviderCapacityResetStatusEvidence`
+// (the 429 substantiation the structured-hint path requires before it records
+// provenance). No prose horizon: the structured `retryNotBefore` is the hint.
+const RATE_LIMIT_429_RESULT_JSON = {
+  subtype: "api_retry",
+  api_error_status: 429,
+  error: "rate_limit_error",
+} as const;
+
+const RATE_LIMIT_429_ERROR_MESSAGE =
+  "API Error: 429 rate_limit_error. Request rate limit exceeded for this organization.";
+
 const GATEWAY_503_ERROR_MESSAGE =
   "API Error: 503 Service temporarily unavailable. This is a server-side issue, usually " +
   "temporary — try again in a moment. If it persists, check your inference gateway (api.penstock.run).";
@@ -268,12 +357,19 @@ describeEmbeddedPostgres("a cohort sharing one advertised floor", () => {
   // Every agent's run advertises this same instant, which is what a real fleet
   // sees: one upstream, one reset, N runs. ~4.5h out, matching the live census.
   let sharedFloor: Date;
+  // Deliberately INSIDE CCROTATE_CAPACITY_MAX_PARK_MS (15m) and outside the
+  // rate-limit curve's flat 90s hop. Inside the ceiling is what makes the
+  // capacity clamp decline to apply, which is the whole point of this fixture;
+  // outside 90s is what makes the floor beat the base curve so it reaches the
+  // dispersion branch at all.
+  let sharedCapacityFloor: Date;
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-pen2509-shared-floor-");
     db = createDb(tempDb!.connectionString);
     heartbeat = heartbeatService(db, { skipQueuedRunDispatch: true });
     sharedFloor = new Date(Date.now() + 4.5 * 60 * 60 * 1000);
+    sharedCapacityFloor = new Date(Date.now() + 5 * 60 * 1000);
 
     registerServerAdapter({
       type: SHARED_FLOOR_TEST_ADAPTER,
@@ -291,10 +387,28 @@ describeEmbeddedPostgres("a cohort sharing one advertised floor", () => {
         testedAt: new Date().toISOString(),
       }),
     });
+
+    registerServerAdapter({
+      type: RATE_LIMIT_429_TEST_ADAPTER,
+      execute: async () => ({
+        exitCode: 1,
+        signal: null,
+        timedOut: false,
+        errorMessage: RATE_LIMIT_429_ERROR_MESSAGE,
+        resultJson: { ...RATE_LIMIT_429_RESULT_JSON } as Record<string, unknown>,
+        retryNotBefore: sharedCapacityFloor.toISOString(),
+      }),
+      testEnvironment: async () => ({
+        status: "pass" as const,
+        checks: [],
+        testedAt: new Date().toISOString(),
+      }),
+    });
   }, 240_000);
 
   afterAll(async () => {
     unregisterServerAdapter(SHARED_FLOOR_TEST_ADAPTER);
+    unregisterServerAdapter(RATE_LIMIT_429_TEST_ADAPTER);
     await cleanupHeartbeatTestState(db, heartbeat, {
       errorLabel: "PEN-2509 shared-floor cohort cleanup",
       drainTimeoutMs: 30_000,
@@ -302,7 +416,7 @@ describeEmbeddedPostgres("a cohort sharing one advertised floor", () => {
     await tempDb?.cleanup();
   });
 
-  async function seedAgent() {
+  async function seedAgent(adapterType: string = SHARED_FLOOR_TEST_ADAPTER) {
     const companyId = randomUUID();
     const agentId = randomUUID();
     await db.insert(companies).values({
@@ -318,7 +432,7 @@ describeEmbeddedPostgres("a cohort sharing one advertised floor", () => {
       name: `SharedFloor ${agentId.slice(0, 8)}`,
       role: "engineer",
       status: "idle",
-      adapterType: SHARED_FLOOR_TEST_ADAPTER,
+      adapterType,
       adapterConfig: {},
       runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
       permissions: {},
@@ -400,5 +514,109 @@ describeEmbeddedPostgres("a cohort sharing one advertised floor", () => {
     // probability ~8*(1/300)^7 = 3e-17. The deterministic bounds are pinned in
     // the `jitterTransientRetryFloor` suite above; this arm exists to prove the
     // wiring, and the loose threshold is what keeps it non-flaky.
+  }, 240_000);
+
+  // PEN-2509 reopen (2026-10-13). The case above never herded in production,
+  // because a hintless 503 writes no capacity provenance. THIS one did: the
+  // original fix exempted any row carrying `providerCapacityResetProvenance`,
+  // and the finalize path writes that marker for a 429-substantiated structured
+  // hint while still adopting the advertised instant verbatim.
+  //
+  // Measured consequence before this narrowing: 20.4% of 749 `transient_failure`
+  // parks across 8 agents landed on a whole second (~0.1% by chance), 152/153 of
+  // them on a 10-minute grid, with cohorts of up to 6 agents sharing one instant
+  // to 0.000s.
+  //
+  // This is the end-to-end arm: the predicate unit tests prove the decision, and
+  // this proves the decision reaches `scheduledRetryAt` through the real
+  // finalize + schedule path rather than only through a hand-built row.
+  it("disperses a provenance-marked cohort whose capacity clamp did not apply", async () => {
+    const COHORT = 8;
+    const agentIds: string[] = [];
+    const originResultJson: Record<string, unknown>[] = [];
+    for (let i = 0; i < COHORT; i += 1) agentIds.push(await seedAgent(RATE_LIMIT_429_TEST_ADAPTER));
+
+    const originRunIds: string[] = [];
+    for (const agentId of agentIds) {
+      const run = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
+      await heartbeat.__test_executeRunForTesting(run.id);
+      originRunIds.push(run.id);
+    }
+
+    // The fixture only reproduces the bug if the finalize path really did take
+    // the branch this test is about. Assert that directly rather than assuming
+    // it: provenance present (so the OLD predicate would have exempted the row)
+    // AND no clamp marker (so the floor is the raw advertised instant). If a
+    // future change makes the capacity clamp apply here, these fail loudly
+    // instead of leaving a test that passes for the wrong reason.
+    for (const runId of originRunIds) {
+      const origin = await db
+        .select({ resultJson: heartbeatRuns.resultJson })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runId))
+        .then((rows) => rows[0] ?? null);
+      const resultJson = (origin?.resultJson ?? {}) as Record<string, unknown>;
+      expect(
+        resultJson.providerCapacityResetProvenance,
+        "fixture must reproduce the provenance marker the old predicate exempted on",
+      ).toBeTruthy();
+      expect(
+        resultJson[CCROTATE_CAPACITY_PARK_CLAMPED_FROM_KEY],
+        "fixture must NOT be capacity-clamped, or it is testing the exempt path",
+      ).toBeUndefined();
+      expect(resultJson.retryNotBefore).toBe(sharedCapacityFloor.toISOString());
+      originResultJson.push(resultJson);
+    }
+
+    const dueMs: number[] = [];
+    for (const runId of originRunIds) {
+      const row = await db
+        .select({
+          scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+          scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
+        })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.retryOfRunId, runId))
+        .then((rows) => rows[0] ?? null);
+      expect(row, `run ${runId} should have parked a scheduled retry`).not.toBeNull();
+      expect(row!.scheduledRetryReason).toBe("transient_failure");
+      dueMs.push(row!.scheduledRetryAt!.getTime());
+    }
+
+    // Forward-only, and bounded by the jitter cap: the advertised reset is still
+    // honoured and the park is not pushed past the window this fix sizes.
+    for (const ms of dueMs) {
+      expect(ms).toBeGreaterThanOrEqual(sharedCapacityFloor.getTime());
+      expect(ms).toBeLessThanOrEqual(
+        sharedCapacityFloor.getTime() + TRANSIENT_RETRY_FLOOR_JITTER_MAX_MS,
+      );
+    }
+
+    // The acceptance criterion. On the pre-narrowing predicate this spread is 0
+    // and `distinct` is 1 — that is the production reading this ticket reopened
+    // on, reproduced in-process.
+    const distinct = new Set(dueMs).size;
+    const spreadMs = Math.max(...dueMs) - Math.min(...dueMs);
+    expect(distinct, `cohort of ${COHORT} collapsed onto ${distinct} instant(s)`).toBe(COHORT);
+    expect(spreadMs, "a wake cohort must span more than one second").toBeGreaterThan(1_000);
+
+    // Flake budget, stated as above. The window here is min(300s*0.2, 300s) =
+    // 60s rather than 300s, so 8 draws collapse inside 1s with probability
+    // ~8*(1/60)^7 = 2.9e-11. Still far below any threshold worth engineering
+    // around, and the deterministic bounds live in the unit suite.
+    //
+    // ALSO the whole-second instrument the reopen adjudication adopts: a
+    // verbatim provider floor lands on `.000` with p=1, a jittered one with
+    // p~1/1000. Asserting it here ties the production instrument to the code.
+    const wholeSecond = dueMs.filter((ms) => ms % 1000 === 0).length;
+    expect(wholeSecond, "a dispersed cohort must not land on whole seconds").toBeLessThanOrEqual(1);
+
+    // Named last on purpose. This is the decision the assertions above are a
+    // consequence of, so asserting it first would make a pre-fix run fail here
+    // with "expected true to be false" and hide the thing worth seeing — the
+    // cohort collapsing onto one instant, which is the production reading.
+    for (const resultJson of originResultJson) {
+      expect(isCapacityGovernedRetryFloor(resultJson)).toBe(false);
+    }
   }, 240_000);
 });

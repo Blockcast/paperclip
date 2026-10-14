@@ -188,8 +188,17 @@ export function schedulerLeaseHolder(
     renewIntervalMs = SCHEDULER_LEASE_RENEW_INTERVAL_MS,
     identity = schedulerLeaseIdentity(),
     now = () => Date.now(),
+    onAcquire,
   }: {
     name: string;
+    /**
+     * Fired on every transition from not-holding to holding: the first
+     * acquisition, every failover takeover, and this same process re-winning
+     * after its own renewals lapsed past the TTL (or a fail-open process
+     * first reaching the table) (BLO-45212). Synchronous and
+     * fire-and-forget; a throw is logged and does not affect the lease.
+     */
+    onAcquire?: () => void;
     ttlMs?: number;
     renewIntervalMs?: number;
     identity?: { pod: string; holderId: string };
@@ -200,9 +209,7 @@ export function schedulerLeaseHolder(
   let lastRenewedAtMs = 0;
   /** Has this process ever actually reached the lease table and won a round? */
   let everAcquired = false;
-  /** Did the most recent attempt throw (as opposed to cleanly losing)? */
-  let lastAttemptFailed = false;
-  let failOpenLogged = false;
+  let neverAcquiredLogged = false;
   let timer: ReturnType<typeof setInterval> | null = null;
   let stopped = false;
   // Single-flight latch. Without it `setInterval` stacks a fresh query every
@@ -215,40 +222,33 @@ export function schedulerLeaseHolder(
   const isLeader = () => now() < heldUntilMs;
 
   /**
-   * Whether this process may run the gated loop.
+   * Whether this process may run the gated loop. Exactly `isLeader()`.
    *
-   * Not the same question as `isLeader()`, and the difference is one narrow
-   * case: a process that has NEVER once reached the lease table, because every
-   * attempt threw. That is "unknown", not "someone else has it", and it is
-   * resolved by running — otherwise a lease subsystem that is broken (table
-   * not yet migrated, connection refused at boot) would take fleet dispatch
-   * down, which is strictly worse than the single-replica status quo this
-   * change must not regress.
+   * It used to also return true for a process that had NEVER reached the lease
+   * table (every attempt threw), on the theory that "unknown" should not take
+   * dispatch down at `replicas: 1`. At `replicas: 2` that is a double-enqueue:
+   * a code-ahead-of-migration rollout, or a lease query that errors while other
+   * writes succeed, puts BOTH pods on the loop (BLO-45763). So unknown now
+   * means follower: the renew timer keeps retrying and this process takes the
+   * loop within one {@link SCHEDULER_LEASE_RENEW_INTERVAL_MS} (15 s) of the
+   * table becoming reachable.
    *
-   * Once the lease HAS been held even once, the deadline is the only authority
-   * and an error never extends it. That is the case that matters: a stalled
-   * holder whose renewals are failing must demote at the deadline, because
-   * that is the instant the database lets a survivor in. Failing open there
-   * would put two processes on the loop at exactly the moment the mechanism
-   * exists to prevent it.
-   *
-   * ponytail: the residual hole is a cold replica whose lease query errors
-   * while its other writes succeed — it would run alongside a healthy leader.
-   * Reachable today only by deploying this code ahead of its migration, and
-   * harmless at `replicas: 1`. Close it before raising replicas by making the
-   * boot refuse to start the scheduler when the lease table is missing.
+   * Stays a follower rather than exiting so the HTTP API keeps serving and no
+   * CrashLoopBackOff (up to 5 min) is stacked on top of the outage. The
+   * single-replica cost is bounded: dispatch is dark for exactly as long as
+   * `scheduler_leases` is unreachable, plus at most 15 s. When the whole DB is
+   * unreachable that cost is zero, since the loop cannot dispatch without it
+   * anyway. `PAPERCLIP_SCHEDULER_LEASE_ENABLED=false` is the escape hatch: it
+   * skips this holder entirely and restores the unleased loop.
    */
-  const shouldRunLoop = () => isLeader() || (!everAcquired && lastAttemptFailed);
+  const shouldRunLoop = () => isLeader();
 
   const publish = () => {
     recordSchedulerLeaseState({
       lease: name,
       holder: identity.pod,
-      // Deliberately the "do I run the loop" answer, not the "do I hold the
-      // lease" one, so `sum by (lease) (...) != 1` alerts on the thing that
-      // actually matters. The renewal-age series is what separates a real
-      // leader from a fail-open process: the latter never renews, so its
-      // timestamp stays 0.
+      // `sum by (lease) (...) != 1` alerts on the thing that matters: zero
+      // means dispatch is dark, two means double-enqueue.
       held: shouldRunLoop(),
       lastRenewedAtMs,
     });
@@ -276,7 +276,6 @@ export function schedulerLeaseHolder(
         holderId: identity.holderId,
         ttlMs,
       });
-      lastAttemptFailed = false;
       if (hold) {
         everAcquired = true;
         heldUntilMs = startedAtMs + ttlMs;
@@ -286,6 +285,11 @@ export function schedulerLeaseHolder(
             { lease: name, holder: identity.holderId, ttlMs, renewIntervalMs },
             "scheduler lease acquired - this process now runs the heartbeat timer loop",
           );
+          try {
+            onAcquire?.();
+          } catch (err) {
+            logger.error({ err, lease: name }, "scheduler lease onAcquire callback failed");
+          }
         }
       } else if (wasLeader) {
         // Another process took it while we still believed we held it. Only
@@ -303,17 +307,17 @@ export function schedulerLeaseHolder(
       // long a failing renewer may keep believing it is the leader, and it is
       // the same bound the database would enforce. Clearing here would turn
       // one failed query into an immediate dispatch gap.
-      lastAttemptFailed = true;
       logger.error(
         { err, lease: name, holder: identity.holderId },
         "scheduler lease renewal failed",
       );
-      if (!everAcquired && !failOpenLogged) {
-        failOpenLogged = true;
+      if (!everAcquired && !neverAcquiredLogged) {
+        neverAcquiredLogged = true;
         logger.error(
-          { lease: name, holder: identity.holderId },
-          "scheduler lease has never been acquired and every attempt has failed - running the "
-          + "heartbeat timer loop unleased; this is safe at one replica and NOT safe at more",
+          { lease: name, holder: identity.holderId, renewIntervalMs },
+          "scheduler lease has never been acquired and every attempt has failed - NOT running the "
+          + "heartbeat timer loop until it is; retrying every renew interval. "
+          + "PAPERCLIP_SCHEDULER_LEASE_ENABLED=false restores the unleased loop (one replica only)",
         );
       }
     }
@@ -365,7 +369,6 @@ export function schedulerLeaseHolder(
       if (inFlight) await inFlight.catch(() => undefined);
       const wasLeader = isLeader();
       heldUntilMs = 0;
-      lastAttemptFailed = false;
       publish();
       if (!wasLeader || !release) return false;
       try {

@@ -277,6 +277,7 @@ import {
 import {
   buildHeartbeatRunStopMetadata,
   mergeHeartbeatRunStopMetadata,
+  readObservedHeartbeatRunTimeout,
   normalizeMaxTurnStopReason,
 } from "./heartbeat-stop-metadata.js";
 import {
@@ -434,6 +435,7 @@ import {
   recordHeartbeatTimerTick,
   recordRetryScheduleOutcome,
   recordStartLockReapDisposition,
+  recordOrphanReapStage,
   recordConcurrentRunBlocked,
   recordAgentDispatchDeclined,
   recordHeartbeatRunFailed,
@@ -475,6 +477,7 @@ import {
   resolveCcrotateCapacityRetry,
   clampTransientRetryHorizon,
   jitterTransientRetryFloor,
+  CCROTATE_CAPACITY_PARK_CLAMPED_FROM_KEY,
   isCapacityGovernedRetryFloor,
   applyCcrotateCapacityDecision,
   clearCcrotateCapacityDecision,
@@ -1693,6 +1696,42 @@ export async function probeStaleKillReviewEvidence(
   }
 }
 
+/**
+ * BLO-45251: the retry floor for a pr_review Job the provider refused with a
+ * 429, or null when the run is not that shape.
+ *
+ * PEN-3129 recovers the refusal from the run log and books it `job_failed`
+ * with a server-parsed `providerCapacityResetAt`, deliberately without a
+ * top-level `errorFamily`. That keeps issue runs on the
+ * `adapterInvocationStarted === false` proof, but a pr_review Job that reached
+ * the provider has always started its adapter, so it could never pass that
+ * proof and the review was dropped. Measured 2026-10-12 on Ally: 3 of 4 such
+ * 429 runs were never retried.
+ *
+ * The retry is safe for pr_review because of a different proof. The
+ * reconciler's GitHub probe found no review at the exact head after the Job
+ * had already terminated (`reviewEvidenceFound === false`). That is the same
+ * gate the stale-kill arm uses. Issue runs have no equivalent proof and stay
+ * terminal, and so does a `job_failed` run with no 429 evidence.
+ */
+export function readPrReviewProviderCapacityRefusalRetryNotBefore(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson" | "contextSnapshot">,
+): Date | null {
+  if (run.errorCode !== "job_failed") return null;
+  const resultJson = parseObject(run.resultJson);
+  const recovery = parseObject(resultJson.externalLifecycleRecovery);
+  if (recovery.providerRefusalStatusCode !== 429) return null;
+  if (recovery.reviewEvidenceFound !== false) return null;
+  // Only the server terminal path's own write. The adapter-owner path strips
+  // these keys from adapter output, so a matching source cannot be forged.
+  const provenance = parseObject(resultJson.providerCapacityResetProvenance);
+  if (provenance.source !== PROVIDER_CAPACITY_RESET_PROVENANCE_SOURCE) return null;
+  const resetAt = readNonEmptyString(resultJson.providerCapacityResetAt);
+  const parsed = resetAt ? new Date(resetAt) : null;
+  if (!parsed || Number.isNaN(parsed.getTime())) return null;
+  return isPrReviewRetryContext(parseObject(run.contextSnapshot)) ? parsed : null;
+}
+
 export function shouldScheduleAutomaticRunRetry(
   run: Pick<typeof heartbeatRuns.$inferSelect, "errorCode" | "resultJson" | "contextSnapshot">,
 ) {
@@ -1796,10 +1835,13 @@ export function shouldScheduleAutomaticRunRetry(
   // is unchanged for both run kinds.
   if (JOB_FAILED_EQUIVALENT_ERROR_CODES.has(run.errorCode ?? "")) {
     const recovery = parseObject(parseObject(run.resultJson).externalLifecycleRecovery);
-    return (
+    if (
       (isIssueRun || isPrReviewRetryContext(contextSnapshot)) &&
       recovery.adapterInvocationStarted === false
-    );
+    ) {
+      return true;
+    }
+    return readPrReviewProviderCapacityRefusalRetryNotBefore(run) !== null;
   }
   if (run.errorCode === "session_unavailable") return true;
   // BLO-35668: `skill_materialization_pending` (BLO-32055 / #1669) rides this arm
@@ -1831,11 +1873,22 @@ export function shouldScheduleAutomaticRunRetry(
   // likewise unasserted: those assertions are keyed on the two literals and
   // cannot see a set they do not name, so enumerate consumers by hand. Site 1
   // is not exported from recovery/service.ts and is unasserted either way.
-  if (
-    run.errorCode !== "adapter_failed" &&
-    run.errorCode !== "process_lost" &&
-    run.errorCode !== "skill_materialization_pending"
-  ) {
+  //
+  // BLO-44931: for ISSUE runs this code is admitted here too, unlike its two
+  // siblings on this arm. The continuation sweep that covers `adapter_failed`
+  // on issue runs re-dispatches to the issue's assignee (or in_review
+  // participant) — recovery/service.ts `reconcileStrandedCandidate` picks
+  // `agentId` from the issue, never from the failed run — so a wake for any
+  // OTHER agent (an `issue_comment_mentioned` on a row it does not own) had no
+  // retry path in either engine and was dropped. Safe without an invocation
+  // proof because the claude-k8s adapter raises it before the CLI is spawned
+  // (vendor/paperclip-adapter-claude-k8s/src/server/execute.ts, the
+  // `catalogBacked` branch). `adapter_failed`/`process_lost` carry no such
+  // guarantee, so they stay PR-scoped.
+  if (run.errorCode === "skill_materialization_pending") {
+    return isIssueRun || isPrReviewRetryContext(contextSnapshot);
+  }
+  if (run.errorCode !== "adapter_failed" && run.errorCode !== "process_lost") {
     return false;
   }
 
@@ -2310,7 +2363,7 @@ const EXTERNAL_LIFECYCLE_PRE_ADAPTER_STALE_MS = 5 * 60 * 1000;
 // STARVATION_FULL_ESCALATION_MS, promote it ahead of routine work while
 // preserving ranks 0-1 for explicit critical issues.
 const STARVATION_STATUS_BOOST_MS = 30 * 60 * 1000;
-const STARVATION_FULL_ESCALATION_MS = 2 * 60 * 60 * 1000;
+export const STARVATION_FULL_ESCALATION_MS = 2 * 60 * 60 * 1000;
 // BLO-21792: the two steps above bound how long a run waits *behind routine
 // work*, but not how long it waits overall. Escalating to rank 2 deliberately
 // preserves ranks 0-1 for critical issues, so on an agent with a SUSTAINED
@@ -2331,7 +2384,7 @@ const STARVATION_FULL_ESCALATION_MS = 2 * 60 * 60 * 1000;
 // BLO-19337 regressions pin (both use 3h-old runs, comfortably under this).
 // Only genuinely pathological waits — the class BLO-21116 measured at 5-16h —
 // cross it.
-const STARVATION_ABSOLUTE_ESCALATION_MS = 6 * 60 * 60 * 1000;
+export const STARVATION_ABSOLUTE_ESCALATION_MS = 6 * 60 * 60 * 1000;
 // The rank an absolute-floor run escalates to. Named rather than a bare `-1` so
 // the one value that must outrank every routine rank — including the 0-1 the
 // critical lane produces — is stated once and greppable from the lane that
@@ -14335,6 +14388,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       return;
     }
 
+    // BLO-36049: this notice reports what ONE reviewer run did, and was emitted
+    // without re-reading the artifact — so it fired on PRs that had already
+    // merged (Blockcast/paperclip#1375: 2h20m after merge) and on heads that
+    // already carried a clean review (#1375 again, ~1d21h earlier;
+    // trafficcontrol#2001). On a merged PR the remedy is meaningless; on an
+    // open one with an at-head review it invites a push that voids it.
+    // Deliberately after the linked-issue lookup, so a notice with nobody to
+    // tell costs no GitHub calls. Fail-soft toward NOTIFYING: an unreadable PR
+    // or evidence surface keeps the status-quo notice, because this notifier's
+    // failure mode is the silence BLO-33589 exists to remove.
+    const suppressedBy = await prReviewGateNoticeSuppression(target);
+    if (suppressedBy) {
+      logger.info(
+        {
+          runId: run.id,
+          repoFullName: target.repoFullName,
+          prNumber: target.prNumber,
+          headSha: target.sha,
+          suppressedBy,
+        },
+        "suppressed failed PR-review gate notice: artifact state already answers it",
+      );
+      return;
+    }
+
     const shortSha = target.sha.slice(0, 7);
     const cause = reason === "retry_exhausted"
       ? "exhausted its automatic retries"
@@ -14375,7 +14453,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       `The Paperclip reviewer run for head \`${shortSha}\` ${cause}. **No review was posted by that run**, and the gate below is red on its behalf.`,
       "",
       `- Head: \`${target.sha}\``,
-      `- Gate status: \`${target.context}\` set to \`failure\` on that commit`,
+      // BLO-36049: the status is only QUEUED here. The outbox re-checks
+      // reviewer evidence and may skip the write, so claiming it was "set"
+      // was measured false on paperclip#1375 and trafficcontrol#2001.
+      `- Gate status: a \`failure\` for \`${target.context}\` is queued for that commit (the delivery is skipped if a review is found there first)`,
       mergeImpact,
       ...(target.prUrl ? [`- PR: ${target.prUrl}`] : []),
       `- Reviewer run: \`${run.id}\``,
@@ -14406,6 +14487,37 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           );
         });
     }
+  }
+
+  /**
+   * BLO-36049: `null` means "emit the notice". The evidence read is the same
+   * predicate the status outbox uses before writing the failure, so the two
+   * cannot disagree about whether a review exists — it reads both surfaces
+   * (formal reviews + `## Ally` comments) and attests head via the immutable
+   * `Reviewed head:` marker, never `reviews[].commit_id` (BLO-34666).
+   */
+  async function prReviewGateNoticeSuppression(
+    target: NonNullable<ReturnType<typeof resolvePrReviewGateStatusTarget>>,
+  ): Promise<"pull_request_closed" | "reviewer_evidence_found" | null> {
+    try {
+      const pr = await githubGetPullRequestGate({
+        repoFullName: target.repoFullName,
+        prNumber: target.prNumber,
+      });
+      if (pr && "state" in pr && pr.state === "closed") return "pull_request_closed";
+      const evidence = await githubHasReviewerEvidenceForPr({
+        repoFullName: target.repoFullName,
+        prNumber: target.prNumber,
+        headSha: target.sha,
+      });
+      if (evidence && "found" in evidence && evidence.found) return "reviewer_evidence_found";
+    } catch (error) {
+      logger.warn(
+        { err: error, repoFullName: target.repoFullName, prNumber: target.prNumber },
+        "failed to re-read PR state for a failed PR-review gate notice; notifying anyway",
+      );
+    }
+    return null;
   }
 
   async function notifyOneLinkedIssueOfFailedPrReviewGate(
@@ -22368,7 +22480,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       clampTransientHorizon && transientRetryNotBefore
         ? clampTransientRetryHorizon({ retryNotBefore: transientRetryNotBefore, now })
         : null;
-    const effectiveRetryNotBefore = clampedTransientRetry?.dueAt ?? transientRetryNotBefore;
+    // BLO-45251: a pr_review 429 park carries no transient family, so its floor
+    // is the server-parsed reset instant (already bounded by the parser's cap).
+    const prReviewRefusalRetryNotBefore =
+      clampedTransientRetry || transientRetryNotBefore
+        ? null
+        : readPrReviewProviderCapacityRefusalRetryNotBefore(run);
+    const effectiveRetryNotBefore =
+      clampedTransientRetry?.dueAt ?? transientRetryNotBefore ?? prReviewRefusalRetryNotBefore;
     // PEN-2509: the floor is adopted verbatim below, and an advertised floor is
     // an absolute instant shared by every run that saw the same denial — so
     // "adopt verbatim" is also "resume in lockstep". Disperse it forward before
@@ -22380,11 +22499,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // Only the *verbatim, undispersed* floor is dispersed here. Two floors
     // reaching this point are already per-run and must be left exactly alone:
     //
-    //  - A capacity floor. Its instant is owned end-to-end by the capacity
-    //    arithmetic — the resolver arm jitters it, and both arms are bounded by
+    //  - A floor the capacity arithmetic COMPUTED. Its instant is owned
+    //    end-to-end there — the resolver jitters it and bounds it by
     //    `CCROTATE_CAPACITY_MAX_PARK_MS`. A second window here would stack on
-    //    the first and push the other arm past that ceiling, re-tuning another
+    //    the first and push the result past that ceiling, re-tuning another
     //    mechanism's bound as a side effect of dispersing ours.
+    //
+    //    PEN-2509 reopen: "capacity denial" and "capacity-computed floor" are
+    //    NOT the same set, and this exemption is only sound for the second. The
+    //    finalize path adopts the raw advertised instant whenever its clamp
+    //    lands no earlier than that instant, while still recording the denial's
+    //    provenance — so keying the exemption on provenance exempted a verbatim
+    //    whole-second floor and left the measured herd live (20.0% of post-fix
+    //    `transient_failure` parks on a whole second, 200x chance). The
+    //    predicate now requires positive evidence of the routing.
     //  - A horizon-clamped floor. That value is `now + MAX_TRANSIENT_RETRY_
     //    HORIZON_MS`, and `now` is each run's own park instant, so the cohort is
     //    dispersed by construction; jitter would buy nothing and would push
@@ -22394,8 +22522,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // advertised instant, shared verbatim by every run that saw the same
     // denial, parked as `transient_failure`. That is the only floor that forms
     // a herd here, and the only one dispersed below.
+    //
+    // BLO-45251: the pr_review refusal floor is that same raw instant. It carries
+    // capacity provenance but never went through the resolver's jitter, so it
+    // must not inherit the capacity exemption. Its `over_horizon` park is
+    // `now + cap` at the reconciler pass, which runs refused in one pass share.
     const floorAlreadyDispersed =
-      clampedTransientRetry?.clampedFromIso != null || isCapacityGovernedRetryFloor(run.resultJson);
+      prReviewRefusalRetryNotBefore === null &&
+      (clampedTransientRetry?.clampedFromIso != null || isCapacityGovernedRetryFloor(run.resultJson));
     const flooredDueAt =
       effectiveRetryNotBefore && effectiveRetryNotBefore.getTime() > baseSchedule.dueAt.getTime()
         ? floorAlreadyDispersed
@@ -25369,6 +25503,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       outcome,
       errorCode: options?.errorCode ?? null,
       errorMessage: options?.errorMessage ?? null,
+      // PEN-4023: the adapter may have measured the bound that actually killed
+      // the run, which can be one `adapterConfig` knows nothing about — the
+      // k8s Job's `activeDeadlineSeconds`. It rides in on the adapter's own
+      // resultJson, which is this same object, so no new plumbing is needed.
+      observedTimeout: readObservedHeartbeatRunTimeout(options?.resultJson),
     });
     return mergeHeartbeatRunStopMetadata(options?.resultJson ?? null, stopMetadata);
   }
@@ -26049,6 +26188,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : providerCapacityRefusal?.horizon.kind === "over_horizon"
           ? providerCapacityRefusal.horizon.parkAt
           : null;
+    // BLO-45251: a pr_review refused with a 429 has started its adapter, so the
+    // invocation proof can never admit its retry. Ask GitHub whether a review
+    // landed at the exact head instead. The Job has already failed
+    // (`backoffLimit: 0`), so no live agent can post after a negative probe.
+    // A probe error records nothing and the run stays terminal.
+    const providerCapacityReviewEvidenceFound =
+      providerCapacityParkAt &&
+      input.jobStatus?.phase !== "active" &&
+      isPrReviewRetryContext(parseObject(input.run.contextSnapshot))
+        ? await probeStaleKillReviewEvidence(input.run)
+        : null;
 
     const terminalClaimToken = randomUUID();
     let resultJson = mergeRunStopMetadataForAgent(
@@ -26115,6 +26265,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                     providerCapacityRefusal.statusEvidence.statusCode,
                   providerRefusalHorizon: providerCapacityRefusal.horizon.kind,
                 }
+              : {}),
+            ...(providerCapacityReviewEvidenceFound !== null
+              ? { reviewEvidenceFound: providerCapacityReviewEvidenceFound }
               : {}),
           },
         },
@@ -26269,7 +26422,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (
       persistedDecision.outcome === "failed" &&
       !persistedDecision.pipelineStageExited &&
-      adapterInvocationStarted !== true &&
+      (adapterInvocationStarted !== true ||
+        readPrReviewProviderCapacityRefusalRetryNotBefore(finalizedRun) !== null) &&
       shouldScheduleAutomaticRunRetry(finalizedRun) &&
       finalizationAgent
     ) {
@@ -26381,7 +26535,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // different paths, and on TERMINAL rows they do diverge exactly that way —
     // classifyAndPersistRunLiveness stamps lastUsefulActionAt to the last concrete
     // *evidence* time (comment/doc/work-product, often hours old) while leaving
-    // lastOutputAt fresh (run-liveness.ts:314,320).
+    // lastOutputAt fresh (see the `output` helper in run-liveness.ts
+    // classifyRunLiveness). PEN-4035 widened that from the three "good" terminal
+    // states to every state carrying concrete evidence, so the divergence this
+    // max() guards against is now reachable on `failed` rows too.
     //
     // On a RUNNING row consumed HERE they cannot diverge today, and no currently
     // reachable transition makes them: the only writer that touches a live run is
@@ -26699,41 +26856,39 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           onlyRunId ? eq(externalRuntimeReservations.runId, onlyRunId) : undefined,
           or(
             eq(externalRuntimeReservations.state, "release_pending"),
-            and(
-              inArray(externalRuntimeReservations.state, ["reserved", "launching"]),
-              isNull(externalRuntimeReservations.expectedJobName),
-              isNull(externalRuntimeReservations.jobName),
-              isNull(externalRuntimeReservations.jobUid),
-              inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
-            ),
-            // BLO-18995: an *identified* reservation (a Job name was recorded)
-            // whose run reached a terminal status without the normal
-            // finalize-time release running — the canonical case is
-            // `drainRunningRunsForShutdown` marking a running run
-            // `interrupted` on SIGTERM, which never releases the reservation.
-            // The two branches above cannot see it: it is not
-            // `release_pending`, and it is `launched` with a non-null
-            // `jobName`. The row then keeps `released_at IS NULL` forever and
-            // the partial unique index
-            // `external_runtime_reservations_active_slot_idx (agent_id,
-            // slot_id) WHERE released_at IS NULL` blocks that slot
+            // BLO-18995: a reservation whose run reached a terminal status
+            // without the normal finalize-time release running — the canonical
+            // case is `drainRunningRunsForShutdown` marking a running run
+            // `interrupted` on SIGTERM. `interrupted` is the one terminal
+            // status the migration-0128 trigger does NOT cover (it fires only
+            // on succeeded/failed/cancelled/timed_out), so nothing else moves
+            // the row to `release_pending` and the branch above cannot see it.
+            // The row then keeps `released_at IS NULL` forever and the partial
+            // unique index `external_runtime_reservations_active_slot_idx
+            // (agent_id, slot_id) WHERE released_at IS NULL` blocks that slot
             // permanently, so every worker restart with a run in flight
             // ratchets the agent's effective concurrency down by one. Observed
             // in production: four agents each stuck a slot for 1-5 days (Ally
             // 4/5 slots, Release Engineer 1/2).
             //
-            // Selecting the row here is safe because it does not release it:
-            // the loop below still verifies the recorded Job is genuinely gone
-            // or finished (exact `readAgentJobRunStatusByName` lookup plus
-            // jobUid identity match) and skips any reservation whose Job is
-            // still `active`. A Job that outlives the worker therefore keeps
-            // its slot until it actually terminates.
+            // BLO-19148: this branch carries NO predicate on the recorded Job
+            // name, deliberately. It used to be split in two — an all-names-null
+            // arm and a `jobName IS NOT NULL OR jobUid IS NOT NULL` arm — which
+            // between them could not see the third shape: `expectedJobName` set
+            // (persisted by `onMeta`) with `jobName`/`jobUid` still null, left
+            // by a SIGTERM landing between `onMeta` and `createNamespacedJob`.
+            // That is the same permanent slot leak via a narrower door, and
+            // every future name column would re-open it. Selection is not
+            // release, so there is nothing for a name predicate to protect:
+            // the loop below verifies the Job (`reservation.jobName ??
+            // reservation.expectedJobName`) is genuinely gone or finished via
+            // an exact `readAgentJobRunStatusByName` lookup plus a jobUid
+            // identity match, skips anything still `active`, and holds a
+            // nameless recent shared/workspace row behind
+            // `isolationSetupGraceActive`. A Job that outlives the worker
+            // therefore keeps its slot until it actually terminates.
             and(
               inArray(externalRuntimeReservations.state, ["reserved", "launching", "launched"]),
-              or(
-                isNotNull(externalRuntimeReservations.jobName),
-                isNotNull(externalRuntimeReservations.jobUid),
-              ),
               inArray(heartbeatRuns.status, [...HEARTBEAT_RUN_TERMINAL_STATUSES]),
             ),
           ),
@@ -27647,6 +27802,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number; suppressDispatchAfterReap?: boolean }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
+    // BLO-42010: per-stage sweep timing. Start-lock waiters can wait ~2x a
+    // sweep, so the sweep's own duration sets the reap `timed_out` rate.
+    // ponytail: a sweep that throws records only the stages it finished, and no
+    // `total`; read the stage counts against `total` before trusting a mean.
+    const orphanReapStartedAt = Date.now();
+    let orphanReapLapAt = orphanReapStartedAt;
+    const lapOrphanReap = (stage: Parameters<typeof recordOrphanReapStage>[0]) => {
+      const at = Date.now();
+      recordOrphanReapStage(stage, (at - orphanReapLapAt) / 1000);
+      orphanReapLapAt = at;
+    };
 
     // Find all runs stuck in "running" state (queued runs are legitimately waiting; resumeQueuedRuns handles them)
     const activeRuns = await db
@@ -27682,6 +27848,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       ]),
     );
 
+    lapOrphanReap("load_runs");
     const reaped: string[] = [];
 
     // Query the kube API once for namespace-wide agent Job state. Active runs
@@ -27767,6 +27934,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .map((reservation) => reservation.runId),
     );
 
+    lapOrphanReap("list_jobs");
     // BLO-16184: emit the process_lost run-volume DENOMINATOR every reap cycle so
     // a "0 process_lost" reading can never be silently trusted at low run volume.
     // Set reset-then-set so a genuine drop to 0 is written explicitly, not stale.
@@ -27836,20 +28004,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             // finished Job is reclaimed by its own `ttlSecondsAfterFinished`
             // (agent Job manifests set it), not by the reaper:
             // cleanupTerminalExternalLifecycleJobs only considers phase=active
-            // Jobs, and this branch fires only for non-active ones.
-            // A still-active Job with no reservation is a real orphan and still
-            // falls through. Bookkeeping matches the catch so the sweep's
-            // liveness view is unchanged.
+            // Jobs. A still-active Job here is skipped only inside the stale
+            // window (see below); past it, it is a real orphan and still falls
+            // through. Bookkeeping matches the catch so the sweep's liveness
+            // view is unchanged.
             const reservationFinalizing = !reservation || reservation.state === "release_pending";
-            if (reservationFinalizing && jobStatus?.phase !== "active") {
+            const lastSignalRef = externalLifecycleRecentRefTime(run);
+            const finalizeOverdue = !lastSignalRef || now.getTime() - lastSignalRef >= EXTERNAL_LIFECYCLE_STALE_MS;
+            // The Job pod is frequently still `active` for a few seconds after
+            // the release starts (postRun/teardown still running): measured
+            // 2026-10-13, 99 of 102 post-fix mismatch lines were this, every
+            // one clearing within 28s. So an active Job is benign only inside
+            // the stale window; past it, it falls through to the catch and
+            // logs at ERROR, because an active Job outliving its reservation
+            // is a real orphan.
+            if (reservationFinalizing && (jobStatus?.phase !== "active" || !finalizeOverdue)) {
               // The same condition holds forever for a run whose row never
               // leaves `running` (postRun or workspace finalize died after the
               // release). Such a run is skipped by the reap loop below via
               // ambiguousExternalRunIds, so this line is its only trace: keep
               // the benign finalize window at debug, and escalate to warn once
               // the run has been silent past EXTERNAL_LIFECYCLE_STALE_MS.
-              const lastSignalRef = externalLifecycleRecentRefTime(run);
-              const finalizeOverdue = !lastSignalRef || now.getTime() - lastSignalRef >= EXTERNAL_LIFECYCLE_STALE_MS;
               const skipPayload = {
                 runId: run.id,
                 jobName,
@@ -27925,6 +28100,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 expectedJobName: reservation?.expectedJobName ?? null,
                 persistedJobName: reservation?.jobName ?? null,
                 persistedJobUid: reservation?.jobUid ?? null,
+                // `error` serializes to nothing in production (pino only
+                // applies its Error serializer to `err`); the message is what
+                // names the guard that threw.
+                errorMessage: error instanceof Error ? error.message : String(error),
                 error,
               },
               "external-runtime reservation Job identity mismatch",
@@ -27936,8 +28115,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
     }
 
+    lapOrphanReap("identity_stamp");
     const cleanedTerminalJobRunIds = await cleanupTerminalExternalLifecycleJobs(jobRunStatuses, now);
     reaped.push(...cleanedTerminalJobRunIds);
+    lapOrphanReap("terminal_job_cleanup");
     // BLO-21460: the two reconcilers below can throw (both reach the kube API
     // via confirmStaleKilledJobQuiesced). The backlog refresh must still run,
     // because prom-client gauges retain their last value: skipping it leaves
@@ -28001,6 +28182,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         );
       }
     }
+    lapOrphanReap("reconcile_reservations");
     const liveJobRunIds =
       jobRunStatuses !== null
         ? new Set(
@@ -28035,6 +28217,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       );
     }
 
+    lapOrphanReap("pod_cleanup");
     for (const { run, adapterType, adapterConfig } of activeRuns) {
       if (runningProcesses.has(run.id)) continue;
       if (ambiguousExternalRunIds.has(run.id)) continue;
@@ -28732,6 +28915,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     }
 
+    lapOrphanReap("per_run");
+    recordOrphanReapStage("total", (Date.now() - orphanReapStartedAt) / 1000);
     if (reaped.length > 0) {
       logger.warn({ reapedCount: reaped.length, runIds: reaped }, "reaped orphaned heartbeat runs");
     }
@@ -30314,9 +30499,38 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // does not own the adapter lifecycle, so dispatching here resolves to the
     // process-fallback adapter and dies with "Process adapter missing command".
     // The workers tier (paperclipNodeRole !== "api") owns run execution; leave
-    // the run queued for it. Worker stays a singleton until an atomic per-run
-    // claim (FOR UPDATE SKIP LOCKED / leader election) is added — do NOT scale
-    // workers >1 before then, or N workers will double-dispatch.
+    // the run queued for it.
+    //
+    // Cross-replica exclusion (BLO-44457). `withAgentStartLock` below is
+    // in-process only, so with workers >1 two passes for one agent can run at
+    // once (timer leader + an HTTP wake on the other replica). What the
+    // DATABASE enforces regardless (dispatch-cross-process-claim.test.ts pins the
+    // external-slot path only; the local CAS and advisory lock are untested here):
+    //  - per run: every queued->running transition is a CAS on
+    //    status='queued' (claimQueuedRun / claimRunWithExternalRuntimeSlotOutcome),
+    //    so no run is claimed twice;
+    //  - per agent, external-lifecycle adapters (claude_k8s, opencode_k8s):
+    //    maxConcurrentRuns is the partial unique index
+    //    external_runtime_reservations_active_slot_idx (agent_id, slot_id);
+    //  - exclusive PR-review task keys: pg_advisory_xact_lock in canClaimPrReviewTask.
+    // Still in-process only — read before raising workers >1:
+    //  - local adapters (claude_local, codex_local, ...): maxConcurrentRuns is
+    //    countRunsOccupyingSlots under the start lock, so N replicas can run up
+    //    to N x the cap for one agent (each run still claimed once);
+    //  - pre-claim side effects of a pass (duplicate/terminal-issue pruning,
+    //    claimQueuedRun's cancellations) run on per-replica snapshots and can
+    //    execute concurrently; their writes are status-CAS'd, not locked;
+    //  - reapOrphanedRuns skips only runs in this process's activeRunExecutions
+    //    and probes pids on this host, so it can finalize another replica's LIVE
+    //    local-adapter run as lost — destructive, not merely racy;
+    //  - resumeRunningExternalRuntimeRuns runs at startup AND at the head of
+    //    every scheduler tick on the lease leader (index.ts periodic chain),
+    //    guarded only by activeRunExecutions. A run a follower claimed via an
+    //    HTTP wake is RUNNING but absent from the leader's set, so the leader
+    //    re-enters executeRun on it — for claude_k8s/opencode_k8s too. The
+    //    scheduler lease does NOT close this: the leader is exactly the replica
+    //    that cannot see the follower's execution. Harm on second attach to a
+    //    live Job is untraced (BLO-16537 abandonedForLiveOwnJob may bound it).
     if (paperclipNodeRole === "api") {
       logger.debug(
         { agentId, role: paperclipNodeRole },
@@ -31341,6 +31555,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // low work while preserving ranks 0-1 for explicit critical issue
           // work. The PR-review fairness promotion above remains the bounded
           // path for an aged review to jump even critical work.
+          //
+          // BLO-44443: that promotion is one run per pass, and none when the
+          // previous start was already a review, so under a sustained review
+          // backlog it is not a bound at all. Returning here also skipped the
+          // BLO-21792 absolute ceiling below, which exists precisely so that a
+          // ready run of ANY class stops losing to fresh critical arrivals once
+          // its wait becomes pathological. Measured on Ally 2026-10-12: 502
+          // queued pr_review runs, every repo's reviews waiting 24-36h on
+          // average, while every issue-backed tier was capped at 6h. Apply the
+          // same ceiling to this class; past it the run sorts FIFO with every
+          // other escalated run (comparator tiebreak on createdAt), so this
+          // cannot introduce a new starvation order either.
+          if (waitedMs >= STARVATION_ABSOLUTE_ESCALATION_MS) {
+            return ABSOLUTE_STARVATION_DISPATCH_RANK;
+          }
           return waitedMs >= STARVATION_FULL_ESCALATION_MS ? 2 : 10;
         }
         // NB: the aging escalation below stays *underneath* this `!ready`
@@ -35627,7 +35856,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   ? {
                       // BLO-28919: same key the wake-gate writer uses, so a
                       // clamped floor reads identically whichever writer set it.
-                      penstockCapacityParkClampedFrom: advertisedRetryNotBefore,
+                      //
+                      // PEN-2509: this key is also the evidence
+                      // `isCapacityGovernedRetryFloor` reads to decide the floor
+                      // below was COMPUTED here rather than adopted verbatim —
+                      // see that predicate and
+                      // CCROTATE_CAPACITY_PARK_CLAMPED_FROM_KEY. It is written
+                      // under exactly the condition that makes
+                      // `effectiveRetryNotBefore` the resolver's output, so the
+                      // two must stay on the same conjunct. Writing it on a
+                      // wider condition would re-exempt a verbatim floor from
+                      // dispersion, which is the herd this ticket removes.
+                      [CCROTATE_CAPACITY_PARK_CLAMPED_FROM_KEY]: advertisedRetryNotBefore,
                     }
                   : {}),
                 ...(prReviewIncompleteOverride
@@ -40491,6 +40731,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     alreadyDelivered: boolean;
   };
 
+  /**
+   * Shape a wake-dispatch failure for durable storage (BLO-18877).
+   *
+   * Both records a failed dispatch leaves behind -- the inline safety net's
+   * `payload.dispatchRetry.lastError` and the reconciler's terminal
+   * `dispatch_failed_exhausted` `error` -- used to persist `err.message` raw.
+   * For a drizzle write failure that message is the "Failed query" wrapper with
+   * every bind param inlined and *no* SQLSTATE: the code that actually explains
+   * the failure hangs off `.cause`. The three rows dead-lettered on 2026-07-23
+   * recorded only `update "issues" set "execution_run_id" = $1 ...` plus their
+   * params, which cannot distinguish a constraint violation from a lock timeout
+   * from a serialization failure -- so that incident was undiagnosable after
+   * the fact, and a dead-letter queue you cannot read is a queue nobody drains.
+   *
+   * Same shaping as the run-finalization path (BLO-19085): keep the cause, drop
+   * the params. Non-database errors fall through to their own message
+   * unchanged, so HttpError business-rule text is untouched.
+   */
+  function describeWakeDispatchError(err: unknown): string {
+    return isDbError(err)
+      ? describeDbError(err, "wake dispatch failed")
+      : err instanceof Error
+        ? err.message
+        : String(err);
+  }
+
   async function wakeupWithDispatchRetry(agentId: string, opts: WakeupOptions = {}) {
     const githubReviewReason = githubPrReviewWakeReason(opts);
     // Filled in by enqueueWakeup's writeSkippedRequest when a gate declines the
@@ -40589,7 +40855,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               attempts: 0,
               nextAttemptAt: new Date(Date.now() + DISPATCH_RETRY_RECONCILE_BACKOFF_MS[0]).toISOString(),
               originalOpts: safeJson(opts, { unserializable: true, reason: opts.reason ?? null, source: opts.source ?? null }),
-              lastError: lastError instanceof Error ? lastError.message : String(lastError),
+              lastError: describeWakeDispatchError(lastError),
             },
           },
           status: "dispatch_failed",
@@ -40955,7 +41221,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (attempts >= DISPATCH_RETRY_MAX_ATTEMPTS) {
           const fenced = await finishClaimedRow({
             status: "dispatch_failed_exhausted",
-            error: err instanceof Error ? err.message : String(err),
+            error: describeWakeDispatchError(err),
             finishedAt: now,
             updatedAt: now,
           });
@@ -40989,7 +41255,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               ...retryState,
               attempts,
               nextAttemptAt: new Date(now.getTime() + backoffMs).toISOString(),
-              lastError: err instanceof Error ? err.message : String(err),
+              lastError: describeWakeDispatchError(err),
             },
           },
           updatedAt: now,

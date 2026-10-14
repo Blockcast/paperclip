@@ -196,27 +196,36 @@ describeEmbeddedPostgres("scheduler lease (BLO-43292)", () => {
     expect(holder.state().runsLoop).toBe(false);
   });
 
-  it("runs the loop unleased when it has NEVER reached the lease table", async () => {
-    // The lease subsystem being unavailable (table not yet migrated, no
-    // connection at boot) must not take fleet dispatch down: that is strictly
-    // worse than the single-replica status quo. Unknown is not "someone else
-    // has it".
-    const broken = { execute: () => Promise.reject(new Error("relation does not exist")) };
-    const holder = schedulerLeaseHolder(broken as never, {
+  it("stays a follower when it has NEVER reached the lease table, then takes over once it can (BLO-45763)", async () => {
+    // Unknown is not leadership. At `replicas: 2` a cold replica that ran the
+    // loop unleased (table not migrated, lease query erroring) would enqueue
+    // alongside a healthy leader. It must retry and run only once it wins.
+    let reachable = false;
+    const coldDb = {
+      execute: (query: unknown) => {
+        if (!reachable) return Promise.reject(new Error("relation does not exist"));
+        return (db as unknown as { execute: (q: unknown) => Promise<unknown> }).execute(query);
+      },
+    };
+    const holder = schedulerLeaseHolder(coldDb as never, {
       name: LEASE,
       ttlMs: 45_000,
       renewIntervalMs: 60_000,
       identity: { pod: "pod-1", holderId: "pod-1#fixed" },
     });
 
-    expect(await holder.tick()).toBe(true);
+    expect(await holder.tick()).toBe(false);
+    expect(await holder.tick()).toBe(false);
     expect(holder.isLeader()).toBe(false);
-    expect(holder.state()).toMatchObject({ everAcquired: false, runsLoop: true, lastRenewedAtMs: 0 });
+    expect(holder.state()).toMatchObject({ everAcquired: false, runsLoop: false, lastRenewedAtMs: 0 });
+
+    reachable = true;
+    expect(await holder.tick()).toBe(true);
+    expect(holder.state()).toMatchObject({ everAcquired: true, runsLoop: true });
   });
 
   it("does NOT run the loop when it cleanly loses to a live holder", async () => {
-    // The other half of the case above: a clean loss is evidence, not
-    // uncertainty, so there is nothing to fail open about.
+    // A clean loss and an error both leave this process a follower.
     await acquireSchedulerLease(db, { name: LEASE, holderId: "incumbent", ttlMs: 45_000 });
     const holder = schedulerLeaseHolder(db, {
       name: LEASE,
@@ -275,5 +284,64 @@ describeEmbeddedPostgres("scheduler lease (BLO-43292)", () => {
     expect(await holder.stop({ release: false })).toBe(false);
     expect(holder.isLeader()).toBe(false);
     expect(await db.select().from(schedulerLeases)).toHaveLength(1);
+  });
+
+  it("fires onAcquire once on the boot leader only, and again on the survivor at takeover (BLO-45212)", async () => {
+    // Stands in for the startup recovery chain: index.ts runs it from
+    // onAcquire, so "fired" == "this process ran recovery".
+    const recoveredBy: string[] = [];
+    const make = (pod: string) => schedulerLeaseHolder(db, {
+      name: LEASE,
+      ttlMs: 45_000,
+      renewIntervalMs: 60_000,
+      identity: { pod, holderId: `${pod}#fixed` },
+      onAcquire: () => recoveredBy.push(pod),
+    });
+    const one = make("pod-1");
+    const two = make("pod-2");
+
+    // Both boot together, then keep renewing: recovery ran in exactly one.
+    await Promise.all([one.tick(), two.tick()]);
+    for (let i = 0; i < 5; i += 1) await Promise.all([one.tick(), two.tick()]);
+    expect(recoveredBy).toHaveLength(1);
+
+    const leader = recoveredBy[0] === "pod-1" ? one : two;
+    const survivor = leader === one ? two : one;
+    await leader.stop();
+    await survivor.tick();
+    expect(recoveredBy).toEqual([leader.identity.pod, survivor.identity.pod]);
+  });
+
+  it("fires onAcquire again when the same holder re-wins after its own renewals lapsed", async () => {
+    let t = Date.now();
+    let fired = 0;
+    const holder = schedulerLeaseHolder(db, {
+      name: LEASE,
+      ttlMs: 45_000,
+      renewIntervalMs: 60_000,
+      identity: { pod: "pod-1", holderId: "pod-1#fixed" },
+      now: () => t,
+      onAcquire: () => { fired += 1; },
+    });
+    expect(await holder.tick()).toBe(true);
+    expect(await holder.tick()).toBe(true);
+    expect(fired).toBe(1);
+    t += 46_000; // a DB stall longer than the TTL
+    expect(await holder.tick()).toBe(true);
+    expect(fired).toBe(2);
+  });
+
+  it("keeps the lease when onAcquire throws", async () => {
+    const holder = schedulerLeaseHolder(db, {
+      name: LEASE,
+      ttlMs: 45_000,
+      renewIntervalMs: 60_000,
+      identity: { pod: "pod-1", holderId: "pod-1#fixed" },
+      onAcquire: () => {
+        throw new Error("boom");
+      },
+    });
+    expect(await holder.tick()).toBe(true);
+    expect(holder.isLeader()).toBe(true);
   });
 });

@@ -250,6 +250,28 @@ export const CCROTATE_CAPACITY_ADVERTISED_RESUME_AT_KEY = "penstockAdvertisedRes
  *    working single-run instrument is `GET /heartbeat-runs/:runId`, which selects
  *    the real column.
  */
+/**
+ * The advertised horizon a capacity park declined to honour, ISO-8601 (BLO-28919).
+ *
+ * Written by BOTH capacity writers, and — this is the part that matters to
+ * {@link isCapacityGovernedRetryFloor} — written ONLY on the branch where the
+ * floor that was persisted came out of {@link resolveCcrotateCapacityRetry}:
+ *
+ *  - {@link applyCcrotateCapacityDecision} sets it iff `decision.clampedFromIso`
+ *    is non-null, in the same projection that sets `retryNotBefore` to
+ *    `decision.retryAtIso` (the resolver's output).
+ *  - the finalize path in `heartbeat.ts` sets it iff `capacityFloorClampApplies`,
+ *    in the same object literal that sets `retryNotBefore` to
+ *    `capacityFloorClamp.retryAt` (the resolver's output).
+ *
+ * That co-write is a contract, not a coincidence: this key's presence is the
+ * only durable evidence on a run row that its floor was *computed* by the
+ * capacity arithmetic rather than adopted verbatim from the provider. Named
+ * here so the two writers and the one reader cannot drift apart — same reason
+ * as {@link CCROTATE_CAPACITY_ADVERTISED_RESUME_AT_KEY}.
+ */
+export const CCROTATE_CAPACITY_PARK_CLAMPED_FROM_KEY = "penstockCapacityParkClampedFrom";
+
 const CCROTATE_CAPACITY_DECISION_KEYS = [
   "retryNotBefore",
   "transientRetryNotBefore",
@@ -258,7 +280,7 @@ const CCROTATE_CAPACITY_DECISION_KEYS = [
   "penstockReason",
   "penstockRetryAfterSeconds",
   CCROTATE_CAPACITY_ADVERTISED_RESUME_AT_KEY,
-  "penstockCapacityParkClampedFrom",
+  CCROTATE_CAPACITY_PARK_CLAMPED_FROM_KEY,
   /**
    * Which gate probe denied this park: "capacity" or "messages_fallback"
    * (BLO-29900).
@@ -339,30 +361,58 @@ function readCapacityChainOriginIso(value: unknown): string | null {
 }
 
 /**
- * Is this run's `retryNotBefore` floor governed by the capacity park mechanism?
+ * Did this run's `retryNotBefore` floor come OUT of the capacity arithmetic?
  *
  * PEN-2509 disperses an advertised floor so a cohort sharing one does not
- * resume in lockstep. A capacity floor is deliberately excluded, because its
- * instant is already owned end-to-end by the capacity arithmetic: the resolver
- * arm adds its own positive jitter ({@link CCROTATE_CAPACITY_PARK_JITTER_RATIO})
- * and both arms are bounded by {@link CCROTATE_CAPACITY_MAX_PARK_MS}. Adding a
- * second, independently-sized window on top would stack jitter on the one arm
- * and push the other past a ceiling this module guarantees — re-tuning another
- * mechanism's bound as a side effect of dispersing ours.
+ * resume in lockstep. A floor the capacity arithmetic produced is deliberately
+ * excluded, because its instant is already owned end-to-end there: the resolver
+ * ({@link resolveCcrotateCapacityRetry}) adds its own positive jitter
+ * ({@link CCROTATE_CAPACITY_PARK_JITTER_RATIO}) and bounds the result by
+ * {@link CCROTATE_CAPACITY_MAX_PARK_MS}. Adding a second, independently-sized
+ * window on top would stack jitter and push the result past a ceiling this
+ * module guarantees — re-tuning another mechanism's bound as a side effect of
+ * dispersing ours.
  *
- * The measured PEN-2509 herd was `transient_failure` parks converging on a raw
- * advertised instant, which is the path this predicate deliberately leaves
- * dispersible.
+ * ## The question is ROUTING, not provenance (PEN-2509 reopen, 2026-10-13)
  *
- * TWO writers produce a capacity floor and they mark it differently, so testing
- * one marker would silently answer "not capacity" for half of them:
+ * This predicate used to answer "was this a capacity denial?" via
+ * `providerCapacityResetProvenance`. That is a different question, and the gap
+ * between the two is a live herd.
  *
- *  - {@link applyCcrotateCapacityDecision} always writes the chain-origin key.
- *    (`penstockProvider`, `penstockAdvertisedResumeAt` and
- *    `penstockCapacityParkClampedFrom` are all conditional there, so none of
- *    them is a sound marker on its own.)
- *  - the finalize path writes `providerCapacityResetProvenance`, its paired
- *    discriminator for a server-computed reset park.
+ * `providerCapacityResetProvenance` is a *diagnostic* record of where a reset
+ * instant was recovered from (prose parse, structured hint, run log). The
+ * finalize path in `heartbeat.ts` writes it for every such recovery — but it
+ * only routes the instant through {@link resolveCcrotateCapacityRetry} when the
+ * resolved value lands EARLIER than the advertised one (`capacityFloorClampApplies`).
+ * When it does not, `retryNotBefore` is the raw advertised instant, adopted
+ * verbatim: a whole-second absolute instant, identical for every agent that saw
+ * the same denial, and never dispersed by anything. Exempting it on the
+ * provenance marker meant exempting exactly the population that herds.
+ *
+ * Measured after the original fix shipped (n = 380 `transient_failure` parks
+ * across three agents, 2026-10-13): 20.0% landed on a whole second, against
+ * ~0.1% by chance for a jittered instant — 200x enrichment, and 76/76 of them
+ * on a 10-minute grid. The jitter was live and byte-identical to what merged;
+ * it simply never covered these rows.
+ *
+ * So the test is positive evidence of ROUTING, and there are exactly two
+ * markers that carry it. Both are co-written with the resolver's own output, in
+ * the same projection, by the only two writers that produce a capacity floor:
+ *
+ *  - {@link CCROTATE_CAPACITY_FIRST_DEFERRED_AT_KEY} — {@link applyCcrotateCapacityDecision}
+ *    always writes it, and always sets `retryNotBefore` to `decision.retryAtIso`.
+ *    (`penstockProvider` and {@link CCROTATE_CAPACITY_ADVERTISED_RESUME_AT_KEY}
+ *    are conditional there, so neither is a sound marker on its own.)
+ *  - {@link CCROTATE_CAPACITY_PARK_CLAMPED_FROM_KEY} — written by BOTH writers,
+ *    and only on the branch whose persisted floor is the resolver's output. See
+ *    that constant's own comment for the co-write contract.
+ *
+ * Fail-closed direction, stated because it is not symmetric: a false negative
+ * here disperses a floor that was already dispersed (bounded, additive, at most
+ * {@link TRANSIENT_RETRY_FLOOR_JITTER_MAX_MS}), while a false positive leaves a
+ * verbatim provider instant pinning a whole cohort to one millisecond. The
+ * second is the failure this ticket exists to remove, so an unrecognised marker
+ * resolves to "disperse it".
  *
  * Lives here, beside both markers' contract, so the writers and this reader
  * cannot drift apart.
@@ -371,8 +421,13 @@ export function isCapacityGovernedRetryFloor(resultJson: unknown): boolean {
   if (typeof resultJson !== "object" || resultJson === null) return false;
   const row = resultJson as Record<string, unknown>;
   if (readCapacityChainOriginIso(row[CCROTATE_CAPACITY_FIRST_DEFERRED_AT_KEY]) !== null) return true;
-  const provenance = row.providerCapacityResetProvenance;
-  return typeof provenance === "object" && provenance !== null;
+  // Presence is the signal, not the value: this key records the horizon that
+  // was DECLINED, so it is whatever string the provider advertised and is not
+  // required to round-trip the way a key we generate is. A non-empty string is
+  // the whole claim — "the clamp branch ran, so the floor beside me is the
+  // resolver's output".
+  const clampedFrom = row[CCROTATE_CAPACITY_PARK_CLAMPED_FROM_KEY];
+  return typeof clampedFrom === "string" && clampedFrom.trim().length > 0;
 }
 
 /**
@@ -517,7 +572,7 @@ export function applyCcrotateCapacityDecision(
     next[CCROTATE_CAPACITY_ADVERTISED_RESUME_AT_KEY] = decision.advertisedResumeAtIso;
   }
   if (decision.clampedFromIso !== null) {
-    next.penstockCapacityParkClampedFrom = decision.clampedFromIso;
+    next[CCROTATE_CAPACITY_PARK_CLAMPED_FROM_KEY] = decision.clampedFromIso;
   }
   return next;
 }

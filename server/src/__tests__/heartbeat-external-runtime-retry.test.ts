@@ -1787,6 +1787,47 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
     expect((overdue[0][0] as { silentForMs: number }).silentForMs).toBeGreaterThanOrEqual(20 * 60 * 1000);
   }, 120_000);
 
+  it.each([
+    { kind: "release_pending" as const, reservationState: "release_pending" },
+    { kind: "released" as const, reservationState: null },
+  ])("does not log an identity mismatch while the Job is still active in the finalize window: $kind (BLO-29133)", async ({ kind, reservationState }) => {
+    // Production after the first fix: the pod is often still `active` for a
+    // few seconds after the release starts, and that fell through to the catch.
+    const { agentId, runId } = await seedRunningRunWithObservedJob({
+      name: `ActiveJobFinalizing${kind}Co`,
+      slotId: 0,
+      reservation: { kind },
+    });
+    mockListManagedAgentJobs.mockResolvedValue([{ ...terminalJobFor({ runId, agentId }), phase: "active" as const }]);
+
+    const { mismatches, skips, overdue } = await reapCapturingFinalizeLogs();
+
+    expect(mismatches).toEqual([]);
+    expect(skips).toHaveLength(1);
+    expect(skips[0][0]).toMatchObject({ runId, jobPhase: "active", reservationState });
+    expect(overdue).toEqual([]);
+  }, 120_000);
+
+  it("still logs an active Job with no reservation at error once past the stale window (BLO-29133)", async () => {
+    // A Job still running long after its reservation was released is a real
+    // orphan, not a finalize race: the guard must not swallow it.
+    const { agentId, runId } = await seedRunningRunWithObservedJob({
+      name: "ActiveJobOrphanCo",
+      slotId: 0,
+      reservation: { kind: "released" },
+      lastActivityAt: new Date(Date.now() - 20 * 60 * 1000),
+    });
+    mockListManagedAgentJobs.mockResolvedValue([{ ...terminalJobFor({ runId, agentId }), phase: "active" as const }]);
+
+    const { mismatches, skips, overdue } = await reapCapturingFinalizeLogs();
+
+    expect(skips).toEqual([]);
+    expect(overdue).toEqual([]);
+    expect(mismatches).toHaveLength(1);
+    expect(mismatches[0][0]).toMatchObject({ runId, jobPhase: "active", reservationState: null });
+    expect((mismatches[0][0] as { errorMessage: string }).errorMessage).toContain("No active external-runtime reservation");
+  }, 120_000);
+
   it("still logs a real Job-name divergence at error, naming the reservation and slot (BLO-29133)", async () => {
     const observedJobName = "ac-observed-divergent";
     const observedJobUid = "uid-observed-divergent";
@@ -1844,6 +1885,7 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
     });
     expect(payload.error).toBeInstanceOf(Error);
     expect((payload.error as Error).message).toContain("Job identity mismatch");
+    expect(payload.errorMessage).toContain("Job identity mismatch");
   }, 120_000);
 
   // BLO-18995: `drainRunningRunsForShutdown` marks in-flight runs `interrupted`

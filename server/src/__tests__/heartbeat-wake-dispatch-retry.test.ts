@@ -107,16 +107,26 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
    *
    * `failures: 1` models a transient blip (first attempt fails, retry
    * succeeds); a large value models a hard outage that exhausts the chain.
+   *
+   * `transactionsOnly` fails only inserts made through a transaction's `tx`,
+   * leaving the outer db healthy. That is the fault where enqueueWakeup's
+   * transaction fails but wakeupWithDispatchRetry's safety-net insert (on the
+   * outer db) still lands; without it the safety net fails too.
    */
-  function dbWithFailingInserts(target: typeof db, failures: number) {
+  function dbWithFailingInserts(
+    target: typeof db,
+    failures: number,
+    makeError: () => unknown = () => new Error("simulated transient dispatch failure (BLO-18859)"),
+    { transactionsOnly = false }: { transactionsOnly?: boolean } = {},
+  ) {
     let remaining = failures;
-    const wrap = (obj: object): typeof db => new Proxy(obj, {
+    const wrap = (obj: object, inTransaction: boolean): typeof db => new Proxy(obj, {
       get(rawTarget, prop) {
-        if (prop === "insert") {
+        if (prop === "insert" && (inTransaction || !transactionsOnly)) {
           return (...args: unknown[]) => {
             if (remaining > 0) {
               remaining -= 1;
-              throw new Error("simulated transient dispatch failure (BLO-18859)");
+              throw makeError();
             }
             return (rawTarget as Record<string, (...a: unknown[]) => unknown>).insert(...args);
           };
@@ -124,7 +134,7 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
         if (prop === "transaction") {
           return (callback: (tx: unknown) => unknown, ...rest: unknown[]) =>
             (rawTarget as Record<string, (...a: unknown[]) => unknown>).transaction(
-              (tx: object) => callback(wrap(tx)),
+              (tx: object) => callback(wrap(tx, true)),
               ...rest,
             );
         }
@@ -134,7 +144,41 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
         return typeof value === "function" ? value.bind(rawTarget) : value;
       },
     }) as unknown as typeof db;
-    return wrap(target as unknown as object);
+    return wrap(target as unknown as object, false);
+  }
+
+  /**
+   * BLO-18877: the exact shape drizzle surfaces for a failed write -- a
+   * "Failed query" wrapper with every bind param inlined, and the SQLSTATE
+   * reachable only through `.cause`. Persisting the wrapper's `message` raw
+   * (what both dispatch failure records used to do) keeps the params and
+   * drops the one field that explains the failure.
+   *
+   * The statement is the one from the 2026-07-23 dead letters this fixes. The
+   * SQLSTATE on it is REPRESENTATIVE, not a claim about that incident: a
+   * foreign-key violation exercises both halves of what gets rendered (code AND
+   * constraint name). The real cause of those rows is not recoverable -- which
+   * is the whole point of this fix -- and is in fact unlikely to have been
+   * 23503, since the checkout takes `SELECT ... FOR UPDATE` on the
+   * `heartbeat_runs` row and bails unless it is `running`, so the FK referent
+   * provably exists inside that transaction.
+   */
+  const DEAD_LETTER_BIND_PARAM = "0bd09565-bf06-4ee2-bbcd-5f9ede813348";
+  function makeDrizzlePgError() {
+    const cause = Object.assign(new Error("insert or update on table \"issues\" violates foreign key constraint"), {
+      code: "23503",
+      constraint: "issues_execution_run_id_heartbeat_runs_id_fk",
+      table: "issues",
+      detail: "Key (execution_run_id)=(dbc2ea65-d76b-4826-a4d7-bd9c4b8972eb) is not present in table \"heartbeat_runs\".",
+    });
+    return Object.assign(
+      new Error(
+        'Failed query: update "issues" set "execution_run_id" = $1, "execution_agent_name_key" = $2, '
+        + '"execution_locked_at" = $3, "updated_at" = $4 where "issues"."id" = $5\n'
+        + `params: dbc2ea65-d76b-4826-a4d7-bd9c4b8972eb,devops,2026-07-23T09:52:40.425Z,2026-07-23T09:52:40.425Z,${DEAD_LETTER_BIND_PARAM}`,
+      ),
+      { cause },
+    );
   }
 
   const GITHUB_REVIEW_PAYLOAD = {
@@ -634,6 +678,142 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
         );
       expect(exhaustedRows).toHaveLength(1);
       expect(exhaustedRows[0]!.id).toBe(wakeupRequestId);
+    });
+
+    // BLO-18877: the dead-letter queue's only three occupants (2026-07-23) each
+    // recorded the failing SQL and its bind params and nothing else, so the
+    // incident could never be classified -- constraint violation, lock timeout
+    // and serialization failure are indistinguishable from that text. Both
+    // records a failed dispatch leaves behind are pinned here.
+    it("records the driver SQLSTATE, not the bind params, when the exhausting failure is a db error", async () => {
+      const { agentId, companyId } = await seedCompanyAndAgent();
+      const wakeupRequestId = randomUUID();
+      const now = new Date();
+      await db.insert(agentWakeupRequests).values({
+        id: wakeupRequestId,
+        companyId,
+        agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "github_pr_review_submitted",
+        payload: {
+          dispatchRetry: {
+            attempts: 4,
+            nextAttemptAt: new Date(now.getTime() - 1000).toISOString(),
+            originalOpts: {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "github_pr_review_submitted",
+              payload: GITHUB_REVIEW_PAYLOAD,
+            },
+          },
+        },
+        status: "dispatch_failed",
+      });
+
+      const failingHeartbeat = heartbeatService(
+        dbWithFailingInserts(db, Number.MAX_SAFE_INTEGER, makeDrizzlePgError),
+        { skipQueuedRunDispatch: true },
+      );
+      const result = await failingHeartbeat.reconcileFailedWakeDispatches(now);
+      expect(result.exhausted).toBe(1);
+
+      const exhaustedRows = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.agentId, agentId),
+            eq(agentWakeupRequests.status, "dispatch_failed_exhausted"),
+          ),
+        );
+      // AC3: one exhausted delivery still yields exactly one terminal row.
+      expect(exhaustedRows).toHaveLength(1);
+
+      const error = exhaustedRows[0]!.error ?? "";
+      expect(error).toContain("SQLSTATE 23503");
+      expect(error).toContain("issues_execution_run_id_heartbeat_runs_id_fk");
+      // The params are the part that made the original rows unreadable (and in
+      // the BLO-19085 case 605KB long); they must not survive into the column.
+      expect(error).not.toContain(DEAD_LETTER_BIND_PARAM);
+    });
+
+    it("records the driver SQLSTATE on the reconciler re-arm's lastError, which the exhausted row keeps", async () => {
+      const { agentId, companyId } = await seedCompanyAndAgent();
+      const wakeupRequestId = randomUUID();
+      const now = new Date();
+      await db.insert(agentWakeupRequests).values({
+        id: wakeupRequestId,
+        companyId,
+        agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "github_pr_review_submitted",
+        payload: {
+          dispatchRetry: {
+            // attempts: 2 => this pass computes 3 < DISPATCH_RETRY_MAX_ATTEMPTS and re-arms.
+            attempts: 2,
+            nextAttemptAt: new Date(now.getTime() - 1000).toISOString(),
+            originalOpts: {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "github_pr_review_submitted",
+              payload: GITHUB_REVIEW_PAYLOAD,
+            },
+          },
+        },
+        status: "dispatch_failed",
+      });
+
+      const failingHeartbeat = heartbeatService(
+        dbWithFailingInserts(db, Number.MAX_SAFE_INTEGER, makeDrizzlePgError),
+        { skipQueuedRunDispatch: true },
+      );
+      const result = await failingHeartbeat.reconcileFailedWakeDispatches(now);
+      expect(result.stillFailing).toBe(1);
+
+      const [row] = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, wakeupRequestId));
+      expect(row!.status).toBe("dispatch_failed");
+      const retryState = (row!.payload as { dispatchRetry?: { lastError?: string } } | null)?.dispatchRetry;
+      // The terminal write sets only `error`, so this payload field survives
+      // onto the dispatch_failed_exhausted row; it must not carry the params.
+      expect(retryState?.lastError ?? "").toContain("SQLSTATE 23503");
+      expect(retryState?.lastError ?? "").not.toContain(DEAD_LETTER_BIND_PARAM);
+    });
+
+    it("records the driver SQLSTATE on the inline safety-net row's lastError", async () => {
+      const { agentId } = await seedCompanyAndAgent();
+      const failingHeartbeat = heartbeatService(
+        dbWithFailingInserts(db, Number.MAX_SAFE_INTEGER, makeDrizzlePgError, { transactionsOnly: true }),
+        { skipQueuedRunDispatch: true },
+      );
+
+      // Every enqueue attempt fails inside enqueueWakeup's transaction, so the
+      // chain exhausts and falls through to the safety-net insert on the outer
+      // db, which `transactionsOnly` leaves healthy. wakeupWithDispatchRetry
+      // then rethrows the last dispatch error to its caller (the same contract
+      // the exhaustion tests above pin with `.rejects`), with the driver code
+      // still on `.cause`.
+      await expect(
+        failingHeartbeat.wakeup(agentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "github_pr_review_submitted",
+          payload: GITHUB_REVIEW_PAYLOAD,
+        }),
+      ).rejects.toMatchObject({ cause: { code: "23503" } });
+
+      const rows = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(and(eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.status, "dispatch_failed")));
+      expect(rows).toHaveLength(1);
+      const retryState = (rows[0]!.payload as { dispatchRetry?: { lastError?: string } }).dispatchRetry;
+      expect(retryState?.lastError ?? "").toContain("SQLSTATE 23503");
+      expect(retryState?.lastError ?? "").not.toContain(DEAD_LETTER_BIND_PARAM);
     });
 
     // The two HttpError holes Ally's review of 901a4009 found. Both are

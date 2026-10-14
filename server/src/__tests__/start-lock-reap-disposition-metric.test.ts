@@ -2,8 +2,11 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
   AGENT_START_LOCK_PHASE_SECONDS_METRIC,
   AGENT_START_LOCK_REAP_DISPOSITION_METRIC,
+  KNOWN_ORPHAN_REAP_STAGES,
   KNOWN_START_LOCK_REAP_DISPOSITIONS,
+  ORPHAN_REAP_STAGE_SECONDS_METRIC,
   __resetMetricsForTest,
+  recordOrphanReapStage,
   recordStartLockReapDisposition,
   renderMetrics,
 } from "../services/metrics.js";
@@ -137,5 +140,31 @@ describe("recordStartLockReapDisposition", () => {
     // No phase series exists in this test, so the selector must appear nowhere.
     expect(body).not.toContain(`${AGENT_START_LOCK_PHASE_SECONDS_METRIC}{`);
     expect(names.filter((name) => help[0].includes(`${name}{`))).toEqual([]);
+  });
+});
+
+describe("recordOrphanReapStage", () => {
+  beforeEach(() => {
+    __resetMetricsForTest();
+  });
+
+  async function stageCount(stage: string): Promise<number | null> {
+    const { body } = await renderMetrics();
+    const line = body
+      .split("\n")
+      .find((c) => c.startsWith(`${ORPHAN_REAP_STAGE_SECONDS_METRIC}_count{`) && c.includes(`stage="${stage}"`));
+    return line ? Number(line.trim().split(/\s+/).pop()) : null;
+  }
+
+  it("observes every allow-listed stage under its own label", async () => {
+    for (const stage of KNOWN_ORPHAN_REAP_STAGES) recordOrphanReapStage(stage, 1.5);
+    for (const stage of KNOWN_ORPHAN_REAP_STAGES) expect(await stageCount(stage)).toBe(1);
+  });
+
+  it("drops an unknown stage and a non-finite duration instead of minting a series", async () => {
+    recordOrphanReapStage("bogus" as never, 1);
+    recordOrphanReapStage("total", Number.NaN);
+    expect(await stageCount("bogus")).toBeNull();
+    expect(await stageCount("total")).toBeNull();
   });
 });

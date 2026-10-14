@@ -350,12 +350,27 @@ export interface PluginDefinition {
     params: PluginEnvironmentResumeLeaseParams,
   ): Promise<PluginEnvironmentLease>;
 
-  /** Called when a run finishes and the provider lease can be released. */
+  /**
+   * Called when a run finishes and the provider lease can be released.
+   *
+   * THIS CALL IS AT-LEAST-ONCE AND YOUR IMPLEMENTATION MUST BE IDEMPOTENT
+   * (BLO-20795). The host persists the lease row only *after* this resolves,
+   * so if the host crashes — or its database write fails — in between, crash
+   * recovery replays the release with the same `providerLeaseId`. Releasing a
+   * resource that is already gone MUST resolve, not throw: treat "not found" /
+   * "already released" as success. Throwing instead leaves the host unable to
+   * mark the lease released, so the run never finishes recovering and the
+   * environment stays reserved.
+   */
   onEnvironmentReleaseLease?(
     params: PluginEnvironmentReleaseLeaseParams,
   ): Promise<void>;
 
-  /** Called when the host needs to force-destroy provider state. */
+  /**
+   * Called when the host needs to force-destroy provider state.
+   *
+   * Same at-least-once idempotency contract as `onEnvironmentReleaseLease`.
+   */
   onEnvironmentDestroyLease?(
     params: PluginEnvironmentDestroyLeaseParams,
   ): Promise<void>;

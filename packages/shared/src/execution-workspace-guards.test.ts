@@ -38,6 +38,17 @@ describe("isExecutionWorkspaceDetachPatch", () => {
     expect(detach({ executionWorkspaceId: CLOSED_ID })).toBe(false);
   });
 
+  it("refuses re-pinning the same closed workspace spelled in upper case", () => {
+    // CLOSED_ID is all digits, so it needs an id with hex letters to have an upper case at all.
+    const closed = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    expect(
+      isExecutionWorkspaceDetachPatch({
+        body: { executionWorkspaceId: closed.toUpperCase() },
+        closedExecutionWorkspaceId: closed,
+      }),
+    ).toBe(false);
+  });
+
   it("refuses a patch that does not set executionWorkspaceId at all", () => {
     expect(detach({ executionWorkspacePreference: "isolated_workspace" })).toBe(false);
   });

@@ -73,16 +73,30 @@ export class CapabilityDeniedError extends Error {
   }
 }
 
+const MISSING_INVOCATION_SCOPE_MESSAGE =
+  "the worker referenced a missing, expired, or unknown invocation scope " +
+  "(host calls made after the originating RPC settles are unsupported; await them inside the handler)";
+
 /**
  * Thrown when a worker→host call asks for company-scoped data outside the
- * company authorized for the current top-level plugin invocation.
+ * company authorized for the current top-level plugin invocation, or
+ * references an invocation scope the host no longer holds.
+ *
+ * This is NOT a capability/grant failure (that is `CapabilityDeniedError`),
+ * so the message deliberately avoids "not allowed to perform" wording: a
+ * plugin holding the grant was being sent to debug its manifest (BLO-31190).
+ *
+ * Contract: host calls made after the originating RPC settles are
+ * unsupported. A `call()` invocation scope ends when its handler returns; a
+ * `notify()` scope is held for at most `MAX_RPC_TIMEOUT_MS` (15 min) because a
+ * notification has no settle signal. Await every host call inside the handler.
  */
 export class InvocationScopeDeniedError extends Error {
   override readonly name = "InvocationScopeDeniedError";
   readonly code = PLUGIN_RPC_ERROR_CODES.INVOCATION_SCOPE_DENIED;
 
   constructor(pluginId: string, method: string, message: string) {
-    super(`Plugin "${pluginId}" is not allowed to perform "${method}": ${message}`);
+    super(`Plugin "${pluginId}" host call "${method}" is outside its invocation scope (not a capability grant problem): ${message}`);
   }
 }
 
@@ -667,7 +681,7 @@ export function createHostClientHandlers(
       throw new InvocationScopeDeniedError(
         pluginId,
         method,
-        "the worker referenced a missing, expired, or unknown invocation scope",
+        MISSING_INVOCATION_SCOPE_MESSAGE,
       );
     }
 
@@ -707,7 +721,7 @@ export function createHostClientHandlers(
       throw new InvocationScopeDeniedError(
         pluginId,
         method,
-        "the worker referenced a missing, expired, or unknown invocation scope",
+        MISSING_INVOCATION_SCOPE_MESSAGE,
       );
     }
 

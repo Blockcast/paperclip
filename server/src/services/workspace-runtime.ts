@@ -5550,7 +5550,27 @@ export async function cleanupExecutionWorkspaceArtifacts(input: {
           },
         });
         warnings.push(...authorization.warnings);
-        if (authorization.authorized) {
+        // BLO-45629: ownership is proven by the lock's branch string, and nothing
+        // re-stamps that lock when an agent switches a reused worktree to another
+        // branch in place. A stale row whose `branchName` still equals the lock
+        // therefore classifies `owned` and would `--force --force` a live tree.
+        // The operator archive is the one destructive caller with no reclaim
+        // probe of its own (the collector defers on `dirty` or `unverifiable`
+        // before reaching here), so refuse when the tree is dirty or its state
+        // cannot be verified. A clean tree with unpushed commits remains
+        // removable: its commits stay on the branch and branch deletion below
+        // already refuses to discard an unmerged branch.
+        const operatorSafety = authorization.authorized && trigger === "operator"
+          ? await inspectWorktreeReclaimSafety(workspacePath, { trigger, cleanupReason })
+          : null;
+        if (operatorSafety?.reason === "dirty" || operatorSafety?.reason === "unverifiable") {
+          const safetyMessage = operatorSafety.reason === "dirty"
+            ? "it has uncommitted changes"
+            : "its state could not be verified";
+          warnings.push(
+            `Refusing to remove git worktree "${workspacePath}": ${safetyMessage} (${operatorSafety.detail}).`,
+          );
+        } else if (authorization.authorized) {
           // Monotonic, for the reason given at `inspectWorktreeReclaimSafety`.
           const startedAt = performance.now();
           let removalSucceeded = false;

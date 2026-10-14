@@ -11085,13 +11085,19 @@ describeEmbeddedPostgres("github-webhook route", () => {
 
   // BLO-26613: the Dependabot alert route has exactly one configured owner
   // and no fallback. A paused (or otherwise uninvokable) configured agent
-  // must not receive the new alert issue silently -- it should file
-  // unassigned so `allow_company_agent` lets any agent pick it up. The wake
-  // to the paused agent itself still fails (heartbeat.wakeup rejects a
-  // paused target and the error is caught/logged a few lines below) --
-  // that is a pre-existing, separate mechanism this change does not touch.
-  // The point of this test is that the ISSUE doesn't silently inherit the
-  // paused assignee merely because the wake attempt happened to fail too.
+  // must not receive the new alert issue silently. The wake to the paused
+  // agent itself still fails (heartbeat.wakeup rejects a paused target and
+  // the error is caught/logged a few lines below) -- that is a pre-existing,
+  // separate mechanism this change does not touch. The point of this test is
+  // that the ISSUE doesn't silently inherit the paused assignee merely
+  // because the wake attempt happened to fail too.
+  //
+  // BLO-43103: dependabot alerts are retrofit-owned. `resolveCreateIssueAssignee`
+  // (server/src/services/issues.ts) carves `github_dependabot_alert` out of the
+  // create-time company-default fallback along with `plugin:*` origins, so this
+  // row is deliberately left unassigned at create rather than pre-filled with
+  // the company default user. `issue-create-assignee-default.test.ts` pins the
+  // same outcome at the service layer.
   it("files a new dependabot alert issue unassigned when the configured agent is paused", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent({ agentName: "Release Engineer" });
     await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agentId));

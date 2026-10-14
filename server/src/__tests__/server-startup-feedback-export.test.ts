@@ -236,6 +236,21 @@ vi.mock("@paperclipai/db", async (importOriginal) => ({
   runDatabaseBackup: vi.fn(),
 }));
 
+// BLO-45763: a lease holder that never reached `scheduler_leases` now stays a
+// follower instead of failing open. The mocked db above never reaches it, so
+// the real holder would gate off every scheduler tick these tests drive. Pin it
+// to leader; lease semantics are scheduler-lease.test.ts's job.
+vi.mock("../services/scheduler-lease.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/scheduler-lease.js")>()),
+  schedulerLeaseHolder: vi.fn(() => ({
+    identity: { pod: "test-pod", holderId: "test-pod#leader" },
+    isLeader: () => true,
+    shouldRunLoop: () => true,
+    start: async () => true,
+    stop: async () => false,
+  })),
+}));
+
 // PEN-3314 review follow-up: a PASS-THROUGH partial mock, not a replacement.
 // Every export stays the genuine article — including `renderMetrics` and the
 // metric-name constants — so the recovery-chain series test below still drives

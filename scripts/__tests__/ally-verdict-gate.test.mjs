@@ -486,12 +486,16 @@ const CANONICAL =
   "(github.event_name == 'check_run' && github.event.check_run.app.id == 3966421 && " +
   "github.event.check_run.conclusion == 'success' && (github.event.check_run.name == " +
   "'gate/ally-comment-findings' || github.event.check_run.name == 'ci/ally-head-attested')) || " +
+  "(github.event_name == 'workflow_run' && github.event.workflow_run.event == 'pull_request' && " +
+  "github.event.workflow_run.run_attempt == 1 && github.event.workflow_run.conclusion == 'failure') || " +
   "(github.event_name == 'workflow_dispatch')";
 
-test("dispatcher: only the verdict and manual arms, each a trusted default-branch trigger", () => {
+test("dispatcher: only the verdict, completed-run and manual arms, each a trusted default-branch trigger", () => {
   const on = dispatcherYml.slice(dispatcherYml.indexOf("\non:\n"), dispatcherYml.indexOf("\npermissions:"));
-  assert.deepEqual([...on.matchAll(/^ {2}([a-z_]+):/gm)].map((m) => m[1]), ["issue_comment", "check_run", "workflow_dispatch"]);
+  assert.deepEqual([...on.matchAll(/^ {2}([a-z_]+):/gm)].map((m) => m[1]), ["issue_comment", "check_run", "workflow_run", "workflow_dispatch"]);
   assert.match(on, /check_run:\n {4}types: \[completed\]\n/);
+  // BLO-45984: the release for a verdict that lands after a live run's hold failed.
+  assert.match(on, /workflow_run:\n {4}workflows: \[PR\]\n {4}types: \[completed\]\n/);
   assert.match(on, /workflow_dispatch:\n {4}inputs:\n {6}pr_number:\n/);
   assert.doesNotMatch(dispatcherYml, /^ {2}(pull_request|pull_request_target|pull_request_review)\b/m);
 });
@@ -505,6 +509,8 @@ test("dispatcher: canonical unlock and manual writer, arc-light, default branch"
   assert.equal(runsOn(block), "arc-light");
   assert.match(block, /uses: actions\/checkout@[0-9a-f]{40}[^\n]*\n {8}with:\n {10}ref: \$\{\{ github\.event\.repository\.default_branch \}\}\n/);
   assert.match(block, /concurrency:\n {6}group: ally-verdict-dispatch-\$\{\{[^\n]*\}\}\n {6}cancel-in-progress: false\n/);
+  // One slot per PR across arms, so the completed-run and verdict arms serialise.
+  assert.match(block, /group: ally-verdict-dispatch-\$\{\{ github\.event\.check_run\.pull_requests\[0\]\.number \|\| github\.event\.workflow_run\.pull_requests\[0\]\.number \|\|/);
   assert.match(block, /bypass: \$\{\{ vars\.ALLY_GATED_CI_BYPASS \}\}/);
   assert.match(block, /actions: write/);
 });
@@ -521,7 +527,7 @@ test("dispatcher: the pull number comes from the resolve step on every arm, neve
   assert.ok(resolveStep, "the dispatcher must resolve the PR in its own step");
   assert.match(resolveStep, /run: node scripts\/ally-verdict-ci\.mjs resolve\n/);
   assert.match(resolveStep, /EVENT_NAME: \$\{\{ github\.event_name \}\}\n/);
-  assert.match(resolveStep, /CHECK_HEAD_SHA: \$\{\{ github\.event\.check_run\.head_sha \}\}\n/);
+  assert.match(resolveStep, /CHECK_HEAD_SHA: \$\{\{ github\.event\.check_run\.head_sha \|\| github\.event\.workflow_run\.head_sha \}\}\n/);
   assert.match(resolveStep, /INPUT_PR_NUMBER: \$\{\{ inputs\.pr_number \}\}\n/);
   const evaluate = steps.filter((step) => usesOf(step) === "./.github/actions/verdict-dispatch");
   assert.equal(evaluate.length, 1);
@@ -603,6 +609,24 @@ test("rerunDecision: exactly once, only attempt 1 of a completed run whose hold 
   for (const c of ["cancelled", "skipped", null]) assert.equal(rerunDecision(run(), lock(c)).rerun, false);
   assert.equal(rerunDecision(run(), []).rerun, false);
   assert.equal(rerunDecision(run(), [...lock("failure"), { name: "ally-verdict", conclusion: "failure" }]).rerun, false);
+});
+
+// BLO-45984: a live run is covered only while its hold has yet to read the
+// verdict. Once `ally-verdict` concluded non-success the run cannot see it, so
+// the decision must not claim cover; the workflow_run arm releases it.
+test("rerunDecision: a live run is covered only while its hold is pending", () => {
+  const pending = [{ name: "ally-verdict", status: "queued", conclusion: null }];
+  for (const status of ["in_progress", "queued"]) {
+    const live = rerunDecision(run({ status }), pending);
+    assert.equal(live.rerun, false, "never a duplicate attempt while the hold can still read the verdict");
+    assert.match(live.reason, /covered while live/);
+    assert.match(rerunDecision(run({ status }), []).reason, /covered while live/);
+    const frozen = rerunDecision(run({ status }), lock("failure"));
+    assert.equal(frozen.rerun, false, "a live run cannot be re-run");
+    assert.doesNotMatch(frozen.reason, /covered/);
+    assert.match(frozen.reason, /deferred to the workflow_run arm/);
+    assert.match(rerunDecision(run({ status }), lock("success")).reason, /covered while live/);
+  }
 });
 
 test("chooseRun: newest pull_request run by id on this PR's branch at this head", () => {
@@ -727,6 +751,15 @@ test("unlock re-runs the held run's failed jobs once, after re-reading the head"
   assert.equal(calls.filter((c) => c.endsWith("/pulls/7")).length, 2, "the head is re-read immediately before the write");
 });
 
+test("unlock on a live run whose hold already failed defers instead of claiming cover, and writes nothing", async () => {
+  const routes = baseRoutes([livePull()]).map(([m, re, fn]) =>
+    String(re).includes("runs\\?head_sha") ? [m, re, () => [200, { workflow_runs: [run({ id: 77, status: "in_progress" })] }]] : [m, re, fn]);
+  const { status, stdout, calls } = await unlockAgainst(routes, {});
+  assert.equal(status, 0, stdout);
+  assert.match(stdout, /SKIP, run 77 is in_progress but its 'ally-verdict' job already concluded failure/);
+  assert.equal(calls.filter((c) => c.startsWith("POST")).length, 0);
+});
+
 test("unlock writes nothing when the head moves between the decision and the write", async () => {
   const { status, stdout, calls } = await unlockAgainst(baseRoutes([livePull(), livePull("c".repeat(40))]), {});
   assert.equal(status, 0, stdout);
@@ -769,6 +802,12 @@ test("resolve: the verdict arm names the PR from the check_run's head, never fro
   assert.equal(none.status, 0, none.stdout);
   assert.equal(none.outputs, "pr_number=\nhead_sha=\n");
   assert.match(none.stdout, /nothing to unlock/);
+});
+
+test("resolve: the completed-run arm names the PR from the run's head, like the verdict arm", async () => {
+  const { status, stdout, outputs } = await resolveAgainst(headPullsRoute([livePull()]), { EVENT_NAME: "workflow_run", CHECK_HEAD_SHA: H, INPUT_PR_NUMBER: "9" });
+  assert.equal(status, 0, stdout);
+  assert.equal(outputs, `pr_number=7\nhead_sha=${H}\n`);
 });
 
 test("resolve: the manual arm takes a validated PR number and reads its live head", async () => {

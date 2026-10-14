@@ -302,6 +302,28 @@ export function anthropicRoutingEnv(
 }
 
 /**
+ * Non-secret host settings forwarded to every plugin worker, only when set.
+ * `PAPERCLIP_ALERTMANAGER_API_URL` is the deploy-time default for the
+ * alertmanager plugin's `alertmanagerApiUrl` (BLO-42694); a value set in the
+ * plugin's instance config still wins. Same narrow-allowlist rule as above:
+ * never add a credential here.
+ */
+const PLUGIN_PASSTHROUGH_ENV_KEYS = ["PAPERCLIP_ALERTMANAGER_API_URL"] as const;
+
+export function pluginPassthroughEnv(
+  source: NodeJS.ProcessEnv = process.env,
+): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const key of PLUGIN_PASSTHROUGH_ENV_KEYS) {
+    const value = source[key];
+    if (typeof value === "string" && value.length > 0) {
+      env[key] = value;
+    }
+  }
+  return env;
+}
+
+/**
  * Options for starting a worker process.
  */
 export interface WorkerStartOptions {
@@ -790,6 +812,11 @@ export function createPluginWorkerHandle(
     return {};
   }
 
+  // `call()` scopes carry no TTL and are cleared when the RPC settles;
+  // `notify()` scopes have no settle signal, so they expire after a bounded
+  // TTL instead. Either way, a worker host call made after its originating RPC
+  // settles finds no scope and is denied — that is the documented contract
+  // (see `InvocationScopeDeniedError`), not a capability failure (BLO-31190).
   function registerInvocation(scope: PluginInvocationScope, ttlMs?: number): PluginInvocationContext {
     const invocation: PluginInvocationContext = {
       id: randomUUID(),
@@ -1010,6 +1037,7 @@ export function createPluginWorkerHandle(
       // empty ANTHROPIC_BASE_URL would clobber the SDK default); this is a
       // narrow, explicit allowlist — the rest of process.env is still withheld.
       ...anthropicRoutingEnv(),
+      ...pluginPassthroughEnv(),
       // options.env is spread last so per-plugin overrides (like NODE_PATH
       // pointing to a local SDK build) take precedence over defaults.
       ...options.env,

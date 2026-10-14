@@ -32,6 +32,7 @@ import {
   JOB_FAILED_EQUIVALENT_ERROR_CODES,
   RECOVERABLE_AGENT_STATUS_ERROR_CODES,
   readHeartbeatRunErrorFamily,
+  readPrReviewProviderCapacityRefusalRetryNotBefore,
   readTransientRecoveryContractFromRun,
   shouldScheduleAutomaticRunRetry,
 } from "../services/heartbeat.js";
@@ -213,9 +214,9 @@ describe("BLO-35668: skill_materialization_pending retries wherever adapter_fail
   // The actual invariant the #1669 comment asserts. Written as a comparison
   // rather than a literal `true` so it keeps holding if `adapter_failed`'s own
   // gating is ever narrowed — the two must move together or not at all.
+  // Issue context is deliberately absent: BLO-44931 below diverges there.
   it.each([
     ["pr_review context", prReview],
-    ["issue context", { issueId: "issue-a" }],
     ["neither", {}],
   ] as const)("matches adapter_failed exactly (%s)", (_label, contextSnapshot) => {
     expect(
@@ -272,6 +273,49 @@ describe("BLO-35668: skill_materialization_pending retries wherever adapter_fail
     expect(ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES.has("skill_materialization_pending")).toBe(
       ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES.has("adapter_failed"),
     );
+  });
+});
+
+// BLO-44931 — the non-PR sibling. The issue continuation sweep re-dispatches to
+// the issue's ASSIGNEE, so a wake for any other agent (here a mention on a row it
+// does not own) had no retry path in either engine: measured on run 4b505e43,
+// 2026-10-11, a blocking CEO decision lost for ~2h. The code is raised before the
+// CLI is spawned, so issue runs may retry it without an invocation proof — which
+// is exactly what `adapter_failed` lacks, hence the deliberate divergence.
+describe("BLO-44931: skill_materialization_pending retries a non-PR issue wake", () => {
+  const mentionWake = {
+    issueId: "issue-owned-by-someone-else",
+    taskKey: "issue-owned-by-someone-else",
+    wakeReason: "issue_comment_mentioned",
+    wakeCommentId: "comment-a",
+  };
+
+  it("schedules a retry for a mention wake with no invocation proof", () => {
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "skill_materialization_pending",
+        resultJson: null,
+        contextSnapshot: mentionWake,
+      }),
+    ).toBe(true);
+  });
+
+  // Controls: the siblings on the same arm stay PR-scoped (no pre-spawn
+  // guarantee), and a run with no issue and no PR context stays terminal.
+  it.each(["adapter_failed", "process_lost"])("leaves %s terminal on an issue wake", (errorCode) => {
+    expect(
+      shouldScheduleAutomaticRunRetry({ errorCode, resultJson: null, contextSnapshot: mentionWake }),
+    ).toBe(false);
+  });
+
+  it("stays terminal with neither issue nor PR context", () => {
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "skill_materialization_pending",
+        resultJson: null,
+        contextSnapshot: { wakeReason: "heartbeat_timer" },
+      }),
+    ).toBe(false);
   });
 });
 
@@ -336,5 +380,54 @@ describe("BLO-35668: job_failed retries a pr_review run once invocation is dispr
     ),
   )("%s stays terminal on %s when resultJson is %s", (errorCode, _kind, _shape, contextSnapshot, resultJson) => {
     expect(shouldScheduleAutomaticRunRetry({ errorCode, resultJson, contextSnapshot })).toBe(false);
+  });
+});
+
+// BLO-45251: a pr_review Job the provider refused with a 429 is booked
+// `job_failed` with a server-parsed reset instant and no `errorFamily`
+// (PEN-3129). Its adapter had started, so the invocation proof above can never
+// admit it. Measured 2026-10-12 on Ally: run fd6dce90 and two siblings were
+// never retried. The retry is admitted only on the reconciler's
+// review-absent-at-head probe.
+describe("BLO-45251: a pr_review 429 park retries once no review exists at head", () => {
+  const resetAt = "2026-10-12T19:48:32.000Z";
+  const fd6dce90 = (recovery: Record<string, unknown> = {}, extra: Record<string, unknown> = {}) => ({
+    providerCapacityResetAt: resetAt,
+    providerCapacityResetProvenance: {
+      source: "server_parse_provider_capacity_horizon",
+      errorFamily: "rate_limit_exhausted",
+      observedStatusCode: 429,
+    },
+    externalLifecycleRecovery: {
+      reason: "job_failed",
+      jobReason: "BackoffLimitExceeded",
+      adapterInvocationStarted: true,
+      providerRefusalStatusCode: 429,
+      providerRefusalHorizon: "usable",
+      reviewEvidenceFound: false,
+      ...recovery,
+    },
+    ...extra,
+  });
+  const prReview = { reviewKind: "pr_review" };
+
+  it("retries the fd6dce90 shape, floored at the parsed reset instant", () => {
+    const run = { errorCode: "job_failed", resultJson: fd6dce90(), contextSnapshot: prReview };
+    expect(shouldScheduleAutomaticRunRetry(run)).toBe(true);
+    expect(readPrReviewProviderCapacityRefusalRetryNotBefore(run)?.toISOString()).toBe(resetAt);
+  });
+
+  it.each([
+    ["a review exists at head", fd6dce90({ reviewEvidenceFound: true }), prReview],
+    ["the probe was unproven", fd6dce90({ reviewEvidenceFound: undefined }), prReview],
+    ["no 429 evidence (f02576ba)", fd6dce90({ providerRefusalStatusCode: undefined }), prReview],
+    ["a non-429 refusal", fd6dce90({ providerRefusalStatusCode: 529 }), prReview],
+    ["no parsed reset instant", fd6dce90({}, { providerCapacityResetAt: undefined }), prReview],
+    ["adapter-forged provenance", fd6dce90({}, { providerCapacityResetProvenance: { source: "adapter" } }), prReview],
+    ["an issue run", fd6dce90(), { issueId: "issue-a" }],
+  ])("stays terminal when %s", (_label, resultJson, contextSnapshot) => {
+    const run = { errorCode: "job_failed", resultJson, contextSnapshot };
+    expect(shouldScheduleAutomaticRunRetry(run)).toBe(false);
+    expect(readPrReviewProviderCapacityRefusalRetryNotBefore(run)).toBeNull();
   });
 });

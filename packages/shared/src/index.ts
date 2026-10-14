@@ -1431,6 +1431,7 @@ export type { ServerGitInfo, ServerGitLocalChanges, ServerInfoSnapshot } from ".
 export {
   getClosedIsolatedExecutionWorkspaceMessage,
   isClosedExecutionWorkspace,
+  isClosedExecutionWorkspaceStatus,
   isClosedIsolatedExecutionWorkspace,
   isExecutionWorkspaceDetachPatch,
 } from "./execution-workspace-guards.js";
@@ -1615,6 +1616,8 @@ export {
   issueExecutionPolicySchema,
   issueExecutionStateSchema,
   resolveIssueRecoveryActionSchema,
+  isContradictedRestoredClaim,
+  RESTORED_CONTRADICTING_ISSUE_STATUSES,
   issueReviewRequestSchema,
   issueExecutionWorkspaceSettingsSchema,
   checkoutIssueSchema,

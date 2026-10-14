@@ -28,6 +28,7 @@ import {
   findPrViolations,
   findViolations,
   hasBlockingFindings,
+  hasBlockingVerdict,
   hasDeferredDisposition,
   hasStillPresentDisposition,
   idleDays,
@@ -284,6 +285,11 @@ describe("hasStillPresentDisposition", () => {
       ["en dash separator", "- **prior:354d5b9 important 1** – still-present – not mirrored", true],
       ["space after the emphasis", "- ** prior:354d5b9 important 1** — still-present — not mirrored", true],
       ["3-space indent", "   - **prior:354d5b9 important 1** — still-present — not mirrored", true],
+      // BLO-42492: Ally emits the verb emphasised as well as bare. All three
+      // readers widened together; this row is what pins that they did.
+      ["bolded verb", "- **prior:354d5b9 important 1** — **still-present** — not mirrored", true],
+      ["underscored verb", "- **prior:354d5b9 important 1** — _still-present_ — not mirrored", true],
+      ["bolded fixed verb", "- **prior:354d5b9 important 1** — **fixed** — closed", false],
       ["trailing parenthetical after the index", "- **prior:354d5b9 important 1 (see below)** — still-present — not mirrored", false],
       ["fixed verb", "- **prior:354d5b9 important 1** — fixed — closed", false],
       ["verb in prose only", "still-present in quoted prose\n- prior:354d5b9 important 1 still-present", false],
@@ -295,6 +301,20 @@ describe("hasStillPresentDisposition", () => {
       assert.equal(sweep, expected, `sweep reader: ${name}`);
       assert.equal(hasStillPresentDisposition(text), expected, `auditor: ${name}`);
     }
+  });
+
+  // The LOOSE reader's own reachability. It is the second arm of a union
+  // (proseStillPresent), so every row in the corpus above is answered by the
+  // strict arm before it is consulted — widening it there would have been
+  // untestable, and an untested guard is a comment. The shape that reaches it
+  // is a bullet whose KEY the strict grammar cannot express: Ally's compound
+  // `prior:A sev N / prior:B` form (BLO-31947). Bolded, that is blocking
+  // feedback no reader sees at all unless this arm is wide too.
+  it("reads an emphasised still-present on a key the strict grammar rejects (BLO-42492)", () => {
+    const compound =
+      "- **prior:6ac2bd7 important 1 / prior:8843b13c** — **still-present** — the defect stands.";
+    assert.equal(hasStillPresentDisposition(compound), false, "strict arm cannot read the key");
+    assert.equal(hasBlockingVerdict(compound), true, "loose arm must still block");
   });
   // BLO-36903 AC5. This auditor and the merge gate
   // (server/src/services/ally-review-detection.ts) must agree on every verb, and
@@ -381,6 +401,21 @@ describe("hasDeferredDisposition", () => {
       ),
       true,
     );
+  });
+
+  // BLO-42492: the gate counts an emphasised verb as a deferral, so this must
+  // too. It EXEMPTS, so narrow-here/wide-there is a false I4 violation on a
+  // correctly-deferred review: the one direction with no self-clearing path.
+  it("fires on an emphasised tracked verb, as the gate does", () => {
+    for (const verb of ["**tracked**", "_tracked_"]) {
+      assert.equal(
+        hasDeferredDisposition(
+          `- **prior:354d5b9 important 1** \u2014 ${verb} \u2014 accepted onto the follow-up issue`,
+        ),
+        true,
+        verb,
+      );
+    }
   });
 
   it("does NOT fire on other verbs, prose, or an indented-code paste", () => {

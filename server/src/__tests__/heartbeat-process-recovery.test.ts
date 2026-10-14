@@ -2966,6 +2966,110 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  it.each([
+    { name: "PR already merged", suppressed: true, prState: "closed", merged: true, evidenceAtNotice: false },
+    { name: "PR closed unmerged", suppressed: true, prState: "closed", merged: false, evidenceAtNotice: false },
+    { name: "clean review already at head", suppressed: true, prState: "open", merged: false, evidenceAtNotice: true },
+    { name: "open PR, no review at head", suppressed: false, prState: "open", merged: false, evidenceAtNotice: false },
+  ])("re-reads the artifact before the failed-gate notice: $name (BLO-36049)", async (c) => {
+    // Measured on Blockcast/paperclip#1375: the notice landed 2h20m after the
+    // PR merged and ~1d21h after the clean at-head review it implied was
+    // missing. The notifier reported its own run and never re-read the PR.
+    const jobName = `agent-opencode-gate-notice-${c.prState}-${c.merged}-${c.evidenceAtNotice}`;
+    const headSha = "1375aa5e4e5092fc66f689e5ba1ec7cf45e66250";
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      agentStatus: "idle",
+      externalRunId: jobName,
+      includeIssue: false,
+      contextSnapshot: {
+        reviewKind: "pr_review",
+        taskKey: `pr_review:Blockcast/libmmt:1375:${headSha}`,
+        githubRepoFullName: "Blockcast/libmmt",
+        githubPrNumber: 1375,
+        githubPrUrl: "https://github.com/Blockcast/libmmt/pull/1375",
+        githubHeadSha: headSha,
+      },
+    });
+    await seedAdapterInvokeEvent({ companyId, agentId, runId });
+    await seedLaunchedReservation({ companyId, agentId, runId, jobName });
+    const authorAgentId = randomUUID();
+    const authorIssueId = randomUUID();
+    await db.insert(agents).values({
+      id: authorAgentId,
+      companyId,
+      name: "PlayersEngineer",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: authorIssueId,
+      companyId,
+      title: "gate notice owner",
+      status: "in_review",
+      priority: "high",
+      assigneeAgentId: authorAgentId,
+      issueNumber: 1375,
+      identifier: "TAUTHOR-1375",
+    });
+    await db.insert(issueWorkProducts).values({
+      companyId,
+      issueId: authorIssueId,
+      type: "pull_request",
+      provider: "github",
+      externalId: "Blockcast/libmmt#1375",
+      title: "gate notice owner",
+      url: "https://github.com/Blockcast/libmmt/pull/1375",
+      status: "ready_for_review",
+    });
+
+    // The completion path must still see NO evidence, so the failure really is
+    // queued and the notifier really is reached — otherwise "no notice" below
+    // would pass vacuously. Evidence flips only once the notifier's own PR read
+    // has happened, i.e. a review that landed between the run and the notice.
+    let notifierReadPr = false;
+    mockGithubGetPullRequestGate.mockImplementation(async () => {
+      notifierReadPr = true;
+      return { state: c.prState, merged: c.merged };
+    });
+    mockGithubHasReviewerEvidenceForPr.mockImplementation(async () =>
+      c.evidenceAtNotice && notifierReadPr ? { found: true, via: "review" } : { found: false }
+    );
+    mockListManagedAgentJobs.mockResolvedValueOnce([]);
+    mockReadAgentJobRunStatusByName.mockResolvedValueOnce({ phase: "missing", reason: "NotFound", name: jobName });
+    const previousGateContext = process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT;
+    process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT = "review/ally-complete";
+    try {
+      await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+    } finally {
+      if (previousGateContext === undefined) delete process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT;
+      else process.env.PAPERCLIP_PR_REVIEW_GATE_STATUS_CONTEXT = previousGateContext;
+      mockGithubGetPullRequestGate.mockResolvedValue({ state: "open", merged: false });
+      mockGithubHasReviewerEvidenceForPr.mockResolvedValue({ found: false });
+    }
+
+    const [comments, wakeups, gateDeliveries] = await Promise.all([
+      db.select().from(issueComments).where(eq(issueComments.issueId, authorIssueId)),
+      db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, authorAgentId)),
+      db.select().from(githubCommitStatusDeliveries).where(eq(githubCommitStatusDeliveries.sourceRunId, runId)),
+    ]);
+    expect(gateDeliveries).toHaveLength(1);
+    expect(notifierReadPr).toBe(true);
+    const notice = comments.filter((comment) => comment.body.includes("Ally review did not land on"));
+    const gateWakes = wakeups.filter((wakeup) => wakeup.reason === "github_pr_review_gate_failed");
+    expect(notice).toHaveLength(c.suppressed ? 0 : 1);
+    expect(gateWakes).toHaveLength(c.suppressed ? 0 : 1);
+    if (!c.suppressed) {
+      // AC4: the status is only queued here; the notice must not claim it was set.
+      expect(notice[0]?.body).not.toMatch(/set to `failure`/);
+      expect(notice[0]?.body).toContain("is queued for that commit");
+    }
+  });
+
   it("notifies only the issue the PR owns, not every issue its body mentions (BLO-37225)", async () => {
     // A PR work product row is written for EVERY issue the PR references
     // anywhere — the row is evidence about the PR, not a wake. The notifier read
@@ -3884,13 +3988,24 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(persistedReservation?.releasedAt).toBeNull();
   });
 
-  it("does not treat expected Job ownership as a terminal prelaunch orphan", async () => {
+  // BLO-19148: the pair below replaces an earlier case that asserted an
+  // `expectedJobName`-only reservation was never even *selected* by the reclaim
+  // sweep (#740, "does not treat expected Job ownership as a terminal prelaunch
+  // orphan"). That exclusion predated the exact `readAgentJobRunStatusByName`
+  // verification #831 added to the loop body, and it leaked a slot forever: the
+  // migration-0128 trigger does not fire on `interrupted`, so a SIGTERM landing
+  // between `onMeta` (which persists `expectedJobName`) and
+  // `createNamespacedJob` left a row no selection branch could see. The guard
+  // the old case was really buying — "a live Job keeps its slot" — is now the
+  // second test here, asserted against the Job rather than against the name
+  // column.
+  it("releases an expectedJobName-only reservation whose Job never existed and whose run was interrupted", async () => {
     const reservedAt = new Date(Date.now() - 16 * 60 * 1000);
     const expectedJobName = "agent-opencode-expected-job";
     const { companyId, agentId, runId } = await seedRunFixture({
       adapterType: "opencode_k8s",
       agentStatus: "idle",
-      runStatus: "failed",
+      runStatus: "interrupted",
       processPid: null,
       processGroupId: null,
       includeIssue: false,
@@ -3906,7 +4021,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       reservedAt,
     });
     mockListManagedAgentJobs.mockResolvedValueOnce([]);
-    mockReadAgentJobRunStatusByName.mockResolvedValueOnce({
+    mockReadAgentJobRunStatusByName.mockResolvedValue({
       phase: "missing",
       reason: "NotFound",
       name: expectedJobName,
@@ -3919,9 +4034,50 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .from(externalRuntimeReservations)
       .where(eq(externalRuntimeReservations.id, reservation.id))
       .then((rows) => rows[0]);
+    expect(persistedReservation).toMatchObject({
+      state: "released",
+      releaseReason: "terminal_prelaunch_orphan",
+    });
+    expect(persistedReservation?.releasedAt).not.toBeNull();
+    expect(mockReadAgentJobRunStatusByName).toHaveBeenCalledWith(expectedJobName);
+  });
+
+  it("keeps an expectedJobName-only reservation whose expected Job is still active", async () => {
+    const reservedAt = new Date(Date.now() - 16 * 60 * 1000);
+    const expectedJobName = "agent-opencode-live-job";
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      agentStatus: "idle",
+      runStatus: "interrupted",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: false,
+      lastOutputAt: null,
+    });
+    const reservation = await seedPrelaunchReservation({
+      companyId,
+      agentId,
+      runId,
+      state: "launching",
+      isolationMode: "shared",
+      expectedJobName,
+      reservedAt,
+    });
+    mockListManagedAgentJobs.mockResolvedValueOnce([]);
+    mockReadAgentJobRunStatusByName.mockResolvedValue({
+      phase: "active",
+      name: expectedJobName,
+    });
+
+    await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+    const persistedReservation = await db
+      .select()
+      .from(externalRuntimeReservations)
+      .where(eq(externalRuntimeReservations.id, reservation.id))
+      .then((rows) => rows[0]);
     expect(persistedReservation?.state).toBe("launching");
     expect(persistedReservation?.releasedAt).toBeNull();
-    expect(mockReadAgentJobRunStatusByName).not.toHaveBeenCalled();
   });
 
   it("keeps a recent shared prelaunch reservation while terminal execution teardown may still be unwinding", async () => {

@@ -29,6 +29,7 @@ import { logger } from "../middleware/logger.js";
 import { describeHeldAgentStartLocks } from "./agent-start-lock.js";
 import { refreshExternalRuntimeReservationMetrics } from "./external-runtime-reservations.js";
 import { refreshExternalRuntimeReservationStrandMetrics } from "./external-runtime-reservation-strand-metrics.js";
+import { refreshApprovalQueueMetrics } from "./approval-queue-metrics.js";
 import {
   refreshDeferredIssueExecutionWakeAgeMetrics,
   refreshOverdueScheduledRetryAgeMetrics,
@@ -38,10 +39,12 @@ import {
 import { refreshRoutineFireGapMetrics } from "./routine-fire-gap-metrics.js";
 import {
   setAgentStartLockHeldMetrics,
+  setApprovalQueueMetricsRefreshSuccess,
   setDbPoolStats,
   setDeferredIssueExecutionWakeAgeMetricsRefreshSuccess,
   setExternalRuntimeReservationStrandMetricsRefreshSuccess,
   setFdClassMetrics,
+  setNativeMemoryMetrics,
   setOverdueScheduledRetryAgeMetricsRefreshSuccess,
   setQueuedRunAgeMetricsRefreshSuccess,
   setRoutineFireGapMetricsRefreshSuccess,
@@ -49,6 +52,7 @@ import {
   type DbPoolStats,
 } from "./metrics.js";
 import { collectFdClassSnapshot } from "./fd-class-metrics.js";
+import { collectNativeMemorySnapshot } from "./native-memory-metrics.js";
 
 /** Scrape interval is 15 s; refreshing on the same cadence keeps every scrape at most one tick behind. */
 const DEFAULT_INTERVAL_MS = 15_000;
@@ -119,6 +123,15 @@ const REFRESHES: readonly ScrapeRefresh[] = [
     name: "external-runtime-reservation-strand",
     run: (db) => refreshExternalRuntimeReservationStrandMetrics(db),
     setFresh: setExternalRuntimeReservationStrandMetricsRefreshSuccess,
+  },
+  {
+    // BLO-29850. Not a run-table refresh and not a queue the platform serves at
+    // all: the board approval queue is served by humans, so every refresh above
+    // is blind to it. It stopped for 3.2 days with 39 cards filed into it and
+    // nothing could tell that apart from an empty queue.
+    name: "approval-queue",
+    run: (db) => refreshApprovalQueueMetrics(db),
+    setFresh: setApprovalQueueMetricsRefreshSuccess,
   },
 ];
 
@@ -222,6 +235,26 @@ export function refreshAgentStartLockMetrics(): void {
  */
 export function refreshFdClassMetrics(): void {
   setFdClassMetrics(collectFdClassSnapshot());
+}
+
+/**
+ * PEN-3314: publish the native-memory accounting on the scrape path.
+ *
+ * On the scrape path rather than in {@link REFRESHES} for the third reason given
+ * for {@link refreshFdClassMetrics}, which applies here with more force: this
+ * gauge exists to be correlated against `process_resident_memory_bytes`,
+ * `nodejs_heap_size_total_bytes` and `nodejs_external_memory_bytes`, all of which
+ * prom-client renders at scrape time. `native_unaccounted` is a *subtraction* of
+ * two of them, so a one-tick offset would not merely add noise — it would make
+ * the published residual disagree with the same residual computed in PromQL from
+ * the three default gauges, and the disagreement would be invisible.
+ *
+ * Unlike the descriptor walk this costs no syscall worth measuring:
+ * `process.memoryUsage()` reads this process's own counters and
+ * `v8.getHeapStatistics()` is an in-process struct copy.
+ */
+export function refreshNativeMemoryMetrics(): void {
+  setNativeMemoryMetrics(collectNativeMemorySnapshot());
 }
 
 export interface ScrapeMetricsCollectorOptions {
