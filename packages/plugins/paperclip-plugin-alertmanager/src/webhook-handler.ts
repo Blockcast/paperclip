@@ -2177,9 +2177,13 @@ const replayKey = (companyId: string, alert: AlertmanagerAlert): string =>
  * A retry and a `repeat_interval` re-send are byte-identical — Alertmanager
  * carries no delivery or attempt id — so elapsed time is the only available
  * discriminator, and this window is therefore a heuristic rather than an exact
- * test. It is sized to sit above Alertmanager's retry train (the measured
- * 2026-09-10 episode ran ~15 retries over 5m22s) and far below any realistic
- * `repeat_interval` (default 4h; a value under 5m would be pathological).
+ * test. It must sit above Alertmanager's retry train AND its `group_interval`,
+ * and far below `repeat_interval`. BLO-37485 (2026-10-14): at 5m it sat below
+ * both — retry trains ran 5m22s (2026-09-10) to 6m32s, and a changing aggregate
+ * group is re-sent every `group_interval: 5m` — so commits aged out mid-train,
+ * later attempts re-paid ~1.6s/alert for work already done, and a 70-130 alert
+ * group never converged inside the 90s delivery budget. 15m clears both with
+ * margin and stays well under the live `repeat_interval: 1h`.
  *
  * Both error directions are bounded, and they are deliberately asymmetric:
  *   - too short — a late retry redoes idempotent work. That is exactly the
@@ -2197,7 +2201,7 @@ const replayKey = (companyId: string, alert: AlertmanagerAlert): string =>
  * ponytail: wall-clock window, not an exact replay test. If Alertmanager ever
  * exposes a delivery/attempt id, key on that instead and delete this.
  */
-const ALERT_REPLAY_SKIP_WINDOW_MS = 5 * 60_000;
+const ALERT_REPLAY_SKIP_WINDOW_MS = 15 * 60_000;
 
 /**
  * Record that a firing pass for this alert completed end to end. Called only
