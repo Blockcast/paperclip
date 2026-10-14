@@ -433,6 +433,14 @@ export type IssueRecoveryActionOutcome = (typeof ISSUE_RECOVERY_ACTION_OUTCOMES)
 export const ISSUE_RECOVERY_ACTION_RETIRING_BOUNDS = [
   "timeout_horizon",
   "attempt_budget",
+  // PEN-4006: retired by `escalateExpiredWakeHorizons` at its absolute ceiling while a wake
+  // run for the action was STILL PENDING. Creation-anchored like `timeout_horizon`, and
+  // deliberately a distinct value rather than a flag beside it: `retiringBound` is written
+  // with `coalesce` on one of the two writers (first writer wins permanently), so "a wake was
+  // still in flight when we gave up" can only be recorded at the call site that knows it.
+  // Reading it later as `timeout_horizon` would say the opposite of what happened — that the
+  // action was woken and did not converge.
+  "pending_wake_ceiling",
   "discharged",
   "cancelled",
 ] as const;
