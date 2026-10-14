@@ -1332,9 +1332,61 @@ function isFullEnvDump(command) {
 // fails OPEN: no task id (PR-review runs carry none), no credentials, an
 // unreachable API, or a lock nobody holds all allow — this blocks only when
 // the server positively names a DIFFERENT run as the issue's lock holder.
-const OUTWARD_RE = /(?:^|[^\w-])git(?:\s+-[cC]\s+\S+|\s+--?[\w-]+(?:=\S+)?)*\s+push\b|(?:^|[^\w-])gh\s+pr\s+create\b/;
-async function foreignLockHolder(command) {
-  if (!OUTWARD_RE.test(command)) return null;
+//
+// BLO-46113. Matched on LEXED words, not command text: echo "git push later"
+// and a commit message that mentions a push are data, and the old text regex
+// both false-matched them and missed gh api writes and gh pr merge.
+const GIT_VALUE_OPTS = ["-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env"];
+function gitSubcommand(words, i) {
+  for (let j = i + 1; j < words.length; j += 1) {
+    if (GIT_VALUE_OPTS.indexOf(words[j]) !== -1) { j += 1; continue; }
+    if (words[j][0] !== "-") return words[j];
+  }
+  return null;
+}
+// gh api defaults to GET, and to POST once any field or --input is given.
+const GH_WRITE_PATH_RE = /(?:^|\/)(?:pulls|git\/refs|merges)(?:[\/?]|$)/;
+function ghApiWrites(args) {
+  let method = null, fields = false, path = false;
+  for (let j = 0; j < args.length; j += 1) {
+    const a = args[j];
+    const m = /^(?:-X|--method)(?:=?(.+))?$/.exec(a);
+    if (m) { method = (m[1] || args[j + 1] || "").toUpperCase(); if (!m[1]) j += 1; continue; }
+    if (/^(?:-[fF]|--field|--raw-field|--input)(?:=|$)/.test(a) || /^-[fF]./.test(a)) fields = true;
+    if (a[0] !== "-" && GH_WRITE_PATH_RE.test(a)) path = true;
+  }
+  const writes = method ? method !== "GET" && method !== "HEAD" : fields;
+  return path && writes;
+}
+function outwardWords(words, depth) {
+  const wrapped = words.some((w) => COMMAND_POSITION_WRAPPERS.indexOf(basename(w)) !== -1);
+  for (let i = 0; i < words.length; i += 1) {
+    const base = basename(words[i]);
+    if (base === "git" && gitSubcommand(words, i) === "push") return true;
+    if (base === "gh") {
+      if (words[i + 1] === "pr" && (words[i + 2] === "create" || words[i + 2] === "merge")) return true;
+      if (words[i + 1] === "api" && ghApiWrites(words.slice(i + 2))) return true;
+    }
+    // A quoted word is a command only after something that re-parses it
+    // (eval, ssh, sudo sh -c ...); after any other program it is data.
+    if (wrapped && /\s/.test(words[i]) && isOutward(words[i], depth + 1)) return true;
+  }
+  return false;
+}
+function isOutward(command, depth) {
+  if (depth > 4) return false;
+  const lexed = lexShell(command);
+  for (const words of lexed.commands) if (outwardWords(words, depth)) return true;
+  for (const body of lexed.nested) if (body.trim() && isOutward(body, depth + 1)) return true;
+  for (const body of lexed.heredocs) {
+    for (const inner of lexShell(body).nested) if (inner.trim() && isOutward(inner, depth + 1)) return true;
+  }
+  return false;
+}
+// BLO-46113: the GitHub MCP write tools reach the same side effects without
+// Bash. Keep in lockstep with GUARD_HOOK_MATCHER, which routes them here.
+const MCP_GITHUB_WRITE_RE = /^mcp__github__(?:create_pull_request|merge_pull_request|push_files|create_or_update_file|delete_file|create_branch|update_pull_request_branch)$/;
+async function foreignLockHolder() {
   const env = process.env;
   const task = env.PAPERCLIP_TASK_ID, run = env.PAPERCLIP_RUN_ID;
   const api = env.PAPERCLIP_API_URL, key = env.PAPERCLIP_API_KEY;
@@ -1371,13 +1423,14 @@ process.stdin.on("end", async () => {
       );
       process.exit(2);
     }
-    const foreign = /^(?:Bash|Shell)$/i.test(String(tool)) && command
-      ? await foreignLockHolder(String(command))
-      : null;
+    const outward = /^(?:Bash|Shell)$/i.test(String(tool))
+      ? Boolean(command) && isOutward(String(command), 0)
+      : MCP_GITHUB_WRITE_RE.test(String(tool));
+    const foreign = outward ? await foreignLockHolder() : null;
     if (foreign) {
       process.stderr.write(
         "Blocked by Paperclip lock guard (BLO-29965): this command pushes to a git " +
-          "remote or opens a PR for " + foreign.issue + ", but that issue's execution " +
+          "remote, or opens, merges or moves a PR or ref, for " + foreign.issue + ", but that issue's execution " +
           "lock is held by run " + foreign.holder + ", not this run (" + foreign.run +
           "). Another run may be working the same issue. Re-assert the lock first " +
           "(paperclipCheckoutIssue, or POST /api/issues/" + foreign.id + "/checkout " +
@@ -1403,11 +1456,13 @@ for (const name of Object.keys(process.env).sort()) console.log(name);
 `;
 
 /**
- * Idempotent settings-merge script (runs via `node -`). Adds a Bash-matcher
- * PreToolUse hook to the runtime's `settings.json` only if an identical command
+ * Idempotent settings-merge script (runs via `node -`). Adds a PreToolUse hook
+ * matching Bash and the GitHub MCP write tools (BLO-46113) to the runtime's `settings.json` only if an identical command
  * entry is not already present, preserving any existing hooks (e.g. Claude
  * Code's installed Stop hook).
  */
+export const GUARD_HOOK_MATCHER =
+  "Bash|mcp__github__(?:create_pull_request|merge_pull_request|push_files|create_or_update_file|delete_file|create_branch|update_pull_request_branch)";
 const SETTINGS_MERGE_SCRIPT = String.raw`const fs=require("fs"),p=require("path");
 const dir=process.env.CLAUDE_CONFIG_DIR||(process.env.HOME||"/paperclip")+"/.claude";
 const f=p.join(dir,"settings.json");
@@ -1421,18 +1476,20 @@ const guard=process.env.PAPERCLIP_GUARD_FILE||p.join(dir,"paperclip-env-guard.mj
 // every hash rotation would APPEND a guard hook instead of replacing the old
 // one. The optional trailing quote also prunes pre-quoting entries on rollout.
 const cmd="node '"+guard.replace(/'/g,"'\\''")+"'";
+// A matcher change re-registers the hook even when the guard hash did not move.
+const M=${JSON.stringify(GUARD_HOOK_MATCHER)};
 const GUARD_RE=/paperclip-env-guard[^\s"']*\.mjs'?$/;
 const list=(Array.isArray(s.hooks.PreToolUse)?s.hooks.PreToolUse:[])
   .map(function(g){
     if(!g||!Array.isArray(g.hooks))return g;
     const hooks=g.hooks.filter(function(h){
-      return !(h&&typeof h.command==="string"&&h.command!==cmd&&GUARD_RE.test(h.command));
+      return !(h&&typeof h.command==="string"&&GUARD_RE.test(h.command)&&(h.command!==cmd||g.matcher!==M));
     });
     return Object.assign({},g,{hooks:hooks});
   })
   .filter(function(g){return !g||!Array.isArray(g.hooks)||g.hooks.length>0;});
-const has=list.some(function(g){return g&&Array.isArray(g.hooks)&&g.hooks.some(function(h){return h&&h.command===cmd;});});
-if(!has)list.push({matcher:"Bash",hooks:[{type:"command",command:cmd}]});
+const has=list.some(function(g){return g&&g.matcher===M&&Array.isArray(g.hooks)&&g.hooks.some(function(h){return h&&h.command===cmd;});});
+if(!has)list.push({matcher:M,hooks:[{type:"command",command:cmd}]});
 s.hooks.PreToolUse=list;
 fs.mkdirSync(dir,{recursive:true});
 const t=f+"."+process.pid+".tmp";
