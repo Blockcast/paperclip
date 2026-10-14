@@ -1616,6 +1616,8 @@ export {
   issueExecutionPolicySchema,
   issueExecutionStateSchema,
   resolveIssueRecoveryActionSchema,
+  isContradictedRestoredClaim,
+  RESTORED_CONTRADICTING_ISSUE_STATUSES,
   issueReviewRequestSchema,
   issueExecutionWorkspaceSettingsSchema,
   checkoutIssueSchema,

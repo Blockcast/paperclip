@@ -16628,7 +16628,20 @@ export function recoveryService(
         // the re-raised findings, not the round count, which counts converging
         // rounds too. The two changes are not alternatives — this one replaces
         // only the "or record a disposition" tail.
-        ? `Self-reviewed PR #${input.prNumber} ${reRaised}, after ${input.cycleCount} actionable review rounds. Take over the PR, unblock or reassign the author, or discharge this action yourself: POST /issues/${issue.id}/recovery-actions/resolve with body {"outcome":"restored","resolutionNote":"<why>"} (the action id goes in the BODY as an optional "actionId", never in the path; omit "sourceIssueStatus" to leave the source issue's status untouched). Do not leave the author looping on its own self-review.`
+        //
+        // Ally review on #2584 asked that this point at `blocked` +
+        // `sourceIssueStatus: "blocked"` for a blocked issue, to stop generating
+        // PEN-3991 downgrades at source. Named CONDITIONALLY rather than as the
+        // instruction, because `blocked` is not always available: the route
+        // refuses it with 422 unless the source issue carries an unresolved
+        // first-class `blocks` relation (`routes/issues.ts`), and the measured
+        // PEN-3991 population was blocked by infra faults with no such edge. An
+        // unconditional steer would hand that population a deterministic refusal
+        // in place of a working exit. For them `restored_unverified` is not a row
+        // to eliminate — it is the honest record of a discharge on an issue that
+        // was not left runnable, which is the whole point of PEN-3991, so the
+        // text says plainly what gets recorded instead of hiding it.
+        ? `Self-reviewed PR #${input.prNumber} ${reRaised}, after ${input.cycleCount} actionable review rounds. Take over the PR, unblock or reassign the author, or discharge this action yourself: POST /issues/${issue.id}/recovery-actions/resolve with body {"outcome":"restored","resolutionNote":"<why>"} (the action id goes in the BODY as an optional "actionId", never in the path; omit "sourceIssueStatus" to leave the source issue's status untouched. If the issue is waiting on an unresolved first-class blocker, prefer {"outcome":"blocked","sourceIssueStatus":"blocked"} — that returns ownership without claiming a repair, and is refused unless such a blocker exists. On an issue left blocked or cancelled, "restored" is still accepted but recorded as "restored_unverified"). Do not leave the author looping on its own self-review.`
         : `Self-reviewed PR #${input.prNumber} ${reRaised}, after ${input.cycleCount} actionable review rounds, and no invokable agent can own it. Board intervention needed.`,
       wakePolicy: ownerAgentId
         ? { type: "wake_owner", reason: "self_review_pr_non_convergence", ownerAgentId }

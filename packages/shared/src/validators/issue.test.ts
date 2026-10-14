@@ -10,6 +10,7 @@ import {
   misplacedIssueMonitorInputMessage,
   MISPLACED_ISSUE_PARKED_INPUT_KEYS,
   PARKED_DISPOSITION_MAX_HORIZON_DAYS,
+  isContradictedRestoredClaim,
   resolveIssueRecoveryActionSchema,
   respondIssueThreadInteractionSchema,
   suggestedTaskDraftSchema,
@@ -747,5 +748,89 @@ describe("issue validators", () => {
     });
 
     expect(parsed.success).toBe(false);
+  });
+});
+
+describe("isContradictedRestoredClaim (PEN-3991)", () => {
+  it("accepts a restored claim that leaves the issue runnable", () => {
+    for (const status of ["todo", "done", "in_review"] as const) {
+      expect(
+        isContradictedRestoredClaim({
+          requestedSourceIssueStatus: status,
+          currentIssueStatus: "in_progress",
+        }),
+      ).toBe(false);
+    }
+  });
+
+  it("contradicts a restored claim that explicitly lands the issue on blocked", () => {
+    // The schema already refuses this combination outright, so the route never
+    // sees it today. Asserted anyway: if that refusal is ever relaxed, the two
+    // halves of this rule must still agree rather than silently diverge — which
+    // is the shape of the defect this guards.
+    expect(
+      isContradictedRestoredClaim({
+        requestedSourceIssueStatus: "blocked",
+        currentIssueStatus: "in_progress",
+      }),
+    ).toBe(true);
+  });
+
+  it("contradicts a restored claim on an already-blocked issue when sourceIssueStatus is omitted", () => {
+    // ⭐ THE DEFECT. `restored` + explicit `blocked` was refused while
+    // `restored` + omitted-while-already-`blocked` was accepted — same end
+    // state, opposite verdicts — because a body validator cannot see the
+    // issue's existing status. Four actions were discharged this way twice in
+    // eight hours with `resolutionSnapshot.issueStatus: "blocked"` captured by
+    // the same write.
+    expect(
+      isContradictedRestoredClaim({
+        requestedSourceIssueStatus: undefined,
+        currentIssueStatus: "blocked",
+      }),
+    ).toBe(true);
+    expect(
+      isContradictedRestoredClaim({
+        requestedSourceIssueStatus: null,
+        currentIssueStatus: "blocked",
+      }),
+    ).toBe(true);
+  });
+
+  it("contradicts a restored claim on a cancelled issue, which cannot even be requested explicitly", () => {
+    expect(
+      isContradictedRestoredClaim({
+        requestedSourceIssueStatus: undefined,
+        currentIssueStatus: "cancelled",
+      }),
+    ).toBe(true);
+  });
+
+  it("leaves PEN-2756's omitted-status landings alone", () => {
+    // These are the branch this check deliberately EXCLUDES, and the reason the
+    // predicate is a named list rather than "anything outside todo/done/in_review".
+    // PEN-2756 added the omitted-`sourceIssueStatus` route precisely so a beacon
+    // on one of these could be discharged without claiming a status the resolver
+    // cannot verify. `restored` is honest on both: `in_progress` is a live run,
+    // `backlog` is a board-approved park. Widening the list re-breaks that.
+    for (const status of ["in_progress", "backlog"] as const) {
+      expect(
+        isContradictedRestoredClaim({
+          requestedSourceIssueStatus: undefined,
+          currentIssueStatus: status,
+        }),
+      ).toBe(false);
+    }
+  });
+
+  it("reads the requested status in preference to the current one", () => {
+    // A blocked issue being moved to `todo` IS a restoration — the claim is
+    // about where the write leaves the issue, not where it found it.
+    expect(
+      isContradictedRestoredClaim({
+        requestedSourceIssueStatus: "todo",
+        currentIssueStatus: "blocked",
+      }),
+    ).toBe(false);
   });
 });
