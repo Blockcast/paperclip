@@ -910,6 +910,46 @@ the volume before you disable the flag — see the security section above, where
 that ordering and the reason for it are spelled out — and delete both once the
 diff has been read.
 
+### ⛔ Anything you DERIVE from a snapshot inherits the secrets — and nothing sweeps it
+
+Every control above governs one directory. `MAX_AGE_MINUTES`, the delete-on-disable
+prune, the `.partial` suffix — all of them act on files *in* `<instance-root>/data/diagnostics/heap/`
+that the worker itself wrote. **A file you produce from a snapshot is covered by
+none of them**, and it holds the same plaintext, because an analysis of a heap
+snapshot is mostly an analysis of its strings.
+
+This is measured, not hypothetical. PEN-3631's own `summarize.mjs` applied the
+redaction contract at *report* time and wrote raw node names to its
+`summary.json`. Three of those sat in a sibling directory — deliberately outside
+`heap/`, so the prune could not destroy the tooling — for up to 44 hours,
+totalling 101 MB. Scanned 2026-10-13:
+
+| in one 30 MB summary | count |
+|---|---|
+| full 3-part JWTs (`ES256` with `kid`, `ES256`, `HS256`) | 45 |
+| `postgres://` URIs carrying userinfo (19–58 chars) | 3 |
+
+They outlived the snapshot they came from: the snapshot was pruned on schedule at
+its 24 h stamp and the summaries were not, because nothing was watching them.
+Note what did *not* appear — the `ghp_`/`ghs_` prefix hits were detector regexes
+in library code, never a full-length token, and the two `BEGIN … PRIVATE KEY`
+lines carried no base64 body. Check the shape before reporting a finding here;
+the prefix alone is not one.
+
+**Redaction therefore belongs at the write, not at the read.** `tools/heap-analysis/redact.mjs`
+is the single contract (`<type, Nch, #sha256-8>`), it is idempotent, and
+`summarize.mjs` applies it before a row can reach disk. If you add a tool, import
+it there rather than at the point of display.
+
+Two consequences for the operator ordering above:
+
+- **Step 1 — "copy the snapshot off the volume" — creates an unmanaged copy by
+  design.** That copy is yours to delete; the prune will never reach it. Prefer
+  analysing in place and copying only redacted output.
+- **A grep, a `cut`, a scratch file, a pasted excerpt is the same object as the
+  snapshot** for this purpose. The only safe thing to move off the claim is
+  output that has been through `redactName()`.
+
 ## Secrets in Dev
 
 Agent env vars now support secret references. By default, secret values are stored with local encryption and only secret refs are persisted in agent config.
