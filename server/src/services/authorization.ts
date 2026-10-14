@@ -948,7 +948,13 @@ export function authorizationService(db: Db) {
       .then((rows) => rows[0] ?? null);
   }
 
-  async function loadIssue(issueId: string): Promise<IssueAuthorizationRow | null> {
+  // Reads an issue row regardless of which company owns it. Only for call sites
+  // that load a possibly-foreign row *in order to compare* its companyId and
+  // reject it. Everything else wants `loadIssue`, which is company-scoped: a
+  // foreign row reaching `resolveCoreTrustPreset` as a policy source is an
+  // unconditional `deny_policy_restricted` on every action (BLO-23207, and the
+  // issue-side twin of it, BLO-29127).
+  async function loadIssueAnyCompany(issueId: string): Promise<IssueAuthorizationRow | null> {
     return db
       .select({
         id: issues.id,
@@ -965,6 +971,24 @@ export function authorizationService(db: Db) {
       .from(issues)
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0] ?? null);
+  }
+
+  // Returns null for both "no such issue" and "the issue belongs to another
+  // company". `resource.companyId` is NOT always row-derived — `previewAssignment`
+  // and `explainAssignment` (plugin-host-services.ts:3350,3366) build it from
+  // `params.companyId` alongside a caller-supplied `params.target.issueId`, so the
+  // two can disagree by construction. Any call site that would fall back to
+  // ANYTHING OTHER THAN THE ROW when this returns null must fail closed instead.
+  // Not just a caller-supplied field: falling back to a literal that happens to
+  // mean "no restriction" is the same hazard and is easier to miss, because
+  // there is no caller-supplied value in sight to make it look suspicious —
+  // `?.originKind ?? null` at :1745 read exactly that way until Ally caught it.
+  // "Fail closed" is a direction, not a return value: it is `false` where the
+  // function answers "is this within the boundary", and `true` where it answers
+  // "does this block the claim".
+  async function loadIssue(companyId: string, issueId: string): Promise<IssueAuthorizationRow | null> {
+    const row = await loadIssueAnyCompany(issueId);
+    return row && row.companyId === companyId ? row : null;
   }
 
   async function loadRunPolicy(runId: string | null | undefined, companyId: string, agentId: string) {
@@ -1005,7 +1029,10 @@ export function authorizationService(db: Db) {
   }
 
   async function loadResourceContext(resource: AuthorizationResource) {
-    const issue = resource.type === "issue" && resource.issueId ? await loadIssue(resource.issueId) : null;
+    const issue =
+      resource.type === "issue" && resource.issueId
+        ? await loadIssue(resource.companyId, resource.issueId)
+        : null;
     const projectId =
       resource.type === "issue"
         ? issue?.projectId ?? resource.projectId ?? null
@@ -1061,7 +1088,13 @@ export function authorizationService(db: Db) {
     boundary: LowTrustBoundaryWithCompany,
     resource: Extract<AuthorizationResource, { type: "issue" }>,
   ) {
-    const issue = resource.issueId ? await loadIssue(resource.issueId) : null;
+    const issue = resource.issueId ? await loadIssue(resource.companyId, resource.issueId) : null;
+    // An `issueId` this company cannot read is foreign or dangling, not absent.
+    // Falling through would decide the boundary from the caller-supplied
+    // `projectId` instead — and `previewAssignment` / `explainAssignment`
+    // (plugin-host-services.ts:3350,3366) take both straight from the caller,
+    // so the two can disagree by construction. Fail closed.
+    if (resource.issueId && !issue) return false;
     const candidate = {
       companyId: resource.companyId,
       id: issue?.id ?? resource.issueId ?? null,
@@ -1072,7 +1105,8 @@ export function authorizationService(db: Db) {
       return issueIdIsDescendantOf(candidate.id, boundary.rootIssueId, boundary.companyId);
     }
     if (!resource.parentIssueId) return false;
-    const parent = await loadIssue(resource.parentIssueId);
+    // Deliberately unscoped: the boundary check below compares `parent.companyId`.
+    const parent = await loadIssueAnyCompany(resource.parentIssueId);
     if (!parent) return false;
     if (
       isIssueWithinLowTrustBoundary(boundary, {
@@ -1095,7 +1129,8 @@ export function authorizationService(db: Db) {
     if (!projectId) return false;
     if (boundary.projectIds?.includes(projectId)) return true;
     if (!boundary.rootIssueId) return false;
-    const rootIssue = await loadIssue(boundary.rootIssueId);
+    // Deliberately unscoped: keyed on the boundary's company, compared below.
+    const rootIssue = await loadIssueAnyCompany(boundary.rootIssueId);
     return rootIssue?.companyId === boundary.companyId && rootIssue.projectId === projectId;
   }
 
@@ -1272,7 +1307,8 @@ export function authorizationService(db: Db) {
       return true;
     }
     if (resource.parentIssueId && allowedProjectIds.length > 0) {
-      const parent = await loadIssue(resource.parentIssueId);
+      // Deliberately unscoped: the condition below compares `parent.companyId`.
+      const parent = await loadIssueAnyCompany(resource.parentIssueId);
       if (parent?.companyId === resource.companyId && parent.projectId && allowedProjectIds.includes(parent.projectId)) {
         return true;
       }
@@ -1285,7 +1321,13 @@ export function authorizationService(db: Db) {
     keyId: string;
     resource: Extract<AuthorizationResource, { type: "issue" }>;
   }) {
-    const issue = input.resource.issueId ? await loadIssue(input.resource.issueId) : null;
+    const issue = input.resource.issueId
+      ? await loadIssue(input.resource.companyId, input.resource.issueId)
+      : null;
+    // Same fail-closed rule as the low-trust boundary above: an unreadable
+    // `issueId` must not degrade to the caller-supplied `assigneeAgentId`,
+    // which would clear this write boundary on an actor match alone.
+    if (input.resource.issueId && !issue) return false;
     const assigneeAgentId = issue?.assigneeAgentId ?? input.resource.assigneeAgentId ?? null;
     if (assigneeAgentId === input.actorAgentId) return true;
     const originKind = issue?.originKind ?? input.resource.originKind ?? null;
@@ -1760,12 +1802,26 @@ export function authorizationService(db: Db) {
     // would make every ordinary (origin-less) issue reload the full row here —
     // the common case, and the one this branch exists to serve — while only
     // issues that already carry an origin kind took the cheap path.
-    const originKind = resource.originKind !== undefined
-      ? resource.originKind
-      : resource.issueId
-        ? (await loadIssue(resource.issueId))?.originKind ?? null
-        : null;
-    return AGENT_UNASSIGNED_CLAIM_DENIED_ORIGIN_KINDS.has(originKind ?? "");
+    if (resource.originKind !== undefined) {
+      return AGENT_UNASSIGNED_CLAIM_DENIED_ORIGIN_KINDS.has(resource.originKind ?? "");
+    }
+    if (!resource.issueId) return false;
+    const issue = await loadIssue(resource.companyId, resource.issueId);
+    // Same fail-closed rule as the two boundary checks above, inverted because
+    // here `true` is the blocking answer. An `issueId` this company cannot read
+    // is foreign or dangling, not "an issue with no origin kind" — and the
+    // difference matters precisely on the path that reaches here. This gates the
+    // BLO-19094 self-appointment deny at :2343, inside the `tasks:assign` block,
+    // and `tasks:assign` is what `previewAssignment` / `explainAssignment`
+    // (plugin-host-services.ts:3350,3366) pass to `decide()` with a
+    // caller-supplied `issueId` and no `originKind`. Degrading an unreadable row
+    // to `null` would answer "not a review shell" — the permissive direction —
+    // for a shell in another company. Neither sibling guard reaches this path:
+    // `issueResourceWithinLowTrustBoundary` sees `tasks:assign` only for a
+    // low-trust actor, and `issueMatchesTaskBridgeWriteBoundary` needs a
+    // `task_bridge` keyScope that `pluginAssignmentActor` does not emit.
+    if (!issue) return true;
+    return AGENT_UNASSIGNED_CLAIM_DENIED_ORIGIN_KINDS.has(issue.originKind ?? "");
   }
 
   async function decideBase(input: {

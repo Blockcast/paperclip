@@ -33,6 +33,7 @@ export function isHostWriteUnavailableError(err: unknown): boolean {
   const message = errorMessage(err);
   return message.includes("missing, expired, or unknown invocation scope")
     || message.includes("not allowed to perform")
+    || message.includes("outside its invocation scope")
     || message.includes("CapabilityDeniedError")
     || message.includes("InvocationScopeDeniedError");
 }

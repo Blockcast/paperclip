@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const issueId = "11111111-1111-4111-8111-111111111111";
 const closedWorkspaceId = "33333333-3333-4333-8333-333333333333";
 const nextWorkspaceId = "44444444-4444-4444-8444-444444444444";
+const otherClosedWorkspaceId = "55555555-5555-4555-8555-555555555555";
 const agentId = "22222222-2222-4222-8222-222222222222";
 
 const mockIssueService = vi.hoisted(() => ({
@@ -23,6 +24,13 @@ const mockExecutionWorkspaceService = vi.hoisted(() => ({
 const mockAccessService = vi.hoisted(() => ({
   canUser: vi.fn(),
   hasPermission: vi.fn(),
+  // Only the agent cases reach decide(); the issue is assigned to the acting agent.
+  decide: vi.fn(async (input: { action: string }) => ({
+    allowed: input.action === "issue:read" || input.action === "issue:mutate",
+    action: input.action,
+    reason: "allow_company_agent",
+    explanation: "Allowed by test default.",
+  })),
 }));
 
 const mockHeartbeatService = vi.hoisted(() => ({
@@ -81,7 +89,11 @@ function registerServiceMocks() {
     }),
     accessService: () => mockAccessService,
     agentService: () => ({
-      getById: vi.fn(async () => null),
+      getById: vi.fn(async (id: string) =>
+        id === agentId
+          ? { id, companyId: "company-1", role: "engineer", status: "active", reportsTo: null, permissions: {} }
+          : null,
+      ),
     }),
     companySkillService: () => ({
       completeTestRunForIssue: vi.fn(async () => null),
@@ -141,7 +153,22 @@ function registerServiceMocks() {
   }));
 }
 
-async function createApp() {
+const boardActor = {
+  type: "board",
+  userId: "local-board",
+  companyIds: ["company-1"],
+  source: "local_implicit",
+  isInstanceAdmin: false,
+};
+
+const assigneeAgentActor = {
+  type: "agent",
+  agentId,
+  companyId: "company-1",
+  source: "agent_key",
+};
+
+async function createApp(actor: Record<string, unknown> = boardActor) {
   const [{ issueRoutes }, { errorHandler }] = await Promise.all([
     import("../routes/issues.js"),
     import("../middleware/index.js"),
@@ -149,13 +176,7 @@ async function createApp() {
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
-    (req as any).actor = {
-      type: "board",
-      userId: "local-board",
-      companyIds: ["company-1"],
-      source: "local_implicit",
-      isInstanceAdmin: false,
-    };
+    (req as any).actor = actor;
     next();
   });
   app.use("/api", issueRoutes({} as any, {} as any));
@@ -287,5 +308,33 @@ describe.sequential("closed isolated workspace issue routes", () => {
 
     expect(res.status).toBe(200);
     expect(res.body.executionWorkspaceId).toBe(nextWorkspaceId);
+  });
+
+  // BLO-42036 positive control for the agent path: without this the refusal below could
+  // pass merely because the detach exemption never fires for agents at all.
+  it("lets the assignee agent detach the issue from its closed workspace", async () => {
+    mockIssueService.update.mockResolvedValue({ ...makeIssue(), executionWorkspaceId: null });
+
+    const res = await request(await createApp(assigneeAgentActor))
+      .patch(`/api/issues/${issueId}`)
+      .send({ executionWorkspaceId: null });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalled();
+  });
+
+  // The route destructures hiddenAt out of the body before building updateFields, then
+  // writes it unconditionally after the closed-workspace guard. When the detach exemption
+  // was keyed on updateFields it could not see hiddenAt, so rebinding onto ANOTHER closed
+  // workspace landed a hide on an issue that stayed bricked. The exemption is keyed on the
+  // whole body now; this pins that wiring at the route.
+  it("refuses an agent detach that carries hiddenAt along with it", async () => {
+    const res = await request(await createApp(assigneeAgentActor))
+      .patch(`/api/issues/${issueId}`)
+      .send({ executionWorkspaceId: otherClosedWorkspaceId, hiddenAt: "2026-10-10T00:00:00.000Z" });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toContain("closed workspace");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 });

@@ -64,6 +64,13 @@ import {
   toolAccessService,
 } from "./services/index.js";
 import { resolveWorktreeRunExecutionActivationState } from "./services/instance-settings.js";
+import {
+  HEARTBEAT_TIMER_LEASE,
+  SCHEDULER_LEASE_RENEW_INTERVAL_MS,
+  SCHEDULER_LEASE_TTL_MS,
+  schedulerLeaseHolder,
+  type SchedulerLeaseHolder,
+} from "./services/scheduler-lease.js";
 import { setDbInheritedTimeouts } from "./services/metrics.js";
 import { auditConfiguredHookCommandsOnBoot } from "./services/lifecycle-hook-command-audit.js";
 import {
@@ -95,6 +102,7 @@ import {
   seedLastAutoSnapshotAtMs,
   takeHeapSnapshot,
 } from "./services/heap-snapshot.js";
+import { CPU_PROFILE_SENTINEL_BASENAME, maybeTakeCpuProfile } from "./services/cpu-profile.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
@@ -1140,6 +1148,26 @@ export async function startServer(): Promise<StartedServer> {
   let heartbeatSchedulerStopped = false;
   let heartbeatStartupRecoveryPending = false;
   let heartbeatSchedulerInterval: ReturnType<typeof setInterval> | null = null;
+  /**
+   * BLO-43292. Leader election for the periodic scheduler tick, so a second
+   * replica can take the loop over when this one stops renewing.
+   *
+   * Declared out here, next to the interval handle it gates, because
+   * `shutdown()` has to release the lease: a graceful release is what keeps a
+   * rolling restart from costing a full lease TTL of dispatch silence.
+   *
+   * Null when leader election is switched off (see
+   * `PAPERCLIP_SCHEDULER_LEASE_ENABLED` at its construction below), in which
+   * case the tick behaves exactly as it did before this change.
+   */
+  let schedulerLease: SchedulerLeaseHolder | null = null;
+  /**
+   * BLO-45212. Runs the one-shot recovery chain (crash reconciliation,
+   * external-run reattach, full orphan reap, ...). Null
+   * when scheduling is suppressed for this instance. Called only by the process
+   * that runs the gated loop — see the lease construction below for why.
+   */
+  let runLeaderRecovery: (() => void) | null = null;
   // PEN-3314. Separate timer from `heartbeatSchedulerInterval` on purpose — see
   // the watchdog registration below for why the recovery-chain detector must
   // not ride the heartbeat tick.
@@ -1285,6 +1313,29 @@ export async function startServer(): Promise<StartedServer> {
     }
   };
 
+  // Sentinel-triggered CPU profile (BLO-45336): attributes event-loop stalls
+  // that no log line names. Not behind heapSnapshotEnabled — a profile holds
+  // call frames, not heap values. See services/cpu-profile.ts. Registered
+  // before the heartbeat scheduler so the scheduler stays the last timer
+  // startServer registers (server-startup-feedback-export.test.ts relies on
+  // it); `unref?.()` because those tests stub setInterval to return a number.
+  if (config.paperclipNodeRole !== "api") {
+    setInterval(() => {
+      maybeTakeCpuProfile({ dir: config.heapSnapshotDir, durationMs: 60_000, keep: 3 })
+        .then((file) => {
+          if (file) logger.warn({ file }, "CPU profile written");
+        })
+        .catch((err) =>
+          logger.error(
+            // Fields, not path.join: a handler that throws would turn one
+            // failed capture into an unhandled rejection.
+            { err, dir: config.heapSnapshotDir, sentinel: CPU_PROFILE_SENTINEL_BASENAME },
+            "CPU profile capture failed",
+          ),
+        );
+    }, 60_000).unref?.();
+  }
+
   if (config.heartbeatSchedulerEnabled) {
     const heartbeat = heartbeatService(db as any, {
       pluginWorkerManager,
@@ -1330,47 +1381,13 @@ export async function startServer(): Promise<StartedServer> {
         "heartbeat scheduling suppressed for this runtime instance",
       );
     } else {
-      heartbeatStartupRecoveryPending = true;
-      const startupHeartbeatRecovery = (async () => {
-        // BLO-19722: finish any worker-crash recovery a previous crash could
-        // not. These rows are already terminal (`interrupted` /
-        // `worker_crashed`), so the orphan reaper below can never find them —
-        // it only scans `running`. Without this pass nothing would ever
-        // release the issue execution locks they still hold.
-        //
-        // First, deliberately: a crash-marked run may still own an issue's
-        // execution lock, and both the reattach and reap passes below make
-        // ownership decisions that should see the post-recovery state. It is
-        // bounded by batch size, and each run is claimed with a durable,
-        // expiring lease, so a slow or partly-failing backlog cannot stall
-        // startup — whatever is left is picked up next start.
-        try {
-          const crashRecovery = await heartbeat.reconcileWorkerCrashedRuns();
-          if (crashRecovery.reconciledRunIds.length > 0 || crashRecovery.unresolvedRunIds.length > 0) {
-            logger.warn(
-              crashRecovery,
-              "startup worker-crash recovery reconciliation complete",
-            );
-          }
-        } catch (err) {
-          logger.error(
-            { err },
-            "startup worker-crash recovery reconciliation failed - crash-marked runs stay unrecovered until the next start",
-          );
-        }
-
-        try {
-          const reattachedExternalRuns = await heartbeat.resumeRunningExternalRuntimeRuns();
-          if (reattachedExternalRuns > 0) {
-            logger.info({ reattachedExternalRuns }, "reattached running external-runtime Jobs after restart");
-          }
-        } catch (err) {
-          logger.error(
-            { err },
-            "startup external-runtime Job reattachment failed - orphan reaper will serve as degraded backstop",
-          );
-        }
-
+      // BLO-45212: hot-restart adoption is process-local. It adopts the local
+      // child processes this process's predecessor left alive, judged by pids
+      // that only mean anything in this pod's namespace. So it runs at boot in
+      // every unsuppressed process, NOT on lease acquisition: a restarted
+      // follower must still adopt its own children, and a peer that wins the
+      // lease cannot adopt another pod's. Never rejects.
+      const hotRestartAdoption = (async () => {
         try {
           const hotRestart = await heartbeat.reconcileHotRestartAdoption();
           if (hotRestart.mode === "reported") {
@@ -1385,248 +1402,307 @@ export async function startServer(): Promise<StartedServer> {
             "startup hot-restart adoption reconciliation failed - orphan reaper will serve as degraded backstop",
           );
         }
-
-        for (let attempt = 1; attempt <= 2; attempt++) {
+      })();
+      trackHeartbeatSchedulerWork(hotRestartAdoption);
+      runLeaderRecovery = () => {
+        // Single-flight: a lease re-acquired while a previous recovery is still
+        // running must not start a second one beside it.
+        if (heartbeatStartupRecoveryPending || heartbeatSchedulerStopped) return;
+        heartbeatStartupRecoveryPending = true;
+        const startupHeartbeatRecovery = (async () => {
+          // BLO-19722: finish any worker-crash recovery a previous crash could
+          // not. These rows are already terminal (`interrupted` /
+          // `worker_crashed`), so the orphan reaper below can never find them —
+          // it only scans `running`. Without this pass nothing would ever
+          // release the issue execution locks they still hold.
+          //
+          // First, deliberately: a crash-marked run may still own an issue's
+          // execution lock, and both the reattach and reap passes below make
+          // ownership decisions that should see the post-recovery state. It is
+          // bounded by batch size, and each run is claimed with a durable,
+          // expiring lease, so a slow or partly-failing backlog cannot stall
+          // startup — whatever is left is picked up next start.
           try {
-            const result = await heartbeat.reapOrphanedRuns();
-            logger.info(
-              { reaped: result.reaped, runIds: result.runIds },
-              "startup reap of orphaned heartbeat runs complete",
-            );
-            break;
-          } catch (err) {
-            if (attempt < 2) {
-              logger.warn({ err, attempt }, "startup reap failed, retrying");
-            } else {
-              logger.error(
-                { err },
-                "startup reap of orphaned heartbeat runs failed after retry - periodic reaper will serve as degraded backstop",
+            const crashRecovery = await heartbeat.reconcileWorkerCrashedRuns();
+            if (crashRecovery.reconciledRunIds.length > 0 || crashRecovery.unresolvedRunIds.length > 0) {
+              logger.warn(
+                crashRecovery,
+                "startup worker-crash recovery reconciliation complete",
               );
             }
-          }
-        }
-
-        // Lock cleanup must not be starved by failures in the broader recovery
-        // sequence: stale checkout ownership can prevent every later run.
-        try {
-          const swept = await heartbeat.sweepStaleIssueLocks();
-          if (swept.cleared > 0) {
-            logger.warn({ ...swept }, "startup stale-lock sweeper cleared issue locks");
-          }
-        } catch (err) {
-          logger.error({ err }, "startup stale-lock sweeper failed");
-        }
-
-        // BLO-21621: terminalize queued runs whose issue lock has already
-        // moved on or gone empty, so a detached run cannot sit invisible to
-        // every other recovery sweep indefinitely.
-        try {
-          const detached = await heartbeat.reconcileDetachedQueuedRuns();
-          if (detached.terminalized > 0) {
-            logger.warn({ ...detached }, "startup detached-queued-run sweeper terminalized stale runs");
-          }
-        } catch (err) {
-          logger.error({ err }, "startup detached-queued-run sweeper failed");
-        }
-
-        // PEN-3582: the dispatch pair is isolated from the recovery passes that
-        // follow it, exactly like `sweepStaleIssueLocks` and
-        // `reconcileDetachedQueuedRuns` above. `resumeQueuedRuns` completes its
-        // pass and then rethrows by design (BLO-12990 contract; see the
-        // rationale beside it in heartbeat.ts), and this startup sequence is
-        // serial under the single terminal `.catch()` at the end of this IIFE —
-        // so an unwrapped rejection here skipped `reconcileStrandedAssignedIssues`
-        // and every pass after it. Suppressing stranded-issue repair is worst
-        // precisely at startup, when a just-restarted control plane is most
-        // likely to be holding strandings.
-        //
-        // Grouped rather than wrapped individually on purpose: a
-        // `promoteDueScheduledRetries` rejection already skips `resumeQueuedRuns`
-        // in the periodic chain, so this leaves both chains' dispatch semantics
-        // identical and only changes what happens AFTER the pair.
-        let promotion: Awaited<ReturnType<typeof heartbeat.promoteDueScheduledRetries>> | null = null;
-        try {
-          promotion = await heartbeat.promoteDueScheduledRetries();
-          await heartbeat.resumeQueuedRuns();
-        } catch (err) {
-          logger.error({ err }, "startup heartbeat dispatch resumption failed");
-        }
-        // PEN-3810 (carried from Ally's non-blocking review 2 on PR #2234).
-        // Every pass below this point was a bare `await` under the single
-        // terminal `.catch()` at the end of this IIFE, so the first one to
-        // reject skipped all of the others. PR #2234 moved that trigger off the
-        // pass that rejects BY DESIGN (`resumeQueuedRuns`); it did not remove
-        // the coupling behind it.
-        //
-        // Shape chosen, not pattern-matched from #2234:
-        //
-        //   - A single guard around the whole run would NOT fix this. The harm
-        //     is "one rejection skips every later pass", and inside one guard
-        //     that cascade is unchanged — it would only spare the collector at
-        //     the end. Per-pass isolation is the only shape that removes it.
-        //   - #2234 grouped its pair for a reason that does not generalise:
-        //     a `promoteDueScheduledRetries` rejection already skips
-        //     `resumeQueuedRuns` in the periodic chain, so grouping kept both
-        //     chains' dispatch semantics identical. These passes have no such
-        //     pairing — they are independent, and no result below is read by
-        //     any pass but its own logging block.
-        //   - It matches the six passes AHEAD of the dispatch pair, which each
-        //     already carry their own `try`/`catch` and their own named error
-        //     log. One idiom in one block.
-        //
-        // Each handler names its own pass, so a failure stays attributable
-        // rather than collapsing into the terminal "startup heartbeat recovery
-        // failed" line, which cannot say which pass died.
-        //
-        // Scoped to STARTUP deliberately. The periodic chain (see the
-        // `trackHeartbeatSchedulerWork` chain further down this file) has the
-        // same serial `.then()` cascade under one terminal `.catch()`, but it
-        // re-runs every tick, so a transient fault there costs one interval.
-        // This sequence runs exactly once: a rejection here means those passes
-        // do not run again until the process restarts.
-        try {
-          const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
-          if (
-            (promotion?.promoted ?? 0) > 0 ||
-            reconciled.assignmentDispatched > 0 ||
-            reconciled.dispatchRequeued > 0 ||
-            reconciled.continuationRequeued > 0 ||
-            reconciled.successfulRunHandoffEscalated > 0 ||
-            reconciled.reviewWaitingParked > 0 ||
-            reconciled.waitingOnReviewResolved > 0 ||
-            reconciled.escalated > 0
-          ) {
-            logger.warn(
-              {
-                // `null`, not 0, when the pair above rejected: a fabricated zero
-                // would read as "measured, nothing promoted".
-                promotedScheduledRetries: promotion?.promoted ?? null,
-                promotedScheduledRetryRunIds: promotion?.runIds ?? null,
-                ...reconciled,
-              },
-              "startup heartbeat recovery changed assigned issue state",
+          } catch (err) {
+            logger.error(
+              { err },
+              "startup worker-crash recovery reconciliation failed - crash-marked runs stay unrecovered until the next start",
             );
           }
-        } catch (err) {
-          logger.error({ err }, "startup stranded-assigned-issue reconciliation failed");
-        }
 
-        try {
-          const issueGraphReconciled = await heartbeat.reconcileIssueGraphLiveness();
-          if (
-            issueGraphReconciled.escalationsCreated > 0 ||
-            issueGraphReconciled.dependencyWakesHealed > 0 ||
-            issueGraphReconciled.staleEscalationsAutoResolved > 0
-          ) {
-            logger.warn(
-              { ...issueGraphReconciled },
-              "startup issue-graph liveness reconciliation changed issue graph state",
+          try {
+            const reattachedExternalRuns = await heartbeat.resumeRunningExternalRuntimeRuns();
+            if (reattachedExternalRuns > 0) {
+              logger.info({ reattachedExternalRuns }, "reattached running external-runtime Jobs after restart");
+            }
+          } catch (err) {
+            logger.error(
+              { err },
+              "startup external-runtime Job reattachment failed - orphan reaper will serve as degraded backstop",
             );
           }
-        } catch (err) {
-          logger.error({ err }, "startup issue-graph liveness reconciliation failed");
-        }
 
-        try {
-          const taskWatchdogsReconciled = await heartbeat.reconcileTaskWatchdogs();
-          if (taskWatchdogsReconciled.triggered > 0) {
-            logger.warn(
-              { ...taskWatchdogsReconciled },
-              "startup task-watchdog reconciliation triggered watchdog work",
-            );
+          // Started at boot, not here; see `hotRestartAdoption` above. Awaited
+          // so the reap below still sees the runs this process adopted. Keep
+          // this await isolated as well: the adoption promise is currently
+          // self-guarded, but a future change must not let it skip the reap.
+          try {
+            await hotRestartAdoption;
+          } catch (err) {
+            logger.error({ err }, "startup hot-restart adoption wait failed");
           }
-        } catch (err) {
-          logger.error({ err }, "startup task-watchdog reconciliation failed");
-        }
 
-        try {
-          const scanned = await heartbeat.scanSilentActiveRuns();
-          if (scanned.created > 0 || scanned.escalated > 0) {
-            logger.warn({ ...scanned }, "startup active-run output watchdog created review work");
+          for (let attempt = 1; attempt <= 2; attempt++) {
+            try {
+              const result = await heartbeat.reapOrphanedRuns();
+              logger.info(
+                { reaped: result.reaped, runIds: result.runIds },
+                "startup reap of orphaned heartbeat runs complete",
+              );
+              break;
+            } catch (err) {
+              if (attempt < 2) {
+                logger.warn({ err, attempt }, "startup reap failed, retrying");
+              } else {
+                logger.error(
+                  { err },
+                  "startup reap of orphaned heartbeat runs failed after retry - periodic reaper will serve as degraded backstop",
+                );
+              }
+            }
           }
-        } catch (err) {
-          logger.error({ err }, "startup active-run output watchdog failed");
-        }
 
-        try {
-          const reviewed = await heartbeat.reconcileProductivityReviews();
-          // BLO-30303 AC4: log the funnel counters unconditionally. Gating this
-          // on `created|updated|failed > 0` discarded the one record that
-          // explains a zero — which is how a fleet-wide hard zero looked
-          // identical to a healthy fleet for 23 days. `scanned` plus the
-          // suppression breakdown is what tells those two apart.
-          logger.info({ ...reviewed }, "startup productivity reconciliation funnel");
-          if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
-            logger.warn({ ...reviewed }, "startup productivity reconciliation created or updated review work");
+          // Lock cleanup must not be starved by failures in the broader recovery
+          // sequence: stale checkout ownership can prevent every later run.
+          try {
+            const swept = await heartbeat.sweepStaleIssueLocks();
+            if (swept.cleared > 0) {
+              logger.warn({ ...swept }, "startup stale-lock sweeper cleared issue locks");
+            }
+          } catch (err) {
+            logger.error({ err }, "startup stale-lock sweeper failed");
           }
-        } catch (err) {
-          logger.error({ err }, "startup productivity reconciliation failed");
-        }
 
-        try {
-          const blockerDependentsSwept = await heartbeat.reconcileResolvedBlockerDependents();
-          if (blockerDependentsSwept.woken > 0 || blockerDependentsSwept.failed > 0) {
-            logger.warn({ ...blockerDependentsSwept }, "startup resolved-blocker-dependents sweep enqueued wakes");
+          // BLO-21621: terminalize queued runs whose issue lock has already
+          // moved on or gone empty, so a detached run cannot sit invisible to
+          // every other recovery sweep indefinitely.
+          try {
+            const detached = await heartbeat.reconcileDetachedQueuedRuns();
+            if (detached.terminalized > 0) {
+              logger.warn({ ...detached }, "startup detached-queued-run sweeper terminalized stale runs");
+            }
+          } catch (err) {
+            logger.error({ err }, "startup detached-queued-run sweeper failed");
           }
-        } catch (err) {
-          logger.error({ err }, "startup resolved-blocker-dependents sweep failed");
-        }
 
-        try {
-          const deadMonitors = await heartbeat.reconcileUndeliverableIssueMonitors();
-          if (deadMonitors.cleared > 0 || deadMonitors.failed > 0) {
-            logger.warn(
-              { ...deadMonitors },
-              "startup undeliverable-monitor reconciliation cleared monitors armed on ineligible issues (BLO-33539)",
-            );
+          // PEN-3582: the dispatch pair is isolated from the recovery passes that
+          // follow it, exactly like `sweepStaleIssueLocks` and
+          // `reconcileDetachedQueuedRuns` above. `resumeQueuedRuns` completes its
+          // pass and then rethrows by design (BLO-12990 contract; see the
+          // rationale beside it in heartbeat.ts), and this startup sequence is
+          // serial under the single terminal `.catch()` at the end of this IIFE —
+          // so an unwrapped rejection here skipped `reconcileStrandedAssignedIssues`
+          // and every pass after it. Suppressing stranded-issue repair is worst
+          // precisely at startup, when a just-restarted control plane is most
+          // likely to be holding strandings.
+          //
+          // Grouped rather than wrapped individually on purpose: a
+          // `promoteDueScheduledRetries` rejection already skips `resumeQueuedRuns`
+          // in the periodic chain, so this leaves both chains' dispatch semantics
+          // identical and only changes what happens AFTER the pair.
+          let promotion: Awaited<ReturnType<typeof heartbeat.promoteDueScheduledRetries>> | null = null;
+          try {
+            promotion = await heartbeat.promoteDueScheduledRetries();
+            await heartbeat.resumeQueuedRuns();
+          } catch (err) {
+            logger.error({ err }, "startup heartbeat dispatch resumption failed");
           }
-        } catch (err) {
-          logger.error({ err }, "startup undeliverable-monitor reconciliation failed");
-        }
-
-        try {
-          const failedWakeDispatches = await heartbeat.reconcileFailedWakeDispatches();
-          if (failedWakeDispatches.recovered > 0 || failedWakeDispatches.exhausted > 0) {
-            logger.warn(
-              { ...failedWakeDispatches },
-              "startup failed-wake-dispatch reconciliation retried durable wake failures (BLO-14395)",
-            );
+          // PEN-3810 (carried from Ally's non-blocking review 2 on PR #2234).
+          // Every pass below this point was a bare `await` under the single
+          // terminal `.catch()` at the end of this IIFE, so the first one to
+          // reject skipped all of the others. PR #2234 moved that trigger off the
+          // pass that rejects BY DESIGN (`resumeQueuedRuns`); it did not remove
+          // the coupling behind it.
+          //
+          // Shape chosen, not pattern-matched from #2234:
+          //
+          //   - A single guard around the whole run would NOT fix this. The harm
+          //     is "one rejection skips every later pass", and inside one guard
+          //     that cascade is unchanged — it would only spare the collector at
+          //     the end. Per-pass isolation is the only shape that removes it.
+          //   - #2234 grouped its pair for a reason that does not generalise:
+          //     a `promoteDueScheduledRetries` rejection already skips
+          //     `resumeQueuedRuns` in the periodic chain, so grouping kept both
+          //     chains' dispatch semantics identical. These passes have no such
+          //     pairing — they are independent, and no result below is read by
+          //     any pass but its own logging block.
+          //   - It matches the six passes AHEAD of the dispatch pair, which each
+          //     already carry their own `try`/`catch` and their own named error
+          //     log. One idiom in one block.
+          //
+          // Each handler names its own pass, so a failure stays attributable
+          // rather than collapsing into the terminal "startup heartbeat recovery
+          // failed" line, which cannot say which pass died.
+          //
+          // Scoped to STARTUP deliberately. The periodic chain (see the
+          // `trackHeartbeatSchedulerWork` chain further down this file) has the
+          // same serial `.then()` cascade under one terminal `.catch()`, but it
+          // re-runs every tick, so a transient fault there costs one interval.
+          // This sequence runs exactly once: a rejection here means those passes
+          // do not run again until the process restarts.
+          try {
+            const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
+            if (
+              (promotion?.promoted ?? 0) > 0 ||
+              reconciled.assignmentDispatched > 0 ||
+              reconciled.dispatchRequeued > 0 ||
+              reconciled.continuationRequeued > 0 ||
+              reconciled.successfulRunHandoffEscalated > 0 ||
+              reconciled.reviewWaitingParked > 0 ||
+              reconciled.waitingOnReviewResolved > 0 ||
+              reconciled.escalated > 0
+            ) {
+              logger.warn(
+                {
+                  // `null`, not 0, when the pair above rejected: a fabricated zero
+                  // would read as "measured, nothing promoted".
+                  promotedScheduledRetries: promotion?.promoted ?? null,
+                  promotedScheduledRetryRunIds: promotion?.runIds ?? null,
+                  ...reconciled,
+                },
+                "startup heartbeat recovery changed assigned issue state",
+              );
+            }
+          } catch (err) {
+            logger.error({ err }, "startup stranded-assigned-issue reconciliation failed");
           }
-        } catch (err) {
-          logger.error({ err }, "startup failed-wake-dispatch reconciliation failed");
-        }
 
-        // BLO-22984: the only consumer of `execution_workspaces.cleanup_eligible_at`.
-        // Logged unconditionally — a collector that never runs is indistinguishable
-        // from one that runs and finds nothing, and the previous code was believed
-        // to collect for weeks while reclaiming zero bytes.
-        // Not awaited: this must not hold `heartbeatStartupRecoveryPending` and
-        // starve every periodic pass on a slow git/fs (prior:19b276c important 2
-        // principle). It gates nothing below it; it is tracked for the shutdown
-        // drain and holds the collector latch so the first tick does not double it.
-        // It may take the latch without testing it only because
-        // `heartbeatStartupRecoveryPending` is still true here and the tick
-        // early-returns on it, so no periodic pass can be holding it yet.
-        executionWorkspaceCollectorInFlight = true;
-        executionWorkspaceCollectorStartedAt = Date.now();
-        trackHeartbeatSchedulerWork(executionWorkspaceCleanup
-          .reconcileExecutionWorkspaceCleanup()
-          .then((workspacesCollected) => {
-            logger.info({ ...workspacesCollected }, "startup execution-workspace collector");
-          })
-          .catch((err) => {
-            logger.error({ err }, "startup execution-workspace collector failed");
-          })
-          .finally(() => {
-            executionWorkspaceCollectorInFlight = false;
-            executionWorkspaceCollectorStartedAt = 0;
-          }));
-      })().catch((err) => {
-        logger.error({ err }, "startup heartbeat recovery failed");
-      }).finally(() => {
-        heartbeatStartupRecoveryPending = false;
-      });
-      trackHeartbeatSchedulerWork(startupHeartbeatRecovery);
+          try {
+            const issueGraphReconciled = await heartbeat.reconcileIssueGraphLiveness();
+            if (
+              issueGraphReconciled.escalationsCreated > 0 ||
+              issueGraphReconciled.dependencyWakesHealed > 0 ||
+              issueGraphReconciled.staleEscalationsAutoResolved > 0
+            ) {
+              logger.warn(
+                { ...issueGraphReconciled },
+                "startup issue-graph liveness reconciliation changed issue graph state",
+              );
+            }
+          } catch (err) {
+            logger.error({ err }, "startup issue-graph liveness reconciliation failed");
+          }
+
+          try {
+            const taskWatchdogsReconciled = await heartbeat.reconcileTaskWatchdogs();
+            if (taskWatchdogsReconciled.triggered > 0) {
+              logger.warn(
+                { ...taskWatchdogsReconciled },
+                "startup task-watchdog reconciliation triggered watchdog work",
+              );
+            }
+          } catch (err) {
+            logger.error({ err }, "startup task-watchdog reconciliation failed");
+          }
+
+          try {
+            const scanned = await heartbeat.scanSilentActiveRuns();
+            if (scanned.created > 0 || scanned.escalated > 0) {
+              logger.warn({ ...scanned }, "startup active-run output watchdog created review work");
+            }
+          } catch (err) {
+            logger.error({ err }, "startup active-run output watchdog failed");
+          }
+
+          try {
+            const reviewed = await heartbeat.reconcileProductivityReviews();
+            // BLO-30303 AC4: log the funnel counters unconditionally. Gating this
+            // on `created|updated|failed > 0` discarded the one record that
+            // explains a zero — which is how a fleet-wide hard zero looked
+            // identical to a healthy fleet for 23 days. `scanned` plus the
+            // suppression breakdown is what tells those two apart.
+            logger.info({ ...reviewed }, "startup productivity reconciliation funnel");
+            if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
+              logger.warn({ ...reviewed }, "startup productivity reconciliation created or updated review work");
+            }
+          } catch (err) {
+            logger.error({ err }, "startup productivity reconciliation failed");
+          }
+
+          try {
+            const blockerDependentsSwept = await heartbeat.reconcileResolvedBlockerDependents();
+            if (blockerDependentsSwept.woken > 0 || blockerDependentsSwept.failed > 0) {
+              logger.warn({ ...blockerDependentsSwept }, "startup resolved-blocker-dependents sweep enqueued wakes");
+            }
+          } catch (err) {
+            logger.error({ err }, "startup resolved-blocker-dependents sweep failed");
+          }
+
+          try {
+            const deadMonitors = await heartbeat.reconcileUndeliverableIssueMonitors();
+            if (deadMonitors.cleared > 0 || deadMonitors.failed > 0) {
+              logger.warn(
+                { ...deadMonitors },
+                "startup undeliverable-monitor reconciliation cleared monitors armed on ineligible issues (BLO-33539)",
+              );
+            }
+          } catch (err) {
+            logger.error({ err }, "startup undeliverable-monitor reconciliation failed");
+          }
+
+          try {
+            const failedWakeDispatches = await heartbeat.reconcileFailedWakeDispatches();
+            if (failedWakeDispatches.recovered > 0 || failedWakeDispatches.exhausted > 0) {
+              logger.warn(
+                { ...failedWakeDispatches },
+                "startup failed-wake-dispatch reconciliation retried durable wake failures (BLO-14395)",
+              );
+            }
+          } catch (err) {
+            logger.error({ err }, "startup failed-wake-dispatch reconciliation failed");
+          }
+
+          // BLO-22984: the only consumer of `execution_workspaces.cleanup_eligible_at`.
+          // Logged unconditionally — a collector that never runs is indistinguishable
+          // from one that runs and finds nothing, and the previous code was believed
+          // to collect for weeks while reclaiming zero bytes.
+          // Not awaited: this must not hold `heartbeatStartupRecoveryPending` and
+          // starve every periodic pass on a slow git/fs (prior:19b276c important 2
+          // principle). It gates nothing below it; it is tracked for the shutdown
+          // drain and holds the collector latch so the first tick does not double it.
+          // Tested, not assumed (BLO-45212): this chain also runs on a lease
+          // takeover, and a process that held the lease earlier may still have a
+          // periodic collector pass in flight.
+          if (!executionWorkspaceCollectorInFlight) {
+            executionWorkspaceCollectorInFlight = true;
+            executionWorkspaceCollectorStartedAt = Date.now();
+            trackHeartbeatSchedulerWork(executionWorkspaceCleanup
+              .reconcileExecutionWorkspaceCleanup()
+              .then((workspacesCollected) => {
+                logger.info({ ...workspacesCollected }, "startup execution-workspace collector");
+              })
+              .catch((err) => {
+                logger.error({ err }, "startup execution-workspace collector failed");
+              })
+              .finally(() => {
+                executionWorkspaceCollectorInFlight = false;
+                executionWorkspaceCollectorStartedAt = 0;
+              }));
+          }
+        })();
+        trackHeartbeatSchedulerWork(startupHeartbeatRecovery.catch((err) => {
+          logger.error({ err }, "startup heartbeat recovery failed");
+        }).finally(() => {
+          heartbeatStartupRecoveryPending = false;
+        }));
+      };
     }
 
     const setupCleanup = await environmentCustomImages.cleanupExpiredSetupSessions();
@@ -1715,6 +1791,67 @@ export async function startServer(): Promise<StartedServer> {
         logger.warn({ err }, "heartbeat recovery chain watchdog tick failed");
       }
     }, HEARTBEAT_RECOVERY_CHAIN_WATCHDOG_INTERVAL_MS);
+
+    // BLO-43292. Leader election for the periodic tick below, so that raising
+    // `replicas` above 1 does not double-enqueue every heartbeat.
+    //
+    // Default ON, deliberately. A flag defaulted off would make the safety of
+    // the (separate, later, Platform/SRE-owned) `replicas` bump depend on
+    // somebody remembering to flip it in the same change — which is exactly
+    // the accident the sequencing requirement exists to prevent. With the
+    // lease always armed, the bump is safe whenever it lands.
+    //
+    // `=false` is the incident kill-switch: it restores pre-BLO-43292
+    // behaviour (this process always runs the loop) without a code change, for
+    // the case where the lease itself is implicated in an outage. It is NOT a
+    // normal operating mode, and setting it with more than one replica running
+    // reintroduces the double-enqueue.
+    if (process.env.PAPERCLIP_SCHEDULER_LEASE_ENABLED !== "false") {
+      // BLO-45212: the recovery chain above is gated on the same lease, and
+      // runs on ACQUISITION rather than on boot. Not on boot, because a
+      // follower running it would write shared recovery rows beside a live
+      // leader — and `resumeRunningExternalRuntimeRuns` would start driving
+      // every live external run the leader is driving, since its "already
+      // mine" test is this process's in-memory set. On acquisition, because
+      // the periodic tick's reattach + 5-minute reap do not cover what a
+      // takeover needs at once: crash reconciliation and the threshold-0 reap
+      // of the dead holder's rows. (Hot-restart adoption is the exception and
+      // runs at boot — see `hotRestartAdoption`.) This also re-runs when the
+      // same process re-wins the lease after its own renewals lapsed; the
+      // reap's in-process guards keep that safe beside its own live runs.
+      schedulerLease = schedulerLeaseHolder(db as any, {
+        name: HEARTBEAT_TIMER_LEASE,
+        ttlMs: SCHEDULER_LEASE_TTL_MS,
+        renewIntervalMs: SCHEDULER_LEASE_RENEW_INTERVAL_MS,
+        onAcquire: () => runLeaderRecovery?.(),
+      });
+      // Awaited so the first tick already has a verdict rather than skipping
+      // on a not-yet-acquired lease. A failure here is logged by the holder
+      // and leaves this process a follower; the renew timer retries.
+      const leader = await schedulerLease.start();
+      // Fail-open (lease table unreachable, never acquired): `onAcquire` never
+      // fired, but this process runs the loop, so it runs recovery too.
+      if (leader && !schedulerLease.isLeader()) runLeaderRecovery?.();
+      logger.info(
+        {
+          lease: HEARTBEAT_TIMER_LEASE,
+          holder: schedulerLease.identity.holderId,
+          leader,
+          ttlMs: SCHEDULER_LEASE_TTL_MS,
+          renewIntervalMs: SCHEDULER_LEASE_RENEW_INTERVAL_MS,
+        },
+        leader
+          ? "heartbeat timer lease acquired at startup"
+          : "heartbeat timer lease held elsewhere - running as follower",
+      );
+    } else {
+      logger.warn(
+        { lease: HEARTBEAT_TIMER_LEASE },
+        "heartbeat timer leader election DISABLED by PAPERCLIP_SCHEDULER_LEASE_ENABLED=false "
+        + "- this process always runs the timer loop; do not run more than one replica",
+      );
+      runLeaderRecovery?.();
+    }
 
     heartbeatSchedulerInterval = setInterval(() => {
       // Async so the suppression checks below can honor the override-aware
@@ -1816,6 +1953,22 @@ export async function startServer(): Promise<StartedServer> {
           }));
 
         if (heartbeatStartupRecoveryPending) return;
+        // BLO-43292: everything below this line enqueues runs or reconciles
+        // shared rows, so exactly one process in the estate may reach it.
+        //
+        // Placed BELOW the four gauge publishers above on purpose, and for the
+        // same reason those sit below the two gates they sit below: all four
+        // are read-only, and a follower that published nothing would not
+        // render "No data" — the three unlabelled ones are zero-initialized at
+        // registration, so it would export a confident `0` for the fleet it
+        // can see perfectly well. Fabricated health is the defect those
+        // publishers were hoisted to remove; a follower is not a licence to
+        // reintroduce it.
+        //
+        // `isLeader()` is an in-memory deadline comparison with no database
+        // access, so it cannot be starved by the pool exhaustion that stops a
+        // tick reaching anything further down.
+        if (schedulerLease && !schedulerLease.shouldRunLoop()) return;
         const sweptRuntimeStatuses = heartbeat.sweepExpiredRuntimeStatuses();
         if (sweptRuntimeStatuses > 0) {
           logger.info(
@@ -3126,6 +3279,25 @@ export async function startServer(): Promise<StartedServer> {
         waitForHeartbeatSchedulerIdle,
       });
       const skipHeartbeatDrain = heartbeatShutdown.hotRestart?.skipDrain === true;
+
+      // BLO-43292. Released only AFTER the scheduler's in-flight work has
+      // drained (`waitedForSchedulerIdle`), not when the tick is disarmed: the
+      // last tick's gated work (sweeps, reconciliations, enqueues) is still
+      // writing until then, and releasing earlier lets a survivor's next poll
+      // acquire and tick concurrently — two writers, the thing this lease
+      // exists to prevent. The renew timer keeps the lease held through that
+      // drain, so nobody can take it over mid-write.
+      //
+      // The release is what makes a rolling restart cost one follower poll
+      // rather than a full TTL: the replacement process is a new holder (the
+      // holder id carries a per-process nonce) and would otherwise wait the
+      // lease out. When the idle wait was skipped (hot restart), do NOT
+      // release — let the TTL expire, trading handover speed for exclusion.
+      // Best-effort either way: the holder logs and swallows a failed release.
+      if (schedulerLease) {
+        await schedulerLease.stop({ release: heartbeatShutdown.waitedForSchedulerIdle });
+        schedulerLease = null;
+      }
       if (skipHeartbeatDrain) {
         logger.info(
           { signal, hotRestart: heartbeatShutdown.hotRestart },

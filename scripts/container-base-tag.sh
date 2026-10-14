@@ -48,6 +48,7 @@ case "${1:-}" in
       printf 'ffmpeg-image=%s\n' "$ffmpeg_image"
       for file in \
         Dockerfile.agent-toolchain \
+        scripts/paperclip-sccache.sh \
         scripts/smoke/agent-browser-screenshot.sh; do
         printf 'file=%s\n' "$file"
         sha256_digest "$file"

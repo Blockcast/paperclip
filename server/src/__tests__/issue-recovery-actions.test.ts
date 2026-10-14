@@ -911,13 +911,16 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       maxAttempts: 5,
     });
 
-    await svc.retireAndReleaseWakeAttempt({
+    const retired = await svc.retireAndReleaseWakeAttempt({
       companyId,
       actionId: action.id,
       expectedOwnerAgentId: managerId,
       expectedAttemptCount: action.attemptCount,
       retiringBound: "attempt_budget",
     });
+    // PEN-3989 (Ally review of #2607): the return value is the UPDATE's row match, and it is
+    // the only evidence a caller has that this call did anything. See the CAS-miss test below.
+    expect(retired).toBe(true);
 
     const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
     const recovery = recoveryService(db, { enqueueWakeup });
@@ -935,6 +938,71 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       retiringBound: "attempt_budget",
       attemptCount: action.attemptCount - 1,
       nonDeliverySweepCount: 1,
+    });
+  });
+
+  /**
+   * PEN-3989 (Ally review of #2607): `retireAndReleaseWakeAttempt` resolves without error when
+   * its reservation CAS matches NOTHING, so "the call did not throw" is not evidence of a
+   * retirement. Its only caller used to read it that way and announced a retirement that had
+   * not happened — a `paperclip_recovery_horizon_expired_total` increment feeding PEN-3322's
+   * alert, a notice telling an operator a still-`active` row had moved to `escalated`, and a
+   * dedup marker that then makes the REAL retirement's notice look like a duplicate.
+   *
+   * Both arms are asserted. The `true` arm alone would still pass against a function that
+   * returned a hardcoded `true`, which is the shape this is guarding.
+   */
+  it("reports whether the retirement UPDATE matched a row", async () => {
+    const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+    await db.update(issues).set({ status: "blocked", assigneeAgentId: managerId }).where(eq(issues.id, sourceIssueId));
+    const svc = issueRecoveryActionService(db);
+    const action = await svc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: "retire-cas:fingerprint",
+      nextAction: "Wake the recovery owner.",
+      maxAttempts: 5,
+    });
+
+    // The miss: another sweep re-homed the action between the reserve and this call, which is
+    // what `isNewOwnerSequence` does on every ownership change.
+    const missed = await svc.retireAndReleaseWakeAttempt({
+      companyId,
+      actionId: action.id,
+      expectedOwnerAgentId: coderId,
+      expectedAttemptCount: action.attemptCount,
+      retiringBound: "timeout_horizon",
+    });
+    expect(missed).toBe(false);
+    // Nothing was written — the whole point. A caller that announced here would be describing
+    // a row that is still `active` with no bound.
+    const [untouched] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    expect(untouched).toMatchObject({
+      status: "active",
+      retiringBound: null,
+      ownerAgentId: managerId,
+      attemptCount: action.attemptCount,
+      nonDeliverySweepCount: 0,
+    });
+
+    // The hit, on the same row, differing only in the CAS inputs.
+    const matched = await svc.retireAndReleaseWakeAttempt({
+      companyId,
+      actionId: action.id,
+      expectedOwnerAgentId: managerId,
+      expectedAttemptCount: action.attemptCount,
+      retiringBound: "timeout_horizon",
+    });
+    expect(matched).toBe(true);
+    const [retiredRow] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    expect(retiredRow).toMatchObject({
+      status: "escalated",
+      retiringBound: "timeout_horizon",
+      attemptCount: action.attemptCount - 1,
     });
   });
 
@@ -2852,9 +2920,11 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(updatedIssue?.monitorNextCheckAt === null).toBe(providerQuotaMonitored === 0);
   });
 
-  // PEN-3636: a frozen clock for the two per-pass memos, shared by the two call-site tests
+  // PEN-3636: a frozen clock for the sweep's three per-pass caches — the pause-hold
+  // prefilter, the agent-roster memo and the attendance prefetch, all of which the sweep
+  // constructs unconditionally off this one dep — shared by the two call-site tests
   // below. Both assert `liveReads === 1`, which is meant to be a claim about WIRING; against
-  // the real clock it is also a claim about SPEED, because the memos' TTL is wall-clock and
+  // the real clock it is also a claim about SPEED, because the TTL is wall-clock and
   // a sweep that stalls past it between two candidates re-reads. Embedded Postgres under
   // parallel vitest can stall that long, so the assertion could go red for a reason that has
   // nothing to do with what it tests. Frozen rather than a huge `ttlMs` on purpose: the
@@ -5234,6 +5304,188 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(settled).toMatchObject({ status: "escalated", retiringBound: "timeout_horizon" });
   });
 
+  // PEN-4013. `resolveActiveForIssue`'s predicate is `ACTIVE_RECOVERY_ACTION_STATUSES`,
+  // which is `["active", "escalated"]` — so a manual discharge matches rows that have
+  // ALREADY been retired, and the unconditional `.set()` it used to carry overwrote the
+  // bound recording that retirement. The `active` case is the one that always worked and
+  // is exactly what hid this, so each arm below is paired with its `active` control.
+  //
+  // The erasure is unrecoverable: `resolvedAt` and `resolutionNote` are not projected by
+  // the company-scoped route at all, and the discharge overwrites `updatedAt`. Measured
+  // company-wide before the fix: 0 surviving `timeout_horizon` / `attempt_budget` bounds
+  // across 1,695 rows, against 184 live-era rows whose horizon had demonstrably expired
+  // before the resolve landed.
+  async function seedRetiredActionForDischarge(bound: "timeout_horizon" | "attempt_budget") {
+    const fixture = await seedCompany();
+    const actionId = randomUUID();
+    await db.insert(issueRecoveryActions).values({
+      id: actionId,
+      companyId: fixture.companyId,
+      sourceIssueId: fixture.sourceIssueId,
+      kind: "stranded_assigned_issue",
+      status: "escalated",
+      ownerType: "agent",
+      ownerAgentId: fixture.managerId,
+      cause: "agent_not_invokable",
+      fingerprint: `retired:${actionId}`,
+      evidence: {},
+      nextAction: "Wake the recovery owner.",
+      attemptCount: 0,
+      maxAttempts: defaultRecoveryActionMaxAttempts,
+      timeoutAt: new Date(Date.now() - 60 * 60 * 1000),
+      retiringBound: bound,
+    });
+    return { ...fixture, actionId };
+  }
+
+  it("preserves a timeout_horizon retirement when an escalated action is discharged", async () => {
+    const { companyId, sourceIssueId, actionId } = await seedRetiredActionForDischarge("timeout_horizon");
+    const svc = issueRecoveryActionService(db);
+
+    const resolved = await svc.resolveActiveForIssue({
+      companyId,
+      sourceIssueId,
+      status: "resolved",
+      outcome: "restored",
+      resolutionNote: "Owner discharged the stale action.",
+    });
+
+    // The discharge must still land — this is not a refusal, the disposal is recorded in
+    // `status`/`outcome`/`resolvedAt` exactly as before. Only the retirement bound is kept.
+    expect(resolved).toMatchObject({ id: actionId, status: "resolved", retiringBound: "timeout_horizon" });
+    const [settled] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, actionId));
+    expect(settled).toMatchObject({ status: "resolved", outcome: "restored", retiringBound: "timeout_horizon" });
+    expect(settled!.resolvedAt).not.toBeNull();
+  });
+
+  it("preserves an attempt_budget retirement when an escalated action is discharged", async () => {
+    const { companyId, sourceIssueId } = await seedRetiredActionForDischarge("attempt_budget");
+    const svc = issueRecoveryActionService(db);
+
+    const resolved = await svc.resolveActiveForIssue({
+      companyId,
+      sourceIssueId,
+      status: "resolved",
+      outcome: "restored",
+    });
+
+    expect(resolved).toMatchObject({ status: "resolved", retiringBound: "attempt_budget" });
+  });
+
+  it("preserves a prior retirement bound when an escalated action is cancelled rather than discharged", async () => {
+    // The cancel arm writes a different literal (`cancelled`), so it needs its own
+    // coverage: a fix applied to only the discharge branch would pass the two above.
+    const { companyId, sourceIssueId, actionId } = await seedRetiredActionForDischarge("timeout_horizon");
+    const svc = issueRecoveryActionService(db);
+
+    const resolved = await svc.resolveActiveForIssue({
+      companyId,
+      sourceIssueId,
+      status: "cancelled",
+      outcome: "cancelled",
+    });
+
+    expect(resolved).toMatchObject({ status: "cancelled", retiringBound: "timeout_horizon" });
+    const [settled] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, actionId));
+    expect(settled).toMatchObject({ status: "cancelled", retiringBound: "timeout_horizon" });
+  });
+
+  it("still stamps discharged when an active action with no prior bound is resolved", async () => {
+    // Negative control. This arm already worked and must keep working: with nothing to
+    // preserve, `coalesce` has to fall through to the literal. A fix that simply stopped
+    // writing the field would pass the three tests above and fail here.
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const svc = issueRecoveryActionService(db);
+    const actionId = randomUUID();
+    await db.insert(issueRecoveryActions).values({
+      id: actionId,
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      status: "active",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "agent_not_invokable",
+      fingerprint: `live:${actionId}`,
+      evidence: {},
+      nextAction: "Wake the recovery owner.",
+      attemptCount: 0,
+      maxAttempts: defaultRecoveryActionMaxAttempts,
+      retiringBound: null,
+    });
+
+    const resolved = await svc.resolveActiveForIssue({
+      companyId,
+      sourceIssueId,
+      status: "resolved",
+      outcome: "restored",
+    });
+
+    expect(resolved).toMatchObject({ status: "resolved", retiringBound: "discharged" });
+  });
+
+  it("still stamps cancelled when an active action with no prior bound is cancelled", async () => {
+    // Second negative control, for the cancel literal rather than the discharge one.
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const svc = issueRecoveryActionService(db);
+    const actionId = randomUUID();
+    await db.insert(issueRecoveryActions).values({
+      id: actionId,
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      status: "active",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "agent_not_invokable",
+      fingerprint: `live:${actionId}`,
+      evidence: {},
+      nextAction: "Wake the recovery owner.",
+      attemptCount: 0,
+      maxAttempts: defaultRecoveryActionMaxAttempts,
+      retiringBound: null,
+    });
+
+    const resolved = await svc.resolveActiveForIssue({
+      companyId,
+      sourceIssueId,
+      status: "cancelled",
+      outcome: "cancelled",
+    });
+
+    expect(resolved).toMatchObject({ status: "cancelled", retiringBound: "cancelled" });
+  });
+
+  it("keeps a horizon-retired action countable through the recovery-actions projection after it is discharged", async () => {
+    // PEN-4013 "Done when", reproduced as a test: a retrospective census of horizon
+    // expiries must survive a discharge. This asserts through
+    // `recoveryObservabilityService.listActions` — the same projection the company-scoped
+    // `/companies/:id/recovery-actions` route serves — rather than against the table, so
+    // dropping `retiringBound` from that projection fails here too. That projection is the
+    // ONLY live-API route to this fact: it carries no `resolvedAt` and no `resolutionNote`,
+    // and `updatedAt` is overwritten by the discharge.
+    const { companyId, sourceIssueId, actionId } = await seedRetiredActionForDischarge("timeout_horizon");
+    const svc = issueRecoveryActionService(db);
+
+    await svc.resolveActiveForIssue({
+      companyId,
+      sourceIssueId,
+      status: "resolved",
+      outcome: "restored",
+    });
+
+    const listed = await recoveryObservabilityService(db).listActions(companyId, { limit: 500 });
+    const horizonRetired = listed.filter((action) => action.retiringBound === "timeout_horizon");
+    expect(horizonRetired).toHaveLength(1);
+    expect(horizonRetired[0]).toMatchObject({ id: actionId, status: "resolved" });
+  });
+
   it("does not refresh the handoff grant when recovery sweeps through its own owner churn", async () => {
     const companyId = randomUUID();
     const ceoId = randomUUID();
@@ -6943,6 +7195,389 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     // The bound must not cost the first wake — it retires the beacon later, it
     // does not suppress the escalation it exists to deliver.
     expect(enqueueWakeup).toHaveBeenCalledTimes(1);
+  });
+
+  describe("an unverifiable restored claim is recorded as such (PEN-3991)", () => {
+    // `outcome: "restored"` asserts the source issue has a live execution path
+    // again. The request schema enforces that only for an EXPLICIT
+    // `sourceIssueStatus` — it refuses `restored` + `blocked` by name. It cannot
+    // enforce it when the field is OMITTED, because the status that then applies
+    // is the issue's existing one and a body validator never sees it.
+    //
+    // That asymmetry is the defect. Measured on four issues, twice in under
+    // eight hours (2026-10-12T00:15Z and 07:54Z): discharged `restored` with
+    // `resolutionSnapshot.issueStatus: "blocked"` captured by the same write,
+    // with replacement actions minted on all four 71 minutes later. The ledger
+    // held both the claim and the evidence against it and accepted the claim.
+    //
+    // It is reached through the SANCTIONED path, not through misuse: the
+    // `nextAction` text this subsystem writes tells resolvers to
+    // `omit "sourceIssueStatus" to leave the source issue's status untouched`.
+    it("records restored_unverified when an omitted status leaves the issue blocked", async () => {
+      const { companyId, managerId, sourceIssueId } = await seedCompany();
+      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, sourceIssueId));
+      const recoveryActionSvc = issueRecoveryActionService(db);
+      const action = await recoveryActionSvc.upsertSourceScoped({
+        companyId,
+        sourceIssueId,
+        kind: "stranded_assigned_issue",
+        ownerType: "agent",
+        ownerAgentId: managerId,
+        cause: "stranded_assigned_issue",
+        fingerprint: "pen3991:blocked:omitted",
+        evidence: {},
+        nextAction: "Re-home the stranded issue.",
+        wakePolicy: { type: "wake_owner" },
+      });
+      const app = createApp();
+
+      const resolved = await request(app)
+        .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+        .send({
+          actionId: action.id,
+          outcome: "restored",
+          resolutionNote: "Not chasing this one further.",
+        })
+        // Still ACCEPTED. The discharge is sanctioned; only the claim recorded
+        // about it was false. Refusing would delete a working exit under exactly
+        // the incident pressure it exists for.
+        .expect(200);
+
+      expect(resolved.body.recoveryAction).toMatchObject({
+        id: action.id,
+        status: "resolved",
+        outcome: "restored_unverified",
+      });
+
+      // The contradiction this makes legible: the same write that recorded the
+      // claim also captured the issue sitting on `blocked`.
+      const [row] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.id, action.id));
+      expect((row!.evidence as Record<string, unknown>).resolvedIssueStatus).toBe("blocked");
+      expect(row!.outcome).toBe("restored_unverified");
+
+      // And the principal that made the claim is recoverable, which the action
+      // record alone cannot say.
+      const [activity] = await db
+        .select()
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.entityId, sourceIssueId),
+            eq(activityLog.action, "issue.recovery_action_resolved"),
+          ),
+        );
+      expect(activity!.details).toMatchObject({
+        claimedOutcome: "restored",
+        claimDowngraded: true,
+        effectiveSourceIssueStatus: "blocked",
+      });
+    });
+
+    it("still records a plain restored claim when the issue is left runnable", async () => {
+      const { companyId, managerId, sourceIssueId } = await seedCompany();
+      const recoveryActionSvc = issueRecoveryActionService(db);
+      const action = await recoveryActionSvc.upsertSourceScoped({
+        companyId,
+        sourceIssueId,
+        kind: "stranded_assigned_issue",
+        ownerType: "agent",
+        ownerAgentId: managerId,
+        cause: "stranded_assigned_issue",
+        fingerprint: "pen3991:runnable",
+        evidence: {},
+        nextAction: "Re-home the stranded issue.",
+        wakePolicy: { type: "wake_owner" },
+      });
+      const app = createApp();
+
+      const resolved = await request(app)
+        .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+        .send({
+          actionId: action.id,
+          outcome: "restored",
+          sourceIssueStatus: "in_review",
+          resolutionNote: "Work is up for review again.",
+        })
+        .expect(200);
+
+      expect(resolved.body.recoveryAction.outcome).toBe("restored");
+
+      const [activity] = await db
+        .select()
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.entityId, sourceIssueId),
+            eq(activityLog.action, "issue.recovery_action_resolved"),
+          ),
+        );
+      expect(activity!.details).toMatchObject({
+        claimedOutcome: "restored",
+        claimDowngraded: false,
+        effectiveSourceIssueStatus: "in_review",
+      });
+    });
+
+    // Ally review on #2584. `claimDowngraded` was first written as
+    // `recordedOutcome !== requestedOutcome`, which is true for EVERY derived
+    // outcome — including the two routine, honest ones below. That would have
+    // polluted the new signal from its first row: a consumer counting
+    // contradicted claims would have counted every hand-back and every
+    // owner-completion. These two pin the narrow meaning.
+    it("does not flag a hand-back as a downgraded claim", async () => {
+      const { companyId, managerId, coderId, sourceIssueId } = await seedCompany();
+      const recoveryActionSvc = issueRecoveryActionService(db);
+      const action = await recoveryActionSvc.upsertSourceScoped({
+        companyId,
+        sourceIssueId,
+        kind: "stranded_assigned_issue",
+        ownerType: "agent",
+        ownerAgentId: managerId,
+        // The hand-back arm only fires when a return owner is recorded.
+        returnOwnerAgentId: coderId,
+        cause: "stranded_assigned_issue",
+        fingerprint: "pen3991:handback",
+        evidence: {},
+        nextAction: "Re-home the stranded issue.",
+        wakePolicy: { type: "wake_owner" },
+      });
+      const app = createApp();
+
+      const resolved = await request(app)
+        .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+        .send({
+          actionId: action.id,
+          outcome: "restored",
+          sourceIssueStatus: "todo",
+          resolutionNote: "Strand cleared; back to the original owner.",
+        })
+        .expect(200);
+
+      // The outcome IS derived — and that is exactly why the old form misfired.
+      expect(resolved.body.recoveryAction.outcome).toBe("handed_back");
+
+      const [activity] = await db
+        .select()
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.entityId, sourceIssueId),
+            eq(activityLog.action, "issue.recovery_action_resolved"),
+          ),
+        );
+      expect(activity!.details).toMatchObject({
+        claimedOutcome: "restored",
+        claimDowngraded: false,
+      });
+    });
+
+    it("does not flag an owner-completion as a downgraded claim", async () => {
+      const { companyId, managerId, sourceIssueId } = await seedCompany();
+      const recoveryActionSvc = issueRecoveryActionService(db);
+      const action = await recoveryActionSvc.upsertSourceScoped({
+        companyId,
+        sourceIssueId,
+        kind: "stranded_assigned_issue",
+        ownerType: "agent",
+        ownerAgentId: managerId,
+        cause: "stranded_assigned_issue",
+        fingerprint: "pen3991:owner-completed",
+        evidence: {},
+        nextAction: "Re-home the stranded issue.",
+        wakePolicy: { type: "wake_owner" },
+      });
+      const app = createApp();
+
+      const resolved = await request(app)
+        .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+        .send({
+          actionId: action.id,
+          outcome: "restored",
+          sourceIssueStatus: "done",
+          resolutionNote: "Finished it myself.",
+        })
+        .expect(200);
+
+      expect(resolved.body.recoveryAction.outcome).toBe("owner_completed");
+
+      const [activity] = await db
+        .select()
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.entityId, sourceIssueId),
+            eq(activityLog.action, "issue.recovery_action_resolved"),
+          ),
+        );
+      expect(activity!.details).toMatchObject({
+        claimedOutcome: "restored",
+        claimDowngraded: false,
+      });
+    });
+
+    it("leaves PEN-2756's omitted-status backlog discharge recorded as restored", async () => {
+      // The branch this check deliberately EXCLUDES. PEN-2756 added the
+      // omitted-`sourceIssueStatus` route so a beacon on a board-approved
+      // `backlog` park (or a live `in_progress` run) could be discharged without
+      // the resolver claiming a status it cannot verify. Downgrading here would
+      // re-break exactly what that ticket fixed.
+      const { companyId, managerId, sourceIssueId } = await seedCompany();
+      await db.update(issues).set({ status: "backlog" }).where(eq(issues.id, sourceIssueId));
+      const recoveryActionSvc = issueRecoveryActionService(db);
+      const action = await recoveryActionSvc.upsertSourceScoped({
+        companyId,
+        sourceIssueId,
+        kind: "stranded_assigned_issue",
+        ownerType: "agent",
+        ownerAgentId: managerId,
+        cause: "stranded_assigned_issue",
+        fingerprint: "pen3991:backlog",
+        evidence: {},
+        nextAction: "Re-home the stranded issue.",
+        wakePolicy: { type: "wake_owner" },
+      });
+      const app = createApp();
+
+      const resolved = await request(app)
+        .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+        .send({
+          actionId: action.id,
+          outcome: "restored",
+          resolutionNote: "Board-approved park; beacon retired without disturbing the park.",
+        })
+        .expect(200);
+
+      expect(resolved.body.recoveryAction.outcome).toBe("restored");
+      const [row] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(row!.status).toBe("backlog");
+    });
+
+    it("attributes a replacement action to the restored claim it refutes", async () => {
+      // Each replacement gets a NEW id, so a re-mint read as a fresh unrelated
+      // strand and nothing scored the pair as a loop — the four measured issues
+      // went round twice, invisibly. The back-pointer is written at MINT, because
+      // the refutation does not exist yet when the claim is made.
+      const { companyId, managerId, sourceIssueId } = await seedCompany();
+      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, sourceIssueId));
+      const recoveryActionSvc = issueRecoveryActionService(db);
+      const first = await recoveryActionSvc.upsertSourceScoped({
+        companyId,
+        sourceIssueId,
+        kind: "stranded_assigned_issue",
+        ownerType: "agent",
+        ownerAgentId: managerId,
+        cause: "stranded_assigned_issue",
+        fingerprint: "pen3991:refuted:first",
+        evidence: {},
+        nextAction: "Re-home the stranded issue.",
+        wakePolicy: { type: "wake_owner" },
+      });
+      const app = createApp();
+      await request(app)
+        .post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`)
+        .send({ actionId: first.id, outcome: "restored", resolutionNote: "Called it restored." })
+        .expect(200);
+
+      // The same fault recurs and the sweep opens a new strand on the same issue.
+      const replacement = await recoveryActionSvc.upsertSourceScoped({
+        companyId,
+        sourceIssueId,
+        kind: "stranded_assigned_issue",
+        ownerType: "agent",
+        ownerAgentId: managerId,
+        cause: "stranded_assigned_issue",
+        fingerprint: "pen3991:refuted:second",
+        evidence: {},
+        nextAction: "Re-home the stranded issue.",
+        wakePolicy: { type: "wake_owner" },
+      });
+      expect(replacement.id).not.toBe(first.id);
+
+      const evidence = replacement.evidence as Record<string, unknown>;
+      expect(evidence.supersedesRestoredClaimActionId).toBe(first.id);
+      expect(evidence.supersedesRestoredClaimOutcome).toBe("restored_unverified");
+      expect(typeof evidence.supersedesRestoredClaimResolvedAt).toBe("string");
+      expect(evidence.supersedesRestoredClaimElapsedMs).toEqual(expect.any(Number));
+      expect(evidence.supersedesRestoredClaimElapsedMs as number).toBeGreaterThanOrEqual(0);
+      // Ally review on #2584: the link is temporal adjacency, not proof the prior
+      // claim was false — most writers of `restored` are system discharges that
+      // are generally true. The prior claim's shape is recorded so a consumer can
+      // tell the measured loop shape (same kind, minutes apart) from a
+      // coincidence, rather than this code guessing on their behalf.
+      expect(evidence.supersedesRestoredClaimKind).toBe("stranded_assigned_issue");
+      expect(evidence.supersedesRestoredClaimCause).toBe("stranded_assigned_issue");
+      expect(evidence.supersedesRestoredClaimSameKind).toBe(true);
+    });
+
+    it("marks a different-kind prior claim as linked but not same-kind", async () => {
+      // The coincidence case the review named: a system discharge whose
+      // `restored` is generally true (a merged-PR `pr_review_non_convergence`
+      // beacon), followed within the window by an unrelated new strand. It is
+      // still linked — dropping the link would leave no trace to audit — but it
+      // must not read as the loop that same-kind adjacency indicates.
+      const { companyId, managerId, sourceIssueId } = await seedCompany();
+      const recoveryActionSvc = issueRecoveryActionService(db);
+      const prior = await recoveryActionSvc.upsertSourceScoped({
+        companyId,
+        sourceIssueId,
+        kind: "pr_review_non_convergence",
+        ownerType: "agent",
+        ownerAgentId: managerId,
+        cause: "self_review_pr_non_convergence",
+        fingerprint: "pen3991:different-kind:prior",
+        evidence: {},
+        nextAction: "Take over the PR.",
+        wakePolicy: { type: "wake_owner" },
+      });
+      await recoveryActionSvc.resolveActiveForIssue({
+        companyId,
+        sourceIssueId,
+        actionId: prior.id,
+        status: "resolved",
+        outcome: "restored",
+        resolutionNote: "PR merged, so the self-review loop ended.",
+      });
+
+      const replacement = await recoveryActionSvc.upsertSourceScoped({
+        companyId,
+        sourceIssueId,
+        kind: "stranded_assigned_issue",
+        ownerType: "agent",
+        ownerAgentId: managerId,
+        cause: "stranded_assigned_issue",
+        fingerprint: "pen3991:different-kind:replacement",
+        evidence: {},
+        nextAction: "Re-home the stranded issue.",
+        wakePolicy: { type: "wake_owner" },
+      });
+
+      const evidence = replacement.evidence as Record<string, unknown>;
+      expect(evidence.supersedesRestoredClaimActionId).toBe(prior.id);
+      expect(evidence.supersedesRestoredClaimKind).toBe("pr_review_non_convergence");
+      expect(evidence.supersedesRestoredClaimCause).toBe("self_review_pr_non_convergence");
+      expect(evidence.supersedesRestoredClaimSameKind).toBe(false);
+    });
+
+    it("does not attribute a first-ever action to anything", async () => {
+      const { companyId, managerId, sourceIssueId } = await seedCompany();
+      const recoveryActionSvc = issueRecoveryActionService(db);
+      const action = await recoveryActionSvc.upsertSourceScoped({
+        companyId,
+        sourceIssueId,
+        kind: "stranded_assigned_issue",
+        ownerType: "agent",
+        ownerAgentId: managerId,
+        cause: "stranded_assigned_issue",
+        fingerprint: "pen3991:first-ever",
+        evidence: {},
+        nextAction: "Re-home the stranded issue.",
+        wakePolicy: { type: "wake_owner" },
+      });
+      expect(action.evidence).not.toHaveProperty("supersedesRestoredClaimActionId");
+    });
   });
 
   describe("a closed PR discharges its non-convergence action (PEN-3397)", () => {
@@ -10910,6 +11545,95 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       expect(escalation).toMatchObject({ documentWriteRefusedRunId: refusedRunId });
       expect(escalation).not.toHaveProperty("recoveryWorkClass");
       expect(await issueActivityDetails(companyId, sourceIssueId, DISPATCHED)).toHaveLength(0);
+    });
+
+    /**
+     * PEN-3983: `enqueueWakeup` returning null is NOT proof that no run was queued, and the
+     * refund must not treat it as such. The provider-capacity gate POSTPONES a wake rather
+     * than declining it — it commits a durable `scheduled_retry` run and then returns null
+     * (`heartbeat.ts`, BLO-31344). That run is later promoted, dispatched through the
+     * recovery lane, and executed.
+     *
+     * Before this fix the refund fired anyway, so the action dropped back to
+     * `attemptCount: 0` while its wake was still on its way. That reading is what the
+     * horizon then retired as wake-exhausted and labelled `never_delivered`. Measured on
+     * the live fleet 2026-10-12: of the 100 most recent recovery actions, 49 sat at
+     * `attemptCount: 0` and all 49 carried `nonDeliverySweepCount >= 1` — every zero in
+     * the population was minted by this refund. On the four actions PEN-3983 was filed
+     * from, three of the parked wakes later ran and SUCCEEDED, 2.3-2.7h after their
+     * actions had already been retired for never being woken.
+     *
+     * The mock reproduces the gate exactly: commit a `scheduled_retry` run carrying the
+     * wake's own `contextSnapshot` (which is where `recoveryActionId` lives), then return
+     * null.
+     */
+    it("keeps the attempt spent when the capacity gate parked a run and returned null", async () => {
+      const { companyId, coderId, sourceIssueId } = await seedCompany();
+      await seedStrandedJobMissingRun({
+        companyId,
+        agentId: coderId,
+        issueId: sourceIssueId,
+        refusedAt: null,
+      });
+      const parkedRunIds: string[] = [];
+      const enqueueWakeup = vi.fn(async (agentId: string, opts: any) => {
+        const snapshot = opts?.contextSnapshot ?? {};
+        if (snapshot.source === "issue_recovery_action") {
+          const runId = randomUUID();
+          parkedRunIds.push(runId);
+          await db.insert(heartbeatRuns).values({
+            id: runId,
+            companyId,
+            agentId,
+            invocationSource: "assignment",
+            status: "scheduled_retry",
+            scheduledRetryAt: new Date("2026-09-07T18:00:00.000Z"),
+            scheduledRetryReason: "ccrotate_capacity",
+            errorCode: "rate_limit_exhausted",
+            contextSnapshot: snapshot,
+          });
+        }
+        return null;
+      });
+      const recovery = recoveryService(db, { enqueueWakeup });
+
+      await recovery.reconcileStrandedAssignedIssues();
+
+      // The gate really did commit a run — without this the assertion below would pass for
+      // the wrong reason, on a sweep that never reached the recovery wake at all.
+      expect(parkedRunIds).toHaveLength(1);
+      const [action] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
+      expect(action).toMatchObject({ attemptCount: 1, nonDeliverySweepCount: 0 });
+    });
+
+    /**
+     * PEN-3983 control. The refund still has to fire on the paths that genuinely queue
+     * nothing — a pause hold, a cooldown, wake-on-demand disabled. Without this the fix
+     * above could be "never refund", which would restore the unbounded budget BLO-18996
+     * and BLO-19124 closed. Same sweep, same null return, no committed run.
+     */
+    it("still refunds the attempt when the null return queued nothing", async () => {
+      const { companyId, coderId, sourceIssueId } = await seedCompany();
+      await seedStrandedJobMissingRun({
+        companyId,
+        agentId: coderId,
+        issueId: sourceIssueId,
+        refusedAt: null,
+      });
+      const enqueueWakeup = vi.fn(async () => null);
+      const recovery = recoveryService(db, { enqueueWakeup });
+
+      await recovery.reconcileStrandedAssignedIssues();
+
+      const [action] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId));
+      expect(action.attemptCount).toBe(0);
+      expect(action.nonDeliverySweepCount).toBeGreaterThanOrEqual(1);
     });
 
     /**

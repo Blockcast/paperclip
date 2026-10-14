@@ -31,6 +31,7 @@ import {
   parsePullRequestRefs,
   taskKeysMatch,
   NOT_A_REVIEW_REQUEST_MARKER,
+  inferPrReviewTargetFromCanonicalTitle,
 } from "../services/pr-review-duplicate-issue-guard.js";
 
 // This suite exercises duplicate-review admission, not assignment wake
@@ -158,6 +159,32 @@ describe("pr review duplicate issue guard (pure helpers)", () => {
         { repoFullName: NORMALIZED_REPO, prNumber: PR_NUMBER },
       ]);
     }
+  });
+
+  describe("inferPrReviewTargetFromCanonicalTitle (BLO-44562)", () => {
+    const reviewerAgentIds = ["ally"];
+    const base = {
+      assigneeAgentId: "ally",
+      title: `Review onprem-k8s PR #${PR_NUMBER} exact head 8ee6f12d60 — fix things`,
+      description: `Publish one consolidated review of ${PR_URL} at exact head 8ee6f12d60.`,
+    };
+
+    it("infers the target from a canonical hand-filed review row", () => {
+      expect(inferPrReviewTargetFromCanonicalTitle(base, { reviewerAgentIds }))
+        .toEqual({ repoFullName: REPO, prNumber: PR_NUMBER });
+    });
+
+    it.each([
+      ["a non-reviewer assignee", { assigneeAgentId: "someone-else" }],
+      ["no assignee", { assigneeAgentId: null }],
+      ["a non-canonical title", { title: `Ally's review of PR #${PR_NUMBER} failed` }],
+      ["a title PR number that disagrees with the URL", { title: "Review onprem-k8s PR #1 exact head 8ee6f12d60" }],
+      ["two PR URLs", { description: `${PR_URL} and ${PR_URL.replace(String(PR_NUMBER), "1")}` }],
+      ["no PR URL", { description: "no link" }],
+      ["the not-a-review-request marker", { description: `${PR_URL} ${NOT_A_REVIEW_REQUEST_MARKER}` }],
+    ])("does not infer for %s", (_label, override) => {
+      expect(inferPrReviewTargetFromCanonicalTitle({ ...base, ...override }, { reviewerAgentIds })).toBeNull();
+    });
   });
 
   it("is not corrupted by regex lastIndex state across calls", () => {
@@ -765,5 +792,37 @@ describeEmbeddedPostgres("issue create PR-review duplicate guard routes", () => 
 
     expect(res.status).toBe(201);
     expect(await db.select().from(issues).where(eq(issues.companyId, companyId))).toHaveLength(1);
+  });
+  it("folds a hand-filed review row for a moved head into the open pr_review row (BLO-44562)", async () => {
+    const { companyId, reviewer, app } = await setup();
+    const first = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send(reviewIssueBody(reviewer.id, { prReviewTarget: { repoFullName: REPO, prNumber: PR_NUMBER } }))
+      .expect(201);
+
+    // Head moved; filed without prReviewTarget, exactly like a drive-session row.
+    const moved = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send(reviewIssueBody(reviewer.id, {
+        title: `Review ${REPO} PR #${PR_NUMBER} exact head 0b77b30dbb`,
+        description: `Please review ${PR_URL} at head 0b77b30dbb.`,
+      }))
+      .expect(200);
+
+    expect(moved.body).toMatchObject({ id: first.body.id, deduplicationReason: "pr_review_target" });
+    const rows = await db.select().from(issues).where(eq(issues.companyId, companyId));
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ originKind: "pr_review", title: expect.stringContaining("0b77b30dbb") });
+  });
+
+  it("leaves a canonical-titled row for a non-reviewer as manual (BLO-44562)", async () => {
+    const { companyId, app } = await setup();
+    const engineer = await seedAgent(companyId, "Engineer");
+    await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send(reviewIssueBody(engineer.id))
+      .expect(201);
+    const [row] = await db.select().from(issues).where(eq(issues.companyId, companyId));
+    expect(row).toMatchObject({ originKind: "manual" });
   });
 });

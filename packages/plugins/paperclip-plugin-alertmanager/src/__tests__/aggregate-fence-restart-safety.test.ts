@@ -605,6 +605,42 @@ describe("BLO-31036 — startup reconciliation drains fences no live process can
     expect((await readFence())?.phase).toBe("active");
   });
 
+  it("releases a `finalizing` fence left by a dead predecessor in this slot", async () => {
+    // The gap this closes. A resolver that dies between
+    // `tryClaimAggregateFinalization` and `beginAggregateCancellation` leaves
+    // the row in `finalizing`. Only a *firing* claim clears that phase, and an
+    // aggregate whose alert has stopped firing never sends one — so the row
+    // refuses every resolution delivery forever. Measured in production
+    // 2026-10-11: three rows wedged in `finalizing`, oldest 2026-09-14.
+    await seedFence({
+      phase: "finalizing",
+      resolutionToken: "resolution-token-from-the-dead-process",
+      ownerInstanceId: DEAD_PREDECESSOR.instanceId,
+      ownerSlot: DEAD_PREDECESSOR.slot,
+    });
+    const { ctx } = mkCtx();
+
+    await expect(reconcileAbandonedAggregateFences(ctx)).resolves.toEqual({ byIdentity: 1, byAge: 0 });
+    expect((await readFence())?.phase).toBe("active");
+  });
+
+  it("leaves a `finalizing` fence held by this live process alone", async () => {
+    // The safety control for the case above: widening the phase filter must not
+    // turn the sweep into "release anything finalizing". A live finalization in
+    // this very process is excluded by `IS DISTINCT FROM`, exactly as `firing`
+    // is, so a resolution racing setup is not collateral damage.
+    await seedFence({
+      phase: "finalizing",
+      resolutionToken: "resolution-token-live",
+      ownerInstanceId: SELF.instanceId,
+      ownerSlot: SELF.slot,
+    });
+    const { ctx } = mkCtx();
+
+    await expect(reconcileAbandonedAggregateFences(ctx)).resolves.toEqual({ byIdentity: 0, byAge: 0 });
+    expect((await readFence())?.phase).toBe("finalizing");
+  });
+
   it("leaves a fence held by this process alone, so a delivery racing setup survives", async () => {
     // `pluginCtx` is assigned at the top of setup, so a delivery can arrive
     // while the sweep is still running. It must not be collateral damage.
@@ -710,6 +746,24 @@ describe("BLO-32113 — the startup sweep also reclaims on age, for aggregates t
       resolutionToken: "resolution-token-self-stale",
       ownerInstanceId: SELF.instanceId,
       ownerSlot: SELF.slot,
+      updatedAt: pastBackstop(),
+    });
+    const { ctx } = mkCtx();
+
+    await expect(reconcileAbandonedAggregateFences(ctx)).resolves.toEqual({ byIdentity: 0, byAge: 1 });
+    expect((await readFence())?.phase).toBe("active");
+  });
+
+  it("reclaims a `finalizing` fence a foreign slot left past the backstop", async () => {
+    // The two oldest production rows are this exact shape: phase `finalizing`,
+    // an `unknown-slot:<uuid>` owner the identity arm cannot match, and no
+    // further firing delivery. Identity declines them, so the age arm is the
+    // only path that ever drains them — they had sat 26 and 27 days.
+    await seedFence({
+      phase: "finalizing",
+      resolutionToken: "resolution-token-foreign-stale",
+      ownerInstanceId: FOREIGN_HOST.instanceId,
+      ownerSlot: FOREIGN_HOST.slot,
       updatedAt: pastBackstop(),
     });
     const { ctx } = mkCtx();

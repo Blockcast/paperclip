@@ -185,6 +185,13 @@ const manifest: PaperclipPluginManifestV1 = {
         description:
           "e.g. http://alertmanager.monitoring.svc.cluster.local:9093. The escalation sweep reads /api/v2/alerts here before a rung posts or reassigns, so it can tell 'still firing' from 'the resolve webhook was never delivered'. Leave unset to keep the ladder running without a liveness claim — rung comments then say liveness was not verified instead of asserting it.",
       },
+      reconcileReceivers: {
+        type: "array",
+        title: "Alertmanager receivers to reconcile (lost-webhook backfill)",
+        description:
+          "Alertmanager receiver names whose alerts belong to this company, e.g. [\"paperclip\"]. Every 5 minutes the reconcile job reads active alerts from alertmanagerApiUrl and files any routed to one of these receivers that has no issue yet — the alerts whose webhook Alertmanager gave up on while the control plane was down (BLO-44820). Leave unset to disable.",
+        items: { type: "string", minLength: 1 },
+      },
     },
     // No fields are schema-required: the bootstrap auto-config endpoint
     // posts a partial config (e.g. only webhookToken). A missing
@@ -208,6 +215,13 @@ const manifest: PaperclipPluginManifestV1 = {
       displayName: "Check unresolved alert escalations",
       description: "Advances overdue alerts through the reportsTo chain.",
       schedule: "*/1 * * * *",
+    },
+    {
+      jobKey: "reconcile-active-alerts",
+      displayName: "Backfill active alerts with no delivered webhook",
+      description:
+        "Files an issue for any alert Alertmanager still holds active whose webhook never arrived (BLO-44820).",
+      schedule: "*/5 * * * *",
     },
   ],
   apiRoutes: [

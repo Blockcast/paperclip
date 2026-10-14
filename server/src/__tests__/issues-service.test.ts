@@ -410,6 +410,7 @@ describeEmbeddedPostgres("issueService.addComment idempotency", () => {
     const issueId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: "BLO",
       requireBoardApprovalForNewAgents: false,
@@ -436,6 +437,7 @@ describeEmbeddedPostgres("issueService.addComment idempotency", () => {
     const issueId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: "BLO",
       requireBoardApprovalForNewAgents: false,
@@ -464,6 +466,7 @@ describeEmbeddedPostgres("issueService.addComment idempotency", () => {
     const issueId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: "BLO",
       requireBoardApprovalForNewAgents: false,
@@ -492,6 +495,7 @@ describeEmbeddedPostgres("issueService.addComment idempotency", () => {
     const issueId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: "BLO",
       requireBoardApprovalForNewAgents: false,
@@ -578,6 +582,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     const companyId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -670,6 +675,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
         description: null,
         status,
         priority: "medium",
+        assigneeAgentId: agentId,
       });
       const runId = randomUUID();
       await db.insert(heartbeatRuns).values({
@@ -912,6 +918,103 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
       await svc.clearCheckoutRunIfTerminal(issue.id);
 
       expect(await readIssue(issue.id)).toMatchObject({ status: "backlog", restore: null });
+    });
+
+    // BLO-29597: a checkout off `blocked` used to be a ratchet-preserving round
+    // trip. The stranded-blocked reconciler selects `status = 'blocked'`,
+    // checkout promotes the row straight out of that predicate, and a verbatim
+    // restore put it back in the exact shape it was found in — activity-shaped,
+    // and repairing nothing.
+    //
+    // Two halves are pinned here, because each is useless without the other.
+    // The claim guard refuses a row with a live blocker edge, so every `blocked`
+    // row checkout can take is by construction a stranded one; and the restore
+    // recomputes readiness from the live edges rather than replaying the marker,
+    // so a no-progress round trip cannot hand the row back stranded while an
+    // edge filed mid-run is still honoured.
+    async function seedBlockerEdge(
+      companyId: string,
+      blockedIssueId: string,
+      blockerStatus: string,
+    ) {
+      const blockerId = randomUUID();
+      await db.insert(issues).values({
+        id: blockerId,
+        companyId,
+        title: "Blocker",
+        status: blockerStatus,
+        priority: "medium",
+      });
+      await db.insert(issueRelations).values({
+        companyId,
+        issueId: blockerId,
+        relatedIssueId: blockedIssueId,
+        type: "blocks",
+      });
+      return blockerId;
+    }
+
+    it("lands a stranded blocked issue in todo when the run releases without advancing it", async () => {
+      const { agentId, issue, runId } = await seedCheckoutFixture("blocked");
+
+      await svc.checkout(issue.id, agentId, ["blocked"], runId);
+      // The promotion is what hides the row from the reconciler's predicate.
+      expect(await readIssue(issue.id)).toMatchObject({ status: "in_progress", restore: "blocked" });
+
+      await finishRun(runId);
+      await svc.clearCheckoutRunIfTerminal(issue.id);
+
+      // No blocker edge, so `blocked` here has no wake path of any kind: the
+      // heartbeat skips it and there is nothing for the resolved sweep to fire
+      // on. `todo` keeps it in inbox-lite and re-dispatchable.
+      expect(await readIssue(issue.id)).toMatchObject({ status: "todo", restore: null });
+    });
+
+    it("refuses to claim a genuinely blocked issue even when expectedStatuses allows blocked", async () => {
+      const { companyId, agentId, issue, runId } = await seedCheckoutFixture("blocked");
+      await seedBlockerEdge(companyId, issue.id, "todo");
+
+      // BLO-29597 AC2, pinned: `blocked` in `expectedStatuses` is NOT a licence
+      // to claim a blocked row. The blocker guard runs under the relation lock,
+      // status-independently, and refuses before any promotion — so the two
+      // populations are separated at claim time rather than being, as
+      // BLO-29597 assumed, indistinguishable. Work that cannot proceed never
+      // starts, and the row keeps the blockers_resolved wake that will move it.
+      await expect(svc.checkout(issue.id, agentId, ["blocked"], runId)).rejects.toThrow(
+        "Issue is blocked by unresolved blockers",
+      );
+      expect(await readIssue(issue.id)).toMatchObject({ status: "blocked", restore: null });
+    });
+
+    it("returns to blocked when a blocker edge is filed during the run", async () => {
+      const { companyId, agentId, issue, runId } = await seedCheckoutFixture("blocked");
+
+      await svc.checkout(issue.id, agentId, ["blocked"], runId);
+      // The negative control for the test above, and the only way a claimed row
+      // becomes genuinely blocked: the agent discovers a real dependency and
+      // records it mid-run. Without this, a restore that simply always wrote
+      // `todo` would pass and silently launder that edge.
+      await seedBlockerEdge(companyId, issue.id, "todo");
+
+      await finishRun(runId);
+      await svc.clearCheckoutRunIfTerminal(issue.id);
+
+      // Readiness is recomputed from the live edges at restore time rather than
+      // replayed from the marker, so the new edge is honoured.
+      expect(await readIssue(issue.id)).toMatchObject({ status: "blocked", restore: null });
+    });
+
+    it("lands a stranded blocked issue in todo when the agent releases it explicitly", async () => {
+      const { agentId, issue, runId } = await seedCheckoutFixture("blocked");
+
+      await svc.checkout(issue.id, agentId, ["blocked"], runId);
+      await svc.release(issue.id, agentId, runId);
+
+      // Release writes the terminal status itself, so the marker it recorded at
+      // checkout describes a promotion that is already undone. Leaving it set
+      // would strand `checkout_restore_status = 'blocked'` on a `todo` row and
+      // break any census keyed on that column.
+      expect(await readIssue(issue.id)).toMatchObject({ status: "todo", restore: null });
     });
 
     it("keeps a status the run actually wrote", async () => {
@@ -1247,7 +1350,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
       description: null,
       status: "todo",
       priority: "medium",
-      assigneeAgentId: null,
+      assigneeAgentId: agentId,
     });
 
     const checkedOut = await svc.checkout(issue.id, agentId, ["todo"], checkoutRunId);
@@ -1565,6 +1668,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -1682,6 +1786,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -1737,6 +1842,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -1786,6 +1892,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -1843,6 +1950,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     const companyId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -1868,6 +1976,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -1915,6 +2024,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -1957,6 +2067,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     const companyId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -1972,6 +2083,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -2025,6 +2137,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -2093,6 +2206,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -2133,6 +2247,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -2180,6 +2295,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -2232,6 +2348,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -2281,6 +2398,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: "PC1A2",
       requireBoardApprovalForNewAgents: false,
@@ -2321,6 +2439,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -2401,6 +2520,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -2484,6 +2604,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -2604,6 +2725,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -2667,6 +2789,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -2717,6 +2840,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -2760,6 +2884,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -2845,6 +2970,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -2913,6 +3039,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -3001,6 +3128,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -3059,6 +3187,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -3116,6 +3245,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -3178,6 +3308,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -3244,6 +3375,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -3318,6 +3450,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -3372,6 +3505,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -3418,6 +3552,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -3439,8 +3574,10 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
 
     expect(result).toBeTruthy();
     expect(result?.description).toHaveLength(1200);
-    expect(result?.executionPolicy).toBeNull();
-    expect(result?.executionState).toBeNull();
+    // BLO-44407: policy is absent (unbounded, not served here); state is trimmed to its
+    // bounded summary keys, so an unrecognised blob yields an empty summary, not a forged null.
+    expect(result).not.toHaveProperty("executionPolicy");
+    expect(result?.executionState).toEqual({});
     expect(result?.executionWorkspaceSettings).toBeNull();
   });
 
@@ -3451,6 +3588,7 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -3514,6 +3652,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -3588,6 +3727,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -3627,6 +3767,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -3659,6 +3800,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -3697,6 +3839,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -3737,6 +3880,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -3786,6 +3930,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -3831,6 +3976,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -3888,6 +4034,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -3954,6 +4101,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -3999,6 +4147,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -4045,6 +4194,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -4098,6 +4248,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -4148,6 +4299,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -4207,6 +4359,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -4252,6 +4405,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -4303,6 +4457,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -4343,6 +4498,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     const responsibleUserId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -4393,6 +4549,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     const requestedResponsibleUserId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -4420,6 +4577,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     const requestedResponsibleUserId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -4443,6 +4601,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -4517,6 +4676,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -4599,6 +4759,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -4706,6 +4867,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -4782,6 +4944,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -4879,6 +5042,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -4951,6 +5115,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -5048,6 +5213,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -5119,6 +5285,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -5179,6 +5346,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -5329,6 +5497,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -5417,6 +5586,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     const companyId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -5456,6 +5626,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     const companyId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -5490,6 +5661,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     const companyId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -5530,6 +5702,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     const companyId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -5564,6 +5737,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     const companyId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -5607,6 +5781,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     const companyId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -5630,6 +5805,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     const companyId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -5664,6 +5840,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     const assigneeAgentId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -5720,6 +5897,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       const ctoAgentId = randomUUID();
       await db.insert(companies).values({
         id: companyId,
+        defaultResponsibleUserId: "responsible-user",
         name: "Paperclip",
         issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
         requireBoardApprovalForNewAgents: false,
@@ -5944,6 +6122,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       const assigneeAgentId = randomUUID();
       await db.insert(companies).values({
         id: companyId,
+        defaultResponsibleUserId: "responsible-user",
         name: "Paperclip",
         issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
         requireBoardApprovalForNewAgents: false,
@@ -6035,6 +6214,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       const assigneeAgentId = randomUUID();
       await db.insert(companies).values({
         id: companyId,
+        defaultResponsibleUserId: "responsible-user",
         name: "Paperclip",
         issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
         requireBoardApprovalForNewAgents: false,
@@ -6094,6 +6274,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
       const ctoAgentId = randomUUID();
       await db.insert(companies).values({
         id: companyId,
+        defaultResponsibleUserId: "responsible-user",
         name: "Paperclip",
         issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
         requireBoardApprovalForNewAgents: false,
@@ -6412,6 +6593,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -6525,6 +6707,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -6634,6 +6817,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -6799,6 +6983,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -6950,6 +7135,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -7110,6 +7296,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -7205,6 +7392,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -7427,6 +7615,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -7473,6 +7662,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     const companyId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -7511,6 +7701,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     const companyId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -7558,6 +7749,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     const assigneeAgentId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -7605,6 +7797,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     const blockedId = "ffffffff-ffff-4fff-8fff-ffffffffffff";
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Concurrent blocker readiness",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -7683,6 +7876,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     const blockedId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Concurrent checkout blocker readiness",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -7763,6 +7957,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     const blockedId = "ffffffff-ffff-4fff-8fff-ffffffffffff";
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Concurrent checkout blocker status",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -7847,6 +8042,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     const issueId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -7891,6 +8087,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     const issueId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -7933,6 +8130,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     const issueId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -7988,6 +8186,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -8062,6 +8261,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     const assigneeAgentId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -8138,6 +8338,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     const assigneeAgentId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -8213,6 +8414,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
 
       await db.insert(companies).values({
         id: companyId,
+        defaultResponsibleUserId: "responsible-user",
         name: "Paperclip",
         issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
         requireBoardApprovalForNewAgents: false,
@@ -8651,6 +8853,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -8727,6 +8930,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -8791,6 +8995,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -8820,6 +9025,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -8853,6 +9059,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -8950,6 +9157,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -9023,6 +9231,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -9093,6 +9302,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -9140,6 +9350,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -9310,6 +9521,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -9363,6 +9575,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -9392,6 +9605,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -9460,6 +9674,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -9529,6 +9744,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -9590,6 +9806,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -9665,6 +9882,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -9718,6 +9936,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -9743,6 +9962,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     await expect(svc.update(issue.id, {
       assigneeAgentId: agentId,
+      assigneeUserId: null,
       executionWorkspaceSettings: {
         mode: "isolated_workspace",
         workspaceStrategy: { type: "git_worktree" },
@@ -9766,6 +9986,7 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -9906,6 +10127,7 @@ describeEmbeddedPostgres("issueService.findMentionedProjectIds", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -9988,6 +10210,7 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -10093,6 +10316,7 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix,
       requireBoardApprovalForNewAgents: false,
@@ -10169,6 +10393,7 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
     const assigneeAgentId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -10233,6 +10458,7 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -10307,6 +10533,7 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -10403,6 +10630,7 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -10478,6 +10706,7 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -10550,6 +10779,7 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -10654,6 +10884,7 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -10775,6 +11006,7 @@ describeEmbeddedPostgres("accepted plan decomposition", () => {
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -10821,6 +11053,7 @@ describeEmbeddedPostgres("accepted plan decomposition", () => {
     if (!args?.companyId || !args?.goalId || !args?.assigneeAgentId) {
       await db.insert(companies).values({
         id: companyId,
+        defaultResponsibleUserId: "responsible-user",
         name: "Paperclip",
         issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
         requireBoardApprovalForNewAgents: false,
@@ -11477,6 +11710,7 @@ describeEmbeddedPostgres("issueService.assertCheckoutOwner stale checkout adopti
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -11861,6 +12095,7 @@ describeEmbeddedPostgres("issueService.update expectedCurrentStatus (BLO-18797)"
 
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name: "Paperclip",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -12121,6 +12356,7 @@ describeEmbeddedPostgres("issueService cross-company parentId (BLO-28635)", () =
     const companyId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
+      defaultResponsibleUserId: "responsible-user",
       name,
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
@@ -12201,7 +12437,7 @@ describeEmbeddedPostgres("issueService cross-company parentId (BLO-28635)", () =
     const foreignParentId = await seedIssue(foreignCompanyId, "Foreign parent secrets");
     const childId = randomUUID();
     // Written straight to the table: the guard above now refuses to mint this
-    // shape, but the historical rows repaired by 0254 look exactly like it.
+    // shape, but the historical rows repaired by 0255 look exactly like it.
     await db.insert(issues).values({
       id: childId,
       companyId: homeCompanyId,

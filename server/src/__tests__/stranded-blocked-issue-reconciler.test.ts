@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -561,6 +561,109 @@ describeEmbeddedPostgres("reconcileStrandedBlockedIssues", () => {
     expect((await reconcileStrandedBlockedIssues(db)).reconciled).toBe(0);
     expect(await statusOf(declared)).toBe("blocked");
   });
+
+  // PEN-3974, reproducing PEN-3789 exactly: a card set `blocked` with its unblock
+  // owner and action named in a COMMENT, whose blocker edges have all reached
+  // `done`, while the real gate (a human approving a PR) is still held.
+  //
+  // The flip itself is correct and is pinned here as such — the edges are resolved
+  // and a comment is the documented non-match, so the row genuinely has no wake
+  // path and must not be left silently `blocked`. What PEN-3974 is about is that
+  // the flip used to be legible only from `activity_log`: the assignee saw its
+  // deliberate `blocked` become `todo` with no actor, no reason and no remedy, and
+  // paid two heartbeats rediscovering it by observation. The announcement is the
+  // fix, so it is the assertion.
+  it("announces the flip on the thread, naming the declaration that would have held it", async () => {
+    const { companyId, agentId } = await createCompany("SBAN");
+    const dependent = await insertIssue({
+      companyId,
+      identifier: "SBAN-1",
+      status: "blocked",
+      assigneeAgentId: agentId,
+      description: "Portal form work. PR is open and waiting on an approving review.",
+    });
+    // Both edges resolved, exactly as on PEN-3789 — so `hasPendingBlocker` is false
+    // and the row is dependency-ready even though nothing it actually waits on moved.
+    for (const identifier of ["SBAN-2", "SBAN-3"]) {
+      const blocker = await insertIssue({ companyId, identifier, status: "done" });
+      await block({ companyId, blockerIssueId: blocker, blockedIssueId: dependent });
+    }
+    // The gate, named the way the tool guidance used to imply was sufficient.
+    await db.insert(issueComments).values({
+      companyId,
+      issueId: dependent,
+      authorAgentId: agentId,
+      authorType: "agent",
+      body: "Blocked: unblock owner @kkroo, action: approving review on #2326 at 45df396a.",
+    });
+
+    expect((await reconcileStrandedBlockedIssues(db)).reconciled).toBe(1);
+    expect(await statusOf(dependent)).toBe("todo");
+
+    const announcements = async () =>
+      await db
+        .select({
+          body: issueComments.body,
+          authorType: issueComments.authorType,
+          authorAgentId: issueComments.authorAgentId,
+          authorUserId: issueComments.authorUserId,
+          presentation: issueComments.presentation,
+          metadata: issueComments.metadata,
+        })
+        .from(issueComments)
+        .where(and(eq(issueComments.issueId, dependent), eq(issueComments.authorType, "system")));
+
+    const posted = await announcements();
+    expect(posted).toHaveLength(1);
+    // Author-less on purpose: it must not read as a decision by an agent, and
+    // `findBlockedPromotionsAwaitingUserInput` only scans agent-authored comments,
+    // so announcing cannot disturb the `latest_agent_comment_awaiting_user`
+    // suppression on a later sweep.
+    expect(posted[0]).toMatchObject({ authorAgentId: null, authorUserId: null });
+    expect(posted[0].presentation).toMatchObject({ kind: "system_notice", tone: "warning" });
+    expect(posted[0].metadata).toMatchObject({ version: 1 });
+    // The remedy, not just the notification — this is what the assignee was missing.
+    expect(posted[0].body).toContain("external owner:");
+    expect(posted[0].body).toContain("external action:");
+    expect(posted[0].body).toContain("description");
+    expect(posted[0].body).toContain("stranded-blocked-issue reconciler");
+
+    // A sweep that flips nothing announces nothing.
+    expect((await reconcileStrandedBlockedIssues(db)).reconciled).toBe(0);
+    expect(await announcements()).toHaveLength(1);
+
+    // ...but a SECOND real flip announces again. PEN-3789 was flipped twice ~2h15m
+    // apart, and an issue-scoped idempotency key would have silenced exactly the
+    // recurrence that made this expensive.
+    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, dependent));
+    expect((await reconcileStrandedBlockedIssues(db)).reconciled).toBe(1);
+    expect(await announcements()).toHaveLength(2);
+  });
+
+  // The matched control for the test above: a declared wait is never flipped, so it
+  // must never be announced either. Without this, an announcement bug that fired on
+  // every candidate rather than every flip would pass the test above.
+  it("does not announce on an issue it did not flip", async () => {
+    const { companyId } = await createCompany("SBANC");
+    const declared = await insertIssue({
+      companyId,
+      identifier: "SBANC-1",
+      status: "blocked",
+      description: [
+        "external owner: kkroo",
+        "external action: approve the PR",
+      ].join("\n"),
+    });
+
+    expect((await reconcileStrandedBlockedIssues(db)).reconciled).toBe(0);
+    expect(await statusOf(declared)).toBe("blocked");
+    const comments = await db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, declared));
+    expect(comments).toEqual([]);
+  });
+
 
   // The suppression reads the full `description` column. Callers that project a
   // `substring(...)` preview parse a past-the-cutoff declaration as `null` (BLO-31839); if

@@ -19,7 +19,7 @@ const STUCK_COVER_RECONCILE_LIMIT = 200;
  * `createSweepLivenessReader`'s short-circuit, one hanging Alertmanager costs a
  * sweep at most one of these, however many issues are due.
  */
-const ALERTMANAGER_READ_TIMEOUT_MS = 5_000;
+export const ALERTMANAGER_READ_TIMEOUT_MS = 5_000;
 
 function q(ns: string, table: string): string {
   return `${ns}.${table}`;
@@ -119,13 +119,26 @@ type LivenessReader = (alertname: string) => Promise<AlertLiveness>;
  * raw error text carries resolved addresses, ports, and response bytes. The
  * raw error goes to the plugin log instead.
  */
+/**
+ * The instance config wins; `PAPERCLIP_ALERTMANAGER_API_URL` (forwarded to the
+ * worker by the host, BLO-42694) is only the deploy-time default, so a board
+ * stopgap set in the UI is never overridden. Empty when neither is set.
+ */
+export function resolveAlertmanagerApiUrl(
+  config: AlertmanagerPluginConfig,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const raw = config.alertmanagerApiUrl?.trim() || env.PAPERCLIP_ALERTMANAGER_API_URL?.trim() || "";
+  return raw.replace(/\/+$/, "");
+}
+
 async function readAlertLiveness(
   config: AlertmanagerPluginConfig,
   alertname: string,
   now: Date,
   logger: PluginContext["logger"],
 ): Promise<AlertLiveness> {
-  const base = config.alertmanagerApiUrl?.trim().replace(/\/+$/, "");
+  const base = resolveAlertmanagerApiUrl(config);
   if (!base) return { state: "unknown", reason: "no alertmanagerApiUrl is configured for this instance" };
   // `fetch` takes any scheme. A `data:` URL answers with a body of the
   // configurer's choosing — `[]` would read every alert as clear and hold

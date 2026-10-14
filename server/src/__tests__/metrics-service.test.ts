@@ -147,7 +147,7 @@ describe("PR-review queue-wait metrics (BLO-30623)", () => {
     expect(body).not.toContain("Blockcast");
   });
 
-  it("keeps the saturated regime measured on BLO-31298 in a finite bucket", () => {
+  it("keeps the saturated regime's measured mean (BLO-31298) in a finite bucket", () => {
     // 2026-10-10T11:44Z: 100% of samples past the then-top edge of 28800, mean
     // 48941s. Past the top finite edge histogram_quantile() returns that edge
     // verbatim, so the p95 panel flatlines at 8h while the wait keeps growing.
@@ -217,7 +217,8 @@ describe("run dispatch-wait metrics (BLO-25024)", () => {
 
   it("keeps the worst wait measured on BLO-25024 in a finite bucket", () => {
     // 28h 19m (run e4de0932). Past the top finite edge it lands in +Inf and
-    // histogram_quantile() reads +Inf for the p95 during the incident regime.
+    // histogram_quantile() returns that edge verbatim for the p95, so the
+    // panel flatlines during the incident regime instead of reading +Inf.
     expect(RUN_DISPATCH_WAIT_BUCKETS_SECONDS.at(-1)).toBeGreaterThan(28 * 3600 + 19 * 60);
   });
 

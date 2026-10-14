@@ -1317,6 +1317,7 @@ export function executionWorkspaceService(db: Db) {
           .select({
             id: issues.id,
             identifier: issues.identifier,
+            status: issues.status,
             checkoutRunId: issues.checkoutRunId,
             executionRunId: issues.executionRunId,
           })
@@ -1364,6 +1365,18 @@ export function executionWorkspaceService(db: Db) {
             };
           }
         }
+
+        // BLO-45629: a row with no active run whose every linked issue is terminal is
+        // abandoned bookkeeping, not a rival — refusing on it blocks safe repair while
+        // telling the operator there is "no active run". The source issue must be among
+        // the rows read, so a hidden or missing source never counts as terminal.
+        // Orphans (null `sourceIssueId`) still contend: nothing proves them finished.
+        if (
+          activeRun === null
+          && candidate.sourceIssueId
+          && linkedIssueRows.some((issue) => issue.id === candidate.sourceIssueId)
+          && linkedIssueRows.every((issue) => issue.status === "done" || issue.status === "cancelled")
+        ) continue;
 
         const claimedIssue =
           linkedIssueRows.find((issue) => issue.id === candidate.sourceIssueId)

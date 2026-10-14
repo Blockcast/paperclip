@@ -75,6 +75,7 @@ import {
   SYSTEM_ISSUE_DOCUMENT_KEYS,
   ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY,
   type ExecutionWorkspaceConfig,
+  type IssueExecutionState,
 } from "@paperclipai/shared";
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
 import {
@@ -122,6 +123,7 @@ import {
 import { instanceSettingsService, readInstanceSettingsOn } from "./instance-settings.js";
 import {
   assertNotDuplicatePrReviewIssue,
+  inferPrReviewTargetFromCanonicalTitle,
   lockPrReviewIssueScopes,
   normalizePrReviewRepoFullName,
 } from "./pr-review-duplicate-issue-guard.js";
@@ -610,6 +612,63 @@ async function resolveResponsibleUserIdForIssueCreate(
   return input.createdByUserId ?? null;
 }
 
+/**
+ * BLO-43103 — every inbox selects by assignee, not by status (see
+ * `agent-inbox-lite.ts`), so an issue with both assignee columns null is
+ * reachable by no routing path at any status: mutable by anyone, discoverable
+ * by nobody, and invisible to the sweeps that would otherwise bounce it. 74
+ * live `todo` rows were in that state on 2026-10-10 with zero wake paths
+ * between them. An owner is therefore assigned at creation rather than left to
+ * a sweep — a wrong default costs one PATCH to correct, which is one more
+ * remedy than `null` has.
+ *
+ * The union return type carries the single-assignee invariant: a branch cannot
+ * set both columns, so this cannot reproduce the `"Issue can only have one
+ * assignee"` loop BLO-42855 hit one layer up. And no default here can assign
+ * work to a third party, so none needs the `assertCanAssignTasks` gate the
+ * routes apply to an explicit assignee: `createdByAgentId` is stamped by the
+ * route from the authenticated actor, and both user fallbacks are attribution
+ * already written to this row or configured on the company.
+ *
+ * `companyDefaultResponsibleUserId` is what makes the final throw safe to ship.
+ * A census of the 40,972 live rows on 2026-10-10 found 2,919 whose create had
+ * neither a creating agent nor a resolvable responsible user — 2,559
+ * `plugin:paperclip-plugin-alertmanager` (0 of its 7,564 rows ever set
+ * `createdByAgentId`) and 351 `github_dependabot_alert`. Throwing on those
+ * would not produce an owned alert, it would refuse to record the alert at all,
+ * which is worse than the ownerless row this exists to prevent. Resolved
+ * lazily, so an ordinary create still costs zero extra queries.
+ *
+ * Origins whose writer fills the owner in later are left as created. The
+ * alertmanager owner retrofit (BLO-40764) patches `{ assigneeAgentId }` alone
+ * and skips its user leg once `assigneeUserId` is set, so a pre-filled default
+ * user turned every agent retrofit into the `"Issue can only have one
+ * assignee"` 422 and every user retrofit into a silent no-op. Those rows were
+ * ownerless before this change and stay that way until their writer decides.
+ */
+async function resolveCreateIssueAssignee(
+  input: {
+    assigneeAgentId?: string | null;
+    assigneeUserId?: string | null;
+    createdByAgentId?: string | null;
+    responsibleUserId?: string | null;
+    originKind?: string | null;
+  },
+  companyDefaultResponsibleUserId: () => Promise<string | null>,
+): Promise<{ assigneeAgentId: string } | { assigneeUserId: string } | Record<string, never>> {
+  if (input.assigneeAgentId) return { assigneeAgentId: input.assigneeAgentId };
+  if (input.assigneeUserId) return { assigneeUserId: input.assigneeUserId };
+  if (input.originKind?.startsWith("plugin:") || input.originKind === "github_dependabot_alert") return {};
+  if (input.createdByAgentId) return { assigneeAgentId: input.createdByAgentId };
+  if (input.responsibleUserId) return { assigneeUserId: input.responsibleUserId };
+  const companyDefault = await companyDefaultResponsibleUserId();
+  if (companyDefault) return { assigneeUserId: companyDefault };
+  throw unprocessable(
+    "Issue requires an assignee: no explicit assignee, creating agent, responsible user, "
+      + "or company default responsible user to default to",
+  );
+}
+
 // BLO-27706: a reused execution workspace is shared by every issue bound to it, so
 // an issue update must patch only the config keys that issue actually supplies.
 // Emitting `null` for an absent key defeated mergeExecutionWorkspaceConfig's
@@ -838,8 +897,13 @@ export interface IssueFilters {
    * over it re-orders rows mid-sweep, so an exhaustive walk both duplicates and skips
    * rows. "id" sorts by the immutable primary key instead: rows never move, so a walk
    * is safe to paginate. Pair it with `afterId` for a keyset cursor.
+   *
+   * "pick" is the agent work-pick order (BLO-44922): priority band first, then OLDEST
+   * first within the band. The default order is newest-activity first within a band,
+   * so under inflow >= drain the oldest row's in-band rank grows without bound and it
+   * is never reached. Created-at is also immutable, so offset paging stays stable.
    */
-  sortField?: "updated" | "id";
+  sortField?: "updated" | "id" | "pick";
   sortDir?: "asc" | "desc";
   /** Keyset cursor: return only rows with `id > afterId`. Requires sortField "id". */
   afterId?: string;
@@ -2271,6 +2335,9 @@ function issueListOrderBy(
     // row between pages. Relevance ranking is deliberately dropped: a stable walk that
     // visits every row exactly once is the whole point of this mode.
     return [sortDir === "desc" ? desc(issues.id) : asc(issues.id)];
+  }
+  if (sortField === "pick") {
+    return [asc(priorityOrder), asc(issues.createdAt), asc(issues.id)];
   }
   if (sortField === "updated") {
     const activityOrder = sortDir === "asc"
@@ -3875,6 +3942,16 @@ async function listIssueBlockerAttentionMap(
   return attentionMap;
 }
 
+const ISSUE_LIST_EXECUTION_STATE_KEYS = [
+  "status",
+  "currentStageId",
+  "currentStageIndex",
+  "currentStageType",
+  "currentParticipant",
+  "returnAssignee",
+  "lastDecisionOutcome",
+] as const satisfies readonly (keyof IssueExecutionState)[];
+
 const issueListSelect = {
   id: issues.id,
   companyId: issues.companyId,
@@ -3918,8 +3995,24 @@ const issueListSelect = {
   requestDepth: issues.requestDepth,
   billingCode: issues.billingCode,
   assigneeAdapterOverrides: issues.assigneeAdapterOverrides,
-  executionPolicy: sql<null>`null`,
-  executionState: sql<null>`null`,
+  // BLO-44407: these were literal `null` — present, type-correct, and unconditionally wrong — so
+  // every list-surface wake-path predicate read "no review stage, no pinned participant" on every
+  // row in the estate, scoring rows with a live reviewer as strands. Never project a forged null.
+  //
+  // `executionPolicy` is deliberately ABSENT from list rows (not null): it is unbounded, and
+  // `PATCH /issues/:id` replaces it whole, so a trimmed copy would be a lost-update trap for
+  // anyone who reads it here and writes it back (BLO-40082). Read the single-issue surface.
+  //
+  // `executionState` is server-owned, so it CAN be trimmed: only the keys below are copied, and
+  // only when present. The multi-KB `reviewRequest`, `completedStageIds`, `lastDecisionId` and
+  // `monitor` (mirrored by the monitor_* columns) are ABSENT, never null. ~150 B/row populated.
+  executionState: sql<Pick<IssueExecutionState, (typeof ISSUE_LIST_EXECUTION_STATE_KEYS)[number]> | null>`CASE
+    WHEN ${issues.executionState} IS NULL THEN NULL
+    ELSE coalesce((
+      SELECT jsonb_object_agg(key, value) FROM jsonb_each(${issues.executionState})
+      WHERE key IN (${sql.join(ISSUE_LIST_EXECUTION_STATE_KEYS.map((key) => sql`${key}`), sql`, `)})
+    ), '{}'::jsonb)
+  END`,
   monitorNextCheckAt: issues.monitorNextCheckAt,
   monitorWakeRequestedAt: issues.monitorWakeRequestedAt,
   monitorLastTriggeredAt: issues.monitorLastTriggeredAt,
@@ -8177,7 +8270,8 @@ export function issueService(db: Db) {
         ? (limit === undefined ? baseQuery.offset(offset) : baseQuery.limit(limit).offset(offset))
         : (limit === undefined ? baseQuery : baseQuery.limit(limit));
       const rows = await pageQuery;
-      const withLabels = await withIssueLabels(db, rows);
+      // BLO-44407: list rows carry no `executionPolicy` key at runtime (see issueListSelect).
+      const withLabels = await withIssueLabels(db, rows as IssueRow[]);
       // Both derived maps are built from the already-paginated page, so this
       // stays additive to the row shape and neutral to `limit`/`offset`.
       const [runMap, retryMap] = await Promise.all([
@@ -10137,7 +10231,7 @@ export function issueService(db: Db) {
         trustExplicitResponsibleUserId,
         idempotencyKey: rawIdempotencyKey,
         allowDuplicate,
-        prReviewTarget,
+        prReviewTarget: explicitPrReviewTarget,
         onDeduplicated,
         beforeSideEffects,
         fencingPrecondition,
@@ -10150,6 +10244,7 @@ export function issueService(db: Db) {
       // so there are no mixed-case rows to stay compatible with — unlike the
       // live `pr_review:` task keys, whose producers are still mid-rollout and
       // are matched through `matchesAnyTaskKey`'s dual-read predicate instead.
+      const prReviewTarget = explicitPrReviewTarget ?? inferPrReviewTargetFromCanonicalTitle(issueData);
       const prReviewFingerprint = prReviewTarget
         ? `pr_review:${normalizePrReviewRepoFullName(prReviewTarget.repoFullName)}:${prReviewTarget.prNumber}`
         : null;
@@ -10635,6 +10730,23 @@ export function issueService(db: Db) {
         const values = {
           ...issueData,
           responsibleUserId,
+          // BLO-43103: last writer wins over `...issueData`, so an explicit
+          // assignee is echoed back unchanged and only a create with neither
+          // column set is defaulted.
+          ...(await resolveCreateIssueAssignee({
+            assigneeAgentId: issueData.assigneeAgentId,
+            assigneeUserId: issueData.assigneeUserId,
+            createdByAgentId: issueData.createdByAgentId,
+            responsibleUserId,
+            originKind: issueData.originKind,
+          }, async () => {
+            const [company] = await tx
+              .select({ defaultResponsibleUserId: companies.defaultResponsibleUserId })
+              .from(companies)
+              .where(eq(companies.id, companyId))
+              .limit(1);
+            return company?.defaultResponsibleUserId ?? null;
+          })),
           requestDepth: clampIssueRequestDepth(issueData.requestDepth),
           originKind: issueData.originKind ?? "manual",
           goalId: resolveIssueGoalId({
@@ -11938,6 +12050,46 @@ export function issueService(db: Db) {
         return enriched;
       }),
 
+    /**
+     * BLO-29597 — the recorded decision on claiming a `blocked` row, because it
+     * was previously implicit in the `expectedStatuses` examples and the obvious
+     * reading of those examples is wrong.
+     *
+     * `blocked` in `expectedStatuses` does NOT mean checkout will claim a
+     * blocked issue. {@link withLockedIssueCheckoutExecution} refuses any issue
+     * with a live blocker edge outright — `422 Issue is blocked by unresolved
+     * blockers` — under the blocker-relation lock, status-independently, before
+     * any promotion. So the two populations BLO-29597 calls indistinguishable
+     * are in fact already separated here, by the same
+     * `listIssueDependencyReadinessMap` the stranded-blocked reconciler uses:
+     *
+     *   - genuinely blocked (an edge that can still reach `done`) -> refused.
+     *     Work that cannot proceed never starts, and the row keeps the
+     *     `blockers_resolved` wake that will actually move it.
+     *   - stranded blocked (zero unresolved blockers) -> admitted. This is the
+     *     deliberate half: an agent picking the row up is one of the two things
+     *     that can repair it, and refusing here would lock out the actor while
+     *     leaving the strand in place.
+     *
+     * The consequence is sharper than "checkout may claim blocked rows": EVERY
+     * `blocked` row checkout can ever claim is, by construction, a stranded one.
+     * While the run holds it the row reads `in_progress`, so it is invisible to
+     * the reconciler's `status = 'blocked'` predicate — which is the BLO-29597
+     * defect, and also why a `status = 'blocked'` census is a floor rather than
+     * a count. A census wanting the count must union in `status = 'in_progress'
+     * AND checkout_restore_status = 'blocked'`, and every row that union adds
+     * was a strand when claimed (a row given a real edge mid-run is genuinely
+     * blocked until its restore runs, so the union is an upper bound on live
+     * strands).
+     *
+     * The ratchet itself is closed on the way OUT, not the way in:
+     * `checkoutRestoreTargetStatus` in `issue-checkout-status.ts` recomputes readiness from the live
+     * edges when the promotion is undone, so a no-progress round trip cannot
+     * hand the row back in the stranded shape it was found in — and an edge
+     * filed DURING the run (the one way a claimed row becomes genuinely blocked)
+     * is honoured, because the recomputation reads the edges at restore time
+     * rather than replaying the marker.
+     */
     checkout: async (
       id: string,
       agentId: string,
@@ -12838,6 +12990,18 @@ export function issueService(db: Db) {
             executionRunId: null,
             executionAgentNameKey: null,
             executionLockedAt: null,
+            // BLO-29597: this branch writes the terminal status itself, so the
+            // promotion is already undone and the marker describes a checkout
+            // that no longer exists. Leaving it set is inert for the restore
+            // path — `restorableCheckoutPromotion` requires `in_progress`, which
+            // this write just left — but it leaves `todo` rows carrying
+            // `checkout_restore_status = 'blocked'`, and the stranded-blocked
+            // census keys on exactly that column. Clear it here so the column
+            // means "a live checkout promoted this row from X" and nothing else.
+            // The lock-only relinquish branch above deliberately does NOT clear
+            // it: that row keeps its status, so its promotion is still pending a
+            // restore.
+            checkoutRestoreStatus: null,
             updatedAt: new Date(),
             // BLO-28900: release strips BOTH monitor-eligibility conditions
             // (status leaves `in_progress`, the agent assignee is dropped), so a

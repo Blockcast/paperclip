@@ -246,7 +246,14 @@ describe("destroyLeaseResources", () => {
   function makeClients() {
     return {
       custom: { deleteNamespacedCustomObject: vi.fn().mockResolvedValue({}) },
-      batch: { deleteNamespacedJob: vi.fn().mockResolvedValue({}) },
+      batch: {
+        // BLO-27156: deleteJob reads before deleting so it can precondition on
+        // the uid and refuse a Job that is not plugin-managed.
+        readNamespacedJob: vi.fn().mockResolvedValue({
+          metadata: { uid: "job-uid-1", labels: { "paperclip.io/managed-by": "paperclip-k8s-plugin" } },
+        }),
+        deleteNamespacedJob: vi.fn().mockResolvedValue({}),
+      },
       core: {
         deleteNamespacedPod: vi.fn().mockResolvedValue({}),
         deleteNamespacedSecret: vi.fn().mockResolvedValue({}),
@@ -295,6 +302,7 @@ describe("destroyLeaseResources", () => {
       namespace: "ns",
       name: "pc-job",
       propagationPolicy: "Foreground",
+      body: { preconditions: { uid: "job-uid-1" } },
     });
     expect(clients.custom.deleteNamespacedCustomObject).not.toHaveBeenCalled();
     expect(clients.core.deleteNamespacedPod).not.toHaveBeenCalled();

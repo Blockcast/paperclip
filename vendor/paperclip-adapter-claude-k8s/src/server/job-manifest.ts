@@ -293,11 +293,25 @@ function warnIfPersistentTreeIsOffVolume(
  * Returns a minimal set: any target that is a descendant of another target is
  * dropped, since the ancestor's mount already makes it writable.
  */
+/** The agent dir owning a canonical instructions file: the grandparent of a
+ *  managed `.../agents/<agentId>/instructions/<file>`, else the file's own dir.
+ *  "" for unset, or for a dir that is the data root (never re-open the volume). */
+function agentBundleRoot(file: string | null, dataMountPath: string): string {
+  if (!file) return "";
+  const dir = path.posix.dirname(file);
+  const root = path.posix.basename(dir) === "instructions" ? path.posix.dirname(dir) : dir;
+  return root === dataMountPath || root === "/" ? "" : root;
+}
+
 export function resolveScopedWritableMounts(input: {
   dataMountPath: string;
   isolation: JobIsolation;
   podLogPath: string;
   instructionsFilePath: string | null;
+  /** The raw `config.instructionsFilePath` — the agent's canonical bundle on the
+   *  PVC. When a prompt bundle is present `instructionsFilePath` is the
+   *  prompt-cache copy instead, so the canonical bundle needs its own entry. */
+  agentInstructionsFilePath?: string | null;
   addDir: string | null;
   companyId: string;
   /** Pod path of the company-scoped managed Claude Code runtime root, or "" when
@@ -337,6 +351,12 @@ export function resolveScopedWritableMounts(input: {
     // managed` makes that directory the canonical store of the agent's charter,
     // which agents edit. Only FOREIGN bundles become unreachable.
     ["instructionsFilePath", instructionsFilePath ? path.posix.dirname(instructionsFilePath) : ""],
+    // ...and the canonical bundle itself. With a prompt bundle the entry above
+    // is the prompt-cache copy, so without this the agent's own charter and its
+    // `memory/` tree sat under the read-only parent (EROFS on every self-edit).
+    // Managed bundles live at `agents/<agentId>/instructions/`; open the whole
+    // agent dir so `memory/` is covered too.
+    ["agentInstructionsFilePath", agentBundleRoot(input.agentInstructionsFilePath ?? null, dataMountPath)],
     ["promptBundle.addDir", addDir ?? ""],
     // The managed Claude Code runtime installs itself at Job start (runtime-pin.ts).
     // Like the pnpm store it is a sibling of the isolation root, so nothing above
@@ -2764,6 +2784,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
         isolation,
         podLogPath: containerLogPath,
         instructionsFilePath: effectiveInstructionsFilePath,
+        agentInstructionsFilePath: rawInstructionsFilePath || null,
         addDir: promptBundle?.addDir ?? null,
         companyId: logPathCompanyId,
         claudeCodeRuntimeRoot: claudeCodeVersion ? claudeCodeRuntimeRoot(dataMountPath, logPathCompanyId) : "",

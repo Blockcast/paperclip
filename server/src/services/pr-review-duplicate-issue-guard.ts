@@ -308,6 +308,30 @@ export function parsePullRequestRefs(...texts: Array<string | null | undefined>)
   return parsePullRequestRefsWithCasing(false, ...texts);
 }
 
+/**
+ * BLO-44562: hand-filed reviewer rows ("Review <repo> PR #N exact head <sha>")
+ * arrive without `prReviewTarget`, so they are stamped `originKind: manual`,
+ * never dedupe into the PR's `pr_review` row, and are left pinned to a dead
+ * head when the PR moves. Infer the target only for that canonical title, on a
+ * configured reviewer, when the text names exactly one PR URL with the title's
+ * number — narrow on purpose, because a dedupe hit rewrites the existing row's
+ * title and description.
+ */
+const CANONICAL_REVIEW_TITLE_PATTERN = /^Review \S+ PR #(\d+) exact head [0-9a-f]{7,40}\b/;
+
+export function inferPrReviewTargetFromCanonicalTitle(
+  candidate: Pick<DuplicatePrReviewIssueCandidate, "assigneeAgentId" | "title" | "description">,
+  options: DuplicatePrReviewIssueOptions = {},
+): PullRequestRef | null {
+  const match = CANONICAL_REVIEW_TITLE_PATTERN.exec(candidate.title ?? "");
+  if (!match || !candidate.assigneeAgentId) return null;
+  if (!configuredPrReviewerAgentIds(options.reviewerAgentIds).includes(candidate.assigneeAgentId)) return null;
+  if (declaresNotAReviewRequest({ companyId: "", ...candidate })) return null;
+  const refs = parsePullRequestRefsWithCasing(true, candidate.title, candidate.description);
+  if (refs.length !== 1 || refs[0]!.prNumber !== Number(match[1])) return null;
+  return refs[0]!;
+}
+
 function configuredPrReviewerAgentIds(override?: readonly string[]): string[] {
   const raw = override ?? readGithubPrReviewerAgentIds();
   return [...new Set(raw.map((agentId) => agentId.trim()).filter(Boolean))];

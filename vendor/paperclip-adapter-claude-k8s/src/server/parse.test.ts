@@ -43,6 +43,94 @@ describe("parseClaudeStreamJson", () => {
     expect(result.model).toBe("claude-opus-4-6");
   });
 
+  it("records every declared MCP server with the status the CLI reached (BLO-43344)", () => {
+    const stdout = JSON.stringify({
+      type: "system",
+      subtype: "init",
+      session_id: "sess_mcp",
+      model: "claude-opus-4-6",
+      mcp_servers: [
+        { name: "gbrain", status: "connected", source: "dynamic" },
+        { name: "k8s-ro", status: "pending", source: "dynamic" },
+        { name: "linear", status: "failed", source: "dynamic" },
+        { status: "connected" },
+      ],
+    });
+    const result = parseClaudeStreamJson(stdout);
+    // A server that never connects is reported, not omitted — that is the only
+    // signal distinguishing it from one that was never declared.
+    expect(result.mcpServers).toEqual([
+      { name: "gbrain", status: "connected" },
+      { name: "k8s-ro", status: "pending" },
+      { name: "linear", status: "failed" },
+    ]);
+  });
+
+  it("reports no MCP servers when the init event carries none", () => {
+    const stdout = JSON.stringify({
+      type: "system",
+      subtype: "init",
+      session_id: "sess_nomcp",
+      model: "claude-opus-4-6",
+    });
+    // Absent must stay absent: a CLI that does not report mcp_servers must not
+    // read as "every server failed".
+    expect(parseClaudeStreamJson(stdout).mcpServers).toEqual([]);
+  });
+
+  it("lets a resumed session's init replace the earlier MCP statuses (BLO-43344)", () => {
+    const stdout = [
+      JSON.stringify({
+        type: "system",
+        subtype: "init",
+        session_id: "sess_resume",
+        model: "claude-opus-4-6",
+        mcp_servers: [
+          { name: "gbrain", status: "failed" },
+          { name: "k8s-ro", status: "connected" },
+        ],
+      }),
+      JSON.stringify({
+        type: "system",
+        subtype: "init",
+        session_id: "sess_resume",
+        model: "claude-opus-4-6",
+        mcp_servers: [{ name: "gbrain", status: "connected" }],
+      }),
+    ].join("\n");
+    // Replace, not append: the resumed session's statuses supersede the first
+    // init's. Appending would report `gbrain` twice with contradictory statuses
+    // and keep `k8s-ro` alive after the CLI stopped declaring it.
+    expect(parseClaudeStreamJson(stdout).mcpServers).toEqual([
+      { name: "gbrain", status: "connected" },
+    ]);
+  });
+
+  it("keeps the earlier MCP list when a later init carries no mcp_servers (BLO-43344)", () => {
+    const stdout = [
+      JSON.stringify({
+        type: "system",
+        subtype: "init",
+        session_id: "sess_resume_nomcp",
+        model: "claude-opus-4-6",
+        mcp_servers: [{ name: "gbrain", status: "failed" }],
+      }),
+      JSON.stringify({
+        type: "system",
+        subtype: "init",
+        session_id: "sess_resume_nomcp",
+        model: "claude-opus-4-6",
+      }),
+    ].join("\n");
+    // The `Array.isArray` guard at parse.ts:50 is what makes "replace" mean
+    // replace-when-reported rather than erase-when-silent. Dropping the guard,
+    // or moving the assignment outside it, clears the list here and the dead
+    // `gbrain` goes unreported again — the exact regression BLO-43344 is about.
+    expect(parseClaudeStreamJson(stdout).mcpServers).toEqual([
+      { name: "gbrain", status: "failed" },
+    ]);
+  });
+
   it("parses assistant text blocks", () => {
     const lines = [
       JSON.stringify({

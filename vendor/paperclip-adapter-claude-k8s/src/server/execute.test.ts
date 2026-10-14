@@ -131,6 +131,9 @@ const {
   shouldAbortForCancellation,
   selectJobOwnedPod,
   teardownCancelledJob,
+  waitForJobCompletion,
+  describeFiredTimeoutBound,
+  buildTimeoutExecutionResult,
   execute,
 } = await import("./execute.js");
 
@@ -1217,6 +1220,48 @@ describe("execute: concurrency guard", () => {
       isolationMode: "shared",
       isolationKey: "agent-sharedagent-abc",
       taskKey: "task-conflict",
+    });
+  });
+
+  // The one reason `ClaudeK8sConcurrentRunBlockedRate` actually alerts on
+  // (BLO-4296 AC2). It needs a live Job that carries valid isolation metadata
+  // but NO run-id label, so `classifyConcurrentBlock` falls past the
+  // shared-mode and unknown-isolation arms to the null `conflictingRunId`.
+  // The neighbouring unlabeled-Job test takes the unknown-isolation arm
+  // instead, so without this case the alerting branch has no adapter-level
+  // assertion that it emits the reason the rule matches on.
+  it("reports a true orphan as live_job_for_unknown_run when the live Job has isolation labels but no run-id", async () => {
+    const orphan = makeJob({
+      agentId: "agent-abc",
+      taskId: "task-conflict",
+      sessionId: "session-conflict",
+      isolationMode: "workspace",
+      isolationKey: "orphan-key",
+    });
+    mockBatchListJobs.mockResolvedValue({ items: [orphan] });
+    const fetchMock = vi.fn().mockImplementation(async (_url: string, init?: RequestInit) => {
+      if (init?.method === "POST") return { ok: true, status: 202 };
+      throw new Error("run-table lookup must not run for a Job with no run-id label");
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await execute(makeCtx({
+      authToken: "run-token",
+      runtime: makeIsolatedRuntime("current-key"),
+    }));
+
+    expect(result.errorCode).toBe("k8s_orphan_task_unknown");
+    const reportCall = fetchMock.mock.calls.find(([url, init]) =>
+      String(url).endsWith("/api/metrics/claude-k8s/concurrent-run-blocked")
+      && (init as RequestInit | undefined)?.method === "POST"
+    );
+    expect(reportCall).toBeDefined();
+    expect(JSON.parse((reportCall![1] as RequestInit).body as string)).toMatchObject({
+      reason: "live_job_for_unknown_run",
+      isolationMode: "workspace",
+      isolationKey: "orphan-key",
+      taskKey: "task-conflict",
+      sessionId: "session-conflict",
     });
   });
 
@@ -4114,5 +4159,260 @@ describe("cleanupJob pod-log reaping", () => {
       "stderr",
       expect.stringContaining("failed to remove pod log"),
     );
+  });
+});
+
+
+// PEN-4023 / PEN-4016. Every agent Job in production carries
+// `spec.activeDeadlineSeconds: 7200` written by something outside this
+// adapter, while `config.timeoutSec` is 0 — so the adapter logs
+// `(deadline: none)`, Kubernetes kills the Job at two hours, and the run used
+// to be reported as `Timed out after 0s`. Eleven runs across two agents were
+// lost that way, eight of them in a 105-second window at 7248–7305 s, and the
+// signature was unreadable because the number that fired was written nowhere.
+describe("waitForJobCompletion: reports the bound that fired (PEN-4023)", () => {
+  const DEADLINE_EXCEEDED_JOB = {
+    spec: { activeDeadlineSeconds: 7200 },
+    status: {
+      conditions: [{
+        type: "Failed",
+        status: "True",
+        reason: "DeadlineExceeded",
+        // The real kubelet message. Note it carries no number — which is why
+        // the bound has to come off `spec`, not off the condition text.
+        message: "Job was active longer than specified deadline",
+      }],
+    },
+  };
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+  });
+
+  it("reads the Job's own activeDeadlineSeconds, not any configured value", async () => {
+    mockBatchReadJob.mockResolvedValue(DEADLINE_EXCEEDED_JOB);
+
+    // timeoutMs 0 is the production shape: `timeoutSec: 0` makes the adapter's
+    // own poll loop unbounded, so the only bound in play is the Job's.
+    const result = await waitForJobCompletion("paperclip", "ac-job", 0);
+
+    expect(result).toEqual({
+      succeeded: false,
+      timedOut: true,
+      timeoutBound: { source: "job_deadline", seconds: 7200 },
+    });
+  });
+
+  it("reports an unreadable deadline as unknown rather than as zero", async () => {
+    // A Job killed for exceeding a deadline whose value we cannot read. Null
+    // must stay distinguishable from 0 — collapsing them is the defect.
+    mockBatchReadJob.mockResolvedValue({
+      spec: {},
+      status: { conditions: [{ type: "Failed", status: "True", reason: "DeadlineExceeded" }] },
+    });
+
+    const result = await waitForJobCompletion("paperclip", "ac-job", 0);
+
+    expect(result.timedOut).toBe(true);
+    expect(result.timeoutBound).toEqual({ source: "job_deadline", seconds: null });
+  });
+
+  it("does not claim a timeout for a Job that failed for any other reason", async () => {
+    mockBatchReadJob.mockResolvedValue({
+      spec: { activeDeadlineSeconds: 7200 },
+      status: {
+        conditions: [{ type: "Failed", status: "True", reason: "BackoffLimitExceeded" }],
+      },
+    });
+
+    const result = await waitForJobCompletion("paperclip", "ac-job", 0);
+
+    // A deadline on the spec is not evidence it fired.
+    expect(result).toEqual({ succeeded: false, timedOut: false });
+  });
+
+  it("names its own wait budget when the poll loop runs out instead", async () => {
+    // Distinct from the Job deadline and from `timeoutSec`: this bound is
+    // `(timeoutSec + graceSec)`, and mislabelling it `config` is the same
+    // class of error as reporting the configured value for a Job kill.
+    mockBatchReadJob.mockResolvedValue({ spec: {}, status: { conditions: [] } });
+
+    const result = await waitForJobCompletion("paperclip", "ac-job", 1);
+
+    expect(result.timedOut).toBe(true);
+    expect(result.timeoutBound).toEqual({ source: "adapter_completion_wait", seconds: 0 });
+  });
+
+  it("distinguishes the bounded state re-check from the ordinary completion wait", async () => {
+    mockBatchReadJob.mockResolvedValue({ spec: {}, status: { conditions: [] } });
+
+    const result = await waitForJobCompletion(
+      "paperclip", "ac-job", 1, undefined, undefined, "adapter_state_recheck",
+    );
+
+    expect(result.timeoutBound).toEqual({ source: "adapter_state_recheck", seconds: 0 });
+  });
+
+  it("reports no bound at all on a clean completion", async () => {
+    mockBatchReadJob.mockResolvedValue({
+      spec: { activeDeadlineSeconds: 7200 },
+      status: { conditions: [{ type: "Complete", status: "True" }] },
+    });
+
+    const result = await waitForJobCompletion("paperclip", "ac-job", 0);
+
+    expect(result).toEqual({ succeeded: true, timedOut: false });
+  });
+
+  // The two halves composed. Each is individually plausible in isolation —
+  // the wait returns a correct bound, and the formatter renders whatever it is
+  // handed — so pin them together, end to end, on the exact production shape.
+  it("renders the observed deadline, never the configured zero", async () => {
+    mockBatchReadJob.mockResolvedValue(DEADLINE_EXCEEDED_JOB);
+
+    const { timeoutBound } = await waitForJobCompletion("paperclip", "ac-job", 0);
+    const fired = describeFiredTimeoutBound(timeoutBound ?? null, /* configuredTimeoutSec */ 0);
+
+    expect(fired.message).toBe("Timed out after 7200s (Job activeDeadlineSeconds; adapter timeoutSec=0)");
+    expect(fired.seconds).toBe(7200);
+    expect(fired.source).toBe("job_deadline");
+  });
+});
+
+describe("describeFiredTimeoutBound (PEN-4023)", () => {
+  it("names the disagreement when the Job's bound is not the configured one", () => {
+    // Saying both is the point: `Timed out after 7200s` alone would read as
+    // "something configured 7200", and the finding is that nothing did.
+    expect(describeFiredTimeoutBound({ source: "job_deadline", seconds: 7200 }, 0).message).toBe(
+      "Timed out after 7200s (Job activeDeadlineSeconds; adapter timeoutSec=0)",
+    );
+  });
+
+  it("omits the comparison when the Job's bound is the configured one", () => {
+    expect(describeFiredTimeoutBound({ source: "job_deadline", seconds: 900 }, 900).message).toBe(
+      "Timed out after 900s (Job activeDeadlineSeconds)",
+    );
+  });
+
+  it("falls back to the configured bound only when nothing was observed", () => {
+    expect(describeFiredTimeoutBound(null, 45)).toEqual({
+      message: "Timed out after 45s (adapter timeoutSec)",
+      seconds: 45,
+      source: "config",
+    });
+  });
+
+  it("says it does not know, rather than saying zero", () => {
+    expect(describeFiredTimeoutBound(null, 0)).toEqual({
+      message:
+        "Timed out, but no bound could be identified: the adapter configured none " +
+        "(timeoutSec=0) and no Job deadline was observed",
+      seconds: null,
+      source: "unknown",
+    });
+
+    expect(describeFiredTimeoutBound({ source: "job_deadline", seconds: null }, 0)).toEqual({
+      message:
+        "Timed out: Job activeDeadlineSeconds fired but did not report a usable bound " +
+        "(adapter timeoutSec=0)",
+      seconds: null,
+      source: "job_deadline",
+    });
+
+    // Zero is not a bound either: nothing fires after zero seconds, so a
+    // literal 0 is declined rather than rendered as `Timed out after 0s`.
+    expect(describeFiredTimeoutBound({ source: "adapter_completion_wait", seconds: 0 }, 0).seconds).toBeNull();
+  });
+
+  // THE REGRESSION PIN for the adapter half. `Timed out after 0s` is the exact
+  // string that made a 2-hour fleet-wide kill look like a rendering glitch;
+  // assert it is unproducible across every input, rather than asserting the
+  // happy path alone.
+  it("can never produce \"Timed out after 0s\"", () => {
+    const bounds = [
+      null,
+      { source: "job_deadline" as const, seconds: null },
+      { source: "job_deadline" as const, seconds: 0 },
+      { source: "job_deadline" as const, seconds: 7200 },
+      { source: "adapter_completion_wait" as const, seconds: null },
+      { source: "adapter_completion_wait" as const, seconds: 0 },
+      { source: "adapter_completion_wait" as const, seconds: 615 },
+      { source: "adapter_state_recheck" as const, seconds: 60 },
+    ];
+
+    for (const bound of bounds) {
+      for (const configuredTimeoutSec of [0, 45, 900, 7200]) {
+        const { message, seconds, source } = describeFiredTimeoutBound(bound, configuredTimeoutSec);
+        const context = JSON.stringify({ bound, configuredTimeoutSec });
+
+        // The bare string, in the shape the incident produced it.
+        expect(message, context).not.toContain("Timed out after 0s");
+
+        // A `0` may legitimately appear as `timeoutSec=0`, which is the
+        // diagnostic. What must never happen is reporting the configured
+        // value as the bound that fired while an observed one exists.
+        if (bound?.seconds != null && bound.seconds > 0) {
+          expect(message, context).toContain(`Timed out after ${bound.seconds}s`);
+          expect(seconds, context).toBe(bound.seconds);
+          expect(source, context).toBe(bound.source);
+        }
+
+        // Every outcome either names a positive number or says plainly that
+        // it cannot. There is no third state that renders an unusable value.
+        if (seconds == null) {
+          expect(message.toLowerCase(), context).toMatch(
+            /did not report a usable bound|no bound could be identified/,
+          );
+        } else {
+          expect(seconds, context).toBeGreaterThan(0);
+        }
+      }
+    }
+  });
+});
+
+describe("execute: timeout result construction (PEN-4023)", () => {
+  it("builds the whole result from the observed bound, config untouched", () => {
+    // The production shape: configured 0, Job deadline 7200.
+    expect(buildTimeoutExecutionResult(null, { source: "job_deadline", seconds: 7200 }, 0)).toEqual({
+      exitCode: null,
+      signal: null,
+      timedOut: true,
+      errorCode: "timeout",
+      errorMessage: "Timed out after 7200s (Job activeDeadlineSeconds; adapter timeoutSec=0)",
+      resultJson: {
+        observedTimeoutSec: 7200,
+        observedTimeoutSource: "job_deadline",
+        // Kept beside the observed value rather than instead of it: the
+        // disagreement is the diagnostic, so the record carries both.
+        configuredTimeoutSec: 0,
+      },
+    });
+  });
+
+  it("still records a greppable provenance when no bound could be named", () => {
+    expect(buildTimeoutExecutionResult(137, null, 0).resultJson).toEqual({
+      observedTimeoutSec: null,
+      observedTimeoutSource: "unknown",
+      configuredTimeoutSec: 0,
+    });
+  });
+
+  // STATIC PIN for the single statement no behavioural test in this suite can
+  // reach: `execute()` cannot be driven to its timeout return without a
+  // running-pod and log-tail fixture that does not exist here. Without this,
+  // reverting that one line restores `Timed out after 0s` with a fully green
+  // suite — measured, not assumed. Same idiom as the stdout-accumulator pin
+  // above.
+  it("routes execute()'s timeout return through the builder", async () => {
+    const source = await readFile(new URL("./execute.ts", import.meta.url), "utf-8");
+
+    expect(source).toMatch(
+      /if \(jobTimedOut\) \{\s*\n\s*return buildTimeoutExecutionResult\(exitCode, jobTimeoutBound, timeoutSec\);\s*\n\s*\}/,
+    );
+
+    // And the defective formatting is gone from the file entirely, not merely
+    // bypassed at this one call site.
+    expect(source).not.toMatch(/Timed out after \$\{timeoutSec\}s/);
   });
 });

@@ -9,6 +9,7 @@ import {
   getAgentWorkEligibility,
   type IssueGraphLivenessAutoRecoveryPreview,
   type IssueGraphLivenessAutoRecoveryPreviewItem,
+  type IssueRecoveryAction,
   type IssueRecoveryActionKind,
   type IssueStatus,
 } from "@paperclipai/shared";
@@ -151,6 +152,11 @@ import {
 import { createPassTimer, type PassTimer } from "./pass-timing.js";
 import { type AgentRosterMemo, createAgentRosterMemo } from "./agent-roster-memo.js";
 import {
+  createStrandedAttendancePrefetch,
+  type IssueAttendanceEvidence,
+  type StrandedAttendanceWindow,
+} from "./stranded-attendance-prefetch.js";
+import {
   resolveStrandedEscalationStatus,
   shouldReuseStrandedRecoveryAction,
 } from "./stranded-escalation-status.js";
@@ -199,6 +205,14 @@ class ProviderQuotaMonitorRollback extends Error {
 
 const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["interrupted", "failed", "cancelled", "timed_out"] as const;
+/**
+ * Heartbeat-run statuses meaning "this run has not finished and is still going to run".
+ *
+ * Deliberately a POSITIVE list rather than the complement of the terminal set: a status
+ * added upstream would silently read as pending through a `notInArray` test, and the
+ * consumer below turns "pending" into "this wake was delivered" (PEN-3983).
+ */
+const PENDING_HEARTBEAT_RUN_STATUSES = ["queued", "scheduled_retry", "running"] as const;
 export const ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS = 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 4 * 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = 30 * 60 * 1000;
@@ -2351,13 +2365,15 @@ export function recoveryService(
       blockedByIssueIds: string[];
     }) => Promise<void> | void;
     /**
-     * Test-only clock for the sweep's two per-pass memos (PEN-3636), threaded into the
-     * `now` seam both factories already expose. Production leaves this unset and both
-     * take `Date.now`.
+     * Test-only clock for the sweep's three per-pass caches (PEN-3636): the pause-hold
+     * prefilter and the agent-roster memo, both keyed by COMPANY and so true memos, plus
+     * the attendance prefetch, keyed by ISSUE and so a forward window over the candidate
+     * list rather than a memo. Threaded into the `now` seam each factory already exposes.
+     * Production leaves this unset and all three take `Date.now`.
      *
      * ⚠️ Why this exists: the call-site tests assert `liveReads === 1`, which is a claim
-     * about WIRING, but against the real clock it is also a claim about SPEED — the
-     * memos' 5 s TTL is wall-clock, so a DB-backed sweep that stalls >5 s between two
+     * about WIRING, but against the real clock it is also a claim about SPEED — their
+     * 5 s TTL is wall-clock, so a DB-backed sweep that stalls >5 s between two
      * candidates re-reads and the assertion goes red for a reason unrelated to what it
      * tests. Embedded Postgres under parallel vitest can do that, and this row's own
      * production figure (~787 ms–1.77 s per candidate) is the same order as the budget.
@@ -2376,6 +2392,35 @@ export function recoveryService(
      * leaves this unset.
      */
     beforeBackstopCandidateLoopForTest?: () => Promise<void> | void;
+    /**
+     * Test-only accessor for the three attendance predicates (PEN-3636), handed out at
+     * construction. Production leaves it unset.
+     *
+     * ⚠️ Why a seam rather than an export: the batched `readStrandedAttendanceWindow`
+     * and the two single-issue predicates it stands in for are deliberately closures in
+     * this file, immediately adjacent to the shared terms they compose — that adjacency
+     * IS the drift control the batch's own doc comment argues for. Hoisting them into a
+     * separate module to make them importable would dissolve the control in order to
+     * test it.
+     *
+     * What it buys: `recovery-stranded-attendance-batch.test.ts` runs the batch and the
+     * single-issue forms against the SAME embedded-Postgres rows and compares verdicts
+     * issue by issue. That is the one control the static call-site guards cannot be —
+     * they prove the two queries are composed from shared terms, never that the two
+     * agree on an answer.
+     */
+    attendancePredicatesForTest?: (predicates: {
+      hasActiveExecutionPath: (
+        companyId: string,
+        issueId: string,
+        agentId?: string | null,
+      ) => Promise<boolean>;
+      hasPendingWakeInteraction: (companyId: string, issueId: string) => Promise<boolean>;
+      readStrandedAttendanceWindow: (
+        companyId: string,
+        issueIds: readonly string[],
+      ) => Promise<StrandedAttendanceWindow>;
+    }) => void;
   },
 ) {
   const issuesSvc = issueService(db);
@@ -2497,6 +2542,55 @@ export function recoveryService(
       .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
       .limit(1)
       .then((rows) => rows[0] ?? null);
+  }
+
+  /**
+   * Is a wake run for this recovery action still on its way?
+   *
+   * PEN-3983. `enqueueWakeup` returning null does NOT mean "no run was queued", though the
+   * refund in `enqueueOrRefundAttempt` used to assume exactly that. The provider-capacity
+   * gate is the exception, and on this fleet it is the DOMINANT null path: it does not
+   * decline a wake, it POSTPONES it — committing a durable `scheduled_retry` run and then
+   * returning null. The gate says so itself (`heartbeat.ts`, BLO-31344): "The capacity gate
+   * does not decline a wake, it *postpones* it: it commits a `scheduled_retry` run and
+   * returns null." That row is later promoted to `queued`, dispatched through the recovery
+   * lane, and executed.
+   *
+   * So the refund's stated premise — every null path "either writes a *skipped* request row
+   * or nothing at all. None of them queues a run" — is false for that one path, and the
+   * consequence was not cosmetic. Measured 2026-10-12 across the 100 most recent recovery
+   * actions: 49 sat at `attemptCount: 0` and ALL 49 carried `nonDeliverySweepCount >= 1`,
+   * i.e. every zero in the population was minted by this refund and none by any other route.
+   * On the four actions PEN-3983 was filed from, all four were refunded to 0 while their wake
+   * runs sat parked on `ccrotate_capacity`; three of those runs then promoted, dispatched and
+   * SUCCEEDED (`9e4ef21c`, `da1039b8`, `a48593dc`, started 10:00-10:26Z) — 2.3-2.7h AFTER the
+   * horizon had retired their actions as wake-exhausted and labelled them `never_delivered`.
+   *
+   * The test is for a run that is still PENDING, not merely for one that exists: a terminal
+   * run says nothing about whether this attempt ever reached anyone, whereas a `queued` /
+   * `scheduled_retry` / `running` row is positive evidence that it did.
+   *
+   * Over-crediting is bounded and is the safe direction. At worst a pending run left by an
+   * earlier attempt keeps one attempt of five spent on a sweep that enqueued nothing itself —
+   * and that is arguably the right reading anyway, since a wake for this action IS in flight.
+   * `timeoutAt` bounds the row on wall-clock regardless of `attemptCount`, so this cannot
+   * reopen the unbounded loop BLO-18996/BLO-19124 closed. Under-crediting is what produced
+   * the incident.
+   */
+  async function hasPendingWakeRunForRecoveryAction(
+    companyId: string,
+    recoveryActionId: string,
+  ): Promise<boolean> {
+    const [row] = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.companyId, companyId),
+        sql`${heartbeatRuns.contextSnapshot} ->> 'recoveryActionId' = ${recoveryActionId}`,
+        inArray(heartbeatRuns.status, [...PENDING_HEARTBEAT_RUN_STATUSES]),
+      ))
+      .limit(1);
+    return Boolean(row);
   }
 
   // BLO-18860: the run that took over `adoptedRun`'s checkout — i.e. the run the
@@ -2815,6 +2909,37 @@ export function recoveryService(
     return { consecutive, latestFinishedAt };
   }
 
+  // PEN-3636: the issue-id expressions and the non-issue, non-agent terms of the three
+  // attendance predicates, factored out so the single-issue forms below and the windowed
+  // batch in `readStrandedAttendanceWindow` cannot drift apart. A batched query that
+  // silently loses a term answers "unattended" for real attendance — the harmful
+  // direction — and no type or test would catch it, so the control has to be structural.
+  // This is the same "by construction" argument `activePauseHoldPredicate` gives the
+  // pause-hold prefilter: a new term lands on both call sites or on neither.
+  //
+  // Functions rather than constants so each query composes a fresh `SQL` node, and so the
+  // JSONB key appears exactly once per predicate in this file.
+  const heartbeatRunIssueIdExpr = () => sql<string>`${heartbeatRuns.contextSnapshot} ->> 'issueId'`;
+  const deferredExecutionWakeIssueIdExpr = () =>
+    sql<string>`${agentWakeupRequests.payload} ->> 'issueId'`;
+  const executionPathRunTerms = (companyId: string) =>
+    and(
+      eq(heartbeatRuns.companyId, companyId),
+      inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
+    );
+  const deferredExecutionWakeTerms = (companyId: string) =>
+    and(
+      eq(agentWakeupRequests.companyId, companyId),
+      eq(agentWakeupRequests.status, "deferred_issue_execution"),
+    );
+  const pendingWakeInteractionTerms = (companyId: string, cutoff: Date) =>
+    and(
+      eq(issueThreadInteractions.companyId, companyId),
+      eq(issueThreadInteractions.status, "pending"),
+      inArray(issueThreadInteractions.continuationPolicy, ["wake_assignee", "wake_assignee_on_accept"]),
+      gt(issueThreadInteractions.createdAt, cutoff),
+    );
+
   async function hasActiveExecutionPath(companyId: string, issueId: string, agentId?: string | null) {
     const [run, deferredWake] = await Promise.all([
       db
@@ -2822,9 +2947,8 @@ export function recoveryService(
         .from(heartbeatRuns)
         .where(
           and(
-            eq(heartbeatRuns.companyId, companyId),
-            inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
-            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+            executionPathRunTerms(companyId),
+            eq(heartbeatRunIssueIdExpr(), issueId),
             agentId ? eq(heartbeatRuns.agentId, agentId) : sql`true`,
           ),
         )
@@ -2835,9 +2959,8 @@ export function recoveryService(
         .from(agentWakeupRequests)
         .where(
           and(
-            eq(agentWakeupRequests.companyId, companyId),
-            eq(agentWakeupRequests.status, "deferred_issue_execution"),
-            sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
+            deferredExecutionWakeTerms(companyId),
+            eq(deferredExecutionWakeIssueIdExpr(), issueId),
             agentId ? eq(agentWakeupRequests.agentId, agentId) : sql`true`,
           ),
         )
@@ -2943,16 +3066,129 @@ export function recoveryService(
       .from(issueThreadInteractions)
       .where(
         and(
-          eq(issueThreadInteractions.companyId, companyId),
+          pendingWakeInteractionTerms(companyId, new Date(Date.now() - PENDING_INTERACTION_MAX_AGE_MS)),
           eq(issueThreadInteractions.issueId, issueId),
-          eq(issueThreadInteractions.status, "pending"),
-          inArray(issueThreadInteractions.continuationPolicy, ["wake_assignee", "wake_assignee_on_accept"]),
-          gt(issueThreadInteractions.createdAt, new Date(Date.now() - PENDING_INTERACTION_MAX_AGE_MS)),
         ),
       )
       .limit(1)
       .then((rows) => Boolean(rows[0]));
   }
+
+  /**
+   * The two predicates immediately above, asked for a whole window of issues at once.
+   *
+   * PEN-3636. Deliberately adjacent to `hasActiveExecutionPath` and
+   * `hasPendingWakeInteraction`, and composed from the SAME shared terms, so the one
+   * hazard of this change — a batched query drifting away from the single-issue one it
+   * stands in for — is structural rather than something a reviewer has to re-derive.
+   * The only thing that differs below is the issue-id predicate (`IN (...)` instead of
+   * `=` — drizzle's `inArray` emits an expanded `IN` list, not `= ANY`) and the absence
+   * of the agent filter, which is applied in memory instead.
+   *
+   * ⭐ The equivalence is exact, not approximate:
+   *
+   *   - The run and wake halves are unioned per issue, so membership of `agentIds` is
+   *     exactly "(a run by this agent) OR (a deferred wake by this agent)" — the
+   *     agent-scoped form — while `any` is "(any run) OR (any wake)" — the unfiltered
+   *     form the single-issue version expresses as `agentId ? eq(...) : sql`true``.
+   *     Doing the agent filter in memory is what lets ONE window serve both forms.
+   *   - The interaction age cutoff is computed ONCE per window rather than once per
+   *     candidate. The bound is 24 h; a few seconds of drift across one window cannot
+   *     move a row across it.
+   *
+   * ⚠️ No `LIMIT`, and that is deliberate rather than an oversight: the single-issue
+   * forms use `limit(1)` because they answer a boolean about one issue, and a `LIMIT`
+   * here would silently truncate the window and return "unattended" for real
+   * attendance — the harmful direction. The row counts are bounded in practice by the
+   * narrowness of the predicates (three non-terminal run statuses; one wake status;
+   * pending cards inside a 24 h window) over at most one window of issues, all of which
+   * are by construction *stranded* candidates whose runs have already died.
+   *
+   * Both JSONB predicates hit the partial expression indexes on
+   * `(company_id, (context_snapshot ->> 'issueId'))` (migrations 0077 and 0204); the
+   * `IN (...)` widening keeps the same leading column and the same expression, so the
+   * index remains usable.
+   */
+  async function readStrandedAttendanceWindow(
+    companyId: string,
+    issueIds: readonly string[],
+  ): Promise<StrandedAttendanceWindow> {
+    const ids = [...issueIds];
+    if (ids.length === 0) {
+      return { executionPath: new Map(), pendingWakeInteractionIssueIds: new Set() };
+    }
+    const interactionCutoff = new Date(Date.now() - PENDING_INTERACTION_MAX_AGE_MS);
+    const [runRows, deferredWakeRows, interactionRows] = await Promise.all([
+      db
+        .select({ issueId: heartbeatRunIssueIdExpr(), agentId: heartbeatRuns.agentId })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            executionPathRunTerms(companyId),
+            inArray(heartbeatRunIssueIdExpr(), ids),
+          ),
+        ),
+      db
+        .select({
+          issueId: deferredExecutionWakeIssueIdExpr(),
+          agentId: agentWakeupRequests.agentId,
+        })
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            deferredExecutionWakeTerms(companyId),
+            inArray(deferredExecutionWakeIssueIdExpr(), ids),
+          ),
+        ),
+      db
+        .select({ issueId: issueThreadInteractions.issueId })
+        .from(issueThreadInteractions)
+        .where(
+          and(
+            pendingWakeInteractionTerms(companyId, interactionCutoff),
+            inArray(issueThreadInteractions.issueId, ids),
+          ),
+        ),
+    ]);
+
+    const executionPath = new Map<string, IssueAttendanceEvidence & { agentIds: Set<string> }>();
+    const note = (issueId: string | null, agentId: string | null) => {
+      // A row whose JSONB key is absent cannot match any requested id, so it is dropped
+      // rather than recorded under a falsy key — the same rows the single-issue form's
+      // equality would never have returned.
+      if (!issueId) return;
+      let evidence = executionPath.get(issueId);
+      if (!evidence) {
+        evidence = { any: false, agentIds: new Set<string>() };
+        executionPath.set(issueId, evidence);
+      }
+      evidence.any = true;
+      if (agentId) evidence.agentIds.add(agentId);
+    };
+    for (const row of runRows) note(row.issueId, row.agentId);
+    for (const row of deferredWakeRows) note(row.issueId, row.agentId);
+
+    return {
+      executionPath,
+      pendingWakeInteractionIssueIds: new Set(interactionRows.map((row) => row.issueId)),
+    };
+  }
+
+  // Handed out immediately after the three are defined, so a predicate added to this
+  // trio later is in scope here. ⚠️ That adjacency alone does NOT make its absence from
+  // the equivalence test a compile error: the matrix reaches these by destructuring
+  // named fields, and destructuring a subset stays legal TypeScript however wide this
+  // object grows. The enforcement lives in the TEST —
+  // `recovery-stranded-attendance-batch.test.ts` pins the key set with
+  // `satisfies Record<keyof AttendancePredicates, true>`, so a fourth predicate added
+  // here fails `tsc` there until the matrix covers it. Adding one here without a line
+  // there is the silent gap; that literal is what closes it.
+  // Production leaves this unset; see the field's doc.
+  deps.attendancePredicatesForTest?.({
+    hasActiveExecutionPath,
+    hasPendingWakeInteraction,
+    readStrandedAttendanceWindow,
+  });
 
   // PEN-3352: named rather than three adjacent bare `number` positionals. The three
   // graces differ by more than an order of magnitude (6h / 7d / 14d) and a transposition
@@ -6444,6 +6680,11 @@ export function recoveryService(
       // already `escalated`. The mislabel is unrecoverable, which is why it is discriminated
       // at the call site instead of being repaired downstream.
       //
+      // PEN-4013: that invariant holds across all four writers, but only since PEN-4013 —
+      // it was previously true of three. `resolveActiveForIssue` matches `escalated` as
+      // well as `active`, so a manual discharge used to overwrite an already-written bound
+      // with `discharged`. It now coalesces like the rest.
+      //
       // The comparison is `>`, not the backstop's `>=`, because this call site reads a row
       // whose attempt is ALREADY RESERVED (`attemptAlreadyReserved` defaults to true).
       // Using `>=` here would attribute the last legitimate wake to the budget.
@@ -6461,22 +6702,50 @@ export function recoveryService(
         await refundUnspentWakeAttempt("enqueue_not_delivered");
         return;
       }
+      const retiringBound = attemptBudgetReached
+        ? "attempt_budget"
+        : (pendingWake && ceilingReached ? "pending_wake_ceiling" : "timeout_horizon");
       const retireAndRefund = () => recoveryActionsSvc.retireAndReleaseWakeAttempt({
         companyId: input.issue.companyId,
         actionId: input.action.id,
         expectedOwnerAgentId: reservedOwnerAgentId,
         expectedAttemptCount: reservedAttemptCount,
-        retiringBound: attemptBudgetReached
-          ? "attempt_budget"
-          : (pendingWake && ceilingReached
-            ? "pending_wake_ceiling"
-            : "timeout_horizon"),
+        retiringBound,
       });
+      // PEN-3989 (Ally review of #2607): this is the RETURN VALUE of the UPDATE, not "the
+      // call did not throw". `retireAndReleaseWakeAttempt`'s predicate is a CAS on owner +
+      // attempt count; a sweep that re-homes the action between the reserve above and this
+      // call matches zero rows and resolves with no error. Reading the absence of a throw as
+      // proof of retirement announced a retirement that had not happened — see that
+      // function's doc comment for the three consequences.
+      let retirementCommitted = false;
       try {
-        await retireAndRefund();
+        retirementCommitted = await retireAndRefund();
       } catch (firstError) {
         try {
-          await retireAndRefund();
+          retirementCommitted = await retireAndRefund();
+          if (!retirementCommitted) {
+            // The retry is for a transient database blip, and a blip can land AFTER the
+            // commit — the statement succeeded, the client never saw the reply. The retry's
+            // CAS then misses because the first call already decremented `attemptCount`, and
+            // reading that as "nothing happened" would re-introduce exactly the silence this
+            // row exists to end: the row IS retired, and neither the horizon sweep (gated on
+            // `status = 'active'`) nor the backstop (gated on `retiring_bound IS NULL`) can
+            // pick it up afterwards.
+            //
+            // One read disambiguates. It cannot distinguish our own first call from a racer
+            // that retired the row in the same window — but it does not need to: the
+            // pre-state conjunct below still holds, and announcing under a race costs at most
+            // a duplicate counter increment that the marker dedup keeps to one notice. That
+            // is the tolerance this call site already accepts, and it is strictly better than
+            // dropping the only announcement the row will ever get.
+            const confirmed = await recoveryActionsSvc.getActiveForIssue(
+              input.issue.companyId,
+              input.issue.id,
+            );
+            retirementCommitted = confirmed?.id === input.action.id
+              && confirmed.retiringBound === retiringBound;
+          }
         } catch (secondError) {
           logger.warn(
             {
@@ -6489,6 +6758,51 @@ export function recoveryService(
               maxAttempts: input.action.maxAttempts,
             },
             "recovery wake retirement/refund failed after retry",
+          );
+        }
+      }
+      // PEN-3989: the third `timeout_horizon` writer, and it emitted neither observable
+      // either. Same cause as the backstop gate above — see
+      // `announceRecoveryHorizonRetirement`.
+      //
+      // Transition evidence here is TWO conjuncts, because neither is sufficient alone:
+      //
+      //   - `retirementCommitted` — the UPDATE matched a row, so the reservation CAS (owner
+      //     plus attempt count) still held. Without it, a concurrent re-home silently makes
+      //     the statement a no-op and every announcement below is about a row that is still
+      //     `active`. This was the gap Ally found on #2607; see
+      //     `retireAndReleaseWakeAttempt`.
+      //   - `input.action.retiringBound === null` — the PRE-STATE read from moments earlier
+      //     in this same dispatch. Needed because the UPDATE is deliberately idempotent
+      //     (`coalesce` on the bound, a `CASE` on the status) so that a re-run still refunds:
+      //     a matched row does not by itself prove THIS call did the transition.
+      //
+      // A racer landing between the pre-state read and the UPDATE can still make both paths
+      // announce; the marker dedup inside the helper keeps that to one notice, and a
+      // duplicate counter increment is harmless for a `> 0` alert.
+      //
+      // `attemptCount` is adjusted because the refund has already landed: the row we are
+      // describing carries `greatest(attemptCount - 1, 0)`, not the reserved count still held
+      // in `input.action`. Announcing the unrefunded value would report `Attempts: 1` on a row
+      // that reads 0, and — worse — would flip `neverDelivered` to false and label a
+      // never-woken action as `delivered`, which is precisely the mislabel PEN-3000 exists to
+      // prevent.
+      if (retirementCommitted && retiringBound === "timeout_horizon" && input.action.retiringBound === null) {
+        try {
+          await announceRecoveryHorizonRetirement({
+            ...input.action,
+            status: "escalated",
+            retiringBound: "timeout_horizon",
+            attemptCount: Math.max(input.action.attemptCount - 1, 0),
+          }, { retiredBy: "stranded_recovery_wake_dispatch" });
+        } catch (error) {
+          logger.warn(
+            {
+              err: error,
+              actionId: input.action.id,
+              sourceIssueId: input.issue.id,
+            },
+            "failed to announce recovery wake horizon expiry from the stranded wake dispatch",
           );
         }
       }
@@ -6551,6 +6865,33 @@ export function recoveryService(
         throw error;
       }
       if (!queued) {
+        // PEN-3983: a null return means "nobody was woken" for the paths that write a skipped
+        // request row or nothing at all — but NOT for the provider-capacity deferral, which
+        // commits a durable `scheduled_retry` run and returns null anyway. Refunding there
+        // records a wake that is demonstrably still on its way as never delivered, which is
+        // what made `attemptCount: 0` the dominant reading on this fleet. See
+        // `hasPendingWakeRunForRecoveryAction` for the measurement.
+        let wakeIsStillPending = false;
+        try {
+          wakeIsStillPending = await hasPendingWakeRunForRecoveryAction(
+            input.issue.companyId,
+            input.action.id,
+          );
+        } catch (error) {
+          // Fall back to the pre-PEN-3983 behaviour and refund. Over-refunding costs at most
+          // one attempt of five and `timeoutAt` bounds the row either way, whereas throwing
+          // from here would abort an escalation whose status transition has already committed.
+          logger.warn(
+            {
+              err: error,
+              companyId: input.issue.companyId,
+              issueId: input.issue.id,
+              recoveryActionId: input.action.id,
+            },
+            "could not determine whether a recovery wake run is still pending; refunding the attempt",
+          );
+        }
+        if (wakeIsStillPending) return queued;
         await refundUnspentWakeAttempt("enqueue_not_delivered");
         return queued;
       }
@@ -9186,6 +9527,34 @@ export function recoveryService(
       // projection rather than a reading.
       agentRosterMemoLiveReads: 0,
       agentRosterMemoHits: 0,
+      // Issue-scoped attendance windows loaded vs lookups answered from one (PEN-3636).
+      //
+      // ⚠️ NOT in the same unit as the four fields above, and the adjacency invites
+      // reading them the same way. There, one memo hit is one round-trip removed. Here
+      // the unit is a *lookup*, and each candidate makes two of them (execution path,
+      // then wake interaction) against a single window. The honest reading is at the
+      // window level: master issued 3 queries per candidate in 2 serialized steps, so
+      // the round-trips this pass avoided is
+      // `3 * (candidatesScanned - attendancePrefetchLiveReads)`.
+      // `attendancePrefetchHits` is best read as a health signal — it should sit near
+      // `2 * candidatesScanned` on a healthy database, and collapse toward
+      // `candidatesScanned` as windows start expiring on arrival.
+      //
+      // `attendancePrefetchWindowExpiries` separates a window replaced because the loop
+      // walked off its end (intended) from one replaced because its TTL bound (a slow
+      // database). A pass where the second approaches `attendancePrefetchLiveReads` is
+      // reporting latency, not a mis-sized window — and is also the pass on which the
+      // staleness this optimisation trades for is SMALLEST.
+      attendancePrefetchLiveReads: 0,
+      attendancePrefetchHits: 0,
+      attendancePrefetchWindowExpiries: 0,
+      // The only counter that answers whether `windowSize` is sized right:
+      // `attendancePrefetchIdsLoaded / attendancePrefetchLiveReads` is the mean window
+      // actually requested, and comparing it to `candidatesScanned` shows how much of
+      // each window the loop went on to use. A window that is mostly unused is rows
+      // fetched for candidates the pass never reached; one that is always full means the
+      // bound, not the company boundary, is what ended it.
+      attendancePrefetchIdsLoaded: 0,
       issueIds: [] as string[],
     };
     // Resolved once for the whole pass, not once per candidate. See
@@ -9226,6 +9595,17 @@ export function recoveryService(
     // same reason. See `createAgentRosterMemo` for the freshness trade — it is narrower
     // than the prefilter's, because the subject agent's own row is never memoised.
     const agentRosterMemo = createAgentRosterMemo(db, { now: deps.perPassMemoClockForTest });
+    // The third sibling, and the only one keyed by ISSUE rather than by company — so it
+    // is a forward window over the candidate list rather than a memo. It stands in for
+    // the two attendance reads at the top of every candidate — 3 queries in 2 serialized
+    // steps — which the 2026-10-10 phase timing put at 31.9% of a pass together with
+    // `prologue.getLatestIssueRun`. See `stranded-attendance-prefetch.ts` for the
+    // freshness trade and for why a whole-pass pre-pass was rejected.
+    const attendancePrefetch = createStrandedAttendancePrefetch(
+      readStrandedAttendanceWindow,
+      candidates,
+      { now: deps.perPassMemoClockForTest },
+    );
     const reconcileStrandedCandidate = async (issue: (typeof candidates)[number]) => {
       const executionState = issue.status === "in_review"
         ? parseIssueExecutionState(issue.executionState)
@@ -9243,7 +9623,13 @@ export function recoveryService(
         return;
       }
 
-      if (await passTimer.time("prologue.hasActiveExecutionPath", () => hasActiveExecutionPath(
+      // PEN-3636: served from the windowed prefetch, so this phase now measures a map
+      // lookup on most candidates and one bulk load on the rest. ⚠️ Its mean is
+      // therefore NOT comparable to the pre-change mean — the population behind the
+      // phase changed, exactly as `prologue.getLatestIssueRun`'s sample count did when
+      // #2194 inserted an early return above it. Read `attendancePrefetchLiveReads`
+      // against `candidatesScanned` for what the batching actually bought.
+      if (await passTimer.time("prologue.hasActiveExecutionPath", () => attendancePrefetch.hasActiveExecutionPath(
         issue.companyId,
         issue.id,
         issue.status === "in_review" ? agentId : null,
@@ -9252,9 +9638,13 @@ export function recoveryService(
         return;
       }
 
+      // Shares the window the check above loaded, so on a candidate that reached here
+      // this is a map lookup rather than a round-trip — except when the TTL lapses
+      // between the two lookups, which reloads. That exception is the point: it is what
+      // keeps the freshness bound a wall-clock one rather than a per-candidate one.
       if (await passTimer.time(
         "prologue.hasPendingWakeInteraction",
-        () => hasPendingWakeInteraction(issue.companyId, issue.id),
+        () => attendancePrefetch.hasPendingWakeInteraction(issue.companyId, issue.id),
       )) {
         result.skipped += 1;
         return;
@@ -10859,6 +11249,11 @@ export function recoveryService(
     result.pauseHoldPrefilterMemoHits = pauseHoldPrefilterStats.memoHits;
     result.agentRosterMemoLiveReads = agentRosterMemoStats.liveReads;
     result.agentRosterMemoHits = agentRosterMemoStats.memoHits;
+    const attendancePrefetchStats = attendancePrefetch.stats();
+    result.attendancePrefetchLiveReads = attendancePrefetchStats.liveReads;
+    result.attendancePrefetchHits = attendancePrefetchStats.prefetchHits;
+    result.attendancePrefetchWindowExpiries = attendancePrefetchStats.windowExpiries;
+    result.attendancePrefetchIdsLoaded = attendancePrefetchStats.idsLoaded;
     logger.info(
       {
         candidatesScanned: result.candidatesScanned,
@@ -10867,6 +11262,10 @@ export function recoveryService(
         pauseHoldPrefilterMemoHits: result.pauseHoldPrefilterMemoHits,
         agentRosterMemoLiveReads: result.agentRosterMemoLiveReads,
         agentRosterMemoHits: result.agentRosterMemoHits,
+        attendancePrefetchLiveReads: result.attendancePrefetchLiveReads,
+        attendancePrefetchHits: result.attendancePrefetchHits,
+        attendancePrefetchWindowExpiries: result.attendancePrefetchWindowExpiries,
+        attendancePrefetchIdsLoaded: result.attendancePrefetchIdsLoaded,
         skipped: strandedLoopSkipped,
         reconcileErrors: result.reconcileErrors,
       },
@@ -13187,6 +13586,199 @@ export function recoveryService(
   }
 
   /**
+   * PEN-3989: emit the two observables a horizon retirement owes an operator — the PEN-3000
+   * counter and the source-row notice — for ONE action, regardless of which code path
+   * performed the retirement.
+   *
+   * This used to be inlined in `reconcileExpiredRecoveryWakeHorizons`'s per-row loop, which
+   * made it an effect of ONE CALLER rather than of the TRANSITION. `retiring_bound =
+   * 'timeout_horizon'` has three writers, not one:
+   *
+   *   1. `escalateExpiredWakeHorizons`   (this sweep)                      — emitted both
+   *   2. `retireAndReleaseWakeAttempt`   (`enqueueSourceScopedStrandedRecoveryWake`) — emitted neither
+   *   3. `retireWakeAction`              (`strandedRecoveryWakeBackstop`)  — emitted neither
+   *
+   * Writers 2 and 3 take the value from a ternary (`attemptBudgetReached ? "attempt_budget" :
+   * "timeout_horizon"`), so a grep for the contiguous literal `retiringBound:
+   * "timeout_horizon"` returns writer 1 only and reads as proof of single ownership. It is
+   * not. Both sit behind `strandedRecoveryWakeAttemptsExhausted`, which is DISJUNCTIVE — true
+   * on the attempt budget OR on `timeoutAt <= now` — so they fire on exactly the condition
+   * writer 1 exists to handle, and they race it.
+   *
+   * Writer 1 then cannot recover: it selects `status = 'active'` and nothing else, so once
+   * writer 2 or 3 has flipped the row to `escalated` the row is permanently unselectable,
+   * `candidateIds` comes back empty, and the per-row loop below is never entered. The
+   * transition commits; both observables are silently skipped.
+   *
+   * Measured (PEN-3989, 2026-10-12): four `stranded_assigned_issue` actions passed a 6 h
+   * horizon at 07:26:3x–4xZ and were flipped to `escalated` with `retiring_bound =
+   * 'timeout_horizon'` at 07:41:39Z. `paperclip_recovery_horizon_expired_total{delivery=
+   * "never_delivered"}` stayed 0 across four reads on one uninterrupted process, and no
+   * notice reached any source row. Writer 3 did it: writer 1 stamps ONE batch-scoped `now`
+   * across every row of its single UPDATE, and the four `updatedAt` values are distinct
+   * across 746 ms, which only a per-row loop calling `new Date()` can produce. Writer 2 is
+   * excluded because it is reachable only downstream of the dispatch reserve that stamps
+   * `lastAttemptAt: now`, and all four still carried their creation claim.
+   *
+   * Consequence for PEN-3322's alerts, which are the reason this counter exists: they did not
+   * measure "an action was retired at its horizon" but "an action was retired at its horizon
+   * BY WRITER 1", and the backstop reliably gets there first.
+   *
+   * Call this from every site that performs the retirement, gated on that site having
+   * actually transitioned the row (writers 1 and 3 can prove it; see their call sites). The
+   * `alreadyAnnounced` marker check stays the authority on posting at most one notice per
+   * action, so two paths racing the same row cost a duplicate metric increment at worst —
+   * harmless for a `> 0` alert, and strictly better than the silence it replaces.
+   */
+  async function announceRecoveryHorizonRetirement(
+    action: IssueRecoveryAction,
+    opts?: { runId?: string | null; retiredBy?: string | null },
+  ): Promise<{
+    neverDelivered: boolean;
+    neverDeliveredButWorked: boolean;
+    announced: boolean;
+  }> {
+    // PEN-3000: `attemptCount` counts wakes that REACHED THE QUEUE, not sweeps — every
+    // sweep reserves +1 and refunds it when `enqueueWakeup` returned null, so the counter
+    // freezes at the delivered count. It also restarts on owner change (`isNewOwnerSequence`
+    // in `upsertSourceScopedUnlocked`), so 0 means no wake was delivered to the CURRENT
+    // owner since it took over — not necessarily across the row's whole life. Within that
+    // scope it is a wake-channel fault rather than an owner who was woken and did not
+    // converge; those are different incidents with different responders and they render
+    // identically without this split. Not gated on `previousOwnerAgentId`: the stranded
+    // sweep writes it from the issue's assignee on the first insert (see `upsertSourceScoped`
+    // call above), so it is non-null on the un-churned rows this label exists to catch.
+    const neverDelivered = action.attemptCount === 0;
+    // PEN-3989 (Ally review of #2607): the increment stays HERE, before the dedup check, and
+    // the return shape carries no `counted` flag. Moving it after the dedup would couple the
+    // counter to the notice, and the notice's marker is shared with
+    // `escalateStrandedAssignedIssue` — so an action whose notice that path had already
+    // posted would retire with no metric at all, which is exactly the silence this row
+    // exists to end. The cost of keeping it here is that two racing writers on one action
+    // increment twice; PEN-3322's alerts are `> 0` over a 1 d window, so that is harmless.
+    recordRecoveryHorizonExpired(neverDelivered ? "never_delivered" : "delivered");
+
+    // BLO-19124: only asked on the `neverDelivered` branch, because that is the only notice
+    // arm that claims the stranding went unworked — the delivered arm makes no such claim,
+    // so buying this row would be a query per sweep for nothing.
+    //
+    // "Since the action opened" is deliberately an OVERLAP test, not a containment one:
+    // `hasSuccessfulIssueRunSince` matches `createdAt >= since OR finishedAt >= since`, so a
+    // run that started before this action and finished inside its window counts. That is the
+    // meaning the notice needs — such a run WAS working the issue during the horizon.
+    //
+    // `hasActiveExecutionPath`, the guard the sibling decision points in this subsystem use,
+    // is the wrong instrument here: it asks whether a run is in flight RIGHT NOW and would
+    // have missed all three BLO-19124 runs, every one of which had finished before the sweep
+    // read the row.
+    // `createdAt` is `string | Date` on the read model — the driver hands back a Date, but
+    // the type is widened, so normalise rather than relying on the runtime shape.
+    const neverDeliveredButWorked = neverDelivered
+      && await hasSuccessfulIssueRunSince(
+        action.companyId,
+        action.sourceIssueId,
+        new Date(action.createdAt),
+      );
+
+    logger.warn(
+      {
+        actionId: action.id,
+        companyId: action.companyId,
+        sourceIssueId: action.sourceIssueId,
+        cause: action.cause,
+        ownerAgentId: action.ownerAgentId,
+        attemptCount: action.attemptCount,
+        maxAttempts: action.maxAttempts,
+        neverDelivered,
+        neverDeliveredButWorked,
+        timeoutAt: action.timeoutAt,
+        runId: opts?.runId ?? null,
+        retiredBy: opts?.retiredBy ?? null,
+      },
+      "recovery action passed its wake horizon and was escalated out of active",
+    );
+
+    // Same marker text and the same exact-match dedup as the notice in
+    // `escalateStrandedAssignedIssue`, so whichever path gets there first wins and the
+    // other stays quiet — the operator sees one horizon notice per action, not two.
+    const horizonAt = action.timeoutAt instanceof Date
+      ? action.timeoutAt.toISOString()
+      : action.timeoutAt != null
+        ? String(action.timeoutAt)
+        // BLO-40297 derived arm: the row never persisted a horizon, so report the one it
+        // was actually retired on — `createdAt` plus the configured horizon. This is for
+        // operator legibility only; the marker would still dedup correctly without it,
+        // because it embeds the unique `action.id` (an earlier version of this comment
+        // claimed a null horizon would collide across rows — it would not).
+        //
+        // `createdAt` is deliberately NOT null-guarded, though the read model widens it to
+        // `Date | string | null`: the derived arm selects on `lte(createdAt, …)`, which
+        // never matches SQL NULL, and the persisted arm does not reach this branch. If you
+        // widen that predicate, guard this first — `new Date(null)` is the epoch, so a null
+        // would render a 1970 horizon into an operator notice instead of failing.
+        : new Date(
+          new Date(action.createdAt).getTime() + recoveryActionBoundsConfig().timeoutMs,
+        ).toISOString();
+    const marker = `Recovery wake horizon reached for action \`${action.id}\` (horizon \`${horizonAt}\`)`;
+    const alreadyAnnounced = await db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(and(
+        eq(issueComments.issueId, action.sourceIssueId),
+        eq(issueComments.authorType, "system"),
+        sql`${issueComments.body} LIKE ${`%${escapeLikePattern(marker)}%`} ESCAPE '\\'`,
+      ))
+      .limit(1)
+      .then((rows) => rows.length > 0);
+    if (alreadyAnnounced) {
+      return { neverDelivered, neverDeliveredButWorked, announced: false };
+    }
+
+    await issuesSvc.addComment(
+      action.sourceIssueId,
+      [
+        `${marker}.`,
+        "",
+        "This recovery action passed its auto-recovery horizon without being discharged, so Paperclip has " +
+          "stopped waking anyone for it and has moved it out of `active` to `escalated`. It now needs a human " +
+          "or a board operator to resolve it.",
+        "",
+        `- Attempts: ${action.attemptCount} (budget ${action.maxAttempts ?? "none — this action was created before wake bounds existed, or by a cause that carries none"})`,
+        `- Auto-recovery horizon: ${horizonAt}${action.timeoutAt == null ? " (derived from `createdAt`; none was persisted)" : ""}`,
+        `- Cause: \`${action.cause}\``,
+        action.attemptCount === 0
+          ? "- Note: no wake reached the queue for this action's current owner. `Attempts` counts wakes " +
+            "that were DELIVERED, not sweeps attempted — each sweep reserves an attempt and refunds it " +
+            "when the wake is not delivered, and the count restarts when ownership changes — so 0 means " +
+            "every sweep since the current owner took over was refused by the wake channel " +
+            "(provider-capacity deferral, an active tree pause hold, wake disabled, or cooldown). An " +
+            "earlier owner may have been woken; check the action's owner history before concluding the " +
+            "whole window was refused. " +
+            (neverDeliveredButWorked
+              // BLO-19124: the claim below is about THIS ACTION's wakes, never about the issue.
+              // Saying "never worked" here was false on every row where the issue was serviced by
+              // another path, and it is the whole reason an operator would open this notice.
+              ? "The issue itself WAS worked inside this window even so — at least one run on it " +
+                "succeeded after this action was opened — so this is a bookkeeping failure (the " +
+                "action was never discharged) rather than an unworked stranding. Check whether the " +
+                "work that happened actually resolved the stranding before treating this as an " +
+                "incident."
+              : "No run on the issue succeeded inside this window either, so within the current " +
+                "owner's tenure the stranding this action was opened to repair was never worked, and " +
+                "that is a scheduler-side fault rather than an owner who was woken and could not " +
+                "resolve it.")
+          : "- Note: reassigning will NOT restore the wake budget — the horizon above is fixed for the life of " +
+            "the action, so a new owner does not get fresh attempts.",
+        "- Next action: discharge or cancel this recovery action, or record an intentional manual resolution.",
+      ].join("\n"),
+      {},
+      { authorType: "system" },
+    );
+    return { neverDelivered, neverDeliveredButWorked, announced: true };
+  }
+
+
+  /**
    * BLO-24662: move recovery actions that have burned their wake horizon out of `active`.
    *
    * `strandedRecoveryWakeAttemptsExhausted` already makes every sweep skip these, and
@@ -13256,141 +13848,20 @@ export function recoveryService(
       // BLO-19124: the WHOLE per-row body is inside this try, not just the comment write.
       // `escalateExpiredWakeHorizons` flipped the entire batch to `escalated` in one UPDATE
       // above and only ever selects `status = "active"` rows, so a row this loop drops is
-      // never re-selected and its notice is lost for good. Both reads below hit the database
-      // — a connection blip or a statement timeout on either used to abort the sweep and
-      // silently strand every remaining row in the batch (default limit 200), which is the
-      // BLO-24662 shape this pass exists to end. The status transition is the load-bearing
-      // half and is already committed; nothing here may roll it back or abort the rest.
+      // never re-selected and its notice is lost for good. Both reads inside the helper hit
+      // the database — a connection blip or a statement timeout on either used to abort the
+      // sweep and silently strand every remaining row in the batch (default limit 200), which
+      // is the BLO-24662 shape this pass exists to end. The status transition is the
+      // load-bearing half and is already committed; nothing here may roll it back or abort
+      // the rest.
       try {
-        // PEN-3000: `attemptCount` counts wakes that REACHED THE QUEUE, not sweeps — every
-        // sweep reserves +1 and refunds it when `enqueueWakeup` returned null, so the counter
-        // freezes at the delivered count. It also restarts on owner change (`isNewOwnerSequence`
-        // in `upsertSourceScopedUnlocked`), so 0 means no wake was delivered to the CURRENT
-        // owner since it took over — not necessarily across the row's whole life. Within that
-        // scope it is a wake-channel fault rather than an owner who was woken and did not
-        // converge; those are different incidents with different responders and they render
-        // identically without this split. Not gated on `previousOwnerAgentId`: the stranded
-        // sweep writes it from the issue's assignee on the first insert (see `upsertSourceScoped`
-        // call above), so it is non-null on the un-churned rows this label exists to catch.
-        const neverDelivered = action.attemptCount === 0;
-        if (neverDelivered) result.neverDelivered += 1;
-        recordRecoveryHorizonExpired(neverDelivered ? "never_delivered" : "delivered");
-
-        // BLO-19124: only asked on the `neverDelivered` branch, because that is the only notice
-        // arm that claims the stranding went unworked — the delivered arm makes no such claim,
-        // so buying this row would be a query per sweep for nothing.
-        //
-        // "Since the action opened" is deliberately an OVERLAP test, not a containment one:
-        // `hasSuccessfulIssueRunSince` matches `createdAt >= since OR finishedAt >= since`, so a
-        // run that started before this action and finished inside its window counts. That is the
-        // meaning the notice needs — such a run WAS working the issue during the horizon.
-        //
-        // `hasActiveExecutionPath`, the guard the sibling decision points in this subsystem use,
-        // is the wrong instrument here: it asks whether a run is in flight RIGHT NOW and would
-        // have missed all three BLO-19124 runs, every one of which had finished before the sweep
-        // read the row.
-        // `createdAt` is `string | Date` on the read model — the driver hands back a Date, but
-        // the type is widened, so normalise rather than relying on the runtime shape.
-        const neverDeliveredButWorked = neverDelivered
-          && await hasSuccessfulIssueRunSince(
-            action.companyId,
-            action.sourceIssueId,
-            new Date(action.createdAt),
-          );
-        if (neverDeliveredButWorked) result.neverDeliveredButWorked += 1;
-
-        logger.warn(
-          {
-            actionId: action.id,
-            companyId: action.companyId,
-            sourceIssueId: action.sourceIssueId,
-            cause: action.cause,
-            ownerAgentId: action.ownerAgentId,
-            attemptCount: action.attemptCount,
-            maxAttempts: action.maxAttempts,
-            neverDelivered,
-            neverDeliveredButWorked,
-            timeoutAt: action.timeoutAt,
-            runId: opts?.runId ?? null,
-          },
-          "recovery action passed its wake horizon and was escalated out of active",
-        );
-
-        // Same marker text and the same exact-match dedup as the notice in
-        // `escalateStrandedAssignedIssue`, so whichever path gets there first wins and the
-        // other stays quiet — the operator sees one horizon notice per action, not two.
-        const horizonAt = action.timeoutAt instanceof Date
-          ? action.timeoutAt.toISOString()
-          : action.timeoutAt != null
-            ? String(action.timeoutAt)
-            // BLO-40297 derived arm: the row never persisted a horizon, so report the one it
-            // was actually retired on — `createdAt` plus the configured horizon. This is for
-            // operator legibility only; the marker would still dedup correctly without it,
-            // because it embeds the unique `action.id` (an earlier version of this comment
-            // claimed a null horizon would collide across rows — it would not).
-            //
-            // `createdAt` is deliberately NOT null-guarded, though the read model widens it to
-            // `Date | string | null`: the derived arm selects on `lte(createdAt, …)`, which
-            // never matches SQL NULL, and the persisted arm does not reach this branch. If you
-            // widen that predicate, guard this first — `new Date(null)` is the epoch, so a null
-            // would render a 1970 horizon into an operator notice instead of failing.
-            : new Date(
-              new Date(action.createdAt).getTime() + recoveryActionBoundsConfig().timeoutMs,
-            ).toISOString();
-        const marker = `Recovery wake horizon reached for action \`${action.id}\` (horizon \`${horizonAt}\`)`;
-        const alreadyAnnounced = await db
-          .select({ id: issueComments.id })
-          .from(issueComments)
-          .where(and(
-            eq(issueComments.issueId, action.sourceIssueId),
-            eq(issueComments.authorType, "system"),
-            sql`${issueComments.body} LIKE ${`%${escapeLikePattern(marker)}%`} ESCAPE '\\'`,
-          ))
-          .limit(1)
-          .then((rows) => rows.length > 0);
-        if (alreadyAnnounced) continue;
-
-        await issuesSvc.addComment(
-          action.sourceIssueId,
-          [
-            `${marker}.`,
-            "",
-            "This recovery action passed its auto-recovery horizon without being discharged, so Paperclip has " +
-              "stopped waking anyone for it and has moved it out of `active` to `escalated`. It now needs a human " +
-              "or a board operator to resolve it.",
-            "",
-            `- Attempts: ${action.attemptCount} (budget ${action.maxAttempts ?? "none — this action was created before wake bounds existed, or by a cause that carries none"})`,
-            `- Auto-recovery horizon: ${horizonAt}${action.timeoutAt == null ? " (derived from `createdAt`; none was persisted)" : ""}`,
-            `- Cause: \`${action.cause}\``,
-            action.attemptCount === 0
-              ? "- Note: no wake reached the queue for this action's current owner. `Attempts` counts wakes " +
-                "that were DELIVERED, not sweeps attempted — each sweep reserves an attempt and refunds it " +
-                "when the wake is not delivered, and the count restarts when ownership changes — so 0 means " +
-                "every sweep since the current owner took over was refused by the wake channel " +
-                "(provider-capacity deferral, an active tree pause hold, wake disabled, or cooldown). An " +
-                "earlier owner may have been woken; check the action's owner history before concluding the " +
-                "whole window was refused. " +
-                (neverDeliveredButWorked
-                  // BLO-19124: the claim below is about THIS ACTION's wakes, never about the issue.
-                  // Saying "never worked" here was false on every row where the issue was serviced by
-                  // another path, and it is the whole reason an operator would open this notice.
-                  ? "The issue itself WAS worked inside this window even so — at least one run on it " +
-                    "succeeded after this action was opened — so this is a bookkeeping failure (the " +
-                    "action was never discharged) rather than an unworked stranding. Check whether the " +
-                    "work that happened actually resolved the stranding before treating this as an " +
-                    "incident."
-                  : "No run on the issue succeeded inside this window either, so within the current " +
-                    "owner's tenure the stranding this action was opened to repair was never worked, and " +
-                    "that is a scheduler-side fault rather than an owner who was woken and could not " +
-                    "resolve it.")
-              : "- Note: reassigning will NOT restore the wake budget — the horizon above is fixed for the life of " +
-                "the action, so a new owner does not get fresh attempts.",
-            "- Next action: discharge or cancel this recovery action, or record an intentional manual resolution.",
-          ].join("\n"),
-          {},
-          { authorType: "system" },
-        );
-        result.announced += 1;
+        const emitted = await announceRecoveryHorizonRetirement(action, {
+          runId: opts?.runId ?? null,
+          retiredBy: "expired_wake_horizon_sweep",
+        });
+        if (emitted.neverDelivered) result.neverDelivered += 1;
+        if (emitted.neverDeliveredButWorked) result.neverDeliveredButWorked += 1;
+        if (emitted.announced) result.announced += 1;
       } catch (error) {
         logger.warn(
           { err: error, actionId: action.id, sourceIssueId: action.sourceIssueId },
@@ -14156,13 +14627,43 @@ export function recoveryService(
           result.pendingWakeSkipped += 1;
           continue;
         }
-        await recoveryActionsSvc.retireWakeAction({
+        const retired = await recoveryActionsSvc.retireWakeAction({
           companyId: candidate.companyId,
           actionId: candidate.actionId,
           retiringBound: attemptBudgetReached
             ? "attempt_budget"
             : (pendingWake ? "pending_wake_ceiling" : "timeout_horizon"),
         });
+        // PEN-3989: this gate is the horizon's DOMINANT retirement path, and it used to emit
+        // nothing at all — no PEN-3000 counter, no source-row notice, only
+        // `exhaustedSkipped += 1` on an in-memory tally that is logged and discarded. Because
+        // `escalateExpiredWakeHorizons` (the path that does emit both) selects
+        // `status = 'active'` and nothing else, retiring the row here makes it permanently
+        // unselectable there, so the announcement was not deferred — it was lost. Four actions
+        // retired silently this way on 2026-10-12; see `announceRecoveryHorizonRetirement`.
+        //
+        // `retireWakeAction` returns the updated row only when IT performed the transition
+        // (its UPDATE is guarded on `retiring_bound IS NULL`), and `null` otherwise — so this
+        // is exact transition evidence, not an inference, and a row another path already
+        // retired cannot be announced twice from here.
+        //
+        // Gated on `timeout_horizon`: `attempt_budget` is a different retirement with a
+        // different meaning, and PEN-3322's alerts key on the horizon arm.
+        if (retired && retired.retiringBound === "timeout_horizon") {
+          try {
+            await announceRecoveryHorizonRetirement(retired, {
+              runId: opts?.runId ?? null,
+              retiredBy: "stranded_recovery_wake_backstop",
+            });
+          } catch (error) {
+            // Never abort the backstop for an announcement failure: the retirement is already
+            // committed and the remaining candidates still need sweeping.
+            logger.warn(
+              { err: error, actionId: candidate.actionId, sourceIssueId: candidate.issueId },
+              "failed to announce recovery wake horizon expiry from the stranded wake backstop",
+            );
+          }
+        }
         result.exhaustedSkipped += 1;
         continue;
       }
@@ -16443,7 +16944,20 @@ export function recoveryService(
         // the re-raised findings, not the round count, which counts converging
         // rounds too. The two changes are not alternatives — this one replaces
         // only the "or record a disposition" tail.
-        ? `Self-reviewed PR #${input.prNumber} ${reRaised}, after ${input.cycleCount} actionable review rounds. Take over the PR, unblock or reassign the author, or discharge this action yourself: POST /issues/${issue.id}/recovery-actions/resolve with body {"outcome":"restored","resolutionNote":"<why>"} (the action id goes in the BODY as an optional "actionId", never in the path; omit "sourceIssueStatus" to leave the source issue's status untouched). Do not leave the author looping on its own self-review.`
+        //
+        // Ally review on #2584 asked that this point at `blocked` +
+        // `sourceIssueStatus: "blocked"` for a blocked issue, to stop generating
+        // PEN-3991 downgrades at source. Named CONDITIONALLY rather than as the
+        // instruction, because `blocked` is not always available: the route
+        // refuses it with 422 unless the source issue carries an unresolved
+        // first-class `blocks` relation (`routes/issues.ts`), and the measured
+        // PEN-3991 population was blocked by infra faults with no such edge. An
+        // unconditional steer would hand that population a deterministic refusal
+        // in place of a working exit. For them `restored_unverified` is not a row
+        // to eliminate — it is the honest record of a discharge on an issue that
+        // was not left runnable, which is the whole point of PEN-3991, so the
+        // text says plainly what gets recorded instead of hiding it.
+        ? `Self-reviewed PR #${input.prNumber} ${reRaised}, after ${input.cycleCount} actionable review rounds. Take over the PR, unblock or reassign the author, or discharge this action yourself: POST /issues/${issue.id}/recovery-actions/resolve with body {"outcome":"restored","resolutionNote":"<why>"} (the action id goes in the BODY as an optional "actionId", never in the path; omit "sourceIssueStatus" to leave the source issue's status untouched. If the issue is waiting on an unresolved first-class blocker, prefer {"outcome":"blocked","sourceIssueStatus":"blocked"} — that returns ownership without claiming a repair, and is refused unless such a blocker exists. On an issue left blocked or cancelled, "restored" is still accepted but recorded as "restored_unverified"). Do not leave the author looping on its own self-review.`
         : `Self-reviewed PR #${input.prNumber} ${reRaised}, after ${input.cycleCount} actionable review rounds, and no invokable agent can own it. Board intervention needed.`,
       wakePolicy: ownerAgentId
         ? { type: "wake_owner", reason: "self_review_pr_non_convergence", ownerAgentId }

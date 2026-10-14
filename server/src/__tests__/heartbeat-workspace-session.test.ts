@@ -3305,6 +3305,33 @@ describe("K8s session isolation metadata", () => {
     });
   });
 
+  it("preserves fixed Cargo paths only on a Pod's ephemeral cache volume", () => {
+    const env = {
+      API_TOKEN: "preserved",
+      CARGO_HOME: "/runtime-cache/cargo",
+      CARGO_TARGET_DIR: "/runtime-cache/cargo-target",
+      HOME: "/paperclip/shared-home",
+    };
+    const podIsolation = { ...isolation, cacheRoot: "/runtime-cache/paperclip-runs/run-1/cache" };
+    expect(stripK8sIsolationOwnedEnv({ env }, podIsolation).env).toEqual({
+      API_TOKEN: "preserved",
+      CARGO_HOME: "/runtime-cache/cargo",
+      CARGO_TARGET_DIR: "/runtime-cache/cargo-target",
+    });
+    for (const unsafeIsolation of [
+      isolation,
+      { ...podIsolation, storage: { ...podIsolation.storage, cache: "persistent" as const } },
+    ]) {
+      expect(stripK8sIsolationOwnedEnv({ env }, unsafeIsolation).env).toEqual({ API_TOKEN: "preserved" });
+    }
+    for (const value of ["/paperclip/shared", "/runtime-cache/cargo/../other", "/runtime-cache/cargo-other"]) {
+      expect(stripK8sIsolationOwnedEnv({ env: { CARGO_HOME: value } }, podIsolation).env).toEqual({});
+    }
+    for (const value of ["/paperclip/project/target", "/runtime-cache/cargo-target/../other", "/runtime-cache/cargo-target-other"]) {
+      expect(stripK8sIsolationOwnedEnv({ env: { CARGO_TARGET_DIR: value } }, podIsolation).env).toEqual({});
+    }
+  });
+
   it("builds fully ephemeral run isolation metadata for stateless PR reviews", () => {
     expect(
       buildK8sRunIsolationDescriptorFromWorkspace({

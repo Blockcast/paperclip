@@ -121,6 +121,68 @@ const LATEST_RUN_ID_EVIDENCE_KEY = "latestRunId";
 export const RESOLVED_ASSIGNEE_AGENT_ID_EVIDENCE_KEY = "resolvedAssigneeAgentId";
 export const RESOLVED_ISSUE_STATUS_EVIDENCE_KEY = "resolvedIssueStatus";
 
+// PEN-3991: the most recent restored-family claim this action follows.
+//
+// A recovery action that is discharged and then re-minted gets a NEW id, so the
+// replacement reads as a fresh unrelated strand and nothing scores the pair as a
+// loop. Measured: four issues were discharged `restored` at 2026-10-12T00:15Z and
+// carried four fresh actions 71 minutes later; the same four were discharged
+// `restored` again at 07:54Z. Twice through the same cycle, invisible as a cycle.
+//
+// ⚠ WHAT THIS LINK ASSERTS, PRECISELY. It is temporal adjacency on one source
+// issue: a restored-family claim was discharged here, and within the window a new
+// strand opened. That is NOT the same as "the prior claim was false", and reading
+// it that way over-claims on a real population. The resolve route is only ONE of
+// the writers of `outcome: "restored"`; every other one is a SYSTEM discharge
+// acting on an observed event, whose claim is generally true — the merged-PR
+// discharge of a `pr_review_non_convergence` beacon
+// (`recovery/service.ts`, `closePrReviewNonConvergenceForClosedPr`), the
+// continuation-cancel parks (`reconcileReviewWaitingContinuation`,
+// `parkNoDependencyReviewWaitingIssue`), and the workspace-branch reconciliation
+// (`execution-workspaces.ts`, `workspace_validation`). An unrelated strand
+// opening 20h after a genuine merge is a coincidence, not a refutation.
+//
+// So the pair is recorded with enough shape for a consumer to tell those apart
+// rather than filtered down to a guess here: `…Kind` and `…Cause` identify what
+// the prior claim was about, and `…ElapsedMs` how far back. A loop is a prior
+// claim of the SAME kind, discharged minutes ago — which is exactly the measured
+// shape, and is distinguishable from a merge discharge of a different kind
+// without this code having to decide. Narrowing the query to same-kind instead
+// was considered and rejected: it would silently drop a genuine loop that changes
+// kind between strands, and a dropped link leaves no trace to audit.
+//
+// These are a BACK-pointer written at mint, not a forward one written at resolve,
+// because the later strand does not exist yet when the claim is made.
+export const SUPERSEDES_RESTORED_CLAIM_ACTION_ID_EVIDENCE_KEY = "supersedesRestoredClaimActionId";
+export const SUPERSEDES_RESTORED_CLAIM_OUTCOME_EVIDENCE_KEY = "supersedesRestoredClaimOutcome";
+export const SUPERSEDES_RESTORED_CLAIM_KIND_EVIDENCE_KEY = "supersedesRestoredClaimKind";
+export const SUPERSEDES_RESTORED_CLAIM_CAUSE_EVIDENCE_KEY = "supersedesRestoredClaimCause";
+export const SUPERSEDES_RESTORED_CLAIM_RESOLVED_AT_EVIDENCE_KEY = "supersedesRestoredClaimResolvedAt";
+export const SUPERSEDES_RESTORED_CLAIM_ELAPSED_MS_EVIDENCE_KEY = "supersedesRestoredClaimElapsedMs";
+export const SUPERSEDES_RESTORED_CLAIM_SAME_KIND_EVIDENCE_KEY = "supersedesRestoredClaimSameKind";
+
+/**
+ * The outcomes that assert a live execution path, and are therefore worth linking
+ * a later strand on the same source issue back to.
+ *
+ * `restored_unverified` is included even though it already records its own doubt:
+ * a later strand is the independent confirmation that the doubt was warranted, and
+ * leaving it out would make the clearest cases the only unlinked ones.
+ */
+const RESTORED_CLAIM_OUTCOMES = ["restored", "restored_unverified"] as const;
+
+/**
+ * How recently a restored claim must have been discharged for a new action on the
+ * same issue to be linked back to it.
+ *
+ * An unbounded link would assert adjacency across arbitrary time — two unrelated
+ * failures months apart are not a pair. 24h is generous against the 71-minute gap
+ * actually measured, which is the point: the window should not be the thing that
+ * decides a borderline case. `supersedesRestoredClaimElapsedMs` records the real
+ * gap, so any consumer can apply a tighter rule without re-deriving this one.
+ */
+const RESTORED_CLAIM_LINK_WINDOW_MS = 24 * 60 * 60 * 1000;
+
 // How long after a recovery transfer the previous owner keeps the comment-only
 // handoff channel opened by BLO-18906 / #827.
 //
@@ -462,6 +524,83 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
     return upsertSourceScopedUnlocked(input, retryCount + 1);
   }
 
+  /**
+   * The most recent restored-family claim on this source issue, if a new action
+   * minted now falls inside the link window (PEN-3991).
+   *
+   * Returns the prior claim's shape — `kind` and `cause` as well as its outcome
+   * and age — rather than deciding here whether the pair is a loop. See the
+   * evidence-key block above: most writers of `outcome: "restored"` are system
+   * discharges that are generally true, so a same-issue pairing is adjacency,
+   * and only the shape distinguishes a loop from a coincidence.
+   *
+   * Only called on the INSERT path — i.e. when no active action exists and a
+   * genuinely new strand is being opened. The UPDATE path reuses a row that was
+   * never discharged, so there is no prior claim and no query to pay for.
+   */
+  async function findSupersededRestoredClaim(
+    companyId: string,
+    sourceIssueId: string,
+    now: Date,
+    // `kind`/`cause` are NOT NULL on the table, so they need no null handling.
+  ): Promise<{ id: string; outcome: string; kind: string; cause: string; resolvedAt: Date } | null> {
+    const [candidate] = await db
+      .select({
+        id: issueRecoveryActions.id,
+        outcome: issueRecoveryActions.outcome,
+        kind: issueRecoveryActions.kind,
+        cause: issueRecoveryActions.cause,
+        resolvedAt: issueRecoveryActions.resolvedAt,
+      })
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.sourceIssueId, sourceIssueId),
+          inArray(issueRecoveryActions.outcome, [...RESTORED_CLAIM_OUTCOMES]),
+          isNotNull(issueRecoveryActions.resolvedAt),
+        ),
+      )
+      .orderBy(desc(issueRecoveryActions.resolvedAt))
+      .limit(1);
+    if (!candidate) return null;
+    const resolvedAt = toValidDate(candidate.resolvedAt);
+    if (!resolvedAt || !candidate.outcome) return null;
+    const elapsedMs = now.getTime() - resolvedAt.getTime();
+    // Guard both ends. A negative gap means the clocks disagree, not that the
+    // claim was made in the future, and linking on it would publish that
+    // confusion as a measurement.
+    if (elapsedMs < 0 || elapsedMs > RESTORED_CLAIM_LINK_WINDOW_MS) return null;
+    return {
+      id: candidate.id,
+      outcome: candidate.outcome,
+      kind: candidate.kind,
+      cause: candidate.cause,
+      resolvedAt,
+    };
+  }
+
+  function withSupersededRestoredClaimEvidence(
+    evidence: unknown,
+    claim: { id: string; outcome: string; kind: string; cause: string; resolvedAt: Date } | null,
+    now: Date,
+    kind: string,
+  ): Record<string, unknown> {
+    const next = isRecord(evidence) ? { ...evidence } : {};
+    if (!claim) return next;
+    next[SUPERSEDES_RESTORED_CLAIM_ACTION_ID_EVIDENCE_KEY] = claim.id;
+    next[SUPERSEDES_RESTORED_CLAIM_OUTCOME_EVIDENCE_KEY] = claim.outcome;
+    next[SUPERSEDES_RESTORED_CLAIM_KIND_EVIDENCE_KEY] = claim.kind;
+    next[SUPERSEDES_RESTORED_CLAIM_CAUSE_EVIDENCE_KEY] = claim.cause;
+    next[SUPERSEDES_RESTORED_CLAIM_RESOLVED_AT_EVIDENCE_KEY] = claim.resolvedAt.toISOString();
+    next[SUPERSEDES_RESTORED_CLAIM_ELAPSED_MS_EVIDENCE_KEY] = now.getTime() - claim.resolvedAt.getTime();
+    // Precomputed because it is the single discriminator a consumer needs most:
+    // a same-kind prior claim minutes old is the measured loop shape, while a
+    // different-kind one is the merge-discharge coincidence.
+    next[SUPERSEDES_RESTORED_CLAIM_SAME_KIND_EVIDENCE_KEY] = claim.kind === kind;
+    return next;
+  }
+
   async function upsertSourceScopedUnlocked(
     input: UpsertIssueRecoveryActionInput,
     retryCount = 0,
@@ -737,6 +876,16 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
       return toReadModel(updated!);
     }
 
+    // PEN-3991: minting here means a NEW strand is opening on this issue. If a
+    // restored claim was discharged on it recently, this action is the evidence
+    // that the claim was false — record the back-pointer now, while both ends
+    // are known.
+    const supersededRestoredClaim = await findSupersededRestoredClaim(
+      input.companyId,
+      input.sourceIssueId,
+      now,
+    );
+
     try {
       const [created] = await db
         .insert(issueRecoveryActions)
@@ -753,13 +902,18 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
           returnOwnerAgentId: input.returnOwnerAgentId ?? null,
           cause: input.cause,
           fingerprint: input.fingerprint,
-          evidence: withRecoveryHandoffGrantAnchorEvidence(
-            withSourceScopedWakeHorizonEvidence(
-              input.evidence ?? {},
-              (input.maxAttempts ?? null) !== null ? (input.timeoutAt ?? null) : null,
+          evidence: withSupersededRestoredClaimEvidence(
+            withRecoveryHandoffGrantAnchorEvidence(
+              withSourceScopedWakeHorizonEvidence(
+                input.evidence ?? {},
+                (input.maxAttempts ?? null) !== null ? (input.timeoutAt ?? null) : null,
+              ),
+              // Creating the row IS the transfer, so it anchors the TTL.
+              { kind: "valid", at: now },
             ),
-            // Creating the row IS the transfer, so it anchors the TTL.
-            { kind: "valid", at: now },
+            supersededRestoredClaim,
+            now,
+            input.kind,
           ),
           nextAction: input.nextAction,
           wakePolicy: input.wakePolicy ?? null,
@@ -825,13 +979,30 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
       );
   }
 
+  /**
+   * Returns whether the UPDATE matched a row, i.e. whether the reservation CAS below still
+   * held when the statement ran.
+   *
+   * PEN-3989 (Ally review of #2607): this used to return `void`, and the only caller read
+   * "the call did not throw" as proof the row had been retired. It is not. The predicate is a
+   * compare-and-swap on `ownerAgentId` + `attemptCount`, so a sweep that re-homes the action
+   * between the reserve and this call (`isNewOwnerSequence` resets `attemptCount`) matches
+   * zero rows and still resolves with no error. The caller then announced a retirement that
+   * had not happened: a `paperclip_recovery_horizon_expired_total` increment feeding PEN-3322's
+   * alert, a source-row notice claiming a still-`active` row had moved to `escalated`, and a
+   * dedup marker that makes the REAL retirement's notice look like a duplicate later.
+   *
+   * `false` means "this call changed nothing"; it does NOT distinguish a matched row that the
+   * SQL-level idempotency below left untransitioned (a re-run) from one it transitioned. The
+   * caller supplies that half from the pre-state it already holds.
+   */
   async function retireAndReleaseWakeAttempt(input: {
     companyId: string;
     actionId: string;
     expectedOwnerAgentId: string;
     expectedAttemptCount: number;
     retiringBound: IssueRecoveryActionRetiringBound;
-  }): Promise<void> {
+  }): Promise<boolean> {
     // Retiring and refunding must share one statement. Splitting them lets a sweep observe a
     // row whose status advanced without its reserved attempt coming back, which reopens the
     // exhausted action.
@@ -848,7 +1019,7 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
     // So the predicate keeps only the reservation CAS — owner plus attempt count, scoped to
     // active statuses — and the retirement writes are made idempotent in SQL instead. A
     // re-run refunds its own reserve and rewrites neither `status` nor `retiring_bound`.
-    await db
+    const matched = await db
       .update(issueRecoveryActions)
       .set({
         status: sql`case when ${issueRecoveryActions.retiringBound} is null and ${issueRecoveryActions.status} = 'active' then 'escalated' else ${issueRecoveryActions.status} end`,
@@ -863,7 +1034,9 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
         eq(issueRecoveryActions.ownerAgentId, input.expectedOwnerAgentId),
         eq(issueRecoveryActions.attemptCount, input.expectedAttemptCount),
         inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
-      ));
+      ))
+      .returning({ id: issueRecoveryActions.id });
+    return matched.length > 0;
   }
 
   async function retireWakeAction(input: {
@@ -1156,7 +1329,33 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
       .set({
         status: input.status,
         outcome: input.outcome,
-        retiringBound: input.status === "cancelled" ? "cancelled" : "discharged",
+        // PEN-4013: `coalesce`, not a plain set, because this predicate matches
+        // `escalated` as well as `active` (`ACTIVE_RECOVERY_ACTION_STATUSES`). A manual
+        // discharge therefore lands on rows that have ALREADY been retired, and an
+        // unconditional write erased the bound that recorded the retirement —
+        // `timeout_horizon` and `attempt_budget` both became `discharged`.
+        //
+        // That erasure is unrecoverable and silent. `retiringBound` is the only field
+        // distinguishing HOW an action ended that the company-scoped recovery-actions
+        // route projects at all: `resolvedAt` and `resolutionNote` are not in that
+        // projection, and the discharge overwrites `updatedAt` on its way past. So every
+        // retrospective census of horizon expiries — the query PEN-3000 and PEN-3322 rest
+        // on — under-counted by exactly the rows someone had since discharged, with no
+        // indication that it had.
+        //
+        // The decision this encodes (PEN-4013): `retiringBound` means "how the action was
+        // RETIRED", not "how it ended". Preserving the prior bound costs the disposal
+        // record nothing, because the value this writes carries no information `status`
+        // does not already carry — `input.status` is `Extract<…, "resolved" | "cancelled">`
+        // and the mapping to `discharged`/`cancelled` is total and 1:1. Nothing routes on
+        // the field here either: every reader that routes on it is gated on
+        // `status IN ('active','escalated')`, and this statement moves the row to
+        // `resolved`/`cancelled` in the same write. On a terminal row the field is
+        // forensic only, which is what makes preserving it free of live consequence.
+        //
+        // This also makes the first-writer-wins invariant asserted in
+        // `recovery/service.ts` true of all FOUR writers rather than three.
+        retiringBound: sql`coalesce(${issueRecoveryActions.retiringBound}, ${input.status === "cancelled" ? "cancelled" : "discharged"})`,
         resolutionNote: input.resolutionNote ?? null,
         resolvedAt: now,
         updatedAt: now,

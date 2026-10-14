@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq, inArray } from "drizzle-orm";
+import { eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -952,5 +952,437 @@ describeEmbeddedPostgres("recovery wake horizon expiry (BLO-24662)", () => {
     expect(statuses).toEqual(["escalated", "escalated"]);
     const comments = await db.select({ id: issueComments.id }).from(issueComments);
     expect(comments).toHaveLength(1);
+  });
+  /**
+   * PEN-3989: the horizon retirement has THREE writers, and until this change only one of
+   * them emitted the PEN-3000 counter or the source-row notice.
+   *
+   * Every test above drives `reconcileExpiredRecoveryWakeHorizons` — writer 1, the path that
+   * already worked. That is exactly the blind spot that let this ship: the suite was thorough
+   * about the arm that was never broken. `retiring_bound = 'timeout_horizon'` is also written
+   * by `retireWakeAction` from the stranded-wake backstop and by `retireAndReleaseWakeAttempt`
+   * from the wake dispatch, both from a ternary (`attemptBudgetReached ? ... : ...`) that a
+   * grep for the contiguous literal cannot see, and both behind the DISJUNCTIVE
+   * `strandedRecoveryWakeAttemptsExhausted` — so they fire on the same condition writer 1
+   * exists to handle, and they race it.
+   *
+   * Writer 1 cannot recover afterwards: it selects `status = 'active'` only, so a row the
+   * backstop already flipped to `escalated` is permanently unselectable there. The
+   * announcement was not deferred, it was lost.
+   *
+   * Measured on 2026-10-12: four actions passed a 6 h horizon, were flipped to `escalated`
+   * with `retiring_bound = 'timeout_horizon'` at 07:41:39Z by the backstop, and produced
+   * neither a metric increment nor a notice on any of the four source rows.
+   *
+   * These tests assert BOTH observables, from the BACKSTOP. Asserting only the status
+   * transition is what made the failure invisible — that half never stopped working.
+   */
+  describe("horizon retirement performed by the stranded-wake backstop (PEN-3989)", () => {
+    it("counts and announces a horizon retirement the backstop performs", async () => {
+      // Counts are deliberately ASYMMETRIC (2 never-delivered vs 1 delivered) for the same
+      // reason as the writer-1 test above: with one of each, both series read 1 and an
+      // inverted ternary at the call site is invisible.
+      __resetMetricsForTest();
+      const neverDeliveredA = await seed();
+      await insertAction(neverDeliveredA, { attemptCount: 0 });
+      const neverDeliveredB = await seed();
+      await insertAction(neverDeliveredB, { attemptCount: 0 });
+      // Horizon passed but the budget is NOT spent, so this retires on `timeout_horizon`
+      // with a wake already delivered — the `delivered` arm, through the same gate.
+      const delivered = await seed();
+      await insertAction(delivered, { attemptCount: 2 });
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn().mockResolvedValue(null) });
+
+      const result = await recovery.reconcileStrandedRecoveryWakeBackstop({ now });
+      expect(result).toMatchObject({ exhaustedSkipped: 3 });
+
+      // Half one: the transition. This never stopped working and is NOT what this guards.
+      const actions = await db.select().from(issueRecoveryActions);
+      expect(actions).toHaveLength(3);
+      for (const action of actions) {
+        expect(action.status).toBe("escalated");
+        expect(action.retiringBound).toBe("timeout_horizon");
+      }
+
+      // Half two: the metric. Zero on both series before this change.
+      const { body } = await renderMetrics();
+      expect(body).toContain(`${RECOVERY_HORIZON_EXPIRED_METRIC}{delivery="never_delivered"} 2`);
+      expect(body).toContain(`${RECOVERY_HORIZON_EXPIRED_METRIC}{delivery="delivered"} 1`);
+
+      // Half three: the notice on the SOURCE row. Absent entirely before this change, which
+      // is why the four production rows retired with no trace an operator could read.
+      for (const seeded of [neverDeliveredA, neverDeliveredB, delivered]) {
+        const comments = await db
+          .select({ body: issueComments.body })
+          .from(issueComments)
+          .where(eq(issueComments.issueId, seeded.sourceIssueId));
+        expect(comments).toHaveLength(1);
+        expect(comments[0]!.body).toContain("Recovery wake horizon reached");
+      }
+    });
+
+    it("does not count or announce a backstop retirement on the attempt budget", async () => {
+      // Negative control for the ternary. `strandedRecoveryWakeAttemptsExhausted` is
+      // disjunctive, so a spent budget reaches the SAME gate — but it is a different
+      // retirement with a different meaning, and PEN-3322's alerts key on the horizon arm.
+      // Without this, widening the announce to every retirement would still pass the test
+      // above.
+      __resetMetricsForTest();
+      const seeded = await seed();
+      await insertAction(seeded, {
+        attemptCount: 5,
+        maxAttempts: 5,
+        timeoutAt: futureHorizon,
+      });
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn().mockResolvedValue(null) });
+
+      await recovery.reconcileStrandedRecoveryWakeBackstop({ now });
+
+      const [action] = await db.select().from(issueRecoveryActions);
+      expect(action!.retiringBound).toBe("attempt_budget");
+      const { body } = await renderMetrics();
+      expect(body).toContain(`${RECOVERY_HORIZON_EXPIRED_METRIC}{delivery="never_delivered"} 0`);
+      expect(body).toContain(`${RECOVERY_HORIZON_EXPIRED_METRIC}{delivery="delivered"} 0`);
+      const comments = await db.select({ id: issueComments.id }).from(issueComments);
+      expect(comments).toHaveLength(0);
+    });
+
+    it("announces exactly once when the horizon sweep runs after the backstop retired the row", async () => {
+      // The two paths race the same condition in production. The backstop wins, which leaves
+      // the row `escalated` and therefore invisible to writer 1 — so the horizon sweep must
+      // find nothing to do and must not post a second notice. This pins the dedup that makes
+      // announcing from three call sites safe.
+      __resetMetricsForTest();
+      const seeded = await seed();
+      await insertAction(seeded, { attemptCount: 0 });
+      const recovery = recoveryService(db, { enqueueWakeup: vi.fn().mockResolvedValue(null) });
+
+      await recovery.reconcileStrandedRecoveryWakeBackstop({ now });
+      const sweep = await recovery.reconcileExpiredRecoveryWakeHorizons({ now });
+
+      expect(sweep).toMatchObject({ escalated: 0, announced: 0 });
+      const comments = await db
+        .select({ id: issueComments.id })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, seeded.sourceIssueId));
+      expect(comments).toHaveLength(1);
+      const { body } = await renderMetrics();
+      expect(body).toContain(`${RECOVERY_HORIZON_EXPIRED_METRIC}{delivery="never_delivered"} 1`);
+    });
+  });
+
+  /**
+   * PEN-3989 (Ally review of #2607): writer 2 — the wake dispatch — had NO test at all.
+   *
+   * The block above covers writer 3 (the backstop) and the blocks above that cover writer 1
+   * (the sweep). Writer 2 is `retireAndReleaseWakeAttempt`, reached from
+   * `enqueueSourceScopedStrandedRecoveryWake`'s exhaustion gate, and it is the one site whose
+   * announce input is DERIVED rather than read: the refund has already landed when the
+   * announce runs, so the call adjusts `attemptCount` down by the reserve it is giving back.
+   * Announcing the unadjusted value would print `Attempts: 1` on a row that reads 0 AND flip
+   * `neverDelivered` to false — labelling a never-woken action `delivered`, the exact mislabel
+   * PEN-3000 exists to prevent. Reverting that `Math.max(..., 0)` left the whole suite green.
+   *
+   * The gate on that announce is the second untested thing. It takes two conjuncts and both
+   * are load-bearing; see `retireAndReleaseWakeAttempt`.
+   */
+  describe("horizon retirement performed by the wake dispatch (PEN-3989)", () => {
+    const latestRun = {
+      id: randomUUID(),
+      status: "failed",
+      error: "agent is not invokable",
+      errorCode: "agent_not_invokable",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+      resultJson: null,
+      usageJson: null,
+      createdAt: pastHorizon,
+    } as const;
+
+    /**
+     * Drive one dispatch that lands on the exhaustion gate with `timeoutAt` already past.
+     *
+     * The first escalation mints the action with a service-computed fingerprint; the row is
+     * then backdated and its fingerprint staled so the second escalation's
+     * `isUnchangedAction` check is false and the upsert actually RESERVES an attempt instead
+     * of short-circuiting through `shouldReuseStrandedRecoveryAction`. That reserve is what
+     * puts `attemptCount` at 1 on a row whose true delivered count is 0, which is precisely
+     * the state the adjusted announce has to describe.
+     */
+    /**
+     * `seed()` creates one engineer and no manager. `resolveStrandedRecoveryRouting` walks the
+     * manager ladder for an `agent_not_invokable` strand, so without a `reportsTo` target the
+     * routed owner can come back null — and `enqueueSourceScopedStrandedRecoveryWake` returns
+     * on `if (!input.action.ownerAgentId)` before the exhaustion gate this block exists to
+     * exercise. Give the ladder somewhere to go.
+     */
+    async function withManager(seeded: Awaited<ReturnType<typeof seed>>) {
+      const managerId = randomUUID();
+      await db.insert(agents).values({
+        id: managerId,
+        companyId: seeded.companyId,
+        name: "CTO",
+        role: "cto",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db.update(agents)
+        .set({ reportsTo: managerId })
+        .where(eq(agents.id, seeded.ownerAgentId));
+      return managerId;
+    }
+
+    async function dispatchOntoPastHorizon(
+      database: typeof db,
+      seeded: Awaited<ReturnType<typeof seed>>,
+    ) {
+      const issue = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, seeded.sourceIssueId))
+        .then((rows) => rows[0]!);
+      // Non-delivery: every wake out of this gate is refunded, so no attempt is ever spent.
+      const recovery = recoveryService(database, {
+        enqueueWakeup: vi.fn().mockResolvedValue(null),
+      });
+      await recovery.escalateStrandedAssignedIssue({
+        issue,
+        previousStatus: "in_progress",
+        latestRun: { ...latestRun, agentId: seeded.ownerAgentId },
+        comment: "Automatic continuation recovery failed.",
+      });
+      const [minted] = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, seeded.sourceIssueId));
+      expect(minted).toBeDefined();
+      await db
+        .update(issueRecoveryActions)
+        .set({
+          status: "active",
+          retiringBound: null,
+          // 0 delivered wakes. The reserve on the next pass takes it to 1 and the refund
+          // takes it back to 0, which is the discrepancy the announce has to correct for.
+          attemptCount: 0,
+          timeoutAt: pastHorizon,
+          // BOTH homes of the horizon, not just the column. `upsertSourceScoped` preserves
+          // the creation-anchored horizon across sweeps by reading
+          // `evidence.sourceScopedWakeHorizonAt` FIRST and writing it back into `timeoutAt`
+          // (`carriedWakeHorizonAt` / `wakeHorizonAt`). Backdating the column alone is
+          // silently undone by the next upsert, which restores the future horizon the first
+          // escalation minted — the row then is not exhausted, the dispatch never reaches the
+          // gate, and the test fails having exercised nothing.
+          //
+          // Merged in SQL rather than replaced, so the keys the first escalation wrote
+          // (`latestRunAgentId`, the routing anchors) survive and the fixture differs from a
+          // real row in exactly one field.
+          evidence: sql`${issueRecoveryActions.evidence} || ${JSON.stringify({
+            sourceScopedWakeHorizonAt: pastHorizon.toISOString(),
+          })}::jsonb`,
+          // Stale it so `isUnchangedAction` is false and the upsert reserves.
+          fingerprint: `stale:${seeded.sourceIssueId}`,
+        })
+        .where(eq(issueRecoveryActions.id, minted!.id));
+      // Clear the mint-time escalation comment and the mint-time metric reads, so what the
+      // assertions see comes only from the dispatch under test.
+      await db.delete(issueComments).where(eq(issueComments.issueId, seeded.sourceIssueId));
+      __resetMetricsForTest();
+
+      // Re-read: the first escalation transfers ownership and writes the issue, so the
+      // object captured above is stale by now.
+      const escalatedIssue = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, seeded.sourceIssueId))
+        .then((rows) => rows[0]!);
+      await recovery.escalateStrandedAssignedIssue({
+        issue: escalatedIssue,
+        previousStatus: "in_progress",
+        latestRun: { ...latestRun, agentId: seeded.ownerAgentId },
+        comment: "Automatic continuation recovery failed.",
+      });
+      return minted!.id;
+    }
+
+    it("counts and announces the dispatch retirement with the REFUNDED attempt count", async () => {
+      const seeded = await seed();
+      await withManager(seeded);
+      const actionId = await dispatchOntoPastHorizon(db, seeded);
+
+      const action = await readAction(actionId);
+      expect(action).toMatchObject({
+        status: "escalated",
+        retiringBound: "timeout_horizon",
+        // The refund landed: reserved to 1, given back to 0.
+        attemptCount: 0,
+      });
+
+      // THE discriminator for the `Math.max(attemptCount - 1, 0)` adjustment. The announce is
+      // handed the REFUNDED count, so `neverDelivered` is true and the increment lands on
+      // `never_delivered`. Hand it the reserved count instead — which is what reverting that
+      // one expression does — and `attemptCount === 0` is false, the increment lands on
+      // `delivered`, and a never-woken action is labelled as woken. That is precisely the
+      // mislabel PEN-3000 exists to prevent, and this pair of assertions is what catches it:
+      // the second one matters as much as the first, because a single-series check passes
+      // against a revert that merely moves the count to the other label.
+      const { body } = await renderMetrics();
+      expect(body).toContain(`${RECOVERY_HORIZON_EXPIRED_METRIC}{delivery="never_delivered"} 1`);
+      expect(body).toContain(`${RECOVERY_HORIZON_EXPIRED_METRIC}{delivery="delivered"} 0`);
+
+      // Exactly one notice, from two writers that share a marker. `escalateStrandedAssignedIssue`
+      // posts the identical `Recovery wake horizon reached for action ...` text inside the
+      // escalation transaction, which runs BEFORE this dispatch — so on this path the
+      // dispatch's own notice is always deduped away and its contribution is the METRIC
+      // above, not the comment. That is why the metric increment must stay ahead of the dedup
+      // check in `announceRecoveryHorizonRetirement`: behind it, writer 2 would contribute
+      // nothing at all on the only path it ever runs, which is the silence this row exists to
+      // end.
+      //
+      // The surviving notice's `- Attempts:` figure is therefore NOT assertable as the
+      // refunded count here — it is the escalation path's text, and that one renders the
+      // RESERVED count (`action.attemptCount`, pre-refund) against a row that reads 0. That
+      // discrepancy is real but pre-existing and belongs to the other writer; it is recorded
+      // on PEN-3989 rather than widened into this change.
+      const comments = await db
+        .select({ body: issueComments.body })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, seeded.sourceIssueId));
+      const horizonNotices = comments.filter((row) => row.body.includes("Recovery wake horizon reached"));
+      expect(horizonNotices).toHaveLength(1);
+    });
+
+    /**
+     * The CAS miss. `retireAndReleaseWakeAttempt` only updates a row while the owner and the
+     * attempt count still match what the reserve read; a sweep that re-homes the action in
+     * between (`isNewOwnerSequence` resets `attemptCount`) matches ZERO rows and resolves with
+     * no error.
+     *
+     * Before the fix the gate read "did not throw" as proof of retirement and announced
+     * anyway: a counter increment feeding PEN-3322's alert, a notice telling an operator a
+     * still-`active` row had moved to `escalated`, and a dedup marker that makes the REAL
+     * retirement's notice look like a duplicate when it arrives.
+     */
+    function dbWithRehomeDuringRetire(
+      real: typeof db,
+      sabotage: { run: () => Promise<unknown>; armed: boolean; fired: boolean },
+    ) {
+      const bind = (target: object, prop: string | symbol) => {
+        const value = Reflect.get(target, prop);
+        return typeof value === "function" ? value.bind(target) : value;
+      };
+      // Run the re-home immediately before the statement executes, so the CAS reads a row
+      // the reserve no longer describes. Wrapping `then` rather than the builder call is what
+      // makes the ordering exact: drizzle builds lazily and executes on await.
+      const deferUntilAfterSabotage = (node: object): object => new Proxy(node, {
+        get(target, prop) {
+          if (prop === "then") {
+            return (onFulfilled?: unknown, onRejected?: unknown) =>
+              sabotage.run().then(() => {
+                sabotage.fired = true;
+                return (target as PromiseLike<unknown>).then(
+                  onFulfilled as never,
+                  onRejected as never,
+                );
+              });
+          }
+          const value = bind(target, prop);
+          if (prop === "where" || prop === "returning") {
+            return (...args: unknown[]) =>
+              deferUntilAfterSabotage((value as (...a: unknown[]) => object)(...args));
+          }
+          return value;
+        },
+      });
+      return new Proxy(real, {
+        get(target, prop) {
+          if (prop !== "update") return bind(target, prop);
+          return (table: unknown) => {
+            const builder = (target.update as (t: unknown) => object)(table);
+            if (table !== issueRecoveryActions) return builder;
+            return new Proxy(builder, {
+              get(b, p) {
+                if (p !== "set") return bind(b, p);
+                return (values: Record<string, unknown>) => {
+                  const node = (bind(b, "set") as (v: unknown) => object)(values);
+                  // Discriminate the retire+refund statement by its payload: it is the only
+                  // UPDATE that writes `retiringBound` AND bumps `nonDeliverySweepCount`.
+                  // `releaseWakeAttempt` bumps the sweep count without the bound;
+                  // `retireWakeAction` writes the bound without the sweep count.
+                  const isRetireAndRefund = values.retiringBound !== undefined
+                    && values.nonDeliverySweepCount !== undefined;
+                  if (!isRetireAndRefund || sabotage.armed === false) return node;
+                  sabotage.armed = false;
+                  return deferUntilAfterSabotage(node);
+                };
+              },
+            });
+          };
+        },
+      }) as typeof db;
+    }
+
+    it("does not count or announce when the retirement UPDATE matched no row", async () => {
+      const seeded = await seed();
+      await withManager(seeded);
+      // A THIRD agent, distinct from both the owner and the manager, so the re-home below
+      // cannot coincide with whatever the routing ladder picked.
+      const rehomedOwnerId = randomUUID();
+      await db.insert(agents).values({
+        id: rehomedOwnerId,
+        companyId: seeded.companyId,
+        name: "Another owner",
+        role: "engineer",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      const sabotage = {
+        // `armed` gates the one-shot injection; `fired` records that it actually EXECUTED,
+        // which is a different claim — the statement could be built and never awaited.
+        armed: true,
+        fired: false,
+        run: () =>
+          db
+            .update(issueRecoveryActions)
+            .set({ ownerAgentId: rehomedOwnerId })
+            .where(eq(issueRecoveryActions.sourceIssueId, seeded.sourceIssueId)),
+      };
+
+      const actionId = await dispatchOntoPastHorizon(
+        dbWithRehomeDuringRetire(db, sabotage),
+        seeded,
+      );
+
+      // The injection really fired, and it really re-homed the row. Without BOTH, this test
+      // would pass on a no-op proxy — the strongest failure mode for a race fixture.
+      expect(sabotage.fired).toBe(true);
+      expect((await readAction(actionId)).ownerAgentId).toBe(rehomedOwnerId);
+
+      // The row was NOT retired — which is the whole point. Pre-fix the gate announced a
+      // retirement of a row that still reads `active` with no bound.
+      const action = await readAction(actionId);
+      expect(action).toMatchObject({ status: "active", retiringBound: null });
+
+      // THE assertion. Both series flat: the dispatch announced nothing, because the UPDATE
+      // it is reporting on matched no row. Before the fix, `retirementCommitted` meant only
+      // "did not throw", so this same state incremented `never_delivered` — one count, into
+      // the series PEN-3322's alert sums, for a retirement that never happened.
+      const { body } = await renderMetrics();
+      expect(body).toContain(`${RECOVERY_HORIZON_EXPIRED_METRIC}{delivery="never_delivered"} 0`);
+      expect(body).toContain(`${RECOVERY_HORIZON_EXPIRED_METRIC}{delivery="delivered"} 0`);
+
+      // Deliberately NOT asserting the absence of a horizon notice. The second consequence
+      // Ally named — a notice claiming a still-`active` row moved to `escalated` — is
+      // unreachable from this path in either direction, because `escalateStrandedAssignedIssue`
+      // posts the identical marker earlier in the same pass and wins the dedup. So the comment
+      // count is 1 whether the gate is fixed or broken, and asserting on it would be a check
+      // that cannot fail for the reason it names. The metric above is the one that
+      // discriminates.
+    });
   });
 });

@@ -228,4 +228,115 @@ describe("run liveness classifier", () => {
     expect(classification.actionability).toBe("unknown");
     expect(classification.nextAction).toBeNull();
   });
+
+  // PEN-4035. The stamp used to be gated on `advanced | completed | blocked`,
+  // so a run that died at the provider after writing a real issue comment
+  // reported `lastUsefulActionAt: null` -- and because
+  // classifyAndPersistRunLiveness writes the field unconditionally, that null
+  // also overwrote the live stamp flushOutputProgress had already recorded.
+  // Measured over n=1000 runs: 0/57 rate_limit_exhausted, 0/9 timed_out, 0/9
+  // claude_transient_upstream and 0/7 acpx_turn_failed carried the stamp,
+  // against 22/22 for cancelled, while 8 of 63 of those null rows had in fact
+  // authored a durable comment.
+  describe("lastUsefulActionAt is kept on abnormal termination (PEN-4035)", () => {
+    const latestEvidenceAt = new Date("2026-10-12T09:15:00Z");
+    const evidence = { issueCommentsCreated: 1, latestEvidenceAt };
+
+    // The fault classes measured at a false 0%: every non-succeeded run status
+    // lands on `failed`, so one case per distinct errorCode shape is enough to
+    // cover all four.
+    it.each([
+      ["failed", "rate_limit_exhausted"],
+      ["timed_out", "timed_out"],
+      ["failed", "claude_transient_upstream"],
+      ["failed", "acpx_turn_failed"],
+    ])("retains the evidence stamp for runStatus=%s errorCode=%s", (runStatus, errorCode) => {
+      const classification = classifyRunLiveness({ ...baseInput, runStatus, errorCode, evidence });
+
+      expect(classification.livenessState).toBe("failed");
+      expect(classification.lastUsefulActionAt).toBe(latestEvidenceAt);
+    });
+
+    it("retains the evidence stamp on the interrupted -> needs_followup arm", () => {
+      const classification = classifyRunLiveness({
+        ...baseInput,
+        runStatus: "interrupted",
+        errorCode: "external_wait_yield",
+        evidence,
+      });
+
+      expect(classification.livenessState).toBe("needs_followup");
+      expect(classification.lastUsefulActionAt).toBe(latestEvidenceAt);
+    });
+
+    it("retains the evidence stamp on the unmanaged-background-task failed arm", () => {
+      const classification = classifyRunLiveness({
+        ...baseInput,
+        runStatus: "failed",
+        errorCode: "process_lost",
+        evidence,
+        resultJson: {
+          stopReason: "unmanaged_background_task_stopped",
+          unmanagedBackgroundTask: {
+            kind: "orphaned_process_group_cleanup",
+            stopped: true,
+            stopReason: "unmanaged_background_task_stopped",
+            reason: "unmanaged background task stopped; no durable live path",
+          },
+        },
+      });
+
+      expect(classification.livenessState).toBe("failed");
+      expect(classification.lastUsefulActionAt).toBe(latestEvidenceAt);
+    });
+
+    // The other half of the contract: the fix widens *what is kept*, it does
+    // not invent a stamp. A failed run that genuinely produced nothing durable
+    // must still read null, or the 0% artifact is merely replaced by a 100%
+    // one. Workspace creation alone is explicitly not concrete evidence
+    // (hasConcreteActionEvidence), so it is the sharpest negative case.
+    it("still reports null for a failed run with no concrete evidence", () => {
+      expect(
+        classifyRunLiveness({ ...baseInput, runStatus: "failed", errorCode: "rate_limit_exhausted" })
+          .lastUsefulActionAt,
+      ).toBeNull();
+
+      expect(
+        classifyRunLiveness({
+          ...baseInput,
+          runStatus: "failed",
+          errorCode: "rate_limit_exhausted",
+          evidence: { workspaceOperationsCreated: 1, latestEvidenceAt },
+        }).lastUsefulActionAt,
+      ).toBeNull();
+    });
+
+    // Regression guard on the states that always kept the stamp, so a future
+    // edit cannot restore the gate by inverting it.
+    it("still retains the stamp for advanced/completed/blocked", () => {
+      expect(
+        classifyRunLiveness({
+          ...baseInput,
+          resultJson: { summary: "Updated implementation." },
+          evidence,
+        }).lastUsefulActionAt,
+      ).toBe(latestEvidenceAt);
+
+      expect(
+        classifyRunLiveness({
+          ...baseInput,
+          issue: { ...baseInput.issue, status: "done" },
+          evidence,
+        }).lastUsefulActionAt,
+      ).toBe(latestEvidenceAt);
+
+      expect(
+        classifyRunLiveness({
+          ...baseInput,
+          issue: { ...baseInput.issue, status: "blocked" },
+          evidence,
+        }).lastUsefulActionAt,
+      ).toBe(latestEvidenceAt);
+    });
+  });
 });

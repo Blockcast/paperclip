@@ -75,6 +75,7 @@ import {
   refreshAgentStartLockMetrics,
   refreshDbPoolMetrics,
   refreshFdClassMetrics,
+  refreshNativeMemoryMetrics,
   startScrapeMetricsCollector,
 } from "./services/scrape-metrics-collector.js";
 import { pluginUiStaticRoutes } from "./routes/plugin-ui-static.js";
@@ -339,6 +340,7 @@ export async function createApp(
       refreshDbPoolMetrics(db);
       refreshAgentStartLockMetrics();
       refreshFdClassMetrics();
+      refreshNativeMemoryMetrics();
       const { contentType, body } = await renderMetrics();
       res.status(200).set("Content-Type", contentType).send(body);
     } catch (err) {

@@ -159,6 +159,79 @@ describe("issue thread interaction helpers", () => {
     })).toBe("Question expired after comment");
   });
 
+  it("names withdrawal with one verb across every withdrawable kind", () => {
+    // BLO-20688: all four withdrawable kinds store status "cancelled", so the
+    // thread must not call the same action "Cancelled" on one and "Withdrew" on
+    // the rest. Asserted as a set so a new label cannot drift off the verb.
+    const base = {
+      id: "interaction-withdrawn",
+      companyId: "company-1",
+      issueId: "issue-1",
+      status: "cancelled" as const,
+      continuationPolicy: "wake_assignee" as const,
+      createdAt: "2026-04-06T12:00:00.000Z",
+      updatedAt: "2026-04-06T12:00:00.000Z",
+    };
+
+    const summaries = [
+      buildIssueThreadInteractionSummary({
+        ...base,
+        kind: "ask_user_questions",
+        payload: {
+          version: 1,
+          questions: [
+            {
+              id: "question-1",
+              prompt: "Pick one",
+              selectionMode: "single",
+              options: [{ id: "option-1", label: "Option 1" }],
+            },
+          ],
+        },
+      }),
+      buildIssueThreadInteractionSummary({
+        ...base,
+        kind: "suggest_tasks",
+        payload: { version: 1, tasks: [{ clientKey: "task-1", title: "One" }] },
+      }),
+      buildIssueThreadInteractionSummary({
+        ...base,
+        kind: "request_confirmation",
+        payload: { version: 1, prompt: "Proceed?" },
+      }),
+      buildIssueThreadInteractionSummary({
+        ...base,
+        kind: "request_checkbox_confirmation",
+        payload: { version: 1, prompt: "Pick items", options: [{ id: "a", label: "A" }] },
+      }),
+    ];
+
+    expect(summaries.filter((summary) => summary.startsWith("Withdrew "))).toHaveLength(4);
+    expect(summaries[0]).toBe("Withdrew 1 question");
+
+    expect(buildIssueThreadInteractionSummary({
+      ...base,
+      kind: "ask_user_questions",
+      payload: {
+        version: 1,
+        questions: [
+          {
+            id: "question-1",
+            prompt: "Pick one",
+            selectionMode: "single",
+            options: [{ id: "option-1", label: "Option 1" }],
+          },
+          {
+            id: "question-2",
+            prompt: "Pick another",
+            selectionMode: "single",
+            options: [{ id: "option-2", label: "Option 2" }],
+          },
+        ],
+      },
+    })).toBe("Withdrew 2 questions");
+  });
+
   it("summarizes checkbox confirmation interactions by count", () => {
     const base = {
       id: "interaction-checkbox",

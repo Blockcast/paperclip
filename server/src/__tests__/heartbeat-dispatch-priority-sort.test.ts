@@ -140,7 +140,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-dispatch-priority-");
     db = createDb(tempDb.connectionString);
-    heartbeat = heartbeatService(db, { penstockGate: allowPenstockGate });
+    heartbeat = heartbeatService(db, { penstockAvailabilityGate: allowPenstockGate });
   });
 
   afterEach(async () => {
@@ -2075,7 +2075,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     // scanLimit 2 + maxScanBatches 1 makes the first pass stop after exactly
     // two rows with the cursor set and the scan NOT exhausted.
     const boundedHeartbeat = heartbeatService(db, {
-      penstockGate: allowPenstockGate,
+      penstockAvailabilityGate: allowPenstockGate,
       queuedRunDispatchBounds: { scanLimit: 2, maxScanBatches: 1, maxResumePasses: 8 },
     });
 
@@ -2251,7 +2251,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     const freshAt = new Date(baseNow);
 
     const boundedHeartbeat = heartbeatService(db, {
-      penstockGate: allowPenstockGate,
+      penstockAvailabilityGate: allowPenstockGate,
       queuedRunDispatchBounds: { scanLimit: 2, maxScanBatches: 1, maxResumePasses: 8 },
     });
 
@@ -2439,7 +2439,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     const baseNow = Date.now();
 
     const boundedHeartbeat = heartbeatService(db, {
-      penstockGate: allowPenstockGate,
+      penstockAvailabilityGate: allowPenstockGate,
       queuedRunDispatchBounds: { scanLimit: 2, maxScanBatches: 1, maxResumePasses: 64 },
     });
 
@@ -2889,7 +2889,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     const baseNow = Date.now();
 
     const boundedHeartbeat = heartbeatService(db, {
-      penstockGate: allowPenstockGate,
+      penstockAvailabilityGate: allowPenstockGate,
       queuedRunDispatchBounds: { scanLimit: 2, maxScanBatches: 1, maxResumePasses: 64 },
     });
 
@@ -3192,7 +3192,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
 
     const criticalLaneReschedules: Array<{ agentId: string; reason: string }> = [];
     const boundedHeartbeat = heartbeatService(db, {
-      penstockGate: allowPenstockGate,
+      penstockAvailabilityGate: allowPenstockGate,
       onQueuedDispatchScheduledForTest: (event) => {
         if (event.reason === "resume_critical_lane") {
           criticalLaneReschedules.push({ agentId: event.agentId, reason: event.reason });
@@ -3512,6 +3512,140 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     expect(starvedRun?.status).not.toBe("queued");
   });
 
+  it("dispatches an issue-less run past the absolute starvation ceiling before fresh critical issue work (BLO-44443)", async () => {
+    // Regression for BLO-44443: the `!hasId` branch of dispatchRank returned
+    // before the BLO-21792 absolute ceiling, so every GitHub PR-review wake
+    // (issue-less by construction) could age past STARVATION_ABSOLUTE_ESCALATION_MS
+    // and still rank 2, behind any fresh critical issue row forever. Measured
+    // on Ally 2026-10-12: 502 queued pr_review runs, 24-36h mean wait on every
+    // repo, while the ceiling bounds every issue-backed tier at 6h. Past the
+    // ceiling an issue-less run must rank ABSOLUTE_STARVATION_DISPATCH_RANK and
+    // win even against fresh critical work, exactly like an issue-backed run.
+    // The 3h-old sibling case (BLO-19337) pins that below the ceiling critical
+    // work still wins.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const criticalIssueId = randomUUID();
+    const issuePrefix = `W${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(companies).values({
+      id: companyId,
+      name: "IssuelessAbsoluteCeilingTestCo",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "IssuelessAbsoluteCeilingTestAgent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(issues).values([
+      {
+        id: criticalIssueId,
+        companyId,
+        title: "Critical exact-head review",
+        status: "todo",
+        priority: "critical",
+        assigneeAgentId: agentId,
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+      },
+    ]);
+    // One hour past the 6h ceiling; the BLO-19337 sibling uses 3h, under it.
+    const starvedCreatedAt = new Date(Date.now() - 7 * 60 * 60 * 1000);
+    const freshCreatedAt = new Date();
+    const starvedWakeId = randomUUID();
+    const starvedRunId = randomUUID();
+    const criticalWakeId = randomUUID();
+    const criticalRunId = randomUUID();
+    await db.insert(agentWakeupRequests).values([
+      {
+        id: starvedWakeId,
+        companyId,
+        agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "github_pr_ready_for_review",
+        payload: {},
+        status: "queued",
+        runId: starvedRunId,
+        requestedAt: starvedCreatedAt,
+        updatedAt: starvedCreatedAt,
+      },
+      {
+        id: criticalWakeId,
+        companyId,
+        agentId,
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "heartbeat_timer",
+        payload: { issueId: criticalIssueId },
+        status: "queued",
+        runId: criticalRunId,
+        requestedAt: freshCreatedAt,
+        updatedAt: freshCreatedAt,
+      },
+    ]);
+    await db.insert(heartbeatRuns).values([
+      {
+        id: starvedRunId,
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "queued",
+        wakeupRequestId: starvedWakeId,
+        contextSnapshot: { wakeReason: "github_pr_ready_for_review" },
+        createdAt: starvedCreatedAt,
+        updatedAt: starvedCreatedAt,
+      },
+      {
+        id: criticalRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        wakeupRequestId: criticalWakeId,
+        contextSnapshot: { issueId: criticalIssueId, wakeReason: "heartbeat_timer" },
+        createdAt: freshCreatedAt,
+        updatedAt: freshCreatedAt,
+      },
+    ]);
+    const dispatchedRunIds: string[] = [];
+    mockAdapterExecute.mockImplementation(async (args: { runId: string }) => {
+      dispatchedRunIds.push(args.runId);
+      return {
+        exitCode: 0,
+        signal: null as string | null,
+        timedOut: false,
+        errorMessage: null as string | null,
+        resultJson: { exitCode: 0 },
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, starvedRunId);
+
+    // The ceiling is the only rank that outranks fresh critical work, and past
+    // it the issue-less run must take the single slot first.
+    expect(dispatchedRunIds[0]).toBe(starvedRunId);
+    const starvedRun = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, starvedRunId))
+      .then((rows) => rows[0] ?? null);
+    expect(starvedRun?.status).not.toBe("queued");
+  });
+
   it("keeps a fresh issue-less run behind issue work (BLO-18995 does not invert normal order)", async () => {
     // Guard the other side of the BLO-18995 change: the escalation must be an
     // aging floor, not a blanket promotion. A *fresh* issue-less run still
@@ -3666,7 +3800,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     const blockedCount =
       dispatchBounds.scanLimit * dispatchBounds.maxScanBatches * dispatchBounds.maxResumePasses;
     const cappedHeartbeat = heartbeatService(db, {
-      penstockGate: allowPenstockGate,
+      penstockAvailabilityGate: allowPenstockGate,
       queuedRunDispatchBounds: dispatchBounds,
       onQueuedDispatchScheduledForTest: ({ reason }) => {
         dispatchEvents.push(reason);
@@ -3873,7 +4007,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     // NOT exhausted, which is the state that owes a continuation.
     const dispatchBounds = { scanLimit: 2, maxScanBatches: 1, maxResumePasses: 5 };
     const partialHeartbeat = heartbeatService(db, {
-      penstockGate: allowPenstockGate,
+      penstockAvailabilityGate: allowPenstockGate,
       queuedRunDispatchBounds: dispatchBounds,
     });
 
@@ -4063,7 +4197,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     });
     let boundedHeartbeat!: ReturnType<typeof heartbeatService>;
     boundedHeartbeat = heartbeatService(db, {
-      penstockGate: allowPenstockGate,
+      penstockAvailabilityGate: allowPenstockGate,
       queuedRunDispatchBounds: { scanLimit: 2, maxScanBatches: 1, maxResumePasses: 5 },
       beforeQueuedDispatchPassForTest: async (event) => {
         if (event.reason !== "resume_critical_lane") return;
@@ -4273,7 +4407,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     const issuePrefix = `R${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
     const baseCreatedAt = new Date(Date.now() - 5 * 60 * 1000);
     const boundedHeartbeat = heartbeatService(db, {
-      penstockGate: allowPenstockGate,
+      penstockAvailabilityGate: allowPenstockGate,
       queuedRunDispatchBounds: { scanLimit: 2, maxScanBatches: 1, maxResumePasses: 5 },
     });
 
@@ -4484,7 +4618,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
       let releasedStaleSlot = false;
 
       const boundedHeartbeat = heartbeatService(db, {
-        penstockGate: allowPenstockGate,
+        penstockAvailabilityGate: allowPenstockGate,
         queuedRunDispatchBounds: { scanLimit: 4, maxScanBatches: 1, maxResumePasses: 5 },
         afterQueuedDispatchContinuationScheduledForTest: async (event) => {
           if (
@@ -4682,7 +4816,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     let sawFullyDeferredRecoveryPage = false;
 
     const boundedHeartbeat = heartbeatService(db, {
-      penstockGate: allowPenstockGate,
+      penstockAvailabilityGate: allowPenstockGate,
       queuedRunDispatchBounds: { scanLimit: 2, maxScanBatches: 1, maxResumePasses: 12 },
       beforeQueuedDispatchRefusalStatusReadForTest: async () => {
         refusalStatusReads += 1;
@@ -4842,7 +4976,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     const scheduledReasons: string[] = [];
     let releasedSlot = false;
     const boundedHeartbeat = heartbeatService(db, {
-      penstockGate: allowPenstockGate,
+      penstockAvailabilityGate: allowPenstockGate,
       queuedRunDispatchBounds: { scanLimit: 1, maxScanBatches: 1, maxResumePasses: 5 },
       onQueuedDispatchScheduledForTest: ({ reason }) => scheduledReasons.push(reason),
       beforeQueuedDispatchPassForTest: async ({ reason }) => {
@@ -4964,7 +5098,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     const issuePrefix = `F${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
     let injectedFailure = false;
     const boundedHeartbeat = heartbeatService(db, {
-      penstockGate: allowPenstockGate,
+      penstockAvailabilityGate: allowPenstockGate,
       beforeQueuedDispatchRefusalStatusReadForTest: (run) => {
         if (run.id !== secondRunId || injectedFailure) return;
         injectedFailure = true;
@@ -5101,7 +5235,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     // would make the test pass vacuously whenever that agent sorted last.
     let failedAgentId: string | null = null;
     const boundedHeartbeat = heartbeatService(db, {
-      penstockGate: allowPenstockGate,
+      penstockAvailabilityGate: allowPenstockGate,
       beforeQueuedDispatchRefusalStatusReadForTest: (run) => {
         if (failedAgentId !== null) return;
         if (agentIdByRefusedRunId.get(run.id) !== run.agentId) return;
@@ -5232,7 +5366,7 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
     const issuePrefix = `U${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
     const cursorEvents: string[] = [];
     const boundedHeartbeat = heartbeatService(db, {
-      penstockGate: allowPenstockGate,
+      penstockAvailabilityGate: allowPenstockGate,
       queuedRunDispatchBounds: { scanLimit: 1, maxScanBatches: 1, maxResumePasses: 5 },
       onQueuedDispatchScheduledForTest: ({ reason }) => cursorEvents.push(reason),
     });

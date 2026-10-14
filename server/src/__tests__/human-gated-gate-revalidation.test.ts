@@ -243,7 +243,15 @@ describe("probeApprovalGate", () => {
     expect(result?.evidence).toContain("a2=escalated_to_board");
   });
 
-  it("stays gated while any one of several cards is undecided", () => {
+  it("prefers a grant over a sibling undecided card (PEN-4061)", () => {
+    // This test previously asserted the opposite, and the behaviour it pinned
+    // is the defect. An undecided sibling is a *different ask*: it discharges
+    // the grant no more than a refusal or a withdrawal does, both of which the
+    // grant already beats. The inversion fired on exactly the rows that could
+    // least afford it — the correct response to noticing an approved decision
+    // nobody executed is to file a card chasing it, and filing it deleted the
+    // row from this escalation while moving it onto the queue the grant had
+    // already removed it from.
     const result = probeApprovalGate(
       evidence({
         approvals: [
@@ -252,8 +260,47 @@ describe("probeApprovalGate", () => {
         ],
       }),
     );
+    expect(result?.verdict).toBe("resolved-but-open");
+    expect(result?.resolutionKind).toBe("approval-granted");
+    expect(result?.evidence).toContain("a1=approved");
+    // The undecided card is carried as context, not dropped: a reader must be
+    // able to see the chase card exists without it suppressing the grant.
+    expect(result?.evidence).toContain("a2=pending");
+    expect(result?.evidence).toContain("does not discharge the grant");
+  });
+
+  it("still gates a row whose undecided card has no grant beside it (PEN-4061)", () => {
+    // The guard on the reorder above: it must stay a narrowing. With no grant
+    // on the row, an undecided card gates it exactly as it always did.
+    const result = probeApprovalGate(
+      evidence({
+        approvals: [
+          { approvalId: "a1", approvalType: "request_board_approval", approvalStatus: "rejected" },
+          { approvalId: "a2", approvalType: "request_board_approval", approvalStatus: "pending" },
+        ],
+      }),
+    );
     expect(result?.verdict).toBe("still-gated");
     expect(result?.evidence).toContain("a2=pending");
+  });
+
+  it("lets drift outrank a grant, unlike an undecided card (PEN-4061)", () => {
+    // The asymmetry is deliberate and is the whole reason `unrecognised` keeps
+    // its short-circuit above the grant. `pending` has a known meaning and it
+    // is not "this grant is suspended"; an unrecognised status has no known
+    // meaning, so it may be exactly that. Property 2 applies where the meaning
+    // is unknown and does not apply where it is known.
+    const result = probeApprovalGate(
+      evidence({
+        approvals: [
+          { approvalId: "a1", approvalStatus: "approved" },
+          { approvalId: "a2", approvalStatus: "grant_suspended_pending_countersign" },
+        ],
+      }),
+    );
+    expect(result?.verdict).toBe("still-gated");
+    expect(result?.evidence).toContain("does not recognise");
+    expect(result?.evidence).toContain("a2=grant_suspended_pending_countersign");
   });
 });
 
@@ -473,11 +520,77 @@ describe("classifyGate", () => {
     // notice that a card was answered.
     expect(result.resolutionKind).toBe("blocker-cancelled-edge-stuck");
   });
+
+  it("escalates a chased grant instead of deleting it from the list (PEN-4061)", () => {
+    // The live shape the ticket measured, as a whole-row classification rather
+    // than a probe call: PEN-2203 carried two approved cards and one pending
+    // chase card filed 2026-10-12, and from that filing it was absent from the
+    // digest's `authorised, unperformed` bucket — proven absent, the bucket
+    // being fully enumerated at 22 of 22.
+    const result = classifyGate(
+      evidence({
+        issueId: "chased-grant",
+        status: "todo",
+        approvals: [
+          { approvalId: "1234beec", approvalType: "request_board_approval", approvalStatus: "approved" },
+          { approvalId: "612a9e95", approvalType: "request_board_approval", approvalStatus: "approved" },
+          { approvalId: "889ddfdc", approvalType: "request_board_approval", approvalStatus: "pending" },
+        ],
+      }),
+    );
+    expect(result.verdict).toBe("resolved-but-open");
+    expect(result.resolutionKind).toBe("approval-granted");
+    expect(
+      withheldFromAgeRankingIssueIds(revalidateGates([
+        evidence({
+          issueId: "chased-grant",
+          status: "todo",
+          approvals: [
+            { approvalId: "1234beec", approvalStatus: "approved" },
+            { approvalId: "889ddfdc", approvalStatus: "pending" },
+          ],
+        }),
+      ])).has("chased-grant"),
+    ).toBe(false);
+  });
+
+  it("carries a live grant through a blocker-gated row instead of dropping it (PEN-4061)", () => {
+    // PEN-1095: one card, approved 2026-06-26, zero undecided siblings, and
+    // absent from `authorised, unperformed` 109 days later. The probe-level
+    // reorder above does not reach it — `blockedBy` PEN-1225 (`todo`) gates the
+    // row, and still-gated wins at the combine step. That precedence is kept,
+    // because an open edge really does bar checkout (422); what changes is that
+    // the grant is no longer dropped from the text on the way past.
+    const result = classifyGate(
+      evidence({
+        issueId: "blocked-grant",
+        status: "blocked",
+        blockers: [
+          { blockerIssueId: "b1", blockerIdentifier: "PEN-1225", blockerStatus: "todo" },
+        ],
+        approvals: [{ approvalId: "ee75c805", approvalStatus: "approved" }],
+      }),
+    );
+    // The row genuinely cannot move, so it is not promoted to action-owed.
+    expect(result.verdict).toBe("still-gated");
+    expect(result.evidence).toContain("PEN-1225");
+    // But the authorisation is visible rather than silently discarded.
+    expect(result.evidence).toContain("ee75c805=approved");
+    expect(result.evidence).toContain("grant on it is live and undischarged");
+  });
 });
 
 describe("combineProbeVerdicts", () => {
   it("returns unverifiable for an empty probe list", () => {
     expect(combineProbeVerdicts("i1", "BLO-1", []).verdict).toBe("unverifiable");
+  });
+
+  it("does not invent a grant clause on a gated row that has none (PEN-4061)", () => {
+    const result = combineProbeVerdicts("i1", "BLO-1", [
+      { probe: "blocker-premise", verdict: "still-gated", evidence: "1 of 1 blockers still open" },
+    ]);
+    expect(result.verdict).toBe("still-gated");
+    expect(result.evidence).not.toContain("grant on it is live");
   });
 });
 

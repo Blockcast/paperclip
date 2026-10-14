@@ -119,7 +119,7 @@ describeEmbeddedPostgres("heartbeat dependabot stale-wake backfill (BLO-16446)",
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-dependabot-stale-wake-");
     db = createDb(tempDb.connectionString);
-    heartbeat = heartbeatService(db, { penstockGate: allowPenstockGate });
+    heartbeat = heartbeatService(db, { penstockAvailabilityGate: allowPenstockGate });
   });
 
   afterEach(async () => {

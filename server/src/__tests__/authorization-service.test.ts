@@ -711,6 +711,184 @@ describeEmbeddedPostgres("authorization service", () => {
     });
   });
 
+  it("ignores a foreign issue row without weakening configured cross-company boundary denial", async () => {
+    const company = await createCompany(db, "ForeignIssuePointer");
+    const foreignCompany = await createCompany(db, "ForeignIssueSource");
+    const actorAgent = await createAgent(db, company.id);
+    // Inserted directly, bypassing the service, so the row's companyId and the
+    // resource's companyId disagree — the data-integrity defect a caller that
+    // derived `resource.companyId` from the actor would produce.
+    const foreignIssue = await createIssue(db, foreignCompany.id, {
+      assigneeAgentId: actorAgent.id,
+    });
+    const inCompanyIssue = await createIssue(db, company.id, {
+      assigneeAgentId: actorAgent.id,
+    });
+    const actor = {
+      type: "agent" as const,
+      agentId: actorAgent.id,
+      companyId: company.id,
+      source: "agent_key" as const,
+    };
+    const authorization = authorizationService(db);
+
+    // Before the scoped loadIssue, the foreign row became a policy source and
+    // every action denied as cross_company_boundary / source "issue".
+    for (const action of ["issue:read", "issue:comment"] as const) {
+      await expect(authorization.decide({
+        actor,
+        action,
+        resource: {
+          type: "issue",
+          companyId: company.id,
+          issueId: foreignIssue.id,
+          assigneeAgentId: actorAgent.id,
+        },
+      })).resolves.toMatchObject({ allowed: true });
+    }
+
+    // A genuinely configured cross-company boundary on the actor's own issue
+    // still denies: the issue arm is scoped, not dropped.
+    await db.update(issues).set({
+      executionPolicy: {
+        authorizationPolicy: {
+          trustBoundary: {
+            mode: LOW_TRUST_REVIEW_PRESET,
+            companyId: foreignCompany.id,
+            rootIssueId: inCompanyIssue.id,
+          },
+        },
+      },
+    }).where(eq(issues.id, inCompanyIssue.id));
+
+    await expect(authorization.decide({
+      actor,
+      action: "issue:read",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: inCompanyIssue.id,
+        assigneeAgentId: actorAgent.id,
+      },
+    })).resolves.toMatchObject({
+      allowed: false,
+      reason: "deny_policy_restricted",
+      policyResolution: { reason: "cross_company_boundary", source: "issue" },
+    });
+  });
+
+  it("resolves a low-trust project boundary through its root issue's project", async () => {
+    const company = await createCompany(db, "LowTrustRootIssueProject");
+    const project = await createProject(db, company.id, "RootIssueProject");
+    const otherProject = await createProject(db, company.id, "OutsideRootIssue");
+    const rootIssueId = randomUUID();
+    const actorAgent = await createAgent(db, company.id, {
+      permissions: {
+        trustPreset: LOW_TRUST_REVIEW_PRESET,
+        authorizationPolicy: {
+          trustBoundary: { mode: LOW_TRUST_REVIEW_PRESET, rootIssueId },
+        },
+      },
+    });
+    await createIssue(db, company.id, { id: rootIssueId, projectId: project.id });
+    const authorization = authorizationService(db);
+    const actor = {
+      type: "agent" as const,
+      agentId: actorAgent.id,
+      companyId: company.id,
+      source: "agent_key" as const,
+    };
+
+    await expect(authorization.decide({
+      actor,
+      action: "project:read",
+      resource: { type: "project", companyId: company.id, projectId: project.id },
+    })).resolves.toMatchObject({ allowed: true, reason: "allow_low_trust_boundary" });
+    await expect(authorization.decide({
+      actor,
+      action: "project:read",
+      resource: { type: "project", companyId: company.id, projectId: otherProject.id },
+    })).resolves.toMatchObject({ allowed: false, reason: "deny_low_trust_boundary" });
+  });
+
+  it("keeps a boundary closed when the issueId is unreadable in the resource's company", async () => {
+    // `previewAssignment` / `explainAssignment` build their resource as
+    // `{ companyId: params.companyId, ...params.target }`, so `companyId` and
+    // `issueId` are both caller-supplied and can disagree. An unreadable row
+    // must not degrade to the caller-supplied projectId / assigneeAgentId.
+    const company = await createCompany(db, "UnreadableIssuePointer");
+    const foreignCompany = await createCompany(db, "UnreadableIssueSource");
+    const project = await createProject(db, company.id, "InBoundary");
+    const foreignIssue = await createIssue(db, foreignCompany.id, {
+      projectId: null,
+    });
+    const authorization = authorizationService(db);
+
+    const bridgeAgent = await createAgent(db, company.id);
+    const keyId = randomUUID();
+    const bridgeActor = {
+      type: "agent" as const,
+      agentId: bridgeAgent.id,
+      companyId: company.id,
+      source: "agent_key" as const,
+      keyId,
+      keyScope: { kind: "task_bridge" as const, projectId: project.id },
+    };
+    const ownIssue = await createIssue(db, company.id, { assigneeAgentId: bridgeAgent.id });
+
+    // Control: the write boundary does clear on a readable assigned issue.
+    await expect(authorization.decide({
+      actor: bridgeActor,
+      action: "issue:mutate",
+      resource: { type: "issue", companyId: company.id, issueId: ownIssue.id },
+    })).resolves.toMatchObject({ allowed: true });
+
+    await expect(authorization.decide({
+      actor: bridgeActor,
+      action: "issue:mutate",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: foreignIssue.id,
+        assigneeAgentId: bridgeAgent.id,
+      },
+    })).resolves.toMatchObject({ allowed: false, reason: "deny_scope" });
+
+    const lowTrustAgent = await createAgent(db, company.id, {
+      permissions: {
+        trustPreset: LOW_TRUST_REVIEW_PRESET,
+        authorizationPolicy: {
+          trustBoundary: { mode: LOW_TRUST_REVIEW_PRESET, projectIds: [project.id] },
+        },
+      },
+    });
+    const lowTrustActor = {
+      type: "agent" as const,
+      agentId: lowTrustAgent.id,
+      companyId: company.id,
+      source: "agent_key" as const,
+    };
+
+    // Control: with no issueId, the caller-supplied projectId is all there is
+    // and the boundary opens on it.
+    await expect(authorization.decide({
+      actor: lowTrustActor,
+      action: "issue:read",
+      resource: { type: "issue", companyId: company.id, projectId: project.id },
+    })).resolves.toMatchObject({ allowed: true, reason: "allow_low_trust_boundary" });
+
+    await expect(authorization.decide({
+      actor: lowTrustActor,
+      action: "issue:read",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: foreignIssue.id,
+        projectId: project.id,
+      },
+    })).resolves.toMatchObject({ allowed: false, reason: "deny_low_trust_boundary" });
+  });
+
   it("keeps responsible-user issue mutations denied for viewer memberships", async () => {
     const company = await createCompany(db, "ResponsibleUserIssueViewerDenied");
     const actorAgent = await createAgent(db, company.id, { role: "engineer" });
@@ -1951,6 +2129,109 @@ describeEmbeddedPostgres("authorization service", () => {
         status: "todo",
       },
     })).resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+  });
+
+  it("does not let an agent self-appoint onto a review shell in another company", async () => {
+    // Ally on #2479 at 1bc9a2b7: the scoped `loadIssue` made "foreign" and
+    // "absent" indistinguishable at a third converted site,
+    // `recoveryOrReviewIssueBlocksUnassignedAgentClaim`, which got no guard
+    // because the prior commit judged it to "want null-means-nothing". It does
+    // not: an unreadable row yielded `?.originKind ?? null`, and
+    // `DENIED_ORIGIN_KINDS.has("")` is `false` — "not a review shell", the
+    // permissive answer.
+    //
+    // This is the path that matters. The guard gates the self-appointment deny
+    // inside the `tasks:assign` block, and `tasks:assign` is exactly what
+    // `previewAssignment` / `explainAssignment` (plugin-host-services.ts:3350,
+    // 3366) pass to `decide()` — with `{ companyId: params.companyId,
+    // ...params.target }`, so companyId and issueId are both caller-supplied,
+    // can disagree by construction, and `originKind` is not among the fields
+    // `params.target` carries. Neither sibling guard covers it: the low-trust
+    // boundary sees `tasks:assign` only for a low-trust actor, and the
+    // task-bridge boundary needs a keyScope `pluginAssignmentActor` never emits.
+    const company = await createCompany(db, "SelfAppointForeignShellPointer");
+    const foreignCompany = await createCompany(db, "SelfAppointForeignShellSource");
+    const actor = await createAgent(db, company.id, { role: "engineer" });
+    const other = await createAgent(db, foreignCompany.id, { role: "engineer" });
+    const authorization = authorizationService(db);
+    const actorContext = { type: "agent", agentId: actor.id, companyId: company.id, source: "agent_key" } as const;
+
+    const foreignSource = await createIssue(db, foreignCompany.id, {
+      title: "Source issue in another company",
+      assigneeAgentId: other.id,
+      originKind: "manual",
+    });
+    const foreignReview = await createIssue(db, foreignCompany.id, {
+      title: "Orphaned productivity review in another company",
+      assigneeAgentId: null,
+      originKind: "issue_productivity_review",
+      originId: foreignSource.id,
+    });
+
+    // The finding: companyId is the actor's, issueId names a shell the actor's
+    // company cannot read, and no originKind is supplied — the exact shape the
+    // plugin callers produce. Unreadable must mean blocking, not "no origin
+    // kind". Before the guard this fell through to the ordinary assignment path.
+    await expect(authorization.decide({
+      actor: actorContext,
+      action: "tasks:assign",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: foreignReview.id,
+        assigneeAgentId: actor.id,
+        currentAssigneeAgentId: null,
+      },
+    })).resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+
+    // A dangling issueId takes the same branch, and must answer the same way.
+    await expect(authorization.decide({
+      actor: actorContext,
+      action: "tasks:assign",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: randomUUID(),
+        assigneeAgentId: actor.id,
+        currentAssigneeAgentId: null,
+      },
+    })).resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+
+    // CONTROL, on the readable path — without it this test would pass on a
+    // guard that denied every self-claim, which is the regression that would
+    // shut ordinary checkout fleet-wide.
+    const ownIssue = await createIssue(db, company.id, {
+      title: "Ordinary issue in the actor's own company",
+      assigneeAgentId: null,
+      originKind: "manual",
+    });
+    await expect(authorization.decide({
+      actor: actorContext,
+      action: "tasks:assign",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: ownIssue.id,
+        assigneeAgentId: actor.id,
+        currentAssigneeAgentId: null,
+      },
+    })).resolves.toMatchObject({ allowed: true });
+
+    // CONTROL on the caller-supplied short-circuit: a supplied `originKind` is
+    // still answered without a row read, so the `undefined` / `null`
+    // distinction the branch is built around survives the guard.
+    await expect(authorization.decide({
+      actor: actorContext,
+      action: "tasks:assign",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: foreignReview.id,
+        assigneeAgentId: actor.id,
+        currentAssigneeAgentId: null,
+        originKind: null,
+      },
+    })).resolves.toMatchObject({ allowed: true });
   });
 
   it("does not let an agent self-appoint onto a review shell through tasks:assign", async () => {

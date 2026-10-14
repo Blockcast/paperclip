@@ -91,9 +91,23 @@ function probeBlock(rendered, name) {
   return match[2];
 }
 
-// A stalled vCPU can hold /healthz past 5 s for a couple of periods without
-// the process being wedged; the worker already tolerates 10 s x 6. Killing
-// the API on 3 x 5 s is how 2026-09-05's outage happened.
+// A stalled vCPU can hold an in-memory probe handler past 5 s for a couple of
+// periods without the process being wedged; the worker already tolerates
+// 10 s x 6. Killing the API on 3 x 5 s is how 2026-09-05's outage happened.
+// These are the overlay's own steal-tolerance numbers and are asserted nowhere
+// else; the reasoning survives liveness moving /healthz -> /livez in BLO-28615,
+// since /livez is the same synchronous in-memory shape behind the same event
+// loop.
+//
+// This test used to also pin readiness at `timeoutSeconds: 5` — "the chart
+// default so a slow replica still leaves rotation". BLO-28615 moved readiness
+// to /api/health and inverted that: the timeout now sits above the endpoint's
+// own 13.19 s saturation tail so a *slow* pool stays in rotation and only a
+// *dead* one leaves it, and it is additionally floored by the /livez wedge
+// detector's saturation margin. Those assertions moved to probes.test.mjs,
+// which renders the same overlay and asserts floors rather than exact values —
+// so an overlay that re-tightens readiness is still caught, by a test that
+// carries the derivation.
 test("API liveness tolerates 10 s x 6 like the worker", () => {
   const rendered = renderTemplate("templates/deployment-api.yaml", [
     "--set",
@@ -103,10 +117,6 @@ test("API liveness tolerates 10 s x 6 like the worker", () => {
   const liveness = probeBlock(rendered, "livenessProbe");
   assert.match(liveness, /failureThreshold: 6\b/);
   assert.match(liveness, /timeoutSeconds: 10\b/);
-  // Readiness keeps the chart default so a slow replica still leaves rotation.
-  const readiness = probeBlock(rendered, "readinessProbe");
-  assert.match(readiness, /failureThreshold: 3\b/);
-  assert.match(readiness, /timeoutSeconds: 5\b/);
 });
 
 // With pve3 excluded, the hard two-host spread left pve2 as the only host for

@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { execFileSync } from "node:child_process";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
@@ -130,6 +131,92 @@ describe("referenced shared docs materialization", () => {
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }
+  });
+
+  describe("keeps materialized docs out of git status (BLO-22984)", () => {
+    const git = (cwd: string, ...args: string[]) =>
+      execFileSync("git", ["-c", "user.email=t@t", "-c", "user.name=t", ...args], { cwd, encoding: "utf8" });
+
+    async function repoWithLinkedWorktree(root: string) {
+      const main = path.join(root, "main");
+      await fs.mkdir(main, { recursive: true });
+      git(main, "init", "-q");
+      git(main, "commit", "-q", "--allow-empty", "-m", "init");
+      const linked = path.join(root, "linked");
+      git(main, "worktree", "add", "-q", linked);
+      return { main, linked };
+    }
+
+    it("leaves a linked worktree clean after writing a placeholder, idempotently", async () => {
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-docs-exclude-"));
+      const instructionsRootPath = path.join(root, "instructions");
+      await fs.mkdir(instructionsRootPath, { recursive: true });
+      try {
+        const { main, linked } = await repoWithLinkedWorktree(root);
+        for (let i = 0; i < 2; i++) {
+          await ensureReferencedSharedDocsMaterialized({
+            cwd: linked,
+            instructionsRootPath,
+            instructionsContents: "Read: docs/backlog-process.md",
+            onLog: async () => {},
+          });
+          // Checked per pass: on pass 2 the heal path would mask a missing write-path exclude.
+          expect(git(linked, "status", "--porcelain", "--untracked-files=all")).toBe("");
+        }
+        await expect(fs.readFile(path.join(linked, "docs", "backlog-process.md"), "utf8"))
+          .resolves.toContain("# Missing Shared Documentation");
+        expect(git(linked, "status", "--porcelain", "--untracked-files=all")).toBe("");
+        const exclude = await fs.readFile(path.join(main, ".git", "info", "exclude"), "utf8");
+        expect(exclude.split("\n").filter((l) => l === "/docs/backlog-process.md")).toHaveLength(1);
+      } finally {
+        await fs.rm(root, { recursive: true, force: true });
+      }
+    });
+
+    it("excludes a placeholder left by an earlier run in a plain repo", async () => {
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-docs-exclude-legacy-"));
+      const cwd = path.join(root, "workspace");
+      const instructionsRootPath = path.join(root, "instructions");
+      await fs.mkdir(path.join(cwd, "docs"), { recursive: true });
+      await fs.mkdir(instructionsRootPath, { recursive: true });
+      try {
+        git(cwd, "init", "-q");
+        await fs.writeFile(
+          path.join(cwd, "docs", "backlog-process.md"),
+          "# Missing Shared Documentation: docs/backlog-process.md\n",
+        );
+        await fs.writeFile(path.join(cwd, "docs", "real-work.md"), "# mine\n");
+        await ensureReferencedSharedDocsMaterialized({
+          cwd,
+          instructionsRootPath,
+          instructionsContents: "Read: docs/backlog-process.md\nRead: docs/real-work.md",
+          onLog: async () => {},
+        });
+        // Only our own placeholder is hidden; a genuine untracked doc stays visible.
+        expect(git(cwd, "status", "--porcelain", "--untracked-files=all")).toBe("?? docs/real-work.md\n");
+      } finally {
+        await fs.rm(root, { recursive: true, force: true });
+      }
+    });
+
+    it("does nothing outside a git repo", async () => {
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-docs-exclude-norepo-"));
+      const cwd = path.join(root, "workspace");
+      await fs.mkdir(cwd, { recursive: true });
+      const logs: string[] = [];
+      try {
+        await ensureReferencedSharedDocsMaterialized({
+          cwd,
+          instructionsRootPath: root,
+          instructionsContents: "Read: docs/backlog-process.md",
+          onLog: async (_s, chunk) => { logs.push(chunk); },
+        });
+        await expect(fs.stat(path.join(cwd, ".git"))).rejects.toThrow();
+        expect(logs.join("")).not.toContain("Could not exclude");
+      } finally {
+        await fs.rm(root, { recursive: true, force: true });
+      }
+    });
   });
 
   it("resolves shared docs curated above the instructions root", async () => {

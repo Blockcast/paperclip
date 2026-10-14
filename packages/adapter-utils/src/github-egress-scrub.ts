@@ -109,7 +109,22 @@ const ENVIRONMENT_DUMP_RE = new RegExp(
 // NAME=VALUE where the value is long and opaque. This is the fail-closed net
 // under the count threshold: one interpolated secret is not a "dump" but is
 // still a secret. Structural — it tests the value, not the name.
-const ASSIGNMENT_RE = /\b([A-Za-z_][A-Za-z0-9_]{2,})=(["']?)([^\s"'`\r\n]{16,})\2/g;
+//
+// BLO-43580: the value capture is the token alphabet, NOT "anything up to
+// whitespace". The old `[^\s"'`]` capture was greedy to end of line, so one
+// out-of-alphabet joiner (`?`, `&`, `,`, `;`, `(`, `|`, `#`, …) made the
+// whole run fail the alphabet gate then in isOpaqueSecretValue — and because the
+// regex had already CONSUMED that run, a nested `key=<secret>` inside it was
+// never offered to the detector at all. Stopping the capture at the first
+// out-of-alphabet character leaves the rest of the line to be scanned.
+//
+// No closing-quote backreference either: a quote is consumed only on the way
+// in, and the replacer leaves whatever follows the value in place. Requiring
+// the closing quote let `x="<secret>?…"` escape the same way.
+//
+// This capture IS the alphabet gate: isOpaqueSecretValue used to re-test the
+// value against the same class, which can no longer fail, so it was removed.
+const ASSIGNMENT_RE = /\b([A-Za-z_][A-Za-z0-9_]{2,})=(["']?)([A-Za-z0-9+/=_.\-]{16,})/g;
 
 // PEN-3907: a cryptographic content digest bound to a name that says so.
 //
@@ -136,7 +151,7 @@ const ASSIGNMENT_RE = /\b([A-Za-z_][A-Za-z0-9_]{2,})=(["']?)([^\s"'`\r\n]{16,})\
 // either, so both are required.
 //
 // Note the OCI form `name="sha256:<64hex>"` is already exempt for an unrelated
-// reason — `:` is outside the token alphabet in `isOpaqueSecretValue` — and
+// reason — `:` is outside the token alphabet ASSIGNMENT_RE captures — and
 // `digestExemptionApplies` does not cover it. A test pins that so the two
 // paths cannot silently diverge.
 
@@ -157,8 +172,18 @@ const HEX_DIGEST_RE = /^(?:[0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{56}|[0-9a-f]{64}|[
  *  stays correct if that capture ever widens. */
 const DIGEST_NAME_RE = /(?:^|[_.\-])(?:sha(?:1|224|256|384|512)|md5|digest|checksum)$/i;
 
+/** BLO-43580: pnpm's `patch_hash` — a base32 md5 of a patch file, 26 chars
+ *  of `[a-z2-7]` — as written into pnpm-lock.yaml inside a version specifier:
+ *  `postgres@3.4.9(patch_hash=<26>)`. It used to pass only because the old
+ *  greedy capture swallowed the trailing `)` and failed the alphabet gate;
+ *  once the capture stopped at `)` every dependency bump that re-wrote such a
+ *  line became unpushable. Exact name AND exact shape, same reasoning as the
+ *  hex digest pin above: neither half is safe alone. */
+const PNPM_PATCH_HASH_RE = /^[a-z2-7]{26}$/;
+
 /** True when a NAME=VALUE pair is a content digest pin rather than a secret. */
 function isContentDigestAssignment(name: string, value: string): boolean {
+  if (name === "patch_hash" && PNPM_PATCH_HASH_RE.test(value)) return true;
   return DIGEST_NAME_RE.test(name) && HEX_DIGEST_RE.test(value);
 }
 
@@ -179,6 +204,26 @@ function shannonEntropyBitsPerChar(value: string): number {
  *  segments essentially never take, because a token mixes letters with digits
  *  inside each run. */
 const LEXICAL_SEGMENT_RE = /^(?:[A-Za-z]+|[0-9]+)$/;
+
+/** BLO-44747: a word carrying ONE short digit run — `orc8r`, `k8s`, `ipv6`,
+ *  `i18n`, `eastus2`. Infrastructure names are built from these, and the
+ *  strict form above refused them: the orc8r CDN forward-queue federate job, a
+ *  Prometheus scrape-job name already public on onprem-k8s master, made every
+ *  agent push touching that file unpublishable. Bounded so it stays a word:
+ *  must open with a letter, one digit run of at most 2, and an exonerated value
+ *  may carry at most ONE such segment, written in a single case. A UUID stays
+ *  opaque — `386c81e8` opens with a digit, `e454` has a 3-digit run.
+ *
+ *  This DOES widen exoneration for random tokens, and the residual is measured,
+ *  not zero (Ally, review 5496550156). A random token often has all-but-one
+ *  segment letters-only, and this forgives exactly that one. Single case cuts
+ *  base64url-32 from ~70 to ~12 per 100k; fixed-layout keys are closed by the
+ *  uniform-length check in isLexicalIdentifier. What remains, through the whole
+ *  of isOpaqueSecretValue, 100k random values per shape: base64url-32 ~1e-4,
+ *  lower+digit with random separators ~3–5e-4 at 24–28 chars and ~2e-5 at 32,
+ *  fixed-layout 4×6 / 5×5 keys and base64url-43 0. Accepted: the alternative was refusing every agent
+ *  push touching a file that names an `orc8r` job. */
+const MIXED_LEXICAL_SEGMENT_RE = /^(?=.{2,8}$)(?:[a-z]+[0-9]{1,2}[a-z]*|[A-Z]+[0-9]{1,2}[A-Z]*)$/;
 
 /** Longest segment an identifier may carry and still be exonerated. This is
  *  identifier HEADROOM, not a security bound: 16 random lowercase letters is
@@ -222,7 +267,8 @@ const LEXICAL_IDENTIFIER_MAX_CONTENT_LENGTH = 3 * LEXICAL_LONG_SEGMENT_LENGTH;
  *
  * The discriminator is structure, not vocabulary (no word list to drift): a
  * credential is ONE opaque run, so a value is exonerated only when every
- * separator-delimited segment is itself a plain word or number, none exceeds
+ * separator-delimited segment is itself a plain word or number (BLO-44747: or,
+ * for at most one segment, MIXED_LEXICAL_SEGMENT_RE), none exceeds
  * LEXICAL_SEGMENT_MAX_LENGTH, at most one exceeds LEXICAL_LONG_SEGMENT_LENGTH,
  * AND the segments sum to at most LEXICAL_IDENTIFIER_MAX_CONTENT_LENGTH. Each
  * conjunct carries weight — `release-Candidate-<20 letters>` is refused on the
@@ -236,6 +282,8 @@ const LEXICAL_IDENTIFIER_MAX_CONTENT_LENGTH = 3 * LEXICAL_LONG_SEGMENT_LENGTH;
  * shape (Ally, review 5476147384): 0/20000 alnum-40, 1/20000 base64url-43 and
  * 1/20000 alnum-24 pass, and each of those passes is the entropy floor, not
  * this rule; re-measured with the summed-length cap in place, 0/20000 of each.
+ * Those figures predate the mixed-segment branch and hold for the all-plain
+ * path only; that branch's own residual is on MIXED_LEXICAL_SEGMENT_RE.
  * A UUID stays opaque, because `386c81e8` is neither a word nor a number.
  */
 function isLexicalIdentifier(value: string): boolean {
@@ -245,10 +293,14 @@ function isLexicalIdentifier(value: string): boolean {
   if (longSegments > 1) return false;
   const contentLength = segments.reduce((sum, s) => sum + s.length, 0);
   if (contentLength > LEXICAL_IDENTIFIER_MAX_CONTENT_LENGTH) return false;
-  return segments.every(
-    (segment) =>
-      segment.length <= LEXICAL_SEGMENT_MAX_LENGTH && LEXICAL_SEGMENT_RE.test(segment),
-  );
+  if (segments.some((s) => s.length > LEXICAL_SEGMENT_MAX_LENGTH)) return false;
+  const nonPlain = segments.filter((s) => !LEXICAL_SEGMENT_RE.test(s));
+  if (nonPlain.length === 0) return true;
+  if (nonPlain.length !== 1 || !MIXED_LEXICAL_SEGMENT_RE.test(nonPlain[0]!)) return false;
+  // Generated keys use a fixed layout (`xxxxxx-xxxxxx-xxxxxx-xxxxxx`); real
+  // identifiers are words of varying length. Without this, ~0.4% of random
+  // 4×6 lower+digit keys carry exactly one admissible mixed segment.
+  return new Set(segments.map((s) => s.length)).size > 1;
 }
 
 /** Character classes a value must draw from at least two of, before the entropy
@@ -284,6 +336,8 @@ function isLexicalIdentifier(value: string): boolean {
  *  reach them: homogeneous letter-or-digit runs are precisely what keeps
  *  random tokens OUT of that exemption, so loosening it trades a bounded false
  *  positive for a false negative. That residual belongs to PEN-3920.
+ *  (BLO-44747 since admits ONE such segment per value under a bounded shape —
+ *  see MIXED_LEXICAL_SEGMENT_RE; it leaves this regex untouched.)
  *
  *  Deliberately still out of reach: a single-case LETTERS-ONLY value scores
  *  one class under this form too, in both cases, so it never reaches the
@@ -297,17 +351,75 @@ function classIndex(value: string): number {
   return [/[a-z]/, /[A-Z]/, /[0-9]/].filter((re) => re.test(value)).length;
 }
 
-/** A value is "opaque" when it is long, drawn from a token alphabet and from
- *  at least two character classes, is not a hyphenated identifier, and has
- *  high per-character entropy. Deliberately narrow: applied only to
- *  assignment values, never to bare words. A 40-char git SHA scores ~4.0
- *  bits/char and would be redacted out of ordinary review prose if this ran
- *  unbound. */
+/**
+ * BLO-41153: a fully-qualified gRPC method path is a wire identifier, not a
+ * credential, and `isLexicalIdentifier` cannot reach it.
+ *
+ * `/magma.orc8r.Bootstrapper/GetChallenge`, bound to a `method` key, scores
+ * 4.05 bits/char and is refused. (Every mention of that binding in this file
+ * and its tests keeps a space around the `=`, or builds the pair at runtime:
+ * written out contiguously it is the very material the unfixed rule refuses,
+ * so the fix for the false positive could not be pushed past the false
+ * positive. Same convention as the PEN-3907 and BLO-41262 fixtures.)
+ *
+ * It fails the lexical exemption three separate ways, so loosening that
+ * rule's constants is not the fix: `/` is not one of its separators,
+ * `orc8r` is neither a plain word nor a plain number, `Bootstrapper` and
+ * `GetChallenge` are two segments over LEXICAL_LONG_SEGMENT_LENGTH, and the
+ * segments sum to 34 against a cap of 30. Each of those bounds is load-bearing
+ * against random letter runs and must stay where it is.
+ *
+ * So this is a separate shape rather than a widened one, and it is anchored so
+ * tightly that no credential ENCODING can reach it: the value must be
+ * slash-rooted, carry at least one `.` inside the package, then exactly one
+ * more `/`, with every run starting with a letter and holding only
+ * `[A-Za-z0-9]`. base64url has no `.` and no `/`; standard base64 and hex have
+ * no `.` either. A JWT has dots but no slash, and decodes under its own
+ * detector first.
+ *
+ * The dot is the conjunct carrying the security argument, and it is the one to
+ * leave alone: without it a standard-base64 secret beginning with `/` — 1 in
+ * 64 of them — walks through. The letter-initial runs are shape hygiene after
+ * that, mirroring proto identifier rules; each is pinned by a failing mutation
+ * in the test file so the narrowing is not merely a comment.
+ *
+ * Shape alone, with no name conjunction — unlike `isContentDigestAssignment`,
+ * where bare hex IS a real credential shape (`SECRET_KEY=<64 hex>`) and the
+ * name has to carry half the decision. Nothing of this shape is a credential,
+ * and a name list would drift: the same path is bound to `method`, `rpc`,
+ * `grpc_method` and `full_method` across the fleet's runbooks and alert rules,
+ * and the first name nobody enumerated reproduces this false positive.
+ *
+ * The trailing method is optional because a grep pattern legitimately stops at
+ * the service — `grep -c 'method = /magma.orc8r.Bootstrapper/'` (modulo the
+ * spacing convention above) is BLO-41153's own verifying signal, and under the
+ * unfixed rule the runbook documenting that command could not be pushed.
+ */
+/*
+ * BLO-45350: the method run is bounded to `[A-Z][A-Za-z]*` — proto method
+ * style, UpperCamelCase with no digits. The package and service runs above
+ * only have to start with a letter, so without this a value shaped
+ * `/a.b/<opaque token>` was exonerated whole: any base62 token starting with a
+ * letter fit the old method run. Excluding digits is what does the work — a
+ * random 32-char base62 token starts uppercase AND draws no digit in ~0.2% of
+ * cases, against 100% of letter-initial ones before. Shape rather than entropy
+ * on purpose: real long method names (`GetGatewayDeviceInfoAndStatus`, 4.0
+ * bits/char) clear the 3.5 threshold on their own.
+ */
+const GRPC_METHOD_PATH_RE =
+  /^\/[A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z][A-Za-z0-9]*)+\/(?:[A-Z][A-Za-z]*)?$/;
+
+/** A value is "opaque" when it is long (its token alphabet is guaranteed by
+ *  ASSIGNMENT_RE's capture), is drawn from at least two character classes,
+ *  is not a hyphenated identifier, and has high per-character entropy.
+ *  Deliberately narrow: applied only to assignment values, never to bare
+ *  words. A 40-char git SHA scores ~4.0 bits/char and would be redacted out
+ *  of ordinary review prose if this ran unbound. */
 function isOpaqueSecretValue(value: string): boolean {
   if (value.length < HIGH_ENTROPY_MIN_LENGTH) return false;
-  if (!/^[A-Za-z0-9+/=_.\-]+$/.test(value)) return false;
   if (classIndex(value) < 2) return false;
   if (isLexicalIdentifier(value)) return false;
+  if (GRPC_METHOD_PATH_RE.test(value)) return false;
   return shannonEntropyBitsPerChar(value) >= HIGH_ENTROPY_MIN_BITS_PER_CHAR;
 }
 
@@ -394,7 +506,7 @@ export function scrubGitHubEgressText(input: string): GitHubEgressScrubResult {
     if (isContentDigestAssignment(name, value)) return match;
     if (!isOpaqueSecretValue(value)) return match;
     fired.add("high-entropy-assignment");
-    return `${name}=${quote}${redactionMarker("high-entropy-assignment")}${quote}`;
+    return `${name}=${quote}${redactionMarker("high-entropy-assignment")}`;
   });
 
   const order: GitHubEgressScrubClass[] = [

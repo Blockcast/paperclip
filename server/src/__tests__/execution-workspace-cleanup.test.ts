@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { companies, createDb, executionWorkspaces, projects } from "@paperclipai/db";
+import { companies, createDb, executionWorkspaces, issues, projects } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -388,6 +388,7 @@ describeEmbeddedPostgres("reconcileExecutionWorkspaceCleanup", () => {
   });
 
   beforeEach(async () => {
+    await db.delete(issues);
     await db.delete(executionWorkspaces);
     await db.delete(projects);
     await db.delete(companies);
@@ -469,6 +470,65 @@ describeEmbeddedPostgres("reconcileExecutionWorkspaceCleanup", () => {
     expect(row?.cleanupReason).toBe("collected");
     // Cleared so the row cannot be selected again.
     expect(row?.cleanupEligibleAt).toBeNull();
+  });
+
+  // BLO-42036: a collected workspace used to leave its binding behind, and
+  // every closed-workspace guard keys on that binding — so the source issue
+  // became permanently unwritable by its own assignee, with no agent-reachable
+  // remedy. Reaching the collect branch means the tree was PROVEN clean and
+  // removed, so the binding points at nothing recoverable.
+  it("unbinds the source issue when it collects the workspace, and only then", async () => {
+    const { repo } = createRepoWithRemote();
+    const collectedId = randomUUID();
+    const deferredId = randomUUID();
+    const collectedPath = path.join(path.dirname(repo), "wt-unbind-collected");
+    const deferredPath = path.join(path.dirname(repo), "wt-unbind-deferred");
+    await addOwnedWorktree({ repo, worktreePath: collectedPath, branchName: "wt-unbind-collected", executionWorkspaceId: collectedId });
+    await addOwnedWorktree({ repo, worktreePath: deferredPath, branchName: "wt-unbind-deferred", executionWorkspaceId: deferredId });
+    // The control: uncommitted work, so this one is deferred rather than
+    // collected and must keep its binding and its guard.
+    fs.writeFileSync(path.join(deferredPath, "README.md"), "unsaved work\n", "utf8");
+
+    for (const [id, worktreePath, branchName] of [
+      [collectedId, collectedPath, "wt-unbind-collected"],
+      [deferredId, deferredPath, "wt-unbind-deferred"],
+    ] as const) {
+      await db.insert(executionWorkspaces).values({
+        id,
+        companyId,
+        projectId,
+        mode: "isolated_workspace",
+        strategyType: "git_worktree",
+        name: branchName,
+        status: "active",
+        cwd: worktreePath,
+        providerType: "git_worktree",
+        providerRef: worktreePath,
+        branchName,
+        cleanupEligibleAt: hourAgo(),
+        lastUsedAt: hourAgo(),
+      });
+    }
+
+    const collectedIssueId = randomUUID();
+    const deferredIssueId = randomUUID();
+    await db.insert(issues).values([
+      { id: collectedIssueId, companyId, projectId, title: "bound to the collected worktree", executionWorkspaceId: collectedId },
+      { id: deferredIssueId, companyId, projectId, title: "bound to the deferred worktree", executionWorkspaceId: deferredId },
+    ]);
+
+    const result = await cleanup.reconcileExecutionWorkspaceCleanup();
+    expect(result.collected).toBe(1);
+    expect(result.skipped).toBe(1);
+
+    const [collectedIssue] = await db.select().from(issues).where(eq(issues.id, collectedIssueId));
+    expect(collectedIssue?.executionWorkspaceId).toBeNull();
+    const [deferredIssue] = await db.select().from(issues).where(eq(issues.id, deferredIssueId));
+    expect(deferredIssue?.executionWorkspaceId).toBe(deferredId);
+    // The unbind is scoped to the collected row: the deferred sibling is
+    // untouched, and the collected row itself still records what happened.
+    const [collectedWorkspace] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, collectedId));
+    expect(collectedWorkspace?.cleanupReason).toBe("collected");
   });
 
   it("leaves a worktree with uncommitted work on disk and defers it", async () => {

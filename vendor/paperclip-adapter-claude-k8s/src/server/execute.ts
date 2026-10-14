@@ -1494,13 +1494,155 @@ async function waitForPod(
  */
 type JobConditionSnapshot = { type?: string; status?: string; reason?: string; message?: string };
 
-async function waitForJobCompletion(
+/**
+ * PEN-4023: which bound produced `timedOut`, and its value in seconds.
+ *
+ * `timedOut` has three distinct causes with three different bounds, and only
+ * one of them is `config.timeoutSec`.  Reporting the configured value for all
+ * of them is what made a fleet-wide 2-hour kill read as `Timed out after 0s`
+ * for an unknown length of time (PEN-4016): the Job carried
+ * `activeDeadlineSeconds: 7200` that this adapter never set and does not know
+ * about, Kubernetes enforced it, and the number that actually fired was
+ * written down nowhere.  Nobody can grep for a number that is never recorded.
+ *
+ * - `job_deadline` — Kubernetes failed the Job with `reason: DeadlineExceeded`.
+ *   The bound is the Job's own `spec.activeDeadlineSeconds`, read off the same
+ *   Job object that carries the condition.  It is NOT necessarily the value
+ *   this adapter put there: the manifest omits the field entirely when
+ *   `timeoutSec` is 0, and a 7200 observed under `timeoutSec: 0` is exactly
+ *   the case this type exists to make legible.  `seconds` is null when the
+ *   field is somehow absent from a Job that was nevertheless killed for
+ *   exceeding it — unknown, which is reported as unknown rather than as 0.
+ * - `adapter_completion_wait` — this function's own poll loop ran out of
+ *   `timeoutMs`, i.e. `(timeoutSec + graceSec)`.  Unreachable when
+ *   `timeoutSec` is 0, because the loop is then unbounded.
+ * - `adapter_state_recheck` — the bounded re-check after an unexpected watch
+ *   error gave up.  The Job may still be running; the bound is the re-check
+ *   budget, which has nothing to do with any configured run timeout.
+ */
+type JobTimeoutBoundSource = "job_deadline" | "adapter_completion_wait" | "adapter_state_recheck";
+export type JobTimeoutBound = { source: JobTimeoutBoundSource; seconds: number | null };
+
+const TIMEOUT_BOUND_LABELS: Record<JobTimeoutBoundSource, string> = {
+  job_deadline: "Job activeDeadlineSeconds",
+  adapter_completion_wait: "adapter completion wait",
+  adapter_state_recheck: "adapter job-state re-check",
+};
+
+/**
+ * PEN-4023: render the bound that fired, and surface it for the run record.
+ *
+ * Three rules, each paid for by the PEN-4016 incident:
+ *
+ * 1. An observed bound always wins over `configuredTimeoutSec`.  The whole
+ *    defect was preferring the configured value for a kill it did not cause.
+ * 2. When the observed bound disagrees with config, say both.  A reader of
+ *    `Timed out after 7200s` alone would reasonably assume something
+ *    configured 7200; naming `timeoutSec=0` in the same sentence is what
+ *    makes the Job-vs-adapter disagreement visible from a single log line.
+ * 3. An unknown bound is reported as unknown.  Falling back to a configured
+ *    `0` would reconstruct `Timed out after 0s`, which is the string this
+ *    function exists to make unproducible.
+ *
+ * A non-positive observed value counts as no bound at all, under either
+ * source.  Nothing can fire after zero seconds: Kubernetes rejects
+ * `activeDeadlineSeconds: 0`, and a wait budget under half a second rounds
+ * there.  Rendering it would rebuild the same uninterpretable string by a
+ * different route.
+ */
+export function describeFiredTimeoutBound(
+  bound: JobTimeoutBound | null,
+  configuredTimeoutSec: number,
+): { message: string; seconds: number | null; source: JobTimeoutBoundSource | "config" | "unknown" } {
+  if (bound && bound.seconds != null && bound.seconds > 0) {
+    const label = TIMEOUT_BOUND_LABELS[bound.source];
+    const disagrees = bound.source === "job_deadline" && bound.seconds !== configuredTimeoutSec;
+    const detail = disagrees
+      ? `${label}; adapter timeoutSec=${configuredTimeoutSec}`
+      : label;
+    return { message: `Timed out after ${bound.seconds}s (${detail})`, seconds: bound.seconds, source: bound.source };
+  }
+
+  if (bound) {
+    // A bound fired but reported nothing usable — a Job failed
+    // `DeadlineExceeded` with `spec.activeDeadlineSeconds` unreadable, or a
+    // sub-second wait budget that rounds to zero.
+    return {
+      message:
+        `Timed out: ${TIMEOUT_BOUND_LABELS[bound.source]} fired but did not report a usable bound ` +
+        `(adapter timeoutSec=${configuredTimeoutSec})`,
+      seconds: null,
+      source: bound.source,
+    };
+  }
+
+  if (configuredTimeoutSec > 0) {
+    return {
+      message: `Timed out after ${configuredTimeoutSec}s (adapter timeoutSec)`,
+      seconds: configuredTimeoutSec,
+      source: "config",
+    };
+  }
+
+  return {
+    message:
+      "Timed out, but no bound could be identified: the adapter configured none " +
+      "(timeoutSec=0) and no Job deadline was observed",
+    seconds: null,
+    source: "unknown",
+  };
+}
+
+/**
+ * PEN-4023: the whole timed-out result, built from the bound that fired.
+ *
+ * Extracted from `execute()` so the one line that emits the user-visible
+ * message is itself testable.  Driving `execute()` to this point needs a
+ * running-pod and log-tail fixture that exists nowhere in this suite, so left
+ * inline this was the single uncovered statement in the fix — and a one-line
+ * revert of it restores `Timed out after 0s` with every test still green.
+ * `execute: timeout result construction` in the test file also pins statically
+ * that `execute` routes through here rather than re-interpolating `timeoutSec`.
+ */
+export function buildTimeoutExecutionResult(
+  exitCode: number | null,
+  bound: JobTimeoutBound | null,
+  configuredTimeoutSec: number,
+): AdapterExecutionResult {
+  // These disagree in production — `timeoutSec` is 0 on every agent while the
+  // Job carries `activeDeadlineSeconds: 7200` from a writer outside this
+  // adapter — and interpolating `timeoutSec` is what reported a two-hour
+  // Kubernetes kill as `Timed out after 0s`.
+  const firedBound = describeFiredTimeoutBound(bound, configuredTimeoutSec);
+  return {
+    exitCode,
+    signal: null,
+    timedOut: true,
+    errorMessage: firedBound.message,
+    errorCode: "timeout",
+    // Carried into the run record so the number that fired is greppable. The
+    // server reconciles these against the configured policy rather than
+    // persisting `timeoutFired: true` beside `timeoutConfigured: false`.
+    resultJson: {
+      observedTimeoutSec: firedBound.seconds,
+      observedTimeoutSource: firedBound.source,
+      configuredTimeoutSec,
+    },
+  };
+}
+
+// Exported for tests: the DeadlineExceeded branch is the only place the bound
+// that actually killed a run can be read, and driving it through `execute()`
+// needs a full running-pod + log-tail fixture that would pin a dozen unrelated
+// behaviours alongside it.
+export async function waitForJobCompletion(
   namespace: string,
   jobName: string,
   timeoutMs: number,
   kubeconfigPath?: string,
   observer?: { lastConditions: JobConditionSnapshot[] | null; pollCount: number },
-): Promise<{ succeeded: boolean; timedOut: boolean; jobGone?: boolean }> {
+  waitBoundSource: Extract<JobTimeoutBoundSource, "adapter_completion_wait" | "adapter_state_recheck"> = "adapter_completion_wait",
+): Promise<{ succeeded: boolean; timedOut: boolean; jobGone?: boolean; timeoutBound?: JobTimeoutBound | null }> {
   const batchApi = getBatchApi(kubeconfigPath);
   const deadline = timeoutMs > 0 ? Date.now() + timeoutMs : 0;
 
@@ -1531,13 +1673,32 @@ async function waitForJobCompletion(
     const failed = conditions.find((c) => c.type === "Failed" && c.status === "True");
     if (failed) {
       const isDeadlineExceeded = failed.reason === "DeadlineExceeded";
-      return { succeeded: false, timedOut: isDeadlineExceeded };
+      if (!isDeadlineExceeded) return { succeeded: false, timedOut: false };
+      // PEN-4023: the condition names the *reason* but carries no number — the
+      // kubelet message is a fixed string.  The bound lives on the same Job
+      // object we just read, so capture it here rather than falling back to a
+      // configured value that may have had nothing to do with this kill.
+      const activeDeadlineSeconds = job.spec?.activeDeadlineSeconds;
+      return {
+        succeeded: false,
+        timedOut: true,
+        timeoutBound: {
+          source: "job_deadline",
+          seconds: typeof activeDeadlineSeconds === "number" && Number.isFinite(activeDeadlineSeconds)
+            ? activeDeadlineSeconds
+            : null,
+        },
+      };
     }
 
     await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
   }
 
-  return { succeeded: false, timedOut: true };
+  return {
+    succeeded: false,
+    timedOut: true,
+    timeoutBound: { source: waitBoundSource, seconds: Math.round(timeoutMs / 1000) },
+  };
 }
 
 /**
@@ -2901,6 +3062,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   let exitCode: number | null = null;
   let podTerminatedState: PodTerminatedState | null = null;
   let jobTimedOut = false;
+  // PEN-4023: the bound that actually produced `jobTimedOut`, as observed at
+  // runtime.  Null means no timeout fired, or one fired whose bound could not
+  // be named — which is reported as unknown rather than silently as
+  // `config.timeoutSec`.
+  let jobTimeoutBound: JobTimeoutBound | null = null;
   let keepaliveTimer: ReturnType<typeof setInterval> | null = null;
   // Set when we return a mismatch error so the finally block knows not to
   // delete a job that is still alive and the UI is waiting on.
@@ -3113,6 +3279,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     if (completionResult.status === "fulfilled") {
       jobTimedOut = completionResult.value.timedOut;
+      jobTimeoutBound = completionResult.value.timeoutBound ?? null;
       if (completionResult.value.jobGone) {
         // Job was deleted by TTL or externally before we observed the Complete/Failed
         // condition.  The container must have exited first (TTL only fires after
@@ -3130,12 +3297,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // avoid returning while the job is still running.  Use a bounded timeout
       // (60s) so we don't hang the heartbeat indefinitely if the K8s API is degraded.
       jobTimedOut = false;
+      jobTimeoutBound = null;
       const RECHECK_TIMEOUT_MS = 60_000;
-      const actualState = await waitForJobCompletion(namespace, jobName, RECHECK_TIMEOUT_MS, kubeconfigPath, jobObserver);
+      const actualState = await waitForJobCompletion(namespace, jobName, RECHECK_TIMEOUT_MS, kubeconfigPath, jobObserver, "adapter_state_recheck");
       if (actualState.timedOut) {
         // Re-check itself timed out — the job may still be running.
         // Return an error so the UI knows the run is not done.
         jobTimedOut = true;
+        jobTimeoutBound = actualState.timeoutBound ?? null;
       } else if (actualState.jobGone) {
         // Job was deleted before we could confirm terminal state — same as the
         // fulfilled+jobGone case above: proceed with captured output.
@@ -3204,17 +3373,50 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
 
   // Parse Claude output (reuse claude_local parsing)
-  if (jobTimedOut) {
-    return {
-      exitCode,
-      signal: null,
-      timedOut: true,
-      errorMessage: `Timed out after ${timeoutSec}s`,
-      errorCode: "timeout",
-    };
+  const parsedStream = parseClaudeStreamJson(stdout);
+
+  // BLO-43344: a declared MCP server that fails to connect contributes no tools
+  // and is otherwise indistinguishable from one that was never configured, so
+  // its absence reads as deliberate policy. The CLI does report it — the init
+  // event carries every declared server with a status — so name the ones that
+  // did not come up. Logged rather than raised: a dead MCP server degrades a run
+  // but does not fail it, and failing the run here would turn one unreachable
+  // endpoint into a fleet-wide outage. `logQuietly` is what makes that true of
+  // the log call itself: a rejecting sink must not become the throw site, and
+  // the trigger is fleet-correlated — one dead endpoint puts every run here.
+  //
+  // Emitted above the `jobTimedOut` return, not below it: a run that spun
+  // because a tool namespace was missing is a likely candidate for hitting the
+  // wall, so the timeout path is one of the cases that most wants this signal.
+  // `parseClaudeStreamJson` is pure and `stdout` is final from the tail/on-disk
+  // reconciliation above, so moving the parse up costs only the parse itself on
+  // the paths that used to return before it.
+  const unconnectedMcpServers = parsedStream.mcpServers.filter((s) => s.status !== "connected");
+  if (unconnectedMcpServers.length > 0) {
+    // `name` is interpolated into a `[paperclip] `-prefixed line that is read
+    // back as host run output, so quote it: a name carrying a newline would
+    // otherwise forge a second such line. Names come from operator
+    // `adapterConfig.mcpServers` rather than from the model, so this is
+    // defence in depth, not a live escape.
+    await logQuietly(
+      onLog,
+      "stderr",
+      `[paperclip] MCP servers declared but not connected: ` +
+        `${unconnectedMcpServers.map((s) => `${JSON.stringify(s.name)}=${s.status}`).join(", ")} ` +
+        `(connected: ${
+          parsedStream.mcpServers
+            .filter((s) => s.status === "connected")
+            .map((s) => JSON.stringify(s.name))
+            .join(", ") || "none"
+        }). ` +
+        `Each contributes no mcp__<name>__* tools to this run.\n`,
+    );
   }
 
-  const parsedStream = parseClaudeStreamJson(stdout);
+  if (jobTimedOut) {
+    return buildTimeoutExecutionResult(exitCode, jobTimeoutBound, timeoutSec);
+  }
+
   let parsed = parsedStream.resultJson;
 
   // Recovery path for malformed or partially duplicated streams: if a complete

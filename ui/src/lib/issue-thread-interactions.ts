@@ -241,7 +241,9 @@ export function buildIssueThreadInteractionSummary(
     return count === 1 ? "Answered 1 question" : `Answered ${count} questions`;
   }
   if (interaction.status === "cancelled") {
-    return count === 1 ? "Cancelled 1 question" : `Cancelled ${count} questions`;
+    // Same verb as the other three withdrawable kinds (BLO-20688). The stored
+    // status stays "cancelled"; only the label reads "Withdrew".
+    return count === 1 ? "Withdrew 1 question" : `Withdrew ${count} questions`;
   }
   if (interaction.status === "expired") {
     if (interaction.result?.expirationReason === "superseded_by_comment") {

@@ -2902,12 +2902,14 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
     // is restored on the NEXT sweep, not this one (asserted by case (b)).
     expect(swept.findings).toBe(0);
 
-    // Retiring the row is not a source-status change: the source stays open.
+    // Retiring the row is not a source-status change: the source stays open,
+    // still `blocked` by the real blocker leaf. Pinned as the exact status
+    // rather than "not terminal" so a vanished row cannot pass this.
     const [source] = await db
       .select({ status: issues.status })
       .from(issues)
       .where(eq(issues.id, blockedIssueId));
-    expect(["done", "cancelled"]).not.toContain(source?.status);
+    expect(source?.status).toBe("blocked");
 
     // Discoverable without reading sweep logs. The activity row is keyed to the
     // SOURCE, so "which sources were suppressed by an abandoned row" is a query;
@@ -3024,6 +3026,90 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       .from(issues)
       .where(eq(issues.id, recoveryIssueId));
     expect(recovery?.status).toBe("todo");
+  });
+
+  // BLO-28996: the over-retiring guard the age bound alone cannot give you.
+  // `lastActivityAt` is a proxy for "someone is working this", and it is a
+  // lagging one -- a run that picked the row up and has not yet written to it
+  // still reads as idle, so a row can be past the bound and busy at the same
+  // moment. Cancelling it there would unwire a live worker from the row it is
+  // mid-write on, which is the same failure the stale-escalation guard at
+  // "leaves a stale escalation untouched while a running owner still holds its
+  // lock" exists to prevent. The run check is what makes the clock safe to act
+  // on; without it the bound is only as good as its proxy.
+  //
+  // Counter split matters here: an abandoned row falls THROUGH the
+  // source-still-open skip, so it is held by `activeSkipped` alone and
+  // `sourceStillOpenSkipped` must stay 0. A row deferred for a live run is not
+  // a row being suppressed by its source's status, and conflating the two is
+  // what made the "is the bound firing?" question unanswerable before #1420.
+  it("defers an abandoned recovery row while a run still holds it, without annotating it", async () => {
+    await enableAutoRecovery();
+    const { companyId, managerId, blockedIssueId, recoveryIssueId } = await seedOpenRecoveryRow({
+      idleMs: DEFAULT_LIVENESS_ABANDONED_RECOVERY_MS + 24 * 60 * 60 * 1000,
+    });
+
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: managerId,
+      status: "running",
+      startedAt: new Date(),
+      contextSnapshot: { issueId: recoveryIssueId },
+    });
+
+    const swept = await heartbeatSvc.reconcileIssueGraphLiveness({ now: new Date() });
+
+    const [recovery] = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, recoveryIssueId));
+    expect(recovery?.status).toBe("todo");
+
+    expect(swept.obsoleteRecoveriesAbandonedRetired).toBe(0);
+    expect(swept.obsoleteRecoveriesRetired).toBe(0);
+    expect(swept.obsoleteRecoveriesActiveSkipped).toBe(1);
+    expect(swept.obsoleteRecoveriesSourceStillOpenSkipped).toBe(0);
+
+    // Neither annotation surface may fire on a deferral. The comment is the
+    // sharper assertion of the two: it bumps the row's `lastActivityAt`
+    // (migration 0076, AFTER INSERT on `issue_comments`), so a stray one here
+    // would reset the abandonment clock and buy this row another full bound of
+    // silent suppression once the run ends -- the exact defect the bound fixes.
+    const abandonedActivity = await db
+      .select({ entityId: activityLog.entityId })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.action, "issue.liveness_recovery_abandoned"),
+        ),
+      );
+    expect(abandonedActivity).toEqual([]);
+
+    // Asserted as "no comment at all", not "no marker comment": the clock reset
+    // is an AFTER INSERT trigger on `issue_comments`, so ANY body resets it.
+    const comments = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, recoveryIssueId));
+    expect(comments).toEqual([]);
+
+    // The source is untouched -- but note what that does and does not pin.
+    // `removeRecoveryBlockerFromSource` runs BEFORE the live-run guard, so a
+    // deferral DOES prune a recovery->source blocker edge and can restore the
+    // source off `blocked`. That ordering is deliberate: the fabricated edge is
+    // legacy (BLO-28618 stopped writing it) and un-wedging the source is the
+    // point of pruning it, while the row stays open and keeps suppressing
+    // findings either way. This fixture has no such edge -- the source is
+    // `blocked` by the real blocker leaf, not by the recovery row -- so the
+    // prune is `PRUNE_NOT_APPLICABLE` here and the seeded status survives.
+    const [source] = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, blockedIssueId));
+    expect(source?.status).toBe("blocked");
   });
 
   // BLO-29761: the suppression decision is persisted, so "suppressed by

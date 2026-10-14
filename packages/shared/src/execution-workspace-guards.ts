@@ -4,6 +4,11 @@ type ExecutionWorkspaceGuardTarget = Pick<ExecutionWorkspace, "closedAt" | "mode
 
 const CLOSED_EXECUTION_WORKSPACE_STATUSES = new Set<ExecutionWorkspace["status"]>(["archived", "cleanup_failed"]);
 
+/** Does this status, on its own, mean "closed"? */
+export function isClosedExecutionWorkspaceStatus(status: ExecutionWorkspace["status"]): boolean {
+  return CLOSED_EXECUTION_WORKSPACE_STATUSES.has(status);
+}
+
 /**
  * Mode-independent: is this workspace closed, whatever kind it is?
  *
@@ -39,4 +44,52 @@ export function getClosedIsolatedExecutionWorkspaceMessage(
   workspace: Pick<ExecutionWorkspaceGuardTarget, "name">,
 ): string {
   return `This issue is linked to the closed workspace "${workspace.name}". Move it to an open workspace before adding comments or resuming work.`;
+}
+
+// BLO-42036: the fields a patch may carry and still count as "detach this issue from its
+// dead execution workspace" rather than as work inside it. Deliberately NOT the route's
+// ISSUE_WORKSPACE_AUDIT_FIELDS, despite the overlap: that set decides what gets logged, so
+// anything added to it for audit reasons would silently widen this security exemption.
+const EXECUTION_WORKSPACE_DETACH_FIELDS = new Set([
+  "executionWorkspaceId",
+  "executionWorkspacePreference",
+  "executionWorkspaceSettings",
+]);
+
+/**
+ * BLO-42036. The closed-workspace 409 tells the caller to "move it to an open workspace",
+ * and until this predicate existed no agent-reachable route could. The guard keys on
+ * `closedAt`, which no exposed route accepts — the execution-workspace PATCH schema takes
+ * `status`, and flipping that leaves `closedAt` set, so the issue kept 409ing while its
+ * own error body read `status: "active"`. Archiving the workspace instead 409s the other
+ * way ("still linked to an open issue"). A collected workspace therefore bricked its
+ * source issue permanently, and alert rows were the common victim: they get isolated
+ * workspaces, those get collected, and from then on the row could not even be commented
+ * on during its own incident.
+ *
+ * True only when the patch's ONLY effect is detaching from (or rebinding off) the closed
+ * workspace: it performs no work inside the dead workspace, and it cannot carry a comment,
+ * a review request, or any other field along with it. Re-pinning the SAME closed workspace
+ * is not a detach — otherwise the guard would be bypassable by echoing the current value.
+ *
+ * `body` must be the WHOLE validated request body, not the route's `updateFields`. The
+ * route destructures `comment`, `reviewRequest`, `reopen`, `resume`, `interrupt` and
+ * `hiddenAt` out of the body before building `updateFields`, so a predicate keyed on
+ * `updateFields` could not see them — and `hiddenAt` is written unconditionally after the
+ * guard, so `{executionWorkspaceId: <another closed ws>, hiddenAt}` landed a write on an
+ * issue that stayed bricked. Keyed on the whole body, any key the route pulls out (today's
+ * six or a future one) is rejected by default instead of admitted by default.
+ */
+export function isExecutionWorkspaceDetachPatch(input: {
+  body: Record<string, unknown>;
+  closedExecutionWorkspaceId: string;
+}): boolean {
+  const keys = Object.keys(input.body);
+  if (!keys.every((key) => EXECUTION_WORKSPACE_DETACH_FIELDS.has(key))) return false;
+  // Also covers the empty patch: `every` is vacuously true on no keys, and this rejects it.
+  if (!Object.prototype.hasOwnProperty.call(input.body, "executionWorkspaceId")) return false;
+  // UUIDs compare case-insensitively: the validator accepts an uppercase id, so a strict
+  // `!==` let an echo of the same workspace in upper case pass as a rebind.
+  const target = input.body.executionWorkspaceId;
+  return typeof target !== "string" || target.toLowerCase() !== input.closedExecutionWorkspaceId.toLowerCase();
 }

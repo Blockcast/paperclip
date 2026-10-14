@@ -78,8 +78,12 @@ describe("createJob", () => {
     expect(create).not.toHaveBeenCalled();
   });
 
+  // Mirrors exactly what paperclipLabels() stamps, so a label added there and
+  // not here shows up as an adoption failure rather than silently going
+  // unchecked.
   const identityLabels = {
     "paperclip.io/run-id": "run-abc",
+    "paperclip.io/agent-id": "agent-abc",
     "paperclip.io/company-id": "company-abc",
     "paperclip.io/managed-by": "paperclip-k8s-plugin",
     "paperclip.io/adapter": "codex_local",
@@ -107,6 +111,22 @@ describe("createJob", () => {
     const create = vi.fn().mockRejectedValue({ code: 409 });
     const read = vi.fn().mockResolvedValue({
       metadata: { uid: "existing-uid", labels: { ...identityLabels, "paperclip.io/run-id": "other-run" } },
+    });
+    const clients = { batch: { createNamespacedJob: create, readNamespacedJob: read } };
+    const jobManifest = {
+      apiVersion: "batch/v1",
+      kind: "Job",
+      metadata: { name: "r-1", namespace: "ns", labels: identityLabels },
+      spec: { template: {} },
+    };
+
+    await expect(createJob(clients as never, "ns", jobManifest)).rejects.toThrow(/expected Paperclip identity labels/);
+  });
+
+  it("rejects an existing Job carrying a foreign agent-id (BLO-27156)", async () => {
+    const create = vi.fn().mockRejectedValue({ code: 409 });
+    const read = vi.fn().mockResolvedValue({
+      metadata: { uid: "existing-uid", labels: { ...identityLabels, "paperclip.io/agent-id": "other-agent" } },
     });
     const clients = { batch: { createNamespacedJob: create, readNamespacedJob: read } };
     const jobManifest = {
@@ -220,17 +240,74 @@ describe("findPodForJob", () => {
 });
 
 describe("deleteJob", () => {
-  it("calls batch.deleteNamespacedJob with foreground propagation", async () => {
+  const managedJob = {
+    metadata: { uid: "job-uid-1", labels: { "paperclip.io/managed-by": "paperclip-k8s-plugin" } },
+  };
+
+  it("calls batch.deleteNamespacedJob with foreground propagation and the uid precondition", async () => {
+    const read = vi.fn().mockResolvedValue(managedJob);
     const del = vi.fn().mockResolvedValue({});
-    const clients = { batch: { deleteNamespacedJob: del } };
+    const clients = { batch: { readNamespacedJob: read, deleteNamespacedJob: del } };
     await deleteJob(clients as never, "ns", "r-1");
+    expect(read).toHaveBeenCalledWith({ namespace: "ns", name: "r-1" });
     expect(del).toHaveBeenCalledWith(
       expect.objectContaining({
         namespace: "ns",
         name: "r-1",
         propagationPolicy: "Foreground",
+        body: { preconditions: { uid: "job-uid-1" } },
       }),
     );
+  });
+
+  // BLO-27156: the precondition is what makes the name→object binding
+  // point-in-time. Without it, a Job recycled onto this name between the read
+  // and the delete would be destroyed by a DELETE aimed at its predecessor;
+  // with it the API server rejects that DELETE 409. Asserting the uid comes
+  // from THIS read (not a constant) is the part that would catch a regression.
+  it("preconditions on the uid it just read, not a remembered one", async () => {
+    const read = vi.fn().mockResolvedValue({
+      metadata: { uid: "replacement-uid", labels: managedJob.metadata.labels },
+    });
+    const del = vi.fn().mockResolvedValue({});
+    const clients = { batch: { readNamespacedJob: read, deleteNamespacedJob: del } };
+    await deleteJob(clients as never, "ns", "r-1");
+    expect(del.mock.calls[0]?.[0]?.body).toEqual({ preconditions: { uid: "replacement-uid" } });
+  });
+
+  it("refuses to delete a Job that is not plugin-managed, without calling delete", async () => {
+    const read = vi.fn().mockResolvedValue({ metadata: { uid: "foreign-uid", labels: { app: "someone-elses" } } });
+    const del = vi.fn().mockResolvedValue({});
+    const clients = { batch: { readNamespacedJob: read, deleteNamespacedJob: del } };
+    await expect(deleteJob(clients as never, "ns", "r-1")).rejects.toThrow(/Refusing to delete Job ns\/r-1/);
+    expect(del).not.toHaveBeenCalled();
+  });
+
+  it("refuses to delete a Job with no uid to precondition on", async () => {
+    const read = vi.fn().mockResolvedValue({ metadata: { labels: managedJob.metadata.labels } });
+    const del = vi.fn().mockResolvedValue({});
+    const clients = { batch: { readNamespacedJob: read, deleteNamespacedJob: del } };
+    await expect(deleteJob(clients as never, "ns", "r-1")).rejects.toThrow(/no uid to precondition on/);
+    expect(del).not.toHaveBeenCalled();
+  });
+
+  // destroyLeaseResources and onEnvironmentReleaseLease both treat "already
+  // gone" as success; the read must not convert that into a throw.
+  it("is a no-op when the Job is already gone", async () => {
+    const read = vi.fn().mockRejectedValue({ code: 404 });
+    const del = vi.fn().mockResolvedValue({});
+    const clients = { batch: { readNamespacedJob: read, deleteNamespacedJob: del } };
+    await expect(deleteJob(clients as never, "ns", "r-1")).resolves.toBeUndefined();
+    expect(del).not.toHaveBeenCalled();
+  });
+
+  it("re-throws a non-404 read failure rather than deleting blind", async () => {
+    const boom = new Error("apiserver exploded");
+    const read = vi.fn().mockRejectedValue(boom);
+    const del = vi.fn().mockResolvedValue({});
+    const clients = { batch: { readNamespacedJob: read, deleteNamespacedJob: del } };
+    await expect(deleteJob(clients as never, "ns", "r-1")).rejects.toBe(boom);
+    expect(del).not.toHaveBeenCalled();
   });
 });
 

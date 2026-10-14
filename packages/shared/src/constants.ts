@@ -403,6 +403,23 @@ export type IssueRecoveryActionOwnerType = (typeof ISSUE_RECOVERY_ACTION_OWNER_T
 
 export const ISSUE_RECOVERY_ACTION_OUTCOMES = [
   "restored",
+  /**
+   * A `restored` claim the resolving write's OWN evidence contradicts (PEN-3991).
+   *
+   * `restored` asserts the source issue has a live execution path again. This
+   * value is recorded instead when the issue lands, in that same write, on a
+   * status that has no such path — see `isContradictedRestoredClaim`. It is a
+   * DERIVED outcome like `handed_back` and `owner_completed`: callers cannot
+   * request it, and the request is still accepted.
+   *
+   * Downgrading rather than refusing is deliberate. The `nextAction` text this
+   * subsystem writes tells resolvers to discharge an action they have decided
+   * not to chase, and PEN-2756 deliberately made an omitted `sourceIssueStatus`
+   * mean "assert nothing about status". Refusing would delete the only exit
+   * those two sanction. What was wrong was never the discharge — it was that
+   * the ledger recorded a repair that did not happen.
+   */
+  "restored_unverified",
   "handed_back",
   "owner_completed",
   "delegated",

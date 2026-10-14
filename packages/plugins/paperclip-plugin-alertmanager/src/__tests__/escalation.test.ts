@@ -3,7 +3,13 @@ import { createServer, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { PLUGIN_STATE_PRECONDITION_FAILED_CODE, type PluginContext } from "@paperclipai/plugin-sdk";
-import { COVER_ORIGIN, escalationDeadlineMs, recordSourceResolvedAndCloseCovers, runAlertEscalationSweep } from "../escalation.js";
+import {
+  COVER_ORIGIN,
+  escalationDeadlineMs,
+  recordSourceResolvedAndCloseCovers,
+  resolveAlertmanagerApiUrl,
+  runAlertEscalationSweep,
+} from "../escalation.js";
 import { handleFiring, handleResolved } from "../webhook-handler.js";
 import { BLOCKCAST_PHYSICAL_INFRA_AGENT_ID, DEFAULT_ISSUE_ROUTE_MAP } from "../constants.js";
 import manifest from "../manifest.js";
@@ -1387,5 +1393,25 @@ describe("BLO-40739 alert-escalation liveness claims", () => {
       const updates = mocks.issues.update.mock.calls as unknown as Array<[string, { status?: string }]>;
       for (const [, patch] of updates) expect(["done", "cancelled"]).not.toContain(patch.status);
     }
+  });
+});
+
+// BLO-42694: the env var is only a deploy-time default. Reverting the `||`
+// order (env first) fails the "instance config wins" case.
+describe("resolveAlertmanagerApiUrl", () => {
+  const ENV = { PAPERCLIP_ALERTMANAGER_API_URL: " http://am-env:9093/ " };
+  const cfg = (alertmanagerApiUrl?: string) => ({ alertmanagerApiUrl }) as AlertmanagerPluginConfig;
+
+  it("instance config wins over the env default", () => {
+    expect(resolveAlertmanagerApiUrl(cfg("http://am-board:9093/"), ENV)).toBe("http://am-board:9093");
+  });
+
+  it("falls back to the env default when the instance config is unset or blank", () => {
+    expect(resolveAlertmanagerApiUrl(cfg(), ENV)).toBe("http://am-env:9093");
+    expect(resolveAlertmanagerApiUrl(cfg("   "), ENV)).toBe("http://am-env:9093");
+  });
+
+  it("is empty when neither is set, so the read stays 'unknown' (fail closed)", () => {
+    expect(resolveAlertmanagerApiUrl(cfg(), {})).toBe("");
   });
 });

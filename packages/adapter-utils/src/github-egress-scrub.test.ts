@@ -574,6 +574,245 @@ describe("scrubGitHubEgressText", () => {
     });
   });
 
+  describe("BLO-41153 regression: a gRPC method path is not a credential", () => {
+    // Measured on Blockcast/magma PR #2289 @ 7c95ac44: scanning the two files
+    // the push guard named found exactly one firing value in each, and it was
+    // neither a metric name nor a Chart.lock digest — it was the gRPC method
+    // path, at 4.05 bits/char in the runbook and 3.64 in the alert rule.
+    //
+    // Every binding below is assembled at runtime. Written out contiguously
+    // the pair is the material the unfixed rule refuses, so a literal here
+    // could not be pushed past the false positive it tests for. Same reason
+    // as the PEN-3907 and BLO-41262 fixtures above.
+    const GRPC_METHOD = "/magma.orc8r.Bootstrapper/GetChallenge";
+    const GRPC_SERVICE = "/magma.orc8r.Bootstrapper/";
+    const bind = (name: string, value: string) => `${name}=${value}`;
+
+    it.each([GRPC_METHOD, GRPC_SERVICE])("passes %s through byte-exact", (path) => {
+      const text = bind("method", path);
+      const result = scrubGitHubEgressText(text);
+      expect(result.text).toBe(text);
+      expect(result.redacted).toBe(false);
+      expect(result.classes).toEqual([]);
+    });
+
+    it.each(["method", "rpc", "grpc_method", "full_method"])(
+      "exempts on shape, not on the name %s",
+      (name) => {
+        // The exemption is deliberately name-free. A name list would drift,
+        // and the first name nobody enumerated reproduces this false positive.
+        const text = bind(name, GRPC_METHOD);
+        expect(scrubGitHubEgressText(text).text).toBe(text);
+      },
+    );
+
+    it("still refuses an opaque token in the same assignment position", () => {
+      // The negative control for the name half: `method` is not a pass.
+      const result = scrubGitHubEgressText(bind("method", SYNTHETIC_OPAQUE_VALUE));
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(SYNTHETIC_OPAQUE_VALUE);
+    });
+
+    it("still refuses a slash-rooted value with no dot in the package", () => {
+      // The dot is what keeps every credential ENCODING out of this shape:
+      // base64url has no `.` and no `/`, standard base64 and hex have no `.`.
+      // Without this conjunct a standard-base64 secret that happens to start
+      // with `/` — 1 in 64 of them — would be exonerated, so this case is the
+      // whole security argument for the rule and not a corner.
+      //
+      // Both runs are sliced to start with a LETTER on purpose. An earlier
+      // split landed a digit at the head of the second run, which the
+      // per-segment shape refused on its own — so the test passed with the
+      // dot conjunct deleted and pinned nothing.
+      const token = `/${SYNTHETIC_OPAQUE_VALUE.slice(0, 15)}/${SYNTHETIC_OPAQUE_VALUE.slice(15)}`;
+      const result = scrubGitHubEgressText(bind("method", token));
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(token);
+    });
+
+    it.each([
+      "/0agma.orc8r.Bootstrapper/GetChallenge",
+      "/magma.0rc8r.Bootstrapper/GetChallenge",
+      "/magma.orc8r.Bootstrapper/0etChallenge",
+    ])("still refuses %s: a run that does not start with a letter", (token) => {
+      // Shape hygiene rather than a security bound — the dot conjunct is what
+      // keeps token encodings out — but pinned in all three run positions so
+      // the narrowing is not a comment. A proto identifier starts with a
+      // letter; one case per position, because a mutation to any one of them
+      // is invisible to the other two.
+      const result = scrubGitHubEgressText(bind("method", token));
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(token);
+    });
+
+    it.each([
+      // Pins the no-digit half: uppercase-initial, so only the digits refuse it.
+      `/a.b/S${SYNTHETIC_OPAQUE_VALUE.slice(1)}`,
+      // Pins the uppercase-initial half: letters only, so only the case refuses it.
+      `/a.b/${SYNTHETIC_OPAQUE_VALUE.replace(/[0-9]/g, "")}`,
+    ])("still refuses %s: an opaque token in the method position (BLO-45350)", (token) => {
+      // The method run used to be `[A-Za-z][A-Za-z0-9]*`, so any letter-initial
+      // token rode in behind a two-letter dotted package. One case per conjunct
+      // of `[A-Z][A-Za-z]*`, because a mutation to either is invisible to a
+      // fixture the other one already refuses.
+      const result = scrubGitHubEgressText(bind("method", token));
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(token);
+    });
+
+    it("still refuses a credential with a real method path appended", () => {
+      // Pins the start anchor, as the extra-segment case below pins the end
+      // one. Unanchored, the regex would find the valid path in the tail and
+      // exonerate the whole value, token and all.
+      const token = `${SYNTHETIC_OPAQUE_VALUE}${GRPC_METHOD}`;
+      const result = scrubGitHubEgressText(bind("method", token));
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(SYNTHETIC_OPAQUE_VALUE);
+    });
+
+    it("still refuses a dotted path whose segments leave the identifier alphabet", () => {
+      // Pins the per-run `[A-Za-z][A-Za-z0-9]*` shape. `-` and `_` are in the
+      // token alphabet a secret is drawn from, so admitting them here would
+      // reopen the gap the dot conjunct closes.
+      const token = `/magma.orc8r.Boot_strapper/${SYNTHETIC_OPAQUE_VALUE}`;
+      const result = scrubGitHubEgressText(bind("method", token));
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(token);
+    });
+
+    it("still refuses a path with an extra segment carrying a credential", () => {
+      // The regex is anchored at both ends and allows exactly one `/` after
+      // the dotted package, so a real method path is not a prefix a token can
+      // ride in on. Appended inside the token alphabet deliberately: an
+      // out-of-alphabet joiner such as `?` would be refused by the alphabet
+      // gate upstream and would not exercise the anchoring at all.
+      const token = `${GRPC_METHOD}/${SYNTHETIC_OPAQUE_VALUE}`;
+      const result = scrubGitHubEgressText(bind("method", token));
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(SYNTHETIC_OPAQUE_VALUE);
+    });
+  });
+
+  describe("BLO-44747 regression: one word with a short digit run is still a word", () => {
+    // A Prometheus scrape-job name already public on onprem-k8s master. Derived,
+    // not embedded: until this fix deploys, the pre-push guard refuses the literal.
+    const JOB = ["orc8r", "cdn", "forward", "queue", "federate"].join("-");
+    const EXPR = `expr: up{job="${JOB}"} == 0 or absent(up{job="${JOB}"})`;
+
+    it("passes the onprem-k8s alert expression through byte-exact", () => {
+      expect(scrubGitHubEgressText(EXPR).text).toBe(EXPR);
+      expect(locateGitHubEgressMatches(EXPR)).toEqual([]);
+    });
+
+    it.each(["k8s", "ipv6", "eastus2", "i18n"])("exonerates the mixed segment %s", (word) => {
+      const text = `job="${[word, "cdn", "forward", "federate"].join("-")}"`;
+      expect(scrubGitHubEgressText(text).classes).toEqual([]);
+    });
+
+    it.each([
+      ["two mixed segments", ["orc8r", "k8s", "forward", "queue", "federate"]],
+      ["a mixed segment over 8 chars", ["orchestr8r", "cdn", "forward", "federate"]],
+      ["a 3-digit run", ["orc888r", "cdn", "forward", "queue", "federate"]],
+      ["a digit-led segment", ["8orcr", "cdn", "forward", "queue", "federate"]],
+      ["two digit runs in one segment", ["o2rc8r", "cdn", "forward", "queue", "federate"]],
+      ["a mixed-case mixed segment", ["oRc8r", "cdn", "forward", "queue", "federate"]],
+      // A random 4×6 lower+digit key with exactly one admissible mixed segment:
+      // refused by the uniform-length check (Ally, review 5496550156).
+      ["a fixed-layout key", ["xotjia", "uzvdso", "mhknub", "sn1prx"]],
+    ])("still refuses %s", (_label, parts) => {
+      const token = parts.join("-");
+      const result = scrubGitHubEgressText(`sessionkey=${token}`);
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(token);
+    });
+  });
+
+  describe("BLO-43580: a nested assignment is not swallowed by the one before it", () => {
+    // Every binding is assembled at runtime: written out contiguously each one
+    // is the material the deployed guard refuses, so a literal would make this
+    // file unpushable. Same convention as the fixtures above.
+    const T = SYNTHETIC_OPAQUE_VALUE;
+    const bind = (name: string, value: string) => `${name}=${value}`;
+    const MARKER = redactionMarker("high-entropy-assignment");
+    const expectRedacted = (text: string) => {
+      const result = scrubGitHubEgressText(text);
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(T);
+    };
+
+    it("redacts the token behind a gRPC method path and a `?`", () => {
+      // The measured case. The method path itself still passes (BLO-41153).
+      const text = `${bind("method", "/magma.orc8r.Bootstrapper/GetChallenge")}?${bind("key", T)}`;
+      const result = scrubGitHubEgressText(text);
+      expect(result.classes).toEqual(["high-entropy-assignment"]);
+      expect(result.text).toBe(`${bind("method", "/magma.orc8r.Bootstrapper/GetChallenge")}?${bind("key", MARKER)}`);
+    });
+
+    const JOINERS = ["?", "&", ",", ";", "(", ")", "{", "}", "|", "#"];
+    const filler = (name: string) => bind(name, "alpha");
+
+    it.each(JOINERS)("redacts a token in second position after %s", (j) => {
+      // Second of three: an out-of-alphabet joiner on BOTH sides of the token,
+      // so the capture has to stop at the trailing one too.
+      expectRedacted([filler("one"), bind("key", T), filler("two")].join(j));
+    });
+
+    it.each(JOINERS)("redacts a token in third position after %s", (j) => {
+      expectRedacted([filler("one"), filler("two"), bind("key", T), filler("three")].join(j));
+    });
+
+    it.each(JOINERS)("redacts a token in last position after %s", (j) => {
+      expectRedacted([filler("one"), filler("two"), bind("key", T)].join(j));
+    });
+
+    it("redacts a quoted token followed by junk before the closing quote", () => {
+      // The old `\2` backreference demanded the closing quote right after the
+      // value, so `"<token>?…"` matched neither arm and escaped.
+      expectRedacted(`${bind("token", `"${T}?x=1"`)}`);
+    });
+
+    it("redacts a token nested inside a quoted URL", () => {
+      expectRedacted(bind("href", `"/cb?${bind("key", T)}"`));
+    });
+
+    it("keeps both quotes around a quoted token, exactly once each", () => {
+      // The closing quote is no longer consumed, so the replacer must not
+      // re-append it.
+      expect(scrubGitHubEgressText(bind("token", `"${T}"`)).text).toBe(bind("token", `"${MARKER}"`));
+    });
+
+    // pnpm-lock.yaml writes `postgres@3.4.9(patch_hash=<26 base32>)`. It used to
+    // pass only because the trailing `)` failed the old greedy capture; the
+    // narrower capture exposed it and every dependency bump re-writing such a
+    // line became unpushable. Derived: base32 of an md5, as pnpm does.
+    const BASE32 = "abcdefghijklmnopqrstuvwxyz234567";
+    const md5 = createHash("md5").update("synthetic-patch").digest();
+    let bits = 0n;
+    for (const byte of md5) bits = (bits << 8n) | BigInt(byte);
+    const PATCH_HASH = Array.from({ length: 26 }, (_, i) =>
+      BASE32[Number((bits << 2n >> BigInt(125 - i * 5)) & 31n)],
+    ).join("");
+
+    it("passes a pnpm lockfile patch_hash through byte-exact", () => {
+      expect(PATCH_HASH).toMatch(/^[a-z2-7]{26}$/);
+      const text = `postgres@3.4.9(${bind("patch_hash", PATCH_HASH)})`;
+      const result = scrubGitHubEgressText(text);
+      expect(result.text).toBe(text);
+      expect(result.redacted).toBe(false);
+    });
+
+    it("still refuses the same value under any other name", () => {
+      // Name half of the conjunction: the shape alone is a 130-bit token.
+      const result = scrubGitHubEgressText(`(${bind("access_hash", PATCH_HASH)})`);
+      expect(result.classes).toContain("high-entropy-assignment");
+    });
+
+    it("still refuses an opaque token bound to patch_hash", () => {
+      // Shape half: the name alone exonerates nothing.
+      expectRedacted(`(${bind("patch_hash", T)})`);
+    });
+  });
+
   describe("BLO-41262: locateGitHubEgressMatches names the line", () => {
     const token = SYNTHETIC_OPAQUE_VALUE;
 

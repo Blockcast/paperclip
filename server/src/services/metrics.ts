@@ -21,6 +21,7 @@
  */
 
 import { Counter, Gauge, Histogram, Registry, collectDefaultMetrics } from "prom-client";
+import { APPROVAL_TYPES } from "@paperclipai/shared";
 import { logger } from "../middleware/logger.js";
 // Type-only, so it is erased at runtime and creates no import cycle with the
 // reaper (which imports the recorder below). Structurally restating the result
@@ -41,6 +42,7 @@ import {
   snapshotRoutineDispatchMetrics,
 } from "./routine-dispatch-metrics.js";
 import type { FdClassSnapshot } from "./fd-class-metrics.js";
+import type { NativeMemorySnapshot } from "./native-memory-metrics.js";
 
 export const CONCURRENT_RUN_BLOCKED_METRIC = "claude_k8s_concurrent_run_blocked_total";
 /**
@@ -282,6 +284,39 @@ export const HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC = "paperclip_heartbeat_rec
  * line.
  */
 export const HEARTBEAT_RECOVERY_CHAIN_STALLED_METRIC = "paperclip_heartbeat_recovery_chain_stalled_total";
+
+/**
+ * Whether THIS process currently holds a named scheduler lease (BLO-43292).
+ * `1` while it runs the loop, `0` while it does not.
+ *
+ * Labelled by pod, not by holder id: the holder id carries a per-process nonce
+ * so a restarted pod cannot renew its predecessor's lease, and using it here
+ * would mint a fresh series on every restart. The nonce is in the DB row and
+ * in the acquire/lose log lines, which is where you want it when reconstructing
+ * a handover.
+ *
+ * The alert is `sum by (lease) (...) != 1` — zero means nothing is running the
+ * loop (fleet dispatch is dark, the 2026-10-05 failure), and more than one
+ * means two processes believe they are the leader, which should be impossible
+ * and is worth knowing immediately if it is not. Evaluate it with a `for:`
+ * longer than {@link SCHEDULER_LEASE_RENEWED_METRIC}'s renew interval, since a
+ * handover legitimately passes through zero.
+ */
+export const SCHEDULER_LEASE_HELD_METRIC = "paperclip_scheduler_lease_held";
+/**
+ * Unix time of this process's last SUCCESSFUL lease renewal, in seconds;
+ * `0` if it has never held the lease (BLO-43292).
+ *
+ * `time() - ` this is renewal age. It is the one signal that separates "the
+ * leader is renewing and the loop is simply quiet" from "the leader stopped
+ * renewing and nobody has taken over yet" — the two look identical on
+ * {@link SCHEDULER_LEASE_HELD_METRIC} alone for the length of the TTL.
+ *
+ * Written on every renew attempt including failed ones (the value then stays
+ * where it was, so the age climbs), which is what makes a wedged renewer
+ * visible rather than merely absent.
+ */
+export const SCHEDULER_LEASE_RENEWED_METRIC = "paperclip_scheduler_lease_last_renewal_timestamp_seconds";
 
 /**
  * Isolation-workspace reaper sweep metrics (BLO-36814).
@@ -1023,6 +1058,24 @@ export const EXTERNAL_RUNTIME_RESERVATION_STRANDED_OLDEST_AGE_METRIC =
 export const EXTERNAL_RUNTIME_RESERVATION_STRAND_METRICS_REFRESH_SUCCESS_METRIC =
   "paperclip_external_runtime_reservation_strand_metrics_refresh_success";
 /**
+ * Board-approval-queue depth and staleness (BLO-29850). The approval queue is
+ * the mandated escalation path for shared-infra changes and had no telemetry at
+ * all: it stopped serving for 3.2 days while 39 new cards were filed into it,
+ * and the only observable difference between "the board decided everything" and
+ * "the board decided nothing" was an API call nobody made.
+ *
+ * The LAST-DECISION timestamp is the load-bearing one. Depth alone is a staffing
+ * opinion -- 88 pending against a healthy service rate is a backlog, 3 pending
+ * against a dead one is an outage -- so the alert is a staleness threshold on
+ * this series gated on pending > 0, never a threshold on depth.
+ */
+export const APPROVALS_PENDING_METRIC = "paperclip_approvals_pending";
+export const APPROVAL_OLDEST_PENDING_AGE_METRIC = "paperclip_approval_oldest_pending_age_seconds";
+export const APPROVAL_LAST_DECISION_TIMESTAMP_METRIC =
+  "paperclip_approval_last_decision_timestamp_seconds";
+export const APPROVAL_QUEUE_METRICS_REFRESH_SUCCESS_METRIC =
+  "paperclip_approval_queue_metrics_refresh_success";
+/**
  * How long each currently-held per-agent start lock has been held (PEN-3305).
  *
  * `withAgentStartLock` serializes queued-run dispatch per agent and has no
@@ -1149,6 +1202,32 @@ export const KNOWN_START_LOCK_REAP_DISPOSITIONS = [
   "error",
 ] as const;
 export type StartLockReapDispositionLabel = (typeof KNOWN_START_LOCK_REAP_DISPOSITIONS)[number];
+
+/**
+ * Seconds spent in each stage of one fleet-wide `reapOrphanedRuns` sweep
+ * (BLO-42010 AC3).
+ *
+ * A start-lock caller that arrives while a sweep is already reading waits out
+ * the rest of it AND the chained sweep after it, so its wait is up to ~2x the
+ * sweep. Measured 2026-10-13 06:xxZ: logged `ran` sweeps p50 55.8 s, max
+ * 115.4 s, over ~53 running runs. Any sweep past ~60 s therefore pushes chained
+ * waiters over the 120 s bound, and that is the `timed_out` rate. The lever is
+ * sweep duration, and the sweep had no internal timing. This splits it.
+ *
+ * No `agent_id`: the sweep is fleet-wide. `stage` is an allow-list.
+ */
+export const ORPHAN_REAP_STAGE_SECONDS_METRIC = "paperclip_orphan_reap_stage_seconds";
+export const KNOWN_ORPHAN_REAP_STAGES = [
+  "load_runs",
+  "list_jobs",
+  "identity_stamp",
+  "terminal_job_cleanup",
+  "reconcile_reservations",
+  "pod_cleanup",
+  "per_run",
+  "total",
+] as const;
+export type OrphanReapStageLabel = (typeof KNOWN_ORPHAN_REAP_STAGES)[number];
 /**
  * Overdue-parked-retry age gauge (BLO-22094). {@link QUEUED_RUN_OLDEST_AGE_METRIC}
  * deliberately excludes `status='scheduled_retry'` rows -- that exclusion is
@@ -1435,6 +1514,21 @@ export const DB_INHERITED_TIMEOUT_METRIC = "paperclip_db_inherited_timeout_secon
 export const PROCESS_OPEN_FDS_BY_CLASS_METRIC = "paperclip_process_open_fds_by_class";
 
 /**
+ * Resident memory broken into the pools V8's own gauges do not report
+ * (PEN-3314). Companion to `process_resident_memory_bytes` /
+ * `nodejs_heap_size_total_bytes` / `nodejs_external_memory_bytes`, which say the
+ * process is growing but not which pool is growing — see
+ * `services/native-memory-metrics.ts` for the measurement that motivated it.
+ */
+export const PROCESS_MEMORY_COMPONENT_BYTES_METRIC = "paperclip_process_memory_component_bytes";
+
+/**
+ * V8 context counts (PEN-3314). `detached` is a leak signature whose healthy
+ * steady state is 0, which is why it is published at 0 rather than omitted.
+ */
+export const PROCESS_V8_CONTEXT_COUNT_METRIC = "paperclip_process_v8_context_count";
+
+/**
  * `setting` label of the series carrying the pool's OWN idle-in-transaction
  * bound (PEN-3365), published beside the inherited reading so a loosening is a
  * one-series comparison. Named once here so the help text, the startup wiring
@@ -1524,7 +1618,8 @@ export const RUN_DISPATCH_WAIT_INVOCATION_SOURCES = [
  * Day-granular edges past 86400 because the regime this metric was filed for
  * is multi-day: the worst wait measured on BLO-25024 was 28h 19m. With 86400
  * as the top finite edge that sample lands in +Inf, and histogram_quantile()
- * then returns +Inf for the p95 exactly while the incident is happening.
+ * then returns 86400 — the last finite edge — for the p95 exactly while the
+ * incident is happening, however bad the wait actually is.
  */
 export const RUN_DISPATCH_WAIT_BUCKETS_SECONDS = [
   10,
@@ -3545,6 +3640,7 @@ let heartbeatRunFailed: Counter<HeartbeatRunFailedLabel> | null = null;
 let ccrotateCapacityDeferred: Counter<"adapter" | "provider"> | null = null;
 let retryScheduleOutcome: Counter<"outcome" | "retry_reason"> | null = null;
 let startLockReapDisposition: Counter<"disposition"> | null = null;
+let orphanReapStageSeconds: Histogram<"stage"> | null = null;
 let penstockGateProbe: Counter<"path" | "outcome" | "provider" | "model"> | null = null;
 let penstockGateProbeDuration: Histogram<"path" | "provider"> | null = null;
 let heartbeatTimerSchedulerExclusion: Counter<"reason"> | null = null;
@@ -3565,6 +3661,10 @@ let environmentLeasesOrphanedOldestAge: Gauge | null = null;
 let orphanedRuntimeResourceMetricsRefreshSuccess: Gauge | null = null;
 let externalRuntimeReservationStrandedOldestAge: Gauge<"agent_id"> | null = null;
 let externalRuntimeReservationStrandMetricsRefreshSuccess: Gauge | null = null;
+let approvalsPending: Gauge<"type"> | null = null;
+let approvalOldestPendingAge: Gauge<"type"> | null = null;
+let approvalLastDecisionTimestamp: Gauge | null = null;
+let approvalQueueMetricsRefreshSuccess: Gauge | null = null;
 let agentStartLockHeldSeconds: Gauge<"agent_id"> | null = null;
 let agentStartLockPhaseSeconds: Gauge<"agent_id" | "phase"> | null = null;
 let agentStartLockAbortedTotal: Counter<"agent_id"> | null = null;
@@ -3595,6 +3695,8 @@ let dbPoolConnections: Gauge<"state"> | null = null;
 let dbPoolWaitingQueries: Gauge | null = null;
 let dbInheritedTimeout: Gauge<"setting" | "source"> | null = null;
 let processOpenFdsByClass: Gauge<"fd_class"> | null = null;
+let processMemoryComponentBytes: Gauge<"component"> | null = null;
+let processV8ContextCount: Gauge<"kind"> | null = null;
 let pluginError: Gauge<"plugin_id" | "plugin_key"> | null = null;
 let crashRecoveryCandidateIndexPresent: Gauge<"index"> | null = null;
 let pluginMetric: Counter<
@@ -3679,6 +3781,8 @@ let heartbeatRecoveryChainSkipped: Counter | null = null;
 let heartbeatRecoveryChainDuration: Gauge | null = null;
 let heartbeatRecoveryChainInflight: Gauge | null = null;
 let heartbeatRecoveryChainStalled: Counter | null = null;
+let schedulerLeaseHeld: Gauge<"lease" | "holder"> | null = null;
+let schedulerLeaseRenewed: Gauge<"lease" | "holder"> | null = null;
 let pluginWebhookDeliveryRejected:
   | Counter<"plugin_key" | "response_class" | "plugin_status">
   | null = null;
@@ -3708,6 +3812,7 @@ function ensureRegistry(): {
   capacityDeferredCounter: Counter<"adapter" | "provider">;
   retryScheduleOutcomeCounter: Counter<"outcome" | "retry_reason">;
   startLockReapDispositionCounter: Counter<"disposition">;
+  orphanReapStageSecondsHistogram: Histogram<"stage">;
   penstockGateProbeCounter: Counter<"path" | "outcome" | "provider" | "model">;
   penstockGateProbeDurationHistogram: Histogram<"path" | "provider">;
   heartbeatTimerSchedulerExclusionCounter: Counter<"reason">;
@@ -3753,6 +3858,8 @@ function ensureRegistry(): {
   dbPoolWaitingQueriesGauge: Gauge;
   dbInheritedTimeoutGauge: Gauge<"setting" | "source">;
   processOpenFdsByClassGauge: Gauge<"fd_class">;
+  processMemoryComponentBytesGauge: Gauge<"component">;
+  processV8ContextCountGauge: Gauge<"kind">;
   pluginErrorGauge: Gauge<"plugin_id" | "plugin_key">;
   crashRecoveryCandidateIndexPresentGauge: Gauge<"index">;
   pluginMetricCounter: Counter<
@@ -3762,6 +3869,10 @@ function ensureRegistry(): {
   pluginStatusCollectorLastSuccessGauge: Gauge<"role">;
   externalRuntimeReservationStrandedOldestAgeGauge: Gauge<"agent_id">;
   externalRuntimeReservationStrandMetricsRefreshSuccessGauge: Gauge;
+  approvalsPendingGauge: Gauge<"type">;
+  approvalOldestPendingAgeGauge: Gauge<"type">;
+  approvalLastDecisionTimestampGauge: Gauge;
+  approvalQueueMetricsRefreshSuccessGauge: Gauge;
   agentStartLockHeldSecondsGauge: Gauge<"agent_id">;
   agentStartLockPhaseSecondsGauge: Gauge<"agent_id" | "phase">;
   agentStartLockAbortedTotalCounter: Counter<"agent_id">;
@@ -3785,6 +3896,8 @@ function ensureRegistry(): {
   heartbeatRecoveryChainDurationGauge: Gauge;
   heartbeatRecoveryChainInflightGauge: Gauge;
   heartbeatRecoveryChainStalledCounter: Counter;
+  schedulerLeaseHeldGauge: Gauge<"lease" | "holder">;
+  schedulerLeaseRenewedGauge: Gauge<"lease" | "holder">;
   pluginWebhookDeliveryRejectedCounter: Counter<"plugin_key" | "response_class" | "plugin_status">;
   recoveryHorizonExpiredCounter: Counter<"delivery">;
   workerTierProxyFailuresCounter: Counter<"reason">;
@@ -3812,6 +3925,7 @@ function ensureRegistry(): {
     || !ccrotateCapacityDeferred
     || !retryScheduleOutcome
     || !startLockReapDisposition
+    || !orphanReapStageSeconds
     || !penstockGateProbe
     || !penstockGateProbeDuration
     || !heartbeatTimerSchedulerExclusion
@@ -3830,6 +3944,10 @@ function ensureRegistry(): {
     || !orphanedRuntimeResourceMetricsRefreshSuccess
     || !externalRuntimeReservationStrandedOldestAge
     || !externalRuntimeReservationStrandMetricsRefreshSuccess
+    || !approvalsPending
+    || !approvalOldestPendingAge
+    || !approvalLastDecisionTimestamp
+    || !approvalQueueMetricsRefreshSuccess
     || !agentStartLockHeldSeconds
     || !agentStartLockPhaseSeconds
     || !agentStartLockAbortedTotal
@@ -3862,6 +3980,8 @@ function ensureRegistry(): {
     || !dbPoolWaitingQueries
     || !dbInheritedTimeout
     || !processOpenFdsByClass
+    || !processMemoryComponentBytes
+    || !processV8ContextCount
     || !pluginError
     || !crashRecoveryCandidateIndexPresent
     || !pluginMetric
@@ -3887,6 +4007,8 @@ function ensureRegistry(): {
     || !heartbeatRecoveryChainDuration
     || !heartbeatRecoveryChainInflight
     || !heartbeatRecoveryChainStalled
+    || !schedulerLeaseHeld
+    || !schedulerLeaseRenewed
     || !pluginWebhookDeliveryRejected
     || !recoveryHorizonExpired
     || !workerTierProxyFailures
@@ -4130,6 +4252,16 @@ function ensureRegistry(): {
       labelNames: ["outcome", "retry_reason"],
       registers: [registry],
     });
+    orphanReapStageSeconds = new Histogram({
+      name: ORPHAN_REAP_STAGE_SECONDS_METRIC,
+      help:
+        "Seconds per stage of one fleet-wide orphan-reap sweep (BLO-42010). "
+        + "stage='total' is the whole sweep. Start-lock waiters can wait ~2x a sweep, "
+        + "so sweeps over ~60 s drive the reap disposition timed_out rate.",
+      labelNames: ["stage"],
+      buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 30, 45, 60, 90, 120, 180, 300],
+      registers: [registry],
+    });
     startLockReapDisposition = new Counter({
       name: AGENT_START_LOCK_REAP_DISPOSITION_METRIC,
       help:
@@ -4217,6 +4349,42 @@ function ensureRegistry(): {
         + "broken rather than absent -- its value is always 0 and carries nothing; its presence "
         + "is the signal.",
       labelNames: ["fd_class"],
+      registers: [registry],
+    });
+    processMemoryComponentBytes = new Gauge({
+      name: PROCESS_MEMORY_COMPONENT_BYTES_METRIC,
+      help:
+        "Resident memory split into the pools V8's own gauges do not report (PEN-3314). "
+        + "native_unaccounted = rss - heapTotal - external, the headline residual: measured "
+        + "281 -> 2098 MB over 21h on the 2026-10-11 worker generation while "
+        + "nodejs_heap_size_used_bytes' floor slope was NEGATIVE (-3.5 MB/h), which is why the "
+        + "heap gauges stopped being evidence about this process. It is NOT clamped at zero -- a "
+        + "negative value means V8's committed heap holds pages that are not resident (normal "
+        + "shortly after start) and is distinct from 'no native memory'. "
+        + "array_buffers and external_other split nodejs_external_memory_bytes into its "
+        + "ArrayBuffer-backed and C++-bound-object halves; v8_malloced / v8_peak_malloced and "
+        + "v8_global_handles_total / v8_global_handles_used are V8 allocations OUTSIDE the heap "
+        + "it reports as heapTotal, so a native addon leaking persistent handles appears in "
+        + "v8_global_handles_total and in no other series this process emits. "
+        + "These components are NOT a partition of RSS and do not sum to it -- array_buffers and "
+        + "external_other are inside the external that native_unaccounted subtracts, and "
+        + "v8_malloced overlaps the residual. Read each on its own trend. "
+        + "NOT an alert source: it names which pool grows, it does not bound it. An absent "
+        + "component means this runtime does not report that field, deliberately distinct from a "
+        + "zero; absence of the whole metric means neither process.memoryUsage() nor "
+        + "v8.getHeapStatistics() could be read at all.",
+      labelNames: ["component"],
+      registers: [registry],
+    });
+    processV8ContextCount = new Gauge({
+      name: PROCESS_V8_CONTEXT_COUNT_METRIC,
+      help:
+        "V8 context counts (PEN-3314). kind=native is a steady-state value; growth means "
+        + "contexts are being retained. kind=detached counts contexts detached but not yet "
+        + "collected -- a leak signature whose healthy steady state is 0, so the series is "
+        + "published AT 0 rather than omitted, and an absent series means this runtime does not "
+        + "report the field.",
+      labelNames: ["kind"],
       registers: [registry],
     });
     agentStartLockHeldSeconds = new Gauge({
@@ -4323,6 +4491,58 @@ function ensureRegistry(): {
       registers: [registry],
     });
     externalRuntimeReservationStrandMetricsRefreshSuccess.set(0);
+    approvalsPending = new Gauge({
+      name: APPROVALS_PENDING_METRIC,
+      help:
+        "Board approvals currently in status 'pending', labeled by bounded approval type "
+        + "(BLO-29850). `revision_requested` is excluded deliberately: that card is back in the "
+        + "REQUESTER's court to resubmit or withdraw, so counting it would attribute a requester "
+        + "backlog to board unresponsiveness. Every known approval type is seeded with 0 on each "
+        + "refresh, so a drained type -- and an empty queue -- reads back an explicit 0 rather than "
+        + "an absent series or a frozen stale value. This gauge is the "
+        + "alert's GATE, never its trigger -- depth alone is a staffing opinion; see "
+        + APPROVAL_LAST_DECISION_TIMESTAMP_METRIC + " for the fault signal.",
+      labelNames: ["type"],
+      registers: [registry],
+    });
+    approvalOldestPendingAge = new Gauge({
+      name: APPROVAL_OLDEST_PENDING_AGE_METRIC,
+      help:
+        "Age in seconds of the oldest still-'pending' board approval, labeled by bounded approval "
+        + "type (BLO-29850). Slow-burn companion to the staleness alert: a queue being served at a "
+        + "healthy rate can still strand one card forever, which the last-decision timestamp alone "
+        + "cannot see. Reset-then-set every refresh; a type with nothing pending has no series here "
+        + "(its " + APPROVALS_PENDING_METRIC + " reads 0), because 0 would read as a card filed this "
+        + "instant.",
+      labelNames: ["type"],
+      registers: [registry],
+    });
+    approvalLastDecisionTimestamp = new Gauge({
+      name: APPROVAL_LAST_DECISION_TIMESTAMP_METRIC,
+      help:
+        "Unix timestamp (seconds) of the most recent BOARD decision on an approval -- "
+        + "approved/rejected/revision_requested only (BLO-29850). `withdrawn` and `cancelled` are "
+        + "excluded because they are requester-side cleanup: a burst of agents retiring their own "
+        + "moot cards drains the pending count without the board deciding anything, and a "
+        + "depth-only metric scores that as progress. Excluding them here is what makes "
+        + "`time() - <this>` a true service-liveness signal. A revision request is also read from "
+        + "the append-only activity log, because the requester's resubmit/withdraw erases it from "
+        + "the approval row. 0 means no board decision has ever "
+        + "been recorded, so alerts must gate on " + APPROVAL_QUEUE_METRICS_REFRESH_SUCCESS_METRIC
+        + " rather than reading 0 as an infinitely stale queue.",
+      registers: [registry],
+    });
+    approvalLastDecisionTimestamp.set(0);
+    approvalQueueMetricsRefreshSuccess = new Gauge({
+      name: APPROVAL_QUEUE_METRICS_REFRESH_SUCCESS_METRIC,
+      help:
+        "1 when the most recent approval-queue database refresh completed before metrics "
+        + "exposition; 0 when it failed, so a stale pending count cannot be read as a fresh empty "
+        + "queue. Silence is not health: this gauge is what separates 'measured nothing pending' "
+        + "from 'failed to measure'.",
+      registers: [registry],
+    });
+    approvalQueueMetricsRefreshSuccess.set(0);
     processLostTotal = new Counter({
       name: PROCESS_LOST_TOTAL_METRIC,
       help:
@@ -5110,6 +5330,30 @@ function ensureRegistry(): {
       registers: [registry],
     });
     heartbeatRecoveryChainStalled.inc(0);
+    schedulerLeaseHeld = new Gauge({
+      name: SCHEDULER_LEASE_HELD_METRIC,
+      help:
+        "1 while this process holds the named scheduler lease and runs that loop, 0 while it "
+        + "does not (BLO-43292). Alert on sum by (lease) (...) != 1: zero means nobody is "
+        + "running the loop, >1 means two processes both believe they lead.",
+      labelNames: ["lease", "holder"] as const,
+      registers: [registry],
+    });
+    schedulerLeaseRenewed = new Gauge({
+      name: SCHEDULER_LEASE_RENEWED_METRIC,
+      help:
+        "Unix time of this process's last successful scheduler-lease renewal, in seconds; 0 if "
+        + "it has never held the lease (BLO-43292). time() minus this is renewal age, which is "
+        + "what separates a quiet leader from one that has stopped renewing.",
+      labelNames: ["lease", "holder"] as const,
+      registers: [registry],
+    });
+    // Deliberately NOT pre-seeded. Both series are labelled, so there is no
+    // label set to seed without inventing a lease name; and unlike the
+    // unlabelled gauges above, an absent series here is the honest reading —
+    // a process that holds no lease and has never tried is not "0 held", it
+    // has no opinion. The series appears on the first renew attempt, which is
+    // within one renew interval of start.
     // Pre-seed every backstop series so "healthy" reads as a literal 0 rather than an
     // absent series. The gauge already did this; the counters did not, which reproduced
     // the exact silence defect BLO-29763 was opened to remove, one metric over: on a
@@ -5207,9 +5451,17 @@ function ensureRegistry(): {
       help:
         "Directories skipped UNEXAMINED because their top level did not match the "
         + "{home, session} allowlist (BLO-36814). Its own series, not an outcome "
-        + "label: a rise above baseline means the tree is more heterogeneous than "
-        + "the allowlist was validated against. BLO-36735 measured that baseline "
-        + "as 1 at maxAgeDays=30 (a stray wt-blo-19094 git worktree). A directory "
+        + "label. SUMS TWO POPULATIONS WITH OPPOSITE MEANINGS AND CANNOT SPLIT "
+        + "THEM: single-sided ({home} or {session} alone -- a half-materialized "
+        + "workspace, benign) and genuine supersets (an extra top-level entry -- "
+        + "the real heterogeneity signal). BLO-36735 measured the whole live tree "
+        + "at maxAgeDays=30 on 2026-10-11: 50 skips = 42 single-sided + 8 "
+        + "supersets, that subset unchanged from 2026-10-10. So the total is not "
+        + "readable as a rise -- an earlier reading of this help gave the baseline "
+        + "as 1 (the superset count before the single-sided population existed at "
+        + "scale) and against 50 that fires permanently on a benign cause. Until "
+        + "this carries a reason label, split it against the tree; see "
+        + "runbooks/isolation-workspace-reaper.md. A directory "
         + "whose top level DID match but which holds a nested git checkout is not "
         + "counted here; it is " + ISOLATION_WORKSPACE_REAPER_ENTRIES_METRIC
         + "{outcome=\"retained_nested_checkout\"}.",
@@ -5420,6 +5672,7 @@ function ensureRegistry(): {
     capacityDeferredCounter: ccrotateCapacityDeferred,
     retryScheduleOutcomeCounter: retryScheduleOutcome,
     startLockReapDispositionCounter: startLockReapDisposition,
+    orphanReapStageSecondsHistogram: orphanReapStageSeconds,
     penstockGateProbeCounter: penstockGateProbe,
     penstockGateProbeDurationHistogram: penstockGateProbeDuration,
     heartbeatTimerSchedulerExclusionCounter: heartbeatTimerSchedulerExclusion,
@@ -5439,6 +5692,10 @@ function ensureRegistry(): {
     externalRuntimeReservationStrandedOldestAgeGauge: externalRuntimeReservationStrandedOldestAge,
     externalRuntimeReservationStrandMetricsRefreshSuccessGauge:
       externalRuntimeReservationStrandMetricsRefreshSuccess,
+    approvalsPendingGauge: approvalsPending,
+    approvalOldestPendingAgeGauge: approvalOldestPendingAge,
+    approvalLastDecisionTimestampGauge: approvalLastDecisionTimestamp,
+    approvalQueueMetricsRefreshSuccessGauge: approvalQueueMetricsRefreshSuccess,
     agentStartLockHeldSecondsGauge: agentStartLockHeldSeconds,
     agentStartLockPhaseSecondsGauge: agentStartLockPhaseSeconds,
     agentStartLockAbortedTotalCounter: agentStartLockAbortedTotal,
@@ -5472,6 +5729,8 @@ function ensureRegistry(): {
     dbPoolWaitingQueriesGauge: dbPoolWaitingQueries,
     dbInheritedTimeoutGauge: dbInheritedTimeout,
     processOpenFdsByClassGauge: processOpenFdsByClass,
+    processMemoryComponentBytesGauge: processMemoryComponentBytes,
+    processV8ContextCountGauge: processV8ContextCount,
     pluginErrorGauge: pluginError,
     crashRecoveryCandidateIndexPresentGauge: crashRecoveryCandidateIndexPresent,
     pluginMetricCounter: pluginMetric,
@@ -5497,6 +5756,8 @@ function ensureRegistry(): {
     heartbeatRecoveryChainDurationGauge: heartbeatRecoveryChainDuration,
     heartbeatRecoveryChainInflightGauge: heartbeatRecoveryChainInflight,
     heartbeatRecoveryChainStalledCounter: heartbeatRecoveryChainStalled,
+    schedulerLeaseHeldGauge: schedulerLeaseHeld,
+    schedulerLeaseRenewedGauge: schedulerLeaseRenewed,
     pluginWebhookDeliveryRejectedCounter: pluginWebhookDeliveryRejected,
     recoveryHorizonExpiredCounter: recoveryHorizonExpired,
     workerTierProxyFailuresCounter: workerTierProxyFailures,
@@ -5754,6 +6015,12 @@ export function recordRetryScheduleOutcome(
   };
   ensureRegistry().retryScheduleOutcomeCounter.inc(labels);
   return labels;
+}
+
+/** Observe one {@link ORPHAN_REAP_STAGE_SECONDS_METRIC} sample. Unknown stages are dropped. */
+export function recordOrphanReapStage(stage: OrphanReapStageLabel, seconds: number) {
+  if (!(KNOWN_ORPHAN_REAP_STAGES as readonly string[]).includes(stage) || !Number.isFinite(seconds)) return;
+  ensureRegistry().orphanReapStageSecondsHistogram.observe({ stage }, Math.max(0, seconds));
 }
 
 /**
@@ -6376,6 +6643,36 @@ export function setFdClassMetrics(snapshot: FdClassSnapshot | null): void {
 }
 
 /**
+ * PEN-3314: publish the native-memory accounting.
+ *
+ * Reset-then-set for the same reason as {@link setFdClassMetrics}: a component
+ * this runtime stops reporting must stop being published, or its last value
+ * freezes in place and reads as a pool that stopped growing.
+ *
+ * A `null` snapshot publishes nothing at all — see
+ * {@link collectNativeMemorySnapshot}, which returns `null` only when the
+ * readings could not be taken. "Cannot measure" and "measured zero" must not
+ * render identically, and that distinction is sharper here than anywhere else in
+ * this file: a flat zero line is exactly what the heap gauge was showing while
+ * this process leaked 87 MB/h.
+ *
+ * The loops must not skip zero values. `detached` contexts are 0 in the healthy
+ * state, and that 0 is the measurement.
+ */
+export function setNativeMemoryMetrics(snapshot: NativeMemorySnapshot | null): void {
+  const metrics = ensureRegistry();
+  metrics.processMemoryComponentBytesGauge.reset();
+  metrics.processV8ContextCountGauge.reset();
+  if (!snapshot) return;
+  for (const [component, bytes] of snapshot.components) {
+    metrics.processMemoryComponentBytesGauge.set({ component }, bytes);
+  }
+  for (const [kind, count] of snapshot.contexts) {
+    metrics.processV8ContextCountGauge.set({ kind }, count);
+  }
+}
+
+/**
  * BLO-21460. Set from the residual backlog measured AFTER each reconciliation
  * pass (`reapOrphanedRuns` -> `reconcileReleasePendingExternalRuntimeReservations`),
  * not the pre-pass candidate count — see the metric's doc comment for why 0 is
@@ -6439,6 +6736,56 @@ export function setExternalRuntimeReservationStrandedOldestAgeMetrics(
 /** Mark whether the stranded-reservation gauge was refreshed from the database. */
 export function setExternalRuntimeReservationStrandMetricsRefreshSuccess(success: boolean): void {
   ensureRegistry().externalRuntimeReservationStrandMetricsRefreshSuccessGauge.set(success ? 1 : 0);
+}
+
+/**
+ * Publish board-approval-queue depth, oldest-pending age, and last-board-decision
+ * timestamp (BLO-29850). Reset-then-set like
+ * {@link setExternalRuntimeReservationStrandedOldestAgeMetrics}, plus one thing
+ * that setter cannot do: the pending gauge is SEEDED with 0 for every known
+ * `APPROVAL_TYPES` value before the query rows are applied. The query only
+ * returns types that have pending rows, so without the seed a drained type (and
+ * the whole family, on an empty queue) is absent rather than 0 -- and an absent
+ * series is exactly what "never exported" looks like. The type set is bounded, so
+ * seeding it costs nothing in cardinality; a row outside the enum still gets its
+ * own series.
+ *
+ * The oldest-pending-age gauge is deliberately NOT seeded: a type with nothing
+ * pending has no oldest card, and 0 would read as "a card filed this instant".
+ * Its absence is unambiguous because the seeded pending gauge reads 0 alongside.
+ *
+ * `lastDecisionTimestampSeconds` is left UNTOUCHED when null rather than zeroed.
+ * Zeroing it would make `time() - <gauge>` enormous and fire the staleness alert
+ * on an installation that has simply never recorded a board decision, which is a
+ * cold-start artifact rather than an outage. The gauge's initial value is already
+ * 0 and the freshness gate distinguishes the two cases.
+ */
+export function setApprovalQueuePendingMetrics(input: {
+  entries: ReadonlyArray<{ type: string; pending: number; oldestAgeSeconds: number }>;
+  lastDecisionTimestampSeconds: number | null;
+}): void {
+  const metrics = ensureRegistry();
+  metrics.approvalsPendingGauge.reset();
+  metrics.approvalOldestPendingAgeGauge.reset();
+  for (const type of APPROVAL_TYPES) metrics.approvalsPendingGauge.set({ type }, 0);
+  for (const entry of input.entries) {
+    const type = entry.type || "unknown";
+    const pending = Number.isFinite(entry.pending) ? Math.max(0, entry.pending) : 0;
+    const age = Number.isFinite(entry.oldestAgeSeconds) ? Math.max(0, entry.oldestAgeSeconds) : 0;
+    metrics.approvalsPendingGauge.set({ type }, pending);
+    metrics.approvalOldestPendingAgeGauge.set({ type }, age);
+  }
+  if (
+    input.lastDecisionTimestampSeconds !== null
+    && Number.isFinite(input.lastDecisionTimestampSeconds)
+  ) {
+    metrics.approvalLastDecisionTimestampGauge.set(Math.max(0, input.lastDecisionTimestampSeconds));
+  }
+}
+
+/** Mark whether the approval-queue gauges were refreshed from the database. */
+export function setApprovalQueueMetricsRefreshSuccess(success: boolean): void {
+  ensureRegistry().approvalQueueMetricsRefreshSuccessGauge.set(success ? 1 : 0);
 }
 
 export function computePrReviewQueueWaitSeconds(
@@ -7386,6 +7733,29 @@ export function recordHeartbeatRecoveryChainStalled(): void {
   ensureRegistry().heartbeatRecoveryChainStalledCounter.inc();
 }
 
+/**
+ * BLO-43292: publish this process's view of one scheduler lease.
+ *
+ * Both series are written on every renew attempt, successful or not. That is
+ * the point: on a failed renewal `held` still reads 1 until the cached
+ * deadline passes while `lastRenewedAtMs` stops advancing, so renewal age is
+ * what makes a wedged leader visible before the TTL turns it into an outage.
+ */
+export function recordSchedulerLeaseState(input: {
+  lease: string;
+  holder: string;
+  held: boolean;
+  lastRenewedAtMs: number;
+}): void {
+  const registry = ensureRegistry();
+  const labels = { lease: input.lease, holder: input.holder };
+  registry.schedulerLeaseHeldGauge.set(labels, input.held ? 1 : 0);
+  registry.schedulerLeaseRenewedGauge.set(
+    labels,
+    input.lastRenewedAtMs > 0 ? input.lastRenewedAtMs / 1000 : 0,
+  );
+}
+
 export function recordBackstopCandidateSkipped(source: BackstopSource, reason: BackstopSkipReason): void {
   ensureRegistry().backstopCandidatesSkippedCounter.inc({ source, reason });
 }
@@ -7712,6 +8082,7 @@ export function __resetMetricsForTest(): void {
   ccrotateCapacityDeferred = null;
   retryScheduleOutcome = null;
   startLockReapDisposition = null;
+  orphanReapStageSeconds = null;
   penstockGateProbe = null;
   penstockGateProbeDuration = null;
   heartbeatTimerSchedulerExclusion = null;
@@ -7731,10 +8102,16 @@ export function __resetMetricsForTest(): void {
   orphanedRuntimeResourceMetricsRefreshSuccess = null;
   externalRuntimeReservationStrandedOldestAge = null;
   externalRuntimeReservationStrandMetricsRefreshSuccess = null;
+  approvalsPending = null;
+  approvalOldestPendingAge = null;
+  approvalLastDecisionTimestamp = null;
+  approvalQueueMetricsRefreshSuccess = null;
   agentStartLockHeldSeconds = null;
   agentStartLockPhaseSeconds = null;
   agentStartLockAbortedTotal = null;
   processOpenFdsByClass = null;
+  processMemoryComponentBytes = null;
+  processV8ContextCount = null;
   processLostTotal = null;
   externalLifecycleRunningRuns = null;
   externalLifecycleRunSilenceGap = null;
@@ -7785,6 +8162,8 @@ export function __resetMetricsForTest(): void {
   heartbeatRecoveryChainDuration = null;
   heartbeatRecoveryChainInflight = null;
   heartbeatRecoveryChainStalled = null;
+  schedulerLeaseHeld = null;
+  schedulerLeaseRenewed = null;
   recoveryHorizonExpired = null;
   gbrainRecallTotal = null;
   pluginWebhookDeliveryRejected = null;

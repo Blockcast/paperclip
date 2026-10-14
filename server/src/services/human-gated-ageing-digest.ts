@@ -32,7 +32,8 @@
  * assembled from N registered producers. That is what lets a second ageing
  * source join the same seam without re-deciding the channel.
  */
-import { and, asc, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
+import { NON_HUMAN_USER_SENTINEL_IDS } from "@paperclipai/shared";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -682,6 +683,7 @@ export async function resolveDigestOwnerUserId(
         eq(companyMemberships.companyId, companyId),
         eq(companyMemberships.principalType, "user"),
         eq(companyMemberships.status, "active"),
+        notInArray(companyMemberships.principalId, [...NON_HUMAN_USER_SENTINEL_IDS]),
       ),
     )
     .orderBy(
@@ -717,6 +719,7 @@ async function isActiveCompanyMember(
         eq(companyMemberships.principalType, "user"),
         eq(companyMemberships.principalId, userId),
         eq(companyMemberships.status, "active"),
+        notInArray(companyMemberships.principalId, [...NON_HUMAN_USER_SENTINEL_IDS]),
       ),
     )
     .limit(1);
