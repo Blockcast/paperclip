@@ -1003,10 +1003,19 @@ describe("merge commits (BLO-46233)", () => {
    * Real git, because the defect lived in which `show` flag was passed and a
    * fake reader would only echo back whatever the test assumed it emits.
    */
+  // Hermetic: a leaked GIT_DIR/GIT_INDEX_FILE would aim `update-ref` and
+  // `commit --amend` at the outer repo, and global config (hooks, signing,
+  // diff.noprefix) would change what runs and what `show` emits.
+  const gitEnv = {
+    ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_"))),
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_NOSYSTEM: "1",
+  };
+
   function withMergedBranch(run: (git: (...args: string[]) => string, dir: string) => void): void {
     const dir = mkdtempSync(join(tmpdir(), "egress-merge-"));
     const git = (...args: string[]): string => {
-      const result = spawnSync("git", args, { cwd: dir, encoding: "utf8" });
+      const result = spawnSync("git", args, { cwd: dir, encoding: "utf8", env: gitEnv });
       if (result.status !== 0) throw new Error(`git ${args.join(" ")}: ${result.stderr}`);
       return result.stdout;
     };
@@ -1042,7 +1051,7 @@ describe("merge commits (BLO-46233)", () => {
 
   function scanTopicPush(git: (...args: string[]) => string, dir: string): GitPushFinding[] {
     const reader: GitReader = (args) => {
-      const result = spawnSync("git", args, { cwd: dir, encoding: "utf8" });
+      const result = spawnSync("git", args, { cwd: dir, encoding: "utf8", env: gitEnv });
       return result.status === 0 ? result.stdout : null;
     };
     return scanPrePushUpdates(
@@ -1079,4 +1088,27 @@ describe("merge commits (BLO-46233)", () => {
       expect(formatRefusal(findings)).toContain("--rebase-merges");
     });
   }, 60_000);
+
+  // `--cc` ignores `--text`: these files print `Binary files differ` with no
+  // `+` lines, so without the `-m` fallback the merge reads as clean.
+  for (const [label, attributes, prefix] of [
+    ["a `-diff` attribute", "z -diff\n", ""],
+    ["a NUL byte", null, "\0"],
+  ] as const) {
+    it(`still refuses a resolution that hides material behind ${label}`, () => {
+      withMergedBranch((git, dir) => {
+        writeFileSync(join(dir, "z"), `${prefix}${vendorKey()}\n`);
+        git("add", "z");
+        if (attributes) {
+          writeFileSync(join(dir, ".gitattributes"), attributes);
+          git("add", ".gitattributes");
+        }
+        git("commit", "-q", "--amend", "--no-edit");
+        const findings = scanTopicPush(git, dir);
+        expect(findings).toHaveLength(1);
+        expect(findings[0]!.merge).toBe(true);
+        expect(findings[0]!.classes).toContain("vendor-key");
+      });
+    }, 60_000);
+  }
 });

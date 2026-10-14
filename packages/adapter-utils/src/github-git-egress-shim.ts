@@ -1016,6 +1016,9 @@ function readGit(runGit: GitReader, args: string[], commit?: string): string {
  * upstream, on every push, with nothing the author can amend. The residual is
  * narrow — material already published to another remote, i.e. already disclosed
  * once — where the alternative's cost falls on ordinary clean pushes.
+ * BLO-46233 extends it to merges: `scanCommit` now reads only a merge's own
+ * resolution, so a parent excluded because a DIFFERENT remote has it is no
+ * longer re-scanned through the merge, as it accidentally was under `-m`.
  *
  * PEN-3907 widened that trade-off to the existing-ref arm, which previously did
  * not consult `--remotes` at all. Stated plainly so it is not discovered later:
@@ -1198,15 +1201,33 @@ export function scanCommit(commit: string, runGit: GitReader): GitPushFinding[] 
   // returns null, and `readGit` throws rather than scanning a truncated patch.
   // That is deliberate — the alternative is scanning a prefix and calling the
   // rest clean, which is worst exactly when the push is biggest.
-  const patch = readGit(
+  //
+  // One exception, and it is fail-closed: git's combined diff IGNORES `--text`,
+  // so on a merge a NUL-bearing or `-diff` file still prints `Binary files
+  // differ` with no `+` lines — the hole `--text` exists to close. Any binary
+  // line in the combined output re-reads the whole commit with `-m`, which does
+  // honour `--text`. That restores the pre-BLO-46233 over-report for that merge.
+  // ponytail: whole-commit fallback; narrow it to the binary paths if merges
+  // with binary resolutions start refusing on parent content in practice.
+  let patch = readGit(
     runGit,
     ["show", "--format=", "--no-color", "--cc", "--unified=0", "--text", "--no-textconv", commit],
     commit,
   );
+  // A merge's combined diff labels every file `diff --cc`; a non-merge's says
+  // `diff --git`. Read before any fallback, and present even when the only file
+  // is binary and there is no `@@@` hunk.
+  const merge = /^diff --cc /m.test(patch);
+  if (/^Binary files /m.test(patch)) {
+    patch = readGit(
+      runGit,
+      ["show", "--format=", "--no-color", "-m", "--unified=0", "--text", "--no-textconv", commit],
+      commit,
+    );
+  }
   if (patch) {
     const scrubbed = scrubGitHubEgressText(addedLinesFromPatch(patch));
     if (scrubbed.redacted) {
-      const merge = /^@@@/m.test(patch);
       findings.push({ commit, shortCommit, subject, where: "content", classes: scrubbed.classes, ...(merge ? { merge } : {}) });
     }
   }
