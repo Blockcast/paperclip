@@ -518,6 +518,44 @@ test("an env.path override that keeps the wrapper directory first is accepted", 
   assert.ok(value.includes("/opt/custom/bin"), "override must be honored");
 });
 
+// --- In-repo consumers that name a wrapper by ABSOLUTE path ---------------
+//
+// PATH ordering protects every consumer that resolves a wrapper BY NAME. It
+// does nothing for one that hardcodes an absolute path, and this card found two
+// of those: the seeded `.mcp.json` github upstream (fixed above), and the
+// server's own git credential helper.
+//
+// The server one is the dangerous shape, because both of its failure modes are
+// silent. While the stale PVC copy survives, the server executes a
+// uid-1000-writable helper while holding the App installation token. Once
+// PEN-3840's post-merge step deletes it, `existsSync` in
+// `resolveServerGitInvocation` goes false and the credential arguments are
+// simply dropped — server-side fetches of private repos lose auth with no
+// render failure, no test failure, and no log line saying why.
+//
+// Read out of the source rather than imported: this file runs under plain
+// `node --test` with no bundler, and the constant is deliberately module-private.
+// Same technique as `github-write-egress-scrub.test.ts`, which pins a regex
+// literal the same way. The `assert.ok` on the match is the half that matters —
+// without it a renamed or reshaped constant makes the equality vacuous rather
+// than failing.
+test("the server's git credential helper names the root-owned image copy (PEN-3840)", () => {
+  const source = fs.readFileSync(
+    path.join(repoRoot, "server/src/services/workspace-runtime.ts"),
+    "utf8",
+  );
+  const match = /SERVER_GIT_CREDENTIAL_HELPER_PATH\s*=\s*"([^"]+)"/.exec(source);
+  assert.ok(
+    match,
+    "SERVER_GIT_CREDENTIAL_HELPER_PATH moved or changed shape — this test went vacuous, re-point it",
+  );
+  assert.equal(
+    match[1],
+    `${IMAGE_WRAPPER_BIN}/github-token-credential-helper`,
+    "the server would execute an agent-writable credential helper, or none at all once the PVC copy is deleted",
+  );
+});
+
 // --- The live deployment must not move ------------------------------------
 
 test("the Blockcast overlay renders the PATH the chart now derives", () => {
