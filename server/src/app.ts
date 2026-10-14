@@ -78,6 +78,7 @@ import {
   refreshNativeMemoryMetrics,
   startScrapeMetricsCollector,
 } from "./services/scrape-metrics-collector.js";
+import { startHeapPeakTracking } from "./services/heap-peak-tracker.js";
 import { pluginUiStaticRoutes } from "./routes/plugin-ui-static.js";
 import { readBrandedStaticIndexHtml } from "./static-index-html.js";
 import { applyUiBranding } from "./ui-branding.js";
@@ -1123,6 +1124,11 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
   // BLO-33243: every tier serves /metrics and is a scrape target, so unlike the
   // plugin-status collector this one is NOT gated on the node role.
   const stopScrapeMetricsCollector = startScrapeMetricsCollector(db);
+  // PEN-3314: sample the V8 heap size far faster than the 60s scrape, so a heap
+  // excursion that completes between two scrapes still leaves a durable number.
+  // Started beside the scrape collector and for the same reason: every tier is a
+  // scrape target, and the api tier is where the 3 GB excursion was first caught.
+  const stopHeapPeakTracking = startHeapPeakTracking();
   if (appConfig.paperclipNodeRole === "api") {
     logger.info(
       { role: appConfig.paperclipNodeRole },
@@ -1171,6 +1177,7 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
     stopGitHubStatusDeliveryOutbox?.();
     stopPluginStatusCollector?.();
     stopScrapeMetricsCollector();
+    stopHeapPeakTracking();
     await stopIssueCommentEffectReconciler?.();
     disableFeedbackExportFlushes();
     devWatcher?.close();
