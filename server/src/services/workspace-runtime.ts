@@ -1056,8 +1056,23 @@ export const executeProcessForTests = executeProcess;
  */
 export const isProcessGroupAliveForTests = isProcessGroupAlive;
 
-/** Where the chart writes the credential helper the egress `git` wrapper configures. */
-const SERVER_GIT_CREDENTIAL_HELPER_PATH = "/paperclip/.local/bin/github-token-credential-helper";
+/**
+ * The credential helper the egress `git` wrapper configures, in the image.
+ *
+ * PEN-3840: this was `/paperclip/.local/bin/github-token-credential-helper`, a copy the Helm
+ * seed wrote onto the shared PVC. That seed is gone, and the stale PVC copy is deleted as this
+ * card's post-merge step, so the old constant had two failure modes and no loud one between
+ * them: until the file is deleted the server executes a **uid-1000-writable** helper while
+ * holding the App installation token, and the moment it is deleted `existsSync` below goes
+ * false and the credential arguments are silently dropped, so server-side fetches of private
+ * repos lose auth with nothing failing.
+ *
+ * The image copy is root-owned (`Dockerfile`, `COPY --chmod=0755 docker/github-wrappers/`), and
+ * it is the same script — the two generations were byte-identical but for which directory they
+ * chain `paperclip-github-token-env` from.
+ */
+const SERVER_GIT_CREDENTIAL_HELPER_PATH =
+  "/usr/local/libexec/paperclip/bin/github-token-credential-helper";
 
 /** Where the real git binary lives in the runtime image. */
 const SERVER_GIT_REAL_BINARY_PATH = "/usr/bin/git";
@@ -1096,9 +1111,11 @@ const SERVER_GIT_REAL_BINARY_PATH = "/usr/bin/git";
  * appended and was not invoked once the empty assignment preceded it. This
  * matches the wrapper's coverage exactly, including its limit: it resets the
  * `https://github.com`-scoped list only, not an unscoped `credential.helper`.
- * It defeats a helper added through *repo config*; it is not a trust boundary
- * against a replaced helper *file*, since the pinned helper itself sits on the
- * agent-writable `/paperclip` volume (as the wrapper the server used before did).
+ * It defeats a helper added through *repo config*. Since PEN-3840 it is also a
+ * trust boundary against a replaced helper *file*: the pinned helper is the
+ * root-owned image copy under `/usr/local/libexec/paperclip/bin`, which uid 1000
+ * cannot rewrite. It was previously the agent-writable `/paperclip` copy, and
+ * that was the weaker half of this guarantee.
  *
  * Resolved per call rather than cached: two `existsSync` checks are free next to
  * spawning a process, and it keeps `PAPERCLIP_SERVER_GIT` overridable in tests
