@@ -335,6 +335,29 @@ export async function markCommentProcessedIfSettled(db: Db, commentId: string): 
   return stamped.length > 0 || outstanding.length === 0;
 }
 
+let warnedInvalidCommentId = false;
+
+/**
+ * `comment_id` is `uuid NOT NULL`, so a row without a string id can only be a
+ * misattributed driver response (BLO-46428: a desynced postgres.js connection
+ * delivered another query's rows). Passing it on made every 1 s reconciler pass
+ * throw `UNDEFINED_VALUE` building the follow-up query, which is itself what
+ * desyncs a pipelining connection. Drop it, and say so once per process.
+ */
+function validCommentIds(rows: Array<{ commentId: unknown }>): string[] {
+  const ids = rows
+    .map((row) => row.commentId)
+    .filter((id): id is string => typeof id === "string" && id.length > 0);
+  if (ids.length !== rows.length && !warnedInvalidCommentId) {
+    warnedInvalidCommentId = true;
+    logger.error(
+      { dropped: rows.length - ids.length },
+      "issue-comment-effects: dropped rows with no comment id (driver response misattributed?)",
+    );
+  }
+  return ids;
+}
+
 /**
  * Comments whose effects are still outstanding and are due for another attempt
  * — i.e. a due `queued` or `failed` row, or `processing` past its lease. This
@@ -365,7 +388,7 @@ export async function listCommentsWithResumableEffects(
       ),
     )
     .limit(limit);
-  return rows.map((row: { commentId: string }) => row.commentId);
+  return validCommentIds(rows);
 }
 
 /**
@@ -439,7 +462,7 @@ export async function listSettledUnprocessedComments(
       ),
     )
     .limit(limit);
-  return rows.map((row: { commentId: string }) => row.commentId);
+  return validCommentIds(rows);
 }
 
 /**
