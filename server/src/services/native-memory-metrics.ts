@@ -69,6 +69,13 @@
 
 import { getHeapStatistics } from "node:v8";
 
+import {
+  HEAP_TOTAL_PEAK_COMPONENT,
+  HEAP_USED_PEAK_COMPONENT,
+  type HeapPeakReading,
+  readHeapPeaks,
+} from "./heap-peak-tracker.js";
+
 /**
  * Resident memory not attributable to the V8 heap or to `external`.
  *
@@ -148,6 +155,7 @@ export interface MemoryUsageReading {
 export interface CollectNativeMemoryOptions {
   memoryUsage?: () => MemoryUsageReading;
   heapStatistics?: () => HeapStatisticsReading;
+  heapPeaks?: () => HeapPeakReading | null;
 }
 
 /**
@@ -180,6 +188,7 @@ export function collectNativeMemorySnapshot(
   options: CollectNativeMemoryOptions = {},
 ): NativeMemorySnapshot | null {
   const readMemoryUsage = options.memoryUsage ?? (() => process.memoryUsage());
+  const readPeaks = options.heapPeaks ?? readHeapPeaks;
   // `node:v8` is a core module, so the import never fails; the field this reads
   // is what varies by runtime. The `typeof` check throws into the `null` branch
   // below rather than letting a missing function surface as a crash on the
@@ -224,6 +233,18 @@ export function collectNativeMemorySnapshot(
   }
   if (finite(heap.used_global_handles_size)) {
     components.set(V8_GLOBAL_HANDLES_USED_COMPONENT, heap.used_global_handles_size);
+  }
+
+  // PEN-3314: the lifetime heap peaks, which are the whole reason this row's
+  // floor-based statistics kept reading "flat". Sourced from the 1 s sampler
+  // rather than from `heap` above, because the excursion that costs permanent
+  // RSS completes between two scrapes and so is never present in a scrape-time
+  // reading. A `null` here means the sampler is not running: publish nothing,
+  // never a zero, for the reason given on `readHeapPeaks`.
+  const peaks = readPeaks();
+  if (peaks) {
+    components.set(HEAP_USED_PEAK_COMPONENT, peaks.usedPeakBytes);
+    components.set(HEAP_TOTAL_PEAK_COMPONENT, peaks.totalPeakBytes);
   }
 
   if (finite(heap.number_of_native_contexts)) {
