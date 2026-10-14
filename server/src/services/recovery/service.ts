@@ -11,6 +11,7 @@ import {
   type IssueGraphLivenessAutoRecoveryPreviewItem,
   type IssueRecoveryAction,
   type IssueRecoveryActionKind,
+  type IssueRecoveryActionRetiringBound,
   type IssueStatus,
 } from "@paperclipai/shared";
 import {
@@ -2427,6 +2428,18 @@ export function isLapsedMonitorStillLive(input: {
   if (!Number.isFinite(triggeredAt)) return false;
   if (triggeredAt > input.now) return false;
   return input.now - triggeredAt < input.graceMs;
+}
+
+/**
+ * PEN-4006 / PEN-3989: the retiring bounds that are wall-clock horizon retirements and so
+ * must be announced (PEN-3000 counter + source-row notice) by whichever writer wins the
+ * race. `pending_wake_ceiling` is the creation-anchored ceiling a pending wake defers to;
+ * it escalates the action exactly as `timeout_horizon` does. `attempt_budget` is a
+ * different retirement and stays unannounced here. Shared by all three writers so the
+ * observable depends on the transition, not on which writer committed it.
+ */
+export function isHorizonRetiringBound(bound: IssueRecoveryActionRetiringBound | null | undefined): boolean {
+  return bound === "timeout_horizon" || bound === "pending_wake_ceiling";
 }
 
 export function recoveryService(
@@ -6896,12 +6909,12 @@ export function recoveryService(
       // that reads 0, and — worse — would flip `neverDelivered` to false and label a
       // never-woken action as `delivered`, which is precisely the mislabel PEN-3000 exists to
       // prevent.
-      if (retirementCommitted && retiringBound === "timeout_horizon" && input.action.retiringBound === null) {
+      if (retirementCommitted && isHorizonRetiringBound(retiringBound) && input.action.retiringBound === null) {
         try {
           await announceRecoveryHorizonRetirement({
             ...input.action,
             status: "escalated",
-            retiringBound: "timeout_horizon",
+            retiringBound,
             attemptCount: Math.max(input.action.attemptCount - 1, 0),
           }, { retiredBy: "stranded_recovery_wake_dispatch" });
         } catch (error) {
@@ -14757,9 +14770,11 @@ export function recoveryService(
         // is exact transition evidence, not an inference, and a row another path already
         // retired cannot be announced twice from here.
         //
-        // Gated on `timeout_horizon`: `attempt_budget` is a different retirement with a
-        // different meaning, and PEN-3322's alerts key on the horizon arm.
-        if (retired && retired.retiringBound === "timeout_horizon") {
+        // Gated on the horizon bounds (`timeout_horizon` and PEN-4006's
+        // `pending_wake_ceiling`, see `isHorizonRetiringBound`): `attempt_budget` is a
+        // different retirement with a different meaning, and PEN-3322's alerts key on the
+        // horizon arm.
+        if (retired && isHorizonRetiringBound(retired.retiringBound)) {
           try {
             await announceRecoveryHorizonRetirement(retired, {
               runId: opts?.runId ?? null,
