@@ -22,9 +22,9 @@ tests:
     name: "30.7h blind window on a 1h-cadence routine fires"
     input_series:
       # Age climbing from 0 across the whole window, one sample per minute.
-      - series: 'paperclip_routine_last_done_fire_age_seconds{routine_id="bridge-watchdog", instance="pod-a", job="paperclip-control-plane"}'
+      - series: 'paperclip_routine_last_done_fire_age_seconds{routine_id="bridge-watchdog", company_id="tenant-a", instance="pod-a", job="paperclip-control-plane"}'
         values: "0+60x1842"
-      - series: 'paperclip_routine_fire_interval_seconds{routine_id="bridge-watchdog", instance="pod-a", job="paperclip-control-plane"}'
+      - series: 'paperclip_routine_fire_interval_seconds{routine_id="bridge-watchdog", company_id="tenant-a", instance="pod-a", job="paperclip-control-plane"}'
         values: "3600+0x1842"
       - series: 'paperclip_routine_fire_gap_metrics_refresh_success{instance="pod-a", job="paperclip-control-plane"}'
         values: "1+0x1842"
@@ -37,6 +37,7 @@ tests:
           - exp_labels:
               severity: warning
               routine_id: bridge-watchdog
+              company_id: tenant-a
             exp_annotations:
               summary: "Paperclip routine bridge-watchdog has not completed a fire in 2x its own cadence"
               description: "Routine bridge-watchdog last completed a fire 110520s ago, more than 2x the longest gap its own cron schedules (BLO-32638). The age is only trusted while paperclip_routine_fire_gap_metrics_refresh_success is 1. The routine is still `active` with an enabled schedule trigger, so this is not a deliberate pause -- it is either not dispatching, or its fires are dispatching and then dying before the execution issue reaches `done`. Those are different faults with different evidence: check paperclip_routine_dispatch_total for the first, and the routine's recent `routine_runs` rows for the second. A never-fired routine reports its age from creation, so a large value on a young routine means it has never worked at all rather than that it stopped."
@@ -49,6 +50,7 @@ tests:
           - exp_labels:
               severity: warning
               routine_id: bridge-watchdog
+              company_id: tenant-a
             exp_annotations:
               summary: "Paperclip routine bridge-watchdog has not completed a fire in 2x its own cadence"
               description: "Routine bridge-watchdog last completed a fire 43200s ago, more than 2x the longest gap its own cron schedules (BLO-32638). The age is only trusted while paperclip_routine_fire_gap_metrics_refresh_success is 1. The routine is still `active` with an enabled schedule trigger, so this is not a deliberate pause -- it is either not dispatching, or its fires are dispatching and then dying before the execution issue reaches `done`. Those are different faults with different evidence: check paperclip_routine_dispatch_total for the first, and the routine's recent `routine_runs` rows for the second. A never-fired routine reports its age from creation, so a large value on a young routine means it has never worked at all rather than that it stopped."

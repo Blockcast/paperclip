@@ -63,10 +63,15 @@ const HOUR_S = 3600;
  * seconds, so a 1000x unit error on either side pages permanently (or never)
  * with every test green. Parse the line and compare the value.
  */
-async function gaugeValue(metric: string, routineId: string): Promise<string | undefined> {
+async function gaugeLine(metric: string, routineId: string): Promise<string | undefined> {
   const { body } = await renderMetrics();
-  const prefix = `${metric}{routine_id="${routineId}"} `;
-  return body.split("\n").find((line) => line.startsWith(prefix))?.slice(prefix.length).trim();
+  return body
+    .split("\n")
+    .find((line) => line.startsWith(`${metric}{`) && line.includes(`routine_id="${routineId}"`));
+}
+
+async function gaugeValue(metric: string, routineId: string): Promise<string | undefined> {
+  return (await gaugeLine(metric, routineId))?.split("} ")[1]?.trim();
 }
 
 describeEmbeddedPostgres("refreshRoutineFireGapMetrics (BLO-32638)", () => {
@@ -150,6 +155,22 @@ describeEmbeddedPostgres("refreshRoutineFireGapMetrics (BLO-32638)", () => {
       completedAt: opts.completedAt,
     });
   }
+
+  it("labels both gauges with the routine's OWN company so the alert routes per tenant (BLO-46511)", async () => {
+    // Two tenants, so a label taken from the wrong row (or a constant) fails.
+    const companyA = await insertCompany();
+    const companyB = await insertCompany();
+    const routineA = await insertRoutine({ companyId: companyA });
+    const routineB = await insertRoutine({ companyId: companyB });
+
+    await refreshRoutineFireGapMetrics(db, NOW);
+
+    for (const [routineId, companyId] of [[routineA, companyA], [routineB, companyB]]) {
+      for (const metric of [ROUTINE_LAST_DONE_FIRE_AGE_METRIC, ROUTINE_FIRE_INTERVAL_METRIC]) {
+        expect(await gaugeLine(metric, routineId)).toContain(`company_id="${companyId}"`);
+      }
+    }
+  });
 
   it("ages off the most recent completed fire and publishes the derived cadence", async () => {
     const companyId = await insertCompany();

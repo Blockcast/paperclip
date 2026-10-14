@@ -787,7 +787,15 @@ spec:
           # both choices err toward firing rather than suppressing, which is
           # the right direction for an alert whose entire purpose is to notice
           # a signal that has gone quiet.
-          expr: max by (routine_id) (paperclip_routine_last_done_fire_age_seconds and on(instance) (paperclip_routine_fire_gap_metrics_refresh_success == 1)) > on(routine_id) ({{ .Values.prometheusRule.routineFireGapIntervalMultiplier }} * min by (routine_id) (paperclip_routine_fire_interval_seconds and on(instance) (paperclip_routine_fire_gap_metrics_refresh_success == 1)))
+          #
+          # `company_id` in both `by` clauses (BLO-46511) is what puts the
+          # owning tenant on the alert, so Alertmanager's `company_id` route
+          # files it with that tenant instead of the catch-all company. A
+          # routine has exactly one company, so it does not split the join.
+          # It must also be in `on()`: a one-to-one match with `on(...)` keeps
+          # ONLY the listed labels on the result, so `on(routine_id)` alone
+          # silently strips company_id back off the alert (promtool-verified).
+          expr: max by (routine_id, company_id) (paperclip_routine_last_done_fire_age_seconds and on(instance) (paperclip_routine_fire_gap_metrics_refresh_success == 1)) > on(routine_id, company_id) ({{ .Values.prometheusRule.routineFireGapIntervalMultiplier }} * min by (routine_id, company_id) (paperclip_routine_fire_interval_seconds and on(instance) (paperclip_routine_fire_gap_metrics_refresh_success == 1)))
           for: {{ .Values.prometheusRule.routineFireGapFor }}
           labels:
             severity: warning
