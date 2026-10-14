@@ -1491,6 +1491,65 @@ describe("startServer feedback export wiring", () => {
     }
   });
 
+  // BLO-35878: the periodic orphan reap is single-flighted across ticks, and
+  // ONLY the reap: a tick that finds one in flight must still drive
+  // `resumeQueuedRuns`. Unlatched, a reap outliving the 30 s tick overlapped the
+  // next one and the overlap compounded (~6 concurrent sweeps measured).
+  it("single-flights the periodic orphan reap while dispatch keeps running", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: 30000,
+    }));
+    let intervalCallback: (() => void) | null = null;
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void) => {
+        intervalCallback = callback;
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+    // Ticks inside the predicate, so the count only has a lower bound.
+    const tickUntilReapCallsExceed = async (n: number) =>
+      vi.waitFor(() => {
+        intervalCallback?.();
+        expect(heartbeatServiceMock.reapOrphanedRuns.mock.calls.length).toBeGreaterThan(n);
+      });
+
+    let releaseReap: (() => void) | null = null;
+    try {
+      await startServer();
+      // Ticks return early until the startup recovery sequence finishes.
+      await vi.waitFor(() =>
+        expect(heartbeatServiceMock.reconcileStrandedAssignedIssues).toHaveBeenCalledTimes(1));
+      heartbeatServiceMock.reapOrphanedRuns.mockClear();
+      heartbeatServiceMock.resumeQueuedRuns.mockClear();
+
+      heartbeatServiceMock.reapOrphanedRuns.mockImplementationOnce(
+        () => new Promise((resolve) => {
+          releaseReap = () => resolve({ reaped: 0, runIds: [] });
+        }),
+      );
+      intervalCallback?.();
+      await vi.waitFor(() => expect(releaseReap).not.toBeNull());
+
+      // Second tick with the reap parked: skips the reap, still dispatches.
+      intervalCallback?.();
+      await vi.waitFor(() => expect(heartbeatServiceMock.resumeQueuedRuns).toHaveBeenCalledTimes(1));
+      expect(heartbeatServiceMock.reapOrphanedRuns).toHaveBeenCalledTimes(1);
+
+      // Released on resolve...
+      releaseReap?.();
+      releaseReap = null;
+      await tickUntilReapCallsExceed(1);
+      // ...and on reject: the call after the rejected one must still happen.
+      heartbeatServiceMock.reapOrphanedRuns.mockRejectedValueOnce(new Error("reap blew up"));
+      const beforeReject = heartbeatServiceMock.reapOrphanedRuns.mock.calls.length;
+      await tickUntilReapCallsExceed(beforeReject + 1);
+    } finally {
+      releaseReap?.();
+      setIntervalSpy.mockRestore();
+    }
+  });
+
   // PEN-3314 review follow-up: the latch must be cleared BEFORE the settle
   // path's fallible recorders, so a throwing metrics call costs a sample rather
   // than the chain.
