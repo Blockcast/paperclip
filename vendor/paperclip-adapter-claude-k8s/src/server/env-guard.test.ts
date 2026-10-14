@@ -840,6 +840,14 @@ describe("embedded guard: lock re-assertion before outward side effects (BLO-299
     "bash -c 'git push origin HEAD'",
     "ssh host 'cd /w && git push'",
     "bash <<'EOF'\ngit push origin HEAD\nEOF",
+    // Ally on #2714: interpreter programs, a leading -R, and contents writes.
+    `python3 -c "import os; os.system('git push')"`,
+    `node -e "require('child_process').execSync('gh pr merge 3')"`,
+    `perl -e 'system("git push origin HEAD")'`,
+    "python3 <<'EOF'\nimport subprocess\nsubprocess.run(['sh', '-c', 'git push'])\nEOF",
+    "gh -R O/R pr merge 1 --squash",
+    "gh --repo=O/R pr create --fill",
+    "gh api repos/O/R/contents/x -X PUT -f content=eA==",
   ]) {
     it(`blocks ${JSON.stringify(cmd)} when another run holds the lock`, async () => {
       await withApi(foreign, async (vars) => {
@@ -883,6 +891,8 @@ describe("embedded guard: lock re-assertion before outward side effects (BLO-299
         "git commit -m 'fix: git push now re-asserts the lock'",
         "gh api repos/O/R/pulls/12",
         "gh api repos/O/R/pulls -X GET",
+        "gh api repos/O/R/contents/README.md",
+        'python3 -c "print(1)"',
       ]) {
         expect((await run(cmd, vars)).status).toBe(0);
       }

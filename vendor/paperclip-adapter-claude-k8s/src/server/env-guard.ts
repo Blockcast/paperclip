@@ -1345,7 +1345,7 @@ function gitSubcommand(words, i) {
   return null;
 }
 // gh api defaults to GET, and to POST once any field or --input is given.
-const GH_WRITE_PATH_RE = /(?:^|\/)(?:pulls|git\/refs|merges)(?:[\/?]|$)/;
+const GH_WRITE_PATH_RE = /(?:^|\/)(?:pulls|git\/refs|merges|contents)(?:[\/?]|$)/;
 function ghApiWrites(args) {
   let method = null, fields = false, path = false;
   for (let j = 0; j < args.length; j += 1) {
@@ -1358,14 +1358,21 @@ function ghApiWrites(args) {
   const writes = method ? method !== "GET" && method !== "HEAD" : fields;
   return path && writes;
 }
+// An interpreter runs its -c/-e program or stdin script as code the shell lexer
+// cannot see into, so a command line that invokes one falls back to the
+// pre-BLO-46113 text match. False positives cost one lock lookup, never a block.
+const INTERPRETER_BASENAMES = ["python", "python3", "node", "ruby", "php", "perl"];
+const OUTWARD_TEXT_RE = /(?:^|[^\w-])git(?:\s+-[cC]\s+\S+|\s+--?[\w-]+(?:=\S+)?)*\s+push\b|(?:^|[^\w-])gh\s+pr\s+(?:create|merge)\b/;
 function outwardWords(words, depth) {
   const wrapped = words.some((w) => COMMAND_POSITION_WRAPPERS.indexOf(basename(w)) !== -1);
   for (let i = 0; i < words.length; i += 1) {
     const base = basename(words[i]);
     if (base === "git" && gitSubcommand(words, i) === "push") return true;
     if (base === "gh") {
-      if (words[i + 1] === "pr" && (words[i + 2] === "create" || words[i + 2] === "merge")) return true;
-      if (words[i + 1] === "api" && ghApiWrites(words.slice(i + 2))) return true;
+      let k = i + 1;
+      while (k < words.length && /^(?:-R|--repo)(?:=|$)/.test(words[k])) k += words[k].indexOf("=") === -1 ? 2 : 1;
+      if (words[k] === "pr" && (words[k + 1] === "create" || words[k + 1] === "merge")) return true;
+      if (words[k] === "api" && ghApiWrites(words.slice(k + 1))) return true;
     }
     // A quoted word is a command only after something that re-parses it
     // (eval, ssh, sudo sh -c ...); after any other program it is data.
@@ -1377,6 +1384,8 @@ function isOutward(command, depth) {
   if (depth > 4) return false;
   const lexed = lexShell(command);
   for (const words of lexed.commands) if (outwardWords(words, depth)) return true;
+  const interpreted = lexed.commands.some((words) => words.some((w) => INTERPRETER_BASENAMES.indexOf(basename(w)) !== -1));
+  if (interpreted && OUTWARD_TEXT_RE.test(command)) return true;
   for (const body of lexed.nested) if (body.trim() && isOutward(body, depth + 1)) return true;
   for (const body of lexed.heredocs) {
     for (const inner of lexShell(body).nested) if (inner.trim() && isOutward(inner, depth + 1)) return true;
