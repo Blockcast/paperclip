@@ -221,11 +221,18 @@ describeEmbeddedPostgres("PEN-4036 provider-death retry session resume", () => {
 
   /**
    * Resume markers are scoped to the run that resolved them. A later attempt
-   * that does not re-resolve one must not inherit the previous attempt's
-   * pointer — otherwise a retry chain keeps shipping a stale session at the
-   * adapter long after the run that owned it is gone.
+   * that does not re-resolve one must not inherit a pointer the retried run has
+   * already SUPERSEDED — otherwise a retry chain keeps shipping an older session
+   * at the adapter and rewinds the conversation.
+   *
+   * "Superseded" is carried here by `sessionIdAfter: "sess-dead"`: that column is
+   * written in exactly one place, at completion from the adapter result, so it is
+   * durable proof this run reached the adapter and advanced past `sess-stale`.
+   * Test 6 is this test's minimal pair — identical but for that one value — and
+   * pins the opposite verdict, which is what keeps the rule here from being read
+   * as "always clear".
    */
-  it("drops resume markers inherited from an earlier attempt when this mint resolves none", async () => {
+  it("drops resume markers the retried run superseded with a session of its own", async () => {
     const staleRunId = randomUUID();
     const { runId, now } = await seed({
       errorCode: "adapter_failed",
@@ -243,5 +250,43 @@ describeEmbeddedPostgres("PEN-4036 provider-death retry session resume", () => {
     expect(ctx.resumeFromRunId).toBeUndefined();
     expect(ctx.resumeSessionDisplayId).toBeUndefined();
     expect(ctx.resumeSessionParams).toBeUndefined();
+  });
+
+  /**
+   * Review follow-up (PR#2686, Ally Important #1). The minimal pair of test 5:
+   * the ONLY difference is `sessionIdAfter: null`, i.e. this run died before it
+   * ever reached the adapter.
+   *
+   * That is the real pre-adapter path — `scheduleBoundedRetryForRun` fires from
+   * the vanished-Job reconciler under `adapterInvocationStarted !== true`, and a
+   * successful-run handoff stamps exactly these three keys on the run it wakes.
+   * Such a run never touched the inherited session, so the pointer was never
+   * consumed and is still the correct one. Clearing it would drop the retry onto
+   * the ordinary task-session lookup that `resolveTaskSessionConfigFreshness`
+   * discards ~98.7% of the time — this PR's own failure mode, moved onto a
+   * family it does not otherwise serve.
+   *
+   * The retry family here resolves no provider-death resume of its own (test 3),
+   * so nothing re-stamps these keys: they survive only by being left alone.
+   */
+  it("keeps an inherited handoff resume when the retried run failed before the adapter started", async () => {
+    const handoffRunId = randomUUID();
+    const { runId, now } = await seed({
+      errorCode: "adapter_failed",
+      errorFamily: "transient_upstream",
+      sessionIdAfter: null,
+      taskSession: null,
+      contextExtras: {
+        resumeFromRunId: handoffRunId,
+        resumeSessionDisplayId: "sess-handoff",
+        resumeSessionParams: { sessionId: "sess-handoff", cwd: "/tmp/pen4036-handoff" },
+      },
+    });
+    const ctx = await retryContextFor(runId, now);
+
+    expect(ctx.resumeFromRunId).toBe(handoffRunId);
+    expect(ctx.resumeSessionDisplayId).toBe("sess-handoff");
+    expect((ctx.resumeSessionParams as Record<string, unknown>).sessionId).toBe("sess-handoff");
+    expect((ctx.resumeSessionParams as Record<string, unknown>).cwd).toBe("/tmp/pen4036-handoff");
   });
 });
