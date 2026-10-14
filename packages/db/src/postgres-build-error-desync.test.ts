@@ -14,7 +14,9 @@ import postgres from "postgres";
  * `TypeError: Cannot read properties of null (reading 'types')`.
  *
  * `patches/postgres@3.4.9.patch` builds before enqueueing. Reverting that hunk
- * makes this test fail: A rejects with B's UNDEFINED_VALUE and C never settles.
+ * makes the first test fail: A rejects with B's UNDEFINED_VALUE and C never
+ * settles. Dropping the catch's `write(Sync)` makes the second one fail: the
+ * transaction and the query behind the failing one never settle.
  */
 
 const int32 = (value: number): Buffer => {
@@ -26,7 +28,7 @@ const int32 = (value: number): Buffer => {
 const message = (type: string, payload: Buffer = Buffer.alloc(0)): Buffer =>
   Buffer.concat([Buffer.from(type, "latin1"), int32(4 + payload.length), payload]);
 
-const READY_FOR_QUERY = message("Z", Buffer.from("I", "latin1"));
+const readyForQuery = (status: "I" | "T"): Buffer => message("Z", Buffer.from(status, "latin1"));
 
 /**
  * Answers each Sync / simple Query in order, after a delay, with a command tag
@@ -40,10 +42,15 @@ class PipelineSocket extends EventEmitter {
   private greeted = false;
   private replies = 0;
 
+  /** `status` is the ReadyForQuery transaction byte: "T" inside `sql.begin`. */
+  constructor(private readonly status: "I" | "T" = "I") {
+    super();
+  }
+
   write(chunk: Buffer, callback?: () => void): boolean {
     if (!this.greeted) {
       this.greeted = true;
-      setImmediate(() => this.emit("data", Buffer.concat([message("R", int32(0)), READY_FOR_QUERY])));
+      setImmediate(() => this.emit("data", Buffer.concat([message("R", int32(0)), readyForQuery("I")])));
     } else {
       for (let offset = 0; offset < chunk.length; offset += 1 + chunk.readUInt32BE(offset + 1)) {
         const type = String.fromCharCode(chunk[offset]);
@@ -52,7 +59,7 @@ class PipelineSocket extends EventEmitter {
         setTimeout(
           () => this.emit("data", Buffer.concat([
             message("C", Buffer.from(`SELECT ${sequence}\0`, "latin1")),
-            READY_FOR_QUERY,
+            readyForQuery(this.status),
           ])),
           10 * sequence,
         );
@@ -97,6 +104,39 @@ describe("postgres.js build error during pipelining (BLO-45336)", () => {
       expect(await inFlight).toBe("count=2");
       expect(await failing).toBe("rejected UNDEFINED_VALUE");
       expect(await next).toBe("count=3");
+    } finally {
+      await sql.end({ timeout: 0 });
+    }
+  });
+
+  it("keeps a transaction moving when the failing query is built with nothing in flight", async () => {
+    // max_pipeline: 1 drives the connection to `full`, so inside `sql.begin`
+    // later queries queue and are drained only by ReadyForQuery. The failing
+    // query is drained onto an idle connection; without the catch's `Sync`
+    // no ReadyForQuery follows and every query behind it -- the scope's
+    // rollback included -- hangs.
+    const sql = postgres({
+      max: 1,
+      max_pipeline: 1,
+      fetch_types: false,
+      prepare: false,
+      idle_timeout: null,
+      max_lifetime: null,
+      socket: () => new PipelineSocket("T") as never,
+    } as never);
+    try {
+      let results: string[] = [];
+      const tx = sql.begin(async (tx) => {
+        results = await Promise.all([
+          settle(tx.unsafe("select 1")),
+          settle(tx.unsafe("select 2")),
+          settle(tx.unsafe("select $1", [undefined as never])),
+          settle(tx.unsafe("select 3")),
+        ]);
+      });
+      // The scope rejects with the failing query's error once its rollback ran.
+      expect(await settle(tx.then(() => ({ count: null })))).toBe("rejected UNDEFINED_VALUE");
+      expect(results).toEqual(["count=2", "count=3", "rejected UNDEFINED_VALUE", "count=5"]);
     } finally {
       await sql.end({ timeout: 0 });
     }
