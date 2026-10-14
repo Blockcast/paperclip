@@ -571,7 +571,7 @@ jobs:
 
       - name: Test Ally agent instruction contract
         if: ${{ !cancelled() }}
-        run: node --test ./scripts/ally-agent-idempotency-contract.test.mjs
+        run: node --test ./scripts/ally-agent-idempotency-contract.test.mjs ./scripts/check-ally-bundle-anchors.test.mjs
         timeout-minutes: 1
 
       - name: Test scheduled-guard liveness detector (PEN-3281)
