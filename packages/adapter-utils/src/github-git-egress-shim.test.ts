@@ -1,3 +1,8 @@
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { describe, expect, it } from "vitest";
 
 import {
@@ -14,6 +19,7 @@ import {
   scanCommit,
   scanPrePushUpdates,
   TAG_PEEL_LIMIT,
+  type GitPushFinding,
   type GitReader,
 } from "./github-git-egress-shim.js";
 
@@ -587,7 +593,7 @@ describe("addedLinesFromPatch", () => {
       fakeGit({
         "log -1 --format=%s deadbeefcafe0000": "add config",
         "log -1 --format=%B deadbeefcafe0000": "add config\n",
-        "show --format= --no-color -m --unified=0 --text --no-textconv deadbeefcafe0000": patch,
+        "show --format= --no-color --cc --unified=0 --text --no-textconv deadbeefcafe0000": patch,
       }),
     );
     expect(findings.map((f) => f.where)).toEqual(["content"]);
@@ -604,7 +610,7 @@ describe("scanCommit", () => {
       fakeGit({
         [`log -1 --format=%s ${sha}`]: "wip",
         [`log -1 --format=%B ${sha}`]: `wip\n\n${environmentDump()}\n`,
-        [`show --format= --no-color -m --unified=0 --text --no-textconv ${sha}`]: "",
+        [`show --format= --no-color --cc --unified=0 --text --no-textconv ${sha}`]: "",
       }),
     );
     expect(findings).toHaveLength(1);
@@ -625,7 +631,7 @@ describe("scanCommit", () => {
       fakeGit({
         [`log -1 --format=%s ${sha}`]: subject,
         [`log -1 --format=%B ${sha}`]: `${subject}\n`,
-        [`show --format= --no-color -m --unified=0 --text --no-textconv ${sha}`]: "",
+        [`show --format= --no-color --cc --unified=0 --text --no-textconv ${sha}`]: "",
       }),
     );
     expect(findings).toHaveLength(1);
@@ -646,7 +652,7 @@ describe("scanCommit", () => {
       fakeGit({
         [`log -1 --format=%s ${sha}`]: "docs: bump the multicast reference",
         [`log -1 --format=%B ${sha}`]: "docs: bump the multicast reference\n",
-        [`show --format= --no-color -m --unified=0 --text --no-textconv ${sha}`]:
+        [`show --format= --no-color --cc --unified=0 --text --no-textconv ${sha}`]:
           // Derived — see github-egress-scrub.test.ts on why.
           `+  <seriesInfo name='Internet-Draft' value='${["draft", "ramadan", "moq", "multicast", "00"].join("-")}'/>\n`,
       }),
@@ -660,7 +666,7 @@ describe("scanCommit", () => {
       fakeGit({
         [`log -1 --format=%s ${sha}`]: "fix: tidy the readme",
         [`log -1 --format=%B ${sha}`]: "fix: tidy the readme\n",
-        [`show --format= --no-color -m --unified=0 --text --no-textconv ${sha}`]: "+Hello, world.\n",
+        [`show --format= --no-color --cc --unified=0 --text --no-textconv ${sha}`]: "+Hello, world.\n",
       }),
     );
     expect(findings).toEqual([]);
@@ -673,7 +679,7 @@ describe("scanCommit", () => {
     const complete: Record<string, string> = {
       [`log -1 --format=%s ${sha}`]: "wip",
       [`log -1 --format=%B ${sha}`]: "wip\n",
-      [`show --format= --no-color -m --unified=0 --text --no-textconv ${sha}`]: "+clean\n",
+      [`show --format= --no-color --cc --unified=0 --text --no-textconv ${sha}`]: "+clean\n",
     };
     for (const omitted of Object.keys(complete)) {
       const responses = { ...complete };
@@ -691,7 +697,7 @@ describe("scanCommit", () => {
       fakeGit({
         [`log -1 --format=%s ${sha}`]: "",
         [`log -1 --format=%B ${sha}`]: "",
-        [`show --format= --no-color -m --unified=0 --text --no-textconv ${sha}`]: "",
+        [`show --format= --no-color --cc --unified=0 --text --no-textconv ${sha}`]: "",
       }),
     );
     expect(findings).toEqual([]);
@@ -976,4 +982,101 @@ describe("formatRefusal", () => {
     expect(message).toContain("git tag -f -a");
     expect(message).not.toContain(token);
   });
+});
+
+describe("merge commits (BLO-46233)", () => {
+  it("reads a combined hunk: only lines absent from every parent count as added", () => {
+    const patch = [
+      "diff --cc f",
+      "--- a/f",
+      "+++ b/f",
+      "@@@ -3,1 -4,0 +4,2 @@@",
+      " +from-parent-2",
+      "+ from-parent-1",
+      "++in-the-resolution",
+      "+++starts-with-plus",
+    ].join("\n");
+    expect(addedLinesFromPatch(patch)).toBe("in-the-resolution\n+starts-with-plus");
+  });
+
+  /**
+   * Real git, because the defect lived in which `show` flag was passed and a
+   * fake reader would only echo back whatever the test assumed it emits.
+   */
+  function withMergedBranch(run: (git: (...args: string[]) => string, dir: string) => void): void {
+    const dir = mkdtempSync(join(tmpdir(), "egress-merge-"));
+    const git = (...args: string[]): string => {
+      const result = spawnSync("git", args, { cwd: dir, encoding: "utf8" });
+      if (result.status !== 0) throw new Error(`git ${args.join(" ")}: ${result.stderr}`);
+      return result.stdout;
+    };
+    try {
+      git("init", "-q", "-b", "master");
+      git("config", "user.email", "test@example.invalid");
+      git("config", "user.name", "test");
+      // "Published" is modelled as a remote-tracking ref, which is all
+      // `--remotes` reads. A real push would run this host's own pre-push hook
+      // against the fixture's material.
+      const publish = (branch: string) => git("update-ref", `refs/remotes/origin/${branch}`, branch);
+      writeFileSync(join(dir, "a"), "base\n");
+      git("add", "a");
+      git("commit", "-qm", "base");
+      publish("master");
+      git("checkout", "-qb", "topic");
+      writeFileSync(join(dir, "b"), "topic work\n");
+      git("add", "b");
+      git("commit", "-qm", "topic");
+      publish("topic");
+      // master gains the flagged material and publishes it first.
+      git("checkout", "-q", "master");
+      writeFileSync(join(dir, "a"), `base\n${environmentDump()}\n`);
+      git("commit", "-qam", "master adds material");
+      publish("master");
+      git("checkout", "-q", "topic");
+      git("merge", "-q", "--no-edit", "master");
+      run(git, dir);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  function scanTopicPush(git: (...args: string[]) => string, dir: string): GitPushFinding[] {
+    const reader: GitReader = (args) => {
+      const result = spawnSync("git", args, { cwd: dir, encoding: "utf8" });
+      return result.status === 0 ? result.stdout : null;
+    };
+    return scanPrePushUpdates(
+      [
+        {
+          localRef: "refs/heads/topic",
+          localSha: git("rev-parse", "HEAD").trim(),
+          remoteRef: "refs/heads/topic",
+          remoteSha: git("rev-parse", "origin/topic").trim(),
+        },
+      ],
+      reader,
+    );
+  }
+
+  it("accepts merging master in when the material is already on master", () => {
+    withMergedBranch((git, dir) => {
+      expect(scanTopicPush(git, dir)).toEqual([]);
+    });
+  }, 60_000);
+
+  it("still refuses material introduced in the merge's own resolution", () => {
+    withMergedBranch((git, dir) => {
+      writeFileSync(join(dir, "b"), `topic work\n${vendorKey()}\n`);
+      git("add", "b");
+      git("commit", "-q", "--amend", "--no-edit");
+      const findings = scanTopicPush(git, dir);
+      expect(findings).toHaveLength(1);
+      expect(findings[0]!.where).toBe("content");
+      expect(findings[0]!.merge).toBe(true);
+      expect(findings[0]!.classes).toContain("vendor-key");
+      // Content master already published is not attributed to the merge.
+      expect(findings[0]!.classes).not.toContain("environment-dump");
+      expect(formatRefusal(findings)).toContain("--rebase-merges");
+    });
+  }, 60_000);
 });
