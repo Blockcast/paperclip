@@ -106,6 +106,17 @@ Headers: Authorization: Bearer $PAPERCLIP_API_KEY, X-Paperclip-Run-Id: $PAPERCLI
 
 If already checked out by you, returns normally. If owned by another agent: `409 Conflict` — stop, pick a different task. **Never retry a 409.**
 
+**`blocked` in `expectedStatuses` does not mean you can claim a blocked task.** Checkout refuses any issue that still has a blocker edge not yet `done` with `422 Issue is blocked by unresolved blockers`, whatever its status — the guard reads the blocker relations, not the status field. What `blocked` in the list actually admits is the *stranded* case: a row left `blocked` with zero unresolved blockers, which is a defect being repaired rather than a dependency being waited on. Keeping `blocked` in the list is deliberate, because an agent picking such a row up is one of the two things that can repair it.
+
+So a `422` here is information, not an obstacle — but read `details.unresolvedBlockerIssueIds` and check each blocker's status before deciding what it means. Only `done` resolves an edge, so the 422 covers two different shapes:
+
+- **Every blocker is still open** → the task is waiting on a real dependency. It will be woken by `issue_blockers_resolved` when that dependency closes, and there is nothing for you to do on it now. Pick different work.
+- **Any blocker is `cancelled`** → the task is **wedged, not waiting**. A cancelled blocker never reaches `done`, so no resolved-sweep wake will ever fire. Do not walk away: either the blocker should have closed `done` (fix it, or ask its assignee), or the edge should be cut (`PATCH {blockedByIssueIds}` without it — on a `blocked` row send `status: "todo"` in the same PATCH, or you leave it `blocked` with no edge, which is a permanent strand). Do one of those or report it on the task.
+
+Either way, do **not** re-attempt with a narrower `expectedStatuses` — the status was never what refused you.
+
+You do not need to protect a claimed `blocked` row from being re-stranded. If your run ends without advancing it, the restore recomputes readiness from the live blocker edges rather than replaying the status it found: zero unresolved blockers lands it in `todo` (dispatchable), and an edge you filed during the run lands it back in `blocked` (wakeable). Both outcomes are better than the shape you picked it up in.
+
 **Checkout _is_ the concurrency check — it is not optional bookkeeping.** The execution lock is enforced atomically inside the checkout UPDATE, and it is **run-scoped, not agent-scoped**: if another run already holds the lock you get a `409` even when that run belongs to *the same agent as you*. This is the only guardrail against two concurrent runs doing the same work, and it is the reason checkout is mandatory before work of any kind — including work you found yourself rather than being woken for.
 
 Do **not** substitute your own inspection of the `executionRunId` / `executionAgentNameKey` / `executionLockedAt` fields on the issue for calling checkout. Reading them and then deciding is a race: the lock can be taken between your read and your first write, and nothing you do with those values is atomic. They are the lock's storage, not its API. Use them for diagnostics only; let the `409` be your answer.
