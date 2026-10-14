@@ -473,3 +473,26 @@ describeEmbeddedPostgres("issue comment effect ledger", () => {
     expect(executed).toEqual([effect.id]);
   }, 60_000);
 });
+
+describe("reconciler work lists reject rows without a comment id (BLO-46428)", () => {
+  /** Chainable query-builder stand-in that resolves to `rows` when awaited. */
+  function fakeDb(rows: Array<{ commentId: unknown }>) {
+    const chain: Record<string, unknown> = {};
+    for (const method of ["from", "innerJoin", "where", "limit"]) chain[method] = () => chain;
+    chain.then = (resolve: (value: unknown) => void) => resolve(rows);
+    return { selectDistinct: () => chain } as unknown as Parameters<typeof listCommentsWithResumableEffects>[0];
+  }
+
+  it("never hands an undefined/null commentId to the reconciler, and logs it once", async () => {
+    const { logger } = await import("../middleware/logger.js");
+    const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => undefined as never);
+    try {
+      const rows = [{ commentId: undefined }, { commentId: "c-1" }, { commentId: null }];
+      expect(await listCommentsWithResumableEffects(fakeDb(rows), 50)).toEqual(["c-1"]);
+      expect(await listSettledUnprocessedComments(fakeDb(rows), 50)).toEqual(["c-1"]);
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+});
