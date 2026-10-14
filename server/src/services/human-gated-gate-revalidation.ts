@@ -446,9 +446,9 @@ export function probeBlockerPremise(input: GateEvidenceInput): ProbeResult | nul
  *
  * Four outcomes (PEN-3089 split the last three out of one):
  *
- * - any card still undecided, **or carrying a status this module does not
- *   recognise** → `still-gated`;
+ * - any card carrying a status this module does not recognise → `still-gated`;
  * - otherwise, any card `approved` → `approval-granted`;
+ * - otherwise, any card still undecided → `still-gated`;
  * - otherwise, any card `withdrawn`/`cancelled` → the board was asked and never
  *   answered (`approval-abandoned`);
  * - otherwise every card was `rejected` → `approval-refused`.
@@ -456,6 +456,25 @@ export function probeBlockerPremise(input: GateEvidenceInput): ProbeResult | nul
  * Grant beats everything below it for the same reason unknown beats everything:
  * a single live authorisation means work is owed, and the escalation surface
  * must not lose it behind a sibling that resolved into no obligation.
+ *
+ * PEN-4061 moved `undecided` below the grant, where the same argument puts it.
+ * An undecided sibling is a *different ask*; it discharges the grant no more
+ * than a refusal or a withdrawal does. Testing it first was the one ordering
+ * PEN-3089 did not revisit, and it was the one the real world produces: the
+ * correct human response to spotting an approved decision nobody executed is to
+ * file a fresh card chasing it, and that act added the undecided sibling that
+ * deleted the row from this escalation. The defect was not random — it was
+ * triggered by the remedy, and fired only on rows already known to be both
+ * authorised and overdue. It also moved the row's visibility onto the pending-
+ * approval queue, which is the surface the grant had already removed it from
+ * (see the {@link ACTION_OWED_RESOLUTION_KINDS} note), so the row ended up
+ * watched by nothing.
+ *
+ * Drift keeps its short-circuit *above* the grant, and the asymmetry with
+ * `undecided` is deliberate: `pending`/`revision_requested` have known meanings,
+ * and neither of them means "this grant is suspended". An unrecognised status is
+ * one whose meaning is unknown, so it may be exactly that. Property 2 applies
+ * where the meaning is unknown and does not apply where it is known.
  *
  * Abandonment beats refusal for the narrower version of that argument, and that
  * ordering is load-bearing. A refusal answers *its own* ask and nothing else; it
@@ -469,7 +488,8 @@ export function probeBlockerPremise(input: GateEvidenceInput): ProbeResult | nul
  * a refused ask followed by a re-ask).
  *
  * This stays a narrowing rather than an "escalate everything": refusal still
- * withholds the row when refusal is the row's whole approval story.
+ * withholds the row when refusal is the row's whole approval story, and a row
+ * with no grant on it is still gated by an undecided card exactly as before.
  *
  * The unknown-status branch is property 2 (fail toward `still-gated`) applied
  * to schema drift. `approvals.status` is a plain `text` column, and before
@@ -501,16 +521,18 @@ export function probeApprovalGate(input: GateEvidenceInput): ProbeResult | null 
       !APPROVAL_ABANDONED.has(approval.approvalStatus),
   );
 
-  if (undecided.length > 0 || unrecognised.length > 0) {
-    const clauses: string[] = [];
+  // Drift alone still short-circuits (PEN-3089, property 2): an unrecognised
+  // status is a status whose *meaning* is unknown, so it may well be the one
+  // that suspends a grant. A grant must not be read out from under it.
+  // `undecided` gets the opposite treatment below precisely because its
+  // meaning is known — see the grant branch.
+  if (unrecognised.length > 0) {
+    const clauses: string[] = [
+      `${unrecognised.length} of ${total} linked approval${cards} carr${unrecognised.length === 1 ? "ies" : "y"} a status this module does not recognise, so the gate is read as live rather than resolved: ${unrecognised.map(describeApproval).join(", ")}`,
+    ];
     if (undecided.length > 0) {
       clauses.push(
         `${undecided.length} of ${total} linked approval${cards} still undecided: ${undecided.map(describeApproval).join(", ")}`,
-      );
-    }
-    if (unrecognised.length > 0) {
-      clauses.push(
-        `${unrecognised.length} of ${total} linked approval${cards} carr${unrecognised.length === 1 ? "ies" : "y"} a status this module does not recognise, so the gate is read as live rather than resolved: ${unrecognised.map(describeApproval).join(", ")}`,
       );
     }
     return {
@@ -524,12 +546,38 @@ export function probeApprovalGate(input: GateEvidenceInput): ProbeResult | null 
     APPROVAL_GRANTED.has(approval.approvalStatus),
   );
 
+  // Ahead of the undecided branch (PEN-4061). An undecided sibling is a
+  // *different ask*; it discharges the grant no more than a refused or a
+  // withdrawn one does, so the docblock's ordering argument — grant beats
+  // everything that resolved into no obligation on it — applies to it
+  // unchanged. Testing undecided first inverted that, and the inversion fired
+  // on exactly the wrong rows: the natural response to spotting an approved
+  // decision nobody executed is to file a fresh card chasing it, and that act
+  // added the undecided sibling that deleted the row from this escalation. The
+  // remedy destroyed the instrument. Worse, it moved the row onto the pending-
+  // approval queue, which is the surface the grant had already left.
+  //
+  // This is not an "escalate everything": with no grant on the row the
+  // undecided branch below is reached unchanged, and drift has already
+  // short-circuited above.
   if (granted.length > 0) {
+    const context =
+      undecided.length > 0
+        ? ` — a later card is still undecided (${undecided.map(describeApproval).join(", ")}), which is a separate ask and does not discharge the grant`
+        : "";
     return {
       probe: "approval-gate",
       verdict: "resolved-but-open",
       resolutionKind: "approval-granted",
-      evidence: `${granted.map(describeApproval).join(", ")} — ${granted.length} of ${total} linked approval${cards} ${granted.length === 1 ? "was" : "were"} granted and the row has not moved since, so it is authorised and unperformed: the gate opened and whoever the row is assigned to still owes the work`,
+      evidence: `${granted.map(describeApproval).join(", ")} — ${granted.length} of ${total} linked approval${cards} ${granted.length === 1 ? "was" : "were"} granted and the row has not moved since, so it is authorised and unperformed: the gate opened and whoever the row is assigned to still owes the work${context}`,
+    };
+  }
+
+  if (undecided.length > 0) {
+    return {
+      probe: "approval-gate",
+      verdict: "still-gated",
+      evidence: `${undecided.length} of ${total} linked approval${cards} still undecided: ${undecided.map(describeApproval).join(", ")}`,
     };
   }
 
@@ -745,6 +793,22 @@ const UNVERIFIABLE_REASON_EVIDENCE: Readonly<Record<UnverifiableReason, string>>
  * Any `still-gated` wins — see property 2 in the module docblock. With no probe
  * result at all the row expresses nothing checkable, which is `unverifiable`
  * and is a finding in its own right, not a failure.
+ *
+ * That precedence is kept, and it is right: an open blocker edge is a real bar
+ * — the platform refuses checkout (422) while one exists — so reporting such a
+ * row as "authorised and unperformed, you owe the work" would name an
+ * obligation its assignee cannot discharge.
+ *
+ * But the grant must not vanish on the way past (PEN-4061). Rendering only the
+ * gating probes' evidence dropped a live authorisation out of the digest text
+ * whenever any *other* probe gated the row — the same loss the probe-level
+ * ordering above exists to prevent, one layer up and reached by a different
+ * route. PEN-1095 is the measured instance: one card, `approved` 2026-06-26,
+ * zero undecided siblings, and still absent from `authorised, unperformed` 109
+ * days later because `blockedBy` PEN-1225 (`todo`) gated the row. Neither the
+ * row's `blocked` status nor its age excluded it. So the grant is carried into
+ * the evidence as context: the verdict still says the row cannot move, and the
+ * text now says what is already authorised on it and who owes it once it can.
  */
 export function combineProbeVerdicts(
   issueId: string,
@@ -754,12 +818,19 @@ export function combineProbeVerdicts(
 ): GateClassification {
   const gating = probes.filter((probe) => probe.verdict === "still-gated");
   if (gating.length > 0) {
+    const carried = probes.filter((probe) => probe.resolutionKind === "approval-granted");
+    const clauses = gating.map((probe) => `[${probe.probe}] ${probe.evidence}`);
+    for (const probe of carried) {
+      clauses.push(
+        `[${probe.probe}] the row is gated above, but a grant on it is live and undischarged, so the work is authorised for whenever the gate clears: ${probe.evidence}`,
+      );
+    }
     return {
       issueId,
       identifier,
       verdict: "still-gated",
       probes,
-      evidence: gating.map((probe) => `[${probe.probe}] ${probe.evidence}`).join(" | "),
+      evidence: clauses.join(" | "),
     };
   }
 
