@@ -843,6 +843,12 @@ export const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS = [
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_JITTER_RATIO = 0.25;
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON = "transient_failure";
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON = "transient_failure_retry";
+/**
+ * PEN-4036 kill switch. Default ON. Set to "false" to restore the prior
+ * behaviour in which the retry of a provider-killed run always starts cold.
+ */
+const PROVIDER_DEATH_RETRY_SESSION_RESUME_ENABLED =
+  process.env.PAPERCLIP_PROVIDER_DEATH_RETRY_SESSION_RESUME !== "false";
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS = BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length;
 const K8S_ISOLATION_RETRY_ATTEMPT_CONTEXT_KEY = "paperclipK8sIsolationRetryAttempt";
 const K8S_ISOLATION_RETRY_AT_CONTEXT_KEY = "paperclipK8sIsolationRetryAt";
@@ -17525,6 +17531,85 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     };
   }
 
+  /**
+   * PEN-4036: carry a provider-killed run's session onto its retry.
+   *
+   * A run killed mid-flight by the provider (`errorFamily: "rate_limit_exhausted"`)
+   * persists a perfectly usable session. Measured over 2.1 days, 69/69 such runs
+   * wrote `sessionIdAfter`, and none was near the 150,000-token rotation threshold
+   * (`rawInputTokens` p50 26, max 144 — a long run's context is almost entirely
+   * *cached*, and rotation keys on raw input, so the obvious "it must be too big to
+   * resume" intuition is wrong by three orders of magnitude).
+   *
+   * Its retry nonetheless starts cold, and NOT because the session is missing:
+   * 53/53 successors of such runs reported `taskSessionAvailable: true`, then 51
+   * discarded it at {@link resolveTaskSessionConfigFreshness}. That gate fires on
+   * agent image bumps and on issue-row `updatedAt` mtimes — neither of which
+   * invalidates a conversation. Handing the predecessor's `sessionIdAfter` to the
+   * ordinary task-session lookup would therefore change nothing, because that
+   * lookup already finds exactly this session and the gate already throws it away.
+   *
+   * So this routes through the *explicit* resume override, which
+   * `previousSessionParams` consults ahead of the reset. That precedence is the
+   * whole point of the change. Justification for taking it: a bounded transient
+   * retry is a continuation of the same interrupted turn minutes later, and
+   * starting cold re-burns a median 26.6 minutes of streamed work.
+   *
+   * Note the precedence is wider than the config-freshness gate alone: dispatch
+   * builds `previousSessionParams` from the explicit resume first and only falls
+   * back to `taskSessionForRun`, so the override also outruns
+   * {@link shouldResetTaskSessionForWake} and any carried `forceFreshSession`.
+   * That is sound here only because the retry families are disjoint — a mint
+   * that would reset is never one that resolves a provider-death resume — but it
+   * is deliberate, not incidental, so do not narrow the stamp on the assumption
+   * that the freshness gate is the only thing it has to beat.
+   *
+   * The override may legitimately resolve to a bare `{ sessionId }` with no
+   * `cwd`: that happens when the dead run's session is not the one the task
+   * session currently holds, so there are no stored params to read a workspace
+   * from. Accepted — dispatch resolves the workspace independently via
+   * {@link resolveWorkspaceForRun}, and a bare id still resumes the right
+   * conversation, which is the whole point. The `cwd` is a bonus when the task
+   * session happens to still point at the same session, not a precondition.
+   *
+   * Resolved per mint from the run being retried, so attempt 3 resumes attempt 2
+   * rather than re-pointing at the original death.
+   */
+  async function resolveProviderDeathResumeSession(
+    agent: typeof agents.$inferSelect,
+    run: typeof heartbeatRuns.$inferSelect,
+    taskKey: string | null,
+  ) {
+    if (!run.sessionIdAfter && !run.sessionIdBefore) return null;
+    const sessionCodec = getAdapterSessionCodec(agent.adapterType);
+    const taskSession = taskKey
+      ? await getTaskSession(agent.companyId, agent.id, agent.adapterType, taskKey)
+      : null;
+    const runResult = parseObject(run.resultJson);
+    const runSessionId = requiresCanonicalSessionIds(agent.adapterType)
+      ? readNonEmptyString(runResult.sessionId) ?? readNonEmptyString(runResult.session_id)
+      : null;
+    const sessionOverride = buildExplicitResumeSessionOverride({
+      adapterType: agent.adapterType,
+      resumeFromRunId: run.id,
+      resumeRunSessionIdBefore: run.sessionIdBefore,
+      resumeRunSessionIdAfter: run.sessionIdAfter,
+      resumeRunSessionParams: runSessionId ? { sessionId: runSessionId } : null,
+      taskSession,
+      sessionCodec,
+    });
+    if (!sessionOverride) return null;
+    // Mirror resolveExplicitResumeSessionOverride: a k8s session is only
+    // resumable inside the isolation scope that created it, so the key has to
+    // travel with the params or the resumed session resolves to a dead cwd.
+    const sourceIsolationKey = readK8sIsolationKeyFromContext(parseObject(run.contextSnapshot));
+    const sessionParams =
+      isK8sAdapter(agent.adapterType) && sessionOverride.sessionParams && sourceIsolationKey
+        ? { ...sessionOverride.sessionParams, [SESSION_ISOLATION_KEY_PARAM]: sourceIsolationKey }
+        : sessionOverride.sessionParams;
+    return { sessionDisplayId: sessionOverride.sessionDisplayId, sessionParams };
+  }
+
   async function resolveWorkspaceForRun(
     agent: typeof agents.$inferSelect,
     context: Record<string, unknown>,
@@ -22561,7 +22646,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
     }
     const taskKey = deriveTaskKeyWithHeartbeatFallback(contextSnapshot, null);
-    const sessionBefore = await resolveSessionBeforeForWakeup(agent, taskKey);
+    // PEN-4036: a provider-killed run's session is still good. Resolve it here so
+    // the retry resumes the interrupted turn instead of starting cold.
+    const providerDeathResume =
+      PROVIDER_DEATH_RETRY_SESSION_RESUME_ENABLED && isRateLimitFamily
+        ? await resolveProviderDeathResumeSession(agent, run, taskKey)
+        : null;
+    const sessionBefore =
+      providerDeathResume?.sessionDisplayId ?? (await resolveSessionBeforeForWakeup(agent, taskKey));
     const interactionContinuationPayload = retryReason === INTERACTION_CONTINUATION_INFRA_RETRY_REASON
       ? {
           mutation: "interaction",
@@ -22578,9 +22670,48 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const shouldQuarantineWorkspaceForRetry =
       workspaceValidationRetryPayload !== null &&
       Object.keys(workspaceValidationRetryPayload).length > 0;
+    const carriedRetryContextSnapshot = carryRetryContextSnapshot(contextSnapshot);
+    // Resume markers are scoped to the run that resolved them, and this mint may
+    // not re-resolve one — only the rate-limit family does, above. Drop an
+    // inherited pointer ONLY once the run being retried has superseded it by
+    // producing a session of its own. `sessionIdAfter` is written in exactly one
+    // place, at completion from the adapter result, so it is durable proof the
+    // run reached the adapter and advanced the conversation past whatever it
+    // inherited; carrying the older pointer forward would rewind the retry.
+    //
+    // When it is unset the run never got that far — the vanished-Job reconciler
+    // reaches `scheduleBoundedRetryForRun` under `adapterInvocationStarted !==
+    // true`, and any family can die before dispatch — so the inherited pointer
+    // was never consumed and is still the correct one. (A `max_turns_continuation`
+    // retry is the ordinary case on the other side of this branch: it ran by
+    // definition, so it has its own `sessionIdAfter` and the clear fires.) A
+    // successful-run handoff stamps exactly these three keys, and clearing them
+    // there would push its retry onto the ordinary task-session lookup that
+    // `resolveTaskSessionConfigFreshness` discards ~98.7% of the time: this
+    // change's own failure mode, relocated onto another family.
+    //
+    // `sessionIdBefore` is deliberately NOT part of the test. It is stamped at
+    // mint time (including by this function, just above), so it proves only that
+    // a run was HANDED a pointer, never that it used one.
+    //
+    // Deleted rather than overwritten because the stamp below is conditional and
+    // an `undefined` value would not reliably clear the key through the jsonb
+    // round-trip.
+    if (run.sessionIdAfter) {
+      delete carriedRetryContextSnapshot.resumeFromRunId;
+      delete carriedRetryContextSnapshot.resumeSessionDisplayId;
+      delete carriedRetryContextSnapshot.resumeSessionParams;
+    }
     const retryContextSnapshot: Record<string, unknown> = withRecoveryModelProfileHint({
-      ...carryRetryContextSnapshot(contextSnapshot),
+      ...carriedRetryContextSnapshot,
       retryOfRunId: run.id,
+      ...(providerDeathResume
+        ? {
+            resumeFromRunId: run.id,
+            resumeSessionDisplayId: providerDeathResume.sessionDisplayId,
+            resumeSessionParams: providerDeathResume.sessionParams,
+          }
+        : {}),
       wakeReason,
       retryReason,
       ...(shouldQuarantineWorkspaceForRetry
