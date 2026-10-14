@@ -1485,6 +1485,50 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
   });
 
+  it("defers an expired horizon while its wake run is still pending", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const createdAt = new Date("2026-08-25T00:00:00.000Z");
+    const now = new Date("2026-08-25T12:00:00.000Z");
+    await db.update(issues).set({ status: "blocked", assigneeAgentId: managerId }).where(eq(issues.id, sourceIssueId));
+    const [action] = await db.insert(issueRecoveryActions).values({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      cause: "stranded_assigned_issue",
+      status: "active",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      fingerprint: `source_scoped_recovery:${companyId}:${sourceIssueId}:pending-wake-horizon`,
+      evidence: {},
+      nextAction: "Wake the recovery owner.",
+      attemptCount: 0,
+      maxAttempts: defaultRecoveryActionMaxAttempts,
+      timeoutAt: new Date("2026-08-25T01:00:00.000Z"),
+      createdAt,
+      lastAttemptAt: null,
+    }).returning();
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId: managerId,
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      status: "queued",
+      contextSnapshot: { issueId: sourceIssueId, recoveryActionId: action!.id },
+    });
+    const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
+    const result = await recoveryService(db, { enqueueWakeup }).reconcileStrandedRecoveryWakeBackstop({
+      companyId,
+      now,
+      cooldownMs: 0,
+    });
+
+    expect(result).toMatchObject({ checked: 1, pendingWakeSkipped: 1, exhaustedSkipped: 0, healed: 0 });
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    const [unchanged] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action!.id));
+    expect(unchanged).toMatchObject({ status: "active", retiringBound: null, attemptCount: 0 });
+  });
+
   it("does not claim a candidate retired after selection", async () => {
     const { companyId, managerId, sourceIssueId } = await seedCompany();
     await db.update(issues).set({ status: "blocked", assigneeAgentId: managerId }).where(eq(issues.id, sourceIssueId));
