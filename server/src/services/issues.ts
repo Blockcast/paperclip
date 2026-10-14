@@ -7132,13 +7132,31 @@ export function issueService(db: Db) {
         return null;
       }
 
-      await lockHeartbeatRunsForUpdate(tx, [input.actorRunId]);
-      const actorRun = await tx
-        .select({ status: heartbeatRuns.status })
+      const ownerRunIds = [...new Set([input.expectedCheckoutRunId, input.expectedExecutionRunId]
+        .filter((id): id is string => Boolean(id) && id !== input.actorRunId))];
+      await lockHeartbeatRunsForUpdate(tx, [input.actorRunId, ...ownerRunIds]);
+      const runs = await tx
+        .select({
+          id: heartbeatRuns.id,
+          status: heartbeatRuns.status,
+          startedAt: heartbeatRuns.startedAt,
+          wakeupRequestId: heartbeatRuns.wakeupRequestId,
+        })
         .from(heartbeatRuns)
-        .where(eq(heartbeatRuns.id, input.actorRunId))
-        .then((rows) => rows[0] ?? null);
-      if (actorRun?.status !== "running") return null;
+        .where(inArray(heartbeatRuns.id, [input.actorRunId, ...ownerRunIds]));
+      const runById = new Map(runs.map((run) => [run.id, run]));
+      if (runById.get(input.actorRunId)?.status !== "running") return null;
+      // BLO-46114: being newer is not a claim on the lock. A same-agent run under
+      // maxConcurrentRuns > 1 must not strand an older owner that is still
+      // working, so only a reapable (terminal or never-started) owner yields, and
+      // a never-started one is reaped so it cannot start against the new owner.
+      if (!ownerRunIds.every((id) => isReapableHeartbeatRunRow(runById.get(id)))) return null;
+      for (const ownerRunId of ownerRunIds) {
+        if (!(await cancelNeverStartedOwnerRun(tx, runById.get(ownerRunId), {
+          reason: "Cancelled because the issue checkout was adopted by the current execution run",
+          errorCode: "issue_checkout_adopted",
+        }))) return null;
+      }
 
       const now = new Date();
       return tx

@@ -468,7 +468,9 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     });
   });
 
-  it("allows a same-agent active issue-scoped run to adopt mismatched live run ownership", async () => {
+  // BLO-46114: before this, being newer was enough to take the lock from a still
+  // running owner, stranding its in-flight work. A live owner now keeps it.
+  it("does not let a newer active issue-scoped run take ownership from a live older run", async () => {
     const { companyId, agentId, failedRunId, currentRunId } = await seedCompanyAgentAndRuns({
       staleRunStatus: "running",
     });
@@ -494,8 +496,8 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       .patch(`/api/issues/${issueId}`)
       .send({ status: "done" });
 
-    expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(res.body.status).toBe("done");
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.error).toBe("Issue run ownership conflict");
 
     const row = await db
       .select({
@@ -507,13 +509,13 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0]);
     expect(row).toEqual({
-      status: "done",
-      checkoutRunId: null,
-      executionRunId: null,
+      status: "in_progress",
+      checkoutRunId: failedRunId,
+      executionRunId: failedRunId,
     });
   });
 
-  it("rejects stale output after a newer active issue-scoped run adopts ownership", async () => {
+  it("keeps a live older issue-scoped owner writing when a newer same-agent run starts", async () => {
     const { companyId, agentId, failedRunId, currentRunId } = await seedCompanyAgentAndRuns({
       staleRunStatus: "running",
     });
@@ -539,15 +541,14 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       .patch(`/api/issues/${issueId}`)
       .send({ title: "claimed by newer run" });
 
-    expect(newerRunRes.status, JSON.stringify(newerRunRes.body)).toBe(200);
-    expect(newerRunRes.body.title).toBe("claimed by newer run");
+    expect(newerRunRes.status, JSON.stringify(newerRunRes.body)).toBe(409);
+    expect(newerRunRes.body.error).toBe("Issue run ownership conflict");
 
-    const staleRunRes = await request(createApp(agentActor(companyId, agentId, failedRunId)))
+    const ownerRes = await request(createApp(agentActor(companyId, agentId, failedRunId)))
       .patch(`/api/issues/${issueId}`)
-      .send({ title: "older stale output" });
+      .send({ title: "owner output" });
 
-    expect(staleRunRes.status, JSON.stringify(staleRunRes.body)).toBe(409);
-    expect(staleRunRes.body.error).toBe("Issue run ownership conflict");
+    expect(ownerRes.status, JSON.stringify(ownerRes.body)).toBe(200);
 
     const row = await db
       .select({
@@ -559,15 +560,15 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0]);
     expect(row).toEqual({
-      title: "claimed by newer run",
-      checkoutRunId: currentRunId,
-      executionRunId: currentRunId,
+      title: "owner output",
+      checkoutRunId: failedRunId,
+      executionRunId: failedRunId,
     });
   });
 
   it("lets an active issue-scoped routine publish a sweep comment then close its run issue", async () => {
     const { companyId, agentId, failedRunId, currentRunId } = await seedCompanyAgentAndRuns({
-      staleRunStatus: "running",
+      staleRunStatus: "failed",
     });
     const routineIssueId = randomUUID();
     const sweepTargetIssueId = randomUUID();

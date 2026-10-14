@@ -7980,6 +7980,99 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     expect(updated).toMatchObject({ id: issueId, status: "todo" });
   });
 
+  describe("BLO-46114: a newer same-agent run does not take the lock from a live older owner", () => {
+    async function seed(params: { ownerStatus: "running" | "failed"; checkoutHeld: boolean }) {
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const ownerRunId = randomUUID();
+      const actorRunId = randomUUID();
+      const issueId = randomUUID();
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+        requireBoardApprovalForNewAgents: false,
+      });
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "Engineer",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      await db.insert(heartbeatRuns).values([
+        {
+          id: ownerRunId,
+          companyId,
+          agentId,
+          status: params.ownerStatus,
+          invocationSource: "automation",
+          contextSnapshot: { issueId },
+          createdAt: new Date(Date.now() - 60_000),
+          startedAt: new Date(Date.now() - 60_000),
+          finishedAt: params.ownerStatus === "running" ? null : new Date(),
+        },
+        {
+          id: actorRunId,
+          companyId,
+          agentId,
+          status: "running",
+          invocationSource: "automation",
+          contextSnapshot: { issueId },
+          createdAt: new Date(),
+          startedAt: new Date(),
+        },
+      ]);
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Concurrent same-agent runs",
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        checkoutRunId: params.checkoutHeld ? ownerRunId : null,
+        executionRunId: ownerRunId,
+        executionAgentNameKey: "engineer",
+        executionLockedAt: new Date(),
+      });
+      return { agentId, ownerRunId, actorRunId, issueId };
+    }
+
+    async function owners(issueId: string) {
+      return db
+        .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0]);
+    }
+
+    for (const checkoutHeld of [true, false]) {
+      it(`keeps ownership with a running older owner (checkout ${checkoutHeld ? "held" : "null"})`, async () => {
+        const s = await seed({ ownerStatus: "running", checkoutHeld });
+
+        await expect(svc.assertCheckoutOwner(s.issueId, s.agentId, s.actorRunId)).rejects.toMatchObject({ status: 409 });
+        expect(await owners(s.issueId)).toEqual({
+          checkoutRunId: checkoutHeld ? s.ownerRunId : null,
+          executionRunId: s.ownerRunId,
+        });
+      });
+
+      it(`lets the newer run adopt from a failed older owner (checkout ${checkoutHeld ? "held" : "null"})`, async () => {
+        const s = await seed({ ownerStatus: "failed", checkoutHeld });
+
+        await expect(svc.assertCheckoutOwner(s.issueId, s.agentId, s.actorRunId)).resolves.toMatchObject({
+          checkoutRunId: s.actorRunId,
+          executionRunId: s.actorRunId,
+        });
+        expect(await owners(s.issueId)).toEqual({ checkoutRunId: s.actorRunId, executionRunId: s.actorRunId });
+      });
+    }
+  });
+
   it("lets a same-agent retry adopt the previous run ownership lock", async () => {
     const companyId = randomUUID();
     const assigneeAgentId = randomUUID();
