@@ -936,7 +936,12 @@ function classifyNoExecutableTurnRun(
   const isCapacityClass =
     run.scheduledRetryReason === CAPACITY_RETRY_REASON || run.errorCode === CAPACITY_RETRY_ERROR_CODE;
   const scheduledRetryAt = coerceDate(run.scheduledRetryAt);
-  if (isCapacityClass && scheduledRetryAt) {
+  // A promoted park that has not been dispatched yet (`queued`, no `startedAt`)
+  // is still waiting for a slot: let it fall through to `dispatch_backlog` so
+  // it stays an OPEN current block. Claimed here it would read `resolved` and
+  // drop suppression on a run that never got its turn (Ally, #2727).
+  const awaitingDispatch = !run.startedAt && run.status === "queued";
+  if (isCapacityClass && scheduledRetryAt && !awaitingDispatch) {
     return {
       mechanism: "capacity_park",
       scheduledRetryAt,
@@ -1114,6 +1119,8 @@ function noExecutableTurnBreakdown(
     // before its retry. Open states (`scheduled_retry` still pending its own
     // due time, or a dispatch-backlog run still genuinely `queued`) have no
     // `finishedAt` yet and legitimately park through to the next run.
+    // The status test below is the rule, not this list: any future mechanism
+    // that ends terminal inherits finish-time truncation.
     const isTerminalNoTurnRun = TERMINAL_RUN_STATUSES.includes(
       run.status as (typeof TERMINAL_RUN_STATUSES)[number],
     );
