@@ -494,6 +494,26 @@ describe("BLO-33168 — replayed deliveries skip already-committed fingerprints"
     );
   });
 
+  it("a replay later in the retry train or one group_interval on is still skipped (BLO-37485)", async () => {
+    const { ctx, mocks } = mkCtx();
+
+    await deliver(ctx, healthyOnly(), "req-6a");
+    mocks.metrics.write.mockClear();
+    mocks.issues.update.mockClear();
+
+    // Measured 2026-10-14: one retry train spanned 6m32s, and a changing group
+    // is re-sent every `group_interval: 5m`. A 5m window aged commits out
+    // mid-train, so retries re-walked finished work and never converged.
+    shiftCachedCommit(ctx, FP_HEALTHY, -(7 * 60_000));
+
+    await deliver(ctx, healthyOnly(), "req-6a-retry");
+
+    expect(metricNames(mocks.metrics.write)).toContain(
+      "alertmanager.alert.replay_skipped",
+    );
+    expect(mocks.issues.update).not.toHaveBeenCalled();
+  });
+
   it("a delivery arriving after the replay window is processed, not skipped", async () => {
     const { ctx, mocks } = mkCtx();
 
