@@ -28042,8 +28042,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             // the run clock flagged every draining stale-kill Job as an orphan
             // (measured 2026-10-15 on run d51468be: ERROR 20s after the kill).
             // With no active row there is no release clock to read.
-            const releaseOverdue = reservation?.state === "release_pending"
-              ? now.getTime() - new Date(reservation.updatedAt).getTime() >= EXTERNAL_LIFECYCLE_STALE_MS
+            const releasePendingForMs = reservation?.state === "release_pending"
+              ? now.getTime() - new Date(reservation.updatedAt).getTime()
+              : null;
+            const releaseOverdue = releasePendingForMs !== null
+              ? releasePendingForMs >= EXTERNAL_LIFECYCLE_STALE_MS
               : finalizeOverdue;
             if (reservationFinalizing && (jobStatus?.phase !== "active" || !releaseOverdue)) {
               // The same condition holds forever for a run whose row never
@@ -28051,7 +28054,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               // release). Such a run is skipped by the reap loop below via
               // ambiguousExternalRunIds, so this line is its only trace: keep
               // the benign finalize window at debug, and escalate to warn once
-              // the run has been silent past EXTERNAL_LIFECYCLE_STALE_MS.
+              // it is past EXTERNAL_LIFECYCLE_STALE_MS -- on the release clock
+              // when a release_pending row exists (a stale-killed run is
+              // silent past the window by definition), else on run silence.
               const skipPayload = {
                 runId: run.id,
                 jobName,
@@ -28061,8 +28066,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 // row still in `release_pending`.
                 reservationState: reservation?.state ?? null,
                 silentForMs: lastSignalRef ? now.getTime() - lastSignalRef : null,
+                releasePendingForMs,
               };
-              if (finalizeOverdue) {
+              if (releaseOverdue) {
                 logger.warn(
                   skipPayload,
                   "external-runtime run still running past the stale window after its reservation finalized; skipping identity stamp",
