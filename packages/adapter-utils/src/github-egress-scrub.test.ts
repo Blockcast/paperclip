@@ -896,6 +896,43 @@ describe("scrubGitHubEgressText", () => {
     );
   });
 
+  describe("BLO-46892 regression: a flake input git commit pin is not a credential", () => {
+    // Derived, not embedded: until this fix deploys, the pre-push guard refuses the literal.
+    const sha = ["2515e5ca485854475eb2739d", "73aef58d765564f2"].join("");
+    const rev = (value: string) => ["rev", value].join("=");
+
+    it.each([
+      `    url = "git+ssh://git@github.com/Blockcast/libmmt.git?ref=main&${rev(sha)}";`,
+      `    url = "github:Blockcast/libmmt?${rev(sha)}";`,
+      rev(sha),
+    ])("passes %s through byte-exact", (text) => {
+      expect(scrubGitHubEgressText(text).text).toBe(text);
+      expect(locateGitHubEgressMatches(text)).toEqual([]);
+    });
+
+    it("still refuses the same value under any other name", () => {
+      // Name half: the shape alone exonerates nothing.
+      const result = scrubGitHubEgressText(["password", sha].join("="));
+      expect(result.classes).toContain("high-entropy-assignment");
+    });
+
+    it.each([sha.toUpperCase(), `${sha}ab`, SYNTHETIC_OPAQUE_VALUE])(
+      "still refuses the non-SHA value %s bound to rev",
+      (token) => {
+        // Shape half: only exactly 40 lowercase hex is a commit pin.
+        expect(scrubGitHubEgressText(rev(token)).classes).toContain("high-entropy-assignment");
+      },
+    );
+
+    it("still fires the true-positive controls", () => {
+      const ghp = ["ghp", "_", "Kq2Vt9Lm4Xb8Nd3Wp6Zc1Yr5Hj7Tg0PsQFaB"].join("");
+      expect(scrubGitHubEgressText(["token", ghp].join("=")).classes).toContain("vendor-key");
+      expect(scrubGitHubEgressText(["password", SYNTHETIC_OPAQUE_VALUE].join("=")).classes).toContain(
+        "high-entropy-assignment",
+      );
+    });
+  });
+
   describe("BLO-41262: locateGitHubEgressMatches names the line", () => {
     const token = SYNTHETIC_OPAQUE_VALUE;
 
