@@ -1571,6 +1571,8 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
       | { kind: "launched"; expectedJobName: string; jobName: string; jobUid: string };
     // Last run activity. Defaults to now, i.e. inside the stale window.
     lastActivityAt?: Date;
+    // When the trigger moved the row to release_pending (its updated_at).
+    releaseStartedAt?: Date;
   }) {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -1646,6 +1648,7 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
         jobName: `ac-${runId.slice(0, 8)}`,
         jobUid: `uid-${runId.slice(0, 8)}`,
         releasedAt: null,
+        updatedAt: input.releaseStartedAt ?? new Date(),
       });
     } else {
       await db.insert(externalRuntimeReservations).values({
@@ -1831,6 +1834,70 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
     expect(skips).toHaveLength(1);
     expect(skips[0][0]).toMatchObject({ runId, jobPhase: "active", reservationState });
     expect(overdue).toEqual([]);
+  }, 120_000);
+
+  it("does not log an identity mismatch when a still-active Job's reservation starts releasing between the read and the stamp (BLO-29133)", async () => {
+    // Production 2026-10-15 (runs 47ba317e, 2544af7c): the run was cancelled or
+    // killed, the reaper's read still saw `launched`, and the Job pod was still
+    // `active` while it drained. The release is seconds old, not an orphan.
+    const { agentId, runId } = await seedRunningRunWithObservedJob({
+      name: "ActiveJobReleaseRaceCo",
+      slotId: 0,
+      reservation: { kind: "release_pending" },
+      lastActivityAt: new Date(Date.now() - 20 * 60 * 1000),
+    });
+    mockListManagedAgentJobs.mockResolvedValue([{ ...terminalJobFor({ runId, agentId }), phase: "active" as const }]);
+    mockGetActiveExternalRuntimeReservation.mockImplementationOnce(async (dbArg, runIdArg) => {
+      const row = await actualExternalRuntimeReservationsRef.current.getActiveExternalRuntimeReservation(dbArg, runIdArg);
+      return row ? { ...row, state: "launched" as const } : row;
+    });
+
+    const { mismatches, skips } = await reapCapturingFinalizeLogs();
+
+    // Fails on the parent commit: the catch only downgraded non-active Jobs.
+    expect(mismatches).toEqual([]);
+    expect(skips).toHaveLength(1);
+    expect(skips[0][0]).toMatchObject({ runId, jobPhase: "active", reservationState: "release_pending" });
+  }, 120_000);
+
+  it("judges a draining Job by release age, not run silence, so a fresh stale-kill is not an orphan (BLO-29133)", async () => {
+    // Production 2026-10-15 (run d51468be, external_lifecycle_stale_killed):
+    // a stale-killed run is silent past the window by definition, so the run
+    // clock flagged its still-draining Job 20s after the kill.
+    const { agentId, runId } = await seedRunningRunWithObservedJob({
+      name: "ActiveJobFreshReleaseCo",
+      slotId: 0,
+      reservation: { kind: "release_pending" },
+      lastActivityAt: new Date(Date.now() - 20 * 60 * 1000),
+      releaseStartedAt: new Date(),
+    });
+    mockListManagedAgentJobs.mockResolvedValue([{ ...terminalJobFor({ runId, agentId }), phase: "active" as const }]);
+
+    const { mismatches, skips, overdue } = await reapCapturingFinalizeLogs();
+
+    // Fails on the parent commit: run silence alone sent it to the catch.
+    expect(mismatches).toEqual([]);
+    expect([...skips, ...overdue]).toHaveLength(1);
+  }, 120_000);
+
+  it("still logs an active Job at error once its release has been pending past the stale window (BLO-29133)", async () => {
+    // The orphan guard is kept: a Job still active 20 min into its release
+    // outlived it, whatever the run clock says.
+    const { agentId, runId } = await seedRunningRunWithObservedJob({
+      name: "ActiveJobStaleReleaseCo",
+      slotId: 0,
+      reservation: { kind: "release_pending" },
+      releaseStartedAt: new Date(Date.now() - 20 * 60 * 1000),
+    });
+    mockListManagedAgentJobs.mockResolvedValue([{ ...terminalJobFor({ runId, agentId }), phase: "active" as const }]);
+
+    const { mismatches, skips, overdue } = await reapCapturingFinalizeLogs();
+
+    expect(skips).toEqual([]);
+    expect(overdue).toEqual([]);
+    expect(mismatches).toHaveLength(1);
+    expect(mismatches[0][0]).toMatchObject({ runId, jobPhase: "active", reservationState: "release_pending" });
+    expect((mismatches[0][0] as { errorMessage: string }).errorMessage).toContain("not launchable from release_pending");
   }, 120_000);
 
   it("still logs an active Job with no reservation at error once past the stale window (BLO-29133)", async () => {
