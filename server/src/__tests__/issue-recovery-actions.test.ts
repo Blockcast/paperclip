@@ -920,7 +920,14 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     });
     // PEN-3989 (Ally review of #2607): the return value is the UPDATE's row match, and it is
     // the only evidence a caller has that this call did anything. See the CAS-miss test below.
-    expect(retired).toBe(true);
+    // PEN-4033: and it is the matched ROW, so the caller can describe the retirement from
+    // what was written rather than from the pre-state it read beforehand.
+    expect(retired).toMatchObject({
+      id: action.id,
+      status: "escalated",
+      retiringBound: "attempt_budget",
+      attemptCount: action.attemptCount - 1,
+    });
 
     const enqueueWakeup = vi.fn(async () => ({ id: randomUUID() }));
     const recovery = recoveryService(db, { enqueueWakeup });
@@ -977,7 +984,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       expectedAttemptCount: action.attemptCount,
       retiringBound: "timeout_horizon",
     });
-    expect(missed).toBe(false);
+    expect(missed).toBeNull();
     // Nothing was written — the whole point. A caller that announced here would be describing
     // a row that is still `active` with no bound.
     const [untouched] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
@@ -997,13 +1004,76 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       expectedAttemptCount: action.attemptCount,
       retiringBound: "timeout_horizon",
     });
-    expect(matched).toBe(true);
+    expect(matched).toMatchObject({
+      id: action.id,
+      status: "escalated",
+      retiringBound: "timeout_horizon",
+      attemptCount: action.attemptCount - 1,
+    });
     const [retiredRow] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
     expect(retiredRow).toMatchObject({
       status: "escalated",
       retiringBound: "timeout_horizon",
       attemptCount: action.attemptCount - 1,
     });
+  });
+
+  /**
+   * PEN-4033 (Ally review of #2703): the returned row reports what the `coalesce` and the
+   * `CASE` RESOLVED TO, which is not always what the caller asked for.
+   *
+   * The racer is concrete, not hypothetical: `retireWakeAction` (the stranded-wake backstop)
+   * writes `retiring_bound` and `status` WITHOUT touching `attemptCount`, so it can land
+   * between a dispatch's pre-state read and its retire+refund UPDATE and leave the
+   * reservation CAS matching anyway. The dispatch's caller used to announce from its own
+   * ternary — `timeout_horizon`, because its pre-state said the budget was not reached — on a
+   * row that by then carried `attempt_budget`.
+   *
+   * The refund still happens, which is why this cannot simply be refused: the reserve must
+   * come back regardless of who won the bound.
+   */
+  it("returns the bound and status the row ended up carrying, not the ones it was asked for", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    await db.update(issues).set({ status: "blocked", assigneeAgentId: managerId }).where(eq(issues.id, sourceIssueId));
+    const svc = issueRecoveryActionService(db);
+    const action = await svc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "stranded_assigned_issue",
+      ownerType: "agent",
+      ownerAgentId: managerId,
+      cause: "stranded_assigned_issue",
+      fingerprint: "retire-coalesce-racer:fingerprint",
+      nextAction: "Wake the recovery owner.",
+      maxAttempts: 5,
+    });
+
+    // The racer, in the shape the backstop actually writes it: bound and status only, so the
+    // owner + attempt-count CAS below is untouched and still matches.
+    await db
+      .update(issueRecoveryActions)
+      .set({ status: "escalated", retiringBound: "attempt_budget" })
+      .where(eq(issueRecoveryActions.id, action.id));
+
+    const outcome = await svc.retireAndReleaseWakeAttempt({
+      companyId,
+      actionId: action.id,
+      expectedOwnerAgentId: managerId,
+      expectedAttemptCount: action.attemptCount,
+      retiringBound: "timeout_horizon",
+    });
+
+    // Matched — the CAS held — and yet the row carries the racer's bound. A caller that reads
+    // the return value as a bare "did it work" cannot see the difference, which is the defect.
+    expect(outcome).toMatchObject({
+      status: "escalated",
+      retiringBound: "attempt_budget",
+      attemptCount: action.attemptCount - 1,
+    });
+    const [row] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    // `coalesce` means first writer wins PERMANENTLY, so the returned value is the durable
+    // one, not a transient view of it.
+    expect(row).toMatchObject({ retiringBound: "attempt_budget", attemptCount: action.attemptCount - 1 });
   });
 
   it.each([

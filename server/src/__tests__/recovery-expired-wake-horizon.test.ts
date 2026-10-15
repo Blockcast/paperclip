@@ -21,6 +21,7 @@ import {
 } from "../services/issue-recovery-actions.js";
 import { attentionService } from "../services/attention.js";
 import { recoveryService } from "../services/recovery/service.js";
+import { logger } from "../middleware/logger.js";
 import { reconcileStrandedBlockedIssues } from "../services/stranded-blocked-issue-reconciler.js";
 import {
   RECOVERY_HORIZON_EXPIRED_METRIC,
@@ -59,6 +60,10 @@ describeEmbeddedPostgres("recovery wake horizon expiry (BLO-24662)", () => {
     // `onDelete` action (BLO-22231) — so a hand-ordered delete list has to track
     // every FK this table grows; this gets them for free.
     await truncateCompanyScopedTestState(db);
+    // PEN-4033: the message-split tests spy on `logger.warn`, and `vi.spyOn` on an
+    // already-spied method hands back the SAME spy — so without this the call list
+    // accumulates across tests and every `not.toContain` assertion becomes unfalsifiable.
+    vi.restoreAllMocks();
   });
 
   afterAll(async () => {
@@ -1336,63 +1341,100 @@ describeEmbeddedPostgres("recovery wake horizon expiry (BLO-24662)", () => {
      * still-`active` row had moved to `escalated`, and a dedup marker that makes the REAL
      * retirement's notice look like a duplicate when it arrives.
      */
-    function dbWithRehomeDuringRetire(
-      real: typeof db,
-      sabotage: { run: () => Promise<unknown>; armed: boolean; fired: boolean },
-    ) {
-      const bind = (target: object, prop: string | symbol) => {
-        const value = Reflect.get(target, prop);
-        return typeof value === "function" ? value.bind(target) : value;
-      };
-      // Run the re-home immediately before the statement executes, so the CAS reads a row
-      // the reserve no longer describes. Wrapping `then` rather than the builder call is what
-      // makes the ordering exact: drizzle builds lazily and executes on await.
-      const deferUntilAfterSabotage = (node: object): object => new Proxy(node, {
+    const bindTo = (target: object, prop: string | symbol) => {
+      const value = Reflect.get(target, prop);
+      return typeof value === "function" ? value.bind(target) : value;
+    };
+
+    /**
+     * Wrap a drizzle builder node so `onAwait` runs in place of its normal resolution, with
+     * `run()` as the thunk that executes the real statement.
+     *
+     * Wrapping `then` rather than the builder call is what makes the ordering exact: drizzle
+     * builds lazily and executes on await, so a hook attached here lands between "statement
+     * built" and "statement run". `where` and `returning` are re-wrapped so the hook survives
+     * the rest of the chain.
+     */
+    function hookOnAwait(
+      node: object,
+      onAwait: (run: () => PromiseLike<unknown>) => PromiseLike<unknown>,
+    ): object {
+      return new Proxy(node, {
         get(target, prop) {
           if (prop === "then") {
             return (onFulfilled?: unknown, onRejected?: unknown) =>
-              sabotage.run().then(() => {
-                sabotage.fired = true;
-                return (target as PromiseLike<unknown>).then(
-                  onFulfilled as never,
-                  onRejected as never,
-                );
-              });
+              onAwait(() => target as PromiseLike<unknown>)
+                .then(onFulfilled as never, onRejected as never);
           }
-          const value = bind(target, prop);
+          const value = bindTo(target, prop);
           if (prop === "where" || prop === "returning") {
             return (...args: unknown[]) =>
-              deferUntilAfterSabotage((value as (...a: unknown[]) => object)(...args));
+              hookOnAwait((value as (...a: unknown[]) => object)(...args), onAwait);
           }
           return value;
         },
       });
+    }
+
+    /**
+     * Wrap `db` so the retire+refund UPDATE — and only that one — runs under a hook chosen
+     * per call, `hookFor` returning `null` to let a call through untouched.
+     *
+     * PEN-4033: one helper for four fixtures, because they differ only in what the hook does
+     * (inject a racing write, commit then throw, reject outright) and sharing the
+     * discrimination keeps that one fragile part in one place.
+     *
+     * Discriminated by PAYLOAD: the retire+refund is the only UPDATE that writes
+     * `retiringBound` AND bumps `nonDeliverySweepCount`. `releaseWakeAttempt` bumps the sweep
+     * count without the bound; `retireWakeAction` writes the bound without the sweep count.
+     *
+     * `hookFor` receives the 1-based call index, so a fixture can target the first attempt and
+     * leave the dispatch's retry running for real — which the retry-then-confirm branch needs.
+     */
+    function dbWithRetireHook(
+      real: typeof db,
+      hookFor: (call: number) => ((run: () => PromiseLike<unknown>) => PromiseLike<unknown>) | null,
+    ) {
+      let calls = 0;
       return new Proxy(real, {
         get(target, prop) {
-          if (prop !== "update") return bind(target, prop);
+          if (prop !== "update") return bindTo(target, prop);
           return (table: unknown) => {
             const builder = (target.update as (t: unknown) => object)(table);
             if (table !== issueRecoveryActions) return builder;
             return new Proxy(builder, {
               get(b, p) {
-                if (p !== "set") return bind(b, p);
+                if (p !== "set") return bindTo(b, p);
                 return (values: Record<string, unknown>) => {
-                  const node = (bind(b, "set") as (v: unknown) => object)(values);
-                  // Discriminate the retire+refund statement by its payload: it is the only
-                  // UPDATE that writes `retiringBound` AND bumps `nonDeliverySweepCount`.
-                  // `releaseWakeAttempt` bumps the sweep count without the bound;
-                  // `retireWakeAction` writes the bound without the sweep count.
+                  const node = (bindTo(b, "set") as (v: unknown) => object)(values);
                   const isRetireAndRefund = values.retiringBound !== undefined
                     && values.nonDeliverySweepCount !== undefined;
-                  if (!isRetireAndRefund || sabotage.armed === false) return node;
-                  sabotage.armed = false;
-                  return deferUntilAfterSabotage(node);
+                  if (!isRetireAndRefund) return node;
+                  calls += 1;
+                  const hook = hookFor(calls);
+                  return hook ? hookOnAwait(node, hook) : node;
                 };
               },
             });
           };
         },
       }) as typeof db;
+    }
+
+    /**
+     * Run `sabotage.run()` immediately before the retire+refund statement executes, so the
+     * statement reads a row the dispatch's pre-state no longer describes. First attempt only.
+     */
+    function dbWithWriteDuringRetire(
+      real: typeof db,
+      sabotage: { run: () => Promise<unknown>; fired: boolean },
+    ) {
+      return dbWithRetireHook(real, (call) => (call === 1
+        ? (run) => sabotage.run().then(() => {
+          sabotage.fired = true;
+          return run();
+        })
+        : null));
     }
 
     it("does not count or announce when the retirement UPDATE matched no row", async () => {
@@ -1413,9 +1455,8 @@ describeEmbeddedPostgres("recovery wake horizon expiry (BLO-24662)", () => {
         permissions: {},
       });
       const sabotage = {
-        // `armed` gates the one-shot injection; `fired` records that it actually EXECUTED,
-        // which is a different claim — the statement could be built and never awaited.
-        armed: true,
+        // `fired` records that the injection actually EXECUTED, which is a different claim
+        // from it being armed — the statement could be built and never awaited.
         fired: false,
         run: () =>
           db
@@ -1425,7 +1466,7 @@ describeEmbeddedPostgres("recovery wake horizon expiry (BLO-24662)", () => {
       };
 
       const actionId = await dispatchOntoPastHorizon(
-        dbWithRehomeDuringRetire(db, sabotage),
+        dbWithWriteDuringRetire(db, sabotage),
         seeded,
       );
 
@@ -1454,6 +1495,354 @@ describeEmbeddedPostgres("recovery wake horizon expiry (BLO-24662)", () => {
       // count is 1 whether the gate is fixed or broken, and asserting on it would be a check
       // that cannot fail for the reason it names. The metric above is the one that
       // discriminates.
+    });
+
+    /**
+     * PEN-4033 (Ally review of #2703), §3: the announce gate used to take its BOUND from the
+     * dispatch's own pre-state — a ternary over `input.action.attemptCount` read before the
+     * write — and so could announce a `timeout_horizon` retirement on a row that carries
+     * `attempt_budget`.
+     *
+     * The racer has a real writer behind it. `retireWakeAction` (the stranded-wake backstop)
+     * sets `status` and `retiring_bound` and does NOT touch `attemptCount`, so landing it
+     * between the pre-state read and this UPDATE leaves the reservation CAS MATCHING: the
+     * statement succeeds, the refund lands, and `coalesce` keeps the racer's bound. Pre-fix
+     * the dispatch read "the UPDATE matched" as licence to announce its own intent.
+     *
+     * That matching CAS is what makes this a different defect from the test above rather than
+     * a restatement of it — there the UPDATE touched nothing, here it did everything except
+     * win the bound.
+     */
+    it("does not announce a horizon retirement when a racer took the bound first", async () => {
+      const seeded = await seed();
+      await withManager(seeded);
+      const sabotage = {
+        fired: false,
+        // The backstop's write, in the shape it actually takes: bound and status, no
+        // `attemptCount`, so the dispatch's owner + attempt-count CAS is left matching.
+        run: () =>
+          db
+            .update(issueRecoveryActions)
+            .set({ status: "escalated", retiringBound: "attempt_budget" })
+            .where(eq(issueRecoveryActions.sourceIssueId, seeded.sourceIssueId)),
+      };
+
+      const actionId = await dispatchOntoPastHorizon(dbWithWriteDuringRetire(db, sabotage), seeded);
+
+      expect(sabotage.fired).toBe(true);
+      // The CAS MATCHED: the refund landed (reserved to 1, back to 0) and the row is retired.
+      // Only the bound is not the one this dispatch meant to write.
+      expect(await readAction(actionId)).toMatchObject({
+        status: "escalated",
+        retiringBound: "attempt_budget",
+        attemptCount: 0,
+      });
+
+      // THE assertion. No horizon announcement on either label. Pre-fix the gate read its own
+      // ternary — which says `timeout_horizon`, because `attemptCount` never exceeded
+      // `maxAttempts` — and incremented `never_delivered` for a horizon expiry that is not
+      // what retired this row. PEN-3322's alerts sum that series.
+      const { body } = await renderMetrics();
+      expect(body).toContain(`${RECOVERY_HORIZON_EXPIRED_METRIC}{delivery="never_delivered"} 0`);
+      expect(body).toContain(`${RECOVERY_HORIZON_EXPIRED_METRIC}{delivery="delivered"} 0`);
+    });
+
+    /**
+     * Commit the first retire+refund for real, then throw — a transient database blip that
+     * lands AFTER the commit, where the statement ran and the client never saw the reply.
+     *
+     * `onFirstCall` is the hook the caller wants on attempt 1 only; attempt 2 is left running
+     * for real, because the retry-then-confirm branch is only entered when the retry resolves
+     * and reports no match. `notify` lets a caller observe the call index without changing it.
+     */
+    function dbWithCommitThenThrowOnFirstRetire(
+      real: typeof db,
+      state: { committedThenThrew: boolean; retireCalls: number },
+      notify?: (call: number) => void,
+    ) {
+      return dbWithRetireHook(real, (call) => {
+        state.retireCalls = call;
+        notify?.(call);
+        if (call !== 1) return null;
+        return (run) => run().then(() => {
+          // Ordering is the whole fixture: the UPDATE has COMMITTED by the time this runs,
+          // so the throw is a lost reply and not a failed write.
+          state.committedThenThrew = true;
+          throw new Error("simulated connection reset after commit");
+        });
+      });
+    }
+
+    /**
+     * PEN-4033 §2: the retry-then-confirm arm — the ONLY path that establishes the retirement
+     * from a READ rather than from the UPDATE's return value — had no test.
+     *
+     * Reading the retry's CAS miss as "nothing happened" would drop the only announcement the
+     * row will ever get: once it is retired, neither the horizon sweep (gated on `status =
+     * 'active'`) nor the backstop (gated on `retiring_bound IS NULL`) can pick it up.
+     *
+     * This is the BENIGN half of the arm and it passes against the pre-fix code — deliberately.
+     * Our own committed first call did the refund, so the row's `attemptCount` and the derived
+     * `input.action.attemptCount - 1` agree at 0, and nothing here can tell the two sources
+     * apart. It is a characterisation test for a branch that had none. The test below is the
+     * one that discriminates §4, by making the CAS miss a RACER's doing instead.
+     */
+    it("confirms a retirement that committed before the connection dropped, and announces exactly once", async () => {
+      const seeded = await seed();
+      await withManager(seeded);
+      const state = { committedThenThrew: false, retireCalls: 0 };
+      const warn = vi.spyOn(logger, "warn").mockImplementation(() => logger);
+
+      const actionId = await dispatchOntoPastHorizon(
+        dbWithCommitThenThrowOnFirstRetire(db, state),
+        seeded,
+      );
+
+      // Both attempts happened and the first really committed before throwing. Without these
+      // the test would pass against a fixture that never fired — the strongest failure mode
+      // for a race harness, and the one the CAS-miss test above guards the same way.
+      expect(state.committedThenThrew).toBe(true);
+      expect(state.retireCalls).toBe(2);
+
+      // The row IS retired, by that first call, exactly as the branch assumes.
+      expect(await readAction(actionId)).toMatchObject({
+        status: "escalated",
+        retiringBound: "timeout_horizon",
+        attemptCount: 0,
+      });
+
+      // Neither warning fires here: the retry resolved (it merely matched nothing) and the
+      // confirm read succeeded. Asserting their ABSENCE is what keeps the two message tests
+      // below from being tautologies.
+      const messages = warn.mock.calls.map((call) => call[1]);
+      expect(messages).not.toContain("recovery wake retirement/refund failed after retry");
+      expect(messages).not.toContain("recovery wake retirement likely committed but could not be confirmed");
+
+      // THE assertion for §2 and §4 together. One announce, labelled from the RE-READ row's
+      // `attemptCount` — 0, the refunded count the committed first call wrote — and not from
+      // a derived `input.action.attemptCount - 1`. On this arm those two can differ: a CAS
+      // miss caused by a racer rather than by our own committed call means our reserve was
+      // never refunded, and the derived value then describes a count the row does not hold,
+      // flipping `neverDelivered` and labelling a never-woken action `delivered` — the
+      // mislabel PEN-3000 exists to prevent.
+      const { body } = await renderMetrics();
+      expect(body).toContain(`${RECOVERY_HORIZON_EXPIRED_METRIC}{delivery="never_delivered"} 1`);
+      expect(body).toContain(`${RECOVERY_HORIZON_EXPIRED_METRIC}{delivery="delivered"} 0`);
+
+      const comments = await db
+        .select({ body: issueComments.body })
+        .from(issueComments)
+        .where(eq(issueComments.issueId, seeded.sourceIssueId));
+      const horizonNotices = comments.filter((row) => row.body.includes("Recovery wake horizon reached"));
+      expect(horizonNotices).toHaveLength(1);
+    });
+
+    /**
+     * PEN-4033 §4: the same arm, but with the CAS miss caused by a RACER rather than by our
+     * own committed first call — which is the only configuration where the two candidate
+     * attempt counts disagree, and therefore the only one that can discriminate the fix.
+     *
+     * Nothing refunded our reserve here: the first attempt threw BEFORE its statement ran, and
+     * the racer that retired the row re-homed it without touching `attemptCount`. So the row
+     * holds the reserved 1, while the derived `input.action.attemptCount - 1` says 0.
+     *
+     * That difference is not cosmetic, because `neverDelivered` is `attemptCount === 0`:
+     *
+     *   - pre-fix, the announce is handed the derived 0 and the increment lands on
+     *     `never_delivered` — a never-woken claim about a row that reads 1.
+     *   - post-fix it is handed the row's 1 and lands on `delivered`.
+     *
+     * Announcing the row as it actually reads is the point. The row genuinely over-counts by
+     * one unrefunded reserve, and a notice that quietly corrects for a refund that never
+     * happened is the PEN-3000 mislabel pointing the other way.
+     */
+    it("announces the re-read count, not the derived one, when a racer caused the CAS miss", async () => {
+      const seeded = await seed();
+      await withManager(seeded);
+      // A third agent so the re-home cannot coincide with whatever the routing ladder picked.
+      const racerOwnerId = randomUUID();
+      await db.insert(agents).values({
+        id: racerOwnerId,
+        companyId: seeded.companyId,
+        name: "Racing owner",
+        role: "engineer",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      const racer = { fired: false };
+      const warn = vi.spyOn(logger, "warn").mockImplementation(() => logger);
+
+      const racingDb = dbWithRetireHook(db, (call) => {
+        // Attempt 1: a blip BEFORE the statement ran, so nothing commits and — crucially —
+        // our reserved attempt is never given back.
+        if (call === 1) {
+          return () => Promise.reject(new Error("simulated blip before the statement ran"));
+        }
+        // Attempt 2: a racer retires and re-homes the row first. `attemptCount` is untouched,
+        // so the row still carries our unrefunded reserve, and the owner change is what makes
+        // our CAS miss.
+        if (call === 2) {
+          return (run) =>
+            db
+              .update(issueRecoveryActions)
+              .set({
+                ownerAgentId: racerOwnerId,
+                status: "escalated",
+                retiringBound: "timeout_horizon",
+              })
+              .where(eq(issueRecoveryActions.sourceIssueId, seeded.sourceIssueId))
+              .then(() => {
+                racer.fired = true;
+                return run();
+              });
+        }
+        return null;
+      });
+
+      const actionId = await dispatchOntoPastHorizon(racingDb, seeded);
+
+      expect(racer.fired).toBe(true);
+      // The state the arm is reasoning about: retired by someone else, re-homed, and still
+      // holding the attempt WE reserved and never got back.
+      expect(await readAction(actionId)).toMatchObject({
+        ownerAgentId: racerOwnerId,
+        status: "escalated",
+        retiringBound: "timeout_horizon",
+        attemptCount: 1,
+      });
+      // The confirm read is what established the retirement — neither warning fired.
+      const messages = warn.mock.calls.map((call) => call[1]);
+      expect(messages).not.toContain("recovery wake retirement/refund failed after retry");
+      expect(messages).not.toContain("recovery wake retirement likely committed but could not be confirmed");
+
+      // THE discriminator, and it is the label that moves. Post-fix the announce reads the
+      // row's 1 and lands on `delivered`; pre-fix it reads the derived 0 and lands on
+      // `never_delivered`. Both series are asserted, because a single-series check passes
+      // against a revert that merely moves the count to the other label.
+      const { body } = await renderMetrics();
+      expect(body).toContain(`${RECOVERY_HORIZON_EXPIRED_METRIC}{delivery="delivered"} 1`);
+      expect(body).toContain(`${RECOVERY_HORIZON_EXPIRED_METRIC}{delivery="never_delivered"} 0`);
+    });
+
+    /**
+     * Fail the next read of `issue_recovery_actions`, once. Armed late on purpose — the
+     * dispatch reads that table several times before the confirm read, and failing an earlier
+     * one would exercise a different path while looking like this one.
+     */
+    function dbWithFailingRecoveryActionRead(real: typeof db, armed: { value: boolean; fired: boolean }) {
+      const rejectOnAwait = (node: object): object => new Proxy(node, {
+        get(target, prop) {
+          if (prop === "then") {
+            return (onFulfilled?: unknown, onRejected?: unknown) =>
+              Promise.reject(new Error("simulated confirm read failure"))
+                .then(onFulfilled as never, onRejected as never);
+          }
+          const value = bindTo(target, prop);
+          if (typeof value !== "function") return value;
+          return (...args: unknown[]) => {
+            const next = (value as (...a: unknown[]) => unknown)(...args);
+            // Only builder nodes are re-wrapped. Drizzle also exposes non-object helpers
+            // (`toSQL`, `getSQL`), and `new Proxy` on a primitive throws.
+            return typeof next === "object" && next !== null ? rejectOnAwait(next) : next;
+          };
+        },
+      });
+      return new Proxy(real, {
+        get(target, prop) {
+          if (prop !== "select") return bindTo(target, prop);
+          return (...selectArgs: unknown[]) => {
+            const builder = (target.select as (...a: unknown[]) => object)(...selectArgs);
+            return new Proxy(builder, {
+              get(b, p) {
+                if (p !== "from") return bindTo(b, p);
+                return (table: unknown) => {
+                  const node = (bindTo(b, "from") as (t: unknown) => object)(table);
+                  if (table !== issueRecoveryActions || !armed.value) return node;
+                  armed.value = false;
+                  armed.fired = true;
+                  return rejectOnAwait(node);
+                };
+              },
+            });
+          };
+        },
+      }) as typeof db;
+    }
+
+    /**
+     * PEN-4033 §1: the two failures reachable from that one `catch` mean OPPOSITE things, and
+     * the single message was only ever true for one of them.
+     *
+     * If the retry's UPDATE throws, the retirement genuinely may not have landed. If the
+     * CONFIRM READ throws, the retry's UPDATE has already resolved reporting no match — which
+     * is positive evidence that the first call committed and decremented `attemptCount`. The
+     * old message sent an operator after the write in a state where the write is the half
+     * that worked, and it did so in the one subsystem whose founding defect (PEN-3989) is a
+     * horizon retirement that commits and then says nothing.
+     *
+     * Both arms are asserted, each checking the OTHER message is absent. One arm alone would
+     * pass against a function that logs both messages every time.
+     */
+    it("logs a confirm-read failure under its own message, not as a failed retirement", async () => {
+      const seeded = await seed();
+      await withManager(seeded);
+      const state = { committedThenThrew: false, retireCalls: 0 };
+      const readSabotage = { value: false, fired: false };
+      const warn = vi.spyOn(logger, "warn").mockImplementation(() => logger);
+
+      // Arm the read failure as the SECOND retire statement is built, so the select it
+      // catches is the confirm read and nothing earlier in the dispatch.
+      const retireDb = dbWithCommitThenThrowOnFirstRetire(db, state, (call) => {
+        if (call === 2) readSabotage.value = true;
+      });
+
+      const actionId = await dispatchOntoPastHorizon(
+        dbWithFailingRecoveryActionRead(retireDb, readSabotage),
+        seeded,
+      );
+
+      expect(state.committedThenThrew).toBe(true);
+      expect(readSabotage.fired).toBe(true);
+      // The row is retired — the confirm READ is what failed, not the retirement.
+      expect(await readAction(actionId)).toMatchObject({
+        status: "escalated",
+        retiringBound: "timeout_horizon",
+      });
+
+      // THE assertion. The message names the half that is actually missing.
+      const messages = warn.mock.calls.map((call) => call[1]);
+      expect(messages).toContain("recovery wake retirement likely committed but could not be confirmed");
+      expect(messages).not.toContain("recovery wake retirement/refund failed after retry");
+
+      // No announce: the read that would have proved the retirement did not return. That is
+      // the conservative direction — the counter undercounts rather than reporting a
+      // retirement nobody confirmed — which is exactly why the log line has to be accurate.
+      const { body } = await renderMetrics();
+      expect(body).toContain(`${RECOVERY_HORIZON_EXPIRED_METRIC}{delivery="never_delivered"} 0`);
+      expect(body).toContain(`${RECOVERY_HORIZON_EXPIRED_METRIC}{delivery="delivered"} 0`);
+    });
+
+    it("logs a genuinely failed retirement under the retry message", async () => {
+      const seeded = await seed();
+      await withManager(seeded);
+      const warn = vi.spyOn(logger, "warn").mockImplementation(() => logger);
+
+      // BOTH attempts fail before the statement runs, so nothing commits and the confirm read
+      // is never reached. This is the arm the old single message described correctly, and it
+      // must keep that message.
+      const failingDb = dbWithRetireHook(db, () => () =>
+        Promise.reject(new Error("simulated retire failure")));
+
+      const actionId = await dispatchOntoPastHorizon(failingDb, seeded);
+
+      // Nothing was written: the retirement really did fail, which is what the message claims.
+      expect(await readAction(actionId)).toMatchObject({ status: "active", retiringBound: null });
+      const messages = warn.mock.calls.map((call) => call[1]);
+      expect(messages).toContain("recovery wake retirement/refund failed after retry");
+      expect(messages).not.toContain("recovery wake retirement likely committed but could not be confirmed");
     });
   });
 });

@@ -6840,38 +6840,33 @@ export function recoveryService(
       // call matches zero rows and resolves with no error. Reading the absence of a throw as
       // proof of retirement announced a retirement that had not happened — see that
       // function's doc comment for the three consequences.
-      let retirementCommitted = false;
+      //
+      // PEN-4033 (Ally review of #2703): it is also the row ITSELF, not a boolean. Everything
+      // the announce below needs — the bound the row carries, its status, its refunded
+      // attempt count — is read off whichever of the two sources could prove the retirement,
+      // never derived from `input.action`. See the gate for why that distinction has teeth.
+      // Structurally the intersection of the two sources — `RetiredWakeAttemptOutcome` from
+      // the UPDATE and `IssueRecoveryAction` from the confirm read — narrowed to the three
+      // fields the gate and the announce consume, so neither source can smuggle a field in.
+      let retiredRow: Pick<IssueRecoveryAction, "status" | "retiringBound" | "attemptCount"> | null = null;
       try {
-        retirementCommitted = await retireAndRefund();
+        retiredRow = await retireAndRefund();
       } catch (firstError) {
+        // Two failures with the same shape and opposite meanings, which is why they are
+        // caught separately rather than under one `catch` (PEN-4033). Collapsing them logged
+        // "retirement/refund failed after retry" for a confirm read that threw — a state in
+        // which the retry's UPDATE had already returned cleanly, so the most likely reading
+        // is that the row IS retired. Pointing an operator at the retirement half there is
+        // pointing them at the half that worked, and this subsystem exists because a horizon
+        // retirement can commit and then say nothing (PEN-3989).
+        let retryThrew = false;
         try {
-          retirementCommitted = await retireAndRefund();
-          if (!retirementCommitted) {
-            // The retry is for a transient database blip, and a blip can land AFTER the
-            // commit — the statement succeeded, the client never saw the reply. The retry's
-            // CAS then misses because the first call already decremented `attemptCount`, and
-            // reading that as "nothing happened" would re-introduce exactly the silence this
-            // row exists to end: the row IS retired, and neither the horizon sweep (gated on
-            // `status = 'active'`) nor the backstop (gated on `retiring_bound IS NULL`) can
-            // pick it up afterwards.
-            //
-            // One read disambiguates. It cannot distinguish our own first call from a racer
-            // that retired the row in the same window — but it does not need to: the
-            // pre-state conjunct below still holds, and announcing under a race costs at most
-            // a duplicate counter increment that the marker dedup keeps to one notice. That
-            // is the tolerance this call site already accepts, and it is strictly better than
-            // dropping the only announcement the row will ever get.
-            const confirmed = await recoveryActionsSvc.getActiveForIssue(
-              input.issue.companyId,
-              input.issue.id,
-            );
-            retirementCommitted = confirmed?.id === input.action.id
-              && confirmed.retiringBound === retiringBound;
-          }
-        } catch (secondError) {
+          retiredRow = await retireAndRefund();
+        } catch (retryError) {
+          retryThrew = true;
           logger.warn(
             {
-              err: secondError,
+              err: retryError,
               firstErr: firstError,
               companyId: input.issue.companyId,
               issueId: input.issue.id,
@@ -6882,6 +6877,50 @@ export function recoveryService(
             "recovery wake retirement/refund failed after retry",
           );
         }
+        if (!retryThrew && !retiredRow) {
+          // The retry is for a transient database blip, and a blip can land AFTER the
+          // commit — the statement succeeded, the client never saw the reply. The retry's
+          // CAS then misses because the first call already decremented `attemptCount`, and
+          // reading that as "nothing happened" would re-introduce exactly the silence this
+          // row exists to end: the row IS retired, and neither the horizon sweep (gated on
+          // `status = 'active'`) nor the backstop (gated on `retiring_bound IS NULL`) can
+          // pick it up afterwards.
+          //
+          // One read disambiguates. It cannot distinguish our own first call from a racer
+          // that retired the row in the same window — but it does not need to: the
+          // pre-state conjunct below still holds, and announcing under a race costs at most
+          // a duplicate counter increment that the marker dedup keeps to one notice. That
+          // is the tolerance this call site already accepts, and it is strictly better than
+          // dropping the only announcement the row will ever get.
+          try {
+            const confirmed = await recoveryActionsSvc.getActiveForIssue(
+              input.issue.companyId,
+              input.issue.id,
+            );
+            // PEN-4033: identity only. The bound comparison that used to live here has moved
+            // into the gate below, where it is applied to BOTH sources uniformly — and where
+            // it reads the row's bound rather than the one this call meant to write.
+            if (confirmed?.id === input.action.id) retiredRow = confirmed;
+          } catch (confirmError) {
+            logger.warn(
+              {
+                err: confirmError,
+                firstErr: firstError,
+                companyId: input.issue.companyId,
+                issueId: input.issue.id,
+                recoveryActionId: input.action.id,
+                attemptCount: input.action.attemptCount,
+                maxAttempts: input.action.maxAttempts,
+              },
+              // Deliberately NOT the message above. The retry's UPDATE resolved and reported
+              // no match, which is positive evidence that the first call committed and
+              // decremented `attemptCount`; what failed is the read that would have proved
+              // it. The announce is skipped either way — this records which half is missing,
+              // so the operator looks at the row rather than at the write.
+              "recovery wake retirement likely committed but could not be confirmed",
+            );
+          }
+        }
       }
       // PEN-3989: the third `timeout_horizon` writer, and it emitted neither observable
       // either. Same cause as the backstop gate above — see
@@ -6889,33 +6928,60 @@ export function recoveryService(
       //
       // Transition evidence here is TWO conjuncts, because neither is sufficient alone:
       //
-      //   - `retirementCommitted` — the UPDATE matched a row, so the reservation CAS (owner
-      //     plus attempt count) still held. Without it, a concurrent re-home silently makes
-      //     the statement a no-op and every announcement below is about a row that is still
-      //     `active`. This was the gap Ally found on #2607; see
-      //     `retireAndReleaseWakeAttempt`.
+      //   - `retiredRow` — the UPDATE matched a row (so the reservation CAS on owner plus
+      //     attempt count still held), or the confirm read found the row we were retiring.
+      //     Without it, a concurrent re-home silently makes the statement a no-op and every
+      //     announcement below is about a row that is still `active`. This was the gap Ally
+      //     found on #2607; see `retireAndReleaseWakeAttempt`.
       //   - `input.action.retiringBound === null` — the PRE-STATE read from moments earlier
       //     in this same dispatch. Needed because the UPDATE is deliberately idempotent
       //     (`coalesce` on the bound, a `CASE` on the status) so that a re-run still refunds:
-      //     a matched row does not by itself prove THIS call did the transition.
+      //     a matched row does not by itself prove THIS call did the transition. This is the
+      //     one conjunct that must stay pre-state — it is a claim ABOUT the pre-state.
+      //
+      // PEN-4033 (Ally review of #2703): everything else is read off `retiredRow`, and that
+      // is the fix, not a tidy-up. The bound used to come from the local ternary — our
+      // INTENT, computed from `input.action` before the write — so a racer that `coalesce`d
+      // `attempt_budget` in between left `matched` true and this path announced a
+      // `timeout_horizon` retirement the row does not carry. `retireAndReleaseWakeAttempt`
+      // now returns what the `coalesce` and the `CASE` actually resolved to, which makes this
+      // gate as exact as the backstop's (`retireWakeAction` returns a row only when its
+      // `retiring_bound IS NULL` guard matched, and its caller reads the returned bound).
+      // `status` is checked for the same reason: the `CASE` leaves a row that was already
+      // `escalated` alone, so a matched row is not proof of a transition to it.
       //
       // A racer landing between the pre-state read and the UPDATE can still make both paths
       // announce; the marker dedup inside the helper keeps that to one notice, and a
       // duplicate counter increment is harmless for a `> 0` alert.
       //
-      // `attemptCount` is adjusted because the refund has already landed: the row we are
-      // describing carries `greatest(attemptCount - 1, 0)`, not the reserved count still held
-      // in `input.action`. Announcing the unrefunded value would report `Attempts: 1` on a row
-      // that reads 0, and — worse — would flip `neverDelivered` to false and label a
-      // never-woken action as `delivered`, which is precisely the mislabel PEN-3000 exists to
-      // prevent.
-      if (retirementCommitted && isHorizonRetiringBound(retiringBound) && input.action.retiringBound === null) {
+      // `attemptCount` likewise comes from the row and not from `input.action`. The refund
+      // has already landed, so the row carries `greatest(attemptCount - 1, 0)` and announcing
+      // the unrefunded reserve would report `Attempts: 1` on a row that reads 0 — and, worse,
+      // flip `neverDelivered` to false and label a never-woken action as `delivered`, the
+      // mislabel PEN-3000 exists to prevent. The derived `- 1` that used to stand here was
+      // exact on the ordinary path (the CAS pins `attemptCount` to the reserved count) but
+      // NOT on the confirm arm, where a racer-caused CAS miss means our own reserve was never
+      // refunded and the row holds a different number entirely.
+      //
+      // PEN-4006: the bound is tested with `isHorizonRetiringBound` rather than against
+      // `timeout_horizon` alone, so the `pending_wake_ceiling` retirement is announced from
+      // this writer too — the observable depends on the transition, not on which writer
+      // committed it. Reading that test off `retiredRow` is what keeps it exact here: a racer
+      // can `coalesce` the row onto a bound this dispatch never asked for, and when that bound
+      // is `attempt_budget` the announce must NOT fire, which the local `retiringBound` (our
+      // intent) cannot see.
+      if (
+        retiredRow
+        && isHorizonRetiringBound(retiredRow.retiringBound)
+        && retiredRow.status === "escalated"
+        && input.action.retiringBound === null
+      ) {
         try {
           await announceRecoveryHorizonRetirement({
             ...input.action,
             status: "escalated",
-            retiringBound,
-            attemptCount: Math.max(input.action.attemptCount - 1, 0),
+            retiringBound: retiredRow.retiringBound,
+            attemptCount: retiredRow.attemptCount,
           }, { retiredBy: "stranded_recovery_wake_dispatch" });
         } catch (error) {
           logger.warn(
