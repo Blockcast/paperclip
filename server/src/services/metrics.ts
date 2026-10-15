@@ -1540,6 +1540,20 @@ export const PROCESS_MEMORY_COMPONENT_BYTES_METRIC = "paperclip_process_memory_c
 export const PROCESS_V8_CONTEXT_COUNT_METRIC = "paperclip_process_v8_context_count";
 
 /**
+ * Liveness of the 1 s heap-peak sampler (PEN-3314).
+ *
+ * The qualifier for the three `*_peak` components on
+ * {@link PROCESS_MEMORY_COMPONENT_BYTES_METRIC}. Those are the only series on
+ * this row whose LOW reading decides anything, and they are sampled on the
+ * event loop that the leak's step stalls -- so a flat peak has two readings
+ * with opposite conclusions, and this series is what separates them.
+ *
+ * Its own unit is a count, which is why it is not a label value on the
+ * `..._bytes` gauge.
+ */
+export const PROCESS_HEAP_PEAK_SAMPLES_METRIC = "paperclip_process_heap_peak_samples";
+
+/**
  * `setting` label of the series carrying the pool's OWN idle-in-transaction
  * bound (PEN-3365), published beside the inherited reading so a loosening is a
  * one-series comparison. Named once here so the help text, the startup wiring
@@ -3710,6 +3724,7 @@ let dbInheritedTimeout: Gauge<"setting" | "source"> | null = null;
 let processOpenFdsByClass: Gauge<"fd_class"> | null = null;
 let processMemoryComponentBytes: Gauge<"component"> | null = null;
 let processV8ContextCount: Gauge<"kind"> | null = null;
+let processHeapPeakSamples: Gauge | null = null;
 let pluginError: Gauge<"plugin_id" | "plugin_key"> | null = null;
 let crashRecoveryCandidateIndexPresent: Gauge<"index"> | null = null;
 let pluginMetric: Counter<
@@ -3873,6 +3888,7 @@ function ensureRegistry(): {
   processOpenFdsByClassGauge: Gauge<"fd_class">;
   processMemoryComponentBytesGauge: Gauge<"component">;
   processV8ContextCountGauge: Gauge<"kind">;
+  processHeapPeakSamplesGauge: Gauge;
   pluginErrorGauge: Gauge<"plugin_id" | "plugin_key">;
   crashRecoveryCandidateIndexPresentGauge: Gauge<"index">;
   pluginMetricCounter: Counter<
@@ -3999,6 +4015,7 @@ function ensureRegistry(): {
     || !processOpenFdsByClass
     || !processMemoryComponentBytes
     || !processV8ContextCount
+    || !processHeapPeakSamples
     || !pluginError
     || !crashRecoveryCandidateIndexPresent
     || !pluginMetric
@@ -4404,6 +4421,35 @@ function ensureRegistry(): {
       labelNames: ["kind"],
       registers: [registry],
     });
+    processHeapPeakSamples = new Gauge({
+      name: PROCESS_HEAP_PEAK_SAMPLES_METRIC,
+      help:
+        "Samples the 1s heap-peak sampler has folded in over this process's life (PEN-3314). "
+        + "Qualifies the heap_used_peak / heap_total_peak / external_peak components of "
+        + PROCESS_MEMORY_COMPONENT_BYTES_METRIC
+        + " -- the only series here whose LOW reading decides anything, since a flat "
+        + "external_peak is what sends the next instrument to malloc level instead of into "
+        + "server code. The sampler runs on the event loop, and the measured step STALLS the "
+        + "event loop (up was 0 at 2026-10-15T09:31Z while RSS gained 1096 MiB), so a peak that "
+        + "is flat because the sampler never ran during the burst is indistinguishable from one "
+        + "that is flat because nothing happened -- opposite conclusions. rate() over this "
+        + "series separates them: a healthy 1s sampler rates at ~1.0/s and a dip IS the stall, "
+        + "measured rather than inferred from a scrape that happened not to land. "
+        + "Monotonic within a process; on restart the series goes ABSENT and then reappears "
+        + "from a low count rather than stepping down, so read it with rate()/increase() and "
+        + "never as a level. An absent series means the sampler has not ticked yet; it is never "
+        + "published at 0, because the tracker reports nothing until its first sample. "
+        + "NOT an alert source on its own.",
+      registers: [registry],
+    });
+    // prom-client publishes a LABEL-LESS gauge as `name 0` the moment it is
+    // registered -- before anything has measured anything. For this series a 0
+    // is not a quiet default: rate() reads it as a permanently stalled event
+    // loop, which is the exact failure the series exists to detect. Drop it at
+    // construction so "the sampler has never run" is ABSENT from the first
+    // scrape onward, and so that property belongs to the metric rather than to
+    // the order in which `/metrics` happens to call its refreshers.
+    processHeapPeakSamples.remove();
     agentStartLockHeldSeconds = new Gauge({
       name: AGENT_START_LOCK_HELD_SECONDS_METRIC,
       help:
@@ -5776,6 +5822,7 @@ function ensureRegistry(): {
     processOpenFdsByClassGauge: processOpenFdsByClass,
     processMemoryComponentBytesGauge: processMemoryComponentBytes,
     processV8ContextCountGauge: processV8ContextCount,
+    processHeapPeakSamplesGauge: processHeapPeakSamples,
     pluginErrorGauge: pluginError,
     crashRecoveryCandidateIndexPresentGauge: crashRecoveryCandidateIndexPresent,
     pluginMetricCounter: pluginMetric,
@@ -6718,12 +6765,31 @@ export function setNativeMemoryMetrics(snapshot: NativeMemorySnapshot | null): v
   const metrics = ensureRegistry();
   metrics.processMemoryComponentBytesGauge.reset();
   metrics.processV8ContextCountGauge.reset();
+  // `remove()`, NOT `reset()`, and the difference is the whole point of the
+  // series. prom-client renders a LABEL-LESS gauge as `name 0` from the moment
+  // it is registered, and `reset()` returns it to that same 0 -- so a sampler
+  // that has never run would publish a flat zero, which rate() reads as a
+  // permanently stalled event loop. That is the measured-versus-unmeasurable
+  // conflation this whole module exists to avoid, and it is reachable here in a
+  // way it is not on the labelled gauges above, where `reset()` does drop the
+  // series. `remove()` deletes it outright, so absent stays absent.
+  //
+  // Safe because `refreshNativeMemoryMetrics()` runs INLINE on the `/metrics`
+  // handler immediately before `renderMetrics()` (app.ts), so no scrape can
+  // observe the registration-time 0 before this function has removed or set it.
+  metrics.processHeapPeakSamplesGauge.remove();
   if (!snapshot) return;
   for (const [component, bytes] of snapshot.components) {
     metrics.processMemoryComponentBytesGauge.set({ component }, bytes);
   }
   for (const [kind, count] of snapshot.contexts) {
     metrics.processV8ContextCountGauge.set({ kind }, count);
+  }
+  // `null` means the sampler has never ticked, so publish nothing. Zero is not
+  // an available reading here (the tracker returns null until its first
+  // sample), which is what keeps "absent" unambiguous.
+  if (snapshot.heapPeakSampleCount !== null) {
+    metrics.processHeapPeakSamplesGauge.set(snapshot.heapPeakSampleCount);
   }
 }
 
@@ -8206,6 +8272,7 @@ export function __resetMetricsForTest(): void {
   processOpenFdsByClass = null;
   processMemoryComponentBytes = null;
   processV8ContextCount = null;
+  processHeapPeakSamples = null;
   processLostTotal = null;
   externalLifecycleRunningRuns = null;
   externalLifecycleRunSilenceGap = null;

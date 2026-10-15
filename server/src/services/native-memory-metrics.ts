@@ -133,6 +133,35 @@ export interface NativeMemorySnapshot {
   components: ReadonlyMap<string, number>;
   /** Context kind -> count. */
   contexts: ReadonlyMap<string, number>;
+  /**
+   * Samples the 1 s heap-peak sampler has folded in over this process's life,
+   * or `null` when it has never run.
+   *
+   * Deliberately NOT a {@link components} entry: that map is published on a
+   * `..._bytes` gauge and this is a count, so putting it there would make the
+   * metric's unit a lie for one label value. It gets its own series instead.
+   *
+   * ## Why it is published at all
+   *
+   * The three peak components are the only series on this row whose *low*
+   * reading is load-bearing: `external_peak` flat near its scrape value is what
+   * sends the next instrument to malloc level instead of into server code. But
+   * the peaks are sampled by an `unref()`d 1 s timer on the event loop, and the
+   * event loop is exactly what the measured step stalls -- `up{pod="paperclip-0"}`
+   * was **0** at 09:31Z on 2026-10-15 while RSS gained 1096 MiB. A sampler that
+   * did not run during the burst reports a flat peak for the same reason a
+   * sampler that ran 18 000 times and found nothing does, and the two carry
+   * opposite conclusions.
+   *
+   * `rate()` over this series answers that in one query: a healthy 1 s sampler
+   * rates at ~1.0/s, and a dip is the stall, measured rather than inferred from
+   * a scrape that happened not to land.
+   *
+   * ⚠ Absence of the series means the sampler never started -- distinct from a
+   * published 0, which this never is (the tracker returns `null` until the first
+   * sample, so there is no count to publish before then).
+   */
+  heapPeakSampleCount: number | null;
 }
 
 /** Subset of `v8.getHeapStatistics()` this module reads. Every field is optional by Node version. */
@@ -243,6 +272,10 @@ export function collectNativeMemorySnapshot(
   // reading. A `null` here means the sampler is not running: publish nothing,
   // never a zero, for the reason given on `readHeapPeaks`.
   const peaks = readPeaks();
+  // Null until the sampler's first tick; see `heapPeakSampleCount`. Read out of
+  // the same reading as the peaks so the count can never describe a different
+  // sampler state than the values it qualifies.
+  const heapPeakSampleCount = peaks && finite(peaks.sampleCount) ? peaks.sampleCount : null;
   if (peaks) {
     components.set(HEAP_USED_PEAK_COMPONENT, peaks.usedPeakBytes);
     components.set(HEAP_TOTAL_PEAK_COMPONENT, peaks.totalPeakBytes);
@@ -265,5 +298,5 @@ export function collectNativeMemorySnapshot(
   // native memory, so report it as unmeasurable instead.
   if (components.size === 0 && contexts.size === 0) return null;
 
-  return { components, contexts };
+  return { components, contexts, heapPeakSampleCount };
 }
