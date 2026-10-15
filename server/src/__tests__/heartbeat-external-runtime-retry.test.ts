@@ -1813,6 +1813,8 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
       reservationState: null,
     });
     expect((overdue[0][0] as { silentForMs: number }).silentForMs).toBeGreaterThanOrEqual(20 * 60 * 1000);
+    // No row, no release clock.
+    expect(overdue[0][0]).toMatchObject({ releasePendingForMs: null });
   }, 120_000);
 
   it.each([
@@ -1877,7 +1879,12 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
 
     // Fails on the parent commit: run silence alone sent it to the catch.
     expect(mismatches).toEqual([]);
-    expect([...skips, ...overdue]).toHaveLength(1);
+    // And at debug, not warn: the warn was keyed on run silence too.
+    expect(overdue).toEqual([]);
+    expect(skips).toHaveLength(1);
+    const releasePendingForMs = (skips[0][0] as { releasePendingForMs: number }).releasePendingForMs;
+    expect(releasePendingForMs).toBeGreaterThanOrEqual(0);
+    expect(releasePendingForMs).toBeLessThan(15 * 60 * 1000);
   }, 120_000);
 
   it("still logs an active Job at error once its release has been pending past the stale window (BLO-29133)", async () => {
