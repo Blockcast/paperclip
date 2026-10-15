@@ -13,6 +13,29 @@ import type {
 export const ACTIVE_RECOVERY_ACTION_STATUSES = ["active", "escalated"] as const satisfies readonly IssueRecoveryActionStatus[];
 
 /**
+ * The post-UPDATE shape of the row `retireAndReleaseWakeAttempt` matched, or `null` when its
+ * reservation CAS matched nothing.
+ *
+ * PEN-4033 (Ally review of #2703): this used to be a bare `boolean`, and a `true` told the
+ * caller only that SOME row matched — never what that row ended up carrying. The caller then
+ * described the retirement from its own pre-state: the bound from a ternary over
+ * `input.action`, and the attempt count from `attemptCount - 1`. Both are read-before-write
+ * values, so a racer landing in between made the announcement describe a row that does not
+ * exist. These three fields are what the statement actually wrote, so the caller can gate and
+ * announce on the row instead of on its memory of it.
+ *
+ * Postgres `RETURNING` yields POST-update values, which is the whole point: `retiringBound`
+ * comes back as the `coalesce` result (a racer's bound if one got there first, ours
+ * otherwise), `status` as the `CASE` result, and `attemptCount` as the refunded count.
+ */
+export type RetiredWakeAttemptOutcome = {
+  id: string;
+  status: IssueRecoveryActionStatus;
+  retiringBound: IssueRecoveryActionRetiringBound | null;
+  attemptCount: number;
+};
+
+/**
  * Recovery-action statuses that still hold a live repair path, for the purpose of
  * suppressing blocked-issue auto-resume.
  *
@@ -980,8 +1003,8 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
   }
 
   /**
-   * Returns whether the UPDATE matched a row, i.e. whether the reservation CAS below still
-   * held when the statement ran.
+   * Returns the POST-UPDATE row when the reservation CAS below still held, `null` when it
+   * matched nothing.
    *
    * PEN-3989 (Ally review of #2607): this used to return `void`, and the only caller read
    * "the call did not throw" as proof the row had been retired. It is not. The predicate is a
@@ -992,9 +1015,11 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
    * alert, a source-row notice claiming a still-`active` row had moved to `escalated`, and a
    * dedup marker that makes the REAL retirement's notice look like a duplicate later.
    *
-   * `false` means "this call changed nothing"; it does NOT distinguish a matched row that the
-   * SQL-level idempotency below left untransitioned (a re-run) from one it transitioned. The
-   * caller supplies that half from the pre-state it already holds.
+   * `null` means "this call changed nothing". A returned row does NOT by itself distinguish a
+   * match the SQL-level idempotency below left untransitioned (a re-run) from one it
+   * transitioned — the caller supplies that half from the pre-state it already holds. What
+   * the returned row DOES settle is what the row now carries, which the caller could
+   * previously only guess at; see `RetiredWakeAttemptOutcome`.
    */
   async function retireAndReleaseWakeAttempt(input: {
     companyId: string;
@@ -1002,7 +1027,7 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
     expectedOwnerAgentId: string;
     expectedAttemptCount: number;
     retiringBound: IssueRecoveryActionRetiringBound;
-  }): Promise<boolean> {
+  }): Promise<RetiredWakeAttemptOutcome | null> {
     // Retiring and refunding must share one statement. Splitting them lets a sweep observe a
     // row whose status advanced without its reserved attempt coming back, which reopens the
     // exhausted action.
@@ -1035,8 +1060,27 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
         eq(issueRecoveryActions.attemptCount, input.expectedAttemptCount),
         inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
       ))
-      .returning({ id: issueRecoveryActions.id });
-    return matched.length > 0;
+      // PEN-4033: `status` and `attemptCount` ride along with `retiringBound` because all
+      // three are rewritten by expressions whose result the caller cannot compute. `status`
+      // is a `CASE` that leaves a non-`active` row alone, and `attemptCount` is a
+      // `greatest(... - 1, 0)` over whatever the row held when the statement ran, not over
+      // the count the caller reserved.
+      .returning({
+        id: issueRecoveryActions.id,
+        status: issueRecoveryActions.status,
+        retiringBound: issueRecoveryActions.retiringBound,
+        attemptCount: issueRecoveryActions.attemptCount,
+      });
+    const [retired] = matched;
+    if (!retired) return null;
+    // Same widening cast `toReadModel` applies: these columns are `text` in the schema, so
+    // drizzle types them `string`, and the enum union lives only in the shared types.
+    return {
+      id: retired.id,
+      status: retired.status as IssueRecoveryActionStatus,
+      retiringBound: retired.retiringBound as IssueRecoveryActionRetiringBound | null,
+      attemptCount: retired.attemptCount,
+    };
   }
 
   async function retireWakeAction(input: {
