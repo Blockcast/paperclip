@@ -11630,7 +11630,7 @@ export function issueRoutes(
       projectId: createBody.projectId ?? null,
       executionPolicy,
     }, actor);
-    let deduplicationReason: "idempotency_key" | "recent_open_title" | "pr_review_target" | null = null;
+    let deduplicationReason: "idempotency_key" | "recent_open_title" | "pr_review_target" | "pr_review_target_stale" | null = null;
     const issue = await svc.create(companyId, {
       ...createBody,
       ...(taskBridgeOriginForActor(req) ?? {}),

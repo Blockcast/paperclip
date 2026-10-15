@@ -317,7 +317,12 @@ export function parsePullRequestRefs(...texts: Array<string | null | undefined>)
  * number — narrow on purpose, because a dedupe hit rewrites the existing row's
  * title and description.
  */
-const CANONICAL_REVIEW_TITLE_PATTERN = /^Review \S+ PR #(\d+) exact head [0-9a-f]{7,40}\b/;
+const CANONICAL_REVIEW_TITLE_PATTERN = /^Review \S+ PR #(\d+) exact head ([0-9a-f]{7,40})\b/;
+
+/** The head SHA (possibly abbreviated) a canonical review title names, else null. */
+export function canonicalReviewTitleHeadSha(title: string | null | undefined): string | null {
+  return CANONICAL_REVIEW_TITLE_PATTERN.exec(title ?? "")?.[2] ?? null;
+}
 
 export function inferPrReviewTargetFromCanonicalTitle(
   candidate: Pick<DuplicatePrReviewIssueCandidate, "assigneeAgentId" | "title" | "description">,

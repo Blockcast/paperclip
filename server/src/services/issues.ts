@@ -124,6 +124,7 @@ import { instanceSettingsService, readInstanceSettingsOn } from "./instance-sett
 import {
   assertNotDuplicatePrReviewIssue,
   inferPrReviewTargetFromCanonicalTitle,
+  canonicalReviewTitleHeadSha,
   lockPrReviewIssueScopes,
   normalizePrReviewRepoFullName,
 } from "./pr-review-duplicate-issue-guard.js";
@@ -1173,7 +1174,7 @@ type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId"> & {
   idempotencyKey?: string | null;
   allowDuplicate?: boolean;
   prReviewTarget?: { repoFullName: string; prNumber: number } | null;
-  onDeduplicated?: (reason: "idempotency_key" | "recent_open_title" | "pr_review_target") => void;
+  onDeduplicated?: (reason: "idempotency_key" | "recent_open_title" | "pr_review_target" | "pr_review_target_stale") => void;
   beforeSideEffects?: (tx: DbTransaction) => Promise<void> | void;
   /**
    * Fencing generation the caller must still hold for this create to run. Set
@@ -10338,7 +10339,7 @@ export function issueService(db: Db) {
         }
 
         let existingIssue: typeof issues.$inferSelect | undefined;
-        let deduplicationReason: "idempotency_key" | "recent_open_title" | "pr_review_target" | null = null;
+        let deduplicationReason: "idempotency_key" | "recent_open_title" | "pr_review_target" | "pr_review_target_stale" | null = null;
         if (idempotencyKey) {
           const idempotencyKeyRetentionCutoff = new Date(Date.now() - ISSUE_CREATE_IDEMPOTENCY_KEY_RETENTION_MS);
           await tx.execute(sql`
@@ -10377,7 +10378,28 @@ export function issueService(db: Db) {
               notInArray(issues.status, ["done", "cancelled"]),
             ))
             .limit(1);
-          if (existingIssue) {
+          // BLO-46886: a late or replayed request for an OLDER head must not
+          // retarget the row backwards onto a dead SHA. Only when the incoming
+          // head differs from the row's do we ask GitHub; fail open (retarget)
+          // when GitHub cannot answer, which is the pre-guard behaviour.
+          const incomingHead = canonicalReviewTitleHeadSha(issueData.title);
+          let staleHead = false;
+          if (existingIssue && incomingHead && !existingIssue.title.includes(incomingHead)) {
+            const liveHead = await githubFetchPrHeadSha({
+              repoFullName: prReviewTarget!.repoFullName,
+              prNumber: prReviewTarget!.prNumber,
+              signal: AbortSignal.timeout(5_000),
+            }).catch(() => null);
+            staleHead = !!liveHead && !liveHead.toLowerCase().startsWith(incomingHead);
+            if (staleHead) {
+              logger.warn(
+                { issueId: existingIssue.id, prReviewFingerprint, incomingHead, liveHead },
+                "pr_review dedupe ignored a stale-head filing",
+              );
+              deduplicationReason = "pr_review_target_stale";
+            }
+          }
+          if (existingIssue && !staleHead) {
             [existingIssue] = await tx
               .update(issues)
               .set({
