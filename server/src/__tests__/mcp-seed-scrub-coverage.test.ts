@@ -188,6 +188,16 @@ type SeedEntry = { type?: string; url?: string; command?: string; args?: string[
  * baseline entry (PEN-2428 step 3). Dropping the substitution would make the
  * next such entry a JSON parse error at best and a silently unclassified
  * upstream at worst.
+ *
+ * PEN-3840 added a second interpolation family on the same footing: Helm
+ * template actions. The `github` upstream's command is now
+ * `{{ include "paperclip.imageWrapperBinDir" . }}/github-mcp-server`, and the
+ * quotes INSIDE that action end the JSON string early — the seed stopped
+ * parsing here the moment the chart named a directory through a helper rather
+ * than a shell variable. They normalise to `<helm:NAME>` for the same reason
+ * `${VAR}` normalises to `<shell:NAME>`: the concrete value is known at render
+ * time, not from this file, and an entry whose value we cannot pin must stay
+ * classified rather than disappear.
  */
 function readSeededMcpServers(): Record<string, SeedEntry | string> {
   const source = readFileSync(statefulSetPath, "utf8");
@@ -209,7 +219,16 @@ function readSeededMcpServers(): Record<string, SeedEntry | string> {
     // bare value position: `"name": ${VAR}` -> a quoted sentinel
     .replace(/:\s*\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, ': "<shell:$1>"')
     // remaining interpolations are already inside quotes
-    .replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, "<shell:$1>");
+    .replace(/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/g, "<shell:$1>")
+    // bare value position: `"name": {{ ... }}` -> a quoted sentinel. Ordered
+    // before the in-string rule for the same reason the shell pair is.
+    .replace(/:\s*\{\{-?\s*include\s+"([A-Za-z0-9_.-]+)"[^}]*\}\}/g, ': "<helm:$1>"')
+    .replace(/:\s*\{\{[\s\S]*?\}\}/g, ': "<helm:action>"')
+    // in-string actions. `include "name"` keeps the helper's name so a reader
+    // can tell two different directories apart; anything else collapses to one
+    // sentinel rather than being dropped, which would read as a literal value.
+    .replace(/\{\{-?\s*include\s+"([A-Za-z0-9_.-]+)"[^}]*\}\}/g, "<helm:$1>")
+    .replace(/\{\{[\s\S]*?\}\}/g, "<helm:action>");
 
   const parsed = JSON.parse(normalised) as { mcpServers?: Record<string, SeedEntry | string> };
   if (!parsed.mcpServers) throw new Error("shared MCP seed has no mcpServers block");
@@ -226,8 +245,9 @@ function hostOf(entry: SeedEntry | string): string | null {
  * Every URL that appears literally in a chunk of the init script, split into the
  * ones we can pin to a host and the ones we cannot.
  *
- * Anything still carrying an unexpanded `${VAR}` / `<shell:VAR>` is reported as
- * *unresolved* rather than guessed at. Callers treat a non-empty `unresolved` as
+ * Anything still carrying an unexpanded `${VAR}` / `<shell:VAR>`, or a Helm
+ * action / `<helm:NAME>` sentinel, is reported as *unresolved* rather than
+ * guessed at. Callers treat a non-empty `unresolved` as
  * a failure: an upstream whose host is not knowable from this repo cannot be
  * asserted to be off the gateway, and "cannot tell" must not read as "fine".
  */
@@ -236,7 +256,12 @@ function urlsIn(text: string): { hosts: string[]; unresolved: string[] } {
   const unresolved: string[] = [];
   for (const match of text.matchAll(/https?:\/\/[^\s"'`\\)]+/g)) {
     const raw = match[0]!;
-    if (raw.includes("${") || raw.includes("<shell:")) {
+    if (
+      raw.includes("${") ||
+      raw.includes("<shell:") ||
+      raw.includes("{{") ||
+      raw.includes("<helm:")
+    ) {
       unresolved.push(raw);
       continue;
     }

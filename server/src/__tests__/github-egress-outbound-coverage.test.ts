@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
@@ -30,14 +30,24 @@ import {
  *
  * ## What this table binds
  *
- * The Helm init script writes a small launcher into `${LOCAL_BIN}` for every
- * GitHub-touching binary in the agent sandbox, and `${LOCAL_BIN}` is first on
- * the PATH of every agent Job. Those launchers are the complete set of
- * interposition points available to us, so they are the complete set of places
- * an outbound control can live. This table requires each one to be classified,
- * and — for the ones claimed as controlled — asserts the launcher actually
- * still execs its egress runtime. Deleting the control from a wrapper fails
- * here.
+ * `docker/github-wrappers/` holds a small launcher for every GitHub-touching
+ * binary in the agent sandbox. The `Dockerfile` installs that directory
+ * root-owned at `/usr/local/libexec/paperclip/bin`, and the chart puts that
+ * directory first on the PATH of every agent Job. Those launchers are the
+ * complete set of interposition points available to us, so they are the
+ * complete set of places an outbound control can live. This table requires each
+ * one to be classified, and — for the ones claimed as controlled — asserts the
+ * launcher actually still execs its egress runtime. Deleting the control from a
+ * wrapper fails here.
+ *
+ * PEN-3840 moved this table's source of truth. It used to derive the launcher
+ * set from the Helm seed heredocs, back when the chart wrote a second,
+ * agent-writable copy of each wrapper onto the shared PVC. That generation is
+ * retired — uid 1000 wrote it and uid 1000 consumed it, so PATH ordering could
+ * not protect it — and `docker/github-wrappers/` is now the single source. Do
+ * not point this back at the chart: a seed that writes a wrapper again is a
+ * regression, and `deploy/helm/paperclip/tests/agent-egress-path.test.mjs`
+ * asserts the chart writes none.
  *
  * Note that "controlled" covers two different mechanisms, and the `Coverage`
  * union keeps them apart on purpose: `egress-scrubbed` rewrites the payload in
@@ -71,6 +81,12 @@ import {
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
 const statefulSetPath = path.join(repoRoot, "deploy/helm/paperclip/templates/statefulset.yaml");
+/** The single source of truth for the sandbox launchers, as the image ships them. */
+const wrappersDirectory = path.join(repoRoot, "docker/github-wrappers");
+const dockerfilePath = path.join(repoRoot, "Dockerfile");
+const helpersPath = path.join(repoRoot, "deploy/helm/paperclip/templates/_helpers.tpl");
+/** Where the Dockerfile installs `wrappersDirectory`, and what the chart leads PATH with. */
+const IMAGE_WRAPPER_BIN = "/usr/local/libexec/paperclip/bin";
 const servicesDirectory = path.join(repoRoot, "server/src/services");
 const serverSourceDirectory = path.join(repoRoot, "server/src");
 
@@ -111,7 +127,7 @@ type Coverage =
   | { kind: "not-an-authored-text-path"; why: string };
 
 /**
- * Every launcher the Helm seed writes into `${LOCAL_BIN}`.
+ * Every launcher `docker/github-wrappers/` ships into the image.
  *
  * Keep this exhaustive. If you are here because the suite failed after you
  * added a wrapper, that is this test working: choose a `kind` and say why.
@@ -142,7 +158,7 @@ const WRAPPER_COVERAGE: Readonly<Record<string, Coverage>> = {
     // publishes, so spending that escape hatch here would put a false claim
     // inside a security control. Note the scanner matches `git-push` and
     // `git_push` too, so hyphenating is not a way around it.
-    why: "guarded by github-git-egress-runtime.js, which the seed puts on BOTH interposition points: the ${LOCAL_BIN}/git launcher (inside the token wrapper, so credentials still reach it) and a pre-push hook it injects via core.hooksPath. It scans the outgoing commit range — messages, added file content including binary/textconv-laundered paths, and annotated tag messages — and refuses the publish naming the offending object and class, rather than rewriting it, because commit objects are content-addressed and altering one changes every downstream SHA. Failed reads refuse rather than pass unscanned. The hook covers the porcelain publish verb ONLY, because it is the only one git runs a pre-push hook for; the plumbing verbs that publish without consulting it (send-pack, http-push) are refused outright by the wrapper, which enforces by an allowlist of verbs known not to publish, so an unrecognised verb refuses rather than passing through unscanned",
+    why: "guarded by github-git-egress-runtime.js, which sits on BOTH interposition points: the image git launcher (inside the token wrapper, so credentials still reach it) and a pre-push hook the launcher injects via core.hooksPath, which the chart seeds onto the shared PVC. It scans the outgoing commit range — messages, added file content including binary/textconv-laundered paths, and annotated tag messages — and refuses the publish naming the offending object and class, rather than rewriting it, because commit objects are content-addressed and altering one changes every downstream SHA. Failed reads refuse rather than pass unscanned. The hook covers the porcelain publish verb ONLY, because it is the only one git runs a pre-push hook for; the plumbing verbs that publish without consulting it (send-pack, http-push) are refused outright by the wrapper, which enforces by an allowlist of verbs known not to publish, so an unrecognised verb refuses rather than passing through unscanned",
   },
   "paperclip-github-token-env": {
     kind: "not-an-authored-text-path",
@@ -200,39 +216,56 @@ const SERVER_WRITE_COVERAGE: Readonly<Record<string, Coverage>> = {
   },
 };
 
-/** The init-script region that writes the sandbox launchers. */
+/**
+ * The launcher set, read from the directory the image installs.
+ *
+ * `.md` is excluded to match the `Dockerfile` COPY, which excludes it by the
+ * same glob — so this enumerates exactly the files that land executable in
+ * `IMAGE_WRAPPER_BIN`, not merely the files in the directory.
+ */
 function readWrapperNames(): string[] {
-  const source = readFileSync(statefulSetPath, "utf8");
-  const names = [...source.matchAll(/cat > "\$\{LOCAL_BIN\}\/([A-Za-z0-9._-]+)" <<'EOF'/g)].map(
-    (match) => match[1] as string,
-  );
+  const names = readdirSync(wrappersDirectory)
+    .filter((entry) => !entry.endsWith(".md"))
+    .sort();
   if (names.length === 0) {
     throw new Error(
-      `Found no \${LOCAL_BIN} launchers in ${statefulSetPath}. If the seed moved, point this ` +
-        "test at its new home rather than deleting it — PEN-3152 exists because an outbound " +
-        "egress door went unenumerated behind a table that only covered the inbound leg.",
+      `Found no launchers in ${wrappersDirectory}. If the wrappers moved, point this test at ` +
+        "their new home rather than deleting it — PEN-3152 exists because an outbound egress " +
+        "door went unenumerated behind a table that only covered the inbound leg.",
     );
   }
   return names;
 }
 
-/** The body of one launcher heredoc, so its exec line can be asserted. */
-function readWrapperBody(name: string): string {
-  const source = readFileSync(statefulSetPath, "utf8");
-  const marker = `cat > "\${LOCAL_BIN}/${name}" <<'EOF'`;
+/** The body of one `{{- define "name" -}} ... {{- end }}` block in _helpers.tpl. */
+function helperBody(source: string, name: string): string {
+  const marker = `{{- define "${name}" -}}`;
   const markerAt = source.indexOf(marker);
-  expect(markerAt, `launcher ${name} not found in the seed`).toBeGreaterThanOrEqual(0);
-  const bodyStart = source.indexOf("\n", markerAt) + 1;
-  const bodyEnd = source.indexOf("\n              EOF", bodyStart);
-  expect(bodyEnd, `launcher ${name} heredoc is not terminated as expected`).toBeGreaterThan(
-    bodyStart,
-  );
-  return source.slice(bodyStart, bodyEnd);
+  expect(markerAt, `${name} is no longer defined in ${helpersPath}`).toBeGreaterThanOrEqual(0);
+  const bodyStart = markerAt + marker.length;
+  const bodyEnd = source.indexOf("{{- end }}", bodyStart);
+  expect(bodyEnd, `${name} is not terminated as expected`).toBeGreaterThan(bodyStart);
+  return source.slice(bodyStart, bodyEnd).trim();
 }
 
+/** The body of one launcher, so its exec line can be asserted. */
+function readWrapperBody(name: string): string {
+  const file = path.join(wrappersDirectory, name);
+  expect(existsSync(file), `launcher ${name} is not in ${wrappersDirectory}`).toBe(true);
+  return readFileSync(file, "utf8");
+}
+
+/**
+ * The `github` upstream's command, as the seeded `.mcp.json` carries it.
+ *
+ * The capture runs to the end of the line rather than to the next `"`, because
+ * since PEN-3840 the value is a Helm `include` and so contains quotes of its
+ * own. A `[^"]+` capture silently truncates it to `{{ include ` and the
+ * comparison below then fails for the wrong reason.
+ */
 function readSeededGitHubMcpCommand(): string {
   const source = readFileSync(statefulSetPath, "utf8");
-  const match = /"github":\s*\{\s*"command":\s*"([^"]+)"/.exec(source);
+  const match = /"github":\s*\{\s*"command":\s*"(.+)",\s*$/m.exec(source);
   expect(match, "the seeded mcpServers block no longer has a github command").not.toBeNull();
   return (match as RegExpExecArray)[1] as string;
 }
@@ -275,7 +308,7 @@ function scannedServerFilesWritingToGitHub(): string[] {
 
 describe("outbound GitHub egress coverage", () => {
   describe("sandbox launchers", () => {
-    it("classifies every launcher the seed writes", () => {
+    it("classifies every launcher the image ships", () => {
       const seeded = readWrapperNames().sort();
       const classified = Object.keys(WRAPPER_COVERAGE).sort();
       expect(seeded).toEqual(classified);
@@ -361,13 +394,36 @@ describe("outbound GitHub egress coverage", () => {
 
     it("publishes the guarded launcher on the default PATH", () => {
       // Without this the guard is decorative, and that is measured rather
-      // than theoretical: before PEN-3156, ${LOCAL_BIN}/git existed while a
+      // than theoretical: before PEN-3156 a `git` launcher existed while a
       // live agent Job pod resolved `command -v git` to /usr/bin/git, because
-      // ${LOCAL_BIN} is only prepended to PATH by a LOGIN shell and agent
-      // tool harnesses spawn non-login shells. Same defect PEN-2527 fixed for
-      // the gh wrapper — a choke point nothing traverses.
-      const source = readFileSync(statefulSetPath, "utf8");
-      expect(source).toContain('ln -sf "${LOCAL_BIN}/git" "${PATH_BIN}/git"');
+      // the directory holding it was only prepended to PATH by a LOGIN shell
+      // and agent tool harnesses spawn non-login shells. Same defect PEN-2527
+      // fixed for the gh wrapper — a choke point nothing traverses.
+      //
+      // Two halves, and either alone leaves the launcher unreachable. The
+      // Dockerfile has to install the directory, and the chart has to lead
+      // PATH with it. PEN-3840 replaced a single `ln -sf` assertion here: the
+      // chart used to publish the guarded launcher by symlinking a PVC copy
+      // into ${BASE}/bin, and that copy was writable by the uid that consumed
+      // it. The ORDERING of the rendered PATH is pinned in the chart's own
+      // suite (deploy/helm/paperclip/tests/agent-egress-path.test.mjs), which
+      // can render; this asserts the two links in the chain that a server-side
+      // test can see without helm.
+      const dockerfile = readFileSync(dockerfilePath, "utf8");
+      expect(
+        dockerfile,
+        `the image no longer installs ${wrappersDirectory} at ${IMAGE_WRAPPER_BIN}`,
+      ).toContain(`docker/github-wrappers/ ${IMAGE_WRAPPER_BIN}/`);
+
+      const helpers = readFileSync(helpersPath, "utf8");
+      expect(
+        helperBody(helpers, "paperclip.imageWrapperBinDir").trim(),
+        "the chart's image wrapper directory no longer matches the Dockerfile install path",
+      ).toBe(IMAGE_WRAPPER_BIN);
+      expect(
+        helperBody(helpers, "paperclip.wrapperBinDirs"),
+        "the wrapper PATH list no longer leads with the root-owned image directory",
+      ).toMatch(/^\{\{-\s*include\s+"paperclip\.imageWrapperBinDir"/m);
     });
   });
 
@@ -378,17 +434,28 @@ describe("outbound GitHub egress coverage", () => {
       // scrub while leaving every wrapper assertion above green.
       //
       // PEN-3713 moved the other four wrappers into the image but deliberately
-      // left this one dialling the PVC copy. The command is ABSOLUTE, so PATH
-      // ordering cannot absorb a skew, and the seed that writes it runs in the
-      // server pod while the file is read by agent Job pods on an
-      // independently pinned image — so the server carrying a root-owned
-      // wrapper is no evidence the agent does. It reaches LOCAL_BIN rather than
-      // a hardcoded /paperclip so it tracks persistence.mountPath, exactly as
-      // the seed's own wrapper install does.
-      expect(readSeededGitHubMcpCommand()).toBe("${LOCAL_BIN}/github-mcp-server");
+      // left this one dialling the PVC copy, because the command is ABSOLUTE —
+      // PATH ordering cannot absorb a skew — and the seed that writes it runs
+      // in the server pod while the file is read by agent Job pods on an
+      // independently pinned image, so the server carrying a root-owned wrapper
+      // was no evidence the agent did. PEN-3840 is the change whose entry gate
+      // is exactly that evidence (every agent image measured descended from
+      // bb62073a), so the command now names the root-owned image copy.
+      //
+      // Asserted structurally rather than against the literal template text:
+      // the EXACT rendered value is pinned in the chart's own suite, which can
+      // render. What matters here is that the name resolves into the
+      // root-owned directory and not back onto an agent-writable one.
+      const command = readSeededGitHubMcpCommand();
+      expect(command).toContain("paperclip.imageWrapperBinDir");
+      expect(command.endsWith("/github-mcp-server"), `unexpected command ${command}`).toBe(true);
+      // The regression guard, pointing the other way now: a PVC path here
+      // would be a file uid 1000 can rewrite, dialled by absolute path.
+      expect(command).not.toContain("LOCAL_BIN");
+      expect(command).not.toContain(".local/bin");
     });
 
-    it("is a wrapper the seed actually writes", () => {
+    it("is a wrapper the image actually ships", () => {
       const command = readSeededGitHubMcpCommand();
       expect(readWrapperNames()).toContain(path.basename(command));
     });
