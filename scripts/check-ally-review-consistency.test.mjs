@@ -49,6 +49,7 @@ import {
   retiredFindingKeys,
   sameLaneBodyRelation,
   scopeSummary,
+  supersedingAttestation,
   violationFingerprint,
 } from "./check-ally-review-consistency.mjs";
 
@@ -1920,6 +1921,119 @@ describe("I2d — APPROVED with no attestation line", () => {
       findPrViolations({ number: 1, headSha: HEAD, reviews }).filter((v) => v.startsWith("I2d")),
       [],
     );
+  });
+});
+
+describe("I3 — a re-anchored review superseded at the current head", () => {
+  // paperclip#2734: 5522968987 approved 3c07bb4d; a push re-anchored it onto
+  // b588cce8, and Ally then approved b588cce8 as 5527537503. GitHub reads the
+  // reviewer's latest review, so the first one backs nothing — yet it held the
+  // guard red, as #2388 and #2698 had until they merged.
+  const STALE_ID = 5522968987;
+  const FRESH_ID = 5527537503;
+  const THIRD = "c".repeat(40);
+  const human = { login: "kkroo", is_bot: false };
+  const stale = (overrides = {}) =>
+    appReview({ id: STALE_ID, submitted_at: "2026-10-14T18:46:10Z", body: canonicalBody(OTHER, "first pass"), ...overrides });
+  const fresh = (overrides = {}) =>
+    appReview({ id: FRESH_ID, submitted_at: "2026-10-15T03:01:33Z", body: canonicalBody(HEAD, "re-review"), ...overrides });
+  const i3 = (violations) => violations.filter((v) => v.startsWith("I3"));
+
+  it("reports it as a notice, not a violation, once a later App approval attests the head", () => {
+    const pr = { number: 2734, headSha: HEAD, author: human, reviews: [stale(), fresh()] };
+    assert.deepEqual(findPrViolations(pr), []);
+    assert.equal(supersedingAttestation(pr.reviews[0], pr.reviews, HEAD)?.id, FRESH_ID);
+    assert.ok(
+      findPrNotices(pr).some((n) =>
+        n.startsWith(
+          `PR #2734 @ff1c72db: Ally App review ${STALE_ID} attests head b3a240ec but GitHub re-anchored it onto ff1c72db; the later review ${FRESH_ID} (APPROVED)`,
+        ),
+      ),
+    );
+  });
+
+  it("control: without the later review the same stale approval is fatal", () => {
+    const pr = { number: 2734, headSha: HEAD, author: human, reviews: [stale()] };
+    assert.match(i3(findPrViolations(pr))[0] ?? "", new RegExp(`review ${STALE_ID} attests head b3a240ec`));
+  });
+
+  it("stays fatal when the stale review is the latest submission", () => {
+    // Read later than the attesting review, it is what GitHub reads.
+    const pr = {
+      number: 2734,
+      headSha: HEAD,
+      author: human,
+      reviews: [fresh({ submitted_at: "2026-10-14T18:46:10Z" }), stale({ submitted_at: "2026-10-15T03:01:33Z" })],
+    };
+    assert.equal(i3(findPrViolations(pr)).length, 1);
+  });
+
+  it("stays fatal when the later review attests some other head", () => {
+    const pr = { number: 2734, headSha: HEAD, author: human, reviews: [stale(), fresh({ body: canonicalBody(THIRD, "re-review") })] };
+    assert.equal(i3(findPrViolations(pr)).length, 2);
+  });
+
+  it("stays fatal when the only later pass is COMMENTED, which leaves the stale approval standing", () => {
+    const pr = { number: 2734, headSha: HEAD, author: human, reviews: [stale(), fresh({ state: "COMMENTED" })] };
+    assert.match(i3(findPrViolations(pr))[0] ?? "", new RegExp(`review ${STALE_ID} attests head`));
+  });
+
+  it("is superseded by a later CHANGES_REQUESTED, which GitHub reads instead", () => {
+    // I2f judges this pair on its own terms; only I3 is in question here.
+    const pr = {
+      number: 2734,
+      headSha: HEAD,
+      author: human,
+      reviews: [stale(), fresh({ state: "CHANGES_REQUESTED", body: canonicalBody(HEAD, "### Critical Issues (1)\n- boom") })],
+    };
+    assert.deepEqual(i3(findPrViolations(pr)), []);
+  });
+
+  it("lets a later COMMENTED pass supersede a stale COMMENTED one, which carries no decision", () => {
+    // App-authored, so a clean COMMENTED self-review is the only verdict
+    // available and I4 exempts both.
+    const pr = {
+      number: 2734,
+      headSha: HEAD,
+      author: { login: "allyblockcast[bot]", is_bot: true },
+      reviews: [stale({ state: "COMMENTED" }), fresh({ state: "COMMENTED" })],
+    };
+    assert.deepEqual(findPrViolations(pr), []);
+  });
+
+  for (const [why, later] of [
+    ["is not canonical", () => fresh({ body: `${canonicalBody(HEAD, "re-review")}\n## Ally — Consolidated PR Review\n` })],
+    ["was dismissed", () => fresh({ state: "DISMISSED" })],
+    ["came from the User seat", () => seatReview({ id: FRESH_ID, submitted_at: "2026-10-15T03:01:33Z", body: canonicalBody(HEAD, "re-review") })],
+  ]) {
+    it(`does not let a later review supersede it when that review ${why}`, () => {
+      const pr = { number: 2734, headSha: HEAD, author: human, reviews: [stale(), later()] };
+      assert.ok(i3(findPrViolations(pr)).some((v) => v.includes(`review ${STALE_ID} attests head b3a240ec`)));
+    });
+  }
+
+  // A stale review that carries no decision accepts any later state, so these
+  // two isolate the operative-at-this-head filter from the decision rule.
+  for (const [why, later] of [
+    ["was dismissed", () => fresh({ state: "DISMISSED" })],
+    ["is recorded against another commit", () => fresh({ commit_id: THIRD })],
+  ]) {
+    it(`does not let a later review supersede a COMMENTED stale review when that review ${why}`, () => {
+      const pr = { number: 2734, headSha: HEAD, author: human, reviews: [stale({ state: "COMMENTED" }), later()] };
+      assert.ok(i3(findPrViolations(pr)).some((v) => v.includes(`review ${STALE_ID} attests head b3a240ec`)));
+    });
+  }
+
+  it("never excuses a non-canonical stale body", () => {
+    const pr = {
+      number: 2734,
+      headSha: HEAD,
+      author: human,
+      reviews: [stale({ body: `${canonicalBody(OTHER, "first pass")}\n## Ally — Consolidated PR Review\n` }), fresh()],
+    };
+    assert.deepEqual(i3(findPrViolations(pr)), [
+      `I3 PR #2734 @ff1c72db: Ally App review ${STALE_ID} is not canonical — expected one consolidated-review heading and one Reviewed head attestation`,
+    ]);
   });
 });
 
