@@ -98,7 +98,7 @@ describeEmbeddedPostgres("refreshRoutineFireGapMetrics (BLO-32638)", () => {
     await db.insert(companies).values({
       id: companyId,
       name: "Routine Gap Co",
-      issuePrefix: "RGC",
+      issuePrefix: `RGC${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false,
       defaultResponsibleUserId: "responsible-user",
     });
