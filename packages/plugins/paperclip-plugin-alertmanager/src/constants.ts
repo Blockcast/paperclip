@@ -105,6 +105,16 @@ export const DEFAULT_ESCALATION_DEADLINE_MINUTES: Record<string, number> = {
 export const DEFAULT_COVER_DEDUP_WINDOW_MINUTES = 120;
 
 /**
+ * How long every source alert of a cover must STAY resolved before the cover
+ * closes (BLO-42259). Without a hold the cover cancelled on the first resolve,
+ * so a 3-minute flap of a live critical dropped the human ask mid-incident.
+ * The resolve path only marks members resolved; the sweep closes the cover
+ * once the hold has elapsed, and a re-fire inside the hold reopens membership.
+ * Override via `config.coverCloseHoldMinutes`.
+ */
+export const DEFAULT_COVER_CLOSE_HOLD_MINUTES = 15;
+
+/**
  * How long an operator-closed issue mutes re-fires of its fingerprint before
  * the plugin re-opens it anyway (BLO-24234).
  *
@@ -324,6 +334,7 @@ export const DEFAULT_CONFIG: AlertmanagerPluginConfig = {
   issueRouteMap: DEFAULT_ISSUE_ROUTE_MAP,
   escalationDeadlineMinutes: DEFAULT_ESCALATION_DEADLINE_MINUTES,
   coverDedupWindowMinutes: DEFAULT_COVER_DEDUP_WINDOW_MINUTES,
+  coverCloseHoldMinutes: DEFAULT_COVER_CLOSE_HOLD_MINUTES,
 };
 
 /**

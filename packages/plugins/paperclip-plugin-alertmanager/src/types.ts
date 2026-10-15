@@ -152,6 +152,11 @@ export interface AlertmanagerPluginConfig {
    * their own. Defaults to `DEFAULT_COVER_DEDUP_WINDOW_MINUTES`.
    */
   coverDedupWindowMinutes?: number;
+  /**
+   * Minutes every source alert of a board cover must stay resolved before the
+   * cover closes (BLO-42259). Defaults to `DEFAULT_COVER_CLOSE_HOLD_MINUTES`.
+   */
+  coverCloseHoldMinutes?: number;
 }
 
 // ---------------------------------------------------------------------------

@@ -37,7 +37,7 @@ import {
 } from "./owner-resolver.js";
 import type { CompanyAgentRoster } from "./owner-resolver.js";
 import { aggregateKeyForAlert } from "./aggregate-key.js";
-import { escalationDeadlineMs, recordSourceResolvedAndCloseCovers } from "./escalation.js";
+import { coverCloseHoldMinutes, escalationDeadlineMs, recordSourceResolvedAndCloseCovers, reopenOpenCoverMembership } from "./escalation.js";
 import {
   ORIGIN_KIND,
   type AlertStateRecord,
@@ -2778,6 +2778,20 @@ export async function handleFiring(
         }
       }
 
+      // BLO-42259: a flap that resolved inside the cover close hold must put
+      // this alert back to an unresolved cover member, or the cover closes at
+      // hold expiry while the alert is firing again. Tolerated like the
+      // retrofit above: a failure here degrades to the pre-hold behaviour.
+      if (!terminal) {
+        try {
+          await reopenOpenCoverMembership(ctx, existing.paperclipIssueId);
+        } catch (err) {
+          ctx.logger.warn(
+            `Failed to reopen cover membership for issue ${existing.paperclipIssueId} on re-fire: ${String(err)}`,
+          );
+        }
+      }
+
       // Ladder restart keeps its original trigger — the alert going
       // resolved → firing — which is independent of the issue's status: an
       // operator may have re-opened the issue by hand, in which case the branch
@@ -3750,6 +3764,7 @@ export async function handleResolved(
       ctx,
       existing.paperclipCompanyId,
       aggregateResolution.issueId,
+      coverCloseHoldMinutes(config),
     );
 
     // BLO-31736: authorship is a property of the *issue*, but this record is
@@ -3832,6 +3847,7 @@ export async function handleResolved(
       ctx,
       existing.paperclipCompanyId,
       aggregateResolution.issueId,
+      coverCloseHoldMinutes(config),
     );
 
     await ctx.events.emit(

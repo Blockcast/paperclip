@@ -6,6 +6,7 @@ import { PLUGIN_STATE_PRECONDITION_FAILED_CODE, type PluginContext } from "@pape
 import {
   COVER_ORIGIN,
   escalationDeadlineMs,
+  reopenOpenCoverMembership,
   recordSourceResolvedAndCloseCovers,
   resolveAlertmanagerApiUrl,
   runAlertEscalationSweep,
@@ -148,10 +149,14 @@ function buildFakeAlertmanagerStore() {
         return { rowCount: 1 };
       }
       if (text.includes("NOT EXISTS")) {
-        const [coverIssueId] = params as [string];
+        const [coverIssueId, holdMinutes] = params as [string, number];
         const cover = covers.get(coverIssueId);
         if (!cover || cover.closing_claimed_at !== null || cover.cancelled_at !== null) return { rowCount: 0 };
         if (openMemberCount(coverIssueId) > 0) return { rowCount: 0 };
+        const holdStart = Date.now() - holdMinutes * 60_000;
+        for (const m of members.values()) {
+          if (m.cover_issue_id === coverIssueId && Date.parse(m.resolved_at!) > holdStart) return { rowCount: 0 };
+        }
         cover.closing_claimed_at = new Date().toISOString();
         return { rowCount: 1 };
       }
@@ -215,6 +220,12 @@ function buildFakeAlertmanagerStore() {
         const [coverIssueId] = params as [string];
         const cover = covers.get(coverIssueId);
         return cover ? [{ closing_claimed_at: cover.closing_claimed_at, resolution_comment_posted_at: cover.resolution_comment_posted_at, cancelled_at: cover.cancelled_at }] as T[] : [];
+      }
+      if (text.includes("c.closing_claimed_at IS NULL AND c.cancelled_at IS NULL")) {
+        const [companyId] = params as [string];
+        return [...covers.values()]
+          .filter((c) => c.company_id === companyId && c.closing_claimed_at === null && c.cancelled_at === null && openMemberCount(c.cover_issue_id) === 0)
+          .map((c) => ({ cover_issue_id: c.cover_issue_id })) as T[];
       }
       if (text.includes("closing_claimed_at IS NOT NULL AND cancelled_at IS NULL")) {
         const [companyId] = params as [string];
@@ -467,6 +478,19 @@ describe("alert escalation", () => {
   });
 });
 
+describe("BLO-42259 re-fire inside the cover close hold", () => {
+  it("handleFiring reopens the resolved cover membership so the held cover does not close under a firing alert", async () => {
+    const store = buildFakeAlertmanagerStore();
+    store.covers.set("cover-1", { cover_issue_id: "cover-1", company_id: "company-1", dedup_fingerprint: "cover:SyntheticAlert:1", closing_claimed_at: null, resolution_comment_posted_at: null, cancelled_at: null });
+    store.members.set("cover-1:issue-1", { id: randomUUID(), cover_issue_id: "cover-1", alert_issue_id: "issue-1", resolved_at: new Date().toISOString() });
+    const state = { paperclipIssueId: "issue-1", paperclipCompanyId: "company-1", assigneeUserId: null, assigneeAgentId: "engineer", alertname: "SyntheticAlert", severity: "critical", firstSeenAt: "x", lastFiredAt: "x", resolvedAt: null, nextEscalationAt: null, escalationAttempt: 3, escalationComplete: true };
+    const mocks = { state: { get: vi.fn(async () => state), set: vi.fn(async () => undefined) }, issues: { get: vi.fn(async () => ({ id: "issue-1", status: "todo" })), update: vi.fn(async () => ({})) }, events: { emit: vi.fn() }, metrics: { write: vi.fn() }, logger: { warn: vi.fn() }, db: store.db };
+    await handleFiring(mocks as unknown as PluginContext, config(), alert());
+    expect(store.members.get("cover-1:issue-1")?.resolved_at).toBeNull();
+    expect(mocks.logger.warn).not.toHaveBeenCalledWith(expect.stringContaining("reopen cover membership"));
+  });
+});
+
 describe("BLO-16120 aggregate-aware cover cleanup on resolve", () => {
   /** Seeds a cover with N unresolved members and returns a resolve-ready ctx. */
   function coverContext(memberAlertIssueIds: string[]) {
@@ -521,6 +545,35 @@ describe("BLO-16120 aggregate-aware cover cleanup on resolve", () => {
     expect(mocks.issues.createComment).toHaveBeenCalledTimes(1);
     expect(mocks.issues.update).toHaveBeenCalledTimes(1);
     expect(mocks.issues.update).toHaveBeenCalledWith(coverId, { status: "cancelled" }, "company-1");
+  });
+
+  it("BLO-42259: with a close hold, a resolve does not close the cover; a re-fire inside the hold keeps it open past expiry", async () => {
+    const { ctx, mocks, store, coverId } = coverContext(["alert-A"]);
+    await recordSourceResolvedAndCloseCovers(ctx, "company-1", "alert-A", 15);
+    expect(mocks.issues.update).not.toHaveBeenCalled();
+    expect(store.covers.get(coverId)?.closing_claimed_at).toBeNull();
+
+    // the sweep inside the hold must not close it either
+    await runAlertEscalationSweep(ctx as any, config(), new Date());
+    expect(mocks.issues.update).not.toHaveBeenCalled();
+
+    // flap: the alert re-fires before the hold expires
+    expect(await reopenOpenCoverMembership(ctx, "alert-A")).toBe(1);
+    await runAlertEscalationSweep(ctx as any, { ...config(), coverCloseHoldMinutes: 0 }, new Date());
+    expect(mocks.issues.update).not.toHaveBeenCalled();
+    expect(store.covers.get(coverId)?.cancelled_at).toBeNull();
+  });
+
+  it("BLO-42259: the sweep closes a cover once every member has stayed resolved past the hold", async () => {
+    const { ctx, mocks, store, coverId } = coverContext(["alert-A"]);
+    await recordSourceResolvedAndCloseCovers(ctx, "company-1", "alert-A", 15);
+    expect(mocks.issues.update).not.toHaveBeenCalled();
+    store.members.get(`${coverId}:alert-A`)!.resolved_at = new Date(Date.now() - 16 * 60_000).toISOString();
+
+    await runAlertEscalationSweep(ctx as any, { ...config(), coverCloseHoldMinutes: 15 }, new Date());
+    expect(mocks.issues.createComment).toHaveBeenCalledTimes(1);
+    expect(mocks.issues.update).toHaveBeenCalledWith(coverId, { status: "cancelled" }, "company-1");
+    expect(store.covers.get(coverId)?.cancelled_at).not.toBeNull();
   });
 
   it("an alert that never joined a cover resolves without touching any cover", async () => {
@@ -890,11 +943,11 @@ describe("BLO-20650 concurrent webhook + sweep on one alert-state record", () =>
     // exists — so the resolve's own cascade finds no membership to close,
     // which is exactly why the cover would otherwise be orphaned.
     mocks.access.members.list = vi.fn(async () => {
-      await handleResolved(resolveContext(store), config(), resolvedAlert);
+      await handleResolved(resolveContext(store), config({ coverCloseHoldMinutes: 0 }), resolvedAlert);
       return [{ principalType: "user", principalId: "board-1", status: "active", membershipRole: "owner" }];
     });
 
-    await runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:00:00Z"));
+    await runAlertEscalationSweep(ctx, config({ coverCloseHoldMinutes: 0 }), new Date("2026-07-11T01:00:00Z"));
 
     // The resolution survives, as on every other rung.
     expect(store.read().resolvedAt).toBe("2026-07-11T02:00:00Z");
@@ -979,7 +1032,7 @@ describe("BLO-20650 concurrent webhook + sweep on one alert-state record", () =>
       // issue exists.
       webhook = handleResolved(
         { ...(resolveContext(store) as unknown as Record<string, unknown>), db: resolveDb } as unknown as PluginContext,
-        config(),
+        config({ coverCloseHoldMinutes: 0 }),
         resolvedAlert,
       );
       // Let it run right up to its state write. Bounded, so a change to the

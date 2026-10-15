@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { PLUGIN_STATE_PRECONDITION_FAILED_CODE, type PluginContext } from "@paperclipai/plugin-sdk";
 import { isNonHumanUserSentinel } from "@paperclipai/shared";
-import { DEFAULT_COVER_DEDUP_WINDOW_MINUTES, DEFAULT_ESCALATION_DEADLINE_MINUTES, alertStateRef } from "./constants.js";
+import { DEFAULT_COVER_CLOSE_HOLD_MINUTES, DEFAULT_COVER_DEDUP_WINDOW_MINUTES, DEFAULT_ESCALATION_DEADLINE_MINUTES, alertStateRef } from "./constants.js";
 import { resolveIssueRoute } from "./issue-route-resolver.js";
 import { ORIGIN_KIND, type AlertmanagerAlert, type AlertmanagerPluginConfig, type AlertStateRecord } from "./types.js";
 
@@ -396,17 +396,7 @@ async function createCover(
   // from any cover. Falling through instead routes it into `createCover`'s
   // normal create-or-join path, which opens/joins a fresh cover (BLO-16120
   // PR #662 review).
-  const already = await ctx.db.execute(
-    `UPDATE ${q(ns, MEMBERS_TABLE)} AS m
-     SET resolved_at = NULL, updated_at = now()
-     FROM ${q(ns, COVERS_TABLE)} c
-     WHERE m.cover_issue_id = c.cover_issue_id
-       AND m.alert_issue_id = $1
-       AND c.cancelled_at IS NULL
-       AND c.closing_claimed_at IS NULL`,
-    [issue.id],
-  );
-  if (already.rowCount > 0) return;
+  if ((await reopenOpenCoverMembership(ctx, issue.id)) > 0) return;
 
   const windowMinutes = config.coverDedupWindowMinutes ?? DEFAULT_COVER_DEDUP_WINDOW_MINUTES;
   const fingerprint = coverDedupFingerprint(alertname, windowMinutes, now);
@@ -479,8 +469,31 @@ async function createCover(
 }
 
 /**
+ * Marks `alertIssueId` OPEN again in every still-open, unclaimed cover it
+ * belongs to, returning how many memberships matched. Used by `createCover`
+ * as its "already covered" guard, and by `handleFiring` on a re-fire
+ * (BLO-42259): a flap that resolves and re-fires inside the close hold must
+ * put the member back to unresolved, or the cover would close at hold expiry
+ * while the alert is firing again.
+ */
+export async function reopenOpenCoverMembership(ctx: PluginContext, alertIssueId: string): Promise<number> {
+  const ns = ctx.db.namespace;
+  const result = await ctx.db.execute(
+    `UPDATE ${q(ns, MEMBERS_TABLE)} AS m
+     SET resolved_at = NULL, updated_at = now()
+     FROM ${q(ns, COVERS_TABLE)} c
+     WHERE m.cover_issue_id = c.cover_issue_id
+       AND m.alert_issue_id = $1
+       AND c.cancelled_at IS NULL
+       AND c.closing_claimed_at IS NULL`,
+    [alertIssueId],
+  );
+  return result.rowCount;
+}
+
+/**
  * Attempts to close `coverIssueId` once every represented source alert has
- * resolved. The claim (who gets to run the resolution comment + terminal
+ * resolved and stayed resolved for `holdMinutes` (BLO-42259). The claim (who gets to run the resolution comment + terminal
  * transition) is a single atomic UPDATE of `closing_claimed_at`, guarded by
  * `NOT EXISTS (unresolved members)` — under concurrent callers (duplicate
  * resolve deliveries, two siblings resolving at once), Postgres row-level
@@ -501,7 +514,7 @@ async function createCover(
  * meant a `createComment` failure left the cover reading as "resolution
  * comment posted" when it never was, and nothing ever retried it.
  */
-async function closeCoverIfEligible(ctx: PluginContext, companyId: string, coverIssueId: string): Promise<void> {
+async function closeCoverIfEligible(ctx: PluginContext, companyId: string, coverIssueId: string, holdMinutes: number): Promise<void> {
   const ns = ctx.db.namespace;
   const claim = await ctx.db.execute(
     `UPDATE ${q(ns, COVERS_TABLE)} AS c
@@ -511,11 +524,12 @@ async function closeCoverIfEligible(ctx: PluginContext, companyId: string, cover
        AND c.cancelled_at IS NULL
        AND NOT EXISTS (
          SELECT 1 FROM ${q(ns, MEMBERS_TABLE)} m
-         WHERE m.cover_issue_id = c.cover_issue_id AND m.resolved_at IS NULL
+         WHERE m.cover_issue_id = c.cover_issue_id
+           AND (m.resolved_at IS NULL OR m.resolved_at > now() - make_interval(mins => $2::int))
        )`,
-    [coverIssueId],
+    [coverIssueId, holdMinutes],
   );
-  if (claim.rowCount === 0) return; // not yet eligible, or another caller already claimed it
+  if (claim.rowCount === 0) return; // not yet eligible (open member, or still inside the hold), or another caller already claimed it
   await finalizeCoverCancellation(ctx, companyId, coverIssueId);
 }
 
@@ -574,6 +588,7 @@ export async function recordSourceResolvedAndCloseCovers(
   ctx: PluginContext,
   companyId: string,
   alertIssueId: string,
+  holdMinutes = 0,
 ): Promise<void> {
   const ns = ctx.db.namespace;
   const resolved = await ctx.db.execute(
@@ -589,7 +604,34 @@ export async function recordSourceResolvedAndCloseCovers(
     [alertIssueId],
   );
   for (const { cover_issue_id: coverIssueId } of coverRows) {
-    await closeCoverIfEligible(ctx, companyId, coverIssueId);
+    await closeCoverIfEligible(ctx, companyId, coverIssueId, holdMinutes);
+  }
+}
+
+/**
+ * Deferred close for the hold (BLO-42259): with a non-zero hold the resolve
+ * cascade cannot close a cover itself, and no further webhook arrives once
+ * every member has resolved — so the sweep is the trigger that closes a cover
+ * whose members have all stayed resolved past the hold.
+ */
+async function closeHeldCovers(ctx: PluginContext, companyId: string, holdMinutes: number): Promise<void> {
+  const ns = ctx.db.namespace;
+  const ready = await ctx.db.query<{ cover_issue_id: string }>(
+    `SELECT c.cover_issue_id FROM ${q(ns, COVERS_TABLE)} c
+     WHERE c.company_id = $1 AND c.closing_claimed_at IS NULL AND c.cancelled_at IS NULL
+       AND NOT EXISTS (
+         SELECT 1 FROM ${q(ns, MEMBERS_TABLE)} m
+         WHERE m.cover_issue_id = c.cover_issue_id AND m.resolved_at IS NULL
+       )
+     LIMIT ${STUCK_COVER_RECONCILE_LIMIT}`,
+    [companyId],
+  );
+  for (const { cover_issue_id: coverIssueId } of ready) {
+    try {
+      await closeCoverIfEligible(ctx, companyId, coverIssueId, holdMinutes);
+    } catch (err) {
+      ctx.logger.warn(`alert-escalation: failed to close held cover ${coverIssueId}: ${String(err)}`);
+    }
   }
 }
 
@@ -642,6 +684,15 @@ export async function runAlertEscalationSweep(ctx: PluginContext, config: Alertm
   } catch (err) {
     ctx.logger.warn(`alert-escalation: cover reconciliation pass failed: ${String(err)}`);
   }
+  try {
+    await closeHeldCovers(ctx, companyId, coverCloseHoldMinutes(config));
+  } catch (err) {
+    ctx.logger.warn(`alert-escalation: held-cover close pass failed: ${String(err)}`);
+  }
+}
+
+export function coverCloseHoldMinutes(config: AlertmanagerPluginConfig): number {
+  return config.coverCloseHoldMinutes ?? DEFAULT_COVER_CLOSE_HOLD_MINUTES;
 }
 
 type SweepIssue = Awaited<ReturnType<PluginContext["issues"]["list"]>>[number];
@@ -772,7 +823,7 @@ async function advanceIssueLadder(
       // keeps the cover open. A re-fire rather than a resolve leaves it open
       // too, which is what a firing alert should have.
       const winner = await ctx.state.get(ref) as AlertStateRecord | null;
-      if (winner?.resolvedAt) await recordSourceResolvedAndCloseCovers(ctx, companyId, issue.id);
+      if (winner?.resolvedAt) await recordSourceResolvedAndCloseCovers(ctx, companyId, issue.id, coverCloseHoldMinutes(config));
       ctx.logger.info(`alert-escalation: abandoned cover rung for ${issue.identifier ?? issue.id}; alert state changed under the sweep`);
       return;
     }
