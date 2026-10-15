@@ -194,10 +194,19 @@ const PNPM_PATCH_HASH_RE = /^[a-z2-7]{26}$/;
  *  bounds still left ~1.4e-3 at 24 chars, above this file's accepted band. */
 const ALERT_NAME_RE = /^(?:[A-Z][a-z]+|[A-Z]{1,5}(?=[A-Z][a-z]))+$/;
 
+/** BLO-46892: a git commit pin, `rev=<40 lowercase hex>`, as Nix flake inputs
+ *  write it (`git+ssh://...?ref=main&rev=<sha>`). A flake input must be a
+ *  literal URL, so there is no way to keep the SHA out of the pushed blob, and
+ *  every pin bump was refused. Exact name AND exact shape, as above: a 40-hex
+ *  value under any other name, or a non-hex value under `rev`, stays subject
+ *  to the entropy test. */
+const GIT_COMMIT_SHA_RE = /^[0-9a-f]{40}$/;
+
 /** True when a NAME=VALUE pair is a content digest pin rather than a secret. */
 function isContentDigestAssignment(name: string, value: string): boolean {
   if (name === "patch_hash" && PNPM_PATCH_HASH_RE.test(value)) return true;
   if (name === "alertname" && ALERT_NAME_RE.test(value)) return true;
+  if (name === "rev" && GIT_COMMIT_SHA_RE.test(value)) return true;
   return DIGEST_NAME_RE.test(name) && HEX_DIGEST_RE.test(value);
 }
 
