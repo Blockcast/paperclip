@@ -140,6 +140,21 @@ export const PENDING_CONCURRENT_INDEXES: readonly ConcurrentIndexSpec[] = [
       + "WHERE retry_of_run_id IS NOT NULL",
     dropStatement: "DROP INDEX CONCURRENTLY IF EXISTS heartbeat_runs_retry_successor_idx",
   },
+  {
+    migration: "0259_heartbeat_runs_failed_finished_at_index.sql",
+    name: "heartbeat_runs_failed_finished_at_idx",
+    table: "heartbeat_runs",
+    requiredColumns: ["finished_at", "id", "status"],
+    accessMethod: "btree",
+    keyColumns: ["finished_at", "id"],
+    keyOptions: [0, 0],
+    predicate: "status = 'failed'::text",
+    createStatement:
+      "CREATE INDEX CONCURRENTLY IF NOT EXISTS heartbeat_runs_failed_finished_at_idx "
+      + "ON heartbeat_runs USING btree (finished_at, id) "
+      + "WHERE status = 'failed'",
+    dropStatement: "DROP INDEX CONCURRENTLY IF EXISTS heartbeat_runs_failed_finished_at_idx",
+  },
 ];
 
 export const DEFAULT_STATEMENT_TIMEOUT_MS = 10 * 60 * 1000;

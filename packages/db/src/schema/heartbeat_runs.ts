@@ -298,6 +298,36 @@ export const heartbeatRuns = pgTable(
     crashRecoveryPendingIdx: index("heartbeat_runs_crash_recovery_pending_idx")
       .on(table.finishedAt, table.id)
       .where(sql`${table.errorCode} = 'worker_crashed' and ${table.crashRecoveryCompletedAt} is null`),
+    // PEN-3633 / Ally review on #2750: backs the workspace-reuse refusal sweep,
+    // which runs on every scrape-metrics collector tick (15s) on every replica:
+    //
+    //   status = 'failed' AND finished_at >= now() - 2h
+    //   ... ORDER BY finished_at DESC LIMIT 5000
+    //
+    // No existing index can serve it. Every `status`-bearing index here leads
+    // with `company_id` and the sweep is fleet-wide, so there is no leading-key
+    // value to probe with; PostgreSQL before 18 has no index skip scan. The only
+    // other `finished_at` index is crashRecoveryPendingIdx above, whose
+    // `error_code = 'worker_crashed'` predicate the sweep's rows do not satisfy.
+    //
+    // Measured 2026-10-15 off the production exporter: heartbeat_runs averages
+    // 368,694 rows read per sequential scan, and production performs ~2 of them
+    // per DAY on this table. Unindexed, this sweep alone would add ~8/min across
+    // 2 replicas over a heap carrying a wide `context_snapshot` jsonb and `error`
+    // text. The collector runs its refreshes in series within a non-overlapping
+    // tick, so that scan would not stay local to this gauge: it delays every
+    // refresh after it and holds one of ten pool connections while it runs.
+    //
+    // Partial on the one status, with `id` after `finished_at` so the LIMIT cut
+    // is deterministic rather than arbitrary among same-instant rows.
+    //
+    // On a populated database this index is created out of band with
+    // `CREATE INDEX CONCURRENTLY` (see migration 0259). Declared here so
+    // drizzle's schema diff stays clean and so fresh/bootstrap databases get it
+    // automatically.
+    failedFinishedAtIdx: index("heartbeat_runs_failed_finished_at_idx")
+      .on(table.finishedAt, table.id)
+      .where(sql`${table.status} = 'failed'`),
     companyAgentCreatedAtDescIdx: index("heartbeat_runs_company_agent_created_at_idx").on(
       table.companyId,
       table.agentId,

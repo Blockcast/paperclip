@@ -27,6 +27,8 @@ import {
 import {
   formatGitProbeRefusal,
   formatOriginMismatchRefusal,
+  REUSE_FAILURE_HEADLINE,
+  REUSE_FAILURE_NO_CAUSE_HEADLINE,
 } from "../services/workspace-reuse-refusal-class.js";
 
 /**
@@ -238,6 +240,47 @@ describeEmbeddedPostgres("refreshWorkspaceReuseRefusalMetrics (PEN-3633)", () =>
 
     expect(body).not.toContain(`${WORKSPACE_REUSE_REFUSAL_WINDOW_METRIC}{`);
     expect(unlabelledGauge(body, WORKSPACE_REUSE_REFUSAL_METRICS_REFRESH_SUCCESS_METRIC)).toBe(1);
+  });
+
+  it("counts the wrapper's no-cause arm but not its reported-cause arm", async () => {
+    // Regression for the Ally review on #2750, asserted end to end because the
+    // fix spans both halves: the SQL prefilter must still admit the no-cause
+    // body (if the marker list and the predicate drifted apart, this series
+    // would silently vanish), and the classifier must refuse a wrapper whose
+    // cause was reported and is not a checkout fault. An archived execution
+    // workspace is an ISSUE-level fault; counting it against a
+    // project_workspace_id is the mis-routing this metric exists to remove.
+    const { companyId, agentId, projectWorkspaceId } = await seedCompany();
+    await seedFailedRun({
+      companyId,
+      agentId,
+      projectWorkspaceId,
+      error: `${REUSE_FAILURE_NO_CAUSE_HEADLINE} (execution workspace ws-1).`,
+    });
+    for (const cause of [
+      "execution workspace ws-2 is archived",
+      "failed to restore execution workspace: ENOENT: no such file or directory",
+    ]) {
+      await seedFailedRun({
+        companyId,
+        agentId,
+        projectWorkspaceId,
+        error: `${REUSE_FAILURE_HEADLINE} because ${cause}.`,
+      });
+    }
+
+    await refreshWorkspaceReuseRefusalMetrics(db, NOW);
+    const { body } = await renderMetrics();
+
+    expect(
+      seriesValue(body, WORKSPACE_REUSE_REFUSAL_WINDOW_METRIC, {
+        project_workspace_id: projectWorkspaceId,
+        failure_class: "cause_unreported",
+      }),
+    ).toBe(1);
+    expect(body).not.toContain('failure_class="origin_mismatch"');
+    expect(body).not.toContain('failure_class="not_a_checkout"');
+    expect(body).not.toContain('failure_class="probe_indeterminate"');
   });
 
   it("drops a drained series on the next sweep rather than holding a stale count", async () => {
