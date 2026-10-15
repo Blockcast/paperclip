@@ -1,4 +1,4 @@
-import { and, eq, gte, isNotNull, or, sql } from "drizzle-orm";
+import { and, eq, gte, inArray, isNotNull, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { heartbeatRuns, issues } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
@@ -60,6 +60,41 @@ function errorBodyCarriesRefusalMarker() {
   );
 }
 
+/**
+ * `heartbeat_runs.context_issue_id` is a generated column over
+ * `context_snapshot->>'issueId'`, so it is TEXT and anything at all could be in
+ * it. Non-UUID values are dropped here rather than handed to the query,
+ * preserving the property the old `issues.id::text` join had for a different
+ * reason: one malformed snapshot value must not abort the whole sweep and
+ * surface as a refresh failure rather than as the data it is.
+ */
+const ISSUE_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** issue id -> project workspace id, for the issues that have one. */
+async function resolveProjectWorkspaces(
+  db: Db,
+  contextIssueIds: readonly (string | null)[],
+): Promise<Map<string, string>> {
+  const issueIds = [
+    ...new Set(
+      contextIssueIds.filter(
+        (value): value is string => typeof value === "string" && ISSUE_ID_PATTERN.test(value),
+      ),
+    ),
+  ];
+  const resolved = new Map<string, string>();
+  if (issueIds.length === 0) return resolved;
+
+  const rows = await db
+    .select({ id: issues.id, projectWorkspaceId: issues.projectWorkspaceId })
+    .from(issues)
+    .where(and(inArray(issues.id, issueIds), isNotNull(issues.projectWorkspaceId)));
+  for (const row of rows) {
+    if (row.projectWorkspaceId) resolved.set(row.id, row.projectWorkspaceId);
+  }
+  return resolved;
+}
+
 export type WorkspaceReuseRefusalWindowEntry = {
   projectWorkspaceId: string;
   failureClass: WorkspaceReuseRefusalClass;
@@ -84,16 +119,32 @@ export type WorkspaceReuseRefusalWindowEntry = {
  * unambiguously "no refusals in the window" because the alert is a `>=`
  * threshold that absence can never satisfy.
  *
- * Why it is cheap enough to run on every tick: migration 0259 adds
- * `heartbeat_runs_failed_finished_at_idx`, a partial index on
- * `(finished_at, id) WHERE status = 'failed'`. Without it no index fits this
- * predicate at all -- every `status`-bearing index on the table leads with
- * `company_id` and this sweep is fleet-wide. The cost of getting that wrong is
- * not local: the collector runs its refreshes in SERIES within a tick and ticks
- * do not overlap, so a slow query here delays every gauge after it and, past
- * 15s, the next tick entirely -- while holding one of ten pool connections for
- * the duration. Pool contention on this path is the exact failure BLO-33243
- * moved off the scrape handler. (Ally on #2750.)
+ * Why it is two queries and not one join, and why it is cheap enough to run on
+ * every tick. Both answers come from reading the plan rather than guessing at
+ * it (`EXPLAIN (ANALYZE, BUFFERS)`, 60k runs / 60k issues; Ally on #2750):
+ *
+ * - Migration 0259's `heartbeat_runs_failed_finished_at_idx`, partial on
+ *   `(finished_at, id) WHERE status = 'failed'`, serves the run-side read as a
+ *   single backward index scan bounded by the window. It is NOT true that
+ *   nothing could serve the predicate without it: PostgreSQL will `BitmapAnd`
+ *   the trailing `finished_at` and `status` columns of two `company_id`-leading
+ *   indexes, which is a bitmap index scan, not the sequential scan this was
+ *   first justified as avoiding. The index earns its place on how the two
+ *   SCALE -- the bitmap path reads one index entry per failed run that has ever
+ *   existed (8,572 at 60k rows), this one reads the failed runs inside the 2h
+ *   window (24).
+ * - The join is what actually dominated: `context_issue_id` is TEXT and
+ *   `issues.id` is UUID, so `issues.id::text` is unindexable and the planner
+ *   sequentially scanned `issues` on every tick -- 42ms of 74ms and 1,396 of
+ *   1,412 buffers, growing with the issue table rather than with refusals.
+ *   Reading the (tiny, already filtered) refusal set first and resolving its
+ *   issue ids through the primary key removes that scan entirely.
+ *
+ * None of this stays local to this gauge if it is got wrong: the collector runs
+ * its refreshes in SERIES within a tick and ticks do not overlap, so a slow
+ * query here delays every gauge after it and, past 15s, the next tick entirely,
+ * while holding one of ten pool connections. Pool contention on this path is
+ * the exact failure BLO-33243 moved off the scrape handler.
  *
  * Why this does not wait on a dispatch: the sweep reads finished runs on the
  * collector tick. A project whose checkout is broken stops dispatching
@@ -109,29 +160,23 @@ export async function refreshWorkspaceReuseRefusalMetrics(
 
     const rows = await db
       .select({
-        projectWorkspaceId: issues.projectWorkspaceId,
+        contextIssueId: heartbeatRuns.contextIssueId,
         error: heartbeatRuns.error,
       })
       .from(heartbeatRuns)
-      // `contextIssueId` is a generated column over `context_snapshot->>'issueId'`
-      // and is therefore TEXT, while `issues.id` is UUID. The cast goes on
-      // `issues.id` deliberately: casting the run side to uuid would make a
-      // single malformed snapshot value abort the whole sweep, which would
-      // surface as a refresh failure rather than as the data it is.
-      .innerJoin(issues, eq(heartbeatRuns.contextIssueId, sql<string>`${issues.id}::text`))
       .where(
         and(
           eq(heartbeatRuns.status, "failed"),
           gte(heartbeatRuns.finishedAt, windowStart),
           isNotNull(heartbeatRuns.error),
-          isNotNull(issues.projectWorkspaceId),
+          isNotNull(heartbeatRuns.contextIssueId),
           errorBodyCarriesRefusalMarker(),
         ),
       )
       // `id` breaks the tie so the scan-limit cut is deterministic among
       // same-instant rows rather than arbitrary, and the pair matches
-      // `heartbeat_runs_failed_finished_at_idx` exactly, so the whole ORDER BY
-      // is a backward index scan with no sort step.
+      // `heartbeat_runs_failed_finished_at_idx`, so the window, the order and
+      // the cut all come off one backward index scan.
       .orderBy(sql`${heartbeatRuns.finishedAt} desc, ${heartbeatRuns.id} desc`)
       .limit(WORKSPACE_REUSE_REFUSAL_SCAN_LIMIT);
 
@@ -146,11 +191,18 @@ export async function refreshWorkspaceReuseRefusalMetrics(
       );
     }
 
+    const projectWorkspaceByIssueId = await resolveProjectWorkspaces(
+      db,
+      rows.map((row) => row.contextIssueId),
+    );
+
     const counts = new Map<string, WorkspaceReuseRefusalWindowEntry>();
     for (const row of rows) {
       const failureClass = classifyWorkspaceReuseRefusal(row.error);
       if (!failureClass) continue;
-      const projectWorkspaceId = row.projectWorkspaceId;
+      const projectWorkspaceId = row.contextIssueId
+        ? projectWorkspaceByIssueId.get(row.contextIssueId)
+        : undefined;
       if (!projectWorkspaceId) continue;
       const key = `${projectWorkspaceId}\u0000${failureClass}`;
       const existing = counts.get(key);

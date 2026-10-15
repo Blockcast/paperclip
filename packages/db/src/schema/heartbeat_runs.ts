@@ -302,24 +302,29 @@ export const heartbeatRuns = pgTable(
     // which runs on every scrape-metrics collector tick (15s) on every replica:
     //
     //   status = 'failed' AND finished_at >= now() - 2h
-    //   ... ORDER BY finished_at DESC LIMIT 5000
+    //   ... ORDER BY finished_at DESC, id DESC LIMIT 5000
     //
-    // No existing index can serve it. Every `status`-bearing index here leads
-    // with `company_id` and the sweep is fleet-wide, so there is no leading-key
-    // value to probe with; PostgreSQL before 18 has no index skip scan. The only
-    // other `finished_at` index is crashRecoveryPendingIdx above, whose
-    // `error_code = 'worker_crashed'` predicate the sweep's rows do not satisfy.
+    // Not because the predicate is otherwise unservable -- measured, it is.
+    // Every `status`-bearing index here leads with `company_id` and the sweep is
+    // fleet-wide, but PostgreSQL will still `BitmapAnd` the TRAILING
+    // `finished_at` and `status` columns of two of them, which is a bitmap index
+    // scan rather than the heap scan this was first justified as avoiding. (The
+    // other `finished_at` index, crashRecoveryPendingIdx above, is genuinely
+    // unusable here: its `error_code = 'worker_crashed'` predicate excludes
+    // these rows.)
     //
-    // Measured 2026-10-15 off the production exporter: heartbeat_runs averages
-    // 368,694 rows read per sequential scan, and production performs ~2 of them
-    // per DAY on this table. Unindexed, this sweep alone would add ~8/min across
-    // 2 replicas over a heap carrying a wide `context_snapshot` jsonb and `error`
-    // text. The collector runs its refreshes in series within a non-overlapping
-    // tick, so that scan would not stay local to this gauge: it delays every
-    // refresh after it and holds one of ten pool connections while it runs.
+    // It earns its place on how the two SCALE. `EXPLAIN (ANALYZE, BUFFERS)` at
+    // 60k rows: the bitmap path reads one index entry per failed run that has
+    // ever existed (8,572 of them) and a growing table only widens that, while
+    // this index is already restricted to failed runs and is probed over the 2h
+    // window (24 rows, 2 buffers read). The collector runs its refreshes in
+    // series within a non-overlapping tick, so the difference does not stay
+    // local to this gauge: a slow query delays every refresh after it and holds
+    // one of ten pool connections while it runs.
     //
-    // Partial on the one status, with `id` after `finished_at` so the LIMIT cut
-    // is deterministic rather than arbitrary among same-instant rows.
+    // Partial on the one status, with `id` after `finished_at` so the window,
+    // the ORDER BY and the LIMIT cut all come off one backward index scan and
+    // the cut is deterministic among same-instant rows.
     //
     // On a populated database this index is created out of band with
     // `CREATE INDEX CONCURRENTLY` (see migration 0259). Declared here so
