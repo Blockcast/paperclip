@@ -57,7 +57,9 @@
  *       App approval without a `Reviewed head:` attestation.
  *   I3  An operative App review has exactly one canonical body and its
  *       body-attested `Reviewed head:` matches the commit GitHub recorded it
- *       against.
+ *       against, unless a later App review has since attested that head and
+ *       superseded it (`supersedingAttestation`, and "On I3's mechanism"
+ *       below).
  *   I4  A clean App verdict is a formal `APPROVED` review. The sole exception
  *       is an App-authored PR: GitHub prevents the App from approving its own
  *       PR, so its clean canonical self-review is necessarily `COMMENTED`. A
@@ -84,6 +86,25 @@
  * commit created after submission. The body's attestation is therefore the
  * record of which tree was examined; I3 remains fatal when it disagrees with
  * the current head.
+ *
+ * It is fatal while that review is the reviewer's standing verdict, and no
+ * longer. Once Ally reviews the new head, the re-anchored review backs
+ * nothing: `reviewDecision` follows that reviewer's later approval or change
+ * request, and the merge gate reads body attestations, so neither sees the
+ * stale one. The attestation arm used to fire on it anyway, and nothing in
+ * the review flow dismisses it (Ally's duplicate cleanup selects reviews that
+ * attest the head, which this one does not), so every approved PR that was
+ * pushed to and re-reviewed held the run red until it merged. Measured over
+ * all 40 scheduled runs from 2026-10-13T19:30Z to 2026-10-15T10:32Z: 28
+ * failed on I3 alone, and all 39 findings were this shape on three PRs —
+ * #2388 (13 runs), #2698 (11) and #2734 (8) — each with a later APPROVED App
+ * review attesting the current head, and none was cleared by a dismissal.
+ * (Of the rest, 10 lost `gh pr list` to a GraphQL 502/504, one runner was
+ * shut down, one passed.) Such a review is now a notice. It stays fatal when
+ * nothing later attests the head, when it is itself the latest submission, or
+ * when the only later pass is COMMENTED and the stale review is an approval or
+ * a change request: a COMMENTED review overrides neither, so the stale one
+ * would still be what GitHub reads.
  *
  * "Operative" excludes DISMISSED and PENDING: a dismissed review is disposed,
  * not a standing attestation.
@@ -827,6 +848,49 @@ export function operativeAllyReviews(reviews, headSha, lane = null) {
   );
 }
 
+/**
+ * True for the two states that, as a reviewer's latest review, decide
+ * GitHub's `reviewDecision` for that reviewer. A COMMENTED review overrides
+ * neither, so a COMMENTED pass leaves the same reviewer's earlier approval or
+ * change request standing.
+ */
+function carriesReviewDecision(review) {
+  const state = reviewState(review);
+  return state === "APPROVED" || state === "CHANGES_REQUESTED";
+}
+
+/**
+ * The later App review that supersedes `stale`, or null when none does.
+ *
+ * `stale` is an operative App review whose body attests a head other than the
+ * one GitHub now records it against: GitHub re-anchors an approval's
+ * `commit_id` forward on a push (see "On I3's mechanism"). It is fatal while it
+ * is the reviewer's standing verdict. A review supersedes it only when it is
+ * every one of these:
+ *
+ *   - an operative App-lane review at this head. The seat may not carry a
+ *     verdict at all (I6), and a dismissed review supersedes nothing.
+ *   - submitted after `stale`. A stale review submitted later is the
+ *     reviewer's latest, so it is the one GitHub reads, and it stays fatal.
+ *   - canonical, and attesting exactly this head, read as I3 reads it.
+ *   - an approval or change request whenever `stale` is one. Otherwise the
+ *     stale review is still the one `reviewDecision` reads.
+ *
+ * Only the attestation arm consults this. A non-canonical body is still
+ * fatal, and I2/I4 still evaluate the stale review on its own content.
+ */
+export function supersedingAttestation(stale, reviews, headSha) {
+  const normalizedHead = String(headSha ?? "").toLowerCase();
+  return (
+    operativeAllyReviews(reviews, headSha, "app").find(
+      (review) =>
+        bySubmission(stale, review) < 0 &&
+        canonicalReviewHead(review.body) === normalizedHead &&
+        (carriesReviewDecision(review) || !carriesReviewDecision(stale)),
+    ) ?? null
+  );
+}
+
 function isCleanAppSelfReview(pr, review) {
   return (
     isAllyAppLogin(pr?.author?.login) &&
@@ -925,7 +989,9 @@ export function sameLaneBodyRelation(operative) {
  *
  * This exempts the shape from I1 only. Every review in the set is still
  * carried through I2/I3/I4/I5, so a superseded review that approves over a
- * blocking finding remains fatal.
+ * blocking finding remains fatal. I3's attestation arm has its own, narrower
+ * rule for a review GitHub re-anchored onto a head it never read: see
+ * `supersedingAttestation`.
  */
 export function isSupersedingAppRereview(lane, operative) {
   return lane === "app" && sameLaneBodyRelation(operative) === "recompute";
@@ -936,20 +1002,38 @@ export function isSupersedingAppRereview(lane, operative) {
  * doing one PR's work, so it is reported rather than dropped: silence here
  * would make a re-review storm indistinguishable from a quiet week.
  *
+ * A review GitHub re-anchored onto a head it never read is reported here too
+ * once a later review supersedes it (`supersedingAttestation`). It backs
+ * nothing, but the PR page still shows it against this head.
+ *
  * @returns {string[]}
  */
 export function findPrNotices(pr) {
   const head = pr.headSha;
   const short = String(head ?? "").slice(0, 8);
   const reviews = operativeAllyReviews(pr.reviews, head, "app");
-  if (!isSupersedingAppRereview("app", reviews)) return [];
-  const latest = [...reviews].sort(bySubmission).at(-1);
-  return [
-    `PR #${pr.number} @${short}: ${reviews.length} operative Ally App reviews (${reviewDetails(reviews)}) with distinct bodies — ` +
-      `treating the latest (${latest?.id}, ${latest?.submitted_at ?? "no submission time"}) as the standing verdict. Legitimate for a re-review of an ` +
-      `unchanged head; also the signature of two concurrent runs, which review data cannot distinguish (BLO-25764). ` +
-      `Exclusion belongs at dispatch — see BLO-20074.`,
-  ];
+  const notices = [];
+  if (isSupersedingAppRereview("app", reviews)) {
+    const latest = [...reviews].sort(bySubmission).at(-1);
+    notices.push(
+      `PR #${pr.number} @${short}: ${reviews.length} operative Ally App reviews (${reviewDetails(reviews)}) with distinct bodies — ` +
+        `treating the latest (${latest?.id}, ${latest?.submitted_at ?? "no submission time"}) as the standing verdict. Legitimate for a re-review of an ` +
+        `unchanged head; also the signature of two concurrent runs, which review data cannot distinguish (BLO-25764). ` +
+        `Exclusion belongs at dispatch — see BLO-20074.`,
+    );
+  }
+  for (const review of reviews) {
+    const attested = attestedHead(review.body);
+    if (!attested || attested === String(head ?? "").toLowerCase()) continue;
+    const superseding = supersedingAttestation(review, pr.reviews, head);
+    if (!superseding) continue;
+    notices.push(
+      `PR #${pr.number} @${short}: Ally App review ${review.id} attests head ${attested.slice(0, 8)} but GitHub re-anchored it onto ${short}; ` +
+        `the later review ${superseding.id} (${reviewState(superseding)}) attests this head and is the one reviewDecision reads, ` +
+        `so ${review.id} backs nothing. Dismissing it would clear this notice.`,
+    );
+  }
+  return notices;
 }
 
 const SAME_LANE_RELATION_NOTES = {
@@ -1033,7 +1117,11 @@ export function findPrViolations(pr) {
           );
         }
 
-        if (attested && attested !== String(head ?? "").toLowerCase()) {
+        if (
+          attested &&
+          attested !== String(head ?? "").toLowerCase() &&
+          !supersedingAttestation(review, pr.reviews, head)
+        ) {
           violations.push(
             `I3 PR #${pr.number} @${short}: ${label} review ${review.id} attests head ${attested.slice(0, 8)} but is now recorded against ${short} — a force-push re-anchored it, so it stands as an attestation of a tree its author never read`,
           );

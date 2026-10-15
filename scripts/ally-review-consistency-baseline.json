@@ -16,7 +16,9 @@
     "disabled ratchet: with no entries, every finding on a mergeable PR fails the run.",
     "Separately (BLO-25764): the I1 shape four of them suppressed is no longer a violation when",
     "the bodies differ - a re-review supersedes. That exemption is I1-only and does not reach",
-    "I3, which asserts one canonical body and a matching attestation."
+    "I3, which asserts one canonical body and a matching attestation. I3 has its own, narrower",
+    "rule: a review GitHub re-anchored onto a head it never read is a notice, not a violation,",
+    "once a later App review attests that head (supersedingAttestation in the script)."
   ],
   "entries": []
 }
