@@ -71,6 +71,7 @@ import {
   schedulerLeaseHolder,
   type SchedulerLeaseHolder,
 } from "./services/scheduler-lease.js";
+import { superviseWorkerSingleton } from "./services/worker-singleton-supervisor.js";
 import { setDbInheritedTimeouts } from "./services/metrics.js";
 import { auditConfiguredHookCommandsOnBoot } from "./services/lifecycle-hook-command-audit.js";
 import {
@@ -982,6 +983,35 @@ export async function startServer(): Promise<StartedServer> {
   // loopback HTTP calls to /api/plugins/install (which require instance admin).
   // Lives only in this Node process — never written to disk or logged.
   const internalBootstrapToken = randomBytes(32).toString("hex");
+  /**
+   * BLO-43292. Leader election for the periodic scheduler tick, so a second
+   * replica can take the loop over when this one stops renewing.
+   *
+   * Declared out here, next to the interval handle it gates, because
+   * `shutdown()` has to release the lease: a graceful release is what keeps a
+   * rolling restart from costing a full lease TTL of dispatch silence.
+   *
+   * Null when leader election is switched off (see
+   * `PAPERCLIP_SCHEDULER_LEASE_ENABLED` at its construction below), in which
+   * case the tick behaves exactly as it did before this change.
+   */
+  let schedulerLease: SchedulerLeaseHolder | null = null;
+  /**
+   * BLO-46694. Whether this process may run the worker-tier singletons (DB
+   * backup, the reconcilers, the isolation reaper, the digest, the Linear
+   * tunnel, the plugin job scheduler and event outbox). Same lease, and the
+   * same switch, as the heartbeat timer: one holder runs every singleton.
+   *
+   * With no lease (scheduler disabled on this process, or the
+   * PAPERCLIP_SCHEDULER_LEASE_ENABLED=false kill-switch) the answer is "yes",
+   * which is the pre-lease single-replica behaviour. When the lease WILL exist
+   * but has not been constructed yet, the answer is "no": the supervisors
+   * re-check every renew interval and pick the loops up once it is held.
+   */
+  const workerSingletonsLeased =
+    config.heartbeatSchedulerEnabled && process.env.PAPERCLIP_SCHEDULER_LEASE_ENABLED !== "false";
+  const shouldRunWorkerSingletons = () =>
+    !workerSingletonsLeased || (schedulerLease?.shouldRunLoop() ?? false);
   const app = await createApp(db as any, {
     uiMode,
     serverPort: listenPort,
@@ -1018,6 +1048,7 @@ export async function startServer(): Promise<StartedServer> {
     betterAuthHandler,
     resolveSession,
     pluginWorkerManager,
+    shouldRunWorkerSingletons,
   });
   const server = createServer(app as unknown as Parameters<typeof createServer>[0]);
 
@@ -1148,19 +1179,6 @@ export async function startServer(): Promise<StartedServer> {
   let heartbeatSchedulerStopped = false;
   let heartbeatStartupRecoveryPending = false;
   let heartbeatSchedulerInterval: ReturnType<typeof setInterval> | null = null;
-  /**
-   * BLO-43292. Leader election for the periodic scheduler tick, so a second
-   * replica can take the loop over when this one stops renewing.
-   *
-   * Declared out here, next to the interval handle it gates, because
-   * `shutdown()` has to release the lease: a graceful release is what keeps a
-   * rolling restart from costing a full lease TTL of dispatch silence.
-   *
-   * Null when leader election is switched off (see
-   * `PAPERCLIP_SCHEDULER_LEASE_ENABLED` at its construction below), in which
-   * case the tick behaves exactly as it did before this change.
-   */
-  let schedulerLease: SchedulerLeaseHolder | null = null;
   /**
    * BLO-45212. Runs the one-shot recovery chain (crash reconciliation,
    * external-run reattach, full orphan reap, ...). Null
@@ -2503,7 +2521,8 @@ export async function startServer(): Promise<StartedServer> {
   
   // Database backup is a singleton scheduled task (writes one file per
   // interval; multiple replicas racing would clobber the same target).
-  // Worker tier owns this; API tier skips it entirely.
+  // Worker tier owns this; API tier skips it entirely. BLO-46694: only the
+  // scheduler lease holder runs it. A manual backup (API route) stays per-pod.
   if (config.databaseBackupEnabled && config.paperclipNodeRole !== "api") {
     const backupIntervalMs = config.databaseBackupIntervalMinutes * 60 * 1000;
 
@@ -2515,11 +2534,14 @@ export async function startServer(): Promise<StartedServer> {
       },
       "Automatic database backups enabled",
     );
-    setInterval(() => {
-      void runServerDatabaseBackup("scheduled").catch(() => {
-        // runServerDatabaseBackup already logs the failure with context.
-      });
-    }, backupIntervalMs);
+    superviseWorkerSingleton("database-backup", shouldRunWorkerSingletons, () => {
+      const timer = setInterval(() => {
+        void runServerDatabaseBackup("scheduled").catch(() => {
+          // runServerDatabaseBackup already logs the failure with context.
+        });
+      }, backupIntervalMs);
+      return () => clearInterval(timer);
+    });
   }
 
   // Merged-PR reconciler (BLO-9150). Worker-tier singleton (API tier skips it):
@@ -2552,8 +2574,12 @@ export async function startServer(): Promise<StartedServer> {
         }).catch((err) => {
           logger.error({ err }, "Merged-PR reconciler sweep failed");
         });
-      runReconcilerSweepTick();
-      setInterval(runReconcilerSweepTick, reconcilerIntervalMs);
+      // BLO-46694: lease holder only.
+      superviseWorkerSingleton("merged-pr-reconciler", shouldRunWorkerSingletons, () => {
+        runReconcilerSweepTick();
+        const timer = setInterval(runReconcilerSweepTick, reconcilerIntervalMs);
+        return () => clearInterval(timer);
+      });
     }
   }
 
@@ -2571,9 +2597,12 @@ export async function startServer(): Promise<StartedServer> {
       { intervalMinutes: config.strandedBlockedIssueReconcilerIntervalMinutes },
       "Stranded-blocked-issue reconciler enabled (BLO-21523)",
     );
-    startStrandedBlockedIssueReconciler(
-      db,
-      config.strandedBlockedIssueReconcilerIntervalMinutes * 60 * 1000,
+    // BLO-46694: lease holder only.
+    superviseWorkerSingleton("stranded-blocked-issue-reconciler", shouldRunWorkerSingletons, () =>
+      startStrandedBlockedIssueReconciler(
+        db,
+        config.strandedBlockedIssueReconcilerIntervalMinutes * 60 * 1000,
+      ),
     );
   }
 
@@ -2595,10 +2624,13 @@ export async function startServer(): Promise<StartedServer> {
       },
       "Approval-enforcement reconciler enabled (BLO-24631)",
     );
-    startApprovalEnforcementReconciler(
-      db,
-      config.approvalEnforcementReconcilerIntervalMinutes * 60 * 1000,
-      { graceHours: config.approvalEnforcementReconcilerGraceHours },
+    // BLO-46694: lease holder only.
+    superviseWorkerSingleton("approval-enforcement-reconciler", shouldRunWorkerSingletons, () =>
+      startApprovalEnforcementReconciler(
+        db,
+        config.approvalEnforcementReconcilerIntervalMinutes * 60 * 1000,
+        { graceHours: config.approvalEnforcementReconcilerGraceHours },
+      ),
     );
   }
 
@@ -2624,14 +2656,17 @@ export async function startServer(): Promise<StartedServer> {
       },
       "Isolation-workspace reaper enabled (BLO-31222)",
     );
-    startIsolationWorkspaceReaper(
-      db,
-      config.isolationWorkspaceReaperIntervalMinutes * 60 * 1000,
-      {
-        maxAgeDays: config.isolationWorkspaceReaperMaxAgeDays,
-        maxDeletesPerTick: config.isolationWorkspaceReaperMaxDeletesPerTick,
-        dryRun: config.isolationWorkspaceReaperDryRun,
-      },
+    // BLO-46694: lease holder only.
+    superviseWorkerSingleton("isolation-workspace-reaper", shouldRunWorkerSingletons, () =>
+      startIsolationWorkspaceReaper(
+        db,
+        config.isolationWorkspaceReaperIntervalMinutes * 60 * 1000,
+        {
+          maxAgeDays: config.isolationWorkspaceReaperMaxAgeDays,
+          maxDeletesPerTick: config.isolationWorkspaceReaperMaxDeletesPerTick,
+          dryRun: config.isolationWorkspaceReaperDryRun,
+        },
+      ),
     );
   }
 
@@ -2652,9 +2687,12 @@ export async function startServer(): Promise<StartedServer> {
       },
       "Human-gated ageing digest enabled (BLO-29420)",
     );
-    startHumanGatedDigestSweep(db, config.humanGatedDigestIntervalMinutes * 60 * 1000, {
-      periodDays: config.humanGatedDigestPeriodDays,
-    });
+    // BLO-46694: lease holder only.
+    superviseWorkerSingleton("human-gated-digest-sweep", shouldRunWorkerSingletons, () =>
+      startHumanGatedDigestSweep(db, config.humanGatedDigestIntervalMinutes * 60 * 1000, {
+        periodDays: config.humanGatedDigestPeriodDays,
+      }),
+    );
   }
 
   // Open-PR review-state reconciler (BLO-30259). Worker-tier singleton. Feeds
@@ -2685,10 +2723,13 @@ export async function startServer(): Promise<StartedServer> {
         },
         "Open-PR review-state reconciler enabled (BLO-30259)",
       );
-      startPrReviewStateReconciler(
-        db,
-        config.prReviewStateReconcilerIntervalMinutes * 60 * 1000,
-        { maxPullRequests: config.prReviewStateMaxPullRequestsPerRepo },
+      // BLO-46694: lease holder only.
+      superviseWorkerSingleton("pr-review-state-reconciler", shouldRunWorkerSingletons, () =>
+        startPrReviewStateReconciler(
+          db,
+          config.prReviewStateReconcilerIntervalMinutes * 60 * 1000,
+          { maxPullRequests: config.prReviewStateMaxPullRequestsPerRepo },
+        ),
       );
     }
   }
@@ -2711,7 +2752,10 @@ export async function startServer(): Promise<StartedServer> {
         { intervalMinutes: config.approvalGateReconcilerIntervalMinutes },
         "Approval-gate reconciler enabled (BLO-29359)",
       );
-      startApprovalGateReconciler(db, config.approvalGateReconcilerIntervalMinutes * 60 * 1000);
+      // BLO-46694: lease holder only.
+      superviseWorkerSingleton("approval-gate-reconciler", shouldRunWorkerSingletons, () =>
+        startApprovalGateReconciler(db, config.approvalGateReconcilerIntervalMinutes * 60 * 1000),
+      );
     }
   }
   // Terminal-gate reconciler (BLO-27515). Worker-tier singleton. Re-reads the
@@ -2741,9 +2785,12 @@ export async function startServer(): Promise<StartedServer> {
         { intervalMinutes: config.terminalGateReconcilerIntervalMinutes },
         "Terminal-gate reconciler enabled (BLO-27515)",
       );
-      startTerminalGateReconciler(
-        db,
-        config.terminalGateReconcilerIntervalMinutes * 60 * 1000,
+      // BLO-46694: lease holder only.
+      superviseWorkerSingleton("terminal-gate-reconciler", shouldRunWorkerSingletons, () =>
+        startTerminalGateReconciler(
+          db,
+          config.terminalGateReconcilerIntervalMinutes * 60 * 1000,
+        ),
       );
     }
   }
@@ -2765,6 +2812,11 @@ export async function startServer(): Promise<StartedServer> {
   // lived inside the feature flag (as this first shipped), switching capture
   // off stopped the sweep with it: the moment an operator believes the exposure
   // ended was the moment it became permanent. (CTO review, PEN-3631.)
+  //
+  // BLO-46694: deliberately NOT lease-gated. Capture is per-process by nature
+  // (each pod snapshots its own heap), and the retention prune is idempotent
+  // deletes over a shared directory, so two pods pruning at once only race to
+  // remove the same files; `keep` stays a directory-wide cap either way.
   if (config.paperclipNodeRole !== "api") {
     // Config carries each of these in the unit its env var is written in, so
     // the bounds key can match the field name (see NUMERIC_SETTING_BOUNDS).
@@ -3209,7 +3261,17 @@ export async function startServer(): Promise<StartedServer> {
   // Auto-install bundled plugins (idempotent — skips if already installed).
   // Skipped on the API tier: /api/plugins/install hits pluginWorkerManager
   // which is stubbed; the workers tier owns plugin installs.
-  if (config.paperclipNodeRole !== "api") {
+  // BLO-46694: lease holder only, so two workers do not install concurrently.
+  // Checked once at boot, not supervised: the install lands in the shared DB,
+  // so a later takeover finds it already done and has nothing to repeat. (A
+  // supervisor would also register a timer after the scheduler's, which the
+  // startup tests rely on being last.)
+  if (config.paperclipNodeRole !== "api" && !shouldRunWorkerSingletons()) {
+    logger.info(
+      { singleton: "bundled-plugin-auto-install" },
+      "worker singleton skipped - not the scheduler lease holder",
+    );
+  } else if (config.paperclipNodeRole !== "api") {
     void autoInstallBundledPlugins(db as any, internalBootstrapToken).catch((err) => {
       logger.warn({ err }, "auto-install of bundled plugins failed (non-fatal)");
     });
@@ -3223,37 +3285,53 @@ export async function startServer(): Promise<StartedServer> {
   // Start Linear tunnel if Linear is connected and cloudflared is available.
   // The tunnel is a singleton outbound cloudflared process; running multiple
   // copies (one per API replica) would point Linear's webhooks at whichever
-  // tunnel won the race. Worker tier owns this.
+  // tunnel won the race. Worker tier owns this. BLO-46694: and only the
+  // scheduler lease holder; a holder that loses the lease stops its tunnel.
   if (config.linearOAuthClientId && config.paperclipNodeRole !== "api") {
-    void (async () => {
-      try {
-        const { secretService } = await import("./services/index.js");
-        const svc = secretService(db as any);
-        // Find any company with a Linear token
-        const allCompanies = await (db as any).select().from(companies);
-        for (const company of allCompanies) {
-          const linearSecret = await svc.getByName(company.id, "linear-oauth-token");
-          if (linearSecret) {
-            const token = await svc.resolveSecretValue(company.id, linearSecret.id, "latest");
-            // Get teamId from plugin config
-            const [plugin] = await (db as any).select().from(plugins).where(eq(plugins.pluginKey, "paperclip-plugin-linear")).limit(1);
-            let teamId = "";
-            if (plugin) {
-              const { pluginConfig: pluginConfigTable } = await import("@paperclipai/db");
-              const [cfg] = await (db as any).select().from(pluginConfigTable).where(eq(pluginConfigTable.pluginId, plugin.id));
-              teamId = (cfg?.configJson as Record<string, unknown>)?.teamId as string ?? "";
+    superviseWorkerSingleton("linear-tunnel", shouldRunWorkerSingletons, () => {
+      // Held so a lease loss can also delete the webhook this holder
+      // registered, rather than leave Linear pointed at a dead tunnel.
+      let tunnelToken: string | null = null;
+      let stopped = false;
+      void (async () => {
+        try {
+          const { secretService } = await import("./services/index.js");
+          const svc = secretService(db as any);
+          // Find any company with a Linear token
+          const allCompanies = await (db as any).select().from(companies);
+          for (const company of allCompanies) {
+            const linearSecret = await svc.getByName(company.id, "linear-oauth-token");
+            if (linearSecret) {
+              const token = await svc.resolveSecretValue(company.id, linearSecret.id, "latest");
+              // Get teamId from plugin config
+              const [plugin] = await (db as any).select().from(plugins).where(eq(plugins.pluginKey, "paperclip-plugin-linear")).limit(1);
+              let teamId = "";
+              if (plugin) {
+                const { pluginConfig: pluginConfigTable } = await import("@paperclipai/db");
+                const [cfg] = await (db as any).select().from(pluginConfigTable).where(eq(pluginConfigTable.pluginId, plugin.id));
+                teamId = (cfg?.configJson as Record<string, unknown>)?.teamId as string ?? "";
+              }
+              if (token && teamId && !stopped) {
+                tunnelToken = token;
+                const { startLinearTunnel, stopLinearTunnel } = await import("./linear-tunnel.js");
+                await startLinearTunnel({ port: listenPort, linearToken: token, teamId });
+                // Lost the lease while the tunnel was coming up.
+                if (stopped) await stopLinearTunnel(token);
+              }
+              break; // Only need one company's token
             }
-            if (token && teamId) {
-              const { startLinearTunnel } = await import("./linear-tunnel.js");
-              await startLinearTunnel({ port: listenPort, linearToken: token, teamId });
-            }
-            break; // Only need one company's token
           }
+        } catch (err) {
+          logger.info("[linear-tunnel] skipped (not connected or cloudflared unavailable)");
         }
-      } catch (err) {
-        logger.info("[linear-tunnel] skipped (not connected or cloudflared unavailable)");
-      }
-    })();
+      })();
+      return () => {
+        stopped = true;
+        void import("./linear-tunnel.js")
+          .then(({ stopLinearTunnel }) => stopLinearTunnel(tunnelToken ?? undefined))
+          .catch((err) => logger.warn({ err }, "[linear-tunnel] stop on lease loss failed"));
+      };
+    });
   }
 
   {

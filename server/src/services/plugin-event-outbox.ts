@@ -7,9 +7,15 @@ import type { PluginEventBus } from "./plugin-event-bus.js";
 /**
  * Worker-tier poller that drains the plugin_event_outbox and is the SOLE
  * emitter of plugin domain events. `publishPluginDomainEvent` only enqueues
- * rows; this loop claims them (CAS — single worker replica, no SKIP LOCKED),
- * emits to the in-process bus in creation order, and marks them processed.
- * One writer + one emitter ⇒ no double-delivery.
+ * rows; this loop claims them (CAS, no SKIP LOCKED), emits to the in-process
+ * bus in creation order, and marks them processed. One writer + one emitter ⇒
+ * no double-delivery.
+ *
+ * "One emitter" is enforced by the scheduler lease, not by replica count
+ * (BLO-46694): app.ts starts this only on the lease holder. Two things here
+ * still assume that and are NOT safe beside a second live poller:
+ * `resetStaleProcessing` requeues the other poller's in-flight rows, and the
+ * claim emits in `seq` order only within one process.
  */
 
 const POLL_INTERVAL_MS = 1_000;
@@ -21,8 +27,11 @@ const RETENTION_DELETE_BATCH = 5_000;
 const RETENTION_MAX_ITERATIONS = 100;
 
 /**
- * Requeue rows left in `processing` by a previous crash. Safe because there is
- * exactly one worker replica, so nothing is mid-flight at startup.
+ * Requeue rows left in `processing` by a previous crash (or by a previous lease
+ * holder). Safe because only the scheduler lease holder runs this poller, so
+ * nothing else is mid-flight when it starts. On a takeover the old holder can
+ * still be finishing one batch, which this re-emits: at-least-once, bounded by
+ * one batch per takeover.
  */
 export async function resetStaleProcessing(db: Db): Promise<number> {
   const rows = await db
@@ -45,14 +54,20 @@ export async function pollOnce(db: Db, bus: PluginEventBus): Promise<number> {
     .update(pluginEventOutbox)
     .set({ status: "processing", updatedAt: new Date() })
     .where(
-      inArray(
-        pluginEventOutbox.id,
-        db
-          .select({ id: pluginEventOutbox.id })
-          .from(pluginEventOutbox)
-          .where(eq(pluginEventOutbox.status, "queued"))
-          .orderBy(asc(pluginEventOutbox.seq))
-          .limit(CLAIM_BATCH),
+      and(
+        // Re-checked against the row as locked. Without it the outer UPDATE
+        // matches on `id` alone, and a concurrent claimer that waited on the
+        // row lock would claim the same rows again after the first commits.
+        eq(pluginEventOutbox.status, "queued"),
+        inArray(
+          pluginEventOutbox.id,
+          db
+            .select({ id: pluginEventOutbox.id })
+            .from(pluginEventOutbox)
+            .where(eq(pluginEventOutbox.status, "queued"))
+            .orderBy(asc(pluginEventOutbox.seq))
+            .limit(CLAIM_BATCH),
+        ),
       ),
     )
     .returning();
