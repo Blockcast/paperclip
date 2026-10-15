@@ -47,6 +47,46 @@
  * tell "sampled 18 000 times, nothing above 1.1 GB" apart from "the sampler
  * never started", which are the same gauge value and opposite conclusions.
  *
+ * ## The third axis: `external_memory` (added 2026-10-15)
+ *
+ * The worker's step does not look like the api's. Caught at 60 s resolution on
+ * `paperclip-0` (instance `10.244.3.67`) on 2026-10-15, across a single dropped
+ * scrape at 09:31Z — `up` for that target was 0 at exactly that minute, so the
+ * process did not answer while it happened:
+ *
+ * | time  | rss    | heapTotal | heapUsed | native_unaccounted |
+ * |-------|--------|-----------|----------|--------------------|
+ * | 09:30 | 1285.8 | 656.7     | 531.4    | 526.3              |
+ * | 09:31 | —      | —         | —        | — (scrape dropped) |
+ * | 09:32 | 2381.9 | 741.1     | **471.8**| 1577.3             |
+ *
+ * (MiB.) RSS gained **+1096 MiB** while `heapUsed` **fell** ~60 MiB, and four
+ * hours later it had not come back. {@link HEAP_USED_PEAK_COMPONENT} cannot
+ * explain that step — the heap is not where it landed. But `external` and
+ * `array_buffers` are *also* back at baseline on the far side (20.1 / 25.7 MiB),
+ * which is what a large transient Buffer allocation looks like one scrape later:
+ * allocated, freed, and the pages never returned to the OS.
+ *
+ * `v8.getHeapStatistics().external_memory` is the same number as
+ * `process.memoryUsage().external` (verified byte-identical on Node 24) and costs
+ * nothing extra here — it is already in the struct this sampler copies every
+ * second. Tracking its peak turns that hypothesis into a decision a reader can
+ * make from one query:
+ *
+ * - `external_peak` ≈ the size of the RSS step ⇒ the burst **is** external /
+ *   ArrayBuffer memory, which V8 does account for. That is server-code-shaped:
+ *   find the unbounded read and bound it.
+ * - `external_peak` flat near its scrape value ⇒ the burst is native memory V8
+ *   never sees, and no V8-sourced gauge will ever find it. The next instrument
+ *   is then malloc-level (`malloc_info(3)`), not another component from here.
+ *
+ * ⛔ The lower-bound caveat above applies to this component unchanged, and the
+ * dropped 09:31 scrape is exactly why it bites hardest here: a process too
+ * stalled to answer `/metrics` may well be too stalled to run this timer, so a
+ * FLAT `external_peak` across a step is much weaker evidence than a high one.
+ * Read {@link HeapPeakReading.sampleCount} against the process's age before
+ * concluding anything from a flat peak — the two readings are not symmetric.
+ *
  * ## What it is not
  *
  * ⛔ Not a fix, and not an alert source on its own. It answers one question —
@@ -78,12 +118,20 @@ export const DEFAULT_SAMPLE_INTERVAL_MS = 1_000;
 export const HEAP_USED_PEAK_COMPONENT = "heap_used_peak";
 /** Lifetime peak of `v8.getHeapStatistics().total_heap_size` (V8's COMMITTED heap). */
 export const HEAP_TOTAL_PEAK_COMPONENT = "heap_total_peak";
+/**
+ * Lifetime peak of `v8.getHeapStatistics().external_memory` — ArrayBuffer and
+ * other external memory, the axis the worker's 2026-10-15T09:31Z step is
+ * consistent with and the heap peaks are not. See the module docblock.
+ */
+export const EXTERNAL_PEAK_COMPONENT = "external_peak";
 
 export interface HeapPeakReading {
   /** Highest `used_heap_size` seen since process start, in bytes. */
   usedPeakBytes: number;
   /** Highest `total_heap_size` seen since process start, in bytes. */
   totalPeakBytes: number;
+  /** Highest `external_memory` seen since process start, in bytes. */
+  externalPeakBytes: number;
   /** How many samples contributed. 0 means the sampler never ran — see the module docblock. */
   sampleCount: number;
   /** The interval those samples were taken at, which bounds what could have been missed. */
@@ -94,11 +142,18 @@ export interface HeapPeakReading {
 export interface HeapSizeReading {
   used_heap_size?: number;
   total_heap_size?: number;
+  /**
+   * `external_memory`. Byte-identical to `process.memoryUsage().external` but
+   * read from the struct this sampler already copies, so tracking it adds no
+   * syscall — the constraint the module docblock sets for this timer.
+   */
+  external_memory?: number;
 }
 
 interface TrackerState {
   usedPeakBytes: number;
   totalPeakBytes: number;
+  externalPeakBytes: number;
   sampleCount: number;
   sampleIntervalMs: number;
 }
@@ -106,6 +161,7 @@ interface TrackerState {
 const state: TrackerState = {
   usedPeakBytes: 0,
   totalPeakBytes: 0,
+  externalPeakBytes: 0,
   sampleCount: 0,
   sampleIntervalMs: DEFAULT_SAMPLE_INTERVAL_MS,
 };
@@ -135,6 +191,9 @@ export function recordHeapPeakSample(reading: HeapSizeReading): void {
   if (finite(reading.total_heap_size) && reading.total_heap_size > state.totalPeakBytes) {
     state.totalPeakBytes = reading.total_heap_size;
   }
+  if (finite(reading.external_memory) && reading.external_memory > state.externalPeakBytes) {
+    state.externalPeakBytes = reading.external_memory;
+  }
 }
 
 /**
@@ -151,6 +210,7 @@ export function readHeapPeaks(): HeapPeakReading | null {
   return {
     usedPeakBytes: state.usedPeakBytes,
     totalPeakBytes: state.totalPeakBytes,
+    externalPeakBytes: state.externalPeakBytes,
     sampleCount: state.sampleCount,
     sampleIntervalMs: state.sampleIntervalMs,
   };
@@ -210,6 +270,7 @@ export function startHeapPeakTracking(options: StartHeapPeakTrackingOptions = {}
 export function __resetHeapPeakTrackerForTest(): void {
   state.usedPeakBytes = 0;
   state.totalPeakBytes = 0;
+  state.externalPeakBytes = 0;
   state.sampleCount = 0;
   state.sampleIntervalMs = DEFAULT_SAMPLE_INTERVAL_MS;
 }
