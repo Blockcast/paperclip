@@ -69,6 +69,7 @@ const TRIGGERS: Array<[cron: string, timeZone: string]> = [
 
 const rows = TRIGGERS.map(([cronExpression, timezone], index) => ({
   routineId: `routine-${index}`,
+  companyId: "company-1",
   createdAt: new Date("2026-01-01T00:00:00Z"),
   triggerKind: "schedule",
   cronExpression,
@@ -172,9 +173,9 @@ describe("scrape-metrics collector: routine-fire-gap refresh work per tick (BLO-
     const intervals = await scrape(`${ROUTINE_FIRE_INTERVAL_METRIC}{`);
     // Every trigger but `0 0 31 2 *` (it never fires, so it has no cadence).
     expect(intervals).toHaveLength(TRIGGERS.length - 1);
-    expect(intervals).toContain(`${ROUTINE_FIRE_INTERVAL_METRIC}{routine_id="routine-17"} ${366 * DAY_SECONDS}`);
-    expect(intervals).toContain(`${ROUTINE_FIRE_INTERVAL_METRIC}{routine_id="routine-5"} ${4 * 60 * 60}`);
-    expect(intervals).toContain(`${ROUTINE_FIRE_INTERVAL_METRIC}{routine_id="routine-7"} ${3 * DAY_SECONDS}`);
+    expect(intervals).toContain(`${ROUTINE_FIRE_INTERVAL_METRIC}{routine_id="routine-17",company_id="company-1"} ${366 * DAY_SECONDS}`);
+    expect(intervals).toContain(`${ROUTINE_FIRE_INTERVAL_METRIC}{routine_id="routine-5",company_id="company-1"} ${4 * 60 * 60}`);
+    expect(intervals).toContain(`${ROUTINE_FIRE_INTERVAL_METRIC}{routine_id="routine-7",company_id="company-1"} ${3 * DAY_SECONDS}`);
 
     // The boot tick derived each trigger once, and no single derivation is
     // over the per-trigger bound.
