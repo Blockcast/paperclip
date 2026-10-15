@@ -10674,6 +10674,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       },
     ]);
 
+    // BLO-46812: the landed cancel must be counted exactly once.
+    const readSuppressed = async () => {
+      const { body } = await renderMetrics();
+      const m = body.match(/^paperclip_heartbeat_duplicate_dispatch_suppressed_total (\S+)$/m);
+      return Number(m?.[1]);
+    };
+    const suppressedBefore = await readSuppressed();
+
     await heartbeat.resumeQueuedRuns();
     await waitForRunToSettle(heartbeat, olderRunId);
 
@@ -10685,6 +10693,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     const winner = runs.find((r) => r.id === olderRunId);
     const loser = runs.find((r) => r.id === newerRunId);
+    expect((await readSuppressed()) - suppressedBefore).toBe(1);
     // Older row wins per startNextQueuedRunForAgent's createdAt-ASC tie-break.
     // We only assert the winner was claimed past `queued` — the dedupe gate's
     // job is to ensure exactly one row leaves the queued state per (agent,
