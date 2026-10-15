@@ -443,6 +443,7 @@ import {
   recordOrphanReapStage,
   recordConcurrentRunBlocked,
   recordAgentDispatchDeclined,
+  recordDuplicateDispatchSuppressed,
   recordHeartbeatRunFailed,
   recordOrphanedManagedPodReaped,
   recordProcessLost,
@@ -25032,6 +25033,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
     if (!outcome.updated) return null;
     const cancelled = outcome.run;
+    recordDuplicateDispatchSuppressed();
 
     await setWakeupStatus(run.wakeupRequestId, "skipped", {
       finishedAt: now,
@@ -31809,8 +31811,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             // repeatedly.
             const cancelled = await cancelQueuedRunForDuplicateDispatch(queuedRun, queuedIssueId);
             if (cancelled) {
-              logger.info(
-                { runId: queuedRun.id, agentId, issueId: queuedIssueId },
+              logger.warn(
+                {
+                  runId: queuedRun.id,
+                  agentId,
+                  issueId: queuedIssueId,
+                  errorCode: "duplicate_dispatch_suppressed",
+                },
                 "startNextQueuedRunForAgent: cancelled duplicate queued run for in-flight issue",
               );
             }

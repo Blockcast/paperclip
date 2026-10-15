@@ -1153,6 +1153,23 @@ export const AGENT_START_LOCK_PHASE_SECONDS_METRIC = "paperclip_agent_start_lock
  */
 export const AGENT_START_LOCK_ABORTED_METRIC = "paperclip_agent_start_lock_aborted_total";
 /**
+ * Queued runs cancelled as `duplicate_dispatch_suppressed` (BLO-46812).
+ *
+ * A start-lock reap that bails, or stale orphan state, leaves a dead run
+ * reading `running`, and dispatch then cancels queued same-issue work here.
+ * That cancel was invisible: the run ends `cancelled`, not `failed`, so
+ * {@link HEARTBEAT_RUN_FAILED_METRIC} can never carry it, and its log line
+ * carried no errorCode. Incremented only when the status CAS lands, so it
+ * counts DB rows, not dispatch passes.
+ *
+ * Unlabelled on purpose: prom-client exports an unlabelled counter at 0 from
+ * registration, so the first cancel on a pod is a 0->1 transition that
+ * `increase()` sees (see seedAgentStartLockAbortedSeries for the trap a
+ * labelled counter falls into).
+ */
+export const HEARTBEAT_DUPLICATE_DISPATCH_SUPPRESSED_METRIC =
+  "paperclip_heartbeat_duplicate_dispatch_suppressed_total";
+/**
  * How each dispatch pass resolved its start-lock orphan reap (BLO-42010).
  *
  * The bound shipped in BLO-41036 stops the outage by letting a waiter give up
@@ -3681,6 +3698,7 @@ let approvalQueueMetricsRefreshSuccess: Gauge | null = null;
 let agentStartLockHeldSeconds: Gauge<"agent_id"> | null = null;
 let agentStartLockPhaseSeconds: Gauge<"agent_id" | "phase"> | null = null;
 let agentStartLockAbortedTotal: Counter<"agent_id"> | null = null;
+let duplicateDispatchSuppressedTotal: Counter | null = null;
 let processLostTotal: Counter<"adapter" | "error_bucket" | "classification"> | null = null;
 let externalLifecycleRunningRuns: Gauge<"adapter"> | null = null;
 let externalLifecycleRunSilenceGap: Histogram<"adapter" | "status"> | null = null;
@@ -3891,6 +3909,7 @@ function ensureRegistry(): {
   agentStartLockHeldSecondsGauge: Gauge<"agent_id">;
   agentStartLockPhaseSecondsGauge: Gauge<"agent_id" | "phase">;
   agentStartLockAbortedTotalCounter: Counter<"agent_id">;
+  duplicateDispatchSuppressedCounter: Counter;
   prReviewQueueWaitHistogram: Histogram;
   runDispatchWaitHistogram: Histogram;
   authRequestCounter: Counter<"operation" | "outcome">;
@@ -3968,6 +3987,7 @@ function ensureRegistry(): {
     || !agentStartLockHeldSeconds
     || !agentStartLockPhaseSeconds
     || !agentStartLockAbortedTotal
+    || !duplicateDispatchSuppressedTotal
     || !processLostTotal
     || !externalLifecycleRunningRuns
     || !externalLifecycleRunSilenceGap
@@ -4436,6 +4456,16 @@ function ensureRegistry(): {
         + "fire. A 0 here therefore means \"this agent dispatched on this pod and was never "
         + "aborted\", which is the healthy reading, NOT a missing metric.",
       labelNames: ["agent_id"],
+      registers: [registry],
+    });
+    duplicateDispatchSuppressedTotal = new Counter({
+      name: HEARTBEAT_DUPLICATE_DISPATCH_SUPPRESSED_METRIC,
+      help:
+        "Queued heartbeat runs cancelled as duplicate_dispatch_suppressed because another run for "
+        + "the same issue reads in-flight (BLO-46812). Counts landed cancels only, so it should match "
+        + "a DB count of heartbeat_runs with error_code='duplicate_dispatch_suppressed'. Mixes benign "
+        + "same-tick wake dedupes with stale-running losses, so do not alert on raw non-zero; a rise "
+        + "alongside start-lock reap timed_out may indicate a stale running row cost a dispatch.",
       registers: [registry],
     });
     agentStartLockPhaseSeconds = new Gauge({
@@ -5744,6 +5774,7 @@ function ensureRegistry(): {
     agentStartLockHeldSecondsGauge: agentStartLockHeldSeconds,
     agentStartLockPhaseSecondsGauge: agentStartLockPhaseSeconds,
     agentStartLockAbortedTotalCounter: agentStartLockAbortedTotal,
+    duplicateDispatchSuppressedCounter: duplicateDispatchSuppressedTotal,
     processLostTotalCounter: processLostTotal,
     externalLifecycleRunningRunsGauge: externalLifecycleRunningRuns,
     externalLifecycleRunSilenceGapHistogram: externalLifecycleRunSilenceGap,
@@ -6597,6 +6628,11 @@ export function setDbInheritedTimeouts(settings: readonly DbInheritedTimeoutSett
  */
 export function recordAgentStartLockAborted(agentId: string): void {
   ensureRegistry().agentStartLockAbortedTotalCounter.inc({ agent_id: agentId });
+}
+
+/** Increment {@link HEARTBEAT_DUPLICATE_DISPATCH_SUPPRESSED_METRIC}. Call once per landed cancel. */
+export function recordDuplicateDispatchSuppressed(): void {
+  ensureRegistry().duplicateDispatchSuppressedCounter.inc();
 }
 
 /**
@@ -8203,6 +8239,7 @@ export function __resetMetricsForTest(): void {
   agentStartLockHeldSeconds = null;
   agentStartLockPhaseSeconds = null;
   agentStartLockAbortedTotal = null;
+  duplicateDispatchSuppressedTotal = null;
   processOpenFdsByClass = null;
   processMemoryComponentBytes = null;
   processV8ContextCount = null;
