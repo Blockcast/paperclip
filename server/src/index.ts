@@ -1056,6 +1056,14 @@ export async function startServer(): Promise<StartedServer> {
     pluginWorkerManager,
     shouldRunWorkerSingletons,
   });
+  // BLO-46711: createApp's own lease-gated singletons (plugin job scheduler,
+  // plugin event outbox) join the list shutdown stops before the release.
+  // Only when there is a lease to hand over: without one, paperclipShutdown
+  // stops them as before, so the outbox still delivers events the drain emits.
+  workerSingletonStops.push(() => {
+    if (!schedulerLease) return;
+    (app as { locals?: { stopWorkerSingletons?: () => void } }).locals?.stopWorkerSingletons?.();
+  });
   const server = createServer(app as unknown as Parameters<typeof createServer>[0]);
 
   // Increase keep-alive timeouts to safely outlive default idle timeouts

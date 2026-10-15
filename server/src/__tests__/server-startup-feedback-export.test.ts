@@ -246,7 +246,7 @@ vi.mock("@paperclipai/db", async (importOriginal) => ({
 //
 // BLO-46694: `singletonLease.leader` lets the worker-singleton tests below run
 // this process as a follower. Every other test leaves it `true`.
-const singletonLease = vi.hoisted(() => ({ leader: true }));
+const singletonLease = vi.hoisted(() => ({ leader: true, events: [] as string[] }));
 vi.mock("../services/scheduler-lease.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../services/scheduler-lease.js")>()),
   schedulerLeaseHolder: vi.fn((_db: unknown, opts?: { onAcquire?: () => void }) => ({
@@ -257,7 +257,10 @@ vi.mock("../services/scheduler-lease.js", async (importOriginal) => ({
       if (singletonLease.leader) opts?.onAcquire?.();
       return singletonLease.leader;
     },
-    stop: async () => false,
+    stop: async (stopOpts?: { release?: boolean }) => {
+      singletonLease.events.push(`lease-stop release=${stopOpts?.release}`);
+      return false;
+    },
   })),
 }));
 
@@ -2482,5 +2485,37 @@ describe("startServer worker-tier singletons (BLO-46694)", () => {
     } finally {
       restore();
     }
+  });
+  // BLO-46711: createApp's lease-gated singletons (plugin job scheduler, plugin
+  // event outbox) must stop before the lease is released, or the old pod's
+  // outbox polls beside the survivor that just took the lease over.
+  const shutdownOrder = async () => {
+    const appStop = vi.fn(() => singletonLease.events.push("app-singletons-stop"));
+    createAppMock.mockResolvedValueOnce(Object.assign(() => {}, { locals: { stopWorkerSingletons: appStop } }) as never);
+    singletonLease.events.length = 0;
+    const priorSigterm = process.listeners("SIGTERM");
+    process.removeAllListeners("SIGTERM");
+    try {
+      await startServer();
+      process.emit("SIGTERM" as NodeJS.Signals);
+      // fakeServer.close never calls back, so the handler parks there, after the release.
+      await vi.waitFor(() => expect(fakeServer.close).toHaveBeenCalled());
+      return { appStop, events: [...singletonLease.events] };
+    } finally {
+      process.removeAllListeners("SIGTERM");
+      for (const listener of priorSigterm) process.on("SIGTERM", listener as (...args: unknown[]) => void);
+    }
+  };
+
+  it("the lease holder stops the app-tier singletons before releasing the lease", async () => {
+    const { events } = await shutdownOrder();
+    expect(events).toEqual(["app-singletons-stop", "lease-stop release=true"]);
+  });
+
+  it("with no lease, shutdown leaves the app-tier singletons to paperclipShutdown", async () => {
+    loadConfigMock.mockReturnValue(buildTestConfig({ paperclipNodeRole: "worker" as const, heartbeatSchedulerEnabled: false }));
+    const { appStop, events } = await shutdownOrder();
+    expect(appStop).not.toHaveBeenCalled();
+    expect(events).toEqual([]);
   });
 });
