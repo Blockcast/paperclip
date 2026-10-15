@@ -16,7 +16,7 @@
 
 import type { PluginContext, PluginWebhookInput } from "@paperclipai/plugin-sdk";
 import { WEBHOOK_KEYS } from "./constants.js";
-import { ALERTMANAGER_READ_TIMEOUT_MS } from "./escalation.js";
+import { ALERTMANAGER_READ_TIMEOUT_MS, resolveAlertmanagerApiUrl } from "./escalation.js";
 import { alertMatchesLabelFilter } from "./issue-mapping.js";
 import { handleWebhook, readAlertState } from "./webhook-handler.js";
 import type {
@@ -105,7 +105,7 @@ export async function reconcileActiveAlerts(
   now: Date = new Date(),
 ): Promise<ReconcileResult> {
   const receivers = new Set((config.reconcileReceivers ?? []).filter((r) => typeof r === "string" && r));
-  const base = config.alertmanagerApiUrl?.trim().replace(/\/+$/, "");
+  const base = resolveAlertmanagerApiUrl(config);
   const companyId = config.defaultCompanyId;
   if (receivers.size === 0) return { skipped: "no reconcileReceivers configured", routed: 0, backfilled: [] };
   if (!base || !["http:", "https:"].includes(URL.parse(base)?.protocol ?? "")) {
