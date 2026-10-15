@@ -70,6 +70,7 @@
 import { getHeapStatistics } from "node:v8";
 
 import {
+  EXTERNAL_PEAK_COMPONENT,
   HEAP_TOTAL_PEAK_COMPONENT,
   HEAP_USED_PEAK_COMPONENT,
   type HeapPeakReading,
@@ -245,6 +246,11 @@ export function collectNativeMemorySnapshot(
   if (peaks) {
     components.set(HEAP_USED_PEAK_COMPONENT, peaks.usedPeakBytes);
     components.set(HEAP_TOTAL_PEAK_COMPONENT, peaks.totalPeakBytes);
+    // The worker's measured step moved RSS +1096 MiB while `heapUsed` FELL, so
+    // the heap peaks above cannot account for it. This is the axis it could have
+    // landed on that V8 still accounts for; a flat reading here is what sends the
+    // next instrument to malloc level instead. See the tracker's docblock.
+    components.set(EXTERNAL_PEAK_COMPONENT, peaks.externalPeakBytes);
   }
 
   if (finite(heap.number_of_native_contexts)) {

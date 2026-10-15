@@ -15,12 +15,18 @@
  *    two months for exactly that conflation on `nodejs_heap_size_used_bytes`.
  * 3. **The sampler must not keep the process alive.** `unref()` on the timer.
  * 4. **One throwing read must not blind the sampler for the process lifetime.**
+ * 5. **`external_peak` must be tracked independently of the heap peaks.** The
+ *    worker's measured step (2026-10-15T09:31Z) moved RSS +1096 MiB while
+ *    `heapUsed` FELL, so an implementation that folded external into the heap
+ *    maxima, or that let a flat heap suppress it, would publish nothing on the
+ *    one axis that step could still be on.
  */
 
 import { describe, expect, it, beforeEach } from "vitest";
 
 import {
   DEFAULT_SAMPLE_INTERVAL_MS,
+  EXTERNAL_PEAK_COMPONENT,
   HEAP_TOTAL_PEAK_COMPONENT,
   HEAP_USED_PEAK_COMPONENT,
   __resetHeapPeakTrackerForTest,
@@ -36,6 +42,22 @@ const EXCURSION = [
   { used_heap_size: 3_010_000_000, total_heap_size: 3_134_000_000 },
   { used_heap_size: 558_000_000, total_heap_size: 661_000_000 },
   { used_heap_size: 394_000_000, total_heap_size: 548_000_000 },
+];
+
+/**
+ * The worker step on `paperclip-0` (10.244.3.67), 2026-10-15T09:30 -> 09:32Z.
+ *
+ * The scrape at 09:31 was DROPPED (`up` == 0 for that target at that minute), and
+ * the burst is inside it. These are the two surviving scrapes plus the excursion
+ * the 1 s sampler would have seen between them if the burst is external memory:
+ * RSS +1096 MiB with `heapUsed` falling, and `external` back at baseline on the
+ * far side. The whole point of the component is that the first and last rows are
+ * all a 60 s scrape ever sees.
+ */
+const WORKER_STEP = [
+  { used_heap_size: 557_200_000, total_heap_size: 688_600_000, external_memory: 88_600_000 },
+  { used_heap_size: 494_800_000, total_heap_size: 777_000_000, external_memory: 1_120_000_000 },
+  { used_heap_size: 494_700_000, total_heap_size: 777_100_000, external_memory: 48_000_000 },
 ];
 
 beforeEach(() => {
@@ -60,13 +82,45 @@ describe("recordHeapPeakSample", () => {
     expect(peaks.totalPeakBytes).toBe(900);
   });
 
+  it("holds the external peak through a burst the surrounding scrapes both miss", () => {
+    for (const sample of WORKER_STEP) recordHeapPeakSample(sample);
+    const peaks = readHeapPeaks()!;
+    // 1.12 GB passed through `external` between two scrapes that both read < 90 MB.
+    expect(peaks.externalPeakBytes).toBe(1_120_000_000);
+    // ...and the heap peaks are NOT what moved, which is the whole asymmetry:
+    // an implementation keying external off the heap maxima would report 0 here.
+    expect(peaks.usedPeakBytes).toBe(557_200_000);
+  });
+
+  it("tracks external independently of a heap that is falling", () => {
+    recordHeapPeakSample({ used_heap_size: 900, total_heap_size: 900, external_memory: 10 });
+    recordHeapPeakSample({ used_heap_size: 100, total_heap_size: 100, external_memory: 5_000 });
+    const peaks = readHeapPeaks()!;
+    expect(peaks.externalPeakBytes).toBe(5_000);
+    expect(peaks.usedPeakBytes).toBe(900);
+  });
+
+  it("reports an external peak of zero when the runtime omits the field", () => {
+    // Not `null`, and not suppressed: the sampler ran, so `sampleCount` carries
+    // the "is it alive" answer and a 0 here means "this runtime reported none".
+    recordHeapPeakSample({ used_heap_size: 1, total_heap_size: 2 });
+    const peaks = readHeapPeaks()!;
+    expect(peaks.externalPeakBytes).toBe(0);
+    expect(peaks.sampleCount).toBe(1);
+  });
+
   it("ignores absent and non-finite fields without losing an established peak", () => {
-    recordHeapPeakSample({ used_heap_size: 5_000, total_heap_size: 6_000 });
+    recordHeapPeakSample({ used_heap_size: 5_000, total_heap_size: 6_000, external_memory: 7_000 });
     recordHeapPeakSample({});
-    recordHeapPeakSample({ used_heap_size: Number.NaN, total_heap_size: Number.POSITIVE_INFINITY });
+    recordHeapPeakSample({
+      used_heap_size: Number.NaN,
+      total_heap_size: Number.POSITIVE_INFINITY,
+      external_memory: Number.NaN,
+    });
     const peaks = readHeapPeaks()!;
     expect(peaks.usedPeakBytes).toBe(5_000);
     expect(peaks.totalPeakBytes).toBe(6_000);
+    expect(peaks.externalPeakBytes).toBe(7_000);
     // Still counted: the sampler IS alive, it just read nothing usable. Conflating
     // that with "never started" is the ambiguity this field exists to remove.
     expect(peaks.sampleCount).toBe(3);
@@ -186,6 +240,27 @@ describe("native-memory snapshot integration", () => {
     })!.components;
     expect(components.get(HEAP_USED_PEAK_COMPONENT)).toBe(3_010_000_000);
     expect(components.get(HEAP_TOTAL_PEAK_COMPONENT)).toBe(3_134_000_000);
+  });
+
+  it("publishes the external peak the scrape-time reading cannot show", () => {
+    for (const sample of WORKER_STEP) recordHeapPeakSample(sample);
+    const components = collectNativeMemorySnapshot({
+      memoryUsage: () => USAGE,
+      heapStatistics: () => HEAP,
+    })!.components;
+    expect(components.get(EXTERNAL_PEAK_COMPONENT)).toBe(1_120_000_000);
+    // The scrape-time `external` in USAGE is 102 MB. Publishing that as the peak
+    // — i.e. sourcing this component from `heap`/`usage` instead of the sampler —
+    // would reproduce the exact blindness this instrument exists to remove.
+    expect(components.get(EXTERNAL_PEAK_COMPONENT)).not.toBe(USAGE.external);
+  });
+
+  it("omits the external peak too when the sampler never ran", () => {
+    const components = collectNativeMemorySnapshot({
+      memoryUsage: () => USAGE,
+      heapStatistics: () => HEAP,
+    })!.components;
+    expect(components.has(EXTERNAL_PEAK_COMPONENT)).toBe(false);
   });
 
   it("omits both components entirely when the sampler never ran", () => {
