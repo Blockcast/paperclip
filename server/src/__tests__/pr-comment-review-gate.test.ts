@@ -488,6 +488,7 @@ describe("evaluateCommentReviewGate", () => {
     const verdict = evaluateCommentReviewGate({
       headSha: INTERMEDIATE_HEAD,
       prAuthorLogin: ALLY_BOT_LOGIN,
+      prAuthorLane: null,
       comments: [
         allyComment(blockingReview(OLD_HEAD), "2026-10-09T02:10:07Z"),
         allyComment(atHead, "2026-10-09T16:34:27Z"),
@@ -516,6 +517,7 @@ describe("evaluateCommentReviewGate", () => {
     const verdict = evaluateCommentReviewGate({
       headSha: INTERMEDIATE_HEAD,
       prAuthorLogin: null,
+      prAuthorLane: null,
       comments: [
         allyComment(blockingReview(OLD_HEAD), "2026-10-09T02:10:07Z"),
         allyComment(unknownVerb, "2026-10-09T16:34:27Z"),
@@ -1122,6 +1124,7 @@ describe("evaluateCommentReviewGate", () => {
       // The author IS the reviewer identity, which is what appends the
       // misleading tail. Without this the fixture cannot exercise the defect.
       prAuthorLogin: ALLY_BOT_LOGIN,
+      prAuthorLane: null,
       comments: [original, mirror, ledger],
     });
 
@@ -1152,6 +1155,7 @@ describe("evaluateCommentReviewGate", () => {
     const mirrorRetired = evaluateCommentReviewGate({
       headSha: CURRENT_HEAD,
       prAuthorLogin: ALLY_BOT_LOGIN,
+      prAuthorLane: null,
       comments: [
         original,
         mirror,
@@ -1173,6 +1177,7 @@ describe("evaluateCommentReviewGate", () => {
     const chainRetired = evaluateCommentReviewGate({
       headSha: CURRENT_HEAD,
       prAuthorLogin: ALLY_BOT_LOGIN,
+      prAuthorLane: null,
       comments: [
         original,
         mirror,
@@ -1203,6 +1208,7 @@ describe("evaluateCommentReviewGate", () => {
 
     const verdict = evaluateCommentReviewGate({
       prAuthorLogin: null,
+      prAuthorLane: null,
       headSha: CURRENT_HEAD,
       comments: [blocking, ledger],
     });
@@ -1221,6 +1227,7 @@ describe("evaluateCommentReviewGate", () => {
     const verdict = evaluateCommentReviewGate({
       headSha: CURRENT_HEAD,
       prAuthorLogin: ALLY_BOT_LOGIN,
+      prAuthorLane: null,
       comments: [
         allyComment(blockingReviewWithFindings(OLD_HEAD, 9), "2026-08-04T20:09:19Z"),
         allyComment(cleanReview(CURRENT_HEAD), "2026-08-04T21:09:19Z"),
