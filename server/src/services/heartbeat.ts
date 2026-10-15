@@ -336,6 +336,7 @@ import {
   WorkspaceGitSubmoduleError,
   WorkspaceRepoMismatchError,
 } from "./workspace-runtime.js";
+import { REUSE_FAILURE_HEADLINE } from "./workspace-reuse-refusal-class.js";
 import { issueService } from "./issues.js";
 import {
   ISSUE_EXECUTION_LOCK_HOLDING_RUN_STATUSES,
@@ -8710,9 +8711,13 @@ function formatInheritedExecutionWorkspaceReuseFailure(input: {
   const remediation = input.reason === "inherited_workspace_reuse_failed"
     ? "Inspect the referenced execution workspace restore/provision logs, repair or unarchive the workspace, or intentionally clear the issue's reuse_existing workspace binding before retrying."
     : "Repair or unarchive the referenced execution workspace, or intentionally clear the issue's reuse_existing workspace binding before retrying.";
+  // PEN-3633 item 3: the headline prefix is the shared membership marker for the
+  // body-bucketed refusal metric. Interpolating the constant rather than
+  // repeating the literal keeps the detector and this sentence from drifting --
+  // `workspace-reuse-refusal-class.test.ts` round-trips both arms.
   const headline = causeMessage
-    ? `Inherited execution workspace reuse failed because ${causeMessage}.`
-    : `Inherited execution workspace reuse failed: the referenced execution workspace could not be restored, and no cause was reported (execution workspace ${workspaceLabel}).`;
+    ? `${REUSE_FAILURE_HEADLINE} because ${causeMessage}.`
+    : `${REUSE_FAILURE_HEADLINE}: the referenced execution workspace could not be restored, and no cause was reported (execution workspace ${workspaceLabel}).`;
   const context = `Issue ${issueLabel} requested reuse of execution workspace ${workspaceLabel}.`;
 
   return `${headline}\n${context}\n${remediation}`;
