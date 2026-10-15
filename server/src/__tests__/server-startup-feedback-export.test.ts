@@ -294,6 +294,14 @@ vi.mock("../services/human-gated-ageing-digest.js", () => ({
 vi.mock("../services/pr-review-state-reconciler.js", () => ({
   startPrReviewStateReconciler: singletonStarts.startPrReviewStateReconciler,
 }));
+// BLO-46694: a demoted holder must kill its tunnel without deleting the
+// webhook, which is shared with (and may already be repointed by) the next
+// holder. The delete only happens when a token is passed.
+const stopLinearTunnelMock = vi.hoisted(() => vi.fn(async (_token?: string) => undefined));
+vi.mock("../linear-tunnel.js", () => ({
+  startLinearTunnel: vi.fn(async () => null),
+  stopLinearTunnel: stopLinearTunnelMock,
+}));
 vi.mock("../services/approval-gate-reconciler.js", () => ({
   startApprovalGateReconciler: singletonStarts.startApprovalGateReconciler,
 }));
@@ -433,6 +441,7 @@ vi.mock("../auth/better-auth.js", () => ({
 
 import { startServer } from "../index.js";
 import { logger } from "../middleware/logger.js";
+import { SCHEDULER_LEASE_RENEW_INTERVAL_MS } from "../services/scheduler-lease.js";
 
 describe("startServer feedback export wiring", () => {
   beforeEach(() => {
@@ -989,8 +998,9 @@ describe("startServer feedback export wiring", () => {
     let intervalCallback: (() => void) | null = null;
     const setIntervalSpy = vi
       .spyOn(globalThis, "setInterval")
-      .mockImplementation(((callback: () => void) => {
-        intervalCallback = callback;
+      .mockImplementation(((callback: () => void, delay?: number) => {
+        // Match by delay: lease-supervised singletons register timers too (BLO-46694).
+        if (delay === 30000) intervalCallback = callback;
         return 1 as unknown as ReturnType<typeof setInterval>;
       }) as typeof setInterval);
 
@@ -1032,8 +1042,9 @@ describe("startServer feedback export wiring", () => {
     let intervalCallback: (() => void) | null = null;
     const setIntervalSpy = vi
       .spyOn(globalThis, "setInterval")
-      .mockImplementation(((callback: () => void) => {
-        intervalCallback = callback;
+      .mockImplementation(((callback: () => void, delay?: number) => {
+        // Match by delay: lease-supervised singletons register timers too (BLO-46694).
+        if (delay === 30000) intervalCallback = callback;
         return 1 as unknown as ReturnType<typeof setInterval>;
       }) as typeof setInterval);
 
@@ -1081,8 +1092,9 @@ describe("startServer feedback export wiring", () => {
     let intervalCallback: (() => void) | null = null;
     const setIntervalSpy = vi
       .spyOn(globalThis, "setInterval")
-      .mockImplementation(((callback: () => void) => {
-        intervalCallback = callback;
+      .mockImplementation(((callback: () => void, delay?: number) => {
+        // Match by delay: lease-supervised singletons register timers too (BLO-46694).
+        if (delay === 30000) intervalCallback = callback;
         return 1 as unknown as ReturnType<typeof setInterval>;
       }) as typeof setInterval);
 
@@ -1149,8 +1161,9 @@ describe("startServer feedback export wiring", () => {
     let intervalCallback: (() => void) | null = null;
     const setIntervalSpy = vi
       .spyOn(globalThis, "setInterval")
-      .mockImplementation(((callback: () => void) => {
-        intervalCallback = callback;
+      .mockImplementation(((callback: () => void, delay?: number) => {
+        // Match by delay: lease-supervised singletons register timers too (BLO-46694).
+        if (delay === 30000) intervalCallback = callback;
         return 1 as unknown as ReturnType<typeof setInterval>;
       }) as typeof setInterval);
 
@@ -1225,8 +1238,9 @@ describe("startServer feedback export wiring", () => {
     let intervalCallback: (() => void) | null = null;
     const setIntervalSpy = vi
       .spyOn(globalThis, "setInterval")
-      .mockImplementation(((callback: () => void) => {
-        intervalCallback = callback;
+      .mockImplementation(((callback: () => void, delay?: number) => {
+        // Match by delay: lease-supervised singletons register timers too (BLO-46694).
+        if (delay === 30000) intervalCallback = callback;
         return 1 as unknown as ReturnType<typeof setInterval>;
       }) as typeof setInterval);
 
@@ -1287,8 +1301,9 @@ describe("startServer feedback export wiring", () => {
     let intervalCallback: (() => void) | null = null;
     const setIntervalSpy = vi
       .spyOn(globalThis, "setInterval")
-      .mockImplementation(((callback: () => void) => {
-        intervalCallback = callback;
+      .mockImplementation(((callback: () => void, delay?: number) => {
+        // Match by delay: lease-supervised singletons register timers too (BLO-46694).
+        if (delay === 30000) intervalCallback = callback;
         return 1 as unknown as ReturnType<typeof setInterval>;
       }) as typeof setInterval);
 
@@ -1322,8 +1337,9 @@ describe("startServer feedback export wiring", () => {
     let intervalCallback: (() => void) | null = null;
     const setIntervalSpy = vi
       .spyOn(globalThis, "setInterval")
-      .mockImplementation(((callback: () => void) => {
-        intervalCallback = callback;
+      .mockImplementation(((callback: () => void, delay?: number) => {
+        // Match by delay: lease-supervised singletons register timers too (BLO-46694).
+        if (delay === 30000) intervalCallback = callback;
         return 1 as unknown as ReturnType<typeof setInterval>;
       }) as typeof setInterval);
     // `startServer` installs a `process.once("SIGTERM")` handler. Isolate this
@@ -1393,8 +1409,9 @@ describe("startServer feedback export wiring", () => {
     let intervalCallback: (() => void) | null = null;
     const setIntervalSpy = vi
       .spyOn(globalThis, "setInterval")
-      .mockImplementation(((callback: () => void) => {
-        intervalCallback = callback;
+      .mockImplementation(((callback: () => void, delay?: number) => {
+        // Match by delay: lease-supervised singletons register timers too (BLO-46694).
+        if (delay === 30000) intervalCallback = callback;
         return 1 as unknown as ReturnType<typeof setInterval>;
       }) as typeof setInterval);
 
@@ -1465,8 +1482,9 @@ describe("startServer feedback export wiring", () => {
     let intervalCallback: (() => void) | null = null;
     const setIntervalSpy = vi
       .spyOn(globalThis, "setInterval")
-      .mockImplementation(((callback: () => void) => {
-        intervalCallback = callback;
+      .mockImplementation(((callback: () => void, delay?: number) => {
+        // Match by delay: lease-supervised singletons register timers too (BLO-46694).
+        if (delay === 30000) intervalCallback = callback;
         return 1 as unknown as ReturnType<typeof setInterval>;
       }) as typeof setInterval);
 
@@ -1568,8 +1586,9 @@ describe("startServer feedback export wiring", () => {
     let intervalCallback: (() => void) | null = null;
     const setIntervalSpy = vi
       .spyOn(globalThis, "setInterval")
-      .mockImplementation(((callback: () => void) => {
-        intervalCallback = callback;
+      .mockImplementation(((callback: () => void, delay?: number) => {
+        // Match by delay: lease-supervised singletons register timers too (BLO-46694).
+        if (delay === 30000) intervalCallback = callback;
         return 1 as unknown as ReturnType<typeof setInterval>;
       }) as typeof setInterval);
     // Ticks inside the predicate, so the count only has a lower bound.
@@ -1959,10 +1978,12 @@ describe("startServer feedback export wiring", () => {
     // than one timer is now involved, so a last-wins capture would silently
     // test the tick again and assert nothing new.
     const intervalCallbacks: Array<() => void> = [];
+    let schedulerTick: (() => void) | null = null;
     const setIntervalSpy = vi
       .spyOn(globalThis, "setInterval")
-      .mockImplementation(((callback: () => void) => {
+      .mockImplementation(((callback: () => void, delay?: number) => {
         intervalCallbacks.push(callback);
+        if (delay === 30000) schedulerTick = callback;
         return 1 as unknown as ReturnType<typeof setInterval>;
       }) as typeof setInterval);
 
@@ -1998,10 +2019,9 @@ describe("startServer feedback export wiring", () => {
         }),
       );
 
-      // The scheduler tick is the last timer registered (every other
-      // `setInterval`-spying test in this file depends on that too).
-      const schedulerTick = intervalCallbacks[intervalCallbacks.length - 1];
-      schedulerTick?.();
+      // Addressed by delay, not registration order: lease-supervised
+      // singletons register timers too (BLO-46694).
+      (schedulerTick as (() => void) | null)?.();
       await vi.waitFor(() => expect(releaseTail).not.toBeNull());
 
       const skippedBefore = (await readSeries(HEARTBEAT_RECOVERY_CHAIN_SKIPPED_METRIC)) ?? 0;
@@ -2330,6 +2350,7 @@ describe("startServer worker-tier singletons (BLO-46694)", () => {
     "approval-gate-reconciler",
     "terminal-gate-reconciler",
     "linear-tunnel",
+    "bundled-plugin-auto-install",
   ];
   const ORIGINAL_GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 
@@ -2398,7 +2419,7 @@ describe("startServer worker-tier singletons (BLO-46694)", () => {
     // Positive control: each one was registered with the supervisor and
     // skipped, rather than never reached at all.
     expect(singletonLog("worker singleton skipped - not the scheduler lease holder")).toEqual(
-      expect.arrayContaining([...GATED, "bundled-plugin-auto-install"]),
+      expect.arrayContaining(GATED),
     );
     const opts = createAppMock.mock.calls[0]?.[1] as { shouldRunWorkerSingletons?: () => boolean };
     expect(opts.shouldRunWorkerSingletons?.()).toBe(false);
@@ -2415,5 +2436,51 @@ describe("startServer worker-tier singletons (BLO-46694)", () => {
     expect(singletonStarts.startHumanGatedDigestSweep).toHaveBeenCalledTimes(1);
     const opts = createAppMock.mock.calls[0]?.[1] as { shouldRunWorkerSingletons?: () => boolean };
     expect(opts.shouldRunWorkerSingletons?.()).toBe(true);
+  });
+
+  // The supervisors re-check the lease on its renew interval.
+  const captureLeaseChecks = () => {
+    const checks: Array<() => void> = [];
+    const spy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void, delay?: number) => {
+        if (delay === SCHEDULER_LEASE_RENEW_INTERVAL_MS) checks.push(callback);
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+    return { checks, restore: () => spy.mockRestore() };
+  };
+
+  it("a follower that takes the lease over starts every one of them, auto-install included", async () => {
+    singletonLease.leader = false;
+    const { checks, restore } = captureLeaseChecks();
+    try {
+      await startServer();
+      expect(singletonLog("worker singleton started on the scheduler lease holder")).toEqual([]);
+
+      singletonLease.leader = true;
+      for (const check of checks) check();
+
+      expect(singletonLog("worker singleton started on the scheduler lease holder")).toEqual(
+        expect.arrayContaining(GATED),
+      );
+    } finally {
+      restore();
+    }
+  });
+
+  it("a demoted holder stops them, killing the Linear tunnel without deleting the shared webhook", async () => {
+    const { checks, restore } = captureLeaseChecks();
+    try {
+      await startServer();
+      stopLinearTunnelMock.mockClear();
+
+      singletonLease.leader = false;
+      for (const check of checks) check();
+      await vi.waitFor(() => expect(stopLinearTunnelMock).toHaveBeenCalled());
+
+      expect(stopLinearTunnelMock.mock.calls.every((call) => call[0] === undefined)).toBe(true);
+    } finally {
+      restore();
+    }
   });
 });
