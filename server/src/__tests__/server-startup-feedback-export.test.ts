@@ -243,18 +243,62 @@ vi.mock("@paperclipai/db", async (importOriginal) => ({
 // `onAcquire` as the real holder does on acquisition: BLO-45212 runs the
 // startup recovery chain from that callback, so a pinned leader that skips it
 // never runs recovery at all.
+//
+// BLO-46694: `singletonLease.leader` lets the worker-singleton tests below run
+// this process as a follower. Every other test leaves it `true`.
+const singletonLease = vi.hoisted(() => ({ leader: true }));
 vi.mock("../services/scheduler-lease.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../services/scheduler-lease.js")>()),
   schedulerLeaseHolder: vi.fn((_db: unknown, opts?: { onAcquire?: () => void }) => ({
     identity: { pod: "test-pod", holderId: "test-pod#leader" },
-    isLeader: () => true,
-    shouldRunLoop: () => true,
+    isLeader: () => singletonLease.leader,
+    shouldRunLoop: () => singletonLease.leader,
     start: async () => {
-      opts?.onAcquire?.();
-      return true;
+      if (singletonLease.leader) opts?.onAcquire?.();
+      return singletonLease.leader;
     },
     stop: async () => false,
   })),
+}));
+
+// BLO-46694: every worker-tier singleton started from startServer, stubbed so
+// the tests below can see whether a follower started any of them.
+const singletonStarts = vi.hoisted(() => {
+  const stop = () => {};
+  return {
+    reconcilerSweepTick: vi.fn(async () => undefined),
+    startStrandedBlockedIssueReconciler: vi.fn(() => stop),
+    startApprovalEnforcementReconciler: vi.fn(() => stop),
+    startIsolationWorkspaceReaper: vi.fn(() => stop),
+    startHumanGatedDigestSweep: vi.fn(() => stop),
+    startPrReviewStateReconciler: vi.fn(() => stop),
+    startApprovalGateReconciler: vi.fn(() => stop),
+    startTerminalGateReconciler: vi.fn(() => stop),
+  };
+});
+vi.mock("../services/pr-reconciler-sweep.js", () => ({
+  reconcilerSweepTick: singletonStarts.reconcilerSweepTick,
+}));
+vi.mock("../services/stranded-blocked-issue-reconciler.js", () => ({
+  startStrandedBlockedIssueReconciler: singletonStarts.startStrandedBlockedIssueReconciler,
+}));
+vi.mock("../services/approval-enforcement-reconciler.js", () => ({
+  startApprovalEnforcementReconciler: singletonStarts.startApprovalEnforcementReconciler,
+}));
+vi.mock("../services/isolation-workspace-reaper.js", () => ({
+  startIsolationWorkspaceReaper: singletonStarts.startIsolationWorkspaceReaper,
+}));
+vi.mock("../services/human-gated-ageing-digest.js", () => ({
+  startHumanGatedDigestSweep: singletonStarts.startHumanGatedDigestSweep,
+}));
+vi.mock("../services/pr-review-state-reconciler.js", () => ({
+  startPrReviewStateReconciler: singletonStarts.startPrReviewStateReconciler,
+}));
+vi.mock("../services/approval-gate-reconciler.js", () => ({
+  startApprovalGateReconciler: singletonStarts.startApprovalGateReconciler,
+}));
+vi.mock("../services/terminal-gate-reconciler.js", () => ({
+  startTerminalGateReconciler: singletonStarts.startTerminalGateReconciler,
 }));
 
 // PEN-3314 review follow-up: a PASS-THROUGH partial mock, not a replacement.
@@ -2269,5 +2313,107 @@ describe("startServer PAPERCLIP_API_URL handling", () => {
     expect(started.listenPort).toBe(3110);
     expect(started.apiUrl).toBe("https://paperclip.example");
     expect(process.env.PAPERCLIP_RUNTIME_API_URL).toBe("https://paperclip.example");
+  });
+});
+
+describe("startServer worker-tier singletons (BLO-46694)", () => {
+  // Every singleton startServer gates on the scheduler lease. Adding a new
+  // worker-tier singleton without gating it should add a name here.
+  const GATED = [
+    "database-backup",
+    "merged-pr-reconciler",
+    "stranded-blocked-issue-reconciler",
+    "approval-enforcement-reconciler",
+    "isolation-workspace-reaper",
+    "human-gated-digest-sweep",
+    "pr-review-state-reconciler",
+    "approval-gate-reconciler",
+    "terminal-gate-reconciler",
+    "linear-tunnel",
+  ];
+  const ORIGINAL_GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+
+  const singletonConfig = () =>
+    buildTestConfig({
+      paperclipNodeRole: "worker" as const,
+      heartbeatSchedulerEnabled: true,
+      databaseBackupEnabled: true,
+      prReconcilerEnabled: true,
+      prReconcilerIntervalMinutes: 60,
+      prReconcilerWindowDays: 7,
+      prReconcilerEnrichLoc: false,
+      strandedBlockedIssueReconcilerEnabled: true,
+      strandedBlockedIssueReconcilerIntervalMinutes: 5,
+      approvalEnforcementReconcilerEnabled: true,
+      approvalEnforcementReconcilerIntervalMinutes: 15,
+      approvalEnforcementReconcilerGraceHours: 24,
+      isolationWorkspaceReaperEnabled: true,
+      isolationWorkspaceReaperIntervalMinutes: 60,
+      isolationWorkspaceReaperMaxAgeDays: 14,
+      isolationWorkspaceReaperMaxDeletesPerTick: 10,
+      isolationWorkspaceReaperDryRun: true,
+      humanGatedDigestEnabled: true,
+      humanGatedDigestIntervalMinutes: 60,
+      humanGatedDigestPeriodDays: 7,
+      prReviewStateReconcilerEnabled: true,
+      prReviewStateReconcilerIntervalMinutes: 15,
+      prReviewStateMaxPullRequestsPerRepo: 50,
+      approvalGateReconcilerEnabled: true,
+      approvalGateReconcilerIntervalMinutes: 15,
+      terminalGateReconcilerEnabled: true,
+      terminalGateReconcilerIntervalMinutes: 15,
+      linearOAuthClientId: "linear-client",
+    });
+
+  const singletonLog = (message: string) =>
+    vi
+      .mocked(logger.info)
+      .mock.calls.filter((call) => call[1] === message)
+      .map((call) => (call[0] as { singleton?: string }).singleton)
+      .filter((name): name is string => Boolean(name))
+      .sort();
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    loadConfigMock.mockReturnValue(singletonConfig());
+    process.env.BETTER_AUTH_SECRET = "test-secret";
+    process.env.GITHUB_TOKEN = "test-token";
+  });
+
+  afterEach(() => {
+    singletonLease.leader = true;
+    if (ORIGINAL_GITHUB_TOKEN === undefined) delete process.env.GITHUB_TOKEN;
+    else process.env.GITHUB_TOKEN = ORIGINAL_GITHUB_TOKEN;
+  });
+
+  it("a follower starts none of them, and hands createApp a gate that reads false", async () => {
+    singletonLease.leader = false;
+
+    await startServer();
+
+    for (const start of Object.values(singletonStarts)) {
+      expect(start).not.toHaveBeenCalled();
+    }
+    expect(singletonLog("worker singleton started on the scheduler lease holder")).toEqual([]);
+    // Positive control: each one was registered with the supervisor and
+    // skipped, rather than never reached at all.
+    expect(singletonLog("worker singleton skipped - not the scheduler lease holder")).toEqual(
+      expect.arrayContaining([...GATED, "bundled-plugin-auto-install"]),
+    );
+    const opts = createAppMock.mock.calls[0]?.[1] as { shouldRunWorkerSingletons?: () => boolean };
+    expect(opts.shouldRunWorkerSingletons?.()).toBe(false);
+  });
+
+  it("the lease holder starts every one of them", async () => {
+    await startServer();
+
+    expect(singletonLog("worker singleton started on the scheduler lease holder")).toEqual(
+      expect.arrayContaining(GATED),
+    );
+    expect(singletonStarts.reconcilerSweepTick).toHaveBeenCalledTimes(1);
+    expect(singletonStarts.startIsolationWorkspaceReaper).toHaveBeenCalledTimes(1);
+    expect(singletonStarts.startHumanGatedDigestSweep).toHaveBeenCalledTimes(1);
+    const opts = createAppMock.mock.calls[0]?.[1] as { shouldRunWorkerSingletons?: () => boolean };
+    expect(opts.shouldRunWorkerSingletons?.()).toBe(true);
   });
 });

@@ -96,6 +96,7 @@ import { buildHostServices, flushPluginLogBuffer } from "./services/plugin-host-
 import { createPluginEventBus } from "./services/plugin-event-bus.js";
 import { setPluginEventBus, setPluginEventOutboxDb } from "./services/activity-log.js";
 import { startPluginEventOutbox } from "./services/plugin-event-outbox.js";
+import { superviseWorkerSingleton } from "./services/worker-singleton-supervisor.js";
 import { startPluginStatusCollector } from "./services/plugin-status-metrics.js";
 import { startGitHubCommitStatusDeliveryOutbox } from "./services/github-status-delivery-outbox.js";
 import { startGithubReviewGateDeliveryWorker } from "./services/github-review-gate-authority.js";
@@ -299,6 +300,11 @@ export async function createApp(
     localPluginDir?: string;
     pluginMigrationDb?: Db;
     pluginWorkerManager?: PluginWorkerManager;
+    /**
+     * BLO-46694. Gate for the plugin job scheduler and event outbox: true only
+     * on the scheduler lease holder. Omitted means always (single replica).
+     */
+    shouldRunWorkerSingletons?: () => boolean;
     betterAuthHandler?: express.RequestHandler;
     resolveSession?: (req: ExpressRequest) => Promise<BetterAuthSessionResult | null>;
     /** Random per-process token for trusted loopback bootstrap. */
@@ -956,7 +962,19 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
   app.use(errorHandler);
 
   jobCoordinator.start();
-  scheduler.start();
+  // BLO-46694: scheduled plugin jobs run on the scheduler lease holder only;
+  // without this every worker ran every due job. Per-pod and NOT gated: the
+  // job coordinator (it only syncs job declarations), plugin worker processes,
+  // and manual `triggerJob` from the API.
+  const shouldRunWorkerSingletons = opts.shouldRunWorkerSingletons ?? (() => true);
+  const stopPluginJobScheduler = superviseWorkerSingleton(
+    "plugin-job-scheduler",
+    shouldRunWorkerSingletons,
+    () => {
+      scheduler.start();
+      return () => scheduler.stop();
+    },
+  );
   let feedbackExportShuttingDown = false;
   let feedbackExportTimer: ReturnType<typeof setInterval> | null = null;
   const disableFeedbackExportFlushes = () => {
@@ -1162,7 +1180,14 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
           }
           // Start the outbox poller only after plugins have subscribed, so an
           // early event isn't marked processed with no handler to receive it.
-          stopPluginEventOutbox = startPluginEventOutbox(db, eventBus);
+          // BLO-46694: lease holder only. Its startup reset requeues every
+          // `processing` row, which beside a live second poller is a double
+          // delivery; one emitter estate-wide is the design it assumes.
+          stopPluginEventOutbox = superviseWorkerSingleton(
+            "plugin-event-outbox",
+            shouldRunWorkerSingletons,
+            () => startPluginEventOutbox(db, eventBus),
+          );
         }
       })
       .catch((err) => {
@@ -1174,6 +1199,7 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
     if (appServicesShutdown) return;
     appServicesShutdown = true;
     stopPluginEventOutbox?.();
+    stopPluginJobScheduler();
     stopGitHubStatusDeliveryOutbox?.();
     stopPluginStatusCollector?.();
     stopScrapeMetricsCollector();
