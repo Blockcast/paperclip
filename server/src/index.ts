@@ -1012,6 +1012,12 @@ export async function startServer(): Promise<StartedServer> {
     config.heartbeatSchedulerEnabled && process.env.PAPERCLIP_SCHEDULER_LEASE_ENABLED !== "false";
   const shouldRunWorkerSingletons = () =>
     !workerSingletonsLeased || (schedulerLease?.shouldRunLoop() ?? false);
+  // Stop handles, so shutdown can stop every singleton before it releases the
+  // lease rather than leave this process running them beside the next holder.
+  const workerSingletonStops: Array<() => void> = [];
+  const superviseLeased = (name: string, start: () => (() => void) | void) => {
+    workerSingletonStops.push(superviseWorkerSingleton(name, shouldRunWorkerSingletons, start));
+  };
   const app = await createApp(db as any, {
     uiMode,
     serverPort: listenPort,
@@ -2534,7 +2540,7 @@ export async function startServer(): Promise<StartedServer> {
       },
       "Automatic database backups enabled",
     );
-    superviseWorkerSingleton("database-backup", shouldRunWorkerSingletons, () => {
+    superviseLeased("database-backup", () => {
       const timer = setInterval(() => {
         void runServerDatabaseBackup("scheduled").catch(() => {
           // runServerDatabaseBackup already logs the failure with context.
@@ -2575,7 +2581,7 @@ export async function startServer(): Promise<StartedServer> {
           logger.error({ err }, "Merged-PR reconciler sweep failed");
         });
       // BLO-46694: lease holder only.
-      superviseWorkerSingleton("merged-pr-reconciler", shouldRunWorkerSingletons, () => {
+      superviseLeased("merged-pr-reconciler", () => {
         runReconcilerSweepTick();
         const timer = setInterval(runReconcilerSweepTick, reconcilerIntervalMs);
         return () => clearInterval(timer);
@@ -2598,7 +2604,7 @@ export async function startServer(): Promise<StartedServer> {
       "Stranded-blocked-issue reconciler enabled (BLO-21523)",
     );
     // BLO-46694: lease holder only.
-    superviseWorkerSingleton("stranded-blocked-issue-reconciler", shouldRunWorkerSingletons, () =>
+    superviseLeased("stranded-blocked-issue-reconciler", () =>
       startStrandedBlockedIssueReconciler(
         db,
         config.strandedBlockedIssueReconcilerIntervalMinutes * 60 * 1000,
@@ -2625,7 +2631,7 @@ export async function startServer(): Promise<StartedServer> {
       "Approval-enforcement reconciler enabled (BLO-24631)",
     );
     // BLO-46694: lease holder only.
-    superviseWorkerSingleton("approval-enforcement-reconciler", shouldRunWorkerSingletons, () =>
+    superviseLeased("approval-enforcement-reconciler", () =>
       startApprovalEnforcementReconciler(
         db,
         config.approvalEnforcementReconcilerIntervalMinutes * 60 * 1000,
@@ -2657,7 +2663,7 @@ export async function startServer(): Promise<StartedServer> {
       "Isolation-workspace reaper enabled (BLO-31222)",
     );
     // BLO-46694: lease holder only.
-    superviseWorkerSingleton("isolation-workspace-reaper", shouldRunWorkerSingletons, () =>
+    superviseLeased("isolation-workspace-reaper", () =>
       startIsolationWorkspaceReaper(
         db,
         config.isolationWorkspaceReaperIntervalMinutes * 60 * 1000,
@@ -2688,7 +2694,7 @@ export async function startServer(): Promise<StartedServer> {
       "Human-gated ageing digest enabled (BLO-29420)",
     );
     // BLO-46694: lease holder only.
-    superviseWorkerSingleton("human-gated-digest-sweep", shouldRunWorkerSingletons, () =>
+    superviseLeased("human-gated-digest-sweep", () =>
       startHumanGatedDigestSweep(db, config.humanGatedDigestIntervalMinutes * 60 * 1000, {
         periodDays: config.humanGatedDigestPeriodDays,
       }),
@@ -2724,7 +2730,7 @@ export async function startServer(): Promise<StartedServer> {
         "Open-PR review-state reconciler enabled (BLO-30259)",
       );
       // BLO-46694: lease holder only.
-      superviseWorkerSingleton("pr-review-state-reconciler", shouldRunWorkerSingletons, () =>
+      superviseLeased("pr-review-state-reconciler", () =>
         startPrReviewStateReconciler(
           db,
           config.prReviewStateReconcilerIntervalMinutes * 60 * 1000,
@@ -2753,7 +2759,7 @@ export async function startServer(): Promise<StartedServer> {
         "Approval-gate reconciler enabled (BLO-29359)",
       );
       // BLO-46694: lease holder only.
-      superviseWorkerSingleton("approval-gate-reconciler", shouldRunWorkerSingletons, () =>
+      superviseLeased("approval-gate-reconciler", () =>
         startApprovalGateReconciler(db, config.approvalGateReconcilerIntervalMinutes * 60 * 1000),
       );
     }
@@ -2786,7 +2792,7 @@ export async function startServer(): Promise<StartedServer> {
         "Terminal-gate reconciler enabled (BLO-27515)",
       );
       // BLO-46694: lease holder only.
-      superviseWorkerSingleton("terminal-gate-reconciler", shouldRunWorkerSingletons, () =>
+      superviseLeased("terminal-gate-reconciler", () =>
         startTerminalGateReconciler(
           db,
           config.terminalGateReconcilerIntervalMinutes * 60 * 1000,
@@ -3262,18 +3268,14 @@ export async function startServer(): Promise<StartedServer> {
   // Skipped on the API tier: /api/plugins/install hits pluginWorkerManager
   // which is stubbed; the workers tier owns plugin installs.
   // BLO-46694: lease holder only, so two workers do not install concurrently.
-  // Checked once at boot, not supervised: the install lands in the shared DB,
-  // so a later takeover finds it already done and has nothing to repeat. (A
-  // supervisor would also register a timer after the scheduler's, which the
-  // startup tests rely on being last.)
-  if (config.paperclipNodeRole !== "api" && !shouldRunWorkerSingletons()) {
-    logger.info(
-      { singleton: "bundled-plugin-auto-install" },
-      "worker singleton skipped - not the scheduler lease holder",
-    );
-  } else if (config.paperclipNodeRole !== "api") {
-    void autoInstallBundledPlugins(db as any, internalBootstrapToken).catch((err) => {
-      logger.warn({ err }, "auto-install of bundled plugins failed (non-fatal)");
+  // Supervised, not checked once: on a rolling deploy the new pod boots as a
+  // follower, and only a re-run on takeover installs a newly bundled plugin or
+  // applies the upgrade half. The install is idempotent, so re-runs are safe.
+  if (config.paperclipNodeRole !== "api") {
+    superviseLeased("bundled-plugin-auto-install", () => {
+      void autoInstallBundledPlugins(db as any, internalBootstrapToken).catch((err) => {
+        logger.warn({ err }, "auto-install of bundled plugins failed (non-fatal)");
+      });
     });
   } else {
     logger.info(
@@ -3288,10 +3290,11 @@ export async function startServer(): Promise<StartedServer> {
   // tunnel won the race. Worker tier owns this. BLO-46694: and only the
   // scheduler lease holder; a holder that loses the lease stops its tunnel.
   if (config.linearOAuthClientId && config.paperclipNodeRole !== "api") {
-    superviseWorkerSingleton("linear-tunnel", shouldRunWorkerSingletons, () => {
-      // Held so a lease loss can also delete the webhook this holder
-      // registered, rather than leave Linear pointed at a dead tunnel.
-      let tunnelToken: string | null = null;
+    superviseLeased("linear-tunnel", () => {
+      // On lease loss only the tunnel is killed. The webhook is NOT deleted:
+      // registration upserts one shared webhook id, so this holder deleting it
+      // could delete the one the next holder has already repointed. The next
+      // holder's upsert repoints it instead.
       let stopped = false;
       void (async () => {
         try {
@@ -3312,11 +3315,10 @@ export async function startServer(): Promise<StartedServer> {
                 teamId = (cfg?.configJson as Record<string, unknown>)?.teamId as string ?? "";
               }
               if (token && teamId && !stopped) {
-                tunnelToken = token;
                 const { startLinearTunnel, stopLinearTunnel } = await import("./linear-tunnel.js");
                 await startLinearTunnel({ port: listenPort, linearToken: token, teamId });
                 // Lost the lease while the tunnel was coming up.
-                if (stopped) await stopLinearTunnel(token);
+                if (stopped) await stopLinearTunnel();
               }
               break; // Only need one company's token
             }
@@ -3328,7 +3330,7 @@ export async function startServer(): Promise<StartedServer> {
       return () => {
         stopped = true;
         void import("./linear-tunnel.js")
-          .then(({ stopLinearTunnel }) => stopLinearTunnel(tunnelToken ?? undefined))
+          .then(({ stopLinearTunnel }) => stopLinearTunnel())
           .catch((err) => logger.warn({ err }, "[linear-tunnel] stop on lease loss failed"));
       };
     });
@@ -3388,6 +3390,8 @@ export async function startServer(): Promise<StartedServer> {
       // lease out. When the idle wait was skipped (hot restart), do NOT
       // release — let the TTL expire, trading handover speed for exclusion.
       // Best-effort either way: the holder logs and swallows a failed release.
+      // BLO-46694: stop the worker singletons before the lease can pass on.
+      for (const stop of workerSingletonStops.splice(0)) stop();
       if (schedulerLease) {
         await schedulerLease.stop({ release: heartbeatShutdown.waitedForSchedulerIdle });
         schedulerLease = null;
@@ -3450,7 +3454,9 @@ export async function startServer(): Promise<StartedServer> {
       try {
         const { stopLinearTunnel } = await import("./linear-tunnel.js");
         let cleanupToken: string | undefined;
-        try {
+        // BLO-46694: under the lease the webhook is shared with the next
+        // holder, which may already have repointed it; only kill the tunnel.
+        if (!workerSingletonsLeased) try {
           const { secretService } = await import("./services/index.js");
           const svc = secretService(db as any);
           const allCompanies = await (db as any).select().from(companies);
