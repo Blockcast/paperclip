@@ -32,6 +32,8 @@ pre-PEN-3633 message got wrong — it named `repoUrl` on a branch that never rea
 | `probe_indeterminate` | `git rev-parse --git-dir` itself failed to reach a verdict | **Check the API pod before the disk.** See below. |
 | `cause_unreported` | The reuse wrapper fired with no cause attached | A defect in its own right — file it. |
 
+An inherited-reuse failure that DID report a cause which is not one of the three checkout conditions above — an archived execution workspace, a failed restore, a provision timeout — is deliberately absent from this metric. Those are issue-level faults: they belong to the one issue whose workspace binding is broken, not to the project checkout every issue in the project shares, so counting them here would page an operator to fix a checkout that is fine. Find them on the issue itself.
+
 ### `probe_indeterminate` is the one that is not necessarily on disk
 
 An indeterminate probe means the probe failed, not that the directory is bad. It
