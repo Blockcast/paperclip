@@ -35,6 +35,7 @@ import {
   collectNativeMemorySnapshot,
 } from "../services/native-memory-metrics.js";
 import {
+  PROCESS_HEAP_PEAK_SAMPLES_METRIC,
   PROCESS_MEMORY_COMPONENT_BYTES_METRIC,
   PROCESS_V8_CONTEXT_COUNT_METRIC,
   __resetMetricsForTest,
@@ -55,6 +56,27 @@ const HEAP = {
 
 function collect(usage: Record<string, number> = USAGE, heap: Record<string, number> = HEAP) {
   return collectNativeMemorySnapshot({ memoryUsage: () => usage, heapStatistics: () => heap });
+}
+
+/**
+ * A sampler reading. The numbers are the measured 2026-10-15T09:30→09:32Z step:
+ * the sampler had been up ~67 min at 1 s, and the answer the peaks carry is
+ * ~1 GB against a scrape-time `external` of ~20 MiB.
+ */
+const PEAKS = {
+  usedPeakBytes: 974_000_000,
+  totalPeakBytes: 1_136_000_000,
+  externalPeakBytes: 1_149_000_000,
+  sampleCount: 4_021,
+  sampleIntervalMs: 1_000,
+};
+
+function collectWithPeaks(peaks: typeof PEAKS | null) {
+  return collectNativeMemorySnapshot({
+    memoryUsage: () => USAGE,
+    heapStatistics: () => HEAP,
+    heapPeaks: () => peaks,
+  });
 }
 
 describe("collectNativeMemorySnapshot", () => {
@@ -133,6 +155,21 @@ describe("collectNativeMemorySnapshot", () => {
     expect(collect({}, {})).toBeNull();
   });
 
+  it("carries the sampler's own sample count, read from the same reading as the peaks", () => {
+    // The count must qualify THESE peaks. Recomputing it from anywhere else
+    // would let it describe a sampler state the published values do not share.
+    expect(collectWithPeaks(PEAKS)!.heapPeakSampleCount).toBe(PEAKS.sampleCount);
+  });
+
+  it("reports a null sample count — never 0 — when the sampler has never run", () => {
+    // The distinction the whole series exists for. 0 is a legitimate-looking
+    // count, so a sampler that never started must be ABSENT downstream rather
+    // than publishing a value that rate() reads as a stalled event loop.
+    const snapshot = collectWithPeaks(null);
+    expect(snapshot!.heapPeakSampleCount).toBeNull();
+    expect(snapshot!.components.has("external_peak")).toBe(false);
+  });
+
   it("reads this process's real memory accounting", () => {
     // Positive control. Every assertion above drives injected fakes, so without
     // this the suite would pass against field names Node does not actually emit
@@ -164,10 +201,22 @@ describe("setNativeMemoryMetrics (the publish path)", () => {
   const components = () => published(PROCESS_MEMORY_COMPONENT_BYTES_METRIC, "component");
   const contexts = () => published(PROCESS_V8_CONTEXT_COUNT_METRIC, "kind");
 
+  /** The liveness gauge carries no labels, so it renders as a bare `name value`. */
+  async function samplerLiveness(): Promise<number | null> {
+    const { body } = await renderMetrics();
+    for (const line of body.split("\n")) {
+      if (line.startsWith("#")) continue;
+      const matched = new RegExp(`^${PROCESS_HEAP_PEAK_SAMPLES_METRIC}\\s+(\\S+)$`).exec(line);
+      if (matched) return Number(matched[1]);
+    }
+    return null;
+  }
+
   it("publishes one series per component and per context kind", async () => {
     setNativeMemoryMetrics({
       components: new Map([[NATIVE_UNACCOUNTED_COMPONENT, 1_817_000_000]]),
       contexts: new Map([[DETACHED_CONTEXT_KIND, 0]]),
+      heapPeakSampleCount: null,
     });
     expect(await components()).toEqual({ [NATIVE_UNACCOUNTED_COMPONENT]: 1_817_000_000 });
     // Published AT ZERO: a "skip falsy values" tidy-up in the publish loop would
@@ -180,6 +229,7 @@ describe("setNativeMemoryMetrics (the publish path)", () => {
     setNativeMemoryMetrics({
       components: new Map([[NATIVE_UNACCOUNTED_COMPONENT, -350]]),
       contexts: new Map(),
+      heapPeakSampleCount: null,
     });
     expect(await components()).toEqual({ [NATIVE_UNACCOUNTED_COMPONENT]: -350 });
   });
@@ -190,10 +240,12 @@ describe("setNativeMemoryMetrics (the publish path)", () => {
     setNativeMemoryMetrics({
       components: new Map([[NATIVE_UNACCOUNTED_COMPONENT, 10], [V8_MALLOCED_COMPONENT, 20]]),
       contexts: new Map(),
+      heapPeakSampleCount: null,
     });
     setNativeMemoryMetrics({
       components: new Map([[NATIVE_UNACCOUNTED_COMPONENT, 11]]),
       contexts: new Map(),
+      heapPeakSampleCount: null,
     });
     expect(await components()).toEqual({ [NATIVE_UNACCOUNTED_COMPONENT]: 11 });
   });
@@ -202,9 +254,60 @@ describe("setNativeMemoryMetrics (the publish path)", () => {
     setNativeMemoryMetrics({
       components: new Map([[NATIVE_UNACCOUNTED_COMPONENT, 10]]),
       contexts: new Map([[NATIVE_CONTEXT_KIND, 3]]),
+      heapPeakSampleCount: 7,
     });
     setNativeMemoryMetrics(null);
     expect(await components()).toEqual({});
     expect(await contexts()).toEqual({});
+    expect(await samplerLiveness()).toBeNull();
+  });
+
+  it("publishes NO liveness series before anything has been set", async () => {
+    // prom-client renders a label-less gauge as `name 0` from registration, and
+    // `reset()` returns it to that same 0 -- so this gauge needs `remove()`, and
+    // without this assertion a fresh process would publish a flat zero that
+    // rate() reads as a permanently stalled event loop.
+    expect(await samplerLiveness()).toBeNull();
+  });
+
+  it("publishes the sampler's liveness count", async () => {
+    setNativeMemoryMetrics({
+      components: new Map(),
+      contexts: new Map(),
+      heapPeakSampleCount: 4_021,
+    });
+    expect(await samplerLiveness()).toBe(4_021);
+  });
+
+  it("publishes NO liveness series when the sampler has never run", async () => {
+    // The mutation that matters. Publishing 0 here would render identically to
+    // a sampler that is up but wedged — and a wedged sampler is exactly the
+    // event-loop stall the measured step exhibits, so the two readings carry
+    // opposite conclusions about a flat `external_peak`.
+    setNativeMemoryMetrics({
+      components: new Map([[NATIVE_UNACCOUNTED_COMPONENT, 10]]),
+      contexts: new Map(),
+      heapPeakSampleCount: null,
+    });
+    expect(await samplerLiveness()).toBeNull();
+    // ...and the rest of the snapshot still publishes: the absence is scoped.
+    expect(await components()).toEqual({ [NATIVE_UNACCOUNTED_COMPONENT]: 10 });
+  });
+
+  it("stops publishing the liveness count once the sampler stops reporting", async () => {
+    // Reset-then-set, property #3, applied to the new gauge. Without the reset
+    // the last count freezes, rate() goes to 0/s, and a healthy process reads
+    // as a permanently stalled event loop.
+    setNativeMemoryMetrics({
+      components: new Map(),
+      contexts: new Map(),
+      heapPeakSampleCount: 4_021,
+    });
+    setNativeMemoryMetrics({
+      components: new Map(),
+      contexts: new Map(),
+      heapPeakSampleCount: null,
+    });
+    expect(await samplerLiveness()).toBeNull();
   });
 });
