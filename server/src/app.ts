@@ -1183,6 +1183,7 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
           // BLO-46694: lease holder only. Its startup reset requeues every
           // `processing` row, which beside a live second poller is a double
           // delivery; one emitter estate-wide is the design it assumes.
+          if (appWorkerSingletonsStopped) return;
           stopPluginEventOutbox = superviseWorkerSingleton(
             "plugin-event-outbox",
             shouldRunWorkerSingletons,
@@ -1194,12 +1195,23 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
         logger.error({ err }, "Failed to load ready plugins on startup");
       });
   }
+  // BLO-46711: the lease-gated singletons, stopped as a unit so the server's
+  // shutdown can stop them BEFORE it releases the scheduler lease, not in
+  // paperclipShutdown after it. The flag also keeps a loadAll() that resolves
+  // after this from starting the outbox.
+  let appWorkerSingletonsStopped = false;
+  const stopAppWorkerSingletons = () => {
+    appWorkerSingletonsStopped = true;
+    stopPluginEventOutbox?.();
+    stopPluginEventOutbox = null;
+    stopPluginJobScheduler();
+  };
+  app.locals.stopWorkerSingletons = stopAppWorkerSingletons;
   let appServicesShutdown = false;
   const shutdownAppServices = async () => {
     if (appServicesShutdown) return;
     appServicesShutdown = true;
-    stopPluginEventOutbox?.();
-    stopPluginJobScheduler();
+    stopAppWorkerSingletons();
     stopGitHubStatusDeliveryOutbox?.();
     stopPluginStatusCollector?.();
     stopScrapeMetricsCollector();

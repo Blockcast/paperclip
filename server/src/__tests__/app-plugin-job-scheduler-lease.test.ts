@@ -15,6 +15,34 @@ vi.mock("../services/plugin-job-scheduler.js", async (importOriginal) => ({
   })),
 }));
 
+// BLO-46711: the event outbox starts only after loadAll() resolves, so it is
+// stubbed to resolve on demand and the outbox itself is a spy.
+const outbox = vi.hoisted(() => ({
+  stop: vi.fn(),
+  start: vi.fn(),
+  releaseLoadAll: null as null | (() => void),
+}));
+vi.mock("../services/plugin-event-outbox.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/plugin-event-outbox.js")>()),
+  startPluginEventOutbox: vi.fn(() => {
+    outbox.start();
+    return outbox.stop;
+  }),
+}));
+vi.mock("../services/plugin-loader.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/plugin-loader.js")>();
+  return {
+    ...actual,
+    pluginLoader: vi.fn((...args: Parameters<typeof actual.pluginLoader>) => ({
+      ...actual.pluginLoader(...args),
+      loadAll: () =>
+        new Promise((resolve) => {
+          outbox.releaseLoadAll = () => resolve({ results: [] } as never);
+        }),
+    })),
+  };
+});
+
 import { createApp } from "../app.js";
 
 async function boot(shouldRunWorkerSingletons: () => boolean): Promise<Express> {
@@ -38,6 +66,7 @@ describe("createApp plugin job scheduler lease gate (BLO-46694)", () => {
   afterEach(async () => {
     await (app?.locals?.paperclipShutdown as undefined | (() => Promise<void>))?.();
     app = null;
+    outbox.releaseLoadAll = null;
     vi.clearAllMocks();
   });
 
@@ -52,5 +81,24 @@ describe("createApp plugin job scheduler lease gate (BLO-46694)", () => {
     await (app.locals.paperclipShutdown as () => Promise<void>)();
     app = null;
     expect(schedulerSpy.stop).toHaveBeenCalled();
+  }, 120_000);
+  it("stopWorkerSingletons stops the scheduler and the outbox without the rest of shutdown (BLO-46711)", async () => {
+    app = await boot(() => true);
+    await vi.waitFor(() => expect(outbox.releaseLoadAll).not.toBeNull());
+    outbox.releaseLoadAll?.();
+    await vi.waitFor(() => expect(outbox.start).toHaveBeenCalledTimes(1));
+
+    (app.locals.stopWorkerSingletons as () => void)();
+    expect(schedulerSpy.stop).toHaveBeenCalledTimes(1);
+    expect(outbox.stop).toHaveBeenCalledTimes(1);
+  }, 120_000);
+
+  it("a loadAll() that resolves after stopWorkerSingletons does not start the outbox (BLO-46711)", async () => {
+    app = await boot(() => true);
+    await vi.waitFor(() => expect(outbox.releaseLoadAll).not.toBeNull());
+    (app.locals.stopWorkerSingletons as () => void)();
+    outbox.releaseLoadAll?.();
+    for (let i = 0; i < 25; i += 1) await Promise.resolve();
+    expect(outbox.start).not.toHaveBeenCalled();
   }, 120_000);
 });
