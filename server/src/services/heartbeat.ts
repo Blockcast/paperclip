@@ -28033,7 +28033,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             // the stale window; past it, it falls through to the catch and
             // logs at ERROR, because an active Job outliving its reservation
             // is a real orphan.
-            if (reservationFinalizing && (jobStatus?.phase !== "active" || !finalizeOverdue)) {
+            // An active Job is judged by how long its RELEASE has been
+            // pending, not by run silence. The terminal-run trigger stamps
+            // updated_at when it moves the row to release_pending, and a
+            // stale-killed run is silent past the window by definition, so
+            // the run clock flagged every draining stale-kill Job as an orphan
+            // (measured 2026-10-15 on run d51468be: ERROR 20s after the kill).
+            // With no active row there is no release clock to read.
+            const releaseOverdue = reservation?.state === "release_pending"
+              ? now.getTime() - new Date(reservation.updatedAt).getTime() >= EXTERNAL_LIFECYCLE_STALE_MS
+              : finalizeOverdue;
+            if (reservationFinalizing && (jobStatus?.phase !== "active" || !releaseOverdue)) {
               // The same condition holds forever for a run whose row never
               // leaves `running` (postRun or workspace finalize died after the
               // release). Such a run is skipped by the reap loop below via
@@ -28108,8 +28118,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             // locked re-read: the same finalize window the
             // reservationFinalizing skip handles, caught one read late.
             // Measured 2026-10-14: every remaining post-fix line (2-6/h) was
-            // this, with a succeeded Job and matching name/UID.
-            if (error instanceof ExternalRuntimeReservationReleasePendingError && jobStatus?.phase !== "active") {
+            // this, with a succeeded Job and matching name/UID. The release
+            // began after this sweep's own read, so it is seconds old and a
+            // still-active Job is just draining (2026-10-15: runs 47ba317e
+            // and 2544af7c, cancelled/killed, Job `active`). A Job that
+            // outlives the release is caught on a later sweep by the
+            // release-age check above, which sees the release_pending row and
+            // deliberately lets an overdue one fall through to here -- so only
+            // a read that did NOT see release_pending is the race.
+            if (error instanceof ExternalRuntimeReservationReleasePendingError && reservation?.state !== "release_pending") {
               logger.debug(
                 {
                   runId: run.id,
