@@ -42,12 +42,49 @@ permissions:
 jobs:
   prime:
     name: Prime Playwright browser cache
-    runs-on: arc-light
+    # arc-paperclip-general, not arc-light. When this runs for a
+    # `pnpm-lock.yaml` push -- the trigger that matters, because a Playwright
+    # bump arrives as one -- `Install dependencies` is a COLD-store install,
+    # and a cold install does not fit in arc-light's 4 GiB. setup-node restores
+    # the pnpm store by exact lockfile-hash key only, and nothing has normally
+    # saved the new key on `master` by the time this job installs (Refresh
+    # Lockfile seeds it minutes later, and only when its own run succeeds), so
+    # pnpm fetches and extracts all 1,342 packages.
+    #
+    # On arc-light (4 GiB limit, no CPU limit): run 38695349021 (48d8c59f3,
+    # 2026-10-15) died in `Install dependencies` on both attempts, and
+    # kube-state-metrics recorded both runner containers as OOMKilled. The
+    # runner died with them, so no log was uploaded and the job was only
+    # marked failed ~13 min after it started. The last cadvisor sample, 23 s
+    # into the install, read 1.44 GB (1.27 GB RSS); the container was gone by
+    # the next one. Two of the three 10-07 lockfile pushes also died ~10 min in
+    # with no step results recorded; the third passed only on a re-run five
+    # days later. Both arc-light successes restored an already-saved store.
+    #
+    # Off-cluster, same lockfile and flags, the standalone pnpm 9.15.4 that
+    # setup-pnpm installs, on a 32-CPU host like the node that OOMed: a cold
+    # install peaks at 5.1-5.6 GiB anonymous memory (8.3-9.2 GiB with page
+    # cache) and is OOM-killed 32 s in under a 4 GiB cap. With the store warm it
+    # peaks at 2.1 GiB, which is why arc-light only ever passed warm. pnpm sizes
+    # its extraction workers (CPUs - 1) and fetch concurrency (CPUs, at least
+    # 16) to the CPUs it sees, ignoring a cgroup CPU quota, so it runs 20-64
+    # wide on the nodes these pods land on, whatever the pod's limit. Narrowing
+    # it does not rescue 4 GiB: 15 workers still peaked at 4.5 GiB anonymous.
+    #
+    # arc-paperclip-general (16 GiB) is where master-health.yml already runs
+    # this same install for `master` pushes, on the same runner image. Not
+    # arc-e2e: it is the scarce browser-suite pool, and this job runs no
+    # browser suite. Not `default`: the org-wide pool that pr.yml keeps
+    # paperclip's heavy lanes off.
+    runs-on: arc-paperclip-general
     # Floor enforced for every job that sets up pnpm by
     # scripts/__tests__/pnpm-setup-retry.test.mjs. This job's own measured
     # demand is smaller: the sum of the per-step maxima in the 28-run sample
     # above (checkout 105 s, setup pnpm 28 s, setup node 95 s, install 97 s,
-    # browser install 201 s, cache save 53 s) is 579 s.
+    # browser install 201 s, cache save 53 s) is 579 s. Those installs restored
+    # a warm store; this job's cold one measured 93-121 s off-cluster (Refresh
+    # Lockfile's cold `pnpm fetch` on `default`: 64-122 s), which keeps the sum
+    # near 10 min.
     timeout-minutes: 15
 
     steps:
@@ -57,8 +94,9 @@ jobs:
       - name: Setup pnpm
         uses: ./.github/actions/setup-pnpm
 
-      # Same Node major and `cache: pnpm` as the e2e job, so the store restore
-      # hits the entry `master-health.yml` already saves.
+      # Same Node major and `cache: pnpm` as the e2e job. On a lockfile push the
+      # store restore misses (see `runs-on` above); on a push of this file or a
+      # dispatch it hits the entry `master-health.yml` and Refresh Lockfile save.
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
