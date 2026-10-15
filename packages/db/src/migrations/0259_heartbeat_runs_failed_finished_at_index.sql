@@ -4,31 +4,41 @@
 -- refreshWorkspaceReuseRefusalMetrics runs, on every scrape-metrics collector
 -- tick (15s) on every control-plane replica,
 --
---   SELECT ... FROM heartbeat_runs JOIN issues ...
+--   SELECT context_issue_id, error FROM heartbeat_runs
 --   WHERE status = 'failed' AND finished_at >= now() - interval '2 hours'
---   ORDER BY finished_at DESC LIMIT 5000
+--     AND error IS NOT NULL AND <refusal markers>
+--   ORDER BY finished_at DESC, id DESC LIMIT 5000
 --
--- No existing index can serve that predicate. Every `status`-bearing index on
--- heartbeat_runs leads with `company_id` and this sweep is fleet-wide, so there
--- is no leading-key value to probe with, and PostgreSQL before 18 has no index
--- skip scan. The only other `finished_at` index is
--- heartbeat_runs_crash_recovery_pending_idx, whose `error_code =
--- 'worker_crashed'` predicate these rows do not satisfy.
+-- Not because nothing else can serve that predicate. It was first justified
+-- that way and the measurement refuted it: every `status`-bearing index on
+-- heartbeat_runs leads with `company_id` and this sweep is fleet-wide, but
+-- PostgreSQL will still `BitmapAnd` the TRAILING `finished_at` and `status`
+-- columns of two of them, which is a bitmap index scan, not a sequential scan.
+-- (heartbeat_runs_crash_recovery_pending_idx genuinely cannot serve it -- its
+-- `error_code = 'worker_crashed'` predicate excludes these rows.) Production
+-- corroborates the planner's preference: increase(pg_heartbeat_runs_access_
+-- seq_scan[24h]) = 2.0, i.e. this table is sequentially scanned about twice a
+-- DAY, not on a 15s timer.
 --
--- Measured 2026-10-15 from the production exporter
--- (pg_heartbeat_runs_access_seq_tup_read / pg_heartbeat_runs_access_seq_scan):
--- heartbeat_runs averages 368,694 rows per sequential scan, and production runs
--- ~2 sequential scans per DAY on it (increase(..._seq_scan[24h]) = 2.0).
--- Unindexed, this sweep alone would add ~8 per minute across the 2 api replicas,
--- over a heap carrying a wide `context_snapshot` jsonb and `error` text. The
--- collector runs its refreshes in series within a non-overlapping 15s tick, so
--- the cost would not stay local to this gauge: a slow scan here delays every
--- refresh after it and holds one of ten pool connections while it runs, which
--- is the contention BLO-33243 moved off the scrape path in the first place.
+-- This index earns its place on how the two SCALE, measured with
+-- EXPLAIN (ANALYZE, BUFFERS) at 60k rows:
 --
--- Partial on the single status, with `id` after `finished_at` so the LIMIT cut
--- is deterministic among same-instant rows. The indexed set is the failed runs
--- only, and the sweep reads a 2h range of it.
+--   without:  BitmapAnd, one index entry per failed run that has EVER existed
+--             (8,572 rows at 60k), 37 buffers on the run side
+--   with:     Index Scan Backward, the failed runs inside the 2h window
+--             (24 rows), 16 buffers hit + 2 read
+--
+-- The without-path's cost grows with the table; this one's grows with the
+-- window. For scale, the same production exporter reports heartbeat_runs
+-- averaging 368,694 rows per sequential scan. The collector runs its refreshes
+-- in series within a non-overlapping 15s tick, so the difference does not stay
+-- local to this gauge: a slow query delays every refresh after it and holds one
+-- of ten pool connections while it runs, which is the contention BLO-33243
+-- moved off the scrape path in the first place.
+--
+-- Partial on the single status, with `id` after `finished_at` so the window,
+-- the ORDER BY and the LIMIT cut all come off one backward index scan and the
+-- cut is deterministic among same-instant rows.
 --
 -- Drizzle migrations are transactional, so CONCURRENTLY is unavailable here and
 -- a plain CREATE INDEX would hold a SHARE lock on a large hot table for the
