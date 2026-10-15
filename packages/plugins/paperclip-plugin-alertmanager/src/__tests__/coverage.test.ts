@@ -144,4 +144,26 @@ describe("runCoverageCheck (BLO-40673 AC4)", () => {
     await runCoverageCheck(ctx, config, new Date("2026-10-13T18:16:00Z"), read);
     expect(read).not.toHaveBeenCalled();
   });
+
+  // Production sets only the host env default (BLO-42694), never the instance
+  // config field. Reading config alone made every pass return before the
+  // heartbeat, so the detector shipped inert.
+  it("reads Alertmanager via the PAPERCLIP_ALERTMANAGER_API_URL default when config leaves it unset", async () => {
+    vi.stubEnv("PAPERCLIP_ALERTMANAGER_API_URL", "http://am-env:9093/");
+    const fetchMock = vi.fn(async (_url: unknown) => new Response(JSON.stringify([amAlert("fp1")]), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      const { ctx, write } = harness({
+        records: { fp1: record() },
+        issues: { "issue-1": { id: "issue-1", status: "cancelled" } },
+      });
+      await runCoverageCheck(ctx, { defaultCompanyId: COMPANY }, NOW);
+      expect(String(fetchMock.mock.calls[0][0])).toMatch(/^http:\/\/am-env:9093\/api\/v2\/alerts/);
+      expect(uncoveredCalls(write)).toHaveLength(1);
+      expect(write).toHaveBeenCalledWith("alertmanager.coverage.checked", 1);
+    } finally {
+      vi.unstubAllEnvs();
+      vi.unstubAllGlobals();
+    }
+  });
 });

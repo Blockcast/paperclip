@@ -120,6 +120,18 @@ describe("reconcileActiveAlerts (BLO-44820)", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
+  it("falls back to the host PAPERCLIP_ALERTMANAGER_API_URL default like the escalation ladder (BLO-40673)", async () => {
+    vi.stubEnv("PAPERCLIP_ALERTMANAGER_API_URL", "http://am-env:9093/");
+    try {
+      served = [amAlert("lost")];
+      const result = await reconcileActiveAlerts(ctx, { ...config, alertmanagerApiUrl: undefined }, NOW);
+      expect(result.backfilled).toEqual(["lost"]);
+      expect(String((fetch as unknown as { mock: { calls: unknown[][] } }).mock.calls[0][0])).toMatch(/^http:\/\/am-env:9093\/api\/v2\/alerts/);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("fails the run on an unreadable Alertmanager instead of reporting nothing missing", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response("down", { status: 503 })));
     await expect(reconcileActiveAlerts(ctx, config, NOW)).rejects.toThrow(/503/);

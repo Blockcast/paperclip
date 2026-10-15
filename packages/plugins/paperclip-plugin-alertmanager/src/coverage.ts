@@ -1,6 +1,7 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { aggregateKeyForAlert } from "./aggregate-key.js";
 import { alertStateRef } from "./constants.js";
+import { resolveAlertmanagerApiUrl } from "./escalation.js";
 import { isTerminalSeverity } from "./issue-mapping.js";
 import type { AlertmanagerAlert, AlertmanagerPluginConfig, AlertStateRecord } from "./types.js";
 import { decideRefire, findActiveAggregateIssue } from "./webhook-handler.js";
@@ -66,8 +67,14 @@ export async function classifyAlertCoverage(
  * skips the pass, so `uncovered` is never emitted off a read that did not land.
  */
 async function readActiveAlerts(config: AlertmanagerPluginConfig, logger: PluginContext["logger"]): Promise<AmAlert[] | null> {
-  const base = config.alertmanagerApiUrl?.trim().replace(/\/+$/, "");
-  if (!base || !["http:", "https:"].includes(URL.parse(base)?.protocol ?? "")) return null;
+  // Same resolver as the escalation ladder: config first, then the host's
+  // PAPERCLIP_ALERTMANAGER_API_URL default. Reading config alone left this
+  // detector inert in production, where only the env default is set.
+  const base = resolveAlertmanagerApiUrl(config);
+  if (!base || !["http:", "https:"].includes(URL.parse(base)?.protocol ?? "")) {
+    logger.warn("alert-coverage: no usable alertmanagerApiUrl, skipping this pass");
+    return null;
+  }
   try {
     // Global fetch, not ctx.http: the host's SSRF guard refuses the
     // cluster-internal ClusterIP (see readAlertLiveness in escalation.ts).
