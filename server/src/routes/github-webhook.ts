@@ -7402,7 +7402,8 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
     // for the other lanes. Collapse them to ONE wake per (issue, head): the
     // first red lane wakes at once (actionable now); a green lane wakes only
     // once every check-run on the head is terminal. All three events share one
-    // head-scoped key, so whichever arrives first wins and the rest dedup.
+    // head-scoped key, so whichever arrives first wins and the rest dedup while
+    // that wake is in flight; once it is consumed, a re-run may wake again.
     // `unknown` settlement fails OPEN -- a dropped CI wake strands the assignee.
     const ciCompletionHeadSha =
       CI_COMPLETION_WAKE_REASONS.has(context.wakeReason) && context.repoFullName && context.headSha
@@ -7612,7 +7613,10 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
             and(
               eq(agentWakeupRequests.agentId, effectiveAssigneeAgentId),
               eq(agentWakeupRequests.idempotencyKey, authorWakeIdempotencyKey),
-              inArray(agentWakeupRequests.status, idempotentWakeStatuses("request")),
+              // In-flight only: a CONSUMED wake must not mute this head forever.
+              // A re-run (pr.yml's attempt 2 after the Ally verdict, or a manual
+              // `gh run rerun`) settles the same head again and is a new verdict.
+              inArray(agentWakeupRequests.status, idempotentWakeStatuses("stable")),
             ),
           )
           .limit(1);

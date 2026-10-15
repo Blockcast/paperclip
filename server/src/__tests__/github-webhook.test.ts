@@ -8846,6 +8846,20 @@ describeEmbeddedPostgres("github-webhook route", () => {
       expect(await send(app, ciDelivery("check_run", 9, "head-next", "failure"))).toBe(1);
     });
 
+    it("a re-run on the same head wakes again once the first wake was consumed", async () => {
+      const { agentId } = await seedIssueWithIdentifier("BLO-3182");
+      const app = buildApp({ resolveCiHeadSettlement: async () => "settled" });
+      // Attempt 1: pr.yml's structural no-verdict red.
+      expect(await send(app, ciDelivery("check_run", 1, "head-rerun", "failure"))).toBe(1);
+      expect(await send(app, ciDelivery("workflow_run", 1, "head-rerun", "failure"))).toBe(0);
+      await db
+        .update(agentWakeupRequests)
+        .set({ status: "completed" })
+        .where(eq(agentWakeupRequests.agentId, agentId));
+      // Attempt 2 on the SAME head carries the real verdict and must not be swallowed.
+      expect(await send(app, ciDelivery("check_run", 2, "head-rerun", "failure"))).toBe(1);
+    });
+
     it("fails open when settlement is unknown, still collapsing to one wake per head", async () => {
       await seedIssueWithIdentifier("BLO-3182");
       const app = buildApp({ resolveCiHeadSettlement: async () => "unknown" });
