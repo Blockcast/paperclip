@@ -41,6 +41,14 @@ vi.mock("../services/issue-assignment-wakeup.js", () => ({
   queueIssueAssignmentWakeup: vi.fn(),
 }));
 
+// BLO-46886: the pr_review dedupe asks GitHub for the live head before letting
+// a filing retarget the row. Default null = GitHub unavailable = fail open.
+const fetchPrHeadSha = vi.hoisted(() => vi.fn(async (_ref: unknown): Promise<string | null> => null));
+vi.mock("../services/github-app-auth.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/github-app-auth.js")>()),
+  githubFetchPrHeadSha: fetchPrHeadSha,
+}));
+
 const REPO = "Blockcast/pim-multicast-gateway";
 const NORMALIZED_REPO = REPO.toLowerCase();
 const PR_NUMBER = 1911;
@@ -813,6 +821,44 @@ describeEmbeddedPostgres("issue create PR-review duplicate guard routes", () => 
     const rows = await db.select().from(issues).where(eq(issues.companyId, companyId));
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ originKind: "pr_review", title: expect.stringContaining("0b77b30dbb") });
+  });
+
+  describe("stale-head filings (BLO-46886)", () => {
+    const OLD = "af338ef18c";
+    const NEW = "78ba7ab933";
+    const LIVE = `${NEW}0123456789abcdef0123456789abcdef`;
+    const filing = (reviewerId: string, head: string) =>
+      reviewIssueBody(reviewerId, {
+        title: `Review ${REPO} PR #${PR_NUMBER} exact head ${head}`,
+        description: `Please review ${PR_URL} at head ${head}.`,
+      });
+    afterEach(() => fetchPrHeadSha.mockReset().mockResolvedValue(null));
+
+    it("retargets forward, then ignores a re-filed older head", async () => {
+      fetchPrHeadSha.mockResolvedValue(LIVE);
+      const { companyId, reviewer, app } = await setup();
+      const first = await request(app).post(`/api/companies/${companyId}/issues`).send(filing(reviewer.id, OLD)).expect(201);
+
+      const forward = await request(app).post(`/api/companies/${companyId}/issues`).send(filing(reviewer.id, NEW)).expect(200);
+      expect(forward.body).toMatchObject({ id: first.body.id, deduplicationReason: "pr_review_target" });
+
+      const stale = await request(app).post(`/api/companies/${companyId}/issues`).send(filing(reviewer.id, OLD)).expect(200);
+      expect(stale.body).toMatchObject({ id: first.body.id, deduplicationReason: "pr_review_target_stale" });
+
+      const rows = await db.select().from(issues).where(eq(issues.companyId, companyId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.title).toContain(NEW);
+      expect(rows[0]!.description).toContain(NEW);
+    });
+
+    it("fails open and retargets when GitHub cannot report the live head", async () => {
+      const { companyId, reviewer, app } = await setup();
+      await request(app).post(`/api/companies/${companyId}/issues`).send(filing(reviewer.id, NEW)).expect(201);
+      const refiled = await request(app).post(`/api/companies/${companyId}/issues`).send(filing(reviewer.id, OLD)).expect(200);
+      expect(refiled.body).toMatchObject({ deduplicationReason: "pr_review_target" });
+      const [row] = await db.select().from(issues).where(eq(issues.companyId, companyId));
+      expect(row!.title).toContain(OLD);
+    });
   });
 
   it("leaves a canonical-titled row for a non-reviewer as manual (BLO-44562)", async () => {
