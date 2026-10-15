@@ -55,13 +55,35 @@ export const NOT_A_CHECKOUT_MARKER = "git rev-parse --git-dir found no git repos
 export const PROBE_INDETERMINATE_MARKER = "git rev-parse --git-dir could not verify a checkout in ";
 
 /**
- * Marker for the `formatInheritedExecutionWorkspaceReuseFailure` wrapper in
- * `heartbeat.ts`. The wrapper embeds the inner cause, so an episode normally
- * classifies on one of the three markers above; this one is reached only when
- * the wrapper reported no cause at all, which is itself worth separating
- * because it is the one shape item 1 was meant to eliminate.
+ * Headline PREFIX of the `formatInheritedExecutionWorkspaceReuseFailure`
+ * wrapper in `heartbeat.ts`. Deliberately NOT a membership marker -- both of
+ * the wrapper's arms open with it. See {@link REUSE_FAILURE_NO_CAUSE_HEADLINE}.
  */
 export const REUSE_FAILURE_HEADLINE = "Inherited execution workspace reuse failed";
+
+/**
+ * Marker for the wrapper's no-cause arm: the headline AND the sentence that
+ * only that arm emits.
+ *
+ * The prefix alone cannot be the marker, because the cause-PRESENT arm emits
+ * `${REUSE_FAILURE_HEADLINE} because <cause>.` from the same constant. Keying
+ * on the prefix therefore swept in every inherited-reuse failure in the fleet
+ * whose cause was not one of the three checkout markers above -- an archived
+ * execution workspace, a failed restore, a provision error -- all of which
+ * DID report a cause. That was wrong three times over: it contradicted this
+ * bucket's own meaning, it sent the runbook looking for a defect in the
+ * reporting path when nothing was missing, and (the expensive one) it added
+ * ISSUE-scoped failures to a PER-PROJECT-WORKSPACE count, so three unrelated
+ * archived-workspace reuses in one project paged as "ONE broken checkout...
+ * do not triage the issues individually" -- the exact mis-routing this row
+ * exists to remove. (Ally review on #2750.)
+ *
+ * A wrapper whose embedded cause carries none of the checkout markers is not a
+ * member of this class and classifies as `null`.
+ */
+export const REUSE_FAILURE_NO_CAUSE_HEADLINE =
+  `${REUSE_FAILURE_HEADLINE}: the referenced execution workspace could not be restored, ` +
+  "and no cause was reported";
 
 /** Builds the episode-1 refusal. Sole producer of {@link ORIGIN_MISMATCH_MARKER}. */
 export function formatOriginMismatchRefusal(input: {
@@ -91,20 +113,41 @@ export function formatGitProbeRefusal(input: {
 }
 
 /**
+ * Marker -> class, in precedence order.
+ *
+ * The inner markers are tested BEFORE the wrapper's, because the wrapper embeds
+ * the inner cause and the inner cause is the informative half: a body carrying
+ * both must count as the specific failure, not as `cause_unreported`.
+ */
+const REFUSAL_CLASS_BY_MARKER = [
+  [NOT_A_CHECKOUT_MARKER, "not_a_checkout"],
+  [PROBE_INDETERMINATE_MARKER, "probe_indeterminate"],
+  [ORIGIN_MISMATCH_MARKER, "origin_mismatch"],
+  [REUSE_FAILURE_NO_CAUSE_HEADLINE, "cause_unreported"],
+] as const satisfies readonly (readonly [string, WorkspaceReuseRefusalClass])[];
+
+/**
+ * Every substring that can make a body a member of this class.
+ *
+ * Exported so the sweep's SQL prefilter is built from the SAME list
+ * {@link classifyWorkspaceReuseRefusal} branches on. A hand-copied predicate
+ * that drifted narrower would drop refusals before they were ever classified,
+ * and the only symptom would be a count that quietly went down.
+ */
+export const WORKSPACE_REUSE_REFUSAL_MARKERS: readonly string[] = REFUSAL_CLASS_BY_MARKER.map(
+  ([marker]) => marker,
+);
+
+/**
  * Classify a `heartbeat_runs.error` body, or null when the body is not a member
  * of this class.
- *
- * Inner markers are tested BEFORE the wrapper headline, because the wrapper
- * embeds the inner cause and the inner cause is the informative half: a body
- * carrying both must count as the specific failure, not as `cause_unreported`.
  */
 export function classifyWorkspaceReuseRefusal(
   errorBody: string | null | undefined,
 ): WorkspaceReuseRefusalClass | null {
   if (!errorBody) return null;
-  if (errorBody.includes(NOT_A_CHECKOUT_MARKER)) return "not_a_checkout";
-  if (errorBody.includes(PROBE_INDETERMINATE_MARKER)) return "probe_indeterminate";
-  if (errorBody.includes(ORIGIN_MISMATCH_MARKER)) return "origin_mismatch";
-  if (errorBody.includes(REUSE_FAILURE_HEADLINE)) return "cause_unreported";
+  for (const [marker, failureClass] of REFUSAL_CLASS_BY_MARKER) {
+    if (errorBody.includes(marker)) return failureClass;
+  }
   return null;
 }

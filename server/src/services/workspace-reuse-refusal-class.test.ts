@@ -7,7 +7,9 @@ import {
   formatGitProbeRefusal,
   formatOriginMismatchRefusal,
   REUSE_FAILURE_HEADLINE,
+  REUSE_FAILURE_NO_CAUSE_HEADLINE,
   WORKSPACE_REUSE_REFUSAL_CLASSES,
+  WORKSPACE_REUSE_REFUSAL_MARKERS,
 } from "./workspace-reuse-refusal-class.js";
 
 /**
@@ -28,7 +30,7 @@ import {
 function wrapReuseFailure(cause: string | null): string {
   return cause
     ? `${REUSE_FAILURE_HEADLINE} because ${cause}.`
-    : `${REUSE_FAILURE_HEADLINE}: the referenced execution workspace could not be restored, and no cause was reported (execution workspace ws-1).`;
+    : `${REUSE_FAILURE_NO_CAUSE_HEADLINE} (execution workspace ws-1).`;
 }
 
 describe("classifyWorkspaceReuseRefusal", () => {
@@ -86,6 +88,36 @@ describe("classifyWorkspaceReuseRefusal", () => {
 
   it("classifies a wrapper that reported no cause as cause_unreported", () => {
     expect(classifyWorkspaceReuseRefusal(wrapReuseFailure(null))).toBe("cause_unreported");
+  });
+
+  it("does NOT claim a wrapper whose cause is reported but is not a checkout fault", () => {
+    // Regression for the Ally review on #2750. Both of the wrapper's arms open
+    // with REUSE_FAILURE_HEADLINE, so keying `cause_unreported` on that prefix
+    // swallowed every inherited-reuse failure in the fleet -- an archived
+    // workspace, a failed restore, a provision error -- each of which DID
+    // report a cause, and none of which is a property of the project checkout.
+    // Counting them per project_workspace_id is the mis-routing this row
+    // removes: three unrelated archived-workspace reuses in one project would
+    // have paged as ONE broken checkout.
+    for (const cause of [
+      "execution workspace 9ba3b757-0b1b-477e-ad8d-aac636837a3e is archived",
+      "failed to restore execution workspace: ENOENT: no such file or directory",
+      "provisioning the execution workspace timed out after 300000ms",
+    ]) {
+      expect(classifyWorkspaceReuseRefusal(wrapReuseFailure(cause))).toBeNull();
+    }
+  });
+
+  it("exports exactly the markers it branches on, so the SQL prefilter cannot drift", () => {
+    // The sweep prefilters in SQL from WORKSPACE_REUSE_REFUSAL_MARKERS before
+    // applying its scan limit. If that list were narrower than what the
+    // classifier accepts, refusals would be dropped before classification and
+    // the only symptom would be a count that quietly went down.
+    const classes = WORKSPACE_REUSE_REFUSAL_MARKERS.map((marker) =>
+      classifyWorkspaceReuseRefusal(`prefix ${marker} suffix`),
+    );
+    expect(classes.every((value) => value !== null)).toBe(true);
+    expect(new Set(classes)).toEqual(new Set(WORKSPACE_REUSE_REFUSAL_CLASSES));
   });
 
   it("returns null for bodies outside the class, so unrelated setup_failed is not absorbed", () => {
@@ -153,8 +185,15 @@ describe("the real producers are wired to the shared markers", () => {
 
   it("heartbeat.ts builds the reuse-failure headline through this module", () => {
     const source = read("heartbeat.ts");
-    expect(source).toContain('import { REUSE_FAILURE_HEADLINE } from "./workspace-reuse-refusal-class.js"');
+    expect(source).toContain(
+      'import {\n  REUSE_FAILURE_HEADLINE,\n  REUSE_FAILURE_NO_CAUSE_HEADLINE,\n} from "./workspace-reuse-refusal-class.js";',
+    );
     expect(source).toContain("`${REUSE_FAILURE_HEADLINE} because ${causeMessage}.`");
+    // The no-cause arm must stay built from its OWN constant. Rebuilding it from
+    // the shared prefix plus an inline sentence is what made `cause_unreported`
+    // absorb every reported-cause reuse failure (#2750).
+    expect(source).toContain("`${REUSE_FAILURE_NO_CAUSE_HEADLINE} (execution workspace ${workspaceLabel}).`");
+    expect(source).not.toContain("and no cause was reported (execution workspace ${");
     // PEN-3633 item 4 put the cause on line 1 so the 240-char summarizers cannot
     // elide it. If the headline is ever rebuilt as an inline literal, that fix
     // and this detector both regress together, so pin the literal's absence.

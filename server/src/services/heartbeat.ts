@@ -335,7 +335,10 @@ import {
   WorkspaceGitSubmoduleError,
   WorkspaceRepoMismatchError,
 } from "./workspace-runtime.js";
-import { REUSE_FAILURE_HEADLINE } from "./workspace-reuse-refusal-class.js";
+import {
+  REUSE_FAILURE_HEADLINE,
+  REUSE_FAILURE_NO_CAUSE_HEADLINE,
+} from "./workspace-reuse-refusal-class.js";
 import { issueService } from "./issues.js";
 import {
   ISSUE_EXECUTION_LOCK_HOLDING_RUN_STATUSES,
@@ -8710,13 +8713,19 @@ function formatInheritedExecutionWorkspaceReuseFailure(input: {
   const remediation = input.reason === "inherited_workspace_reuse_failed"
     ? "Inspect the referenced execution workspace restore/provision logs, repair or unarchive the workspace, or intentionally clear the issue's reuse_existing workspace binding before retrying."
     : "Repair or unarchive the referenced execution workspace, or intentionally clear the issue's reuse_existing workspace binding before retrying.";
-  // PEN-3633 item 3: the headline prefix is the shared membership marker for the
-  // body-bucketed refusal metric. Interpolating the constant rather than
-  // repeating the literal keeps the detector and this sentence from drifting --
-  // `workspace-reuse-refusal-class.test.ts` round-trips both arms.
+  // PEN-3633 item 3: the detector buckets on this body, so both arms are built
+  // from the constants it matches rather than from inline literals --
+  // `workspace-reuse-refusal-class.test.ts` round-trips both.
+  //
+  // The two arms carry DIFFERENT markers on purpose. `REUSE_FAILURE_HEADLINE`
+  // opens both, so it identifies the wrapper, not the no-cause case; only
+  // `REUSE_FAILURE_NO_CAUSE_HEADLINE` means "no cause was reported". Rebuilding
+  // the no-cause arm from the prefix plus an inline sentence would classify
+  // every archived-workspace and failed-restore reuse as `cause_unreported` and
+  // count issue-level faults against a project-level checkout. (Ally on #2750.)
   const headline = causeMessage
     ? `${REUSE_FAILURE_HEADLINE} because ${causeMessage}.`
-    : `${REUSE_FAILURE_HEADLINE}: the referenced execution workspace could not be restored, and no cause was reported (execution workspace ${workspaceLabel}).`;
+    : `${REUSE_FAILURE_NO_CAUSE_HEADLINE} (execution workspace ${workspaceLabel}).`;
   const context = `Issue ${issueLabel} requested reuse of execution workspace ${workspaceLabel}.`;
 
   return `${headline}\n${context}\n${remediation}`;

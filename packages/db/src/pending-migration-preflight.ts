@@ -194,6 +194,15 @@ export const PRECREATE_REQUIRED_INDEXES: readonly PrecreateRequiredIndex[] = [
       "ON agent_wakeup_requests USING btree (agent_id, requested_at) " +
       "WHERE status = 'deferred_issue_execution'",
   },
+  {
+    migration: "0259_heartbeat_runs_failed_finished_at_index.sql",
+    name: "heartbeat_runs_failed_finished_at_idx",
+    table: "heartbeat_runs",
+    createStatement:
+      "CREATE INDEX CONCURRENTLY IF NOT EXISTS heartbeat_runs_failed_finished_at_idx " +
+      "ON heartbeat_runs USING btree (finished_at, id) " +
+      "WHERE status = 'failed'",
+  },
 ];
 
 export type PreflightBlocker = {

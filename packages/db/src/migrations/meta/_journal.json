@@ -1758,6 +1758,13 @@
       "when": 1791764500000,
       "tag": "0258_unbind_issues_from_collected_execution_workspaces",
       "breakpoints": true
+    },
+    {
+      "idx": 259,
+      "version": "7",
+      "when": 1791764600000,
+      "tag": "0259_heartbeat_runs_failed_finished_at_index",
+      "breakpoints": true
     }
   ]
 }
