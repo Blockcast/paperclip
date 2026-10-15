@@ -49,7 +49,33 @@ export const heartbeatRuns = pgTable(
     // A run that has never emitted progress-counting output is a different
     // case, but telling
     // the two apart safely needs the distribution of time-to-first-output on
-    // HEALTHY runs, and nothing records it. Measured 2026-09-18: 41
+    // HEALTHY runs. PEN-2317, measured 2026-10-15, closes that gap: n=483
+    // started runs, whole company, all `claude_k8s`, over a ~29h window
+    // (2026-10-14T17:30Z -> 2026-10-15T22:26Z). p50 6.0s, p90 15.2s, p95
+    // 20.3s, p99 37.2s, max 103.3s; ZERO runs exceeded 120s. The window opens
+    // a month after 0245 applied (2026-09-16), so the migration's own analyst
+    // caveat -- runs already streaming at apply time get a mid-run stamp --
+    // cannot reach it. Quote the window length with n: a cutoff derived from a
+    // sample MAX is sensitive to how long the sample ran.
+    //
+    // ⛔ Read the margin before picking a cutoff. 2 min is NOT comfortably
+    // clear of that max -- 120 / 103.3 is 1.16x, a ~16% margin off a single
+    // tail sample, which is the too-short floor 0245 warns about wearing a
+    // number. Useful multiples: ~5 min is 2.9x the observed max (~8x p99),
+    // ~30 min is >16x.
+    //
+    // The other half is yield, and it is window-scoped on purpose. In THIS
+    // window a never-spoke cutoff would have reclaimed nothing: of 478
+    // started+terminal runs `firstOutputAt` was NULL on 0, and all 5
+    // `external_lifecycle_stale_killed` runs had it SET (9.5-17.7s, 197-329
+    // progress chunks) -- "spoke, then stopped", which this column does not
+    // select and no never-spoke floor can reach. That is NOT a general claim:
+    // the 2026-09-18 measurement retained below is exactly such a population
+    // (41 runs, every one `log_bytes` 0), on a different adapter generation.
+    // Yield here is a property of the current fleet, not of the mechanism.
+    // Re-measure the window you are about to act on.
+    //
+    // Earlier measurement, retained -- 2026-09-18: 41
     // `process_lost` runs held 638 slot-minutes -- within 1% of the 644
     // minutes all successful runs consumed in the same window -- every one
     // with `log_bytes` 0, killed at a 15.1m median. Those minutes cost zero
