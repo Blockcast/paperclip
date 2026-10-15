@@ -1135,6 +1135,7 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
   // in server/src/index.ts so plugin lifecycle only runs on the tier that
   // can host workers.
   let stopPluginEventOutbox: (() => void) | null = null;
+  let appWorkerSingletonsStopped = false;
   let stopGitHubStatusDeliveryOutbox: (() => void) | null = null;
   let stopPluginStatusCollector: (() => void) | null = null;
   let stopGithubReviewGateDeliveryWorker: (() => Promise<void>) | null = null;
@@ -1198,8 +1199,8 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
   // BLO-46711: the lease-gated singletons, stopped as a unit so the server's
   // shutdown can stop them BEFORE it releases the scheduler lease, not in
   // paperclipShutdown after it. The flag also keeps a loadAll() that resolves
-  // after this from starting the outbox.
-  let appWorkerSingletonsStopped = false;
+  // after this from starting the outbox (declared up top, before the loadAll
+  // chain that reads it, so a later await cannot turn that read into a TDZ throw).
   const stopAppWorkerSingletons = () => {
     appWorkerSingletonsStopped = true;
     stopPluginEventOutbox?.();
