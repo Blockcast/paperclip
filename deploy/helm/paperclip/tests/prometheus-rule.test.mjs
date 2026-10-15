@@ -2658,3 +2658,81 @@ test("the start-lock runbook routes its two arms on agent count, not on an alert
     "runbook must not offer heldMs as the discriminator between the two arms -- it grows in both",
   );
 });
+
+test("PaperclipWorkspaceReuseRefusalEpisode is project-scoped, body-bucketed, gauge-keyed and freshness-gated (PEN-3633)", () => {
+  // Every property asserted here is one this alert would silently lose.
+  //
+  // - project-scoped: the unit of failure is the project CHECKOUT, not the run.
+  //   One broken checkout produced 33 run failures across 8.6h, none of which
+  //   named the checkout they shared. Grouping by anything else re-fans it out.
+  // - gauge, not increase() over a counter: a labelled counter is born at its
+  //   first increment, so increase() is permanently silent for the FIRST
+  //   episode on a given project_workspace_id -- exactly what this is for.
+  // - freshness-gated: a failed sweep retains the last snapshot rather than
+  //   zeroing it, so the stale series must be dropped from the episode alert
+  //   rather than read as fresh.
+  const rendered = renderChart([
+    "--show-only",
+    "templates/prometheusrule.yaml",
+    "--set",
+    "prometheusRule.enabled=true",
+  ]);
+
+  assert.match(rendered, /alert: PaperclipWorkspaceReuseRefusalEpisode/);
+  assert.match(rendered, /alert: PaperclipWorkspaceReuseRefusalMetricsRefreshFailed/);
+
+  const expr = rendered.match(
+    /alert: PaperclipWorkspaceReuseRefusalEpisode[\s\S]*?\n\s+expr: (.*)\n/,
+  )?.[1];
+  assert.ok(expr, "episode alert must render an expr");
+
+  assert.match(
+    expr,
+    /max by \(project_workspace_id, failure_class\)/,
+    "must aggregate by the project workspace, or the alert re-fans out to one page per run",
+  );
+  assert.match(
+    expr,
+    /paperclip_workspace_reuse_refusal_window_count/,
+    "must key on the window gauge",
+  );
+  assert.doesNotMatch(
+    expr,
+    /increase\(|rate\(/,
+    "must not use increase()/rate(): a labelled counter born at its first increment makes those permanently silent for the first episode on any project workspace",
+  );
+  assert.match(
+    expr,
+    /and on\(instance\) \(paperclip_workspace_reuse_refusal_metrics_refresh_success == 1\)/,
+    "must drop stale series, because a failed sweep retains the previous snapshot rather than zeroing it",
+  );
+  assert.match(expr, />= 3/, "threshold must render from prometheusRule.workspaceReuseRefusalCount");
+
+  assert.ok(
+    existsSync(path.join(repoRoot, "runbooks/workspace-reuse-refusal.md")),
+    "runbooks/workspace-reuse-refusal.md must exist for the runbook_url to resolve",
+  );
+
+  // The description has to route the responder to the checkout rather than to
+  // the issues, which is the mistake both measured episodes produced.
+  const description = rendered.match(
+    /alert: PaperclipWorkspaceReuseRefusalEpisode[\s\S]*?description: "([\s\S]*?)"\n/,
+  )?.[1];
+  assert.ok(description, "episode alert must render a description");
+  assert.match(
+    description,
+    /ONE broken checkout and not N broken issues/,
+    "description must tell the responder not to triage the issues individually",
+  );
+  for (const failureClass of [
+    "origin_mismatch",
+    "not_a_checkout",
+    "probe_indeterminate",
+    "cause_unreported",
+  ]) {
+    assert.ok(
+      description.includes(failureClass),
+      `description must explain the ${failureClass} class it can be labelled with`,
+    );
+  }
+});
