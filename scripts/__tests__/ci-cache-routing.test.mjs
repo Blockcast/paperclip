@@ -7,6 +7,7 @@ const prWorkflowPath = ".github/workflows/pr.yml";
 const dockerWorkflowPath = ".github/workflows/docker.yml";
 const dockerAgentWorkflowPath = ".github/workflows/docker-agent.yml";
 const refreshLockfileWorkflowPath = ".github/workflows/refresh-lockfile.yml";
+const playwrightCachePrimeWorkflowPath = ".github/workflows/playwright-cache-prime.yml";
 
 test("PR jobs do not install an ineffective compiler cache", async () => {
   const workflow = await readFile(prWorkflowPath, "utf8");
@@ -114,6 +115,21 @@ test("Refresh Lockfile populates the setup-node-compatible pnpm cache before sav
     orderedSteps,
     "the refreshed lockfile must be restored, fetched, and saved in order",
   );
+});
+
+test("Playwright cache prime runs its cold-store install on a 16 GiB pool, not arc-light", async () => {
+  const workflow = await readFile(playwrightCachePrimeWorkflowPath, "utf8");
+  const primeJob = workflow.match(/\n  prime:\n([\s\S]*?)(?=\n  [A-Za-z0-9_-]+:\n|$)/)?.[1];
+
+  assert.ok(primeJob, "Playwright cache prime job is missing");
+  // A pnpm-lock.yaml push gives setup-node a store key nothing has saved on
+  // master yet, so this install is cold-store: 5.1-5.6 GiB of anonymous memory
+  // measured, and OOMKilled at arc-light's 4 GiB on both attempts of run
+  // 38695349021. arc-paperclip-general (16 GiB) already runs the same install
+  // for master-health.yml. See the comment on the job's runs-on.
+  assert.match(workflow, /\n    paths:\n      - pnpm-lock\.yaml\n/);
+  assert.match(primeJob, /\n      - name: Install dependencies\n        run: pnpm install --frozen-lockfile\n/);
+  assert.match(primeJob, /\n    runs-on: arc-paperclip-general\n/);
 });
 
 
