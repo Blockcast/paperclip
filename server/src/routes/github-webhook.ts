@@ -2970,6 +2970,55 @@ const REVIEWER_HEAD_SCOPED_WAKE_REASONS: ReadonlySet<string> = new Set([
 // separate behavior change.
 const AUTHOR_DELIVERY_SCOPED_WAKE_REASONS: ReadonlySet<string> = new Set();
 
+// PEN-4114: CI-completion wake reasons, suppressed while the issue carries a
+// live deliberate park.
+//
+// These three are the purely MECHANICAL reasons -- a lane finished, nobody
+// said anything. They carry no human or reviewer intent, so a parked row has
+// nothing to answer and the park's own monitor is the designed resumption
+// path. Every other reason is deliberately absent: a submitted review, an
+// @ally request, a close/merge and a PR opening all carry something a person
+// or a reviewer decided, and swallowing those would turn a park into a
+// mailbox that silently drops post.
+//
+// Why this set rather than a `startsWith("github_check")` test: the three
+// spellings come from three different GitHub events (check_run, check_suite,
+// workflow_run) and only `github_workflow_completed` has no `check` in its
+// name at all, so a prefix test would silently miss the one that fires per
+// workflow -- which is the one the measured poller in PEN-4114 wrote.
+//
+// Measured motivation: a row parked to 2026-10-19 took 15 webhook wakes /
+// $47.55 in 13.16 h from a FROZEN PR it did not own, because a scheduled
+// review-gate poller re-stamped that PR's head every ~15 min and every stamp
+// was a wake. The row was parked, unblocked, monitored and behaving
+// correctly throughout; nothing it could do would have stopped the bleed.
+const PARK_SUPPRESSED_WAKE_REASONS: ReadonlySet<string> = new Set([
+  "github_check_completed",
+  "github_check_suite_completed",
+  "github_workflow_completed",
+]);
+
+/**
+ * PEN-4114: is a deliberate park currently in force on this row?
+ *
+ * Keyed on the deadline alone and compared with `> nowMs`, deliberately
+ * matching `hasActiveParkedDisposition` in
+ * `services/recovery/issue-graph-liveness.ts` so the two readings of "parked"
+ * cannot drift. Expiry is therefore the default: a park nobody restates stops
+ * suppressing on its own, and un-parking (writing `parkedDisposition: null`,
+ * which clears the column) takes effect immediately. This mechanism cannot
+ * decay into permanent silence on a row that genuinely needs the wake.
+ */
+function hasLiveDeliberatePark(
+  issue: { parkedUntil?: Date | string | null },
+  nowMs: number,
+): boolean {
+  const raw = issue.parkedUntil;
+  if (!raw) return false;
+  const parkedUntilMs = raw instanceof Date ? raw.getTime() : new Date(raw).getTime();
+  return Number.isFinite(parkedUntilMs) && parkedUntilMs > nowMs;
+}
+
 function prReviewerWakeIdempotencyScope(
   context: ResolvedEventContext,
   deliveryId: string | null,
@@ -6540,6 +6589,11 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         monitorNextCheckAt: issues.monitorNextCheckAt,
         monitorLastTriggeredAt: issues.monitorLastTriggeredAt,
         monitorAttemptCount: issues.monitorAttemptCount,
+        // PEN-4114: read so the author-wake loop can tell a deliberate park
+        // from an ordinary in_progress row. Selected here rather than
+        // re-fetched per issue in the loop -- one column on a query that
+        // already runs, against a per-issue round trip inside the hot path.
+        parkedUntil: issues.parkedUntil,
       })
       .from(issues);
     const matched = matchedIssues.filter(
@@ -7377,6 +7431,44 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       // CI ping arrived.
       if (issue.status === "done" || issue.status === "cancelled") {
         skipped.push({ issueIdentifier: issue.identifier, reason: "terminal_status" });
+        continue;
+      }
+
+      // PEN-4114: a live deliberate park suppresses the CI-completion wakes.
+      //
+      // Same shape as the terminal-status skip above and for the same reason:
+      // the assignee has already said "not until T", and a lane finishing is
+      // not new information that changes that. The park's monitor fires at T
+      // and re-reads then, so nothing is lost -- only deferred to the moment
+      // the parker chose.
+      //
+      // This is scoped to PARK_SUPPRESSED_WAKE_REASONS, not to every reason:
+      // see that set for why a review, an @ally request or a merge still
+      // lands on a parked row.
+      //
+      // The skip is pushed to `skipped`, which is returned on the delivery
+      // response as well as logged, so the suppression is assertable from the
+      // webhook's own reply rather than only from log scraping. A silent drop
+      // here would be indistinguishable from the bug it fixes.
+      if (
+        PARK_SUPPRESSED_WAKE_REASONS.has(context.wakeReason) &&
+        hasLiveDeliberatePark(issue, Date.now())
+      ) {
+        skipped.push({ issueIdentifier: issue.identifier, reason: "deliberately_parked" });
+        logger.info(
+          {
+            deliveryId,
+            event: eventName,
+            wakeReason: context.wakeReason,
+            issueId: issue.id,
+            identifier: issue.identifier,
+            parkedUntil: issue.parkedUntil,
+            prNumber: context.prNumber,
+            repoFullName: context.repoFullName,
+            headSha: context.headSha,
+          },
+          "github webhook suppressed CI-completion wake: issue is deliberately parked",
+        );
         continue;
       }
 

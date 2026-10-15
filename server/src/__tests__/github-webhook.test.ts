@@ -3247,7 +3247,10 @@ describeEmbeddedPostgres("github-webhook route", () => {
     return { body, signature };
   }
 
-  async function seedIssueWithIdentifier(identifier: string, opts?: { status?: string; assignee?: boolean }) {
+  async function seedIssueWithIdentifier(
+    identifier: string,
+    opts?: { status?: string; assignee?: boolean; parkedUntil?: Date | null },
+  ) {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const issueId = randomUUID();
@@ -3279,6 +3282,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
       assigneeAgentId: opts?.assignee === false ? null : agentId,
       issueNumber: Number(identifier.split("-")[1] ?? 1),
       identifier,
+      ...(opts?.parkedUntil !== undefined ? { parkedUntil: opts.parkedUntil } : {}),
     });
     return { companyId, agentId, issueId };
   }
@@ -3376,6 +3380,213 @@ describeEmbeddedPostgres("github-webhook route", () => {
       .from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.agentId, agentId));
     expect(wakes).toHaveLength(0);
+  });
+
+
+  // PEN-4114: a deliberate park is ignored by CI-completion wakes.
+  //
+  // Measured on PEN-4037: that row was parked to 2026-10-19 with its monitor
+  // `scheduled` and attemptCount 0, and still took 15 webhook wakes / $47.55
+  // in 13.16 h -- because a FROZEN PR whose branch named the row sat under a
+  // *scheduled* review-gate poller, which re-stamped its head every ~15 min.
+  // Every stamp was a check-run completion and every completion was a wake.
+  // The row could not merge that PR and could not stop the stamping; the only
+  // place the loop can be broken is here.
+  //
+  // One case per webhook event rather than one parameterised case, because
+  // the three spellings are produced by three different branches of
+  // resolveEventContext and a shared case would not catch one of them
+  // regressing. `github_workflow_completed` in particular has no `check` in
+  // its name, so it is the one a prefix-shaped fix would silently miss.
+  describe("deliberate-park suppression of CI-completion wakes (PEN-4114)", () => {
+    const parkedUntil = () => new Date(Date.now() + 60 * 60 * 1000);
+    const expiredPark = () => new Date(Date.now() - 60 * 60 * 1000);
+
+    async function deliver(
+      event: string,
+      payload: Record<string, unknown>,
+      delivery: string,
+    ) {
+      const app = buildApp();
+      const { body, signature } = signedRequest(payload);
+      return request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", event)
+        .set("x-hub-signature-256", signature)
+        .set("x-github-delivery", delivery)
+        .set("content-type", "application/json")
+        .send(body);
+    }
+
+    async function wakesFor(agentId: string) {
+      return db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, agentId));
+    }
+
+    it("suppresses a check_run.completed wake while the park is live", async () => {
+      const { agentId } = await seedIssueWithIdentifier("BLO-4114", {
+        parkedUntil: parkedUntil(),
+      });
+      const res = await deliver(
+        "check_run",
+        {
+          action: "completed",
+          check_run: {
+            head_branch: "fix/BLO-4114",
+            head_sha: "parked-head-sha",
+            pull_requests: [{ number: 5650, head: { ref: "fix/BLO-4114" } }],
+          },
+          repository: { full_name: "Blockcast/onprem-k8s" },
+        },
+        "delivery-pen4114-check-run",
+      );
+
+      expect(res.status).toBe(200);
+      expect(res.body.wakes).toHaveLength(0);
+      // Asserted on the RESPONSE, not only on the absence of a wake row: a
+      // silent drop and this suppression would otherwise be indistinguishable
+      // from the outside, which is the shape of the bug being fixed.
+      expect(res.body.skipped).toEqual([
+        { issueIdentifier: "BLO-4114", reason: "deliberately_parked" },
+      ]);
+      expect(await wakesFor(agentId)).toHaveLength(0);
+    });
+
+    it("suppresses a check_suite.completed wake while the park is live", async () => {
+      const { agentId } = await seedIssueWithIdentifier("BLO-4115", {
+        parkedUntil: parkedUntil(),
+      });
+      const res = await deliver(
+        "check_suite",
+        {
+          action: "completed",
+          check_suite: {
+            head_branch: "fix/BLO-4115",
+            head_sha: "parked-suite-sha",
+            pull_requests: [{ number: 5651, head: { ref: "fix/BLO-4115" } }],
+          },
+          repository: { full_name: "Blockcast/onprem-k8s" },
+        },
+        "delivery-pen4114-check-suite",
+      );
+
+      expect(res.status).toBe(200);
+      expect(res.body.wakes).toHaveLength(0);
+      expect(res.body.skipped).toEqual([
+        { issueIdentifier: "BLO-4115", reason: "deliberately_parked" },
+      ]);
+      expect(await wakesFor(agentId)).toHaveLength(0);
+    });
+
+    it("suppresses a workflow_run.completed wake while the park is live", async () => {
+      const { agentId } = await seedIssueWithIdentifier("BLO-4116", {
+        parkedUntil: parkedUntil(),
+      });
+      const res = await deliver(
+        "workflow_run",
+        {
+          action: "completed",
+          workflow_run: {
+            head_branch: "fix/BLO-4116",
+            head_sha: "parked-workflow-sha",
+            pull_requests: [{ number: 5652, head: { ref: "fix/BLO-4116" } }],
+          },
+          repository: { full_name: "Blockcast/onprem-k8s" },
+        },
+        "delivery-pen4114-workflow-run",
+      );
+
+      expect(res.status).toBe(200);
+      expect(res.body.wakes).toHaveLength(0);
+      expect(res.body.skipped).toEqual([
+        { issueIdentifier: "BLO-4116", reason: "deliberately_parked" },
+      ]);
+      expect(await wakesFor(agentId)).toHaveLength(0);
+    });
+
+    // Expiry is the default. A park nobody restates must stop suppressing on
+    // its own, or this mechanism decays into permanent silence on a row that
+    // genuinely needs the wake -- the failure mode that would be far worse
+    // than the bill it was added to stop.
+    it("wakes normally once the park deadline has passed", async () => {
+      const { agentId } = await seedIssueWithIdentifier("BLO-4117", {
+        parkedUntil: expiredPark(),
+      });
+      const res = await deliver(
+        "check_run",
+        {
+          action: "completed",
+          check_run: {
+            head_branch: "fix/BLO-4117",
+            head_sha: "expired-park-sha",
+            pull_requests: [{ number: 5653, head: { ref: "fix/BLO-4117" } }],
+          },
+          repository: { full_name: "Blockcast/onprem-k8s" },
+        },
+        "delivery-pen4114-expired-park",
+      );
+
+      expect(res.status).toBe(200);
+      expect(res.body.wakes).toHaveLength(1);
+      expect(res.body.skipped).toHaveLength(0);
+      expect(await wakesFor(agentId)).toHaveLength(1);
+    });
+
+    it("wakes normally on an unparked row", async () => {
+      const { agentId } = await seedIssueWithIdentifier("BLO-4118");
+      const res = await deliver(
+        "check_run",
+        {
+          action: "completed",
+          check_run: {
+            head_branch: "fix/BLO-4118",
+            head_sha: "unparked-sha",
+            pull_requests: [{ number: 5654, head: { ref: "fix/BLO-4118" } }],
+          },
+          repository: { full_name: "Blockcast/onprem-k8s" },
+        },
+        "delivery-pen4114-unparked",
+      );
+
+      expect(res.status).toBe(200);
+      expect(res.body.wakes).toHaveLength(1);
+      expect(await wakesFor(agentId)).toHaveLength(1);
+    });
+
+    // The scoping is the load-bearing half of this change. A park must defer
+    // mechanical CI noise and nothing else: a human or reviewer saying
+    // something is exactly what a parked row still needs to hear, and
+    // swallowing it would turn a park into a mailbox that drops post. If this
+    // test ever has to be loosened, the suppression set has grown past what
+    // PEN-4114 authorised.
+    it("still wakes a parked row on a PR-shaped reason that carries intent", async () => {
+      const { agentId } = await seedIssueWithIdentifier("BLO-4119", {
+        parkedUntil: parkedUntil(),
+      });
+      const res = await deliver(
+        "pull_request",
+        {
+          action: "closed",
+          pull_request: {
+            number: 5655,
+            title: "BLO-4119: land the fix",
+            body: null,
+            merged: true,
+            head: { ref: "fix/BLO-4119", sha: "parked-pr-sha" },
+          },
+          repository: { full_name: "Blockcast/onprem-k8s" },
+        },
+        "delivery-pen4114-pr-closed",
+      );
+
+      expect(res.status).toBe(200);
+      expect(
+        (res.body.skipped ?? []).map((s: { reason: string }) => s.reason),
+      ).not.toContain("deliberately_parked");
+      expect(await wakesFor(agentId)).toHaveLength(1);
+    });
   });
 
   it("acks events with no matching paperclip issue without erroring", async () => {
