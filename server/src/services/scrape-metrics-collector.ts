@@ -29,6 +29,7 @@ import { logger } from "../middleware/logger.js";
 import { describeHeldAgentStartLocks } from "./agent-start-lock.js";
 import { refreshExternalRuntimeReservationMetrics } from "./external-runtime-reservations.js";
 import { refreshExternalRuntimeReservationStrandMetrics } from "./external-runtime-reservation-strand-metrics.js";
+import { refreshWorkspaceReuseRefusalMetrics } from "./workspace-reuse-refusal-metrics.js";
 import { refreshApprovalQueueMetrics } from "./approval-queue-metrics.js";
 import {
   refreshDeferredIssueExecutionWakeAgeMetrics,
@@ -49,6 +50,7 @@ import {
   setQueuedRunAgeMetricsRefreshSuccess,
   setRoutineFireGapMetricsRefreshSuccess,
   setScheduledRetryParkHorizonRefreshSuccess,
+  setWorkspaceReuseRefusalMetricsRefreshSuccess,
   type DbPoolStats,
 } from "./metrics.js";
 import { collectFdClassSnapshot } from "./fd-class-metrics.js";
@@ -123,6 +125,15 @@ const REFRESHES: readonly ScrapeRefresh[] = [
     name: "external-runtime-reservation-strand",
     run: (db) => refreshExternalRuntimeReservationStrandMetrics(db),
     setFresh: setExternalRuntimeReservationStrandMetricsRefreshSuccess,
+  },
+  {
+    // PEN-3633. Every refresh above is scoped to an agent or a run. This one is
+    // scoped to the project CHECKOUT, which is the actual unit of failure here:
+    // one broken checkout produced 33 run failures across 8.6 h, each reported
+    // separately and none naming the checkout they shared.
+    name: "workspace-reuse-refusal",
+    run: (db) => refreshWorkspaceReuseRefusalMetrics(db),
+    setFresh: setWorkspaceReuseRefusalMetricsRefreshSuccess,
   },
   {
     // BLO-29850. Not a run-table refresh and not a queue the platform serves at

@@ -1058,6 +1058,17 @@ export const EXTERNAL_RUNTIME_RESERVATION_STRANDED_OLDEST_AGE_METRIC =
 export const EXTERNAL_RUNTIME_RESERVATION_STRAND_METRICS_REFRESH_SUCCESS_METRIC =
   "paperclip_external_runtime_reservation_strand_metrics_refresh_success";
 /**
+ * PEN-3633 item 3. Managed-checkout refusals in the recent window, per
+ * project workspace and per body-derived failure class. The unit of failure is
+ * the project checkout and the unit of reporting is the run, so a single broken
+ * checkout produced 33 separate run failures and no signal that named the
+ * checkout; this collapses that fan-out into one series per project workspace.
+ */
+export const WORKSPACE_REUSE_REFUSAL_WINDOW_METRIC =
+  "paperclip_workspace_reuse_refusal_window_count";
+export const WORKSPACE_REUSE_REFUSAL_METRICS_REFRESH_SUCCESS_METRIC =
+  "paperclip_workspace_reuse_refusal_metrics_refresh_success";
+/**
  * Board-approval-queue depth and staleness (BLO-29850). The approval queue is
  * the mandated escalation path for shared-infra changes and had no telemetry at
  * all: it stopped serving for 3.2 days while 39 new cards were filed into it,
@@ -3661,6 +3672,8 @@ let environmentLeasesOrphanedOldestAge: Gauge | null = null;
 let orphanedRuntimeResourceMetricsRefreshSuccess: Gauge | null = null;
 let externalRuntimeReservationStrandedOldestAge: Gauge<"agent_id"> | null = null;
 let externalRuntimeReservationStrandMetricsRefreshSuccess: Gauge | null = null;
+let workspaceReuseRefusalWindow: Gauge<"project_workspace_id" | "failure_class"> | null = null;
+let workspaceReuseRefusalMetricsRefreshSuccess: Gauge | null = null;
 let approvalsPending: Gauge<"type"> | null = null;
 let approvalOldestPendingAge: Gauge<"type"> | null = null;
 let approvalLastDecisionTimestamp: Gauge | null = null;
@@ -3869,6 +3882,8 @@ function ensureRegistry(): {
   pluginStatusCollectorLastSuccessGauge: Gauge<"role">;
   externalRuntimeReservationStrandedOldestAgeGauge: Gauge<"agent_id">;
   externalRuntimeReservationStrandMetricsRefreshSuccessGauge: Gauge;
+  workspaceReuseRefusalWindowGauge: Gauge<"project_workspace_id" | "failure_class">;
+  workspaceReuseRefusalMetricsRefreshSuccessGauge: Gauge;
   approvalsPendingGauge: Gauge<"type">;
   approvalOldestPendingAgeGauge: Gauge<"type">;
   approvalLastDecisionTimestampGauge: Gauge;
@@ -3944,6 +3959,8 @@ function ensureRegistry(): {
     || !orphanedRuntimeResourceMetricsRefreshSuccess
     || !externalRuntimeReservationStrandedOldestAge
     || !externalRuntimeReservationStrandMetricsRefreshSuccess
+    || !workspaceReuseRefusalWindow
+    || !workspaceReuseRefusalMetricsRefreshSuccess
     || !approvalsPending
     || !approvalOldestPendingAge
     || !approvalLastDecisionTimestamp
@@ -4491,6 +4508,32 @@ function ensureRegistry(): {
       registers: [registry],
     });
     externalRuntimeReservationStrandMetricsRefreshSuccess.set(0);
+    workspaceReuseRefusalWindow = new Gauge({
+      name: WORKSPACE_REUSE_REFUSAL_WINDOW_METRIC,
+      help:
+        "Count of managed-checkout refusals in the recent window for a project workspace, bucketed "
+        + "by a body-derived failure class (PEN-3633). Bucketed on the error BODY and not on "
+        + "error_code because every refusal in this class books as `setup_failed`, which cannot "
+        + "separate an origin mismatch from a failed git probe nor either from unrelated setup "
+        + "failures. Deliberately a reset-then-set gauge rather than a counter: a labelled counter "
+        + "is born at its first increment, so increase() over it is permanently silent for the "
+        + "FIRST episode on a given project_workspace_id -- exactly the case this measures. An "
+        + "absent series therefore means 'no refusals in the window' unambiguously, and the alert "
+        + "is a >= threshold that absence can never satisfy. project_workspace_id is unbounded; "
+        + "failure_class is a closed four-value set, so the pair's cardinality is bounded by the "
+        + "number of project workspaces actually refusing right now, which is 0 when healthy.",
+      labelNames: ["project_workspace_id", "failure_class"],
+      registers: [registry],
+    });
+    workspaceReuseRefusalMetricsRefreshSuccess = new Gauge({
+      name: WORKSPACE_REUSE_REFUSAL_METRICS_REFRESH_SUCCESS_METRIC,
+      help:
+        "1 when the most recent workspace-reuse-refusal database sweep completed before metrics "
+        + "exposition; 0 when it failed, so a stale snapshot cannot be read as 'this project "
+        + "stopped refusing'.",
+      registers: [registry],
+    });
+    workspaceReuseRefusalMetricsRefreshSuccess.set(0);
     approvalsPending = new Gauge({
       name: APPROVALS_PENDING_METRIC,
       help:
@@ -5692,6 +5735,8 @@ function ensureRegistry(): {
     externalRuntimeReservationStrandedOldestAgeGauge: externalRuntimeReservationStrandedOldestAge,
     externalRuntimeReservationStrandMetricsRefreshSuccessGauge:
       externalRuntimeReservationStrandMetricsRefreshSuccess,
+    workspaceReuseRefusalWindowGauge: workspaceReuseRefusalWindow,
+    workspaceReuseRefusalMetricsRefreshSuccessGauge: workspaceReuseRefusalMetricsRefreshSuccess,
     approvalsPendingGauge: approvalsPending,
     approvalOldestPendingAgeGauge: approvalOldestPendingAge,
     approvalLastDecisionTimestampGauge: approvalLastDecisionTimestamp,
@@ -6746,6 +6791,43 @@ export function setExternalRuntimeReservationStrandedOldestAgeMetrics(
 /** Mark whether the stranded-reservation gauge was refreshed from the database. */
 export function setExternalRuntimeReservationStrandMetricsRefreshSuccess(success: boolean): void {
   ensureRegistry().externalRuntimeReservationStrandMetricsRefreshSuccessGauge.set(success ? 1 : 0);
+}
+
+/**
+ * Publish the per-project-workspace refusal counts for the current window
+ * (PEN-3633 item 3).
+ *
+ * Reset-then-set, and NOT seeded. The companion closed-vocabulary seed that
+ * {@link setApprovalQueueMetrics} performs is deliberately not done here: its
+ * label set is bounded on every axis, whereas `project_workspace_id` is not, so
+ * seeding would mean emitting a zero series for every project workspace that
+ * has ever existed. Absence is already unambiguous for this metric because the
+ * alert thresholds with `>=`, which no absent series can satisfy, and the
+ * companion refresh-success gauge separates "measured none" from "did not
+ * measure".
+ */
+export function setWorkspaceReuseRefusalWindowMetrics(
+  entries: ReadonlyArray<{
+    projectWorkspaceId: string;
+    failureClass: string;
+    count: number;
+  }>,
+): void {
+  const gauge = ensureRegistry().workspaceReuseRefusalWindowGauge;
+  gauge.reset();
+  for (const entry of entries) {
+    if (!entry.projectWorkspaceId || !entry.failureClass) continue;
+    const count = Number.isFinite(entry.count) ? Math.max(0, entry.count) : 0;
+    gauge.set(
+      { project_workspace_id: entry.projectWorkspaceId, failure_class: entry.failureClass },
+      count,
+    );
+  }
+}
+
+/** Mark whether the workspace-reuse-refusal gauge was refreshed from the database. */
+export function setWorkspaceReuseRefusalMetricsRefreshSuccess(success: boolean): void {
+  ensureRegistry().workspaceReuseRefusalMetricsRefreshSuccessGauge.set(success ? 1 : 0);
 }
 
 /**
@@ -8111,6 +8193,8 @@ export function __resetMetricsForTest(): void {
   environmentLeasesOrphanedOldestAge = null;
   orphanedRuntimeResourceMetricsRefreshSuccess = null;
   externalRuntimeReservationStrandedOldestAge = null;
+  workspaceReuseRefusalWindow = null;
+  workspaceReuseRefusalMetricsRefreshSuccess = null;
   externalRuntimeReservationStrandMetricsRefreshSuccess = null;
   approvalsPending = null;
   approvalOldestPendingAge = null;
