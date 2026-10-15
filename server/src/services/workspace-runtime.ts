@@ -23,6 +23,7 @@ import { and, desc, eq, inArray, isNull, ne, notInArray } from "drizzle-orm";
 import { asNumber, asString, parseObject, renderTemplate } from "../adapters/utils.js";
 import { resolveHomeAwarePath, resolveManagedProjectWorkspaceDir } from "../home-paths.js";
 import { REPO_MANAGED_WORKTREES_SUBPATH } from "../worktree-config.js";
+import { formatGitProbeRefusal, formatOriginMismatchRefusal } from "./workspace-reuse-refusal-class.js";
 import {
   createLocalServiceKey,
   findLocalServiceRegistryRecordByRuntimeServiceId,
@@ -3333,7 +3334,13 @@ async function validateProjectPrimaryRepoOrigin(input: {
   if (!actual || actual === expected) return;
 
   throw new WorkspaceRepoMismatchError(
-    `Execution workspace cwd "${input.cwd}" is checked out from "${actualUrl}" but the issue expects "${input.expectedRepoUrl}". Refusing to start the agent in the wrong repository.`,
+    // PEN-3633 item 3: built from the shared marker module so the body-bucketed
+    // refusal metric cannot drift from this sentence.
+    formatOriginMismatchRefusal({
+      cwd: input.cwd,
+      actualUrl,
+      expectedRepoUrl: input.expectedRepoUrl,
+    }),
   );
 }
 
@@ -4970,9 +4977,12 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
         // this failure's wake policy as a side effect.
         const probeReason = cwdGitProbe.reason ?? "no diagnostic available";
         throw new WorkspaceRepoMismatchError(
-          cwdGitProbe.state === "not_a_checkout"
-            ? `git rev-parse --git-dir found no git repository in "${cwd}" (${probeReason}); refusing to start a managed run from a directory that is not a checkout.`
-            : `git rev-parse --git-dir could not verify a checkout in "${cwd}" (${probeReason}); refusing to start because the probe did not reach a verdict, so the directory's state is unknown.`,
+          // PEN-3633 item 3: same shared-marker rule as the origin refusal above.
+          formatGitProbeRefusal({
+            state: cwdGitProbe.state === "not_a_checkout" ? "not_a_checkout" : "indeterminate",
+            cwd,
+            probeReason,
+          }),
         );
       }
     }
