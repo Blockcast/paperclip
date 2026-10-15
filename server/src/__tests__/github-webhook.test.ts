@@ -3215,7 +3215,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     await tempDb?.cleanup();
   });
 
-  function buildApp(config: Pick<GithubWebhookConfig, "prReviewerAgentIds" | "prReviewerAgentId" | "prReviewerBotLogin" | "resolvePrReviewHeadSha" | "listPrReviewsForAttestation" | "runPrCommentReviewGateCheck" | "selfReviewEscalationThreshold" | "dependabotAgentId" | "dependabotMinSeverity" | "heartbeatOptions" | "listPullRequestCommits" | "notifyForeignCommits"> = {}) {
+  function buildApp(config: Pick<GithubWebhookConfig, "prReviewerAgentIds" | "prReviewerAgentId" | "prReviewerBotLogin" | "resolvePrReviewHeadSha" | "listPrReviewsForAttestation" | "runPrCommentReviewGateCheck" | "selfReviewEscalationThreshold" | "dependabotAgentId" | "dependabotMinSeverity" | "heartbeatOptions" | "listPullRequestCommits" | "notifyForeignCommits" | "resolveCiHeadSettlement"> = {}) {
     const app = express();
     app.use(express.json({
       verify: (req, _res, buf) => {
@@ -3226,6 +3226,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
       webhookSecret,
       ...config,
       resolvePrReviewHeadSha: config.resolvePrReviewHeadSha ?? (async () => null),
+      resolveCiHeadSettlement: config.resolveCiHeadSettlement ?? (async () => "unknown" as const),
       runPrCommentReviewGateCheck: config.runPrCommentReviewGateCheck ?? (async () => ({
         posted: false as const,
         reason: "not_configured" as const,
@@ -8783,6 +8784,74 @@ describeEmbeddedPostgres("github-webhook route", () => {
       expect.objectContaining({ status: "coalesced", reason: "github_state_change_queued_coalesced" }),
       expect.objectContaining({ status: "coalesced", reason: "github_state_change_queued_coalesced" }),
     ]);
+  });
+
+  describe("BLO-46732: one CI-completion wake per (issue, head)", () => {
+    const ciDelivery = (event: string, n: number, headSha: string, conclusion: string) => {
+      const obj = {
+        head_branch: "fix/BLO-3182-webflow",
+        head_sha: headSha,
+        conclusion,
+        pull_requests: [{ number: 117, head: { ref: "fix/BLO-3182-webflow" } }],
+      };
+      const key = event === "check_run" ? "check_run" : event === "check_suite" ? "check_suite" : "workflow_run";
+      return {
+        event,
+        delivery: `delivery-${headSha}-${event}-${n}`,
+        payload: { action: "completed", [key]: obj, repository: { full_name: "Blockcast/paperclip" } },
+      };
+    };
+    const send = async (app: express.Express, d: ReturnType<typeof ciDelivery>) => {
+      const { body, signature } = signedRequest(d.payload);
+      const res = await request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", d.event)
+        .set("x-hub-signature-256", signature)
+        .set("x-github-delivery", d.delivery)
+        .set("content-type", "application/json")
+        .send(body);
+      expect(res.status).toBe(200);
+      return (res.body.wakes as unknown[]).length;
+    };
+
+    it("5 green lanes + suite + workflow wake the assignee exactly once, when the head settles", async () => {
+      await seedIssueWithIdentifier("BLO-3182");
+      let lanesDone = 0;
+      const app = buildApp({ resolveCiHeadSettlement: async () => (lanesDone >= 5 ? "settled" : "pending") });
+      const wakesPerDelivery: number[] = [];
+      for (let i = 1; i <= 5; i++) {
+        lanesDone = i;
+        wakesPerDelivery.push(await send(app, ciDelivery("check_run", i, "head-green", "success")));
+      }
+      wakesPerDelivery.push(await send(app, ciDelivery("check_suite", 1, "head-green", "success")));
+      wakesPerDelivery.push(await send(app, ciDelivery("workflow_run", 1, "head-green", "success")));
+      // Only the lane that completed the head wakes; suite/workflow dedup onto it.
+      expect(wakesPerDelivery).toEqual([0, 0, 0, 0, 1, 0, 0]);
+    });
+
+    it("a red lane wakes immediately and later green lanes on that head do not re-wake", async () => {
+      await seedIssueWithIdentifier("BLO-3182");
+      let lanesDone = 0;
+      const app = buildApp({ resolveCiHeadSettlement: async () => (lanesDone >= 5 ? "settled" : "pending") });
+      const wakesPerDelivery: number[] = [];
+      lanesDone = 1;
+      wakesPerDelivery.push(await send(app, ciDelivery("check_run", 1, "head-red", "failure")));
+      for (let i = 2; i <= 5; i++) {
+        lanesDone = i;
+        wakesPerDelivery.push(await send(app, ciDelivery("check_run", i, "head-red", "success")));
+      }
+      wakesPerDelivery.push(await send(app, ciDelivery("workflow_run", 1, "head-red", "failure")));
+      expect(wakesPerDelivery).toEqual([1, 0, 0, 0, 0, 0]);
+      // A new push is a new head and earns its own wake.
+      expect(await send(app, ciDelivery("check_run", 9, "head-next", "failure"))).toBe(1);
+    });
+
+    it("fails open when settlement is unknown, still collapsing to one wake per head", async () => {
+      await seedIssueWithIdentifier("BLO-3182");
+      const app = buildApp({ resolveCiHeadSettlement: async () => "unknown" });
+      expect(await send(app, ciDelivery("check_run", 1, "head-unknown", "success"))).toBe(1);
+      expect(await send(app, ciDelivery("check_suite", 1, "head-unknown", "success"))).toBe(0);
+    });
   });
 
   it("reopens an in_review issue when Ally posts actionable PR feedback and ignores done siblings on the same PR", async () => {

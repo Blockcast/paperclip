@@ -66,6 +66,7 @@ import {
 } from "../services/paperclip-identifiers.js";
 import {
   githubFetchPrHeadSha,
+  githubHeadChecksSettlement,
   githubListPullRequestCommits,
   githubListOpenPullRequestsByBase,
   githubResolveBranchState,
@@ -191,6 +192,11 @@ export interface GithubWebhookConfig {
    * uses the GitHub App lookup; route tests can provide a deterministic seam.
    */
   resolvePrReviewHeadSha?: typeof githubFetchPrHeadSha;
+  /**
+   * BLO-46732 seam: is every check-run on a head terminal? Gates the
+   * CI-completion author wake to one per (issue, head). Production asks GitHub.
+   */
+  resolveCiHeadSettlement?: typeof githubHeadChecksSettlement;
   /**
    * Optional seam for the head-attestation idempotency check (BLO-32198).
    * Production lists reviews through the GitHub App; route tests supply a
@@ -1212,6 +1218,8 @@ interface ResolvedEventContext {
   prUrl?: string | null;
   eventUrl?: string | null;
   headSha?: string | null;
+  // BLO-46732: conclusion of the completed check_run / check_suite / workflow_run.
+  ciConclusion?: string | null;
   prPreviousHeadSha?: string | null;
   // pull_request_review.submitted only — drives the author-facing directive
   // so the assignee wake's prompt carries the reviewer's findings without
@@ -1505,6 +1513,7 @@ function resolveEventContextRaw(
         prUrl: githubPrUrl(repoFullName, firstNumber, firstPrUrl),
         eventUrl: readStringField(checkRun, "html_url"),
         headSha: readStringField(checkRun, "head_sha"),
+        ciConclusion: readStringField(checkRun, "conclusion"),
       };
     }
     case "check_suite": {
@@ -1533,6 +1542,7 @@ function resolveEventContextRaw(
         prUrl: githubPrUrl(repoFullName, firstNumber, firstPrUrl),
         eventUrl: readStringField(checkSuite, "html_url") ?? readStringField(checkSuite, "url"),
         headSha: readStringField(checkSuite, "head_sha"),
+        ciConclusion: readStringField(checkSuite, "conclusion"),
       };
     }
     case "workflow_run": {
@@ -1562,6 +1572,7 @@ function resolveEventContextRaw(
         prUrl: githubPrUrl(repoFullName, firstNumber, firstPrUrl),
         eventUrl: readStringField(workflowRun, "html_url"),
         headSha: readStringField(workflowRun, "head_sha"),
+        ciConclusion: readStringField(workflowRun, "conclusion"),
       };
     }
     case "issue_comment": {
@@ -5074,6 +5085,21 @@ const IDEMPOTENT_REVIEWER_WAKE_STATUSES = [
 // produced a review, so a redelivery is a legitimate second chance.
 const TERMINAL_REQUEST_SCOPED_IDEMPOTENT_STATUSES = ["completed", "cancelled"];
 
+// BLO-46732: the CI-completion author wakes, collapsed to one per (issue, head).
+const CI_COMPLETION_WAKE_REASONS: ReadonlySet<string> = new Set([
+  "github_check_completed",
+  "github_check_suite_completed",
+  "github_workflow_completed",
+]);
+// A red lane is actionable before the rest finish. `cancelled` is absent on
+// purpose: cancel-in-progress supersession produces it on every force-push.
+const RED_CI_CONCLUSIONS: ReadonlySet<string> = new Set([
+  "failure",
+  "timed_out",
+  "action_required",
+  "startup_failure",
+]);
+
 function idempotentWakeStatuses(scope: WakeIdempotencyScope): string[] {
   return scope === "request"
     ? [...IDEMPOTENT_REVIEWER_WAKE_STATUSES, ...TERMINAL_REQUEST_SCOPED_IDEMPOTENT_STATUSES]
@@ -7371,6 +7397,31 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       }
     }
 
+    // BLO-46732: check_run, check_suite and workflow_run each used to wake the
+    // assignee once per lane, so one push cost ~2N+1 runs that could only wait
+    // for the other lanes. Collapse them to ONE wake per (issue, head): the
+    // first red lane wakes at once (actionable now); a green lane wakes only
+    // once every check-run on the head is terminal. All three events share one
+    // head-scoped key, so whichever arrives first wins and the rest dedup.
+    // `unknown` settlement fails OPEN -- a dropped CI wake strands the assignee.
+    const ciCompletionHeadSha =
+      CI_COMPLETION_WAKE_REASONS.has(context.wakeReason) && context.repoFullName && context.headSha
+        ? context.headSha
+        : null;
+    let ciHeadPending = false;
+    if (
+      ciCompletionHeadSha &&
+      !suppressAuthorWake &&
+      authorWakeCandidates.length > 0 &&
+      !RED_CI_CONCLUSIONS.has(context.ciConclusion ?? "")
+    ) {
+      const settlement = await (config.resolveCiHeadSettlement ?? githubHeadChecksSettlement)({
+        repoFullName: context.repoFullName as string,
+        headSha: ciCompletionHeadSha,
+      }).catch(() => "unknown" as const);
+      ciHeadPending = settlement === "pending";
+    }
+
     for (const issue of suppressAuthorWake ? [] : authorWakeCandidates) {
       // Terminal-status issues don't need to wake -- the assignee
       // shouldn't reopen `done`/`cancelled` work just because a stale
@@ -7548,6 +7599,28 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         skipped.push({ issueIdentifier: issue.identifier, reason: "unassigned" });
         continue;
       }
+      if (ciCompletionHeadSha) {
+        if (ciHeadPending) {
+          skipped.push({ issueIdentifier: issue.identifier, reason: "ci_head_pending" });
+          continue;
+        }
+        authorWakeIdempotencyKey = `ci_completion:${issue.id}:${context.repoFullName}:${ciCompletionHeadSha}`;
+        const existingCiWake = await db
+          .select({ id: agentWakeupRequests.id })
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              eq(agentWakeupRequests.agentId, effectiveAssigneeAgentId),
+              eq(agentWakeupRequests.idempotencyKey, authorWakeIdempotencyKey),
+              inArray(agentWakeupRequests.status, idempotentWakeStatuses("request")),
+            ),
+          )
+          .limit(1);
+        if (existingCiWake.length > 0) {
+          skipped.push({ issueIdentifier: issue.identifier, reason: "duplicate_ci_completion_wake" });
+          continue;
+        }
+      }
       // PR-shaped wakes carry an `prRole: "author"` marker so the
       // heartbeat directive flips from reviewer-shaped ("review this PR")
       // to author-shaped ("a reviewer just posted findings on YOUR PR").
@@ -7684,7 +7757,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           // authorWakeIdempotencyKey is always set by this point when
           // isPrWake is true (either by the actionableReviewFeedback branch
           // or the precheck above).
-          ...(isPrWake ? { idempotencyKey: authorWakeIdempotencyKey as string } : {}),
+          ...(authorWakeIdempotencyKey ? { idempotencyKey: authorWakeIdempotencyKey } : {}),
         });
         wakes.push({ issueIdentifier: issue.identifier, agentId: effectiveAssigneeAgentId });
       } catch (err) {

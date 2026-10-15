@@ -2109,3 +2109,39 @@ export async function githubPostIssueComment(input: {
     return false;
   }
 }
+
+/**
+ * BLO-46732: has every check-run on `headSha` reached a terminal state?
+ * `settled` / `pending` are positive answers; `unknown` means the lookup could
+ * not say, and callers must fail OPEN (wake) on it -- a dropped CI wake strands
+ * the assignee, a duplicate one only costs a run.
+ */
+export type HeadChecksSettlement = "settled" | "pending" | "unknown";
+
+const HEAD_CHECKS_MAX_PAGES = 5;
+
+export async function githubHeadChecksSettlement(input: {
+  repoFullName: string;
+  headSha: string;
+}): Promise<HeadChecksSettlement> {
+  const tokenResult = await getInstallationTokenResult();
+  if (!tokenResult.ok) return "unknown";
+  const base = `${gitHubApiBase(GITHUB_HOST)}/repos/${input.repoFullName}/commits/${input.headSha}/check-runs`;
+  for (let page = 1; page <= HEAD_CHECKS_MAX_PAGES; page++) {
+    let body: { check_runs?: Array<{ status?: string }> } | null;
+    try {
+      const res = await ghFetch(`${base}?filter=latest&per_page=100&page=${page}`, {
+        headers: { ...GITHUB_API_HEADERS, authorization: `Bearer ${tokenResult.token}` },
+      });
+      if (!res.ok) return "unknown";
+      body = (await res.json().catch(() => null)) as typeof body;
+    } catch {
+      return "unknown";
+    }
+    const runs = body?.check_runs;
+    if (!Array.isArray(runs)) return "unknown";
+    if (runs.some((run) => run?.status !== "completed")) return "pending";
+    if (runs.length < 100) return page === 1 && runs.length === 0 ? "unknown" : "settled";
+  }
+  return "unknown";
+}
