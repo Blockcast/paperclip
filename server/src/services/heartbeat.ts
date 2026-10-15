@@ -223,6 +223,7 @@ import {
   bindExternalRuntimeReservationIsolation,
   claimRunWithExternalRuntimeSlotPool,
   ExternalRuntimeIsolationConflictError,
+  ExternalRuntimeReservationReleasePendingError,
   externalRuntimeReservationCanRelease,
   getActiveExternalRuntimeReservation,
   markExternalRuntimeReservationLaunching,
@@ -28088,6 +28089,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               jobRunStatuses.delete(run.id);
             }
           } catch (error) {
+            // The reservation read above was still `launched`, but the
+            // reconciler moved it to `release_pending` before the stamp's
+            // locked re-read: the same finalize window the
+            // reservationFinalizing skip handles, caught one read late.
+            // Measured 2026-10-14: every remaining post-fix line (2-6/h) was
+            // this, with a succeeded Job and matching name/UID.
+            if (error instanceof ExternalRuntimeReservationReleasePendingError && jobStatus?.phase !== "active") {
+              logger.debug(
+                {
+                  runId: run.id,
+                  jobName,
+                  jobUid: jobStatus?.uid ?? null,
+                  jobPhase: jobStatus?.phase ?? null,
+                  reservationState: "release_pending",
+                },
+                "external-runtime reservation already finalizing for a terminal Job; skipping identity stamp",
+              );
+              ambiguousExternalRunIds.add(run.id);
+              jobRunStatuses.delete(run.id);
+              continue;
+            }
             logger.error(
               {
                 runId: run.id,

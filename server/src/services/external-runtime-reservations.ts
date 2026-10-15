@@ -660,6 +660,18 @@ export async function recordExpectedExternalRuntimeJobName(
 }
 
 /**
+ * The identity matched, but the reservation began releasing (its Job finished)
+ * between the caller's unlocked read and this stamp's locked re-read. Typed so
+ * the heartbeat reaper can tell this benign finalize race from a real mismatch.
+ */
+export class ExternalRuntimeReservationReleasePendingError extends Error {
+  constructor(runId: string) {
+    super(`External runtime reservation for run ${runId} is not launchable from release_pending`);
+    this.name = "ExternalRuntimeReservationReleasePendingError";
+  }
+}
+
+/**
  * Stamps the observed Job name/UID onto the run's active reservation. This is
  * the "did we win or lose the create/stamp race" checkpoint: `createNamespacedJob`
  * happens in an external adapter package (outside this repo) and can succeed
@@ -723,6 +735,9 @@ export async function recordExternalRuntimeJobIdentity(
           sql`${heartbeatRuns.externalRunId} IS DISTINCT FROM ${input.jobName}`,
         ));
       return { reservation: existing, transitioned: false };
+    }
+    if (existing.state === "release_pending") {
+      throw new ExternalRuntimeReservationReleasePendingError(input.runId);
     }
     if (existing.state !== "launching" && existing.state !== "launched") {
       throw new Error(`External runtime reservation for run ${input.runId} is not launchable from ${existing.state}`);

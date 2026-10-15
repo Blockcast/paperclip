@@ -1761,6 +1761,31 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
     expect(overdue).toEqual([]);
   }, 120_000);
 
+  it("does not log an identity mismatch when the reservation starts releasing between the read and the stamp (BLO-29133)", async () => {
+    const { agentId, runId } = await seedRunningRunWithObservedJob({
+      name: "TerminalJobReleaseRaceCo",
+      slotId: 0,
+      reservation: { kind: "release_pending" },
+    });
+    mockListManagedAgentJobs.mockResolvedValue([terminalJobFor({ runId, agentId })]);
+    // The reaper's unlocked read still sees `launched`; the stamp's locked
+    // re-read sees the `release_pending` row. Production after #2664: every
+    // remaining mismatch line had reservationState "launched" and an
+    // errorMessage of `is not launchable from release_pending`.
+    mockGetActiveExternalRuntimeReservation.mockImplementationOnce(async (dbArg, runIdArg) => {
+      const row = await actualExternalRuntimeReservationsRef.current.getActiveExternalRuntimeReservation(dbArg, runIdArg);
+      return row ? { ...row, state: "launched" as const } : row;
+    });
+
+    const { mismatches, skips, overdue } = await reapCapturingFinalizeLogs();
+
+    // Fails on the parent commit: the stamp's throw lands in the catch at ERROR.
+    expect(mismatches).toEqual([]);
+    expect(skips).toHaveLength(1);
+    expect(skips[0][0]).toMatchObject({ runId, jobPhase: "succeeded", reservationState: "release_pending" });
+    expect(overdue).toEqual([]);
+  }, 120_000);
+
   it("escalates the finalizing skip to warn once the run is silent past the stale window (BLO-29133)", async () => {
     // The same condition holds forever for a run whose row never leaves
     // `running` (postRun or workspace finalize died after the release). The
