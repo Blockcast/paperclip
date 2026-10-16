@@ -17,7 +17,7 @@
 // of the regex, so they exercise the actual execFile error plumbing: a `git`
 // shim first on PATH emits the fixture stderr and exits 128, which is how a
 // real git failure reaches the classifier.
-import { execFile as execFileCallback } from "node:child_process";
+import { execFile as execFileCallback, spawnSync } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -27,7 +27,30 @@ import { probeGitCheckoutStateStrict } from "../services/heartbeat.js";
 
 const execFile = promisify(execFileCallback);
 
-const REAL_GIT = process.env.REAL_GIT ?? "/usr/bin/git";
+// PEN-4185 (1). This used to be a hardcoded `/usr/bin/git`. Where git lives
+// anywhere else -- on the sandbox that filed this, `command -v git` resolves
+// to `/usr/local/libexec/paperclip/bin/git` -- `execFile` rejects with ENOENT,
+// `error.stderr` is undefined, and the byte-exactness control at the bottom
+// of this file read "did not match". That is the worst possible direction for
+// THIS test: raising its one alarm (git reworded its fatal) for a cause that
+// is really PATH sends the operator to git's release notes.
+//
+// Resolution has to happen here, at module scope, against the PATH the
+// process started with: `beforeEach` prepends the shim directory, so
+// resolving any later would find the shim rather than git.
+const ORIGINAL_PATH = process.env.PATH ?? "";
+
+const resolveRealGit = (): string => {
+  const explicit = process.env.REAL_GIT?.trim();
+  if (explicit) return explicit;
+  const resolved = spawnSync("/bin/sh", ["-c", "command -v git"], {
+    encoding: "utf8",
+    env: { ...process.env, PATH: ORIGINAL_PATH },
+  });
+  return resolved.status === 0 ? resolved.stdout.trim() : "";
+};
+
+const REAL_GIT = resolveRealGit();
 
 describe("probeGitCheckoutStateStrict stderr classification", () => {
   let root = "";
@@ -119,9 +142,79 @@ describe("probeGitCheckoutStateStrict stderr classification", () => {
   // re-indented this fatal, the anchored matcher would silently stop matching
   // and every dispatch through this guard would be refused; this fails first.
   it("matches the real git binary's fatal, byte for byte at column 0", async () => {
-    const realStderr = await execFile(REAL_GIT, ["rev-parse", "--show-toplevel"], { cwd: probeCwd })
-      .then(() => "", (error: { stderr?: string }) => error.stderr ?? "");
-    expect(realStderr).toMatch(/^fatal: not a git repository/m);
+    // PEN-4185: three environmental failures used to be indistinguishable
+    // from "git reworded its fatal", because each one left `realStderr` empty
+    // and the regex below was the only assertion. Each is now named BEFORE
+    // the regex runs, so a red here means what it says.
+    expect(
+      REAL_GIT,
+      "git not found: `command -v git` resolved nothing on the PATH this suite started with, "
+        + "and $REAL_GIT is unset. Environment failure, NOT git rewording its fatal.",
+    ).not.toBe("");
+
+    // PEN-4185 (2). This call used to inherit `process.env` wholesale.
+    // `rev-parse` walks UP from its cwd, and GIT_DIR / GIT_WORK_TREE redirect
+    // the search outright, so under a git hook, some CI shells, or a TMPDIR
+    // that itself sits inside a checkout, it SUCCEEDS against an unrelated
+    // repository and writes no stderr at all. Both were reproduced directly.
+    //
+    // Both halves are load-bearing: the ceiling confines the upward walk to
+    // the temp root, but git documents that it "will not exclude ... a GIT_DIR
+    // set on the command line or in the environment", so the ceiling alone
+    // does not undo GIT_DIR. PATH is restored because `beforeEach` scrubbed it
+    // for the shim, and this control is the one place that wants real git.
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      PATH: ORIGINAL_PATH,
+      GIT_CEILING_DIRECTORIES: root,
+    };
+    delete env.GIT_DIR;
+    delete env.GIT_WORK_TREE;
+
+    const outcome = await execFile(REAL_GIT, ["rev-parse", "--show-toplevel"], { cwd: probeCwd, env })
+      .then(
+        (result): { kind: "succeeded" | "not-executable" | "failed"; detail: string } => ({
+          kind: "succeeded",
+          detail: result.stdout.trim(),
+        }),
+        (error: { code?: unknown; stderr?: unknown }) =>
+          error.code === "ENOENT"
+            ? { kind: "not-executable" as const, detail: "" }
+            : {
+              kind: "failed" as const,
+              detail: typeof error.stderr === "string" ? error.stderr : "",
+            },
+      );
+
+    expect(
+      outcome.kind,
+      `git not found: ${REAL_GIT} could not be executed (ENOENT). `
+        + "Environment failure, NOT git rewording its fatal.",
+    ).not.toBe("not-executable");
+    expect(
+      outcome.kind,
+      `git rev-parse SUCCEEDED in ${probeCwd} (toplevel ${JSON.stringify(outcome.detail)}), `
+        + "so it produced no stderr to compare: either GIT_DIR/GIT_WORK_TREE redirected it, "
+        + "or it found a repository above the temp root. "
+        + "Environment failure, NOT git rewording its fatal.",
+    ).not.toBe("succeeded");
+
+    const realStderr = outcome.detail;
+    expect(
+      realStderr,
+      `${REAL_GIT} failed in ${probeCwd} but wrote nothing to stderr. `
+        + "Environment failure, NOT git rewording its fatal.",
+    ).not.toBe("");
+
+    // Past the three guards above, git ran, failed, and spoke -- so a red
+    // here really is the tripwire firing.
+    expect(
+      realStderr,
+      `${REAL_GIT} emitted ${JSON.stringify(realStderr)}, which no longer starts a line with `
+        + "`fatal: not a git repository`. If git reworded this fatal, the anchored matcher in "
+        + "probeGitCheckoutStateStrict() has stopped matching and every dispatch through the "
+        + "BLO-18147 guard is now refused.",
+    ).toMatch(/^fatal: not a git repository/m);
     await installGitShim(realStderr.trimEnd());
     expect(await probeGitCheckoutStateStrict(probeCwd)).toBe("not_a_checkout");
   });
