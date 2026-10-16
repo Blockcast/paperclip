@@ -436,15 +436,28 @@ jobs:
       name: paperclip-production
     # Covers the sequential 30m Helm wait, 30m api rollout wait and 15m worker
     # rollout wait (BLO-29008), plus the pending-migration pre-flight's 600s
-    # startup + 180s run budgets (BLO-31254), plus checkout, approval, final
-    # verification, and cleanup margin. scripts/check-docker-deploy-timeout.test.js
-    # sums EVERY `rollout status --timeout=` in this job AND reads both
-    # PREFLIGHT_*_SECONDS defaults out of .github/scripts/check-pending-migrations.sh,
-    # so raising any of them without raising this fails CI rather than silently
-    # overrunning the job. Overrunning is not a clean failure: GitHub cancels the
+    # startup + 180s run budgets (BLO-31254), plus the online-index
+    # precreation's 600s startup + 2280s run budgets (PEN-4179), plus checkout,
+    # approval, final verification, and cleanup margin.
+    # scripts/check-docker-deploy-timeout.test.js sums EVERY
+    # `rollout status --timeout=` in this job AND reads both PREFLIGHT_*_SECONDS
+    # defaults out of .github/scripts/check-pending-migrations.sh and both
+    # PRECREATE_*_SECONDS defaults out of
+    # .github/scripts/precreate-online-indexes.sh, so raising any of them
+    # without raising this fails CI rather than silently overrunning the job.
+    # Overrunning is not a clean failure: GitHub cancels the
     # job mid-`helm upgrade --atomic`, killing the process whose job is to roll
     # back, which is the half-applied release BLO-21492 added --atomic to prevent.
-    timeout-minutes: 98
+    #
+    # The precreation budget is the big term and it is a CEILING, not an
+    # expectation: it is sized for three pending guarded migrations at the
+    # concurrent-index guard's own per-spec timeouts (2m DDL lock + 10m build,
+    # plus one shortened 2m serializing-lock wait). The common case prints
+    # "No pending migration requires online index precreation" and exits in
+    # seconds. Shrink it by cutting the SPEC COUNT it is sized for, never by
+    # cutting the statement timeout -- an interrupted CREATE INDEX CONCURRENTLY
+    # leaves an INVALID index, whose remediation is worse than an absent one.
+    timeout-minutes: 146
     concurrency:
       # Serialize deploys to the same target so a fast-followup push doesn't
       # race with an in-flight upgrade.
@@ -911,6 +924,28 @@ jobs:
             cat "${approval_log}"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # Build the online indexes that pending migrations require, BEFORE the
+      # read-only gate below decides whether to roll. PEN-4179: the gate has
+      # always printed a `CREATE INDEX CONCURRENTLY` remediation and handed it
+      # to a human, while the repository already shipped the code to run it --
+      # the migration runner calls `ensureConcurrentIndexesForMigration` per
+      # file outside the transaction (packages/db/src/client.ts) and
+      # `pnpm db:migrate` calls `ensureOnlineIndexPrerequisites` up front
+      # (packages/db/src/migrate.ts). This pipeline was the only path that never
+      # wired it up. PEN-4176 measured the cost: ~25 h of silent deploy freeze.
+      #
+      # ADVISORY: the script always exits 0 and the pre-flight below stays the
+      # decider, so this step can move a blocker from "absent" to "built" but
+      # can never introduce a stop of its own. It also sits before
+      # `helm upgrade`, so `steps.helm.conclusion` stays `skipped` on any
+      # failure here -- the only value that licenses the in-flight lock cleanup
+      # at the end of this job.
+      - name: online-index precreation
+        env:
+          DIGEST: ${{ steps.artifact.outputs.digest }}
+          NS: ${{ vars.PAPERCLIP_NAMESPACE || 'paperclip' }}
+        run: .github/scripts/precreate-online-indexes.sh
 
       # Refuse to start a rollout whose pending migrations need an index built
       # online first. Those migrations raise from inside worker startup, so
