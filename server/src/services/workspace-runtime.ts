@@ -23,7 +23,8 @@ import { and, desc, eq, inArray, isNull, ne, notInArray } from "drizzle-orm";
 import { asNumber, asString, parseObject, renderTemplate } from "../adapters/utils.js";
 import { resolveHomeAwarePath, resolveManagedProjectWorkspaceDir } from "../home-paths.js";
 import { REPO_MANAGED_WORKTREES_SUBPATH } from "../worktree-config.js";
-import { formatGitProbeRefusal, formatOriginMismatchRefusal } from "./workspace-reuse-refusal-class.js";
+import { formatGitProbeRefusal } from "./workspace-reuse-refusal-class.js";
+import { compareProjectCheckoutOrigin, normalizeRepoIdentity } from "./project-checkout-origin.js";
 import {
   createLocalServiceKey,
   findLocalServiceRegistryRecordByRuntimeServiceId,
@@ -3314,49 +3315,60 @@ async function isGitCheckout(cwd: string): Promise<boolean> {
   return (await probeGitCheckout(cwd)).state === "checkout";
 }
 
-function normalizeRepoIdentity(repoUrl: string | null | undefined): string | null {
-  const trimmed = (repoUrl ?? "").trim();
-  if (!trimmed) return null;
-
-  const sshMatch = trimmed.match(/^[^@\s]+@([^:\s]+):(.+)$/);
-  const pathish = sshMatch
-    ? `/${sshMatch[2]}`
-    : (() => {
-        try {
-          return new URL(trimmed).pathname;
-        } catch {
-          return trimmed;
-        }
-      })();
-  const parts = pathish.replace(/\\/g, "/").replace(/\/+$/, "").split("/").filter(Boolean);
-  if (parts.length >= 2) {
-    const owner = parts[parts.length - 2].toLowerCase();
-    const repo = parts[parts.length - 1].replace(/\.git$/i, "").toLowerCase();
-    if (owner && repo) return `${owner}/${repo}`;
-  }
-  return trimmed.replace(/\.git$/i, "").toLowerCase();
+/**
+ * Read a checkout's stored origin URL, or `null` when it cannot be read.
+ *
+ * `git config --get remote.origin.url`, never `git remote -v`: the shared
+ * `/paperclip/.gitconfig` carries an `insteadOf` rewrite, so `remote -v` prints
+ * the SSH form on every healthy Blockcast checkout while the config holds
+ * HTTPS. See the header of `project-checkout-origin.ts`.
+ *
+ * Exported for PEN-4188 so the periodic reconciler performs the SAME read as
+ * the dispatch gate. `timeoutMs` is the only difference between the two
+ * callers: the gate passes none (behaviour unchanged from before this split),
+ * the reconciler bounds it, because a reconciler walks hundreds of checkouts on
+ * a shared network filesystem where one wedged mount must not stall the pass.
+ *
+ * Every failure collapses to `null` -- a missing directory, a directory that is
+ * not a checkout, a remote with no origin, a timeout. That is the correct
+ * fail-open for the gate (a transient git failure must not strand every run)
+ * and the reconciler accounts for it explicitly rather than reading it as
+ * health; see `ProjectCheckoutOriginVerdict`.
+ */
+export async function readGitOriginUrl(
+  cwd: string,
+  options: { timeoutMs?: number } = {},
+): Promise<string | null> {
+  return runGit(["config", "--get", "remote.origin.url"], cwd, options).catch(() => null);
 }
 
 async function validateProjectPrimaryRepoOrigin(input: {
   cwd: string;
   expectedRepoUrl: string | null | undefined;
 }) {
-  const expected = normalizeRepoIdentity(input.expectedRepoUrl);
-  if (!expected) return;
+  // PEN-4188: the comparison and the normaliser both live in
+  // `project-checkout-origin.ts` so the periodic reconciler cannot drift from
+  // this gate. `unknown` (no expected URL, or an unreadable origin) stays a
+  // silent pass here, exactly as the two early returns this replaced did.
+  //
+  // The expected side is checked BEFORE the read, not only inside the
+  // comparison, so a workspace with no repo_url still costs zero `git` spawns
+  // on the dispatch path -- which is what the early return this replaced did.
+  // Same shared normaliser, so the two cannot disagree about what "no expected
+  // repository" means.
+  if (!normalizeRepoIdentity(input.expectedRepoUrl)) return;
 
-  const actualUrl = await runGit(["config", "--get", "remote.origin.url"], input.cwd).catch(() => null);
-  const actual = normalizeRepoIdentity(actualUrl);
-  if (!actual || actual === expected) return;
+  const verdict = compareProjectCheckoutOrigin({
+    cwd: input.cwd,
+    expectedRepoUrl: input.expectedRepoUrl,
+    actualUrl: await readGitOriginUrl(input.cwd),
+  });
+  if (verdict.state !== "mismatch") return;
 
-  throw new WorkspaceRepoMismatchError(
-    // PEN-3633 item 3: built from the shared marker module so the body-bucketed
-    // refusal metric cannot drift from this sentence.
-    formatOriginMismatchRefusal({
-      cwd: input.cwd,
-      actualUrl,
-      expectedRepoUrl: input.expectedRepoUrl,
-    }),
-  );
+  // PEN-3633 item 3: the sentence is built from the shared marker module (via
+  // `compareProjectCheckoutOrigin`) so the body-bucketed refusal metric cannot
+  // drift from it.
+  throw new WorkspaceRepoMismatchError(verdict.message);
 }
 
 async function findVerifiedManagedProjectPrimaryCheckout(input: {
@@ -3372,7 +3384,7 @@ async function findVerifiedManagedProjectPrimaryCheckout(input: {
   });
   if (managedCwd === path.resolve(input.currentCwd) || !await isGitCheckout(managedCwd)) return null;
 
-  const actualUrl = await runGit(["config", "--get", "remote.origin.url"], managedCwd).catch(() => null);
+  const actualUrl = await readGitOriginUrl(managedCwd);
   if (normalizeRepoIdentity(actualUrl) !== normalizeRepoIdentity(input.expectedRepoUrl)) return null;
   return managedCwd;
 }
@@ -3817,7 +3829,12 @@ async function directoryExists(value: string) {
   return fs.stat(value).then((stats) => stats.isDirectory()).catch(() => false);
 }
 
-function deriveRepoNameFromRepoUrlForRuntime(repoUrl: string | null | undefined): string | null {
+/**
+ * Exported for PEN-4188: the periodic origin reconciler must resolve a
+ * managed checkout to the SAME directory the dispatcher would bind, or it
+ * would reconcile a path nothing runs in.
+ */
+export function deriveRepoNameFromRepoUrlForRuntime(repoUrl: string | null | undefined): string | null {
   const trimmed = (repoUrl ?? "").trim();
   if (!trimmed) return null;
   try {
