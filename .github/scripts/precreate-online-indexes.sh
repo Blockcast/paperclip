@@ -39,22 +39,29 @@ DB_SECRET_KEY="${DB_SECRET_KEY:-url}"
 # the gate's (BLO-31254 measured a ~1.7 GB cold pull at 3m3s, so a single short
 # budget failed good builds). Same image, same node pool, same number.
 STARTUP_TIMEOUT_SECONDS="${PRECREATE_STARTUP_TIMEOUT_SECONDS:-600}"
-# Run budget. ⚠️ DERIVED FROM THE GUARD'S OWN TIMEOUTS -- do not lower it to buy
-# margin elsewhere. An interrupted `CREATE INDEX CONCURRENTLY` leaves an
-# INVALID index, and the pre-flight's remediation for that is strictly worse
-# than for an absent one ("drop it first"). So this budget must EXCEED the
-# guard's worst case rather than clip it:
+# Run budget: one spec's worth of the guard's own per-spec bound
+# (DEFAULT_STATEMENT_TIMEOUT_MS, 10 min), and deliberately NOT the worst case
+# over several specs.
 #
-#   DEFAULT_LOCK_WAIT_TIMEOUT_MS   paid once (shortened below)        2 min
-#   DEFAULT_DDL_LOCK_TIMEOUT_MS    per spec                          2 min
-#   DEFAULT_STATEMENT_TIMEOUT_MS   per spec, the build itself       10 min
+# This is safe to size for the common case ONLY because overrunning it does not
+# abort anything: see `delete_job_if_terminal` -- a Job that is still building
+# is left alone to finish, the step reports INCOMPLETE, and the pre-flight
+# behind it refuses to roll over an index that is not yet valid. So a long build
+# costs this deploy, not the index: the build completes in the background and
+# the next deploy passes. That is why the wall clock here can be modest while
+# the timeouts INSIDE postgres must not be touched.
 #
-# Sized for three pending specs: 2 + 3*(2+10) = 38 min. Three is a ceiling, not
-# an expectation -- this family lands one migration at a time, and the common
-# case ("No pending migration requires online index precreation") exits in
-# seconds. If this ever needs to shrink, cut the SPEC COUNT it is sized for and
-# say so here; never cut the statement timeout.
-TIMEOUT_SECONDS="${PRECREATE_TIMEOUT_SECONDS:-2280}"
+# ⚠️ The thing that must never be cut is the statement timeout. An interrupted
+# `CREATE INDEX CONCURRENTLY` leaves an INVALID index, whose pre-flight
+# remediation ("drop it first") is strictly worse than the absent index it
+# replaced. Shrink the SPEC COUNT this is sized for; never the build time.
+#
+# It also cannot grow freely. The deploy job's timeout must stay under
+# PAPERCLIP_STRANDED_LOCK_GRACE_MINUTES minus the runner-queueing margin, or a
+# lock held by a RUNNING deploy reads as stranded -- pinned by
+# scripts/check-stranded-approval-lock.test.js, which is what caught an earlier
+# 38-minute sizing here.
+TIMEOUT_SECONDS="${PRECREATE_TIMEOUT_SECONDS:-600}"
 # Only the serializing advisory lock wait is safe to shorten: it elapses BEFORE
 # any DDL begins, so giving up on it cannot leave anything half-built. On
 # contention this step gives up, says so, and the gate decides -- which is

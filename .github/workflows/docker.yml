@@ -449,15 +449,25 @@ jobs:
     # job mid-`helm upgrade --atomic`, killing the process whose job is to roll
     # back, which is the half-applied release BLO-21492 added --atomic to prevent.
     #
-    # The precreation budget is the big term and it is a CEILING, not an
-    # expectation: it is sized for three pending guarded migrations at the
-    # concurrent-index guard's own per-spec timeouts (2m DDL lock + 10m build,
-    # plus one shortened 2m serializing-lock wait). The common case prints
-    # "No pending migration requires online index precreation" and exits in
-    # seconds. Shrink it by cutting the SPEC COUNT it is sized for, never by
-    # cutting the statement timeout -- an interrupted CREATE INDEX CONCURRENTLY
-    # leaves an INVALID index, whose remediation is worse than an absent one.
-    timeout-minutes: 146
+    # ⚠️ This total has a SECOND ceiling above it, and it is not in this file:
+    # scripts/check-stranded-approval-lock.sh treats an approval lock older than
+    # PAPERCLIP_STRANDED_LOCK_GRACE_MINUTES as stranded, on the premise that
+    # such a lock is only ever held by a running deploy job. That window must
+    # stay above this timeout PLUS the runner-queueing margin it was given
+    # (120m = the old 98m + 22m), or a lock held by a live deploy -- including
+    # one inside a `helm upgrade --atomic` rollback -- reads as abandoned.
+    # scripts/check-stranded-approval-lock.test.js pins the relationship, so the
+    # two move together or CI fails. Raising this to 146m for a three-spec
+    # precreation budget is exactly what it caught.
+    #
+    # The precreation budget is therefore sized for ONE spec's build (600s
+    # startup + 600s run = 20m), not for the worst case over several. That is
+    # safe because overrunning it aborts nothing: the script leaves a still-
+    # building Job alone, reports INCOMPLETE, and the pre-flight refuses to roll
+    # over an invalid index -- so a slow build costs this deploy and not the
+    # index. The common case prints "No pending migration requires online index
+    # precreation" and exits in seconds.
+    timeout-minutes: 118
     concurrency:
       # Serialize deploys to the same target so a fast-followup push doesn't
       # race with an in-flight upgrade.
