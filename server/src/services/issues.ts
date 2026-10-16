@@ -155,6 +155,7 @@ import { countDoneWhenBullets } from "./evidence-gate.js";
 import { shouldBlockNarratedDone } from "./done-gate.js";
 import {
   githubFetchPrHeadSha,
+  githubFetchCommitAuthorEmail,
   githubFetchPrAuthorLogin,
   githubGetPullRequestGate,
   githubHasCommitEvidence,
@@ -2422,6 +2423,7 @@ const githubTruthProbe: TruthProbe = buildGithubTruthProbe({
   listReviewerSurfaces: (ref) => githubListReviewerSurfacesAtPr(ref),
   getPullRequestGate: (ref) => githubGetPullRequestGate(ref),
   fetchPrAuthorLogin: (ref) => githubFetchPrAuthorLogin(ref),
+  fetchCommitAuthorEmail: (ref) => githubFetchCommitAuthorEmail(ref),
   get reviewerBotLogin() {
     return loadConfig().prReviewerBotLogin;
   },

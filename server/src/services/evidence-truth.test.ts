@@ -82,6 +82,13 @@ function deps(o: Partial<GithubTruthDeps> = {}): GithubTruthDeps {
     // fixture is an independently-reviewed PR, so the comment surface can
     // still reach `clean`. Tests that want the self-attested shape override it.
     fetchPrAuthorLogin: async () => "some-human",
+    // Throws rather than returning a value, so a test that reaches this call
+    // without meaning to fails loudly instead of quietly taking a default.
+    // Nothing in the default fixture declares a `reviewer`, so nothing should
+    // reach it (BLO-43550).
+    fetchCommitAuthorEmail: async () => {
+      throw new Error("fetchCommitAuthorEmail: no fixture declares a reviewer lane");
+    },
     reviewerBotLogin: ALLY,
     ...o,
   };
@@ -1021,5 +1028,174 @@ Land.`;
     )({ workProducts: [wp()] });
     expect(r.detections["review:ally-clean"]).toBeUndefined();
     expect(r.probeFailed).toBe(false);
+  });
+});
+
+/**
+ * The probe's half of the author-lane read (BLO-43550).
+ *
+ * The gate's orchestration is covered in
+ * `server/src/__tests__/pr-comment-review-gate-check.test.ts`; this suite covers
+ * the MIRROR in `probeOne`, which reads the same lane for the same reason over a
+ * different dependency surface. It exists because that mirror shipped with no
+ * behavioural case and a fail-closed guard that did not fail closed (Ally review
+ * of #2498): per this repo's standard, a guard with no failing mutation is a
+ * comment.
+ *
+ * ⚠ `reviewer` is a SELF-DECLARATION, not a trust boundary. These cases pin that
+ * the probe refuses a retirement declaring the head commit author's own lane —
+ * not that an author cannot retire its own finding, which it still can by
+ * omitting the field.
+ */
+describe("buildGithubTruthProbe — author-lane mirror (BLO-43550)", () => {
+  const AUTHOR_LANE = "staff-engineer@paperclip.blockcast.net";
+  const OTHER_LANE = "ally@paperclip.blockcast.net";
+  // A head BETWEEN the finding and the current one. The retirement has to attest
+  // something OTHER than the current head, or `forHead` short-circuits to the
+  // `clean` return above the carried-finding check and the lane is never
+  // consulted — the same reason the gate suite uses an intermediate head.
+  const MID = "b".repeat(40);
+
+  const verdictBlock = (head: string, lane: string | null, dispositions: unknown[]): string =>
+    [
+      "<!-- ally-verdict:1",
+      JSON.stringify({
+        head,
+        findings: { critical: 0, important: 0 },
+        dispositions,
+        ...(lane === null ? {} : { reviewer: lane }),
+      }),
+      "-->",
+    ].join("\n");
+
+  /** Ally retiring OLD's Important at MID, optionally declaring its own lane. */
+  const retiringAtMid = (lane: string | null): string =>
+    [
+      "## Ally — Consolidated PR Review",
+      "",
+      verdictBlock(MID, lane, [{ head: OLD.slice(0, 7), severity: "important", index: 1, verb: "fixed" }]),
+      "",
+      `Reviewed head: ${MID}`,
+      "### Prior Findings Dispositioned (1)",
+      `- **prior:${OLD.slice(0, 7)} important 1** — fixed — re-checked against this head.`,
+      "### Critical Issues (0)",
+      "### Important Issues (0)",
+    ].join("\n");
+
+  // A finding raised at OLD and retired at MID, beside a formal review object
+  // that attests the CURRENT head but carries no `## Ally` heading. That review
+  // is the Surface-2-only population `formalClean` exists for, and it is what
+  // makes the lane load-bearing here: credit the retirement and Surface 2
+  // vouches, refuse it and `commentBlocking` vetoes.
+  const corpus = (lane: string | null) => async () => ({
+    reviews: [
+      { login: ALLY, body: attestedNoHeading, state: "COMMENTED", commitId: HEAD, submittedAt: "2026-09-06T02:00:00Z" },
+    ],
+    comments: [
+      { login: ALLY, body: dirtyAtOld, createdAt: "2026-09-06T00:00:00Z" },
+      { login: ALLY, body: retiringAtMid(lane), createdAt: "2026-09-06T01:00:00Z" },
+    ],
+  });
+
+  it("refuses a retirement declaring the head commit author's own lane, and does not vouch", async () => {
+    const r = await buildGithubTruthProbe(
+      deps({ listReviewerSurfaces: corpus(AUTHOR_LANE), fetchCommitAuthorEmail: async () => AUTHOR_LANE }),
+    )({ workProducts: [wp()] });
+    expect(r.detections["review:ally-clean"]).toBeUndefined();
+    // Refusing a retirement is a VERDICT, not an inability to ask.
+    expect(r.probeFailed).toBe(false);
+  });
+
+  // THE NEGATIVE CONTROL: byte-identical but for the declared lane. Both sides
+  // carry the same single `allyblockcast[bot]` login, which is why this can
+  // never be a login comparison.
+  it("still credits the retirement when the review declares a different lane", async () => {
+    const r = await buildGithubTruthProbe(
+      deps({ listReviewerSurfaces: corpus(OTHER_LANE), fetchCommitAuthorEmail: async () => AUTHOR_LANE }),
+    )({ workProducts: [wp()] });
+    expect(r.detections["review:ally-clean"]).toBe(true);
+    expect(r.probeFailed).toBe(false);
+  });
+
+  // THE FAIL-CLOSED GUARD. A null lane CREDITS the retirement — the gate's own
+  // anti-deadlock direction — so on this corpus an unread lane left this probe
+  // vouching `clean` at a head the gate, reading the lane, publishes `failure`
+  // for. `failed` alone does not withhold the vouch: `out.clean` never reads it,
+  // the aggregator treats it as suppressing the escalation branch and not the
+  // pass path, and `evidence-gate` reads it as "could not ask" and DEMOTES an
+  // unlabeled block on the strength of it. So the guard has to return.
+  //
+  // MUTATION: drop the `return out` and only this row goes red — the control
+  // above still passes, because its lane reads fine. Drop `out.failed = true`,
+  // or the diagnostic push, and the second and third assertions catch those
+  // separately.
+  it("withholds the vouch — not merely `failed` — when a declared lane cannot be read", async () => {
+    const r = await buildGithubTruthProbe(
+      deps({ listReviewerSurfaces: corpus(AUTHOR_LANE), fetchCommitAuthorEmail: async () => null }),
+    )({ workProducts: [wp()] });
+    expect(r.detections["review:ally-clean"]).toBeUndefined();
+    expect(r.probeFailed).toBe(true);
+    expect(r.diagnostics.some((d) => d.startsWith("github-truth-probe-failed:commit_author_lane:"))).toBe(true);
+  });
+
+  // THE ZERO-EXTRA-CALLS AC on this side too: gated on a DECLARED lane, not on
+  // the verdict outcome, so it stays free until a producer emits `reviewer`.
+  // MUTATION: an unconditional fetch fails here and only here.
+  it("issues no commit fetch when no comment declares a lane", async () => {
+    let calls = 0;
+    const r = await buildGithubTruthProbe(
+      deps({
+        listReviewerSurfaces: corpus(null),
+        fetchCommitAuthorEmail: async () => {
+          calls += 1;
+          return AUTHOR_LANE;
+        },
+      }),
+    )({ workProducts: [wp()] });
+    expect(calls).toBe(0);
+    expect(r.probeFailed).toBe(false);
+  });
+
+  // The lane and the PR author are resolved TOGETHER. Serialized they would make
+  // the would-be-clean route gate -> head -> surfaces -> lane -> author, a FIFTH
+  // serial call, and `MAX_SERIAL_CALLS` is pinned strictly against
+  // `PROBE_DEADLINE_MS` at exactly the boundary. So the concurrency is the
+  // argument, and until now it was only a comment.
+  //
+  // This fixture needs BOTH fetches to be reached, which means a consolidated
+  // comment attesting the current head (that is what sets `authorUnknown`) which
+  // ALSO declares a lane.
+  //
+  // MUTATION: replace the `Promise.all` with two serial `await`s and
+  // `maxInFlight` drops to 1.
+  it("resolves the lane and the PR author concurrently, keeping the serial chain at 4", async () => {
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const overlap = async <T>(value: T): Promise<T> => {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      inFlight -= 1;
+      return value;
+    };
+    const cleanDeclaring = clean.replace(
+      "## Ally — Consolidated PR Review\n",
+      `## Ally — Consolidated PR Review\n\n${verdictBlock(HEAD, OTHER_LANE, [])}\n`,
+    );
+    const r = await buildGithubTruthProbe(
+      deps({
+        listReviewerSurfaces: async () => ({
+          reviews: [],
+          comments: [{ login: ALLY, body: cleanDeclaring, createdAt: "2026-09-06T00:00:00Z" }],
+        }),
+        fetchCommitAuthorEmail: () => overlap(AUTHOR_LANE),
+        fetchPrAuthorLogin: () => overlap("some-human"),
+      }),
+    )({ workProducts: [wp()] });
+    expect(maxInFlight).toBe(2);
+    expect(MAX_SERIAL_CALLS).toBe(4);
+    // A sanity check that the fixture reached the branch at all rather than
+    // skipping it: an unrelated declared lane leaves the clean verdict standing.
+    expect(r.detections["review:ally-clean"]).toBe(true);
   });
 });

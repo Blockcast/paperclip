@@ -1091,6 +1091,60 @@ export async function githubFetchPrAuthorLogin(input: {
 }
 
 /**
+ * The git author email recorded on one commit, or `null` when it cannot be read.
+ *
+ * One `GET /repos/{o}/{r}/commits/{sha}` — NOT `git config user.email`, which in
+ * an agent worktree routinely names a different lane than the one that actually
+ * authored the commits there.
+ *
+ * `commit.author.email` rather than the `author.login` sitting beside it in the
+ * same response: on this fleet every agent PR is authored by the shared
+ * `allyblockcast[bot]` App identity, so the login cannot tell two lanes apart at
+ * all, while the git author is genuinely per-lane (BLO-34389 measured
+ * `staff-engineer@…` against `release-engineer@…` under one login). That is the
+ * whole reason this helper exists rather than a second call to
+ * `githubFetchPrAuthorLogin`.
+ *
+ * Returned as GitHub gives it, trimmed. Case folding belongs to the one consumer
+ * that compares it (`evaluateCommentReviewGate` lowercases both sides), so that
+ * there is a single normalization point rather than two that can drift.
+ *
+ * EVERY failure answers `null` — no token, non-2xx, unparseable body, absent
+ * field, thrown socket. The caller must read `null` as "unknown", never as "a
+ * different lane": crediting on unknown is this field's safe direction, and
+ * BLO-43550's `prAuthorLane` contract is written the same way.
+ *
+ * ⚠ The returned address is self-reported git metadata, not an authenticated
+ * identity. It answers *which lane says it wrote this commit*, which is all its
+ * consumer needs; it is not evidence against an author that set it deliberately.
+ */
+export async function githubFetchCommitAuthorEmail(input: {
+  repoFullName: string;
+  sha: string;
+  signal?: AbortSignal;
+}): Promise<string | null> {
+  const token = await getInstallationToken(Date.now(), { signal: input.signal });
+  if (!token) return null;
+  try {
+    const res = await ghFetch(
+      `${gitHubApiBase(GITHUB_HOST)}/repos/${input.repoFullName}/commits/${encodeURIComponent(input.sha)}`,
+      {
+        headers: { ...GITHUB_API_HEADERS, authorization: `Bearer ${token}` },
+        signal: input.signal,
+      },
+    );
+    if (!res.ok) return null;
+    const body = (await res.json().catch(() => null)) as
+      | { commit?: { author?: { email?: string } } }
+      | null;
+    const email = body?.commit?.author?.email;
+    return typeof email === "string" && email.trim().length > 0 ? email.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Whether a comment is Ally emitting a consolidated review that attests to this
  * exact head. Both halves are required: a request comment can quote an arbitrary
  * SHA, so a loose substring match is not durable evidence the review side effect
