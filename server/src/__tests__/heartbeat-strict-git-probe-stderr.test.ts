@@ -59,10 +59,18 @@ describe("probeGitCheckoutStateStrict stderr classification", () => {
 
   // Exits 128 like real git, so the rejection carries `.stderr` and a numeric
   // code — never "ENOENT", which the branch above the matcher would absorb.
+  // The fixture goes to a sidecar file the shim cats, rather than through a
+  // shell string: embedding it would put the escaping of a newline between
+  // the fixture and the classifier, and the whole point of the `m` flag is
+  // that a newline is present. (It bit once: `printf '%s'` does not expand a
+  // backslash-n in its ARGUMENT, so the multi-line fixture arrived as one
+  // line and the anchored matcher correctly refused it.)
   const installGitShim = async (stderr: string) => {
+    const fixture = path.join(shimBin, "stderr.fixture");
+    await fs.writeFile(fixture, stderr, "utf8");
     await fs.writeFile(
       path.join(shimBin, "git"),
-      `#!/bin/sh\nprintf '%s\\n' ${JSON.stringify(stderr)} >&2\nexit 128\n`,
+      `#!/bin/sh\ncat ${JSON.stringify(fixture)} >&2\nexit 128\n`,
       { mode: 0o755 },
     );
   };
