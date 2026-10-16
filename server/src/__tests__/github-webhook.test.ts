@@ -64,6 +64,7 @@ import {
   __test_verifyGithubSignature,
   __test_wakeIdempotencySuffix,
   __resetWorkflowRunSupersessionTrackingForTest,
+  deriveGithubWebhookMaxConcurrentDeliveries,
   derivePrReviewerWakeMaxConcurrency,
   githubWebhookRoutes,
   reconcileContendedPrReviewerWakes,
@@ -3215,7 +3216,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
     await tempDb?.cleanup();
   });
 
-  function buildApp(config: Pick<GithubWebhookConfig, "prReviewerAgentIds" | "prReviewerAgentId" | "prReviewerBotLogin" | "resolvePrReviewHeadSha" | "listPrReviewsForAttestation" | "runPrCommentReviewGateCheck" | "selfReviewEscalationThreshold" | "dependabotAgentId" | "dependabotMinSeverity" | "heartbeatOptions" | "listPullRequestCommits" | "notifyForeignCommits" | "resolveCiHeadSettlement"> = {}) {
+  function buildApp(config: Pick<GithubWebhookConfig, "prReviewerAgentIds" | "prReviewerAgentId" | "prReviewerBotLogin" | "resolvePrReviewHeadSha" | "listPrReviewsForAttestation" | "runPrCommentReviewGateCheck" | "selfReviewEscalationThreshold" | "dependabotAgentId" | "dependabotMinSeverity" | "heartbeatOptions" | "listPullRequestCommits" | "notifyForeignCommits" | "resolveCiHeadSettlement" | "maxConcurrentDeliveries"> = {}) {
     const app = express();
     app.use(express.json({
       verify: (req, _res, buf) => {
@@ -9038,6 +9039,47 @@ describeEmbeddedPostgres("github-webhook route", () => {
       wakesPerDelivery.push(await send(app, ciDelivery("workflow_run", 1, "head-green", "success")));
       // Only the lane that completed the head wakes; suite/workflow dedup onto it.
       expect(wakesPerDelivery).toEqual([0, 0, 0, 0, 1, 0, 0]);
+    });
+
+    // BLO-47034: a CI burst must not reach the DB faster than the bulkhead
+    // admits it. The settlement seam stands in for the in-handler work: while
+    // one delivery is parked inside it, a second must not have started — under
+    // the old unbounded handler both enter at once.
+    it("admits at most maxConcurrentDeliveries deliveries into the handler at once", async () => {
+      await seedIssueWithIdentifier("BLO-3182");
+      let inside = 0;
+      let maxInside = 0;
+      let entered = 0;
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      const app = buildApp({
+        maxConcurrentDeliveries: 1,
+        resolveCiHeadSettlement: async () => {
+          entered += 1;
+          inside += 1;
+          maxInside = Math.max(maxInside, inside);
+          await gate;
+          inside -= 1;
+          return "settled";
+        },
+      });
+      const sends = [1, 2, 3].map((i) => send(app, ciDelivery("check_run", i, `head-bulkhead-${i}`, "success")));
+      await vi.waitFor(() => expect(entered).toBe(1));
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(entered).toBe(1);
+      release();
+      expect(await Promise.all(sends)).toEqual([1, 1, 1]);
+      expect(maxInside).toBe(1);
+    });
+
+    it("derives the delivery bulkhead from the pool: a third, never zero", () => {
+      expect(deriveGithubWebhookMaxConcurrentDeliveries(POSTGRES_POOL_MAX)).toBe(Math.floor(POSTGRES_POOL_MAX / 3));
+      // A reviewer-wake delivery holds 2 connections, so even an all-reviewer
+      // burst must leave interactive traffic part of the pool.
+      for (const poolMax of [3, 6, 10, 18, 50]) {
+        expect(deriveGithubWebhookMaxConcurrentDeliveries(poolMax) * 2).toBeLessThan(poolMax);
+      }
+      for (const poolMax of [1, 2]) expect(deriveGithubWebhookMaxConcurrentDeliveries(poolMax)).toBe(1);
     });
 
     it("a red lane wakes immediately and later green lanes on that head do not re-wake", async () => {
