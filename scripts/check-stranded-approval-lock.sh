@@ -116,18 +116,26 @@ fi
 #
 # This is what makes the check safe against `helm upgrade --atomic`. A lock is
 # only ever held by a running deploy job, and docker.yml caps that job at
-# `timeout-minutes: 98` -- so a lock older than that is held by nothing, and the
+# `timeout-minutes: 118` -- so a lock older than that is held by nothing, and the
 # --atomic window (which lives entirely inside the job) is long over. The
-# default is 120m: 98m plus margin for the runner queueing before the job's own
-# clock starts. scripts/check-stranded-approval-lock.test.js pins it at or above
-# the deploy job's timeout, so raising that timeout fails there rather than
-# silently narrowing this window into the race.
+# default is 140m: 118m plus the same 22m margin for the runner queueing before
+# the job's own clock starts that the original 120m carried over 98m.
+# scripts/check-stranded-approval-lock.test.js pins it at or above the deploy
+# job's timeout, so raising that timeout fails there rather than silently
+# narrowing this window into the race.
+#
+# ⚠️ Raised 120 -> 140 with the deploy job's 98 -> 118 (PEN-4179 added an
+# online-index precreation step ahead of the migration pre-flight). The two MUST
+# move together: narrowing the gap is what re-opens the --atomic race, and the
+# queueing margin is not spare capacity to spend on a longer job. If the deploy
+# job ever shortens again, bring this back down with it rather than leaving a
+# window wider than the race it bounds.
 #
 # It is also what makes the BLO-31598 shape decidable at all. A lock taken
 # seconds ago whose `helm upgrade` has not run yet is indistinguishable from one
 # whose deploy died before it ever would: in both the Deployment is healthy and
 # has not advanced. Only elapsed time separates them.
-GRACE_MINUTES="${PAPERCLIP_STRANDED_LOCK_GRACE_MINUTES:-120}"
+GRACE_MINUTES="${PAPERCLIP_STRANDED_LOCK_GRACE_MINUTES:-140}"
 if [[ ! "$GRACE_MINUTES" =~ ^[0-9]+$ ]]; then
   echo "PAPERCLIP_STRANDED_LOCK_GRACE_MINUTES='${GRACE_MINUTES}' is not a non-negative integer" >&2
   exit 2
