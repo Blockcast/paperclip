@@ -16,6 +16,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { truncateCompanyScopedTestState } from "./helpers/truncate-company-scoped-test-state.js";
 import {
+  ACTIVE_RECOVERY_ACTION_STATUSES,
   BLOCKED_AUTO_RESUME_SUPPRESSING_RECOVERY_ACTION_STATUSES,
   issueRecoveryActionService,
 } from "../services/issue-recovery-actions.js";
@@ -1886,29 +1887,81 @@ describeEmbeddedPostgres("recovery wake horizon expiry (BLO-24662)", () => {
       }
 
       /**
+       * The status literals the live `issue_recovery_actions_active_source_uq` predicate is
+       * built from, read from the catalog rather than from the migration text — the running
+       * schema is what the read is actually exposed to, and a later migration could rewrite
+       * the predicate without anyone editing `0097`.
+       *
+       * Postgres normalizes `status in ('active','escalated')` on the way in and renders it
+       * back as an `= ANY (ARRAY[...])` over casts, so the surrounding syntax is not stable
+       * enough to match on. The STRING LITERALS are: the predicate names no value other than
+       * the statuses, so harvesting every quoted literal recovers the set exactly without
+       * depending on how this server version chose to spell the comparison.
+       */
+      async function indexPredicateStatuses(indexName: string): Promise<string[]> {
+        const rows = (await db.execute(sql`
+          SELECT pg_get_expr(i.indpred, i.indrelid) AS predicate
+          FROM pg_index i
+          JOIN pg_class c ON c.oid = i.indexrelid
+          WHERE c.relname = ${indexName}
+        `)) as unknown as Array<{ predicate: string | null }>;
+        // Distinguishes "no such index" from "an index with no predicate" — the second is a
+        // real regression (a UNIQUE index over every status, not a partial one) and would
+        // otherwise read as the empty set, which is also what a typo in `indexName` gives.
+        if (rows.length !== 1) return [`EXPECTED EXACTLY 1 INDEX NAMED ${indexName}, FOUND ${rows.length}`];
+        const predicate = rows[0]?.predicate;
+        if (!predicate) return [`INDEX ${indexName} HAS NO PARTIAL PREDICATE`];
+        return [...new Set(Array.from(predicate.matchAll(/'([^']*)'/g), (match) => match[1]!))].sort();
+      }
+
+      /**
        * The invariant the OLD read depended on, stated as a test.
        *
-       * This is the tripwire. Add a status to `ACTIVE_RECOVERY_ACTION_STATUSES` without
-       * widening the index predicate, or relax the predicate itself, and the sibling state
-       * becomes constructible — at which point `getActiveForIssue` really can return someone
-       * else's row. This test fails first and names the reason.
+       * This is the tripwire, and it is keyed on `ACTIVE_RECOVERY_ACTION_STATUSES` itself so
+       * that it pins the whole constant rather than the two statuses that happen to be in it
+       * today. Add a status to the constant without widening the index predicate, relax the
+       * predicate, or widen it past the constant, and this fails first and names the reason —
+       * instead of the confirm arm failing later and silently.
+       *
+       * PEN-4159 (Ally review of #2774): the two assertions are deliberately kept separate
+       * and neither subsumes the other. The catalog comparison is the only one that can see a
+       * status the constant does not yet name, so it is what makes the claim above true; but
+       * it reads index TEXT, which an `INVALID` index left behind by a failed concurrent build
+       * also has. The insert loop is the one that proves the index actually refuses rows. The
+       * first version of this test asserted only the second, over a hardcoded `"active"`, and
+       * so pinned neither direction of what its own doc promised.
        */
-      it("refuses a second active action on one issue, which is why the issue-keyed read had one candidate", async () => {
+      it("refuses a second action on one issue for every status the active set names", async () => {
         const seeded = await seed();
         const mineId = await insertAction(seeded, { status: "escalated", retiringBound: "timeout_horizon" });
 
-        // The sentinel distinguishes "did not throw" from "threw for another reason"; without
-        // it a silent success would read as an unhelpful null mismatch.
-        const refusal = await insertAction(seeded, {
-          status: "active",
-          fingerprint: `sibling:${seeded.sourceIssueId}`,
-        }).then(
-          () => "INSERT UNEXPECTEDLY SUCCEEDED",
-          (error: unknown) => uniqueViolationConstraint(error) ?? `unexpected error: ${String(error)}`,
+        // The constant and the predicate are two spellings of one decision. They are written
+        // 150 migrations apart, so nothing but this line holds them together.
+        expect(await indexPredicateStatuses("issue_recovery_actions_active_source_uq")).toEqual(
+          [...ACTIVE_RECOVERY_ACTION_STATUSES].sort(),
         );
-        expect(refusal).toBe("issue_recovery_actions_active_source_uq");
 
-        // The refusal is the index and not some unrelated failure: ours is still the only row.
+        for (const status of ACTIVE_RECOVERY_ACTION_STATUSES) {
+          // A per-status fingerprint keeps the sibling clear of the OTHER partial index on
+          // this table, `..._active_fingerprint_uq` over (company, issue, cause, fingerprint).
+          // Sharing one fingerprint across the loop would let that index take the refusal on a
+          // later pass and the assertion below would then name the wrong constraint — a
+          // green-looking test that had stopped exercising the index it is about.
+          //
+          // The sentinel distinguishes "did not throw" from "threw for another reason";
+          // without it a silent success would read as an unhelpful null mismatch.
+          const refusal = await insertAction(seeded, {
+            status,
+            fingerprint: `sibling:${status}:${seeded.sourceIssueId}`,
+          }).then(
+            () => "INSERT UNEXPECTEDLY SUCCEEDED",
+            (error: unknown) => uniqueViolationConstraint(error) ?? `unexpected error: ${String(error)}`,
+          );
+          expect(`${status}: ${refusal}`).toBe(`${status}: issue_recovery_actions_active_source_uq`);
+        }
+
+        // The refusals are the index and not some unrelated failure: ours is still the only
+        // row, so not one pass of the loop got a sibling in.
         const rows = await db
           .select()
           .from(issueRecoveryActions)
