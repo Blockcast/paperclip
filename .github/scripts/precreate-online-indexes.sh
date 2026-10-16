@@ -161,6 +161,7 @@ fi
 # changes between causes is what gets printed.
 pod_name=""
 container_started=0
+startup_terminal_reason=""
 startup_deadline=$(( $(date +%s) + STARTUP_TIMEOUT_SECONDS ))
 while :; do
   pod_name="$(kubectl -n "${NS}" get pods -l "job-name=${JOB_NAME}" \
@@ -175,6 +176,19 @@ while :; do
       container_started=1
       break
     fi
+    # Mirrors the gate's phase 1 (check-pending-migrations.sh): these never
+    # self-heal, so riding out the rest of the startup budget only delays an
+    # answer that is already decided -- and here it delays the deploy. Pull
+    # errors are deliberately NOT in this list: ErrImagePull/ImagePullBackOff
+    # routinely recover, and failing fast on them is what the split budget
+    # exists to avoid.
+    case "$(kubectl -n "${NS}" get pod "${pod_name}" \
+      -o jsonpath='{.status.containerStatuses[0].state.waiting.reason}' 2>/dev/null || true)" in
+      InvalidImageName|CreateContainerConfigError)
+        startup_terminal_reason="terminal container error"
+        break
+        ;;
+    esac
   fi
   if [ "$(date +%s)" -ge "${startup_deadline}" ]; then
     break
@@ -183,26 +197,64 @@ while :; do
 done
 
 if [ "${container_started}" -ne 1 ]; then
-  echo "online-index precreation: SKIPPED — the container never started within its ${STARTUP_TIMEOUT_SECONDS}s startup budget. No index was built and nothing was changed; the pre-flight decides." >&2
+  if [ -n "${startup_terminal_reason}" ]; then
+    # Distinguished from budget exhaustion deliberately: saying "within its
+    # ${STARTUP_TIMEOUT_SECONDS}s budget" here would imply the budget was the
+    # constraint when the answer was decided long before it.
+    echo "online-index precreation: SKIPPED — the container hit a ${startup_terminal_reason} and will not start; waiting out the remaining startup budget would not have cleared it. No index was built and nothing was changed; the pre-flight decides." >&2
+  else
+    echo "online-index precreation: SKIPPED — the container never started within its ${STARTUP_TIMEOUT_SECONDS}s startup budget. No index was built and nothing was changed; the pre-flight decides." >&2
+  fi
   delete_job_now
   exit 0
 fi
 
 # Phase 2: the build itself.
-kubectl -n "${NS}" wait --for=condition=complete "job/${JOB_NAME}" --timeout="${TIMEOUT_SECONDS}s" >/dev/null 2>&1
-completed=$?
+#
+# Polled on BOTH terminal conditions rather than `kubectl wait
+# --for=condition=complete`. That wait does not return early on a FAILED Job --
+# Complete never goes true, so it returns only when the timeout expires
+# (kubernetes/kubectl#1629, which check-pending-migrations.sh:43-45 documents for
+# its own budget). The fast failures here are the COMMON ones: losing the
+# serializing lock throws after lockWaitTimeoutMs, and a bad secret or an
+# unreachable database throws within seconds. With a single Complete wait, each
+# of those would hold the deploy for the whole run budget after the answer was
+# already known -- a quieter version of the latency this step exists to remove,
+# and it would make this script's own claim that contention "gives up and lets
+# the gate decide" false.
+job_outcome=""
+run_deadline=$(( $(date +%s) + TIMEOUT_SECONDS ))
+while :; do
+  # One read for both: `succeeded` and `failed` are counts, and with
+  # backoffLimit 0 exactly one of them reaches 1. Concatenated so a single
+  # jsonpath answers "is it terminal yet".
+  job_status="$(kubectl -n "${NS}" get job "${JOB_NAME}" \
+    -o jsonpath='{.status.succeeded}|{.status.failed}' 2>/dev/null || true)"
+  case "${job_status}" in
+    "") ;;                       # job not readable yet
+    *[1-9]*"|") job_outcome="succeeded"; break ;;
+    "|"*[1-9]*) job_outcome="failed"; break ;;
+  esac
+  if [ "$(date +%s)" -ge "${run_deadline}" ]; then
+    job_outcome="timeout"
+    break
+  fi
+  sleep "${POLL_SECONDS}"
+done
 
 echo "--- precreation output ---"
 kubectl -n "${NS}" logs "job/${JOB_NAME}" --tail=200 2>&1 || echo "(no logs available)"
 echo "--- end precreation output ---"
 
-if [ "${completed}" -eq 0 ]; then
+if [ "${job_outcome}" = "succeeded" ]; then
   echo "online-index precreation: done — every pending migration's online index is built. The pre-flight below verifies it."
+elif [ "${job_outcome}" = "failed" ]; then
+  # Reached in seconds on the common failures (lost serializing lock, bad
+  # secret, unreachable database) instead of at the end of the run budget.
+  # Still not this step's to adjudicate: the gate reads the real index state.
+  echo "online-index precreation: FAILED — job/${JOB_NAME} exited non-zero (see output above); no index was precreated by this step. Nothing is broken by this: the pre-flight below reports the real index state and stops the deploy if an index is absent or half-built." >&2
 else
-  # `kubectl wait --for=condition=complete` also returns non-zero on a FAILED
-  # job (kubernetes/kubectl#1629 — Complete never goes true), so this covers
-  # both "still building" and "failed". Neither is this step's to adjudicate.
-  echo "online-index precreation: INCOMPLETE — job/${JOB_NAME} did not report complete within ${TIMEOUT_SECONDS}s (still building, or failed; see output above). Nothing is broken by this: the pre-flight below reports the real index state and stops the deploy if an index is absent or half-built." >&2
+  echo "online-index precreation: INCOMPLETE — job/${JOB_NAME} reached neither terminal state within ${TIMEOUT_SECONDS}s, so a build is most likely still running (see output above). Nothing is broken by this: the pre-flight below reports the real index state and stops the deploy if an index is absent or half-built." >&2
 fi
 
 delete_job_if_terminal

@@ -143,6 +143,50 @@ test("the deploy runs precreation BEFORE the gate that reports on it", () => {
   );
 });
 
+test("the precreation step observes BOTH terminal job states, not just Complete", () => {
+  // Asked for by review on f854110. `kubectl wait --for=condition=complete`
+  // does NOT return early on a FAILED Job -- Complete never goes true, so it
+  // returns only at the timeout (kubernetes/kubectl#1629, which
+  // check-pending-migrations.sh documents for its own budget). The fast
+  // failures here are the common ones (lost serializing lock, bad secret,
+  // unreachable database), so a Complete-only wait would hold the deploy for
+  // the whole run budget after the answer was already known -- a quieter
+  // version of the latency this step exists to remove.
+  const script = readFileSync(
+    new URL("../.github/scripts/precreate-online-indexes.sh", import.meta.url),
+    "utf8",
+  );
+
+  const bareCompleteWait = /kubectl[^\n]*wait --for=condition=complete/;
+  assert.doesNotMatch(
+    script,
+    bareCompleteWait,
+    "`kubectl wait --for=condition=complete` cannot see a Failed Job; poll both terminal " +
+      "states (or add a concurrent `--for=condition=failed` arm) so a fast failure is not " +
+      "charged the whole run budget",
+  );
+  // The replacement must actually read the failure side, not just avoid the
+  // banned call: an assertion that only forbids `wait` would be satisfied by a
+  // poll that still watches success alone.
+  assert.match(
+    script,
+    /\{\.status\.succeeded\}/,
+    "the terminal-state poll must read .status.succeeded",
+  );
+  assert.match(
+    script,
+    /\{\.status\.failed\}/,
+    "the terminal-state poll must read .status.failed — otherwise a failed job is " +
+      "indistinguishable from a slow build and waits out the budget",
+  );
+  assert.match(
+    script,
+    /job_outcome="failed"/,
+    "a failed job must reach a distinct outcome branch, so its message does not claim the " +
+      "build is still running",
+  );
+});
+
 test("the precreation step cannot fail the deploy", () => {
   // Advisory is load-bearing: the step sits on the production deploy path and
   // must only ever be able to improve the outcome. `set -e` would make any

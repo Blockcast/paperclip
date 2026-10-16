@@ -293,7 +293,6 @@ export function selectGuardedPendingIndexes(
   return specs.filter((spec) => pending.has(spec.migration));
 }
 
-/** Operator-facing failure text: what stopped, why, and the exact fix. */
 /**
  * Migrations whose online index the MIGRATION RUNNER builds for itself, derived
  * from the guard rather than restated, so this set cannot drift from the
@@ -318,6 +317,7 @@ export const MIGRATIONS_WITH_RUNNER_PRECREATION: ReadonlySet<string> = new Set(
   PENDING_CONCURRENT_INDEXES.map((spec) => spec.migration),
 );
 
+/** Operator-facing failure text: what stopped, why, and the exact fix. */
 export function formatPreflightFailure(blockers: readonly PreflightBlocker[]): string {
   // Partitioned because the two halves need different instructions, and the
   // single undifferentiated paragraph this replaced asserted something false
