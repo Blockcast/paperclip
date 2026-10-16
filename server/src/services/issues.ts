@@ -4803,6 +4803,7 @@ function attentionBase(input: {
   recoveryIssue?: IssueBlockedInboxIssueRef | null;
   approvalId?: string | null;
   interactionId?: string | null;
+  overdueInteractionId?: string | null;
   sampleIssueIdentifier?: string | null;
   externalDetailsRedacted?: boolean;
 }): IssueBlockedInboxAttention {
@@ -4819,6 +4820,9 @@ function attentionBase(input: {
     recoveryIssue: input.recoveryIssue ?? null,
     approvalId: input.approvalId ?? null,
     interactionId: input.interactionId ?? null,
+    // PEN-4193: defaulted here but normally stamped by `setAttention`, which
+    // knows the row id and so cannot forget. Callers may pass it explicitly.
+    overdueInteractionId: input.overdueInteractionId ?? null,
     sampleIssueIdentifier:
       input.sampleIssueIdentifier
       ?? input.leafIssue?.identifier
@@ -5129,11 +5133,26 @@ async function listIssueBlockedInboxAttentionMap(
 ): Promise<Map<string, BlockedInboxAttentionEntry>> {
   const rowIssueIds = [...new Set(issueRows.map((row) => row.id))];
   const result = new Map<string, BlockedInboxAttentionEntry>();
+  // PEN-4193: overdue pending cards keyed by the row they sit on. Declared here and filled
+  // below, before the reason ladder runs, so `setAttention` can stamp EVERY branch without
+  // each branch remembering to. That is the actual fix: the bug was not that one branch got
+  // the wrong value, it was that exactly one branch of seven carried the card at all, so any
+  // row claimed earlier in the ladder reported no overdue card however long it had waited.
+  // Stamping centrally means a branch added later inherits the behaviour instead of
+  // silently reintroducing the hole.
+  const overdueInteractionIdByIssueId = new Map<string, string>();
   const setAttention = (
     issueId: string,
     attention: IssueBlockedInboxAttention,
     externalWait: { owner: string; action: string } | null = null,
-  ) => result.set(issueId, { attention, externalWait });
+  ) => result.set(issueId, {
+    attention: {
+      ...attention,
+      overdueInteractionId:
+        attention.overdueInteractionId ?? overdueInteractionIdByIssueId.get(issueId) ?? null,
+    },
+    externalWait,
+  });
   if (rowIssueIds.length === 0) return result;
 
   const [graphIssueRows, graphRelationRows, companyAgentRows] = await Promise.all([
@@ -5406,6 +5425,14 @@ async function listIssueBlockedInboxAttentionMap(
     const createdAtMs = row.createdAt instanceof Date ? row.createdAt.getTime() : NaN;
     if (Number.isFinite(createdAtMs) && createdAtMs <= interactionCutoffMs) {
       if (!staleInteractionByIssueId.has(row.issueId)) staleInteractionByIssueId.set(row.issueId, row);
+      // PEN-4193: keyed on the row the card actually sits on. The finding branch below also
+      // names a stale card, but it keys on `finding.recoveryIssueId` -- a different row in
+      // every dependency-path form -- so it answers "which card does this finding's
+      // recommended action refer to", not "is anything overdue on this row". Both are wanted;
+      // they are not substitutes, which is why this is a separate map and a separate field.
+      if (!overdueInteractionIdByIssueId.has(row.issueId)) {
+        overdueInteractionIdByIssueId.set(row.issueId, row.id);
+      }
       continue;
     }
     if (!interactionByIssueId.has(row.issueId)) interactionByIssueId.set(row.issueId, row);

@@ -359,6 +359,7 @@ describe("issue validators", () => {
       recoveryIssue: null,
       approvalId: null,
       interactionId: null,
+      overdueInteractionId: null,
       sampleIssueIdentifier: "PAP-2",
       redaction: {
         externalDetailsRedacted: false,
