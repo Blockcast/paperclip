@@ -1093,6 +1093,35 @@ export const WORKSPACE_REUSE_REFUSAL_WINDOW_METRIC =
 export const WORKSPACE_REUSE_REFUSAL_METRICS_REFRESH_SUCCESS_METRIC =
   "paperclip_workspace_reuse_refusal_metrics_refresh_success";
 /**
+ * PEN-4188 (PEN-3633 item 5). A project checkout whose actual git origin
+ * disagrees with its project workspace's `repo_url`, observed on a timer rather
+ * than discovered per-run as a dispatch refusal.
+ *
+ * Strictly EARLIER than, and strictly narrower than,
+ * {@link WORKSPACE_REUSE_REFUSAL_WINDOW_METRIC}. Earlier because it does not
+ * wait for a run to be spent: PEN-3628 burned 33 runs over 8.6 h before a
+ * manual board sweep found it. Narrower because it can only ever see episode 1
+ * of the two measured episodes -- episode 2's checkout had the CORRECT origin
+ * and is visible only from the run side. The two are complements, not
+ * substitutes; do not retire either for the other.
+ */
+export const PROJECT_CHECKOUT_ORIGIN_MISMATCH_METRIC =
+  "paperclip_project_checkout_origin_mismatch";
+/**
+ * Checkouts the reconciler actually read an origin from on its last pass.
+ *
+ * The POSITIVE CONTROL for the gauge above, and not optional: an absent
+ * mismatch series means "no checkout disagrees" only if something was
+ * compared. A pass that probed nothing -- PVC unmounted, every directory
+ * unprovisioned, `git` missing from the image -- produces the identical empty
+ * mismatch set, so the alert gates on this being non-zero and a separate alert
+ * fires when it reaches zero.
+ */
+export const PROJECT_CHECKOUT_ORIGIN_RECONCILE_COMPARED_METRIC =
+  "paperclip_project_checkout_origin_reconcile_compared";
+export const PROJECT_CHECKOUT_ORIGIN_RECONCILE_METRICS_REFRESH_SUCCESS_METRIC =
+  "paperclip_project_checkout_origin_reconcile_metrics_refresh_success";
+/**
  * Board-approval-queue depth and staleness (BLO-29850). The approval queue is
  * the mandated escalation path for shared-infra changes and had no telemetry at
  * all: it stopped serving for 3.2 days while 39 new cards were filed into it,
@@ -3729,6 +3758,11 @@ let externalRuntimeReservationStrandedOldestAge: Gauge<"agent_id"> | null = null
 let externalRuntimeReservationStrandMetricsRefreshSuccess: Gauge | null = null;
 let workspaceReuseRefusalWindow: Gauge<"project_workspace_id" | "failure_class"> | null = null;
 let workspaceReuseRefusalMetricsRefreshSuccess: Gauge | null = null;
+let projectCheckoutOriginMismatch:
+  | Gauge<"project_workspace_id" | "company_id" | "project_id">
+  | null = null;
+let projectCheckoutOriginReconcileCompared: Gauge | null = null;
+let projectCheckoutOriginReconcileMetricsRefreshSuccess: Gauge | null = null;
 let approvalsPending: Gauge<"type"> | null = null;
 let approvalOldestPendingAge: Gauge<"type"> | null = null;
 let approvalLastDecisionTimestamp: Gauge | null = null;
@@ -3943,6 +3977,9 @@ function ensureRegistry(): {
   externalRuntimeReservationStrandMetricsRefreshSuccessGauge: Gauge;
   workspaceReuseRefusalWindowGauge: Gauge<"project_workspace_id" | "failure_class">;
   workspaceReuseRefusalMetricsRefreshSuccessGauge: Gauge;
+  projectCheckoutOriginMismatchGauge: Gauge<"project_workspace_id" | "company_id" | "project_id">;
+  projectCheckoutOriginReconcileComparedGauge: Gauge;
+  projectCheckoutOriginReconcileMetricsRefreshSuccessGauge: Gauge;
   approvalsPendingGauge: Gauge<"type">;
   approvalOldestPendingAgeGauge: Gauge<"type">;
   approvalLastDecisionTimestampGauge: Gauge;
@@ -4022,6 +4059,9 @@ function ensureRegistry(): {
     || !externalRuntimeReservationStrandMetricsRefreshSuccess
     || !workspaceReuseRefusalWindow
     || !workspaceReuseRefusalMetricsRefreshSuccess
+    || !projectCheckoutOriginMismatch
+    || !projectCheckoutOriginReconcileCompared
+    || !projectCheckoutOriginReconcileMetricsRefreshSuccess
     || !approvalsPending
     || !approvalOldestPendingAge
     || !approvalLastDecisionTimestamp
@@ -4645,6 +4685,42 @@ function ensureRegistry(): {
       registers: [registry],
     });
     workspaceReuseRefusalMetricsRefreshSuccess.set(0);
+    projectCheckoutOriginMismatch = new Gauge({
+      name: PROJECT_CHECKOUT_ORIGIN_MISMATCH_METRIC,
+      help:
+        "1 while a project checkout's actual git origin disagrees with its project workspace's "
+        + "repo_url, observed on a timer rather than per-run at dispatch (PEN-4188). Both sides are "
+        + "normalised to lowercased owner/repo before comparison, and the origin is read with "
+        + "`git config --get remote.origin.url` and never `git remote -v`, because the shared "
+        + "/paperclip/.gitconfig rewrites https://github.com/Blockcast/ to SSH at transport time -- "
+        + "a verbatim comparison would report a mismatch on every healthy Blockcast checkout in the "
+        + "estate. Reset-then-set, so an absent series means 'this checkout agrees' -- but ONLY when "
+        + "paperclip_project_checkout_origin_reconcile_compared is non-zero; alert on the pair. The "
+        + "three labels are functionally dependent (workspace determines project determines "
+        + "company), so cardinality is that of project_workspace_id alone, which is 0 when healthy; "
+        + "company_id and project_id are carried so the page routes without a lookup.",
+      labelNames: ["project_workspace_id", "company_id", "project_id"],
+      registers: [registry],
+    });
+    projectCheckoutOriginReconcileCompared = new Gauge({
+      name: PROJECT_CHECKOUT_ORIGIN_RECONCILE_COMPARED_METRIC,
+      help:
+        "Project checkouts whose git origin was successfully read and compared on the last "
+        + "reconcile pass (PEN-4188). The positive control for the mismatch gauge: zero mismatches "
+        + "is only evidence of health when this is non-zero. Excludes workspaces whose checkout "
+        + "directory does not exist (an unprovisioned project) and those whose origin could not be "
+        + "read at all.",
+      registers: [registry],
+    });
+    projectCheckoutOriginReconcileCompared.set(0);
+    projectCheckoutOriginReconcileMetricsRefreshSuccess = new Gauge({
+      name: PROJECT_CHECKOUT_ORIGIN_RECONCILE_METRICS_REFRESH_SUCCESS_METRIC,
+      help:
+        "1 when the most recent project-checkout origin reconcile pass completed; 0 when it "
+        + "failed, so a stale snapshot cannot be read as 'every checkout still agrees'.",
+      registers: [registry],
+    });
+    projectCheckoutOriginReconcileMetricsRefreshSuccess.set(0);
     approvalsPending = new Gauge({
       name: APPROVALS_PENDING_METRIC,
       help:
@@ -5868,6 +5944,10 @@ function ensureRegistry(): {
       externalRuntimeReservationStrandMetricsRefreshSuccess,
     workspaceReuseRefusalWindowGauge: workspaceReuseRefusalWindow,
     workspaceReuseRefusalMetricsRefreshSuccessGauge: workspaceReuseRefusalMetricsRefreshSuccess,
+    projectCheckoutOriginMismatchGauge: projectCheckoutOriginMismatch,
+    projectCheckoutOriginReconcileComparedGauge: projectCheckoutOriginReconcileCompared,
+    projectCheckoutOriginReconcileMetricsRefreshSuccessGauge:
+      projectCheckoutOriginReconcileMetricsRefreshSuccess,
     approvalsPendingGauge: approvalsPending,
     approvalOldestPendingAgeGauge: approvalOldestPendingAge,
     approvalLastDecisionTimestampGauge: approvalLastDecisionTimestamp,
@@ -6988,6 +7068,60 @@ export function setWorkspaceReuseRefusalWindowMetrics(
 /** Mark whether the workspace-reuse-refusal gauge was refreshed from the database. */
 export function setWorkspaceReuseRefusalMetricsRefreshSuccess(success: boolean): void {
   ensureRegistry().workspaceReuseRefusalMetricsRefreshSuccessGauge.set(success ? 1 : 0);
+}
+
+/** One project checkout whose git origin disagrees with its workspace's `repo_url` (PEN-4188). */
+export type ProjectCheckoutOriginMismatchEntry = {
+  projectWorkspaceId: string;
+  companyId: string;
+  projectId: string;
+  cwd: string;
+  actualUrl: string;
+  expectedRepoUrl: string;
+};
+
+/**
+ * Publish the origin-mismatch set and the count it was derived from (PEN-4188).
+ *
+ * The two are set TOGETHER, by one function, on purpose. They are a claim and
+ * its positive control, and the failure this guards against is publishing the
+ * claim without the control: an empty mismatch set from a pass that compared
+ * nothing is indistinguishable from a healthy estate, and reads as recovery on
+ * any threshold alert.
+ *
+ * Reset-then-set and NOT seeded, for the same reason as
+ * {@link setWorkspaceReuseRefusalWindowMetrics}: `project_workspace_id` is
+ * unbounded, so seeding would emit a zero series for every project workspace
+ * that has ever existed. The URLs are deliberately NOT labels -- they are
+ * unbounded strings and belong in the log line the reconciler emits beside
+ * this, which carries both in full.
+ */
+export function setProjectCheckoutOriginMismatchMetrics(
+  mismatches: ReadonlyArray<ProjectCheckoutOriginMismatchEntry>,
+  comparedCount: number,
+): void {
+  const registry = ensureRegistry();
+  const gauge = registry.projectCheckoutOriginMismatchGauge;
+  gauge.reset();
+  for (const mismatch of mismatches) {
+    if (!mismatch.projectWorkspaceId) continue;
+    gauge.set(
+      {
+        project_workspace_id: mismatch.projectWorkspaceId,
+        company_id: mismatch.companyId || "unknown",
+        project_id: mismatch.projectId || "unknown",
+      },
+      1,
+    );
+  }
+  registry.projectCheckoutOriginReconcileComparedGauge.set(
+    Number.isFinite(comparedCount) ? Math.max(0, comparedCount) : 0,
+  );
+}
+
+/** Mark whether the most recent project-checkout origin reconcile pass completed. */
+export function setProjectCheckoutOriginReconcileMetricsRefreshSuccess(success: boolean): void {
+  ensureRegistry().projectCheckoutOriginReconcileMetricsRefreshSuccessGauge.set(success ? 1 : 0);
 }
 
 /**
@@ -8359,6 +8493,9 @@ export function __resetMetricsForTest(): void {
   externalRuntimeReservationStrandedOldestAge = null;
   workspaceReuseRefusalWindow = null;
   workspaceReuseRefusalMetricsRefreshSuccess = null;
+  projectCheckoutOriginMismatch = null;
+  projectCheckoutOriginReconcileCompared = null;
+  projectCheckoutOriginReconcileMetricsRefreshSuccess = null;
   externalRuntimeReservationStrandMetricsRefreshSuccess = null;
   approvalsPending = null;
   approvalOldestPendingAge = null;

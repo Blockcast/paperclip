@@ -1234,6 +1234,85 @@ spec:
             summary: "Paperclip workspace-reuse-refusal metrics refresh is failing"
             description: "The workspace-reuse-refusal database sweep has failed for {{ .Values.prometheusRule.workspaceReuseRefusalMetricsRefreshFailureFor }} (PEN-3633), so PaperclipWorkspaceReuseRefusalEpisode is gated off and a broken project checkout would NOT page. This gauge is initialised to 0 at process start, so a replica that has never completed a sweep also fires this -- check whether the collector tick is running at all before assuming a query fault."
             runbook_url: {{ .Values.prometheusRule.workspaceReuseRefusalRunbookUrl | quote }}
+        - alert: PaperclipProjectCheckoutOriginMismatch
+          # PEN-4188 (PEN-3633 item 5, parent PEN-3628). DECISION THIS INFORMS:
+          # a project checkout is pointed at the WRONG REPOSITORY and a human
+          # must repoint or re-clone it, BEFORE any run is dispatched into it.
+          #
+          # EARLIER than PaperclipWorkspaceReuseRefusalEpisode above, and
+          # NARROWER. Earlier because that alert counts refusals, so it cannot
+          # fire until runs have already been spent failing -- PEN-3628 burned
+          # 33 of them over 8.6 h and was found by a manual board sweep ~3 h in.
+          # This one reads the checkout itself on a 5-minute timer and never
+          # waits on a dispatch, which matters because a project whose checkout
+          # is broken STOPS dispatching successfully: any detector that needed a
+          # new successful run would go quiet exactly as the fault got worse.
+          # Narrower because it sees only `origin_mismatch` -- episode 2 of the
+          # two measured episodes had the CORRECT origin and is structurally
+          # invisible here. The two are complements; do not retire either.
+          #
+          # NO COUNT THRESHOLD, unlike the refusal episode. That alert counts
+          # run failures, where a threshold separates an episode from one
+          # self-healing transient. This gauge is a direct observation of the
+          # checkout, so one disagreeing checkout is one fault and `== 1` is the
+          # honest predicate; `for:` is scrape-flap tolerance only.
+          #
+          # GATED ON THE POSITIVE CONTROL, which is the part that is easy to
+          # drop and expensive to omit. An absent mismatch series means "every
+          # checkout agrees" ONLY if the pass actually read some origins -- a
+          # pass that compared nothing (PVC unmounted, git missing, every
+          # project unprovisioned) produces the identical empty set. Hence both
+          # `..._reconcile_metrics_refresh_success == 1` (the pass completed)
+          # AND `..._reconcile_compared > 0` (it compared something), joined per
+          # replica on `instance` so one healthy replica cannot bless another's
+          # blind or stale snapshot. PaperclipProjectCheckoutOriginReconcileBlind
+          # below pages the case this gate silences.
+          expr: max by (project_workspace_id, company_id, project_id) (paperclip_project_checkout_origin_mismatch and on(instance) (paperclip_project_checkout_origin_reconcile_metrics_refresh_success == 1) and on(instance) (paperclip_project_checkout_origin_reconcile_compared > 0)) == 1
+          for: {{ .Values.prometheusRule.projectCheckoutOriginMismatchFor }}
+          labels:
+            severity: warning
+            paperclip_dedupe_domain: '{{`{{ $labels.project_workspace_id }}`}}'
+          annotations:
+            summary: "Paperclip project checkout for workspace {{`{{ $labels.project_workspace_id }}`}} is cloned from the wrong repository"
+            description: "The on-disk checkout backing project workspace {{`{{ $labels.project_workspace_id }}`}} (project {{`{{ $labels.project_id }}`}}, company {{`{{ $labels.company_id }}`}}) has a git origin that does not match the repository the workspace expects (PEN-4188). This is the PEN-3628 fault, caught before a run is dispatched into it rather than after. Both URLs in full, plus the cwd, are in the paperclip-api log line `project checkout origin does not match the project workspace repo_url` -- read that, do not guess from this annotation.\n\nONE broken checkout, not N broken issues: every issue bound to this project workspace resolves to the same directory, and worktrees do not escape it because a worktree's `.git` is a file pointing into the parent clone. Repair the checkout; do not triage, reassign or cancel the issues.\n\nDo NOT diagnose this with `git remote -v`. The shared /paperclip/.gitconfig rewrites https://github.com/Blockcast/ to SSH at transport time, so `remote -v` prints a different URL from the stored config on most healthy checkouts and will mislead you in both directions. Read `git config --get remote.origin.url`, which is what the reconciler compares."
+            runbook_url: {{ .Values.prometheusRule.projectCheckoutOriginRunbookUrl | quote }}
+        - alert: PaperclipProjectCheckoutOriginReconcileBlind
+          # PEN-4188. The positive control, as its own page.
+          #
+          # This is NOT redundant with the refresh-failure alert below. That one
+          # fires when the pass THREW; this one fires when the pass SUCCEEDED
+          # and compared nothing, which is the silent half and the one that
+          # looks exactly like a healthy estate on every other surface. Without
+          # it, "no mismatch series" is an unverified zero.
+          #
+          # `max()` across replicas, not `min()`: fire only when EVERY fresh
+          # replica compared nothing, i.e. the detector is estate-wide blind.
+          # One blind replica beside a working one is a lesser condition and
+          # already degrades the mismatch alert's coverage rather than its
+          # correctness, because that alert gates per replica.
+          expr: max(paperclip_project_checkout_origin_reconcile_compared and on(instance) (paperclip_project_checkout_origin_reconcile_metrics_refresh_success == 1)) == 0
+          for: {{ .Values.prometheusRule.projectCheckoutOriginReconcileBlindFor }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Paperclip project-checkout origin reconciler compared zero checkouts"
+            description: "The origin reconciler completed its pass but read an origin from NO project checkout (PEN-4188), so PaperclipProjectCheckoutOriginMismatch is gated off and a repointed checkout would NOT page. The detector is blind, not clear -- an empty mismatch set in this state carries no information. Check that the project data volume is mounted at PAPERCLIP_HOME in the control-plane pods, that `git` is on PATH in the image, and that /paperclip/instances/<instance>/projects still holds the managed checkouts. A fleet with genuinely zero provisioned git-backed project workspaces would also read 0 here; confirm against `select count(*) from project_workspaces where repo_url is not null` before treating it as a defect."
+            runbook_url: {{ .Values.prometheusRule.projectCheckoutOriginRunbookUrl | quote }}
+        - alert: PaperclipProjectCheckoutOriginReconcileMetricsRefreshFailed
+          # PEN-4188. Strand alert for the two gauges above. A failed pass
+          # leaves the previous snapshot in place rather than zeroing it
+          # (zeroing would read as "every checkout is correct now", the one
+          # conclusion a failed pass cannot support), so the freshness gate
+          # drops the stale series out of both alerts and this one pages the
+          # pass instead.
+          expr: paperclip_project_checkout_origin_reconcile_metrics_refresh_success == 0
+          for: {{ .Values.prometheusRule.projectCheckoutOriginReconcileMetricsRefreshFailureFor }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Paperclip project-checkout origin reconcile pass is failing"
+            description: "The project-checkout origin reconcile pass has failed for {{ .Values.prometheusRule.projectCheckoutOriginReconcileMetricsRefreshFailureFor }} (PEN-4188), so PaperclipProjectCheckoutOriginMismatch is gated off and a repointed checkout would NOT page. This gauge is initialised to 0 at process start and the reconciler sweeps every 5 minutes, so a replica that has never completed a pass also fires this -- check whether the reconciler is running at all before assuming a database fault."
+            runbook_url: {{ .Values.prometheusRule.projectCheckoutOriginRunbookUrl | quote }}
         - alert: PaperclipExternalRuntimeReservationStrandMetricsRefreshFailed
           # Separate from the strand alert for the same reason the queued-run
           # pair is separate: a failed refresh means the age is not fresh, not
