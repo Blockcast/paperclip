@@ -6905,13 +6905,35 @@ export function recoveryService(
           // is the tolerance this call site already accepts, and it is strictly better than
           // dropping the only announcement the row will ever get.
           try {
-            const confirmed = await recoveryActionsSvc.getActiveForIssue(
+            // PEN-4159 (Ally review of #2743): keyed on the ACTION, not on the issue. The
+            // previous read was `getActiveForIssue(companyId, issue.id)`, which asks "what is
+            // this issue's most recently updated active-or-escalated action?" and then
+            // recovers identity by comparing ids. That returns our row only because a partial
+            // unique index — `issue_recovery_actions_active_source_uq` (migration 0097),
+            // `UNIQUE (company_id, source_issue_id) WHERE status IN ('active','escalated')` —
+            // admits at most one such row per issue, so the `ORDER BY updated_at DESC LIMIT 1`
+            // has nothing to choose between and a sibling cannot outrank us.
+            //
+            // That invariant holds today and this change is behaviour-preserving while it
+            // does (`recovery-expired-wake-horizon.test.ts` pins it, so a migration that
+            // relaxes the predicate fails there rather than here). It is still the wrong
+            // question to ask: the correctness of a silence-critical confirm should not rest
+            // on an index 150 migrations away that neither the read nor this call site names.
+            // Keyed on the id it rests on nothing — and the failure direction if that
+            // invariant ever did break is the one this lineage exists to prevent, a
+            // retirement that committed and announced nothing (PEN-3989).
+            const confirmed = await recoveryActionsSvc.getById(
               input.issue.companyId,
-              input.issue.id,
+              input.action.id,
             );
             // PEN-4033: identity only. The bound comparison that used to live here has moved
             // into the gate below, where it is applied to BOTH sources uniformly — and where
             // it reads the row's bound rather than the one this call meant to write.
+            //
+            // PEN-4159: KEPT, though the read above now makes it redundant by construction.
+            // It costs one comparison and it is the only thing standing between a future
+            // mis-keyed read and an announce about someone else's row; a read being exact is
+            // not a licence to stop checking that it was.
             if (confirmed?.id === input.action.id) retiredRow = confirmed;
           } catch (confirmError) {
             logger.warn(

@@ -512,6 +512,39 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
     }
   }
 
+  /**
+   * The one row with this id, in this company — no status filter and no ordering, because
+   * neither can change which row an id selects.
+   *
+   * PEN-4159 (Ally review of #2743): added for the horizon confirm arm, which needs to ask
+   * "is MY action retired?" and had only `getActiveForIssue` to ask it with. That read is
+   * keyed on the ISSUE, so the caller had to recover identity afterwards by comparing ids —
+   * and whether the row it returns IS the caller's depends on a partial unique index
+   * (`issue_recovery_actions_active_source_uq`, migration 0097) that the read itself never
+   * mentions. Today that index holds, so the two reads agree; see the confirm arm for why
+   * asking the exact question anyway is worth a function.
+   *
+   * Deliberately unfiltered by status. The confirm arm's gate already demands
+   * `status === "escalated"`, which is strictly narrower than
+   * `ACTIVE_RECOVERY_ACTION_STATUSES`, so filtering here would only hide a row the caller
+   * must inspect to reject — and hiding it makes "no such action" and "that action is no
+   * longer escalated" indistinguishable at the call site.
+   */
+  async function getById(companyId: string, id: string): Promise<IssueRecoveryAction | null> {
+    const row = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          eq(issueRecoveryActions.companyId, companyId),
+          eq(issueRecoveryActions.id, id),
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    return row ? toReadModel(row) : null;
+  }
+
   async function getActiveForIssue(companyId: string, sourceIssueId: string): Promise<IssueRecoveryAction | null> {
     const row = await db
       .select()
@@ -1696,6 +1729,7 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
   }
 
   return {
+    getById,
     getActiveForIssue,
     listActiveForIssues,
     resolveActiveForIssue,
