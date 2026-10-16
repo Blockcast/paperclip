@@ -37,6 +37,7 @@
 import type { EvidenceShape } from "./evidence-shapes.js";
 import { evaluateCommentReviewGate } from "./pr-comment-review-gate.js";
 import {
+  allyVerdictReviewerLane,
   countAllyDeferredPriorFindings,
   extractAllyReviewedHeadSha,
   hasActionablePrReviewFeedback,
@@ -154,6 +155,17 @@ export interface GithubTruthDeps {
   fetchPrAuthorLogin(ref: {
     repoFullName: string;
     prNumber: number;
+    signal?: AbortSignal;
+  }): Promise<string | null>;
+  /**
+   * The git author email on one commit (BLO-43550). Keyed on a SHA rather than
+   * a PR number: it answers which lane wrote the tree being judged, which the
+   * PR-level author cannot, because every agent PR here carries the same shared
+   * App login.
+   */
+  fetchCommitAuthorEmail(ref: {
+    repoFullName: string;
+    sha: string;
     signal?: AbortSignal;
   }): Promise<string | null>;
   reviewerBotLogin: string;
@@ -278,25 +290,79 @@ async function probeOne(
       ],
       headSha: normalizedHead,
       reviewerBotLogin: deps.reviewerBotLogin,
-      // Mirrors the gate's own `null` (BLO-34389), for the reason spelled out
-      // at its call site in `pr-comment-review-gate.ts`: the token space is
-      // settled but no producer emits `reviewer` yet. This probe must not
-      // diverge from the gate it exists to predict — a lane the gate does not
-      // supply would make this surface vouch differently from the status it is
-      // checking, so this stays `null` until the gate's own fetch lands.
-      prAuthorLane: null,
     };
-    let commentVerdict = evaluateCommentReviewGate({ ...commentInput, prAuthorLogin: null });
+    // Both extra author facts the gate reads, resolved in ONE step.
+    //
+    // `prAuthorLane` is BLO-43550, mirroring the gate's own fetch with the gate's
+    // own gate — a DECLARED `reviewer` in the corpus, not the verdict outcome —
+    // so that while no producer emits one this costs zero extra calls here too.
+    //
+    // CONCURRENT, and that is load-bearing rather than tidy. Serialized this
+    // would make the would-be-`clean` chain gate → head → surfaces → lane →
+    // author, a FIFTH serial call, and `MAX_SERIAL_CALLS` is pinned STRICTLY
+    // against `PROBE_DEADLINE_MS` at exactly the boundary (4 x 1800 = 7200 =
+    // 8000 x 0.9). A fifth would have to buy itself room by cutting per-call
+    // patience, and a deadline loss discards every PR's result rather than the
+    // slow one. Run together they are one step and the pinned chain is unmoved.
+    //
+    // Deciding BOTH conditions off the author-blind verdict is safe because
+    // `authorUnknown` is INVARIANT under the lane re-evaluation: it is carried
+    // from `withheldPositive`, computed from the at-head attestation and
+    // `prAuthorLogin` alone, which never consults the lane — the lane can only
+    // add carried findings. So this reads the same author the serial form would
+    // have, and the gate's serial form and this concurrent one issue the same
+    // calls for the same corpus.
+    const laneDeclared = commentInput.comments.some((c) => allyVerdictReviewerLane(c.body) !== null);
+    let commentVerdict = evaluateCommentReviewGate({
+      ...commentInput,
+      prAuthorLogin: null,
+      prAuthorLane: null,
+    });
     // `authorUnknown` marks every outcome the author could still change. Gating
     // on `outcome` instead would miss the carried-finding route, and `clean` is
     // unreachable author-blind by construction.
-    if ("authorUnknown" in commentVerdict && commentVerdict.authorUnknown) {
-      const prAuthorLogin = await readPrAuthor();
-      if (prAuthorLogin) {
-        commentVerdict = evaluateCommentReviewGate({ ...commentInput, prAuthorLogin });
+    const authorUnknown = "authorUnknown" in commentVerdict && Boolean(commentVerdict.authorUnknown);
+    if (laneDeclared || authorUnknown) {
+      const [prAuthorLane, prAuthorLogin] = await Promise.all([
+        laneDeclared
+          ? deps.fetchCommitAuthorEmail({
+              repoFullName: call.repoFullName,
+              sha: normalizedHead,
+              signal: sig(),
+            })
+          : Promise.resolve(null),
+        authorUnknown ? readPrAuthor() : Promise.resolve(null),
+      ]);
+      // Fail CLOSED on an unread lane, the same discipline as `readPrAuthor` and
+      // for the mirror-image reason. A null lane CREDITS the retirement, so
+      // where the corpus declares one and we could not read it this surface
+      // could vouch `clean` while the gate — reading the lane successfully —
+      // publishes `failure`. Over-vouching is the one direction a probe whose
+      // premise is that it never fabricates a pass must not take.
+      //
+      // RETURN, rather than only setting `failed` — which does not withhold the
+      // vouch and so did not fail closed at all (Ally review of #2498). Nothing
+      // downstream reads `failed`: `out.clean` below never consults it, the
+      // aggregator treats `probeFailed` as suppressing the escalation branch and
+      // not the `pass` path, and `evidence-gate` reads it as "could not ask" and
+      // uses it to DEMOTE an unlabeled block to a warn. So on the one route
+      // where the lane changes the verdict — a retirement this lane would refuse,
+      // beside a formal review attesting this head without the `## Ally` heading
+      // (the Surface-2-only population below) — an unread lane left this probe
+      // vouching `clean` against a gate publishing `failure`, and softened the
+      // unlabeled-block gate while it did so.
+      //
+      // Early return costs nothing: `PerPr` carries no redder-than-clean field,
+      // so the re-evaluation below can only lower `out.clean`, which is already
+      // false here. Same shape as the `head_sha` and `surfaces` returns above.
+      if (laneDeclared && !prAuthorLane) {
+        out.failed = true;
+        out.diagnostics.push(`github-truth-probe-failed:commit_author_lane:${tag}`);
+        return out;
       }
-      // else: the verdict stays at the withheld positive, so this surface
-      // cannot vouch. `readPrAuthor` has already set `failed` and reported it.
+      commentVerdict = evaluateCommentReviewGate({ ...commentInput, prAuthorLogin, prAuthorLane });
+      // A null `prAuthorLogin` leaves the verdict at the withheld positive, so
+      // this surface cannot vouch; `readPrAuthor` has already set `failed`.
     }
     const commentClean = commentVerdict.state === "success" && commentVerdict.outcome === "clean";
     // `blocking_finding` and `carried_finding` — the two outcomes that make the

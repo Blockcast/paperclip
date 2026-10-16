@@ -20,6 +20,7 @@ const mockListComments = vi.hoisted(() => vi.fn());
 const mockListReviews = vi.hoisted(() => vi.fn());
 const mockFetchHeadSha = vi.hoisted(() => vi.fn());
 const mockFetchPrAuthor = vi.hoisted(() => vi.fn());
+const mockFetchCommitAuthorEmail = vi.hoisted(() => vi.fn());
 const mockPostStatus = vi.hoisted(() => vi.fn());
 const mockPostCheckRun = vi.hoisted(() => vi.fn());
 const mockStatusDeliveryLock = vi.hoisted(() => vi.fn());
@@ -32,6 +33,7 @@ vi.mock("../services/github-app-auth.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../services/github-app-auth.js")>()),
   githubFetchPrHeadSha: mockFetchHeadSha,
   githubFetchPrAuthorLogin: mockFetchPrAuthor,
+  githubFetchCommitAuthorEmail: mockFetchCommitAuthorEmail,
   githubListIssueCommentsWithTimestamps: mockListComments,
   githubListPrReviewsWithTimestamps: mockListReviews,
   githubPostCommitStatusDetailed: mockPostStatus,
@@ -92,6 +94,7 @@ beforeEach(() => {
   mockListReviews.mockReset();
   mockFetchHeadSha.mockReset();
   mockFetchPrAuthor.mockReset();
+  mockFetchCommitAuthorEmail.mockReset();
   mockPostStatus.mockReset();
   mockPostCheckRun.mockReset();
   mockStatusDeliveryLock.mockReset();
@@ -102,6 +105,16 @@ beforeEach(() => {
   // A PR author who is not the reviewer identity, so the existing fixtures keep
   // their meaning; the self-attestation tests override it (BLO-34316).
   mockFetchPrAuthor.mockResolvedValue("some-contributor");
+  // Throws rather than resolving, so a future lane-declaring case that forgets
+  // to stub it fails loudly and IMMEDIATELY. Left unstubbed it resolves
+  // `undefined`, which is `== null`, so it burned 1.25 s of real sleep in
+  // `withBoundedRetry` and then took the credit-the-retirement path — the one
+  // outcome a lane test must never reach by accident. `withBoundedRetry` does
+  // not catch, so a throw costs neither a retry nor a sleep (Ally review of
+  // #2498). Matches the same dep's default in `evidence-truth.test.ts`.
+  mockFetchCommitAuthorEmail.mockImplementation(() => {
+    throw new Error("githubFetchCommitAuthorEmail: this case declares a reviewer lane and did not stub the fetch");
+  });
   mockPostCheckRun.mockResolvedValue({ ok: true, statusCode: 201 });
 });
 
@@ -1299,5 +1312,160 @@ describe("ci/ally-head-attested schedule signal", () => {
       expect(run(AUTHOR, [cleanAt(HEAD)])).toMatchObject({ outcome: "clean" });
       expect(run(AUTHOR, [cleanAt(HEAD)])).not.toHaveProperty("headAttested");
     });
+  });
+});
+
+/**
+ * The author-lane fetch (BLO-43550).
+ *
+ * BLO-34389 shipped `prAuthorLane` exercised by tests in
+ * `pr-comment-review-gate.test.ts` and hardcoded `null` at every production
+ * call site, so the exclusion could not fire against a real review. These cases
+ * cover the ORCHESTRATION that supplies it — which lives in
+ * `runPrCommentReviewGateCheck`, not in the pure evaluator — and so they live
+ * here, in the suite that already stubs the network, rather than in the pure
+ * suite BLO-43550's verifying signal names. That suite has no mocks at all by
+ * design, and a stubbed commit fetch is exactly what these need.
+ *
+ * ⚠ What this control does and does not do. `reviewer` is a SELF-DECLARATION.
+ * These cases pin that the gate reads a declared lane and refuses a retirement
+ * matching the head commit's author — they do not pin, and the feature does not
+ * provide, any obstacle to an author that omits or misspells the field. The
+ * ceiling is pinned directly in the pure suite ("credits an author-lane
+ * retirement that declares no lane at all").
+ */
+describe("author-lane fetch (BLO-43550)", () => {
+  const AUTHOR_LANE = "staff-engineer@paperclip.blockcast.net";
+  const OTHER_LANE = "ally@paperclip.blockcast.net";
+  const OLD_HEAD = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const INTERMEDIATE_HEAD = "cccccccccccccccccccccccccccccccccccccccc";
+
+  /** Ally raising one Important finding at `headSha`. */
+  const blockingAt = (headSha: string, createdAt: string) => ({
+    login: "allyblockcast[bot]",
+    body: `## Ally — Consolidated PR Review\nReviewed head: ${headSha}\n### Important Issues (1)\nFix before merge.`,
+    createdAt,
+  });
+
+  /**
+   * Ally retiring `priorHeadSha`'s finding, optionally declaring `lane` as the
+   * review's own author.
+   *
+   * The structured block must AGREE with the prose beside it — head, counts and
+   * ledger alike — or `parseAllyVerdictBlock` fails closed on the disagreement
+   * and these cases would be measuring that instead of the lane.
+   */
+  const retiringAt = (headSha: string, priorHeadSha: string, lane: string | null, createdAt: string) => ({
+    login: "allyblockcast[bot]",
+    body: [
+      "## Ally — Consolidated PR Review",
+      "",
+      "<!-- ally-verdict:1",
+      JSON.stringify({
+        head: headSha,
+        findings: { critical: 0, important: 0 },
+        dispositions: [{ head: priorHeadSha.slice(0, 7), severity: "important", index: 1, verb: "fixed" }],
+        ...(lane === null ? {} : { reviewer: lane }),
+      }),
+      "-->",
+      "",
+      `Reviewed head: ${headSha}`,
+      "### Prior Findings Dispositioned (1)",
+      `- **prior:${priorHeadSha.slice(0, 7)} important 1** — fixed — re-checked against this head.`,
+      "### Critical Issues (0)",
+      "### Important Issues (0)",
+    ].join("\n"),
+    createdAt,
+  });
+
+  /** A finding raised at OLD_HEAD and retired at INTERMEDIATE_HEAD, judged at TARGET.headSha. */
+  const carryThenRetire = (lane: string | null) => [
+    blockingAt(OLD_HEAD, "2026-08-04T20:09:19Z"),
+    retiringAt(INTERMEDIATE_HEAD, OLD_HEAD, lane, "2026-08-04T21:09:19Z"),
+  ];
+
+  beforeEach(() => {
+    mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
+  });
+
+  // THE END-TO-END AC. The head commit is authored by lane L and the review
+  // retiring the only carried finding declares `reviewer: L`, so the retirement
+  // is refused and the gate stays red — the production behaviour BLO-34389
+  // could not reach with `prAuthorLane` hardcoded.
+  it("refuses a retirement declaring the head commit author's own lane", async () => {
+    mockListComments.mockResolvedValue(carryThenRetire(AUTHOR_LANE));
+    mockFetchCommitAuthorEmail.mockResolvedValue(AUTHOR_LANE);
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({
+      posted: true,
+      verdict: { state: "failure", outcome: "carried_finding", carriedFromHeadSha: OLD_HEAD },
+    });
+    expect(mockFetchCommitAuthorEmail).toHaveBeenCalledWith(
+      expect.objectContaining({ repoFullName: TARGET.repoFullName, sha: TARGET.headSha }),
+    );
+    // The description has to name the refused retirement. A reader who sees
+    // only this string must not be told the head is merely unattested — that is
+    // true of the head and false about the cause, and it routes the author into
+    // posting another comment rather than reopening the finding.
+    expect(mockPostStatus.mock.calls[0][0].description).toContain("the PR author's own lane");
+  });
+
+  // THE NEGATIVE CONTROL, and the reason this cannot be a login comparison.
+  // Byte-identical to the case above but for the declared lane: same comments,
+  // same timestamps, same single `allyblockcast[bot]` login on both sides. A
+  // gate that reds this one has no route to green at all (BLO-29711).
+  it("still retires when the review declares a lane other than the commit author's", async () => {
+    mockListComments.mockResolvedValue(carryThenRetire(OTHER_LANE));
+    mockFetchCommitAuthorEmail.mockResolvedValue(AUTHOR_LANE);
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({
+      posted: true,
+      verdict: { state: "success", outcome: "not_evaluated" },
+    });
+  });
+
+  // THE ZERO-EXTRA-CALLS AC, as a test rather than a claim. The fetch is gated
+  // on a DECLARED lane, not on the verdict outcome, so until a producer emits
+  // `reviewer` this costs nothing — which is what lets the consumer land ahead
+  // of the producer with no ordering constraint in either direction.
+  //
+  // Reverting that gate to an unconditional fetch fails here and only here.
+  it("issues no commit fetch when no comment declares a lane", async () => {
+    mockListComments.mockResolvedValue(carryThenRetire(null));
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({ posted: true });
+    expect(mockFetchCommitAuthorEmail).not.toHaveBeenCalled();
+  });
+
+  // An unreadable fetch leaves the lane `null`, which CREDITS the retirement —
+  // today's behaviour, and the anti-deadlock direction. Refusing on an unknown
+  // author instead would red every open PR whose finding Ally has retired.
+  it("credits the retirement when the commit fetch cannot be read", async () => {
+    mockListComments.mockResolvedValue(carryThenRetire(AUTHOR_LANE));
+    mockFetchCommitAuthorEmail.mockResolvedValue(null);
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({
+      posted: true,
+      verdict: { state: "success", outcome: "not_evaluated" },
+    });
+  });
+
+  // The other half of that AC, and the direction this module must not get
+  // wrong: a red already justified author-blind must still PUBLISH when the
+  // lane fetch fails. The fetch sits after the author-blind pass precisely so
+  // an unreadable `GET` can never turn a finding into silence.
+  it("publishes a red the author-blind pass justified even when the commit fetch fails", async () => {
+    mockListComments.mockResolvedValue([
+      ...carryThenRetire(AUTHOR_LANE),
+      blockingAt(TARGET.headSha, "2026-08-04T22:09:19Z"),
+    ]);
+    mockFetchCommitAuthorEmail.mockResolvedValue(null);
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({
+      posted: true,
+      verdict: { state: "failure", outcome: "blocking_finding" },
+    });
+    expect(mockFetchCommitAuthorEmail).toHaveBeenCalled();
+    expect(mockPostStatus.mock.calls[0][0]).toMatchObject({ state: "failure" });
   });
 });
