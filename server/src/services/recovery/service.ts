@@ -9721,6 +9721,12 @@ export function recoveryService(
       // optimisation removed, which turns its saving from a projection into a reading.
       pauseHoldPrefilterLiveReads: 0,
       pauseHoldPrefilterMemoHits: 0,
+      // PEN-3636 increment 2: the company-scoped reads the pause-hold GATE skipped because
+      // the prefilter handed it the rows. Separate from the pair above because it counts a
+      // different query at a different call site — see `ActivePauseHoldPrefilterStats`.
+      // Without it the increment is unobservable: the two counters above are unchanged by
+      // it, so a post-merge reading of them alone would say nothing happened.
+      pauseHoldGateReadsAvoided: 0,
       // Company-scoped agent-roster reads taken vs answered from the per-pass memo
       // (PEN-3636). Counts the SECOND of the two round-trips `agentInvokabilityEvaluated`
       // sizes; the first (`getAgent`, keyed by agent id) is not memoised and still runs
@@ -11448,6 +11454,7 @@ export function recoveryService(
     result.candidatesScanned = candidates.length;
     result.pauseHoldPrefilterLiveReads = pauseHoldPrefilterStats.liveReads;
     result.pauseHoldPrefilterMemoHits = pauseHoldPrefilterStats.memoHits;
+    result.pauseHoldGateReadsAvoided = pauseHoldPrefilterStats.gateReadsAvoided;
     result.agentRosterMemoLiveReads = agentRosterMemoStats.liveReads;
     result.agentRosterMemoHits = agentRosterMemoStats.memoHits;
     const attendancePrefetchStats = attendancePrefetch.stats();
@@ -11461,6 +11468,7 @@ export function recoveryService(
         agentInvokabilityEvaluated: result.agentInvokabilityEvaluated,
         pauseHoldPrefilterLiveReads: result.pauseHoldPrefilterLiveReads,
         pauseHoldPrefilterMemoHits: result.pauseHoldPrefilterMemoHits,
+        pauseHoldGateReadsAvoided: result.pauseHoldGateReadsAvoided,
         agentRosterMemoLiveReads: result.agentRosterMemoLiveReads,
         agentRosterMemoHits: result.agentRosterMemoHits,
         attendancePrefetchLiveReads: result.attendancePrefetchLiveReads,

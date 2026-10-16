@@ -762,6 +762,58 @@ describeEmbeddedPostgres("issueTreeControlService", () => {
     expect(await treeSvc.hasAnyActivePauseHold(otherCompanyId)).toBe(false);
   });
 
+  // PEN-3636 increment 2: the gate takes the company-scoped rows as a parameter so a sweep
+  // can read them once instead of once per candidate. Against real SQL this test asks two
+  // things a mocked service cannot: that `listActivePauseHolds` returns what the gate's own
+  // inlined query used to, and that passing them actually REPLACES that query.
+  //
+  // The second is proved by divergence, which is the only way to prove it. Equivalence
+  // ("same answer with and without") is satisfied just as well by a gate that ignores the
+  // parameter entirely and re-reads — so it would pass against the unoptimised code and
+  // measure nothing. Handing the gate a list that disagrees with the database is therefore
+  // the point of the test, not a misuse of the API.
+  it("honours preloaded active pause holds instead of re-reading them", async () => {
+    const companyId = randomUUID();
+    const heldRootIssueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values({
+      id: heldRootIssueId,
+      companyId,
+      title: "Paused tree root",
+      status: "todo",
+      priority: "medium",
+    });
+
+    const treeSvc = issueTreeControlService(db);
+    await treeSvc.createHold(companyId, heldRootIssueId, {
+      mode: "pause",
+      reason: "board paused this tree",
+      actor: { actorType: "user", actorId: "board-user", userId: "board-user" },
+    });
+
+    // The extracted read returns the gate's own projection, against real SQL.
+    const holds = await treeSvc.listActivePauseHolds(companyId);
+    expect(holds).toHaveLength(1);
+    expect(holds[0]).toMatchObject({ rootIssueId: heldRootIssueId });
+
+    // Supplying them reaches the same verdict as the live read it replaces.
+    expect(
+      await treeSvc.getActivePauseHoldGate(companyId, heldRootIssueId, db, holds),
+    ).not.toBeNull();
+
+    // ...and the live read is genuinely skipped: an empty preloaded list wins over a
+    // database that does hold this very tree. If the gate re-read, this would be non-null.
+    expect(await treeSvc.getActivePauseHoldGate(companyId, heldRootIssueId, db, [])).toBeNull();
+    // Control: omitting the parameter still reads live, so the row above is really there.
+    expect(await treeSvc.getActivePauseHoldGate(companyId, heldRootIssueId)).not.toBeNull();
+  });
+
   // BLO-3855: in-txn callers must route via tx, not the outer pool, or FOR UPDATE locks deadlock the pool. Visibility of uncommitted writes inside the same txn proves tx was used.
   it("routes getActivePauseHoldGate through tx so callers see uncommitted txn state", async () => {
     const companyId = randomUUID();
