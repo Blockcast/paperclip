@@ -148,8 +148,8 @@ jobs:
     #
     # `gh` on arc-light has in-repo precedent: commitperclip-review.yml runs
     # `gh api` on arc-light with GH_TOKEN: ${{ github.token }} (its job at
-    # `runs-on: arc-light`, querying `repos/.../pulls/<n>`).
-    runs-on: arc-light
+    # `runs-on: arc-paperclip-light`, querying `repos/.../pulls/<n>`).
+    runs-on: arc-paperclip-light
     timeout-minutes: 5
     outputs:
       pretested: ${{ steps.check.outputs.pretested }}

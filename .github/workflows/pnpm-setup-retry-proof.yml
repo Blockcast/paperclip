@@ -38,7 +38,7 @@ jobs:
   # So asserting outcome == 'failure' against an unreachable registry proves the
   # gating works, with no dependency on how fast anything ran.
   gating_actually_evaluates:
-    runs-on: arc-light
+    runs-on: arc-paperclip-light
     timeout-minutes: 15
     steps:
       - name: Checkout repository
@@ -88,7 +88,7 @@ jobs:
 
   # End-to-end: attempt one fails, attempt two succeeds, pnpm ends up on PATH.
   recovers_on_the_second_attempt:
-    runs-on: arc-light
+    runs-on: arc-paperclip-light
     timeout-minutes: 15
     steps:
       - name: Checkout repository

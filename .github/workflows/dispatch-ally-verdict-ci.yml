@@ -69,7 +69,7 @@ jobs:
       github.event.comment.user.type == 'User' && github.event.comment.user.login != 'allyblockcast' &&
       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) &&
       contains(github.event.comment.body, '/test')
-    runs-on: arc-light
+    runs-on: arc-paperclip-light
     timeout-minutes: 5
     permissions:
       contents: read
@@ -102,7 +102,7 @@ jobs:
       github.event.workflow_run.run_attempt == 1 && github.event.workflow_run.conclusion == 'failure')
       || (github.event_name == 'workflow_dispatch')
       || (github.event_name == 'issue_comment' && needs.manual_request.outputs.manual == 'true'))
-    runs-on: arc-light
+    runs-on: arc-paperclip-light
     # A hang detector: one checkout, one Node setup, about six API calls.
     timeout-minutes: 10
     # Per PR, never cancelling a running job: B and S success for one head

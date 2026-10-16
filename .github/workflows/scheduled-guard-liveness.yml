@@ -263,7 +263,7 @@ permissions:
 jobs:
   check-guard-liveness:
     name: scheduled guards have executed recently
-    runs-on: arc-light
+    runs-on: arc-paperclip-light
     timeout-minutes: 10
     steps:
       - name: Checkout repository

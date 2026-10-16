@@ -307,7 +307,7 @@ jobs:
   # (ally-verdict-gate.test.mjs enforces all of it).
   ally_verdict_backstop:
     name: Ally verdict backstop (held heavy CI)
-    runs-on: arc-light
+    runs-on: arc-paperclip-light
     # A hang detector: up to 4 GraphQL pages and 10 dispatches.
     timeout-minutes: 10
     permissions:
