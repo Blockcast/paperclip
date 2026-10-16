@@ -72,7 +72,7 @@ jobs:
     # those two together. No workflow in this repo uses a GitHub-hosted runner.
     # Adding one is a fleet-routing and billing decision, not a detail of this
     # lane, so this takes the lightest allowed pool instead. See BLO-34222.
-    runs-on: arc-light
+    runs-on: arc-paperclip-light
     timeout-minutes: 25
 
     steps:

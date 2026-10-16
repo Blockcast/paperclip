@@ -62,7 +62,7 @@ env:
 
 jobs:
   review:
-    runs-on: arc-light
+    runs-on: arc-paperclip-light
     # ARC runners have no warm toolcache, so setup-node's download plus
     # Dependency Review can exceed a tight 5-min cap and cancel the job (the
     # cancelled job surfaces as a red `review` check). 10 min gives headroom

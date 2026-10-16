@@ -73,7 +73,7 @@ concurrency:
 
 jobs:
   classify:
-    runs-on: arc-light
+    runs-on: arc-paperclip-light
     timeout-minutes: 5
     steps:
       # Checkout the base branch explicitly, never the PR's own ref: this

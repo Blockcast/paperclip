@@ -38,7 +38,7 @@ jobs:
   policy:
     # A merge-group is the sole landing candidate and must not wait behind the
     # pull-request review backlog that saturates arc-light.
-    runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-light' }}
+    runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-paperclip-light' }}
     # THIS IS A HANG DETECTOR, NOT A PERFORMANCE BUDGET.
     # Sized by the BLO-35615 rule. Do NOT re-tune it from observed durations.
     #
@@ -1211,7 +1211,7 @@ jobs:
   # chart already fails the required check without any `policy` coupling.
   helm_chart:
     name: Helm chart
-    runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-light' }}
+    runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-paperclip-light' }}
     # HANG DETECTOR, NOT A PERFORMANCE BUDGET. BLO-35615 rule; do NOT re-tune
     # from observed durations. W95 = 277 CPU-seconds (p95 counter delta of
     # container_cpu_usage_seconds_total{container="runner"} over the job,
@@ -1955,7 +1955,7 @@ jobs:
     # tsconfig project references (see pnpm-workspace.yaml), so nothing else
     # in CI compiles or exercises it. Without this job it is dead-lettered.
     name: Vendored claude_k8s adapter
-    runs-on: arc-light
+    runs-on: arc-paperclip-light
     # HANG DETECTOR, NOT A PERFORMANCE BUDGET. BLO-35615 rule; do NOT re-tune
     # from observed durations. W95 = 210 CPU-seconds (p95 counter delta of
     # container_cpu_usage_seconds_total{container="runner"} over the job,
@@ -2064,7 +2064,7 @@ jobs:
     # it. Vendoring without this job would REMOVE review coverage rather than
     # add it — the in-stage `npm test` in the Dockerfile runs two files.
     name: Vendored opencode_k8s adapter
-    runs-on: arc-light
+    runs-on: arc-paperclip-light
     # HANG DETECTOR, NOT A PERFORMANCE BUDGET. BLO-35615 rule. No W95 series
     # exists for this job yet — it is new — so this is NOT derived from the
     # primary form. It is set equal to its claude sibling, which runs the same
@@ -2173,7 +2173,7 @@ jobs:
     # BLO-22428: merge_group traffic must not wait behind the pull_request
     # backlog that saturates arc-light; same routing as `policy` and `verify`.
     # The merge_group path is a bare `exit 0`.
-    runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-light' }}
+    runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-paperclip-light' }}
     # Measured nowhere yet (new job); a hang detector, not a budget. The work
     # is a Node setup plus three paginated reads, each bounded by the action's
     # own 20s timeout and 3 attempts.
@@ -2323,7 +2323,7 @@ jobs:
         vendor_opencode_k8s,
         ally_verdict,
       ]
-    runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-light' }}
+    runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-paperclip-light' }}
     # BLO-28999: the failure path below adds checkout + Node setup + up to N+1
     # API round trips, and it runs precisely when the pool is saturated. At the
     # previous 5 minutes a slow classify step could time `verify` out and lose

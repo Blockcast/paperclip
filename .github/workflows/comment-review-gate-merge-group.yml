@@ -54,7 +54,7 @@ jobs:
     # this is the precedented pool for a merge_group job that is not pr.yml,
     # and it leaves the dedicated queue pool's exclusivity intact rather than
     # asking a runner admin to widen it.
-    runs-on: arc-light
+    runs-on: arc-paperclip-light
     # The job itself is three API calls, but ARC runners start cold and the
     # checkout dominates. 10 matches the floor the rest of this repo settled on
     # rather than inventing a tighter budget for one job.
