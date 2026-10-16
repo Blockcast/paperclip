@@ -93,6 +93,9 @@ export const issueBlockedInboxAttentionSchema = z.object({
   recoveryIssue: issueBlockedInboxIssueRefSchema.nullable(),
   approvalId: z.string().uuid().nullable(),
   interactionId: z.string().uuid().nullable(),
+  // PEN-4193: this object is `.strict()`, so the key has to be admitted here or the whole
+  // attention payload is REJECTED rather than merely stripped of the new field.
+  overdueInteractionId: z.string().uuid().nullable(),
   sampleIssueIdentifier: z.string().nullable(),
   redaction: z.object({
     externalDetailsRedacted: z.boolean(),

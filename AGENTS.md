@@ -227,6 +227,46 @@ When adding endpoints:
 - write activity log entries for mutations
 - return consistent HTTP errors (`400/401/403/404/409/422/500`)
 
+### Enumerating outstanding human-asks (PEN-4193)
+
+There are exactly two company-wide enumerations of pending interaction cards, and an agent
+seat can reach only one of them:
+
+| surface | agent seat | ages pending cards? |
+|---|---|---|
+| `GET /companies/:id/attention` | **403 `Board access required`** | no |
+| `GET /companies/:id/issues?attention=blocked` | works | **yes, see below** |
+
+On the reachable one, a pending card older than `PENDING_INTERACTION_MAX_AGE_MS` (24 h) does
+**not** claim the interaction branch of the blocked-inbox reason ladder. That is deliberate
+(BLO-22660): a card nobody has answered in a day must stop reporting the row as
+`awaiting_decision` owned by "Board", because that names an owner who has not acted. The row
+is still listed — it is reclassified, not hidden.
+
+The consequence to plan for is that **`interactionId` alone is not a census of outstanding
+questions.** It means "the live card to answer", and the ladder reaches that field only for
+cards inside the 24 h window, so a list of rows with a non-null `interactionId` is a list of
+questions asked *today*. Reading it as the backlog inverts the signal: the longer a question
+goes unanswered, the more certainly it is missing from it.
+
+Read **`overdueInteractionId`** instead, or as well. It names a pending card on that row that
+is past the cutoff, and it is stamped on every branch of the ladder regardless of which one
+claimed the row — so a row claimed by a pending approval, an external wait, or a stalled
+blocker chain still reports its overdue question. Before PEN-4193 only one branch of seven
+carried a stale card id, and it keyed on the finding's recovery issue rather than the listed
+row; PEN-3256 sat with a 31.8-day unanswered cost question reported by nothing an agent could
+reach, because its pending approval claimed the row first.
+
+Note the two fields answer different questions and are not substitutes:
+
+- `interactionId` — the live card to answer (interaction branch), or the card a finding's
+  recommended action refers to, which may sit on a **different** row (the blocker/recovery
+  issue), not the one you are reading.
+- `overdueInteractionId` — a card on **this** row that is past the 24 h cutoff.
+
+Neither is a substitute for reading the issue's own `/issues/:id/interactions`, which is the
+only unbounded per-row view.
+
 ## 9. GitHub Access From Agent Workspaces
 
 Agent pods authenticate to GitHub as the `allyblockcast[bot]` GitHub App

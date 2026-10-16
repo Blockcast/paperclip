@@ -1113,6 +1113,12 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     // means must be named. Dropping the row from the loop left this null while the action
     // text still told the operator to go withdraw something it declined to identify.
     expect(stale?.interactionId).toBe(staleCardId);
+    // PEN-4193: the same stale card is also reported in its own field, which is what makes
+    // "is anything overdue on this row?" answerable without re-deriving the 24h cutoff.
+    // The fresh arm must be null: a card inside the window is not overdue, and without this
+    // arm the stale assertion passes vacuously on an implementation that stamps every row.
+    expect(stale?.overdueInteractionId).toBe(staleCardId);
+    expect(fresh?.overdueInteractionId).toBeNull();
   });
 
   // BLO-22660: the pin above is the SELF form -- the stale card sits on the row being
@@ -1162,6 +1168,11 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     // the lookup on the listed row's id returned null here while the prose still said
     // "resolve or withdraw its stale interaction".
     expect(attention?.interactionId).toBe(staleCardId);
+    // PEN-4193: the two fields answer different questions and are keyed on different rows.
+    // `interactionId` names the card the finding's recommended action refers to (on the
+    // blocker); `overdueInteractionId` names an overdue card on the LISTED row, and there is
+    // none here. Pinning null is what stops the new field from silently becoming an alias.
+    expect(attention?.overdueInteractionId).toBeNull();
   });
 
   // BLO-22660: the ageing rule is deliberately asymmetric -- interactions age, approvals do
@@ -1180,8 +1191,9 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       assigneeAgentId: agentId,
       executionState: null,
     });
+    const staleCardId = randomUUID();
     await db.insert(issueThreadInteractions).values({
-      id: randomUUID(),
+      id: staleCardId,
       companyId,
       issueId: reviewId,
       kind: "request_confirmation",
@@ -1210,6 +1222,16 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       owner: { type: "board" },
       approvalId,
     });
+    // PEN-4193 regression. This is the measured shape: PEN-3256 carried a 31.8-day
+    // unanswered card AND a pending approval, and the approval branch -- which runs before
+    // the finding branch that was the ONLY carrier of a stale card id -- claimed the row, so
+    // the surface reported "Decide approval" and named no card at all. Whoever read it
+    // concluded an approval was the only thing outstanding. The approval still legitimately
+    // owns the next action (pinned above, BLO-22660); what must not happen is the question
+    // going unreported because of it. `interactionId` stays null on this branch by design:
+    // it means "the live card to answer", and this card is not live.
+    expect(attention?.interactionId).toBeNull();
+    expect(attention?.overdueInteractionId).toBe(staleCardId);
   });
 
   it("classifies recovery issues and missing successful-run dispositions", async () => {

@@ -40,6 +40,7 @@ function makeAttention(
     recoveryIssue: null,
     approvalId: null,
     interactionId: null,
+    overdueInteractionId: null,
     sampleIssueIdentifier: null,
     redaction: { externalDetailsRedacted: false, secretFieldsOmitted: true },
     ...overrides,

@@ -487,6 +487,15 @@ export interface IssueBlockedInboxAttention {
   recoveryIssue: IssueBlockedInboxIssueRef | null;
   approvalId: string | null;
   interactionId: string | null;
+  // PEN-4193: the pending interaction on THIS row that is older than
+  // `PENDING_INTERACTION_MAX_AGE_MS`, or null. Always populated when such a card
+  // exists, on every branch of the reason ladder, independently of which branch
+  // claimed the row. `interactionId` cannot carry it: on the interaction branch
+  // that field means "the live card to answer", and the ladder reaches that
+  // branch only for cards *inside* the window, so an overdue card reported there
+  // would contradict the action label. Keeping it in its own field is what makes
+  // "is anything overdue on this row?" answerable without re-deriving the cutoff.
+  overdueInteractionId: string | null;
   sampleIssueIdentifier: string | null;
   redaction: {
     externalDetailsRedacted: boolean;
