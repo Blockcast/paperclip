@@ -27,6 +27,20 @@ import { finalizeSummarySlotsForTerminalIssue } from "./summary-slot-finalizatio
 type IssueRow = typeof issues.$inferSelect;
 type HoldRow = typeof issueTreeHolds.$inferSelect;
 type HoldMemberRow = typeof issueTreeHoldMembers.$inferSelect;
+/**
+ * One active pause-hold row, in exactly the projection `getActivePauseHoldGate` consumes.
+ *
+ * PEN-3636: exported because the recovery sweep's prefilter caches these rows and passes
+ * them back into the gate. Keep it in step with `listActivePauseHolds`'s select — tsc
+ * enforces that, since the function is annotated with this type.
+ */
+export type ActivePauseHoldRow = {
+  id: string;
+  rootIssueId: string;
+  reason: string | null;
+  releasePolicy: Record<string, unknown> | null;
+};
+
 export type ActiveIssueTreePauseHoldGate = {
   holdId: string;
   rootIssueId: string;
@@ -82,12 +96,16 @@ const MAX_PAUSE_HOLD_ANCESTOR_DEPTH = 100;
 /**
  * The one definition of "an active pause hold in this company".
  *
- * PEN-3636: `hasAnyActivePauseHold` is a company-scoped prefilter for
- * `getActivePauseHoldGate`, and that optimisation is only sound while the prefilter's
- * predicate is a SUPERSET of the gate's. Narrow the prefilter relative to the gate and
- * `false` stops being a proof that the gate cannot fire, so the stranded sweep
- * auto-recovers issues sitting under a live human pause hold — a stop control failing
+ * PEN-3636: `hasAnyActivePauseHold` and `listActivePauseHolds` are both company-scoped
+ * prefilters for `getActivePauseHoldGate`, and either optimisation is only sound while the
+ * prefilter's predicate is a SUPERSET of the gate's. Narrow a prefilter relative to the
+ * gate and an empty result stops being a proof that the gate cannot fire, so the stranded
+ * sweep auto-recovers issues sitting under a live human pause hold — a stop control failing
  * open, silently, with every mocked test still green.
+ *
+ * `listActivePauseHolds` is the stronger of the two: the gate reads its rows THROUGH it, so
+ * there the relation is identity rather than superset and cannot drift at all. That is the
+ * path the recovery sweep takes.
  *
  * Composing both from this one expression is what makes the superset property hold by
  * CONSTRUCTION rather than by test: a later term (a second `mode`, an expiry, a
@@ -604,9 +622,15 @@ export function issueTreeControlService(db: Db) {
    * `activePauseHoldPredicate`, so the superset relation they depend on is structural and
    * not merely asserted. That gate returns `null` before it ever looks at the issue when
    * this is false, so a `false` here is a sound proof that the gate cannot fire for *any*
-   * issue in the company — which is what lets a sweep answer thousands of per-candidate
-   * gate calls from one company-scoped read. `true` proves nothing about a given issue:
-   * the ancestor walk still has to run, so callers must fall through to the full gate.
+   * issue in the company. `true` proves nothing about a given issue: the ancestor walk
+   * still has to run, so callers must fall through to the full gate.
+   *
+   * ⚠️ PEN-3636: the recovery sweep no longer reads through here — it caches the ROWS via
+   * `listActivePauseHolds` instead, because a `true` answer left it re-reading the same
+   * company-scoped list once per candidate. This remains the cheaper read (`limit 1`, one
+   * column) and is the right call for a caller that only needs the boolean and will not go
+   * on to open the gate. Both still compose `activePauseHoldPredicate`, so they cannot
+   * disagree.
    */
   async function hasAnyActivePauseHold(
     companyId: string,
@@ -620,13 +644,28 @@ export function issueTreeControlService(db: Db) {
       .then((rows) => rows.length > 0);
   }
 
-  async function getActivePauseHoldGate(
+  /**
+   * The company-scoped half of `getActivePauseHoldGate`, as a value rather than a step.
+   *
+   * PEN-3636: the gate used to inline this select, which made it unreachable by a caller
+   * that had already read the same rows a moment earlier — so a sweep over N candidates of
+   * one company issued N byte-identical copies of it. Naming it lets the recovery sweep's
+   * prefilter hold the result across candidates and hand it back in (`preloadedActivePauseHolds`
+   * below), turning the gate's cost into the ancestor walk alone.
+   *
+   * ⚠️ The ORDER is load-bearing, which is why this is one function and not two call sites
+   * with the same `where`. The gate builds `holdByRootIssueId` with `new Map(...)`, and a
+   * `Map` built from entries keeps the LAST value for a duplicated key — so when two active
+   * holds share a `rootIssueId`, this `orderBy` is what decides which one the gate reports.
+   * A caller that re-read the rows with a different (or absent) ordering would change the
+   * gate's answer without changing its logic. Reading through here makes that
+   * unrepresentable rather than merely discouraged.
+   */
+  async function listActivePauseHolds(
     companyId: string,
-    issueId: string,
     dbOrTx: Pick<Db, "select"> = db,
-  ): Promise<ActiveIssueTreePauseHoldGate | null> {
-    // dbOrTx: pass tx from inside db.transaction() — acquiring a separate pool connection while holding FOR UPDATE locks risks pool-exhaustion deadlock (BLO-3855).
-    const activePauseHolds = await dbOrTx
+  ): Promise<ActivePauseHoldRow[]> {
+    return dbOrTx
       .select({
         id: issueTreeHolds.id,
         rootIssueId: issueTreeHolds.rootIssueId,
@@ -636,6 +675,24 @@ export function issueTreeControlService(db: Db) {
       .from(issueTreeHolds)
       .where(activePauseHoldPredicate(companyId))
       .orderBy(asc(issueTreeHolds.createdAt), asc(issueTreeHolds.id));
+  }
+
+  async function getActivePauseHoldGate(
+    companyId: string,
+    issueId: string,
+    dbOrTx: Pick<Db, "select"> = db,
+    // PEN-3636: the company-scoped rows, when the caller already holds them. Omitting it
+    // reads them live, which is what every caller outside the recovery sweep does — this
+    // parameter adds a path, it does not change the default one. The rows MUST have come
+    // from `listActivePauseHolds` for this company (see its ordering note); supplying a
+    // differently-ordered or foreign-company list silently changes which hold the gate
+    // reports. The sweep satisfies that by construction: its only source is a prefilter
+    // bound at construction to one company key and one db handle.
+    preloadedActivePauseHolds?: readonly ActivePauseHoldRow[],
+  ): Promise<ActiveIssueTreePauseHoldGate | null> {
+    // dbOrTx: pass tx from inside db.transaction() — acquiring a separate pool connection while holding FOR UPDATE locks risks pool-exhaustion deadlock (BLO-3855).
+    const activePauseHolds = preloadedActivePauseHolds
+      ?? (await listActivePauseHolds(companyId, dbOrTx));
     if (activePauseHolds.length === 0) return null;
 
     const holdByRootIssueId = new Map(activePauseHolds.map((hold) => [hold.rootIssueId, hold]));
@@ -1258,6 +1315,7 @@ export function issueTreeControlService(db: Db) {
     listHolds,
     getActivePauseHoldGate,
     hasAnyActivePauseHold,
+    listActivePauseHolds,
     releaseHold,
     cancelUnclaimedWakeupsForTree,
   };
