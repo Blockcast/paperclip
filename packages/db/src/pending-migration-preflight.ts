@@ -1,5 +1,6 @@
 import postgres from "postgres";
 import { inspectMigrations } from "./client.js";
+import { PENDING_CONCURRENT_INDEXES } from "./concurrent-index-guard.js";
 
 /**
  * Several migrations in this directory refuse to run on a populated database
@@ -16,7 +17,7 @@ import { inspectMigrations } from "./client.js";
  * to roll back, because a pod stuck in CrashLoopBackOff cannot be evicted.
  * A one-line prerequisite costs an hour of deploy and a worker outage.
  *
- * `concurrent-index-guard.ts` states the assumption this falsifies:
+ * `concurrent-index-guard.ts` once stated the assumption this falsifies:
  *
  *   > 0205, 0208, and 0209 are deliberately NOT listed here: each of those
  *   > migrations already RAISEs and stalls the migration itself when its index
@@ -25,6 +26,15 @@ import { inspectMigrations } from "./client.js";
  *
  * It fails, but not visibly. This module moves that detection ahead of
  * `helm upgrade`, where it costs a second and prints the exact remediation.
+ *
+ * ⚠️ That quote is HISTORICAL and is kept only because it records why this
+ * module exists. All three of those migrations ARE listed in
+ * `PENDING_CONCURRENT_INDEXES` today, and reading the quote as current is how
+ * PEN-4176 came to record an operator precreate as "the normal cost" of
+ * landing one. `MIGRATIONS_WITH_RUNNER_PRECREATION` below derives the real
+ * membership from the guard rather than restating it, and
+ * `formatPreflightFailure` partitions on it, so the two registries can no
+ * longer drift apart silently in the remediation text.
  *
  * Scope, stated honestly: this checks that each guarded pending migration's
  * index **exists and is fully built**. It does not re-verify the index's
@@ -284,15 +294,81 @@ export function selectGuardedPendingIndexes(
 }
 
 /** Operator-facing failure text: what stopped, why, and the exact fix. */
+/**
+ * Migrations whose online index the MIGRATION RUNNER builds for itself, derived
+ * from the guard rather than restated, so this set cannot drift from the
+ * runner's actual behaviour.
+ *
+ * `applyPendingMigrations({ prepareOnlineIndexes: true })` calls
+ * `ensureConcurrentIndexesForMigration` for each file, outside the transaction,
+ * immediately before applying it (`client.ts`), and `migrate.ts` calls
+ * `ensureOnlineIndexPrerequisites` up front. The deploy pipeline runs the same
+ * CLI as its own step ahead of this gate
+ * (`.github/scripts/precreate-online-indexes.sh`, PEN-4179).
+ *
+ * This set does NOT soften the gate for its members. A blocker here means that
+ * automation did not in fact leave the index built — it timed out, lost the
+ * serializing lock, or never ran — and rolling anyway would make the worker
+ * attempt the build inside `helm upgrade --wait`, bounded by the guard's
+ * 10-minute statement timeout, with a non-retryable `57014` on overrun: the
+ * crashloop this module exists to prevent. What the set changes is only what
+ * the operator is told to DO about it.
+ */
+export const MIGRATIONS_WITH_RUNNER_PRECREATION: ReadonlySet<string> = new Set(
+  PENDING_CONCURRENT_INDEXES.map((spec) => spec.migration),
+);
+
 export function formatPreflightFailure(blockers: readonly PreflightBlocker[]): string {
+  // Partitioned because the two halves need different instructions, and the
+  // single undifferentiated paragraph this replaced asserted something false
+  // about one of them: "Drizzle runs migrations in a transaction, so these
+  // cannot build the index themselves" is true of the SQL FILE but not of the
+  // runner, which builds the automated half one statement earlier, outside the
+  // transaction. Telling an operator to hand-run a statement that the pipeline
+  // is supposed to run is how a recurring 25-hour deploy freeze gets recorded
+  // as the normal cost of landing a migration (PEN-4176).
+  const automated = blockers.filter((blocker) =>
+    MIGRATIONS_WITH_RUNNER_PRECREATION.has(blocker.migration),
+  );
+  const manual = blockers.filter(
+    (blocker) => !MIGRATIONS_WITH_RUNNER_PRECREATION.has(blocker.migration),
+  );
+
   const lines = [
     `Deploy stopped before helm upgrade: ${blockers.length} pending migration(s) require an index that must be ` +
-      `built online first. Drizzle runs migrations in a transaction, so these cannot build the index themselves; ` +
+      `built online first. Drizzle wraps each migration file in a transaction and ` +
+      `CREATE INDEX CONCURRENTLY cannot run inside one, so an absent index raises from the file itself; ` +
       `starting the rollout now would crashloop the worker and stall helm until its timeout expires.`,
     "",
-    "Run each statement below against the target database, then re-run this deploy:",
-    "",
   ];
+
+  if (automated.length > 0) {
+    lines.push(
+      `${automated.length} of these has a deploy-time precreation path and should NOT have reached you: ` +
+        `the online-index precreation step runs ahead of this gate and builds exactly these. ` +
+        `Read that step's output in this job before hand-running anything — it will say whether it was ` +
+        `skipped, timed out, or lost the serializing lock. Re-running the deploy is usually the right move; ` +
+        `the statement is listed only so you are not blocked on the pipeline:`,
+      "",
+    );
+    lines.push(...describeBlockers(automated));
+  }
+
+  if (manual.length > 0) {
+    lines.push(
+      `${manual.length} of these has NO automated path — no entry in PENDING_CONCURRENT_INDEXES, so neither ` +
+        `the precreation step nor the migration runner will build it. ` +
+        `Run each statement below against the target database, then re-run this deploy:`,
+      "",
+    );
+    lines.push(...describeBlockers(manual));
+  }
+
+  return lines.join("\n");
+}
+
+function describeBlockers(blockers: readonly PreflightBlocker[]): string[] {
+  const lines: string[] = [];
   for (const blocker of blockers) {
     const reason =
       blocker.state === "absent"
@@ -303,7 +379,7 @@ export function formatPreflightFailure(blockers: readonly PreflightBlocker[]): s
     lines.push(`    ${blocker.remediation};`);
     lines.push("");
   }
-  return lines.join("\n");
+  return lines;
 }
 
 async function probeIndex(sql: ReturnType<typeof postgres>, name: string): Promise<IndexProbe> {
