@@ -3265,13 +3265,11 @@ export type GitCheckoutProbe =
 // which is reported as `indeterminate` rather than asserted as absence. This
 // mirrors the tri-state of `probeGitCheckoutStateStrict` in heartbeat.ts,
 // which cannot be reused directly because heartbeat.ts imports from this
-// module — but deliberately NOT its matching rule: the anchored test below is
-// tighter than that function's unanchored `/not a git repository/i`, so the
-// two classifiers can disagree on the same stderr. PEN-3889 owns closing that
-// gap on the heartbeat.ts side, and it is not done here because the same
-// one-character change has inverted blast radius there: `not_a_checkout` is
-// the sole *allow* value on its fail-closed dispatch guard, so it needs its
-// own fixtures rather than riding along on this one.
+// module. Its matching rule is now the same anchored test as below (PEN-3889
+// closed that gap; the two had disagreed on the same stderr while this one was
+// anchored and that one was not). Keep them in step: `not_a_checkout` is the
+// sole *allow* value on heartbeat's fail-closed dispatch guard, so loosening
+// either copy re-opens a hole there that is invisible from this side.
 export function classifyGitCheckoutProbeFailure(
   error: unknown,
 ): Extract<GitCheckoutProbe, { reason: string }> {

@@ -4120,7 +4120,19 @@ export async function probeGitCheckoutStateStrict(
     const stderr = typeof (error as { stderr?: unknown })?.stderr === "string"
       ? (error as { stderr: string }).stderr
       : "";
-    if (/not a git repository/i.test(stderr)) return "not_a_checkout";
+    // PEN-3889: anchored to the start of a line, matching the sibling
+    // classifyGitCheckoutProbeFailure() in workspace-runtime.ts. git emits
+    // this fatal in two forms ("...(or any of the parent directories): .git"
+    // and "...: '<path>'"), both at column 0 — measured against git 2.47.3,
+    // and against 2.43.0 in PR#2299. The `m` flag keeps it matching after a
+    // preceding diagnostic line (e.g. a `warning:`). Unanchored, the phrase
+    // appearing anywhere in the stderr — including inside a path carried by
+    // an unrelated failure, as in "Unable to create '/srv/not a git
+    // repository/index.lock'" — was read as positive absence, which is the
+    // sole *allow* verdict at the only call site. That routed exactly the
+    // storage-layer failures the comment above disclaims (stale handle, lock
+    // contention, dubious ownership) straight through to dispatch.
+    if (/^fatal: not a git repository/im.test(stderr)) return "not_a_checkout";
     return "indeterminate";
   }
 }
