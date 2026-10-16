@@ -4484,10 +4484,10 @@ function ensureRegistry(): {
         + PROCESS_MEMORY_COMPONENT_BYTES_METRIC
         + " -- the only series here whose LOW reading decides anything, since a flat "
         + "external_peak is what sends the next instrument to malloc level instead of into "
-        + "server code. The sampler runs on the event loop, and the measured step STALLS the "
-        + "event loop (up was 0 at 2026-10-15T09:31Z while RSS gained 1096 MiB), so a peak that "
-        + "is flat because the sampler never ran during the burst is indistinguishable from one "
-        + "that is flat because nothing happened -- opposite conclusions. rate() over this "
+        + "server code. The sampler runs on the event loop, and the step it exists to catch "
+        + "STALLS the event loop, so a peak that is flat because the sampler never ran "
+        + "during the burst is indistinguishable from one that is flat because nothing "
+        + "happened -- opposite conclusions. rate() over this "
         + "series separates them: a healthy 1s sampler rates at ~1.0/s and a dip IS the stall, "
         + "measured rather than inferred from a scrape that happened not to land. "
         + "Monotonic within a process; on restart the series goes ABSENT and then reappears "
@@ -6866,9 +6866,11 @@ export function setNativeMemoryMetrics(snapshot: NativeMemorySnapshot | null): v
   // way it is not on the labelled gauges above, where `reset()` does drop the
   // series. `remove()` deletes it outright, so absent stays absent.
   //
-  // Safe because `refreshNativeMemoryMetrics()` runs INLINE on the `/metrics`
-  // handler immediately before `renderMetrics()` (app.ts), so no scrape can
-  // observe the registration-time 0 before this function has removed or set it.
+  // This is NOT what makes the registration-time 0 unobservable -- the gauge is
+  // already `remove()`d at construction (see its definition), so the 0 is gone
+  // before any scrape, whatever order `/metrics` calls its refreshers in. What
+  // this call does is keep it gone on every LATER scrape, once the sampler has
+  // stopped reporting a count again.
   metrics.processHeapPeakSamplesGauge.remove();
   if (!snapshot) return;
   for (const [component, bytes] of snapshot.components) {
