@@ -5396,6 +5396,11 @@ async function wakeStackedChildIssues(input: {
  *
  * Derived from {@link POSTGRES_POOL_MAX} for the same reason as the reviewer
  * bound: shrinking the pool must shrink this with it.
+ *
+ * Scope: this bounds work done before the response is sent. Fire-and-forget
+ * tails that outlive it (`runPrCommentReviewGateCheck` and retirement enqueues,
+ * `enrichAuthoredLocForRow`) run outside the bulkhead; they sit on
+ * pull_request/merge paths, not the CI burst this was measured on.
  */
 export function deriveGithubWebhookMaxConcurrentDeliveries(poolMax: number): number {
   return Math.max(1, Math.floor(poolMax / 3));
@@ -5463,26 +5468,6 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       }
     });
 
-    if (deliveriesInFlight < maxConcurrentDeliveries) {
-      deliveriesInFlight += 1;
-    } else if (deliveryWaiters.length >= GITHUB_WEBHOOK_MAX_QUEUED_DELIVERIES) {
-      logger.error(
-        { event: req.header("x-github-event"), deliveryId: req.header("x-github-delivery") },
-        "github webhook delivery refused: bulkhead queue full (BLO-47034)",
-      );
-      res.status(503).json({ error: "github webhook busy" });
-      return;
-    } else {
-      await new Promise<void>((resolve) => deliveryWaiters.push(resolve));
-    }
-    try {
-      await handleDelivery(req, res);
-    } finally {
-      releaseDeliverySlot();
-    }
-  });
-
-  async function handleDelivery(req: Request, res: Response): Promise<void> {
     if (!config.webhookSecret) {
       logger.warn("github webhook received but GITHUB_WEBHOOK_SECRET is not configured; refusing");
       res.status(503).json({ error: "github webhook not configured" });
@@ -5505,6 +5490,29 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       return;
     }
 
+    // Admission comes AFTER signature verification (pure CPU, no DB), so an
+    // unsigned flood is answered 401 at once and can never occupy a slot or a
+    // queue position that a signed GitHub delivery needs.
+    if (deliveriesInFlight < maxConcurrentDeliveries) {
+      deliveriesInFlight += 1;
+    } else if (deliveryWaiters.length >= GITHUB_WEBHOOK_MAX_QUEUED_DELIVERIES) {
+      logger.error(
+        { event: req.header("x-github-event"), deliveryId: req.header("x-github-delivery") },
+        "github webhook delivery refused: bulkhead queue full (BLO-47034)",
+      );
+      res.status(503).json({ error: "github webhook busy" });
+      return;
+    } else {
+      await new Promise<void>((resolve) => deliveryWaiters.push(resolve));
+    }
+    try {
+      await handleDelivery(req, res, rawBody);
+    } finally {
+      releaseDeliverySlot();
+    }
+  });
+
+  async function handleDelivery(req: Request, res: Response, rawBody: Buffer): Promise<void> {
     const eventName = req.header("x-github-event") ?? "";
     const deliveryId = req.header("x-github-delivery") ?? null;
     const payload = (req.body ?? {}) as Record<string, unknown>;

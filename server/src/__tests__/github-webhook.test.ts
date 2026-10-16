@@ -9067,6 +9067,15 @@ describeEmbeddedPostgres("github-webhook route", () => {
       await vi.waitFor(() => expect(entered).toBe(1));
       await new Promise((resolve) => setTimeout(resolve, 100));
       expect(entered).toBe(1);
+      // With the only slot held, an unsigned request is still refused at once:
+      // verification precedes admission, so it can never queue ahead of (or
+      // displace) a signed delivery.
+      const unsigned = await request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", "check_run")
+        .set("content-type", "application/json")
+        .send(signedRequest(ciDelivery("check_run", 9, "head-bulkhead-unsigned", "success").payload).body);
+      expect(unsigned.status).toBe(401);
       release();
       expect(await Promise.all(sends)).toEqual([1, 1, 1]);
       expect(maxInside).toBe(1);
