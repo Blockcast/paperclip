@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq, inArray, sql } from "drizzle-orm";
+import { desc, eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -1843,6 +1843,235 @@ describeEmbeddedPostgres("recovery wake horizon expiry (BLO-24662)", () => {
       const messages = warn.mock.calls.map((call) => call[1]);
       expect(messages).toContain("recovery wake retirement/refund failed after retry");
       expect(messages).not.toContain("recovery wake retirement likely committed but could not be confirmed");
+    });
+
+    /**
+     * PEN-4159 (Ally review of #2743): the confirm read used to be keyed on the ISSUE
+     * (`getActiveForIssue`) and recover identity afterwards with `confirmed?.id ===
+     * input.action.id`. The review's reading was that a sibling action on the same issue,
+     * touched more recently, wins the read's `ORDER BY updated_at DESC LIMIT 1`, the identity
+     * check then fails, and the announce is skipped — silence, which is this lineage's whole
+     * failure mode (PEN-3989).
+     *
+     * Measured here rather than taken on the review's word, and the measurement disagrees:
+     * that two-row state is REFUSED BY THE SCHEMA. `issue_recovery_actions_active_source_uq`
+     * (migration 0097) is `UNIQUE (company_id, source_issue_id) WHERE status IN ('active',
+     * 'escalated')`, so the issue-keyed read has at most one candidate and a sibling cannot
+     * outrank us. The race is unreachable in production and the by-id read is therefore
+     * behaviour-preserving, not a bug fix.
+     *
+     * It is still worth making, and these three tests are why. The old read was correct only
+     * BECAUSE of an index 150 migrations away that neither the read nor the call site named —
+     * an undeclared dependency, in the direction where breaking it means a retirement that
+     * commits and announces nothing. The first test pins the index so relaxing it fails here,
+     * loudly, instead of in the confirm arm, silently. The second shows the by-id read holds
+     * even once it is relaxed. The third keeps the end-to-end announce honest.
+     */
+    describe("the confirm read is keyed on the action, not the issue (PEN-4159)", () => {
+      /**
+       * Drizzle re-throws a constraint violation wrapped in a `Failed query: ...` Error whose
+       * MESSAGE carries the SQL and the parameters but not the constraint that rejected it —
+       * the `PostgresError` holding `constraint_name` is one level down, in `cause`. Matching
+       * a regex against the message therefore fails even on a genuine violation of the right
+       * index, which is how this test first failed. Walking the chain for `constraint_name`
+       * also makes the assertion exact: it names WHICH index refused the row, where a regex
+       * over the message would equally have matched the index name appearing in the SQL text.
+       */
+      function uniqueViolationConstraint(error: unknown): string | null {
+        for (let node: unknown = error; node; node = (node as { cause?: unknown }).cause) {
+          const name = (node as { constraint_name?: unknown }).constraint_name;
+          if (typeof name === "string") return name;
+        }
+        return null;
+      }
+
+      /**
+       * The invariant the OLD read depended on, stated as a test.
+       *
+       * This is the tripwire. Add a status to `ACTIVE_RECOVERY_ACTION_STATUSES` without
+       * widening the index predicate, or relax the predicate itself, and the sibling state
+       * becomes constructible — at which point `getActiveForIssue` really can return someone
+       * else's row. This test fails first and names the reason.
+       */
+      it("refuses a second active action on one issue, which is why the issue-keyed read had one candidate", async () => {
+        const seeded = await seed();
+        const mineId = await insertAction(seeded, { status: "escalated", retiringBound: "timeout_horizon" });
+
+        // The sentinel distinguishes "did not throw" from "threw for another reason"; without
+        // it a silent success would read as an unhelpful null mismatch.
+        const refusal = await insertAction(seeded, {
+          status: "active",
+          fingerprint: `sibling:${seeded.sourceIssueId}`,
+        }).then(
+          () => "INSERT UNEXPECTEDLY SUCCEEDED",
+          (error: unknown) => uniqueViolationConstraint(error) ?? `unexpected error: ${String(error)}`,
+        );
+        expect(refusal).toBe("issue_recovery_actions_active_source_uq");
+
+        // The refusal is the index and not some unrelated failure: ours is still the only row.
+        const rows = await db
+          .select()
+          .from(issueRecoveryActions)
+          .where(eq(issueRecoveryActions.sourceIssueId, seeded.sourceIssueId));
+        expect(rows.map((row) => row.id)).toEqual([mineId]);
+      });
+
+      /**
+       * The discriminator, and the only configuration in which the two reads can disagree:
+       * the index dropped, so the sibling state the review described actually exists.
+       *
+       * Dropped and restored in a `finally` rather than left to `afterEach`, which truncates
+       * DATA and would leave the schema maimed for every test after this one.
+       */
+      it("returns OUR action by id where the issue-keyed read returns a newer sibling", async () => {
+        const seeded = await seed();
+        const actions = issueRecoveryActionService(db);
+        await db.execute(sql`DROP INDEX IF EXISTS issue_recovery_actions_active_source_uq`);
+        try {
+          const mineId = await insertAction(seeded, {
+            status: "escalated",
+            retiringBound: "timeout_horizon",
+            // Explicit timestamps, not wall-clock ordering: two inserts can land in the same
+            // millisecond and a tie would make the sibling's precedence a coin flip, which is
+            // the one thing this test must not leave to chance.
+            updatedAt: new Date("2026-08-09T05:00:00.000Z"),
+          });
+          const siblingId = await insertAction(seeded, {
+            status: "active",
+            fingerprint: `sibling:${seeded.sourceIssueId}`,
+            updatedAt: new Date("2026-08-09T05:30:00.000Z"),
+          });
+
+          // The pre-fix read, run against the pre-fix premise. It picks the sibling, and the
+          // identity check `confirmed?.id === input.action.id` the confirm arm applies to it
+          // would therefore fail and skip the announce.
+          const byIssue = await actions.getActiveForIssue(seeded.companyId, seeded.sourceIssueId);
+          expect(byIssue?.id).toBe(siblingId);
+
+          // The read the confirm arm uses now. Keyed on the id, so the sibling is irrelevant.
+          const byId = await actions.getById(seeded.companyId, mineId);
+          expect(byId?.id).toBe(mineId);
+          expect(byId).toMatchObject({ status: "escalated", retiringBound: "timeout_horizon" });
+
+          // Company-scoped like every other read in that service: a correct id under the
+          // wrong company is not a match. Without this the scope argument could be dropped
+          // and nothing here would notice.
+          expect(await actions.getById(randomUUID(), mineId)).toBeNull();
+        } finally {
+          // The two coexisting rows ARE what the index forbids, so they have to go before it
+          // can be rebuilt — `CREATE UNIQUE INDEX` over them fails 23505 ("Key (company_id,
+          // source_issue_id) is duplicated"), which is how this first failed. `afterEach`'s
+          // truncate runs too late to help: a failed rebuild here leaves every later test in
+          // the file running without the invariant, silently.
+          await db
+            .delete(issueRecoveryActions)
+            .where(eq(issueRecoveryActions.sourceIssueId, seeded.sourceIssueId));
+          await db.execute(sql`
+            CREATE UNIQUE INDEX IF NOT EXISTS issue_recovery_actions_active_source_uq
+            ON issue_recovery_actions USING btree (company_id, source_issue_id)
+            WHERE status IN ('active', 'escalated')
+          `);
+        }
+      });
+
+      /**
+       * End to end through the real confirm arm, with a sibling present ON THE ISSUE at the
+       * moment the confirm read runs. The sibling is newer than ours and outside the active
+       * set — the only sibling shape the schema admits, per the first test.
+       *
+       * `getActiveForIssue` filtered that row out by status, so this does not discriminate the
+       * fix; it is a regression guard. What it pins is that the announce still fires now the
+       * read no longer filters by status at all, which is the one way the new read could have
+       * made this path worse — a sibling it refuses to hide is a sibling it could return.
+       */
+      it("announces the retirement with a newer, non-active sibling already on the issue", async () => {
+        const seeded = await seed();
+        await withManager(seeded);
+        const state = { committedThenThrew: false, retireCalls: 0, siblingInserted: false };
+        const warn = vi.spyOn(logger, "warn").mockImplementation(() => logger);
+
+        // The sibling has to land INSIDE the window: after our retire+refund commits (so the
+        // active-source slot is held by an `escalated` row rather than contested) and before
+        // the confirm read that this test is about. Inserting it before the dispatch would
+        // have held that slot and stopped our action from ever being minted; inserting it
+        // after the dispatch returns would miss the read entirely and prove nothing.
+        const insertSibling = () => db.insert(issueRecoveryActions).values({
+          id: randomUUID(),
+          companyId: seeded.companyId,
+          sourceIssueId: seeded.sourceIssueId,
+          kind: "stranded_assigned_issue",
+          // Outside ACTIVE_RECOVERY_ACTION_STATUSES, so the partial unique index does not
+          // cover it and it may coexist with our escalated row.
+          status: "resolved",
+          ownerType: "agent",
+          ownerAgentId: seeded.ownerAgentId,
+          cause: "stranded_assigned_issue",
+          fingerprint: `sibling:${seeded.sourceIssueId}`,
+          evidence: {},
+          nextAction: "Restore a live execution path.",
+          attemptCount: 0,
+          maxAttempts: 5,
+          timeoutAt: pastHorizon,
+          // Ahead of the REAL clock, not of this suite's fixture dates. `now`/`pastHorizon`
+          // above are row DATA — nothing here fakes the clock — so the dispatch stamps
+          // `updatedAt` with the actual current time, which is years past 2026-08-09. A
+          // fixture-dated sibling is therefore the OLDEST row, not the newest, and the test
+          // silently stops describing a sibling at all. A minute ahead of now is
+          // unambiguously newest and leaves no millisecond tie to chance.
+          updatedAt: new Date(Date.now() + 60_000),
+        }).then(() => {
+          state.siblingInserted = true;
+        });
+
+        const retireDb = dbWithRetireHook(db, (call) => {
+          state.retireCalls = call;
+          if (call !== 1) return null;
+          return (run) => run()
+            .then(insertSibling)
+            .then(() => {
+              state.committedThenThrew = true;
+              throw new Error("simulated connection reset after commit");
+            });
+        });
+
+        const actionId = await dispatchOntoPastHorizon(retireDb, seeded);
+
+        // The fixture fired and the confirm arm really was the path taken. Without these the
+        // test would pass against a harness that never ran — the failure mode the CAS-miss
+        // tests above guard the same way.
+        expect(state.committedThenThrew).toBe(true);
+        expect(state.siblingInserted).toBe(true);
+        expect(state.retireCalls).toBe(2);
+
+        // The sibling is genuinely the issue's most recently updated row, which is what makes
+        // it a sibling in the sense the review meant.
+        const newest = await db
+          .select({ id: issueRecoveryActions.id })
+          .from(issueRecoveryActions)
+          .where(eq(issueRecoveryActions.sourceIssueId, seeded.sourceIssueId))
+          .orderBy(desc(issueRecoveryActions.updatedAt))
+          .limit(1);
+        expect(newest[0]?.id).not.toBe(actionId);
+
+        expect(await readAction(actionId)).toMatchObject({
+          status: "escalated",
+          retiringBound: "timeout_horizon",
+          attemptCount: 0,
+        });
+
+        const messages = warn.mock.calls.map((call) => call[1]);
+        expect(messages).not.toContain("recovery wake retirement likely committed but could not be confirmed");
+
+        const { body } = await renderMetrics();
+        expect(body).toContain(`${RECOVERY_HORIZON_EXPIRED_METRIC}{delivery="never_delivered"} 1`);
+        expect(body).toContain(`${RECOVERY_HORIZON_EXPIRED_METRIC}{delivery="delivered"} 0`);
+
+        const comments = await db
+          .select({ body: issueComments.body })
+          .from(issueComments)
+          .where(eq(issueComments.issueId, seeded.sourceIssueId));
+        expect(comments.filter((row) => row.body.includes("Recovery wake horizon reached"))).toHaveLength(1);
+      });
     });
   });
 });
