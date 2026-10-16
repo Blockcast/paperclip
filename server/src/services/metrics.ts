@@ -4327,12 +4327,20 @@ function ensureRegistry(): {
         + "created because the owning routine's window cannot accept a useful one, so the next "
         + "scheduled fire takes the work. That branch persists no row, so it is invisible to "
         + SCHEDULED_RETRY_PARK_HORIZON_METRIC + ", which is a max over LIVE retries and therefore "
-        + "falls when retries are dropped. Not pre-seeded: an absent series means never "
-        + "incremented, so pair any zero-abandon reading with a populated control series before "
-        + "concluding no abandons occurred rather than no scrape.",
+        + "falls when retries are dropped. Every outcome x retry_reason series is zero-seeded at "
+        + "start, so increase() counts the first event after each worker restart.",
       labelNames: ["outcome", "retry_reason"],
       registers: [registry],
     });
+    // BLO-35472: zero-seed the closed label set. A lazily-created series makes
+    // its first sample its first event, which increase()/rate() cannot see --
+    // and the worker restarts often, so the rare arms this counter exists for
+    // lost one event per restart (measured 7d: 8 abandons reported vs 12 real).
+    for (const outcome of KNOWN_RETRY_SCHEDULE_OUTCOMES) {
+      for (const retry_reason of KNOWN_RETRY_SCHEDULE_REASONS) {
+        retryScheduleOutcome.inc({ outcome, retry_reason }, 0);
+      }
+    }
     orphanReapStageSeconds = new Histogram({
       name: ORPHAN_REAP_STAGE_SECONDS_METRIC,
       help:

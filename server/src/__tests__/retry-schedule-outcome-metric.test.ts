@@ -17,6 +17,8 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import {
+  KNOWN_RETRY_SCHEDULE_OUTCOMES,
+  KNOWN_RETRY_SCHEDULE_REASONS,
   RETRY_SCHEDULE_OUTCOME_METRIC,
   __resetMetricsForTest,
   recordRetryScheduleOutcome,
@@ -61,6 +63,22 @@ async function readOutcomeCount(outcome: string, retryReason: string): Promise<n
 describe("recordRetryScheduleOutcome", () => {
   beforeEach(() => {
     __resetMetricsForTest();
+  });
+
+  it("zero-seeds every outcome x reason series so increase() sees the first event", async () => {
+    // An absent series and a zero series read the same through `readOutcomeCount`,
+    // but not through increase(): a series born at 1 has no prior sample, so the
+    // first abandon after a worker restart was invisible to rate queries.
+    const { body } = await renderMetrics();
+    const series = body
+      .split("\n")
+      .filter((line) => line.startsWith(`${RETRY_SCHEDULE_OUTCOME_METRIC}{`));
+    expect(series).toContain(
+      `${RETRY_SCHEDULE_OUTCOME_METRIC}{outcome="routine_retry_abandoned",retry_reason="transient_failure"} 0`,
+    );
+    expect(series).toHaveLength(
+      KNOWN_RETRY_SCHEDULE_OUTCOMES.length * KNOWN_RETRY_SCHEDULE_REASONS.length,
+    );
   });
 
   it("coerces an unknown outcome and reason to 'other' so cardinality stays bounded", async () => {
