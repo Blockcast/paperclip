@@ -76,6 +76,14 @@ JOB_NAME="paperclip-precreate-indexes-$(date +%s)-${RANDOM}"
 # expensive "drop it first" one. The Job is therefore only deleted once it has
 # reached a terminal state; a build still in progress is left alone to finish,
 # and the pre-flight will correctly refuse to roll over an incomplete index.
+# Safe unconditionally: used only where the container provably never ran, so no
+# DDL can have begun and there is nothing half-built to protect. Without this
+# the never-started path (an unpullable digest, an unschedulable pod) would leak
+# a Job that never finishes and therefore never reaches its TTL.
+delete_job_now() {
+  kubectl -n "${NS}" delete job "${JOB_NAME}" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+}
+
 delete_job_if_terminal() {
   local phase
   phase="$(kubectl -n "${NS}" get pods -l "job-name=${JOB_NAME}" \
@@ -169,7 +177,7 @@ done
 
 if [ "${container_started}" -ne 1 ]; then
   echo "online-index precreation: SKIPPED — the container never started within its ${STARTUP_TIMEOUT_SECONDS}s startup budget. No index was built and nothing was changed; the pre-flight decides." >&2
-  delete_job_if_terminal
+  delete_job_now
   exit 0
 fi
 
