@@ -668,57 +668,50 @@ test("the chart's image wrapper directory is the one the Dockerfiles install int
   );
 
   // The adapter prepends this same directory to every agent Job's PATH, on a
-  // surface the Helm render guard above cannot reach. It is declared once, in
-  // runtime-pin.ts: the runtime-pin bootstrap keys its PATH ordering off it
-  // (PEN-3714), and job-manifest.ts imports it rather than restating it, so a
-  // directory move cannot leave one of the two on a stale literal.
-  const adapterSource = (file) =>
-    fs.readFileSync(
-      path.join(repoRoot, "vendor/paperclip-adapter-claude-k8s/src/server", file),
-      "utf8",
-    );
-  assert.ok(
-    adapterSource("runtime-pin.ts").includes(
-      `export const IMAGE_WRAPPER_BIN_DIR = "${IMAGE_WRAPPER_BIN}";`,
-    ),
-    "the claude_k8s adapter must prepend the same directory the chart names",
-  );
-  assert.match(
-    adapterSource("job-manifest.ts"),
-    /import \{[^}]*\bIMAGE_WRAPPER_BIN_DIR\b[^}]*\} from "\.\/runtime-pin\.js";/,
-    "job-manifest.ts must take the wrapper directory from runtime-pin.ts, the one place it is declared",
-  );
-
-  // PEN-3916: opencode_k8s prepends the same directory, on the same
-  // unreachable-from-Helm surface. The assertion above used to stand alone,
-  // because opencode_k8s was cloned from a fork at a pinned SHA and there was no
-  // in-tree file to read; `scripts/check-opencode-k8s-pin-reachable.mjs` covered
-  // it by grepping the pinned tree over the network for a MENTION of the
-  // directory -- which, as Ally noted on #2392, attests presence and not
-  // ordering. The source is vendored now, so this is an ordinary file read, and
-  // the ORDERING itself is asserted behaviourally by the adapter's own suite
-  // (`buildJobManifest -- GitHub egress wrapper PATH ordering`, five cases
-  // including present-but-late). Neither property depends on a network probe.
+  // surface the Helm render guard above cannot reach. Both adapters declare it
+  // once, in runtime-pin.ts: each runtime-pin bootstrap keys its PATH ordering
+  // off it (PEN-3714 for claude_k8s, PEN-3925 for opencode_k8s), and each
+  // job-manifest.ts imports it rather than restating it, so a directory move
+  // cannot leave one of the two on a stale literal.
   //
-  // The shape differs from claude_k8s above deliberately, and it is not drift to
-  // reconcile here: PEN-3714's declare-once refactor moved the claude constant
-  // into runtime-pin.ts because its runtime-pin bootstrap also keys PATH
-  // ordering off it. This adapter's runtime-pin.ts does not, so PEN-3732's patch
-  // declares the directory in job-manifest.ts, its only consumer. One consumer,
-  // one declaration -- the property both assertions carry is the same: the
-  // directory the adapter prepends is the directory the chart names.
-  assert.ok(
-    fs
-      .readFileSync(
-        path.join(
-          repoRoot,
-          "vendor/paperclip-adapter-opencode-k8s/src/server/job-manifest.ts",
-        ),
+  // PEN-3916 vendored opencode_k8s, which is what makes this an ordinary file
+  // read for both. It used to be a network grep over the pinned fork tree
+  // (`scripts/check-opencode-k8s-pin-reachable.mjs`) which, as Ally noted on
+  // #2392, attested presence and not ordering. Ordering is now asserted
+  // behaviourally by each adapter's own suite, at BOTH layers: the Job spec
+  // (`buildJobManifest -- GitHub egress wrapper PATH ordering`, five cases) and
+  // the post-bootstrap shell (`PATH precedence`, executed under /bin/sh). The
+  // second layer exists because the first one passed for both adapters while
+  // runtime-pin.ts re-prepended the agent-writable runtime root after it.
+  for (const adapter of [
+    "paperclip-adapter-claude-k8s",
+    "paperclip-adapter-opencode-k8s",
+  ]) {
+    const adapterSource = (file) =>
+      fs.readFileSync(
+        path.join(repoRoot, "vendor", adapter, "src/server", file),
         "utf8",
-      )
-      .includes(`const GITHUB_WRAPPER_BIN_DIR = "${IMAGE_WRAPPER_BIN}";`),
-    "the opencode_k8s adapter must prepend the same directory the chart names",
-  );
+      );
+    assert.ok(
+      adapterSource("runtime-pin.ts").includes(
+        `export const IMAGE_WRAPPER_BIN_DIR = "${IMAGE_WRAPPER_BIN}";`,
+      ),
+      `the ${adapter} adapter must prepend the same directory the chart names`,
+    );
+    assert.match(
+      adapterSource("job-manifest.ts"),
+      /import \{[^}]*\bIMAGE_WRAPPER_BIN_DIR\b[^}]*\} from "\.\/runtime-pin\.js";/,
+      `${adapter}/job-manifest.ts must take the wrapper directory from runtime-pin.ts, the one place it is declared`,
+    );
+    // The runtime-pin bootstrap is the LAST writer of PATH in the Job's
+    // bootstrap pipeline, so it must re-assert the ordering rather than
+    // bare-prepend its own agent-writable runtime root over it (PEN-3925).
+    assert.match(
+      adapterSource("runtime-pin.ts"),
+      /case ":\$PATH:" in/,
+      `${adapter}/runtime-pin.ts must keep the wrapper directory ahead of the agent-writable runtime root`,
+    );
+  }
 
   // The third place the directory is named: inside the wrapper scripts
   // themselves. `git` and `github-mcp-server` chain-load

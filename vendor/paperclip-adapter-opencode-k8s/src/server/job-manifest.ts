@@ -1,7 +1,7 @@
 import { createHash } from "crypto";
 import { readFileSync } from "node:fs";
 import path from "node:path";
-import { buildOpencodeRuntimeShell, resolveOpencodeVersion } from "./runtime-pin.js";
+import { buildOpencodeRuntimeShell, IMAGE_WRAPPER_BIN_DIR, resolveOpencodeVersion } from "./runtime-pin.js";
 import type * as k8s from "@kubernetes/client-node";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import {
@@ -110,12 +110,13 @@ export const LARGE_PROMPT_THRESHOLD_BYTES = 100 * 1024;
 const RUNTIME_CACHE_VOLUME_NAME = "runtime-cache";
 const RUNTIME_CACHE_MOUNT_PATH = "/runtime-cache";
 
-// PEN-3713/PEN-3732. Where the paperclip agent image installs the root-owned
-// GitHub egress wrappers (Dockerfile `COPY docker/github-wrappers/`). Must
-// match `paperclip.imageWrapperBinDir` in the chart and the identical constant
-// in the claude_k8s adapter — the three name one directory, and a value that
-// drifts becomes a PATH entry no image carries.
-const GITHUB_WRAPPER_BIN_DIR = "/usr/local/libexec/paperclip/bin";
+// PEN-3713/PEN-3732/PEN-3925. Where the paperclip agent image installs the
+// root-owned GitHub egress wrappers (Dockerfile `COPY docker/github-wrappers/`).
+// Declared once, in runtime-pin.ts, and imported here: that bootstrap keys its
+// own PATH ordering off the same directory (PEN-3925), so a value declared in
+// both places could drift into a PATH entry no image carries. Must match
+// `paperclip.imageWrapperBinDir` in the chart and the identical constant in the
+// claude_k8s adapter.
 // Only used when the merged env carries no PATH at all; see the prepend below.
 const GITHUB_WRAPPER_FALLBACK_PATH =
   "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -735,10 +736,10 @@ function buildEnvVars(
   // branch is in practice unreachable — layer 3 `inheritedEnv` carries the
   // server pod's PATH, which the inherit allowlist admits by name.
   const pathEntries = (existingPath || GITHUB_WRAPPER_FALLBACK_PATH).split(":");
-  if (pathEntries[0] !== GITHUB_WRAPPER_BIN_DIR) {
+  if (pathEntries[0] !== IMAGE_WRAPPER_BIN_DIR) {
     merged.PATH = [
-      GITHUB_WRAPPER_BIN_DIR,
-      ...pathEntries.filter((entry) => entry !== GITHUB_WRAPPER_BIN_DIR),
+      IMAGE_WRAPPER_BIN_DIR,
+      ...pathEntries.filter((entry) => entry !== IMAGE_WRAPPER_BIN_DIR),
     ].join(":");
   }
 

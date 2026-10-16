@@ -2084,7 +2084,11 @@ describe("buildJobManifest — adapter-managed OpenCode runtime (opencodeVersion
     expect(command).toContain("set -o pipefail; __pover=");
     expect(command).toContain(`__pover='${DEFAULT_OPENCODE_VERSION}'`);
     expect(command).toContain(poroot("/paperclip"));
-    expect(command).toContain('export PATH="$__podir/node_modules/.bin:$PATH"');
+    // PEN-3925: the bootstrap re-asserts the wrapper ordering instead of
+    // bare-prepending the agent-writable runtime root. Both arms are pinned in
+    // runtime-pin.test.ts; here it is enough that PATH is exported at all.
+    expect(command).toContain('*) PATH="$__podir/node_modules/.bin:$PATH" ;;');
+    expect(command).toContain("esac; export PATH;");
     const runtimeEnd = command.indexOf("falling back to the image opencode");
     expect(runtimeEnd).toBeGreaterThan(-1);
     for (const later of ["ccrotate next", "cat /tmp/prompt/prompt.txt | opencode"]) {
