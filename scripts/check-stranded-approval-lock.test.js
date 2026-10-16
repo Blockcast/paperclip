@@ -332,6 +332,12 @@ test("an unreadable Deployment fails closed rather than reporting clean", () => 
 });
 
 // The grace window is only safe while it outlives the job that can hold a lock.
+// The deploy job is dispatched before a runner picks it up, so the grace
+// window must cover the job's own timeout PLUS the time it can sit queued.
+// 22m is the margin the pairing has carried since it was introduced (98m job /
+// 120m grace) and still carries today (118m / 140m).
+const RUNNER_QUEUEING_MARGIN_MINUTES = 22;
+
 // docker.yml caps the deploy job; raising that cap must fail here rather than
 // silently narrowing this window into the --atomic race.
 test("the grace window covers the whole deploy job", () => {
@@ -353,6 +359,21 @@ test("the grace window covers the whole deploy job", () => {
     `grace window (${grace[1]}m) must cover the deploy job timeout (${jobTimeout[1]}m), or a lock ` +
       "still held by a running deploy -- including one inside a `helm upgrade --atomic` rollback -- " +
       "reads as stranded",
+  );
+
+  // Covering the timeout is necessary but not sufficient: the job does not
+  // start when it is dispatched, it starts when a runner picks it up. The
+  // grace window has to clear the timeout by that queueing margin too, or a
+  // deploy that merely waited in the queue reads as stranded while it runs.
+  // Without this second assertion the margin is unpinned -- raising
+  // timeout-minutes alone would silently eat it and still pass.
+  assert.ok(
+    Number(grace[1]) - Number(jobTimeout[1]) >= RUNNER_QUEUEING_MARGIN_MINUTES,
+    `grace window (${grace[1]}m) must clear the deploy job timeout (${jobTimeout[1]}m) by at least ` +
+      `the ${RUNNER_QUEUEING_MARGIN_MINUTES}m runner-queueing margin, leaving ` +
+      `${Number(grace[1]) - Number(jobTimeout[1])}m; raise ` +
+      "PAPERCLIP_STRANDED_LOCK_GRACE_MINUTES in scripts/check-stranded-approval-lock.sh alongside " +
+      "timeout-minutes in .github/workflows/docker.yml",
   );
 });
 

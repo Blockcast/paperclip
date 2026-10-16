@@ -437,7 +437,7 @@ jobs:
     # Covers the sequential 30m Helm wait, 30m api rollout wait and 15m worker
     # rollout wait (BLO-29008), plus the pending-migration pre-flight's 600s
     # startup + 180s run budgets (BLO-31254), plus the online-index
-    # precreation's 600s startup + 2280s run budgets (PEN-4179), plus checkout,
+    # precreation's 600s startup + 600s run budgets (PEN-4179), plus checkout,
     # approval, final verification, and cleanup margin.
     # scripts/check-docker-deploy-timeout.test.js sums EVERY
     # `rollout status --timeout=` in this job AND reads both PREFLIGHT_*_SECONDS
@@ -454,11 +454,13 @@ jobs:
     # PAPERCLIP_STRANDED_LOCK_GRACE_MINUTES as stranded, on the premise that
     # such a lock is only ever held by a running deploy job. That window must
     # stay above this timeout PLUS the runner-queueing margin it was given
-    # (120m = the old 98m + 22m), or a lock held by a live deploy -- including
-    # one inside a `helm upgrade --atomic` rollback -- reads as abandoned.
-    # scripts/check-stranded-approval-lock.test.js pins the relationship, so the
-    # two move together or CI fails. Raising this to 146m for a three-spec
-    # precreation budget is exactly what it caught.
+    # (today 140m = this job's 118m + 22m), or a lock held by a live deploy --
+    # including one inside a `helm upgrade --atomic` rollback -- reads as
+    # abandoned. scripts/check-stranded-approval-lock.test.js pins BOTH halves:
+    # that the grace window covers this timeout, and that it clears it by at
+    # least the 22m queueing margin -- so raising this without raising the grace
+    # window fails CI instead of silently eating the margin. Raising this to
+    # 146m for a three-spec precreation budget is exactly what it caught.
     #
     # The precreation budget is therefore sized for ONE spec's build (600s
     # startup + 600s run = 20m), not for the worst case over several. That is
