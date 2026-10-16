@@ -66,6 +66,23 @@ export function opencodeRuntimeDir(dataMountPath: string, version: string): stri
   return `${dataMountPath.replace(/\/+$/, "")}/${RUNTIMES_DIR_RELATIVE}/opencode/${version}`;
 }
 
+/**
+ * Where the image installs the root-owned GitHub egress wrappers
+ * (`Dockerfile`: `COPY docker/github-wrappers/`). The single declaration site:
+ * job-manifest.ts imports it from here to make it `PATH[0]` on the Job env.
+ * deploy/helm/paperclip/tests/agent-egress-path.test.mjs pins this literal to
+ * the chart's `paperclip.imageWrapperBinDir`, the Dockerfiles and the wrapper
+ * scripts, and asserts that job-manifest.ts imports it rather than restating it.
+ *
+ * Mirrors the identical constant in the claude_k8s adapter (PEN-3925): both
+ * runtime-pin bootstraps key their PATH ordering off it, so both declare it
+ * here, in the module job-manifest.ts already imports.
+ *
+ * Contains no shell metacharacter, which is what lets the `case` pattern below
+ * interpolate it unquoted; `shellSingleQuote` still guards the assignment.
+ */
+export const IMAGE_WRAPPER_BIN_DIR = "/usr/local/libexec/paperclip/bin";
+
 function shellSingleQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
 }
@@ -118,7 +135,28 @@ export function buildOpencodeRuntimeShell(opts: { version: string; dataMountPath
       'fi; ' +
     'fi',
     'if [ -f "$__podir/.complete" ] && [ -x "$__pobin" ]; then ' +
-      'export PATH="$__podir/node_modules/.bin:$PATH"; ' +
+      // PEN-3925, mirroring PEN-3714 in the claude_k8s adapter. The managed
+      // binary goes ahead of the image's `opencode` - but NOT ahead of the
+      // root-owned GitHub egress wrappers. job-manifest.ts makes
+      // IMAGE_WRAPPER_BIN_DIR `PATH[0]` on the Job env; this snippet runs later,
+      // in the Job's own shell, so a bare prepend here silently demoted it.
+      //
+      // That matters because the wrapper directory is the one control over
+      // `gh`/`git`/`github-mcp-server` that a PVC write cannot reach: it lives in
+      // the image, root-owned, precisely so the shared-PVC trust assumption does
+      // NOT extend to it. The runtime root IS agent-writable by construction, so
+      // a Job shadows a wrapper by CREATING a file, not only by replacing one -
+      // reopening exactly what that directory closed.
+      //
+      // Keyed off $PATH rather than the filesystem so the branch is a pure
+      // function of the env this snippet inherits: an image that predates the
+      // wrappers has the directory on neither, and gains no phantom PATH entry.
+      // Re-prepending one already-present entry is a no-op for resolution.
+      'case ":$PATH:" in ' +
+        '*":' + IMAGE_WRAPPER_BIN_DIR + ':"*) ' +
+          'PATH=' + shellSingleQuote(IMAGE_WRAPPER_BIN_DIR) + '":$__podir/node_modules/.bin:$PATH" ;; ' +
+        '*) PATH="$__podir/node_modules/.bin:$PATH" ;; ' +
+      'esac; export PATH; ' +
       'echo "[paperclip] opencode runtime $(opencode --version 2>/dev/null | head -n1) (adapter-managed, pinned $__pover)" >&2; ' +
     'else ' +
       'echo "[paperclip] opencode $__pover unavailable; falling back to the image opencode $(opencode --version 2>/dev/null | head -n1)" >&2; ' +
