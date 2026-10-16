@@ -98,6 +98,7 @@ import { setPluginEventBus, setPluginEventOutboxDb } from "./services/activity-l
 import { startPluginEventOutbox } from "./services/plugin-event-outbox.js";
 import { superviseWorkerSingleton } from "./services/worker-singleton-supervisor.js";
 import { startPluginStatusCollector } from "./services/plugin-status-metrics.js";
+import { startProjectCheckoutOriginReconciler } from "./services/project-checkout-origin-reconciler.js";
 import { startGitHubCommitStatusDeliveryOutbox } from "./services/github-status-delivery-outbox.js";
 import { startGithubReviewGateDeliveryWorker } from "./services/github-review-gate-authority.js";
 import { startIssueCommentEffectReconciler } from "./services/issue-comment-effects.js";
@@ -1143,6 +1144,16 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
   // BLO-33243: every tier serves /metrics and is a scrape target, so unlike the
   // plugin-status collector this one is NOT gated on the node role.
   const stopScrapeMetricsCollector = startScrapeMetricsCollector(db);
+  // PEN-4188. NOT one of the scrape collector's refreshes: it probes the
+  // filesystem (one `git config` spawn per provisioned project checkout, 665 of
+  // them on the measured estate) rather than the database, and the collector
+  // runs its refreshes in series inside a 15 s tick. Its own 5-minute timer
+  // keeps a slow shared filesystem from delaying every DB-backed gauge.
+  // Unconditional for the same reason as the collector above: every tier mounts
+  // the project data volume and every tier is a scrape target, so a reconciler
+  // that ran on one tier only would leave the other publishing a permanently
+  // stale freshness gauge.
+  const stopProjectCheckoutOriginReconciler = startProjectCheckoutOriginReconciler(db);
   // PEN-3314: sample the V8 heap size far faster than the 60s scrape, so a heap
   // excursion that completes between two scrapes still leaves a durable number.
   // Started beside the scrape collector and for the same reason: every tier is a
@@ -1216,6 +1227,7 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
     stopGitHubStatusDeliveryOutbox?.();
     stopPluginStatusCollector?.();
     stopScrapeMetricsCollector();
+    stopProjectCheckoutOriginReconciler();
     stopHeapPeakTracking();
     await stopIssueCommentEffectReconciler?.();
     disableFeedbackExportFlushes();
