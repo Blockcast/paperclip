@@ -25,7 +25,7 @@
  * configured -- safer to refuse silently than to accept unsigned
  * requests masquerading as GitHub.
  */
-import { Router } from "express";
+import { Router, type Request, type Response } from "express";
 import crypto from "node:crypto";
 import {
   type Db,
@@ -197,6 +197,8 @@ export interface GithubWebhookConfig {
    * CI-completion author wake to one per (issue, head). Production asks GitHub.
    */
   resolveCiHeadSettlement?: typeof githubHeadChecksSettlement;
+  /** Test seam for the delivery bulkhead (BLO-47034); production derives it from the pool. */
+  maxConcurrentDeliveries?: number;
   /**
    * Optional seam for the head-attestation idempotency check (BLO-32198).
    * Production lists reviews through the GitHub App; route tests supply a
@@ -5372,8 +5374,51 @@ async function wakeStackedChildIssues(input: {
   return woken;
 }
 
+/**
+ * Cap on deliveries this router processes at once (BLO-47034).
+ *
+ * GitHub delivers CI events in bursts — measured 1,159/min on 2026-10-15 22:12Z,
+ * mostly `check_run`/`workflow_run` — and before this bound every delivery
+ * started its DB work the instant it arrived. Reproduced with 120 concurrent
+ * `check_run.completed` deliveries on one 18-connection pool: `active` 18/18,
+ * 103 queries waiting, an unrelated `select 1` delayed 2.5–3.1 s. That held
+ * both before and after BLO-46732 cut a CI lane to 2 queries, because even a
+ * cheap first query queues when a hundred land at once. In production the same
+ * shape stalled every API request on the pod for 1–3 minutes, including
+ * `/api/cli-auth/me`, which the auth proxies time out at 5 s.
+ *
+ * So bound the deliveries, not the queries: at most `floor(poolMax / 3)` are
+ * in the handler at once. A CI delivery holds one connection at a time, so a CI
+ * burst takes at most a third of the pool; a reviewer-wake delivery can hold
+ * two (see {@link derivePrReviewerWakeMaxConcurrency}), so even a burst made
+ * entirely of those leaves a third free. The rest wait here, in-process and
+ * FIFO, rather than in postgres.js's queue in front of interactive traffic.
+ *
+ * Derived from {@link POSTGRES_POOL_MAX} for the same reason as the reviewer
+ * bound: shrinking the pool must shrink this with it.
+ */
+export function deriveGithubWebhookMaxConcurrentDeliveries(poolMax: number): number {
+  return Math.max(1, Math.floor(poolMax / 3));
+}
+
+// ponytail: bounds memory, not latency — past this, a delivery is refused 503
+// rather than queued. At the measured drain rate a queue this deep is already
+// far past GitHub's 10 s window, so the delivery has failed on GitHub's side
+// either way; refusing only stops a DB outage from growing the queue forever.
+const GITHUB_WEBHOOK_MAX_QUEUED_DELIVERIES = 2000;
+
 export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
   const router = Router();
+  const maxConcurrentDeliveries =
+    config.maxConcurrentDeliveries ?? deriveGithubWebhookMaxConcurrentDeliveries(POSTGRES_POOL_MAX);
+  let deliveriesInFlight = 0;
+  const deliveryWaiters: Array<() => void> = [];
+  const releaseDeliverySlot = () => {
+    // Hand the slot straight to the next waiter, as releasePrReviewerWakeSlot does.
+    const next = deliveryWaiters.shift();
+    if (next) next();
+    else deliveriesInFlight -= 1;
+  };
 
   router.post("/", async (req, res) => {
     // BLO-39378: count every inbound delivery that reaches this router, on
@@ -5418,6 +5463,26 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       }
     });
 
+    if (deliveriesInFlight < maxConcurrentDeliveries) {
+      deliveriesInFlight += 1;
+    } else if (deliveryWaiters.length >= GITHUB_WEBHOOK_MAX_QUEUED_DELIVERIES) {
+      logger.error(
+        { event: req.header("x-github-event"), deliveryId: req.header("x-github-delivery") },
+        "github webhook delivery refused: bulkhead queue full (BLO-47034)",
+      );
+      res.status(503).json({ error: "github webhook busy" });
+      return;
+    } else {
+      await new Promise<void>((resolve) => deliveryWaiters.push(resolve));
+    }
+    try {
+      await handleDelivery(req, res);
+    } finally {
+      releaseDeliverySlot();
+    }
+  });
+
+  async function handleDelivery(req: Request, res: Response): Promise<void> {
     if (!config.webhookSecret) {
       logger.warn("github webhook received but GITHUB_WEBHOOK_SECRET is not configured; refusing");
       res.status(503).json({ error: "github webhook not configured" });
@@ -7962,7 +8027,7 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
           }
         : {}),
     });
-  });
+  }
 
   return router;
 }
