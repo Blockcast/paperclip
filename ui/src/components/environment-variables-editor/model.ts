@@ -249,6 +249,26 @@ export function maskedRenameBlockers(rows: EnvRow[]): EnvRow[] {
   return rows.filter((row) => maskedRenameIssue(row) !== null);
 }
 
+/**
+ * The one sentence a refused save is allowed to say, wherever it is said.
+ *
+ * Lives here rather than in the banner JSX because the refusal now has more than one audience: the
+ * editor's own "Unsaved changes" banner renders it inline, and an *outer* Save — a consumer driving
+ * the editor through `flushPendingDraft` — surfaces the same refusal away from the editor, where
+ * the banner may be scrolled out of view. Two renderings of one refusal must not be allowed to
+ * drift into two different explanations of it, so there is one function and both call it.
+ *
+ * Returns `null` for the empty set so callers can use it directly as "is there anything to say".
+ */
+export function maskedRenameBlockerMessage(blockers: readonly EnvRow[]): string | null {
+  if (blockers.length === 0) return null;
+  if (blockers.length === 1) {
+    const row = blockers[0]!;
+    return `Can't save: ${row.maskedKey} has a hidden value and can't be renamed to ${row.name.trim() || "an empty name"}.`;
+  }
+  return `Can't save: ${blockers.map((row) => row.maskedKey).join(", ")} have hidden values and can't be renamed.`;
+}
+
 /** Names that appear on more than one row (trimmed, non-empty). */
 export function computeDuplicateNames(rows: EnvRow[]): Set<string> {
   const counts = new Map<string, number>();

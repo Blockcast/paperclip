@@ -4,6 +4,7 @@ import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, Route, Routes } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { REDACTED_SENTINEL } from "@paperclipai/shared";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { CompanyEnvironments } from "./CompanyEnvironments";
 
@@ -698,6 +699,65 @@ describe("CompanyEnvironments — test provider button", () => {
       }),
     );
     await waitForAssertion(() => expect(getEnvironmentFormPage()).toBeNull());
+  });
+
+  it("refuses to save the environment while a withheld variable is renamed, instead of saving stale env (PEN-3358)", async () => {
+    // The third `flushPendingDraft` consumer. `flushEnvironmentForm` used to fall back to
+    // `environmentForm` — which carries the last committed `envVars` — whenever the editor
+    // returned `null`. Because a refusal and "no draft" were the same `null`, renaming a
+    // server-masked variable submitted the environment with its *pre-edit* env alongside every
+    // other edited field, and reported it as a successful save.
+    mockEnvironmentsApi.list.mockResolvedValue([
+      {
+        id: "env-1",
+        name: "Alpha",
+        driver: "sandbox",
+        description: null,
+        config: { provider: "e2b" },
+        envVars: { GH_TOKEN: { type: "plain", value: REDACTED_SENTINEL } },
+      },
+      { id: "env-2", name: "Beta", driver: "sandbox", description: null, config: { provider: "e2b" } },
+    ]);
+
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root!.render(renderCompanyEnvironments(queryClient));
+    });
+    await flushReact();
+
+    await openFirstEnvironmentForEditing(container);
+    await waitForAssertion(() => {
+      expect(getEnvironmentFormPage()?.textContent).toContain("Edit environment");
+    });
+
+    const page = getEnvironmentFormPage()!;
+    const variableName = page.querySelector<HTMLInputElement>('input[aria-label="Variable name"]')!;
+    expect(variableName.value, "the masked row must be loaded from the environment").toBe("GH_TOKEN");
+
+    // Rename the withheld variable off the key its mask was issued under.
+    await act(async () => {
+      setInputValue(variableName, "GITHUB_TOKEN");
+    });
+    await flushReact();
+
+    await act(async () => {
+      findButton(document.body, "Save environment")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    await flushReact();
+
+    // The sibling test above ("opens the edit form ... and closes after save") proves this same
+    // button DOES call `update` when the editor is not refusing, so this is about the refusal.
+    expect(
+      mockEnvironmentsApi.update,
+      "a refused env draft must abort the environment save, not submit the pre-edit env",
+    ).not.toHaveBeenCalled();
+
+    // The form must stay open on the refusal — closing it would discard the edit silently.
+    expect(getEnvironmentFormPage(), "the edit page must stay open so the block can be fixed").not.toBeNull();
+    expect(page.textContent).toContain("Can't save");
+    expect(page.textContent).toContain("GH_TOKEN");
   });
 
   it("confirms before cancelling the edit page with unsaved environment variable drafts", async () => {

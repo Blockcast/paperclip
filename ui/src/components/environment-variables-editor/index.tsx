@@ -22,6 +22,7 @@ import {
   computeUserSecretRowHealth,
   emptyRow,
   envKeyFromSecretName,
+  maskedRenameBlockerMessage,
   maskedRenameBlockers,
   maskedRenameIssue,
   rowsFromValue,
@@ -139,12 +140,34 @@ export interface EnvironmentVariablesEditorProps {
   onDirtyChange?: (dirty: boolean) => void;
 }
 
+/**
+ * What an outer action learns when it asks the editor to promote its draft.
+ *
+ * Three outcomes, because the caller must treat them differently and a single nullable value
+ * cannot tell them apart. `null` used to mean both "there was nothing to promote" and "there were
+ * changes and I refused them", and every consumer read the pair as the first: on a refusal the
+ * outer Save proceeded **without** the env edit, silently saving around a block the editor was
+ * displaying at that moment. The discriminant exists so that mistake is not expressible.
+ */
+export type FlushPendingDraftResult =
+  /** A draft existed and is now promoted; `env` is the value the parent has just been given. */
+  | { status: "flushed"; env: Record<string, EnvBinding> }
+  /** Nothing to promote — the editor is disabled, or the draft matches the committed value. */
+  | { status: "idle" }
+  /**
+   * A draft existed and the editor refused it. The outer action **must not proceed**: the refusal
+   * is the same one the editor's own Save button is disabled by, and `message` is the same sentence
+   * its banner renders. The editor has already moved focus to the offending row.
+   */
+  | { status: "blocked"; message: string };
+
 export interface EnvironmentVariablesEditorHandle {
   /**
-   * Promote the editor-local draft into the controlled value before an outer
-   * action reads parent state. Returns the promoted value when a draft existed.
+   * Promote the editor-local draft into the controlled value before an outer action reads parent
+   * state. See {@link FlushPendingDraftResult} — a `blocked` result must abort the outer action,
+   * not fall through to the last committed value.
    */
-  flushPendingDraft: () => Record<string, EnvBinding> | null;
+  flushPendingDraft: () => FlushPendingDraftResult;
 }
 
 export const EnvironmentVariablesEditor = forwardRef<EnvironmentVariablesEditorHandle, EnvironmentVariablesEditorProps>(function EnvironmentVariablesEditor({
@@ -239,6 +262,7 @@ export const EnvironmentVariablesEditor = forwardRef<EnvironmentVariablesEditorH
   // Declared up here, above `flushPendingDraft`, because that callback's dependency array is
   // evaluated during render — a `const` declared further down would be in its TDZ.
   const renameBlockers = useMemo(() => maskedRenameBlockers(rows), [rows]);
+  const renameBlockerMessage = useMemo(() => maskedRenameBlockerMessage(renameBlockers), [renameBlockers]);
 
   useEffect(() => {
     onDirtyChange?.(!disabled && hasUnsavedChanges);
@@ -284,18 +308,33 @@ export const EnvironmentVariablesEditor = forwardRef<EnvironmentVariablesEditorH
     return () => window.removeEventListener("beforeunload", handleBeforeUnload);
   }, [disabled, hasUnsavedChanges]);
 
-  const flushPendingDraft = useCallback(() => {
-    if (disabled || !hasUnsavedChanges) return null;
+  const flushPendingDraft = useCallback((): FlushPendingDraftResult => {
+    if (disabled || !hasUnsavedChanges) return { status: "idle" };
     // Same refusal as `saveDraft`, and it has to be repeated here rather than left to the button:
     // this is the path an *outer* Save/submit takes, so without it the very edit the row is
     // flagging would be promoted past the block the row is displaying.
-    if (renameBlockers.length > 0) return null;
+    //
+    // Reporting it is this function's job too. The outer action that called us renders somewhere
+    // else on the page — a sticky header, a dialog footer — and the editor's banner may well be
+    // scrolled out of view, so "the banner already says so" is not a signal the user receives.
+    // Focus the offending row (same move the editor's own Save makes) and say it once out loud.
+    if (renameBlockers.length > 0) {
+      const message = maskedRenameBlockerMessage(renameBlockers) ?? "Can't save: a hidden value can't be renamed.";
+      setPendingFocus({ rowId: renameBlockers[0]!.id, field: "name" });
+      toast?.pushToast({
+        title: message,
+        tone: "error",
+        // Repeated Save presses are one unresolved problem, not a queue of them.
+        dedupeKey: `env-editor-rename-blocked|${message}`,
+      });
+      return { status: "blocked", message };
+    }
     pendingSaveValueKeyRef.current = draftValueKey;
     flushSync(() => {
       onChange(draftValue);
     });
-    return draftValue ?? {};
-  }, [disabled, draftValue, draftValueKey, hasUnsavedChanges, onChange, renameBlockers]);
+    return { status: "flushed", env: draftValue ?? {} };
+  }, [disabled, draftValue, draftValueKey, hasUnsavedChanges, onChange, renameBlockers, toast]);
 
   useImperativeHandle(ref, () => ({ flushPendingDraft }), [flushPendingDraft]);
 
@@ -303,8 +342,16 @@ export const EnvironmentVariablesEditor = forwardRef<EnvironmentVariablesEditorH
     const form = editorRootRef.current?.closest("form");
     if (!form) return;
 
-    function handleSubmit() {
-      flushPendingDraft();
+    function handleSubmit(event: Event) {
+      // Capture phase, so this runs before the form's own submit handler. A refusal has to stop
+      // the submit outright rather than merely decline to contribute: letting it through would
+      // submit the *last committed* env alongside every other field's new value, which is the
+      // silent partial save this block exists to prevent. Consumers that read the handle directly
+      // get the same answer from the return value; this covers the ones that never call it.
+      if (flushPendingDraft().status === "blocked") {
+        event.preventDefault();
+        event.stopPropagation();
+      }
     }
 
     form.addEventListener("submit", handleSubmit, true);
@@ -323,7 +370,13 @@ export const EnvironmentVariablesEditor = forwardRef<EnvironmentVariablesEditorH
       if (!button || button.disabled) return;
       const label = `${button.getAttribute("aria-label") ?? ""} ${button.textContent ?? ""}`;
       if (button.type === "submit" || /\b(save|create|update|test|import)\b/i.test(label)) {
-        flushPendingDraft();
+        // Same reasoning as the form `submit` listener above: on a refusal, swallow the click in
+        // the capture phase so the outer button's own handler never runs. Without this the button
+        // would proceed on state the editor has just refused to update.
+        if (flushPendingDraft().status === "blocked") {
+          event.preventDefault();
+          event.stopPropagation();
+        }
       }
     }
 
@@ -557,12 +610,8 @@ export const EnvironmentVariablesEditor = forwardRef<EnvironmentVariablesEditorH
                 {changeSummaryText}
               </p>
             ) : null}
-            {renameBlockers.length > 0 ? (
-              <p className="min-w-0 pl-4 text-xs font-medium text-destructive">
-                {renameBlockers.length === 1
-                  ? `Can't save: ${renameBlockers[0]!.maskedKey} has a hidden value and can't be renamed to ${renameBlockers[0]!.name.trim() || "an empty name"}.`
-                  : `Can't save: ${renameBlockers.map((row) => row.maskedKey).join(", ")} have hidden values and can't be renamed.`}
-              </p>
+            {renameBlockerMessage ? (
+              <p className="min-w-0 pl-4 text-xs font-medium text-destructive">{renameBlockerMessage}</p>
             ) : null}
           </div>
           <div className="flex items-center gap-2">

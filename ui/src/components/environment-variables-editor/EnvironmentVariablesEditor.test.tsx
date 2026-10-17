@@ -707,10 +707,36 @@ describe("EnvironmentVariablesEditor", () => {
     outerSave.click();
     await flush();
     expect(onChange, "an outer submit must not promote the blocked draft either").not.toHaveBeenCalled();
-    expect(submitted.at(-1), "the outer form still sees the last good value").toEqual({
-      GH_TOKEN: { type: "plain", value: REDACTED_SENTINEL },
-      NODE_ENV: { type: "plain", value: "production" },
-    });
+    // PEN-3358: the outer submit is now *aborted*, not merely un-contributed-to.
+    //
+    // This assertion previously read `submitted.at(-1)` and accepted the last committed env —
+    // encoding the silent partial save as the contract. Declining to promote the draft while
+    // letting the submit through means the form commits the env the user had *before* the edit,
+    // alongside every other field's new value, and reports that as a success. The capture-phase
+    // listener now `preventDefault()`s on a refusal, so the form's own submit handler never runs.
+    expect(submitted, "a refused draft must abort the outer submit, not submit stale env").toEqual([]);
+
+    // The two capture-phase listeners (form `submit` and outside-Save `click`) both cover the
+    // click above, so neither is killed by that assertion alone — remove either one and it still
+    // passes. Pin them individually by dispatching each event directly and reading
+    // `defaultPrevented`, which is the listener's own observable effect.
+    const form = container.querySelector("form")!;
+    const submitEvent = new Event("submit", { bubbles: true, cancelable: true });
+    form.dispatchEvent(submitEvent);
+    await flush();
+    expect(
+      submitEvent.defaultPrevented,
+      "the capture-phase form submit listener must cancel a submit the editor is refusing",
+    ).toBe(true);
+
+    const clickEvent = new MouseEvent("click", { bubbles: true, cancelable: true });
+    outerSave.dispatchEvent(clickEvent);
+    await flush();
+    expect(
+      clickEvent.defaultPrevented,
+      "the outside-Save click listener must cancel a click the editor is refusing",
+    ).toBe(true);
+    expect(submitted, "and neither path may reach the form handler").toEqual([]);
 
     // Re-entering a value makes the rename legitimate; both routes must open back up.
     const maskedValue = container.querySelectorAll<HTMLInputElement>('input[aria-label="Variable value"]')[0]!;

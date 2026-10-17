@@ -4,7 +4,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { flushSync } from "react-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { Agent, Environment } from "@paperclipai/shared";
+import { REDACTED_SENTINEL, type Agent, type Environment } from "@paperclipai/shared";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { AgentConfigForm } from "./AgentConfigForm";
 import { defaultCreateValues } from "./agent-config-defaults";
@@ -188,10 +188,27 @@ function setInputValue(input: HTMLInputElement, value: string) {
   input.dispatchEvent(new Event("input", { bubbles: true }));
 }
 
+/** Matches `AgentConfigFormProps["onSave"]` in edit mode. */
+type AgentSaveHandler = (patch: Record<string, unknown>) => void | Promise<unknown>;
+type AgentSaveSpy = ReturnType<typeof vi.fn<AgentSaveHandler>>;
+
 async function renderForm(
   environments: Environment[],
   agentOverrides: Partial<Agent> = {},
-  options: { showAdapterTestEnvironmentButton?: boolean } = {},
+  options: {
+    showAdapterTestEnvironmentButton?: boolean;
+    /** Spy for the edit-mode save. Defaults to a fresh spy; returned as `onSave`. */
+    onSave?: AgentSaveSpy;
+    /** Hide the built-in sticky Save, as a parent toolbar owning the save action does. */
+    hideInlineSave?: boolean;
+    /**
+     * Register `onTestActionChange` so the test can invoke the adapter test programmatically.
+     * Opt-in because supplying the callback at all hides the form's own inline Test button
+     * (`AgentConfigForm.tsx` — `showInlineAdapterTestEnvironmentButton`), which the DOM-driven
+     * tests in this file rely on.
+     */
+    captureTestAction?: boolean;
+  } = {},
 ) {
   mockEnvironmentsApi.list.mockResolvedValue(environments);
 
@@ -205,6 +222,15 @@ async function renderForm(
     },
   });
 
+  const onSave: AgentSaveSpy = options.onSave ?? vi.fn<AgentSaveHandler>();
+  // The save action AgentConfigForm registers with a parent toolbar. Captured so a test can invoke
+  // the real `handleSave` without going through a DOM click near the editor — the path a parent
+  // that owns its own Save button takes, and the only path the editor's capture-phase listeners
+  // cannot see.
+  const saveAction: { current: (() => void) | null } = { current: null };
+  /** Same idea for the adapter test action a parent toolbar owns. */
+  const testAction: { current: (() => void) | null } = { current: null };
+
   await act(async () => {
     root.render(
       <QueryClientProvider client={queryClient}>
@@ -212,7 +238,14 @@ async function renderForm(
           <AgentConfigForm
             mode="edit"
             agent={makeAgent(agentOverrides)}
-            onSave={vi.fn()}
+            onSave={onSave}
+            onSaveActionChange={(save) => {
+              saveAction.current = save;
+            }}
+            onTestActionChange={options.captureTestAction ? (test) => {
+              testAction.current = test;
+            } : undefined}
+            hideInlineSave={options.hideInlineSave ?? false}
             hidePromptTemplate
             showAdapterTypeField={false}
             showAdapterTestEnvironmentButton={options.showAdapterTestEnvironmentButton ?? false}
@@ -223,7 +256,7 @@ async function renderForm(
   });
 
   await flushReact();
-  return { container, root };
+  return { container, root, onSave, saveAction, testAction };
 }
 
 async function renderCreateForm(
@@ -567,6 +600,153 @@ describe("AgentConfigForm environment selector", () => {
         }),
       ]);
     }
+  });
+
+  // ---- PEN-3358: a refused env draft must abort the outer action, not be saved around ----
+  //
+  // `flushPendingDraft` used to answer `null` both for "nothing to promote" and for "there are
+  // changes and I refuse them". Both ref-handle consumers read that single value as the former, so
+  // a refusal let the outer action proceed on the *last committed* env — a partial save the user
+  // was never told about. These two tests pin the two ways an outer action reaches the editor.
+
+  /** An agent whose stored env carries a server-masked value, plus one ordinary variable. */
+  const maskedEnvAgent = {
+    adapterConfig: {
+      model: "gpt-5.4",
+      env: {
+        GH_TOKEN: { type: "plain", value: REDACTED_SENTINEL },
+        NODE_ENV: { type: "plain", value: "production" },
+      },
+    },
+  } satisfies Partial<Agent>;
+
+  /** Rename the masked row off the key its mask was issued under — the refusal trigger. */
+  async function renameMaskedRow(container: HTMLElement, to: string) {
+    const nameInput = container.querySelectorAll<HTMLInputElement>('input[aria-label="Variable name"]')[0];
+    expect(nameInput, "the masked row's name field must be present").toBeTruthy();
+    await act(async () => {
+      setInputValue(nameInput!, to);
+    });
+    await flushReact();
+  }
+
+  it("refuses an adapter-config test while a withheld env row is renamed, instead of testing stale env (PEN-3358)", async () => {
+    const result = await renderForm(
+      [makeEnvironment({ id: "local-1", name: "Local", driver: "local" })],
+      maskedEnvAgent,
+      { showAdapterTestEnvironmentButton: true },
+    );
+    roots.push(result.root);
+
+    await renameMaskedRow(result.container, "GITHUB_TOKEN");
+
+    const testButton = Array.from(result.container.querySelectorAll("button")).find(
+      (button) => button.textContent?.trim() === "Test",
+    );
+    expect(testButton).toBeTruthy();
+
+    await act(async () => {
+      testButton?.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+    });
+    await flushReact();
+
+    // The sibling test above ("flushes pending environment variable edits before testing adapter
+    // config") proves this same button DOES reach `testEnvironment` with the promoted draft when
+    // the editor is not refusing — so this assertion is about the refusal, not about the button
+    // being inert in general.
+    expect(
+      mockAgentsApi.testEnvironment,
+      "a refused env draft must abort the test, not test the pre-edit env",
+    ).not.toHaveBeenCalled();
+
+    // And the refusal has to be legible, naming the row that caused it.
+    expect(result.container.textContent).toContain("Can't save");
+    expect(result.container.textContent).toContain("GH_TOKEN");
+  });
+
+  it("refuses a programmatic adapter test while a withheld env row is renamed (PEN-3358)", async () => {
+    // The DOM-click version of this above is also covered by the editor's outside-Save click
+    // listener, so it does not pin the guard inside `testEnvironment`'s `mutationFn`. Invoking the
+    // registered test action directly bypasses every DOM listener and leaves only that guard.
+    const result = await renderForm(
+      [makeEnvironment({ id: "local-1", name: "Local", driver: "local" })],
+      maskedEnvAgent,
+      { showAdapterTestEnvironmentButton: true, captureTestAction: true },
+    );
+    roots.push(result.root);
+
+    await renameMaskedRow(result.container, "GITHUB_TOKEN");
+
+    expect(result.testAction.current, "the form must register a test action").toBeTruthy();
+    await act(async () => {
+      result.testAction.current?.();
+    });
+    await flushReact();
+
+    expect(
+      mockAgentsApi.testEnvironment,
+      "a refused env draft must abort the adapter test, not test the pre-edit env",
+    ).not.toHaveBeenCalled();
+    // And the refusal reaches the user through the form's own error surface.
+    expect(result.container.textContent).toContain("Can't save");
+  });
+
+  it("refuses a programmatic Save while a withheld env row is renamed, then saves once the block lifts (PEN-3358)", async () => {
+    const result = await renderForm(
+      [makeEnvironment({ id: "local-1", name: "Local", driver: "local" })],
+      maskedEnvAgent,
+      // No inline Save: the parent toolbar owns it and calls the registered action directly. This
+      // is the path the editor's capture-phase listeners cannot intercept, so it isolates the
+      // consumer-side guard in `AgentConfigForm.handleSave`.
+      { hideInlineSave: true },
+    );
+    roots.push(result.root);
+
+    // Dirty a NON-env field as well. This is what makes the bug a *partial save* rather than a
+    // no-op: under the old code the refusal fell through to `overlay`, which carries this name
+    // change, so `onSave` fired with the new name and the pre-edit env — reported as a success.
+    const nameField = result.container.querySelector<HTMLInputElement>('input[placeholder="Agent name"]');
+    expect(nameField, "the identity Name field must be present").toBeTruthy();
+    await act(async () => {
+      setInputValue(nameField!, "Cody Renamed");
+    });
+    await flushReact();
+
+    await renameMaskedRow(result.container, "GITHUB_TOKEN");
+
+    expect(result.saveAction.current, "the form must register a save action").toBeTruthy();
+    await act(async () => {
+      result.saveAction.current?.();
+    });
+    await flushReact();
+
+    expect(
+      result.onSave,
+      "a refused env draft must abort the whole save, not save the other fields around it",
+    ).not.toHaveBeenCalled();
+
+    // Re-entering a value makes the rename legitimate. The block must lift rather than latch —
+    // without this the test would also pass against a form that simply never saves.
+    const maskedValue = result.container.querySelectorAll<HTMLInputElement>('input[aria-label="Variable value"]')[0];
+    expect(maskedValue).toBeTruthy();
+    await act(async () => {
+      setInputValue(maskedValue!, "a-new-token");
+    });
+    await flushReact();
+
+    await act(async () => {
+      result.saveAction.current?.();
+    });
+    await flushReact();
+
+    expect(result.onSave, "the save must go through once the row is no longer blocking").toHaveBeenCalledTimes(1);
+    const patch = result.onSave.mock.calls[0]![0] as Record<string, unknown>;
+    const adapterConfig = patch.adapterConfig as Record<string, unknown> | undefined;
+    expect(adapterConfig?.env, "and must carry the renamed binding, not the pre-edit env").toEqual({
+      GITHUB_TOKEN: { type: "plain", value: "a-new-token" },
+      NODE_ENV: { type: "plain", value: "production" },
+    });
+    expect(patch.name, "and must still carry the non-env edit").toBe("Cody Renamed");
   });
 
   it("surfaces request failures instead of converting them into model test checks", async () => {

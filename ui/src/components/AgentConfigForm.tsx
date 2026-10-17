@@ -50,6 +50,7 @@ import { ReportsToPicker } from "./ReportsToPicker";
 import {
   EnvironmentVariablesEditor,
   type EnvironmentVariablesEditorHandle,
+  type FlushPendingDraftResult,
 } from "./environment-variables-editor";
 import { shouldShowLegacyWorkingDirectoryField } from "../lib/legacy-agent-config";
 import { listAdapterOptions, listVisibleAdapterTypes } from "../adapters/metadata";
@@ -320,8 +321,10 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
     }));
   }
 
-  function flushEnvironmentDraft() {
-    return environmentVariablesEditorRef.current?.flushPendingDraft() ?? null;
+  function flushEnvironmentDraft(): FlushPendingDraftResult {
+    // No editor mounted (create mode, or a layout that hides the section) is "nothing to promote",
+    // not "refused" — the optional-chain fallback must stay on the permissive branch.
+    return environmentVariablesEditorRef.current?.flushPendingDraft() ?? { status: "idle" };
   }
 
   /** Build accumulated patch and send to parent */
@@ -331,13 +334,19 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
 
   const handleSave = useCallback(async () => {
     if (isCreate) return;
-    const flushedEnv = flushEnvironmentDraft();
-    const nextOverlay = flushedEnv
+    const flushed = flushEnvironmentDraft();
+    // Abort the whole save. Previously a refusal fell through to `overlay`, so Save went ahead with
+    // the *last committed* env and every other dirty field's new value — a partial save the user
+    // was never told about, and which reads as success. If nothing else was dirty it returned
+    // silently instead, so the Save button simply did nothing. The editor has already explained
+    // itself and focused the offending row; the only thing left for us to do is not save.
+    if (flushed.status === "blocked") return;
+    const nextOverlay = flushed.status === "flushed"
       ? {
           ...overlay,
           adapterConfig: {
             ...overlay.adapterConfig,
-            env: flushedEnv,
+            env: flushed.env,
           },
         }
       : overlay;
@@ -631,8 +640,13 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
       if (!selectedCompanyId) {
         throw new Error("Select a company to test adapter environment");
       }
-      const flushedEnv = flushEnvironmentDraft();
-      const adapterConfigPatch = flushedEnv ? { env: flushedEnv } : undefined;
+      const flushed = flushEnvironmentDraft();
+      // The second ref-handle consumer in this file, and it had the same defect as `handleSave`:
+      // a refusal read as "no draft" and the adapter was tested against the pre-edit env, so the
+      // run that told the user their config works never saw the config they were editing.
+      // Refuse the test outright and say why — `testActionError` renders this inline.
+      if (flushed.status === "blocked") throw new Error(flushed.message);
+      const adapterConfigPatch = flushed.status === "flushed" ? { env: flushed.env } : undefined;
       const primaryModel = currentModelId.trim() || null;
       const cheapTestCase = getCheapModelTestCase(adapterConfigPatch);
       const environmentId = currentDefaultEnvironmentId || null;
