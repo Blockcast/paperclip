@@ -1478,9 +1478,17 @@ export function CompanyEnvironments({ mode = "list" }: CompanyEnvironmentsProps)
     navigate(ENVIRONMENTS_PATH);
   }
 
-  function flushEnvironmentForm(): EnvironmentFormState {
-    const flushedEnvVars = environmentVariablesEditorRef.current?.flushPendingDraft();
-    return flushedEnvVars ? { ...environmentForm, envVars: flushedEnvVars } : environmentForm;
+  /**
+   * The form state to submit, or `null` when the env editor refused its draft.
+   *
+   * `null` means **do not submit**. It previously fell back to `environmentForm`, which carries the
+   * last committed `envVars`, so a refused rename was submitted as an unchanged env alongside every
+   * other edited field — a partial save reported to the user as a successful one.
+   */
+  function flushEnvironmentForm(): EnvironmentFormState | null {
+    const flushed = environmentVariablesEditorRef.current?.flushPendingDraft() ?? { status: "idle" as const };
+    if (flushed.status === "blocked") return null;
+    return flushed.status === "flushed" ? { ...environmentForm, envVars: flushed.env } : environmentForm;
   }
 
   const discoveredPluginSandboxProviders = Object.entries(environmentCapabilities?.sandboxProviders ?? {})
@@ -1968,14 +1976,20 @@ export function CompanyEnvironments({ mode = "list" }: CompanyEnvironmentsProps)
             {environmentForm.driver !== "local" ? (
               <Button
                 variant="outline"
-                onClick={() => draftEnvironmentProbeMutation.mutate(flushEnvironmentForm())}
+                onClick={() => {
+                  const form = flushEnvironmentForm();
+                  if (form) draftEnvironmentProbeMutation.mutate(form);
+                }}
                 disabled={draftEnvironmentProbeMutation.isPending || !environmentFormValid}
               >
                 {draftEnvironmentProbeMutation.isPending ? "Testing..." : "Test"}
               </Button>
             ) : null}
             <Button
-              onClick={() => environmentMutation.mutate(flushEnvironmentForm())}
+              onClick={() => {
+                const form = flushEnvironmentForm();
+                if (form) environmentMutation.mutate(form);
+              }}
               disabled={environmentMutation.isPending || !environmentFormValid}
             >
               {environmentMutation.isPending
