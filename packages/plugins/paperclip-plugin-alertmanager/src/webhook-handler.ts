@@ -37,7 +37,7 @@ import {
 } from "./owner-resolver.js";
 import type { CompanyAgentRoster } from "./owner-resolver.js";
 import { aggregateKeyForAlert } from "./aggregate-key.js";
-import { coverCloseHoldMinutes, escalationDeadlineMs, recordSourceResolvedAndCloseCovers, reopenOpenCoverMembership } from "./escalation.js";
+import { coverCloseHoldMinutes, escalationDeadlineMs, hasLiveBlocker, recordSourceResolvedAndCloseCovers, reopenOpenCoverMembership } from "./escalation.js";
 import {
   ORIGIN_KIND,
   type AlertStateRecord,
@@ -2613,10 +2613,18 @@ export async function handleFiring(
             if (winner && winner.id !== existing.paperclipIssueId) {
               return takeOver(winner);
             }
+            // BLO-40673: the resolve-time cancel drops the status but keeps the
+            // row's blocker edges. Reopening to `todo` behind a live edge
+            // gives a row that checkout refuses, while the escalation ladder
+            // keeps paging its owner. Restore `blocked` so the edge stays the
+            // row's wake path.
+            const reopenStatus = (await hasLiveBlocker(ctx, existing.paperclipIssueId, existing.paperclipCompanyId))
+              ? "blocked" as const
+              : "todo" as const;
             try {
               await ctx.issues.update(
                 existing.paperclipIssueId,
-                { status: "todo", description: newDescription },
+                { status: reopenStatus, description: newDescription },
                 existing.paperclipCompanyId,
                 undefined,
                 { fencing: firingFence(companyId, aggregateKey, firingToken) },

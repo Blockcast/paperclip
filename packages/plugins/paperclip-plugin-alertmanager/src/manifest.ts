@@ -22,6 +22,9 @@ const manifest: PaperclipPluginManifestV1 = {
     "issues.create",
     "issues.update",
     "issues.wakeup",
+    // BLO-40673: reopen-on-re-fire and the escalation ladder both need to see
+    // whether a row is parked behind a live blocker.
+    "issue.relations.read",
     "issue.comments.read",
     "issue.comments.create",
     // Owner mapping
