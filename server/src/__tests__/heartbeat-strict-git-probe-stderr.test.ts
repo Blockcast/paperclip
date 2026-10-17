@@ -171,19 +171,32 @@ describe("probeGitCheckoutStateStrict stderr classification", () => {
     delete env.GIT_DIR;
     delete env.GIT_WORK_TREE;
 
+    // PEN-4185 follow-up. The `failed` arm is a catch-all: it takes every
+    // non-ENOENT rejection, which is git running and exiting non-zero (code
+    // is then the numeric exit status, 128 for the fatal this test wants) but
+    // ALSO a spawn that never got that far -- EACCES on a non-executable
+    // REAL_GIT, EPERM, ELOOP. Those write no stderr, so they fall through to
+    // the empty-stderr assertion below, which can only say "wrote nothing".
+    // Carrying the code lets that message name the cause instead.
     const outcome = await execFile(REAL_GIT, ["rev-parse", "--show-toplevel"], { cwd: probeCwd, env })
       .then(
-        (result): { kind: "succeeded" | "not-executable" | "failed"; detail: string } => ({
+        (result): { kind: "succeeded" | "not-executable" | "failed"; detail: string; code: string } => ({
           kind: "succeeded",
           detail: result.stdout.trim(),
+          code: "",
         }),
-        (error: { code?: unknown; stderr?: unknown }) =>
-          error.code === "ENOENT"
-            ? { kind: "not-executable" as const, detail: "" }
+        (error: { code?: unknown; stderr?: unknown }) => {
+          const code = typeof error.code === "string" || typeof error.code === "number"
+            ? String(error.code)
+            : "unknown";
+          return error.code === "ENOENT"
+            ? { kind: "not-executable" as const, detail: "", code }
             : {
               kind: "failed" as const,
               detail: typeof error.stderr === "string" ? error.stderr : "",
-            },
+              code,
+            };
+        },
       );
 
     expect(
@@ -202,7 +215,8 @@ describe("probeGitCheckoutStateStrict stderr classification", () => {
     const realStderr = outcome.detail;
     expect(
       realStderr,
-      `${REAL_GIT} failed in ${probeCwd} but wrote nothing to stderr. `
+      `${REAL_GIT} failed in ${probeCwd} with code ${outcome.code} but wrote nothing to stderr `
+        + "(a non-zero exit writing no stderr, or a spawn failure such as EACCES -- the code says which). "
         + "Environment failure, NOT git rewording its fatal.",
     ).not.toBe("");
 
