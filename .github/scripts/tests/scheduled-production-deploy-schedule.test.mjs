@@ -574,6 +574,165 @@ test('the record-closing step can tell WHICH non-pending outcome it is closing o
   );
 });
 
+// ---------------------------------------------------------------------------
+// PEN-4224. A dispatch that DIES in front of the `deploy` job burns the slot and
+// leaves nothing PENDING, so guard (1b) reported `checked-no-pending` — green,
+// and literally true — while production sat 64 commits behind. Guard (1)
+// measures the reviewer gate's OCCUPANCY; nothing measured the last dispatch's
+// FATE. These pin the detection that closes that gap and, more importantly, the
+// three things it must NOT have changed.
+// ---------------------------------------------------------------------------
+
+test('the dead-dispatch detection runs AFTER guard (1) and BEFORE guard (1b)', () => {
+  const at = (needle) => {
+    const i = code.indexOf(needle);
+    assert.notEqual(i, -1, `expected to find ${JSON.stringify(needle)} in ${WORKFLOW}`);
+    return i;
+  };
+  const DETECT = 'node .github/scripts/detect-dead-dispatch.mjs';
+
+  // AFTER guard (1): if something is still pending there is no death to report
+  // — the lane is occupied, which is guard (1)'s business and already handled.
+  assert.ok(at('outcome=skipped-pending') < at(DETECT), 'the detection must not pre-empt guard (1)');
+  // BEFORE guard (1b): that early return is the false green being replaced, so
+  // a detection below it could never change what the sampling slot reports.
+  assert.ok(at(DETECT) < at('"$IS_DISPATCH_SLOT"'), 'the detection must run before the sampling exit');
+});
+
+test('setup-node precedes the dispatch step, or the detection is `command not found`', () => {
+  // `node` is not on the arc-deploy image's PATH for `run:` steps. The detection
+  // is invoked from INSIDE the dispatch step (it has to be — guard (1b) is an
+  // early return in the same `run:` block), and it fails QUIET by design. So
+  // with setup-node left below, the symptom would be silence: the detection
+  // would report nothing, forever, while reading as installed.
+  assert.ok(
+    code.indexOf('- name: Set up Node') < code.indexOf('- name: Dispatch deploy if master is ahead'),
+    'setup-node must come before the step that shells out to node',
+  );
+});
+
+test('the detection CANNOT fail the dispatcher — it is non-fatal twice over', () => {
+  // The step runs under `set -euo pipefail`, so a bare `node ...` that exits
+  // non-zero would abort the dispatch step and redden the run. PEN-2848 made
+  // this workflow's `conclusion` load-bearing for a stuck approval; it must not
+  // start meaning "detection broke".
+  assert.match(
+    code,
+    /node \.github\/scripts\/detect-dead-dispatch\.mjs \|\| true/,
+    'the detection call must be || true',
+  );
+  // ...and the file it writes must be read defensively, since `|| true` means
+  // it may not exist at all.
+  assert.match(code, /DEAD_DISPATCH=false/, 'the flag must default to false');
+  assert.match(
+    code,
+    /if \[ -f "\$DEAD_DISPATCH_JSON_PATH" \]/,
+    'a missing detection file must read as "no death", not as an error',
+  );
+});
+
+test('a dead lane is reported as its OWN outcome, never as `checked-no-pending`', () => {
+  // The measured defect, stated as an assertion: the two must not share an exit.
+  const branch = code.match(/if \[ "\$DEAD_DISPATCH" = "true" \][\s\S]*?\n            fi\n/);
+  assert.ok(branch, 'the sampling slot must branch on a dead lane');
+  assert.match(branch[0], /echo "outcome=dispatch-died" >> "\$GITHUB_OUTPUT"/);
+  assert.ok(
+    !/outcome=checked-no-pending/.test(branch[0]),
+    'the dead-lane branch must not fall through to the green outcome',
+  );
+  // ::warning:: not ::notice::, the same convention guard (1) uses for a skip:
+  // a dead lane must not read as an identical green success in the Actions list.
+  assert.match(branch[0], /::warning::/);
+  assert.ok(
+    !/::notice::/.test(branch[0]),
+    'a dead lane is not a notice — PEN-2848 is explicit that a non-dispatch must be distinguishable',
+  );
+});
+
+test('the dead-lane report names the manual lever, because that was the actual gap', () => {
+  // The fault was never "no recovery is possible" — a `workflow_dispatch` of
+  // this workflow dispatches at any hour, since IS_DISPATCH_SLOT's left arm is
+  // true for every non-schedule event. The fault was that every signal said
+  // things were fine, so nobody knew to pull it. A report that does not name
+  // the lever rebuilds the same gap one step further on.
+  const branch = code.match(/if \[ "\$DEAD_DISPATCH" = "true" \][\s\S]*?\n            fi\n/);
+  assert.ok(branch, 'the sampling slot must branch on a dead lane');
+  assert.match(branch[0], /scheduled-production-deploy\.yml/, 'name the workflow to run');
+  assert.match(branch[0], /regardless of the hour/, 'and say that it does not wait for the cron');
+  assert.match(branch[0], /approves nothing/, 'and that the lever is still not an approval');
+});
+
+test('the dead-lane backstop makes `conclusion` carry it, without touching the outcome gates', () => {
+  // Gated on its OWN output rather than `outcome == 'dispatch-died'`, so the set
+  // of `outcome ==` step gates stays exactly {skipped-pending} and the
+  // escalation cannot be re-coupled to this by a later edit. (The `gates`
+  // assertion above is what would break; this records WHY it still holds.)
+  const backstop = code.match(/- name: Fail the run when the last dispatch died[\s\S]*?exit 1/);
+  assert.ok(backstop, 'a dead lane must make the run red, as a stuck approval does');
+  assert.match(backstop[0], /if:\s*steps\.dispatch\.outputs\.dead_dispatch == 'true'/);
+  const gates = [...code.matchAll(/if:\s*steps\.dispatch\.outputs\.outcome\s*==\s*'([^']+)'/g)].map(
+    (m) => m[1],
+  );
+  assert.deepEqual(gates, ['skipped-pending'], 'the outcome-gated step set must not grow');
+});
+
+test('the dead_dispatch flag is written ONLY where a dead lane is the final word', () => {
+  // A dispatch slot that finds a dead lane goes on to DISPATCH A REPLACEMENT —
+  // it recovers. Writing the flag outside the sampling branch would redden
+  // exactly the run that fixed the problem, and would do it on the one path
+  // where a human need do nothing at all.
+  const writes = [...code.matchAll(/dead_dispatch=true/g)];
+  assert.equal(writes.length, 1, 'exactly one writer');
+  const samplingBranch = code.match(/if \[ "\$IS_DISPATCH_SLOT" != "true" \][\s\S]*?\n          fi\n/);
+  assert.ok(samplingBranch, 'the sampling-slot guard must still exist');
+  assert.match(samplingBranch[0], /dead_dispatch=true/, 'the flag must be written inside it');
+});
+
+test('PEN-4224 added NO new dispatch authority — guard (1) still has one dispatcher', () => {
+  // Done-when #3, the anti-stacking property. Option 3 was chosen precisely
+  // because it needs no retry logic and no anti-stacking reasoning: nothing in
+  // the detection path can produce a dispatch, so the double-roll guard (1)
+  // exists to prevent (observed 2026-08-30) is untouched by construction. The
+  // count is the assertion — one call, and it is still below the sampling-slot
+  // early return, so a sampling slot cannot reach it.
+  const dispatches = [...code.matchAll(/gh workflow run docker\.yml/g)];
+  assert.equal(dispatches.length, 1, 'exactly one dispatch call in the whole workflow');
+  assert.ok(
+    code.indexOf('"$IS_DISPATCH_SLOT"') < code.indexOf('gh workflow run docker.yml'),
+    'and it stays behind the sampling-slot early return',
+  );
+  // The detection is a read. If it ever grows a write, this is the tripwire.
+  assert.ok(
+    !/detect-dead-dispatch\.mjs[^\n]*--/.test(code),
+    'the detection takes no mode flag that could turn it into an actor',
+  );
+});
+
+test('the dispatcher still APPROVES NOTHING, including on the new path', () => {
+  // Done-when #4, asserted rather than assumed. The sibling assertion on the
+  // supersede covers the workflow text; this re-states it after PEN-4224 added
+  // a step and a script, and detect-dead-dispatch.test.mjs makes the same
+  // assertion against that script's own source.
+  assert.ok(!/pending_deployments/.test(code), 'no step may reach the environment approval API');
+  assert.ok(
+    !/\/approve|reviews.*approve/.test(code),
+    'and nothing may call an approval endpoint by any other spelling',
+  );
+});
+
+test('the record close is told the FATE as well as the outcome (PEN-4224)', () => {
+  // `dispatched` claims the lane was refilled; what happened is that a dispatch
+  // was ISSUED. Without the fate reaching the script, `laneRefilled` degrades to
+  // REFILLING_OUTCOMES and the fail-open is back with the code still present.
+  const close = code.match(/- name: Close the durable deploy-stall record[\s\S]*?--resolve/);
+  assert.ok(close, 'the workflow must close the stall record');
+  assert.match(
+    close[0],
+    /LAST_DISPATCH_FATE:\s*\$\{\{\s*steps\.dispatch\.outputs\.last_dispatch_fate\s*\}\}/,
+    'the close must be told the last dispatch fate',
+  );
+});
+
 test('every outcome the close step fires on is classified by the resolver', () => {
   // Guards the seam: a new outcome added to the dispatch step would otherwise
   // fall through REFILLING_OUTCOMES and silently close an unrefilled record.
