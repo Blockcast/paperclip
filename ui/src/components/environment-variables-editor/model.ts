@@ -146,7 +146,13 @@ export function rowsFromValue(value: Record<string, EnvBinding> | null | undefin
  * result emits `undefined`. Duplicate names are last-writer-wins (unchanged).
  */
 export function valueFromRows(rows: EnvRow[]): Record<string, EnvBinding> | undefined {
-  const record: Record<string, EnvBinding> = {};
+  // Null-prototype accumulator (PEN-3257), for the same reason `server/src/env-binding-mask.ts`
+  // uses one: on a plain `{}`, `record["__proto__"] = binding` hits the inherited `__proto__`
+  // SETTER and re-parents the accumulator instead of adding a key, so the row vanishes from the
+  // emitted value with nothing serialized. The editor's whole contract is to emit every row it is
+  // shown, and the save gate only blocks on masked-rename blockers — so without this the row is
+  // silently dropped on the client and the server's refusal for that name is never even reached.
+  const record: Record<string, EnvBinding> = Object.create(null);
   for (const row of rows) {
     const name = row.name.trim();
     if (!name) continue;
@@ -190,6 +196,16 @@ export function validateName(
   if (!trimmed) return null;
   if (!ENV_NAME_RE.test(trimmed)) {
     return { level: "error", message: "Invalid name — use letters, digits and _" };
+  }
+  // PEN-3257. `__proto__` passes the shape check above — it really is letters and underscores — so
+  // the message there would be actively misleading. The server refuses this name because no plain
+  // `{}` accumulator can hold it (assigning it hits the `Object.prototype.__proto__` setter, so the
+  // binding is discarded), and it answers 422. Flagged here too, with its own wording, so the row
+  // is marked before the save instead of the whole PATCH failing with one key named in the error.
+  // Deliberately NOT folded into ENV_NAME_RE: that constant is the shape rule, and reusing it would
+  // attach the wrong explanation to a name whose shape is fine.
+  if (trimmed === "__proto__") {
+    return { level: "error", message: "Reserved name — __proto__ can't be stored" };
   }
   if (duplicateNames.has(trimmed)) {
     return { level: "error", message: "Duplicate name" };

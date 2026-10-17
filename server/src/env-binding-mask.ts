@@ -51,12 +51,16 @@ function maskBinding(binding: EnvBinding): EnvBinding {
 
 export function maskEnvBindings<T extends AgentEnvConfig | null | undefined>(env: T): T {
   if (!env || typeof env !== "object") return env;
-  // Null-prototype accumulator: `ENV_KEY_RE` (`services/secrets.ts`) is /^[A-Za-z_][A-Za-z0-9_]*$/,
-  // which admits `__proto__`, and JSON.parse hands it over as an ordinary own property. On a `{}`
-  // accumulator `masked[key] = ...` would then be a PROTOTYPE write: the binding would vanish with
-  // no own property and nothing serialized. A dropped binding discloses nothing, so this is a
+  // Null-prototype accumulator: `JSON.parse` hands `__proto__` over as an ordinary own property, so
+  // on a `{}` accumulator `masked[key] = ...` would be a PROTOTYPE write — the binding would vanish
+  // with no own property and nothing serialized. A dropped binding discloses nothing, so this is a
   // correctness fix rather than a disclosure one — but silently losing a row is the wrong failure
   // mode for the module whose job is to round-trip every binding it is handed.
+  //
+  // `ENV_KEY_RE` (`services/secrets.ts`) now REFUSES that one name on the write paths (PEN-3257),
+  // so a freshly written config cannot carry it. This stays null-prototype anyway: it masks rows
+  // read back out of jsonb, which is not revalidated on the way out, and the guarantee wanted here
+  // is "round-trip whatever you are handed" rather than "trust the writer".
   const masked: AgentEnvConfig = Object.create(null);
   for (const [key, binding] of Object.entries(env)) {
     masked[key] = maskBinding(binding as EnvBinding);

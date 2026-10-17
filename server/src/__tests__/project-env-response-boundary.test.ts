@@ -255,7 +255,7 @@ describe("project env disclosure boundary (PEN-3033)", () => {
     });
   });
 
-  describe("the `__proto__` key, which the env key regex admits", () => {
+  describe("the `__proto__` key, which the env key regex used to admit", () => {
     // ENV_KEY_RE is /^[A-Za-z_][A-Za-z0-9_]*$/, so `__proto__` is a WELL-FORMED env key, and
     // JSON.parse gives it to us as an ordinary own property rather than as a prototype write. A
     // plain-object accumulator then turns `acc[key] = binding` into a prototype assignment: the
@@ -317,19 +317,27 @@ describe("project env disclosure boundary (PEN-3033)", () => {
       }
     });
 
-    it("does NOT by itself make the key persistable — normalizeEnvConfig drops it downstream", () => {
-      // Pinned deliberately: `services/secrets.ts` accumulates into `{}` on the same key, so a
-      // `__proto__` binding still cannot reach storage. Closing that is a change to a function
-      // shared with the agent and environment paths, and is not bundled into this PR. This
-      // assertion is what makes that boundary visible instead of assumed — if the shared path is
-      // ever hardened, this is the test that says so.
-      const downstream: Record<string, unknown> = {};
-      for (const [key, binding] of Object.entries(
-        maskEnvBindings(protoStored()) as Record<string, unknown>,
-      )) {
-        downstream[key] = binding;
-      }
-      expect(Object.hasOwn(downstream, "__proto__")).toBe(false);
+    it("does NOT by itself make the key persistable — the shared normalize path REFUSES it", async () => {
+      // Updated by PEN-3257, which is the event the previous version of this test said to watch
+      // for. It used to re-implement the `{}` accumulator locally and assert the binding was
+      // silently DROPPED, noting that hardening the shared path was out of scope for PEN-3033.
+      // That path is now hardened, so the truth here changed: the key is refused BY NAME before
+      // anything is accumulated, and a caller gets a 422 instead of a 200 that stored nothing.
+      //
+      // Asserted against the real `services/secrets.ts` rather than a local re-implementation, so
+      // this row and PEN-3257's cannot drift into disagreeing about the same key. The name check is
+      // the first thing in the loop and runs before any database access, so no db is needed to
+      // reach it — the authoritative per-path coverage lives in `secrets-service.test.ts`.
+      // `vi.importActual`, not the top-level import: this file mocks `secretService` out, so the
+      // module-level binding would hand back `mockSecretService` and this test would pass by
+      // echoing its own input back. (It did, on the first run — the mock resolved the very object
+      // the guard is supposed to refuse.)
+      const { secretService: realSecretService } =
+        await vi.importActual<typeof import("../services/secrets.js")>("../services/secrets.js");
+      const svc = realSecretService(undefined as never);
+      await expect(
+        svc.normalizeEnvBindingsForPersistence("company-1", maskEnvBindings(protoStored())),
+      ).rejects.toThrow(/Invalid environment variable name: __proto__/);
     });
   });
 

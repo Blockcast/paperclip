@@ -69,7 +69,20 @@ import { REDACTED_SENTINEL } from "./secret-sentinel.js";
 // truth. See that file for why the constant does not live here.
 export { REDACTED_SENTINEL };
 
-const ENV_KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+// `__proto__` passes the shape check below but can never be STORED under it: every accumulator in
+// this module builds a plain `{}`, and `acc["__proto__"] = binding` invokes the
+// `Object.prototype.__proto__` setter instead of creating an own property. With an object-valued
+// binding (`normalizeEnvConfig`) that silently REPLACES the accumulator's prototype; with a
+// string-valued one (`resolveEnvBindings`, `resolveAdapterConfigForRuntime`) it is silently
+// discarded. Either way the binding never reaches storage — a JSON round-trip drops it — so the
+// caller got a `200` for a write that did nothing. Refusing the name turns that silent no-op into
+// the `422` the malformed-name path already produces. It is excluded here, in the shared pattern,
+// so every call site inherits the refusal rather than each having to repeat it.
+//
+// Scoped to `__proto__` deliberately: `constructor`, `prototype`, `toString` and friends assign as
+// ordinary own properties and round-trip correctly today, so refusing those would break writes
+// that currently work. See PEN-3257.
+const ENV_KEY_RE = /^(?!__proto__$)[A-Za-z_][A-Za-z0-9_]*$/;
 const COMING_SOON_SECRET_PROVIDERS: ReadonlySet<SecretProvider> = new Set([
   "gcp_secret_manager",
   "vault",

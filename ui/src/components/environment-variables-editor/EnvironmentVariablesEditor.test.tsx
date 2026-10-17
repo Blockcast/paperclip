@@ -1269,4 +1269,61 @@ describe("EnvironmentVariablesEditor", () => {
     );
     expect(match?.querySelector<HTMLElement>("[title]")?.getAttribute("title")).toBe(cloudMigrationKey);
   });
+
+  // PEN-3257. The model-level rule lives in `model.test.ts`; this pins the WIRING — that the rule
+  // reaches the rendered row as visible text AND as `aria-invalid`, which is what a screen-reader
+  // user gets. Neither was covered for any name issue before this.
+  it("flags a `__proto__` name on the row itself, with its own copy and aria-invalid", async () => {
+    render(
+      <EnvironmentVariablesEditor
+        value={{ NODE_ENV: { type: "plain", value: "production" } }}
+        secrets={secrets}
+        onChange={() => {}}
+        onCreateSecret={async () => secrets[0]}
+      />,
+    );
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
+    const nameInput = nameInputs()[0]!;
+    setter.call(nameInput, "__proto__");
+    nameInput.dispatchEvent(new Event("input", { bubbles: true }));
+    // Flush BEFORE blur: the blur handler resolves the row id against the `rows` it closed over,
+    // so firing both in one tick marks the pre-rename name as touched and the issue stays hidden.
+    await flush();
+    nameInput.dispatchEvent(new FocusEvent("focusout", { bubbles: true }));
+    await flush();
+
+    expect(container.textContent).toContain("Reserved name");
+    // The charset copy would be wrong here — `__proto__` IS letters and underscores. Assert it is
+    // absent rather than only asserting some error appeared.
+    expect(container.textContent).not.toContain("use letters, digits and _");
+    expect(nameInput.getAttribute("aria-invalid")).toBe("true");
+    // The message must be the row's accessible description, not just loose text somewhere.
+    const describedBy = nameInput.getAttribute("aria-describedby");
+    expect(describedBy).toBeTruthy();
+    expect(document.getElementById(describedBy!)?.textContent).toContain("Reserved name");
+  });
+
+  it("leaves an ordinary name clean, so the flag above is not an always-on error", async () => {
+    render(
+      <EnvironmentVariablesEditor
+        value={{ NODE_ENV: { type: "plain", value: "production" } }}
+        secrets={secrets}
+        onChange={() => {}}
+        onCreateSecret={async () => secrets[0]}
+      />,
+    );
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
+    const nameInput = nameInputs()[0]!;
+    setter.call(nameInput, "MY__proto__KEY");
+    nameInput.dispatchEvent(new Event("input", { bubbles: true }));
+    // Flush BEFORE blur: the blur handler resolves the row id against the `rows` it closed over,
+    // so firing both in one tick marks the pre-rename name as touched and the issue stays hidden.
+    await flush();
+    nameInput.dispatchEvent(new FocusEvent("focusout", { bubbles: true }));
+    await flush();
+
+    expect(container.textContent).not.toContain("Reserved name");
+    expect(nameInput.getAttribute("aria-invalid")).toBeNull();
+  });
+
 });
