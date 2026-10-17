@@ -255,6 +255,7 @@ function sweepContext(state: AlertStateRecord, reportsTo: string | null = "cto",
       update: vi.fn(async () => issue),
       create: vi.fn(store.issuesCreate as any),
       get: vi.fn(async () => issue),
+      relations: { get: vi.fn(async () => ({ blockedBy: [] as Array<{ id: string; status: string }>, blocks: [] })) },
     },
     db: store.db,
     agents: {
@@ -452,6 +453,29 @@ describe("alert escalation", () => {
     await runAlertEscalationSweep(ctx, config(), new Date("2026-07-11T01:00:00Z"));
     expect(mocks.issues.update).toHaveBeenCalledWith("issue-1", { assigneeAgentId: "cto", assigneeUserId: null }, "company-1");
     expect(mocks.issues.requestWakeup).toHaveBeenCalledTimes(1);
+  });
+
+  // BLO-40673: a row parked behind a live blocker is waiting on the blocker's
+  // owner. The ladder must not wake, reassign, or cover it. It defers one
+  // interval, and a cancelled blocker (which never drains) does not count.
+  it("defers the rung instead of waking or reassigning a row behind a live blocker", async () => {
+    const due = { paperclipIssueId: "issue-1", paperclipCompanyId: "company-1", assigneeUserId: null, assigneeAgentId: "engineer", alertname: "SyntheticAlert", severity: "critical", firstSeenAt: "x", lastFiredAt: "x", resolvedAt: null, nextEscalationAt: "2026-07-11T00:00:00Z", escalationAttempt: 1, escalationIntervalMs: 30 * 60_000 };
+    const blocked = sweepContext(due);
+    blocked.mocks.issues.relations.get.mockResolvedValue({ blockedBy: [{ id: "human-row", status: "todo" }], blocks: [] });
+    await runAlertEscalationSweep(blocked.ctx, config(), new Date("2026-07-11T01:00:00Z"));
+    expect(blocked.mocks.issues.requestWakeup).not.toHaveBeenCalled();
+    expect(blocked.mocks.issues.update).not.toHaveBeenCalled();
+    expect(blocked.mocks.issues.createComment).not.toHaveBeenCalled();
+    expect(blocked.mocks.state.set).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ escalationAttempt: 1, nextEscalationAt: "2026-07-11T01:30:00.000Z" }),
+      expect.anything(),
+    );
+
+    const deadEdge = sweepContext(due);
+    deadEdge.mocks.issues.relations.get.mockResolvedValue({ blockedBy: [{ id: "old-alert", status: "cancelled" }], blocks: [] });
+    await runAlertEscalationSweep(deadEdge.ctx, config(), new Date("2026-07-11T01:00:00Z"));
+    expect(deadEdge.mocks.issues.update).toHaveBeenCalledWith("issue-1", { assigneeAgentId: "cto", assigneeUserId: null }, "company-1");
   });
 
   it("continues the sweep past an issue whose processing throws", async () => {

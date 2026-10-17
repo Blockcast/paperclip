@@ -190,6 +190,7 @@ interface MockClients {
     update: ReturnType<typeof vi.fn>;
     listComments: ReturnType<typeof vi.fn>;
     createComment: ReturnType<typeof vi.fn>;
+    relations: { get: ReturnType<typeof vi.fn> };
   };
   db: {
     namespace: string;
@@ -240,6 +241,7 @@ const mkCtx = (): { ctx: PluginContext; mocks: MockClients } => {
       update: vi.fn(async () => ({ id: "issue-1" })),
       listComments: vi.fn(async () => []),
       createComment: vi.fn(async () => ({ id: "comment-1" })),
+      relations: { get: vi.fn(async () => ({ blockedBy: [], blocks: [] })) },
     },
     db: {
       namespace: "alertmanager",
@@ -2053,6 +2055,42 @@ describe("handleWebhook — dedup on re-fire", () => {
       "alertmanager.firing.reopened",
       1,
       { alertname: "CiliumPolicyDropsHigh", severity: "critical" },
+    );
+  });
+
+  // BLO-40673: the resolve-time cancel keeps the row's blocker edges. A reopen
+  // to `todo` behind a live edge is a row checkout refuses, while the ladder
+  // keeps paging its owner. Restore `blocked`. A cancelled blocker never
+  // drains, so it does not count and the row reopens `todo` as before.
+  it.each([
+    ["todo", "blocked"],
+    ["cancelled", "todo"],
+  ])("re-fire reopen with a %s blocker sets status %s", async (blockerStatus, expected) => {
+    const { ctx, mocks } = mkCtx();
+    mocks.state.get.mockResolvedValueOnce({
+      paperclipIssueId: "issue-existing",
+      paperclipCompanyId: "company-1",
+      assigneeUserId: null,
+      assigneeAgentId: "agent-fallback",
+      alertname: "CiliumPolicyDropsHigh",
+      severity: "critical",
+      firstSeenAt: "2026-04-29T08:00:00Z",
+      lastFiredAt: "2026-04-29T08:00:00Z",
+      resolvedAt: "2026-04-29T09:00:00Z",
+      pluginClosedAt: "2026-04-29T09:00:00Z",
+    } satisfies AlertStateRecord);
+    mocks.issues.get.mockResolvedValueOnce({ id: "issue-existing", status: "cancelled" });
+    mocks.issues.relations.get.mockResolvedValue({ blockedBy: [{ id: "human-row", status: blockerStatus }], blocks: [] });
+
+    await handleWebhook(ctx, baseConfig(), true, baseInput());
+
+    expect(mocks.issues.relations.get).toHaveBeenCalledWith("issue-existing", "company-1");
+    expect(mocks.issues.update).toHaveBeenCalledWith(
+      "issue-existing",
+      expect.objectContaining({ status: expected }),
+      "company-1",
+      undefined,
+      expect.anything(),
     );
   });
 
