@@ -27,7 +27,7 @@ pre-PEN-3633 message got wrong — it named `repoUrl` on a branch that never rea
 
 | `failure_class` | What was tested | Where to look |
 |---|---|---|
-| `origin_mismatch` | `git config --get remote.origin.url` disagreed with the issue's expected repo | The checkout is a real repository pointed at the wrong remote. Repoint or re-clone it. |
+| `origin_mismatch` | `git config --get remote.origin.url` disagreed with the issue's expected repo | The checkout is a real repository pointed at the wrong remote. Repoint or re-clone it. See [project-checkout-origin-mismatch.md](./project-checkout-origin-mismatch.md), which catches this class on a timer BEFORE any run is refused. |
 | `not_a_checkout` | `git rev-parse --git-dir` ran and found no repository | The directory was replaced, emptied, or never provisioned. |
 | `probe_indeterminate` | `git rev-parse --git-dir` itself failed to reach a verdict | **Check the API pod before the disk.** See below. |
 | `cause_unreported` | The reuse wrapper fired with no cause attached | A defect in its own right — file it. |

@@ -2736,3 +2736,85 @@ test("PaperclipWorkspaceReuseRefusalEpisode is project-scoped, body-bucketed, ga
     );
   }
 });
+
+test("the project-checkout origin alerts gate on their own positive control (PEN-4188)", () => {
+  // The mismatch alert's claim is "no series means every checkout agrees". That
+  // is true only while something was compared: a pass that read zero origins
+  // (PVC unmounted, git missing, nothing provisioned) publishes the identical
+  // empty set. Every assertion below pins one half of that -- the gate on the
+  // mismatch alert, and the alert that fires for the case the gate silences.
+  // Dropping either turns the detector into an unverified zero, which is the
+  // failure mode PEN-3628 already paid for once.
+  const rendered = renderChart([
+    "--show-only",
+    "templates/prometheusrule.yaml",
+    "--set",
+    "prometheusRule.enabled=true",
+  ]);
+
+  assert.match(rendered, /alert: PaperclipProjectCheckoutOriginMismatch/);
+  assert.match(rendered, /alert: PaperclipProjectCheckoutOriginReconcileBlind/);
+  assert.match(rendered, /alert: PaperclipProjectCheckoutOriginReconcileMetricsRefreshFailed/);
+
+  const expr = rendered.match(
+    /alert: PaperclipProjectCheckoutOriginMismatch\n[\s\S]*?\n\s+expr: (.*)\n/,
+  )?.[1];
+  assert.ok(expr, "mismatch alert must render an expr");
+
+  assert.match(
+    expr,
+    /max by \(project_workspace_id, company_id, project_id\)/,
+    "must aggregate by the project workspace, or one broken checkout re-fans out across its issues",
+  );
+  assert.match(
+    expr,
+    /and on\(instance\) \(paperclip_project_checkout_origin_reconcile_compared > 0\)/,
+    "THE POSITIVE CONTROL: without it, a pass that compared nothing is indistinguishable from a healthy estate",
+  );
+  assert.match(
+    expr,
+    /and on\(instance\) \(paperclip_project_checkout_origin_reconcile_metrics_refresh_success == 1\)/,
+    "must drop stale series, because a failed pass retains the previous snapshot rather than zeroing it",
+  );
+  assert.doesNotMatch(
+    expr,
+    /increase\(|rate\(/,
+    "must not use increase()/rate(): this is a reset-then-set gauge, and a labelled counter would be silent for the first episode on any project workspace",
+  );
+
+  const blindExpr = rendered.match(
+    /alert: PaperclipProjectCheckoutOriginReconcileBlind\n[\s\S]*?\n\s+expr: (.*)\n/,
+  )?.[1];
+  assert.ok(blindExpr, "blind alert must render an expr");
+  assert.match(
+    blindExpr,
+    /^max\(/,
+    "must be max() across replicas, not min(): fire only when EVERY fresh replica compared nothing, since one blind replica beside a working one already degrades coverage rather than correctness",
+  );
+  assert.match(blindExpr, /== 0/, "blind alert must fire on zero comparisons");
+
+  assert.ok(
+    existsSync(path.join(repoRoot, "runbooks/project-checkout-origin-mismatch.md")),
+    "runbooks/project-checkout-origin-mismatch.md must exist for the runbook_url to resolve",
+  );
+
+  const description = rendered.match(
+    /alert: PaperclipProjectCheckoutOriginMismatch\n[\s\S]*?description: "([\s\S]*?)"\n/,
+  )?.[1];
+  assert.ok(description, "mismatch alert must render a description");
+  assert.match(
+    description,
+    /ONE broken checkout, not N broken issues/,
+    "description must tell the responder not to triage the issues individually",
+  );
+  assert.match(
+    description,
+    /Do NOT diagnose this with `git remote -v`/,
+    "description must warn off `git remote -v`: the shared insteadOf rewrite makes it disagree with the stored config on most healthy checkouts, so it misleads in both directions",
+  );
+  assert.match(
+    description,
+    /git config --get remote\.origin\.url/,
+    "description must name the command the reconciler actually compares",
+  );
+});

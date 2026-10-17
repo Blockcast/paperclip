@@ -171,16 +171,37 @@ describe("the real producers are wired to the shared markers", () => {
   const here = path.dirname(fileURLToPath(import.meta.url));
   const read = (file: string) => readFileSync(path.join(here, file), "utf8");
 
-  it("workspace-runtime.ts builds both refusals through this module", () => {
+  it("workspace-runtime.ts builds the git-probe refusal through this module", () => {
     const source = read("workspace-runtime.ts");
     expect(source).toContain('from "./workspace-reuse-refusal-class.js"');
-    expect(source).toContain("formatOriginMismatchRefusal({");
     expect(source).toContain("formatGitProbeRefusal({");
     // The inline literals these replaced must be gone, or a stale copy could
     // still be the one that throws.
     expect(source).not.toContain("` is checked out from `");
     expect(source).not.toContain('git rev-parse --git-dir found no git repository in "${');
     expect(source).not.toContain('git rev-parse --git-dir could not verify a checkout in "${');
+  });
+
+  it("the origin-mismatch refusal is still built through this module, one file over (PEN-4188)", () => {
+    // PEN-4188 moved the comparison -- and with it the ONLY call to
+    // `formatOriginMismatchRefusal` -- out of `workspace-runtime.ts` and into
+    // `project-checkout-origin.ts`, so that the periodic reconciler and the
+    // dispatch gate cannot drift apart. This guard has to follow the producer
+    // or it silently stops guarding anything: the assertion it replaced would
+    // now pass against a `workspace-runtime.ts` that had gone back to an
+    // inline literal, as long as some other file still mentioned the builder.
+    //
+    // So pin BOTH halves of the new shape: the builder still lives behind this
+    // module, and the runtime still reaches it rather than re-deriving the
+    // sentence.
+    const producer = read("project-checkout-origin.ts");
+    expect(producer).toContain('from "./workspace-reuse-refusal-class.js"');
+    expect(producer).toContain("formatOriginMismatchRefusal({");
+    expect(producer).not.toContain("` is checked out from `");
+
+    const runtime = read("workspace-runtime.ts");
+    expect(runtime).toContain('from "./project-checkout-origin.js"');
+    expect(runtime).toContain("compareProjectCheckoutOrigin({");
   });
 
   it("heartbeat.ts builds the reuse-failure headline through this module", () => {
