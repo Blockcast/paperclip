@@ -367,8 +367,13 @@ env:
     # must not be the same act.
     - name: PAPERCLIP_ISOLATION_WORKSPACE_REAPER_ENABLED
       value: "true"
+    # Step 2, BLO-36735: "false" — live. Edited, not removed (see above). The
+    # dry-run phase ran 2026-10-09..10-16 with failed=0 and vanished=0 on every
+    # sweep, and the nested-checkout guard (#2417) retaining 4 per capped sweep
+    # on the deployed build — i.e. AC1/AC2 were read off production, not a
+    # fixture. To stop deleting, set this back to "true"; that is the rollback.
     - name: PAPERCLIP_ISOLATION_WORKSPACE_REAPER_DRY_RUN
-      value: "true"
+      value: "false"
     # 30d — the code default, stated rather than inherited, because it is the
     # only threshold whose match set has been audited: 448 dirs by hand under
     # BLO-31222, and all 929 on 2026-09-26 by running the shipped
@@ -408,8 +413,22 @@ env:
     # over 2026-09-26..10-09, and eligible arrivals lag that by MAX_AGE_DAYS at
     # a lower historical rate, so 200/tick keeps up with room to spare. Raising
     # it buys nothing but a bigger burst.
+    #
+    # 100 every 720 min (was 200 every 1440, BLO-36735 live flip) — the SAME
+    # 200 directories/day, in half-size bursts. Two reasons it is split now and
+    # was not while dry: (1) a dry tick unlinks nothing, so its burst cost was
+    # zero; a live 200-directory tick is ~2.3h typical / ~5.2h worst of serial
+    # unlink on CephFS's single active MDS (BLO-29767). (2) startIsolation-
+    # WorkspaceReaper runs a tick at BOOT, not only on the interval, and
+    # paperclip-0 ran as ~7 distinct pods in the 7d to 2026-10-16 — so ticks
+    # land at arbitrary hours, often working hours, and the per-tick size is
+    # the only bound on any one of them. Backlog then drains in ~2.5x the time
+    # (tree 406 GiB / 8.26M entries / 1669 dirs on 2026-10-16), which is fine:
+    # this is a reclaim, not an incident, and /paperclip is at 62%.
     - name: PAPERCLIP_ISOLATION_WORKSPACE_REAPER_MAX_DELETES_PER_TICK
-      value: "200"
+      value: "100"
+    - name: PAPERCLIP_ISOLATION_WORKSPACE_REAPER_INTERVAL_MINUTES
+      value: "720"
 
 # Worker tier also runs plugin workers and scheduled plugin jobs. Linear's
 # periodic sync can transiently burn CPU over large BLO backlogs; keep enough
