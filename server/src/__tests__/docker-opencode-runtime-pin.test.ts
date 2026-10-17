@@ -346,8 +346,9 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(dockerAgentWorkflow).not.toContain("runs-on: self-hosted");
   });
 
-  it("keeps the agent image build timeout above full toolchain rebuild duration", () => {
-    expect(dockerAgentWorkflow).toContain("timeout-minutes: 90");
+  it("keeps the agent image build timeout above the measured slow-overlay + smoke budget", () => {
+    // BLO-47194: 84.7 (worst overlay) + 25.6 (smoke p100) + 2.7 (post steps) = 113.0 -> 115.
+    expect(dockerAgentWorkflow).toContain("timeout-minutes: 115");
   });
 
   it("gates agent rollout on a restricted-container screenshot smoke test", () => {
