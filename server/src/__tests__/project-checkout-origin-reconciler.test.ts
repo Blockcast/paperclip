@@ -415,6 +415,100 @@ describe("startProjectCheckoutOriginReconciler", () => {
     expect(clearIntervalFn).toHaveBeenCalledWith(timer);
   });
 
+  it("skips ticks while a timed-out pass's probe phase is still running", async () => {
+    // The pass budget releases the non-overlap guard on time, which is what
+    // stops a wedged mount from killing the detector outright. But the probes
+    // it walked away from keep running, and the `fs.stat` in front of each one
+    // has no timeout: on a dead mount it holds a libuv threadpool thread, of
+    // which there are 4 by default. Without this skip every later tick piles on
+    // up to PROBE_CONCURRENCY more, so the reconciler would progressively
+    // starve unrelated `fs`, `dns.lookup` and zlib work in the same process.
+    __resetMetricsForTest();
+
+    const row = {
+      id: randomUUID(),
+      companyId: randomUUID(),
+      projectId: randomUUID(),
+      cwd: "/co/wedged",
+      repoUrl: HTTPS,
+    };
+    const stubDb = {
+      select: () => ({
+        from: () => ({ where: () => ({ orderBy: () => ({ limit: async () => [row] }) }) }),
+      }),
+    } as never;
+
+    let releaseStat!: (value: boolean) => void;
+    const wedged = new Promise<boolean>((resolve) => {
+      releaseStat = resolve;
+    });
+    // First pass answers immediately so it SUCCEEDS; every later pass hangs,
+    // exactly like a stat against a mount that died in between. That ordering
+    // is what makes the freshness gauge an edge-triggered 1 -> 0 signal below,
+    // rather than a value that was 0 all along and proves nothing.
+    const directoryExists = vi.fn(() => (directoryExists.mock.calls.length === 1
+      ? Promise.resolve(false)
+      : wedged));
+
+    const freshness = async () =>
+      unlabelledGauge(
+        (await renderMetrics()).body,
+        PROJECT_CHECKOUT_ORIGIN_RECONCILE_METRICS_REFRESH_SUCCESS_METRIC,
+      );
+
+    let intervalCallback!: () => void;
+    const setIntervalFn = vi.fn((cb: () => void) => {
+      intervalCallback = cb;
+      return { unref: vi.fn() } as unknown as ReturnType<typeof setInterval>;
+    }) as unknown as typeof setInterval;
+
+    const stop = startProjectCheckoutOriginReconciler(stubDb, {
+      setInterval: setIntervalFn,
+      clearInterval: (() => {}) as unknown as typeof clearInterval,
+      passBudgetMs: 10,
+      directoryExists,
+    });
+
+    // Pass 1 completes normally.
+    await vi.waitFor(async () => expect(await freshness()).toBe(1));
+    expect(directoryExists).toHaveBeenCalledTimes(1);
+
+    // Pass 2 hangs on the stat and is cut off by its budget. Waiting on the
+    // 1 -> 0 transition -- not on a sleep -- is what proves the budget actually
+    // fired and released `ticking`, so what the next two ticks hit is THIS
+    // guard and not the ordinary non-overlap one.
+    intervalCallback();
+    await vi.waitFor(async () => expect(await freshness()).toBe(0));
+    expect(directoryExists).toHaveBeenCalledTimes(2);
+
+    // Two more ticks while that stat is still hung: neither may add a probe.
+    intervalCallback();
+    intervalCallback();
+    // A full timer turn, not a single microtask. With the guard removed, an
+    // unguarded pass today reaches `statDir` after exactly one microtask --
+    // the stub's `limit` resolves immediately and `mapWithConcurrency` calls
+    // `fn` synchronously -- so `await Promise.resolve()` was only just enough.
+    // One more `await` anywhere ahead of that stat and this check would still
+    // read 2 with the guard gone, and the final count-of-3 wait below would
+    // then be satisfied by the unguarded pass itself: green, and no longer
+    // testing anything. Yielding past a timer does not depend on that count.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(directoryExists).toHaveBeenCalledTimes(2);
+
+    // The skip is not a silent stop -- freshness is still 0 throughout, so the
+    // ...ReconcileMetricsRefreshFailed alert goes on paging for its duration.
+    expect(await freshness()).toBe(0);
+
+    // Mount recovers: the orphan settles and the next tick sweeps again.
+    releaseStat(false);
+    await vi.waitFor(() => {
+      intervalCallback();
+      expect(directoryExists).toHaveBeenCalledTimes(3);
+    });
+
+    stop();
+  });
+
   it("polls far more often than the ~3h manual sweep PEN-3628 needed", () => {
     expect(PROJECT_CHECKOUT_ORIGIN_RECONCILE_INTERVAL_MS).toBeLessThanOrEqual(15 * 60 * 1000);
   });

@@ -125,9 +125,21 @@ export const PROJECT_CHECKOUT_ORIGIN_PASS_BUDGET_MS = 120_000;
 
 /** Thrown when a pass exceeds {@link PROJECT_CHECKOUT_ORIGIN_PASS_BUDGET_MS}. */
 export class ProjectCheckoutOriginPassTimeoutError extends Error {
-  constructor(budgetMs: number) {
+  /**
+   * The probe phase this pass walked away from, still running.
+   *
+   * Carried on the error so the caller's tick loop can decline to start
+   * another pass on top of it. Nothing can cancel it, so the only lever left
+   * is to stop ADDING to it -- see the skip in
+   * {@link startProjectCheckoutOriginReconciler}. Already neutered against
+   * unhandled rejection by {@link withPassBudget}, so awaiting it is safe.
+   */
+  readonly pendingProbe: Promise<void>;
+
+  constructor(budgetMs: number, pendingProbe: Promise<void>) {
     super(`project-checkout origin reconcile pass exceeded ${budgetMs}ms`);
     this.name = "ProjectCheckoutOriginPassTimeoutError";
+    this.pendingProbe = pendingProbe;
   }
 }
 
@@ -249,14 +261,26 @@ async function mapWithConcurrency<T, R>(
  * it with, every probe it holds is independently timed out, and its result is
  * discarded. What matters is that THIS pass settles, so the caller's
  * non-overlap guard is released and the next tick can run.
+ *
+ * It is not merely dropped, though: the orphan is attached to the thrown error
+ * as {@link ProjectCheckoutOriginPassTimeoutError.pendingProbe}, because the
+ * one unbounded thing it can still be holding is `fs.stat` on a wedged mount,
+ * and that occupies a libuv threadpool thread that no timeout reclaims.
  */
 async function withPassBudget<T>(budgetMs: number, work: Promise<T>): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
+  // Settled form of `work`, used for two things: it is what the timeout error
+  // carries to the tick loop, and it absorbs a late rejection from work that
+  // nothing is awaiting any more once the race has been lost.
+  const settled = work.then(() => {}, () => {});
   try {
     return await Promise.race([
       work,
       new Promise<never>((_resolve, reject) => {
-        timer = setTimeout(() => reject(new ProjectCheckoutOriginPassTimeoutError(budgetMs)), budgetMs);
+        timer = setTimeout(
+          () => reject(new ProjectCheckoutOriginPassTimeoutError(budgetMs, settled)),
+          budgetMs,
+        );
         timer.unref?.();
       }),
     ]);
@@ -432,15 +456,47 @@ export function startProjectCheckoutOriginReconciler(
 
   let ticking = false;
   let stopped = false;
+  /**
+   * Probe phase of a timed-out pass that is still running, or null.
+   *
+   * Distinct from `ticking`: `ticking` is held only while a pass is being
+   * awaited, and the whole point of the budget is to release it on time. This
+   * outlives that release.
+   */
+  let orphanedProbe: Promise<void> | null = null;
 
   async function tick(): Promise<void> {
     // A pass can outlive its interval on a slow filesystem; overlapping passes
     // would double the spawn pressure that slowness is already evidence of.
     if (ticking || stopped) return;
+    // A previous pass blew its budget and walked away from its probe phase.
+    // Each probe's `git` is independently timed out, but the `fs.stat` in front
+    // of it is not -- on a wedged network mount it hangs indefinitely, holding
+    // a libuv threadpool thread. The pool is 4 threads by default and a pass
+    // can abandon up to PROBE_CONCURRENCY (8) of them, so starting another pass
+    // here would not just repeat the stall, it would starve unrelated `fs`,
+    // `dns.lookup` and zlib work elsewhere in this process. Nothing can cancel
+    // the orphan, so declining to add to it is the only lever left.
+    //
+    // This cannot turn into a silently dead detector, which is the failure the
+    // pass budget itself exists to prevent: the pass that timed out already set
+    // the freshness gauge to 0 and nothing here raises it, so
+    // PaperclipProjectCheckoutOriginReconcileMetricsRefreshFailed goes on
+    // paging for exactly as long as this skip lasts.
+    if (orphanedProbe) return;
     ticking = true;
     try {
       await reconcileProjectCheckoutOrigins(db, options);
     } catch (err) {
+      if (err instanceof ProjectCheckoutOriginPassTimeoutError) {
+        const orphan = err.pendingProbe;
+        orphanedProbe = orphan;
+        // Guarded by identity so a stop/start, or a later orphan, cannot have
+        // its skip cleared by an older pass settling.
+        void orphan.finally(() => {
+          if (orphanedProbe === orphan) orphanedProbe = null;
+        });
+      }
       logger.warn({ err }, "project-checkout origin reconcile pass failed");
     } finally {
       ticking = false;
