@@ -1,2114 +1,2419 @@
-# Graph Report - server/src  (2026-08-23)
+# Graph Report - src  (2026-10-14)
 
 ## Corpus Check
-- 979 files · ~2,033,152 words
+- 1266 files · ~3,329,870 words
 - Verdict: corpus is large enough that graph structure adds value.
 
 ## Summary
-- 10148 nodes · 21037 edges · 484 communities (442 shown, 42 thin omitted)
-- Extraction: 99% EXTRACTED · 1% INFERRED · 0% AMBIGUOUS · INFERRED: 228 edges (avg confidence: 0.8)
+- 16101 nodes · 40335 edges · 532 communities (464 shown, 68 thin omitted)
+- Extraction: 98% EXTRACTED · 2% INFERRED · 0% AMBIGUOUS · INFERRED: 972 edges (avg confidence: 0.85)
 - Token cost: 0 input · 0 output
 
 ## Graph Freshness
-- Built from commit: `d92989b8`
+- Built from commit: `2a919b83`
+- Generator: graphify 0.9.62 via graphify-reindex.sh (AST-only `--force` rebuild, no LLM)
 - Run `git rev-parse HEAD` and compare to check if the graph is stale.
 - Run `graphify update .` after code changes (no API cost).
 
 ## Community Hubs (Navigation)
-- [[_COMMUNITY_Community 0|Community 0]]
-- [[_COMMUNITY_Community 1|Community 1]]
-- [[_COMMUNITY_Community 2|Community 2]]
-- [[_COMMUNITY_Community 3|Community 3]]
-- [[_COMMUNITY_Community 4|Community 4]]
-- [[_COMMUNITY_Community 5|Community 5]]
-- [[_COMMUNITY_Community 6|Community 6]]
-- [[_COMMUNITY_Community 7|Community 7]]
-- [[_COMMUNITY_Community 8|Community 8]]
-- [[_COMMUNITY_Community 9|Community 9]]
-- [[_COMMUNITY_Community 10|Community 10]]
-- [[_COMMUNITY_Community 11|Community 11]]
-- [[_COMMUNITY_Community 12|Community 12]]
-- [[_COMMUNITY_Community 13|Community 13]]
-- [[_COMMUNITY_Community 14|Community 14]]
-- [[_COMMUNITY_Community 15|Community 15]]
-- [[_COMMUNITY_Community 16|Community 16]]
-- [[_COMMUNITY_Community 17|Community 17]]
-- [[_COMMUNITY_Community 18|Community 18]]
-- [[_COMMUNITY_Community 19|Community 19]]
-- [[_COMMUNITY_Community 20|Community 20]]
-- [[_COMMUNITY_Community 21|Community 21]]
-- [[_COMMUNITY_Community 22|Community 22]]
-- [[_COMMUNITY_Community 23|Community 23]]
-- [[_COMMUNITY_Community 24|Community 24]]
-- [[_COMMUNITY_Community 25|Community 25]]
-- [[_COMMUNITY_Community 26|Community 26]]
-- [[_COMMUNITY_Community 27|Community 27]]
-- [[_COMMUNITY_Community 28|Community 28]]
-- [[_COMMUNITY_Community 29|Community 29]]
-- [[_COMMUNITY_Community 30|Community 30]]
-- [[_COMMUNITY_Community 31|Community 31]]
-- [[_COMMUNITY_Community 32|Community 32]]
-- [[_COMMUNITY_Community 33|Community 33]]
-- [[_COMMUNITY_Community 34|Community 34]]
-- [[_COMMUNITY_Community 35|Community 35]]
-- [[_COMMUNITY_Community 36|Community 36]]
-- [[_COMMUNITY_Community 37|Community 37]]
-- [[_COMMUNITY_Community 38|Community 38]]
-- [[_COMMUNITY_Community 39|Community 39]]
-- [[_COMMUNITY_Community 40|Community 40]]
-- [[_COMMUNITY_Community 41|Community 41]]
-- [[_COMMUNITY_Community 42|Community 42]]
-- [[_COMMUNITY_Community 43|Community 43]]
-- [[_COMMUNITY_Community 44|Community 44]]
-- [[_COMMUNITY_Community 45|Community 45]]
-- [[_COMMUNITY_Community 46|Community 46]]
-- [[_COMMUNITY_Community 47|Community 47]]
-- [[_COMMUNITY_Community 48|Community 48]]
-- [[_COMMUNITY_Community 49|Community 49]]
-- [[_COMMUNITY_Community 50|Community 50]]
-- [[_COMMUNITY_Community 51|Community 51]]
-- [[_COMMUNITY_Community 52|Community 52]]
-- [[_COMMUNITY_Community 53|Community 53]]
-- [[_COMMUNITY_Community 54|Community 54]]
-- [[_COMMUNITY_Community 55|Community 55]]
-- [[_COMMUNITY_Community 56|Community 56]]
-- [[_COMMUNITY_Community 57|Community 57]]
-- [[_COMMUNITY_Community 58|Community 58]]
-- [[_COMMUNITY_Community 59|Community 59]]
-- [[_COMMUNITY_Community 60|Community 60]]
-- [[_COMMUNITY_Community 61|Community 61]]
-- [[_COMMUNITY_Community 62|Community 62]]
-- [[_COMMUNITY_Community 63|Community 63]]
-- [[_COMMUNITY_Community 64|Community 64]]
-- [[_COMMUNITY_Community 65|Community 65]]
-- [[_COMMUNITY_Community 66|Community 66]]
-- [[_COMMUNITY_Community 67|Community 67]]
-- [[_COMMUNITY_Community 68|Community 68]]
-- [[_COMMUNITY_Community 69|Community 69]]
-- [[_COMMUNITY_Community 70|Community 70]]
-- [[_COMMUNITY_Community 71|Community 71]]
-- [[_COMMUNITY_Community 72|Community 72]]
-- [[_COMMUNITY_Community 73|Community 73]]
-- [[_COMMUNITY_Community 74|Community 74]]
-- [[_COMMUNITY_Community 75|Community 75]]
-- [[_COMMUNITY_Community 76|Community 76]]
-- [[_COMMUNITY_Community 77|Community 77]]
-- [[_COMMUNITY_Community 78|Community 78]]
-- [[_COMMUNITY_Community 79|Community 79]]
-- [[_COMMUNITY_Community 80|Community 80]]
-- [[_COMMUNITY_Community 81|Community 81]]
-- [[_COMMUNITY_Community 82|Community 82]]
-- [[_COMMUNITY_Community 83|Community 83]]
-- [[_COMMUNITY_Community 84|Community 84]]
-- [[_COMMUNITY_Community 85|Community 85]]
-- [[_COMMUNITY_Community 86|Community 86]]
-- [[_COMMUNITY_Community 87|Community 87]]
-- [[_COMMUNITY_Community 88|Community 88]]
-- [[_COMMUNITY_Community 89|Community 89]]
-- [[_COMMUNITY_Community 90|Community 90]]
-- [[_COMMUNITY_Community 91|Community 91]]
-- [[_COMMUNITY_Community 92|Community 92]]
-- [[_COMMUNITY_Community 93|Community 93]]
-- [[_COMMUNITY_Community 94|Community 94]]
-- [[_COMMUNITY_Community 95|Community 95]]
-- [[_COMMUNITY_Community 96|Community 96]]
-- [[_COMMUNITY_Community 97|Community 97]]
-- [[_COMMUNITY_Community 98|Community 98]]
-- [[_COMMUNITY_Community 99|Community 99]]
-- [[_COMMUNITY_Community 100|Community 100]]
-- [[_COMMUNITY_Community 101|Community 101]]
-- [[_COMMUNITY_Community 102|Community 102]]
-- [[_COMMUNITY_Community 103|Community 103]]
-- [[_COMMUNITY_Community 104|Community 104]]
-- [[_COMMUNITY_Community 105|Community 105]]
-- [[_COMMUNITY_Community 106|Community 106]]
-- [[_COMMUNITY_Community 107|Community 107]]
-- [[_COMMUNITY_Community 108|Community 108]]
-- [[_COMMUNITY_Community 109|Community 109]]
-- [[_COMMUNITY_Community 110|Community 110]]
-- [[_COMMUNITY_Community 111|Community 111]]
-- [[_COMMUNITY_Community 112|Community 112]]
-- [[_COMMUNITY_Community 113|Community 113]]
-- [[_COMMUNITY_Community 114|Community 114]]
-- [[_COMMUNITY_Community 115|Community 115]]
-- [[_COMMUNITY_Community 116|Community 116]]
-- [[_COMMUNITY_Community 117|Community 117]]
-- [[_COMMUNITY_Community 118|Community 118]]
-- [[_COMMUNITY_Community 119|Community 119]]
-- [[_COMMUNITY_Community 120|Community 120]]
-- [[_COMMUNITY_Community 121|Community 121]]
-- [[_COMMUNITY_Community 122|Community 122]]
-- [[_COMMUNITY_Community 123|Community 123]]
-- [[_COMMUNITY_Community 124|Community 124]]
-- [[_COMMUNITY_Community 125|Community 125]]
-- [[_COMMUNITY_Community 126|Community 126]]
-- [[_COMMUNITY_Community 127|Community 127]]
-- [[_COMMUNITY_Community 128|Community 128]]
-- [[_COMMUNITY_Community 129|Community 129]]
-- [[_COMMUNITY_Community 130|Community 130]]
-- [[_COMMUNITY_Community 131|Community 131]]
-- [[_COMMUNITY_Community 132|Community 132]]
-- [[_COMMUNITY_Community 133|Community 133]]
-- [[_COMMUNITY_Community 134|Community 134]]
-- [[_COMMUNITY_Community 135|Community 135]]
-- [[_COMMUNITY_Community 136|Community 136]]
-- [[_COMMUNITY_Community 137|Community 137]]
-- [[_COMMUNITY_Community 138|Community 138]]
-- [[_COMMUNITY_Community 139|Community 139]]
-- [[_COMMUNITY_Community 140|Community 140]]
-- [[_COMMUNITY_Community 141|Community 141]]
-- [[_COMMUNITY_Community 142|Community 142]]
-- [[_COMMUNITY_Community 143|Community 143]]
-- [[_COMMUNITY_Community 144|Community 144]]
-- [[_COMMUNITY_Community 145|Community 145]]
-- [[_COMMUNITY_Community 146|Community 146]]
-- [[_COMMUNITY_Community 147|Community 147]]
-- [[_COMMUNITY_Community 148|Community 148]]
-- [[_COMMUNITY_Community 149|Community 149]]
-- [[_COMMUNITY_Community 150|Community 150]]
-- [[_COMMUNITY_Community 151|Community 151]]
-- [[_COMMUNITY_Community 152|Community 152]]
-- [[_COMMUNITY_Community 153|Community 153]]
-- [[_COMMUNITY_Community 154|Community 154]]
-- [[_COMMUNITY_Community 155|Community 155]]
-- [[_COMMUNITY_Community 156|Community 156]]
-- [[_COMMUNITY_Community 157|Community 157]]
-- [[_COMMUNITY_Community 158|Community 158]]
-- [[_COMMUNITY_Community 159|Community 159]]
-- [[_COMMUNITY_Community 160|Community 160]]
-- [[_COMMUNITY_Community 161|Community 161]]
-- [[_COMMUNITY_Community 162|Community 162]]
-- [[_COMMUNITY_Community 163|Community 163]]
-- [[_COMMUNITY_Community 164|Community 164]]
-- [[_COMMUNITY_Community 165|Community 165]]
-- [[_COMMUNITY_Community 166|Community 166]]
-- [[_COMMUNITY_Community 167|Community 167]]
-- [[_COMMUNITY_Community 168|Community 168]]
-- [[_COMMUNITY_Community 169|Community 169]]
-- [[_COMMUNITY_Community 170|Community 170]]
-- [[_COMMUNITY_Community 171|Community 171]]
-- [[_COMMUNITY_Community 172|Community 172]]
-- [[_COMMUNITY_Community 173|Community 173]]
-- [[_COMMUNITY_Community 174|Community 174]]
-- [[_COMMUNITY_Community 175|Community 175]]
-- [[_COMMUNITY_Community 176|Community 176]]
-- [[_COMMUNITY_Community 177|Community 177]]
-- [[_COMMUNITY_Community 178|Community 178]]
-- [[_COMMUNITY_Community 179|Community 179]]
-- [[_COMMUNITY_Community 180|Community 180]]
-- [[_COMMUNITY_Community 181|Community 181]]
-- [[_COMMUNITY_Community 182|Community 182]]
-- [[_COMMUNITY_Community 183|Community 183]]
-- [[_COMMUNITY_Community 184|Community 184]]
-- [[_COMMUNITY_Community 185|Community 185]]
-- [[_COMMUNITY_Community 186|Community 186]]
-- [[_COMMUNITY_Community 187|Community 187]]
-- [[_COMMUNITY_Community 188|Community 188]]
-- [[_COMMUNITY_Community 189|Community 189]]
-- [[_COMMUNITY_Community 190|Community 190]]
-- [[_COMMUNITY_Community 191|Community 191]]
-- [[_COMMUNITY_Community 192|Community 192]]
-- [[_COMMUNITY_Community 193|Community 193]]
-- [[_COMMUNITY_Community 194|Community 194]]
-- [[_COMMUNITY_Community 195|Community 195]]
-- [[_COMMUNITY_Community 196|Community 196]]
-- [[_COMMUNITY_Community 197|Community 197]]
-- [[_COMMUNITY_Community 198|Community 198]]
-- [[_COMMUNITY_Community 199|Community 199]]
-- [[_COMMUNITY_Community 200|Community 200]]
-- [[_COMMUNITY_Community 201|Community 201]]
-- [[_COMMUNITY_Community 202|Community 202]]
-- [[_COMMUNITY_Community 203|Community 203]]
-- [[_COMMUNITY_Community 204|Community 204]]
-- [[_COMMUNITY_Community 205|Community 205]]
-- [[_COMMUNITY_Community 206|Community 206]]
-- [[_COMMUNITY_Community 207|Community 207]]
-- [[_COMMUNITY_Community 208|Community 208]]
-- [[_COMMUNITY_Community 209|Community 209]]
-- [[_COMMUNITY_Community 210|Community 210]]
-- [[_COMMUNITY_Community 211|Community 211]]
-- [[_COMMUNITY_Community 212|Community 212]]
-- [[_COMMUNITY_Community 213|Community 213]]
-- [[_COMMUNITY_Community 214|Community 214]]
-- [[_COMMUNITY_Community 215|Community 215]]
-- [[_COMMUNITY_Community 216|Community 216]]
-- [[_COMMUNITY_Community 217|Community 217]]
-- [[_COMMUNITY_Community 218|Community 218]]
-- [[_COMMUNITY_Community 219|Community 219]]
-- [[_COMMUNITY_Community 220|Community 220]]
-- [[_COMMUNITY_Community 221|Community 221]]
-- [[_COMMUNITY_Community 222|Community 222]]
-- [[_COMMUNITY_Community 223|Community 223]]
-- [[_COMMUNITY_Community 224|Community 224]]
-- [[_COMMUNITY_Community 225|Community 225]]
-- [[_COMMUNITY_Community 226|Community 226]]
-- [[_COMMUNITY_Community 227|Community 227]]
-- [[_COMMUNITY_Community 228|Community 228]]
-- [[_COMMUNITY_Community 229|Community 229]]
-- [[_COMMUNITY_Community 230|Community 230]]
-- [[_COMMUNITY_Community 231|Community 231]]
-- [[_COMMUNITY_Community 232|Community 232]]
-- [[_COMMUNITY_Community 233|Community 233]]
-- [[_COMMUNITY_Community 234|Community 234]]
-- [[_COMMUNITY_Community 235|Community 235]]
-- [[_COMMUNITY_Community 236|Community 236]]
-- [[_COMMUNITY_Community 237|Community 237]]
-- [[_COMMUNITY_Community 238|Community 238]]
-- [[_COMMUNITY_Community 239|Community 239]]
-- [[_COMMUNITY_Community 240|Community 240]]
-- [[_COMMUNITY_Community 241|Community 241]]
-- [[_COMMUNITY_Community 242|Community 242]]
-- [[_COMMUNITY_Community 243|Community 243]]
-- [[_COMMUNITY_Community 244|Community 244]]
-- [[_COMMUNITY_Community 245|Community 245]]
-- [[_COMMUNITY_Community 246|Community 246]]
-- [[_COMMUNITY_Community 247|Community 247]]
-- [[_COMMUNITY_Community 248|Community 248]]
-- [[_COMMUNITY_Community 249|Community 249]]
-- [[_COMMUNITY_Community 250|Community 250]]
-- [[_COMMUNITY_Community 251|Community 251]]
-- [[_COMMUNITY_Community 252|Community 252]]
-- [[_COMMUNITY_Community 253|Community 253]]
-- [[_COMMUNITY_Community 254|Community 254]]
-- [[_COMMUNITY_Community 255|Community 255]]
-- [[_COMMUNITY_Community 256|Community 256]]
-- [[_COMMUNITY_Community 257|Community 257]]
-- [[_COMMUNITY_Community 258|Community 258]]
-- [[_COMMUNITY_Community 259|Community 259]]
-- [[_COMMUNITY_Community 260|Community 260]]
-- [[_COMMUNITY_Community 261|Community 261]]
-- [[_COMMUNITY_Community 262|Community 262]]
-- [[_COMMUNITY_Community 263|Community 263]]
-- [[_COMMUNITY_Community 264|Community 264]]
-- [[_COMMUNITY_Community 265|Community 265]]
-- [[_COMMUNITY_Community 266|Community 266]]
-- [[_COMMUNITY_Community 267|Community 267]]
-- [[_COMMUNITY_Community 268|Community 268]]
-- [[_COMMUNITY_Community 269|Community 269]]
-- [[_COMMUNITY_Community 270|Community 270]]
-- [[_COMMUNITY_Community 271|Community 271]]
-- [[_COMMUNITY_Community 272|Community 272]]
-- [[_COMMUNITY_Community 273|Community 273]]
-- [[_COMMUNITY_Community 274|Community 274]]
-- [[_COMMUNITY_Community 275|Community 275]]
-- [[_COMMUNITY_Community 276|Community 276]]
-- [[_COMMUNITY_Community 277|Community 277]]
-- [[_COMMUNITY_Community 278|Community 278]]
-- [[_COMMUNITY_Community 279|Community 279]]
-- [[_COMMUNITY_Community 280|Community 280]]
-- [[_COMMUNITY_Community 281|Community 281]]
-- [[_COMMUNITY_Community 282|Community 282]]
-- [[_COMMUNITY_Community 283|Community 283]]
-- [[_COMMUNITY_Community 284|Community 284]]
-- [[_COMMUNITY_Community 285|Community 285]]
-- [[_COMMUNITY_Community 286|Community 286]]
-- [[_COMMUNITY_Community 287|Community 287]]
-- [[_COMMUNITY_Community 288|Community 288]]
-- [[_COMMUNITY_Community 289|Community 289]]
-- [[_COMMUNITY_Community 290|Community 290]]
-- [[_COMMUNITY_Community 291|Community 291]]
-- [[_COMMUNITY_Community 292|Community 292]]
-- [[_COMMUNITY_Community 293|Community 293]]
-- [[_COMMUNITY_Community 294|Community 294]]
-- [[_COMMUNITY_Community 295|Community 295]]
-- [[_COMMUNITY_Community 296|Community 296]]
-- [[_COMMUNITY_Community 297|Community 297]]
-- [[_COMMUNITY_Community 298|Community 298]]
-- [[_COMMUNITY_Community 299|Community 299]]
-- [[_COMMUNITY_Community 300|Community 300]]
-- [[_COMMUNITY_Community 301|Community 301]]
-- [[_COMMUNITY_Community 302|Community 302]]
-- [[_COMMUNITY_Community 303|Community 303]]
-- [[_COMMUNITY_Community 304|Community 304]]
-- [[_COMMUNITY_Community 305|Community 305]]
-- [[_COMMUNITY_Community 306|Community 306]]
-- [[_COMMUNITY_Community 307|Community 307]]
-- [[_COMMUNITY_Community 308|Community 308]]
-- [[_COMMUNITY_Community 309|Community 309]]
-- [[_COMMUNITY_Community 310|Community 310]]
-- [[_COMMUNITY_Community 311|Community 311]]
-- [[_COMMUNITY_Community 312|Community 312]]
-- [[_COMMUNITY_Community 313|Community 313]]
-- [[_COMMUNITY_Community 314|Community 314]]
-- [[_COMMUNITY_Community 315|Community 315]]
-- [[_COMMUNITY_Community 316|Community 316]]
-- [[_COMMUNITY_Community 317|Community 317]]
-- [[_COMMUNITY_Community 318|Community 318]]
-- [[_COMMUNITY_Community 319|Community 319]]
-- [[_COMMUNITY_Community 320|Community 320]]
-- [[_COMMUNITY_Community 321|Community 321]]
-- [[_COMMUNITY_Community 322|Community 322]]
-- [[_COMMUNITY_Community 323|Community 323]]
-- [[_COMMUNITY_Community 324|Community 324]]
-- [[_COMMUNITY_Community 325|Community 325]]
-- [[_COMMUNITY_Community 326|Community 326]]
-- [[_COMMUNITY_Community 327|Community 327]]
-- [[_COMMUNITY_Community 328|Community 328]]
-- [[_COMMUNITY_Community 329|Community 329]]
-- [[_COMMUNITY_Community 330|Community 330]]
-- [[_COMMUNITY_Community 331|Community 331]]
-- [[_COMMUNITY_Community 332|Community 332]]
-- [[_COMMUNITY_Community 333|Community 333]]
-- [[_COMMUNITY_Community 334|Community 334]]
-- [[_COMMUNITY_Community 336|Community 336]]
-- [[_COMMUNITY_Community 337|Community 337]]
-- [[_COMMUNITY_Community 338|Community 338]]
-- [[_COMMUNITY_Community 339|Community 339]]
-- [[_COMMUNITY_Community 340|Community 340]]
-- [[_COMMUNITY_Community 341|Community 341]]
-- [[_COMMUNITY_Community 342|Community 342]]
-- [[_COMMUNITY_Community 343|Community 343]]
-- [[_COMMUNITY_Community 344|Community 344]]
-- [[_COMMUNITY_Community 345|Community 345]]
-- [[_COMMUNITY_Community 346|Community 346]]
-- [[_COMMUNITY_Community 347|Community 347]]
-- [[_COMMUNITY_Community 348|Community 348]]
-- [[_COMMUNITY_Community 349|Community 349]]
-- [[_COMMUNITY_Community 350|Community 350]]
-- [[_COMMUNITY_Community 351|Community 351]]
-- [[_COMMUNITY_Community 352|Community 352]]
-- [[_COMMUNITY_Community 354|Community 354]]
-- [[_COMMUNITY_Community 355|Community 355]]
-- [[_COMMUNITY_Community 356|Community 356]]
-- [[_COMMUNITY_Community 357|Community 357]]
-- [[_COMMUNITY_Community 358|Community 358]]
-- [[_COMMUNITY_Community 359|Community 359]]
-- [[_COMMUNITY_Community 360|Community 360]]
-- [[_COMMUNITY_Community 361|Community 361]]
-- [[_COMMUNITY_Community 362|Community 362]]
-- [[_COMMUNITY_Community 363|Community 363]]
-- [[_COMMUNITY_Community 364|Community 364]]
-- [[_COMMUNITY_Community 365|Community 365]]
-- [[_COMMUNITY_Community 366|Community 366]]
-- [[_COMMUNITY_Community 367|Community 367]]
-- [[_COMMUNITY_Community 368|Community 368]]
-- [[_COMMUNITY_Community 369|Community 369]]
-- [[_COMMUNITY_Community 370|Community 370]]
-- [[_COMMUNITY_Community 371|Community 371]]
-- [[_COMMUNITY_Community 372|Community 372]]
-- [[_COMMUNITY_Community 373|Community 373]]
-- [[_COMMUNITY_Community 374|Community 374]]
-- [[_COMMUNITY_Community 375|Community 375]]
-- [[_COMMUNITY_Community 376|Community 376]]
-- [[_COMMUNITY_Community 377|Community 377]]
-- [[_COMMUNITY_Community 378|Community 378]]
-- [[_COMMUNITY_Community 379|Community 379]]
-- [[_COMMUNITY_Community 380|Community 380]]
-- [[_COMMUNITY_Community 381|Community 381]]
-- [[_COMMUNITY_Community 382|Community 382]]
-- [[_COMMUNITY_Community 383|Community 383]]
-- [[_COMMUNITY_Community 384|Community 384]]
-- [[_COMMUNITY_Community 385|Community 385]]
-- [[_COMMUNITY_Community 386|Community 386]]
-- [[_COMMUNITY_Community 387|Community 387]]
-- [[_COMMUNITY_Community 388|Community 388]]
-- [[_COMMUNITY_Community 389|Community 389]]
-- [[_COMMUNITY_Community 390|Community 390]]
-- [[_COMMUNITY_Community 391|Community 391]]
-- [[_COMMUNITY_Community 392|Community 392]]
-- [[_COMMUNITY_Community 393|Community 393]]
-- [[_COMMUNITY_Community 394|Community 394]]
-- [[_COMMUNITY_Community 395|Community 395]]
-- [[_COMMUNITY_Community 396|Community 396]]
-- [[_COMMUNITY_Community 399|Community 399]]
-- [[_COMMUNITY_Community 400|Community 400]]
-- [[_COMMUNITY_Community 401|Community 401]]
-- [[_COMMUNITY_Community 402|Community 402]]
-- [[_COMMUNITY_Community 403|Community 403]]
-- [[_COMMUNITY_Community 404|Community 404]]
-- [[_COMMUNITY_Community 405|Community 405]]
-- [[_COMMUNITY_Community 407|Community 407]]
-- [[_COMMUNITY_Community 409|Community 409]]
-- [[_COMMUNITY_Community 410|Community 410]]
-- [[_COMMUNITY_Community 411|Community 411]]
-- [[_COMMUNITY_Community 412|Community 412]]
-- [[_COMMUNITY_Community 413|Community 413]]
-- [[_COMMUNITY_Community 414|Community 414]]
-- [[_COMMUNITY_Community 419|Community 419]]
-- [[_COMMUNITY_Community 421|Community 421]]
-- [[_COMMUNITY_Community 425|Community 425]]
-- [[_COMMUNITY_Community 426|Community 426]]
-- [[_COMMUNITY_Community 427|Community 427]]
-- [[_COMMUNITY_Community 428|Community 428]]
-- [[_COMMUNITY_Community 437|Community 437]]
-- [[_COMMUNITY_Community 443|Community 443]]
-- [[_COMMUNITY_Community 444|Community 444]]
-- [[_COMMUNITY_Community 445|Community 445]]
-- [[_COMMUNITY_Community 446|Community 446]]
-- [[_COMMUNITY_Community 447|Community 447]]
-- [[_COMMUNITY_Community 461|Community 461]]
-- [[_COMMUNITY_Community 462|Community 462]]
-- [[_COMMUNITY_Community 463|Community 463]]
-- [[_COMMUNITY_Community 464|Community 464]]
-- [[_COMMUNITY_Community 465|Community 465]]
-- [[_COMMUNITY_Community 466|Community 466]]
-- [[_COMMUNITY_Community 467|Community 467]]
-- [[_COMMUNITY_Community 468|Community 468]]
-- [[_COMMUNITY_Community 469|Community 469]]
-- [[_COMMUNITY_Community 470|Community 470]]
-- [[_COMMUNITY_Community 471|Community 471]]
-- [[_COMMUNITY_Community 472|Community 472]]
-- [[_COMMUNITY_Community 473|Community 473]]
-- [[_COMMUNITY_Community 474|Community 474]]
-- [[_COMMUNITY_Community 475|Community 475]]
-- [[_COMMUNITY_Community 476|Community 476]]
-- [[_COMMUNITY_Community 477|Community 477]]
-- [[_COMMUNITY_Community 478|Community 478]]
-- [[_COMMUNITY_Community 479|Community 479]]
-- [[_COMMUNITY_Community 481|Community 481]]
-- [[_COMMUNITY_Community 482|Community 482]]
+- heartbeat.ts
+- services/issues.ts
+- company-portability.ts
+- embedded-postgres.ts
+- costs-service.test.ts
+- app.ts
+- issue-create-deduplication-routes.test.ts
+- routes/projects.ts
+- services/company-skills.ts
+- services/pipelines.ts
+- routes/issues.ts
+- services/built-in-agents.ts
+- issue-dependency-wakeups-routes.test.ts
+- workspace-runtime.ts
+- services/plugin-loader.ts
+- github-webhook.ts
+- routes/pipelines.ts
+- cleanup-heartbeat-test-state.ts
+- k8s-job-liveness.ts
+- parseObject
+- services/tool-gateway.ts
+- services/tool-access.ts
+- routes/access.ts
+- executeRun
+- agents-service-secret-bindings.test.ts
+- recovery-stale-issue-lock-sweep.test.ts
+- productivity-review.ts
+- services/teams-catalog.ts
+- plugins.ts
+- environment-config.ts
+- evidence-gate.ts
+- middleware/auth.ts
+- services/cloud-upstreams.ts
+- services/secrets.ts
+- registry.ts
+- tool-access-policy.ts
+- recovery/index.ts
+- services/attention.ts
+- cases.ts
+- logger
+- issueRoutes
+- environment-custom-images.ts
+- feedback.ts
+- metrics.ts
+- workspace-file-resources.ts
+- openapi.ts
+- skills-catalog.ts
+- github-app-auth.ts
+- services/routines.ts
+- agent-adapter-validation-routes.test.ts
+- effective-run-config-fingerprints.ts
+- environment-runtime.ts
+- penstock-availability-gate.ts
+- authorization.ts
+- companySkillService
+- execution-workspace-cleanup.ts
+- tool-gateway.test.ts
+- heartbeatService
+- issue-agent-mutation-ownership-routes.test.ts
+- redaction.ts
+- adapters.ts
+- conflict
+- services/execution-workspaces.ts
+- services/issue-tree-control.ts
+- better-auth.ts
+- sandbox-provider-runtime.ts
+- storage/types.ts
+- issue-attachment-routes.test.ts
+- plugin-job-scheduler.ts
+- plugin-database.ts
+- local-service-supervisor.ts
+- services/projects.ts
+- org-chart-svg.ts
+- environment-run-orchestrator.ts
+- issue-thread-interactions.ts
+- plugin-host-services.ts
+- run-liveness.ts
+- badRequest
+- agentService
+- company-search.ts
+- task-watchdogs.ts
+- git-worktree-ownership.ts
+- services/smoke-lab.ts
+- workspace-runtime.test.ts
+- heartbeat-process-recovery.test.ts
+- worktree-config.ts
+- kkroo-bundled-plugins.ts
+- unprocessable
+- environment-custom-image-terminal-ws.ts
+- plugin-routes-authz.test.ts
+- toolAccessService
+- config.ts
+- run-liveness-continuations.ts
+- recoveryService
+- agent-instructions.ts
+- heartbeat-hintless-transient-upstream.test.ts
+- hot-restart.ts
+- process-crash-guard.ts
+- productivity-review-service.test.ts
+- parseIssueExecutionState
+- issue-comment-reopen-routes.test.ts
+- pipelines-aggregation.ts
+- environment-probe-k8s.test.ts
+- productivityReviewService
+- pluginCapabilityValidator
+- plugin-worker-manager.ts
+- sweep-wake-preflight.ts
+- issue-execution-policy-routes.test.ts
+- tool-access-service.test.ts
+- budgetService
+- external-objects.ts
+- environment-routes.test.ts
+- services/dashboard.ts
+- identifier-allocator.ts
+- issue-execution-policy.ts
+- listBlockedInboxIssues
+- ui-branding.ts
+- agent-cross-tenant-authz-routes.test.ts
+- agent-permissions-routes.test.ts
+- heartbeat-workspace-branch-containment.test.ts
+- file-resources.ts
+- company-artifacts.ts
+- execution-workspace-policy.ts
+- plugin-config-masking.ts
+- tool-oauth-legacy-backfill.ts
+- api-compression.ts
+- index.ts
+- live-events-ws.ts
+- github-review-gate-authority.ts
+- source-trust.ts
+- issue-continuation-summary.ts
+- recovery/service.ts
+- github-status-delivery-outbox.ts
+- opencode-k8s-seed-transport.test.ts
+- successful-run-handoff.ts
+- server-info.ts
+- low-trust-red-team-routes.test.ts
+- environmentService
+- issue-pull-requests.ts
+- issues-service.test.ts
+- heartbeat-wake-dispatch-retry.test.ts
+- trust-preset-resolver.ts
+- agent-skills-routes.test.ts
+- issues-goal-context-routes.test.ts
+- accessService
+- services/resource-memberships.ts
+- heartbeat-run-runtime-status.ts
+- issue-rewake-throttle.ts
+- synthetic-ssh-probe.ts
+- environment-custom-image-terminal-ws.test.ts
+- issue-efficiency.ts
+- issueService
+- secretService
+- companies-route-cross-company-authz.test.ts
+- version.ts
+- human-gated-ageing.ts
+- environmentCustomImageTerminalConnectionRegistry
+- worker-tier-proxy.ts
+- logger.ts
+- company-skills-routes.test.ts
+- pr-comment-review-gate.ts
+- services/instance-settings.ts
+- recovery-observability.ts
+- agentRoutes
+- db-retry.ts
+- scrape-metrics-collector.ts
+- authorizationService
+- human-gated-ageing-digest.ts
+- adapter-routes-authz.test.ts
+- ac-policy-assignee-routing.ts
+- company-portability-routes.test.ts
+- environment-capabilities-k8s.test.ts
+- environment-custom-image-routes.test.ts
+- redactCurrentUserText
+- built-in-agents.test.ts
+- issue-visibility.ts
+- plugin-dev-watcher.ts
+- createToolRuntimeSupervisor
+- git-checkout-identity.ts
+- FakeRuntime
+- human-gated-gate-revalidation.ts
+- heartbeat-workspace-finalize-branch.test.ts
+- issue-comment-cancel-routes.test.ts
+- cursor-models.ts
+- health.ts
+- bootstrap-claim-routes.test.ts
+- work-timeline.ts
+- agent-invokability.ts
+- plugin-environment-driver.ts
+- issue-recovery-actions.ts
+- aws-secrets-manager-provider.ts
+- issue-workspace-command-authz.test.ts
+- heartbeat-pr-review-gate-replay.test.ts
+- gbrain-client-factory.test.ts
+- heartbeat-stop-metadata.ts
+- remote-http-endpoint-guard.ts
+- run-scratch.ts
+- pr-review-duplicate-issue-guard.ts
+- adapter-model-refresh-routes.test.ts
+- agent-instructions-routes.test.ts
+- issue-feedback-routes.test.ts
+- routes/dashboard.ts
+- issue-recovery-actions.test.ts
+- metrics-ingest.ts
+- adapter-registry-bootstrap.ts
+- builtInAgentService
+- gbrain-client-factory.ts
+- issueReferenceService
+- agent-inbox-lite.ts
+- pipelineService
+- PluginWorkerManager
+- claude-local-execute.test.ts
+- issue-document-restore-routes.test.ts
+- workspace-runtime-routes-authz.test.ts
+- pr-review-request-ageing.ts
+- dev-runner-worktree.ts
+- dev-server-status.ts
+- openapi-routes.test.ts
+- body
+- execution-allowlist.ts
+- pluginManagedRoutineService
+- extractWakeCommentIds
+- github-write-egress-scrub.test.ts
+- transitionCaseInTransaction
+- visibleIssueCondition
+- isolation-workspace-reaper.test.ts
+- ac-policy-sweep.ts
+- environment-custom-image-terminal-sessions.ts
+- feedback-redaction.ts
+- plugin-managed-agents.ts
+- plugin-managed-skills.ts
+- execution-workspace-per-run-isolation.test.ts
+- approval-routes-idempotency.test.ts
+- approval-withdraw-routes.test.ts
+- company-portability.test.ts
+- docker-opencode-runtime-pin.test.ts
+- done-gate-durable-artifact.test.ts
+- environment-selection-route-guards.test.ts
+- issue-thread-interaction-routes.test.ts
+- routines-routes.test.ts
+- approval-gate-reconciler.ts
+- stranded-blocked-issue-reconciler.ts
+- buildOpenApiDocument
+- workspace-command-authz.ts
+- runtime-api.ts
+- pluginRegistryService
+- routineService
+- renderMetrics
+- codex-auth-reconciliation.ts
+- isPlainRecord
+- terminal-gate-reconciler.ts
+- reconcileStrandedRecoveryWakeBackstopImpl
+- workspace-operation-log-store.ts
+- agent-test-environment-routes.test.ts
+- document-annotation-routes.test.ts
+- external-object-routes.test.ts
+- issue-activity-events-routes.test.ts
+- renderYamlBlock
+- issue-telemetry-routes.test.ts
+- project-goal-telemetry-routes.test.ts
+- routine-document-annotation-routes.test.ts
+- summary-slot-routes.test.ts
+- ccrotate-state-hook.ts
+- exportBundle
+- plugin-secrets-handler.ts
+- workspace-response-withholding-guard.test.ts
+- issue-monitor-convergence-guard.test.ts
+- branch-run-claims.ts
+- http-metrics-per-route.test.ts
+- dev-runner-snapshot.test.ts
+- company-branding-route.test.ts
+- heartbeat-accepted-plan-workspace-refresh.test.ts
+- issue-approval-link-authorization.ts
+- invite-accept-existing-member.test.ts
+- issue-closed-workspace-routes.test.ts
+- middleware/index.ts
+- model-profile-hint.ts
+- recovery-stranded-attendance-batch.test.ts
+- issue-repo-binding-guard.ts
+- managed-checkout-push-guard.ts
+- agent-auth-jwt.ts
+- workspace-scan.ts
+- backfill-agent-bundle.ts
+- agent-run-health.ts
+- authorization-service.test.ts
+- summarySlotService
+- issue-comment-effects.ts
+- managed-checkout-partial-clone.ts
+- importBundle
+- approval-enforcement-reconciler.ts
+- createPluginJobScheduler
+- heartbeat-timer-suppression-park-bypass.test.ts
+- run-secret-redaction.ts
+- agent-hires-instructions-materialize.test.ts
+- zoned-cron.ts
+- built-in-agent-routes.test.ts
+- codex-local-execute.test.ts
+- company-skills-catalog-service.test.ts
+- issue-update-comment-wakeup-routes.test.ts
+- node:http
+- instrumentation.ts
+- http-log-policy.ts
+- redact-sensitive.ts
+- issue-blocker-diagnostics-routes.test.ts
+- strand-comment-provider-capacity.test.ts
+- heartbeat-retry-scheduling.test.ts
+- fd-class-metrics.ts
+- issue-subtree-diagnostics-routes.test.ts
+- issue-wake-diagnostics-routes.test.ts
+- heartbeat-run-summary.ts
+- zoned-cron-equivalence.test.ts
+- live-events.ts
+- plugin-orchestration-apis.test.ts
+- process-loss-classification.ts
+- openrouter/execute.ts
+- evidence-truth.ts
+- config
+- pr-review-state-reconciler.ts
+- process-crash-guard-exit.test.ts
+- security-audit-overrides.test.ts
+- pen3142-live-event-transcript-scope.test.ts
+- utils.ts
+- agent-shell-guard.ts
+- native-memory-metrics.test.ts
+- services/index.ts
+- zodToOpenApiSchema
+- heartbeat-provider-capacity-horizon.test.ts
+- company-export-readme.ts
+- company-search-service.test.ts
+- collectEvidence
+- lifecycle-hook-command-audit.ts
+- linear-auth.ts
+- boardAuthService
+- environmentRoutes
+- pen3142-run-transcript-scope.test.ts
+- input
+- project-env-response-boundary.test.ts
+- setup-supertest.ts
+- routes/decision-training.ts
+- .call
+- queued-run-age-metrics.ts
+- agent-secret-bindings.ts
+- readPortableCatalogProvenance
+- OAuthMintBearer
+- plugin-activation-boot-retry.test.ts
+- normalizeIssueExecutionPolicy
+- routines-service.test.ts
+- issue-list-assignee-filter-routes.test.ts
+- heartbeat-issue-liveness-escalation.test.ts
+- approval-budget-assertion-required.test.ts
+- asNumber
+- cursor-local-execute.test.ts
+- docker-entrypoint.test.ts
+- local-encrypted-provider.ts
+- buildPortableProjectWorkspaces
+- pipeline-case-outputs.ts
+- heartbeat-zombie-guard.test.ts
+- issue-liveness.test.ts
+- issue-monitor-scheduler.test.ts
+- pull-request-work-products.ts
+- linear-webhook.test.ts
+- pr-review-request-ageing-producer.ts
+- dev-watch-ignore.ts
+- pipelines-service.test.ts
+- approval-create-issue-link-authorization.test.ts
+- applyDocumentFixups
+- user-profiles.ts
+- approval-link-route-equivalence.test.ts
+- issue-checkout-status.ts
+- done-gate.ts
+- heartbeat-stale-queue-invalidation.test.ts
+- routine-scheduler-heartbeat.ts
+- issue-goal-fallback.ts
+- agent-profile-change-gate-mixing.test.ts
+- approval-agent-config-authz-routes.test.ts
+- github-fetch.ts
+- board-chat.ts
+- graceful-shutdown-exit.test.ts
+- invite-create-route.test.ts
+- company-issue-identity-guard.test.ts
+- activityService
+- run-log-terminal-result.ts
+- agent-budget-mirror-write.test.ts
+- mcp-seed-scrub-coverage.test.ts
+- stacked-pr-auto-retarget.test.ts
+- heartbeat-hard-stale-subprocess-liveness.test.ts
+- plugin-webhook-not-ready-retryable.test.ts
+- scheduler-lease.ts
+- readNonEmptyString
+- sweep-wake-preflight.test.ts
+- agent-hire-source-issue-authorization.test.ts
+- approval-revision-exit.test.ts
+- issue-create-pr-review-duplicate-routes.test.ts
+- company-search-rate-limit.ts
+- createToolGatewayService
+- HEARTBEAT.md -- CEO Heartbeat Checklist
+- docker-onboard-smoke-contract.test.ts
+- gemini-local-execute.test.ts
+- approval-payload-title-guard.test.ts
+- openclaw-invite-prompt-route.test.ts
+- extractEnforcementAssertions
+- issues-open-assignment-census.test.ts
+- plugin-status-metrics.ts
+- readPenstockCapacity
+- paperclip-skill-utils.test.ts
+- auth-session-route.test.ts
+- github-review-posted-metric.test.ts
+- issue-watchdogs-routes.test.ts
+- assertAssignableAgent
+- approval-enforcement-reconciler.test.ts
+- company-issue-identity.ts
+- ccrotate-plugin-retirement.test.ts
+- environment-test-harness.test.ts
+- documents.ts
+- matchesTaskKey
+- SandboxProvider
+- sse-registry.ts
+- environment-instance-routes.test.ts
+- plugin-metric-exposition.test.ts
+- Ally — Consolidated PR Review
+- issue-runtime-service-command-masking.test.ts
+- deriveSkillExportDirCandidates
+- database-backup-health.ts
+- README.md
+- server-package-build-script.test.ts
+- tar-security-override.test.ts
+- human-gated-gate-revalidation-wiring.test.ts
+- agent-budgets-route-config-revision.test.ts
+- secrets/types.ts
+- blocked-inbox-count-list-parity.test.ts
+- cases-routes.test.ts
+- plugin-manifest-validator.ts
+- plugin-state-store.ts
+- scrape-metrics-routine-fire-gap-work.test.ts
+- execution-lock-orphan-cleanup.test.ts
+- trust-proxy.ts
+- privateHostnameGuard
+- pr-review-issue-scope-locks.test.ts
+- closeOpenSuppressedReviews
+- heartbeat-reviewer-evidence-live-head.test.ts
+- permissions-upgrade-boundary-routes.test.ts
+- issue-stale-execution-lock-routes.test.ts
+- startup-filesystem-io.test.ts
+- chain
+- event-loop-stall-log.ts
+- issue-monitor-convergence-message.test.ts
+- Ally — Consolidated PR Review
+- human-gated-gate-revalidation-backfill.test.ts
+- issue-stable-enumeration-routes.test.ts
+- ceo/AGENTS.md
+- EnvironmentRuntimeDriver
+- penstock-availability-gate.test.ts
+- plugin-host-service-cleanup.ts
+- ensureServerWorkspaceLinksCurrent
+- Ally — Consolidated PR Review
+- heartbeat-worktree-suppression.test.ts
+- pod-failure-label-corpus.test.ts
+- linear-tunnel.ts
+- inherited-workspace-reuse-failure-summary.test.ts
+- issue-assignment-wakeup.ts
+- agent-auth-middleware.test.ts
+- plugin-worker-invocation-scope.cjs
+- issue-checkout-routine-lock-conflict.test.ts
+- issue-release-lock-only-degrade.test.ts
+- pen3139-transcript-credential-shapes.test.ts
+- startup-dispatch-isolation.test.ts
+- workspace-operation-secret-scrub.test.ts
+- reflection-coach/AGENTS.md
+- Recent agent reflection sweep
+- summarizer/AGENTS.md
+- Refresh stale summary slots
+- validateTerminalUpgrade
+- healthz-probe-route.test.ts
+- environment-runtime-driver-contract.test.ts
+- heartbeat-result-json-write-path-audit.test.ts
+- issue-thread-interactions-service.test.ts
+- metrics-route-no-db.test.ts
+- reviewer-wake-outcome-log-fields.test.ts
+- SOUL.md -- CEO Persona
+- Wake Pre-flight (do this FIRST when woken)
+- issues-checkout-wakeup.ts
+- parseStatusFilter
+- redactSecretValuesFromText
+- createPluginJobCoordinator
+- authz-existence-oracle-guard.test.ts
+- plugin-worker-delayed.cjs
+- plugin-worker-terminated.cjs
+- postgres-pool-budget.test.ts
+- recovery-candidate-phase-timer-coverage.test.ts
+- default/AGENTS.md
+- recovery-pause-hold-guard-call-shape.test.ts
+- express.d.ts
+- TOOLS.md
 
 ## God Nodes (most connected - your core abstractions)
-1. `unprocessable()` - 175 edges
-2. `notFound()` - 119 edges
-3. `issueRoutes()` - 104 edges
-4. `heartbeatService()` - 104 edges
-5. `parseObject()` - 100 edges
-6. `createApp()` - 84 edges
-7. `logger` - 83 edges
-8. `logActivity()` - 83 edges
-9. `readNonEmptyString()` - 75 edges
-10. `forbidden()` - 71 edges
+1. `heartbeatService()` - 586 edges
+2. `unprocessable()` - 381 edges
+3. `issueRoutes()` - 376 edges
+4. `notFound()` - 337 edges
+5. `issueService()` - 264 edges
+6. `logActivity()` - 258 edges
+7. `recoveryService()` - 243 edges
+8. `executeRun()` - 241 edges
+9. `parseObject` - 193 edges
+10. `agentRoutes()` - 186 edges
 
 ## Surprising Connections (you probably didn't know these)
-- `startServer()` --calls--> `waitForExternalAdapters()`  [INFERRED]
-  index.ts → adapters/registry.ts
-- `createApp()` --calls--> `createPluginStreamBus()`  [INFERRED]
-  app.ts → services/plugin-stream-bus.ts
-- `createApp()` --calls--> `accessRoutes()`  [INFERRED]
-  __tests__/access-routes-permissions-upgrade.test.ts → routes/access.ts
-- `createApp()` --calls--> `activityRoutes()`  [INFERRED]
-  __tests__/activity-routes.test.ts → routes/activity.ts
-- `unregisterTestAdapter()` --calls--> `unregisterServerAdapter()`  [INFERRED]
-  __tests__/adapter-model-refresh-routes.test.ts → adapters/registry.ts
+- `createApp()` --indirect_call--> `errorHandler()`  [INFERRED]
+  __tests__/adapter-routes-authz.test.ts → middleware/error-handler.ts
+- `createApp()` --indirect_call--> `errorHandler()`  [INFERRED]
+  __tests__/adapter-routes.test.ts → middleware/error-handler.ts
+- `createApp()` --indirect_call--> `errorHandler()`  [INFERRED]
+  __tests__/agent-auth-middleware.test.ts → middleware/error-handler.ts
+- `createApp()` --indirect_call--> `errorHandler()`  [INFERRED]
+  __tests__/agent-budget-mirror-write.test.ts → middleware/error-handler.ts
+- `createApp()` --indirect_call--> `errorHandler()`  [INFERRED]
+  __tests__/agent-budgets-route-config-revision.test.ts → middleware/error-handler.ts
 
 ## Import Cycles
-- 1-file cycle: `home-paths.ts -> home-paths.ts`
-- 1-file cycle: `telemetry.ts -> telemetry.ts`
-- 2-file cycle: `services/execution-workspaces.ts -> services/workspace-runtime.ts -> services/execution-workspaces.ts`
-- 3-file cycle: `services/plugin-lifecycle.ts -> services/plugin-loader.ts -> services/plugin-tool-dispatcher.ts -> services/plugin-lifecycle.ts`
+- 2-file cycle: `services/issues.ts -> services/task-watchdogs.ts -> services/issues.ts`
 
-## Communities (484 total, 42 thin omitted)
+## Communities (532 total, 68 thin omitted)
 
-### Community 0 - "Community 0"
+### Community 0 - "heartbeat.ts"
 Cohesion: 0.01
-Nodes (164): AcceptedPlanWakeRoutingDecision, activeRunExecutions, adapterSupportsManagedMcpConfig(), AGENT_SCOPE_ONLY_ENV_KEYS, appendReviewOutputEvidenceText(), AppliedModelProfileConfigSource, assertPathContained(), AUTHOR_REVIEW_CONTENT_WAKE_REASONS (+156 more)
+Nodes (272): appendWithByteCap, createServerGbrainClient(), AcceptedPlanWakeRoutingDecision, ACTIVE_RUN_LOG_RUNTIME_STATUS_REFRESH_INTERVAL_MS, ACTIVE_RUN_OUTPUT_PROGRESS_FLUSH_INTERVAL_MS, activeRunExecutions, ADAPTER_RESOLUTION_RETRY_DELAY_MS, adapterSupportsManagedMcpConfig() (+264 more)
 
-### Community 1 - "Community 1"
+### Community 1 - "services/issues.ts"
 Cohesion: 0.02
-Nodes (112): getDefaultCompanyGoal(), ACCEPTED_PLAN_DECOMPOSITION_FINGERPRINT_CHILD_METADATA_KEYS, AcceptedPlanDecompositionInput, AcceptedPlanDocumentInteraction, ALL_ISSUE_STATUSES, BLOCKED_INBOX_ACTIVE_RUN_STATUSES, BLOCKED_INBOX_PENDING_APPROVAL_STATUSES, BLOCKED_INBOX_PENDING_INTERACTION_STATUSES (+104 more)
+Nodes (131): ParsedExecutionWorkspaceMode, getDefaultCompanyGoal(), GoalReader, ACCEPTED_PLAN_DECOMPOSITION_FINGERPRINT_CHILD_METADATA_KEYS, AcceptedPlanDecompositionInput, AcceptedPlanDocumentInteraction, ALL_ISSUE_STATUSES, attentionBase() (+123 more)
 
-### Community 2 - "Community 2"
+### Community 2 - "company-portability.ts"
 Cohesion: 0.04
-Nodes (39): ADAPTER_DEFAULT_RULES_BY_TYPE, AgentLike, appendCodexImportArg(), applyImportAdapterRunDefaults(), COMPANY_LOGO_CONTENT_TYPE_EXTENSIONS, CompanyPackageIncludeEntry, DEFAULT_INCLUDE, EnvInputRecord (+31 more)
+Nodes (57): ADAPTER_DEFAULT_RULES_BY_TYPE, AgentLike, appendCodexImportArg(), applyImportAdapterRunDefaults(), asInteger(), buildLegacyRoutineTriggerFromRecurrence(), collectSelectedExportSlugs(), COMPANY_LOGO_CONTENT_TYPE_EXTENSIONS (+49 more)
 
-### Community 3 - "Community 3"
+### Community 3 - "embedded-postgres.ts"
 Cohesion: 0.02
-Nodes (85): attachErrorContext(), ErrorContext, errorHandler(), getPaperclipDb(), isRedactedSkillPolicyDenial(), recordResponsibleUserDenialFromHttpError(), shouldExposeTrustedCloudTenantImportError(), httpLogger (+77 more)
+Nodes (62): attachErrorContext(), ErrorContext, errorHandler(), getPaperclipDb(), isRedactedSkillPolicyDenial(), recordResponsibleUserDenialFromHttpError(), shouldExposeTrustedCloudTenantImportError(), normalizeResponsibleUserDenialCode() (+54 more)
 
-### Community 4 - "Community 4"
+### Community 4 - "costs-service.test.ts"
+Cohesion: 0.14
+Nodes (14): createApp(), createAppWithActor(), loadCostParsers(), makeDb(), mockAccessService, mockAgentService, mockBudgetService, mockCompanyService (+6 more)
+
+### Community 5 - "app.ts"
+Cohesion: 0.03
+Nodes (163): hermesGatewayAgentConfigurationDoc, acceptsGzip(), createApp(), createPrecompressedStaticMiddleware(), isDatabaseConnectionUnavailableError(), PRECOMPRESSED_STATIC_EXTENSIONS, resolveViteHmrHost(), resolveViteHmrPort() (+155 more)
+
+### Community 6 - "issue-create-deduplication-routes.test.ts"
+Cohesion: 0.15
+Nodes (10): findCreateIssueDuplicateCandidates(), ISSUE_CREATE_DUPLICATE_CANDIDATE_LATENCY_BUDGET_MS, ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP, ISSUE_CREATE_DUPLICATE_CANDIDATE_SCAN_CAP, ISSUE_CREATE_IDEMPOTENCY_KEY_RETENTION_DAYS, createApp(), FilingFixture, monitorFilings (+2 more)
+
+### Community 7 - "routes/projects.ts"
 Cohesion: 0.04
-Nodes (81): recoveryService(), agentRoutes(), containsRedactedAdapterValue(), EXTERNAL_LIFECYCLE_ADAPTER_TYPE_SET, isRedactedEnvBinding(), OMIT_REDACTED_ADAPTER_VALUE, restoreRedactedAdapterValue(), stripRedactedEnvBindingsFromAdapterConfig() (+73 more)
+Nodes (90): appendWithCap, maskWorkspaceRuntimeForRead(), maskWorkspaceRuntimeTextForRead(), REDACTED_EVENT_VALUE, withholdWorkspaceOperationCapturedOutput(), executionWorkspaceRoutes(), assertRuntimeManageAllowed(), handleExecutionWorkspaceRuntimeCommand() (+82 more)
 
-### Community 5 - "Community 5"
+### Community 8 - "services/company-skills.ts"
+Cohesion: 0.03
+Nodes (87): skillImportPolicyResource(), ALLOWED_SKILL_TEST_TEMPLATE_PLACEHOLDERS, assertImportedSkillSourceAllowed(), assertNoSymlinksInLocalTree(), assertVersionMatchesSkill(), auditInstalledSkillBytes(), buildInventoryContentHash(), BUILT_IN_SKILL_TEST_RUN_TEMPLATE_BODY (+79 more)
+
+### Community 9 - "services/pipelines.ts"
+Cohesion: 0.05
+Nodes (65): addFormVariablesForStage(), assertActorProvenance(), assertCaseKey(), assertValidParentCase(), buildCaseDeepLink(), buildPipelineAutomationIssueTitlePrefix(), buildPipelineCaseContextMarkdown(), buildPipelineCaseContextPack() (+57 more)
+
+### Community 10 - "routes/issues.ts"
+Cohesion: 0.02
+Nodes (144): IssueApprovalLinkAuthorizationIssue, ACTIVE_REVIEW_APPROVAL_STATUSES, ActivityExecutionParticipant, activityExecutionParticipantKey(), ActivityIssueRelationSummary, applyActorMonitorScheduledBy(), attachmentArtifactMetadataInputSchema, blockerDiagnosticLabel() (+136 more)
+
+### Community 11 - "services/built-in-agents.ts"
 Cohesion: 0.04
-Nodes (92): createApp(), createPrecompressedStaticMiddleware(), isDatabaseConnectionUnavailableError(), PRECOMPRESSED_STATIC_EXTENSIONS, resolveViteHmrHost(), resolveViteHmrPort(), shouldEnablePrivateHostnameGuard(), shouldServeViteDevHtml() (+84 more)
+Nodes (51): reconcileApprovedBuiltInAgent(), assertAdapterAllowed(), assertKnownBuiltInAgentModel(), BUILT_IN_AGENT_DEFAULT_GRANTS, BUILT_INS_DIR, BuiltInAgentBundleDefinition, BuiltInAgentDefinition, builtInAgentNotConfiguredError() (+43 more)
 
-### Community 6 - "Community 6"
+### Community 12 - "issue-dependency-wakeups-routes.test.ts"
+Cohesion: 0.14
+Nodes (12): findExistingIssueBlockersResolvedWake(), IDEMPOTENT_DEPENDENCY_WAKE_STATUSES, ISSUE_BLOCKERS_RESOLVED_WAKE_REASON, createApp(), mockDb, mockFindExistingIssueBlockersResolvedWake, mockIssueService, mockListBlockedDependentIssueIds (+4 more)
+
+### Community 13 - "workspace-runtime.ts"
+Cohesion: 0.03
+Nodes (152): asString, buildAgentGitIdentityEnv(), applyIssueIdentifierToBranchName(), applyRunScopeToBranchName(), assertDirtyQuarantineRuntimeServicesStopped(), branchIncoherenceValidationFailure(), buildDirtyQuarantineRescueBranch(), buildWorkspaceCommandEnv() (+144 more)
+
+### Community 14 - "services/plugin-loader.ts"
+Cohesion: 0.02
+Nodes (113): BUNDLED_PLUGIN_PACKAGES, isIsolatedSdkPluginPackage(), ISOLATED_SDK_PLUGIN_PACKAGES, isolatedPluginsRoot(), resolveDefaultInstallDir(), sanitizePackageNameForPath(), ActivationLatchClassification, ADAPTER_ENV_PASSTHROUGH (+105 more)
+
+### Community 15 - "github-webhook.ts"
+Cohesion: 0.02
+Nodes (191): redactSensitiveText(), acquirePrReviewerWakeSlot(), ACTIVE_PR_REVIEWER_RUN_STATUSES, attemptPrReviewerWake(), AUTHOR_DELIVERY_SCOPED_WAKE_REASONS, backLinkAbsoluteUrl(), bodyReRaisesPriorFinding(), buildDependabotAlertIssueBody() (+183 more)
+
+### Community 16 - "routes/pipelines.ts"
+Cohesion: 0.04
+Nodes (89): acknowledgeDriftSchema, activityActorForPipelineRoute(), actorForMutation(), assertCaseAccess(), assertCurrentStageAutomationTargetWriteAccess(), assertPipelineAccess(), assertPipelineCompanyAccess(), assertPipelineWriteAccess() (+81 more)
+
+### Community 17 - "cleanup-heartbeat-test-state.ts"
+Cohesion: 0.04
+Nodes (28): runningProcesses, _settleDetachedAgentStartLockWorkForTesting(), DEP_BLOCKED_MAX_RETRY_ATTEMPTS, DEP_BLOCKED_RETRY_REASON, STARVATION_ABSOLUTE_ESCALATION_MS, STARVATION_FULL_ESCALATION_MS, mockAdapterExecute, mockAdapterExecute (+20 more)
+
+### Community 18 - "k8s-job-liveness.ts"
+Cohesion: 0.05
+Nodes (58): applyImageBumpToAgent(), ApplyResult, bumpAgentImagesForCompany(), BumpBatchSummary, ELIGIBLE_ADAPTER_TYPES, EligibleAgent, EXECUTING_RUN_STATUSES, isAgentExecuting() (+50 more)
+
+### Community 19 - "parseObject"
+Cohesion: 0.03
+Nodes (132): parseObject, publishPluginDomainEvent(), shouldReopenTerminalIssueForDeferredWake(), incrementDepBlockedMetric(), allowsIssueInteractionWake(), boundHeartbeatRunEventPayloadForStorage(), carryRetryContextSnapshot(), computeK8sIsolationRetryDelayMs() (+124 more)
+
+### Community 20 - "services/tool-gateway.ts"
+Cohesion: 0.05
+Nodes (45): looksLikeJsonRpcMessage(), MCP_HTTP_ACCEPT, mcpHttpRequestHeaders(), parseMcpHttpResponseBody(), AgentToolDescriptor, ACTIVE_GATEWAY_RUN_STATUSES, approvalSnapshotsMatch(), buildHumanizedActionPreview() (+37 more)
+
+### Community 21 - "services/tool-access.ts"
+Cohesion: 0.05
+Nodes (58): ACTIVE_BROKER_RUN_STATUSES, activityLogActionToLifecycleType(), actorBinding(), ActorInfo, APPROVED_STDIO_TEMPLATES, assertClass3ToolCredentialRefAllowed(), assertSameOAuthActor(), buildProfileDetails() (+50 more)
+
+### Community 22 - "routes/access.ts"
+Cohesion: 0.03
+Nodes (133): tooManyRequests(), claimFirstInstanceAdmin(), FirstAdminClaimResult, FirstAdminTransaction, accessRoutes(), approveHumanJoinRequestFromInvite(), assertInstanceAdmin(), createCompanyInviteForCompany() (+125 more)
+
+### Community 23 - "executeRun"
+Cohesion: 0.02
+Nodes (208): getServerAdapter(), resolveAgentEmptyWorkspaceSourceDir(), resolveDefaultAgentWorkspaceDir(), resolveStaleDependabotAlertWakeIssue(), createEffectiveRunConfigFingerprints(), createEffectiveRunConfigSubcategoryFingerprints(), resolveEffectiveWorkspaceStrategyType(), describeGitFailure() (+200 more)
+
+### Community 24 - "agents-service-secret-bindings.test.ts"
+Cohesion: 0.25
+Nodes (3): mockEnsureBuiltInAgent, mockNotifyHireApproved, pendingApproval()
+
+### Community 25 - "recovery-stale-issue-lock-sweep.test.ts"
+Cohesion: 0.10
+Nodes (6): AGENT_POD_BUSY_MAX_STALE_MS, NON_LIVE_EXECUTION_SILENCE_MS, LOCKLESS_DEFERRED_WAKE_MIN_AGE_MS, STALE_RUNNING_ISSUE_LOCK_MS, mockProbeAgentPodActivity, mockTelemetryClient
+
+### Community 26 - "productivity-review.ts"
+Cohesion: 0.04
+Nodes (74): ACTIVE_RUN_STATUSES, AgentRow, APPROVAL_GATE_SUPPRESSION_STATUSES, ApprovalGatedSuppression, DbOrTx, DEFAULT_HEARTBEAT_SCHEDULER_INTERVAL_MS, DEFAULT_PRODUCTIVITY_REVIEW_APPROVAL_GATE_MAX_AGE_MS, DEFAULT_PRODUCTIVITY_REVIEW_CREATION_WINDOW_MS (+66 more)
+
+### Community 27 - "services/teams-catalog.ts"
+Cohesion: 0.05
+Nodes (60): buildPortabilityInput(), CatalogManifestFile, catalogManifestPath, catalogPackageRootCandidates, catalogProvenance(), CatalogTargetManagerReference, CatalogTeamActorContext, CatalogTeamFileDetail (+52 more)
+
+### Community 28 - "plugins.ts"
+Cohesion: 0.03
+Nodes (76): AvailableBundledPlugin, bundledPluginMetadata(), __dirname, discoverBundledPlugins(), DiscoveredBundledPlugin, EXPERIMENTAL_BUNDLED_PLUGIN_PACKAGE_NAMES, fileExists(), findPackageJsonFiles() (+68 more)
+
+### Community 29 - "environment-config.ts"
 Cohesion: 0.09
-Nodes (13): actorMiddleware(), findCreateIssueDuplicateCandidates(), raceCreateIssueDuplicateCandidateLookup(), boardAuthService(), createApp(), createApp(), mockBoardAuth, authenticatedApp() (+5 more)
+Nodes (37): createEnvironmentSecret(), fakeSandboxEnvironmentConfigSchema, getSandboxProvider(), getSandboxProviderConfigSchema(), normalizeEnvironmentConfig(), normalizeEnvironmentConfigForPersistence(), normalizeEnvironmentConfigForProbe(), ParsedEnvironmentConfig (+29 more)
 
-### Community 7 - "Community 7"
+### Community 30 - "evidence-gate.ts"
+Cohesion: 0.06
+Nodes (55): ALL_SHAPES, BLOCKABLE_TRUTH_SHAPES, buildAgentEvidenceText(), countDoneWhenBullets(), CriteriaSection, detectAll(), detectChecklistDoneWhen(), detectCiGreen() (+47 more)
+
+### Community 31 - "middleware/auth.ts"
+Cohesion: 0.12
+Nodes (25): BetterAuthSessionResult, actorMiddleware(), ActorMiddlewareOptions, auditAgentJwtMissingResponsibleUser(), auditAgentJwtRunHeaderMismatch(), auditAgentKeyMissingResponsibleUser(), cloudTenantCompanyId(), constantTimeStringEqual() (+17 more)
+
+### Community 32 - "services/cloud-upstreams.ts"
+Cohesion: 0.05
+Nodes (77): activationChecklistFromReport(), activationEntityLabel(), asRecord(), assertActivationEntityType(), buildEntitiesFromPortableExport(), buildLocalChunks(), buildLocalUpstreamExportBundle(), buildWarnings() (+69 more)
+
+### Community 33 - "services/secrets.ts"
+Cohesion: 0.10
+Nodes (22): isSecretProviderClientError(), CanonicalEnvBinding, COMING_SOON_SECRET_PROVIDERS, defaultProviderConfigStatus(), deriveSecretNameFromExternalRef(), FALLBACK_ADAPTER_SCHEMA_SECRET_FIELDS, MissingRuntimeBinding, missingRuntimeConsumerType() (+14 more)
+
+### Community 34 - "registry.ts"
+Cohesion: 0.06
+Nodes (42): BUILTIN_ADAPTER_TYPES, acpxLocalAdapter, adaptersByType, buildCursorRuntimeCommandSpec(), buildNpmRuntimeCommandSpec(), builtinFallbacks, claudeLocalAdapter, codexLocalAdapter (+34 more)
+
+### Community 35 - "tool-access-policy.ts"
+Cohesion: 0.06
+Nodes (72): argumentConditionMatches(), argumentFiltersMatch(), assertGenericPolicyType(), assertSupportedGenericPolicyShape(), assertSupportedPolicyConditions(), asToolRiskLevel(), auditOutcome(), boolCondition() (+64 more)
+
+### Community 36 - "recovery/index.ts"
+Cohesion: 0.05
+Nodes (86): addAgentChainCandidates(), addOwnerCandidate(), classifyIssueGraphLiveness(), blockedFindingForLeaf(), blockedWithoutBlockersFinding(), firstBlockedChainFinding(), hasAnyBlockerEdge(), hasExplicitWaitingPath() (+78 more)
+
+### Community 37 - "services/attention.ts"
+Cohesion: 0.07
+Nodes (50): activeDismissalState(), approvalDetail(), approvalTitle(), ATTENTION_SOURCE_KINDS, AttentionListOptions, attentionService(), betterDuplicate(), blockingIssueMap() (+42 more)
+
+### Community 38 - "cases.ts"
 Cohesion: 0.04
-Nodes (78): forbidden(), HttpError, unauthorized(), readObject(), readRunIssueId(), assertAuthenticated(), assertBoard(), assertBoardOrAgent() (+70 more)
+Nodes (65): allowedPatterns, DEFAULT_ALLOWED_TYPES, DEFAULT_ATTACHMENT_CONTENT_TYPE, INLINE_ATTACHMENT_TYPES, isAllowedContentType(), isInlineAttachmentContentType(), matchesContentType(), MAX_ATTACHMENT_BYTES (+57 more)
 
-### Community 8 - "Community 8"
-Cohesion: 0.03
-Nodes (59): ALLOWED_SKILL_TEST_TEMPLATE_PLACEHOLDERS, assertImportedSkillSourceAllowed(), assertNoSymlinksInLocalTree(), assertVersionMatchesSkill(), buildSkillRuntimeName(), BUILT_IN_SKILL_TEST_RUN_TEMPLATE_BODY, BUILT_IN_SKILL_TEST_RUN_TEMPLATE_DATE, CompanySkillCommentRow (+51 more)
+### Community 39 - "logger"
+Cohesion: 0.06
+Nodes (16): logger, PluginRouteToolDeps, prunePluginLogs(), startPluginLogRetention(), createPluginToolDispatcher(), handlePluginEnabled(), registerFromDb(), PluginToolDispatcher (+8 more)
 
-### Community 9 - "Community 9"
-Cohesion: 0.04
-Nodes (85): activityActorPatch(), actorOwnsLease(), addFormVariablesForStage(), adjustParentCounts(), assertActorCanApproveStageExit(), assertActorProvenance(), assertLeaseAvailable(), assertStageEnabled() (+77 more)
-
-### Community 10 - "Community 10"
+### Community 40 - "issueRoutes"
 Cohesion: 0.02
-Nodes (128): ACTIVE_REVIEW_APPROVAL_STATUSES, ActivityExecutionParticipant, ActivityIssueRelationSummary, applyActorMonitorScheduledBy(), assertCanManageIssueMonitor(), attachmentArtifactMetadataInputSchema, auditAgentIssueCreateAttributionSpoof(), AutoApprovalIssueMissingError (+120 more)
+Nodes (123): actorMatchesExecutionParticipant(), applyCreateIssueStatusDefault(), authenticatedActorResponsibleUserId(), AutoApprovalIssueMissingError, buildAttachmentContentPath(), buildCreateIssueActivityStatusDetails(), buildRequestItemVerdictsWakeIdempotencyKey(), compactIssueListEtag() (+115 more)
 
-### Community 11 - "Community 11"
-Cohesion: 0.04
-Nodes (53): assertAdapterAllowed(), assertKnownBuiltInAgentModel(), BUILT_IN_AGENT_DEFAULT_GRANTS, BUILT_INS_DIR, BuiltInAgentBundleDefinition, BuiltInAgentDefinition, BuiltInAgentProvisionActor, BuiltInAgentProvisionInput (+45 more)
-
-### Community 12 - "Community 12"
-Cohesion: 0.03
-Nodes (81): isAutomaticRecoverySuppressedByPauseHold(), IssueTreeControlService, AdapterFailureRecoveryClassification, buildExecutionReviewParticipantRecoveryComment(), buildExecutionReviewParticipantUnavailableComment(), buildLivenessEscalationDescription(), buildLivenessOriginalIssueComment(), buildNonRetryableEscalationComment() (+73 more)
-
-### Community 13 - "Community 13"
-Cohesion: 0.04
-Nodes (68): delay(), buildWorkspaceReadyComment(), DirtyQuarantineRepairResult, discoverWorkspacePackagePaths(), ensureServerWorkspaceLinksCurrent(), executeProcess(), ExecutionWorkspaceAgentRef, ExecutionWorkspaceInput (+60 more)
-
-### Community 14 - "Community 14"
-Cohesion: 0.04
-Nodes (57): listBundledPlugins(), ADAPTER_ENV_PASSTHROUGH, buildLocalPluginBuildCommand(), buildLocalPluginBuildCommands(), buildLocalPluginRecoveryCommand(), buildStandaloneBundledPluginInstallArgs(), buildStandaloneBundledPluginInstallCommand(), BUNDLED_LOCAL_PLUGIN_ROOT (+49 more)
-
-### Community 15 - "Community 15"
-Cohesion: 0.03
-Nodes (71): acquirePrReviewerWakeSlot(), ACTIVE_PR_REVIEWER_RUN_STATUSES, attemptPrReviewerWake(), AUTHOR_DELIVERY_SCOPED_WAKE_REASONS, buildPrAuthorWakeIdempotencyKey(), buildPrFeedbackExternalKey(), buildPrReviewerTaskKey(), buildPrReviewerTaskLockKeys() (+63 more)
-
-### Community 16 - "Community 16"
-Cohesion: 0.03
-Nodes (63): acknowledgeDriftSchema, assertCaseAccess(), assertCurrentStageAutomationTargetWriteAccess(), assertPipelineAccess(), assertPipelineCompanyAccess(), assertPipelineWriteAccess(), assertStageAutomationTargetWriteAccess(), attentionCallerFor() (+55 more)
-
-### Community 17 - "Community 17"
-Cohesion: 0.04
-Nodes (27): cancelActiveRunsForCleanup(), cleanupHeartbeatTestState(), CleanupHeartbeatTestStateOptions, Db, Heartbeat, mockAdapterExecute, getRunStatus(), mockAdapterExecute (+19 more)
-
-### Community 18 - "Community 18"
-Cohesion: 0.05
-Nodes (56): applyImageBumpToAgent(), ApplyResult, bumpAgentImagesForCompany(), BumpBatchSummary, ELIGIBLE_ADAPTER_TYPES, EligibleAgent, EXECUTING_RUN_STATUSES, isAgentExecuting() (+48 more)
-
-### Community 19 - "Community 19"
-Cohesion: 0.04
-Nodes (76): extractAgentMcpKeys(), readSshEnvironmentPrivateKeySecretId(), applyPersistedExecutionWorkspaceConfig(), buildExecutionWorkspaceConfigSnapshot(), buildHeartbeatRunFailedMetricInput(), clearInteractionContinuationWakeContext(), coalesceQueuedGithubStateWake(), deriveCommentId() (+68 more)
-
-### Community 20 - "Community 20"
-Cohesion: 0.04
-Nodes (44): AgentToolDescriptor, ACTIVE_GATEWAY_RUN_STATUSES, approvalSnapshotsMatch(), asRecord(), buildHumanizedActionPreview(), BUILTIN_LOCAL_STDIO_RUNTIME_TEMPLATES, BUILTIN_TOOLS, ConnectedCredentialVersionSnapshot (+36 more)
-
-### Community 21 - "Community 21"
-Cohesion: 0.04
-Nodes (42): parseRemoteHttpEndpoint(), ACTIVE_BROKER_RUN_STATUSES, actorBinding(), ActorInfo, APPROVED_STDIO_TEMPLATES, asRecord(), assertClass3ToolCredentialRefAllowed(), assertSameOAuthActor() (+34 more)
-
-### Community 22 - "Community 22"
-Cohesion: 0.05
-Nodes (43): tooManyRequests(), agentJoinGrantsFromDefaults(), AvailableSkill, companyInviteExpiresAt(), CompanyMemberRecord, createInviteToken(), defaultInviteResolutionNetwork, grantsFromDefaults() (+35 more)
-
-### Community 23 - "Community 23"
-Cohesion: 0.04
-Nodes (66): resolveAgentEmptyWorkspaceSourceDir(), resolveDefaultAgentWorkspaceDir(), allowsIssueInteractionWake(), assertGitSensitiveAdapterWorkspaceValid(), buildEffectiveRunSessionConfigMetadata(), buildEffectiveRunWorkspaceConfigMetadata(), buildExplicitResumeSessionOverride(), buildK8sRunIsolationDescriptor() (+58 more)
-
-### Community 24 - "Community 24"
-Cohesion: 0.08
-Nodes (11): ApprovalListFilters, issuePrefix(), seedCompany(), mockEnsureBuiltInAgent, mockNotifyHireApproved, ApprovalRecord, expectRejectedWithoutMutation(), mockAgentService (+3 more)
-
-### Community 25 - "Community 25"
-Cohesion: 0.04
-Nodes (5): allowPenstockGate, allowPenstockGate, HostServicesWithRuntimeExtras, mockTelemetryClient, createApp()
-
-### Community 26 - "Community 26"
-Cohesion: 0.04
-Nodes (37): ACTIVE_RUN_STATUSES, AgentRow, APPROVAL_GATE_SUPPRESSION_STATUSES, ApprovalGatedSuppression, buildThresholds(), DbOrTx, EnqueueWakeup, formatRuntimeFailureManagerClaim() (+29 more)
-
-### Community 27 - "Community 27"
-Cohesion: 0.05
-Nodes (47): CatalogManifestFile, catalogManifestPath, catalogPackageRootCandidates, catalogProvenance(), CatalogTargetManagerReference, CatalogTeamActorContext, CatalogTeamFileDetail, CatalogTeamImportOptions (+39 more)
-
-### Community 28 - "Community 28"
-Cohesion: 0.06
-Nodes (40): AvailableBundledPlugin, bundledPluginMetadata(), __dirname, discoverBundledPlugins(), DiscoveredBundledPlugin, EXPERIMENTAL_BUNDLED_PLUGIN_PACKAGE_NAMES, fileExists(), findPackageJsonFiles() (+32 more)
-
-### Community 29 - "Community 29"
-Cohesion: 0.13
-Nodes (31): collectEnvironmentSecretRefs(), createEnvironmentSecret(), fakeSandboxEnvironmentConfigSchema, getSandboxProvider(), getSandboxProviderConfigSchema(), normalizeEnvironmentConfig(), normalizeEnvironmentConfigForPersistence(), normalizeEnvironmentConfigForProbe() (+23 more)
-
-### Community 30 - "Community 30"
+### Community 41 - "environment-custom-images.ts"
 Cohesion: 0.07
-Nodes (43): ALL_SHAPES, buildAgentEvidenceText(), countDoneWhenBullets(), CriteriaSection, detectAll(), detectChecklistDoneWhen(), detectCiGreen(), detectE2eRun() (+35 more)
+Nodes (61): applyCustomImageTemplateToSandboxConfig(), classifyEnvironmentCustomImageConfigChange(), defaultEnvironmentCustomImageRuntimeConfigBinding(), ENVIRONMENT_CUSTOM_IMAGE_CONFIG_FINGERPRINT_EXCLUDED_PATHS, ENVIRONMENT_CUSTOM_IMAGE_RUNTIME_CONFIG_BINDING_METADATA_KEY, ENVIRONMENT_CUSTOM_IMAGE_TEMPLATE_SOURCE_FIELDS, EnvironmentCustomImageConfigChangeKind, EnvironmentCustomImageRuntimeConfigBinding (+53 more)
 
-### Community 31 - "Community 31"
-Cohesion: 0.13
-Nodes (12): BetterAuthSessionResult, ActorMiddlewareOptions, cloudTenantCompanyId(), constantTimeStringEqual(), issuePrefixForCloudStack(), normalizeOptionalString(), normalizeRunId(), requiredCloudHeader() (+4 more)
+### Community 42 - "feedback.ts"
+Cohesion: 0.10
+Nodes (37): asBoolean(), asNumber(), asRecord(), asString(), buildAgentContext(), buildIssueContext(), buildIssuePath(), buildPayloadArtifacts() (+29 more)
 
-### Community 32 - "Community 32"
+### Community 43 - "metrics.ts"
+Cohesion: 0.01
+Nodes (198): createBetterAuthHandler(), normalizeAuthLocationHeader(), counters, DepBlockedMetricKey, getDepBlockedMetric(), resetDepBlockedMetrics(), snapshotDepBlockedMetrics(), AGENT_ERROR_REASON_NONE (+190 more)
+
+### Community 44 - "workspace-file-resources.ts"
+Cohesion: 0.07
+Nodes (64): AutoDiscovered, availableFileList(), candidateFromExecutionWorkspace(), candidateFromProjectWorkspace(), contentTypeForPath(), DENIED_SEGMENTS, denyReasonForPathSegments(), directoryResource() (+56 more)
+
+### Community 45 - "openapi.ts"
 Cohesion: 0.05
-Nodes (61): activationChecklistFromReport(), asRecord(), buildEntitiesFromPortableExport(), buildLocalChunks(), buildLocalUpstreamExportBundle(), canonicalJson(), cloudUpstreamRemoteFailureReport(), cloudUpstreamRunStatus() (+53 more)
-
-### Community 33 - "Community 33"
-Cohesion: 0.07
-Nodes (25): executionWorkspaceUsesPerRunScope(), resolveOverlaidWorkspaceStrategy(), applyRunScopedMentionedSkillKeys(), assertLowTrustEnvConfigAllowed(), extractMentionedSkillIdsFromSources(), hasGithubPrWorkflowSkill(), isAgentScopeOnlyEnvKey(), isConfigurationIncompleteFailedRun() (+17 more)
-
-### Community 34 - "Community 34"
-Cohesion: 0.05
-Nodes (50): acpxLocalAdapter, adaptersByType, buildCursorRuntimeCommandSpec(), buildNpmRuntimeCommandSpec(), builtinFallbacks, claudeLocalAdapter, codexLocalAdapter, cursorCloudAdapter (+42 more)
-
-### Community 35 - "Community 35"
-Cohesion: 0.07
-Nodes (39): argumentConditionMatches(), argumentFiltersMatch(), assertGenericPolicyType(), assertSupportedGenericPolicyShape(), assertSupportedPolicyConditions(), asToolRiskLevel(), boolCondition(), conditionGroupFail() (+31 more)
-
-### Community 36 - "Community 36"
-Cohesion: 0.07
-Nodes (41): addAgentChainCandidates(), addOwnerCandidate(), classifyIssueGraphLiveness(), finding(), hasActiveParkedDisposition(), hasConfiguredReviewWorkflow(), hasScheduledMonitor(), incidentKey() (+33 more)
-
-### Community 37 - "Community 37"
-Cohesion: 0.06
-Nodes (26): activeDismissalState(), ATTENTION_SOURCE_KINDS, AttentionListOptions, betterDuplicate(), BlockingIssueSummary, compareAttentionItems(), CreateAttentionItemInput, createItem() (+18 more)
-
-### Community 38 - "Community 38"
-Cohesion: 0.04
-Nodes (38): annotationActorInput(), assertCaseAccess(), assertCasesEnabled(), assertLabelsBelongToCompany(), assertParentCaseBelongsToCompany(), assertProjectBelongsToCompany(), autoLinkRunIssue(), buildCasePatchUpdateValues() (+30 more)
-
-### Community 39 - "Community 39"
-Cohesion: 0.08
-Nodes (21): registerLinearWebhook(), registerWebhookWithToken(), logDir, logFile, logger, sharedOpts, LifecycleHookKind, runCommand() (+13 more)
-
-### Community 40 - "Community 40"
-Cohesion: 0.08
-Nodes (45): agentLinkRow(), AgentRow, buildFinishSuccessfulRunHandoffIdempotencyKey(), buildSuccessfulRunHandoffExhaustedNotice(), buildSuccessfulRunHandoffInstruction(), buildSuccessfulRunHandoffRequiredNotice(), decideSuccessfulRunHandoff(), findExistingFinishSuccessfulRunHandoffWake() (+37 more)
-
-### Community 41 - "Community 41"
-Cohesion: 0.08
-Nodes (38): applyCustomImageTemplateToSandboxConfig(), classifyEnvironmentCustomImageConfigChange(), defaultEnvironmentCustomImageRuntimeConfigBinding(), ENVIRONMENT_CUSTOM_IMAGE_CONFIG_FINGERPRINT_EXCLUDED_PATHS, ENVIRONMENT_CUSTOM_IMAGE_TEMPLATE_SOURCE_FIELDS, EnvironmentCustomImageConfigChangeKind, EnvironmentCustomImageRuntimeConfigBinding, environmentCustomImageTemplateFromRow() (+30 more)
-
-### Community 42 - "Community 42"
-Cohesion: 0.11
-Nodes (33): appendNote(), asBoolean(), asNumber(), asRecord(), asString(), buildAgentContext(), buildClaudeTraceFiles(), buildCodexTraceFiles() (+25 more)
-
-### Community 43 - "Community 43"
-Cohesion: 0.05
-Nodes (49): ALERTING_GITHUB_SUPPRESSION_CAUSES, AuthOperation, AuthOutcome, classifyAuthOutcome(), classifyAuthResponse(), EXTERNAL_LIFECYCLE_RUN_SILENCE_GAP_BUCKETS_SECONDS, EXTERNAL_RUNTIME_RESERVATION_EVENTS, ExternalLifecycleSilenceGapRunSignals (+41 more)
-
-### Community 44 - "Community 44"
-Cohesion: 0.07
-Nodes (40): AutoDiscovered, contentTypeForPath(), DENIED_SEGMENTS, denyReasonForPathSegments(), directoryResource(), enumerateWorkspaceDirectoryChildren(), enumerateWorkspaceFiles(), execFileAsync (+32 more)
-
-### Community 45 - "Community 45"
-Cohesion: 0.04
 Nodes (42): ACCEPTED_OPERATIONS, AUTHENTICATED_OPERATIONS, AUTHENTICATED_SECURITY, BOARD_ONLY_OPERATIONS, BOARD_ONLY_PREFIXES, BOARD_SECURITY, cloudCompanyBodySchema, cloudCompanyQuerySchema (+34 more)
 
-### Community 46 - "Community 46"
-Cohesion: 0.10
-Nodes (31): resolveCatalogSkillIfPresent(), CatalogManifestFile, CatalogManifestUnavailableError, copyCatalogSkillFile(), devCatalogManifestPath, devCatalogPackageRoot, getCatalogManifest(), getCatalogPackageMetadata() (+23 more)
-
-### Community 47 - "Community 47"
+### Community 46 - "skills-catalog.ts"
 Cohesion: 0.09
-Nodes (43): asCommitStatusFailure(), base64Url(), ClassifiedGithubHttpFailure, classifyGithubHttpFailure(), classifyWorkflowRunNotFound(), consolidatedReviewHead(), exactGithubLogin(), fetchPrHeadSha() (+35 more)
+Nodes (37): collectSkillFileBytes(), visit(), listMaterializedFiles(), walk(), walkLocalFiles(), resolveRawGitHubUrl(), normalizePortablePath(), CatalogManifestFile (+29 more)
 
-### Community 48 - "Community 48"
+### Community 47 - "github-app-auth.ts"
 Cohesion: 0.05
-Nodes (48): IssueAssignmentWakeupDeps, queueIssueAssignmentWakeup(), WakeupSource, WakeupTriggerDetail, ACTIVITY_GATE_IGNORED_ACTIONS, Actor, assertRoutineCanEnable(), assertRoutineVariableDefinitions() (+40 more)
+Nodes (97): __test_stackedChildDirective, asCommitStatusFailure(), base64Url(), BranchState, ClassifiedGithubHttpFailure, classifyGithubHttpFailure(), classifyWorkflowRunNotFound(), encodeGitRefPath() (+89 more)
 
-### Community 49 - "Community 49"
-Cohesion: 0.12
-Nodes (14): externalAdapter, mockAccessService, mockAgentInstructionsService, mockAgentService, mockApprovalService, mockBudgetService, mockCompanySkillService, mockHeartbeatService (+6 more)
-
-### Community 50 - "Community 50"
-Cohesion: 0.09
-Nodes (39): buildSecretManifestIndex(), CanonicalizeContext, canonicalizeEffectiveRunConfigCategory(), canonicalizeEnvRecord(), canonicalizePlainEnvValueForHash(), canonicalizeValue(), canonicalRecord(), canonicalSecretMetadata() (+31 more)
-
-### Community 51 - "Community 51"
-Cohesion: 0.10
-Nodes (19): createEffectiveRunConfigFingerprints(), buildEnvironmentSecretMetadataForLeaseFingerprint(), buildReusableSandboxLeaseFingerprint(), buildReusableSandboxLeaseScope(), EnvironmentDriverAcquireInput, EnvironmentDriverExecuteInput, EnvironmentDriverLeaseInput, EnvironmentDriverRealizeWorkspaceInput (+11 more)
-
-### Community 52 - "Community 52"
+### Community 48 - "services/routines.ts"
 Cohesion: 0.08
-Nodes (39): asRecord(), buildCapacityUrl(), buildMessagesUrl(), CacheEntry, capacityEndpointUnavailable(), capacityRetryFromBody(), createPenstockAvailabilityGate(), defaultCapacityRetry() (+31 more)
+Nodes (38): ACTIVITY_GATE_IGNORED_ACTIONS, Actor, assertRoutineCanEnable(), assertRoutineVariableDefinitions(), assertScheduleCompatibleVariables(), buildRoutineRevisionSnapshot(), canonicalSnapshot(), collectProvidedRoutineVariables() (+30 more)
 
-### Community 53 - "Community 53"
+### Community 49 - "agent-adapter-validation-routes.test.ts"
+Cohesion: 0.11
+Nodes (15): createApp(), externalAdapter, mockAccessService, mockAgentInstructionsService, mockAgentService, mockApprovalService, mockBudgetService, mockCompanySkillService (+7 more)
+
+### Community 50 - "effective-run-config-fingerprints.ts"
+Cohesion: 0.08
+Nodes (42): buildSecretManifestIndex(), CanonicalizeContext, canonicalizeEffectiveRunConfigCategory(), canonicalizeEnvRecord(), canonicalizePlainEnvValueForHash(), canonicalizeValue(), canonicalRecord(), canonicalSecretMetadata() (+34 more)
+
+### Community 51 - "environment-runtime.ts"
 Cohesion: 0.07
-Nodes (23): AGENT_UNASSIGNED_CLAIM_DENIED_ORIGIN_KINDS, AgentAuthorizationRow, AgentHierarchyRow, AssignmentPolicyEffect, AuthorizationAction, authorizationBoundaryLabel(), AuthorizationDecision, evaluateAuthorizationPolicyForAssignment() (+15 more)
+Nodes (50): stripSandboxProviderEnvelope(), buildEnvironmentSecretMetadataForLeaseFingerprint(), buildReusableSandboxLeaseFingerprint(), buildReusableSandboxLeaseScope(), createK8sEnvironmentDriver(), createLocalEnvironmentDriver(), resolvePluginDriver(), resolvePluginDriverForRelease() (+42 more)
 
-### Community 54 - "Community 54"
-Cohesion: 0.17
-Nodes (29): parseFrontmatterMarkdown(), assertImportedSkillKeyAllowed(), asString(), collectLocalSkillInventory(), deriveCanonicalSkillKey(), deriveImportedSkillSlug(), deriveImportedSkillSource(), deriveTrustLevel() (+21 more)
-
-### Community 55 - "Community 55"
+### Community 52 - "penstock-availability-gate.ts"
 Cohesion: 0.11
-Nodes (40): buildWorkspaceCommandEnv(), cleanupExecutionWorkspaceArtifacts(), deriveRepoNameFromRepoUrlForRuntime(), describeSubmoduleInspectionDegradation(), detectDefaultBranch(), directoryExists(), ensureGitSubmodulesReady(), ensurePersistedExecutionWorkspaceAvailable() (+32 more)
+Nodes (19): PenstockProbeOutcomeLabel, PenstockProbePathLabel, buildCapacityUrl(), buildMessagesUrl(), CacheEntry, isPenstockBaseUrl(), PenstockAvailabilityGateAllowResult, PenstockAvailabilityGateDenyResult (+11 more)
 
-### Community 56 - "Community 56"
-Cohesion: 0.11
-Nodes (8): PluginRouteToolDeps, mcpGatewayProtocolRoutes(), PluginToolDispatcher, createGatewayRouteApp(), createTestToolGatewayService(), Db, FakeMcpRequest, ToolGatewayServiceOptions
+### Community 53 - "authorization.ts"
+Cohesion: 0.08
+Nodes (36): buildKeyedCommentEffectIntents(), persistedCommentActor(), AGENT_UNASSIGNED_CLAIM_DENIED_ORIGIN_KINDS, AgentAuthorizationRow, AgentHierarchyRow, agentIsInSubtree(), AssignmentPolicyEffect, AuthorizationAction (+28 more)
 
-### Community 57 - "Community 57"
-Cohesion: 0.09
-Nodes (35): bindExternalRuntimeReservationIsolation(), claimRunWithExternalRuntimeSlot(), claimRunWithExternalRuntimeSlotOutcome(), claimRunWithExternalRuntimeSlotPool(), ExternalRuntimeClaim, ExternalRuntimeIsolationConflictError, ExternalRuntimeIsolationMode, ExternalRuntimeReservation (+27 more)
-
-### Community 58 - "Community 58"
+### Community 54 - "companySkillService"
 Cohesion: 0.05
-Nodes (29): createApp(), createRunContextDb(), DeniedWriteLookupKind, DeniedWriteLookupStub, denyCommentGrantEverywhere(), denyCommentWithReason(), foreignOwnedRecoveryAction(), lockedPendingReviewForOwner() (+21 more)
+Nodes (133): assertImportedSkillKeyAllowed(), asString(), buildHarnessIssueDescription(), buildMissingLocalSourceMarker(), buildMissingRuntimeSourceDetail(), buildSkillRuntimeName(), bundledFolderLabel(), classifyInventoryKind() (+125 more)
 
-### Community 59 - "Community 59"
-Cohesion: 0.13
-Nodes (18): AMBIGUOUS_PROMOTABLE_TOKENS, classifyKeyTier(), CLI_SECRET_FLAG_RE, ENV_DUMP_SECRET_ASSIGNMENT_RE, ESCAPED_JSON_SECRET_FIELD_TEXT_RE, hasOpaqueUrlPathSegment(), JSON_SECRET_FIELD_TEXT_RE, keyTokens() (+10 more)
-
-### Community 60 - "Community 60"
-Cohesion: 0.08
-Nodes (44): BUILTIN_ADAPTER_TYPES, buildExternalAdapters(), extractUiParserSource(), getOrExtractUiParserSource(), getUiParserSource(), loadExternalAdapterPackage(), loadFromRecord(), reloadExternalAdapter() (+36 more)
-
-### Community 61 - "Community 61"
-Cohesion: 0.12
-Nodes (4): buildFolderViews(), FolderRow, RESERVED_CHILD_ROOT_SYSTEM_KEYS, RESERVED_ROOT_SLUGS
-
-### Community 62 - "Community 62"
-Cohesion: 0.07
-Nodes (33): assertBranchReconcileRuntimeServicesStopped(), assertBranchReconcileWorkspaceIsSafe(), assigneeMatchesExecutionPrincipal(), deriveAgentCwd(), execFileAsync, ExecutionWorkspaceBranchReconcileActor, ExecutionWorkspaceBranchReconcileInspection, ExecutionWorkspaceBranchReconcileMode (+25 more)
-
-### Community 63 - "Community 63"
-Cohesion: 0.07
-Nodes (31): ACTIVE_RUN_STATUSES, ActiveCancelSnapshot, ActiveIssueTreePauseHoldGate, ActiveRunRow, ActorInput, actorMatchesComment(), coerceIssueStatus(), DEFAULT_RELEASE_POLICY (+23 more)
-
-### Community 64 - "Community 64"
-Cohesion: 0.11
-Nodes (30): BetterAuthGetSessionApi, BetterAuthHandlerTarget, BetterAuthInstance, BetterAuthSessionResolver, BetterAuthSessionUser, buildBetterAuthAdvancedOptions(), buildBetterAuthRateLimitOptions(), buildDexOAuthProviderConfigFromEnv() (+22 more)
-
-### Community 65 - "Community 65"
-Cohesion: 0.10
-Nodes (29): createSandboxEnvironmentDriver(), findReusableSandboxLeaseId(), AcquireSandboxLeaseInput, acquireSandboxProviderLease(), assertProviderConfig(), buildFakeSandboxProbe(), DestroySandboxLeaseInput, destroySandboxProviderLease() (+21 more)
-
-### Community 66 - "Community 66"
-Cohesion: 0.13
-Nodes (17): createStorageServiceFromConfig(), getStorageService(), signatureForConfig(), createLocalDiskStorageProvider(), normalizeObjectKey(), resolveWithin(), createStorageProviderFromConfig(), assertPutFileInput() (+9 more)
-
-### Community 67 - "Community 67"
-Cohesion: 0.04
-Nodes (43): allowedPatterns, DEFAULT_ALLOWED_TYPES, INLINE_ATTACHMENT_TYPES, isAllowedContentType(), isInlineAttachmentContentType(), matchesContentType(), normalizeContentType(), normalizeIssueAttachmentMaxBytes() (+35 more)
-
-### Community 68 - "Community 68"
-Cohesion: 0.09
-Nodes (30): PluginRouteJobDeps, advanceToNextMonth(), FIELD_SPECS, FieldSpec, findNext(), nextCronTick(), nextCronTickFromExpression(), parseCron() (+22 more)
-
-### Community 69 - "Community 69"
-Cohesion: 0.09
-Nodes (21): ApplyPluginMigrationsOptions, assertAllowedPublicRead(), assertIdentifier(), assertNoBannedSql(), derivePluginDatabaseNamespace(), extractQualifiedRefs(), normaliseSql(), PluginDatabaseClient (+13 more)
-
-### Community 70 - "Community 70"
-Cohesion: 0.14
-Nodes (35): terminateHeartbeatRunProcess(), adoptLocalServiceFromPortOwner(), createLocalServiceKey(), doesLocalServiceRecordMatchCwd(), execFileAsync, findAdoptableLocalService(), findLocalServiceRegistryRecordByRuntimeServiceId(), getRuntimeServiceRegistryPath() (+27 more)
-
-### Community 71 - "Community 71"
-Cohesion: 0.08
-Nodes (27): parseProjectExecutionWorkspacePolicy(), recordProjectPrimaryWorkspaceFallback(), attachGoals(), attachListMetrics(), buildProjectListMetricMaps(), CreateWorkspaceInput, deriveNameFromCwd(), deriveNameFromRepoUrl() (+19 more)
-
-### Community 72 - "Community 72"
-Cohesion: 0.10
-Nodes (34): avatarGridHeight(), avatarGridRows(), avatarGridWidth(), cardHeight(), cardWidth(), collapseToAvatars(), countNodes(), defaultRenderCard() (+26 more)
-
-### Community 73 - "Community 73"
-Cohesion: 0.09
-Nodes (29): resolveEnvironmentDriverConfigForRuntime(), isPlainObject(), isStringRecord(), resolveEnvironmentExecutionTarget(), resolveEnvironmentExecutionTransport(), EnvironmentAcquisitionResult, EnvironmentErrorCode, EnvironmentRealizationResult (+21 more)
-
-### Community 74 - "Community 74"
-Cohesion: 0.05
-Nodes (41): assertRequestConfirmationTargetIsCurrent(), buildInteractionResolvedCounts(), buildIssueDocumentTargetFromSnapshot(), buildStaleTargetResult(), buildSupersededByCommentResult(), deriveResolutionReason(), deriveTargetType(), emitInteractionResolvedTelemetry() (+33 more)
-
-### Community 75 - "Community 75"
-Cohesion: 0.04
-Nodes (53): approvalResolutionResponse(), redactApprovalPayload(), GithubWebhookConfig, MIME_TYPES, PluginUiStaticRouteOptions, pluginUiStaticRoutes(), pluginRoutes(), ApprovalResolutionActor (+45 more)
-
-### Community 76 - "Community 76"
-Cohesion: 0.12
-Nodes (31): actionabilityText(), classifyRunActionability(), classifyRunLiveness(), combinedOutput(), declaredBlocker(), DEFAULT_EVIDENCE, evidenceReason(), extractNextAction() (+23 more)
-
-### Community 77 - "Community 77"
-Cohesion: 0.13
-Nodes (32): badRequest(), parseCostDateRange(), parseCostLimit(), parseCaseEventsQuery(), parseOptionalNonNegativeInteger(), assertActivationEntityType(), assertConfiguredLocalFolder(), assertPathInsideRoot() (+24 more)
-
-### Community 78 - "Community 78"
-Cohesion: 0.10
-Nodes (24): AgentConfigSnapshot, AgentShortnameCollisionOptions, AgentShortnameRow, assertExternalLifecycleConcurrencyPolicy(), buildConfigSnapshot(), CONFIG_REVISION_FIELDS, configPatchFromApprovalPayload(), configPatchFromSnapshot() (+16 more)
-
-### Community 79 - "Community 79"
-Cohesion: 0.07
-Nodes (12): extractFirstImageUrl(), iso(), issueFilterConditions(), issueHref(), issueResult(), IssueSearchRow, matchedFacetConditions(), SearchAggregateRow (+4 more)
-
-### Community 80 - "Community 80"
-Cohesion: 0.07
-Nodes (21): ActorFields, isActiveTaskWatchdogUniqueConflict(), isIssueWatchdogUniqueConflict(), IssueRow, IssueWatchdogRow, IssueWatchdogUpsertInput, isUniqueConstraintConflict(), TASK_WATCHDOG_LIVE_RUN_STATUSES (+13 more)
-
-### Community 81 - "Community 81"
-Cohesion: 0.13
-Nodes (30): authorizeOwnedGitWorktreeCleanup(), classifyWorktreeOwnership(), describeDeclinedCleanup(), describeOwner(), describeUnreadableRegistry(), directoryExists(), findGitWorktreeRegistration(), formatWorktreeOwnerLockReason() (+22 more)
-
-### Community 82 - "Community 82"
+### Community 55 - "execution-workspace-cleanup.ts"
 Cohesion: 0.06
-Nodes (16): FETCH_BLOCKED_PORTS, FIXTURE_TOOLS, FixtureTool, HTTP_SERVICE_ID, OAUTH_SERVICE_ID, OAuthCodeRecord, OAuthTokenRecord, sha256() (+8 more)
+Nodes (46): classifyRemovalProof(), decodeRunAttribution(), encodeRetainedReason(), EXECUTION_WORKSPACE_IDLE_GRACE_MS, EXECUTION_WORKSPACE_LEGACY_IDLE_MS, ExecutionWorkspaceCleanupResult, executionWorkspaceCleanupService(), reconcileExecutionWorkspaceCleanup() (+38 more)
 
-### Community 83 - "Community 83"
-Cohesion: 0.11
-Nodes (22): executeProcessForTests, isProcessGroupAliveForTests, setProcessGroupLivenessProbeForTests(), setSubmoduleInspectSettingsForTests(), WorkspaceGitSubmoduleError, WorkspaceRepoMismatchError, advanceRemoteMaster(), createClonedRepoWithRemote() (+14 more)
+### Community 56 - "tool-gateway.test.ts"
+Cohesion: 0.09
+Nodes (6): awaitRateLimitWindow(), createApprovedToolAction(), createTestToolGatewayService(), Db, FakeMcpRequest, ToolGatewayServiceOptions
 
-### Community 84 - "Community 84"
+### Community 57 - "heartbeatService"
+Cohesion: 0.02
+Nodes (219): countRunsOccupyingSlots(), shouldCancelRunsForNonInvokableAgent(), getActiveAgentIds(), markAgentStartLockPhase(), rethrowIfAgentStartLockAborted(), runDetachedFromAgentStartLock(), incrementBlockerResolvedWakeMetric(), bindExternalRuntimeReservationIsolation() (+211 more)
+
+### Community 58 - "issue-agent-mutation-ownership-routes.test.ts"
 Cohesion: 0.05
-Nodes (32): allowPenstockGate, drainInFlightExecutions(), expectSourceScopedStrandedRecoveryAction(), expectStrandedRecoveryArtifacts(), isPidAlive(), mockAdapterExecute, mockDeleteAgentJobsByRunId, mockDeleteAgentJobsForRun (+24 more)
+Nodes (35): cheapRecoveryDedupeHarness(), collectSqlParams(), createApp(), createAuthorizationDecisionDb(), createRunContextDb(), createWatchdogDb(), DeniedWriteLookupKind, deniedWriteLookupLimitStub() (+27 more)
 
-### Community 85 - "Community 85"
+### Community 59 - "redaction.ts"
+Cohesion: 0.04
+Nodes (96): containAgentConfig(), RFC-3986, AMBIGUOUS_PROMOTABLE_TOKENS, BENIGN_HEADER_NAMES, classifyKeyTier(), CLI_SECRET_FLAG_RE, ENV_DUMP_SECRET_ASSIGNMENT_RE, ESCAPED_JSON_SECRET_FIELD_TEXT_RE (+88 more)
+
+### Community 60 - "adapters.ts"
+Cohesion: 0.12
+Nodes (41): buildExternalAdapters(), extractUiParserSource(), getOrExtractUiParserSource(), getUiParserSource(), loadExternalAdapterPackage(), loadFromRecord(), reloadExternalAdapter(), resolvePackageDir() (+33 more)
+
+### Community 61 - "conflict"
 Cohesion: 0.11
-Nodes (27): buildIsolatedConfig(), buildLegacyConfig(), ORIGINAL_CWD, ORIGINAL_ENV, applyRuntimePortSelectionToConfig(), buildIsolatedWorktreeConfig(), collectSiblingWorktreePorts(), expandHomePrefix() (+19 more)
+Nodes (45): conflict(), archiveMember(), assertAssignableArchiveTarget(), assertCanRemoveActiveOwner(), updateMember(), updateMemberAndPermissions(), buildFolderViews(), FolderRow (+37 more)
 
-### Community 86 - "Community 86"
-Cohesion: 0.22
+### Community 62 - "services/execution-workspaces.ts"
+Cohesion: 0.06
+Nodes (60): assertBranchReconcileRuntimeServicesStopped(), assertBranchReconcileWorkspaceIsSafe(), assertLockedBranchReconcileWorkspaceStillMatchesInspection(), assigneeMatchesExecutionPrincipal(), cloneRecord(), deriveAgentCwd(), execFileAsync, ExecutionWorkspaceBranchReconcileActor (+52 more)
+
+### Community 63 - "services/issue-tree-control.ts"
+Cohesion: 0.07
+Nodes (48): ACTIVE_RUN_STATUSES, ActiveCancelSnapshot, ActiveIssueTreePauseHoldGate, activePauseHoldPredicate(), ActiveRunRow, ActorInput, actorMatchesComment(), buildAffectedAgents() (+40 more)
+
+### Community 64 - "better-auth.ts"
+Cohesion: 0.08
+Nodes (36): BetterAuthGetSessionApi, BetterAuthHandlerTarget, BetterAuthInstance, BetterAuthSessionResolver, BetterAuthSessionUser, buildBetterAuthAdvancedOptions(), buildBetterAuthRateLimitOptions(), buildDexOAuthProviderConfigFromEnv() (+28 more)
+
+### Community 65 - "sandbox-provider-runtime.ts"
+Cohesion: 0.10
+Nodes (26): findReusableSandboxLeaseId(), AcquireSandboxLeaseInput, acquireSandboxProviderLease(), assertProviderConfig(), buildFakeSandboxProbe(), DestroySandboxLeaseInput, FakeSandboxProvider, findReusableSandboxProviderLeaseId() (+18 more)
+
+### Community 66 - "storage/types.ts"
+Cohesion: 0.05
+Nodes (40): createDurableRunLogStore(), ensureDir(), readLocalRange(), readS3Range(), s3Key(), DurableRunLogStoreOptions, isAtOrPastEnd(), normalizeKeyPrefix() (+32 more)
+
+### Community 67 - "issue-attachment-routes.test.ts"
+Cohesion: 0.08
+Nodes (25): normalizeIssueAttachmentMaxBytes(), DEFAULT_JSON_BODY_LIMIT, PORTABLE_JSON_BODY_LIMIT, PORTABLE_JSON_BODY_LIMIT_BYTES, captureRawBody(), registerBodyParsers(), shouldCaptureRawBody(), findRawNulInBody() (+17 more)
+
+### Community 68 - "plugin-job-scheduler.ts"
+Cohesion: 0.09
+Nodes (16): PluginRouteJobDeps, PluginJobCoordinator, PluginJobCoordinatorOptions, PluginJobScheduler, PluginJobSchedulerOptions, SchedulerDiagnostics, TriggerJobResult, CompleteJobRunInput (+8 more)
+
+### Community 69 - "plugin-database.ts"
+Cohesion: 0.07
+Nodes (27): ApplyPluginMigrationsOptions, assertAllowedPublicRead(), assertIdentifier(), assertNoBannedSql(), derivePluginDatabaseNamespace(), extractQualifiedRefs(), normaliseSql(), PluginDatabaseClient (+19 more)
+
+### Community 70 - "local-service-supervisor.ts"
+Cohesion: 0.09
+Nodes (55): renderTemplate, adoptLocalServiceFromPortOwner(), createLocalServiceKey(), doesLocalServiceRecordMatchCwd(), execFileAsync, findAdoptableLocalService(), findLocalServiceRegistryRecordByRuntimeServiceId(), getRuntimeServiceRegistryPath() (+47 more)
+
+### Community 71 - "services/projects.ts"
+Cohesion: 0.09
+Nodes (39): recordProjectPrimaryWorkspaceFallback(), cloneRecord(), isRecord(), mergeProjectWorkspaceRuntimeConfig(), readDesiredState(), readProjectWorkspaceRuntimeConfig(), readServiceStates(), attachGoals() (+31 more)
+
+### Community 72 - "org-chart-svg.ts"
+Cohesion: 0.10
+Nodes (33): avatarGridHeight(), avatarGridRows(), avatarGridWidth(), cardHeight(), cardWidth(), collapseToAvatars(), countNodes(), defaultRenderCard() (+25 more)
+
+### Community 73 - "environment-run-orchestrator.ts"
+Cohesion: 0.08
+Nodes (37): DEFAULT_K8S_REMOTE_CWD, DEFAULT_SANDBOX_REMOTE_CWD, isPlainObject(), isStringRecord(), resolveEnvironmentExecutionTarget(), resolveEnvironmentExecutionTransport(), EnvironmentAcquisitionResult, EnvironmentErrorCode (+29 more)
+
+### Community 74 - "issue-thread-interactions.ts"
+Cohesion: 0.05
+Nodes (65): assertRequestConfirmationTargetIsCurrent(), buildInteractionResolvedCounts(), buildIssueDocumentTargetFromDocument(), buildIssueDocumentTargetFromSnapshot(), buildStaleTargetResult(), buildSupersededByCommentResult(), buildTaskCreationOrder(), buildWithdrawnInteractionResult() (+57 more)
+
+### Community 75 - "plugin-host-services.ts"
+Cohesion: 0.05
+Nodes (63): RFC-1918, assertBelongsToCompany(), FinanceDateRange, financeService(), rangeConditions(), ADAPTER_OVERRIDE_ALLOWED_KEYS, ALLOWED_PROTOCOLS, BufferedLogEntry (+55 more)
+
+### Community 76 - "run-liveness.ts"
+Cohesion: 0.12
+Nodes (34): findCommentNextAction(), actionabilityText(), classifyRunActionability(), classifyRunLiveness(), combinedOutput(), compactReason(), declaredBlocker(), DEFAULT_EVIDENCE (+26 more)
+
+### Community 77 - "badRequest"
+Cohesion: 0.05
+Nodes (45): badRequest(), assertInstanceAdmin(), parseDocumentKey(), activationEntityTypeBody(), cloudUpstreamRoutes(), optionalString(), stringBody(), stringQuery() (+37 more)
+
+### Community 78 - "agentService"
+Cohesion: 0.08
+Nodes (55): defaultPermissionsForRole(), normalizeAgentPermissions(), NormalizedAgentPermissions, describeAgentStartLockDispatchHealth(), AgentConfigSnapshot, agentService(), assertBuiltInAgentMetadataMutationAllowed(), assertCompanyShortnameAvailable() (+47 more)
+
+### Community 79 - "company-search.ts"
+Cohesion: 0.08
+Nodes (54): activeIssueFilters(), artifactResult(), companySearchService(), countAgents(), countArtifacts(), countProjects(), countTotalNonIssue(), enrichIssueSnippets() (+46 more)
+
+### Community 80 - "task-watchdogs.ts"
+Cohesion: 0.05
+Nodes (65): TASK_WATCHDOG_ORIGIN_KIND, ActorFields, assertWatchdogAgentInvokable(), assertWatchedIssue(), buildStoppedFingerprintComment(), classifyTaskWatchdogSubtree(), isActiveTaskWatchdogUniqueConflict(), isIssueWatchdogUniqueConflict() (+57 more)
+
+### Community 81 - "git-worktree-ownership.ts"
+Cohesion: 0.13
+Nodes (31): authorizeOwnedGitWorktreeCleanup(), classifyWorktreeOwnership(), describeDeclinedCleanup(), describeOwner(), describeUnreadableRegistry(), directoryExists(), findGitWorktreeRegistration(), formatWorktreeOwnerLockReason() (+23 more)
+
+### Community 82 - "services/smoke-lab.ts"
+Cohesion: 0.06
+Nodes (39): allocateFetchAllowedLoopbackPort(), appendRedirectParam(), asRecord(), assertSmokeOAuthRedirectUri(), escapeHtml(), FETCH_BLOCKED_PORTS, FIXTURE_TOOLS, FixtureTool (+31 more)
+
+### Community 83 - "workspace-runtime.test.ts"
+Cohesion: 0.07
+Nodes (38): WorkspaceOperationRecorder, executeProcessForTests, ExecutionWorkspaceInput, GIT_INDEX_LOCK_STALE_MS, isProcessGroupAliveForTests, LockHolderScan, RealizedExecutionWorkspace, setLockHolderScanForTests() (+30 more)
+
+### Community 84 - "heartbeat-process-recovery.test.ts"
+Cohesion: 0.04
+Nodes (41): HEARTBEAT_RUN_FAILED_METRIC, PROCESS_LOST_LIVENESS_NULL_METRIC, PROCESS_LOST_TOTAL_METRIC, ISSUE_ASSIGNMENT_RECOVERY_PER_AGENT_SWEEP_LIMIT, allowPenstockGate, drainInFlightExecutions(), expectSourceScopedStrandedRecoveryAction(), expectStrandedRecoveryArtifacts() (+33 more)
+
+### Community 85 - "worktree-config.ts"
+Cohesion: 0.13
+Nodes (30): buildIsolatedConfig(), buildLegacyConfig(), ORIGINAL_CWD, ORIGINAL_ENV, applyRuntimePortSelectionToConfig(), buildIsolatedWorktreeConfig(), collectSiblingWorktreePorts(), expandHomePrefix() (+22 more)
+
+### Community 86 - "kkroo-bundled-plugins.ts"
+Cohesion: 0.21
 Nodes (16): autoConfigureAlertmanagerFromEnv(), autoConfigureLinearFromEnv(), BootstrapContext, compareVersions(), enableBundledPlugin(), FetchInternal, forceReinstallLocalPlugin(), installKkrooLocalPlugins() (+8 more)
 
-### Community 87 - "Community 87"
-Cohesion: 0.05
-Nodes (45): conflict(), notFound(), resolveCasePipelineId(), AgentAssignmentConflictReason, AgentAssignmentKind, assertAssignableAgent(), AssignabilityAgent, assignmentMessage() (+37 more)
+### Community 87 - "unprocessable"
+Cohesion: 0.04
+Nodes (68): notFound(), unprocessable(), assertAgentDefaultEnvironmentSelection(), normalizeAgentReference(), assertBuiltInAgentsEnabled(), assertEnabled(), validatePolicyBody(), assertActiveUserMembership() (+60 more)
 
-### Community 88 - "Community 88"
-Cohesion: 0.10
-Nodes (22): AuthenticatedTerminalContext, clientSafeErrorMessage(), closeUpgradeSocket(), CUSTOM_IMAGE_TERMINAL_UTF8_ENV, CustomImageTerminalService, decodeClientMessage(), errorStatus(), IncomingMessageWithTerminalContext (+14 more)
+### Community 88 - "environment-custom-image-terminal-ws.ts"
+Cohesion: 0.08
+Nodes (32): AuthenticatedTerminalContext, clientSafeErrorMessage(), closeClient(), closeUpgradeSocket(), createSsh2EnvironmentCustomImageSshConnector(), CUSTOM_IMAGE_TERMINAL_UTF8_ENV, decodeClientMessage(), EnvironmentCustomImageSshConnector (+24 more)
 
-### Community 89 - "Community 89"
+### Community 89 - "plugin-routes-authz.test.ts"
 Cohesion: 0.12
 Nodes (7): ragHealthBucketCache, createApp(), maskingSchema, mockLifecycle, mockRegistry, mockSecretService, withTransactionSupport()
 
-### Community 90 - "Community 90"
-Cohesion: 0.36
-Nodes (8): ChallengeStatus, claimBoardOwnership(), ClaimChallenge, createChallenge(), getBoardClaimWarningUrl(), getChallengeStatus(), initializeBoardClaimChallenge(), inspectBoardClaimChallenge()
+### Community 90 - "toolAccessService"
+Cohesion: 0.04
+Nodes (129): HttpError, asRecord(), builtInStdioTemplate(), googleSheetsAllowedSpreadsheetIds(), isGoogleSheetsConnectionConfig(), normalizeGoogleSheetsConnectionConfig(), normalizeToolDescriptor(), readStdioTemplateId() (+121 more)
 
-### Community 91 - "Community 91"
-Cohesion: 0.11
-Nodes (29): CWD_ENV_PATH, DatabaseMode, detectTailnetBindHost(), readConfigFile(), loadConfig(), PAPERCLIP_ENV_FILE_PATH, readGithubPrReviewerAgentIds(), resolveDefaultBackupDir() (+21 more)
-
-### Community 92 - "Community 92"
-Cohesion: 0.10
-Nodes (23): PLANNING_ONLY_RECOVERY_GUARD_CONTEXT, RECOVERY_MODEL_PROFILE_HINT_KEYS, RECOVERY_MODEL_PROFILE_KEY, recoveryAssigneeAdapterOverrides(), RecoveryModelProfileHintKey, RecoveryModelProfileWorkClass, scrubRecoveryModelProfileHints(), STATUS_ONLY_RECOVERY_GUARD_CONTEXT (+15 more)
-
-### Community 93 - "Community 93"
+### Community 91 - "config.ts"
 Cohesion: 0.05
-Nodes (32): derivePrReviewerWakeMaxConcurrency(), githubWebhookRoutes(), __resetWorkflowRunSupersessionTrackingForTest(), __test_backLinkAbsoluteUrl, __test_buildDependabotAlertIssueBody, __test_buildIssueBackLinkBody, __test_buildPrReviewerWakeIdempotencyKey, __test_buildPrReviewFeedbackComment (+24 more)
+Nodes (57): CWD_ENV_PATH, DatabaseMode, describeNumericCandidate(), detectTailnetBindHost(), readConfigFile(), loadConfig(), MAX_TIMER_DELAY_MS, NUMERIC_SETTING_BOUNDS (+49 more)
 
-### Community 94 - "Community 94"
-Cohesion: 0.11
-Nodes (29): AgentInstructionsBundle, AgentInstructionsFileDetail, AgentInstructionsFileSummary, AgentLike, applyBundleConfig(), asRecord(), asString(), buildPersistedBundleConfig() (+21 more)
-
-### Community 95 - "Community 95"
-Cohesion: 0.07
-Nodes (29): allocationFaultStatusGate(), BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS, countConsecutiveFailedOrZeroTokenResumes(), countConsecutiveZeroTokenCompletedRuns(), didRunSnapshotHitGatewayAllocationFault(), heartbeatRunTokenUsage(), isFailedOrZeroTokenResume(), isGatewayAllocationFault() (+21 more)
-
-### Community 96 - "Community 96"
+### Community 92 - "run-liveness-continuations.ts"
 Cohesion: 0.12
-Nodes (28): normalizeHeartbeatCooldownSec(), normalizeHeartbeatIntervalSec(), normalizeMaxConcurrentRuns(), normalizeOptionalNonNegativeInteger(), normalizeUsageTotals(), readRawUsageTotals(), resolveExternalLifecycleConcurrency(), resolveHeartbeatPolicyForRuntimeConfig() (+20 more)
+Nodes (15): RECOVERY_REASON_KINDS, ACTIONABLE_LIVENESS_STATES, AgentRow, CONTINUATION_ACTIVE_ISSUE_STATUSES, CONTINUATION_AGENT_STATUSES, DEFAULT_MAX_LIVENESS_CONTINUATION_ATTEMPTS, HeartbeatRunRow, IDEMPOTENT_WAKE_STATUSES (+7 more)
 
-### Community 97 - "Community 97"
-Cohesion: 0.07
-Nodes (28): BUNDLED_PLUGIN_PACKAGES, padBytes, BetterAuthSessionResult, BetterAuthSessionUser, EmbeddedPostgresCtor, EmbeddedPostgresInstance, StartedServer, CrashGuardContext (+20 more)
+### Community 93 - "recoveryService"
+Cohesion: 0.04
+Nodes (123): redactRunResultJson(), isTerminalIssueStatus(), issueLockOwnerStateMatches(), lockIssueOwnership(), buildIssueBlockersResolvedWakeIdempotencyKey(), applyIssueMonitorPolicyTransition(), isMonitorNextCheckAtLive(), lockIssueParentMutationCompany() (+115 more)
 
-### Community 99 - "Community 99"
+### Community 94 - "agent-instructions.ts"
 Cohesion: 0.14
-Nodes (26): hasExecutionParticipant(), summarizeIssueMonitor(), applyMonitorTransition(), blankExecutionState(), buildClearedMonitorState(), buildIssueMonitorClearedPatch(), buildIssueMonitorDispatchRearmPatch(), buildIssueMonitorTriggeredPatch() (+18 more)
+Nodes (40): AgentInstructionsBundle, AgentInstructionsFileDetail, AgentInstructionsFileSummary, agentInstructionsService(), deleteFile(), ensureWritableBundle(), exportFiles(), getBundle() (+32 more)
 
-### Community 100 - "Community 100"
-Cohesion: 0.07
-Nodes (24): mockAccessService, mockAgentService, mockDb, mockDbSelect, mockDbSelectFrom, mockDbSelectLimit, mockDbSelectOrderBy, mockDbSelectWhere (+16 more)
-
-### Community 101 - "Community 101"
-Cohesion: 0.08
-Nodes (28): ENTRY, ActiveWork, AttentionCaller, boundedLimit(), CaseChildNode, CaseChildrenRollup, CaseRow, DescendantActiveWorkCountRow (+20 more)
-
-### Community 102 - "Community 102"
+### Community 95 - "heartbeat-hintless-transient-upstream.test.ts"
 Cohesion: 0.10
-Nodes (20): ParsedEnvironmentConfig, probeEnvironment(), probeK8sEnvironment(), raceWithTimeout(), probePluginSandboxProviderDriver(), isBuiltinSandboxProvider(), probeSandboxProvider(), FakeKubeConfig (+12 more)
+Nodes (23): allocationFaultStatusGate(), BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS, didRunSnapshotHitGatewayAllocationFault(), isImmediatePredecessorRepeatGatewayAllocationFault(), isGatewayAllocationFault(), isHintlessTransientUpstreamFault(), isPrReviewRetryContext(), isRepeatedGatewayAllocationFault() (+15 more)
 
-### Community 103 - "Community 103"
-Cohesion: 0.11
-Nodes (32): logK8sGuardDecision(), classifyAuthOperation(), computeExternalLifecycleSilenceGapSeconds(), ensureRegistry(), KNOWN_BLOCKED_REASONS, KNOWN_EXTERNAL_LIFECYCLE_TERMINAL_STATUSES, KNOWN_INVOCATION_SOURCES, KNOWN_ISOLATION_MODES (+24 more)
-
-### Community 104 - "Community 104"
-Cohesion: 0.08
-Nodes (13): CapabilityCheckResult, FEATURE_CAPABILITIES, LAUNCHER_PLACEMENT_CAPABILITIES, OPERATION_CAPABILITIES, pluginCapabilityValidator, UI_SLOT_CAPABILITIES, CapabilityScopedInvoker, DEFAULT_GLOBALS (+5 more)
-
-### Community 105 - "Community 105"
-Cohesion: 0.06
-Nodes (32): ActiveInvocation, ANTHROPIC_ROUTING_ENV_KEYS, anthropicRoutingEnv(), appendStderrExcerpt(), createPluginWorkerHandle(), formatWorkerFailureMessage(), HOST_STARTUP_RPC_FAILURE, HostStartupRpcFailure (+24 more)
-
-### Community 106 - "Community 106"
-Cohesion: 0.11
-Nodes (32): compareSweepWakeFrame(), composeSweepWakeFramePage(), currentMinuteBucket(), detectSweepWakeRace(), equalStringArrays(), getIssueSnapshot(), isCompanyFlagEnabled(), isValidIsoDate() (+24 more)
-
-### Community 107 - "Community 107"
-Cohesion: 0.09
-Nodes (24): hasScheduledMonitor(), computeIssueMonitorGateFingerprint(), normalizeGateToken(), normalizeIssueExecutionPolicy(), normalizeIssueMonitorGateSignals(), normalizePolicy(), issueWithClearedStalledMonitor(), issueWithTriggeredMonitor() (+16 more)
-
-### Community 108 - "Community 108"
+### Community 96 - "hot-restart.ts"
 Cohesion: 0.15
-Nodes (19): canonicalToolArguments(), hashToolValue(), isPlainObject(), PROMPT_INJECTION_PATTERNS, readSignedToolArguments(), readSignedToolArgumentsPayload(), resolveToolActionSigningSecret(), scanPromptInjection() (+11 more)
+Nodes (24): prepareHotRestartShutdown(), toHotRestartIntentRun(), asBoolean(), asNumber(), asString(), HOT_RESTART_INTENT_FILENAME, HOT_RESTART_REPORT_FILENAME, HotRestartIntent (+16 more)
 
-### Community 109 - "Community 109"
-Cohesion: 0.14
-Nodes (13): BudgetBurnEstimate, BudgetEnforcementScope, buildApprovalPayload(), computeObservedAmount(), computeWindowBurn(), currentUtcMonthWindow(), formatBudgetAmount(), IncidentRow (+5 more)
+### Community 97 - "process-crash-guard.ts"
+Cohesion: 0.09
+Nodes (27): CrashTimeRunMarker, installWorkerCrashGuard(), markInFlightRunsForWorkerCrash(), registerCrashTimeRunMarker(), resetCrashTimeRunMarkerForTest(), CRASH_GUARD_EXIT_CODE, CrashGuardContext, CrashGuardLogger (+19 more)
 
-### Community 110 - "Community 110"
-Cohesion: 0.07
-Nodes (37): createExternalObjectDetectorRegistry(), createExternalObjectResolverRegistry(), createPluginProviderDetector(), ExternalObjectDetection, ExternalObjectDetector, ExternalObjectMentionRecord, ExternalObjectRecord, ExternalObjectResolver (+29 more)
+### Community 98 - "productivity-review-service.test.ts"
+Cohesion: 0.05
+Nodes (18): DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_HOURLY, DEFAULT_PRODUCTIVITY_REVIEW_HIGH_CHURN_SIX_HOURS, DEFAULT_PRODUCTIVITY_REVIEW_MAX_REFRESH_COMMENTS, DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS, DEFAULT_PRODUCTIVITY_REVIEW_REFRESH_INTERVAL_MS, ISSUE_MONITOR_WAKE_CLAIM_TTL_MS, PRODUCTIVITY_REVIEW_MIN_REFRESH_INTERVAL_MS, PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX (+10 more)
 
-### Community 111 - "Community 111"
+### Community 99 - "parseIssueExecutionState"
+Cohesion: 0.32
+Nodes (11): dispatchClaimedIssueMonitor(), tickDueIssueMonitors(), shouldAutoCheckoutIssueForWake(), suppressedDispatchRearmDelayMs(), buildIssueMonitorClearedPatch(), buildIssueMonitorDispatchRearmPatch(), buildIssueMonitorTriggeredPatch(), derivePersistedMonitorState() (+3 more)
+
+### Community 100 - "issue-comment-reopen-routes.test.ts"
+Cohesion: 0.06
+Nodes (26): installActor(), mockAccessService, mockAgentService, mockDb, mockDbSelect, mockDbSelectFrom, mockDbSelectLimit, mockDbSelectOrderBy (+18 more)
+
+### Community 101 - "pipelines-aggregation.ts"
+Cohesion: 0.09
+Nodes (28): ActiveWork, AttentionCaller, boundedLimit(), CASE_CHILDREN_TREE_MAX_DEPTH, CASE_CHILDREN_TREE_MAX_NODES, CaseChildNode, CaseChildrenRollup, caseDisplay() (+20 more)
+
+### Community 102 - "environment-probe-k8s.test.ts"
+Cohesion: 0.24
+Nodes (6): FakeKubeConfig, mockGetCode, mockLoadFromCluster, mockLoadFromString, mockMakeApiClient, mockResolveSecretValue
+
+### Community 103 - "productivityReviewService"
+Cohesion: 0.06
+Nodes (66): buildThresholds(), extractReviewTriggerFromDescription(), isActiveProductivityReviewUniqueConflict(), isApprovalGatedSuppression(), isMonitorScheduledSuppression(), isSoftStopTrigger(), isTerminalGateClosableTriggerSet(), isTerminalIssueStatus() (+58 more)
+
+### Community 104 - "pluginCapabilityValidator"
+Cohesion: 0.06
+Nodes (19): CapabilityCheckResult, FEATURE_CAPABILITIES, LAUNCHER_PLACEMENT_CAPABILITIES, OPERATION_CAPABILITIES, pluginCapabilityValidator, UI_SLOT_CAPABILITIES, CapabilityScopedInvoker, DEFAULT_GLOBALS (+11 more)
+
+### Community 105 - "plugin-worker-manager.ts"
+Cohesion: 0.04
+Nodes (71): ActiveInvocation, ANTHROPIC_ROUTING_ENV_KEYS, anthropicRoutingEnv(), appendStderrExcerpt(), createPluginWorkerHandle(), attachStdioHandlers(), callInternal(), cancelPendingRestart() (+63 more)
+
+### Community 106 - "sweep-wake-preflight.ts"
+Cohesion: 0.15
+Nodes (22): composeSweepWakeFramePage(), currentMinuteBucket(), detectSweepWakeRace(), getIssueSnapshot(), isCompanyFlagEnabled(), listIssueBlockerIds(), listRecentComments(), maxBlockerCompletedAt() (+14 more)
+
+### Community 107 - "issue-execution-policy-routes.test.ts"
+Cohesion: 0.10
+Nodes (19): createApp(), issueWithClearedStalledMonitor(), issueWithTriggeredMonitor(), mockAccessService, mockDb, mockDbInsert, mockDbInsertValues, mockDbLeftJoinWhere (+11 more)
+
+### Community 108 - "tool-access-service.test.ts"
 Cohesion: 0.08
-Nodes (23): createApp(), currentActor, mockAccessService, mockAgentService, mockCancelPluginEnvironmentInteractiveSetup, mockCapturePluginEnvironmentTemplate, mockDeletePluginEnvironmentTemplate, mockEnvironmentCustomImageService (+15 more)
+Nodes (27): canonicalToolArguments(), hashToolValue(), isPlainObject(), PROMPT_INJECTION_PATTERNS, readSignedToolArguments(), readSignedToolArgumentsPayload(), resolveToolActionSigningSecret(), scanPromptInjection() (+19 more)
 
-### Community 112 - "Community 112"
-Cohesion: 0.14
-Nodes (11): AgentReviewCounts, AgentRunCounts, AgentScorecard, AgentScorecardInput, AgentScorecardOptions, AgentScorecardsResult, computeAgentScorecards(), PerMetricSufficient (+3 more)
+### Community 109 - "budgetService"
+Cohesion: 0.05
+Nodes (53): AppliedAssertion, applyApprovalEnforcement(), ApplyApprovalEnforcementResult, ApplyApprovalRefusalCode, refuse(), withRefusalLogged(), AssertionEnforcementState, classifyEnforcementAssertion() (+45 more)
 
-### Community 113 - "Community 113"
-Cohesion: 0.12
+### Community 110 - "external-objects.ts"
+Cohesion: 0.05
+Nodes (69): runSingleFileUpload(), addSeconds(), createExternalObjectDetectorRegistry(), detect(), createExternalObjectResolverRegistry(), find(), createPluginProviderDetector(), ExternalObjectDetection (+61 more)
+
+### Community 111 - "environment-routes.test.ts"
+Cohesion: 0.08
+Nodes (22): currentActor, mockAccessService, mockAgentService, mockCancelPluginEnvironmentInteractiveSetup, mockCapturePluginEnvironmentTemplate, mockDeletePluginEnvironmentTemplate, mockEnvironmentCustomImageService, mockEnvironmentService (+14 more)
+
+### Community 112 - "services/dashboard.ts"
+Cohesion: 0.11
+Nodes (22): AgentReviewCounts, AgentRunCounts, AgentScorecard, AgentScorecardInput, AgentScorecardOptions, AgentScorecardsResult, computeAgentScorecards(), MIN_SAMPLE_DONE (+14 more)
+
+### Community 113 - "identifier-allocator.ts"
+Cohesion: 0.13
 Nodes (16): allocateFromLinear(), allocateFromPaperclip(), allocateIdentifier(), AllocateIdentifierInput, AllocateIdentifierResult, allocationFromLinearIssue(), CreatedLinearIssue, createLinearIssue() (+8 more)
 
-### Community 114 - "Community 114"
-Cohesion: 0.11
-Nodes (30): ActorLike, actorPrincipal(), applyIssueExecutionStageTransition(), AssigneeLike, assigneePrincipal(), buildChangesRequestedState(), buildCompletedState(), buildInitialIssueMonitorFields() (+22 more)
-
-### Community 115 - "Community 115"
+### Community 114 - "issue-execution-policy.ts"
 Cohesion: 0.09
-Nodes (31): parseIssueGraphLivenessIncidentKey(), parseLivenessIncidentKey(), activeRunMapForIssues(), activeRunMapKey(), appendBlockerAttentionEdges(), attentionBase(), blockedByMapForIssues(), blockerSampleIdentifier() (+23 more)
+Nodes (42): ActorLike, actorPrincipal(), applyIssueExecutionStageTransition(), applyMonitorTransition(), AssigneeLike, assigneePrincipal(), blankExecutionState(), buildChangesRequestedState() (+34 more)
 
-### Community 116 - "Community 116"
-Cohesion: 0.17
-Nodes (21): readBrandedStaticIndexHtml(), applyUiBranding(), createFaviconDataUrl(), DEFAULT_FAVICON_LINKS, deriveColorFromSeed(), escapeHtmlAttribute(), getWorktreeUiBranding(), hexToRgb() (+13 more)
-
-### Community 117 - "Community 117"
-Cohesion: 0.10
-Nodes (22): assertAuthenticated(), assertBoard(), assertCompanyAccess(), assertInstanceAdmin(), baseAgent, baseKey, getAccessibleResource(), getActorInfo() (+14 more)
-
-### Community 118 - "Community 118"
-Cohesion: 0.07
-Nodes (22): baseAgent, createDbStub(), mockAccessService, mockAgentInstructionsService, mockAgentService, mockApprovalService, mockBudgetService, mockBuiltInAgentService (+14 more)
-
-### Community 119 - "Community 119"
-Cohesion: 0.12
-Nodes (22): adapterExecute, asRecord(), BranchContainmentCallSite, createForwardBranchMismatch(), createGitRepo(), Db, execFileAsync, expectContainedWorkspaceBranchFailure() (+14 more)
-
-### Community 120 - "Community 120"
-Cohesion: 0.12
-Nodes (11): createFileResourceLimiter(), createFileResourceListLimiter(), FileResourceLimiter, fileResourceRoutes(), readListQuery(), readQuery(), WorkspaceFileResourceService, workspaceFileResourceService() (+3 more)
-
-### Community 121 - "Community 121"
-Cohesion: 0.11
-Nodes (14): ArtifactCursor, ArtifactGroupBy, buildArtifactGroups(), buildArtifactsGroupHref(), decodeCursor(), emptyGroup(), encodeCursor(), getIssueSummary() (+6 more)
-
-### Community 122 - "Community 122"
-Cohesion: 0.14
-Nodes (22): buildExecutionWorkspaceAdapterConfig(), cloneRecord(), defaultIssueExecutionWorkspaceSettingsForProject(), ExecutionWorkspaceEnvironmentResolution, ExecutionWorkspaceEnvironmentSource, gateProjectExecutionWorkspacePolicy(), hasReusableExecutionWorkspaceBinding(), issueExecutionWorkspaceModeForPersistedWorkspace() (+14 more)
-
-### Community 123 - "Community 123"
-Cohesion: 0.09
-Nodes (34): AMBIGUOUS_SCHEMA_NODE, childNodesForIndex(), childNodesForKey(), collectDiscardedPointerStringLeaves(), collectPluginConfigSecretValues(), collectStringLeaves(), containsMask(), designatedIdentityKey() (+26 more)
-
-### Community 124 - "Community 124"
-Cohesion: 0.14
-Nodes (19): asRecord(), backfillLegacyToolOAuthTokens(), configPath(), DbTransaction, hasRawOauthTokenKeys(), LegacyOAuthToken, OAuthTokenKind, RAW_OAUTH_TOKEN_KEYS (+11 more)
-
-### Community 125 - "Community 125"
-Cohesion: 0.11
-Nodes (16): apiCompression(), ApiCompressionOptions, deflateAsync, EncodingPreference, gzipAsync, isJsonContentType(), parseAcceptEncoding(), selectEncoding() (+8 more)
-
-### Community 126 - "Community 126"
-Cohesion: 0.14
-Nodes (16): AGENT_TOOLS, callOpenRouter(), ChatMessage, execAsync, execute(), executeToolCall(), sanitize(), ToolCall (+8 more)
-
-### Community 127 - "Community 127"
-Cohesion: 0.11
-Nodes (15): authorizeUpgrade(), closeUpgradeSocket(), hashToken(), headersFromIncomingMessage(), IncomingMessageWithContext, isWritableUpgradeSocket(), parseBearerToken(), rejectUpgrade() (+7 more)
-
-### Community 128 - "Community 128"
-Cohesion: 0.17
-Nodes (20): buildJoinDefaultsPayloadForAccept(), canReplayOpenClawGatewayInviteAccept(), extractHeaderEntries(), generateEd25519PrivateKeyPem(), hashToken(), headerMapGetIgnoreCase(), headerMapHasKeyIgnoreCase(), isDefaultHermesDashboardRoot() (+12 more)
-
-### Community 129 - "Community 129"
+### Community 115 - "listBlockedInboxIssues"
 Cohesion: 0.08
-Nodes (32): buildCaseContextMarkdown(), sourceTrustForPipelineCaseDocumentWrite(), buildPaperclipWakePayload(), contentPath(), DELIVERABLE_TITLE_PATTERNS, deliverableDocumentRank(), downloadPath(), formatPipelineCaseOutputContextMarkdown() (+24 more)
+Nodes (35): activeRunMapForIssues(), activeRunMapKey(), appendBlockerAttentionEdges(), blockedByMapForIssues(), blockedInboxAttentionResponseFields(), blockedInboxResponseDescription(), blockedInboxSearchText(), blockerSampleIdentifier() (+27 more)
 
-### Community 130 - "Community 130"
-Cohesion: 0.19
-Nodes (18): AgentSummaryInput, asNonEmptyString(), buildContinuationSummaryMarkdown(), bulletList(), continuationSummaryParksExecutor(), extractContinuationSummaryNextAction(), extractMarkdownSection(), extractPathCandidates() (+10 more)
-
-### Community 131 - "Community 131"
+### Community 116 - "ui-branding.ts"
 Cohesion: 0.09
-Nodes (22): readFullRunLog(), createDurableRunLogStore(), DurableRunLogStoreOptions, getRunLogStore(), normalizeKeyPrefix(), resolveRunLogS3(), RunLogFinalizeSummary, RunLogHandle (+14 more)
+Nodes (31): readBrandedStaticIndexHtml(), tempDir(), applyUiBranding(), createFaviconDataUrl(), DEFAULT_FAVICON_LINKS, deriveColorFromSeed(), escapeHtmlAttribute(), getWorktreeUiBranding() (+23 more)
 
-### Community 132 - "Community 132"
+### Community 117 - "agent-cross-tenant-authz-routes.test.ts"
+Cohesion: 0.09
+Nodes (24): assertAuthenticated(), assertBoard(), assertCompanyAccess(), assertInstanceAdmin(), baseAgent, baseKey, createApp(), getAccessibleResource() (+16 more)
+
+### Community 118 - "agent-permissions-routes.test.ts"
+Cohesion: 0.08
+Nodes (23): baseAgent, createApp(), createDbStub(), mockAccessService, mockAgentInstructionsService, mockAgentService, mockApprovalService, mockBudgetService (+15 more)
+
+### Community 119 - "heartbeat-workspace-branch-containment.test.ts"
+Cohesion: 0.12
+Nodes (22): adapterExecute, asRecord(), BranchContainmentCallSite, createForwardBranchMismatch(), createGitRepo(), Db, drainInFlightExecutions(), execFileAsync (+14 more)
+
+### Community 120 - "file-resources.ts"
+Cohesion: 0.14
+Nodes (22): activityDetails(), createFileResourceLimiter(), createFileResourceListLimiter(), denialReasonFromError(), FileResourceLimiter, fileResourceRoutes(), logDeniedAttempt(), logListDeniedAttempt() (+14 more)
+
+### Community 121 - "company-artifacts.ts"
+Cohesion: 0.14
+Nodes (24): ArtifactCursor, ArtifactGroupBy, attachmentContentPath(), buildArtifactGroups(), buildArtifactsGroupHref(), buildIssueHref(), classifyMediaKind(), companyArtifactsService() (+16 more)
+
+### Community 122 - "execution-workspace-policy.ts"
+Cohesion: 0.11
+Nodes (29): buildExecutionWorkspaceAdapterConfig(), cloneRecord(), defaultIssueExecutionWorkspaceSettingsForProject(), ExecutionWorkspaceEnvironmentResolution, ExecutionWorkspaceEnvironmentSource, executionWorkspaceUsesGitWorktree(), executionWorkspaceUsesPerRunScope(), gateProjectExecutionWorkspacePolicy() (+21 more)
+
+### Community 123 - "plugin-config-masking.ts"
 Cohesion: 0.10
-Nodes (29): githubAppCredentialsConfigured(), GitHubCommitStatusState, _resetInstallationTokenCache(), appendDeliveryRunEvent(), claimDueGitHubCommitStatusDeliveries(), classifyReviewerEvidenceError(), DbTransaction, deliveryClaimWhere() (+21 more)
+Nodes (44): RFC-6901, AMBIGUOUS_SCHEMA_NODE, childNodesForIndex(), childNodesForKey(), collectDiscardedPointerStringLeaves(), collectPluginConfigSecretValues(), collectStringLeaves(), containsMask() (+36 more)
 
-### Community 133 - "Community 133"
-Cohesion: 0.09
-Nodes (16): CapturedCall, JsonRpcMessage, listen(), opencodeBin, opencodeEnv(), PlannedCall, repoRoot, runOpenCode() (+8 more)
-
-### Community 134 - "Community 134"
-Cohesion: 0.17
-Nodes (12): buildInvocationEnvForLogs(), BuildInvocationEnvForLogsOptions, runChildProcess(), execute(), httpAdapter, normalizeMethod(), summarizeStatus(), testEnvironment() (+4 more)
-
-### Community 135 - "Community 135"
-Cohesion: 0.17
-Nodes (14): DEFAULT_BUILD_COMMIT_PATH, parseBuildCommit(), readBuildCommit(), ReadTextFile, BuildCommitCommand, createServerInfoSnapshot(), getGitLocalChanges(), getServerInfoSnapshot() (+6 more)
-
-### Community 136 - "Community 136"
-Cohesion: 0.11
-Nodes (7): parseWakePayloadFromMessage(), Db, deleteCompaniesAfterSideEffectsDrain(), deleteDocuments(), deleteHeartbeatRunsAndWakeupsAfterActivityLogDrains(), Fixture, isHeartbeatCleanupFkError()
-
-### Community 137 - "Community 137"
-Cohesion: 0.13
-Nodes (12): ACTIVE_CUSTOM_IMAGE_SETUP_STATUSES, cloneRecord(), EnvironmentLeaseRow, EnvironmentListFilters, EnvironmentRow, readEnum(), toEnvironment(), toEnvironmentLease() (+4 more)
-
-### Community 138 - "Community 138"
-Cohesion: 0.12
-Nodes (27): enrichAuthoredLocForRow(), fetchPullRequestFiles(), githubApiHeaders(), GithubPullDetail, GithubSearchItem, LINK_SOURCE_STRENGTH, reconcileMergedPullRequests(), reconcilePendingLocEnrichment() (+19 more)
-
-### Community 139 - "Community 139"
-Cohesion: 0.07
-Nodes (22): checkoutRestoreStatusExpression, DbOrTransaction, DbTransaction, releaseIssueRunOwnership(), restorableCheckoutPromotion, restoreCheckoutPromotedStatus(), restoreCheckoutPromotedStatuses(), restoreCheckoutPromotionSet() (+14 more)
-
-### Community 140 - "Community 140"
-Cohesion: 0.11
-Nodes (11): getMetricsRegistry(), deliveryCount(), suppressionCount(), gaugeValue(), deadLetterGauge(), deliveryCount(), heartbeatWithCapacityDenied(), suppressionCount() (+3 more)
-
-### Community 141 - "Community 141"
-Cohesion: 0.21
-Nodes (18): asRecord(), deny(), hasBoundaryScope(), intersectSets(), isTrustPresetResolution(), JsonRecord, mergeBoundary(), normalizeSet() (+10 more)
-
-### Community 142 - "Community 142"
-Cohesion: 0.09
-Nodes (16): mockAccessService, mockAdapter, mockAgentInstructionsService, mockAgentService, mockApprovalService, mockBudgetService, mockCompanySkillService, mockEnvironmentService (+8 more)
-
-### Community 143 - "Community 143"
-Cohesion: 0.09
-Nodes (20): createApp(), legacyProjectLinkedIssue, mockAccessService, mockAgentService, mockDb, mockDocumentsService, mockEnvironmentService, mockExecutionWorkspaceService (+12 more)
-
-### Community 144 - "Community 144"
-Cohesion: 0.04
-Nodes (55): COMPANY_ACTIVITY_QUERY_PARAMS, companyActivityQuerySchema, createActivitySchema, uuidQueryParamSchema, activationEntityTypeBody(), cloudUpstreamRoutes(), stringBody(), stringQuery() (+47 more)
-
-### Community 145 - "Community 145"
+### Community 124 - "tool-oauth-legacy-backfill.ts"
 Cohesion: 0.15
-Nodes (7): assertBoardSelfMembershipAccess(), BoardActor, MembershipChangeKind, MembershipUpdateResult, PolicyDecision, ResourceMembershipPolicyHook, ResourceMembershipServiceOptions
+Nodes (21): awsSecretsManagerProvider, asRecord(), backfillLegacyToolOAuthTokens(), configPath(), hasRawOauthTokenKeys(), LegacyOAuthToken, OAuthTokenKind, RAW_OAUTH_TOKEN_KEYS (+13 more)
 
-### Community 146 - "Community 146"
-Cohesion: 0.19
-Nodes (20): maybeContainsSecretText(), redactSensitiveText(), decorateHeartbeatRunRuntimeStatus(), isHeartbeatRunRuntimeStatusActive(), publishHeartbeatRunRuntimeProgress(), recordHeartbeatRunRuntimeProgress(), clearAllHeartbeatRunRuntimeStatuses(), clearHeartbeatRunRuntimeStatus() (+12 more)
+### Community 125 - "api-compression.ts"
+Cohesion: 0.15
+Nodes (21): API_COMPRESSION_THRESHOLD_BYTES, apiCompression(), ApiCompressionOptions, deflateAsync, EncodingPreference, gzipAsync, isJsonContentType(), normalizeEndArgs() (+13 more)
 
-### Community 147 - "Community 147"
+### Community 126 - "index.ts"
+Cohesion: 0.06
+Nodes (56): BetterAuthSessionResult, BetterAuthSessionUser, EmbeddedPostgresCtor, EmbeddedPostgresInstance, StartedServer, startServer(), applyMigrationsForLabel(), assertCloudDatabaseContract() (+48 more)
+
+### Community 127 - "live-events-ws.ts"
+Cohesion: 0.11
+Nodes (16): authorizeUpgrade(), closeUpgradeSocket(), hashToken(), headersFromIncomingMessage(), IncomingMessageWithContext, isWritableUpgradeSocket(), parseBearerToken(), parseCompanyId() (+8 more)
+
+### Community 128 - "github-review-gate-authority.ts"
+Cohesion: 0.05
+Nodes (56): GithubWebhookConfig, activateGithubReviewGateDelivery(), affectsProtectedBase(), Candidate, claimDueGithubReviewGateDeliveries(), COMMENT_ACTIONS, commentSignals(), deliveryClaimWhere() (+48 more)
+
+### Community 129 - "source-trust.ts"
+Cohesion: 0.16
+Nodes (18): sourceTrustForActorWrite(), fenceMarkdown(), formatPipelineConversationBodyDocumentContextMarkdown(), loadPipelineConversationBodyDocumentContext(), PIPELINE_CASE_BODY_CASE_DOCUMENT_KEY, PipelineConversationBodyDocumentContext, QueryableDb, truncateWithFlag() (+10 more)
+
+### Community 130 - "issue-continuation-summary.ts"
+Cohesion: 0.18
+Nodes (17): AgentSummaryInput, asNonEmptyString(), buildContinuationSummaryMarkdown(), bulletList(), extractContinuationSummaryNextAction(), extractMarkdownSection(), extractPathCandidates(), extractPreviousNextAction() (+9 more)
+
+### Community 131 - "recovery/service.ts"
+Cohesion: 0.02
+Nodes (119): DeferredWakeReopenEligibility, LOCKLESS_DEFERRED_WAKE_DEPENDENCY_BLOCKED_ERROR, LOCKLESS_DEFERRED_WAKE_PROMOTED_ERROR, locklessDeferredWakeTerminalError(), readNonEmptyString(), WAKE_COMMENT_IDS_KEY, IssueDependencyReadiness, POD_GIT_TRANSPORT_FAILURE (+111 more)
+
+### Community 132 - "github-status-delivery-outbox.ts"
+Cohesion: 0.10
+Nodes (34): githubAppCredentialsConfigured(), githubGetLatestCommitStatusForContext(), appendDeliveryRunEvent(), claimDueGitHubCommitStatusDeliveries(), classifyReviewerEvidenceError(), DbHandle, deliveryClaimWhere(), DeliveryRow (+26 more)
+
+### Community 133 - "opencode-k8s-seed-transport.test.ts"
 Cohesion: 0.12
-Nodes (14): computeIssueRewakeCooldownMs(), evaluateIssueRewakeThrottle(), ISSUE_NEW_INPUT_ACTIVITY_ACTION_SET, ISSUE_NEW_INPUT_ACTIVITY_ACTIONS, ISSUE_PROGRESS_ACTIVITY_ACTION_SET, ISSUE_PROGRESS_ACTIVITY_ACTIONS, IssueRewakeActivityRow, IssueRewakeCandidateInput (+6 more)
+Nodes (24): CapturedCall, classifyCall(), completionChunk(), initializeResult(), JsonRpcMessage, listen(), opencodeBin, opencodeEnv() (+16 more)
 
-### Community 148 - "Community 148"
+### Community 134 - "successful-run-handoff.ts"
+Cohesion: 0.06
+Nodes (49): agentLinkRow(), AgentRow, buildSuccessfulRunHandoffExhaustedNotice(), buildSuccessfulRunHandoffInstruction(), buildSuccessfulRunHandoffRequiredNotice(), decideSuccessfulRunHandoff(), DEFAULT_MAX_SUCCESSFUL_RUN_HANDOFF_ATTEMPTS, FINISH_SUCCESSFUL_RUN_HANDOFF_REASON (+41 more)
+
+### Community 135 - "server-info.ts"
+Cohesion: 0.16
+Nodes (13): DEFAULT_BUILD_COMMIT_PATH, parseBuildCommit(), readBuildCommit(), ReadTextFile, BuildCommitCommand, createServerInfoSnapshot(), getGitLocalChanges(), GitCommand (+5 more)
+
+### Community 136 - "low-trust-red-team-routes.test.ts"
+Cohesion: 0.14
+Nodes (7): createApp(), Db, deleteCompaniesAfterSideEffectsDrain(), deleteDocuments(), deleteHeartbeatRunsAndWakeupsAfterActivityLogDrains(), Fixture, isHeartbeatCleanupFkError()
+
+### Community 137 - "environmentService"
+Cohesion: 0.08
+Nodes (34): ACTIVE_CUSTOM_IMAGE_SETUP_STATUSES, cloneRecord(), countFromRows(), EnvironmentLeaseRow, EnvironmentListFilters, EnvironmentRow, environmentService(), hasConstraintName() (+26 more)
+
+### Community 138 - "issue-pull-requests.ts"
+Cohesion: 0.06
+Nodes (50): AUTHORED_LOC_EXCLUSION_RULES, AuthoredLocResult, computeAuthoredLoc(), ExclusionRule, GithubPullFile, isExcludedFromAuthoredLoc(), LOCKFILE_BASENAMES, matchExclusionRule() (+42 more)
+
+### Community 139 - "issues-service.test.ts"
+Cohesion: 0.06
+Nodes (28): ISSUE_EXECUTION_LOCK_HOLDING_RUN_STATUSES, ISSUE_EXECUTION_LOCK_REAPABLE_NEVER_STARTED_RUN_STATUSES, runOwnsIssueExecutionLock(), runStatusHoldsIssueExecutionLock(), TERMINAL_HEARTBEAT_RUN_STATUS_VALUES, TERMINAL_HEARTBEAT_RUN_STATUSES, deriveIssueCommentRunLogAttribution(), extractExecutiveHoldMarker() (+20 more)
+
+### Community 140 - "heartbeat-wake-dispatch-retry.test.ts"
+Cohesion: 0.05
+Nodes (39): GITHUB_REVIEW_DELIVERY_COUNT_KEY, JOB_FAILED_HEARTBEAT_RETRY_REASON, AGENT_ERROR_DURATION_SECONDS_METRIC, AGENT_ERROR_REASON_AGENTS_METRIC, AGENT_ERROR_REASON_OLDEST_AGE_METRIC, AGENT_HEARTBEAT_AGE_SECONDS_METRIC, AGENT_HEARTBEAT_INTERVAL_SECONDS_METRIC, AGENT_WAKEUP_TERMINAL_FAILED_OLDEST_AGE_METRIC (+31 more)
+
+### Community 141 - "trust-preset-resolver.ts"
+Cohesion: 0.10
+Nodes (34): readObject(), resolveAgentSelfTrustPreset(), readRunIssueId(), assertAgentCanManageRuntimeServicesForWorkspace(), assertLowTrustCanManageRuntimeForActor(), assertLowTrustCanManageRuntimeForIssue(), listReportingSubtreeAgentIds(), readRunIssueId() (+26 more)
+
+### Community 142 - "agent-skills-routes.test.ts"
+Cohesion: 0.08
+Nodes (17): createApp(), mockAccessService, mockAdapter, mockAgentInstructionsService, mockAgentService, mockApprovalService, mockBudgetService, mockCompanySkillService (+9 more)
+
+### Community 143 - "issues-goal-context-routes.test.ts"
+Cohesion: 0.08
+Nodes (21): createApp(), legacyProjectLinkedIssue, mockAccessService, mockAgentService, mockDb, mockDocumentsService, mockEnvironmentService, mockExecutionWorkspaceService (+13 more)
+
+### Community 144 - "accessService"
+Cohesion: 0.04
+Nodes (67): ChallengeStatus, claimBoardOwnership(), ClaimChallenge, createChallenge(), getBoardClaimWarningUrl(), getChallengeStatus(), initializeBoardClaimChallenge(), inspectBoardClaimChallenge() (+59 more)
+
+### Community 145 - "services/resource-memberships.ts"
+Cohesion: 0.12
+Nodes (14): logMembershipChange(), requireBoardUserId(), resourceMembershipRoutes(), assertBoardSelfMembershipAccess(), BoardActor, evaluatePolicy(), MembershipChangeKind, MembershipUpdateResult (+6 more)
+
+### Community 146 - "heartbeat-run-runtime-status.ts"
+Cohesion: 0.17
+Nodes (22): decorateHeartbeatRunRuntimeStatus(), recordCurrentHeartbeatRunRuntimeProgress(), isHeartbeatRunRuntimeStatusActive(), recordHeartbeatRunRuntimeProgress(), clearAllHeartbeatRunRuntimeStatuses(), clearHeartbeatRunRuntimeStatus(), cloneStatus(), getHeartbeatRunRuntimeStatus() (+14 more)
+
+### Community 147 - "issue-rewake-throttle.ts"
+Cohesion: 0.11
+Nodes (22): computeIssueRewakeCooldownMs(), evaluateIssueRewakeThrottle(), isIssueRewakeNewInputActivity(), isIssueRewakeProgressActivity(), ISSUE_COMMENT_ADDED_ACTION, ISSUE_NEW_INPUT_ACTIVITY_ACTION_SET, ISSUE_NEW_INPUT_ACTIVITY_ACTIONS, ISSUE_PROGRESS_ACTIVITY_ACTION_SET (+14 more)
+
+### Community 148 - "synthetic-ssh-probe.ts"
 Cohesion: 0.14
 Nodes (12): classifyError(), computeMedian(), execFileAsync, extractSshHandshakeMs(), readSshdAuthAttempts(), runProbeOnce(), SyntheticProbeAlert, SyntheticProbeOptions (+4 more)
 
-### Community 149 - "Community 149"
-Cohesion: 0.12
-Nodes (11): createSsh2EnvironmentCustomImageSshConnector(), EnvironmentCustomImageSshConnector, setupEnvironmentCustomImageTerminalWebSocketServer(), createSession(), flushPromises(), futureDate(), listen(), require (+3 more)
+### Community 149 - "environment-custom-image-terminal-ws.test.ts"
+Cohesion: 0.07
+Nodes (11): EnvironmentCustomImageSshShell, closeServer(), createSession(), FakeSshShell, flushPromises(), futureDate(), listen(), require (+3 more)
 
-### Community 150 - "Community 150"
-Cohesion: 0.14
-Nodes (13): AdapterUsage, adapterUsageForIssues(), ApportionedAdapter, apportionIssueAcrossAdapters(), CostSource, coverageForWindow(), CoverageReport, IssueEfficiency (+5 more)
+### Community 150 - "issue-efficiency.ts"
+Cohesion: 0.17
+Nodes (16): AdapterUsage, adapterUsageForIssues(), ApportionedAdapter, apportionIssueAcrossAdapters(), CostSource, coverageForWindow(), CoverageReport, IssueEfficiency (+8 more)
 
-### Community 151 - "Community 151"
-Cohesion: 0.11
-Nodes (18): assertValidAssigneeAgentFilter(), blockedInboxIssueConditions(), hasPlanDocumentCondition(), inboxVisibleForUserCondition(), lowTrustBoundaryIssueCondition(), myLastCommentAtExpr(), myLastReadAtExpr(), myLastTouchAtExpr() (+10 more)
+### Community 151 - "issueService"
+Cohesion: 0.03
+Nodes (82): activeInboxArchiveFields(), alertmanagerAggregateCreationFingerprint(), appendAcceptanceCriteriaToDescription(), applyStatusSideEffects(), assertTransition(), assertValidAssigneeAgentFilter(), blockedInboxIssueConditions(), buildPreRealizationExecutionWorkspaceSettings() (+74 more)
 
-### Community 152 - "Community 152"
-Cohesion: 0.14
-Nodes (22): assertDirtyQuarantineRuntimeServicesStopped(), assertGitIndexIsUnlocked(), branchIncoherenceValidationFailure(), detectGitWorktreeInProgressOperation(), ensureGitWorktreeBranchCoherent(), explainGitWorktreeBranchIncoherence(), findGitWorktreeBranchContention(), formatBranchForMessage() (+14 more)
-
-### Community 153 - "Community 153"
-Cohesion: 0.12
-Nodes (14): exportPreviewResult(), exportRequest, exportResult(), importResult(), mockAccessService, mockAgentService, mockBudgetService, mockCompanyArtifactsService (+6 more)
-
-### Community 154 - "Community 154"
-Cohesion: 0.16
-Nodes (15): compactRecord(), DebugLog, GitDescribeCommand, isPackagedInstall(), normalizeErrorField(), PackageJson, packageRoot, parseGitDescribeVersion() (+7 more)
-
-### Community 155 - "Community 155"
-Cohesion: 0.09
-Nodes (32): AgedHumanGatedIssue, classifyHumanGatedWait(), DEFAULT_ESCALATE_AFTER_DAYS_BY_PRIORITY, escalateAfterDaysFor(), formatAge(), formatHumanGatedAgeingSections(), formatIssueRef(), formatMalformedIssueRef() (+24 more)
-
-### Community 156 - "Community 156"
-Cohesion: 0.19
-Nodes (6): userSlugCandidates(), EnvironmentCustomImageTerminalConnectionRegistry, EnvironmentCustomImageTerminalSessionStore, hashTerminalSessionToken(), minDate(), toValidFutureDate()
-
-### Community 157 - "Community 157"
-Cohesion: 0.15
-Nodes (12): boardOrgAccessProxyGuard(), createWorkerProxyHandler(), fetchWithStartupRetry(), HOP_BY_HOP_HEADERS, registerWorkerTierProxyRoutes(), sleep(), WORKER_DEPENDENT_PLUGIN_ROUTES, WorkerTierProxyOptions (+4 more)
-
-### Community 158 - "Community 158"
-Cohesion: 0.14
-Nodes (14): AgentStartLockOptions, detachedFollowUps, ensureCoalescedFollowUp(), followUpByAgent, heldAgentIds, _resetAgentStartLocksForTesting(), runDetachedFromAgentStartLock(), runExclusively() (+6 more)
-
-### Community 159 - "Community 159"
-Cohesion: 0.14
-Nodes (13): AGENT_PROFILE_CHANGE_CONSENT_FIELDS, agentInstructionsChangeTargetKey(), agentProfileChangeTargetKey(), changeConsentGateService(), ConsumedRequestConfirmationResult, expandTargetKeysForLegacyCompatibility(), legacyTargetKeysFor(), payloadHasDisplayedDiff() (+5 more)
-
-### Community 160 - "Community 160"
+### Community 152 - "secretService"
 Cohesion: 0.08
-Nodes (31): extractAllyReviewedHeadSha(), GitHubCommitStatusPostResult, AttestingComment, CommentReviewGateComment, CommentReviewGateOutcome, CommentReviewGateVerdict, commentReviewGateVerdictIsMisreadable(), evaluateCommentReviewGate() (+23 more)
+Nodes (51): getSecretProvider(), asRecord(), assertClass3StaticLeaseAllowed(), assertSelectableProviderConfig(), canonicalizeBinding(), cleanupPreparedProviderWrite(), deleteLocalSecretCreateReservationOrThrow(), isUniqueConstraintViolation() (+43 more)
 
-### Community 161 - "Community 161"
-Cohesion: 0.21
-Nodes (16): applyExperimentalSettingsPatch(), getRuntimeInstanceId(), instanceExperimentalSettingsStorageSchema, instanceGeneralSettingsStorageSchema, InstanceSettingsServiceOptions, isTruthyRuntimeEnvValue(), normalizeExperimentalSettings(), normalizeGeneralSettings() (+8 more)
-
-### Community 162 - "Community 162"
+### Community 153 - "companies-route-cross-company-authz.test.ts"
 Cohesion: 0.12
-Nodes (12): ACTIVE_STATUSES, classifyRecoveryHandoff(), evaluateRecoveryRateAlert(), HandoffClass, RecoveryActionFacts, RecoveryCauseGroup, RecoveryCauseRouting, RecoveryHandoffSummary (+4 more)
+Nodes (16): createApp(), createCompany(), exportPreviewResult(), exportRequest, exportResult(), importResult(), mockAccessService, mockAgentService (+8 more)
 
-### Community 163 - "Community 163"
+### Community 154 - "version.ts"
+Cohesion: 0.14
+Nodes (17): compactRecord(), DebugLog, GitDescribeCommand, hasGitMetadataBeforeNodeModulesBoundary(), hasPathSegment(), isPackagedInstall(), normalizeErrorField(), PackageJson (+9 more)
+
+### Community 155 - "human-gated-ageing.ts"
+Cohesion: 0.10
+Nodes (35): AgedHumanGatedIssue, classifyHumanGatedWait(), comparePriority(), DEFAULT_ESCALATE_AFTER_DAYS_BY_PRIORITY, escalateAfterDaysFor(), formatAge(), formatHumanGatedAgeingSections(), formatIssueRef() (+27 more)
+
+### Community 157 - "worker-tier-proxy.ts"
 Cohesion: 0.11
-Nodes (17): agentActor, baseAgent, boardActor, createApp(), createDbStub(), mockAccessService, mockAgentInstructionsService, mockAgentService (+9 more)
+Nodes (21): RFC-7230, boardOrgAccessProxyGuard(), createWorkerProxyHandler(), fetchWithStartupRetry(), forwardRequestHeaders(), hasRequestBody(), HOP_BY_HOP_HEADERS, readPositiveIntegerEnv() (+13 more)
 
-### Community 164 - "Community 164"
-Cohesion: 0.13
-Nodes (15): Db, truncateCompanyScopedTestState(), TruncateCompanyScopedTestStateOptions, compactErrorText(), describeDbError(), findPgError(), isDbError(), isPostgresSqlState() (+7 more)
+### Community 158 - "logger.ts"
+Cohesion: 0.04
+Nodes (71): httpLogger, logDir, logFile, sharedOpts, AgentStartLockAbortedError, AgentStartLockDispatchHealth, AgentStartLockOptions, agentStartLockSweepContext (+63 more)
 
-### Community 165 - "Community 165"
-Cohesion: 0.27
-Nodes (6): assertLowTrustRuntimeServicesAllowed(), assertLowTrustWorkspaceIsolation(), issueIdIsDescendantOf(), workspaceIssueWithinLowTrustBoundary(), isIssueWithinLowTrustBoundary(), TrustPresetResolution
+### Community 159 - "company-skills-routes.test.ts"
+Cohesion: 0.08
+Nodes (25): AGENT_PROFILE_CHANGE_CONSENT_FIELDS, changeConsentGateService(), ConsumedRequestConfirmationResult, expandTargetKeysForLegacyCompatibility(), legacyTargetKeysFor(), markRequestConfirmationResultConsumed(), payloadHasDisplayedDiff(), readNonEmptyString() (+17 more)
 
-### Community 167 - "Community 167"
+### Community 160 - "pr-comment-review-gate.ts"
+Cohesion: 0.03
+Nodes (121): classifyPrReviewComment(), isActionablePrReviewComment(), isReviewShapedPrComment(), ActionableFeedbackOptions, ALLY_CONSOLIDATED_REVIEW_HEADING_PATTERN, ALLY_VERDICT_BLOCK_PATTERN, ALLY_VERDICT_OPENER_PATTERN, allyClaimedReviewHead() (+113 more)
+
+### Community 161 - "services/instance-settings.ts"
+Cohesion: 0.17
+Nodes (19): applyExperimentalSettingsPatch(), getRuntimeInstanceId(), instanceExperimentalSettingsStorageSchema, instanceGeneralSettingsStorageSchema, InstanceSettingsServiceOptions, isTruthyRuntimeEnvValue(), normalizeExperimentalSettings(), normalizeGeneralSettings() (+11 more)
+
+### Community 162 - "recovery-observability.ts"
+Cohesion: 0.08
+Nodes (26): RESOLVED_ASSIGNEE_AGENT_ID_EVIDENCE_KEY, RESOLVED_ISSUE_STATUS_EVIDENCE_KEY, ACTIVE_STATUSES, classifyRecoveryHandoff(), DEFAULT_RECOVERY_RATE_THRESHOLD_PERCENT, evaluateRecoveryRateAlert(), HandoffClass, MAX_WINDOW_WEEKS (+18 more)
+
+### Community 163 - "agentRoutes"
+Cohesion: 0.02
+Nodes (135): findServerAdapter(), asRecord(), containAgentMetadata(), containsRedactedAdapterValue(), isRedactedEnvBinding(), keepSanitizedAgentMetadata(), OMIT_REDACTED_ADAPTER_VALUE, redactAgentSecrets() (+127 more)
+
+### Community 164 - "db-retry.ts"
 Cohesion: 0.19
-Nodes (16): addCompanyMemberRemovalAccess(), assertCanManageCompanyMember(), getProtectedMemberReason(), isLocalImplicit(), loadCompanyAccessSummary(), mergeInviteDefaults(), resolveAcceptedInviteJoinRequest(), resolveActorEmail() (+8 more)
+Nodes (12): compactErrorText(), describeDbError(), findPgError(), isDbError(), isPostgresSqlState(), isTransientDbError(), PgErrorFields, POSTGRES_SQLSTATE_CLASSES (+4 more)
 
-### Community 168 - "Community 168"
+### Community 165 - "scrape-metrics-collector.ts"
+Cohesion: 0.05
+Nodes (38): BOARD_DECISION_STATUSES, refreshApprovalQueueMetrics(), EXTERNAL_RUNTIME_RESERVATION_STRAND_SILENCE_MS, refreshExternalRuntimeReservationStrandMetrics(), TERMINAL_RUN_STATUSES, APPROVAL_LAST_DECISION_TIMESTAMP_METRIC, APPROVAL_OLDEST_PENDING_AGE_METRIC, APPROVAL_QUEUE_METRICS_REFRESH_SUCCESS_METRIC (+30 more)
+
+### Community 166 - "authorizationService"
+Cohesion: 0.09
+Nodes (54): activeActorMembership(), activeResponsibleUserCanAuthorizeAgentGrantedSkillChange(), activeResponsibleUserCanAuthorizeIssueAction(), allow(), authorizationService(), agentHasMentionGrantOnIssue(), agentHasProductivityReviewGrantOnIssue(), agentHasRecoveryHandoffGrantOnIssue() (+46 more)
+
+### Community 167 - "human-gated-ageing-digest.ts"
+Cohesion: 0.07
+Nodes (43): db, MAX_PRS, token, DEFAULT_MAX_ESCALATED, AGGREGATE_CHUNK_SIZE, buildDigestBody(), chunk(), collectDigest() (+35 more)
+
+### Community 168 - "adapter-routes-authz.test.ts"
 Cohesion: 0.13
-Nodes (13): adapterRoutes(), createAdapter(), createApp(), installedRecord(), instanceAdmin, mocks, requestApp(), seedInstalledExternalAdapter() (+5 more)
+Nodes (14): setOverridePaused(), createAdapter(), createApp(), installedRecord(), instanceAdmin, mocks, requestApp(), resetInstalledExternalAdapterState() (+6 more)
 
-### Community 169 - "Community 169"
+### Community 169 - "ac-policy-assignee-routing.ts"
 Cohesion: 0.14
 Nodes (15): AcPolicyAgentTargetReason, AcPolicyFilingTarget, AcPolicyFilingTargetInput, AcPolicyResolvedOwner, AcPolicySkippedAgent, AcPolicySweepAgent, AcPolicyUnroutableReason, AcPolicyUserTargetReason (+7 more)
 
-### Community 170 - "Community 170"
+### Community 170 - "company-portability-routes.test.ts"
 Cohesion: 0.11
-Nodes (12): cloudHeaders, exportRequest, importRequest, mockAccessService, mockAgentService, mockBudgetService, mockCompanyArtifactsService, mockCompanyPortabilityService (+4 more)
+Nodes (13): cloudHeaders, createApp(), exportRequest, importRequest, mockAccessService, mockAgentService, mockBudgetService, mockCompanyArtifactsService (+5 more)
 
-### Community 171 - "Community 171"
+### Community 171 - "environment-capabilities-k8s.test.ts"
 Cohesion: 0.11
 Nodes (17): createApp(), currentActor, mockAccessService, mockAgentService, mockEnvironmentCustomImageService, mockEnvironmentService, mockExecutionWorkspaceService, mockInstanceSettingsService (+9 more)
 
-### Community 172 - "Community 172"
-Cohesion: 0.12
-Nodes (11): createApp(), futureDate(), mockEnvironmentCustomImageService, mockEnvironmentService, mockExecutionWorkspaceService, mockInstanceSettingsService, mockIssueService, mockLogActivity (+3 more)
+### Community 172 - "environment-custom-image-routes.test.ts"
+Cohesion: 0.11
+Nodes (10): createApp(), mockEnvironmentCustomImageService, mockEnvironmentService, mockExecutionWorkspaceService, mockInstanceSettingsService, mockIssueService, mockLogActivity, mockProjectService (+2 more)
 
-### Community 173 - "Community 173"
-Cohesion: 0.24
-Nodes (15): CurrentUserCandidates, CurrentUserRedactionOptions, defaultHomeDirs(), defaultUserNames(), escapeRegExp(), getDefaultCurrentUserCandidates(), isPlainObject(), maskUserNameForLogs() (+7 more)
-
-### Community 174 - "Community 174"
-Cohesion: 0.08
-Nodes (24): BuiltInAgentMarker, builtInAgentMarkersEqual(), isPlainRecord(), normalizeFeatureKeys(), readBuiltInAgentMarker(), withBuiltInAgentMarker(), builtInMetadata(), listBuiltInAgentDefinitions() (+16 more)
-
-### Community 175 - "Community 175"
-Cohesion: 0.16
-Nodes (9): escapeRegexPattern(), excerpt(), extractMatches(), ExtractSource, literalOccurrences(), sourceOccurrences(), trimUrlToken(), urlContainsPattern() (+1 more)
-
-### Community 176 - "Community 176"
-Cohesion: 0.13
-Nodes (10): createPluginDevWatcher(), log, PluginDevWatcher, PluginDevWatcherFsDeps, PluginPackageJson, PluginWatchTarget, ResolvePluginPackagePath, resolvePluginWatchTargets() (+2 more)
-
-### Community 177 - "Community 177"
+### Community 173 - "redactCurrentUserText"
 Cohesion: 0.14
-Nodes (11): ACTIVE_SLOT_STATUSES, asRecord(), createToolRuntimeSupervisor(), numberOption(), numberValue(), RuntimeSlotHandle, slotView(), ToolRuntimeSlotView (+3 more)
+Nodes (17): CURRENT_USER_REDACTION_TOKEN, CurrentUserCandidates, CurrentUserRedactionOptions, defaultHomeDirs(), defaultUserNames(), escapeRegExp(), getDefaultCurrentUserCandidates(), isPlainObject() (+9 more)
 
-### Community 178 - "Community 178"
-Cohesion: 0.18
-Nodes (20): clearIdleTimer(), ensureRuntimeServicesForRun(), markPersistedRuntimeServicesStoppedForExecutionWorkspace(), persistRuntimeServiceRecord(), readConfiguredServiceStates(), readDesiredRuntimeState(), releaseRuntimeServicesForRun(), resetRuntimeServicesForTests() (+12 more)
-
-### Community 179 - "Community 179"
+### Community 174 - "built-in-agents.test.ts"
 Cohesion: 0.12
-Nodes (3): FakeRuntime, LogEntry, TestAcpRuntimeOptions
+Nodes (18): BUILT_IN_AGENT_METADATA_KEY, BuiltInAgentMarker, isPlainRecord(), normalizeFeatureKeys(), readBuiltInAgentMarker(), withBuiltInAgentMarker(), getBuiltInAgentDefinition(), listBuiltInAgentDefinitions() (+10 more)
 
-### Community 180 - "Community 180"
-Cohesion: 0.12
-Nodes (11): mockAccessService, mockAgentService, mockCatalogService, mockCompanySkillPolicyService, mockCompanySkillService, mockGetTelemetryClient, mockHeartbeatService, mockIssueService (+3 more)
+### Community 175 - "issue-visibility.ts"
+Cohesion: 0.17
+Nodes (14): companySearchExtractService(), contentMatch(), escapeLikePattern(), escapeRegexPattern(), excerpt(), extractMatches(), ExtractSource, literalOccurrences() (+6 more)
 
-### Community 181 - "Community 181"
-Cohesion: 0.13
-Nodes (7): adapterExecute, createGitRepo(), Db, execFileAsync, Heartbeat, runGit(), seedRunTarget()
+### Community 176 - "plugin-dev-watcher.ts"
+Cohesion: 0.11
+Nodes (21): createPluginDevWatcher(), close(), handlePluginDisabled(), handlePluginEnabled(), handlePluginLoaded(), handlePluginUnloaded(), unwatchPlugin(), watchLocalPluginById() (+13 more)
 
-### Community 182 - "Community 182"
-Cohesion: 0.12
-Nodes (12): HeartbeatRunFixture, mockAccessService, mockDecisionTrainingService, mockDocumentAnnotationService, mockExternalObjectService, mockFeedbackService, mockHeartbeatService, mockInstanceSettingsService (+4 more)
+### Community 177 - "createToolRuntimeSupervisor"
+Cohesion: 0.14
+Nodes (26): ACTIVE_SLOT_STATUSES, asRecord(), createToolRuntimeSupervisor(), activeRows(), assertCapacity(), assertLocalStdioAvailable(), assertRestartAllowed(), ensureRunningSlot() (+18 more)
 
-### Community 183 - "Community 183"
+### Community 178 - "git-checkout-identity.ts"
+Cohesion: 0.06
+Nodes (41): AGENT_AUTHOR_EMAIL_DOMAINS, agentUrlKeyFromAuthorEmail(), CommitAuthorRef, CommitSkipReason, ForeignCommit, ForeignCommitSelection, normalizeEmail(), NotifiableAgentRef (+33 more)
+
+### Community 179 - "FakeRuntime"
+Cohesion: 0.11
+Nodes (4): FakeRuntime, LogEntry, TestAcpRuntimeOptions, runtime()
+
+### Community 180 - "human-gated-gate-revalidation.ts"
+Cohesion: 0.06
+Nodes (47): ACTION_OWED_RESOLUTION_KINDS, APPROVAL_ABANDONED, APPROVAL_GRANTED, APPROVAL_REFUSED, APPROVAL_UNDECIDED, ApprovalEvidence, BLOCKER_RESOLVING_STATUSES, BLOCKER_TERMINAL_NON_RESOLVING_STATUSES (+39 more)
+
+### Community 181 - "heartbeat-workspace-finalize-branch.test.ts"
+Cohesion: 0.14
+Nodes (8): adapterExecute, createGitRepo(), Db, drainInFlightExecutions(), execFileAsync, Heartbeat, runGit(), seedRunTarget()
+
+### Community 182 - "issue-comment-cancel-routes.test.ts"
+Cohesion: 0.11
+Nodes (13): HeartbeatRunFixture, installActor(), mockAccessService, mockDecisionTrainingService, mockDocumentAnnotationService, mockExternalObjectService, mockFeedbackService, mockHeartbeatService (+5 more)
+
+### Community 183 - "cursor-models.ts"
 Cohesion: 0.16
 Nodes (21): dedupeModels(), fetchOpenAiModels(), fingerprint(), listCodexModels(), loadCodexModels(), mergedWithFallback(), refreshCodexModels(), resetCodexModelsCacheForTests() (+13 more)
 
-### Community 184 - "Community 184"
-Cohesion: 0.14
-Nodes (12): AuthCapabilities, alertFileCandidates(), DatabaseBackupHealthStatus, DatabaseBackupHealthWarning, DatabaseBackupHealthWarningCode, inspectDatabaseBackupHealth(), InspectDatabaseBackupHealthOptions, readLastFailure() (+4 more)
+### Community 184 - "health.ts"
+Cohesion: 0.18
+Nodes (13): toDevServerHealthStatus(), hasDevServerStatusToken(), healthRoutes(), redactedDatabaseBackupHealth(), redactedDatabaseBackupWarning(), shouldExposeFullHealthDetails(), withHealthProbeDeadline(), getServerInfoSnapshot() (+5 more)
 
-### Community 185 - "Community 185"
-Cohesion: 0.20
-Nodes (13): boardMutationGuard(), DEFAULT_DEV_ORIGINS, isTrustedBoardMutationRequest(), parseOrigin(), SAFE_METHODS, trustedOriginsForRequest(), createApp(), accessServiceMock (+5 more)
-
-### Community 186 - "Community 186"
-Cohesion: 0.08
-Nodes (25): CompanyUserRow, dayKeyExpr(), isoDay(), loadDailyStats(), loadWindowStats(), PROFILE_WINDOWS, resolveCompanyUser(), slugifyUserPart() (+17 more)
-
-### Community 187 - "Community 187"
+### Community 185 - "bootstrap-claim-routes.test.ts"
 Cohesion: 0.19
-Nodes (13): AgentInvokability, AgentInvokabilityBlockReason, AgentOrgRow, AgentStatus, blocked(), DIRECT_NON_INVOKABLE_STATUSES, evaluateAgentInvokability(), evaluateAgentInvokabilityFromDb() (+5 more)
+Nodes (14): boardMutationGuard(), DEFAULT_DEV_ORIGINS, isTrustedBoardMutationRequest(), parseOrigin(), SAFE_METHODS, trustedOriginsForRequest(), createApp(), accessServiceMock (+6 more)
 
-### Community 188 - "Community 188"
+### Community 186 - "work-timeline.ts"
+Cohesion: 0.13
+Nodes (25): actorId(), dateIso(), IssueRow, maybeUuidList(), normalizeLimit(), normalizeOffset(), normalizeRunUsage(), normalizeTimelineWindow() (+17 more)
+
+### Community 187 - "agent-invokability.ts"
+Cohesion: 0.14
+Nodes (17): AgentInvokability, AgentInvokabilityBlockReason, AgentOrgRow, AgentStatus, blocked(), CompanyAgentRosterReader, DIRECT_NON_INVOKABLE_STATUSES, evaluateAgentInvokability() (+9 more)
+
+### Community 188 - "plugin-environment-driver.ts"
 Cohesion: 0.32
 Nodes (15): createPluginEnvironmentDriver(), cancelPluginEnvironmentInteractiveSetup(), capturePluginEnvironmentTemplate(), deletePluginEnvironmentTemplate(), destroyPluginEnvironmentLease(), executePluginEnvironmentCommand(), getPluginEnvironmentInteractiveSetup(), pluginDriverProviderKey() (+7 more)
 
-### Community 189 - "Community 189"
-Cohesion: 0.13
-Nodes (15): DbOrTransaction, DbTransaction, isRecord(), IssueRecoveryActionRow, readLatestRunAgentId(), readLatestRunId(), readRecoveryHandoffGrantAnchor(), readSourceScopedWakeHorizonAt() (+7 more)
+### Community 189 - "issue-recovery-actions.ts"
+Cohesion: 0.11
+Nodes (30): ACTIVE_RECOVERY_ACTION_STATUSES, DbOrTransaction, isRecord(), IssueRecoveryActionRow, issueRecoveryActionService(), escalateExpiredWakeHorizons(), getActiveForIssue(), listActiveForIssues() (+22 more)
 
-### Community 190 - "Community 190"
+### Community 190 - "aws-secrets-manager-provider.ts"
+Cohesion: 0.08
+Nodes (45): asAwsSecretsManagerMaterial(), asOptionalNonEmptyString(), assertNotManagedNamespaceExternalRef(), AwsCredentialIdentity, awsCredentialProviders, awsDateParts(), AwsSecretsManagerConfig, AwsSecretsManagerListSecretEntry (+37 more)
+
+### Community 191 - "issue-workspace-command-authz.test.ts"
 Cohesion: 0.12
-Nodes (7): PluginRouteToolGatewayDeps, backfillPendingActionRequestSignature(), ToolGatewayService, createRouteApp(), mcpHttpResponse(), mcpSseResponse(), mockToolsList()
+Nodes (14): createApp(), mockAccessService, mockAgentService, mockDb, mockDbSelect, mockDbSelectFrom, mockDbSelectWhere, mockExecutionWorkspaceService (+6 more)
 
-### Community 191 - "Community 191"
-Cohesion: 0.12
-Nodes (13): mockAccessService, mockAgentService, mockDb, mockDbSelect, mockDbSelectFrom, mockDbSelectWhere, mockExecutionWorkspaceService, mockFeedbackService (+5 more)
+### Community 192 - "heartbeat-pr-review-gate-replay.test.ts"
+Cohesion: 0.22
+Nodes (11): allyReview(), bodyAttestsToHead(), buildApp(), deliverFreshHeadSynchronize(), extractReviewedHeadSha(), FixtureReview, latestAllyReview(), NEW_HEAD_REVIEW (+3 more)
 
-### Community 192 - "Community 192"
-Cohesion: 0.13
-Nodes (17): isPrReviewRetryContext(), readHeartbeatRunErrorFamily(), readTransientRecoveryContractFromRun(), readTransientRetryNotBeforeFromRun(), RECOVERABLE_AGENT_STATUS_ERROR_CODES, selectAgedPrReviewRunForFairDispatch(), shouldScheduleAutomaticRunRetry(), bodyAttestsToHead() (+9 more)
+### Community 193 - "gbrain-client-factory.test.ts"
+Cohesion: 0.19
+Nodes (6): BearerSource, NullBearer, resolveBearerSource(), StaticBearer, clientWithFetch(), FAKE_CLIENTS_JSON
 
-### Community 193 - "Community 193"
-Cohesion: 0.28
-Nodes (5): createServerGbrainClient(), resolveBearerSource(), ServerGbrainCallError, clientWithFetch(), FAKE_CLIENTS_JSON
-
-### Community 194 - "Community 194"
+### Community 194 - "heartbeat-stop-metadata.ts"
 Cohesion: 0.24
 Nodes (13): isMaxTurnExhaustionRun(), buildHeartbeatRunStopMetadata(), defaultTimeoutSecForAdapter(), hasOwn(), HeartbeatRunOutcome, HeartbeatRunStopMetadata, HeartbeatRunStopReason, HeartbeatRunTimeoutPolicy (+5 more)
 
-### Community 195 - "Community 195"
+### Community 195 - "remote-http-endpoint-guard.ts"
 Cohesion: 0.20
 Nodes (11): assertPublicRemoteHttpEndpoint(), isPrivateOrReservedIp(), isPrivateOrReservedIpv4(), isPrivateOrReservedIpv6(), LookupResult, lookupWithTimeout(), parseIpv4Address(), parseMappedIpv4Hex() (+3 more)
 
-### Community 196 - "Community 196"
-Cohesion: 0.20
-Nodes (12): buildHeartbeatRunScratchEnv(), cleanupHeartbeatRunScratch(), HeartbeatRunScratch, HeartbeatRunScratchCleanupResult, HeartbeatRunScratchEnvResult, HeartbeatRunScratchMetadata, isPathInside(), prepareHeartbeatRunScratch() (+4 more)
+### Community 196 - "run-scratch.ts"
+Cohesion: 0.19
+Nodes (13): buildHeartbeatRunScratchEnv(), cleanupHeartbeatRunScratch(), HEARTBEAT_RUN_SCRATCH_MARKER, HeartbeatRunScratch, HeartbeatRunScratchCleanupResult, HeartbeatRunScratchEnvResult, HeartbeatRunScratchMetadata, isPathInside() (+5 more)
 
-### Community 197 - "Community 197"
-Cohesion: 0.09
-Nodes (31): findInvokablePrReviewerForTask(), __test_buildPrReviewerTaskKey, __test_buildPrReviewerTaskLockKeys, coalescePendingTaskScopeWake(), isSameTaskScope(), assertNotDuplicatePrReviewIssue(), buildPrReviewTaskKey(), configuredPrReviewerAgentIds() (+23 more)
-
-### Community 198 - "Community 198"
-Cohesion: 0.12
-Nodes (13): mockAccessService, mockAgentInstructionsService, mockApprovalService, mockBudgetService, mockCompanySkillService, mockEnvironmentService, mockHeartbeatService, mockInstanceSettingsService (+5 more)
-
-### Community 199 - "Community 199"
-Cohesion: 0.14
-Nodes (11): makeAgent(), makeReflectionCoachAgent(), mockAccessService, mockAgentInstructionsService, mockAgentService, mockBuiltInAgentService, mockEnvironmentService, mockFindServerAdapter (+3 more)
-
-### Community 200 - "Community 200"
-Cohesion: 0.13
-Nodes (13): mockAccessService, mockAgentService, mockEnvironmentService, mockExecutionWorkspaceService, mockFeedbackExportService, mockFeedbackService, mockHeartbeatService, mockInstanceSettingsService (+5 more)
-
-### Community 201 - "Community 201"
-Cohesion: 0.50
-Nodes (6): collapseDuplicatePendingHumanJoinRequests(), findReusableHumanJoinRequest(), humanJoinRequestIdentity(), JoinRequestLike, nonEmptyTrimmed(), normalizeJoinRequestEmail()
-
-### Community 202 - "Community 202"
-Cohesion: 0.17
-Nodes (12): isInfraClassStrandedFailure(), STRANDED_RECOVERY_MAX_OWNER_WAKE_ATTEMPTS, STRANDED_RECOVERY_OWNER_WAKE_HORIZON_MS, strandedRecoveryWakeAttemptsExhausted(), createApp(), from(), seedAdoptedCheckout(), seedBacklogRecovery() (+4 more)
-
-### Community 203 - "Community 203"
-Cohesion: 0.20
-Nodes (9): EMPTY_ROSTER, MetricsIngestOptions, metricsIngestRoutes(), readGuardIds(), readString(), cache, CacheEntry, getActiveAgentIds() (+1 more)
-
-### Community 204 - "Community 204"
-Cohesion: 0.24
-Nodes (11): AdapterRegistryEnv, parseAdapterRegistryEnv(), KubernetesEnvironmentConfigInput, applyExecutionPolicyBootstrap(), bootstrapExecutionPolicyFromEnv(), ExecutionPolicyBootstrap, ExecutionPolicyBootstrapEnv, parseBool() (+3 more)
-
-### Community 205 - "Community 205"
-Cohesion: 0.22
-Nodes (10): AUTHORED_LOC_EXCLUSION_RULES, AuthoredLocResult, basename(), computeAuthoredLoc(), ExclusionRule, GithubPullFile, isExcludedFromAuthoredLoc(), LOCKFILE_BASENAMES (+2 more)
-
-### Community 206 - "Community 206"
+### Community 197 - "pr-review-duplicate-issue-guard.ts"
 Cohesion: 0.18
-Nodes (11): AuthbotCredentialEnvelope, AuthbotCredentialResponse, ClientsFile, HttpServerGbrainClient, JsonRpcResponse, OAuthMintBearerOpts, parseGbrainErrorPayload(), parseMcpResponseBody() (+3 more)
+Nodes (21): readGithubPrReviewerAgentIds(), assertNotDuplicatePrReviewIssue(), buildPrReviewTaskKey(), candidatePullRequestRefs(), configuredPrReviewerAgentIds(), declaresNotAReviewRequest(), DuplicatePrReviewIssueGuardDb, DuplicatePrReviewIssueOptions (+13 more)
 
-### Community 207 - "Community 207"
-Cohesion: 0.17
-Nodes (3): issuePath(), SOURCE_KIND_ORDER, sourceHref()
-
-### Community 208 - "Community 208"
-Cohesion: 0.13
-Nodes (17): AgentInboxLiteInput, InboxIssue, IssuesService, loadAgentInboxLite(), RecoveryActionsService, WorktreeRunExecutionActivationState, ActiveRunSignals, isIssueHeldByForeignRun() (+9 more)
-
-### Community 209 - "Community 209"
-Cohesion: 0.22
-Nodes (9): emitter, LiveEventListener, LiveEventPayload, publishGlobalLiveEvent(), publishLiveEvent(), toLiveEvent(), normalizeResponsibleUserDenialCode(), recordResponsibleUserDenialOnActiveRun() (+1 more)
-
-### Community 210 - "Community 210"
-Cohesion: 0.09
-Nodes (17): LifecycleLike, PluginHostServiceCleanupController, PluginWorkerRuntimeEvent, LifecycleEventName, LifecycleEventPayload, PluginLifecycleEvents, PluginLifecycleManagerOptions, VALID_TRANSITIONS (+9 more)
-
-### Community 212 - "Community 212"
-Cohesion: 0.14
-Nodes (11): mockAccessService, mockAgentService, mockDocumentsService, mockHeartbeatService, mockInstanceSettingsService, mockIssueService, mockIssueThreadInteractionService, mockLogActivity (+3 more)
-
-### Community 213 - "Community 213"
-Cohesion: 0.14
-Nodes (11): mockAccessService, mockAssertCanManageExecutionWorkspaceRuntimeServices, mockAssertCanManageProjectWorkspaceRuntimeServices, mockEnvironmentService, mockExecutionWorkspaceService, mockGetTelemetryClient, mockHeartbeatService, mockLogActivity (+3 more)
-
-### Community 214 - "Community 214"
+### Community 198 - "adapter-model-refresh-routes.test.ts"
 Cohesion: 0.11
-Nodes (33): AgedReviewRequest, AgedReviewRequestReport, AgeingPullRequest, AGENT_AUTHOR_LOGINS, AGENT_AUTHOR_SET, ALLY_REVIEW_IDENTITY_LOGINS, ALLY_REVIEW_IDENTITY_SET, ANSWERING_REVIEW_STATES (+25 more)
+Nodes (14): createApp(), mockAccessService, mockAgentInstructionsService, mockApprovalService, mockBudgetService, mockCompanySkillService, mockEnvironmentService, mockHeartbeatService (+6 more)
 
-### Community 215 - "Community 215"
+### Community 199 - "agent-instructions-routes.test.ts"
+Cohesion: 0.12
+Nodes (13): createApp(), makeAgent(), makeReflectionCoachAgent(), mockAccessService, mockAgentInstructionsService, mockAgentService, mockBuiltInAgentService, mockCompanySkillService (+5 more)
+
+### Community 200 - "issue-feedback-routes.test.ts"
+Cohesion: 0.12
+Nodes (14): createApp(), mockAccessService, mockAgentService, mockEnvironmentService, mockExecutionWorkspaceService, mockFeedbackExportService, mockFeedbackService, mockHeartbeatService (+6 more)
+
+### Community 201 - "routes/dashboard.ts"
+Cohesion: 0.14
+Nodes (18): collapseDuplicatePendingHumanJoinRequests(), findReusableHumanJoinRequest(), humanJoinRequestIdentity(), JoinRequestLike, nonEmptyTrimmed(), normalizeJoinRequestEmail(), dashboardRoutes(), parsePositiveNumber() (+10 more)
+
+### Community 202 - "issue-recovery-actions.test.ts"
+Cohesion: 0.04
+Nodes (43): backstopSweepCompletionPath, RECOVERY_SWEEP_COVERED_ISSUE_STATUSES, STRANDED_ASSIGNED_ISSUE_STATUSES, STRANDED_RECOVERY_WAKE_BACKSTOP_FOLD_ONLY_STATUSES, STRANDED_RECOVERY_WAKE_BACKSTOP_ISSUE_STATUSES, summarizeStrandedRecoveryHandBackPass(), createApp(), mockAccessDecide (+35 more)
+
+### Community 203 - "metrics-ingest.ts"
+Cohesion: 0.10
+Nodes (24): EMPTY_ROSTER, logGuardDecision(), MetricsIngestOptions, metricsIngestRoutes(), resolveRoster(), readGuardIds(), readString(), cache (+16 more)
+
+### Community 204 - "adapter-registry-bootstrap.ts"
+Cohesion: 0.23
+Nodes (9): listServerAdapters(), AdapterRegistryEnv, parseAdapterRegistryEnv(), setAdapterDisabled, reconcileAdapterAvailability(), ENTRY, fetchAllQuotaWindows(), providerSlugForAdapterType() (+1 more)
+
+### Community 205 - "builtInAgentService"
+Cohesion: 0.12
+Nodes (48): builtInAgentService(), autoProvisionBundledAgents(), bundleResourceStates(), createOrResetRoutine(), currentInstructionFiles(), defaultProvisionInput(), ensure(), ensureAgentDefaultGrants() (+40 more)
+
+### Community 206 - "gbrain-client-factory.ts"
+Cohesion: 0.15
+Nodes (12): AuthbotCredentialEnvelope, AuthbotCredentialResponse, ClientsFile, HttpServerGbrainClient, JsonRpcResponse, OAuthMintBearerOpts, parseGbrainErrorPayload(), parseMcpResponseBody() (+4 more)
+
+### Community 207 - "issueReferenceService"
+Cohesion: 0.15
+Nodes (20): diffIssueSummaries(), emptySummary(), issuePath(), issueReferenceService(), issueById(), listIssueReferenceSummary(), replaceSourceMentions(), syncAllForCompany() (+12 more)
+
+### Community 208 - "agent-inbox-lite.ts"
+Cohesion: 0.04
+Nodes (49): ISSUE_LIST_APPLIED_LIMIT_HEADER, ISSUE_LIST_TRUNCATED_HEADER, issueListProbeLimit(), parseUnsupportedPaginationParams(), parseUnsupportedTimeFilterParams(), resolveIssueListTruncation(), TIME_FILTER_PARAM_PATTERN, AGENT_INBOX_LITE_STATUS_FILTER (+41 more)
+
+### Community 209 - "pipelineService"
+Cohesion: 0.08
+Nodes (41): redactRunError(), activityActorPatch(), assertReviewTargetsInSet(), descendantCaseIds(), getAncestorCases(), getCaseWithStageForUpdateOrThrow(), getCaseWithStageOrThrow(), PipelinePermissionPreflightError (+33 more)
+
+### Community 210 - "PluginWorkerManager"
+Cohesion: 0.07
+Nodes (18): PluginRouteWebhookDeps, isValidTransition(), LifecycleEventName, LifecycleEventPayload, PluginLifecycleEvents, pluginLifecycleManager, assertTransition(), deactivatePluginRuntime() (+10 more)
+
+### Community 212 - "issue-document-restore-routes.test.ts"
+Cohesion: 0.13
+Nodes (12): createApp(), mockAccessService, mockAgentService, mockDocumentsService, mockHeartbeatService, mockInstanceSettingsService, mockIssueService, mockIssueThreadInteractionService (+4 more)
+
+### Community 213 - "workspace-runtime-routes-authz.test.ts"
+Cohesion: 0.13
+Nodes (14): createExecutionWorkspaceApp(), createProjectApp(), mockAccessService, mockAssertCanManageExecutionWorkspaceRuntimeServices, mockAssertCanManageProjectWorkspaceRuntimeServices, mockEnvironmentService, mockExecutionWorkspaceService, mockGetTelemetryClient (+6 more)
+
+### Community 214 - "pr-review-request-ageing.ts"
+Cohesion: 0.12
+Nodes (32): AgedReviewRequest, AgedReviewRequestReport, AgeingPullRequest, AGENT_AUTHOR_LOGINS, AGENT_AUTHOR_SET, ALLY_REVIEW_IDENTITY_LOGINS, ALLY_REVIEW_IDENTITY_SET, ANSWERING_REVIEW_STATES (+24 more)
+
+### Community 215 - "dev-runner-worktree.ts"
 Cohesion: 0.29
 Nodes (10): bootstrapDevRunnerWorktreeEnv(), expandHomePrefix(), isLinkedGitWorktreeCheckout(), parseEnvFile(), repairStaleMigratedWorktreeEnvEntries(), resolveDefaultWorktreeHome(), resolveHomeAwarePath(), resolveWorktreeEnvFilePath() (+2 more)
 
-### Community 216 - "Community 216"
-Cohesion: 0.24
-Nodes (10): DevServerHealthStatus, DevServerRestartRequest, getDevServerRestartRequestFilePath(), normalizeStringArray(), normalizeTimestamp(), PersistedDevServerStatus, readPersistedDevServerStatus(), toDevServerHealthStatus() (+2 more)
+### Community 216 - "dev-server-status.ts"
+Cohesion: 0.23
+Nodes (10): DevServerHealthStatus, DevServerRestartRequest, getDevServerRestartRequestFilePath(), normalizeStringArray(), normalizeTimestamp(), PersistedDevServerStatus, readPersistedDevServerStatus(), writeDevServerRestartRequest() (+2 more)
 
-### Community 217 - "Community 217"
+### Community 217 - "openapi-routes.test.ts"
 Cohesion: 0.15
-Nodes (18): buildOpenApiSpec, openApiRoutes(), apiPrefixes, CONDITIONAL_INSTANCE_ADMIN_OPERATIONS, createApp(), __dirname, explicitOpenApiCoverageExclusions, HTTP_METHODS (+10 more)
+Nodes (19): buildOpenApiSpec, openApiRoutes(), apiPrefixes, CONDITIONAL_INSTANCE_ADMIN_OPERATIONS, createApp(), __dirname, explicitOpenApiCoverageExclusions, HTTP_METHODS (+11 more)
 
-### Community 218 - "Community 218"
-Cohesion: 0.29
-Nodes (3): sweepWakeFrameSlug(), mockAdapterExecute, mockGbrainCall
+### Community 218 - "body"
+Cohesion: 0.05
+Nodes (22): BLOCKED_AUTO_RESUME_SUPPRESSING_RECOVERY_ACTION_STATUSES, CCROTATE_CAPACITY_DEFERRED_METRIC, EXECUTION_WORKSPACE_CLEANUP_REASONS, EXECUTION_WORKSPACE_COLLECTOR_CANDIDATES_METRIC, EXECUTION_WORKSPACE_COLLECTOR_LAST_PASS_METRIC, EXECUTION_WORKSPACE_COLLECTOR_OUTCOMES, EXECUTION_WORKSPACE_COLLECTOR_SCANNED_METRIC, EXECUTION_WORKSPACE_COLLECTOR_STAMPED_METRIC (+14 more)
 
-### Community 219 - "Community 219"
-Cohesion: 0.22
+### Community 219 - "execution-allowlist.ts"
+Cohesion: 0.23
 Nodes (11): evaluateExecutionAllowlist(), ExecutionAllowlistDecision, ExecutionEnvironmentCandidate, ExecutionPolicy, isExecutionForcedToKubernetes(), isKubernetesSandboxEnvironment(), KUBERNETES_PROVIDER_KEY, fakeSandboxEnv (+3 more)
 
-### Community 220 - "Community 220"
+### Community 220 - "pluginManagedRoutineService"
+Cohesion: 0.22
+Nodes (22): buildRoutineDefaults(), managedByPlugin(), normalizeRef(), pluginManagedRoutineService(), createManagedRoutine(), declarationFor(), ensureDefaultTriggers(), get() (+14 more)
+
+### Community 221 - "extractWakeCommentIds"
+Cohesion: 0.21
+Nodes (11): extractWakeCommentIds(), buildPaperclipWakePayload(), authorFrom(), buildPlanReviewContext(), BuildPlanReviewContextInput, getPlanInteractionContext(), nonEmptyString(), PLAN_REVIEW_CONTEXT_LIMITS (+3 more)
+
+### Community 222 - "github-write-egress-scrub.test.ts"
 Cohesion: 0.08
-Nodes (27): unprocessable(), noopTaskWatchdogService(), actorForMutation(), fetchBinary(), fetchJson(), fetchOptionalText(), fetchText(), fetchJson() (+19 more)
+Nodes (29): _resetInstallationTokenCache(), Coverage, repoRoot, scannedServerFilesWritingToGitHub(), scannedServerSourceFiles(), SERVER_WRITE_COVERAGE, serverSourceDirectory, servicesDirectory (+21 more)
 
-### Community 221 - "Community 221"
-Cohesion: 0.26
-Nodes (7): buildPlanReviewContext(), BuildPlanReviewContextInput, getPlanInteractionContext(), nonEmptyString(), PLAN_REVIEW_CONTEXT_LIMITS, readPlanTarget(), readResult()
+### Community 223 - "transitionCaseInTransaction"
+Cohesion: 0.10
+Nodes (39): actorOwnsLease(), adjustParentCounts(), assertActorCanApproveStageExit(), assertJsonSize(), assertLatestReviewApprovalStillCurrent(), assertLeaseAvailable(), assertNoOpenBlockers(), assertStageEnabled() (+31 more)
 
-### Community 222 - "Community 222"
+### Community 224 - "visibleIssueCondition"
+Cohesion: 0.09
+Nodes (38): visibleIssueCondition(), buildLivenessEscalationDescription(), buildLivenessOriginalIssueComment(), formatDependencyPath(), issueIdFromRunContext(), issueIdFromWakePayload(), isUniqueLivenessRecoveryConflict(), livenessRecoveryLeafFingerprint() (+30 more)
+
+### Community 225 - "isolation-workspace-reaper.test.ts"
+Cohesion: 0.08
+Nodes (34): createDbWorkspaceUsageLookup(), DEFAULT_ISOLATION_WORKSPACE_ROOT, DEFAULT_MAX_DELETES_PER_TICK, defaultScheduler, hasNestedCheckout(), IsolationWorkspaceReaperScheduler, IsolationWorkspaceReapOptions, IsolationWorkspaceReapResult (+26 more)
+
+### Community 226 - "ac-policy-sweep.ts"
+Cohesion: 0.11
+Nodes (20): AcPolicyCandidateClassification, AcPolicyIssueRef, AcPolicyStaleCandidate, classifyAcPolicyStaleCandidate(), formatAcPolicyStaleDashboardSections(), formatHumanClock(), formatIssueRef(), partitionAcPolicyStaleCandidates() (+12 more)
+
+### Community 227 - "environment-custom-image-terminal-sessions.ts"
+Cohesion: 0.12
+Nodes (18): readFutureDate(), readNullableDate(), requireFutureCustomImageSetupExpiry(), EnvironmentCustomImageTerminalConnectionClose, EnvironmentCustomImageTerminalPayloadValidationFailureCode, EnvironmentCustomImageTerminalPayloadValidationResult, environmentCustomImageTerminalSessionStore, hashTerminalSessionToken() (+10 more)
+
+### Community 228 - "feedback-redaction.ts"
 Cohesion: 0.17
-Nodes (9): FakeBatchV1Api, FakeCoreV1Api, FakeKubeConfig, mockDeleteNamespacedJob, mockListNamespacedJob, mockListNamespacedPod, mockReadNamespacedJob, mockRereadAs() (+1 more)
+Nodes (25): appendNote(), buildClaudeTraceFiles(), buildCodexTraceFiles(), buildExportId(), buildFeedbackTraceBundleFromRow(), buildOpenCodeTraceFiles(), findMatchingFile(), search() (+17 more)
 
-### Community 223 - "Community 223"
-Cohesion: 0.16
-Nodes (13): DexRbacConfig, GroupClaimRbacConfig, loadDexRbacConfig(), normalizeGroup(), parseIdTokenGroups(), reconcileDexUser(), reconcileGroupClaimUser(), ReconcileResult (+5 more)
+### Community 229 - "plugin-managed-agents.ts"
+Cohesion: 0.19
+Nodes (27): adapterPreference(), applyInstructionTemplateVariables(), bindingExternalId(), declarationPatch(), declaredInstructionFiles(), fallbackAdapterType(), managedMetadata(), normalizeAdapterType() (+19 more)
 
-### Community 224 - "Community 224"
+### Community 230 - "plugin-managed-skills.ts"
+Cohesion: 0.21
+Nodes (22): buildDeclaredSkillFiles(), buildDefaultMarkdown(), buildPackageFiles(), buildSkillDefaults(), canonicalSkillKey(), pluginKeySlug(), pluginManagedSkillService(), declarationFor() (+14 more)
+
+### Community 231 - "execution-workspace-per-run-isolation.test.ts"
+Cohesion: 0.38
+Nodes (5): createTempRepo(), execFileAsync, realizeRun(), runGit(), tempRoots
+
+### Community 232 - "approval-routes-idempotency.test.ts"
 Cohesion: 0.17
-Nodes (11): 1. Identity and Context, 2. Local Planning Check, 3. Approval Follow-Up, 4. Get Assignments, 5. Checkout and Work, 6. Delegation, 7. Fact Extraction, 8. Exit (+3 more)
+Nodes (13): createAgentApp(), createApp(), createRouteDb(), fileLivenessEscalation(), mockAccessService, mockApprovalService, mockDeferredActivityPublish, mockEscalationCreate() (+5 more)
 
-### Community 225 - "Community 225"
-Cohesion: 0.23
-Nodes (10): buildInviteOnboardingManifest(), buildInviteOnboardingTextDocument(), buildOnboardingConnectionCandidates(), buildOnboardingDiscoveryDiagnostics(), extractInviteHumanRole(), extractInviteMessage(), isLoopbackHost(), normalizeHostname() (+2 more)
+### Community 233 - "approval-withdraw-routes.test.ts"
+Cohesion: 0.18
+Nodes (9): boardActor, createAppWithActor(), createRouteDb(), mockAccessService, mockApprovalService, mockHeartbeatService, mockIssueApprovalService, mockLogActivity (+1 more)
 
-### Community 226 - "Community 226"
-Cohesion: 0.27
-Nodes (10): AcPolicyCandidateClassification, AcPolicyIssueRef, AcPolicyStaleCandidate, classifyAcPolicyStaleCandidate(), formatAcPolicyStaleDashboardSections(), formatHumanClock(), formatIssueRef(), partitionAcPolicyStaleCandidates() (+2 more)
+### Community 234 - "company-portability.test.ts"
+Cohesion: 0.08
+Nodes (17): accessSvc, agentInstructionsSvc, agentSvc, assetSvc, companySkillSvc, companySvc, issueSvc, projectSvc (+9 more)
 
-### Community 227 - "Community 227"
-Cohesion: 0.17
-Nodes (17): terminalPayloadValidationError(), validateTerminalUpgrade(), readCustomImageSetupSessionCompanyId(), readFutureDate(), readNullableDate(), requireFutureCustomImageSetupExpiry(), EnvironmentCustomImageTerminalConnectionClose, EnvironmentCustomImageTerminalPayloadValidationFailureCode (+9 more)
+### Community 235 - "docker-opencode-runtime-pin.test.ts"
+Cohesion: 0.13
+Nodes (13): agentRuntimeBake, agentRuntimeImagesWorkflow, designerDockerfile, designerPackageLock, dockerAgentWorkflow, dockerDesignerWorkflow, dockerWorkflow, prWorkflow (+5 more)
 
-### Community 228 - "Community 228"
-Cohesion: 0.16
-Nodes (21): buildExportId(), buildIssueContext(), buildIssuePath(), buildPayloadArtifacts(), listIssueContextItems(), applyPattern(), createFeedbackRedactionState(), FeedbackRedactionState (+13 more)
-
-### Community 229 - "Community 229"
-Cohesion: 0.24
-Nodes (6): adapterPreference(), declarationPatch(), fallbackAdapterType(), normalizeAdapterType(), PluginManagedAgentServiceOptions, selectPreferredAdapterType()
-
-### Community 230 - "Community 230"
-Cohesion: 0.30
-Nodes (9): buildDeclaredSkillFiles(), buildDefaultMarkdown(), buildPackageFiles(), buildSkillDefaults(), canonicalSkillKey(), pluginKeySlug(), PluginManagedSkillServiceOptions, withManagedSkillKey() (+1 more)
-
-### Community 231 - "Community 231"
-Cohesion: 0.20
-Nodes (10): applyIssueIdentifierToBranchName(), applyRunScopeToBranchName(), buildDirtyQuarantineRescueBranch(), formatUtcBranchTimestamp(), sanitizeBranchName(), createTempRepo(), execFileAsync, realizeRun() (+2 more)
-
-### Community 232 - "Community 232"
-Cohesion: 0.20
-Nodes (7): mockAccessService, mockApprovalService, mockDeferredActivityPublish, mockHeartbeatService, mockIssueApprovalService, mockLogActivity, mockSecretService
-
-### Community 233 - "Community 233"
-Cohesion: 0.17
-Nodes (8): boardActor, createRouteDb(), mockAccessService, mockApprovalService, mockHeartbeatService, mockIssueApprovalService, mockLogActivity, mockSecretService
-
-### Community 234 - "Community 234"
-Cohesion: 0.17
-Nodes (10): accessSvc, agentInstructionsSvc, agentSvc, assetSvc, companySkillSvc, companySvc, issueSvc, projectSvc (+2 more)
-
-### Community 235 - "Community 235"
-Cohesion: 0.17
-Nodes (11): agentRuntimeBake, agentRuntimeImagesWorkflow, designerDockerfile, designerPackageLock, dockerAgentWorkflow, dockerDesignerWorkflow, dockerWorkflow, prWorkflow (+3 more)
-
-### Community 236 - "Community 236"
+### Community 236 - "done-gate-durable-artifact.test.ts"
 Cohesion: 0.17
 Nodes (3): createApp(), LOW_TRUST_REVIEW_PRESET, patchToDone()
 
-### Community 237 - "Community 237"
+### Community 237 - "environment-selection-route-guards.test.ts"
 Cohesion: 0.20
 Nodes (10): buildApp(), createIssueApp(), createProjectApp(), mockCompanyService, mockEnvironmentService, mockIssueReferenceService, mockIssueService, mockLogActivity (+2 more)
 
-### Community 238 - "Community 238"
-Cohesion: 0.17
-Nodes (9): mockAccessDecide, mockDb, mockDbSelect, mockDbSelectFrom, mockDbSelectWhere, mockHeartbeatService, mockInteractionService, mockIssueService (+1 more)
+### Community 238 - "issue-thread-interaction-routes.test.ts"
+Cohesion: 0.15
+Nodes (10): createApp(), mockAccessDecide, mockDb, mockDbSelect, mockDbSelectFrom, mockDbSelectWhere, mockHeartbeatService, mockInteractionService (+2 more)
 
-### Community 239 - "Community 239"
-Cohesion: 0.17
-Nodes (10): mockAccessService, mockAnnotationService, mockGetTelemetryClient, mockLogActivity, mockRoutineService, mockTrackRoutineCreated, pausedRoutine, revision (+2 more)
+### Community 239 - "routines-routes.test.ts"
+Cohesion: 0.15
+Nodes (11): createApp(), mockAccessService, mockAnnotationService, mockGetTelemetryClient, mockLogActivity, mockRoutineService, mockTrackRoutineCreated, pausedRoutine (+3 more)
 
-### Community 240 - "Community 240"
-Cohesion: 0.09
-Nodes (20): announcementBody(), ApprovalGateReconcileResult, ApprovalGateReconcilerOptions, ApprovalGateReconcilerScheduler, CandidateCursor, CandidateRow, classifyGateLookup(), closeAndAnnounce() (+12 more)
+### Community 240 - "approval-gate-reconciler.ts"
+Cohesion: 0.11
+Nodes (22): announcementBody(), announcementIdempotencyKey(), announcementMetadata(), ApprovalGateReconcileResult, ApprovalGateReconcilerOptions, ApprovalGateReconcilerScheduler, CandidateCursor, CandidateRow (+14 more)
 
-### Community 241 - "Community 241"
-Cohesion: 0.10
-Nodes (21): createIssueDependencyReadiness(), findBlockedPromotionsAwaitingUserInput(), listBlockedIssueAutoResumeSuppressions(), listIssueDependencyReadinessMap(), listPendingFinalizeBlockerIssueIds(), recordBlockedPromotionAwaitingUserSkip(), CandidateCursor, CandidateRow (+13 more)
+### Community 241 - "stranded-blocked-issue-reconciler.ts"
+Cohesion: 0.07
+Nodes (35): createIssueDependencyReadiness(), externalWaitFromDescription(), hasValidBlockerMonitor(), listBlockedIssueAutoResumeSuppressions(), listCurrentBlockerIssueIdsFor(), listIssueDependencyReadinessMap(), listPendingFinalizeBlockerIssueIds(), lockIssuesForUpdate() (+27 more)
 
-### Community 242 - "Community 242"
+### Community 242 - "buildOpenApiDocument"
 Cohesion: 0.20
-Nodes (7): buildOpenApiDocument(), jsonBody(), normalizeContent(), normalizeResponses(), OpenAPIRegistry, paramsSchemaFromPath(), registerCurrentRoute()
+Nodes (8): buildOpenApiDocument(), isZodSchema(), jsonBody(), normalizeContent(), normalizeResponses(), OpenAPIRegistry, paramsSchemaFromPath(), registerCurrentRoute()
 
-### Community 243 - "Community 243"
+### Community 243 - "workspace-command-authz.ts"
 Cohesion: 0.51
 Nodes (10): collectAgentAdapterWorkspaceCommandPaths(), collectExecutionWorkspaceCommandPaths(), collectExecutionWorkspaceConfigCommandPaths(), collectIssueWorkspaceCommandPaths(), collectProjectExecutionWorkspaceCommandPaths(), collectProjectWorkspaceCommandPaths(), collectWorkspaceStrategyCommandPaths(), hasOwn() (+2 more)
 
-### Community 244 - "Community 244"
+### Community 244 - "runtime-api.ts"
 Cohesion: 0.56
 Nodes (9): buildRuntimeApiCandidateUrls(), choosePrimaryRuntimeApiUrl(), collectReachableInterfaceHosts(), formatOrigin(), isLinkLocalHost(), isLoopbackHost(), isWildcardHost(), normalizeHost() (+1 more)
 
-### Community 245 - "Community 245"
-Cohesion: 0.29
-Nodes (7): main(), readStdin(), LinearWebhookFixture, loadLinearWebhookFixtures(), sanitizeLinearWebhookFixture(), sanitizeLinearWebhookValue(), SECRET_HEADER_NAMES
-
-### Community 246 - "Community 246"
-Cohesion: 0.22
-Nodes (9): routineRoutes(), documentAnnotationService(), pluginManagedRoutineService(), routineService(), createApp(), createApp(), seedFixture(), createApp() (+1 more)
-
-### Community 247 - "Community 247"
+### Community 245 - "pluginRegistryService"
 Cohesion: 0.10
-Nodes (15): BlockerResolvedWakeMetricKey, counters, getBlockerResolvedWakeMetric(), incrementBlockerResolvedWakeMetric(), resetBlockerResolvedWakeMetrics(), snapshotBlockerResolvedWakeMetrics(), counters, DepBlockedMetricKey (+7 more)
+Nodes (15): main(), readStdin(), LinearWebhookFixture, loadLinearWebhookFixtures(), sanitizeLinearWebhookFixture(), sanitizeLinearWebhookValue(), SECRET_HEADER_NAMES, listReadyPluginEnvironmentDrivers() (+7 more)
 
-### Community 248 - "Community 248"
+### Community 246 - "routineService"
+Cohesion: 0.08
+Nodes (36): incrementRoutineDispatchMetric(), mapRoutineDescriptionDocument(), mapRoutineRevision(), nextResultText(), normalizeWebhookTimestampMs(), routineService(), appendRoutineRevision(), assertRoutineAccess() (+28 more)
+
+### Community 247 - "renderMetrics"
+Cohesion: 0.03
+Nodes (53): BlockerResolvedWakeMetricKey, counters, getBlockerResolvedWakeMetric(), resetBlockerResolvedWakeMetrics(), snapshotBlockerResolvedWakeMetrics(), AGENT_START_LOCK_REAP_DISPOSITION_METRIC, CRASH_RECOVERY_CANDIDATE_INDEX_NAME, CRASH_RECOVERY_CANDIDATE_INDEX_PRESENT_METRIC (+45 more)
+
+### Community 248 - "codex-auth-reconciliation.ts"
 Cohesion: 0.31
-Nodes (7): ApiKeyBinding, asRecord(), classifyApiKeyBinding(), CodexAuthReconciliationSummary, readPlainEnvValue(), reconcileCodexLocalManagedHomesOnStartup(), AgentRow
+Nodes (8): ApiKeyBinding, asRecord(), classifyApiKeyBinding(), CodexAuthReconciliationSummary, readPlainEnvValue(), reconcileCodexLocalManagedHomesOnStartup(), AgentRow, managedAgentHome()
 
-### Community 249 - "Community 249"
-Cohesion: 0.11
-Nodes (27): appendSkillExportDirSuffix(), asBoolean(), asInteger(), asString(), buildLegacyRoutineTriggerFromRecurrence(), buildSkillExportDirMap(), deriveLocalExportNamespace(), deriveManifestSkillKey() (+19 more)
+### Community 249 - "isPlainRecord"
+Cohesion: 0.19
+Nodes (28): asBoolean(), asString(), buildManifestFromPackageFiles(), buildPortableCatalogProvenance(), buildYamlFile(), clonePortableRecord(), deriveManifestSkillKey(), derivePortableCommentAuthorType() (+20 more)
 
-### Community 250 - "Community 250"
-Cohesion: 0.24
-Nodes (7): composeAgentsMdWithPreflight(), DEFAULT_AGENT_BUNDLE_FILES, DefaultAgentBundleRole, loadDefaultAgentInstructionsBundle(), loadWakePreflightContent(), resolveDefaultAgentInstructionsBundleRole(), WAKE_PREFLIGHT_URL
+### Community 250 - "terminal-gate-reconciler.ts"
+Cohesion: 0.10
+Nodes (29): PullRequestGateResult, buildInitialIssueMonitorFields(), exhaustedMonitorClearReason(), issueAllowsMonitor(), parseMonitorDate(), buildTerminalGateResolvedComment(), CandidateRow, defaultScheduler (+21 more)
 
-### Community 251 - "Community 251"
-Cohesion: 0.33
-Nodes (9): computeReconcilerWindow(), ReconcileFn, ReconcileResult, reconcilerSweepTick(), ReconcilerTarget, runReconcilerSweep(), selectReconcilerTargets(), SweepResult (+1 more)
+### Community 251 - "reconcileStrandedRecoveryWakeBackstopImpl"
+Cohesion: 0.08
+Nodes (31): findExistingIssueBlockersResolvedWakeForAnyKey(), recordBackstopCandidateSkipped(), recordBackstopSweepCompleted(), setBackstopDeferredCandidates(), ActivePauseHoldPrefilter, ActivePauseHoldPrefilterStats, createActivePauseHoldPrefilter(), DEFAULT_ACTIVE_PAUSE_HOLD_PREFILTER_TTL_MS (+23 more)
 
-### Community 252 - "Community 252"
-Cohesion: 0.13
-Nodes (10): createLocalFileWorkspaceOperationLogStore(), getWorkspaceOperationLogStore(), WorkspaceOperationLogFinalizeSummary, WorkspaceOperationLogHandle, WorkspaceOperationLogReadOptions, WorkspaceOperationLogReadResult, WorkspaceOperationLogStore, WorkspaceOperationLogStoreType (+2 more)
+### Community 252 - "workspace-operation-log-store.ts"
+Cohesion: 0.12
+Nodes (11): createLocalFileWorkspaceOperationLogStore(), ensureDir(), readFileRange(), getWorkspaceOperationLogStore(), resolveWithin(), WorkspaceOperationLogFinalizeSummary, WorkspaceOperationLogHandle, WorkspaceOperationLogReadOptions (+3 more)
 
-### Community 253 - "Community 253"
-Cohesion: 0.17
-Nodes (11): externalAdapter, mockAccessService, mockAgentService, mockEnvironmentRuntime, mockEnvironmentService, mockInstanceSettingsService, mockReleaseRunLease, mockResolveEnvironmentExecutionTarget (+3 more)
-
-### Community 254 - "Community 254"
-Cohesion: 0.18
-Nodes (9): annotationComment, annotationThread, documentPayload, mockAnnotationService, mockDocumentService, mockHeartbeatService, mockIssueReferenceService, mockIssueService (+1 more)
-
-### Community 255 - "Community 255"
-Cohesion: 0.18
-Nodes (5): mockAccessService, mockAgentService, mockExternalObjectsService, mockInstanceSettingsService, mockIssueService
-
-### Community 256 - "Community 256"
-Cohesion: 0.18
-Nodes (8): defaultBoardActor, mockAccessService, mockFeedbackService, mockHeartbeatService, mockInstanceSettingsService, mockIssueService, mockLogActivity, mockRoutineService
-
-### Community 257 - "Community 257"
+### Community 253 - "agent-test-environment-routes.test.ts"
 Cohesion: 0.15
-Nodes (25): buildPortableProjectWorkspaces(), buildYamlFile(), clonePortableRecord(), collectSelectedExportSlugs(), containsAbsolutePathFragment(), containsSystemDependentPathValue(), disableImportedTimerHeartbeat(), exportPortableProjectExecutionWorkspacePolicy() (+17 more)
+Nodes (12): createApp(), externalAdapter, mockAccessService, mockAgentService, mockEnvironmentRuntime, mockEnvironmentService, mockInstanceSettingsService, mockReleaseRunLease (+4 more)
 
-### Community 258 - "Community 258"
+### Community 254 - "document-annotation-routes.test.ts"
+Cohesion: 0.17
+Nodes (10): annotationComment, annotationThread, createApp(), documentPayload, mockAnnotationService, mockDocumentService, mockHeartbeatService, mockIssueReferenceService (+2 more)
+
+### Community 255 - "external-object-routes.test.ts"
 Cohesion: 0.18
-Nodes (8): mockAgentService, mockDb, mockDbSelect, mockDbSelectFrom, mockDbSelectWhere, mockGetTelemetryClient, mockIssueService, mockTrackAgentTaskCompleted
+Nodes (7): createApp(), makeIssue(), mockAccessService, mockAgentService, mockExternalObjectsService, mockInstanceSettingsService, mockIssueService
 
-### Community 259 - "Community 259"
-Cohesion: 0.18
-Nodes (9): mockAccessService, mockEnvironmentService, mockGetTelemetryClient, mockGoalService, mockLogActivity, mockProjectService, mockSecretService, mockTelemetryTrack (+1 more)
+### Community 256 - "issue-activity-events-routes.test.ts"
+Cohesion: 0.17
+Nodes (9): createApp(), defaultBoardActor, mockAccessService, mockFeedbackService, mockHeartbeatService, mockInstanceSettingsService, mockIssueService, mockLogActivity (+1 more)
 
-### Community 260 - "Community 260"
-Cohesion: 0.18
-Nodes (9): annotationComment, annotationThread, descriptionDocument, mockAnnotationService, mockLogActivity, mockRoutineService, routine, selector (+1 more)
+### Community 257 - "renderYamlBlock"
+Cohesion: 0.25
+Nodes (11): buildMarkdown(), buildReferencedSkillMarkdown(), buildSkillSourceEntry(), compareYamlKeys(), isEmptyObject(), orderedYamlEntries(), renderFrontmatter(), renderYamlBlock() (+3 more)
 
-### Community 261 - "Community 261"
-Cohesion: 0.18
-Nodes (7): agentActor, boardActor, mockAccessService, mockHeartbeatWakeup, mockInstanceSettingsService, mockLogActivity, mockSummarySlotService
+### Community 258 - "issue-telemetry-routes.test.ts"
+Cohesion: 0.17
+Nodes (9): createApp(), mockAgentService, mockDb, mockDbSelect, mockDbSelectFrom, mockDbSelectWhere, mockGetTelemetryClient, mockIssueService (+1 more)
 
-### Community 262 - "Community 262"
+### Community 259 - "project-goal-telemetry-routes.test.ts"
+Cohesion: 0.17
+Nodes (10): createApp(), mockAccessService, mockEnvironmentService, mockGetTelemetryClient, mockGoalService, mockLogActivity, mockProjectService, mockSecretService (+2 more)
+
+### Community 260 - "routine-document-annotation-routes.test.ts"
+Cohesion: 0.17
+Nodes (10): annotationComment, annotationThread, createApp(), descriptionDocument, mockAnnotationService, mockLogActivity, mockRoutineService, routine (+2 more)
+
+### Community 261 - "summary-slot-routes.test.ts"
+Cohesion: 0.17
+Nodes (9): agentActor, boardActor, createApp(), mockAccessService, mockHeartbeatWakeup, mockInstanceSettingsService, mockLogActivity, mockSummarySlotService (+1 more)
+
+### Community 262 - "ccrotate-state-hook.ts"
 Cohesion: 0.40
 Nodes (9): adapterToTarget(), doExport(), doImport(), exitWith(), loadPluginIdOrExit(), PersistedSnapshot, readSnapshot(), runCcrotate() (+1 more)
 
-### Community 263 - "Community 263"
+### Community 263 - "exportBundle"
 Cohesion: 0.11
-Nodes (23): classifyPortableFileKind(), resolvePortablePath(), auditInstalledSkillBytes(), buildInventoryContentHash(), classifyInventoryKind(), collectSkillFileBytes(), contentLooksBinary(), deriveSkillSourceInfo() (+15 more)
+Nodes (20): buildEnvInputMap(), buildOrgTreeFromManifest(), classifyPortableFileKind(), collectRedactedPaths(), exportBundle(), previewExport(), dedupeEnvInputs(), extractPortableEnvInputs() (+12 more)
 
-### Community 264 - "Community 264"
-Cohesion: 0.15
-Nodes (19): readConfigValueAtPath(), assertSecretRefBinding(), coerceLegacySecretRef(), createPluginSecretsHandler(), createRateLimiter(), extractSecretRefBindingsFromConfig(), extractSecretRefPathsFromConfig(), extractSecretRefsFromConfig() (+11 more)
+### Community 264 - "plugin-secrets-handler.ts"
+Cohesion: 0.09
+Nodes (36): versionMaterialHasValueDigest(), collectEnvironmentSecretRefs(), persistConfigSecretRefs(), resolveConfigSecretRefsForProbe(), resolveConfigSecretRefsForRuntime(), collectSecretRefPaths(), walk(), isUuidSecretRef() (+28 more)
 
-### Community 265 - "Community 265"
-Cohesion: 0.17
-Nodes (12): resolveEffectiveWorkspaceStrategyType(), assertGitWorktreeBaseWorkspaceReady(), assertPushCapabilityCheckoutValid(), deriveRepoNameFromRepoUrl(), ensureManagedProjectWorkspace(), execFile, hasGitPushRemote(), isGitCheckout() (+4 more)
+### Community 265 - "workspace-response-withholding-guard.test.ts"
+Cohesion: 0.08
+Nodes (33): classifyProjectValue(), collectProjectRowLocals(), collectWorkspaceBearingLocals(), collectWorkspaceServiceReceivers(), COVERED_ROUTE_MODULES, elideMaskedCalls(), ENV_BOUNDARY_PINS, ENV_LOCAL_WITHHOLDING_HELPERS (+25 more)
 
-### Community 266 - "Community 266"
-Cohesion: 0.24
-Nodes (6): applyIssueExecutionPolicyTransition(), evaluateIssueMonitorConvergence(), normalizeIssueMonitorConvergenceThreshold(), arm(), IssueFixture, MonitorInput
-
-### Community 267 - "Community 267"
-Cohesion: 0.15
-Nodes (13): acquireBranchRunClaim(), BranchClaimConflictError, BranchClaimReadDb, BranchRunClaim, canonicalizeGitRemoteIdentity(), computeBranchClaimKey(), DbTransaction, isConstraintConflict() (+5 more)
-
-### Community 268 - "Community 268"
-Cohesion: 0.22
-Nodes (3): taskWatchdogService(), seedWatchdogRun(), createService()
-
-### Community 269 - "Community 269"
-Cohesion: 0.17
-Nodes (9): findLatestBackup(), roundHours(), listSourceFiles(), findUngatedSites(), REQUEST_INPUT_ALLOWLIST, ROUTES_DIR, readdirSync(), statSync() (+1 more)
-
-### Community 270 - "Community 270"
-Cohesion: 0.20
-Nodes (8): mockAccessService, mockAgentService, mockBudgetService, mockCompanyArtifactsService, mockCompanyPortabilityService, mockCompanyService, mockFeedbackService, mockLogActivity
-
-### Community 271 - "Community 271"
-Cohesion: 0.29
-Nodes (6): adapterExecute, allowPenstockGate, createGitRepo(), createGitRepoWithOrigin(), execFileAsync, runGit()
-
-### Community 272 - "Community 272"
+### Community 266 - "issue-monitor-convergence-guard.test.ts"
 Cohesion: 0.21
-Nodes (10): SESSION_UNAVAILABLE_HEARTBEAT_RETRY_MAX_ATTEMPTS, cleanupRetryFixture(), exhaustPrReviewRun(), expectPlainPrReviewFailureSchedulesRetry(), getScheduledTransientRetryForRun(), mockAdapterExecute, seedMaxTurnFixture(), seedQuarantineFixture() (+2 more)
+Nodes (9): computeIssueMonitorGateFingerprint(), evaluateIssueMonitorConvergence(), normalizeGateToken(), normalizeIssueMonitorConvergenceThreshold(), normalizeIssueMonitorGateSignals(), fire(), IssueFixture, MonitorInput (+1 more)
 
-### Community 273 - "Community 273"
-Cohesion: 0.22
-Nodes (5): accessServiceMock, createApp(), createAppWithActor(), logActivityMock, QueryHooks
+### Community 267 - "branch-run-claims.ts"
+Cohesion: 0.18
+Nodes (14): acquireBranchRunClaim(), BranchClaimConflictError, BranchClaimReadDb, BranchRunClaim, canonicalizeGitRemoteIdentity(), computeBranchClaimKey(), getHeartbeatRunState(), isConstraintConflict() (+6 more)
 
-### Community 274 - "Community 274"
+### Community 268 - "http-metrics-per-route.test.ts"
+Cohesion: 0.10
+Nodes (27): composeRouteLabel(), httpMetricsMiddleware(), InstrumentableResponse, INSTRUMENTED, isApiPath(), isEmptyListBody(), API_PIPELINE_STALL_MS, ApiPipelineStatus (+19 more)
+
+### Community 269 - "dev-runner-snapshot.test.ts"
+Cohesion: 0.33
+Nodes (3): readdirSync(), statSync(), tempRoots
+
+### Community 270 - "company-branding-route.test.ts"
+Cohesion: 0.18
+Nodes (9): createApp(), mockAccessService, mockAgentService, mockBudgetService, mockCompanyArtifactsService, mockCompanyPortabilityService, mockCompanyService, mockFeedbackService (+1 more)
+
+### Community 271 - "heartbeat-accepted-plan-workspace-refresh.test.ts"
+Cohesion: 0.29
+Nodes (7): adapterExecute, allowPenstockGate, createGitRepo(), createGitRepoWithOrigin(), drainInFlightExecutions(), execFileAsync, runGit()
+
+### Community 272 - "issue-approval-link-authorization.ts"
+Cohesion: 0.11
+Nodes (31): assertHireSourceIssueLinksAllowed(), assertIssueLinksAllowed(), AccessDecider, evaluateAgentIssueApprovalLinkAuthorization(), evaluateTaskWatchdogSubtreeScope(), isCreatorOrManagerChainDecision(), isCurrentIssueExecutionRun(), IssueApprovalLinkVerdict (+23 more)
+
+### Community 273 - "invite-accept-existing-member.test.ts"
 Cohesion: 0.20
-Nodes (6): mockAccessService, mockExecutionWorkspaceService, mockHeartbeatService, mockIssueService, mockLogActivity, mockProjectService
+Nodes (6): accessServiceMock, ACTIVE_INVITE_EXPIRES_AT, createApp(), createAppWithActor(), logActivityMock, QueryHooks
 
-### Community 275 - "Community 275"
-Cohesion: 0.20
-Nodes (7): mockAccessService, mockEnvironmentService, mockGetTelemetryClient, mockLogActivity, mockProjectService, mockSecretService, mockWorkspaceOperationService
+### Community 274 - "issue-closed-workspace-routes.test.ts"
+Cohesion: 0.15
+Nodes (9): assigneeAgentActor, boardActor, createApp(), mockAccessService, mockExecutionWorkspaceService, mockHeartbeatService, mockIssueService, mockLogActivity (+1 more)
 
-### Community 276 - "Community 276"
-Cohesion: 0.20
-Nodes (6): mockExistsSync, mockLoggerWarn, mockReadFile, mockReadFileSync, mockRequireResolve, mockStatSync
+### Community 275 - "middleware/index.ts"
+Cohesion: 0.04
+Nodes (38): createApp(), mockBumpAgentImagesForCompany, createApp(), mockFolderService, mockLogActivity, createApp(), mockEnvironmentService, mockHeartbeatService (+30 more)
 
-### Community 277 - "Community 277"
-Cohesion: 0.19
-Nodes (18): clampReviewBody(), githubPrUrl(), hasAllyConsolidatedReviewHeader(), hasPrReviewerAgentRequestMarker(), hasPrReviewerBareAliasMention(), hasPrReviewerRequestMention(), isActionablePrReviewComment(), isActionableReviewFeedbackContext() (+10 more)
+### Community 276 - "model-profile-hint.ts"
+Cohesion: 0.11
+Nodes (28): toIssueActiveRunRow(), isPlanningOnlyRecoveryContextSnapshot(), isStatusOnlyRecoveryContextSnapshot(), PLANNING_ONLY_RECOVERY_GUARD_CONTEXT, readRecoveryRunWriteClass(), RECOVERY_GUARD_CONTEXT_KEYS, RECOVERY_MODEL_PROFILE_HINT_KEYS, RECOVERY_MODEL_PROFILE_KEY (+20 more)
 
-### Community 278 - "Community 278"
+### Community 277 - "recovery-stranded-attendance-batch.test.ts"
+Cohesion: 0.08
+Nodes (21): PENDING_INTERACTION_MAX_AGE_MS, createStrandedAttendancePrefetch(), windowFor(), windowIdsFor(), DEFAULT_STRANDED_ATTENDANCE_PREFETCH_TTL_MS, DEFAULT_STRANDED_ATTENDANCE_PREFETCH_WINDOW, IssueAttendanceEvidence, StrandedAttendancePrefetch (+13 more)
+
+### Community 278 - "issue-repo-binding-guard.ts"
 Cohesion: 0.14
 Nodes (14): BOUND_SOURCE_LABEL, BoundRepo, codeSpan(), CompanyWorkspaceRow, evaluateIssueRepoBinding(), EvaluateIssueRepoBindingInput, formatIssueRepoBindingComment(), issueRepoBindingCommentIdempotencyKey() (+6 more)
 
-### Community 279 - "Community 279"
-Cohesion: 0.26
-Nodes (11): isLegacySessionUnavailableAdapterFailure(), isLegacySessionUnavailableAdapterMismatch(), isZeroTokenSessionResetRetryRun(), isZeroTokenStartupFailureRun(), OPENCODE_ADAPTER_TYPES, readAdapterType(), readTokenCount(), runUsageTokenCounts() (+3 more)
+### Community 279 - "managed-checkout-push-guard.ts"
+Cohesion: 0.11
+Nodes (29): defaultRunGit(), ensureExcluded(), ensureManagedCheckoutRejectsPushes(), execFile, isInside(), isTracked(), ManagedCheckoutPushGuardResult, ManagedCheckoutPushGuardState (+21 more)
 
-### Community 280 - "Community 280"
-Cohesion: 0.24
-Nodes (14): base64UrlDecode(), base64UrlEncode(), createLocalAgentJwt(), defaultRunJwtTtlSeconds(), deriveCompanySigningKey(), jwtConfig(), JwtHeader, LocalAgentJwtClaims (+6 more)
+### Community 280 - "agent-auth-jwt.ts"
+Cohesion: 0.18
+Nodes (15): base64UrlDecode(), base64UrlEncode(), createLocalAgentJwt(), defaultRunJwtTtlSeconds(), deriveCompanySigningKey(), jwtConfig(), JwtHeader, LocalAgentJwtClaims (+7 more)
 
-### Community 281 - "Community 281"
-Cohesion: 0.28
-Nodes (5): CONFIG_FILE_LANGUAGES, execFileAsync, getGitDefaultBranch(), getGitRemoteUrl(), WorkspaceScanResult
-
-### Community 282 - "Community 282"
+### Community 281 - "workspace-scan.ts"
 Cohesion: 0.36
-Nodes (8): Agent, api(), backfillAgentBundles(), backfillOne(), BackfillResult, main(), readWakePreflight(), sleep()
+Nodes (9): CONFIG_FILE_LANGUAGES, detectProjectName(), execFileAsync, fileExists(), getGitDefaultBranch(), getGitRemoteUrl(), readReadmeExcerpt(), WorkspaceScanResult (+1 more)
 
-### Community 283 - "Community 283"
-Cohesion: 0.28
-Nodes (6): AgentRunHealthInput, AgentRunHealthOptions, AgentRunHealthResult, AgentRunHealthSignal, evaluateAgentRunHealth(), NOW
-
-### Community 285 - "Community 285"
-Cohesion: 0.22
-Nodes (7): bootstrap, ensureKubernetesEnvironment, ExecutionPolicyBootstrap, ExecutionPolicyBootstrapEnv, fakeDb, listCompanyIds, updateGeneral
-
-### Community 286 - "Community 286"
-Cohesion: 0.42
-Nodes (9): assertLockedBranchReconcileWorkspaceStillMatchesInspection(), cloneRecord(), isRecord(), mergeExecutionWorkspaceConfig(), readDesiredState(), readExecutionWorkspaceConfig(), readNullableString(), readServiceStates() (+1 more)
-
-### Community 287 - "Community 287"
-Cohesion: 0.28
-Nodes (8): loadEffectiveRuntimeServicesByExecutionWorkspace(), attachWorkspaces(), listCurrentRuntimeServicesForExecutionWorkspaces(), listCurrentRuntimeServicesForProjectWorkspaces(), runtimeServiceIdentityKey(), RuntimeServiceReadDb, selectCurrentRuntimeServiceRows(), WorkspaceRuntimeServiceRow
-
-### Community 288 - "Community 288"
-Cohesion: 0.13
-Nodes (16): applySelectedFilesToSource(), buildManifestFromPackageFiles(), dedupeEnvInputs(), ensureMarkdownPath(), filterCompanyMarkdownIncludes(), findPaperclipExtensionPath(), normalizeFileMap(), normalizePortablePermissionGrants() (+8 more)
-
-### Community 289 - "Community 289"
+### Community 282 - "backfill-agent-bundle.ts"
 Cohesion: 0.21
-Nodes (14): buildDependabotAlertIssueBody(), buildDependabotRefireComment(), buildDependabotSuppressedRefireComment(), buildDependabotTerminalReceipt(), isUniqueDependabotAlertConflict(), recordDependabotTerminalReceipt(), recordSuppressedDependabotRefire(), reopenTerminalDependabotAlertIssue() (+6 more)
+Nodes (12): Agent, api(), backfillAgentBundles(), backfillOne(), BackfillResult, main(), readWakePreflight(), sleep() (+4 more)
 
-### Community 290 - "Community 290"
-Cohesion: 0.16
-Nodes (11): EnvironmentRunError, makeEnvironment(), makeExecutionWorkspace(), makeLease(), makeRealizeInput(), mockAdapterExecutionTargetToRemoteSpec, mockBuildWorkspaceRealizationRequest, mockLogActivity (+3 more)
+### Community 283 - "agent-run-health.ts"
+Cohesion: 0.24
+Nodes (7): AgentRunHealthInput, AgentRunHealthOptions, AgentRunHealthResult, AgentRunHealthSignal, evaluateAgentRunHealth(), WHY: heartbeat.list() orders by desc(createdAt) and truncates to a limit., NOW
 
-### Community 291 - "Community 291"
-Cohesion: 0.28
-Nodes (7): HookState, resolveCommand(), runCommand(), runQuotaExhaustedHook(), RunQuotaExhaustedHookInput, RunResult, state
+### Community 284 - "authorization-service.test.ts"
+Cohesion: 0.27
+Nodes (8): buildFixture(), createAgent(), createCompany(), createIssue(), createProject(), grantAgentPermission(), IssueAction, Relation
 
-### Community 292 - "Community 292"
-Cohesion: 0.28
-Nodes (9): buildExecutionWorkspaceCleanupEnv(), buildNonInteractiveGitEnv(), buildTemplateData(), isAbsolutePath(), renderRuntimeServiceEnv(), resolveConfiguredPath(), resolveRuntimeServiceReuseIdentity(), resolveWorkspaceCommandExecution() (+1 more)
+### Community 285 - "summarySlotService"
+Cohesion: 0.14
+Nodes (29): mapDocument(), mapRevision(), mapSlot(), ResolvedSelector, scopeLabel(), SUMMARIZER_BUILT_IN_KEY, SummaryGenerateActor, SummarySlotRow (+21 more)
 
-### Community 293 - "Community 293"
-Cohesion: 0.22
-Nodes (7): mockAccessService, mockApprovalService, mockCompanySkillService, mockIssueApprovalService, mockLogActivity, mockSecretService, mockSyncInstructionsBundleConfigFromFilePath
+### Community 286 - "issue-comment-effects.ts"
+Cohesion: 0.14
+Nodes (26): claimEffect(), COMMENT_EFFECT_KINDS, CommentEffectIntent, CommentEffectKind, CommentEffectRow, completeEffect(), DEFAULT_CLAIM_LEASE_MS, EFFECT_EXHAUSTED_RETRY_DELAY_MS (+18 more)
 
-### Community 294 - "Community 294"
-Cohesion: 0.22
-Nodes (5): mockAgentService, mockHeartbeatService, mockInstanceSettingsService, mockIssueService, mockLogActivity
+### Community 287 - "managed-checkout-partial-clone.ts"
+Cohesion: 0.12
+Nodes (25): countMissingObjects(), defaultRunGit(), describePartialCloneConfig(), ensureManagedCheckoutCanServeClones(), execFile, ManagedCheckoutPartialCloneResult, ManagedCheckoutPartialCloneState, MissingObjectCounter (+17 more)
 
-### Community 295 - "Community 295"
-Cohesion: 0.22
-Nodes (4): mockAccessService, mockBuiltInAgentService, mockInstanceSettingsService, mockLogActivity
+### Community 288 - "importBundle"
+Cohesion: 0.08
+Nodes (32): applySelectedFilesToSource(), bufferToPortableBinaryFile(), collectAgentSafeImportPolicyErrors(), applyImportedAgentPermissionGrants(), buildPreview(), importBundle(), previewImport(), resolveImportedAssigneeAgentId() (+24 more)
 
-### Community 296 - "Community 296"
+### Community 289 - "approval-enforcement-reconciler.ts"
+Cohesion: 0.13
+Nodes (23): APPROVAL_ENFORCEMENT_DRIFT_ORIGIN_KIND, ApprovalCandidate, ApprovalCursor, approvalCursorFrom(), ApprovalEnforcementReconcileResult, ApprovalEnforcementReconcilerScheduler, BudgetPolicyAmountAssertion, buildDriftIssueBody() (+15 more)
+
+### Community 290 - "createPluginJobScheduler"
+Cohesion: 0.14
+Nodes (23): advanceToNextMonth(), FIELD_SPECS, FieldSpec, findNext(), nextCronTick(), nextCronTickFromExpression(), parseCron(), ParsedCron (+15 more)
+
+### Community 291 - "heartbeat-timer-suppression-park-bypass.test.ts"
+Cohesion: 0.08
+Nodes (5): PenstockAvailabilityGate, PenstockAvailabilityGateCheckInput, PenstockAvailabilityGateResult, __resetQuotaExhaustedHookStateForTesting(), mockAdapterExecute
+
+### Community 292 - "run-secret-redaction.ts"
+Cohesion: 0.14
+Nodes (22): compactRunLogChunk(), MAX_PERSISTED_LOG_CHUNK_CHARS, redactInlineBase64ImageData(), sanitizeRunLogChunkForStorage(), ALWAYS_REDACT_MIN_LENGTH, AMBIGUOUS_BAND_MIN_LENGTH, buildRunSecretRedactionPlan(), characterClassCount() (+14 more)
+
+### Community 293 - "agent-hires-instructions-materialize.test.ts"
+Cohesion: 0.20
+Nodes (8): createApp(), mockAccessService, mockApprovalService, mockCompanySkillService, mockIssueApprovalService, mockLogActivity, mockSecretService, mockSyncInstructionsBundleConfigFromFilePath
+
+### Community 294 - "zoned-cron.ts"
+Cohesion: 0.13
+Nodes (24): assertTimeZone(), isSubHourlyCronExpression(), nextCronTickInTimeZone(), sampleRoutineFireGapsMs(), buildCronMask(), CronMask, daysInMonth(), getZonedMinuteFormatter() (+16 more)
+
+### Community 295 - "built-in-agent-routes.test.ts"
+Cohesion: 0.18
+Nodes (8): allowDecision(), builtInState(), createApp(), mockAccessService, mockBuiltInAgentService, mockInstanceSettingsService, mockLogActivity, stateWithMetadata()
+
+### Community 296 - "codex-local-execute.test.ts"
 Cohesion: 0.22
 Nodes (4): CapturePayload, codexHomeOverrides, fakeCodexAuthJson, LogEntry
 
-### Community 297 - "Community 297"
+### Community 297 - "company-skills-catalog-service.test.ts"
 Cohesion: 0.25
 Nodes (7): contentHash(), createService(), mockCatalogService, sampleAssetBytes, sampleCatalogSkill, sampleFiles, sha256()
 
-### Community 298 - "Community 298"
-Cohesion: 0.22
-Nodes (6): mockGetActiveCompanyMembership, mockHeartbeatService, mockIssueReferenceService, mockIssueService, mockIssueThreadInteractionService, mockLogActivity
-
-### Community 299 - "Community 299"
-Cohesion: 0.29
-Nodes (4): baseGoal, mockGetTelemetryClient, mockGoalService, mockLogActivity
-
-### Community 300 - "Community 300"
-Cohesion: 0.32
-Nodes (6): bootstrapOtel(), ExporterProtocol, importExporter(), resolveProtocol(), shutdownInstrumentation(), importFreshInstrumentation()
-
-### Community 301 - "Community 301"
-Cohesion: 0.32
-Nodes (6): normalizePath(), shouldSilenceHttpSuccessLog(), SILENCED_SUCCESS_API_PATHS, SILENCED_SUCCESS_METHODS, SILENCED_SUCCESS_STATIC_PATHS, SILENCED_SUCCESS_STATIC_PREFIXES
-
-### Community 302 - "Community 302"
-Cohesion: 0.39
-Nodes (6): isSensitiveKey(), isUrlishKey(), redactSensitive(), SENSITIVE_KEYS, stripSecretBearingUrlParts(), URLISH_KEYS
-
-### Community 303 - "Community 303"
-Cohesion: 0.13
-Nodes (6): AgentRow, CompanyRow, createApp(), Db, IssueRow, ProjectRow
-
-### Community 304 - "Community 304"
-Cohesion: 0.22
-Nodes (8): overCapRun(), run(), RUN_CREATED_AT, RUN_FINISHED_AT, SERVER_429_PROVENANCE, SERVER_NON_429_PROVENANCE, SWEEP_AFTER_RESET, SWEEP_WHILE_OPEN
-
-### Community 305 - "Community 305"
+### Community 298 - "issue-update-comment-wakeup-routes.test.ts"
 Cohesion: 0.18
-Nodes (14): applyCcrotateCapacityDecision(), CAPACITY_ESCALATION_AFTER_MS, CapacityEscalationPlan, CCROTATE_CAPACITY_DECISION_KEYS, CCROTATE_CAPACITY_RESULT_KEYS, CcrotateCapacityDecision, CcrotateCapacityRetryInput, CcrotateCapacityRetryPlan (+6 more)
+Nodes (9): createApp(), mockCommentEffects, mockGetActiveCompanyMembership, mockHeartbeatService, mockIssueReferenceService, mockIssueService, mockIssueThreadInteractionService, mockLogActivity (+1 more)
 
-### Community 306 - "Community 306"
+### Community 299 - "node:http"
+Cohesion: 0.12
+Nodes (11): createApp(), mockAccessService, mockActivityService, mockHeartbeatService, mockIssueService, baseGoal, createApp(), loadRouteModules() (+3 more)
+
+### Community 300 - "instrumentation.ts"
+Cohesion: 0.16
+Nodes (7): bootstrapOtel(), ExporterProtocol, importExporter(), instrumentationReady, resolveProtocol(), shutdownInstrumentation(), importFreshInstrumentation()
+
+### Community 301 - "http-log-policy.ts"
+Cohesion: 0.14
+Nodes (20): buildHttpLogProps(), createHttpLogger(), hasEntries(), LoggedRequest, LoggedResponse, normalizePath(), shouldOmitRequestBodyFromLog(), shouldSilenceHttpSuccessLog() (+12 more)
+
+### Community 302 - "redact-sensitive.ts"
 Cohesion: 0.29
-Nodes (8): artifactResult(), createSnippet(), findFirstMatchIndex(), highlightRanges(), matchTerms(), plainText(), scoreSimpleRow(), selectPrimarySnippets()
+Nodes (9): isSensitiveContainerKey(), isSensitiveKey(), isUrlishKey(), redactContainer(), redactSensitive(), SENSITIVE_CONTAINER_KEYS, SENSITIVE_KEYS, stripSecretBearingUrlParts() (+1 more)
 
-### Community 307 - "Community 307"
+### Community 303 - "issue-blocker-diagnostics-routes.test.ts"
 Cohesion: 0.13
 Nodes (6): AgentRow, CompanyRow, createApp(), Db, IssueRow, ProjectRow
 
-### Community 308 - "Community 308"
+### Community 304 - "strand-comment-provider-capacity.test.ts"
+Cohesion: 0.10
+Nodes (18): PROVIDER_CAPACITY_MAX_HORIZON_MS, createPassTimer(), record(), summary(), time(), PassTimer, PassTimingSummary, percentile() (+10 more)
+
+### Community 305 - "heartbeat-retry-scheduling.test.ts"
+Cohesion: 0.03
+Nodes (67): applyCcrotateCapacityDecision(), CAPACITY_ESCALATION_AFTER_MS, CAPACITY_ESCALATION_HEADROOM_RATIO, CapacityEscalationPlan, CCROTATE_CAPACITY_ADVERTISED_RESUME_AT_KEY, CCROTATE_CAPACITY_DECISION_KEYS, CCROTATE_CAPACITY_FIRST_DEFERRED_AT_KEY, CCROTATE_CAPACITY_MAX_PARK_MS (+59 more)
+
+### Community 306 - "fd-class-metrics.ts"
+Cohesion: 0.12
+Nodes (23): boundedDirLabel(), boundedSegment(), classifyFdTarget(), CollectFdClassOptions, collectFdClassSnapshot(), FD_CLASS_MAX_ENTRIES, FD_CLASS_MAX_SEGMENT_CHARS, FD_CLASS_MAX_SERIES (+15 more)
+
+### Community 307 - "issue-subtree-diagnostics-routes.test.ts"
 Cohesion: 0.13
 Nodes (6): AgentRow, CompanyRow, createApp(), Db, IssueRow, ProjectRow
 
-### Community 309 - "Community 309"
-Cohesion: 0.54
-Nodes (6): buildHeartbeatRunIssueComment(), mergeHeartbeatRunResultJson(), readCommentText(), readNumericField(), summarizeHeartbeatRunResultJson(), truncateSummaryText()
+### Community 308 - "issue-wake-diagnostics-routes.test.ts"
+Cohesion: 0.11
+Nodes (12): ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS, AgentRow, collectWriterFiles(), columnReasonLiteralsFromDirectInserts(), CompanyRow, createApp(), Db, isProductionSource() (+4 more)
 
-### Community 310 - "Community 310"
-Cohesion: 0.32
-Nodes (3): createInviteRateLimiter(), InviteRateLimiter, InviteRateLimitResult
+### Community 309 - "heartbeat-run-summary.ts"
+Cohesion: 0.33
+Nodes (9): buildHeartbeatRunIssueComment(), HEARTBEAT_RUN_RESULT_OUTPUT_MAX_CHARS, HEARTBEAT_RUN_RESULT_SUMMARY_MAX_CHARS, HEARTBEAT_RUN_SAFE_RESULT_JSON_MAX_BYTES, mergeHeartbeatRunResultJson(), readCommentText(), readNumericField(), summarizeHeartbeatRunResultJson() (+1 more)
 
-### Community 311 - "Community 311"
-Cohesion: 0.15
-Nodes (7): subscribeCompanyLiveEvents(), captureActivityEvents(), captureActivityEvents(), captureActivityEvents(), captureDeniedWriteEvents(), createApp(), captureActivityEvents()
+### Community 310 - "zoned-cron-equivalence.test.ts"
+Cohesion: 0.11
+Nodes (23): resetRoutineFireGapsMemoForTests(), ZONED_CRON_SEARCH_MAX_AFTER_MS, ZONED_CRON_SEARCH_MIN_AFTER_MS, assertTimeZone(), floorToMinute(), getZonedMinuteFormatter(), getZonedMinuteParts(), matchesCronMinute() (+15 more)
 
-### Community 312 - "Community 312"
-Cohesion: 0.13
-Nodes (11): createPluginEventBus(), PluginEventBus, PluginEventBusEmitResult, ScopedPluginEventBus, Subscription, pollOnce(), pruneOutbox(), resetStaleProcessing() (+3 more)
+### Community 311 - "live-events.ts"
+Cohesion: 0.06
+Nodes (21): resetPluginEventOutboxDbForTests(), HeartbeatEnvironmentRuntime, emitter, LiveEventListener, LiveEventPayload, publishGlobalLiveEvent(), subscribeCompanyLiveEvents(), toLiveEvent() (+13 more)
 
-### Community 313 - "Community 313"
+### Community 312 - "plugin-orchestration-apis.test.ts"
+Cohesion: 0.09
+Nodes (15): createPluginEventBus(), emit(), matchesPattern(), passesFilter(), PluginEventBus, PluginEventBusEmitResult, ScopedPluginEventBus, Subscription (+7 more)
+
+### Community 313 - "process-loss-classification.ts"
 Cohesion: 0.39
 Nodes (6): buildProcessLossCapture(), classifyProcessLoss(), ProcessLossCapture, ProcessLossClassification, ProcessLossJobLiveness, ProcessLossSignals
 
-### Community 314 - "Community 314"
-Cohesion: 0.19
-Nodes (5): isIsolatedSdkPluginPackage(), ISOLATED_SDK_PLUGIN_PACKAGES, isolatedPluginsRoot(), resolveDefaultInstallDir(), sanitizePackageNameForPath()
+### Community 314 - "openrouter/execute.ts"
+Cohesion: 0.13
+Nodes (17): AGENT_TOOLS, callOpenRouter(), ChatMessage, execAsync, execute(), executeToolCall(), walk(), sanitize() (+9 more)
 
-### Community 315 - "Community 315"
-Cohesion: 0.32
-Nodes (7): classifyTaskWatchdogSubtree(), pathIssueIds(), stableStopFingerprint(), TaskWatchdogClassifierIssue, toEpochMs(), classify(), issue()
+### Community 315 - "evidence-truth.ts"
+Cohesion: 0.13
+Nodes (17): buildGithubTruthProbe(), GithubTruthDeps, MAX_LINKED_PRS, MAX_SERIAL_CALLS, PER_CALL_TIMEOUT_MS, PerPr, PROBE_DEADLINE_MS, probeOne() (+9 more)
 
-### Community 316 - "Community 316"
-Cohesion: 0.46
-Nodes (7): describeLiveSsh, readOptionalSecret(), resolveEnvLabStatePath(), resolveSshConfig(), startEnvLabForTest(), tryEnvLabFixture(), tryExplicitConfig()
+### Community 316 - "config"
+Cohesion: 0.24
+Nodes (8): describeLiveSsh, readOptionalSecret(), resolveEnvLabStatePath(), resolveSshConfig(), startEnvLabForTest(), tryEnvLabFixture(), tryExplicitConfig(), config()
 
-### Community 317 - "Community 317"
-Cohesion: 0.46
-Nodes (6): createTempRepo(), execFileAsync, fingerprintWorkspaceBranchIncoherenceForTest(), readGit(), runGit(), stableStringifyForTest()
+### Community 317 - "pr-review-state-reconciler.ts"
+Cohesion: 0.12
+Nodes (23): DEFAULT_MAX_GATE_REDRIVES_PER_REPO, EMPTY_RESULT, emptyGateRedriveResult(), GateRedriveCandidate, GateRedriveResult, gateStatusIsStale(), isPlainResultObject(), latestReviewerReviewAt() (+15 more)
 
-### Community 318 - "Community 318"
-Cohesion: 0.25
-Nodes (5): CrashResult, fixture, here, StalledCrashResult, tsx
+### Community 318 - "process-crash-guard-exit.test.ts"
+Cohesion: 0.14
+Nodes (12): MAX_WRITE_WAIT_MS, CrashResult, fixture, here, LATE_BACKPRESSURE_RUN, PREFILL_RUN, readRemainingStderr(), runFixtureWithStalledStderr() (+4 more)
 
-### Community 319 - "Community 319"
+### Community 319 - "security-audit-overrides.test.ts"
 Cohesion: 0.29
 Nodes (6): copyLockfileFixture(), execFileAsync, repoRoot, repoRootPath, rootPackageJson, serverPackageJson
 
-### Community 320 - "Community 320"
-Cohesion: 0.29
-Nodes (4): CachedViteHtmlRenderer, ViteWatcherEvent, ViteWatcherHost, WATCHER_EVENTS
+### Community 320 - "pen3142-live-event-transcript-scope.test.ts"
+Cohesion: 0.09
+Nodes (9): connectSubscriber(), connectWithKey(), FakeClientSocket, FakeUpgradeSocket, keyDb(), mockDecide, mockLogActivity, mockPublishAudit (+1 more)
 
-### Community 321 - "Community 321"
-Cohesion: 0.33
-Nodes (3): ClaudeExecute, stampClaudeAgentIdHeader(), ExecuteCtx
+### Community 321 - "utils.ts"
+Cohesion: 0.09
+Nodes (27): ClaudeExecute, stampClaudeAgentIdHeader(), ExecuteCtx, execute(), httpAdapter, normalizeMethod(), summarizeStatus(), testEnvironment() (+19 more)
 
-### Community 322 - "Community 322"
-Cohesion: 0.43
-Nodes (5): AgentShellCommandDecision, classifyAgentShellCommand(), FULL_ENV_DUMP_RE, readShellCommandArgument(), unwrapShell()
+### Community 322 - "agent-shell-guard.ts"
+Cohesion: 0.06
+Nodes (53): AgentShellCommandDecision, classifyAgentShellCommand(), CMD_END_RE, CMD_START_RE, COMMAND_BUILTIN_LAUNCHER_RE, COMMAND_POSITION_RE, ENV_BULK_ACCESS_RE, ENV_LAUNCHER_ARGUMENT_RE (+45 more)
 
-### Community 323 - "Community 323"
-Cohesion: 0.29
-Nodes (6): Delegation (critical), Keeping work moving, Memory and Planning, References, Safety Considerations, What you DO personally
+### Community 323 - "native-memory-metrics.test.ts"
+Cohesion: 0.13
+Nodes (22): PROCESS_MEMORY_COMPONENT_BYTES_METRIC, PROCESS_V8_CONTEXT_COUNT_METRIC, setNativeMemoryMetrics(), ARRAY_BUFFERS_COMPONENT, CollectNativeMemoryOptions, collectNativeMemorySnapshot(), DETACHED_CONTEXT_KIND, EXTERNAL_OTHER_COMPONENT (+14 more)
 
-### Community 324 - "Community 324"
-Cohesion: 0.16
-Nodes (8): ACTIVITY_ACTION_TO_PLUGIN_EVENT, enqueuePluginDomainEventAtomically(), eventTypeForActivityAction(), PLUGIN_EVENT_SET, publishPluginDomainEvent(), readNonEmptyString(), resolveResponsibleUserIdForActivity(), TableRows
+### Community 324 - "services/index.ts"
+Cohesion: 0.03
+Nodes (70): auditAgentIssueCreateAttributionSpoof(), ACTIVITY_ACTION_TO_PLUGIN_EVENT, ActivityPublish, eventTypeForActivityAction(), logActivity(), LogActivityInput, PLUGIN_EVENT_SET, readNonEmptyString() (+62 more)
 
-### Community 325 - "Community 325"
-Cohesion: 0.43
+### Community 325 - "zodToOpenApiSchema"
+Cohesion: 0.52
 Nodes (7): applyNumberChecks(), applyStringChecks(), isOptionalSchema(), parametersFromSchema(), unwrapSchema(), zodToOpenApiSchema(), zodTypeName()
 
-### Community 326 - "Community 326"
-Cohesion: 0.15
-Nodes (5): parseProviderCapacityResetHorizon(), resolveProviderCapacityHorizon(), BLO_18278_RESULT_JSON, BLO_18285_OVER_CAP_ERROR_MESSAGE, BLO_18285_OVER_CAP_RUN_STARTED_AT
+### Community 326 - "heartbeat-provider-capacity-horizon.test.ts"
+Cohesion: 0.05
+Nodes (21): registerServerAdapter(), unregisterServerAdapter(), HEARTBEAT_POST_TERMINAL_RUN_EVENT_DROPPED_METRIC, adapterExecute, execFile, mockDeleteAgentJobExact, mockHasActiveJobForAgent, mockListAgentJobRunStatuses (+13 more)
 
-### Community 327 - "Community 327"
+### Community 327 - "company-export-readme.ts"
 Cohesion: 0.43
 Nodes (6): generateOrgChartMermaid(), generateReadme(), mermaidEscape(), mermaidId(), ROLE_LABELS, skillSourceLabel()
 
-### Community 329 - "Community 329"
-Cohesion: 0.21
-Nodes (14): classifyNoExecutableTurnRun(), coerceDate(), deliberatePendingMonitor(), isDependencyBlockedRun(), isInfraFailureRun(), isMonitorSuppressionActor(), isNeverExecutedRun(), latestDate() (+6 more)
+### Community 329 - "collectEvidence"
+Cohesion: 0.11
+Nodes (33): choosePrimaryTrigger(), classifyNoExecutableTurnRun(), coerceDate(), deliberatePendingMonitor(), dominantErrorCode(), isDominantEpisodeShare(), isMonitorSuppressionActor(), isNeverExecutedRun() (+25 more)
 
-### Community 330 - "Community 330"
-Cohesion: 0.22
-Nodes (12): auditPatchedHookCommands(), auditConfiguredHookCommandsOnBoot(), auditHookCommands(), describeHookCommandFinding(), findMissingHookCommandPaths(), HookCommandAuditDeps, HookCommandAuditFinding, LIFECYCLE_HOOK_COMMAND_SETTINGS (+4 more)
+### Community 330 - "lifecycle-hook-command-audit.ts"
+Cohesion: 0.08
+Nodes (38): assertCanManageInstanceSettings(), auditPatchedHookCommands(), instanceSettingsRoutes(), auditConfiguredHookCommandsOnBoot(), auditHookCommands(), basenameOf(), COMMAND_PREFIXES, describeHookCommandFinding() (+30 more)
 
-### Community 331 - "Community 331"
-Cohesion: 0.81
-Nodes (6): cloneRecord(), isRecord(), mergeProjectWorkspaceRuntimeConfig(), readDesiredState(), readProjectWorkspaceRuntimeConfig(), readServiceStates()
+### Community 331 - "linear-auth.ts"
+Cohesion: 0.14
+Nodes (18): LinearTeam, LinearTeamExpectation, LinearTeamFailure, LinearTeamMatch, LinearTeamResolution, linearTeamResolutionError(), resolveLinearTeam(), callbackPage() (+10 more)
 
-### Community 332 - "Community 332"
+### Community 332 - "boardAuthService"
+Cohesion: 0.11
+Nodes (26): BOARD_API_KEY_TTL_MS, boardApiKeyExpiresAt(), boardAuthService(), approveCliAuthChallenge(), assertCurrentBoardKey(), cancelCliAuthChallenge(), createCliAuthChallenge(), createNamedBoardApiKey() (+18 more)
+
+### Community 333 - "environmentRoutes"
+Cohesion: 0.12
+Nodes (19): environmentRoutes(), assertCanAccessInstanceEnvironments(), assertCanReadInstanceEnvironments(), assertCanReadSecretsForDraftProbe(), assertCustomImageCompanyAccess(), canReadFullInstanceEnvironment(), environmentDeleteBlockMessage(), logEnvironmentCustomImageActivity() (+11 more)
+
+### Community 334 - "pen3142-run-transcript-scope.test.ts"
+Cohesion: 0.09
+Nodes (17): boardActor, createApp(), createAppWithDb(), createWorkspaceApp(), mockAgentService, mockDecide, mockExecutionWorkspaceService, mockHeartbeatService (+9 more)
+
+### Community 335 - "input"
 Cohesion: 0.15
-Nodes (3): CliAuthChallengeStatus, createApp(), Db
+Nodes (12): locatePodLogArtifact(), OrphanedRunTerminalResult, readOptionalString(), readOrphanedRunTerminalResult(), resultEventReportsSuccess(), runLogBasePath(), input(), createSecret() (+4 more)
 
-### Community 333 - "Community 333"
-Cohesion: 0.33
-Nodes (7): assertWatchdogAgentInvokable(), assertWatchedIssue(), normalizeInstructions(), summarizeIssueWatchdog(), toIssueWatchdog(), updateIssueWatchdogRow(), upsertIssueWatchdogForIssue()
+### Community 336 - "project-env-response-boundary.test.ts"
+Cohesion: 0.13
+Nodes (17): ENV_VALUE_MASK, maskBinding(), maskEnvBindings(), plainValueOf(), restoreMaskedEnvBindings(), PROJECT_ENV_VALUE_MASK, derivedStageAutomationPayload(), createApp() (+9 more)
 
-### Community 334 - "Community 334"
-Cohesion: 0.18
-Nodes (10): buildMissingLocalSourceMarker(), buildMissingRuntimeSourceDetail(), discoverProjectWorkspaceSkillDirectories(), findMissingLocalSkillIds(), getMissingSourceMarker(), normalizeGitHubSkillDirectory(), normalizeSourceLocatorDirectory(), resolveExistingSkillDirectory() (+2 more)
-
-### Community 336 - "Community 336"
-Cohesion: 0.18
-Nodes (5): closeClient(), EnvironmentCustomImageSshShell, handleClientFrame(), sendJson(), Ssh2Shell
-
-### Community 337 - "Community 337"
+### Community 337 - "setup-supertest.ts"
 Cohesion: 0.29
 Nodes (5): require, SupertestServer, SupertestTest, SupertestTestConstructor, SupertestTestInstance
 
-### Community 338 - "Community 338"
-Cohesion: 0.29
-Nodes (4): mockAccessService, mockAgentService, mockCatalogModule, mockTeamsCatalogService
+### Community 338 - "routes/decision-training.ts"
+Cohesion: 0.15
+Nodes (18): createSchema, decisionTrainingRoutes(), exampleIdSchema, parseExampleId(), previewSchema, requireExampleOwner(), requireHumanUser(), sourceKindSchema (+10 more)
 
-### Community 339 - "Community 339"
-Cohesion: 0.21
-Nodes (12): categoryLookupKey(), importedSkillPersistValuesMatchExisting(), inventoryEntriesEqual(), normalizeCategoryList(), normalizeCategoryName(), normalizeFileInventory(), normalizeSharingScope(), stringArraysEqual() (+4 more)
+### Community 339 - ".call"
+Cohesion: 0.13
+Nodes (7): awsProviderSafeMessage(), AwsSecretsManagerGateway, AwsSecretsManagerJsonGateway, classifyAwsProviderError(), loadAwsCredentials(), normalizeAwsError(), SecretProviderClientError
 
-### Community 340 - "Community 340"
-Cohesion: 0.27
-Nodes (7): setOverdueScheduledRetryAgeMetrics(), setOverdueScheduledRetryAgeMetricsRefreshSuccess(), setQueuedRunAgeMetricsRefreshSuccess(), setQueuedRunOldestAgeMetrics(), refreshOverdueScheduledRetryAgeMetrics(), refreshQueuedRunAgeMetrics(), PlanNode
+### Community 340 - "queued-run-age-metrics.ts"
+Cohesion: 0.06
+Nodes (35): DEP_BLOCKED_MAX_DELAY_MS, MAX_TURN_CONTINUATION_MAX_DELAY_MS, coerceRetryScheduleReason(), DEFERRED_ISSUE_EXECUTION_WAKE_AGE_METRICS_REFRESH_SUCCESS_METRIC, DEFERRED_ISSUE_EXECUTION_WAKE_OLDEST_AGE_METRIC, normalizeAgentId(), QUEUED_RUN_AGE_METRICS_REFRESH_SUCCESS_METRIC, QUEUED_RUN_OLDEST_AGE_METRIC (+27 more)
 
-### Community 341 - "Community 341"
-Cohesion: 0.67
-Nodes (5): AgentSecretBindingSyncService, asRecord(), collectSecretRefs(), collectUserSecretRefs(), syncAgentAdapterEnvBindings()
+### Community 341 - "agent-secret-bindings.ts"
+Cohesion: 0.62
+Nodes (6): AgentSecretBindingSyncService, asRecord(), collectSecretRefs(), collectUserSecretRefs(), secretBindingSignaturesByPath(), syncAgentAdapterEnvBindings()
 
-### Community 342 - "Community 342"
-Cohesion: 0.53
+### Community 342 - "readPortableCatalogProvenance"
+Cohesion: 0.60
 Nodes (5): asCatalogString(), isCatalogRecord(), PORTABLE_CATALOG_PROVENANCE_STRING_KEYS, readCatalogStringList(), readPortableCatalogProvenance()
 
-### Community 343 - "Community 343"
-Cohesion: 0.20
-Nodes (5): authbotCredentialValue(), BearerSource, NullBearer, OAuthMintBearer, StaticBearer
+### Community 344 - "plugin-activation-boot-retry.test.ts"
+Cohesion: 0.10
+Nodes (8): FAILED_CLOSED_ERROR, FORGED_MARKER_ERROR, INITIALIZE_TIMEOUT_ERROR, SDK_INSTALL_RACE_ERROR, ghFetchMock, jsonResponse(), NOW, routeGithub()
 
-### Community 344 - "Community 344"
-Cohesion: 0.67
-Nodes (6): buildRunEventRuntimeProgress(), readFirstLiveRunProgressString(), readLiveRunAssistantSnippet(), readLiveRunProgressString(), readLiveRunToolName(), sanitizeLiveRunProgressText()
+### Community 345 - "normalizeIssueExecutionPolicy"
+Cohesion: 0.15
+Nodes (18): isLapsedMonitorRearmPatch(), applyIssueExecutionPolicyTransition(), DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS, normalizeIssueExecutionPolicy(), normalizeMonitorNotes(), state(), makeInReviewIssue(), makeStuckReviewIssue() (+10 more)
 
-### Community 345 - "Community 345"
-Cohesion: 0.53
-Nodes (5): applyIssueMonitorPolicyTransition(), approvalOnlyPolicy(), makePolicy(), reviewOnlyPolicy(), twoStagePolicy()
+### Community 346 - "routines-service.test.ts"
+Cohesion: 0.11
+Nodes (4): SecretProviderModule, schedulerReceipts(), seedFixture(), seedWithAlertSurface()
 
-### Community 346 - "Community 346"
-Cohesion: 0.22
-Nodes (6): counters, getRoutineDispatchMetric(), incrementRoutineDispatchMetric(), resetRoutineDispatchMetrics(), RoutineDispatchMetricKey, snapshotRoutineDispatchMetrics()
+### Community 347 - "issue-list-assignee-filter-routes.test.ts"
+Cohesion: 0.10
+Nodes (16): __clearIssueListResponseCacheForTests(), __getIssueListResponseCacheSizeForTests(), ISSUE_LIST_SERVER_CACHE_MAX_ENTRIES, listSuccessfulRunHandoffStates(), successfulRunHandoffStateFromActivity(), hydrateSuccessfulRunHandoffLiveness(), resolveSuccessfulRunHandoffForTerminalIssues(), SUCCESSFUL_RUN_HANDOFF_LIVE_RUN_STATUSES (+8 more)
 
-### Community 347 - "Community 347"
-Cohesion: 0.12
-Nodes (17): listSuccessfulRunHandoffStates(), successfulRunHandoffStateFromActivity(), findAcceptedPlanDocumentInteraction(), listSuccessfulRunHandoffMapForIssues(), readAcceptedPlanConfirmationTarget(), readStringFromRecord(), readSuccessfulRunHandoffFromActivity(), resolveResponsibleUserIdForIssueCreate() (+9 more)
+### Community 348 - "heartbeat-issue-liveness-escalation.test.ts"
+Cohesion: 0.11
+Nodes (14): BACKSTOP_CANDIDATES_SKIPPED_METRIC, BACKSTOP_SWEEP_COMPLETED_METRIC, ABANDONED_LIVENESS_RECOVERY_MARKER, DEFAULT_LIVENESS_ABANDONED_RECOVERY_MS, DEFAULT_LIVENESS_REESCALATION_COOLDOWN_MS, DEFAULT_LIVENESS_UNCHANGED_TARGET_SUPPRESSION_MS, STALE_LIVENESS_ESCALATION_AUTO_RESOLVE_MARKER, enableAutoRecovery() (+6 more)
 
-### Community 348 - "Community 348"
-Cohesion: 0.18
-Nodes (8): adapterExecute, execFile, mockDeleteAgentJobExact, mockHasActiveJobForAgent, mockListAgentJobRunStatuses, mockListLiveAgentJobRunIds, mockListManagedAgentJobs, mockReadAgentJobRunStatusByName
+### Community 349 - "approval-budget-assertion-required.test.ts"
+Cohesion: 0.11
+Nodes (15): createAgentApp(), createRouteDb(), createUserApp(), fileCard(), mockAccessService, mockApprovalService, mockDeferredActivityPublish, mockHeartbeatService (+7 more)
 
-### Community 349 - "Community 349"
-Cohesion: 0.33
-Nodes (4): mockAccessService, mockActivityService, mockHeartbeatService, mockIssueService
+### Community 350 - "asNumber"
+Cohesion: 0.17
+Nodes (19): asBoolean, asNumber, EXTERNAL_LIFECYCLE_ADAPTERS, hasExternalLifecycleAdapter(), isRunOccupyingSlot(), normalizeMaxConcurrentRuns(), resolveAgentConcurrencyPolicy(), resolveEffectiveMaxConcurrentRuns() (+11 more)
 
-### Community 350 - "Community 350"
-Cohesion: 0.33
-Nodes (4): mockAccessService, mockAgentService, mockBoardAuthService, mockLogActivity
-
-### Community 352 - "Community 352"
+### Community 352 - "docker-entrypoint.test.ts"
 Cohesion: 0.47
 Nodes (5): ENTRYPOINT, execFileAsync, installStubs(), runEntrypoint(), writeStub()
 
-### Community 354 - "Community 354"
-Cohesion: 0.47
-Nodes (10): isPlainBinding(), isPlainObject(), isSecretPointerCandidate(), isSecretRefBinding(), isUserSecretRefBinding(), sanitizeAgentEnvRecord(), sanitizeSecretMatchedValue(), sanitizeSecretRefPointer() (+2 more)
+### Community 354 - "local-encrypted-provider.ts"
+Cohesion: 0.17
+Nodes (17): resolveDefaultSecretsKeyFilePath(), AwsSecretsManagerMaterial, asLocalEncryptedMaterial(), decodeMasterKey(), encryptValue(), enforceKeyFilePermissionsBestEffort(), inspectLocalEncryptedHealth(), loadOrCreateMasterKey() (+9 more)
 
-### Community 355 - "Community 355"
-Cohesion: 0.24
-Nodes (10): buildMarkdown(), buildPortableCatalogProvenance(), buildReferencedSkillMarkdown(), buildSkillSourceEntry(), execFileAsync, inferPortableWorkspaceGitMetadata(), readGitOutput(), readGitRemoteUrl() (+2 more)
+### Community 355 - "buildPortableProjectWorkspaces"
+Cohesion: 0.28
+Nodes (9): buildPortableProjectWorkspaces(), containsAbsolutePathFragment(), containsSystemDependentPathValue(), derivePortableProjectWorkspaceKey(), execFileAsync, inferPortableWorkspaceGitMetadata(), readGitOutput(), readGitRemoteUrl() (+1 more)
 
-### Community 356 - "Community 356"
-Cohesion: 0.33
-Nodes (4): mockEnvironmentService, mockHeartbeatService, mockInstanceSettingsService, mockLogActivity
+### Community 356 - "pipeline-case-outputs.ts"
+Cohesion: 0.18
+Nodes (19): buildCaseContextMarkdown(), contentPath(), contextFetchHint(), DELIVERABLE_TITLE_PATTERNS, deliverableDocumentRank(), downloadPath(), formatPipelineCaseOutputContextMarkdown(), normalizePreviewText() (+11 more)
 
-### Community 357 - "Community 357"
-Cohesion: 0.33
-Nodes (3): mockIssueService, mockLogActivity, mockWakeup
+### Community 357 - "heartbeat-zombie-guard.test.ts"
+Cohesion: 0.13
+Nodes (13): describeIntervalOverrunCoalesceBypass(), filterIntervalOverrunCoalesceTarget(), filterZombieCoalesceTarget(), isCoalesceTargetPastHeartbeatInterval(), isZombieRun(), resolveStalledCoalesceBudgetMs(), STALLED_COALESCE_BYPASS_SNAPSHOT_KEY, STALLED_COALESCE_INTERVAL_MULTIPLE (+5 more)
 
-### Community 358 - "Community 358"
+### Community 358 - "issue-liveness.test.ts"
 Cohesion: 0.36
 Nodes (6): blockedBlocker(), blocks, deadEnd(), issue(), manager, monitorOnlyIssue()
 
-### Community 359 - "Community 359"
-Cohesion: 0.28
-Nodes (4): cleanupRows(), createHeartbeatWithClaimRace(), heartbeatSideEffectFingerprint(), waitForHeartbeatSideEffectsSettled()
+### Community 359 - "issue-monitor-scheduler.test.ts"
+Cohesion: 0.19
+Nodes (9): ISSUE_MONITOR_DISPATCH_LAPSE_MS, ISSUE_MONITOR_LIVE_CONSUMER_MAX_AGE_MS, ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS, cleanupRows(), createHeartbeatWithClaimRace(), heartbeatSideEffectFingerprint(), reapPastOverAgeQueuedRun(), seedExpiredTriggeredFixture() (+1 more)
 
-### Community 360 - "Community 360"
-Cohesion: 0.38
-Nodes (8): buildPullRequestWorkProductFields(), PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST, pullRequestExternalId(), PullRequestWorkProductFields, PullRequestWorkProductInput, pullRequestWorkProductSourceEventActionOrder(), pullRequestWorkProductSourceEventOrder(), pullRequestWorkProductStatus()
+### Community 360 - "pull-request-work-products.ts"
+Cohesion: 0.14
+Nodes (17): buildPullRequestWorkProductFields(), OPEN_PULL_REQUEST_WORK_PRODUCT_STATUSES, PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE, PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST, PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID, pullRequestExternalId(), pullRequestMergeQueueState, PullRequestWorkProductFields (+9 more)
 
-### Community 363 - "Community 363"
+### Community 361 - "linear-webhook.test.ts"
+Cohesion: 0.40
+Nodes (4): createWebhookApp(), parseWebhookPatch(), PRIORITY_MAP, STATUS_MAP
+
+### Community 362 - "pr-review-request-ageing-producer.ts"
+Cohesion: 0.16
+Nodes (14): DigestProducer, DigestSection, DEFAULT_ESCALATE_AFTER_DAYS, formatPullRequestRef(), buildPrReviewRequestAgeingSection(), LoadedReviewState, PR_REVIEW_REQUEST_AGEING_SECTION_KEY, prReviewRequestAgeingProducer (+6 more)
+
+### Community 363 - "dev-watch-ignore.ts"
 Cohesion: 0.70
 Nodes (3): addIgnorePath(), resolveServerDevWatchIgnorePaths(), toGlobstarPath()
 
-### Community 364 - "Community 364"
-Cohesion: 0.50
-Nodes (3): claimFirstInstanceAdmin(), FirstAdminClaimResult, FirstAdminTransaction
+### Community 364 - "pipelines-service.test.ts"
+Cohesion: 0.14
+Nodes (14): loadPipelineDescendantActiveWorkCounts(), PIPELINE_CASE_EVENTS_MAX_LIMIT, PIPELINE_CONTEXT_PACK_EVENT_LIMIT, PipelineActor, app(), plantedStageConfig(), seedCarrier(), seedCompany() (+6 more)
 
-### Community 365 - "Community 365"
-Cohesion: 0.40
-Nodes (4): Applying changes (permission is gated, not automatic), Core responsibilities, Execution contract, Hard boundaries
+### Community 365 - "approval-create-issue-link-authorization.test.ts"
+Cohesion: 0.11
+Nodes (10): createApp(), createRouteDb(), mockAccessService, mockApprovalService, mockHeartbeatService, mockIssueApprovalService, mockIssueService, mockLogActivity (+2 more)
 
-### Community 366 - "Community 366"
+### Community 366 - "applyDocumentFixups"
 Cohesion: 0.60
 Nodes (5): applyDocumentFixups(), applyOperationStatusOverride(), isBoardOnlyOperation(), operationKey(), resolveOperationAuthLevel()
 
-### Community 367 - "Community 367"
-Cohesion: 0.40
-Nodes (4): Hard limits for this routine, Output, Recent agent reflection sweep, What this run must do
+### Community 367 - "user-profiles.ts"
+Cohesion: 0.25
+Nodes (16): CompanyUserRow, dayKeyExpr(), isoDay(), loadDailyStats(), loadWindowStats(), PROFILE_WINDOWS, resolveCompanyUser(), slugifyUserPart() (+8 more)
 
-### Community 368 - "Community 368"
-Cohesion: 0.40
-Nodes (4): Hard limits for this routine, Output, Refresh stale summary slots, What this run must do
+### Community 368 - "approval-link-route-equivalence.test.ts"
+Cohesion: 0.13
+Nodes (12): attachViaCreateRoute(), attachViaLinkRoute(), createApp(), createRouteDb(), mockAccessService, mockAgentService, mockApprovalService, mockHeartbeatService (+4 more)
 
-### Community 369 - "Community 369"
-Cohesion: 0.70
-Nodes (3): defaultPermissionsForRole(), normalizeAgentPermissions(), NormalizedAgentPermissions
+### Community 369 - "issue-checkout-status.ts"
+Cohesion: 0.14
+Nodes (16): reconcileUndeliverableIssueMonitors(), WakeupOptions, checkoutRestoreStatusExpression, checkoutRestoreTargetStatus, DbOrTransaction, hasCancelledBlocker, hasPendingBlocker, holdsDispatchableMonitor (+8 more)
 
-### Community 370 - "Community 370"
+### Community 370 - "done-gate.ts"
 Cohesion: 0.60
 Nodes (3): DoneGateInput, hasPrLinkEvidence(), shouldBlockNarratedDone()
 
-### Community 371 - "Community 371"
-Cohesion: 0.20
-Nodes (3): mockAdapterExecute, SeedOptions, SeedResult
+### Community 371 - "heartbeat-stale-queue-invalidation.test.ts"
+Cohesion: 0.21
+Nodes (9): mockAdapterExecute, resumeContinuationRetry(), seedCompanyAndAgent(), seedContinuationSummary(), SeedOptions, seedParkedContinuationRetry(), seedQueuedRun(), SeedResult (+1 more)
 
-### Community 372 - "Community 372"
-Cohesion: 0.20
-Nodes (5): createApp(), mockSecretService, registryFor, store, TxHandle
+### Community 372 - "routine-scheduler-heartbeat.ts"
+Cohesion: 0.19
+Nodes (15): AGENT_HEALTH_RECEIPT_KEY_LIKE_PATTERN, buildSchedulerFailureHeartbeatKey(), parseAgentHealthReceiptWindowKey(), describeSearchedWindow(), dispositionClause(), issueUiLink(), isWithinWindow(), postRoutineDispatchFailureHeartbeat() (+7 more)
 
-### Community 373 - "Community 373"
+### Community 373 - "issue-goal-fallback.ts"
 Cohesion: 0.60
 Nodes (3): MaybeId, resolveIssueGoalId(), resolveNextIssueGoalId()
 
-### Community 375 - "Community 375"
-Cohesion: 0.70
-Nodes (3): looksLikeJsonRpcMessage(), mcpHttpRequestHeaders(), parseMcpHttpResponseBody()
+### Community 374 - "agent-profile-change-gate-mixing.test.ts"
+Cohesion: 0.12
+Nodes (11): createApp(), mockAccessService, mockAgentService, mockBuiltInAgentService, mockEnvironmentService, mockFindServerAdapter, mockLogActivity, mockSecretService (+3 more)
 
-### Community 376 - "Community 376"
-Cohesion: 0.40
-Nodes (4): Core responsibilities, Cost discipline, Execution contract, Hard boundaries
+### Community 375 - "approval-agent-config-authz-routes.test.ts"
+Cohesion: 0.12
+Nodes (12): boardActor, createAppWithActor(), createRouteDb(), mockAccessService, mockApprovalService, mockHeartbeatService, mockIssueApprovalService, mockIssueService (+4 more)
 
-### Community 377 - "Community 377"
-Cohesion: 0.40
-Nodes (3): mockGetExperimental, mockIssueService, mockSpawn
+### Community 376 - "github-fetch.ts"
+Cohesion: 0.18
+Nodes (12): GITHUB_FETCH_DEADLINE_MS, GITHUB_REQUEST_TIMEOUT_MS, isGitHubDotCom(), _setGhFetchDeadlineMsForTest(), assertWebhookGithubCallsAreBounded(), blankLiterals(), closingParen(), hasOwnRequestBound() (+4 more)
 
-### Community 378 - "Community 378"
+### Community 377 - "board-chat.ts"
+Cohesion: 0.26
+Nodes (8): boardChatRoutes(), isConciergeReply(), serializeTurn(), stripActionSignals(), createApp(), mockGetExperimental, mockIssueService, mockSpawn
+
+### Community 378 - "graceful-shutdown-exit.test.ts"
 Cohesion: 0.40
 Nodes (4): fixture, here, serverRoot, tsx
 
-### Community 379 - "Community 379"
-Cohesion: 0.50
-Nodes (3): createApp(), createDbStub(), logActivityMock
+### Community 379 - "invite-create-route.test.ts"
+Cohesion: 0.60
+Nodes (4): createApp(), createDbStub(), logActivityMock, registerModuleMocks()
 
-### Community 382 - "Community 382"
-Cohesion: 0.40
-Nodes (4): mockHeartbeatService, mockIssueService, mockLogActivity, mockTreeControlService
+### Community 380 - "company-issue-identity-guard.test.ts"
+Cohesion: 0.19
+Nodes (13): syncIssueIdentityFromLinearTeam(), auditRows(), BLOCKCAST, expectSilentNoOp(), findUnguardedIdentityWrites(), IDENTITY_KEYS, IDENTITY_WRITE_ALLOW_LIST, identityOf() (+5 more)
 
-### Community 383 - "Community 383"
-Cohesion: 0.33
-Nodes (8): buildAgentHealthReceiptKeyLikePattern(), buildSchedulerFailureHeartbeatKey(), dispositionClause(), issueUiLink(), postRoutineSchedulerFailureHeartbeat(), RoutineSchedulerHeartbeatDisposition, RoutineSchedulerHeartbeatIssue, SchedulerHeartbeatAddComment
+### Community 381 - "activityService"
+Cohesion: 0.20
+Nodes (12): ActivityFilters, activityService(), asRecord(), backfillMissingRunLivenessForIssue(), countValue(), dateValue(), latestDate(), readNumber() (+4 more)
 
-### Community 384 - "Community 384"
-Cohesion: 0.22
-Nodes (9): approvalDetail(), excerpt(), genericDetail(), interactionDetail(), isPlanDocumentTarget(), readArray(), readRecord(), readString() (+1 more)
+### Community 382 - "run-log-terminal-result.ts"
+Cohesion: 0.18
+Nodes (12): findTerminalResultEventInRunLogTail(), parseJsonObject(), parseTimestampMs(), RUN_LOG_TERMINAL_MAX_SCAN_BYTES, RUN_LOG_TERMINAL_TAIL_BYTES, RunLogRangeReader, RunLogTailRead, RunLogTerminalResultEvent (+4 more)
 
-### Community 385 - "Community 385"
-Cohesion: 0.40
-Nodes (3): mockLogActivity, mockSidebarPreferenceService, ORDERED_IDS
+### Community 383 - "agent-budget-mirror-write.test.ts"
+Cohesion: 0.14
+Nodes (13): agentActor, agentRow, baseAgent, boardActor, createApp(), createDbStub(), mockAccessService, mockAgentService (+5 more)
 
-### Community 386 - "Community 386"
-Cohesion: 0.40
-Nodes (3): mockAgentService, mockCompanyPortabilityService, mockCompanySkillService
+### Community 384 - "mcp-seed-scrub-coverage.test.ts"
+Cohesion: 0.14
+Nodes (10): Coverage, EntryShape, jobManifestPath, repoRoot, resolveEntryShapes(), SCRUBBING_GATEWAY_HOSTS, SEED_COVERAGE, SeedEntry (+2 more)
 
-### Community 387 - "Community 387"
-Cohesion: 0.39
-Nodes (7): ISSUE_EXECUTION_LOCK_HOLDING_RUN_STATUSES, runStatusHoldsIssueExecutionLock(), TERMINAL_HEARTBEAT_RUN_STATUS_VALUES, TERMINAL_HEARTBEAT_RUN_STATUSES, seedAgent(), seedCompany(), seedIssueHeldByRunWithStatus()
+### Community 385 - "stacked-pr-auto-retarget.test.ts"
+Cohesion: 0.17
+Nodes (10): buildApp(), linkPullRequest(), mockListOpenPrsByBase, mockResolveBranchState, mockResolveMergedBase, mockResolveMergeShape, post(), seedCompany() (+2 more)
 
-### Community 388 - "Community 388"
-Cohesion: 0.50
-Nodes (3): SOUL.md -- CEO Persona, Strategic Posture, Voice and Tone
+### Community 386 - "heartbeat-hard-stale-subprocess-liveness.test.ts"
+Cohesion: 0.14
+Nodes (10): numberFromEnv(), parseCpuQuantityToMillicores(), mockDeleteAgentJobExact, mockDeleteAgentJobsForRun, mockHasActiveJobForAgent, mockListAgentJobRunStatuses, mockListLiveAgentJobRunIds, mockListManagedAgentJobs (+2 more)
 
-### Community 389 - "Community 389"
-Cohesion: 0.25
-Nodes (9): describeNoExecutableTurnMechanismMix(), formatMonitorGating(), formatNoExecutableTurnGating(), formatNoExecutableTurnTriggerNote(), formatPullRequestEvidence(), isFreshPullRequest(), isProgressPullRequest(), msToHuman() (+1 more)
+### Community 387 - "plugin-webhook-not-ready-retryable.test.ts"
+Cohesion: 0.14
+Nodes (11): boundWebhookRejectionPluginKey(), logPluginWebhookDeliveryRejection(), MAX_TRACKED_WEBHOOK_REJECTION_PLUGIN_KEYS, OVERFLOW_WEBHOOK_REJECTION_PLUGIN_KEY, PLUGIN_WEBHOOK_DELIVERY_REJECTED_METRIC, recordPluginWebhookDeliveryRejected(), createApp(), mockLifecycle (+3 more)
 
-### Community 393 - "Community 393"
-Cohesion: 0.50
-Nodes (3): Fall-through write protocol, Short-circuit protocol, Wake Pre-flight (do this FIRST when woken)
+### Community 388 - "scheduler-lease.ts"
+Cohesion: 0.23
+Nodes (11): recordSchedulerLeaseState(), acquireSchedulerLease(), firstRow(), HEARTBEAT_TIMER_LEASE, LeaseDb, releaseSchedulerLease(), SCHEDULER_LEASE_RENEW_INTERVAL_MS, SCHEDULER_LEASE_TTL_MS (+3 more)
 
-### Community 396 - "Community 396"
-Cohesion: 0.50
-Nodes (3): captured, CapturedRequest, responseFor
+### Community 389 - "readNonEmptyString"
+Cohesion: 0.23
+Nodes (14): asRecord(), capacityRetryFromBody(), isPenstockCapacityBody(), parseCapacityResetIso(), parseCapacityRetry(), parseOptionalDate(), parseRetryAfterSeconds(), readCapacityReason() (+6 more)
 
-### Community 399 - "Community 399"
+### Community 390 - "sweep-wake-preflight.test.ts"
+Cohesion: 0.15
+Nodes (13): compareSweepWakeFrame(), equalStringArrays(), isValidIsoDate(), isValidSweepWakeFrame(), parseScalar(), parseSweepWakeFramePage(), sortLex(), SweepWakeFrame (+5 more)
+
+### Community 391 - "agent-hire-source-issue-authorization.test.ts"
+Cohesion: 0.15
+Nodes (10): createApp(), createDb(), mockAccessService, mockAgentService, mockApprovalService, mockIssueApprovalService, mockIssueService, mockLogActivity (+2 more)
+
+### Community 392 - "approval-revision-exit.test.ts"
+Cohesion: 0.15
+Nodes (10): BOARD_NOTE, get(), mockAgentService, mockApprovalService, mockListIssuesForApproval, mockLogActivity, mockWakeup, racingUpdates() (+2 more)
+
+### Community 393 - "issue-create-pr-review-duplicate-routes.test.ts"
+Cohesion: 0.21
+Nodes (9): __test_buildPrReviewerTaskLockKeys, DUPLICATE_PR_REVIEW_ISSUE_ERROR_CODE, NOT_A_REVIEW_REQUEST_MARKER, configureReviewer(), createApp(), NORMALIZED_REPO, seedAgent(), seedCompany() (+1 more)
+
+### Community 394 - "company-search-rate-limit.ts"
+Cohesion: 0.21
+Nodes (8): COMPANY_SEARCH_RATE_LIMIT_MAX_REQUESTS, COMPANY_SEARCH_RATE_LIMIT_WINDOW_MS, CompanySearchRateLimitActor, CompanySearchRateLimiter, CompanySearchRateLimitResult, createCompanySearchRateLimiter(), createApp(), unusedSearch()
+
+### Community 395 - "createToolGatewayService"
+Cohesion: 0.04
+Nodes (111): parseRemoteHttpEndpoint(), remoteEndpoint(), asRecord(), auditSafeEndpoint(), createToolGatewayService(), allowPrivateRemoteEndpoints(), allTools(), approvalRequiredInstructions() (+103 more)
+
+### Community 396 - "HEARTBEAT.md -- CEO Heartbeat Checklist"
+Cohesion: 0.17
+Nodes (11): 1. Identity and Context, 2. Local Planning Check, 3. Approval Follow-Up, 4. Get Assignments, 5. Checkout and Work, 6. Delegation, 7. Fact Extraction, 8. Exit (+3 more)
+
+### Community 399 - "docker-onboard-smoke-contract.test.ts"
 Cohesion: 0.50
 Nodes (3): repoRoot, smokeScript, smokeWorkflow
 
-### Community 401 - "Community 401"
+### Community 401 - "approval-payload-title-guard.test.ts"
+Cohesion: 0.29
+Nodes (10): findPayloadProperty(), isApprovalsInsertValuesCall(), listSourceFiles(), objectHasTitleKey(), payloadObjectLiteralsOf(), propertyNameIs(), scanFile(), visit() (+2 more)
+
+### Community 402 - "openclaw-invite-prompt-route.test.ts"
+Cohesion: 0.25
+Nodes (8): createApp(), createDbStub(), createSelectChain(), mockAccessService, mockAgentService, mockBoardAuthService, mockLogActivity, mockStorage
+
+### Community 403 - "extractEnforcementAssertions"
+Cohesion: 0.24
+Nodes (12): stampPriors(), asArray(), asFiniteNumber(), asNonEmptyString(), asRecord(), extractEnforcementAssertions(), loadEnforcedBudgetPolicies(), readAmountCents() (+4 more)
+
+### Community 404 - "issues-open-assignment-census.test.ts"
+Cohesion: 0.18
+Nodes (7): clampIssueListLimit(), OPEN_ASSIGNMENT_CENSUS_MAX_AGENT_GROUPS, OPEN_ISSUE_STATUSES, appAs(), oracle(), PRIORITY_RANK, rankOf()
+
+### Community 405 - "plugin-status-metrics.ts"
+Cohesion: 0.27
+Nodes (10): PLUGIN_ERROR_METRIC, PLUGIN_STATUS_COLLECTOR_LAST_SUCCESS_METRIC, PluginErrorStatusEntry, setPluginErrorStatus(), setPluginStatusCollectorLastSuccessSeconds(), pluginErrorEntriesFromRows(), PluginStatusCollectorOptions, PluginStatusRow (+2 more)
+
+### Community 406 - "readPenstockCapacity"
+Cohesion: 0.29
+Nodes (10): capacityEndpointUnavailable(), defaultCapacityRetry(), denyObservation(), inconclusiveCapacityReadback(), isAuthoritativeCapacityReason(), isProbeAuthFault(), logProbeAuthFault(), PenstockAvailabilityGateLogger (+2 more)
+
+### Community 408 - "auth-session-route.test.ts"
+Cohesion: 0.20
+Nodes (5): createDb(), createSelectChain(), then(), values(), chartDir
+
+### Community 409 - "github-review-posted-metric.test.ts"
+Cohesion: 0.18
+Nodes (6): __test_resolvePostedReviewObservation, GITHUB_REVIEW_COMPLETION_METRIC, GITHUB_REVIEW_POSTED_METRIC, normalizeGithubReviewRepo(), recordGithubReviewPosted(), ALLY_REVIEW_BODY
+
+### Community 410 - "issue-watchdogs-routes.test.ts"
 Cohesion: 0.28
-Nodes (5): findPayloadProperty(), payloadObjectLiteralsOf(), propertyNameIs(), SRC_DIR, STATICALLY_UNVERIFIABLE_ALLOWLIST
+Nodes (5): createApp(), seedCloudTenantMember(), seedCompany(), seedWatchdogRun(), uniqueIssuePrefix()
 
-### Community 402 - "Community 402"
+### Community 411 - "assertAssignableAgent"
+Cohesion: 0.27
+Nodes (10): AgentAssignmentConflictReason, AgentAssignmentKind, assertAssignableAgent(), AssignabilityAgent, assignmentMessage(), assignmentReasonFromHealth(), conflictDetails(), getAgent() (+2 more)
+
+### Community 412 - "approval-enforcement-reconciler.test.ts"
+Cohesion: 0.18
+Nodes (9): BUDGET_POLICY_AMOUNT_ASSERTION, diffEnforcementAssertions(), EnforcedBudgetPolicy, parseJsonBodyStrict(), AMOUNT_MOVED_AFTER_DECISION, AMOUNT_UNMOVED_SINCE_DECISION, CARD_6F45844E_DECIDED_AT, CARD_6F45844E_EXACT_CHANGES (+1 more)
+
+### Community 413 - "company-issue-identity.ts"
+Cohesion: 0.27
+Nodes (10): ISSUE_IDENTITY_ACTIVITY_ACTION, IssueIdentityPlan, IssueIdentityRefusal, IssueIdentityRequest, IssueIdentityState, normalizeIssuePrefix(), planIssueIdentityChange(), setCompanyIssueIdentity() (+2 more)
+
+### Community 421 - "documents.ts"
+Cohesion: 0.31
+Nodes (7): documentService(), extractLegacyPlanBody(), issueDocumentSelect, isUniqueViolation(), mapIssueDocumentRow(), nextAvailableDocumentKey(), normalizeDocumentKey()
+
+### Community 425 - "matchesTaskKey"
+Cohesion: 0.25
+Nodes (8): isSameTaskScope(), canClaimPrReviewTask(), isPrReviewTaskKey(), matchesAnyTaskKey(), matchesTaskKey(), prReviewTaskLockSpellings(), taskKeysMatch(), allowPenstockGate
+
+### Community 427 - "sse-registry.ts"
+Cohesion: 0.39
+Nodes (5): active, MAX_SSE_BACKLOG_BYTES, sseBacklogExceeded(), sseRegistry, writeSseFrame()
+
+### Community 428 - "environment-instance-routes.test.ts"
+Cohesion: 0.18
+Nodes (9): createApp(), mockEnvironmentCustomImageService, mockEnvironmentService, mockExecutionWorkspaceService, mockInstanceSettingsService, mockIssueService, mockLogActivity, mockProjectService (+1 more)
+
+### Community 430 - "plugin-metric-exposition.test.ts"
+Cohesion: 0.07
+Nodes (24): dbInheritedTimeoutSeries(), DB_INHERITED_TIMEOUT_METRIC, DbInheritedTimeoutSetting, PLUGIN_METRIC_CARDINALITY_BUDGET, PLUGIN_METRIC_DROPPED_METRIC, PLUGIN_METRIC_LABEL_VALUE_MAX_LENGTH, PLUGIN_METRIC_NAME_BUDGET, PLUGIN_METRIC_OVERFLOW_NAME (+16 more)
+
+### Community 431 - "Ally — Consolidated PR Review"
+Cohesion: 0.18
+Nodes (10): Ally — Consolidated PR Review, Critical Issues (0), Important Issues (0), On the one open gate, Prior Findings Dispositioned (2), Re-verified at this head (fresh, not carried forward), Recommended Action, Strengths (+2 more)
+
+### Community 433 - "issue-runtime-service-command-masking.test.ts"
 Cohesion: 0.22
-Nodes (6): createApp(), mockAccessService, mockAgentService, mockBoardAuthService, mockLogActivity, mockStorage
+Nodes (8): createApp(), makeQueryChain(), makeRuntimeService(), makeWorkspace(), mockAccessService, mockAgentService, mockExecutionWorkspaceService, mockIssueService
 
-### Community 403 - "Community 403"
-Cohesion: 0.32
-Nodes (8): hostnameForResolution(), isPrivateOrReservedIpv4(), isPrivateOrReservedIpv6(), isPublicIpAddress(), lookupInviteResolutionHostname(), parseIpv4Address(), parseMappedIpv4Hex(), resolveInviteResolutionTarget()
-
-### Community 404 - "Community 404"
-Cohesion: 0.32
-Nodes (8): agentIsInSubtree(), isAgentInSubtree(), loadCompanyAgentHierarchy(), prefixedScopeValues(), scopeAllows(), scopeIncludesId(), scopeValueList(), scopeValuesForKeys()
-
-### Community 405 - "Community 405"
-Cohesion: 0.50
-Nodes (3): mockPino, mockTransport, PinoTransportOptions
-
-### Community 410 - "Community 410"
-Cohesion: 0.32
-Nodes (4): createApp(), seedCloudTenantMember(), seedCompany(), uniqueIssuePrefix()
-
-### Community 411 - "Community 411"
-Cohesion: 0.52
-Nodes (6): redactAgentConfigPayload(), redactApprovalPayloadByType(), redactApprovalPayloadForDisplay(), redactEventPayload(), sanitizeCommandArgs(), sanitizeRecord()
-
-### Community 413 - "Community 413"
-Cohesion: 1.00
-Nodes (3): normalizeStopFingerprint(), reviewedFingerprintForWatchdogIssue(), stopFingerprintFromText()
-
-### Community 427 - "Community 427"
-Cohesion: 0.43
-Nodes (4): active, sseBacklogExceeded(), sseRegistry, writeSseFrame()
-
-### Community 437 - "Community 437"
+### Community 437 - "deriveSkillExportDirCandidates"
 Cohesion: 0.33
-Nodes (4): evaluateStrandedRunRecovery(), StrandedRunRecoveryCandidate, StrandedRunRecoveryEligibility, UNDISPATCHED_HEARTBEAT_RUN_STATUSES
+Nodes (10): appendSkillExportDirSuffix(), buildSkillExportDirMap(), deriveLocalExportNamespace(), derivePrimarySkillExportDir(), deriveSkillExportDirCandidates(), hashSkillValue(), normalizeExportPathSegment(), normalizeSkillKey() (+2 more)
 
-### Community 461 - "Community 461"
-Cohesion: 0.38
-Nodes (3): tornSharedStore(), writeInstalledPackageVersion(), writeLockfileVersion()
+### Community 438 - "database-backup-health.ts"
+Cohesion: 0.29
+Nodes (9): alertFileCandidates(), DatabaseBackupHealthStatus, DatabaseBackupHealthWarning, DatabaseBackupHealthWarningCode, findLatestBackup(), inspectDatabaseBackupHealth(), InspectDatabaseBackupHealthOptions, readLastFailure() (+1 more)
 
-### Community 462 - "Community 462"
-Cohesion: 0.33
-Nodes (4): isExplicitPrReviewRequestWake(), shouldQueueFollowupForRunningIssueWake(), shouldQueueFollowupInsteadOfAbsorbingIntoRunningRun(), allowPenstockGate
+### Community 446 - "human-gated-gate-revalidation-wiring.test.ts"
+Cohesion: 0.20
+Nodes (3): humanGatedAgeingProducer, collect(), NOW
 
-### Community 463 - "Community 463"
-Cohesion: 0.33
+### Community 447 - "agent-budgets-route-config-revision.test.ts"
+Cohesion: 0.24
+Nodes (6): CompanyRow, createApp(), Db, issuePrefix(), seed(), seedWithSecrets()
+
+### Community 460 - "secrets/types.ts"
+Cohesion: 0.10
+Nodes (22): awsSecretsManagerProvider, gcpSecretManagerProvider, unavailableProvider(), externalFingerprint(), prepareExternalReference(), vaultProvider, checkSecretProviders(), listSecretProviders() (+14 more)
+
+### Community 461 - "blocked-inbox-count-list-parity.test.ts"
+Cohesion: 0.31
+Nodes (6): createCompany(), EXTERNAL_WAIT_DECLARATION, insertIssue(), parkDeclaredEarly(), seedExternallyParkedRowWithCoveredBlocker(), seedParkedRows()
+
+### Community 462 - "cases-routes.test.ts"
+Cohesion: 0.20
+Nodes (3): app(), authenticatedApp(), enableCases()
+
+### Community 463 - "plugin-manifest-validator.ts"
+Cohesion: 0.22
 Nodes (5): ManifestParseFailure, ManifestParseResult, ManifestParseSuccess, pluginManifestValidator, SUPPORTED_VERSIONS
 
-### Community 467 - "Community 467"
-Cohesion: 0.33
-Nodes (4): createApp(), mockIssueService, mockLifecycle, mockRegistry
+### Community 464 - "plugin-state-store.ts"
+Cohesion: 0.14
+Nodes (17): normalizeGbrainRecallStatus(), recordGbrainRecallOutcome(), assertIdentifier(), assertPluginFencingGeneration(), FENCING_GENERATION_LOST_CODE, PluginFencingPreconditionInput, quoteIdentifier(), ResolvedPluginFencingPrecondition (+9 more)
 
-### Community 468 - "Community 468"
-Cohesion: 0.40
-Nodes (5): parseYamlBlock(), parseYamlFile(), parseYamlFrontmatter(), parseYamlScalar(), prepareYamlLines()
+### Community 465 - "scrape-metrics-routine-fire-gap-work.test.ts"
+Cohesion: 0.22
+Nodes (5): db, rows, settle(), tickAt(), TRIGGERS
 
-### Community 470 - "Community 470"
-Cohesion: 0.50
-Nodes (4): AdvisoryLockDb, lockIssueMonitorQueue(), tryLockIssueMonitorQueue(), withIssueMonitorQueueLock()
+### Community 467 - "trust-proxy.ts"
+Cohesion: 0.36
+Nodes (7): RFC-4291, applyTrustProxy(), isValidSubnetToken(), NAMED_SUBNETS, parseTrustProxyEnv(), TrustProxyValue, appWithEnv()
 
-### Community 473 - "Community 473"
-Cohesion: 0.40
-Nodes (3): createApp(), mockLifecycle, mockRegistry
+### Community 468 - "privateHostnameGuard"
+Cohesion: 0.42
+Nodes (7): blockedHostnameMessage(), extractHostname(), isLoopbackHostname(), normalizeAllowedHostnames(), privateHostnameGuard(), resolvePrivateHostnameAllowSet(), createApp()
 
-### Community 474 - "Community 474"
+### Community 469 - "pr-review-issue-scope-locks.test.ts"
+Cohesion: 0.25
+Nodes (8): DuplicatePrReviewIssueCandidate, classify(), fakeDb(), GuardTx, ONE_PR, OPTIONS, Statement, TWO_PRS
+
+### Community 470 - "closeOpenSuppressedReviews"
+Cohesion: 0.20
+Nodes (10): AdvisoryLockDb, lockIssueMonitorQueue(), withIssueMonitorQueueLock(), isDependencyBlockedClosableRecord(), isDependencyBlockedClosableTrigger(), isDependencyBlockedClosableTriggerSet(), issueRunScopeInSql(), closeOpenSuppressedReviews() (+2 more)
+
+### Community 471 - "heartbeat-reviewer-evidence-live-head.test.ts"
+Cohesion: 0.25
+Nodes (6): FakeReview, h, jsonResponse(), PRIVATE_KEY_PEM, { privateKey }, stubGithub()
+
+### Community 472 - "permissions-upgrade-boundary-routes.test.ts"
+Cohesion: 0.16
+Nodes (4): activeReservations(), Db, createApp(), Db
+
+### Community 473 - "issue-stale-execution-lock-routes.test.ts"
+Cohesion: 0.25
+Nodes (3): createApp(), seedCompanyAgentAndRuns(), seedPendingReviewStageIssue()
+
+### Community 474 - "startup-filesystem-io.test.ts"
 Cohesion: 0.40
 Nodes (4): repoRoot, serverSource, statefulSet, tempDirs
 
-### Community 476 - "Community 476"
-Cohesion: 0.83
-Nodes (3): incrementToolRuntimeMetricCounter(), minuteBucket(), recordToolRuntimeAuditWriteFailure()
+### Community 475 - "chain"
+Cohesion: 0.18
+Nodes (3): createFakeDb(), chain, VALID_HEADERS
 
-### Community 479 - "Community 479"
+### Community 476 - "event-loop-stall-log.ts"
+Cohesion: 0.43
+Nodes (6): EventLoopStallLogOptions, resolveStallThresholdMs(), startEventLoopStallLogging(), blockEventLoop(), blockUntilStallObserved(), sleep()
+
+### Community 477 - "issue-monitor-convergence-message.test.ts"
+Cohesion: 0.32
+Nodes (6): loadIssueUnblockOwners(), recordMonitorConvergenceEscalation(), IssueUnblockOwner, monitorConvergenceComment(), convergence, owner()
+
+### Community 478 - "Ally — Consolidated PR Review"
+Cohesion: 0.25
+Nodes (7): Ally — Consolidated PR Review, Critical Issues (0), Important Issues (0), Prior Findings Dispositioned (1), Recommended Action, Strengths, Suggestions (0)
+
+### Community 479 - "human-gated-gate-revalidation-backfill.test.ts"
+Cohesion: 0.25
+Nodes (4): NOW, Stub, StubInteraction, StubIssue
+
+### Community 480 - "issue-stable-enumeration-routes.test.ts"
+Cohesion: 0.29
+Nodes (3): createApp(), seedCompany(), uniqueIssuePrefix()
+
+### Community 481 - "ceo/AGENTS.md"
+Cohesion: 0.29
+Nodes (6): Delegation (critical), Keeping work moving, Memory and Planning, References, Safety Considerations, What you DO personally
+
+### Community 483 - "penstock-availability-gate.test.ts"
+Cohesion: 0.33
+Nodes (4): createPenstockAvailabilityGate(), gateWith(), gateWith(), log
+
+### Community 484 - "plugin-host-service-cleanup.ts"
+Cohesion: 0.29
+Nodes (3): LifecycleLike, PluginHostServiceCleanupController, PluginWorkerRuntimeEvent
+
+### Community 485 - "ensureServerWorkspaceLinksCurrent"
+Cohesion: 0.33
+Nodes (7): discoverWorkspacePackagePaths(), visit(), ensureServerWorkspaceLinksCurrent(), findServerWorkspaceLinkMismatches(), findWorkspaceRoot(), isLinkedGitWorktreeCheckout(), readJsonFile()
+
+### Community 486 - "Ally — Consolidated PR Review"
+Cohesion: 0.29
+Nodes (6): Ally — Consolidated PR Review, Critical Issues (0), Important Issues (0), Recommended Action, Strengths, Suggestions (2)
+
+### Community 487 - "heartbeat-worktree-suppression.test.ts"
+Cohesion: 0.33
+Nodes (4): armWorktreeRunExecution(), deleteHeartbeatRunsWithDependents(), drainInFlightExecutions(), isHeartbeatRunDependentFkError()
+
+### Community 488 - "pod-failure-label-corpus.test.ts"
+Cohesion: 0.29
+Nodes (4): executePath, FIXTURE_PATTERNS, repoRoot, testsDir
+
+### Community 489 - "linear-tunnel.ts"
+Cohesion: 0.47
+Nodes (3): registerLinearWebhook(), registerWebhookWithToken(), startLinearTunnel()
+
+### Community 491 - "issue-assignment-wakeup.ts"
+Cohesion: 0.40
+Nodes (5): IssueAssignmentWakeupDeps, prReviewTargetFromIssue(), queueIssueAssignmentWakeup(), WakeupSource, WakeupTriggerDetail
+
+### Community 492 - "agent-auth-middleware.test.ts"
+Cohesion: 0.40
+Nodes (3): createApp(), createDbState(), createSelectChain()
+
+### Community 493 - "plugin-worker-invocation-scope.cjs"
+Cohesion: 0.40
+Nodes (5): pendingNested, readline, rl, send(), sendNestedHostRequest()
+
+### Community 494 - "issue-checkout-routine-lock-conflict.test.ts"
+Cohesion: 0.53
+Nodes (4): seedAgent(), seedCompany(), seedDuplicateRoutineExecutions(), seedRun()
+
+### Community 495 - "issue-release-lock-only-degrade.test.ts"
+Cohesion: 0.53
+Nodes (4): seedAgent(), seedCompany(), seedHolderRun(), seedStalePair()
+
+### Community 496 - "pen3139-transcript-credential-shapes.test.ts"
+Cohesion: 0.33
+Nodes (4): CARRIERS, NO_CURRENT_USER_REDACTION, Shape, VENDOR_SHAPES
+
+### Community 497 - "startup-dispatch-isolation.test.ts"
+Cohesion: 0.33
+Nodes (4): analyzeRecoveryIife(), ESCAPE_CALLS, repoRoot, serverSource
+
+### Community 498 - "workspace-operation-secret-scrub.test.ts"
+Cohesion: 0.40
+Nodes (5): capturedAppends, capturedInserts, capturedUpdates, makeFakeDb(), runOperation()
+
+### Community 499 - "reflection-coach/AGENTS.md"
+Cohesion: 0.40
+Nodes (4): Applying changes (permission is gated, not automatic), Core responsibilities, Execution contract, Hard boundaries
+
+### Community 500 - "Recent agent reflection sweep"
+Cohesion: 0.40
+Nodes (4): Hard limits for this routine, Output, Recent agent reflection sweep, What this run must do
+
+### Community 501 - "summarizer/AGENTS.md"
+Cohesion: 0.40
+Nodes (4): Core responsibilities, Cost discipline, Execution contract, Hard boundaries
+
+### Community 502 - "Refresh stale summary slots"
+Cohesion: 0.40
+Nodes (4): Hard limits for this routine, Output, Refresh stale summary slots, What this run must do
+
+### Community 503 - "validateTerminalUpgrade"
+Cohesion: 0.50
+Nodes (3): CustomImageTerminalService, terminalPayloadValidationError(), validateTerminalUpgrade()
+
+### Community 504 - "healthz-probe-route.test.ts"
+Cohesion: 0.40
+Nodes (3): HEALTH_PROBE_DEADLINE_MS, appSource, repoRoot
+
+### Community 505 - "environment-runtime-driver-contract.test.ts"
+Cohesion: 0.50
+Nodes (3): runContract(), RuntimeContractCase, seedEnvironment()
+
+### Community 507 - "issue-thread-interactions-service.test.ts"
+Cohesion: 0.50
+Nodes (4): AcceptGateInteractionKind, seedAcceptGateFixture(), seedAgentIssue(), seedConfirmationIssue()
+
+### Community 508 - "metrics-route-no-db.test.ts"
+Cohesion: 0.40
+Nodes (3): APP_SOURCE, DB_REFRESHES, INLINE_REFRESHES
+
+### Community 509 - "reviewer-wake-outcome-log-fields.test.ts"
+Cohesion: 0.50
+Nodes (4): OutcomeLine, outcomeLines(), strippedSource(), WEBHOOK_SOURCE
+
+### Community 510 - "SOUL.md -- CEO Persona"
+Cohesion: 0.50
+Nodes (3): SOUL.md -- CEO Persona, Strategic Posture, Voice and Tone
+
+### Community 511 - "Wake Pre-flight (do this FIRST when woken)"
+Cohesion: 0.50
+Nodes (3): Fall-through write protocol, Short-circuit protocol, Wake Pre-flight (do this FIRST when woken)
+
+### Community 514 - "redactSecretValuesFromText"
 Cohesion: 0.67
-Nodes (3): issueIdFromRunContext(), issueIdFromWakePayload(), readNonEmptyString()
+Nodes (4): orderedSecrets(), redactSecretValuesDeep(), walk(), redactSecretValuesFromText()
 
 ## Knowledge Gaps
-- **2697 isolated node(s):** `CEO`, `OPERATOR`, `ENGINEER`, `Db`, `LogEntry` (+2692 more)
-  These have ≤1 connection - possible missing edges or undocumented components.
-- **42 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
+- **3699 isolated node(s):** `CEO`, `OPERATOR`, `ENGINEER`, `Db`, `LogEntry` (+3694 more)
+  These have ≤1 connection - possible missing edges or undocumented components. (Counts symbols only; 5550 node(s) total have ≤1 connection when file, concept and rationale nodes are included.)
+- **68 thin communities (<3 nodes) omitted from report** — run `graphify query` to explore isolated nodes.
 
 ## Suggested Questions
 _Questions this graph is uniquely positioned to answer:_
 
-- **Why does `unprocessable()` connect `Community 220` to `Community 1`, `Community 2`, `Community 131`, `Community 4`, `Community 7`, `Community 8`, `Community 9`, `Community 10`, `Community 11`, `Community 264`, `Community 16`, `Community 144`, `Community 21`, `Community 151`, `Community 24`, `Community 27`, `Community 28`, `Community 412`, `Community 29`, `Community 31`, `Community 288`, `Community 35`, `Community 165`, `Community 38`, `Community 41`, `Community 42`, `Community 44`, `Community 46`, `Community 47`, `Community 48`, `Community 174`, `Community 54`, `Community 186`, `Community 188`, `Community 61`, `Community 62`, `Community 63`, `Community 66`, `Community 73`, `Community 74`, `Community 75`, `Community 78`, `Community 82`, `Community 87`, `Community 88`, `Community 94`, `Community 227`, `Community 228`, `Community 99`, `Community 107`, `Community 109`, `Community 114`, `Community 120`, `Community 122`?**
-  _High betweenness centrality (0.042) - this node is a cross-community bridge._
-- **Why does `notFound()` connect `Community 87` to `Community 0`, `Community 1`, `Community 2`, `Community 129`, `Community 4`, `Community 131`, `Community 7`, `Community 8`, `Community 9`, `Community 10`, `Community 11`, `Community 12`, `Community 144`, `Community 16`, `Community 145`, `Community 21`, `Community 22`, `Community 150`, `Community 24`, `Community 27`, `Community 412`, `Community 28`, `Community 32`, `Community 35`, `Community 38`, `Community 41`, `Community 42`, `Community 44`, `Community 46`, `Community 47`, `Community 48`, `Community 174`, `Community 186`, `Community 61`, `Community 62`, `Community 63`, `Community 66`, `Community 68`, `Community 74`, `Community 75`, `Community 332`, `Community 77`, `Community 78`, `Community 207`, `Community 464`, `Community 80`, `Community 210`, `Community 82`, `Community 333`, `Community 220`, `Community 94`, `Community 228`, `Community 101`, `Community 229`, `Community 230`, `Community 109`, `Community 110`, `Community 112`, `Community 120`, `Community 121`, `Community 252`?**
-  _High betweenness centrality (0.039) - this node is a cross-community bridge._
-- **Why does `logger` connect `Community 39` to `Community 0`, `Community 1`, `Community 3`, `Community 4`, `Community 5`, `Community 134`, `Community 7`, `Community 132`, `Community 9`, `Community 10`, `Community 267`, `Community 12`, `Community 138`, `Community 14`, `Community 15`, `Community 144`, `Community 145`, `Community 18`, `Community 22`, `Community 23`, `Community 26`, `Community 157`, `Community 158`, `Community 31`, `Community 289`, `Community 34`, `Community 291`, `Community 43`, `Community 46`, `Community 48`, `Community 176`, `Community 53`, `Community 184`, `Community 57`, `Community 312`, `Community 60`, `Community 64`, `Community 324`, `Community 68`, `Community 197`, `Community 71`, `Community 330`, `Community 203`, `Community 75`, `Community 204`, `Community 202`, `Community 209`, `Community 210`, `Community 86`, `Community 88`, `Community 97`, `Community 104`, `Community 105`, `Community 106`, `Community 110`, `Community 240`, `Community 112`, `Community 241`, `Community 248`, `Community 251`, `Community 127`?**
-  _High betweenness centrality (0.036) - this node is a cross-community bridge._
-- **Are the 18 inferred relationships involving `issueRoutes()` (e.g. with `createApp()` and `createApp()`) actually correct?**
-  _`issueRoutes()` has 18 INFERRED edges - model-reasoned connections that need verification._
-- **Are the 98 inferred relationships involving `parseObject()` (e.g. with `execute()` and `testEnvironment()`) actually correct?**
-  _`parseObject()` has 98 INFERRED edges - model-reasoned connections that need verification._
+- **Why does `heartbeatService()` connect `heartbeatService` to `heartbeat.ts`, `source-trust.ts`, `embedded-postgres.ts`, `github-status-delivery-outbox.ts`, `app.ts`, `successful-run-handoff.ts`, `routes/projects.ts`, `environmentService`, `branch-run-claims.ts`, `workspace-runtime.ts`, `trust-preset-resolver.ts`, `k8s-job-liveness.ts`, `parseObject`, `heartbeat-run-runtime-status.ts`, `issue-rewake-throttle.ts`, `model-profile-hint.ts`, `executeRun`, `agent-auth-jwt.ts`, `issueService`, `secretService`, `logger.ts`, `managed-checkout-partial-clone.ts`, `services/instance-settings.ts`, `registry.ts`, `db-retry.ts`, `run-secret-redaction.ts`, `matchesTaskKey`, `feedback.ts`, `redactCurrentUserText`, `github-app-auth.ts`, `heartbeat-retry-scheduling.test.ts`, `environment-runtime.ts`, `heartbeat-run-summary.ts`, `companySkillService`, `execution-workspace-cleanup.ts`, `process-loss-classification.ts`, `redaction.ts`, `agent-invokability.ts`, `conflict`, `services/execution-workspaces.ts`, `services/issue-tree-control.ts`, `heartbeat-stop-metadata.ts`, `services/index.ts`, `run-scratch.ts`, `local-service-supervisor.ts`, `environment-run-orchestrator.ts`, `run-liveness.ts`, `input`, `task-watchdogs.ts`, `unprocessable`, `normalizeIssueExecutionPolicy`, `config.ts`, `execution-allowlist.ts`, `extractWakeCommentIds`, `asNumber`, `heartbeat-hintless-transient-upstream.test.ts`, `hot-restart.ts`, `recoveryService`, `visibleIssueCondition`, `parseIssueExecutionState`, `penstock-availability-gate.test.ts`, `productivityReviewService`, `pull-request-work-products.ts`, `terminal-gate-reconciler.ts`, `sweep-wake-preflight.ts`, `budgetService`, `issue-checkout-status.ts`, `execution-workspace-policy.ts`, `reconcileStrandedRecoveryWakeBackstopImpl`, `run-log-terminal-result.ts`?**
+  _High betweenness centrality (0.001) - this node is a cross-community bridge._
+- **Why does `executionWorkspaceService()` connect `services/execution-workspaces.ts` to `visibleIssueCondition`, `services/issues.ts`, `services/projects.ts`, `unprocessable`, `normalizeIssueExecutionPolicy`, `execution-workspace-policy.ts`, `issue-recovery-actions.ts`?**
+  _High betweenness centrality (0.001) - this node is a cross-community bridge._
+- **Why does `buildHostServices()` connect `plugin-host-services.ts` to `app.ts`, `plugin-secrets-handler.ts`, `accessService`, `issueService`, `secretService`, `documents.ts`, `authorizationService`, `plugin-metric-exposition.test.ts`, `live-events.ts`, `plugin-orchestration-apis.test.ts`, `heartbeatService`, `redaction.ts`, `services/execution-workspaces.ts`, `services/index.ts`, `plugin-database.ts`, `services/projects.ts`, `issue-thread-interactions.ts`, `agentService`, `plugin-state-store.ts`, `pluginManagedRoutineService`, `plugin-managed-agents.ts`, `plugin-managed-skills.ts`, `budgetService`, `pluginRegistryService`?**
+  _High betweenness centrality (0.000) - this node is a cross-community bridge._
+- **Are the 41 inferred relationships involving `heartbeatService()` (e.g. with `decorateHeartbeatRunRuntimeStatus()` and `buildIssueGraphLivenessAutoRecoveryPreview()`) actually correct?**
+  _`heartbeatService()` has 41 INFERRED edges - model-reasoned connections that need verification._
+- **Are the 6 inferred relationships involving `issueRoutes()` (e.g. with `applyCreateIssueStatusDefault()` and `executeKeyedCommentEffect()`) actually correct?**
+  _`issueRoutes()` has 6 INFERRED edges - model-reasoned connections that need verification._
+- **Are the 3 inferred relationships involving `issueService()` (e.g. with `cancelStaleIssueContextRuns()` and `clearCheckoutRunIfTerminal()`) actually correct?**
+  _`issueService()` has 3 INFERRED edges - model-reasoned connections that need verification._
 - **What connects `CEO`, `OPERATOR`, `ENGINEER` to the rest of the system?**
-  _2697 weakly-connected nodes found - possible documentation gaps or missing edges._
-- **Should `Community 0` be split into smaller, more focused modules?**
-  _Cohesion score 0.012075643654591022 - nodes in this community are weakly interconnected._
+  _3699 weakly-connected nodes found - possible documentation gaps or missing edges._
