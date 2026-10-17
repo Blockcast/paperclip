@@ -47,6 +47,27 @@ function rungIntervalMs(state: AlertStateRecord, config: AlertmanagerPluginConfi
   return typeof minutes === "number" && Number.isFinite(minutes) && minutes > 0 ? minutes * 60_000 : 60 * 60_000;
 }
 
+/**
+ * True when `issueId` has at least one blocker that is still live, meaning
+ * neither `done` nor `cancelled` (BLO-40673). That is the edge
+ * `issue_blockers_resolved_sweep` will eventually drain. A `cancelled`
+ * blocker never drains, so it is deliberately not counted here: parking a row
+ * `blocked` behind it would leave the row with no wake path at all.
+ *
+ * Fails toward `false`. A relations read that throws leaves the caller on its
+ * pre-BLO-40673 behaviour (`todo`, ladder advances), which keeps the row
+ * reachable. Failing toward `true` would let one RPC error park a firing alert.
+ */
+export async function hasLiveBlocker(ctx: PluginContext, issueId: string, companyId: string): Promise<boolean> {
+  try {
+    const { blockedBy } = await ctx.issues.relations.get(issueId, companyId);
+    return blockedBy.some((b) => b.status !== "done" && b.status !== "cancelled");
+  } catch (err) {
+    ctx.logger.warn(`alertmanager: blocker read for issue ${issueId} failed; treating as unblocked: ${String(err)}`);
+    return false;
+  }
+}
+
 function holdUntil(comments: Array<{ body: string }>): number | null {
   let latest: number | null = null;
   for (const { body } of comments) {
@@ -771,6 +792,17 @@ async function advanceIssueLadder(
     // Refusal needs no branch: re-arming the schedule is idempotent and the
     // next sweep recomputes it from whatever the webhook wrote.
     await casAlertState(ctx, ref, state, { ...state, nextEscalationAt: new Date(hold).toISOString() });
+    return;
+  }
+
+  // BLO-40673: a row parked behind a live blocker is waiting on that blocker's
+  // owner, not on this row's. Waking it is refused by the host anyway
+  // (`requestWakeup` rejects unresolved blockers), and the later rungs would
+  // reassign it up the chain and mint a [user-cover] for work nobody can start.
+  // Defer the rung by one interval instead. The edge resolving (or being cut)
+  // puts the ladder back on its normal schedule at the next sweep.
+  if (await hasLiveBlocker(ctx, issue.id, companyId)) {
+    await casAlertState(ctx, ref, state, { ...state, nextEscalationAt: new Date(now.getTime() + rungIntervalMs(state, config)).toISOString() });
     return;
   }
 
