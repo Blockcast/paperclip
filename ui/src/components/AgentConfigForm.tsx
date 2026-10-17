@@ -917,7 +917,11 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
   }
 
   return (
-    <div className={cn("relative", cards && "space-y-6")}>
+    // `data-env-editor-scope`: this form's own Save/Test buttons sit outside the env editor's DOM,
+    // so the editor's outside-click guard has to be able to tell them from a button on some other
+    // card. Marking the root is how a panel built from plain `div`s declares that boundary
+    // (PEN-4232); without it the editor falls back to a document-wide reach.
+    <div className={cn("relative", cards && "space-y-6")} data-env-editor-scope="">
       {/* ---- Floating Save button (edit mode, when dirty) ---- */}
       {isDirty && !props.hideInlineSave && (
         <div className="sticky top-0 z-10 flex items-center justify-end px-4 py-2 bg-background/90 backdrop-blur-sm border-b border-primary/20">

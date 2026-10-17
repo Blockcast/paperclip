@@ -1707,7 +1707,14 @@ export function CompanyEnvironments({ mode = "list" }: CompanyEnvironmentsProps)
       ) : null}
 
       {isEnvironmentFormPage && (mode === "create" || editingEnvironment) ? (
-        <div className="rounded-md border border-border bg-background" data-testid="environment-form-page">
+        // `data-env-editor-scope` bounds the env editor's outside-click guard to this panel's own
+        // footer (Test / Save), so a refused env draft cannot cancel a button elsewhere on the
+        // page (PEN-4232).
+        <div
+          className="rounded-md border border-border bg-background"
+          data-testid="environment-form-page"
+          data-env-editor-scope=""
+        >
           <div className="border-b border-border/60 px-6 pb-4 pt-6">
             <div className="mb-4">
               <Button size="sm" variant="ghost" asChild>
