@@ -28,6 +28,7 @@
 
 import { envBindingSecretRefSchema, envBindingUserSecretRefSchema } from "@paperclipai/shared";
 import { isUuidSecretRef } from "./json-schema-secret-refs.js";
+import { assignRecordKey, ownRecordValue } from "../record-keys.js";
 
 /**
  * Sentinel returned in place of a secret-bearing value. Chosen to be visually
@@ -669,14 +670,18 @@ export function maskPluginConfigJson(
       : inheritedSuspect || nodesAreAmbiguous(nodes) || (key !== null && matchesSecretFieldName(key));
 
     if (isPlainRecord(value)) {
+      // `assignRecordKey` (PEN-4240). A stored `__proto__` key cannot reach this
+      // READ walk while `mergeRecord` below drops it on the write path -- i.e. this
+      // site is masked by a sibling bug, not by a server-authored key set. Fixing
+      // the write side alone would newly activate it here.
       const result: Record<string, unknown> = {};
       for (const [childKey, childValue] of Object.entries(value)) {
-        result[childKey] = maskNode(
+        assignRecordKey(result, childKey, maskNode(
           childValue,
           childKey,
           expandSchemaNodes(childNodesForKey(nodes, childKey), root),
           suspect,
-        );
+        ));
       }
       return result;
     }
@@ -779,7 +784,7 @@ export function redactSecretValuesDeep<T>(value: T, secretValues: readonly strin
     if (isPlainRecord(node)) {
       const result: Record<string, unknown> = {};
       for (const [key, child] of Object.entries(node)) {
-        result[redactSecretValuesFromText(key, secrets)] = walk(child);
+        assignRecordKey(result, redactSecretValuesFromText(key, secrets), walk(child));
       }
       return result;
     }
@@ -1019,14 +1024,17 @@ export function mergeMaskedPluginConfig(
     const result: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(incoming)) {
       const childPath = path ? `${path}.${key}` : key;
+      // OWN-property read (PEN-4240): once an incoming `__proto__` key survives this walk,
+      // a bare `storedNode[key]` resolves up the chain to `Object.prototype` and the posted
+      // value would merge against it as though something had been stored there.
       const merged = mergeValue(
         value,
-        storedNode[key],
+        ownRecordValue(storedNode, key),
         childPath,
         expandSchemaNodes(childNodesForKey(nodes, key), root),
       );
       if (merged === DROP_KEY) continue;
-      result[key] = merged;
+      assignRecordKey(result, key, merged);
     }
     return result;
   }

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { sanitizeRecord } from "../redaction.js";
+import { assignRecordKey } from "../record-keys.js";
 
 export type FeedbackRedactionState = {
   redactedFields: Set<string>;
@@ -156,9 +157,13 @@ export function sanitizeFeedbackValue(
     increment(state, "structured_secret", 1);
   }
 
+  // `assignRecordKey` (PEN-4240). `sanitizeRecord` above drops a `__proto__` key at
+  // every depth today, so this walk cannot receive one -- until PEN-3288 lands in
+  // `redaction.ts`, at which point it would. Guarded now so that merge does not
+  // silently re-open the defect here; pinned structurally in the PEN-4240 test.
   const output: Record<string, unknown> = {};
   for (const [key, entry] of Object.entries(structurallySanitized)) {
-    output[key] = sanitizeFeedbackValue(entry, state, `${fieldPath}.${key}`, maxStringLength);
+    assignRecordKey(output, key, sanitizeFeedbackValue(entry, state, `${fieldPath}.${key}`, maxStringLength));
   }
   return output;
 }

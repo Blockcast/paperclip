@@ -1,3 +1,4 @@
+import { assignRecordKey } from "../record-keys.js";
 // Redaction for HTTP log payloads.
 //
 // `customProps` in logger.ts copies `req.body` / `req.params` / `req.query`
@@ -105,7 +106,7 @@ function redactContainer(value: unknown, depth: number): unknown {
   }
   const out: Record<string, unknown> = {};
   for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
-    out[key] = redactContainer(entry, depth + 1);
+    assignRecordKey(out, key, redactContainer(entry, depth + 1));
   }
   return out;
 }
@@ -138,18 +139,18 @@ export function redactSensitive(value: unknown, depth = 0): unknown {
   const out: Record<string, unknown> = {};
   for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
     if (isSensitiveKey(key)) {
-      out[key] = REDACTED;
+      assignRecordKey(out, key, REDACTED);
       continue;
     }
     if (isSensitiveContainerKey(key)) {
-      out[key] = redactContainer(entry, depth + 1);
+      assignRecordKey(out, key, redactContainer(entry, depth + 1));
       continue;
     }
     if (typeof entry === "string" && isUrlishKey(key)) {
-      out[key] = stripSecretBearingUrlParts(entry);
+      assignRecordKey(out, key, stripSecretBearingUrlParts(entry));
       continue;
     }
-    out[key] = redactSensitive(entry, depth + 1);
+    assignRecordKey(out, key, redactSensitive(entry, depth + 1));
   }
   return out;
 }

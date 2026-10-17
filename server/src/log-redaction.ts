@@ -1,4 +1,5 @@
 import os from "node:os";
+import { assignRecordKey } from "./record-keys.js";
 
 export const CURRENT_USER_REDACTION_TOKEN = "*";
 
@@ -142,7 +143,7 @@ export function redactCurrentUserValue<T>(value: T, opts?: CurrentUserRedactionO
 
   const redacted: Record<string, unknown> = {};
   for (const [key, entry] of Object.entries(value)) {
-    redacted[key] = redactCurrentUserValue(entry, opts);
+    assignRecordKey(redacted, key, redactCurrentUserValue(entry, opts));
   }
   return redacted as T;
 }
