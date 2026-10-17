@@ -752,6 +752,162 @@ describe("EnvironmentVariablesEditor", () => {
     });
   });
 
+  it("vetoes only the clicks inside its own submission scope while a rename is refused (PEN-4232)", async () => {
+    // The refusal cancels the click (PEN-3358). That cancel has to be bounded, or an editor with a
+    // blocker open swallows every `type="submit"` button and every save/create/update/test/import
+    // label *anywhere in the document* — a sibling card's Update, a portaled dialog's Create.
+    //
+    // Both arms of the listener's `||` are exercised here on purpose: the sibling "Update" and the
+    // stray "Import" are `type="submit"`, which the listener claims regardless of their labels, so
+    // an opt-in marker on the *button* would not have reached them.
+    const inScopeSave = vi.fn();
+    const siblingUpdate = vi.fn();
+    const dialogCreate = vi.fn();
+    const strayImport = vi.fn();
+    const onChange = vi.fn();
+
+    function PageHarness() {
+      const [value, setValue] = useState<Record<string, EnvBinding>>({
+        GH_TOKEN: { type: "plain", value: REDACTED_SENTINEL },
+      });
+      return (
+        <div>
+          {/* The editor's own panel: no <form>, like every in-repo consumer. */}
+          <div data-env-editor-scope="">
+            <EnvironmentVariablesEditor
+              value={value}
+              secrets={secrets}
+              onChange={(next) => {
+                onChange(next);
+                setValue(next ?? {});
+              }}
+              onCreateSecret={async () => secrets[0]}
+            />
+            <button type="button" onClick={inScopeSave}>
+              Save environment
+            </button>
+          </div>
+          {/* An unrelated card, with its own form. */}
+          <form onSubmit={(event) => event.preventDefault()}>
+            <button type="submit" onClick={siblingUpdate}>
+              Update
+            </button>
+          </form>
+          {/* A dialog the editor does not live in. */}
+          <div role="dialog">
+            <button type="button" onClick={dialogCreate}>
+              Create secret
+            </button>
+          </div>
+          {/* A submit button belonging to nothing at all. */}
+          <button type="submit" onClick={strayImport}>
+            Import
+          </button>
+        </div>
+      );
+    }
+
+    render(<PageHarness />);
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
+
+    function byLabel(text: string) {
+      return [...container.querySelectorAll<HTMLButtonElement>("button")].find(
+        (button) => button.textContent?.trim() === text,
+      )!;
+    }
+    // Dispatch rather than `.click()` so the listener's own effect — cancelling the event — is
+    // readable here; a `stopPropagation()` in the document capture phase also keeps the event from
+    // ever reaching React's root listener, which is what the handler spies record.
+    function clickIsVetoed(button: HTMLButtonElement) {
+      const event = new MouseEvent("click", { bubbles: true, cancelable: true });
+      button.dispatchEvent(event);
+      return event.defaultPrevented;
+    }
+
+    // Refuse the draft: rename the row whose value is withheld.
+    const nameInput = nameInputs()[0]!;
+    setter.call(nameInput, "GITHUB_TOKEN");
+    nameInput.dispatchEvent(new Event("input", { bubbles: true }));
+    await flush();
+    expect(container.textContent, "the refusal must be live for this test to mean anything").toContain("Can't save");
+
+    // Positive: the panel's own footer button is the one the editor may cancel.
+    expect(clickIsVetoed(byLabel("Save environment")), "the editor's own panel Save must be vetoed").toBe(true);
+    await flush();
+    expect(inScopeSave, "and its handler must never run").not.toHaveBeenCalled();
+
+    // Negative — the half that already passed before this fix is the positive one, so these are
+    // the assertions that pin it. Each of these buttons belongs to something else.
+    expect(clickIsVetoed(byLabel("Update")), "a sibling form's submit must not be vetoed").toBe(false);
+    await flush();
+    expect(siblingUpdate, "a sibling form's submit must still fire").toHaveBeenCalledTimes(1);
+
+    expect(clickIsVetoed(byLabel("Create secret")), "a dialog the editor is not in must not be vetoed").toBe(false);
+    await flush();
+    expect(dialogCreate, "that dialog's button must still fire").toHaveBeenCalledTimes(1);
+
+    expect(clickIsVetoed(byLabel("Import")), "a stray submit button must not be vetoed").toBe(false);
+    await flush();
+    expect(strayImport, "the stray submit button must still fire").toHaveBeenCalledTimes(1);
+
+    // Nothing above may have promoted the refused draft, in or out of scope.
+    expect(onChange, "a refused draft is never promoted").not.toHaveBeenCalled();
+
+    // Lift the block. An out-of-scope click still *flushes* — that is this listener's original job
+    // and it is unchanged; only the cancel is scoped.
+    const maskedValue = container.querySelectorAll<HTMLInputElement>('input[aria-label="Variable value"]')[0]!;
+    setter.call(maskedValue, "a-new-token");
+    maskedValue.dispatchEvent(new Event("input", { bubbles: true }));
+    await flush();
+    expect(clickIsVetoed(byLabel("Update")), "with no refusal there is nothing to veto").toBe(false);
+    await flush();
+    expect(onChange, "an out-of-scope click still promotes a clean draft").toHaveBeenLastCalledWith({
+      GITHUB_TOKEN: { type: "plain", value: "a-new-token" },
+    });
+    expect(siblingUpdate).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps its document-wide reach when neither side declares a scope (PEN-4232)", async () => {
+    // The fallback, and it is load-bearing: a consumer that wraps the editor in neither a form, a
+    // dialog, nor a `data-env-editor-scope` root still gets the PEN-3358 guard over its own Save.
+    // Scoping down to "veto nothing" there would hand the silent partial save straight back.
+    const outerSave = vi.fn();
+
+    function BareHarness() {
+      const [value, setValue] = useState<Record<string, EnvBinding>>({
+        GH_TOKEN: { type: "plain", value: REDACTED_SENTINEL },
+      });
+      return (
+        <div>
+          <EnvironmentVariablesEditor
+            value={value}
+            secrets={secrets}
+            onChange={(next) => setValue(next ?? {})}
+            onCreateSecret={async () => secrets[0]}
+          />
+          <button type="button" data-testid="outer-save" onClick={outerSave}>
+            Save
+          </button>
+        </div>
+      );
+    }
+
+    render(<BareHarness />);
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
+    const nameInput = nameInputs()[0]!;
+    setter.call(nameInput, "GITHUB_TOKEN");
+    nameInput.dispatchEvent(new Event("input", { bubbles: true }));
+    await flush();
+
+    // By test id, not by label: the editor renders its own disabled "Save" inside its root.
+    const save = container.querySelector<HTMLButtonElement>('[data-testid="outer-save"]')!;
+    const event = new MouseEvent("click", { bubbles: true, cancelable: true });
+    save.dispatchEvent(event);
+    await flush();
+    expect(event.defaultPrevented, "an undeclared consumer keeps the guard over its own Save").toBe(true);
+    expect(outerSave).not.toHaveBeenCalled();
+  });
+
   it("bulk-imports a dotenv paste into an empty name field", async () => {
     const onChange = vi.fn();
     render(<EnvironmentVariablesEditor value={{}} secrets={secrets} onChange={onChange} onCreateSecret={async () => secrets[0]} />);

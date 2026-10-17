@@ -90,6 +90,41 @@ function formatChangedNames(names: readonly string[]): string {
     : shown;
 }
 
+/**
+ * Elements that bound "one thing the user is about to submit".
+ *
+ * A `<form>` is the real boundary. A dialog is the boundary for a consumer that renders the editor
+ * in one without a form. `data-env-editor-scope` is for a consumer that is neither — a settings
+ * panel assembled from plain `div`s, which is what every in-repo consumer actually is — and lets it
+ * say where its own footer ends.
+ */
+const SUBMISSION_SCOPE_SELECTOR = 'form, dialog, [role="dialog"], [role="alertdialog"], [data-env-editor-scope]';
+
+function submissionScopeOf(element: Element): Element | null {
+  return element.closest(SUBMISSION_SCOPE_SELECTOR);
+}
+
+/**
+ * Does an outside button belong to the same thing-being-submitted as the editor?
+ *
+ * This gates a *veto*, not a flush: on a refusal the outside-click listener cancels the click
+ * (PEN-3358), and an unscoped cancel is a veto over the whole document — with a blocker open, a
+ * sibling card's "Update" or a portaled dialog's "Create" would be swallowed by an editor they have
+ * nothing to do with (PEN-4232).
+ *
+ * Scoping on the *resolved scope* covers both ways that listener claims a click — the
+ * `type === "submit"` arm and the label arm — where an opt-in marker on the button would have fixed
+ * only the second and left every stray submit button in the document vetoed.
+ *
+ * When the editor resolves no scope at all, keep the pre-existing reach (any button that also
+ * resolves none). Degrading to "veto nothing" there would hand back the silent partial save
+ * PEN-3358 closed, because no in-repo consumer wraps the editor in a form or a dialog today. Such a
+ * consumer narrows this to its own panel by marking that panel `data-env-editor-scope`.
+ */
+function sharesSubmissionScope(button: Element, editorRoot: Element): boolean {
+  return submissionScopeOf(button) === submissionScopeOf(editorRoot);
+}
+
 function cloneRows(rows: readonly EnvRow[]): EnvRow[] {
   return rows.map((row) => ({ ...row }));
 }
@@ -318,23 +353,25 @@ export const EnvironmentVariablesEditor = forwardRef<EnvironmentVariablesEditorH
     // else on the page — a sticky header, a dialog footer — and the editor's banner may well be
     // scrolled out of view, so "the banner already says so" is not a signal the user receives.
     // Focus the offending row (same move the editor's own Save makes) and say it once out loud.
-    if (renameBlockers.length > 0) {
-      const message = maskedRenameBlockerMessage(renameBlockers) ?? "Can't save: a hidden value can't be renamed.";
+    // `renameBlockerMessage` is non-null exactly when `renameBlockers` is non-empty (`model.ts`),
+    // so branching on the message is the same test and carries the sentence with it. The banner
+    // renders this very value — one refusal, one phrasing, one memo.
+    if (renameBlockerMessage) {
       setPendingFocus({ rowId: renameBlockers[0]!.id, field: "name" });
       toast?.pushToast({
-        title: message,
+        title: renameBlockerMessage,
         tone: "error",
         // Repeated Save presses are one unresolved problem, not a queue of them.
-        dedupeKey: `env-editor-rename-blocked|${message}`,
+        dedupeKey: `env-editor-rename-blocked|${renameBlockerMessage}`,
       });
-      return { status: "blocked", message };
+      return { status: "blocked", message: renameBlockerMessage };
     }
     pendingSaveValueKeyRef.current = draftValueKey;
     flushSync(() => {
       onChange(draftValue);
     });
     return { status: "flushed", env: draftValue ?? {} };
-  }, [disabled, draftValue, draftValueKey, hasUnsavedChanges, onChange, renameBlockers, toast]);
+  }, [disabled, draftValue, draftValueKey, hasUnsavedChanges, onChange, renameBlockerMessage, renameBlockers, toast]);
 
   useImperativeHandle(ref, () => ({ flushPendingDraft }), [flushPendingDraft]);
 
@@ -369,20 +406,29 @@ export const EnvironmentVariablesEditor = forwardRef<EnvironmentVariablesEditorH
       const button = target.closest("button");
       if (!button || button.disabled) return;
       const label = `${button.getAttribute("aria-label") ?? ""} ${button.textContent ?? ""}`;
-      if (button.type === "submit" || /\b(save|create|update|test|import)\b/i.test(label)) {
-        // Same reasoning as the form `submit` listener above: on a refusal, swallow the click in
-        // the capture phase so the outer button's own handler never runs. Without this the button
-        // would proceed on state the editor has just refused to update.
-        if (flushPendingDraft().status === "blocked") {
-          event.preventDefault();
-          event.stopPropagation();
-        }
+      if (!(button.type === "submit" || /\b(save|create|update|test|import)\b/i.test(label))) return;
+
+      if (!sharesSubmissionScope(button, currentRoot)) {
+        // Someone else's submit. The flush is still worth doing — it is the pre-PEN-3358 behaviour
+        // of this listener and costs the user nothing — but only when there is nothing to refuse:
+        // a refusal here would toast and steal focus over an action that is not ours to refuse,
+        // and we are deliberately not cancelling the click (PEN-4232).
+        if (renameBlockers.length === 0) flushPendingDraft();
+        return;
+      }
+
+      // Same reasoning as the form `submit` listener above: on a refusal, swallow the click in
+      // the capture phase so the outer button's own handler never runs. Without this the button
+      // would proceed on state the editor has just refused to update.
+      if (flushPendingDraft().status === "blocked") {
+        event.preventDefault();
+        event.stopPropagation();
       }
     }
 
     document.addEventListener("click", handleDocumentClick, true);
     return () => document.removeEventListener("click", handleDocumentClick, true);
-  }, [flushPendingDraft]);
+  }, [flushPendingDraft, renameBlockers]);
 
   function updateDraft(nextRows: EnvRow[]) {
     setRows(nextRows);
