@@ -28,7 +28,8 @@ permissions:
 
 jobs:
   staleness:
-    runs-on: default
+    # BLO-46675: off org group 1 (`default`) onto the paperclip-only pool.
+    runs-on: arc-paperclip-general
     steps:
       - uses: actions/checkout@v4
         with:

@@ -36,7 +36,9 @@ jobs:
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'storybook-visual'))
-    runs-on: default
+    # BLO-46675: off org group 1 (`default`); label-gated, so rare, and the
+    # queueing on the paperclip-only pool is accepted (CTO ruling).
+    runs-on: arc-paperclip-general
     timeout-minutes: 35
 
     steps:
