@@ -259,6 +259,39 @@ export function isPlainObject(value: unknown): value is Record<string, unknown> 
   return proto === Object.prototype || proto === null;
 }
 
+/**
+ * The seed for every key-accumulating walk in this module.
+ *
+ * On an ordinary `{}` the assignment `out["__proto__"] = …` does NOT add a key: it hits
+ * `Object.prototype`'s inherited `__proto__` SETTER and re-parents the accumulator, so the key
+ * is absent from the output and from `JSON.stringify`. `JSON.parse` defines `__proto__` as a
+ * real OWN data property, so any jsonb column or request body can carry one — this is reachable
+ * input, not a curiosity. An `Object.prototype.hasOwnProperty.call(...)` guard is NOT a
+ * substitute: it fixes an `in` check and leaves the setter in place, so the key still vanishes.
+ *
+ * Dropping a key discloses strictly less than masking it, so nothing ever leaked here. What it
+ * broke is the PEN-2370 ask-1 invariant this module exists to provide — key NAMES survive so a
+ * reader can tell "withheld" from "never set", values elide. `withholdAgentConfigKeys` is the
+ * sharpest case: a withheld `__proto__` was missing from the output AND from `withheldFields`,
+ * so the approval card under-reported what it withheld.
+ *
+ * A null prototype has no inherited setter, so the key lands as ordinary data and is masked like
+ * any other. `isPlainObject` above admits `proto === null` deliberately, so these accumulators
+ * stay plain objects for this module's own recursion and for every caller that re-walks them.
+ *
+ * Spread seeds (`{ ...incoming }`) are already safe and are deliberately left alone: spread uses
+ * CreateDataProperty, which defines an own `__proto__` rather than invoking the setter.
+ *
+ * PEN-3288. First applied to the two `maskWorkspaceRuntimeForRead` accumulators in `d6da53d04`
+ * (PEN-3073); this centralises that fix across all twelve walks in the module. The sibling
+ * defect in `services/secrets.ts` (PEN-3257) is deliberately NOT routed through this helper —
+ * that is a WRITE boundary, where refusing the key with a 422 is the right answer. Here the
+ * input is already stored, so refusing would turn a harmless stored oddity into a failed read.
+ */
+function emptyRecord(): Record<string, unknown> {
+  return Object.create(null) as Record<string, unknown>;
+}
+
 function isSecretPointerCandidate(value: unknown): value is Record<string, unknown> & { type: "secret_ref" | "user_secret_ref" } {
   return isPlainObject(value) && (value.type === "secret_ref" || value.type === "user_secret_ref");
 }
@@ -335,7 +368,7 @@ function sanitizeValue(value: unknown, options?: SanitizeOptions): unknown {
  * becomes the sentinel string.
  */
 function sanitizeAgentEnvRecord(record: Record<string, unknown>): Record<string, unknown> {
-  const redacted: Record<string, unknown> = {};
+  const redacted: Record<string, unknown> = emptyRecord();
   for (const [key, value] of Object.entries(record)) {
     if (isSecretRefBinding(value)) {
       redacted[key] = sanitizeSecretRefPointer(value) ?? REDACTED_EVENT_VALUE;
@@ -380,7 +413,7 @@ const BENIGN_HEADER_NAMES = new Set([
 ]);
 
 function sanitizeAgentHeaderRecord(record: Record<string, unknown>, options?: SanitizeOptions): Record<string, unknown> {
-  const redacted: Record<string, unknown> = {};
+  const redacted: Record<string, unknown> = emptyRecord();
   for (const [key, value] of Object.entries(record)) {
     redacted[key] = BENIGN_HEADER_NAMES.has(key.trim().toLowerCase())
       ? sanitizeValue(value, options)
@@ -604,7 +637,7 @@ function sanitizeSecretMatchedValue(value: unknown, options: SanitizeOptions | u
     return value.map((entry) => sanitizeSecretMatchedValue(entry, options, tier));
   }
   if (isPlainObject(value)) {
-    const out: Record<string, unknown> = {};
+    const out: Record<string, unknown> = emptyRecord();
     for (const [k, v] of Object.entries(value)) {
       // A child key's own classification only ever strengthens the
       // inherited tier (min(1, 2) = 1), never weakens it — a neutral child
@@ -619,7 +652,7 @@ function sanitizeSecretMatchedValue(value: unknown, options: SanitizeOptions | u
 }
 
 export function sanitizeRecord(record: Record<string, unknown>, options?: SanitizeOptions): Record<string, unknown> {
-  const redacted: Record<string, unknown> = {};
+  const redacted: Record<string, unknown> = emptyRecord();
   for (const [key, value] of Object.entries(record)) {
     if (options?.agentConfig && key === "env") {
       redacted[key] = isPlainObject(value) ? sanitizeAgentEnvRecord(value) : REDACTED_EVENT_VALUE;
@@ -759,7 +792,7 @@ export function withholdAgentConfigKeys(
   function walk(value: unknown, path: string): unknown {
     if (Array.isArray(value)) return value.map((entry, index) => walk(entry, `${path}[${index}]`));
     if (!isPlainObject(value)) return value;
-    const out: Record<string, unknown> = {};
+    const out: Record<string, unknown> = emptyRecord();
     for (const [key, entry] of Object.entries(value)) {
       const childPath = path ? `${path}.${key}` : key;
       // Entitlement cannot depend on shape. Every path that builds a hire card
@@ -1150,7 +1183,7 @@ function projectRunResultJsonValue(
   }
 
   if (isPlainObject(value)) {
-    const projected: Record<string, unknown> = {};
+    const projected: Record<string, unknown> = emptyRecord();
     for (const [childKey, childValue] of Object.entries(value)) {
       const result = projectRunResultJsonValue(
         childKey,
@@ -1218,7 +1251,7 @@ export function withholdRunTranscriptStateContent<T extends Record<string, unkno
   }
 
   if (isPlainObject(out.resultJson)) {
-    const resultJson: Record<string, unknown> = {};
+    const resultJson: Record<string, unknown> = emptyRecord();
     for (const [key, value] of Object.entries(out.resultJson)) {
       const result = projectRunResultJsonValue(key, value, `resultJson.${key}`, withheldFields, 1);
       if (result.kept) resultJson[key] = result.value;
@@ -1359,7 +1392,7 @@ export function maskWorkspaceRuntimeForRead(value: unknown): unknown {
     // so this never leaked; what it broke is ask 1 — names survive, values elide — which is the
     // one property this walk exists to provide. Seeding with a null prototype removes the
     // inherited setter, so the key lands as ordinary data and is masked like any other.
-    const out: Record<string, unknown> = Object.create(null);
+    const out: Record<string, unknown> = emptyRecord();
     for (const [key, child] of Object.entries(entry)) {
       // Identity keys are honoured only on an entry sitting directly inside a
       // `commands`/`services`/`jobs` array — the one position the parser reads them
@@ -1385,7 +1418,7 @@ export function maskWorkspaceRuntimeForRead(value: unknown): unknown {
   // Null-prototype for the same reason as `maskEntry`'s accumulator above — this is the OTHER half
   // of the same walk (the record's top level; `maskEntry` handles every level below it), and both
   // have to be seeded this way or a `__proto__` key is dropped at whichever level is missed.
-  const out: Record<string, unknown> = Object.create(null);
+  const out: Record<string, unknown> = emptyRecord();
   for (const [key, child] of Object.entries(value)) {
     if (WORKSPACE_RUNTIME_COMMAND_LIST_KEYS.has(key) && Array.isArray(child)) {
       out[key] = child.map((item) => maskEntry(item, 1, isPlainObject(item)));
@@ -1570,7 +1603,7 @@ function restoreWithheldValue(incoming: unknown, existing: unknown): unknown {
   if (!isPlainObject(incoming)) return incoming;
 
   const existingRecord = isPlainObject(existing) ? existing : {};
-  const restored: Record<string, unknown> = {};
+  const restored: Record<string, unknown> = emptyRecord();
   for (const [key, value] of Object.entries(incoming)) {
     restored[key] = restoreWithheldValue(value, existingRecord[key]);
   }
@@ -1615,7 +1648,7 @@ export function redactApprovalPayloadForDisplay(
       return redactedValue.map((entry, i) => annotate(originalValue[i], entry, `${path}[${i}]`));
     }
     if (isPlainObject(redactedValue) && isPlainObject(originalValue)) {
-      const out: Record<string, unknown> = {};
+      const out: Record<string, unknown> = emptyRecord();
       for (const k of Object.keys(redactedValue)) {
         out[k] = annotate(originalValue[k], redactedValue[k], path ? `${path}.${k}` : k);
       }
@@ -1738,7 +1771,7 @@ function redactRunResultJsonValue(
     return value.map((entry) => redactRunResultJsonValue(entry, tier, path, depth + 1));
   }
   if (isPlainObject(value)) {
-    const out: Record<string, unknown> = {};
+    const out: Record<string, unknown> = emptyRecord();
     for (const [key, entry] of Object.entries(value)) {
       // A child key's own classification only ever STRENGTHENS the inherited
       // tier (min(1, 2) = 1), never weakens it — mirroring
