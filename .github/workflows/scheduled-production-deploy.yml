@@ -147,12 +147,45 @@ jobs:
         with:
           fetch-depth: 0
 
+      # `node` is not guaranteed on the arc-deploy image (it carries helm,
+      # kubectl, jq and ruby; actions/checkout runs on the runner's own bundled
+      # node, which is not on PATH for `run:` steps). setup-node explicitly, for
+      # the same reason pr.yml pins setup-python rather than trusting a bare
+      # `python3`: an unproven `command not found` on the escalation path would
+      # be worse than the gap it closes.
+      #
+      # Unconditional since PEN-3315: the non-pending outcomes run the
+      # record-closing step below, so every outcome needs node. That costs a few
+      # seconds on the common path.
+      #
+      # AHEAD OF THE DISPATCH STEP since PEN-4224, and that ORDER is now
+      # load-bearing rather than incidental. The dispatch step itself shells out
+      # to detect-dead-dispatch.mjs between guard (1) and guard (1b) — it has to
+      # run there, because guard (1b) is the early exit whose false green is the
+      # whole subject of PEN-4224, and both are inside one `run:` block. With
+      # setup-node left below, that call would be `command not found` on every
+      # slot. It fails quiet by design, so the symptom would be silence: the
+      # detection would report nothing, forever, while reading as installed.
+      # scheduled-production-deploy-schedule.test.mjs pins this order.
+      #
+      # On THIS repository there is no record for the close step to act on
+      # (`has_issues: false`; see the escalation step below), so the lifecycle it
+      # exists for never starts here. Until 2026-10-04 these lines claimed the
+      # cost "buys a record lifecycle that ends, rather than one open issue
+      # inheriting the next stall's clock".
+      - name: Set up Node
+        if: ${{ !cancelled() }}
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
       - name: Dispatch deploy if master is ahead and nothing is already pending
         id: dispatch
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           PENDING_JSON_PATH: ${{ runner.temp }}/pending-dispatches.json
+          DEAD_DISPATCH_JSON_PATH: ${{ runner.temp }}/dead-dispatch.json
           # True only for the daily cron and a manual kick. Keyed on WHICH cron
           # entry fired, not on the wall clock: GitHub delays scheduled runs under
           # load (5-17min late on this repo's own history), and an hour check would
@@ -253,6 +286,34 @@ jobs:
             exit 0
           fi
 
+          # (1c) Nothing is pending — but "nothing pending" is NOT "all is well".
+          # A dispatch that DIED in front of the deploy job leaves nothing
+          # pending either, and until PEN-4224 that read as an identical green.
+          # Measured 2026-10-17: the 07:31Z slot dispatched, the run it created
+          # failed `build-and-push` in 84s with `deploy` SKIPPED, and the 08:33,
+          # 09:30 and 10:29 sampling slots all reported `checked-no-pending`
+          # while production sat 64 commits behind. Guard (1) measures the
+          # reviewer gate's OCCUPANCY; this measures the last dispatch's FATE,
+          # which is a different question and has to be asked separately.
+          #
+          # ⛔ This OBSERVES ONLY. It dispatches nothing — guard (1)'s
+          # anti-stacking property cannot be affected by a step with no write
+          # path — and it approves nothing. It must also never redden the
+          # dispatcher by failing: `|| true` plus a defaulted read, because
+          # PEN-2848 made this workflow's `conclusion` load-bearing and it must
+          # not start meaning "detection broke". The script resolves every
+          # uncertainty to `unknown`, which reports nothing.
+          #
+          # Runs on EVERY slot, not just sampling ones, because the fate is also
+          # what stops a `dispatched` outcome from closing an unrefilled stall
+          # record on a dispatch that is already known to have died
+          # (`laneRefilled` in deploy-stall-record.mjs).
+          node .github/scripts/detect-dead-dispatch.mjs || true
+          DEAD_DISPATCH=false
+          if [ -f "$DEAD_DISPATCH_JSON_PATH" ]; then
+            DEAD_DISPATCH="$(jq -r '.dead // false' "$DEAD_DISPATCH_JSON_PATH" 2>/dev/null || echo false)"
+          fi
+
           # (1b) Sampling slots stop here. They exist ONLY to age a pending approval,
           # which is why this sits BELOW guard (1) rather than above it: guard (1) is
           # what emits `skipped-pending`, and `skipped-pending` is what arms the
@@ -261,6 +322,42 @@ jobs:
           # tidy-up. .github/scripts/tests/scheduled-production-deploy-schedule.test.mjs
           # pins the order for that reason.
           if [ "$IS_DISPATCH_SLOT" != "true" ]; then
+            # The dead-lane branch comes FIRST, because `checked-no-pending` is
+            # exactly the false green it replaces. A sampling slot cannot
+            # dispatch a replacement (that is guard (1b)'s whole purpose, and
+            # PEN-4224 deliberately did not change it), so all it can do is stop
+            # claiming the lane is healthy and name the lever that works.
+            if [ "$DEAD_DISPATCH" = "true" ]; then
+              DEAD_URL="$(jq -r '.run.url // ""' "$DEAD_DISPATCH_JSON_PATH")"
+              DEAD_ID="$(jq -r '.run.databaseId // "unknown"' "$DEAD_DISPATCH_JSON_PATH")"
+              DEAD_CONCLUSION="$(jq -r '.run.conclusion // "unknown"' "$DEAD_DISPATCH_JSON_PATH")"
+              BEHIND="$(jq -r '.gap.commitsBehind // "an unknown number of"' "$DEAD_DISPATCH_JSON_PATH")"
+              # ::warning:: rather than ::notice::, same convention as guard (1):
+              # this must not read as the identical green `checked-no-pending`
+              # that PEN-4224 measured. The run is additionally FAILED by the
+              # backstop step at the bottom of this job, so `conclusion` carries
+              # it too — the signal PEN-2848 made load-bearing.
+              echo "::warning::The last production dispatch (run $DEAD_ID) concluded $DEAD_CONCLUSION WITHOUT reaching the deploy job, and master is $BEHIND commit(s) ahead. The day's dispatch was consumed and nothing shipped."
+              {
+                echo "### ⚠️ The last production dispatch died before it could deploy"
+                echo
+                echo "\`docker.yml\` run [\`$DEAD_ID\`]($DEAD_URL) concluded \`$DEAD_CONCLUSION\` **without the \`deploy\` job ever executing**,"
+                echo "so the dispatch it was given was consumed and nothing shipped."
+                echo
+                echo "Production is **$BEHIND commit(s) behind \`master\`**."
+                echo
+                echo "This is NOT a failed deploy. A \`deploy\` job that runs and fails is a different, separately owned"
+                echo "condition; this run never reached one, which usually means the builder or the runner died in front of it."
+                echo
+                echo "**To recover now, without waiting for the next daily slot:** run the"
+                echo "[\`Scheduled production deploy dispatch\`](${GITHUB_SERVER_URL:-https://github.com}/${REPO}/actions/workflows/scheduled-production-deploy.yml)"
+                echo "workflow manually. A \`workflow_dispatch\` of this workflow dispatches regardless of the hour — it does"
+                echo "not wait for the daily cron — and it still approves nothing."
+              } >> "$GITHUB_STEP_SUMMARY"
+              echo "dead_dispatch=true" >> "$GITHUB_OUTPUT"
+              echo "outcome=dispatch-died" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
             echo "::notice::Approval-age check only: nothing pending, and this is not the daily dispatch slot."
             {
               echo "### Approval-age check only — not a dispatch slot"
@@ -335,28 +432,6 @@ jobs:
             echo "It targets \`paperclip-production\`. Whether it parks for approval depends on that environment's ratified reviewer set (\`RATIFIED_REVIEWERS\` in \`.github/scripts/check-production-environment-protection.mjs\`)."
           } >> "$GITHUB_STEP_SUMMARY"
           echo "outcome=dispatched" >> "$GITHUB_OUTPUT"
-
-      # `node` is not guaranteed on the arc-deploy image (it carries helm,
-      # kubectl, jq and ruby; actions/checkout runs on the runner's own bundled
-      # node, which is not on PATH for `run:` steps). setup-node explicitly, for
-      # the same reason pr.yml pins setup-python rather than trusting a bare
-      # `python3`: an unproven `command not found` on the escalation path would
-      # be worse than the gap it closes.
-      #
-      # Unconditional since PEN-3315: the non-pending outcomes run the
-      # record-closing step below, so every outcome needs node. That costs a few
-      # seconds on the common path.
-      #
-      # On THIS repository there is no record for that step to close
-      # (`has_issues: false`; see the escalation step below), so the lifecycle it
-      # exists for never starts here. Until 2026-10-04 these lines claimed the
-      # cost "buys a record lifecycle that ends, rather than one open issue
-      # inheriting the next stall's clock".
-      - name: Set up Node
-        if: ${{ !cancelled() }}
-        uses: actions/setup-node@v6
-        with:
-          node-version: 24
 
       # The daily cadence exists to keep drift inside the 24h alert threshold.
       # A pending approval defeats it silently: guard (1) skips, the run reports
@@ -478,6 +553,14 @@ jobs:
         if: ${{ !cancelled() && steps.dispatch.outputs.outcome != '' && steps.dispatch.outputs.outcome != 'skipped-pending' }}
         env:
           DISPATCH_OUTCOME: ${{ steps.dispatch.outputs.outcome }}
+          # PEN-4224. `dispatched` claims the lane was refilled; what actually
+          # happened is that a dispatch was ISSUED. On 2026-10-17 one was issued
+          # and the lane was never refilled, because the run it created died in
+          # front of `deploy`. Without this, that outcome closes an unrefilled
+          # record — writing "resolved, nothing is on the reviewer gate" over a
+          # stall that is still running, through the one outcome
+          # STALL_UNREFILLED_LABEL's own check waves through. See `laneRefilled`.
+          LAST_DISPATCH_FATE: ${{ steps.dispatch.outputs.last_dispatch_fate }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -496,4 +579,29 @@ jobs:
         if: steps.escalate.outputs.escalated == 'true'
         run: |
           echo "::error::A production deploy has been awaiting human approval past the alert threshold, so this dispatcher has been a no-op since. ProductionDeployApprovalStuck (severity=critical) was pushed to Alertmanager. See the step summary for the pending run."
+          exit 1
+
+      # PEN-4224's backstop, and the exact counterpart of the one above: it makes
+      # `conclusion` carry a lane that DIED, as that one makes it carry a lane
+      # that is STUCK. Without it the dispatcher's own output is the only record,
+      # and the measured failure was precisely that nobody reads it — three
+      # sampling slots reported a green `checked-no-pending` while production sat
+      # 64 commits behind and the day's dispatch had already been consumed.
+      #
+      # Repeated redness is this workflow's established, accepted shape for a
+      # standing fault, not a new cost: of the 57 dispatcher runs in the 2.4 days
+      # before 2026-10-06T23:00Z, 30 were red and all 30 failed on the stuck
+      # approval backstop above. A dead lane is red for the same reason and
+      # clears the same way — it stops the moment a dispatch reaches `deploy`.
+      #
+      # Gated on its OWN output rather than on `outcome == 'dispatch-died'`, so
+      # the set of `outcome ==` step gates stays exactly {skipped-pending} and
+      # the escalation cannot be re-coupled to this by a later edit. The
+      # dispatch step writes this output only inside the sampling-slot branch:
+      # a dispatch slot that finds a dead lane DISPATCHES A REPLACEMENT, and
+      # reddening the run that recovered would be the wrong signal entirely.
+      - name: Fail the run when the last dispatch died before it could deploy
+        if: steps.dispatch.outputs.dead_dispatch == 'true'
+        run: |
+          echo "::error::The last production dispatch died before reaching the deploy job, so the dispatch it was given shipped nothing and master is still ahead. This slot cannot dispatch a replacement (it is not the daily slot); a manual run of this workflow dispatches at any hour. See the step summary."
           exit 1

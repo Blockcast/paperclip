@@ -22,12 +22,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  DISPATCH_FATE_DIED_BEFORE_DEPLOY,
   REFILLING_OUTCOMES,
   STALL_ISSUE_TITLE,
   STALL_LABEL,
   STALL_UNREFILLED_LABEL,
   createGitHubClient,
   isUnrefilled,
+  laneRefilled,
   parseStallMarker,
   renderStallMarker,
   renderSupersedeFailedComment,
@@ -244,6 +246,74 @@ test('an unrefilled record DOES close once the lane is actually refilled', () =>
   // must not be left open forever — the daily dispatch slot is the bounded exit.
   assert.equal(REFILLING_OUTCOMES.has('dispatched'), true);
   assert.equal(REFILLING_OUTCOMES.has('up-to-date'), true);
+});
+
+// ---------------------------------------------------------------------------
+// PEN-4224. `dispatched` is a PROMISE to refill the lane, not a refill.
+//
+// The record's whole purpose is to tell "a human cleared the gate" apart from
+// "we emptied it and could not refill it". REFILLING_OUTCOMES answers that from
+// the dispatcher's OWN DECISION — and on 2026-10-17 that decision was wrong
+// about its own consequence: a dispatch was issued, reported `dispatched`, and
+// the run it created failed `build-and-push` in 84s with `deploy` skipped. The
+// lane was never refilled. Closing an unrefilled record on that writes
+// "resolved, nothing is on the reviewer gate" over a stall that is still
+// running, arriving through the one outcome the label's own check waves through.
+//
+// ⚠️ Latent, not exercised: on Blockcast/paperclip `has_issues` is false, so no
+// record exists for this to have happened to. PEN-4224 found it by reading and
+// asked for a test rather than a postmortem. These are that test.
+// ---------------------------------------------------------------------------
+
+test('a `dispatched` outcome does NOT close an unrefilled record when that dispatch died', () => {
+  // The done-when, stated directly. Before PEN-4224 this was `true`, because
+  // `dispatched` is in REFILLING_OUTCOMES and nothing else was consulted.
+  assert.equal(REFILLING_OUTCOMES.has('dispatched'), true, 'control: the outcome still refills');
+  assert.equal(
+    laneRefilled({ outcome: 'dispatched', lastDispatchFate: DISPATCH_FATE_DIED_BEFORE_DEPLOY }),
+    false,
+  );
+  // `up-to-date` is falsified by the same evidence and for the same reason.
+  assert.equal(
+    laneRefilled({ outcome: 'up-to-date', lastDispatchFate: DISPATCH_FATE_DIED_BEFORE_DEPLOY }),
+    false,
+  );
+});
+
+test('only an AFFIRMATIVE death blocks the close — an unreadable fate changes nothing', () => {
+  // Direction of error. A record that never closes is its own kind of lie: it
+  // carries a dead stall's clock into the next, unrelated one
+  // (resolveStallStartedAt above). So the pre-PEN-4224 behaviour has to survive
+  // every state that is not a measured death — including the empty string the
+  // workflow passes when the detection could not run at all.
+  for (const fate of ['survived', 'unknown', 'none', '', undefined]) {
+    assert.equal(
+      laneRefilled({ outcome: 'dispatched', lastDispatchFate: fate }),
+      true,
+      `fate ${JSON.stringify(fate)} must not block the close`,
+    );
+  }
+  assert.equal(laneRefilled({ outcome: 'dispatched' }), true, 'absent fate is not a death');
+  assert.equal(laneRefilled(), false, 'and no arguments at all is not an accidental close');
+});
+
+test('laneRefilled keeps every non-refilling outcome non-refilling', () => {
+  // The fate is an extra way to say NO, never a new way to say yes. A healthy
+  // lane must not turn `checked-no-pending` — the outcome a failed supersede
+  // produces — into a close.
+  for (const fate of ['survived', 'unknown', '']) {
+    assert.equal(laneRefilled({ outcome: 'checked-no-pending', lastDispatchFate: fate }), false);
+    assert.equal(laneRefilled({ outcome: 'dispatch-died', lastDispatchFate: fate }), false);
+  }
+});
+
+test('`dispatch-died` is classified, and classified as NOT refilling', () => {
+  // PEN-4224 adds a fifth dispatcher outcome, and the close step fires on it
+  // (it is neither empty nor `skipped-pending`). An outcome that falls through
+  // REFILLING_OUTCOMES unclassified would close an unrefilled record silently —
+  // the seam scheduled-production-deploy-schedule.test.mjs guards generically,
+  // pinned here for the specific value.
+  assert.equal(REFILLING_OUTCOMES.has('dispatch-died'), false);
 });
 
 test('the supersede-failure comment states that production did NOT ship', () => {
