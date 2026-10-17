@@ -169,7 +169,7 @@ const HEAVY = [
   "e2e",
 ];
 const LOCAL_ACTION = /uses: \.\/\.github\/actions\/verdict-dispatch\n/g;
-const MERGE_QUEUE_OR_LIGHT = "${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-light' }}";
+const MERGE_QUEUE_OR_LIGHT = "${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-paperclip-light' }}";
 
 test("Tier 1 is exactly the jobs on a heavy pool, and every one of them needs the hold", () => {
   const heavyPool = /'(arc-paperclip-general|arc-e2e|arc-default|default|arc-dind|arc-ciab|arc-multicast-integ)'/;
@@ -501,13 +501,13 @@ test("dispatcher: only the verdict, completed-run and manual arms, each a truste
   assert.doesNotMatch(dispatcherYml, /^ {2}(pull_request|pull_request_target|pull_request_review)\b/m);
 });
 
-test("dispatcher: canonical unlock and manual writer, arc-light, default branch", () => {
+test("dispatcher: canonical unlock and manual writer, arc-paperclip-light, default branch", () => {
   const dj = jobBlocks(dispatcherYml);
   assert.deepEqual(Object.keys(dj), ["manual_request", "unlock"]);
   const block = dj.unlock;
   const ifText = /^ {4}if: >-\n((?: {6}.*\n)+)/m.exec(block)?.[1];
   assert.equal(collapse(ifText), collapse(`always() && ( ${CANONICAL} || (github.event_name == 'issue_comment' && needs.manual_request.outputs.manual == 'true'))`));
-  assert.equal(runsOn(block), "arc-light");
+  assert.equal(runsOn(block), "arc-paperclip-light");
   assert.match(block, /uses: actions\/checkout@[0-9a-f]{40}[^\n]*\n {8}with:\n {10}ref: \$\{\{ github\.event\.repository\.default_branch \}\}\n/);
   assert.match(block, /concurrency:\n {6}group: ally-verdict-dispatch-\$\{\{[^\n]*\}\}\n {6}cancel-in-progress: false\n/);
   // One slot per PR across arms, so the completed-run and verdict arms serialise.
@@ -573,10 +573,10 @@ test("the vendored predicate fails closed on a missing S, and S never clears a b
   assert.match(preconditionRefusal(pull, { repository: "Blockcast/paperclip", headSha: "d".repeat(40) }), /draft/);
 });
 
-test("backstop: its own arc-light job in the sweep, with its own write scope and the kill switch", () => {
+test("backstop: its own arc-paperclip-light job in the sweep, with its own write scope and the kill switch", () => {
   const block = jobBlocks(sweepYml).ally_verdict_backstop;
   assert.ok(block);
-  assert.equal(runsOn(block), "arc-light");
+  assert.equal(runsOn(block), "arc-paperclip-light");
   assert.match(block, /permissions:\n(?: {6}.*\n)*? {6}actions: write\n/);
   assert.match(block, /run: node scripts\/ally-verdict-ci\.mjs backstop/);
   assert.match(block, /ALLY_GATED_CI_BYPASS: \$\{\{ vars\.ALLY_GATED_CI_BYPASS \}\}/, "the bypass must reach heads already held");

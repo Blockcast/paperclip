@@ -39,7 +39,7 @@ test("merge-group builds are keyed per queue entry, not per base branch", () => 
 
 test("merge-group control gates use the dedicated queue runner pool", () => {
   const runnerExpression =
-    /runs-on: \$\{\{ github\.event_name == 'merge_group' && 'arc-merge-queue' \|\| 'arc-light' \}\}/;
+    /runs-on: \$\{\{ github\.event_name == 'merge_group' && 'arc-merge-queue' \|\| 'arc-paperclip-light' \}\}/;
   const jobs = [
     extractBlock("\n  policy:\n", "\n  helm_chart:\n"),
     extractBlock("\n  helm_chart:\n", "\n  typecheck_release_registry:\n"),

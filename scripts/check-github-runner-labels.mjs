@@ -15,7 +15,7 @@ import { fileURLToPath } from "node:url";
 // the two lists match, so that drift fails loudly and by name instead.
 export const ALLOWED_RUNNERS = new Set([
   "default",
-  "arc-light",
+  "arc-paperclip-light",
   "arc-dind",
   "arc-deploy",
   "arc-e2e",

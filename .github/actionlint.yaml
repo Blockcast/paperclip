@@ -9,7 +9,7 @@
 self-hosted-runner:
   labels:
     - default
-    - arc-light
+    - arc-paperclip-light
     - arc-dind
     - arc-deploy
     - arc-e2e

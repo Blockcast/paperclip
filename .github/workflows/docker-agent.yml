@@ -493,7 +493,7 @@ jobs:
   alert-on-failure:
     needs: build-and-push
     if: always() && needs.build-and-push.result == 'failure' && github.event_name != 'workflow_dispatch'
-    runs-on: arc-light
+    runs-on: arc-paperclip-light
     steps:
       - uses: actions/checkout@v5
       - name: Report the failed build to Alertmanager
@@ -523,7 +523,7 @@ jobs:
   resolve-on-success:
     needs: build-and-push
     if: always() && needs.build-and-push.result == 'success' && github.event_name != 'workflow_dispatch'
-    runs-on: arc-light
+    runs-on: arc-paperclip-light
     steps:
       - uses: actions/checkout@v5
       - name: Resolve the delivery-lane alert (and prove the channel still works)
