@@ -1,4 +1,5 @@
 import { REDACTED_EVENT_VALUE, isPlainObject, redactAgentConfigPayload } from "./redaction.js";
+import { assignRecordKey, ownRecordValue } from "./record-keys.js";
 
 /**
  * Containment helpers for anything that serializes an agent row.
@@ -149,9 +150,15 @@ export function redactAgentSecrets<
     if (env) {
       // The top-level env keeps the shorter `***` sentinel the UI and
       // `stripRedactedEnvBindingsFromAdapterConfig` have always round-tripped.
+      // `assignRecordKey` (PEN-4240). A stored key named `__proto__` cannot reach
+      // here through the API today -- `ENV_KEY_RE` refuses the name on write
+      // (PEN-3257), once `stripRedactedEnvBindingsFromAdapterConfig` below stops
+      // dropping it before the validator runs. Guarded anyway: a non-API writer
+      // (import, seed, direct SQL) is not gated by that refusal, and a read path
+      // that silently loses a key name is the defect PEN-2370 ask-1 forbids.
       const redactedEnv: Record<string, string> = {};
       for (const key of Object.keys(env)) {
-        redactedEnv[key] = REDACTED_ENV_SENTINEL;
+        assignRecordKey(redactedEnv, key, REDACTED_ENV_SENTINEL);
       }
       result.adapterConfig = { ...containedConfig, env: redactedEnv } as T["adapterConfig"];
     } else {
@@ -266,8 +273,14 @@ function restoreRedactedAdapterValueInner(incoming: unknown, existing: unknown):
       : {};
   const restored: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(incoming as Record<string, unknown>)) {
-    const restoredValue = restoreRedactedAdapterValueInner(value, existingRecord[key]);
-    if (restoredValue !== OMIT_REDACTED_ADAPTER_VALUE) restored[key] = restoredValue;
+    // OWN-property read, not `existingRecord[key]` (PEN-4240). This is the READ half of the
+    // same `__proto__` hazard `assignRecordKey` fixes, and it needs its own remedy: once an
+    // incoming `__proto__` key SURVIVES into this walk, a bare lookup resolves it up the chain
+    // to `Object.prototype` -- which is not `undefined`, so the two sentinel branches above read
+    // it as "something was stored" and restore a withheld value to `Object.prototype`,
+    // persisting as `{}`. Fixing the write side is not a substitute for this guard.
+    const restoredValue = restoreRedactedAdapterValueInner(value, ownRecordValue(existingRecord, key));
+    if (restoredValue !== OMIT_REDACTED_ADAPTER_VALUE) assignRecordKey(restored, key, restoredValue);
   }
   return restored;
 }
@@ -302,10 +315,10 @@ export function stripRedactedEnvBindingsFromAdapterConfig(
       // and a naive save sends them back. Preserve the prior binding if we
       // have one; drop the key entirely otherwise.
       if (Object.prototype.hasOwnProperty.call(existingEnv, key)) {
-        cleaned[key] = existingEnv[key];
+        assignRecordKey(cleaned, key, existingEnv[key]);
       }
     } else {
-      cleaned[key] = value;
+      assignRecordKey(cleaned, key, value);
     }
   }
   return { ...restoredAdapterConfig, env: cleaned };

@@ -372,6 +372,47 @@ describe("agent routes adapter validation", () => {
     }));
   });
 
+  /**
+   * PEN-4240. `stripRedactedEnvBindingsFromAdapterConfig` runs BEFORE
+   * `normalizeAdapterConfigForPersistence` on this route. While its accumulator
+   * was seeded `{}`, a posted env key named `__proto__` was swallowed by
+   * `Object.prototype`'s inherited setter and was GONE before the validator
+   * ran — so PEN-3257's `ENV_KEY_RE` 422, which exists to stop exactly this
+   * silent no-op write returning `200`, could never fire here.
+   *
+   * This pins the HANDOFF, not the refusal: `secrets-service.test.ts` already
+   * owns the 422 itself, and this suite mocks persistence. What has to hold is
+   * that the key is still an own property of `env` when the route hands it over.
+   * A future reordering in `routes/agents.ts` that re-introduced a `{}`-seeded
+   * walk ahead of the validator would fail here.
+   */
+  it("hands a posted env key named `__proto__` to persistence validation", async () => {
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .patch("/api/agents/11111111-1111-4111-8111-111111111111")
+        // Raw JSON text, not an object literal: `{ __proto__: … }` in JS assigns
+        // the prototype instead of creating an own key, so the obvious spelling
+        // would pass vacuously against the pre-fix source.
+        .set("Content-Type", "application/json")
+        .send(
+          '{"adapterConfig":{"env":{"__proto__":{"type":"plain","value":"x"},'
+          + '"NORMAL":{"type":"plain","value":"y"}}}}',
+        ),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+
+    const handedOver = mockSecretService.normalizeAdapterConfigForPersistence.mock.calls.at(-1);
+    expect(handedOver, "persistence normalization was never reached").toBeTruthy();
+    const env = (handedOver?.[1] as { env?: Record<string, unknown> } | undefined)?.env ?? {};
+    // Reach control: the ordinary sibling must be here too, or the fixture
+    // never got as far as the env walk and the `__proto__` assertion below
+    // would be measuring nothing.
+    expect(Object.keys(env)).toContain("NORMAL");
+    expect(Object.keys(env)).toContain("__proto__");
+  });
+
   it("passes over-cap runtime updates to persistence validation", async () => {
     mockAgentService.getById.mockResolvedValue({
       ...(await mockAgentService.getById()),
