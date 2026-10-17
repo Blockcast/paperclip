@@ -22,10 +22,21 @@ jobs:
   build-and-push:
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: arc-dind
-    # Full agent-image rebuilds invalidate the heavy apt/toolchain layers when
-    # the base paperclip server image changes. Keep enough room for that path;
-    # Buildx still fails fast on real command errors.
-    timeout-minutes: 90
+    # BLO-47194. Derived from the slowest run that still made progress, not
+    # from a cold toolchain: over 2026-10-15T12Z..10-17T11Z every toolchain
+    # rebuild (4, each triggered by a new ffmpeg-publisher:stable digest) took
+    # <= 11 min. The tail is the per-commit overlay when buildkit-amd64-1's
+    # node disk is saturated (~95-99% io_time): run 38838769599 reached the
+    # end of "Build and push" 84.7 min after job start (healthy p50 ~13 min),
+    # then lost to the 90 min cap inside the smoke test.
+    #   84.7 (job start -> overlay pushed, worst observed)
+    # + 25.6 (smoke test p100, n=22)
+    # +  2.7 (promote + bump + post steps, worst observed)
+    # = 113.0 -> 115
+    # A wedged buildkitd (run 39003886559: zero BuildKit output for 89 min,
+    # scheduler loop stuck on a cache import) is NOT covered by any timeout;
+    # that is tracked as a daemon fault (BLO-47180), not budget.
+    timeout-minutes: 115
     # BLO-43939. `github.ref` is constant here — the trigger is `workflow_run`
     # on master only — so this is ONE group for the whole of trunk, and
     # `cancel-in-progress: true` meant the next successful server build killed
