@@ -201,6 +201,103 @@ describeEmbeddedPostgres("secretService", () => {
     ).resolves.toEqual({ EMPTY_TOKEN: { type: "plain", value: "   " } });
   });
 
+  // PEN-3257: `__proto__` is a well-formed env name by shape, and `JSON.parse` delivers it from a
+  // request body as an ordinary OWN property. Every accumulator in `services/secrets.ts` builds a
+  // plain `{}`, so assigning it hits the `Object.prototype.__proto__` setter instead of creating an
+  // own property and the binding vanishes — a `200` for a write that stored nothing. These pin the
+  // refusal at each entry point separately rather than once, because the shared `ENV_KEY_RE` is the
+  // only thing making them agree; if someone re-spells the check at one call site, one of these
+  // fails rather than all of them.
+  describe("reserved env key names (PEN-3257)", () => {
+    const protoEnv = () =>
+      JSON.parse('{"API_KEY":{"type":"plain","value":"keep"},"__proto__":{"type":"plain","value":"dropped"}}');
+
+    it("refuses __proto__ on the persistence path with a 422 naming the key", async () => {
+      const companyId = await seedCompany();
+      const svc = secretService(db);
+
+      await expect(svc.normalizeEnvBindingsForPersistence(companyId, protoEnv())).rejects.toMatchObject({
+        status: 422,
+      });
+      await expect(svc.normalizeEnvBindingsForPersistence(companyId, protoEnv())).rejects.toThrow(
+        /Invalid environment variable name: __proto__/,
+      );
+    });
+
+    it("refuses __proto__ on the adapter-config persistence path", async () => {
+      const companyId = await seedCompany();
+      const svc = secretService(db);
+
+      await expect(
+        svc.normalizeAdapterConfigForPersistence(companyId, { env: protoEnv() }),
+      ).rejects.toThrow(/Invalid environment variable name: __proto__/);
+    });
+
+    it("refuses __proto__ on the runtime env-resolution path", async () => {
+      const companyId = await seedCompany();
+      const svc = secretService(db);
+
+      await expect(
+        svc.resolveEnvBindings(companyId, protoEnv(), {
+          consumerType: "agent",
+          consumerId: "agent-1",
+          actorType: "agent",
+          actorId: "agent-1",
+        }),
+      ).rejects.toThrow(/Invalid environment variable name: __proto__/);
+    });
+
+    it("refuses __proto__ on the runtime adapter-config resolution path", async () => {
+      const companyId = await seedCompany();
+      const svc = secretService(db);
+
+      await expect(
+        svc.resolveAdapterConfigForRuntime(companyId, { env: protoEnv() }, undefined, {
+          adapterType: "hermes_gateway",
+          skipUserSecrets: true,
+        }),
+      ).rejects.toThrow(/Invalid environment variable name: __proto__/);
+    });
+
+    // Controls. Without these the refusal above is satisfiable by rejecting everything.
+    it("still accepts ordinary keys, and still accepts the other Object.prototype member names", async () => {
+      const companyId = await seedCompany();
+      const svc = secretService(db);
+
+      // `constructor`/`prototype`/`toString` assign as ordinary own properties and round-trip
+      // correctly today, so they are deliberately NOT refused — widening the guard to cover them
+      // would break writes that currently work. This control is what says so.
+      for (const key of ["API_KEY", "constructor", "prototype", "toString", "hasOwnProperty", "_x9"]) {
+        await expect(
+          svc.normalizeEnvBindingsForPersistence(
+            companyId,
+            JSON.parse(`{"${key}":{"type":"plain","value":"kept"}}`),
+          ),
+        ).resolves.toEqual({ [key]: { type: "plain", value: "kept" } });
+      }
+    });
+
+    it("still refuses a malformed name, and the refusal is not what the __proto__ guard added", async () => {
+      const companyId = await seedCompany();
+      const svc = secretService(db);
+
+      await expect(
+        svc.normalizeEnvBindingsForPersistence(companyId, { "1BAD": { type: "plain", value: "x" } }),
+      ).rejects.toThrow(/Invalid environment variable name: 1BAD/);
+      // Prefix/suffix only — the lookahead is anchored to the whole name, not a substring ban.
+      await expect(
+        svc.normalizeEnvBindingsForPersistence(companyId, {
+          __proto__x: { type: "plain", value: "x" },
+        }),
+      ).resolves.toEqual({ __proto__x: { type: "plain", value: "x" } });
+      await expect(
+        svc.normalizeEnvBindingsForPersistence(companyId, {
+          x__proto__: { type: "plain", value: "x" },
+        }),
+      ).resolves.toEqual({ x__proto__: { type: "plain", value: "x" } });
+    });
+  });
+
   it("prevents duplicate bindings for a target config path", async () => {
     const companyId = await seedCompany();
     const svc = secretService(db);

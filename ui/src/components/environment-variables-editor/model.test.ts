@@ -155,6 +155,38 @@ describe("valueFromRows (emit semantics)", () => {
   });
 });
 
+describe("valueFromRows — the `__proto__` row (PEN-3257)", () => {
+  // The save gate blocks only on masked-rename blockers, so a row named `__proto__` IS emitted.
+  // On a plain `{}` accumulator that assignment re-parents the accumulator and the row disappears
+  // with no own property — the client loses it before the server can refuse it.
+  it("emits a `__proto__` row as an own property instead of dropping it", () => {
+    const rows = rowsFromValue({ KEEP: { type: "plain", value: "a" } });
+    const emitted = valueFromRows([
+      ...rows,
+      { ...rows[0]!, id: "row-proto", name: "__proto__", textValue: "b" },
+    ])!;
+    expect(Object.getOwnPropertyNames(emitted)).toContain("__proto__");
+    expect(Object.getOwnPropertyDescriptor(emitted, "__proto__")?.value).toEqual({
+      type: "plain",
+      value: "b",
+    });
+    // It must still survive serialization — that is the half that reaches the server, which
+    // answers 422 for this name rather than storing it.
+    expect(Object.keys(JSON.parse(JSON.stringify(emitted)))).toContain("__proto__");
+  });
+
+  it("still emits ordinary rows unchanged, so the accumulator swap changed nothing else", () => {
+    const emitted = valueFromRows(rowsFromValue({
+      KEEP: { type: "plain", value: "a" },
+      OTHER: { type: "plain", value: "b" },
+    }))!;
+    expect({ ...emitted }).toEqual({
+      KEEP: { type: "plain", value: "a" },
+      OTHER: { type: "plain", value: "b" },
+    });
+  });
+});
+
 describe("validateName", () => {
   const reserved = ["PAPERCLIP_"];
 
@@ -181,6 +213,23 @@ describe("validateName", () => {
 
   it("charset error takes precedence over reserved prefix", () => {
     expect(validateName("PAPERCLIP-X", new Set(), reserved)?.level).toBe("error");
+  });
+
+  // PEN-3257. The server refuses this name (no plain `{}` accumulator can hold it), so without a
+  // client-side flag the row looks fine until the whole PATCH comes back 422.
+  it("flags __proto__ as an error, with its own message rather than the charset one", () => {
+    const issue = validateName("__proto__", new Set(), reserved);
+    expect(issue?.level).toBe("error");
+    expect(issue?.message).toMatch(/Reserved name/);
+    // The charset message would be wrong here — `__proto__` IS letters and underscores — so assert
+    // it is NOT the one shown, not merely that some error appeared.
+    expect(issue?.message).not.toMatch(/letters, digits/);
+  });
+
+  it("flags only the exact name — a key that merely contains __proto__ stays valid", () => {
+    expect(validateName("__proto__x", new Set(), reserved)).toBeNull();
+    expect(validateName("x__proto__", new Set(), reserved)).toBeNull();
+    expect(validateName("MY__proto__KEY", new Set(), reserved)).toBeNull();
   });
 });
 
