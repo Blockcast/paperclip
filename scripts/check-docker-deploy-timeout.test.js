@@ -11,10 +11,21 @@ const preflightScript = readFileSync(
   new URL("../.github/scripts/check-pending-migrations.sh", import.meta.url),
   "utf8",
 );
+const precreateScript = readFileSync(
+  new URL("../.github/scripts/precreate-online-indexes.sh", import.meta.url),
+  "utf8",
+);
 
 // The pre-flight step as executed, not merely mentioned. Shared with the
 // negative control below so the two cannot drift apart.
 const PREFLIGHT_STEP_PATTERN = /^\s*run:\s*\.github\/scripts\/check-pending-migrations\.sh\s*$/m;
+
+// PEN-4179 added a second in-cluster Job ahead of Helm: the online-index
+// precreation. Same anchoring discipline and the same reason — its path is
+// named in the margin comment above `timeout-minutes` too, so a bare-path match
+// would be satisfied by the documentation of this guard rather than by the step.
+const PRECREATE_STEP_PATTERN =
+  /^\s*run:\s*\.github\/scripts\/precreate-online-indexes\.sh\s*$/m;
 
 // BLO-31254 split the pre-flight into a startup budget (scheduling + image
 // transfer) and a run budget (the migration check), and the two are serial
@@ -34,6 +45,24 @@ function getPreflightBudgetMinutes() {
 
   assert.ok(startup, "pre-flight must declare a default PREFLIGHT_STARTUP_TIMEOUT_SECONDS");
   assert.ok(run, "pre-flight must declare a default PREFLIGHT_TIMEOUT_SECONDS");
+
+  return Math.ceil((Number(startup[1]) + Number(run[1])) / 60);
+}
+
+// The precreation budget, read out of its script for the same reason the
+// pre-flight's is: it is serial with Helm but lives in a shell file, so a raise
+// there would otherwise eat this job's margin silently. Its run budget is the
+// dominant term in the sum (PEN-4179 sizes it from the concurrent-index guard's
+// own per-spec timeouts for three pending specs), which makes an unnoticed
+// raise here the most expensive drift available in this job.
+function getPrecreateBudgetMinutes() {
+  const startup = precreateScript.match(
+    /^STARTUP_TIMEOUT_SECONDS="\$\{PRECREATE_STARTUP_TIMEOUT_SECONDS:-(\d+)\}"/m,
+  );
+  const run = precreateScript.match(/^TIMEOUT_SECONDS="\$\{PRECREATE_TIMEOUT_SECONDS:-(\d+)\}"/m);
+
+  assert.ok(startup, "precreation must declare a default PRECREATE_STARTUP_TIMEOUT_SECONDS");
+  assert.ok(run, "precreation must declare a default PRECREATE_TIMEOUT_SECONDS");
 
   return Math.ceil((Number(startup[1]) + Number(run[1])) / 60);
 }
@@ -95,15 +124,22 @@ test("Docker deploy job timeout covers every sequential rollout wait", () => {
     PREFLIGHT_STEP_PATTERN,
     "deploy job must run the pending-migration pre-flight — otherwise folding its budget in is vacuous",
   );
+  assert.match(
+    deployJob,
+    PRECREATE_STEP_PATTERN,
+    "deploy job must run the online-index precreation — otherwise folding its budget in is vacuous",
+  );
   const preflightMinutes = getPreflightBudgetMinutes();
+  const precreateMinutes = getPrecreateBudgetMinutes();
 
   const jobTimeoutMinutes = Number(jobTimeoutMatch[1]);
   const helmTimeoutMinutes = Number(helmTimeoutMatch[1]);
   const rolloutTimeoutMinutes = rolloutTimeouts.reduce((sum, minutes) => sum + minutes, 0);
 
   assert.ok(
-    jobTimeoutMinutes >= helmTimeoutMinutes + rolloutTimeoutMinutes + preflightMinutes + 10,
-    `job timeout (${jobTimeoutMinutes}m) must cover Helm (${helmTimeoutMinutes}m) + rollouts (${rolloutTimeouts.join("m + ")}m = ${rolloutTimeoutMinutes}m) + pre-flight (${preflightMinutes}m) + 10m margin`,
+    jobTimeoutMinutes
+      >= helmTimeoutMinutes + rolloutTimeoutMinutes + preflightMinutes + precreateMinutes + 10,
+    `job timeout (${jobTimeoutMinutes}m) must cover Helm (${helmTimeoutMinutes}m) + rollouts (${rolloutTimeouts.join("m + ")}m = ${rolloutTimeoutMinutes}m) + pre-flight (${preflightMinutes}m) + online-index precreation (${precreateMinutes}m) + 10m margin`,
   );
 });
 

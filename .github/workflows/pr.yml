@@ -342,6 +342,14 @@ jobs:
         run: node --test ./scripts/check-docker-deploy-timeout.test.js
         timeout-minutes: 1
 
+      # PEN-4179: the two online-index registries were maintained independently
+      # with nothing asserting how they relate, which is how the pre-flight came
+      # to tell operators to hand-run a statement the pipeline now runs itself.
+      - name: Validate online-index registry overlap and precreation ordering
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/check-online-index-registry-overlap.test.js
+        timeout-minutes: 1
+
       # BLO-33382: the agent-image delivery lane's alert job routed through
       # GitHub Issues on a repo where Issues are DISABLED, so it could never
       # emit — 8 master failures in 27h produced zero notifications while every

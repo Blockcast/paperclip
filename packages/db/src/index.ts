@@ -28,6 +28,7 @@ export {
   checkPendingMigrationPreflight,
   formatPreflightFailure,
   selectGuardedPendingIndexes,
+  MIGRATIONS_WITH_RUNNER_PRECREATION,
   PRECREATE_REQUIRED_INDEXES,
   type PrecreateRequiredIndex,
   type PreflightBlocker,

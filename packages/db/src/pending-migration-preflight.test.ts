@@ -23,6 +23,7 @@ import {
   collectPreflightBlockers,
   decidePreflightBlocker,
   formatPreflightFailure,
+  MIGRATIONS_WITH_RUNNER_PRECREATION,
   selectGuardedPendingIndexes,
   type IndexProbe,
   type PrecreateRequiredIndex,
@@ -671,5 +672,60 @@ describe("formatPreflightFailure", () => {
     ]);
     expect(message).toContain("issues_active_pr_review_uq");
     expect(message).toContain("second_idx");
+  });
+
+  // PEN-4179. The single undifferentiated paragraph this replaced asserted
+  // that the blocked migrations "cannot build the index themselves", which is
+  // true of the SQL file and false of the migration runner: for everything in
+  // PENDING_CONCURRENT_INDEXES the runner builds the index one statement
+  // earlier, outside the transaction, and the deploy pipeline now runs the same
+  // CLI as its own step. Telling an operator to hand-run a statement the
+  // pipeline owns is how PEN-4176 recorded a 25-hour deploy freeze as routine.
+  describe("partitioning by whether a deploy-time precreation path exists", () => {
+    const automatedBlocker: PreflightBlocker = {
+      migration: "0259_heartbeat_runs_failed_finished_at_index.sql",
+      index: "heartbeat_runs_failed_finished_at_idx",
+      state: "absent",
+      remediation:
+        "CREATE INDEX CONCURRENTLY IF NOT EXISTS heartbeat_runs_failed_finished_at_idx " +
+        "ON heartbeat_runs USING btree (finished_at, id) WHERE status = 'failed'",
+    };
+
+    it("derives the automated set from the guard rather than restating it", () => {
+      // Fixture check with teeth: 0236 must be absent or the "manual" case
+      // below would pass for the wrong reason.
+      expect(MIGRATIONS_WITH_RUNNER_PRECREATION.has(automatedBlocker.migration)).toBe(true);
+      expect(MIGRATIONS_WITH_RUNNER_PRECREATION.has(blockers[0].migration)).toBe(false);
+    });
+
+    it("tells the operator to read the precreation step, not to hand-run SQL", () => {
+      const message = formatPreflightFailure([automatedBlocker]);
+      expect(message).toContain("has a deploy-time precreation path");
+      expect(message).not.toContain("has NO automated path");
+      // Still printed: the operator must not be stranded if the step is broken.
+      expect(message).toContain("heartbeat_runs_failed_finished_at_idx");
+      expect(message).toContain("CREATE INDEX CONCURRENTLY");
+    });
+
+    it("still prints the operator remediation for migrations with no runner path", () => {
+      const message = formatPreflightFailure(blockers);
+      expect(message).toContain("has NO automated path");
+      expect(message).not.toContain("has a deploy-time precreation path");
+    });
+
+    it("reports both halves when a blocker set spans them", () => {
+      const message = formatPreflightFailure([automatedBlocker, ...blockers]);
+      expect(message).toContain("has a deploy-time precreation path");
+      expect(message).toContain("has NO automated path");
+      expect(message).toContain("heartbeat_runs_failed_finished_at_idx");
+      expect(message).toContain("issues_active_pr_review_uq");
+      // The headline still counts every blocker, not just one partition.
+      expect(message).toContain("2 pending migration(s)");
+    });
+
+    it("never repeats the claim that the automated half cannot build its own index", () => {
+      const message = formatPreflightFailure([automatedBlocker, ...blockers]);
+      expect(message).not.toContain("cannot build the index themselves");
+    });
   });
 });
