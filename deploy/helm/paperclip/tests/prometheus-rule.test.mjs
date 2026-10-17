@@ -2818,3 +2818,46 @@ test("the project-checkout origin alerts gate on their own positive control (PEN
     "description must name the command the reconciler actually compares",
   );
 });
+
+test("the three checkout-origin descriptions fit the Slack relay's 400-char lead", () => {
+  // The relay forwards only the first blank-line-delimited paragraph of a
+  // description, whitespace-collapsed and truncated at 400 chars (onprem-k8s
+  // monitoring/alertmanager-slack-relay.yaml, `lead_paragraph` /
+  // `DESC_LEAD_MAX`). These three descriptions led at 513, 711 and 405 chars,
+  // so the responder read a sentence cut mid-word and lost the paragraph that
+  // says what to do. Truncation is silent on every other surface: the rule
+  // renders, the alert fires, and only the human in Slack sees the damage.
+  //
+  // This asserts the rendered chart copy, which is the half that no other test
+  // covers -- the sibling assertions above match substrings anywhere in the
+  // description and so pass just as happily when the text they match has been
+  // pushed out of the lead.
+  const DESC_LEAD_MAX = 400;
+  const rendered = renderChart([
+    "--show-only",
+    "templates/prometheusrule.yaml",
+    "--set",
+    "prometheusRule.enabled=true",
+  ]);
+
+  for (const name of [
+    "PaperclipProjectCheckoutOriginMismatch",
+    "PaperclipProjectCheckoutOriginReconcileBlind",
+    "PaperclipProjectCheckoutOriginReconcileMetricsRefreshFailed",
+  ]) {
+    const raw = rendered.match(
+      new RegExp(`- alert: ${name}\\n[\\s\\S]*?description: "([^\\n]*?)"\\n`),
+    )?.[1];
+    assert.ok(raw, `${name} must render a description`);
+
+    // The rendered scalar is double-quoted with the paragraph breaks still
+    // escaped, so they have to come back before the lead can be split off.
+    const description = raw.replace(/\\n/g, "\n");
+    const lead = description.trim().split("\n\n", 1)[0].split(/\s+/).join(" ");
+
+    assert.ok(
+      lead.length <= DESC_LEAD_MAX,
+      `${name}: Slack lead is ${lead.length} chars, over the ${DESC_LEAD_MAX} cap -- break the description at a sentence boundary with a blank line. Lead: ${lead}`,
+    );
+  }
+});
