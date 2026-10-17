@@ -444,6 +444,47 @@ export function isUnrefilled(issue) {
  */
 export const REFILLING_OUTCOMES = new Set(['dispatched', 'up-to-date']);
 
+/**
+ * The fate value from detect-dead-dispatch.mjs that falsifies `dispatched`.
+ *
+ * Spelled here rather than imported to keep the module edge one-directional:
+ * detect-dead-dispatch.mjs imports THIS file (for the client and the workflow
+ * name), so importing back would make a cycle. The schedule test pins the two
+ * spellings together, exactly as it already does for DEPLOY_WORKFLOW_FILE and
+ * the shell's `--workflow=docker.yml`.
+ */
+export const DISPATCH_FATE_DIED_BEFORE_DEPLOY = 'died-before-deploy';
+
+/**
+ * Did the lane actually get refilled?
+ *
+ * `REFILLING_OUTCOMES` alone answers this from the dispatcher's OWN DECISION,
+ * and PEN-4224 showed that decision can be wrong about its own consequence:
+ * `dispatched` asserts "the lane was refilled" when what happened is "a dispatch
+ * was ISSUED". On 2026-10-17 a dispatch was issued and the lane was never
+ * refilled, because the run it created failed `build-and-push` in 84s with
+ * `deploy` skipped. Closing an unrefilled record on that would write "resolved,
+ * nothing is on the reviewer gate" over a stall that is still running — the
+ * identical fail-open that STALL_UNREFILLED_LABEL exists to prevent, arriving
+ * through the one outcome the label's own check waves through.
+ *
+ * So the question is answered from the outcome AND from the observed fate of the
+ * lane's last completed dispatch. Only an AFFIRMATIVE `died-before-deploy`
+ * blocks: an absent, empty or `unknown` fate leaves the pre-PEN-4224 behaviour
+ * exactly intact, because an unreadable fate is not evidence of death and this
+ * record's failure mode in that direction (a record that never closes) is its
+ * own kind of lie.
+ *
+ * ⚠️ Inert on Blockcast/paperclip today — `has_issues: false`, so no record is
+ * ever created for this to act on. PEN-4224 recorded this as a latent fail-open
+ * found by READING, not as an incident, and it is fixed here with a test rather
+ * than a postmortem. It is live wiring for repositories with Issues enabled.
+ */
+export function laneRefilled({ outcome, lastDispatchFate } = {}) {
+  if (lastDispatchFate === DISPATCH_FATE_DIED_BEFORE_DEPLOY) return false;
+  return REFILLING_OUTCOMES.has(outcome);
+}
+
 async function resolveMain() {
   const outcome = process.env.DISPATCH_OUTCOME || '(unknown)';
   const runUrl = process.env.RUN_URL ?? '';
@@ -461,7 +502,8 @@ async function resolveMain() {
     return;
   }
 
-  if (isUnrefilled(open) && !REFILLING_OUTCOMES.has(outcome)) {
+  const lastDispatchFate = process.env.LAST_DISPATCH_FATE || '';
+  if (isUnrefilled(open) && !laneRefilled({ outcome, lastDispatchFate })) {
     // Closing here would write "Resolved: the dispatcher found no deploy on the
     // reviewer gate" onto a stall that is not over — production is still at the
     // stale commit, and the gate is empty because WE emptied it. Stay open and
@@ -472,7 +514,8 @@ async function resolveMain() {
         `labelled \`${STALL_UNREFILLED_LABEL}\`, so outcome \`${outcome}\` means "nothing ` +
         'pending because a supersede emptied the gate and could not refill it", not "a human ' +
         'cleared it". Production has not shipped. The record closes on the first `dispatched` ' +
-        'or `up-to-date` slot.',
+        'or `up-to-date` slot whose dispatch is not already known to have died before the ' +
+        `\`deploy\` job (last dispatch fate: \`${lastDispatchFate || 'unreported'}\`).`,
     );
     return;
   }
