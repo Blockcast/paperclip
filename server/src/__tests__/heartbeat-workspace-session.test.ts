@@ -61,6 +61,7 @@ import {
   stripPaperclipSessionMetadataFromSessionParams,
   normalizeSessionParams,
   shouldResetTaskSessionForWake,
+  describeSessionResetReason,
   mergeModelProfileAdapterConfig,
   resolveContainedWorkspaceSubpath,
   resolveRepoRelativeWorkspaceCwd,
@@ -4994,5 +4995,200 @@ describe("BLO-23144 issue workspaceStrategy overlay merges field-wise", () => {
 
     expect(merged.workspaceStrategy).toMatchObject({ baseRef: "main" });
     expect((merged.workspaceStrategy as { runScope?: unknown }).runScope).toBeUndefined();
+  });
+});
+
+describe("PEN-4063: row mtimes are not session-invalidating, real config edits still are", () => {
+  // The half that matters is the second one. Without it this change would be
+  // indistinguishable from deleting the gate, so every "no longer invalidates"
+  // assertion below is paired with a "still invalidates" assertion on the
+  // structured field that the removed mtime used to proxy for.
+
+  async function decisionBetween(
+    baseOverrides: Partial<Parameters<typeof buildEffectiveRunSessionConfigMetadata>[0]>,
+    nextOverrides: Partial<Parameters<typeof buildEffectiveRunSessionConfigMetadata>[0]>,
+  ) {
+    const base = await buildSessionConfigMetadata(baseOverrides);
+    const next = await buildSessionConfigMetadata(nextOverrides);
+    return {
+      base,
+      next,
+      decision: resolveTaskSessionConfigFreshness({
+        hasTaskSession: true,
+        configuredModel: "gpt-5.4-mini",
+        taskSessionParams: sessionParamsWithConfigMetadata(base),
+        configMetadata: next,
+      }),
+    };
+  }
+
+  const workspaceConfig = (extra: Record<string, unknown> = {}) => ({
+    requestedMode: "agent_default",
+    effectiveMode: "agent_default",
+    projectPolicy: { mode: "shared_workspace" },
+    issueSettings: { mode: "shared_workspace" },
+    ...extra,
+  });
+
+  const environment = (extra: Record<string, unknown> = {}) => ({
+    selectionSource: "default",
+    selectedEnvironmentId: "environment-1",
+    selectedEnvironment: {
+      id: "environment-1",
+      driver: "local",
+      config: { image: "agent:v1" },
+      ...extra,
+    },
+  });
+
+  it("an issue-row touch (a comment moving issues.updatedAt) no longer invalidates the task session", async () => {
+    // issues.updatedAt tracks lastActivityAt, so this is exactly what an agent
+    // commenting on its own issue used to do to its own session.
+    const { base, next, decision } = await decisionBetween(
+      { workspaceConfig: workspaceConfig({ issueConfigRevisionAt: "2026-10-15T00:00:00.000Z" }) },
+      { workspaceConfig: workspaceConfig({ issueConfigRevisionAt: "2026-10-17T09:47:59.884Z" }) },
+    );
+
+    expect(next.fingerprint).toBe(base.fingerprint);
+    expect(decision.reset).toBe(false);
+    expect(decision.changedCategories).toEqual([]);
+  });
+
+  it("a project-row touch (projects.updatedAt) no longer invalidates the task session", async () => {
+    const { base, next, decision } = await decisionBetween(
+      { workspaceConfig: workspaceConfig({ projectConfigRevisionAt: "2026-10-15T00:00:00.000Z" }) },
+      { workspaceConfig: workspaceConfig({ projectConfigRevisionAt: "2026-10-17T09:47:59.884Z" }) },
+    );
+
+    expect(next.fingerprint).toBe(base.fingerprint);
+    expect(decision.reset).toBe(false);
+  });
+
+  it("an environment-row touch (environments.updatedAt) no longer invalidates the task session", async () => {
+    const { base, next, decision } = await decisionBetween(
+      { environment: environment({ configRevisionAt: "2026-10-15T00:00:00.000Z" }) },
+      { environment: environment({ configRevisionAt: "2026-10-17T09:47:59.884Z" }) },
+    );
+
+    expect(next.fingerprint).toBe(base.fingerprint);
+    expect(decision.reset).toBe(false);
+  });
+
+  it("STILL resets on a real issueSettings edit", async () => {
+    const { decision } = await decisionBetween(
+      { workspaceConfig: workspaceConfig() },
+      {
+        workspaceConfig: {
+          ...workspaceConfig(),
+          issueSettings: { mode: "isolated_workspace" },
+        },
+      },
+    );
+
+    expect(decision.reset).toBe(true);
+    expect(decision.changedCategories).toEqual(["workspaceConfig"]);
+    expect(decision.reasons.join("\n")).toContain("workspace config");
+  });
+
+  it("STILL resets on a real projectPolicy edit", async () => {
+    const { decision } = await decisionBetween(
+      { workspaceConfig: workspaceConfig() },
+      {
+        workspaceConfig: {
+          ...workspaceConfig(),
+          projectPolicy: { mode: "isolated_workspace" },
+        },
+      },
+    );
+
+    expect(decision.reset).toBe(true);
+    expect(decision.changedCategories).toEqual(["workspaceConfig"]);
+  });
+
+  it("STILL resets on a real environment.config edit", async () => {
+    const { decision } = await decisionBetween(
+      { environment: environment() },
+      { environment: environment({ config: { image: "agent:v2" } }) },
+    );
+
+    expect(decision.reset).toBe(true);
+    expect(decision.changedCategories).toEqual(["environment"]);
+  });
+
+  it("STILL resets on a real reusableExecutionWorkspaceConfig edit", async () => {
+    const { decision } = await decisionBetween(
+      { workspaceConfig: workspaceConfig({ reusableExecutionWorkspaceConfig: { baseRef: "main" } }) },
+      { workspaceConfig: workspaceConfig({ reusableExecutionWorkspaceConfig: { baseRef: "release" } }) },
+    );
+
+    expect(decision.reset).toBe(true);
+    expect(decision.changedCategories).toEqual(["workspaceConfig"]);
+  });
+
+  it("STILL resets when the existing execution workspace branch is renamed", async () => {
+    const existing = (branchName: string) => ({
+      id: "workspace-1",
+      mode: "shared_workspace",
+      strategyType: "project_primary",
+      projectWorkspaceId: "project-workspace-1",
+      repoUrl: "https://example.invalid/repo.git",
+      baseRef: "main",
+      branchName,
+      config: null,
+    });
+    const { decision } = await decisionBetween(
+      { workspaceConfig: workspaceConfig({ existingExecutionWorkspace: existing("feat/a") }) },
+      { workspaceConfig: workspaceConfig({ existingExecutionWorkspace: existing("feat/b") }) },
+    );
+
+    expect(decision.reset).toBe(true);
+    expect(decision.changedCategories).toEqual(["workspaceConfig"]);
+  });
+
+  it("strips the mtimes by path, not by name: an unrelated configRevisionAt still invalidates", async () => {
+    // The strip must not degrade into a recursive key match — a field that merely
+    // shares the name elsewhere in the object is a real signal and must survive.
+    const { decision } = await decisionBetween(
+      { workspaceConfig: workspaceConfig({ issueSettings: { configRevisionAt: "2026-10-15T00:00:00.000Z" } }) },
+      { workspaceConfig: workspaceConfig({ issueSettings: { configRevisionAt: "2026-10-17T00:00:00.000Z" } }) },
+    );
+
+    expect(decision.reset).toBe(true);
+    expect(decision.changedCategories).toEqual(["workspaceConfig"]);
+  });
+
+  it("keeps the deliberate wake resets firing (PF-4 heartbeat_timer and issue_assigned)", async () => {
+    // These were 249 of the 474 resets measured and are correct. A regression here
+    // is silent and expensive, so pin both the wake predicate and the reason text
+    // that the freshness decision folds in.
+    expect(shouldResetTaskSessionForWake({ wakeReason: "heartbeat_timer" })).toBe(true);
+    expect(shouldResetTaskSessionForWake({ wakeReason: "issue_assigned" })).toBe(true);
+
+    const base = await buildSessionConfigMetadata({ workspaceConfig: workspaceConfig() });
+    for (const wakeReason of ["heartbeat_timer", "issue_assigned"] as const) {
+      const decision = resolveTaskSessionConfigFreshness({
+        hasTaskSession: true,
+        configuredModel: "gpt-5.4-mini",
+        taskSessionParams: sessionParamsWithConfigMetadata(base),
+        // identical config: the ONLY thing that may reset here is the wake reason
+        configMetadata: await buildSessionConfigMetadata({ workspaceConfig: workspaceConfig() }),
+        wakeResetReason: describeSessionResetReason({ wakeReason }),
+      });
+      expect(decision.reset).toBe(true);
+      expect(decision.reasons.join("\n")).toContain(`wake reason is ${wakeReason}`);
+    }
+  });
+
+  it("keeps forceFreshSession resetting (poisoned/zero-token session path is untouched)", async () => {
+    const base = await buildSessionConfigMetadata({ workspaceConfig: workspaceConfig() });
+    const decision = resolveTaskSessionConfigFreshness({
+      hasTaskSession: true,
+      configuredModel: "gpt-5.4-mini",
+      taskSessionParams: sessionParamsWithConfigMetadata(base),
+      configMetadata: await buildSessionConfigMetadata({ workspaceConfig: workspaceConfig() }),
+      wakeResetReason: describeSessionResetReason({ forceFreshSession: true }),
+    });
+    expect(decision.reset).toBe(true);
+    expect(decision.reasons.join("\n")).toContain("forceFreshSession");
   });
 });

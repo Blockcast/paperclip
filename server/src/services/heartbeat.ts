@@ -9118,6 +9118,61 @@ async function resolveInstructionsConfigFingerprintMetadata(config: Record<strin
   return metadata;
 }
 
+/**
+ * PEN-4063: row modification timestamps must never reach the task-session
+ * fingerprint.
+ *
+ * Three fields used to be hashed into it — `workspaceConfig.issueConfigRevisionAt`
+ * (`issues.updatedAt`), `workspaceConfig.projectConfigRevisionAt`
+ * (`projects.updatedAt`) and `environment.selectedEnvironment.configRevisionAt`
+ * (`environments.updatedAt`). Each sat immediately beside the structured value it
+ * proxied for, so it added no signal the fingerprint did not already carry; it added
+ * only invalidation. `issues.updatedAt` tracks `lastActivityAt` and therefore moves on
+ * every comment, status change and activity touch, including the agent's own — an agent
+ * invalidated its own session by commenting on the issue it was working.
+ *
+ * Measured over 1000 runs (2026-10-15 → 2026-10-17): of 226 runs that had a task session
+ * available AND issue context, `workspaceConfig` changed in 226 — every single one, with
+ * zero exceptions — against 0 of the 248 runs without issue context.
+ *
+ * This strip is applied centrally rather than only at the call site so a new caller
+ * cannot reintroduce the defect by passing the field again. It is deliberately
+ * path-scoped, not a recursive key match: an unrelated field that happens to be named
+ * `configRevisionAt` elsewhere must keep invalidating.
+ *
+ * ⛔ Scope: the SESSION fingerprint only. The workspace-reuse fingerprint
+ * (`buildEffectiveRunWorkspaceConfigMetadata`) is a different gate deciding a different
+ * question and is deliberately left alone.
+ */
+function omitRowRevisionTimestampsFromSessionConfigValues(input: {
+  workspaceConfig: unknown;
+  environment: unknown;
+}) {
+  const workspaceConfig = (() => {
+    if (!input.workspaceConfig || typeof input.workspaceConfig !== "object") {
+      return input.workspaceConfig;
+    }
+    const {
+      issueConfigRevisionAt: _issueConfigRevisionAt,
+      projectConfigRevisionAt: _projectConfigRevisionAt,
+      ...rest
+    } = input.workspaceConfig as Record<string, unknown>;
+    return rest;
+  })();
+
+  const environment = (() => {
+    if (!input.environment || typeof input.environment !== "object") return input.environment;
+    const environmentRecord = input.environment as Record<string, unknown>;
+    const selectedEnvironment = environmentRecord.selectedEnvironment;
+    if (!selectedEnvironment || typeof selectedEnvironment !== "object") return environmentRecord;
+    const { configRevisionAt: _configRevisionAt, ...selectedRest } =
+      selectedEnvironment as Record<string, unknown>;
+    return { ...environmentRecord, selectedEnvironment: selectedRest };
+  })();
+
+  return { workspaceConfig, environment };
+}
+
 function buildSessionConfigCategoryValues(input: {
   adapterType: string;
   effectiveAdapterConfig: Record<string, unknown>;
@@ -9135,6 +9190,12 @@ function buildSessionConfigCategoryValues(input: {
   agentConfigRevision: unknown;
 }) {
   const sanitizedSecretManifest = sanitizeSecretManifestForConfigFingerprint(input.secretManifest);
+  // PEN-4063: row mtimes are stripped here so every caller is covered, not just the
+  // heartbeat dispatch path that originally supplied them.
+  const withoutRowRevisionTimestamps = omitRowRevisionTimestampsFromSessionConfigValues({
+    workspaceConfig: input.workspaceConfig,
+    environment: input.environment,
+  });
   return {
     adapter: {
       adapterType: input.adapterType,
@@ -9145,8 +9206,8 @@ function buildSessionConfigCategoryValues(input: {
     modelProfile: input.modelProfile,
     instructions: input.instructions,
     issueOverrides: input.issueOverrides,
-    workspaceConfig: input.workspaceConfig,
-    environment: input.environment,
+    workspaceConfig: withoutRowRevisionTimestamps.workspaceConfig,
+    environment: withoutRowRevisionTimestamps.environment,
     envBindings: {
       environment: { env: input.environmentEnv },
       project: { env: input.projectEnv },
@@ -33182,12 +33243,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       workspaceConfig: {
         requestedMode: requestedExecutionWorkspaceMode,
         effectiveMode: effectiveExecutionWorkspaceMode,
-        issueConfigRevisionAt: issueContext?.updatedAt instanceof Date
-          ? issueContext.updatedAt.toISOString()
-          : issueContext?.updatedAt ?? null,
-        projectConfigRevisionAt: projectContext?.updatedAt instanceof Date
-          ? projectContext.updatedAt.toISOString()
-          : projectContext?.updatedAt ?? null,
+        // PEN-4063: the issue/project row mtimes are deliberately NOT fingerprinted.
+        // `issues.updatedAt` tracks `lastActivityAt`, so it moved on every comment,
+        // status change and activity touch — including this agent's own — which made
+        // an agent invalidate its own task session simply by commenting on its issue.
+        // The structured values those mtimes proxied for (`projectPolicy`,
+        // `issueSettings`, `reusableExecutionWorkspaceConfig`) are fingerprinted right
+        // here, so a real config edit still invalidates on its own merits. The mtimes
+        // added no signal the fingerprint did not already carry, only invalidation.
+        // `omitRowRevisionTimestampsFromSessionConfigValues` enforces this centrally.
         projectPolicy: projectExecutionWorkspacePolicy,
         issueSettings: issueExecutionWorkspaceSettings,
         reusableExecutionWorkspaceConfig: requestedReusableExecutionWorkspaceConfig,
@@ -33211,10 +33275,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ? {
               id: selectedEnvironmentForConfig.id,
               driver: selectedEnvironmentForConfig.driver,
+              // PEN-4063: environment row mtime deliberately omitted — see the
+              // workspaceConfig note above. `config` is fingerprinted right here, so a
+              // real environment edit still invalidates.
               config: selectedEnvironmentForConfig.config,
-              configRevisionAt: selectedEnvironmentForConfig.updatedAt instanceof Date
-                ? selectedEnvironmentForConfig.updatedAt.toISOString()
-                : selectedEnvironmentForConfig.updatedAt ?? null,
             }
           : null,
         executionPolicy,
