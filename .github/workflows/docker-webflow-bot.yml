@@ -49,7 +49,9 @@ permissions:
 
 jobs:
   test:
-    runs-on: arc-dind
+    # ruff + pytest only: no Docker. BLO-46675 moved it off org group 1
+    # (arc-dind) onto the paperclip-only light lane.
+    runs-on: arc-paperclip-light
     timeout-minutes: 10
     steps:
       - name: Checkout
@@ -83,7 +85,11 @@ jobs:
     # Mirrors docker-figma-bot.yml.
     if: github.event_name != 'pull_request'
     needs: test
-    runs-on: arc-dind
+    # A BuildKit client only, against the shared remote BuildKit (same as
+    # docker.yml). BLO-46675: off org group 1 (arc-dind) so tag pushes
+    # (refs/tags/webflow-bot-v*) and non-master workflow_dispatch keep a runner once
+    # group 1 is scoped to master-pinned workflows (BLO-40782).
+    runs-on: arc-paperclip-buildkit
     timeout-minutes: 30
     concurrency:
       group: docker-webflow-bot-${{ github.ref }}
@@ -104,10 +110,41 @@ jobs:
           username: ${{ secrets.HARBOR_USERNAME }}
           password: ${{ secrets.HARBOR_PASSWORD }}
 
+      # Same endpoint selection as docker-agent.yml: side images use ordinal 1
+      # so they do not evict the main paperclip image's cache on ordinal 0.
+      - name: Select BuildKit endpoint
+        id: buildkit-endpoint
+        env:
+          PREFERRED_ORDINAL: "1"
+        run: |
+          set -euo pipefail
+          if [[ ! "${PREFERRED_ORDINAL}" =~ ^[01]$ ]]; then
+            echo "Invalid BuildKit ordinal: ${PREFERRED_ORDINAL}" >&2
+            exit 1
+          fi
+
+          probe_buildkit() {
+            local host="$1"
+            local timeout_seconds="$2"
+            timeout "${timeout_seconds}" nc -z -w "${timeout_seconds}" "${host}" 1234
+          }
+
+          preferred="buildkit-amd64-${PREFERRED_ORDINAL}.buildkit-amd64-headless.ci.svc.cluster.local"
+          fallback="buildkit-amd64.ci.svc.cluster.local"
+          host="${preferred}"
+          if ! probe_buildkit "${preferred}" 5; then
+            echo "::warning::Preferred BuildKit ${preferred} is unavailable; using the healthy service endpoint"
+            host="${fallback}"
+            probe_buildkit "${fallback}" 10
+          fi
+          echo "endpoint=tcp://${host}:1234" >> "$GITHUB_OUTPUT"
+          echo "Using BuildKit endpoint tcp://${host}:1234"
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
         with:
-          cleanup: true
+          driver: remote
+          endpoint: ${{ steps.buildkit-endpoint.outputs.endpoint }}
 
       - name: Docker meta
         id: meta
