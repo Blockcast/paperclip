@@ -330,6 +330,35 @@ jobs:
         run: node --test ./scripts/check-migration-journal-base.test.mjs
         timeout-minutes: 1
 
+      - name: Guard the server-test typecheck allowlist (PEN-4186)
+        # `server/tsconfig.json` excludes `src/__tests__`, and `typecheck` and
+        # `build` share it, so the ONLY thing that typechecks a server test is
+        # the gated allowlist in `server/tsconfig.tests.json` (BLO-38582).
+        # Nothing compared the two sets: at master 6b4d6a1d that was 6 entries
+        # against 726 test files, so a new test file landed outside the gate by
+        # default and `pnpm typecheck` still exited 0 on it. PEN-3889's author
+        # reported "typecheck passed" on a new file, injected a deliberate type
+        # error, and typecheck still exited 0. The pass was vacuous and read
+        # exactly like a real one.
+        #
+        # Scoped to files ADDED in this diff. It never asks for the ~720-file
+        # backlog -- that is the reason the ratchet is incremental, and widening
+        # this to existing files would demand the whole backlog at once.
+        #
+        # Lives in this job, not in typecheck_release_registry beside
+        # `typecheck:tests`, because two of its four arms are base-relative and
+        # that job checks out at depth 1 and cannot resolve $PR_BASE_SHA. This
+        # job already has fetch-depth: 0. Also runs on merge_group, where a
+        # branch cut before a sibling landed meets it for the first time.
+        if: ${{ !cancelled() }}
+        run: node ./scripts/check-test-typecheck-allowlist.mjs "$PR_BASE_SHA" "$PR_HEAD_SHA"
+        timeout-minutes: 1
+
+      - name: Test server-test typecheck allowlist guard (PEN-4186)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/check-test-typecheck-allowlist.test.mjs
+        timeout-minutes: 1
+
       - name: Validate Dockerfile deps stage
         if: ${{ !cancelled() }}
         run: |
