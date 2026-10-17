@@ -7,6 +7,7 @@
   },
   "include": [
     "src/__tests__/heartbeat-strict-git-probe-stderr.test.ts",
+    "src/__tests__/pen3288-null-prototype-accumulators.test.ts",
     "src/__tests__/pr-comment-review-gate.test.ts",
     "src/__tests__/recovery-stranded-attendance-batch.test.ts",
     "src/__tests__/scrape-metrics-routine-fire-gap-work.test.ts",
