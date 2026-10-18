@@ -27,7 +27,9 @@
 // has no TypeScript toolchain. Each parser throws with a pointer rather than
 // returning an empty set when its anchor moves: an extractor that silently
 // yields `[]` would make this assert `[] === []` and pass while checking
-// nothing, which is the shape of failure this whole ticket is about.
+// nothing, which is the shape of failure this whole ticket is about. Both the
+// throw path and the happy path are pinned below, by injecting a source string
+// — asserting the property rather than only naming it.
 
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -41,9 +43,13 @@ const docPath = path.join(repoRoot, "docs/AGENT-VISIBLE-CONFIG-EGRESS.md");
 
 const DOC_TABLE_HEADER = "| tool | returns | verdict |";
 
-/** The `K8S_RO_TOOLS` array literal in the register. */
-function toolsInRegister() {
-  const source = readFileSync(registerPath, "utf8");
+/**
+ * The `K8S_RO_TOOLS` array literal in the register.
+ *
+ * `source` is injectable so the anchor-removal tests below can exercise the
+ * throw path without touching the real file. Defaults to reading it.
+ */
+function toolsInRegister(source = readFileSync(registerPath, "utf8")) {
   const match = source.match(/const K8S_RO_TOOLS:[^=]*=\s*\[([\s\S]*?)\]/);
   if (!match) {
     throw new Error(
@@ -57,9 +63,12 @@ function toolsInRegister() {
   return tools;
 }
 
-/** Tool names in the first column of the k8s-ro coverage table in the doc. */
-function toolsInDoc() {
-  const doc = readFileSync(docPath, "utf8");
+/**
+ * Tool names in the first column of the k8s-ro coverage table in the doc.
+ *
+ * `doc` is injectable for the same reason as `toolsInRegister`'s `source`.
+ */
+function toolsInDoc(doc = readFileSync(docPath, "utf8")) {
   const tableAt = doc.indexOf(DOC_TABLE_HEADER);
   if (tableAt < 0) {
     throw new Error(
@@ -92,16 +101,37 @@ test("the k8s-ro coverage register and its doc table name the same tools", () =>
   );
 });
 
-test("both extractors fail loudly rather than returning an empty set", () => {
-  // The assertion above compares two parsed sets, so a parser that quietly
-  // yielded `[]` on both sides would pass while checking nothing. Pin that each
-  // one throws on a missing anchor instead.
-  for (const [name, fn] of [
-    ["register", () => readFileSync(registerPath, "utf8")],
-    ["doc", () => readFileSync(docPath, "utf8")],
-  ]) {
-    assert.ok(fn().length > 0, `${name} source is empty`);
-  }
+test("both extractors throw when their anchor is gone, rather than returning an empty set", () => {
+  // THIS IS THE LOAD-BEARING TEST OF THIS FILE.
+  //
+  // The assertion above compares two PARSED sets. A parser that quietly yielded
+  // `[]` when its anchor moved would make it assert `[] === []` and pass while
+  // verifying nothing — a vacuous green, which is the exact failure shape
+  // PEN-4282 exists to kill, reproduced inside PEN-4282's own fix.
+  //
+  // An earlier version of this test was named for that property and did not
+  // test it: it only checked that both files were non-empty and that a known
+  // tool appeared on each side. That is a real positive control, but it is NOT
+  // the throw path, and a test whose name overstates what it does is the same
+  // defect one level up. Caught in review at 26da37bb. Remove an anchor and
+  // assert it throws.
+  assert.throws(
+    () => toolsInRegister("const SOMETHING_ELSE = [];"),
+    /Could not find the K8S_RO_TOOLS array/,
+    "register extractor returned instead of throwing on a missing anchor",
+  );
+  assert.throws(
+    () => toolsInDoc("# a doc with no coverage table in it\n\nprose only.\n"),
+    /Could not find the k8s-ro coverage table/,
+    "doc extractor returned instead of throwing on a missing anchor",
+  );
+});
+
+test("both extractors find a known tool in the real files", () => {
+  // The positive control the test above used to be. Kept, because a throw-path
+  // test says nothing about whether the happy path still parses the real files:
+  // a regex that matches the anchor but captures nothing would pass the throws
+  // above and silently narrow what this check compares.
   assert.ok(toolsInRegister().includes("pods_log"), "register lost a known tool");
   assert.ok(toolsInDoc().includes("pods_log"), "doc table lost a known tool");
 });

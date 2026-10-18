@@ -425,6 +425,21 @@ function scrub(body: string): string {
   return scrubResponseBody(Buffer.from(body, "utf8"), "application/json").toString("utf8");
 }
 
+/**
+ * The same document delivered as an SSE frame, which is how the streamable-HTTP
+ * MCP transport delivers most tool results (`response-scrub.ts`,
+ * `transformResponseBody`).
+ *
+ * Every surface above is asserted over the plain-JSON framing, so without this
+ * the register would describe the *less common* transport while reading as
+ * coverage of the tool. `transformResponseBody` dispatches to a different
+ * function per framing, and each verdict has to hold on both.
+ */
+function scrubSse(body: string): string {
+  const framed = `event: message\ndata: ${body}\n\n`;
+  return scrubResponseBody(Buffer.from(framed, "utf8"), "text/event-stream").toString("utf8");
+}
+
 describe("k8s-ro scrubber coverage register (PEN-4282)", () => {
   it("classifies every tool the k8s-ro seat exposes", () => {
     const classified = new Set(SURFACES.flatMap((surface) => surface.tools));
@@ -501,4 +516,24 @@ describe("k8s-ro scrubber coverage register (PEN-4282)", () => {
     expect(asEnv).not.toContain(SENTINEL);
     expect(asConfigMapData).toContain(SENTINEL);
   });
+
+  // Carried forward from the review of 26da37bb: every assertion above runs on
+  // the plain-JSON framing, but SSE is the framing most tool results actually
+  // arrive in, and it takes a different branch of `transformResponseBody`. A
+  // verdict that held on one framing and not the other would make this register
+  // describe a transport the agent mostly does not use.
+  describe.each(SURFACES.map((surface) => [surface.id, surface] as const))(
+    "%s over SSE framing",
+    (_id, surface) => {
+      it(`reaches the same verdict as the JSON framing (${surface.verdict.kind})`, () => {
+        const output = scrubSse(surface.body);
+        for (const needle of surface.mustNotSurvive) {
+          expect(output, `${surface.id}: "${needle}" survived SSE framing`).not.toContain(needle);
+        }
+        for (const needle of surface.mustSurvive) {
+          expect(output, `${surface.id}: "${needle}" did not survive SSE framing`).toContain(needle);
+        }
+      });
+    },
+  );
 });
