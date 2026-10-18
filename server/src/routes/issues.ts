@@ -13729,6 +13729,8 @@ export function issueRoutes(
     // BLO-47464: the assignee agent records a disposition too, but only by CHANGING
     // status. A no-op reaffirmation (e.g. re-sending the `blocked` that recovery's
     // escalation wrote) still needs a board user (#745), so escalations stay visible.
+    // Note: the assignee moving an escalated `blocked` row to another status DOES
+    // clear the escalation; that status change is the disposition it asks for.
     const assigneeAgentChangedStatus =
       actor.actorType === "agent"
       && actor.agentId != null
