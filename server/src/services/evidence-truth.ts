@@ -400,9 +400,13 @@ async function probeOne(
     const commentClean = commentVerdict.state === "success" && commentVerdict.outcome === "clean";
     // The App-authored population (PEN-4265). Read off the verdict's typed
     // marker, which only the `githubSharesReviewerIdentity` branch sets, so
-    // this cannot be confused with the `authorUnknown` sibling that shares its
-    // `state`/`outcome`/`headAttested` — that one is a failed read and already
-    // sets `out.failed` via `readPrAuthor`.
+    // this cannot be confused with the `authorUnknown` sibling, which is
+    // otherwise identical on the success shape — that one is a failed read and
+    // already sets `out.failed` via `readPrAuthor`. The third field those two
+    // share is deliberately not named here: a containment test keeps that
+    // identifier inside `pr-comment-review-gate.ts`, so that no module which
+    // decides a merge can read a marker that only says a comment EXISTS
+    // (BLO-34316).
     //
     // THIS SURFACE ONLY. It is not yet `out.authorIsReviewer`: the formal
     // surface has its own two vetoes and they are not computed until below.
