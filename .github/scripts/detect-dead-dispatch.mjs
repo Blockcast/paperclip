@@ -287,13 +287,28 @@ export async function detectDeadDispatch({
 async function main() {
   const outPath = process.env.DEAD_DISPATCH_JSON_PATH;
   const writeResult = (result) => {
-    // Only the FATE is published as a step output. `dead` deliberately is not:
-    // it is true on a dispatch slot whose PREVIOUS dispatch died, and that slot
-    // goes on to dispatch a replacement — i.e. it recovers. Publishing `dead`
-    // here would redden exactly the run that fixed the problem. The workflow
-    // writes `dead_dispatch=true` itself, inside the sampling-slot branch, where
-    // it is the whole statement being made.
+    // The FATE and the observed run's CREATION TIME are published as step
+    // outputs; `dead` deliberately is not. `dead` is true on a dispatch slot
+    // whose PREVIOUS dispatch died, and that slot goes on to dispatch a
+    // replacement — i.e. it recovers. Publishing it here would redden exactly
+    // the run that fixed the problem. The workflow writes `dead_dispatch=true`
+    // itself, inside the sampling-slot branch, where it is the whole statement
+    // being made.
+    //
+    // The timestamp exists because the fate ALONE cannot say which dispatch it
+    // describes, and `laneRefilled` needs that. This module runs once per slot,
+    // ABOVE the step that issues the day's dispatch — so on a `dispatched` slot
+    // the fate is always the PREVIOUS run's, and only `createdAt` can
+    // distinguish a survival belonging to the current stall from one that
+    // predates it. Empty whenever no run was read, which blocks the close
+    // rather than widening it.
+    //
+    // (Phrased without naming the CLI verb on purpose: the no-write-path test
+    // in tests/detect-dead-dispatch.test.mjs bans that literal anywhere in this
+    // file, comments included, and the bluntness is the point — it cannot be
+    // talked around, only reworded.)
     setOutput('last_dispatch_fate', result.fate);
+    setOutput('last_dispatch_at', result.run?.createdAt ?? '');
     if (outPath) {
       // Written unconditionally, including on the failure paths, so the calling
       // shell always has a file to read. A missing file there would have to be

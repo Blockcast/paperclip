@@ -611,6 +611,31 @@ test('setup-node precedes the dispatch step, or the detection is `command not fo
   );
 });
 
+test('no earlier step can skip the day\'s dispatch (PEN-4224 review finding 2)', () => {
+  // Moving setup-node ABOVE the dispatch step put a new step on the production
+  // path. GitHub's default step condition is success(), so under it a
+  // setup-node failure SKIPS the dispatch — a node-install hiccup would cost a
+  // full delivery day, which is the exact fault this workflow exists to
+  // prevent, newly created by the fix for it. The dispatch needs no node of its
+  // own (it is `gh` and `git`); only the detection inside it does, and that is
+  // already `|| true` with a defaulted read.
+  const dispatch = code.match(
+    /- name: Dispatch deploy if master is ahead[\s\S]*?\n        env:/,
+  );
+  assert.ok(dispatch, 'the dispatch step must exist');
+  assert.match(
+    dispatch[0],
+    /\n        if: \$\{\{ !cancelled\(\) \}\}\n/,
+    'the dispatch step must run unless the job is cancelled, not merely on success()',
+  );
+  // Positive control: the step this one now tolerates the failure of is still
+  // above it, so the assertion is about a real ordering rather than a vacuous
+  // one.
+  assert.ok(
+    code.indexOf('- name: Set up Node') < code.indexOf('- name: Dispatch deploy if master is ahead'),
+  );
+});
+
 test('the detection CANNOT fail the dispatcher — it is non-fatal twice over', () => {
   // The step runs under `set -euo pipefail`, so a bare `node ...` that exits
   // non-zero would abort the dispatch step and redden the run. PEN-2848 made
@@ -720,16 +745,27 @@ test('the dispatcher still APPROVES NOTHING, including on the new path', () => {
   );
 });
 
-test('the record close is told the FATE as well as the outcome (PEN-4224)', () => {
+test('the record close is told the FATE and the run TIME, not just the outcome (PEN-4224)', () => {
   // `dispatched` claims the lane was refilled; what happened is that a dispatch
   // was ISSUED. Without the fate reaching the script, `laneRefilled` degrades to
   // REFILLING_OUTCOMES and the fail-open is back with the code still present.
+  //
+  // The TIME is equally load-bearing and was the hole in the first fix. The
+  // detection runs above the dispatch, so on a `dispatched` slot the fate is the
+  // PREVIOUS run's; only the run's creation time can tell a survival belonging
+  // to this stall from one that predates it. Drop that env and the gate stops
+  // closing (safe direction, but the feature is silently gone).
   const close = code.match(/- name: Close the durable deploy-stall record[\s\S]*?--resolve/);
   assert.ok(close, 'the workflow must close the stall record');
   assert.match(
     close[0],
     /LAST_DISPATCH_FATE:\s*\$\{\{\s*steps\.dispatch\.outputs\.last_dispatch_fate\s*\}\}/,
     'the close must be told the last dispatch fate',
+  );
+  assert.match(
+    close[0],
+    /LAST_DISPATCH_AT:\s*\$\{\{\s*steps\.dispatch\.outputs\.last_dispatch_at\s*\}\}/,
+    'the close must be told WHEN the observed dispatch was created',
   );
 });
 

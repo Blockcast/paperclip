@@ -445,7 +445,8 @@ export function isUnrefilled(issue) {
 export const REFILLING_OUTCOMES = new Set(['dispatched', 'up-to-date']);
 
 /**
- * The fate value from detect-dead-dispatch.mjs that falsifies `dispatched`.
+ * The fate value from detect-dead-dispatch.mjs that is AFFIRMATIVE evidence the
+ * lane was refilled: the `deploy` job of that dispatch actually executed.
  *
  * Spelled here rather than imported to keep the module edge one-directional:
  * detect-dead-dispatch.mjs imports THIS file (for the client and the workflow
@@ -453,7 +454,34 @@ export const REFILLING_OUTCOMES = new Set(['dispatched', 'up-to-date']);
  * spellings together, exactly as it already does for DEPLOY_WORKFLOW_FILE and
  * the shell's `--workflow=docker.yml`.
  */
-export const DISPATCH_FATE_DIED_BEFORE_DEPLOY = 'died-before-deploy';
+export const DISPATCH_FATE_SURVIVED = 'survived';
+
+/**
+ * When did the stall this record describes begin?
+ *
+ * ⚠️ DELIBERATELY NOT `resolveStallStartedAt`, and the difference is the whole
+ * safety property. That function takes the EARLIEST defensible instant, because
+ * it answers "how old is this stall" and understating an age lets a real stall
+ * read as fresh. This answers "which dispatches belong to this stall", where an
+ * earlier start admits MORE runs as evidence of a refill — so there the
+ * conservative direction is the LATEST defensible instant, not the earliest.
+ * Reusing the other function would quietly widen the close gate.
+ *
+ *   marker           - exact; written at the first escalation of this stall.
+ *   issue created_at - fallback. The record is opened at the first escalation,
+ *                      which happens at or AFTER the true start, so this is an
+ *                      upper bound and the gate it produces is strictly
+ *                      stronger. Note it is used RAW: `resolveStallStartedAt`
+ *                      subtracts `alertAfterHours` to reach back toward the
+ *                      true start, which is exactly the widening to avoid here.
+ *
+ * `null` when neither is readable, which blocks the close — see `laneRefilled`.
+ */
+export function recordStallStartedAt(issue) {
+  const marker = parseStallMarker(issue?.body);
+  if (marker) return marker.stallStartedAt;
+  return Number.isFinite(Date.parse(issue?.created_at)) ? issue.created_at : null;
+}
 
 /**
  * Did the lane actually get refilled?
@@ -468,21 +496,59 @@ export const DISPATCH_FATE_DIED_BEFORE_DEPLOY = 'died-before-deploy';
  * identical fail-open that STALL_UNREFILLED_LABEL exists to prevent, arriving
  * through the one outcome the label's own check waves through.
  *
- * So the question is answered from the outcome AND from the observed fate of the
- * lane's last completed dispatch. Only an AFFIRMATIVE `died-before-deploy`
- * blocks: an absent, empty or `unknown` fate leaves the pre-PEN-4224 behaviour
- * exactly intact, because an unreadable fate is not evidence of death and this
- * record's failure mode in that direction (a record that never closes) is its
- * own kind of lie.
+ * ⛔ THE OBSERVED FATE CANNOT DESCRIBE THE DISPATCH THIS SLOT JUST ISSUED, and
+ * the first version of this guard got that wrong. detect-dead-dispatch.mjs runs
+ * ONCE per slot, inside guard (1c) — before guard (2) and before the
+ * `gh workflow run` that produces the `dispatched` outcome. So on a `dispatched`
+ * slot `lastDispatchFate` necessarily describes the PREVIOUS completed run; the
+ * run this slot created has not started, let alone completed. A guard that
+ * merely refused an affirmative `died-before-deploy` therefore proved nothing
+ * about the dispatch it was gating: replay the 2026-10-17 timeline and the 07:31
+ * slot reads the healthy 10-16 dispatch as `survived` and closes the unrefilled
+ * record anyway, which is the fail-open intact.
+ *
+ * So the gate is positive evidence, time-bounded, and `dispatched` never clears
+ * it on the slot that issues it:
+ *
+ *   up-to-date  - closes unconditionally. It is its OWN evidence: guard (2)
+ *                 emits it only when a `deploy` job SUCCEEDED at exactly
+ *                 master's head, so production demonstrably has the commits.
+ *                 Nothing is owed and no corroboration is available or needed.
+ *                 (The first version blocked this on a stale fate too, which was
+ *                 strictly wrong — it withheld a close from the one outcome that
+ *                 carries proof.)
+ *   dispatched  - closes only when a LATER slot observes the lane's last
+ *                 completed dispatch to have `survived` into the `deploy` job
+ *                 AND that run was created at or after this stall began. The
+ *                 recency bound is what stops a pre-stall success — the very
+ *                 run whose supersede opened the record — from reading as this
+ *                 stall's refill.
+ *
+ * DIRECTION OF ERROR, and it is the opposite of the first version's. An
+ * unreadable fate, an unreadable run time or an unreadable stall start all
+ * BLOCK the close now, because the gate asks for proof rather than for the
+ * absence of a disproof. A record that never closes is still its own kind of lie
+ * — it carries a dead stall's clock into the next, unrelated one — so this is
+ * only tolerable because the record has a second exit that does not depend on
+ * any of those reads: once production catches up, the next slot is `up-to-date`
+ * and closes it outright. The cost of a missed close is therefore a record that
+ * closes one slot late, not one that never closes.
  *
  * ⚠️ Inert on Blockcast/paperclip today — `has_issues: false`, so no record is
  * ever created for this to act on. PEN-4224 recorded this as a latent fail-open
- * found by READING, not as an incident, and it is fixed here with a test rather
- * than a postmortem. It is live wiring for repositories with Issues enabled.
+ * found by READING, not as an incident, and both it and this correction ship
+ * with tests rather than a postmortem. It is live wiring for repositories with
+ * Issues enabled.
  */
-export function laneRefilled({ outcome, lastDispatchFate } = {}) {
-  if (lastDispatchFate === DISPATCH_FATE_DIED_BEFORE_DEPLOY) return false;
-  return REFILLING_OUTCOMES.has(outcome);
+export function laneRefilled({ outcome, lastDispatchFate, lastDispatchAt, stallStartedAt } = {}) {
+  if (!REFILLING_OUTCOMES.has(outcome)) return false;
+  if (outcome !== 'dispatched') return true;
+
+  if (lastDispatchFate !== DISPATCH_FATE_SURVIVED) return false;
+  const observedAt = Date.parse(lastDispatchAt ?? '');
+  const stallStart = Date.parse(stallStartedAt ?? '');
+  if (!Number.isFinite(observedAt) || !Number.isFinite(stallStart)) return false;
+  return observedAt >= stallStart;
 }
 
 async function resolveMain() {
@@ -503,7 +569,12 @@ async function resolveMain() {
   }
 
   const lastDispatchFate = process.env.LAST_DISPATCH_FATE || '';
-  if (isUnrefilled(open) && !laneRefilled({ outcome, lastDispatchFate })) {
+  const lastDispatchAt = process.env.LAST_DISPATCH_AT || '';
+  const stallStartedAt = recordStallStartedAt(open);
+  if (
+    isUnrefilled(open) &&
+    !laneRefilled({ outcome, lastDispatchFate, lastDispatchAt, stallStartedAt })
+  ) {
     // Closing here would write "Resolved: the dispatcher found no deploy on the
     // reviewer gate" onto a stall that is not over — production is still at the
     // stale commit, and the gate is empty because WE emptied it. Stay open and
@@ -513,9 +584,11 @@ async function resolveMain() {
       `::warning::Not closing the production-deploy-stall record #${open.number}: it is ` +
         `labelled \`${STALL_UNREFILLED_LABEL}\`, so outcome \`${outcome}\` means "nothing ` +
         'pending because a supersede emptied the gate and could not refill it", not "a human ' +
-        'cleared it". Production has not shipped. The record closes on the first `dispatched` ' +
-        'or `up-to-date` slot whose dispatch is not already known to have died before the ' +
-        `\`deploy\` job (last dispatch fate: \`${lastDispatchFate || 'unreported'}\`).`,
+        'cleared it". Production has not shipped. It closes on the first `up-to-date` slot, or ' +
+        'on a later slot that OBSERVES a dispatch surviving into the `deploy` job — the fate ' +
+        'read on a `dispatched` slot describes the PREVIOUS run, never the one just issued ' +
+        `(last observed fate: \`${lastDispatchFate || 'unreported'}\` for a run created ` +
+        `\`${lastDispatchAt || 'unreported'}\`; this stall began \`${stallStartedAt || 'unreadable'}\`).`,
     );
     return;
   }

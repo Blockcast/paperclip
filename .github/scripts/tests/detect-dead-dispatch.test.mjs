@@ -27,7 +27,7 @@ import {
   findLastCompletedDispatch,
   isDeadLane,
 } from '../detect-dead-dispatch.mjs';
-import { DISPATCH_FATE_DIED_BEFORE_DEPLOY, laneRefilled } from '../deploy-stall-record.mjs';
+import { DISPATCH_FATE_SURVIVED, laneRefilled } from '../deploy-stall-record.mjs';
 
 const scriptPath = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -378,6 +378,31 @@ test('the fate spelling is shared with deploy-stall-record, not re-derived', () 
   // is spelled independently there. This is the pin that keeps the two honest —
   // a drift would silently restore the fail-open `laneRefilled` exists to close,
   // with both files still reading as correct.
-  assert.equal(DISPATCH_FATE.DIED_BEFORE_DEPLOY, DISPATCH_FATE_DIED_BEFORE_DEPLOY);
-  assert.equal(laneRefilled({ outcome: 'dispatched', lastDispatchFate: DISPATCH_FATE.DIED_BEFORE_DEPLOY }), false);
+  //
+  // The shared spelling is `survived`, not the death: the close gate asks for
+  // affirmative evidence of a refill, so a drift here would make every fate
+  // unrecognisable and the gate would stop closing rather than start
+  // over-closing. Both directions are pinned below.
+  assert.equal(DISPATCH_FATE.SURVIVED, DISPATCH_FATE_SURVIVED);
+  const refilled = {
+    outcome: 'dispatched',
+    lastDispatchAt: '2026-10-17T07:31:45.000Z',
+    stallStartedAt: '2026-10-17T05:00:00.000Z',
+  };
+  assert.equal(laneRefilled({ ...refilled, lastDispatchFate: DISPATCH_FATE.SURVIVED }), true);
+  assert.equal(
+    laneRefilled({ ...refilled, lastDispatchFate: DISPATCH_FATE.DIED_BEFORE_DEPLOY }),
+    false,
+  );
+});
+
+test('the detector publishes the observed run TIME as well as its fate (PEN-4224)', () => {
+  // The fate alone cannot say WHICH dispatch it describes, and on a `dispatched`
+  // slot it never describes the one just issued — this module runs above
+  // `gh workflow run`. `laneRefilled` therefore needs the run's creation time to
+  // tell a survival belonging to this stall from one that predates it. Without
+  // this output the gate receives an empty string and stops closing, which is
+  // the safe direction but is still the feature silently gone.
+  assert.match(source, /setOutput\('last_dispatch_at', result\.run\?\.createdAt \?\? ''\)/);
+  assert.match(source, /setOutput\('last_dispatch_fate', result\.fate\)/);
 });

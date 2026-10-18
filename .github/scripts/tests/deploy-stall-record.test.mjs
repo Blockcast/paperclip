@@ -22,7 +22,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  DISPATCH_FATE_DIED_BEFORE_DEPLOY,
+  DISPATCH_FATE_SURVIVED,
   REFILLING_OUTCOMES,
   STALL_ISSUE_TITLE,
   STALL_LABEL,
@@ -31,6 +31,7 @@ import {
   isUnrefilled,
   laneRefilled,
   parseStallMarker,
+  recordStallStartedAt,
   renderStallMarker,
   renderSupersedeFailedComment,
   resolveStallStartedAt,
@@ -260,40 +261,138 @@ test('an unrefilled record DOES close once the lane is actually refilled', () =>
 // "resolved, nothing is on the reviewer gate" over a stall that is still
 // running, arriving through the one outcome the label's own check waves through.
 //
+// ⛔ THE FIRST FIX FOR THIS DID NOT WORK, and these tests exist in the shape
+// they do because of how it failed. It refused to close on an affirmative
+// `died-before-deploy` fate — but detect-dead-dispatch.mjs runs ONCE per slot,
+// inside guard (1c), ABOVE guard (2) and ABOVE `gh workflow run`. On a
+// `dispatched` slot the fate therefore describes the PREVIOUS completed run and
+// the dispatch being gated has not started. The guard passed its own test only
+// because the test fed it a fate that could not refer to that dispatch. Replay
+// the real 2026-10-17 timeline and the 07:31 slot still closed an unrefilled
+// record. So the first two tests below are written as that replay: a fate that
+// is `survived`, which is what the lane genuinely looked like at 07:31, and
+// which the broken guard waved straight through.
+//
 // ⚠️ Latent, not exercised: on Blockcast/paperclip `has_issues` is false, so no
 // record exists for this to have happened to. PEN-4224 found it by reading and
 // asked for a test rather than a postmortem. These are that test.
 // ---------------------------------------------------------------------------
 
-test('a `dispatched` outcome does NOT close an unrefilled record when that dispatch died', () => {
-  // The done-when, stated directly. Before PEN-4224 this was `true`, because
-  // `dispatched` is in REFILLING_OUTCOMES and nothing else was consulted.
+// The incident, to scale. The record's stall begins between the two dispatches,
+// which is the arrangement that makes the healthy predecessor useless as
+// evidence for the stall that followed it.
+const DISPATCH_BEFORE_STALL = '2026-10-16T07:31:45.000Z';
+const PEN_4224_STALL_START = '2026-10-17T05:00:00.000Z';
+const DISPATCH_AFTER_STALL = '2026-10-17T07:31:45.000Z';
+
+test('a `dispatched` slot does NOT close an unrefilled record on its own say-so', () => {
+  // The done-when, stated against the timeline that defeated the first attempt.
+  // At 07:31 the newest COMPLETED dispatch is the healthy 10-16 one — fate
+  // `survived`, and true. It is still not evidence about the dispatch this slot
+  // is issuing, because that run does not exist yet. A gate keyed only on "not
+  // a known death" reads this as a refill and closes; this one must not.
   assert.equal(REFILLING_OUTCOMES.has('dispatched'), true, 'control: the outcome still refills');
   assert.equal(
-    laneRefilled({ outcome: 'dispatched', lastDispatchFate: DISPATCH_FATE_DIED_BEFORE_DEPLOY }),
+    laneRefilled({
+      outcome: 'dispatched',
+      lastDispatchFate: DISPATCH_FATE_SURVIVED,
+      lastDispatchAt: DISPATCH_BEFORE_STALL,
+      stallStartedAt: PEN_4224_STALL_START,
+    }),
     false,
+    'a survival that PREDATES the stall is not this stall’s refill',
   );
-  // `up-to-date` is falsified by the same evidence and for the same reason.
+  // And the shape the first fix did catch stays caught, now by the absence of
+  // affirmative evidence rather than by a special case for it.
   assert.equal(
-    laneRefilled({ outcome: 'up-to-date', lastDispatchFate: DISPATCH_FATE_DIED_BEFORE_DEPLOY }),
+    laneRefilled({
+      outcome: 'dispatched',
+      lastDispatchFate: 'died-before-deploy',
+      lastDispatchAt: DISPATCH_AFTER_STALL,
+      stallStartedAt: PEN_4224_STALL_START,
+    }),
     false,
   );
 });
 
-test('only an AFFIRMATIVE death blocks the close — an unreadable fate changes nothing', () => {
-  // Direction of error. A record that never closes is its own kind of lie: it
-  // carries a dead stall's clock into the next, unrelated one
-  // (resolveStallStartedAt above). So the pre-PEN-4224 behaviour has to survive
-  // every state that is not a measured death — including the empty string the
-  // workflow passes when the detection could not run at all.
-  for (const fate of ['survived', 'unknown', 'none', '', undefined]) {
+test('a LATER slot closes it once a dispatch is observed to have survived', () => {
+  // The exit. The record must not be unclosable: the next slot after the
+  // 07:31 dispatch completes reads it as the newest completed run, and if it
+  // reached `deploy` the lane really was refilled during this stall.
+  assert.equal(
+    laneRefilled({
+      outcome: 'dispatched',
+      lastDispatchFate: DISPATCH_FATE_SURVIVED,
+      lastDispatchAt: DISPATCH_AFTER_STALL,
+      stallStartedAt: PEN_4224_STALL_START,
+    }),
+    true,
+  );
+  // Boundary: "at or after" is inclusive, so a dispatch issued in the same
+  // instant the stall is recorded as beginning counts. Excluding it would make
+  // the gate depend on clock granularity between two different systems.
+  assert.equal(
+    laneRefilled({
+      outcome: 'dispatched',
+      lastDispatchFate: DISPATCH_FATE_SURVIVED,
+      lastDispatchAt: PEN_4224_STALL_START,
+      stallStartedAt: PEN_4224_STALL_START,
+    }),
+    true,
+  );
+});
+
+test('`up-to-date` closes on its own evidence, with no fate required', () => {
+  // Guard (2) emits `up-to-date` only when a `deploy` job SUCCEEDED at exactly
+  // master's head, so production demonstrably carries the commits. That is a
+  // stronger statement than any fate read, and it is available when the fate is
+  // not. The first fix blocked this outcome on a stale death, which withheld a
+  // close from the one outcome that carries proof — a record kept open by
+  // evidence about a run that had already been superseded by a real deploy.
+  for (const fate of [DISPATCH_FATE_SURVIVED, 'died-before-deploy', 'unknown', 'none', '', undefined]) {
     assert.equal(
-      laneRefilled({ outcome: 'dispatched', lastDispatchFate: fate }),
+      laneRefilled({ outcome: 'up-to-date', lastDispatchFate: fate }),
       true,
-      `fate ${JSON.stringify(fate)} must not block the close`,
+      `up-to-date must close regardless of fate ${JSON.stringify(fate)}`,
     );
   }
-  assert.equal(laneRefilled({ outcome: 'dispatched' }), true, 'absent fate is not a death');
+});
+
+test('an unreadable fate, time or stall start BLOCKS the close, not widens it', () => {
+  // Direction of error, and it is deliberately the OPPOSITE of the first fix's.
+  // That one asked for the absence of a disproof, which is why silence waved a
+  // dispatch through; this asks for proof, so silence withholds. The cost is
+  // bounded and is the reason this is tolerable: `up-to-date` above closes the
+  // record outright once production catches up, so a missed close here is a
+  // record that closes one slot late, never one that never closes.
+  const base = {
+    outcome: 'dispatched',
+    lastDispatchFate: DISPATCH_FATE_SURVIVED,
+    lastDispatchAt: DISPATCH_AFTER_STALL,
+    stallStartedAt: PEN_4224_STALL_START,
+  };
+  assert.equal(laneRefilled(base), true, 'control: the complete evidence closes it');
+  for (const fate of ['unknown', 'none', '', undefined]) {
+    assert.equal(
+      laneRefilled({ ...base, lastDispatchFate: fate }),
+      false,
+      `fate ${JSON.stringify(fate)} is not evidence of survival`,
+    );
+  }
+  for (const at of ['', undefined, 'not-a-date']) {
+    assert.equal(
+      laneRefilled({ ...base, lastDispatchAt: at }),
+      false,
+      `run time ${JSON.stringify(at)} cannot place the run in this stall`,
+    );
+  }
+  for (const start of [null, '', undefined, 'not-a-date']) {
+    assert.equal(
+      laneRefilled({ ...base, stallStartedAt: start }),
+      false,
+      `stall start ${JSON.stringify(start)} cannot place the run in this stall`,
+    );
+  }
   assert.equal(laneRefilled(), false, 'and no arguments at all is not an accidental close');
 });
 
@@ -301,9 +400,50 @@ test('laneRefilled keeps every non-refilling outcome non-refilling', () => {
   // The fate is an extra way to say NO, never a new way to say yes. A healthy
   // lane must not turn `checked-no-pending` — the outcome a failed supersede
   // produces — into a close.
-  for (const fate of ['survived', 'unknown', '']) {
-    assert.equal(laneRefilled({ outcome: 'checked-no-pending', lastDispatchFate: fate }), false);
-    assert.equal(laneRefilled({ outcome: 'dispatch-died', lastDispatchFate: fate }), false);
+  for (const fate of [DISPATCH_FATE_SURVIVED, 'unknown', '']) {
+    assert.equal(
+      laneRefilled({
+        outcome: 'checked-no-pending',
+        lastDispatchFate: fate,
+        lastDispatchAt: DISPATCH_AFTER_STALL,
+        stallStartedAt: PEN_4224_STALL_START,
+      }),
+      false,
+    );
+    assert.equal(
+      laneRefilled({
+        outcome: 'dispatch-died',
+        lastDispatchFate: fate,
+        lastDispatchAt: DISPATCH_AFTER_STALL,
+        stallStartedAt: PEN_4224_STALL_START,
+      }),
+      false,
+    );
+  }
+});
+
+test('the stall start used by the gate is the LATEST defensible one', () => {
+  // recordStallStartedAt is deliberately not resolveStallStartedAt. That one
+  // minimises, because understating a stall's AGE lets a real stall read as
+  // fresh. Here an earlier start admits MORE runs as evidence of a refill, so
+  // minimising would quietly widen the close gate — opposite question, opposite
+  // direction.
+  const body = `${renderStallMarker({ stallStartedAt: PEN_4224_STALL_START })}\n\nprose`;
+  assert.equal(
+    recordStallStartedAt({ body, created_at: '2026-10-17T11:00:00.000Z' }),
+    PEN_4224_STALL_START,
+    'the marker is exact and wins',
+  );
+  // Fallback: the record is opened at the first escalation, i.e. at or AFTER
+  // the true start, so created_at is an upper bound and is used RAW. Subtracting
+  // an alert threshold (as resolveStallStartedAt does) would reach back before
+  // the stall and let a pre-stall dispatch qualify.
+  assert.equal(
+    recordStallStartedAt({ body: 'no marker here', created_at: '2026-10-17T11:00:00.000Z' }),
+    '2026-10-17T11:00:00.000Z',
+  );
+  for (const issue of [undefined, {}, { body: '', created_at: 'nonsense' }]) {
+    assert.equal(recordStallStartedAt(issue), null, 'unreadable is null, which blocks the close');
   }
 });
 
