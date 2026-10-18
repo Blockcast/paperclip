@@ -93,10 +93,10 @@ function formatChangedNames(names: readonly string[]): string {
 /**
  * Elements that bound "one thing the user is about to submit".
  *
- * A `<form>` is the real boundary. A dialog is the boundary for a consumer that renders the editor
- * in one without a form. `data-env-editor-scope` is for a consumer that is neither — a settings
- * panel assembled from plain `div`s, which is what every in-repo consumer actually is — and lets it
- * say where its own footer ends.
+ * A `<form>` is the real boundary, and a live one: `PipelineSettings` wraps its stage editor in a
+ * real `<form>`. A dialog is the boundary for a consumer that renders the editor in one without a
+ * form. `data-env-editor-scope` is for a consumer that is neither — a settings panel assembled from
+ * plain `div`s, which most in-repo consumers are — and lets it say where its own footer ends.
  */
 const SUBMISSION_SCOPE_SELECTOR = 'form, dialog, [role="dialog"], [role="alertdialog"], [data-env-editor-scope]';
 
@@ -134,9 +134,13 @@ function submissionScopeOf(element: Element): Element | null {
  * resolves two different scopes — editor to the inner element, Save to the panel — and the Save loses
  * the veto. No consumer is shaped like that today: the one form-wrapped consumer, `PipelineSettings`,
  * carries no `data-env-editor-scope` marker at all, so there is nothing to nest. The failure direction
- * is fail-*open*, back to the pre-PEN-3358 plain flush, so it degrades to the old behaviour rather
- * than losing data; that is why this stays an identity check. If such a consumer appears, match on
- * "the button's scope contains the editor root" instead of identity.
+ * is fail-*open*, back to the pre-PEN-3358 plain flush — which is not a harmless place to land. That
+ * flush *is* the silent partial save PEN-3358 closed: the last-committed env ships and the pending
+ * masked rename is dropped, and nothing catches it unless that consumer re-checks
+ * `flushPendingDraft().status` itself. It is the conservative direction only in the sense that it
+ * reproduces a known old failure instead of inventing a new one; that is why this stays an identity
+ * check for now. If such a consumer appears, match on "the button's scope contains the editor root"
+ * instead of identity.
  */
 function sharesSubmissionScope(button: Element, editorRoot: Element): boolean {
   return submissionScopeOf(button) === submissionScopeOf(editorRoot);
