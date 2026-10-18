@@ -77,7 +77,7 @@ import { scrubResponseBody } from "./response-scrub.js";
  * that image serves is exposed.
  *
  * So an upstream image bump can add a tool, route it through `/k8s-ro`, and
- * leave this suite green. That half is tracked on PEN-4283 and is named here
+ * leave this suite green. That half is tracked on PEN-4295 and is named here
  * rather than left implicit, exactly as the sibling register
  * (`server/src/__tests__/mcp-seed-scrub-coverage.test.ts`) names its own
  * un-derivable oracle. What this file DOES enforce is that the two in-repo
