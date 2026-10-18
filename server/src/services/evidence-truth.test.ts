@@ -816,6 +816,7 @@ describe("buildGithubTruthProbe", () => {
         }),
       }),
     )({ workProducts: [wp()] });
+    expect(r.detections["review:ally-clean"]).toBeUndefined();
     expect(r.reviewerAuthoredPr).toBe(false);
   });
 
