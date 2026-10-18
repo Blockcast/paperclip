@@ -147,6 +147,34 @@ export const DEPLOY_JOB_NAME = 'deploy';
  * here: it means the job existed and was stopped, which is what a supersede
  * looks like, and the caller excludes those by run conclusion anyway.
  */
+/**
+ * The `deploy` job conclusions that prove the lane was actually REFILLED.
+ *
+ * Strictly narrower than `deployJobExecuted` below, and the two must not be
+ * conflated — Ally caught exactly that conflation on this PR's first head.
+ * `deployJobExecuted` answers the DETECTOR's question ("may I claim this run
+ * died?") and is deliberately generous, so it says yes to a `cancelled` deploy
+ * job. This answers the CLOSE GATE's question ("did a deploy attempt actually
+ * happen?"), which needs proof, so a `cancelled` deploy — a supersede's normal
+ * operation — must not count.
+ *
+ * `failure` DOES count: a `deploy` job that ran and failed is a real deploy
+ * attempt, owned by whatever made it fail (the PEN-4176 migration pre-flight is
+ * the live example). The stall record models "the gate was emptied and could
+ * not be refilled"; a failed deploy refilled it. Whether production SHIPPED is
+ * a different question, and `up-to-date` is the outcome that proves that one.
+ */
+export const DEPLOY_EXECUTED_CONCLUSIONS = Object.freeze(new Set(['success', 'failure']));
+
+/**
+ * Did the `deploy` job of this run actually execute? The strict signal, for the
+ * stall record's close gate. See DEPLOY_EXECUTED_CONCLUSIONS.
+ */
+export function deployJobCompleted(jobs) {
+  const deploy = (jobs ?? []).find((job) => job?.name === DEPLOY_JOB_NAME);
+  return DEPLOY_EXECUTED_CONCLUSIONS.has(deploy?.conclusion);
+}
+
 export function deployJobExecuted(jobs) {
   const deploy = (jobs ?? []).find((job) => job?.name === DEPLOY_JOB_NAME);
   if (!deploy) return false;
@@ -222,6 +250,11 @@ export async function findLastCompletedDispatch({
       conclusion: run.conclusion ?? '',
       createdAt: run.created_at ?? '',
       completedAt: run.updated_at ?? '',
+      // The strict refill signal. Only set on this path, where the job list was
+      // read successfully — an unreadable job list returns the raw run object
+      // above and carries no such field, so the close gate sees `false` and
+      // withholds, which is this module's fail-quiet direction.
+      deployExecuted: deployJobCompleted(jobs),
     },
   };
 }
@@ -309,6 +342,12 @@ async function main() {
     // talked around, only reworded.)
     setOutput('last_dispatch_fate', result.fate);
     setOutput('last_dispatch_at', result.run?.createdAt ?? '');
+    // `deploy_executed`, NOT the fate, is what the stall record's close gate
+    // reads. The fate's `survived` is a catch-all meaning "not a death this
+    // module may claim" — it covers a `cancelled` run whose deploy never ran
+    // and a `success` run whose deploy was SKIPPED by the pending guard. That
+    // is right for a fail-quiet detector and wrong for a gate that needs proof.
+    setOutput('last_dispatch_deploy_executed', result.run?.deployExecuted === true ? 'true' : 'false');
     if (outPath) {
       // Written unconditionally, including on the failure paths, so the calling
       // shell always has a file to read. A missing file there would have to be
