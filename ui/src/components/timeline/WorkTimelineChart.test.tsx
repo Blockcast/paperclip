@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { flushSync } from "react-dom";
-import type { ComponentProps } from "react";
+import { act, type ComponentProps } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import type { WorkTimelineResult } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -24,8 +24,10 @@ beforeEach(() => {
   root = createRoot(container);
 });
 
-afterEach(() => {
-  flushSync(() => root.unmount());
+afterEach(async () => {
+  await act(async () => {
+    root.unmount();
+  });
   container.remove();
   vi.restoreAllMocks();
 });
@@ -46,10 +48,32 @@ function renderChart(
   });
 }
 
-async function flushTimelineEffects(count = 5) {
-  for (let index = 0; index < count; index += 1) {
+// The chart drives its axis from a `scroll` handler, and React treats `scroll`
+// (and `mouseover`) as ContinuousEventPriority — a lane `flushSync` does NOT
+// flush. The commit is left to React's scheduler, which re-schedules itself
+// with a fresh `setImmediate` every time a render overruns its 5ms slice. On a
+// loaded CI runner that reschedule lands AFTER a pending `setTimeout(0)`, so a
+// fixed-delay wait reads the pre-update DOM and fails (PEN-4249). Drive the
+// updates through `act(...)` and wait on the condition, never on a delay.
+async function flushTimelineEffects() {
+  await act(async () => {
+    await Promise.resolve();
     await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+}
+
+async function waitForAssertion(assertion: () => void, attempts = 50) {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      assertion();
+      return;
+    } catch (error) {
+      lastError = error;
+      await flushTimelineEffects();
+    }
   }
+  throw lastError;
 }
 
 function timelineSample(): WorkTimelineResult {
@@ -118,15 +142,16 @@ describe("WorkTimelineChart", () => {
     expect(timeAxis.style.height).toBe("32px");
     expect(axisSvg.style.transform).toBe("translateX(0px)");
 
-    flushSync(() => {
+    act(() => {
       Object.defineProperty(scroller, "scrollTop", { configurable: true, value: 400 });
       Object.defineProperty(scroller, "scrollLeft", { configurable: true, value: 240 });
       scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
     });
-    await new Promise((resolve) => setTimeout(resolve, 0));
 
+    await waitForAssertion(() => {
+      expect(axisSvg.style.transform).toBe("translateX(-240px)");
+    });
     expect(timeAxis.textContent).toContain("Jul 2");
-    expect(axisSvg.style.transform).toBe("translateX(-240px)");
   });
 
   it("renders actor labels in a sticky gutter outside the horizontally scrolling SVG", () => {
@@ -148,7 +173,7 @@ describe("WorkTimelineChart", () => {
     expect(gutter?.textContent).not.toContain("agent");
     expect(gutter?.textContent).not.toContain("×");
 
-    flushSync(() => {
+    act(() => {
       scroller!.scrollLeft = 10_000;
       scroller!.dispatchEvent(new Event("scroll", { bubbles: true }));
     });
@@ -167,15 +192,16 @@ describe("WorkTimelineChart", () => {
     const scroller = container.querySelector<HTMLElement>("[data-testid='work-timeline-scroll']")!;
     expect(onVisibleWindowChange).toHaveBeenCalled();
 
-    flushSync(() => {
+    act(() => {
       scroller.scrollLeft = 0;
       scroller.dispatchEvent(new Event("scroll", { bubbles: true }));
     });
-    await flushTimelineEffects();
 
-    const lastCall = onVisibleWindowChange.mock.calls.at(-1)?.[0];
-    expect(lastCall?.fromMs).toBe(new Date(data.window.from).getTime());
-    expect(lastCall?.toMs).toBeCloseTo(new Date("2026-07-02T01:00:00.000Z").getTime(), -3);
+    await waitForAssertion(() => {
+      const lastCall = onVisibleWindowChange.mock.calls.at(-1)?.[0];
+      expect(lastCall?.fromMs).toBe(new Date(data.window.from).getTime());
+      expect(lastCall?.toMs).toBeCloseTo(new Date("2026-07-02T01:00:00.000Z").getTime(), -3);
+    });
   });
 
   it("renders configured agent icons in the actor gutter instead of generated initials", () => {
@@ -254,12 +280,13 @@ describe("WorkTimelineChart", () => {
     expect(container.querySelectorAll("[data-testid='timeline-connector']")).toHaveLength(0);
 
     const hovered = container.querySelector<SVGGElement>("[data-run-id='run-2']")!;
-    flushSync(() => {
+    act(() => {
       hovered.dispatchEvent(new MouseEvent("mouseover", { bubbles: true, clientX: 100, clientY: 100 }));
     });
-    await new Promise((resolve) => setTimeout(resolve, 0));
 
-    expect(container.querySelectorAll("[data-testid='timeline-connector']")).toHaveLength(2);
+    await waitForAssertion(() => {
+      expect(container.querySelectorAll("[data-testid='timeline-connector']")).toHaveLength(2);
+    });
     const connectorStrokePaths = Array.from(
       container.querySelectorAll<SVGPathElement>("[data-testid='timeline-connector'] path[fill='none']"),
     );
