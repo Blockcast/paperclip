@@ -96,21 +96,28 @@ verbatim, and `events_list` over ns `paperclip` returned 442,601 characters acro
 > measurement. Making the scrubber a credential boundary was considered and declined; the test above
 > records why, and what it would cost.
 
-> **Second scope boundary, now closed where it is set (PEN-4295).** The `k8s-ro` tool *surface* is
-> still not derivable from this repo — it is set by the upstream server image, its `--read-only
+> **Second scope boundary this file cannot close (PEN-4295) — still OPEN.** The `k8s-ro` tool
+> *surface* is not derivable from this repo. It is set by the upstream server image, its `--read-only
 > --disable-destructive` flags and the `disabled_tools` list, all in
-> `Blockcast/onprem-k8s:paperclip/k8s-mcp-stack.yaml`. What changed is that it is now **declared and
-> gated there**: the `k8s-ro` upstream map carries a twelve-tool allowlist and
-> `onprem-k8s:scripts/check-k8s-ro-tool-surface.mjs` reddens that repo's build on an image bump, a
-> dropped flag, a deleted `disabled_tools`, or an allowlist that is not exactly the list in the table
-> above (carrier: onprem-k8s#6135). A tool a future image adds is denied rather than served, so an
-> image bump can no longer add reach while every test here stays green.
+> `Blockcast/onprem-k8s:paperclip/k8s-mcp-stack.yaml`, and the `k8s-ro` gateway upstream map **on
+> that repo's master carries no `tools` allowlist** — unlike the prometheus gateway, whose five-tool
+> allowlist is what actually closed PEN-2735. So an upstream image bump can add a tool, route it
+> through `/k8s-ro`, and leave every test here green. The register holds the two in-repo records in
+> step; it does not watch the image.
 >
-> The residual is a restatement, not a gap in reach: the two repos cannot read each other, so this
-> table and that allowlist are kept in step by cross-reference. A tool allowed there but absent here
-> is exposed-but-unclassified; a tool here but absent there is denied. Adding a tool means editing
-> **three** places — this table, `K8S_RO_TOOLS`, and the allowlist plus `ATTESTED_K8S_RO_TOOLS` in
-> onprem-k8s.
+> **What will change, and when.** PEN-4295's carrier is onprem-k8s#6135, which is **open and not
+> merged**. Once it merges *and* the gateway pod restarts (the Deployment carries no config-checksum
+> annotation, so the ConfigMap change does not roll it), the upstream map will carry a twelve-tool
+> allowlist matching the table above and `onprem-k8s:scripts/check-k8s-ro-tool-surface.mjs` will
+> redden that repo's build on an image bump, a dropped flag, a deleted `disabled_tools`, or an
+> allowlist that is not exactly that list. A tool a future image adds will then be denied rather than
+> served. **Until both have happened, the paragraph above is the live state.**
+>
+> Even afterwards the cross-repo half stays a restatement, not an assertion: the two repos cannot
+> read each other, so this table and that allowlist are kept in step by cross-reference. A tool
+> allowed there but absent here is exposed-but-unclassified; a tool here but absent there is denied.
+> Adding a tool will then mean editing **three** places — this table, `K8S_RO_TOOLS`, and the
+> allowlist plus `ATTESTED_K8S_RO_TOOLS` in onprem-k8s.
 
 > **Scope boundary that no static audit can close.** An agent's effective MCP set is
 > `{...sharedSeedBaseline, ...adapterConfig.mcpServers}` (`vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts:1404`).
