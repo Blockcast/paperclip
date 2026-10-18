@@ -1015,6 +1015,47 @@ export function mergeMaskedPluginConfig(
     return incoming;
   }
 
+  /**
+   * ## Write-side policy for a `__proto__` key: persist it, do not refuse it (PEN-4244)
+   *
+   * Since PEN-4240 a key named `__proto__` SURVIVES this merge and is persisted into stored
+   * plugin `configJson`. That is deliberate, and the decision was made against measurements
+   * rather than left implicit — it is the asymmetry with `normalizeEnvConfig` (PEN-3257), which
+   * REFUSES the same key with a 422, so it needs a stated reason.
+   *
+   * Measured at `a76a502f`:
+   *
+   *  - **No `[[Set]]`-based consumer of stored `configJson` or agent `adapterConfig` exists.**
+   *    Only four sites iterate their keys at all, and every one feeds `.length`, a `Set`, or a
+   *    sorted array — never an object accumulator. Every merge of these records downstream is a
+   *    SPREAD, which uses CreateDataProperty and defines an own `__proto__` rather than invoking
+   *    the setter; the one computed-key write (`preserveInstructionsBundleConfig`) draws its key
+   *    from a literal allowlist. So nothing re-parents on a stored key, which is what the harm
+   *    would have to be.
+   *  - **A plugin that wants the key refused already has the mechanism**: a manifest schema with
+   *    `additionalProperties: false` makes Ajv reject it (`must NOT have additional properties`).
+   *    A permissive schema accepts it, which is what a permissive schema means.
+   *
+   * Why NOT to add a refusal in `validateInstanceConfig`, the obvious home:
+   *
+   *  1. It would not cover the surface it appears to. `routes/plugins.ts` runs that validator
+   *     only `if (schema && Object.keys(schema).length > 0)`, so a plugin declaring no
+   *     `instanceConfigSchema` would skip it entirely — a guard that reads as total and is not.
+   *  2. It would break a round-trip the server itself produces. The masked GET returns the
+   *     stored config including this key; an operator editing one unrelated field and PUTting it
+   *     back would get a 400 for data they never typed. PEN-4240's row states the general form:
+   *     a read path that throws turns a harmless stored oddity into a failed read.
+   *
+   * The asymmetry with env is therefore correct rather than accidental, and the two policies are
+   * deliberately NOT unified into one shared helper: `normalizeEnvConfig` produces process
+   * environment for a child process, where a silently dropped binding is a no-op on a
+   * security-relevant setting, so refusing is right there. Here the record is a structured
+   * document whose stated invariant (PEN-2370 ask 1) is that key NAMES survive. One shared home
+   * would imply one shared policy, and there isn't one.
+   *
+   * `write-side-proto-policy.test.ts` pins this decision, and is written to FAIL if a consumer
+   * that re-parents on a stored key is ever introduced.
+   */
   function mergeRecord(
     incoming: Record<string, unknown>,
     storedNode: Record<string, unknown>,

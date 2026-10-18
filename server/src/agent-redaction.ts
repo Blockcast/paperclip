@@ -271,6 +271,11 @@ function restoreRedactedAdapterValueInner(incoming: unknown, existing: unknown):
     existing && typeof existing === "object" && !Array.isArray(existing)
       ? (existing as Record<string, unknown>)
       : {};
+  // WRITE-SIDE POLICY (PEN-4244): a `__proto__` key that survives this walk is deliberately
+  // PERSISTED into stored agent `adapterConfig`, not refused. That is the opposite of
+  // `normalizeEnvConfig`'s 422 (PEN-3257), on purpose; the measurements and the reasoning live
+  // next to `mergeRecord` in `services/plugin-config-masking.ts`, and the decision is pinned by
+  // `__tests__/write-side-proto-policy.test.ts`.
   const restored: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(incoming as Record<string, unknown>)) {
     // OWN-property read, not `existingRecord[key]` (PEN-4240). This is the READ half of the
