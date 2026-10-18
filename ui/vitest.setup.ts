@@ -1,6 +1,12 @@
 import { afterAll } from "vitest";
 import { drainReactScheduler } from "./src/lib/drainReactScheduler";
 
+// React's `act` refuses to drive the work loop unless the environment
+// advertises itself, and this was armed by hand in 173 separate test files
+// (five different casts of the same statement). Arm it once, here, so every
+// test file gets it and no file has to remember (PEN-4255).
+(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+
 const storageEntries = new Map<string, string>();
 
 function installStorageMock(target: Record<string, unknown>) {
