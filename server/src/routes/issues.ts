@@ -13726,8 +13726,18 @@ export function issueRoutes(
       });
     }
 
+    // BLO-47464: the assignee agent records a disposition too, but only by CHANGING
+    // status. A no-op reaffirmation (e.g. re-sending the `blocked` that recovery's
+    // escalation wrote) still needs a board user (#745), so escalations stay visible.
+    const assigneeAgentChangedStatus =
+      actor.actorType === "agent"
+      && actor.agentId != null
+      && actor.agentId === existing.assigneeAgentId
+      && existing.status !== issue.status;
     const explicitlyRecordedSuccessfulRunDisposition =
-      actor.actorType === "user" && req.body.status !== undefined && issue.status !== "in_progress";
+      req.body.status !== undefined
+      && issue.status !== "in_progress"
+      && (actor.actorType === "user" || assigneeAgentChangedStatus);
     if (explicitlyRecordedSuccessfulRunDisposition) {
       // foldTerminal:false — this read decides whether to WRITE the durable
       // resolution row, and `issue` is already terminal by the time we get here.
