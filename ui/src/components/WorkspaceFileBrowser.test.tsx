@@ -34,9 +34,6 @@ vi.mock("@tanstack/react-query", async () => {
   };
 });
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 function createItem(overrides: Partial<WorkspaceFileListFileItem> = {}): WorkspaceFileListFileItem {
   return {
     kind: "file",

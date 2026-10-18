@@ -44,8 +44,6 @@ vi.mock("../api/access", () => ({
   },
 }));
 
-(globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-
 let container: HTMLDivElement | null = null;
 let root: Root | null = null;
 

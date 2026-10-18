@@ -70,9 +70,6 @@ vi.mock("@/plugins/slots", () => ({
   PluginSlotOutlet: () => null,
 }));
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 describe("CommentThread", () => {
   let container: HTMLDivElement;
   let writeTextMock: ReturnType<typeof vi.fn<(text: string) => Promise<void>>>;

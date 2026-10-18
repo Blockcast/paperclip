@@ -28,8 +28,6 @@ vi.mock("@/lib/router", () => ({
     createElement("a", { href: to, ...rest }, children as never),
 }));
 
-(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-
 function makeCatalogEntry(overrides: Partial<ToolCatalogEntry>): ToolCatalogEntry {
   return {
     id: "cat-1",

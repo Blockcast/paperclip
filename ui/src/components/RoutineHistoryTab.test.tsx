@@ -72,9 +72,6 @@ vi.mock("../context/ToastContext", () => ({
   useToastActions: () => ({ pushToast: toastSpy }),
 }));
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 function snapshotV1(overrides?: Partial<RoutineRevisionSnapshotV1["routine"]>): RoutineRevisionSnapshotV1 {
   return {
     version: 1,

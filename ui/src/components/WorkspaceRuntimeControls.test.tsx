@@ -13,9 +13,6 @@ import {
   WorkspaceRuntimeControls,
 } from "./WorkspaceRuntimeControls";
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 function createRuntimeService(overrides: Partial<WorkspaceRuntimeService> = {}): WorkspaceRuntimeService {
   return {
     id: overrides.id ?? "service-1",

@@ -15,12 +15,9 @@ import { act } from "react";
  */
 
 // React's `act` logs "The current testing environment is not configured to
-// support act(...)" unless the environment advertises itself. Importing this
-// module is that opt-in, so a file using these helpers needs no copy of its
-// own. The ~20 files that already set the flag by hand still do — those lines
-// are now redundant but harmless, and removing them is tracked with the rest
-// of the per-file `act` cleanup rather than widening this change.
-(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+// support act(...)" unless the environment advertises itself. That flag is now
+// armed once for the whole suite in `ui/vitest.setup.ts` (PEN-4255), so this
+// module no longer carries its own copy and neither does any test file.
 
 /**
  * Drain React's work loop: microtasks, then one macrotask turn, inside `act`

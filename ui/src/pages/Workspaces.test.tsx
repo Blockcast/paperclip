@@ -45,9 +45,6 @@ vi.mock("../components/SummarySlotCard", () => ({
   },
 }));
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 function overviewItem(overrides: Partial<WorkspaceOverviewItem> = {}): WorkspaceOverviewItem {
   return {
     key: overrides.key ?? "execution:workspace-1",

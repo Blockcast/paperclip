@@ -43,9 +43,6 @@ vi.mock("../context/SidebarContext", () => ({
   useSidebar: () => ({ isMobile: false, setSidebarOpen: vi.fn() }),
 }));
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 import { InstanceSidebar } from "./InstanceSidebar";
 import { flushReact } from "@/test-utils/react";
 

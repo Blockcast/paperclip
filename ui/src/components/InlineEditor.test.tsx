@@ -40,9 +40,6 @@ function enterMultilineEdit(container: HTMLDivElement) {
   }
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 /** Lets React detect a DOM value change on controlled textareas (see React #10140). */
 function setNativeTextareaValue(textarea: HTMLTextAreaElement, value: string) {
   const valueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")?.set;

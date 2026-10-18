@@ -88,9 +88,6 @@ vi.mock("@/plugins/slots", () => ({
   usePluginSlots: mockUsePluginSlots,
 }));
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 describe("CompanySettingsSidebar", () => {
   let container: HTMLDivElement;
 

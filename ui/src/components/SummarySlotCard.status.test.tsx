@@ -21,8 +21,6 @@ import { __liveUpdatesTestUtils } from "@/context/LiveUpdatesProvider";
 import { SummarySlotCard, resolveGenerationStatusLine } from "./SummarySlotCard";
 import { flushReact } from "@/test-utils/react";
 
-(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-
 const { LiveEventSubscriptionContext, dispatchLiveEventToSubscribers } = __liveUpdatesTestUtils;
 
 const mockInstanceSettingsApi = vi.hoisted(() => ({ getExperimental: vi.fn() }));

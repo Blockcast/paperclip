@@ -8,8 +8,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ProjectWorkspaceDetail } from "./ProjectWorkspaceDetail";
 import { flushReact } from "@/test-utils/react";
 
-(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-
 const mockProjectsApi = vi.hoisted(() => ({
   get: vi.fn(),
   updateWorkspace: vi.fn(),

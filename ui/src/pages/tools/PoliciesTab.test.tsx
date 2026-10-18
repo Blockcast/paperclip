@@ -68,8 +68,6 @@ vi.mock("@/components/ui/sheet", () => ({
 import { PoliciesTab } from "./PoliciesTab";
 import { flushReact } from "@/test-utils/react";
 
-(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-
 function policy(partial: Partial<ToolPolicy> & { id: string; policyType: ToolPolicy["policyType"] }): ToolPolicy {
   return {
     id: partial.id,

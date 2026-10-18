@@ -32,8 +32,6 @@ import {
 let root: Root | null = null;
 let container: HTMLDivElement | null = null;
 
-(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-
 vi.mock("@/lib/router", () => ({
   Link: ({ to, children, className }: { to: string; children: ReactNode; className?: string }) => (
     <a href={to} className={className}>{children}</a>

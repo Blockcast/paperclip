@@ -10,8 +10,6 @@ import {
   type CompanyLiveEventHandler,
 } from "./LiveUpdatesProvider";
 
-(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-
 const { LiveEventSubscriptionContext, dispatchLiveEventToSubscribers } = __liveUpdatesTestUtils;
 
 function progressEvent(overrides: Partial<LiveEvent> = {}): LiveEvent {

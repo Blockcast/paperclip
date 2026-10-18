@@ -32,8 +32,6 @@ vi.mock("@/context/ToastContext", () => ({
   useOptionalToastActions: () => ({ pushToast: mockPushToast }),
 }));
 
-(globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-
 let root: Root | null = null;
 let container: HTMLDivElement | null = null;
 

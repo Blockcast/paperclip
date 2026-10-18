@@ -139,9 +139,6 @@ vi.mock("@/lib/router", () => ({
   useNavigate: () => routerMock.navigate,
 }));
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 // jsdom doesn't implement scrollIntoView; the inbox calls it from a passive effect.
 if (typeof Element !== "undefined" && !Element.prototype.scrollIntoView) {
   Element.prototype.scrollIntoView = () => {};

@@ -11,9 +11,6 @@ vi.mock("@/lib/router", () => ({
   Link: ({ to, children }: { to: string; children: ReactNode }) => <a href={to}>{children}</a>,
 }));
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 function event(overrides: Partial<ToolCallEvent>): ToolCallEvent {
   return {
     id: "evt-1",

@@ -32,9 +32,6 @@ vi.mock("../../context/ToastContext", () => ({
   }),
 }));
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 import { ImportFromVaultDialog } from "./ImportFromVaultDialog";
 import { flushReact } from "@/test-utils/react";
 

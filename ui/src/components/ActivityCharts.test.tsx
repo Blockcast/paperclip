@@ -7,9 +7,6 @@ import type { DashboardIssueActivityDay, HeartbeatRun } from "@paperclipai/share
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { IssueStatusChart, PriorityChart, RunActivityChart, SuccessRateChart } from "./ActivityCharts";
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 let container: HTMLDivElement;
 let root: Root;
 

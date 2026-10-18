@@ -61,9 +61,6 @@ vi.mock("@/context/CompanyContext", () => ({
   }),
 }));
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 function renderAuthPage(container: HTMLElement) {
   const root = createRoot(container);
   const queryClient = new QueryClient({

@@ -5,9 +5,6 @@ import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { JsonSchemaForm, getDefaultValues } from "./JsonSchemaForm";
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 // Radix Select relies on PointerEvent, pointer capture, and ResizeObserver,
 // none of which jsdom implements. Stub them so the dropdown can open in tests.
 if (!globalThis.PointerEvent) {

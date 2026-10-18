@@ -30,9 +30,6 @@ vi.mock("../api/issues", () => ({
   issuesApi: { get: vi.fn() },
 }));
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 describe("CommentThread external object decoration (integration)", () => {
   let container: HTMLDivElement;
 

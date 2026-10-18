@@ -102,9 +102,6 @@ vi.mock("../adapters/adapter-display-registry", () => ({
   getAdapterLabel: (type: string) => type,
 }));
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 function makeAgent(overrides: Partial<Agent>): Agent {
   return {
     id: "agent-1",

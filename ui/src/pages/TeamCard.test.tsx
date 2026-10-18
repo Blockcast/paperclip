@@ -7,9 +7,6 @@ import { TeamCard } from "./TeamCatalog";
 import { onboardingTeams } from "./TeamCatalog.fixtures";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 function render(node: React.ReactNode) {
   const container = document.createElement("div");
   document.body.appendChild(container);

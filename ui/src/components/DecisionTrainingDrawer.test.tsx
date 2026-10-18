@@ -29,8 +29,6 @@ vi.mock("@/lib/router", () => ({
   ),
 }));
 
-(globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-
 import { DecisionTrainingDrawer } from "./DecisionTrainingDrawer";
 import { ToastProvider } from "../context/ToastContext";
 

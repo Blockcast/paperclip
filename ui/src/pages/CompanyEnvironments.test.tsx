@@ -179,8 +179,6 @@ vi.mock("@/api/secrets", () => ({
   secretsApi: mockSecretsApi,
 }));
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 // Minimal browser APIs for jsdom.
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).ResizeObserver = class {

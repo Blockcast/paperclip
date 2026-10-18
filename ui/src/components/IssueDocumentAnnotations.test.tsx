@@ -130,9 +130,6 @@ vi.mock("./DocumentAnnotationLayer", () => ({
   ),
 }));
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 async function flush() {
   await act(() => {});
   await flushReact();

@@ -6,9 +6,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ImageGalleryModal, type GalleryMediaItem } from "./ImageGalleryModal";
 import { flushReact } from "@/test-utils/react";
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 function makeMediaItem(overrides: Partial<GalleryMediaItem> = {}): GalleryMediaItem {
   return {
     id: "media-1",

@@ -150,9 +150,6 @@ vi.mock("@/components/ui/popover", () => ({
   PopoverContent: ({ children }: { children: ReactNode }) => <div>{children}</div>,
 }));
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 /**
  * Finds the trigger button for a property row by its (sentence-case) label.
  * `PropertyRow` exposes a stable label hook so layout utility changes do not

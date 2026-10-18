@@ -7,9 +7,6 @@ import { ThemeProvider, useTheme } from "./ThemeContext";
 
 const THEME_STORAGE_KEY = "paperclip.theme";
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 type MediaListener = (event: MediaQueryListEvent) => void;
 
 interface FakeMediaQueryList {

@@ -97,9 +97,6 @@ vi.mock("../context/SidebarContext", () => ({
   }),
 }));
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 describe("SidebarCompanyMenu", () => {
   let container: HTMLDivElement;
 

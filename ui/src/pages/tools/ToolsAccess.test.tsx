@@ -50,9 +50,6 @@ vi.mock("./RunYourOwnTab", () => ({
   RunYourOwnTab: () => <section>Run your own tab</section>,
 }));
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 describe("ToolsAccess", () => {
   let container: HTMLDivElement;
   let root: ReturnType<typeof createRoot>;

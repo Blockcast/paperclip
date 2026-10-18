@@ -8,8 +8,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { AdvancedRule, WizardSelections } from "./profile-model";
 import { WizardToolsStep } from "./WizardToolsStep";
 
-(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-
 function tool(id: string, toolName: string): ToolCatalogEntry {
   return {
     id,

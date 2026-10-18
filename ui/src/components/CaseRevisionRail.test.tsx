@@ -24,8 +24,6 @@ vi.mock("@/lib/router", () => ({
   ),
 }));
 
-(globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-
 const revisions: CaseDocumentRevisions = {
   key: "body",
   document: { id: "doc-1", title: "body", format: "markdown", latestRevisionId: "r2", latestRevisionNumber: 2 },

@@ -8,9 +8,6 @@ import { ToastProvider } from "../context/ToastContext";
 import { StandaloneBrowserControls } from "./StandaloneBrowserControls";
 import { flushReact } from "@/test-utils/react";
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 function installMatchMedia(initialMatches: Record<string, boolean> = {}) {
   type Listener = (event: MediaQueryListEvent) => void;
   const queries = new Map<string, { matches: boolean; listeners: Set<Listener> }>();

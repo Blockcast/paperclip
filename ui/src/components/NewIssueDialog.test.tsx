@@ -256,9 +256,6 @@ vi.mock("@/components/ui/popover", () => ({
   ),
 }));
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 async function typeTextareaValue(textarea: HTMLTextAreaElement, value: string) {
   await act(async () => {
     const valueSetter = Object.getOwnPropertyDescriptor(

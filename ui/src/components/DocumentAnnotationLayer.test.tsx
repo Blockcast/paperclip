@@ -16,9 +16,6 @@ vi.mock("@/lib/document-annotation-selection", () => ({
   rangesForNormalizedSpan: mockRangesForNormalizedSpan,
 }));
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 function makeRect(left: number, top: number, width: number, height: number): DOMRect {
   return {
     x: left,

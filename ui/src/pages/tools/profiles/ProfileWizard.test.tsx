@@ -25,8 +25,6 @@ vi.mock("./useProfilesData", () => ({ useProfilesData: () => profilesData.curren
 
 import { ProfileWizard } from "./ProfileWizard";
 
-(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-
 function tool(id: string, toolName: string): ToolCatalogEntry {
   return {
     id,

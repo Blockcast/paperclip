@@ -52,8 +52,6 @@ vi.mock("../context/BreadcrumbContext", () => ({ useBreadcrumbs: () => breadcrum
 vi.mock("../api/approvals", () => ({ approvalsApi: approvalsApiMock }));
 vi.mock("../api/agents", () => ({ agentsApi: agentsApiMock }));
 
-(globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-
 const budgetCard = (over: Partial<Approval> = {}): Approval =>
   ({
     id: "approval-1",

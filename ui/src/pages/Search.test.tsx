@@ -99,9 +99,6 @@ vi.mock("../components/Identity", () => ({
   Identity: ({ name }: { name: string }) => <span>{name}</span>,
 }));
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 // Search.tsx debounces the draft query with a real window.setTimeout, so any
 // assertion about the resulting request has to outlast that timer on a contended
 // runner. A retry count is not a wall-clock budget: `flushReact()` costs one microtask

@@ -37,9 +37,6 @@ vi.mock("@/lib/router", () => ({
   ),
 }));
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 /** The form field input — excludes the "Find an action" search box. */
 function formInput(): HTMLInputElement {
   const inputs = [...container.querySelectorAll("input")].filter(

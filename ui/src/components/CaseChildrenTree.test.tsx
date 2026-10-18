@@ -15,8 +15,6 @@ vi.mock("@/lib/router", () => ({
     `/PAP/${["cases", ...segments].filter(Boolean).join("/")}`,
 }));
 
-(globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-
 function child(overrides: Partial<CaseSummary>): CaseSummary {
   return {
     id: Math.random().toString(36).slice(2),

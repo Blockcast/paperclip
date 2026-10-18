@@ -23,8 +23,6 @@ vi.mock("../api/issues", () => ({
   },
 }));
 
-(globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-
 let container: HTMLDivElement;
 let root: Root;
 let dateNowSpy: ReturnType<typeof vi.spyOn> | null = null;

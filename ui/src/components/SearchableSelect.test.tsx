@@ -13,9 +13,6 @@ import {
 } from "@/lib/reusable-execution-workspaces";
 import { flushReact } from "@/test-utils/react";
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 function render(node: ReactNode, container: HTMLElement) {
   const root = createRoot(container);
   act(() => {

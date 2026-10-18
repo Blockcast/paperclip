@@ -11,8 +11,6 @@ import {
   type RoutineDetailContextValue,
 } from "./context";
 
-(globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-
 vi.mock("../MarkdownEditor", () => ({
   MarkdownEditor: () => null,
 }));
