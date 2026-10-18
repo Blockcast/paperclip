@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { useState } from "react";
+import { act, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type {
@@ -12,6 +12,7 @@ import {
   DocumentAnnotationsCountChip,
   IssueDocumentAnnotations,
 } from "./IssueDocumentAnnotations";
+import { flushReact } from "@/test-utils/react";
 
 const mockAnnotationsApi = vi.hoisted(() => {
   const api = {
@@ -132,14 +133,9 @@ vi.mock("./DocumentAnnotationLayer", () => ({
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
-async function act(callback: () => void | Promise<void>) {
-  await callback();
-  await Promise.resolve();
-  await new Promise((resolve) => setTimeout(resolve, 0));
-}
-
 async function flush() {
   await act(() => {});
+  await flushReact();
 }
 
 function setTextareaValue(textarea: HTMLTextAreaElement, value: string) {
@@ -300,6 +296,7 @@ describe("IssueDocumentAnnotations", () => {
         root.unmount();
       }
     });
+    await flushReact();
     container.remove();
   });
 
@@ -322,6 +319,7 @@ describe("IssueDocumentAnnotations", () => {
         </QueryClientProvider>,
       );
     });
+    await flushReact();
     await flush();
     await flush();
 
@@ -336,6 +334,7 @@ describe("IssueDocumentAnnotations", () => {
     await act(async () => {
       (chip as HTMLButtonElement).click();
     });
+    await flushReact();
     await flush();
     const panel = container.querySelector('[data-testid="document-annotation-panel"]');
     expect(panel).not.toBeNull();
@@ -386,6 +385,7 @@ describe("IssueDocumentAnnotations", () => {
           </QueryClientProvider>,
         );
       });
+      await flushReact();
       await flush();
       await flush();
 
@@ -445,6 +445,7 @@ describe("IssueDocumentAnnotations", () => {
           </QueryClientProvider>,
         );
       });
+      await flushReact();
       await flush();
       await flush();
 
@@ -474,6 +475,7 @@ describe("IssueDocumentAnnotations", () => {
         </QueryClientProvider>,
       );
     });
+    await flushReact();
     await flush();
     await flush();
 
@@ -498,6 +500,7 @@ describe("IssueDocumentAnnotations", () => {
         </QueryClientProvider>,
       );
     });
+    await flushReact();
     await flush();
     await flush();
 
@@ -525,6 +528,7 @@ describe("IssueDocumentAnnotations", () => {
         </QueryClientProvider>,
       );
     });
+    await flushReact();
     await flush();
     await flush();
 
@@ -561,6 +565,7 @@ describe("IssueDocumentAnnotations", () => {
         </QueryClientProvider>,
       );
     });
+    await flushReact();
     await flush();
     await flush();
 
@@ -642,6 +647,7 @@ describe("IssueDocumentAnnotations", () => {
         </QueryClientProvider>,
       );
     });
+    await flushReact();
     await flush();
     await flush();
 
@@ -652,6 +658,7 @@ describe("IssueDocumentAnnotations", () => {
     });
     // Click the open thread to expand it.
     await act(async () => threadCard.click());
+    await flushReact();
     await flush();
 
     const expandedThread = container.querySelector('[data-thread-id="open-1"]');
@@ -678,6 +685,7 @@ describe("IssueDocumentAnnotations", () => {
         </QueryClientProvider>,
       );
     });
+    await flushReact();
     await flush();
     await flush();
 
@@ -700,6 +708,7 @@ describe("IssueDocumentAnnotations", () => {
         </QueryClientProvider>,
       );
     });
+    await flushReact();
     await flush();
     await flush();
 
@@ -710,6 +719,7 @@ describe("IssueDocumentAnnotations", () => {
     await act(async () => {
       selectOnlyButton!.click();
     });
+    await flushReact();
     await flush();
 
     expect(container.querySelector('[data-testid="document-annotation-composer"]')).toBeNull();
@@ -722,6 +732,7 @@ describe("IssueDocumentAnnotations", () => {
     await act(async () => {
       directRequestButton!.click();
     });
+    await flushReact();
     await flush();
 
     const composer = container.querySelector(
@@ -745,6 +756,7 @@ describe("IssueDocumentAnnotations", () => {
         </QueryClientProvider>,
       );
     });
+    await flushReact();
     await flush();
     await flush();
     expect(mockAnnotationsApi.list).toHaveBeenCalledTimes(1);
@@ -754,6 +766,7 @@ describe("IssueDocumentAnnotations", () => {
     await act(async () => {
       selectButton!.click();
     });
+    await flushReact();
     await flush();
 
     const composer = container.querySelector('[data-testid="document-annotation-composer"]') as HTMLTextAreaElement | null;
@@ -761,6 +774,7 @@ describe("IssueDocumentAnnotations", () => {
     await act(async () => {
       setTextareaValue(composer!, "New anchored comment");
     });
+    await flushReact();
     await flush();
 
     const submit = Array.from(container.querySelectorAll("button")).find(
@@ -770,6 +784,7 @@ describe("IssueDocumentAnnotations", () => {
     await act(async () => {
       submit!.click();
     });
+    await flushReact();
     await flush();
     await flush();
 
@@ -798,6 +813,7 @@ describe("IssueDocumentAnnotations", () => {
         </QueryClientProvider>,
       );
     });
+    await flushReact();
     await flush();
     await flush();
 
@@ -806,6 +822,7 @@ describe("IssueDocumentAnnotations", () => {
     await act(async () => {
       selectButton!.click();
     });
+    await flushReact();
     await flush();
 
     const composer = container.querySelector('[data-testid="document-annotation-composer"]') as HTMLTextAreaElement | null;
@@ -813,6 +830,7 @@ describe("IssueDocumentAnnotations", () => {
     await act(async () => {
       setTextareaValue(composer!, "New anchored comment");
     });
+    await flushReact();
     await flush();
 
     const submit = Array.from(container.querySelectorAll("button")).find(
@@ -822,6 +840,7 @@ describe("IssueDocumentAnnotations", () => {
     await act(async () => {
       submit!.click();
     });
+    await flushReact();
     await flush();
     await flush();
 
@@ -846,18 +865,22 @@ describe("IssueDocumentAnnotations", () => {
         </QueryClientProvider>,
       );
     });
+    await flushReact();
     await flush();
     await flush();
 
     const selectButton = container.querySelector('[data-testid="mock-annotation-selection"]') as HTMLButtonElement | null;
     await act(async () => selectButton!.click());
+    await flushReact();
     await flush();
 
     const composer = container.querySelector('[data-testid="document-annotation-composer"]') as HTMLTextAreaElement | null;
     expect(composer).not.toBeNull();
     await act(async () => setTextareaValue(composer!, "Submitted via shortcut"));
+    await flushReact();
     await flush();
     await act(async () => dispatchSubmitShortcut(composer!));
+    await flushReact();
     await flush();
     await flush();
 
@@ -883,6 +906,7 @@ describe("IssueDocumentAnnotations", () => {
         </QueryClientProvider>,
       );
     });
+    await flushReact();
     await flush();
     await flush();
 
@@ -892,6 +916,7 @@ describe("IssueDocumentAnnotations", () => {
       return el!;
     });
     await act(async () => openThread.click());
+    await flushReact();
     await flush();
 
     const reply = container.querySelector(
@@ -899,8 +924,10 @@ describe("IssueDocumentAnnotations", () => {
     ) as HTMLTextAreaElement | null;
     expect(reply).not.toBeNull();
     await act(async () => setTextareaValue(reply!, "Replying via shortcut"));
+    await flushReact();
     await flush();
     await act(async () => dispatchSubmitShortcut(reply!));
+    await flushReact();
     await flush();
     await flush();
 
@@ -923,6 +950,7 @@ describe("IssueDocumentAnnotations", () => {
         </QueryClientProvider>,
       );
     });
+    await flushReact();
     await flush();
     await flush();
 
@@ -932,6 +960,7 @@ describe("IssueDocumentAnnotations", () => {
       return el!;
     });
     await act(async () => openThread.click());
+    await flushReact();
     await flush();
 
     const reply = container.querySelector(
@@ -939,6 +968,7 @@ describe("IssueDocumentAnnotations", () => {
     ) as HTMLTextAreaElement | null;
     expect(reply).not.toBeNull();
     await act(async () => setTextareaValue(reply!, "Reply should stay visible"));
+    await flushReact();
     await flush();
 
     const replyButton = Array.from(container.querySelectorAll("button")).find(
@@ -946,6 +976,7 @@ describe("IssueDocumentAnnotations", () => {
     );
     expect(replyButton).not.toBeUndefined();
     await act(async () => replyButton!.click());
+    await flushReact();
     await flush();
     await flush();
 
@@ -975,6 +1006,7 @@ describe("IssueDocumentAnnotations", () => {
         </QueryClientProvider>,
       );
     });
+    await flushReact();
     await flush();
     await flush();
 
@@ -984,6 +1016,7 @@ describe("IssueDocumentAnnotations", () => {
       return el!;
     });
     await act(async () => openThread.click());
+    await flushReact();
     await flush();
 
     const resolveButton = Array.from(container.querySelectorAll("button")).find(
@@ -991,6 +1024,7 @@ describe("IssueDocumentAnnotations", () => {
     );
     expect(resolveButton).not.toBeUndefined();
     await act(async () => resolveButton!.click());
+    await flushReact();
     await flush();
     expect(mockAnnotationsApi.updateStatus).toHaveBeenCalledWith("issue-1", "plan", "open-1", "resolved");
 
@@ -998,6 +1032,7 @@ describe("IssueDocumentAnnotations", () => {
     const resolvedThread = container.querySelector('[data-thread-id="resolved-1"]') as HTMLElement | null;
     expect(resolvedThread).not.toBeNull();
     await act(async () => resolvedThread!.click());
+    await flushReact();
     await flush();
 
     const reopenButton = Array.from(container.querySelectorAll("button")).find(
@@ -1005,6 +1040,7 @@ describe("IssueDocumentAnnotations", () => {
     );
     expect(reopenButton).not.toBeUndefined();
     await act(async () => reopenButton!.click());
+    await flushReact();
     await flush();
     expect(mockAnnotationsApi.updateStatus).toHaveBeenCalledWith("issue-1", "plan", "resolved-1", "open");
   });
@@ -1037,6 +1073,7 @@ describe("IssueDocumentAnnotations", () => {
           </QueryClientProvider>,
         );
       });
+      await flushReact();
       await flush();
       await flush();
 

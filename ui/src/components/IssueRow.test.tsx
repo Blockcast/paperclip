@@ -1,7 +1,6 @@
 // @vitest-environment jsdom
 
-import { act as reactAct } from "react";
-import { flushSync } from "react-dom";
+import { act } from "react";
 import { createRoot } from "react-dom/client";
 import type { Issue } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -28,15 +27,6 @@ vi.mock("@/lib/router", () => ({
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
-function act(callback: () => void) {
-  if (typeof reactAct === "function") {
-    reactAct(callback);
-    return;
-  }
-
-  flushSync(callback);
-}
 
 function createIssue(overrides: Partial<Issue> = {}): Issue {
   return {

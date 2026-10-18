@@ -1,8 +1,10 @@
 // @vitest-environment jsdom
 
+import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DocumentAnnotationLayer } from "./DocumentAnnotationLayer";
+import { flushReact } from "@/test-utils/react";
 
 const mockBuildAnchorFromContainerSelection = vi.hoisted(() => vi.fn());
 const mockGetContainerTextOffset = vi.hoisted(() => vi.fn());
@@ -16,12 +18,6 @@ vi.mock("@/lib/document-annotation-selection", () => ({
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
-async function act(callback: () => void | Promise<void>) {
-  await callback();
-  await Promise.resolve();
-  await new Promise((resolve) => setTimeout(resolve, 0));
-}
 
 function makeRect(left: number, top: number, width: number, height: number): DOMRect {
   return {
@@ -59,6 +55,7 @@ describe("DocumentAnnotationLayer", () => {
   afterEach(async () => {
     if (root) {
       await act(() => root?.unmount());
+      await flushReact();
       root = null;
     }
     rectSpy.mockRestore();
@@ -92,6 +89,7 @@ describe("DocumentAnnotationLayer", () => {
       );
       await new Promise((resolve) => window.requestAnimationFrame(resolve));
     });
+    await flushReact();
 
     const highlights = Array.from(container.querySelectorAll(".paperclip-doc-annotation-highlight"));
     expect(highlights).toHaveLength(4);
@@ -138,6 +136,7 @@ describe("DocumentAnnotationLayer", () => {
       );
       await new Promise((resolve) => window.requestAnimationFrame(resolve));
     });
+    await flushReact();
 
     expect(container.querySelector(".paperclip-doc-annotation-highlight")).toBeNull();
     expect(container.querySelector(".paperclip-doc-annotation-hit-target")).toBeNull();
@@ -178,10 +177,12 @@ describe("DocumentAnnotationLayer", () => {
         );
         await new Promise((resolve) => window.requestAnimationFrame(resolve));
       });
+      await flushReact();
 
       await act(async () => {
         document.dispatchEvent(new Event("selectionchange"));
       });
+      await flushReact();
 
       expect(mockGetContainerTextOffset).not.toHaveBeenCalled();
       expect(mockBuildAnchorFromContainerSelection).not.toHaveBeenCalled();
@@ -227,10 +228,12 @@ describe("DocumentAnnotationLayer", () => {
         );
         await new Promise((resolve) => window.requestAnimationFrame(resolve));
       });
+      await flushReact();
 
       await act(async () => {
         document.dispatchEvent(new Event("selectionchange"));
       });
+      await flushReact();
 
       expect(mockGetContainerTextOffset).not.toHaveBeenCalled();
       expect(mockBuildAnchorFromContainerSelection).not.toHaveBeenCalled();
@@ -283,6 +286,7 @@ describe("DocumentAnnotationLayer", () => {
       );
       await new Promise((resolve) => window.requestAnimationFrame(resolve));
     });
+    await flushReact();
 
     expect(container.querySelector(".paperclip-doc-annotation-highlight")).toBeNull();
     expect(container.querySelector(".paperclip-doc-annotation-hit-target")).not.toBeNull();
@@ -291,6 +295,7 @@ describe("DocumentAnnotationLayer", () => {
     expect((openHighlightCall?.[1] as MockHighlight).ranges).toHaveLength(1);
 
     await act(async () => root?.unmount());
+    await flushReact();
     root = null;
     expect(deleteHighlight).toHaveBeenCalledWith("paperclip-doc-annotation-open");
 

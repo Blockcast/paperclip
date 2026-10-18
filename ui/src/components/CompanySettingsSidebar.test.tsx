@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 
+import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -90,12 +91,6 @@ vi.mock("@/plugins/slots", () => ({
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
-async function act(callback: () => void | Promise<void>) {
-  await callback();
-  await Promise.resolve();
-  await new Promise((resolve) => window.setTimeout(resolve, 0));
-}
-
 describe("CompanySettingsSidebar", () => {
   let container: HTMLDivElement;
 
@@ -141,7 +136,7 @@ describe("CompanySettingsSidebar", () => {
         </QueryClientProvider>,
       );
     });
-    await flushReact(3);
+    await flushReact(4);
 
     expect(container.textContent).toContain("Paperclip");
     expect(container.textContent).toContain("Company Settings");
@@ -226,6 +221,7 @@ describe("CompanySettingsSidebar", () => {
     await act(async () => {
       root.unmount();
     });
+    await flushReact();
   });
 
   it("shows cloud upstream only when cloud sync is enabled", async () => {
@@ -244,7 +240,7 @@ describe("CompanySettingsSidebar", () => {
         </QueryClientProvider>,
       );
     });
-    await flushReact(3);
+    await flushReact(4);
 
     expect(container.textContent).toContain("Cloud upstream");
     expect(sidebarNavItemMock).toHaveBeenCalledWith(
@@ -258,6 +254,7 @@ describe("CompanySettingsSidebar", () => {
     await act(async () => {
       root.unmount();
     });
+    await flushReact();
   });
 
   it("renders company settings pages contributed by ready plugins", async () => {
@@ -290,7 +287,7 @@ describe("CompanySettingsSidebar", () => {
         </QueryClientProvider>,
       );
     });
-    await flushReact(3);
+    await flushReact(4);
 
     expect(container.textContent).toContain("Permissions");
     expect(sidebarNavItemMock).toHaveBeenCalledWith(
@@ -304,6 +301,7 @@ describe("CompanySettingsSidebar", () => {
     await act(async () => {
       root.unmount();
     });
+    await flushReact();
   });
 
   it("shows cloud upstream only when cloud sync is enabled", async () => {
@@ -322,7 +320,7 @@ describe("CompanySettingsSidebar", () => {
         </QueryClientProvider>,
       );
     });
-    await flushReact(3);
+    await flushReact(4);
 
     expect(container.textContent).toContain("Cloud upstream");
     expect(sidebarNavItemMock).toHaveBeenCalledWith(
@@ -336,6 +334,7 @@ describe("CompanySettingsSidebar", () => {
     await act(async () => {
       root.unmount();
     });
+    await flushReact();
   });
 
   it("renders instance plugin links while filtering sandbox-provider-only plugins", async () => {
@@ -380,7 +379,7 @@ describe("CompanySettingsSidebar", () => {
         </QueryClientProvider>,
       );
     });
-    await flushReact(3);
+    await flushReact(4);
 
     const pluginLinks = Array.from(
       container.querySelectorAll<HTMLAnchorElement>('a[href^="/company/settings/instance/plugins/"]'),
@@ -396,5 +395,6 @@ describe("CompanySettingsSidebar", () => {
     await act(async () => {
       root.unmount();
     });
+    await flushReact();
   });
 });

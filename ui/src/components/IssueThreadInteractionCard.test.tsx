@@ -1,7 +1,6 @@
 // @vitest-environment jsdom
 
-import { act as reactAct, type ComponentProps, type ReactNode } from "react";
-import { flushSync } from "react-dom";
+import { act, type ComponentProps, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { IssueThreadInteractionCard } from "./IssueThreadInteractionCard";
@@ -34,20 +33,6 @@ let root: Root | null = null;
 let container: HTMLDivElement | null = null;
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-
-async function act(callback: () => void | Promise<void>) {
-  if (typeof reactAct === "function") {
-    await reactAct(callback);
-    return;
-  }
-
-  let result: void | Promise<void> = undefined;
-  flushSync(() => {
-    result = callback();
-  });
-  await result;
-  await new Promise((resolve) => setTimeout(resolve, 0));
-}
 
 vi.mock("@/lib/router", () => ({
   Link: ({ to, children, className }: { to: string; children: ReactNode; className?: string }) => (
