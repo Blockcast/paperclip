@@ -9,7 +9,7 @@ import type {
 } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, createElement } from "react";
-import { flushReact } from "@/test-utils/react";
+import { flushReact, waitForAssertion } from "@/test-utils/react";
 
 const mockToolsApi = vi.hoisted(() => ({
   getEffectiveProfilesForAgent: vi.fn(),
@@ -214,6 +214,17 @@ describe("AgentToolsTab", () => {
 
     await renderTab();
 
+    // "Unavailable tools" is the full catalog minus the allowed tools, and the
+    // catalog comes from a `useQueries` that is DEPENDENT on the connections
+    // query: it only mounts on the render where connections resolve, one settle
+    // cycle after the rest of this surface. Wait for that row before snapshotting
+    // `textContent` — a single post-render flush is *exactly* enough on an idle
+    // box (measured: zero spare cycles) and goes red under load, which ejected
+    // paperclip#2807 from the merge queue (PEN-4277).
+    await waitForAssertion(() => {
+      expect(container.textContent ?? "").toContain("github.delete_repo");
+    });
+
     const text = container.textContent ?? "";
     expect(text).toContain("Effective access");
     expect(text).toContain("github.read_repo");
@@ -227,8 +238,6 @@ describe("AgentToolsTab", () => {
     expect(text).toContain("#1 Require approval for writes");
     // The policy that targets a different agent must NOT appear.
     expect(text).not.toContain("Block other agent");
-    // Unavailable tool surfaced from the full tool list minus allowed.
-    expect(text).toContain("github.delete_repo");
   });
 
   it("shows the empty allow-list message when no profile applies", async () => {

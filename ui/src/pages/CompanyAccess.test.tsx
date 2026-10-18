@@ -5,7 +5,7 @@ import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CompanyAccess, CompanyAccessLegacyRoute } from "./CompanyAccess";
-import { flushReact } from "@/test-utils/react";
+import { flushReact, waitForAssertion } from "@/test-utils/react";
 
 const listMembersMock = vi.hoisted(() => vi.fn());
 const listJoinRequestsMock = vi.hoisted(() => vi.fn());
@@ -198,6 +198,16 @@ describe("CompanyAccess", () => {
     await flushReact();
     await flushReact();
 
+    // "Pending human joins" comes from joinRequestsQuery, which is gated on
+    // membersQuery (`enabled: … membersQuery.data?.access.canApproveJoinRequests`),
+    // so it settles a wave after the rest of the page. Two fixed flushes left
+    // exactly one spare cycle. Wait for the row instead, and do it before the
+    // `not.toContain("Pending agent joins")` below, which would otherwise pass
+    // vacuously on a page that has not rendered the section yet (PEN-4277).
+    await waitForAssertion(() => {
+      expect(container.textContent).toContain("Pending human joins");
+    });
+
     expect(container.textContent).toContain("Manage the people who can work in Paperclip");
     expect(container.textContent).toContain("Members can collaborate across the company by default");
     expect(container.textContent).toContain("Core keeps this page focused on membership");
@@ -306,8 +316,14 @@ describe("CompanyAccess", () => {
     });
     await flushReact();
 
+    // The dialog fetches the removed user's open issues when it opens, so this
+    // row lands a wave after the dialog itself. One fixed flush left no spare
+    // cycle (PEN-4277).
+    await waitForAssertion(() => {
+      expect(document.body.textContent).toContain("Assigned to removed user");
+    });
+
     expect(document.body.textContent).toContain("Remove member");
-    expect(document.body.textContent).toContain("Assigned to removed user");
 
     const reassignmentSelect = document.body.querySelector("select");
     expect(reassignmentSelect).toBeTruthy();
