@@ -777,6 +777,72 @@ describe("buildGithubTruthProbe", () => {
     expect(r.reviewerAuthoredPr).toBe(false);
   });
 
+  // SINGLE-PR mixed case. Found by Ally's review of #2810 and it was a
+  // fail-open: `out.clean` is false for four independent reasons and only the
+  // comment-surface ones are visible to the marker, so a self-attested at-head
+  // comment beside a BLOCKING FORMAL REVIEW used to yield
+  // `clean: false, authorIsReviewer: true` — suppressing the escalation on a
+  // head that carries an actionable finding, with a diagnostic claiming only
+  // independence was missing. The set-level test above cannot reach this: it
+  // needs both conditions on ONE PR.
+  it("self-attested comment beside a BLOCKING formal review → reviewerAuthoredPr false", async () => {
+    const r = await buildGithubTruthProbe(
+      deps({
+        fetchPrAuthorLogin: async () => ALLY,
+        listReviewerSurfaces: async () => ({
+          reviews: [{ login: ALLY, body: dirty, state: "COMMENTED", commitId: HEAD, submittedAt: null }],
+          comments: [{ login: ALLY, body: clean, createdAt: "2026-09-06T00:00:00Z" }],
+        }),
+      }),
+    )({ workProducts: [wp()] });
+    expect(r.detections["review:ally-clean"]).toBeUndefined();
+    expect(r.reviewerAuthoredPr).toBe(false);
+  });
+
+  // The other formal veto, same shape. A `tracked` entry is a reviewer
+  // accepting a real defect onto a follow-up — an actionable residual, not an
+  // identity problem.
+  it("self-attested comment beside a DEFERRING formal review → reviewerAuthoredPr false", async () => {
+    const tracked = clean.replace(
+      "### Recommended Action",
+      "### Prior Findings Dispositioned (1)\n- **prior:abcdef0 important 1** - tracked - accepted onto BLO-36822.\n\n### Recommended Action",
+    );
+    const r = await buildGithubTruthProbe(
+      deps({
+        fetchPrAuthorLogin: async () => ALLY,
+        listReviewerSurfaces: async () => ({
+          reviews: [{ login: ALLY, body: tracked, state: "COMMENTED", commitId: HEAD, submittedAt: null }],
+          comments: [{ login: ALLY, body: clean, createdAt: "2026-09-06T00:00:00Z" }],
+        }),
+      }),
+    )({ workProducts: [wp()] });
+    expect(r.reviewerAuthoredPr).toBe(false);
+  });
+
+  // The COMMENT-surface asymmetry, also from that review. For a self-authored
+  // PR the gate takes the withheld-positive branch and never ran the deferral
+  // check on the attesting body — that check lives only in the independent
+  // branch — so a body accepting a residual still read as identity-only, while
+  // the SAME body under an independent author yields `deferred_finding` and is
+  // vetoed. The asymmetry failed open, and in the author's favour.
+  it("self-attested comment that itself DEFERS a finding → reviewerAuthoredPr false", async () => {
+    const trackedSelf = clean.replace(
+      "### Recommended Action",
+      "### Prior Findings Dispositioned (1)\n- **prior:abcdef0 important 1** - tracked - accepted onto BLO-36822.\n\n### Recommended Action",
+    );
+    const r = await buildGithubTruthProbe(
+      deps({
+        fetchPrAuthorLogin: async () => ALLY,
+        listReviewerSurfaces: async () => ({
+          reviews: [],
+          comments: [{ login: ALLY, body: trackedSelf, createdAt: "2026-09-06T00:00:00Z" }],
+        }),
+      }),
+    )({ workProducts: [wp()] });
+    expect(r.detections["review:ally-clean"]).toBeUndefined();
+    expect(r.reviewerAuthoredPr).toBe(false);
+  });
+
   // Same withholding the detections get, for the same reason: a PR that was
   // never read could be the one carrying the real gap, so the five that are
   // identity-blocked say nothing about the set.

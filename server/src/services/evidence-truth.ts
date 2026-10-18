@@ -404,12 +404,11 @@ async function probeOne(
     // `state`/`outcome`/`headAttested` — that one is a failed read and already
     // sets `out.failed` via `readPrAuthor`.
     //
-    // Recorded even when `commentClean` is true (it cannot be — the two
-    // branches are exclusive) and regardless of `formalClean`, because the
-    // aggregator below consumes it only in conjunction with `!clean`. Keeping
-    // it a pure statement about THIS surface rather than a pre-combined
-    // verdict is what lets that conjunction stay readable.
-    out.authorIsReviewer = "authorIsReviewer" in commentVerdict && commentVerdict.authorIsReviewer === true;
+    // THIS SURFACE ONLY. It is not yet `out.authorIsReviewer`: the formal
+    // surface has its own two vetoes and they are not computed until below.
+    // See the assignment beside `out.clean`.
+    const commentAuthorIsReviewer =
+      "authorIsReviewer" in commentVerdict && commentVerdict.authorIsReviewer === true;
     // `blocking_finding` and `carried_finding` — the two outcomes that make the
     // merge-visible gate red. `not_evaluated` is silence, not a verdict.
     const commentBlocking = commentVerdict.state === "failure";
@@ -731,6 +730,29 @@ async function probeOne(
     // review that accepts a residual (or the mirror) still reads
     // `review:ally-clean` for a head with a live accepted residual (BLO-36903).
     const commentDeferred = commentVerdict.outcome === "deferred_finding";
+    // Assigned HERE, not where the marker is read, and carrying the formal
+    // surface's two vetoes — found by Ally's review of #2810, and it was a
+    // fail-open.
+    //
+    // The field has to mean "identity is the ONLY reason this is not clean",
+    // because the aggregator consumes it as `r.clean || r.authorIsReviewer`.
+    // `!clean` is NOT the right conjunct to lean on: it is exactly the state a
+    // veto produces. `out.clean` is false for four independent reasons, and
+    // only two of them are visible to the comment verdict —
+    //   - `commentBlocking` / a carried finding: excluded already, since those
+    //     branches return before the marker is ever set;
+    //   - `commentDeferred`: excluded in the gate, which now withholds the
+    //     marker when the attesting body carries a residual;
+    //   - `formalBlocking` / `formalDeferred`: INVISIBLE to the comment verdict,
+    //     and vetoed here.
+    //
+    // Without this, a self-attested at-head comment beside a formal review that
+    // blocks (or accepts a residual) yielded `clean: false, authorIsReviewer:
+    // true`, so the gate suppressed its escalation and the diagnostic claimed
+    // "only independence is missing" about a head carrying an actionable
+    // finding. Behind the flag today, so no live verdict moved — but it is
+    // precisely the fail-open the arm's own premise rules out.
+    out.authorIsReviewer = commentAuthorIsReviewer && !formalBlocking && !formalDeferred;
     out.clean =
       // The `!commentBlocking` conjunct below is DEAD since the
       // `!commentBlocking` guard above subsumed it, and it cannot be given a

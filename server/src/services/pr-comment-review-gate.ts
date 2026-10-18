@@ -962,6 +962,22 @@ export function evaluateCommentReviewGate(input: {
       // seat and the App are one agent wearing two hats, so a PR opened by the
       // seat and attested by the App is still a self-attestation.
     } else if (githubSharesReviewerIdentity(prAuthorLogin, reviewerBotLogin)) {
+      // The attesting body's own deferral count, read here ONLY to withhold the
+      // marker below — the verdict this branch returns is byte-identical either
+      // way (BLO-34316 is untouched: a self-attested deferral is still not
+      // credited as `deferred_finding`, and still falls through to the
+      // carry-forward ledger). The `else` branch's reason for gating the count
+      // behind the independence check does not reach this use, because this use
+      // can only ever make a positive claim SMALLER.
+      //
+      // Needed because the marker's whole meaning is "the shape is unreachable
+      // for an identity reason and for no other". An at-head body that accepts
+      // a residual is an actionable gap — somebody should look at it — and the
+      // same body under an independent author yields `deferred_finding`, which
+      // the evidence probe vetoes. Without this the self-attested copy would be
+      // suppressed while its independent twin was not: the asymmetry would fail
+      // OPEN, and in favour of the author.
+      const selfAttestedDeferrals = countAllyDeferredPriorFindings(forHead.comment.body);
       withheldPositive = {
         state: "success",
         outcome: "not_evaluated",
@@ -976,8 +992,9 @@ export function evaluateCommentReviewGate(input: {
         // The marker the evidence probe keys on. See `authorIsReviewer` on the
         // verdict type: this is the branch where the shape `review:ally-clean`
         // is unreachable as a property of WHO WE ARE rather than of what was
-        // reviewed, and the only branch that may be read that way.
-        authorIsReviewer: true,
+        // reviewed, and the only branch that may be read that way. Conditional,
+        // so a body carrying a residual is simply not claimed as identity-only.
+        ...(selfAttestedDeferrals === 0 ? { authorIsReviewer: true as const } : {}),
         reason: "The only comment attesting this head is the PR author's own; nothing independent reviewed it.",
       };
     } else {
