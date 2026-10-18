@@ -3,12 +3,26 @@ import type { Db } from "@paperclipai/db";
 import { documents, issueDocuments, issues } from "@paperclipai/db";
 import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY, type SourceTrustMetadata } from "@paperclipai/shared";
 import { documentService } from "./documents.js";
-import { truncateText } from "./truncate-text.js";
+import { truncateSectionText, truncateText } from "./truncate-text.js";
 
 export { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY };
 export const ISSUE_CONTINUATION_SUMMARY_TITLE = "Continuation Summary";
 export const ISSUE_CONTINUATION_SUMMARY_MAX_BODY_CHARS = 8_000;
 const SUMMARY_SECTION_MAX_CHARS = 1_200;
+const BODY_ELISION_MARKER =
+  "\n\n[... continuation summary elided to fit the body budget; read the issue description and run log for the full text ...]\n\n";
+const STATUS_DERIVED_NEXT_ACTIONS = {
+  done: "Review the completed issue output and close any remaining follow-up comments.",
+  inReview: "Wait for reviewer feedback or approval before continuing executor work.",
+  failed: "Inspect the failed run, fix the cause, and resume from the most recent concrete action above.",
+  cancelled: "Confirm the cancellation reason before starting another run.",
+  resume: "Resume implementation from the acceptance criteria, latest comments, and this summary.",
+} as const;
+const STATUS_DERIVED_NEXT_ACTION_VALUES: ReadonlySet<string> = new Set(Object.values(STATUS_DERIVED_NEXT_ACTIONS));
+
+function isStatusDerivedNextAction(nextAction: string) {
+  return STATUS_DERIVED_NEXT_ACTION_VALUES.has(nextAction.trim());
+}
 const PATH_CANDIDATE_RE = /(?:^|[\s`"'(])((?:server|ui|packages|doc|scripts|\.github)\/[A-Za-z0-9._/-]+)/g;
 const WAITING_FOR_REVIEW_OR_APPROVAL_RE =
   /\bwait(?:ing)? for\b.{0,160}\b(?:review(?:er)?(?: feedback)?|approval|board|human|user|operator)\b/i;
@@ -70,7 +84,7 @@ function extractMarkdownSection(markdown: string | null | undefined, heading: st
   const re = new RegExp(`^##\\s+${escaped}\\s*$([\\s\\S]*?)(?=^##\\s+|(?![\\s\\S]))`, "im");
   const match = re.exec(markdown);
   const section = match?.[1]?.trim();
-  return section ? truncateText(section, SUMMARY_SECTION_MAX_CHARS) : null;
+  return section ? truncateSectionText(section, SUMMARY_SECTION_MAX_CHARS) : null;
 }
 
 function extractPathCandidates(...texts: Array<string | null | undefined>) {
@@ -95,13 +109,17 @@ function inferMode(issue: IssueSummaryInput, run: RunSummaryInput) {
 }
 
 function inferNextAction(issue: IssueSummaryInput, run: RunSummaryInput, previousNextAction: string | null) {
-  if (issue.status === "done") return "Review the completed issue output and close any remaining follow-up comments.";
-  if (issue.status === "in_review") return "Wait for reviewer feedback or approval before continuing executor work.";
-  if (run.status === "failed" || run.status === "timed_out") {
-    return "Inspect the failed run, fix the cause, and resume from the most recent concrete action above.";
-  }
-  if (run.status === "cancelled") return "Confirm the cancellation reason before starting another run.";
-  return previousNextAction ?? "Resume implementation from the acceptance criteria, latest comments, and this summary.";
+  if (issue.status === "done") return STATUS_DERIVED_NEXT_ACTIONS.done;
+  if (issue.status === "in_review") return STATUS_DERIVED_NEXT_ACTIONS.inReview;
+  if (run.status === "failed" || run.status === "timed_out") return STATUS_DERIVED_NEXT_ACTIONS.failed;
+  if (run.status === "cancelled") return STATUS_DERIVED_NEXT_ACTIONS.cancelled;
+  // A status-derived line is a statement about the run and issue state that produced it, so it
+  // expires with that state. Carrying one forward is how a document records a `succeeded` run and
+  // then tells the next run to inspect the failed one, and how a row that has left `in_review`
+  // keeps re-minting the park line `continuationSummaryParksExecutor` cancels runs on (PEN-4311).
+  // Anything else in that section was not written by this function, so it still carries forward.
+  if (previousNextAction && !isStatusDerivedNextAction(previousNextAction)) return previousNextAction;
+  return STATUS_DERIVED_NEXT_ACTIONS.resume;
 }
 
 function bulletList(items: string[], empty: string) {
@@ -138,7 +156,9 @@ export function buildContinuationSummaryMarkdown(input: {
   const resultSummary = readResultSummary(run.resultJson);
   const recentActions = [
     `Run \`${run.id}\` finished with status \`${run.status}\`${run.finishedAt ? ` at ${run.finishedAt.toISOString()}` : ""}.`,
-    resultSummary ? truncateText(resultSummary, SUMMARY_SECTION_MAX_CHARS) : "No adapter-provided result summary was captured for this run.",
+    resultSummary
+      ? truncateSectionText(resultSummary, SUMMARY_SECTION_MAX_CHARS, "the run log")
+      : "No adapter-provided result summary was captured for this run.",
   ];
   if (run.error) {
     recentActions.push(
@@ -164,7 +184,7 @@ export function buildContinuationSummaryMarkdown(input: {
     "",
     "## Objective",
     "",
-    truncateText(objective, SUMMARY_SECTION_MAX_CHARS),
+    truncateSectionText(objective, SUMMARY_SECTION_MAX_CHARS),
     "",
     "## Acceptance Criteria",
     "",
@@ -202,7 +222,11 @@ export function buildContinuationSummaryMarkdown(input: {
     `- ${nextAction}`,
   ].join("\n");
 
-  return truncateText(body, ISSUE_CONTINUATION_SUMMARY_MAX_BODY_CHARS);
+  // The whole-body cap keeps the head/tail shape on purpose: `## Next Action` is the last
+  // section, and both `extractPreviousNextAction` and `continuationSummaryParksExecutor` read it.
+  // A head-only cut here would silently delete the one section the next run acts on. The marker
+  // is explicit so an over-budget body cannot read as continuous prose (PEN-4311).
+  return truncateText(body, ISSUE_CONTINUATION_SUMMARY_MAX_BODY_CHARS, BODY_ELISION_MARKER);
 }
 
 export async function getIssueContinuationSummaryDocument(
