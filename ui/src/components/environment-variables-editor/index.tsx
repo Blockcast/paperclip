@@ -118,8 +118,25 @@ function submissionScopeOf(element: Element): Element | null {
  *
  * When the editor resolves no scope at all, keep the pre-existing reach (any button that also
  * resolves none). Degrading to "veto nothing" there would hand back the silent partial save
- * PEN-3358 closed, because no in-repo consumer wraps the editor in a form or a dialog today. Such a
- * consumer narrows this to its own panel by marking that panel `data-env-editor-scope`.
+ * PEN-3358 closed. Most in-repo consumers are plain `div` panels that resolve no scope and rely on
+ * that fallback; they narrow it to their own panel by marking it `data-env-editor-scope`.
+ *
+ * CORRECTION (PEN-4236) — an earlier revision of this comment said "no in-repo consumer wraps the
+ * editor in a form or a dialog today". That was wrong. `PipelineSettings` renders its whole stage
+ * editor inside a real `<form>` (`PipelineSettings.tsx`, the stage form around the
+ * `<StageSecretsPanel>` render), and that panel renders this editor — so for that consumer both the
+ * editor and the stage Save button resolve to that `<form>`, and the scope comparison below is doing
+ * real work rather than idling on the no-scope fallback.
+ *
+ * ASSUMPTION — each side is compared on its *nearest* scope, by identity. That is exact only while no
+ * consumer nests a scope inside another scope. A panel marked `data-env-editor-scope` that contains a
+ * `<form>` or `role="dialog"` around the editor, with the panel's Save *outside* that inner element,
+ * resolves two different scopes — editor to the inner element, Save to the panel — and the Save loses
+ * the veto. No consumer is shaped like that today: the one form-wrapped consumer, `PipelineSettings`,
+ * carries no `data-env-editor-scope` marker at all, so there is nothing to nest. The failure direction
+ * is fail-*open*, back to the pre-PEN-3358 plain flush, so it degrades to the old behaviour rather
+ * than losing data; that is why this stays an identity check. If such a consumer appears, match on
+ * "the button's scope contains the editor root" instead of identity.
  */
 function sharesSubmissionScope(button: Element, editorRoot: Element): boolean {
   return submissionScopeOf(button) === submissionScopeOf(editorRoot);
@@ -375,6 +392,19 @@ export const EnvironmentVariablesEditor = forwardRef<EnvironmentVariablesEditorH
 
   useImperativeHandle(ref, () => ({ flushPendingDraft }), [flushPendingDraft]);
 
+  // This listener is LIVE, not dead weight — do not delete it as unreachable.
+  //
+  // `closest("form")` resolves for the `PipelineSettings` consumer: that page wraps its entire stage
+  // editor in a real `<form>` whose submit runs `saveStage.mutate()`, and `<StageSecretsPanel>` —
+  // which renders this editor — sits inside it. So on that surface a stage save really is a form
+  // submit, and without this capture-phase guard a refused rename would let it through. Verified on
+  // `master` @7bd3bd81 (PEN-4236).
+  //
+  // The other consumers (AgentConfigForm, CompanyEnvironments, ProjectProperties,
+  // routine-sections/editable-sections, the DesignGuide showcase) are plain `div` panels with no
+  // `<form>` above them. For those the early return fires and the protection comes from the
+  // document-level capture `click` listener plus the consumer-side `flushPendingDraft().status ===
+  // "blocked"` checks instead.
   useEffect(() => {
     const form = editorRootRef.current?.closest("form");
     if (!form) return;
