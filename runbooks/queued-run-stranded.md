@@ -248,13 +248,22 @@ paperclip_queued_run_oldest_claimable_age_seconds
   run by hand.
 
 `paperclip_queued_run_oldest_claimable_age_seconds` is the same measurand with
-that population removed. It reads `isEffectivelyDependencyReadyForDispatch`
-(`server/src/services/dispatch-readiness.ts`) -- the dispatcher's own
-predicate, not a copy of it -- so it also preserves the claim path's deliberate
-exemption: an issue-interaction wake carrying a comment id **is** counted,
-because it genuinely can run on a blocked issue so a human can talk to the
-assignee while it waits. A run carrying no issue id is counted for the same
-reason: nothing could make it unclaimable.
+that population removed. It reads `isDispatchRankReady`
+(`server/src/services/dispatch-readiness.ts`) -- `dispatchRank`'s own `ready`
+screen, whole, not a copy of it -- so the gauge and the dispatcher cannot
+disagree about what "claimable" means. Two consequences worth knowing before
+you read a value:
+
+- **Admission backoffs are excluded too.** A k8s-isolation or branch-claim
+  retry still sitting out its own stamp (`isQueuedRunAdmissionDeferred`) is
+  waiting on its backoff, not on dispatch, so it does not raise this gauge
+  either. Reading "both high" as starvation would otherwise be wrong for that
+  population as well.
+- **The claim path's exemptions are preserved.** An issue-interaction wake
+  carrying a comment id **is** counted, because it genuinely can run on a
+  blocked issue so a human can talk to the assignee while it waits. A run
+  carrying no issue id is counted for the same reason: nothing could make it
+  unclaimable.
 
 > ⚠️ The alert still fires on the **unfiltered** gauge, on purpose. Repointing
 > it waits on BLO-26656: the app-native collector that serves both gauges has a

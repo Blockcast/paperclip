@@ -504,8 +504,14 @@ import {
 } from "./deferred-wake-reopen.js";
 import {
   allowsIssueInteractionWake,
+  BRANCH_CLAIM_RETRY_AT_CONTEXT_KEY,
   deriveCommentId,
+  isBranchClaimRetryDeferred,
+  isDispatchRankReady,
   isEffectivelyDependencyReadyForDispatch,
+  isK8sIsolationRetryDeferred,
+  isQueuedRunAdmissionDeferred,
+  K8S_ISOLATION_RETRY_AT_CONTEXT_KEY,
 } from "./dispatch-readiness.js";
 import {
   RECOVERY_ORIGIN_KINDS,
@@ -861,11 +867,9 @@ const PROVIDER_DEATH_RETRY_SESSION_RESUME_ENABLED =
   process.env.PAPERCLIP_PROVIDER_DEATH_RETRY_SESSION_RESUME !== "false";
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS = BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS.length;
 const K8S_ISOLATION_RETRY_ATTEMPT_CONTEXT_KEY = "paperclipK8sIsolationRetryAttempt";
-const K8S_ISOLATION_RETRY_AT_CONTEXT_KEY = "paperclipK8sIsolationRetryAt";
 const K8S_ISOLATION_RETRY_BASE_DELAY_MS = 15_000;
 const K8S_ISOLATION_RETRY_MAX_DELAY_MS = 5 * 60_000;
 const BRANCH_CLAIM_RETRY_ATTEMPT_CONTEXT_KEY = "paperclipBranchClaimRetryAttempt";
-const BRANCH_CLAIM_RETRY_AT_CONTEXT_KEY = "paperclipBranchClaimRetryAt";
 // BLO-21602: renewal cadence for an in-flight run's branch claim. Kept well
 // under DEFAULT_BRANCH_CLAIM_LEASE_MS (30m) so a couple of missed ticks (e.g.
 // a slow DB write) still can't let the lease lapse out from under a live run.
@@ -7239,41 +7243,14 @@ export function computeK8sIsolationRetryDelayMs(attempt: number): number {
   );
 }
 
-export function isK8sIsolationRetryDeferred(
-  context: Record<string, unknown> | null | undefined,
-  now = new Date(),
-): boolean {
-  const retryAtValue = readNonEmptyString(context?.[K8S_ISOLATION_RETRY_AT_CONTEXT_KEY]);
-  if (!retryAtValue) return false;
-  const retryAt = new Date(retryAtValue);
-  return !Number.isNaN(retryAt.getTime()) && retryAt.getTime() > now.getTime();
-}
-
-// BLO-21602: deferRunForBranchClaimConflict (like deferRunForK8sIsolationConflict)
-// sends a run back to `queued` with a computed backoff rather than failing it,
-// stamping paperclipBranchClaimRetryAt on the run's contextSnapshot. Queued-run
-// admission must honor that backoff the same way it already honors the K8s
-// isolation retry stamp -- otherwise the run is immediately eligible again and
-// repeatedly performs setup, conflict, and requeue instead of waiting.
-export function isBranchClaimRetryDeferred(
-  context: Record<string, unknown> | null | undefined,
-  now = new Date(),
-): boolean {
-  const retryAtValue = readNonEmptyString(context?.[BRANCH_CLAIM_RETRY_AT_CONTEXT_KEY]);
-  if (!retryAtValue) return false;
-  const retryAt = new Date(retryAtValue);
-  return !Number.isNaN(retryAt.getTime()) && retryAt.getTime() > now.getTime();
-}
-
-// Combines every "queued run is not actually admissible yet" backoff stamp a
-// run's contextSnapshot may carry. Use this everywhere queued runs are
-// scanned for admission instead of checking isK8sIsolationRetryDeferred alone.
-export function isQueuedRunAdmissionDeferred(
-  context: Record<string, unknown> | null | undefined,
-  now = new Date(),
-): boolean {
-  return isK8sIsolationRetryDeferred(context, now) || isBranchClaimRetryDeferred(context, now);
-}
+// Moved to `dispatch-readiness.ts` (PEN-4293) so the queued-age measurand can
+// read the dispatcher's FULL readiness screen without importing this module.
+// Re-exported here because these are part of this module's published surface.
+export {
+  isK8sIsolationRetryDeferred,
+  isBranchClaimRetryDeferred,
+  isQueuedRunAdmissionDeferred,
+};
 
 /**
  * BLO-31443: the caller resolves the isolation identity and passes it in. This
@@ -8046,41 +8023,6 @@ function isRunClaimable(
   now: Date,
 ): boolean {
   if (!issue || TERMINAL_ISSUE_STATUSES.has(issue.status)) return false;
-  if (isQueuedRunAdmissionDeferred(contextSnapshot, now)) return false;
-  return isEffectivelyDependencyReadyForDispatch(contextSnapshot, readiness);
-}
-
-/**
- * `dispatchRank`'s `ready` screen (BLO-22091). Deliberately narrower than
- * `isRunClaimable` above: it omits the terminal-issue check on purpose.
- *
- * By the time a row reaches the ranking step, `queuedRuns` has already been
- * pruned for terminal issues by the main scan via `evaluateQueuedRunStaleness`
- * — the same function `claimQueuedRun` itself uses — which lets a
- * `resumeIntent`/wake-comment-carrying row survive against a done/cancelled
- * issue so a comment can reopen it. That pruning is authoritative and
- * resume-intent-aware; this function must not re-exclude what it already
- * decided to keep. If it did, `dispatchRank`'s `!ready` branch never ages
- * (a row that "cannot be claimed" must not escalate to the front, however
- * long it has waited — see that function) so a legitimately-claimable
- * reopened row would rank `12+` forever and starve exactly the way this
- * ticket exists to prevent, just via a different exemption than leak 5's.
- *
- * The lanes above don't have this problem: they already excluded terminal
- * issues from their own candidate batches unconditionally before this fix
- * (via `criticalIssueById`'s filter, lane B's `candidates` filter, and lane
- * C's inline check), so a resume-intent-exempted terminal row was already
- * never surfaced as "found ready" by any lane — `isRunClaimable` preserves
- * that pre-existing behavior rather than changing it. Only `dispatchRank`'s
- * `ready` previously had *no* terminal screen at all (trusting the upstream
- * prune), so adding the full `isRunClaimable` there — rather than this
- * narrower sibling — would have been a net new regression, not a fix.
- */
-function isDispatchRankReady(
-  contextSnapshot: Record<string, unknown> | null | undefined,
-  readiness: { isDependencyReady: boolean } | null | undefined,
-  now: Date,
-): boolean {
   if (isQueuedRunAdmissionDeferred(contextSnapshot, now)) return false;
   return isEffectivelyDependencyReadyForDispatch(contextSnapshot, readiness);
 }

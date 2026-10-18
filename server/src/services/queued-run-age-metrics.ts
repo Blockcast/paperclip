@@ -3,7 +3,7 @@ import type { Db } from "@paperclipai/db";
 import { agents, agentWakeupRequests, heartbeatRuns } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 import { CCROTATE_CAPACITY_ADVERTISED_RESUME_AT_KEY } from "./ccrotate-capacity-retry.js";
-import { isEffectivelyDependencyReadyForDispatch } from "./dispatch-readiness.js";
+import { isDispatchRankReady } from "./dispatch-readiness.js";
 import { listIssueDependencyReadinessMap } from "./issues.js";
 import {
   setDeferredIssueExecutionWakeAgeMetricsRefreshSuccess,
@@ -117,6 +117,15 @@ const CLAIMABLE_QUEUED_RUN_WINDOW_PER_AGENT = 100;
  * So it ages without bound while the dispatcher behaves exactly as specified,
  * and the unfiltered gauge reads that as starvation.
  *
+ * The screen is `isDispatchRankReady` -- `dispatchRank`'s OWN `ready` test,
+ * whole. Not its dependency conjunct alone: that conjunct omits the
+ * admission-backoff stamps (`isQueuedRunAdmissionDeferred`), so a k8s-isolation
+ * or branch-claim retry still sitting out its own backoff would be counted as
+ * claimable and its wait would read as dispatch latency -- reproducing, for a
+ * smaller population, exactly the false positive this gauge exists to remove.
+ * Taking half the dispatcher's predicate IS re-deriving it (caught in review on
+ * PR #2814).
+ *
  * ## Why this is not a SQL filter
  *
  * Readiness is not a column. `listIssueDependencyReadinessMap` reads
@@ -124,8 +133,8 @@ const CLAIMABLE_QUEUED_RUN_WINDOW_PER_AGENT = 100;
  * the claim path exempts an issue-interaction wake carrying a comment id. A
  * SQL transcription of that would be the fifth site re-deriving a verdict whose
  * previous four re-derivations (BLO-21792 leaks 2-5, BLO-22091, and this one)
- * were each a bug. `isEffectivelyDependencyReadyForDispatch` is the single
- * definition and this reads it rather than restating it -- which is also why
+ * were each a bug. `dispatch-readiness.ts` is the single definition and this
+ * reads it whole rather than restating any part of it -- which is also why
  * PEN-4280's cheaper-looking option, a join in the onprem-k8s exporter's SQL,
  * was rejected: it would have put copy five behind a repo boundary where
  * nothing could catch it drifting.
@@ -209,7 +218,7 @@ async function refreshClaimableQueuedRunAgeMetrics(
     const issueId = row.context_issue_id;
     const readiness =
       issueId && UUID_PATTERN.test(issueId) ? readinessByIssueId.get(issueId) ?? null : null;
-    if (!isEffectivelyDependencyReadyForDispatch(row.context_snapshot, readiness)) continue;
+    if (!isDispatchRankReady(row.context_snapshot, readiness, now)) continue;
     const ageSeconds = Math.max(
       0,
       (now.getTime() - new Date(row.effective_queued_at).getTime()) / 1000,

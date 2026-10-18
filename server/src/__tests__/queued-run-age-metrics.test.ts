@@ -262,6 +262,86 @@ describeEmbeddedPostgres("refreshQueuedRunAgeMetrics (BLO-21116)", () => {
       expect(body).toContain(`${QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC}{agent_id="${agentId}"} 120`);
     });
 
+    it("excludes a run still sitting out its k8s-isolation admission backoff", async () => {
+      // Ally review, PR #2814. `dispatchRank`'s readiness screen is
+      // `isDispatchRankReady`, which refuses to age a row on EITHER conjunct:
+      // dependency-blocked, or still inside an admission backoff stamp. The
+      // first cut of this gauge read only the dependency conjunct, so a
+      // k8s-isolation retry waiting on its own timestamp counted as claimable
+      // and its backoff read as dispatch latency -- the same false positive
+      // this gauge exists to remove, for a smaller population.
+      const { companyId, agentId } = await insertCompanyAndAgent();
+      const now = new Date("2026-10-18T12:00:00.000Z");
+      const readyIssueId = await insertIssue(companyId);
+
+      await insertQueuedRun({
+        companyId,
+        agentId,
+        ageSeconds: 5400,
+        now,
+        contextSnapshot: {
+          issueId: readyIssueId,
+          wakeReason: "heartbeat_timer",
+          paperclipK8sIsolationRetryAt: new Date(now.getTime() + 60_000).toISOString(),
+        },
+      });
+
+      await refreshQueuedRunAgeMetrics(db, now);
+      const { body } = await renderMetrics();
+      expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${agentId}"} 5400`);
+      expect(body).toContain(`${QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC}{agent_id="${agentId}"} 0`);
+    });
+
+    it("excludes a run still sitting out its branch-claim admission backoff", async () => {
+      // The second stamp `isQueuedRunAdmissionDeferred` combines (BLO-21602).
+      // Covering only the k8s one would leave the gauge agreeing with the
+      // dispatcher on one backoff and disagreeing on the other.
+      const { companyId, agentId } = await insertCompanyAndAgent();
+      const now = new Date("2026-10-18T12:00:00.000Z");
+      const readyIssueId = await insertIssue(companyId);
+
+      await insertQueuedRun({
+        companyId,
+        agentId,
+        ageSeconds: 2700,
+        now,
+        contextSnapshot: {
+          issueId: readyIssueId,
+          wakeReason: "heartbeat_timer",
+          paperclipBranchClaimRetryAt: new Date(now.getTime() + 60_000).toISOString(),
+        },
+      });
+
+      await refreshQueuedRunAgeMetrics(db, now);
+      const { body } = await renderMetrics();
+      expect(body).toContain(`${QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC}{agent_id="${agentId}"} 0`);
+    });
+
+    it("counts a run whose admission backoff has already elapsed", async () => {
+      // Negative control for the two above: the exclusion must be keyed on the
+      // stamp being in the FUTURE, not on the stamp existing. A check keyed on
+      // presence would drop every run that was ever deferred, permanently.
+      const { companyId, agentId } = await insertCompanyAndAgent();
+      const now = new Date("2026-10-18T12:00:00.000Z");
+      const readyIssueId = await insertIssue(companyId);
+
+      await insertQueuedRun({
+        companyId,
+        agentId,
+        ageSeconds: 600,
+        now,
+        contextSnapshot: {
+          issueId: readyIssueId,
+          wakeReason: "heartbeat_timer",
+          paperclipK8sIsolationRetryAt: new Date(now.getTime() - 60_000).toISOString(),
+        },
+      });
+
+      await refreshQueuedRunAgeMetrics(db, now);
+      const { body } = await renderMetrics();
+      expect(body).toContain(`${QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC}{agent_id="${agentId}"} 600`);
+    });
+
     it("counts a queued run that carries no issue id at all", async () => {
       // The fail-open direction of this change. A run with no issue has no
       // dependency blockers that could make it unclaimable, so dropping it
