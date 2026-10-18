@@ -495,6 +495,59 @@ describe("issue activity event routes", () => {
     );
   });
 
+  it("logs successful_run_handoff_resolved when the assignee agent moves the issue off in_progress (BLO-47464)", async () => {
+    const issue = { ...makeIssue(), status: "in_progress" };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+    const handoffActivityRow = {
+      entityId: issue.id,
+      action: "issue.successful_run_handoff_required",
+      agentId: issue.assigneeAgentId,
+      runId: "run-1",
+      details: { sourceRunId: "run-1" },
+      createdAt: new Date("2026-05-01T00:00:00.000Z"),
+    };
+    const dbMock = {
+      select: () => ({ from: () => ({ where: () => ({ orderBy: async () => [handoffActivityRow] }) }) }),
+    };
+    const agentActor = (agentId: string) => ({
+      type: "agent",
+      agentId,
+      companyId: issue.companyId,
+      runId: "run-agent-disposition",
+      source: "agent_jwt",
+    });
+
+    // A non-assignee agent's status write is not the assignee's disposition.
+    // (It may also be refused outright by authz; either way nothing is resolved.)
+    await request(await createApp(dbMock, agentActor("33333333-3333-4333-8333-333333333333")))
+      .patch(`/api/issues/${issue.id}`)
+      .send({ status: "todo" });
+    expect(mockLogActivity).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ action: "issue.successful_run_handoff_resolved" }),
+    );
+
+    const res = await request(await createApp(dbMock, agentActor(issue.assigneeAgentId)))
+      .patch(`/api/issues/${issue.id}`)
+      .send({ status: "todo" });
+    expect(res.status).toBe(200);
+    await vi.waitFor(() => {
+      expect(mockLogActivity).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          action: "issue.successful_run_handoff_resolved",
+          entityId: issue.id,
+          details: expect.objectContaining({ sourceRunId: "run-1", resolvedByStatus: "todo" }),
+        }),
+      );
+    });
+  });
+
   it("does not log successful_run_handoff_resolved when status stays in_progress", async () => {
     const issue = { ...makeIssue(), status: "in_progress" };
     mockIssueService.getById.mockResolvedValue(issue);
