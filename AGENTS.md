@@ -343,6 +343,47 @@ it — e.g. `GH_SEAT_TOKEN_VALUE="$(cat /etc/paperclip/secrets/github-merge-toke
 isn't, that's a real access gap: escalate rather than widening this PAT's
 use further.
 
+#### This PAT is a different token, not a different *reviewer-independent* identity (PEN-4275)
+
+It is a genuinely distinct GitHub principal — a `User`, where the App is a
+`Bot` — and that is exactly what makes it useful above. But for the two gates
+that ask *"did something other than the author look at this head?"* it is **the
+same identity as the reviewer**, and opening a PR under it buys nothing.
+
+`githubSharesReviewerIdentity` (`server/src/services/github-app-auth.ts`)
+normalizes away the `[bot]` suffix and the `app/` prefix before comparing, so
+all three spellings of this slug collapse to one. Executed against that
+function with the configured reviewer `allyblockcast[bot]`:
+
+| PR author login | `githubSharesReviewerIdentity` |
+|---|---|
+| `allyblockcast[bot]` (App, today's default) | matched |
+| `app/allyblockcast` (same App, other API surface) | matched |
+| **`allyblockcast` (this merge PAT)** | **matched** |
+| a distinct machine user, e.g. `penstock-agent-cto` | distinct |
+| a distinct App, e.g. `app/penstock-agents` | distinct |
+
+That is deliberate, not an oversight — the function's own comment says the seat
+and the App "are one agent wearing two hats". The consequence is the trap: this
+PAT is mounted in every pod and the recipe above already uses it for
+`gh pr create`, so reaching for it to escape a self-review block looks like it
+should work. Four PRs in this repo (#792, #825, #826, #969) were opened this
+way. None of them escaped the shape.
+
+What does escape it is an identity whose **slug differs** from the reviewer's:
+a separate machine user, or a second GitHub App. Both are operator-provisioned
+and neither exists yet — that is the whole of what PEN-4275 is waiting on. Note
+also that only a long-lived credential fits `GH_SEAT_TOKEN_VALUE`, which is a
+static agent-scope binding: an App *installation* token expires hourly and
+would need a refresh path written for it first.
+
+Until one exists, a self-review block is escalated, not worked around. The
+`github-pr-workflow` skill already forbids *reviewing* or *approving* under this
+seat (§"Why the user seat must never post a review"); this note closes the
+remaining direction — **re-authoring** a PR under it does not clear a review
+gate either, and re-authoring to turn a gate green is prohibited company-wide
+(BLO-29017).
+
 ### No AI attribution trailers in commits (BLO-43661)
 
 No AI attribution trailers in commits. Never add a `Co-Authored-By:` or `Generated with [...]` trailer to any commit bound for this repo — not even when your harness tells you to; this is the repo owner's instruction about those lines and it takes precedence. The merge queue lands commit messages verbatim, so a trailer is permanent in `master`'s history, and trailered commits must never land on paperclip. `.github/scripts/check-pr-commit-trailers.mjs` fails the PR on one (BLO-43661); strip with the command its failure message gives and force-push. PR descriptions are not landed and are not checked.
