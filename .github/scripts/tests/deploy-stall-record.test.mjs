@@ -342,6 +342,44 @@ test('the superseded run that OPENED the record cannot close it', () => {
   );
 });
 
+test('a SECOND superseded run post-dates the record and is caught by the other conjunct', () => {
+  // Review suggestion on head 51c76b1. The record survives across supersedes,
+  // so the recency bound does not exclude every superseded run — only the first.
+  // Sequence: W1 escalates and opens the record -> a supersede cancels W1 and
+  // dispatches W2 successfully -> a later supersede cancels W2 and fails to
+  // dispatch, which applies the unrefilled label. W2 was created AFTER the
+  // record, so it passes the recency bound; what rejects it is that its deploy
+  // job concluded `cancelled` and therefore never executed.
+  //
+  // This is why the two conjuncts are JOINTLY required. Pinned so a later
+  // simplification cannot drop either one as redundant.
+  const w2 = {
+    outcome: 'dispatched',
+    lastDispatchAt: '2026-10-17T09:00:00.000Z', // after the record's created_at
+    stallStartedAt: PEN_4224_STALL_START,
+  };
+  assert.ok(
+    Date.parse(w2.lastDispatchAt) > Date.parse(w2.stallStartedAt),
+    'control: W2 really does pass the recency bound',
+  );
+  assert.equal(
+    laneRefilled({ ...w2, lastDispatchDeployExecuted: 'false' }),
+    false,
+    'a cancelled second supersede must not close the record',
+  );
+  // And the converse pin: the recency bound is the only thing rejecting a
+  // healthy PRE-stall dispatch, whose deploy really did execute.
+  assert.equal(
+    laneRefilled({
+      outcome: 'dispatched',
+      lastDispatchDeployExecuted: 'true',
+      lastDispatchAt: DISPATCH_BEFORE_STALL,
+      stallStartedAt: PEN_4224_STALL_START,
+    }),
+    false,
+  );
+});
+
 test('a LATER slot closes it once a dispatch is observed to have deployed', () => {
   // The exit. The record must not be unclosable: the next slot after a
   // replacement dispatch completes reads it as the newest completed run, and if

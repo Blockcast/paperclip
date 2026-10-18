@@ -465,10 +465,23 @@ export const REFILLING_OUTCOMES = new Set(['dispatched', 'up-to-date']);
  * the marker "exact" and used it.)
  *
  * The record's own `created_at` is used instead, RAW. The record is opened at
- * the first escalation, which happens at or AFTER the true start and strictly
- * after W was created, so it is a genuine upper bound that excludes W. Note
+ * the first escalation, which happens at or AFTER the true start — so it is a
+ * genuine upper bound, where the marker is a lower one. Note
  * `resolveStallStartedAt` subtracts `alertAfterHours` from this same value to
  * reach back toward the true start — exactly the widening to avoid here.
+ *
+ * ⚠️ THIS BOUND ALONE DOES NOT EXCLUDE EVERY SUPERSEDED RUN, and it must not be
+ * credited with doing so. It excludes the FIRST one, because W1 is what
+ * escalated and so predates the record. But the record SURVIVES across
+ * supersedes (`findOpenStallIssue` returns the oldest open one), so the lane
+ * can go: W1 escalates and opens the record → a supersede cancels W1 and
+ * dispatches W2 successfully → a later supersede cancels W2 and fails to
+ * dispatch, which is what applies the label. W2 was created AFTER the record
+ * and passes this bound. What rejects W2 is the OTHER conjunct in
+ * `laneRefilled`: its `deploy` job concluded `cancelled`, so no deploy
+ * executed. The two conjuncts are JOINTLY required and neither is redundant —
+ * this one does not depend on job-list readability, that one does not depend on
+ * clocks or on how many supersedes a stall has been through.
  *
  * `null` when it is unreadable, which blocks the close — see `laneRefilled`.
  */
@@ -509,6 +522,10 @@ export function recordStallStartedAt(issue) {
  *   dispatched  - closes only when a LATER slot observes the lane's last
  *                 completed dispatch to have actually EXECUTED its `deploy` job
  *                 AND that run was created strictly after this stall began.
+ *                 BOTH conjuncts are load-bearing: a second-or-later superseded
+ *                 run post-dates the record and is caught only by the first,
+ *                 while a healthy pre-stall deploy executed and is caught only
+ *                 by the second. See `recordStallStartedAt`.
  *
  * ⚠️ THE EVIDENCE IS `deployExecuted`, NOT THE FATE, and the distinction is
  * load-bearing. The detector's `survived` is a catch-all meaning "not a death I
