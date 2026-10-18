@@ -690,31 +690,45 @@ gh api "repos/Blockcast/paperclip/actions/runs/$drun/pending_deployments" \
 ```
 Run: the commands above  Expected: the reviewer logins listed must match the `RATIFIED_REVIEWERS` set in `.github/scripts/check-production-environment-protection.mjs` — read the symbol, do not restate the count here. ⚠️ That set is EMPTY as of 2026-10-07 (owner removed the required_reviewers rule; Blockcast/onprem-k8s#4913), so on a correct environment today `pending_deployments` is expected to be **empty and stay empty** — the deploy does not park, and Steps 3-4 are then no-ops rather than a hang. Do NOT wait for it to become non-empty on that shape; confirm against the symbol and the live environment before concluding the run is stuck. Two superseded expectations, kept as a quoted record: until 2026-10-04 this expected "the three reviewer logins", and a correction to "one login, `kkroo`, since the environment was narrowed on 2026-08-30" was true when authored on 2026-10-06 but went stale before it landed on 2026-10-08, because the owner removed the rule at ~22:58Z on 2026-10-06 in between. That correction is the commit `docs: strike the last two survivors of the deploy-gate premises` (author date 2026-10-06T01:23:43Z); `scheduled-production-deploy.yml` dates its own kkroo correction to 2026-10-04 because that one is a different commit, `docs: strike two false claims in the deploy-gate design document (PEN-2918)` (author date 2026-10-04T00:31:30Z) — the gap between the two records is two commits, not a contradiction. Both landed via #2331, and both are cited by subject rather than by SHA because the merge queue rebases: the SHA either commit carries before it lands is not the SHA it carries on master. The run may still be in `build-and-push`.
 
-- [ ] **Step 4: If it parked, reconcile against the guard before approving or handing it on**
+- [ ] **Step 4: Reconcile a parked run against the guard before approving or handing it on (a no-op if it did not park)**
 ```bash
 drun=<from Step 3>
 envid="$(gh api repos/Blockcast/paperclip/environments --jq '.environments[] | select(.name=="paperclip-production") | .id')"
-can="$(gh api "repos/Blockcast/paperclip/actions/runs/$drun/pending_deployments" --jq '.[0].current_user_can_approve')"
-# Read the ratified set from the symbol, at the moment you run this. Do NOT
-# restate its contents here: a count in prose is the second source of truth
-# whose drift Step 3 and scheduled-production-deploy.yml's header both record.
-git -C /tmp/track-a/wt fetch -q origin master
-ratified="$(git -C /tmp/track-a/wt show origin/master:.github/scripts/check-production-environment-protection.mjs \
-  | sed -n 's/^export const RATIFIED_REVIEWERS = \(.*\);$/\1/p')"
-echo "RATIFIED_REVIEWERS = ${ratified:-<unreadable>}"
-if [ -z "$ratified" ]; then
-  echo "STOP: the symbol did not parse (moved, renamed, or now spanning lines). Read the guard file by hand before approving anything."
-elif [ "$ratified" = "[]" ]; then
-  echo "DRIFT, not a routing problem: this run parked on a reviewer nobody ratified. Do NOT approve and do NOT hand it on. Read the production-environment-protection-guard run and the guard file's header record, then raise the discrepancy."
-elif [ "$can" = "true" ]; then
-  gh api -X POST "repos/Blockcast/paperclip/actions/runs/$drun/pending_deployments" \
-    -F "environment_ids[]=$envid" -f state=approved \
-    -f comment="Track A landing 2026-09-05: 20 clean PRs plus disposition/gate fixes. Convergence gate will verify both tiers."
+# FIRST: did it actually park? Every branch below is about a run that is waiting
+# on a reviewer, so none of them is meaningful until that is established. On the
+# post-2026-10-07 shape the expected answer is "no" (Step 3), which makes this
+# whole step a no-op rather than a finding -- without this guard the empty-set
+# branch below reports DRIFT on a perfectly healthy unparked deploy and stops a
+# release that nothing is wrong with. Unreadable is NOT "not parked": it takes
+# the STOP arm, same discipline as the symbol parse.
+pending="$(gh api "repos/Blockcast/paperclip/actions/runs/$drun/pending_deployments" --jq 'length' 2>/dev/null)"
+if [ -z "$pending" ]; then
+  echo "STOP: could not read pending_deployments (API error, or the run id is wrong). Re-read it by hand; do not infer 'not parked' from a failed read."
+elif [ "$pending" -eq 0 ]; then
+  echo "NOT PARKED: pending_deployments is empty, so there is nothing to approve or hand on. This is the EXPECTED path on the current shape -- skip to Step 5."
 else
-  echo "Post to a reviewer in RATIFIED_REVIEWERS: approve https://github.com/Blockcast/paperclip/actions/runs/$drun (paperclip-production). Content: Track A landing 2026-09-05; master at $(git -C /tmp/track-a/wt rev-parse origin/master)."
+  can="$(gh api "repos/Blockcast/paperclip/actions/runs/$drun/pending_deployments" --jq '.[0].current_user_can_approve')"
+  # Read the ratified set from the symbol, at the moment you run this. Do NOT
+  # restate its contents here: a count in prose is the second source of truth
+  # whose drift Step 3 and scheduled-production-deploy.yml's header both record.
+  git -C /tmp/track-a/wt fetch -q origin master
+  ratified="$(git -C /tmp/track-a/wt show origin/master:.github/scripts/check-production-environment-protection.mjs \
+    | sed -n 's/^export const RATIFIED_REVIEWERS = \(.*\);$/\1/p')"
+  echo "RATIFIED_REVIEWERS = ${ratified:-<unreadable>}"
+  if [ -z "$ratified" ]; then
+    echo "STOP: the symbol did not parse (moved, renamed, or now spanning lines). Read the guard file by hand before approving anything."
+  elif [ "$ratified" = "[]" ]; then
+    echo "DRIFT, not a routing problem: this run parked on a reviewer nobody ratified. Do NOT approve and do NOT hand it on. Read the production-environment-protection-guard run and the guard file's header record, then raise the discrepancy."
+  elif [ "$can" = "true" ]; then
+    gh api -X POST "repos/Blockcast/paperclip/actions/runs/$drun/pending_deployments" \
+      -F "environment_ids[]=$envid" -f state=approved \
+      -f comment="Track A landing 2026-09-05: 20 clean PRs plus disposition/gate fixes. Convergence gate will verify both tiers."
+  else
+    echo "Post to a reviewer in RATIFIED_REVIEWERS: approve https://github.com/Blockcast/paperclip/actions/runs/$drun (paperclip-production). Content: Track A landing 2026-09-05; master at $(git -C /tmp/track-a/wt rev-parse origin/master)."
+  fi
 fi
 ```
-Run: the commands above  Expected: on an EMPTY ratified set — the shape since 2026-10-07 — the DRIFT line, and **Step 5 does not run**. Reaching this step at all on that shape means the environment holds a `required_reviewers` rule nobody ratified, which is a finding about the environment, not a reviewer to route around: `evaluateEnvironmentProtection` gates its `required_reviewers_rule` branch on `expected.length > 0`, so on an empty set that branch is unreachable and every reviewer present falls through to the membership comparison as `required_reviewers_membership: unexpected [...] (ratified set is [])`. There is no ratified reviewer to hand the run to, and approving would clear the deploy while leaving the drift in place — so investigate against the guard instead, which is the same reconciliation Step 3 asks for before concluding a run is stuck. With a NON-empty set the original path is correct and re-arms unchanged: `can=true` gives JSON containing `"state":"approved"`, otherwise the printed hand-off line, which is pasted to that reviewer and the log. Do not dispatch a second run while this one waits (guard (1) in the scheduled workflow skips it anyway).
+Run: the commands above  Expected: **on the current shape, `NOT PARKED` — and you go straight on to Step 5.** That is the healthy path, not a finding: Step 3 establishes that an empty ratified set means the deploy never parks, so this whole step is a no-op and the script now says so itself rather than leaving it to the heading. A failed read of `pending_deployments` prints STOP instead, because unreadable is not the same as not parked. If it DID park on an EMPTY ratified set, expect the DRIFT line and **Step 5 does not run** — reaching that means the environment holds a `required_reviewers` rule nobody ratified, which is a finding about the environment, not a reviewer to route around: `evaluateEnvironmentProtection` gates its `required_reviewers_rule` branch on `expected.length > 0`, so on an empty set that branch is unreachable and every reviewer present falls through to the membership comparison as `required_reviewers_membership: unexpected [...] (ratified set is [])`. There is no ratified reviewer to hand the run to, and approving would clear the deploy while leaving the drift in place — so investigate against the guard instead, which is the same reconciliation Step 3 asks for before concluding a run is stuck. With a NON-empty set the original path is correct and re-arms unchanged: `can=true` gives JSON containing `"state":"approved"`, otherwise the printed hand-off line, which is pasted to that reviewer and the log. Do not dispatch a second run while this one waits (guard (1) in the scheduled workflow skips it anyway).
 
 - [ ] **Step 5: Wait for the deploy job and capture the convergence line**
 ```bash
