@@ -136,13 +136,18 @@ test("arm 4: a drop made by the BASE, not by this diff, is not this PR's red", (
   // the deletion set reddened that PR for a file it never touched; keying on
   // existence -- read from the same tree that gets typechecked -- does not.
   //
-  // `addedFiles`/deletions are empty on purpose: this PR touched nothing.
+  // The PR here ADDS a file of its own (properly allowlisted) so that arm 3 is
+  // engaged at the same time. That is what separates this case from "dropping
+  // an entry IS allowed once its file no longer exists" above: with an empty
+  // `addedFiles` the two are the same call, since `addedFiles` defaults to [].
+  // A real unrelated PR touches something -- just not the retired file.
+  const unrelated = `${TESTS_DIR}/unrelated-to-the-retirement.test.ts`;
   assert.deepEqual(
     check({
-      include: [GATED],
+      include: [GATED, toIncludeEntry(unrelated)],
       baseInclude: BASELINE,
-      addedFiles: [],
-      fileExists: existsOnly(toRepoPath(GATED)),
+      addedFiles: [unrelated],
+      fileExists: existsOnly(toRepoPath(GATED), unrelated),
     }),
     [],
   );
@@ -169,7 +174,7 @@ test("arm 4: a rename must move the entry, not drop it", () => {
       include: moved,
       baseInclude: BASELINE,
       addedFiles: [to],
-        fileExists: existsOnly(...moved.map(toRepoPath)),
+      fileExists: existsOnly(...moved.map(toRepoPath)),
     }),
     [],
   );
