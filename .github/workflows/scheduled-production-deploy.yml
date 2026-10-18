@@ -196,8 +196,18 @@ jobs:
         with:
           node-version: 24
 
+      # `!cancelled()` rather than the default `success()`, and that is NOT
+      # decoration (PEN-4224 review). Moving setup-node above this step put a new
+      # step on the production path: under `success()` a setup-node failure
+      # SKIPS the day's only dispatch, so a node-install hiccup would silently
+      # cost a delivery day — the exact class of fault this workflow exists to
+      # prevent, newly introduced by the fix for it. The dispatch itself needs no
+      # node (it is `gh` and `git`); only the detection call inside it does, and
+      # that call is already `|| true` with a defaulted read, so it degrades to
+      # silence rather than taking the dispatch down with it.
       - name: Dispatch deploy if master is ahead and nothing is already pending
         id: dispatch
+        if: ${{ !cancelled() }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -321,10 +331,16 @@ jobs:
           # not start meaning "detection broke". The script resolves every
           # uncertainty to `unknown`, which reports nothing.
           #
-          # Runs on EVERY slot, not just sampling ones, because the fate is also
-          # what stops a `dispatched` outcome from closing an unrefilled stall
-          # record on a dispatch that is already known to have died
-          # (`laneRefilled` in deploy-stall-record.mjs).
+          # Runs on EVERY slot, not just sampling ones, because the fate also
+          # feeds the stall record's close gate (`laneRefilled` in
+          # deploy-stall-record.mjs). ⛔ What it feeds it is a reading of the
+          # PREVIOUS completed dispatch: this call sits above guard (2) and above
+          # `gh workflow run`, so on a slot that goes on to dispatch, the run it
+          # creates has not started and cannot be classified here. That is why
+          # the close gate is satisfied by a LATER slot observing a `survived`
+          # dispatch created at or after the stall began, and never by this
+          # slot's own `dispatched` outcome. Hoisting the dispatch above this
+          # call would not fix that — the run would merely be `queued`.
           node .github/scripts/detect-dead-dispatch.mjs || true
           DEAD_DISPATCH=false
           if [ -f "$DEAD_DISPATCH_JSON_PATH" ]; then
@@ -573,11 +589,22 @@ jobs:
           # PEN-4224. `dispatched` claims the lane was refilled; what actually
           # happened is that a dispatch was ISSUED. On 2026-10-17 one was issued
           # and the lane was never refilled, because the run it created died in
-          # front of `deploy`. Without this, that outcome closes an unrefilled
-          # record — writing "resolved, nothing is on the reviewer gate" over a
-          # stall that is still running, through the one outcome
-          # STALL_UNREFILLED_LABEL's own check waves through. See `laneRefilled`.
+          # front of `deploy`, and that outcome then closes an unrefilled record
+          # — writing "resolved, nothing is on the reviewer gate" over a stall
+          # that is still running, through the one outcome
+          # STALL_UNREFILLED_LABEL's own check waves through.
+          #
+          # ⛔ THESE TWO DESCRIBE THE PREVIOUS DISPATCH, NEVER THE ONE THIS SLOT
+          # JUST ISSUED. The detection runs once, inside guard (1c), above guard
+          # (2) and above `gh workflow run`; on a `dispatched` slot the run being
+          # gated has not started. So they cannot be read as a verdict on it, and
+          # `laneRefilled` does not try: `dispatched` closes an unrefilled record
+          # only on a LATER slot that observes a `survived` dispatch created at
+          # or after the stall began. The timestamp is what makes "at or after"
+          # answerable; without it a pre-stall success reads as this stall's
+          # refill. See `laneRefilled`.
           LAST_DISPATCH_FATE: ${{ steps.dispatch.outputs.last_dispatch_fate }}
+          LAST_DISPATCH_AT: ${{ steps.dispatch.outputs.last_dispatch_at }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
