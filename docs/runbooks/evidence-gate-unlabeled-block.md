@@ -47,7 +47,7 @@ plus a redeploy.
 |---|---|---|
 | `review:ally-clean` | yes — a PR may be open, at head, 0 Critical / 0 Important, **and authored by someone other than the reviewer** | **yes**, unless suppressed (below) |
 | `review:ally-clean`, no linked PR | **never** — there is no head to review | **no, at any value**; unlabeled is not even required to have it |
-| `review:ally-clean`, PR authored by the reviewer App | **never** — the only identity that attests it is the one that authored it | **yes — and NOT suppressed.** This is the gap; see below |
+| `review:ally-clean`, PR authored by the reviewer App | **never** — the only identity that attests it is the one that authored it | **no, at any value** — suppressed `reviewer-authored-pr` since PEN-4265. Still REQUIRED, so it stays in `missing` and the verdict stays `warn`; see below |
 | `deploy:landed` | **never** — it means merged | **no, at any value** |
 
 The gate runs on exactly one transition, INTO `in_review`
@@ -166,14 +166,52 @@ behaviour and no amount of waiting moves it. So:
 
 - **`willBlock` is not comparable across author types.** Segment it before
   reading it against the 2% gate — see the measurement section.
-- **Do not open the seven-day window expecting it to close.** On the estate as
-  it stands the agent-authored share alone exceeds the gate, so the window will
-  run its seven days and refuse, correctly, every time.
-- **The de-requiring decision comes first.** It is a platform/CTO call with at
-  least three shapes: drop `review:ally-clean` from `required` for App-authored
-  PRs; add a third suppression beside `probe-failed` and `no-linked-pull-request`;
-  or give agents a PR author identity distinct from the reviewer's. This runbook
-  does not pick one, and the flip does not proceed until one lands.
+
+### RULED 2026-10-18 (CTO, PEN-4265) — suppressed, not de-required
+
+The decision this section deferred has landed, and the two bullets it used to
+carry (*"do not open the seven-day window expecting it to close"* and *"the
+de-requiring decision comes first"*) are **retired**. The population is now
+suppressed, so the window CAN close. What replaced them:
+
+**`evidence-gate.ts` carries a third suppression arm,
+`unlabeled-truth-block-suppressed:reviewer-authored-pr`,** beside `probe-failed`
+and `no-linked-pull-request`. It fires when the probe establishes that the whole
+linked set's missing `review:ally-clean` is attributable to the reviewer
+identity authoring the PRs (`reviewerAuthoredPr` on `TruthProbeResult`, read off
+the typed `authorIsReviewer` marker the comment gate now sets).
+
+**The shape was NOT de-required, and that is the decision rather than an
+omission.** Dropping it from `required` would empty `missing` and yield a
+`pass` — asserting "independently reviewed, clean" for a population where the
+attestation is self-issued, and retiring the only required anti-fabrication
+shape (BLO-32239) for exactly the agents it was added to police. Suppression
+keeps the shape in `missing`, so the verdict stays `warn` and the gap stays
+visible and honest.
+
+**Three consequences for this runbook:**
+
+- **The 2% gate now measures what it was written about.** The agent-authored
+  share is suppressed, so it can no longer put the window out of reach. The
+  author-type segmentation below is still worth reading — it tells you how much
+  of your `onlyTruthMissing` is the suppressed population — but it is no longer
+  a precondition for opening the window.
+- **`willBlock` must be computed from the verdict's own diagnostics, not from
+  `missing`.** A suppressed row still carries `review:ally-clean` in `missing`;
+  what makes it a non-block is the `unlabeled-truth-block-suppressed:*`
+  diagnostic. Counting `missing` alone now over-counts `willBlock` by the whole
+  agent-authored population.
+- **`reviewPassRate` stays depressed for agent work and that is expected.**
+  `agent-scorecards.ts` counts `warn` and `block` alike as not-pass, so every
+  agent carries this until PEN-4275 lands. It is uniform across agents, so it
+  moves the level and not the ranking — do not read it as a per-agent
+  regression, and do not "fix" it by de-requiring the shape.
+
+The structural fix — giving agents a PR author identity distinct from the
+reviewer's — is **PEN-4275**. It needs no un-wiring here: the suppression keys
+on a live per-issue fact, so the day that lands `reviewerAuthoredPr` goes false
+by itself and the shape binds again with no edit to this runbook or to
+`evidence-gate.ts`.
 
 **Measured 2026-10-18** against company `b1d3f3d3`, status `in_review`, complete
 page of 55 rows, `company_scope:read` confirmed (6 distinct assignees):
@@ -454,15 +492,22 @@ problems:
   being linked on code-bearing issues, which is a real defect with a different
   owner, while the unlabeled share is mostly the doc-only population this path
   exists for.
-- **the agent-authored share** — not a counter above, and **not derivable from
-  this response at all.** `lastEvidenceVerdict` records *that*
-  `review:ally-clean` is missing, never *why*, and the discriminator is the
-  linked PR's GitHub author, which lives on the other side. Resolve it per
-  issue — read the `pull_request` work products, then
-  `gh api repos/<repo>/pulls/<n> --jq .user.type` — and report `willBlock`
-  split into `Bot` and `User`. Only the `User` half is the number the 2% gate
-  was written about; the `Bot` half is the population above, and it is a
-  pending platform decision, not a reviewable backlog.
+- **the agent-authored share** — since PEN-4265 this IS derivable from this
+  response, and the GitHub round trip below is no longer needed to get it. A
+  suppressed row names its own reason: look for
+  `unlabeled-truth-block-suppressed:reviewer-authored-pr` in the verdict's
+  `diagnostics`. Count those separately and exclude them from `willBlock` —
+  they are not blocks at any flag value.
+
+  The old recipe still has one use, as a **control** rather than as the
+  measurement: `lastEvidenceVerdict` is written only on a PATCH carrying
+  `status: "in_review"`, so a row that entered review BEFORE the suppression
+  shipped carries a pre-suppression verdict and will not show the diagnostic
+  even though it is in the population. On a row whose verdict predates the
+  deploy, resolve the author the slow way — read the `pull_request` work
+  products, then `gh api repos/<repo>/pulls/<n> --jq .user.type` — and treat a
+  `Bot` as suppressed. Only the `User` half was ever the number the 2% gate was
+  written about.
 
 `onlyTruthMissing` remains a safe upper bound on `willBlock`; since the registry
 change its only excess is the two suppressed populations.
@@ -471,10 +516,15 @@ change its only excess is the two suppressed populations.
 
 Seven consecutive days with **all** of:
 
-- the agent-authored population either de-required or suppressed (see the third
-  unsatisfiable population above). Until that lands, `willBlock` carries a share
-  no review can clear and the window cannot close on its own — this is a
-  precondition on opening the window, not a number measured inside it;
+- ~~the agent-authored population either de-required or suppressed~~ —
+  **SATISFIED 2026-10-18 by PEN-4265**, which suppressed it as
+  `reviewer-authored-pr` (see the third unsatisfiable population above). Left
+  in the list rather than deleted because it is a standing property, not a
+  one-off: if a future change removes that arm, this precondition is unmet
+  again and the window must not be opened. Verify it the cheap way — a row in
+  the agent-authored population carries
+  `unlabeled-truth-block-suppressed:reviewer-authored-pr` in its verdict
+  diagnostics;
 - every day's page complete — `truncated: false`. A truncated day does not
   count toward the seven and is not a failure either; it is unmeasured, and the
   window pauses until you re-measure it completely. Same standard as the seven

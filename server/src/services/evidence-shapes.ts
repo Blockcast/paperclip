@@ -168,6 +168,39 @@ export const DEFAULT_EVIDENCE_REGISTRY: EvidenceRegistry = {
  *     that population is the flip's own work; see
  *     `docs/runbooks/evidence-gate-unlabeled-block.md`.
  *
+ *     RULED 2026-10-18 (CTO, PEN-4265). That work is done, and the answer is
+ *     NOT a de-requiring: the shape stays in BOTH `required` arrays for the
+ *     App-authored population, and the flag's escalation is suppressed for it
+ *     instead — `unlabeled-truth-block-suppressed:reviewer-authored-pr`, the
+ *     third arm beside `probe-failed` and `no-linked-pull-request` in
+ *     `evidence-gate.ts`. Three reasons, in the order they decided it:
+ *
+ *       1. DROPPING IT WOULD YIELD A `pass`, AND THE `pass` WOULD BE FALSE.
+ *          An empty `missing` reads as "independently reviewed, clean". Here
+ *          a head exists and WAS reviewed; what is absent is the attestation's
+ *          INDEPENDENCE. That is the opposite of the PR-less unlabeled drop
+ *          above, where no head exists and so no claim is made. Granting the
+ *          pass would retire the only REQUIRED anti-fabrication shape
+ *          (BLO-32239) for exactly the population the two incidents behind it
+ *          came from — agents writing about their own work.
+ *       2. THE COST IS A TRUE NOT-PASS, NOT AN INVERTED ONE. Suppression keeps
+ *          the shape in `missing`, so `reviewPassRate` (`agent-scorecards.ts`)
+ *          stays depressed for agent work and no agent behaviour lifts it.
+ *          Accepted: unlike `deploy:landed` and the PR-less case, where the
+ *          not-pass was vacuous, this one is TRUE — nothing independent did
+ *          attest the head. It is also uniform across agents, so it moves the
+ *          level and not the ranking, and the scorecard keeps discriminating.
+ *       3. IT IS SELF-RETIRING. The suppression keys on a fact the probe
+ *          computes per issue (`reviewerAuthoredPr`), not on a registry edit.
+ *          On the day agents get a PR author identity distinct from the
+ *          reviewer's — the real fix, PEN-4275 — the fact goes false by
+ *          itself and the shape binds again with no code change and nobody
+ *          having to remember. An author-keyed `required` array would have to
+ *          be reversed by hand and would fail OPEN until someone did.
+ *
+ *     So the shape below is unchanged, deliberately, and this paragraph is the
+ *     record of why it is unchanged rather than of nobody having decided.
+ *
  * `deploy:landed` is deliberately NOT required, here or on any labeled path
  * (CTO ruling 2026-09-17) — see the registry comment above. Unlabeled is the
  * majority shape in this estate, so requiring an unsatisfiable-at-evaluation
