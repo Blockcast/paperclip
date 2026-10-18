@@ -23,7 +23,39 @@ const IDENTIFIER_PREFIX_RE = /^([A-Za-z][A-Za-z0-9]*)-\d+$/;
 // exists. Keep the allowlist narrow: an unlisted key is passed through
 // untouched, so the failure direction for anything new is a link that stays
 // relative — not storage that is silently rewritten.
-const NAVIGATION_HREF_KEYS = new Set(["href"]);
+//
+// PEN-4262: `href` was not the whole set. Surveying every server-side builder
+// of a relative issue/project path (`server/src`, six of them) against the key
+// each is emitted under:
+//
+//   builder                                    key(s)              here?
+//   company-search    issueHref                href                 yes
+//   issue-references  issuePath → sourceHref   href                 yes
+//   company-artifacts buildIssueHref           href                 yes
+//   attention         issueHref                href                 yes
+//   pipeline-case-    sourceIssuePath          sourceIssuePath      yes
+//     outputs           └ sourceDocumentPath   documentPath         yes
+//                       └ (same value)         path                 NO
+//   feedback          buildIssuePath           path                 NO
+//
+// `sourceIssuePath` and `documentPath` qualify on the same grounds as `href`:
+// each has exactly one producer, both in `pipeline-case-outputs.ts` and both
+// derived from the company prefix plus the issue identifier, and neither is
+// ever written back. The PR that introduced this allowlist measured "132 of 132
+// occurrences were `href`" on an issue detail, a document and an inbox page —
+// true of those surfaces, but none of them emits a pipeline case output, so the
+// two keys above came back relative.
+//
+// Bare `path` is deliberately excluded even though it carries the same derived
+// value in both places above. `feedback.ts` also uses `path` for artifact file
+// paths (`adapter/claude/session.jsonl`, and `file.path` for user-supplied
+// names), so it is not server-derived in general and admitting it would put
+// stored content back inside the rewrite — the exact defect PEN-4257 closed.
+// Those two emitters keep returning a relative path; the pipeline one sits
+// beside a `sourceIssuePath` carrying the identical value, so nothing is lost.
+// If the feedback one needs to be absolute, rename it at the source rather than
+// widening this set.
+const NAVIGATION_HREF_KEYS = new Set(["href", "sourceIssuePath", "documentPath"]);
 
 function stripTrailingSlash(value: string): string {
   return value.replace(/\/+$/, "");
