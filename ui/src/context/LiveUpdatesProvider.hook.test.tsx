@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { flushSync } from "react-dom";
+import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import type { LiveEvent } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -13,10 +13,6 @@ import {
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 const { LiveEventSubscriptionContext, dispatchLiveEventToSubscribers } = __liveUpdatesTestUtils;
-
-function act(callback: () => void) {
-  flushSync(callback);
-}
 
 function progressEvent(overrides: Partial<LiveEvent> = {}): LiveEvent {
   return {

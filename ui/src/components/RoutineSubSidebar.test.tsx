@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
+import { act } from "react";
 import type { AnchorHTMLAttributes, ReactNode } from "react";
-import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -22,10 +22,6 @@ vi.mock("@/lib/router", () => ({
 
 import { RoutineSubSidebar } from "./RoutineSubSidebar";
 import type { RoutineSectionKey } from "./routine-sections/context";
-
-function act(callback: () => void) {
-  flushSync(callback);
-}
 
 let container: HTMLDivElement;
 let root: ReturnType<typeof createRoot>;

@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
+import { act } from "react";
 import { createRoot } from "react-dom/client";
-import { flushSync } from "react-dom";
 import type { AnchorHTMLAttributes, ReactElement, ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -26,18 +26,6 @@ vi.mock("../api/issues", () => ({
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
-function act<T>(callback: () => T): T {
-  let result: T | undefined;
-  flushSync(() => {
-    result = callback();
-  });
-  const maybePromise = result as unknown as PromiseLike<unknown>;
-  if (result && typeof maybePromise.then === "function") {
-    throw new TypeError("This test act shim only supports synchronous callbacks.");
-  }
-  return result as T;
-}
 
 let root: ReturnType<typeof createRoot> | null = null;
 let container: HTMLDivElement | null = null;

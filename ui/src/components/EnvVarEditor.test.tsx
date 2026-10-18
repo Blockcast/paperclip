@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
+import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { flushSync } from "react-dom";
 import type { CompanySecret, EnvBinding, UserSecretDefinition } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { EnvironmentVariablesEditor } from "./environment-variables-editor";
@@ -29,14 +29,6 @@ const definition: UserSecretDefinition = {
   createdAt: new Date(),
   updatedAt: new Date(),
 };
-
-async function act(callback: () => void | Promise<void>) {
-  let result: void | Promise<void> = undefined;
-  flushSync(() => {
-    result = callback();
-  });
-  await result;
-}
 
 let container: HTMLDivElement;
 let root: Root;

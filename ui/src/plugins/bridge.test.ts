@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
+import { act } from "react";
 import * as React from "react";
 import * as ReactDOM from "react-dom";
-import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import type { MouseEvent as ReactMouseEvent } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
@@ -45,10 +45,6 @@ function clickEvent(
 afterEach(() => {
   delete globalThis.__paperclipPluginBridge__;
 });
-
-function act(callback: () => void) {
-  flushSync(callback);
-}
 
 describe("plugin host navigation", () => {
   it("resolves plugin page routes into the active company prefix", () => {

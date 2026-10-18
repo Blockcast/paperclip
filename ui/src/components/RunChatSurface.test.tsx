@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { flushSync } from "react-dom";
+import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { LiveRunForIssue } from "../api/heartbeats";
@@ -19,10 +19,6 @@ const run: LiveRunForIssue = {
   startedAt: new Date(0).toISOString(),
   finishedAt: null,
 } as LiveRunForIssue;
-
-function act(callback: () => void) {
-  flushSync(callback);
-}
 
 async function renderSurface() {
   const container = document.createElement("div");

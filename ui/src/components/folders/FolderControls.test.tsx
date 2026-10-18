@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { flushSync } from "react-dom";
+import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { FolderListResult } from "@paperclipai/shared";
@@ -33,14 +33,6 @@ if (!Element.prototype.hasPointerCapture) {
 }
 if (!Element.prototype.scrollIntoView) {
   Element.prototype.scrollIntoView = () => undefined;
-}
-
-function act(callback: () => void | Promise<void>) {
-  let result: void | Promise<void> | undefined;
-  flushSync(() => {
-    result = callback();
-  });
-  return result;
 }
 
 const folderResult: FolderListResult = {

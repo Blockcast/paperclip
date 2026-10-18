@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 
+import { act } from "react";
 import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -16,14 +17,6 @@ const { LiveEventSubscriptionContext, dispatchLiveEventToSubscribers } = __liveU
 
 const mockHeartbeatsApi = vi.hoisted(() => ({ log: vi.fn(), activeRunForIssue: vi.fn() }));
 vi.mock("@/api/heartbeats", () => ({ heartbeatsApi: mockHeartbeatsApi }));
-
-async function act(callback: () => void | Promise<void>) {
-  let result: void | Promise<void> = undefined;
-  flushSync(() => {
-    result = callback();
-  });
-  await result;
-}
 
 function issue(id: string): SummarySlotIssueRef {
   return { id, identifier: `PAP-${id}`, title: "Summarize project", status: "in_progress" };

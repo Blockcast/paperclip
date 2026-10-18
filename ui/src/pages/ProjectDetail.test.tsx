@@ -1,9 +1,9 @@
 // @vitest-environment jsdom
 
+import { act } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Project } from "@paperclipai/shared";
 import type { ReactNode } from "react";
-import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ProjectDetail } from "./ProjectDetail";
@@ -99,14 +99,6 @@ vi.mock("../components/IssuesList", () => ({
     return <div data-testid="issues-list" />;
   },
 }));
-
-async function act(callback: () => void | Promise<void>) {
-  let result: void | Promise<void> = undefined;
-  flushSync(() => {
-    result = callback();
-  });
-  await result;
-}
 
 function project(overrides: Partial<Project> = {}): Project {
   const now = new Date("2026-05-01T00:00:00Z");

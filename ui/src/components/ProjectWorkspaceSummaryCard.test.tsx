@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
+import { act } from "react";
 import type { ComponentProps, ReactNode } from "react";
-import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import type { ExecutionWorkspace, Issue } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -18,20 +18,6 @@ vi.mock("./IssuesQuicklook", () => ({
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
-function act(callback: () => void | Promise<void>) {
-  let result: void | Promise<void> = undefined;
-  flushSync(() => {
-    result = callback();
-  });
-  const maybePromise = result as Promise<void> | undefined;
-  if (maybePromise !== undefined && typeof maybePromise.then === "function") {
-    return maybePromise.then(() => {
-      flushSync(() => {});
-    });
-  }
-  return result;
-}
 
 /** Matches the auto-dismiss delay in CopyText.tsx. */
 const COPY_FEEDBACK_HIDE_MS = 1500;

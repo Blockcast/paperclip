@@ -1,15 +1,11 @@
 // @vitest-environment jsdom
 
-import { flushSync } from "react-dom";
+import { act } from "react";
 import { createRoot } from "react-dom/client";
 import type { AnchorHTMLAttributes } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CaseActivityFeed } from "./CaseActivityFeed";
 import type { CaseEvent } from "@/api/cases";
-
-function act(callback: () => void) {
-  flushSync(callback);
-}
 
 vi.mock("@/lib/router", () => ({
   Link: ({ children, to, ...props }: AnchorHTMLAttributes<HTMLAnchorElement> & { to: string }) => (

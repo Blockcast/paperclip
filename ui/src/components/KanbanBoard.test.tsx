@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
+import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { flushSync } from "react-dom";
 import type { Issue, IssueStatus } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getKanbanColumnTone, KanbanBoard, resolveKanbanTargetStatus } from "./KanbanBoard";
@@ -24,10 +24,6 @@ vi.mock("@/lib/router", () => ({
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
 const mountedRoots: Root[] = [];
-
-function act(callback: () => void): void {
-  flushSync(callback);
-}
 
 function createIssue(index: number, status: IssueStatus): Issue {
   return {

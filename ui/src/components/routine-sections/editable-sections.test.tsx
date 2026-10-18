@@ -1,7 +1,6 @@
 // @vitest-environment jsdom
 
-import { useState } from "react";
-import { flushSync } from "react-dom";
+import { act, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TriggersSection } from "./editable-sections";
@@ -17,10 +16,6 @@ import {
 vi.mock("../MarkdownEditor", () => ({
   MarkdownEditor: () => null,
 }));
-
-function act(callback: () => void) {
-  flushSync(callback);
-}
 
 function buttonByText(container: HTMLElement, label: string): HTMLButtonElement {
   const button = [...container.querySelectorAll("button")].find(

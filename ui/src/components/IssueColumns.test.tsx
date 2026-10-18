@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
+import { act } from "react";
 import { createRoot } from "react-dom/client";
-import { flushSync } from "react-dom";
 import { afterEach, describe, expect, it } from "vitest";
 import type { Issue } from "@paperclipai/shared";
 import { InboxIssueMetaLeading, InboxIssueTrailingColumns } from "./IssueColumns";
@@ -9,10 +9,6 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
-function act(callback: () => void): void {
-  flushSync(callback);
-}
 
 function makeIssue(overrides: Partial<Issue>): Issue {
   return {

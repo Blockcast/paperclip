@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
+import { act } from "react";
 import type { ReactNode } from "react";
-import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -29,14 +29,6 @@ const resolvers: HandoffChipResolvers = {
   resolveUserLabel: (id) => (id === "user-board" ? "Riley Board" : null),
   currentUserId: "user-board",
 };
-
-async function act(callback: () => void | Promise<void>) {
-  let result: void | Promise<void> = undefined;
-  flushSync(() => {
-    result = callback();
-  });
-  await result;
-}
 
 let activeRoot: Root | null = null;
 let activeHost: HTMLDivElement | null = null;

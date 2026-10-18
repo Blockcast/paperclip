@@ -1,21 +1,13 @@
 // @vitest-environment jsdom
 
+import { act } from "react";
 import type { KeyboardEventHandler, ReactNode } from "react";
-import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CommandPalette } from "./CommandPalette";
 import { queryKeys } from "../lib/queryKeys";
 import { flushReact, waitForAssertion } from "@/test-utils/react";
-
-function act(callback: () => void | Promise<void>) {
-  let result: void | Promise<void> | undefined;
-  flushSync(() => {
-    result = callback();
-  });
-  return result;
-}
 
 const companyState = vi.hoisted(() => ({
   selectedCompanyId: "company-1",
