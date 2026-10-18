@@ -4756,6 +4756,9 @@ type BlockedInboxInteractionRow = {
 type BlockedInboxApprovalRow = {
   approvalId: string;
   issueId: string;
+  status: string;
+  requestedByAgentId: string | null;
+  requestedByUserId: string | null;
   createdAt: Date;
 };
 
@@ -5301,6 +5304,9 @@ async function listIssueBlockedInboxAttentionMap(
           .select({
             approvalId: approvals.id,
             issueId: issueApprovals.issueId,
+            status: approvals.status,
+            requestedByAgentId: approvals.requestedByAgentId,
+            requestedByUserId: approvals.requestedByUserId,
             createdAt: approvals.createdAt,
           })
           .from(issueApprovals)
@@ -5439,7 +5445,12 @@ async function listIssueBlockedInboxAttentionMap(
   }
   const approvalByIssueId = new Map<string, BlockedInboxApprovalRow>();
   for (const row of approvalRows as BlockedInboxApprovalRow[]) {
-    if (!approvalByIssueId.has(row.issueId)) approvalByIssueId.set(row.issueId, row);
+    // BLO-47469: a `pending` card waits on the board; a `revision_requested` one waits on its
+    // requester. When a row carries both, the board decision is the one to surface.
+    const existing = approvalByIssueId.get(row.issueId);
+    if (!existing || (existing.status !== "pending" && row.status === "pending")) {
+      approvalByIssueId.set(row.issueId, row);
+    }
   }
   const liveHandoffRunIssueIds = new Set([
     ...(activeRunRows as Array<{ issueId: string | null }>),
@@ -5539,6 +5550,27 @@ async function listIssueBlockedInboxAttentionMap(
     }
 
     const approval = approvalByIssueId.get(row.id);
+    if (approval && approval.status === "revision_requested") {
+      setAttention(row.id, attentionBase({
+        state: "awaiting_decision",
+        reason: "pending_approval_revision",
+        severity: "medium",
+        stoppedSinceAt: approval.createdAt,
+        owner: {
+          type: approval.requestedByAgentId ? "agent" : approval.requestedByUserId ? "user" : "unknown",
+          agentId: approval.requestedByAgentId,
+          userId: approval.requestedByUserId,
+          label: null,
+        },
+        action: {
+          label: "Resubmit or withdraw approval",
+          detail: "The board requested revision on the linked approval; the requester must resubmit it with the objection answered or withdraw it.",
+        },
+        sourceIssue: source,
+        approvalId: approval.approvalId,
+      }));
+      continue;
+    }
     if (approval) {
       setAttention(row.id, attentionBase({
         state: "awaiting_decision",

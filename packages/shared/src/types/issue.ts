@@ -446,6 +446,7 @@ export type IssueBlockedInboxReason =
   | "in_review_without_action_path"
   | "missing_successful_run_disposition"
   | "pending_board_decision"
+  | "pending_approval_revision"
   | "pending_user_decision"
   | "external_owner_action"
   | "open_recovery_issue";

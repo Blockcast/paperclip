@@ -1234,6 +1234,62 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     expect(attention?.overdueInteractionId).toBe(staleCardId);
   });
 
+  // BLO-47469: a `revision_requested` card waits on its requester (resubmit or withdraw), not
+  // the board. Reporting it as "Board / Decide approval" sent operators to a queue with nothing
+  // in it while the requester never learned the card was theirs.
+  it("routes a revision_requested approval to its requester, and prefers a pending one (BLO-47469)", async () => {
+    const { companyId, agentId } = await createCompany("BIR");
+    const reviewId = await insertIssue({
+      companyId,
+      identifier: "BIR-1",
+      title: "Review whose card was sent back",
+      status: "in_review",
+      assigneeAgentId: agentId,
+      executionState: null,
+    });
+    const revisionId = randomUUID();
+    await db.insert(approvals).values({
+      id: revisionId,
+      companyId,
+      type: "request_board_approval",
+      status: "revision_requested",
+      requestedByAgentId: agentId,
+      payload: { title: "Sent back" },
+    });
+    await db.insert(issueApprovals).values({ companyId, issueId: reviewId, approvalId: revisionId });
+
+    const attentionOf = async () => (await svc.list(companyId, { attention: "blocked" }))
+      .find((row) => row.id === reviewId)?.blockedInboxAttention ?? null;
+
+    const revision = await attentionOf();
+    expect(revision).toMatchObject({
+      state: "awaiting_decision",
+      reason: "pending_approval_revision",
+      owner: { type: "agent", agentId, label: null },
+      action: { label: "Resubmit or withdraw approval" },
+      approvalId: revisionId,
+    });
+    expect(revision?.owner.type).not.toBe("board");
+
+    const pendingId = randomUUID();
+    await db.insert(approvals).values({
+      id: pendingId,
+      companyId,
+      type: "request_board_approval",
+      status: "pending",
+      requestedByAgentId: agentId,
+      payload: { title: "Live" },
+    });
+    await db.insert(issueApprovals).values({ companyId, issueId: reviewId, approvalId: pendingId });
+
+    expect(await attentionOf()).toMatchObject({
+      reason: "pending_board_decision",
+      owner: { type: "board", label: "Board" },
+      action: { label: "Decide approval" },
+      approvalId: pendingId,
+    });
+  });
+
   it("classifies recovery issues and missing successful-run dispositions", async () => {
     const { companyId, agentId } = await createCompany("BID");
     const sourceId = await insertIssue({ companyId, identifier: "BID-1", title: "Stopped source", status: "blocked" });
