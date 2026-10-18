@@ -372,7 +372,6 @@ import {
   parseIssueExecutionState,
 } from "./issue-execution-policy.js";
 import {
-  ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
   isVerifiedIssueTreeControlInteractionWake,
   issueTreeControlService,
 } from "./issue-tree-control.js";
@@ -503,6 +502,11 @@ import {
   extractWakeCommentIds,
   shouldReopenTerminalIssueForDeferredWake,
 } from "./deferred-wake-reopen.js";
+import {
+  allowsIssueInteractionWake,
+  deriveCommentId,
+  isEffectivelyDependencyReadyForDispatch,
+} from "./dispatch-readiness.js";
 import {
   RECOVERY_ORIGIN_KINDS,
   FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
@@ -8011,44 +8015,6 @@ function shouldRequireIssueCommentForWake(
   );
 }
 
-function allowsIssueInteractionWake(
-  contextSnapshot: Record<string, unknown> | null | undefined,
-) {
-  const wakeReason = readNonEmptyString(contextSnapshot?.wakeReason);
-  if (!wakeReason || !ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS.has(wakeReason)) return false;
-  return Boolean(deriveCommentId(contextSnapshot, null));
-}
-
-/**
- * The single definition of "can dispatch actually claim this row", as far as
- * dependency blockers are concerned.
- *
- * `claimQueuedRun` cancels a queued run whose issue has unresolved blockers
- * *unless* the run is an issue-interaction wake carrying a comment id — those
- * are deliberately allowed to run on a blocked issue so a human can still talk
- * to the assignee while it waits. Every dispatch-side readiness screen has to
- * agree with that, or the two disagree in a way that is invisible and
- * unbounded (BLO-21792 third review follow-up):
- *
- *   - the emergency/starvation lanes treat the row as unclaimable, so they
- *     page PAST it looking for "real" work and it is never offered; and
- *   - `dispatchRank` files it under the dependency-blocked rank (12+), below
- *     every routine row, so on the pass that does collect it, it loses to
- *     anything else in the window.
- *
- * Under sustained critical arrivals that combination has no upper bound — the
- * exact starvation shape this issue exists to cap — while the claim path would
- * have run the row immediately. Both sides now read this predicate, so a future
- * change to the claim-time exemption cannot silently desynchronize them.
- */
-function isEffectivelyDependencyReadyForDispatch(
-  contextSnapshot: Record<string, unknown> | null | undefined,
-  readiness: { isDependencyReady: boolean } | null | undefined,
-) {
-  if (readiness?.isDependencyReady ?? true) return true;
-  return allowsIssueInteractionWake(contextSnapshot);
-}
-
 /**
  * The single definition of "is this queued run's issue actually claimable
  * right now" (BLO-22091). Every dispatch lane's eligibility test
@@ -8063,7 +8029,8 @@ function isEffectivelyDependencyReadyForDispatch(
  *   1. The issue must exist and be non-terminal (`TERMINAL_ISSUE_STATUSES`).
  *   2. It must not be a k8s-isolation retry still waiting on its timestamp.
  *   3. It must be dependency-ready, or exempted via a verified issue-
- *      interaction wake (`isEffectivelyDependencyReadyForDispatch` above).
+ *      interaction wake (`isEffectivelyDependencyReadyForDispatch`, in
+ *      `dispatch-readiness.ts`).
  *
  * `claimQueuedRun`'s own dependency-blocker gate calls
  * `isEffectivelyDependencyReadyForDispatch` directly rather than this whole
@@ -9906,20 +9873,6 @@ function shouldQueueFollowupForRunningIssueWake(input: {
 
 function isCheckoutConflictError(error: unknown): boolean {
   return error instanceof HttpError && error.status === 409 && error.message === "Issue checkout conflict";
-}
-
-function deriveCommentId(
-  contextSnapshot: Record<string, unknown> | null | undefined,
-  payload: Record<string, unknown> | null | undefined,
-) {
-  const batchedCommentId = extractWakeCommentIds(contextSnapshot).at(-1);
-  return (
-    batchedCommentId ??
-    readNonEmptyString(contextSnapshot?.wakeCommentId) ??
-    readNonEmptyString(contextSnapshot?.commentId) ??
-    readNonEmptyString(payload?.commentId) ??
-    null
-  );
 }
 
 // Re-exported from the shared leaf module so the promoter below and the
