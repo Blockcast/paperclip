@@ -358,22 +358,23 @@ describe("paperclip MCP tools", () => {
     expect(response.content[0]?.text).toContain("CDN+ M0 rollout");
   });
 
-  it("absolutizes Paperclip issue links before returning MCP issue data", async () => {
+  // PEN-4257: these three cases are one property measured on the three surfaces
+  // an agent actually round-trips: a read, a document read, and the echo a write
+  // returns. Stored prose must come back byte-for-byte, because the previous
+  // behaviour rewrote markdown links in every string and a read-modify-write
+  // then persisted the rewrite. The echo case is the sharp one — with both the
+  // echo and the verifying read passing through this layer, a corrupted write
+  // reported byte-identical, so no amount of checking at the call site could
+  // catch it.
+  it("returns issue text byte-for-byte and absolutizes only derived navigation hrefs", async () => {
+    const storedDescription =
+      "Depends on [BLO-9703](/BLO/issues/BLO-9703) and [PCL-2127](/issues/PCL-2127#document-runbook). Keep `/api/issues/{id}` literal.";
     const fetchMock = vi.fn().mockResolvedValue(
       mockJsonResponse({
         identifier: "BLO-9728",
-        description:
-          "Depends on [BLO-9703](/BLO/issues/BLO-9703) and [PCL-2127](/issues/PCL-2127#document-runbook). Keep `/api/issues/{id}` literal.",
+        description: storedDescription,
         relatedWork: {
-          outbound: [
-            {
-              sources: [
-                {
-                  href: "/issues/BLO-9728#comment-abc",
-                },
-              ],
-            },
-          ],
+          outbound: [{ sources: [{ href: "/issues/BLO-9728#comment-abc" }] }],
         },
       }),
     );
@@ -382,20 +383,65 @@ describe("paperclip MCP tools", () => {
     const tool = getTool("paperclipGetIssue", makeClient({
       publicUrl: "https://paperclip.blockcast.net/",
     }));
-    const response = await tool.execute({
+    const payload = payloadOf(await tool.execute({
       issueId: "BLO-9728",
       company: "11111111-1111-1111-1111-111111111111",
-    });
-    const text = response.content[0]?.text ?? "";
+    })) as {
+      description: string;
+      relatedWork: { outbound: Array<{ sources: Array<{ href: string }> }> };
+    };
 
-    expect(text).toContain("[BLO-9703](https://paperclip.blockcast.net/BLO/issues/BLO-9703)");
-    expect(text).toContain("[PCL-2127](https://paperclip.blockcast.net/PCL/issues/PCL-2127#document-runbook)");
-    expect(text).toContain("https://paperclip.blockcast.net/BLO/issues/BLO-9728#comment-abc");
-    expect(text).toContain("Keep `/api/issues/{id}` literal.");
-    expect(text).not.toContain("](/BLO/issues/");
-    expect(text).not.toContain("\": \"/issues/BLO-9728");
+    // The stored body is returned verbatim: relative links stay relative.
+    expect(payload.description).toBe(storedDescription);
+    // ...and the derived navigation pointer is still absolutized, so a caller
+    // with no base URL can still resolve it. Deleting the rewrite outright
+    // would have regressed this.
+    expect(payload.relatedWork.outbound[0]!.sources[0]!.href).toBe(
+      "https://paperclip.blockcast.net/BLO/issues/BLO-9728#comment-abc",
+    );
   });
 
+  it("returns a document body byte-for-byte", async () => {
+    const storedBody = "See [PEN-2111](/PEN/issues/PEN-2111#document-plan) before citing a revision.";
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse({ key: "continuation-summary", body: storedBody }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipGetDocument", makeClient({
+      publicUrl: "https://paperclip.blockcast.net/",
+    }));
+    const payload = payloadOf(await tool.execute({
+      issueId: "PEN-2111",
+      key: "continuation-summary",
+    })) as { body: string };
+
+    expect(payload.body).toBe(storedBody);
+  });
+
+  it("echoes a written comment body byte-for-byte", async () => {
+    const storedBody = "Recorded on [PEN-2111](/PEN/issues/PEN-2111) and [PEN-2508](/PEN/issues/PEN-2508).";
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse({ id: "comment-1", body: storedBody }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipAddComment", makeClient({
+      publicUrl: "https://paperclip.blockcast.net/",
+    }));
+    const payload = payloadOf(await tool.execute({
+      issueId: "PEN-2111",
+      body: storedBody,
+    })) as { body: string };
+
+    // What the caller sent, what the API stored, and what the echo returns are
+    // the same bytes — so verifying a write from its own response is sound.
+    const sentBody = JSON.parse(
+      String((fetchMock.mock.calls[0] as [string, RequestInit])[1].body),
+    ).body as string;
+    expect(sentBody).toBe(storedBody);
+    expect(payload.body).toBe(storedBody);
+  });
   it("uses default agent id for checkout requests", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       mockJsonResponse({ id: "PAP-1135", status: "in_progress" }),
