@@ -52,9 +52,6 @@ vi.mock("@/plugins/slots", async () => {
   };
 });
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 function pageContribution(overrides: Partial<{ slots: unknown[] }> = {}) {
   return {
     pluginId: "plugin-wiki",

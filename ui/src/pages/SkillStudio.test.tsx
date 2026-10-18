@@ -137,9 +137,6 @@ vi.mock("./CompanySkills", () => ({
   ),
 }));
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 let root: Root | null = null;
 let container: HTMLDivElement | null = null;
 

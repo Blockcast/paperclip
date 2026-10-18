@@ -6,8 +6,6 @@ import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import type { Agent } from "@paperclipai/shared";
 import { IssueAssignedBacklogNotice } from "./IssueAssignedBacklogNotice";
 
-(globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-
 const baseAgent = {
   id: "agent-1",
   companyId: "co-1",

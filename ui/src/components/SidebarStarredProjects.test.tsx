@@ -49,9 +49,6 @@ vi.mock("../context/ToastContext", () => ({
 vi.mock("../api/projects", () => ({ projectsApi: mockProjectsApi }));
 vi.mock("../api/resourceMemberships", () => ({ resourceMembershipsApi: mockResourceMembershipsApi }));
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 function makeProject(overrides: Partial<Project>): Project {
   return {
     id: "project-a",

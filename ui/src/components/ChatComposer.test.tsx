@@ -5,8 +5,6 @@ import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ChatComposer, type ChatComposerProps } from "./ChatComposer";
 
-(globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-
 /** Stateful harness so the controlled textarea reflects typed input. */
 function Harness(props: Partial<ChatComposerProps> & { initial?: string }) {
   const { initial = "", onChange, ...rest } = props;

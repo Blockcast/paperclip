@@ -36,8 +36,6 @@ vi.mock("@/lib/router", () => ({
     `/PAP/${["cases", ...segments].filter(Boolean).join("/")}`,
 }));
 
-(globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-
 function dispatchShortcut(key: string) {
   act(() => {
     document.body.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }));

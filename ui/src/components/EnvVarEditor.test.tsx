@@ -6,9 +6,6 @@ import type { CompanySecret, EnvBinding, UserSecretDefinition } from "@paperclip
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { EnvironmentVariablesEditor } from "./environment-variables-editor";
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 const definition: UserSecretDefinition = {
   id: "def-1",
   companyId: "c1",

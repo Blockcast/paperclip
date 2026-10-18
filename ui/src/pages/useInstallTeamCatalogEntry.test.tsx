@@ -23,9 +23,6 @@ const mockTeamCatalogApi = vi.hoisted(() => ({
 
 vi.mock("../api/teamCatalog", () => ({ teamCatalogApi: mockTeamCatalogApi }));
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 // Capture the live hook result so assertions can read it and drive its actions.
 let captured: UseInstallTeamCatalogEntryResult | null = null;
 

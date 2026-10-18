@@ -42,9 +42,6 @@ vi.mock("@/components/WorkspaceFileMarkdownBody", () => ({
   ),
 }));
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 function ok<T>(data: T) {
   return { data, isFetching: false, isError: false, error: null, refetch: vi.fn(async () => ({ data })) };
 }

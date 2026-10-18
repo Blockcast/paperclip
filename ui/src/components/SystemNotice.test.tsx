@@ -6,9 +6,6 @@ import type { ReactElement } from "react";
 import { afterEach, describe, expect, it } from "vitest";
 import { SystemNotice } from "./SystemNotice";
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 let root: ReturnType<typeof createRoot> | null = null;
 let container: HTMLDivElement | null = null;
 

@@ -6,9 +6,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentMultiSelect } from "./AgentMultiSelect";
 import { flushReact } from "@/test-utils/react";
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 function setInputValue(input: HTMLInputElement, value: string) {
   act(() => {
     const valueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")?.set;

@@ -104,9 +104,6 @@ vi.mock("../api/externalObjects", () => ({
   externalObjectsApi: mockExternalObjectsApi,
 }));
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 vi.mock("./IssueRow", () => ({
   IssueRow: ({
     issue,
@@ -169,9 +166,6 @@ vi.mock("./KanbanBoard", () => ({
     );
   },
 }));
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
 function createIssue(overrides: Partial<Issue> = {}): Issue {
   return {

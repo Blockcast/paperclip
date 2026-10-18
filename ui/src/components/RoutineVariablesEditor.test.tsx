@@ -6,9 +6,6 @@ import type { RoutineVariable } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { RoutineVariablesEditor, RoutineVariablesHint } from "./RoutineVariablesEditor";
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 function flushUi(callback: () => void) {
   flushSync(callback);
 }

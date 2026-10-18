@@ -83,8 +83,6 @@ describe("plugin host navigation", () => {
 });
 
 describe("useHostNavigation mobile drawer behavior", () => {
-  // React 19's `act` requires the env flag and React DOM client.
-  (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
   function makeBridgeValue(): PluginBridgeContextValue {
     return {

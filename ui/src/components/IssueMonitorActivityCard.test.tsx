@@ -6,9 +6,6 @@ import type { Issue } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { IssueMonitorActivityCard } from "./IssueMonitorActivityCard";
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 function createIssue(overrides: Partial<Issue> = {}): Issue {
   return {
     id: "issue-1",

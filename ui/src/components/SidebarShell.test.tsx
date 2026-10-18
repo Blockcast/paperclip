@@ -5,9 +5,6 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SidebarShell, SIDEBAR_RAIL_WIDTH } from "./SidebarShell";
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 function pointerEvent(type: string, clientX: number) {
   const event = new MouseEvent(type, { bubbles: true, clientX });
   Object.defineProperty(event, "pointerId", { value: 1 });

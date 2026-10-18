@@ -16,9 +16,6 @@ vi.mock("@/api/issues", () => ({
   },
 }));
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 function makeIssue(overrides: Partial<Issue> = {}): Issue {
   const now = new Date("2026-04-13T20:00:00.000Z");
   return {

@@ -22,9 +22,6 @@ vi.mock("../../context/ToastContext", () => ({
   useToastActions: () => ({ pushToast: mockPushToast }),
 }));
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 function definition(overrides: Partial<UserSecretDefinition> = {}): UserSecretDefinition {
   return {
     id: "def-1",

@@ -5,9 +5,6 @@ import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ToastProvider, useToastActions, useToastState } from "./ToastContext";
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 describe("ToastContext", () => {
   let container: HTMLDivElement;
 

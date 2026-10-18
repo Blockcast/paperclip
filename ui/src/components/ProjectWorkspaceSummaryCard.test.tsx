@@ -16,9 +16,6 @@ vi.mock("./IssuesQuicklook", () => ({
   IssuesQuicklook: ({ children }: { children: ReactNode }) => <>{children}</>,
 }));
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 /** Matches the auto-dismiss delay in CopyText.tsx. */
 const COPY_FEEDBACK_HIDE_MS = 1500;
 

@@ -5,9 +5,6 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SidebarProvider, useSidebar } from "./SidebarContext";
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 const COLLAPSED_STORAGE_KEY = "paperclip.sidebar.collapsed";
 
 // Mutable media state driving the matchMedia mock.

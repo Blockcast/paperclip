@@ -26,9 +26,6 @@ const markdownEditorMockState = vi.hoisted(() => ({
   emitMountEmptyChange: false,
 }));
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 vi.mock("../api/issues", () => ({
   issuesApi: mockIssuesApi,
 }));

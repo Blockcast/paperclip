@@ -5,9 +5,6 @@ import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { StarToggle } from "./StarToggle";
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 describe("StarToggle", () => {
   let container: HTMLDivElement;
   let root: ReturnType<typeof createRoot> | null;

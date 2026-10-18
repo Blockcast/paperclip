@@ -18,8 +18,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SummarySlotCard } from "./SummarySlotCard";
 import { flushReact } from "@/test-utils/react";
 
-(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-
 if (!HTMLElement.prototype.hasPointerCapture) {
   Object.defineProperty(HTMLElement.prototype, "hasPointerCapture", {
     configurable: true,

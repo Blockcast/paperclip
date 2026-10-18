@@ -11,8 +11,6 @@ import { __liveUpdatesTestUtils } from "@/context/LiveUpdatesProvider";
 import { useSummaryDraftStream } from "./useSummaryDraftStream";
 import { flushReact } from "@/test-utils/react";
 
-(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-
 const { LiveEventSubscriptionContext, dispatchLiveEventToSubscribers } = __liveUpdatesTestUtils;
 
 const mockHeartbeatsApi = vi.hoisted(() => ({ log: vi.fn(), activeRunForIssue: vi.fn() }));

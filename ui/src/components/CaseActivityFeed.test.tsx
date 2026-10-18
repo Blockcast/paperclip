@@ -13,8 +13,6 @@ vi.mock("@/lib/router", () => ({
   ),
 }));
 
-(globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-
 function event(overrides: Partial<CaseEvent>): CaseEvent {
   return {
     id: Math.random().toString(36).slice(2),

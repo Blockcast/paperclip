@@ -35,9 +35,6 @@ vi.mock("../components/AgentIconPicker", () => ({
   AgentIcon: () => <span data-testid="agent-icon" />,
 }));
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 const orgTree = [
   {
     id: "agent-1",

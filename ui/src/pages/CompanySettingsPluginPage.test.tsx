@@ -48,9 +48,6 @@ vi.mock("@/plugins/slots", () => ({
   ),
 }));
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 async function renderPage(container: HTMLDivElement) {
   const root = createRoot(container);
   const queryClient = new QueryClient({

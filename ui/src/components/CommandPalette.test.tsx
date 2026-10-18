@@ -133,9 +133,6 @@ vi.mock("@/components/ui/command", () => ({
   CommandSeparator: () => <hr />,
 }));
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 function renderWithQueryClient(
   node: ReactNode,
   container: HTMLDivElement,

@@ -51,9 +51,6 @@ vi.mock("@/components/PageTabBar", () => ({
   PageTabBar: () => null,
 }));
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 function basePlugin(overrides: Record<string, unknown> = {}) {
   return {
     id: "plugin-1",

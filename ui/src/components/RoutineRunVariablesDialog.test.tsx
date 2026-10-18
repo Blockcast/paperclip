@@ -53,9 +53,6 @@ vi.mock("./IssueWorkspaceCard", async () => {
   };
 });
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 async function settleEffects() {
   await Promise.resolve();
   await Promise.resolve();

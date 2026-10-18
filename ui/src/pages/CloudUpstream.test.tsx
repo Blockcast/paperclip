@@ -63,9 +63,6 @@ vi.mock("@/lib/router", () => ({
   useLocation: () => ({ pathname: mockLocationState.pathname, search: mockLocationState.search }),
 }));
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 describe("CloudUpstream", () => {
   let container: HTMLDivElement;
 

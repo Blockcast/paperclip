@@ -79,9 +79,6 @@ vi.mock("../components/MarkdownEditor", () => ({
   },
 }));
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 async function waitFor<T>(assertion: () => T): Promise<T> {
   let lastError: unknown;
   for (let i = 0; i < 20; i++) {

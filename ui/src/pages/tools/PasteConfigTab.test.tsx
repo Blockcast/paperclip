@@ -20,9 +20,6 @@ vi.mock("@/api/tools", () => ({ toolsApi: toolsApiMock }));
 // which needs CompanyProvider; stub it so the copy hint renders in isolation.
 vi.mock("@/lib/router", () => ({ useNavigate: () => mockNavigate }));
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 function setTextareaValue(textarea: HTMLTextAreaElement, value: string) {
   const setter = Object.getOwnPropertyDescriptor(
     window.HTMLTextAreaElement.prototype,

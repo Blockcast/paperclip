@@ -7,9 +7,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { IssueFiltersPopover } from "./IssueFiltersPopover";
 import { defaultIssueFilterState } from "../lib/issue-filters";
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 vi.mock("@/components/ui/popover", () => ({
   Popover: ({ children }: { children: ReactNode }) => <div>{children}</div>,
   PopoverTrigger: ({ children }: { children: ReactNode }) => <>{children}</>,

@@ -6,9 +6,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SidebarProvider, useSidebar } from "../context/SidebarContext";
 import { RequestCollapsedSidebar } from "./RequestCollapsedSidebar";
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 const COLLAPSED_STORAGE_KEY = "paperclip.sidebar.collapsed";
 
 let capturedValue: ReturnType<typeof useSidebar> | null = null;

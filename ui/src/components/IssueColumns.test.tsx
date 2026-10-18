@@ -7,9 +7,6 @@ import type { Issue } from "@paperclipai/shared";
 import { InboxIssueMetaLeading, InboxIssueTrailingColumns } from "./IssueColumns";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 function makeIssue(overrides: Partial<Issue>): Issue {
   return {
     id: "issue-id",

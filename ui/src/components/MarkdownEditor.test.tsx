@@ -150,9 +150,6 @@ vi.mock("../lib/paste-normalization", () => ({
   pasteNormalizationPlugin: () => ({}),
 }));
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 function createFileDragEvent(type: string) {
   const event = (
     typeof DragEvent === "function"

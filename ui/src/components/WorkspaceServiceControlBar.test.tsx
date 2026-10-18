@@ -5,9 +5,6 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { WorkspaceServiceControlBar } from "./WorkspaceServiceControlBar";
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 describe("WorkspaceServiceControlBar", () => {
   let container: HTMLDivElement;
   let root: Root;

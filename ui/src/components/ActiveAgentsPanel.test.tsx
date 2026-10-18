@@ -46,9 +46,6 @@ vi.mock("./transcript/useLiveRunTranscripts", () => ({
   }),
 }));
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
 async function waitForMicrotaskAssertion(assertion: () => void, attempts = 20) {
   let lastError: unknown;
   for (let index = 0; index < attempts; index += 1) {
