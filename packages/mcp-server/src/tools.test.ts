@@ -442,6 +442,77 @@ describe("paperclip MCP tools", () => {
     expect(sentBody).toBe(storedBody);
     expect(payload.body).toBe(storedBody);
   });
+
+  // PEN-4262: the allowlist above is not `href`-only. A pipeline case output is
+  // the surface the PEN-4257 measurement did not sample, and it carries two
+  // more server-derived pointers (`sourceIssuePath`, `documentPath`) plus a
+  // bare `path` holding the same value that is deliberately left relative.
+  // These routes have no named tool, so they are reached through the raw REST
+  // passthrough — the same shared response layer every named tool goes through.
+  it("absolutizes derived pipeline-case-output paths without touching sibling prose or bare `path`", async () => {
+    const storedPreview = "Blocked on [PEN-2111](/PEN/issues/PEN-2111) until the card clears.";
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse({
+        generatedAt: "2026-10-18T06:00:00.000Z",
+        items: [{
+          id: "document:doc-1",
+          kind: "document",
+          sourceIssuePath: "/PEN/issues/PEN-2111",
+          documentPath: "/PEN/issues/PEN-2111#document-plan",
+          // Stored content copied from the source document. `title` is the
+          // sharp case: its value is *exactly* a relative issue path, so the
+          // key check is the only thing keeping it out of the rewrite.
+          title: "/PEN/issues/PEN-2111",
+          preview: storedPreview,
+          contentPath: "/api/attachments/att-1/content",
+        }],
+        // The context summary the same service derives, where the identical
+        // value is emitted under a bare `path`.
+        outputSummaries: { items: [{ sourceIssue: { path: "/PEN/issues/PEN-2111" } }] },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipApiRequest", makeClient({
+      publicUrl: "https://paperclip.blockcast.net/",
+    }));
+    const payload = payloadOf(await tool.execute({
+      method: "GET",
+      path: "/cases/case-1/outputs",
+    })) as {
+      items: Array<{
+        sourceIssuePath: string;
+        documentPath: string;
+        title: string;
+        preview: string;
+        contentPath: string;
+      }>;
+      outputSummaries: { items: Array<{ sourceIssue: { path: string } }> };
+    };
+    const item = payload.items[0]!;
+
+    // Both derived pointers resolve for a caller holding no base URL.
+    expect(item.sourceIssuePath).toBe("https://paperclip.blockcast.net/PEN/issues/PEN-2111");
+    expect(item.documentPath).toBe(
+      "https://paperclip.blockcast.net/PEN/issues/PEN-2111#document-plan",
+    );
+    // Sibling keys holding stored content under the same object are returned
+    // verbatim — widening the allowlist must not reopen the rewrite on text an
+    // agent round-trips. `title` is what makes this assertion load-bearing:
+    // because its value is exactly a relative issue path, it is rewritten the
+    // moment `title` is admitted, so only the key check is holding it.
+    expect(item.title).toBe("/PEN/issues/PEN-2111");
+    expect(item.preview).toBe(storedPreview);
+    // Bare `path` stays relative on purpose: `feedback.ts` uses that key for
+    // artifact file paths, so it is not server-derived in general.
+    expect(payload.outputSummaries.items[0]!.sourceIssue.path).toBe("/PEN/issues/PEN-2111");
+    // `contentPath` is server-derived but `/api/attachments/...` is not an
+    // issue/project path, so the anchored regex declines it and admitting the
+    // key would change nothing. Pinned so a later reader does not add it
+    // expecting an effect.
+    expect(item.contentPath).toBe("/api/attachments/att-1/content");
+  });
+
   it("uses default agent id for checkout requests", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       mockJsonResponse({ id: "PAP-1135", status: "in_progress" }),
