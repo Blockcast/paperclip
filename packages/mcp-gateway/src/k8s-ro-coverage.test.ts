@@ -70,30 +70,34 @@ import { scrubResponseBody } from "./response-scrub.js";
  * `kubernetes-mcp-server-config` — all of which live in
  * `Blockcast/onprem-k8s:paperclip/k8s-mcp-stack.yaml`.
  *
- * PEN-4295 CLOSED the half that made this unbounded, and narrowed what is left
- * to a restatement. The `k8s-ro` upstream map now carries a twelve-tool
- * allowlist in `onprem-k8s:paperclip/k8s-mcp-gateway-k8s-ro.yaml`, matching the
- * list below, and `onprem-k8s:scripts/check-k8s-ro-tool-surface.mjs` fails that
- * repo's build on an image bump, a dropped `--read-only`, a deleted
- * `disabled_tools`, or an allowlist that is not exactly this set. So a tool a
- * future image adds is DENIED rather than served — `isToolAllowed` is enforced
- * on `tools/list` AND `tools/call`, on both the aggregate and prefixed routes
- * — and the bump is red until someone states they re-read the surface.
- * (Carrier: onprem-k8s#6135. The gateway reads its upstream file at startup
- * and the Deployment carries no config checksum, so the allowlist applies from
- * the next pod restart; before that the surface is unrestricted, which is the
- * pre-PEN-4295 behaviour and the safe direction.)
+ * ⛔ AS OF THIS COMMIT THAT IS STILL TRUE AND THIS WARNING STANDS. The `k8s-ro`
+ * gateway upstream map on `onprem-k8s` master carries NO `tools` allowlist
+ * (unlike the prometheus gateway, whose five-tool allowlist is what actually
+ * closed PEN-2735), so every tool that image serves is exposed, and an upstream
+ * image bump can add a tool, route it through `/k8s-ro`, and leave this suite
+ * green. Do not read the paragraph below as saying otherwise.
  *
- * WHAT IS GENUINELY LEFT: the two repos cannot check each other. No test in
- * either can read the other's tree, so `K8S_RO_TOOLS` below and
- * `ATTESTED_K8S_RO_TOOLS` in that guard are two restatements bound by a
- * cross-reference, not an assertion — done-when 4 of PEN-4295 asked for a read
- * rather than a restatement, and cross-repo that is not available. The residual
- * is bounded and legible in both directions, which is the point of writing it
- * here: a tool allowed there but absent below is exposed-but-unclassified (file
- * it), and a tool below but absent there is simply denied (availability, not
- * exposure). Neither is the open-ended "an image bump exposes anything it
- * likes" this block used to have to warn about.
+ * PEN-4295 is the row that closes this half, and its carrier is
+ * onprem-k8s#6135 — OPEN, NOT MERGED at the time of writing, with
+ * `scripts/check-k8s-ro-tool-surface.mjs` returning 404 on that repo's master.
+ * WHEN IT MERGES AND THE GATEWAY POD RESTARTS (the Deployment carries no config
+ * checksum, so the ConfigMap change does not roll it), the map will carry a
+ * twelve-tool allowlist matching the list below, that guard will fail
+ * onprem-k8s's build on an image bump, a dropped `--read-only`, a deleted
+ * `disabled_tools` or an allowlist that is not exactly this set, and a tool a
+ * future image adds will be DENIED rather than served — `isToolAllowed` is
+ * enforced on `tools/list` AND `tools/call`, on both the aggregate and prefixed
+ * routes. Until both of those have happened, the surface is unrestricted.
+ *
+ * WHAT WILL STILL BE LEFT AFTERWARDS, and is worth knowing now: the two repos
+ * cannot check each other. No test in either can read the other's tree, so
+ * `K8S_RO_TOOLS` below and `ATTESTED_K8S_RO_TOOLS` in that guard will be two
+ * restatements bound by a cross-reference, not an assertion — done-when 4 of
+ * PEN-4295 asked for a read rather than a restatement, and cross-repo that is
+ * not available. That residual is bounded and legible in both directions: a
+ * tool allowed there but absent below is exposed-but-unclassified (file it),
+ * and a tool below but absent there is simply denied (availability, not
+ * exposure).
  *
  * What this file DOES enforce is that the two in-repo records cannot drift:
  * `scripts/__tests__/k8s-ro-coverage-doc-sync.test.mjs` asserts
@@ -125,12 +129,12 @@ const REDACTED = "<redacted>";
  * request that went around it.
  *
  * If you are here because this list disagrees with the doc table, add the tool
- * to BOTH, and give it a surface below. Do not delete the assertion. Since
- * PEN-4295 there is a THIRD place: the `tools` allowlist in
+ * to BOTH, and give it a surface below. Do not delete the assertion. ONCE
+ * onprem-k8s#6135 HAS MERGED there is a THIRD place: the `tools` allowlist in
  * `onprem-k8s:paperclip/k8s-mcp-gateway-k8s-ro.yaml` and
- * `ATTESTED_K8S_RO_TOOLS` in that repo's guard. A tool added here but not
- * there is not reachable; a tool added there but not here is reachable and
- * unclassified, which is the direction that matters.
+ * `ATTESTED_K8S_RO_TOOLS` in that repo's guard. From then on a tool added here
+ * but not there is not reachable; a tool added there but not here is reachable
+ * and unclassified, which is the direction that matters.
  */
 const K8S_RO_TOOLS: readonly string[] = [
   "events_list",
