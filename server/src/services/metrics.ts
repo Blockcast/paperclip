@@ -1022,6 +1022,22 @@ export const EXTERNAL_RUNTIME_RESERVATION_OLDEST_AGE_METRIC = "paperclip_externa
 // CONCURRENT_RUN_BLOCKED_METRIC) so `max(...) by (agent_id) > threshold`
 // identifies which agent is starved.
 export const QUEUED_RUN_OLDEST_AGE_METRIC = "paperclip_queued_run_oldest_age_seconds";
+// PEN-4280/PEN-4293: the same measurand as QUEUED_RUN_OLDEST_AGE_METRIC with the
+// structurally-unclaimable population removed. A queued run whose issue is not
+// dependency-ready (and which is not an exempted issue-interaction wake) is
+// deliberately refused the front of the dispatch queue -- `dispatchRank` files
+// it below every routine row and will not let it age forward, and
+// `claimQueuedRun`'s cancel-on-blocked screen only fires on a claim that
+// therefore never arrives. Its wait is NOT dispatch latency, and counting it as
+// such reads a healthy dispatcher as starvation (measured 2026-10-18: 21.8x
+// threshold on one seat, four queued runs stacked on one `blocked` issue in
+// 17 minutes).
+//
+// Published ALONGSIDE the original rather than replacing it: a consumer reads
+// the original, and the two differing is itself the signal that undispatchable
+// work is piling up.
+export const QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC =
+  "paperclip_queued_run_oldest_claimable_age_seconds";
 export const QUEUED_RUN_AGE_METRICS_REFRESH_SUCCESS_METRIC = "paperclip_queued_run_age_metrics_refresh_success";
 // BLO-32638: a routine's receipt that it took a measurement is a `done` issue
 // row, which Prometheus cannot see. So a routine silently disabled for
@@ -3787,6 +3803,7 @@ let agentWakeupTerminalFailedOldestAge: Gauge<"scope"> | null = null;
 let githubWorkflowRunConclusion: Counter<"conclusion" | "supersession"> | null = null;
 let githubWebhookDelivery: Counter<"event" | "outcome"> | null = null;
 let queuedRunOldestAge: Gauge<"agent_id"> | null = null;
+let queuedRunOldestClaimableAge: Gauge<"agent_id"> | null = null;
 let routineLastDoneFireAge: Gauge<"routine_id"> | null = null;
 let routineFireInterval: Gauge<"routine_id"> | null = null;
 let routineFireGapMetricsRefreshSuccess: Gauge | null = null;
@@ -3949,6 +3966,7 @@ function ensureRegistry(): {
   githubWorkflowRunConclusionCounter: Counter<"conclusion" | "supersession">;
   githubWebhookDeliveryCounter: Counter<"event" | "outcome">;
   queuedRunOldestAgeGauge: Gauge<"agent_id">;
+  queuedRunOldestClaimableAgeGauge: Gauge<"agent_id">;
   routineLastDoneFireAgeGauge: Gauge<"routine_id">;
   routineFireIntervalGauge: Gauge<"routine_id">;
   routineFireGapMetricsRefreshSuccessGauge: Gauge;
@@ -4086,6 +4104,7 @@ function ensureRegistry(): {
     || !githubWorkflowRunConclusion
     || !githubWebhookDelivery
     || !queuedRunOldestAge
+    || !queuedRunOldestClaimableAge
     || !routineLastDoneFireAge
     || !routineFireInterval
     || !routineFireGapMetricsRefreshSuccess
@@ -5152,6 +5171,25 @@ function ensureRegistry(): {
       labelNames: ["agent_id"],
       registers: [registry],
     });
+    queuedRunOldestClaimableAge = new Gauge({
+      name: QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC,
+      help:
+        "Age in seconds of the oldest `queued` heartbeat run for an agent that dispatch "
+        + "can actually claim (PEN-4280/PEN-4293). Same population as "
+        + QUEUED_RUN_OLDEST_AGE_METRIC
+        + " minus runs whose issue is not dependency-ready, which the dispatcher "
+        + "deliberately refuses to let age forward (`dispatchRank` ranks them below every "
+        + "routine row; `claimQueuedRun`'s cancel-on-blocked screen fires only on a claim "
+        + "that therefore never arrives). Their wait is undispatchable work, not dispatch "
+        + "latency, so the unfiltered gauge reads a healthy dispatcher as starvation. Both "
+        + "gauges are published: the ORIGINAL is the one existing consumers read, and the "
+        + "DIFFERENCE between them is how much queued work is structurally unclaimable. "
+        + "Same reset-then-set zero-floor convention as "
+        + QUEUED_RUN_OLDEST_AGE_METRIC
+        + " -- every known agent emits an explicit 0 rather than an absent series.",
+      labelNames: ["agent_id"],
+      registers: [registry],
+    });
     deferredIssueExecutionWakeOldestAge = new Gauge({
       name: DEFERRED_ISSUE_EXECUTION_WAKE_OLDEST_AGE_METRIC,
       help:
@@ -5975,6 +6013,7 @@ function ensureRegistry(): {
     githubWorkflowRunConclusionCounter: githubWorkflowRunConclusion,
     githubWebhookDeliveryCounter: githubWebhookDelivery,
     queuedRunOldestAgeGauge: queuedRunOldestAge,
+    queuedRunOldestClaimableAgeGauge: queuedRunOldestClaimableAge,
     routineLastDoneFireAgeGauge: routineLastDoneFireAge,
     routineFireIntervalGauge: routineFireInterval,
     routineFireGapMetricsRefreshSuccessGauge: routineFireGapMetricsRefreshSuccess,
@@ -6567,6 +6606,41 @@ export function setQueuedRunOldestAgeMetrics(
   knownAgentIds: ReadonlySet<string>,
 ): void {
   const gauge = ensureRegistry().queuedRunOldestAgeGauge;
+  gauge.reset();
+  const oldestByAgentId = new Map<string, number>();
+  for (const entry of entries) {
+    const agentId = normalizeAgentId(entry.agentId, knownAgentIds);
+    const ageSeconds = Number.isFinite(entry.ageSeconds) ? Math.max(0, entry.ageSeconds) : 0;
+    const current = oldestByAgentId.get(agentId);
+    if (current === undefined || ageSeconds > current) oldestByAgentId.set(agentId, ageSeconds);
+  }
+  for (const agentId of knownAgentIds) {
+    gauge.set({ agent_id: agentId }, oldestByAgentId.get(agentId) ?? 0);
+  }
+  const unknownAge = oldestByAgentId.get(UNKNOWN_AGENT_ID);
+  if (unknownAge !== undefined) gauge.set({ agent_id: UNKNOWN_AGENT_ID }, unknownAge);
+}
+
+/**
+ * Publish the oldest CLAIMABLE queued-run age per known agent (PEN-4293).
+ *
+ * Deliberately a separate function from {@link setQueuedRunOldestAgeMetrics}
+ * rather than a flag on it: the two are written from the same refresh and must
+ * both be published on every success, so that `original - claimable` is always
+ * a well-formed difference. A shared writer with a mode flag would make a
+ * half-published pair representable.
+ *
+ * The zero-floor is load-bearing in the same way as its sibling's, and for a
+ * sharper reason here: an agent whose ENTIRE queue is dependency-blocked has no
+ * claimable run at all. That must read as an explicit 0 -- "nothing is waiting
+ * on dispatch" -- not as an absent series, which on a dashboard is
+ * indistinguishable from the collector being dead.
+ */
+export function setQueuedRunOldestClaimableAgeMetrics(
+  entries: ReadonlyArray<{ agentId: string | null | undefined; ageSeconds: number }>,
+  knownAgentIds: ReadonlySet<string>,
+): void {
+  const gauge = ensureRegistry().queuedRunOldestClaimableAgeGauge;
   gauge.reset();
   const oldestByAgentId = new Map<string, number>();
   for (const entry of entries) {
@@ -8526,6 +8600,7 @@ export function __resetMetricsForTest(): void {
   githubWorkflowRunConclusion = null;
   githubWebhookDelivery = null;
   queuedRunOldestAge = null;
+  queuedRunOldestClaimableAge = null;
   routineLastDoneFireAge = null;
   routineFireInterval = null;
   routineFireGapMetricsRefreshSuccess = null;

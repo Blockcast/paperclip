@@ -210,6 +210,58 @@ the last age snapshot in memory, but the freshness gate prevents stale data
 from firing or suppressing the primary alert. Resolve the refresh-failure
 alert first.
 
+## Is the head of the queue even dispatchable? (PEN-4280 / PEN-4293)
+
+**Check this before triaging the dispatcher.** The alert's gauge counts every
+`queued` run, including runs the dispatcher is *deliberately* refusing to
+advance. A queued run whose issue is not dependency-ready is structurally
+unclaimable by design:
+
+- `dispatchRank` files it below every routine row and will not let it age
+  forward -- *"a row that cannot be claimed must not escalate to the front,
+  however long it has waited"* (`isDispatchRankReady`, BLO-22091); and
+- `claimQueuedRun`'s cancel-on-blocked screen
+  (`cancelQueuedRunForBlockedDependencies`) fires only on a claim, which
+  therefore never arrives.
+
+So such a run ages without bound **while the dispatcher is behaving exactly as
+specified**, and `paperclip_queued_run_oldest_age_seconds` reads that as
+starvation. Measured 2026-10-18: 21.8x threshold on one seat, two confirmed
+instances, four queued runs stacked on one `blocked` issue in 17 minutes --
+after three days of dispatcher triage that found nothing, because there was
+nothing there to find.
+
+Compare the two gauges:
+
+```promql
+paperclip_queued_run_oldest_age_seconds
+paperclip_queued_run_oldest_claimable_age_seconds
+```
+
+- **Both high** -- a genuinely claimable run is waiting. Continue to *What to
+  do when paged* below; the dispatcher is the right thing to look at.
+- **Unfiltered high, claimable low or `0`** -- the aged head is undispatchable
+  work, not a dispatch fault. Nothing is starved. Find the blocked issue (the
+  SQL in step 1 returns `issue_id`; check its unresolved blockers) and fix or
+  cut the dependency. Do NOT retune the dispatcher, raise concurrency, or
+  clear the run by hand.
+
+`paperclip_queued_run_oldest_claimable_age_seconds` is the same measurand with
+that population removed. It reads `isEffectivelyDependencyReadyForDispatch`
+(`server/src/services/dispatch-readiness.ts`) -- the dispatcher's own
+predicate, not a copy of it -- so it also preserves the claim path's deliberate
+exemption: an issue-interaction wake carrying a comment id **is** counted,
+because it genuinely can run on a blocked issue so a human can talk to the
+assignee while it waits. A run carrying no issue id is counted for the same
+reason: nothing could make it unclaimable.
+
+> ⚠️ The alert still fires on the **unfiltered** gauge, on purpose. Repointing
+> it waits on BLO-26656: the app-native collector that serves both gauges has a
+> known silent-death mode, so the new series has to be observed present
+> fleet-wide before a live page depends on it. Until then this section is the
+> triage step, not an alert change. The two gauges differing is itself the
+> signal that undispatchable work is piling up.
+
 ## What to do when paged
 
 ### Step 1 — find the rows for the paged agent

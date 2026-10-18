@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
-import { agents, companies, createDb, heartbeatRuns } from "@paperclipai/db";
+import { agents, companies, createDb, heartbeatRuns, issueRelations, issues } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -10,6 +10,7 @@ import {
   __resetMetricsForTest,
   QUEUED_RUN_AGE_METRICS_REFRESH_SUCCESS_METRIC,
   QUEUED_RUN_OLDEST_AGE_METRIC,
+  QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC,
   renderMetrics,
 } from "../services/metrics.js";
 import { refreshQueuedRunAgeMetrics } from "../services/queued-run-age-metrics.js";
@@ -31,7 +32,7 @@ describeEmbeddedPostgres("refreshQueuedRunAgeMetrics (BLO-21116)", () => {
     // quadratic here because heartbeat_runs has a self-reference without a
     // child-key index; this database is private to the file, so truncate the
     // fixture graph instead of making cleanup dominate the test timeout.
-    await db.execute(sql`TRUNCATE TABLE heartbeat_runs, agents, companies CASCADE`);
+    await db.execute(sql`TRUNCATE TABLE heartbeat_runs, issue_relations, issues, agents, companies CASCADE`);
     __resetMetricsForTest();
   });
 
@@ -62,6 +63,277 @@ describeEmbeddedPostgres("refreshQueuedRunAgeMetrics (BLO-21116)", () => {
     });
     return { companyId, agentId };
   }
+
+  let issueSeq = 0;
+
+  /**
+   * Insert an issue, optionally behind an unresolved blocker.
+   *
+   * A blocker that is NOT `done` is what `listIssueDependencyReadinessMap`
+   * reads as unresolved, so this is the real readiness path rather than a
+   * stubbed verdict — which matters, because the whole point of PEN-4293 is
+   * that the gauge reads the dispatcher's predicate instead of re-deriving one.
+   */
+  async function insertIssue(
+    companyId: string,
+    options: { blockedBy?: "open" | "done" } = {},
+  ) {
+    const issueId = randomUUID();
+    issueSeq += 1;
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: `Issue ${issueSeq}`,
+      status: options.blockedBy ? "blocked" : "todo",
+      issueNumber: issueSeq,
+      identifier: `QRA-${issueSeq}`,
+    });
+    if (options.blockedBy) {
+      const blockerId = randomUUID();
+      issueSeq += 1;
+      await db.insert(issues).values({
+        id: blockerId,
+        companyId,
+        title: `Blocker ${issueSeq}`,
+        status: options.blockedBy === "done" ? "done" : "in_progress",
+        issueNumber: issueSeq,
+        identifier: `QRA-${issueSeq}`,
+      });
+      await db.insert(issueRelations).values({
+        companyId,
+        issueId: blockerId,
+        relatedIssueId: issueId,
+        type: "blocks",
+      });
+    }
+    return issueId;
+  }
+
+  async function insertQueuedRun(input: {
+    companyId: string;
+    agentId: string;
+    ageSeconds: number;
+    now: Date;
+    contextSnapshot: Record<string, unknown>;
+  }) {
+    const createdAt = new Date(input.now.getTime() - input.ageSeconds * 1000);
+    await db.insert(heartbeatRuns).values({
+      companyId: input.companyId,
+      agentId: input.agentId,
+      invocationSource: "assignment",
+      status: "queued",
+      contextSnapshot: input.contextSnapshot,
+      createdAt,
+      updatedAt: createdAt,
+    });
+  }
+
+  // PEN-4280/PEN-4293. The dispatcher deliberately refuses to let a
+  // dependency-blocked queued run age to the front of the queue
+  // (`dispatchRank`/`isDispatchRankReady`, BLO-22091) and `claimQueuedRun`'s
+  // cancel-on-blocked screen only fires on a claim that therefore never
+  // arrives. So such a run ages without bound while the dispatcher is healthy,
+  // and the unfiltered gauge reads that as starvation. Measured 2026-10-18:
+  // 21.8x threshold on one seat, four queued runs stacked on one `blocked`
+  // issue in 17 minutes.
+  describe("claimable-aware gauge (PEN-4293)", () => {
+    it("excludes a dependency-blocked queued run while the unfiltered gauge still counts it", async () => {
+      const { companyId, agentId } = await insertCompanyAndAgent();
+      const now = new Date("2026-10-18T12:00:00.000Z");
+      const blockedIssueId = await insertIssue(companyId, { blockedBy: "open" });
+
+      await insertQueuedRun({
+        companyId,
+        agentId,
+        ageSeconds: 7200,
+        now,
+        contextSnapshot: { issueId: blockedIssueId, wakeReason: "heartbeat_timer" },
+      });
+
+      await refreshQueuedRunAgeMetrics(db, now);
+      const { body } = await renderMetrics();
+
+      // The unfiltered gauge is deliberately UNCHANGED — a consumer reads it,
+      // and the difference between the two is itself the signal.
+      expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${agentId}"} 7200`);
+      // This is the assertion the exclusion exists for. Deleting the
+      // `isEffectivelyDependencyReadyForDispatch` screen in
+      // `refreshClaimableQueuedRunAgeMetrics` makes this line read 7200.
+      expect(body).toContain(`${QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC}{agent_id="${agentId}"} 0`);
+    });
+
+    it("counts a queued run whose blocker is already done", async () => {
+      // The negative control for the test above: if the exclusion were keyed on
+      // "the issue has a blocker edge" rather than on readiness, this would be
+      // excluded too and the previous test would pass for the wrong reason.
+      const { companyId, agentId } = await insertCompanyAndAgent();
+      const now = new Date("2026-10-18T12:00:00.000Z");
+      const readyIssueId = await insertIssue(companyId, { blockedBy: "done" });
+
+      await insertQueuedRun({
+        companyId,
+        agentId,
+        ageSeconds: 1800,
+        now,
+        contextSnapshot: { issueId: readyIssueId, wakeReason: "heartbeat_timer" },
+      });
+
+      await refreshQueuedRunAgeMetrics(db, now);
+      const { body } = await renderMetrics();
+      expect(body).toContain(`${QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC}{agent_id="${agentId}"} 1800`);
+    });
+
+    it("counts the issue-interaction wake the claim path deliberately exempts", async () => {
+      // `claimQueuedRun` lets an issue-interaction wake carrying a comment id
+      // run on a blocked issue so a human can talk to the assignee while it
+      // waits. That run IS claimable, so excluding it would make this gauge
+      // disagree with the claim path — the exact desynchronization
+      // `isEffectivelyDependencyReadyForDispatch` exists to prevent. An
+      // exclusion written as a bare `isDependencyReady` check fails here.
+      const { companyId, agentId } = await insertCompanyAndAgent();
+      const now = new Date("2026-10-18T12:00:00.000Z");
+      const blockedIssueId = await insertIssue(companyId, { blockedBy: "open" });
+
+      await insertQueuedRun({
+        companyId,
+        agentId,
+        ageSeconds: 900,
+        now,
+        contextSnapshot: {
+          issueId: blockedIssueId,
+          wakeReason: "issue_commented",
+          wakeCommentId: randomUUID(),
+        },
+      });
+
+      await refreshQueuedRunAgeMetrics(db, now);
+      const { body } = await renderMetrics();
+      expect(body).toContain(`${QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC}{agent_id="${agentId}"} 900`);
+    });
+
+    it("does not credit an interaction wake that carries no comment id", async () => {
+      // The exemption is "interaction wake AND a comment id", not the wake
+      // reason alone — a reason-only check would re-open the hole on any run
+      // that merely claims to be an interaction wake.
+      const { companyId, agentId } = await insertCompanyAndAgent();
+      const now = new Date("2026-10-18T12:00:00.000Z");
+      const blockedIssueId = await insertIssue(companyId, { blockedBy: "open" });
+
+      await insertQueuedRun({
+        companyId,
+        agentId,
+        ageSeconds: 3600,
+        now,
+        contextSnapshot: { issueId: blockedIssueId, wakeReason: "issue_commented" },
+      });
+
+      await refreshQueuedRunAgeMetrics(db, now);
+      const { body } = await renderMetrics();
+      expect(body).toContain(`${QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC}{agent_id="${agentId}"} 0`);
+    });
+
+    it("reports the oldest CLAIMABLE run, not the oldest run, when both are queued", async () => {
+      // The shape that actually fired: undispatchable work at the head of the
+      // queue, real work behind it. The unfiltered gauge reports the head's age
+      // and reads as starvation; the claimable gauge reports the real wait.
+      const { companyId, agentId } = await insertCompanyAndAgent();
+      const now = new Date("2026-10-18T12:00:00.000Z");
+      const blockedIssueId = await insertIssue(companyId, { blockedBy: "open" });
+      const readyIssueId = await insertIssue(companyId);
+
+      await insertQueuedRun({
+        companyId,
+        agentId,
+        ageSeconds: 39_240,
+        now,
+        contextSnapshot: { issueId: blockedIssueId, wakeReason: "heartbeat_timer" },
+      });
+      await insertQueuedRun({
+        companyId,
+        agentId,
+        ageSeconds: 120,
+        now,
+        contextSnapshot: { issueId: readyIssueId, wakeReason: "heartbeat_timer" },
+      });
+
+      await refreshQueuedRunAgeMetrics(db, now);
+      const { body } = await renderMetrics();
+      expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${agentId}"} 39240`);
+      expect(body).toContain(`${QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC}{agent_id="${agentId}"} 120`);
+    });
+
+    it("counts a queued run that carries no issue id at all", async () => {
+      // The fail-open direction of this change. A run with no issue has no
+      // dependency blockers that could make it unclaimable, so dropping it
+      // would hide a genuinely stranded run behind a filter never about it.
+      const { companyId, agentId } = await insertCompanyAndAgent();
+      const now = new Date("2026-10-18T12:00:00.000Z");
+
+      await insertQueuedRun({
+        companyId,
+        agentId,
+        ageSeconds: 450,
+        now,
+        contextSnapshot: { wakeReason: "heartbeat_timer" },
+      });
+
+      await refreshQueuedRunAgeMetrics(db, now);
+      const { body } = await renderMetrics();
+      expect(body).toContain(`${QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC}{agent_id="${agentId}"} 450`);
+    });
+
+    it("emits an explicit 0 for an agent with no queued runs at all", async () => {
+      // Absent series and "nothing stuck" render identically on a dashboard —
+      // the failure mode BLO-21092 named for a sibling gauge. An agent whose
+      // entire queue is unclaimable hits the same floor, so the zero has to be
+      // published rather than left out.
+      const { agentId } = await insertCompanyAndAgent();
+      const now = new Date("2026-10-18T12:00:00.000Z");
+
+      await refreshQueuedRunAgeMetrics(db, now);
+      const { body } = await renderMetrics();
+      expect(body).toContain(`${QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC}{agent_id="${agentId}"} 0`);
+    });
+
+    it("keeps each agent's verdict independent when one agent's queue is entirely blocked", async () => {
+      const { companyId, agentId: blockedAgentId } = await insertCompanyAndAgent();
+      const healthyAgentId = randomUUID();
+      await db.insert(agents).values({
+        id: healthyAgentId,
+        companyId,
+        name: "Healthy Agent",
+        role: "engineer",
+        status: "running",
+        adapterType: "claude_k8s",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      const now = new Date("2026-10-18T12:00:00.000Z");
+      const blockedIssueId = await insertIssue(companyId, { blockedBy: "open" });
+      const readyIssueId = await insertIssue(companyId);
+
+      await insertQueuedRun({
+        companyId,
+        agentId: blockedAgentId,
+        ageSeconds: 10_000,
+        now,
+        contextSnapshot: { issueId: blockedIssueId, wakeReason: "heartbeat_timer" },
+      });
+      await insertQueuedRun({
+        companyId,
+        agentId: healthyAgentId,
+        ageSeconds: 300,
+        now,
+        contextSnapshot: { issueId: readyIssueId, wakeReason: "heartbeat_timer" },
+      });
+
+      await refreshQueuedRunAgeMetrics(db, now);
+      const { body } = await renderMetrics();
+      expect(body).toContain(`${QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC}{agent_id="${blockedAgentId}"} 0`);
+      expect(body).toContain(`${QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC}{agent_id="${healthyAgentId}"} 300`);
+    });
+  });
 
   it("ages a fresh queued run off createdAt when queuedAt was never stamped", async () => {
     const { companyId, agentId } = await insertCompanyAndAgent();

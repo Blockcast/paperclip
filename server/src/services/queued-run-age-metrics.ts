@@ -3,6 +3,8 @@ import type { Db } from "@paperclipai/db";
 import { agents, agentWakeupRequests, heartbeatRuns } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 import { CCROTATE_CAPACITY_ADVERTISED_RESUME_AT_KEY } from "./ccrotate-capacity-retry.js";
+import { isEffectivelyDependencyReadyForDispatch } from "./dispatch-readiness.js";
+import { listIssueDependencyReadinessMap } from "./issues.js";
 import {
   setDeferredIssueExecutionWakeAgeMetricsRefreshSuccess,
   setDeferredIssueExecutionWakeOldestAgeMetrics,
@@ -10,9 +12,12 @@ import {
   setOverdueScheduledRetryAgeMetricsRefreshSuccess,
   setQueuedRunAgeMetricsRefreshSuccess,
   setQueuedRunOldestAgeMetrics,
+  setQueuedRunOldestClaimableAgeMetrics,
   setScheduledRetryParkHorizonMetrics,
   setScheduledRetryParkHorizonRefreshSuccess,
 } from "./metrics.js";
+
+const UUID_PATTERN = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 
 /**
  * Refresh the per-agent oldest-`queued`-run-age gauge (BLO-21116). Recomputed
@@ -69,6 +74,7 @@ export async function refreshQueuedRunAgeMetrics(db: Db, now = new Date()): Prom
       }));
 
     setQueuedRunOldestAgeMetrics(entries, knownAgentIds);
+    await refreshClaimableQueuedRunAgeMetrics(db, now, knownAgentIds);
     setQueuedRunAgeMetricsRefreshSuccess(true);
   } catch (error) {
     // Do not replace the last age snapshot with synthetic zeros: that would
@@ -77,6 +83,165 @@ export async function refreshQueuedRunAgeMetrics(db: Db, now = new Date()): Prom
     setQueuedRunAgeMetricsRefreshSuccess(false);
     throw error;
   }
+}
+
+/**
+ * Per-agent cap on how many of an agent's oldest queued runs the claimable
+ * refresh inspects.
+ *
+ * The unfiltered gauge is a `MIN()` aggregate the index answers without
+ * returning rows. The claimable one cannot be: readiness is not a column (see
+ * {@link refreshClaimableQueuedRunAgeMetrics}), so the rows have to come back
+ * and be screened in TypeScript. A window rather than a global `LIMIT` because
+ * a global one is agent-unfair -- one agent with a deep blocked queue would
+ * push every other agent's oldest run out of the result set and silently zero
+ * their series.
+ *
+ * 100 is far above any observed per-agent queued depth (the depth alert fires
+ * in the tens) and is a bound on the pathological case, not the normal one. The
+ * normal case returns a handful of rows per agent.
+ */
+const CLAIMABLE_QUEUED_RUN_WINDOW_PER_AGENT = 100;
+
+/**
+ * Refresh the per-agent oldest-CLAIMABLE-`queued`-run-age gauge
+ * (PEN-4280/PEN-4293).
+ *
+ * Same measurand as {@link refreshQueuedRunAgeMetrics}, with the structurally
+ * unclaimable population removed. A queued run whose issue is not
+ * dependency-ready is deliberately refused the front of the dispatch queue --
+ * `dispatchRank` ranks it below every routine row and will not let it age
+ * forward ("a row that cannot be claimed must not escalate to the front,
+ * however long it has waited", BLO-22091), and `claimQueuedRun`'s
+ * cancel-on-blocked screen fires only on a claim that therefore never arrives.
+ * So it ages without bound while the dispatcher behaves exactly as specified,
+ * and the unfiltered gauge reads that as starvation.
+ *
+ * ## Why this is not a SQL filter
+ *
+ * Readiness is not a column. `listIssueDependencyReadinessMap` reads
+ * `issue_relations` (`type='blocks'`) PLUS the workspace-finalize barrier, and
+ * the claim path exempts an issue-interaction wake carrying a comment id. A
+ * SQL transcription of that would be the fifth site re-deriving a verdict whose
+ * previous four re-derivations (BLO-21792 leaks 2-5, BLO-22091, and this one)
+ * were each a bug. `isEffectivelyDependencyReadyForDispatch` is the single
+ * definition and this reads it rather than restating it -- which is also why
+ * PEN-4280's cheaper-looking option, a join in the onprem-k8s exporter's SQL,
+ * was rejected: it would have put copy five behind a repo boundary where
+ * nothing could catch it drifting.
+ *
+ * ## Both gauges, always, from one refresh
+ *
+ * Called from inside `refreshQueuedRunAgeMetrics` rather than registered as its
+ * own collector tick, so the pair is published atomically on success and the
+ * difference `oldest - oldest_claimable` is always well formed. A separate tick
+ * would let the two drift by a scrape interval and make that difference lie
+ * exactly when the queue is moving. It shares the caller's failure handling for
+ * the same reason: a half-refreshed pair is worse than a stale one, and the
+ * companion freshness gauge already makes a stale pair alert-ineligible.
+ *
+ * A run with no `issueId`, or one whose `issueId` is not a UUID, has no
+ * dependency blockers that could make it unclaimable and is therefore COUNTED.
+ * Dropping it would be the fail-open direction of this change: it would hide a
+ * genuinely stranded issueless run behind a filter that was never about it.
+ */
+type ClaimableQueuedRunWindowRow = {
+  agent_id: string | null;
+  company_id: string;
+  context_issue_id: string | null;
+  context_snapshot: Record<string, unknown> | null;
+  effective_queued_at: Date | string;
+};
+
+async function refreshClaimableQueuedRunAgeMetrics(
+  db: Db,
+  now: Date,
+  knownAgentIds: ReadonlySet<string>,
+): Promise<void> {
+  const windowed = await db.execute<ClaimableQueuedRunWindowRow>(sql`
+    select agent_id, company_id, context_issue_id, context_snapshot, effective_queued_at
+    from (
+      select
+        ${heartbeatRuns.agentId} as agent_id,
+        ${heartbeatRuns.companyId} as company_id,
+        ${heartbeatRuns.contextIssueId} as context_issue_id,
+        ${heartbeatRuns.contextSnapshot} as context_snapshot,
+        coalesce(${heartbeatRuns.queuedAt}, ${heartbeatRuns.createdAt}) as effective_queued_at,
+        row_number() over (
+          partition by ${heartbeatRuns.agentId}
+          order by coalesce(${heartbeatRuns.queuedAt}, ${heartbeatRuns.createdAt}) asc
+        ) as rn
+      from ${heartbeatRuns}
+      where ${heartbeatRuns.status} = 'queued'
+    ) ranked
+    where rn <= ${CLAIMABLE_QUEUED_RUN_WINDOW_PER_AGENT}
+  `);
+
+  // The driver returns either a bare row array or a `QueryResult`-shaped object
+  // depending on which postgres client backs `Db`; accept both rather than
+  // binding this refresh to one of them.
+  const windowRows = (
+    Array.isArray(windowed) ? windowed : (windowed as { rows?: unknown[] }).rows ?? []
+  ) as ClaimableQueuedRunWindowRow[];
+
+  // One readiness batch per company, keyed the same way the dispatcher keys it
+  // (`listQueuedRunDependencyReadiness`): the UUID screen is what keeps a
+  // malformed context snapshot out of an `IN (...)` of issue ids.
+  const issueIdsByCompany = new Map<string, Set<string>>();
+  for (const row of windowRows) {
+    const issueId = row.context_issue_id;
+    if (!issueId || !UUID_PATTERN.test(issueId)) continue;
+    const bucket = issueIdsByCompany.get(row.company_id) ?? new Set<string>();
+    bucket.add(issueId);
+    issueIdsByCompany.set(row.company_id, bucket);
+  }
+
+  const readinessByIssueId = new Map<string, { isDependencyReady: boolean }>();
+  for (const [companyId, issueIds] of issueIdsByCompany) {
+    const batch = await listIssueDependencyReadinessMap(db, companyId, [...issueIds]);
+    for (const [issueId, readiness] of batch) readinessByIssueId.set(issueId, readiness);
+  }
+
+  const oldestClaimableByAgent = new Map<string | null, number>();
+  const windowSizeByAgent = new Map<string | null, number>();
+  for (const row of windowRows) {
+    windowSizeByAgent.set(row.agent_id, (windowSizeByAgent.get(row.agent_id) ?? 0) + 1);
+    const issueId = row.context_issue_id;
+    const readiness =
+      issueId && UUID_PATTERN.test(issueId) ? readinessByIssueId.get(issueId) ?? null : null;
+    if (!isEffectivelyDependencyReadyForDispatch(row.context_snapshot, readiness)) continue;
+    const ageSeconds = Math.max(
+      0,
+      (now.getTime() - new Date(row.effective_queued_at).getTime()) / 1000,
+    );
+    const current = oldestClaimableByAgent.get(row.agent_id);
+    if (current === undefined || ageSeconds > current) {
+      oldestClaimableByAgent.set(row.agent_id, ageSeconds);
+    }
+  }
+
+  // Saturation is the one way this gauge can under-report: if an agent's whole
+  // window is dependency-blocked we publish 0 for it, which is the right answer
+  // only if there is genuinely no claimable run BEHIND the window. Say so in
+  // the log rather than letting a floor pass as a measurement -- the entire
+  // defect being fixed here is a number nobody could tell was wrong.
+  for (const [agentId, windowSize] of windowSizeByAgent) {
+    if (windowSize < CLAIMABLE_QUEUED_RUN_WINDOW_PER_AGENT) continue;
+    if (oldestClaimableByAgent.has(agentId)) continue;
+    logger.warn(
+      {
+        agentId,
+        windowSize,
+        windowLimit: CLAIMABLE_QUEUED_RUN_WINDOW_PER_AGENT,
+      },
+      "claimable queued-run age window saturated with unclaimable runs; published age is a floor",
+    );
+  }
+
+  setQueuedRunOldestClaimableAgeMetrics(
+    [...oldestClaimableByAgent].map(([agentId, ageSeconds]) => ({ agentId, ageSeconds })),
+    knownAgentIds,
+  );
 }
 
 /**
