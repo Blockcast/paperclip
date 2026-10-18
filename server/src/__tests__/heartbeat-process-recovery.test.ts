@@ -670,6 +670,50 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     return { companyId, agentId, runId, wakeupRequestId, issueId };
   }
 
+  // BLO-21525: shape for the zero-row hand-off at the shutdown and orphan
+  // reaper call sites. A retry already exists for the run, so
+  // `enqueueProcessLossRetry` adopts it with `issueLockOwnedByRetry: false`
+  // (the queued retry owns no lock). The run also holds a SIBLING issue lock,
+  // which the retry never takes over. Both locks must be released; the
+  // pre-BLO-20822 `if (!retry)` guard skipped the release and left both
+  // pointing at the terminal run.
+  async function seedAdoptedRetryAndSiblingLock(input: { companyId: string; agentId: string; runId: string }) {
+    const siblingIssueId = randomUUID();
+    const issuePrefix = `T${input.companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(issues).values({
+      id: siblingIssueId,
+      companyId: input.companyId,
+      title: "Sibling issue locked by the same run",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: input.agentId,
+      checkoutRunId: input.runId,
+      executionRunId: input.runId,
+      responsibleUserId: "responsible-user",
+      issueNumber: 2,
+      identifier: `${issuePrefix}-2`,
+    });
+    const run = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, input.runId)).then((rows) => rows[0]!);
+    const retryRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: retryRunId,
+      companyId: input.companyId,
+      agentId: input.agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "queued",
+      retryOfRunId: input.runId,
+      contextSnapshot: { ...(run.contextSnapshot as Record<string, unknown>), wakeReason: "process_lost_retry", retryOfRunId: input.runId },
+    });
+    return { siblingIssueId, retryRunId };
+  }
+
+  async function expectIssueLockReleased(issueId: string) {
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.executionRunId).toBeNull();
+    expect(issue?.checkoutRunId).toBeNull();
+  }
+
   async function seedAdapterInvokeEvent(input: {
     companyId: string;
     agentId: string;
@@ -2282,6 +2326,28 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     // The retry is the SINGLE continuation for this issue: promotion is
     // suppressed, so no second runnable path is created beside it.
     expect(runs).toHaveLength(2);
+  });
+
+  it("releases context and sibling issue locks when the orphan reaper adopts a retry that owns no lock (BLO-21525)", async () => {
+    const { companyId, agentId, runId, issueId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      agentStatus: "idle",
+      processPid: null,
+      processGroupId: null,
+      lastOutputAt: null,
+      contextSnapshot: { wakeReason: "issue_comment_mentioned" },
+    });
+    const { siblingIssueId, retryRunId } = await seedAdoptedRetryAndSiblingLock({ companyId, agentId, runId });
+
+    const result = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+    expect(result.runIds).toContain(runId);
+
+    // Adopted, not duplicated.
+    const retries = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId));
+    expect(retries.map((row) => row.id)).toEqual([retryRunId]);
+
+    await expectIssueLockReleased(issueId);
+    await expectIssueLockReleased(siblingIssueId);
   });
 
   it("leaves a pre-adapter process_lost with no issue id terminal, with no retry (BLO-7913 non-regression)", async () => {
@@ -4768,6 +4834,19 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .then((rows) => rows[0] ?? null);
     expect(issue?.checkoutRunId).toBeNull();
     expect(issue?.executionRunId).toBeNull();
+  });
+
+  it("releases context and sibling issue locks when graceful shutdown adopts a retry that owns no lock (BLO-21525)", async () => {
+    const { companyId, agentId, runId, issueId } = await seedRunFixture({ agentStatus: "running" });
+    const { siblingIssueId, retryRunId } = await seedAdoptedRetryAndSiblingLock({ companyId, agentId, runId });
+    const heartbeat = createHeartbeat();
+
+    const result = await heartbeat.drainRunningRunsForShutdown("SIGTERM", new Date("2026-03-19T00:06:00.000Z"));
+    expect(result.interruptedRunIds).toEqual([runId]);
+    expect(result.retryRunIds).toEqual([retryRunId]);
+
+    await expectIssueLockReleased(issueId);
+    await expectIssueLockReleased(siblingIssueId);
   });
 
   it("suppresses shutdown process-loss recovery when pipeline stage exit already won", async () => {
