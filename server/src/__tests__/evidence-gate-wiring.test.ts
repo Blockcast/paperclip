@@ -14,7 +14,7 @@ const cleanProbe: TruthProbe = async () => ({
   detections: { "review:ally-clean": true, "deploy:landed": true },
   diagnostics: [],
   probeFailed: false,
-  noLinkedPullRequest: false,
+  noLinkedPullRequest: false, reviewerAuthoredPr: false
 });
 
 const FRONTEND_DONE_WHEN = `## Done when\n- a\n- b\n- c\n`;
@@ -392,7 +392,7 @@ describe("runEvidenceGate — truth probe", () => {
       detections: { "review:ally-clean": true, "deploy:landed": true },
       diagnostics: ["probe-ran"],
       probeFailed: false,
-      noLinkedPullRequest: false,
+      noLinkedPullRequest: false, reviewerAuthoredPr: false
     });
     const rec = await runEvidenceGate(async () => checklistIssue(), "i1", NOW, truth);
     expect(rec.verdict).toBe("pass");
@@ -404,7 +404,7 @@ describe("runEvidenceGate — truth probe", () => {
       detections: {},
       diagnostics: ["github-truth-probe-failed:head_sha:Blockcast/paperclip#1"],
       probeFailed: true,
-      noLinkedPullRequest: false,
+      noLinkedPullRequest: false, reviewerAuthoredPr: false
     });
     const rec = await runEvidenceGate(async () => checklistIssue(), "i1", NOW, truth, {
       unlabeledTruthBlock: true,
@@ -419,7 +419,7 @@ describe("runEvidenceGate — truth probe", () => {
       detections: {},
       diagnostics: [],
       probeFailed: false,
-      noLinkedPullRequest: false,
+      noLinkedPullRequest: false, reviewerAuthoredPr: false
     });
     const rec = await runEvidenceGate(async () => checklistIssue(), "i1", NOW, truth, {
       unlabeledTruthBlock: true,
@@ -445,7 +445,7 @@ describe("runEvidenceGate — truth probe", () => {
       detections: {},
       diagnostics: ["no-linked-pull-request"],
       probeFailed: false,
-      noLinkedPullRequest: true,
+      noLinkedPullRequest: true, reviewerAuthoredPr: false
     });
     const rec = await runEvidenceGate(async () => checklistIssue(), "i1", NOW, truth, {
       unlabeledTruthBlock: true,
@@ -471,7 +471,7 @@ describe("runEvidenceGate — truth probe", () => {
     const seen: unknown[] = [];
     const truth: TruthProbe = async ({ workProducts }) => {
       seen.push(...workProducts);
-      return { detections: {}, diagnostics: [], probeFailed: false, noLinkedPullRequest: false };
+      return { detections: {}, diagnostics: [], probeFailed: false, noLinkedPullRequest: false, reviewerAuthoredPr: false };
     };
     await runEvidenceGate(
       async () => ({
@@ -502,7 +502,7 @@ describe("runEvidenceGate — truth probe", () => {
     let calls = 0;
     const truth: TruthProbe = async () => {
       calls += 1;
-      return { detections: {}, diagnostics: [], probeFailed: false, noLinkedPullRequest: false };
+      return { detections: {}, diagnostics: [], probeFailed: false, noLinkedPullRequest: false, reviewerAuthoredPr: false };
     };
     const rec = await runEvidenceGate(
       async () => ({

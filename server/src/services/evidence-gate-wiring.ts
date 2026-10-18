@@ -140,6 +140,7 @@ export async function runEvidenceGate(
   let externalDetections: Partial<Record<EvidenceShape, boolean>> | undefined;
   let probeFailed = false;
   let noLinkedPullRequest = false;
+  let reviewerAuthoredPr = false;
   const truthDiagnostics: string[] = [];
   if (truth) {
     const probed = await truth({
@@ -152,6 +153,7 @@ export async function runEvidenceGate(
     externalDetections = probed.detections;
     probeFailed = probed.probeFailed;
     noLinkedPullRequest = probed.noLinkedPullRequest;
+    reviewerAuthoredPr = probed.reviewerAuthoredPr;
     truthDiagnostics.push(...probed.diagnostics);
   }
   const evaluation = evaluateEvidence({
@@ -170,6 +172,7 @@ export async function runEvidenceGate(
     externalDetections,
     probeFailed,
     noLinkedPullRequest,
+    reviewerAuthoredPr,
     unlabeledTruthBlock: options?.unlabeledTruthBlock,
   });
   return {

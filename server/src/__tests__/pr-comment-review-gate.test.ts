@@ -1606,6 +1606,65 @@ describe("evaluateCommentReviewGate — self-attestation", () => {
     ).toMatchObject({ state: "success", outcome: "clean" });
   });
 
+  it("marks the self-attested withheld positive authorIsReviewer, and the authorUnknown sibling NOT (PEN-4265)", () => {
+    // The two withheld positives are indistinguishable on `state`, `outcome`
+    // and `headAttested`, and they mean different things: one is "the author
+    // IS the reviewer" — a property of the estate that no agent behaviour can
+    // move — and the other is "we could not read the author", which is a
+    // failed read. The evidence probe suppresses an evidence-gate escalation
+    // on the first and must never do so on the second, so the discriminator
+    // has to be carried, not inferred from the pair.
+    const comments = [allyComment(cleanReview(CURRENT_HEAD), "2026-08-04T21:09:19Z")];
+    const selfAttested = evaluateCommentReviewGate({
+      prAuthorLane: null,
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: ALLY_BOT_LOGIN,
+      comments,
+    });
+    const authorUnknown = evaluateCommentReviewGate({
+      prAuthorLane: null,
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: null,
+      comments,
+    });
+
+    expect(selfAttested).toMatchObject({
+      state: "success",
+      outcome: "not_evaluated",
+      headAttested: true,
+      authorIsReviewer: true,
+    });
+    // Conditionally spread, like `authorUnknown`: absence is the contract, so
+    // assert absence rather than `toBeUndefined`, which also passes on a
+    // present-but-undefined property.
+    expect(selfAttested).not.toHaveProperty("authorUnknown");
+    expect(authorUnknown).toMatchObject({
+      state: "success",
+      outcome: "not_evaluated",
+      headAttested: true,
+      authorUnknown: true,
+    });
+    expect(authorUnknown).not.toHaveProperty("authorIsReviewer");
+
+    // The control that makes the marker mean "the author is the reviewer"
+    // rather than "a positive was withheld": a DISTINCT author on the same
+    // comments reaches `clean` and carries no marker at all.
+    const independent = evaluateCommentReviewGate({
+      prAuthorLane: null,
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: DISTINCT_PR_AUTHOR,
+      comments,
+    });
+    expect(independent).toMatchObject({ state: "success", outcome: "clean" });
+    expect(independent).not.toHaveProperty("authorIsReviewer");
+
+    // The merge-facing surfaces must be unmoved by the new marker: it is
+    // evidence-plane only, and nothing deciding a merge may read it.
+    expect(commentReviewGateCheckConclusion(selfAttested)).toBe(
+      commentReviewGateCheckConclusion(authorUnknown),
+    );
+  });
+
   it("keeps authorUnknown on the withheld positive when nothing carries", () => {
     // The caller keys its one PR-author fetch on this flag, so falling through
     // to the carried check must not drop it on the way past.

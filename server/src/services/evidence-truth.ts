@@ -72,6 +72,25 @@ export interface TruthProbeResult {
    * issue where nothing failed.
    */
   noLinkedPullRequest: boolean;
+  /**
+   * True when the linked set's failure to produce `review:ally-clean` is
+   * attributable ENTIRELY to the reviewer identity authoring the PR — the
+   * App-authored population (PEN-4265).
+   *
+   * A FOURTH state, and distinct from both of the above for the same reason
+   * they are distinct from each other: the probe worked, there IS a linked PR,
+   * a comment DOES attest its head and reports nothing blocking, and the only
+   * thing unestablished is the attestation's independence from the author.
+   * Every agent-opened PR in this estate is authored by the shared GitHub App
+   * and Ally reviews as that same App, so no agent behaviour can move it.
+   *
+   * Kept off `probeFailed` and `noLinkedPullRequest` deliberately — each of
+   * the three writes a different `unlabeled-truth-block-suppressed:<reason>`
+   * into an operator-visible verdict, and the rollout runbook's seven-day
+   * measurement reads them apart. Folding this one into either would report a
+   * GitHub outage, or a PR-less issue, on an issue that is neither.
+   */
+  reviewerAuthoredPr: boolean;
 }
 
 export type TruthProbe = (input: TruthProbeInput) => Promise<TruthProbeResult>;
@@ -175,6 +194,14 @@ interface PerPr {
   merged: boolean;
   clean: boolean;
   failed: boolean;
+  /**
+   * This PR's at-head attestation exists and reports nothing blocking, and the
+   * ONLY reason it is not `clean` is that its author shares the reviewer's
+   * identity. Read off the typed `authorIsReviewer` marker on the comment
+   * verdict, never inferred from `clean === false` — "not clean" has several
+   * causes and only this one is unreachable by the assignee.
+   */
+  authorIsReviewer: boolean;
   diagnostics: string[];
 }
 
@@ -185,7 +212,13 @@ async function probeOne(
   probeSignal: AbortSignal,
 ): Promise<PerPr> {
   const tag = `${ref.repoFullName}#${ref.prNumber}`;
-  const out: PerPr = { merged: false, clean: false, failed: false, diagnostics: [] };
+  const out: PerPr = {
+    merged: false,
+    clean: false,
+    failed: false,
+    authorIsReviewer: false,
+    diagnostics: [],
+  };
   const call = { repoFullName: ref.repoFullName, prNumber: ref.prNumber };
   // Two independent cancels: this call's own budget, and the whole-probe
   // deadline. Either one ends the read.
@@ -365,6 +398,18 @@ async function probeOne(
       // this surface cannot vouch; `readPrAuthor` has already set `failed`.
     }
     const commentClean = commentVerdict.state === "success" && commentVerdict.outcome === "clean";
+    // The App-authored population (PEN-4265). Read off the verdict's typed
+    // marker, which only the `githubSharesReviewerIdentity` branch sets, so
+    // this cannot be confused with the `authorUnknown` sibling that shares its
+    // `state`/`outcome`/`headAttested` — that one is a failed read and already
+    // sets `out.failed` via `readPrAuthor`.
+    //
+    // Recorded even when `commentClean` is true (it cannot be — the two
+    // branches are exclusive) and regardless of `formalClean`, because the
+    // aggregator below consumes it only in conjunction with `!clean`. Keeping
+    // it a pure statement about THIS surface rather than a pre-combined
+    // verdict is what lets that conjunction stay readable.
+    out.authorIsReviewer = "authorIsReviewer" in commentVerdict && commentVerdict.authorIsReviewer === true;
     // `blocking_finding` and `carried_finding` — the two outcomes that make the
     // merge-visible gate red. `not_evaluated` is silence, not a verdict.
     const commentBlocking = commentVerdict.state === "failure";
@@ -725,6 +770,7 @@ export function buildGithubTruthProbe(
         diagnostics: ["no-linked-pull-request"],
         probeFailed: false,
         noLinkedPullRequest: true,
+        reviewerAuthoredPr: false,
       };
 
     const diagnostics: string[] = [];
@@ -768,6 +814,7 @@ export function buildGithubTruthProbe(
         diagnostics: [...diagnostics, "truth-probe-deadline"],
         probeFailed: true,
         noLinkedPullRequest: false,
+        reviewerAuthoredPr: false,
       };
     }
 
@@ -789,6 +836,22 @@ export function buildGithubTruthProbe(
       if (result.every((r) => r.merged)) detections["deploy:landed"] = true;
       if (result.every((r) => r.clean)) detections["review:ally-clean"] = true;
     }
-    return { detections, diagnostics, probeFailed, noLinkedPullRequest: false };
+    // The shape is absent for the identity reason ONLY IF that is the reason
+    // for the WHOLE linked set. `every` here mirrors the `every` that decides
+    // `clean` just above, and for the same reason: one PR with a real gap --
+    // a blocking finding, or no attestation at all -- is actionable by the
+    // assignee, so the set is not the unreachable population and must not be
+    // suppressed. `some` is what makes it a positive claim rather than one
+    // vacuously true of a set that is simply clean.
+    //
+    // Withheld on a capped read, exactly as the detections above are: a PR we
+    // never read could be the one carrying the real gap, so the top 5 being
+    // identity-blocked says nothing about the set.
+    const reviewerAuthoredPr =
+      !capped &&
+      detections["review:ally-clean"] !== true &&
+      result.every((r) => r.clean || r.authorIsReviewer) &&
+      result.some((r) => r.authorIsReviewer);
+    return { detections, diagnostics, probeFailed, noLinkedPullRequest: false, reviewerAuthoredPr };
   };
 }
