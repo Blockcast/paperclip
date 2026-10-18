@@ -773,15 +773,33 @@ describe("embedded guard: lock re-assertion before outward side effects (BLO-299
   const ME = "run-mine";
   const LOCK_VARS = ["PAPERCLIP_TASK_ID", "PAPERCLIP_RUN_ID", "PAPERCLIP_API_URL", "PAPERCLIP_API_KEY"];
 
+  /**
+   * PEN-4315: the guard now asks two questions, so the fake API serves two
+   * paths. `GET /api/issues/task-1` is the wake row; `GET /api/agents/me/inbox-lite`
+   * is "does this run hold any execution lock". The inbox reply defaults to the
+   * empty inbox, which is the pre-PEN-4315 world: entitlement unproven, so the
+   * wake-row answer decides, exactly as it did before.
+   */
   async function withApi(
     reply: { status: number; body?: unknown },
-    fn: (vars: Record<string, string>, hits: () => number) => Promise<void>,
+    fn: (vars: Record<string, string>, hits: () => number, inboxHits: () => number) => Promise<void>,
+    inboxReply: { status: number; body?: unknown } = { status: 200, body: { rows: [] } },
   ) {
     let count = 0;
+    let inboxCount = 0;
     const server = createServer((req, res) => {
+      expect(req.headers.authorization).toBe("Bearer k");
+      if (req.url === "/api/agents/me/inbox-lite") {
+        inboxCount += 1;
+        // The run id must travel with the probe: inbox-lite needs it to tell
+        // the caller's own held rows from a foreign run's.
+        expect(req.headers["x-paperclip-run-id"]).toBe(ME);
+        res.writeHead(inboxReply.status, { "content-type": "application/json" });
+        res.end(JSON.stringify(inboxReply.body ?? {}));
+        return;
+      }
       count += 1;
       expect(req.url).toBe("/api/issues/task-1");
-      expect(req.headers.authorization).toBe("Bearer k");
       res.writeHead(reply.status, { "content-type": "application/json" });
       res.end(JSON.stringify(reply.body ?? {}));
     });
@@ -796,6 +814,7 @@ describe("embedded guard: lock re-assertion before outward side effects (BLO-299
           PAPERCLIP_API_KEY: "k",
         },
         () => count,
+        () => inboxCount,
       );
     } finally {
       server.close();
@@ -855,15 +874,86 @@ describe("embedded guard: lock re-assertion before outward side effects (BLO-299
         expect(status).toBe(2);
         expect(stderr).toContain("BLO-29965");
         expect(stderr).toContain("run-other");
-        expect(stderr).toContain("/api/issues/task-1/checkout");
+        expect(stderr).toContain("holds no issue execution lock");
       });
     });
   }
 
   it("allows the push when THIS run holds the lock", async () => {
-    await withApi({ status: 200, body: { executionRunId: ME } }, async (vars, hits) => {
+    await withApi({ status: 200, body: { executionRunId: ME } }, async (vars, hits, inboxHits) => {
       expect((await run("git push", vars)).status).toBe(0);
       expect(hits()).toBe(1);
+      // The entitlement probe is on the blocking path only: the wake row
+      // already answered, so the common case still costs one request.
+      expect(inboxHits()).toBe(0);
+    });
+  });
+
+  /**
+   * PEN-4315 mode (1), the measured regression this change exists to remove.
+   * Woken by a mention on row A, the run picks row B off its inbox, holds B's
+   * execution lock, and pushes B's work. The old predicate read A, saw a
+   * foreign holder and refused — five times in one day, once costing a
+   * reviewed 826-line commit a whole run of publish latency.
+   */
+  it("allows the push when the WAKE row is foreign but this run holds another issue's lock", async () => {
+    await withApi(
+      foreign,
+      async (vars, hits, inboxHits) => {
+        expect((await run("git push", vars)).status).toBe(0);
+        expect(hits()).toBe(1);
+        expect(inboxHits()).toBe(1);
+      },
+      { status: 200, body: { rows: [{ id: "task-2", identifier: "BLO-2", activeRun: { id: ME } }] } },
+    );
+  });
+
+  it("still blocks when the inbox shows only OTHER runs holding rows", async () => {
+    await withApi(
+      foreign,
+      async (vars) => {
+        expect((await run("git push", vars)).status).toBe(2);
+      },
+      { status: 200, body: { rows: [{ id: "task-2", identifier: "BLO-2", activeRun: { id: "run-other" } }, { id: "task-3", activeRun: null }] } },
+    );
+  });
+
+  it("accepts a bare-array inbox body as well as { rows }", async () => {
+    await withApi(
+      foreign,
+      async (vars) => {
+        expect((await run("git push", vars)).status).toBe(0);
+      },
+      { status: 200, body: [{ id: "task-2", activeRun: { id: ME } }] },
+    );
+  });
+
+  /**
+   * The probe cannot invent an entitlement. When it errors the guard must fall
+   * back to the pre-PEN-4315 answer — block — rather than treating an
+   * unreachable inbox as proof the run holds a lock.
+   */
+  it("still blocks when the entitlement probe errors", async () => {
+    await withApi(foreign, async (vars) => {
+      expect((await run("git push", vars)).status).toBe(2);
+    }, { status: 500 });
+  });
+
+  /**
+   * PEN-4315: the old message asserted the command pushes “for” the wake row —
+   * which the guard cannot know — and prescribed re-asserting that row's lock,
+   * i.e. taking an unrelated row's lock to satisfy a check about a different
+   * issue. Three of five reports were first misfiled as a wedged lock because
+   * of that sentence.
+   */
+  it("block message neither claims the push is for the wake row nor prescribes taking its lock", async () => {
+    await withApi(foreign, async (vars) => {
+      const { stderr } = await run("git push", vars);
+      expect(stderr).not.toContain("/api/issues/task-1/checkout");
+      expect(stderr).not.toMatch(/moves a PR or ref, for BLO-1/);
+      expect(stderr).not.toMatch(/Re-assert the lock first/);
+      expect(stderr).toContain("not something this guard can see");
+      expect(stderr).toContain("Do NOT check out BLO-1");
     });
   });
 
@@ -928,11 +1018,20 @@ describe("embedded guard: lock re-assertion before outward side effects (BLO-299
     });
   });
 
+  /**
+   * PEN-4315 mode (2), pinned as a DELIBERATE hole rather than left to be
+   * rediscovered: a run with no task id — every timer wake, and every PR-review
+   * run — pushes ungated and pays no request at all. It stays open because the
+   * same population contains review runs that legitimately write `pulls`, which
+   * this hook also gates; failing closed here would wedge every review. A clean
+   * push under this branch is therefore not evidence of entitlement.
+   */
   it("is out of scope (allows, no API call) when the run has no task id", async () => {
-    await withApi(foreign, async (vars, hits) => {
+    await withApi(foreign, async (vars, hits, inboxHits) => {
       const { PAPERCLIP_TASK_ID: _omit, ...rest } = vars;
       expect((await run("git push", rest)).status).toBe(0);
       expect(hits()).toBe(0);
+      expect(inboxHits()).toBe(0);
     });
   });
 });

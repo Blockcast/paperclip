@@ -1331,7 +1331,36 @@ function isFullEnvDump(command) {
 // side effect. Only matching commands pay the network call. Every unknown
 // fails OPEN: no task id (PR-review runs carry none), no credentials, an
 // unreachable API, or a lock nobody holds all allow — this blocks only when
-// the server positively names a DIFFERENT run as the issue's lock holder.
+// the server positively names a DIFFERENT run as the lock holder AND this run
+// holds no execution lock of its own.
+//
+// PEN-4315. The question this gate has to answer is "is this run entitled to
+// make an outward side effect", and the first version asked a different one.
+// It read PAPERCLIP_TASK_ID — the issue that WOKE the run — and never the issue
+// the push is for; those coincide only by coincidence. Measured cost: five
+// refused runs in one day (PEN-2111 cmt 2d364f3f), including PEN-4286's
+// reviewed 826-line commit left unpublishable for a whole run. Woken by a
+// mention on row A, a run picks row B off its inbox exactly as inbox selection
+// tells it to, legitimately holds B's lock, and is refused because another run
+// holds A. The refusal then told it to re-assert A's lock — taking an unrelated
+// row's lock to satisfy a check about a different issue is precisely the
+// laundering this guard exists to prevent, so the remedy was worse than the
+// block.
+//
+// The subject is now the RUN, not the wake row: a run holding the execution
+// lock on ANY issue has checked work out and may publish it.
+// 'GET /agents/me/inbox-lite' answers that from 'activeRun.id', which is
+// hydrated from 'issues.executionRunId' — the lock column itself, not a proxy
+// for it. It is consulted only on the path that would otherwise block, so the
+// common case still costs exactly one request. A row the run does hold but
+// which inbox-lite omits (status outside its filter, or past the first page)
+// reads as "holds nothing" and falls back to the wake-row answer — i.e. to the
+// pre-PEN-4315 behaviour. The fallback is never weaker than what it replaces.
+//
+// Residual, named rather than carried silently: a run holding SOME lock is
+// allowed to push for an issue it does not hold. Separating those needs the
+// push TARGET, which this hook cannot see — a branch name is a convention, not
+// a fact — so it is left open deliberately and is not closed by this change.
 //
 // BLO-46113. Matched on LEXED words, not command text: echo "git push later"
 // and a commit message that mentions a push are data, and the old text regex
@@ -1395,12 +1424,41 @@ function isOutward(command, depth) {
 // BLO-46113: the GitHub MCP write tools reach the same side effects without
 // Bash. Keep in lockstep with GUARD_HOOK_MATCHER, which routes them here.
 const MCP_GITHUB_WRITE_RE = /^mcp__github__(?:create_pull_request|merge_pull_request|push_files|create_or_update_file|delete_file|create_branch|update_pull_request_branch)$/;
+// PEN-4315: does THIS run hold the execution lock on any issue? 'activeRun' is
+// hydrated from 'issues.executionRunId', so 'activeRun.id === run' IS the lock
+// rather than a stand-in for it. Every uncertainty — error status, timeout,
+// body in an unexpected shape — answers false, which leaves the caller on its
+// pre-PEN-4315 path instead of inventing an entitlement.
+async function holdsAnyExecutionLock(base, key, run) {
+  try {
+    const res = await fetch(base + "/api/agents/me/inbox-lite", {
+      headers: { authorization: "Bearer " + key, "x-paperclip-run-id": run },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) return false;
+    const body = await res.json();
+    const rows = Array.isArray(body) ? body : body && Array.isArray(body.rows) ? body.rows : [];
+    return rows.some((row) => row && row.activeRun && row.activeRun.id === run);
+  } catch (_e) {
+    return false;
+  }
+}
 async function foreignLockHolder() {
   const env = process.env;
   const task = env.PAPERCLIP_TASK_ID, run = env.PAPERCLIP_RUN_ID;
   const api = env.PAPERCLIP_API_URL, key = env.PAPERCLIP_API_KEY;
-  if (!task || !run || !api || !key) return null;
-  const res = await fetch(api.replace(/\/+$/, "") + "/api/issues/" + encodeURIComponent(task), {
+  if (!run || !api || !key) return null;
+  // PEN-4315 mode (2) — KNOWINGLY OPEN, and this line is the justification the
+  // row asked for. With no wake row there is nothing to name as a conflict, so
+  // a timer-woken run pushes ungated. Failing closed here is not available:
+  // the no-task-id population is not only timer wakes — PR-review runs carry no
+  // task id either and legitimately write 'pulls' ('gh api ... -f'), which this
+  // hook also gates, so blocking would wedge every review. Telling the two
+  // apart needs a signal the hook does not have. Until it exists, a clean push
+  // is NOT evidence the run was entitled to it.
+  if (!task) return null;
+  const base = api.replace(/\/+$/, "");
+  const res = await fetch(base + "/api/issues/" + encodeURIComponent(task), {
     headers: { authorization: "Bearer " + key },
     signal: AbortSignal.timeout(10000),
   });
@@ -1408,6 +1466,10 @@ async function foreignLockHolder() {
   const issue = await res.json();
   const holder = issue && issue.executionRunId;
   if (!holder || holder === run) return null;
+  // PEN-4315: a foreign holder on the WAKE row says nothing about what this
+  // command pushes for. Entitlement is a property of the run, so ask that
+  // before refusing — only a run holding no lock at all is unentitled.
+  if (await holdsAnyExecutionLock(base, key, run)) return null;
   return { holder, run, issue: issue.identifier || task, id: issue.id || task };
 }
 let raw = "";
@@ -1438,13 +1500,18 @@ process.stdin.on("end", async () => {
     const foreign = outward ? await foreignLockHolder() : null;
     if (foreign) {
       process.stderr.write(
-        "Blocked by Paperclip lock guard (BLO-29965): this command pushes to a git " +
-          "remote, or opens, merges or moves a PR or ref, for " + foreign.issue + ", but that issue's execution " +
-          "lock is held by run " + foreign.holder + ", not this run (" + foreign.run +
-          "). Another run may be working the same issue. Re-assert the lock first " +
-          "(paperclipCheckoutIssue, or POST /api/issues/" + foreign.id + "/checkout " +
-          "with your agentId). If checkout returns 409, STOP: a live run owns this " +
-          "issue and your push would duplicate or collide with its work.\n",
+        "Blocked by Paperclip lock guard (BLO-29965/PEN-4315): this run (" + foreign.run +
+          ") holds no issue execution lock, so it is not entitled to push to a git " +
+          "remote, or to open, merge or move a PR or ref. What this command pushes " +
+          "FOR is not something this guard can see, and it is not claiming to know: " +
+          "the unentitled run is the finding. (Detected via the issue that woke the " +
+          "run, " + foreign.issue + ", whose lock is held by run " + foreign.holder +
+          ".) Check out the issue this change IS for — paperclipCheckoutIssue — then " +
+          "run the command again. Do NOT check out " + foreign.issue + " to clear this " +
+          "message unless that is the issue you are pushing for: taking an unrelated " +
+          "row's lock is the collision this guard exists to prevent. If the checkout " +
+          "you do need returns 409, STOP — a live run owns that issue and your push " +
+          "would duplicate or collide with its work.\n",
       );
       process.exit(2);
     }
