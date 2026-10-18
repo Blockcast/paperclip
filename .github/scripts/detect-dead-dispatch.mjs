@@ -141,13 +141,6 @@ export const COMPLETED_SCAN_LIMIT = 20;
 export const DEPLOY_JOB_NAME = 'deploy';
 
 /**
- * Did this job list show `deploy` actually executing?
- *
- * `skipped` and absent both mean "did not execute". `cancelled` is NOT folded in
- * here: it means the job existed and was stopped, which is what a supersede
- * looks like, and the caller excludes those by run conclusion anyway.
- */
-/**
  * The `deploy` job conclusions that prove the lane was actually REFILLED.
  *
  * Strictly narrower than `deployJobExecuted` below, and the two must not be
@@ -175,6 +168,17 @@ export function deployJobCompleted(jobs) {
   return DEPLOY_EXECUTED_CONCLUSIONS.has(deploy?.conclusion);
 }
 
+/**
+ * Did this job list show `deploy` actually executing?
+ *
+ * `skipped` and absent both mean "did not execute". `cancelled` is NOT folded in
+ * here: it means the job existed and was stopped, which is what a supersede
+ * looks like, and the caller excludes those by run conclusion anyway.
+ *
+ * ⚠️ This is the DETECTOR's generous predicate, not proof of a refill. Use
+ * `deployJobCompleted` above for anything that needs proof — see
+ * DEPLOY_EXECUTED_CONCLUSIONS for why the two must not be conflated.
+ */
 export function deployJobExecuted(jobs) {
   const deploy = (jobs ?? []).find((job) => job?.name === DEPLOY_JOB_NAME);
   if (!deploy) return false;
