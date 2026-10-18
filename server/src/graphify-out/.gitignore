@@ -1,8 +1,34 @@
-# graphify: commit graph.json/GRAPH_REPORT.md/.graphify_labels.json;
-# ignore the local interpreter pins, the HTML viz, cost accounting, and caches.
+# graphify: commit graph.json + GRAPH_REPORT.md. .graphify_labels.json is
+# committed only while it is already TRACKED here. Tracked-ness is the only
+# durable signal this job has, and what it records is a deliberate decision to
+# KEEP a labels file -- not that any name inside it was written by a human. A
+# tracked file whose entries are all `Community N` placeholders, or all
+# graphify auto-names, carries nothing to preserve, and the reindex job
+# correctly lets the rebuild's machine names stand: carry-graphify-labels.py
+# re-keys only an entry that is neither the placeholder nor one of that
+# community's own member labels (BLO-40331, BLO-41817). An untracked copy is
+# machine-generated and stays out of the index, so the first commit of this
+# file is always a deliberate act.
+# This file is the INPUT of record for community names; it is NOT the only
+# committed copy of them. The same names are DERIVED into two other tracked
+# places on every rebuild -- `community_name` on every graph.json node, and
+# GRAPH_REPORT.md's `### Community N` headings -- and the reindex job rewrites
+# all three together. So hand-edit this file and those two read stale until the
+# next weekly rebuild re-keys them; hand-edit those two and the next rebuild
+# overwrites them. Rename here, and only here.
+# .graphify_labels.json.sig is graphify's membership-signature sidecar for that
+# file (cli.py writes community_member_sigs() beside every labels persist). It
+# is derived, rewritten on every rebuild, and its only consumer is graphify's
+# own reuse path -- which DROPS a label whose community changed rather than
+# re-keying it, so committing it would not preserve curated names. Ignore it.
+# manifest.json is graphify's incremental-rebuild cache: this job rebuilds with
+# --force from a fresh clone every run, so it is never read and a committed copy
+# can only ever describe an older graph (NOP#1079).
 cost.json
 .graphify_python
 .graphify_root
 graph.html
+.graphify_labels.json.sig
 cache/
 memory/
+manifest.json
