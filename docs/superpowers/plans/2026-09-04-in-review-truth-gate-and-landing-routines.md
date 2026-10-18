@@ -716,7 +716,14 @@ if ! pending="$(gh api "repos/Blockcast/paperclip/actions/runs/$drun/pending_dep
 elif [ "$pending" -eq 0 ]; then
   echo "NOT PARKED: pending_deployments is empty, so there is nothing to approve or hand on. This is the EXPECTED path on the current shape -- skip to Step 5."
 else
-  can="$(gh api "repos/Blockcast/paperclip/actions/runs/$drun/pending_deployments" --jq '.[0].current_user_can_approve')"
+  # Same rule as the probe above: a transient failure here would leave $can
+  # holding error JSON, which is not "true", and the script would print the
+  # hand-off line -- asking a reviewer to approve a run it could not read.
+  # Nothing gets approved either way, but it is still a false instruction.
+  if ! can="$(gh api "repos/Blockcast/paperclip/actions/runs/$drun/pending_deployments" --jq '.[0].current_user_can_approve')" \
+     || ! [[ "$can" =~ ^(true|false)$ ]]; then
+    can=unreadable
+  fi
   # Read the ratified set from the symbol, at the moment you run this. Do NOT
   # restate its contents here: a count in prose is the second source of truth
   # whose drift Step 3 and scheduled-production-deploy.yml's header both record.
@@ -728,6 +735,8 @@ else
     echo "STOP: the symbol did not parse (moved, renamed, or now spanning lines). Read the guard file by hand before approving anything."
   elif [ "$ratified" = "[]" ]; then
     echo "DRIFT, not a routing problem: this run parked on a reviewer nobody ratified. Do NOT approve and do NOT hand it on. Read the production-environment-protection-guard run and the guard file's header record, then raise the discrepancy."
+  elif [ "$can" = "unreadable" ]; then
+    echo "STOP: could not read current_user_can_approve (see the gh error above). The run IS parked, so do not treat this as a hand-off; re-read it before approving or routing."
   elif [ "$can" = "true" ]; then
     gh api -X POST "repos/Blockcast/paperclip/actions/runs/$drun/pending_deployments" \
       -F "environment_ids[]=$envid" -f state=approved \
@@ -737,7 +746,7 @@ else
   fi
 fi
 ```
-Run: the commands above  Expected: **on the current shape, `NOT PARKED` — and you go straight on to Step 5.** That is the healthy path, not a finding: Step 3 establishes that an empty ratified set means the deploy never parks, so this whole step is a no-op and the script now says so itself rather than leaving it to the heading. A failed read of `pending_deployments` prints STOP instead, because unreadable is not the same as not parked — the test is on `gh`'s exit status and on the value being an integer, not on it being non-empty, since `gh api` prints its error JSON to *stdout* and a non-empty test would wave a 404 straight through to the parked branch. If it DID park on an EMPTY ratified set, expect the DRIFT line and **Step 5 does not run** — reaching that means the environment holds a `required_reviewers` rule nobody ratified, which is a finding about the environment, not a reviewer to route around: `evaluateEnvironmentProtection` gates its `required_reviewers_rule` branch on `expected.length > 0`, so on an empty set that branch is unreachable and every reviewer present falls through to the membership comparison as `required_reviewers_membership: unexpected [...] (ratified set is [])`. There is no ratified reviewer to hand the run to, and approving would clear the deploy while leaving the drift in place — so investigate against the guard instead, which is the same reconciliation Step 3 asks for before concluding a run is stuck. With a NON-empty set the original path is correct and re-arms unchanged: `can=true` gives JSON containing `"state":"approved"`, otherwise the printed hand-off line, which is pasted to that reviewer and the log. Do not dispatch a second run while this one waits (guard (1) in the scheduled workflow skips it anyway).
+Run: the commands above  Expected: **on the current shape, `NOT PARKED` — and you go straight on to Step 5.** That is the healthy path, not a finding: Step 3 establishes that an empty ratified set means the deploy never parks, so this whole step is a no-op and the script now says so itself rather than leaving it to the heading. A failed read of `pending_deployments` prints STOP instead, because unreadable is not the same as not parked — the test is on `gh`'s exit status and on the value being an integer, not on it being non-empty, since `gh api` prints its error JSON to *stdout* and a non-empty test would wave a 404 straight through to the parked branch. If it DID park on an EMPTY ratified set, expect the DRIFT line and **Step 5 does not run** — reaching that means the environment holds a `required_reviewers` rule nobody ratified, which is a finding about the environment, not a reviewer to route around: `evaluateEnvironmentProtection` gates its `required_reviewers_rule` branch on `expected.length > 0`, so on an empty set that branch is unreachable and every reviewer present falls through to the membership comparison as `required_reviewers_membership: unexpected [...] (ratified set is [])`. There is no ratified reviewer to hand the run to, and approving would clear the deploy while leaving the drift in place — so investigate against the guard instead, which is the same reconciliation Step 3 asks for before concluding a run is stuck. With a NON-empty set the original path is correct and re-arms unchanged: `can=true` gives JSON containing `"state":"approved"`; an unreadable `can` is its own STOP rather than a hand-off, for the same reason the probe above distinguishes them; otherwise the printed hand-off line, which is pasted to that reviewer and the log. Do not dispatch a second run while this one waits (guard (1) in the scheduled workflow skips it anyway).
 
 - [ ] **Step 5: Wait for the deploy job and capture the convergence line**
 ```bash
