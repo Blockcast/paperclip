@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 
+import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { CloudUpstreamRun, CloudUpstreamsState } from "@paperclipai/shared";
@@ -65,12 +66,6 @@ vi.mock("@/lib/router", () => ({
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
-async function act(callback: () => void | Promise<void>) {
-  await callback();
-  await Promise.resolve();
-  await new Promise((resolve) => window.setTimeout(resolve, 0));
-}
-
 describe("CloudUpstream", () => {
   let container: HTMLDivElement;
 
@@ -118,7 +113,7 @@ describe("CloudUpstream", () => {
         </QueryClientProvider>,
       );
     });
-    await flushReact(2);
+    await flushReact(3);
     await flushReact(2);
 
     expect(container.textContent).toContain("Re-run");
@@ -136,7 +131,7 @@ describe("CloudUpstream", () => {
     await act(async () => {
       activateButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flushReact(2);
+    await flushReact(3);
 
     expect(mockCloudUpstreamsApi.activateEntities).toHaveBeenCalledWith(
       "connection-1",
@@ -147,6 +142,7 @@ describe("CloudUpstream", () => {
     await act(async () => {
       root.unmount();
     });
+    await flushReact();
   });
 
   it("sends a company-prefixed redirectUri when starting Connect", async () => {
@@ -165,7 +161,7 @@ describe("CloudUpstream", () => {
         </QueryClientProvider>,
       );
     });
-    await flushReact(2);
+    await flushReact(3);
     await flushReact(2);
 
     const input = container.querySelector<HTMLInputElement>("input[aria-label='Paperclip Cloud stack URL']");
@@ -175,7 +171,7 @@ describe("CloudUpstream", () => {
       setter.call(input!, "https://cloud.example/PAP/dashboard");
       input!.dispatchEvent(new Event("input", { bubbles: true }));
     });
-    await flushReact(2);
+    await flushReact(3);
 
     const connectButton = Array.from(container.querySelectorAll("button"))
       .find((button) => button.textContent?.trim() === "Connect") as HTMLButtonElement | undefined;
@@ -184,7 +180,7 @@ describe("CloudUpstream", () => {
     await act(async () => {
       connectButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flushReact(2);
+    await flushReact(3);
 
     expect(mockCloudUpstreamsApi.startConnect).toHaveBeenCalledWith({
       companyId: "company-1",
@@ -195,6 +191,7 @@ describe("CloudUpstream", () => {
     await act(async () => {
       root.unmount();
     });
+    await flushReact();
   });
 
   it("uses the URL pathname prefix when cleaning up the callback URL with no company context", async () => {
@@ -240,7 +237,7 @@ describe("CloudUpstream", () => {
           </QueryClientProvider>,
         );
       });
-      await flushReact(2);
+      await flushReact(3);
       await flushReact(2);
 
       expect(mockCloudUpstreamsApi.finishConnect).toHaveBeenCalledWith({
@@ -253,6 +250,7 @@ describe("CloudUpstream", () => {
       await act(async () => {
         root.unmount();
       });
+      await flushReact();
     } finally {
       replaceStateSpy.mockRestore();
       window.localStorage.removeItem("paperclip-cloud-upstream-pending-connection");
@@ -277,7 +275,7 @@ describe("CloudUpstream", () => {
           </QueryClientProvider>,
         );
       });
-      await flushReact(2);
+      await flushReact(3);
       await flushReact(2);
       await flushReact(2);
 
@@ -287,6 +285,7 @@ describe("CloudUpstream", () => {
       await act(async () => {
         root.unmount();
       });
+      await flushReact();
     } finally {
       window.localStorage.removeItem("paperclip-cloud-upstream-pending-connection");
     }
@@ -304,7 +303,7 @@ describe("CloudUpstream", () => {
         </QueryClientProvider>,
       );
     });
-    await flushReact(2);
+    await flushReact(3);
     await flushReact(2);
 
     expect(container.textContent).toContain("Retry");
@@ -314,6 +313,7 @@ describe("CloudUpstream", () => {
     await act(async () => {
       root.unmount();
     });
+    await flushReact();
   });
 });
 

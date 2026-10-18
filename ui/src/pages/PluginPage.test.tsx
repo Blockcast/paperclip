@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 
+import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -54,12 +55,6 @@ vi.mock("@/plugins/slots", async () => {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
-async function act(callback: () => void | Promise<void>) {
-  await callback();
-  await Promise.resolve();
-  await new Promise((resolve) => window.setTimeout(resolve, 0));
-}
-
 function pageContribution(overrides: Partial<{ slots: unknown[] }> = {}) {
   return {
     pluginId: "plugin-wiki",
@@ -94,7 +89,7 @@ async function renderPage(container: HTMLDivElement) {
       </QueryClientProvider>,
     );
   });
-  await flushReact(2);
+  await flushReact(3);
   await flushReact(2);
   return root;
 }
@@ -133,6 +128,7 @@ describe("PluginPage", () => {
     await act(async () => {
       root.unmount();
     });
+    await flushReact();
   });
 
   it("uses a route title and hides the Back button when a routeSidebar matches the active route", async () => {
@@ -169,6 +165,7 @@ describe("PluginPage", () => {
     await act(async () => {
       root.unmount();
     });
+    await flushReact();
   });
 
   it("uses the selected plugin page path as the route-sidebar title", async () => {
@@ -202,5 +199,6 @@ describe("PluginPage", () => {
     await act(async () => {
       root.unmount();
     });
+    await flushReact();
   });
 });

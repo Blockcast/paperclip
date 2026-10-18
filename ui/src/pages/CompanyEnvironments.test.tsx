@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 
+import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, Route, Routes } from "react-router";
@@ -227,12 +228,6 @@ class FakeWebSocket {
   }
 }
 
-async function act(callback: () => void | Promise<void>) {
-  await callback();
-  await Promise.resolve();
-  await new Promise((resolve) => window.setTimeout(resolve, 0));
-}
-
 function testProviderButtons(container: HTMLElement): HTMLButtonElement[] {
   return Array.from(container.querySelectorAll("button")).filter((button) => {
     const label = button.textContent?.trim();
@@ -259,6 +254,7 @@ async function openFirstEnvironmentForEditing(root: ParentNode) {
     expect(editButton).toBeTruthy();
   }, 100);
   await act(async () => click(editButton));
+  await flushReact();
 }
 
 function click(element: Element | null | undefined) {
@@ -475,7 +471,7 @@ describe("CompanyEnvironments — test provider button", () => {
     await act(async () => {
       root!.render(renderCompanyEnvironments(queryClient));
     });
-    await flushReact(3);
+    await flushReact(4);
 
     await waitForAssertion(() => expect(testProviderButtons(container)).toHaveLength(2), 100);
     const buttonsBefore = testProviderButtons(container);
@@ -486,7 +482,7 @@ describe("CompanyEnvironments — test provider button", () => {
     await act(async () => {
       buttonsBefore[0].dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flushReact(3);
+    await flushReact(4);
 
     const buttonsAfter = testProviderButtons(container);
     expect(buttonsAfter).toHaveLength(2);
@@ -522,13 +518,13 @@ describe("CompanyEnvironments — test provider button", () => {
     await act(async () => {
       root!.render(renderCompanyEnvironments(queryClient));
     });
-    await flushReact(3);
+    await flushReact(4);
 
     await waitForAssertion(() => expect(testProviderButtons(container)).toHaveLength(1), 100);
     await act(async () => {
       testProviderButtons(container)[0].dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flushReact(3);
+    await flushReact(4);
 
     expect(mockEnvironmentsApi.probe).toHaveBeenCalledExactlyOnceWith("env-1", "company-1");
     expect(container.textContent).toContain("Connected to Daytona sandbox paperclip-probe.");
@@ -562,13 +558,13 @@ describe("CompanyEnvironments — test provider button", () => {
     await act(async () => {
       root!.render(renderCompanyEnvironments(queryClient));
     });
-    await flushReact(3);
+    await flushReact(4);
 
     await waitForAssertion(() => expect(testProviderButtons(container)).toHaveLength(1), 100);
     await act(async () => {
       testProviderButtons(container)[0].dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flushReact(3);
+    await flushReact(4);
 
     expect(container.textContent).toContain("Daytona sandbox probe failed.");
     expect(container.textContent).toContain("Sandbox image was not found.");
@@ -583,24 +579,24 @@ describe("CompanyEnvironments — test provider button", () => {
     await act(async () => {
       root!.render(renderCompanyEnvironments(queryClient));
     });
-    await flushReact(3);
+    await flushReact(4);
 
     // Click both rows in quick succession while both probes are still pending.
     await waitForAssertion(() => expect(testProviderButtons(container)).toHaveLength(2), 100);
     await act(async () => {
       testProviderButtons(container)[0].dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flushReact(3);
+    await flushReact(4);
     await act(async () => {
       testProviderButtons(container)[1].dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flushReact(3);
+    await flushReact(4);
 
     // Settle only the first environment's probe.
     await act(async () => {
       probeResolvers.get("env-1")?.();
     });
-    await flushReact(3);
+    await flushReact(4);
 
     const buttons = testProviderButtons(container);
     expect(buttons[1].textContent?.trim()).toBe("Testing...");
@@ -614,11 +610,12 @@ describe("CompanyEnvironments — test provider button", () => {
     await act(async () => {
       root!.render(renderCompanyEnvironments(queryClient));
     });
-    await flushReact(3);
+    await flushReact(4);
 
     await act(async () => {
       click(findAction(container, "Add environment"));
     });
+    await flushReact();
 
     await waitForAssertion(() => {
       expect(getEnvironmentFormPage()?.textContent).toContain("Add environment");
@@ -627,7 +624,7 @@ describe("CompanyEnvironments — test provider button", () => {
     await act(async () => {
       findButton(document.body, "Cancel")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flushReact(3);
+    await flushReact(4);
 
     await waitForAssertion(() => {
       expect(getEnvironmentFormPage()).toBeNull();
@@ -641,7 +638,7 @@ describe("CompanyEnvironments — test provider button", () => {
     await act(async () => {
       root!.render(renderCompanyEnvironments(queryClient));
     });
-    await flushReact(3);
+    await flushReact(4);
 
     await openFirstEnvironmentForEditing(container);
 
@@ -656,19 +653,19 @@ describe("CompanyEnvironments — test provider button", () => {
     ).toBe(true);
 
     await act(async () => click(findButton(page!, "Add variable")));
-    await flushReact(3);
+    await flushReact(4);
     const variableName = page!.querySelector<HTMLInputElement>('input[aria-label="Variable name"]')!;
     const variableValue = page!.querySelector<HTMLInputElement>('input[aria-label="Variable value"]')!;
     await act(async () => {
       setInputValue(variableName, "API_TOKEN");
       setInputValue(variableValue, "draft-token");
     });
-    await flushReact(3);
+    await flushReact(4);
 
     await act(async () => {
       findButton(document.body, "Save environment")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flushReact(3);
+    await flushReact(4);
 
     expect(mockEnvironmentsApi.update).toHaveBeenCalledExactlyOnceWith(
       "env-1",
@@ -705,7 +702,7 @@ describe("CompanyEnvironments — test provider button", () => {
     await act(async () => {
       root!.render(renderCompanyEnvironments(queryClient));
     });
-    await flushReact(3);
+    await flushReact(4);
 
     await openFirstEnvironmentForEditing(container);
     await waitForAssertion(() => {
@@ -720,12 +717,12 @@ describe("CompanyEnvironments — test provider button", () => {
     await act(async () => {
       setInputValue(variableName, "GITHUB_TOKEN");
     });
-    await flushReact(3);
+    await flushReact(4);
 
     await act(async () => {
       findButton(document.body, "Save environment")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flushReact(3);
+    await flushReact(4);
 
     // The sibling test above ("opens the edit form ... and closes after save") proves this same
     // button DOES call `update` when the editor is not refusing, so this is about the refusal.
@@ -748,7 +745,7 @@ describe("CompanyEnvironments — test provider button", () => {
     await act(async () => {
       root!.render(renderCompanyEnvironments(queryClient));
     });
-    await flushReact(3);
+    await flushReact(4);
 
     await openFirstEnvironmentForEditing(container);
     await waitForAssertion(() => {
@@ -757,23 +754,24 @@ describe("CompanyEnvironments — test provider button", () => {
     const page = getEnvironmentFormPage()!;
 
     await act(async () => click(findButton(page, "Add variable")));
-    await flushReact(3);
+    await flushReact(4);
     const variableName = page.querySelector<HTMLInputElement>('input[aria-label="Variable name"]')!;
     const variableValue = page.querySelector<HTMLInputElement>('input[aria-label="Variable value"]')!;
     await act(async () => {
       setInputValue(variableName, "API_TOKEN");
       setInputValue(variableValue, "draft-token");
     });
-    await flushReact(3);
+    await flushReact(4);
 
     await act(async () => click(findButton(document.body, "Cancel")));
-    await flushReact(3);
+    await flushReact(4);
 
     expect(confirmSpy).toHaveBeenCalledWith("Discard unsaved environment changes?");
     expect(getEnvironmentFormPage()).not.toBeNull();
 
     confirmSpy.mockReturnValue(true);
     await act(async () => click(findButton(document.body, "Cancel")));
+    await flushReact();
     await waitForAssertion(() => expect(getEnvironmentFormPage()).toBeNull(), 100);
   });
 
@@ -785,7 +783,7 @@ describe("CompanyEnvironments — test provider button", () => {
     await act(async () => {
       root!.render(renderCompanyEnvironments(queryClient));
     });
-    await flushReact(3);
+    await flushReact(4);
 
     await openFirstEnvironmentForEditing(container);
     await waitForAssertion(() => {
@@ -794,17 +792,17 @@ describe("CompanyEnvironments — test provider button", () => {
     const page = getEnvironmentFormPage()!;
 
     await act(async () => click(findButton(page, "Add variable")));
-    await flushReact(3);
+    await flushReact(4);
     const variableName = page.querySelector<HTMLInputElement>('input[aria-label="Variable name"]')!;
     const variableValue = page.querySelector<HTMLInputElement>('input[aria-label="Variable value"]')!;
     await act(async () => {
       setInputValue(variableName, "API_TOKEN");
       setInputValue(variableValue, "draft-token");
     });
-    await flushReact(3);
+    await flushReact(4);
 
     await act(async () => click(findButton(page, "Save")));
-    await flushReact(3);
+    await flushReact(4);
     expect(page.textContent).not.toContain("Unsaved changes");
 
     const beforeUnload = new Event("beforeunload", { cancelable: true });
@@ -877,7 +875,7 @@ describe("CompanyEnvironments — test provider button", () => {
     await act(async () => {
       root!.render(renderCompanyEnvironments(queryClient));
     });
-    await flushReact(3);
+    await flushReact(4);
 
     // Daytona supports setup + capture -> "Configure image" on its edit page.
     await openFirstEnvironmentForEditing(container);
@@ -886,19 +884,23 @@ describe("CompanyEnvironments — test provider button", () => {
     }, 100);
     expect(mockEnvironmentsApi.customImageTemplate).toHaveBeenCalledExactlyOnceWith("env-1", "company-1");
     await act(async () => click(findButton(document.body, "Cancel")));
+    await flushReact();
     await waitForAssertion(() => expect(getEnvironmentFormPage()).toBeNull(), 100);
 
     // E2B does not advertise interactive setup.
     await act(async () => click(editButtons(container)[1]));
+    await flushReact();
     await waitForAssertion(() => {
       expect(getEnvironmentFormPage()?.textContent).toContain("Unsupported provider");
     }, 100);
     expect(getEnvironmentFormPage()?.textContent).not.toContain("Configure image");
     await act(async () => click(findButton(document.body, "Cancel")));
+    await flushReact();
     await waitForAssertion(() => expect(getEnvironmentFormPage()).toBeNull(), 100);
 
     // Provider advertises setup but cannot capture an image.
     await act(async () => click(editButtons(container)[2]));
+    await flushReact();
     await waitForAssertion(() => {
       expect(getEnvironmentFormPage()?.textContent).toContain("Setup capture unavailable");
     }, 100);
@@ -950,7 +952,7 @@ describe("CompanyEnvironments — test provider button", () => {
     await act(async () => {
       root!.render(renderCompanyEnvironments(queryClient));
     });
-    await flushReact(3);
+    await flushReact(4);
 
     await openFirstEnvironmentForEditing(container);
     await waitForAssertion(() => {
@@ -958,6 +960,7 @@ describe("CompanyEnvironments — test provider button", () => {
     }, 100);
 
     await act(async () => click(findButton(getEnvironmentFormPage()!, "Cancel")));
+    await flushReact();
     await waitForAssertion(() => {
       expect(getEnvironmentFormPage()?.textContent).toContain("Setup cancelled");
     }, 100);
@@ -990,7 +993,7 @@ describe("CompanyEnvironments — test provider button", () => {
     await act(async () => {
       root!.render(renderCompanyEnvironments(queryClient));
     });
-    await flushReact(3);
+    await flushReact(4);
 
     await openFirstEnvironmentForEditing(container);
     await waitForAssertion(() => {
@@ -1025,6 +1028,7 @@ describe("CompanyEnvironments — test provider button", () => {
       FakeWebSocket.instances[0].emitMessage(JSON.stringify({ type: "ready" }));
       FakeWebSocket.instances[0].emitMessage(JSON.stringify({ type: "output", data: "\u001b[?2004hsetup shell\r\n$ " }));
     });
+    await flushReact();
     const terminalScreen = getEnvironmentFormPage()?.querySelector<HTMLElement>(
       "[data-testid='custom-image-terminal-screen-session-1']",
     );
@@ -1045,6 +1049,7 @@ describe("CompanyEnvironments — test provider button", () => {
       xtermMocks.terminalInstances[0].emitData("l");
       xtermMocks.terminalInstances[0].emitData("\r");
     });
+    await flushReact();
 
     expect(FakeWebSocket.instances[0].sent).toContain(JSON.stringify({ type: "input", data: "l" }));
     expect(FakeWebSocket.instances[0].sent).toContain(JSON.stringify({ type: "input", data: "\r" }));
@@ -1071,7 +1076,7 @@ describe("CompanyEnvironments — test provider button", () => {
     await act(async () => {
       root!.render(renderCompanyEnvironments(queryClient));
     });
-    await flushReact(3);
+    await flushReact(4);
 
     await openFirstEnvironmentForEditing(container);
     let terminalScreen: HTMLElement | null = null;
@@ -1086,7 +1091,7 @@ describe("CompanyEnvironments — test provider button", () => {
     await act(async () => {
       terminalScreen?.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
     });
-    await flushReact(3);
+    await flushReact(4);
 
     expect(getEnvironmentFormPage()?.textContent).toContain(command);
     expect(getEnvironmentFormPage()?.textContent).toContain("Edit environment");
@@ -1130,7 +1135,7 @@ describe("CompanyEnvironments — test provider button", () => {
     await act(async () => {
       root!.render(renderCompanyEnvironments(queryClient));
     });
-    await flushReact(3);
+    await flushReact(4);
 
     await openFirstEnvironmentForEditing(container);
     await waitForAssertion(() => {
@@ -1156,7 +1161,7 @@ describe("CompanyEnvironments — test provider button", () => {
     await act(async () => {
       root!.render(renderCompanyEnvironments(queryClient));
     });
-    await flushReact(3);
+    await flushReact(4);
 
     await openFirstEnvironmentForEditing(container);
     await waitForAssertion(() => {
@@ -1168,7 +1173,7 @@ describe("CompanyEnvironments — test provider button", () => {
     expect(findButton(dialog, "Cancel")?.disabled).toBe(false);
 
     await act(async () => click(findButton(dialog, "Finished")));
-    await flushReact(3);
+    await flushReact(4);
 
     expect(mockEnvironmentsApi.finishCustomImageSetupSession).toHaveBeenCalledExactlyOnceWith("session-1", {});
   });
@@ -1193,7 +1198,7 @@ describe("CompanyEnvironments — test provider button", () => {
     await act(async () => {
       root!.render(renderCompanyEnvironments(queryClient));
     });
-    await flushReact(3);
+    await flushReact(4);
 
     await openFirstEnvironmentForEditing(container);
     await waitForAssertion(() => {
@@ -1239,7 +1244,7 @@ describe("CompanyEnvironments — test provider button", () => {
     await act(async () => {
       root!.render(renderCompanyEnvironments(queryClient));
     });
-    await flushReact(3);
+    await flushReact(4);
 
     await openFirstEnvironmentForEditing(container);
     await waitForAssertion(() => {
@@ -1258,7 +1263,7 @@ describe("CompanyEnvironments — test provider button", () => {
     }, 100);
 
     await act(async () => click(findButton(getEnvironmentFormPage()!, "Refresh")));
-    await flushReact(3);
+    await flushReact(4);
 
     expect(mockEnvironmentsApi.startCustomImageSetupSession).toHaveBeenCalledWith(
       "env-1",
@@ -1301,7 +1306,7 @@ describe("CompanyEnvironments — test provider button", () => {
     await act(async () => {
       root!.render(renderCompanyEnvironments(queryClient));
     });
-    await flushReact(3);
+    await flushReact(4);
 
     await openFirstEnvironmentForEditing(container);
     await waitForAssertion(() => {
@@ -1313,6 +1318,7 @@ describe("CompanyEnvironments — test provider button", () => {
     }, 100);
 
     await act(async () => click(findButton(getEnvironmentFormPage()!, "Cancel")));
+    await flushReact();
     await waitForAssertion(() => {
       const dialog = getEnvironmentFormPage()!;
       expect(dialog.textContent).toContain("Active template");
@@ -1342,7 +1348,7 @@ describe("CompanyEnvironments — test provider button", () => {
     await act(async () => {
       root!.render(renderCompanyEnvironments(queryClient));
     });
-    await flushReact(3);
+    await flushReact(4);
 
     await openFirstEnvironmentForEditing(container);
     await waitForAssertion(() => {
@@ -1369,7 +1375,7 @@ describe("CompanyEnvironments — test provider button", () => {
     await act(async () => {
       root!.render(renderCompanyEnvironments(queryClient));
     });
-    await flushReact(3);
+    await flushReact(4);
 
     await openFirstEnvironmentForEditing(container);
     await waitForAssertion(() => {
@@ -1412,7 +1418,7 @@ describe("CompanyEnvironments — test provider button", () => {
     await act(async () => {
       root!.render(renderCompanyEnvironments(queryClient));
     });
-    await flushReact(3);
+    await flushReact(4);
 
     await openFirstEnvironmentForEditing(container);
     await waitForAssertion(() => {
@@ -1423,11 +1429,13 @@ describe("CompanyEnvironments — test provider button", () => {
     }, 100);
 
     await act(async () => click(findButton(getEnvironmentFormPage()!, "Rollback")));
+    await flushReact();
     await waitForAssertion(() => {
       expect(mockEnvironmentsApi.rollbackCustomImageTemplate).toHaveBeenCalledExactlyOnceWith("env-1", "company-1");
     }, 100);
 
     await act(async () => click(findButton(getEnvironmentFormPage()!, "Disable")));
+    await flushReact();
     await waitForAssertion(() => {
       expect(mockEnvironmentsApi.disableCustomImageTemplate).toHaveBeenCalledExactlyOnceWith("env-1", "company-1");
     }, 100);

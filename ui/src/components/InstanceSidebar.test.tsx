@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 
+import { act } from "react";
 import type { ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -48,12 +49,6 @@ vi.mock("../context/SidebarContext", () => ({
 import { InstanceSidebar } from "./InstanceSidebar";
 import { flushReact } from "@/test-utils/react";
 
-async function act(callback: () => void | Promise<void>) {
-  await callback();
-  await Promise.resolve();
-  await new Promise((resolve) => window.setTimeout(resolve, 0));
-}
-
 function makePlugin(overrides: Partial<PluginRecord> & { manifestJson: PluginRecord["manifestJson"] }): PluginRecord {
   return {
     id: overrides.id ?? "plugin-id",
@@ -79,6 +74,7 @@ async function findPluginLinks(container: HTMLElement, expectedCount: number) {
       expect(container.querySelectorAll('a[href^="/company/settings/instance/plugins/"]')).toHaveLength(expectedCount);
     });
   });
+  await flushReact();
   return Array.from(container.querySelectorAll<HTMLAnchorElement>('a[href^="/company/settings/instance/plugins/"]'));
 }
 
@@ -116,6 +112,7 @@ describe("InstanceSidebar", () => {
       await act(async () => {
         currentRoot.unmount();
       });
+      await flushReact();
     }
     queryClient?.clear();
     container.remove();

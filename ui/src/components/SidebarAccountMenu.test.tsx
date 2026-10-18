@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 
+import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -56,12 +57,6 @@ vi.mock("../context/ThemeContext", () => ({
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
-async function act(callback: () => void | Promise<void>) {
-  await callback();
-  await Promise.resolve();
-  await new Promise((resolve) => window.setTimeout(resolve, 0));
-}
-
 describe("SidebarAccountMenu", () => {
   let container: HTMLDivElement;
 
@@ -109,7 +104,7 @@ describe("SidebarAccountMenu", () => {
         </QueryClientProvider>,
       );
     });
-    await flushReact(2);
+    await flushReact(3);
     await flushReact(2);
 
     expect(container.textContent).toContain("Jane Example");
@@ -121,7 +116,7 @@ describe("SidebarAccountMenu", () => {
     await act(async () => {
       trigger?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flushReact(2);
+    await flushReact(3);
 
     expect(document.body.textContent).toContain("Edit profile");
     expect(document.body.textContent).not.toContain("Instance settings");
@@ -153,7 +148,7 @@ describe("SidebarAccountMenu", () => {
     await act(async () => {
       signOutButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flushReact(2);
+    await flushReact(3);
 
     expect(mockAuthApi.signOut).toHaveBeenCalledOnce();
     expect(queryClient.getQueryState(queryKeys.health)?.isInvalidated).toBe(true);
@@ -161,6 +156,7 @@ describe("SidebarAccountMenu", () => {
     await act(async () => {
       root.unmount();
     });
+    await flushReact();
   });
 
   it("shows the short commit sha instead of a version for source builds", async () => {
@@ -195,7 +191,7 @@ describe("SidebarAccountMenu", () => {
         </QueryClientProvider>,
       );
     });
-    await flushReact(2);
+    await flushReact(3);
 
     expect(document.body.textContent).toContain("feature/source-build-labelPaperclip 518fc71");
     expect(document.body.textContent).not.toContain("2026.626.0+58.git.518fc71ce");
@@ -209,5 +205,6 @@ describe("SidebarAccountMenu", () => {
     await act(async () => {
       root.unmount();
     });
+    await flushReact();
   });
 });
