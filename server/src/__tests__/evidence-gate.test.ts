@@ -1752,6 +1752,88 @@ describe("evaluateEvidence — truth shapes", () => {
   });
 });
 
+describe("evaluateEvidence — the reviewer authored the PR: suppressed, NOT de-required (PEN-4265)", () => {
+  const DONE_WHEN = "## Done when\n- a\n- b\n- c\n";
+  const CHECKLIST = "| Criterion | Status |\n|---|---|\n| a | ✅ |\n| b | ✅ |\n| c | ✅ |";
+  const base = {
+    issue: { description: DONE_WHEN, labels: [] as { name: string }[] },
+    comments: [agentComment(CHECKLIST)],
+    workProducts: [],
+    registry: DEFAULT_EVIDENCE_REGISTRY,
+    unlabeledTruthBlock: true,
+    probeFailed: false,
+    noLinkedPullRequest: false,
+  };
+
+  // The decision this suite pins. The shape STAYS in `missing` — a `pass` here
+  // would assert "independently reviewed, clean" for the whole App-authored
+  // population, retiring the only REQUIRED anti-fabrication shape for exactly
+  // the population it was added for. Only the escalation is suppressed.
+  it("suppresses the escalation and leaves the shape required", () => {
+    const result = evaluateEvidence({ ...base, reviewerAuthoredPr: true });
+    expect(result.verdict).toBe("warn");
+    expect(result.missing).toEqual(["review:ally-clean"]);
+    expect(result.diagnostics).toContain("unlabeled-truth-block-suppressed:reviewer-authored-pr");
+    expect(result.diagnostics).not.toContain("unlabeled-truth-block");
+    // The two de-requiring diagnostics stay absent: this arm must never widen
+    // into a drop, which is what would turn the warn into a pass.
+    expect(result.diagnostics).not.toContain("truth-shapes-not-required:no-linked-pull-request");
+  });
+
+  // THE FAILURE CONTROL. Identical input with the one fact false must BLOCK —
+  // otherwise the test above passes against a gate that suppresses everything,
+  // and the suppression would be hiding real unreviewed work.
+  it("the same gap WITHOUT the identity collision still blocks", () => {
+    const result = evaluateEvidence({ ...base, reviewerAuthoredPr: false });
+    expect(result.verdict).toBe("block");
+    expect(result.diagnostics).toContain("unlabeled-truth-block");
+    expect(result.diagnostics).not.toContain("unlabeled-truth-block-suppressed:reviewer-authored-pr");
+  });
+
+  // Precedence, and it is load-bearing rather than cosmetic: a probe that
+  // could not reach GitHub has not established the AUTHOR either, so reporting
+  // the identity reason there would state a fact the probe never read. The
+  // operator reads these apart in the seven-day measurement.
+  it("a failed probe outranks it — the outage is the fact worth reporting", () => {
+    const result = evaluateEvidence({ ...base, reviewerAuthoredPr: true, probeFailed: true });
+    expect(result.verdict).toBe("warn");
+    expect(result.diagnostics).toContain("unlabeled-truth-block-suppressed:probe-failed");
+    expect(result.diagnostics).not.toContain("unlabeled-truth-block-suppressed:reviewer-authored-pr");
+  });
+
+  it("a PR-less issue outranks it — there is no author to collide with", () => {
+    const result = evaluateEvidence({
+      ...base,
+      issue: { description: DONE_WHEN, labels: [{ name: "frontend" }] },
+      comments: [
+        agentComment(
+          ["![desktop](./shot_1440x900.png)", "![mobile](./shot_390x844.png)", LANDING_ARTIFACT, CHECKLIST].join("\n"),
+        ),
+      ],
+      reviewerAuthoredPr: true,
+      noLinkedPullRequest: true,
+    });
+    expect(result.verdict).toBe("warn");
+    expect(result.diagnostics).toContain("unlabeled-truth-block-suppressed:no-linked-pull-request");
+    expect(result.diagnostics).not.toContain("unlabeled-truth-block-suppressed:reviewer-authored-pr");
+  });
+
+  // The suppression is reachable only from a truth-ONLY gap, so it can never
+  // reach down and clear a shape the agent does own. A labeled issue missing
+  // its screenshots still blocks on the screenshots, App-authored or not.
+  it("a MIXED gap is untouched — it still blocks on the shape the agent owns", () => {
+    const result = evaluateEvidence({
+      ...base,
+      issue: { description: DONE_WHEN, labels: [{ name: "backend" }] },
+      comments: [agentComment([LANDING_ARTIFACT, CHECKLIST].join("\n"))],
+      reviewerAuthoredPr: true,
+    });
+    expect(result.verdict).toBe("block");
+    expect(result.missing).toContain("test-output");
+    expect(result.diagnostics).not.toContain("unlabeled-truth-block-suppressed:reviewer-authored-pr");
+  });
+});
+
 describe("evaluateEvidence — no linked PR: unsatisfiable, so not required (BLO-32239)", () => {
   const DONE_WHEN = "## Done when\n- a\n- b\n- c\n";
   const CHECKLIST = "| Criterion | Status |\n|---|---|\n| a | ✅ |\n| b | ✅ |\n| c | ✅ |";

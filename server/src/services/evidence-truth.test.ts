@@ -714,13 +714,78 @@ describe("buildGithubTruthProbe", () => {
     const r = await buildGithubTruthProbe(deps())({ workProducts: [] });
     // `noLinkedPullRequest` is the load-bearing half: it is what lets the gate
     // suppress the escalation WITHOUT claiming the probe failed. Asserting the
-    // whole object keeps the two states from silently collapsing again.
+    // whole object keeps the two states from silently collapsing again — now
+    // three states, with `reviewerAuthoredPr` false here because there is no
+    // PR to have an author (PEN-4265).
     expect(r).toEqual({
       detections: {},
       diagnostics: ["no-linked-pull-request"],
       probeFailed: false,
       noLinkedPullRequest: true,
+      reviewerAuthoredPr: false,
     });
+  });
+
+  // PEN-4265. The App-authored population: the review happened, attests this
+  // exact head and reports nothing blocking, and the ONLY thing unestablished
+  // is its independence from the author. The probe has to say so in its own
+  // field, because `review:ally-clean` being absent is the same observation
+  // for this and for "nobody reviewed it" — and only one of the two is
+  // reachable by the assignee.
+  it("reviewer identity authored the PR → clean withheld, and reviewerAuthoredPr names why", async () => {
+    const r = await buildGithubTruthProbe(deps({ fetchPrAuthorLogin: async () => ALLY }))({
+      workProducts: [wp()],
+    });
+    expect(r.detections["review:ally-clean"]).toBeUndefined();
+    expect(r.reviewerAuthoredPr).toBe(true);
+    // Not an outage and not a PR-less issue. Each of the three drives a
+    // different operator-visible suppression reason.
+    expect(r.probeFailed).toBe(false);
+    expect(r.noLinkedPullRequest).toBe(false);
+  });
+
+  // The positive control for the field, and the one that keeps it from being
+  // true-by-default: the SAME fixture with an independent author reaches
+  // `clean`, so the flag is reporting the author and not the absence of a
+  // review.
+  it("independent author on the same fixture → clean detected and reviewerAuthoredPr false", async () => {
+    const r = await buildGithubTruthProbe(deps())({ workProducts: [wp()] });
+    expect(r.detections["review:ally-clean"]).toBe(true);
+    expect(r.reviewerAuthoredPr).toBe(false);
+  });
+
+  // `every`, mirroring the `every` that decides `clean`. One PR in the set
+  // with a gap the assignee CAN close makes the set actionable, so the
+  // identity claim must not be made for it. Without this the suppression
+  // would hide a real unreviewed PR behind a sibling's author.
+  it("one identity-blocked PR beside one nobody attested → reviewerAuthoredPr false", async () => {
+    const r = await buildGithubTruthProbe(
+      deps({
+        fetchPrAuthorLogin: async () => ALLY,
+        // #1588 carries the at-head attestation; #1585's newest comment
+        // attests an older head, so nothing attests its current one.
+        listReviewerSurfaces: async ({ prNumber }) => ({
+          reviews: [],
+          comments:
+            prNumber === 1588
+              ? [{ login: ALLY, body: clean, createdAt: "2026-09-06T00:00:00Z" }]
+              : [],
+        }),
+      }),
+    )({ workProducts: [wp(), wp({ prNumber: 1585 })] });
+    expect(r.detections["review:ally-clean"]).toBeUndefined();
+    expect(r.reviewerAuthoredPr).toBe(false);
+  });
+
+  // Same withholding the detections get, for the same reason: a PR that was
+  // never read could be the one carrying the real gap, so the five that are
+  // identity-blocked say nothing about the set.
+  it("a capped read withholds reviewerAuthoredPr too", async () => {
+    const many = [1, 2, 3, 4, 5, 6].map((n) => wp({ prNumber: n }));
+    const r = await buildGithubTruthProbe(deps({ fetchPrAuthorLogin: async () => ALLY }))({
+      workProducts: many,
+    });
+    expect(r.reviewerAuthoredPr).toBe(false);
   });
 
   it("more than 5 linked PRs → probes the 5 highest, names the rest, and withholds every detection", async () => {

@@ -74,6 +74,17 @@ export interface EvaluateEvidenceInput {
    */
   noLinkedPullRequest?: boolean;
   /**
+   * True when the probe established that `review:ally-clean` is absent for the
+   * whole linked set ONLY because the reviewer identity authored the PRs — the
+   * App-authored population (PEN-4265).
+   *
+   * Like `noLinkedPullRequest`, passed as a boolean rather than derived here.
+   * The discriminator is the typed `authorIsReviewer` marker on the comment
+   * verdict, which lives two modules away; re-deriving it from work products
+   * would need the PR's GitHub author, which this pure evaluator cannot read.
+   */
+  reviewerAuthoredPr?: boolean;
+  /**
    * Wired from loadConfig().evidenceGateUnlabeledTruthBlock. Default off.
    *
    * NAME IS NARROWER THAN THE BEHAVIOUR: the env var is
@@ -936,6 +947,41 @@ export function evaluateEvidence(
   // test drives exactly that: it is what pins the flag's scope to
   // BLOCKABLE_TRUTH_SHAPES independently of the registry decision, so the two
   // can never silently collapse into one.
+  // A THIRD population joins them, and it is the one neither of the above
+  // caught: the PR exists, the probe worked, Ally attested the head and found
+  // nothing blocking, and the positive is withheld only because the attesting
+  // identity is also the PR's author (PEN-4265). Every agent-opened PR in this
+  // estate is App-authored and Ally reviews as that App, so the shape is
+  // unreachable for that whole population however clean the review is —
+  // `evidence-truth.ts` records this as the KNOWN CONSEQUENCE of BLO-34969.
+  //
+  // It is suppressed HERE and not dropped from `required` above, and the line
+  // is the one `probeFailed` already draws rather than the one
+  // `prLessUnlabeledTruthDrop` draws:
+  //   - Dropping from `required` empties `missing` and yields `pass`. That is
+  //     right for the PR-less unlabeled case, where there is no head and so no
+  //     claim to make. Here there IS a head and it IS reviewed, and what is
+  //     absent is the attestation's INDEPENDENCE. A `pass` would assert
+  //     "independently reviewed, clean" for 100% of agent PRs — retiring the
+  //     only REQUIRED anti-fabrication shape (BLO-32239) for precisely the
+  //     population the two fabrication incidents behind it came from.
+  //   - Suppressing the escalation keeps the shape in `missing`, so the
+  //     verdict stays `warn` and the gap stays measurable and honest. The cost
+  //     is a `reviewPassRate` (`agent-scorecards.ts`) no agent behaviour can
+  //     lift — accepted deliberately, because unlike the `deploy:landed` and
+  //     PR-less cases the not-pass here is TRUE, and it is uniform across
+  //     agents, so it moves the level and not the ranking.
+  //
+  // Keyed on a LIVE COMPUTED FACT, not a registry edit, and that is the
+  // deciding property: on the day agents get a PR author identity distinct
+  // from the reviewer's, `reviewerAuthoredPr` goes false by itself and the
+  // shape binds again with no code change and nobody having to remember. A
+  // static de-requiring would have to be reversed by hand and would fail open
+  // until someone did.
+  //
+  // ORDER IS LOAD-BEARING. `probeFailed` stays first: a probe that could not
+  // reach GitHub has not established the author either, so its own facts are
+  // the ones to report. This arm is last for the same reason it is narrowest.
   const blockableGap = missing.some((s) => BLOCKABLE_TRUTH_SHAPES.includes(s));
   if (verdict === "warn" && input.unlabeledTruthBlock === true && truthOnlyGap && blockableGap) {
     // Distinct reasons stay distinct in the verdict: the runbook's seven-day
@@ -946,7 +992,9 @@ export function evaluateEvidence(
         ? "probe-failed"
         : input.noLinkedPullRequest === true
           ? "no-linked-pull-request"
-          : null;
+          : input.reviewerAuthoredPr === true
+            ? "reviewer-authored-pr"
+            : null;
     if (suppress !== null) {
       diagnostics.push(`unlabeled-truth-block-suppressed:${suppress}`);
     } else {

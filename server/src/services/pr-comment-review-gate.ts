@@ -172,6 +172,26 @@ export type CommentReviewGateVerdict =
        * of the author examined the head.
        */
       headAttested?: true;
+      /**
+       * Set on exactly ONE of the two `headAttested` branches: the one where
+       * the author IS known and shares the reviewer's identity. The sibling
+       * branch (`authorUnknown`) is deliberately excluded — "we could not read
+       * the author" and "the author is the reviewer" are the same verdict here
+       * but not the same fact, and only the second one is a property of the
+       * estate rather than of a failed read.
+       *
+       * Typed rather than inferred from `reason` or from the absence of
+       * `authorUnknown`, for the reason `headAttested` gives: the evidence
+       * probe (`evidence-truth.ts`) reads it to decide whether a missing
+       * `review:ally-clean` is an actionable gap or the known App-authored
+       * population (PEN-4265), and a conjunction over the other two markers
+       * would silently acquire a third meaning the day another branch sets
+       * them.
+       *
+       * Nothing that decides a MERGE may read it, for the same reason as
+       * `headAttested`.
+       */
+      authorIsReviewer?: true;
     }
   | { state: "failure"; outcome: "blocking_finding"; reason: string; commentCreatedAt: string }
   | { state: "failure"; outcome: "unreadable_verdict"; reason: string; commentCreatedAt: string }
@@ -953,6 +973,11 @@ export function evaluateCommentReviewGate(input: {
         // authors, because `gate/ally-comment-findings` is `neutral` for all of
         // them.
         headAttested: true,
+        // The marker the evidence probe keys on. See `authorIsReviewer` on the
+        // verdict type: this is the branch where the shape `review:ally-clean`
+        // is unreachable as a property of WHO WE ARE rather than of what was
+        // reviewed, and the only branch that may be read that way.
+        authorIsReviewer: true,
         reason: "The only comment attesting this head is the PR author's own; nothing independent reviewed it.",
       };
     } else {
