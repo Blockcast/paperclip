@@ -48,19 +48,62 @@ templates inside Deployment / StatefulSet / Job / CronJob, and to `SecretList` i
 | tool | returns | verdict |
 |---|---|---|
 | `pods_get`, `pods_list`, `pods_list_in_namespace` | pod spec `env[].value`, `command`, `args`, `last-applied-configuration` | **covered** |
-| `resources_get`, `resources_list` | any kind, incl. `Secret` `data`/`stringData` | **covered, except ConfigMap** |
+| `resources_get`, `resources_list` | any kind, incl. `Secret` `data`/`stringData` | **covered where the kind carries a probe shape** — see the CRD note below |
 | `pods_log` | container stdout | **not covered** — plain text, trips no probe |
 | `nodes_log` | kubelet / `/var/log/*` | **not covered** — same |
 | `events_list` | event messages | **not covered** — same |
 | `nodes_top`, `pods_top`, `nodes_stats_summary`, `namespaces_list` | metrics only | n/a |
 
+**PEN-4282 made this table executable.** `packages/mcp-gateway/src/k8s-ro-coverage.test.ts` pushes a
+sentinel through the real `scrubResponseBody` for every surface above and asserts the verdict both
+ways — the sentinel is gone where the row says *covered*, and present where it says *not covered* —
+with a control value that must survive in each case, so a scrubber that ate the document cannot
+score as coverage. The tool list here and the register there are asserted equal, so neither can be
+updated without the other. Everything below was re-measured live on 2026-10-18 against gateway image
+`sha-860c6c6@sha256:81016633…`, with each call confirmed through the gateway by its own access log.
+
 The ConfigMap exemption is **deliberate and already documented at the source**
 (`response-scrub.ts:91-97`): *"Residual risk accepted, explicitly: a ConfigMap used to carry a
-credential is still returned in the clear."* Not re-litigated here.
+credential is still returned in the clear."* Not re-litigated here. Live confirmation, which doubles
+as the in-body positive control: `ConfigMap/paperclip-mcp-gateway-k8s-ro-upstreams` returns
+`last-applied-configuration: "<redacted>"` **and** its `data` in full plaintext in the same
+response — so the plaintext is a coverage gap in a control that ran, not a request that went around
+it.
+
+**CRD note (PEN-4282, correcting the "any kind" reading above).** Coverage is keyed on the response
+*shape*, not on the kind, and those are not the same claim. A CRD that embeds a pod template is
+covered: `AutoscalingRunnerSet/arc-light` returned `<redacted>` for
+`spec.template.spec.containers[].env[].value`, `command` and `lifecycle.postStart.exec.command`. A
+CRD whose config sits under its own key names is **not**: on `Application/paperclip-mcp-gateways`
+the only redacted field in the entire document was `last-applied-configuration`, and all of
+`spec.source.*` came back plaintext. "Any kind" is true of the *rules*; it is not true of the
+*fields*.
 
 The three log/event gaps are unstructured-text surfaces, a different control class from this row's
 subject (structured config). Recorded, not filed — a text scrubber on `pods_log` is a separate
-design question with its own false-positive cost.
+design question with its own false-positive cost. Live: `pods_log` returned container stdout
+verbatim, and `events_list` over ns `paperclip` returned 442,601 characters across 9,502 lines with
+**zero** occurrences of the redaction marker.
+
+> **The boundary, stated (PEN-4282).** The k8s-ro scrubber is **transcript hygiene for the
+> structured pod-spec shapes. It is not a credential boundary.** What bounds an agent seat's reach
+> is RBAC — `ClusterRole/paperclip-k8s-mcp-readonly` — not this scrubber. It follows that
+> **"redacted to me" does not mean "unreachable by any agent"**: the same string is redacted as
+> `env[].value` and returned in full as `ConfigMap.data`, in a pod log, or in an event message. On
+> PEN-4274 two seats independently read a redacted `TO_URL` as proof a question was unanswerable by
+> any agent; it was answerable in minutes through a ConfigMap and a pod log. The inversion runs both
+> ways — a reviewer trusting redaction to bound what agents can see is wrong by the same
+> measurement. Making the scrubber a credential boundary was considered and declined; the test above
+> records why, and what it would cost.
+
+> **Second scope boundary this file cannot close (PEN-4283).** The `k8s-ro` tool *surface* is not
+> derivable from this repo. It is set by the upstream server image, its `--read-only
+> --disable-destructive` flags and the `disabled_tools` list, all in
+> `Blockcast/onprem-k8s:paperclip/k8s-mcp-stack.yaml`, and the `k8s-ro` gateway upstream map carries
+> no `tools` allowlist — unlike the prometheus gateway, whose five-tool allowlist is what actually
+> closed PEN-2735. So an upstream image bump can add a tool, route it through `/k8s-ro`, and leave
+> every test here green. The register holds the two in-repo records in step; it does not watch the
+> image.
 
 > **Scope boundary that no static audit can close.** An agent's effective MCP set is
 > `{...sharedSeedBaseline, ...adapterConfig.mcpServers}` (`vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts:1404`).
