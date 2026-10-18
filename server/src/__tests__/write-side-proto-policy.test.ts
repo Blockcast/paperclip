@@ -5,11 +5,22 @@
  * This is the opposite of `normalizeEnvConfig`'s 422 (PEN-3257), and the asymmetry is
  * intentional. The reasoning lives beside `mergeRecord` in `services/plugin-config-masking.ts`.
  *
- * These tests are a TRIPWIRE, not a feature test. "Persisting is fine" is only true while no
- * downstream consumer re-parents on a stored key — every merge of these records today is a
- * spread (CreateDataProperty, which defines an own property rather than invoking the setter).
- * The pollution assertions below are written to FAIL the moment that stops being true, so the
- * decision is re-opened by a red test rather than by somebody happening to remember this row.
+ * ## What this file pins, and what it does NOT
+ *
+ * It pins two things, both by execution: (1) the write-side walks themselves — `mergeRecord` and
+ * the adapter restore — persist the key without re-parenting their accumulator, and (2) the
+ * policy, that a permissive manifest schema ACCEPTS the key while an `additionalProperties: false`
+ * one refuses it. Introducing a blanket refusal has to come and edit this file on purpose.
+ *
+ * It does NOT detect a new downstream consumer, and must not be read as doing so. "Persisting is
+ * fine" is conditional on no consumer re-parenting on a stored key — every merge of these records
+ * at `a76a502f` is a spread (CreateDataProperty, which defines an own property rather than
+ * invoking the setter). That premise is a MEASUREMENT over the tree at a point in time, not an
+ * invariant this file enforces: the spread exercised below is written here rather than imported
+ * from a consumer, so an `Object.assign(out, storedConfig)` or a bare `out[key] = value` added to
+ * a route or service tomorrow would leave every test in this file green. Anyone adding a consumer
+ * of stored `configJson` / `adapterConfig` has to re-run that measurement by hand against the note
+ * beside `mergeRecord`.
  *
  * Per the PEN-3288/PEN-4240 test traps, every fixture is built from RAW JSON TEXT: `__proto__`
  * in an object literal assigns the prototype instead of creating an own key, and the obvious
@@ -30,8 +41,14 @@ function fromJson(text: string): Record<string, unknown> {
 
 const POSTED = '{"__proto__":{"polluted":"yes"},"ordinarySibling":"kept"}';
 
-/** Assert nothing in this test has re-parented a shared prototype. */
-function expectNoPrototypePollution(): void {
+/**
+ * A GLOBAL-ESCAPE backstop — not the load-bearing guard, and it cannot fail from the defect class
+ * this file covers. A `[[Set]]` of an own `__proto__` key re-parents the TARGET OBJECT; it does
+ * not write `Object.prototype.polluted`. The assertions that would actually bite are the
+ * `Object.getPrototypeOf(...)` ones beside each call. This is kept for the narrower case it does
+ * catch: a reviver or deep-merge that walks INTO the key's value and writes through.
+ */
+function expectNoGlobalPrototypeEscape(): void {
   expect((Object.prototype as unknown as { polluted?: unknown }).polluted).toBeUndefined();
   expect(({} as { polluted?: unknown }).polluted).toBeUndefined();
 }
@@ -56,7 +73,7 @@ describe("PEN-4244: write-side `__proto__` policy", () => {
       const merged = mergeMaskedPluginConfig(fromJson(POSTED), fromJson("{}"));
 
       expect(Object.getPrototypeOf(merged.configJson)).toBe(Object.prototype);
-      expectNoPrototypePollution();
+      expectNoGlobalPrototypeEscape();
     });
 
     it("survives the jsonb round-trip as an own key, still without polluting", () => {
@@ -67,14 +84,16 @@ describe("PEN-4244: write-side `__proto__` policy", () => {
 
       expect(Object.keys(reloaded)).toContain("__proto__");
       expect(Object.getPrototypeOf(reloaded)).toBe(Object.prototype);
-      expectNoPrototypePollution();
+      expectNoGlobalPrototypeEscape();
     });
 
-    it("the downstream consumer shape — a spread merge — copies the key without re-parenting", () => {
-      // Every merge of a stored config/adapterConfig downstream is a spread. Spread uses
-      // CreateDataProperty, so it defines an own `__proto__`; this is the property the
-      // "persisting is fine" decision rests on. If a consumer ever switches to `[[Set]]`
-      // (a bare `out[key] = value`, or `Object.assign`), this is the assertion that goes red.
+    it("a spread merge — the premise the decision rests on — copies the key without re-parenting", () => {
+      // An EXECUTABLE STATEMENT OF THE PREMISE, not a detector of new consumers. The decision
+      // rests on every downstream merge of a stored config being a spread, which uses
+      // CreateDataProperty and so defines an own `__proto__` rather than invoking the setter.
+      // This asserts that that holds OF A SPREAD. The spread is written here, not imported from
+      // a consumer, so a future `Object.assign` or `out[key] = value` somewhere else would NOT
+      // turn this red — see the file header for what has to be re-checked by hand instead.
       const reloaded = JSON.parse(
         JSON.stringify(mergeMaskedPluginConfig(fromJson(POSTED), fromJson("{}")).configJson),
       ) as Record<string, unknown>;
@@ -83,7 +102,7 @@ describe("PEN-4244: write-side `__proto__` policy", () => {
 
       expect(Object.keys(spread)).toContain("__proto__");
       expect(Object.getPrototypeOf(spread)).toBe(Object.prototype);
-      expectNoPrototypePollution();
+      expectNoGlobalPrototypeEscape();
     });
   });
 
@@ -116,7 +135,7 @@ describe("PEN-4244: write-side `__proto__` policy", () => {
       expect(Object.keys(restored)).toContain("__proto__");
       expect(restored.ordinarySibling).toBe("kept");
       expect(Object.getPrototypeOf(restored)).toBe(Object.prototype);
-      expectNoPrototypePollution();
+      expectNoGlobalPrototypeEscape();
     });
 
     it("persists a process-variable key named `__proto__` through the sentinel-cleaning accumulator", () => {
@@ -129,7 +148,7 @@ describe("PEN-4244: write-side `__proto__` policy", () => {
       expect(Object.keys(bindings)).toContain("__proto__");
       expect(bindings.ORDINARY_VAR).toBe("kept");
       expect(Object.getPrototypeOf(bindings)).toBe(Object.prototype);
-      expectNoPrototypePollution();
+      expectNoGlobalPrototypeEscape();
     });
   });
 

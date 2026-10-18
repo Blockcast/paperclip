@@ -1053,8 +1053,12 @@ export function mergeMaskedPluginConfig(
    * document whose stated invariant (PEN-2370 ask 1) is that key NAMES survive. One shared home
    * would imply one shared policy, and there isn't one.
    *
-   * `write-side-proto-policy.test.ts` pins this decision, and is written to FAIL if a consumer
-   * that re-parents on a stored key is ever introduced.
+   * `write-side-proto-policy.test.ts` pins this decision by execution: that these two walks
+   * persist the key without re-parenting their accumulator, and that a permissive schema accepts
+   * it while a strict one refuses. It does NOT detect a new consumer, and a green suite is not
+   * evidence that none exists — the no-`[[Set]]`-consumer premise above is a measurement over the
+   * tree at `a76a502f`, not an invariant any test enforces. If you are adding a consumer of stored
+   * `configJson` / `adapterConfig`, re-run that measurement rather than trusting the suite.
    */
   function mergeRecord(
     incoming: Record<string, unknown>,
