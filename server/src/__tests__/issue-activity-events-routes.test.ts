@@ -523,10 +523,12 @@ describe("issue activity event routes", () => {
     });
 
     // A non-assignee agent's status write is not the assignee's disposition.
-    // (It may also be refused outright by authz; either way nothing is resolved.)
-    await request(await createApp(dbMock, agentActor("33333333-3333-4333-8333-333333333333")))
+    // Assert 200 so the request reaches the clearer; a 403 would leave the
+    // assignee guard untested.
+    const nonAssigneeRes = await request(await createApp(dbMock, agentActor("33333333-3333-4333-8333-333333333333")))
       .patch(`/api/issues/${issue.id}`)
       .send({ status: "todo" });
+    expect(nonAssigneeRes.status).toBe(200);
     expect(mockLogActivity).not.toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({ action: "issue.successful_run_handoff_resolved" }),
