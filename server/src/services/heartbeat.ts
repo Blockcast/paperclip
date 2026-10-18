@@ -17857,11 +17857,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // repo-backed workspace must actually be a checkout. Nothing else ever
         // clones it, so an existing-but-empty directory would otherwise run the
         // agent against the wrong tree and fail later as a repo mismatch.
-        const gitProbe =
+        // Refuse only on a POSITIVE "not a checkout": this refusal latches
+        // manual_repair_required, so a stale handle / I/O error / dubious
+        // ownership (`indeterminate`) must keep the pre-BLO-47335 behaviour
+        // of running the existing directory rather than strand the row.
+        const notACheckout =
           projectCwdExists && !realizedFromManagedCheckout && readNonEmptyString(workspace.repoUrl)
-            ? await probeGitCheckout(projectCwd)
-            : { ok: true, detail: "" };
-        if (projectCwdExists && gitProbe.ok) {
+            ? (await probeGitCheckoutStateStrict(projectCwd)) === "not_a_checkout"
+            : false;
+        if (projectCwdExists && !notACheckout) {
           return {
             cwd: projectCwd,
             source: "project_primary" as const,
@@ -17884,7 +17888,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           workspaceId: workspace.id,
           cwd: projectCwd,
           detail: projectCwdExists
-            ? `path is not a git checkout (git: ${gitProbe.detail})`
+            ? "path is not a git checkout (git: not a git repository)"
             : "path does not exist on this host",
         });
       }
