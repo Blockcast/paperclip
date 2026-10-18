@@ -921,6 +921,14 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
     // so the editor's outside-click guard has to be able to tell them from a button on some other
     // card. Marking the root is how a panel built from plain `div`s declares that boundary
     // (PEN-4232); without it the editor falls back to a document-wide reach.
+    //
+    // ASSUMPTION — marking this root also puts `NewAgent`'s Create button *outside* the scope, since
+    // that button sits outside this component. Create mode therefore has no DOM veto. That is safe
+    // only because a create-mode env can never hold a withheld (`REDACTED`) value: with nothing
+    // masked there is no masked-rename blocker, so the veto would have nothing to fire on. A future
+    // flow that seeds create mode from existing env — "duplicate agent with env", an import, a
+    // template — breaks that premise and must either bring the Create button inside this root or
+    // re-check `flushPendingDraft().status` itself (PEN-4236).
     <div className={cn("relative", cards && "space-y-6")} data-env-editor-scope="">
       {/* ---- Floating Save button (edit mode, when dirty) ---- */}
       {isDirty && !props.hideInlineSave && (

@@ -223,7 +223,10 @@ describe("EnvironmentVariablesEditor", () => {
     expect(onChange).toHaveBeenLastCalledWith({ FOO: { type: "plain", value: "bar" } });
   });
 
-  it("flushes unsaved editor changes before an enclosing form submits", async () => {
+  // This harness mirrors a real consumer, not a hypothetical one: `PipelineSettings` renders
+  // `<StageSecretsPanel>` — and therefore this editor — inside a `<form>` whose submit saves the
+  // stage. That is the shape under test here (PEN-4236).
+  it("flushes unsaved editor changes before an enclosing form submits (the PipelineSettings stage-form shape)", async () => {
     const submittedValues: Array<Record<string, EnvBinding> | undefined> = [];
 
     function FormHarness() {
