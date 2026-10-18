@@ -5,6 +5,7 @@ import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CompanySettingsPluginPage } from "./CompanySettingsPluginPage";
+import { flushReact } from "@/test-utils/react";
 
 const mockSetBreadcrumbs = vi.hoisted(() => vi.fn());
 const mockUsePluginSlots = vi.hoisted(() => vi.fn());
@@ -49,13 +50,6 @@ vi.mock("@/plugins/slots", () => ({
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
-async function flushReact() {
-  await act(async () => {
-    await Promise.resolve();
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
-  });
-}
 
 async function renderPage(container: HTMLDivElement) {
   const root = createRoot(container);

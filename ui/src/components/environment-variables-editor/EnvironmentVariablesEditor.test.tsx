@@ -8,6 +8,7 @@ import type { CompanySecret, EnvBinding } from "@paperclipai/shared";
 import { REDACTED_SENTINEL } from "@paperclipai/shared";
 import { EnvironmentVariablesEditor } from "./index";
 import { SecretPicker } from "./SecretPicker";
+import { flushReact } from "@/test-utils/react";
 
 // Radix (DropdownMenu/Popover) relies on Pointer Capture APIs that jsdom omits.
 const OriginalPointerEvent = globalThis.PointerEvent;
@@ -60,14 +61,6 @@ function makeSecret(id: string, overrides: Partial<CompanySecret> = {}): Company
     updatedAt: new Date(0),
     ...overrides,
   };
-}
-
-async function flush() {
-  for (let i = 0; i < 5; i += 1) {
-    await Promise.resolve();
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
-  }
-  flushSync(() => {});
 }
 
 // Radix DropdownMenu opens/selects on the pointerdown→pointerup sequence, not a
@@ -126,7 +119,7 @@ describe("EnvironmentVariablesEditor", () => {
     // focus-restoration timers) so a timer scheduled by this test can't fire
     // mid-way through the next one and dismiss its freshly-opened popover — that
     // cross-test leak is what made the real-timer sibling regression tests flaky.
-    await flush();
+    await flushReact(5);
     for (const child of [...document.body.children]) {
       child.remove();
     }
@@ -201,7 +194,7 @@ describe("EnvironmentVariablesEditor", () => {
     render(<EnvironmentVariablesEditor value={{}} secrets={secrets} onChange={() => {}} onCreateSecret={async () => secrets[0]} />);
     const addButton = [...container.querySelectorAll("button")].find((b) => b.textContent?.includes("Add variable"))!;
     addButton.click();
-    await flush();
+    await flushReact(5);
     expect(nameInputs()).toHaveLength(1);
   });
 
@@ -210,7 +203,7 @@ describe("EnvironmentVariablesEditor", () => {
     render(<EnvironmentVariablesEditor value={{}} secrets={secrets} onChange={onChange} onCreateSecret={async () => secrets[0]} />);
     const addButton = [...container.querySelectorAll("button")].find((b) => b.textContent?.includes("Add variable"))!;
     addButton.click();
-    await flush();
+    await flushReact(5);
     expect(nameInputs()).toHaveLength(1);
     expect(onChange).not.toHaveBeenCalled();
   });
@@ -222,11 +215,11 @@ describe("EnvironmentVariablesEditor", () => {
     const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
     setter.call(valueInput, "bar");
     valueInput.dispatchEvent(new Event("input", { bubbles: true }));
-    await flush();
+    await flushReact(5);
     expect(onChange).not.toHaveBeenCalled();
     expect(container.textContent).toContain("Unsaved changes");
     saveButton().click();
-    await flush();
+    await flushReact(5);
     expect(onChange).toHaveBeenLastCalledWith({ FOO: { type: "plain", value: "bar" } });
   });
 
@@ -260,13 +253,13 @@ describe("EnvironmentVariablesEditor", () => {
     const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
     setter.call(valueInput, "bar");
     valueInput.dispatchEvent(new Event("input", { bubbles: true }));
-    await flush();
+    await flushReact(5);
 
     const outerSave = [...container.querySelectorAll<HTMLButtonElement>("button")].find((button) =>
       button.textContent?.includes("Outer save"),
     )!;
     outerSave.click();
-    await flush();
+    await flushReact(5);
 
     expect(submittedValues).toEqual([{ FOO: { type: "plain", value: "bar" } }]);
   });
@@ -298,13 +291,13 @@ describe("EnvironmentVariablesEditor", () => {
     const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
     setter.call(valueInput, "bar");
     valueInput.dispatchEvent(new Event("input", { bubbles: true }));
-    await flush();
+    await flushReact(5);
 
     const outerSave = [...container.querySelectorAll<HTMLButtonElement>("button")].find((button) =>
       button.textContent?.includes("Save settings"),
     )!;
     outerSave.click();
-    await flush();
+    await flushReact(5);
 
     expect(savedValues).toEqual([{ FOO: { type: "plain", value: "bar" } }]);
   });
@@ -315,7 +308,7 @@ describe("EnvironmentVariablesEditor", () => {
     const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
     setter.call(valueInput, "bar");
     valueInput.dispatchEvent(new Event("input", { bubbles: true }));
-    await flush();
+    await flushReact(5);
 
     const unsavedBar = [...container.querySelectorAll<HTMLElement>('[role="status"]')].find((node) =>
       node.textContent?.includes("Unsaved changes"),
@@ -346,23 +339,23 @@ describe("EnvironmentVariablesEditor", () => {
     const valueInput = container.querySelector<HTMLInputElement>('input[aria-label="Variable value"]')!;
     setter.call(valueInput, "new");
     valueInput.dispatchEvent(new Event("input", { bubbles: true }));
-    await flush();
+    await flushReact(5);
     expect(container.textContent).toContain("Edited: FOO");
 
     // Remove BAR.
     const removeButtons = [...container.querySelectorAll<HTMLButtonElement>('button[aria-label^="Remove"]')];
     removeButtons.at(-1)!.click();
-    await flush();
+    await flushReact(5);
     expect(container.textContent).toContain("Removed: BAR");
 
     // Add a brand-new variable.
     const addButton = [...container.querySelectorAll("button")].find((b) => b.textContent?.includes("Add variable"))!;
     addButton.click();
-    await flush();
+    await flushReact(5);
     const newNameInput = nameInputs().at(-1)!;
     setter.call(newNameInput, "API_TOKEN");
     newNameInput.dispatchEvent(new Event("input", { bubbles: true }));
-    await flush();
+    await flushReact(5);
     expect(container.textContent).toContain("New: API_TOKEN");
     expect(container.textContent).toContain("Edited: FOO");
     expect(container.textContent).toContain("Removed: BAR");
@@ -409,14 +402,14 @@ describe("EnvironmentVariablesEditor", () => {
     const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
     setter.call(valueInput, "bar");
     valueInput.dispatchEvent(new Event("input", { bubbles: true }));
-    await flush();
+    await flushReact(5);
     expect(dispatchBeforeUnload()).toBe(true);
 
     const revert = [...container.querySelectorAll<HTMLButtonElement>("button")].find(
       (button) => button.textContent?.trim() === "Revert",
     )!;
     revert.click();
-    await flush();
+    await flushReact(5);
     expect(dispatchBeforeUnload()).toBe(false);
   });
 
@@ -424,13 +417,13 @@ describe("EnvironmentVariablesEditor", () => {
     render(<EnvironmentVariablesEditor value={{}} secrets={secrets} onChange={() => {}} onCreateSecret={async () => secrets[0]} />);
     const addButton = [...container.querySelectorAll("button")].find((b) => b.textContent?.includes("Add variable"))!;
     addButton.click();
-    await flush();
+    await flushReact(5);
 
     const nameInput = nameInputs()[0]!;
     const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
     setter.call(nameInput, "API_TOKEN");
     nameInput.dispatchEvent(new Event("input", { bubbles: true }));
-    await flush();
+    await flushReact(5);
 
     expect(nameInput.className).toContain("border-amber-500/70");
     expect(container.textContent).toContain("Unsaved changes");
@@ -452,14 +445,14 @@ describe("EnvironmentVariablesEditor", () => {
     );
     const addButton = [...container.querySelectorAll("button")].find((b) => b.textContent?.includes("Add variable"))!;
     addButton.click();
-    await flush();
+    await flushReact(5);
 
     const newNameInput = nameInputs().at(-1)!;
     const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
     setter.call(newNameInput, "ca");
     newNameInput.dispatchEvent(new Event("input", { bubbles: true }));
     newNameInput.focus();
-    await flush();
+    await flushReact(5);
 
     expect(onChange).not.toHaveBeenCalled();
     expect(document.activeElement).toBe(newNameInput);
@@ -472,7 +465,7 @@ describe("EnvironmentVariablesEditor", () => {
         onCreateSecret={async () => secrets[0]}
       />,
     );
-    await flush();
+    await flushReact(5);
 
     expect(onChange).not.toHaveBeenCalled();
     expect(document.activeElement).toBe(newNameInput);
@@ -480,11 +473,11 @@ describe("EnvironmentVariablesEditor", () => {
 
     setter.call(newNameInput, "carol");
     newNameInput.dispatchEvent(new Event("input", { bubbles: true }));
-    await flush();
+    await flushReact(5);
     expect(onChange).not.toHaveBeenCalled();
 
     saveButton().click();
-    await flush();
+    await flushReact(5);
     expect(onChange).toHaveBeenLastCalledWith({
       ZED: { type: "plain", value: "z" },
       ALPHA: { type: "plain", value: "a" },
@@ -506,23 +499,23 @@ describe("EnvironmentVariablesEditor", () => {
     );
     const addButton = [...container.querySelectorAll("button")].find((b) => b.textContent?.includes("Add variable"))!;
     addButton.click();
-    await flush();
+    await flushReact(5);
 
     const [nameInput] = nameInputs();
     const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
     setter.call(nameInput, "API_TOKEN");
     nameInput.dispatchEvent(new Event("input", { bubbles: true }));
-    await flush();
+    await flushReact(5);
 
     const valueInput = container.querySelector<HTMLInputElement>('input[aria-label="Variable value"]')!;
     setter.call(valueInput, "secret-value");
     valueInput.dispatchEvent(new Event("input", { bubbles: true }));
     valueInput.focus();
-    await flush();
+    await flushReact(5);
     expect(document.activeElement).toBe(valueInput);
     expect(onChange).not.toHaveBeenCalled();
     saveButton().click();
-    await flush();
+    await flushReact(5);
     expect(onChange).toHaveBeenLastCalledWith(savedValue);
 
     rerender(
@@ -533,7 +526,7 @@ describe("EnvironmentVariablesEditor", () => {
         onCreateSecret={async () => secrets[0]}
       />,
     );
-    await flush();
+    await flushReact(5);
 
     expect(document.activeElement).toBe(valueInput);
     expect(container.querySelector<HTMLInputElement>('input[aria-label="Variable value"]')).toBe(valueInput);
@@ -544,10 +537,10 @@ describe("EnvironmentVariablesEditor", () => {
     render(<EnvironmentVariablesEditor value={{ FOO: { type: "plain", value: "x" } }} secrets={secrets} onChange={onChange} onCreateSecret={async () => secrets[0]} />);
     const removeButton = container.querySelector<HTMLButtonElement>('button[aria-label^="Remove"]')!;
     removeButton.click();
-    await flush();
+    await flushReact(5);
     expect(onChange).not.toHaveBeenCalled();
     saveButton().click();
-    await flush();
+    await flushReact(5);
     expect(onChange).toHaveBeenLastCalledWith(undefined);
   });
 
@@ -612,7 +605,7 @@ describe("EnvironmentVariablesEditor", () => {
     const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
     setter.call(nameInput, "GITHUB_TOKEN");
     nameInput.dispatchEvent(new Event("input", { bubbles: true }));
-    await flush();
+    await flushReact(5);
 
     // No blur: `touchedNames` is seeded with the LOADED names and probed by the CURRENT one, so a
     // rename is never "touched". Gating on it would hide this error in exactly the case it exists
@@ -628,11 +621,11 @@ describe("EnvironmentVariablesEditor", () => {
     const valueInput = container.querySelectorAll<HTMLInputElement>('input[aria-label="Variable value"]')[0]!;
     setter.call(valueInput, "a-new-token");
     valueInput.dispatchEvent(new Event("input", { bubbles: true }));
-    await flush();
+    await flushReact(5);
     expect(findRenameError(), "supplying a value should lift the block").toBeFalsy();
 
     saveButton().click();
-    await flush();
+    await flushReact(5);
     expect(onChange).toHaveBeenLastCalledWith({
       GITHUB_TOKEN: { type: "plain", value: "a-new-token" },
       NODE_ENV: { type: "plain", value: "production" },
@@ -684,13 +677,13 @@ describe("EnvironmentVariablesEditor", () => {
     const otherValue = container.querySelectorAll<HTMLInputElement>('input[aria-label="Variable value"]')[1]!;
     setter.call(otherValue, "staging");
     otherValue.dispatchEvent(new Event("input", { bubbles: true }));
-    await flush();
+    await flushReact(5);
 
     // Route 1: the editor's own Save button — disabled, and inert if clicked anyway.
     const save = saveButton();
     expect(save.disabled, "the editor Save button must be disabled").toBe(true);
     save.click();
-    await flush();
+    await flushReact(5);
     expect(onChange, "the editor button must not emit a sentinel-bearing payload").not.toHaveBeenCalled();
 
     // The refusal has to say which row, next to the button it disabled.
@@ -705,7 +698,7 @@ describe("EnvironmentVariablesEditor", () => {
       button.textContent?.includes("Outer save"),
     )!;
     outerSave.click();
-    await flush();
+    await flushReact(5);
     expect(onChange, "an outer submit must not promote the blocked draft either").not.toHaveBeenCalled();
     // PEN-3358: the outer submit is now *aborted*, not merely un-contributed-to.
     //
@@ -723,7 +716,7 @@ describe("EnvironmentVariablesEditor", () => {
     const form = container.querySelector("form")!;
     const submitEvent = new Event("submit", { bubbles: true, cancelable: true });
     form.dispatchEvent(submitEvent);
-    await flush();
+    await flushReact(5);
     expect(
       submitEvent.defaultPrevented,
       "the capture-phase form submit listener must cancel a submit the editor is refusing",
@@ -731,7 +724,7 @@ describe("EnvironmentVariablesEditor", () => {
 
     const clickEvent = new MouseEvent("click", { bubbles: true, cancelable: true });
     outerSave.dispatchEvent(clickEvent);
-    await flush();
+    await flushReact(5);
     expect(
       clickEvent.defaultPrevented,
       "the outside-Save click listener must cancel a click the editor is refusing",
@@ -742,10 +735,10 @@ describe("EnvironmentVariablesEditor", () => {
     const maskedValue = container.querySelectorAll<HTMLInputElement>('input[aria-label="Variable value"]')[0]!;
     setter.call(maskedValue, "a-new-token");
     maskedValue.dispatchEvent(new Event("input", { bubbles: true }));
-    await flush();
+    await flushReact(5);
     expect(saveButton().disabled, "the block must lift, not latch").toBe(false);
     saveButton().click();
-    await flush();
+    await flushReact(5);
     expect(onChange).toHaveBeenLastCalledWith({
       GITHUB_TOKEN: { type: "plain", value: "a-new-token" },
       NODE_ENV: { type: "plain", value: "staging" },
@@ -828,26 +821,26 @@ describe("EnvironmentVariablesEditor", () => {
     const nameInput = nameInputs()[0]!;
     setter.call(nameInput, "GITHUB_TOKEN");
     nameInput.dispatchEvent(new Event("input", { bubbles: true }));
-    await flush();
+    await flushReact(5);
     expect(container.textContent, "the refusal must be live for this test to mean anything").toContain("Can't save");
 
     // Positive: the panel's own footer button is the one the editor may cancel.
     expect(clickIsVetoed(byLabel("Save environment")), "the editor's own panel Save must be vetoed").toBe(true);
-    await flush();
+    await flushReact(5);
     expect(inScopeSave, "and its handler must never run").not.toHaveBeenCalled();
 
     // Negative — the half that already passed before this fix is the positive one, so these are
     // the assertions that pin it. Each of these buttons belongs to something else.
     expect(clickIsVetoed(byLabel("Update")), "a sibling form's submit must not be vetoed").toBe(false);
-    await flush();
+    await flushReact(5);
     expect(siblingUpdate, "a sibling form's submit must still fire").toHaveBeenCalledTimes(1);
 
     expect(clickIsVetoed(byLabel("Create secret")), "a dialog the editor is not in must not be vetoed").toBe(false);
-    await flush();
+    await flushReact(5);
     expect(dialogCreate, "that dialog's button must still fire").toHaveBeenCalledTimes(1);
 
     expect(clickIsVetoed(byLabel("Import")), "a stray submit button must not be vetoed").toBe(false);
-    await flush();
+    await flushReact(5);
     expect(strayImport, "the stray submit button must still fire").toHaveBeenCalledTimes(1);
 
     // Nothing above may have promoted the refused draft, in or out of scope.
@@ -858,9 +851,9 @@ describe("EnvironmentVariablesEditor", () => {
     const maskedValue = container.querySelectorAll<HTMLInputElement>('input[aria-label="Variable value"]')[0]!;
     setter.call(maskedValue, "a-new-token");
     maskedValue.dispatchEvent(new Event("input", { bubbles: true }));
-    await flush();
+    await flushReact(5);
     expect(clickIsVetoed(byLabel("Update")), "with no refusal there is nothing to veto").toBe(false);
-    await flush();
+    await flushReact(5);
     expect(onChange, "an out-of-scope click still promotes a clean draft").toHaveBeenLastCalledWith({
       GITHUB_TOKEN: { type: "plain", value: "a-new-token" },
     });
@@ -897,13 +890,13 @@ describe("EnvironmentVariablesEditor", () => {
     const nameInput = nameInputs()[0]!;
     setter.call(nameInput, "GITHUB_TOKEN");
     nameInput.dispatchEvent(new Event("input", { bubbles: true }));
-    await flush();
+    await flushReact(5);
 
     // By test id, not by label: the editor renders its own disabled "Save" inside its root.
     const save = container.querySelector<HTMLButtonElement>('[data-testid="outer-save"]')!;
     const event = new MouseEvent("click", { bubbles: true, cancelable: true });
     save.dispatchEvent(event);
-    await flush();
+    await flushReact(5);
     expect(event.defaultPrevented, "an undeclared consumer keeps the guard over its own Save").toBe(true);
     expect(outerSave).not.toHaveBeenCalled();
   });
@@ -914,16 +907,16 @@ describe("EnvironmentVariablesEditor", () => {
     // Add an empty row to paste into.
     const addButton = [...container.querySelectorAll("button")].find((b) => b.textContent?.includes("Add variable"))!;
     addButton.click();
-    await flush();
+    await flushReact(5);
     const nameInput = nameInputs()[0]!;
     const clipboardData = { getData: () => "A=1\nB=2\nC=3" } as unknown as DataTransfer;
     const pasteEvent = new Event("paste", { bubbles: true, cancelable: true }) as unknown as ClipboardEvent;
     Object.defineProperty(pasteEvent, "clipboardData", { value: clipboardData });
     nameInput.dispatchEvent(pasteEvent);
-    await flush();
+    await flushReact(5);
     expect(onChange).not.toHaveBeenCalled();
     saveButton().click();
-    await flush();
+    await flushReact(5);
     expect(onChange).toHaveBeenLastCalledWith({
       A: { type: "plain", value: "1" },
       B: { type: "plain", value: "2" },
@@ -944,7 +937,7 @@ describe("EnvironmentVariablesEditor", () => {
       button.textContent?.includes("Add variable"),
     )!;
     addButton.click();
-    await flush();
+    await flushReact(5);
 
     const targetNameInput = nameInputs().at(-1)!;
     const pasteEvent = new Event("paste", { bubbles: true, cancelable: true }) as unknown as ClipboardEvent;
@@ -952,7 +945,7 @@ describe("EnvironmentVariablesEditor", () => {
       value: { getData: () => "A=new" } as unknown as DataTransfer,
     });
     targetNameInput.dispatchEvent(pasteEvent);
-    await flush();
+    await flushReact(5);
 
     const valueInput = container.querySelector<HTMLInputElement>('input[aria-label="Variable value"]')!;
     const valueCell = valueInput.closest<HTMLDivElement>(".relative.flex");
@@ -976,7 +969,7 @@ describe("EnvironmentVariablesEditor", () => {
     const storeButton = container.querySelector<HTMLButtonElement>('button[title^="This value looks sensitive"]');
     expect(storeButton, "sensitive Store-as-secret affordance should render").toBeTruthy();
     storeButton!.click();
-    await flush();
+    await flushReact(5);
     // The store popover carries the typed value forward (not discarded).
     expect(document.body.textContent).toContain("Store value as secret");
     const secretValueField = document.querySelector<HTMLInputElement>('input[aria-label="Secret value"]');
@@ -998,13 +991,13 @@ describe("EnvironmentVariablesEditor", () => {
     );
     const combobox = container.querySelector<HTMLElement>('[role="combobox"]')!;
     combobox.focus();
-    await flush();
+    await flushReact(5);
     const createItem = [...document.querySelectorAll<HTMLElement>("[cmdk-item]")].find((el) =>
       el.textContent?.includes("Create"),
     );
     expect(createItem, "create item should be present in the open picker").toBeTruthy();
     createItem!.click();
-    await flush();
+    await flushReact(5);
     // The create-secret popover is open (heading rendered) and stays open.
     expect(document.body.textContent, "create-secret popover should open").toContain("Create secret");
     expect(
@@ -1036,13 +1029,13 @@ describe("EnvironmentVariablesEditor", () => {
     );
     const combobox = container.querySelector<HTMLElement>('[role="combobox"]')!;
     combobox.focus();
-    await flush();
+    await flushReact(5);
     const createItem = [...document.querySelectorAll<HTMLElement>("[cmdk-item]")].find((el) =>
       el.textContent?.includes("Create"),
     );
     expect(createItem, "create item should be present in the open picker").toBeTruthy();
     createItem!.click();
-    await flush();
+    await flushReact(5);
     expect(document.body.textContent, "create-secret popover should open").toContain("Create secret");
 
     // Simulate the picker's animation-delayed focus-return landing on a control
@@ -1055,7 +1048,7 @@ describe("EnvironmentVariablesEditor", () => {
     const sourceButton = container.querySelector<HTMLElement>('button[aria-label="Value source"]')!;
     expect(sourceButton, "in-anchor Value source control should exist").toBeTruthy();
     sourceButton.focus();
-    await flush();
+    await flushReact(5);
 
     expect(
       document.body.textContent,
@@ -1087,13 +1080,13 @@ describe("EnvironmentVariablesEditor", () => {
     const overflow = container.querySelector<HTMLButtonElement>('button[aria-label="More actions"]');
     expect(overflow, "⋯ overflow menu should render for a non-sensitive text row").toBeTruthy();
     pointerClick(overflow!);
-    await flush();
+    await flushReact(5);
     const storeItem = [...document.querySelectorAll<HTMLElement>('[role="menuitem"]')].find((el) =>
       el.textContent?.includes("Store as secret"),
     );
     expect(storeItem, "Store as secret… menu item should be present").toBeTruthy();
     pointerClick(storeItem!);
-    await flush();
+    await flushReact(5);
     // The store popover is open (heading rendered) and stays open — it must not
     // be dismissed by the menu's focus-return.
     expect(document.body.textContent, "store-as-secret popover should open").toContain(
@@ -1161,7 +1154,7 @@ describe("EnvironmentVariablesEditor", () => {
     );
     expect(dismissButton, "dismiss affordance should render alongside the hint").toBeTruthy();
     dismissButton!.click();
-    await flush();
+    await flushReact(5);
 
     // Hint + its dismiss control are gone, and the value is no longer masked.
     expect(
@@ -1202,7 +1195,7 @@ describe("EnvironmentVariablesEditor", () => {
 
     const combobox = container.querySelector<HTMLElement>('[role="combobox"]')!;
     combobox.focus();
-    await flush();
+    await flushReact(5);
 
     const itemByText = (text: string) =>
       [...document.querySelectorAll<HTMLElement>("[cmdk-item]")].find((el) =>
@@ -1216,21 +1209,21 @@ describe("EnvironmentVariablesEditor", () => {
     );
 
     itemByText("paperclip-cloud")!.click();
-    await flush();
+    await flushReact(5);
     expect(rowTitle(itemByText("prod"))).toBe("/paperclip-cloud/prod");
 
     itemByText("prod")!.click();
-    await flush();
+    await flushReact(5);
     expect(rowTitle(itemByText("provider"))).toBe("/paperclip-cloud/prod/provider");
     expect(rowTitle(itemByText("migration"))).toBe("/paperclip-cloud/prod/migration");
 
     itemByText("provider")!.click();
-    await flush();
+    await flushReact(5);
     const leaf = itemByText("aws-access-key-id");
     expect(rowTitle(leaf)).toBe(cloudProviderKey);
 
     leaf!.click();
-    await flush();
+    await flushReact(5);
     expect(onSelect).toHaveBeenCalledWith("provider-key");
   });
 
@@ -1254,7 +1247,7 @@ describe("EnvironmentVariablesEditor", () => {
 
     const combobox = container.querySelector<HTMLElement>('[role="combobox"]')!;
     combobox.focus();
-    await flush();
+    await flushReact(5);
     expect(document.body.textContent).toContain("paperclip-cloud");
     expect(document.body.textContent).not.toContain("postgres-url");
 
@@ -1262,7 +1255,7 @@ describe("EnvironmentVariablesEditor", () => {
     const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
     setter.call(search, "postgres");
     search.dispatchEvent(new Event("input", { bubbles: true }));
-    await flush();
+    await flushReact(5);
 
     const match = [...document.querySelectorAll<HTMLElement>("[cmdk-item]")].find((el) =>
       el.textContent?.includes(cloudMigrationKey),
@@ -1288,9 +1281,9 @@ describe("EnvironmentVariablesEditor", () => {
     nameInput.dispatchEvent(new Event("input", { bubbles: true }));
     // Flush BEFORE blur: the blur handler resolves the row id against the `rows` it closed over,
     // so firing both in one tick marks the pre-rename name as touched and the issue stays hidden.
-    await flush();
+    await flushReact(5);
     nameInput.dispatchEvent(new FocusEvent("focusout", { bubbles: true }));
-    await flush();
+    await flushReact(5);
 
     expect(container.textContent).toContain("Reserved name");
     // The charset copy would be wrong here — `__proto__` IS letters and underscores. Assert it is
@@ -1318,9 +1311,9 @@ describe("EnvironmentVariablesEditor", () => {
     nameInput.dispatchEvent(new Event("input", { bubbles: true }));
     // Flush BEFORE blur: the blur handler resolves the row id against the `rows` it closed over,
     // so firing both in one tick marks the pre-rename name as touched and the issue stays hidden.
-    await flush();
+    await flushReact(5);
     nameInput.dispatchEvent(new FocusEvent("focusout", { bubbles: true }));
-    await flush();
+    await flushReact(5);
 
     expect(container.textContent).not.toContain("Reserved name");
     expect(nameInput.getAttribute("aria-invalid")).toBeNull();

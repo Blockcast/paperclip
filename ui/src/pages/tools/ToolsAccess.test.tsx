@@ -4,6 +4,7 @@ import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ToolsAccess } from "./ToolsAccess";
+import { flushReact } from "@/test-utils/react";
 
 const mockParams = vi.hoisted(() => ({ tab: undefined as string | undefined }));
 const navigateMock = vi.hoisted(() => vi.fn(({ to }: { to: string }) => <div data-navigate={to} />));
@@ -51,11 +52,6 @@ vi.mock("./RunYourOwnTab", () => ({
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
-async function flushReact() {
-  await Promise.resolve();
-  await new Promise((resolve) => window.setTimeout(resolve, 0));
-}
 
 describe("ToolsAccess", () => {
   let container: HTMLDivElement;

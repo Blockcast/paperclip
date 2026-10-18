@@ -7,6 +7,7 @@ import { MemoryRouter, Route, Routes } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { queryKeys } from "../lib/queryKeys";
 import { AuthPage } from "./Auth";
+import { flushReact } from "@/test-utils/react";
 
 const getSessionMock = vi.hoisted(() => vi.fn());
 const getHealthMock = vi.hoisted(() => vi.fn());
@@ -69,14 +70,6 @@ async function act(callback: () => void | Promise<void>) {
     result = callback();
   });
   await result;
-}
-
-async function flushReact() {
-  await act(async () => {
-    await Promise.resolve();
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
-  });
-  flushSync(() => {});
 }
 
 function renderAuthPage(container: HTMLElement) {

@@ -10,6 +10,7 @@ import type {
 } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createElement } from "react";
+import { flushReact } from "@/test-utils/react";
 
 const mockToolsApi = vi.hoisted(() => ({
   getEffectiveProfilesForAgent: vi.fn(),
@@ -36,16 +37,6 @@ async function act(callback: () => void | Promise<void>) {
     result = callback();
   });
   await result;
-}
-
-async function flushReact(cycles = 4) {
-  // Multiple cycles let dependent query waves settle (connections → per-connection catalog).
-  for (let i = 0; i < cycles; i += 1) {
-    await act(async () => {
-      await Promise.resolve();
-      await new Promise((resolve) => window.setTimeout(resolve, 0));
-    });
-  }
 }
 
 function makeCatalogEntry(overrides: Partial<ToolCatalogEntry>): ToolCatalogEntry {

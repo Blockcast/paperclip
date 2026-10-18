@@ -7,6 +7,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CommandPalette } from "./CommandPalette";
 import { queryKeys } from "../lib/queryKeys";
+import { flushReact, waitForAssertion } from "@/test-utils/react";
 
 function act(callback: () => void | Promise<void>) {
   let result: void | Promise<void> | undefined;
@@ -142,26 +143,6 @@ vi.mock("@/components/ui/command", () => ({
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
-async function flush() {
-  await act(async () => {
-    await Promise.resolve();
-  });
-}
-
-async function waitForAssertion(assertion: () => void, attempts = 20) {
-  let lastError: unknown;
-  for (let attempt = 0; attempt < attempts; attempt += 1) {
-    try {
-      assertion();
-      return;
-    } catch (error) {
-      lastError = error;
-      await flush();
-    }
-  }
-  throw lastError;
-}
 
 function renderWithQueryClient(
   node: ReactNode,

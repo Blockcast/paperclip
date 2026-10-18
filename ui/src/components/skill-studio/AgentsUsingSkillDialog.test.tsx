@@ -15,6 +15,7 @@ import {
   AgentsUsingSkillBadge,
   AgentsUsingSkillDialog,
 } from "./AgentsUsingSkillDialog";
+import { flushReact } from "@/test-utils/react";
 
 const mockAgentsApi = vi.hoisted(() => ({
   list: vi.fn(),
@@ -59,11 +60,6 @@ async function act(callback: () => void | Promise<void>) {
   await result;
 }
 
-async function flush() {
-  await Promise.resolve();
-  await new Promise((resolve) => window.setTimeout(resolve, 0));
-}
-
 function teardown() {
   if (root) flushSync(() => root?.unmount());
   container?.remove();
@@ -84,14 +80,14 @@ async function renderNode(node: ReactNode) {
   await act(async () => {
     root?.render(<QueryClientProvider client={queryClient}>{node}</QueryClientProvider>);
   });
-  await flush();
+  await flushReact();
 }
 
 async function click(el: Element) {
   await act(async () => {
     el.dispatchEvent(new MouseEvent("click", { bubbles: true }));
   });
-  await flush();
+  await flushReact();
 }
 
 function findButton(name: string): HTMLButtonElement {
@@ -321,7 +317,7 @@ describe("AgentsUsingSkillDialog", () => {
       setter?.call(select, "ver-2");
       select?.dispatchEvent(new Event("change", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     expect(mockAgentsApi.syncSkills).toHaveBeenCalledTimes(1);
     const [, sentEntries] = mockAgentsApi.syncSkills.mock.calls[0];

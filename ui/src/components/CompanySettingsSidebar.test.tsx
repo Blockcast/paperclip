@@ -4,6 +4,7 @@ import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CompanySettingsSidebar } from "./CompanySettingsSidebar";
+import { flushReact } from "@/test-utils/react";
 
 const sidebarNavItemMock = vi.hoisted(() => vi.fn());
 const mockSidebarBadgesApi = vi.hoisted(() => ({
@@ -95,13 +96,6 @@ async function act(callback: () => void | Promise<void>) {
   await new Promise((resolve) => window.setTimeout(resolve, 0));
 }
 
-async function flushReact() {
-  for (let i = 0; i < 3; i += 1) {
-    await Promise.resolve();
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
-  }
-}
-
 describe("CompanySettingsSidebar", () => {
   let container: HTMLDivElement;
 
@@ -147,7 +141,7 @@ describe("CompanySettingsSidebar", () => {
         </QueryClientProvider>,
       );
     });
-    await flushReact();
+    await flushReact(3);
 
     expect(container.textContent).toContain("Paperclip");
     expect(container.textContent).toContain("Company Settings");
@@ -250,7 +244,7 @@ describe("CompanySettingsSidebar", () => {
         </QueryClientProvider>,
       );
     });
-    await flushReact();
+    await flushReact(3);
 
     expect(container.textContent).toContain("Cloud upstream");
     expect(sidebarNavItemMock).toHaveBeenCalledWith(
@@ -296,7 +290,7 @@ describe("CompanySettingsSidebar", () => {
         </QueryClientProvider>,
       );
     });
-    await flushReact();
+    await flushReact(3);
 
     expect(container.textContent).toContain("Permissions");
     expect(sidebarNavItemMock).toHaveBeenCalledWith(
@@ -328,7 +322,7 @@ describe("CompanySettingsSidebar", () => {
         </QueryClientProvider>,
       );
     });
-    await flushReact();
+    await flushReact(3);
 
     expect(container.textContent).toContain("Cloud upstream");
     expect(sidebarNavItemMock).toHaveBeenCalledWith(
@@ -386,7 +380,7 @@ describe("CompanySettingsSidebar", () => {
         </QueryClientProvider>,
       );
     });
-    await flushReact();
+    await flushReact(3);
 
     const pluginLinks = Array.from(
       container.querySelectorAll<HTMLAnchorElement>('a[href^="/company/settings/instance/plugins/"]'),

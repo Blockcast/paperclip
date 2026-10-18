@@ -8,6 +8,7 @@ import type { ToolMcpGatewayToken, ToolMcpGatewayWithTokens, ToolProfileWithDeta
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { GatewaysTab } from "./GatewaysTab";
 import { RelativeTime } from "./shared";
+import { flushReact } from "@/test-utils/react";
 
 const listGatewaysMock = vi.hoisted(() => vi.fn());
 const listProfilesMock = vi.hoisted(() => vi.fn());
@@ -50,15 +51,6 @@ async function act(callback: () => void | Promise<void>) {
     result = callback();
   });
   await result;
-}
-
-async function flushReact() {
-  for (let i = 0; i < 3; i += 1) {
-    await act(async () => {
-      await Promise.resolve();
-      await new Promise((resolve) => window.setTimeout(resolve, 0));
-    });
-  }
 }
 
 function profile(overrides: Partial<ToolProfileWithDetails> = {}): ToolProfileWithDetails {
@@ -210,7 +202,7 @@ describe("GatewaysTab", () => {
     await act(async () => {
       root.render(node);
     });
-    await flushReact();
+    await flushReact(3);
   }
 
   it("renders future relative times as an in-prefix and preserves past ago labels", async () => {

@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ConfigureBuiltInAgentModal } from "./ConfigureBuiltInAgentModal";
 import type { BuiltInAgentState } from "@/api/builtInAgents";
+import { flushReact } from "@/test-utils/react";
 
 const provisionMock = vi.hoisted(() => vi.fn());
 const updateMock = vi.hoisted(() => vi.fn());
@@ -72,14 +73,6 @@ function makeState(overrides: Partial<BuiltInAgentState> = {}): BuiltInAgentStat
   };
 }
 
-async function flushReact() {
-  for (let index = 0; index < 6; index += 1) {
-    await Promise.resolve();
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
-  }
-  flushSync(() => {});
-}
-
 function findButton(text: string): HTMLButtonElement | undefined {
   return Array.from(document.body.querySelectorAll("button")).find((b) =>
     b.textContent?.includes(text),
@@ -108,7 +101,7 @@ describe("ConfigureBuiltInAgentModal (PAP-12978)", () => {
         </QueryClientProvider>,
       );
     });
-    await flushReact();
+    await flushReact(6);
   }
 
   beforeEach(() => {
@@ -144,14 +137,14 @@ describe("ConfigureBuiltInAgentModal (PAP-12978)", () => {
       setter.call(modelInput, "gpt-5");
       modelInput.dispatchEvent(new Event("input", { bubbles: true }));
     });
-    await flushReact();
+    await flushReact(6);
 
     const submitReady = findButton("Configure")!;
     expect(submitReady.disabled).toBe(false);
     flushSync(() => {
       submitReady.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flushReact();
+    await flushReact(6);
 
     expect(provisionMock).toHaveBeenCalledWith("c1", "briefs", {
       adapterType: "codex_local",
@@ -181,7 +174,7 @@ describe("ConfigureBuiltInAgentModal (PAP-12978)", () => {
     flushSync(() => {
       submit.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flushReact();
+    await flushReact(6);
 
     expect(provisionMock).toHaveBeenCalledWith("c1", "briefs", {
       adapterType: "claude_local",
@@ -200,7 +193,7 @@ describe("ConfigureBuiltInAgentModal (PAP-12978)", () => {
         defaultAdapterConfig: { model: "claude-haiku-4-6" },
       },
     }));
-    await flushReact();
+    await flushReact(6);
 
     expect(document.body.querySelector('[role="alert"]')?.textContent)
       .toContain("claude-haiku-4-6");
@@ -225,19 +218,19 @@ describe("ConfigureBuiltInAgentModal (PAP-12978)", () => {
       setter.call(modelInput, "gpt-5");
       modelInput.dispatchEvent(new Event("input", { bubbles: true }));
     });
-    await flushReact();
+    await flushReact(6);
 
     const budgetInput = document.body.querySelector('input[type="number"]') as HTMLInputElement;
     flushSync(() => {
       setter.call(budgetInput, "50");
       budgetInput.dispatchEvent(new Event("input", { bubbles: true }));
     });
-    await flushReact();
+    await flushReact(6);
 
     flushSync(() => {
       findButton("Configure")!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flushReact();
+    await flushReact(6);
 
     expect(provisionMock).toHaveBeenCalled();
     expect(provisionMock).toHaveBeenCalledWith("c1", "briefs", {
@@ -265,7 +258,7 @@ describe("ConfigureBuiltInAgentModal (PAP-12978)", () => {
     flushSync(() => {
       submit!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flushReact();
+    await flushReact(6);
 
     expect(provisionMock).toHaveBeenCalledWith("c1", "briefs", {
       adapterType: "process",
@@ -286,12 +279,12 @@ describe("ConfigureBuiltInAgentModal (PAP-12978)", () => {
       setter.call(modelInput, "gpt-5");
       modelInput.dispatchEvent(new Event("input", { bubbles: true }));
     });
-    await flushReact();
+    await flushReact(6);
 
     flushSync(() => {
       findButton("Configure")!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flushReact();
+    await flushReact(6);
 
     expect(document.body.textContent).toContain("Adapter not allowed");
     expect(onOpenChange).not.toHaveBeenCalledWith(false);

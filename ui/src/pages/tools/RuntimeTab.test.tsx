@@ -7,6 +7,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { RuntimeTab } from "./RuntimeTab";
+import { flushReact } from "@/test-utils/react";
 
 const listRuntimeSlotsMock = vi.hoisted(() => vi.fn());
 const getRuntimeHealthMock = vi.hoisted(() => vi.fn());
@@ -45,15 +46,6 @@ async function act(callback: () => void | Promise<void>) {
     result = callback();
   });
   await result;
-}
-
-async function flushReact() {
-  for (let i = 0; i < 3; i += 1) {
-    await act(async () => {
-      await Promise.resolve();
-      await new Promise((resolve) => window.setTimeout(resolve, 0));
-    });
-  }
 }
 
 function slot(overrides: Record<string, unknown> = {}) {
@@ -182,7 +174,7 @@ describe("RuntimeTab", () => {
         </QueryClientProvider>,
       );
     });
-    await flushReact();
+    await flushReact(3);
   }
 
   it("shows the plain-words summary strip and a Working row linked to the app page", async () => {
@@ -225,7 +217,7 @@ describe("RuntimeTab", () => {
     await act(async () => {
       restartButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flushReact();
+    await flushReact(3);
 
     // Confirm modal copy is present; nothing has been restarted yet.
     expect(document.body.textContent).toContain("Restart Gmail?");
@@ -237,7 +229,7 @@ describe("RuntimeTab", () => {
     await act(async () => {
       confirmButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flushReact();
+    await flushReact(3);
 
     expect(restartRuntimeSlotMock).toHaveBeenCalledWith("company-1", "slot-1");
   });

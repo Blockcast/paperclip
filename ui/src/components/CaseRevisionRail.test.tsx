@@ -7,6 +7,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CaseDocumentRevisions } from "@/api/cases";
 import { CaseRevisionRail } from "./CaseRevisionRail";
+import { flushReact } from "@/test-utils/react";
 
 function act(callback: () => void) {
   flushSync(callback);
@@ -28,14 +29,6 @@ vi.mock("@/lib/router", () => ({
 }));
 
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-
-async function flush() {
-  for (let i = 0; i < 5; i += 1) {
-    await Promise.resolve();
-    await new Promise((r) => setTimeout(r, 0));
-  }
-  flushSync(() => {});
-}
 
 const revisions: CaseDocumentRevisions = {
   key: "body",
@@ -91,7 +84,7 @@ describe("CaseRevisionRail", () => {
         </QueryClientProvider>,
       );
     });
-    await flush();
+    await flushReact(5);
     return root;
   }
 
@@ -118,7 +111,7 @@ describe("CaseRevisionRail", () => {
     );
     expect(rev1Button).toBeTruthy();
     act(() => rev1Button!.dispatchEvent(new MouseEvent("click", { bubbles: true })));
-    await flush();
+    await flushReact(5);
     expect(container.querySelector('[data-testid="md"]')?.textContent).toBe("# First version");
     act(() => root.unmount());
   });

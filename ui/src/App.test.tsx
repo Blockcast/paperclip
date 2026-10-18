@@ -7,6 +7,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CloudAccessGate } from "./components/CloudAccessGate";
 import appSource from "./App.tsx?raw";
+import { flushReact } from "@/test-utils/react";
 
 const mockHealthApi = vi.hoisted(() => ({
   get: vi.fn(),
@@ -42,11 +43,6 @@ vi.mock("@/lib/router", () => ({
   useLocation: () => ({ pathname: "/instance/settings/general", search: "", hash: "" }),
   useParams: () => ({}),
 }));
-
-async function flushReact() {
-  await Promise.resolve();
-  await new Promise((resolve) => window.setTimeout(resolve, 0));
-}
 
 async function waitForText(container: HTMLElement, text: string) {
   for (let attempt = 0; attempt < 20; attempt += 1) {

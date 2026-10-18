@@ -10,6 +10,7 @@ import { ToastProvider } from "../context/ToastContext";
 import type { BuiltInAgentState } from "../api/builtInAgents";
 import { Agents } from "./Agents";
 import type { AgentOrgChainHealth } from "@paperclipai/shared";
+import { flushReact } from "@/test-utils/react";
 
 const mockRouterState = vi.hoisted(() => ({
   pathname: "/agents/all",
@@ -283,13 +284,6 @@ const invalidOrgChainHealth: AgentOrgChainHealth = {
   invalidAncestors: [{ id: "manager-1", name: "Terminated Manager", status: "terminated" }],
   repairGuidance: "Alpha reports through terminated ancestor Terminated Manager.",
 };
-
-async function flushReact() {
-  await act(async () => {
-    await Promise.resolve();
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
-  });
-}
 
 function findAgentRow(container: HTMLElement, agentName: string): HTMLElement | null {
   return Array.from(container.querySelectorAll("a")).find((row) => row.textContent?.includes(agentName)) ?? null;

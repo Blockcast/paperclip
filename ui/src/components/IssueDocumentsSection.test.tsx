@@ -10,6 +10,7 @@ import { ISSUE_CONTINUATION_SUMMARY_DOCUMENT_KEY } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { IssueDocumentsSection } from "./IssueDocumentsSection";
 import { queryKeys } from "../lib/queryKeys";
+import { flushReact } from "@/test-utils/react";
 
 const mockIssuesApi = vi.hoisted(() => ({
   listDocuments: vi.fn(),
@@ -189,12 +190,6 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
-async function flush() {
-  await act(async () => {
-    await new Promise((resolve) => setTimeout(resolve, 0));
-  });
-}
-
 function createIssueDocument(overrides: Partial<IssueDocument> = {}): IssueDocument {
   return {
     id: "document-1",
@@ -331,8 +326,8 @@ describe("IssueDocumentsSection", () => {
         </QueryClientProvider>,
       );
     });
-    await flush();
-    await flush();
+    await flushReact();
+    await flushReact();
 
     expect(container.textContent).toContain("# Plan");
     expect(container.textContent).not.toContain("# Handoff");
@@ -380,8 +375,8 @@ describe("IssueDocumentsSection", () => {
         </QueryClientProvider>,
       );
     });
-    await flush();
-    await flush();
+    await flushReact();
+    await flushReact();
 
     const lockButton = container.querySelector('button[title="Lock document"]');
     expect(lockButton).toBeTruthy();
@@ -389,7 +384,7 @@ describe("IssueDocumentsSection", () => {
     await act(async () => {
       lockButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     expect(mockIssuesApi.lockDocument).toHaveBeenCalledWith("issue-1", "plan");
     expect(container.querySelector('button[title="Unlock document"]')).toBeTruthy();
@@ -429,8 +424,8 @@ describe("IssueDocumentsSection", () => {
         </QueryClientProvider>,
       );
     });
-    await flush();
-    await flush();
+    await flushReact();
+    await flushReact();
 
     expect(container.textContent).toContain("Locked plan body");
     expect(container.textContent).not.toContain("Edit document");
@@ -500,8 +495,8 @@ describe("IssueDocumentsSection", () => {
         </QueryClientProvider>,
       );
     });
-    await flush();
-    await flush();
+    await flushReact();
+    await flushReact();
 
     const revisionButton = Array.from(container.querySelectorAll("button"))
       .find((button) => button.textContent?.includes("rev 4"));
@@ -510,7 +505,7 @@ describe("IssueDocumentsSection", () => {
     await act(async () => {
       revisionButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     expect(document.body.textContent).toContain("CodexCoder");
     expect(document.body.textContent).toContain("Dotta");
@@ -568,8 +563,8 @@ describe("IssueDocumentsSection", () => {
         </QueryClientProvider>,
       );
     });
-    await flush();
-    await flush();
+    await flushReact();
+    await flushReact();
 
     expect(container.textContent).not.toContain("Restored plan body");
 
@@ -591,14 +586,14 @@ describe("IssueDocumentsSection", () => {
     await act(async () => {
       restoreButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     expect(mockIssuesApi.restoreDocumentRevision).toHaveBeenCalledWith("issue-1", "plan", "revision-3");
     expect(container.textContent).toContain("Restored plan body");
     expect(container.textContent).not.toContain("Viewing revision 3");
 
     pendingDocuments.resolve([restoredDocument]);
-    await flush();
+    await flushReact();
     await act(async () => {
       root.unmount();
     });
@@ -645,8 +640,8 @@ describe("IssueDocumentsSection", () => {
         </QueryClientProvider>,
       );
     });
-    await flush();
-    await flush();
+    await flushReact();
+    await flushReact();
 
     expect(container.textContent).toContain("Current plan body");
 
@@ -724,8 +719,8 @@ describe("IssueDocumentsSection", () => {
         </QueryClientProvider>,
       );
     });
-    await flush();
-    await flush();
+    await flushReact();
+    await flushReact();
 
     expect(container.textContent).toContain("Current plan body");
 
@@ -786,8 +781,8 @@ describe("IssueDocumentsSection", () => {
       );
     });
 
-    await flush();
-    await flush();
+    await flushReact();
+    await flushReact();
 
     expect(container.textContent).toContain("Loaded plan body");
     expect(container.textContent).not.toContain("Markdown body");
@@ -834,8 +829,8 @@ describe("IssueDocumentsSection", () => {
         </QueryClientProvider>,
       );
     });
-    await flush();
-    await flush();
+    await flushReact();
+    await flushReact();
 
     const markdownBodies = Array.from(
       container.querySelectorAll('[data-testid="markdown-body"]'),
@@ -886,8 +881,8 @@ describe("IssueDocumentsSection", () => {
       );
     });
 
-    await flush();
-    await flush();
+    await flushReact();
+    await flushReact();
 
     const heading = container.querySelector("h3");
     expect(heading).toBeTruthy();
@@ -956,8 +951,8 @@ describe("IssueDocumentsSection", () => {
         </QueryClientProvider>,
       );
     });
-    await flush();
-    await flush();
+    await flushReact();
+    await flushReact();
 
     expect(listDocuments).toHaveBeenCalled();
     expect(container.textContent).toContain("Reusable case document body");
@@ -969,7 +964,7 @@ describe("IssueDocumentsSection", () => {
     await act(async () => {
       lockButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     expect(setDocumentLock).toHaveBeenCalledWith("body", true);
     expect(container.querySelector('button[title="Unlock document"]')).toBeTruthy();

@@ -5,6 +5,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { queryKeys } from "../lib/queryKeys";
 import { SidebarAccountMenu } from "./SidebarAccountMenu";
+import { flushReact } from "@/test-utils/react";
 
 const mockAuthApi = vi.hoisted(() => ({
   getSession: vi.fn(),
@@ -61,13 +62,6 @@ async function act(callback: () => void | Promise<void>) {
   await new Promise((resolve) => window.setTimeout(resolve, 0));
 }
 
-async function flushReact() {
-  await act(async () => {
-    await Promise.resolve();
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
-  });
-}
-
 describe("SidebarAccountMenu", () => {
   let container: HTMLDivElement;
 
@@ -115,8 +109,8 @@ describe("SidebarAccountMenu", () => {
         </QueryClientProvider>,
       );
     });
-    await flushReact();
-    await flushReact();
+    await flushReact(2);
+    await flushReact(2);
 
     expect(container.textContent).toContain("Jane Example");
     expect(container.textContent).not.toContain("jane@example.com");
@@ -127,7 +121,7 @@ describe("SidebarAccountMenu", () => {
     await act(async () => {
       trigger?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flushReact();
+    await flushReact(2);
 
     expect(document.body.textContent).toContain("Edit profile");
     expect(document.body.textContent).not.toContain("Instance settings");
@@ -159,7 +153,7 @@ describe("SidebarAccountMenu", () => {
     await act(async () => {
       signOutButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flushReact();
+    await flushReact(2);
 
     expect(mockAuthApi.signOut).toHaveBeenCalledOnce();
     expect(queryClient.getQueryState(queryKeys.health)?.isInvalidated).toBe(true);
@@ -201,7 +195,7 @@ describe("SidebarAccountMenu", () => {
         </QueryClientProvider>,
       );
     });
-    await flushReact();
+    await flushReact(2);
 
     expect(document.body.textContent).toContain("feature/source-build-labelPaperclip 518fc71");
     expect(document.body.textContent).not.toContain("2026.626.0+58.git.518fc71ce");

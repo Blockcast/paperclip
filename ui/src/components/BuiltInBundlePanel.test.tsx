@@ -10,6 +10,7 @@ import type {
   BuiltInManagedResourceState,
   BuiltInManagedResourceStockStatus,
 } from "@/api/builtInAgents";
+import { flushReact } from "@/test-utils/react";
 
 // The panel links to agent tabs via `@/lib/router` (company-prefixed Link).
 // Stub it to a plain anchor so the panel test doesn't need CompanyContext.
@@ -76,14 +77,6 @@ function makeState(
     pauseReason: null,
     resources,
   };
-}
-
-async function flushReact() {
-  for (let index = 0; index < 5; index += 1) {
-    await Promise.resolve();
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
-  }
-  flushSync(() => {});
 }
 
 const READY_RESOURCES = [

@@ -7,6 +7,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CaseSummary } from "@/api/cases";
 import { Cases } from "./Cases";
+import { flushReact, waitForAssertion } from "@/test-utils/react";
 
 function act(callback: () => void) {
   flushSync(callback);
@@ -41,26 +42,6 @@ vi.mock("@/lib/router", () => ({
 
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
-async function flush() {
-  for (let i = 0; i < 5; i += 1) {
-    await Promise.resolve();
-    await new Promise((r) => setTimeout(r, 0));
-  }
-  flushSync(() => {});
-}
-async function waitForAssertion(assertion: () => void, attempts = 20) {
-  let lastError: unknown;
-  for (let i = 0; i < attempts; i += 1) {
-    try {
-      assertion();
-      return;
-    } catch (e) {
-      lastError = e;
-      await flush();
-    }
-  }
-  throw lastError;
-}
 function dispatchShortcut(key: string) {
   act(() => {
     document.body.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }));
@@ -439,7 +420,7 @@ describe("Cases list", () => {
     });
 
     dispatchShortcut("j");
-    await flush();
+    await flushReact(5);
     dispatchShortcut("ArrowLeft");
 
     await waitForAssertion(() => {
@@ -453,7 +434,7 @@ describe("Cases list", () => {
     });
 
     dispatchShortcut("j");
-    await flush();
+    await flushReact(5);
     dispatchShortcut("Enter");
 
     expect(mockNavigate).toHaveBeenCalledWith("/PAP/cases/PAP-C1");
@@ -496,7 +477,7 @@ describe("Cases list", () => {
     });
 
     dispatchShortcut("j");
-    await flush();
+    await flushReact(5);
     dispatchShortcut("ArrowLeft");
 
     await waitForAssertion(() => {

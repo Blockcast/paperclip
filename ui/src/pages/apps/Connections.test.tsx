@@ -5,6 +5,7 @@ import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Connections } from "./Connections";
+import { flushReact } from "@/test-utils/react";
 
 const listGalleryMock = vi.hoisted(() => vi.fn());
 const listApplicationsMock = vi.hoisted(() => vi.fn());
@@ -52,13 +53,6 @@ async function act(callback: () => void | Promise<void>) {
     result = callback();
   });
   await result;
-}
-
-async function flushReact() {
-  await act(async () => {
-    await Promise.resolve();
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
-  });
 }
 
 function application(overrides: Record<string, unknown>) {

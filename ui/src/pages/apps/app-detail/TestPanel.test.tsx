@@ -7,6 +7,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ToolCatalogEntry } from "@paperclipai/shared";
 import { TestPanel, errorHints } from "./TestPanel";
+import { flushReact } from "@/test-utils/react";
 
 const listTestAgentsMock = vi.hoisted(() => vi.fn());
 const runTestCallMock = vi.hoisted(() => vi.fn());
@@ -47,15 +48,6 @@ async function act(callback: () => void | Promise<void>) {
   await result;
 }
 
-async function flushReact() {
-  for (let i = 0; i < 4; i += 1) {
-    await act(async () => {
-      await Promise.resolve();
-      await new Promise((resolve) => window.setTimeout(resolve, 0));
-    });
-  }
-}
-
 /** The form field input — excludes the "Find an action" search box. */
 function formInput(): HTMLInputElement {
   const inputs = [...container.querySelectorAll("input")].filter(
@@ -72,7 +64,7 @@ async function fillFormField(value: string) {
     setter.call(input, value);
     input.dispatchEvent(new Event("input", { bubbles: true }));
   });
-  await flushReact();
+  await flushReact(4);
 }
 
 /** Wait past the 200ms minimum-spinner delay so the result panel renders. */
@@ -80,14 +72,14 @@ async function settle() {
   await act(async () => {
     await new Promise((resolve) => window.setTimeout(resolve, 260));
   });
-  await flushReact();
+  await flushReact(4);
 }
 
 async function clickByText(text: string) {
   const btn = [...container.querySelectorAll("button")].find((b) => b.textContent?.trim() === text);
   expect(btn).toBeTruthy();
   await act(async () => btn!.click());
-  await flushReact();
+  await flushReact(4);
 }
 
 function catalogEntry(overrides: Partial<ToolCatalogEntry> = {}): ToolCatalogEntry {
@@ -220,7 +212,7 @@ afterEach(() => {
 describe("TestPanel", () => {
   it("renders the Test-as header and grouped actions with access badges", async () => {
     await act(async () => renderPanel());
-    await flushReact();
+    await flushReact(4);
 
     expect(container.textContent).toContain("Test as");
     expect(container.textContent).toContain("ClaudeCoder");
@@ -235,7 +227,7 @@ describe("TestPanel", () => {
 
   it("shows the empty state when there are no actions", async () => {
     await act(async () => renderPanel([]));
-    await flushReact();
+    await flushReact(4);
     expect(container.textContent).toContain("Nothing to test yet");
     expect(container.textContent).toContain("Go to Setup");
   });
@@ -250,13 +242,13 @@ describe("TestPanel", () => {
       ],
     });
     await act(async () => renderPanel());
-    await flushReact();
+    await flushReact(4);
 
     // Expand the allowed (read) action.
     const trigger = [...container.querySelectorAll("button")].find((b) => b.textContent?.includes("Read a sheet"));
     expect(trigger).toBeTruthy();
     await act(async () => trigger!.click());
-    await flushReact();
+    await flushReact(4);
 
     // Fill the required field then Run.
     await fillFormField("sheet-123");
@@ -286,11 +278,11 @@ describe("TestPanel", () => {
       },
     });
     await act(async () => renderPanel());
-    await flushReact();
+    await flushReact(4);
 
     const trigger = [...container.querySelectorAll("button")].find((b) => b.textContent?.includes("Read a sheet"));
     await act(async () => trigger!.click());
-    await flushReact();
+    await flushReact(4);
     await fillFormField("sheet-123");
     await clickByText("Run");
     await settle();
@@ -304,11 +296,11 @@ describe("TestPanel", () => {
   it("renders the ask-first card linking to Review", async () => {
     runTestCallMock.mockResolvedValue({ decision: "ask_first", invocationId: "inv-2", actionRequestId: "req-1" });
     await act(async () => renderPanel());
-    await flushReact();
+    await flushReact(4);
 
     const trigger = [...container.querySelectorAll("button")].find((b) => b.textContent?.includes("Append a row"));
     await act(async () => trigger!.click());
-    await flushReact();
+    await flushReact(4);
 
     await fillFormField("sheet-123");
     await clickByText("Run");
@@ -326,11 +318,11 @@ describe("TestPanel", () => {
   it("restores the ask-first card after leaving and returning to the Test tab", async () => {
     runTestCallMock.mockResolvedValue({ decision: "ask_first", invocationId: "inv-2", actionRequestId: "req-1" });
     await act(async () => renderPanel());
-    await flushReact();
+    await flushReact(4);
 
     const trigger = [...container.querySelectorAll("button")].find((b) => b.textContent?.includes("Append a row"));
     await act(async () => trigger!.click());
-    await flushReact();
+    await flushReact(4);
     await fillFormField("sheet-123");
     await clickByText("Run");
     await settle();
@@ -339,7 +331,7 @@ describe("TestPanel", () => {
     await act(async () => root.unmount());
     root = createRoot(container);
     await act(async () => renderPanel());
-    await flushReact();
+    await flushReact(4);
 
     expect(runTestCallMock).toHaveBeenCalledTimes(1);
     expect(container.textContent).toContain("Sent for your OK.");
@@ -359,11 +351,11 @@ describe("TestPanel", () => {
       durationMs: null,
     });
     await act(async () => renderPanel());
-    await flushReact();
+    await flushReact(4);
 
     const trigger = [...container.querySelectorAll("button")].find((b) => b.textContent?.includes("Append a row"));
     await act(async () => trigger!.click());
-    await flushReact();
+    await flushReact(4);
     await fillFormField("sheet-123");
     await clickByText("Run");
     await settle();
@@ -386,11 +378,11 @@ describe("TestPanel", () => {
       durationMs: 1200,
     });
     await act(async () => renderPanel());
-    await flushReact();
+    await flushReact(4);
 
     const trigger = [...container.querySelectorAll("button")].find((b) => b.textContent?.includes("Append a row"));
     await act(async () => trigger!.click());
-    await flushReact();
+    await flushReact(4);
     await fillFormField("sheet-123");
     await clickByText("Run");
     await settle();
@@ -413,11 +405,11 @@ describe("TestPanel", () => {
       durationMs: null,
     });
     await act(async () => renderPanel());
-    await flushReact();
+    await flushReact(4);
 
     const trigger = [...container.querySelectorAll("button")].find((b) => b.textContent?.includes("Append a row"));
     await act(async () => trigger!.click());
-    await flushReact();
+    await flushReact(4);
     await fillFormField("sheet-123");
     await clickByText("Run");
     await settle();
@@ -428,11 +420,11 @@ describe("TestPanel", () => {
 
   it("explains an off action and links to Permissions without calling the API", async () => {
     await act(async () => renderPanel());
-    await flushReact();
+    await flushReact(4);
 
     const trigger = [...container.querySelectorAll("button")].find((b) => b.textContent?.includes("Delete a row"));
     await act(async () => trigger!.click());
-    await flushReact();
+    await flushReact(4);
 
     expect(container.textContent).toContain("Delete a row is off for ClaudeCoder.");
     const permLink = [...container.querySelectorAll("a")].find((a) => a.getAttribute("href") === "/apps/conn-1/permissions");
@@ -456,11 +448,11 @@ describe("TestPanel", () => {
       ],
     });
     await act(async () => renderPanel());
-    await flushReact();
+    await flushReact(4);
 
     const trigger = [...container.querySelectorAll("button")].find((b) => b.textContent?.includes("Delete a row"));
     await act(async () => trigger!.click());
-    await flushReact();
+    await flushReact(4);
 
     expect(container.textContent).toContain("Last changed by Dotta");
   });
@@ -477,14 +469,14 @@ describe("TestPanel", () => {
       status: "quarantined",
     });
     await act(async () => renderPanel([readEntry, writeAskEntry, offEntry], [quarantinedEntry]));
-    await flushReact();
+    await flushReact(4);
 
     expect(container.textContent).toContain("New (1)");
 
     const trigger = [...container.querySelectorAll("button")].find((b) => b.textContent?.includes("Rename a sheet"));
     expect(trigger).toBeTruthy();
     await act(async () => trigger!.click());
-    await flushReact();
+    await flushReact(4);
 
     expect(container.textContent).toContain("This action is new and hasn't been turned on yet.");
     expect(runTestCallMock).not.toHaveBeenCalled();

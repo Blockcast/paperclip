@@ -7,6 +7,7 @@ import { beforeEach, afterEach, describe, expect, it, vi } from "vitest";
 
 import { ApprovalDetail } from "./ApprovalDetail";
 import type { Approval } from "@paperclipai/shared";
+import { flushReact, waitForAssertion } from "@/test-utils/react";
 
 // `ApprovalDetail.remediation.test.ts` covers `canResubmitFromBoard` as a
 // predicate. It cannot cover the fix: deleting `&& canDriveResubmit` from the
@@ -52,27 +53,6 @@ vi.mock("../api/approvals", () => ({ approvalsApi: approvalsApiMock }));
 vi.mock("../api/agents", () => ({ agentsApi: agentsApiMock }));
 
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-
-async function flush() {
-  await act(async () => {
-    await Promise.resolve();
-    await new Promise((resolve) => setTimeout(resolve, 0));
-  });
-}
-
-async function waitForAssertion(assertion: () => void, attempts = 50) {
-  let lastError: unknown;
-  for (let attempt = 0; attempt < attempts; attempt += 1) {
-    try {
-      assertion();
-      return;
-    } catch (error) {
-      lastError = error;
-      await flush();
-    }
-  }
-  throw lastError;
-}
 
 const budgetCard = (over: Partial<Approval> = {}): Approval =>
   ({

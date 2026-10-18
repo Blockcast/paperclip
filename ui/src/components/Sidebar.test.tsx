@@ -7,6 +7,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Sidebar } from "./Sidebar";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { flushReact } from "@/test-utils/react";
 
 const mockHeartbeatsApi = vi.hoisted(() => ({
   liveRunsForCompany: vi.fn(),
@@ -112,14 +113,6 @@ vi.mock("./SidebarStarredProjects", () => ({
   SidebarStarredProjects: () => <div data-testid="sidebar-starred-projects" />,
 }));
 
-async function flushReact() {
-  for (let index = 0; index < 5; index += 1) {
-    await Promise.resolve();
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
-  }
-  flushSync(() => {});
-}
-
 describe("Sidebar", () => {
   let container: HTMLDivElement;
 
@@ -138,7 +131,7 @@ describe("Sidebar", () => {
         </QueryClientProvider>,
       );
     });
-    await flushReact();
+    await flushReact(5);
 
     return root;
   }

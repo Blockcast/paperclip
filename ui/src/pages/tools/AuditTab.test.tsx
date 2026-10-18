@@ -6,6 +6,7 @@ import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuditTab } from "./AuditTab";
+import { flushReact } from "@/test-utils/react";
 
 const listActivityMock = vi.hoisted(() => vi.fn());
 const listApplicationsMock = vi.hoisted(() => vi.fn());
@@ -43,15 +44,6 @@ async function act(callback: () => void | Promise<void>) {
     result = callback();
   });
   await result;
-}
-
-async function flushReact() {
-  for (let i = 0; i < 3; i += 1) {
-    await act(async () => {
-      await Promise.resolve();
-      await new Promise((resolve) => window.setTimeout(resolve, 0));
-    });
-  }
 }
 
 function event(overrides: Record<string, unknown> = {}) {
@@ -114,7 +106,7 @@ describe("AuditTab", () => {
         </QueryClientProvider>,
       );
     });
-    await flushReact();
+    await flushReact(3);
   }
 
   function clickButton(text: string) {
@@ -142,7 +134,7 @@ describe("AuditTab", () => {
     await render();
 
     await clickButton("used Send Email");
-    await flushReact();
+    await flushReact(3);
 
     expect(container.textContent).toContain("Blocked by a rule.");
     const ruleLink = Array.from(container.querySelectorAll("a")).find((a) =>
@@ -153,7 +145,7 @@ describe("AuditTab", () => {
     // Raw tool name + reason code only appear once Details is opened.
     expect(container.textContent).not.toContain("mail:send_email");
     await clickButton("Details");
-    await flushReact();
+    await flushReact(3);
     expect(container.textContent).toContain("mail:send_email");
     expect(container.textContent).toContain("deny_policy_block");
   });
@@ -193,7 +185,7 @@ describe("AuditTab", () => {
 
     await clickButton("used Send Email");
     await clickButton("Details");
-    await flushReact();
+    await flushReact(3);
 
     expect(container.textContent).toContain("Parameters (redacted)");
     expect(container.textContent).toContain("person@example.com");
@@ -232,7 +224,7 @@ describe("AuditTab", () => {
     await clickButton("received 0 MCP servers");
     expect(container.textContent).toContain("Permitted connections were not installed");
     await clickButton("Details");
-    await flushReact();
+    await flushReact(3);
     expect(container.textContent).toContain("Delivered MCP servers0");
     expect(container.querySelector('a[href="/apps/conn-zapier/permissions"]')?.textContent).toBe("Zapier");
   });
@@ -256,7 +248,7 @@ describe("AuditTab", () => {
 
     expect(container.textContent).not.toContain("Read Email");
     await clickButton("Load more");
-    await flushReact();
+    await flushReact(3);
     expect(container.textContent).toContain("Read Email");
   });
 });

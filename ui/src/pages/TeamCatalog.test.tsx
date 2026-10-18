@@ -10,6 +10,7 @@ import type {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TeamCatalog, parseTeamRoute, teamRoute } from "./TeamCatalog";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { flushReact } from "@/test-utils/react";
 
 const mockTeamCatalogApi = vi.hoisted(() => ({
   catalogList: vi.fn(),
@@ -103,13 +104,6 @@ async function act(callback: () => void | Promise<void>) {
     result = callback();
   });
   await result;
-}
-
-async function flushReact() {
-  await act(async () => {
-    await Promise.resolve();
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
-  });
 }
 
 function makeTeam(overrides: Partial<CatalogTeam> = {}): CatalogTeam {

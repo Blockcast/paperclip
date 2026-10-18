@@ -18,6 +18,7 @@ import type {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { __liveUpdatesTestUtils } from "@/context/LiveUpdatesProvider";
 import { SummarySlotCard, resolveGenerationStatusLine } from "./SummarySlotCard";
+import { flushReact } from "@/test-utils/react";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -55,14 +56,6 @@ async function act(callback: () => void | Promise<void>) {
     result = callback();
   });
   await result;
-}
-
-async function flushQueries() {
-  for (let index = 0; index < 5; index += 1) {
-    await Promise.resolve();
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
-  }
-  flushSync(() => {});
 }
 
 function readySummarizer(): BuiltInAgentState {
@@ -211,7 +204,7 @@ describe("SummarySlotCard live status line", () => {
   it("renders a live status line from a matching progress event", async () => {
     const subscribers = new Set<CompanyLiveEventHandler>();
     root = renderCard(container, subscribers);
-    await flushQueries();
+    await flushReact(5);
 
     // Falls back to the static generating copy before any event arrives.
     expect(container.querySelector('[data-testid="summary-generation-status-line"]')).toBeNull();
@@ -224,7 +217,7 @@ describe("SummarySlotCard live status line", () => {
         progressEvent({ issueId: "issue-1", message: "reviewing 14 open issues" }),
       );
     });
-    await flushQueries();
+    await flushReact(5);
 
     const statusLine = container.querySelector('[data-testid="summary-generation-status-line"]');
     expect(statusLine).not.toBeNull();
@@ -234,7 +227,7 @@ describe("SummarySlotCard live status line", () => {
   it("ignores progress events for a different generating issue", async () => {
     const subscribers = new Set<CompanyLiveEventHandler>();
     root = renderCard(container, subscribers);
-    await flushQueries();
+    await flushReact(5);
 
     await act(async () => {
       dispatchLiveEventToSubscribers(
@@ -243,7 +236,7 @@ describe("SummarySlotCard live status line", () => {
         progressEvent({ issueId: "issue-999", message: "unrelated run" }),
       );
     });
-    await flushQueries();
+    await flushReact(5);
 
     expect(container.querySelector('[data-testid="summary-generation-status-line"]')).toBeNull();
     expect(container.textContent).not.toContain("unrelated run");

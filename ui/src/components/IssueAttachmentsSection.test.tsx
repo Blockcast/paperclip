@@ -7,6 +7,7 @@ import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { IssueAttachmentsSection } from "./IssueAttachmentsSection";
+import { flushReact, waitForAssertion } from "@/test-utils/react";
 
 vi.mock("./MarkdownBody", () => ({
   MarkdownBody: ({ children, className }: { children: string; className?: string }) => (
@@ -62,27 +63,6 @@ function makeAttachment(overrides: Partial<IssueAttachment> = {}): IssueAttachme
     contentPath: "/api/attachments/attachment-1/content",
     ...overrides,
   };
-}
-
-async function flushReact() {
-  await act(async () => {
-    await Promise.resolve();
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
-  });
-}
-
-async function waitForAssertion(assertion: () => void, attempts = 20) {
-  let lastError: unknown;
-  for (let index = 0; index < attempts; index += 1) {
-    try {
-      assertion();
-      return;
-    } catch (error) {
-      lastError = error;
-      await flushReact();
-    }
-  }
-  throw lastError;
 }
 
 describe("IssueAttachmentsSection", () => {

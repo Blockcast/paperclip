@@ -7,6 +7,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ConnectToolAppResult, McpJsonImportPreview } from "@paperclipai/shared";
 import { PasteConfigTab } from "./PasteConfigTab";
+import { flushReact } from "@/test-utils/react";
 
 const toolsApiMock = vi.hoisted(() => ({
   importMcpJson: vi.fn(),
@@ -28,13 +29,6 @@ async function act(callback: () => void | Promise<void>) {
     result = callback();
   });
   await result;
-}
-
-async function flushReact() {
-  await act(async () => {
-    await Promise.resolve();
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
-  });
 }
 
 function setTextareaValue(textarea: HTMLTextAreaElement, value: string) {

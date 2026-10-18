@@ -5,6 +5,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { CloudUpstreamRun, CloudUpstreamsState } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CloudUpstream, buildActivationRows } from "./CloudUpstream";
+import { flushReact } from "@/test-utils/react";
 
 const mockCloudUpstreamsApi = vi.hoisted(() => ({
   list: vi.fn(),
@@ -70,13 +71,6 @@ async function act(callback: () => void | Promise<void>) {
   await new Promise((resolve) => window.setTimeout(resolve, 0));
 }
 
-async function flushReact() {
-  await act(async () => {
-    await Promise.resolve();
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
-  });
-}
-
 describe("CloudUpstream", () => {
   let container: HTMLDivElement;
 
@@ -124,8 +118,8 @@ describe("CloudUpstream", () => {
         </QueryClientProvider>,
       );
     });
-    await flushReact();
-    await flushReact();
+    await flushReact(2);
+    await flushReact(2);
 
     expect(container.textContent).toContain("Re-run");
     expect(container.textContent).not.toContain("Retry");
@@ -142,7 +136,7 @@ describe("CloudUpstream", () => {
     await act(async () => {
       activateButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flushReact();
+    await flushReact(2);
 
     expect(mockCloudUpstreamsApi.activateEntities).toHaveBeenCalledWith(
       "connection-1",
@@ -171,8 +165,8 @@ describe("CloudUpstream", () => {
         </QueryClientProvider>,
       );
     });
-    await flushReact();
-    await flushReact();
+    await flushReact(2);
+    await flushReact(2);
 
     const input = container.querySelector<HTMLInputElement>("input[aria-label='Paperclip Cloud stack URL']");
     expect(input).toBeTruthy();
@@ -181,7 +175,7 @@ describe("CloudUpstream", () => {
       setter.call(input!, "https://cloud.example/PAP/dashboard");
       input!.dispatchEvent(new Event("input", { bubbles: true }));
     });
-    await flushReact();
+    await flushReact(2);
 
     const connectButton = Array.from(container.querySelectorAll("button"))
       .find((button) => button.textContent?.trim() === "Connect") as HTMLButtonElement | undefined;
@@ -190,7 +184,7 @@ describe("CloudUpstream", () => {
     await act(async () => {
       connectButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flushReact();
+    await flushReact(2);
 
     expect(mockCloudUpstreamsApi.startConnect).toHaveBeenCalledWith({
       companyId: "company-1",
@@ -246,8 +240,8 @@ describe("CloudUpstream", () => {
           </QueryClientProvider>,
         );
       });
-      await flushReact();
-      await flushReact();
+      await flushReact(2);
+      await flushReact(2);
 
       expect(mockCloudUpstreamsApi.finishConnect).toHaveBeenCalledWith({
         pendingConnectionId: "pending-1",
@@ -283,9 +277,9 @@ describe("CloudUpstream", () => {
           </QueryClientProvider>,
         );
       });
-      await flushReact();
-      await flushReact();
-      await flushReact();
+      await flushReact(2);
+      await flushReact(2);
+      await flushReact(2);
 
       expect(mockCloudUpstreamsApi.finishConnect).toHaveBeenCalledTimes(1);
       expect(container.textContent).toContain("state expired");
@@ -310,8 +304,8 @@ describe("CloudUpstream", () => {
         </QueryClientProvider>,
       );
     });
-    await flushReact();
-    await flushReact();
+    await flushReact(2);
+    await flushReact(2);
 
     expect(container.textContent).toContain("Retry");
     expect(container.textContent).not.toContain("Re-run");

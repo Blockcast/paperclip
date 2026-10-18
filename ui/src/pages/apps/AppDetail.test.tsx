@@ -6,6 +6,7 @@ import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AppDetail } from "./AppDetail";
+import { flushReact } from "@/test-utils/react";
 
 const getConnectionMock = vi.hoisted(() => vi.fn());
 const getConnectionInstallsMock = vi.hoisted(() => vi.fn());
@@ -96,15 +97,6 @@ async function act(callback: () => void | Promise<void>) {
     result = callback();
   });
   await result;
-}
-
-async function flushReact() {
-  for (let i = 0; i < 3; i += 1) {
-    await act(async () => {
-      await Promise.resolve();
-      await new Promise((resolve) => window.setTimeout(resolve, 0));
-    });
-  }
 }
 
 function connection(overrides: Record<string, unknown> = {}) {
@@ -260,7 +252,7 @@ describe("AppDetail", () => {
         </QueryClientProvider>,
       );
     });
-    await flushReact();
+    await flushReact(3);
   }
 
   it("pauses the app by flipping the connection enabled flag", async () => {
@@ -274,7 +266,7 @@ describe("AppDetail", () => {
     await act(async () => {
       toggle!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flushReact();
+    await flushReact(3);
 
     expect(updateConnectionMock).toHaveBeenCalledWith("conn-1", { enabled: false });
   });
@@ -332,7 +324,7 @@ describe("AppDetail", () => {
         .find((button) => button.textContent?.trim() === "Review")
         ?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flushReact();
+    await flushReact(3);
     expect(container.textContent).toContain("Delete repo");
     expect(container.textContent).not.toContain("Nothing is waiting for your OK right now.");
   });
@@ -411,13 +403,13 @@ describe("AppDetail", () => {
     );
     expect(input).toBeTruthy();
     await act(async () => setInputValue(input!, "https://docs.google.com/spreadsheets/d/sheet_new/edit"));
-    await flushReact();
+    await flushReact(3);
     await act(async () => {
       Array.from(container.querySelectorAll("button"))
         .find((button) => button.textContent?.trim() === "Add sheet")
         ?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flushReact();
+    await flushReact(3);
 
     expect(updateConnectionMock).toHaveBeenCalledWith("conn-1", {
       config: expect.objectContaining({
@@ -455,7 +447,7 @@ describe("AppDetail", () => {
       readSelect!.value = "ask";
       readSelect!.dispatchEvent(new Event("change", { bubbles: true }));
     });
-    await flushReact();
+    await flushReact(3);
 
     expect(finishAppMock).toHaveBeenCalledWith("company-1", "conn-1", {
       enabledCatalogEntryIds: expect.arrayContaining(["catalog-read", "catalog-write"]),
@@ -475,7 +467,7 @@ describe("AppDetail", () => {
       writeSelect!.value = "off";
       writeSelect!.dispatchEvent(new Event("change", { bubbles: true }));
     });
-    await flushReact();
+    await flushReact(3);
 
     expect(finishAppMock).toHaveBeenCalledWith("company-1", "conn-1", {
       enabledCatalogEntryIds: ["catalog-read"],
@@ -495,14 +487,14 @@ describe("AppDetail", () => {
         .find((button) => button.textContent?.includes("Choose agents to install on"))
         ?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flushReact();
+    await flushReact(3);
 
     const coderCheckbox = document.body.querySelector<HTMLElement>('[aria-label="Allow Coder"]');
     expect(coderCheckbox).toBeTruthy();
     await act(async () => {
       coderCheckbox!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flushReact();
+    await flushReact(3);
 
     expect(putConnectionInstallsMock).toHaveBeenCalledWith("conn-1", [
       { targetType: "agent", targetId: "agent-1" },

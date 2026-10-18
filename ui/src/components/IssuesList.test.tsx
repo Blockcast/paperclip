@@ -8,6 +8,7 @@ import type { Issue, Project } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { IssuesList } from "./IssuesList";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { flushReact, waitForAssertion } from "@/test-utils/react";
 
 const companyState = vi.hoisted(() => ({
   selectedCompanyId: "company-1",
@@ -228,33 +229,11 @@ function createIssue(overrides: Partial<Issue> = {}): Issue {
   };
 }
 
-async function flush() {
-  await act(async () => {
-    await new Promise((resolve) => setTimeout(resolve, 0));
-  });
-}
-
 async function flushAnimationFrame() {
   await act(async () => {
     await new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
     await Promise.resolve();
   });
-}
-
-async function waitForAssertion(assertion: () => void, attempts = 20) {
-  let lastError: unknown;
-
-  for (let attempt = 0; attempt < attempts; attempt += 1) {
-    try {
-      assertion();
-      return;
-    } catch (error) {
-      lastError = error;
-      await flush();
-    }
-  }
-
-  throw lastError;
 }
 
 async function waitForMicrotaskAssertion(assertion: () => void, attempts = 20) {
@@ -1390,7 +1369,7 @@ describe("IssuesList", () => {
       expect(container.querySelectorAll('[data-testid="issue-row"]')).toHaveLength(100);
     });
 
-    await flush();
+    await flushReact();
 
     act(() => {
       setDocumentScrollMetrics({ innerHeight: 600, scrollY: 1500, scrollHeight: 2000 });
@@ -1441,8 +1420,8 @@ describe("IssuesList", () => {
       expect(container.querySelectorAll('[data-testid="issue-row"]')).toHaveLength(100);
     });
 
-    await flush();
-    await flush();
+    await flushReact();
+    await flushReact();
     expect(container.querySelectorAll('[data-testid="issue-row"]')).toHaveLength(100);
 
     act(() => {
@@ -1490,7 +1469,7 @@ describe("IssuesList", () => {
     await waitForAssertion(() => {
       expect(onLoadMoreIssues).toHaveBeenCalledTimes(1);
     });
-    await flush();
+    await flushReact();
     expect(onLoadMoreIssues).toHaveBeenCalledTimes(1);
 
     act(() => {

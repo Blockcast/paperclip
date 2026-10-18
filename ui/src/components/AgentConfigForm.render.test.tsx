@@ -8,6 +8,7 @@ import { REDACTED_SENTINEL, type Agent, type Environment } from "@paperclipai/sh
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { AgentConfigForm } from "./AgentConfigForm";
 import { defaultCreateValues } from "./agent-config-defaults";
+import { flushReact } from "@/test-utils/react";
 
 const mockAgentsApi = vi.hoisted(() => ({
   adapterModelProfiles: vi.fn(),
@@ -130,15 +131,6 @@ async function act(callback: () => void | Promise<void>) {
   await result;
 }
 
-async function flushReact() {
-  await act(async () => {
-    for (let i = 0; i < 4; i += 1) {
-      await Promise.resolve();
-      await new Promise((resolve) => window.setTimeout(resolve, 0));
-    }
-  });
-}
-
 function makeAgent(overrides: Partial<Agent> = {}): Agent {
   return {
     id: "agent-1",
@@ -255,7 +247,7 @@ async function renderForm(
     );
   });
 
-  await flushReact();
+  await flushReact(4);
   return { container, root, onSave, saveAction, testAction };
 }
 
@@ -300,7 +292,7 @@ async function renderCreateForm(
     );
   });
 
-  await flushReact();
+  await flushReact(4);
   return { container, root, onChange };
 }
 
@@ -461,7 +453,7 @@ describe("AgentConfigForm environment selector", () => {
     await act(async () => {
       testButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flushReact();
+    await flushReact(4);
 
     expect(mockAgentsApi.testEnvironment).toHaveBeenCalledTimes(2);
     expect(mockAgentsApi.testEnvironment.mock.calls[0]?.[2]).toMatchObject({
@@ -494,7 +486,7 @@ describe("AgentConfigForm environment selector", () => {
     await act(async () => {
       modelButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flushReact();
+    await flushReact(4);
 
     const defaultButton = Array.from(document.body.querySelectorAll("button")).find(
       (button) => button.textContent?.trim() === "Default",
@@ -504,7 +496,7 @@ describe("AgentConfigForm environment selector", () => {
     await act(async () => {
       defaultButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flushReact();
+    await flushReact(4);
 
     const testButton = Array.from(result.container.querySelectorAll("button")).find(
       (button) => button.textContent?.trim() === "Test",
@@ -514,7 +506,7 @@ describe("AgentConfigForm environment selector", () => {
     await act(async () => {
       testButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flushReact();
+    await flushReact(4);
 
     expect(mockAgentsApi.testEnvironment).toHaveBeenCalledTimes(1);
     expect(mockAgentsApi.testEnvironment.mock.calls[0]?.[2]).toMatchObject({
@@ -545,7 +537,7 @@ describe("AgentConfigForm environment selector", () => {
     await act(async () => {
       testButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flushReact();
+    await flushReact(4);
 
     expect(mockAgentsApi.testEnvironment).toHaveBeenCalledTimes(1);
     expect(mockAgentsApi.testEnvironment.mock.calls[0]?.[2]).toMatchObject({
@@ -576,7 +568,7 @@ describe("AgentConfigForm environment selector", () => {
     await act(async () => {
       setInputValue(valueInput!, "draft-token");
     });
-    await flushReact();
+    await flushReact(4);
 
     const testButton = Array.from(result.container.querySelectorAll("button")).find(
       (button) => button.textContent?.trim() === "Test",
@@ -586,7 +578,7 @@ describe("AgentConfigForm environment selector", () => {
     await act(async () => {
       testButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flushReact();
+    await flushReact(4);
 
     expect(mockAgentsApi.testEnvironment).toHaveBeenCalled();
     for (const call of mockAgentsApi.testEnvironment.mock.calls) {
@@ -627,7 +619,7 @@ describe("AgentConfigForm environment selector", () => {
     await act(async () => {
       setInputValue(nameInput!, to);
     });
-    await flushReact();
+    await flushReact(4);
   }
 
   it("refuses an adapter-config test while a withheld env row is renamed, instead of testing stale env (PEN-3358)", async () => {
@@ -648,7 +640,7 @@ describe("AgentConfigForm environment selector", () => {
     await act(async () => {
       testButton?.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
     });
-    await flushReact();
+    await flushReact(4);
 
     // The sibling test above ("flushes pending environment variable edits before testing adapter
     // config") proves this same button DOES reach `testEnvironment` with the promoted draft when
@@ -681,7 +673,7 @@ describe("AgentConfigForm environment selector", () => {
     await act(async () => {
       result.testAction.current?.();
     });
-    await flushReact();
+    await flushReact(4);
 
     expect(
       mockAgentsApi.testEnvironment,
@@ -710,7 +702,7 @@ describe("AgentConfigForm environment selector", () => {
     await act(async () => {
       setInputValue(nameField!, "Cody Renamed");
     });
-    await flushReact();
+    await flushReact(4);
 
     await renameMaskedRow(result.container, "GITHUB_TOKEN");
 
@@ -718,7 +710,7 @@ describe("AgentConfigForm environment selector", () => {
     await act(async () => {
       result.saveAction.current?.();
     });
-    await flushReact();
+    await flushReact(4);
 
     expect(
       result.onSave,
@@ -732,12 +724,12 @@ describe("AgentConfigForm environment selector", () => {
     await act(async () => {
       setInputValue(maskedValue!, "a-new-token");
     });
-    await flushReact();
+    await flushReact(4);
 
     await act(async () => {
       result.saveAction.current?.();
     });
-    await flushReact();
+    await flushReact(4);
 
     expect(result.onSave, "the save must go through once the row is no longer blocking").toHaveBeenCalledTimes(1);
     const patch = result.onSave.mock.calls[0]![0] as Record<string, unknown>;
@@ -777,7 +769,7 @@ describe("AgentConfigForm environment selector", () => {
     await act(async () => {
       testButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flushReact();
+    await flushReact(4);
 
     expect(mockAgentsApi.testEnvironment).toHaveBeenCalledTimes(1);
     expect(result.container.textContent).toContain("Network unavailable");

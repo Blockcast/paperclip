@@ -5,6 +5,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ConferenceRoomChatGate } from "./ConferenceRoomChatGate";
+import { flushReact } from "@/test-utils/react";
 
 const mockInstanceSettingsApi = vi.hoisted(() => ({
   getExperimental: vi.fn(),
@@ -20,14 +21,6 @@ vi.mock("@/lib/router", () => ({
   ),
   Outlet: () => <div data-testid="outlet">gated content</div>,
 }));
-
-async function flushReact() {
-  for (let index = 0; index < 5; index += 1) {
-    await Promise.resolve();
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
-  }
-  flushSync(() => {});
-}
 
 describe("ConferenceRoomChatGate (PAP-137)", () => {
   let container: HTMLDivElement;
@@ -45,7 +38,7 @@ describe("ConferenceRoomChatGate (PAP-137)", () => {
         </QueryClientProvider>,
       );
     });
-    await flushReact();
+    await flushReact(5);
   }
 
   beforeEach(() => {

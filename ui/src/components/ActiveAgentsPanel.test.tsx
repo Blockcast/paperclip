@@ -5,6 +5,7 @@ import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ActiveAgentsPanel } from "./ActiveAgentsPanel";
+import { flushReact } from "@/test-utils/react";
 
 const mockHeartbeatsApi = vi.hoisted(() => ({
   liveRunsForCompany: vi.fn(),
@@ -47,13 +48,6 @@ vi.mock("./transcript/useLiveRunTranscripts", () => ({
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
-async function flushReact() {
-  await act(async () => {
-    await Promise.resolve();
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
-  });
-}
 
 async function waitForMicrotaskAssertion(assertion: () => void, attempts = 20) {
   let lastError: unknown;

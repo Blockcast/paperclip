@@ -15,6 +15,7 @@ import type {
 } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SummarySlotCard } from "./SummarySlotCard";
+import { flushReact } from "@/test-utils/react";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -69,14 +70,6 @@ async function act(callback: () => void | Promise<void>) {
   await result;
 }
 
-async function flushQueries() {
-  for (let index = 0; index < 5; index += 1) {
-    await Promise.resolve();
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
-  }
-  flushSync(() => {});
-}
-
 async function openRevisionSelect(container: HTMLElement) {
   const trigger = container.querySelector<HTMLElement>('button[aria-label="Select summary revision"]');
   expect(trigger).not.toBeNull();
@@ -85,7 +78,7 @@ async function openRevisionSelect(container: HTMLElement) {
     trigger!.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, button: 0 }));
     trigger!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
   });
-  await flushQueries();
+  await flushReact(5);
 
   return trigger!;
 }
@@ -100,7 +93,7 @@ async function chooseRevisionOption(labelPart: string) {
     option!.dispatchEvent(new PointerEvent("pointerup", { bubbles: true, button: 0 }));
     option!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
   });
-  await flushQueries();
+  await flushReact(5);
 }
 
 function readySummarizer(): BuiltInAgentState {
@@ -252,7 +245,7 @@ describe("SummarySlotCard", () => {
     mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableSummaries: false });
 
     root = renderCard(container);
-    await flushQueries();
+    await flushReact(5);
 
     expect(container.textContent).toBe("");
     expect(mockSummarySlotsApi.get).not.toHaveBeenCalled();
@@ -263,7 +256,7 @@ describe("SummarySlotCard", () => {
     mockBuiltInAgentsApi.list.mockResolvedValue([needsSetupSummarizer()]);
 
     root = renderCard(container);
-    await flushQueries();
+    await flushReact(5);
 
     expect(container.textContent).toContain("Set up the Summarizer");
     const setupButton = [...container.querySelectorAll<HTMLButtonElement>("button")].find(
@@ -274,7 +267,7 @@ describe("SummarySlotCard", () => {
     await act(async () => {
       setupButton?.click();
     });
-    await flushQueries();
+    await flushReact(5);
 
     expect(container.querySelector('[data-testid="configure-modal"]')).not.toBeNull();
   });
@@ -293,20 +286,20 @@ describe("SummarySlotCard", () => {
     mockSummarySlotsApi.generate.mockRejectedValue(new Error("Summarizer built-in agent is not configured"));
 
     root = renderCard(container);
-    await flushQueries();
+    await flushReact(5);
 
     const refreshButton = [...container.querySelectorAll<HTMLButtonElement>("button")].find(
       (button) => button.textContent?.includes("Refresh"),
     );
     await act(() => refreshButton?.click());
-    await flushQueries();
+    await flushReact(5);
     expect(container.textContent).toContain("Summary request failed");
 
     const setupButton = [...container.querySelectorAll<HTMLButtonElement>("button")].find(
       (button) => button.textContent === "Set up Summarizer",
     );
     await act(() => setupButton?.click());
-    await flushQueries();
+    await flushReact(5);
     const finishSetupButton = [...container.querySelectorAll<HTMLButtonElement>("button")].find(
       (button) => button.textContent === "Finish setup",
     );
@@ -317,7 +310,7 @@ describe("SummarySlotCard", () => {
 
   it("shows the empty state and starts generation", async () => {
     root = renderCard(container);
-    await flushQueries();
+    await flushReact(5);
 
     expect(container.textContent).toContain("No summary yet");
     const generateButton = [...container.querySelectorAll<HTMLButtonElement>("button")].find(
@@ -328,7 +321,7 @@ describe("SummarySlotCard", () => {
     await act(async () => {
       generateButton?.click();
     });
-    await flushQueries();
+    await flushReact(5);
 
     expect(mockSummarySlotsApi.generate).toHaveBeenCalledWith({
       companyId: "company-1",
@@ -342,7 +335,7 @@ describe("SummarySlotCard", () => {
     mockBuiltInAgentsApi.list.mockResolvedValue([pausedSummarizer()]);
 
     root = renderCard(container);
-    await flushQueries();
+    await flushReact(5);
 
     expect(container.textContent).toContain("Summarizer is paused");
     expect(container.textContent).not.toContain("No summary yet");
@@ -359,7 +352,7 @@ describe("SummarySlotCard", () => {
     } satisfies GetSummarySlotResponse);
 
     root = renderCard(container);
-    await flushQueries();
+    await flushReact(5);
 
     expect(container.firstElementChild?.tagName).toBe("SECTION");
     expect(container.firstElementChild?.className).toContain("space-y-4");
@@ -383,7 +376,7 @@ describe("SummarySlotCard", () => {
     });
 
     root = renderCard(container);
-    await flushQueries();
+    await flushReact(5);
 
     expect(container.textContent).toContain("Latest revision");
     expect(container.textContent).toContain("Review the launch notes.");
@@ -411,7 +404,7 @@ describe("SummarySlotCard", () => {
     });
 
     root = renderCard(container);
-    await flushQueries();
+    await flushReact(5);
 
     expect(container.textContent).toContain("Current body");
     expect(container.textContent).toContain("3 revisions");
@@ -439,7 +432,7 @@ describe("SummarySlotCard", () => {
     await act(async () => {
       latestButton?.click();
     });
-    await flushQueries();
+    await flushReact(5);
 
     expect(container.textContent).toContain("Current body");
     expect(container.textContent).not.toContain("Historical revision");
@@ -470,7 +463,7 @@ describe("SummarySlotCard", () => {
     });
 
     root = renderCard(container);
-    await flushQueries();
+    await flushReact(5);
 
     expect(container.textContent).toContain("32 revisions");
 
@@ -496,7 +489,7 @@ describe("SummarySlotCard", () => {
     } satisfies GetSummarySlotResponse);
 
     root = renderCard(container);
-    await flushQueries();
+    await flushReact(5);
 
     expect(container.textContent).toContain("Summary generation failed");
     expect(container.textContent).toContain("PAP-14000 finished without writing a summary");
@@ -509,7 +502,7 @@ describe("SummarySlotCard", () => {
     await act(async () => {
       retryButton?.click();
     });
-    await flushQueries();
+    await flushReact(5);
 
     expect(mockSummarySlotsApi.generate).toHaveBeenCalled();
   });

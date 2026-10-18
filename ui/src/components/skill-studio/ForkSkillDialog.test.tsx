@@ -12,6 +12,7 @@ import type {
 } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ForkSkillDialog } from "./ForkSkillDialog";
+import { flushReact } from "@/test-utils/react";
 
 const mockNavigate = vi.hoisted(() => vi.fn());
 const mockCompanySkillsApi = vi.hoisted(() => ({
@@ -45,11 +46,6 @@ async function act(callback: () => void | Promise<void>) {
   await result;
 }
 
-async function flush() {
-  await Promise.resolve();
-  await new Promise((resolve) => window.setTimeout(resolve, 0));
-}
-
 function teardown() {
   if (root) flushSync(() => root?.unmount());
   container?.remove();
@@ -69,14 +65,14 @@ async function renderNode(node: ReactNode) {
   await act(async () => {
     root?.render(<QueryClientProvider client={queryClient}>{node}</QueryClientProvider>);
   });
-  await flush();
+  await flushReact();
 }
 
 async function click(el: Element) {
   await act(async () => {
     el.dispatchEvent(new MouseEvent("click", { bubbles: true }));
   });
-  await flush();
+  await flushReact();
 }
 
 function findButton(match: (text: string) => boolean): HTMLButtonElement {

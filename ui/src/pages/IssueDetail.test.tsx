@@ -16,6 +16,7 @@ import {
 } from "./IssueDetail";
 import { queryKeys } from "../lib/queryKeys";
 import { createIssueDetailLocationState } from "../lib/issueDetailBreadcrumb";
+import { flushReact, waitForAssertion } from "@/test-utils/react";
 
 const mockIssuesApi = vi.hoisted(() => ({
   get: vi.fn(),
@@ -927,33 +928,12 @@ function createCancelPreview(issueCount = 8): IssueTreeControlPreview {
   };
 }
 
-async function flushReact() {
-  await act(async () => {
-    await Promise.resolve();
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
-  });
-}
-
 async function setTextareaValue(textarea: HTMLTextAreaElement, value: string) {
   const valueSetter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
   await act(async () => {
     valueSetter?.call(textarea, value);
     textarea.dispatchEvent(new Event("input", { bubbles: true }));
   });
-}
-
-async function waitForAssertion(assertion: () => void, attempts = 20) {
-  let lastError: unknown;
-  for (let attempt = 0; attempt < attempts; attempt += 1) {
-    try {
-      assertion();
-      return;
-    } catch (error) {
-      lastError = error;
-      await flushReact();
-    }
-  }
-  throw lastError;
 }
 
 describe("IssueDetail", () => {

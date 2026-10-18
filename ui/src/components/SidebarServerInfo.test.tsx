@@ -5,6 +5,7 @@ import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SidebarServerInfo } from "./SidebarServerInfo";
+import { flushReact } from "@/test-utils/react";
 
 const mockHealthApi = vi.hoisted(() => ({
   get: vi.fn(),
@@ -20,14 +21,6 @@ vi.mock("@/api/health", () => ({
 vi.mock("@/api/instanceSettings", () => ({
   instanceSettingsApi: mockInstanceSettingsApi,
 }));
-
-async function flushReact() {
-  for (let index = 0; index < 6; index += 1) {
-    await Promise.resolve();
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
-  }
-  flushSync(() => {});
-}
 
 async function flushReactMicrotasks() {
   for (let index = 0; index < 6; index += 1) {
@@ -59,7 +52,7 @@ describe("SidebarServerInfo", () => {
         </QueryClientProvider>,
       );
     });
-    await flushReact();
+    await flushReact(6);
   }
 
   beforeEach(() => {
@@ -266,7 +259,7 @@ describe("SidebarServerInfo", () => {
           </QueryClientProvider>,
         );
       });
-      await flushReact();
+      await flushReact(6);
       return drawerRoot;
     }
 

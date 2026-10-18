@@ -11,6 +11,7 @@ import type {
 } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SkillStudio } from "./SkillStudio";
+import { flushReact } from "@/test-utils/react";
 
 const routeState = vi.hoisted(() => ({
   pathname: "/skills/studio/new",
@@ -148,11 +149,6 @@ async function act(callback: () => void | Promise<void>) {
     result = callback();
   });
   await result;
-}
-
-async function flushReact() {
-  await Promise.resolve();
-  await new Promise((resolve) => window.setTimeout(resolve, 0));
 }
 
 async function waitFor(assertion: () => void) {

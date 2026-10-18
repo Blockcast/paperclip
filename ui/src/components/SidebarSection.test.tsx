@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SidebarSection } from "./SidebarSection";
 import { SidebarNavExpandedProvider } from "./SidebarNavItem";
 import { Plus } from "lucide-react";
+import { flushReact } from "@/test-utils/react";
 
 const sidebarState = vi.hoisted(() => ({
   isMobile: false,
@@ -33,13 +34,6 @@ vi.mock("../context/SidebarContext", () => ({
 if (!globalThis.PointerEvent) {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (globalThis as any).PointerEvent = MouseEvent;
-}
-
-async function flushReact() {
-  await act(async () => {
-    await Promise.resolve();
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
-  });
 }
 
 async function openSectionMenu(container: HTMLElement) {

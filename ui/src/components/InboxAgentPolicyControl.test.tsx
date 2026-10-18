@@ -6,6 +6,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { InboxAgentPolicy } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { InboxAgentPolicyControl } from "./InboxAgentPolicyControl";
+import { flushReact, waitForAssertion } from "@/test-utils/react";
 
 const mockAgentsApi = vi.hoisted(() => ({ list: vi.fn() }));
 const mockInboxAgentPolicyApi = vi.hoisted(() => ({ getMine: vi.fn(), updateMine: vi.fn() }));
@@ -23,26 +24,6 @@ async function act(callback: () => void | Promise<void>) {
     result = callback();
   });
   await result;
-}
-
-async function flush() {
-  await act(async () => {
-    await new Promise((resolve) => setTimeout(resolve, 0));
-  });
-}
-
-async function waitForAssertion(assertion: () => void, attempts = 20) {
-  let lastError: unknown;
-  for (let attempt = 0; attempt < attempts; attempt += 1) {
-    try {
-      assertion();
-      return;
-    } catch (error) {
-      lastError = error;
-      await flush();
-    }
-  }
-  throw lastError;
 }
 
 function policy(overrides: Partial<InboxAgentPolicy> = {}): InboxAgentPolicy {
@@ -101,7 +82,7 @@ describe("InboxAgentPolicyControl", () => {
   it("surfaces policy load failures instead of staying on loading", async () => {
     mockInboxAgentPolicyApi.getMine.mockRejectedValue(new Error("Policy endpoint failed"));
     const root = render(container);
-    await flush();
+    await flushReact();
 
     await waitForAssertion(() => {
       expect(container.textContent).toContain("Policy endpoint failed");
@@ -114,7 +95,7 @@ describe("InboxAgentPolicyControl", () => {
   it("renders all three policy states with the persisted mode selected", async () => {
     mockInboxAgentPolicyApi.getMine.mockResolvedValue(policy({ mode: "disabled" }));
     const root = render(container);
-    await flush();
+    await flushReact();
 
     await waitForAssertion(() => {
       expect(optionByTitle(container, "Any of my agents")).toBeTruthy();
@@ -129,7 +110,7 @@ describe("InboxAgentPolicyControl", () => {
 
   it("round-trips an allowlist selection through the PUT endpoint", async () => {
     const root = render(container);
-    await flush();
+    await flushReact();
 
     // Save disabled until the draft diverges from the persisted policy.
     await waitForAssertion(() => {
@@ -139,7 +120,7 @@ describe("InboxAgentPolicyControl", () => {
 
     // Switch to allowlist — only non-terminated agents are selectable.
     await act(async () => optionByTitle(container, "Only chosen agents")!.click());
-    await flush();
+    await flushReact();
     await waitForAssertion(() => {
       expect(container.textContent).toContain("Gardener");
       expect(container.textContent).toContain("Coder");
@@ -151,13 +132,13 @@ describe("InboxAgentPolicyControl", () => {
     );
     expect(gardenerCheckbox).toBeTruthy();
     await act(async () => gardenerCheckbox!.click());
-    await flush();
+    await flushReact();
 
     const saveButton = Array.from(container.querySelectorAll("button")).find((b) => b.textContent?.includes("Save"))!;
     await waitForAssertion(() => expect(saveButton.disabled).toBe(false));
 
     await act(async () => saveButton.click());
-    await flush();
+    await flushReact();
 
     expect(mockInboxAgentPolicyApi.updateMine).toHaveBeenCalledWith("company-1", {
       mode: "allowlist",
@@ -176,19 +157,19 @@ describe("InboxAgentPolicyControl", () => {
   it("clears the allowlist when switching to Off before saving", async () => {
     mockInboxAgentPolicyApi.getMine.mockResolvedValue(policy({ mode: "allowlist", allowedAgentIds: ["agent-1"], materialized: true }));
     const root = render(container);
-    await flush();
+    await flushReact();
 
     await waitForAssertion(() => {
       expect(optionByTitle(container, "Only chosen agents")?.getAttribute("aria-checked")).toBe("true");
     });
 
     await act(async () => optionByTitle(container, "Off")!.click());
-    await flush();
+    await flushReact();
 
     const saveButton = Array.from(container.querySelectorAll("button")).find((b) => b.textContent?.includes("Save"))!;
     await waitForAssertion(() => expect(saveButton.disabled).toBe(false));
     await act(async () => saveButton.click());
-    await flush();
+    await flushReact();
 
     expect(mockInboxAgentPolicyApi.updateMine).toHaveBeenCalledWith("company-1", {
       mode: "disabled",

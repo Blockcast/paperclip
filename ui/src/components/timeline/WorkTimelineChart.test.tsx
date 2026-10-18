@@ -7,6 +7,7 @@ import type { WorkTimelineResult } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { WorkTimelineChart } from "./WorkTimelineChart";
 import { computeLayout } from "@/lib/timeline/layout";
+import { flushReact, waitForAssertion } from "@/test-utils/react";
 
 vi.mock("@/lib/router", () => ({
   useLocation: () => ({ pathname: "/PAP/timeline" }),
@@ -46,34 +47,6 @@ function renderChart(
       />,
     );
   });
-}
-
-// The chart drives its axis from a `scroll` handler, and React treats `scroll`
-// (and `mouseover`) as ContinuousEventPriority — a lane `flushSync` does NOT
-// flush. The commit is left to React's scheduler, which re-schedules itself
-// with a fresh `setImmediate` every time a render overruns its 5ms slice. On a
-// loaded CI runner that reschedule lands AFTER a pending `setTimeout(0)`, so a
-// fixed-delay wait reads the pre-update DOM and fails (PEN-4249). Drive the
-// updates through `act(...)` and wait on the condition, never on a delay.
-async function flushTimelineEffects() {
-  await act(async () => {
-    await Promise.resolve();
-    await new Promise((resolve) => setTimeout(resolve, 0));
-  });
-}
-
-async function waitForAssertion(assertion: () => void, attempts = 50) {
-  let lastError: unknown;
-  for (let attempt = 0; attempt < attempts; attempt += 1) {
-    try {
-      assertion();
-      return;
-    } catch (error) {
-      lastError = error;
-      await flushTimelineEffects();
-    }
-  }
-  throw lastError;
 }
 
 function timelineSample(): WorkTimelineResult {
@@ -187,7 +160,7 @@ describe("WorkTimelineChart", () => {
     const data = timelineSample();
     renderChart(data, { onVisibleWindowChange });
 
-    await flushTimelineEffects();
+    await flushReact();
 
     const scroller = container.querySelector<HTMLElement>("[data-testid='work-timeline-scroll']")!;
     expect(onVisibleWindowChange).toHaveBeenCalled();

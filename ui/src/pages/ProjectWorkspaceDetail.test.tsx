@@ -6,6 +6,7 @@ import { act, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ProjectWorkspaceDetail } from "./ProjectWorkspaceDetail";
+import { flushReact } from "@/test-utils/react";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -164,11 +165,6 @@ function project(overrides: Partial<Project> = {}): Project {
   };
 }
 
-async function flush() {
-  await new Promise((resolve) => setTimeout(resolve, 0));
-  await new Promise((resolve) => setTimeout(resolve, 0));
-}
-
 function pluginSlot(overrides: Record<string, unknown> = {}) {
   return {
     id: "quality-tab",
@@ -216,7 +212,7 @@ describe("ProjectWorkspaceDetail plugin tabs", () => {
       );
     });
     await act(async () => {
-      await flush();
+      await flushReact(2);
     });
   }
 

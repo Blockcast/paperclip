@@ -6,6 +6,7 @@ import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SidebarCompanyMenu } from "./SidebarCompanyMenu";
+import { flushReact } from "@/test-utils/react";
 
 const mockAuthApi = vi.hoisted(() => ({
   getSession: vi.fn(),
@@ -101,11 +102,6 @@ vi.mock("../context/SidebarContext", () => ({
 
 function act(callback: () => void) {
   flushSync(callback);
-}
-
-async function flushReact() {
-  await Promise.resolve();
-  await new Promise((resolve) => window.setTimeout(resolve, 0));
 }
 
 describe("SidebarCompanyMenu", () => {

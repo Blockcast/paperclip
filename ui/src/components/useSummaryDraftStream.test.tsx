@@ -8,6 +8,7 @@ import type { LiveEvent, SummarySlotIssueRef } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { __liveUpdatesTestUtils } from "@/context/LiveUpdatesProvider";
 import { useSummaryDraftStream } from "./useSummaryDraftStream";
+import { flushReact } from "@/test-utils/react";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -22,14 +23,6 @@ async function act(callback: () => void | Promise<void>) {
     result = callback();
   });
   await result;
-}
-
-async function flushQueries() {
-  for (let index = 0; index < 5; index += 1) {
-    await Promise.resolve();
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
-  }
-  flushSync(() => {});
 }
 
 function issue(id: string): SummarySlotIssueRef {
@@ -147,13 +140,13 @@ describe("useSummaryDraftStream", () => {
   it("streams status line and draft from markers split across delta boundaries", async () => {
     const subscribers = new Set<CompanyLiveEventHandler>();
     ({ root } = renderHarness(issue("1"), subscribers));
-    await flushQueries();
+    await flushReact(5);
 
     // Learn the run id from a progress event.
     await act(async () => {
       dispatchLiveEventToSubscribers(subscribers, "company-1", progressEvent("1", "run-1"));
     });
-    await flushQueries();
+    await flushReact(5);
     expect(captured.current?.runId).toBe("run-1");
 
     // Stream the whole protocol in 4-char slices.
@@ -162,7 +155,7 @@ describe("useSummaryDraftStream", () => {
         dispatchLiveEventToSubscribers(subscribers, "company-1", event);
       }
     });
-    await flushQueries();
+    await flushReact(5);
 
     expect(captured.current?.statusLine).toBe("writing the summary…");
     expect(captured.current?.draft).toBe("## Needs you\n- Approve the launch");
@@ -173,7 +166,7 @@ describe("useSummaryDraftStream", () => {
   it("shows a partial draft and typing state before the closing sentinel", async () => {
     const subscribers = new Set<CompanyLiveEventHandler>();
     ({ root } = renderHarness(issue("1"), subscribers));
-    await flushQueries();
+    await flushReact(5);
     await act(async () => {
       dispatchLiveEventToSubscribers(subscribers, "company-1", progressEvent("1", "run-1"));
     });
@@ -182,7 +175,7 @@ describe("useSummaryDraftStream", () => {
     await act(async () => {
       dispatchLiveEventToSubscribers(subscribers, "company-1", logEvent("run-1", 1, partial));
     });
-    await flushQueries();
+    await flushReact(5);
 
     expect(captured.current?.draft).toBe("## Needs you\n- Approve");
     expect(captured.current?.draftClosed).toBe(false);
@@ -191,7 +184,7 @@ describe("useSummaryDraftStream", () => {
   it("falls back to spinner state when the model skips the markers", async () => {
     const subscribers = new Set<CompanyLiveEventHandler>();
     ({ root } = renderHarness(issue("1"), subscribers));
-    await flushQueries();
+    await flushReact(5);
     await act(async () => {
       dispatchLiveEventToSubscribers(subscribers, "company-1", progressEvent("1", "run-1"));
     });
@@ -199,7 +192,7 @@ describe("useSummaryDraftStream", () => {
     await act(async () => {
       dispatchLiveEventToSubscribers(subscribers, "company-1", logEvent("run-1", 1, "just prose, no markers here"));
     });
-    await flushQueries();
+    await flushReact(5);
 
     expect(captured.current?.draft).toBeNull();
     expect(captured.current?.draftClosed).toBe(false);
@@ -209,7 +202,7 @@ describe("useSummaryDraftStream", () => {
   it("ignores log events for a different run", async () => {
     const subscribers = new Set<CompanyLiveEventHandler>();
     ({ root } = renderHarness(issue("1"), subscribers));
-    await flushQueries();
+    await flushReact(5);
     await act(async () => {
       dispatchLiveEventToSubscribers(subscribers, "company-1", progressEvent("1", "run-1"));
     });
@@ -217,7 +210,7 @@ describe("useSummaryDraftStream", () => {
     await act(async () => {
       dispatchLiveEventToSubscribers(subscribers, "company-1", logEvent("run-999", 1, "<<<SUMMARY-DRAFT>>>\nleak"));
     });
-    await flushQueries();
+    await flushReact(5);
 
     expect(captured.current?.draft).toBeNull();
   });
@@ -226,11 +219,11 @@ describe("useSummaryDraftStream", () => {
     const subscribers = new Set<CompanyLiveEventHandler>();
     let rerender: (next: SummarySlotIssueRef | null) => void;
     ({ root, rerender } = renderHarness(issue("1"), subscribers));
-    await flushQueries();
+    await flushReact(5);
     await act(async () => {
       dispatchLiveEventToSubscribers(subscribers, "company-1", progressEvent("1", "run-1"));
     });
-    await flushQueries();
+    await flushReact(5);
     await act(async () => {
       dispatchLiveEventToSubscribers(
         subscribers,
@@ -238,14 +231,14 @@ describe("useSummaryDraftStream", () => {
         logEvent("run-1", 1, "<<<SUMMARY-DRAFT>>>\nold draft\n<<<END-SUMMARY-DRAFT>>>"),
       );
     });
-    await flushQueries();
+    await flushReact(5);
     expect(captured.current?.draft).toBe("old draft");
 
     // A new generation issue supersedes the old one → everything resets.
     await act(async () => {
       rerender(issue("2"));
     });
-    await flushQueries();
+    await flushReact(5);
     expect(captured.current?.runId).toBeNull();
     expect(captured.current?.draft).toBeNull();
     expect(captured.current?.hasStream).toBe(false);
@@ -282,7 +275,7 @@ describe("useSummaryDraftStream", () => {
 
     const subscribers = new Set<CompanyLiveEventHandler>();
     ({ root } = renderHarness(issue("1"), subscribers));
-    await flushQueries();
+    await flushReact(5);
 
     expect(captured.current?.runId).toBe("run-1");
     expect(captured.current?.draft).toBe("## Needs you\nRecovered after refresh.");

@@ -6,6 +6,7 @@ import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { NewIssueDialog } from "./NewIssueDialog";
+import { flushReact, waitForAssertion } from "@/test-utils/react";
 
 const dialogState = vi.hoisted(() => ({
   newIssueOpen: true,
@@ -268,17 +269,6 @@ function act(callback: () => void | Promise<void>): void | Promise<void> {
     : undefined;
 }
 
-// Drains one macrotask tick inside `act`. This is NOT a settle: anything that
-// needs a query to resolve first — `instanceSettingsApi.getExperimental`, the
-// project list, the reusable-workspace summaries — may still be pending when
-// this returns, and does resolve later under CI load. Assert flag-gated DOM
-// through `waitForAssertion` instead, or the assertion reads the pre-flag DOM.
-async function flush() {
-  await act(async () => {
-    await new Promise((resolve) => setTimeout(resolve, 0));
-  });
-}
-
 async function typeTextareaValue(textarea: HTMLTextAreaElement, value: string) {
   await act(async () => {
     const valueSetter = Object.getOwnPropertyDescriptor(
@@ -295,40 +285,7 @@ async function typeTextareaValue(textarea: HTMLTextAreaElement, value: string) {
     );
     textarea.dispatchEvent(new Event("change", { bubbles: true }));
   });
-  await flush();
-}
-
-// Polls `assertion` until it stops throwing, flushing a tick between attempts.
-//
-// It only settles the gate its OWN assertion reads, and it flushes nothing at
-// all when the assertion already holds on the first attempt. A wait that holds
-// on attempt 0 is not a settle, however it reads.
-//
-// Beware of measuring that on the fast path. `expect(submitButton
-// .hasAttribute("disabled")).toBe(false)` was retired at eleven sites on the
-// evidence that it always returned on attempt 0 — but every sample was taken
-// with an `await flush()` sitting in front of it, which had already supplied
-// the one tick the defaults path needs. Remove the flush and the same wait
-// loops. Two of those eleven were real settles, and retiring them reopened the
-// flake in BLO-32761. Sample a wait with the preceding flush removed before
-// concluding it advances nothing.
-//
-// So never place a read of query-gated DOM after a wait on some unrelated
-// condition. Wait on the gated thing itself.
-async function waitForAssertion(assertion: () => void, attempts = 20) {
-  let lastError: unknown;
-
-  for (let attempt = 0; attempt < attempts; attempt += 1) {
-    try {
-      assertion();
-      return;
-    } catch (error) {
-      lastError = error;
-      await flush();
-    }
-  }
-
-  throw lastError;
+  await flushReact();
 }
 
 // Asserts the submit button exists and is clickable. Deliberately NOT a wait.
@@ -352,7 +309,7 @@ async function waitForAssertion(assertion: () => void, attempts = 20) {
 // first. Prefer settling on a strictly LATER gate the click already requires —
 // e.g. the `listSummaries` call, which react-query only fires once the same
 // effect has set `projectId`. Where no such gate exists, wrap this in
-// `waitForAssertion` and do NOT leave an `await flush()` in front of it: the
+// `waitForAssertion` and do NOT leave an `await flushReact()` in front of it: the
 // flush hides the race by supplying exactly one tick of slack, and a wait that
 // is a no-op on attempt 0 is the decoy described above. With the flush gone the
 // wait genuinely loops every run, so deleting it fails locally instead of
@@ -438,7 +395,7 @@ describe("NewIssueDialog", () => {
 
   it("pre-fills new task descriptions with acceptance and verification headings", async () => {
     const { root } = renderDialog(container);
-    await flush();
+    await flushReact();
 
     const descriptionInput = container.querySelector(
       'textarea[aria-label="Add description..."]',
@@ -453,7 +410,7 @@ describe("NewIssueDialog", () => {
 
   it("creates without a warning when both recommended headings are present", async () => {
     const { root } = renderDialog(container);
-    await flush();
+    await flushReact();
 
     const titleInput = container.querySelector('textarea[placeholder="Task title"]') as HTMLTextAreaElement;
     await typeTextareaValue(titleInput, "Well specified task");
@@ -464,7 +421,7 @@ describe("NewIssueDialog", () => {
     await act(async () => {
       submitButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     expect(mockIssuesApi.create).toHaveBeenCalledWith(
       "company-1",
@@ -486,7 +443,7 @@ describe("NewIssueDialog", () => {
 
     // Defaults entry path: `disabled` is `!titleHasText`, and `titleHasText` is
     // only set by the initialization effect after the first commit. The
-    // `await flush()` that used to sit here supplied exactly one tick and no
+    // `await flushReact()` that used to sit here supplied exactly one tick and no
     // more — the BLO-32761 shape. See the sub-task test below.
     const findSubmitButton = () => Array.from(container.querySelectorAll("button"))
       .find((button) => button.textContent?.includes("Create Task"));
@@ -496,7 +453,7 @@ describe("NewIssueDialog", () => {
     await act(async () => {
       submitButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     expect(toastState.pushToast).toHaveBeenCalledWith({
       title: "Task description is missing recommended headings",
@@ -524,7 +481,7 @@ describe("NewIssueDialog", () => {
     };
 
     const { root } = renderDialog(container);
-    await flush();
+    await flushReact();
 
     expect(container.textContent).toContain("New sub-task");
     expect(container.textContent).toContain("Sub-task of");
@@ -536,7 +493,7 @@ describe("NewIssueDialog", () => {
 
     dialogState.newIssueDefaults = {};
     const rerendered = renderDialog(container);
-    await flush();
+    await flushReact();
 
     expect(container.textContent).toContain("New task");
     expect(container.textContent).toContain("Create Task");
@@ -583,7 +540,7 @@ describe("NewIssueDialog", () => {
     };
 
     const { root } = renderDialog(container);
-    await flush();
+    await flushReact();
 
     // Asserts the endpoint choice, not just that some fetch happened: the
     // dialog must ask for reuse-eligible summaries rather than the full
@@ -608,7 +565,7 @@ describe("NewIssueDialog", () => {
     await act(async () => {
       submitButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     expect(mockIssuesApi.create).toHaveBeenCalledWith(
       "company-1",
@@ -628,7 +585,7 @@ describe("NewIssueDialog", () => {
   it("does not show user-secret warnings when the draft will not run an env binding that needs them", async () => {
     // The banner keys off `currentAssignee.adapterConfig.env`, so it cannot
     // render until the agents query resolves. Asserting its absence after a
-    // bare `flush()` therefore passed for the wrong reason — and with the
+    // bare `flushReact()` therefore passed for the wrong reason — and with the
     // suite defaults (`agents: []`, no assignee) there was no binding of any
     // kind to reject, so it never exercised the "does not need them" path.
     //
@@ -732,7 +689,7 @@ describe("NewIssueDialog", () => {
     const { root } = renderDialog(container);
 
     // Both assertions read state the initialization effect writes after the
-    // first commit, so a single `await flush()` is zero margin under CI load.
+    // first commit, so a single `await flushReact()` is zero margin under CI load.
     const findSubmitButton = () => Array.from(container.querySelectorAll("button"))
       .find((button) => button.textContent?.includes("Create Task"));
     await waitForAssertion(() => {
@@ -745,7 +702,7 @@ describe("NewIssueDialog", () => {
     await act(async () => {
       submitButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     expect(mockIssuesApi.create).toHaveBeenCalledWith(
       "company-1",
@@ -782,7 +739,7 @@ describe("NewIssueDialog", () => {
     await act(async () => {
       submitButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     expect(mockIssuesApi.create).toHaveBeenCalledWith(
       "company-1",
@@ -842,7 +799,7 @@ describe("NewIssueDialog", () => {
     };
 
     const { root } = renderDialog(container);
-    await flush();
+    await flushReact();
 
     expect(container.textContent).toContain("New task");
     expect(container.textContent).not.toContain("New sub-task");
@@ -857,7 +814,7 @@ describe("NewIssueDialog", () => {
     await act(async () => {
       submitButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     expect(mockIssuesApi.create).toHaveBeenCalledWith(
       "company-1",
@@ -917,7 +874,7 @@ describe("NewIssueDialog", () => {
     };
 
     const { root } = renderDialog(container);
-    await flush();
+    await flushReact();
 
     await waitForAssertion(() => {
       const workspaceInput = container.querySelector('input[placeholder="Search workspaces..."]');
@@ -940,7 +897,7 @@ describe("NewIssueDialog", () => {
     }));
 
     const { root } = renderDialog(container);
-    await flush();
+    await flushReact();
 
     const titleInput = container.querySelector('textarea[placeholder="Task title"]') as HTMLTextAreaElement | null;
     const descriptionInput = container.querySelector('textarea[aria-label="Add description..."]') as HTMLTextAreaElement | null;
@@ -962,7 +919,7 @@ describe("NewIssueDialog", () => {
       ]);
       await Promise.resolve();
     });
-    await flush();
+    await flushReact();
 
     const submitButton = Array.from(container.querySelectorAll("button"))
       .find((button) => button.textContent?.includes("Create Task"));
@@ -971,7 +928,7 @@ describe("NewIssueDialog", () => {
     await act(async () => {
       submitButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     expect(mockIssuesApi.create).toHaveBeenCalledWith(
       "company-1",
@@ -994,7 +951,7 @@ describe("NewIssueDialog", () => {
     ].join("\n");
 
     const { root } = renderDialog(container);
-    await flush();
+    await flushReact();
 
     const titleInput = container.querySelector('textarea[placeholder="Task title"]') as HTMLTextAreaElement | null;
     const descriptionInput = container.querySelector('textarea[aria-label="Add description..."]') as HTMLTextAreaElement | null;
@@ -1011,7 +968,7 @@ describe("NewIssueDialog", () => {
     await act(async () => {
       submitButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     expect(mockIssuesApi.create).toHaveBeenCalledWith(
       "company-1",
@@ -1027,7 +984,7 @@ describe("NewIssueDialog", () => {
 
   it("submits planning work mode when planning is selected", async () => {
     const { root } = renderDialog(container);
-    await flush();
+    await flushReact();
 
     const titleInput = container.querySelector('textarea[placeholder="Task title"]') as HTMLTextAreaElement | null;
     expect(titleInput).not.toBeNull();
@@ -1038,7 +995,7 @@ describe("NewIssueDialog", () => {
     await act(async () => {
       planningButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     const submitButton = Array.from(container.querySelectorAll("button"))
       .find((button) => button.textContent?.includes("Create Task"));
@@ -1047,7 +1004,7 @@ describe("NewIssueDialog", () => {
     await act(async () => {
       submitButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     expect(mockIssuesApi.create).toHaveBeenCalledWith(
       "company-1",
@@ -1062,7 +1019,7 @@ describe("NewIssueDialog", () => {
 
   it("submits ask work mode when ask is selected", async () => {
     const { root } = renderDialog(container);
-    await flush();
+    await flushReact();
 
     const titleInput = container.querySelector('textarea[placeholder="Task title"]') as HTMLTextAreaElement | null;
     expect(titleInput).not.toBeNull();
@@ -1073,7 +1030,7 @@ describe("NewIssueDialog", () => {
     await act(async () => {
       askButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     const submitButton = Array.from(container.querySelectorAll("button"))
       .find((button) => button.textContent?.includes("Create Task"));
@@ -1082,7 +1039,7 @@ describe("NewIssueDialog", () => {
     await act(async () => {
       submitButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     expect(mockIssuesApi.create).toHaveBeenCalledWith(
       "company-1",
@@ -1097,7 +1054,7 @@ describe("NewIssueDialog", () => {
 
   it("cycles work modes with cmd-period", async () => {
     const { root } = renderDialog(container);
-    await flush();
+    await flushReact();
 
     const modeChip = () => container.querySelector("[data-issue-work-mode-chip]");
     expect(modeChip()?.getAttribute("data-issue-work-mode-chip")).toBe("standard");
@@ -1137,7 +1094,7 @@ describe("NewIssueDialog", () => {
 
   it("cycles work modes when iOS reports cmd-period as Escape", async () => {
     const { root } = renderDialog(container);
-    await flush();
+    await flushReact();
 
     const modeChip = () => container.querySelector("[data-issue-work-mode-chip]");
     expect(modeChip()?.getAttribute("data-issue-work-mode-chip")).toBe("standard");
@@ -1187,7 +1144,7 @@ describe("NewIssueDialog", () => {
 
   it("cycles work modes with ctrl-period", async () => {
     const { root } = renderDialog(container);
-    await flush();
+    await flushReact();
 
     const modeChip = () => container.querySelector("[data-issue-work-mode-chip]");
     expect(modeChip()?.getAttribute("data-issue-work-mode-chip")).toBe("standard");
@@ -1227,7 +1184,7 @@ describe("NewIssueDialog", () => {
     // `renderDialog` the button is present with `disabled=true`, and it clears
     // on the next tick.
     //
-    // The `await flush()` that used to sit here supplied exactly that one tick
+    // The `await flushReact()` that used to sit here supplied exactly that one tick
     // and no more, so the test carried zero slack and reddened the required
     // gate under CI load (BLO-32761, reverting BLO-19290's fix). It is
     // deliberately NOT restored: without it this wait fails on attempt 0 on
@@ -1242,7 +1199,7 @@ describe("NewIssueDialog", () => {
     await act(async () => {
       submitButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     expect(mockIssuesApi.create).toHaveBeenCalledWith(
       "company-1",
@@ -1260,7 +1217,7 @@ describe("NewIssueDialog", () => {
 
   it("keeps the mobile dialog bounded with an internal flexible scroll region", async () => {
     const { root } = renderDialog(container);
-    await flush();
+    await flushReact();
 
     const dialogContent = Array.from(container.querySelectorAll("div")).find((element) =>
       typeof element.className === "string" && element.className.includes("max-h-(--new-issue-dialog-height)"),
@@ -1285,7 +1242,7 @@ describe("NewIssueDialog", () => {
 
   it("keeps priority under the mobile overflow menu", async () => {
     const { root } = renderDialog(container);
-    await flush();
+    await flushReact();
 
     const priorityChip = container.querySelector('[data-testid="new-issue-priority-chip"]');
     expect(priorityChip?.className).toContain("hidden");
@@ -1297,7 +1254,7 @@ describe("NewIssueDialog", () => {
     await act(async () => {
       highPriorityOption?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     const selectedHighPriorityOption = container.querySelector('[data-testid="new-issue-more-priority-high"]');
     expect(selectedHighPriorityOption?.className).toContain("bg-accent");
@@ -1307,7 +1264,7 @@ describe("NewIssueDialog", () => {
 
   it("allows editor autocomplete portal pointer events inside the modal", async () => {
     const { root } = renderDialog(container);
-    await flush();
+    await flushReact();
 
     const menu = document.createElement("div");
     menu.setAttribute("data-paperclip-floating-ui", "");
@@ -1398,7 +1355,7 @@ describe("NewIssueDialog", () => {
       modeSelect!.value = "shared_workspace";
       modeSelect!.dispatchEvent(new Event("change", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     expect(container.textContent).toContain("will no longer use the parent task workspace");
     expect(container.textContent).toContain("Parent workspace");
@@ -1430,7 +1387,7 @@ describe("NewIssueDialog", () => {
     await act(async () => {
       watchdogMenuItem!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     expect(container.textContent).toContain("Set watchdog");
     expect(container.querySelector('textarea[placeholder^="What should the watchdog"]')).not.toBeNull();
@@ -1483,7 +1440,7 @@ describe("NewIssueDialog", () => {
     await act(async () => {
       submitButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     expect(mockIssuesApi.create).toHaveBeenCalledWith(
       "company-1",

@@ -7,6 +7,7 @@ import { MemoryRouter, Route, Routes } from "react-router";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SEARCH_DEBOUNCE_MS, Search, buildSearchUrl } from "./Search";
+import { flushReact } from "@/test-utils/react";
 
 const companyState = vi.hoisted(() => ({
   selectedCompanyId: "company-1",
@@ -101,16 +102,9 @@ vi.mock("../components/Identity", () => ({
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
-async function flush() {
-  await Promise.resolve();
-  // Sound as a fixed sleep: this is a macrotask yield, not a wait for a specific
-  // timer. It hands control back to the event loop and never needs a budget.
-  await new Promise((resolve) => setTimeout(resolve, 0));
-}
-
 // Search.tsx debounces the draft query with a real window.setTimeout, so any
 // assertion about the resulting request has to outlast that timer on a contended
-// runner. A retry count is not a wall-clock budget: `flush()` costs one microtask
+// runner. A retry count is not a wall-clock budget: `flushReact()` costs one microtask
 // drain plus a setTimeout(0), so 50 attempts bought only ~50-100ms and the fixed
 // pre-assertion sleep was doing all the real waiting. Both numbers below derive
 // from SEARCH_DEBOUNCE_MS so raising the debounce cannot silently re-open the
@@ -129,7 +123,7 @@ async function waitForAssertion(assertion: () => void, timeoutMs = ASSERTION_TIM
       lastError = error;
     }
     if (Date.now() >= deadline) break;
-    await flush();
+    await flushReact();
     await new Promise((resolve) => setTimeout(resolve, ASSERTION_POLL_MS));
   }
   throw lastError;
@@ -141,7 +135,7 @@ async function waitForAssertion(assertion: () => void, timeoutMs = ASSERTION_TIM
 // correctness one.
 async function settleDebounce() {
   await new Promise((resolve) => setTimeout(resolve, SEARCH_DEBOUNCE_MS));
-  await flush();
+  await flushReact();
 }
 
 function renderSearch(initialPath: string, container: HTMLDivElement, node?: ReactNode) {
