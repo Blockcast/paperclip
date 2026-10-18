@@ -147,9 +147,26 @@ export const DEFAULT_EVIDENCE_REGISTRY: EvidenceRegistry = {
  * them, not how much they bite:
  *   - `deploy:landed` is unsatisfiable for EVERY issue at the only transition
  *     the gate runs on, so it is required nowhere.
- *   - `review:ally-clean` is satisfiable by anyone with an open PR, so it stays
- *     required — including on a LABELED issue with no linked PR, whose assignee
- *     can open one. Only the PR-less UNLABELED case is exempt.
+ *   - `review:ally-clean` is satisfiable by anyone with an open PR WHOSE AUTHOR
+ *     IS NOT THE REVIEWER IDENTITY, so it stays required — including on a
+ *     LABELED issue with no linked PR, whose assignee can open one. Only the
+ *     PR-less UNLABELED case is exempt.
+ *
+ *     That author clause is not a refinement, it is a whole population. The
+ *     independence guard (BLO-34969 in `evidence-truth.ts`, and the
+ *     `githubSharesReviewerIdentity` branch of `evaluateCommentReviewGate` in
+ *     `pr-comment-review-gate.ts`) makes the shape unreachable on an
+ *     App-authored PR by BOTH surfaces, and in this estate every agent-opened
+ *     PR is App-authored. So "anyone with an open PR" holds for humans and
+ *     fails for agents, and keeping the shape required is a judgement about
+ *     the human population that the agent population also pays. It costs
+ *     nothing while the gap only warns — `truthOnlyGap` in `evidence-gate.ts`
+ *     demotes it with no label test, so a truth-ONLY gap on one of the six
+ *     labeled arrays above that require it warns too (a MIXED gap still
+ *     blocks, on its other shapes) — and it is the entire exposure the moment
+ *     `PAPERCLIP_EVIDENCE_UNLABELED_BLOCK` is flipped. De-requiring it for
+ *     that population is the flip's own work; see
+ *     `docs/runbooks/evidence-gate-unlabeled-block.md`.
  *
  * `deploy:landed` is deliberately NOT required, here or on any labeled path
  * (CTO ruling 2026-09-17) — see the registry comment above. Unlabeled is the

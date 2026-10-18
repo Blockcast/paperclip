@@ -45,8 +45,9 @@ plus a redeploy.
 
 | shape | satisfiable when entering `in_review`? | flag makes it blocking? |
 |---|---|---|
-| `review:ally-clean` | yes — a PR may be open, at head, 0 Critical / 0 Important | **yes**, unless suppressed (below) |
+| `review:ally-clean` | yes — a PR may be open, at head, 0 Critical / 0 Important, **and authored by someone other than the reviewer** | **yes**, unless suppressed (below) |
 | `review:ally-clean`, no linked PR | **never** — there is no head to review | **no, at any value**; unlabeled is not even required to have it |
+| `review:ally-clean`, PR authored by the reviewer App | **never** — the only identity that attests it is the one that authored it | **yes — and NOT suppressed.** This is the gap; see below |
 | `deploy:landed` | **never** — it means merged | **no, at any value** |
 
 The gate runs on exactly one transition, INTO `in_review`
@@ -90,6 +91,119 @@ and the verdict names which one applied:
   satisfiability, not blast radius. So both mechanisms are live over disjoint
   populations, and a labeled `noPr` issue is the one worth chasing: it means a
   code-bearing issue has no PR linked.
+
+### A THIRD unsatisfiable population — and it is the one the flag does NOT suppress
+
+Both suppressions above were chosen on a **satisfiability** test: a shape the
+assignee can never satisfy is a stall amplifier, not a gate. A third population
+fails that same test and is **not** suppressed, so it arrives in `willBlock`
+indistinguishable from a real evidence gap.
+
+`review:ally-clean` requires the attestation to come from someone who is **not**
+the PR author, on *both* surfaces:
+
+- formal review —
+  `formalClean = !githubSameActorLogin(formalAttestingReview.login, prAuthorLogin)`
+  (`server/src/services/evidence-truth.ts`);
+- comment — the `githubSharesReviewerIdentity(prAuthorLogin, reviewerBotLogin)`
+  branch of `evaluateCommentReviewGate`
+  (`server/src/services/pr-comment-review-gate.ts`), which returns the withheld
+  positive (`not_evaluated`, `headAttested: true`) for "the only comment
+  attesting this head is the PR author's own".
+
+Every agent-opened PR in this estate is authored by the shared GitHub App, and
+Ally reviews as that same App, so the two logins are equal and the shape is
+unreachable **however clean the review is**. The comment surface uses the
+*loose* predicate deliberately, so the bare `allyblockcast` user seat does not
+escape it either: the seat and the App are one agent wearing two hats.
+
+This is not a defect report. It is the KNOWN CONSEQUENCE `evidence-truth.ts`
+records at the independence guard (BLO-34969), in those words, together with the
+conclusion this section exists to make operational:
+
+> the flag is UNFLIPPABLE for that population until the shape is de-required for
+> it, and that de-requiring is the flip's own work.
+
+**Nothing is blocked by this today, and that is the whole reason it is easy to
+miss.** A gap made only of truth shapes is demoted to `warn` by `truthOnlyGap`
+(`evidence-gate.ts`), which has **no label test** — so an agent-authored issue
+carrying `frontend` or `backend` lands at `warn` exactly like an unlabeled one.
+(A *mixed* gap is untouched and still blocks, on its other shapes; what is
+demoted is the gap made only of truth shapes.) The entire exposure is the flip.
+
+**The merge-visible surface stays green on exactly this state, which is why the
+gap is invisible until the flip.** Both gates run the SAME
+`evaluateCommentReviewGate` function over the SAME inputs and differ only in
+which field they key on. (Not a shared object: `evidence-truth.ts:316`/`:363`
+call it themselves, separately from the merge gate's publisher. The argument
+rests on same-function-same-inputs, not on one verdict being handed between
+them.) The merge gate keys on `state`, which is `success` here, so
+`gate/ally-comment-findings` publishes non-red (`neutral` as a check run) and
+`ci/ally-head-attested` still fires, deliberately, so heavy CI does not starve
+on every App-authored PR. The evidence shape keys on `outcome`, which is
+`not_evaluated` rather than `clean`, so the shape is absent. Measured on #2806
+at head `006d374e` — commits lane-authored `ux-designer@paperclip.blockcast.net`,
+PR authored by the App — `gate/ally-comment-findings` describes itself as *"The
+only comment attesting this head is the PR author's own; nothing independent
+reviewed it"* and is **green**, while `review:ally-clean` on the linked issue is
+**missing**. Nothing on the PR tells a reviewer that the `in_review` transition
+would 422 after the flip.
+
+**Do not reach for the commit-author lane as the fix without reading why it was
+refused.** A per-lane discriminator exists and is already wired into this module
+(`prAuthorLane` / `fetchCommitAuthorEmail`, BLO-43550), and on #2806 it resolves
+cleanly. But `evidence-truth.ts` evaluated exactly that as "option 2" for the
+independence check and refused it: the git author says who wrote the CODE, and a
+review is not a commit, so against the shape this guard exists for — an
+implementing agent writing its own consolidated-review body — a code-author test
+returns "independent" and credits the fabrication. The lane is correct for the
+ledger-retirement path and must stay out of the clean path.
+
+**What it means for this runbook.** The flip criterion below reads `willBlock`
+as predicted post-flip blocks on work that *should* have been reviewed. On an
+agent-authored PR the same number counts a design decision instead, and no agent
+behaviour and no amount of waiting moves it. So:
+
+- **`willBlock` is not comparable across author types.** Segment it before
+  reading it against the 2% gate — see the measurement section.
+- **Do not open the seven-day window expecting it to close.** On the estate as
+  it stands the agent-authored share alone exceeds the gate, so the window will
+  run its seven days and refuse, correctly, every time.
+- **The de-requiring decision comes first.** It is a platform/CTO call with at
+  least three shapes: drop `review:ally-clean` from `required` for App-authored
+  PRs; add a third suppression beside `probe-failed` and `no-linked-pull-request`;
+  or give agents a PR author identity distinct from the reviewer's. This runbook
+  does not pick one, and the flip does not proceed until one lands.
+
+**Measured 2026-10-18** against company `b1d3f3d3`, status `in_review`, complete
+page of 55 rows, `company_scope:read` confirmed (6 distinct assignees):
+
+| | count | share of 55 |
+|---|---|---|
+| `willBlock` | 6 | **10.9%** — flip gate is < 2% |
+| …whose linked PR is authored by `allyblockcast[bot]` (type `Bot`) | **6** | **100% of `willBlock`** |
+| rows with `review:ally-clean` detected | 1 | 1.8% |
+| `probeFailed` | 5 | 9.1% — its own gate is < 2% |
+| `block` verdicts today | 0 | — |
+
+The single detection is the control, and it comes out the other way: the one row
+where the shape fired has a linked set including human-authored (`kkroo`, type
+`User`) PRs, its two newest merged. All six non-detections are
+`allyblockcast[bot]`. One company is a sample and not the estate — re-measure
+before quoting it — but it is enough to say the flip gate is not within reach
+today, and that review latency is not why.
+
+> **And 10.9% is a FLOOR, for a reason that applies to every number this runbook
+> asks for.** `lastEvidenceVerdict` is written only on a PATCH carrying
+> `status: "in_review"`, so a long-standing `in_review` row still carries
+> whatever verdict it got when it entered — on this page, 23 of the 55 were last
+> evaluated in August or September, i.e. at or before the shapes' own
+> registration, which makes them structurally incapable of entering `willBlock`.
+> They dilute the denominator and nothing else. Restricted to rows whose verdict
+> was evaluated this month the same six are **18.8% of 32**; restricted to the
+> last seven days, **21.4% of 28**. Like truncation, verdict staleness biases the
+> ratio *safe*, so a whole-page ratio under the gate is weaker evidence than it
+> looks. Report the restricted window beside it.
 
 This is what retired the old flip criterion about `harness_liveness_escalation`
 origins and BLO-24843: those issues have no PR by design and would have 422'd
@@ -340,6 +454,15 @@ problems:
   being linked on code-bearing issues, which is a real defect with a different
   owner, while the unlabeled share is mostly the doc-only population this path
   exists for.
+- **the agent-authored share** — not a counter above, and **not derivable from
+  this response at all.** `lastEvidenceVerdict` records *that*
+  `review:ally-clean` is missing, never *why*, and the discriminator is the
+  linked PR's GitHub author, which lives on the other side. Resolve it per
+  issue — read the `pull_request` work products, then
+  `gh api repos/<repo>/pulls/<n> --jq .user.type` — and report `willBlock`
+  split into `Bot` and `User`. Only the `User` half is the number the 2% gate
+  was written about; the `Bot` half is the population above, and it is a
+  pending platform decision, not a reviewable backlog.
 
 `onlyTruthMissing` remains a safe upper bound on `willBlock`; since the registry
 change its only excess is the two suppressed populations.
@@ -348,6 +471,10 @@ change its only excess is the two suppressed populations.
 
 Seven consecutive days with **all** of:
 
+- the agent-authored population either de-required or suppressed (see the third
+  unsatisfiable population above). Until that lands, `willBlock` carries a share
+  no review can clear and the window cannot close on its own — this is a
+  precondition on opening the window, not a number measured inside it;
 - every day's page complete — `truncated: false`. A truncated day does not
   count toward the seven and is not a failure either; it is unmeasured, and the
   window pauses until you re-measure it completely. Same standard as the seven
