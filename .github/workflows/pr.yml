@@ -1058,6 +1058,15 @@ jobs:
         run: node --test ./scripts/__tests__/select-ci-suites.test.mjs
         timeout-minutes: 3
 
+      # PEN-4282. Cross-artifact string comparison between the k8s-ro coverage
+      # register and the doc table that documents it. Deliberately here and not
+      # in the mcp-gateway vitest suite: reading `docs/` from a selectable suite
+      # makes a prose-only edit select it, which the selector test above forbids.
+      - name: Test k8s-ro scrubber coverage register / doc sync
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/__tests__/k8s-ro-coverage-doc-sync.test.mjs
+        timeout-minutes: 1
+
       - name: Test PR server-shard folding
         if: ${{ !cancelled() }}
         run: node --test ./scripts/__tests__/pr-ci-shard-folding.test.mjs

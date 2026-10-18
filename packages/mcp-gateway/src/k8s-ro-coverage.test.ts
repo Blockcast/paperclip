@@ -1,6 +1,3 @@
-import { readFileSync } from "node:fs";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { scrubResponseBody } from "./response-scrub.js";
 
@@ -81,15 +78,21 @@ import { scrubResponseBody } from "./response-scrub.js";
  * rather than left implicit, exactly as the sibling register
  * (`server/src/__tests__/mcp-seed-scrub-coverage.test.ts`) names its own
  * un-derivable oracle. What this file DOES enforce is that the two in-repo
- * records cannot drift: the register and the doc table are asserted equal, so
- * neither can be updated without the other.
+ * records cannot drift: `scripts/__tests__/k8s-ro-coverage-doc-sync.test.mjs` asserts
+ * `K8S_RO_TOOLS` below equals the tool list in the doc's table, so neither can be
+ * updated without the other.
+ *
+ * That assertion deliberately lives in the always-on `policy` lane rather than
+ * in this file. Reading `docs/…` from a vitest suite makes a prose-only edit
+ * *select* that suite, which breaks the repo's "a prose-only diff skips every
+ * suite" invariant (`scripts/__tests__/select-ci-suites.test.mjs`) — a real
+ * CI-cost property, not a technicality. A cross-artifact string comparison is
+ * cheap and belongs where it runs unconditionally; the behavioural assertions
+ * below are what need the suite.
  */
 
 const SENTINEL = "PEN4282_SENTINEL_MUST_NOT_REACH_AN_AGENT";
 const REDACTED = "<redacted>";
-
-const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
-const egressDocPath = path.join(repoRoot, "docs/AGENT-VISIBLE-CONFIG-EGRESS.md");
 
 /**
  * Every tool the `k8s-ro` seat exposes, as of the measurement below.
@@ -422,40 +425,6 @@ function scrub(body: string): string {
   return scrubResponseBody(Buffer.from(body, "utf8"), "application/json").toString("utf8");
 }
 
-/**
- * Tool names in the first column of the `k8s-ro` coverage table in
- * `docs/AGENT-VISIBLE-CONFIG-EGRESS.md` §1.
- *
- * Parsed rather than duplicated so the doc and this register cannot drift. The
- * doc is what a reader reaches for; this file is what fails. Binding them means
- * a tool added to either is a red build until it is in both — which is the
- * PEN-4282 ask ("a new kind routed through /k8s-ro without a coverage
- * decision") in the half this repo can actually enforce.
- */
-function toolsNamedInEgressDoc(): Set<string> {
-  const doc = readFileSync(egressDocPath, "utf8");
-  const marker = "| tool | returns | verdict |";
-  const tableAt = doc.indexOf(marker);
-  if (tableAt < 0) {
-    throw new Error(
-      `Could not find the k8s-ro coverage table (${marker}) in ${egressDocPath}. ` +
-        "If it moved, point this test at its new home rather than deleting the assertion — " +
-        "PEN-4282 exists because that table could not fail.",
-    );
-  }
-  const rest = doc.slice(tableAt);
-  const end = rest.indexOf("\n\n");
-  const table = end < 0 ? rest : rest.slice(0, end);
-
-  const tools = new Set<string>();
-  for (const line of table.split("\n").slice(2)) {
-    const firstCell = line.split("|")[1];
-    if (!firstCell) continue;
-    for (const match of firstCell.matchAll(/`([a-z_]+)`/g)) tools.add(match[1]!);
-  }
-  return tools;
-}
-
 describe("k8s-ro scrubber coverage register (PEN-4282)", () => {
   it("classifies every tool the k8s-ro seat exposes", () => {
     const classified = new Set(SURFACES.flatMap((surface) => surface.tools));
@@ -469,10 +438,6 @@ describe("k8s-ro scrubber coverage register (PEN-4282)", () => {
         "exact state PEN-4282 was filed for.",
     ).toEqual([]);
     expect(unknown, "SURFACES names a tool that is not in K8S_RO_TOOLS").toEqual([]);
-  });
-
-  it("stays in step with the coverage table in AGENT-VISIBLE-CONFIG-EGRESS.md", () => {
-    expect([...toolsNamedInEgressDoc()].sort()).toEqual([...K8S_RO_TOOLS].sort());
   });
 
   it("declares a surviving control value for every surface", () => {
