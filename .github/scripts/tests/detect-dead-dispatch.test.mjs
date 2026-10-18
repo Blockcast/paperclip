@@ -22,12 +22,13 @@ import {
   DEPLOY_JOB_NAME,
   DISPATCH_FATE,
   classifyDispatchRun,
+  deployJobCompleted,
   deployJobExecuted,
   detectDeadDispatch,
   findLastCompletedDispatch,
   isDeadLane,
 } from '../detect-dead-dispatch.mjs';
-import { DISPATCH_FATE_SURVIVED, laneRefilled } from '../deploy-stall-record.mjs';
+import { laneRefilled } from '../deploy-stall-record.mjs';
 
 const scriptPath = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -372,31 +373,51 @@ test('this module APPROVES NOTHING and DISPATCHES NOTHING — it holds no write 
   assert.deepEqual([...new Set(methods)], ['GET'], `non-GET request found: ${methods.join(',')}`);
 });
 
-test('the fate spelling is shared with deploy-stall-record, not re-derived', () => {
-  // detect-dead-dispatch imports deploy-stall-record (for the client and the
-  // workflow name), so the constant cannot be imported back without a cycle and
-  // is spelled independently there. This is the pin that keeps the two honest —
-  // a drift would silently restore the fail-open `laneRefilled` exists to close,
-  // with both files still reading as correct.
-  //
-  // The shared spelling is `survived`, not the death: the close gate asks for
-  // affirmative evidence of a refill, so a drift here would make every fate
-  // unrecognisable and the gate would stop closing rather than start
-  // over-closing. Both directions are pinned below.
-  assert.equal(DISPATCH_FATE.SURVIVED, DISPATCH_FATE_SURVIVED);
-  const refilled = {
+test('`survived` is NOT proof of a refill, and the close gate must not read it', () => {
+  // Review finding on this change's first head. `classifyDispatchRun` returns
+  // SURVIVED as a catch-all meaning "not a death this module may claim" — which
+  // is right for a fail-quiet detector and wrong for a gate that needs proof.
+  // These two shapes are the ones that caught it out.
+  const cancelledBeforeDeploy = classifyDispatchRun(
+    { status: 'completed', conclusion: 'cancelled' },
+    [{ name: 'build-and-push', conclusion: 'cancelled' }],
+  );
+  const deploySkippedByGuard = classifyDispatchRun({ status: 'completed', conclusion: 'success' }, [
+    { name: 'build-and-push', conclusion: 'success' },
+    { name: 'deploy', conclusion: 'skipped' },
+  ]);
+  assert.equal(cancelledBeforeDeploy, DISPATCH_FATE.SURVIVED, 'a supersede is not a death');
+  assert.equal(deploySkippedByGuard, DISPATCH_FATE.SURVIVED, 'nor is a guard-skipped deploy');
+  // ...and neither refilled the lane. The strict signal says so.
+  assert.equal(deployJobCompleted([{ name: 'build-and-push', conclusion: 'cancelled' }]), false);
+  assert.equal(deployJobCompleted([{ name: 'deploy', conclusion: 'skipped' }]), false);
+  assert.equal(deployJobCompleted([{ name: 'deploy', conclusion: 'cancelled' }]), false);
+  assert.equal(deployJobCompleted([{ name: 'deploy', conclusion: null }]), false);
+  assert.equal(deployJobCompleted([]), false, 'an absent deploy job executed nothing');
+  // A deploy that RAN counts, whether or not it succeeded: that is a real
+  // deploy attempt owned by whatever made it fail (PEN-4176's migration
+  // pre-flight is the live example). The lane was refilled either way.
+  assert.equal(deployJobCompleted([{ name: 'deploy', conclusion: 'success' }]), true);
+  assert.equal(deployJobCompleted([{ name: 'deploy', conclusion: 'failure' }]), true);
+});
+
+test('the close gate is wired to deploy-execution, not to the fate string', () => {
+  // The cross-module pin. detect-dead-dispatch imports deploy-stall-record (for
+  // the client and the workflow name), so the gate cannot be imported back
+  // without a cycle — this keeps the two honest. Feeding the gate a `survived`
+  // run that executed no deploy must NOT close a record.
+  const atRefill = {
     outcome: 'dispatched',
     lastDispatchAt: '2026-10-17T07:31:45.000Z',
     stallStartedAt: '2026-10-17T05:00:00.000Z',
   };
-  assert.equal(laneRefilled({ ...refilled, lastDispatchFate: DISPATCH_FATE.SURVIVED }), true);
-  assert.equal(
-    laneRefilled({ ...refilled, lastDispatchFate: DISPATCH_FATE.DIED_BEFORE_DEPLOY }),
-    false,
-  );
+  assert.equal(laneRefilled({ ...atRefill, lastDispatchDeployExecuted: 'true' }), true);
+  assert.equal(laneRefilled({ ...atRefill, lastDispatchDeployExecuted: 'false' }), false);
+  // The fate is not an input at all any more, so passing one must not close it.
+  assert.equal(laneRefilled({ ...atRefill, lastDispatchFate: DISPATCH_FATE.SURVIVED }), false);
 });
 
-test('the detector publishes the observed run TIME as well as its fate (PEN-4224)', () => {
+test('the detector publishes the run TIME and the STRICT refill signal (PEN-4224)', () => {
   // The fate alone cannot say WHICH dispatch it describes, and on a `dispatched`
   // slot it never describes the one just issued — this module runs above
   // `gh workflow run`. `laneRefilled` therefore needs the run's creation time to
@@ -405,4 +426,11 @@ test('the detector publishes the observed run TIME as well as its fate (PEN-4224
   // the safe direction but is still the feature silently gone.
   assert.match(source, /setOutput\('last_dispatch_at', result\.run\?\.createdAt \?\? ''\)/);
   assert.match(source, /setOutput\('last_dispatch_fate', result\.fate\)/);
+  // The strict signal the close gate actually reads. Published as an explicit
+  // 'true'/'false' string so an absent or unreadable run is 'false' — evidence
+  // withheld — rather than an empty string some later reader coerces.
+  assert.match(
+    source,
+    /setOutput\('last_dispatch_deploy_executed', result\.run\?\.deployExecuted === true \? 'true' : 'false'\)/,
+  );
 });

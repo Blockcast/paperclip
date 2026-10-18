@@ -625,9 +625,11 @@ test('no earlier step can skip the day\'s dispatch (PEN-4224 review finding 2)',
   assert.ok(dispatch, 'the dispatch step must exist');
   assert.match(
     dispatch[0],
-    /\n        if: \$\{\{ !cancelled\(\) \}\}\n/,
-    'the dispatch step must run unless the job is cancelled, not merely on success()',
+    /\n        if: \$\{\{ !cancelled\(\) && steps\.checkout\.outcome == 'success' \}\}\n/,
+    'the dispatch must tolerate setup-node, and ONLY setup-node, failing',
   );
+  // The conjunct is only meaningful if the step it names actually has that id.
+  assert.match(code, /- name: Checkout\n        id: checkout\n/);
   // Positive control: the step this one now tolerates the failure of is still
   // above it, so the assertion is about a real ordering rather than a vacuous
   // one.
@@ -745,22 +747,29 @@ test('the dispatcher still APPROVES NOTHING, including on the new path', () => {
   );
 });
 
-test('the record close is told the FATE and the run TIME, not just the outcome (PEN-4224)', () => {
+test('the record close is told the REFILL EVIDENCE and the run TIME (PEN-4224)', () => {
   // `dispatched` claims the lane was refilled; what happened is that a dispatch
-  // was ISSUED. Without the fate reaching the script, `laneRefilled` degrades to
+  // was ISSUED. Without evidence reaching the script, `laneRefilled` degrades to
   // REFILLING_OUTCOMES and the fail-open is back with the code still present.
   //
-  // The TIME is equally load-bearing and was the hole in the first fix. The
-  // detection runs above the dispatch, so on a `dispatched` slot the fate is the
-  // PREVIOUS run's; only the run's creation time can tell a survival belonging
-  // to this stall from one that predates it. Drop that env and the gate stops
-  // closing (safe direction, but the feature is silently gone).
+  // The TIME is equally load-bearing. The detection runs above the dispatch, so
+  // on a `dispatched` slot the observation is the PREVIOUS run's; only its
+  // creation time can tell a refill belonging to this stall from one that
+  // predates it — including the superseded run that opened the record. Drop
+  // either env and the gate stops closing (safe direction, but silently gone).
   const close = code.match(/- name: Close the durable deploy-stall record[\s\S]*?--resolve/);
   assert.ok(close, 'the workflow must close the stall record');
   assert.match(
     close[0],
-    /LAST_DISPATCH_FATE:\s*\$\{\{\s*steps\.dispatch\.outputs\.last_dispatch_fate\s*\}\}/,
-    'the close must be told the last dispatch fate',
+    /LAST_DISPATCH_DEPLOY_EXECUTED:\s*\$\{\{\s*steps\.dispatch\.outputs\.last_dispatch_deploy_executed\s*\}\}/,
+    'the close must be told whether the observed dispatch actually deployed',
+  );
+  // The FATE must not be what gates the close: `survived` is a catch-all that
+  // covers a cancelled run and a guard-skipped deploy, neither of which
+  // refilled anything.
+  assert.ok(
+    !/LAST_DISPATCH_FATE:/.test(close[0]),
+    'the close must not be gated on the permissive fate string',
   );
   assert.match(
     close[0],

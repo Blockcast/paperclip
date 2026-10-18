@@ -160,6 +160,7 @@ jobs:
     runs-on: arc-deploy
     steps:
       - name: Checkout
+        id: checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -196,18 +197,28 @@ jobs:
         with:
           node-version: 24
 
-      # `!cancelled()` rather than the default `success()`, and that is NOT
-      # decoration (PEN-4224 review). Moving setup-node above this step put a new
-      # step on the production path: under `success()` a setup-node failure
-      # SKIPS the day's only dispatch, so a node-install hiccup would silently
-      # cost a delivery day — the exact class of fault this workflow exists to
-      # prevent, newly introduced by the fix for it. The dispatch itself needs no
-      # node (it is `gh` and `git`); only the detection call inside it does, and
-      # that call is already `|| true` with a defaulted read, so it degrades to
-      # silence rather than taking the dispatch down with it.
+      # The condition names EXACTLY what this step tolerates, which is setup-node
+      # and nothing else (PEN-4224 review).
+      #
+      # `!cancelled()` rather than the default `success()`: moving setup-node
+      # above this step put a new step on the production path, and under
+      # `success()` a setup-node failure SKIPS the day's only dispatch — a
+      # node-install hiccup would silently cost a delivery day, the exact class
+      # of fault this workflow exists to prevent, newly introduced by the fix
+      # for it. The dispatch itself needs no node (it is `gh` and `git`); only
+      # the detection call inside it does, and that call is already `|| true`
+      # with a defaulted read, so it degrades to silence rather than taking the
+      # dispatch down with it.
+      #
+      # ...but `!cancelled()` ALONE would also run this after a failed
+      # `Checkout`, where `git rev-parse origin/master` has no repository to
+      # read and the step would fail on its own first command. Harmless, but it
+      # would make a checkout failure look like a dispatch failure. The explicit
+      # `steps.checkout.outcome` conjunct keeps the tolerance to the one step it
+      # is for.
       - name: Dispatch deploy if master is ahead and nothing is already pending
         id: dispatch
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.checkout.outcome == 'success' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -596,14 +607,21 @@ jobs:
           #
           # ⛔ THESE TWO DESCRIBE THE PREVIOUS DISPATCH, NEVER THE ONE THIS SLOT
           # JUST ISSUED. The detection runs once, inside guard (1c), above guard
-          # (2) and above `gh workflow run`; on a `dispatched` slot the run being
+          # (2) and above the dispatch; on a `dispatched` slot the run being
           # gated has not started. So they cannot be read as a verdict on it, and
           # `laneRefilled` does not try: `dispatched` closes an unrefilled record
-          # only on a LATER slot that observes a `survived` dispatch created at
-          # or after the stall began. The timestamp is what makes "at or after"
-          # answerable; without it a pre-stall success reads as this stall's
-          # refill. See `laneRefilled`.
-          LAST_DISPATCH_FATE: ${{ steps.dispatch.outputs.last_dispatch_fate }}
+          # only on a LATER slot that observes a dispatch which actually executed
+          # its `deploy` job, created strictly after the stall began. The
+          # timestamp is what makes "after" answerable; without it the very run
+          # whose cancellation opened the record reads as this stall's refill.
+          # See `laneRefilled`.
+          #
+          # The evidence is `deploy_executed`, NOT the fate. The fate's
+          # `survived` is a catch-all meaning "not a death the detector may
+          # claim", which also covers a `cancelled` run whose deploy never ran
+          # and a `success` run whose deploy was SKIPPED by the pending guard —
+          # neither refilled anything.
+          LAST_DISPATCH_DEPLOY_EXECUTED: ${{ steps.dispatch.outputs.last_dispatch_deploy_executed }}
           LAST_DISPATCH_AT: ${{ steps.dispatch.outputs.last_dispatch_at }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
