@@ -17774,8 +17774,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const preferredWorkspace = preferredProjectWorkspaceId
         ? projectWorkspaceRows.find((workspace) => workspace.id === preferredProjectWorkspaceId) ?? null
         : null;
-      const missingProjectCwds: string[] = [];
-      let hasConfiguredProjectCwd = false;
+      // BLO-47335: every candidate that did not yield a usable cwd, and why.
+      // Reported verbatim in the failure below — never papered over with the
+      // agent home.
+      const unrealizedProjectWorkspaces: Array<{ workspaceId: string; cwd: string | null; detail: string }> = [];
       let preferredWorkspaceWarning: string | null = null;
       if (preferredProjectWorkspaceId && !preferredWorkspace) {
         preferredWorkspaceWarning =
@@ -17800,6 +17802,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // that looks correct, and no amount of cloning could satisfy it. See
         // BLO-25415.
         const repoRelativeCwd = resolveRepoRelativeWorkspaceCwd(workspace);
+        let realizedFromManagedCheckout = false;
         if (!projectCwd || projectCwd === REPO_ONLY_CWD_SENTINEL || repoRelativeCwd) {
           try {
             const managedWorkspace = await ensureManagedProjectWorkspace({
@@ -17812,6 +17815,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               ? await resolveContainedWorkspaceSubpath(managedWorkspace.cwd, repoRelativeCwd)
               : managedWorkspace.cwd;
             managedWorkspaceWarnings = managedWorkspace.warnings;
+            realizedFromManagedCheckout = true;
           } catch (error) {
             // BLO-31351: a typed workspace-validation failure must NOT be
             // absorbed into "try the next candidate". This catch exists to skip
@@ -17833,18 +17837,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             // real reason is worth more than quietly succeeding on a different
             // tree and leaving it to strand someone else later.
             if (error instanceof WorkspaceValidationFailure) throw error;
+            const detail = error instanceof Error ? error.message : String(error);
             if (preferredWorkspace?.id === workspace.id) {
-              preferredWorkspaceWarning = error instanceof Error ? error.message : String(error);
+              preferredWorkspaceWarning = detail;
             }
+            unrealizedProjectWorkspaces.push({
+              workspaceId: workspace.id,
+              cwd: null,
+              detail: `managed checkout could not be realized: ${detail}`,
+            });
             continue;
           }
         }
-        hasConfiguredProjectCwd = true;
         const projectCwdExists = await fs
           .stat(projectCwd)
           .then((stats) => stats.isDirectory())
           .catch(() => false);
-        if (projectCwdExists) {
+        // BLO-47335: an explicitly configured (local_folder) cwd of a
+        // repo-backed workspace must actually be a checkout. Nothing else ever
+        // clones it, so an existing-but-empty directory would otherwise run the
+        // agent against the wrong tree and fail later as a repo mismatch.
+        const gitProbe =
+          projectCwdExists && !realizedFromManagedCheckout && readNonEmptyString(workspace.repoUrl)
+            ? await probeGitCheckout(projectCwd)
+            : { ok: true, detail: "" };
+        if (projectCwdExists && gitProbe.ok) {
           return {
             cwd: projectCwd,
             source: "project_primary" as const,
@@ -17863,7 +17880,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           preferredWorkspaceWarning =
             `Selected project workspace path "${projectCwd}" is not available yet.`;
         }
-        missingProjectCwds.push(projectCwd);
+        unrealizedProjectWorkspaces.push({
+          workspaceId: workspace.id,
+          cwd: projectCwd,
+          detail: projectCwdExists
+            ? `path is not a git checkout (git: ${gitProbe.detail})`
+            : "path does not exist on this host",
+        });
       }
 
       // Reaching here means the (restricted, when non-primary) candidate set
@@ -17876,36 +17899,34 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         return realizationFailed;
       }
 
-      const fallbackCwd = resolveDefaultAgentWorkspaceDir(agent.id);
-      await fs.mkdir(fallbackCwd, { recursive: true });
-      const warnings: string[] = [];
-      if (preferredWorkspaceWarning) {
-        warnings.push(preferredWorkspaceWarning);
-      }
-      if (missingProjectCwds.length > 0) {
-        const firstMissing = missingProjectCwds[0];
-        const extraMissingCount = Math.max(0, missingProjectCwds.length - 1);
-        warnings.push(
-          extraMissingCount > 0
-            ? `Project workspace path "${firstMissing}" and ${extraMissingCount} other configured path(s) are not available yet. Using fallback workspace "${fallbackCwd}" for this run.`
-            : `Project workspace path "${firstMissing}" is not available yet. Using fallback workspace "${fallbackCwd}" for this run.`,
-        );
-      } else if (!hasConfiguredProjectCwd) {
-        warnings.push(
-          `Project workspace has no local cwd configured. Using fallback workspace "${fallbackCwd}" for this run.`,
-        );
-      }
-      return {
-        cwd: fallbackCwd,
-        source: "project_primary" as const,
-        projectId: resolvedProjectId,
-        workspaceId: projectWorkspaceRows[0]?.id ?? null,
-        repoUrl: projectWorkspaceRows[0]?.repoUrl ?? null,
-        repoRef: projectWorkspaceRows[0]?.repoRef ?? null,
-        workspaceHints,
-        warnings,
-        preferredProjectWorkspaceId,
-      };
+      // BLO-47335: the project HAS workspaces and none could be realized. This
+      // used to fall back to the agent home while still reporting
+      // `source: "project_primary"`, so the run was persisted as a
+      // shared_workspace execution workspace pinned to the agent home — and
+      // re-pinned that way on every unpin. Refuse instead, naming each
+      // workspace and path, so the misconfiguration is fixed where it lives.
+      const details = unrealizedProjectWorkspaces
+        .map((entry) =>
+          entry.cwd
+            ? `project workspace "${entry.workspaceId}" path "${entry.cwd}": ${entry.detail}`
+            : `project workspace "${entry.workspaceId}": ${entry.detail}`,
+        )
+        .join("; ");
+      throw new WorkspaceValidationFailure(
+        `Refusing to run: no workspace of project "${resolvedProjectId}" could be realized (${details}). ` +
+          `Not falling back to the agent home. Create the checkout at the configured path, or clear the ` +
+          `workspace's cwd so the platform manages the checkout.`,
+        {
+          workspaceValidation: {
+            reason: "project_workspace_unrealizable",
+            companyId: agent.companyId,
+            projectId: resolvedProjectId,
+            issueId: issueId ?? null,
+            preferredProjectWorkspaceId,
+            unrealizedProjectWorkspaces,
+          },
+        },
+      );
     }
 
     if (workspaceProjectId) {
