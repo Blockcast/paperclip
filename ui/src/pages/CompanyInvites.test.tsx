@@ -7,6 +7,7 @@ import { MemoryRouter } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CompanyInvites } from "./CompanyInvites";
 import { queryKeys } from "@/lib/queryKeys";
+import { flushReact } from "@/test-utils/react";
 
 const listInvitesMock = vi.hoisted(() => vi.fn());
 const createCompanyInviteMock = vi.hoisted(() => vi.fn());
@@ -41,13 +42,6 @@ vi.mock("@/context/ToastContext", () => ({
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
-async function flushReact() {
-  await act(async () => {
-    await Promise.resolve();
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
-  });
-}
 
 describe("CompanyInvites", () => {
   let container: HTMLDivElement;

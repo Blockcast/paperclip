@@ -8,6 +8,7 @@ import type { Project, ResourceMemberships } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SidebarProjects } from "./SidebarProjects";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { flushReact } from "@/test-utils/react";
 
 const mockProjectsApi = vi.hoisted(() => ({
   list: vi.fn(),
@@ -183,13 +184,6 @@ function makeProject(overrides: Partial<Project>): Project {
     updatedAt: new Date("2026-01-01T00:00:00Z"),
     ...overrides,
   };
-}
-
-async function flushReact() {
-  await act(async () => {
-    await Promise.resolve();
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
-  });
 }
 
 function projectLinkLabels(container: HTMLElement) {

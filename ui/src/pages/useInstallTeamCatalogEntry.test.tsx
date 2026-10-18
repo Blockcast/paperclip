@@ -11,6 +11,7 @@ import {
   type UseInstallTeamCatalogEntryResult,
 } from "./TeamCatalog";
 import { sampleTeam } from "./TeamCatalog.fixtures";
+import { flushReact } from "@/test-utils/react";
 
 const mockTeamCatalogApi = vi.hoisted(() => ({
   catalogList: vi.fn(),
@@ -31,13 +32,6 @@ async function act(callback: () => void | Promise<void>) {
     result = callback();
   });
   await result;
-}
-
-async function flushReact() {
-  await act(async () => {
-    await Promise.resolve();
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
-  });
 }
 
 // Capture the live hook result so assertions can read it and drive its actions.

@@ -7,6 +7,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { WorkspaceOverviewItem, WorkspaceOverviewResponse } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Workspaces } from "./Workspaces";
+import { flushReact } from "@/test-utils/react";
 
 const mockExecutionWorkspacesApi = vi.hoisted(() => ({
   listOverview: vi.fn(),
@@ -110,13 +111,6 @@ function overviewResponse(overrides: Partial<WorkspaceOverviewResponse> = {}): W
   };
 }
 
-async function flushQueries() {
-  await act(async () => {
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    await new Promise((resolve) => setTimeout(resolve, 0));
-  });
-}
-
 describe("Workspaces", () => {
   let root: Root | null = null;
   let container: HTMLDivElement;
@@ -178,7 +172,7 @@ describe("Workspaces", () => {
         </QueryClientProvider>,
       );
     });
-    await flushQueries();
+    await flushReact(2);
 
     expect(mockInstanceSettingsApi.getExperimental).toHaveBeenCalled();
     expect(mockExecutionWorkspacesApi.listOverview).toHaveBeenCalledWith("company-1", { offset: 0 });
@@ -205,7 +199,7 @@ describe("Workspaces", () => {
     await act(async () => {
       loadMoreButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flushQueries();
+    await flushReact(2);
 
     expect(mockExecutionWorkspacesApi.listOverview).toHaveBeenLastCalledWith("company-1", { offset: 50 });
     expect(container.textContent).toContain("Workspace Beta");
@@ -224,7 +218,7 @@ describe("Workspaces", () => {
         </QueryClientProvider>,
       );
     });
-    await flushQueries();
+    await flushReact(2);
 
     expect(container.textContent).toContain("/issues");
     expect(mockExecutionWorkspacesApi.listOverview).not.toHaveBeenCalled();

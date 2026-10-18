@@ -11,6 +11,7 @@ import {
   type ReusableExecutionWorkspaceLike,
   type ReusableWorkspaceOption,
 } from "@/lib/reusable-execution-workspaces";
+import { flushReact } from "@/test-utils/react";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
@@ -21,12 +22,6 @@ function act(callback: () => void | Promise<void>) {
     result = callback();
   });
   return result;
-}
-
-async function flush() {
-  await act(async () => {
-    await Promise.resolve();
-  });
 }
 
 function render(node: ReactNode, container: HTMLElement) {
@@ -126,7 +121,7 @@ describe("SearchableSelect", () => {
     act(() => {
       trigger?.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
     });
-    await flush();
+    await flushReact();
 
     expect(container.querySelector("[data-option-key='recent:alpha']")).not.toBeNull();
     expect(container.querySelector("[data-option-key='all:alpha']")).not.toBeNull();
@@ -162,12 +157,12 @@ describe("SearchableSelect", () => {
     act(() => {
       trigger?.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
     });
-    await flush();
+    await flushReact();
 
     const input = container.querySelector("input[placeholder='Search options...']") as HTMLInputElement | null;
     expect(input).not.toBeNull();
     setInputValue(input!, "sec br");
-    await flush();
+    await flushReact();
 
     expect(container.textContent).not.toContain("Alpha");
     expect(container.textContent).toContain("Bravo");
@@ -221,12 +216,12 @@ describe("SearchableSelect", () => {
     act(() => {
       trigger?.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
     });
-    await flush();
+    await flushReact();
 
     const input = container.querySelector("input[placeholder='Search options...']") as HTMLInputElement | null;
     expect(input).not.toBeNull();
     setInputValue(input!, "mobile");
-    await flush();
+    await flushReact();
 
     const renderedKeys = Array.from(container.querySelectorAll("[data-option-key]")).map((item) =>
       item.getAttribute("data-option-key"),
@@ -268,12 +263,12 @@ describe("SearchableSelect", () => {
     act(() => {
       trigger?.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
     });
-    await flush();
+    await flushReact();
 
     const input = container.querySelector("input[placeholder='Search options...']") as HTMLInputElement | null;
     expect(input).not.toBeNull();
     setInputValue(input!, "visible");
-    await flush();
+    await flushReact();
 
     const renderedKeys = Array.from(container.querySelectorAll("[data-option-key]")).map((item) =>
       item.getAttribute("data-option-key"),
@@ -301,7 +296,7 @@ describe("SearchableSelect", () => {
     act(() => {
       trigger?.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
     });
-    await flush();
+    await flushReact();
     expect(container.textContent).toContain("Loading choices...");
 
     act(() => {
@@ -320,7 +315,7 @@ describe("SearchableSelect", () => {
     const input = container.querySelector("input[placeholder='Search options...']") as HTMLInputElement | null;
     expect(input).not.toBeNull();
     setInputValue(input!, "zzz");
-    await flush();
+    await flushReact();
     expect(container.textContent).toContain("Nothing matched.");
 
     act(() => {
@@ -356,14 +351,14 @@ describe("SearchableSelect", () => {
     act(() => {
       trigger?.focus();
     });
-    await flush();
+    await flushReact();
 
     const input = container.querySelector("input[placeholder='Search options...']") as HTMLInputElement | null;
     expect(input).not.toBeNull();
     expect(trigger?.getAttribute("aria-expanded")).toBe("true");
 
     keyDown(input!, "Escape");
-    await flush();
+    await flushReact();
 
     expect(container.querySelector("input[placeholder='Search options...']")).toBeNull();
     expect(trigger?.getAttribute("aria-expanded")).toBe("false");
@@ -373,7 +368,7 @@ describe("SearchableSelect", () => {
       trigger?.focus();
       trigger?.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
     });
-    await flush();
+    await flushReact();
 
     expect(container.querySelector("input[placeholder='Search options...']")).not.toBeNull();
     expect(trigger?.getAttribute("aria-expanded")).toBe("true");
@@ -381,10 +376,10 @@ describe("SearchableSelect", () => {
     const reopenedInput = container.querySelector("input[placeholder='Search options...']") as HTMLInputElement | null;
     expect(reopenedInput).not.toBeNull();
     setInputValue(reopenedInput!, "alp");
-    await flush();
+    await flushReact();
 
     keyDown(reopenedInput!, "Escape");
-    await flush();
+    await flushReact();
 
     expect(container.querySelector("input[placeholder='Search options...']")).toBeNull();
     expect(trigger?.getAttribute("aria-expanded")).toBe("false");
@@ -433,7 +428,7 @@ describe("SearchableSelect", () => {
     act(() => {
       trigger?.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
     });
-    await flush();
+    await flushReact();
 
     const input = container.querySelector("input[placeholder='Search workspaces...']") as HTMLInputElement | null;
     expect(input).not.toBeNull();
@@ -441,7 +436,7 @@ describe("SearchableSelect", () => {
     expect(container.textContent).toContain("All workspaces");
 
     setInputValue(input!, "pclip reusable");
-    await flush();
+    await flushReact();
 
     expect(container.textContent).toContain("Paperclip app");
     expect(container.textContent).not.toContain("Marketing site");
@@ -452,17 +447,17 @@ describe("SearchableSelect", () => {
 
     expect(selectedOptionKey()).toBe("recent:workspace-paperclip");
     keyDown(input!, "ArrowDown");
-    await flush();
+    await flushReact();
     expect(selectedOptionKey()).toBe("all:workspace-paperclip");
 
     keyDown(input!, "ArrowUp");
-    await flush();
+    await flushReact();
     expect(selectedOptionKey()).toBe("recent:workspace-paperclip");
 
     keyDown(input!, "ArrowDown");
-    await flush();
+    await flushReact();
     keyDown(input!, "Enter");
-    await flush();
+    await flushReact();
 
     expect(onValueChange).toHaveBeenCalledWith(
       "workspace-paperclip",
@@ -478,7 +473,7 @@ describe("SearchableSelect", () => {
     act(() => {
       trigger?.focus();
     });
-    await flush();
+    await flushReact();
 
     expect(container.querySelector("input[placeholder='Search workspaces...']")).toBeNull();
     expect(trigger?.getAttribute("aria-expanded")).toBe("false");

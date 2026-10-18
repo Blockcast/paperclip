@@ -7,6 +7,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { FolderListResult, Issue, RoutineListItem } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Routines, buildRoutineGroups, buildRoutineSections, sortRoutines } from "./Routines";
+import { flushReact } from "@/test-utils/react";
 
 let currentSearch = "";
 
@@ -342,12 +343,6 @@ function createIssue(overrides: Partial<Issue> = {}): Issue {
   };
 }
 
-async function flush() {
-  await Promise.resolve();
-  await Promise.resolve();
-  await new Promise((resolve) => window.setTimeout(resolve, 0));
-}
-
 describe("Routines page", () => {
   let container: HTMLDivElement;
 
@@ -504,14 +499,14 @@ describe("Routines page", () => {
           <Routines />
         </QueryClientProvider>,
       );
-      await flush();
+      await flushReact();
     });
 
     let sortButton = container.querySelector<HTMLButtonElement>('button[title="Sort"]');
     let groupButton = container.querySelector<HTMLButtonElement>('button[title="Group"]');
     for (let attempts = 0; attempts < 5 && (!sortButton || !groupButton); attempts += 1) {
       await act(async () => {
-        await flush();
+        await flushReact();
       });
       sortButton = container.querySelector<HTMLButtonElement>('button[title="Sort"]');
       groupButton = container.querySelector<HTMLButtonElement>('button[title="Group"]');
@@ -547,12 +542,12 @@ describe("Routines page", () => {
           <Routines />
         </QueryClientProvider>,
       );
-      await flush();
+      await flushReact();
     });
 
     for (let attempts = 0; attempts < 5 && !container.textContent?.includes("Morning sync"); attempts += 1) {
       await act(async () => {
-        await flush();
+        await flushReact();
       });
     }
 
@@ -594,12 +589,12 @@ describe("Routines page", () => {
           <Routines />
         </QueryClientProvider>,
       );
-      await flush();
+      await flushReact();
     });
 
     for (let attempts = 0; attempts < 5 && !container.textContent?.includes("Built-in routines"); attempts += 1) {
       await act(async () => {
-        await flush();
+        await flushReact();
       });
     }
 
@@ -672,11 +667,11 @@ describe("Routines page", () => {
           <Routines />
         </QueryClientProvider>,
       );
-      await flush();
+      await flushReact();
     });
     for (let attempts = 0; attempts < 5 && !container.textContent?.includes("Loose routine"); attempts += 1) {
       await act(async () => {
-        await flush();
+        await flushReact();
       });
     }
 
@@ -699,11 +694,11 @@ describe("Routines page", () => {
           <Routines />
         </QueryClientProvider>,
       );
-      await flush();
+      await flushReact();
     });
     for (let attempts = 0; attempts < 5 && !container.textContent?.includes("This folder is empty"); attempts += 1) {
       await act(async () => {
-        await flush();
+        await flushReact();
       });
     }
 
@@ -735,12 +730,12 @@ describe("Routines page", () => {
           <Routines />
         </QueryClientProvider>,
       );
-      await flush();
+      await flushReact();
     });
 
     for (let attempts = 0; attempts < 5 && !container.textContent?.includes("Morning sync"); attempts += 1) {
       await act(async () => {
-        await flush();
+        await flushReact();
       });
     }
 
@@ -771,7 +766,7 @@ describe("Routines page", () => {
           <Routines />
         </QueryClientProvider>,
       );
-      await flush();
+      await flushReact();
     });
 
     let runNowButton = Array.from(container.querySelectorAll("button")).find((button) =>
@@ -779,7 +774,7 @@ describe("Routines page", () => {
     );
     for (let attempts = 0; attempts < 5 && !runNowButton; attempts += 1) {
       await act(async () => {
-        await flush();
+        await flushReact();
       });
       runNowButton = Array.from(container.querySelectorAll("button")).find((button) =>
         button.textContent?.includes("Run now"),
@@ -811,7 +806,7 @@ describe("Routines page", () => {
           <Routines />
         </QueryClientProvider>,
       );
-      await flush();
+      await flushReact();
     });
 
     let createButton = Array.from(container.querySelectorAll("button")).find((button) =>
@@ -819,7 +814,7 @@ describe("Routines page", () => {
     );
     for (let attempts = 0; attempts < 5 && !createButton; attempts += 1) {
       await act(async () => {
-        await flush();
+        await flushReact();
       });
       createButton = Array.from(container.querySelectorAll("button")).find((button) =>
         button.textContent?.includes("Create routine"),
@@ -830,14 +825,14 @@ describe("Routines page", () => {
 
     await act(async () => {
       createButton?.click();
-      await flush();
+      await flushReact();
     });
 
     for (let attempts = 0; attempts < 5; attempts += 1) {
       const hasMentionOptions = markdownEditorRenderMock.mock.calls.some(([props]) => (props.mentions ?? []).length > 0);
       if (hasMentionOptions) break;
       await act(async () => {
-        await flush();
+        await flushReact();
       });
     }
 
@@ -879,12 +874,12 @@ describe("Routines page", () => {
           <Routines />
         </QueryClientProvider>,
       );
-      await flush();
+      await flushReact();
     });
 
     for (let attempts = 0; attempts < 5 && issuesListMock.mock.calls.length === 0; attempts += 1) {
       await act(async () => {
-        await flush();
+        await flushReact();
       });
     }
 

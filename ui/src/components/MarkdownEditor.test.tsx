@@ -15,6 +15,7 @@ import {
   placeCaretAfterMentionAnchor,
   shouldAcceptAutocompleteKey,
 } from "./MarkdownEditor";
+import { flushReact } from "@/test-utils/react";
 
 const mdxEditorMockState = vi.hoisted(() => ({
   emitMountEmptyReset: false,
@@ -160,12 +161,6 @@ async function act(callback: () => void | Promise<void>) {
   await result;
 }
 
-async function flush() {
-  await act(async () => {
-    await new Promise((resolve) => setTimeout(resolve, 0));
-  });
-}
-
 function createFileDragEvent(type: string) {
   const event = (
     typeof DragEvent === "function"
@@ -294,7 +289,7 @@ describe("MarkdownEditor", () => {
       );
     });
 
-    await flush();
+    await flushReact();
     expect(container.textContent).toContain("Loaded plan body");
     expect(handleChange).not.toHaveBeenCalled();
 
@@ -332,7 +327,7 @@ describe("MarkdownEditor", () => {
         );
       });
 
-      await flush();
+      await flushReact();
       const editable = container.querySelector('[contenteditable="true"]');
       expect(editable).not.toBeNull();
       const mentionObserverCountAfterInitialRender = MockMutationObserver.instances.filter(
@@ -349,7 +344,7 @@ describe("MarkdownEditor", () => {
         );
       });
 
-      await flush();
+      await flushReact();
 
       // A separate rich-editor health observer is expected to recreate when the
       // controlled value changes. This assertion only covers the mention
@@ -380,7 +375,7 @@ describe("MarkdownEditor", () => {
       );
     });
 
-    await flush();
+    await flushReact();
     expect(mdxEditorMockState.markdownValues.at(-1)).toContain("![image](https://example.com/test.png)");
     expect(mdxEditorMockState.markdownValues.at(-1)).not.toContain("<img");
     expect(mdxEditorMockState.suppressHtmlProcessingValues).toContain(true);
@@ -405,7 +400,7 @@ describe("MarkdownEditor", () => {
       );
     });
 
-    await flush();
+    await flushReact();
     expect(mdxEditorMockState.suppressHtmlProcessingValues).toContain(true);
     expect(container.querySelector("textarea")).toBeNull();
     expect(container.textContent).toContain("Benchmark notes");
@@ -429,7 +424,7 @@ describe("MarkdownEditor", () => {
       );
     });
 
-    await flush();
+    await flushReact();
     expect(mdxEditorMockState.suppressHtmlProcessingValues).toContain(true);
     expect(container.querySelector("textarea")).toBeNull();
     expect(container.querySelector("script, iframe, p[onclick]")).toBeNull();
@@ -456,7 +451,7 @@ describe("MarkdownEditor", () => {
       );
     });
 
-    await flush();
+    await flushReact();
     await vi.waitFor(() => {
       expect(container.querySelector("textarea")).not.toBeNull();
     });
@@ -524,7 +519,7 @@ describe("MarkdownEditor", () => {
       );
     });
 
-    await flush();
+    await flushReact();
     await vi.waitFor(() => {
       expect(container.querySelector("textarea")).not.toBeNull();
     });
@@ -553,7 +548,7 @@ describe("MarkdownEditor", () => {
       );
     });
 
-    await flush();
+    await flushReact();
 
     const scope = container.querySelector('[data-testid="mdx-editor"]')?.parentElement as HTMLDivElement | null;
     expect(scope).not.toBeNull();
@@ -561,7 +556,7 @@ describe("MarkdownEditor", () => {
     await act(async () => {
       scope?.dispatchEvent(createFileDragEvent("dragenter"));
     });
-    await flush();
+    await flushReact();
 
     expect(scope?.className).toContain("ring-1");
     expect(container.textContent).toContain("Drop image to upload");
@@ -569,7 +564,7 @@ describe("MarkdownEditor", () => {
     await act(async () => {
       scope?.dispatchEvent(createFileDragEvent("dragleave"));
     });
-    await flush();
+    await flushReact();
 
     expect(scope?.className).not.toContain("ring-1");
 
@@ -593,7 +588,7 @@ describe("MarkdownEditor", () => {
       );
     });
 
-    await flush();
+    await flushReact();
 
     const scope = container.querySelector('[data-testid="mdx-editor"]')?.parentElement as HTMLDivElement | null;
     expect(scope).not.toBeNull();
@@ -624,8 +619,8 @@ describe("MarkdownEditor", () => {
       );
     });
 
-    await flush();
-    await flush();
+    await flushReact();
+    await flushReact();
 
     expect(container.querySelector("textarea")).toBeNull();
     expect(container.textContent).not.toContain("Rich editor unavailable for this markdown");
@@ -866,7 +861,7 @@ describe("MarkdownEditor", () => {
       );
     });
 
-    await flush();
+    await flushReact();
 
     const editable = container.querySelector('[contenteditable="true"]');
     expect(editable).not.toBeNull();
@@ -883,7 +878,7 @@ describe("MarkdownEditor", () => {
     act(() => {
       document.dispatchEvent(new Event("selectionchange"));
     });
-    await flush();
+    await flushReact();
 
     const option = Array.from(document.body.querySelectorAll('button[type="button"]'))
       .find((node) => node.textContent?.includes(matchText)) as HTMLButtonElement | undefined;
@@ -1078,7 +1073,7 @@ describe("MarkdownEditor", () => {
         cancelable: true,
       }));
     });
-    await flush();
+    await flushReact();
 
     expect(scrollIntoView).toHaveBeenCalledWith({ block: "nearest" });
 

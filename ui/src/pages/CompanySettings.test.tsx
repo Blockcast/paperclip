@@ -8,6 +8,7 @@ import { AGENT_ADAPTER_TYPES, getEnvironmentCapabilities } from "@paperclipai/sh
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CompanyEnvironments } from "./CompanyEnvironments";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { flushReact, waitForAssertion } from "@/test-utils/react";
 
 const mockCompaniesApi = vi.hoisted(() => ({
   update: vi.fn(),
@@ -108,27 +109,6 @@ async function act(callback: () => void | Promise<void>) {
     result = callback();
   });
   await result;
-}
-
-async function flushReact() {
-  await act(async () => {
-    await Promise.resolve();
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
-  });
-}
-
-async function waitForAssertion(assertion: () => void) {
-  let lastError: unknown;
-  for (let i = 0; i < 100; i += 1) {
-    await flushReact();
-    try {
-      assertion();
-      return;
-    } catch (error) {
-      lastError = error;
-    }
-  }
-  throw lastError;
 }
 
 const ENVIRONMENTS_PATH = "/company/settings/instance/environments";
@@ -253,7 +233,7 @@ describe("CompanyEnvironments", () => {
       click(addEnvironmentButton);
     });
 
-    await waitForAssertion(() => expect(getEnvironmentFormPage()).toBeTruthy());
+    await waitForAssertion(() => expect(getEnvironmentFormPage()).toBeTruthy(), 100);
     const dialog = getEnvironmentFormPage();
 
     const driverSelect = Array.from(dialog?.querySelectorAll("select") ?? [])
@@ -301,7 +281,7 @@ describe("CompanyEnvironments", () => {
       click(editButton);
     });
 
-    await waitForAssertion(() => expect(getEnvironmentFormPage()).toBeTruthy());
+    await waitForAssertion(() => expect(getEnvironmentFormPage()).toBeTruthy(), 100);
     const dialog = getEnvironmentFormPage();
 
     const driverSelect = Array.from(dialog?.querySelectorAll("select") ?? [])
@@ -374,7 +354,7 @@ describe("CompanyEnvironments", () => {
       click(editButton);
     });
 
-    await waitForAssertion(() => expect(getEnvironmentFormPage()).toBeTruthy());
+    await waitForAssertion(() => expect(getEnvironmentFormPage()).toBeTruthy(), 100);
     const dialog = getEnvironmentFormPage();
 
     const providerSelect = Array.from(dialog?.querySelectorAll("select") ?? []).find((select) =>

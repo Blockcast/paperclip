@@ -4,6 +4,7 @@ import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ThemeToggle } from "./ThemeToggle";
+import { flushReact } from "@/test-utils/react";
 
 const mockToggleTheme = vi.hoisted(() => vi.fn());
 const mockTheme = vi.hoisted(() => ({ value: "dark" as "dark" | "light" }));
@@ -17,12 +18,6 @@ vi.mock("../context/ThemeContext", () => ({
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
-async function flushReact() {
-  await act(async () => {
-    await Promise.resolve();
-  });
-}
 
 describe("ThemeToggle", () => {
   let container: HTMLDivElement;

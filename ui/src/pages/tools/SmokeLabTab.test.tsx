@@ -6,6 +6,7 @@ import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SmokeLabTab } from "./SmokeLabTab";
+import { flushReact } from "@/test-utils/react";
 
 const getExperimentalMock = vi.hoisted(() => vi.fn());
 const listServicesMock = vi.hoisted(() => vi.fn());
@@ -48,15 +49,6 @@ async function act(callback: () => void | Promise<void>) {
     result = callback();
   });
   await result;
-}
-
-async function flushReact() {
-  for (let i = 0; i < 3; i += 1) {
-    await act(async () => {
-      await Promise.resolve();
-      await new Promise((resolve) => window.setTimeout(resolve, 0));
-    });
-  }
 }
 
 const RUN = {
@@ -141,7 +133,7 @@ describe("SmokeLabTab", () => {
         </QueryClientProvider>,
       );
     });
-    await flushReact();
+    await flushReact(3);
   }
 
   it("hides the lab and shows a flag-off notice when the flag is disabled", async () => {
@@ -187,7 +179,7 @@ describe("SmokeLabTab", () => {
     await act(async () => {
       runButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flushReact();
+    await flushReact(3);
 
     expect(createRunMock).toHaveBeenCalledWith("company-1", { trigger: "manual", summary: {} });
   });

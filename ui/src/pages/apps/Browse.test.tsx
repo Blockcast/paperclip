@@ -5,6 +5,7 @@ import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Browse } from "./Browse";
+import { flushReact } from "@/test-utils/react";
 
 const listGalleryMock = vi.hoisted(() => vi.fn());
 const navigateMock = vi.hoisted(() => vi.fn());
@@ -40,15 +41,6 @@ async function act(callback: () => void | Promise<void>) {
     result = callback();
   });
   await result;
-}
-
-async function flushReact() {
-  for (let i = 0; i < 5; i += 1) {
-    await act(async () => {
-      await Promise.resolve();
-      await new Promise((resolve) => window.setTimeout(resolve, 0));
-    });
-  }
 }
 
 function galleryEntry(overrides: Record<string, unknown>) {
@@ -99,7 +91,7 @@ describe("Browse store door (PAP-13254 door 1)", () => {
         </QueryClientProvider>,
       );
     });
-    await flushReact();
+    await flushReact(5);
   }
 
   it("renders the store header, popular grid, gallery, and BYO card", async () => {
@@ -165,7 +157,7 @@ describe("Browse store door (PAP-13254 door 1)", () => {
       setter?.call(input, "slack");
       input?.dispatchEvent(new Event("input", { bubbles: true }));
     });
-    await flushReact();
+    await flushReact(5);
 
     const text = container.textContent ?? "";
     expect(text).toContain("Results (1)");
@@ -187,7 +179,7 @@ describe("Browse store door (PAP-13254 door 1)", () => {
       setter?.call(input, "missing app");
       input?.dispatchEvent(new Event("input", { bubbles: true }));
     });
-    await flushReact();
+    await flushReact(5);
 
     expect(container.textContent).toContain("No planned apps match");
     expect(container.textContent).toContain("Connect your own tool");

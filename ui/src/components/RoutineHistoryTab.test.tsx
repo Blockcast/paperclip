@@ -13,6 +13,7 @@ import type {
 } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { RoutineHistoryTab } from "./RoutineHistoryTab";
+import { flushReact } from "@/test-utils/react";
 
 const mockRoutinesApi = vi.hoisted(() => ({
   listRevisions: vi.fn(),
@@ -73,12 +74,6 @@ vi.mock("../context/ToastContext", () => ({
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
-async function flush() {
-  await act(async () => {
-    await new Promise((resolve) => setTimeout(resolve, 0));
-  });
-}
 
 function snapshotV1(overrides?: Partial<RoutineRevisionSnapshotV1["routine"]>): RoutineRevisionSnapshotV1 {
   return {
@@ -195,7 +190,7 @@ describe("RoutineHistoryTab", () => {
         </QueryClientProvider>,
       );
     });
-    await flush();
+    await flushReact();
     return root;
   }
 
@@ -249,7 +244,7 @@ describe("RoutineHistoryTab", () => {
     await act(async () => {
       oldRow?.click();
     });
-    await flush();
+    await flushReact();
     expect(container.textContent).toContain("Viewing revision 1 (read-only)");
     expect(container.textContent).toContain(
       "Restoring this revision creates a new revision 3 with the same content. History stays append-only.",
@@ -296,7 +291,7 @@ describe("RoutineHistoryTab", () => {
     await act(async () => {
       oldRow?.click();
     });
-    await flush();
+    await flushReact();
     const restoreButtons = Array.from(container.querySelectorAll("button")).filter(
       (button) => button.textContent === "Restore as new revision",
     );
@@ -304,7 +299,7 @@ describe("RoutineHistoryTab", () => {
     await act(async () => {
       restoreButtons[0].click();
     });
-    await flush();
+    await flushReact();
     expect(container.querySelector("[data-testid='dialog']")).not.toBeNull();
     const confirmButtons = Array.from(container.querySelectorAll("button")).filter((b) =>
       (b.textContent ?? "").includes("Restore as revision 3"),
@@ -313,7 +308,7 @@ describe("RoutineHistoryTab", () => {
     await act(async () => {
       confirmButtons[0].click();
     });
-    await flush();
+    await flushReact();
     expect(mockRoutinesApi.restoreRevision).toHaveBeenCalledWith(
       "routine-1",
       "revision-1",
@@ -380,7 +375,7 @@ describe("RoutineHistoryTab", () => {
     await act(async () => {
       oldRow?.click();
     });
-    await flush();
+    await flushReact();
     const restoreButtons = Array.from(container.querySelectorAll("button")).filter(
       (button) => button.textContent === "Restore as new revision",
     );
@@ -388,7 +383,7 @@ describe("RoutineHistoryTab", () => {
     await act(async () => {
       restoreButtons[0].click();
     });
-    await flush();
+    await flushReact();
     expect(container.textContent).toContain("Routine secrets will revert");
     expect(container.textContent).toContain("1 key removed");
     expect(container.textContent).toContain("1 key changed");
@@ -468,14 +463,14 @@ describe("RoutineHistoryTab", () => {
     await act(async () => {
       oldRow?.click();
     });
-    await flush();
+    await flushReact();
     const compareButton = Array.from(container.querySelectorAll("button")).find(
       (button) => button.textContent === "Compare with current",
     );
     await act(async () => {
       compareButton?.click();
     });
-    await flush();
+    await flushReact();
 
     expect(container.textContent).toContain("Env GH_TOKEN secret");
     expect(container.textContent).not.toContain("Env GH_TOKEN binding kind");
@@ -513,21 +508,21 @@ describe("RoutineHistoryTab", () => {
     await act(async () => {
       oldRow?.click();
     });
-    await flush();
+    await flushReact();
     const restoreButtons = Array.from(container.querySelectorAll("button")).filter(
       (button) => button.textContent === "Restore as new revision",
     );
     await act(async () => {
       restoreButtons[0].click();
     });
-    await flush();
+    await flushReact();
     const confirmButtons = Array.from(container.querySelectorAll("button")).filter((b) =>
       (b.textContent ?? "").includes("Restore as revision 3"),
     );
     await act(async () => {
       confirmButtons[0].click();
     });
-    await flush();
+    await flushReact();
     expect(onRestored).toHaveBeenCalledTimes(1);
     const [response] = onRestored.mock.calls[0];
     expect(response.routine).toEqual(restoredRoutine);

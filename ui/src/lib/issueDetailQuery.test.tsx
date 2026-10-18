@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { issuesApi } from "@/api/issues";
 import { queryKeys } from "@/lib/queryKeys";
 import { getIssueDetailQueryOptions } from "./issueDetailCache";
+import { flushReact } from "@/test-utils/react";
 
 vi.mock("@/api/issues", () => ({
   issuesApi: {
@@ -76,15 +77,6 @@ function IssueDetailQueryHarness({
   return <div>{query.data?.description ?? "EMPTY"}</div>;
 }
 
-async function flush() {
-  // Multiple act cycles to allow React Query to process the async queryFn
-  for (let i = 0; i < 5; i++) {
-    await act(async () => {
-      await new Promise((r) => setTimeout(r, 0));
-    });
-  }
-}
-
 describe("getIssueDetailQueryOptions", () => {
   afterEach(() => {
     vi.clearAllMocks();
@@ -119,7 +111,7 @@ describe("getIssueDetailQueryOptions", () => {
       );
     });
 
-    await flush();
+    await flushReact(5);
 
     expect(issuesApi.get).toHaveBeenCalledWith("PAP-1442", {
       signal: expect.any(AbortSignal),

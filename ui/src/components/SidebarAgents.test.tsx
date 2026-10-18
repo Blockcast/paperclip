@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SidebarAgents } from "./SidebarAgents";
 import { queryKeys } from "../lib/queryKeys";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { flushReact } from "@/test-utils/react";
 
 const mockAgentsApi = vi.hoisted(() => ({
   list: vi.fn(),
@@ -147,13 +148,6 @@ function makeAgent(overrides: Partial<Agent>): Agent {
     updatedAt: new Date("2026-01-01T00:00:00Z"),
     ...overrides,
   };
-}
-
-async function flushReact() {
-  await act(async () => {
-    await Promise.resolve();
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
-  });
 }
 
 async function openAgentMenu(label = "Open actions for Alpha") {

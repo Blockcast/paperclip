@@ -5,6 +5,7 @@ import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { OrgChart } from "./OrgChart";
+import { flushReact } from "@/test-utils/react";
 
 const navigateMock = vi.fn();
 const orgMock = vi.fn();
@@ -115,13 +116,6 @@ function createTouchEvent(type: string, touches: Array<{ clientX: number; client
     value: touches,
   });
   return event;
-}
-
-async function flushReact() {
-  await act(async () => {
-    await Promise.resolve();
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
-  });
 }
 
 describe("OrgChart mobile gestures", () => {

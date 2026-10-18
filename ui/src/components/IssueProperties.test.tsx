@@ -17,6 +17,7 @@ import type { Issue } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { IssueProperties } from "./IssueProperties";
 import { queryKeys } from "../lib/queryKeys";
+import { flushReact, waitForAssertion } from "@/test-utils/react";
 
 const mockAgentsApi = vi.hoisted(() => ({
   list: vi.fn(),
@@ -160,12 +161,6 @@ async function act(callback: () => void | Promise<void>) {
   await result;
 }
 
-async function flush() {
-  await act(async () => {
-    await new Promise((resolve) => setTimeout(resolve, 0));
-  });
-}
-
 /**
  * Finds the trigger button for a property row by its (sentence-case) label.
  * `PropertyRow` exposes a stable label hook so layout utility changes do not
@@ -175,22 +170,6 @@ function findRowTrigger(container: HTMLElement, label: string): HTMLButtonElemen
   const labelSpan = container.querySelector(`[data-property-label="${label}"]`);
   const row = labelSpan?.closest('[data-property-row="true"]');
   return (row?.querySelector("button") as HTMLButtonElement | null) ?? undefined;
-}
-
-async function waitForAssertion(assertion: () => void, attempts = 20) {
-  let lastError: unknown;
-
-  for (let attempt = 0; attempt < attempts; attempt += 1) {
-    try {
-      assertion();
-      return;
-    } catch (error) {
-      lastError = error;
-      await flush();
-    }
-  }
-
-  throw lastError;
 }
 
 function createIssue(overrides: Partial<Issue> = {}): Issue {
@@ -485,7 +464,7 @@ describe("IssueProperties", () => {
       onUpdate: vi.fn(),
       inline: true,
     });
-    await flush();
+    await flushReact();
 
     await waitForAssertion(() => {
       expect(container.textContent).toContain("Assignee");
@@ -512,7 +491,7 @@ describe("IssueProperties", () => {
       onUpdate: vi.fn(),
       inline: true,
     });
-    await flush();
+    await flushReact();
 
     await waitForAssertion(() => {
       expect(container.textContent).toContain("Originating");
@@ -538,7 +517,7 @@ describe("IssueProperties", () => {
       onUpdate: vi.fn(),
       inline: true,
     });
-    await flush();
+    await flushReact();
 
     await waitForAssertion(() => {
       expect(container.textContent).toContain("Originating");
@@ -565,7 +544,7 @@ describe("IssueProperties", () => {
       onUpdate: vi.fn(),
       inline: true,
     });
-    await flush();
+    await flushReact();
 
     await waitForAssertion(() => {
       expect(container.textContent).toContain("Originating");
@@ -589,7 +568,7 @@ describe("IssueProperties", () => {
       onUpdate: vi.fn(),
       inline: true,
     });
-    await flush();
+    await flushReact();
 
     await waitForAssertion(() => {
       expect(container.textContent).toContain("Originating");
@@ -620,7 +599,7 @@ describe("IssueProperties", () => {
       inline: true,
       hasActiveRun: true,
     });
-    await flush();
+    await flushReact();
 
     // Wait for the agents query to resolve so the current assignee renders.
     let trigger: HTMLButtonElement | undefined;
@@ -633,7 +612,7 @@ describe("IssueProperties", () => {
     await act(async () => {
       trigger!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     // Live-run banner + grouped section headers are present.
     expect(container.querySelector("[data-testid='assignee-running-banner']")?.textContent).toContain(
@@ -650,7 +629,7 @@ describe("IssueProperties", () => {
     await act(async () => {
       qaOption!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
     expect(container.querySelector("[data-testid='interrupt-assign-confirm']")).not.toBeNull();
     expect(onUpdate).not.toHaveBeenCalled();
 
@@ -661,7 +640,7 @@ describe("IssueProperties", () => {
     await act(async () => {
       confirmBtn.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
     expect(onUpdate).toHaveBeenCalledWith({ assigneeAgentId: "agent-2", assigneeUserId: null });
 
     act(() => root.unmount());
@@ -684,7 +663,7 @@ describe("IssueProperties", () => {
       childIssues: [],
       onUpdate: vi.fn(),
     });
-    await flush();
+    await flushReact();
 
     const searchInput = container.querySelector(
       'input[placeholder="Search assignees..."]',
@@ -696,7 +675,7 @@ describe("IssueProperties", () => {
       nativeSetter?.call(searchInput, "no");
       searchInput!.dispatchEvent(new Event("input", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     expect(container.textContent).toContain("No assignee");
     expect(container.textContent).not.toContain("No matches.");
@@ -706,7 +685,7 @@ describe("IssueProperties", () => {
       nativeSetter?.call(searchInput, "zzzz");
       searchInput!.dispatchEvent(new Event("input", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     expect(container.textContent).not.toContain("No assignee");
     expect(container.textContent).toContain("No matches.");
@@ -722,7 +701,7 @@ describe("IssueProperties", () => {
       onAddSubIssue,
       onUpdate: vi.fn(),
     });
-    await flush();
+    await flushReact();
 
     expect(container.textContent).toContain("Sub-tasks");
     expect(container.textContent).toContain("Add sub-task");
@@ -746,7 +725,7 @@ describe("IssueProperties", () => {
       childIssues: [],
       onUpdate: vi.fn(),
     });
-    await flush();
+    await flushReact();
 
     expect(container.textContent).not.toContain("Watchdog");
     expect(container.textContent).not.toContain("Set watchdog");
@@ -764,7 +743,7 @@ describe("IssueProperties", () => {
       onUpdate: vi.fn(),
       inline: true,
     });
-    await flush();
+    await flushReact();
 
     await waitForAssertion(() => {
       expect(container.textContent).toContain("Watchdog");
@@ -793,7 +772,7 @@ describe("IssueProperties", () => {
       childIssues: [],
       onUpdate: vi.fn(),
     });
-    await flush();
+    await flushReact();
 
     expect(container.querySelector('[data-status-icon-state="covered"]')?.textContent).toBe("blocked");
 
@@ -824,7 +803,7 @@ describe("IssueProperties", () => {
       onUpdate,
       inline: true,
     });
-    await flush();
+    await flushReact();
 
     const blockerLink = container.querySelector('a[href="/issues/PAP-2"]');
     expect(blockerLink).not.toBeNull();
@@ -845,7 +824,7 @@ describe("IssueProperties", () => {
     await act(async () => {
       addButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     expect(container.querySelector('input[placeholder="Search tasks..."]')).not.toBeNull();
 
@@ -877,7 +856,7 @@ describe("IssueProperties", () => {
       onUpdate,
       inline: true,
     });
-    await flush();
+    await flushReact();
 
     const addButton = Array.from(container.querySelectorAll("button"))
       .find((button) => button.textContent?.includes("Add blocker"));
@@ -886,7 +865,7 @@ describe("IssueProperties", () => {
     await act(async () => {
       addButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     const searchInput = container.querySelector('input[aria-label="Search tasks to add as blockers"]') as HTMLInputElement | null;
     expect(searchInput).not.toBeNull();
@@ -899,7 +878,7 @@ describe("IssueProperties", () => {
     await act(async () => {
       await new Promise((resolve) => setTimeout(resolve, 250));
     });
-    await flush();
+    await flushReact();
 
     await waitForAssertion(() => {
       expect(mockIssuesApi.list).toHaveBeenCalledWith("company-1", { q: "remote", limit: 50 });
@@ -949,7 +928,7 @@ describe("IssueProperties", () => {
       onUpdate,
       inline: true,
     });
-    await flush();
+    await flushReact();
 
     const removeButton = container.querySelector('button[aria-label="Remove PAP-2 as blocker"]');
     expect(removeButton).not.toBeNull();
@@ -957,7 +936,7 @@ describe("IssueProperties", () => {
     await act(async () => {
       removeButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     expect(document.body.textContent).toContain("Remove PAP-2: Existing blocker as a blocker for this task.");
     const confirmButton = Array.from(document.body.querySelectorAll("button"))
@@ -994,7 +973,7 @@ describe("IssueProperties", () => {
       onUpdate: vi.fn(),
       inline: true,
     });
-    await flush();
+    await flushReact();
 
     expect(container.textContent).toContain("BLOCK-5");
     expect(container.textContent).not.toContain("BLOCK-6");
@@ -1090,7 +1069,7 @@ describe("IssueProperties", () => {
       onUpdate: vi.fn(),
       inline: true,
     });
-    await flush();
+    await flushReact();
 
     expect(container.textContent).toContain("BLOCKING-5");
     expect(container.textContent).not.toContain("BLOCKING-6");
@@ -1158,7 +1137,7 @@ describe("IssueProperties", () => {
       inline: true,
       externalObjects,
     });
-    await flush();
+    await flushReact();
 
     expect(container.textContent).toContain("reference-5");
     expect(container.textContent).not.toContain("reference-6");
@@ -1208,7 +1187,7 @@ describe("IssueProperties", () => {
         </QueryClientProvider>,
       );
     });
-    await flush();
+    await flushReact();
 
     const expandBlockedBy = Array.from(container.querySelectorAll("button")).find((button) =>
       button.textContent?.trim() === "Show 2 more",
@@ -1232,7 +1211,7 @@ describe("IssueProperties", () => {
         </QueryClientProvider>,
       );
     });
-    await flush();
+    await flushReact();
 
     expect(container.textContent).not.toContain("BLOCK-6");
     expect(container.textContent).toContain("Show 2 more");
@@ -1274,7 +1253,7 @@ describe("IssueProperties", () => {
       childIssues: [],
       onUpdate: vi.fn(),
     });
-    await flush();
+    await flushReact();
 
     const serviceLink = container.querySelector(`a[href="${serviceUrl}"]`);
     expect(serviceLink).not.toBeNull();
@@ -1291,7 +1270,7 @@ describe("IssueProperties", () => {
     await act(async () => {
       stopButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     expect(mockExecutionWorkspacesApi.controlRuntimeCommands).toHaveBeenCalledWith(
       "workspace-1",
@@ -1313,7 +1292,7 @@ describe("IssueProperties", () => {
       childIssues: [],
       onUpdate: vi.fn(),
     });
-    await flush();
+    await flushReact();
 
     expect(container.textContent).toMatch(/CreatedApr 6, 2026, \d{1,2}:34 (AM|PM)/);
     expect(container.textContent).toMatch(/StartedApr 6, 2026, \d{1,2}:35 (AM|PM)/);
@@ -1336,8 +1315,8 @@ describe("IssueProperties", () => {
       childIssues: [],
       onUpdate: vi.fn(),
     });
-    await flush();
-    await flush();
+    await flushReact();
+    await flushReact();
 
     const workspaceLink = Array.from(container.querySelectorAll("a")).find(
       (link) => link.textContent?.trim() === "View workspace",
@@ -1366,7 +1345,7 @@ describe("IssueProperties", () => {
       childIssues: [],
       onUpdate: vi.fn(),
     });
-    await flush();
+    await flushReact();
 
     const branchCopyButton = container.querySelector<HTMLButtonElement>(
       'button[aria-label="Copy pap-1-workspace to clipboard"]',
@@ -1376,7 +1355,7 @@ describe("IssueProperties", () => {
     await act(async () => {
       branchCopyButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     expect(writeText).toHaveBeenCalledWith("pap-1-workspace");
     expect(container.textContent).toContain("Copied");
@@ -1401,7 +1380,7 @@ describe("IssueProperties", () => {
       childIssues: [],
       onUpdate: vi.fn(),
     });
-    await flush();
+    await flushReact();
 
     expect(container.querySelector(`a[href="${serviceUrl}"]`)).toBeNull();
     expect(container.textContent).not.toContain("View workspace tasks");
@@ -1437,7 +1416,7 @@ describe("IssueProperties", () => {
       childIssues: [],
       onUpdate: vi.fn(),
     });
-    await flush();
+    await flushReact();
 
     expect(container.textContent).not.toContain("Task ids");
     expect(container.textContent).toContain("Related tasks");
@@ -1525,7 +1504,7 @@ describe("IssueProperties", () => {
       ],
       onUpdate: vi.fn(),
     });
-    await flush();
+    await flushReact();
 
     expect(container.textContent).not.toContain("Related tasks");
 
@@ -1542,7 +1521,7 @@ describe("IssueProperties", () => {
       onUpdate: vi.fn(),
       inline: true,
     });
-    await flush();
+    await flushReact();
 
     const addLabelButton = container.querySelector('button[aria-label="Add label"]');
     expect(addLabelButton).not.toBeNull();
@@ -1551,7 +1530,7 @@ describe("IssueProperties", () => {
     await act(async () => {
       addLabelButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     expect(container.querySelector('input[placeholder="Search labels..."]')).not.toBeNull();
     expect(container.querySelector('button[title="Delete Bug"]')).toBeNull();
@@ -1571,8 +1550,8 @@ describe("IssueProperties", () => {
       onUpdate: vi.fn(),
       inline: true,
     });
-    await flush();
-    await flush();
+    await flushReact();
+    await flushReact();
 
     expect(container.textContent).toContain("Bug");
     expect(container.textContent).not.toContain("No labels");
@@ -1601,7 +1580,7 @@ describe("IssueProperties", () => {
       childIssues: [],
       onUpdate: vi.fn(),
     });
-    await flush();
+    await flushReact();
 
     expect(container.textContent).not.toContain("Model lane");
     expect(container.textContent).not.toContain("Codex options");
@@ -1640,8 +1619,8 @@ describe("IssueProperties", () => {
       childIssues: [],
       onUpdate,
     });
-    await flush();
-    await flush();
+    await flushReact();
+    await flushReact();
 
     expect(container.textContent).toContain("Override · gpt-5.4 · high");
     expect(container.textContent).toContain("Model lane");
@@ -1696,7 +1675,7 @@ describe("IssueProperties", () => {
       childIssues: [],
       onUpdate,
     });
-    await flush();
+    await flushReact();
 
     // The trailing "clear" X was removed (ux-spec: one trailing-action style).
     // Clearing now happens by selecting the "Primary" model lane inside the picker.
@@ -1705,7 +1684,7 @@ describe("IssueProperties", () => {
     await act(async () => {
       optionsTrigger!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     const primaryLane = Array.from(container.querySelectorAll('button[role="radio"]'))
       .find((button) => button.textContent?.trim() === "Primary");
@@ -1735,14 +1714,14 @@ describe("IssueProperties", () => {
       onUpdate: vi.fn(),
       inline: true,
     });
-    await flush();
+    await flushReact();
 
     const addLabelButton = container.querySelector('button[aria-label="Add label"]');
     expect(addLabelButton).not.toBeNull();
     await act(async () => {
       addLabelButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     const labelButtons = Array.from(container.querySelectorAll("button"))
       .filter((button) => button.textContent?.includes("Bug") || button.textContent?.includes("Feature"));
@@ -1775,7 +1754,7 @@ describe("IssueProperties", () => {
       onUpdate,
       inline: true,
     });
-    await flush();
+    await flushReact();
 
     // Empty parent now uses the uniform muted "None" empty state (ux-spec §6).
     const parentTrigger = findRowTrigger(container, "Parent");
@@ -1784,7 +1763,7 @@ describe("IssueProperties", () => {
     await act(async () => {
       parentTrigger!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     const candidateButton = Array.from(container.querySelectorAll("button"))
       .find((button) => button.textContent?.includes("PAP-2 Candidate parent"));
@@ -1825,7 +1804,7 @@ describe("IssueProperties", () => {
       onUpdate,
       inline: true,
     });
-    await flush();
+    await flushReact();
 
     const selectedParentTrigger = Array.from(container.querySelectorAll("button"))
       .find((button) => button.textContent?.includes("PAP-2 Candidate parent"));
@@ -1837,7 +1816,7 @@ describe("IssueProperties", () => {
     await act(async () => {
       selectedParentTrigger!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     const clearParentButton = Array.from(container.querySelectorAll("button"))
       .find((button) => button.textContent?.includes("No parent"));
@@ -1869,7 +1848,7 @@ describe("IssueProperties", () => {
       childIssues: [],
       onUpdate,
     });
-    await flush();
+    await flushReact();
 
     const runReviewButton = Array.from(container.querySelectorAll("button"))
       .find((button) => button.textContent?.includes("Run review now"));
@@ -1901,7 +1880,7 @@ describe("IssueProperties", () => {
       childIssues: [],
       onUpdate: vi.fn(),
     });
-    await flush();
+    await flushReact();
 
     expect(container.textContent).toContain("Run approval now");
     expect(container.textContent).not.toContain("Run review now");
@@ -1928,7 +1907,7 @@ describe("IssueProperties", () => {
       childIssues: [],
       onUpdate: vi.fn(),
     });
-    await flush();
+    await flushReact();
 
     expect(container.textContent).toContain("Run review now");
 
@@ -1958,7 +1937,7 @@ describe("IssueProperties", () => {
       childIssues: [],
       onUpdate: vi.fn(),
     });
-    await flush();
+    await flushReact();
 
     expect(container.textContent).not.toContain("Run review now");
     expect(container.textContent).not.toContain("Run approval now");
@@ -2003,7 +1982,7 @@ describe("IssueProperties", () => {
       onUpdate,
       inline: true,
     });
-    await flush();
+    await flushReact();
 
     expect(container.textContent).toContain("Monitor");
     expect(container.textContent).toContain("Next check");
@@ -2017,7 +1996,7 @@ describe("IssueProperties", () => {
     await act(async () => {
       monitorTrigger!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     const inputs = Array.from(container.querySelectorAll("input"));
     const datetimeInput = inputs.find((input) => input.getAttribute("type") === "datetime-local");
@@ -2061,7 +2040,7 @@ describe("IssueProperties", () => {
       onUpdate,
       inline: true,
     });
-    await flush();
+    await flushReact();
 
     // Reviewers, Approvers and Monitor all render a bare "None" trigger, so
     // pick by the row that carries the label.
@@ -2079,7 +2058,7 @@ describe("IssueProperties", () => {
     await act(async () => {
       monitorTrigger!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     const datetimeInput = container.querySelector<HTMLInputElement>('input[type="datetime-local"]');
     expect(datetimeInput).toBeTruthy();
@@ -2088,7 +2067,7 @@ describe("IssueProperties", () => {
       nativeSetter?.call(datetimeInput!, "2026-12-01T09:00");
       datetimeInput!.dispatchEvent(new Event("input", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     const scheduleButton = Array.from(container.querySelectorAll("button"))
       .find((button) => button.textContent?.trim() === "Schedule");
@@ -2147,13 +2126,13 @@ describe("IssueProperties", () => {
         onUpdate,
         inline: true,
       });
-      await flush();
+      await flushReact();
       const monitorTrigger = Array.from(container.querySelectorAll("button"))
         .find((button) => button.textContent?.includes("Next check"));
       await act(async () => {
         monitorTrigger!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
       });
-      await flush();
+      await flushReact();
       return root;
     }
 
@@ -2339,13 +2318,13 @@ describe("IssueProperties", () => {
         onUpdate,
         inline: true,
       });
-      await flush();
+      await flushReact();
       await act(async () => {
         Array.from(container.querySelectorAll("button"))
           .find((button) => button.textContent?.includes("Next check"))!
           .dispatchEvent(new MouseEvent("click", { bubbles: true }));
       });
-      await flush();
+      await flushReact();
 
       clickMonitorButton(container, "Schedule");
       expect(
@@ -2401,7 +2380,7 @@ describe("IssueProperties", () => {
           ?.call(serviceInput!, "");
         serviceInput!.dispatchEvent(new Event("input", { bubbles: true }));
       });
-      await flush();
+      await flushReact();
       clickMonitorButton(container, "Schedule");
 
       const written = onUpdate.mock.calls.at(-1)?.[0]?.executionPolicy as IssueExecutionPolicy;
@@ -2472,7 +2451,7 @@ describe("IssueProperties", () => {
       onUpdate,
       inline: true,
     });
-    await flush();
+    await flushReact();
 
     let trigger: HTMLButtonElement | undefined;
     await waitForAssertion(() => {
@@ -2484,7 +2463,7 @@ describe("IssueProperties", () => {
     await act(async () => {
       trigger!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     // Choose the agent through the inline selector, then save.
     let agentOption: HTMLElement | undefined;
@@ -2497,7 +2476,7 @@ describe("IssueProperties", () => {
     await act(async () => {
       agentOption!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     const instructions = Array.from(container.querySelectorAll("textarea"))
       .find((node) => node.getAttribute("placeholder")?.includes("watchdog"));
@@ -2507,7 +2486,7 @@ describe("IssueProperties", () => {
       setter.call(instructions!, "Watch the deploy");
       instructions!.dispatchEvent(new Event("input", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     const saveButton = Array.from(container.querySelectorAll("button"))
       .find((button) => /Set watchdog|Update/.test(button.textContent ?? "") && button.closest("[class*='space-y']"));
@@ -2517,7 +2496,7 @@ describe("IssueProperties", () => {
     await act(async () => {
       finalSave!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     expect(mockIssuesApi.upsertWatchdog).toHaveBeenCalledWith(
       "issue-1",
@@ -2544,7 +2523,7 @@ describe("IssueProperties", () => {
       inline: true,
     });
     queryClient.setQueryData(queryKeys.issues.detail(issue.id), issue);
-    await flush();
+    await flushReact();
 
     let trigger: HTMLButtonElement | undefined;
     await waitForAssertion(() => {
@@ -2555,7 +2534,7 @@ describe("IssueProperties", () => {
     await act(async () => {
       trigger!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     let agentOption: HTMLElement | undefined;
     await waitForAssertion(() => {
@@ -2566,7 +2545,7 @@ describe("IssueProperties", () => {
     await act(async () => {
       agentOption!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     const finalSave = Array.from(container.querySelectorAll("button"))
       .find((button) => button.textContent === "Set watchdog" && button !== trigger);
@@ -2574,7 +2553,7 @@ describe("IssueProperties", () => {
     await act(async () => {
       finalSave!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     expect(queryClient.getQueryData<Issue>(queryKeys.issues.detail(issue.id))?.watchdog)
       .toEqual(savedWatchdog);
@@ -2596,7 +2575,7 @@ describe("IssueProperties", () => {
       inline: true,
     });
     queryClient.setQueryData(queryKeys.issues.detail(issue.id), issue);
-    await flush();
+    await flushReact();
 
     await waitForAssertion(() => {
       expect(container.textContent).toContain("ClaudeCoder");
@@ -2607,7 +2586,7 @@ describe("IssueProperties", () => {
     await act(async () => {
       trigger!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     const removeButton = Array.from(container.querySelectorAll("button"))
       .find((button) => button.textContent?.includes("Remove"));
@@ -2615,7 +2594,7 @@ describe("IssueProperties", () => {
     await act(async () => {
       removeButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     expect(mockIssuesApi.deleteWatchdog).toHaveBeenCalledWith("issue-1");
     expect(queryClient.getQueryData<Issue>(queryKeys.issues.detail(issue.id))?.watchdog)
@@ -2638,7 +2617,7 @@ describe("IssueProperties", () => {
       onUpdate: vi.fn(),
       inline: true,
     });
-    await flush();
+    await flushReact();
 
     // ux-spec: watchdog row shows agent + a truncated one-line summary; the
     // full instructions live in the popover (surfaced here via the row title).
@@ -2681,7 +2660,7 @@ describe("IssueProperties", () => {
       onUpdate: vi.fn(),
       inline: true,
     });
-    await flush();
+    await flushReact();
 
     // The link is now an icon-only "open task" affordance (ux-spec: one
     // trailing-action style), so we assert on href + accessible label.
@@ -2770,7 +2749,7 @@ describe("IssueProperties", () => {
         },
       ],
     });
-    await flush();
+    await flushReact();
 
     expect(container.textContent).toContain("Github Pull Request");
     expect(container.textContent).toContain("Github Issue");
@@ -2811,7 +2790,7 @@ describe("IssueProperties", () => {
       onUpdate: vi.fn(),
       inline: true,
     });
-    await flush();
+    await flushReact();
 
     await waitForAssertion(() => {
       expect(container.textContent).toContain("Archived");
@@ -2835,7 +2814,7 @@ describe("IssueProperties", () => {
     await act(async () => {
       unarchiveButton.click();
     });
-    await flush();
+    await flushReact();
     expect(mockIssuesApi.unarchiveFromInbox).toHaveBeenCalledWith("issue-1");
 
     act(() => root.unmount());
@@ -2857,7 +2836,7 @@ describe("IssueProperties", () => {
       onUpdate: vi.fn(),
       inline: true,
     });
-    await flush();
+    await flushReact();
 
     let unarchiveButton: HTMLButtonElement | undefined;
     await waitForAssertion(() => {
@@ -2868,7 +2847,7 @@ describe("IssueProperties", () => {
     await act(async () => {
       unarchiveButton!.click();
     });
-    await flush();
+    await flushReact();
 
     await waitForAssertion(() => {
       expect(container.querySelector('[role="alert"]')?.textContent).toContain("Archive policy denied");
@@ -2888,7 +2867,7 @@ describe("IssueProperties", () => {
       onUpdate: vi.fn(),
       inline: true,
     });
-    await flush();
+    await flushReact();
 
     await waitForAssertion(() => {
       expect(container.textContent).toContain("Updated");

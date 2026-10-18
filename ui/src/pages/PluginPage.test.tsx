@@ -4,6 +4,7 @@ import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PluginPage } from "./PluginPage";
+import { flushReact } from "@/test-utils/react";
 
 const mockPluginsApi = vi.hoisted(() => ({
   listUiContributions: vi.fn(),
@@ -59,13 +60,6 @@ async function act(callback: () => void | Promise<void>) {
   await new Promise((resolve) => window.setTimeout(resolve, 0));
 }
 
-async function flushReact() {
-  await act(async () => {
-    await Promise.resolve();
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
-  });
-}
-
 function pageContribution(overrides: Partial<{ slots: unknown[] }> = {}) {
   return {
     pluginId: "plugin-wiki",
@@ -100,8 +94,8 @@ async function renderPage(container: HTMLDivElement) {
       </QueryClientProvider>,
     );
   });
-  await flushReact();
-  await flushReact();
+  await flushReact(2);
+  await flushReact(2);
   return root;
 }
 

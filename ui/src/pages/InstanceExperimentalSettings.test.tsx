@@ -9,6 +9,7 @@ import type {
 } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { InstanceExperimentalSettings, describeSuppressedFindings } from "./InstanceExperimentalSettings";
+import { flushReact } from "@/test-utils/react";
 
 const mockInstanceSettingsApi = vi.hoisted(() => ({
   getExperimental: vi.fn(),
@@ -31,14 +32,6 @@ async function act(callback: () => void | Promise<void>) {
     result = callback();
   });
   await result;
-}
-
-async function flushReact() {
-  for (let index = 0; index < 5; index += 1) {
-    await Promise.resolve();
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
-  }
-  flushSync(() => {});
 }
 
 const CONFERENCE_TOGGLE_SELECTOR =
@@ -159,7 +152,7 @@ describe("InstanceExperimentalSettings — Conference Room Chat card (PAP-11233)
         </QueryClientProvider>,
       );
     });
-    await flushReact();
+    await flushReact(5);
   }
 
   beforeEach(() => {
@@ -203,7 +196,7 @@ describe("InstanceExperimentalSettings — Conference Room Chat card (PAP-11233)
     expect(toggle?.getAttribute("aria-checked")).toBe("false");
 
     await act(() => toggle?.click());
-    await flushReact();
+    await flushReact(5);
 
     expect(mockInstanceSettingsApi.updateExperimental).toHaveBeenCalledWith({ enableApps: true });
     expect(container.querySelector(APPS_TOGGLE_SELECTOR)?.getAttribute("aria-checked")).toBe("true");
@@ -261,7 +254,7 @@ describe("InstanceExperimentalSettings — Conference Room Chat card (PAP-11233)
     await act(async () => {
       toggle?.click();
     });
-    await flushReact();
+    await flushReact(5);
 
     expect(mockInstanceSettingsApi.updateExperimental).toHaveBeenCalledWith({
       enableTaskWatchdogs: true,
@@ -281,7 +274,7 @@ describe("InstanceExperimentalSettings — Conference Room Chat card (PAP-11233)
     await act(async () => {
       enabledToggle?.click();
     });
-    await flushReact();
+    await flushReact(5);
 
     expect(mockInstanceSettingsApi.updateExperimental).toHaveBeenLastCalledWith({
       enableTaskWatchdogs: false,
@@ -302,7 +295,7 @@ describe("InstanceExperimentalSettings — Conference Room Chat card (PAP-11233)
     await act(async () => {
       toggle?.click();
     });
-    await flushReact();
+    await flushReact(5);
 
     expect(mockInstanceSettingsApi.updateExperimental).toHaveBeenCalledWith({
       enableDecisions: true,
@@ -324,7 +317,7 @@ describe("InstanceExperimentalSettings — Conference Room Chat card (PAP-11233)
     await act(async () => {
       toggle?.click();
     });
-    await flushReact();
+    await flushReact(5);
 
     expect(mockInstanceSettingsApi.updateExperimental).toHaveBeenCalledWith({
       enableGoalsSidebarLink: true,
@@ -356,7 +349,7 @@ describe("InstanceExperimentalSettings — Conference Room Chat card (PAP-11233)
     await act(async () => {
       toggle?.click();
     });
-    await flushReact();
+    await flushReact(5);
 
     expect(mockInstanceSettingsApi.updateExperimental).toHaveBeenCalledWith({
       enableWorktreeRunExecution: true,
@@ -439,7 +432,7 @@ describe("InstanceExperimentalSettings — Conference Room Chat card (PAP-11233)
     await act(async () => {
       toggle?.click();
     });
-    await flushReact();
+    await flushReact(5);
 
     expect(mockInstanceSettingsApi.updateExperimental).toHaveBeenCalledWith({
       enableBuiltInAgents: true,
@@ -459,7 +452,7 @@ describe("InstanceExperimentalSettings — Conference Room Chat card (PAP-11233)
     await act(async () => {
       toggle?.click();
     });
-    await flushReact();
+    await flushReact(5);
 
     expect(mockInstanceSettingsApi.updateExperimental).toHaveBeenCalledWith({
       enableSummaries: true,
@@ -481,7 +474,7 @@ describe("InstanceExperimentalSettings — Conference Room Chat card (PAP-11233)
     await act(async () => {
       toggle?.click();
     });
-    await flushReact();
+    await flushReact(5);
 
     expect(mockInstanceSettingsApi.updateExperimental).toHaveBeenCalledWith({
       enableServerInfoDebugView: true,
@@ -507,7 +500,7 @@ describe("InstanceExperimentalSettings — Conference Room Chat card (PAP-11233)
     await act(async () => {
       container.querySelector<HTMLButtonElement>(AUTO_RECOVERY_TOGGLE_SELECTOR)?.click();
     });
-    await flushReact();
+    await flushReact(5);
 
     expect(document.body.textContent).toContain("3 current findings have already been escalated and resolved");
     expect(document.body.textContent).toContain(
@@ -541,7 +534,7 @@ describe("InstanceExperimentalSettings — Conference Room Chat card (PAP-11233)
     await act(async () => {
       toggle?.click();
     });
-    await flushReact();
+    await flushReact(5);
 
     expect(mockInstanceSettingsApi.previewIssueGraphLivenessAutoRecovery).toHaveBeenCalledWith({
       lookbackHours: 24,
@@ -556,7 +549,7 @@ describe("InstanceExperimentalSettings — Conference Room Chat card (PAP-11233)
     await act(async () => {
       enableOnlyButton?.click();
     });
-    await flushReact();
+    await flushReact(5);
 
     expect(mockInstanceSettingsApi.updateExperimental).toHaveBeenCalledWith({
       enableIssueGraphLivenessAutoRecovery: true,
@@ -588,7 +581,7 @@ describe("InstanceExperimentalSettings — Conference Room Chat card (PAP-11233)
     await act(async () => {
       toggle?.click();
     });
-    await flushReact();
+    await flushReact(5);
 
     expect(document.body.textContent).toContain("Confirm auto-recovery");
     expect(document.body.querySelector('[data-slot="dialog-overlay"]')).not.toBeNull();
@@ -600,7 +593,7 @@ describe("InstanceExperimentalSettings — Conference Room Chat card (PAP-11233)
     await act(async () => {
       enableAndRunButton?.click();
     });
-    await flushReact();
+    await flushReact(5);
 
     expect(mockInstanceSettingsApi.updateExperimental).toHaveBeenCalledWith({
       enableIssueGraphLivenessAutoRecovery: true,

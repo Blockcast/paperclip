@@ -5,6 +5,7 @@ import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AppDetailSidebar } from "./AppConnectionSidebar";
+import { flushReact } from "@/test-utils/react";
 
 const sidebarNavItemMock = vi.hoisted(() => vi.fn());
 const currentPath = vi.hoisted(() => ({ value: "/apps/conn-1/permissions" }));
@@ -81,15 +82,6 @@ async function act(callback: () => void | Promise<void>) {
   await result;
 }
 
-async function flushReact() {
-  for (let i = 0; i < 3; i += 1) {
-    await act(async () => {
-      await Promise.resolve();
-      await new Promise((resolve) => window.setTimeout(resolve, 0));
-    });
-  }
-}
-
 function connection(overrides: Record<string, unknown> = {}) {
   return {
     id: "conn-1",
@@ -161,7 +153,7 @@ describe("AppConnectionSidebar", () => {
         </QueryClientProvider>,
       );
     });
-    await flushReact();
+    await flushReact(3);
   }
 
   it("renders a back link and the connected app tabs (including Test)", async () => {

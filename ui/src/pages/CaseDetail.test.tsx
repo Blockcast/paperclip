@@ -7,6 +7,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CaseDetail as CaseDetailData, CaseSummary } from "@/api/cases";
 import { CaseDetail } from "./CaseDetail";
+import { flushReact, waitForAssertion } from "@/test-utils/react";
 
 function act(callback: () => void) {
   flushSync(callback);
@@ -58,27 +59,6 @@ vi.mock("@/lib/router", () => ({
   useCaseHref: () => (...segments: string[]) =>
     `/PAP/${["cases", ...segments].filter(Boolean).join("/")}`,
 }));
-
-async function flush() {
-  for (let i = 0; i < 5; i += 1) {
-    await Promise.resolve();
-    await new Promise((r) => setTimeout(r, 0));
-  }
-  flushSync(() => {});
-}
-async function waitForAssertion(assertion: () => void, attempts = 20) {
-  let lastError: unknown;
-  for (let i = 0; i < attempts; i += 1) {
-    try {
-      assertion();
-      return;
-    } catch (e) {
-      lastError = e;
-      await flush();
-    }
-  }
-  throw lastError;
-}
 
 function detail(): CaseDetailData {
   return {

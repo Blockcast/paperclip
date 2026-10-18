@@ -6,6 +6,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { WorkTimelineResult } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Timeline, timelineSummary } from "./Timeline";
+import { flushReact } from "@/test-utils/react";
 
 const mockSetBreadcrumbs = vi.hoisted(() => vi.fn());
 const mockWorkTimelineApi = vi.hoisted(() => ({
@@ -111,14 +112,6 @@ const populatedTimeline: WorkTimelineResult = {
   },
 };
 
-async function flushReact() {
-  for (let index = 0; index < 3; index += 1) {
-    await Promise.resolve();
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
-  }
-  flushSync(() => {});
-}
-
 describe("Timeline", () => {
   let container: HTMLDivElement;
   let root: ReturnType<typeof createRoot> | null;
@@ -153,7 +146,7 @@ describe("Timeline", () => {
         </QueryClientProvider>,
       );
     });
-    await flushReact();
+    await flushReact(3);
 
     expect(container.querySelector('[data-testid="request-collapsed-sidebar"]')).not.toBeNull();
   });
@@ -168,7 +161,7 @@ describe("Timeline", () => {
         </QueryClientProvider>,
       );
     });
-    await flushReact();
+    await flushReact(3);
 
     expect(container.textContent).toContain("Range");
     expect(container.querySelector('[aria-label="Zoom out"]')).not.toBeNull();
@@ -190,7 +183,7 @@ describe("Timeline", () => {
         </QueryClientProvider>,
       );
     });
-    await flushReact();
+    await flushReact(3);
 
     expect(container.textContent).toContain("Runs");
     expect(container.textContent).toContain("Agents");
@@ -230,7 +223,7 @@ describe("Timeline", () => {
         </QueryClientProvider>,
       );
     });
-    await flushReact();
+    await flushReact(3);
 
     expect(container.textContent).toContain("Run time");
     expect(container.textContent).toContain("2h 0m");
@@ -267,7 +260,7 @@ describe("Timeline", () => {
         </QueryClientProvider>,
       );
     });
-    await flushReact();
+    await flushReact(3);
 
     expect(container.textContent).toContain("Tokens used");
     expect(container.textContent).toContain("2K");
@@ -298,7 +291,7 @@ describe("Timeline", () => {
         </QueryClientProvider>,
       );
     });
-    await flushReact();
+    await flushReact(3);
 
     expect(mockWorkTimelineApi.get).toHaveBeenCalledWith(
       "company-1",

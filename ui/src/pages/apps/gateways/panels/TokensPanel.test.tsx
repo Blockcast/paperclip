@@ -7,6 +7,7 @@ import type { ReactNode } from "react";
 import type { ToolMcpGatewayToken, ToolMcpGatewayWithTokens } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TokensPanel } from "./TokensPanel";
+import { flushReact } from "@/test-utils/react";
 
 const createGatewayTokenMock = vi.hoisted(() => vi.fn());
 const revokeGatewayTokenMock = vi.hoisted(() => vi.fn());
@@ -32,15 +33,6 @@ async function act(callback: () => void | Promise<void>) {
     result = callback();
   });
   await result;
-}
-
-async function flushReact() {
-  for (let i = 0; i < 3; i += 1) {
-    await act(async () => {
-      await Promise.resolve();
-      await new Promise((resolve) => window.setTimeout(resolve, 0));
-    });
-  }
 }
 
 function token(overrides: Partial<ToolMcpGatewayToken> = {}): ToolMcpGatewayToken {
@@ -127,7 +119,7 @@ describe("TokensPanel", () => {
     await act(async () => {
       root.render(<QueryClientProvider client={client}>{node}</QueryClientProvider>);
     });
-    await flushReact();
+    await flushReact(3);
   }
 
   function clickButton(label: string) {
@@ -171,7 +163,7 @@ describe("TokensPanel", () => {
     await act(async () => {
       form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
     });
-    await flushReact();
+    await flushReact(3);
 
     expect(createGatewayTokenMock).toHaveBeenCalledTimes(1);
     expect(container.textContent).toContain("New token — copy now");
@@ -196,7 +188,7 @@ describe("TokensPanel", () => {
     expect(confirmButton.disabled).toBe(false);
 
     await clickButton("Revoke token");
-    await flushReact();
+    await flushReact(3);
     expect(revokeGatewayTokenMock).toHaveBeenCalledWith("company-1", "token-1");
   });
 });

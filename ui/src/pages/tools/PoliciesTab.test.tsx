@@ -66,6 +66,7 @@ vi.mock("@/components/ui/sheet", () => ({
 }));
 
 import { PoliciesTab } from "./PoliciesTab";
+import { flushReact } from "@/test-utils/react";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -121,13 +122,6 @@ function catalog(partial: Partial<ToolCatalogEntry> & { id: string; toolName: st
   };
 }
 
-async function flushReact() {
-  for (let i = 0; i < 4; i += 1) {
-    await Promise.resolve();
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
-  }
-}
-
 describe("PoliciesTab", () => {
   let container: HTMLDivElement;
   let root: ReturnType<typeof createRoot>;
@@ -176,7 +170,7 @@ describe("PoliciesTab", () => {
         </QueryClientProvider>,
       );
     });
-    await flushReact();
+    await flushReact(4);
   }
 
   it("renders ordered sentence rows without exposing priority numbers", async () => {
@@ -209,7 +203,7 @@ describe("PoliciesTab", () => {
       button.textContent?.includes("Ask first before selected actions")
     );
     flushSync(() => starter?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
-    await flushReact();
+    await flushReact(4);
 
     expect(container.querySelector("#tool-patterns")).toBeNull();
     expect(container.querySelector("#conditions-json")).toBeNull();
@@ -225,12 +219,12 @@ describe("PoliciesTab", () => {
 
     const duplicateButton = [...container.querySelectorAll("button")].find((button) => button.textContent?.includes("Duplicate"));
     flushSync(() => duplicateButton?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
-    await flushReact();
+    await flushReact(4);
     expect(toolsApiMock.duplicatePolicy).toHaveBeenCalledWith("company-1", "rule-1");
 
     const firstSwitch = container.querySelector<HTMLButtonElement>('[role="switch"]');
     flushSync(() => firstSwitch?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
-    await flushReact();
+    await flushReact(4);
     expect(toolsApiMock.updatePolicy).toHaveBeenCalledWith("company-1", "rule-1", { enabled: false });
 
     const rows = container.querySelectorAll("tbody tr");
@@ -238,19 +232,19 @@ describe("PoliciesTab", () => {
       rows[0]?.dispatchEvent(new Event("dragstart", { bubbles: true }));
       rows[1]?.dispatchEvent(new Event("drop", { bubbles: true }));
     });
-    await flushReact();
+    await flushReact(4);
     expect(toolsApiMock.reorderPolicies).toHaveBeenCalledWith("company-1", { policyIds: ["rule-2", "rule-1"] });
 
     const deleteButton = [...container.querySelectorAll("button")].find((button) =>
       button.textContent?.includes("Delete") && button.className.includes("text-destructive")
     );
     flushSync(() => deleteButton?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
-    await flushReact();
+    await flushReact(4);
     expect(container.textContent).toContain("matched 3 times in the last 24 hours");
 
     const confirmDelete = [...container.querySelectorAll("button")].filter((button) => button.textContent?.includes("Delete")).at(-1);
     flushSync(() => confirmDelete?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
-    await flushReact();
+    await flushReact(4);
     expect(toolsApiMock.deletePolicy).toHaveBeenCalledWith("company-1", "rule-1");
   });
 
@@ -271,12 +265,12 @@ describe("PoliciesTab", () => {
 
     const forget = [...container.querySelectorAll("button")].find((button) => button.textContent?.includes("Forget"));
     flushSync(() => forget?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
-    await flushReact();
+    await flushReact(4);
     expect(container.textContent).toContain("Paperclip will ask again");
 
     const confirmForget = [...container.querySelectorAll("button")].filter((button) => button.textContent?.includes("Forget")).at(-1);
     flushSync(() => confirmForget?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
-    await flushReact();
+    await flushReact(4);
     expect(toolsApiMock.revokeTrustRule).toHaveBeenCalledWith("company-1", "trust-1");
   });
 });

@@ -46,6 +46,7 @@ vi.mock("../context/SidebarContext", () => ({
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
 import { InstanceSidebar } from "./InstanceSidebar";
+import { flushReact } from "@/test-utils/react";
 
 async function act(callback: () => void | Promise<void>) {
   await callback();
@@ -70,13 +71,6 @@ function makePlugin(overrides: Partial<PluginRecord> & { manifestJson: PluginRec
     installedAt: overrides.installedAt ?? new Date(0),
     updatedAt: overrides.updatedAt ?? new Date(0),
   };
-}
-
-async function flushReact() {
-  await act(async () => {
-    await Promise.resolve();
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
-  });
 }
 
 async function findPluginLinks(container: HTMLElement, expectedCount: number) {
@@ -165,7 +159,7 @@ describe("InstanceSidebar", () => {
     const rendered = renderSidebar(container);
     root = rendered.root;
     queryClient = rendered.queryClient;
-    await flushReact();
+    await flushReact(2);
 
     const pluginLinks = await findPluginLinks(container, 1);
     expect(pluginLinks[0]?.getAttribute("href")).toBe("/company/settings/instance/plugins/linear");
@@ -203,7 +197,7 @@ describe("InstanceSidebar", () => {
     const rendered = renderSidebar(container);
     root = rendered.root;
     queryClient = rendered.queryClient;
-    await flushReact();
+    await flushReact(2);
 
     const pluginLinks = await findPluginLinks(container, 1);
     expect(pluginLinks[0]?.getAttribute("href")).toBe("/company/settings/instance/plugins/hybrid");
@@ -227,7 +221,7 @@ describe("InstanceSidebar", () => {
     const rendered = renderSidebar(container);
     root = rendered.root;
     queryClient = rendered.queryClient;
-    await flushReact();
+    await flushReact(2);
     await findPluginLinks(container, 1);
 
     await vi.waitFor(() => {
@@ -276,7 +270,7 @@ describe("InstanceSidebar", () => {
     const rendered = renderSidebar(container);
     root = rendered.root;
     queryClient = rendered.queryClient;
-    await flushReact();
+    await flushReact(2);
 
     await vi.waitFor(() => {
       expect(mockPluginsApi.list).toHaveBeenCalled();

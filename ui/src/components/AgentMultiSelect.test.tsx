@@ -4,6 +4,7 @@ import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentMultiSelect } from "./AgentMultiSelect";
+import { flushReact } from "@/test-utils/react";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
@@ -14,12 +15,6 @@ function act(callback: () => void | Promise<void>) {
     result = callback();
   });
   return result;
-}
-
-async function flush() {
-  await act(async () => {
-    await Promise.resolve();
-  });
 }
 
 function setInputValue(input: HTMLInputElement, value: string) {
@@ -71,12 +66,12 @@ describe("AgentMultiSelect", () => {
     act(() => {
       container.querySelector("button")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     const filter = document.body.querySelector<HTMLInputElement>('input[placeholder="Filter agents"]');
     expect(filter).not.toBeNull();
     setInputValue(filter!, "search target");
-    await flush();
+    await flushReact();
 
     expect(document.body.textContent).toContain("Search Target");
     expect(document.body.textContent).not.toContain("Agent 0");
@@ -86,7 +81,7 @@ describe("AgentMultiSelect", () => {
         .querySelector('[aria-label="Allow Search Target"]')
         ?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     expect(onChange).toHaveBeenCalledTimes(1);
     expect(onChange.mock.calls[0]?.[0]).toEqual(new Set(["agent-17"]));
@@ -119,20 +114,20 @@ describe("AgentMultiSelect", () => {
     act(() => {
       container.querySelector("button")?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
     act(() => {
       document.body
         .querySelector('[aria-label="Allow Agent 5"]')
         ?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     expect(onSave).not.toHaveBeenCalled();
     const save = Array.from(document.body.querySelectorAll("button")).find((button) => button.textContent === "Save");
     act(() => {
       save?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     expect(onSave).toHaveBeenCalledWith(new Set(agents.map((agent) => agent.id)));
   });

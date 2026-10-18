@@ -8,6 +8,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { HeartbeatRun, Issue, IssueRecoveryAction } from "@paperclipai/shared";
 import { RunWorkspaceRecoverySurface } from "./RunWorkspaceRecoverySurface";
 import { ToastProvider } from "../context/ToastContext";
+import { flushReact } from "@/test-utils/react";
 
 const navigateMock = vi.hoisted(() => vi.fn());
 const issueGetMock = vi.hoisted(() => vi.fn());
@@ -48,16 +49,6 @@ vi.mock("../api/access", () => ({
 // flushSync-based sync `act` shim (matches the repo pattern in IssueRecoveryActionCard.test.tsx).
 function act(callback: () => void): void {
   flushSync(callback);
-}
-
-// Resolve pending mocked-promise micro/macrotasks, then flush the React state updates react-query
-// queued, repeating so chained query → render → dependent-render settles fully.
-async function flush() {
-  for (let i = 0; i < 6; i += 1) {
-    for (let j = 0; j < 4; j += 1) await Promise.resolve();
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    act(() => {});
-  }
 }
 
 let container: HTMLDivElement | null = null;
@@ -168,7 +159,7 @@ async function renderSurface(run: HeartbeatRun) {
     );
   });
   // Let the issue + board-access queries settle and commit.
-  await flush();
+  await flushReact(6);
   return container!;
 }
 
@@ -213,7 +204,7 @@ describe("RunWorkspaceRecoverySurface", () => {
     const node = await renderSurface(buildRun());
     click(node.querySelector("[data-testid='recovery-action-repair-trigger']"));
     click(document.body.querySelector("[data-testid='recovery-action-repair-confirm']"));
-    await flush();
+    await flushReact(6);
     expect(reconcileMock).toHaveBeenCalledWith("ws-1", { mode: "quarantine_restore" });
   });
 });

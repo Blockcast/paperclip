@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { BuiltInAgentGate } from "./BuiltInAgentGate";
 import type { BuiltInAgentState, BuiltInAgentStatus } from "@/api/builtInAgents";
+import { flushReact } from "@/test-utils/react";
 
 const listMock = vi.hoisted(() => vi.fn());
 const resumeMock = vi.hoisted(() => vi.fn());
@@ -58,14 +59,6 @@ function makeState(status: BuiltInAgentStatus, overrides: Partial<BuiltInAgentSt
   };
 }
 
-async function flushReact() {
-  for (let index = 0; index < 5; index += 1) {
-    await Promise.resolve();
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
-  }
-  flushSync(() => {});
-}
-
 describe("BuiltInAgentGate (PAP-12978)", () => {
   let container: HTMLDivElement;
   let root: Root | null = null;
@@ -82,7 +75,7 @@ describe("BuiltInAgentGate (PAP-12978)", () => {
         </QueryClientProvider>,
       );
     });
-    await flushReact();
+    await flushReact(5);
   }
 
   beforeEach(() => {
@@ -142,7 +135,7 @@ describe("BuiltInAgentGate (PAP-12978)", () => {
     flushSync(() => {
       resumeButton!.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flushReact();
+    await flushReact(5);
     expect(resumeMock).toHaveBeenCalledWith("agent-1", "c1");
   });
 

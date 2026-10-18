@@ -8,6 +8,7 @@ import type { CompanySecret, UserSecretDefinition } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MissingUserSecretsBanner } from "./MissingUserSecretsBanner";
 import type { MyUserSecretEntry } from "../../api/secrets";
+import { flushReact } from "@/test-utils/react";
 
 const mockSecretsApi = vi.hoisted(() => ({
   listMyUserSecrets: vi.fn(),
@@ -81,13 +82,6 @@ async function act(callback: () => void | Promise<void>) {
     result = callback();
   });
   await result;
-}
-
-async function flushReact() {
-  await act(async () => {
-    await Promise.resolve();
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
-  });
 }
 
 let container: HTMLDivElement;

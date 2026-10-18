@@ -36,6 +36,7 @@ vi.mock("../../context/ToastContext", () => ({
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
 
 import { ImportFromVaultDialog } from "./ImportFromVaultDialog";
+import { flushReact } from "@/test-utils/react";
 
 const awsVault: CompanySecretProviderConfig = {
   id: "vault-aws",
@@ -83,13 +84,6 @@ function makePreview(
     nextToken,
     candidates,
   };
-}
-
-async function flush() {
-  await act(async () => {
-    await Promise.resolve();
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
-  });
 }
 
 async function flushDebounce() {
@@ -169,8 +163,8 @@ describe("ImportFromVaultDialog", () => {
         </QueryClientProvider>,
       );
     });
-    await flush();
-    await flush();
+    await flushReact();
+    await flushReact();
 
     const tableBody = document.querySelector('[data-testid="vault-table-body"]');
     expect(tableBody).not.toBeNull();
@@ -185,7 +179,7 @@ describe("ImportFromVaultDialog", () => {
     await act(async () => {
       stripeRow?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
     expect(document.body.textContent).toContain("1 selected");
 
     // Load more page
@@ -194,8 +188,8 @@ describe("ImportFromVaultDialog", () => {
     await act(async () => {
       loadMore!.click();
     });
-    await flush();
-    await flush();
+    await flushReact();
+    await flushReact();
 
     expect(document.body.textContent).toContain("prod/sendgrid");
     // Selection persisted through pagination.
@@ -249,8 +243,8 @@ describe("ImportFromVaultDialog", () => {
         </QueryClientProvider>,
       );
     });
-    await flush();
-    await flush();
+    await flushReact();
+    await flushReact();
 
     const duplicateRow = document.querySelector(
       '[data-testid="vault-row-arn:aws:secretsmanager:us-east-1:1:secret:prod/sendgrid-Q9"]',
@@ -324,8 +318,8 @@ describe("ImportFromVaultDialog", () => {
         </QueryClientProvider>,
       );
     });
-    await flush();
-    await flush();
+    await flushReact();
+    await flushReact();
 
     // Select the conflict row
     const row = document.querySelector(
@@ -334,7 +328,7 @@ describe("ImportFromVaultDialog", () => {
     await act(async () => {
       row?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     // Click "Continue → Review" button.
     const continueBtn = Array.from(document.querySelectorAll("button")).find(
@@ -344,7 +338,7 @@ describe("ImportFromVaultDialog", () => {
     await act(async () => {
       continueBtn!.click();
     });
-    await flush();
+    await flushReact();
 
     // Review step: error message visible, Import button disabled.
     expect(document.body.textContent?.toLowerCase()).toContain("a paperclip secret already uses this");
@@ -388,8 +382,8 @@ describe("ImportFromVaultDialog", () => {
         </QueryClientProvider>,
       );
     });
-    await flush();
-    await flush();
+    await flushReact();
+    await flushReact();
 
     const row = document.querySelector(
       `[data-testid="vault-row-${externalRef}"]`,
@@ -397,7 +391,7 @@ describe("ImportFromVaultDialog", () => {
     await act(async () => {
       row?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     const continueBtn = Array.from(document.querySelectorAll("button")).find(
       (btn) => btn.textContent?.includes("Continue"),
@@ -405,7 +399,7 @@ describe("ImportFromVaultDialog", () => {
     await act(async () => {
       continueBtn!.click();
     });
-    await flush();
+    await flushReact();
 
     const keyInput = document.querySelector(
       `[data-testid="review-key-${externalRef}"]`,
@@ -418,7 +412,7 @@ describe("ImportFromVaultDialog", () => {
       valueSetter?.call(keyInput, "MY_KEY");
       keyInput!.dispatchEvent(new Event("input", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     expect(document.body.textContent).toContain("lowercase letters");
     const importBtn = Array.from(document.querySelectorAll("button")).find(
@@ -480,8 +474,8 @@ describe("ImportFromVaultDialog", () => {
         </QueryClientProvider>,
       );
     });
-    await flush();
-    await flush();
+    await flushReact();
+    await flushReact();
 
     const row = document.querySelector(
       `[data-testid="vault-row-${externalRef}"]`,
@@ -489,7 +483,7 @@ describe("ImportFromVaultDialog", () => {
     await act(async () => {
       row?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     const continueBtn = Array.from(document.querySelectorAll("button")).find(
       (btn) => btn.textContent?.includes("Continue"),
@@ -497,7 +491,7 @@ describe("ImportFromVaultDialog", () => {
     await act(async () => {
       continueBtn!.click();
     });
-    await flush();
+    await flushReact();
 
     const descriptionInput = document.querySelector(
       `[data-testid="review-description-${externalRef}"]`,
@@ -511,7 +505,7 @@ describe("ImportFromVaultDialog", () => {
       valueSetter?.call(descriptionInput, "Operator-entered OpenAI key");
       descriptionInput!.dispatchEvent(new Event("input", { bubbles: true }));
     });
-    await flush();
+    await flushReact();
 
     const importBtn = Array.from(document.querySelectorAll("button")).find(
       (btn) => btn.textContent?.startsWith("Import "),
@@ -519,8 +513,8 @@ describe("ImportFromVaultDialog", () => {
     await act(async () => {
       importBtn!.click();
     });
-    await flush();
-    await flush();
+    await flushReact();
+    await flushReact();
 
     expect(mockSecretsApi.remoteImport).toHaveBeenCalledWith("company-1", {
       providerConfigId: awsVault.id,
@@ -617,8 +611,8 @@ describe("ImportFromVaultDialog", () => {
         </QueryClientProvider>,
       );
     });
-    await flush();
-    await flush();
+    await flushReact();
+    await flushReact();
 
     // Select all loaded
     const headerCheckbox = document.querySelector(
@@ -628,7 +622,7 @@ describe("ImportFromVaultDialog", () => {
     await act(async () => {
       headerCheckbox!.click();
     });
-    await flush();
+    await flushReact();
 
     // Continue
     const continueBtn = Array.from(document.querySelectorAll("button")).find(
@@ -637,7 +631,7 @@ describe("ImportFromVaultDialog", () => {
     await act(async () => {
       continueBtn!.click();
     });
-    await flush();
+    await flushReact();
 
     // Import
     const importBtn = Array.from(document.querySelectorAll("button")).find(
@@ -647,8 +641,8 @@ describe("ImportFromVaultDialog", () => {
     await act(async () => {
       importBtn!.click();
     });
-    await flush();
-    await flush();
+    await flushReact();
+    await flushReact();
 
     expect(mockSecretsApi.remoteImport).toHaveBeenCalledTimes(1);
     expect(document.body.textContent).toContain("Import complete");
@@ -681,7 +675,7 @@ describe("ImportFromVaultDialog", () => {
         </QueryClientProvider>,
       );
     });
-    await flush();
+    await flushReact();
 
     expect(document.querySelector('[data-testid="select-empty-vaults"]')).not.toBeNull();
     expect(mockSecretsApi.remoteImportPreview).not.toHaveBeenCalled();
@@ -714,8 +708,8 @@ describe("ImportFromVaultDialog", () => {
         </QueryClientProvider>,
       );
     });
-    await flush();
-    await flush();
+    await flushReact();
+    await flushReact();
 
     const banner = document.querySelector('[data-testid="preview-error-banner"]');
     expect(banner).not.toBeNull();
@@ -752,8 +746,8 @@ describe("ImportFromVaultDialog", () => {
         </QueryClientProvider>,
       );
     });
-    await flush();
-    await flush();
+    await flushReact();
+    await flushReact();
 
     const banner = document.querySelector('[data-testid="preview-error-banner"]');
     expect(banner).not.toBeNull();
@@ -795,8 +789,8 @@ describe("ImportFromVaultDialog", () => {
         </QueryClientProvider>,
       );
     });
-    await flush();
-    await flush();
+    await flushReact();
+    await flushReact();
 
     const search = document.querySelector('[data-testid="vault-search"]') as HTMLInputElement;
     expect(search).not.toBeNull();
@@ -810,7 +804,7 @@ describe("ImportFromVaultDialog", () => {
       search.dispatchEvent(new Event("input", { bubbles: true }));
     });
     await flushDebounce();
-    await flush();
+    await flushReact();
 
     expect(mockSecretsApi.remoteImportPreview).toHaveBeenCalledTimes(2);
     const lastCall = mockSecretsApi.remoteImportPreview.mock.calls.at(-1);

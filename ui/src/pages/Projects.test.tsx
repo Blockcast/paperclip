@@ -8,6 +8,7 @@ import type { Project } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ToastProvider } from "../context/ToastContext";
 import { Projects } from "./Projects";
+import { flushReact } from "@/test-utils/react";
 
 const mockProjectsApi = vi.hoisted(() => ({
   list: vi.fn(),
@@ -100,13 +101,6 @@ function makeProject(overrides: Partial<Project>): Project {
     updatedAt: new Date("2026-01-01T00:00:00Z"),
     ...overrides,
   };
-}
-
-async function flushReact() {
-  await act(async () => {
-    await Promise.resolve();
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
-  });
 }
 
 describe("Projects", () => {

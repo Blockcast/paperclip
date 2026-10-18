@@ -7,6 +7,7 @@ import { MemoryRouter } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Artifacts } from "./Artifacts";
 import type { CompanyArtifact, CompanyArtifactGroup } from "../api/artifacts";
+import { flushReact, waitForAssertion } from "@/test-utils/react";
 
 const companyState = vi.hoisted(() => ({
   selectedCompanyId: "company-1",
@@ -114,25 +115,6 @@ function sampleGroup(overrides: Partial<CompanyArtifactGroup> = {}): CompanyArti
     href: "/PAP/artifacts?groupBy=task&groupIssueId=issue-1",
     ...overrides,
   };
-}
-
-async function flush() {
-  await Promise.resolve();
-  await new Promise((resolve) => setTimeout(resolve, 0));
-}
-
-async function waitForAssertion(assertion: () => void, attempts = 50) {
-  let lastError: unknown;
-  for (let attempt = 0; attempt < attempts; attempt += 1) {
-    try {
-      assertion();
-      return;
-    } catch (error) {
-      lastError = error;
-      await flush();
-    }
-  }
-  throw lastError;
 }
 
 function renderArtifacts(container: HTMLDivElement, initialEntries: string[] = ["/artifacts"]) {

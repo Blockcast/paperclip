@@ -14,6 +14,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { flushReact } from "@/test-utils/react";
 
 // jsdom's CSS parser rejects the custom-property marker rule stitches inserts
 // (`--sxs{--sxs:N}`), pulled into <App>'s eager import graph transitively via
@@ -96,18 +97,10 @@ vi.mock("./context/CompanyContext", () => ({
   CompanyProvider: ({ children }: { children: ReactNode }) => <>{children}</>,
 }));
 
-async function flushReact() {
-  for (let i = 0; i < 20; i += 1) {
-    await Promise.resolve();
-    await new Promise((resolve) => window.setTimeout(resolve, 0));
-  }
-  flushSync(() => {});
-}
-
 async function waitForText(container: HTMLElement, text: string) {
   for (let attempt = 0; attempt < 25; attempt += 1) {
     if (container.textContent?.includes(text)) return;
-    await flushReact();
+    await flushReact(20);
   }
   expect(container.textContent).toContain(text);
 }
@@ -200,7 +193,7 @@ describe("App Cases routing (PAP-13002)", () => {
     mockAuthApi.getSession.mockResolvedValue(null);
 
     root = await renderAppAt(container, "/auth");
-    await flushReact();
+    await flushReact(20);
     window.dispatchEvent(new Event("paperclip:auth-expired"));
     resolveHealth({
       status: "ok",
