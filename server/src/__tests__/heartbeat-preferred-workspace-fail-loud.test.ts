@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -21,6 +21,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { cleanupHeartbeatTestState } from "./helpers/cleanup-heartbeat-test-state.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import { resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -218,5 +219,132 @@ describeEmbeddedPostgres("preferred non-primary workspace fail-loud", () => {
       .where(eq(issues.id, issueId))
       .then((rows) => rows[0]);
     expect(refreshedIssue?.executionWorkspaceId ?? null).toBeNull();
+  }, 120_000);
+
+  // BLO-47335: a local_folder primary (explicit cwd, nothing clones it) whose
+  // path is missing or is not a checkout used to fall back to the agent home,
+  // labelled `project_primary`, and be persisted as a shared_workspace
+  // execution workspace pinned to that agent home — even for an issue whose
+  // preference is isolated_workspace.
+  async function seedLocalFolderPrimary(cwd: string) {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const workspaceId = randomUUID();
+    const issueId = randomUUID();
+    const agentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Acme",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      status: "active",
+      defaultResponsibleUserId: "responsible-user",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    await db.insert(projects).values({
+      id: projectId,
+      companyId,
+      name: "Local Folder Project",
+      status: "active",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    await db.insert(projectWorkspaces).values({
+      id: workspaceId,
+      companyId,
+      projectId,
+      name: "Primary (local_folder)",
+      sourceType: "git_repo",
+      cwd,
+      repoUrl: "https://github.com/example/local-folder.git",
+      isPrimary: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      projectId,
+      title: "Local folder primary is unusable",
+      status: "in_progress",
+      workMode: "standard",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      identifier: "PAP-47335",
+      executionWorkspacePreference: "isolated_workspace",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+    return { workspaceId, issueId, agentId };
+  }
+
+  async function expectRefusedWithoutAgentHomeFallback(
+    seeded: { workspaceId: string; issueId: string; agentId: string },
+    cwd: string,
+    detail: string,
+  ) {
+    const run = await heartbeat.wakeup(seeded.agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_commented",
+      contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId, wakeReason: "issue_commented" },
+    });
+    expect(run).not.toBeNull();
+    await vi.waitFor(async () => {
+      expect((await heartbeat.getRun(run!.id))?.status).toBe("failed");
+    }, { timeout: 10_000 });
+
+    const failed = await heartbeat.getRun(run!.id);
+    expect(failed?.errorCode).toBe("workspace_validation_failed");
+    expect(failed?.error).toContain(seeded.workspaceId);
+    expect(failed?.error).toContain(cwd);
+    expect(failed?.error).toContain(detail);
+    expect(adapterExecute).not.toHaveBeenCalled();
+
+    // Nothing persisted, nothing pinned, and the agent home was never used.
+    expect(await db.select().from(executionWorkspaces)).toHaveLength(0);
+    const refreshed = await db
+      .select({
+        executionWorkspaceId: issues.executionWorkspaceId,
+        executionWorkspacePreference: issues.executionWorkspacePreference,
+      })
+      .from(issues)
+      .where(eq(issues.id, seeded.issueId))
+      .then((rows) => rows[0]);
+    expect(refreshed?.executionWorkspaceId ?? null).toBeNull();
+    expect(refreshed?.executionWorkspacePreference).toBe("isolated_workspace");
+  }
+
+  it("refuses a local_folder primary whose cwd is missing instead of falling back to the agent home", async () => {
+    const missingCwd = path.join(os.tmpdir(), `paperclip-missing-${randomUUID()}`);
+    const seeded = await seedLocalFolderPrimary(missingCwd);
+    // Production agent homes accumulate a `.git` from prior runs, which is what
+    // let the fallback get far enough to be persisted. Reproduce that.
+    const agentHome = resolveDefaultAgentWorkspaceDir(seeded.agentId);
+    await mkdir(agentHome, { recursive: true });
+    tempRoots.push(agentHome);
+    await execFileAsync("git", ["init"], { cwd: agentHome });
+    await execFileAsync("git", ["-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "--allow-empty", "-m", "home"], { cwd: agentHome });
+    await expectRefusedWithoutAgentHomeFallback(seeded, missingCwd, "path does not exist on this host");
+  }, 120_000);
+
+  it("refuses a local_folder primary whose cwd exists but is not a git checkout", async () => {
+    const notARepo = await mkdtemp(path.join(os.tmpdir(), "paperclip-not-a-repo-"));
+    tempRoots.push(notARepo);
+    const seeded = await seedLocalFolderPrimary(notARepo);
+    await expectRefusedWithoutAgentHomeFallback(seeded, notARepo, "path is not a git checkout");
   }, 120_000);
 });
