@@ -241,10 +241,11 @@ paperclip_queued_run_oldest_claimable_age_seconds
 - **Both high** -- a genuinely claimable run is waiting. Continue to *What to
   do when paged* below; the dispatcher is the right thing to look at.
 - **Unfiltered high, claimable low or `0`** -- the aged head is undispatchable
-  work, not a dispatch fault. Nothing is starved. Find the blocked issue (the
-  SQL in step 1 returns `issue_id`; check its unresolved blockers) and fix or
-  cut the dependency. Do NOT retune the dispatcher, raise concurrency, or
-  clear the run by hand.
+  work, not a dispatch fault. Nothing is starved. Find the blocked issue --
+  *What to do when paged* -> *Step 1* below returns `issue_id` for the paged
+  agent's oldest rows; check that issue's unresolved blockers -- and fix or cut
+  the dependency. Do NOT retune the dispatcher, raise concurrency, or clear the
+  run by hand.
 
 `paperclip_queued_run_oldest_claimable_age_seconds` is the same measurand with
 that population removed. It reads `isEffectivelyDependencyReadyForDispatch`
