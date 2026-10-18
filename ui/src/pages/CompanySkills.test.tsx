@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
+import { act } from "react";
 import type { ComponentProps, ReactNode } from "react";
-import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
 import type { CompanySkillDetail, CompanySkillVersion, FolderListResult } from "@paperclipai/shared";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -99,14 +99,6 @@ vi.mock("../components/MarkdownEditor", () => ({
 
 let root: Root | null = null;
 let container: HTMLDivElement | null = null;
-
-async function act(callback: () => void | Promise<void>) {
-  let result: void | Promise<void> = undefined;
-  flushSync(() => {
-    result = callback();
-  });
-  await result;
-}
 
 afterEach(() => {
   root?.unmount();

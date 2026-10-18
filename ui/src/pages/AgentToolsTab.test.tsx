@@ -1,6 +1,5 @@
 // @vitest-environment jsdom
 
-import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type {
@@ -9,7 +8,7 @@ import type {
   ToolProfileEffectiveSummary,
 } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createElement } from "react";
+import { act, createElement } from "react";
 import { flushReact } from "@/test-utils/react";
 
 const mockToolsApi = vi.hoisted(() => ({
@@ -30,14 +29,6 @@ vi.mock("@/lib/router", () => ({
 }));
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-
-async function act(callback: () => void | Promise<void>) {
-  let result: void | Promise<void> = undefined;
-  flushSync(() => {
-    result = callback();
-  });
-  await result;
-}
 
 function makeCatalogEntry(overrides: Partial<ToolCatalogEntry>): ToolCatalogEntry {
   return {

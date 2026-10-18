@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
+import { act } from "react";
 import { createRoot } from "react-dom/client";
-import { flushSync } from "react-dom";
 import type { AnchorHTMLAttributes, ReactElement } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Agent, IssueRecoveryAction } from "@paperclipai/shared";
@@ -15,18 +15,6 @@ vi.mock("@/lib/router", () => ({
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
-function act<T>(callback: () => T): T {
-  let result: T | undefined;
-  flushSync(() => {
-    result = callback();
-  });
-  const maybePromise = result as unknown as PromiseLike<unknown>;
-  if (result && typeof maybePromise.then === "function") {
-    throw new TypeError("This test act shim only supports synchronous callbacks.");
-  }
-  return result as T;
-}
 
 let root: ReturnType<typeof createRoot> | null = null;
 let container: HTMLDivElement | null = null;

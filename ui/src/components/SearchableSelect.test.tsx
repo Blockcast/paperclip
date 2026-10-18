@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { flushSync } from "react-dom";
+import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -15,14 +15,6 @@ import { flushReact } from "@/test-utils/react";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
-function act(callback: () => void | Promise<void>) {
-  let result: void | Promise<void> | undefined;
-  flushSync(() => {
-    result = callback();
-  });
-  return result;
-}
 
 function render(node: ReactNode, container: HTMLElement) {
   const root = createRoot(container);

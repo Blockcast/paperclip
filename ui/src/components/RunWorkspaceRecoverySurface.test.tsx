@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
 
+import { act } from "react";
 import type { ComponentProps, ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { flushSync } from "react-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { HeartbeatRun, Issue, IssueRecoveryAction } from "@paperclipai/shared";
@@ -45,11 +45,6 @@ vi.mock("../api/access", () => ({
 }));
 
 (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-
-// flushSync-based sync `act` shim (matches the repo pattern in IssueRecoveryActionCard.test.tsx).
-function act(callback: () => void): void {
-  flushSync(callback);
-}
 
 let container: HTMLDivElement | null = null;
 let root: Root | null = null;

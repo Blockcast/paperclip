@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 
+import { act } from "react";
 import type { ReactNode } from "react";
 import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
@@ -38,13 +39,6 @@ let container: HTMLDivElement | null = null;
 
 // React's `act` is not usable in this vitest setup; drive updates via flushSync
 // like SkillStudio.test.tsx / AgentsUsingSkillDialog.test.tsx do.
-async function act(callback: () => void | Promise<void>) {
-  let result: void | Promise<void> = undefined;
-  flushSync(() => {
-    result = callback();
-  });
-  await result;
-}
 
 function teardown() {
   if (root) flushSync(() => root?.unmount());

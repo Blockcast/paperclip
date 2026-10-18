@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { flushSync } from "react-dom";
+import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { InboxAgentPolicy } from "@paperclipai/shared";
@@ -17,14 +17,6 @@ vi.mock("./AgentIconPicker", () => ({ AgentIcon: () => null }));
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
-async function act(callback: () => void | Promise<void>) {
-  let result: void | Promise<void> = undefined;
-  flushSync(() => {
-    result = callback();
-  });
-  await result;
-}
 
 function policy(overrides: Partial<InboxAgentPolicy> = {}): InboxAgentPolicy {
   return {

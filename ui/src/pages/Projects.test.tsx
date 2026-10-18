@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
+import { act } from "react";
 import type { ReactNode } from "react";
-import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Project } from "@paperclipai/shared";
@@ -53,14 +53,6 @@ vi.mock("../api/resourceMemberships", () => ({
 if (!globalThis.PointerEvent) {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (globalThis as any).PointerEvent = MouseEvent;
-}
-
-async function act(callback: () => void | Promise<void>) {
-  let result: void | Promise<void> = undefined;
-  flushSync(() => {
-    result = callback();
-  });
-  await result;
 }
 
 function makeProject(overrides: Partial<Project>): Project {

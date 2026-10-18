@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
+import { act } from "react";
 import type { ComponentProps, ReactNode } from "react";
-import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -258,16 +258,6 @@ vi.mock("@/components/ui/popover", () => ({
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
-function act(callback: () => void | Promise<void>): void | Promise<void> {
-  let result: unknown;
-  flushSync(() => {
-    result = callback();
-  });
-  return result && typeof (result as Promise<void>).then === "function"
-    ? (result as Promise<void>).then(() => undefined)
-    : undefined;
-}
 
 async function typeTextareaValue(textarea: HTMLTextAreaElement, value: string) {
   await act(async () => {

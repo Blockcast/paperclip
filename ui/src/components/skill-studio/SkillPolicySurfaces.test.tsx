@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
+import { act } from "react";
 import { createRoot } from "react-dom/client";
-import { flushSync } from "react-dom";
 import type { ReactNode } from "react";
 import { afterEach, describe, expect, it } from "vitest";
 
@@ -17,14 +17,6 @@ import { ApiError } from "@/api/client";
 
 let root: ReturnType<typeof createRoot> | null = null;
 let container: HTMLDivElement | null = null;
-
-function act<T>(cb: () => T): T {
-  let result: T | undefined;
-  flushSync(() => {
-    result = cb();
-  });
-  return result as T;
-}
 
 function render(node: ReactNode) {
   container = document.createElement("div");

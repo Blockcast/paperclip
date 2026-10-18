@@ -1,8 +1,7 @@
 // @vitest-environment jsdom
 
-import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
-import { useEffect, useState } from "react";
+import { act, useEffect, useState } from "react";
 import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { queryKeys } from "@/lib/queryKeys";
@@ -35,14 +34,6 @@ vi.mock("@/context/ToastContext", () => ({
 }));
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
-
-async function act(callback: () => void | Promise<void>) {
-  let result: void | Promise<void> = undefined;
-  flushSync(() => {
-    result = callback();
-  });
-  await result;
-}
 
 function pendingRequest() {
   return {

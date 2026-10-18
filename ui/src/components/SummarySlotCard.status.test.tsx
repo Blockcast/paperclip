@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 
+import { act } from "react";
 import type { ReactNode } from "react";
 import { flushSync } from "react-dom";
 import { createRoot, type Root } from "react-dom/client";
@@ -49,14 +50,6 @@ vi.mock("@/components/MarkdownBody", () => ({
 vi.mock("@/components/ConfigureBuiltInAgentModal", () => ({
   ConfigureBuiltInAgentModal: () => null,
 }));
-
-async function act(callback: () => void | Promise<void>) {
-  let result: void | Promise<void> = undefined;
-  flushSync(() => {
-    result = callback();
-  });
-  await result;
-}
 
 function readySummarizer(): BuiltInAgentState {
   return {

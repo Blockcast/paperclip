@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { flushSync } from "react-dom";
+import { act } from "react";
 import { createRoot } from "react-dom/client";
 import type { AnchorHTMLAttributes } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -8,10 +8,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CaseDetail as CaseDetailData, CaseSummary } from "@/api/cases";
 import { CaseDetail } from "./CaseDetail";
 import { flushReact, waitForAssertion } from "@/test-utils/react";
-
-function act(callback: () => void) {
-  flushSync(callback);
-}
 
 const companyState = vi.hoisted(() => ({ selectedCompanyId: "company-1" }));
 const mockCasesApi = vi.hoisted(() => ({

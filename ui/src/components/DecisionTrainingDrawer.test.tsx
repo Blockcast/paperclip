@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { flushSync } from "react-dom";
+import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -33,14 +33,6 @@ vi.mock("@/lib/router", () => ({
 
 import { DecisionTrainingDrawer } from "./DecisionTrainingDrawer";
 import { ToastProvider } from "../context/ToastContext";
-
-function act(callback: () => void | Promise<void>) {
-  let result: void | Promise<void> | undefined;
-  flushSync(() => {
-    result = callback();
-  });
-  return result;
-}
 
 async function waitFor(predicate: () => boolean, attempts = 40): Promise<void> {
   for (let i = 0; i < attempts; i += 1) {

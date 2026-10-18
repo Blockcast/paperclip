@@ -1,8 +1,7 @@
 // @vitest-environment jsdom
 
 import { createRoot } from "react-dom/client";
-import { flushSync } from "react-dom";
-import { useState, type AnchorHTMLAttributes, type ReactElement } from "react";
+import { act, useState, type AnchorHTMLAttributes, type ReactElement } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AttentionItem, AttentionSourceKind } from "@paperclipai/shared";
@@ -42,14 +41,6 @@ vi.mock("../lib/utils", async (importOriginal) => {
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 (globalThis as any).IS_REACT_ACT_ENVIRONMENT = true;
-
-function act<T>(cb: () => T): T {
-  let result: T | undefined;
-  flushSync(() => {
-    result = cb();
-  });
-  return result as T;
-}
 
 let root: ReturnType<typeof createRoot> | null = null;
 let container: HTMLDivElement | null = null;
