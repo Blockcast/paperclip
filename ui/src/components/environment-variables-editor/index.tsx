@@ -584,7 +584,7 @@ export const EnvironmentVariablesEditor = forwardRef<EnvironmentVariablesEditorH
 
   return (
     <TooltipProvider>
-      <div ref={editorRootRef} className="@container/env space-y-2">
+      <div ref={editorRootRef} data-testid="environment-variables-editor" className="@container/env space-y-2">
       {attentionCount > 1 ? (
         <p className="inline-flex items-center gap-1.5 text-(length:--text-micro) font-medium text-amber-700 dark:text-amber-400">
           <AlertCircle className="size-3.5" />
