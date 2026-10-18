@@ -96,7 +96,7 @@ verbatim, and `events_list` over ns `paperclip` returned 442,601 characters acro
 > measurement. Making the scrubber a credential boundary was considered and declined; the test above
 > records why, and what it would cost.
 
-> **Second scope boundary this file cannot close (PEN-4283).** The `k8s-ro` tool *surface* is not
+> **Second scope boundary this file cannot close (PEN-4295).** The `k8s-ro` tool *surface* is not
 > derivable from this repo. It is set by the upstream server image, its `--read-only
 > --disable-destructive` flags and the `disabled_tools` list, all in
 > `Blockcast/onprem-k8s:paperclip/k8s-mcp-stack.yaml`, and the `k8s-ro` gateway upstream map carries
