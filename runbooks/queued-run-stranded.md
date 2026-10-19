@@ -1386,6 +1386,16 @@ sweep itself looks.
    stage, which is the kube-API control — if `list_jobs` is flat while the
    DB-backed stages regress, the kube API is not involved.
 
+### ⚠️ Merging the chart does NOT make this alert live on Blockcast
+
+Same onprem-k8s lockstep caveat as every section above. `prometheusRule.enabled`
+is **false** in `deploy/helm/paperclip/values.blockcast.yaml`, so this chart's copy
+of `PaperclipOrphanReapWaitBoundExceeded` does not deploy there — shipping it in
+this repository alone leaves the regression exactly as undetected as it was. It
+must also land in the two lockstep `Blockcast/onprem-k8s` alert files, as
+`PaperclipAgentStartLockWedged` did under PEN-3338. Verify at `/api/v1/rules`
+before relying on it, and do not record "an alert exists" off this file.
+
 ### Instrument gap to know about
 
 There is **no Postgres exporter for the paperclip database**. `pg_stat_activity_*`

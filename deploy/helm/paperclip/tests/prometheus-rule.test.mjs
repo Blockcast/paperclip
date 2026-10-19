@@ -721,6 +721,49 @@ test("PaperclipPrReviewQueueWaitSaturated uses the bounded p95 histogram and run
   assert.match(rendered, /alert: PaperclipPrReviewQueueWaitSaturated[\s\S]*?runbook_url: "[^\"]*runbooks\/pr-review-queue-wait\.md"/);
 });
 
+test("PaperclipOrphanReapWaitBoundExceeded reads a ratio on ONE window and links its runbook (PEN-4380)", () => {
+  const rendered = renderChart(["--show-only", "templates/prometheusrule.yaml", "--set", "prometheusRule.enabled=true"]);
+  assert.match(rendered, /alert: PaperclipOrphanReapWaitBoundExceeded/);
+
+  // Both arms MUST share one window. A numerator and denominator measured over
+  // different spans are not a share of anything, and the failure is silent --
+  // the rule still renders and still fires, just on a number that means nothing.
+  // Asserted as one pattern spanning both `rate(...)` calls so a future edit
+  // cannot move one window without this failing.
+  assert.match(
+    rendered,
+    /sum\(rate\(paperclip_agent_start_lock_reap_disposition_total\{disposition="timed_out"\}\[30m\]\)\)\s*\/\s*sum\(rate\(paperclip_agent_start_lock_reap_disposition_total\[30m\]\)\)/,
+  );
+
+  // The threshold and hold are the separation lever, not cosmetics: the benign
+  // band peaked at 0.685 and crossed 0.9 only in <=20-minute excursions, so a
+  // lower ratio or a shorter hold reintroduces the false pages this form exists
+  // to avoid. See the values.yaml comments for the measurement.
+  assert.match(rendered, /alert: PaperclipOrphanReapWaitBoundExceeded[\s\S]*?> 0\.9/);
+  assert.match(rendered, /alert: PaperclipOrphanReapWaitBoundExceeded[\s\S]*?for: 45m/);
+
+  assert.match(
+    rendered,
+    /alert: PaperclipOrphanReapWaitBoundExceeded[\s\S]*?runbook_url: "[^"]*runbooks\/queued-run-stranded\.md#orphan-reap-wait-bound-exceeded-pen-4380"/,
+  );
+
+  // The anchor the runbook_url points at must actually exist, or the alert sends
+  // a responder to the top of a 1400-line file.
+  const runbook = readFileSync(path.resolve(repoRoot, "runbooks/queued-run-stranded.md"), "utf8");
+  assert.match(runbook, /^## Orphan reap wait bound exceeded \(PEN-4380\)$/m);
+
+  // PEN-4380 / Ally important 1: merging this chart does NOT make the alert live
+  // on Blockcast (`prometheusRule.enabled: false` there). Every neighbouring
+  // runbook section carries that caveat; this one must too, so nobody records
+  // "an alert exists" off a rule that does not deploy.
+  const section = runbook.slice(runbook.indexOf("## Orphan reap wait bound exceeded (PEN-4380)"));
+  assert.match(
+    section.slice(0, section.indexOf("\n## ") === -1 ? undefined : section.indexOf("\n## ")),
+    /prometheusRule\.enabled.*false|onprem-k8s lockstep/s,
+    "the PEN-4380 runbook section must carry the onprem-k8s lockstep caveat",
+  );
+});
+
 test("PaperclipRuntimeResourceReconciliationStuck pins both backlog gauges and the worker-down backstop (BLO-21460)", () => {
   const rendered = renderChart(["--set", "prometheusRule.enabled=true"]);
 

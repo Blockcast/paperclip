@@ -117,6 +117,14 @@ platform cannot resolve automatically. Each runbook should be:
   incident would otherwise be invisible precisely because it was handled.
   Trigger: alert `PaperclipAgentStartLockAborted`, or
   `increase(paperclip_agent_start_lock_aborted_total[1h]) > 0`.
+- [`queued-run-stranded.md#orphan-reap-wait-bound-exceeded-pen-4380`](queued-run-stranded.md#orphan-reap-wait-bound-exceeded-pen-4380) —
+  `PaperclipOrphanReapWaitBoundExceeded`: most start-lock dispatch passes are
+  giving up on the fleet-wide orphan reap at its 120s wait bound and dispatching
+  on stale orphan state. One hop away from the two entries above — the reap runs
+  INSIDE the start lock — but a different fault: the sweep is still running and
+  still finishing, just not inside the bound. The lever is sweep duration; do NOT
+  raise the bound. ⚠️ The chart copy does not deploy on Blockcast
+  (`prometheusRule.enabled: false`), so this alert needs the onprem-k8s port too.
 - [`queued-run-stranded.md#overdue-scheduled-retry-blo-22094`](queued-run-stranded.md#overdue-scheduled-retry-blo-22094) —
   a `heartbeat_runs` row parked at `status='scheduled_retry'` past its own due
   time, never promoted: the retry-promotion sweep either wedged or is

@@ -1638,6 +1638,13 @@ spec:
           # the reap failing to finish inside it, NOT on the bound being too
           # low. Do not "fix" a firing instance by raising the bound.
           #
+          # ⚠️ This rule does NOT deploy on Blockcast: `prometheusRule.enabled`
+          # is false in values.blockcast.yaml. Landing it here is necessary and
+          # NOT sufficient -- it must also be ported to the two lockstep
+          # Blockcast/onprem-k8s alert files, as PaperclipAgentStartLockWedged
+          # was under PEN-3338. Do not report "the alert exists" off this file;
+          # verify at /api/v1/rules.
+          #
           # Why this reads a RATIO and not `rate(...{disposition="timed_out"})
           # > 0`, which is the form PEN-4380 originally asked for: that form is
           # not quiet. Measured over the 7 days to 2026-10-19, `timed_out` was
