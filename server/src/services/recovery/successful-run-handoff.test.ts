@@ -338,6 +338,32 @@ describe("successful run handoff decision", () => {
     });
   });
 
+  // BLO-47468: a PR-event wake that only commented leaves the checkout restore
+  // marker in place; the deferred restore owns the disposition.
+  it("does not queue for a PR-event wake that made no status write", () => {
+    expect(decide({
+      run: { ...run, contextSnapshot: { issueId: "issue-1", wakeReason: "github_pr_review_submitted" } } as any,
+      issue: { ...issue, checkoutRestoreStatus: "todo" } as any,
+    })).toEqual({
+      kind: "skip",
+      reason: "PR-event wake made no status write; checkout restore owns the disposition",
+    });
+  });
+
+  it("still queues for a PR-event wake whose run explicitly wrote in_progress", () => {
+    expect(decide({
+      run: { ...run, contextSnapshot: { issueId: "issue-1", wakeReason: "github_pr_closed" } } as any,
+      issue: { ...issue, checkoutRestoreStatus: null } as any,
+    }).kind).toBe("enqueue");
+  });
+
+  it("still queues for a non-PR wake that made no status write", () => {
+    expect(decide({
+      run: { ...run, contextSnapshot: { issueId: "issue-1", wakeReason: "issue_assigned" } } as any,
+      issue: { ...issue, checkoutRestoreStatus: "todo" } as any,
+    }).kind).toBe("enqueue");
+  });
+
   it("queues a status-only handoff for a preserved missing-Job PR review outcome", () => {
     const decision = decide({
       run: {
