@@ -422,16 +422,18 @@ describeEmbeddedPostgres("successful run handoff liveness", () => {
       return id;
     }
 
-    it("resolves once a later run for the issue finishes successfully", async () => {
+    it("does not resolve on a later successful run alone", async () => {
+      // A run that reaches the decision writes its own row; the only later runs
+      // that leave `required` newest are early-return ones (corrective, comment,
+      // monitor wakes). Crediting them would hide the strand the reconciler chases.
       const { companyId, agentId, issueId } = await seed();
-      const laterRunId = await insertFinishedRun(companyId, agentId, issueId, "succeeded", hoursAgo(1));
+      await insertFinishedRun(companyId, agentId, issueId, "succeeded", hoursAgo(1));
 
       const state = await projectFor(companyId, issueId, hoursAgo(2));
 
-      expect(state.state).toBe("resolved");
-      expect(state.required).toBe(false);
-      expect(state.resolvedByContinuation).toBe("later_run");
-      expect(state.resolvedByRunId).toBe(laterRunId);
+      expect(state.state).toBe("required");
+      expect(state.required).toBe(true);
+      expect(state.resolvedByContinuation).toBeUndefined();
     });
 
     it("resolves once the issue has a pending interaction", async () => {
@@ -470,15 +472,20 @@ describeEmbeddedPostgres("successful run handoff liveness", () => {
 
       await db.update(issues).set({ monitorNextCheckAt: hoursAgo(-1) }).where(eq(issues.id, issueId));
       expect((await projectFor(companyId, issueId, hoursAgo(2))).resolvedByContinuation).toBe("monitor");
+
+      // A monitor only fires on in_progress / in_review: a future one on a blocked row wakes nobody.
+      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, issueId));
+      expect((await projectFor(companyId, issueId, hoursAgo(2))).state).toBe("required");
     });
 
     it("leaves a genuinely stranded handoff required", async () => {
-      // No later run, only the source run and an earlier one, a failed later run,
-      // a decided approval, a non-pending interaction: nothing carries the issue.
+      // Later runs (incl. a succeeded non-source one), a decided approval, a
+      // non-pending interaction: no live review path carries the issue.
       const { companyId, agentId, issueId } = await seed();
       const sourceRunId = await insertFinishedRun(companyId, agentId, issueId, "succeeded", hoursAgo(1));
       await insertFinishedRun(companyId, agentId, issueId, "succeeded", hoursAgo(3));
       await insertFinishedRun(companyId, agentId, issueId, "failed", hoursAgo(1));
+      await insertFinishedRun(companyId, agentId, issueId, "succeeded", hoursAgo(0.5));
       const [approval] = await db
         .insert(approvals)
         .values({ companyId, type: "request_board_approval", status: "revision_requested", payload: { title: "x" } })
