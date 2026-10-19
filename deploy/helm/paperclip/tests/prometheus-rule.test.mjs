@@ -2819,7 +2819,36 @@ test("the project-checkout origin alerts gate on their own positive control (PEN
   );
 });
 
-test("the three checkout-origin descriptions fit the Slack relay's 400-char lead", () => {
+/**
+ * Replace every `{{ ... }}` in an alert lead with a stand-in of the length the
+ * value will have when Prometheus expands it, so a lead can be measured at
+ * fire time rather than as stored.
+ *
+ * The length is only knowable because this chart's description placeholders
+ * are all UUID-valued ids. That assumption is the fragile part, so it is
+ * enforced rather than documented: a placeholder outside the known set fails
+ * here instead of being silently measured at 36 chars. An agent name or a
+ * repo URL is unbounded, and quietly standing one in at UUID width would
+ * restore exactly the under-measurement this helper exists to remove.
+ */
+const UUID_VALUED_LABELS = new Set(["project_workspace_id", "project_id", "company_id"]);
+const UUID_WIDTH = 36; // 8-4-4-4-12 + 4 hyphens
+
+function expandLabelPlaceholders(lead, alertName) {
+  return lead.replace(/\{\{[^}]*\}\}/g, (placeholder) => {
+    const label = placeholder.match(/\$labels\.([A-Za-z_][A-Za-z0-9_]*)/)?.[1];
+    assert.ok(
+      label && UUID_VALUED_LABELS.has(label),
+      `${alertName}: cannot measure the fire-time lead -- ${placeholder} is not a known `
+        + `UUID-valued label. Add it to UUID_VALUED_LABELS only if its value is genuinely `
+        + `bounded at ${UUID_WIDTH} chars; if it is unbounded (an agent name, a repo URL, a `
+        + `cwd) it does not belong in a lead paragraph that Slack truncates at all.`,
+    );
+    return "0".repeat(UUID_WIDTH);
+  });
+}
+
+test("the three checkout-origin descriptions fit the Slack relay's 400-char lead at FIRE TIME", () => {
   // The relay forwards only the first blank-line-delimited paragraph of a
   // description, whitespace-collapsed and truncated at 400 chars (onprem-k8s
   // monitoring/alertmanager-slack-relay.yaml, `lead_paragraph` /
@@ -2853,11 +2882,21 @@ test("the three checkout-origin descriptions fit the Slack relay's 400-char lead
     // The rendered scalar is double-quoted with the paragraph breaks still
     // escaped, so they have to come back before the lead can be split off.
     const description = raw.replace(/\\n/g, "\n");
-    const lead = description.trim().split("\n\n", 1)[0].split(/\s+/).join(" ");
+    const rawLead = description.trim().split("\n\n", 1)[0].split(/\s+/).join(" ");
+
+    // Measure what Slack will actually receive, not what the chart stores.
+    // `{{ $labels.x }}` is still a template here; Prometheus expands it when
+    // the alert fires, and every expansion in these three leads is a UUID --
+    // so the stored text UNDER-measures the real lead. Substituting a 36-char
+    // sentinel turns this from a test that documents the gap into one that
+    // closes it: PaperclipProjectCheckoutOriginMismatch carries three
+    // placeholders worth 82 chars and expands to 108, so its true lead is
+    // 351, not the 325 the raw scalar reports. Ally caught this on #2798.
+    const lead = expandLabelPlaceholders(rawLead, name);
 
     assert.ok(
       lead.length <= DESC_LEAD_MAX,
-      `${name}: Slack lead is ${lead.length} chars, over the ${DESC_LEAD_MAX} cap -- break the description at a sentence boundary with a blank line. Lead: ${lead}`,
+      `${name}: Slack lead is ${lead.length} chars at fire time, over the ${DESC_LEAD_MAX} cap -- break the description at a sentence boundary with a blank line. Lead: ${lead}`,
     );
   }
 });
