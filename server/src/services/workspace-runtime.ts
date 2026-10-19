@@ -2757,6 +2757,26 @@ export async function ensureGitWorktreeBranchCoherent(input: {
   const expectedBranchName = input.expectedBranchName?.trim();
   if (!expectedBranchName) return { branchName: null, reconciledForward: false, warnings: [] };
 
+  // BLO-47493: a worktree dir whose `.git` file is gone is still nested inside the
+  // main checkout, so every git call below would walk up and read (and the repair
+  // would commit and check out) the MAIN checkout. Refuse before any git runs there.
+  const worktreeTopLevel = await runGit(["rev-parse", "--show-toplevel"], input.worktreePath).catch(() => null);
+  const resolvedWorktreePath = await resolvePathForWorktreeComparison(input.worktreePath);
+  if (worktreeTopLevel && path.resolve(worktreeTopLevel) !== resolvedWorktreePath) {
+    throw new WorkspaceRuntimeValidationFailure(
+      `Execution workspace git worktree at "${input.worktreePath}" resolves to repository root "${worktreeTopLevel}" (its .git link is missing), so branch repair was refused and no git writes were made.`,
+      {
+        workspaceValidation: {
+          reason: "wrong_repository_root",
+          worktreePath: input.worktreePath,
+          resolvedRepositoryRoot: worktreeTopLevel,
+          repoRoot: input.repoRoot,
+          expectedBranch: expectedBranchName,
+        },
+      },
+    );
+  }
+
   const currentBranch = input.actualBranchName !== undefined
     ? input.actualBranchName
     : await runGit(["symbolic-ref", "--quiet", "--short", "HEAD"], input.worktreePath).catch(() => null);
