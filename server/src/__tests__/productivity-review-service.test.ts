@@ -5719,6 +5719,9 @@ describeEmbeddedPostgres("productivity review service", () => {
     const [review] = await listProductivityReviews(seeded.companyId);
     expect(review?.description).toContain("overdue-undispatched");
     expect(review?.description).toContain("no due time recorded");
+    // The trigger note must agree with the evidence line: the run is still
+    // stuck behind the park, not "no longer blocked" (Ally, #2834).
+    expect(review?.description).not.toContain("no longer blocked");
   });
 
   it("BLO-24149 AC3: does not treat a promoted-and-claimed park as no-executable-turn time — a run that reached startedAt gave the assignee a real turn", async () => {
