@@ -3004,9 +3004,16 @@ describeEmbeddedPostgres("productivity review service", () => {
     agentId: string;
     issueId: string;
     createdAt: Date;
-    scheduledRetryAt: Date;
+    // BLO-24149: nullable so a fixture can model a park carrying no due time
+    // at all — an unverifiable promise, which the classifier must read as
+    // broken rather than as an indefinite reason for silence.
+    scheduledRetryAt: Date | null;
     scheduledRetryReason?: string | null;
     errorCode?: string | null;
+    status?: "scheduled_retry" | "running";
+    // BLO-24149: a park row that was since promoted and claimed. Genuine turn
+    // time, so it must NOT be attributed to the no-executable-turn bucket.
+    startedAt?: Date | null;
     id?: string;
   }) {
     const runId = input.id ?? randomUUID();
@@ -3014,10 +3021,11 @@ describeEmbeddedPostgres("productivity review service", () => {
       id: runId,
       companyId: input.companyId,
       agentId: input.agentId,
-      status: "scheduled_retry",
+      status: input.status ?? "scheduled_retry",
       invocationSource: "automation",
       triggerDetail: "system",
-      errorCode: input.errorCode ?? "rate_limit_exhausted",
+      errorCode: input.errorCode === undefined ? "rate_limit_exhausted" : input.errorCode,
+      startedAt: input.startedAt ?? null,
       scheduledRetryAt: input.scheduledRetryAt,
       scheduledRetryAttempt: 0,
       scheduledRetryReason: input.scheduledRetryReason ?? "ccrotate_capacity",
@@ -3148,6 +3156,179 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(review?.description).toContain("fleet-capacity signal, not assignee inactivity");
     expect(review?.description).toContain(`run \`${runId}\``);
     expect(review?.description).toContain(`No-executable-turn accounting:`);
+  });
+
+  // BLO-24149 AC3 — three-way discrimination of the stranded shape.
+  //
+  // An `in_progress` issue with a lapsed monitor and no active run has three
+  // causes with OPPOSITE remedies, and the monitor fields cannot tell them
+  // apart. `scheduledRetry` is the (a)-vs-(b) disambiguator; the park's own
+  // due time is the (b)-vs-(c) one. Crucially, `startedAt` is the
+  // DB-readable stand-in for "was a pod ever created" — which is what makes
+  // state (c) detectable without the manual pod census the AC forbids.
+  //
+  //   (a) genuinely unscheduled     -> no park row at all; needs a re-arm
+  //   (b) parked, horizon FUTURE    -> "scheduled at <ts>"; re-arming is
+  //                                    actively wasteful (the wake coalesces
+  //                                    into the park and spends an attempt)
+  //   (c) parked, horizon PASSED,
+  //       never invoked             -> "overdue-undispatched"; needs
+  //                                    intervention, and the elapsed time is
+  //                                    NOT the assignee's fault
+  //
+  // These fixtures use `transient_failure`, deliberately NOT the capacity
+  // class: it is `scheduleBoundedRetryForRun`'s default label and was 484 of
+  // 700 fleet parks on 2026-08-19, so it is the dominant real-world shape and
+  // the one the pre-BLO-24149 classifier dropped on the floor entirely.
+
+  it("BLO-24149 AC3(b): treats a future-horizon non-capacity park as scheduled, suppressing long_active_duration rather than billing the wait to the assignee", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const episodeStart = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStart });
+    const scheduledRetryAt = new Date(now.getTime() + 4 * 60 * 60 * 1000);
+    await insertCapacityScheduledRetryRun({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      createdAt: episodeStart,
+      scheduledRetryAt,
+      // The dominant real-world park class, and NOT the capacity class the
+      // pre-fix classifier special-cased.
+      scheduledRetryReason: "transient_failure",
+      errorCode: null,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    // Pre-fix this returned 1: a non-capacity park classified as `null`, so
+    // none of the 7h was recognized as no-executable-turn time and the whole
+    // wait was attributed to the assignee.
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  it("BLO-24149 AC3(c): fires on an overdue, never-invoked non-capacity park and names it overdue-undispatched, attributing the wait to dispatch rather than the assignee", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const episodeStart = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStart });
+    const scheduledRetryAt = new Date(now.getTime() - 90 * 60 * 1000);
+    const { runId } = await insertCapacityScheduledRetryRun({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      createdAt: episodeStart,
+      scheduledRetryAt,
+      scheduledRetryReason: "transient_failure",
+      errorCode: null,
+      // The state that reads healthy on every monitor field: the scheduler
+      // promised a turn, the horizon passed, and nothing ever ran.
+      startedAt: null,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    // Still reviewable — BLO-22331's no-indefinite-suppression guard must keep
+    // holding for this widened mechanism, or a park past its own due time
+    // would buy silence forever.
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+    // (c) must be distinguishable from (b) in the evidence text, not left for
+    // a reader to derive by comparing a timestamp to the clock.
+    expect(review?.description).toContain("overdue-undispatched");
+    expect(review?.description).toContain(scheduledRetryAt.toISOString());
+    expect(review?.description).toContain("retry park");
+    expect(review?.description).toContain(`run \`${runId}\``);
+    // Attribution: never the assignee, and never the capacity-specific
+    // wording — this park class is not evidence of a seat-pool outage.
+    expect(review?.description).toContain("not assignee inactivity");
+    expect(review?.description).not.toContain("fleet-capacity signal");
+  });
+
+  it("BLO-24149 AC3(c): reads a park carrying no due time at all as overdue-undispatched, since an unverifiable promise must not buy silence", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const episodeStart = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStart });
+    await insertCapacityScheduledRetryRun({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      createdAt: episodeStart,
+      scheduledRetryAt: null,
+      scheduledRetryReason: "transient_failure",
+      errorCode: null,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("overdue-undispatched");
+    expect(review?.description).toContain("no due time recorded");
+  });
+
+  it("BLO-24149 AC3: does not treat a promoted-and-claimed park as no-executable-turn time — a run that reached startedAt gave the assignee a real turn", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const episodeStart = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStart });
+    await insertCapacityScheduledRetryRun({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      createdAt: episodeStart,
+      // Future horizon, so if this were mis-read as a live park it would
+      // suppress the review exactly as AC3(b) above does.
+      scheduledRetryAt: new Date(now.getTime() + 4 * 60 * 60 * 1000),
+      scheduledRetryReason: "transient_failure",
+      errorCode: null,
+      status: "running",
+      // ...but it was promoted and claimed, so the assignee did get a turn.
+      startedAt: episodeStart,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+    // No park claim of either flavour: this is ordinary elapsed time.
+    expect(review?.description).not.toContain("overdue-undispatched");
+    expect(review?.description).not.toContain("retry park");
+  });
+
+  it("BLO-24149 AC3(a): leaves a genuinely unscheduled strand unqualified by any park claim", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const episodeStart = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({ status: "in_progress", startedAt: episodeStart });
+    // No park row at all — the original BLO-24149 defect shape: nothing is
+    // scheduled and nothing claims otherwise.
+    const [issueRow] = await db.select().from(issues).where(eq(issues.id, seeded.issueId));
+    expect(issueRow?.executionRunId).toBeNull();
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+    // Must not claim a scheduled path that does not exist — the false
+    // reassurance that would talk a reviewer out of re-arming.
+    expect(review?.description).not.toContain("scheduled at");
+    expect(review?.description).not.toContain("overdue-undispatched");
   });
 
   it("surfaces the no-executable-turn bucket in evidence and does not let long_active_duration ride along when a different trigger fires (BLO-23248 AC, generalized by BLO-23624)", async () => {
