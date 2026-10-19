@@ -1447,8 +1447,10 @@ describe("buildJobManifest", () => {
       const container = job.spec?.template?.spec?.containers[0];
       const env = new Map(container?.env?.map((entry) => [entry.name, entry.value]));
       expect(container?.workingDir).toBe("/paperclip/shared-workspace");
-      expect(env.get("HOME")).toBe("/paperclip");
-      expect(env.get("TMPDIR")).toBeUndefined();
+      // BLO-47526: shared runs keep the handed checkout but get agent-scoped roots.
+      expect(env.get("HOME")).toBe("/paperclip/instances/default/data/k8s-isolation/co1/agent-abc/agent-sharedagent-abc/home");
+      expect(env.get("CLAUDE_CONFIG_DIR")).toBe("/paperclip/instances/default/data/k8s-isolation/co1/agent-abc/agent-sharedagent-abc/home/.claude");
+      expect(env.get("TMPDIR")).toBe("/paperclip/instances/default/data/k8s-isolation/co1/agent-abc/agent-sharedagent-abc/tmp");
       expect(job.metadata?.labels?.["paperclip.io/isolation-mode"]).toBe("shared");
       expect(job.metadata?.labels?.["paperclip.io/isolation-key"]).toBe("agent-sharedagent-abc");
     });
@@ -4688,18 +4690,35 @@ describe("scoped writable mounts (BLO-32734)", () => {
     expect(result.scopedWritableDirs).toContain(`/paperclip/${covering?.subPath ?? ""}`);
   });
 
-  // The residual, pinned deliberately: a shared-isolation run has no per-run
-  // roots to derive a scope from (HOME falls back to /paperclip itself), so it
-  // keeps today's broad rw mount. Narrowing it needs the roots to exist first.
-  it("keeps the broad rw mount for a shared-isolation run", () => {
-    const ctx = makeCtx();
+  // BLO-47526: the shared runtime branch is the server's default exit for any
+  // run without an isolated workspace. It used to keep the broad rw mount, which
+  // left `/paperclip/.mcp.json` (server-read, baked into every agent's MCP
+  // config) and every company's instruction bundles writable. It must narrow.
+  it("narrows the data mount for a shared-isolation run (BLO-47526)", () => {
+    const ctx = makeCtx({ context: { paperclipWorkspace: { cwd: "/paperclip/instances/default/projects/co1/p1/_default" } } });
     setRuntimeIsolation(ctx, { isolationMode: "shared", isolationKey: "agent-shared:agent-abc" });
     const result = buildJobManifest({ ctx, selfPod: makeSelfPod() });
-    const main = result.job.spec?.template?.spec?.containers[0]?.volumeMounts ?? [];
-    const parent = main.find((m) => m.mountPath === "/paperclip");
-    expect(parent?.readOnly).toBeFalsy();
-    expect(main.filter((m) => m.subPath)).toEqual([]);
-    expect(result.scopedWritableDirs).toEqual([]);
+    const container = result.job.spec?.template?.spec?.containers[0];
+    const main = container?.volumeMounts ?? [];
+    expect(main.find((m) => m.mountPath === "/paperclip" && !m.subPath)?.readOnly).toBe(true);
+    const rw = main.filter((m) => m.subPath).map((m) => m.mountPath);
+    // The handed shared checkout stays the cwd and stays writable...
+    expect(container?.workingDir).toBe("/paperclip/instances/default/projects/co1/p1/_default");
+    expect(rw).toContain("/paperclip/instances/default/projects/co1/p1/_default");
+    expect(rw).toContain("/paperclip/instances/default/data/k8s-isolation/co1/agent-abc/agent-sharedagent-abc/home");
+    // ...and nothing re-opens the data root, its `.mcp.json`, or a foreign bundle.
+    for (const mountPath of rw) {
+      expect(mountPath).not.toBe("/paperclip");
+      expect(mountPath.startsWith("/paperclip/instances/default/companies/")).toBe(false);
+    }
+    expect(result.job.metadata?.annotations?.["paperclip.io/data-mount-scope"]).toBe("scoped");
+  });
+
+  it("gives a shared run with no handed cwd a private workspace, never the data root", () => {
+    const ctx = makeCtx({ context: { paperclipWorkspace: { cwd: "/paperclip" } } });
+    setRuntimeIsolation(ctx, { isolationMode: "shared", isolationKey: "agent-shared:agent-abc" });
+    const { job } = buildJobManifest({ ctx, selfPod: makeSelfPod() });
+    expect(job.spec?.template?.spec?.containers[0]?.workingDir).toBe("/paperclip/instances/default/data/k8s-isolation/co1/agent-abc/agent-sharedagent-abc/workspace");
   });
 
   // The three broad-rw fallbacks above are SILENT by construction: whether a
@@ -4724,9 +4743,8 @@ describe("scoped writable mounts (BLO-32734)", () => {
         .filter((entry) => entry?.event === "claude_k8s.data_mount_broad_rw");
     }
 
-    it("isolation_disabled — a shared-isolation run", () => {
+    it("isolation_disabled — a config-only run with no runtime descriptor", () => {
       const ctx = makeCtx();
-      setRuntimeIsolation(ctx, { isolationMode: "shared", isolationKey: "agent-shared:agent-abc" });
       const { job } = buildJobManifest({ ctx, selfPod: makeSelfPod() });
       expect(job.metadata?.annotations?.[SCOPE_ANNOTATION]).toBe("broad:isolation_disabled");
       const entries = broadRwWarnings();
