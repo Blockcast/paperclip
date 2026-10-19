@@ -46,7 +46,7 @@ type HeartbeatRunRow = typeof heartbeatRuns.$inferSelect;
 type IssueRow = Pick<
   typeof issues.$inferSelect,
   "id" | "companyId" | "identifier" | "title" | "status" | "workMode" | "assigneeAgentId" | "assigneeUserId" | "executionState"
->;
+> & Partial<Pick<typeof issues.$inferSelect, "checkoutRestoreStatus">>;
 type AgentRow = Pick<typeof agents.$inferSelect, "id" | "companyId" | "status">;
 type NoticeIssue = Pick<typeof issues.$inferSelect, "id" | "identifier" | "title" | "status">;
 type NoticeRun = Pick<typeof heartbeatRuns.$inferSelect, "id" | "status">;
@@ -321,6 +321,10 @@ function isGithubPrReviewRun(run: HeartbeatRunRow) {
   return reviewKind === "pr_review";
 }
 
+function isGithubPrEventWake(run: HeartbeatRunRow) {
+  return Boolean(readString(readRecord(run.contextSnapshot).wakeReason)?.startsWith("github_pr_"));
+}
+
 function hasPreservedMissingJobOutcome(run: HeartbeatRunRow) {
   if (!run.resultJson || typeof run.resultJson !== "object" || Array.isArray(run.resultJson)) return false;
   const recovery = (run.resultJson as Record<string, unknown>).externalLifecycleRecovery;
@@ -448,6 +452,14 @@ export function decideSuccessfulRunHandoff(input: {
   }
   if (issue.assigneeUserId) return { kind: "skip", reason: "issue is human-owned" };
   if (issue.status !== "in_progress") return { kind: "skip", reason: `issue status ${issue.status} is a valid disposition` };
+  // BLO-47468: a PR-event wake ("review submitted", "PR closed", ...) usually
+  // only comments and exits. Any status write clears `checkoutRestoreStatus`,
+  // so a surviving marker proves the run made none — the caller's deferred
+  // checkout restore puts the issue back where it was before checkout, which
+  // is the disposition, instead of a corrective wake asking for one.
+  if (isGithubPrEventWake(run) && issue.checkoutRestoreStatus) {
+    return { kind: "skip", reason: "PR-event wake made no status write; checkout restore owns the disposition" };
+  }
   if (issue.executionState) return { kind: "skip", reason: "issue has execution policy state" };
   if (input.isRoutineReceiverParent) return { kind: "skip", reason: "issue is a routine receiver parent" };
   if (agent.status === "paused" || agent.status === "terminated" || agent.status === "pending_approval") {
