@@ -1,7 +1,16 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
-import { agents, companies, createDb, heartbeatRuns, issues } from "@paperclipai/db";
+import {
+  agents,
+  approvals,
+  companies,
+  createDb,
+  heartbeatRuns,
+  issueApprovals,
+  issueThreadInteractions,
+  issues,
+} from "@paperclipai/db";
 import type { SuccessfulRunHandoffState } from "@paperclipai/shared";
 import {
   getEmbeddedPostgresTestSupport,
@@ -9,6 +18,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import {
   hydrateSuccessfulRunHandoffLiveness,
+  resolveSuccessfulRunHandoffForLaterContinuation,
   resolveSuccessfulRunHandoffForTerminalIssues,
   SUCCESSFUL_RUN_HANDOFF_UNSTARTED_RUN_LIVENESS_MS,
 } from "../services/successful-run-handoff-state.js";
@@ -360,6 +370,133 @@ describeEmbeddedPostgres("successful run handoff liveness", () => {
       expect(state.state).toBe("resolved");
       expect(state.hasLiveContinuation).toBe(false);
       expect(state.liveRunId).toBeNull();
+    });
+  });
+  /**
+   * BLO-47584. The corrective run's own completion short-circuits
+   * `decideSuccessfulRunHandoff` at "source run is already a corrective handoff
+   * run", which is not a valid-path skip, so nothing ever wrote `resolved`: a
+   * handoff stayed `required` after the issue had visibly moved on (BLO-31103,
+   * BLO-23371 for 51 days).
+   */
+  describe("later continuation", () => {
+    afterEach(async () => {
+      await db.delete(issueThreadInteractions);
+      await db.delete(issueApprovals);
+      await db.delete(approvals);
+    });
+
+    async function projectFor(companyId: string, issueId: string, requiredAt: Date, sourceRunId: string | null = null) {
+      const states = new Map<string, SuccessfulRunHandoffState>([
+        [
+          issueId,
+          {
+            state: "required",
+            required: true,
+            hasLiveContinuation: false,
+            sourceRunId,
+            correctiveRunId: null,
+            assigneeAgentId: null,
+            detectedProgressSummary: null,
+            createdAt: requiredAt,
+          } satisfies SuccessfulRunHandoffState,
+        ],
+      ]);
+      await resolveSuccessfulRunHandoffForLaterContinuation(db, companyId, states);
+      await hydrateSuccessfulRunHandoffLiveness(db, companyId, states);
+      return states.get(issueId)!;
+    }
+
+    async function insertFinishedRun(companyId: string, agentId: string, issueId: string, status: string, finishedAt: Date) {
+      const id = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id,
+        companyId,
+        agentId,
+        status,
+        createdAt: new Date(finishedAt.getTime() - 60_000),
+        startedAt: new Date(finishedAt.getTime() - 60_000),
+        finishedAt,
+        contextSnapshot: { issueId },
+      });
+      return id;
+    }
+
+    it("resolves once a later run for the issue finishes successfully", async () => {
+      const { companyId, agentId, issueId } = await seed();
+      const laterRunId = await insertFinishedRun(companyId, agentId, issueId, "succeeded", hoursAgo(1));
+
+      const state = await projectFor(companyId, issueId, hoursAgo(2));
+
+      expect(state.state).toBe("resolved");
+      expect(state.required).toBe(false);
+      expect(state.resolvedByContinuation).toBe("later_run");
+      expect(state.resolvedByRunId).toBe(laterRunId);
+    });
+
+    it("resolves once the issue has a pending interaction", async () => {
+      const { companyId, issueId } = await seed();
+      await db.insert(issueThreadInteractions).values({
+        companyId,
+        issueId,
+        kind: "request_confirmation",
+        status: "pending",
+        payload: { version: 1, prompt: "ok?" } as never,
+      });
+
+      const state = await projectFor(companyId, issueId, hoursAgo(2));
+
+      expect(state.state).toBe("resolved");
+      expect(state.resolvedByContinuation).toBe("pending_interaction");
+    });
+
+    it("resolves once the issue has a linked pending approval", async () => {
+      const { companyId, issueId } = await seed();
+      const [approval] = await db
+        .insert(approvals)
+        .values({ companyId, type: "request_board_approval", status: "pending", payload: { title: "x" } })
+        .returning({ id: approvals.id });
+      await db.insert(issueApprovals).values({ companyId, issueId, approvalId: approval!.id });
+
+      const state = await projectFor(companyId, issueId, hoursAgo(2));
+
+      expect(state.resolvedByContinuation).toBe("pending_approval");
+    });
+
+    it("resolves once the issue has a monitor due in the future, but not an overdue one", async () => {
+      const { companyId, issueId } = await seed();
+      await db.update(issues).set({ monitorNextCheckAt: hoursAgo(1) }).where(eq(issues.id, issueId));
+      expect((await projectFor(companyId, issueId, hoursAgo(2))).state).toBe("required");
+
+      await db.update(issues).set({ monitorNextCheckAt: hoursAgo(-1) }).where(eq(issues.id, issueId));
+      expect((await projectFor(companyId, issueId, hoursAgo(2))).resolvedByContinuation).toBe("monitor");
+    });
+
+    it("leaves a genuinely stranded handoff required", async () => {
+      // No later run, only the source run and an earlier one, a failed later run,
+      // a decided approval, a non-pending interaction: nothing carries the issue.
+      const { companyId, agentId, issueId } = await seed();
+      const sourceRunId = await insertFinishedRun(companyId, agentId, issueId, "succeeded", hoursAgo(1));
+      await insertFinishedRun(companyId, agentId, issueId, "succeeded", hoursAgo(3));
+      await insertFinishedRun(companyId, agentId, issueId, "failed", hoursAgo(1));
+      const [approval] = await db
+        .insert(approvals)
+        .values({ companyId, type: "request_board_approval", status: "revision_requested", payload: { title: "x" } })
+        .returning({ id: approvals.id });
+      await db.insert(issueApprovals).values({ companyId, issueId, approvalId: approval!.id });
+      await db.insert(issueThreadInteractions).values({
+        companyId,
+        issueId,
+        kind: "request_confirmation",
+        status: "answered",
+        payload: { version: 1, prompt: "ok?" } as never,
+      });
+
+      const state = await projectFor(companyId, issueId, hoursAgo(2), sourceRunId);
+
+      expect(state.state).toBe("required");
+      expect(state.required).toBe(true);
+      expect(state.resolvedByContinuation).toBeUndefined();
     });
   });
 });
