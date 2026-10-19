@@ -14,10 +14,18 @@ import { fileURLToPath } from "node:url";
 // Two failures have already happened at this seam, and each was invisible to the
 // tests that existed at the time:
 //
-//   1. #1509 shipped the wrapper into ${BASE}/.local/bin, which is prepended to
-//      PATH only by .profile/.bashrc — sourced by *login* shells. Agent tool
-//      harnesses spawn non-login shells, so the merged, deployed, correct
-//      scrubber was never reached.
+//   1. #1509 shipped the wrapper into ${BASE}/.local/bin, which was prepended
+//      to PATH only by .profile/.bashrc. Agent tool harnesses spawn non-login
+//      shells, so the merged, deployed, correct scrubber was never reached.
+//
+//      PEN-4357: do NOT carry "those files only run in login shells" forward as
+//      a general fact — it has not been true since the claude_k8s Job started
+//      setting BASH_ENV/ZDOTDIR to stubs that chain them on EVERY shell start
+//      (see the PEN-3840 block below, and `resolvesThroughDotfile`). Reading
+//      that narrower, once-true observation as general is precisely what left
+//      the same defect live under `bash -c` while the top-level tool shell
+//      measured clean. What remains true about #1509 is the outcome, not the
+//      mechanism: the directory was not on the harness's PATH.
 //   2. #1546 published it to ${BASE}/bin as well, but ${BASE}/bin was put on
 //      PATH only by values.blockcast.yaml. Every other deployment of this chart
 //      still resolved `gh` to the image CLI. The chart tests all rendered *with*

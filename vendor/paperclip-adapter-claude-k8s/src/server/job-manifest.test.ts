@@ -35,6 +35,16 @@ import type { JobIsolation } from "./job-manifest.js";
 import { DEFAULT_CLAUDE_CODE_VERSION } from "./runtime-pin.js";
 import type { SelfPodInfo } from "./k8s-client.js";
 
+// PEN-4357: resolved once, as an absolute path, so the bash-resolution cases
+// below can hand the child an env whose PATH is the Job PATH under test
+// without losing the ability to find bash itself. A host without bash skips
+// those cases honestly rather than passing them vacuously.
+const BASH_BIN = ((): string => {
+  const probe = spawnSync("sh", ["-c", "command -v bash"], { encoding: "utf8" });
+  return probe.status === 0 ? probe.stdout.trim() : "";
+})();
+const itWithBashBin = BASH_BIN ? it : it.skip;
+
 function makeCtx(overrides: Partial<AdapterExecutionContext> = {}): AdapterExecutionContext {
   return {
     runId: "run-abc12345",
@@ -1660,10 +1670,12 @@ describe("buildJobManifest", () => {
       return entry?.value ?? result.envSecret?.data.PATH ?? "";
     }
 
-    it("prepends the root-owned wrapper directory to an inherited PATH", () => {
+    it("prepends the root-owned wrapper directory to an inherited PATH, tooling behind it", () => {
       selfPod.inheritedEnv = { PATH: "/usr/local/bin:/usr/bin:/bin" };
       const value = pathOf(buildJobManifest({ ctx, selfPod }));
-      expect(value).toBe(`${WRAPPER_BIN}:/usr/local/bin:/usr/bin:/bin`);
+      // PEN-4357: the two $HOME directories the PVC dotfiles would otherwise
+      // prepend to the FRONT are backfilled here instead, behind the lead.
+      expect(value).toBe(`${WRAPPER_BIN}:/paperclip/.local/bin:/paperclip/bin:/usr/local/bin:/usr/bin:/bin`);
     });
 
     it("prepends it to an operator-set PATH too, which the merge does not validate", () => {
@@ -1683,8 +1695,20 @@ describe("buildJobManifest", () => {
       expect(value).toContain("/usr/bin");
     });
 
-    it("is idempotent when the wrapper directory already leads", () => {
-      const already = `${WRAPPER_BIN}:/usr/bin:/bin`;
+    // PEN-4357 turned this from "unchanged on the first build" into "a fixed
+    // point". The first build now legitimately adds the two tooling
+    // directories; what must not happen is adding them again on every
+    // subsequent build, which is the PATH-growth bug the original case existed
+    // to catch. Asserting only the no-op case would no longer catch it.
+    it("reaches a fixed point: rebuilding from its own output changes nothing", () => {
+      selfPod.inheritedEnv = { PATH: `${WRAPPER_BIN}:/usr/bin:/bin` };
+      const once = pathOf(buildJobManifest({ ctx, selfPod }));
+      selfPod.inheritedEnv = { PATH: once };
+      expect(pathOf(buildJobManifest({ ctx, selfPod }))).toBe(once);
+    });
+
+    it("is idempotent when the wrapper directory leads and both tooling directories are present", () => {
+      const already = `${WRAPPER_BIN}:/paperclip/.local/bin:/paperclip/bin:/usr/bin:/bin`;
       selfPod.inheritedEnv = { PATH: already };
       expect(pathOf(buildJobManifest({ ctx, selfPod }))).toBe(already);
     });
@@ -1695,6 +1719,121 @@ describe("buildJobManifest", () => {
       expect(value.split(":")[0]).toBe(WRAPPER_BIN);
       expect(value.split(":").length).toBeGreaterThan(1);
       expect(value).toContain("/usr/bin");
+    });
+
+    // PEN-4357. Every assertion above reads a DECLARED PATH value, and the
+    // defect this suite exists to prevent is created by a shell that runs
+    // AFTER that value is set. The PVC dotfiles (`$HOME/.bashrc`, `.profile`,
+    // `.zshenv` — fleet state, not in this repo) carry a PRESENCE-guarded
+    // prepend of `$HOME/.local/bin` and `$HOME/bin`, and this manifest points
+    // BASH_ENV at a stub that chains them on every non-interactive bash. So an
+    // `env.PATH` that merely OMITS those directories is not neutral: the
+    // stanza puts them at the FRONT, ahead of the root-owned wrappers. The
+    // chart's own `agent-egress-path.test.mjs` runs this stanza, but against
+    // the chart-RENDERED PATH, which carries the tooling directories by
+    // construction; it never sees the Job PATH `buildEnvVars` emits from an
+    // operator-set value. That is the gap these cases close.
+    //
+    // Read the two together. The second is the control: it re-runs the
+    // identical harness on the PATH this code emitted BEFORE the backfill and
+    // requires it to resolve to the agent-writable copy. Without it, a harness
+    // that silently never reached the stanza would pass the first vacuously.
+    const DOTFILE_STANZA = [
+      'case ":$PATH:" in',
+      '  *":$HOME/bin:"*) ;;',
+      '  *) PATH="$HOME/bin:$PATH" ;;',
+      "esac",
+      'case ":$PATH:" in',
+      '  *":$HOME/.local/bin:"*) ;;',
+      '  *) PATH="$HOME/.local/bin:$PATH" ;;',
+      "esac",
+      "export PATH",
+    ].join("\n");
+
+    // The live layer-4 value, measured on an agent pod 2026-10-19: the chart
+    // default with `<base>/.local/bin` swapped for an unrelated directory, so
+    // the entry is absent while the wrapper directory is still present.
+    const LIVE_OPERATOR_PATH =
+      `${WRAPPER_BIN}:/paperclip/opencode-api-key-bin:/paperclip/bin:` +
+      "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+    const emitWithOperatorPath = (value: string): string =>
+      pathOf(
+        buildJobManifest({
+          ctx: { ...ctx, config: { ...(ctx.config as Record<string, unknown>), env: { PATH: value } } },
+          selfPod,
+        }),
+      );
+
+    function resolveUnderDotfiles(emittedPath: string, tool: string): string {
+      const home = mkdtempSync(join(tmpdir(), "pen4357-home-"));
+      const wrapperBin = join(home, "image-wrapper-bin");
+      const imageBin = join(home, "usr-bin");
+      const pvcLocalBin = join(home, ".local", "bin");
+      const pvcBin = join(home, "bin");
+      for (const dir of [wrapperBin, imageBin, pvcLocalBin, pvcBin]) mkdirSync(dir, { recursive: true });
+      const stub = (dir: string, marker: string): void =>
+        writeFileSync(join(dir, tool), `#!/bin/sh\necho ${marker}\n`, { mode: 0o755 });
+      stub(wrapperBin, "image-wrapper");
+      stub(imageBin, "image-cli");
+      // Written on purpose. The assertion must hold because of PATH ORDER, not
+      // because the stale PVC copy happens to have been deleted (PEN-3840 step
+      // 4) — a guarantee that only works once those files are gone re-breaks
+      // the moment anything recreates one.
+      stub(pvcLocalBin, "agent-writable-pvc");
+      stub(pvcBin, "agent-writable-pvc");
+
+      // Re-root the PVC entries onto the temp HOME so the stanza's `$HOME/...`
+      // expansion names these same directories. The wrapper directory is
+      // matched FIRST on purpose: `/usr/local/libexec/paperclip/bin` ends in
+      // `/paperclip/bin`, so a naive substring rewrite would corrupt it.
+      const testPath = emittedPath
+        .split(":")
+        .map((entry) => {
+          if (entry === WRAPPER_BIN) return wrapperBin;
+          if (entry === "/usr/bin") return imageBin;
+          if (entry.startsWith("/paperclip/")) return join(home, entry.slice("/paperclip/".length));
+          return entry;
+        })
+        .join(":");
+
+      writeFileSync(join(home, ".bashrc"), `${DOTFILE_STANZA}\n`);
+      // Same shape as TOOL_RLIMIT_BASHENV: chain $HOME/.bashrc on every shell.
+      writeFileSync(join(home, "bashenv.sh"), 'if [ -r "$HOME/.bashrc" ]; then . "$HOME/.bashrc"; fi\n');
+
+      const result = spawnSync(BASH_BIN, ["-c", `exec ${tool}`], {
+        encoding: "utf8",
+        // SHLVL mirrors what the manifest ships; without it bash can take its
+        // rshd branch and skip $BASH_ENV entirely (see the BLO-34477 suite).
+        env: { HOME: home, PATH: testPath, BASH_ENV: join(home, "bashenv.sh"), SHLVL: "2" },
+      });
+      rmSync(home, { recursive: true, force: true });
+      expect(result.status, result.stderr).toBe(0);
+      return result.stdout.trim();
+    }
+
+    for (const tool of ["gh", "git", "github-mcp-server"]) {
+      itWithBashBin(`${tool} resolves to the root-owned wrapper under bash -c, after the PVC dotfile runs`, () => {
+        expect(resolveUnderDotfiles(emitWithOperatorPath(LIVE_OPERATOR_PATH), tool)).toBe("image-wrapper");
+      });
+    }
+
+    itWithBashBin("control: without the tooling backfill the same harness resolves to the agent-writable copy", () => {
+      const preFix = emitWithOperatorPath(LIVE_OPERATOR_PATH)
+        .split(":")
+        .filter((entry) => entry !== "/paperclip/.local/bin")
+        .join(":");
+      expect(resolveUnderDotfiles(preFix, "gh")).toBe("agent-writable-pvc");
+    });
+
+    // The guarantee must not depend on the operator value being the chart
+    // default — the live one is not. An inherited PATH with neither tooling
+    // directory is the harder case: both stanzas fire.
+    itWithBashBin("holds for an inherited PATH carrying neither tooling directory", () => {
+      selfPod.inheritedEnv = { PATH: "/usr/local/bin:/usr/bin:/bin" };
+      const emitted = pathOf(buildJobManifest({ ctx, selfPod }));
+      expect(emitted.split(":")[0]).toBe(WRAPPER_BIN);
+      expect(resolveUnderDotfiles(emitted, "git")).toBe("image-wrapper");
     });
 
     it("leaves a non-operator, non-sensitive inherited var as a literal", () => {
