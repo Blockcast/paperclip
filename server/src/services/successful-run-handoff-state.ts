@@ -216,11 +216,14 @@ export async function resolveSuccessfulRunHandoffForTerminalIssues(
  * and monitor wakes short-circuit the same way.
  *
  * Same shape as the terminal fold above: a read projection, so history heals on
- * its next read. Resolved when, after the requirement was recorded, a run for the
- * issue other than the source run finished `succeeded`, or the issue now has a live
- * review path (pending interaction, linked `pending` approval, monitor due in the
- * future). `revision_requested` approvals and overdue monitors do not count: they
- * wake nobody, and folding on them would hide a genuinely stranded row.
+ * its next read. Resolved only when the issue now has a live review path (pending
+ * interaction, linked `pending` approval, or a future monitor on an `in_progress` /
+ * `in_review` issue, the only statuses a monitor fires on). A later run alone does
+ * NOT count: a run that reaches the decision writes its own required/resolved row,
+ * so the only later runs that leave this row newest are the early-return ones
+ * (corrective, monitor, PR-review, comment wakes) — exactly the "corrective handoff
+ * still records no disposition" shape the exhausted-handoff reconciler treats as
+ * stranded. `revision_requested` approvals and overdue monitors wake nobody either.
  */
 export async function resolveSuccessfulRunHandoffForLaterContinuation(
   dbOrTx: any,
@@ -231,23 +234,8 @@ export async function resolveSuccessfulRunHandoffForLaterContinuation(
     .filter(([, state]) => state.state === "required")
     .map(([issueId]) => issueId);
   if (requiredIssueIds.length === 0) return states;
-  // Bound the run scan to after the oldest requirement; per-issue cutoffs are applied below.
-  const requiredAtMsList = requiredIssueIds
-    .map((issueId) => states.get(issueId)!.createdAt)
-    .map((value) => (value ? new Date(value).getTime() : Number.NaN))
-    .filter((ms) => !Number.isNaN(ms));
-  const earliestRequiredAt = requiredAtMsList.length > 0 ? new Date(Math.min(...requiredAtMsList)) : null;
 
-  const [laterRuns, interactionRows, approvalRows, monitorRows] = await Promise.all([
-    dbOrTx
-      .select({ id: heartbeatRuns.id, issueId: heartbeatRunIssueId, finishedAt: heartbeatRuns.finishedAt })
-      .from(heartbeatRuns)
-      .where(and(
-        eq(heartbeatRuns.companyId, companyId),
-        eq(heartbeatRuns.status, "succeeded"),
-        inArray(heartbeatRunIssueId, requiredIssueIds),
-        earliestRequiredAt ? gt(heartbeatRuns.finishedAt, earliestRequiredAt) : sql`false`,
-      )),
+  const [interactionRows, approvalRows, monitorRows] = await Promise.all([
     dbOrTx
       .select({ issueId: issueThreadInteractions.issueId })
       .from(issueThreadInteractions)
@@ -271,6 +259,7 @@ export async function resolveSuccessfulRunHandoffForLaterContinuation(
       .where(and(
         eq(issues.companyId, companyId),
         inArray(issues.id, requiredIssueIds),
+        inArray(issues.status, ["in_progress", "in_review"]),
         gt(issues.monitorNextCheckAt, new Date()),
       )),
   ]);
@@ -281,24 +270,9 @@ export async function resolveSuccessfulRunHandoffForLaterContinuation(
   for (const row of interactionRows as Array<{ issueId: string }>) reviewPath.set(row.issueId, "pending_interaction");
 
   for (const issueId of requiredIssueIds) {
-    const state = states.get(issueId)!;
-    const requiredAtMs = state.createdAt ? new Date(state.createdAt).getTime() : Number.NaN;
-    const laterRun = Number.isNaN(requiredAtMs)
-      ? undefined
-      : (laterRuns as Array<{ id: string; issueId: string | null; finishedAt: Date | null }>).find((run) =>
-        run.issueId === issueId
-        && run.id !== state.sourceRunId
-        && run.finishedAt != null
-        && run.finishedAt.getTime() > requiredAtMs);
-    const resolvedByContinuation = laterRun ? "later_run" : reviewPath.get(issueId);
+    const resolvedByContinuation = reviewPath.get(issueId);
     if (!resolvedByContinuation) continue;
-    states.set(issueId, {
-      ...state,
-      state: "resolved",
-      required: false,
-      resolvedByContinuation,
-      ...(laterRun ? { resolvedByRunId: laterRun.id } : {}),
-    });
+    states.set(issueId, { ...states.get(issueId)!, state: "resolved", required: false, resolvedByContinuation });
   }
 
   return states;
