@@ -96,22 +96,34 @@ verbatim, and `events_list` over ns `paperclip` returned 442,601 characters acro
 > measurement. Making the scrubber a credential boundary was considered and declined; the test above
 > records why, and what it would cost.
 
-> **Second scope boundary this file cannot close (PEN-4295) — still OPEN.** The `k8s-ro` tool
-> *surface* is not derivable from this repo. It is set by the upstream server image, its `--read-only
+> **Second scope boundary this file cannot close (PEN-4295).** The `k8s-ro` tool *surface* is not
+> derivable from this repo. It is set by the upstream server image, its `--read-only
 > --disable-destructive` flags and the `disabled_tools` list, all in
-> `Blockcast/onprem-k8s:paperclip/k8s-mcp-stack.yaml`, and the `k8s-ro` gateway upstream map **on
-> that repo's master carries no `tools` allowlist** — unlike the prometheus gateway, whose five-tool
-> allowlist is what actually closed PEN-2735. So an upstream image bump can add a tool, route it
-> through `/k8s-ro`, and leave every test here green. The register holds the two in-repo records in
-> step; it does not watch the image.
+> `Blockcast/onprem-k8s:paperclip/k8s-mcp-stack.yaml`. Nothing here watches the image: the register
+> holds the two in-repo records in step, so an upstream image bump can add a tool, route it through
+> `/k8s-ro`, and leave every test here green.
 >
-> **What will change, and when.** PEN-4295's carrier is onprem-k8s#6135, which is **open and not
-> merged**. Once it merges *and* the gateway pod restarts (the Deployment carries no config-checksum
-> annotation, so the ConfigMap change does not roll it), the upstream map will carry a twelve-tool
-> allowlist matching the table above and `onprem-k8s:scripts/check-k8s-ro-tool-surface.mjs` will
-> redden that repo's build on an image bump, a dropped flag, a deleted `disabled_tools`, or an
-> allowlist that is not exactly that list. A tool a future image adds will then be denied rather than
-> served. **Until both have happened, the paragraph above is the live state.**
+> **What closes it — written as a condition, not a status.** What bounds the surface is a `tools`
+> allowlist on the `k8s-ro` gateway upstream map in `onprem-k8s`, the same mechanism whose five-tool
+> version actually closed PEN-2735 for the prometheus gateway. That allowlist is *enforcing* only
+> once **both** of the following hold, and the second does not follow from the first:
+>
+> 1. it is present on that repo's `master` — PEN-4295's carrier is onprem-k8s#6135; **and**
+> 2. a gateway pod that started *after* it landed is serving. `loadUpstreams()` is startup-only and
+>    the Deployment carries no config-checksum annotation, so ArgoCD's sync of the ConfigMap does
+>    **not** roll the pod. An operator `rollout restart` is the gate.
+>
+> **Until both hold, the surface is unrestricted and the paragraph above is the live state.** Check
+> them rather than trusting a date or a merge status written here — this paragraph deliberately
+> states neither, because a status written in a durable record rots silently and a condition does
+> not (PEN-4323: the status this replaced was false four minutes after the commit that wrote it).
+> Probe 1 with `gh api repos/Blockcast/onprem-k8s/contents/paperclip/k8s-mcp-gateway-k8s-ro.yaml`;
+> probe 2 by comparing the age of `Deployment/paperclip-mcp-gateway-k8s-ro`'s pods against that
+> file's last commit. PEN-4295 carries the live status.
+>
+> Once both hold, `onprem-k8s:scripts/check-k8s-ro-tool-surface.mjs` reddens that repo's build on an
+> image bump, a dropped flag, a deleted `disabled_tools`, or an allowlist that is not exactly the
+> table above, and a tool a future image adds is denied rather than served.
 >
 > Even afterwards the cross-repo half stays a restatement, not an assertion: the two repos cannot
 > read each other, so this table and that allowlist are kept in step by cross-reference. A tool
