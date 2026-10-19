@@ -757,11 +757,20 @@ test("PaperclipOrphanReapWaitBoundExceeded reads a ratio on ONE window and links
   // runbook section carries that caveat; this one must too, so nobody records
   // "an alert exists" off a rule that does not deploy.
   const section = runbook.slice(runbook.indexOf("## Orphan reap wait bound exceeded (PEN-4380)"));
+  const body = section.slice(0, section.indexOf("\n## ") === -1 ? undefined : section.indexOf("\n## "));
+  // Ally suggestion on d40ad6a2: the first version of this guard was
+  // `/prometheusRule\.enabled.*false|onprem-k8s lockstep/s`. The `s` flag lets
+  // `.*` cross lines, so it passed whenever the section mentioned
+  // `prometheusRule.enabled` anywhere before ANY later `false` -- including
+  // after the caveat itself had been deleted. A guard against silent removal
+  // that survives the removal is worse than none. Anchor on the literal
+  // subsection heading instead, with no `s` flag.
   assert.match(
-    section.slice(0, section.indexOf("\n## ") === -1 ? undefined : section.indexOf("\n## ")),
-    /prometheusRule\.enabled.*false|onprem-k8s lockstep/s,
+    body,
+    /^### .*Merging the chart does NOT make this alert live on Blockcast$/m,
     "the PEN-4380 runbook section must carry the onprem-k8s lockstep caveat",
   );
+  assert.match(body, /onprem-k8s/, "the caveat must name the repo the port lands in");
 });
 
 test("PaperclipRuntimeResourceReconciliationStuck pins both backlog gauges and the worker-down backstop (BLO-21460)", () => {
