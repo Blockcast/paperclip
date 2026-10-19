@@ -27824,6 +27824,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       recordOrphanReapStage(stage, (at - orphanReapLapAt) / 1000);
       orphanReapLapAt = at;
     };
+    // PEN-4380: time one call WITHOUT advancing the lap cursor, so a sub-stage
+    // can be reported inside a lap that still measures its original span. This
+    // is why the split is additive: `orphanReapLapAt` is untouched here, so
+    // `reconcile_reservations` below still covers exactly the three calls it
+    // always covered and its history stays comparable across this change.
+    //
+    // Records from a `finally` for the same reason the lap chain does: the call
+    // most worth attributing is the one that threw, and timing only the success
+    // path would drop precisely that sample. The recorder itself rejects a
+    // non-finite value, so a throw before `startedAt` can never poison a series.
+    const timeOrphanReapCall = async <T>(
+      stage: Parameters<typeof recordOrphanReapStage>[0],
+      fn: () => Promise<T>,
+    ): Promise<T> => {
+      const startedAt = Date.now();
+      try {
+        return await fn();
+      } finally {
+        recordOrphanReapStage(stage, (Date.now() - startedAt) / 1000);
+      }
+    };
 
     // Find all runs stuck in "running" state (queued runs are legitimately waiting; resumeQueuedRuns handles them)
     const activeRuns = await db
@@ -28204,14 +28225,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     let reconciliationSweepSucceeded = false;
     const reconciliationFailures: RuntimeResourceReconciliationFailures = { failedRowCount: 0 };
     try {
-      await reconcileReleasePendingExternalRuntimeReservations(
-        jobRunStatuses,
-        ambiguousExternalRunIds,
-        undefined,
-        reconciliationFailures,
-        { suppressDispatch: opts?.suppressDispatchAfterReap },
+      await timeOrphanReapCall("reconcile_release_pending", () =>
+        reconcileReleasePendingExternalRuntimeReservations(
+          jobRunStatuses,
+          ambiguousExternalRunIds,
+          undefined,
+          reconciliationFailures,
+          { suppressDispatch: opts?.suppressDispatchAfterReap },
+        ));
+      await timeOrphanReapCall(
+        "reconcile_env_leases",
+        () => reconcileOrphanedEnvironmentLeases(reconciliationFailures),
       );
-      await reconcileOrphanedEnvironmentLeases(reconciliationFailures);
       reconciliationSweepSucceeded = reconciliationFailures.failedRowCount === 0;
     } catch (error) {
       reconciliationSweepSucceeded = false;
@@ -28221,7 +28246,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       );
     } finally {
       try {
-        await refreshOrphanedRuntimeResourceMetrics(now);
+        await timeOrphanReapCall(
+          "refresh_resource_metrics",
+          () => refreshOrphanedRuntimeResourceMetrics(now),
+        );
         setOrphanedRuntimeResourceMetricsRefreshSuccess(reconciliationSweepSucceeded);
         if (reconciliationFailures.failedRowCount > 0) {
           logger.warn(
