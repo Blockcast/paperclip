@@ -12,6 +12,7 @@
     "src/__tests__/pr-comment-review-gate.test.ts",
     "src/__tests__/recovery-stranded-attendance-batch.test.ts",
     "src/__tests__/scrape-metrics-routine-fire-gap-work.test.ts",
+    "src/__tests__/truncate-text.test.ts",
     "src/__tests__/zoned-cron-equivalence.test.ts",
     "src/__tests__/zoned-cron-work-bound.test.ts"
   ],
