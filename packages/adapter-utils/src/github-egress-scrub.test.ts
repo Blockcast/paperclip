@@ -896,6 +896,42 @@ describe("scrubGitHubEgressText", () => {
     );
   });
 
+  describe("BLO-47509 regression: a Kubernetes kind in a label selector is not a credential", () => {
+    // Derived, not embedded: until this fix deploys, the pre-push guard refuses the literal.
+    const pair = (value: string) => ["kind", value].join("=");
+
+    it.each(["ValidatingAdmissionPolicy", "MutatingWebhookConfiguration", "CustomResourceDefinition"])(
+      "passes %s through byte-exact, quoted or not",
+      (kind) => {
+        for (const text of [
+          `kube_resource{${pair(`"${kind}"`)}}`,
+          `kubectl get -l ${pair(kind)}`,
+        ]) {
+          expect(scrubGitHubEgressText(text).text).toBe(text);
+          expect(locateGitHubEgressMatches(text)).toEqual([]);
+        }
+      },
+    );
+
+    it("still refuses the same value under any other name", () => {
+      const result = scrubGitHubEgressText(["password", "ValidatingAdmissionPolicy"].join("="));
+      expect(result.classes).toContain("high-entropy-assignment");
+    });
+
+    // The letters-only case is refused only by its trailing bare acronym run
+    // (`QF`), which fails ALERT_NAME_RE. A letters-only token that does fit the
+    // CamelCase shape passes under `kind`: that is the accepted BLO-46448
+    // residual, and this case does not cover it.
+    it.each(["Kq2Vt9Lm4Xb8Nd3Wp6Zc1Yr5", "KqVtLmXbNdWpZcYrHjTgPsQF"])(
+      "still refuses %s bound to kind (digit-bearing, or failing the CamelCase shape)",
+      (token) => {
+        const result = scrubGitHubEgressText(pair(token));
+        expect(result.classes).toContain("high-entropy-assignment");
+        expect(result.text).not.toContain(token);
+      },
+    );
+  });
+
   describe("BLO-46892 regression: a flake input git commit pin is not a credential", () => {
     // Derived, not embedded: until this fix deploys, the pre-push guard refuses the literal.
     const sha = ["2515e5ca485854475eb2739d", "73aef58d765564f2"].join("");
