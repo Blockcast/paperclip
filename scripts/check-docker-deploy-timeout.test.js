@@ -24,8 +24,14 @@ const PREFLIGHT_STEP_PATTERN = /^\s*run:\s*\.github\/scripts\/check-pending-migr
 // precreation. Same anchoring discipline and the same reason — its path is
 // named in the margin comment above `timeout-minutes` too, so a bare-path match
 // would be satisfied by the documentation of this guard rather than by the step.
-const PRECREATE_STEP_PATTERN =
-  /^\s*run:\s*\.github\/scripts\/precreate-online-indexes\.sh\s*$/m;
+//
+// PEN-4310 moved that invocation to the trusted `.release-tooling` checkout, so
+// the step no longer spells the script on its `run:` line — and the path now
+// appears in the sparse-checkout list and the tooling verification as well, so a
+// bare-path match would have THREE non-step ways to go vacuous. Anchor on the
+// step name: `- name:` cannot occur inside a `#` comment or a sparse-checkout
+// entry, so only the step itself can satisfy this.
+const PRECREATE_STEP_PATTERN = /^\s*- name: online-index precreation\s*$/m;
 
 // BLO-31254 split the pre-flight into a startup budget (scheduling + image
 // transfer) and a run budget (the migration check), and the two are serial

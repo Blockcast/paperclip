@@ -122,9 +122,7 @@ test("the deploy runs precreation BEFORE the gate that reports on it", () => {
   const nextJob = remainder.search(/^  [A-Za-z0-9_-]+:\s*$/m);
   const deployJob = nextJob === -1 ? remainder : remainder.slice(0, nextJob);
 
-  const precreate = deployJob.search(
-    /^\s*run:\s*\.github\/scripts\/precreate-online-indexes\.sh\s*$/m,
-  );
+  const precreate = deployJob.indexOf("- name: online-index precreation");
   const preflight = deployJob.search(
     /^\s*run:\s*\.github\/scripts\/check-pending-migrations\.sh\s*$/m,
   );
@@ -212,5 +210,87 @@ test("the precreation step cannot fail the deploy", () => {
     [...new Set(exits)],
     ["0"],
     `every exit must be 0; found ${exits.join(", ")}`,
+  );
+});
+
+test("the precreation step runs from the trusted checkout, not the operator-supplied one", () => {
+  // PEN-4310. The test above ("cannot fail the deploy") reads the SCRIPT and
+  // proves it exits 0. That is vacuous for the failure that actually matters:
+  // if the script is ABSENT the shell never reaches `exit 0`, it exits 127 and
+  // the step is a hard gate. The guarantee lives inside the callee, so it
+  // cannot cover the callee not being there.
+  //
+  // It is absent on every rollback. The deploy job has two checkouts: the bare
+  // repo path is `target_sha`, an operator-supplied commit which for a rollback
+  // is an arbitrary historical revision, and the script landed in 118cc3ff —
+  // so dispatching Docker at any earlier commit (including 2bd68db8, what
+  // production ran at the time) died at 127 before pre-flight and before helm.
+  //
+  // docker.yml already documents this hazard ~350 lines above, as the reason
+  // the trusted `.release-tooling` checkout exists at all: "a rollback to
+  // before this script existed dies on `No such file or directory`."
+  //
+  // Fixed by running it from that trusted checkout rather than by adding
+  // `continue-on-error: true`. Both were offered in review and either closes
+  // the 127; the trusted checkout is pinned here because it is the stronger
+  // of the two — it keeps operator-supplied code off the release path, and it
+  // makes precreation WORK on a rollback instead of merely not breaking it.
+  const marker = "\n  deploy:\n";
+  const start = workflow.indexOf(marker);
+  assert.notEqual(start, -1, "docker.yml must define a deploy job");
+  const remainder = workflow.slice(start + marker.length);
+  const nextJob = remainder.search(/^  [A-Za-z0-9_-]+:\s*$/m);
+  const deployJob = nextJob === -1 ? remainder : remainder.slice(0, nextJob);
+
+  // 1. The step must not invoke the script out of the untrusted checkout. A
+  //    bare `.github/...` run line resolves against the workspace root, which
+  //    is `target_sha`.
+  assert.doesNotMatch(
+    deployJob,
+    /^\s*run:\s*\.github\/scripts\/precreate-online-indexes\.sh\s*$/m,
+    "the precreation step must not run the script from the bare workspace path: that " +
+      "checkout is the operator-supplied target_sha, so a rollback to before the script " +
+      "existed exits 127 and fails the deploy",
+  );
+
+  // 2. It must resolve through the verified trusted-tooling output, the same
+  //    way the three release-approval scripts do.
+  const stepStart = deployJob.indexOf("- name: online-index precreation");
+  assert.notEqual(stepStart, -1, "deploy job must run the online-index precreation step");
+  const stepBody = deployJob.slice(stepStart, deployJob.indexOf("\n      - name:", stepStart + 1));
+  assert.match(
+    stepBody,
+    /steps\.tooling\.outputs\.precreate_script/,
+    "the precreation step must take its script path from the verified trusted-tooling " +
+      "output, so the script and the workflow step invoking it are the same revision",
+  );
+
+  // 3. …which is only true if the trusted checkout actually materializes it.
+  //    That checkout is sparse and non-cone-mode, so a path missing from the
+  //    list is silently absent and lands straight back on exit 127 — on EVERY
+  //    deploy this time, not just rollbacks.
+  const toolingCheckout = deployJob.slice(
+    deployJob.indexOf("- name: Checkout release tooling at trusted revision"),
+  );
+  const sparse = toolingCheckout.slice(
+    toolingCheckout.indexOf("sparse-checkout:"),
+    toolingCheckout.indexOf("sparse-checkout-cone-mode:"),
+  );
+  assert.match(
+    sparse,
+    /^\s*\.github\/scripts\/precreate-online-indexes\.sh\s*$/m,
+    "the trusted sparse-checkout must list the precreation script, or resolving it from " +
+      ".release-tooling is exit 127 on every deploy",
+  );
+
+  // 4. And absence must surface as a named failure rather than a bare 127.
+  //    The existing tooling verification already asserts the other three
+  //    scripts are executable; precreation joins that conjunct.
+  const verify = deployJob.slice(deployJob.indexOf("- name: Verify release tooling revision"));
+  assert.match(
+    verify,
+    /\[ ! -x "\$\{precreate\}" \]/,
+    "the tooling verification must assert the precreation script is executable, so an " +
+      "inconsistent trusted checkout fails with a message instead of exit 127",
   );
 });
