@@ -1627,6 +1627,56 @@ spec:
             summary: "Paperclip isolation-workspace reaper (dry_run={{`{{ $labels.dry_run }}`}}) has not completed a sweep in over {{ .Values.prometheusRule.isolationWorkspaceReaperStaleSeconds }}s"
             description: "paperclip_isolation_workspace_reaper_last_sweep_timestamp_seconds has not advanced in {{`{{ $value | printf \"%.0f\" }}`}}s (BLO-36814). This gauge advances at the END of every sweep including one that deletes nothing, so a stall means the sweep is not running -- not that the tree is clean. While it is stalled, data/k8s-isolation/workspaces/ grows unreclaimed on the CephFS ssd-fast pool that produced BLO-31222's write-block incident (0 -> 406.7 GiB in ~2 months with no reaper). Check the worker StatefulSet still has PAPERCLIP_ISOLATION_WORKSPACE_REAPER_ENABLED=true, then grep worker logs for 'isolation-workspace reaper sweep failed'. If the reaper was deliberately disabled, this series stops being scraped and the alert resolves on its own -- it does not need silencing."
             runbook_url: {{ .Values.prometheusRule.isolationWorkspaceReaperRunbookUrl | quote }}
+    - name: paperclip-orphan-reap-wait-bound
+      rules:
+        - alert: PaperclipOrphanReapWaitBoundExceeded
+          # PEN-4380. `startNextQueuedRunForAgent` awaits a FLEET-WIDE orphan
+          # reap from inside `withAgentStartLock`, bounded at 120s
+          # (START_LOCK_REAP_WAIT_BOUND_DEFAULT_MS, heartbeat.ts). On expiry the
+          # caller gives up and dispatches on stale orphan state. The bound is
+          # BLO-41036's liveness mechanism and is correct -- this alert fires on
+          # the reap failing to finish inside it, NOT on the bound being too
+          # low. Do not "fix" a firing instance by raising the bound.
+          #
+          # Why this reads a RATIO and not `rate(...{disposition="timed_out"})
+          # > 0`, which is the form PEN-4380 originally asked for: that form is
+          # not quiet. Measured over the 7 days to 2026-10-19, `timed_out` was
+          # non-zero in 34 separate hourly samples with no incident attached, at
+          # 0.003-0.09/s -- and the 2026-10-19 regression ran at 0.059-0.149/s,
+          # which OVERLAPS that band. The absolute rate therefore does not
+          # separate the two regimes in either direction, so an alert on it
+          # would have been tuned away long before the regression it exists to
+          # catch.
+          #
+          # The share of reap attempts that time out does separate them, because
+          # it carries its own denominator: a reap that still completes for
+          # somebody shows up as `ran`/`joined`, and the regression is precisely
+          # that NOBODY completes. Over those same 7 days the ratio peaked at
+          # 0.685 and crossed 0.9 only in excursions of <=20 minutes (10-14
+          # ~06:00-07:40Z); during the regression it sat at 0.99-1.00
+          # continuously for over five hours. Hence 0.9 for 45m: ~2.25x the
+          # longest benign excursion measured, against a fault that holds the
+          # ratio at 1.
+          #
+          # The counter is only born on first increment, so before any reap has
+          # run the expression has no series and cannot fire. That is the safe
+          # direction for a ">" rule -- it can be late, never false -- but it
+          # does mean ABSENCE here is not evidence of health. The denominator
+          # being alive at all is what `ran`/`joined`/`skipped_fresh` report;
+          # check those before reading a non-firing rule as "reaps are fine".
+          expr: >-
+            (sum(rate(paperclip_agent_start_lock_reap_disposition_total{disposition="timed_out"}[{{ .Values.prometheusRule.orphanReapTimedOutWindow }}]))
+            / sum(rate(paperclip_agent_start_lock_reap_disposition_total[{{ .Values.prometheusRule.orphanReapTimedOutWindow }}])))
+            > {{ .Values.prometheusRule.orphanReapTimedOutRatio }}
+          for: {{ .Values.prometheusRule.orphanReapTimedOutFor }}
+          labels:
+            severity: warning
+            service: paperclip
+            signal: orphan_reap_wait_bound
+          annotations:
+            summary: "Paperclip orphan reap is timing out on more than {{ .Values.prometheusRule.orphanReapTimedOutRatio }} of start-lock dispatch passes"
+            description: "{{`{{ $value | printf \"%.2f\" }}`}} of start-lock orphan-reap attempts are hitting the 120s wait bound (PEN-4380), so queued-run dispatch is running on stale orphan state fleet-wide. The cost is NOT confined to the reap: each acted candidate in the stranded-assigned-issue sweep pays up to ~2x the bound, which on 2026-10-19 took the recovery chain from ~135s to 23-78 minutes. The lever is SWEEP DURATION, not the bound -- a chained waiter waits out the running sweep AND the one chained after it, so any sweep past ~60s pushes waiters over 120s. Break the sweep down with paperclip_orphan_reap_stage_seconds by stage, and read `reconcile_release_pending` / `reconcile_env_leases` / `refresh_resource_metrics` rather than their `reconcile_reservations` aggregate, which spans all three. Check the stage's population gauges (paperclip_external_runtime_reservations_release_pending, paperclip_environment_leases_orphaned_active) before assuming volume: in the 2026-10-19 regression both were ~0 throughout and the cost was per-query, not per-row. See the runbook."
+            runbook_url: {{ .Values.prometheusRule.orphanReapTimedOutRunbookUrl | quote }}
     {{- with .Values.prometheusRule.additionalGroups }}
     {{- toYaml . | nindent 4 }}
     {{- end }}

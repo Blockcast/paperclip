@@ -41,6 +41,11 @@ vi.mock("../services/k8s-job-liveness.js", async (importOriginal) => {
 });
 
 const { heartbeatService } = await import("../services/heartbeat.ts");
+const {
+  ORPHAN_REAP_STAGE_SECONDS_METRIC,
+  __resetMetricsForTest,
+  renderMetrics,
+} = await import("../services/metrics.js");
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -120,6 +125,55 @@ describeEmbeddedPostgres("start-lock orphan reap coalescing (BLO-36922)", () => 
     }
     return { companyId, agentIds };
   }
+
+  /**
+   * PEN-4380: `reconcile_reservations` spans THREE calls and is named after one
+   * of them, so a sweep that spends its time in either of the other two reports
+   * it under a label that points somewhere else.
+   *
+   * That is not hypothetical. On 2026-10-19 the stage went from a 0.150s mean
+   * to 33.1s (~221x) and took the fleet sweep past the ~60s at which chained
+   * start-lock waiters blow the 120s `START_LOCK_REAP_WAIT_BOUND_DEFAULT_MS`
+   * -- `ran` 443-679/30m to ~0. But the population belonging to the call the
+   * label names (`external_runtime_reservations` in `release_pending`) was 0-2
+   * throughout, before AND after, so the only reading the metric supported was
+   * of a loop with nothing to iterate. The split is what makes the next
+   * occurrence attributable.
+   *
+   * Asserted together rather than as three separate cases, because the property
+   * under test is a CONJUNCTION: the sub-stages must appear AND the aggregate
+   * must keep its original span. Splitting them would let a change that
+   * replaced `reconcile_reservations` with its three parts pass the first half
+   * while silently breaking every series recorded before the split.
+   */
+  it("reports each reconcile sub-stage separately without displacing the aggregate", async () => {
+    await seedFleet(1);
+    const heartbeat = heartbeatService(db);
+    __resetMetricsForTest();
+
+    expect(await heartbeat.reapOrphanedRunsForStartLock()).toBe("ran");
+
+    const { body } = await renderMetrics();
+    const stageCount = (stage: string) => {
+      const line = body
+        .split("\n")
+        .find((candidate) =>
+          candidate.startsWith(`${ORPHAN_REAP_STAGE_SECONDS_METRIC}_count{`)
+          && candidate.includes(`stage="${stage}"`));
+      return line ? Number(line.trim().split(/\s+/).pop()) : null;
+    };
+
+    // The three calls the aggregate spans, each now answerable on its own.
+    expect(stageCount("reconcile_release_pending")).toBe(1);
+    expect(stageCount("reconcile_env_leases")).toBe(1);
+    expect(stageCount("refresh_resource_metrics")).toBe(1);
+
+    // ...and the aggregate still observes the SAME span it always did, so the
+    // pre-split history stays comparable. This is the half that makes the
+    // change additive rather than a rename.
+    expect(stageCount("reconcile_reservations")).toBe(1);
+    expect(stageCount("total")).toBe(1);
+  });
 
   it("folds concurrent start-lock reaps into a single fleet sweep", async () => {
     await seedFleet(3);

@@ -1337,6 +1337,66 @@ repository alone does **not** make this alert live. It must also land in the two
 lockstep `Blockcast/onprem-k8s` alert files — tracked as **PEN-3338** alongside
 `PaperclipAgentStartLockWedged`. Verify at `/api/v1/rules` before relying on it.
 
+## Orphan reap wait bound exceeded (PEN-4380)
+
+Fired by `PaperclipOrphanReapWaitBoundExceeded`. It means most start-lock dispatch
+passes are giving up on the fleet-wide orphan reap at its 120 s wait bound
+(`START_LOCK_REAP_WAIT_BOUND_DEFAULT_MS`, `server/src/services/heartbeat.ts`) and
+dispatching on stale orphan state.
+
+**The bound is not the bug.** It is BLO-41036's liveness mechanism, and it is
+doing exactly what it was built to do. Raising it converts a visible, bounded
+degradation into the unbounded fleet-wide dispatch stall it was added to prevent.
+Fix the sweep's duration instead.
+
+### What it costs
+
+`startNextQueuedRunForAgent` calls the reap from *inside* `withAgentStartLock`,
+and `enqueueWakeup` awaits `startNextQueuedRunForAgent`. So every path that
+enqueues a wake pays the bound, including the stranded-assigned-issue sweep's
+acting branch — once per acted candidate. A caller arriving while a sweep is
+already reading waits out that sweep **and** the one chained behind it, so the
+worst case per candidate is ~2x the bound. Measured on 2026-10-19: passes with
+`acted == 0` averaged 54 s, passes with `acted > 0` averaged 2,125 s, and the
+recovery chain went from a 115–135 s band to 23–78 minutes.
+
+That ~2x is also why the lever is sweep duration and not the bound: **any sweep
+past ~60 s pushes chained waiters over 120 s**, regardless of how healthy the
+sweep itself looks.
+
+### Triage
+
+1. Confirm the regime, not just the rate. Compare
+   `disposition="timed_out"` against `ran` / `joined` / `skipped_fresh` on
+   `paperclip_agent_start_lock_reap_disposition_total`. A non-zero `timed_out`
+   is routine; `ran` collapsing to ~0 is the fault.
+2. Split the sweep with `paperclip_orphan_reap_stage_seconds` by `stage`.
+   Read `reconcile_release_pending`, `reconcile_env_leases` and
+   `refresh_resource_metrics` individually — their `reconcile_reservations`
+   aggregate spans all three and names only the first, which is how a 33 s stage
+   was once attributed to a loop whose population was zero.
+3. Check the population gauges **before** assuming volume:
+   `paperclip_external_runtime_reservations_release_pending` and
+   `paperclip_environment_leases_orphaned_active`. If a stage is slow while its
+   population is flat and near zero, the cost is per-query, not per-row, and the
+   reservation/lease backlog is a dead end.
+4. Rule the cheap causes in or out explicitly, because several look alike here:
+   `paperclip_db_pool_waiting_queries` (pool starvation),
+   `nodejs_eventloop_lag_p99_seconds` (event-loop stall), and the `list_jobs`
+   stage, which is the kube-API control — if `list_jobs` is flat while the
+   DB-backed stages regress, the kube API is not involved.
+
+### Instrument gap to know about
+
+There is **no Postgres exporter for the paperclip database**. `pg_stat_activity_*`
+and `pg_stat_activity_max_tx_duration` exist only for the `penstock` and
+`hindsight` servers, so a bare `max(pg_stat_activity_max_tx_duration)` silently
+answers about a *different database* and must not be read as evidence about
+paperclip. The paperclip-scoped series are `pg_paperclip_db_backends_backends`,
+`pg_paperclip_db_connections_in_use` and `pg_heartbeat_runs_access_seq_scan`.
+Until an exporter exists, per-statement latency, lock waits, long transactions
+and table bloat on this database are not observable from Prometheus at all.
+
 ## References
 
 - `runbooks/README.md` — index

@@ -1320,6 +1320,25 @@ export const KNOWN_ORPHAN_REAP_STAGES = [
   "identity_stamp",
   "terminal_job_cleanup",
   "reconcile_reservations",
+  // PEN-4380: the three calls `reconcile_reservations` spans, reported
+  // separately. They are ADDITIVE, not a replacement -- `reconcile_reservations`
+  // still measures the identical span it always did, so series recorded before
+  // this split stay comparable and nothing that reads it has to change.
+  //
+  // The split exists because the aggregate could not answer the question it was
+  // reached for. On 2026-10-19 `reconcile_reservations` went from a 0.15s mean
+  // to 33s (~221x) in the 16:30-17:00Z bucket, which alone took the fleet sweep
+  // past ~60s and so pushed every chained start-lock waiter over the 120s
+  // `START_LOCK_REAP_WAIT_BOUND_DEFAULT_MS` -- `ran` 443-679/30m to ~0 and
+  // `timed_out` to 155-272/30m. But the stage name points at only the FIRST of
+  // the three calls under it, and that call's population
+  // (`paperclip_external_runtime_reservations_release_pending`) was 0-2
+  // throughout, before AND after. So the label implicated a loop that had
+  // nothing to iterate, and the real spender -- one of these three -- was not
+  // separable from the metric. Do not re-merge these.
+  "reconcile_release_pending",
+  "reconcile_env_leases",
+  "refresh_resource_metrics",
   "pod_cleanup",
   "per_run",
   "total",
