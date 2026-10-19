@@ -28203,6 +28203,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // no alerting while keeping nine unrelated recovery passes alive.
     let reconciliationSweepSucceeded = false;
     const reconciliationFailures: RuntimeResourceReconciliationFailures = { failedRowCount: 0 };
+    // BLO-47659: `reconcile_reservations` ran 55-120 s while its two SELECTs
+    // EXPLAIN at ~2 ms, so time each of the three calls it wraps.
+    // A call that throws still records its lap, under the stage in flight.
+    let reconcileSubLapAt = Date.now();
+    let reconcileInFlight: Parameters<typeof recordOrphanReapStage>[0] | null =
+      "reconcile_release_pending";
+    const lapReconcile = (next: typeof reconcileInFlight) => {
+      const at = Date.now();
+      if (reconcileInFlight) recordOrphanReapStage(reconcileInFlight, (at - reconcileSubLapAt) / 1000);
+      reconcileSubLapAt = at;
+      reconcileInFlight = next;
+    };
     try {
       await reconcileReleasePendingExternalRuntimeReservations(
         jobRunStatuses,
@@ -28211,9 +28223,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         reconciliationFailures,
         { suppressDispatch: opts?.suppressDispatchAfterReap },
       );
+      lapReconcile("reconcile_env_leases");
       await reconcileOrphanedEnvironmentLeases(reconciliationFailures);
+      lapReconcile(null);
       reconciliationSweepSucceeded = reconciliationFailures.failedRowCount === 0;
     } catch (error) {
+      lapReconcile(null);
       reconciliationSweepSucceeded = false;
       logger.error(
         { error: error instanceof Error ? error.message : String(error) },
@@ -28221,7 +28236,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       );
     } finally {
       try {
+        reconcileSubLapAt = Date.now();
+        reconcileInFlight = "reconcile_refresh_metrics";
         await refreshOrphanedRuntimeResourceMetrics(now);
+        lapReconcile(null);
         setOrphanedRuntimeResourceMetricsRefreshSuccess(reconciliationSweepSucceeded);
         if (reconciliationFailures.failedRowCount > 0) {
           logger.warn(
@@ -28230,6 +28248,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           );
         }
       } catch (error) {
+        lapReconcile(null);
         setOrphanedRuntimeResourceMetricsRefreshSuccess(false);
         logger.warn(
           { error: error instanceof Error ? error.message : String(error) },

@@ -161,6 +161,11 @@ describe("recordOrphanReapStage", () => {
     for (const stage of KNOWN_ORPHAN_REAP_STAGES) expect(await stageCount(stage)).toBe(1);
   });
 
+  it("allow-lists the reconcile_reservations sub-stages (BLO-47659)", () => {
+    for (const stage of ["reconcile_release_pending", "reconcile_env_leases", "reconcile_refresh_metrics"])
+      expect(KNOWN_ORPHAN_REAP_STAGES).toContain(stage);
+  });
+
   it("drops an unknown stage and a non-finite duration instead of minting a series", async () => {
     recordOrphanReapStage("bogus" as never, 1);
     recordOrphanReapStage("total", Number.NaN);

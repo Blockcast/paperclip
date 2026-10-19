@@ -1320,6 +1320,11 @@ export const KNOWN_ORPHAN_REAP_STAGES = [
   "identity_stamp",
   "terminal_job_cleanup",
   "reconcile_reservations",
+  // BLO-47659: sub-stages of `reconcile_reservations`, timed independently so
+  // the parent's series stays continuous. They do not add into `total`.
+  "reconcile_release_pending",
+  "reconcile_env_leases",
+  "reconcile_refresh_metrics",
   "pod_cleanup",
   "per_run",
   "total",
