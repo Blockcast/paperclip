@@ -164,7 +164,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       notYetStale?: boolean;
       // Override the blocker leaf's status (default "todo"). The
       // "assigned backlog blocker leaf" scenario passes "backlog".
-      blockerStatus?: "backlog" | "todo" | "in_progress" | "blocked" | "in_review";
+      blockerStatus?: "backlog" | "todo" | "in_progress" | "blocked" | "in_review" | "cancelled";
       // Symbolic agent reference for the blocker's assignee — "coder",
       // "manager", or undefined (unassigned). The escalation engine
       // distinguishes assigned-vs-unassigned blockers when deciding the
@@ -1167,6 +1167,23 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
         blockerIssueId,
       ].join(":"),
     });
+  });
+
+  it("still sees a cancelled blocker after terminal rows are narrowed out of the scan (BLO-45336)", async () => {
+    await enableAutoRecovery();
+    const { companyId } = await seedBlockedChain({ blockerStatus: "cancelled", blockerAssigneeAgentId: "coder" });
+
+    // The scan drops done/cancelled rows that block nothing. A cancelled row that DOES
+    // block something must survive the filter. If it is dropped the source still yields
+    // one finding -- but as `blocked_without_blockers`, so assert the state, not the count.
+    const result = await heartbeatSvc.reconcileIssueGraphLiveness();
+
+    expect(result.findings).toBe(1);
+    const escalations = await db
+      .select({ originId: issues.originId })
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "harness_liveness_escalation")));
+    expect(escalations.map((row) => row.originId?.split(":")[3])).toEqual(["blocked_by_cancelled_issue"]);
   });
 
   it("treats open recovery issues as active waiting paths for non-assigned-backlog states", async () => {
