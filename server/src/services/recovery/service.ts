@@ -11578,6 +11578,18 @@ export function recoveryService(
           and(
             isNull(issues.hiddenAt),
             notInArray(issues.originKind, [RECOVERY_ORIGIN_KINDS.issueGraphLivenessEscalation]),
+            // BLO-45336: the classifier only reaches a `done`/`cancelled` row as somebody's
+            // blocker (it never inspects one as a source), so terminal rows that block
+            // nothing are dead weight. They are most of the table and this pass runs every
+            // 30s; loading their JSONB + description was a measured ~2s main-thread stall.
+            or(
+              notInArray(issues.status, ["done", "cancelled"]),
+              inArray(
+                issues.id,
+                db.select({ id: issueRelations.issueId }).from(issueRelations)
+                  .where(eq(issueRelations.type, "blocks")),
+              ),
+            ),
           ),
         )
         // PEN-3314: derive `hasExternalWaitOwner` here rather than at the `sharedInput` call
