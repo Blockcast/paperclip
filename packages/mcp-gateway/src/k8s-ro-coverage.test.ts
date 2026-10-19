@@ -466,6 +466,12 @@ function scrub(body: string): string {
   return scrubResponseBody(Buffer.from(body, "utf8"), "application/json").toString("utf8");
 }
 
+/** The SSE wire framing for one document. Shared so an assertion's expected
+ * value is built by the same code as the body under test, and cannot drift. */
+function sseFrame(body: string): string {
+  return `event: message\ndata: ${body}\n\n`;
+}
+
 /**
  * The same document delivered as an SSE frame, which is how the streamable-HTTP
  * MCP transport delivers most tool results (`response-scrub.ts`,
@@ -476,10 +482,6 @@ function scrub(body: string): string {
  * coverage of the tool. `transformResponseBody` dispatches to a different
  * function per framing, and each verdict has to hold on both.
  */
-function sseFrame(body: string): string {
-  return `event: message\ndata: ${body}\n\n`;
-}
-
 function scrubSse(body: string): string {
   return scrubResponseBody(Buffer.from(sseFrame(body), "utf8"), "text/event-stream").toString("utf8");
 }
@@ -581,6 +583,16 @@ describe("k8s-ro scrubber coverage register (PEN-4282)", () => {
 
       if (surface.verdict.kind === "scrubbed") {
         it("replaces the material with the redaction marker rather than dropping the field silently", () => {
+          // Today this is implied by the `mustSurvive` loop above: all four
+          // `scrubbed` surfaces happen to list REDACTED there. Kept anyway, for
+          // the reason the JSON arm keeps its twin — the implication is a
+          // CONTINGENT property of the current table, not a structural one.
+          // Nothing requires a `scrubbed` surface to name REDACTED in
+          // `mustSurvive`, so the next surface added can break the implication
+          // silently; this assertion keeps firing when it does. Parity with the
+          // JSON arm is also the point of PEN-4323 — the two arms diverging is
+          // the defect being fixed, so re-introducing an asymmetry here would
+          // leave the next reader to re-derive which arm checks what.
           expect(scrubSse(surface.body)).toContain(REDACTED);
         });
       } else if (surface.mustNotSurvive.length === 0) {
