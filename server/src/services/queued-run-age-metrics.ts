@@ -5,7 +5,9 @@ import { logger } from "../middleware/logger.js";
 import { CCROTATE_CAPACITY_ADVERTISED_RESUME_AT_KEY } from "./ccrotate-capacity-retry.js";
 import { isDispatchRankReady } from "./dispatch-readiness.js";
 import { listIssueDependencyReadinessMap } from "./issues.js";
+import type { QueuedRunAgentIdentity } from "./metrics.js";
 import {
+  UNKNOWN_AGENT_ID,
   setDeferredIssueExecutionWakeAgeMetricsRefreshSuccess,
   setDeferredIssueExecutionWakeOldestAgeMetrics,
   setOverdueScheduledRetryAgeMetrics,
@@ -52,7 +54,12 @@ const UUID_PATTERN = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{
 export async function refreshQueuedRunAgeMetrics(db: Db, now = new Date()): Promise<void> {
   try {
     const [agentRows, oldestByAgent] = await Promise.all([
-      db.select({ id: agents.id }).from(agents),
+      // `name` and `companyId` ride along so both age gauges can carry the
+      // routing/attribution labels their downstream alert needs (PEN-4280).
+      // Same single roster read, two more columns off a row already fetched.
+      // Read from `agents` rather than `heartbeat_runs.company_id` so that an
+      // agent with an EMPTY queue still emits a correctly-labelled 0.
+      db.select({ id: agents.id, name: agents.name, companyId: agents.companyId }).from(agents),
       // Keep this predicate in the same simple form as the queue-only age
       // index from migration 0217 so scrapes never scan heartbeat history.
       db
@@ -65,7 +72,18 @@ export async function refreshQueuedRunAgeMetrics(db: Db, now = new Date()): Prom
         .groupBy(heartbeatRuns.agentId),
     ]);
 
-    const knownAgentIds = new Set(agentRows.map((row) => row.id));
+    const knownAgents = new Map<string, QueuedRunAgentIdentity>(
+      agentRows.map((row) => [
+        row.id,
+        {
+          // Mirrors the onprem exporter's `coalesce(a.name, 'unknown')` /
+          // `coalesce(a.company_id, 'unknown')` so one agent reads identically
+          // on both collection paths.
+          agentName: row.name && row.name.length > 0 ? row.name : UNKNOWN_AGENT_ID,
+          companyId: row.companyId && row.companyId.length > 0 ? row.companyId : UNKNOWN_AGENT_ID,
+        },
+      ]),
+    );
     const entries = oldestByAgent
       .filter((row) => row.agentId !== null && row.oldestQueuedAt)
       .map((row) => ({
@@ -73,8 +91,8 @@ export async function refreshQueuedRunAgeMetrics(db: Db, now = new Date()): Prom
         ageSeconds: Math.max(0, (now.getTime() - new Date(row.oldestQueuedAt as Date | string).getTime()) / 1000),
       }));
 
-    setQueuedRunOldestAgeMetrics(entries, knownAgentIds);
-    await refreshClaimableQueuedRunAgeMetrics(db, now, knownAgentIds);
+    setQueuedRunOldestAgeMetrics(entries, knownAgents);
+    await refreshClaimableQueuedRunAgeMetrics(db, now, knownAgents);
     setQueuedRunAgeMetricsRefreshSuccess(true);
   } catch (error) {
     // Do not replace the last age snapshot with synthetic zeros: that would
@@ -165,7 +183,7 @@ type ClaimableQueuedRunWindowRow = {
 async function refreshClaimableQueuedRunAgeMetrics(
   db: Db,
   now: Date,
-  knownAgentIds: ReadonlySet<string>,
+  knownAgents: ReadonlyMap<string, QueuedRunAgentIdentity>,
 ): Promise<void> {
   const windowed = await db.execute<ClaimableQueuedRunWindowRow>(sql`
     select agent_id, company_id, context_issue_id, context_snapshot, effective_queued_at
@@ -249,7 +267,7 @@ async function refreshClaimableQueuedRunAgeMetrics(
 
   setQueuedRunOldestClaimableAgeMetrics(
     [...oldestClaimableByAgent].map(([agentId, ageSeconds]) => ({ agentId, ageSeconds })),
-    knownAgentIds,
+    knownAgents,
   );
 }
 

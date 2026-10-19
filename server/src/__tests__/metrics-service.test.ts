@@ -115,6 +115,40 @@ import {
   snapshotDepBlockedMetrics,
 } from "../services/dep-blocked-metrics.js";
 
+/**
+ * Exact rendered value of `metric` for one `agent_id`, or undefined when the
+ * series is absent.
+ *
+ * Deliberately parses the rendered line instead of `toContain`-ing a label
+ * literal. These gauges carry `agent_name` and `company_id` beside `agent_id`
+ * (PEN-4280), so a hand-written literal pins label ORDER as well as value and
+ * breaks on any future label addition. It is also strictly STRONGER than
+ * `toContain`, which matches a value PREFIX -- a rendered `... 0.0455`
+ * satisfies a `... 0` literal, which is exactly the trap this file's own
+ * PEN-3314 block warns about.
+ */
+/**
+ * Bounded roster for the queued-run age setters (PEN-4280).
+ *
+ * The setters take agent IDENTITY, not just a set of ids, because the gauges
+ * carry the `agent_name` / `company_id` that identity determines. Names and
+ * company are synthesized per id here so a test that only cares about ages
+ * does not have to spell them out.
+ */
+function knownAgentsOf(...agentIds: string[]) {
+  return new Map(
+    agentIds.map((id, i) => [id, { agentName: `agent-${i}`, companyId: `company-${i}` }]),
+  );
+}
+
+function gaugeValue(body: string, metric: string, agentId: string): number | undefined {
+  const line = body
+    .split("\n")
+    .find((l) => l.startsWith(`${metric}{`) && l.includes(`agent_id="${agentId}"`));
+  if (!line) return undefined;
+  return Number(line.slice(line.lastIndexOf("}") + 1).trim());
+}
+
 afterEach(() => {
   __resetMetricsForTest();
 });
@@ -1084,13 +1118,13 @@ describe("queued-run age metrics (BLO-21116)", () => {
   it("publishes explicit queue zeros and a separate refresh-success signal", async () => {
     const agentA = "11111111-1111-1111-1111-111111111111";
     const agentB = "22222222-2222-2222-2222-222222222222";
-    const known = new Set([agentA, agentB]);
+    const known = knownAgentsOf(agentA, agentB);
 
     setQueuedRunOldestAgeMetrics([{ agentId: agentA, ageSeconds: 54000 }], known);
     setQueuedRunAgeMetricsRefreshSuccess(true);
     let body = (await renderMetrics()).body;
-    expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${agentA}"} 54000`);
-    expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${agentB}"} 0`);
+    expect(gaugeValue(body, QUEUED_RUN_OLDEST_AGE_METRIC, agentA)).toBe(54000);
+    expect(gaugeValue(body, QUEUED_RUN_OLDEST_AGE_METRIC, agentB)).toBe(0);
     expect(body).toContain(`${QUEUED_RUN_AGE_METRICS_REFRESH_SUCCESS_METRIC} 1`);
 
     // A successful next refresh with no queued rows resolves the age. A
@@ -1099,7 +1133,7 @@ describe("queued-run age metrics (BLO-21116)", () => {
     setQueuedRunOldestAgeMetrics([], known);
     setQueuedRunAgeMetricsRefreshSuccess(false);
     body = (await renderMetrics()).body;
-    expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${agentA}"} 0`);
+    expect(gaugeValue(body, QUEUED_RUN_OLDEST_AGE_METRIC, agentA)).toBe(0);
     expect(body).toContain(`${QUEUED_RUN_AGE_METRICS_REFRESH_SUCCESS_METRIC} 0`);
   });
 });
@@ -1484,25 +1518,25 @@ describe("setQueuedRunOldestAgeMetrics (BLO-21116)", () => {
   it("writes an explicit 0 for a known agent whose queue has drained (drop-to-0 observable)", async () => {
     const agentA = "11111111-1111-1111-1111-111111111111";
     const agentB = "22222222-2222-2222-2222-222222222222";
-    const known = new Set([agentA, agentB]);
+    const known = knownAgentsOf(agentA, agentB);
 
     setQueuedRunOldestAgeMetrics([{ agentId: agentA, ageSeconds: 54000 }], known);
     let body = (await renderMetrics()).body;
-    expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${agentA}"} 54000`);
-    expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${agentB}"} 0`);
+    expect(gaugeValue(body, QUEUED_RUN_OLDEST_AGE_METRIC, agentA)).toBe(54000);
+    expect(gaugeValue(body, QUEUED_RUN_OLDEST_AGE_METRIC, agentB)).toBe(0);
 
     // Next refresh: agentA's queue drained. reset-then-set must write 0, not
     // leave the stale 54000 -- that stale value is what would keep an alert
     // on this series from ever resolving.
     setQueuedRunOldestAgeMetrics([], known);
     body = (await renderMetrics()).body;
-    expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${agentA}"} 0`);
-    expect(body).not.toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${agentA}"} 54000`);
+    expect(gaugeValue(body, QUEUED_RUN_OLDEST_AGE_METRIC, agentA)).toBe(0);
+    expect(gaugeValue(body, QUEUED_RUN_OLDEST_AGE_METRIC, agentA)).not.toBe(54000);
   });
 
   it("takes the oldest of multiple queued runs per agent, and collapses an unknown agent id", async () => {
     const agentA = "33333333-3333-3333-3333-333333333333";
-    const known = new Set([agentA]);
+    const known = knownAgentsOf(agentA);
 
     setQueuedRunOldestAgeMetrics(
       [
@@ -1513,8 +1547,20 @@ describe("setQueuedRunOldestAgeMetrics (BLO-21116)", () => {
       known,
     );
     const { body } = await renderMetrics();
-    expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${agentA}"} 9000`);
-    expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${UNKNOWN_AGENT_ID}"} 4500`);
+    expect(gaugeValue(body, QUEUED_RUN_OLDEST_AGE_METRIC, agentA)).toBe(9000);
+    expect(gaugeValue(body, QUEUED_RUN_OLDEST_AGE_METRIC, UNKNOWN_AGENT_ID)).toBe(4500);
+    // PEN-4280: an id outside the bounded roster has no identity to carry, so
+    // its routing labels must collapse too. Leaving them EMPTY rather than
+    // "unknown" would make the series match an `agent_name=""` selector and,
+    // worse, fall outside every per-tenant Alertmanager route -- an unrouted
+    // alert instead of a mis-routed one. "unknown" mirrors the onprem
+    // exporter's own `coalesce(a.name, 'unknown')` for the same row.
+    const unknownLine = body
+      .split("\n")
+      .find((l) => l.startsWith(`${QUEUED_RUN_OLDEST_AGE_METRIC}{`)
+        && l.includes(`agent_id="${UNKNOWN_AGENT_ID}"`));
+    expect(unknownLine).toContain(`agent_name="${UNKNOWN_AGENT_ID}"`);
+    expect(unknownLine).toContain(`company_id="${UNKNOWN_AGENT_ID}"`);
   });
 });
 

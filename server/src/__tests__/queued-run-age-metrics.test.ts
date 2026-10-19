@@ -15,6 +15,44 @@ import {
 } from "../services/metrics.js";
 import { refreshQueuedRunAgeMetrics } from "../services/queued-run-age-metrics.js";
 
+/**
+ * Exact rendered value of `metric` for one `agent_id`, or undefined when the
+ * series is absent.
+ *
+ * Deliberately parses the rendered line instead of `toContain`-ing a label
+ * literal. These gauges carry `agent_name` and `company_id` beside `agent_id`
+ * (PEN-4280), so a hand-written literal pins label ORDER as well as value and
+ * breaks on any future label addition. It is also strictly STRONGER than
+ * `toContain`, which matches a value PREFIX -- a rendered `... 0.0455`
+ * satisfies a `... 0` literal, which is exactly the trap this file's own
+ * PEN-3314 block warns about.
+ */
+function gaugeValue(body: string, metric: string, agentId: string): number | undefined {
+  const line = body
+    .split("\n")
+    .find((l) => l.startsWith(`${metric}{`) && l.includes(`agent_id="${agentId}"`));
+  if (!line) return undefined;
+  return Number(line.slice(line.lastIndexOf("}") + 1).trim());
+}
+
+/**
+ * The full rendered label set of `metric` for one `agent_id`, as a map.
+ *
+ * Returned unordered on purpose: these assertions are about which labels are
+ * PRESENT and what they carry, never about the order prom-client happens to
+ * render them in.
+ */
+function gaugeLabels(body: string, metric: string, agentId: string): Record<string, string> {
+  const line = body
+    .split("\n")
+    .find((l) => l.startsWith(`${metric}{`) && l.includes(`agent_id="${agentId}"`));
+  if (!line) return {};
+  const inner = line.slice(line.indexOf("{") + 1, line.lastIndexOf("}"));
+  return Object.fromEntries(
+    [...inner.matchAll(/(\w+)="([^"]*)"/g)].map((m) => [m[1], m[2]]),
+  );
+}
+
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
@@ -155,11 +193,11 @@ describeEmbeddedPostgres("refreshQueuedRunAgeMetrics (BLO-21116)", () => {
 
       // The unfiltered gauge is deliberately UNCHANGED — a consumer reads it,
       // and the difference between the two is itself the signal.
-      expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${agentId}"} 7200`);
+      expect(gaugeValue(body, QUEUED_RUN_OLDEST_AGE_METRIC, agentId)).toBe(7200);
       // This is the assertion the exclusion exists for. Deleting the
       // `isEffectivelyDependencyReadyForDispatch` screen in
       // `refreshClaimableQueuedRunAgeMetrics` makes this line read 7200.
-      expect(body).toContain(`${QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC}{agent_id="${agentId}"} 0`);
+      expect(gaugeValue(body, QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC, agentId)).toBe(0);
     });
 
     it("counts a queued run whose blocker is already done", async () => {
@@ -180,7 +218,7 @@ describeEmbeddedPostgres("refreshQueuedRunAgeMetrics (BLO-21116)", () => {
 
       await refreshQueuedRunAgeMetrics(db, now);
       const { body } = await renderMetrics();
-      expect(body).toContain(`${QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC}{agent_id="${agentId}"} 1800`);
+      expect(gaugeValue(body, QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC, agentId)).toBe(1800);
     });
 
     it("counts the issue-interaction wake the claim path deliberately exempts", async () => {
@@ -208,7 +246,7 @@ describeEmbeddedPostgres("refreshQueuedRunAgeMetrics (BLO-21116)", () => {
 
       await refreshQueuedRunAgeMetrics(db, now);
       const { body } = await renderMetrics();
-      expect(body).toContain(`${QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC}{agent_id="${agentId}"} 900`);
+      expect(gaugeValue(body, QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC, agentId)).toBe(900);
     });
 
     it("does not credit an interaction wake that carries no comment id", async () => {
@@ -229,7 +267,7 @@ describeEmbeddedPostgres("refreshQueuedRunAgeMetrics (BLO-21116)", () => {
 
       await refreshQueuedRunAgeMetrics(db, now);
       const { body } = await renderMetrics();
-      expect(body).toContain(`${QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC}{agent_id="${agentId}"} 0`);
+      expect(gaugeValue(body, QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC, agentId)).toBe(0);
     });
 
     it("reports the oldest CLAIMABLE run, not the oldest run, when both are queued", async () => {
@@ -258,8 +296,8 @@ describeEmbeddedPostgres("refreshQueuedRunAgeMetrics (BLO-21116)", () => {
 
       await refreshQueuedRunAgeMetrics(db, now);
       const { body } = await renderMetrics();
-      expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${agentId}"} 39240`);
-      expect(body).toContain(`${QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC}{agent_id="${agentId}"} 120`);
+      expect(gaugeValue(body, QUEUED_RUN_OLDEST_AGE_METRIC, agentId)).toBe(39240);
+      expect(gaugeValue(body, QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC, agentId)).toBe(120);
     });
 
     it("excludes a run still sitting out its k8s-isolation admission backoff", async () => {
@@ -288,8 +326,8 @@ describeEmbeddedPostgres("refreshQueuedRunAgeMetrics (BLO-21116)", () => {
 
       await refreshQueuedRunAgeMetrics(db, now);
       const { body } = await renderMetrics();
-      expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${agentId}"} 5400`);
-      expect(body).toContain(`${QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC}{agent_id="${agentId}"} 0`);
+      expect(gaugeValue(body, QUEUED_RUN_OLDEST_AGE_METRIC, agentId)).toBe(5400);
+      expect(gaugeValue(body, QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC, agentId)).toBe(0);
     });
 
     it("excludes a run still sitting out its branch-claim admission backoff", async () => {
@@ -314,7 +352,7 @@ describeEmbeddedPostgres("refreshQueuedRunAgeMetrics (BLO-21116)", () => {
 
       await refreshQueuedRunAgeMetrics(db, now);
       const { body } = await renderMetrics();
-      expect(body).toContain(`${QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC}{agent_id="${agentId}"} 0`);
+      expect(gaugeValue(body, QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC, agentId)).toBe(0);
     });
 
     it("counts a run whose admission backoff has already elapsed", async () => {
@@ -339,7 +377,7 @@ describeEmbeddedPostgres("refreshQueuedRunAgeMetrics (BLO-21116)", () => {
 
       await refreshQueuedRunAgeMetrics(db, now);
       const { body } = await renderMetrics();
-      expect(body).toContain(`${QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC}{agent_id="${agentId}"} 600`);
+      expect(gaugeValue(body, QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC, agentId)).toBe(600);
     });
 
     it("counts a queued run that carries no issue id at all", async () => {
@@ -359,7 +397,7 @@ describeEmbeddedPostgres("refreshQueuedRunAgeMetrics (BLO-21116)", () => {
 
       await refreshQueuedRunAgeMetrics(db, now);
       const { body } = await renderMetrics();
-      expect(body).toContain(`${QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC}{agent_id="${agentId}"} 450`);
+      expect(gaugeValue(body, QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC, agentId)).toBe(450);
     });
 
     it("emits an explicit 0 for an agent with no queued runs at all", async () => {
@@ -372,7 +410,7 @@ describeEmbeddedPostgres("refreshQueuedRunAgeMetrics (BLO-21116)", () => {
 
       await refreshQueuedRunAgeMetrics(db, now);
       const { body } = await renderMetrics();
-      expect(body).toContain(`${QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC}{agent_id="${agentId}"} 0`);
+      expect(gaugeValue(body, QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC, agentId)).toBe(0);
     });
 
     it("keeps each agent's verdict independent when one agent's queue is entirely blocked", async () => {
@@ -410,8 +448,8 @@ describeEmbeddedPostgres("refreshQueuedRunAgeMetrics (BLO-21116)", () => {
 
       await refreshQueuedRunAgeMetrics(db, now);
       const { body } = await renderMetrics();
-      expect(body).toContain(`${QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC}{agent_id="${blockedAgentId}"} 0`);
-      expect(body).toContain(`${QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC}{agent_id="${healthyAgentId}"} 300`);
+      expect(gaugeValue(body, QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC, blockedAgentId)).toBe(0);
+      expect(gaugeValue(body, QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC, healthyAgentId)).toBe(300);
     });
   });
 
@@ -432,7 +470,7 @@ describeEmbeddedPostgres("refreshQueuedRunAgeMetrics (BLO-21116)", () => {
 
     await refreshQueuedRunAgeMetrics(db, now);
     const { body } = await renderMetrics();
-    expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${agentId}"} 600`);
+    expect(gaugeValue(body, QUEUED_RUN_OLDEST_AGE_METRIC, agentId)).toBe(600);
     expect(body).toContain(`${QUEUED_RUN_AGE_METRICS_REFRESH_SUCCESS_METRIC} 1`);
   });
 
@@ -459,8 +497,12 @@ describeEmbeddedPostgres("refreshQueuedRunAgeMetrics (BLO-21116)", () => {
 
     await refreshQueuedRunAgeMetrics(db, now);
     const { body } = await renderMetrics();
-    expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${agentId}"} 90`);
-    expect(body).not.toMatch(new RegExp(`agent_id="${agentId}"\\} 43[0-9]{3}`));
+    expect(gaugeValue(body, QUEUED_RUN_OLDEST_AGE_METRIC, agentId)).toBe(90);
+    // The pre-coalesce age would have been ~43 200s; assert on the parsed
+    // value rather than a label-literal regex, which the added routing labels
+    // (PEN-4280) would otherwise silently stop matching -- a regex that no
+    // longer matches passes this negative assertion for the wrong reason.
+    expect(gaugeValue(body, QUEUED_RUN_OLDEST_AGE_METRIC, agentId)).toBeLessThan(43000);
   });
 
   it("marks the age snapshot stale after a refresh failure without publishing a false zero", async () => {
@@ -487,7 +529,7 @@ describeEmbeddedPostgres("refreshQueuedRunAgeMetrics (BLO-21116)", () => {
     await expect(refreshQueuedRunAgeMetrics(failingDb, now)).rejects.toThrow("simulated queued-run metric refresh outage");
 
     const { body } = await renderMetrics();
-    expect(body).toContain(`${QUEUED_RUN_OLDEST_AGE_METRIC}{agent_id="${agentId}"} 600`);
+    expect(gaugeValue(body, QUEUED_RUN_OLDEST_AGE_METRIC, agentId)).toBe(600);
     expect(body).toContain(`${QUEUED_RUN_AGE_METRICS_REFRESH_SUCCESS_METRIC} 0`);
   });
 
@@ -571,6 +613,90 @@ describeEmbeddedPostgres("refreshQueuedRunAgeMetrics (BLO-21116)", () => {
       `);
     }
   });
+
+  /**
+   * PEN-4280. onprem-k8s' `HeartbeatRunQueueAgentOldestQueuedHigh` is the
+   * consumer these gauges exist to be repointed onto once BLO-26656 clears.
+   * That alert is pinned to a per-tenant Alertmanager route on `company_id`
+   * (BLO-31172) and renders `{{ $labels.agent_name }}` in its summary, so an
+   * agent_id-only series cannot carry it: the repoint would silently route
+   * every Penstock page to Blockcast on-call and render an empty agent name.
+   * Its own design note 4 records that route being absent for 34 days.
+   */
+  describe("routing and attribution labels (PEN-4280)", () => {
+    it("carries the agent's name and owning company on both gauges", async () => {
+      const { companyId, agentId } = await insertCompanyAndAgent();
+      const now = new Date();
+      const issueId = await insertIssue(companyId);
+      await insertQueuedRun({
+        companyId,
+        agentId,
+        ageSeconds: 3600,
+        now,
+        contextSnapshot: { issueId },
+      });
+
+      await refreshQueuedRunAgeMetrics(db, now);
+      const { body } = await renderMetrics();
+
+      for (const metric of [QUEUED_RUN_OLDEST_AGE_METRIC, QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC]) {
+        expect(gaugeLabels(body, metric, agentId)).toEqual({
+          agent_id: agentId,
+          agent_name: "Test Agent",
+          company_id: companyId,
+        });
+      }
+    });
+
+    it("gives both gauges an identical label set, so their difference is well formed", async () => {
+      // `oldest - oldest_claimable` is the published measure of how much queued
+      // work is structurally unclaimable. In PromQL that subtraction only
+      // matches where the two sides agree on EVERY label, so a label added to
+      // one gauge and not the other would make the difference silently empty
+      // rather than wrong -- the harder failure to notice.
+      const { companyId, agentId } = await insertCompanyAndAgent();
+      const now = new Date();
+      const blockedIssueId = await insertIssue(companyId, { blockedBy: "open" });
+      await insertQueuedRun({
+        companyId,
+        agentId,
+        ageSeconds: 7200,
+        now,
+        contextSnapshot: { issueId: blockedIssueId },
+      });
+
+      await refreshQueuedRunAgeMetrics(db, now);
+      const { body } = await renderMetrics();
+
+      const raw = gaugeLabels(body, QUEUED_RUN_OLDEST_AGE_METRIC, agentId);
+      const claimable = gaugeLabels(body, QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC, agentId);
+      expect(Object.keys(raw).sort()).toEqual(Object.keys(claimable).sort());
+      expect(raw).toEqual(claimable);
+      // And the difference this enables is the real one: the blocked run is
+      // counted raw and excluded from claimable.
+      expect(gaugeValue(body, QUEUED_RUN_OLDEST_AGE_METRIC, agentId)).toBe(7200);
+      expect(gaugeValue(body, QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC, agentId)).toBe(0);
+    });
+
+    it("labels an agent with an empty queue, which has no run to read a company from", async () => {
+      // The zero-floor series is why these labels are sourced from `agents`
+      // rather than `heartbeat_runs.company_id`: an idle agent emits an
+      // explicit 0 and there is no queued row to carry its company.
+      const { companyId, agentId } = await insertCompanyAndAgent();
+      const now = new Date();
+
+      await refreshQueuedRunAgeMetrics(db, now);
+      const { body } = await renderMetrics();
+
+      expect(gaugeValue(body, QUEUED_RUN_OLDEST_AGE_METRIC, agentId)).toBe(0);
+      expect(gaugeLabels(body, QUEUED_RUN_OLDEST_AGE_METRIC, agentId)).toEqual({
+        agent_id: agentId,
+        agent_name: "Test Agent",
+        company_id: companyId,
+      });
+    });
+  });
+
 });
 
 type PlanNode = {
