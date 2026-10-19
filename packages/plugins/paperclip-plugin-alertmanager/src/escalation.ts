@@ -68,6 +68,37 @@ export async function hasLiveBlocker(ctx: PluginContext, issueId: string, compan
   }
 }
 
+/**
+ * True when `issue` carries a monitor wake still in the future (PEN-4337).
+ *
+ * Attendance in this platform is the UNION of two mechanisms — an unresolved
+ * `blockedBy` edge and an armed monitor — and this ladder only consulted the
+ * first. An alert row whose owner has deliberately scheduled their own return
+ * was therefore indistinguishable from an abandoned one, so the ladder woke
+ * them early, reassigned the row out from under the monitor they armed, and
+ * finally minted a founder-assigned `[user-cover]` for work that was already
+ * attended. Measured on PEN-4261: parked `blocked` with a monitor on its
+ * blocker, it still drew rungs at 11:28Z / 15:29Z / 19:29Z and a cover at
+ * 23:29Z on 2026-10-18.
+ *
+ * Accepts `Date` and `string` because BOTH shapes are real. The host hands
+ * plugins the whole issue row, and the worker boundary is JSON-RPC over stdio
+ * (`plugin-worker-manager.ts`), so a `Date` column arrives in production as an
+ * ISO string while the in-process test harness supplies a real `Date`. A guard
+ * written against `Date` alone would pass its tests and be inert in production
+ * — the exact failure shape this one exists to remove.
+ *
+ * Fails toward `false`, matching `hasLiveBlocker`: an absent, null, or
+ * unparseable stamp is NOT a wake, and reading one as attendance would hold a
+ * firing alert forever.
+ */
+export function hasArmedMonitor(issue: { monitorNextCheckAt?: Date | string | null }, now: Date): boolean {
+  const raw = issue.monitorNextCheckAt;
+  if (raw === null || raw === undefined) return false;
+  const at = raw instanceof Date ? raw.getTime() : Date.parse(String(raw));
+  return Number.isFinite(at) && at > now.getTime();
+}
+
 function holdUntil(comments: Array<{ body: string }>): number | null {
   let latest: number | null = null;
   for (const { body } of comments) {
@@ -795,13 +826,25 @@ async function advanceIssueLadder(
     return;
   }
 
-  // BLO-40673: a row parked behind a live blocker is waiting on that blocker's
-  // owner, not on this row's. Waking it is refused by the host anyway
+  // The row is ATTENDED, by either of the two mechanisms this platform uses.
+  // Defer the rung by one interval; whichever mechanism clears puts the ladder
+  // back on its normal schedule at the next sweep.
+  //
+  // BLO-40673 — an unresolved `blockedBy` edge: the row is waiting on that
+  // blocker's owner, not on this row's. Waking it is refused by the host anyway
   // (`requestWakeup` rejects unresolved blockers), and the later rungs would
   // reassign it up the chain and mint a [user-cover] for work nobody can start.
-  // Defer the rung by one interval instead. The edge resolving (or being cut)
-  // puts the ladder back on its normal schedule at the next sweep.
-  if (await hasLiveBlocker(ctx, issue.id, companyId)) {
+  //
+  // PEN-4337 — an armed monitor: the owner has already scheduled their own
+  // return, so a rung here is a spurious wake, a reassign that orphans the
+  // monitor its armer owns, and ultimately a founder-assigned cover for work
+  // that was never abandoned. Deliberately checked FIRST: it reads a field the
+  // sweep already has, so an attended row costs no `relations.get` round trip.
+  //
+  // Both are deferrals rather than permanent skips, which is what keeps a
+  // genuinely abandoned row reachable: neither mechanism is a promise that the
+  // work happens, only that a wake exists, so the ladder has to re-ask.
+  if (hasArmedMonitor(issue, now) || await hasLiveBlocker(ctx, issue.id, companyId)) {
     await casAlertState(ctx, ref, state, { ...state, nextEscalationAt: new Date(now.getTime() + rungIntervalMs(state, config)).toISOString() });
     return;
   }

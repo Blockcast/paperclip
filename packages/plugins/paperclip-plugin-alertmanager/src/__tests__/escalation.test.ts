@@ -6,6 +6,7 @@ import { PLUGIN_STATE_PRECONDITION_FAILED_CODE, type PluginContext } from "@pape
 import {
   COVER_ORIGIN,
   escalationDeadlineMs,
+  hasArmedMonitor,
   reopenOpenCoverMembership,
   recordSourceResolvedAndCloseCovers,
   resolveAlertmanagerApiUrl,
@@ -240,10 +241,19 @@ function buildFakeAlertmanagerStore() {
   return { issuesList, issuesCreate, db, coverIssuesById, covers, members, openMemberCount };
 }
 
-function sweepContext(state: AlertStateRecord, reportsTo: string | null = "cto", store = buildFakeAlertmanagerStore()) {
+function sweepContext(
+  state: AlertStateRecord,
+  reportsTo: string | null = "cto",
+  store = buildFakeAlertmanagerStore(),
+  // PEN-4337: the monitor stamp the host projects onto every list row. Typed
+  // `Date | string` because the worker boundary is JSON-RPC, so production
+  // sees the string form; tests exercise both.
+  monitorNextCheckAt: Date | string | null = null,
+) {
   const issue = {
     id: "issue-1", identifier: "BLO-1", title: "Alert", status: "todo", priority: "critical",
     originId: "fp-1", assigneeAgentId: "engineer", projectId: null, goalId: null,
+    monitorNextCheckAt,
   };
   const mocks = {
     state: { get: vi.fn(async () => state), set: vi.fn(async () => undefined) },
@@ -476,6 +486,94 @@ describe("alert escalation", () => {
     deadEdge.mocks.issues.relations.get.mockResolvedValue({ blockedBy: [{ id: "old-alert", status: "cancelled" }], blocks: [] });
     await runAlertEscalationSweep(deadEdge.ctx, config(), new Date("2026-07-11T01:00:00Z"));
     expect(deadEdge.mocks.issues.update).toHaveBeenCalledWith("issue-1", { assigneeAgentId: "cto", assigneeUserId: null }, "company-1");
+  });
+
+  // PEN-4337: an armed monitor is the OTHER half of attendance. Coverage is the
+  // union of an unresolved `blockedBy` edge and a future `monitorNextCheckAt`;
+  // this ladder consulted only the first, so a row whose owner had scheduled
+  // their own return still drew rungs and, at the top of the chain, a
+  // founder-assigned [user-cover]. Measured on PEN-4261/PEN-4271, 2026-10-18.
+  describe("armed monitor (PEN-4337)", () => {
+    const due = {
+      paperclipIssueId: "issue-1", paperclipCompanyId: "company-1", assigneeUserId: null,
+      assigneeAgentId: "engineer", alertname: "SyntheticAlert", severity: "critical",
+      firstSeenAt: "x", lastFiredAt: "x", resolvedAt: null,
+      nextEscalationAt: "2026-07-11T00:00:00Z", escalationAttempt: 1, escalationIntervalMs: 30 * 60_000,
+    };
+    const NOW = new Date("2026-07-11T01:00:00Z");
+
+    // Both wire shapes, because only one of them is what production sees. The
+    // host projects a `Date` column and the worker boundary is JSON-RPC over
+    // stdio, so a guard written against `Date` alone passes in-process and is
+    // inert in the deployment it was written for.
+    it.each([
+      ["Date", new Date("2026-07-11T09:00:00Z")],
+      ["ISO string", "2026-07-11T09:00:00.000Z"],
+    ])("defers the rung instead of waking or reassigning a row with a future monitor (%s)", async (_shape, stamp) => {
+      const { ctx, mocks } = sweepContext(due, "cto", buildFakeAlertmanagerStore(), stamp);
+      await runAlertEscalationSweep(ctx, config(), NOW);
+      expect(mocks.issues.requestWakeup).not.toHaveBeenCalled();
+      expect(mocks.issues.update).not.toHaveBeenCalled();
+      expect(mocks.issues.createComment).not.toHaveBeenCalled();
+      expect(mocks.state.set).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ escalationAttempt: 1, nextEscalationAt: "2026-07-11T01:30:00.000Z" }),
+        expect.anything(),
+      );
+    });
+
+    // The literal defect: top of chain, so the next rung is the cover itself.
+    it("mints no founder-assigned [user-cover] for a row with a future monitor", async () => {
+      const store = buildFakeAlertmanagerStore();
+      const { ctx, mocks } = sweepContext(due, null, store, "2026-07-11T09:00:00.000Z");
+      await runAlertEscalationSweep(ctx, config(), NOW);
+      expect(mocks.issues.create).not.toHaveBeenCalled();
+      expect(store.covers.size).toBe(0);
+      // and the ladder is DEFERRED, not terminated: a skip that set
+      // `escalationComplete` would be short-circuited by the guard at the top
+      // of every later sweep, so a row that later goes genuinely unattended
+      // could never be covered at all — silence where an escalation belongs.
+      expect(mocks.state.set).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ nextEscalationAt: "2026-07-11T01:30:00.000Z" }),
+        expect.anything(),
+      );
+      const writes = mocks.state.set.mock.calls as unknown as Array<[unknown, { escalationComplete?: boolean }, unknown]>;
+      expect(writes.at(-1)?.[1].escalationComplete).not.toBe(true);
+    });
+
+    // Negative controls. Without these the guard above is satisfied by a
+    // ladder that never advances for any reason, which is not what was built.
+    it.each([
+      ["a lapsed monitor", "2026-07-11T00:30:00.000Z"],
+      ["no monitor", null],
+      ["an unparseable stamp", "not-a-date"],
+    ])("still advances the ladder with %s", async (_label, stamp) => {
+      const { ctx, mocks } = sweepContext(due, "cto", buildFakeAlertmanagerStore(), stamp);
+      await runAlertEscalationSweep(ctx, config(), NOW);
+      expect(mocks.issues.update).toHaveBeenCalledWith("issue-1", { assigneeAgentId: "cto", assigneeUserId: null }, "company-1");
+      expect(mocks.issues.requestWakeup).toHaveBeenCalledTimes(1);
+    });
+
+    // An attended row must cost no blocker round trip — the monitor field is
+    // already in hand. Guards the short-circuit order, which is the only
+    // reason this check is free.
+    it("short-circuits the blocker read when a monitor is armed", async () => {
+      const { ctx, mocks } = sweepContext(due, "cto", buildFakeAlertmanagerStore(), "2026-07-11T09:00:00.000Z");
+      await runAlertEscalationSweep(ctx, config(), NOW);
+      expect(mocks.issues.relations.get).not.toHaveBeenCalled();
+    });
+
+    it("reads the stamp directly, for both wire shapes", () => {
+      const now = new Date("2026-07-11T01:00:00Z");
+      expect(hasArmedMonitor({ monitorNextCheckAt: new Date("2026-07-11T02:00:00Z") }, now)).toBe(true);
+      expect(hasArmedMonitor({ monitorNextCheckAt: "2026-07-11T02:00:00.000Z" }, now)).toBe(true);
+      expect(hasArmedMonitor({ monitorNextCheckAt: new Date("2026-07-11T00:00:00Z") }, now)).toBe(false);
+      expect(hasArmedMonitor({ monitorNextCheckAt: "2026-07-11T00:00:00.000Z" }, now)).toBe(false);
+      expect(hasArmedMonitor({ monitorNextCheckAt: null }, now)).toBe(false);
+      expect(hasArmedMonitor({}, now)).toBe(false);
+      expect(hasArmedMonitor({ monitorNextCheckAt: "garbage" }, now)).toBe(false);
+    });
   });
 
   it("continues the sweep past an issue whose processing throws", async () => {
