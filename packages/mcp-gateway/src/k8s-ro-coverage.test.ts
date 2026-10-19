@@ -70,24 +70,38 @@ import { scrubResponseBody } from "./response-scrub.js";
  * `kubernetes-mcp-server-config` — all of which live in
  * `Blockcast/onprem-k8s:paperclip/k8s-mcp-stack.yaml`.
  *
- * ⛔ AS OF THIS COMMIT THAT IS STILL TRUE AND THIS WARNING STANDS. The `k8s-ro`
- * gateway upstream map on `onprem-k8s` master carries NO `tools` allowlist
- * (unlike the prometheus gateway, whose five-tool allowlist is what actually
- * closed PEN-2735), so every tool that image serves is exposed, and an upstream
- * image bump can add a tool, route it through `/k8s-ro`, and leave this suite
- * green. Do not read the paragraph below as saying otherwise.
+ * ⛔ THIS WARNING STANDS UNTIL BOTH CONDITIONS BELOW HOLD. It is written as a
+ * CONDITION, not a status, on purpose: the status it replaced ("open and not
+ * merged", "returning 404") was false four minutes after the commit that wrote
+ * it, and nothing in this repo noticed (PEN-4323). Do not restate a merge
+ * state or a date here — state the condition and name its probe.
  *
- * PEN-4295 is the row that closes this half, and its carrier is
- * onprem-k8s#6135 — OPEN, NOT MERGED at the time of writing, with
- * `scripts/check-k8s-ro-tool-surface.mjs` returning 404 on that repo's master.
- * WHEN IT MERGES AND THE GATEWAY POD RESTARTS (the Deployment carries no config
- * checksum, so the ConfigMap change does not roll it), the map will carry a
- * twelve-tool allowlist matching the list below, that guard will fail
- * onprem-k8s's build on an image bump, a dropped `--read-only`, a deleted
- * `disabled_tools` or an allowlist that is not exactly this set, and a tool a
- * future image adds will be DENIED rather than served — `isToolAllowed` is
- * enforced on `tools/list` AND `tools/call`, on both the aggregate and prefixed
- * routes. Until both of those have happened, the surface is unrestricted.
+ * What bounds the `k8s-ro` surface is a `tools` allowlist on that gateway's
+ * upstream map in `onprem-k8s` — the mechanism whose five-tool version is what
+ * actually closed PEN-2735 for the prometheus gateway. PEN-4295 is the row
+ * that closes this half; its carrier is onprem-k8s#6135. That allowlist is
+ * ENFORCING only once BOTH of the following hold:
+ *
+ *   1. it is present on `onprem-k8s` master — probe:
+ *      `paperclip/k8s-mcp-gateway-k8s-ro.yaml` on that repo's default branch;
+ *      AND
+ *   2. a gateway pod that started AFTER it landed is serving — probe: the age
+ *      of `Deployment/paperclip-mcp-gateway-k8s-ro`'s pods against that file's
+ *      last commit. `loadUpstreams()` is startup-only and the Deployment
+ *      carries no config checksum, so the ConfigMap change does NOT roll the
+ *      pod; an operator `rollout restart` is the gate.
+ *
+ * Condition 2 does not follow from condition 1, and no test in THIS repo can
+ * read either. UNTIL BOTH HOLD, every tool that image serves is exposed: an
+ * upstream image bump can add a tool, route it through `/k8s-ro`, and leave
+ * this suite green. Do not read the paragraph below as saying otherwise.
+ *
+ * ONCE BOTH HOLD, the map carries a twelve-tool allowlist matching the list
+ * below, `onprem-k8s:scripts/check-k8s-ro-tool-surface.mjs` fails that repo's
+ * build on an image bump, a dropped `--read-only`, a deleted `disabled_tools`
+ * or an allowlist that is not exactly this set, and a tool a future image adds
+ * is DENIED rather than served — `isToolAllowed` is enforced on `tools/list`
+ * AND `tools/call`, on both the aggregate and prefixed routes.
  *
  * WHAT WILL STILL BE LEFT AFTERWARDS, and is worth knowing now: the two repos
  * cannot check each other. No test in either can read the other's tree, so
@@ -462,9 +476,12 @@ function scrub(body: string): string {
  * coverage of the tool. `transformResponseBody` dispatches to a different
  * function per framing, and each verdict has to hold on both.
  */
+function sseFrame(body: string): string {
+  return `event: message\ndata: ${body}\n\n`;
+}
+
 function scrubSse(body: string): string {
-  const framed = `event: message\ndata: ${body}\n\n`;
-  return scrubResponseBody(Buffer.from(framed, "utf8"), "text/event-stream").toString("utf8");
+  return scrubResponseBody(Buffer.from(sseFrame(body), "utf8"), "text/event-stream").toString("utf8");
 }
 
 describe("k8s-ro scrubber coverage register (PEN-4282)", () => {
@@ -561,6 +578,45 @@ describe("k8s-ro scrubber coverage register (PEN-4282)", () => {
           expect(output, `${surface.id}: "${needle}" did not survive SSE framing`).toContain(needle);
         }
       });
+
+      if (surface.verdict.kind === "scrubbed") {
+        it("replaces the material with the redaction marker rather than dropping the field silently", () => {
+          expect(scrubSse(surface.body)).toContain(REDACTED);
+        });
+      } else if (surface.mustNotSurvive.length === 0) {
+        it("passes through byte-exact", () => {
+          // The JSON arm's byte-exact check, carried over with BOTH of its
+          // guards unchanged: the `mustNotSurvive.length === 0` condition, and
+          // the `configmap-data` carve-out that condition implements (that
+          // surface's sample carries the echo annotation precisely so the
+          // control fires on it, so its body MUST change).
+          //
+          // What this catches, stated as measured rather than as assumed
+          // (PEN-4323). A PURE reformat — one that leaves `ctx.changed` false —
+          // is already structurally discarded: `transformResponseBody` returns
+          // the ORIGINAL Buffer unless `ctx.changed`, so appending to a frame
+          // nothing was redacted from changes nothing observable. Mutation-
+          // tested: that mutation alone is GREEN on this suite, so the threat
+          // as originally written ("reformat a frame it has nothing to redact")
+          // is not reachable on its own.
+          //
+          // What IS reachable, and what this pins, is a reformat that rides a
+          // body the scrubber did touch — a lossy SSE re-framing, or an
+          // over-redaction that trips `ctx.changed` on a surface that should
+          // pass through. Neither is caught by the assertions above, which only
+          // pin the mustSurvive/mustNotSurvive pair and are blind to every byte
+          // outside those needles. Mutation-tested red: reformatting every
+          // re-emitted frame AND setting `ctx.changed` reddens 6 of these while
+          // leaving all 35 pre-PEN-4323 assertions green — the
+          // assertion-that-cannot-fail class PEN-4282 was filed about, found
+          // inside PEN-4282's own guard.
+          //
+          // The baseline is the FRAMED string, not `surface.body`: `scrubSse`
+          // frames before scrubbing. Both sides go through `sseFrame` so the
+          // expected value cannot drift from the helper that produces it.
+          expect(scrubSse(surface.body)).toBe(sseFrame(surface.body));
+        });
+      }
     },
   );
 });
