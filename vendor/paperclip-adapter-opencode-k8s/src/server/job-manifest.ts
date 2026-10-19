@@ -736,12 +736,62 @@ function buildEnvVars(
   // branch is in practice unreachable — layer 3 `inheritedEnv` carries the
   // server pod's PATH, which the inherit allowlist admits by name.
   const pathEntries = (existingPath || GITHUB_WRAPPER_FALLBACK_PATH).split(":");
-  if (pathEntries[0] !== IMAGE_WRAPPER_BIN_DIR) {
-    merged.PATH = [
-      IMAGE_WRAPPER_BIN_DIR,
-      ...pathEntries.filter((entry) => entry !== IMAGE_WRAPPER_BIN_DIR),
-    ].join(":");
-  }
+  const leadOrdered =
+    pathEntries[0] === IMAGE_WRAPPER_BIN_DIR
+      ? pathEntries
+      : [IMAGE_WRAPPER_BIN_DIR, ...pathEntries.filter((entry) => entry !== IMAGE_WRAPPER_BIN_DIR)];
+
+  // PEN-4357: making the wrapper directory PATH[0] here is necessary but NOT
+  // sufficient, because this process env is not the env the agent's commands
+  // resolve under. The PVC shell dotfiles (`$HOME/.bashrc`, `.profile`,
+  // `.zshenv` - fleet state, not in this repo) each carry
+  //
+  //     case ":$PATH:" in
+  //       *":$HOME/.local/bin:"*) ;;
+  //       *) PATH="$HOME/.local/bin:$PATH" ;;
+  //     esac
+  //
+  // and the same shape for `$HOME/bin`. This manifest points BASH_ENV (and
+  // ZDOTDIR) at stubs that chain them on EVERY non-interactive shell, not only
+  // login shells - so the stanza runs after the prepend above, in the Job's own
+  // shell, and is the later writer.
+  //
+  // The guard is on PRESENCE, so the stanza is a no-op when the directory is
+  // already on PATH and a FRONT prepend when it is not. Dropping the directory
+  // therefore does not take it out of the lookup; it promotes it past the
+  // root-owned wrappers. That is the whole defect: an `adapterConfig.env.PATH`
+  // that merely OMITS `<home>/.local/bin` - the live layer-4 value, which swaps
+  // it for `/paperclip/opencode-api-key-bin` - makes every `bash -c` resolve
+  // `gh`/`git`/`github-mcp-server` out of an agent-writable directory on a PVC
+  // shared across companies. Measured in an agent pod 2026-10-19: with the
+  // entry absent all three resolved to `/paperclip/.local/bin` (node:node, uid
+  // 1000-writable); with it present all three resolved to the image directory.
+  //
+  // So backfill the two tooling directories BEHIND the lead, which makes the
+  // stanza a no-op by construction. Behind the lead they cannot shadow a
+  // wrapper, which is the property that matters; they are agent-writable and
+  // nothing security-relevant may live in them. Keyed off `merged.HOME`, set
+  // above, because that is the variable the stanza itself expands - deriving it
+  // from the data mount instead would miss an isolated per-run home.
+  //
+  // This is the adapter-layer mirror of `paperclip.toolingBinDirs` in the
+  // chart, which fixes the same shape for the StatefulSet and api Deployment.
+  // Fixing the N operator-set PATH values instead is not equivalent: the
+  // omission originated in configuration, and configuration is not a security
+  // control.
+  //
+  // NOT covered, and deliberately out of scope here: the same dotfiles also
+  // carry UNCONDITIONAL `export PATH="$BUN_INSTALL/bin:$PATH"` lines, which
+  // prepend whether or not the entry is present. No presence invariant can
+  // neutralise those. They are harmless today only because those directories
+  // carry no `gh`/`git`/`github-mcp-server` - which is an observation about
+  // current PVC contents, not a control. Closing that needs the dotfiles to
+  // stop being agent-writable; see PEN-4367.
+  const homeRoot = (merged.HOME ?? "").replace(/\/+$/, "");
+  const missingToolingDirs = homeRoot
+    ? [`${homeRoot}/.local/bin`, `${homeRoot}/bin`].filter((dir) => !leadOrdered.includes(dir))
+    : [];
+  merged.PATH = [leadOrdered[0], ...missingToolingDirs, ...leadOrdered.slice(1)].join(":");
 
   // Keep credential-shaped values out of the Job spec. A Secret-backed
   // secretKeyRef is visible to the kubelet but not to a read-only Pod GET.
