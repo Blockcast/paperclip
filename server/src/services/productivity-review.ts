@@ -1813,12 +1813,11 @@ function formatNoExecutableTurnTriggerNote(gating: NonNullable<ProductivityRevie
   if (
     (gating.currentMechanism === "capacity_park" || gating.currentMechanism === "retry_park")
     && gating.overdue
-    && gating.scheduledRetryAt
   ) {
     const attribution = gating.currentMechanism === "capacity_park"
       ? "this is a fleet-capacity signal, not assignee inactivity"
       : "the assignee was never given a turn on it, so this is a dispatch signal, not assignee inactivity";
-    return ` — ${msToHuman(gating.noExecutableTurnMs)} of that is no-executable-turn time (${mix}), currently behind an overdue-undispatched \`scheduled_retry\` (run \`${gating.currentRunId}\`, due ${gating.scheduledRetryAt.toISOString()}, not yet promoted); ${attribution}`;
+    return ` — ${msToHuman(gating.noExecutableTurnMs)} of that is no-executable-turn time (${mix}), currently behind an overdue-undispatched \`scheduled_retry\` (run \`${gating.currentRunId}\`, ${gating.scheduledRetryAt ? `due ${gating.scheduledRetryAt.toISOString()}` : "no due time recorded"}, not yet promoted); ${attribution}`;
   }
   return ` — ${msToHuman(gating.noExecutableTurnMs)} of that is no-executable-turn time (${mix}), but the current run is no longer blocked, so this is not being suppressed`;
 }
