@@ -624,6 +624,7 @@ jobs:
             scripts/approve-paperclip-api-digest.sh
             scripts/stamp-paperclip-api-approval-plan.sh
             scripts/verify-review-gate-capture-promotion.mjs
+            .github/scripts/precreate-online-indexes.sh
           sparse-checkout-cone-mode: false
 
       - name: Verify release tooling revision
@@ -649,13 +650,16 @@ jobs:
           script="$(pwd)/.release-tooling/scripts/approve-paperclip-api-digest.sh"
           stamper="$(pwd)/.release-tooling/scripts/stamp-paperclip-api-approval-plan.sh"
           promotion_verifier="$(pwd)/.release-tooling/scripts/verify-review-gate-capture-promotion.mjs"
-          if [ ! -x "${script}" ] || [ ! -x "${stamper}" ] || [ ! -r "${promotion_verifier}" ]; then
+          precreate="$(pwd)/.release-tooling/.github/scripts/precreate-online-indexes.sh"
+          if [ ! -x "${script}" ] || [ ! -x "${stamper}" ] || [ ! -r "${promotion_verifier}" ] \
+            || [ ! -x "${precreate}" ]; then
             echo "Approval release tooling missing or non-executable at trusted revision ${expected}" >&2
             exit 1
           fi
           echo "approve_script=${script}" >> "$GITHUB_OUTPUT"
           echo "stamp_script=${stamper}" >> "$GITHUB_OUTPUT"
           echo "promotion_verify_script=${promotion_verifier}" >> "$GITHUB_OUTPUT"
+          echo "precreate_script=${precreate}" >> "$GITHUB_OUTPUT"
 
       - name: Render, stamp, and validate deploy plan
         id: plan
@@ -953,11 +957,23 @@ jobs:
       # `helm upgrade`, so `steps.helm.conclusion` stays `skipped` on any
       # failure here -- the only value that licenses the in-flight lock cleanup
       # at the end of this job.
+      #
+      # PEN-4310: that advisory guarantee is written INSIDE the script, so it is
+      # vacuous when the script is absent -- the shell exits 127 and this step
+      # becomes a hard gate. It was absent on every rollback: run from the bare
+      # workspace path this resolved against `target_sha`, an operator-supplied
+      # historical commit, and the script only landed in 118cc3ff. Running it
+      # from the trusted `.release-tooling` checkout at `github.workflow_sha`
+      # binds the script to the same revision as the step invoking it, which is
+      # the reason that checkout exists (see its comment above, which names this
+      # exact failure). Precreation now also WORKS on a rollback rather than
+      # merely not breaking it.
       - name: online-index precreation
         env:
           DIGEST: ${{ steps.artifact.outputs.digest }}
           NS: ${{ vars.PAPERCLIP_NAMESPACE || 'paperclip' }}
-        run: .github/scripts/precreate-online-indexes.sh
+          PRECREATE_SCRIPT: ${{ steps.tooling.outputs.precreate_script }}
+        run: "${PRECREATE_SCRIPT}"
 
       # Refuse to start a rollout whose pending migrations need an index built
       # online first. Those migrations raise from inside worker startup, so
