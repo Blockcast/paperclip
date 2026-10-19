@@ -80,6 +80,7 @@ import {
 } from "./services/adapter-registry-bootstrap.js";
 import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-share-client.js";
 import { summarizeStrandedRecoveryHandBackPass } from "./services/recovery/service.js";
+import { createRecoveryChainTimer } from "./services/recovery/chain-pass-timing.js";
 import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl } from "./runtime-api.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
 import {
@@ -2369,8 +2370,21 @@ export async function startServer(): Promise<StartedServer> {
             // report its own stall immediately rather than waiting out the
             // previous pass's re-log clock.
             heartbeatRecoveryChainStallLoggedAt = 0;
-            trackHeartbeatSchedulerWork(heartbeat
-              .reconcileStrandedAssignedIssues()
+            // PEN-4381: per-pass timing for the whole chain, on one join key.
+            // Pass 1 already had `pass-timing.ts` measuring INSIDE it and the
+            // chain had a gauge measuring the TOTAL; nothing measured passes
+            // 2-8, which by 2026-10-19 were 60% of a 135 s chain. The two
+            // existing instruments could only be joined by timestamp proximity,
+            // which fails precisely when the chain overruns its 30 s tick and
+            // overlaps the next one. Diagnostic only — see the module docblock.
+            const chainTimer = createRecoveryChainTimer({
+              log: (fields, message) => logger.info(fields, message),
+            });
+            trackHeartbeatSchedulerWork(chainTimer
+              // Pass 1's span is the sweep call alone, so it stays directly
+              // comparable with the `stranded assigned issue sweep phase
+              // timing` line the sweep emits from inside itself.
+              .time(1, "reconcileStrandedAssignedIssues", () => heartbeat.reconcileStrandedAssignedIssues())
               .then(async (reconciled) => {
                 if (
                   reconciled.assignmentDispatched > 0 ||
@@ -2384,7 +2398,7 @@ export async function startServer(): Promise<StartedServer> {
                   logger.warn({ ...reconciled }, "periodic heartbeat recovery changed assigned issue state");
                 }
               })
-              .then(async () => {
+              .then(chainTimer.pass(2, "reconcileIssueGraphLiveness", async () => {
                 const reconciled = await heartbeat.reconcileIssueGraphLiveness();
                 // BLO-29601: auto-resolving a dead escalation is a change to the issue
                 // graph too. Without it in this gate the drain runs silently and the only
@@ -2401,34 +2415,34 @@ export async function startServer(): Promise<StartedServer> {
                 ) {
                   logger.warn({ ...reconciled }, "periodic issue-graph liveness reconciliation changed issue graph state");
                 }
-              })
-              .then(async () => {
+              }))
+              .then(chainTimer.pass(3, "reconcileTaskWatchdogs", async () => {
                 const reconciled = await heartbeat.reconcileTaskWatchdogs();
                 if (reconciled.triggered > 0) {
                   logger.warn({ ...reconciled }, "periodic task-watchdog reconciliation triggered watchdog work");
                 }
-              })
-              .then(async () => {
+              }))
+              .then(chainTimer.pass(4, "scanSilentActiveRuns", async () => {
                 const scanned = await heartbeat.scanSilentActiveRuns();
                 if (scanned.created > 0 || scanned.escalated > 0) {
                   logger.warn({ ...scanned }, "periodic active-run output watchdog created review work");
                 }
-              })
-              .then(async () => {
+              }))
+              .then(chainTimer.pass(5, "reconcileProductivityReviews", async () => {
                 const reviewed = await heartbeat.reconcileProductivityReviews();
                 // BLO-30303 AC4: unconditional — see the startup pass above.
                 logger.info({ ...reviewed }, "periodic productivity reconciliation funnel");
                 if (reviewed.created > 0 || reviewed.updated > 0 || reviewed.failed > 0) {
                   logger.warn({ ...reviewed }, "periodic productivity reconciliation created or updated review work");
                 }
-              })
-              .then(async () => {
+              }))
+              .then(chainTimer.pass(6, "reconcileResolvedBlockerDependents", async () => {
                 const swept = await heartbeat.reconcileResolvedBlockerDependents();
                 if (swept.woken > 0 || swept.failed > 0) {
                   logger.warn({ ...swept }, "periodic resolved-blocker-dependents sweep enqueued wakes");
                 }
-              })
-              .then(async () => {
+              }))
+              .then(chainTimer.pass(7, "reconcileFailedWakeDispatches", async () => {
                 const failedWakeDispatches = await heartbeat.reconcileFailedWakeDispatches();
                 if (failedWakeDispatches.recovered > 0 || failedWakeDispatches.exhausted > 0) {
                   logger.warn(
@@ -2436,8 +2450,8 @@ export async function startServer(): Promise<StartedServer> {
                     "periodic failed-wake-dispatch reconciliation retried durable wake failures (BLO-14395)",
                   );
                 }
-              })
-              .then(async () => {
+              }))
+              .then(chainTimer.pass(8, "reconcileContendedPrReviewerWakes", async () => {
                 // BLO-21995: replay PR-reviewer wakes that lost their PR-scope
                 // advisory lock at webhook time. GitHub never redelivers a 200,
                 // so this pass is the only path back for a sanctioned review
@@ -2458,7 +2472,7 @@ export async function startServer(): Promise<StartedServer> {
                     "periodic contended PR-reviewer wake reconciliation replayed lock-contended review requests (BLO-21995)",
                   );
                 }
-              })
+              }))
               .catch((err) => {
                 logger.error({ err }, "periodic heartbeat recovery failed");
               })
@@ -2482,6 +2496,13 @@ export async function startServer(): Promise<StartedServer> {
                 // outage.
                 heartbeatRecoveryChainInFlight = false;
                 heartbeatRecoveryChainStartedAt = 0;
+                // PEN-4381: emitted BEFORE the metric recorders, and infallible
+                // by construction (it swallows its own logging errors), so the
+                // per-pass reconciliation survives a prom-client failure that
+                // would cost the gauge sample. This is the line that makes the
+                // chain total joinable to the passes: the gauge carries no
+                // labels, so without it the only join is timestamp proximity.
+                chainTimer.settle(elapsedMs);
                 try {
                   recordHeartbeatRecoveryChainDuration(elapsedMs);
                   // No pass is outstanding now. Leaving the previous value behind
