@@ -1,6 +1,14 @@
-import { and, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { activityLog, agentWakeupRequests, heartbeatRuns, issues } from "@paperclipai/db";
+import {
+  activityLog,
+  agentWakeupRequests,
+  approvals,
+  heartbeatRuns,
+  issueApprovals,
+  issueThreadInteractions,
+  issues,
+} from "@paperclipai/db";
 import type { SuccessfulRunHandoffState } from "@paperclipai/shared";
 import { logActivity } from "./activity-log.js";
 
@@ -189,6 +197,107 @@ export async function resolveSuccessfulRunHandoffForTerminalIssues(
       hasLiveContinuation: false,
       liveRunId: null,
       resolvedBySourceIssueStatus: row.status as "done" | "cancelled",
+    });
+  }
+
+  return states;
+}
+
+/**
+ * BLO-47584: a `required` handoff is discharged by whatever continues the issue,
+ * not only by the run that happens to take a valid-path skip.
+ *
+ * The only run-side writer of `resolved` is `resolveRequiredSuccessfulRunHandoffOnValidPath`,
+ * reached when `decideSuccessfulRunHandoff` returns a valid-path skip. The
+ * corrective run itself never gets there: its first check is "source run is
+ * already a corrective handoff run", so a corrective run that opens a review card
+ * and exits cleanly leaves the row `required` forever (BLO-31103, still required
+ * 5 days after its own corrective run made the card; BLO-23371, 51 days). Comment
+ * and monitor wakes short-circuit the same way.
+ *
+ * Same shape as the terminal fold above: a read projection, so history heals on
+ * its next read. Resolved when, after the requirement was recorded, a run for the
+ * issue other than the source run finished `succeeded`, or the issue now has a live
+ * review path (pending interaction, linked `pending` approval, monitor due in the
+ * future). `revision_requested` approvals and overdue monitors do not count: they
+ * wake nobody, and folding on them would hide a genuinely stranded row.
+ */
+export async function resolveSuccessfulRunHandoffForLaterContinuation(
+  dbOrTx: any,
+  companyId: string,
+  states: Map<string, SuccessfulRunHandoffState>,
+) {
+  const requiredIssueIds = [...states.entries()]
+    .filter(([, state]) => state.state === "required")
+    .map(([issueId]) => issueId);
+  if (requiredIssueIds.length === 0) return states;
+  // Bound the run scan to after the oldest requirement; per-issue cutoffs are applied below.
+  const requiredAtMsList = requiredIssueIds
+    .map((issueId) => states.get(issueId)!.createdAt)
+    .map((value) => (value ? new Date(value).getTime() : Number.NaN))
+    .filter((ms) => !Number.isNaN(ms));
+  const earliestRequiredAt = requiredAtMsList.length > 0 ? new Date(Math.min(...requiredAtMsList)) : null;
+
+  const [laterRuns, interactionRows, approvalRows, monitorRows] = await Promise.all([
+    dbOrTx
+      .select({ id: heartbeatRuns.id, issueId: heartbeatRunIssueId, finishedAt: heartbeatRuns.finishedAt })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.companyId, companyId),
+        eq(heartbeatRuns.status, "succeeded"),
+        inArray(heartbeatRunIssueId, requiredIssueIds),
+        earliestRequiredAt ? gt(heartbeatRuns.finishedAt, earliestRequiredAt) : sql`false`,
+      )),
+    dbOrTx
+      .select({ issueId: issueThreadInteractions.issueId })
+      .from(issueThreadInteractions)
+      .where(and(
+        eq(issueThreadInteractions.companyId, companyId),
+        inArray(issueThreadInteractions.issueId, requiredIssueIds),
+        eq(issueThreadInteractions.status, "pending"),
+      )),
+    dbOrTx
+      .select({ issueId: issueApprovals.issueId })
+      .from(issueApprovals)
+      .innerJoin(approvals, eq(issueApprovals.approvalId, approvals.id))
+      .where(and(
+        eq(issueApprovals.companyId, companyId),
+        inArray(issueApprovals.issueId, requiredIssueIds),
+        eq(approvals.status, "pending"),
+      )),
+    dbOrTx
+      .select({ issueId: issues.id })
+      .from(issues)
+      .where(and(
+        eq(issues.companyId, companyId),
+        inArray(issues.id, requiredIssueIds),
+        gt(issues.monitorNextCheckAt, new Date()),
+      )),
+  ]);
+
+  const reviewPath = new Map<string, "pending_interaction" | "pending_approval" | "monitor">();
+  for (const row of monitorRows as Array<{ issueId: string }>) reviewPath.set(row.issueId, "monitor");
+  for (const row of approvalRows as Array<{ issueId: string }>) reviewPath.set(row.issueId, "pending_approval");
+  for (const row of interactionRows as Array<{ issueId: string }>) reviewPath.set(row.issueId, "pending_interaction");
+
+  for (const issueId of requiredIssueIds) {
+    const state = states.get(issueId)!;
+    const requiredAtMs = state.createdAt ? new Date(state.createdAt).getTime() : Number.NaN;
+    const laterRun = Number.isNaN(requiredAtMs)
+      ? undefined
+      : (laterRuns as Array<{ id: string; issueId: string | null; finishedAt: Date | null }>).find((run) =>
+        run.issueId === issueId
+        && run.id !== state.sourceRunId
+        && run.finishedAt != null
+        && run.finishedAt.getTime() > requiredAtMs);
+    const resolvedByContinuation = laterRun ? "later_run" : reviewPath.get(issueId);
+    if (!resolvedByContinuation) continue;
+    states.set(issueId, {
+      ...state,
+      state: "resolved",
+      required: false,
+      resolvedByContinuation,
+      ...(laterRun ? { resolvedByRunId: laterRun.id } : {}),
     });
   }
 

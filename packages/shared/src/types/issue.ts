@@ -588,6 +588,11 @@ export interface SuccessfulRunHandoffState {
   // on every handoff resolved the ordinary way, so a reader can tell the two
   // apart instead of inferring a continuation that never ran (BLO-16074).
   resolvedBySourceIssueStatus?: "done" | "cancelled" | null;
+  // Set when the handoff reads `resolved` because something continued the issue
+  // after the requirement was recorded, without a run writing the resolution
+  // row (BLO-47584). `resolvedByRunId` names the later successful run.
+  resolvedByContinuation?: "later_run" | "pending_interaction" | "pending_approval" | "monitor" | null;
+  resolvedByRunId?: string | null;
 }
 
 export type IssueScheduledRetryStatus = "scheduled_retry" | "queued" | "running" | "cancelled";

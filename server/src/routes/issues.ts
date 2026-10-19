@@ -139,6 +139,7 @@ import { buildPlanReviewContext } from "../services/plan-review-context.js";
 import {
   hydrateSuccessfulRunHandoffLiveness,
   resolveSuccessfulRunHandoffForTerminalIssues,
+  resolveSuccessfulRunHandoffForLaterContinuation,
 } from "../services/successful-run-handoff-state.js";
 import {
   TASK_WATCHDOG_ORIGIN_KIND,
@@ -1189,6 +1190,7 @@ async function listSuccessfulRunHandoffStates(
   // first would make the pending handoff invisible and swallow the audit event.
   if (options?.foldTerminal !== false) {
     await resolveSuccessfulRunHandoffForTerminalIssues(db, companyId, states);
+    await resolveSuccessfulRunHandoffForLaterContinuation(db, companyId, states);
   }
   return options?.hydrateLiveness === false
     ? states

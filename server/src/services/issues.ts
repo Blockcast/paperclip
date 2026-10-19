@@ -94,6 +94,7 @@ import { parseObject } from "../adapters/utils.js";
 import {
   hydrateSuccessfulRunHandoffLiveness,
   resolveSuccessfulRunHandoffForTerminalIssues,
+  resolveSuccessfulRunHandoffForLaterContinuation,
   SUCCESSFUL_RUN_HANDOFF_LIVE_WAKE_STATUSES,
 } from "./successful-run-handoff-state.js";
 import {
@@ -4934,6 +4935,7 @@ async function listSuccessfulRunHandoffMapForIssues(
   // every caller of this helper is a read path; the route-side twin takes a
   // `foldTerminal` opt-out because one of its callers gates an activity-row write.
   await resolveSuccessfulRunHandoffForTerminalIssues(dbOrTx, companyId, states);
+  await resolveSuccessfulRunHandoffForLaterContinuation(dbOrTx, companyId, states);
   return options?.hydrateLiveness === false
     ? states
     : hydrateSuccessfulRunHandoffLiveness(dbOrTx, companyId, states);
