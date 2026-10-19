@@ -321,8 +321,18 @@ function isGithubPrReviewRun(run: HeartbeatRunRow) {
   return reviewKind === "pr_review";
 }
 
+// Informational PR events only. Actionable ones (review_gate_failed,
+// review_feedback, merge_queue_evicted, ...) keep the corrective handoff, and
+// an unlisted future reason fails closed to it as well.
+const INFORMATIONAL_GITHUB_PR_WAKE_REASONS = new Set([
+  "github_pr_review_submitted",
+  "github_pr_review_requested",
+  "github_pr_closed",
+]);
+
 function isGithubPrEventWake(run: HeartbeatRunRow) {
-  return Boolean(readString(readRecord(run.contextSnapshot).wakeReason)?.startsWith("github_pr_"));
+  const wakeReason = readString(readRecord(run.contextSnapshot).wakeReason);
+  return wakeReason !== null && INFORMATIONAL_GITHUB_PR_WAKE_REASONS.has(wakeReason);
 }
 
 function hasPreservedMissingJobOutcome(run: HeartbeatRunRow) {

@@ -357,6 +357,13 @@ describe("successful run handoff decision", () => {
     }).kind).toBe("enqueue");
   });
 
+  it("still queues for an actionable PR-event wake that made no status write", () => {
+    expect(decide({
+      run: { ...run, contextSnapshot: { issueId: "issue-1", wakeReason: "github_pr_review_gate_failed" } } as any,
+      issue: { ...issue, checkoutRestoreStatus: "in_review" } as any,
+    }).kind).toBe("enqueue");
+  });
+
   it("still queues for a non-PR wake that made no status write", () => {
     expect(decide({
       run: { ...run, contextSnapshot: { issueId: "issue-1", wakeReason: "issue_assigned" } } as any,
