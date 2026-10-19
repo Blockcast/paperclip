@@ -825,6 +825,100 @@ test("gh auth setup-git interception does not require HOME to be set", () => {
   });
 });
 
+// BLO-47692: `pr merge --squash` always reaches the real gh with an explicit
+// body that carries no AI co-author / "Generated with" line. The stub answers
+// `pr view` with a fixed PR body and, for `pr merge`, prints the argv and the
+// contents of whatever --body-file it was handed.
+const PR_BODY = [
+  "Fix the thing.",
+  "",
+  "values-ack: chart-1.2",
+  "Signed-off-by: Dev <dev@example.com>",
+  "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>",
+  "  co-authored-by: HangPlayerEngineer <h@example.com>",
+  "🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+].join("\n");
+const MERGE_STUB_GH = `#!/bin/sh
+if [ "$1 $2" = "pr view" ]; then echo "VIEW=$*" >&2; printf '%s\\n' "$PR_BODY"; exit 0; fi
+echo "ARGS=$*"
+prev=""
+for a; do [ "$prev" = --body-file ] && { echo "BODY<<"; cat "$a"; echo ">>BODY"; }; prev="$a"; done
+`;
+
+function runMerge(dir, args, { input } = {}) {
+  const stub = path.join(dir, "gh.real");
+  writeFileSync(stub, MERGE_STUB_GH);
+  chmodSync(stub, 0o755);
+  const tokenFile = path.join(dir, "token");
+  writeFileSync(tokenFile, "ghs_test");
+  const env = sanitizedEnv({
+    GH_TOKEN_WRAPPER_REAL_GH: stub,
+    PAPERCLIP_GITHUB_TOKEN_FILE: tokenFile,
+    PR_BODY,
+    TMPDIR: dir,
+  });
+  const proc = spawnSync("sh", [WRAPPER, ...args], { env, encoding: "utf8", input });
+  assert.equal(proc.status, 0, proc.stderr);
+  const body = /BODY<<\n([\s\S]*?)>>BODY/.exec(proc.stdout)?.[1] ?? null;
+  return { proc, args: /^ARGS=(.*)$/m.exec(proc.stdout)?.[1], body };
+}
+
+function assertClean(body) {
+  assert.ok(body !== null, "no --body-file reached the real gh");
+  assert.doesNotMatch(body, /co-authored-by/i);
+  assert.doesNotMatch(body, /generated with/i);
+}
+
+test("squash merge with no body injects the PR body minus AI trailers (BLO-47692)", () => {
+  withTempDir((dir) => {
+    const { proc, args, body } = runMerge(dir, ["pr", "merge", "573", "--squash", "-R", "Blockcast/libmmt", "--delete-branch"]);
+    assertClean(body);
+    assert.match(body, /^Fix the thing\.$/m);
+    assert.match(body, /^values-ack: chart-1\.2$/m);
+    assert.match(body, /^Signed-off-by: Dev <dev@example\.com>$/m);
+    assert.match(proc.stderr, /VIEW=pr view 573 --repo Blockcast\/libmmt --json body/);
+    assert.match(args, /^pr merge 573 --squash -R Blockcast\/libmmt --delete-branch --body-file /);
+  });
+});
+
+for (const [label, flags] of [
+  ["--body", (b) => ["--body", b]],
+  ["-b", (b) => ["-b", b]],
+  ["--body=", (b) => [`--body=${b}`]],
+]) {
+  test(`squash merge scrubs a caller-supplied ${label} body (BLO-47692)`, () => {
+    withTempDir((dir) => {
+      const { proc, args, body } = runMerge(dir, ["pr", "merge", "-s", ...flags(PR_BODY)]);
+      assertClean(body);
+      assert.match(body, /^values-ack: chart-1\.2$/m);
+      assert.doesNotMatch(proc.stderr, /VIEW=/, "must not fetch the PR body when the caller gave one");
+      assert.doesNotMatch(args, /--body |-b /);
+    });
+  });
+}
+
+test("squash merge scrubs a caller-supplied --body-file, including stdin (BLO-47692)", () => {
+  withTempDir((dir) => {
+    const f = path.join(dir, "msg");
+    writeFileSync(f, PR_BODY);
+    const fromFile = runMerge(dir, ["pr", "merge", "--squash", "--body-file", f]);
+    assertClean(fromFile.body);
+    assert.equal(readFileSync(f, "utf8"), PR_BODY, "the caller's file must not be modified");
+    const fromStdin = runMerge(dir, ["pr", "merge", "--squash", "-F", "-"], { input: PR_BODY });
+    assertClean(fromStdin.body);
+    assert.match(fromStdin.body, /^values-ack: chart-1\.2$/m);
+  });
+});
+
+test("non-squash merge is passed through untouched (BLO-47692)", () => {
+  withTempDir((dir) => {
+    const { proc, args, body } = runMerge(dir, ["pr", "merge", "12", "--rebase"]);
+    assert.equal(args, "pr merge 12 --rebase");
+    assert.equal(body, null);
+    assert.doesNotMatch(proc.stderr, /VIEW=/);
+  });
+});
+
 // Pins the isolation the helper above provides, by re-running this whole file
 // in a child process with every credential input already set in the ambient
 // environment. Before the sanitized-env helper, that run failed two tests: the

@@ -549,6 +549,24 @@ describe("buildEnvGuardSetupShell", () => {
     expect(blobs).toContain(SAFE_ENV_INSPECT_SCRIPT);
   });
 
+  it("turns off Claude commit/PR attribution, overriding a seeded value (BLO-47692)", () => {
+    const mergeScript = decodedBlobs(buildEnvGuardSetupShell())[2]!;
+    const dir = mkdtempSync(path.join(tmpdir(), "pc-settings-"));
+    try {
+      writeFileSync(
+        path.join(dir, "settings.json"),
+        JSON.stringify({ attribution: { commit: "Co-Authored-By: Claude", sessionUrl: false }, includeCoAuthoredBy: true }),
+      );
+      const env = { ...process.env, CLAUDE_CONFIG_DIR: dir, PAPERCLIP_GUARD_FILE: path.join(dir, "g.mjs") };
+      expect(spawnSync(process.execPath, ["-"], { input: mergeScript, encoding: "utf8", env }).status).toBe(0);
+      const settings = JSON.parse(readFileSync(path.join(dir, "settings.json"), "utf8"));
+      expect(settings.attribution).toEqual({ commit: "", pr: "", sessionUrl: false });
+      expect(settings.includeCoAuthoredBy).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("merges the PreToolUse hook idempotently, preserving existing hooks", () => {
     const shell = buildEnvGuardSetupShell();
     // The merge blob is the 3rd base64 (guard, helper, merge).

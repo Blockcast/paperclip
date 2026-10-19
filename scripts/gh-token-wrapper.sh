@@ -43,6 +43,9 @@ GIT_BIN="${GH_TOKEN_WRAPPER_GIT:-/usr/bin/git}"
 # for.
 exec_real_gh() {
   case "${1:-} ${2:-}" in
+    "pr merge") squash_merge_without_ai_trailers "$@" ;;
+  esac
+  case "${1:-} ${2:-}" in
     "auth setup-git" | "auth login")
       status=0
       "${REAL_GH}" "$@" || status=$?
@@ -51,6 +54,88 @@ exec_real_gh() {
       ;;
   esac
   exec "${REAL_GH}" "$@"
+}
+
+# BLO-47692: GitHub's default squash message appends a `Co-authored-by:` for
+# every commit author who is not the merger, and copies the branch commits'
+# own `Co-Authored-By: Claude …` / "Generated with" lines — even on repos set to
+# squash_merge_commit_message=BLANK. Every agent merge runs through this
+# wrapper, so for `pr merge --squash` it always passes an explicit body: the
+# caller's, or else the PR body, with those lines removed. Other trailers
+# (`Signed-off-by:`, `values-ack:`) are kept. Non-squash merges are untouched.
+# ponytail: only `-s`/`--squash` are detected, not a short-flag cluster like `-ds`.
+strip_ai_trailers() {
+  grep -viE '^[[:space:]]*co-authored-by:|^[^[:alnum:]]*generated with' || true
+}
+
+squash_merge_without_ai_trailers() {
+  squash=no
+  for a in "$@"; do
+    case "${a}" in -s | --squash | --squash=true) squash=yes ;; esac
+  done
+  [ "${squash}" = yes ] || return 0
+
+  body_file="$(mktemp "${TMPDIR:-/tmp}/gh-merge-body.XXXXXX")"
+  have_body=no selector="" repo=""
+  n=$#
+  i=0
+  while [ "${i}" -lt "${n}" ]; do
+    a="$1"
+    shift
+    i=$((i + 1))
+    v=""
+    case "${a}" in
+      -b | --body | -F | --body-file | -R | --repo | -t | --subject | -A | --author-email | --match-head-commit)
+        v="${1:-}"
+        shift
+        i=$((i + 1))
+        ;;
+      --body=* | --body-file=* | --repo=*) v="${a#*=}" a="${a%%=*}" ;;
+      -b?* | -F?* | -R?*) v="${a#-?}" a="${a%"${v}"}" ;;
+    esac
+    case "${a}" in
+      -b | --body)
+        printf '%s\n' "${v}" | strip_ai_trailers > "${body_file}"
+        have_body=yes
+        continue
+        ;;
+      -F | --body-file)
+        if [ "${v}" != - ] && [ ! -r "${v}" ]; then
+          rm -f "${body_file}"
+          echo "gh-token-wrapper: --body-file ${v} is not readable" >&2
+          exit 1
+        fi
+        if [ "${v}" = - ]; then cat; else cat -- "${v}"; fi | strip_ai_trailers > "${body_file}"
+        have_body=yes
+        continue
+        ;;
+      -R | --repo) repo="${v}" ;;
+      -*) ;;
+      *) [ "${i}" -le 2 ] || [ -n "${selector}" ] || selector="${a}" ;;
+    esac
+    set -- "$@" "${a}"
+    case "${a}" in
+      -t | --subject | -A | --author-email | --match-head-commit) set -- "$@" "${v}" ;;
+      --repo) set -- "$@" "${v}" ;;
+      -R) set -- "$@" "${v}" ;;
+    esac
+  done
+
+  if [ "${have_body}" = no ]; then
+    # Fail closed: a trailer that reaches main cannot be taken back.
+    if ! "${REAL_GH}" pr view ${selector:+"${selector}"} ${repo:+--repo "${repo}"} --json body --jq .body > "${body_file}.raw"; then
+      rm -f "${body_file}" "${body_file}.raw"
+      echo "gh-token-wrapper: could not read the PR body to build a squash message without AI co-author trailers (BLO-47692); pass --body-file explicitly" >&2
+      exit 1
+    fi
+    strip_ai_trailers < "${body_file}.raw" > "${body_file}"
+    rm -f "${body_file}.raw"
+  fi
+
+  status=0
+  "${REAL_GH}" "$@" --body-file "${body_file}" || status=$?
+  rm -f "${body_file}"
+  exit "${status}"
 }
 
 # Best-effort repair of whatever `gh auth setup-git` (directly, or via `gh

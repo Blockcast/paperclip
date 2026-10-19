@@ -1535,7 +1535,7 @@ for (const name of Object.keys(process.env).sort()) console.log(name);
  * Idempotent settings-merge script (runs via `node -`). Adds a PreToolUse hook
  * matching Bash and the GitHub MCP write tools (BLO-46113) to the runtime's `settings.json` only if an identical command
  * entry is not already present, preserving any existing hooks (e.g. Claude
- * Code's installed Stop hook).
+ * Code's installed Stop hook). Also forces commit/PR attribution off (BLO-47692).
  */
 export const GUARD_HOOK_MATCHER =
   "Bash|mcp__github__(?:create_pull_request|merge_pull_request|push_files|create_or_update_file|delete_file|create_branch|update_pull_request_branch)";
@@ -1567,6 +1567,12 @@ const list=(Array.isArray(s.hooks.PreToolUse)?s.hooks.PreToolUse:[])
 const has=list.some(function(g){return g&&g.matcher===M&&Array.isArray(g.hooks)&&g.hooks.some(function(h){return h&&h.command===cmd;});});
 if(!has)list.push({matcher:M,hooks:[{type:"command",command:cmd}]});
 s.hooks.PreToolUse=list;
+// BLO-47692: Claude Code's default attribution makes every session reminder say
+// "End git commit messages with: Co-Authored-By: Claude …", which then reaches
+// main through squash merges. Empty strings turn the reminder into "do not add
+// attribution lines"; includeCoAuthoredBy covers older runtimes.
+s.attribution=Object.assign({},typeof s.attribution==="object"?s.attribution:{},{commit:"",pr:""});
+s.includeCoAuthoredBy=false;
 fs.mkdirSync(dir,{recursive:true});
 const t=f+"."+process.pid+".tmp";
 fs.writeFileSync(t,JSON.stringify(s,null,2));
