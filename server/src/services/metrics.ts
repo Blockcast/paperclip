@@ -3323,6 +3323,47 @@ const knownIsolationModeSet: ReadonlySet<string> = new Set(KNOWN_ISOLATION_MODES
 export const UNKNOWN_REASON = "other";
 export const UNKNOWN_AGENT_ID = "unknown";
 
+/**
+ * Routing/attribution identity carried beside the bounded `agent_id` on the
+ * queued-run age gauges (PEN-4280).
+ *
+ * Both fields are FUNCTIONALLY DETERMINED by `agent_id` -- an agent has exactly
+ * one name and one owning company -- so adding them multiplies the series count
+ * by nothing. That is what makes this safe here while `company_id` is
+ * deliberately omitted from metrics keyed on something coarser, where it is
+ * genuinely unbounded per tenant.
+ *
+ * They are load-bearing downstream rather than decorative. onprem-k8s'
+ * `HeartbeatRunQueueAgentOldestQueuedHigh` is pinned to a per-tenant
+ * Alertmanager route on `company_id` (BLO-31172) and renders
+ * `{{ $labels.agent_name }}` in its summary; its own design note 4 records that
+ * route being absent for 34 days, during which every Penstock page was filed
+ * against Blockcast on-call. Any consumer repointed onto these gauges without
+ * these labels re-opens exactly that, silently.
+ *
+ * Sourced from the `agents` row, NOT from `heartbeat_runs.company_id`: the
+ * zero-floor series (an agent with nothing queued) has no run to read a company
+ * from, and `agents.company_id` is also what the onprem exporter's own
+ * `company_id` label resolves to, so the two agree by construction.
+ */
+export interface QueuedRunAgentIdentity {
+  agentName: string;
+  companyId: string;
+}
+
+/** Shared shape of both queued-run age gauges. */
+type QueuedRunAgeGauge = Gauge<"agent_id" | "agent_name" | "company_id">;
+
+/**
+ * Label set for an `agent_id` that is not in the bounded roster. Mirrors the
+ * onprem exporter's `coalesce(a.name, 'unknown')` / `coalesce(a.company_id,
+ * 'unknown')` so the same agent reads identically on both collection paths.
+ */
+const UNKNOWN_QUEUED_RUN_AGENT_IDENTITY: QueuedRunAgentIdentity = {
+  agentName: UNKNOWN_AGENT_ID,
+  companyId: UNKNOWN_AGENT_ID,
+};
+
 const knownReasonSet: ReadonlySet<string> = new Set(KNOWN_BLOCKED_REASONS);
 
 /**
@@ -3821,8 +3862,8 @@ let agentWakeupTerminalFailedUnresolved: Gauge<"error_code" | "scope"> | null = 
 let agentWakeupTerminalFailedOldestAge: Gauge<"scope"> | null = null;
 let githubWorkflowRunConclusion: Counter<"conclusion" | "supersession"> | null = null;
 let githubWebhookDelivery: Counter<"event" | "outcome"> | null = null;
-let queuedRunOldestAge: Gauge<"agent_id"> | null = null;
-let queuedRunOldestClaimableAge: Gauge<"agent_id"> | null = null;
+let queuedRunOldestAge: QueuedRunAgeGauge | null = null;
+let queuedRunOldestClaimableAge: QueuedRunAgeGauge | null = null;
 let routineLastDoneFireAge: Gauge<"routine_id"> | null = null;
 let routineFireInterval: Gauge<"routine_id"> | null = null;
 let routineFireGapMetricsRefreshSuccess: Gauge | null = null;
@@ -3984,8 +4025,8 @@ function ensureRegistry(): {
   agentWakeupTerminalFailedOldestAgeGauge: Gauge<"scope">;
   githubWorkflowRunConclusionCounter: Counter<"conclusion" | "supersession">;
   githubWebhookDeliveryCounter: Counter<"event" | "outcome">;
-  queuedRunOldestAgeGauge: Gauge<"agent_id">;
-  queuedRunOldestClaimableAgeGauge: Gauge<"agent_id">;
+  queuedRunOldestAgeGauge: QueuedRunAgeGauge;
+  queuedRunOldestClaimableAgeGauge: QueuedRunAgeGauge;
   routineLastDoneFireAgeGauge: Gauge<"routine_id">;
   routineFireIntervalGauge: Gauge<"routine_id">;
   routineFireGapMetricsRefreshSuccessGauge: Gauge;
@@ -5186,8 +5227,10 @@ function ensureRegistry(): {
         + ": `for:` measures how long the alert expression has been true, not the age of "
         + "any one row. Reset-then-set every refresh (see setQueuedRunOldestAgeMetrics) so an "
         + "agent whose queue drains to empty reads back an explicit 0 rather than a frozen "
-        + "stale value or an absent series. Labeled by bounded agent_id.",
-      labelNames: ["agent_id"],
+        + "stale value or an absent series. Labeled by bounded agent_id, plus the "
+        + "agent_name and company_id that identity determines (PEN-4280) so a consumer "
+        + "can route and attribute without a second lookup.",
+      labelNames: ["agent_id", "agent_name", "company_id"],
       registers: [registry],
     });
     queuedRunOldestClaimableAge = new Gauge({
@@ -5205,8 +5248,13 @@ function ensureRegistry(): {
         + "DIFFERENCE between them is how much queued work is structurally unclaimable. "
         + "Same reset-then-set zero-floor convention as "
         + QUEUED_RUN_OLDEST_AGE_METRIC
-        + " -- every known agent emits an explicit 0 rather than an absent series.",
-      labelNames: ["agent_id"],
+        + " -- every known agent emits an explicit 0 rather than an absent series. "
+        + "Carries agent_name and company_id for the reason given on "
+        + QUEUED_RUN_OLDEST_AGE_METRIC
+        + ": onprem-k8s' per-agent queue alert routes per tenant on company_id and "
+        + "renders agent_name, so a repoint onto an agent_id-only series would "
+        + "silently mis-route and lose attribution (PEN-4280).",
+      labelNames: ["agent_id", "agent_name", "company_id"],
       registers: [registry],
     });
     deferredIssueExecutionWakeOldestAge = new Gauge({
@@ -6616,16 +6664,31 @@ export function setExternalRuntimeReservationMetrics(input: {
 }
 
 /**
+ * The label set both queued-run age gauges emit for one agent.
+ *
+ * Shared rather than inlined twice so the pair can never diverge: the whole
+ * point of publishing them together is that `oldest - oldest_claimable` is a
+ * well-formed difference, and in PromQL that subtraction only matches when the
+ * two sides carry an IDENTICAL label set. Two independent literals would let a
+ * later edit to one of them turn that difference silently empty rather than
+ * wrong, which is the harder failure to notice.
+ */
+function queuedRunAgeLabels(agentId: string, identity: QueuedRunAgentIdentity) {
+  return { agent_id: agentId, agent_name: identity.agentName, company_id: identity.companyId };
+}
+
+/**
  * Publish the oldest queued-run age per known agent. Reset-then-set is
  * deliberate: an agent whose queue drains must read 0 rather than retaining a
  * stale age that would keep the stranded-run alert open forever.
  */
 export function setQueuedRunOldestAgeMetrics(
   entries: ReadonlyArray<{ agentId: string | null | undefined; ageSeconds: number }>,
-  knownAgentIds: ReadonlySet<string>,
+  knownAgents: ReadonlyMap<string, QueuedRunAgentIdentity>,
 ): void {
   const gauge = ensureRegistry().queuedRunOldestAgeGauge;
   gauge.reset();
+  const knownAgentIds = new Set(knownAgents.keys());
   const oldestByAgentId = new Map<string, number>();
   for (const entry of entries) {
     const agentId = normalizeAgentId(entry.agentId, knownAgentIds);
@@ -6633,11 +6696,16 @@ export function setQueuedRunOldestAgeMetrics(
     const current = oldestByAgentId.get(agentId);
     if (current === undefined || ageSeconds > current) oldestByAgentId.set(agentId, ageSeconds);
   }
-  for (const agentId of knownAgentIds) {
-    gauge.set({ agent_id: agentId }, oldestByAgentId.get(agentId) ?? 0);
+  for (const [agentId, identity] of knownAgents) {
+    gauge.set(queuedRunAgeLabels(agentId, identity), oldestByAgentId.get(agentId) ?? 0);
   }
   const unknownAge = oldestByAgentId.get(UNKNOWN_AGENT_ID);
-  if (unknownAge !== undefined) gauge.set({ agent_id: UNKNOWN_AGENT_ID }, unknownAge);
+  if (unknownAge !== undefined) {
+    gauge.set(
+      queuedRunAgeLabels(UNKNOWN_AGENT_ID, UNKNOWN_QUEUED_RUN_AGENT_IDENTITY),
+      unknownAge,
+    );
+  }
 }
 
 /**
@@ -6657,10 +6725,11 @@ export function setQueuedRunOldestAgeMetrics(
  */
 export function setQueuedRunOldestClaimableAgeMetrics(
   entries: ReadonlyArray<{ agentId: string | null | undefined; ageSeconds: number }>,
-  knownAgentIds: ReadonlySet<string>,
+  knownAgents: ReadonlyMap<string, QueuedRunAgentIdentity>,
 ): void {
   const gauge = ensureRegistry().queuedRunOldestClaimableAgeGauge;
   gauge.reset();
+  const knownAgentIds = new Set(knownAgents.keys());
   const oldestByAgentId = new Map<string, number>();
   for (const entry of entries) {
     const agentId = normalizeAgentId(entry.agentId, knownAgentIds);
@@ -6668,11 +6737,16 @@ export function setQueuedRunOldestClaimableAgeMetrics(
     const current = oldestByAgentId.get(agentId);
     if (current === undefined || ageSeconds > current) oldestByAgentId.set(agentId, ageSeconds);
   }
-  for (const agentId of knownAgentIds) {
-    gauge.set({ agent_id: agentId }, oldestByAgentId.get(agentId) ?? 0);
+  for (const [agentId, identity] of knownAgents) {
+    gauge.set(queuedRunAgeLabels(agentId, identity), oldestByAgentId.get(agentId) ?? 0);
   }
   const unknownAge = oldestByAgentId.get(UNKNOWN_AGENT_ID);
-  if (unknownAge !== undefined) gauge.set({ agent_id: UNKNOWN_AGENT_ID }, unknownAge);
+  if (unknownAge !== undefined) {
+    gauge.set(
+      queuedRunAgeLabels(UNKNOWN_AGENT_ID, UNKNOWN_QUEUED_RUN_AGENT_IDENTITY),
+      unknownAge,
+    );
+  }
 }
 
 /** Mark whether the queued-run age gauge was refreshed from the database. */
