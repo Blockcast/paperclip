@@ -7974,6 +7974,46 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
     });
   }, 20_000);
 
+  it("refuses branch repair with zero git writes when the worktree's .git link is gone (BLO-47493)", async () => {
+    const expectedBranch = "PAP-47493-recorded";
+    const actualBranch = "PAP-47493-live";
+    const { repoRoot, worktreePath } = await createDirtyMismatchRepo({ expectedBranch, actualBranch });
+    const ids = await seedDirtyQuarantineRecords({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      sourceIdentifier: "PAP-47493",
+      claimant: "none",
+    });
+    // Husk: registration survives, `.git` link does not; the main checkout is dirty.
+    await fs.rm(path.join(worktreePath, ".git"));
+    await fs.appendFile(path.join(repoRoot, "README.md"), "main checkout dirty\n", "utf8");
+    const snapshot = async () => ({
+      head: await readGit(repoRoot, ["symbolic-ref", "HEAD"]),
+      status: await readGit(repoRoot, ["status", "--porcelain", "--untracked-files=all"]),
+      refs: await readGit(repoRoot, ["for-each-ref", "--format=%(refname) %(objectname)"]),
+    });
+    const before = await snapshot();
+
+    await expect(ensureGitWorktreeBranchCoherent({
+      db,
+      repoRoot,
+      worktreePath,
+      expectedBranchName: expectedBranch,
+      sourceIssue: { id: ids.sourceIssueId, identifier: ids.sourceIdentifier, title: "Husk worktree" },
+      executionWorkspaceId: ids.sourceWorkspaceId,
+      heartbeatRunId: ids.runId,
+      enableWorkspaceDirtyQuarantineRepair: true,
+      enableWorkspaceBranchReconcileForward: true,
+    })).rejects.toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: { workspaceValidation: expect.objectContaining({ reason: "wrong_repository_root" }) },
+    });
+
+    expect(await snapshot()).toEqual(before);
+  }, 20_000);
+
   it("refuses dirty quarantine repair while the execution workspace has an active runtime service", async () => {
     const expectedBranch = "PAP-458-recorded";
     const actualBranch = "PAP-458-live";
