@@ -689,7 +689,7 @@ function readDescriptorStorage(raw: Record<string, unknown>, field: string): Iso
 }
 
 export function resolveJobIsolation(
-  ctx: Pick<AdapterExecutionContext, "runtime" | "agent">,
+  ctx: Pick<AdapterExecutionContext, "runtime" | "agent"> & Partial<Pick<AdapterExecutionContext, "context">>,
   config: Record<string, unknown>,
 ): JobIsolation {
   const runtimeIsolation = (ctx.runtime as unknown as { isolation?: unknown }).isolation;
@@ -703,7 +703,43 @@ export function resolveJobIsolation(
       const rawKey = readRequiredDescriptorString(raw, "isolationKey");
       const key = sanitizeForK8sPath(rawKey) || shortHash(rawKey);
       assertSafePathComponent("isolationKey", key);
-      return { ...SHARED_JOB_ISOLATION, source: "runtime", key };
+      // BLO-47526: a shared run used to come back `enabled:false`, which kept
+      // HOME at the data mount root and so kept the WHOLE PVC mounted rw — the
+      // server-read `/paperclip/.mcp.json` and every company's instruction
+      // bundles were writable from it. The server's default exit for any run
+      // without an isolated workspace is this branch, so it is the common case,
+      // not an edge. Give it agent-scoped persistent roots (same layout as the
+      // config-isolated path below) so `narrowWritableSurface` holds. The key
+      // is already agent-scoped (`agent-shared:<agentId>`), so warm state stays
+      // per agent. The checkout is NOT moved: a shared run keeps working in
+      // the shared workspace it was handed, which becomes one of its rw mounts.
+      const dataMountPath = resolveDataMountPath(config);
+      const companyId = sanitizeForK8sPath(ctx.agent.companyId);
+      const agentId = sanitizeForK8sPath(ctx.agent.id);
+      assertSafePathComponent("companyId", companyId);
+      assertSafePathComponent("agentId", agentId);
+      const root = `${dataMountPath}/instances/default/data/k8s-isolation/${companyId}/${agentId}/${key}`;
+      const handedCwd =
+        asString(parseObject(ctx.context?.paperclipWorkspace).cwd, "").trim() || asString(config.cwd, "").trim();
+      // The data root itself would re-open the whole volume; fall back to a private dir.
+      const workspaceRoot =
+        handedCwd && path.posix.isAbsolute(handedCwd) && path.posix.normalize(handedCwd) !== dataMountPath
+          ? handedCwd
+          : `${root}/workspace`;
+      return {
+        enabled: true,
+        mode: "shared",
+        source: "runtime",
+        key,
+        root,
+        homeRoot: `${root}/home`,
+        sessionRoot: `${root}/home`,
+        workspaceRoot,
+        cacheRoot: `${root}/cache`,
+        tmpRoot: `${root}/tmp`,
+        promptCacheRoot: `${root}/prompt-cache`,
+        storage: { ...SHARED_JOB_ISOLATION.storage },
+      };
     }
     if (mode !== "run" && mode !== "workspace") {
       throw new Error(`runtime isolation descriptor has invalid isolationMode: ${mode || "<missing>"}`);
@@ -2611,12 +2647,11 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // READ-ONLY and re-mount the few trees a run genuinely writes rw, nested
   // inside it, via `subPath` (see `resolveScopedWritableMounts`).
   //
-  // Gated on `isolation.enabled`, and that gate is structural rather than a
-  // carve-out of convenience: a shared-isolation run has no per-run roots at all
-  // (`homeRoot`/`sessionRoot` are ""), so HOME and CLAUDE_CONFIG_DIR fall back to
-  // `dataMountPath` and `${dataMountPath}/.claude`. There is nothing to derive a
-  // scope from, and a read-only mount would fail the run at env-guard install.
-  // Such runs keep today's broad rw mount — a stated residual, not a fix.
+  // Gated on `isolation.enabled`: a run with no per-run roots (`homeRoot` is "")
+  // falls back to HOME=`dataMountPath`, so a read-only mount would fail it at
+  // env-guard install. Since BLO-47526 a runtime `shared` descriptor carries
+  // agent-scoped roots and narrows like any other; only a config-only run with
+  // no descriptor and no `isolationMode` still reaches this fallback.
   //
   // Also gated on the Job's `data` volume being THIS server's own PVC. The
   // `subPath` targets are pre-created by the server through its own mount (see
