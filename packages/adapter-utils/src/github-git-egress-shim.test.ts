@@ -926,6 +926,60 @@ describe("formatRefusal", () => {
     expect(message).toContain("content-addressed");
   });
 
+  // PEN-3920 (D6): the false-positive advice on this door used to name exactly
+  // one route - derive the value at runtime - which is unavailable for the
+  // dominant real false positive, a label literal that has to be in the blob.
+  // An author in that case was told to do something they cannot do, and that
+  // is the failure mode that gets a control switched off.
+  it("offers a route that exists when the value cannot leave the blob", () => {
+    const message = formatRefusal([
+      {
+        commit: "a".repeat(40),
+        shortCommit: "aaaaaaaaaaaa",
+        subject: "convert rules shard to a block scalar",
+        where: "content",
+        classes: ["high-entropy-assignment"],
+      },
+    ]);
+    // The runtime-derivation route is still named, because it is the right
+    // answer for a test fixture.
+    expect(message).toContain("derive it at runtime");
+    // ...but it is no longer the ONLY one. The author must be told where the
+    // identifier class is recorded and how to report a value that cannot move.
+    expect(message).toContain("docs/security/PEN-3920-egress-entropy-identifier-decision.md");
+    expect(message).toContain("file against the detector");
+    expect(message).toContain("Prometheus label matcher");
+    // And the refusal must say WHY exoneration is name-anchored, so a reader
+    // can tell "wrong name" from "wrong shape" without reading the source.
+    expect(message).toContain("exonerated under the label name");
+  });
+
+  // The remedy was widened; the control was NOT. PEN-3920 section 5.3: the
+  // env-backed overrides that once existed were removed BECAUSE they were an
+  // escape hatch, and nothing here may reintroduce one. This test exists to
+  // fail loudly if a later edit "helps" by offering a bypass.
+  it("offers no allowlist, override or bypass", () => {
+    const message = formatRefusal([
+      {
+        commit: "b".repeat(40),
+        shortCommit: "bbbbbbbbbbbb",
+        subject: "add alert rule",
+        where: "content",
+        classes: ["high-entropy-assignment"],
+      },
+    ]);
+    expect(message).toContain("no allowlist or override by design");
+    for (const bypass of [
+      "PAPERCLIP_GIT_EGRESS_HOOKS_DIR",
+      "PAPERCLIP_GIT_EGRESS_GIT",
+      "--no-verify",
+      "skip the check",
+      "disable the hook",
+    ]) {
+      expect(message).not.toContain(bypass);
+    }
+  });
+
   it("points a multi-commit refusal at the oldest one", () => {
     const message = formatRefusal([
       {

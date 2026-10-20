@@ -1428,8 +1428,21 @@ export function formatRefusal(findings: readonly GitPushFinding[]): string {
     );
   }
   lines.push("");
+  // PEN-3920 (D6): this block is the ONLY false-positive advice on this door,
+  // and until that row it named exactly one route — derive the value at
+  // runtime — which is unavailable for the dominant real false positive. A
+  // Prometheus label literal inside a rules file HAS to be in the blob, so an
+  // author hitting that class was told to do something they cannot do, with no
+  // allowlist and no escape hatch behind it. Telling someone to do the
+  // impossible is what gets a control switched off, so the fix is to name a
+  // route that exists — NOT to lower the bar. Deliberately still no bypass
+  // here: the env-backed overrides that once existed were removed BECAUSE they
+  // were one, and that removal stands (PEN-3920 section 5.3).
   lines.push(
-    "If this is a false positive on a test fixture, derive the value at runtime instead of embedding a literal — that is what the existing fixtures in this repository do, and it closes the finding permanently rather than suppressing it.",
+    "If this is a false positive: when the value is a test fixture, derive it at runtime instead of embedding a literal — that is what the existing fixtures in this repository do, and it closes the finding permanently rather than suppressing it.",
+  );
+  lines.push(
+    "When the value cannot leave the blob — a Prometheus label matcher, a Kubernetes object name, any identifier a config file has to spell out — deriving it at runtime is not available, and there is no allowlist or override by design. That case is a known class with a home: see docs/security/PEN-3920-egress-entropy-identifier-decision.md, and file against the detector quoting the refused value so the shape can be measured and the rule narrowed. Identifiers are exonerated under the label name that binds them, so a refusal here usually means a name or a shape the rule does not cover yet.",
   );
 
   return lines.join("\n");

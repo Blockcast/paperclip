@@ -885,10 +885,15 @@ describe("scrubGitHubEgressText", () => {
       expect(result.classes).toContain("high-entropy-assignment");
     });
 
-    it.each(["Kq2Vt9Lm4Xb8Nd3Wp6Zc1Yr5", "KqVtLmXbNdWpZcYrHjTgPsQF", "Vlan1MacvlanV6ProbeInstrumentBroken"])(
+    it.each(["Kq2Vt9Lm4Xb8Nd3Wp6Zc1Yr5", "KqVtLmXbNdWpZcYrHjTgPsQF"])(
       "still refuses the opaque token %s bound to alertname",
       (token) => {
-        // Shape half: a digit, or capitals not forming words, keep a token opaque.
+        // Shape half: unbounded digit runs, or capitals not forming words, keep
+        // a token opaque. PEN-3920 (D4) moved one case off this list on purpose
+        // (see that describe block): a BOUNDED digit run no longer condemns a
+        // value under an anchored name. Both tokens here are still refused, and
+        // for reasons D4 does not touch: the first carries 8 digit runs against
+        // a cap of 2, the second is letters-only but ends in a bare acronym run.
         const result = scrubGitHubEgressText(pair(token));
         expect(result.classes).toContain("high-entropy-assignment");
         expect(result.text).not.toContain(token);
@@ -928,6 +933,81 @@ describe("scrubGitHubEgressText", () => {
         const result = scrubGitHubEgressText(pair(token));
         expect(result.classes).toContain("high-entropy-assignment");
         expect(result.text).not.toContain(token);
+      },
+    );
+  });
+
+  describe("PEN-3920 regression: an identifier carrying bounded digit runs is not a credential", () => {
+    // Derived, not embedded, throughout this block: several of these pairs are
+    // the exact material the SHIPPED rule refuses, so writing one contiguously
+    // would make this file unpushable until the fix deploys. Same convention as
+    // the BLO-46448/BLO-47509 blocks above and the PEN-3907 fixtures.
+    const pair = (name: string, value: string) => [name, value].join("=");
+
+    // D4: each CamelCase word may carry a trailing digit run of at most 2, and
+    // the value at most 2 runs. The tail is on the ACRONYM branch too, which is
+    // what reaches `V6` and `HTTP2` - they have no lowercase run to attach to.
+    it.each([
+      "Vlan1MacvlanV6ProbeInstrumentBroken",
+      "ArcRunnerPool2CeilingClipped",
+      "HTTP2ServerStreamsExhausted",
+      "Ipv6RouteAdvertisementStale",
+    ])("passes the digit-bearing alert name %s byte-exact under an anchored name", (name) => {
+      for (const text of [`    ${pair("alertname", name)}`, `kube{${pair("kind", `"${name}"`)}}`]) {
+        expect(scrubGitHubEgressText(text).text).toBe(text);
+        expect(locateGitHubEgressMatches(text)).toEqual([]);
+      }
+    });
+
+    // D5: a `job` value is lowercase snake_case with bounded digit runs. This
+    // is the case isLexicalIdentifier cannot reach - TWO mixed segments
+    // (`vlan1`, `v6`) against its cap of one - and raising that cap was
+    // measured at a 4x widening under every binding name, so it was REFUSED.
+    it("passes a snake_case job value carrying two mixed segments", () => {
+      const text = `    ${pair("job", "vlan1_macvlan_v6_listener")}`;
+      expect(scrubGitHubEgressText(text).text).toBe(text);
+      expect(locateGitHubEgressMatches(text)).toEqual([]);
+    });
+
+    // The name anchor is the load-bearing half (PEN-3920 section 4). Shape
+    // alone exonerates nothing, so the same values under a credential-ish name
+    // must still be caught.
+    it.each([
+      ["alertname", "Vlan1MacvlanV6ProbeInstrumentBroken"],
+      ["job", "vlan1_macvlan_v6_listener"],
+    ])("refuses the %s-shaped value when it is bound to `password` instead", (_name, value) => {
+      const result = scrubGitHubEgressText(pair("password", value));
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(value);
+    });
+
+    // The digit bound is a CAP, not a licence. These are the shapes it keeps
+    // out, and each fails on a different conjunct.
+    it.each([
+      // 8 digit runs against a cap of 2.
+      ["alertname", "Kq2Vt9Lm4Xb8Nd3Wp6Zc1Yr5"],
+      // 3-digit run: longer than the per-word tail of 2.
+      ["alertname", "Arc123RunnerPoolCeilingClipped"],
+      // lowercase tail after a digit run - the variant measured at ~1.6x the
+      // residual and DECLINED, so it must stay refused.
+      ["alertname", "CoreDNSPanicCount24hRetryStorm"],
+      // same caps on the snake_case branch.
+      ["job", "kq2vt9lm4xb8nd3wp6zc1yr5"],
+      ["job", "a1b2c3d4e5f6g7h8i9j0k1l2"],
+    ])("still refuses %s bound to a value the digit bound does not admit", (name, value) => {
+      const result = scrubGitHubEgressText(pair(name, value));
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(value);
+    });
+
+    // Regression on the half D4 explicitly does NOT widen: a letters-only
+    // token has no digits to bound, so every digit-free name already exempt
+    // stays exempt and nothing new is exonerated on that alphabet.
+    it.each(["VaultTLSProbeUnreachable", "NodeFilesystemAlmostOutOfSpace", "ArcRunnerPoolCeilingClipped"])(
+      "keeps the digit-free alert name %s passing",
+      (name) => {
+        const text = `    ${pair("alertname", name)}`;
+        expect(scrubGitHubEgressText(text).text).toBe(text);
       },
     );
   });
