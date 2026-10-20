@@ -335,7 +335,10 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(dockerWorkflow).toContain(
       "if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}",
     );
-    expect(dockerAgentWorkflow.match(/runs-on: arc-dind/g)).toHaveLength(1);
+    // BLO-33389: pinned to the prod group; the tools-cluster `arc-dind` twin
+    // cannot resolve the BuildKit pool.
+    expect(dockerAgentWorkflow).toContain("runs-on:\n      group: default\n      labels: arc-dind\n");
+    expect(dockerAgentWorkflow).not.toContain("runs-on: arc-dind");
     expect(dockerAgentWorkflow).toContain("driver: remote");
     expect(dockerAgentWorkflow).toContain('PREFERRED_ORDINAL: "1"');
     expect(dockerAgentWorkflow).toContain(
