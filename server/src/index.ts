@@ -18,6 +18,8 @@ import type { Request as ExpressRequest, RequestHandler } from "express";
 import { and, eq } from "drizzle-orm";
 import {
   createDb,
+  POSTGRES_POOL_MAX,
+  POSTGRES_WEBHOOK_POOL_MAX,
   ensurePostgresDatabase,
   formatEmbeddedPostgresError,
   getPostgresDataDirectory,
@@ -570,6 +572,7 @@ export async function startServer(): Promise<StartedServer> {
   
   let db;
   let pluginMigrationDb;
+  let githubWebhookDb;
   let embeddedPostgres: EmbeddedPostgresInstance | null = null;
   let embeddedPostgresStartedByThisProcess = false;
   let migrationSummary: MigrationSummary = "skipped";
@@ -583,7 +586,20 @@ export async function startServer(): Promise<StartedServer> {
     const migrationUrl = config.databaseMigrationUrl ?? config.databaseUrl;
     migrationSummary = await ensureMigrations(migrationUrl, "PostgreSQL");
   
-    db = withAgentStartLockAbortableDb(createDb(config.databaseUrl));
+    // BLO-47034: on the API tier the webhook router gets its own pool, carved
+    // out of the main one so the per-process total stays POSTGRES_POOL_MAX.
+    // The worker keeps the whole pool: its scheduler and plugin jobs are what
+    // need it, and webhooks land on the API tier.
+    const splitWebhookPool = config.paperclipNodeRole === "api";
+    db = withAgentStartLockAbortableDb(
+      createDb(
+        config.databaseUrl,
+        splitWebhookPool ? POSTGRES_POOL_MAX - POSTGRES_WEBHOOK_POOL_MAX : POSTGRES_POOL_MAX,
+      ),
+    );
+    githubWebhookDb = splitWebhookPool
+      ? withAgentStartLockAbortableDb(createDb(config.databaseUrl, POSTGRES_WEBHOOK_POOL_MAX))
+      : undefined;
     pluginMigrationDb = config.databaseMigrationUrl ? createDb(config.databaseMigrationUrl) : db;
     logger.info("Using external PostgreSQL via DATABASE_URL/config");
     activeDatabaseConnectionString = config.databaseUrl;
@@ -1052,6 +1068,7 @@ export async function startServer(): Promise<StartedServer> {
     companyDeletionEnabled: config.companyDeletionEnabled,
     authPublicBaseUrl: config.authPublicBaseUrl ?? null,
     pluginMigrationDb: pluginMigrationDb as any,
+    githubWebhookDb: githubWebhookDb as any,
     betterAuthHandler,
     resolveSession,
     pluginWorkerManager,

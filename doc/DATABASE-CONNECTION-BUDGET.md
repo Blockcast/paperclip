@@ -70,6 +70,14 @@ single pod in place and never doubles.
 
 ### There is no second application pool
 
+**One split, no addition (BLO-47034).** On `PAPERCLIP_NODE_ROLE=api` the
+process pool is divided: the main pool gets
+`POSTGRES_POOL_MAX - POSTGRES_WEBHOOK_POOL_MAX` and the GitHub webhook router
+gets `POSTGRES_WEBHOOK_POOL_MAX` (`packages/db/src/client.ts`). The two sum to
+`POSTGRES_POOL_MAX`, so every figure below is unchanged. The worker keeps the
+whole pool. The gauges carry a `pool` label (`main` / `webhook`), so sum over
+it when reading a per-process total.
+
 `server/src/index.ts` creates a second pool only in the
 `config.databaseMigrationUrl` branch, and that resolves solely from
 `DATABASE_MIGRATION_URL` (`databaseMigrationUrl` in `server/src/config.ts`).

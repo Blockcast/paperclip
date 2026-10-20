@@ -21,6 +21,7 @@ import {
   issues,
   issueWorkProducts,
   POSTGRES_POOL_MAX,
+  POSTGRES_WEBHOOK_POOL_MAX,
 } from "@paperclipai/db";
 import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import { logger } from "../middleware/logger.js";
@@ -9089,6 +9090,19 @@ describeEmbeddedPostgres("github-webhook route", () => {
         expect(deriveGithubWebhookMaxConcurrentDeliveries(poolMax) * 2).toBeLessThan(poolMax);
       }
       for (const poolMax of [1, 2]) expect(deriveGithubWebhookMaxConcurrentDeliveries(poolMax)).toBe(1);
+    });
+
+    it("on a dedicated pool every delivery may nest 2 connections and still fit (BLO-47034)", () => {
+      // No interactive traffic shares a dedicated pool, so the bound only has
+      // to keep the reviewer-wake nest (lock tx + wakeup tx) deadlock-free.
+      for (const poolMax of [2, 3, 6, 10, 18]) {
+        expect(deriveGithubWebhookMaxConcurrentDeliveries(poolMax, true) * 2).toBeLessThanOrEqual(poolMax);
+      }
+      expect(deriveGithubWebhookMaxConcurrentDeliveries(POSTGRES_WEBHOOK_POOL_MAX, true)).toBe(3);
+      expect(derivePrReviewerWakeMaxConcurrency(POSTGRES_WEBHOOK_POOL_MAX)).toBe(2);
+      // Carved out of the process pool, never added to it: the main pool on the
+      // API tier must stay usable.
+      expect(POSTGRES_POOL_MAX - POSTGRES_WEBHOOK_POOL_MAX).toBeGreaterThanOrEqual(POSTGRES_POOL_MAX / 2);
     });
 
     it("a red lane wakes immediately and later green lanes on that head do not re-wake", async () => {

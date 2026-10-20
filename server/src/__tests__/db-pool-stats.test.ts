@@ -65,6 +65,17 @@ describe("DB pool exposition (BLO-33243)", () => {
     expect(await seriesFor(DB_POOL_WAITING_QUERIES_METRIC)).toHaveLength(1);
   });
 
+  it("labels each pool, so the API tier's webhook pool is its own series (BLO-47034)", async () => {
+    refreshDbPoolMetrics(createDb(IDLE_URL) as never, "main");
+    refreshDbPoolMetrics(createDb(IDLE_URL, 3) as never, "webhook");
+
+    const webhook = (await seriesFor(DB_POOL_CONNECTIONS_METRIC)).filter((line) => line.includes('pool="webhook"'));
+    expect(webhook.map((line) => line.match(/state="([^"]+)"/)?.[1]).sort()).toEqual(["active", "connecting", "idle", "max"]);
+    expect(webhook.find((line) => line.includes('state="max"'))).toMatch(/ 3$/);
+    const waitingPools = (await seriesFor(DB_POOL_WAITING_QUERIES_METRIC)).map((line) => line.match(/pool="([^"]+)"/)?.[1]);
+    expect(waitingPools.sort()).toEqual(["main", "webhook"]);
+  });
+
   it("degrades to no-op rather than throwing when the client has no poolStats", () => {
     expect(() => refreshDbPoolMetrics({ $client: {} } as never)).not.toThrow();
     expect(() => refreshDbPoolMetrics({} as never)).not.toThrow();
