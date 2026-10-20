@@ -96,7 +96,7 @@ and a reason disagree, trust the reason. It is also what the tests assert on.
 | `allow_manager_chain` | `:2466` | A | — | — | `isManagerOf(actor, resource.assigneeAgentId)` |
 | `allow_issue_mention_grant` | `:2481` | A | — | — | a live, non-deleted `agent://<actor>` mention from a principal entitled to grant it |
 | `allow_recovery_handoff_grant` | `:2493` | A | — | — | an open recovery handoff naming the actor |
-| `allow_dependency_edge` | `agentHoldsIssueAcrossDependencyEdge` | A | — | — | a `blocks` row joins the target T and a non-terminal issue X whose **current** assignee is the actor. **X blocks T** (row in T's blocker set, so T's side declared it): allowed. **T blocks X** (row in X's blocker set, writable with no relation to T): allowed only if the edge's creator had standing on T — a board user, T's assignee or creator, or a manager of T's assignee. Derived at decision time: cutting the edge, reassigning X, or closing X revokes it (`BLO-30968`) |
+| `allow_dependency_edge` | `agentHoldsIssueAcrossDependencyEdge` | A | — | — | a `blocks` row joins the target T and a non-terminal issue X whose **current** assignee is the actor. In **either** direction the edge's creator must have had standing on T — a board user, T's assignee or creator, or a manager of T's assignee. Neither blocker set is written only by T's side: X's set needs no relation to T, and T's set is also written by child-create with `blockParentUntilDone`, which needs only read on T. Derived at decision time: cutting the edge, reassigning X, or closing X revokes it (`BLO-30968`) |
 | `allow_productivity_review_grant` | `:2518` | A | **A** | — | the actor is assigned the review whose `originId` is this issue |
 | `allow_explicit_grant` | `:857` via `:2411` | n/a | n/a | A | **coordination metadata only** — `tasks:assign`/`tasks:assign_scope` **and** `isManagerOf(assignee)` |
 
@@ -118,7 +118,7 @@ Terminal denials:
   the 403 rather than from this file. A relation not in that list is excluded
   on purpose if it appears in the negative controls below, and unmodelled
   otherwise — adding one means adding it there, here, and in the matrix.
-- `:2637` `deny_missing_grant` — the fallthrough (since `BLO-30968`, reached only by `issue:mutate`; `issue:comment` returns the denial above first). `permissionForAction` returns
+- `deny_missing_grant` at the end of `decideBase` — the fallthrough (since `BLO-30968`, reached only by `issue:mutate`; `issue:comment` returns the denial above first). `permissionForAction` returns
   `null` for all three issue actions (`:186`, `:192`), so the generic
   `permissionKey` grant fallback at `:2597` never fires for them. **No permission
   grant of any kind can satisfy `issue:mutate`.** That is deliberate: issue writes
@@ -208,9 +208,10 @@ without re-deciding the model itself:
   Ancestry is not a declared dependency; only a `blocks` edge is.
 - An agent across a `blocks` edge: denied `issue:mutate` — the edge grants a
   voice to the owner, not a rewrite of their issue.
-- An agent whose issue X is **blocked by** T, where the edge was written by
-  someone with no standing on T (the agent itself parking X, or a peer agent
-  creating X for it): denied `issue:comment` on T. Otherwise any two agents
+- An agent holding X across a `blocks` edge with T, in either direction,
+  where the edge was written by someone with no standing on T (the agent
+  itself parking X, a peer creating X for it, or the agent spawning X as a
+  child of T with `blockParentUntilDone`): denied `issue:comment` on T. Otherwise any two agents
   could hand each other a voice on any issue. The cost is deliberate: an
   agent that parks itself behind an unrelated issue gets no reach from that.
 - An agent whose issue X is `done`/`cancelled`: no reach along X's edges.

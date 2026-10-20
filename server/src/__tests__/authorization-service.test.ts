@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import {
   agents,
   authUsers,
@@ -4870,9 +4870,8 @@ describeEmbeddedPostgres("authorization service", () => {
           issueId: relation === "blocked_issue_assignee" ? issue.id : held.id,
           relatedIssueId: relation === "blocked_issue_assignee" ? held.id : issue.id,
           type: "blocks",
-          // T blocks X needs a creator with standing on T; here, T's owner.
-          // X blocks T sits in T's own blocker set and needs no stamp.
-          createdByAgentId: relation === "blocked_issue_assignee" ? issue.assigneeAgentId : null,
+          // Either direction needs a creator with standing on T; here, T's owner.
+          createdByAgentId: issue.assigneeAgentId,
         });
       }
 
@@ -5058,7 +5057,7 @@ describeEmbeddedPostgres("authorization service", () => {
       },
       {
         relation: "blocking_issue_assignee",
-        note: "BLO-30968 — the actor's issue blocks the target: the edge is symmetric for comment",
+        note: "BLO-30968 — the actor's issue blocks the target: same creator-standing rule",
         cells: [
           { action: "issue:comment", allowed: true, reason: "allow_dependency_edge" },
           { action: "issue:mutate", allowed: false, reason: "deny_missing_grant" },
@@ -5198,13 +5197,34 @@ describeEmbeddedPostgres("authorization service", () => {
       expect((await decideComment()).allowed).toBe(false);
       await db.update(issues).set({ status: "todo" }).where(eq(issues.id, consumer.id));
 
-      // X blocks T sits in T's own blocker set, so T's side declared it: no
-      // creator condition, even when the actor's own id is on the row.
+      // X blocks T obeys the same rule: T's blocker set is also writable
+      // without standing on T (child-create with blockParentUntilDone).
+      const reverseBy = async (by: { createdByAgentId?: string; createdByUserId?: string }) => {
+        await db.delete(issueRelations).where(eq(issueRelations.relatedIssueId, producer.id));
+        await db.insert(issueRelations).values({
+          companyId: company.id, issueId: consumer.id, relatedIssueId: producer.id, type: "blocks", ...by,
+        });
+        return (await decideComment()).allowed;
+      };
       await db.delete(issueRelations).where(eq(issueRelations.relatedIssueId, consumer.id));
-      await db.insert(issueRelations).values({
-        companyId: company.id, issueId: consumer.id, relatedIssueId: producer.id, type: "blocks",
-        createdByAgentId: actor.id,
+      expect(await reverseBy({ createdByAgentId: actor.id })).toBe(false);
+      expect(await reverseBy({})).toBe(false); // unstamped fails closed
+      expect(await reverseBy({ createdByAgentId: owner.id })).toBe(true);
+      await db.delete(issueRelations).where(eq(issueRelations.relatedIssueId, producer.id));
+
+      // The child-create path: an agent that can merely read T spawns a child
+      // that blocks T. The stamp is the spawner, who has no standing on T.
+      const svc = issueService(db);
+      const { issue: child } = await svc.createChild(producer.id, {
+        title: "Self-spawned blocker", assigneeAgentId: actor.id, blockParentUntilDone: true,
+        createdByAgentId: actor.id, actorAgentId: actor.id,
       });
+      const [childEdge] = await db.select().from(issueRelations)
+        .where(and(eq(issueRelations.issueId, child.id), eq(issueRelations.relatedIssueId, producer.id)));
+      expect(childEdge?.createdByAgentId).toBe(actor.id);
+      expect((await decideComment()).allowed).toBe(false);
+      // The same shape spawned by T's owner does count.
+      await db.update(issueRelations).set({ createdByAgentId: owner.id }).where(eq(issueRelations.id, childEdge!.id));
       expect((await decideComment()).reason).toBe("allow_dependency_edge");
     });
 
