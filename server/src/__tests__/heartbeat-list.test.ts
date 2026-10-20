@@ -224,6 +224,65 @@ describeEmbeddedPostgres("heartbeat list", () => {
     });
   });
 
+  it("returns queuedAt on list rows, matching getRun, in full and summary mode (BLO-47997)", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const promotedRunId = randomUUID();
+    const directRunId = randomUUID();
+    const queuedAt = new Date("2026-10-20T10:30:00Z");
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "running",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    await db.insert(heartbeatRuns).values([
+      {
+        id: promotedRunId,
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        status: "succeeded",
+        createdAt: new Date("2026-10-20T10:00:00Z"),
+        scheduledRetryAt: new Date("2026-10-20T10:29:00Z"),
+        queuedAt,
+        startedAt: new Date("2026-10-20T10:35:00Z"),
+      },
+      {
+        id: directRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        status: "queued",
+        createdAt: new Date("2026-10-20T11:00:00Z"),
+      },
+    ]);
+
+    const service = heartbeatService(db);
+    const promoted = await service.getRun(promotedRunId);
+    expect(promoted?.queuedAt).toEqual(queuedAt);
+
+    for (const summary of [false, true]) {
+      const byId = new Map((await service.list(companyId, agentId, 5, { summary })).map((run) => [run.id, run]));
+      expect(byId.get(promotedRunId)?.queuedAt).toEqual(promoted?.queuedAt);
+      expect(byId.get(directRunId)).toHaveProperty("queuedAt", null);
+    }
+  });
+
   it("bounds oversized legacy result json payloads on getRun", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();

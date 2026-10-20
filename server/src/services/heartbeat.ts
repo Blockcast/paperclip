@@ -4661,6 +4661,10 @@ const heartbeatRunListColumns = {
   scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
   scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
   scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
+  // BLO-47997: without this a list reader cannot tell a re-queued run from a
+  // fresh one, so `startedAt - createdAt` reports a re-queue's prior backoff or
+  // execution as dispatch wait. See HeartbeatRun.queuedAt.
+  queuedAt: heartbeatRuns.queuedAt,
   livenessState: heartbeatRuns.livenessState,
   livenessReason: heartbeatRuns.livenessReason,
   continuationAttempt: heartbeatRuns.continuationAttempt,
