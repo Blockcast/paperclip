@@ -564,10 +564,6 @@ api:
 # move this entry into env.extra: that list is rendered on the API Deployment
 # as well, and the chart rejects that configuration.
 worker:
-  # BLO-45764: a second worker so a lost worker pod is a <=60 s lease failover,
-  # not an outage. Safe because every singleton is lease-gated (BLO-46694) and
-  # /paperclip is the shared RWX paperclip-data claim.
-  replicas: 2
   extraEnv:
     - name: PENSTOCK_API_KEY
       valueFrom:
