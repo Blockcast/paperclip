@@ -221,6 +221,26 @@ async function fetchWithStartupRetry(
 }
 
 /**
+ * BLO-47803. True only for failures that prove the request never reached the
+ * target (nothing listening, no route, connect timed out), so serving it
+ * locally cannot execute a POST twice. A reset after connecting is NOT one.
+ */
+const CONNECT_PHASE_ERROR_CODES = new Set([
+  "ECONNREFUSED",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "EHOSTDOWN",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "UND_ERR_CONNECT_TIMEOUT",
+]);
+
+function isConnectPhaseError(err: unknown): boolean {
+  const cause = (err as { cause?: { code?: unknown } } | null)?.cause;
+  return typeof cause?.code === "string" && CONNECT_PHASE_ERROR_CODES.has(cause.code);
+}
+
+/**
  * Build an Express handler that reverse-proxies the request to the worker
  * tier at `workersInternalUrl`.
  */
@@ -228,9 +248,21 @@ function createWorkerProxyHandler(
   target: string | ((res: ExpressResponse) => string),
   streaming: boolean,
   requestTimeoutMs: number,
-  extraHeaders: Record<string, string> = {},
+  {
+    extraHeaders = {},
+    serveLocallyIfUnreachable = false,
+  }: {
+    extraHeaders?: Record<string, string>;
+    /**
+     * BLO-47803: when the target cannot be connected to, hand the request to
+     * the next matching route (the local handler) instead of replying 502.
+     * Also turns off the GET startup retry, which would otherwise spin until
+     * the request timeout against a dead holder.
+     */
+    serveLocallyIfUnreachable?: boolean;
+  } = {},
 ): RequestHandler {
-  return async (req, res) => {
+  return async (req, res, next) => {
     const workersInternalUrl = typeof target === "string" ? target : target(res);
     const targetUrl = `${workersInternalUrl}${req.originalUrl}`;
     // The same URL with the query string dropped on untrusted webhook routes.
@@ -310,7 +342,7 @@ function createWorkerProxyHandler(
         }
       }
 
-      const retryStartupRace = req.method === "GET";
+      const retryStartupRace = req.method === "GET" && !serveLocallyIfUnreachable;
       const retryBudgetMs = streaming
         ? readPositiveIntegerEnv(
           "PAPERCLIP_WORKER_PROXY_STREAM_STARTUP_RETRY_BUDGET_MS",
@@ -357,6 +389,14 @@ function createWorkerProxyHandler(
     } catch (err) {
       // Client left before we finished — expected, nothing to report.
       if (clientDisconnected) return;
+      if (serveLocallyIfUnreachable && !timedOut && !res.headersSent && isConnectPhaseError(err)) {
+        logger.warn(
+          { err, targetUrl: targetUrlForLog, method: req.method },
+          "plugin holder forward: lease holder unreachable; serving locally",
+        );
+        next("route");
+        return;
+      }
       // `headersSent` is definitive proof the worker responded: those headers
       // were read off the upstream response above and forwarded. Counting
       // that as `unreachable` would send the responder hunting for a missing
@@ -460,7 +500,8 @@ export const PLUGIN_HOLDER_FORWARDED_HEADER = "x-paperclip-plugin-holder-forward
  *
  * `resolveHolderUrl` returns null when this process should serve the request
  * itself: it is the holder, there is no lease, or the holder advertises no
- * address. Null is today's behaviour, so the fallback is never worse than it.
+ * address. Null is today's behaviour. A holder that cannot be connected to is
+ * served locally too (see `serveLocallyIfUnreachable`).
  */
 export function registerPluginHolderForwardRoutes(
   router: Router,
@@ -491,7 +532,15 @@ export function registerPluginHolderForwardRoutes(
       (res) => res.locals.pluginHolderUrl as string,
       route.streaming ?? false,
       timeoutMs,
-      { [PLUGIN_HOLDER_FORWARDED_HEADER]: "1" },
+      {
+        extraHeaders: { [PLUGIN_HOLDER_FORWARDED_HEADER]: "1" },
+        // A holder that crashed keeps its lease row until the TTL lapses
+        // (~45 s); serve locally rather than fail every call in that window.
+        // ponytail: a black-holed address waits out undici's 10 s connect
+        // timeout per request; add a shorter connect deadline (undici Agent)
+        // if that window ever matters.
+        serveLocallyIfUnreachable: true,
+      },
     ));
     router[route.method](route.path, ...handlers);
   }
