@@ -478,6 +478,22 @@ describeEmbeddedPostgres("successful run handoff liveness", () => {
       expect((await projectFor(companyId, issueId, hoursAgo(2))).state).toBe("required");
     });
 
+    it("resolves once a human owns the row, and not while an agent does", async () => {
+      // BLO-47836 (BLO-23371): human assignee, no agent assignee, no other path.
+      const { companyId, issueId } = await seed();
+      await db
+        .update(issues)
+        .set({ assigneeAgentId: null, assigneeUserId: "user-1" })
+        .where(eq(issues.id, issueId));
+      const state = await projectFor(companyId, issueId, hoursAgo(2));
+      expect(state.state).toBe("resolved");
+      expect(state.required).toBe(false);
+      expect(state.resolvedByContinuation).toBe("human_assignee");
+
+      await db.update(issues).set({ assigneeUserId: null }).where(eq(issues.id, issueId));
+      expect((await projectFor(companyId, issueId, hoursAgo(2))).state).toBe("required");
+    });
+
     it("leaves a genuinely stranded handoff required", async () => {
       // Later runs (incl. a succeeded non-source one), a decided approval, a
       // non-pending interaction: no live review path carries the issue.

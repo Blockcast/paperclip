@@ -1,4 +1,4 @@
-import { and, desc, eq, gt, inArray, sql } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, isNotNull, isNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -217,8 +217,9 @@ export async function resolveSuccessfulRunHandoffForTerminalIssues(
  *
  * Same shape as the terminal fold above: a read projection, so history heals on
  * its next read. Resolved only when the issue now has a live review path (pending
- * interaction, linked `pending` approval, or a future monitor on an `in_progress` /
- * `in_review` issue, the only statuses a monitor fires on). A later run alone does
+ * interaction, linked `pending` approval, a future monitor on an `in_progress` /
+ * `in_review` issue, the only statuses a monitor fires on, or a human assignee with
+ * no agent assignee — BLO-47836). A later run alone does
  * NOT count: a run that reaches the decision writes its own required/resolved row,
  * so the only later runs that leave this row newest are the early-return ones
  * (corrective, monitor, PR-review, comment wakes) — exactly the "corrective handoff
@@ -235,7 +236,7 @@ export async function resolveSuccessfulRunHandoffForLaterContinuation(
     .map(([issueId]) => issueId);
   if (requiredIssueIds.length === 0) return states;
 
-  const [interactionRows, approvalRows, monitorRows] = await Promise.all([
+  const [interactionRows, approvalRows, monitorRows, humanAssignedRows] = await Promise.all([
     dbOrTx
       .select({ issueId: issueThreadInteractions.issueId })
       .from(issueThreadInteractions)
@@ -262,9 +263,21 @@ export async function resolveSuccessfulRunHandoffForLaterContinuation(
         inArray(issues.status, ["in_progress", "in_review"]),
         gt(issues.monitorNextCheckAt, new Date()),
       )),
+    // BLO-47836: a human assignee is a review path in its own right; with no
+    // agent assignee there is no agent left to carry the handoff forward.
+    dbOrTx
+      .select({ issueId: issues.id })
+      .from(issues)
+      .where(and(
+        eq(issues.companyId, companyId),
+        inArray(issues.id, requiredIssueIds),
+        isNotNull(issues.assigneeUserId),
+        isNull(issues.assigneeAgentId),
+      )),
   ]);
 
-  const reviewPath = new Map<string, "pending_interaction" | "pending_approval" | "monitor">();
+  const reviewPath = new Map<string, NonNullable<SuccessfulRunHandoffState["resolvedByContinuation"]>>();
+  for (const row of humanAssignedRows as Array<{ issueId: string }>) reviewPath.set(row.issueId, "human_assignee");
   for (const row of monitorRows as Array<{ issueId: string }>) reviewPath.set(row.issueId, "monitor");
   for (const row of approvalRows as Array<{ issueId: string }>) reviewPath.set(row.issueId, "pending_approval");
   for (const row of interactionRows as Array<{ issueId: string }>) reviewPath.set(row.issueId, "pending_interaction");

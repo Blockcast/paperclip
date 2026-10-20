@@ -591,7 +591,7 @@ export interface SuccessfulRunHandoffState {
   // Set when the handoff reads `resolved` because something continued the issue
   // after the requirement was recorded, without a run writing the resolution
   // row (BLO-47584): the issue now has a live review path.
-  resolvedByContinuation?: "pending_interaction" | "pending_approval" | "monitor" | null;
+  resolvedByContinuation?: "pending_interaction" | "pending_approval" | "monitor" | "human_assignee" | null;
 }
 
 export type IssueScheduledRetryStatus = "scheduled_retry" | "queued" | "running" | "cancelled";
