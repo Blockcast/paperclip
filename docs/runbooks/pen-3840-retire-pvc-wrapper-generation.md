@@ -154,16 +154,23 @@ All four must be true. Measure them; do not assume.
      deleted is as unplaceable as a digest, so ancestry **cannot** clear it.
 
    When a reference will not resolve, do not stall and do not wave it through.
-   Ask the image the question directly, from any pod running it — this is the
-   authoritative check in every case, because it tests the directory the
-   fall-through actually needs rather than a proxy for it:
+   Ask the image the question directly — this is the authoritative check in
+   every case, because it tests the directory the fall-through actually needs
+   rather than a proxy for it:
 
    ```console
-   $ ls -l /usr/local/libexec/paperclip/bin/
+   $ kubectl -n paperclip exec <a pod running that reference> -c claude -- \
+       ls -l /usr/local/libexec/paperclip/bin/{gh,git,github-mcp-server,github-token-credential-helper,paperclip-github-token-env}
    ```
 
-   All five wrappers must be present and `root:root`. Measured 2026-10-20 on
-   `sha-d529842-k8s-vendored`: five files, `root root 755`, `test -w` false for
+   Run it **once per distinct unverified reference** the census returned, not
+   once overall. The census is `sort -u`, so it can hand you several, and the
+   answer is a property of the image — one pod's result says nothing about a
+   pod on a different reference. All five paths must exist and be `root:root`;
+   a missing one fails the precondition for that reference.
+
+   Measured 2026-10-20 on `sha-d529842-k8s-vendored`, the single reference the
+   fleet was then running: five files, `root root 755`, `test -w` false for
    each — so that unresolvable tag is cleared on evidence, not on inference.
 
    > **Census trap.** Do not scope this by `image=~".*paperclip-agent.*"`. That
