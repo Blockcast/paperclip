@@ -355,6 +355,30 @@ function isCreditableAllyReviewSubmission(
   );
 }
 
+/**
+ * Credit-surface rank for the per-head tie-breaks (PEN-4431): a review
+ * submission outranks a plain issue comment.
+ *
+ * This exists because narrowing the credit ROUTES was not enough on its own.
+ * A route decides who may state a positive; the tie-breaks decide whose
+ * statement about a head is read at all, and those were ordered on recency
+ * alone. So a clean issue comment posted after a blocking review submission at
+ * the same head simply became the head's statement, the blocking branch never
+ * ran, and an `issues: write` principal still turned the merge-facing status
+ * from `failure` to `success` -- only the label moved. Displacing is retiring
+ * by another name, which is the same reasoning the attested/unattested axis in
+ * `headsWithUndispositionedFinding` already carries (Ally, #2875 at 5359c08e,
+ * Important 1).
+ *
+ * Ranking decides only who may make the POSITIVE claim. Both tie-breaks pair
+ * it with an eligible-set expansion that keeps a non-displacing issue comment
+ * able to ADD a finding, because a finding blocks from either surface and
+ * narrowing THAT would be the fail-open this module must not get wrong.
+ */
+function creditSurfaceRank(comment: CommentReviewGateComment): number {
+  return comment.surface === "pull_request_review" ? 1 : 0;
+}
+
 interface AttestingComment {
   comment: CommentReviewGateComment;
   attestedHeadSha: string;
@@ -419,15 +443,51 @@ function latestAttestingAllyComment(
     candidates.push({ attesting: { comment, attestedHeadSha }, timeMs: commentTime });
   }
 
-  // Strictly newest wins; on an exact tie the finding wins over the clean
-  // review. Two comments at the same second, one carrying a finding and one
-  // clean, used to go green with the finding open whenever the finding
+  // Credit surface first, then recency; on an exact tie the finding wins over
+  // the clean review. Two comments at the same second, one carrying a finding
+  // and one clean, used to go green with the finding open whenever the finding
   // happened to come first in the array.
-  const tied = topTiedBy(candidates, (candidate) => [candidate.timeMs]);
+  //
+  // Surface outranks recency so that an issue comment cannot DISPLACE a review
+  // submission at this head (PEN-4431, see `creditSurfaceRank`). Every
+  // candidate here is attested by construction -- an unextractable or
+  // mismatched head was skipped above -- so surface is the only precedence
+  // axis this tie-break needs.
+  const tied = topTiedBy(candidates, (candidate) => [
+    creditSurfaceRank(candidate.attesting.comment),
+    candidate.timeMs,
+  ]);
+  const winner = tied[0];
+  if (!winner) return null;
+
+  // ...but it may still ADD. An issue comment at least as new as the winning
+  // review submission stays eligible to carry a finding, exactly as an
+  // unreadable review does in `headsWithUndispositionedFinding`: the blocking
+  // branch reads whatever this function returns, so dropping a newer
+  // issue-comment finding here would hide a red behind an older clean review.
+  // Strictly older issue comments are NOT eligible, which is what preserves
+  // the disposition rule -- a later clean review of the same head means Ally
+  // re-examined that exact tree and found nothing.
+  //
+  // When the winner is itself an issue comment there is no review submission
+  // at this head at all, so there is nothing to displace and the set is just
+  // the newest tied candidates, as before.
+  const eligible =
+    creditSurfaceRank(winner.attesting.comment) === 1
+      ? [
+          ...tied,
+          ...candidates.filter(
+            (candidate) =>
+              creditSurfaceRank(candidate.attesting.comment) === 0 &&
+              candidate.timeMs >= winner.timeMs,
+          ),
+        ]
+      : tied;
+
   const chosen =
-    tied.find((candidate) => hasActionablePrReviewFeedback(candidate.attesting.comment.body)) ??
-    tied[0];
-  return chosen?.attesting ?? null;
+    eligible.find((candidate) => hasActionablePrReviewFeedback(candidate.attesting.comment.body)) ??
+    winner;
+  return chosen.attesting;
 }
 
 /**
@@ -557,7 +617,7 @@ function headsWithUndispositionedFinding(
       // head. Checked after the lane so an entry refused on both reports the
       // lane — the older, better-understood cause, and the one whose remedy
       // ("someone else has to retire it") subsumes the other's.
-      const refusedOffSurface = comment.surface !== "pull_request_review";
+      const refusedOffSurface = !isCreditableAllyReviewSubmission(comment, reviewerBotLogin);
       for (const entry of extractAllyPriorFindingDispositions(comment.body)) {
         const retiring = entry.kind === "retires" || entry.kind === "defers";
         const target = !retiring
@@ -801,11 +861,45 @@ function headsWithUndispositionedFinding(
   // newer unreadable one that counts a finding -- exactly what every review
   // becomes on a SUPPORTED_ALLY_VERDICT_VERSION bump (Ally, #1721 at 5f4d5302,
   // Critical 2).
+  //
+  // Credit surface joins the same precedence, one rank BELOW `attested`
+  // (PEN-4431). It closes the twin of the displacement above: a clean issue
+  // comment attesting head H, newer than H's blocking review submission, used
+  // to win H's slot here and drop that review out of `byHead` entirely -- so
+  // the finding stopped carrying forward and the red became `success`. The
+  // same mechanism reached back a head: a later clean issue comment attesting
+  // OLD retired OLD's blocking review by displacing it.
+  //
+  // Ally's note suggested the surface axis ahead of `attested`; it sits below
+  // instead, and the difference is deliberate. Above `attested`, an UNREADABLE
+  // review submission would outrank an ATTESTED issue comment, which is the
+  // precedence the paragraph above exists to forbid -- an unreadable body
+  // makes no statement, so it must not displace one on any axis. Below it,
+  // both invariants hold at once and neither leans on the eligible-set
+  // expansion to stay safe. The defect Ally reported is between two ATTESTED
+  // bodies, where `attested` ties and surface decides, so it is fixed either
+  // way.
   const carried: { attesting: AttestingComment; timeMs: number }[] = [];
   for (const candidates of byHead.values()) {
-    const tied = topTiedBy(candidates, (candidate) => [candidate.attested ? 1 : 0, candidate.timeMs]);
-    const eligible = tied[0]!.attested
-      ? [...tied, ...candidates.filter((c) => !c.attested && c.timeMs >= tied[0]!.timeMs)]
+    const tied = topTiedBy(candidates, (candidate) => [
+      candidate.attested ? 1 : 0,
+      creditSurfaceRank(candidate.attesting.comment),
+      candidate.timeMs,
+    ]);
+    const winner = tied[0]!;
+    // An issue comment joins the eligible set on the same terms as an
+    // unreadable review, and for the same reason: it may not displace, but it
+    // may still carry a finding, and a finding blocks from either surface.
+    const eligible = winner.attested
+      ? [
+          ...tied,
+          ...candidates.filter(
+            (c) =>
+              !tied.includes(c) &&
+              c.timeMs >= winner.timeMs &&
+              (!c.attested || creditSurfaceRank(c.attesting.comment) < creditSurfaceRank(winner.attesting.comment)),
+          ),
+        ]
       : candidates;
     const blocking = eligible.find(
       (entry) =>
@@ -1037,6 +1131,9 @@ export function evaluateCommentReviewGate(input: {
   // to avoid. What this branch closes is the malformed-ledger shape, where the
   // section parses as absent and the bare attestation was the whole claim.
   let withheldPositive: Extract<CommentReviewGateVerdict, { outcome: "not_evaluated" }> | null = null;
+  // Held for the same reason `withheldPositive` is, on the surface axis rather
+  // than the author one (PEN-4431). See the deferral branch below.
+  let heldDeferral: Extract<CommentReviewGateVerdict, { outcome: "deferred_finding" }> | null = null;
 
   if (forHead) {
     if (hasActionablePrReviewFeedback(forHead.comment.body)) {
@@ -1137,13 +1234,33 @@ export function evaluateCommentReviewGate(input: {
       // carry-forward ledger instead.
       const deferred = countAllyDeferredPriorFindings(forHead.comment.body);
       if (deferred > 0) {
-        return {
+        const deferral = {
           state: "success",
           outcome: "deferred_finding",
           reason:
             `Ally's review of this head accepts ${deferred} prior ` +
             `${deferred === 1 ? "finding" : "findings"} as tracked on a follow-up, not fixed.`,
-        };
+        } as const;
+        if (isCreditableAllyReviewSubmission(forHead.comment, reviewerBotLogin)) return deferral;
+        // Off the review surface the deferral is HELD, not returned
+        // (PEN-4431). `deferred_finding` is only less positive than `clean`;
+        // against a `carried_finding` red it is a PROMOTION, and returning it
+        // here skipped `headsWithUndispositionedFinding` entirely. That let an
+        // `issues: write` principal clear a carried red with one issue comment
+        // attesting the current head and carrying a single `tracked` ledger
+        // line -- `countAllyDeferredPriorFindings` counts the line whether or
+        // not it names a real finding, and the same entry is correctly refused
+        // into `refusedOffReviewSurface` by the ledger that this return never
+        // reached (Ally, #2875 at 5359c08e, Important 2).
+        //
+        // Held rather than suppressed, because the deferral must still be
+        // HEARD: the evidence probe reads it as a veto on a clean vouch, so
+        // dropping it off this surface would be the fail-OPEN the surface
+        // check below is explicitly written not to cause. It is returned
+        // unchanged once no red carries, which keeps that veto and the
+        // `ci/ally-head-attested` schedule signal (`deferred_finding` is
+        // `success` there) exactly as they were.
+        heldDeferral = deferral;
       }
       // Name the source that decided this, because "clean" from a counted
       // structured block and "clean" from the prose fallback are different
@@ -1175,7 +1292,7 @@ export function evaluateCommentReviewGate(input: {
       // less positive stays surface-blind. Caught by
       // "a tracked deferral on either surface beats a clean one on the other"
       // in `evidence-truth.test.ts`, which fails if this check moves back up.
-      if (forHead.comment.surface !== "pull_request_review") {
+      if (!isCreditableAllyReviewSubmission(forHead.comment, reviewerBotLogin)) {
         // Held rather than returned, like every other withheld positive: the
         // carry-forward ledger below still has to run.
         withheldPositive = {
@@ -1337,7 +1454,15 @@ export function evaluateCommentReviewGate(input: {
   // comment DOES attest this head, so the generic "no comment attests" reason
   // below would be false, and `authorUnknown` has to survive for the caller to
   // know this is the one outcome worth a PR-author fetch.
+  // The held deferral outranks `withheldPositive` here. Both can be set at
+  // once -- an issue comment carrying a deferral is held by the branch above
+  // and then also trips the surface check below it -- and of the two only
+  // `deferred_finding` still says a residual was accepted, which is the claim
+  // the evidence probe vetoes on. `not_evaluated` would silently drop it.
+  // (The author-withheld shapes are set in branches the deferral cannot
+  // reach, so this choice is only ever between the surface-withheld pair.)
   return (
+    heldDeferral ??
     withheldPositive ?? {
       state: "success",
       outcome: "not_evaluated",

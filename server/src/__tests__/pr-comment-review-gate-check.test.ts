@@ -258,16 +258,18 @@ describe("runPrCommentReviewGateCheck", () => {
     });
   });
 
-  it("merges both surfaces by chronology rather than preferring one", async () => {
-    // ORDERING is surface-blind and stays that way: the newest attestation for
-    // a head is the one read, whichever surface carried it. PEN-4431 narrowed
-    // what a body may CLAIM, not which body is read, and those are separate
-    // properties that this test now pins separately.
+  it("a later clean issue comment cannot displace a blocking review submission", async () => {
+    // The displacement hole (Ally, #2875 at 5359c08e, Important 1). Narrowing
+    // what a body may CLAIM was not enough on its own: ordering decided WHICH
+    // body is read, it was keyed on recency alone, and displacing is retiring
+    // by another name. So a clean issue comment posted after a blocking review
+    // at the same head took the head's slot, the blocking branch never ran,
+    // and an `issues: write` principal still moved the merge-facing status off
+    // `failure` — only the label moved, from `clean` to `not_evaluated`.
     //
-    // Half one: a blocking review superseded by a later clean issue comment.
-    // The issue comment is still read and still displaces the blocking review
-    // — the verdict is not `blocking_finding` — but it cannot carry the gate
-    // to `clean`, because a positive claim needs a review submission.
+    // Half one: the blocking review is newer-surface, so it keeps the slot and
+    // the finding is still reported, whatever arrives after it on the weaker
+    // surface.
     const cleanBody = `## Ally — Consolidated PR Review\nReviewed head: ${TARGET.headSha}\n### Critical Issues (0)\n### Important Issues (0)`;
     mockListReviews.mockResolvedValue([blockingCommentFor(TARGET.headSha)]);
     mockListComments.mockResolvedValue([
@@ -277,13 +279,14 @@ describe("runPrCommentReviewGateCheck", () => {
 
     await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({
       posted: true,
-      verdict: { state: "success", outcome: "not_evaluated" },
+      verdict: { state: "failure", outcome: "blocking_finding" },
     });
 
-    // Half two, the mirror, which is what proves half one is about the surface
-    // of the CLAIM and not about chronology having quietly become
-    // surface-preferring: swap the two surfaces and the later clean body —
-    // now a review submission — does reach `clean`.
+    // Half two, the mirror: the SAME two bodies with their surfaces swapped.
+    // Here the later clean body is a review submission and the older blocking
+    // one is an issue comment, so the review legitimately disposes it and the
+    // gate reaches `clean`. This is what keeps half one honest — it pins the
+    // rule to the surface precedence rather than to "a finding always wins".
     mockListReviews.mockResolvedValue([
       { login: "allyblockcast[bot]", body: cleanBody, createdAt: "2026-08-04T22:09:19Z" },
     ]);
@@ -292,6 +295,112 @@ describe("runPrCommentReviewGateCheck", () => {
     await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({
       posted: true,
       verdict: { state: "success", outcome: "clean" },
+    });
+  });
+
+  it("an issue comment carrying a finding still blocks a clean review it post-dates", async () => {
+    // The guard on the fix above: the surface rank decides only who may make
+    // the POSITIVE claim. A finding blocks from either surface, so an issue
+    // comment NEWER than the winning review submission stays eligible to
+    // carry one. Without this, ranking review submissions first would have
+    // bought the displacement fix at the price of a fresh fail-open in the
+    // other direction.
+    mockListReviews.mockResolvedValue([cleanCommentFor(TARGET.headSha, "2026-08-04T20:09:19Z")]);
+    mockListComments.mockResolvedValue([
+      {
+        ...blockingCommentFor(TARGET.headSha),
+        createdAt: "2026-08-04T22:09:19Z",
+      },
+    ]);
+    mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({
+      posted: true,
+      verdict: { state: "failure", outcome: "blocking_finding" },
+    });
+  });
+
+  it("a later clean issue comment cannot retire a finding carried from an earlier head", async () => {
+    // The same displacement mechanism reaching BACK a head, which is the half
+    // that survives a push: the gate is evaluating the current head, and the
+    // finding it must carry was raised against OLD. A clean issue comment
+    // attesting OLD displaced OLD's blocking review inside the per-head pick,
+    // so OLD dropped out of the carry set and the red disappeared — without
+    // anything ever claiming the current head was reviewed.
+    const OLD = "0".repeat(40);
+    mockListReviews.mockResolvedValue([blockingCommentFor(OLD)]);
+    mockListComments.mockResolvedValue([cleanCommentFor(OLD, "2026-08-04T22:09:19Z")]);
+    mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({
+      posted: true,
+      verdict: { state: "failure", outcome: "carried_finding", carriedFromHeadSha: OLD },
+    });
+  });
+
+  it("a tracked ledger line in an issue comment cannot clear a carried red", async () => {
+    // Ally, #2875 at 5359c08e, Important 2. `deferred_finding` is only less
+    // positive than `clean`; against `carried_finding` it is a PROMOTION, and
+    // it was RETURNED rather than held, so `headsWithUndispositionedFinding`
+    // never ran. One issue comment attesting the current head and carrying a
+    // single `tracked` line therefore turned an earlier head's red green —
+    // `countAllyDeferredPriorFindings` counts the line whether or not it names
+    // a real finding, and the ledger that correctly REFUSES that entry off the
+    // issue-comment surface was downstream of the return.
+    const OLD = "0".repeat(40);
+    mockFetchPrAuthor.mockResolvedValue("some-contributor");
+    mockListReviews.mockResolvedValue([blockingCommentFor(OLD)]);
+    mockListComments.mockResolvedValue([
+      {
+        login: "allyblockcast[bot]",
+        body: [
+          "## Ally — Consolidated PR Review",
+          `Reviewed head: ${TARGET.headSha}`,
+          "### Prior Findings Dispositioned (1)",
+          `- **prior:${OLD.slice(0, 7)} important 1** — tracked — accepted onto a follow-up.`,
+          "### Critical Issues (0)",
+          "### Important Issues (0)",
+        ].join("\n"),
+        createdAt: "2026-08-04T22:09:19Z",
+      },
+    ]);
+    mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({
+      posted: true,
+      verdict: { state: "failure", outcome: "carried_finding" },
+    });
+  });
+
+  it("still reports a deferral off the issue-comment surface once nothing carries", async () => {
+    // The other half of holding rather than suppressing it. With no carried
+    // red to outrank, the held deferral is returned unchanged — so the
+    // evidence probe still hears the veto it reads on a clean vouch, and the
+    // `ci/ally-head-attested` schedule signal still sees an attested head.
+    // Suppressing the deferral off this surface would have been a fail-OPEN,
+    // which is the direction this module must not get wrong.
+    const OLD = "0".repeat(40);
+    mockFetchPrAuthor.mockResolvedValue("some-contributor");
+    mockListReviews.mockResolvedValue([]);
+    mockListComments.mockResolvedValue([
+      {
+        login: "allyblockcast[bot]",
+        body: [
+          "## Ally — Consolidated PR Review",
+          `Reviewed head: ${TARGET.headSha}`,
+          "### Prior Findings Dispositioned (1)",
+          `- **prior:${OLD.slice(0, 7)} important 1** — tracked — accepted onto a follow-up.`,
+          "### Critical Issues (0)",
+          "### Important Issues (0)",
+        ].join("\n"),
+        createdAt: "2026-08-04T22:09:19Z",
+      },
+    ]);
+    mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({
+      posted: true,
+      verdict: { state: "success", outcome: "deferred_finding" },
     });
   });
 
