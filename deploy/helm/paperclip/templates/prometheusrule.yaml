@@ -1185,6 +1185,78 @@ spec:
             summary: "Paperclip agent {{`{{ $labels.agent_id }}`}} has a stranded external-runtime reservation and cannot launch"
             description: "Agent {{`{{ $labels.agent_id }}`}} holds an unreleased external_runtime_reservations row that has been alive for {{`{{ $value }}`}}s and whose heartbeat run is either terminal or silent past the 45m hard-stale floor (BLO-28865). That row holds the agent's slot through external_runtime_reservations_active_slot_idx, so EVERY launch for this agent is blocked, not only the run that stranded it. The age is only trusted while paperclip_external_runtime_reservation_strand_metrics_refresh_success is 1. First check whether the agent's adapterType changed recently -- that is the known cause, and it should now self-heal via the cancel cascade, so a firing alert means either the cascade did not run or this is a different strand. Then check paperclip_external_runtime_reservation_events_total{event=\"name_mismatch\"}: a nonzero rate means launches are being rejected because the Job name disagrees with the reservation. Inspect with `select id, agent_id, run_id, state, expected_job_name, job_name, job_uid, reserved_at from external_runtime_reservations where released_at is null order by reserved_at asc`. Do NOT clear job_name/job_uid to unwedge it: those are the only handle on the orphaned Job, and dropping them leaks a live pod that can still make model calls."
             runbook_url: {{ .Values.prometheusRule.externalRuntimeReservationStrandedRunbookUrl | quote }}
+        - alert: PaperclipAcceptedInteractionActionUnobserved
+          # PEN-4409. DECISION THIS INFORMS: an acceptance was recorded, the
+          # action it authorised has not been observed to have happened, and a
+          # PERSON must either do it or withdraw it. Nothing automated can act
+          # here and nothing in this path is permitted to -- the sweep reports
+          # and performs no writes at all, because the record it reads is a
+          # board or operator decision.
+          #
+          # The measured instance: interaction `f2a8595c` was accepted
+          # 2026-10-19T07:01:42Z authorising the merge of
+          # `Blockcast/paperclip#2584`. At 26h45m the PR was still open at its
+          # original head and the card still read `accepted`, having emitted
+          # nothing. No gate was holding it -- 4 of 6 sampled PRs that merged in
+          # that same window merged with zero approving reviews, one of them 59
+          # minutes after the acceptance in the identical gate state. The action
+          # simply was not done, and nothing could tell.
+          #
+          # Thresholds the OLDEST-AGE gauge rather than counting the bucket. A
+          # count fires on a healthy backlog of fresh acceptances; the age is
+          # the only series that separates "acceptances exist" from "an
+          # acceptance has been ignored".
+          #
+          # Per-replica freshness gate rather than an `on()` join, matching
+          # PaperclipQueuedRunStranded. A failed sweep keeps its last snapshot
+          # rather than zeroing (zeroing would read as "every acceptance has
+          # been acted on", the one conclusion a failed sweep cannot support),
+          # so the gate drops a stale series here and the strand alert below
+          # pages the sweep instead.
+          expr: max(paperclip_accepted_interaction_outcome_oldest_age_seconds{bucket="unobserved"} and on(instance) (paperclip_accepted_interaction_outcome_metrics_refresh_success == 1)) > {{ .Values.prometheusRule.acceptedInteractionUnobservedAgeSeconds }}
+          for: {{ .Values.prometheusRule.acceptedInteractionUnobservedFor }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Paperclip accepted interaction authorised an action that has not been observed"
+            description: "An accepted issue-thread confirmation declared an expectedOutcome that has still not been observed after {{`{{ $value | humanizeDuration }}`}} (PEN-4409). The acceptance is a decision a person must now act on, or withdraw -- this alert does NOT mean anything is broken in the platform, and nothing automated will clear it, by design. Find the card in the control-plane log line `accepted interactions whose authorised action has not been observed`, which names the interaction id, the issue identifier and the declared outcome. IMPORTANT: unobserved is NOT proof the action did not happen. A `github_pr_merged` outcome resolves against `issue_pull_requests`, which is webhook-fed and backfilled only for repos it has already seen, so a merge this installation never recorded also reads unobserved -- that ambiguity is resolved toward the alarm deliberately, because a false clear is worse than the silence this replaces. Check the real object first. Resolve by performing the authorised action, or by withdrawing the interaction if it has gone moot."
+            runbook_url: {{ .Values.prometheusRule.acceptedInteractionOutcomeRunbookUrl | quote }}
+        - alert: PaperclipAcceptedInteractionUntracked
+          # PEN-4409, AMENDMENT 2 on the issue. This is the adoption signal for
+          # `payload.expectedOutcome`, and it is deliberately an alert rather
+          # than a dashboard panel nobody opens.
+          #
+          # An untracked acceptance is not itself a failure -- it is an
+          # acceptance nothing CAN check. The reason it must be surfaced anyway
+          # is that a report showing only the cards which volunteered a
+          # reference reads clean precisely because it excludes the population
+          # the defect was measured on: `f2a8595c` declared nothing, so a sweep
+          # that filtered this bucket would have been blind to the exact card
+          # that motivated the work while reporting all-green.
+          #
+          # `info`, long threshold, and no runbook escalation: this asks for a
+          # habit change from filing agents, not an incident response.
+          expr: max(paperclip_accepted_interaction_outcome_oldest_age_seconds{bucket="untracked"} and on(instance) (paperclip_accepted_interaction_outcome_metrics_refresh_success == 1)) > {{ .Values.prometheusRule.acceptedInteractionUntrackedAgeSeconds }}
+          for: {{ .Values.prometheusRule.acceptedInteractionUntrackedFor }}
+          labels:
+            severity: info
+          annotations:
+            summary: "Paperclip accepted interactions carry no declared outcome to check"
+            description: "Accepted issue-thread confirmations are sitting with no `payload.expectedOutcome`, the oldest for {{`{{ $value | humanizeDuration }}`}} (PEN-4409). Nothing can tell whether the actions they authorised happened, because nothing recorded what they were. This is not an outage and no action is urgent: it means filing agents are not declaring an expectedOutcome when they ask for a confirmation. The field is optional on purpose -- requiring it would break every existing caller -- so this series is the only place the gap is visible. It is reported rather than filtered deliberately: a sweep that showed only the cards which declared a reference would read clean by excluding exactly the cards it exists to catch. Resolve by having filing agents set `payload.expectedOutcome` on confirmations that authorise a concrete action; the field is never inferred from prose, because the prose of the card that motivated this named ten different candidate references and the correct one was neither the first nor the most frequent."
+            runbook_url: {{ .Values.prometheusRule.acceptedInteractionOutcomeRunbookUrl | quote }}
+        - alert: PaperclipAcceptedInteractionOutcomeMetricsRefreshFailed
+          # PEN-4409. Strand alert for the two gauges above. The sweep keeps its
+          # last snapshot on failure rather than zeroing it, so without this the
+          # bucket series would freeze at last-good and both alerts above would
+          # be silently gated off by their own freshness check.
+          expr: paperclip_accepted_interaction_outcome_metrics_refresh_success == 0
+          for: {{ .Values.prometheusRule.acceptedInteractionOutcomeMetricsRefreshFailureFor }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Paperclip accepted-interaction outcome sweep is failing"
+            description: "The accepted-interaction outcome sweep has failed for {{ .Values.prometheusRule.acceptedInteractionOutcomeMetricsRefreshFailureFor }} (PEN-4409), so PaperclipAcceptedInteractionActionUnobserved is gated off and an acceptance nobody acted on would NOT surface. The bucket gauges deliberately keep their last values rather than being zeroed, because an all-zero report reads as 'every acceptance has been acted on' -- the one wrong answer this sweep exists to prevent. This gauge is initialised to 0 at process start, so a replica that has never completed a sweep also fires this; check whether the scrape collector tick is running at all before assuming a query fault."
+            runbook_url: {{ .Values.prometheusRule.acceptedInteractionOutcomeRunbookUrl | quote }}
         - alert: PaperclipWorkspaceReuseRefusalEpisode
           # PEN-3633 (parent PEN-3628). DECISION THIS INFORMS: a project's
           # managed checkout is refusing runs and a human must repair the

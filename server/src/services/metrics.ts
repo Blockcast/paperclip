@@ -25,7 +25,11 @@ import { Counter, Gauge, Histogram, Registry, collectDefaultMetrics } from "prom
 // second copy of either here would be free to drift from the map that decides which kinds the
 // sweep discharges. `@paperclipai/shared` is a leaf package with no edge back here, so
 // unlike the service imports below this one cannot form a cycle.
-import { APPROVAL_TYPES, RESTORED_EXECUTION_DISCHARGE_KINDS } from "@paperclipai/shared";
+import {
+  ACCEPTED_INTERACTION_OUTCOME_BUCKETS,
+  APPROVAL_TYPES,
+  RESTORED_EXECUTION_DISCHARGE_KINDS,
+} from "@paperclipai/shared";
 import { logger } from "../middleware/logger.js";
 // Type-only, so it is erased at runtime and creates no import cycle with the
 // reaper (which imports the recorder below). Structurally restating the result
@@ -1156,6 +1160,25 @@ export const APPROVAL_LAST_DECISION_TIMESTAMP_METRIC =
   "paperclip_approval_last_decision_timestamp_seconds";
 export const APPROVAL_QUEUE_METRICS_REFRESH_SUCCESS_METRIC =
   "paperclip_approval_queue_metrics_refresh_success";
+/**
+ * Accepted-interaction outcome tracking (PEN-4409).
+ *
+ * An accepted interaction records that a decision was MADE; nothing recorded
+ * whether the action it AUTHORISED happened, so an acceptance that was never
+ * acted on was byte-identical to one that was. The measured instance sat
+ * `accepted` and silent for 26h45m across 28 unrelated merges while the PR it
+ * authorised stayed open with no gate blocking it.
+ *
+ * The `untracked` series is the one that must never be dropped for being
+ * uninteresting: it counts acceptances that declared no outcome at all, and a
+ * dashboard which showed only the cards that volunteered a reference would read
+ * clean precisely because it excluded the failures it exists to catch.
+ */
+export const ACCEPTED_INTERACTION_OUTCOME_METRIC = "paperclip_accepted_interaction_outcome_total";
+export const ACCEPTED_INTERACTION_OUTCOME_OLDEST_AGE_METRIC =
+  "paperclip_accepted_interaction_outcome_oldest_age_seconds";
+export const ACCEPTED_INTERACTION_OUTCOME_METRICS_REFRESH_SUCCESS_METRIC =
+  "paperclip_accepted_interaction_outcome_metrics_refresh_success";
 /**
  * How long each currently-held per-agent start lock has been held (PEN-3305).
  *
@@ -3899,6 +3922,9 @@ let approvalsPending: Gauge<"type"> | null = null;
 let approvalOldestPendingAge: Gauge<"type"> | null = null;
 let approvalLastDecisionTimestamp: Gauge | null = null;
 let approvalQueueMetricsRefreshSuccess: Gauge | null = null;
+let acceptedInteractionOutcome: Gauge<"bucket"> | null = null;
+let acceptedInteractionOutcomeOldestAge: Gauge<"bucket"> | null = null;
+let acceptedInteractionOutcomeMetricsRefreshSuccess: Gauge | null = null;
 let agentStartLockHeldSeconds: Gauge<"agent_id"> | null = null;
 let agentStartLockPhaseSeconds: Gauge<"agent_id" | "phase"> | null = null;
 let agentStartLockAbortedTotal: Counter<"agent_id"> | null = null;
@@ -4128,6 +4154,9 @@ function ensureRegistry(): {
   approvalOldestPendingAgeGauge: Gauge<"type">;
   approvalLastDecisionTimestampGauge: Gauge;
   approvalQueueMetricsRefreshSuccessGauge: Gauge;
+  acceptedInteractionOutcomeGauge: Gauge<"bucket">;
+  acceptedInteractionOutcomeOldestAgeGauge: Gauge<"bucket">;
+  acceptedInteractionOutcomeMetricsRefreshSuccessGauge: Gauge;
   agentStartLockHeldSecondsGauge: Gauge<"agent_id">;
   agentStartLockPhaseSecondsGauge: Gauge<"agent_id" | "phase">;
   agentStartLockAbortedTotalCounter: Counter<"agent_id">;
@@ -4207,6 +4236,9 @@ function ensureRegistry(): {
     || !projectCheckoutOriginReconcileCompared
     || !projectCheckoutOriginReconcileMetricsRefreshSuccess
     || !approvalsPending
+    || !acceptedInteractionOutcome
+    || !acceptedInteractionOutcomeOldestAge
+    || !acceptedInteractionOutcomeMetricsRefreshSuccess
     || !approvalOldestPendingAge
     || !approvalLastDecisionTimestamp
     || !approvalQueueMetricsRefreshSuccess
@@ -5029,6 +5061,45 @@ function ensureRegistry(): {
       registers: [registry],
     });
     approvalQueueMetricsRefreshSuccess.set(0);
+    acceptedInteractionOutcome = new Gauge({
+      name: ACCEPTED_INTERACTION_OUTCOME_METRIC,
+      help:
+        "Accepted issue-thread confirmations by outcome-tracking bucket (PEN-4409): `observed` "
+        + "(the agent-declared outcome has been observed to have happened), `unobserved` (declared "
+        + "but not observed), `untracked` (the acceptance declared no outcome at all, so nothing "
+        + "can ever check it). The three are EXHAUSTIVE over accepted confirmations and all three "
+        + "are always emitted, including `untracked` -- filtering it would make this series read "
+        + "clean by excluding exactly the population the issue measured. Every ambiguity resolves "
+        + "to `unobserved`: an unrecognised outcome kind, an unresolvable reference, or a merge "
+        + "this installation holds no record of all count there, because a false alarm costs a "
+        + "look while a false clear is worse than silence.",
+      labelNames: ["bucket"],
+      registers: [registry],
+    });
+    acceptedInteractionOutcomeOldestAge = new Gauge({
+      name: ACCEPTED_INTERACTION_OUTCOME_OLDEST_AGE_METRIC,
+      help:
+        "Seconds since acceptance of the OLDEST accepted confirmation in each outcome bucket "
+        + "(PEN-4409). This is the series an alert thresholds -- 'unobserved after N hours' is "
+        + "`" + ACCEPTED_INTERACTION_OUTCOME_OLDEST_AGE_METRIC + "{bucket=\"unobserved\"} > N`, "
+        + "which keeps N in the alert where it can be tuned instead of baking it into the "
+        + "population. Reset-then-set; an empty bucket has NO series here rather than 0, because 0 "
+        + "would read as an acceptance made this instant. Its "
+        + ACCEPTED_INTERACTION_OUTCOME_METRIC + " reads an explicit 0 alongside, so the absence is "
+        + "unambiguous.",
+      labelNames: ["bucket"],
+      registers: [registry],
+    });
+    acceptedInteractionOutcomeMetricsRefreshSuccess = new Gauge({
+      name: ACCEPTED_INTERACTION_OUTCOME_METRICS_REFRESH_SUCCESS_METRIC,
+      help:
+        "1 when the most recent accepted-interaction outcome sweep completed; 0 when it failed. "
+        + "On failure the bucket gauges keep their last values rather than being zeroed, because "
+        + "an all-zero report reads as 'every acceptance has been acted on' -- the one wrong "
+        + "answer this sweep exists to prevent. Alerts on the bucket series must gate on this.",
+      registers: [registry],
+    });
+    acceptedInteractionOutcomeMetricsRefreshSuccess.set(0);
     processLostTotal = new Counter({
       name: PROCESS_LOST_TOTAL_METRIC,
       help:
@@ -6234,6 +6305,9 @@ function ensureRegistry(): {
     approvalOldestPendingAgeGauge: approvalOldestPendingAge,
     approvalLastDecisionTimestampGauge: approvalLastDecisionTimestamp,
     approvalQueueMetricsRefreshSuccessGauge: approvalQueueMetricsRefreshSuccess,
+    acceptedInteractionOutcomeGauge: acceptedInteractionOutcome,
+    acceptedInteractionOutcomeOldestAgeGauge: acceptedInteractionOutcomeOldestAge,
+    acceptedInteractionOutcomeMetricsRefreshSuccessGauge: acceptedInteractionOutcomeMetricsRefreshSuccess,
     agentStartLockHeldSecondsGauge: agentStartLockHeldSeconds,
     agentStartLockPhaseSecondsGauge: agentStartLockPhaseSeconds,
     agentStartLockAbortedTotalCounter: agentStartLockAbortedTotal,
@@ -7563,6 +7637,47 @@ export function setApprovalQueuePendingMetrics(input: {
 /** Mark whether the approval-queue gauges were refreshed from the database. */
 export function setApprovalQueueMetricsRefreshSuccess(success: boolean): void {
   ensureRegistry().approvalQueueMetricsRefreshSuccessGauge.set(success ? 1 : 0);
+}
+
+/**
+ * Publish the accepted-interaction outcome buckets (PEN-4409).
+ *
+ * The COUNT gauge is SEEDED with 0 for all three buckets before the entries are
+ * applied, so a bucket that is genuinely empty reads back an explicit 0 rather
+ * than vanishing. That matters most for `untracked`: an absent series and a
+ * never-exported series are indistinguishable, and "no untracked acceptances"
+ * is a claim this family has to be able to make out loud.
+ *
+ * The OLDEST-AGE gauge is deliberately NOT seeded, for the reason spelled out in
+ * {@link setApprovalQueuePendingMetrics}: a bucket with nothing in it has no
+ * oldest card, and 0 would read as an acceptance made this instant. Its absence
+ * is unambiguous because the seeded count gauge reads 0 beside it.
+ */
+export function setAcceptedInteractionOutcomeMetrics(input: {
+  entries: ReadonlyArray<{ bucket: string; count: number; oldestAgeSeconds: number | null }>;
+}): void {
+  const metrics = ensureRegistry();
+  metrics.acceptedInteractionOutcomeGauge.reset();
+  metrics.acceptedInteractionOutcomeOldestAgeGauge.reset();
+  for (const bucket of ACCEPTED_INTERACTION_OUTCOME_BUCKETS) {
+    metrics.acceptedInteractionOutcomeGauge.set({ bucket }, 0);
+  }
+  for (const entry of input.entries) {
+    const bucket = entry.bucket || "unknown";
+    const count = Number.isFinite(entry.count) ? Math.max(0, entry.count) : 0;
+    metrics.acceptedInteractionOutcomeGauge.set({ bucket }, count);
+    if (entry.oldestAgeSeconds !== null && Number.isFinite(entry.oldestAgeSeconds)) {
+      metrics.acceptedInteractionOutcomeOldestAgeGauge.set(
+        { bucket },
+        Math.max(0, entry.oldestAgeSeconds),
+      );
+    }
+  }
+}
+
+/** Mark whether the accepted-interaction outcome sweep completed. */
+export function setAcceptedInteractionOutcomeMetricsRefreshSuccess(success: boolean): void {
+  ensureRegistry().acceptedInteractionOutcomeMetricsRefreshSuccessGauge.set(success ? 1 : 0);
 }
 
 export function computePrReviewQueueWaitSeconds(

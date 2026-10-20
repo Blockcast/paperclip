@@ -31,6 +31,7 @@ import { refreshExternalRuntimeReservationMetrics } from "./external-runtime-res
 import { refreshExternalRuntimeReservationStrandMetrics } from "./external-runtime-reservation-strand-metrics.js";
 import { refreshWorkspaceReuseRefusalMetrics } from "./workspace-reuse-refusal-metrics.js";
 import { refreshApprovalQueueMetrics } from "./approval-queue-metrics.js";
+import { refreshAcceptedInteractionOutcomeMetrics } from "./accepted-interaction-outcome-sweep.js";
 import {
   refreshDeferredIssueExecutionWakeAgeMetrics,
   refreshOverdueScheduledRetryAgeMetrics,
@@ -40,6 +41,7 @@ import {
 import { refreshRoutineFireGapMetrics } from "./routine-fire-gap-metrics.js";
 import {
   setAgentStartLockHeldMetrics,
+  setAcceptedInteractionOutcomeMetricsRefreshSuccess,
   setApprovalQueueMetricsRefreshSuccess,
   setDbPoolStats,
   setDeferredIssueExecutionWakeAgeMetricsRefreshSuccess,
@@ -149,6 +151,17 @@ const REFRESHES: readonly ScrapeRefresh[] = [
     name: "approval-queue",
     run: (db) => refreshApprovalQueueMetrics(db),
     setFresh: setApprovalQueueMetricsRefreshSuccess,
+  },
+  {
+    // PEN-4409. Every refresh above measures whether the platform is serving
+    // work. This one measures whether a DECISION the platform recorded was ever
+    // acted on -- a question no run, queue or lease gauge can reach, because the
+    // acceptance is already terminal and the action belongs to someone else.
+    // Report-only by construction: `refreshAcceptedInteractionOutcomeMetrics`
+    // issues no writes and must never gain the ability to resolve a card.
+    name: "accepted-interaction-outcome",
+    run: (db) => refreshAcceptedInteractionOutcomeMetrics(db),
+    setFresh: setAcceptedInteractionOutcomeMetricsRefreshSuccess,
   },
 ];
 

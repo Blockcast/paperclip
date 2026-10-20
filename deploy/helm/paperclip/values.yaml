@@ -940,6 +940,18 @@ prometheusRule:
   externalRuntimeReservationStrandMetricsRefreshFailureFor: 5m
   # -- Runbook for the stranded-reservation and metric-freshness alerts, linked from their annotations.
   externalRuntimeReservationStrandedRunbookUrl: "https://github.com/Blockcast/paperclip/blob/master/runbooks/external-runtime-reservation-stranded.md"
+  # -- Seconds an accepted interaction's authorised action may go UNOBSERVED before paging (PEN-4409). 86400 (24h) against the measured instance: interaction `f2a8595c` was accepted 2026-10-19T07:01:42Z authorising a PR merge, and at 26h45m the PR was still open with no gate blocking it while 28 unrelated PRs merged past it. A day is deliberately generous -- an acceptance is a decision a PERSON must then act on, and normal acting latency is hours, so a threshold in minutes would page on every acceptance made before a weekend. This is a seconds threshold rather than a `for:` duration because `for:` requires the condition to hold continuously, which would add the tolerance window ON TOP of the age and double the real alerting delay. Raise this rather than silencing the alert if a team's acting latency is genuinely longer.
+  acceptedInteractionUnobservedAgeSeconds: 86400
+  # -- Scrape-flap tolerance for the unobserved alert (PEN-4409). The detection lives entirely in acceptedInteractionUnobservedAgeSeconds; this only suppresses a single bad scrape. The age gauge is monotonic while a card sits unactioned, so this never delays the alert by more than one tick in practice.
+  acceptedInteractionUnobservedFor: 15m
+  # -- Seconds acceptances may sit with NO declared outcome before reporting (PEN-4409). 259200 (72h), deliberately far longer than the unobserved threshold and at `info` severity: an untracked card is not itself a failure, it is an acceptance nothing CAN check, so this measures adoption of `payload.expectedOutcome` rather than a live incident. It exists as an alert rather than only a dashboard panel for one reason -- an untracked population that is never surfaced anywhere is exactly how a sweep comes to read clean while excluding the very cards it was built to catch.
+  acceptedInteractionUntrackedAgeSeconds: 259200
+  # -- Scrape-flap tolerance for the untracked-adoption signal (PEN-4409).
+  acceptedInteractionUntrackedFor: 1h
+  # -- Alert only after sustained failed sweeps; a one-off failure is logged and retried on the next scrape.
+  acceptedInteractionOutcomeMetricsRefreshFailureFor: 15m
+  # -- Runbook for the accepted-interaction outcome alerts.
+  acceptedInteractionOutcomeRunbookUrl: "https://github.com/Blockcast/paperclip/blob/master/runbooks/accepted-interaction-outcome.md"
   # -- How many managed-checkout refusals against ONE project workspace, inside WORKSPACE_REUSE_REFUSAL_WINDOW_MS (2h, in server/src/services/workspace-reuse-refusal-metrics.ts), constitute an episode (PEN-3633). Set to 3 against the measured rate of the 2026-10-05 episode: 33 refusals over 8.6h is ~3.8/h, so that episode presents ~7.7 in a 2h window and clears 3 with margin, while the common benign case -- one agent, one bad cwd, self-healing -- presents 1 and never fires. Raise this, not the window, if a project legitimately churns checkouts; widening the window instead slows the alert's recovery without making it quieter.
   workspaceReuseRefusalCount: 3
   # -- Scrape-flap tolerance only (PEN-3633). The episode detection lives in workspaceReuseRefusalCount above and in the sweep's own 2h window; this stacks on top.
