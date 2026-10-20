@@ -61,6 +61,14 @@ const ALLOWED_UNRESOLVED_REFERENCES = new Map<string, string>([]);
  * `\b` keeps a longer identifier that merely ENDS in a metric name (say
  * `legacy_paperclip_foo`) from matching, since `_p` is not a word boundary.
  *
+ * Only sound against UNESCAPED text -- see {@link unescapeHelp}. The exposition
+ * renders a real newline as the two characters `\` + `n`, and `n` is a word
+ * character, so a token immediately after one has no word boundary before it
+ * and is silently missed. A false NEGATIVE in a guard is the dangerous
+ * direction: it reports clean. (A lookbehind such as `(?<![A-Za-z0-9_])` does
+ * NOT fix this -- it excludes exactly the same character class, so it misses
+ * the same token. Measured against prom-client 15.1.3.)
+ *
  * Shared at module scope only because every use below goes through
  * `String.prototype.match`, which resets `lastIndex` for a `/g` regex. Switch a
  * caller to `.exec()` or `.test()` and this becomes stateful across calls.
@@ -71,6 +79,22 @@ interface DanglingReference {
   /** The metric whose HELP line carries the unresolved token. */
   readonly owner: string;
   readonly token: string;
+}
+
+/**
+ * Recover HELP text as it was written, before the exposition escaped it.
+ *
+ * Prometheus HELP escaping is `\` -> `\\` and newline -> `\` + `n`, so a
+ * multi-line help string arrives on ONE line with literal backslash-n in it.
+ * Matching without undoing that misses any metric named right after a newline.
+ * No help string in `metrics.ts` is multi-line today, so this is hardening
+ * against a latent false negative rather than a live one.
+ *
+ * One left-to-right pass, so a literal backslash followed by `n` (escaped
+ * `\\n`) is NOT mistaken for a newline.
+ */
+function unescapeHelp(text: string): string {
+  return text.replace(/\\([\\n])/g, (_, char: string) => (char === "n" ? "\n" : "\\"));
 }
 
 /**
@@ -130,7 +154,7 @@ function danglingHelpReferences(body: string): DanglingReference[] {
     const match = /^# HELP (\S+) (.*)$/.exec(line);
     if (!match) continue;
     const [, owner, text] = match;
-    for (const token of text.match(METRIC_TOKEN) ?? []) {
+    for (const token of unescapeHelp(text).match(METRIC_TOKEN) ?? []) {
       if (resolves(token, types)) continue;
       if (ALLOWED_UNRESOLVED_REFERENCES.has(token)) continue;
       dangling.push({ owner, token });
@@ -145,7 +169,7 @@ function helpReferenceTokens(body: string): Set<string> {
   for (const line of body.split("\n")) {
     const match = /^# HELP (\S+) (.*)$/.exec(line);
     if (!match) continue;
-    for (const token of match[2].match(METRIC_TOKEN) ?? []) tokens.add(token);
+    for (const token of unescapeHelp(match[2]).match(METRIC_TOKEN) ?? []) tokens.add(token);
   }
   return tokens;
 }
@@ -220,6 +244,37 @@ describe("Prometheus HELP cross-references", () => {
         token: "paperclip_process_glibc_secondary_arena_count",
       },
     ]);
+  });
+
+  it("sees a metric named right after a newline in multi-line help", () => {
+    // Found by review on this PR. The exposition renders a real newline as the
+    // two characters `\` + `n`, so a token straight after one is preceded by a
+    // word character and `\b` never matches it -- the guard would report clean
+    // on a genuinely dangling reference, which is the one direction a guard
+    // must not fail in.
+    //
+    // The escaping is asserted here rather than assumed: this is what
+    // prom-client 15.1.3 actually emits, and the assertion below fails if a
+    // future version stops escaping or escapes differently, which would make
+    // `unescapeHelp` silently wrong rather than silently unnecessary.
+    const escaped = "first line\\npaperclip_after_newline ends it.";
+    expect(escaped).toContain("\\n");
+    expect(escaped).not.toContain("\n");
+
+    const multiline = [
+      `# HELP paperclip_pointer_metric ${escaped}`,
+      "# TYPE paperclip_pointer_metric gauge",
+      "",
+    ].join("\n");
+
+    expect(danglingHelpReferences(multiline)).toEqual([
+      { owner: "paperclip_pointer_metric", token: "paperclip_after_newline" },
+    ]);
+
+    // A literal backslash-then-n (escaped `\\n`) is not a newline, and the
+    // single left-to-right pass must not turn it into one.
+    expect(unescapeHelp("a \\\\n b")).toBe("a \\n b");
+    expect(unescapeHelp("a \\n b")).toBe("a \n b");
   });
 
   it("reads metric names, not label values or env vars", () => {
