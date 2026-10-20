@@ -2,7 +2,7 @@ import express, { Router, type Request as ExpressRequest } from "express";
 import path from "node:path";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
-import { issues, plugins, type Db } from "@paperclipai/db";
+import { issues, plugins, POSTGRES_POOL_MAX, POSTGRES_WEBHOOK_POOL_MAX, type Db } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
 import type { DeploymentExposure, DeploymentMode } from "@paperclipai/shared";
 import type { InspectDatabaseBackupHealthOptions } from "./services/database-backup-health.js";
@@ -300,6 +300,8 @@ export async function createApp(
     hostVersion?: string;
     localPluginDir?: string;
     pluginMigrationDb?: Db;
+    /** BLO-47034: the API tier's dedicated webhook pool. Omitted means the router shares `db`. */
+    githubWebhookDb?: Db;
     pluginWorkerManager?: PluginWorkerManager;
     /**
      * BLO-46694. Gate for the plugin job scheduler and event outbox: true only
@@ -345,7 +347,8 @@ export async function createApp(
   app.get("/metrics", async (_req, res, next) => {
     try {
       expireStaleRefreshFreshness();
-      refreshDbPoolMetrics(db);
+      refreshDbPoolMetrics(db, "main");
+      if (opts.githubWebhookDb) refreshDbPoolMetrics(opts.githubWebhookDb, "webhook");
       refreshAgentStartLockMetrics();
       refreshFdClassMetrics();
       refreshNativeMemoryMetrics();
@@ -742,7 +745,9 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
   // isn't configured.
   app.use(
     "/api/webhooks/github",
-    githubWebhookRoutes(db, {
+    githubWebhookRoutes(opts.githubWebhookDb ?? db, {
+      poolMax: opts.githubWebhookDb ? POSTGRES_WEBHOOK_POOL_MAX : POSTGRES_POOL_MAX,
+      dedicatedPool: Boolean(opts.githubWebhookDb),
       webhookSecret: appConfig.githubWebhookSecret || null,
       pluginWorkerManager: workerManager,
       // Webhooks land on the API tier in split deployments. Forward the node

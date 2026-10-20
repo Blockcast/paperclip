@@ -200,6 +200,14 @@ export interface GithubWebhookConfig {
   /** Test seam for the delivery bulkhead (BLO-47034); production derives it from the pool. */
   maxConcurrentDeliveries?: number;
   /**
+   * Size of the pool behind `db` (BLO-47034). The webhook bounds derive from
+   * it, so a dedicated, smaller pool shrinks them with it. Defaults to
+   * POSTGRES_POOL_MAX, i.e. `db` is the shared process pool.
+   */
+  poolMax?: number;
+  /** True when `db` is the API tier's dedicated webhook pool, shared with nothing else. */
+  dedicatedPool?: boolean;
+  /**
    * Optional seam for the head-attestation idempotency check (BLO-32198).
    * Production lists reviews through the GitHub App; route tests supply a
    * deterministic list so the suppression path is verified without network.
@@ -3442,12 +3450,14 @@ export function derivePrReviewerWakeMaxConcurrency(poolMax: number): number {
   return Math.max(1, Math.floor(poolMax / 2) - 1);
 }
 
-const PR_REVIEWER_WAKE_MAX_CONCURRENCY = derivePrReviewerWakeMaxConcurrency(POSTGRES_POOL_MAX);
+// Re-derived by githubWebhookRoutes from the pool it is given (BLO-47034): one
+// router per process, and a dedicated webhook pool is smaller than the default.
+let prReviewerWakeMaxConcurrency = derivePrReviewerWakeMaxConcurrency(POSTGRES_POOL_MAX);
 let prReviewerWakeInFlight = 0;
 const prReviewerWakeWaiters: Array<() => void> = [];
 
 async function acquirePrReviewerWakeSlot(): Promise<void> {
-  if (prReviewerWakeInFlight < PR_REVIEWER_WAKE_MAX_CONCURRENCY) {
+  if (prReviewerWakeInFlight < prReviewerWakeMaxConcurrency) {
     prReviewerWakeInFlight += 1;
     return;
   }
@@ -5402,8 +5412,11 @@ async function wakeStackedChildIssues(input: {
  * `enrichAuthoredLocForRow`) run outside the bulkhead; they sit on
  * pull_request/merge paths, not the CI burst this was measured on.
  */
-export function deriveGithubWebhookMaxConcurrentDeliveries(poolMax: number): number {
-  return Math.max(1, Math.floor(poolMax / 3));
+export function deriveGithubWebhookMaxConcurrentDeliveries(poolMax: number, dedicatedPool = false): number {
+  // A dedicated pool has no interactive traffic to protect, so the only
+  // constraint left is the reviewer-wake nest: every delivery may hold 2
+  // connections and still fit (BLO-47034).
+  return Math.max(1, Math.floor(poolMax / (dedicatedPool ? 2 : 3)));
 }
 
 // ponytail: bounds memory, not latency — past this, a delivery is refused 503
@@ -5414,8 +5427,11 @@ const GITHUB_WEBHOOK_MAX_QUEUED_DELIVERIES = 2000;
 
 export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
   const router = Router();
+  const poolMax = config.poolMax ?? POSTGRES_POOL_MAX;
+  prReviewerWakeMaxConcurrency = derivePrReviewerWakeMaxConcurrency(poolMax);
   const maxConcurrentDeliveries =
-    config.maxConcurrentDeliveries ?? deriveGithubWebhookMaxConcurrentDeliveries(POSTGRES_POOL_MAX);
+    config.maxConcurrentDeliveries
+    ?? deriveGithubWebhookMaxConcurrentDeliveries(poolMax, config.dedicatedPool);
   let deliveriesInFlight = 0;
   const deliveryWaiters: Array<() => void> = [];
   const releaseDeliverySlot = () => {

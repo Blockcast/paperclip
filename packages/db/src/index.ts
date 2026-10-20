@@ -2,6 +2,7 @@ export {
   createDb,
   createDbFromPostgresClient,
   POSTGRES_POOL_MAX,
+  POSTGRES_WEBHOOK_POOL_MAX,
   POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS,
   POSTGRES_ROLE_IDLE_IN_TRANSACTION_TIMEOUT_MS,
   readInheritedTimeoutSettings,

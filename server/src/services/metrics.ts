@@ -3871,8 +3871,8 @@ let overdueScheduledRetryOldestAge: Gauge<"agent_id"> | null = null;
 let overdueScheduledRetryAgeMetricsRefreshSuccess: Gauge | null = null;
 let scheduledRetryParkHorizon: Gauge<"agent_id"> | null = null;
 let scheduledRetryParkHorizonRefreshSuccess: Gauge | null = null;
-let dbPoolConnections: Gauge<"state"> | null = null;
-let dbPoolWaitingQueries: Gauge | null = null;
+let dbPoolConnections: Gauge<"pool" | "state"> | null = null;
+let dbPoolWaitingQueries: Gauge<"pool"> | null = null;
 let dbInheritedTimeout: Gauge<"setting" | "source"> | null = null;
 let processOpenFdsByClass: Gauge<"fd_class"> | null = null;
 let processMemoryComponentBytes: Gauge<"component"> | null = null;
@@ -4037,8 +4037,8 @@ function ensureRegistry(): {
   overdueScheduledRetryAgeMetricsRefreshSuccessGauge: Gauge;
   scheduledRetryParkHorizonGauge: Gauge<"agent_id" | "reason">;
   scheduledRetryParkHorizonRefreshSuccessGauge: Gauge;
-  dbPoolConnectionsGauge: Gauge<"state">;
-  dbPoolWaitingQueriesGauge: Gauge;
+  dbPoolConnectionsGauge: Gauge<"pool" | "state">;
+  dbPoolWaitingQueriesGauge: Gauge<"pool">;
   dbInheritedTimeoutGauge: Gauge<"setting" | "source">;
   processOpenFdsByClassGauge: Gauge<"fd_class">;
   processMemoryComponentBytesGauge: Gauge<"component">;
@@ -4502,8 +4502,9 @@ function ensureRegistry(): {
         + "idle (connected, no query), active (serving or reserved), connecting (handshaking). "
         + "Per-pod, because the pool is per-process -- which is what made the /metrics scrape "
         + "timeouts independent across pods and across nodes. Saturation is idle=0 with "
-        + "active=max and " + DB_POOL_WAITING_QUERIES_METRIC + " above 0.",
-      labelNames: ["state"],
+        + "active=max and " + DB_POOL_WAITING_QUERIES_METRIC + " above 0. pool=main is the "
+        + "process pool; pool=webhook is the API tier's dedicated GitHub webhook pool (BLO-47034).",
+      labelNames: ["pool", "state"],
       registers: [registry],
     });
     dbPoolWaitingQueries = new Gauge({
@@ -4511,7 +4512,8 @@ function ensureRegistry(): {
       help:
         "Statements queued with no pool connection yet (BLO-33243). postgres.js only enqueues "
         + "here once every connection is busy, so a sustained non-zero value IS pool exhaustion "
-        + "and a zero value rules it out.",
+        + "and a zero value rules it out. Labelled by pool like " + DB_POOL_CONNECTIONS_METRIC + ".",
+      labelNames: ["pool"],
       registers: [registry],
     });
     dbInheritedTimeout = new Gauge({
@@ -6922,13 +6924,13 @@ export interface DbPoolStats {
  * connection is exactly when the pool is interesting and exactly when it would
  * fail to report.
  */
-export function setDbPoolStats(stats: DbPoolStats): void {
+export function setDbPoolStats(stats: DbPoolStats, pool: "main" | "webhook" = "main"): void {
   const { dbPoolConnectionsGauge, dbPoolWaitingQueriesGauge } = ensureRegistry();
-  dbPoolConnectionsGauge.set({ state: "max" }, stats.max);
-  dbPoolConnectionsGauge.set({ state: "idle" }, stats.idle);
-  dbPoolConnectionsGauge.set({ state: "active" }, stats.active);
-  dbPoolConnectionsGauge.set({ state: "connecting" }, stats.connecting);
-  dbPoolWaitingQueriesGauge.set(stats.waiting);
+  dbPoolConnectionsGauge.set({ pool, state: "max" }, stats.max);
+  dbPoolConnectionsGauge.set({ pool, state: "idle" }, stats.idle);
+  dbPoolConnectionsGauge.set({ pool, state: "active" }, stats.active);
+  dbPoolConnectionsGauge.set({ pool, state: "connecting" }, stats.connecting);
+  dbPoolWaitingQueriesGauge.set({ pool }, stats.waiting);
 }
 
 /**

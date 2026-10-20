@@ -199,10 +199,10 @@ type PoolStatsClient = { poolStats?: () => DbPoolStats };
  * the `/metrics` request path -- which is the point, since a saturated pool is
  * only observable while it is saturated.
  */
-export function refreshDbPoolMetrics(db: Db): void {
+export function refreshDbPoolMetrics(db: Db, pool: "main" | "webhook" = "main"): void {
   const client = (db as { $client?: PoolStatsClient }).$client;
   const stats = client?.poolStats?.();
-  if (stats) setDbPoolStats(stats);
+  if (stats) setDbPoolStats(stats, pool);
 }
 
 /**

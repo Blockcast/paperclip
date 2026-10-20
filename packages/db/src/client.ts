@@ -275,10 +275,11 @@ export type ApplyPendingMigrationsOptions = {
  * case would cost the margin that protects against the outage, so the
  * remaining contention is left as latency on purpose.
  *
- * There is no second application pool in production: `server/src/index.ts`
- * creates one only in the `config.databaseMigrationUrl` branch, and that
- * resolves solely from `DATABASE_MIGRATION_URL`, which is unset on both
- * workloads.
+ * No second pool is ADDED in production: the migration pool is created only in
+ * the `config.databaseMigrationUrl` branch, which resolves solely from
+ * `DATABASE_MIGRATION_URL`, unset on both workloads. The API tier does split
+ * this budget in two -- see {@link POSTGRES_WEBHOOK_POOL_MAX} -- but the halves
+ * sum to this number, so the per-process total is unchanged.
  *
  * {@link POSTGRES_POOL_MAX} has exactly one derived consumer,
  * `derivePrReviewerWakeMaxConcurrency` (`routes/github-webhook.ts`), which
@@ -310,6 +311,23 @@ export type ApplyPendingMigrationsOptions = {
  * deliberately; the reason is recorded at its call site.
  */
 export const POSTGRES_POOL_MAX = 18;
+
+/**
+ * The GitHub webhook router's own pool on the API tier (BLO-47034), carved OUT
+ * of {@link POSTGRES_POOL_MAX} rather than added to it: on `PAPERCLIP_NODE_ROLE=api`
+ * the main pool is `POSTGRES_POOL_MAX - POSTGRES_WEBHOOK_POOL_MAX` and the
+ * webhook router gets this. The per-process total is unchanged, so
+ * `doc/DATABASE-CONNECTION-BUDGET.md`'s arithmetic still holds.
+ *
+ * Why a separate pool and not a tighter bulkhead: the in-handler bulkhead
+ * (#2780) bounds deliveries, but after it shipped the api pool still flashed to
+ * 18/18 active with 150-175 waiting for single scrapes during webhook bursts,
+ * and nothing could say which caller held the connections. A pool boundary
+ * holds regardless of who the caller is -- detached tails started by a
+ * delivery capture this pool too -- and its `pool` label on the pool gauges
+ * answers the attribution question the shared pool could not.
+ */
+export const POSTGRES_WEBHOOK_POOL_MAX = 6;
 
 /**
  * The `idle_in_transaction_session_timeout` this deployment's Postgres role
@@ -463,9 +481,9 @@ type PatchedPostgresOptions = Omit<
   max_lifetime?: number | (() => number) | null;
 };
 
-export function createDb(url: string) {
+export function createDb(url: string, max: number = POSTGRES_POOL_MAX) {
   const sql = postgres(url, ({
-    max: POSTGRES_POOL_MAX,
+    max,
     max_lifetime: postgresMaxLifetimeSeconds,
     close_timeout: POSTGRES_CLOSE_TIMEOUT_SECONDS,
     // Sent in the startup packet, so it applies to every connection this pool
