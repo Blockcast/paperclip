@@ -173,8 +173,10 @@ All four must be true. Measure them; do not assume.
    and agent Job pods reach `Completed` and are then TTL-reaped. Select one
    with `--field-selector=status.phase=Running`. If no pod on that reference is
    still running, you cannot answer the question this way, and that is **not**
-   a pass: the reference is no longer live, so re-run the census and confirm it
-   has dropped out — never record an unexec'able reference as cleared.
+   a pass — never record an unexec'able reference as cleared. Note the census
+   reads Jobs, not pods, so a finished Job keeps its reference listed until its
+   TTL reaps it: seeing it still listed is expected and is not a dead end. Wait
+   for the TTL, or for a Running pod on that reference, then re-check.
 
    Measured 2026-10-20 on `sha-d529842-k8s-vendored`, the single reference the
    fleet was then running: five files, `root root 755`, `test -w` false for
