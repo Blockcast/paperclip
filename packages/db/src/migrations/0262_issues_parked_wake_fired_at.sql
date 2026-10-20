@@ -1,0 +1,49 @@
+-- PEN-4420: give the deliberate park a RELEASE edge.
+--
+-- 0222 made `parked_until` a suppression predicate, and two later changes made that
+-- predicate load-bearing on the wake path: PEN-4114 (a live park suppresses
+-- `github_check_*` wakes) and BLO-33572 (a live park is explicitly not a review path).
+-- Nothing ever read it to RELEASE. `parked_until` passing produced no event on any
+-- status, so a parked row with no monitor sat inert -- measured 2026-10-20 at 6
+-- `in_review` rows plus 5 `todo` rows already 0.2-8.1 days past their deadline, all
+-- assigned to live agents.
+--
+-- `parked_wake_fired_at` is the fire-once marker for the sweep that closes that gap.
+-- Without it every sweep pass would re-wake the same expired park, which is exactly the
+-- unbounded-wake billing defect PEN-4114 fixed from the other direction.
+--
+-- NULL means "this park has not yet fired its release wake" -- which is the correct
+-- reading for every pre-existing row, parked or not, so there is no backfill. The
+-- already-lapsed population is therefore picked up by the first sweep after deploy and
+-- woken exactly once, which is the intended migration behaviour rather than a side
+-- effect.
+--
+-- The park writer (`services/issues.ts`) resets this to NULL on every
+-- `parkedDisposition` write, so re-parking a row re-arms the release edge. The sweep
+-- additionally treats `parked_wake_fired_at < parked_at` as unfired, so a future writer
+-- that forgets the reset still cannot permanently silence a re-park.
+ALTER TABLE "issues" ADD COLUMN "parked_wake_fired_at" timestamp with time zone;
+--
+-- ⛔ NO INDEX, deliberately. The sweep's candidate query filters on
+-- `parked_until IS NOT NULL AND parked_wake_fired_at IS NULL`, which a partial index
+-- would serve well -- but building ANY index on `issues` takes an ACCESS EXCLUSIVE lock
+-- for a full heap scan, because drizzle migrations run inside a transaction and
+-- `CREATE INDEX CONCURRENTLY` cannot. The repo's answer to that is the concurrent-index
+-- guard (`concurrent-index-guard.ts`, worked example 0243), which RAISEs unless an
+-- operator precreated the index CONCURRENTLY first.
+--
+-- That guard is the right tool for a hot table and the wrong trade here, on three counts:
+--
+--  1. The index is an optimisation, never a correctness requirement. The sweep's SQL is a
+--     deliberately sound over-approximation and `issueParkOwesReleaseWake` is the decision,
+--     so an unindexed scan returns the same rows, more slowly.
+--  2. `tickDueIssueMonitors` already runs the same per-tick shape over `issues` on
+--     `monitor_next_check_at` with no index at all, on this same timer. An unindexed park
+--     sweep costs what the sweep beside it already costs.
+--  3. The guard adds an operator step that must land BEFORE migrations. An unapplied
+--     operator half is precisely the failure PEN-4404 measured (13h of wedged delivery from
+--     one `kubectl apply` that never followed its merge) -- a poor thing to make a
+--     reliability fix depend on.
+--
+-- If this scan ever shows up in `pg_stat_statements`, add the index through the guard as a
+-- separate migration with its own precreation step. Do not add a bare `CREATE INDEX` here.

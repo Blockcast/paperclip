@@ -85,6 +85,13 @@ export const issues = pgTable(
     parkedReason: text("parked_reason"),
     parkedByAgentId: uuid("parked_by_agent_id").references((): AnyPgColumn => agents.id),
     parkedAt: timestamp("parked_at", { withTimezone: true }),
+    // PEN-4420: the fire-once marker for the park's RELEASE edge. NULL means this park
+    // has not yet fired its expiry wake; the sweep stamps it when it does, and the park
+    // writer resets it to NULL on every `parkedDisposition` write so a re-park re-arms.
+    // Deliberately NOT one of the four all-or-nothing park columns above: those describe
+    // the park, this records what the platform has already done about it, and it must
+    // survive being read on a row whose park has lapsed.
+    parkedWakeFiredAt: timestamp("parked_wake_fired_at", { withTimezone: true }),
     executionWorkspaceId: uuid("execution_workspace_id")
       .references((): AnyPgColumn => executionWorkspaces.id, { onDelete: "set null" }),
     executionWorkspacePreference: text("execution_workspace_preference"),

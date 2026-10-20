@@ -1779,6 +1779,13 @@
       "when": 1792002801477,
       "tag": "0261_cost_events_company_issue_index",
       "breakpoints": true
+    },
+    {
+      "idx": 262,
+      "version": "7",
+      "when": 1792002901477,
+      "tag": "0262_issues_parked_wake_fired_at",
+      "breakpoints": true
     }
   ]
 }

@@ -361,6 +361,12 @@ import { toolAccessService } from "./tool-access.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { ISSUE_BLOCKERS_RESOLVED_WAKE_REASON } from "./issue-dependency-wakeups.js";
 import {
+  ISSUE_PARK_EXPIRED_WAKE_REASON,
+  ISSUE_PARK_EXPIRY_WAKE_STATUSES,
+  buildIssueParkExpiredWakeIdempotencyKey,
+  issueParkOwesReleaseWake,
+} from "./issue-park-expiry.js";
+import {
   DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
   buildIssueMonitorDispatchRearmPatch,
   buildIssueMonitorClearedPatch,
@@ -17228,6 +17234,185 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return {
       checked,
       recovered,
+    };
+  }
+
+  /**
+   * PEN-4420: fire the deliberate park's RELEASE edge — exactly one wake per park, on any
+   * status a park can be set on.
+   *
+   * See `services/issue-park-expiry.ts` for why this is not a monitor, why it is not a
+   * review path, and why it does not weaken PEN-4114's live-park suppression. The short
+   * version: `parked_until` was read in two places to SUPPRESS and nowhere to RELEASE, so
+   * a park deadline passing produced no event at all — measured 2026-10-20 at 6 `in_review`
+   * rows with no monitor plus 5 `todo` rows already 0.2–8.1 days past their deadline, every
+   * one assigned to a live agent.
+   *
+   * Sits beside the two monitor ticks and runs on the same timer because it answers the
+   * same shape of question (what became due while nobody was looking?) — but it shares no
+   * machinery with them, deliberately. A monitor is a poll with a convergence guard; this
+   * is a one-shot deadline that cannot converge and has nothing for that guard to measure.
+   *
+   * ## Fire-once
+   *
+   * `parked_wake_fired_at` is the marker, and the CONDITIONAL UPDATE below is what makes it
+   * a claim rather than a note: whichever concurrent loop wins that update owns the wake,
+   * and every other loop reads zero rows back and skips. Without that, an N-pass sweep over
+   * one expired park delivers N wakes, which is the unbounded-wake billing defect PEN-4114
+   * fixed from the other direction ($47.55 / 13h on PEN-4037). The marker is written BEFORE
+   * the enqueue for the same reason: a crash between the two must leave the park quiet, not
+   * re-firing on the next tick.
+   *
+   * A thrown enqueue is the one case that rolls the marker back, because nothing was
+   * recorded anywhere and leaving it set would convert a transient failure into the
+   * permanent silence this row exists to remove. A `null` return does NOT roll back — that
+   * is `enqueueWakeup` deciding to suppress (budget, invokability, a dependency-blocked
+   * park), which it records in `agent_wakeup_requests` itself. The edge fired; the platform
+   * declined it. Re-firing on the next tick would be polling a decision.
+   */
+  async function tickExpiredIssueParks(now = new Date()) {
+    const nowMs = now.getTime();
+    const candidates = await db
+      .select({
+        id: issues.id,
+        companyId: issues.companyId,
+        identifier: issues.identifier,
+        status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+        assigneeUserId: issues.assigneeUserId,
+        parkedUntil: issues.parkedUntil,
+        parkedReason: issues.parkedReason,
+        parkedAt: issues.parkedAt,
+        parkedWakeFiredAt: issues.parkedWakeFiredAt,
+      })
+      .from(issues)
+      .innerJoin(companies, eq(companies.id, issues.companyId))
+      .where(
+        and(
+          eq(companies.status, "active"),
+          sql`${issues.parkedUntil} is not null`,
+          lte(issues.parkedUntil, now),
+          isNull(issues.assigneeUserId),
+          sql`${issues.assigneeAgentId} is not null`,
+          inArray(issues.status, [...ISSUE_PARK_EXPIRY_WAKE_STATUSES]),
+          // Mirrors `issueParkOwesReleaseWake`'s fire-once conjunct so an already-fired
+          // park is not re-read on every tick. The TS predicate re-checks every row below
+          // and is the decision; this clause only has to be a sound over-approximation of
+          // it. (Migration 0262 deliberately adds no index -- see its header for why.)
+          or(
+            isNull(issues.parkedWakeFiredAt),
+            lt(issues.parkedWakeFiredAt, issues.parkedAt),
+          ),
+        ),
+      )
+      .orderBy(asc(issues.parkedUntil), asc(issues.id))
+      .limit(50);
+
+    let woken = 0;
+    let skipped = 0;
+    let failed = 0;
+
+    for (const candidate of candidates) {
+      // The authoritative test. The SQL above is a sound over-approximation of it; this
+      // is what actually decides, so the two cannot drift into disagreement.
+      if (!issueParkOwesReleaseWake(candidate, nowMs)) {
+        skipped += 1;
+        continue;
+      }
+      if (!candidate.assigneeAgentId) {
+        skipped += 1;
+        continue;
+      }
+
+      const claimed = await db
+        .update(issues)
+        .set({ parkedWakeFiredAt: now, updatedAt: now })
+        .where(
+          and(
+            eq(issues.id, candidate.id),
+            sql`${issues.parkedUntil} is not null`,
+            lte(issues.parkedUntil, now),
+            or(
+              isNull(issues.parkedWakeFiredAt),
+              lt(issues.parkedWakeFiredAt, issues.parkedAt),
+            ),
+          ),
+        )
+        .returning({ id: issues.id })
+        .then((rows) => rows[0] ?? null);
+      // Another loop claimed this park first. Its wake is the one wake this park gets.
+      if (!claimed) {
+        skipped += 1;
+        continue;
+      }
+
+      const idempotencyKey = buildIssueParkExpiredWakeIdempotencyKey({
+        issueId: candidate.id,
+        parkedAt: candidate.parkedAt,
+      });
+
+      try {
+        const run = await enqueueWakeup(candidate.assigneeAgentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: ISSUE_PARK_EXPIRED_WAKE_REASON,
+          requestedByActorType: "system",
+          requestedByActorId: "heartbeat_scheduler",
+          payload: {
+            issueId: candidate.id,
+            parkedUntil: candidate.parkedUntil?.toISOString() ?? null,
+            parkedReason: candidate.parkedReason,
+          },
+          contextSnapshot: {
+            issueId: candidate.id,
+            taskId: candidate.id,
+            wakeReason: ISSUE_PARK_EXPIRED_WAKE_REASON,
+            source: "issue.park_expired",
+            parkedUntil: candidate.parkedUntil?.toISOString() ?? null,
+            parkedReason: candidate.parkedReason,
+          },
+          idempotencyKey,
+        });
+        if (run) woken += 1;
+        else skipped += 1;
+        logger.info(
+          {
+            issueId: candidate.id,
+            identifier: candidate.identifier,
+            assigneeAgentId: candidate.assigneeAgentId,
+            status: candidate.status,
+            parkedUntil: candidate.parkedUntil?.toISOString() ?? null,
+            outcome: run ? "sent" : "skipped",
+          },
+          "issue park expiry wake outcome",
+        );
+      } catch (err) {
+        failed += 1;
+        // Nothing was recorded, so un-claim rather than leave the park permanently quiet.
+        // Guarded on the marker still being the one we wrote: if a re-park landed in the
+        // meantime it has already re-armed the edge and must not be clobbered back.
+        await db
+          .update(issues)
+          .set({ parkedWakeFiredAt: null })
+          .where(and(eq(issues.id, candidate.id), eq(issues.parkedWakeFiredAt, now)))
+          .catch((rollbackErr: unknown) => {
+            logger.error(
+              { err: rollbackErr, issueId: candidate.id },
+              "failed to release issue park expiry wake claim after enqueue failure",
+            );
+          });
+        logger.warn(
+          { err, issueId: candidate.id, identifier: candidate.identifier },
+          "issue park expiry wake failed",
+        );
+      }
+    }
+
+    return {
+      checked: candidates.length,
+      woken,
+      skipped,
+      failed,
     };
   }
 
@@ -43524,6 +43709,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : null;
     },
     __test_tickDueIssueMonitors: (now?: Date) => tickDueIssueMonitors(now),
+    __test_tickExpiredIssueParks: (now?: Date) => tickExpiredIssueParks(now),
     __test_tickExpiredIssueMonitors: (now?: Date) => tickExpiredIssueMonitors(now),
     // Override-aware scheduling-suppression check (honors the worktree
     // run-execution experimental setting). Callers outside the service that
@@ -43923,10 +44109,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       const issueMonitors = await tickDueIssueMonitors(now);
       const expiredIssueMonitors = await tickExpiredIssueMonitors(now);
+      // PEN-4420: the park's release edge. Runs on the same timer as the two monitor ticks
+      // because it answers the same question (what became due unobserved?), while sharing
+      // none of their machinery -- see `tickExpiredIssueParks`.
+      const expiredIssueParks = await tickExpiredIssueParks(now);
 
       const result = {
-        checked: checked + issueMonitors.checked + expiredIssueMonitors.checked,
-        enqueued: enqueued + issueMonitors.triggered,
+        checked: checked + issueMonitors.checked + expiredIssueMonitors.checked +
+          expiredIssueParks.checked,
+        enqueued: enqueued + issueMonitors.triggered + expiredIssueParks.woken,
         // Blocker-deferred monitors delivered no wake, so they belong on the
         // not-enqueued side of the ledger rather than silently widening the gap
         // between `checked` and the two counters that explain it (BLO-22048).
@@ -43934,7 +44125,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // was delivered, and the timer survived.
         skipped: skipped + issueMonitors.skipped + issueMonitors.dependencyBlockedDeferred +
           issueMonitors.dispatchSuppressedDeferred +
-          expiredIssueMonitors.recovered,
+          expiredIssueMonitors.recovered +
+          // A failed park wake un-claimed itself and will be retried, so it belongs on the
+          // not-enqueued side alongside the skips rather than widening the unexplained gap
+          // between `checked` and the counters (BLO-22048).
+          expiredIssueParks.skipped + expiredIssueParks.failed,
         idleSkipped,
       };
       // Recorded here rather than at the caller's log line, which is gated on
