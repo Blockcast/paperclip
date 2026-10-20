@@ -3139,10 +3139,11 @@ export async function handleFiring(
       // displaced predecessor announcing a re-fire in the common case, where
       // the displacement happened long before this point. It does not make
       // delivery authoritative: a steal landing between the check and the
-      // fan-out still delivers. Nothing in this repo subscribes to this event,
-      // and any future subscriber must re-establish ownership before acting on
-      // it rather than trusting delivery. See `PluginEventOwnershipCheck` and
-      // BLO-31113 for the authoritative-delivery follow-up.
+      // fan-out still delivers. The host stamps this generation onto the
+      // delivered event as `event.ownership` (BLO-31113); a subscriber in this
+      // plugin must pass that as `fencing` on whatever it does with the event,
+      // which is where the generation is actually enforced. Nothing in this
+      // repo subscribes to it today. See `PluginEventOwnershipCheck`.
       await ctx.events.emit(
         "alertmanager.alert.firing",
         tracked.paperclipCompanyId,
