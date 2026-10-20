@@ -2384,7 +2384,9 @@ export async function startServer(): Promise<StartedServer> {
               // Pass 1's span is the sweep call alone, so it stays directly
               // comparable with the `stranded assigned issue sweep phase
               // timing` line the sweep emits from inside itself.
-              .time(1, "reconcileStrandedAssignedIssues", () => heartbeat.reconcileStrandedAssignedIssues())
+              .time(1, "reconcileStrandedAssignedIssues", () => heartbeat.reconcileStrandedAssignedIssues({
+                recoveryChainId: chainTimer.chainId,
+              }))
               .then(async (reconciled) => {
                 if (
                   reconciled.assignmentDispatched > 0 ||

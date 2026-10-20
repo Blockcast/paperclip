@@ -29043,8 +29043,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
   }
 
-  async function reconcileStrandedAssignedIssues() {
-    return recovery.reconcileStrandedAssignedIssues({ issueCreatedAtGte: await getWorktreeExecutionCutoff() });
+  async function reconcileStrandedAssignedIssues(opts?: { recoveryChainId?: string }) {
+    return recovery.reconcileStrandedAssignedIssues({
+      issueCreatedAtGte: await getWorktreeExecutionCutoff(),
+      recoveryChainId: opts?.recoveryChainId,
+    });
   }
 
   /**
