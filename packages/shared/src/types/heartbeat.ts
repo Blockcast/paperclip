@@ -164,6 +164,19 @@ export interface HeartbeatRun {
   scheduledRetryReason?: string | null;
   retryExhaustedReason?: string | null;
   /**
+   * When an existing row last re-entered `queued`. Null for a fresh insert,
+   * whose `createdAt` already is its queue-entry time. Stamped by
+   * `promoteScheduledRetryRun` (out of `scheduled_retry`) and by the two
+   * running-to-queued re-queues, `deferRunForK8sIsolationConflict` and
+   * `deferRunForBranchClaimConflict` — so a non-null value does NOT imply the
+   * run was a retry; read `scheduledRetryAt` for that.
+   *
+   * Dispatch wait is `startedAt - (queuedAt ?? createdAt)`, the same clock
+   * `paperclip_run_dispatch_wait_seconds` uses. Bare `startedAt - createdAt`
+   * overstates it on exactly the slow tail. BLO-47997.
+   */
+  queuedAt?: Date | null;
+  /**
    * Outbound retry edge — the park created because this run ended. Decorated
    * onto the single-run read (`GET /api/heartbeat-runs/:runId`) only; absent on
    * list endpoints, which do not resolve it. BLO-29312.
