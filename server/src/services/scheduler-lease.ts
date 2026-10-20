@@ -160,7 +160,65 @@ export async function releaseSchedulerLease(
  */
 export function schedulerLeaseIdentity() {
   const pod = process.env.HOSTNAME?.trim() || os.hostname() || "unknown";
-  return { pod, holderId: `${pod}#${randomUUID().slice(0, 8)}` };
+  // BLO-47803: the pod IP (downward API) rides in the holder id so a follower
+  // can route plugin traffic to the holder. The worker StatefulSet's governing
+  // Service is not headless, so there is no per-pod DNS name to use instead.
+  const addr = process.env.PAPERCLIP_POD_IP?.trim();
+  return { pod, holderId: `${pod}#${randomUUID().slice(0, 8)}${addr ? `@${addr}` : ""}` };
+}
+
+/** The address a holder id advertises, or null for an id written without one. */
+export function schedulerLeaseHolderAddress(holderId: string | null | undefined): string | null {
+  const at = holderId?.lastIndexOf("@") ?? -1;
+  return at >= 0 ? holderId!.slice(at + 1) || null : null;
+}
+
+/**
+ * BLO-47803. URL of the live holder of lease `name` when this process is a
+ * follower, or null when it should serve the request itself (it holds the
+ * lease, there is no lease, or the holder advertises no address). Every
+ * replica listens on the same port, so the holder is reached on `port`.
+ *
+ * Cached for `cacheMs` so a burst of plugin calls is not one lease read each;
+ * a stale entry costs one hop to a pod that then serves the request itself.
+ */
+export function leaseHolderUrlResolver(
+  db: LeaseDb,
+  {
+    name,
+    port,
+    lease,
+    cacheMs = 2_000,
+    now = () => Date.now(),
+  }: {
+    name: string;
+    port: number;
+    lease: () => Pick<SchedulerLeaseHolder, "shouldRunLoop" | "identity"> | null;
+    cacheMs?: number;
+    now?: () => number;
+  },
+): () => Promise<string | null> {
+  let cache: { atMs: number; holderId: string | null } | null = null;
+  return async () => {
+    const own = lease();
+    if (!own || own.shouldRunLoop()) return null;
+    const nowMs = now();
+    if (!cache || nowMs - cache.atMs > cacheMs) {
+      cache = { atMs: nowMs, holderId: await readSchedulerLeaseHolderId(db, name) };
+    }
+    const { holderId } = cache;
+    const addr = holderId === own.identity.holderId ? null : schedulerLeaseHolderAddress(holderId);
+    if (!addr) return null;
+    return `http://${addr.includes(":") ? `[${addr}]` : addr}:${port}`;
+  };
+}
+
+/** Holder id of the live (unexpired) lease `name`, or null if none is held. */
+export async function readSchedulerLeaseHolderId(db: LeaseDb, name: string): Promise<string | null> {
+  const row = firstRow(await db.execute(sql`
+    select holder_id from scheduler_leases where name = ${name} and expires_at > now()
+  `));
+  return row ? String(row.holder_id) : null;
 }
 
 export type SchedulerLeaseHolder = ReturnType<typeof schedulerLeaseHolder>;

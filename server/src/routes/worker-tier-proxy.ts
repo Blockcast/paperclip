@@ -20,7 +20,7 @@
 
 import { Readable } from "node:stream";
 import type { IncomingHttpHeaders } from "node:http";
-import type { Request, RequestHandler, Router } from "express";
+import type { Request, RequestHandler, Response as ExpressResponse, Router } from "express";
 import { logger } from "../middleware/logger.js";
 import { urlForLog } from "../middleware/http-log-policy.js";
 import { assertBoardOrgAccess } from "./authz.js";
@@ -123,6 +123,9 @@ const HOP_BY_HOP_HEADERS = new Set([
   // Drop accept-encoding so the worker replies identity-encoded — we stream
   // the body straight through and never re-encode.
   "accept-encoding",
+  // PLUGIN_HOLDER_FORWARDED_HEADER (BLO-47803). Only a follower worker may set
+  // it, so a client-supplied copy is dropped rather than relayed.
+  "x-paperclip-plugin-holder-forwarded",
 ]);
 
 function forwardRequestHeaders(headers: IncomingHttpHeaders): Headers {
@@ -222,11 +225,13 @@ async function fetchWithStartupRetry(
  * tier at `workersInternalUrl`.
  */
 function createWorkerProxyHandler(
-  workersInternalUrl: string,
+  target: string | ((res: ExpressResponse) => string),
   streaming: boolean,
   requestTimeoutMs: number,
+  extraHeaders: Record<string, string> = {},
 ): RequestHandler {
   return async (req, res) => {
+    const workersInternalUrl = typeof target === "string" ? target : target(res);
     const targetUrl = `${workersInternalUrl}${req.originalUrl}`;
     // The same URL with the query string dropped on untrusted webhook routes.
     // `req.originalUrl` is sender-authored on those routes, so interpolating
@@ -273,6 +278,7 @@ function createWorkerProxyHandler(
 
     try {
       const headers = forwardRequestHeaders(req.headers);
+      for (const [name, value] of Object.entries(extraHeaders)) headers.set(name, value);
       // Node's runtime fetch accepts string | Uint8Array bodies, but the global
       // DOM-flavored BodyInit type (from @types/node) omits Uint8Array; cast at
       // the fetch call site below.
@@ -433,4 +439,60 @@ export function registerWorkerTierProxyRoutes(
     },
     "worker-tier proxy: API tier will forward worker-dependent plugin routes",
   );
+}
+
+/**
+ * Set on a request a follower worker has already forwarded to the scheduler
+ * lease holder. The receiver always serves such a request itself, so a lease
+ * that moves mid-flight costs one stale hop, never a forwarding loop.
+ */
+export const PLUGIN_HOLDER_FORWARDED_HEADER = "x-paperclip-plugin-holder-forwarded";
+
+/**
+ * Worker tier, `replicas > 1` (BLO-47803): forward the same worker-dependent
+ * plugin routes from a follower worker pod to the scheduler lease holder.
+ *
+ * The `-workers` Service load-balances across every worker pod, but plugin
+ * lifecycle changes propagate only in-process, and the plugin event outbox
+ * runs on the lease holder only. Serving every plugin route on the holder
+ * makes the holder's plugin set the one that answers webhooks, `api/*`,
+ * bridge calls and SSE streams, whichever pod the Service picked.
+ *
+ * `resolveHolderUrl` returns null when this process should serve the request
+ * itself: it is the holder, there is no lease, or the holder advertises no
+ * address. Null is today's behaviour, so the fallback is never worse than it.
+ */
+export function registerPluginHolderForwardRoutes(
+  router: Router,
+  resolveHolderUrl: () => Promise<string | null>,
+  options: WorkerTierProxyOptions = {},
+): void {
+  const defaultTimeoutMs = options.requestTimeoutMs ?? PROXY_REQUEST_TIMEOUT_MS;
+  const pluginApiTimeoutMs =
+    options.pluginApiRequestTimeoutMs ?? PROXY_PLUGIN_API_REQUEST_TIMEOUT_MS;
+  const decide: RequestHandler = async (req, res, next) => {
+    if (req.headers[PLUGIN_HOLDER_FORWARDED_HEADER] !== undefined) return next("route");
+    let url: string | null = null;
+    try {
+      url = await resolveHolderUrl();
+    } catch (err) {
+      logger.warn({ err }, "plugin holder forward: could not resolve the lease holder; serving locally");
+    }
+    if (!url) return next("route");
+    res.locals.pluginHolderUrl = url;
+    next();
+  };
+  for (const route of WORKER_DEPENDENT_PLUGIN_ROUTES) {
+    const timeoutMs =
+      route.timeoutProfile === "plugin-api" ? pluginApiTimeoutMs : defaultTimeoutMs;
+    const handlers: RequestHandler[] = [decide];
+    if (route.preProxyAuth === "board-org") handlers.push(boardOrgAccessProxyGuard);
+    handlers.push(createWorkerProxyHandler(
+      (res) => res.locals.pluginHolderUrl as string,
+      route.streaming ?? false,
+      timeoutMs,
+      { [PLUGIN_HOLDER_FORWARDED_HEADER]: "1" },
+    ));
+    router[route.method](route.path, ...handlers);
+  }
 }
