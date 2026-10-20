@@ -39,7 +39,7 @@ function registeredMigrations(source) {
 const RUNNER_REGISTRY = registeredMigrations(guardSource);
 const PREFLIGHT_REGISTRY = registeredMigrations(preflightSource);
 
-// Measured from master at 816ad95a, 2026-10-16. This is the set the deploy-time
+// Measured from master at 816ad95a, 2026-10-16; 0261 added by BLO-47753. This is the set the deploy-time
 // precreation step covers; the pre-flight-only remainder has no automated path
 // and its operators are told so.
 const EXPECTED_OVERLAP = [
@@ -50,6 +50,7 @@ const EXPECTED_OVERLAP = [
   "0224_heartbeat_runs_overdue_scheduled_retry_index.sql",
   "0230_heartbeat_runs_retry_successor_index.sql",
   "0259_heartbeat_runs_failed_finished_at_index.sql",
+  "0261_cost_events_company_issue_index.sql",
 ];
 
 test("both registries are non-empty and parsed from `migration:` keys, not from prose", () => {

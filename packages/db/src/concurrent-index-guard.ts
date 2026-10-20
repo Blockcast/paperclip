@@ -27,7 +27,7 @@ export type ConcurrentIndexEnsureResult = {
 
 /**
  * Every migration that requires an online index on a populated, hot table
- * (mostly heartbeat_runs). Keep these definitions in sync with the structural guards in the SQL
+ * Keep these definitions in sync with the structural guards in the SQL
  * files. The migration runner invokes the matching entry immediately before
  * each file, after earlier files have committed prerequisite columns.
  */
