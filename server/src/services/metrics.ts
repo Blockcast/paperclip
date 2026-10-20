@@ -4708,9 +4708,9 @@ function ensureRegistry(): {
       name: PROCESS_MAPPING_COUNT_METRIC,
       help:
         "Mappings (VMAs) per mapping_class (PEN-3314), beside "
-        + "paperclip_process_mapping_rss_bytes. Note a single glibc secondary arena is 2+ VMAs "
-        + "(a committed prefix and a PROT_NONE tail), so this is NOT the arena count -- read "
-        + "paperclip_process_glibc_secondary_arena_count for that. Published at a measured 0 "
+        + "paperclip_process_mapping_rss_bytes. Note a single glibc secondary-arena HEAP is 2+ "
+        + "VMAs (a committed prefix and a PROT_NONE tail), so this is NOT the heap count -- read "
+        + "paperclip_process_glibc_secondary_arena_heap_count for that. Published at a measured 0 "
         + "for classes this process currently has none of.",
       labelNames: ["mapping_class"],
       registers: [registry],
