@@ -938,6 +938,44 @@ test("squash merge drops a `## Model used` section and `Model used:` lines (BLO-
   });
 });
 
+// The repo's real PR template, filled in: its checklist says "the model used"
+// in prose, which must not trip the post-scrub refusal (review on #2883).
+test("squash merge of a body built from the real PR template goes through (BLO-47692)", () => {
+  withTempDir((dir) => {
+    const template = readFileSync(new URL("../.github/PULL_REQUEST_TEMPLATE.md", import.meta.url), "utf8")
+      .replace(/^## Model Used\n([\s\S]*?)^-$/m, "## Model Used\n$1- Claude Opus 5.5 (1M context)");
+    assert.match(template, /Claude Opus 5\.5/, "fixture must fill in the Model Used section");
+    const { body } = runMerge(dir, ["pr", "merge", "2883", "--squash"], { prBody: template });
+    assert.ok(body !== null);
+    assert.doesNotMatch(body, /claude opus/i);
+    assert.match(body, /^- \[ \] I have specified the model used/m);
+  });
+});
+
+test("the Model used skip honours code fences and subheadings (BLO-47692)", () => {
+  withTempDir((dir) => {
+    const prBody = [
+      "## Summary",
+      "```sh",
+      "# Model used for the build",
+      "make",
+      "```",
+      "kept after the fence",
+      "## Model used",
+      "### Details",
+      "Opus 5.5 1M",
+      "## Test plan",
+      "- unit tests",
+      "Regenerated with buf.",
+    ].join("\n");
+    const { body } = runMerge(dir, ["pr", "merge", "9", "--squash"], { prBody });
+    assert.ok(body !== null);
+    assert.match(body, /^make\n```\nkept after the fence$/m);
+    assert.doesNotMatch(body, /opus|details/i);
+    assert.match(body, /^## Test plan\n- unit tests\nRegenerated with buf\.$/m);
+  });
+});
+
 for (const [label, leftover] of [
   ["a bulleted trailer", "- Co-authored-by: Paperclip <noreply@paperclip.ing>"],
   ["an anthropic noreply address in prose", "Thanks claude <noreply@anthropic.com> for this"],
@@ -962,6 +1000,8 @@ test("a `-ds` short-flag cluster is treated as a squash (BLO-47692)", () => {
 for (const args of [
   ["api", "-X", "PUT", "repos/Blockcast/moqtail-private/pulls/563/merge", "-f", "merge_method=squash"],
   ["api", "--method=PUT", "/repos/o/r/pulls/5/merge"],
+  ["api", "-X", "Put", "repos/o/r/pulls/5/merge"],
+  ["api", "-X=PUT", "repos/o/r/pulls/5/merge"],
   ["api", "graphql", "-f", "query=mutation{mergePullRequest(input:{pullRequestId:\"x\",mergeMethod:SQUASH}){clientMutationId}}"],
   ["api", "graphql", "-f", "query=mutation{enablePullRequestAutoMerge(input:{pullRequestId:\"x\"}){clientMutationId}}"],
 ]) {
