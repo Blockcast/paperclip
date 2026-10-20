@@ -130,6 +130,14 @@ worker:
   # as Secret-backed valueFrom entries; literal credential values are rejected
   # by policy and must never live in this file.
   extraEnv: []
+  # -- Worker StatefulSet replicas. Above 1 is safe only with the scheduler lease
+  # on (`PAPERCLIP_SCHEDULER_LEASE_ENABLED`, default on): the heartbeat timer and
+  # every worker singleton (backup, reconcilers, reaper, digest, Linear tunnel,
+  # plugin job scheduler and event outbox) run on the lease holder only
+  # (BLO-43292, BLO-46694). Every replica mounts the same `/paperclip`, so it
+  # also needs `persistence.existingClaim` on a ReadWriteMany volume — with
+  # volumeClaimTemplates each pod would get its own empty data directory.
+  replicas: 1
 
 # -- Kubernetes Service exposing the HTTP UI/API.
 service:
