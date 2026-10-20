@@ -172,7 +172,7 @@ const LOCAL_ACTION = /uses: \.\/\.github\/actions\/verdict-dispatch\n/g;
 const MERGE_QUEUE_OR_LIGHT = "${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-paperclip-light' }}";
 
 test("Tier 1 is exactly the jobs on a heavy pool, and every one of them needs the hold", () => {
-  const heavyPool = /'(arc-paperclip-general|arc-e2e|arc-default|default|arc-dind|arc-ciab|arc-multicast-integ)'/;
+  const heavyPool = /'(arc-paperclip-general|arc-paperclip-e2e|arc-default|default|arc-dind|arc-ciab|arc-multicast-integ)'/;
   const onHeavyPool = Object.entries(jobs)
     .filter(([, block]) => heavyPool.test(runsOn(block)))
     .map(([id]) => id)
