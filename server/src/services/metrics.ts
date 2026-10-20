@@ -4708,10 +4708,16 @@ function ensureRegistry(): {
       name: PROCESS_MAPPING_COUNT_METRIC,
       help:
         "Mappings (VMAs) per mapping_class (PEN-3314), beside "
-        + "paperclip_process_mapping_rss_bytes. Note a single glibc secondary-arena HEAP is 2+ "
-        + "VMAs (a committed prefix and a PROT_NONE tail), so this is NOT the heap count -- read "
-        + "paperclip_process_glibc_secondary_arena_heap_count for that. Published at a measured 0 "
-        + "for classes this process currently has none of.",
+        + "paperclip_process_mapping_rss_bytes. NOT a heap count, and it errs in BOTH "
+        + "directions: a YOUNG glibc secondary-arena heap is 2+ VMAs (a committed prefix and a "
+        + "PROT_NONE tail), but one grown to HEAP_MAX_SIZE has no tail left and is a single VMA, "
+        + "and the kernel merges mature neighbours, so several heaps can be ONE mapping. "
+        + "paperclip_process_glibc_secondary_arena_heap_count does NOT close that gap: it counts "
+        + "the YOUNG heaps only. Mature ones land in mapping_class=anon_aligned_64m_full, which "
+        + "is a candidate class and not a heap count either -- an aligned N x 64MiB V8 "
+        + "reservation is indistinguishable. Read those two together; arena retention appears as "
+        + "the full class rising while the heap count plateaus, and NO series here is the heap "
+        + "count. Published at a measured 0 for classes this process currently has none of.",
       labelNames: ["mapping_class"],
       registers: [registry],
     });
