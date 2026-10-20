@@ -47,6 +47,7 @@ import {
 } from "./routine-dispatch-metrics.js";
 import type { FdClassSnapshot } from "./fd-class-metrics.js";
 import type { NativeMemorySnapshot } from "./native-memory-metrics.js";
+import type { ProcessMappingSnapshot } from "./process-mapping-metrics.js";
 
 export const CONCURRENT_RUN_BLOCKED_METRIC = "claude_k8s_concurrent_run_blocked_total";
 /**
@@ -1643,6 +1644,46 @@ export const PROCESS_MEMORY_COMPONENT_BYTES_METRIC = "paperclip_process_memory_c
  * steady state is 0, which is why it is published at 0 rather than omitted.
  */
 export const PROCESS_V8_CONTEXT_COUNT_METRIC = "paperclip_process_v8_context_count";
+
+/**
+ * Resident memory partitioned by the allocator region it lives in (PEN-3314).
+ *
+ * Where `PROCESS_MEMORY_COMPONENT_BYTES_METRIC` reports a residual
+ * (`rss - heapTotal - external`), this reports an attribution: every mapping
+ * lands in exactly one `mapping_class` and the classes sum to the `total`
+ * series. See `services/process-mapping-metrics.ts`.
+ */
+export const PROCESS_MAPPING_RSS_BYTES_METRIC = "paperclip_process_mapping_rss_bytes";
+
+/** VMA counts per `mapping_class` (PEN-3314), beside the bytes. */
+export const PROCESS_MAPPING_COUNT_METRIC = "paperclip_process_mapping_count";
+
+/**
+ * Distinct glibc secondary-arena heaps (PEN-3314). The population the
+ * 64-CPU/512-arena hypothesis is about, counted rather than argued.
+ */
+export const PROCESS_GLIBC_SECONDARY_ARENA_COUNT_METRIC =
+  "paperclip_process_glibc_secondary_arena_count";
+
+/**
+ * Duration of the last `/proc/self/smaps` scan (PEN-3314).
+ *
+ * Published because the scan is a synchronous event-loop block that costs
+ * O(resident pages) — ~110 ms at 3 GB — and this row is chasing an event-loop
+ * stall. An instrument that can induce the signature must make its own cost
+ * attributable rather than anonymous.
+ */
+export const PROCESS_MAPPING_SCAN_SECONDS_METRIC = "paperclip_process_mapping_scan_seconds";
+
+/**
+ * Unix time of the last completed scan (PEN-3314).
+ *
+ * The mapping series are sampled on a long cadence and republished in between,
+ * so they are deliberately staler than the scrape. This makes that staleness
+ * computable (`time() - this`) instead of invisible.
+ */
+export const PROCESS_MAPPING_SCAN_TIMESTAMP_METRIC =
+  "paperclip_process_mapping_scan_timestamp_seconds";
 
 /**
  * Liveness of the 1 s heap-peak sampler (PEN-3314).
@@ -3892,6 +3933,11 @@ let dbInheritedTimeout: Gauge<"setting" | "source"> | null = null;
 let processOpenFdsByClass: Gauge<"fd_class"> | null = null;
 let processMemoryComponentBytes: Gauge<"component"> | null = null;
 let processV8ContextCount: Gauge<"kind"> | null = null;
+let processMappingRssBytes: Gauge<"mapping_class"> | null = null;
+let processMappingCount: Gauge<"mapping_class"> | null = null;
+let processGlibcSecondaryArenaCount: Gauge | null = null;
+let processMappingScanSeconds: Gauge | null = null;
+let processMappingScanTimestamp: Gauge | null = null;
 let processHeapPeakSamples: Gauge | null = null;
 let pluginError: Gauge<"plugin_id" | "plugin_key"> | null = null;
 let crashRecoveryCandidateIndexPresent: Gauge<"index"> | null = null;
@@ -4058,6 +4104,11 @@ function ensureRegistry(): {
   processOpenFdsByClassGauge: Gauge<"fd_class">;
   processMemoryComponentBytesGauge: Gauge<"component">;
   processV8ContextCountGauge: Gauge<"kind">;
+  processMappingRssBytesGauge: Gauge<"mapping_class">;
+  processMappingCountGauge: Gauge<"mapping_class">;
+  processGlibcSecondaryArenaCountGauge: Gauge;
+  processMappingScanSecondsGauge: Gauge;
+  processMappingScanTimestampGauge: Gauge;
   processHeapPeakSamplesGauge: Gauge;
   pluginErrorGauge: Gauge<"plugin_id" | "plugin_key">;
   crashRecoveryCandidateIndexPresentGauge: Gauge<"index">;
@@ -4195,6 +4246,11 @@ function ensureRegistry(): {
     || !processOpenFdsByClass
     || !processMemoryComponentBytes
     || !processV8ContextCount
+    || !processMappingRssBytes
+    || !processMappingCount
+    || !processGlibcSecondaryArenaCount
+    || !processMappingScanSeconds
+    || !processMappingScanTimestamp
     || !processHeapPeakSamples
     || !pluginError
     || !crashRecoveryCandidateIndexPresent
@@ -4612,6 +4668,91 @@ function ensureRegistry(): {
       labelNames: ["kind"],
       registers: [registry],
     });
+    processMappingRssBytes = new Gauge({
+      name: PROCESS_MAPPING_RSS_BYTES_METRIC,
+      help:
+        "Resident memory attributed to the allocator region it lives in, from /proc/self/smaps "
+        + "(PEN-3314). Unlike paperclip_process_memory_component_bytes -- which is a residual, "
+        + "rss - heapTotal - external -- this IS a partition: every mapping lands in exactly one "
+        + "mapping_class and the classes sum to mapping_class=total, which carries the kernel's "
+        + "own figure so a dropped mapping is a visible subtraction rather than a silent one. "
+        + "glibc_secondary_arena is the population the 64-CPU/512-arena hypothesis is about: a "
+        + "64MiB-aligned, exactly-64MiB, gapless run of anonymous mappings carrying a PROT_NONE "
+        + "tail, which is glibc new_heap()'s signature and nothing else's. glibc_main_arena is "
+        + "[heap] (brk). anon_other carries V8's own heap reservations and is EXPECTED to be "
+        + "large -- it is the complement that makes the partition exact, NOT a leak signal; the "
+        + "reading that matters is differential (arena RSS tracking the residual while "
+        + "anon_other stays flat, or the reverse). file_backed is executable text and shared "
+        + "objects, special is kernel pseudo-mappings, unclassified-truncated is the fold past "
+        + "the per-scan mapping cap. "
+        + "SAMPLED ON A LONG CADENCE, NOT PER SCRAPE: the read costs O(resident pages) "
+        + "(~36us/MB; 108ms measured at 3037MB) and is a synchronous event-loop block, and the "
+        + "signature this row chases is itself an event-loop stall -- see "
+        + "paperclip_process_mapping_scan_timestamp_seconds for how stale the values are and "
+        + "paperclip_process_mapping_scan_seconds for what the scan cost. "
+        + "NOT an alert source: it localises growth to a region class, it does not bound it. "
+        + "Absent metric means /proc/self/smaps could not be read at all (non-Linux), "
+        + "deliberately distinct from a measured zero.",
+      labelNames: ["mapping_class"],
+      registers: [registry],
+    });
+    processMappingCount = new Gauge({
+      name: PROCESS_MAPPING_COUNT_METRIC,
+      help:
+        "Mappings (VMAs) per mapping_class (PEN-3314), beside "
+        + "paperclip_process_mapping_rss_bytes. Note a single glibc secondary arena is 2+ VMAs "
+        + "(a committed prefix and a PROT_NONE tail), so this is NOT the arena count -- read "
+        + "paperclip_process_glibc_secondary_arena_count for that. Published at a measured 0 "
+        + "for classes this process currently has none of.",
+      labelNames: ["mapping_class"],
+      registers: [registry],
+    });
+    processGlibcSecondaryArenaCount = new Gauge({
+      name: PROCESS_GLIBC_SECONDARY_ARENA_COUNT_METRIC,
+      help:
+        "Distinct glibc secondary-arena heaps, each 64MiB of reserved address space (PEN-3314). "
+        + "glibc caps arenas at 8 * sysconf(_SC_NPROCESSORS_ONLN), which reads the NODE and not "
+        + "the cgroup -- 512 on this 64-CPU node against a 4-CPU container limit -- and never "
+        + "trims them back to the OS. Detector validated against a forced positive: 256 "
+        + "concurrent zlib.gzip calls at UV_THREADPOOL_SIZE=64 moved it 5 -> 69 arenas "
+        + "(0.29 -> 10.29 MB), one per threadpool thread. "
+        + "A HIGH COUNT IS NOT BY ITSELF A FINDING: the blanket arena lead was demoted "
+        + "2026-10-13 because the same-image paperclip-api sibling on the same node has the "
+        + "same cap and releases memory normally. The finding would be arena RSS tracking the "
+        + "native residual across a generation while the sibling's does not.",
+      registers: [registry],
+    });
+    processMappingScanSeconds = new Gauge({
+      name: PROCESS_MAPPING_SCAN_SECONDS_METRIC,
+      help:
+        "Duration of the last /proc/self/smaps scan (PEN-3314). The read walks page tables, so "
+        + "it costs O(resident pages) and GROWS WITH THE LEAK IT MEASURES: measured 1.91ms at "
+        + "47MB RSS, 35.96ms at 1047MB, 108.42ms at 3037MB (~36us/MB, median of 7). That is a "
+        + "synchronous event-loop block, which is why the scan runs on a long cadence rather "
+        + "than per scrape -- the +672MB step signature co-occurs with the heartbeat timer "
+        + "failing to advance, so an instrument that stalls the loop could manufacture its own "
+        + "evidence. Watch this series to confirm it does not.",
+      registers: [registry],
+    });
+    processMappingScanTimestamp = new Gauge({
+      name: PROCESS_MAPPING_SCAN_TIMESTAMP_METRIC,
+      help:
+        "Unix time of the last completed /proc/self/smaps scan (PEN-3314). The mapping series "
+        + "are republished unchanged between scans, so they are deliberately staler than the "
+        + "scrape; time() - this is that staleness. A value that stops advancing while the "
+        + "process still serves /metrics means scans are failing, which the mapping series "
+        + "alone cannot show because they would simply hold their last value.",
+      registers: [registry],
+    });
+    // Same registration-time hazard as processHeapPeakSamples below: prom-client
+    // renders a LABEL-LESS gauge as `name 0` from the moment it is registered.
+    // Each of these three would be actively misleading at 0 -- no secondary
+    // arenas, a free scan, and a 1970 scan timestamp that makes
+    // `time() - timestamp` read as 56 years of staleness. Drop them at
+    // construction so "no scan has completed" is ABSENT until one has.
+    processGlibcSecondaryArenaCount.remove();
+    processMappingScanSeconds.remove();
+    processMappingScanTimestamp.remove();
     processHeapPeakSamples = new Gauge({
       name: PROCESS_HEAP_PEAK_SAMPLES_METRIC,
       help:
@@ -6114,6 +6255,11 @@ function ensureRegistry(): {
     processOpenFdsByClassGauge: processOpenFdsByClass,
     processMemoryComponentBytesGauge: processMemoryComponentBytes,
     processV8ContextCountGauge: processV8ContextCount,
+    processMappingRssBytesGauge: processMappingRssBytes,
+    processMappingCountGauge: processMappingCount,
+    processGlibcSecondaryArenaCountGauge: processGlibcSecondaryArenaCount,
+    processMappingScanSecondsGauge: processMappingScanSeconds,
+    processMappingScanTimestampGauge: processMappingScanTimestamp,
     processHeapPeakSamplesGauge: processHeapPeakSamples,
     pluginErrorGauge: pluginError,
     crashRecoveryCandidateIndexPresentGauge: crashRecoveryCandidateIndexPresent,
@@ -7152,6 +7298,48 @@ export function setNativeMemoryMetrics(snapshot: NativeMemorySnapshot | null): v
   if (snapshot.heapPeakSampleCount !== null) {
     metrics.processHeapPeakSamplesGauge.set(snapshot.heapPeakSampleCount);
   }
+}
+
+/**
+ * PEN-3314: publish the mapping-class attribution.
+ *
+ * Reset-then-set on the labelled pair for the same reason as
+ * {@link setNativeMemoryMetrics}: a class that stops being reported must stop
+ * being published rather than freezing its last value.
+ *
+ * The three label-less gauges use `remove()` instead, for the reason spelled
+ * out on {@link setNativeMemoryMetrics}'s `processHeapPeakSamplesGauge` call —
+ * `reset()` on a label-less gauge returns it to a *published* 0 rather than
+ * deleting it. Here that would be worse than merely ambiguous: a 0 scan
+ * timestamp dates the last scan to 1970, so the staleness expression this
+ * series exists to support (`time() - timestamp`) would read ~56 years instead
+ * of going absent.
+ *
+ * A `null` snapshot publishes nothing at all — {@link collectProcessMappingSnapshot}
+ * returns `null` only when `/proc/self/smaps` could not be read, and "no procfs
+ * on this host" must not render as "this process maps nothing".
+ *
+ * Zero-valued classes ARE published: a readable smaps that contains no
+ * secondary arenas is a measurement of zero arenas, which is the control
+ * reading the arena hypothesis is tested against.
+ */
+export function setProcessMappingMetrics(snapshot: ProcessMappingSnapshot | null): void {
+  const metrics = ensureRegistry();
+  metrics.processMappingRssBytesGauge.reset();
+  metrics.processMappingCountGauge.reset();
+  metrics.processGlibcSecondaryArenaCountGauge.remove();
+  metrics.processMappingScanSecondsGauge.remove();
+  metrics.processMappingScanTimestampGauge.remove();
+  if (!snapshot) return;
+  for (const [mappingClass, bytes] of snapshot.rssByClass) {
+    metrics.processMappingRssBytesGauge.set({ mapping_class: mappingClass }, bytes);
+  }
+  for (const [mappingClass, count] of snapshot.countByClass) {
+    metrics.processMappingCountGauge.set({ mapping_class: mappingClass }, count);
+  }
+  metrics.processGlibcSecondaryArenaCountGauge.set(snapshot.secondaryArenaCount);
+  metrics.processMappingScanSecondsGauge.set(snapshot.scanSeconds);
+  metrics.processMappingScanTimestampGauge.set(snapshot.scanTimestampSeconds);
 }
 
 /**
@@ -8698,6 +8886,11 @@ export function __resetMetricsForTest(): void {
   processOpenFdsByClass = null;
   processMemoryComponentBytes = null;
   processV8ContextCount = null;
+  processMappingRssBytes = null;
+  processMappingCount = null;
+  processGlibcSecondaryArenaCount = null;
+  processMappingScanSeconds = null;
+  processMappingScanTimestamp = null;
   processHeapPeakSamples = null;
   processLostTotal = null;
   externalLifecycleRunningRuns = null;
