@@ -1370,11 +1370,30 @@ sweep itself looks.
    `disposition="timed_out"` against `ran` / `joined` / `skipped_fresh` on
    `paperclip_agent_start_lock_reap_disposition_total`. A non-zero `timed_out`
    is routine; `ran` collapsing to ~0 is the fault.
-2. Split the sweep with `paperclip_orphan_reap_stage_seconds` by `stage`.
+2. Split the sweep with `paperclip_orphan_reap_stage_seconds` by `stage`. It is
+   a **histogram**, so the bare metric name returns an empty vector — read the
+   `_sum` / `_count` series instead, as a mean per sweep:
+
+   ```
+   sum by (stage) (increase(paperclip_orphan_reap_stage_seconds_sum[30m]))
+     / sum by (stage) (increase(paperclip_orphan_reap_stage_seconds_count[30m]))
+   ```
+
+   ⚠️ An empty result from the bare name is a **query mistake, not evidence the
+   instrument is undeployed**. The live window for this adjudication is narrow;
+   do not spend it concluding the split never shipped.
+
    Read `reconcile_release_pending`, `reconcile_env_leases` and
    `refresh_resource_metrics` individually — their `reconcile_reservations`
    aggregate spans all three and names only the first, which is how a 33 s stage
    was once attributed to a loop whose population was zero.
+
+   Healthy baseline, measured 2026-10-20 03:50Z over 463 sweeps/30m: `total`
+   **1.23 s** per sweep, split `identity_stamp` 32% / `per_run` 22% /
+   `list_jobs` 18% / `pod_cleanup` 17% / `reconcile_reservations` 7% /
+   `load_runs` 3% / `terminal_job_cleanup` 1%. The seven stages account for
+   ~100% of `total`, so unlike the older `passTimer` (which covered only 2–11%
+   of a pathological pass) an unexplained remainder here is itself a finding.
 3. Check the population gauges **before** assuming volume:
    `paperclip_external_runtime_reservations_release_pending` and
    `paperclip_environment_leases_orphaned_active`. If a stage is slow while its
