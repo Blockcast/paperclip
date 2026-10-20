@@ -1202,18 +1202,21 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
     if (processIssueCommentEffects) {
       stopIssueCommentEffectReconciler = startIssueCommentEffectReconciler(db, processIssueCommentEffects);
     }
+    let bootSnapshot: Awaited<ReturnType<typeof pluginStateSnapshot>> | null = null;
     void ensureBundledKubernetesPlugin()
       .then(() => retireLegacyCcrotatePlugin())
       .then(() => retireIncompatiblePluginUpdater())
-      .then(async () => {
-        // Snapshot BEFORE the load, for the reason given in the resync below.
-        const snapshot = await pluginStateSnapshot(db);
-        const result = await loader.loadAll();
-        loadedPluginFingerprint = snapshot.fingerprint;
-        loadedPluginKeys = snapshot.keys;
-        return result;
+      // Snapshot BEFORE the load, for the reason given in the resync below. A
+      // failed snapshot must not keep plugins unloaded: load anyway, and let
+      // the next takeover reload.
+      .then(() => pluginStateSnapshot(db).catch(() => null))
+      .then((snapshot) => {
+        bootSnapshot = snapshot;
       })
+      .then(() => loader.loadAll())
       .then((result) => {
+        loadedPluginFingerprint = bootSnapshot?.fingerprint ?? PLUGIN_RELOAD_REQUIRED;
+        loadedPluginKeys = bootSnapshot?.keys ?? new Map();
         if (result) {
           for (const loaded of result.results) {
             if (devWatcher && loaded.success && loaded.plugin.packagePath) {
