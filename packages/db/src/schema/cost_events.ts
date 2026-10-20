@@ -64,5 +64,8 @@ export const costEvents = pgTable(
       table.companyId,
       table.heartbeatRunId,
     ),
+    // BLO-47753: per-issue cost rollups. Without it the generic plan filters
+    // issue_id through the heartbeat-run index (~2 s/call at 431k rows).
+    companyIssueIdx: index("cost_events_company_issue_idx").on(table.companyId, table.issueId),
   }),
 );

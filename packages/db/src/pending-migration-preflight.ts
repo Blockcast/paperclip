@@ -213,6 +213,14 @@ export const PRECREATE_REQUIRED_INDEXES: readonly PrecreateRequiredIndex[] = [
       "ON heartbeat_runs USING btree (finished_at, id) " +
       "WHERE status = 'failed'",
   },
+  {
+    migration: "0261_cost_events_company_issue_index.sql",
+    name: "cost_events_company_issue_idx",
+    table: "cost_events",
+    createStatement:
+      "CREATE INDEX CONCURRENTLY IF NOT EXISTS cost_events_company_issue_idx " +
+      "ON cost_events USING btree (company_id, issue_id)",
+  },
 ];
 
 export type PreflightBlocker = {
