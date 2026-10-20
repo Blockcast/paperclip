@@ -26,8 +26,8 @@ export type ConcurrentIndexEnsureResult = {
 };
 
 /**
- * Every migration that requires an online index on a populated heartbeat_runs
- * table. Keep these definitions in sync with the structural guards in the SQL
+ * Every migration that requires an online index on a populated, hot table
+ * (mostly heartbeat_runs). Keep these definitions in sync with the structural guards in the SQL
  * files. The migration runner invokes the matching entry immediately before
  * each file, after earlier files have committed prerequisite columns.
  */
@@ -154,6 +154,20 @@ export const PENDING_CONCURRENT_INDEXES: readonly ConcurrentIndexSpec[] = [
       + "ON heartbeat_runs USING btree (finished_at, id) "
       + "WHERE status = 'failed'",
     dropStatement: "DROP INDEX CONCURRENTLY IF EXISTS heartbeat_runs_failed_finished_at_idx",
+  },
+  {
+    migration: "0261_cost_events_company_issue_index.sql",
+    name: "cost_events_company_issue_idx",
+    table: "cost_events",
+    requiredColumns: ["company_id", "issue_id"],
+    accessMethod: "btree",
+    keyColumns: ["company_id", "issue_id"],
+    keyOptions: [0, 0],
+    predicate: "",
+    createStatement:
+      "CREATE INDEX CONCURRENTLY IF NOT EXISTS cost_events_company_issue_idx "
+      + "ON cost_events USING btree (company_id, issue_id)",
+    dropStatement: "DROP INDEX CONCURRENTLY IF EXISTS cost_events_company_issue_idx",
   },
 ];
 

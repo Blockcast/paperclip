@@ -1772,6 +1772,13 @@
       "when": 1792002701477,
       "tag": "0260_issue_recovery_actions_restored_execution_watermark",
       "breakpoints": true
+    },
+    {
+      "idx": 261,
+      "version": "7",
+      "when": 1792002801477,
+      "tag": "0261_cost_events_company_issue_index",
+      "breakpoints": true
     }
   ]
 }
