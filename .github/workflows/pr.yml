@@ -867,6 +867,7 @@ jobs:
       - name: Test stalled-Ally-review sweep decision logic (BLO-28203)
         if: ${{ !cancelled() }}
         run: python3 -m unittest discover -s .github/scripts -p 'test_sweep_*.py' -v
+        timeout-minutes: 1
 
       # BLO-31492. The floor guards above only ever see whatever the lockfiles
       # resolved -- one known-good version -- so a dropped advisory or a
@@ -1087,34 +1088,42 @@ jobs:
       - name: Test ip-address security override
         if: ${{ !cancelled() }}
         run: pnpm run test:ip-address-security-override
+        timeout-minutes: 1
 
       - name: Test browserslist security override
         if: ${{ !cancelled() }}
         run: pnpm run test:browserslist-security-override
+        timeout-minutes: 1
 
       - name: Test multer security override
         if: ${{ !cancelled() }}
         run: pnpm run test:multer-security-override
+        timeout-minutes: 1
 
       - name: Test js-yaml security override
         if: ${{ !cancelled() }}
         run: pnpm run test:js-yaml-security-override
+        timeout-minutes: 1
 
       - name: Test http-cache-semantics security override
         if: ${{ !cancelled() }}
         run: pnpm run test:http-cache-semantics-security-override
+        timeout-minutes: 1
 
       - name: Test proxy-addr security override
         if: ${{ !cancelled() }}
         run: pnpm run test:proxy-addr-security-override
+        timeout-minutes: 1
 
       - name: Test @hono/node-server security override
         if: ${{ !cancelled() }}
         run: pnpm run test:hono-node-server-security-override
+        timeout-minutes: 1
 
       - name: Test agent-health preflight fixtures
         if: ${{ !cancelled() }}
         run: pnpm run test:agent-health-preflight
+        timeout-minutes: 1
 
       - name: Verify release package bootstrap for changed manifests
         if: ${{ !cancelled() }}

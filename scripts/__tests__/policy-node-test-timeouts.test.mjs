@@ -56,8 +56,22 @@ function policySteps() {
   return workflow.slice(start, end).split("\n      - name: ").slice(1);
 }
 
-function nodeTestSteps() {
-  return policySteps().filter((step) => step.includes("node --test"));
+// BLO-31482. This used to be `step.includes("node --test")`, which scoped the
+// guard to how a step is *spelled* rather than to what it is. Nine `Test *`
+// steps therefore carried no bound at all: eight are `node --test` suites
+// hidden behind a `pnpm run test:*` alias, the ninth is Python unittest. So
+// match on either the literal invocation (keeps every step the old rule held,
+// including the `Validate *`-named ones) or a `Test ` name. Union, never
+// replacement: a name-only rule would silently drop those `Validate *` steps.
+//
+// Setup and `Validate`/`Reject`/`Check` guard steps that do not run `node
+// --test` are deliberately left to the job cap; the setup steps that matter
+// are bounded separately by `assertSetupBounded` (BLO-31690). Widen this only
+// on evidence that one of the remaining steps actually hangs.
+function boundedTestSteps() {
+  return policySteps().filter(
+    (step) => step.includes("node --test") || stepName(step).startsWith("Test "),
+  );
 }
 
 // BLO-32670. GitHub Actions accepts fractional minutes. Matching only `(\d+)`
@@ -120,12 +134,12 @@ function stepName(step) {
 // stronger rule — bounds are per-step worst cases and every step is expected to
 // run, so that sum exceeds any sane cap by design.
 function assertTimeouts(steps, cap = policyJobCap()) {
-  assert.ok(steps.length > 0, "policy must contain node --test steps");
+  assert.ok(steps.length > 0, "policy must contain bounded test steps");
   for (const step of steps) {
     const bound = timeoutMinutes(step, 8);
     assert.ok(
       bound > 0,
-      `policy node --test step "${stepName(step)}" must declare a step-level timeout-minutes`,
+      `policy test step "${stepName(step)}" must declare a step-level timeout-minutes`,
     );
     assert.ok(
       bound < cap,
@@ -134,20 +148,43 @@ function assertTimeouts(steps, cap = policyJobCap()) {
   }
 }
 
-test("every policy node --test step has a step-level timeout", () => {
-  assertTimeouts(nodeTestSteps());
+test("every policy test step has a step-level timeout", () => {
+  assertTimeouts(boundedTestSteps());
 });
 
-test("the timeout guard fails when a node --test bound is removed", () => {
-  const mutated = nodeTestSteps().map((step) =>
-    step.replace(new RegExp(`\\n {8}${TIMEOUT_MINUTES}\\n`), "\n"),
-  );
-  assert.throws(() => assertTimeouts(mutated), /must declare a step-level timeout-minutes/);
-});
-
-test("the timeout guard fails when a node --test bound reaches the job cap", () => {
+// BLO-31482. Per step, not all at once. Stripping every bound in one mutation
+// passes as long as *some* step is covered, so it cannot tell a guard that sees
+// every step from one that has gone blind to a few -- the exact gap that let
+// nine steps sit unbounded under a green gate.
+test("the timeout guard fails when any single test step loses its bound", () => {
+  const steps = boundedTestSteps();
   const cap = policyJobCap();
-  const mutated = nodeTestSteps().map((step) =>
+  for (const [index, target] of steps.entries()) {
+    const name = stepName(target);
+    const stripped = target.replace(new RegExp(`\\n {8}${TIMEOUT_MINUTES}\\n`), "\n");
+    assert.notEqual(stripped, target, `"${name}" must carry a strippable bound`);
+    const mutated = steps.map((step, at) => (at === index ? stripped : step));
+    assert.throws(
+      () => assertTimeouts(mutated, cap),
+      (error) => error.message.includes(`"${name}" must declare`),
+      `dropping the bound from "${name}" must fail the guard, naming that step`,
+    );
+  }
+});
+
+test("the test-step filter sees pnpm-aliased and Python Test steps (BLO-31482)", () => {
+  const names = boundedTestSteps().map(stepName);
+  for (const name of [
+    "Test ip-address security override",
+    "Test stalled-Ally-review sweep decision logic (BLO-28203)",
+  ]) {
+    assert.ok(names.includes(name), `"${name}" must be in the bounded-step scope`);
+  }
+});
+
+test("the timeout guard fails when a test step bound reaches the job cap", () => {
+  const cap = policyJobCap();
+  const mutated = boundedTestSteps().map((step) =>
     step.replace(new RegExp(`\\n {8}${TIMEOUT_MINUTES}\\n`), `\n        timeout-minutes: ${cap}\n`),
   );
   assert.throws(() => assertTimeouts(mutated, cap), /must sit below the/);
