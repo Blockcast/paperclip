@@ -9521,7 +9521,14 @@ export function recoveryService(
       readNonEmptyString(monitor.externalRef) === latestRun.id;
   }
 
-  async function reconcileStrandedAssignedIssues(opts?: { issueCreatedAtGte?: Date | null }) {
+  async function reconcileStrandedAssignedIssues(opts?: {
+    issueCreatedAtGte?: Date | null;
+    // PEN-4381: the chain this pass belongs to, echoed onto the phase-timing
+    // line below so it joins to the chain's per-pass lines by KEY rather than
+    // by falling inside pass 1's window. Undefined for the startup pass and
+    // for tests, which belong to no chain — pino omits the field entirely.
+    recoveryChainId?: string;
+  }) {
     // PEN-3636: published on the pass's own log line below, then cleared in the
     // `finally` so nothing outside a sweep is ever timed into it. Assigned rather
     // than pushed/popped because this sweep is single-flight — `index.ts` will not
@@ -9599,6 +9606,7 @@ export function recoveryService(
       try {
         logger.info(
           {
+            recoveryChainId: opts?.recoveryChainId,
             ...passTimer.summary(),
             candidatesScanned: scanned.candidates,
             // Distinguishes a complete pass from a truncated one. Without it a
