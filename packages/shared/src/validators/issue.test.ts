@@ -12,6 +12,8 @@ import {
   PARKED_DISPOSITION_MAX_HORIZON_DAYS,
   isContradictedRestoredClaim,
   resolveIssueRecoveryActionSchema,
+  requestCheckboxConfirmationPayloadSchema,
+  requestConfirmationPayloadSchema,
   respondIssueThreadInteractionSchema,
   suggestedTaskDraftSchema,
   updateIssueSchema,
@@ -833,5 +835,111 @@ describe("isContradictedRestoredClaim (PEN-3991)", () => {
         currentIssueStatus: "blocked",
       }),
     ).toBe(false);
+  });
+});
+
+/**
+ * PEN-4409 — `expectedOutcome` is the field that makes an acceptance auditable,
+ * and it is reachable by a filing agent ONLY through these payload schemas:
+ * `packages/mcp-server/src/tools.ts` hands them to the MCP tool definitions
+ * verbatim. A field dropped by the schema is a field the agent cannot set and
+ * the database never sees, so the parse results below are the real contract.
+ */
+describe("interaction expectedOutcome (PEN-4409)", () => {
+  const basePayload = { version: 1 as const, prompt: "Merge it?" };
+
+  it("keeps a declared github_pr_merged outcome on a request_confirmation payload", () => {
+    const parsed = requestConfirmationPayloadSchema.parse({
+      ...basePayload,
+      expectedOutcome: {
+        kind: "github_pr_merged",
+        ref: { repoFullName: "Blockcast/paperclip", prNumber: 2584 },
+        note: "the merge this acceptance authorises",
+      },
+    });
+    expect(parsed.expectedOutcome).toEqual({
+      kind: "github_pr_merged",
+      ref: { repoFullName: "Blockcast/paperclip", prNumber: 2584 },
+      note: "the merge this acceptance authorises",
+    });
+  });
+
+  it("keeps a declared outcome on a request_checkbox_confirmation payload", () => {
+    const parsed = requestCheckboxConfirmationPayloadSchema.parse({
+      ...basePayload,
+      options: [{ id: "a", label: "A" }],
+      expectedOutcome: {
+        kind: "issue_status",
+        ref: { issueId: "11111111-1111-4111-8111-111111111111", status: "done" },
+      },
+    });
+    expect(parsed.expectedOutcome?.kind).toBe("issue_status");
+  });
+
+  /**
+   * The field stays optional on purpose — requiring it would break every
+   * existing caller — which is exactly why the sweep reports `untracked` as its
+   * own bucket instead of assuming absence means nothing to check.
+   */
+  it("is optional, and its absence is what the sweep reports as untracked", () => {
+    const parsed = requestConfirmationPayloadSchema.parse(basePayload);
+    expect(parsed.expectedOutcome).toBeUndefined();
+  });
+
+  /**
+   * The sweep resolves `repoFullName` with an equality predicate, so a URL or a
+   * trailing slash matches nothing and reads `unobserved` forever — a finding
+   * that is really a typo. Refusing it at the ask is the cheap place.
+   */
+  it.each([
+    "https://github.com/Blockcast/paperclip",
+    "Blockcast/paperclip/",
+    "paperclip",
+  ])("refuses a repoFullName that is not owner/repo: %s", (repoFullName) => {
+    expect(() => requestConfirmationPayloadSchema.parse({
+      ...basePayload,
+      expectedOutcome: { kind: "github_pr_merged", ref: { repoFullName, prNumber: 1 } },
+    })).toThrow();
+  });
+
+  it("refuses a non-positive or non-integer prNumber", () => {
+    for (const prNumber of [0, -1, 2584.5]) {
+      expect(() => requestConfirmationPayloadSchema.parse({
+        ...basePayload,
+        expectedOutcome: {
+          kind: "github_pr_merged",
+          ref: { repoFullName: "Blockcast/paperclip", prNumber },
+        },
+      })).toThrow();
+    }
+  });
+
+  it("refuses an issue_status reference that is not a UUID", () => {
+    expect(() => requestConfirmationPayloadSchema.parse({
+      ...basePayload,
+      expectedOutcome: { kind: "issue_status", ref: { issueId: "PEN-4409", status: "done" } },
+    })).toThrow();
+  });
+
+  it("refuses an issue_status reference naming a status that does not exist", () => {
+    expect(() => requestConfirmationPayloadSchema.parse({
+      ...basePayload,
+      expectedOutcome: {
+        kind: "issue_status",
+        ref: { issueId: "11111111-1111-4111-8111-111111111111", status: "merged" },
+      },
+    })).toThrow();
+  });
+
+  /**
+   * An unknown kind must be refused at the ask rather than stored. A stored one
+   * would be unobservable by construction and would sit in `unobserved`
+   * forever, which is the false-finding direction the bucket must stay clear of.
+   */
+  it("refuses an outcome kind this build has no observer for", () => {
+    expect(() => requestConfirmationPayloadSchema.parse({
+      ...basePayload,
+      expectedOutcome: { kind: "github_pr_approved", ref: { repoFullName: "a/b", prNumber: 1 } },
+    })).toThrow();
   });
 });

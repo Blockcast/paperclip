@@ -17,6 +17,7 @@ import type {
   AskUserQuestionsInteraction,
   CancelIssueThreadInteraction,
   CreateIssueThreadInteraction,
+  InteractionExpectedOutcome,
   IssueThreadInteraction,
   IssueThreadInteractionResult,
   RequestCheckboxConfirmationInteraction,
@@ -852,6 +853,46 @@ function buildIssueDocumentTargetFromDocument(args: {
   };
 }
 
+/**
+ * Refuse an `expectedOutcome` whose referenced object does not exist (PEN-4409).
+ *
+ * A declared outcome is only worth having if a failure to observe it means the
+ * authorised action did not happen. A typo'd `issueId` produces exactly the
+ * same reading — permanently `unobserved` — while meaning nothing at all, and a
+ * bucket that mixes real findings with dead references stops being read. The
+ * `issues` row is cheap to check here and impossible to check later, so this is
+ * the only place the distinction can be drawn.
+ *
+ * `github_pr_merged` gets shape validation in the schema and no existence check:
+ * confirming a PR exists needs a GitHub call on the ask path, and the
+ * installation deliberately keeps GitHub I/O off request paths (see
+ * `pull_request_review_state`, where exactly that call was pushed to a
+ * reconciler to keep it out of the digest transaction). The residual risk is
+ * one-directional — a wrong PR ref reads `unobserved`, never `observed` — so it
+ * costs a spurious flag, not a false clear.
+ */
+async function assertExpectedOutcomeRefResolves(db: Db | any, args: {
+  companyId: string;
+  expectedOutcome?: InteractionExpectedOutcome | null;
+}) {
+  const expectedOutcome = args.expectedOutcome;
+  if (!expectedOutcome) return;
+  if (expectedOutcome.kind !== "issue_status") return;
+  const referenced = await db
+    .select({ id: issues.id })
+    .from(issues)
+    .where(and(
+      eq(issues.id, expectedOutcome.ref.issueId),
+      eq(issues.companyId, args.companyId),
+    ))
+    .then((rows: Array<{ id: string }>) => rows[0] ?? null);
+  if (!referenced) {
+    throw unprocessable(
+      "expectedOutcome.ref.issueId must be an issue UUID in this company",
+    );
+  }
+}
+
 async function assertRequestConfirmationTargetIsCurrent(db: Db | any, args: {
   companyId: string;
   issueId: string;
@@ -1232,6 +1273,13 @@ export function issueThreadInteractionService(db: Db) {
           companyId: issue.companyId,
           issueId: issue.id,
           target: data.payload.target ?? null,
+        });
+      }
+
+      if (data.kind === "request_confirmation" || data.kind === "request_checkbox_confirmation") {
+        await assertExpectedOutcomeRefResolves(db, {
+          companyId: issue.companyId,
+          expectedOutcome: data.payload.expectedOutcome ?? null,
         });
       }
 

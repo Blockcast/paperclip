@@ -833,7 +833,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipRequestConfirmation",
-      "Create a request_confirmation interaction on an issue. NOTE: `payload.supersedeOnUserComment` DEFAULTS TO TRUE when omitted — while true, any user comment on the issue expires this ask unanswered, including an unrelated one. Pass `false` explicitly for a gate that must survive routine thread traffic, and confirm it in the response.",
+      "Create a request_confirmation interaction on an issue. NOTE: `payload.supersedeOnUserComment` DEFAULTS TO TRUE when omitted — while true, any user comment on the issue expires this ask unanswered, including an unrelated one. Pass `false` explicitly for a gate that must survive routine thread traffic, and confirm it in the response. ALSO set `payload.expectedOutcome` when accepting this ask authorises a concrete action (a PR merge, an issue reaching a status): it is the only thing that lets anything later tell an acceptance whose action happened from one whose action never did, it is never inferred from your prompt text, and without it the card is reported as `untracked`.",
       createRequestConfirmationToolSchema,
       async ({ issueId, ...body }) =>
         client.requestJson("POST", `/issues/${encodeURIComponent(issueId)}/interactions`, {
@@ -845,7 +845,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipRequestCheckboxConfirmation",
-      "Create a request_checkbox_confirmation interaction on an issue. NOTE: `payload.supersedeOnUserComment` DEFAULTS TO TRUE when omitted — while true, any user comment on the issue expires this ask unanswered, including an unrelated one. Pass `false` explicitly for a gate that must survive routine thread traffic, and confirm it in the response.",
+      "Create a request_checkbox_confirmation interaction on an issue. NOTE: `payload.supersedeOnUserComment` DEFAULTS TO TRUE when omitted — while true, any user comment on the issue expires this ask unanswered, including an unrelated one. Pass `false` explicitly for a gate that must survive routine thread traffic, and confirm it in the response. ALSO set `payload.expectedOutcome` when accepting this ask authorises a concrete action (a PR merge, an issue reaching a status): it is the only thing that lets anything later tell an acceptance whose action happened from one whose action never did, it is never inferred from your prompt text, and without it the card is reported as `untracked`.",
       createRequestCheckboxConfirmationToolSchema,
       async ({ issueId, ...body }) =>
         client.requestJson("POST", `/issues/${encodeURIComponent(issueId)}/interactions`, {

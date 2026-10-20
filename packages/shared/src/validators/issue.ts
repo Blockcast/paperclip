@@ -1129,6 +1129,72 @@ export const requestConfirmationTargetSchema = z.discriminatedUnion("type", [
   requestConfirmationCustomTargetSchema,
 ]);
 
+/**
+ * Agent-declared `expectedOutcome` (PEN-4409).
+ *
+ * The `.describe()` strings below are not decoration: these payload schemas are
+ * handed verbatim to the MCP tool definitions
+ * (`packages/mcp-server/src/tools.ts` reuses `requestConfirmationPayloadSchema`),
+ * so this text is the only place the filing agent is told the field exists or
+ * what it is for. That is the same channel `supersedeOnUserComment` uses.
+ *
+ * `repoFullName` is pattern-bound rather than a bare string. The sweep resolves
+ * it with an equality predicate against `issue_pull_requests.repo_full_name`, so
+ * a value carrying a URL prefix or a trailing slash silently matches nothing and
+ * the card reads `unobserved` forever — a finding that is really a typo. Refusing
+ * it at the ask is cheaper than explaining it in a dashboard.
+ */
+const expectedOutcomeNoteSchema = z.string().trim().min(1).max(500).nullable().optional()
+  .describe("Free-text for a human reading the sweep output. Never parsed, never matched.");
+
+export const interactionExpectedOutcomeGithubPrMergedSchema = z.object({
+  kind: z.literal("github_pr_merged"),
+  ref: z.object({
+    repoFullName: z.string().trim().min(1).max(255)
+      .regex(/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/, "repoFullName must be `owner/repo`")
+      .describe("`owner/repo`, exactly as GitHub spells it — not a URL."),
+    prNumber: z.number().int().positive()
+      .describe("Pull request number, e.g. 2584 for `owner/repo#2584`."),
+  }),
+  note: expectedOutcomeNoteSchema,
+});
+
+export const interactionExpectedOutcomeIssueStatusSchema = z.object({
+  kind: z.literal("issue_status"),
+  ref: z.object({
+    issueId: z.string().uuid()
+      .describe(
+        "Issue UUID (not a `PEN-1234` identifier). Validated to resolve inside this "
+        + "interaction's company when the ask is created, so a wrong id is refused here "
+        + "rather than reported as a finding later.",
+      ),
+    status: z.enum(ISSUE_STATUSES)
+      .describe("The status that means the authorised action happened."),
+  }),
+  note: expectedOutcomeNoteSchema,
+});
+
+export const interactionExpectedOutcomeSchema = z.discriminatedUnion("kind", [
+  interactionExpectedOutcomeGithubPrMergedSchema,
+  interactionExpectedOutcomeIssueStatusSchema,
+]);
+
+/** Shared `.describe()` text for the `expectedOutcome` field on every payload that carries it. */
+const EXPECTED_OUTCOME_DESCRIPTION =
+  "OPTIONAL, and the ONLY thing that makes an acceptance auditable. Declare here what "
+  + "accepting this ask AUTHORISES, so a sweep can tell an acceptance whose action happened "
+  + "from one whose action never did. Without it the card is reported as `untracked`: it "
+  + "records that a decision was made and nothing anywhere records whether the authorised "
+  + "action followed. Measured instance (PEN-4409) — interaction `f2a8595c` authorised "
+  + "merging a PR, then sat `accepted` and silent for 26h45m across 28 unrelated merges "
+  + "while the PR stayed open; no gate was blocking it, the merge simply never happened and "
+  + "nothing noticed. THIS IS NEVER INFERRED FROM YOUR PROSE, and deliberately so: that same "
+  + "card's text named ten different PR numbers, SHAs and issue keys, and the correct one was "
+  + "neither the first nor the most frequent. You are the only party that knows which object "
+  + "you are asking about, so name it here or it is not tracked. Declare the outcome you "
+  + "actually need — `github_pr_merged` for a merge, `issue_status` for a row reaching a "
+  + "status — not merely the nearest thing you have an id for.";
+
 export const requestConfirmationToolActionPayloadSchema = z.object({
   version: z.literal(1),
   actionRequestId: z.string().uuid(),
@@ -1168,6 +1234,8 @@ export const requestConfirmationPayloadSchema = z.object({
     .optional(),
   target: requestConfirmationTargetSchema.nullable().optional(),
   toolAction: requestConfirmationToolActionPayloadSchema.optional(),
+  expectedOutcome: interactionExpectedOutcomeSchema.nullable().optional()
+    .describe(EXPECTED_OUTCOME_DESCRIPTION),
 });
 
 export const requestCheckboxConfirmationOptionSchema = z.object({
@@ -1207,6 +1275,8 @@ export const requestCheckboxConfirmationPayloadSchema = z.object({
     )
     .optional(),
   target: requestConfirmationTargetSchema.nullable().optional(),
+  expectedOutcome: interactionExpectedOutcomeSchema.nullable().optional()
+    .describe(EXPECTED_OUTCOME_DESCRIPTION),
 }).superRefine((value, ctx) => {
   const optionIds = new Set<string>();
   for (const [index, option] of value.options.entries()) {

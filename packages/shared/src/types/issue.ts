@@ -1176,6 +1176,109 @@ export interface AskUserQuestionsResult {
   summaryMarkdown?: string | null;
 }
 
+/**
+ * What an acceptance AUTHORISES, declared by the agent that files the ask
+ * (PEN-4409).
+ *
+ * ## The gap this closes
+ *
+ * An accepted interaction records that a decision was *made* and nothing
+ * anywhere records whether the action it authorised actually *happened*. The
+ * measured instance is interaction `f2a8595c`: `status: accepted`, resolved
+ * 2026-10-19T07:01:42Z, authorising the merge of `Blockcast/paperclip#2584`.
+ * 26h45m and 28 unrelated merges later the PR was still open, the card still
+ * read `accepted`, and the card had emitted nothing. Its whole payload was
+ * `{version, prompt, acceptLabel, …}` — not one field naming the PR. So an
+ * accepted decision whose action never happened is byte-identical to one whose
+ * action did, and nothing can query the difference.
+ *
+ * ## Why this is DECLARED and never extracted from prose
+ *
+ * The obvious cheaper design — scan `prompt` / `detailsMarkdown` for a PR
+ * number, a SHA, an issue key — is a decoy, and shipping it would be worse than
+ * shipping nothing. `f2a8595c`'s prose names `#2584`, `#2569`, `3ecdf1dd`,
+ * `8b14f0e6`, `PEN-4318`, `PEN-4284`, `ci.yml:578`, `:1380`, `27.7%` and
+ * `02:30–03:30Z`. An extractor picks one. The correct answer (`#2584`) is not
+ * the first, not the most frequent, and not distinguishable by shape from
+ * `#2569` — the PR the DECLINE path would have acted on. When the extractor
+ * picks wrong the sweep reports a *tracked* card observing the wrong object and
+ * calls it green while the authorised action never happened. A false clear is
+ * strictly worse than today's honest silence: silence does not claim to have
+ * checked.
+ *
+ * The agent that writes the ask is the only party that knows what it is asking
+ * for. Nobody downstream can recover that from prose.
+ *
+ * ## Why the `kind` set is small, and why it stays small
+ *
+ * Every admitted `kind` MUST have a durable in-process observer, or the field
+ * manufactures the opposite failure: a card declaring an outcome nothing can
+ * ever observe sits in `unobserved` forever and trains readers to ignore the
+ * bucket. Both kinds below resolve against a table this process already holds,
+ * needing no new credential and no new workload — the same argument that keeps
+ * the approval-queue gauges in the app rather than in a sidecar exporter.
+ *
+ * `github_pr_approved` is DELIBERATELY ABSENT. The only approval state the
+ * installation persists is `pull_request_review_state`, which covers **open**
+ * PRs and is pruned once a PR leaves the open set. An approval observed before
+ * the merge would become unobservable after it, so the card would flip back
+ * from `observed` to `unobserved` permanently — a false alarm that never
+ * clears. Add it when an approval record outlives the PR's open state, not
+ * before.
+ *
+ * Adding a kind is therefore a two-part change: the variant here AND its
+ * observer in `accepted-interaction-outcome-sweep.ts`. A kind with no observer
+ * is classified `unobserved` (never `observed`), so forgetting the second half
+ * fails toward the alarm, not toward the clear.
+ */
+export interface InteractionExpectedOutcomeGithubPrMerged {
+  kind: "github_pr_merged";
+  /**
+   * Observed against `issue_pull_requests`, which is webhook-fed on merge and
+   * backfilled by the merged-PR reconciler.
+   *
+   * ABSENCE OF A ROW IS NOT EVIDENCE OF NON-MERGE — it is absence of a record,
+   * and the reconciler only discovers a repo once it has at least one
+   * forward-captured PR. That ambiguity is resolved toward `unobserved`, never
+   * toward `observed`, so an unrecorded merge costs a spurious flag rather than
+   * a false clear. This is the inverse of the `requestsReadable` trap in
+   * `pull_request_review_state`, where an unreadable probe rendered as an empty
+   * section and read to a human as "nothing is waiting".
+   */
+  ref: {
+    /** `owner/repo`, exactly as GitHub spells it. */
+    repoFullName: string;
+    prNumber: number;
+  };
+  /** Free-text for a human reading the sweep output. Never parsed. */
+  note?: string | null;
+}
+
+export interface InteractionExpectedOutcomeIssueStatus {
+  kind: "issue_status";
+  /**
+   * Observed against `issues.status` in the interaction's own company.
+   *
+   * `issueId` is validated to resolve at creation time, so a typo is refused at
+   * the ask rather than sitting in `unobserved` forever pretending to be a
+   * finding.
+   */
+  ref: {
+    /** Issue UUID. */
+    issueId: string;
+    /** The status that means the authorised action happened. */
+    status: IssueStatus;
+  };
+  /** Free-text for a human reading the sweep output. Never parsed. */
+  note?: string | null;
+}
+
+export type InteractionExpectedOutcome =
+  | InteractionExpectedOutcomeGithubPrMerged
+  | InteractionExpectedOutcomeIssueStatus;
+
+export type InteractionExpectedOutcomeKind = InteractionExpectedOutcome["kind"];
+
 export interface RequestConfirmationIssueDocumentTarget {
   type: "issue_document";
   issueId?: string | null;
@@ -1250,6 +1353,13 @@ export interface RequestConfirmationPayload {
   supersedeOnUserComment?: boolean;
   target?: RequestConfirmationTarget | null;
   toolAction?: RequestConfirmationToolActionPayload;
+  /**
+   * What accepting this ask AUTHORISES, so a sweep can tell an acceptance whose
+   * action happened from one whose action never did (PEN-4409). Optional, and
+   * NEVER inferred from `prompt` / `detailsMarkdown` — see
+   * {@link InteractionExpectedOutcome}.
+   */
+  expectedOutcome?: InteractionExpectedOutcome | null;
 }
 
 export interface RequestCheckboxConfirmationOption {
@@ -1274,6 +1384,13 @@ export interface RequestCheckboxConfirmationPayload {
   declineReasonPlaceholder?: string | null;
   supersedeOnUserComment?: boolean;
   target?: RequestConfirmationTarget | null;
+  /**
+   * What accepting this ask AUTHORISES, so a sweep can tell an acceptance whose
+   * action happened from one whose action never did (PEN-4409). Optional, and
+   * NEVER inferred from `prompt` / `detailsMarkdown` — see
+   * {@link InteractionExpectedOutcome}.
+   */
+  expectedOutcome?: InteractionExpectedOutcome | null;
 }
 
 export type RequestItemVerdictValue = "approve" | "reject" | "defer";
