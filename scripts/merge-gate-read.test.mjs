@@ -92,6 +92,16 @@ function pending(runs) {
   return out.split("\n").filter(Boolean);
 }
 
+/** BLO-47984: the approval-gated-lanes check over run rows at `head`. */
+function gated(runs, head, isGated) {
+  const stdin = runs.map((r) => r.join("\t")).join("\n") + "\n";
+  const out = execFileSync("bash", [READER, "--gated", head, isGated ? "1" : ""], {
+    input: stdin,
+    encoding: "utf8",
+  });
+  return out.split("\n").filter(Boolean);
+}
+
 /** Validate a candidate head sha. Returns { rc, out }. */
 function shaGuard(sha) {
   try {
@@ -1441,7 +1451,7 @@ describe("merge-gate reader", () => {
         ]),
         [
           "323092531\tpull_request_target\t35408039808\tsuccess\t2026-09-19T00:04:04Z\t" +
-            "completed\treview-gate\t2026-09-19T00:05:37Z",
+            "completed\treview-gate\t2026-09-19T00:05:37Z\t",
         ],
       );
     });
@@ -1471,7 +1481,7 @@ describe("merge-gate reader", () => {
         "",
         "2026-09-29T11:45:33Z",
       ]);
-      assert.deepEqual(row.slice(5), ["pending", "Go Unit Tests", "2026-09-29T11:46:00Z"]);
+      assert.deepEqual(row.slice(5), ["pending", "Go Unit Tests", "2026-09-29T11:46:00Z", ""]);
     });
 
     // Composed across the seam: @tsv renders a null as the empty string, and
@@ -1503,7 +1513,7 @@ describe("merge-gate reader", () => {
           updated_at: "2026-09-19T01:10:00Z",
         },
       ]);
-      assert.equal(rows[0], "10\tpush\t100\tcancelled\t\tcompleted\tci\t2026-09-19T01:06:00Z");
+      assert.equal(rows[0], "10\tpush\t100\tcancelled\t\tcompleted\tci\t2026-09-19T01:06:00Z\t");
       assert.equal(dead(rows.map((r) => r.split("\t"))), "");
     });
   });
@@ -1713,7 +1723,7 @@ describe("merge-gate reader", () => {
       // edit to this list and never a silent widening of the exemption. The
       // `/actions/runs/` entry must keep its trailing slash: `/actions/runs?`
       // is the LIST fetch and exempting it would un-paginate the run surface.
-      const SINGLE_OBJECT = ["/commits/$2", "/actions/runs/$rid"];
+      const SINGLE_OBJECT = ["/commits/$2", "/actions/runs/$rid", "/contents/"];
       const isSingle = (l) => SINGLE_OBJECT.some((p) => l.includes(p));
       const singles = SOURCE.split("\n").filter((l) => l.includes('gh api "repos/') && isSingle(l));
       assert.equal(singles.length, SINGLE_OBJECT.length, `single-object lookup lost or doubled?`);
@@ -1832,5 +1842,52 @@ describe("merge-gate reader", () => {
       assert.ok(firstUse > guarded, `a fetch at line ${firstUse} uses $H before the guard`);
     });
   });
-});
 
+  // BLO-47984. onprem-k8s#6335 @ c12e2fbc merged with ZERO dispatched CI runs and
+  // the reader printed nothing: the review machinery's check-runs kept the
+  // ABSENT guard quiet. Run rows below are the shapes measured at both heads.
+  describe("approval-gated CI lanes", () => {
+    const H6335 = "c12e2fbc3858b83c1746b038f9040e6106c04c7d";
+    const H6319 = "5d11d645d9621c2396c5bd0624099798df2ece70";
+    const review = (h, n) => [
+      "1", "pull_request_target", "901", "success", "2026-10-20T19:58:00Z", "completed",
+      "review-gate", "2026-10-20T19:59:00Z",
+      `review-gate ordered-v4 pull_request_target Blockcast/onprem-k8s master ${n} ${h}`,
+    ];
+    const dispatched = (h, n, id) => [
+      "2", "workflow_dispatch", String(id), "success", "2026-10-20T19:00:00Z", "completed",
+      `CI PR #${n} @${h}`, "2026-10-20T19:05:00Z", `CI PR #${n} @${h}`,
+    ];
+
+    it("stops on a gated repo when no CI PR run was dispatched at the head (#6335)", () => {
+      assert.deepEqual(gated([review(H6335, 6335)], H6335, true), [
+        "STOP\t<approval-gated CI lanes: no dispatched CI PR run at this head>\tABSENT\trun=-",
+      ]);
+    });
+
+    it("adds no line when the dispatched CI PR runs exist at the head (#6319)", () => {
+      const runs = [review(H6319, 6319), dispatched(H6319, 6319, 11), dispatched(H6319, 6319, 12)];
+      assert.deepEqual(gated(runs, H6319, true), []);
+    });
+
+    it("is inert on a repo without dispatch-approved-pr-ci.yml", () => {
+      assert.deepEqual(gated([review(H6335, 6335)], H6335, false), []);
+    });
+
+    // The title must name THIS head in full: a dispatch for another head, or a
+    // review-gate workflow_dispatch run, is not the CI lanes.
+    it("does not accept a dispatched run for a different head or a non-CI title", () => {
+      const other = dispatched(H6319, 6319, 13);
+      const worker = ["3", "workflow_dispatch", "14", "success", "", "completed", "review-gate",
+        "", `review-gate worker-v1 workflow_dispatch Blockcast/onprem-k8s master 6335 ${H6335}`];
+      assert.equal(stops(gated([other, worker], H6335, true)).length, 1);
+    });
+
+    // The probe needs `gh`, so pin the live wiring on the source, as the
+    // require_sha check does: a deleted call would leave every fixture green.
+    it("wires the probe and the guard into the live path", () => {
+      assert.match(SOURCE, /contents\/\.github\/workflows\/dispatch-approved-pr-ci\.yml/);
+      assert.match(SOURCE, /^printf '%s\\n' "\$RUNS" \| gated_lanes "\$H" "\$GATED"$/m);
+    });
+  });
+});
