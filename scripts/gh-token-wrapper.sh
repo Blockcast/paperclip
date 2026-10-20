@@ -72,16 +72,25 @@ exec_real_gh() {
 strip_ai_trailers() {
   awk '
     { l = tolower($0) }
-    l ~ /^[ \t]*#+[ \t]/ { skip = (l ~ /^[ \t]*#+[ \t]*model used/) }
+    l ~ /^[ \t]*(```|~~~)/ { fence = !fence }
+    !fence && l ~ /^[ \t]*#+[ \t]/ {
+      match(l, /#+/)
+      if (skip && RLENGTH <= level) skip = 0
+      if (!skip && l ~ /^[ \t]*#+[ \t]*model used/) { skip = 1; level = RLENGTH }
+    }
     skip { next }
     l ~ /^[ \t]*co-authored-by:/ || l ~ /^[^a-z0-9]*(generated with|model used)/ { next }
     { print }
   '
 }
 
+# Attribution shapes only: a bare "model used" or "generated with" also appears
+# in the PR template's checklist and in codegen prose, and refusing on those
+# refused every templated PR.
+AI_ATTRIBUTION_RE='co-authored-by:|noreply@anthropic\.com|noreply@paperclip\.ing|generated with \[?claude|^[-*_> \t]*model used'
 refuse_if_ai_attribution_left() {
-  if grep -qiE 'co-authored-by|generated with|model used|noreply@anthropic\.com|noreply@paperclip\.ing' "$1"; then
-    grep -niE 'co-authored-by|generated with|model used|noreply@anthropic\.com|noreply@paperclip\.ing' "$1" >&2 || true
+  if grep -qiE "${AI_ATTRIBUTION_RE}" "$1"; then
+    grep -niE "${AI_ATTRIBUTION_RE}" "$1" >&2 || true
     rm -f "$1"
     echo "gh-token-wrapper: refusing the squash merge: the message above still carries AI attribution after scrubbing (BLO-47692); pass a --body-file without it" >&2
     exit 1
@@ -92,11 +101,14 @@ refuse_if_ai_attribution_left() {
 # merge mutations) gets GitHub's default squash message, trailers included,
 # and never reaches the scrub above. Refuse it; `gh pr merge` does the same job.
 # ponytail: a GraphQL query passed as `query=@file` is not opened, only argv is read.
+# `enqueuePullRequest` is deliberately allowed: paperclip lands through its
+# rebase merge queue (AC3), which keeps the branch commits and is gated by
+# check-pr-commit-trailers.mjs instead.
 refuse_api_merge() {
   put=no merge=no prev=""
   for a in "$@"; do
-    case "${prev} ${a}" in
-      "-X PUT" | "-X put" | "--method PUT" | "--method put" | *" -XPUT" | *" -Xput" | *" --method=PUT" | *" --method=put") put=yes ;;
+    case "$(printf '%s %s' "${prev}" "${a}" | tr '[:upper:]' '[:lower:]')" in
+      "-x put" | "--method put" | *" -xput" | *" -x=put" | *" --method=put") put=yes ;;
     esac
     case "${a}" in
       *pulls/*/merge | *pulls/*/merge\?*) merge=yes ;;
