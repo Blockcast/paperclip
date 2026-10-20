@@ -21,7 +21,13 @@ permissions:
 jobs:
   build-and-push:
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
-    runs-on: arc-dind
+    # BLO-33389: pinned to org group `default` (prod cluster). The `arc-dind`
+    # label is also served by the tools-cluster twin in `default-tools`
+    # (onprem-k8s#6299), where `buildkit-amd64*.ci.svc.cluster.local` does not
+    # resolve; run 39420733721 failed there in "Select BuildKit endpoint".
+    runs-on:
+      group: default
+      labels: arc-dind
     # BLO-47194. Derived from the slowest run that still made progress, not
     # from a cold toolchain: over 2026-10-15T12Z..10-17T11Z every toolchain
     # rebuild (4, each triggered by a new ffmpeg-publisher:stable digest) took
