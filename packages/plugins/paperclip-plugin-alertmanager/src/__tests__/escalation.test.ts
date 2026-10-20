@@ -564,6 +564,47 @@ describe("alert escalation", () => {
       expect(mocks.issues.relations.get).not.toHaveBeenCalled();
     });
 
+    // PEN-4337 follow-up — a deferral MUST leave a trace naming which
+    // mechanism held the rung.
+    //
+    // Without it the guard is unobservable on live traffic: it writes only
+    // `nextEscalationAt` into plugin state (which has no read API), emits no
+    // metric, and posts no comment, so its entire external signature is a
+    // cover row that fails to appear. A ladder that was already spent looks
+    // identical. Confirming this fix in production is exactly the problem of
+    // telling those two apart, and that is what these assert.
+    it("logs the deferral and names the armed monitor", async () => {
+      const { ctx, mocks } = sweepContext(due, "cto", buildFakeAlertmanagerStore(), "2026-07-11T09:00:00.000Z");
+      await runAlertEscalationSweep(ctx, config(), NOW);
+      expect(mocks.logger.info).toHaveBeenCalledWith(expect.stringContaining("deferred rung for BLO-1"));
+      expect(mocks.logger.info).toHaveBeenCalledWith(expect.stringContaining("armed monitor"));
+      expect(mocks.logger.info).not.toHaveBeenCalledWith(expect.stringContaining("unresolved blocker"));
+    });
+
+    it("logs the deferral and names the unresolved blocker when that is what attends the row", async () => {
+      const { ctx, mocks } = sweepContext(due, "cto", buildFakeAlertmanagerStore(), null);
+      mocks.issues.relations.get = vi.fn(async () => ({ blockedBy: [{ id: "blocker-1", status: "in_progress" }], blocks: [] }));
+      await runAlertEscalationSweep(ctx, config(), NOW);
+      expect(mocks.logger.info).toHaveBeenCalledWith(expect.stringContaining("deferred rung for BLO-1"));
+      expect(mocks.logger.info).toHaveBeenCalledWith(expect.stringContaining("unresolved blocker"));
+      expect(mocks.logger.info).not.toHaveBeenCalledWith(expect.stringContaining("armed monitor"));
+    });
+
+    // The deferral log must not claim a deferral that never landed: losing the
+    // CAS means a webhook re-fired the alert under the sweep, and a confident
+    // "deferred" line there would be the same false signal in a new place.
+    it("does not claim a deferral when the state swap is lost", async () => {
+      const { ctx, mocks } = sweepContext(due, "cto", buildFakeAlertmanagerStore(), "2026-07-11T09:00:00.000Z");
+      mocks.state.set = vi.fn(async () => {
+        throw Object.assign(new Error("Plugin state changed since it was read; refusing the write"), {
+          data: { code: PLUGIN_STATE_PRECONDITION_FAILED_CODE },
+        });
+      });
+      await runAlertEscalationSweep(ctx, config(), NOW);
+      expect(mocks.logger.info).toHaveBeenCalledWith(expect.stringContaining("abandoned deferral for BLO-1"));
+      expect(mocks.logger.info).not.toHaveBeenCalledWith(expect.stringContaining("deferred rung for"));
+    });
+
     it("reads the stamp directly, for both wire shapes", () => {
       const now = new Date("2026-07-11T01:00:00Z");
       expect(hasArmedMonitor({ monitorNextCheckAt: new Date("2026-07-11T02:00:00Z") }, now)).toBe(true);

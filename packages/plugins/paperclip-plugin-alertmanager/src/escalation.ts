@@ -844,8 +844,31 @@ async function advanceIssueLadder(
   // Both are deferrals rather than permanent skips, which is what keeps a
   // genuinely abandoned row reachable: neither mechanism is a promise that the
   // work happens, only that a wake exists, so the ladder has to re-ask.
-  if (hasArmedMonitor(issue, now) || await hasLiveBlocker(ctx, issue.id, companyId)) {
-    await casAlertState(ctx, ref, state, { ...state, nextEscalationAt: new Date(now.getTime() + rungIntervalMs(state, config)).toISOString() });
+  //
+  // The two are evaluated into named locals rather than inlined into the `||`
+  // so the deferral can say WHICH mechanism held the rung. The short-circuit is
+  // preserved deliberately: `hasLiveBlocker` is an RPC and is still not called
+  // when the monitor is armed.
+  //
+  // PEN-4337 follow-up — this branch has to log. A deferral writes only
+  // `nextEscalationAt` into plugin state, which has no read API, emits no
+  // metric, and posts no comment; its sole external trace was the ABSENCE of a
+  // cover row. That is indistinguishable from a ladder that was already spent,
+  // so "the guard is working" could not be told apart from "the guard never
+  // ran" on live traffic — the gap that left this fix unverifiable in
+  // production after it shipped.
+  const monitorArmed = hasArmedMonitor(issue, now);
+  const blockerLive = monitorArmed ? false : await hasLiveBlocker(ctx, issue.id, companyId);
+  if (monitorArmed || blockerLive) {
+    const deferredTo = new Date(now.getTime() + rungIntervalMs(state, config)).toISOString();
+    const deferred = await casAlertState(ctx, ref, state, { ...state, nextEscalationAt: deferredTo });
+    if (!deferred) {
+      ctx.logger.info(`alert-escalation: abandoned deferral for ${issue.identifier ?? issue.id}; alert state changed under the sweep`);
+      return;
+    }
+    ctx.logger.info(
+      `alert-escalation: deferred rung for ${issue.identifier ?? issue.id}; attended by ${monitorArmed ? "armed monitor" : "unresolved blocker"}; next attempt ${deferredTo}`,
+    );
     return;
   }
 
