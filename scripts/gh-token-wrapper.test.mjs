@@ -845,7 +845,7 @@ prev=""
 for a; do [ "$prev" = --body-file ] && { echo "BODY<<"; cat "$a"; echo ">>BODY"; }; prev="$a"; done
 `;
 
-function runMerge(dir, args, { input } = {}) {
+function runMerge(dir, args, { input, prBody = PR_BODY, status = 0 } = {}) {
   const stub = path.join(dir, "gh.real");
   writeFileSync(stub, MERGE_STUB_GH);
   chmodSync(stub, 0o755);
@@ -854,11 +854,11 @@ function runMerge(dir, args, { input } = {}) {
   const env = sanitizedEnv({
     GH_TOKEN_WRAPPER_REAL_GH: stub,
     PAPERCLIP_GITHUB_TOKEN_FILE: tokenFile,
-    PR_BODY,
+    PR_BODY: prBody,
     TMPDIR: dir,
   });
   const proc = spawnSync("sh", [WRAPPER, ...args], { env, encoding: "utf8", input });
-  assert.equal(proc.status, 0, proc.stderr);
+  assert.equal(proc.status, status, proc.stderr);
   const body = /BODY<<\n([\s\S]*?)>>BODY/.exec(proc.stdout)?.[1] ?? null;
   return { proc, args: /^ARGS=(.*)$/m.exec(proc.stdout)?.[1], body };
 }
@@ -907,6 +907,77 @@ test("squash merge scrubs a caller-supplied --body-file, including stdin (BLO-47
     const fromStdin = runMerge(dir, ["pr", "merge", "--squash", "-F", "-"], { input: PR_BODY });
     assertClean(fromStdin.body);
     assert.match(fromStdin.body, /^values-ack: chart-1\.2$/m);
+  });
+});
+
+// The PR template's required `## Model used` section, and the one-line forms,
+// reached main through a squash body (hang-mmt-fec d93d2bba, moqtail-private
+// f4e2b747).
+const TEMPLATED_BODY = [
+  "## Summary",
+  "Fix the thing.",
+  "",
+  "## Model used",
+  "Claude Opus 5.5",
+  "",
+  "## Test plan",
+  "- unit tests",
+  "Model used: Claude Opus 5.5.",
+  "**Model used:** Claude Opus 5.5",
+  "values-ack: chart-1.2",
+].join("\n");
+
+test("squash merge drops a `## Model used` section and `Model used:` lines (BLO-47692)", () => {
+  withTempDir((dir) => {
+    const { body } = runMerge(dir, ["pr", "merge", "826", "--squash"], { prBody: TEMPLATED_BODY });
+    assert.ok(body !== null);
+    assert.doesNotMatch(body, /model used|claude opus/i);
+    assert.match(body, /^## Summary\nFix the thing\.$/m);
+    assert.match(body, /^## Test plan\n- unit tests$/m, "the section after `## Model used` must survive");
+    assert.match(body, /^values-ack: chart-1\.2$/m);
+  });
+});
+
+for (const [label, leftover] of [
+  ["a bulleted trailer", "- Co-authored-by: Paperclip <noreply@paperclip.ing>"],
+  ["an anthropic noreply address in prose", "Thanks claude <noreply@anthropic.com> for this"],
+  ["an inline Generated-with mention", "This was (Generated with Claude Code)"],
+]) {
+  test(`squash merge is refused when ${label} survives the scrub (BLO-47692)`, () => {
+    withTempDir((dir) => {
+      const { proc, args } = runMerge(dir, ["pr", "merge", "-s"], { prBody: `Fix.\n${leftover}`, status: 1 });
+      assert.equal(args, undefined, "the real merge must not run");
+      assert.match(proc.stderr, /refusing the squash merge/);
+    });
+  });
+}
+
+test("a `-ds` short-flag cluster is treated as a squash (BLO-47692)", () => {
+  withTempDir((dir) => {
+    const { body } = runMerge(dir, ["pr", "merge", "7", "-ds"]);
+    assertClean(body);
+  });
+});
+
+for (const args of [
+  ["api", "-X", "PUT", "repos/Blockcast/moqtail-private/pulls/563/merge", "-f", "merge_method=squash"],
+  ["api", "--method=PUT", "/repos/o/r/pulls/5/merge"],
+  ["api", "graphql", "-f", "query=mutation{mergePullRequest(input:{pullRequestId:\"x\",mergeMethod:SQUASH}){clientMutationId}}"],
+  ["api", "graphql", "-f", "query=mutation{enablePullRequestAutoMerge(input:{pullRequestId:\"x\"}){clientMutationId}}"],
+]) {
+  test(`\`gh ${args.join(" ").slice(0, 70)}\` is refused (BLO-47692)`, () => {
+    withTempDir((dir) => {
+      const { proc, args: ran } = runMerge(dir, args, { status: 1 });
+      assert.equal(ran, undefined, "the real gh must not run");
+      assert.match(proc.stderr, /refusing a pull-request merge through `gh api`/);
+    });
+  });
+}
+
+test("read-only gh api calls on the merge endpoint still pass through (BLO-47692)", () => {
+  withTempDir((dir) => {
+    assert.equal(runMerge(dir, ["api", "repos/o/r/pulls/5/merge"]).args, "api repos/o/r/pulls/5/merge");
+    assert.equal(runMerge(dir, ["api", "-X", "PUT", "repos/o/r/pulls/5/update-branch"]).args, "api -X PUT repos/o/r/pulls/5/update-branch");
   });
 });
 
