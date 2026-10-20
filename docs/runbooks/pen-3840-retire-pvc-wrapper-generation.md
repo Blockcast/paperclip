@@ -108,12 +108,17 @@ All four must be true. Measure them; do not assume.
    mtime *older than* the current `paperclip-0` start time — that is what
    proves the live pod did not rewrite them and they will not come back.
 
+   Stat **all five**, not just `gh`. The seed wrote them as one block, but a
+   partial re-seed is exactly the state this precondition exists to catch, and
+   checking one file cannot distinguish it. The *newest* of the five is the one
+   that has to predate the pod.
+
    ```console
-   $ stat -c '%y %n' /paperclip/.local/bin/gh
+   $ stat -c '%y %n' /paperclip/.local/bin/{gh,git,github-mcp-server,github-token-credential-helper,paperclip-github-token-env}
    $ kubectl -n paperclip get pod paperclip-0 -o jsonpath='{.status.startTime}{"\n"}'
    ```
 
-   Verified 2026-10-19: files at `2026-10-19T00:29:49Z`, pod started ~08:22Z.
+   Verified 2026-10-19: all five at `2026-10-19T00:29:49Z`, pod started ~08:22Z.
 
 2. **Every live agent image carries the image wrapper directory.** The delete is
    only safe because `gh` falls through to `/usr/local/libexec/paperclip/bin`.
@@ -143,6 +148,13 @@ All four must be true. Measure them; do not assume.
    ```
 
    Expect `scoped` for every row. Any `broad:*` row names a Job to wait out.
+
+   > **This is a point-in-time read.** It only sees Jobs that exist now —
+   > completed Jobs are TTL-reaped out of it, and a new Job can be admitted a
+   > second after it returns. That is the right population for *"is anything
+   > running broad right now"*, which is the question that matters, but it means
+   > the check has to be taken **immediately before the `rm`**, not hours earlier
+   > as part of a planning pass. Re-run it if you step away.
 
 4. **Resolution already prefers the image copy.** From a live agent pod, under
    `bash -c` specifically — the top-level tool shell is not the exposed one:
