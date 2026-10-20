@@ -980,9 +980,12 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
   // job coordinator (it only syncs job declarations), plugin worker processes,
   // and manual `triggerJob` from the API.
   const shouldRunWorkerSingletons = opts.shouldRunWorkerSingletons ?? (() => true);
+  /** BLO-47803: raised while a lease-takeover resync has plugins unloaded. */
+  let pluginResyncInFlight = false;
   const stopPluginJobScheduler = superviseWorkerSingleton(
     "plugin-job-scheduler",
-    shouldRunWorkerSingletons,
+    // BLO-47803: not against a half-reloaded plugin set during a takeover resync.
+    () => shouldRunWorkerSingletons() && !pluginResyncInFlight,
     () => {
       scheduler.start();
       return () => scheduler.stop();
@@ -1148,9 +1151,14 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
   // in server/src/index.ts so plugin lifecycle only runs on the tier that
   // can host workers.
   let stopPluginEventOutbox: (() => void) | null = null;
-  /** BLO-47803: plugin state as of this process's last full load; null until boot loadAll finishes. */
+  /**
+   * BLO-47803: plugin state as of this process's last full load. Null until the
+   * boot load settles; PLUGIN_RELOAD_REQUIRED after a load that threw, so the
+   * next takeover retries it rather than resync staying disabled.
+   */
   let loadedPluginFingerprint: string | null = null;
-  let pluginResyncInFlight = false;
+  /** Plugin keys by id as of that load, to unload a plugin whose row is gone since. */
+  let loadedPluginKeys = new Map<string, string>();
   let appWorkerSingletonsStopped = false;
   let stopGitHubStatusDeliveryOutbox: (() => void) | null = null;
   let stopPluginStatusCollector: (() => void) | null = null;
@@ -1197,7 +1205,14 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
     void ensureBundledKubernetesPlugin()
       .then(() => retireLegacyCcrotatePlugin())
       .then(() => retireIncompatiblePluginUpdater())
-      .then(() => loader.loadAll())
+      .then(async () => {
+        // Snapshot BEFORE the load, for the reason given in the resync below.
+        const snapshot = await pluginStateSnapshot(db);
+        const result = await loader.loadAll();
+        loadedPluginFingerprint = snapshot.fingerprint;
+        loadedPluginKeys = snapshot.keys;
+        return result;
+      })
       .then((result) => {
         if (result) {
           for (const loaded of result.results) {
@@ -1220,11 +1235,9 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
           );
         }
       })
-      .then(async () => {
-        loadedPluginFingerprint = await pluginStateFingerprint(db);
-      })
       .catch((err) => {
-        logger.error({ err }, "Failed to load ready plugins on startup");
+        loadedPluginFingerprint = PLUGIN_RELOAD_REQUIRED;
+        logger.error({ err }, "Failed to load ready plugins on startup; a lease takeover will reload them");
       });
   }
   // BLO-46711: the lease-gated singletons, stopped as a unit so the server's
@@ -1253,17 +1266,32 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
     // rare and a full reload is the same path boot takes; diff per plugin if a
     // takeover-time worker restart ever becomes the cost that matters.
     try {
-      const current = await pluginStateFingerprint(db);
-      if (current === loadedPluginFingerprint) return;
-      logger.info("plugin state changed since this process loaded it; reloading plugins on lease takeover");
-      const rows = await db.select({ id: plugins.id, pluginKey: plugins.pluginKey }).from(plugins);
-      for (const row of rows) {
-        if (workerManager.isRunning(row.id)) await loader.unloadSingle(row.id, row.pluginKey);
-      }
-      // Fingerprint BEFORE the load: a change racing the load then re-triggers
+      // Snapshot BEFORE the load: a change racing the load then re-triggers
       // the next takeover, instead of being recorded as already applied.
-      loadedPluginFingerprint = await pluginStateFingerprint(db);
+      const snapshot = await pluginStateSnapshot(db);
+      if (snapshot.fingerprint === loadedPluginFingerprint) return;
+      logger.info("plugin state changed since this process loaded it; reloading plugins on lease takeover");
+      // Unload what is in MEMORY, not just what the DB lists: a plugin hard-
+      // deleted on the old holder has no row but may still have a worker,
+      // subscriptions and tools here, and a crashed/starting handle that is not
+      // `isRunning` would make loadAll's startWorker throw "already registered".
+      const keyById = new Map([...loadedPluginKeys, ...snapshot.keys]);
+      const ids = new Set([
+        ...keyById.keys(),
+        ...workerManager.diagnostics().map((d) => d.pluginId),
+      ]);
+      for (const id of ids) {
+        const key = keyById.get(id);
+        try {
+          if (key) await loader.unloadSingle(id, key);
+          else if (workerManager.getWorker(id)) await workerManager.stopWorker(id);
+        } catch (err) {
+          logger.warn({ err, pluginId: id }, "plugin takeover resync: unload failed; continuing");
+        }
+      }
       await loader.loadAll();
+      loadedPluginFingerprint = snapshot.fingerprint;
+      loadedPluginKeys = snapshot.keys;
     } finally {
       pluginResyncInFlight = false;
     }
@@ -1298,10 +1326,21 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
   return app;
 }
 
+/** BLO-47803. Never equals a real fingerprint, so the next takeover reloads. */
+const PLUGIN_RELOAD_REQUIRED = "reload-required";
+
 /**
- * BLO-47803. Changes whenever a plugin row or a plugin config row is added,
- * removed or updated; every lifecycle write bumps `updated_at`.
+ * BLO-47803. The fingerprint changes whenever a plugin row or a plugin config
+ * row is added, removed or updated; every lifecycle write bumps `updated_at`.
  */
+async function pluginStateSnapshot(db: Db): Promise<{ fingerprint: string; keys: Map<string, string> }> {
+  const rows = await db.select({ id: plugins.id, pluginKey: plugins.pluginKey }).from(plugins);
+  return {
+    fingerprint: await pluginStateFingerprint(db),
+    keys: new Map(rows.map((row) => [row.id, row.pluginKey])),
+  };
+}
+
 async function pluginStateFingerprint(db: Db): Promise<string> {
   const result = await db.execute(sql`
     select

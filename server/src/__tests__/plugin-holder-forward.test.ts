@@ -53,6 +53,84 @@ describe("scheduler lease holder address (BLO-47803)", () => {
 });
 
 /**
+ * A crashed holder keeps its lease row until the TTL lapses. Through that
+ * window a follower must serve plugin calls itself, not fail them all; but
+ * only when the request provably never reached the holder, or a POST (a
+ * webhook delivery) could execute twice.
+ */
+describe("plugin holder forward when the holder is unreachable (BLO-47803)", () => {
+  const servers: Server[] = [];
+  afterEach(async () => {
+    for (const s of servers.splice(0)) {
+      s.closeAllConnections();
+      await new Promise<void>((r) => s.close(() => r()));
+    }
+  });
+
+  async function listen(app: express.Express | ((...a: never[]) => void)): Promise<string> {
+    const server = createServer(app as never);
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    return `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  }
+
+  async function follower(holderUrl: string): Promise<string> {
+    const app = express();
+    app.use(express.json({
+      verify: (req, _res, buf) => {
+        (req as unknown as { rawBody: Buffer }).rawBody = buf;
+      },
+    }));
+    const router = express.Router();
+    registerPluginHolderForwardRoutes(router, async () => holderUrl);
+    router.post("/plugins/:pluginId/webhooks/:endpointKey", (req, res) => {
+      res.json({ servedBy: "local", body: req.body });
+    });
+    router.get("/plugins/:pluginId/api/*splat", (_req, res) => {
+      res.json({ servedBy: "local" });
+    });
+    app.use("/api", router);
+    return listen(app);
+  }
+
+  async function closedPortUrl(): Promise<string> {
+    const probe = createServer();
+    await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
+    const port = (probe.address() as AddressInfo).port;
+    await new Promise<void>((resolve) => probe.close(() => resolve()));
+    return `http://127.0.0.1:${port}`;
+  }
+
+  it("serves POST and GET locally when nothing is listening at the holder address", async () => {
+    const url = await follower(await closedPortUrl());
+    const posted = await fetch(`${url}/api/plugins/p1/webhooks/alert`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ n: 1 }),
+    });
+    expect(posted.status).toBe(200);
+    expect(await posted.json()).toEqual({ servedBy: "local", body: { n: 1 } });
+
+    const got = await fetch(`${url}/api/plugins/p1/api/status`);
+    expect(got.status).toBe(200);
+    expect(await got.json()).toEqual({ servedBy: "local" });
+  });
+
+  it("does NOT serve locally once the holder received the request, so a POST cannot run twice", async () => {
+    const holder = await listen((_req: unknown, res: { socket: { destroy: () => void } }) => {
+      res.socket.destroy();
+    });
+    const url = await follower(holder);
+    const posted = await fetch(`${url}/api/plugins/p1/webhooks/alert`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ n: 1 }),
+    });
+    expect(posted.status).toBe(502);
+  });
+});
+
+/**
  * AC3: two app instances against ONE database. Each instance keeps its plugin
  * state in-process, exactly as `plugin-lifecycle.ts` does (an EventEmitter, no
  * DB poll), and the only thing they share is the real `scheduler_leases` row.

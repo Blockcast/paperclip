@@ -28,15 +28,19 @@ vi.mock("../services/plugin-event-outbox.js", async (importOriginal) => ({
 import { createApp } from "../app.js";
 
 const state = { fingerprint: "1/t0|0/" };
-const pluginRows = [
+const BOOT_ROWS = [
   { id: "p-running", pluginKey: "acme.running" },
   { id: "p-stopped", pluginKey: "acme.stopped" },
 ];
+let pluginRows = [...BOOT_ROWS];
+/** In-memory worker handles, whatever their status. */
+let handleIds: string[] = [];
+const stopWorker = vi.fn(async () => {});
 
 /** Just enough of a Db for the fingerprint read and the plugin listing. */
 const fakeDb = {
   execute: vi.fn(async () => [{ fp: state.fingerprint }]),
-  select: () => ({ from: async () => pluginRows }),
+  select: () => ({ from: async () => [...pluginRows] }),
 };
 
 async function boot(): Promise<Express> {
@@ -53,9 +57,10 @@ async function boot(): Promise<Express> {
     shouldRunWorkerSingletons: () => false,
     pluginWorkerManager: {
       isRunning: (id: string) => id === "p-running",
-      getWorker: () => undefined,
+      getWorker: (id: string) => (handleIds.includes(id) ? {} : undefined),
+      stopWorker,
       stopAll: async () => {},
-      diagnostics: () => [],
+      diagnostics: () => handleIds.map((pluginId) => ({ pluginId })),
     } as never,
   } as never);
 }
@@ -69,6 +74,8 @@ describe("plugin resync on scheduler lease takeover (BLO-47803)", () => {
     await (app?.locals?.paperclipShutdown as undefined | (() => Promise<void>))?.();
     app = null;
     state.fingerprint = "1/t0|0/";
+    pluginRows = [...BOOT_ROWS];
+    handleIds = [];
     vi.clearAllMocks();
   });
 
@@ -89,18 +96,67 @@ describe("plugin resync on scheduler lease takeover (BLO-47803)", () => {
     expect(loader.loadAll).not.toHaveBeenCalled();
   }, 120_000);
 
-  it("reloads every running plugin from the database when another holder changed plugin state", async () => {
+  it("reloads every plugin from the database when another holder changed plugin state", async () => {
     app = await bootLoaded();
     state.fingerprint = "1/t1|1/t1"; // e.g. a config saved on the old holder
 
     await resync(app);
-    expect(loader.unloadSingle).toHaveBeenCalledTimes(1);
+    // Not gated on isRunning: a crashed or starting handle must be cleared too.
+    expect(loader.unloadSingle).toHaveBeenCalledTimes(2);
     expect(loader.unloadSingle).toHaveBeenCalledWith("p-running", "acme.running");
+    expect(loader.unloadSingle).toHaveBeenCalledWith("p-stopped", "acme.stopped");
     expect(loader.loadAll).toHaveBeenCalledTimes(1);
 
     // Applied: the next takeover with no further change is a no-op.
     await resync(app);
     expect(loader.loadAll).toHaveBeenCalledTimes(1);
+  }, 120_000);
+
+  it("unloads a plugin hard-deleted on the old holder, which has no row left to list", async () => {
+    app = await bootLoaded();
+    pluginRows = [BOOT_ROWS[1]]; // DELETE /plugins/p-running with removeData
+    state.fingerprint = "1/t1|0/";
+
+    await resync(app);
+    expect(loader.unloadSingle).toHaveBeenCalledWith("p-running", "acme.running");
+    expect(loader.loadAll).toHaveBeenCalledTimes(1);
+  }, 120_000);
+
+  it("stops a worker handle this process knows no key for", async () => {
+    app = await bootLoaded();
+    handleIds = ["p-orphan"];
+    state.fingerprint = "changed";
+
+    await resync(app);
+    expect(stopWorker).toHaveBeenCalledWith("p-orphan");
+    expect(loader.loadAll).toHaveBeenCalledTimes(1);
+  }, 120_000);
+
+  it("reloads on takeover after a boot load that threw, and retries a reload that threw", async () => {
+    loader.loadAll.mockRejectedValueOnce(new Error("boot load failed"));
+    app = await boot();
+    await vi.waitFor(() => expect(loader.loadAll).toHaveBeenCalledTimes(1));
+    for (let i = 0; i < 10; i += 1) await Promise.resolve();
+
+    // Fingerprint unchanged, yet the failed boot load was never applied.
+    loader.loadAll.mockRejectedValueOnce(new Error("reload failed"));
+    await expect(resync(app)).rejects.toThrow("reload failed");
+    expect(loader.loadAll).toHaveBeenCalledTimes(2);
+
+    await resync(app);
+    expect(loader.loadAll).toHaveBeenCalledTimes(3);
+    await resync(app); // now applied
+    expect(loader.loadAll).toHaveBeenCalledTimes(3);
+  }, 120_000);
+
+  it("retries a takeover reload that threw, even with no further state change", async () => {
+    app = await bootLoaded();
+    state.fingerprint = "changed";
+    loader.loadAll.mockRejectedValueOnce(new Error("reload failed"));
+    await expect(resync(app)).rejects.toThrow("reload failed");
+
+    await resync(app);
+    expect(loader.loadAll).toHaveBeenCalledTimes(2);
   }, 120_000);
 
   it("does nothing before the boot load has finished, so it cannot race it", async () => {
