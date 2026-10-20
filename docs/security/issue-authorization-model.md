@@ -96,7 +96,7 @@ and a reason disagree, trust the reason. It is also what the tests assert on.
 | `allow_manager_chain` | `:2466` | A | — | — | `isManagerOf(actor, resource.assigneeAgentId)` |
 | `allow_issue_mention_grant` | `:2481` | A | — | — | a live, non-deleted `agent://<actor>` mention from a principal entitled to grant it |
 | `allow_recovery_handoff_grant` | `:2493` | A | — | — | an open recovery handoff naming the actor |
-| `allow_dependency_edge` | `agentHoldsIssueAcrossDependencyEdge` | A | — | — | a `blocks` row in `issue_relations` joins the target and some issue X (either direction), and the actor is X's **current** assignee; derived at decision time, so cutting the edge or reassigning X revokes it (`BLO-30968`) |
+| `allow_dependency_edge` | `agentHoldsIssueAcrossDependencyEdge` | A | — | — | a `blocks` row in `issue_relations` joins the target and some issue X (either direction), and the actor is X's **current** assignee, and the edge was **not created by the actor** (else any agent could self-declare a blocker and comment anywhere); derived at decision time, so cutting the edge or reassigning X revokes it (`BLO-30968`) |
 | `allow_productivity_review_grant` | `:2518` | A | **A** | — | the actor is assigned the review whose `originId` is this issue |
 | `allow_explicit_grant` | `:857` via `:2411` | n/a | n/a | A | **coordination metadata only** — `tasks:assign`/`tasks:assign_scope` **and** `isManagerOf(assignee)` |
 
@@ -208,6 +208,8 @@ without re-deciding the model itself:
   Ancestry is not a declared dependency; only a `blocks` edge is.
 - An agent across a `blocks` edge: denied `issue:mutate` — the edge grants a
   voice to the owner, not a rewrite of their issue.
+- An agent across a `blocks` edge **it created itself**: denied `issue:comment`.
+  Self-declared edges would turn every peer into a commenter on every issue.
 - Any actor in a different company: denied regardless of grants or role.
 
 ## Regression test
