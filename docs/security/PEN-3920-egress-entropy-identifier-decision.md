@@ -73,22 +73,29 @@ This correction cuts against the row, and it is the honest reading: the detector
 because "arbitrary" is an argument for removing a control and "one deterministic axis" is an
 argument for a bounded fix. The second is what the evidence supports.
 
-**(b) The digest fix reached production by the house rebase convention, not by an unknown route.**
+**(b) The digest fix reached production by a tracked replacement PR, not by an unknown route.**
 
 PR #2399 is indeed closed, but `isContentDigestAssignment` ships from **#2412, merged
-2026-10-10T06:47:47Z**, on branch `be4fce/rb-2399`. That is not an anomaly - it is how every
-egress-scrub change in this repo lands. The agent-authored PR is closed and a rebased
-replacement is merged under `be4fce/rb-<original>`:
+2026-10-10T06:47:47Z**, on branch `be4fce/rb-2399`. That is not an anomaly - an egress-scrub
+change in this repo *often* lands as a rebased replacement PR: the agent-authored PR is
+closed and a replacement is merged, usually but not always under `be4fce/rb-<original>`:
 
-| original (closed) | replacement (merged) | change |
-|---|---|---|
-| #2399 | #2412, 2026-10-10 | PEN-3907 digest pins |
-| #2475 | #2509, 2026-10-12 | PEN-3932 class split |
-| #2485 | #2581, 2026-10-12 | BLO-41153 gRPC paths |
-| #2715 | #2718, 2026-10-14 | BLO-46233 merge scan |
+| original (closed) | replacement (merged) | replacement branch | change |
+|---|---|---|---|
+| #2399 | #2412, 2026-10-10 | `be4fce/rb-2399` | PEN-3907 digest pins |
+| #2475 | #2509, 2026-10-12 | `be4fce/rb-2475` | PEN-3932 class split |
+| #2485 | #2581, 2026-10-12 | `be4fce/rb-2485` | BLO-41153 gRPC paths |
+| #2715 | #2718, 2026-10-14 | `drive/BLO-46233-trailer-free-2715` | BLO-46233 merge scan |
 
-Anyone auditing what ships should resolve a closed egress PR to its `be4fce/rb-` replacement
-before concluding the code took an untracked path.
+It is **not** universal, and an auditor should not assume it. The two changes this document
+relies on most merged directly from their own branches, with no closed original and no
+rebased replacement: **#2736** (`cto/blo-46448-camelcase-identifier`, 2026-10-15) and
+**#2829** (`cto/blo-47509-camelcase-kind`, 2026-10-19).
+
+So: anyone auditing what ships should, on finding a *closed* egress PR, look for a merged
+replacement carrying the same change before concluding the code took an untracked path - by
+title or by diff, not by assuming a `be4fce/rb-` branch name. A merged PR on its own branch
+needs no such resolution.
 
 **(c) PEN-3920's question D1 was already answered, the opposite way, by BLO-46448.**
 
@@ -247,8 +254,32 @@ This section is bounds, not a patch. The row asked for the judgement before the 
 ### 6.1 Approved: bounded digits inside the existing name-anchored CamelCase exemption (D4)
 
 Permit each CamelCase word in `ALERT_NAME_RE` to carry a short trailing digit run, bounded in
-run length and in how many runs a value may carry. Measured residual, 500,000 random values
-per cell, as a fraction newly exonerated **under an anchored name**:
+run length and in how many runs a value may carry.
+
+The shape measured below is, against the shipped
+`/^(?:[A-Z][a-z]+|[A-Z]{1,5}(?=[A-Z][a-z]))+$/`:
+
+```js
+// bounded form - the approved one. <=2-digit tail on BOTH branches.
+/^(?:[A-Z][a-z]+\d{0,2}|[A-Z]{1,5}\d{0,2}(?=[A-Z][a-z]))+$/
+// plus, as a separate check the regex does not express:
+//   (value.match(/\d+/g) ?? []).length <= 2
+```
+
+```js
+// lowercase-tail variant - the declined one, third row of the table.
+/^(?:[A-Z][a-z]+\d{0,2}[a-z]*|[A-Z]{1,5}\d{0,2}(?=[A-Z][a-z]))+$/
+```
+
+Note the digit tail must be on the **acronym branch too**, with the `(?=[A-Z][a-z])`
+lookahead re-anchored *after* the digits. The narrower reading - a `\d{0,2}` tail on the
+`[A-Z][a-z]+` branch only - is not what was measured and does **not** reach the corpus: it
+misses `Vlan1MacvlanV6ProbeInstrumentBroken` (the `V6` word has no lowercase run) and
+`HTTP2ServerStreamsExhausted` (same, on `HTTP2`). An implementing PR that takes the narrower
+reading will not reproduce either the residual table or the coverage claim below.
+
+Measured residual, 500,000 random values per cell, as a fraction newly exonerated **under an
+anchored name**:
 
 | shape | base62 @24 | base62 @32 | base64url @24 | base64url @32 |
 |---|---|---|---|---|
@@ -268,9 +299,11 @@ Two readings govern the choice:
   be kept even though it is not load-bearing against the dominant alphabet, because it keeps
   the stated bound honest.
 
-Coverage of the measured corpus under the bounded form: `Vlan1MacvlanV6ProbeInstrumentBroken`,
-`ArcRunnerPool2CeilingClipped`, `HTTP2ServerStreamsExhausted` and `Ipv6RouteAdvertisementStale`
-all pass; every digit-free name already passing continues to pass.
+Coverage of the measured corpus under the bounded form: `Vlan1MacvlanV6ProbeInstrumentBroken`
+(2 digit runs), `ArcRunnerPool2CeilingClipped`, `HTTP2ServerStreamsExhausted` and
+`Ipv6RouteAdvertisementStale` (1 each) all pass, all within the `<=2` run cap; every
+digit-free name already passing continues to pass. `CoreDNSPanicCount24h` does **not** pass,
+and is the one corpus member the declined lowercase-tail variant would have bought.
 
 ### 6.2 Approved: route `job` through the name anchor (D5)
 
