@@ -54,7 +54,7 @@ const ALLY_BOT_LOGIN = "allyblockcast[bot]";
 const DISTINCT_PR_AUTHOR = "some-contributor";
 
 function allyComment(body: string, createdAt: string) {
-  return { authorLogin: ALLY_BOT_LOGIN, body, createdAt };
+  return { authorLogin: ALLY_BOT_LOGIN, body, createdAt, surface: "pull_request_review" as const };
 }
 
 /** The two ledger bullets, taken from the fixture rather than restated. */

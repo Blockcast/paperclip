@@ -51,9 +51,18 @@ const DEFAULT_PR_LIMIT = 60;
  * head; …"). It is NOT what catches a self-attested head: that renders "The
  * only comment attesting this head is the PR author's own", which this
  * alternative never matches and the PR-author alternative does.
+ *
+ * `attesting this head is a plain issue comment` is the PEN-4431 sibling of
+ * that PR-author alternative: a head whose only attestation arrived on the
+ * issue-comment surface rather than as a review submission. It is a fourth
+ * distinct `not_evaluated` description, and like the others it is quoted long
+ * enough to be unique to this gate. Adding a `not_evaluated` reason WITHOUT
+ * adding its alternative here is silent — the census simply stops seeing that
+ * population — which is why `pr-comment-review-gate.test.ts` pins each one
+ * against this predicate rather than against a copy of it.
  */
 const NOT_EVALUATED_DESCRIPTION_PATTERN =
-  /no (?:independent )?Ally consolidated-review comment attests|no head SHA was supplied|attesting this head is the PR author's own|The PR author is unknown/i;
+  /no (?:independent )?Ally consolidated-review comment attests|no head SHA was supplied|attesting this head is the PR author's own|attesting this head is a plain issue comment|The PR author is unknown/i;
 
 export function isReviewNamespacedContext(context) {
   return typeof context === "string" && context.trim().toLowerCase().startsWith("review/");

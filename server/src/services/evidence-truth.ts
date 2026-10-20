@@ -315,11 +315,28 @@ async function probeOne(
       // it. Surface 2 below keeps reading `surfaces.reviews` separately — it
       // asks a question only it can (the bodyless CHANGES_REQUESTED veto, keyed
       // on review STATE rather than on grammar).
+      // Each row is tagged with the surface it came off (PEN-4431). It is not
+      // cosmetic here: the gate's CREDIT routes now require a review
+      // submission, so an untagged or mistagged row would make this probe
+      // vouch `clean` against a gate publishing something else — the exact
+      // divergence the paragraph above exists to prevent. The two sources are
+      // already separate at this point, so the tag is read off the source and
+      // never inferred from the body.
       comments: [
-        ...surfaces.comments.map((c) => ({ authorLogin: c.login, body: c.body, createdAt: c.createdAt })),
+        ...surfaces.comments.map((c) => ({
+          authorLogin: c.login,
+          body: c.body,
+          createdAt: c.createdAt,
+          surface: "issue_comment" as const,
+        })),
         ...surfaces.reviews
           .filter((r) => (r.state ?? "").trim().toUpperCase() !== "DISMISSED" && typeof r.submittedAt === "string")
-          .map((r) => ({ authorLogin: r.login, body: r.body, createdAt: r.submittedAt as string })),
+          .map((r) => ({
+            authorLogin: r.login,
+            body: r.body,
+            createdAt: r.submittedAt as string,
+            surface: "pull_request_review" as const,
+          })),
       ],
       headSha: normalizedHead,
       reviewerBotLogin: deps.reviewerBotLogin,

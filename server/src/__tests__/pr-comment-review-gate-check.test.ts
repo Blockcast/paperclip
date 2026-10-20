@@ -259,18 +259,35 @@ describe("runPrCommentReviewGateCheck", () => {
   });
 
   it("merges both surfaces by chronology rather than preferring one", async () => {
-    // A blocking review on the reviews surface, superseded by a later clean
-    // issue comment for the same head. Newest attestation wins regardless of
-    // which surface carried it.
+    // ORDERING is surface-blind and stays that way: the newest attestation for
+    // a head is the one read, whichever surface carried it. PEN-4431 narrowed
+    // what a body may CLAIM, not which body is read, and those are separate
+    // properties that this test now pins separately.
+    //
+    // Half one: a blocking review superseded by a later clean issue comment.
+    // The issue comment is still read and still displaces the blocking review
+    // — the verdict is not `blocking_finding` — but it cannot carry the gate
+    // to `clean`, because a positive claim needs a review submission.
+    const cleanBody = `## Ally — Consolidated PR Review\nReviewed head: ${TARGET.headSha}\n### Critical Issues (0)\n### Important Issues (0)`;
     mockListReviews.mockResolvedValue([blockingCommentFor(TARGET.headSha)]);
     mockListComments.mockResolvedValue([
-      {
-        login: "allyblockcast[bot]",
-        body: `## Ally — Consolidated PR Review\nReviewed head: ${TARGET.headSha}\n### Critical Issues (0)\n### Important Issues (0)`,
-        createdAt: "2026-08-04T22:09:19Z",
-      },
+      { login: "allyblockcast[bot]", body: cleanBody, createdAt: "2026-08-04T22:09:19Z" },
     ]);
     mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
+
+    await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({
+      posted: true,
+      verdict: { state: "success", outcome: "not_evaluated" },
+    });
+
+    // Half two, the mirror, which is what proves half one is about the surface
+    // of the CLAIM and not about chronology having quietly become
+    // surface-preferring: swap the two surfaces and the later clean body —
+    // now a review submission — does reach `clean`.
+    mockListReviews.mockResolvedValue([
+      { login: "allyblockcast[bot]", body: cleanBody, createdAt: "2026-08-04T22:09:19Z" },
+    ]);
+    mockListComments.mockResolvedValue([blockingCommentFor(TARGET.headSha)]);
 
     await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({
       posted: true,
@@ -368,7 +385,11 @@ describe("runPrCommentReviewGateCheck", () => {
     // by construction. Result was a green->red flip on a merge-blocking status
     // for a head an independent reviewer did attest.
     mockFetchPrAuthor.mockResolvedValue("some-contributor");
-    mockListComments.mockResolvedValue([
+    // On the reviews surface: this case is about the AUTHOR, and after
+    // PEN-4431 a positive claim needs a review submission, so carrying it as
+    // an issue comment would make the fixture fail for a reason that has
+    // nothing to do with what it tests.
+    mockListReviews.mockResolvedValue([
       blockingCommentFor("0".repeat(40)),
       cleanCommentFor(TARGET.headSha),
     ]);
@@ -571,7 +592,8 @@ describe("check-run mirror (BLO-33657)", () => {
 
   it("mirrors the verdict as a check-run alongside the commit status", async () => {
     mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
-    mockListComments.mockResolvedValue([clean]);
+    // Reviews surface: the subject is the check-run mirror, not the surface.
+    mockListReviews.mockResolvedValue([clean]);
 
     await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({ posted: true });
 
@@ -916,7 +938,15 @@ describe("ci/ally-head-attested schedule signal", () => {
     },
   ])("truth table: $name -> gate $gate, signal $signal", async ({ author, comments, outcome, gate, signal }) => {
     mockFetchPrAuthor.mockResolvedValue(author);
-    mockListComments.mockResolvedValue(comments);
+    // Fed through the REVIEWS surface. The table's subject is the
+    // outcome -> check-run mapping, and two of its rows make a positive claim
+    // (`clean`, `deferred_finding`), which after PEN-4431 requires a review
+    // submission. Carrying the table on the issue-comment surface would
+    // collapse those two rows onto `not_evaluated` and quietly stop testing
+    // the mapping they are there for. It is also the realistic surface: 83 of
+    // 83 Ally consolidated reviews measured on `Blockcast/paperclip`
+    // (2026-10-20) were review submissions.
+    mockListReviews.mockResolvedValue(comments);
 
     // `outcome` is asserted too, so a fixture that stops reaching the branch it
     // names fails here instead of passing on the wrong one.
@@ -1291,7 +1321,12 @@ describe("ci/ally-head-attested schedule signal", () => {
         evaluateCommentReviewGate({
           headSha: HEAD,
           prAuthorLogin,
-          comments: comments.map((c) => ({ authorLogin: c.login, body: c.body, createdAt: c.createdAt })),
+          comments: comments.map((c) => ({
+            authorLogin: c.login,
+            body: c.body,
+            createdAt: c.createdAt,
+            surface: "pull_request_review" as const,
+          })),
         });
 
       // The two withheld routes: shared identity, and an author nobody could read.
@@ -1415,7 +1450,10 @@ describe("author-lane fetch (BLO-43550)", () => {
   // same timestamps, same single `allyblockcast[bot]` login on both sides. A
   // gate that reds this one has no route to green at all (BLO-29711).
   it("still retires when the review declares a lane other than the commit author's", async () => {
-    mockListComments.mockResolvedValue(carryThenRetire(OTHER_LANE));
+    // Reviews surface: the subject is the declared LANE. A retirement carried
+    // as an issue comment is refused on its surface (PEN-4431), which would
+    // mask the lane behaviour this case exists to pin.
+    mockListReviews.mockResolvedValue(carryThenRetire(OTHER_LANE));
     mockFetchCommitAuthorEmail.mockResolvedValue(AUTHOR_LANE);
 
     await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({
@@ -1441,7 +1479,7 @@ describe("author-lane fetch (BLO-43550)", () => {
   // today's behaviour, and the anti-deadlock direction. Refusing on an unknown
   // author instead would red every open PR whose finding Ally has retired.
   it("credits the retirement when the commit fetch cannot be read", async () => {
-    mockListComments.mockResolvedValue(carryThenRetire(AUTHOR_LANE));
+    mockListReviews.mockResolvedValue(carryThenRetire(AUTHOR_LANE));
     mockFetchCommitAuthorEmail.mockResolvedValue(null);
 
     await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({

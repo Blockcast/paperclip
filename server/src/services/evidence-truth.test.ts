@@ -73,14 +73,20 @@ function wp(
 function deps(o: Partial<GithubTruthDeps> = {}): GithubTruthDeps {
   return {
     fetchHeadSha: async () => HEAD,
+    // The clean body sits on the REVIEWS surface, which is both what Ally
+    // actually files (83 of 83 consolidated reviews measured on
+    // `Blockcast/paperclip`, 2026-10-20) and what a `clean` vouch now requires
+    // (PEN-4431). On the comment surface this default would reach
+    // `not_evaluated`, and every test that inherits it and asserts
+    // `review:ally-clean` would fail for a reason unrelated to its subject.
     listReviewerSurfaces: async () => ({
-      reviews: [],
-      comments: [{ login: ALLY, body: clean, createdAt: "2026-09-06T00:00:00Z" }],
+      reviews: [{ login: ALLY, body: clean, state: "COMMENTED", commitId: HEAD, submittedAt: "2026-09-06T00:00:00Z" }],
+      comments: [],
     }),
     getPullRequestGate: async () => ({ state: "closed", merged: true }),
     // A PR opened by someone OTHER than the reviewer identity: the default
-    // fixture is an independently-reviewed PR, so the comment surface can
-    // still reach `clean`. Tests that want the self-attested shape override it.
+    // fixture is an independently-reviewed PR, so it can still reach `clean`.
+    // Tests that want the self-attested shape override it.
     fetchPrAuthorLogin: async () => "some-human",
     // Throws rather than returning a value, so a test that reaches this call
     // without meaning to fails loudly instead of quietly taking a default.
@@ -278,8 +284,13 @@ describe("buildGithubTruthProbe", () => {
         getPullRequestGate: counted({ state: "closed", merged: true } as const),
         fetchHeadSha: counted(HEAD),
         listReviewerSurfaces: counted({
-          reviews: [],
-          comments: [{ login: ALLY, body: clean, createdAt: "2026-09-06T00:00:00Z" }],
+          // Reviews surface: the subject is the serial-call BUDGET on the
+          // would-be-clean route, and that route now needs a review
+          // submission to reach `clean` (PEN-4431).
+          reviews: [
+            { login: ALLY, body: clean, state: "COMMENTED", commitId: HEAD, submittedAt: "2026-09-06T00:00:00Z" },
+          ],
+          comments: [],
         }),
         fetchPrAuthorLogin: counted("some-human"),
       }),
@@ -1106,15 +1117,17 @@ Land.`;
     const r = await buildGithubTruthProbe(
       deps({
         listReviewerSurfaces: async () => ({
-          // `submittedAt` is a real timestamp, so this row is ALSO spread into
-          // the comment surface — the production-reachable shape, not the
-          // `submittedAt: null` divergence. It attests OLD, so it is not that
-          // surface's `forHead` and cannot set `commentDeferred`; the clean
-          // comment below is.
+          // Both rows on the reviews surface. `submittedAt` is a real
+          // timestamp on each, so both are spread into the gate's comment list
+          // — the production-reachable shape, not the `submittedAt: null`
+          // divergence. The tracked row attests OLD, so it is not `forHead`
+          // and cannot set `commentDeferred`; the clean row at HEAD is, and it
+          // has to be a review submission to reach `clean` (PEN-4431).
           reviews: [
             { login: ALLY, body: trackedAtOld, state: "COMMENTED", commitId: HEAD, submittedAt: "2026-09-06T00:00:00Z" },
+            { login: ALLY, body: clean, state: "COMMENTED", commitId: HEAD, submittedAt: "2026-09-06T01:00:00Z" },
           ],
-          comments: [{ login: ALLY, body: clean, createdAt: "2026-09-06T01:00:00Z" }],
+          comments: [],
         }),
       }),
     )({ workProducts: [wp()] });
@@ -1219,14 +1232,18 @@ describe("buildGithubTruthProbe — author-lane mirror (BLO-43550)", () => {
   // is the Surface-2-only population `formalClean` exists for, and it is what
   // makes the lane load-bearing here: credit the retirement and Surface 2
   // vouches, refuse it and `commentBlocking` vetoes.
+  // The retiring body is a review SUBMISSION. PEN-4431 refuses a retirement
+  // carried as a plain issue comment, so leaving it on the comment surface
+  // would red both arms of this pair for a surface reason and destroy the
+  // lane as the single variable these two cases turn on. The dirty body stays
+  // on the comment surface deliberately: RAISING is surface-blind, and keeping
+  // it there proves that.
   const corpus = (lane: string | null) => async () => ({
     reviews: [
       { login: ALLY, body: attestedNoHeading, state: "COMMENTED", commitId: HEAD, submittedAt: "2026-09-06T02:00:00Z" },
+      { login: ALLY, body: retiringAtMid(lane), state: "COMMENTED", commitId: HEAD, submittedAt: "2026-09-06T01:00:00Z" },
     ],
-    comments: [
-      { login: ALLY, body: dirtyAtOld, createdAt: "2026-09-06T00:00:00Z" },
-      { login: ALLY, body: retiringAtMid(lane), createdAt: "2026-09-06T01:00:00Z" },
-    ],
+    comments: [{ login: ALLY, body: dirtyAtOld, createdAt: "2026-09-06T00:00:00Z" }],
   });
 
   it("refuses a retirement declaring the head commit author's own lane, and does not vouch", async () => {
@@ -1317,8 +1334,13 @@ describe("buildGithubTruthProbe — author-lane mirror (BLO-43550)", () => {
     const r = await buildGithubTruthProbe(
       deps({
         listReviewerSurfaces: async () => ({
-          reviews: [],
-          comments: [{ login: ALLY, body: cleanDeclaring, createdAt: "2026-09-06T00:00:00Z" }],
+          // Reviews surface: this case asserts the CONCURRENCY of the lane and
+          // author fetches on the would-be-clean route, which needs a review
+          // submission to stay would-be-clean (PEN-4431).
+          reviews: [
+            { login: ALLY, body: cleanDeclaring, state: "COMMENTED", commitId: HEAD, submittedAt: "2026-09-06T00:00:00Z" },
+          ],
+          comments: [],
         }),
         fetchCommitAuthorEmail: () => overlap(AUTHOR_LANE),
         fetchPrAuthorLogin: () => overlap("some-human"),

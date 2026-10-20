@@ -56,7 +56,22 @@ function cleanReview(headSha: string): string {
 }
 
 function allyComment(body: string, createdAt: string) {
-  return { authorLogin: ALLY_BOT_LOGIN, body, createdAt };
+  // Defaults to the review surface because that is what Ally actually files:
+  // measured 2026-10-20 on `Blockcast/paperclip`, 83 of 83 consolidated-review
+  // bodies across the 40 most recent PRs and all 5 open ones were review
+  // submissions and 0 were issue comments (PEN-4431). `allyIssueComment` below
+  // is the explicit opt-out for the cases that test the surface rule itself.
+  return { authorLogin: ALLY_BOT_LOGIN, body, createdAt, surface: "pull_request_review" as const };
+}
+
+/**
+ * The same body, carried as a plain `POST /issues/{n}/comments` instead of a
+ * review submission. The surface is the only axis that differs from
+ * `allyComment`, which is what makes the PEN-4431 cases below one-variable
+ * tests rather than two.
+ */
+function allyIssueComment(body: string, createdAt: string) {
+  return { authorLogin: ALLY_BOT_LOGIN, body, createdAt, surface: "issue_comment" as const };
 }
 
 /**
@@ -1389,6 +1404,7 @@ describe("evaluateCommentReviewGate", () => {
       comments: [
         {
           authorLogin: "allyblockcast",
+          surface: "pull_request_review" as const,
           body: blockingReview(CURRENT_HEAD),
           createdAt: "2026-08-04T20:09:19Z",
         },
@@ -2695,7 +2711,12 @@ describe("commentReviewGateCheckConclusion", () => {
         prAuthorLogin: null,
         headSha: CURRENT_HEAD,
         comments: [
-          { authorLogin: "someone-else", body: cleanReview(CURRENT_HEAD), createdAt: "2026-08-04T21:09:19Z" },
+          {
+            authorLogin: "someone-else",
+            body: cleanReview(CURRENT_HEAD),
+            createdAt: "2026-08-04T21:09:19Z",
+            surface: "pull_request_review" as const,
+          },
         ],
       }),
     ];
@@ -3825,5 +3846,233 @@ describe("mirrored findings retire under both identities (#1707)", () => {
         carriedFromHeadSha: MIRRORING,
       });
     });
+  });
+});
+
+describe("PEN-4431 — what may CREDIT a head", () => {
+  // Board card 6ed159df ask (C). The row's stated worry is that the gate
+  // trusts a review comment because of WHO WROTE IT, so a PR author holding
+  // the reviewer identity could clear their own gate.
+  //
+  // Two separate properties are pinned here, because they have separate
+  // mechanisms and separate failure modes:
+  //
+  //   1. IDENTITY. The author's own attestation never reaches a positive
+  //      claim. This already held when the row was filed (BLO-34316's
+  //      independence check) and was only incidentally covered; these cases
+  //      make it a named, regression-proof property rather than a side effect
+  //      of fixtures written for other reasons.
+  //   2. SURFACE. A positive claim now additionally requires a review
+  //      SUBMISSION. Posting an issue comment needs `issues: write`; posting a
+  //      review needs `pull_requests: write`. The second is a strictly smaller
+  //      set of principals, and it is the evidence class Done-when 1 names.
+  //
+  // What these do NOT claim, said plainly so no later reader reads more into
+  // them: neither property makes the evidence unproducible by the PR author
+  // while every agent seat holds the reviewer App credential. An author who
+  // can comment as the reviewer can submit a review as the reviewer. That
+  // residual closes by re-scoping the credential (ask (A)), not here, and
+  // "P2b" below is its live witness — kept deliberately as a characterization
+  // test so that re-scoping, when it lands, has something to flip.
+
+  const selfAuthoredClean = (headSha: string) =>
+    reviewBody(headSha, ["### Critical Issues (0)", "### Important Issues (0)", "No findings."]);
+
+  it("does not clear the gate for an author-written comment copying the heading and the Reviewed head line", () => {
+    // Done-when 2, literally: the author writes a body carrying both of the
+    // two conditions they control — the `## Ally — Consolidated PR Review`
+    // heading and a `Reviewed head:` line naming the real head — while holding
+    // the reviewer identity. The only condition they do not control is being
+    // someone else, and that is the one that decides it.
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: ALLY_BOT_LOGIN,
+      prAuthorLane: null,
+      comments: [allyComment(selfAuthoredClean(CURRENT_HEAD), "2026-10-20T10:00:00Z")],
+    });
+
+    expect(verdict.outcome).not.toBe("clean");
+    expect(verdict.outcome).toBe("not_evaluated");
+    expect(verdict).toMatchObject({ authorIsReviewer: true });
+  });
+
+  it("still credits the identical body when an independent reviewer wrote it", () => {
+    // The control that keeps the case above honest. Same body, same surface,
+    // same head — only the author differs — so the test above cannot pass by
+    // the gate having been switched off, or by the fixture failing to parse.
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: DISTINCT_PR_AUTHOR,
+      prAuthorLane: null,
+      comments: [allyComment(selfAuthoredClean(CURRENT_HEAD), "2026-10-20T10:00:00Z")],
+    });
+
+    expect(verdict).toMatchObject({ state: "success", outcome: "clean" });
+  });
+
+  it("does not credit a head whose only attestation is a plain issue comment", () => {
+    // One variable against the control above: an independent author, the same
+    // body, carried on the issue-comment surface.
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: DISTINCT_PR_AUTHOR,
+      prAuthorLane: null,
+      comments: [allyIssueComment(selfAuthoredClean(CURRENT_HEAD), "2026-10-20T10:00:00Z")],
+    });
+
+    expect(verdict.outcome).not.toBe("clean");
+    expect(verdict).toMatchObject({ state: "success", outcome: "not_evaluated", headAttested: true });
+    // Not the identity marker: this head was refused for a SURFACE reason, and
+    // the evidence probe reads `authorIsReviewer` as the identity claim.
+    expect(verdict).not.toHaveProperty("authorIsReviewer");
+    // Pinned against the census's own predicate, exactly as the other
+    // `not_evaluated` reasons are. A new description that the census cannot
+    // recognise does not fail anything — the audit just stops seeing that
+    // population — so each reason has to be pinned as it is added.
+    expect(admitsNothingEvaluated(verdict.reason)).toBe(true);
+  });
+
+  it("hears a deferral from EITHER surface, because a deferral can only lower the claim", () => {
+    // The deliberate exception to the surface rule, and the one place where
+    // applying it would fail OPEN.
+    //
+    // `deferred_finding` reads as positive against `carried_finding`, but
+    // against `clean` it is a downgrade: it is the only thing that tells a
+    // reader a residual was ACCEPTED rather than fixed, and the evidence probe
+    // reads it as a veto on a clean vouch. Refuse to hear it on the
+    // issue-comment surface and nothing vetoes — so a clean vouch lands on a
+    // head whose review accepted a residual. Strictly more permissive than
+    // before the change, which is the direction this module must not take.
+    //
+    // So the rule is not "positive routes need a review". It is "anything that
+    // can only make the verdict LESS positive stays surface-blind", which is
+    // the same discipline the blocking and carried branches already follow.
+    const body = dispositioningReview(CURRENT_HEAD, OLD_HEAD, "tracked");
+
+    for (const comment of [allyComment(body, "2026-10-20T10:00:00Z"), allyIssueComment(body, "2026-10-20T10:00:00Z")]) {
+      expect(
+        evaluateCommentReviewGate({
+          headSha: CURRENT_HEAD,
+          prAuthorLogin: DISTINCT_PR_AUTHOR,
+          prAuthorLane: null,
+          comments: [comment],
+        }),
+      ).toMatchObject({ state: "success", outcome: "deferred_finding" });
+    }
+  });
+
+  it("refuses a ledger retirement written as an issue comment, and names that as the cause", () => {
+    // The merge-facing one. A finding carried from an earlier head is a
+    // `failure`; a ledger entry retiring it turns that red green. Restricting
+    // the retiring direction to review submissions is what stops the
+    // issue-comment write population from performing that flip.
+    const raised = blockingReview(OLD_HEAD);
+    const ledger = reviewBody(CURRENT_HEAD, [
+      "### Prior Findings Dispositioned (1)",
+      `- **prior:${OLD_HEAD.slice(0, 7)} important 1** — fixed — re-checked against this head.`,
+      "### Critical Issues (0)",
+      "### Important Issues (0)",
+    ]);
+
+    const refused = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: DISTINCT_PR_AUTHOR,
+      prAuthorLane: null,
+      comments: [allyComment(raised, "2026-10-20T09:00:00Z"), allyIssueComment(ledger, "2026-10-20T10:00:00Z")],
+    });
+    expect(refused).toMatchObject({ state: "failure", outcome: "carried_finding" });
+    // The red has to name the refusal, not a missing attestation: an author
+    // told "no comment attests the current head" posts another comment, which
+    // is the routing loop the conditional tail exists to close.
+    expect(refused.reason).toContain("its retirement was a comment, not a review.");
+    // And it must not also list the finding as one nobody named — the entry
+    // exists, it was refused.
+    expect(refused.reason).not.toContain("No ledger entry names");
+    expect(refused.reason.length).toBeLessThanOrEqual(140);
+  });
+
+  it("still credits the same retirement when it arrives as a review submission", () => {
+    // The anti-deadlock control. BLO-29711 forbids a change that leaves an
+    // agent PR permanently red, so the refusal above has to be about the
+    // surface and nothing else: identical bodies, identical timestamps, one
+    // axis changed.
+    const raised = blockingReview(OLD_HEAD);
+    const ledger = reviewBody(CURRENT_HEAD, [
+      "### Prior Findings Dispositioned (1)",
+      `- **prior:${OLD_HEAD.slice(0, 7)} important 1** — fixed — re-checked against this head.`,
+      "### Critical Issues (0)",
+      "### Important Issues (0)",
+    ]);
+
+    const credited = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: DISTINCT_PR_AUTHOR,
+      prAuthorLane: null,
+      comments: [allyComment(raised, "2026-10-20T09:00:00Z"), allyComment(ledger, "2026-10-20T10:00:00Z")],
+    });
+    expect(credited.state).toBe("success");
+    expect(credited.outcome).not.toBe("carried_finding");
+  });
+
+  it("keeps the RED direction surface-blind: an issue comment still raises and still carries", () => {
+    // The fail-closed half, and the reason the issue-comment reader stays. A
+    // finding is a finding wherever it is written. Narrowing this direction
+    // too would be the fail-open the whole change exists to avoid, and it is
+    // the mistake the narrowing is one line away from.
+    const atHead = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: DISTINCT_PR_AUTHOR,
+      prAuthorLane: null,
+      comments: [allyIssueComment(blockingReview(CURRENT_HEAD), "2026-10-20T10:00:00Z")],
+    });
+    expect(atHead).toMatchObject({ state: "failure", outcome: "blocking_finding" });
+
+    const carried = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: DISTINCT_PR_AUTHOR,
+      prAuthorLane: null,
+      comments: [allyIssueComment(blockingReview(OLD_HEAD), "2026-10-20T09:00:00Z")],
+    });
+    expect(carried).toMatchObject({ state: "failure", outcome: "carried_finding" });
+  });
+
+  it("characterizes the residual that only re-scoping the credential closes", () => {
+    // NOT an endorsement. On an Ally-authored PR the author holds the reviewer
+    // App credential, so they can submit the retiring review themselves — and
+    // a carried red goes green on their own say-so. This is the live state the
+    // row describes, and the one thing in it that code here cannot fix:
+    // requiring independence for a retirement makes an agent PR permanently
+    // red once any finding is raised, because on such a PR nothing independent
+    // ever writes a ledger (BLO-29711's anti-deadlock constraint).
+    //
+    // Pinned as a characterization test so that when ask (A) re-scopes the
+    // agent credential, whoever does it has an assertion that fails and points
+    // at this paragraph, instead of a silent behaviour nobody re-checks.
+    const raised = blockingReview(OLD_HEAD);
+    const selfRetiring = reviewBody(CURRENT_HEAD, [
+      "### Prior Findings Dispositioned (1)",
+      `- **prior:${OLD_HEAD.slice(0, 7)} important 1** — fixed — re-checked against this head.`,
+      "### Critical Issues (0)",
+      "### Important Issues (0)",
+    ]);
+
+    const withoutLedger = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: ALLY_BOT_LOGIN,
+      prAuthorLane: null,
+      comments: [allyComment(raised, "2026-10-20T09:00:00Z")],
+    });
+    const withSelfLedger = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: ALLY_BOT_LOGIN,
+      prAuthorLane: null,
+      comments: [allyComment(raised, "2026-10-20T09:00:00Z"), allyComment(selfRetiring, "2026-10-20T10:00:00Z")],
+    });
+
+    expect(withoutLedger.state).toBe("failure");
+    expect(withSelfLedger.state).toBe("success");
+    // The positive is still withheld, which is the part that IS closed: the
+    // author flips the red, but never earns `clean`.
+    expect(withSelfLedger.outcome).not.toBe("clean");
   });
 });
