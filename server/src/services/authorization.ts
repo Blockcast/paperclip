@@ -1733,6 +1733,14 @@ export function authorizationService(db: Db) {
   // Derived from `issue_relations` at decision time, so cutting the edge or
   // reassigning X revokes it with no operator action. Never `issue:mutate`: a
   // dependency is a reason to talk to the owner, not to rewrite their issue.
+  //
+  // An edge the actor declared ITSELF grants nothing. X's blocker set is X's
+  // coordination metadata, which the actor may write via `allow_self`; without
+  // this condition any agent could attach any issue as a blocker of its own
+  // and so comment anywhere, collapsing the "same-company peer" negative
+  // control. Because the blocker sync deletes and re-inserts, an actor that
+  // rewrites its own blocker set also re-stamps the edge and loses the grant —
+  // fail closed, by design.
   async function agentHoldsIssueAcrossDependencyEdge(input: {
     companyId: string;
     issueId: string;
@@ -1751,6 +1759,7 @@ export function authorizationService(db: Db) {
       .where(and(
         eq(issueRelations.companyId, input.companyId),
         eq(issueRelations.type, "blocks"),
+        sql`${issueRelations.createdByAgentId} is distinct from ${input.actorAgentId}`,
         eq(issues.companyId, input.companyId),
         eq(issues.assigneeAgentId, input.actorAgentId),
       ))

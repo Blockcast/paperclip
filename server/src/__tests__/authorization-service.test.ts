@@ -5171,6 +5171,17 @@ describeEmbeddedPostgres("authorization service", () => {
       expect(denied.allowed).toBe(false);
       expect(denied.reason).toBe("deny_missing_grant");
       expect(authorizationDeniedDetails(denied).evaluatedRelations).toContain("dependency_edge");
+
+      // An edge the actor declared itself grants nothing: otherwise any agent
+      // could attach any issue as a blocker of its own and comment anywhere.
+      await db.insert(issueRelations).values({
+        companyId: company.id,
+        issueId: producer.id,
+        relatedIssueId: consumer.id,
+        type: "blocks",
+        createdByAgentId: actor.id,
+      });
+      expect((await decideComment()).allowed).toBe(false);
     });
 
     it("blocker edge (escape hatch 3) gates checkout and in_progress, not done", async () => {
