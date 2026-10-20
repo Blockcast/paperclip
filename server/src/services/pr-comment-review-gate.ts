@@ -92,10 +92,37 @@ function fitQuotedTokens(quoted: string[], budget: number): string {
   return budget >= 3 ? `${quoted[0].slice(0, budget - 2)}…"` : "";
 }
 
+/**
+ * Which GitHub surface carried this body (PEN-4431).
+ *
+ * `pull_request_review` is a submitted `POST /pulls/{n}/reviews` object;
+ * `issue_comment` is a plain `POST /issues/{n}/comments`. Both are read, and
+ * both may RAISE a finding — a finding is a finding wherever it is written,
+ * and narrowing the red direction is the one thing this module must not get
+ * wrong. Only the POSITIVE routes distinguish them, because only those credit
+ * a head, and crediting is where the write population matters: posting an
+ * issue comment needs `issues: write`, which is a strictly larger set of
+ * principals than the `pull_requests: write` a review submission needs.
+ *
+ * Measured before narrowing (2026-10-20, `Blockcast/paperclip`): of 83 Ally
+ * consolidated-review bodies across the 40 most recent PRs and all 5 open
+ * ones, 83 were review submissions and 0 were issue comments. So the credit
+ * routes lose nothing real here. The issue-comment reader stays because that
+ * population is a deployment fact about one repo at one time, not a property
+ * of the protocol, and because it is still wanted for the red direction.
+ */
+export type CommentReviewGateSurface = "pull_request_review" | "issue_comment";
+
 export interface CommentReviewGateComment {
   authorLogin: string | null | undefined;
   body: string | null | undefined;
   createdAt: string | Date;
+  /**
+   * Required, with no default, on purpose. A default would let a new call site
+   * reach the credit routes without ever stating which surface it read, which
+   * is exactly the silent re-opening this field exists to prevent.
+   */
+  surface: CommentReviewGateSurface;
 }
 
 /**
@@ -300,6 +327,34 @@ function isAllyConsolidatedReviewComment(
   );
 }
 
+/**
+ * May this body CREDIT a head — claim it clean, accept a residual on it, or
+ * retire an earlier finding (PEN-4431)?
+ *
+ * Strictly narrower than `isAllyConsolidatedReviewComment`, and deliberately
+ * NOT a replacement for it: that predicate still governs every route that can
+ * turn this gate red, so a finding raised in a plain issue comment keeps
+ * blocking exactly as before. Only the positive direction is narrowed.
+ *
+ * What this does and does not buy, stated honestly because the obvious reading
+ * overclaims. It does NOT make the evidence unproducible by the PR author:
+ * while every agent seat holds the reviewer App credential (PEN-4431 ask (A),
+ * PEN-4222), an author who can post a comment as the reviewer can submit a
+ * review as the reviewer too. What it does buy is removing the `issues: write`
+ * population from every credit route, which is a real and strictly smaller
+ * attack surface, and it is the shape Done-when 1 names first. The residual is
+ * closed by re-scoping the credential, not here.
+ */
+function isCreditableAllyReviewSubmission(
+  comment: CommentReviewGateComment,
+  reviewerBotLogin: string,
+): boolean {
+  return (
+    comment.surface === "pull_request_review" &&
+    isAllyConsolidatedReviewComment(comment, reviewerBotLogin)
+  );
+}
+
 interface AttestingComment {
   comment: CommentReviewGateComment;
   attestedHeadSha: string;
@@ -329,6 +384,15 @@ interface CarriedFinding extends AttestingComment {
    * looked at this tree when one did not.
    */
   selfRetiredByAuthorLane: boolean;
+  /**
+   * True when this head would have been retired but for a ledger entry refused
+   * for arriving as a plain issue comment rather than a review submission
+   * (PEN-4431). Separate from `selfRetiredByAuthorLane` rather than folded into
+   * it: the two refusals have different remedies — re-post as a review, versus
+   * get someone else to retire it — and a tail that names the wrong one routes
+   * the author into the loop the conditional tail exists to avoid.
+   */
+  retirementRefusedOffReviewSurface: boolean;
 }
 
 /**
@@ -406,6 +470,11 @@ function headsWithUndispositionedFinding(
   // so an explanation can only ever cite an entry that would otherwise have
   // retired the finding — the discipline `unrecognizedVerbs` already follows.
   const refusedByAuthorLane: typeof ledger = [];
+  // Entries refused for arriving on the issue-comment surface (PEN-4431), kept
+  // for the same reason as the lane bucket: the red has to be able to name its
+  // own cause, and an entry that named the finding must not also be listed as
+  // one the author still owes.
+  const refusedOffReviewSurface: typeof ledger = [];
 
   for (const comment of comments) {
     if (!isAllyConsolidatedReviewComment(comment, reviewerBotLogin)) continue;
@@ -482,9 +551,22 @@ function headsWithUndispositionedFinding(
       // named for and must not swallow. Diverting it too would leave
       // `isExplicitlyBlocked` unable to see it, so the gate would report an
       // unrecognized verb for a finding that carries a perfectly recognized one.
+      // The surface refusal sits beside the lane refusal and under the same
+      // discipline (PEN-4431): it narrows RETIRING only, so `byHead` below is
+      // untouched and a finding raised in an issue comment still reds this
+      // head. Checked after the lane so an entry refused on both reports the
+      // lane — the older, better-understood cause, and the one whose remedy
+      // ("someone else has to retire it") subsumes the other's.
+      const refusedOffSurface = comment.surface !== "pull_request_review";
       for (const entry of extractAllyPriorFindingDispositions(comment.body)) {
         const retiring = entry.kind === "retires" || entry.kind === "defers";
-        const target = refusedByLane && retiring ? refusedByAuthorLane : ledger;
+        const target = !retiring
+          ? ledger
+          : refusedByLane
+            ? refusedByAuthorLane
+            : refusedOffSurface
+              ? refusedOffReviewSurface
+              : ledger;
         target.push({ entry, timeMs: commentTime, attestedHeadSha });
       }
     }
@@ -623,7 +705,9 @@ function headsWithUndispositionedFinding(
     // exists while `carriedTail` says it was refused, which is the routing
     // loop that tail exists to close.
     const named = (finding: AllyFindingRef) =>
-      [...ledger, ...refusedByAuthorLane].some((prior) => namesFinding(prior, headSha, entry.timeMs, finding));
+      [...ledger, ...refusedByAuthorLane, ...refusedOffReviewSurface].some((prior) =>
+        namesFinding(prior, headSha, entry.timeMs, finding),
+      );
     return reported.filter((finding) => !named(finding)).map((finding) => `${finding.severity} ${finding.index}`);
   };
 
@@ -648,6 +732,29 @@ function headsWithUndispositionedFinding(
       (finding) =>
         isDisposed(headSha, entry.timeMs, finding) ||
         refusedByAuthorLane.some(
+          (prior) =>
+            (prior.entry.kind === "retires" || prior.entry.kind === "defers") &&
+            namesFinding(prior, headSha, entry.timeMs, finding),
+        ),
+    );
+  };
+
+  // The surface twin of `retiredOnlyByAuthorLane`, same shape and same
+  // "every finding, not any" discipline: with a second finding genuinely open,
+  // that open finding is the honest cause and naming the refusal would route
+  // the author at the wrong thing. Explains the red; changes no verdict.
+  const retiredOnlyOffReviewSurface = (entry: {
+    attesting: AttestingComment;
+    timeMs: number;
+  }): boolean => {
+    if (refusedOffReviewSurface.length === 0) return false;
+    const headSha = entry.attesting.attestedHeadSha;
+    const reported = extractAllyReportedFindingRefs(entry.attesting.comment.body);
+    if (!reported || reported.length === 0) return false;
+    return reported.every(
+      (finding) =>
+        isDisposed(headSha, entry.timeMs, finding) ||
+        refusedOffReviewSurface.some(
           (prior) =>
             (prior.entry.kind === "retires" || prior.entry.kind === "defers") &&
             namesFinding(prior, headSha, entry.timeMs, finding),
@@ -735,6 +842,7 @@ function headsWithUndispositionedFinding(
       unrecognizedVerbs: unrecognizedVerbsBlocking(entry),
       unnamedFindings: unnamedFindingsBlocking(entry),
       selfRetiredByAuthorLane: retiredOnlyByAuthorLane(entry),
+      retirementRefusedOffReviewSurface: retiredOnlyOffReviewSurface(entry),
     }));
 }
 
@@ -1048,15 +1156,50 @@ export function evaluateCommentReviewGate(input: {
       // in github-app-auth.ts slices at 140 before the POST, so an overlong
       // description is never rejected — it is silently cut, and what it cuts is
       // the tail, which is where the source attribution lives. Pinned by test.
-      const source =
-        parseAllyVerdictBlock(forHead.comment.body).kind === "ok"
-          ? "its structured ally-verdict block"
-          : "prose fallback (no ally-verdict block)";
-      return {
-        state: "success",
-        outcome: "clean",
-        reason: `Ally's most recent consolidated-review comment for this head reports no unresolved findings, per ${source}.`,
-      };
+      // The SURFACE check sits here, on `clean` alone, and deliberately NOT on
+      // the deferral above (PEN-4431). The two look like one rule and are not:
+      //
+      //   - `clean` is the gate's strongest positive. Requiring a review
+      //     submission narrows who can produce it, which is the whole point.
+      //   - `deferred_finding` reads as positive against `carried_finding`,
+      //     but against `clean` it is a DOWNGRADE — it is the only thing that
+      //     tells a reader a residual was accepted rather than fixed, and the
+      //     evidence probe reads it as a veto on `clean`. Gating it on the
+      //     surface therefore makes the probe MORE permissive: the deferral
+      //     stops being heard, nothing vetoes, and a clean vouch lands on a
+      //     head whose review accepted a residual. That is a fail-OPEN, and it
+      //     is the direction this module must not get wrong.
+      //
+      // So the deferral is heard from either surface, under the same reasoning
+      // as the blocking branch above: anything that can only make the verdict
+      // less positive stays surface-blind. Caught by
+      // "a tracked deferral on either surface beats a clean one on the other"
+      // in `evidence-truth.test.ts`, which fails if this check moves back up.
+      if (forHead.comment.surface !== "pull_request_review") {
+        // Held rather than returned, like every other withheld positive: the
+        // carry-forward ledger below still has to run.
+        withheldPositive = {
+          state: "success",
+          outcome: "not_evaluated",
+          // A comment does attest this head and reports nothing blocking,
+          // which is exactly what this marker asserts. `authorIsReviewer` is
+          // deliberately absent: the shape is unreachable for a SURFACE reason
+          // and the evidence probe reads that marker as the identity claim.
+          headAttested: true,
+          reason:
+            "The only comment attesting this head is a plain issue comment, not a review submission.",
+        };
+      } else {
+        const source =
+          parseAllyVerdictBlock(forHead.comment.body).kind === "ok"
+            ? "its structured ally-verdict block"
+            : "prose fallback (no ally-verdict block)";
+        return {
+          state: "success",
+          outcome: "clean",
+          reason: `Ally's most recent consolidated-review comment for this head reports no unresolved findings, per ${source}.`,
+        };
+      }
     }
   }
 
@@ -1098,8 +1241,16 @@ export function evaluateCommentReviewGate(input: {
     // comment attests the current head" there is true of the head and false
     // about the cause, and it routes the author to post another comment — the
     // exact loop the conditional tail exists to avoid.
+    // The surface refusal joins the same ordering and for the same reason: it
+    // too describes an attestation that EXISTS and retires the finding on its
+    // face, so the three "missing attestation" tails below would all be true
+    // of the head and false about the cause. At 49 characters it is inside the
+    // 55 the budget arithmetic below is written against, so it does not move
+    // the 131-character ceiling.
     const carriedTail = carried.selfRetiredByAuthorLane
       ? "; its retirement came from the PR author's own lane."
+      : carried.retirementRefusedOffReviewSurface
+        ? "; its retirement was a comment, not a review."
       : !withheldPositive
         ? "; no comment attests the current head."
         : withheldPositive.authorUnknown
@@ -1664,11 +1815,23 @@ async function executeCommentReviewGateCheck(
     ]);
     if (issueComments == null || prReviews == null) return { posted: false, reason: "fetch_failed" };
 
-    const comments = [...issueComments, ...prReviews].map((comment) => ({
-      authorLogin: comment.login,
-      body: comment.body,
-      createdAt: comment.createdAt,
-    }));
+    // Tagged at the only place that knows, which is here: downstream both
+    // arrays are the same shape and the distinction is unrecoverable once they
+    // are concatenated (PEN-4431). Tag before the concat, never after.
+    const comments: CommentReviewGateComment[] = [
+      ...issueComments.map((comment) => ({
+        authorLogin: comment.login,
+        body: comment.body,
+        createdAt: comment.createdAt,
+        surface: "issue_comment" as const,
+      })),
+      ...prReviews.map((review) => ({
+        authorLogin: review.login,
+        body: review.body,
+        createdAt: review.createdAt,
+        surface: "pull_request_review" as const,
+      })),
+    ];
 
     // Evaluate author-blind FIRST. Only `clean` reads the author, and both red
     // outcomes stand on the comment surfaces alone — so fetching the author up
