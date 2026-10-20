@@ -1,4 +1,4 @@
-import { and, eq, inArray, isNull, notInArray, sql } from "drizzle-orm";
+import { and, eq, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -8,6 +8,7 @@ import {
   instanceUserRoles,
   issueComments,
   issueRecoveryActions,
+  issueRelations,
   issues,
   principalPermissionGrants,
   projects,
@@ -132,6 +133,7 @@ export type AuthorizationDecision = {
     | "allow_issue_mention_grant"
     | "allow_source_scoped_recovery_owner"
     | "allow_issue_creator"
+    | "allow_dependency_edge"
     | "allow_recovery_handoff_grant"
     | "allow_productivity_review_grant"
     | "allow_self"
@@ -152,6 +154,8 @@ export type AuthorizationDecision = {
     | "deny_low_trust_boundary"
     | "deny_scope"
     | "deny_unsupported_action";
+  /** issue:comment denials only: the relations that were checked (BLO-30968). */
+  evaluatedRelations?: string[];
   grant?: {
     principalType: PrincipalType;
     principalId: string;
@@ -656,11 +660,26 @@ function scopeBoolean(scope: Record<string, unknown> | null | undefined, key: st
   return scope?.[key] === true;
 }
 
+// Every relation `decideBase` evaluates for an agent's `issue:comment`, in
+// order. Returned on denial so the next "why was I refused" is answerable from
+// the 403. Keep in step with docs/security/issue-authorization-model.md.
+export const ISSUE_COMMENT_EVALUATED_RELATIONS = [
+  "assignee",
+  "unassigned_issue",
+  "creator",
+  "manager_of_assignee",
+  "agent_mention",
+  "recovery_handoff",
+  "dependency_edge",
+  "productivity_review",
+] as const;
+
 export function authorizationDeniedDetails(decision: AuthorizationDecision) {
   return {
     ...(decision.code ? { code: decision.code } : {}),
     reason: decision.reason,
     boundary: authorizationBoundaryLabel(decision.reason),
+    ...(decision.evaluatedRelations ? { evaluatedRelations: decision.evaluatedRelations } : {}),
     ...(decision.policyResolution ? { resolution: decision.policyResolution } : {}),
   };
 }
@@ -1702,6 +1721,43 @@ export function authorizationService(db: Db) {
     return true;
   }
 
+  // BLO-30968: comment-only reach across a declared dependency edge. The edge
+  // is first-class for scheduling (checkout, `dependency_blocked` parking,
+  // `blockerAttention`), and the one message that most needs to cross it —
+  // "I am blocked by you, here is what I need you to emit" — is by
+  // construction from a non-assignee to a different assignee, so before this
+  // path it was always denied.
+  //
+  // The rule: the actor may COMMENT on issue T when a `blocks` edge joins T and
+  // some issue X in either direction, and the actor is X's current assignee.
+  // Derived from `issue_relations` at decision time, so cutting the edge or
+  // reassigning X revokes it with no operator action. Never `issue:mutate`: a
+  // dependency is a reason to talk to the owner, not to rewrite their issue.
+  async function agentHoldsIssueAcrossDependencyEdge(input: {
+    companyId: string;
+    issueId: string;
+    actorAgentId: string;
+  }) {
+    const [row] = await db
+      .select({ id: issueRelations.id })
+      .from(issueRelations)
+      .innerJoin(
+        issues,
+        or(
+          and(eq(issueRelations.issueId, input.issueId), eq(issues.id, issueRelations.relatedIssueId)),
+          and(eq(issueRelations.relatedIssueId, input.issueId), eq(issues.id, issueRelations.issueId)),
+        ),
+      )
+      .where(and(
+        eq(issueRelations.companyId, input.companyId),
+        eq(issueRelations.type, "blocks"),
+        eq(issues.companyId, input.companyId),
+        eq(issues.assigneeAgentId, input.actorAgentId),
+      ))
+      .limit(1);
+    return Boolean(row);
+  }
+
   function allowRecoveryHandoffGrant(action: AuthorizationAction): AuthorizationDecision {
     return allow({
       action,
@@ -2604,6 +2660,21 @@ export function authorizationService(db: Db) {
       ) {
         return allowRecoveryHandoffGrant(input.action);
       }
+      if (
+        input.action === "issue:comment" &&
+        resource?.issueId &&
+        await agentHoldsIssueAcrossDependencyEdge({
+          companyId,
+          issueId: resource.issueId,
+          actorAgentId,
+        })
+      ) {
+        return allow({
+          action: input.action,
+          reason: "allow_dependency_edge",
+          explanation: "Allowed because the actor is assigned an issue joined to this one by a blocks edge.",
+        });
+      }
       // Unlike the two grants above this covers `issue:mutate` as well as
       // `issue:comment`: a productivity review's entire remedy set (block,
       // cancel, reassign, snooze) is a mutation of the source issue, so a
@@ -2634,6 +2705,18 @@ export function authorizationService(db: Db) {
           action: input.action,
           reason: "deny_missing_grant",
           explanation: "Review and escalation issues cannot be claimed through generic unassigned-issue access.",
+        });
+      }
+      // Name every relation that was evaluated, so a denial is diagnosable from
+      // the error rather than from reading this function (BLO-30968). The
+      // relations NOT listed — parent/sibling, project lead, same-company peer —
+      // are excluded on purpose; see docs/security/issue-authorization-model.md.
+      if (input.action === "issue:comment") {
+        return deny({
+          action: input.action,
+          reason: "deny_missing_grant",
+          explanation: "No issue:comment relation holds between the actor and this issue.",
+          evaluatedRelations: [...ISSUE_COMMENT_EVALUATED_RELATIONS],
         });
       }
     }

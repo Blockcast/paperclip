@@ -69,6 +69,7 @@ chain, at any depth.
 | Agent — `agent://` **mentioned** on the thread | A | — | — |
 | Agent — holds a **recovery handoff** on the issue | A | — | — |
 | Agent — assigned the issue's **productivity review** | A | **A** | A (via `issue:mutate`) |
+| Agent — assignee of an issue joined to this one by a **`blocks` edge**, either direction | A | — | — |
 | Agent — **project lead**, no other relation | — | — | — |
 | Agent — assignee of the **parent** or a **sibling** issue | — | — | — |
 | Agent — same company, no relation | — | — | — |
@@ -95,6 +96,7 @@ and a reason disagree, trust the reason. It is also what the tests assert on.
 | `allow_manager_chain` | `:2466` | A | — | — | `isManagerOf(actor, resource.assigneeAgentId)` |
 | `allow_issue_mention_grant` | `:2481` | A | — | — | a live, non-deleted `agent://<actor>` mention from a principal entitled to grant it |
 | `allow_recovery_handoff_grant` | `:2493` | A | — | — | an open recovery handoff naming the actor |
+| `allow_dependency_edge` | `agentHoldsIssueAcrossDependencyEdge` | A | — | — | a `blocks` row in `issue_relations` joins the target and some issue X (either direction), and the actor is X's **current** assignee; derived at decision time, so cutting the edge or reassigning X revokes it (`BLO-30968`) |
 | `allow_productivity_review_grant` | `:2518` | A | **A** | — | the actor is assigned the review whose `originId` is this issue |
 | `allow_explicit_grant` | `:857` via `:2411` | n/a | n/a | A | **coordination metadata only** — `tasks:assign`/`tasks:assign_scope` **and** `isManagerOf(assignee)` |
 
@@ -110,7 +112,13 @@ Terminal denials:
   recovery or review shell (`BLO-19094`).
 - `:2398`, `:2404` `deny_scope` — coordination metadata on a self-owned, unassigned,
   or unmanaged issue.
-- `:2637` `deny_missing_grant` — the fallthrough. `permissionForAction` returns
+- `deny_missing_grant` for `issue:comment` — returned at the end of the agent
+  issue block with `details.evaluatedRelations` (`ISSUE_COMMENT_EVALUATED_RELATIONS`),
+  the ordered list of every relation checked, so a refusal is diagnosable from
+  the 403 rather than from this file. A relation not in that list is excluded
+  on purpose if it appears in the negative controls below, and unmodelled
+  otherwise — adding one means adding it there, here, and in the matrix.
+- `:2637` `deny_missing_grant` — the fallthrough (now reached by `issue:mutate`). `permissionForAction` returns
   `null` for all three issue actions (`:186`, `:192`), so the generic
   `permissionKey` grant fallback at `:2597` never fires for them. **No permission
   grant of any kind can satisfy `issue:mutate`.** That is deliberate: issue writes
@@ -121,8 +129,16 @@ Terminal denials:
 ## Why `comment` and `description` are deliberately asymmetric
 
 The asymmetry is **intended**, and it is the point of the model rather than an
-oversight. Four relations (creator, manager, mention, recovery handoff) grant
-`issue:comment` and stop there.
+oversight. Five relations (creator, manager, mention, recovery handoff,
+dependency edge) grant `issue:comment` and stop there.
+
+The dependency edge is in that set because it is the one cross-issue message
+that is always from a non-assignee to a different assignee: "I am blocked by
+you, here is what I need you to emit" (`BLO-30968`, where a silent
+field-name mismatch in a producer contract could only be reported on a GitHub
+PR its reader had no reason to open). A comment is append-only, so reach along
+an edge the graph already declares for scheduling costs nothing the model
+protects.
 
 1. **They are different kinds of act.** A comment is append-only, attributed, and
    timestamped: it adds a claim to the record without removing one. A `description`
@@ -189,6 +205,9 @@ without re-deciding the model itself:
   `issue:coordination_metadata` (`deny_scope`).
 - A mentioned agent: denied `issue:mutate` — the mention grants reply, not rewrite.
 - An agent assigned a parent or sibling issue: denied on the target issue.
+  Ancestry is not a declared dependency; only a `blocks` edge is.
+- An agent across a `blocks` edge: denied `issue:mutate` — the edge grants a
+  voice to the owner, not a rewrite of their issue.
 - Any actor in a different company: denied regardless of grants or role.
 
 ## Regression test

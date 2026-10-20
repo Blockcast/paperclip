@@ -10,6 +10,7 @@ import {
   instanceUserRoles,
   issueComments,
   issueRecoveryActions,
+  issueRelations,
   issues,
   principalPermissionGrants,
   projects,
@@ -4695,6 +4696,8 @@ describeEmbeddedPostgres("authorization service", () => {
       | "project_lead"
       | "parent_issue_assignee"
       | "sibling_issue_assignee"
+      | "blocked_issue_assignee"
+      | "blocking_issue_assignee"
       | "peer"
       | "other_company";
 
@@ -4771,6 +4774,8 @@ describeEmbeddedPostgres("authorization service", () => {
         case "recovery_handoff":
         case "productivity_reviewer":
         case "project_lead":
+        case "blocked_issue_assignee":
+        case "blocking_issue_assignee":
         case "peer": {
           actorAgentId = (await createAgent(db, company.id, { role: "engineer" })).id;
           break;
@@ -4848,6 +4853,23 @@ describeEmbeddedPostgres("authorization service", () => {
           cause: "stranded_assigned_issue",
           fingerprint: `matrix-${randomUUID()}`,
           nextAction: "Hand the diagnosis back to the previous owner.",
+        });
+      }
+
+      if (relation === "blocked_issue_assignee" || relation === "blocking_issue_assignee") {
+        // BLO-30968: the actor holds X; a `blocks` edge joins X and the target.
+        // `blocked_issue_assignee` is the BLO-30925 -> BLO-30924 shape: the
+        // target blocks the actor's issue, and the actor needs to tell its owner.
+        const held = await createIssue(db, company.id, {
+          title: `Matrix dependency held by the actor (${relation})`,
+          assigneeAgentId: actorAgentId,
+          createdByAgentId: actorAgentId,
+        });
+        await db.insert(issueRelations).values({
+          companyId: company.id,
+          issueId: relation === "blocked_issue_assignee" ? issue.id : held.id,
+          relatedIssueId: relation === "blocked_issue_assignee" ? held.id : issue.id,
+          type: "blocks",
         });
       }
 
@@ -5023,6 +5045,24 @@ describeEmbeddedPostgres("authorization service", () => {
         ],
       },
       {
+        relation: "blocked_issue_assignee",
+        note: "BLO-30968 — the target blocks the actor's issue: reply across the edge, never rewrite",
+        cells: [
+          { action: "issue:comment", allowed: true, reason: "allow_dependency_edge" },
+          { action: "issue:mutate", allowed: false, reason: "deny_missing_grant" },
+          { action: "issue:coordination_metadata", allowed: false, reason: "deny_scope" },
+        ],
+      },
+      {
+        relation: "blocking_issue_assignee",
+        note: "BLO-30968 — the actor's issue blocks the target: the edge is symmetric for comment",
+        cells: [
+          { action: "issue:comment", allowed: true, reason: "allow_dependency_edge" },
+          { action: "issue:mutate", allowed: false, reason: "deny_missing_grant" },
+          { action: "issue:coordination_metadata", allowed: false, reason: "deny_scope" },
+        ],
+      },
+      {
         relation: "peer",
         note: "negative control — same company, no relation",
         cells: [
@@ -5063,9 +5103,9 @@ describeEmbeddedPostgres("authorization service", () => {
     it("covers every relation the model documents, in both directions", () => {
       // Guards against a row being deleted to make a failure go away, and
       // against a cell being dropped rather than fixed.
-      // 17 = the 16 rows of the doc's grid, with its parent-or-sibling row
-      // modelled as two relations.
-      expect(MATRIX).toHaveLength(17);
+      // 19 = the 17 rows of the doc's grid, with its parent-or-sibling and
+      // dependency-edge rows each modelled as two relations.
+      expect(MATRIX).toHaveLength(19);
       for (const row of MATRIX) {
         expect(row.cells.map((cell) => cell.action), row.relation).toEqual([
           "issue:comment",
@@ -5085,7 +5125,52 @@ describeEmbeddedPostgres("authorization service", () => {
         "manager_with_tasks_assign",
         "mentioned",
         "recovery_handoff",
+        "blocked_issue_assignee",
+        "blocking_issue_assignee",
       ]));
+    });
+
+    it("dependency-edge comment grant is derived live from the edge and the assignee (BLO-30968)", async () => {
+      const company = await createCompany(db, "Matrix-dependency-edge-live");
+      const owner = await createAgent(db, company.id, { role: "engineer" });
+      const actor = await createAgent(db, company.id, { role: "engineer" });
+      const other = await createAgent(db, company.id, { role: "engineer" });
+      const producer = await createIssue(db, company.id, { title: "Producer", assigneeAgentId: owner.id });
+      const consumer = await createIssue(db, company.id, { title: "Consumer", assigneeAgentId: actor.id });
+      const [edge] = await db.insert(issueRelations).values({
+        companyId: company.id,
+        issueId: producer.id,
+        relatedIssueId: consumer.id,
+        type: "blocks",
+      }).returning();
+      const authorization = authorizationService(db);
+      const decideComment = () => authorization.decide({
+        actor: { type: "agent", agentId: actor.id, companyId: company.id, source: "agent_jwt" },
+        action: "issue:comment",
+        resource: {
+          type: "issue",
+          companyId: company.id,
+          issueId: producer.id,
+          assigneeAgentId: owner.id,
+          createdByAgentId: null,
+          status: producer.status,
+        },
+      });
+
+      expect((await decideComment()).reason).toBe("allow_dependency_edge");
+
+      // Reassigning the actor's side revokes it: the grant follows who holds X.
+      await db.update(issues).set({ assigneeAgentId: other.id }).where(eq(issues.id, consumer.id));
+      expect((await decideComment()).allowed).toBe(false);
+      await db.update(issues).set({ assigneeAgentId: actor.id }).where(eq(issues.id, consumer.id));
+      expect((await decideComment()).allowed).toBe(true);
+
+      // Cutting the edge revokes it, and the denial names what was evaluated.
+      await db.delete(issueRelations).where(eq(issueRelations.id, edge!.id));
+      const denied = await decideComment();
+      expect(denied.allowed).toBe(false);
+      expect(denied.reason).toBe("deny_missing_grant");
+      expect(authorizationDeniedDetails(denied).evaluatedRelations).toContain("dependency_edge");
     });
 
     it("blocker edge (escape hatch 3) gates checkout and in_progress, not done", async () => {
