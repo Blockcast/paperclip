@@ -8,7 +8,7 @@ metadata:
   labels:
     {{- include "paperclip.labels" . | nindent 4 }}
 spec:
-  replicas: 1
+  replicas: {{ .Values.worker.replicas }}
   serviceName: {{ include "paperclip.fullname" . }}
   podManagementPolicy: OrderedReady
   updateStrategy:
