@@ -1438,11 +1438,25 @@ export function formatRefusal(findings: readonly GitPushFinding[]): string {
   // route that exists — NOT to lower the bar. Deliberately still no bypass
   // here: the env-backed overrides that once existed were removed BECAUSE they
   // were one, and that removal stands (PEN-3920 section 5.3).
+  //
+  // PEN-4428: what this asks the reporter to SEND is part of the control. The
+  // only person who reaches this sentence is someone who has judged a refused
+  // value harmless; the detector disagreed. So the one reader who can cause
+  // harm by complying is the one most likely to comply, and an issue tracker
+  // is more durable, more indexed and more widely read than the push that was
+  // just refused. Ask for the two things every narrowing decision in this
+  // family was actually derived from — the binding name and the value's shape
+  // (BLO-41153, BLO-41262, BLO-44747, BLO-46448, BLO-47509, PEN-3920 D4/D5)
+  // — and say plainly not to paste the value. None of those decisions needed
+  // the literal, so the weaker ask is also the complete one.
   lines.push(
     "If this is a false positive: when the value is a test fixture, derive it at runtime instead of embedding a literal — that is what the existing fixtures in this repository do, and it closes the finding permanently rather than suppressing it.",
   );
   lines.push(
-    "When the value cannot leave the blob — a Prometheus label matcher, a Kubernetes object name, any identifier a config file has to spell out — deriving it at runtime is not available, and there is no allowlist or override by design. That case is a known class with a home: see docs/security/PEN-3920-egress-entropy-identifier-decision.md, and file against the detector quoting the refused value so the shape can be measured and the rule narrowed. Identifiers are exonerated under the label name that binds them, so a refusal here usually means a name or a shape the rule does not cover yet.",
+    "When the value cannot leave the blob — a Prometheus label matcher, a Kubernetes object name, any identifier a config file has to spell out — deriving it at runtime is not available, and there is no allowlist or override by design. That case is a known class with a home: see docs/security/PEN-3920-egress-entropy-identifier-decision.md, and file against the detector so the rule can be narrowed. Identifiers are exonerated under the label name that binds them, so a refusal here usually means a name or a shape the rule does not cover yet.",
+  );
+  lines.push(
+    "Report the binding name — the label or key the value sits under — and the value's shape: its length, which character classes it mixes, and how long its longest digit run is. Do not paste the refused value. The name is what decides exoneration and the shape is what the rule is measured on, so those two are enough to narrow it; and if the detector is right rather than you, quoting the value would publish a live credential somewhere more durable and more widely read than the push this door just refused.",
   );
 
   return lines.join("\n");
