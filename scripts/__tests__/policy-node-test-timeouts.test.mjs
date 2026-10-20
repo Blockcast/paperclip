@@ -153,9 +153,11 @@ test("every policy test step has a step-level timeout", () => {
 });
 
 // BLO-31482. Per step, not all at once. Stripping every bound in one mutation
-// passes as long as *some* step is covered, so it cannot tell a guard that sees
-// every step from one that has gone blind to a few -- the exact gap that let
-// nine steps sit unbounded under a green gate.
+// passes as long as *some* step is covered, so it cannot tell a guard that
+// names every step it is handed from one that only checks a few. This proves
+// `assertTimeouts` attributes each step in `boundedTestSteps()`; it cannot see
+// a step the filter dropped. Coverage of the workflow is pinned by the scope
+// test below.
 test("the timeout guard fails when any single test step loses its bound", () => {
   const steps = boundedTestSteps();
   const cap = policyJobCap();
@@ -172,11 +174,15 @@ test("the timeout guard fails when any single test step loses its bound", () => 
   }
 });
 
-test("the test-step filter sees pnpm-aliased and Python Test steps (BLO-31482)", () => {
+// One step per half of the union, so each half has a failing mutation: the
+// `Test ` names catch a revert to `node --test`-only, and the `Validate *` step
+// catches a "simplification" to name-only.
+test("the test-step filter sees pnpm-aliased, Python and non-Test node --test steps (BLO-31482)", () => {
   const names = boundedTestSteps().map(stepName);
   for (const name of [
     "Test ip-address security override",
     "Test stalled-Ally-review sweep decision logic (BLO-28203)",
+    "Validate pending-migration deploy pre-flight",
   ]) {
     assert.ok(names.includes(name), `"${name}" must be in the bounded-step scope`);
   }
