@@ -3,9 +3,10 @@
  *
  * WHY THIS EXISTS
  *
- * The recovery chain in `index.ts` is eight sequential passes. Only pass 1
+ * The recovery chain in `index.ts` is nine sequential passes (eight when this
+ * module was written; pass 9 was added by PEN-4385). Only pass 1
  * (`reconcileStrandedAssignedIssues`) was instrumented — `pass-timing.ts`
- * measures *inside* it. Passes 2-8 had no timing at all, and the chain's own
+ * measures *inside* it. Every later pass had no timing at all, and the chain's own
  * gauge (`paperclip_heartbeat_recovery_chain_duration_seconds`) reports only
  * the total. So the difference between the two was the entire measurement:
  * subtract pass 1 from the chain and whatever is left is "passes 2-8", with no
@@ -84,8 +85,8 @@ export interface RecoveryChainTimer {
   time<T>(passIndex: number, pass: string, run: () => Promise<T>): Promise<T>;
   /**
    * `time()` curried for use directly as a `.then()` argument, so wiring a pass
-   * into the chain does not re-indent its body — which keeps the diff on an
-   * eight-pass chain reviewable.
+   * into the chain does not re-indent its body — which keeps the diff on a
+   * multi-pass chain reviewable.
    */
   pass<T>(passIndex: number, pass: string, run: () => Promise<T>): () => Promise<T>;
   /**

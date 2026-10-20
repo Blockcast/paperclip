@@ -1687,6 +1687,21 @@ export async function startServer(): Promise<StartedServer> {
           }
 
           try {
+            // PEN-4385: drain any dependency-blocked `queued` rows this process
+            // inherited before waiting a full tick. These age without bound, so
+            // a restart is the cheapest moment to clear the standing backlog.
+            const reapedQueued = await heartbeat.reapUnclaimableQueuedRuns();
+            if (reapedQueued.reaped > 0 || reapedQueued.failed > 0) {
+              logger.warn(
+                { ...reapedQueued },
+                "startup unclaimable-queued-run reap cancelled dependency-blocked queued runs (PEN-4385)",
+              );
+            }
+          } catch (err) {
+            logger.error({ err }, "startup unclaimable-queued-run reap failed");
+          }
+
+          try {
             const deadMonitors = await heartbeat.reconcileUndeliverableIssueMonitors();
             if (deadMonitors.cleared > 0 || deadMonitors.failed > 0) {
               logger.warn(
@@ -2472,6 +2487,21 @@ export async function startServer(): Promise<StartedServer> {
                   logger.warn(
                     { ...contendedReviewerWakes },
                     "periodic contended PR-reviewer wake reconciliation replayed lock-contended review requests (BLO-21995)",
+                  );
+                }
+              }))
+              .then(chainTimer.pass(9, "reapUnclaimableQueuedRuns", async () => {
+                // PEN-4385: cancel `queued` runs whose issue is
+                // dependency-blocked. Nothing else reaps them -- every dispatch
+                // lane pages past an unclaimable row and the only disposition
+                // for one was gated behind a claim that never arrives -- so they
+                // age in `queued` without bound, occupy the dispatch scan's
+                // window, and inflate the queued-age measurand.
+                const reapedQueued = await heartbeat.reapUnclaimableQueuedRuns();
+                if (reapedQueued.reaped > 0 || reapedQueued.failed > 0) {
+                  logger.warn(
+                    { ...reapedQueued },
+                    "periodic unclaimable-queued-run reap cancelled dependency-blocked queued runs (PEN-4385)",
                   );
                 }
               }))

@@ -6,11 +6,11 @@ import { fileURLToPath } from "node:url";
 /**
  * Static guard on the recovery chain's per-pass timing wiring (PEN-4381).
  *
- * The chain in `index.ts` is eight sequential `.then()` passes, and its own
+ * The chain in `index.ts` is nine sequential `.then()` passes, and its own
  * comment already records that it is written as a block rather than an early
  * `return` precisely so that "a pass appended after it still runs". That is the
- * hazard this file exists for: a NINTH pass can be appended, work correctly, and
- * be silently absent from the timing — which is exactly the state this row found
+ * hazard this file exists for: a further pass can be appended, work correctly,
+ * and be silently absent from the timing — which is exactly the state this row found
  * the chain in, with passes 2-8 unmeasured while pass 1 and the chain total were
  * both instrumented. The failure is invisible to everything else:
  *
@@ -59,14 +59,14 @@ describe("recovery chain per-pass timing wiring (PEN-4381)", () => {
 
     // Not anchored on `chainTimer.` — pass 1 is the chain HEAD, so its receiver
     // sits on the `trackHeartbeatSchedulerWork(chainTimer` line with a comment
-    // between, and an anchored pattern silently matches only passes 2-8. The
+    // between, and an anchored pattern silently matches only the later passes. The
     // slice is already scoped to the chain, so the bare `.time(`/`.pass(` is
     // unambiguous here.
     const timed = [...body.matchAll(/\.(?:time|pass)\(\s*(\d+)\s*,\s*"([A-Za-z]+)"/g)]
       .map((m) => ({ index: Number(m[1]), name: m[2] }));
 
-    expect(timed.length).toBe(8);
-    expect(timed.map((t) => t.index)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(timed.length).toBe(9);
+    expect(timed.map((t) => t.index)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
     expect(timed.map((t) => t.name)).toEqual([
       "reconcileStrandedAssignedIssues",
       "reconcileIssueGraphLiveness",
@@ -76,6 +76,9 @@ describe("recovery chain per-pass timing wiring (PEN-4381)", () => {
       "reconcileResolvedBlockerDependents",
       "reconcileFailedWakeDispatches",
       "reconcileContendedPrReviewerWakes",
+      // PEN-4385. The ninth pass this file's docblock anticipated: it was
+      // appended, worked, and was caught here before it could run untimed.
+      "reapUnclaimableQueuedRuns",
     ]);
   });
 

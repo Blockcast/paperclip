@@ -505,13 +505,16 @@ import {
 import {
   allowsIssueInteractionWake,
   BRANCH_CLAIM_RETRY_AT_CONTEXT_KEY,
+  classifyQueuedRunForDependencyReap,
   deriveCommentId,
   isBranchClaimRetryDeferred,
   isDispatchRankReady,
   isEffectivelyDependencyReadyForDispatch,
   isK8sIsolationRetryDeferred,
   isQueuedRunAdmissionDeferred,
+  isRunClaimable,
   K8S_ISOLATION_RETRY_AT_CONTEXT_KEY,
+  TERMINAL_ISSUE_STATUSES,
 } from "./dispatch-readiness.js";
 import {
   RECOVERY_ORIGIN_KINDS,
@@ -724,7 +727,6 @@ const QUEUED_RUN_DISPATCH_RESUME_CAP_RETRY_DELAY_MS = 1_000;
  * Issue statuses that make any queued run targeting them pointless. Matches the
  * convention used by execution-workspaces / issue-tree-control / routines.
  */
-const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
 const PIPELINE_STAGE_EXIT_ERROR_CODE = "pipeline_stage_exited";
 const PIPELINE_STAGE_EXIT_CANCELLATION_REASON =
   "Cancelled because the pipeline case left the automation issue's originating stage";
@@ -1115,6 +1117,40 @@ export const DEP_BLOCKED_RETRY_REASON = "dependency_blocked";
 export const DEP_BLOCKED_BASE_DELAY_MS = 5 * 60 * 1000;
 export const DEP_BLOCKED_MAX_DELAY_MS = 60 * 60 * 1000;
 export const DEP_BLOCKED_MAX_RETRY_ATTEMPTS = 12;
+
+/**
+ * How long a run must have sat in `queued` before the out-of-band reaper will
+ * cancel it for dependency blockers (PEN-4385).
+ *
+ * This is a grace window, not a tolerance for the harm. The reap's disposition
+ * is identical to what `claimQueuedRun` applies the instant it reaches such a
+ * row, so a zero window would be defensible on correctness grounds -- the
+ * window exists because blockers routinely resolve on the order of seconds (an
+ * agent finishing the blocking issue), and cancelling a run that would have
+ * become claimable moments later spends a wake to save nothing.
+ *
+ * Strictly greater than {@link DEP_BLOCKED_BASE_DELAY_MS} (5 min) on purpose:
+ * the enqueue-time park already judged 5 minutes the right first look at a
+ * blocked issue, and a reaper that fired sooner than the park's own first retry
+ * would be claiming to know better than the mechanism it defers to. 10 minutes
+ * also leaves the measurand (PEN-4280 cites a 10.9 h inflated head, alerting at
+ * 4 h) bounded two orders of magnitude below where it pages.
+ */
+export const UNCLAIMABLE_QUEUED_RUN_REAP_MIN_AGE_MS = 10 * 60 * 1000;
+
+/**
+ * Rows read per reaper batch, and batches per sweep. The product (5,000) is the
+ * most one pass will examine.
+ *
+ * Bounds a pass, not the population: an unexhausted pass logs and the next
+ * sweep resumes from the top of the queue, which is correct because the cursor
+ * walks oldest-first and the oldest rows are the ones this exists to clear.
+ * Sized well above any observed queued depth (the depth alert fires in the
+ * tens) so the bound is a backstop on the pathological case rather than a
+ * routine throttle.
+ */
+export const UNCLAIMABLE_QUEUED_RUN_REAP_BATCH_SIZE = 200;
+export const UNCLAIMABLE_QUEUED_RUN_REAP_MAX_BATCHES = 25;
 
 /**
  * Choose the durable reason for a timer wake that did not dispatch.
@@ -7992,40 +8028,11 @@ function shouldRequireIssueCommentForWake(
   );
 }
 
-/**
- * The single definition of "is this queued run's issue actually claimable
- * right now" (BLO-22091). Every dispatch lane's eligibility test
- * (`foundReadyCritical`, `foundReadyRecovery`, `foundReadyAbsolute`) calls
- * this and nothing else, so a future change to any one screen cannot
- * silently desynchronize the lanes from what the claim path actually
- * accepts — the exact shape of leaks 2-5 (BLO-21792), which were each one
- * site re-deriving this verdict slightly differently from the others.
- *
- * Three screens, matching what `claimQueuedRun` applies to a routine
- * (non-reopen) queued run:
- *   1. The issue must exist and be non-terminal (`TERMINAL_ISSUE_STATUSES`).
- *   2. It must not be a k8s-isolation retry still waiting on its timestamp.
- *   3. It must be dependency-ready, or exempted via a verified issue-
- *      interaction wake (`isEffectivelyDependencyReadyForDispatch`, in
- *      `dispatch-readiness.ts`).
- *
- * `claimQueuedRun`'s own dependency-blocker gate calls
- * `isEffectivelyDependencyReadyForDispatch` directly rather than this whole
- * predicate, and the `dispatchRank` invocation below calls the narrower
- * sibling `isDispatchRankReady` instead of this — see that function's
- * comment for why terminal-status can't be folded in there without
- * reintroducing an unbounded wait for a different exemption.
- */
-function isRunClaimable(
-  contextSnapshot: Record<string, unknown> | null | undefined,
-  issue: { status: string } | null | undefined,
-  readiness: { isDependencyReady: boolean } | null | undefined,
-  now: Date,
-): boolean {
-  if (!issue || TERMINAL_ISSUE_STATUSES.has(issue.status)) return false;
-  if (isQueuedRunAdmissionDeferred(contextSnapshot, now)) return false;
-  return isEffectivelyDependencyReadyForDispatch(contextSnapshot, readiness);
-}
+// `isRunClaimable` -- the single "can dispatch claim this row" predicate every
+// lane calls -- now lives in `dispatch-readiness.ts` beside its two siblings
+// (PEN-4385). It moved so the out-of-band reaper can hold it as a safety
+// interlock without importing this module; the body is unchanged. See that
+// file for why re-derivation, not inconvenience, is the bug class here.
 
 async function listUnresolvedBlockerSummaries(
   dbOrTx: Pick<Db, "select">,
@@ -24354,15 +24361,38 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return claimed;
   }
 
+  /**
+   * The authoritative disposition for "this queued run's issue is dependency
+   * blocked": cancel the run, mark its wakeup skipped, release the issue's
+   * execution lock, and undo the `in_progress` its checkout wrote.
+   *
+   * `requireQueued` picks which write does the cancelling, and the choice is
+   * about who is holding what:
+   *
+   *   - `claimQueuedRun` (default, `false`) runs under the agent start lock on a
+   *     row it has just read as `queued`, so nothing can move the row underneath
+   *     it and the by-id `setRunStatus` is safe. Left exactly as it was.
+   *   - `reapUnclaimableQueuedRuns` (PEN-4385) holds NO lock -- it is an
+   *     out-of-band sweep that may run on any replica concurrently with a
+   *     dispatch pass on the same row. `setRunStatus` is an unguarded set-by-id
+   *     that always reports success, so without the CAS this sweep could cancel
+   *     a run a dispatcher had just claimed to `running` (the BLO-20396 shape,
+   *     one hazard class worse: there the duplicate was a log line, here it is a
+   *     live run). `setRunStatusIfQueued` makes exactly one caller the winner,
+   *     and a loser returns before touching the wakeup, the issue lock, or the
+   *     checkout status -- so losing the race is a clean no-op, not a partial
+   *     teardown of someone else's run.
+   */
   async function cancelQueuedRunForBlockedDependencies(
     run: typeof heartbeatRuns.$inferSelect,
     issueId: string,
     unresolvedBlockerIssueIds: string[],
+    opts?: { requireQueued?: boolean },
   ) {
     const now = new Date();
     const reason =
       "Cancelled because issue dependencies are still blocked; Paperclip will wake the assignee when blockers resolve";
-    const cancelled = await setRunStatus(run.id, "cancelled", {
+    const patch = {
       finishedAt: now,
       error: reason,
       errorCode: "issue_dependencies_blocked",
@@ -24374,7 +24404,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         timeoutSource: "dependency_gate",
         timeoutFired: false,
       },
-    });
+    };
+    // The two writers return different shapes: `setRunStatus` yields the row or
+    // null, `setRunStatusIfQueued` yields `{ run, updated }` where `updated`
+    // false means another writer won the CAS. Normalize to "the row we actually
+    // cancelled, or null".
+    const cancelled = opts?.requireQueued
+      ? await setRunStatusIfQueued(run.id, "cancelled", patch).then((result) =>
+          result.updated ? result.run : null,
+        )
+      : await setRunStatus(run.id, "cancelled", patch);
     if (!cancelled) return null;
 
     await setWakeupStatus(run.wakeupRequestId, "skipped", {
@@ -29776,6 +29815,292 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     return { scanned: candidates.length, woken, skipped, failed };
+  }
+
+  /**
+   * PEN-4385 — reap a `queued` run whose issue is dependency-blocked.
+   *
+   * ## The defect
+   *
+   * A dependency-blocked *wake* is handled correctly: `enqueueWakeup` parks it
+   * into `scheduled_retry` under {@link DEP_BLOCKED_RETRY_REASON}, with a retry
+   * budget, a wall-clock ceiling, and a promote-on-unblock path. A parked run is
+   * not `queued`, so it is correctly invisible to every queue-age gauge.
+   *
+   * The gap is a run that is ALREADY `queued` when its issue becomes un-ready.
+   * Enqueue-time screening cannot close it, because the commoner shape is a run
+   * enqueued against a ready issue that is blocked *afterwards*. Such a row is
+   * unclaimable, so:
+   *
+   *   1. every dispatch lane pages past it, and `dispatchRank` files it at rank
+   *      12+, where by design it "must not escalate to the front, however long
+   *      it has waited" (BLO-22091); and
+   *   2. the only thing that cancels it,
+   *      {@link cancelQueuedRunForBlockedDependencies}, had exactly ONE call
+   *      site -- inside `claimQueuedRun` -- so it fired only on a claim that
+   *      never came.
+   *
+   * The dispatch scan carries the row into its candidate pool precisely so the
+   * claim gate can cancel it, and on a quiet queue that works. It stops working
+   * under load: the claim loop breaks the moment `claimedRuns.length >=
+   * availableSlots`, and a rank-12+ row sorts after everything runnable, so a
+   * steady supply of ready work means the loop never reaches it. That makes the
+   * leak load-dependent, which is why it reads as a dispatcher fault rather than
+   * as undispatchable work.
+   *
+   * Measured harm (PEN-4280 §1): unbounded aging in `queued`, occupancy of
+   * per-agent queue depth and of the dispatch scan's bounded window -- which is
+   * what the scan's resume-cursor workaround for "a dependency-blocked prefix
+   * that never drains" exists to survive -- and inflation of
+   * `pg_heartbeat_run_queue_backlog_by_agent_oldest_unparked_queued_seconds`,
+   * which cost three days of triage on a healthy dispatcher. Four queued runs
+   * stacked on one `blocked` issue inside 17 minutes on 2026-10-18.
+   *
+   * ## Cancel, not park
+   *
+   * This does exactly what the claim path would have done had the claim arrived:
+   * it calls the same {@link cancelQueuedRunForBlockedDependencies}. Parking the
+   * row into the `dependency_blocked` `scheduled_retry` lane was the other
+   * candidate and is NOT used, because the cancel already has the property the
+   * park would have been bought for: when the blockers resolve,
+   * {@link reconcileResolvedBlockerDependents} wakes the assignee. That sweep is
+   * an existing, independently-tested mechanism and is exactly what the cancel
+   * reason promises the reader. Parking would instead have required
+   * transplanting a `queued` row into a lineage (`depBlockedFirstParkedAt`
+   * origin carry, attempt budget, blocker-set churn cancel, interaction-wake
+   * recovery) built around rows that are INSERTED parked, with no second
+   * disposition to reconcile against -- new state semantics to buy a wake that
+   * already exists.
+   *
+   * So the fix is one call site, not one state machine: the disposition is
+   * unchanged and authoritative, and all that changes is that something other
+   * than a claim now reaches it.
+   *
+   * ## What it will not touch
+   *
+   * The eligibility verdict is {@link classifyQueuedRunForDependencyReap}, whose
+   * first and binding arm is `isRunClaimable` -- the dispatcher's own predicate,
+   * whole. Nothing about claimability is re-derived here; see
+   * `dispatch-readiness.ts` for why that matters more on this reader than on any
+   * other. In particular the issue-interaction-wake exemption is preserved for
+   * free: a wake carrying a comment id is reported `claimable` and left alone,
+   * which is the one case in this population with a person waiting on it.
+   *
+   * Terminal-issue rows are left to `evaluateQueuedRunStaleness` (which is
+   * resume-intent-aware, as this is not) and admission-deferred rows are left to
+   * their own timestamps.
+   */
+  async function reapUnclaimableQueuedRuns(opts?: {
+    now?: Date;
+    minQueuedAgeMs?: number;
+    batchSize?: number;
+    maxBatches?: number;
+  }) {
+    const now = opts?.now ?? new Date();
+    const minQueuedAgeMs = opts?.minQueuedAgeMs ?? UNCLAIMABLE_QUEUED_RUN_REAP_MIN_AGE_MS;
+    const batchSize = Math.max(1, opts?.batchSize ?? UNCLAIMABLE_QUEUED_RUN_REAP_BATCH_SIZE);
+    const maxBatches = Math.max(1, opts?.maxBatches ?? UNCLAIMABLE_QUEUED_RUN_REAP_MAX_BATCHES);
+    const cutoff = new Date(now.getTime() - minQueuedAgeMs);
+
+    let scanned = 0;
+    let reaped = 0;
+    let raced = 0;
+    let failed = 0;
+    let batches = 0;
+    let exhausted = false;
+    const skippedByReason = new Map<string, number>();
+    // Keyset on (agent_id, created_at, id) -- deliberately the exact column list
+    // and order of `heartbeat_runs_agent_queued_dispatch_idx`, which is partial
+    // on `status = 'queued'` (migration 0237). That makes this scan an index-
+    // only walk of the queued population with no sort node. A global
+    // `(created_at, id)` order reads more naturally for a fleet-wide sweep and
+    // was the first cut, but every queued index in this schema leads with
+    // `agent_id`, so it would have had to sort whatever the partial index
+    // returned. Visiting agent-by-agent instead of globally-oldest-first costs
+    // nothing here: the sweep has no priority semantics -- it visits every
+    // eligible row, and the order it finds them in does not change any verdict.
+    //
+    // The AGE filter is on `coalesce(queued_at, created_at)` because that is
+    // when the row entered `queued` -- a run promoted out of a long
+    // `scheduled_retry` backoff has an old `created_at` and a fresh `queued_at`,
+    // and ageing it off `created_at` would reap it on contact for a wait it
+    // never served in this status. That expression is not in this index, so it
+    // is evaluated as a filter on the rows the index returns rather than as a
+    // range bound; the queued population is small (the depth alert fires in the
+    // tens) so that is a few dozen comparisons, not a scan of run history.
+    let cursor: { agentId: string; createdAt: Date; id: string } | null = null;
+
+    while (batches < maxBatches) {
+      batches += 1;
+      // Conditions and the result are both annotated explicitly: `cursor` is
+      // written from this query's own last row, so leaving either to inference
+      // makes `page` depend on itself (TS7022).
+      const pageConditions: Array<SQL | undefined> = [
+        eq(heartbeatRuns.status, "queued"),
+        isNotNull(heartbeatRuns.contextIssueId),
+        // Written as one boolean fragment with an explicitly stringified,
+        // explicitly cast bound value. `lte(sql`coalesce(...)`, cutoff)` type-
+        // checks and then fails at runtime: drizzle maps a JS `Date` using the
+        // COLUMN's type, and a raw `sql` expression has none, so the driver is
+        // handed a `Date` it cannot bind.
+        sql`coalesce(${heartbeatRuns.queuedAt}, ${heartbeatRuns.createdAt}) <= ${cutoff.toISOString()}::timestamptz`,
+        cursor
+          ? or(
+              gt(heartbeatRuns.agentId, cursor.agentId),
+              and(
+                eq(heartbeatRuns.agentId, cursor.agentId),
+                gt(heartbeatRuns.createdAt, cursor.createdAt),
+              ),
+              and(
+                eq(heartbeatRuns.agentId, cursor.agentId),
+                eq(heartbeatRuns.createdAt, cursor.createdAt),
+                gt(heartbeatRuns.id, cursor.id),
+              ),
+            )
+          : undefined,
+      ];
+      const page: Array<typeof heartbeatRuns.$inferSelect> = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(and(...pageConditions))
+        .orderBy(asc(heartbeatRuns.agentId), asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
+        .limit(batchSize);
+
+      if (page.length === 0) {
+        exhausted = true;
+        break;
+      }
+      const lastRow = page[page.length - 1];
+      cursor = {
+        agentId: lastRow.agentId,
+        createdAt: new Date(lastRow.createdAt),
+        id: lastRow.id,
+      };
+      scanned += page.length;
+
+      // One readiness batch per company, keyed exactly the way the dispatcher
+      // keys it (`listQueuedRunDependencyReadiness`): the UUID screen is what
+      // keeps a malformed context snapshot out of an `IN (...)` of issue ids.
+      const runsByCompany = new Map<string, Array<typeof heartbeatRuns.$inferSelect>>();
+      for (const run of page) {
+        const bucket = runsByCompany.get(run.companyId) ?? [];
+        bucket.push(run);
+        runsByCompany.set(run.companyId, bucket);
+      }
+
+      for (const [companyId, companyRuns] of runsByCompany) {
+        const readinessByIssueId = await listQueuedRunDependencyReadiness(companyId, companyRuns);
+        // Derived from the RUNS, not from `readinessByIssueId.keys()`. The two
+        // are equal today only because `listIssueDependencyReadinessMap`
+        // pre-seeds an entry per requested id; keying the issue read off that
+        // would make a row's issue silently unreadable -- and so skipped as
+        // `issue_missing` rather than judged -- if it ever returned only the
+        // issues it found blockers for.
+        const issueIds = [
+          ...new Set(
+            companyRuns
+              .map((companyRun) => readNonEmptyString(parseObject(companyRun.contextSnapshot).issueId))
+              .filter((id): id is string => Boolean(id && UUID_PATTERN.test(id))),
+          ),
+        ];
+        const issuesById = new Map<string, { id: string; status: string }>();
+        if (issueIds.length > 0) {
+          const issueRows = await db
+            .select({ id: issues.id, status: issues.status })
+            .from(issues)
+            .where(and(eq(issues.companyId, companyId), inArray(issues.id, issueIds)));
+          for (const issue of issueRows) issuesById.set(issue.id, issue);
+        }
+
+        for (const run of companyRuns) {
+          const context = parseObject(run.contextSnapshot);
+          const issueId = readNonEmptyString(context.issueId);
+          if (!issueId || !UUID_PATTERN.test(issueId)) {
+            skippedByReason.set("issue_missing", (skippedByReason.get("issue_missing") ?? 0) + 1);
+            continue;
+          }
+          const verdict = classifyQueuedRunForDependencyReap(
+            context,
+            issuesById.get(issueId) ?? null,
+            readinessByIssueId.get(issueId) ?? null,
+            now,
+          );
+          if (!verdict.reap) {
+            skippedByReason.set(verdict.reason, (skippedByReason.get(verdict.reason) ?? 0) + 1);
+            continue;
+          }
+          try {
+            const cancelled = await cancelQueuedRunForBlockedDependencies(
+              run,
+              issueId,
+              readinessByIssueId.get(issueId)?.unresolvedBlockerIssueIds ?? [],
+              // Out of band: no start lock is held, so the write must lose
+              // cleanly to a concurrent claim rather than stomp it.
+              { requireQueued: true },
+            );
+            if (!cancelled) {
+              // The row stopped being `queued` between the read and the write --
+              // a dispatcher claimed it, or another replica's sweep got there
+              // first. Either way this pass did nothing and says nothing.
+              raced += 1;
+              continue;
+            }
+            reaped += 1;
+            incrementDepBlockedMetric("dep_blocked_queued_reaped");
+            logger.info(
+              {
+                runId: run.id,
+                agentId: run.agentId,
+                issueId,
+                companyId,
+                queuedAgeSeconds: Math.max(
+                  0,
+                  (now.getTime() -
+                    new Date(run.queuedAt ?? run.createdAt).getTime()) /
+                    1000,
+                ),
+                unresolvedBlockerCount:
+                  readinessByIssueId.get(issueId)?.unresolvedBlockerCount ?? 0,
+              },
+              "reapUnclaimableQueuedRuns: cancelled dependency-blocked queued run (PEN-4385)",
+            );
+          } catch (err) {
+            failed += 1;
+            logger.warn(
+              { err, runId: run.id, issueId, companyId },
+              "reapUnclaimableQueuedRuns: failed to cancel dependency-blocked queued run",
+            );
+          }
+        }
+      }
+
+      if (page.length < batchSize) {
+        exhausted = true;
+        break;
+      }
+    }
+
+    if (!exhausted) {
+      // Say so rather than letting a bounded pass read as a drained queue. The
+      // cursor is local to this call, so the remainder is picked up by the next
+      // sweep from the start of the keyset -- which converges, because reaping
+      // removes rows from `status = 'queued'` and so shortens the walk every
+      // pass, but is slower than one pass and is worth knowing about.
+      logger.warn(
+        { scanned, reaped, batches, batchSize },
+        "reapUnclaimableQueuedRuns: hit its batch bound before exhausting the queued backlog",
+      );
+    }
+
+    return {
+      scanned,
+      reaped,
+      raced,
+      failed,
+      batches,
+      exhausted,
+      skipped: Object.fromEntries(skippedByReason),
+    };
   }
 
   /**
@@ -43268,6 +43593,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     reconcileProductivityReviews,
 
     reconcileResolvedBlockerDependents,
+    reapUnclaimableQueuedRuns,
     reconcileUndeliverableIssueMonitors,
     reconcileTaskWatchdogs,
 
