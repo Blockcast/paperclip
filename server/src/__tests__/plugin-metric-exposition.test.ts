@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
   PLUGIN_METRIC_CARDINALITY_BUDGET,
+  PLUGIN_METRIC_CARDINALITY_BUDGET_OVERRIDES,
   PLUGIN_METRIC_DROPPED_METRIC,
   PLUGIN_METRIC_LABEL_VALUE_MAX_LENGTH,
   PLUGIN_METRIC_NAME_BUDGET,
@@ -758,5 +759,28 @@ describe("BLO-32163 — fence-blocked labels survive the two-sided promotion gat
       ),
     ).toBe(true);
     expect(dropped.some((line) => line.includes(`metric="${FENCE_METRIC}"`))).toBe(false);
+  });
+
+  // BLO-32163 AC2: past the default 50 the fence metric must still name its
+  // aggregate, or a wedge averages into the pool and the page stays silent.
+  it("keeps naming fence aggregates past the default budget", async () => {
+    const N = PLUGIN_METRIC_CARDINALITY_BUDGET + 10;
+    for (let i = 0; i < N; i += 1) {
+      recordPluginMetric({
+        ...PLUGIN,
+        name: FENCE_METRIC,
+        value: 1,
+        tags: { alertname: "ArgoAppOutOfSyncTooLong", aggregate_key: `agg-${i}` },
+        declaredLabels: MANIFEST_METRIC_LABELS,
+      });
+    }
+    const fence = (await seriesFor(PLUGIN_METRIC_TOTAL_METRIC)).filter((line) =>
+      line.includes(`metric="${FENCE_METRIC}"`),
+    );
+    expect(fence).toHaveLength(N);
+    expect(fence.some((line) => line.includes(`agg-${N - 1}`))).toBe(true);
+    const dropped = await seriesFor(PLUGIN_METRIC_DROPPED_METRIC);
+    expect(dropped.some((line) => line.includes(`metric="${FENCE_METRIC}"`))).toBe(false);
+    expect(PLUGIN_METRIC_CARDINALITY_BUDGET_OVERRIDES.get(FENCE_METRIC)).toBeGreaterThan(N);
   });
 });

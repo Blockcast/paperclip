@@ -2621,6 +2621,21 @@ export const PLUGIN_METRIC_NAME_BUDGET = 50;
  */
 export const PLUGIN_METRIC_CARDINALITY_BUDGET = 50;
 
+/**
+ * Per-name raises of {@link PLUGIN_METRIC_CARDINALITY_BUDGET}, for metrics a
+ * page reads per-tag (BLO-32163 AC2). `PaperclipAlertmanagerAggregateFenceWedged`
+ * fires on mean hold age per `aggregate_key`; once the 50-slot ledger fills, a
+ * new key's writes land on the label-less series and average into the whole
+ * pool, so a real wedge reads as ~660s against an 1800s threshold and never
+ * pages. Measured 2026-10-13..14: 303 fence writes shed to `label_budget` in
+ * 7d, one worker at exactly 50 combinations. Still bounded: worst case adds
+ * 2 x (500 - 50) series per worker lifetime.
+ */
+export const PLUGIN_METRIC_CARDINALITY_BUDGET_OVERRIDES: ReadonlyMap<string, number> = new Map([
+  ["alertmanager.aggregate.fence_blocked", 500],
+  ["alertmanager.aggregate.fence_blocked_age_seconds", 500],
+]);
+
 /** Label value that over-name-budget writes collapse into. */
 export const PLUGIN_METRIC_OVERFLOW_NAME = "_overflow";
 
@@ -7999,7 +8014,10 @@ export function recordPluginMetric(input: RecordPluginMetricInput): void {
       pluginMetricCombinations.set(ledgerKey, seen);
     }
     if (!seen.has(combo)) {
-      if (seen.size >= PLUGIN_METRIC_CARDINALITY_BUDGET) {
+      if (
+        seen.size
+        >= (PLUGIN_METRIC_CARDINALITY_BUDGET_OVERRIDES.get(name) ?? PLUGIN_METRIC_CARDINALITY_BUDGET)
+      ) {
         // Drop the LABELS, keep the `metric`. The name already cleared tier 1,
         // so its series is bounded and an alert rule matching on
         // `metric="<name>"` keeps working — which is the entire reason this
