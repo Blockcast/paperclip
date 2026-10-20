@@ -4870,6 +4870,9 @@ describeEmbeddedPostgres("authorization service", () => {
           issueId: relation === "blocked_issue_assignee" ? issue.id : held.id,
           relatedIssueId: relation === "blocked_issue_assignee" ? held.id : issue.id,
           type: "blocks",
+          // T blocks X needs a creator with standing on T; here, T's owner.
+          // X blocks T sits in T's own blocker set and needs no stamp.
+          createdByAgentId: relation === "blocked_issue_assignee" ? issue.assigneeAgentId : null,
         });
       }
 
@@ -5142,6 +5145,7 @@ describeEmbeddedPostgres("authorization service", () => {
         issueId: producer.id,
         relatedIssueId: consumer.id,
         type: "blocks",
+        createdByAgentId: owner.id, // the producer's owner declared it
       }).returning();
       const authorization = authorizationService(db);
       const decideComment = () => authorization.decide({
@@ -5172,16 +5176,54 @@ describeEmbeddedPostgres("authorization service", () => {
       expect(denied.reason).toBe("deny_missing_grant");
       expect(authorizationDeniedDetails(denied).evaluatedRelations).toContain("dependency_edge");
 
-      // An edge the actor declared itself grants nothing: otherwise any agent
-      // could attach any issue as a blocker of its own and comment anywhere.
+      // T blocks X: the edge sits in X's blocker set, writable without any
+      // relation to T, so only a creator with standing on T makes it count.
+      const edgeBy = async (by: { createdByAgentId?: string; createdByUserId?: string }) => {
+        await db.delete(issueRelations).where(eq(issueRelations.relatedIssueId, consumer.id));
+        await db.insert(issueRelations).values({
+          companyId: company.id, issueId: producer.id, relatedIssueId: consumer.id, type: "blocks", ...by,
+        });
+        return (await decideComment()).allowed;
+      };
+      const manager = await createAgent(db, company.id, { role: "engineer" });
+      await db.update(agents).set({ reportsTo: manager.id }).where(eq(agents.id, owner.id));
+      expect(await edgeBy({ createdByAgentId: actor.id })).toBe(false); // self-declared
+      expect(await edgeBy({ createdByAgentId: other.id })).toBe(false); // A creates X for B, blocked by T
+      expect(await edgeBy({ createdByAgentId: owner.id })).toBe(true); // T's owner
+      expect(await edgeBy({ createdByAgentId: manager.id })).toBe(true); // manager of T's owner
+      expect(await edgeBy({ createdByUserId: "board-user" })).toBe(true);
+
+      // A closed X ends the reach: the grant lasts while the dependency is live.
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, consumer.id));
+      expect((await decideComment()).allowed).toBe(false);
+      await db.update(issues).set({ status: "todo" }).where(eq(issues.id, consumer.id));
+
+      // X blocks T sits in T's own blocker set, so T's side declared it: no
+      // creator condition, even when the actor's own id is on the row.
+      await db.delete(issueRelations).where(eq(issueRelations.relatedIssueId, consumer.id));
       await db.insert(issueRelations).values({
-        companyId: company.id,
-        issueId: producer.id,
-        relatedIssueId: consumer.id,
-        type: "blocks",
+        companyId: company.id, issueId: consumer.id, relatedIssueId: producer.id, type: "blocks",
         createdByAgentId: actor.id,
       });
-      expect((await decideComment()).allowed).toBe(false);
+      expect((await decideComment()).reason).toBe("allow_dependency_edge");
+    });
+
+    it("rewriting a blocker set keeps the original creator stamp on unchanged edges (BLO-30968)", async () => {
+      const company = await createCompany(db, "Matrix-dependency-edge-stamp");
+      const owner = await createAgent(db, company.id, { role: "engineer" });
+      const actor = await createAgent(db, company.id, { role: "engineer" });
+      const producer = await createIssue(db, company.id, { title: "Producer", assigneeAgentId: owner.id });
+      const extra = await createIssue(db, company.id, { title: "Extra blocker" });
+      const consumer = await createIssue(db, company.id, { title: "Consumer", assigneeAgentId: actor.id });
+      const svc = issueService(db);
+      await svc.update(consumer.id, { blockedByIssueIds: [producer.id], actorAgentId: owner.id });
+      await svc.update(consumer.id, { blockedByIssueIds: [producer.id, extra.id], actorAgentId: actor.id });
+      const stamps = await db
+        .select({ issueId: issueRelations.issueId, by: issueRelations.createdByAgentId })
+        .from(issueRelations)
+        .where(eq(issueRelations.relatedIssueId, consumer.id));
+      expect(stamps.find((r) => r.issueId === producer.id)?.by).toBe(owner.id);
+      expect(stamps.find((r) => r.issueId === extra.id)?.by).toBe(actor.id);
     });
 
     it("blocker edge (escape hatch 3) gates checkout and in_progress, not done", async () => {

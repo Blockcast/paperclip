@@ -1729,25 +1729,34 @@ export function authorizationService(db: Db) {
   // path it was always denied.
   //
   // The rule: the actor may COMMENT on issue T when a `blocks` edge joins T and
-  // some issue X in either direction, and the actor is X's current assignee.
-  // Derived from `issue_relations` at decision time, so cutting the edge or
-  // reassigning X revokes it with no operator action. Never `issue:mutate`: a
-  // dependency is a reason to talk to the owner, not to rewrite their issue.
+  // a non-terminal issue X whose current assignee is the actor. Derived from
+  // `issue_relations` at decision time, so cutting the edge, reassigning X, or
+  // closing X revokes it. Never `issue:mutate`: a dependency is a reason to
+  // talk to the owner, not to rewrite their issue. The two directions differ
+  // in who consented to the edge:
   //
-  // An edge the actor declared ITSELF grants nothing. X's blocker set is X's
-  // coordination metadata, which the actor may write via `allow_self`; without
-  // this condition any agent could attach any issue as a blocker of its own
-  // and so comment anywhere, collapsing the "same-company peer" negative
-  // control. Because the blocker sync deletes and re-inserts, an actor that
-  // rewrites its own blocker set also re-stamps the edge and loses the grant —
-  // fail closed, by design.
+  // - X blocks T. The row sits in T's blocker set, and only someone with
+  //   standing on T can write that set, so T's side declared it. Allowed.
+  // - T blocks X. The row sits in X's blocker set, which X's assignee (or
+  //   anyone creating X) can write without any relation to T, so the row
+  //   alone proves nothing: two agents could hand each other a voice on any
+  //   issue. Allowed only when the edge's creator itself had standing on T —
+  //   a board user, T's assignee or creator, or a manager of T's assignee.
+  //   An agent that parks itself behind an issue it has no relation to gets
+  //   no reach from that; this fails closed by design.
   async function agentHoldsIssueAcrossDependencyEdge(input: {
     companyId: string;
     issueId: string;
+    issueAssigneeAgentId: string | null;
+    issueCreatedByAgentId: string | null;
     actorAgentId: string;
   }) {
-    const [row] = await db
-      .select({ id: issueRelations.id })
+    const rows = await db
+      .select({
+        blockerIssueId: issueRelations.issueId,
+        createdByAgentId: issueRelations.createdByAgentId,
+        createdByUserId: issueRelations.createdByUserId,
+      })
       .from(issueRelations)
       .innerJoin(
         issues,
@@ -1759,12 +1768,21 @@ export function authorizationService(db: Db) {
       .where(and(
         eq(issueRelations.companyId, input.companyId),
         eq(issueRelations.type, "blocks"),
-        sql`${issueRelations.createdByAgentId} is distinct from ${input.actorAgentId}`,
         eq(issues.companyId, input.companyId),
         eq(issues.assigneeAgentId, input.actorAgentId),
-      ))
-      .limit(1);
-    return Boolean(row);
+        notInArray(issues.status, ["done", "cancelled"]),
+      ));
+    for (const row of rows) {
+      if (row.blockerIssueId !== input.issueId) return true;
+      if (row.createdByUserId) return true;
+      const creator = row.createdByAgentId;
+      if (!creator) continue;
+      if (creator === input.issueAssigneeAgentId || creator === input.issueCreatedByAgentId) return true;
+      if (input.issueAssigneeAgentId && await isManagerOf(input.companyId, creator, input.issueAssigneeAgentId)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   function allowRecoveryHandoffGrant(action: AuthorizationAction): AuthorizationDecision {
@@ -2675,6 +2693,8 @@ export function authorizationService(db: Db) {
         await agentHoldsIssueAcrossDependencyEdge({
           companyId,
           issueId: resource.issueId,
+          issueAssigneeAgentId: resource.assigneeAgentId ?? null,
+          issueCreatedByAgentId: resource.createdByAgentId ?? null,
           actorAgentId,
         })
       ) {

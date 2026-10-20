@@ -7019,20 +7019,29 @@ export function issueService(db: Db) {
       await assertNoBlockingCycles(companyId, issueId, deduped, dbOrTx);
     }
 
-    await dbOrTx
-      .delete(issueRelations)
-      .where(
-        and(
-          eq(issueRelations.companyId, companyId),
-          eq(issueRelations.relatedIssueId, issueId),
-          eq(issueRelations.type, "blocks"),
-        ),
-      );
+    // Diff rather than delete-and-reinsert: an unchanged edge keeps the creator
+    // stamp of whoever declared it. `allow_dependency_edge` (authorization.ts)
+    // reads that stamp, so re-stamping every edge on an unrelated write would
+    // silently transfer authorship to the latest writer (BLO-30968).
+    const blockerOf = and(
+      eq(issueRelations.companyId, companyId),
+      eq(issueRelations.relatedIssueId, issueId),
+      eq(issueRelations.type, "blocks"),
+    );
+    const existing = new Set<string>(
+      (await dbOrTx.select({ issueId: issueRelations.issueId }).from(issueRelations).where(blockerOf))
+        .map((row: { issueId: string }) => row.issueId),
+    );
+    const removed = [...existing].filter((id) => !deduped.includes(id));
+    if (removed.length > 0) {
+      await dbOrTx.delete(issueRelations).where(and(blockerOf, inArray(issueRelations.issueId, removed)));
+    }
 
-    if (deduped.length === 0) return;
+    const added = deduped.filter((id) => !existing.has(id));
+    if (added.length === 0) return;
 
     await dbOrTx.insert(issueRelations).values(
-      deduped.map((blockerIssueId) => ({
+      added.map((blockerIssueId) => ({
         companyId,
         issueId: blockerIssueId,
         relatedIssueId: issueId,
