@@ -170,13 +170,23 @@ All four must be true. Measure them; do not assume.
    a missing one fails the precondition for that reference.
 
    The pod must be **Running** — `kubectl exec` refuses a completed container,
-   and agent Job pods reach `Completed` and are then TTL-reaped. Select one
-   with `--field-selector=status.phase=Running`. If no pod on that reference is
-   still running, you cannot answer the question this way, and that is **not**
-   a pass — never record an unexec'able reference as cleared. Note the census
-   reads Jobs, not pods, so a finished Job keeps its reference listed until its
-   TTL reaps it: seeing it still listed is expected and is not a dead end. Wait
-   for the TTL, or for a Running pod on that reference, then re-check.
+   and agent Job pods reach `Completed` and are then TTL-reaped. Pods carry no
+   field selector for image, so narrow by phase and match the reference
+   yourself:
+
+   ```console
+   $ kubectl -n paperclip get pods -l app.kubernetes.io/component=agent-job \
+       --field-selector=status.phase=Running \
+       -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.containers[0].image}{"\n"}{end}' \
+     | grep -F '<reference>'
+   ```
+
+   If no pod on that reference is still running, you cannot answer the question
+   this way, and that is **not** a pass — never record an unexec'able reference
+   as cleared. Note the census reads Jobs, not pods, so a finished Job keeps its
+   reference listed until its TTL reaps it: seeing it still listed is expected
+   and is not a dead end. Wait for the TTL, or for a Running pod on that
+   reference, then re-check.
 
    Measured 2026-10-20 on `sha-d529842-k8s-vendored`, the single reference the
    fleet was then running: five files, `root root 755`, `test -w` false for
