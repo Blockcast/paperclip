@@ -76,6 +76,7 @@ import {
   refreshDbPoolMetrics,
   refreshFdClassMetrics,
   refreshNativeMemoryMetrics,
+  refreshProcessMappingMetrics,
   startScrapeMetricsCollector,
 } from "./services/scrape-metrics-collector.js";
 import { startHeapPeakTracking } from "./services/heap-peak-tracker.js";
@@ -352,6 +353,7 @@ export async function createApp(
       refreshAgentStartLockMetrics();
       refreshFdClassMetrics();
       refreshNativeMemoryMetrics();
+      refreshProcessMappingMetrics();
       const { contentType, body } = await renderMetrics();
       res.status(200).set("Content-Type", contentType).send(body);
     } catch (err) {

@@ -46,6 +46,7 @@ import {
   setExternalRuntimeReservationStrandMetricsRefreshSuccess,
   setFdClassMetrics,
   setNativeMemoryMetrics,
+  setProcessMappingMetrics,
   setOverdueScheduledRetryAgeMetricsRefreshSuccess,
   setQueuedRunAgeMetricsRefreshSuccess,
   setRoutineFireGapMetricsRefreshSuccess,
@@ -55,6 +56,11 @@ import {
 } from "./metrics.js";
 import { collectFdClassSnapshot } from "./fd-class-metrics.js";
 import { collectNativeMemorySnapshot } from "./native-memory-metrics.js";
+import {
+  DEFAULT_MIN_SCAN_INTERVAL_MS,
+  collectProcessMappingSnapshot,
+  type ProcessMappingSnapshot,
+} from "./process-mapping-metrics.js";
 
 /** Scrape interval is 15 s; refreshing on the same cadence keeps every scrape at most one tick behind. */
 const DEFAULT_INTERVAL_MS = 15_000;
@@ -266,6 +272,61 @@ export function refreshFdClassMetrics(): void {
  */
 export function refreshNativeMemoryMetrics(): void {
   setNativeMemoryMetrics(collectNativeMemorySnapshot());
+}
+
+/**
+ * Last completed mapping scan, republished on every scrape in between.
+ *
+ * Module-level rather than passed in because the cadence is a property of the
+ * *process*, not of any caller: `/metrics` can be scraped by more than one
+ * client, and a per-caller cache would multiply the scan rate by the number of
+ * scrapers — reintroducing exactly the event-loop cost the cadence exists to
+ * bound.
+ */
+let lastMappingSnapshot: ProcessMappingSnapshot | null = null;
+let lastMappingScanAtMs: number | null = null;
+
+/** Test seam: forget the cached scan so the next refresh performs a real one. */
+export function __resetProcessMappingCacheForTest(): void {
+  lastMappingSnapshot = null;
+  lastMappingScanAtMs = null;
+}
+
+/**
+ * PEN-3314: publish the mapping-class attribution, scanning at most once per
+ * {@link DEFAULT_MIN_SCAN_INTERVAL_MS}.
+ *
+ * ⚠ This is the one memory refresher that is NOT simply "do the work on the
+ * scrape path", and the departure is deliberate. Its two neighbours justify
+ * running per scrape on cost: `process.memoryUsage()` is a counter read, and
+ * the descriptor walk is a bounded 43.7 ms at its cap. Neither holds here. The
+ * `/proc/self/smaps` read costs O(resident pages) — measured 1.91 ms at 47 MB,
+ * 35.96 ms at 1047 MB, **108.42 ms at 3037 MB** — so on this worker it is a
+ * ~110 ms synchronous event-loop block whose cost *grows with the leak it
+ * measures*, and `smaps_rollup` is not a cheaper fallback (108.53 ms at the
+ * same RSS; it walks the same page tables).
+ *
+ * That matters beyond throughput. The step this row is chasing is a +672 MB
+ * rise in one 60 s scrape during which the heartbeat-timer counter does not
+ * advance — an event-loop stall. An instrument stalling the loop for ~110 ms
+ * every 15 s would be injecting a weaker copy of the signature into the
+ * evidence. At the 300 s floor the same scan is a 0.037% duty cycle, against
+ * the ~0.3% {@link refreshFdClassMetrics} already accepts.
+ *
+ * Between scans the cached snapshot is republished verbatim, so the series stay
+ * continuous and `paperclip_process_mapping_scan_timestamp_seconds` carries how
+ * stale they are. A failed scan drops the cache rather than preserving it: a
+ * frozen value that reads as live is the failure mode these three modules are
+ * collectively built against.
+ */
+export function refreshProcessMappingMetrics(nowMs: number = Date.now()): void {
+  const due =
+    lastMappingScanAtMs === null || nowMs - lastMappingScanAtMs >= DEFAULT_MIN_SCAN_INTERVAL_MS;
+  if (due) {
+    lastMappingScanAtMs = nowMs;
+    lastMappingSnapshot = collectProcessMappingSnapshot();
+  }
+  setProcessMappingMetrics(lastMappingSnapshot);
 }
 
 export interface ScrapeMetricsCollectorOptions {
