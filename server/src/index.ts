@@ -1909,7 +1909,8 @@ export async function startServer(): Promise<StartedServer> {
         onAcquire: () => {
           const resync = (app as { locals?: { resyncPluginsOnTakeover?: () => Promise<void> } })
             .locals?.resyncPluginsOnTakeover;
-          void (resync ? resync() : Promise.resolve())
+          if (!resync) return runLeaderRecovery?.();
+          void resync()
             .catch((err) => logger.error({ err }, "plugin resync on lease takeover failed"))
             .finally(() => runLeaderRecovery?.());
         },
