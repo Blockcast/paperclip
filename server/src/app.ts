@@ -99,6 +99,7 @@ import { setPluginEventBus, setPluginEventOutboxDb } from "./services/activity-l
 import { startPluginEventOutbox } from "./services/plugin-event-outbox.js";
 import { superviseWorkerSingleton } from "./services/worker-singleton-supervisor.js";
 import { startPluginStatusCollector } from "./services/plugin-status-metrics.js";
+import { startIssueTreeHoldCollector } from "./services/issue-tree-hold-metrics.js";
 import { startProjectCheckoutOriginReconciler } from "./services/project-checkout-origin-reconciler.js";
 import { startGitHubCommitStatusDeliveryOutbox } from "./services/github-status-delivery-outbox.js";
 import { startGithubReviewGateDeliveryWorker } from "./services/github-review-gate-authority.js";
@@ -1164,6 +1165,7 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
   let appWorkerSingletonsStopped = false;
   let stopGitHubStatusDeliveryOutbox: (() => void) | null = null;
   let stopPluginStatusCollector: (() => void) | null = null;
+  let stopIssueTreeHoldCollector: (() => void) | null = null;
   let stopGithubReviewGateDeliveryWorker: (() => Promise<void>) | null = null;
   let stopIssueCommentEffectReconciler: (() => Promise<void>) | null = null;
   // BLO-33243: every tier serves /metrics and is a scrape target, so unlike the
@@ -1195,6 +1197,7 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
     // already-error'd plugin from a previous boot must be visible on /metrics
     // immediately, not only after this boot's own load attempt resolves.
     stopPluginStatusCollector = startPluginStatusCollector(db);
+    stopIssueTreeHoldCollector = startIssueTreeHoldCollector(db);
     // Capture is staged across every API replica before processing is enabled.
     // This prevents an old replica from acknowledging a delivery without
     // persisting it during the authority activation rollout.
@@ -1308,6 +1311,7 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
     stopAppWorkerSingletons();
     stopGitHubStatusDeliveryOutbox?.();
     stopPluginStatusCollector?.();
+    stopIssueTreeHoldCollector?.();
     stopScrapeMetricsCollector();
     stopProjectCheckoutOriginReconciler();
     stopHeapPeakTracking();
