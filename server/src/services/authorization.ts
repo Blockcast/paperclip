@@ -1729,21 +1729,20 @@ export function authorizationService(db: Db) {
   // path it was always denied.
   //
   // The rule: the actor may COMMENT on issue T when a `blocks` edge joins T and
-  // a non-terminal issue X whose current assignee is the actor. Derived from
-  // `issue_relations` at decision time, so cutting the edge, reassigning X, or
-  // closing X revokes it. Never `issue:mutate`: a dependency is a reason to
-  // talk to the owner, not to rewrite their issue. The two directions differ
-  // in who consented to the edge:
+  // a non-terminal issue X whose current assignee is the actor, AND the edge's
+  // creator had standing on T — a board user, T's assignee or creator, or a
+  // manager of T's assignee. Derived from `issue_relations` at decision time,
+  // so cutting the edge, reassigning X, or closing X revokes it. Never
+  // `issue:mutate`: a dependency is a reason to talk to the owner, not to
+  // rewrite their issue.
   //
-  // - X blocks T. The row sits in T's blocker set, and only someone with
-  //   standing on T can write that set, so T's side declared it. Allowed.
-  // - T blocks X. The row sits in X's blocker set, which X's assignee (or
-  //   anyone creating X) can write without any relation to T, so the row
-  //   alone proves nothing: two agents could hand each other a voice on any
-  //   issue. Allowed only when the edge's creator itself had standing on T —
-  //   a board user, T's assignee or creator, or a manager of T's assignee.
-  //   An agent that parks itself behind an issue it has no relation to gets
-  //   no reach from that; this fails closed by design.
+  // The creator condition applies in BOTH directions. Neither blocker set is
+  // written only by T's side: X's set is writable by X's assignee (or anyone
+  // creating X) with no relation to T, and T's set is also written by
+  // `POST /issues/:id/children` with `blockParentUntilDone`, which needs only
+  // read on T. So the row alone never proves T's side consented; the stamp
+  // does. An agent that declares a dependency on an issue it has no relation
+  // to gets no reach from that; this fails closed by design.
   async function agentHoldsIssueAcrossDependencyEdge(input: {
     companyId: string;
     issueId: string;
@@ -1753,7 +1752,6 @@ export function authorizationService(db: Db) {
   }) {
     const rows = await db
       .select({
-        blockerIssueId: issueRelations.issueId,
         createdByAgentId: issueRelations.createdByAgentId,
         createdByUserId: issueRelations.createdByUserId,
       })
@@ -1773,7 +1771,6 @@ export function authorizationService(db: Db) {
         notInArray(issues.status, ["done", "cancelled"]),
       ));
     for (const row of rows) {
-      if (row.blockerIssueId !== input.issueId) return true;
       if (row.createdByUserId) return true;
       const creator = row.createdByAgentId;
       if (!creator) continue;
