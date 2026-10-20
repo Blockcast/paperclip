@@ -248,7 +248,12 @@ export function createPluginEventBus(): PluginEventBus {
        * @throws {Error} if `name` already contains the `plugin.` prefix
        *   (prevents cross-namespace spoofing).
        */
-      async emit(name: string, companyId: string, payload: unknown): Promise<PluginEventBusEmitResult> {
+      async emit(
+        name: string,
+        companyId: string,
+        payload: unknown,
+        ownership?: PluginEvent["ownership"],
+      ): Promise<PluginEventBusEmitResult> {
         if (!name || name.trim() === "") {
           throw new Error(`Plugin "${pluginId}" must provide a non-empty event name.`);
         }
@@ -273,6 +278,7 @@ export function createPluginEventBus(): PluginEventBus {
           actorType: "plugin",
           actorId: pluginId,
           payload,
+          ...(ownership ? { ownership } : {}),
         };
 
         return emit(event);
@@ -403,7 +409,12 @@ export interface ScopedPluginEventBus {
    * @throws {Error} if `name` is empty or whitespace-only.
    * @throws {Error} if `name` starts with `"plugin."` (namespace spoofing guard).
    */
-  emit(name: string, companyId: string, payload: unknown): Promise<PluginEventBusEmitResult>;
+  emit(
+    name: string,
+    companyId: string,
+    payload: unknown,
+    ownership?: PluginEvent["ownership"],
+  ): Promise<PluginEventBusEmitResult>;
 
   /**
    * Remove all subscriptions registered by this plugin.

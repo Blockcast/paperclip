@@ -60,6 +60,8 @@ export type PluginFencingPreconditionInput = {
   table: string;
   /** Column -> required value. All must match one row for the mutation to run. */
   match: Record<string, string | number | null>;
+  /** If present, must be the calling plugin's key (see `PluginEvent.ownership`). */
+  pluginKey?: string;
 };
 
 /** Validated form, safe to interpolate. Only built by `resolve...` below. */
