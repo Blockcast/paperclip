@@ -96,10 +96,27 @@ describe("recovery chain per-pass timing wiring (PEN-4381)", () => {
     // Must be inside the chain's `finally`, after the in-flight latch is cleared
     // — the latch clear must precede anything that could throw, and the settle
     // line must still be emitted when the metric recorders fail.
-    const latchClear = indexSrc.indexOf("heartbeatRecoveryChainStartedAt = 0;");
-    const settle = indexSrc.indexOf("chainTimer.settle(elapsedMs);");
-    const recordDuration = indexSrc.indexOf("recordHeartbeatRecoveryChainDuration(elapsedMs);");
+    //
+    // Scoped to the `finally` body rather than searched over the whole file. An
+    // earlier revision anchored the latch clear with
+    // `indexSrc.indexOf("heartbeatRecoveryChainStartedAt = 0;")`, which matches
+    // the `let heartbeatRecoveryChainStartedAt = 0;` DECLARATION ~1200 lines
+    // above — so `settle > latchClear` held no matter where `settle()` sat, and
+    // the assertion was vacuous. A mutant that moved `settle()` to before the
+    // clear passed all four tests. Keep the slice.
+    const finallyStart = indexSrc.indexOf("const elapsedMs = Math.max(0, Date.now() - heartbeatRecoveryChainStartedAt);");
+    expect(finallyStart, "chain finally not found").toBeGreaterThan(-1);
+    const finallyEnd = indexSrc.indexOf("chain latch already cleared", finallyStart);
+    expect(finallyEnd).toBeGreaterThan(finallyStart);
+    const body = indexSrc.slice(finallyStart, finallyEnd);
 
+    const latchClear = body.indexOf("heartbeatRecoveryChainStartedAt = 0;");
+    const settle = body.indexOf("chainTimer.settle(elapsedMs);");
+    const recordDuration = body.indexOf("recordHeartbeatRecoveryChainDuration(elapsedMs);");
+
+    expect(latchClear).toBeGreaterThan(-1);
+    expect(settle).toBeGreaterThan(-1);
+    expect(recordDuration).toBeGreaterThan(-1);
     expect(settle).toBeGreaterThan(latchClear);
     expect(settle).toBeLessThan(recordDuration);
   });
