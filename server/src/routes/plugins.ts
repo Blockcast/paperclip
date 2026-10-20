@@ -97,7 +97,7 @@ import {
 } from "../services/plugin-secrets-handler.js";
 import { secretService } from "../services/secrets.js";
 import { badRequest, forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
-import { registerWorkerTierProxyRoutes } from "./worker-tier-proxy.js";
+import { registerPluginHolderForwardRoutes, registerWorkerTierProxyRoutes } from "./worker-tier-proxy.js";
 
 /** UI slot declaration extracted from plugin manifest */
 type PluginUiSlotDeclaration = NonNullable<NonNullable<PaperclipPluginManifestV1["ui"]>["slots"]>[number];
@@ -725,6 +725,8 @@ export function pluginRoutes(
   workerProxy?: {
     nodeRole: "api" | "worker" | "all";
     workersInternalUrl: string | null;
+    /** Worker tier: URL of the scheduler lease holder, or null to serve locally (BLO-47803). */
+    resolvePluginHolderUrl?: () => Promise<string | null>;
   },
   toolGatewayDeps?: PluginRouteToolGatewayDeps,
 ) {
@@ -739,6 +741,8 @@ export function pluginRoutes(
     workerProxy.workersInternalUrl
   ) {
     registerWorkerTierProxyRoutes(router, workerProxy.workersInternalUrl);
+  } else if (workerProxy?.resolvePluginHolderUrl) {
+    registerPluginHolderForwardRoutes(router, workerProxy.resolvePluginHolderUrl);
   }
 
   const registry = pluginRegistryService(db);

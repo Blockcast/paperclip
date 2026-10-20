@@ -70,6 +70,7 @@ import {
   HEARTBEAT_TIMER_LEASE,
   SCHEDULER_LEASE_RENEW_INTERVAL_MS,
   SCHEDULER_LEASE_TTL_MS,
+  leaseHolderUrlResolver,
   schedulerLeaseHolder,
   type SchedulerLeaseHolder,
 } from "./services/scheduler-lease.js";
@@ -1035,6 +1036,12 @@ export async function startServer(): Promise<StartedServer> {
   const superviseLeased = (name: string, start: () => (() => void) | void) => {
     workerSingletonStops.push(superviseWorkerSingleton(name, shouldRunWorkerSingletons, start));
   };
+  // BLO-47803: a follower worker forwards plugin routes to the lease holder.
+  const resolvePluginHolderUrl = leaseHolderUrlResolver(db as any, {
+    name: HEARTBEAT_TIMER_LEASE,
+    port: listenPort,
+    lease: () => schedulerLease,
+  });
   const app = await createApp(db as any, {
     uiMode,
     serverPort: listenPort,
@@ -1073,6 +1080,7 @@ export async function startServer(): Promise<StartedServer> {
     resolveSession,
     pluginWorkerManager,
     shouldRunWorkerSingletons,
+    resolvePluginHolderUrl,
   });
   // BLO-46711: createApp's own lease-gated singletons (plugin job scheduler,
   // plugin event outbox) join the list shutdown stops before the release.
@@ -1896,7 +1904,15 @@ export async function startServer(): Promise<StartedServer> {
         name: HEARTBEAT_TIMER_LEASE,
         ttlMs: SCHEDULER_LEASE_TTL_MS,
         renewIntervalMs: SCHEDULER_LEASE_RENEW_INTERVAL_MS,
-        onAcquire: () => runLeaderRecovery?.(),
+        // BLO-47803: bring the warm-standby plugin set up to date first, so
+        // recovery drives external runs through current plugin code/config.
+        onAcquire: () => {
+          const resync = (app as { locals?: { resyncPluginsOnTakeover?: () => Promise<void> } })
+            .locals?.resyncPluginsOnTakeover;
+          void (resync ? resync() : Promise.resolve())
+            .catch((err) => logger.error({ err }, "plugin resync on lease takeover failed"))
+            .finally(() => runLeaderRecovery?.());
+        },
       });
       // Awaited so the first tick already has a verdict rather than skipping
       // on a not-yet-acquired lease. A failure here is logged by the holder

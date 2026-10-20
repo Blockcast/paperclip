@@ -756,6 +756,12 @@ spec:
             - name: PAPERCLIP_NODE_ROLE
               value: worker
             {{- end }}
+            # BLO-47803: advertised in the scheduler lease holder id, so a
+            # follower worker can forward plugin routes to the holder pod.
+            - name: PAPERCLIP_POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
             - name: HOST
               value: {{ .Values.env.host | quote }}
             - name: PORT

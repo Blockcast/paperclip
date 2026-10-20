@@ -3,7 +3,7 @@ import path from "node:path";
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import { issues, plugins, POSTGRES_POOL_MAX, POSTGRES_WEBHOOK_POOL_MAX, type Db } from "@paperclipai/db";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import type { DeploymentExposure, DeploymentMode } from "@paperclipai/shared";
 import type { InspectDatabaseBackupHealthOptions } from "./services/database-backup-health.js";
 import type { StorageService } from "./storage/types.js";
@@ -308,6 +308,12 @@ export async function createApp(
      * on the scheduler lease holder. Omitted means always (single replica).
      */
     shouldRunWorkerSingletons?: () => boolean;
+    /**
+     * BLO-47803. Worker tier: URL of the scheduler lease holder when this
+     * process is a follower, so plugin routes are served by the holder; null
+     * to serve locally. Omitted means always local (single replica).
+     */
+    resolvePluginHolderUrl?: () => Promise<string | null>;
     betterAuthHandler?: express.RequestHandler;
     resolveSession?: (req: ExpressRequest) => Promise<BetterAuthSessionResult | null>;
     /** Random per-process token for trusted loopback bootstrap. */
@@ -838,6 +844,7 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
       {
         nodeRole: appConfig.paperclipNodeRole,
         workersInternalUrl: appConfig.paperclipWorkersInternalUrl,
+        resolvePluginHolderUrl: opts.resolvePluginHolderUrl,
       },
       { toolGateway },
     ),
@@ -1141,6 +1148,9 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
   // in server/src/index.ts so plugin lifecycle only runs on the tier that
   // can host workers.
   let stopPluginEventOutbox: (() => void) | null = null;
+  /** BLO-47803: plugin state as of this process's last full load; null until boot loadAll finishes. */
+  let loadedPluginFingerprint: string | null = null;
+  let pluginResyncInFlight = false;
   let appWorkerSingletonsStopped = false;
   let stopGitHubStatusDeliveryOutbox: (() => void) | null = null;
   let stopPluginStatusCollector: (() => void) | null = null;
@@ -1203,10 +1213,15 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
           if (appWorkerSingletonsStopped) return;
           stopPluginEventOutbox = superviseWorkerSingleton(
             "plugin-event-outbox",
-            shouldRunWorkerSingletons,
+            // BLO-47803: not while a takeover resync has plugins unloaded, or
+            // the outbox marks events processed with no subscriber left.
+            () => shouldRunWorkerSingletons() && !pluginResyncInFlight,
             () => startPluginEventOutbox(db, eventBus),
           );
         }
+      })
+      .then(async () => {
+        loadedPluginFingerprint = await pluginStateFingerprint(db);
       })
       .catch((err) => {
         logger.error({ err }, "Failed to load ready plugins on startup");
@@ -1224,6 +1239,35 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
     stopPluginJobScheduler();
   };
   app.locals.stopWorkerSingletons = stopAppWorkerSingletons;
+  // BLO-47803: a follower keeps its boot-time plugin set as a warm standby
+  // (leader recovery drives external runs through the sandbox-provider plugin
+  // the moment the lease is taken), but every lifecycle change since then was
+  // served by the old holder and reached only its process. On takeover,
+  // reload from the database if plugin state moved since this process loaded.
+  app.locals.resyncPluginsOnTakeover = async (): Promise<void> => {
+    if (loadedPluginFingerprint === null || pluginResyncInFlight) return;
+    // Raised before the first await, so the outbox supervisor cannot start the
+    // outbox between the check below and the unload.
+    pluginResyncInFlight = true;
+    // ponytail: reloads every plugin, not just the changed ones. Takeovers are
+    // rare and a full reload is the same path boot takes; diff per plugin if a
+    // takeover-time worker restart ever becomes the cost that matters.
+    try {
+      const current = await pluginStateFingerprint(db);
+      if (current === loadedPluginFingerprint) return;
+      logger.info("plugin state changed since this process loaded it; reloading plugins on lease takeover");
+      const rows = await db.select({ id: plugins.id, pluginKey: plugins.pluginKey }).from(plugins);
+      for (const row of rows) {
+        if (workerManager.isRunning(row.id)) await loader.unloadSingle(row.id, row.pluginKey);
+      }
+      // Fingerprint BEFORE the load: a change racing the load then re-triggers
+      // the next takeover, instead of being recorded as already applied.
+      loadedPluginFingerprint = await pluginStateFingerprint(db);
+      await loader.loadAll();
+    } finally {
+      pluginResyncInFlight = false;
+    }
+  };
   let appServicesShutdown = false;
   const shutdownAppServices = async () => {
     if (appServicesShutdown) return;
@@ -1252,4 +1296,19 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
   });
 
   return app;
+}
+
+/**
+ * BLO-47803. Changes whenever a plugin row or a plugin config row is added,
+ * removed or updated; every lifecycle write bumps `updated_at`.
+ */
+async function pluginStateFingerprint(db: Db): Promise<string> {
+  const result = await db.execute(sql`
+    select
+      (select count(*) || '/' || coalesce(max(updated_at)::text, '') from plugins)
+      || '|' ||
+      (select count(*) || '/' || coalesce(max(updated_at)::text, '') from plugin_config) as fp
+  `);
+  const rows = Array.isArray(result) ? result : (result as { rows?: unknown[] }).rows ?? [];
+  return String((rows[0] as { fp?: unknown } | undefined)?.fp ?? "");
 }
