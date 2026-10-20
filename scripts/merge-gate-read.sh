@@ -111,8 +111,27 @@ run_extract() { # stdin: actions/runs API body (one object per page) -> run rows
   # $8 is the run's `updated_at` — for a completed run, when it CONCLUDED. See
   # the "still in flight" paragraph in dead_runs() for why the sibling arm needs
   # the success's END and not only its start, and why an absent $8 is safe.
+  # $9 is `display_title`, appended for gated_lanes() (BLO-47984).
   jq -r '.workflow_runs[]|[.workflow_id,.event,.id,.conclusion,.run_started_at,
-                           .status,.name,.updated_at]|@tsv'
+                           .status,.name,.updated_at,.display_title]|@tsv'
+}
+
+gated_lanes() { # stdin: run rows; $1 = head sha, $2 non-empty = repo is gated
+  # BLO-47984. On a repo whose default branch carries
+  # dispatch-approved-pr-ci.yml, the CI lanes only run when the dispatcher fires
+  # them as `workflow_dispatch` runs titled `CI PR #<n> @<full head>`. If it never
+  # fires, the only check-runs at the head are the review machinery's, they count
+  # as survivors, and the ABSENT guard stays quiet: the reader printed NOTHING at
+  # onprem-k8s#6335 @ c12e2fbc, which merged with zero CI. Keyed on the dispatched
+  # run's title, NOT on the `ci/dispatched-lanes` aggregator — that is absent on
+  # 9 of 15 merged onprem-k8s PRs, including #6319 @ 5d11d645 with 14 green
+  # dispatched runs. Existence only: those runs' own check-runs (and their
+  # NO-VERDICT rows) already carry the verdict through verdicts().
+  # No exemption for "the dispatcher legitimately dispatched nothing": none has
+  # been measured. Fails closed — a false STOP costs a wait.
+  [ -n "${2:-}" ] || return 0
+  awk -F'\t' -v h="$1" '$2 == "workflow_dispatch" && $9 ~ ("^CI PR #[0-9]+ @" h "$") { found = 1 }
+    END { if (!found) printf "STOP\t<approval-gated CI lanes: no dispatched CI PR run at this head>\tABSENT\trun=-\n" }'
 }
 
 pending_runs() { # stdin: run rows -> stdout: pend rows for runs owing a verdict
@@ -678,6 +697,7 @@ if [ "${1:-}" = "--extract" ]; then extract; exit 0; fi
 if [ "${1:-}" = "--status-extract" ]; then status_extract; exit 0; fi
 if [ "${1:-}" = "--witness-extract" ]; then witness_extract; exit 0; fi
 if [ "${1:-}" = "--runs-extract" ]; then run_extract; exit 0; fi
+if [ "${1:-}" = "--gated" ]; then gated_lanes "${2:-}" "${3:-}"; exit 0; fi
 if [ "${1:-}" = "--sha-guard" ]; then require_sha "${2:-}"; exit $?; fi
 
 R="$1"
@@ -728,6 +748,12 @@ WITNESSES=$(printf '%s' "$STATUSES" | witness_extract \
       [ -n "$pair" ] && printf '%s %s\n' "$pair" "$ts"
     done)
 
+# BLO-47984: does the DEFAULT branch carry the approval-gated dispatcher? Only a
+# 404 means no. Any other failure (rate limit, network) is read as gated, so an
+# unreadable probe fails toward STOP.
+probe=$(gh api "repos/$R/contents/.github/workflows/dispatch-approved-pr-ci.yml" --jq .path 2>&1)
+case "$?:$probe" in 0:*) GATED=1 ;; *"HTTP 404"*) GATED= ;; *) GATED=1 ;; esac
+
 DEAD=$(printf '%s\n' "$RUNS" | dead_runs "$WITNESSES")
 WDEAD=$(printf '%s\n' "$RUNS" | dead_runs "$WITNESSES" witness)
 PENDING=$(printf '%s\n' "$RUNS" | pending_runs)
@@ -739,3 +765,6 @@ PENDING=$(printf '%s\n' "$RUNS" | pending_runs)
 { printf '%s' "$STATUSES" | status_extract
   gh api "repos/$R/commits/$H/check-runs?per_page=100" --paginate | extract
 } | verdicts "$DEAD" "$PENDING" "$WDEAD"
+rc=$?
+printf '%s\n' "$RUNS" | gated_lanes "$H" "$GATED"
+exit $rc
