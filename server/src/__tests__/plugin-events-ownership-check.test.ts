@@ -10,30 +10,33 @@
  *
  * The contract has two halves and they are asymmetric on purpose:
  *
- *   1. ENFORCED — a generation already gone when `emit` is called is refused.
- *      The bus is never reached. This is the case that actually fires in
- *      production: a displaced worker is normally displaced long before it gets
- *      to its emit, not inside a microsecond window.
+ *   1. ENFORCED AT EMIT — a generation already gone when `emit` is called is
+ *      refused. The bus is never reached. This is the case that actually fires
+ *      in production: a displaced worker is normally displaced long before it
+ *      gets to its emit, not inside a microsecond window.
  *
- *   2. NOT ENFORCED, DELIBERATELY — a steal committing between the check's
- *      COMMIT and the fan-out still delivers. There is no transaction to join
- *      (the bus is an in-memory fan-out), so the only way to exclude it is to
- *      hold the share lock across subscriber handlers. Handlers run arbitrary
- *      plugin code, so that would let one slow handler block a steal —
- *      recreating the unstealable fence this entire ticket exists to drain.
+ *   2. ENFORCED AT THE POINT OF ACTION (BLO-31113) — a steal committing
+ *      between the check's COMMIT and the fan-out still DELIVERS. There is no
+ *      transaction to join (the bus is an in-memory fan-out), and holding the
+ *      share lock across subscriber handlers is rejected: handlers run
+ *      arbitrary plugin code, so one slow handler would block a steal —
+ *      recreating the unstealable fence BLO-31036 exists to drain. What changed
+ *      is that the checked generation now travels on the envelope as
+ *      `event.ownership`, and a subscriber passing it as `fencing` on the
+ *      mutation it acts with is refused under the host lock once the
+ *      generation is superseded. Delivery is a notification; the stamp is the
+ *      authorization.
  *
- * Case 2 is the reason the option is named `ownershipCheck` and carries its own
- * type rather than reusing `fencing`: the `issues.*` / `state.set` fences take
- * the lock inside the mutation's own transaction and hold it to commit, so for
- * those there is no equivalent window. Asserting case 2 here is the point. If
- * someone later makes delivery authoritative (a transactional outbox in the
- * host event subsystem — the only real fix, and not one the emitting side can
- * make), this test SHOULD fail, and its failure is the signal to update the
- * `PluginEventOwnershipCheck` docs and the plugin's expectations with it.
+ * Case 2 used to assert only "still delivers" and was the documented gap. It
+ * is rewritten, not deleted: delivery is still asserted, and so is the
+ * refusal of the stale stamp, against a control proving the same stamp is
+ * accepted while the generation is current.
  *
  * Mutation-check: deleting the `assertPluginFencingGeneration` call from
- * `events.emit` in `plugin-host-services.ts` fails case 1 and leaves case 2
- * green — which is precisely the asymmetry being documented.
+ * `events.emit` fails case 1; dropping the stamp passed to `scopedBus.emit`
+ * fails case 2 (the stale event's `ownership` is undefined, so the fenced
+ * write is admitted); deleting the `pluginKey` guard in
+ * `resolveCallerFencingPrecondition` fails case 3.
  */
 import { randomUUID } from "node:crypto";
 import path from "node:path";
@@ -90,7 +93,7 @@ function alertmanagerManifest(): PaperclipPluginManifestV1 {
   };
 }
 
-describeEmbeddedPostgres("events.emit ownership check (BLO-31036)", () => {
+describeEmbeddedPostgres("events.emit ownership check (BLO-31036, BLO-31113)", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   let pluginId!: string;
@@ -223,7 +226,26 @@ describeEmbeddedPostgres("events.emit ownership check (BLO-31036)", () => {
     services.dispose();
   });
 
-  it("still dispatches when the steal lands between the check and the fan-out (NOT ENFORCED, documented)", async () => {
+  /** The envelope a subscriber would receive, rebuilt from the bus spy. */
+  function deliveredOwnership(scoped: { emit: ReturnType<typeof vi.fn> }) {
+    const call = scoped.emit.mock.calls.at(-1) as unknown[] | undefined;
+    return call?.[3] as { pluginKey: string; table: string; match: Record<string, string> } | undefined;
+  }
+
+  /** A subscriber acting on the event, fenced by the stamp it was delivered. */
+  function actOnEvent(
+    services: ReturnType<typeof buildHostServices>,
+    fencing: unknown,
+  ): Promise<void> {
+    return services.state.set({
+      scopeKind: "instance",
+      stateKey: `acted:${randomUUID()}`,
+      value: { acted: true },
+      fencing,
+    } as never);
+  }
+
+  it("delivers a steal-window event, but its stamped generation refuses the subscriber's action (ENFORCED AT ACTION)", async () => {
     await seedFence("token-original");
 
     let stolen = false;
@@ -243,17 +265,61 @@ describeEmbeddedPostgres("events.emit ownership check (BLO-31036)", () => {
     });
 
     expect(stolen).toBe(true);
-    // Asserted, not tolerated. This is the residual window the option's name and
-    // docs promise callers, and the reason a subscriber must re-establish
-    // ownership before doing anything durable rather than trusting delivery.
-    // If this ever starts failing, delivery became authoritative — update
-    // `PluginEventOwnershipCheck` and the alertmanager plugin's comments too.
+    // Delivery is NOT suppressed — asserted, not tolerated. No lock spans the
+    // fan-out, by design.
     expect(scoped.emit).toHaveBeenCalledTimes(1);
+
+    // The envelope carries the generation the emitter asserted…
+    const ownership = deliveredOwnership(scoped);
+    expect(ownership).toEqual({
+      pluginKey: ALERTMANAGER_PLUGIN_KEY,
+      ...ownershipCheckFor("token-original"),
+    });
+
+    // …so a subscriber acting with it is refused under the host lock.
+    await expect(actOnEvent(services, ownership)).rejects.toMatchObject({
+      status: 409,
+      details: { code: "fencing_generation_lost", table: FENCE_TABLE },
+    });
 
     services.dispose();
   });
 
-  it("dispatches unconditionally when no ownership check is supplied", async () => {
+  it("accepts the same stamped generation while it is still current (control)", async () => {
+    await seedFence("token-original");
+    const { services, scoped } = makeServices();
+
+    await services.events.emit({
+      name: EVENT_NAME,
+      companyId,
+      payload: { aggregateKey: AGGREGATE_KEY },
+      ownershipCheck: ownershipCheckFor("token-original"),
+    });
+
+    // Without this, the refusal above could be a malformed stamp, not a steal.
+    await expect(actOnEvent(services, deliveredOwnership(scoped))).resolves.toBeUndefined();
+
+    services.dispose();
+  });
+
+  it("refuses a stamp from another plugin instead of resolving it against the caller's namespace", async () => {
+    await seedFence("token-original");
+    const { services } = makeServices();
+
+    await expect(
+      actOnEvent(services, {
+        pluginKey: "some.other-plugin",
+        ...ownershipCheckFor("token-original"),
+      }),
+    ).rejects.toMatchObject({
+      status: 409,
+      details: { code: "fencing_precondition_foreign" },
+    });
+
+    services.dispose();
+  });
+
+  it("dispatches unconditionally, unstamped, when no ownership check is supplied", async () => {
     await seedFence("token-original");
     const { services, scoped } = makeServices();
 
@@ -264,6 +330,7 @@ describeEmbeddedPostgres("events.emit ownership check (BLO-31036)", () => {
     });
 
     expect(scoped.emit).toHaveBeenCalledTimes(1);
+    expect(deliveredOwnership(scoped)).toBeUndefined();
 
     services.dispose();
   });

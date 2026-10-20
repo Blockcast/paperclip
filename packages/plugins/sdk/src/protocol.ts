@@ -431,6 +431,15 @@ export type PluginFencingPrecondition = {
   table: string;
   /** Column -> required value. One row must match all of them. */
   match: Record<string, string | number | null>;
+  /**
+   * Optional. When present it must equal the calling plugin's key, or the
+   * mutation is refused with `fencing_precondition_foreign`. It exists so a
+   * {@link PluginEventOwnership} stamp can be passed straight through as
+   * `fencing`: an event from another plugin names a table in *that* plugin's
+   * namespace, and resolving it against the caller's own namespace could match
+   * an unrelated same-named table and admit the mutation.
+   */
+  pluginKey?: string;
 };
 
 /** Error code returned when a supplied {@link PluginFencingPrecondition} no longer holds. */
@@ -448,31 +457,35 @@ export const PLUGIN_FENCING_GENERATION_LOST_CODE = "fencing_generation_lost";
 export const PLUGIN_STATE_PRECONDITION_FAILED_CODE = "state_precondition_failed";
 
 /**
- * A best-effort ownership check for `events.emit`. **This is not a fence, and
- * it is a separate type from {@link PluginFencingPrecondition} for exactly that
- * reason.**
+ * The ownership check for `events.emit`. **On its own this is not a fence**,
+ * and it is a separate type from {@link PluginFencingPrecondition} for that
+ * reason — but since BLO-31113 it travels with the event, which is what makes
+ * the end-to-end contract enforceable.
  *
- * What it does guarantee: the host re-reads this generation immediately before
- * fan-out and refuses to dispatch if it is already gone. That downgrades "a
- * displaced worker announces an event it does not own" from *likely* (the
- * displacement usually happened long before the emit) to *a race it has to
- * win*.
+ * At emit: the host re-reads this generation immediately before fan-out and
+ * refuses to dispatch if it is already gone. A steal committing between that
+ * check and the fan-out still results in delivery. Holding the share lock
+ * across the handlers would close that window and is rejected on purpose:
+ * handlers run arbitrary plugin code, so a slow or wedged handler would block
+ * the steal path, reintroducing the unstealable-fence failure this mechanism
+ * exists to prevent (BLO-31036).
  *
- * What it does NOT guarantee, and callers must not assume: that a delivered
- * event was owned at the moment a subscriber acted on it. Event delivery is an
- * in-memory fan-out with no transaction to join, so there is no lock to hold
- * from the check through the dispatch. A steal committing in that window still
- * results in delivery. Holding the share lock across the handlers *would* close
- * it and is rejected on purpose: handlers run arbitrary plugin code, so a slow
- * or wedged handler would block the steal path — reintroducing the
- * unstealable-fence failure this whole mechanism exists to prevent (BLO-31036).
+ * At delivery: the host stamps the checked generation onto the envelope as
+ * {@link PluginEvent.ownership}. A subscriber acting on the event passes that
+ * object as the `fencing` option of its `state.set` / `issues.*` mutation, and
+ * the host takes the share lock inside *that* mutation's transaction — so a
+ * superseded generation cannot be acted on, however late it is delivered.
+ * That is the authoritative point, and it is the point of action rather than
+ * the point of delivery, which is the only place the lock can be held without
+ * blocking a steal on handler code.
  *
- * Therefore: **treat a plugin event as a notification, not as an authorization
- * to act on the named aggregate.** A subscriber that performs a durable or
- * side-effecting action must re-establish ownership itself at the point of that
- * action. Making delivery authoritative needs a transactional outbox in the
- * host event subsystem and is tracked in BLO-31113 — it cannot be fixed from
- * the emitting side.
+ * Therefore: **delivery is a notification; `fencing: event.ownership` is the
+ * authorization.** A subscriber that acts without passing it has no guarantee.
+ *
+ * Scope: the stamp names a table in the *emitting* plugin's namespace, so it
+ * is enforceable only by the emitting plugin's own handlers. Another plugin
+ * passing it is refused with `fencing_precondition_foreign` rather than
+ * resolved against the wrong schema.
  */
 export type PluginEventOwnershipCheck = {
   /** Table in the calling plugin's namespace that holds the generation. */
@@ -480,6 +493,14 @@ export type PluginEventOwnershipCheck = {
   /** Column -> required value. One row must match all of them. */
   match: Record<string, string | number | null>;
 };
+
+/**
+ * The generation stamped onto a delivered {@link PluginEvent} by the host when
+ * its emit carried an {@link PluginEventOwnershipCheck}. Shaped as a
+ * {@link PluginFencingPrecondition} so it can be passed through unchanged as
+ * `fencing`; `pluginKey` is the emitting plugin, set by the host.
+ */
+export type PluginEventOwnership = PluginEventOwnershipCheck & { pluginKey: string };
 
 /**
  * Input for the `performAction` RPC method.
@@ -1186,8 +1207,8 @@ export interface WorkerToHostMethods {
       companyId: string;
       payload: unknown;
       /**
-       * Best-effort pre-dispatch ownership check. NOT a fence — see
-       * {@link PluginEventOwnershipCheck}. Deliberately not `fencing`.
+       * Pre-dispatch ownership check, stamped onto the delivered event as
+       * `ownership`. Not a fence by itself — see {@link PluginEventOwnershipCheck}.
        */
       ownershipCheck?: PluginEventOwnershipCheck;
     },

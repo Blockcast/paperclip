@@ -86,7 +86,11 @@ export {
   PLUGIN_STATE_PRECONDITION_FAILED_CODE,
   _resetIdCounter,
 } from "./protocol.js";
-export type { PluginFencingPrecondition } from "./protocol.js";
+export type {
+  PluginEventOwnership,
+  PluginEventOwnershipCheck,
+  PluginFencingPrecondition,
+} from "./protocol.js";
 
 // ---------------------------------------------------------------------------
 // Type exports

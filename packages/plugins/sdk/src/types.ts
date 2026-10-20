@@ -52,6 +52,7 @@ import type {
   EnvSecretRefBinding,
 } from "@paperclipai/shared";
 import type {
+  PluginEventOwnership,
   PluginEventOwnershipCheck,
   PluginFencingPrecondition,
   PluginPerformActionContext,
@@ -255,6 +256,15 @@ export interface PluginEvent<TPayload = unknown> {
   companyId: string;
   /** Typed event payload. */
   payload: TPayload;
+  /**
+   * The ownership generation the emitter asserted, stamped by the host after
+   * its pre-dispatch check (BLO-31113). Present only when the emit carried an
+   * `ownershipCheck`. Delivery alone still proves nothing — pass this object
+   * as the `fencing` option of the mutation you act with, and the host
+   * enforces it under a lock inside that mutation's transaction. See
+   * {@link PluginEventOwnershipCheck}.
+   */
+  ownership?: PluginEventOwnership;
 }
 
 // ---------------------------------------------------------------------------
@@ -737,11 +747,14 @@ export interface PluginEventsClient {
    * wedged handler would block the steal path, reintroducing the
    * unstealable-fence failure this mechanism exists to prevent (BLO-31036).
    *
-   * Consequently a subscriber must treat an event as a notification, not as an
-   * authorization to act: anything durable or side-effecting has to
-   * re-establish ownership itself. Making delivery authoritative requires a
-   * transactional outbox in the host event subsystem (BLO-31113) and cannot be
-   * fixed from the emitting side.
+   * So delivery is a notification, not an authorization. What closes the gap
+   * (BLO-31113): the host stamps the checked generation onto the delivered
+   * event as `event.ownership`, and a subscriber passes that object as the
+   * `fencing` option of the mutation it acts with. The host then enforces the
+   * generation under a lock inside that mutation's own transaction, so a
+   * superseded owner's event cannot be acted on however late it arrives. This
+   * works for the emitting plugin's own handlers only; another plugin passing
+   * the stamp is refused with `fencing_precondition_foreign`.
    *
    * @see PluginEventOwnershipCheck
    */

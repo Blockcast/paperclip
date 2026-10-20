@@ -1,3 +1,4 @@
+import { conflict } from "../errors.js";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -623,6 +624,14 @@ export function buildHostServices(
     fencing: PluginFencingPreconditionInput | null | undefined,
   ): Promise<ResolvedPluginFencingPrecondition | null> => {
     if (!fencing) return null;
+    // A `PluginEvent.ownership` stamp names a table in the EMITTING plugin's
+    // namespace. Resolving a foreign one against ours could match an
+    // unrelated same-named table and admit the mutation, so refuse it.
+    if (fencing.pluginKey !== undefined && fencing.pluginKey !== pluginKey) {
+      throw conflict("Fencing precondition belongs to another plugin", {
+        code: "fencing_precondition_foreign",
+      });
+    }
     const namespace = await pluginDb.getRuntimeNamespace(pluginId);
     return resolvePluginFencingPrecondition(namespace, fencing);
   };
@@ -1387,36 +1396,36 @@ export function buildHostServices(
         if (params.companyId) {
           await ensurePluginAvailableForCompany(params.companyId);
         }
-        // A best-effort pre-dispatch ownership check, NOT a fence — which is
-        // why the param is `ownershipCheck` and carries its own type rather
-        // than reusing `fencing`. The `issues.*` / `state.set` fences join the
-        // mutation's own transaction and hold the lock to commit, so a
-        // displaced caller's write cannot land. A bus emit is an in-memory
-        // fan-out with no transaction to join, so the best available guarantee
-        // is "re-read the generation immediately before dispatch, and refuse
-        // once it is gone".
+        // The pre-dispatch check is a barrier, not a fence: a steal committing
+        // between its commit and the fan-out below still results in delivery.
+        // Holding the lock across the fan-out would close that and is rejected
+        // on purpose — handlers run arbitrary plugin code, so one slow handler
+        // would block a steal, recreating the unstealable fence BLO-31036
+        // exists to drain.
         //
-        // The residual window is real and deliberate: a steal committing
-        // between this check's commit and the fan-out below still results in
-        // delivery. Holding the lock across the fan-out would close it and is
-        // rejected on purpose — subscriber handlers run arbitrary plugin code,
-        // so one slow handler would block a steal, recreating the unstealable
-        // fence this whole mechanism exists to prevent (BLO-31036).
-        //
-        // Consequence for consumers, and it is part of the contract: an event
-        // is a notification, not an authorization to act on the named
-        // aggregate. A subscriber doing anything durable must re-establish
-        // ownership itself. Making delivery authoritative needs a
-        // transactional outbox in this event subsystem (BLO-31113) and cannot be
-        // done from the emitting side. Both halves are pinned by
-        // `server/src/__tests__/plugin-events-ownership-check.test.ts`.
+        // Instead the checked generation travels with the event (BLO-31113).
+        // A subscriber passes `event.ownership` as `fencing` on the mutation it
+        // acts with, and the host enforces it inside THAT transaction — the
+        // only place a lock can be held without spanning handler code. Pinned
+        // by `server/src/__tests__/plugin-events-ownership-check.test.ts`.
         const ownershipCheck = await resolveCallerFencingPrecondition(params.ownershipCheck);
         if (ownershipCheck) {
           await db.transaction(async (tx) => {
             await assertPluginFencingGeneration(tx, ownershipCheck);
           });
         }
-        await scopedBus.emit(params.name, params.companyId, params.payload);
+        await scopedBus.emit(
+          params.name,
+          params.companyId,
+          params.payload,
+          params.ownershipCheck
+            ? {
+                pluginKey,
+                table: params.ownershipCheck.table,
+                match: params.ownershipCheck.match,
+              }
+            : undefined,
+        );
       },
       async subscribe(params: { eventPattern: string; filter?: Record<string, unknown> | null }) {
         const handler = async (event: import("@paperclipai/plugin-sdk").PluginEvent) => {
