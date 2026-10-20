@@ -182,17 +182,66 @@ const DIGEST_NAME_RE = /(?:^|[_.\-])(?:sha(?:1|224|256|384|512)|md5|digest|check
 const PNPM_PATCH_HASH_RE = /^[a-z2-7]{26}$/;
 
 /** BLO-46448: an Alertmanager/Prometheus alert name — `VaultTLSProbeUnreachable`
- *  — in an `amtool silence add alertname=<name>` matcher, as written into the
- *  alert rules' own runbook text on onprem-k8s. It scores 3.94 bits/char, and
- *  every agent push touching a rules file carrying that line was refused.
+ *  — in an `amtool silence add` matcher, as written into the alert rules' own
+ *  runbook text on onprem-k8s. It scores 3.94 bits/char, and every agent push
+ *  touching a rules file carrying that line was refused.
  *
  *  UpperCamelCase words, optionally with an acronym run of up to 5 capitals
- *  before the next word (`TLS`, `API`), no digits. Name-anchored on purpose,
- *  like the patch_hash pin: shape alone was measured and declined. Through
- *  the entropy floor, 500k random values per shape, the bare shape passes
- *  ~22% of mixed-case letters-only tokens; adding lowercase-run and acronym
- *  bounds still left ~1.4e-3 at 24 chars, above this file's accepted band. */
-const ALERT_NAME_RE = /^(?:[A-Z][a-z]+|[A-Z]{1,5}(?=[A-Z][a-z]))+$/;
+ *  before the next word (`TLS`, `API`). Name-anchored on purpose, like the
+ *  patch_hash pin: shape alone was measured and declined. Through the entropy
+ *  floor, 500k random values per shape, the bare shape passes ~22% of
+ *  mixed-case letters-only tokens; adding lowercase-run and acronym bounds
+ *  still left ~1.4e-3 at 24 chars, above this file's accepted band.
+ *
+ *  PEN-3920 (D4): each word may carry a trailing digit run of at most 2, and
+ *  the value at most ALERT_NAME_MAX_DIGIT_RUNS runs overall. The digit tail is
+ *  on the ACRONYM branch too, with the lookahead re-anchored after it — without
+ *  that, `V6` and `HTTP2` have no lowercase run to attach to and the rule
+ *  reaches neither of the measured names. A lowercase tail after a digit run
+ *  was measured and DECLINED: ~1.6x the residual to buy one corpus member.
+ *
+ *  THE RESIDUAL THIS ANCHOR CARRIES — the number a future reader widening this
+ *  rule needs most (PEN-3920 section 6.5). Under an anchored name this shape
+ *  exonerates 2.33e-1 of random mixed-case LETTERS-ONLY tokens at 24 chars.
+ *  That is not a typo and it is not closed by the digit bound: a letters-only
+ *  token has no digits to bound, so D4 leaves that column unchanged. What
+ *  makes it acceptable is the name anchor and nothing else (PEN-3920 section
+ *  4): this file guards ACCIDENTAL disclosure, and an accidental leak does not
+ *  choose its binding name — the name comes from whatever code interpolated
+ *  the value. Widen the SHAPE here if the measurement supports it; do not
+ *  widen the NAME set without re-reading that section, and never move this
+ *  shape into a name-free rule. For scale, on digit-bearing alphabets D4 moves
+ *  the residual from 4.01e-3 to 1.81e-2 (base62 at 24 chars). */
+const ALERT_NAME_RE = /^(?:[A-Z][a-z]+\d{0,2}|[A-Z]{1,5}\d{0,2}(?=[A-Z][a-z]))+$/;
+
+/** PEN-3920 (D4): how many digit runs a name-anchored identifier may carry.
+ *  The per-word bound above caps each run at 2 characters but says nothing
+ *  about how MANY runs a value holds, so without this a value alternating
+ *  short letter runs with 2-digit runs stays exonerated. Two is what the
+ *  measured corpus needs (`Vlan1...V6...` carries exactly two). */
+const ALERT_NAME_MAX_DIGIT_RUNS = 2;
+
+/** PEN-3920 (D5): a Prometheus `job` label value — lowercase snake_case words,
+ *  each optionally carrying a trailing digit run of at most 2, at least two
+ *  segments. Routed through the NAME anchor, deliberately, rather than through
+ *  isLexicalIdentifier: that rule is name-free, so raising its mixed-segment
+ *  cap to reach this value was measured at a consistent 4x widening under every
+ *  binding name in the fleet, and is REFUSED (PEN-3920 section 6.3).
+ *
+ *  Residual: lower than the CamelCase row above, because the alphabet is one
+ *  case and the separator is mandatory — a random lowercase token carries no
+ *  underscore, so it fails the two-segment floor before any other conjunct is
+ *  reached. The digit-run cap applies here too.
+ *
+ *  The digit run is a TAIL only, matching the shape D4 approved and measured.
+ *  So a word carrying an INTERIOR digit (`orc8r`, `i18n`) does not match here
+ *  — deliberately. Those are already reached by isLexicalIdentifier via
+ *  MIXED_LEXICAL_SEGMENT_RE, which admits one such segment under any name;
+ *  what this rule adds is the case that rule refuses, a value carrying TWO
+ *  mixed segments (`vlan1` and `v6`). Widening the tail to `[a-z]*` was
+ *  declined for the CamelCase rule on measurement and is not taken here on
+ *  the same caution — it has not been measured for this alphabet. */
+const JOB_NAME_RE = /^[a-z]+\d{0,2}(?:_[a-z]+\d{0,2})+$/;
 
 /** BLO-47509: a Kubernetes kind — `ValidatingAdmissionPolicy` — in a PromQL
  *  label selector or a kubectl example, as onprem-k8s rule tests write it.
@@ -200,6 +249,16 @@ const ALERT_NAME_RE = /^(?:[A-Z][a-z]+|[A-Z]{1,5}(?=[A-Z][a-z]))+$/;
  *  ALERT_NAME_RE under the same name-anchored trade: the residual is the one
  *  measured on BLO-46448, now reachable under one more exact name. */
 const CAMEL_CASE_VALUE_NAMES = new Set(["alertname", "kind"]);
+
+/** PEN-3920 (D5): names whose values take the snake_case identifier shape.
+ *  Separate from CAMEL_CASE_VALUE_NAMES because the shapes differ; the
+ *  name-anchored trade is the same one. */
+const SNAKE_CASE_VALUE_NAMES = new Set(["job"]);
+
+/** Digit runs in a value, for the bound above. */
+function digitRunCount(value: string): number {
+  return (value.match(/\d+/g) ?? []).length;
+}
 
 /** BLO-46892: a git commit pin, `rev=<40 lowercase hex>`, as Nix flake inputs
  *  write it (`git+ssh://...?ref=main&rev=<sha>`). A flake input must be a
@@ -212,7 +271,10 @@ const GIT_COMMIT_SHA_RE = /^[0-9a-f]{40}$/;
 /** True when a NAME=VALUE pair is a content digest pin rather than a secret. */
 function isContentDigestAssignment(name: string, value: string): boolean {
   if (name === "patch_hash" && PNPM_PATCH_HASH_RE.test(value)) return true;
-  if (CAMEL_CASE_VALUE_NAMES.has(name) && ALERT_NAME_RE.test(value)) return true;
+  if (digitRunCount(value) <= ALERT_NAME_MAX_DIGIT_RUNS) {
+    if (CAMEL_CASE_VALUE_NAMES.has(name) && ALERT_NAME_RE.test(value)) return true;
+    if (SNAKE_CASE_VALUE_NAMES.has(name) && JOB_NAME_RE.test(value)) return true;
+  }
   if (name === "rev" && GIT_COMMIT_SHA_RE.test(value)) return true;
   return DIGEST_NAME_RE.test(name) && HEX_DIGEST_RE.test(value);
 }
