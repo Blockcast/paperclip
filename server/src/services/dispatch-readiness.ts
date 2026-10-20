@@ -197,3 +197,130 @@ export function isDispatchRankReady(
   if (isQueuedRunAdmissionDeferred(contextSnapshot, now)) return false;
   return isEffectivelyDependencyReadyForDispatch(contextSnapshot, readiness);
 }
+
+/**
+ * Issue statuses that end a run's reason to exist.
+ *
+ * Lives here rather than in `heartbeat.ts` so {@link isRunClaimable} can live
+ * here too. `heartbeat.ts` imports it; there is deliberately only one copy, for
+ * the reason stated at the top of this file.
+ */
+export const TERMINAL_ISSUE_STATUSES: ReadonlySet<string> = new Set(["done", "cancelled"]);
+
+/**
+ * The single definition of "is this queued run's issue actually claimable right
+ * now" (BLO-22091). Every dispatch lane's eligibility test
+ * (`foundReadyCritical`, `foundReadyRecovery`, `foundReadyAbsolute`) calls this
+ * and nothing else, so a future change to any one screen cannot silently
+ * desynchronize the lanes from what the claim path actually accepts -- the exact
+ * shape of leaks 2-5 (BLO-21792), which were each one site re-deriving this
+ * verdict slightly differently from the others.
+ *
+ * Three screens, matching what `claimQueuedRun` applies to a routine
+ * (non-reopen) queued run:
+ *   1. The issue must exist and be non-terminal ({@link TERMINAL_ISSUE_STATUSES}).
+ *   2. It must not be a queued-admission retry still waiting on its timestamp.
+ *   3. It must be dependency-ready, or exempted via a verified issue-interaction
+ *      wake ({@link isEffectivelyDependencyReadyForDispatch}).
+ *
+ * `claimQueuedRun`'s own dependency-blocker gate calls
+ * {@link isEffectivelyDependencyReadyForDispatch} directly rather than this
+ * whole predicate, and `dispatchRank` calls the narrower sibling
+ * {@link isDispatchRankReady} instead of this -- see that function's comment for
+ * why terminal-status can't be folded in there without reintroducing an
+ * unbounded wait for a different exemption.
+ *
+ * PEN-4385 moved this out of `heartbeat.ts` so the out-of-band reaper can hold
+ * it as a safety interlock without importing the ~40k-line run lifecycle. The
+ * body is unchanged by that move.
+ */
+export function isRunClaimable(
+  contextSnapshot: Record<string, unknown> | null | undefined,
+  issue: { status: string } | null | undefined,
+  readiness: { isDependencyReady: boolean } | null | undefined,
+  now: Date,
+): boolean {
+  if (!issue || TERMINAL_ISSUE_STATUSES.has(issue.status)) return false;
+  if (isQueuedRunAdmissionDeferred(contextSnapshot, now)) return false;
+  return isEffectivelyDependencyReadyForDispatch(contextSnapshot, readiness);
+}
+
+/**
+ * Why a queued run is or is not eligible for the out-of-band dependency reap
+ * (PEN-4385). Every arm is named so the sweep's log says which population a row
+ * fell into rather than just that it was skipped.
+ */
+export type QueuedRunDependencyReapVerdict =
+  | { reap: false; reason: "claimable" | "issue_missing" | "terminal_issue" | "admission_deferred" }
+  | { reap: true; reason: "dependency_blocked" };
+
+/**
+ * Decide whether an already-`queued` run should be reaped because its issue is
+ * dependency-blocked (PEN-4385).
+ *
+ * ## The gap this closes
+ *
+ * A dependency-blocked *wake* is handled correctly: it parks into
+ * `scheduled_retry` under `DEP_BLOCKED_RETRY_REASON`, with a retry budget and a
+ * wall-clock ceiling. The gap is a run that is ALREADY `queued` when its issue
+ * becomes un-ready -- the common shape being a run enqueued against a ready
+ * issue that is blocked afterwards, which no enqueue-time screen can catch.
+ * Such a row is unclaimable, so every dispatch lane pages past it and
+ * `dispatchRank` files it at rank 12+ where it "must not escalate to the front,
+ * however long it has waited". The only thing that cancels it,
+ * `cancelQueuedRunForBlockedDependencies`, had exactly one call site -- inside
+ * `claimQueuedRun` -- so it fired only on a claim that never came. The row then
+ * aged in `queued` without bound, occupying per-agent queue depth and the
+ * dispatch scan's bounded window, and inflating
+ * `pg_heartbeat_run_queue_backlog_by_agent_oldest_unparked_queued_seconds`
+ * (PEN-4280 §1: three days of triage on a healthy dispatcher).
+ *
+ * ## Why the arms are in this order
+ *
+ * {@link isRunClaimable} comes FIRST and is the hard safety interlock: a row the
+ * dispatcher could claim right now is never reaped, whatever the arms below
+ * would say. It is the dispatcher's own predicate, called whole -- not a
+ * dependency conjunct, not a restatement. That matters more here than anywhere
+ * else in this file, because this is the one reader whose verdict DESTROYS a
+ * run rather than ranking or counting it: a re-derivation that drifted
+ * permissive would cancel dispatchable work.
+ *
+ * The remaining arms then split "unclaimable" by cause, because only one cause
+ * is unbounded:
+ *
+ *   - `terminal_issue` / `issue_missing` are NOT this sweep's population.
+ *     `evaluateQueuedRunStaleness` owns them and is resume-intent-aware: it
+ *     deliberately keeps a `resumeIntent`/wake-comment-carrying row alive
+ *     against a done or cancelled issue so a comment can reopen it. This
+ *     function has no way to see that intent, so reaping here would kill rows
+ *     that are legitimately waiting to be reopened.
+ *   - `admission_deferred` is already bounded by construction. A k8s-isolation
+ *     or branch-claim backoff carries its own future timestamp and clears
+ *     itself; the row is unclaimable on purpose and only for as long as the
+ *     stamp says. Reaping it would cancel a run that is behaving exactly as
+ *     designed.
+ *   - `dependency_blocked` is the one with no other bound, and the one the
+ *     claim path already knows how to dispose of.
+ *
+ * The issue-interaction-wake exemption is preserved for free, because it lives
+ * inside {@link isEffectivelyDependencyReadyForDispatch}: a wake carrying a
+ * comment id is deliberately allowed to run on a blocked issue so a human can
+ * still talk to the assignee, and it is reported `claimable` by the first arm.
+ * That is the one case in this whole population with a person waiting on it.
+ */
+export function classifyQueuedRunForDependencyReap(
+  contextSnapshot: Record<string, unknown> | null | undefined,
+  issue: { status: string } | null | undefined,
+  readiness: { isDependencyReady: boolean } | null | undefined,
+  now: Date,
+): QueuedRunDependencyReapVerdict {
+  if (isRunClaimable(contextSnapshot, issue, readiness, now)) {
+    return { reap: false, reason: "claimable" };
+  }
+  if (!issue) return { reap: false, reason: "issue_missing" };
+  if (TERMINAL_ISSUE_STATUSES.has(issue.status)) return { reap: false, reason: "terminal_issue" };
+  if (isEffectivelyDependencyReadyForDispatch(contextSnapshot, readiness)) {
+    return { reap: false, reason: "admission_deferred" };
+  }
+  return { reap: true, reason: "dependency_blocked" };
+}

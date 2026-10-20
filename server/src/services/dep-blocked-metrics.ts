@@ -21,7 +21,17 @@ export type DepBlockedMetricKey =
   // interaction-wake evasion was actually taken" — a persistently zero value on a
   // fleet with dep-blocked parks and comment traffic means the recovery is not
   // matching, not that the hole is unused.
-  | "dep_blocked_origin_recovered";
+  | "dep_blocked_origin_recovered"
+  // An already-`queued` run cancelled out of band by `reapUnclaimableQueuedRuns`
+  // because its issue was dependency-blocked (PEN-4385). Distinct from
+  // dep_blocked_scheduled, which counts a wake PARKED before it ever reached
+  // `queued`: these two measure the two different ways a blocked issue stops
+  // consuming dispatch, and conflating them would hide whether the enqueue-time
+  // park is doing its job. A persistently non-zero value here is normal (a run
+  // enqueued against a ready issue that was blocked afterwards cannot be caught
+  // at enqueue time); a persistently ZERO value on a fleet with dep-blocked
+  // parks means the sweep is not reaching rows, not that none exist.
+  | "dep_blocked_queued_reaped";
 
 const MAX_COUNTER_VALUE = Number.MAX_SAFE_INTEGER;
 
@@ -34,6 +44,7 @@ const counters: Record<DepBlockedMetricKey, number> = {
   dep_blocked_exhausted: 0,
   dep_blocked_age_expired: 0,
   dep_blocked_origin_recovered: 0,
+  dep_blocked_queued_reaped: 0,
 };
 
 export function incrementDepBlockedMetric(key: DepBlockedMetricKey): void {

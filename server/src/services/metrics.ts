@@ -8598,7 +8598,7 @@ export async function renderMetrics(): Promise<{ contentType: string; body: stri
   const reg = getMetricsRegistry();
   const depBlockedSnapshot = snapshotDepBlockedMetrics();
   const depBlockedBody = [
-    `# HELP ${DEP_BLOCKED_WAKEUP_METRIC} Count of dependency-blocked wakeup coalescer outcomes, labeled by outcome.`,
+    `# HELP ${DEP_BLOCKED_WAKEUP_METRIC} Count of dependency-blocked outcomes, labeled by outcome: the wakeup coalescer's park/promote/expire outcomes, plus dep_blocked_queued_reaped for an already-queued run cancelled out of band by reapUnclaimableQueuedRuns (PEN-4385).`,
     `# TYPE ${DEP_BLOCKED_WAKEUP_METRIC} counter`,
     ...Object.entries(depBlockedSnapshot).map(
       ([outcome, value]) => `${DEP_BLOCKED_WAKEUP_METRIC}{outcome="${outcome}"} ${value}`,
