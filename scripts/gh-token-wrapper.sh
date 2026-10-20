@@ -44,6 +44,7 @@ GIT_BIN="${GH_TOKEN_WRAPPER_GIT:-/usr/bin/git}"
 exec_real_gh() {
   case "${1:-} ${2:-}" in
     "pr merge") squash_merge_without_ai_trailers "$@" ;;
+    "api "*) refuse_api_merge "$@" ;;
   esac
   case "${1:-} ${2:-}" in
     "auth setup-git" | "auth login")
@@ -63,15 +64,56 @@ exec_real_gh() {
 # wrapper, so for `pr merge --squash` it always passes an explicit body: the
 # caller's, or else the PR body, with those lines removed. Other trailers
 # (`Signed-off-by:`, `values-ack:`) are kept. Non-squash merges are untouched.
-# ponytail: only `-s`/`--squash` are detected, not a short-flag cluster like `-ds`.
+#
+# A `## Model used` section (the PR template requires one) and any
+# `Model used:` line are dropped too. A strip list always misses the next
+# form, so after stripping the merge is refused if any attribution text is
+# left anywhere in the body.
 strip_ai_trailers() {
-  grep -viE '^[[:space:]]*co-authored-by:|^[^[:alnum:]]*generated with' || true
+  awk '
+    { l = tolower($0) }
+    l ~ /^[ \t]*#+[ \t]/ { skip = (l ~ /^[ \t]*#+[ \t]*model used/) }
+    skip { next }
+    l ~ /^[ \t]*co-authored-by:/ || l ~ /^[^a-z0-9]*(generated with|model used)/ { next }
+    { print }
+  '
+}
+
+refuse_if_ai_attribution_left() {
+  if grep -qiE 'co-authored-by|generated with|model used|noreply@anthropic\.com|noreply@paperclip\.ing' "$1"; then
+    grep -niE 'co-authored-by|generated with|model used|noreply@anthropic\.com|noreply@paperclip\.ing' "$1" >&2 || true
+    rm -f "$1"
+    echo "gh-token-wrapper: refusing the squash merge: the message above still carries AI attribution after scrubbing (BLO-47692); pass a --body-file without it" >&2
+    exit 1
+  fi
+}
+
+# BLO-47692: a merge through `gh api` (REST PUT pulls/N/merge, or the GraphQL
+# merge mutations) gets GitHub's default squash message, trailers included,
+# and never reaches the scrub above. Refuse it; `gh pr merge` does the same job.
+# ponytail: a GraphQL query passed as `query=@file` is not opened, only argv is read.
+refuse_api_merge() {
+  put=no merge=no prev=""
+  for a in "$@"; do
+    case "${prev} ${a}" in
+      "-X PUT" | "-X put" | "--method PUT" | "--method put" | *" -XPUT" | *" -Xput" | *" --method=PUT" | *" --method=put") put=yes ;;
+    esac
+    case "${a}" in
+      *pulls/*/merge | *pulls/*/merge\?*) merge=yes ;;
+      *mergePullRequest* | *enablePullRequestAutoMerge*) put=yes merge=yes ;;
+    esac
+    prev="${a}"
+  done
+  if [ "${put}" = yes ] && [ "${merge}" = yes ]; then
+    echo "gh-token-wrapper: refusing a pull-request merge through \`gh api\`: it would land GitHub's default squash message with AI co-author trailers (BLO-47692); use \`gh pr merge --squash\`" >&2
+    exit 1
+  fi
 }
 
 squash_merge_without_ai_trailers() {
   squash=no
   for a in "$@"; do
-    case "${a}" in -s | --squash | --squash=true) squash=yes ;; esac
+    case "${a}" in -s | -ds | -sd | --squash | --squash=true) squash=yes ;; esac
   done
   [ "${squash}" = yes ] || return 0
 
@@ -131,6 +173,7 @@ squash_merge_without_ai_trailers() {
     strip_ai_trailers < "${body_file}.raw" > "${body_file}"
     rm -f "${body_file}.raw"
   fi
+  refuse_if_ai_attribution_left "${body_file}"
 
   status=0
   "${REAL_GH}" "$@" --body-file "${body_file}" || status=$?
