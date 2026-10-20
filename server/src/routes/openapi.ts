@@ -771,7 +771,6 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "POST /api/issues/{id}/interactions/{interactionId}/accept",
   "POST /api/issues/{id}/interactions/{interactionId}/reject",
   "POST /api/issues/{id}/interactions/{interactionId}/respond",
-  "POST /api/issues/{id}/interactions/{interactionId}/acknowledge-outcome",
   "GET /api/companies/{companyId}/tools/gallery",
   "POST /api/companies/{companyId}/tools/apps/connect",
   "POST /api/companies/{companyId}/tools/apps/{connectionId}/finish",

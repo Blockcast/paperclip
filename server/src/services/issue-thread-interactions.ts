@@ -2135,11 +2135,14 @@ export function issueThreadInteractionService(db: Db) {
      * it reads are board and operator decisions, and a sweep that could write
      * one off would be executing a decision nobody delegated to it. Deciding
      * that an authorised action is moot is exactly such a decision. It is
-     * therefore made by a person here, and the sweep only reads the result.
+     * therefore made by an explicit, recorded caller here, and the sweep only
+     * reads the result.
      *
-     * Board-only at the route, and refused on a card that is not `accepted` or
-     * whose kind the sweep never reports — acknowledging a card that was never
-     * in the population would write a record implying a wait that never existed.
+     * Open to agents as well as the board at the route — the party that knows
+     * an action went moot is usually the agent that filed the ask. Refused on a
+     * card that is not `accepted` or whose kind the sweep never reports:
+     * acknowledging a card that was never in the population would write a
+     * record implying a wait that never existed.
      */
     acknowledgeInteractionOutcome: async (
       issue: { id: string; companyId: string },
