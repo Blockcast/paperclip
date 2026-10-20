@@ -846,6 +846,13 @@ export interface Issue {
   parkedByAgentId?: string | null;
   parkedAt?: Date | null;
   /**
+   * PEN-4420: when the park's one-shot expiry wake fired, or `null` while it has not.
+   * Projected read-only alongside the four park columns for the same reason they are:
+   * the audit that found this defect (PEN-4419) is a client-side query over list rows,
+   * and "is this park's release edge still pending?" is the question it now has to ask.
+   */
+  parkedWakeFiredAt?: Date | null;
+  /**
    * Flat scheduled-retry projection carried by every issue **list** row
    * (BLO-28843). Present-and-null when the issue has no run parked in
    * `scheduled_retry`; never absent on a list row.

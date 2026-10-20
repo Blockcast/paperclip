@@ -4031,6 +4031,9 @@ const issueListSelect = {
   parkedReason: issues.parkedReason,
   parkedByAgentId: issues.parkedByAgentId,
   parkedAt: issues.parkedAt,
+  // PEN-4420: the release edge's fire-once marker, projected for the same reason the four
+  // above are -- the stranded-park audit runs over list rows.
+  parkedWakeFiredAt: issues.parkedWakeFiredAt,
   executionWorkspaceId: issues.executionWorkspaceId,
   executionWorkspacePreference: issues.executionWorkspacePreference,
   executionWorkspaceSettings: sql<null>`null`,
@@ -11397,6 +11400,15 @@ export function issueService(db: Db) {
           patch.parkedByAgentId = actorAgentId ?? null;
           patch.parkedAt = new Date();
         }
+        // PEN-4420: re-arm the park's release edge on BOTH arms. A park now fires exactly
+        // one expiry wake, marked by `parkedWakeFiredAt`, so a row re-parked after that
+        // wake fired would never fire again if the marker survived -- the park would be
+        // silently one-shot per row instead of per park. Cleared on the un-park arm too:
+        // the marker describes a park, and once there is no park there is nothing for it
+        // to describe. The sweep carries an independent `parkedWakeFiredAt < parkedAt`
+        // backstop so a future writer that forgets this line degrades to a late wake
+        // rather than to permanent silence.
+        patch.parkedWakeFiredAt = null;
       }
 
       const nextAssigneeAgentId =
