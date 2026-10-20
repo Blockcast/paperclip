@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 
 const script = fileURLToPath(new URL("./check-github-runner-labels.mjs", import.meta.url));
 const repoRoot = path.resolve(path.dirname(script), "..");
-const prE2eRunnerPattern = /\n  e2e:\n(?:(?!\n  [A-Za-z0-9_-]+:)[\s\S])*?\n    runs-on: \$\{\{ github\.event_name == 'merge_group' && 'arc-merge-queue' \|\| 'arc-e2e' \}\}\n/;
+const prE2eRunnerPattern = /\n  e2e:\n(?:(?!\n  [A-Za-z0-9_-]+:)[\s\S])*?\n    runs-on: \$\{\{ github\.event_name == 'merge_group' && 'arc-merge-queue' \|\| 'arc-paperclip-e2e' \}\}\n/;
 
 test("runner-label guard accepts only ARC workflows", async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-runner-labels-"));
@@ -18,7 +18,7 @@ test("runner-label guard accepts only ARC workflows", async (t) => {
     await mkdir(path.join(root, ".github/workflows"), { recursive: true });
     await writeFile(
       path.join(root, ".github/workflows/arc.yml"),
-      "jobs:\n  check:\n    runs-on: default\n  quoted:\n    runs-on: \"default\"\n  aggregate:\n    runs-on: [arc-paperclip-light, arc-dind]\n  release:\n    runs-on:\n      group: arc-deploy\n  browser:\n    runs-on:\n      - arc-e2e\n  image:\n    runs-on: arc-paperclip-buildkit\n  merge_group_style:\n    runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-paperclip-general' }}\n",
+      "jobs:\n  check:\n    runs-on: default\n  quoted:\n    runs-on: \"default\"\n  aggregate:\n    runs-on: [arc-paperclip-light, arc-dind]\n  release:\n    runs-on:\n      group: arc-deploy\n  browser:\n    runs-on:\n      - arc-paperclip-e2e\n  image:\n    runs-on: arc-paperclip-buildkit\n  merge_group_style:\n    runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-paperclip-general' }}\n",
     );
 
     const result = spawnSync(process.execPath, [script], { cwd: root, encoding: "utf8" });
@@ -100,13 +100,13 @@ test("PR e2e workflow isolates pull requests and merge groups", async () => {
   assert.match(
     workflow,
     prE2eRunnerPattern,
-    "expected PR e2e on arc-e2e and merge-group e2e on arc-merge-queue",
+    "expected PR e2e on arc-paperclip-e2e and merge-group e2e on arc-merge-queue",
   );
 
   const driftedWorkflow = `${workflow.replace(
-    "\n    runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-e2e' }}\n",
-    "\n    runs-on: arc-e2e\n",
-  )}\n  later-job:\n    runs-on: arc-e2e\n`;
+    "\n    runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-paperclip-e2e' }}\n",
+    "\n    runs-on: arc-paperclip-e2e\n",
+  )}\n  later-job:\n    runs-on: arc-paperclip-e2e\n`;
   assert.doesNotMatch(
     driftedWorkflow,
     prE2eRunnerPattern,

@@ -2194,7 +2194,7 @@ jobs:
   # new signal on each PR, or before ally approved resulting in CI runs that
   # are unecessary." Rolled out at once per the owner, 2026-10-09 (~11:34Z).
   #
-  # The heavy lanes (every job on arc-paperclip-general or arc-e2e) `needs:`
+  # The heavy lanes (every job on arc-paperclip-general or arc-paperclip-e2e) `needs:`
   # this job, so on a pull_request they wait for a typed, head-bound Ally
   # verdict at the exact head. This job decides WHEN they run, never WHETHER
   # they are required: `verify` still needs every lane and turns a failed or
@@ -2829,7 +2829,11 @@ jobs:
         needs.policy.outputs.merge_group_trim_e2e == 'true') }}
     # Keep PR browser suites off the org-wide default pool. Merge groups use
     # the queue's reserved capacity so unrelated repos cannot delay admission.
-    runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-e2e' }}
+    # BLO-46675: PR runs use the paperclip-only twin `arc-paperclip-e2e`
+    # (onprem-k8s#5894, maxRunners 1), not the shared `arc-e2e`, so this job
+    # keeps a runner once org runner group 1 is scoped. The `arc-e2e` figures
+    # below are history measured on the shared pool.
+    runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-paperclip-e2e' }}
     # The serial browser suite covers 49 flows (43 before BLO-33282 split
     # smoke-lab into 7). 90, not 75, sized against the measured p100 of
     # SUCCESSFUL runs rather than the median. Every ratio here
