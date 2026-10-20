@@ -178,8 +178,15 @@ All four must be true. Measure them; do not assume.
    $ kubectl -n paperclip get pods -l app.kubernetes.io/component=agent-job \
        --field-selector=status.phase=Running \
        -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.containers[0].image}{"\n"}{end}' \
-     | grep -F '<reference>'
+     | awk -F'\t' '$2 == "<reference>"'
    ```
+
+   Match the image field **exactly**, as above. A substring match (`grep -F`)
+   also hits a longer tag that contains the one you are checking — `sha-d529842`
+   matches `sha-d529842-k8s-vendored` — which would send you into a pod on a
+   *different* reference and clear the wrong image. Today's tags are not
+   prefixes of one another, so this is latent rather than live; it is written
+   exactly so that stays true.
 
    If no pod on that reference is still running, you cannot answer the question
    this way, and that is **not** a pass — never record an unexec'able reference
