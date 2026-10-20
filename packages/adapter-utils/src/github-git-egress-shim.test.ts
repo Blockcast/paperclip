@@ -954,6 +954,36 @@ describe("formatRefusal", () => {
     expect(message).toContain("exonerated under the label name");
   });
 
+  // PEN-4428: the reporting ask is itself part of the control. Everyone who
+  // reaches this sentence has judged a refused value harmless and the detector
+  // disagreed, so the one reader who can cause harm by complying is the one
+  // most likely to comply — and an issue tracker is more durable, more indexed
+  // and more widely read than the push that was just refused. Every narrowing
+  // decision in this family was derived from the binding name and the value's
+  // shape, never from the literal, so the message must ask for those and say
+  // plainly not to paste the value.
+  it("asks for the binding name and the shape, never the refused value itself", () => {
+    const message = formatRefusal([
+      {
+        commit: "c".repeat(40),
+        shortCommit: "cccccccccccc",
+        subject: "add recording rule",
+        where: "content",
+        classes: ["high-entropy-assignment"],
+      },
+    ]);
+    expect(message).toContain("file against the detector");
+    expect(message).toContain("Report the binding name");
+    // The shape, spelled out — a reporter should not have to guess what
+    // "shape" means to produce a usable report.
+    expect(message).toContain("length");
+    expect(message).toContain("character classes");
+    expect(message).toContain("digit run");
+    // ...and the prohibition, stated rather than implied.
+    expect(message).toContain("Do not paste the refused value");
+    expect(message).not.toContain("quoting the refused value");
+  });
+
   // The remedy was widened; the control was NOT. PEN-3920 section 5.3: the
   // env-backed overrides that once existed were removed BECAUSE they were an
   // escape hatch, and nothing here may reintroduce one. This test exists to

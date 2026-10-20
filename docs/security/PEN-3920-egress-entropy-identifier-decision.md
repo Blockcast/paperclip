@@ -336,6 +336,18 @@ may file against the detector with the refused value, and that an identifier ref
 label name is a known class with a home (this document). It must **not** gain an allowlist,
 an env override, or any other bypass - section 5.3.
 
+**Amended by PEN-4428 (2026-10-20): the report must not carry the refused value.** The clause
+above said "with the refused value", and that is the wrong direction for a disclosure guard.
+The only reader who reaches that sentence is one who has judged a refused value harmless while
+the detector disagreed, so the single reader who can cause harm by complying is also the one
+most likely to comply — and an issue tracker is more durable, more indexed and more widely read
+than the blob the push door just refused. The refusal now asks for the **binding name** (the
+label or key the value sits under) and the value's **shape** (length, character classes present,
+longest digit run), and says plainly not to paste the value. That is not a weaker report: every
+narrowing decision in this family — BLO-41153, BLO-41262, BLO-44747, BLO-46448, BLO-47509, and
+D4/D5 above — was derived from exactly the name and the shape, and none needed the literal. The
+rest of D6 is unchanged, and section 5.3 still stands: no allowlist, no env override, no bypass.
+
 ### 6.5 Record the residual honestly
 
 The name-anchored CamelCase exemption carries a 2.33e-1 exoneration rate on mixed-case
