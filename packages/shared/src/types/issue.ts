@@ -1279,6 +1279,46 @@ export type InteractionExpectedOutcome =
 
 export type InteractionExpectedOutcomeKind = InteractionExpectedOutcome["kind"];
 
+/**
+ * A person's record that an accepted card's authorised action will NOT be
+ * observed, and that this is fine (PEN-4409).
+ *
+ * ## Why this exists at all
+ *
+ * `unobserved` had no exit. An acceptance is terminal — `withdrawInteraction`
+ * refuses any interaction that is not `pending` — so the runbook's original
+ * remedy, "withdraw the interaction if it has gone moot", named an operation
+ * the API refuses. And because the alert thresholds the OLDEST age in the
+ * bucket, a single card whose action legitimately never happens (its PR closed
+ * unmerged, or superseded by a different PR) pinned the warning on forever and
+ * masked every newer unobserved card behind it. An alert with no clearing path
+ * is not a strict alert, it is an alert that gets ignored.
+ *
+ * ## Why it is a separate record and not a status change
+ *
+ * The acceptance itself stays `accepted` with its original `resolvedAt`,
+ * `resolvedByUserId` and reason untouched. The decision genuinely was made and
+ * rewriting that row to `cancelled` would falsify the audit trail this whole
+ * feature exists to create. This is an annotation recording that nobody is
+ * waiting any more — not a retraction of the decision.
+ *
+ * ## Why `reason` is required
+ *
+ * An acknowledgement with no reason is indistinguishable from a silenced alarm,
+ * and the failure this feature was built against is precisely a decision that
+ * went unrecorded. The reason is never parsed; it is there so the next reader
+ * can tell "the PR was closed in favour of #2601" from "someone wanted the
+ * alert to stop".
+ */
+export interface InteractionOutcomeAcknowledgement {
+  /** ISO-8601. When the acknowledgement was recorded, not when the card was accepted. */
+  acknowledgedAt: string;
+  acknowledgedByUserId?: string | null;
+  acknowledgedByAgentId?: string | null;
+  /** Free text. Required, never parsed — see the note above on why. */
+  reason: string;
+}
+
 export interface RequestConfirmationIssueDocumentTarget {
   type: "issue_document";
   issueId?: string | null;
@@ -1434,6 +1474,13 @@ export interface RequestConfirmationResult {
     updatedAt?: string | null;
   } | null;
   toolAction?: RequestConfirmationToolActionResult;
+  /**
+   * Set only by `acknowledgeInteractionOutcome` (PEN-4409), long after the card
+   * resolved. Records that a person has accepted that the authorised action
+   * will not be observed, which is the ONLY way a card leaves the `unobserved`
+   * bucket without the action actually happening. Never written by the sweep.
+   */
+  outcomeAcknowledgement?: InteractionOutcomeAcknowledgement | null;
 }
 
 export interface RequestCheckboxConfirmationResult extends RequestConfirmationResult {

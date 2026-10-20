@@ -1374,6 +1374,18 @@ export const requestConfirmationToolActionResultSchema = z.object({
   updatedAt: z.string().datetime({ offset: true }),
 });
 
+/**
+ * A person's record that an accepted card's authorised action will not be
+ * observed (PEN-4409). See `acknowledgeIssueThreadInteractionOutcomeSchema` for
+ * the request body; this is the shape as persisted on `result`.
+ */
+export const interactionOutcomeAcknowledgementSchema = z.object({
+  acknowledgedAt: z.string().min(1),
+  acknowledgedByUserId: z.string().nullable().optional(),
+  acknowledgedByAgentId: z.string().uuid().nullable().optional(),
+  reason: z.string().trim().min(1).max(4000),
+});
+
 export const requestConfirmationResultSchema = z.object({
   version: z.literal(1),
   // "cancelled" records a withdrawal by the creating agent (or a board user)
@@ -1385,6 +1397,12 @@ export const requestConfirmationResultSchema = z.object({
   staleTarget: requestConfirmationTargetSchema.nullable().optional(),
   resumeFailure: requestConfirmationResumeFailureSchema.nullable().optional(),
   toolAction: requestConfirmationToolActionResultSchema.optional(),
+  // PEN-4409. Written long after the card resolved, by
+  // `acknowledgeInteractionOutcome`, to record that the authorised action will
+  // not be observed. It must be declared here or `hydrateInteraction` silently
+  // strips it on the way out (zod drops unknown keys), and the sweep's
+  // `acknowledged` bucket would then read as an annotation that never persisted.
+  outcomeAcknowledgement: interactionOutcomeAcknowledgementSchema.nullable().optional(),
 });
 
 export const requestCheckboxConfirmationResultSchema = requestConfirmationResultSchema.extend({
@@ -1629,6 +1647,23 @@ export const cancelIssueThreadInteractionSchema = z.object({
   reason: z.string().trim().max(4000).optional(),
 });
 export type CancelIssueThreadInteraction = z.infer<typeof cancelIssueThreadInteractionSchema>;
+
+/**
+ * Record that an accepted card's authorised action will not be observed, and
+ * that nobody is waiting on it any more (PEN-4409).
+ *
+ * `reason` is REQUIRED here, unlike the optional `reason` on cancel/withdraw
+ * above, and the difference is deliberate. Withdrawing a `pending` card retracts
+ * an ask nobody has answered yet; this annotates a decision that was genuinely
+ * made and whose action is now being written off. Without a recorded reason the
+ * acknowledgement is indistinguishable from someone silencing an alert, which is
+ * the exact class of unrecorded decision PEN-4409 exists to make visible.
+ */
+export const acknowledgeIssueThreadInteractionOutcomeSchema = z.object({
+  reason: z.string().trim().min(1).max(4000),
+});
+export type AcknowledgeIssueThreadInteractionOutcome =
+  z.infer<typeof acknowledgeIssueThreadInteractionOutcomeSchema>;
 
 export const respondIssueThreadInteractionSchema = z.object({
   answers: z.array(askUserQuestionsAnswerSchema).max(20),

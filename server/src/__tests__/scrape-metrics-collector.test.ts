@@ -26,10 +26,15 @@ const refreshOverdueScheduledRetryAgeMetrics = vi.fn(async () => {});
 const refreshScheduledRetryParkHorizonMetrics = vi.fn(async () => {});
 const refreshDeferredIssueExecutionWakeAgeMetrics = vi.fn(async () => {});
 const refreshExternalRuntimeReservationStrandMetrics = vi.fn(async () => {});
+const refreshAcceptedInteractionOutcomeMetrics = vi.fn(async () => {});
 
 vi.mock("../services/external-runtime-reservations.js", () => ({
   refreshExternalRuntimeReservationMetrics: (db: unknown) =>
     refreshExternalRuntimeReservationMetrics(db as never),
+}));
+vi.mock("../services/accepted-interaction-outcome-sweep.js", () => ({
+  refreshAcceptedInteractionOutcomeMetrics: (db: unknown) =>
+    refreshAcceptedInteractionOutcomeMetrics(db as never),
 }));
 vi.mock("../services/external-runtime-reservation-strand-metrics.js", () => ({
   refreshExternalRuntimeReservationStrandMetrics: (db: unknown) =>
@@ -46,9 +51,11 @@ vi.mock("../services/queued-run-age-metrics.js", () => ({
 }));
 
 const {
+  ACCEPTED_INTERACTION_OUTCOME_METRICS_REFRESH_SUCCESS_METRIC,
   QUEUED_RUN_AGE_METRICS_REFRESH_SUCCESS_METRIC,
   __resetMetricsForTest,
   renderMetrics,
+  setAcceptedInteractionOutcomeMetricsRefreshSuccess,
   setQueuedRunAgeMetricsRefreshSuccess,
 } = await import("../services/metrics.js");
 const { expireStaleRefreshFreshness, resetScrapeMetricsCollectorState, startScrapeMetricsCollector } =
@@ -75,6 +82,7 @@ beforeEach(() => {
     refreshScheduledRetryParkHorizonMetrics,
     refreshDeferredIssueExecutionWakeAgeMetrics,
     refreshExternalRuntimeReservationStrandMetrics,
+    refreshAcceptedInteractionOutcomeMetrics,
   ]) {
     fn.mockReset();
     fn.mockResolvedValue(undefined);
@@ -179,5 +187,97 @@ describe("expireStaleRefreshFreshness (BLO-28865 contract)", () => {
     setQueuedRunAgeMetricsRefreshSuccess(true);
     expireStaleRefreshFreshness(Date.now() + 86_400_000);
     expect(await gaugeValue(QUEUED_RUN_AGE_METRICS_REFRESH_SUCCESS_METRIC)).toBe("1");
+  });
+});
+
+/**
+ * PEN-4409. The accepted-interaction sweep is the only refresh in the list on a
+ * cadence of its own: its CTE scans every accepted confirmation ever filed with
+ * two correlated EXISTS per row, a cost that grows with history and never
+ * shrinks, while what it measures (has a person acted on a decision?) moves on
+ * human timescales against a 24 h alerting threshold. Four scans a minute to
+ * re-derive the same answer is pure waste.
+ */
+describe("per-refresh cadence", () => {
+  function startWithClock(nowMs: { value: number }) {
+    let tick: (() => void) | null = null;
+    const stopFn = startScrapeMetricsCollector(DB, {
+      setInterval: vi.fn((fn: () => void) => {
+        tick = fn;
+        return 0;
+      }) as never,
+      now: () => nowMs.value,
+    });
+    return { stopFn, runTick: () => tick?.() };
+  }
+
+  it("skips a slowed refresh before its own interval has elapsed, while siblings keep ticking", async () => {
+    const nowMs = { value: 1_000_000 };
+    const { stopFn, runTick } = startWithClock(nowMs);
+    stop = stopFn;
+    await settle();
+
+    expect(refreshAcceptedInteractionOutcomeMetrics).toHaveBeenCalledTimes(1);
+
+    nowMs.value += INTERVAL_MS;
+    runTick();
+    await settle();
+    nowMs.value += INTERVAL_MS;
+    runTick();
+    await settle();
+
+    expect(refreshAcceptedInteractionOutcomeMetrics).toHaveBeenCalledTimes(1);
+    // The siblings are unaffected: three ticks, three runs.
+    expect(refreshQueuedRunAgeMetrics).toHaveBeenCalledTimes(3);
+  });
+
+  it("runs the slowed refresh again once its own interval has elapsed", async () => {
+    const nowMs = { value: 1_000_000 };
+    const { stopFn, runTick } = startWithClock(nowMs);
+    stop = stopFn;
+    await settle();
+
+    nowMs.value += 5 * 60_000;
+    runTick();
+    await settle();
+
+    expect(refreshAcceptedInteractionOutcomeMetrics).toHaveBeenCalledTimes(2);
+  });
+
+  /**
+   * The trap this guards. The default stale window is six TICKS (90 s), which
+   * silently assumes every refresh runs every tick. A refresh deliberately
+   * slowed to 5 min would be marked stale between every pair of its OWN runs,
+   * firing its strand alert permanently and reporting a working sweep as broken.
+   */
+  it("does not mark a slowed refresh stale merely for running on its own cadence", async () => {
+    const nowMs = { value: 1_000_000 };
+    refreshAcceptedInteractionOutcomeMetrics.mockImplementation(async () => {
+      setAcceptedInteractionOutcomeMetricsRefreshSuccess(true);
+    });
+    const { stopFn } = startWithClock(nowMs);
+    stop = stopFn;
+    await settle();
+    expect(await gaugeValue(ACCEPTED_INTERACTION_OUTCOME_METRICS_REFRESH_SUCCESS_METRIC)).toBe("1");
+
+    // Well past the 90 s default window, well inside six of its own intervals.
+    expireStaleRefreshFreshness(nowMs.value + 4 * 60_000);
+
+    expect(await gaugeValue(ACCEPTED_INTERACTION_OUTCOME_METRICS_REFRESH_SUCCESS_METRIC)).toBe("1");
+  });
+
+  it("still marks a slowed refresh stale once it has missed several of its own intervals", async () => {
+    const nowMs = { value: 1_000_000 };
+    refreshAcceptedInteractionOutcomeMetrics.mockImplementation(async () => {
+      setAcceptedInteractionOutcomeMetricsRefreshSuccess(true);
+    });
+    const { stopFn } = startWithClock(nowMs);
+    stop = stopFn;
+    await settle();
+    expect(await gaugeValue(ACCEPTED_INTERACTION_OUTCOME_METRICS_REFRESH_SUCCESS_METRIC)).toBe("1");
+
+    expireStaleRefreshFreshness(nowMs.value + 7 * 5 * 60_000);
+
+    expect(await gaugeValue(ACCEPTED_INTERACTION_OUTCOME_METRICS_REFRESH_SUCCESS_METRIC)).toBe("0");
   });
 });

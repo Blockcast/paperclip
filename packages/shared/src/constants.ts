@@ -277,13 +277,28 @@ export type IssueThreadInteractionStatus = (typeof ISSUE_THREAD_INTERACTION_STAT
 /**
  * Outcome-tracking buckets for accepted issue-thread confirmations (PEN-4409).
  *
- * EXHAUSTIVE and all three are always reported. `untracked` — an acceptance
+ * EXHAUSTIVE and all four are always reported. `untracked` — an acceptance
  * that declared no `expectedOutcome` at all — is the one that must never be
  * filtered out for being uninformative: a report showing only the cards that
  * volunteered a reference reads clean because it excludes exactly the
  * population the defect was measured on.
+ *
+ * `acknowledged` is the CLEARING PATH, and the sweep cannot put a card there
+ * itself. An acceptance is terminal — `withdrawInteraction` refuses anything
+ * that is not `pending` — so a card whose authorised action legitimately will
+ * never happen (the PR was closed unmerged, the ask was superseded) had no exit
+ * from `unobserved` at all. Because the alert thresholds the OLDEST age in the
+ * bucket, one such card pinned the alert on forever and masked every newer
+ * unobserved card behind it. A person records the acknowledgement through
+ * `POST /issues/:id/interactions/:interactionId/acknowledge-outcome`; the sweep
+ * only READS it, and must never gain the ability to write one.
  */
-export const ACCEPTED_INTERACTION_OUTCOME_BUCKETS = ["observed", "unobserved", "untracked"] as const;
+export const ACCEPTED_INTERACTION_OUTCOME_BUCKETS = [
+  "observed",
+  "unobserved",
+  "untracked",
+  "acknowledged",
+] as const;
 export type AcceptedInteractionOutcomeBucket = (typeof ACCEPTED_INTERACTION_OUTCOME_BUCKETS)[number];
 
 export const ISSUE_THREAD_INTERACTION_CONTINUATION_POLICIES = [

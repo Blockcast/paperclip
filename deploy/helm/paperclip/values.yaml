@@ -944,10 +944,12 @@ prometheusRule:
   acceptedInteractionUnobservedAgeSeconds: 86400
   # -- Scrape-flap tolerance for the unobserved alert (PEN-4409). The detection lives entirely in acceptedInteractionUnobservedAgeSeconds; this only suppresses a single bad scrape. The age gauge is monotonic while a card sits unactioned, so this never delays the alert by more than one tick in practice.
   acceptedInteractionUnobservedFor: 15m
-  # -- Seconds acceptances may sit with NO declared outcome before reporting (PEN-4409). 259200 (72h), deliberately far longer than the unobserved threshold and at `info` severity: an untracked card is not itself a failure, it is an acceptance nothing CAN check, so this measures adoption of `payload.expectedOutcome` rather than a live incident. It exists as an alert rather than only a dashboard panel for one reason -- an untracked population that is never surfaced anywhere is exactly how a sweep comes to read clean while excluding the very cards it was built to catch.
-  acceptedInteractionUntrackedAgeSeconds: 259200
-  # -- Scrape-flap tolerance for the untracked-adoption signal (PEN-4409).
-  acceptedInteractionUntrackedFor: 1h
+  # -- Fraction of RECENTLY accepted confirmations that may carry no declared `expectedOutcome` before the adoption signal fires (PEN-4409). 0.5 at `info` severity: an untracked card is not itself a failure, it is an acceptance nothing CAN check, so this measures adoption of `payload.expectedOutcome` rather than a live incident. It exists as an alert rather than only a dashboard panel for one reason -- an untracked population that is never surfaced anywhere is exactly how a sweep comes to read clean while excluding the very cards it was built to catch. A SHARE OF A TRAILING WINDOW, not an all-time age: every acceptance filed before this feature shipped is permanently untracked and can never acquire a declaration retroactively, so an all-time threshold is true on the first tick after deploy, can never be cleared by the adoption it asks for, and measures the deploy date instead. Lower this as adoption improves to keep the signal meaningful.
+  acceptedInteractionUntrackedShare: 0.5
+  # -- Minimum recent acceptances before the untracked share is considered meaningful (PEN-4409). Below this the window is too small to distinguish a habit from an accident -- one stray card in a quiet week is 100% non-adoption and says nothing.
+  acceptedInteractionUntrackedMinSample: 5
+  # -- Scrape-flap tolerance for the untracked-adoption signal (PEN-4409). Long, because the share moves only as new acceptances are filed and nothing here is urgent.
+  acceptedInteractionUntrackedFor: 6h
   # -- Alert only after sustained failed sweeps; a one-off failure is logged and retried on the next scrape.
   acceptedInteractionOutcomeMetricsRefreshFailureFor: 15m
   # -- Runbook for the accepted-interaction outcome alerts.

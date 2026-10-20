@@ -824,6 +824,135 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     });
   });
 
+  /**
+   * PEN-4409. The clearing path for `PaperclipAcceptedInteractionActionUnobserved`.
+   *
+   * `withdrawInteraction` refuses anything that is not `pending`, and an
+   * acceptance is terminal — so a card whose authorised action legitimately
+   * never happens had NO exit from the `unobserved` bucket. Because the alert
+   * thresholds the oldest age in that bucket, one such card pinned it on
+   * forever and masked every newer card behind it.
+   */
+  describe("acknowledgeInteractionOutcome", () => {
+    async function seedAcceptedConfirmation(title: string) {
+      const { companyId, goalId, issueId } = await seedConfirmationIssue(title);
+      const agentId = randomUUID();
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "CodexCoder",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+      const created = await interactionsSvc.create({ id: issueId, companyId }, {
+        kind: "request_confirmation",
+        payload: { version: 1, prompt: "Merge the PR?" },
+      }, { agentId });
+      const accepted = await interactionsSvc.acceptInteraction(
+        { id: issueId, companyId, goalId, projectId: null },
+        created.id,
+        {},
+        { userId: "local-board" },
+      );
+      return { companyId, issueId, agentId, interactionId: accepted.interaction.id };
+    }
+
+    it("annotates the result without disturbing the decision record", async () => {
+      const { companyId, issueId, interactionId } = await seedAcceptedConfirmation("Ack moot card");
+      const before = await interactionsSvc.getById(interactionId);
+
+      const acked = await interactionsSvc.acknowledgeInteractionOutcome(
+        { id: issueId, companyId },
+        interactionId,
+        { reason: "superseded by #2601; the PR was closed unmerged" },
+        { userId: "local-board" },
+      );
+
+      // The acceptance itself is untouched: it genuinely happened, and rewriting
+      // it would falsify the audit trail this whole feature exists to create.
+      expect(acked.status).toBe("accepted");
+      expect(acked.resolvedAt).toEqual(before?.resolvedAt);
+      expect(acked.resolvedByUserId).toBe(before?.resolvedByUserId);
+
+      const result = acked.result as { outcome?: string; outcomeAcknowledgement?: Record<string, unknown> };
+      expect(result.outcome).toBe("accepted");
+      expect(result.outcomeAcknowledgement).toMatchObject({
+        acknowledgedByUserId: "local-board",
+        reason: "superseded by #2601; the PR was closed unmerged",
+      });
+    });
+
+    it("refuses a second acknowledgement so the first author is not overwritten", async () => {
+      const { companyId, issueId, interactionId } = await seedAcceptedConfirmation("Ack twice");
+      await interactionsSvc.acknowledgeInteractionOutcome(
+        { id: issueId, companyId },
+        interactionId,
+        { reason: "first" },
+        { userId: "local-board" },
+      );
+
+      await expect(interactionsSvc.acknowledgeInteractionOutcome(
+        { id: issueId, companyId },
+        interactionId,
+        { reason: "second" },
+        { userId: "someone-else" },
+      )).rejects.toMatchObject({ status: 409 });
+    });
+
+    it("refuses a card that is not accepted, which has no authorised outcome to write off", async () => {
+      const { companyId, issueId } = await seedConfirmationIssue("Ack pending card");
+      const created = await interactionsSvc.create({ id: issueId, companyId }, {
+        kind: "request_confirmation",
+        payload: { version: 1, prompt: "Merge the PR?" },
+      }, { userId: "local-board" });
+
+      await expect(interactionsSvc.acknowledgeInteractionOutcome(
+        { id: issueId, companyId },
+        created.id,
+        { reason: "not applicable" },
+        { userId: "local-board" },
+      )).rejects.toMatchObject({ status: 409 });
+    });
+
+    it("refuses a kind the sweep never reports", async () => {
+      const { companyId, issueId } = await seedConfirmationIssue("Ack wrong kind");
+      const created = await interactionsSvc.create({ id: issueId, companyId }, {
+        kind: "ask_user_questions",
+        payload: {
+          version: 1,
+          questions: [{
+            id: "scope",
+            prompt: "Choose the scope",
+            selectionMode: "single",
+            options: [{ id: "a", label: "A" }],
+          }],
+        },
+      } as CreateIssueThreadInteraction, { userId: "local-board" });
+
+      await expect(interactionsSvc.acknowledgeInteractionOutcome(
+        { id: issueId, companyId },
+        created.id,
+        { reason: "not applicable" },
+        { userId: "local-board" },
+      )).rejects.toMatchObject({ status: 422 });
+    });
+
+    it("rejects an empty reason, which would be indistinguishable from a silenced alarm", async () => {
+      const { companyId, issueId, interactionId } = await seedAcceptedConfirmation("Ack no reason");
+
+      await expect(interactionsSvc.acknowledgeInteractionOutcome(
+        { id: issueId, companyId },
+        interactionId,
+        { reason: "   " },
+        { userId: "local-board" },
+      )).rejects.toThrow();
+    });
+  });
+
   it("expires ask_user_questions interactions by default when a user comments after creation", async () => {
     const { companyId, issueId } = await seedConfirmationIssue("Question supersede");
     const commentId = randomUUID();

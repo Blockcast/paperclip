@@ -28,11 +28,25 @@
  * would be executing a decision nobody delegated to it. The only outputs are
  * Prometheus gauges and a log line.
  *
- * ## The three buckets are EXHAUSTIVE, and `untracked` is emitted
+ * ## The four buckets are EXHAUSTIVE, and `untracked` is emitted
  *
- * - `observed`  — a declared outcome that has been observed to have happened.
- * - `unobserved`— a declared outcome not (yet) observed.
- * - `untracked` — accepted, with no declared outcome at all.
+ * - `observed`     — a declared outcome that has been observed to have happened.
+ * - `unobserved`   — a declared outcome not (yet) observed.
+ * - `untracked`    — accepted, with no declared outcome at all.
+ * - `acknowledged` — a person has recorded that the action will not happen, so
+ *                    nobody is waiting on it any more.
+ *
+ * `acknowledged` is the CLEARING PATH, added after review. Without it
+ * `unobserved` had no exit at all: an acceptance is terminal, so
+ * `withdrawInteraction` — which refuses anything that is not `pending` — can
+ * never be applied to one, and the runbook’s original "withdraw it if it has
+ * gone moot" named an operation the API refuses. Because the alert thresholds
+ * the OLDEST age in the bucket, a single card whose action legitimately never
+ * happens (its PR closed unmerged, or superseded by a different PR) pinned the
+ * warning on forever and masked every newer unobserved card behind it. THE
+ * SWEEP STILL WRITES NOTHING: a person records the acknowledgement through
+ * `POST /issues/:id/interactions/:interactionId/acknowledge-outcome`, and this
+ * module only reads it.
  *
  * `untracked` is deliberately REPORTED rather than filtered. A sweep that
  * silently drops the cards which declared nothing reads clean precisely because
@@ -93,8 +107,34 @@ export const ACCEPTED_OUTCOME_SWEEP_KINDS = [
  */
 export type AcceptedInteractionOutcomeSource = "declared" | "tool_action" | "none";
 
+/**
+ * The ordered issue lifecycle, used to decide whether a declared `issue_status`
+ * has been REACHED rather than whether the issue is sitting on it right now.
+ *
+ * `blocked` and `cancelled` are deliberately absent. Neither is progress past
+ * any declared status, so `array_position` answers NULL for them and the
+ * comparison in the sweep's SQL yields NULL — not observed. A cancelled target
+ * is the textbook moot card, and writing it off is a human judgement recorded
+ * through the acknowledgement route, never an inference this sweep may make.
+ *
+ * Order, not identity, is the contract here: a status may be inserted but the
+ * relative order of the existing five must not change, or previously-observed
+ * cards silently revert to unobserved.
+ */
+const ISSUE_STATUS_PROGRESSION = ["backlog", "todo", "in_progress", "in_review", "done"] as const;
+
 /** Report-only threshold. Partitions the OUTPUT; never filters the population. */
 export const DEFAULT_UNOBSERVED_AFTER_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Trailing window for the `recentCount` adoption series.
+ *
+ * Seven days: long enough that a quiet weekend does not empty the denominator
+ * and make the share meaningless, short enough that a team which starts
+ * declaring outcomes sees the series move within a sprint rather than being
+ * told to wait out the entire history of the table.
+ */
+export const DEFAULT_RECENT_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 
 /** Cap on per-bucket samples carried in the result and log line. */
 const SAMPLE_LIMIT = 10;
@@ -110,6 +150,7 @@ export interface AcceptedInteractionOutcomeSample {
   resolvedAt: string;
   ageSeconds: number;
   beyondThreshold: boolean;
+  acknowledged: boolean;
 }
 
 export interface AcceptedInteractionOutcomeBucketReport {
@@ -119,12 +160,25 @@ export interface AcceptedInteractionOutcomeBucketReport {
   oldestAgeSeconds: number | null;
   /** How many of `count` are older than the reporting threshold. */
   beyondThresholdCount: number;
+  /**
+   * How many of `count` were accepted inside the trailing window.
+   *
+   * This is the only series adoption of `expectedOutcome` can actually move.
+   * `count` and `oldestAgeSeconds` are both all-time, and every acceptance ever
+   * filed before this feature shipped is permanently `untracked` and can never
+   * acquire a declaration retroactively — so an alert on the all-time oldest
+   * untracked age is true from the first tick after deploy and stays true
+   * forever no matter how completely filing agents adopt the field. It would
+   * measure the deploy date, not adoption.
+   */
+  recentCount: number;
   samples: AcceptedInteractionOutcomeSample[];
 }
 
 export interface AcceptedInteractionOutcomeReport {
   generatedAt: Date;
   unobservedAfterMs: number;
+  recentWindowMs: number;
   buckets: Record<AcceptedInteractionOutcomeBucket, AcceptedInteractionOutcomeBucketReport>;
 }
 
@@ -139,6 +193,8 @@ export interface ClassifiedRow {
   source: AcceptedInteractionOutcomeSource;
   resolvedAt: Date | string;
   observed: boolean;
+  /** A person recorded that the authorised action will not happen. Read, never written, here. */
+  acknowledged: boolean;
 }
 
 function toRows<T>(rows: unknown): T[] {
@@ -169,6 +225,12 @@ async function listClassifiedRows(db: Pick<Db, "execute">): Promise<ClassifiedRo
     ACCEPTED_OUTCOME_SWEEP_KINDS.map((kind) => sql`${kind}`),
     sql`, `,
   );
+  // Bound as parameters rather than spliced as literal text, so the ladder
+  // cannot become a SQL-injection surface if it ever grows a configured member.
+  const ladder = sql`ARRAY[${sql.join(
+    ISSUE_STATUS_PROGRESSION.map((status) => sql`${status}`),
+    sql`, `,
+  )}]::text[]`;
   const rows = await db.execute(sql<ClassifiedRow>`
     WITH accepted AS (
       SELECT
@@ -180,7 +242,8 @@ async function listClassifiedRows(db: Pick<Db, "execute">): Promise<ClassifiedRo
         ti.resolved_at AS "resolvedAt",
         ti.payload -> 'expectedOutcome' AS expected_outcome,
         (ti.payload -> 'toolAction') IS NOT NULL AS has_tool_action,
-        ti.result -> 'toolAction' ->> 'status' AS tool_action_status
+        ti.result -> 'toolAction' ->> 'status' AS tool_action_status,
+        (ti.result -> 'outcomeAcknowledgement') IS NOT NULL AS acknowledged
       FROM issue_thread_interactions ti
       LEFT JOIN issues iss ON iss.id = ti.issue_id
       WHERE ti.status = 'accepted'
@@ -194,6 +257,7 @@ async function listClassifiedRows(db: Pick<Db, "execute">): Promise<ClassifiedRo
       a."issueIdentifier",
       a.kind,
       a."resolvedAt",
+      a.acknowledged,
       a.expected_outcome ->> 'kind' AS "outcomeKind",
       CASE
         WHEN a.expected_outcome IS NOT NULL THEN 'declared'
@@ -216,7 +280,27 @@ async function listClassifiedRows(db: Pick<Db, "execute">): Promise<ClassifiedRo
           FROM issues target
           WHERE target.id::text = lower(a.expected_outcome -> 'ref' ->> 'issueId')
             AND target.company_id = a."companyId"::uuid
-            AND target.status = a.expected_outcome -> 'ref' ->> 'status'
+            -- "Reached at least this far", not "is sitting here right now".
+            -- A bare equality test meant an issue that passed THROUGH the
+            -- declared status and moved on reverted the card from observed to
+            -- unobserved and then alarmed forever: a declared in_review that
+            -- later reached done is the authorised action having happened and
+            -- then some, and that is the single most likely way an
+            -- issue_status card ends its life.
+            --
+            -- Ranked on ISSUE_STATUS_PROGRESSION via array_position, which
+            -- answers NULL for a status that is not on the ladder. blocked and
+            -- cancelled are deliberately off it: neither is progress past any
+            -- declared status, and a NULL on either side makes this comparison
+            -- NULL, i.e. not observed, so both keep failing toward the alarm.
+            -- cancelled in particular stays a human judgement -- an abandoned
+            -- issue is exactly the moot card the acknowledgement route exists
+            -- for, not something this sweep may write off by itself.
+            AND (
+              target.status = a.expected_outcome -> 'ref' ->> 'status'
+              OR array_position(${ladder}, target.status)
+                 > array_position(${ladder}, a.expected_outcome -> 'ref' ->> 'status')
+            )
         )
         -- An expectedOutcome naming a kind this build has no observer for falls
         -- through to false, i.e. 'unobserved'. Adding a kind without adding its
@@ -231,12 +315,34 @@ async function listClassifiedRows(db: Pick<Db, "execute">): Promise<ClassifiedRo
 }
 
 function emptyBucket(bucket: AcceptedInteractionOutcomeBucket): AcceptedInteractionOutcomeBucketReport {
-  return { bucket, count: 0, oldestAgeSeconds: null, beyondThresholdCount: 0, samples: [] };
+  return {
+    bucket,
+    count: 0,
+    oldestAgeSeconds: null,
+    beyondThresholdCount: 0,
+    recentCount: 0,
+    samples: [],
+  };
 }
 
+/**
+ * Exactly one bucket per card, and the ORDER of these tests is the contract.
+ *
+ * `observed` outranks `acknowledged`: if the action demonstrably happened, that
+ * is the better record, and it would be misleading to file a card under "nobody
+ * is waiting" when the thing was in fact done.
+ *
+ * `acknowledged` then outranks BOTH `unobserved` and `untracked`, which is what
+ * makes it a clearing path for either alert. An untracked card can be moot just
+ * as an unobserved one can — more easily, since nothing was ever checking it —
+ * and leaving it pinned in `untracked` would hand the adoption signal the same
+ * unclearable-backlog problem.
+ */
 function bucketFor(row: ClassifiedRow): AcceptedInteractionOutcomeBucket {
+  if (row.observed) return "observed";
+  if (row.acknowledged) return "acknowledged";
   if (row.source === "none") return "untracked";
-  return row.observed ? "observed" : "unobserved";
+  return "unobserved";
 }
 
 /**
@@ -245,20 +351,23 @@ function bucketFor(row: ClassifiedRow): AcceptedInteractionOutcomeBucket {
  */
 export function buildAcceptedInteractionOutcomeReport(
   rows: ReadonlyArray<ClassifiedRow>,
-  options: { now?: Date; unobservedAfterMs?: number } = {},
+  options: { now?: Date; unobservedAfterMs?: number; recentWindowMs?: number } = {},
 ): AcceptedInteractionOutcomeReport {
   const now = options.now ?? new Date();
   const unobservedAfterMs = Math.max(0, options.unobservedAfterMs ?? DEFAULT_UNOBSERVED_AFTER_MS);
+  const recentWindowMs = Math.max(0, options.recentWindowMs ?? DEFAULT_RECENT_WINDOW_MS);
   const buckets: Record<AcceptedInteractionOutcomeBucket, AcceptedInteractionOutcomeBucketReport> = {
     observed: emptyBucket("observed"),
     unobserved: emptyBucket("unobserved"),
     untracked: emptyBucket("untracked"),
+    acknowledged: emptyBucket("acknowledged"),
   };
 
   const samplesByBucket: Record<AcceptedInteractionOutcomeBucket, AcceptedInteractionOutcomeSample[]> = {
     observed: [],
     unobserved: [],
     untracked: [],
+    acknowledged: [],
   };
 
   for (const row of rows) {
@@ -276,6 +385,10 @@ export function buildAcceptedInteractionOutcomeReport(
 
     report.count += 1;
     if (beyondThreshold) report.beyondThresholdCount += 1;
+    // An unparseable resolvedAt is not counted as recent: it cannot be aged, and
+    // guessing it into the window would inflate the adoption denominator with a
+    // row nothing can date.
+    if (ageSeconds !== null && ageSeconds * 1000 <= recentWindowMs) report.recentCount += 1;
     if (ageSeconds !== null) {
       report.oldestAgeSeconds = report.oldestAgeSeconds === null
         ? ageSeconds
@@ -293,6 +406,7 @@ export function buildAcceptedInteractionOutcomeReport(
       resolvedAt: Number.isFinite(resolvedMs) ? resolvedAt.toISOString() : String(row.resolvedAt),
       ageSeconds: ageSeconds ?? 0,
       beyondThreshold,
+      acknowledged: row.acknowledged,
     });
   }
 
@@ -304,16 +418,100 @@ export function buildAcceptedInteractionOutcomeReport(
       .slice(0, SAMPLE_LIMIT);
   }
 
-  return { generatedAt: now, unobservedAfterMs, buckets };
+  return { generatedAt: now, unobservedAfterMs, recentWindowMs, buckets };
 }
 
 /** Classify and report. Read-only: issues no INSERT, UPDATE or DELETE. */
 export async function sweepAcceptedInteractionOutcomes(
   db: Db,
-  options: { now?: Date; unobservedAfterMs?: number } = {},
+  options: { now?: Date; unobservedAfterMs?: number; recentWindowMs?: number } = {},
 ): Promise<AcceptedInteractionOutcomeReport> {
   const rows = await listClassifiedRows(db);
   return buildAcceptedInteractionOutcomeReport(rows, options);
+}
+
+
+/**
+ * ## Why this is gated rather than emitted every tick
+ *
+ * The condition is PERMANENTLY TRUE in any installation with history. Every
+ * acceptance filed before this feature existed is `untracked` and can never
+ * acquire a declaration retroactively, so one historical card past the
+ * threshold — which is to say, essentially every one of them — made the
+ * unconditional `log.info` below fire on EVERY collector tick. At the 15 s
+ * cadence that is ~5.7k lines per day per replica, each carrying up to twenty
+ * nested sample objects, describing a set that had not changed since the
+ * previous line. That is not a report; it is a cost, and it buries the ticks
+ * where something actually did change.
+ *
+ * So: log when the picture CHANGES, plus a floor so a standing problem is still
+ * restated periodically and does not vanish from a log search window. The
+ * signature covers the per-bucket counts and the identity of the oldest card in
+ * each reported bucket, so a card entering or leaving — or the worst offender
+ * being replaced while the count happens to stay equal — all re-log.
+ */
+const LOG_RELOG_INTERVAL_MS = 60 * 60 * 1000;
+
+let lastLoggedSignature: string | null = null;
+let lastLoggedAtMs = 0;
+
+/** Test seam: forget the throttle so each test observes the first-log behaviour. */
+export function __resetAcceptedInteractionOutcomeLogStateForTest(): void {
+  lastLoggedSignature = null;
+  lastLoggedAtMs = 0;
+}
+
+function reportSignature(report: AcceptedInteractionOutcomeReport): string {
+  return ACCEPTED_INTERACTION_OUTCOME_BUCKETS.map((bucket) => {
+    const b = report.buckets[bucket];
+    return [
+      bucket,
+      b.count,
+      b.beyondThresholdCount,
+      b.recentCount,
+      b.samples[0]?.interactionId ?? "-",
+    ].join(":");
+  }).join("|");
+}
+
+function maybeLogAcceptedInteractionOutcomeReport(
+  report: AcceptedInteractionOutcomeReport,
+  log: typeof defaultLogger,
+): void {
+  const unobserved = report.buckets.unobserved;
+  const untracked = report.buckets.untracked;
+  if (unobserved.beyondThresholdCount === 0 && untracked.beyondThresholdCount === 0) return;
+
+  const signature = reportSignature(report);
+  const nowMs = report.generatedAt.getTime();
+  const elapsed = nowMs - lastLoggedAtMs;
+  const changed = signature !== lastLoggedSignature;
+  // `elapsed < 0` catches a backwards clock step: re-log rather than going
+  // silent until the clock catches up, since silence here reads as "nothing
+  // outstanding" and that is the one wrong answer this module exists to avoid.
+  if (!changed && elapsed >= 0 && elapsed < LOG_RELOG_INTERVAL_MS) return;
+
+  lastLoggedSignature = signature;
+  lastLoggedAtMs = nowMs;
+  log.info(
+    {
+      unobservedAfterMs: report.unobservedAfterMs,
+      recentWindowMs: report.recentWindowMs,
+      observed: report.buckets.observed.count,
+      unobserved: unobserved.count,
+      unobservedBeyondThreshold: unobserved.beyondThresholdCount,
+      untracked: untracked.count,
+      untrackedBeyondThreshold: untracked.beyondThresholdCount,
+      untrackedRecent: untracked.recentCount,
+      acknowledged: report.buckets.acknowledged.count,
+      unobservedSample: unobserved.samples,
+      untrackedSample: untracked.samples,
+      // Why this line appeared now, so a reader is not left guessing whether
+      // anything changed since the last one.
+      reason: changed ? "changed" : "periodic",
+    },
+    "accepted interactions whose authorised action has not been observed (PEN-4409)",
+  );
 }
 
 /**
@@ -327,7 +525,12 @@ export async function sweepAcceptedInteractionOutcomes(
  */
 export async function refreshAcceptedInteractionOutcomeMetrics(
   db: Db,
-  options: { now?: Date; unobservedAfterMs?: number; logger?: typeof defaultLogger } = {},
+  options: {
+    now?: Date;
+    unobservedAfterMs?: number;
+    recentWindowMs?: number;
+    logger?: typeof defaultLogger;
+  } = {},
 ): Promise<void> {
   const log = options.logger ?? defaultLogger;
   try {
@@ -337,27 +540,11 @@ export async function refreshAcceptedInteractionOutcomeMetrics(
         bucket,
         count: report.buckets[bucket].count,
         oldestAgeSeconds: report.buckets[bucket].oldestAgeSeconds,
+        recentCount: report.buckets[bucket].recentCount,
       })),
     });
     setAcceptedInteractionOutcomeMetricsRefreshSuccess(true);
-
-    const unobserved = report.buckets.unobserved;
-    const untracked = report.buckets.untracked;
-    if (unobserved.beyondThresholdCount > 0 || untracked.beyondThresholdCount > 0) {
-      log.info(
-        {
-          unobservedAfterMs: report.unobservedAfterMs,
-          observed: report.buckets.observed.count,
-          unobserved: unobserved.count,
-          unobservedBeyondThreshold: unobserved.beyondThresholdCount,
-          untracked: untracked.count,
-          untrackedBeyondThreshold: untracked.beyondThresholdCount,
-          unobservedSample: unobserved.samples,
-          untrackedSample: untracked.samples,
-        },
-        "accepted interactions whose authorised action has not been observed (PEN-4409)",
-      );
-    }
+    maybeLogAcceptedInteractionOutcomeReport(report, log);
   } catch (error) {
     setAcceptedInteractionOutcomeMetricsRefreshSuccess(false);
     throw error;
