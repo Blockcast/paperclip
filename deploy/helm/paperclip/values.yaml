@@ -137,6 +137,12 @@ worker:
   # (BLO-43292, BLO-46694). Every replica mounts the same `/paperclip`, so it
   # also needs `persistence.existingClaim` on a ReadWriteMany volume — with
   # volumeClaimTemplates each pod would get its own empty data directory.
+  # NOT YET SAFE above 1 (BLO-45764 review): every worker runs its own plugin
+  # subprocesses (`loader.loadAll()` is not lease-gated), the `-workers`
+  # Service spreads plugin routes across pods, and plugin install/enable/
+  # upgrade/config only reach the pod that served the request. The plugin
+  # event outbox also runs on the lease holder only, so bridge streams on the
+  # other pod get no events. Keep 1 until plugin hosting follows the lease.
   replicas: 1
 
 # -- Kubernetes Service exposing the HTTP UI/API.
@@ -603,7 +609,8 @@ workerProbes:
   # The rationale here used to read: "Keep it tighter than liveness so API
   # callers stop routing to a worker whose event loop is not answering
   # promptly." That holds for a horizontally-scaled tier, where readiness
-  # sheds traffic to healthy peers. This StatefulSet runs `replicas: 1`, so
+  # sheds traffic to healthy peers. This StatefulSet runs `replicas: 1` (see
+  # `worker.replicas` before raising it; revisit this tuning when you do), so
   # there is no peer to shed to: removing the only endpoint does not redirect
   # plugin traffic, it 502s it. Every API-to-worker call then fails in the
   # `catch` at `server/src/routes/worker-tier-proxy.ts` with "Worker tier
