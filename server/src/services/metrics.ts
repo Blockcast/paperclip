@@ -1662,8 +1662,8 @@ export const PROCESS_MAPPING_COUNT_METRIC = "paperclip_process_mapping_count";
  * Distinct glibc secondary-arena heaps (PEN-3314). The population the
  * 64-CPU/512-arena hypothesis is about, counted rather than argued.
  */
-export const PROCESS_GLIBC_SECONDARY_ARENA_COUNT_METRIC =
-  "paperclip_process_glibc_secondary_arena_count";
+export const PROCESS_GLIBC_SECONDARY_ARENA_HEAP_COUNT_METRIC =
+  "paperclip_process_glibc_secondary_arena_heap_count";
 
 /**
  * Duration of the last `/proc/self/smaps` scan (PEN-3314).
@@ -3935,7 +3935,7 @@ let processMemoryComponentBytes: Gauge<"component"> | null = null;
 let processV8ContextCount: Gauge<"kind"> | null = null;
 let processMappingRssBytes: Gauge<"mapping_class"> | null = null;
 let processMappingCount: Gauge<"mapping_class"> | null = null;
-let processGlibcSecondaryArenaCount: Gauge | null = null;
+let processGlibcSecondaryArenaHeapCount: Gauge | null = null;
 let processMappingScanSeconds: Gauge | null = null;
 let processMappingScanTimestamp: Gauge | null = null;
 let processHeapPeakSamples: Gauge | null = null;
@@ -4106,7 +4106,7 @@ function ensureRegistry(): {
   processV8ContextCountGauge: Gauge<"kind">;
   processMappingRssBytesGauge: Gauge<"mapping_class">;
   processMappingCountGauge: Gauge<"mapping_class">;
-  processGlibcSecondaryArenaCountGauge: Gauge;
+  processGlibcSecondaryArenaHeapCountGauge: Gauge;
   processMappingScanSecondsGauge: Gauge;
   processMappingScanTimestampGauge: Gauge;
   processHeapPeakSamplesGauge: Gauge;
@@ -4248,7 +4248,7 @@ function ensureRegistry(): {
     || !processV8ContextCount
     || !processMappingRssBytes
     || !processMappingCount
-    || !processGlibcSecondaryArenaCount
+    || !processGlibcSecondaryArenaHeapCount
     || !processMappingScanSeconds
     || !processMappingScanTimestamp
     || !processHeapPeakSamples
@@ -4676,15 +4676,23 @@ function ensureRegistry(): {
         + "rss - heapTotal - external -- this IS a partition: every mapping lands in exactly one "
         + "mapping_class and the classes sum to mapping_class=total, which carries the kernel's "
         + "own figure so a dropped mapping is a visible subtraction rather than a silent one. "
-        + "glibc_secondary_arena is the population the 64-CPU/512-arena hypothesis is about: a "
-        + "64MiB-aligned, exactly-64MiB, gapless run of anonymous mappings carrying a PROT_NONE "
-        + "tail, which is glibc new_heap()'s signature and nothing else's. glibc_main_arena is "
-        + "[heap] (brk). anon_other carries V8's own heap reservations and is EXPECTED to be "
-        + "large -- it is the complement that makes the partition exact, NOT a leak signal; the "
-        + "reading that matters is differential (arena RSS tracking the residual while "
-        + "anon_other stays flat, or the reverse). file_backed is executable text and shared "
-        + "objects, special is kernel pseudo-mappings, unclassified-truncated is the fold past "
-        + "the per-scan mapping cap. "
+        + "glibc_secondary_arena and anon_aligned_64m_full are the population the "
+        + "64-CPU/512-arena hypothesis is about, SPLIT BY HEAP MATURITY AND MEANT TO BE READ "
+        + "TOGETHER: new_heap() reserves 64MiB at 64MiB alignment with a PROT_NONE tail "
+        + "(glibc_secondary_arena), but grow_heap() consumes that tail as the heap grows, so a "
+        + "heap at HEAP_MAX_SIZE -- and two mature neighbours the kernel has merged -- appear "
+        + "fully committed and land in anon_aligned_64m_full instead. That second class is a "
+        + "CANDIDATE: an aligned, exactly-N*64MiB V8 reservation is indistinguishable from a "
+        + "mature heap, which is why it is published beside the confirmed class rather than "
+        + "added to it. Reading glibc_secondary_arena alone would miss precisely the "
+        + "large-retention case. glibc_main_arena is [heap] (brk). anon_other carries V8's own "
+        + "heap reservations and is EXPECTED to be large -- the complement that makes the "
+        + "partition exact, NOT a leak signal, and NOT a negative result about glibc: anonymous "
+        + "memory that is unaligned or not an exact multiple of 64MiB lands there whatever "
+        + "allocated it, and the arena classes are strict enough to under-claim. file_backed is "
+        + "executable text and shared objects, special is kernel pseudo-mappings (named "
+        + "anonymous mappings from PR_SET_VMA_ANON_NAME go to anon_other, not here), "
+        + "unclassified_truncated is the fold past the per-scan mapping cap. "
         + "SAMPLED ON A LONG CADENCE, NOT PER SCRAPE: the read costs O(resident pages) "
         + "(~36us/MB; 108ms measured at 3037MB) and is a synchronous event-loop block, and the "
         + "signature this row chases is itself an event-loop stall -- see "
@@ -4707,15 +4715,23 @@ function ensureRegistry(): {
       labelNames: ["mapping_class"],
       registers: [registry],
     });
-    processGlibcSecondaryArenaCount = new Gauge({
-      name: PROCESS_GLIBC_SECONDARY_ARENA_COUNT_METRIC,
+    processGlibcSecondaryArenaHeapCount = new Gauge({
+      name: PROCESS_GLIBC_SECONDARY_ARENA_HEAP_COUNT_METRIC,
       help:
-        "Distinct glibc secondary-arena heaps, each 64MiB of reserved address space (PEN-3314). "
-        + "glibc caps arenas at 8 * sysconf(_SC_NPROCESSORS_ONLN), which reads the NODE and not "
-        + "the cgroup -- 512 on this 64-CPU node against a 4-CPU container limit -- and never "
-        + "trims them back to the OS. Detector validated against a forced positive: 256 "
-        + "concurrent zlib.gzip calls at UV_THREADPOOL_SIZE=64 moved it 5 -> 69 arenas "
-        + "(0.29 -> 10.29 MB), one per threadpool thread. "
+        "glibc secondary-arena HEAPS that still carry a PROT_NONE reserved tail (PEN-3314). "
+        + "HEAPS, NOT ARENAS: an arena that outgrows its first heap allocates another, so one "
+        + "arena can contribute several -- do NOT compare this with the 8 * ncpu arena cap "
+        + "(512 on this 64-CPU node, which glibc sizes from the NODE and not the 4-CPU cgroup, "
+        + "and never trims back to the OS). "
+        + "COUNTS YOUNG HEAPS ONLY: grow_heap() mprotects the reserved tail read/write as a "
+        + "heap grows, so a heap at HEAP_MAX_SIZE has no tail left and is NOT counted here -- "
+        + "it moves to mapping_class=anon_aligned_64m_full, as do two mature neighbours the "
+        + "kernel has merged into one mapping. READ THE TWO TOGETHER; arena retention appears "
+        + "as the full class rising while this one plateaus, and reading this series alone "
+        + "would miss exactly the large-retention case. "
+        + "Validated against a forced positive: 256 concurrent zlib.gzip calls at "
+        + "UV_THREADPOOL_SIZE=64 moved it 5 -> 69 heaps (0.29 -> 10.29 MB), one per threadpool "
+        + "thread -- which exercises this series only, never the mature branch. "
         + "A HIGH COUNT IS NOT BY ITSELF A FINDING: the blanket arena lead was demoted "
         + "2026-10-13 because the same-image paperclip-api sibling on the same node has the "
         + "same cap and releases memory normally. The finding would be arena RSS tracking the "
@@ -4750,7 +4766,7 @@ function ensureRegistry(): {
     // arenas, a free scan, and a 1970 scan timestamp that makes
     // `time() - timestamp` read as 56 years of staleness. Drop them at
     // construction so "no scan has completed" is ABSENT until one has.
-    processGlibcSecondaryArenaCount.remove();
+    processGlibcSecondaryArenaHeapCount.remove();
     processMappingScanSeconds.remove();
     processMappingScanTimestamp.remove();
     processHeapPeakSamples = new Gauge({
@@ -6257,7 +6273,7 @@ function ensureRegistry(): {
     processV8ContextCountGauge: processV8ContextCount,
     processMappingRssBytesGauge: processMappingRssBytes,
     processMappingCountGauge: processMappingCount,
-    processGlibcSecondaryArenaCountGauge: processGlibcSecondaryArenaCount,
+    processGlibcSecondaryArenaHeapCountGauge: processGlibcSecondaryArenaHeapCount,
     processMappingScanSecondsGauge: processMappingScanSeconds,
     processMappingScanTimestampGauge: processMappingScanTimestamp,
     processHeapPeakSamplesGauge: processHeapPeakSamples,
@@ -7327,7 +7343,7 @@ export function setProcessMappingMetrics(snapshot: ProcessMappingSnapshot | null
   const metrics = ensureRegistry();
   metrics.processMappingRssBytesGauge.reset();
   metrics.processMappingCountGauge.reset();
-  metrics.processGlibcSecondaryArenaCountGauge.remove();
+  metrics.processGlibcSecondaryArenaHeapCountGauge.remove();
   metrics.processMappingScanSecondsGauge.remove();
   metrics.processMappingScanTimestampGauge.remove();
   if (!snapshot) return;
@@ -7337,7 +7353,7 @@ export function setProcessMappingMetrics(snapshot: ProcessMappingSnapshot | null
   for (const [mappingClass, count] of snapshot.countByClass) {
     metrics.processMappingCountGauge.set({ mapping_class: mappingClass }, count);
   }
-  metrics.processGlibcSecondaryArenaCountGauge.set(snapshot.secondaryArenaCount);
+  metrics.processGlibcSecondaryArenaHeapCountGauge.set(snapshot.secondaryArenaHeapCount);
   metrics.processMappingScanSecondsGauge.set(snapshot.scanSeconds);
   metrics.processMappingScanTimestampGauge.set(snapshot.scanTimestampSeconds);
 }
@@ -8888,7 +8904,7 @@ export function __resetMetricsForTest(): void {
   processV8ContextCount = null;
   processMappingRssBytes = null;
   processMappingCount = null;
-  processGlibcSecondaryArenaCount = null;
+  processGlibcSecondaryArenaHeapCount = null;
   processMappingScanSeconds = null;
   processMappingScanTimestamp = null;
   processHeapPeakSamples = null;
