@@ -169,6 +169,13 @@ All four must be true. Measure them; do not assume.
    pod on a different reference. All five paths must exist and be `root:root`;
    a missing one fails the precondition for that reference.
 
+   The pod must be **Running** — `kubectl exec` refuses a completed container,
+   and agent Job pods reach `Completed` and are then TTL-reaped. Select one
+   with `--field-selector=status.phase=Running`. If no pod on that reference is
+   still running, you cannot answer the question this way, and that is **not**
+   a pass: the reference is no longer live, so re-run the census and confirm it
+   has dropped out — never record an unexec'able reference as cleared.
+
    Measured 2026-10-20 on `sha-d529842-k8s-vendored`, the single reference the
    fleet was then running: five files, `root root 755`, `test -w` false for
    each — so that unresolvable tag is cleared on evidence, not on inference.
