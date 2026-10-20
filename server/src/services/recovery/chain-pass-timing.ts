@@ -166,10 +166,13 @@ export function createRecoveryChainTimer(opts: RecoveryChainTimerOptions): Recov
             ...joinKey(),
             chainDurationMs: boundedChainDurationMs,
             passDurationMsTotal,
-            // Can legitimately be negative if the chain total was captured
-            // before the last pass's `finally` ran; reported as measured rather
-            // than clamped, because a negative value here means the two clocks
-            // disagree and clamping would hide that.
+            // Expected to be >= 0 as the chain is wired in `index.ts`: the
+            // chain total is computed in the chain's own `finally`, after every
+            // pass's `finally`, and off a start stamp taken BEFORE this timer
+            // takes its own. So there is no ordering race here to go looking
+            // for -- a negative value means the clock stepped. Reported as
+            // measured rather than clamped, because clamping would hide exactly
+            // that.
             unaccountedMs: boundedChainDurationMs - passDurationMsTotal,
             passesRun: passes.length,
             passesFailed: passes.filter((p) => p.outcome === "failed").length,
