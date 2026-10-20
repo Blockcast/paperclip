@@ -31,6 +31,14 @@
  * population, so the hypothesis becomes a readable series instead of an
  * argument.
  *
+ * ⚠ Detection is split across two classes because a glibc heap stops looking
+ * like one as it matures — `grow_heap()` consumes the `PROT_NONE` tail, and a
+ * heap at `HEAP_MAX_SIZE` has none left. {@link SECONDARY_ARENA_CLASS} counts
+ * heaps that still have a tail; {@link ANON_ALIGNED_64M_FULL_CLASS} is the
+ * candidate class that mature (and kernel-merged) heaps fall into. **Read them
+ * together.** Reading only the first would miss precisely the large-retention
+ * case this row is chasing.
+ *
  * ⚠ The *blanket* arena lead was demoted on 2026-10-13 and this module does not
  * revive it: the same-image `paperclip-api` sibling on the same node released
  * 1177 then 865 MB in ten minutes each, so a 512-arena cap that applies equally
@@ -147,11 +155,32 @@ export const SPECIAL_CLASS = "special";
  *
  * ⚠ This is the class that carries V8's own heap reservations, so it is
  * expected to be large and is NOT itself the leak signal. It is the complement
- * that makes the partition exact, and its value is differential: arena RSS
- * rising while this stays flat is the arena hypothesis; the reverse points back
- * at V8's reservations or at direct `mmap` by native code.
+ * that makes the partition exact.
+ *
+ * ⛔ Do NOT read growth here as "therefore not arenas". Anonymous memory that is
+ * not 64 MiB-aligned, or whose contiguous run is not an exact multiple of
+ * 64 MiB, lands here regardless of what allocated it — and the arena classes
+ * are deliberately strict, so they under-claim rather than over-claim. This
+ * class is a residue, not a negative result about glibc.
  */
 export const ANON_OTHER_CLASS = "anon_other";
+/**
+ * A fully committed, 64 MiB-aligned, exactly-N x 64 MiB anonymous run.
+ *
+ * ⚠ **A candidate class, not a confirmed one.** A glibc heap that has grown to
+ * `HEAP_MAX_SIZE` has no `PROT_NONE` tail left and looks exactly like this, and
+ * so can two fully grown neighbours the kernel has merged into one mapping — so
+ * this is where arena growth lands once heaps mature. But a V8 reservation that
+ * happens to be aligned and an exact multiple of 64 MiB is indistinguishable
+ * from here, which is why it is published beside
+ * {@link SECONDARY_ARENA_CLASS} rather than added to it.
+ *
+ * Read it with {@link SECONDARY_ARENA_CLASS}, not instead of it: young heaps
+ * are counted there and mature ones here, so arena retention shows up as this
+ * class rising while that one plateaus.
+ */
+export const ANON_ALIGNED_64M_FULL_CLASS = "anon_aligned_64m_full";
+
 /** Mappings past {@link MAPPING_SCAN_MAX_ENTRIES}, folded so the partition still sums. */
 export const TRUNCATED_CLASS = "unclassified_truncated";
 
@@ -169,6 +198,7 @@ export const MAPPING_RSS_TOTAL_CLASS = "total";
 export const MAPPING_CLASSES: readonly string[] = [
   MAIN_ARENA_CLASS,
   SECONDARY_ARENA_CLASS,
+  ANON_ALIGNED_64M_FULL_CLASS,
   STACK_CLASS,
   FILE_BACKED_CLASS,
   SPECIAL_CLASS,
@@ -181,8 +211,16 @@ export interface ProcessMappingSnapshot {
   rssByClass: ReadonlyMap<string, number>;
   /** Mapping class -> number of VMAs. Excludes {@link MAPPING_RSS_TOTAL_CLASS}. */
   countByClass: ReadonlyMap<string, number>;
-  /** Distinct glibc secondary-arena heaps, each 64 MiB of reserved address space. */
-  secondaryArenaCount: number;
+  /**
+   * Distinct glibc secondary-arena *heaps* carrying a reserved tail.
+   *
+   * ⚠ Heaps, not arenas: an arena that outgrows its first heap allocates
+   * another, so one arena can contribute several. Do not compare this against
+   * the `8 * ncpu` arena cap.
+   */
+  secondaryArenaHeapCount: number;
+  /** 64 MiB blocks in the {@link ANON_ALIGNED_64M_FULL_CLASS} candidate class. */
+  fullAlignedBlockCount: number;
   /** Wall-clock seconds the scan took, published so its event-loop cost is attributable. */
   scanSeconds: number;
   /**
@@ -252,39 +290,76 @@ export function parseSmaps(text: string, maxEntries = MAPPING_SCAN_MAX_ENTRIES):
 }
 
 /**
- * Identify glibc secondary-arena heaps among the anonymous mappings.
+ * Identify 64 MiB-aligned anonymous heap blocks, split by whether they still
+ * carry a reserved tail.
  *
- * Returns the set of 64 MiB-aligned base addresses that carry the full
- * `new_heap()` signature. The test is deliberately strict on all four counts —
- * aligned base, exact 64 MiB extent, no interior gap, at least one PROT_NONE
- * mapping — because a loose version is worse than none: grouping anonymous
- * mappings by 64 MiB block alone reported **38 "arenas" in a 48 MB process**
- * where the strict test reports 5, and an inflated count would have read as
- * confirmation of the very hypothesis this is built to test.
+ * ## Why this is two classes and not one
  *
- * Validated against a forced positive: driving 256 concurrent `zlib.gzip` calls
- * with `UV_THREADPOOL_SIZE=64` moved this from **5 arenas / 0.29 MB to 69 arenas
- * / 10.29 MB** — i.e. it tracks arena creation one-for-one with threadpool
- * threads, and it does so without the loose detector's background noise.
+ * glibc's `new_heap()` reserves `HEAP_MAX_SIZE` at that alignment with
+ * `PROT_NONE` and `mprotect`s only the used prefix read/write — so a *young*
+ * heap has an unmistakable `---p` tail. But `grow_heap()` extends that prefix
+ * by `mprotect`ing further into the tail, and a heap that reaches
+ * `HEAP_MAX_SIZE` has **no `---p` left at all**; the arena then allocates a new
+ * heap. Keying solely on the tail therefore misses exactly the heaps that have
+ * grown large — which is the retention case PEN-3314 is testing for, so the
+ * miss would be biased in the worst possible direction. Worse, the residue
+ * lands in {@link ANON_OTHER_CLASS}, which an earlier revision of this module
+ * documented as pointing *away* from arenas and back at V8: a real positive
+ * would have been read as a negative. (Found in review of PR #2856.)
+ *
+ * A second mechanism compounds it: the kernel merges adjacent anonymous VMAs
+ * with identical flags, so two fully grown neighbouring heaps become a single
+ * 128 MiB `rw-p` mapping rather than two 64 MiB ones.
+ *
+ * So blocks are classified, not filtered:
+ *
+ *   - `confirmed` — an aligned 64 MiB block whose own mappings cover it exactly,
+ *     gaplessly, and include a `PROT_NONE` extent. That is `new_heap()`'s
+ *     footprint before the heap has grown. Grouped by BLOCK, so an unrelated
+ *     anonymous mapping abutting the heap cannot hide it.
+ *   - `full` — a maximal contiguous anonymous run that is aligned, exactly
+ *     N x 64 MiB, and carries no reserved extent anywhere. One mature heap, or
+ *     several the kernel merged. Published separately as
+ *     {@link ANON_ALIGNED_64M_FULL_CLASS} and called a candidate, because an
+ *     aligned, unguarded, exactly-N x 64 MiB V8 reservation is indistinguishable.
+ *
+ * The "no reserved extent anywhere" condition on `full` is the load-bearing
+ * guard. A `PROT_NONE` tail is precisely what prevents the kernel merging two
+ * heaps, so a guarded multi-block run cannot be a merged pair — it is a large
+ * reservation, and V8 makes those. Classifying per block inside any aligned run
+ * instead sliced V8's 8.25 GiB reservation into **132 "arenas"** on an idle
+ * 70 MB process. ⚠ The honest cost: a mature heap merged against a *young*
+ * neighbour's committed prefix carries that neighbour's tail, so it is skipped
+ * and lands in {@link ANON_OTHER_CLASS}. A deliberate under-count, taken
+ * because the alternative over-counts by two orders of magnitude.
  */
-function findSecondaryArenaBases(vmas: readonly Vma[]): Set<bigint> {
+function findHeapBlocks(vmas: readonly Vma[]): {
+  confirmed: Set<bigint>;
+  full: Set<bigint>;
+} {
   const heapMax = BigInt(GLIBC_HEAP_MAX_SIZE);
-  const blocks = new Map<bigint, Vma[]>();
+  const confirmed = new Set<bigint>();
+  const full = new Set<bigint>();
 
-  for (const vma of vmas) {
-    if (vma.path) continue;
-    // A mapping straddling a 64 MiB boundary cannot be part of a heap that is
-    // both 64 MiB long and 64 MiB aligned.
+  const anon = vmas.filter((vma) => !vma.path)
+    .sort((a, b) => (a.start < b.start ? -1 : a.start > b.start ? 1 : 0));
+
+  // --- young heaps: grouped by 64 MiB BLOCK, not by contiguous run ----------
+  // Block grouping is what makes this robust. A heap's own mappings always sit
+  // inside one aligned block, whereas its *run* extends through any unrelated
+  // anonymous mapping that happens to abut it -- which would then fail the
+  // exact-64 MiB test and drop the heap. Measured: run-grouping found 0-1 heaps
+  // where block-grouping finds the validated 5 (idle) / 69 (threadpool load).
+  const blocks = new Map<bigint, Vma[]>();
+  for (const vma of anon) {
+    // A mapping straddling a boundary cannot belong to a 64 MiB-aligned heap.
     if ((vma.end - 1n) / heapMax !== vma.start / heapMax) continue;
     const base = (vma.start / heapMax) * heapMax;
     const group = blocks.get(base);
     if (group) group.push(vma);
     else blocks.set(base, [vma]);
   }
-
-  const bases = new Set<bigint>();
   for (const [base, group] of blocks) {
-    group.sort((a, b) => (a.start < b.start ? -1 : a.start > b.start ? 1 : 0));
     if (group[0]!.start !== base) continue;
     if (group[group.length - 1]!.end !== base + heapMax) continue;
     let gapless = true;
@@ -295,22 +370,53 @@ function findSecondaryArenaBases(vmas: readonly Vma[]): Set<bigint> {
       }
     }
     if (!gapless) continue;
-    // The reserved, never-committed tail. Its absence means the region is fully
-    // committed and is something other than a fresh glibc heap.
+    // The reserved, never-committed tail: `new_heap()`'s signature.
     if (!group.some((vma) => vma.perms.startsWith("---"))) continue;
-    bases.add(base);
+    confirmed.add(base);
   }
 
-  return bases;
+  // --- mature / merged heaps: whole contiguous runs, fully committed --------
+  // These have no tail left, so they cannot be told apart block by block; the
+  // run is the unit. Requiring the run to carry NO reserved extent at all is
+  // the guard that keeps V8 out: a `PROT_NONE` extent is exactly what stops the
+  // kernel merging two heaps, so a guarded multi-block run is a reservation,
+  // not a merged pair.
+  let i = 0;
+  while (i < anon.length) {
+    let j = i + 1;
+    while (j < anon.length && anon[j]!.start === anon[j - 1]!.end) j += 1;
+    const run = anon.slice(i, j);
+    i = j;
+
+    const begin = run[0]!.start;
+    const finish = run[run.length - 1]!.end;
+    const length = finish - begin;
+    if (begin % heapMax !== 0n || length === 0n || length % heapMax !== 0n) continue;
+    if (run.some((vma) => vma.perms.startsWith("---"))) continue;
+    for (let base = begin; base < finish; base += heapMax) full.add(base);
+  }
+
+  return { confirmed, full };
 }
 
-function classify(vma: Vma, arenaBases: ReadonlySet<bigint>): string {
+function classify(
+  vma: Vma,
+  confirmed: ReadonlySet<bigint>,
+  full: ReadonlySet<bigint>,
+): string {
   if (vma.path === "[heap]") return MAIN_ARENA_CLASS;
   if (vma.path === "[stack]" || vma.path.startsWith("[stack")) return STACK_CLASS;
+  // `PR_SET_VMA_ANON_NAME` (Linux >= 5.17) names anonymous mappings `[anon:x]`
+  // and `[anon_shmem:x]`. They start with `[` but are anonymous memory, not
+  // kernel pseudo-mappings, so they must not land in `special`.
+  if (vma.path.startsWith("[anon:") || vma.path.startsWith("[anon_shmem:")) {
+    return ANON_OTHER_CLASS;
+  }
   if (vma.path.startsWith("[")) return SPECIAL_CLASS;
   if (vma.path) return FILE_BACKED_CLASS;
   const base = (vma.start / BigInt(GLIBC_HEAP_MAX_SIZE)) * BigInt(GLIBC_HEAP_MAX_SIZE);
-  if (arenaBases.has(base)) return SECONDARY_ARENA_CLASS;
+  if (confirmed.has(base)) return SECONDARY_ARENA_CLASS;
+  if (full.has(base)) return ANON_ALIGNED_64M_FULL_CLASS;
   return ANON_OTHER_CLASS;
 }
 
@@ -361,7 +467,7 @@ export function collectProcessMappingSnapshot(
   // it means the read did not give us what we parse. Report it unmeasurable.
   if (vmas.length === 0 && truncatedCount === 0) return null;
 
-  const arenaBases = findSecondaryArenaBases(vmas);
+  const { confirmed, full } = findHeapBlocks(vmas);
 
   const rssByClass = new Map<string, number>();
   const countByClass = new Map<string, number>();
@@ -372,7 +478,7 @@ export function collectProcessMappingSnapshot(
 
   let total = 0;
   for (const vma of vmas) {
-    const mappingClass = classify(vma, arenaBases);
+    const mappingClass = classify(vma, confirmed, full);
     rssByClass.set(mappingClass, rssByClass.get(mappingClass)! + vma.rss);
     countByClass.set(mappingClass, countByClass.get(mappingClass)! + 1);
     total += vma.rss;
@@ -387,7 +493,8 @@ export function collectProcessMappingSnapshot(
   return {
     rssByClass,
     countByClass,
-    secondaryArenaCount: arenaBases.size,
+    secondaryArenaHeapCount: confirmed.size,
+    fullAlignedBlockCount: full.size,
     scanSeconds: Math.max(0, monotonic() - started),
     scanTimestampSeconds: wallClock(),
   };

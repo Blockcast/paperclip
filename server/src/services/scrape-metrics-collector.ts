@@ -319,7 +319,15 @@ export function __resetProcessMappingCacheForTest(): void {
  * frozen value that reads as live is the failure mode these three modules are
  * collectively built against.
  */
-export function refreshProcessMappingMetrics(nowMs: number = Date.now()): void {
+export function refreshProcessMappingMetrics(
+  nowMs: number = Number(process.hrtime.bigint() / 1_000_000n),
+): void {
+  // MONOTONIC, not `Date.now()`. A backwards wall-clock step (NTP correction,
+  // VM migration) would make this difference negative and suppress every scan
+  // until the clock caught up, while the republished snapshot kept the series
+  // looking live -- a stall that is invisible precisely because the cache is
+  // working. The staleness timestamp on the snapshot stays wall-clock, because
+  // its only consumer is `time() - timestamp` in PromQL.
   const due =
     lastMappingScanAtMs === null || nowMs - lastMappingScanAtMs >= DEFAULT_MIN_SCAN_INTERVAL_MS;
   if (due) {

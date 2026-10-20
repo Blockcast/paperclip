@@ -27,6 +27,7 @@
 import { describe, expect, it, afterEach } from "vitest";
 
 import {
+  ANON_ALIGNED_64M_FULL_CLASS,
   ANON_OTHER_CLASS,
   FILE_BACKED_CLASS,
   GLIBC_HEAP_MAX_SIZE,
@@ -39,7 +40,7 @@ import {
   collectProcessMappingSnapshot,
 } from "../services/process-mapping-metrics.js";
 import {
-  PROCESS_GLIBC_SECONDARY_ARENA_COUNT_METRIC,
+  PROCESS_GLIBC_SECONDARY_ARENA_HEAP_COUNT_METRIC,
   PROCESS_MAPPING_COUNT_METRIC,
   PROCESS_MAPPING_RSS_BYTES_METRIC,
   PROCESS_MAPPING_SCAN_SECONDS_METRIC,
@@ -93,7 +94,7 @@ function snapshotOf(stanzas: string[], maxEntries?: number) {
 describe("collectProcessMappingSnapshot — arena detection", () => {
   it("accepts the glibc new_heap() footprint", () => {
     const snapshot = snapshotOf(arena(ARENA_BASE, 2048, 1024))!;
-    expect(snapshot.secondaryArenaCount).toBe(1);
+    expect(snapshot.secondaryArenaHeapCount).toBe(1);
     expect(snapshot.rssByClass.get(SECONDARY_ARENA_CLASS)).toBe(1024 * 1024);
   });
 
@@ -107,7 +108,7 @@ describe("collectProcessMappingSnapshot — arena detection", () => {
       vma(second + 0x100000n, second + 0x200000n, "rw-p", 256),
       vma(second + 0x200000n, second + HEAP_MAX, "---p", 0),
     ])!;
-    expect(snapshot.secondaryArenaCount).toBe(2);
+    expect(snapshot.secondaryArenaHeapCount).toBe(2);
     expect(snapshot.countByClass.get(SECONDARY_ARENA_CLASS)).toBe(5);
   });
 
@@ -117,7 +118,7 @@ describe("collectProcessMappingSnapshot — arena detection", () => {
       vma(off, off + 0x200000n, "rw-p", 1024),
       vma(off + 0x200000n, ARENA_BASE + HEAP_MAX, "---p", 0),
     ])!;
-    expect(snapshot.secondaryArenaCount).toBe(0);
+    expect(snapshot.secondaryArenaHeapCount).toBe(0);
     expect(snapshot.rssByClass.get(ANON_OTHER_CLASS)).toBe(1024 * 1024);
   });
 
@@ -126,7 +127,7 @@ describe("collectProcessMappingSnapshot — arena detection", () => {
       vma(ARENA_BASE, ARENA_BASE + 0x200000n, "rw-p", 1024),
       vma(ARENA_BASE + 0x200000n, ARENA_BASE + 0x400000n, "---p", 0),
     ])!;
-    expect(snapshot.secondaryArenaCount).toBe(0);
+    expect(snapshot.secondaryArenaHeapCount).toBe(0);
   });
 
   it("rejects a run with an interior gap", () => {
@@ -136,16 +137,86 @@ describe("collectProcessMappingSnapshot — arena detection", () => {
       vma(ARENA_BASE, ARENA_BASE + 0x100000n, "rw-p", 1024),
       vma(ARENA_BASE + 0x200000n, ARENA_BASE + HEAP_MAX, "---p", 0),
     ])!;
-    expect(snapshot.secondaryArenaCount).toBe(0);
+    expect(snapshot.secondaryArenaHeapCount).toBe(0);
   });
 
-  it("rejects a fully committed 64 MiB run with no PROT_NONE tail", () => {
-    // This is the discriminating case: right size, right alignment, gapless, but
-    // no reserved tail. glibc always leaves one, so this is something else --
-    // most plausibly a V8 reservation, which must not be counted as an arena.
+  it("files a fully committed 64 MiB run as a CANDIDATE, not as a confirmed heap", () => {
+    // Found in review of PR #2856, and it is the case that matters most:
+    // grow_heap() mprotects the reserved tail read/write as the heap grows, so a
+    // heap at HEAP_MAX_SIZE has NO `---p` left. An earlier revision rejected this
+    // outright and swept it into anon_other, which is documented as pointing away
+    // from arenas -- i.e. it would have rendered the large-retention case this
+    // row is chasing as evidence against the hypothesis.
     const snapshot = snapshotOf([vma(ARENA_BASE, ARENA_BASE + HEAP_MAX, "rw-p", 65536)])!;
-    expect(snapshot.secondaryArenaCount).toBe(0);
-    expect(snapshot.rssByClass.get(ANON_OTHER_CLASS)).toBe(65536 * 1024);
+    expect(snapshot.secondaryArenaHeapCount).toBe(0);
+    expect(snapshot.fullAlignedBlockCount).toBe(1);
+    expect(snapshot.rssByClass.get(ANON_ALIGNED_64M_FULL_CLASS)).toBe(65536 * 1024);
+    expect(snapshot.rssByClass.get(ANON_OTHER_CLASS)).toBe(0);
+  });
+
+  it("counts two kernel-merged mature heaps as two candidate blocks", () => {
+    // The kernel merges adjacent anonymous VMAs with identical flags, so two
+    // fully grown neighbours arrive as ONE 128 MiB rw-p mapping. Per-block
+    // classification inside the aligned run is what recovers both.
+    const snapshot = snapshotOf([vma(ARENA_BASE, ARENA_BASE + 2n * HEAP_MAX, "rw-p", 131072)])!;
+    expect(snapshot.fullAlignedBlockCount).toBe(2);
+    expect(snapshot.rssByClass.get(ANON_ALIGNED_64M_FULL_CLASS)).toBe(131072 * 1024);
+  });
+
+  it("UNDER-COUNTS a mature heap merged against a young one, by design", () => {
+    // Documented limitation, asserted so it stays deliberate. A full rw-p heap
+    // abutting the next heap's rw-p prefix merges into one 128 MiB run that
+    // carries the young heap's tail -- so it is neither a clean single block nor
+    // an unguarded run, and both halves fall to anon_other.
+    //
+    // The alternative was classifying per block inside any aligned run, which
+    // sliced V8's 8.25 GiB reservation into 132 "arenas" on an idle 70 MB
+    // process. Under-counting a narrow adjacency beats over-counting by two
+    // orders of magnitude on the series whose whole purpose is to be believed.
+    const snapshot = snapshotOf([
+      vma(ARENA_BASE, ARENA_BASE + HEAP_MAX + 0x200000n, "rw-p", 66560),
+      vma(ARENA_BASE + HEAP_MAX + 0x200000n, ARENA_BASE + 2n * HEAP_MAX, "---p", 0),
+    ])!;
+    expect(snapshot.fullAlignedBlockCount).toBe(0);
+    expect(snapshot.secondaryArenaHeapCount).toBe(0);
+    expect(snapshot.rssByClass.get(ANON_OTHER_CLASS)).toBe(66560 * 1024);
+  });
+
+  it("does not slice a large guarded reservation into candidate blocks", () => {
+    // The regression this guard exists for. A 192 MiB aligned anonymous run with
+    // interior PROT_NONE guard pages is a V8-style reservation, not three heaps;
+    // an earlier revision reported 132 "arenas" from exactly this shape.
+    const snapshot = snapshotOf([
+      vma(ARENA_BASE, ARENA_BASE + 0x4000000n, "rw-p", 4096),
+      vma(ARENA_BASE + 0x4000000n, ARENA_BASE + 0x4001000n, "---p", 0),
+      vma(ARENA_BASE + 0x4001000n, ARENA_BASE + 3n * HEAP_MAX, "rw-p", 2048),
+    ])!;
+    expect(snapshot.secondaryArenaHeapCount).toBe(0);
+    expect(snapshot.fullAlignedBlockCount).toBe(0);
+    expect(snapshot.rssByClass.get(ANON_OTHER_CLASS)).toBe((4096 + 2048) * 1024);
+  });
+
+  it("still finds a young heap when an unrelated mapping abuts it", () => {
+    // Why `confirmed` groups by block rather than by contiguous run: the run
+    // would extend through the neighbour, fail the exact-64 MiB test, and drop a
+    // real heap. Measured at 0-1 heaps under run-grouping against the validated
+    // 5 under block-grouping.
+    const snapshot = snapshotOf([
+      ...arena(ARENA_BASE, 2048, 1024),
+      vma(ARENA_BASE + HEAP_MAX, ARENA_BASE + HEAP_MAX + 0x10000n, "rw-p", 64),
+    ])!;
+    expect(snapshot.secondaryArenaHeapCount).toBe(1);
+  });
+
+  it("does not slice candidate blocks out of an unaligned or odd-sized anon run", () => {
+    // The outer guard. Without it, any large V8 reservation would donate interior
+    // 64 MiB slices to the candidate class and make it meaningless.
+    const odd = snapshotOf([vma(ARENA_BASE, ARENA_BASE + HEAP_MAX + 0x100000n, "rw-p", 1024)])!;
+    expect(odd.fullAlignedBlockCount).toBe(0);
+    const unaligned = snapshotOf([
+      vma(ARENA_BASE + 0x100000n, ARENA_BASE + 0x100000n + 2n * HEAP_MAX, "rw-p", 1024),
+    ])!;
+    expect(unaligned.fullAlignedBlockCount).toBe(0);
   });
 
   it("never treats a file-backed run as an arena", () => {
@@ -153,7 +224,7 @@ describe("collectProcessMappingSnapshot — arena detection", () => {
       vma(ARENA_BASE, ARENA_BASE + 0x200000n, "r-xp", 1024, "/usr/lib/libc.so.6"),
       vma(ARENA_BASE + 0x200000n, ARENA_BASE + HEAP_MAX, "---p", 0, "/usr/lib/libc.so.6"),
     ])!;
-    expect(snapshot.secondaryArenaCount).toBe(0);
+    expect(snapshot.secondaryArenaHeapCount).toBe(0);
     expect(snapshot.rssByClass.get(FILE_BACKED_CLASS)).toBe(1024 * 1024);
   });
 });
@@ -177,6 +248,19 @@ describe("collectProcessMappingSnapshot — the partition", () => {
     expect(classes).toBe((1024 + 2048 + 128 + 4 + 512 + 777) * 1024);
   });
 
+  it("files a named anonymous mapping as anonymous, not as a kernel pseudo-mapping", () => {
+    // PR_SET_VMA_ANON_NAME (Linux >= 5.17) renders as [anon:name]. It starts with
+    // '[' but is ordinary anonymous memory, so routing it to `special` would
+    // quietly move native-addon allocations out of the class that tracks them.
+    const snapshot = snapshotOf([
+      vma(0x1234000000n, 0x1234100000n, "rw-p", 64, "[anon:v8-zone]"),
+      vma(0x1235000000n, 0x1235100000n, "rw-p", 32, "[anon_shmem:thing]"),
+      vma(0x7fff00000000n, 0x7fff00001000n, "r-xp", 4, "[vdso]"),
+    ])!;
+    expect(snapshot.rssByClass.get(ANON_OTHER_CLASS)).toBe((64 + 32) * 1024);
+    expect(snapshot.rssByClass.get(SPECIAL_CLASS)).toBe(4 * 1024);
+  });
+
   it("classifies each pseudo-path to its own class", () => {
     const snapshot = snapshotOf(MIXED)!;
     expect(snapshot.rssByClass.get(MAIN_ARENA_CLASS)).toBe(2048 * 1024);
@@ -191,7 +275,7 @@ describe("collectProcessMappingSnapshot — the partition", () => {
     // arena hypothesis is tested against, so it has to be expressible.
     const snapshot = snapshotOf([vma(0x400000n, 0x500000n, "r-xp", 512, "/usr/bin/node")])!;
     expect(snapshot.rssByClass.get(SECONDARY_ARENA_CLASS)).toBe(0);
-    expect(snapshot.secondaryArenaCount).toBe(0);
+    expect(snapshot.secondaryArenaHeapCount).toBe(0);
   });
 
   it("folds mappings past the cap instead of dropping them, so the sum still holds", () => {
@@ -275,18 +359,19 @@ describe("setProcessMappingMetrics (the publish path)", () => {
   const SNAPSHOT = {
     rssByClass: new Map([[SECONDARY_ARENA_CLASS, 1024], [MAPPING_RSS_TOTAL_CLASS, 4096]]),
     countByClass: new Map([[SECONDARY_ARENA_CLASS, 2]]),
-    secondaryArenaCount: 1,
+    secondaryArenaHeapCount: 1,
+    fullAlignedBlockCount: 0,
     scanSeconds: 0.108,
     scanTimestampSeconds: 1_700_000_000,
   };
 
   it("publishes every series, including a zero arena count", async () => {
-    setProcessMappingMetrics({ ...SNAPSHOT, secondaryArenaCount: 0 });
+    setProcessMappingMetrics({ ...SNAPSHOT, secondaryArenaHeapCount: 0 });
     expect(await labelled(PROCESS_MAPPING_RSS_BYTES_METRIC))
       .toEqual({ [SECONDARY_ARENA_CLASS]: 1024, [MAPPING_RSS_TOTAL_CLASS]: 4096 });
     expect(await labelled(PROCESS_MAPPING_COUNT_METRIC)).toEqual({ [SECONDARY_ARENA_CLASS]: 2 });
     const all = await lines();
-    expect(all).toContain(`${PROCESS_GLIBC_SECONDARY_ARENA_COUNT_METRIC} 0`);
+    expect(all).toContain(`${PROCESS_GLIBC_SECONDARY_ARENA_HEAP_COUNT_METRIC} 0`);
     expect(all).toContain(`${PROCESS_MAPPING_SCAN_SECONDS_METRIC} 0.108`);
     expect(all).toContain(`${PROCESS_MAPPING_SCAN_TIMESTAMP_METRIC} 1700000000`);
   });
@@ -309,7 +394,7 @@ describe("setProcessMappingMetrics (the publish path)", () => {
     setProcessMappingMetrics(null);
     const all = await lines();
     expect(all.some((l) => l.startsWith(PROCESS_MAPPING_RSS_BYTES_METRIC))).toBe(false);
-    expect(all.some((l) => l.startsWith(PROCESS_GLIBC_SECONDARY_ARENA_COUNT_METRIC))).toBe(false);
+    expect(all.some((l) => l.startsWith(PROCESS_GLIBC_SECONDARY_ARENA_HEAP_COUNT_METRIC))).toBe(false);
     expect(all.some((l) => l.startsWith(PROCESS_MAPPING_SCAN_TIMESTAMP_METRIC))).toBe(false);
   });
 
@@ -319,7 +404,7 @@ describe("setProcessMappingMetrics (the publish path)", () => {
     await renderMetrics();
     const all = await lines();
     expect(all.some((l) => l.startsWith(PROCESS_MAPPING_SCAN_TIMESTAMP_METRIC))).toBe(false);
-    expect(all.some((l) => l.startsWith(PROCESS_GLIBC_SECONDARY_ARENA_COUNT_METRIC))).toBe(false);
+    expect(all.some((l) => l.startsWith(PROCESS_GLIBC_SECONDARY_ARENA_HEAP_COUNT_METRIC))).toBe(false);
   });
 });
 
