@@ -142,8 +142,29 @@ All four must be true. Measure them; do not assume.
        -o jsonpath='{range .items[*]}{.spec.template.spec.containers[0].image}{"\n"}{end}' | sort -u
    ```
 
-   Every tag must be at or after `bb62073a`. Treat a `@sha256:` digest pin as
-   **unverified**, not as a pass — resolve it to a commit before proceeding.
+   Every tag must be at or after `bb62073a`. Treat a reference you cannot
+   place in history as **unverified**, not as a pass. Two kinds occur:
+
+   - a `@sha256:` digest pin, which names no commit at all; and
+   - a `sha-<short>` tag that does not resolve — `gh api
+     repos/Blockcast/paperclip/commits/<short>` answers `422 No commit found`.
+     Measured 2026-10-20: the entire live agent fleet ran
+     `sha-d529842-k8s-vendored`, and `d529842` is not a reachable commit in
+     this repository. A tag whose commit was rewritten or whose branch was
+     deleted is as unplaceable as a digest, so ancestry **cannot** clear it.
+
+   When a reference will not resolve, do not stall and do not wave it through.
+   Ask the image the question directly, from any pod running it — this is the
+   authoritative check in every case, because it tests the directory the
+   fall-through actually needs rather than a proxy for it:
+
+   ```console
+   $ ls -l /usr/local/libexec/paperclip/bin/
+   ```
+
+   All five wrappers must be present and `root:root`. Measured 2026-10-20 on
+   `sha-d529842-k8s-vendored`: five files, `root root 755`, `test -w` false for
+   each — so that unresolvable tag is cleared on evidence, not on inference.
 
    > **Census trap.** Do not scope this by `image=~".*paperclip-agent.*"`. That
    > pulls in the `paperclip-agent-image-cache` DaemonSet and
