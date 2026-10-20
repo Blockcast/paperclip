@@ -226,6 +226,14 @@ type AggregateMemberResolution = {
     | "finalization-pending";
   issueId: string;
   resolutionToken?: string;
+  /**
+   * Why finalization was refused (PEN-4405). Present only on
+   * `finalization-pending`, and carried out to `handleResolved` so the delivery
+   * error can name the phase that actually blocked instead of asserting one.
+   */
+  blockingPhase?: string | null;
+  heldMs?: number | null;
+  memberReattached?: boolean;
 };
 
 /**
@@ -1370,6 +1378,18 @@ async function finishAggregateFiring(
  * The transition it performs is the same `cancelling` -> `active` release the
  * withheld-cancellation path already takes, so it introduces no new state.
  *
+ * `finalizing` is included too (PEN-4405), on the narrower ground that it
+ * refuses every *resolution* claim even though it never refuses a firing one.
+ * A resolver that dies between `beginAggregateFinalization` and
+ * `beginAggregateCancellation` leaves it there, and for an aggregate whose
+ * alert has stopped firing nothing automatic reaches it before the next worker
+ * restart: the per-claim backstop only runs on a delivery, and
+ * `reconcileAbandonedAggregateFences` only runs from `setup()`. Its release is
+ * the same `-> active` transition `releaseAggregateFinalization` performs, so
+ * this introduces no new state either, and the compare-and-set on
+ * `resolution_token` is what keeps it from reopening a fence a newer resolver
+ * owns.
+ *
  * `token` is therefore a firing token or a resolution token depending on which
  * phase holds the fence. The operator-facing request field is still named
  * `firingToken` because that is the published wire contract; the listing route
@@ -1404,7 +1424,7 @@ export async function recoverAggregateFiring(
   // Same compare-and-set discipline on the resolution token: a stale or wrong
   // token releases nothing, so this cannot reopen a fence owned by a newer
   // resolver.
-  const cancelling = await ctx.db.execute(
+  const resolving = await ctx.db.execute(
     `UPDATE ${fences}
      SET phase = 'active',
          resolution_token = NULL,
@@ -1413,21 +1433,52 @@ export async function recoverAggregateFiring(
          updated_at = now()
      WHERE company_id = $1
        AND aggregate_key = $2
-       AND phase = 'cancelling'
+       AND phase IN ('cancelling', 'finalizing')
        AND resolution_token = $3`,
     [companyId, aggregateKey, token],
   );
-  if (cancelling.rowCount === 0) return false;
+  if (resolving.rowCount === 0) return false;
   signalLocalFenceRelease(companyId, aggregateKey);
   return true;
 }
 
-async function tryClaimAggregateFinalization(
+/**
+ * Outcome of claiming the fence for finalization (PEN-4405).
+ *
+ * Mirrors {@link AggregateFiringClaim}, and for the same reason: a refusal is
+ * only actionable if it names what refused. Before this, the resolve path
+ * reported a fixed `already finalizing` for every refusal, which is the exact
+ * defect `beginAggregateFiring` was already fixed for — see the read-back
+ * comment there, and PEN-2581, where a fixed phase sent a six-day investigation
+ * after the one phase that could not have produced the failure. Measured on
+ * 2026-10-18: 138 refusals of this kind on a SINGLE-member aggregate
+ * (`PaperclipProductionDeployFailing`) over 44m38s, every one of them claiming
+ * `finalizing`, on a day when zero firing claims were refused at all.
+ *
+ * `memberReattached` separates the one refusal that waiting cannot fix. The
+ * claim has two predicates, and only one of them is a fence: `phase = 'active'`
+ * is a hold that a sibling delivery will release, while the `NOT EXISTS`
+ * unresolved-member guard means a firing delivery re-attached a live member to
+ * this issue between the sibling read and this claim. The second is not
+ * contention — the aggregate is no longer last-member-resolved — so there is
+ * nothing to wait for and waiting would only spend a budget to re-derive the
+ * same answer.
+ */
+type AggregateFinalizationClaim =
+  | { ok: true; token: string }
+  | {
+      ok: false;
+      blockingPhase: string | null;
+      heldMs: number | null;
+      memberReattached: boolean;
+    };
+
+async function beginAggregateFinalization(
   ctx: PluginContext,
   companyId: string,
   aggregateKey: string,
   issueId: string,
-): Promise<string | null> {
+): Promise<AggregateFinalizationClaim> {
   const ns = ctx.db.namespace;
   const fences = q(ns, AGGREGATE_LIFECYCLE_FENCES_TABLE);
   const members = q(ns, AGGREGATE_MEMBERS_TABLE);
@@ -1466,7 +1517,150 @@ async function tryClaimAggregateFinalization(
       WORKER_SLOT,
     ],
   );
-  return result.rowCount > 0 ? token : null;
+  if (result.rowCount > 0) return { ok: true, token };
+  // Read back which of the two predicates refused. One statement so the two
+  // readings cannot disagree about a row that is moving underneath them; it is
+  // a plain SELECT, so — like `assertFiringGeneration` — it cannot bump
+  // `updated_at` and hide a held fence from the wedged-fence detector.
+  const rows = await ctx.db.query<{
+    phase: string;
+    held_ms: number | string | null;
+    member_reattached: boolean | null;
+  }>(
+    `SELECT f.phase,
+            EXTRACT(EPOCH FROM (now() - f.updated_at)) * 1000 AS held_ms,
+            EXISTS (
+              SELECT 1
+              FROM ${members} m
+              WHERE m.company_id = $1
+                AND m.aggregate_key = $2
+                AND m.issue_id = $3
+                AND m.resolved_at IS NULL
+            ) AS member_reattached
+       FROM ${fences} f
+      WHERE f.company_id = $1
+        AND f.aggregate_key = $2`,
+    [companyId, aggregateKey, issueId],
+  );
+  const heldMsRaw = rows[0]?.held_ms;
+  const heldMs =
+    heldMsRaw === null || heldMsRaw === undefined
+      ? null
+      : Math.round(Number(heldMsRaw));
+  return {
+    ok: false,
+    blockingPhase: rows[0]?.phase ?? null,
+    heldMs: heldMs !== null && Number.isFinite(heldMs) ? heldMs : null,
+    memberReattached: rows[0]?.member_reattached === true,
+  };
+}
+
+/**
+ * `beginAggregateFinalization`, but waits out a fence held by a live holder
+ * instead of failing the delivery on first refusal (PEN-4405).
+ *
+ * This is the firing path's {@link claimAggregateFiringWaiting}, applied to the
+ * side that never had it. The asymmetry it removes was total, and it is what
+ * made a single-subject aggregate able to 502 itself:
+ *
+ *   - a firing claim admits `active` AND `finalizing`, admits a same-slot
+ *     holder from a dead instance, admits any holder past the abandonment
+ *     backstop, and then waits up to {@link AGGREGATE_FENCE_WAIT_BUDGET_MS}
+ *     with a FIFO local handoff;
+ *   - a finalization claim admitted `active` and nothing else, with no steal,
+ *     no backstop, and no wait — one attempt, then throw.
+ *
+ * So a resolution delivery lost to *any* concurrent delivery on its own
+ * aggregate, including the sub-second firing delivery the firing side absorbs
+ * silently. Alertmanager retried the 502 into the same collision, and on
+ * 2026-10-18 that sustained itself for 44m38s on one fingerprint. Splitting the
+ * aggregate key — the fix for the sibling arm (PEN-4110) — is a no-op against
+ * it, because the two deliveries contending are the firing and the resolution
+ * of the SAME subject.
+ *
+ * Deliberately shares the waiter queue and the wedged memo with the firing
+ * path rather than keeping its own:
+ *   - the queue, because the release this waiter is waiting for is overwhelmingly
+ *     `finishAggregateFiring`'s. A private queue would mean the one process that
+ *     knows the fence just became claimable could not tell the waiter.
+ *   - the memo, because its argument is about the KEY, not about who asked: an
+ *     alert that already spent a full budget on this key established that it is
+ *     not becoming claimable on this delivery's timescale, and a resolve for the
+ *     same key learns nothing new by spending another.
+ *
+ * Ownership safety is unchanged. This waits for a claim and holds nothing while
+ * it sleeps, and the terminal transition still rests entirely on
+ * `resolution_token` being matched by `beginAggregateCancellation`, so a claim
+ * won on the second attempt is indistinguishable from one won on the first. A
+ * delivery that loses anyway still throws exactly as before, so it is retried,
+ * not lost.
+ */
+async function claimAggregateFinalizationWaiting(
+  ctx: PluginContext,
+  companyId: string,
+  aggregateKey: string,
+  issueId: string,
+  policyOverrides?: Partial<AggregateFenceWaitPolicy>,
+  wedgedKeys?: AggregateFenceWedgedMemo,
+): Promise<AggregateFinalizationClaim> {
+  const policy: AggregateFenceWaitPolicy = policyOverrides
+    ? { ...DEFAULT_AGGREGATE_FENCE_WAIT, ...policyOverrides }
+    : DEFAULT_AGGREGATE_FENCE_WAIT;
+
+  const startedAt = policy.now();
+  let attempt = 0;
+  let claim = await beginAggregateFinalization(ctx, companyId, aggregateKey, issueId);
+  // Same single-attempt treatment as the firing path for a key already known
+  // wedged on this delivery: the attempt still happens (the holder may have
+  // released since), only the waiting is skipped.
+  if (claim.ok || claim.memberReattached || wedgedKeys?.has(aggregateKey)) return claim;
+
+  const queueKey = localFenceQueueKey(companyId, aggregateKey);
+  const waiter = createLocalFenceWaiter();
+  const queue = aggregateFenceLocalWaiters.get(queueKey) ?? [];
+  queue.push(waiter);
+  aggregateFenceLocalWaiters.set(queueKey, queue);
+
+  try {
+    while (!claim.ok) {
+      // Re-checked every round, not only on entry: a firing delivery can attach
+      // a member while this one sleeps, and once it has, no further waiting can
+      // convert the claim. Returning here reports the member reason rather than
+      // the phase, which is the honest answer and ends the wait immediately.
+      if (claim.memberReattached) return claim;
+      const elapsedMs = policy.now() - startedAt;
+      const remainingMs = policy.budgetMs - elapsedMs;
+      if (remainingMs <= 0) {
+        wedgedKeys?.add(aggregateKey);
+        return claim;
+      }
+      const ceiling = Math.min(
+        policy.maxDelayMs,
+        policy.initialDelayMs * 2 ** attempt,
+      );
+      const delayMs = Math.min(remainingMs, Math.ceil(policy.random() * ceiling));
+      await Promise.race([waiter.awaken(), policy.sleep(delayMs)]);
+      attempt += 1;
+      claim = await beginAggregateFinalization(ctx, companyId, aggregateKey, issueId);
+      if (!claim.ok) requeueLocalFenceWaiter(queueKey, waiter);
+    }
+  } finally {
+    const live = aggregateFenceLocalWaiters.get(queueKey);
+    if (live) {
+      const index = live.indexOf(waiter);
+      if (index >= 0) live.splice(index, 1);
+      if (live.length === 0) aggregateFenceLocalWaiters.delete(queueKey);
+    }
+  }
+
+  if (attempt > 0) {
+    ctx.logger.info(
+      `Alertmanager aggregate ${aggregateKey} was held by a concurrent ` +
+        `delivery; claimed finalization after ${attempt} attempt(s) over ` +
+        `${policy.now() - startedAt}ms instead of failing the resolution delivery.`,
+    );
+  }
+  return claim;
 }
 
 async function beginAggregateCancellation(
@@ -1532,6 +1726,8 @@ async function resolveAggregateMember(
   issueId: string,
   fingerprint: string,
   claimFinalization: boolean,
+  fenceWaitPolicy?: Partial<AggregateFenceWaitPolicy>,
+  fenceWedgedMemo?: AggregateFenceWedgedMemo,
 ): Promise<AggregateMemberResolution> {
   const ns = ctx.db.namespace;
   // Read the membership and mark it resolved as two statements, not one
@@ -1583,19 +1779,27 @@ async function resolveAggregateMember(
   if (!claimFinalization) {
     return { disposition: "last-member-resolved", issueId: resolvedIssueId };
   }
-  const resolutionToken = await tryClaimAggregateFinalization(
+  const claim = await claimAggregateFinalizationWaiting(
     ctx,
     companyId,
     aggregateKey,
     resolvedIssueId,
+    fenceWaitPolicy,
+    fenceWedgedMemo,
   );
-  return resolutionToken
+  return claim.ok
     ? {
         disposition: "last-member-resolved",
         issueId: resolvedIssueId,
-        resolutionToken,
+        resolutionToken: claim.token,
       }
-    : { disposition: "finalization-pending", issueId: resolvedIssueId };
+    : {
+        disposition: "finalization-pending",
+        issueId: resolvedIssueId,
+        blockingPhase: claim.blockingPhase,
+        heldMs: claim.heldMs,
+        memberReattached: claim.memberReattached,
+      };
 }
 
 async function findAggregateMemberKey(
@@ -3513,6 +3717,8 @@ export async function handleResolved(
   ctx: PluginContext,
   config: AlertmanagerPluginConfig,
   alert: AlertmanagerAlert,
+  fenceWaitPolicy?: Partial<AggregateFenceWaitPolicy>,
+  fenceWedgedMemo?: AggregateFenceWedgedMemo,
 ): Promise<void> {
   // Same scoping rule as handleFiring: without a company there is no namespace
   // to look in, and `recoverStateFromIssue` could not query either.
@@ -3565,6 +3771,8 @@ export async function handleResolved(
     existing.paperclipIssueId,
     alert.fingerprint,
     config.autoCloseOnResolve !== false,
+    fenceWaitPolicy,
+    fenceWedgedMemo,
   );
   let cancellationToken: string | null = null;
   let cancelWithheldForRunId: string | null = null;
@@ -3576,8 +3784,76 @@ export async function handleResolved(
   try {
     if (config.autoCloseOnResolve !== false) {
       if (aggregateResolution.disposition === "finalization-pending") {
+        // PEN-4405. Two things changed here, and the second is the one that
+        // makes this arm countable at all.
+        //
+        // 1. The phase is READ, not asserted. `is already finalizing` was a
+        //    fixed string covering three different blocking phases, and on the
+        //    2026-10-18 burst it was almost certainly wrong on all 138 lines:
+        //    zero firing claims were refused that day, which is what `firing`
+        //    stealing from `finalizing` looks like from the resolve side.
+        //    `memberReattached` is reported separately because it is not
+        //    contention at all — a live member re-attached, so this aggregate
+        //    is simply no longer last-member-resolved.
+        //
+        // 2. It emits a metric. The firing arm has had
+        //    `alertmanager.aggregate.fence_blocked` since BLO-32113; this arm
+        //    had NOTHING, which is why six weeks of 502 investigation
+        //    (PEN-2988) folded it into the firing arm's family and never
+        //    separated it — there was no series that could have shown it
+        //    moving while the firing arm sat flat. Same two-series split and
+        //    the same reasoning as that comment: an occurrence count plus a
+        //    summed age, never one duration-valued counter.
+        //
+        // `phase` stays an unpromoted tag, matching the firing arm: promoting
+        // it would multiply this metric's combination count inside its own
+        // per-name label budget and starve `aggregate_key`, which is the label
+        // that names what is actually stuck.
+        const blockedPhase = aggregateResolution.memberReattached
+          ? "member-reattached"
+          : (aggregateResolution.blockingPhase ?? "unknown");
+        const blockedHeldMs = aggregateResolution.heldMs ?? null;
+        try {
+          const tags = {
+            alertname,
+            aggregate_key: aggregateKey,
+            phase: blockedPhase,
+          };
+          await ctx.metrics.write("alertmanager.aggregate.finalization_blocked", 1, tags);
+          // Skipped rather than zero-filled when unknown, for the reason the
+          // firing arm gives: a zero would drag the mean down and misreport a
+          // wedge as brief.
+          if (blockedHeldMs !== null) {
+            await ctx.metrics.write(
+              "alertmanager.aggregate.finalization_blocked_age_s",
+              Math.round(blockedHeldMs / 1000),
+              tags,
+            );
+          }
+        } catch (metricErr) {
+          ctx.logger.error(
+            `paperclip-plugin-alertmanager: failed to record blocked-finalization metric for ${alert.fingerprint}: ${String(metricErr)}`,
+          );
+        }
         throw new Error(
-          `Alertmanager aggregate ${aggregateKey} is already finalizing; retrying resolution delivery`,
+          aggregateResolution.memberReattached
+            ? `Alertmanager aggregate ${aggregateKey} re-attached a live member while this ` +
+              `resolution was in flight, so it is no longer last-member-resolved; retrying ` +
+              `resolution delivery. This is not fence contention and waiting cannot clear it — ` +
+              `the retry re-reads the membership and will defer to the surviving member.`
+            : `Alertmanager aggregate ${aggregateKey} finalization is held in phase ` +
+              `'${blockedPhase}' by a delivery in progress; ` +
+              (blockedHeldMs === null
+                ? ""
+                : `held for ${Math.round(blockedHeldMs / 1000)}s; `) +
+              `retrying resolution delivery after a full ` +
+              `${fenceWaitPolicy?.budgetMs ?? AGGREGATE_FENCE_WAIT_BUDGET_MS}ms wait. ` +
+              `A fence abandoned by a dead process is released automatically by its slot's ` +
+              `next worker, and 'firing'/'cancelling' held past the abandonment backstop is ` +
+              `reclaimed by the next firing claim. 'finalizing' is NOT reclaimed by either ` +
+              `while the alert has stopped firing — if that is the phase here and it persists, ` +
+              `an operator can release it via the plugin's recover-aggregate-firing route ` +
+              `using its resolution token.`,
         );
       }
       // Old per-fingerprint records have no aggregate key or member row, so
@@ -4279,7 +4555,13 @@ export async function handleWebhook(
         // opted out from the start: with no issue ever filed there is no state
         // row, and handleResolved drops an unknown fingerprint without touching
         // anything.
-        await handleResolved(ctx, config, alert);
+        await handleResolved(
+          ctx,
+          config,
+          alert,
+          fenceWaitPolicy,
+          fenceWedgedMemo,
+        );
         accepted += 1;
       } else {
         ctx.logger.warn(

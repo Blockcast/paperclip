@@ -41,22 +41,73 @@ See `docs/specs/2026-04-29-alertmanager-plugin-spec.md` for the full design.
   `plugin.alertmanager.alert.resolved` so sibling plugins (status pages,
   paging integrations) can subscribe.
 
+## The three 502 arms (start here)
+
+A webhook delivery answering 502 at `webhooks/alertmanager` has **three**
+distinct causes. They look alike in a 502 rate graph and have nothing else in
+common: different mechanisms, different fixes, different owners. PEN-2988 spent
+six weeks treating arms 1 and 3 as one family because nothing wrote this down,
+so an investigation should start from this table rather than rediscover it.
+
+| arm | log line | mechanism | fixed by |
+| --- | --- | --- | --- |
+| 1. N-subject contention | `aggregate <key> is held in phase '<phase>' by a delivery in progress` | distinct subjects serialise on one shared fence key | PEN-3013 (bounded wait + FIFO handoff), PEN-4110 (per-subject keys) |
+| 2. delivery budget | `delivery budget 90000ms exhausted after N of M alerts` | one batch cannot finish inside the budget | PEN-4100 |
+| 3. finalize race | `aggregate <key> finalization is held in phase '<phase>' by a delivery in progress` | a **resolution** delivery is refused by its own aggregate's fence | PEN-4405 (bounded wait on the resolve path too) |
+
+Three things to know before reaching for a fix:
+
+- **Splitting the aggregate key cannot touch arm 3.** Arm 1's fix is "give each
+  subject its own fence"; arm 3's contending pair is the firing and the
+  resolution of the *same* subject. The 2026-10-18 burst was 139 refusals over
+  44m38s on **one** fingerprint under **one** key
+  (`alert-aggregate:v1:["PaperclipProductionDeployFailing",null]`, an
+  `and on()`-chained alert that emits exactly one series), while arms 1 and 2
+  were silent all day — 4.55% of that day's deliveries. Adding a
+  `paperclip_dedupe_domain` to such an alert would fabricate a dimension that
+  renders constant; its `excluded:` entry in
+  `monitoring/paperclip-dedupe-domain-index.yaml` is correct.
+- **Arm 3 is bursty with multi-day silences**, so a plain zero over any window
+  is not evidence that it is fixed — 2026-10-16 and 10-17 were both zero with
+  the fault fully intact, and it fired 139 times on 10-18. Verify it against the
+  code path, not against a quiet window.
+- **Each arm has its own metric.** Arm 1 is
+  `alertmanager.aggregate.fence_blocked{,_age_seconds}`; arm 3 is
+  `alertmanager.aggregate.finalization_blocked{,_age_s}`. Arm 3 had no metric at
+  all until PEN-4405, which is why it was invisible as a separate cause: there
+  was no series that could show it moving while arm 1 sat flat. Both publish
+  `tag_aggregate_key` and `tag_alertname`; `phase` stays a `plugin_logs`-only
+  tag on both, so read it from the log line.
+
+Counting note: do not grep bare `502` — it matches run UUIDs. The handler
+pattern is `webhooks/alertmanager 502`.
+
 ## Recovering an interrupted aggregate delivery
 
 The aggregate lifecycle fence intentionally fails closed: if the worker stops
 after it claims a fence but before it finishes the delivery, later firings and
 final resolution wait until an operator releases that exact fence.
 
-Two phases hold a fence this way, and both are recoverable here:
+Three phases hold a fence this way, and all three are recoverable here:
 
-| held phase | left behind by | token to release it |
-| --- | --- | --- |
-| `firing` | an interrupted firing delivery | `firing_token` |
-| `cancelling` | an interrupted terminal transition | `resolution_token` |
+| held phase | left behind by | token to release it | blocks |
+| --- | --- | --- | --- |
+| `firing` | an interrupted firing delivery | `firing_token` | firing **and** resolution claims |
+| `finalizing` | a resolver interrupted before its terminal transition | `resolution_token` | resolution claims only |
+| `cancelling` | an interrupted terminal transition | `resolution_token` | firing **and** resolution claims |
 
-Both are reported by the listing route as `phase`, with the token to use in
-`firingToken` regardless of which column it came from. `active` and `finalizing`
-never block a firing claim, so neither ever needs recovery.
+All three are reported by the listing route as `phase`, with the token to use in
+`firingToken` regardless of which column it came from. `active` blocks nothing.
+
+`finalizing` was omitted from this route until PEN-4405 on the reasoning that it
+never blocks a *firing* claim — `beginAggregateFiring` admits it outright — which
+is true and was the wrong test. It blocks every *resolution* claim absolutely,
+and for an aggregate whose alert has stopped firing neither automatic drain
+reaches it: the per-claim backstop in `beginAggregateFiring` only runs on a
+delivery, and `reconcileAbandonedAggregateFences` only runs from `setup()`, i.e.
+at a restart. Between restarts it was reachable by no path at all, operator
+included. Measured 2026-10-11: three rows wedged in `finalizing`, the oldest
+since 2026-09-14 — 27 days, surviving every restart in between.
 
 ### Recognising the wedge
 
@@ -71,6 +122,34 @@ wait says so, at info:
 Alertmanager aggregate <key> was held by a concurrent delivery; claimed it
 after <n> attempt(s) over <ms>ms instead of failing the delivery.
 ```
+
+A **resolution** claim takes the same bounded wait since PEN-4405, and logs the
+same way at info:
+
+```
+Alertmanager aggregate <key> was held by a concurrent delivery; claimed
+finalization after <n> attempt(s) over <ms>ms instead of failing the resolution
+delivery.
+```
+
+Before that it had no wait at all — one attempt, then throw — against a firing
+claim that waits, steals from a dead same-slot owner, steals past the 15m
+backstop, and admits `finalizing` outright. That asymmetry is what let a
+single-subject aggregate 502 itself for 44 minutes: the resolution lost to the
+sub-second firing delivery the firing side absorbs silently, Alertmanager
+retried the 502, and the retry collided again.
+
+One refusal on the resolve path is **not** contention and is reported
+differently, because no amount of waiting can clear it:
+
+```
+Alertmanager aggregate <key> re-attached a live member while this resolution
+was in flight, so it is no longer last-member-resolved; retrying resolution
+delivery.
+```
+
+That is a firing delivery landing between the sibling read and the claim. The
+retry re-reads the membership and defers to the surviving member.
 
 Only once that budget is spent does the delivery fail, with:
 

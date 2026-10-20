@@ -4290,7 +4290,7 @@ describe("PEN-2581 — a wedged aggregate fence names the phase that actually bl
   });
 });
 
-describe("PEN-2581 — an interrupted cancellation is listable and recoverable", () => {
+describe("PEN-2581 / PEN-4405 — an interrupted resolver is listable and recoverable", () => {
   const aggregateKey = 'alert-aggregate:v1:["CdnEdgePublicPrDown",null]';
   const resolutionToken = "resolution-token-interrupted";
 
@@ -4299,64 +4299,81 @@ describe("PEN-2581 — an interrupted cancellation is listable and recoverable",
   // live process has. That refuses every later firing claim, so without these
   // two paths the aggregate is wedged permanently: previously it was neither
   // listed (the query filtered phase='firing') nor releasable.
-  it("lists a stuck cancelling fence so the operator can find its token", async () => {
-    const { ctx, mocks } = mkCtx();
-    mocks.db.query.mockResolvedValueOnce([
-      {
-        aggregate_key: aggregateKey,
-        phase: "cancelling",
-        firing_token: resolutionToken,
-        updated_at: "2026-08-25T21:20:24.000Z",
-      },
-    ]);
+  //
+  // PEN-4405 adds 'finalizing', one step earlier in the same sequence: a
+  // resolver that dies between beginAggregateFinalization and
+  // beginAggregateCancellation. That phase does NOT refuse a firing claim, which
+  // is why it was originally left out — but it refuses every RESOLUTION claim,
+  // and for an aggregate whose alert has stopped firing no automatic path
+  // reaches it before the next worker restart. Both phases are therefore
+  // asserted together here: the recovery predicate is one statement and a test
+  // that pinned only 'cancelling' is what let the gap persist.
+  for (const heldPhase of ["cancelling", "finalizing"] as const) {
+    it(`lists a stuck ${heldPhase} fence so the operator can find its token`, async () => {
+      const { ctx, mocks } = mkCtx();
+      mocks.db.query.mockResolvedValueOnce([
+        {
+          aggregate_key: aggregateKey,
+          phase: heldPhase,
+          firing_token: resolutionToken,
+          updated_at: "2026-08-25T21:20:24.000Z",
+        },
+      ]);
 
-    await expect(listAggregateFiringFences(ctx, "company-1")).resolves.toEqual([
-      {
-        aggregateKey,
-        phase: "cancelling",
-        firingToken: resolutionToken,
-        updatedAt: "2026-08-25T21:20:24.000Z",
-        ownerInstanceId: null,
-        ownerSlot: null,
-      },
-    ]);
+      await expect(listAggregateFiringFences(ctx, "company-1")).resolves.toEqual([
+        {
+          aggregateKey,
+          phase: heldPhase,
+          firingToken: resolutionToken,
+          updatedAt: "2026-08-25T21:20:24.000Z",
+          ownerInstanceId: null,
+          ownerSlot: null,
+        },
+      ]);
 
-    const [sql] = mocks.db.query.mock.calls[0];
-    expect(sql).toContain("phase = 'cancelling'");
-    expect(sql).toContain("resolution_token IS NOT NULL");
-  });
-
-  it("releases a cancelling fence on its resolution token, and only that token", async () => {
-    const { ctx, mocks } = mkCtx();
-    let phase: "cancelling" | "active" = "cancelling";
-    mocks.db.execute.mockImplementation(async (sql: string, params?: unknown[]) => {
-      const [companyId, requestedKey, requestedToken] = params ?? [];
-      const matches =
-        companyId === "company-1" &&
-        requestedKey === aggregateKey &&
-        requestedToken === resolutionToken;
-      if (/AND phase = 'cancelling'/i.test(sql) && phase === "cancelling" && matches) {
-        phase = "active";
-        return { rowCount: 1 };
-      }
-      return { rowCount: 0 };
+      const [sql] = mocks.db.query.mock.calls[0];
+      expect(sql).toContain("phase IN ('cancelling', 'finalizing')");
+      expect(sql).toContain("resolution_token IS NOT NULL");
     });
 
-    // Wrong token releases nothing — the same CAS discipline as the firing path.
-    await expect(
-      recoverAggregateFiring(ctx, "company-1", aggregateKey, "wrong-token"),
-    ).resolves.toBe(false);
-    expect(phase).toBe("cancelling");
+    it(`releases a ${heldPhase} fence on its resolution token, and only that token`, async () => {
+      const { ctx, mocks } = mkCtx();
+      let phase: typeof heldPhase | "active" = heldPhase;
+      mocks.db.execute.mockImplementation(async (sql: string, params?: unknown[]) => {
+        const [companyId, requestedKey, requestedToken] = params ?? [];
+        const matches =
+          companyId === "company-1" &&
+          requestedKey === aggregateKey &&
+          requestedToken === resolutionToken;
+        if (
+          /AND phase IN \('cancelling', 'finalizing'\)/i.test(sql) &&
+          phase === heldPhase &&
+          matches
+        ) {
+          phase = "active";
+          return { rowCount: 1 };
+        }
+        return { rowCount: 0 };
+      });
 
-    await expect(
-      recoverAggregateFiring(ctx, "company-1", aggregateKey, resolutionToken),
-    ).resolves.toBe(true);
-    expect(phase).toBe("active");
-    expect(mocks.db.execute).toHaveBeenLastCalledWith(
-      expect.stringContaining("AND resolution_token = $3"),
-      ["company-1", aggregateKey, resolutionToken],
-    );
-  });
+      // Wrong token releases nothing — the same CAS discipline as the firing
+      // path. This is what keeps the widened predicate from reopening a fence a
+      // newer resolver owns.
+      await expect(
+        recoverAggregateFiring(ctx, "company-1", aggregateKey, "wrong-token"),
+      ).resolves.toBe(false);
+      expect(phase).toBe(heldPhase);
+
+      await expect(
+        recoverAggregateFiring(ctx, "company-1", aggregateKey, resolutionToken),
+      ).resolves.toBe(true);
+      expect(phase).toBe("active");
+      expect(mocks.db.execute).toHaveBeenLastCalledWith(
+        expect.stringContaining("AND resolution_token = $3"),
+        ["company-1", aggregateKey, resolutionToken],
+      );
+    });
+  }
 });
 
 // ---------------------------------------------------------------------------

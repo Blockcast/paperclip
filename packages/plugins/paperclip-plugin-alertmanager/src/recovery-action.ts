@@ -53,12 +53,26 @@ function isBoardUser(input: PluginApiRequestInput): boolean {
 }
 
 /**
- * List only currently-held fences for the already host-authorized company. Both
- * phases that block a new firing claim are listed: `firing` (an interrupted
- * firing delivery) and `cancelling` (an interrupted terminal transition). A
- * `cancelling` fence was previously omitted, which left it both unlistable and
+ * List only currently-held fences for the already host-authorized company.
+ * Three phases are listed: `firing` (an interrupted firing delivery),
+ * `cancelling` (an interrupted terminal transition) and `finalizing` (an
+ * interrupted resolver between its claim and that transition). A `cancelling`
+ * fence was previously omitted, which left it both unlistable and
  * unrecoverable — the operator could not discover the token needed to release
  * it, so the aggregate stayed wedged permanently.
+ *
+ * `finalizing` was omitted for a reason that has since stopped holding
+ * (PEN-4405). It does not block a *firing* claim — `beginAggregateFiring`
+ * admits it outright — so by the "phases that block a new firing claim" rule
+ * above it was correctly excluded. But it blocks every *resolution* claim
+ * absolutely, and the two automatic drains both miss the case that matters:
+ * the per-claim backstop in `beginAggregateFiring` runs only on a delivery,
+ * and an aggregate whose alert has stopped firing sends none, while
+ * `reconcileAbandonedAggregateFences` runs only from `setup()`, i.e. at a
+ * restart. Between restarts a `finalizing` wedge was reachable by no path at
+ * all, operator included. Measured 2026-10-11: three rows wedged in
+ * `finalizing`, the oldest since 2026-09-14 — 27 days, surviving every restart
+ * in between.
  *
  * The token is present in this function's result because a board operator needs
  * it to identify the interrupted owner. It is NOT present in every response:
@@ -85,7 +99,7 @@ export async function listAggregateFiringFences(
       WHERE company_id = $1
         AND (
           (phase = 'firing' AND firing_token IS NOT NULL)
-          OR (phase = 'cancelling' AND resolution_token IS NOT NULL)
+          OR (phase IN ('cancelling', 'finalizing') AND resolution_token IS NOT NULL)
         )
       ORDER BY updated_at ASC`,
     [companyId],
