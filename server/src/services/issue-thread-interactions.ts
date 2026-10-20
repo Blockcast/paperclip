@@ -13,15 +13,18 @@ import {
 import { trackInteractionResolved } from "@paperclipai/shared/telemetry";
 import type {
   AcceptIssueThreadInteraction,
+  AcknowledgeIssueThreadInteractionOutcome,
   AskUserQuestionsAnswer,
   AskUserQuestionsInteraction,
   CancelIssueThreadInteraction,
   CreateIssueThreadInteraction,
   InteractionExpectedOutcome,
+  InteractionOutcomeAcknowledgement,
   IssueThreadInteraction,
   IssueThreadInteractionResult,
   RequestCheckboxConfirmationInteraction,
   RequestConfirmationInteraction,
+  RequestConfirmationResult,
   RequestConfirmationTarget,
   RequestItemVerdictsInteraction,
   RequestItemVerdictsResult,
@@ -34,6 +37,7 @@ import type {
 } from "@paperclipai/shared";
 import {
   acceptIssueThreadInteractionSchema,
+  acknowledgeIssueThreadInteractionOutcomeSchema,
   askUserQuestionsPayloadSchema,
   askUserQuestionsResultSchema,
   cancelIssueThreadInteractionSchema,
@@ -111,6 +115,18 @@ type WithdrawInteractionOptions = {
  * parsed on read by hydrateInteraction, so the shape has to satisfy that kind's
  * required fields while recording the withdrawal reason.
  */
+/**
+ * Kinds whose acceptance authorises an action someone else must then perform,
+ * and which therefore appear in the accepted-interaction outcome sweep
+ * (PEN-4409). Kept in step with `ACCEPTED_OUTCOME_SWEEP_KINDS` in
+ * `accepted-interaction-outcome-sweep.ts`: acknowledging a card the sweep never
+ * reports would record that a wait ended which was never being tracked.
+ */
+export const ACKNOWLEDGEABLE_OUTCOME_INTERACTION_KINDS = [
+  "request_confirmation",
+  "request_checkbox_confirmation",
+] as const;
+
 function buildWithdrawnInteractionResult(
   kind: WithdrawableInteractionKind,
   reason: string | null,
@@ -2096,6 +2112,118 @@ export function issueThreadInteractionService(db: Db) {
       const cancelled = hydrateInteraction(updated);
       await emitInteractionResolvedTelemetry(db, cancelled);
       return cancelled;
+    },
+
+    /**
+     * Record that an ACCEPTED card's authorised action will not be observed,
+     * and that nobody is waiting on it any more (PEN-4409).
+     *
+     * ## Why this is not `withdrawInteraction`
+     *
+     * Withdrawal refuses anything that is not `pending` and resolves the card to
+     * `cancelled`. Neither half fits. An acceptance is terminal, so withdrawal
+     * is simply unavailable — which is what left the `unobserved` bucket with no
+     * exit and the runbook prescribing an operation the API refuses. And
+     * rewriting an acceptance to `cancelled` would falsify it: the decision WAS
+     * made, by a named party, at a recorded time, and that record is the entire
+     * point of this feature. So this writes an ANNOTATION onto `result` and
+     * changes neither `status` nor `resolvedAt` nor `resolvedBy*`.
+     *
+     * ## Why the sweep cannot do this itself
+     *
+     * The sweep is report-only by construction and must stay that way: the rows
+     * it reads are board and operator decisions, and a sweep that could write
+     * one off would be executing a decision nobody delegated to it. Deciding
+     * that an authorised action is moot is exactly such a decision. It is
+     * therefore made by a person here, and the sweep only reads the result.
+     *
+     * Board-only at the route, and refused on a card that is not `accepted` or
+     * whose kind the sweep never reports — acknowledging a card that was never
+     * in the population would write a record implying a wait that never existed.
+     */
+    acknowledgeInteractionOutcome: async (
+      issue: { id: string; companyId: string },
+      interactionId: string,
+      input: AcknowledgeIssueThreadInteractionOutcome,
+      actor: InteractionActor,
+    ) => {
+      const data = acknowledgeIssueThreadInteractionOutcomeSchema.parse(input);
+      const current = await db
+        .select()
+        .from(issueThreadInteractions)
+        .where(eq(issueThreadInteractions.id, interactionId))
+        .then((rows) => rows[0] ?? null);
+
+      if (!current) throw notFound("Interaction not found");
+      if (current.companyId !== issue.companyId || current.issueId !== issue.id) {
+        throw notFound("Interaction not found");
+      }
+      if (!ACKNOWLEDGEABLE_OUTCOME_INTERACTION_KINDS.includes(
+        current.kind as (typeof ACKNOWLEDGEABLE_OUTCOME_INTERACTION_KINDS)[number],
+      )) {
+        throw unprocessable(
+          `${current.kind} interactions do not carry a tracked outcome; `
+          + `acknowledgeable kinds are ${ACKNOWLEDGEABLE_OUTCOME_INTERACTION_KINDS.join(", ")}`,
+        );
+      }
+      if (current.status !== "accepted") {
+        throw conflict(
+          "Only an accepted interaction has an authorised outcome to acknowledge",
+        );
+      }
+
+      const existingResult = (current.result ?? null) as RequestConfirmationResult | null;
+      if (existingResult?.outcomeAcknowledgement) {
+        // Refused rather than overwritten: the first acknowledgement is the one
+        // that stopped the wait, and silently replacing its author, timestamp
+        // and reason would destroy the only record of who wrote the action off.
+        throw conflict("Interaction outcome has already been acknowledged");
+      }
+
+      const acknowledgement: InteractionOutcomeAcknowledgement = {
+        acknowledgedAt: new Date().toISOString(),
+        acknowledgedByUserId: actor.userId ?? null,
+        acknowledgedByAgentId: actor.agentId ?? null,
+        reason: data.reason,
+      };
+
+      // Spread over a well-formed base rather than over `{}`: `result` is
+      // nominally always present on an accepted confirmation, but it is a
+      // nullable jsonb column and a null there must not produce a result object
+      // missing its required `version`/`outcome`. The defaults are the truth for
+      // this row -- we have already established the card is `accepted` -- and
+      // the spread means a real existing result overrides both.
+      const nextResult: RequestConfirmationResult = {
+        version: 1,
+        outcome: "accepted",
+        ...(existingResult ?? {}),
+        outcomeAcknowledgement: acknowledgement,
+      };
+
+      const [updated] = await db
+        .update(issueThreadInteractions)
+        .set({
+          result: nextResult,
+          updatedAt: new Date(),
+        })
+        .where(and(
+          eq(issueThreadInteractions.id, interactionId),
+          // Re-applied so a concurrent accept/withdraw cannot slip between the
+          // read above and this write and leave the annotation on a card that
+          // is no longer accepted.
+          eq(issueThreadInteractions.status, "accepted"),
+        ))
+        .returning();
+
+      if (!updated) {
+        throw conflict("Only an accepted interaction has an authorised outcome to acknowledge");
+      }
+
+      await touchIssue(db, issue.id);
+      // No `emitInteractionResolvedTelemetry`: the card resolved when it was
+      // accepted and already emitted then. Re-emitting would double-count the
+      // acceptance in every resolution metric downstream.
+      return hydrateInteraction(updated);
     },
   };
 }

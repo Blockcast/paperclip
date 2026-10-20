@@ -602,6 +602,7 @@ export type {
   InteractionExpectedOutcome,
   InteractionExpectedOutcomeGithubPrMerged,
   InteractionExpectedOutcomeIssueStatus,
+  InteractionOutcomeAcknowledgement,
   InteractionExpectedOutcomeKind,
   RequestConfirmationTarget,
   RequestConfirmationPayload,

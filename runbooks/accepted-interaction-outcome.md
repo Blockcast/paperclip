@@ -43,15 +43,61 @@ A declared outcome has not been observed, and the oldest such card is past
    declared outcome kind and age.
 2. **Check the real object before concluding anything.** `unobserved` is not
    proof the action did not happen — see the ambiguity note below.
-3. If the action genuinely has not happened: do it, or withdraw the interaction
-   if it has gone moot. Nothing automated will clear this.
+3. If the action genuinely has not happened: **do it**, or — if it has gone
+   moot — **acknowledge it** (below). Nothing automated will clear this.
+
+### Clearing a moot card: acknowledge it, you cannot withdraw it
+
+**An accepted interaction cannot be withdrawn.** `withdrawInteraction` refuses
+any interaction that is not `pending`
+(`server/src/services/issue-thread-interactions.ts`), and `accepted` is
+terminal. An earlier version of this runbook told you to withdraw a moot card;
+that instruction named an operation the API refuses, and following it left the
+card pinned in `unobserved`.
+
+That mattered more than it sounds. **This alert thresholds the OLDEST age in the
+bucket**, so one card whose authorised action legitimately never happens — its
+PR closed unmerged, or superseded by a different PR — holds the warning on
+forever *and masks every newer unobserved card behind it*. An alert with no
+clearing path does not stay strict; it gets ignored.
+
+So record the write-off explicitly:
+
+```
+POST /issues/:issueId/interactions/:interactionId/acknowledge-outcome
+{ "reason": "superseded by #2601; #2584 closed unmerged" }
+```
+
+Agents without a dedicated tool can reach it through `paperclipApiRequest`.
+`reason` is required — an acknowledgement with no reason is indistinguishable
+from a silenced alarm, and an unrecorded decision is the exact failure this
+feature exists to make visible.
+
+What it does and does not do:
+
+- The card moves to the `acknowledged` bucket, leaving `unobserved` (or
+  `untracked`), so both alerts above can clear.
+- The acceptance itself is **unchanged** — still `accepted`, same `resolvedAt`,
+  same `resolvedBy`. This is an annotation saying "nobody is waiting any more",
+  not a retraction of a decision that genuinely was made.
+- It is written by a **person**, through this route. The sweep only reads it.
+  The sweep must never gain the ability to acknowledge a card itself: deciding
+  that an authorised action is moot is precisely the kind of decision nobody
+  delegated to it.
+- It is recorded in `activity_log` as
+  `issue.thread_interaction_outcome_acknowledged`, with the actor and reason.
+  `paperclip_accepted_interaction_outcome_total{bucket="acknowledged"}` is its
+  own series — **a rising acknowledgement rate is itself a signal** that asks
+  are being filed for actions nobody intends to take.
+- A second acknowledgement is refused. The first one is the record of who wrote
+  the action off.
 
 ### `unobserved` resolves ambiguity toward the alarm, on purpose
 
 | Declared kind | Observed from | Why absence is not proof |
 |---|---|---|
 | `github_pr_merged` | `issue_pull_requests.mergedAt`, scoped to the interaction's company | The table is webhook-fed on merge and backfilled only for repos that already have at least one forward-captured PR. A merge this installation never recorded reads `unobserved`. |
-| `issue_status` | `issues.status` in the same company | Fully in-DB; absence here really does mean the status was not reached. |
+| `issue_status` | `issues.status` in the same company, compared as "reached at least this far" along `backlog < todo < in_progress < in_review < done` | Fully in-DB; absence really does mean the status was not reached. A target that moved PAST the declared status still counts as observed, so a declared `in_review` that later reached `done` does not revert to unobserved. `blocked` and `cancelled` are off that ladder and never satisfy a declaration — a cancelled target is a moot card, which is a human judgement for the acknowledgement path above, not an inference the sweep may make. |
 
 An outcome `kind` this build has no observer for also reads `unobserved`. That
 is deliberate: adding a kind without adding its observer fails toward the alarm,
@@ -72,6 +118,25 @@ bucket would have been blind to the very card that motivated the work.
 
 Resolve by having filing agents populate `payload.expectedOutcome` on
 confirmations that authorise a concrete action.
+
+### It measures a trailing-window SHARE, not the all-time oldest card
+
+The alert fires when more than
+`prometheusRule.acceptedInteractionUntrackedShare` of the acceptances made
+inside the sweep's trailing window (7d) declared no outcome, and only once that
+window holds at least `acceptedInteractionUntrackedMinSample` acceptances.
+
+That shape is deliberate and was not the first draft. Thresholding the all-time
+`oldest_age_seconds{bucket="untracked"}` — which is what shipped first — could
+never be cleared by the adoption it asked for: **every acceptance filed before
+this feature existed is permanently untracked and cannot acquire a declaration
+retroactively**, so the oldest untracked card is already past any age threshold
+on the first tick after deploy and only gets older. It measured the deploy date.
+The share of recent acceptances is the number adoption actually moves, and it
+reaches 0 once filing agents adopt the field.
+
+A card that will never be declared and never acted on can also be moved out of
+this bucket with the acknowledgement route above.
 
 ### Why this is declared and never extracted from the card's prose
 
@@ -97,6 +162,12 @@ completed a sweep also fires this. **Check whether the scrape collector tick is
 running at all before assuming a query fault**: the refresh is registered as
 `accepted-interaction-outcome` in
 `server/src/services/scrape-metrics-collector.ts`.
+
+Note this refresh runs on its OWN cadence (`minIntervalMs`, 5 min) rather than
+every 15 s tick, because its CTE scans every accepted confirmation ever filed
+and what it measures moves on human timescales against a 24 h threshold. Its
+staleness window is scaled off that cadence, so the gap between two successful
+runs is normal and does not fire this alert.
 
 ## Adding an outcome kind
 

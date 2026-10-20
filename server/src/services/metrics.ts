@@ -1177,6 +1177,8 @@ export const APPROVAL_QUEUE_METRICS_REFRESH_SUCCESS_METRIC =
 export const ACCEPTED_INTERACTION_OUTCOME_METRIC = "paperclip_accepted_interaction_outcome_total";
 export const ACCEPTED_INTERACTION_OUTCOME_OLDEST_AGE_METRIC =
   "paperclip_accepted_interaction_outcome_oldest_age_seconds";
+export const ACCEPTED_INTERACTION_OUTCOME_RECENT_METRIC =
+  "paperclip_accepted_interaction_outcome_recent_count";
 export const ACCEPTED_INTERACTION_OUTCOME_METRICS_REFRESH_SUCCESS_METRIC =
   "paperclip_accepted_interaction_outcome_metrics_refresh_success";
 /**
@@ -3924,6 +3926,7 @@ let approvalLastDecisionTimestamp: Gauge | null = null;
 let approvalQueueMetricsRefreshSuccess: Gauge | null = null;
 let acceptedInteractionOutcome: Gauge<"bucket"> | null = null;
 let acceptedInteractionOutcomeOldestAge: Gauge<"bucket"> | null = null;
+let acceptedInteractionOutcomeRecent: Gauge<"bucket"> | null = null;
 let acceptedInteractionOutcomeMetricsRefreshSuccess: Gauge | null = null;
 let agentStartLockHeldSeconds: Gauge<"agent_id"> | null = null;
 let agentStartLockPhaseSeconds: Gauge<"agent_id" | "phase"> | null = null;
@@ -4156,6 +4159,7 @@ function ensureRegistry(): {
   approvalQueueMetricsRefreshSuccessGauge: Gauge;
   acceptedInteractionOutcomeGauge: Gauge<"bucket">;
   acceptedInteractionOutcomeOldestAgeGauge: Gauge<"bucket">;
+  acceptedInteractionOutcomeRecentGauge: Gauge<"bucket">;
   acceptedInteractionOutcomeMetricsRefreshSuccessGauge: Gauge;
   agentStartLockHeldSecondsGauge: Gauge<"agent_id">;
   agentStartLockPhaseSecondsGauge: Gauge<"agent_id" | "phase">;
@@ -4238,6 +4242,7 @@ function ensureRegistry(): {
     || !approvalsPending
     || !acceptedInteractionOutcome
     || !acceptedInteractionOutcomeOldestAge
+    || !acceptedInteractionOutcomeRecent
     || !acceptedInteractionOutcomeMetricsRefreshSuccess
     || !approvalOldestPendingAge
     || !approvalLastDecisionTimestamp
@@ -5087,6 +5092,22 @@ function ensureRegistry(): {
         + "would read as an acceptance made this instant. Its "
         + ACCEPTED_INTERACTION_OUTCOME_METRIC + " reads an explicit 0 alongside, so the absence is "
         + "unambiguous.",
+      labelNames: ["bucket"],
+      registers: [registry],
+    });
+    acceptedInteractionOutcomeRecent = new Gauge({
+      name: ACCEPTED_INTERACTION_OUTCOME_RECENT_METRIC,
+      help:
+        "Accepted issue-thread confirmations per outcome bucket whose acceptance falls inside "
+        + "the sweep's trailing window (PEN-4409, default 7d). This is the ADOPTION series, and "
+        + "the reason it exists is that `" + ACCEPTED_INTERACTION_OUTCOME_METRIC + "` and "
+        + "`" + ACCEPTED_INTERACTION_OUTCOME_OLDEST_AGE_METRIC + "` are both all-time. Every "
+        + "acceptance filed before the feature shipped is permanently `untracked` and cannot "
+        + "acquire a declaration retroactively, so the all-time oldest untracked age is already "
+        + "past any threshold on the first tick after deploy and stays there no matter how "
+        + "completely filing agents adopt `expectedOutcome` -- it measures the deploy date, not "
+        + "adoption. The untracked SHARE of this windowed count is the thing adoption actually "
+        + "moves, so that is what the untracked alert thresholds.",
       labelNames: ["bucket"],
       registers: [registry],
     });
@@ -6307,6 +6328,7 @@ function ensureRegistry(): {
     approvalQueueMetricsRefreshSuccessGauge: approvalQueueMetricsRefreshSuccess,
     acceptedInteractionOutcomeGauge: acceptedInteractionOutcome,
     acceptedInteractionOutcomeOldestAgeGauge: acceptedInteractionOutcomeOldestAge,
+    acceptedInteractionOutcomeRecentGauge: acceptedInteractionOutcomeRecent,
     acceptedInteractionOutcomeMetricsRefreshSuccessGauge: acceptedInteractionOutcomeMetricsRefreshSuccess,
     agentStartLockHeldSecondsGauge: agentStartLockHeldSeconds,
     agentStartLockPhaseSecondsGauge: agentStartLockPhaseSeconds,
@@ -7654,18 +7676,30 @@ export function setApprovalQueueMetricsRefreshSuccess(success: boolean): void {
  * is unambiguous because the seeded count gauge reads 0 beside it.
  */
 export function setAcceptedInteractionOutcomeMetrics(input: {
-  entries: ReadonlyArray<{ bucket: string; count: number; oldestAgeSeconds: number | null }>;
+  entries: ReadonlyArray<{
+    bucket: string;
+    count: number;
+    oldestAgeSeconds: number | null;
+    recentCount?: number;
+  }>;
 }): void {
   const metrics = ensureRegistry();
   metrics.acceptedInteractionOutcomeGauge.reset();
   metrics.acceptedInteractionOutcomeOldestAgeGauge.reset();
+  metrics.acceptedInteractionOutcomeRecentGauge.reset();
   for (const bucket of ACCEPTED_INTERACTION_OUTCOME_BUCKETS) {
     metrics.acceptedInteractionOutcomeGauge.set({ bucket }, 0);
+    // Seeded, unlike the oldest-age gauge. An empty bucket really does have a
+    // recent count of zero, and the untracked alert divides by the sum of these
+    // -- a missing series would make that denominator silently drop a bucket.
+    metrics.acceptedInteractionOutcomeRecentGauge.set({ bucket }, 0);
   }
   for (const entry of input.entries) {
     const bucket = entry.bucket || "unknown";
     const count = Number.isFinite(entry.count) ? Math.max(0, entry.count) : 0;
     metrics.acceptedInteractionOutcomeGauge.set({ bucket }, count);
+    const recent = Number.isFinite(entry.recentCount) ? Math.max(0, entry.recentCount as number) : 0;
+    metrics.acceptedInteractionOutcomeRecentGauge.set({ bucket }, recent);
     if (entry.oldestAgeSeconds !== null && Number.isFinite(entry.oldestAgeSeconds)) {
       metrics.acceptedInteractionOutcomeOldestAgeGauge.set(
         { bucket },

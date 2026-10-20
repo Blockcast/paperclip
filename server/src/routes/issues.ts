@@ -28,6 +28,7 @@ import {
   addIssueCommentSchema,
   acceptIssueThreadInteractionSchema,
   attachmentArtifactWorkProductMetadataSchema,
+  acknowledgeIssueThreadInteractionOutcomeSchema,
   cancelIssueThreadInteractionSchema,
   companySearchExtractQuerySchema,
   companySearchQuerySchema,
@@ -15363,6 +15364,73 @@ export function issueRoutes(
       res.json(interaction);
     },
   );
+
+  /**
+   * Record that an accepted card's authorised action will not be observed
+   * (PEN-4409). This is the CLEARING PATH for
+   * `PaperclipAcceptedInteractionActionUnobserved`.
+   *
+   * Deliberately NOT `/withdraw`. Withdrawal refuses anything that is not
+   * `pending`, so an accepted card could not be withdrawn at all — which left
+   * the `unobserved` bucket with no exit and, because the alert thresholds the
+   * OLDEST age in that bucket, let one permanently-moot card pin the warning on
+   * forever and mask every newer card behind it. Withdrawal also resolves to
+   * `cancelled`, which would falsify a decision that genuinely was made. This
+   * writes an annotation and changes no decision field.
+   *
+   * Not restricted to the board. The party that knows a PR was closed in favour
+   * of another one is usually the agent that filed the ask, and requiring a
+   * human for every superseded card reproduces the un-clearable backlog this
+   * fixes. The controls are that `reason` is required, the actor is recorded on
+   * the annotation, an activity row is written, and the sweep reports the
+   * `acknowledged` bucket as its own series — so writing a card off is visible
+   * rather than silent, and a rising acknowledgement rate is itself a signal.
+   */
+  router.post(
+    "/issues/:id/interactions/:interactionId/acknowledge-outcome",
+    validate(acknowledgeIssueThreadInteractionOutcomeSchema),
+    async (req, res) => {
+      const id = req.params.id as string;
+      const interactionId = req.params.interactionId as string;
+      const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+      if (!issue) return;
+      if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
+      // Interactions are control-plane state: an agent that may not create them
+      // must not be able to write off the wait on one either.
+      if (await assertLowTrustControlPlaneDenied(req, res, issue.companyId, issue)) return;
+
+      const actor = getActorInfo(req);
+      const interaction = await issueThreadInteractionService(db).acknowledgeInteractionOutcome(
+        issue,
+        interactionId,
+        req.body,
+        {
+          agentId: actor.agentId,
+          userId: actor.actorType === "user" ? actor.actorId : null,
+        },
+      );
+
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action: "issue.thread_interaction_outcome_acknowledged",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          interactionId: interaction.id,
+          interactionKind: interaction.kind,
+          reason: req.body.reason,
+        },
+      });
+
+      res.json(interaction);
+    },
+  );
+
 
   router.get("/issues/:id/comments/:commentId", async (req, res) => {
     const id = req.params.id as string;

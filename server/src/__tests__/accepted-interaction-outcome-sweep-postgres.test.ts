@@ -102,7 +102,7 @@ describeEmbeddedPostgres("sweepAcceptedInteractionOutcomes (PEN-4409)", () => {
 
   async function bucketOf(interactionId: string): Promise<AcceptedInteractionOutcomeBucket | null> {
     const report = await sweepAcceptedInteractionOutcomes(db);
-    for (const bucket of ["observed", "unobserved", "untracked"] as const) {
+    for (const bucket of ["observed", "unobserved", "untracked", "acknowledged"] as const) {
       if (report.buckets[bucket].samples.some((s) => s.interactionId === interactionId)) return bucket;
     }
     return null;
@@ -255,6 +255,169 @@ describeEmbeddedPostgres("sweepAcceptedInteractionOutcomes (PEN-4409)", () => {
     });
 
     expect(await bucketOf(interactionId)).toBe("observed");
+  });
+
+  /**
+   * "Reached at least this far", not "is sitting here right now". A bare
+   * equality test reverted a card from `observed` to `unobserved` as soon as
+   * the target moved PAST the declared status, which is the single most likely
+   * way an `issue_status` card ends its life — and produced a permanent false
+   * finding out of a genuinely completed action.
+   */
+  it("keeps an issue_status card observed after the target moves past the declared status", async () => {
+    const { companyId, issueId } = await seedCompanyAndIssue();
+    const targetId = randomUUID();
+    await db.insert(issues).values({
+      id: targetId,
+      companyId,
+      title: "Target",
+      status: "in_review",
+      priority: "medium",
+    });
+    const interactionId = await insertAcceptedConfirmation({
+      companyId,
+      issueId,
+      payload: {
+        expectedOutcome: { kind: "issue_status", ref: { issueId: targetId, status: "in_review" } },
+      },
+    });
+
+    expect(await bucketOf(interactionId)).toBe("observed");
+
+    await db.execute(sql`UPDATE issues SET status = 'done' WHERE id = ${targetId}::uuid`);
+
+    expect(await bucketOf(interactionId)).toBe("observed");
+  });
+
+  it("does not treat a status short of the declared one as reached", async () => {
+    const { companyId, issueId } = await seedCompanyAndIssue();
+    const targetId = randomUUID();
+    await db.insert(issues).values({
+      id: targetId,
+      companyId,
+      title: "Target",
+      status: "todo",
+      priority: "medium",
+    });
+    const interactionId = await insertAcceptedConfirmation({
+      companyId,
+      issueId,
+      payload: {
+        expectedOutcome: { kind: "issue_status", ref: { issueId: targetId, status: "in_review" } },
+      },
+    });
+
+    expect(await bucketOf(interactionId)).toBe("unobserved");
+  });
+
+  /**
+   * `blocked` and `cancelled` are off the progression ladder, so they satisfy
+   * nothing and keep failing toward the alarm. A cancelled target is the
+   * textbook moot card, and writing one off is a human judgement recorded
+   * through the acknowledgement route — never an inference this sweep makes.
+   */
+  it.each(["blocked", "cancelled"])(
+    "does not treat an off-ladder %s target as having reached the declared status",
+    async (status) => {
+      const { companyId, issueId } = await seedCompanyAndIssue();
+      const targetId = randomUUID();
+      await db.insert(issues).values({
+        id: targetId,
+        companyId,
+        title: "Target",
+        status: "in_progress",
+        priority: "medium",
+      });
+      const interactionId = await insertAcceptedConfirmation({
+        companyId,
+        issueId,
+        payload: {
+          expectedOutcome: { kind: "issue_status", ref: { issueId: targetId, status: "in_review" } },
+        },
+      });
+      await db.execute(sql`UPDATE issues SET status = ${status} WHERE id = ${targetId}::uuid`);
+
+      expect(await bucketOf(interactionId)).toBe("unobserved");
+    },
+  );
+
+  it("still matches an exact off-ladder status, which the ladder alone cannot express", async () => {
+    const { companyId, issueId } = await seedCompanyAndIssue();
+    const targetId = randomUUID();
+    await db.insert(issues).values({
+      id: targetId,
+      companyId,
+      title: "Target",
+      status: "blocked",
+      priority: "medium",
+    });
+    const interactionId = await insertAcceptedConfirmation({
+      companyId,
+      issueId,
+      payload: {
+        expectedOutcome: { kind: "issue_status", ref: { issueId: targetId, status: "blocked" } },
+      },
+    });
+
+    expect(await bucketOf(interactionId)).toBe("observed");
+  });
+
+  /**
+   * The clearing path (`acknowledged`), read out of `result`. An acceptance is
+   * terminal, so a moot card could not be withdrawn and had no exit from
+   * `unobserved` at all — and since the alert thresholds the OLDEST age in the
+   * bucket, one such card pinned it on forever.
+   */
+  it("reads an acknowledgement recorded on result as the acknowledged bucket", async () => {
+    const { companyId, issueId } = await seedCompanyAndIssue();
+    const interactionId = await insertAcceptedConfirmation({
+      companyId,
+      issueId,
+      payload: {
+        expectedOutcome: {
+          kind: "github_pr_merged",
+          ref: { repoFullName: "Blockcast/paperclip", prNumber: 2584 },
+        },
+      },
+    });
+
+    expect(await bucketOf(interactionId)).toBe("unobserved");
+
+    await db.execute(sql`
+      UPDATE issue_thread_interactions
+      SET result = jsonb_set(
+        result,
+        '{outcomeAcknowledgement}',
+        ${JSON.stringify({
+          acknowledgedAt: new Date().toISOString(),
+          acknowledgedByUserId: "operator",
+          reason: "superseded by #2601",
+        })}::jsonb
+      )
+      WHERE id = ${interactionId}::uuid
+    `);
+
+    expect(await bucketOf(interactionId)).toBe("acknowledged");
+  });
+
+  it("clears an untracked card through acknowledgement as well", async () => {
+    const { companyId, issueId } = await seedCompanyAndIssue();
+    const interactionId = await insertAcceptedConfirmation({
+      companyId,
+      issueId,
+      payload: {},
+      result: {
+        version: 1,
+        outcome: "accepted",
+        outcomeAcknowledgement: {
+          acknowledgedAt: new Date().toISOString(),
+          acknowledgedByUserId: "operator",
+          reason: "ask is moot",
+        },
+      },
+    });
+
+    expect(await bucketOf(interactionId)).toBe("acknowledged");
   });
 
   it("reports an acceptance that declared nothing as untracked", async () => {

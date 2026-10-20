@@ -1188,7 +1188,8 @@ spec:
         - alert: PaperclipAcceptedInteractionActionUnobserved
           # PEN-4409. DECISION THIS INFORMS: an acceptance was recorded, the
           # action it authorised has not been observed to have happened, and a
-          # PERSON must either do it or withdraw it. Nothing automated can act
+          # PERSON must either do it or acknowledge it as moot (an acceptance is
+          # terminal, so it cannot be withdrawn -- see the runbook). Nothing automated can act
           # here and nothing in this path is permitted to -- the sweep reports
           # and performs no writes at all, because the record it reads is a
           # board or operator decision.
@@ -1219,7 +1220,7 @@ spec:
             severity: warning
           annotations:
             summary: "Paperclip accepted interaction authorised an action that has not been observed"
-            description: "An accepted issue-thread confirmation declared an expectedOutcome that has still not been observed after {{`{{ $value | humanizeDuration }}`}} (PEN-4409). The acceptance is a decision a person must now act on, or withdraw -- this alert does NOT mean anything is broken in the platform, and nothing automated will clear it, by design. Find the card in the control-plane log line `accepted interactions whose authorised action has not been observed`, which names the interaction id, the issue identifier and the declared outcome. IMPORTANT: unobserved is NOT proof the action did not happen. A `github_pr_merged` outcome resolves against `issue_pull_requests`, which is webhook-fed and backfilled only for repos it has already seen, so a merge this installation never recorded also reads unobserved -- that ambiguity is resolved toward the alarm deliberately, because a false clear is worse than the silence this replaces. Check the real object first. Resolve by performing the authorised action, or by withdrawing the interaction if it has gone moot."
+            description: "An accepted issue-thread confirmation declared an expectedOutcome that has still not been observed after {{`{{ $value | humanizeDuration }}`}} (PEN-4409). The acceptance is a decision a person must now act on, or withdraw -- this alert does NOT mean anything is broken in the platform, and nothing automated will clear it, by design. Find the card in the control-plane log line `accepted interactions whose authorised action has not been observed`, which names the interaction id, the issue identifier and the declared outcome. IMPORTANT: unobserved is NOT proof the action did not happen. A `github_pr_merged` outcome resolves against `issue_pull_requests`, which is webhook-fed and backfilled only for repos it has already seen, so a merge this installation never recorded also reads unobserved -- that ambiguity is resolved toward the alarm deliberately, because a false clear is worse than the silence this replaces. Check the real object first. Resolve by performing the authorised action; if it has genuinely gone moot (its PR was closed unmerged, or superseded by another), record that with `POST /issues/:id/interactions/:interactionId/acknowledge-outcome` and a reason, which moves the card to the `acknowledged` bucket. Note the card canNOT be withdrawn: withdrawal refuses anything that is not `pending` and an acceptance is terminal, so acknowledgement is the only clearing path. Because this alert thresholds the OLDEST age in the bucket, leaving one permanently-moot card unacknowledged pins it on forever and masks every newer unobserved card behind it."
             runbook_url: {{ .Values.prometheusRule.acceptedInteractionOutcomeRunbookUrl | quote }}
         - alert: PaperclipAcceptedInteractionUntracked
           # PEN-4409, AMENDMENT 2 on the issue. This is the adoption signal for
@@ -1234,15 +1235,39 @@ spec:
           # that filtered this bucket would have been blind to the exact card
           # that motivated the work while reporting all-green.
           #
-          # `info`, long threshold, and no runbook escalation: this asks for a
-          # habit change from filing agents, not an incident response.
-          expr: max(paperclip_accepted_interaction_outcome_oldest_age_seconds{bucket="untracked"} and on(instance) (paperclip_accepted_interaction_outcome_metrics_refresh_success == 1)) > {{ .Values.prometheusRule.acceptedInteractionUntrackedAgeSeconds }}
+          # ⚠ THRESHOLDS THE TRAILING-WINDOW SHARE, NOT THE ALL-TIME OLDEST AGE.
+          # The first draft of this alert read
+          # `..._oldest_age_seconds{bucket="untracked"} > 72h`, which measured
+          # the deploy date rather than adoption and could never be cleared:
+          # every acceptance filed before this feature shipped is permanently
+          # untracked and cannot acquire a declaration retroactively, so the
+          # all-time oldest untracked card is already past any age threshold on
+          # the first tick after deploy and only gets older. Its own stated
+          # remedy -- have filing agents declare an outcome -- could not move it
+          # by construction. The untracked SHARE of recent acceptances is the
+          # thing adoption actually moves, and it reaches 0 once agents adopt
+          # the field.
+          #
+          # The `>= minSample` guard keeps a single stray card in a quiet week
+          # from reading as 100% non-adoption. `clamp_min(..., 1)` only guards
+          # the division: with no recent acceptances the numerator is 0 too, so
+          # the ratio is 0 and the guard above has already excluded the window.
+          expr: |-
+            max(
+              (
+                sum by(instance) (paperclip_accepted_interaction_outcome_recent_count{bucket="untracked"})
+                / clamp_min(sum by(instance) (paperclip_accepted_interaction_outcome_recent_count), 1)
+              )
+              and on(instance) (sum by(instance) (paperclip_accepted_interaction_outcome_recent_count) >= {{ .Values.prometheusRule.acceptedInteractionUntrackedMinSample }})
+              and on(instance) (paperclip_accepted_interaction_outcome_metrics_refresh_success == 1)
+            ) > {{ .Values.prometheusRule.acceptedInteractionUntrackedShare }}
           for: {{ .Values.prometheusRule.acceptedInteractionUntrackedFor }}
           labels:
             severity: info
           annotations:
-            summary: "Paperclip accepted interactions carry no declared outcome to check"
-            description: "Accepted issue-thread confirmations are sitting with no `payload.expectedOutcome`, the oldest for {{`{{ $value | humanizeDuration }}`}} (PEN-4409). Nothing can tell whether the actions they authorised happened, because nothing recorded what they were. This is not an outage and no action is urgent: it means filing agents are not declaring an expectedOutcome when they ask for a confirmation. The field is optional on purpose -- requiring it would break every existing caller -- so this series is the only place the gap is visible. It is reported rather than filtered deliberately: a sweep that showed only the cards which declared a reference would read clean by excluding exactly the cards it exists to catch. Resolve by having filing agents set `payload.expectedOutcome` on confirmations that authorise a concrete action; the field is never inferred from prose, because the prose of the card that motivated this named ten different candidate references and the correct one was neither the first nor the most frequent."
+            summary: "Paperclip accepted interactions are mostly filed with no declared outcome"
+            description: "{{`{{ $value | humanizePercentage }}`}} of the issue-thread confirmations accepted in the sweep's trailing window carried no `payload.expectedOutcome` (PEN-4409). Nothing can tell whether the actions they authorised happened, because nothing recorded what they were. This is not an outage and no action is urgent: it means filing agents are not declaring an expectedOutcome when they ask for a confirmation. The field is optional on purpose -- requiring it would break every existing caller -- so this series is the only place the gap is visible. It is reported rather than filtered deliberately: a sweep that showed only the cards which declared a reference would read clean by excluding exactly the cards it exists to catch. This measures the TRAILING WINDOW, not all time, so that adoption can actually clear it -- every acceptance predating the feature is permanently untracked and an all-time threshold would be stuck on from the first scrape. Resolve by having filing agents set `payload.expectedOutcome` on confirmations that authorise a concrete action; the field is never inferred from prose, because the prose of the card that motivated this named ten different candidate references and the correct one was neither the first nor the most frequent."
+            runbook_url: {{ .Values.prometheusRule.acceptedInteractionOutcomeRunbookUrl | quote }}
             runbook_url: {{ .Values.prometheusRule.acceptedInteractionOutcomeRunbookUrl | quote }}
         - alert: PaperclipAcceptedInteractionOutcomeMetricsRefreshFailed
           # PEN-4409. Strand alert for the two gauges above. The sweep keeps its

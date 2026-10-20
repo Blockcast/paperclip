@@ -88,6 +88,19 @@ interface ScrapeRefresh {
    * mistakable for a healthy one) and is therefore listed with `null`.
    */
   setFresh: ((success: boolean) => void) | null;
+  /**
+   * Run this refresh at most once per this many ms, instead of every tick.
+   *
+   * Default (undefined) is every tick, which is right for anything derived from
+   * run/queue/lease tables: those change on machine timescales and the gauge is
+   * read against a 15 s scrape. Set it only where the underlying data changes on
+   * HUMAN timescales and the query is not cheap, so that re-asking four times a
+   * minute buys nothing and costs a full scan.
+   *
+   * {@link expireStaleRefreshFreshness} derives this refresh's stale window from
+   * the value, so a slowed refresh is not mistaken for a stopped one.
+   */
+  minIntervalMs?: number;
 }
 
 const REFRESHES: readonly ScrapeRefresh[] = [
@@ -162,6 +175,13 @@ const REFRESHES: readonly ScrapeRefresh[] = [
     name: "accepted-interaction-outcome",
     run: (db) => refreshAcceptedInteractionOutcomeMetrics(db),
     setFresh: setAcceptedInteractionOutcomeMetricsRefreshSuccess,
+    // The only refresh in this list on a cadence of its own. Its CTE scans every
+    // accepted confirmation ever filed with two correlated EXISTS per row, and
+    // that cost grows with history and never shrinks -- while what it measures
+    // (has a person acted on a decision?) moves on a scale of hours against a
+    // 24 h alerting threshold. Asking four times a minute bought nothing and
+    // scanned the whole table 5.7k times a day to re-derive the same answer.
+    minIntervalMs: 5 * 60_000,
   },
 ];
 
@@ -193,8 +213,24 @@ export function expireStaleRefreshFreshness(
   for (const refresh of REFRESHES) {
     const last = lastSuccessMs.get(refresh.name);
     if (last === undefined) continue;
-    if (now - last > staleAfterMs) refresh.setFresh?.(false);
+    if (now - last > staleWindowFor(refresh, staleAfterMs)) refresh.setFresh?.(false);
   }
+}
+
+/**
+ * How long this refresh may go without a success before its freshness gauge is
+ * forced to 0.
+ *
+ * Scaled off `minIntervalMs` where one is set. The default window is six TICKS,
+ * which silently assumes every refresh runs every tick — so a refresh
+ * deliberately slowed below that window would be marked stale between every
+ * pair of its own runs, firing its strand alert permanently and reporting a
+ * working sweep as a broken one. Six of its OWN intervals keeps the original
+ * "several consecutive misses, not one slow run" semantics at any cadence.
+ */
+function staleWindowFor(refresh: ScrapeRefresh, defaultStaleAfterMs: number): number {
+  if (refresh.minIntervalMs === undefined) return defaultStaleAfterMs;
+  return Math.max(defaultStaleAfterMs, 6 * refresh.minIntervalMs);
 }
 
 /** Test seam: forget recorded successes so `expireStaleRefreshFreshness` starts from a clean slate. */
@@ -378,6 +414,13 @@ export function startScrapeMetricsCollector(
     ticking = true;
     try {
       for (const refresh of REFRESHES) {
+        // Cadence is checked against the last SUCCESS, not the last attempt, so
+        // a failing slow refresh keeps retrying on every tick rather than
+        // holding its own failure for another full interval.
+        if (refresh.minIntervalMs !== undefined) {
+          const last = lastSuccessMs.get(refresh.name);
+          if (last !== undefined && now() - last < refresh.minIntervalMs) continue;
+        }
         try {
           await refresh.run(db);
           lastSuccessMs.set(refresh.name, now());

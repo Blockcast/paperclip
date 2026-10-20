@@ -1,7 +1,10 @@
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  __resetAcceptedInteractionOutcomeLogStateForTest,
   buildAcceptedInteractionOutcomeReport,
+  DEFAULT_RECENT_WINDOW_MS,
   DEFAULT_UNOBSERVED_AFTER_MS,
+  refreshAcceptedInteractionOutcomeMetrics,
   type ClassifiedRow,
 } from "./accepted-interaction-outcome-sweep.js";
 
@@ -29,25 +32,29 @@ function row(overrides: Partial<ClassifiedRow> = {}): ClassifiedRow {
     source: "declared",
     resolvedAt: new Date(NOW.getTime() - HOUR).toISOString(),
     observed: false,
+    acknowledged: false,
     ...overrides,
   };
 }
 
 describe("buildAcceptedInteractionOutcomeReport", () => {
-  it("sorts each card into exactly one of the three buckets", () => {
+  it("sorts each card into exactly one of the four buckets", () => {
     const report = buildAcceptedInteractionOutcomeReport([
       row({ interactionId: "a", source: "declared", observed: true }),
       row({ interactionId: "b", source: "declared", observed: false }),
       row({ interactionId: "c", source: "none", outcomeKind: null, observed: false }),
+      row({ interactionId: "d", source: "declared", observed: false, acknowledged: true }),
     ], { now: NOW });
 
     expect(report.buckets.observed.count).toBe(1);
     expect(report.buckets.unobserved.count).toBe(1);
     expect(report.buckets.untracked.count).toBe(1);
+    expect(report.buckets.acknowledged.count).toBe(1);
     const total = report.buckets.observed.count
       + report.buckets.unobserved.count
-      + report.buckets.untracked.count;
-    expect(total).toBe(3);
+      + report.buckets.untracked.count
+      + report.buckets.acknowledged.count;
+    expect(total).toBe(4);
   });
 
   /**
@@ -143,5 +150,169 @@ describe("buildAcceptedInteractionOutcomeReport", () => {
     expect(report.buckets.unobserved.count).toBe(15);
     expect(report.buckets.unobserved.samples).toHaveLength(10);
     expect(report.buckets.unobserved.samples[0]?.interactionId).toBe("card-14");
+  });
+  /**
+   * The clearing path. An acceptance is terminal, so `withdrawInteraction`
+   * refuses it and a moot card had NO exit from `unobserved` at all. Because
+   * the alert thresholds the oldest age in the bucket, one such card pinned the
+   * warning on forever and masked every newer card behind it.
+   */
+  it("moves an acknowledged card out of unobserved so the oldest-age alert can clear", () => {
+    const stuck = row({
+      interactionId: "moot",
+      resolvedAt: new Date(NOW.getTime() - 400 * HOUR).toISOString(),
+      acknowledged: true,
+    });
+    const fresh = row({
+      interactionId: "real",
+      resolvedAt: new Date(NOW.getTime() - 30 * HOUR).toISOString(),
+    });
+
+    const report = buildAcceptedInteractionOutcomeReport([stuck, fresh], { now: NOW });
+
+    expect(report.buckets.acknowledged.count).toBe(1);
+    expect(report.buckets.unobserved.count).toBe(1);
+    // The 400h card no longer sets the unobserved oldest age, so the newer card
+    // is visible behind it instead of being masked.
+    expect(report.buckets.unobserved.samples[0]?.interactionId).toBe("real");
+    expect(report.buckets.unobserved.oldestAgeSeconds).toBeCloseTo(30 * 3600, 0);
+  });
+
+  it("clears an acknowledged card out of untracked too, not only out of unobserved", () => {
+    const report = buildAcceptedInteractionOutcomeReport([
+      row({ source: "none", outcomeKind: null, acknowledged: true }),
+    ], { now: NOW });
+
+    expect(report.buckets.untracked.count).toBe(0);
+    expect(report.buckets.acknowledged.count).toBe(1);
+  });
+
+  /**
+   * Observed outranks acknowledged: if the action demonstrably happened, that is
+   * the better record, and filing it under "nobody is waiting" would misreport
+   * a card whose action was in fact done.
+   */
+  it("reports an acknowledged card whose action did happen as observed", () => {
+    const report = buildAcceptedInteractionOutcomeReport([
+      row({ source: "declared", observed: true, acknowledged: true }),
+    ], { now: NOW });
+
+    expect(report.buckets.observed.count).toBe(1);
+    expect(report.buckets.acknowledged.count).toBe(0);
+  });
+
+  /**
+   * The adoption series. `count` and `oldestAgeSeconds` are all-time, and every
+   * acceptance predating the feature is permanently untracked — so an alert on
+   * either is true from the first tick after deploy and can never be cleared by
+   * the adoption it asks for.
+   */
+  it("counts only acceptances inside the trailing window as recent", () => {
+    const report = buildAcceptedInteractionOutcomeReport([
+      row({ interactionId: "old", source: "none", outcomeKind: null,
+        resolvedAt: new Date(NOW.getTime() - DEFAULT_RECENT_WINDOW_MS - HOUR).toISOString() }),
+      row({ interactionId: "new", source: "none", outcomeKind: null,
+        resolvedAt: new Date(NOW.getTime() - HOUR).toISOString() }),
+    ], { now: NOW });
+
+    expect(report.buckets.untracked.count).toBe(2);
+    expect(report.buckets.untracked.recentCount).toBe(1);
+  });
+
+  it("leaves an undateable card out of recentCount rather than assuming it is recent", () => {
+    const report = buildAcceptedInteractionOutcomeReport([
+      row({ source: "none", outcomeKind: null, resolvedAt: "not-a-date" }),
+    ], { now: NOW });
+
+    expect(report.buckets.untracked.count).toBe(1);
+    expect(report.buckets.untracked.recentCount).toBe(0);
+  });
+});
+
+/**
+ * The untracked population is every accepted confirmation ever filed with no
+ * declaration, and none of them can acquire one retroactively — so the log
+ * condition is permanently true in any installation with history. Unthrottled,
+ * that meant a line carrying up to twenty nested sample objects on EVERY 15 s
+ * collector tick, per replica, forever (~5.7k lines/day/replica), restating a
+ * set that had not changed.
+ */
+describe("refreshAcceptedInteractionOutcomeMetrics logging", () => {
+  const STALE = new Date("2026-01-01T00:00:00.000Z").toISOString();
+
+  function dbReturning(rows: ClassifiedRow[]) {
+    return { execute: async () => rows } as never;
+  }
+
+  function logger() {
+    return { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as never;
+  }
+
+  beforeEach(() => {
+    __resetAcceptedInteractionOutcomeLogStateForTest();
+  });
+
+  it("logs the first tick, then stays silent while the picture is unchanged", async () => {
+    const rows = [row({ source: "none", outcomeKind: null, resolvedAt: STALE })];
+    const log = logger();
+    const db = dbReturning(rows);
+
+    await refreshAcceptedInteractionOutcomeMetrics(db, { now: NOW, logger: log });
+    await refreshAcceptedInteractionOutcomeMetrics(db, {
+      now: new Date(NOW.getTime() + 15_000),
+      logger: log,
+    });
+    await refreshAcceptedInteractionOutcomeMetrics(db, {
+      now: new Date(NOW.getTime() + 30_000),
+      logger: log,
+    });
+
+    expect((log as unknown as { info: { mock: { calls: unknown[] } } }).info.mock.calls).toHaveLength(1);
+  });
+
+  it("logs again when a card enters the bucket", async () => {
+    const log = logger();
+    const first = [row({ interactionId: "a", source: "none", outcomeKind: null, resolvedAt: STALE })];
+    const second = [
+      ...first,
+      row({ interactionId: "b", source: "none", outcomeKind: null, resolvedAt: STALE }),
+    ];
+
+    await refreshAcceptedInteractionOutcomeMetrics(dbReturning(first), { now: NOW, logger: log });
+    await refreshAcceptedInteractionOutcomeMetrics(dbReturning(second), {
+      now: new Date(NOW.getTime() + 15_000),
+      logger: log,
+    });
+
+    expect((log as unknown as { info: { mock: { calls: unknown[] } } }).info.mock.calls).toHaveLength(2);
+  });
+
+  it("restates a standing problem on the periodic floor so it cannot fall out of a log search", async () => {
+    const rows = [row({ source: "none", outcomeKind: null, resolvedAt: STALE })];
+    const log = logger();
+
+    await refreshAcceptedInteractionOutcomeMetrics(dbReturning(rows), { now: NOW, logger: log });
+    await refreshAcceptedInteractionOutcomeMetrics(dbReturning(rows), {
+      now: new Date(NOW.getTime() + 61 * 60 * 1000),
+      logger: log,
+    });
+
+    const calls = (log as unknown as { info: { mock: { calls: Array<[Record<string, unknown>, string]> } } })
+      .info.mock.calls;
+    expect(calls).toHaveLength(2);
+    expect(calls[1]?.[0]?.reason).toBe("periodic");
+  });
+
+  it("stays silent when nothing is past the threshold at all", async () => {
+    const log = logger();
+    const rows = [row({
+      source: "none",
+      outcomeKind: null,
+      resolvedAt: new Date(NOW.getTime() - HOUR).toISOString(),
+    })];
+
+    await refreshAcceptedInteractionOutcomeMetrics(dbReturning(rows), { now: NOW, logger: log });
+
+    expect((log as unknown as { info: { mock: { calls: unknown[] } } }).info.mock.calls).toHaveLength(0);
   });
 });
