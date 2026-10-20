@@ -113,12 +113,24 @@ All four must be true. Measure them; do not assume.
    checking one file cannot distinguish it. The *newest* of the five is the one
    that has to predate the pod.
 
+   Compare **epoch seconds**, not printed timestamps. `stat -c '%y'` renders in
+   the shell's local timezone with a numeric offset, while `.status.startTime`
+   is UTC `Z`. On a bastion that is not UTC those are unlike strings, and
+   eyeballing them can invert the comparison — which here would read a
+   still-seeding file as an orphan. The first column below is epoch, so the
+   check is mechanical.
+
    ```console
-   $ stat -c '%y %n' /paperclip/.local/bin/{gh,git,github-mcp-server,github-token-credential-helper,paperclip-github-token-env}
-   $ kubectl -n paperclip get pod paperclip-0 -o jsonpath='{.status.startTime}{"\n"}'
+   $ TZ=UTC stat -c '%Y  %y  %n' /paperclip/.local/bin/{gh,git,github-mcp-server,github-token-credential-helper,paperclip-github-token-env}
+   $ date -u -d "$(kubectl -n paperclip get pod paperclip-0 -o jsonpath='{.status.startTime}')" +'%s  %Y-%m-%d %H:%M:%S UTC'
    ```
 
-   Verified 2026-10-19: all five at `2026-10-19T00:29:49Z`, pod started ~08:22Z.
+   Every file's epoch must be **less than** the pod's.
+
+   Measured 2026-10-19 and re-measured 2026-10-20 from a live agent pod: all
+   five at epoch `1792369789` (`2026-10-19 00:29:49Z`), identical to the second
+   — consistent with a single seed write — against a `paperclip-0` start of
+   ~08:22Z. The two `/paperclip/bin` symlinks carry the same timestamp.
 
 2. **Every live agent image carries the image wrapper directory.** The delete is
    only safe because `gh` falls through to `/usr/local/libexec/paperclip/bin`.
