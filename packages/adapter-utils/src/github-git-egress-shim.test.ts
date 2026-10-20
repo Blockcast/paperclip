@@ -976,7 +976,7 @@ describe("formatRefusal", () => {
     expect(message).toContain("Report the binding name");
     // The shape, spelled out — a reporter should not have to guess what
     // "shape" means to produce a usable report.
-    expect(message).toContain("length");
+    expect(message).toContain("its length");
     expect(message).toContain("character classes");
     expect(message).toContain("digit run");
     // ...and the prohibition, stated rather than implied.
