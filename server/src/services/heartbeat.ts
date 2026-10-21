@@ -31449,8 +31449,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // BLO-42411: apply even while runs are executing. The image is read only
         // when a Job is created, and a re-executed run adopts its existing Job
         // rather than recreating it, so in-flight Jobs keep their image. Holding
-        // the start lock means no dispatch for this agent can launch the old
-        // image after this point, which is all convergence needs. The previous
+        // the start lock means no newly claimed run for this agent can launch
+        // the old image after this point, which is all convergence needs. Two
+        // paths outside this dispatch still can: an in-flight run's ccrotate
+        // relaunch (up to PAPERCLIP_K8S_CCROTATE_IN_RUN_RETRY_MAX_ATTEMPTS, built
+        // from the run-start runtimeConfig), and a run claimed before the bump
+        // whose detached executeRun creates its Job afterwards. The previous
         // drain (decline until runningCount hit 0) froze every free slot of a
         // multi-slot agent behind its slowest run, for up to timeoutSec.
         await processPendingImageBumpForAgent(db, agentId, { applyWhileExecuting: true });

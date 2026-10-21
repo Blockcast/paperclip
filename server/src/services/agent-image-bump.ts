@@ -38,9 +38,10 @@ export async function selectEligibleAgentsForImageBump(
     );
 }
 
-// A pending image bump is deferred only while the agent is *actively
-// executing* — a heartbeat run is `running`, or (when the DB lags) the agent
-// still has a live k8s Job. Queued runs are intentionally NOT counted:
+// Outside the dispatcher, a pending image bump is deferred only while the agent
+// is *actively executing* — a heartbeat run is `running`, or (when the DB lags)
+// the agent still has a live k8s Job. The queued-run dispatcher skips this
+// check and applies the bump under the start lock regardless (BLO-42411). Queued runs are intentionally NOT counted:
 // BLO-8746/BLO-8827 — a maxConcurrentRuns=1 agent under steady automation is
 // perpetually backlogged, so gating on queued runs let a pending bump starve
 // forever and pinned the agent to a stale (possibly broken) image. The image
@@ -76,9 +77,10 @@ export interface ApplyResult {
  *   also writes an agent_config_revisions audit row. Clears any prior
  *   pending_image_bump.
  * - Actively executing: stash the target in agents.pending_image_bump
- *   (last-write-wins) and skip the PATCH. The heartbeat run-completion hook and
- *   the queued-run dispatcher both retry it the next time the agent is idle
- *   between runs (so a queued backlog no longer starves the bump).
+ *   (last-write-wins) and skip the PATCH. The heartbeat run-completion hook
+ *   retries it once the agent is idle; the queued-run dispatcher applies it on
+ *   its next pass even while other runs are executing (BLO-42411), so neither a
+ *   queued backlog nor one long run starves the bump.
  *
  * Mirrors the partial-patch semantics of PATCH /agents/:id without going
  * through HTTP, so the same audit trail lands either way.
@@ -193,9 +195,11 @@ export async function bumpAgentImagesForCompany(
 }
 
 /**
- * Retry the pending image bump for an agent if it's set + the agent is now idle.
+ * Retry the pending image bump for an agent if it's set + the agent is now idle
+ * (or unconditionally, with `applyWhileExecuting`).
  *
- * Called by the heartbeat run-completion hook (Task 7). Safe to call
+ * Called by the heartbeat run-completion hook (Task 7) and, with
+ * `applyWhileExecuting`, by the queued-run dispatcher. Safe to call
  * unconditionally on every terminal-status transition — short-circuits when
  * there's nothing pending, and re-defers when another run snuck in between
  * the original skip and now (self-healing — gets retried on the next
@@ -207,7 +211,8 @@ export async function processPendingImageBumpForAgent(
   opts: {
     /**
      * Skip the executing check. Only for the dispatcher, which holds the agent
-     * start lock so nothing can launch the old image after the PATCH (BLO-42411).
+     * start lock so no newly claimed run can launch the old image after the
+     * PATCH (BLO-42411). In-flight runs can still relaunch it; see heartbeat.ts.
      */
     applyWhileExecuting?: boolean;
   } = {},
