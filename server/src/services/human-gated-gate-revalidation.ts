@@ -828,7 +828,7 @@ const NON_SELF_CLEARING_RESOLUTION_KINDS: readonly GateResolutionKind[] = Object
 
 /**
  * Resolution kinds that leave an action owed, so the row keeps its place in the
- * age-ranked escalation list (PEN-3089).
+ * escalation list (PEN-3089).
  *
  * This is the set {@link withheldFromAgeRankingIssueIds} inverts, and the
  * distinction it draws is the one the caller used to get wrong. "The gate
@@ -1120,7 +1120,7 @@ export function resolvedButOpenIssueIds(report: GateRevalidationReport): Set<str
 }
 
 /**
- * Ids the caller may withhold from the age-ranked escalation list (PEN-3089).
+ * Ids the caller may withhold from the escalation list (PEN-3089).
  *
  * A strict subset of {@link resolvedButOpenIssueIds}, and the two must stay
  * distinct: every resolved-but-open row is still *rendered* with its age, but
@@ -1291,7 +1291,7 @@ function boundEvidence(evidence: string): string {
 export type FormatGateRevalidationOptions = {
   /**
    * Age in days per issue id, so a `resolved-but-open` row keeps its age when
-   * it moves out of the age-ranked list. Without this the row would appear to
+   * it moves out of the escalation list. Without this the row would appear to
    * lose information by being reclassified, which is how a reader learns to
    * distrust the reclassification.
    */
@@ -1306,7 +1306,7 @@ export type FormatGateRevalidationOptions = {
  * `resolved-but-open` rows are listed individually with their evidence, because
  * they are the actionable output. `still-gated` and `unverifiable` are reported
  * as counts — listing every still-gated row would just reproduce the
- * age-ranked list one section earlier, and the digest's whole design constraint
+ * escalation list one section earlier, and the digest's whole design constraint
  * is that a report nobody finishes reading is a report that gets muted.
  */
 export function formatGateRevalidationSections(
@@ -1374,7 +1374,7 @@ export function formatGateRevalidationSections(
     "",
     `#### Gate resolved but row still open — ${resolved.length}`,
     "",
-    "Each row below had its gate re-tested and the gate is no longer live. That is *not* the same as 'no longer waiting': where the resolution left an action owed, the row is marked ⛔ and is **not** withheld from the age-ranked list — it escalates there once it passes its human-silence threshold. Only the unmarked rows are withheld outright.",
+    "Each row below had its gate re-tested and the gate is no longer live. That is *not* the same as 'no longer waiting': where the resolution left an action owed, the row is marked ⛔ and is **not** withheld from the escalation list — it escalates there once it passes its human-silence threshold. Only the unmarked rows are withheld outright.",
   );
 
   // The rendered disposition is read from the *same* set that drives the
@@ -1386,7 +1386,7 @@ export function formatGateRevalidationSections(
   // being `resolved[0]`, and `probeBlockerPremise` runs first). A row with
   // every blocker `done` plus one granted card is therefore filed under
   // `blocker-done-row-not-moved` while being escalated — and labelling it from
-  // its kind printed "withheld from the age-ranked list" over a row that was in
+  // its kind printed "withheld from the escalation list" over a row that was in
   // that list. Deriving from `withheld` makes the label unable to contradict
   // the filter by construction, which is the whole point of this module.
   //
@@ -1397,7 +1397,7 @@ export function formatGateRevalidationSections(
   // medium, 45d low/unset) and then caps the list at `DEFAULT_MAX_ESCALATED`.
   // Since `loadHumanGatedIssues` applies no age predicate at all, most rows in
   // this section are younger than their threshold, so "still appears in the
-  // age-ranked list" would be false on most ⛔ marks. Claiming membership
+  // escalation list" would be false on most ⛔ marks. Claiming membership
   // honestly would mean plumbing the over-threshold ids back out of the ageing
   // pass — a new seam, for a label; claiming non-withholding needs no seam and
   // keeps the property that the label cannot contradict the filter.
@@ -1423,10 +1423,10 @@ export function formatGateRevalidationSections(
     const escalatedCount = inKind.filter(isEscalated).length;
     const disposition =
       escalatedCount === inKind.length
-        ? "⛔ action owed — not withheld from the age-ranked list"
+        ? "⛔ action owed — not withheld from the escalation list"
         : escalatedCount === 0
-          ? "withheld from the age-ranked list"
-          : `⛔ ${escalatedCount} action owed · ${inKind.length - escalatedCount} withheld from the age-ranked list`;
+          ? "withheld from the escalation list"
+          : `⛔ ${escalatedCount} action owed · ${inKind.length - escalatedCount} withheld from the escalation list`;
     body.push("", `**${RESOLUTION_KIND_HEADINGS[kind]} — ${inKind.length}** (${disposition})`);
     for (const classification of inKind) {
       if (listed >= maxListed) break;

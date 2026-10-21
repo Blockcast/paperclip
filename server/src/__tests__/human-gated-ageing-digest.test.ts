@@ -488,7 +488,7 @@ describeEmbeddedPostgres("humanGatedDigestTick (wired)", () => {
     // rule is asserted too, so a notice that kept the count while losing what
     // was withheld would fail here rather than read as a pass.
     expect(body).toContain("5 rows are withheld by the cap and not listed below");
-    expect(body).toContain("The cut is by age alone");
+    expect(body).toContain("The cut is by priority first, then age");
   });
 
   // -- A failing producer must not read as an all-clear -----------------------

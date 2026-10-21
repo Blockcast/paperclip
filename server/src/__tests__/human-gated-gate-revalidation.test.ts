@@ -126,7 +126,7 @@ describe("probeApprovalGate", () => {
     // Both resolve the gate, and they resolve it into opposite obligations: a
     // grant is an instruction to perform, a refusal ends the ask. Only the
     // first leaves the row owing work, which is what decides whether it stays
-    // in the age-ranked escalation list.
+    // in the escalation list.
     expect(
       probeApprovalGate(evidence({ approvals: [{ approvalId: "a1", approvalStatus: "approved" }] }))
         ?.resolutionKind,
@@ -969,7 +969,7 @@ describe("formatGateRevalidationSections", () => {
       ageDaysByIssueId: new Map([["resolved", 41.2]]),
     });
     expect(markdown).toContain("Gate resolved but row still open — 1");
-    expect(markdown).toContain("withheld from the age-ranked list");
+    expect(markdown).toContain("withheld from the escalation list");
     // Reclassification must not lose information the reader already had.
     expect(markdown).toContain("BLO-29399 (41.2d silent)");
     expect(markdown).toContain("BLO-29004=done");
@@ -1003,7 +1003,7 @@ describe("formatGateRevalidationSections", () => {
     // `blocker-done-row-not-moved` — a kind that is *not* action-owed — but the
     // first also carries a granted card, so `withheldFromAgeRankingIssueIds`
     // keeps it escalated. Labelling the block from its kind printed "withheld
-    // from the age-ranked list" over a row that was in that list, which is the
+    // from the escalation list" over a row that was in that list, which is the
     // same false claim this ticket removed from the global heading.
     const report = revalidateGates([
       evidence({

@@ -208,7 +208,7 @@ describeEmbeddedPostgres("gate re-validation (wired into the digest producer)", 
     expect(evidence[1].approvals[0]).toMatchObject({ approvalStatus: "pending" });
   });
 
-  it("withholds a resolved-but-open row from the age-ranked list and reports it separately", async () => {
+  it("withholds a resolved-but-open row from the escalation list and reports it separately", async () => {
     // The BLO-29399 shape: a critical row `blocked` by a blocker that has since
     // completed. Before this pass it aged forever, indistinguishable from a row
     // genuinely still waiting.
@@ -407,7 +407,7 @@ describeEmbeddedPostgres("gate re-validation (wired into the digest producer)", 
     expect(markdown).toContain("Human-gated work past its human-silence threshold (1)");
   });
 
-  it("still exempts a refused ask from the age-ranked list (PEN-3089)", async () => {
+  it("still exempts a refused ask from the escalation list (PEN-3089)", async () => {
     // The narrowing has to stay a narrowing. A rejection is a real answer: the
     // ask is over and the row needs closing, not escalating. If this one ever
     // starts escalating, the change has stopped discriminating and the digest
