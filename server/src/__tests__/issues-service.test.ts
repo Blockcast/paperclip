@@ -3237,6 +3237,161 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     expect(comments.map((comment) => comment.id)).toEqual([latestCommentId]);
   });
 
+  // PEN-4458 -- the two cursor tests above pass against the BROKEN
+  // implementation, because `.000Z` fixtures are the one input class where the
+  // defect cannot fire.
+  //
+  // `issue_comments.created_at` is `timestamptz`, which Postgres stores at
+  // MICROSECOND precision. The anchor row used to be read back into a JS
+  // `Date` -- millisecond precision -- and re-bound as the keyset boundary, so
+  // the boundary landed strictly BELOW the anchor's real timestamp whenever it
+  // carried a sub-millisecond remainder. With a `.000Z` fixture the truncation
+  // is a no-op and both orders look right; in production essentially every row
+  // has a non-zero remainder, so `asc` returned the cursor comment itself at
+  // the head of every page while `desc` silently dropped same-millisecond rows.
+  //
+  // A JS `Date` cannot express microseconds, so these fixtures are written
+  // through raw SQL deliberately. Rewriting them with `new Date(...)` -- or
+  // rounding the literals to milliseconds -- makes all of this green against
+  // the defect, which is exactly how it survived.
+  async function seedMicrosecondCommentThread(timestamps: ReadonlyArray<string>) {
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+    const commentIds = timestamps.map(() => randomUUID());
+
+    await db.insert(companies).values({
+      id: companyId,
+      defaultResponsibleUserId: "responsible-user",
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Microsecond cursor issue",
+      status: "todo",
+      priority: "medium",
+    });
+    await db.insert(issueComments).values(
+      commentIds.map((id, index) => ({
+        id,
+        companyId,
+        issueId,
+        body: `Comment ${index}`,
+      })),
+    );
+    for (const [index, id] of commentIds.entries()) {
+      await db.execute(
+        sql`update ${issueComments} set created_at = ${timestamps[index]}::timestamptz where ${issueComments.id} = ${id}`,
+      );
+    }
+
+    return { companyId, issueId, commentIds };
+  }
+
+  it("excludes a microsecond-precision anchor from its own ascending page", async () => {
+    // The anchor's remainder (.000123) sits above a millisecond-truncated
+    // bound, so `created_at > $bound` used to be true for the anchor itself.
+    const { issueId, commentIds } = await seedMicrosecondCommentThread([
+      "2026-03-26T11:00:00.000123Z",
+      "2026-03-26T12:00:00.000456Z",
+    ]);
+    const [anchorCommentId, laterCommentId] = commentIds;
+
+    const comments = await svc.listComments(issueId, {
+      afterCommentId: anchorCommentId,
+      order: "asc",
+      limit: 50,
+    });
+
+    expect(comments.map((comment) => comment.id)).toEqual([laterCommentId]);
+  });
+
+  it("keeps a same-millisecond earlier sibling in the descending page", async () => {
+    // Both rows land in the same millisecond. Truncating the anchor's
+    // timestamp put the earlier sibling in the gap between the bound and the
+    // anchor, where it satisfied neither `< bound` nor `= bound`, and it was
+    // dropped from the page with nothing reporting a gap.
+    const { issueId, commentIds } = await seedMicrosecondCommentThread([
+      "2026-03-26T11:00:00.000200Z",
+      "2026-03-26T11:00:00.000500Z",
+    ]);
+    const [earlierCommentId, anchorCommentId] = commentIds;
+
+    const comments = await svc.listComments(issueId, {
+      afterCommentId: anchorCommentId,
+      order: "desc",
+      limit: 50,
+    });
+
+    expect(comments.map((comment) => comment.id)).toEqual([earlierCommentId]);
+  });
+
+  it("refuses an after cursor that names no comment on this issue", async () => {
+    // The whole point of the row: this used to answer `[]`, which is also what
+    // "nothing new" would look like to any caller that did not already know
+    // its cursor was live.
+    const { issueId } = await seedMicrosecondCommentThread([
+      "2026-03-26T11:00:00.000123Z",
+    ]);
+
+    await expect(
+      svc.listComments(issueId, { afterCommentId: randomUUID(), order: "asc", limit: 50 }),
+    ).rejects.toMatchObject({
+      status: 400,
+      details: { code: "after_cursor_not_found" },
+    });
+  });
+
+  it("refuses an after cursor belonging to a different issue", async () => {
+    // Scoped to the thread, not just to the table: a cursor from another issue
+    // is as unusable as one that does not exist, and answering `[]` for it
+    // would reintroduce the same silent all-clear on a cross-thread mix-up.
+    const { issueId } = await seedMicrosecondCommentThread([
+      "2026-03-26T11:00:00.000123Z",
+    ]);
+    const other = await seedMicrosecondCommentThread(["2026-03-26T11:00:00.000123Z"]);
+
+    await expect(
+      svc.listComments(issueId, {
+        afterCommentId: other.commentIds[0],
+        order: "asc",
+        limit: 50,
+      }),
+    ).rejects.toMatchObject({
+      status: 400,
+      details: { code: "after_cursor_not_found" },
+    });
+  });
+
+  it("accepts a deleted comment's id as a cursor", async () => {
+    // PEN-4458 filed this as the untested case most likely to bite in the
+    // wild: poll, anchored on a comment, and the comment gets deleted. A
+    // deleted comment is redacted rather than removed, so the row survives and
+    // the cursor keeps resolving -- polling does not silently go dark. If
+    // deletion ever becomes a hard delete, this test is the one that should
+    // fail and force the cursor contract to be restated.
+    const { issueId, commentIds } = await seedMicrosecondCommentThread([
+      "2026-03-26T11:00:00.000123Z",
+      "2026-03-26T12:00:00.000456Z",
+    ]);
+    const [anchorCommentId, laterCommentId] = commentIds;
+
+    await db
+      .update(issueComments)
+      .set({ deletedAt: new Date("2026-03-26T13:00:00.000Z"), deletedByType: "user" })
+      .where(eq(issueComments.id, anchorCommentId));
+
+    const comments = await svc.listComments(issueId, {
+      afterCommentId: anchorCommentId,
+      order: "asc",
+      limit: 50,
+    });
+
+    expect(comments.map((comment) => comment.id)).toEqual([laterCommentId]);
+  });
+
   it("lists user comments when derived run attribution scans a timestamp window", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();

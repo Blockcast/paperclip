@@ -152,7 +152,7 @@ import {
 import type { TaskWatchdogServiceDeps, taskWatchdogService } from "../services/task-watchdogs.js";
 import { logger } from "../middleware/logger.js";
 import { urlForLog } from "../middleware/http-log-policy.js";
-import { conflict, forbidden, HttpError, notFound, unauthorized, unprocessable } from "../errors.js";
+import { badRequest, conflict, forbidden, HttpError, notFound, unauthorized, unprocessable } from "../errors.js";
 import { actorCanReadAgentConfig, assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import {
   assertNoAgentHostWorkspaceCommandMutation,
@@ -8874,6 +8874,15 @@ export function issueRoutes(
       return;
     }
     if (afterId !== undefined) {
+      // PEN-4458 audited every `after`-shaped cursor in the API and this one is
+      // already correct, for a structural reason worth keeping written down:
+      // it compares the cursor UUID *directly* against `issues.id` rather than
+      // looking an anchor row up and re-binding its columns. So it has neither
+      // of the comment cursor's defects -- no timestamp to lose precision on,
+      // and no unknown-cursor case to confuse with an empty page, because an id
+      // matching no row is a perfectly well-defined lower bound here. The
+      // malformed-input refusal below is the only part that was ever shared,
+      // and it already exists; do not "align" this with the comment route.
       if (typeof afterId !== "string" || !isUuidLike(afterId.trim())) {
         res.status(400).json({ error: "afterId must be an issue UUID" });
         return;
@@ -14815,6 +14824,17 @@ export function issueRoutes(
         : typeof req.query.afterCommentId === "string" && req.query.afterCommentId.trim().length > 0
           ? req.query.afterCommentId.trim()
           : null;
+    // PEN-4458: `after` reaches a `uuid` column, so a non-UUID value used to
+    // surface as a bare `500 Internal server error` from Postgres `22P02` --
+    // a caller mistake reported as a server fault, with nothing naming the
+    // offending parameter. Refuse it here with the same `after_cursor_*` code
+    // family the service uses for a well-formed-but-unknown cursor.
+    if (afterCommentId !== null && !isUuidLike(afterCommentId)) {
+      throw badRequest("after must be a comment UUID", {
+        code: "after_cursor_malformed",
+        after: afterCommentId,
+      });
+    }
     const order =
       typeof req.query.order === "string" && req.query.order.trim().toLowerCase() === "asc"
         ? "asc"

@@ -213,8 +213,17 @@ const searchIssuesSchema = listIssuesSchema.omit({ q: true }).extend({
 
 const listCommentsSchema = z.object({
   issueId: issueIdSchema,
-  after: z.string().uuid().optional(),
-  order: z.enum(["asc", "desc"]).optional(),
+  after: z
+    .string()
+    .uuid()
+    .optional()
+    .describe(
+      "Keyset cursor: return only comments STRICTLY AFTER this comment id, in the direction `order` selects. The cursor comment itself is never included, so `0 rows` means 'no replies since that comment' and nothing else. PEN-4458: before 2026-10-21 this was INCLUSIVE in `order: asc` and exclusive in `order: desc`, so the cursor comment came back at the head of every ascending page and `replies = rows - 1` was the only correct reading; if you carry logic that subtracts the self row, drop it. An `after` that names no comment on this issue is now refused 400 `code: after_cursor_not_found` rather than answered with an empty array -- an empty array previously meant 'your cursor is wrong' and was byte-identical to the all-clear, so a stale or truncated cursor reported a permanent, confident 'nobody has replied'. A non-UUID value is refused 400 `code: after_cursor_malformed` (it used to 500). A DELETED comment's id remains a valid cursor: the row survives deletion and is only redacted, so polling does not break when the comment you anchored on is removed.",
+    ),
+  order: z
+    .enum(["asc", "desc"])
+    .optional()
+    .describe("Chronological direction, applied to both the page order and the `after` cursor. Defaults to `desc` (newest first), so pair `after` with `order: asc` for the usual 'what arrived since my comment' poll."),
   limit: z.number().int().positive().max(500).optional(),
 });
 
@@ -560,7 +569,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipListComments",
-      "List issue comments with incremental options",
+      "List issue comments, oldest- or newest-first, optionally from a keyset cursor. The `after` cursor is EXCLUSIVE in both orders -- see its parameter description for the semantics and for what changed in PEN-4458.",
       listCommentsSchema,
       async ({ issueId, after, order, limit }) => {
         const params = new URLSearchParams();

@@ -2080,8 +2080,33 @@ registry.registerPath({
   path: "/api/issues/{id}/comments",
   tags: ["issues"],
   summary: "List issue comments",
-  request: { params: z.object({ id: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  request: {
+    params: z.object({ id: z.string() }),
+    // PEN-4458: this route always accepted `after`/`order`/`limit` and
+    // documented none of them, which is how an inclusive-in-`asc`,
+    // exclusive-in-`desc` cursor went unnoticed. Declared here so the
+    // exclusivity and the two refusal codes are part of the contract.
+    query: z.object({
+      after: z
+        .string()
+        .uuid()
+        .optional()
+        .describe(
+          "Keyset cursor. Returns only comments strictly after this comment id in the `order` direction; the cursor comment itself is never included, so zero rows means 'nothing since that comment'. Refused 400 `after_cursor_malformed` if not a UUID, and 400 `after_cursor_not_found` if it names no comment on this issue. A deleted comment's id stays a valid cursor.",
+        ),
+      afterCommentId: z
+        .string()
+        .uuid()
+        .optional()
+        .describe("Legacy spelling of `after`; `after` wins when both are sent."),
+      order: z
+        .enum(["asc", "desc"])
+        .optional()
+        .describe("Page and cursor direction. Defaults to `desc`."),
+      limit: z.coerce.number().int().positive().optional().describe("Page size, clamped server-side."),
+    }),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
 registry.registerPath({
