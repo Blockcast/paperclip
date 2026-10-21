@@ -430,6 +430,11 @@ describe("agent instructions bundle routes", () => {
     );
   });
 
+  // The model id is incidental to what this asserts, so it is the CLI alias
+  // rather than a versioned id: PEN-4447 made `claude_local` refuse ids it
+  // does not register, and this fixture's previous `claude-sonnet-4` was one
+  // (Sonnet 4 is spelled `claude-sonnet-4-0`). An alias cannot age out of the
+  // registry the way a versioned id can, so do not "fix" it back to one.
   it("preserves managed instructions config when switching adapters", async () => {
     mockAgentService.getById.mockResolvedValue({
       ...makeAgent(),
@@ -448,7 +453,7 @@ describe("agent instructions bundle routes", () => {
       .send({
         adapterType: "claude_local",
         adapterConfig: {
-          model: "claude-sonnet-4",
+          model: "sonnet",
         },
       }));
 
@@ -458,7 +463,7 @@ describe("agent instructions bundle routes", () => {
       expect.objectContaining({
         adapterType: "claude_local",
         adapterConfig: expect.objectContaining({
-          model: "claude-sonnet-4",
+          model: "sonnet",
           instructionsBundleMode: "managed",
           instructionsRootPath: "/tmp/agent-1",
           instructionsEntryFile: "AGENTS.md",
@@ -479,7 +484,7 @@ describe("agent instructions bundle routes", () => {
       ...makeAgent(),
       adapterType: "claude_local",
       adapterConfig: {
-        model: "claude-sonnet-4",
+        model: "sonnet",
         paperclipSkillSync: { desiredSkills: ["research", "code-review"] },
       },
     });
