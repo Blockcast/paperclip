@@ -204,6 +204,13 @@ export async function bumpAgentImagesForCompany(
 export async function processPendingImageBumpForAgent(
   db: Db,
   agentId: string,
+  opts: {
+    /**
+     * Skip the executing check. Only for the dispatcher, which holds the agent
+     * start lock so nothing can launch the old image after the PATCH (BLO-42411).
+     */
+    applyWhileExecuting?: boolean;
+  } = {},
 ): Promise<void> {
   const [row] = await db
     .select({ pending: agents.pendingImageBump, adapterConfig: agents.adapterConfig })
@@ -221,7 +228,7 @@ export async function processPendingImageBumpForAgent(
     return;
   }
 
-  if (await isAgentExecuting(db, agentId)) {
+  if (!opts.applyWhileExecuting && (await isAgentExecuting(db, agentId))) {
     logger.info({ agentId }, "pending image bump deferred; a run is actively executing");
     return;
   }

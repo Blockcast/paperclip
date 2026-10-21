@@ -3568,7 +3568,10 @@ export const KNOWN_DISPATCH_DECLINE_REASONS = [
   "untracked_external_job",
   /** No free slot. Paired with {@link CONCURRENT_RUN_BLOCKED_METRIC}. */
   "no_available_slots",
-  /** A pending image bump is draining the agent's slots before it applies. */
+  /**
+   * Retired by BLO-42411 (the dispatcher now applies the bump instead of
+   * draining slots). Kept so historical series still normalize.
+   */
   "pending_image_bump",
   /**
    * A bounded critical-lane pass is still walking; lower lanes wait.
