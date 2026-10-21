@@ -2776,6 +2776,16 @@ export async function startServer(): Promise<StartedServer> {
     );
   }
 
+  // Terminal-run pod-log sweeper (BLO-48193). Worker-tier singleton. Reaps
+  // `<runId>.pod.ndjson` the adapter never unlinked because its owner died
+  // (restart, eviction, OOM). Default-on: it deletes only files the adapter
+  // would itself have deleted, and only those written after its backlog
+  // cutoff — see the module header for the three gates.
+  if (config.paperclipNodeRole !== "api") {
+    const { startPodLogSweeper } = await import("./services/pod-log-sweeper.js");
+    superviseLeased("pod-log-sweeper", () => startPodLogSweeper(db as any, 60 * 60 * 1000));
+  }
+
   // Human-gated ageing digest (BLO-29420). Worker-tier singleton. BLO-19130's
   // ageing module shipped as 683 lines of tested pure functions with zero
   // production importers, so the escalation it describes had never fired once;
