@@ -2834,6 +2834,10 @@ function toCompactIssue(issue: any): CompactIssue {
     parentId: issue.parentId,
     title: issue.title,
     description: issue.description,
+    // PEN-4450: emitted unconditionally, never spread-on-truthy. An absent key has to
+    // mean "server predates this field", so that a caller can tell deploy skew from a
+    // genuine `false`; a conditional spread would collide the two.
+    descriptionTruncated: issue.descriptionTruncated === true,
     status: issue.status,
     workMode: issue.workMode,
     priority: issue.priority,

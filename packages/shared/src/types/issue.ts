@@ -959,6 +959,18 @@ export type CompactIssue = Pick<
   | "createdAt"
   | "updatedAt"
 > & {
+  /**
+   * PEN-4450: `true` when the stored description is longer than the list projection's
+   * character cap, so `description` here is a prefix. Always present on a list row — an
+   * ABSENT key means the server predates this field and the question is unanswerable
+   * from this response, which is not the same as `false`. Read the row with
+   * `GET /api/issues/:id` to get the whole description.
+   *
+   * It describes the STORED column. On a blocked-inbox row whose description was also
+   * redacted, both claims hold independently: text was removed from within the prefix
+   * AND there is more text past it.
+   */
+  descriptionTruncated?: boolean;
   labelIds?: string[];
   labels?: IssueLabel[];
   blockedBy?: IssueRelationIssueSummary[];
