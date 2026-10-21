@@ -2107,7 +2107,7 @@ async function inspectGitWorktreeBranchIncoherence(input: {
         : "worktree is not clean"
       : !registered
         ? !registeredWorktrees && directRegistration === null
-          ? `could not enumerate worktrees within ${WORKTREE_RECLAIM_GIT_TIMEOUT_MS / 1000}s and the direct registration read stalled, so registration is unknown`
+          ? `could not enumerate worktrees (list failed or exceeded ${WORKTREE_RECLAIM_GIT_TIMEOUT_MS / 1000}s) and the direct registration read stalled, so registration is unknown`
           : "worktree path is not registered"
       : !registeredBranchMatchesHead
         ? "registered worktree branch does not match HEAD"
@@ -2124,8 +2124,10 @@ async function inspectGitWorktreeBranchIncoherence(input: {
               workspaceClaimants,
               workspaceClaimantLookup.status === "ok" && workspaceClaimantLookup.truncated,
             )
-            : !registeredWorktrees
-              ? `could not enumerate worktrees within ${WORKTREE_RECLAIM_GIT_TIMEOUT_MS / 1000}s, so whether another worktree holds the recorded branch is unknown`
+            // Only the diverged arm needs the listing; label it only when that
+            // arm's other preconditions hold.
+            : !registeredWorktrees && actualBranchExists === true && ancestryVerdict !== "ancestor" && !sameHead
+              ? `could not enumerate worktrees (list failed or exceeded ${WORKTREE_RECLAIM_GIT_TIMEOUT_MS / 1000}s), so whether another worktree holds the recorded branch is unknown`
             : expectedBranchHeldByOtherWorktree
               ? `recorded branch is already checked out in another worktree at ${expectedBranchWorktreePath}`
               : !sameHead
