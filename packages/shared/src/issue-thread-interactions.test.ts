@@ -3,6 +3,14 @@ import {
   acceptIssueThreadInteractionSchema,
   askUserQuestionsResultSchema,
   createIssueThreadInteractionSchema,
+  askUserQuestionsPayloadSchema,
+  INTERACTION_PAYLOAD_KNOWN_KEYS,
+  INTERACTION_PAYLOAD_UNRECOGNIZED_KEYS_NOTE,
+  MAX_REPORTED_UNRECOGNIZED_PAYLOAD_KEYS,
+  requestCheckboxConfirmationPayloadSchema,
+  requestItemVerdictsPayloadSchema,
+  suggestTasksPayloadSchema,
+  unrecognizedInteractionPayloadKeys,
   requestConfirmationPayloadSchema,
   requestConfirmationResultSchema,
   submitIssueThreadInteractionVerdictsSchema,
@@ -458,5 +466,140 @@ describe("issue thread interaction schemas", () => {
         { id: "api", verdict: "reject", reason: "Needs revision" },
       ],
     })).toThrow("verdict item ids must be unique");
+  });
+});
+
+// PEN-4445. An interaction payload carrying a key the server does not know is
+// silently stripped and returns 201. The ruling keeps that lenient parse --
+// refusing the create during a tool-schema-ahead-of-server window would mean
+// the human-decision card is never filed at all, and for a `toolAction` card
+// that card IS the approval gate in front of a destructive tool call. What
+// changes is that the drop is reported instead of silent.
+describe("unrecognized interaction payload keys (PEN-4445)", () => {
+  it("names a top-level key the payload schema does not know", () => {
+    expect(unrecognizedInteractionPayloadKeys("request_confirmation", {
+      version: 1,
+      prompt: "Merge it?",
+      expectedOutcome: { kind: "github_pr_merged", ref: { repoFullName: "o/r", prNumber: 1 } },
+    })).toEqual([]);
+
+    // The measured instance: a field this build DOES know, against a build that
+    // does not. Simulated with a name no schema will ever carry.
+    expect(unrecognizedInteractionPayloadKeys("request_confirmation", {
+      version: 1,
+      prompt: "Merge it?",
+      somethingThisServerPredates: { kind: "github_pr_merged" },
+    })).toEqual(["somethingThisServerPredates"]);
+  });
+
+  it("reports nothing when every key is recognized", () => {
+    expect(unrecognizedInteractionPayloadKeys("request_confirmation", {
+      version: 1,
+      prompt: "Merge it?",
+      acceptLabel: "Merge",
+      supersedeOnUserComment: false,
+      expectedOutcome: null,
+    })).toEqual([]);
+  });
+
+  it("catches a misspelled key, which is the typo half of the signal", () => {
+    expect(unrecognizedInteractionPayloadKeys("request_confirmation", {
+      version: 1,
+      prompt: "Merge it?",
+      expectedOutcom: { kind: "github_pr_merged" },
+    })).toEqual(["expectedOutcom"]);
+  });
+
+  // The known-key table is derived from the union rather than hand-listed, and
+  // a kind it cannot unwrap is ABSENT from it so that the report stays silent
+  // rather than naming every key of a valid payload as dropped. That fail-safe
+  // would hide a newly added kind losing coverage entirely, so pin the cover.
+  it("derives known keys for every member of the create union", () => {
+    const unionKinds = createIssueThreadInteractionSchema.options
+      .map((option) => (option.shape.kind as { _def: { value: string } })._def.value);
+    expect(unionKinds.length).toBeGreaterThan(0);
+    for (const kind of unionKinds) {
+      const known = INTERACTION_PAYLOAD_KNOWN_KEYS.get(kind);
+      expect(known, `no derived payload keys for kind ${kind}`).toBeDefined();
+      expect(known!.size, `empty payload key set for kind ${kind}`).toBeGreaterThan(0);
+    }
+  });
+
+  it("derives the keys the parser actually keeps, for each kind", () => {
+    // Spot-check against the parse rather than against a second hand-written
+    // list: a list would drift the same way the table could.
+    expect(INTERACTION_PAYLOAD_KNOWN_KEYS.get("request_confirmation")).toContain("expectedOutcome");
+    expect(INTERACTION_PAYLOAD_KNOWN_KEYS.get("request_confirmation")).toContain("toolAction");
+    expect(INTERACTION_PAYLOAD_KNOWN_KEYS.get("request_checkbox_confirmation")).toContain("options");
+    expect(INTERACTION_PAYLOAD_KNOWN_KEYS.get("suggest_tasks")).toContain("tasks");
+    expect(INTERACTION_PAYLOAD_KNOWN_KEYS.get("ask_user_questions")).toContain("questions");
+    expect(INTERACTION_PAYLOAD_KNOWN_KEYS.get("request_item_verdicts")).toContain("items");
+  });
+
+  // Called on raw, unvalidated request bodies from the request path, so it must
+  // never throw. Every uncertain case under-reports rather than claiming a key
+  // was dropped when it was not.
+  it("is total over garbage input", () => {
+    for (const payload of [null, undefined, 42, "nope", [], [{ a: 1 }]]) {
+      expect(unrecognizedInteractionPayloadKeys("request_confirmation", payload)).toEqual([]);
+    }
+    expect(unrecognizedInteractionPayloadKeys("not_a_kind", { surprise: 1 })).toEqual([]);
+    expect(unrecognizedInteractionPayloadKeys(undefined, { surprise: 1 })).toEqual([]);
+    expect(unrecognizedInteractionPayloadKeys(7, { surprise: 1 })).toEqual([]);
+  });
+
+  it("bounds how many dropped keys one response reports", () => {
+    const payload: Record<string, unknown> = { version: 1, prompt: "x" };
+    for (let i = 0; i < MAX_REPORTED_UNRECOGNIZED_PAYLOAD_KEYS * 3; i += 1) {
+      payload[`k${String(i).padStart(3, "0")}`] = i;
+    }
+    const reported = unrecognizedInteractionPayloadKeys("request_confirmation", payload);
+    expect(reported).toHaveLength(MAX_REPORTED_UNRECOGNIZED_PAYLOAD_KEYS);
+    // Sorted, so the cap is deterministic rather than insertion-ordered.
+    expect(reported).toEqual([...reported].sort());
+  });
+
+  // "Be strict about the meaning of what you understand; be loud, not fatal,
+  // about what you do not." The lenient envelope must not have relaxed the
+  // strict interior PEN-4409 Amendment 1 demanded.
+  it("leaves expectedOutcome's internal strictness alone", () => {
+    expect(() => createIssueThreadInteractionSchema.parse({
+      kind: "request_confirmation",
+      payload: {
+        version: 1,
+        prompt: "Merge it?",
+        expectedOutcome: { kind: "a_kind_that_does_not_exist", ref: {} },
+      },
+    })).toThrow();
+
+    expect(() => createIssueThreadInteractionSchema.parse({
+      kind: "request_confirmation",
+      payload: {
+        version: 1,
+        prompt: "Merge it?",
+        expectedOutcome: {
+          kind: "github_pr_merged",
+          ref: { repoFullName: "https://github.com/o/r", prNumber: 1 },
+        },
+      },
+    })).toThrow();
+  });
+
+  // The `.describe()` text is the only channel the filing agent reads: the MCP
+  // tool definitions reuse these payload schemas verbatim, so the description
+  // becomes the `payload` property's description in the tool's JSON schema.
+  it("tells the filing agent, on every payload schema, that unknown keys are dropped", () => {
+    const schemas = {
+      suggestTasksPayloadSchema,
+      askUserQuestionsPayloadSchema,
+      requestConfirmationPayloadSchema,
+      requestCheckboxConfirmationPayloadSchema,
+      requestItemVerdictsPayloadSchema,
+    };
+    for (const [name, schema] of Object.entries(schemas)) {
+      expect(schema.description, `${name} carries no unknown-key note`)
+        .toBe(INTERACTION_PAYLOAD_UNRECOGNIZED_KEYS_NOTE);
+    }
+    expect(INTERACTION_PAYLOAD_UNRECOGNIZED_KEYS_NOTE).toContain("unrecognizedPayloadKeys");
   });
 });

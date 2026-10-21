@@ -1181,6 +1181,64 @@ export const ACCEPTED_INTERACTION_OUTCOME_RECENT_METRIC =
   "paperclip_accepted_interaction_outcome_recent_count";
 export const ACCEPTED_INTERACTION_OUTCOME_METRICS_REFRESH_SUCCESS_METRIC =
   "paperclip_accepted_interaction_outcome_metrics_refresh_success";
+
+/**
+ * Interaction payload keys this server did not recognise and therefore dropped
+ * (PEN-4445).
+ *
+ * Interaction payload schemas parse leniently — zod strips an unknown key and
+ * returns `200` — and that is deliberate: "tool schema ahead of server" is the
+ * default state after any interaction schema change, and refusing the create
+ * during that window would mean the human-decision card is never filed at all.
+ * The create response names the dropped keys back to the caller, but that half
+ * only helps a caller that reads the field. This counter is the half that does
+ * not depend on anyone's diligence: it makes fleet-wide skew visible here
+ * instead of waiting for someone to compare two payloads by hand, which is how
+ * the original instance was actually found.
+ *
+ * Read a non-zero value as EITHER a deploy skew (agents carrying a newer tool
+ * schema than this server) OR a misspelled key — the two are indistinguishable
+ * from here, and both are worth the same look. `payload_key` is the field name
+ * that evaporated, which is what makes the distinction cheap for a human.
+ */
+export const INTERACTION_PAYLOAD_UNRECOGNIZED_KEY_METRIC =
+  "paperclip_interaction_payload_unrecognized_key_total";
+
+/**
+ * Shape a dropped key must have to be published as a `payload_key` label
+ * value.
+ *
+ * The label value is chosen by the caller — that is the entire point of the
+ * metric — so it crosses a trust boundary, and prom-client never retires a
+ * label combination. Anything that is not identifier-shaped is published as
+ * {@link UNRECOGNIZED_PAYLOAD_KEY_MALFORMED} rather than verbatim: a real
+ * dropped field name is always identifier-shaped (it came from someone's
+ * schema), so this costs the signal nothing while keeping control characters,
+ * newlines and JSON injected through a key name out of the exposition.
+ */
+const UNRECOGNIZED_PAYLOAD_KEY_REGEX = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
+
+/** Published for a dropped key whose name is not identifier-shaped. */
+export const UNRECOGNIZED_PAYLOAD_KEY_MALFORMED = "_malformed";
+
+/**
+ * Published once the distinct-key budget is spent, so the counter keeps
+ * counting while its series count stops growing.
+ */
+export const UNRECOGNIZED_PAYLOAD_KEY_OVERFLOW = "_overflow";
+
+/**
+ * Ceiling on distinct `payload_key` values this process will ever publish.
+ *
+ * The honest expected cardinality is tiny — a skew window drops the one or two
+ * fields a schema change added — so a budget of 50 is far above any legitimate
+ * steady state, and reaching it is itself a signal that something is
+ * generating key names rather than carrying a newer schema. Degrading to
+ * {@link UNRECOGNIZED_PAYLOAD_KEY_OVERFLOW} keeps the `interaction_kind`
+ * breakdown and the total intact; only the per-key split is lost, which is the
+ * right thing to give up because the total is what an alert thresholds.
+ */
+const UNRECOGNIZED_PAYLOAD_KEY_BUDGET = 50;
 /**
  * How long each currently-held per-agent start lock has been held (PEN-3305).
  *
@@ -3928,6 +3986,7 @@ let acceptedInteractionOutcome: Gauge<"bucket"> | null = null;
 let acceptedInteractionOutcomeOldestAge: Gauge<"bucket"> | null = null;
 let acceptedInteractionOutcomeRecent: Gauge<"bucket"> | null = null;
 let acceptedInteractionOutcomeMetricsRefreshSuccess: Gauge | null = null;
+let interactionPayloadUnrecognizedKey: Counter<"interaction_kind" | "payload_key"> | null = null;
 let agentStartLockHeldSeconds: Gauge<"agent_id"> | null = null;
 let agentStartLockPhaseSeconds: Gauge<"agent_id" | "phase"> | null = null;
 let agentStartLockAbortedTotal: Counter<"agent_id"> | null = null;
@@ -4161,6 +4220,7 @@ function ensureRegistry(): {
   acceptedInteractionOutcomeOldestAgeGauge: Gauge<"bucket">;
   acceptedInteractionOutcomeRecentGauge: Gauge<"bucket">;
   acceptedInteractionOutcomeMetricsRefreshSuccessGauge: Gauge;
+  interactionPayloadUnrecognizedKeyCounter: Counter<"interaction_kind" | "payload_key">;
   agentStartLockHeldSecondsGauge: Gauge<"agent_id">;
   agentStartLockPhaseSecondsGauge: Gauge<"agent_id" | "phase">;
   agentStartLockAbortedTotalCounter: Counter<"agent_id">;
@@ -4244,6 +4304,7 @@ function ensureRegistry(): {
     || !acceptedInteractionOutcomeOldestAge
     || !acceptedInteractionOutcomeRecent
     || !acceptedInteractionOutcomeMetricsRefreshSuccess
+    || !interactionPayloadUnrecognizedKey
     || !approvalOldestPendingAge
     || !approvalLastDecisionTimestamp
     || !approvalQueueMetricsRefreshSuccess
@@ -5127,6 +5188,24 @@ function ensureRegistry(): {
       registers: [registry],
     });
     acceptedInteractionOutcomeMetricsRefreshSuccess.set(0);
+    interactionPayloadUnrecognizedKey = new Counter({
+      name: INTERACTION_PAYLOAD_UNRECOGNIZED_KEY_METRIC,
+      help:
+        "Count of top-level interaction payload keys this server did not recognise and "
+        + "therefore DROPPED while still creating the card (PEN-4445). Lenient parsing is "
+        + "deliberate -- rejecting the create during a tool-schema-ahead-of-server window "
+        + "would mean the human-decision card is never filed at all -- so this counter, not a "
+        + "4xx, is how that skew becomes visible. A non-zero value is EITHER agents carrying a "
+        + "newer tool schema than this deployment OR a misspelled field name; the two are "
+        + "indistinguishable from here and both deserve the same look. payload_key is the "
+        + "field that evaporated. payload_key='" + UNRECOGNIZED_PAYLOAD_KEY_MALFORMED + "' is a "
+        + "key name that was not identifier-shaped, and '" + UNRECOGNIZED_PAYLOAD_KEY_OVERFLOW
+        + "' is this process past its distinct-key budget -- in both cases the count is still "
+        + "real and only the per-key split is lost. Counted once the card is CREATED, so a "
+        + "rejected or unauthorized request contributes nothing.",
+      labelNames: ["interaction_kind", "payload_key"],
+      registers: [registry],
+    });
     processLostTotal = new Counter({
       name: PROCESS_LOST_TOTAL_METRIC,
       help:
@@ -6336,6 +6415,7 @@ function ensureRegistry(): {
     acceptedInteractionOutcomeOldestAgeGauge: acceptedInteractionOutcomeOldestAge,
     acceptedInteractionOutcomeRecentGauge: acceptedInteractionOutcomeRecent,
     acceptedInteractionOutcomeMetricsRefreshSuccessGauge: acceptedInteractionOutcomeMetricsRefreshSuccess,
+    interactionPayloadUnrecognizedKeyCounter: interactionPayloadUnrecognizedKey,
     agentStartLockHeldSecondsGauge: agentStartLockHeldSeconds,
     agentStartLockPhaseSecondsGauge: agentStartLockPhaseSeconds,
     agentStartLockAbortedTotalCounter: agentStartLockAbortedTotal,
@@ -7716,6 +7796,70 @@ export function setAcceptedInteractionOutcomeMetrics(input: {
 }
 
 /** Mark whether the accepted-interaction outcome sweep completed. */
+/**
+ * Distinct `payload_key` label values this process has already published.
+ *
+ * Kept alongside the counter rather than derived from the registry because
+ * prom-client offers no cheap "how many children does this counter have"
+ * read, and the budget check sits on the request path. Cleared by
+ * {@link __resetMetricsForTest} so a test that exercises the budget does not
+ * leak its exhaustion into the next one.
+ */
+const publishedUnrecognizedPayloadKeys = new Set<string>();
+
+/**
+ * Coerce one dropped key name into a bounded `payload_key` label value.
+ *
+ * Two independent bounds, because they fail differently. The SHAPE bound keeps
+ * a key name that is not identifier-shaped out of the exposition entirely:
+ * prom-client escapes only `\`, `\n` and `"`, so every other control
+ * character reaches the scraper verbatim, and this value is caller-chosen. The
+ * BUDGET bound keeps the series count finite: prom-client never retires a
+ * label combination, so without it one caller generating key names would grow
+ * this metric for the process lifetime.
+ *
+ * Both degrade to a reserved value rather than dropping the observation. The
+ * count is the part an alert thresholds and it stays exact either way; only
+ * the per-key breakdown is given up, and only for the keys that forced it.
+ */
+function unrecognizedPayloadKeyLabel(key: string): string {
+  if (!UNRECOGNIZED_PAYLOAD_KEY_REGEX.test(key)) return UNRECOGNIZED_PAYLOAD_KEY_MALFORMED;
+  if (publishedUnrecognizedPayloadKeys.has(key)) return key;
+  if (publishedUnrecognizedPayloadKeys.size >= UNRECOGNIZED_PAYLOAD_KEY_BUDGET) {
+    return UNRECOGNIZED_PAYLOAD_KEY_OVERFLOW;
+  }
+  publishedUnrecognizedPayloadKeys.add(key);
+  return key;
+}
+
+/**
+ * Record the top-level payload keys an interaction create dropped (PEN-4445).
+ *
+ * Call this only AFTER the card has actually been created. A request that was
+ * refused by authorization or by validation says nothing about schema skew,
+ * and counting it would let an unauthorized caller write into the series.
+ *
+ * Returns the published label values so a caller — in practice the test — can
+ * assert what landed on the metric without re-deriving the coercion.
+ */
+export function recordUnrecognizedInteractionPayloadKeys(
+  interactionKind: string,
+  keys: readonly string[],
+): Array<{ interaction_kind: string; payload_key: string }> {
+  if (keys.length === 0) return [];
+  const counter = ensureRegistry().interactionPayloadUnrecognizedKeyCounter;
+  const recorded: Array<{ interaction_kind: string; payload_key: string }> = [];
+  for (const key of keys) {
+    const labels = {
+      interaction_kind: interactionKind,
+      payload_key: unrecognizedPayloadKeyLabel(key),
+    };
+    counter.inc(labels);
+    recorded.push(labels);
+  }
+  return recorded;
+}
+
 export function setAcceptedInteractionOutcomeMetricsRefreshSuccess(success: boolean): void {
   ensureRegistry().acceptedInteractionOutcomeMetricsRefreshSuccessGauge.set(success ? 1 : 0);
 }
@@ -9008,6 +9152,8 @@ export async function renderMetrics(): Promise<{ contentType: string; body: stri
 /** Test-only: drop the registry so each test starts from a clean counter. */
 export function __resetMetricsForTest(): void {
   registry = null;
+  interactionPayloadUnrecognizedKey = null;
+  publishedUnrecognizedPayloadKeys.clear();
   executionWorkspaceTeardown = null;
   executionWorkspaceTeardownDuration = null;
   executionWorkspaceCollectorScanned = null;

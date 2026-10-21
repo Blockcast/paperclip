@@ -34,6 +34,7 @@ import {
   companySearchQuerySchema,
   createIssueAttachmentMetadataSchema,
   createIssueThreadInteractionSchema,
+  unrecognizedInteractionPayloadKeys,
   createIssueWorkProductSchema,
   createIssueLabelSchema,
   createAcceptedPlanDecompositionSchema,
@@ -107,6 +108,7 @@ import { trackAgentTaskCompleted } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import type { StorageService } from "../storage/types.js";
 import { validate } from "../middleware/validate.js";
+import { recordUnrecognizedInteractionPayloadKeys } from "../services/metrics.js";
 import * as serviceIndex from "../services/index.js";
 import {
   accessService,
@@ -697,6 +699,26 @@ type SuccessfulRunHandoffActivityRow = {
 };
 type TaskWatchdogService = ReturnType<typeof taskWatchdogService>;
 type TaskWatchdogServiceFactory = typeof taskWatchdogService;
+
+/**
+ * Stash the top-level interaction payload keys this server does not recognise,
+ * before {@link validate} parses them away (PEN-4445).
+ *
+ * Order is the whole point: `validate()` assigns the PARSED body back over
+ * `req.body`, and zod has already stripped the unknown keys by then, so there
+ * is nothing left to diff downstream. This has to run first, on the raw body.
+ *
+ * It only measures. The metric is written from the handler after the card is
+ * actually created, so a request that fails authorization or validation --
+ * both of which happen after this point -- contributes nothing to the series.
+ */
+function captureUnrecognizedInteractionPayloadKeys(req: Request, res: Response, next: () => void) {
+  const body = req.body as { kind?: unknown; payload?: unknown } | undefined;
+  res.locals.unrecognizedInteractionPayloadKeys = body && typeof body === "object" && !Array.isArray(body)
+    ? unrecognizedInteractionPayloadKeys(body.kind, body.payload)
+    : [];
+  next();
+}
 
 function applyCreateIssueStatusDefault(req: Request, res: Response, next: () => void) {
   if (!req.body || typeof req.body !== "object" || Array.isArray(req.body)) {
@@ -14832,55 +14854,72 @@ export function issueRoutes(
     res.json(interactions);
   });
 
-  router.post("/issues/:id/interactions", validate(createIssueThreadInteractionSchema), async (req, res) => {
-    const id = req.params.id as string;
-    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
-    if (!issue) return;
-    if (req.actor.type === "agent") {
-      if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
-      if (await assertLowTrustControlPlaneDenied(req, res, issue.companyId, issue)) return;
-    } else {
-      assertBoard(req);
-    }
+  router.post(
+    "/issues/:id/interactions",
+    captureUnrecognizedInteractionPayloadKeys,
+    validate(createIssueThreadInteractionSchema),
+    async (req, res) => {
+      const unrecognizedPayloadKeys = (res.locals.unrecognizedInteractionPayloadKeys ?? []) as string[];
+      const id = req.params.id as string;
+      const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+      if (!issue) return;
+      if (req.actor.type === "agent") {
+        if (!(await assertAgentIssueMutationAllowed(req, res, issue))) return;
+        if (await assertLowTrustControlPlaneDenied(req, res, issue.companyId, issue)) return;
+      } else {
+        assertBoard(req);
+      }
 
-    const actor = getActorInfo(req);
-    const agentSourceRunId = req.actor.type === "agent" ? requireAgentRunId(req, res) : null;
-    if (req.actor.type === "agent" && !agentSourceRunId) return;
-    if (req.body.kind === "request_confirmation" && req.body.payload?.toolAction !== undefined) {
-      throw unprocessable("payload.toolAction is server-owned metadata and cannot be supplied when creating an interaction");
-    }
+      const actor = getActorInfo(req);
+      const agentSourceRunId = req.actor.type === "agent" ? requireAgentRunId(req, res) : null;
+      if (req.actor.type === "agent" && !agentSourceRunId) return;
+      if (req.body.kind === "request_confirmation" && req.body.payload?.toolAction !== undefined) {
+        throw unprocessable("payload.toolAction is server-owned metadata and cannot be supplied when creating an interaction");
+      }
 
-    const interaction = await issueThreadInteractionService(db).create(issue, {
-      ...req.body,
-      sourceRunId: req.actor.type === "agent" ? agentSourceRunId : req.body.sourceRunId ?? null,
-    }, {
-      agentId: actor.agentId,
-      userId: actor.actorType === "user" ? actor.actorId : null,
-    });
+      const interaction = await issueThreadInteractionService(db).create(issue, {
+        ...req.body,
+        sourceRunId: req.actor.type === "agent" ? agentSourceRunId : req.body.sourceRunId ?? null,
+      }, {
+        agentId: actor.agentId,
+        userId: actor.actorType === "user" ? actor.actorId : null,
+      });
 
-    await logActivity(db, {
-      companyId: issue.companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      agentApiKeyId: actor.agentApiKeyId,
-      action: "issue.thread_interaction_created",
-      entityType: "issue",
-      entityId: issue.id,
-      details: {
-        identifier: issue.identifier,
-        interactionId: interaction.id,
-        interactionKind: interaction.kind,
-        interactionStatus: interaction.status,
-        continuationPolicy: interaction.continuationPolicy,
-        title: interaction.title ?? null,
-        summary: interaction.summary ?? null,
-      },
-    });
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action: "issue.thread_interaction_created",
+        entityType: "issue",
+        entityId: issue.id,
+        details: {
+          identifier: issue.identifier,
+          interactionId: interaction.id,
+          interactionKind: interaction.kind,
+          interactionStatus: interaction.status,
+          continuationPolicy: interaction.continuationPolicy,
+          title: interaction.title ?? null,
+          summary: interaction.summary ?? null,
+        },
+      });
 
-    res.status(201).json(interaction);
-  });
+      // Counted here rather than at capture time, so the series only ever reflects
+      // requests that actually produced a card. Labelled by the CREATED card's kind,
+      // which a caller cannot steer independently of what the server honoured.
+      if (unrecognizedPayloadKeys.length > 0) {
+        recordUnrecognizedInteractionPayloadKeys(interaction.kind, unrecognizedPayloadKeys);
+      }
+      // Present on EVERY create, `[]` included. The absent-vs-empty distinction is
+      // load-bearing: an empty array says this server checked and dropped nothing, while
+      // the field missing entirely says the server predates PEN-4445 and can say nothing
+      // either way. Collapsing the two would leave the caller diffing payloads to find
+      // out, which is the thing this replaces.
+      res.status(201).json({ ...interaction, unrecognizedPayloadKeys });
+    },
+  );
 
   router.post(
     "/issues/:id/interactions/:interactionId/accept",

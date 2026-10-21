@@ -186,3 +186,48 @@ and is pruned once a PR leaves the open set — so an approval observed before a
 merge becomes unobservable after it, and the card would flip back to
 `unobserved` permanently. Add it when an approval record outlives the PR's open
 state, not before.
+
+## `paperclip_interaction_payload_unrecognized_key_total` (PEN-4445)
+
+Companion counter, no alert rule attached. It measures the *filing* side of the
+same family: how often an interaction payload carried a top-level key this
+server did not recognise and therefore dropped.
+
+Interaction payload schemas parse leniently — zod strips an unknown key and the
+create still returns `201`. That is deliberate and was ruled on rather than
+inherited. "Tool schema ahead of server" is the default state after any
+interaction schema change, because the MCP tool schema is vendored into the
+agent image while the handler rolls with `paperclip-api`; refusing the create
+during that window would mean the human-decision card is never filed at all,
+and for a `toolAction` card that card **is** the approval gate in front of a
+write/destructive tool call. A dropped annotation loses tracking; a rejected
+create loses the decision.
+
+What changed is that the drop is no longer silent:
+
+- `POST /issues/:id/interactions` returns `unrecognizedPayloadKeys` on every
+  `201`, `[]` included. An empty array means this server checked and dropped
+  nothing; the field being **absent** means the server predates PEN-4445 and
+  can tell you nothing either way. Do not collapse the two.
+- This counter records the same thing, labelled by `interaction_kind` and
+  `payload_key`, so skew is visible here even when no caller reads the list.
+
+Reading it:
+
+- **Non-zero on a key that matches a field in `packages/shared/src/validators/issue.ts`
+  on `master`** — deploy skew. Agents are carrying a newer tool schema than this
+  deployment. It clears itself on the next `paperclip-api` deploy (07:23 UTC
+  daily); nothing to do unless the key is one whose loss matters, in which case
+  the affected cards were filed without it and will not acquire it retroactively.
+- **Non-zero on a key that matches nothing** — a misspelling in the filing
+  agent's call. `expectedOutcom` for `expectedOutcome` is the worked example.
+  Fix the caller; the card itself is fine.
+- The two are indistinguishable from the metric alone, which is why
+  `payload_key` carries the field name: reading it answers the question.
+- `payload_key="_malformed"` is a key name that was not identifier-shaped, and
+  `"_overflow"` is this process past its 50-distinct-key budget. In both cases
+  the count is still exact and only the per-key split is lost. Either value
+  appearing at all is worth a look at *who* is calling, not at the schema.
+
+The counter is written only once the card has been created, so a request
+refused by authorization or validation contributes nothing.

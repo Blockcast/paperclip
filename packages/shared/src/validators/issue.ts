@@ -959,6 +959,42 @@ export const issueDocumentKeySchema = z
   .max(64)
   .regex(/^[a-z0-9][a-z0-9_-]*$/, "Document key must be lowercase letters, numbers, _ or -");
 
+/**
+ * Envelope-level note appended to every interaction payload schema (PEN-4445).
+ *
+ * These payload schemas are plain `z.object(...)`, and zod STRIPS unknown keys
+ * rather than refusing them. That behaviour is deliberate and is not being
+ * changed: "schema ahead of server" is the default state after any interaction
+ * schema change, because the MCP tool schema is vendored into the agent image
+ * while the handler rolls with `paperclip-api`. Refusing the create during that
+ * window would mean the card is never filed at all — and for
+ * `requestConfirmationToolActionPayloadSchema`, the card IS the human approval
+ * gate in front of a write/destructive tool call, so a version skew would get
+ * to decide whether an approval gate exists. Losing an annotation is cheaper
+ * than losing the decision.
+ *
+ * What changes instead is that the drop stops being silent. The only signal a
+ * caller had was an *absence* it would have to diff the echoed payload for,
+ * which is why the stripping went unnoticed until an executive compared two
+ * payloads by hand (PEN-4409). {@link unrecognizedInteractionPayloadKeys} turns
+ * that absence into an affirmative list on the create response, and the server
+ * counts it at `/metrics` so fleet-wide skew is visible without anyone probing.
+ *
+ * This text is in a `.describe()` because that is the only channel the filing
+ * agent reads: the MCP tool definitions reuse these payload schemas verbatim
+ * (`packages/mcp-server/src/tools.ts`), so the description becomes the
+ * `payload` property's description in the tool's JSON schema. Same channel
+ * `expectedOutcome` and `supersedeOnUserComment` use.
+ */
+export const INTERACTION_PAYLOAD_UNRECOGNIZED_KEYS_NOTE =
+  "Unknown top-level keys here are DROPPED, not rejected: the ask still lands, so a tool "
+  + "schema newer than the server loses the annotation but never the decision. The create "
+  + "response reports what was dropped in `unrecognizedPayloadKeys` — read that back rather "
+  + "than diffing the echoed payload, and treat a non-empty list as either 'this server does "
+  + "not know that field yet' or 'you misspelled it'. An empty list means nothing was "
+  + "dropped; the field being ABSENT from the response means the server predates this report "
+  + "and can tell you nothing either way. (PEN-4445)";
+
 export const suggestedTaskDraftSchema = z.object({
   clientKey: z.string().trim().min(1).max(120),
   parentClientKey: z.string().trim().min(1).max(120).nullable().optional(),
@@ -1001,8 +1037,7 @@ export const suggestTasksPayloadSchema = z.object({
     }
     seenClientKeys.add(task.clientKey);
   }
-});
-
+}).describe(INTERACTION_PAYLOAD_UNRECOGNIZED_KEYS_NOTE);
 export const suggestTasksResultCreatedTaskSchema = z.object({
   clientKey: z.string().trim().min(1).max(120),
   issueId: z.string().uuid(),
@@ -1079,8 +1114,7 @@ export const askUserQuestionsPayloadSchema = z.object({
       seenOptionIds.add(option.id);
     }
   }
-});
-
+}).describe(INTERACTION_PAYLOAD_UNRECOGNIZED_KEYS_NOTE);
 export const askUserQuestionsAnswerSchema = z.object({
   questionId: z.string().trim().min(1).max(120),
   optionIds: z.array(z.string().trim().min(1).max(120)).max(20),
@@ -1236,8 +1270,7 @@ export const requestConfirmationPayloadSchema = z.object({
   toolAction: requestConfirmationToolActionPayloadSchema.optional(),
   expectedOutcome: interactionExpectedOutcomeSchema.nullable().optional()
     .describe(EXPECTED_OUTCOME_DESCRIPTION),
-});
-
+}).describe(INTERACTION_PAYLOAD_UNRECOGNIZED_KEYS_NOTE);
 export const requestCheckboxConfirmationOptionSchema = z.object({
   id: z.string().trim().min(1).max(120),
   label: z.string().trim().min(1).max(120),
@@ -1348,8 +1381,7 @@ export const requestCheckboxConfirmationPayloadSchema = z.object({
       });
     }
   }
-});
-
+}).describe(INTERACTION_PAYLOAD_UNRECOGNIZED_KEYS_NOTE);
 export const requestConfirmationResumeFailureSchema = z.object({
   status: z.enum(["retrying", "needs_attention"]),
   errorCode: z.string().trim().min(1).max(120).nullable(),
@@ -1516,8 +1548,7 @@ export const requestItemVerdictsPayloadSchema = z.object({
       });
     }
   }
-});
-
+}).describe(INTERACTION_PAYLOAD_UNRECOGNIZED_KEYS_NOTE);
 export const requestItemVerdictsResultItemSchema = z.object({
   id: z.string().trim().min(1).max(120),
   verdict: requestItemVerdictValueSchema,
@@ -1603,6 +1634,99 @@ export const createIssueThreadInteractionSchema = z.discriminatedUnion("kind", [
 ]);
 
 export type CreateIssueThreadInteraction = z.infer<typeof createIssueThreadInteractionSchema>;
+
+/**
+ * Hard ceiling on how many dropped key names one create response reports
+ * (PEN-4445).
+ *
+ * The list is echoed straight back to the caller, so its length is chosen by
+ * whoever wrote the request. The cap is generous relative to the real signal —
+ * a skew window drops the one or two fields a schema change added, and a typo
+ * drops exactly one — so hitting it means something is wrong with the caller
+ * rather than with the server's vocabulary, and the first {@link
+ * MAX_REPORTED_UNRECOGNIZED_PAYLOAD_KEYS} names say so just as well as all of
+ * them would.
+ */
+export const MAX_REPORTED_UNRECOGNIZED_PAYLOAD_KEYS = 25;
+
+/**
+ * Unwrap a payload schema down to the `ZodObject` whose shape defines the keys
+ * the server actually understands.
+ *
+ * Four of the five payload schemas end in `.superRefine(...)`, which makes them
+ * `ZodEffects` rather than `ZodObject`, so reading `.shape` off the exported
+ * constant does not work uniformly. Dispatch on `_def.typeName` rather than
+ * `instanceof`: a monorepo can resolve more than one copy of zod, and an
+ * `instanceof` check against the wrong copy fails silently — which here would
+ * report every key of a perfectly valid payload as dropped.
+ */
+function unwrapPayloadObjectSchema(schema: z.ZodTypeAny | undefined): z.ZodObject<z.ZodRawShape> | null {
+  let current: z.ZodTypeAny | undefined = schema;
+  // Bounded rather than `while (true)`: a malformed schema must not hang the
+  // request path, and no real payload nests more than a couple of wrappers.
+  for (let depth = 0; depth < 10 && current; depth += 1) {
+    const def = current._def as {
+      typeName?: string;
+      schema?: z.ZodTypeAny;
+      innerType?: z.ZodTypeAny;
+    } | undefined;
+    if (def?.typeName === "ZodObject") return current as z.ZodObject<z.ZodRawShape>;
+    current = def?.schema ?? def?.innerType;
+  }
+  return null;
+}
+
+/**
+ * Top-level payload keys each interaction kind understands, derived from
+ * {@link createIssueThreadInteractionSchema} itself.
+ *
+ * Derived rather than hand-listed on purpose: this table's whole job is to say
+ * what the parser will keep, so reading it off any other source would let the
+ * two drift and make the report lie in the one direction that matters — naming
+ * a key as dropped when it was in fact honoured. A kind whose payload cannot be
+ * unwrapped to an object is ABSENT here rather than present-and-empty, so
+ * {@link unrecognizedInteractionPayloadKeys} reports nothing for it instead of
+ * reporting all of its keys. `issue-thread-interactions.test.ts` asserts the
+ * table covers every member of the union, so that fail-safe cannot quietly
+ * become permanent coverage loss for a newly added kind.
+ */
+export const INTERACTION_PAYLOAD_KNOWN_KEYS: ReadonlyMap<string, ReadonlySet<string>> = (() => {
+  const table = new Map<string, ReadonlySet<string>>();
+  for (const option of createIssueThreadInteractionSchema.options) {
+    const shape = (option as z.ZodObject<z.ZodRawShape>).shape;
+    const kindDef = shape.kind?._def as { value?: unknown } | undefined;
+    const payloadObject = unwrapPayloadObjectSchema(shape.payload);
+    if (typeof kindDef?.value !== "string" || !payloadObject) continue;
+    table.set(kindDef.value, new Set(Object.keys(payloadObject.shape)));
+  }
+  return table;
+})();
+
+/**
+ * Top-level payload keys this server does not know, i.e. the ones zod is about
+ * to strip (PEN-4445).
+ *
+ * MUST be called on the RAW request body, before `validate()` replaces it with
+ * the parsed value — by then the dropped keys are gone and there is nothing
+ * left to diff.
+ *
+ * Total by construction: it is called on unvalidated input, from the request
+ * path, and a throw here would turn a reporting aid into an outage. Every
+ * uncertain case resolves to the empty list, which under-reports rather than
+ * claiming a key was dropped when it was not — the direction that keeps a
+ * non-empty result trustworthy enough to act on.
+ */
+export function unrecognizedInteractionPayloadKeys(kind: unknown, payload: unknown): string[] {
+  if (typeof kind !== "string") return [];
+  const known = INTERACTION_PAYLOAD_KNOWN_KEYS.get(kind);
+  if (!known) return [];
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return [];
+  return Object.keys(payload as Record<string, unknown>)
+    .filter((key) => !known.has(key))
+    .sort()
+    .slice(0, MAX_REPORTED_UNRECOGNIZED_PAYLOAD_KEYS);
+}
+
 
 export const acceptIssueThreadInteractionSchema = z.object({
   selectedClientKeys: z.array(z.string().trim().min(1).max(120)).min(1).max(50).optional(),
