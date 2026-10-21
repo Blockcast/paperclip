@@ -375,3 +375,105 @@ PEN-3920 blocks PEN-4226 (DevOps shard conversion). This document lands the deci
 door still refuses `alertname = Vlan1MacvlanV6ProbeInstrumentBroken` and
 `job = vlan1_macvlan_v6_listener` until 6.1 and 6.2 are implemented and the bundle redeploys.
 PEN-4226 should not resume on the strength of this document alone.
+
+## 9. PEN-4438 (D7) - Kubernetes object names under `cronjob`, `instance`, `name`, `pod`
+
+Added 2026-10-21 by the Security Engineer, after PEN-4425 shipped and PEN-4226 re-measured
+the door. Same method as above: read-only, against the shipped bundle
+(`/opt/paperclip-bundled-adapters/...`, mtime 2026-10-20 22:18) through the exported
+`locateGitHubEgressMatches`. Convention of section 2 applies - no `name=value` pair below is
+written contiguously.
+
+### 9.1 What was left
+
+PEN-4425 closed the CamelCase/snake_case class. The residual PEN-4226 then hit is a different
+one: Kubernetes-GENERATED identifiers, under four label names that were never anchored. Four
+distinct values, in three `PrometheusRule` shard keys, all refused `high-entropy-assignment`:
+
+| name | shape | fails `isLexicalIdentifier` on |
+|---|---|---|
+| `pod` | `<deploy>-<pod-template-hash>-<suffix>` | two mixed segments; summed content 32 against a cap of 30 |
+| `name` | `<scale-set>-<hash>-listener` | its hash segment opens with a digit, so no mixed-segment branch reaches it |
+| `instance` | `<service>.<namespace>.svc` | two mixed segments; summed content 39 |
+| `cronjob` | `<ticket-id><digits>-<words>-selftest` | a 5-digit run against a per-segment cap of 2 |
+
+A label matcher inside a PromQL expression must be a literal, so "derive it at runtime" is
+unavailable - the gap PEN-4428 removed from the refusal text.
+
+### 9.2 Verdict: anchor all four
+
+| name | decision | why |
+|---|---|---|
+| `pod` | **ANCHOR** | 556 distinct values in the corpus, 239 refused today. Binding name is Kubernetes-specific. |
+| `instance` | **ANCHOR** | 58 distinct, 7 refused. Prometheus/Kubernetes-specific. |
+| `cronjob` | **ANCHOR** | 39 distinct, 1 refused. Narrowest of the four. |
+| `name` | **ANCHOR**, and it is the one that needed the argument | Generic binding name, so section 4's "accident does not choose the name" is weakest here. What carries it is the SHAPE half: the word-mass floor (9.3) is not satisfiable by any real credential format, measured over 28 of them. |
+
+Refusing any one of them leaves a shard key permanently single-line, and `pod` and `name`
+appear in the same key, so a partial answer unblocks nothing in shard 3.
+
+### 9.3 The shape, and the conjunct that carries it
+
+A DNS-1123 subdomain whose hyphen-separated segments are words (letters only), numbers
+(digits only), or GENERATED (anything else, at most 2 of them, each at most 10 characters,
+summing to at most 16) - admitted only when the WORD segments sum to at least 16 characters.
+
+That last floor is the whole rule. Without it the shape exonerates 3.5e-2 of random segmented
+lowercase tokens; with it, 2.9e-3 to 9.9e-3. It is also what no credential format satisfies:
+`sk-ant-api03-...` musters 5 characters of letter runs, `xoxb-...` 4, `sk_live_...` 6.
+
+### 9.4 Residual, 200,000 random values per family
+
+Fraction NEWLY exonerated under an anchored name. Varying-length segment generators, per the
+measurement trap in 6.3.
+
+| family | newly exonerated |
+|---|---|
+| base62 @24/@32, base64url @24/@43, base32 @32, lowercase hex @32/@40, mixed-case letters @24, UUID v4 layout | **0** each |
+| base36, 4-6 varying groups of 2-8, `-` | 9.54e-3 |
+| base36, 3-5 varying groups of 3-7, `-` | 5.39e-3 |
+| base36, 2-4 varying groups of 4-10, `-` | 2.93e-3 |
+| base36, 3-4 varying groups of 3-9, `.` | 2.96e-3 |
+| Kubernetes suffix alphabet, 3-5 varying groups of 3-9, `-` | 9.85e-3 |
+
+Credential-format check: 28 real formats (GitHub classic and fine-grained PATs, Slack, Stripe,
+AWS id and secret, Google, Anthropic, OpenAI, Vault, GitLab, npm, Grafana, JWT, base32 TOTP
+seed, Kubernetes bootstrap token, UUID, raw hex and base64 blobs), 20,000 synthesized samples
+each: **0 of 560,000** newly exonerated.
+
+For scale, the name-anchored CamelCase exemption this file already accepts carries 2.33e-1
+(6.5), and `isLexicalIdentifier` carries 2.96e-3 to 3.57e-3 *name-free*. This rule sits
+between them and is anchored.
+
+### 9.5 What it does admit, stated plainly
+
+A value built as real dictionary words glued to an opaque tail - `<16+ characters of
+words>-<8-10 opaque>` - is exonerated at ~5e-1. No further conjunct closes it, because a
+genuine Kubernetes name IS words plus a generated suffix; the two are not separable by shape.
+Two things make it acceptable, and neither is "the number is small":
+
+- It is a DELIBERATE construction. Accident binds the raw credential; it does not prepend
+  dictionary words to it. Section 4 and PEN-3183 put deliberate bypass outside this control.
+- The opaque mass admitted is at most 16 lowercase-alnum characters, ~83 bits - LESS than the
+  ~141 bits `isLexicalIdentifier` already exonerates under EVERY name (three 10-letter random
+  segments, hyphenated, is clean on the shipped bundle today).
+
+The name anchor carries this rule. The shape alone was never going to, and a future reader
+should not read 9.4 as though it did.
+
+### 9.6 Corpus
+
+556 distinct `pod` values, 145 `name`, 58 `instance`, 39 `cronjob` across Blockcast/onprem-k8s,
+Blockcast/paperclip and Blockcast/penstock-llm-proxy-core. 262 are refused today; this rule
+exonerates 204, every one an ordinary Kubernetes name - so this is a 204-value false-positive
+class, not three shard keys. Loosening to the corpus maxima (3 generated segments, mass 21)
+buys three more, so the caps sit at the knee. Held against the same corpus, the four-name
+anchor withholds this shape from 23 other binding names that would gain it under a name-free
+rule, among them `uid`, `evidence`, `claim` and `RULE_ID`.
+
+### 9.7 Refused, unchanged
+
+- `isLexicalIdentifier`'s mixed-segment cap stays at 1 (6.3).
+- `HIGH_ENTROPY_MIN_BITS_PER_CHAR` stays at 3.5 (section 1).
+- The push door keeps the comment door's threshold (section 5).
+- No allowlist, env override or bypass.

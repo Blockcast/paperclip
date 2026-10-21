@@ -1012,6 +1012,94 @@ describe("scrubGitHubEgressText", () => {
     );
   });
 
+  describe("PEN-4438 regression: a Kubernetes object name is not a credential", () => {
+    // Derived, not embedded, throughout: every positive below is the exact
+    // material the SHIPPED rule refuses, so writing one contiguously would make
+    // this file unpushable until the fix deploys. Same convention as the
+    // PEN-3920 block above and the PEN-3907 fixtures.
+    const pair = (name: string, value: string) => [name, value].join("=");
+
+    // The four shapes, one per anchored name, taken from the PromQL label
+    // matchers in Blockcast/onprem-k8s that this rule unblocks. Kubernetes
+    // appends the generated segments; the author cannot choose them, and a
+    // label matcher cannot derive its literal at runtime.
+    const POD = ["arc", "gha", "rs", "controller", "57fdd5ff6", "z5sdf"].join("-");
+    const LISTENER = ["arc", "default", "6bdb5cb7", "listener"].join("-");
+    const SERVICE = [
+      ["orc8r", "kube", "state", "metrics"].join("-"),
+      ["production", "orc8r"].join("-"),
+      "svc",
+    ].join(".");
+    const CRONJOB = ["blo28848", "imagepull", "selftest"].join("-");
+    // Five dot-labels: the corpus maximum, and the only real value that needs
+    // K8S_NAME_MAX_LABELS above four.
+    const SERVICE_FQDN = [
+      ["orc8r", "prometheus"].join("-"),
+      ["production", "orc8r"].join("-"),
+      "svc",
+      "cluster",
+      "local",
+    ].join(".");
+
+    it.each([
+      ["pod", POD],
+      ["name", LISTENER],
+      ["instance", SERVICE],
+      ["instance", SERVICE_FQDN],
+      ["cronjob", CRONJOB],
+    ])("passes the %s label matcher byte-exact under its anchored name", (name, value) => {
+      const text = `            kube_pod_info{${pair(name, `"${value}"`)}}`;
+      expect(scrubGitHubEgressText(text).text).toBe(text);
+      expect(locateGitHubEgressMatches(text)).toEqual([]);
+    });
+
+    // The name anchor is the load-bearing half (PEN-3920 section 4). Shape
+    // alone exonerates nothing, so every one of these stays refused under a
+    // credential-ish name — and under the near-miss names the anchor
+    // deliberately withholds it from.
+    it.each([
+      ["password", POD],
+      ["token", SERVICE],
+      ["k8s_pod_name", POD],
+      ["job_name", LISTENER],
+    ])("refuses a Kubernetes-shaped value bound to %s instead", (name, value) => {
+      const result = scrubGitHubEgressText(pair(name, value));
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(value);
+    });
+
+    // Each bound is a cap, not a licence. One case per conjunct, each failing
+    // on a different one, so loosening any single constant fails a test.
+    it.each([
+      // Word mass 15 against a floor of 16 — the conjunct that holds the rule,
+      // pinned one character below the boundary.
+      ["word mass", ["kube", "state", "metric", "a1f93kd82"].join("-")],
+      // Three generated segments against a cap of two.
+      ["generated count", ["controller", "listener", "57fdd5ff6", "z5sdf", "9fk2d"].join("-")],
+      // Generated mass 18 against a cap of 16.
+      ["generated mass", ["controller", "listener", "57fdd5ff6", "8kd93mf2s"].join("-")],
+      // An 11-character generated segment against a cap of 10.
+      ["generated length", ["controller", "listener", "57fdd5ff6a2"].join("-")],
+      // Uppercase: not a DNS-1123 label, and the half that keeps every
+      // mixed-case credential alphabet out of this rule entirely.
+      ["uppercase", ["controller", "listener", "57FDD5FF6"].join("-")],
+      // `_` is not a Kubernetes name separator.
+      ["underscore separator", ["controller", "listener", "57fdd5ff6"].join("_")],
+      // Six dot-labels against a cap of five.
+      ["label count", ["controller", "listener", "metrics", "a1b2c3d4", "svc", "local"].join(".")],
+      // One opaque run: no separator, no word mass. A credential looks like
+      // this and a Kubernetes name does not.
+      ["lowercase hex digest", "a3f91c8e2b7d405fa6c19e83bd27f04a1c6e59b8"],
+      // A UUID stays opaque here for the same reason it does in
+      // isLexicalIdentifier: its groups are neither words nor numbers.
+      ["uuid", ["386c81e8", "e454", "4f2a", "9b31", "7c5d2e8a1f04"].join("-")],
+    ])("still refuses a value failing the %s bound, under an anchored name", (_why, value) => {
+      const result = scrubGitHubEgressText(pair("pod", value));
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(value);
+    });
+  });
+
   describe("BLO-46892 regression: a flake input git commit pin is not a credential", () => {
     // Derived, not embedded: until this fix deploys, the pre-push guard refuses the literal.
     const sha = ["2515e5ca485854475eb2739d", "73aef58d765564f2"].join("");

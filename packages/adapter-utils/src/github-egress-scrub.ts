@@ -268,6 +268,133 @@ function digitRunCount(value: string): number {
  *  to the entropy test. */
 const GIT_COMMIT_SHA_RE = /^[0-9a-f]{40}$/;
 
+/** PEN-4438 (D7): a Kubernetes object name, or an in-cluster DNS name, as a
+ *  `PrometheusRule` label matcher writes it — `pod`, `name`, `instance`,
+ *  `cronjob`. Kubernetes appends GENERATED segments to the names it creates
+ *  (a ReplicaSet's pod-template-hash, a pod's 5-character suffix, a CronJob
+ *  run's epoch index), and `isLexicalIdentifier` admits at most ONE segment
+ *  that mixes letters and digits, under a 2-digit run and a summed-content cap
+ *  of 30. Every k8s-generated name of any size fails at least one of those, so
+ *  a PromQL expression pinning a pod or a service was unpushable.
+ *
+ *  Name-anchored, like the CamelCase and snake_case rules above and for the
+ *  reason PEN-3920 section 4 states: this file guards ACCIDENTAL disclosure,
+ *  and an accidental leak does not choose its binding name. The alternative —
+ *  relaxing `isLexicalIdentifier`'s caps, which is where these values fail —
+ *  is name-FREE and so reaches every binding name in the fleet. That is the
+ *  trade PEN-4425 measured at 4x and REFUSED, and it is refused again here.
+ *
+ *  THE SHAPE, and why each conjunct is load-bearing. A value is admitted when
+ *  it is a DNS-1123 subdomain (lowercase alnum, `-` inside a label, `.`
+ *  between labels) whose hyphen-separated segments split into:
+ *
+ *   - WORD segments, letters only. Their summed length must reach
+ *     K8S_NAME_MIN_WORD_MASS. This single conjunct does nearly all the work:
+ *     without it the rule exonerates 3.5e-2 of random segmented lowercase
+ *     tokens, with it 2.9e-3 to 9.9e-3 (table below). It is also what keeps
+ *     real credential FORMATS out — none carries 16 characters of lowercase
+ *     letter runs: `sk-ant-api03-…` musters 5, `xoxb-…` 4, `sk_live_…` 6.
+ *   - NUMBER segments, digits only. Free — a digit run carries no alphabet.
+ *   - GENERATED segments, anything else. At most
+ *     K8S_NAME_MAX_GENERATED_SEGMENTS of them, each at most
+ *     K8S_NAME_MAX_GENERATED_LENGTH, summing to at most
+ *     K8S_NAME_MAX_GENERATED_MASS. This is the opaque mass the rule admits.
+ *
+ *  THE RESIDUAL. 200,000 random values per family, fraction NEWLY exonerated
+ *  under one of the four anchored names (varying-length segment generators —
+ *  PEN-4425 records that fixed-length ones make a cap look free because the
+ *  uniform-length check in `isLexicalIdentifier` absorbs the difference):
+ *
+ *    base62 @24/@32, base64url @24/@43, base32 @32, lowercase hex @32/@40,
+ *    mixed-case letters @24, UUID v4 layout ......................... 0 each
+ *    base36, 4-6 varying groups of 2-8, `-` ...................... 9.54e-3
+ *    base36, 3-5 varying groups of 3-7, `-` ...................... 5.39e-3
+ *    base36, 2-4 varying groups of 4-10, `-` ..................... 2.93e-3
+ *    base36, 3-4 varying groups of 3-9, `.` ...................... 2.96e-3
+ *    k8s suffix alphabet, 3-5 varying groups of 3-9, `-` ......... 9.85e-3
+ *
+ *  Every FLAT token family is zero: a credential is one opaque run, and one
+ *  run reaches neither the word mass nor the segment floor. Also measured: 28
+ *  real credential formats (GitHub PAT classic and fine-grained, Slack, Stripe,
+ *  AWS id and secret, Google, Anthropic, OpenAI, Vault, GitLab, npm, Grafana,
+ *  JWT, base32 TOTP seed, k8s bootstrap token, UUID, raw hex and base64 blobs),
+ *  20,000 synthesized samples each — 0 of 560,000 newly exonerated.
+ *
+ *  What this DOES admit, stated plainly because the number is large: a value
+ *  built as real dictionary words glued to an opaque tail — `<16+ chars of
+ *  words>-<8-10 opaque>` — is exonerated at ~5e-1. That shape is not separable
+ *  from a genuine k8s name by structure, because a genuine k8s name IS words
+ *  plus a generated suffix; no further conjunct closes it. It is a DELIBERATE
+ *  construction, which PEN-3920 section 4 and PEN-3183 put outside this
+ *  control's threat model, and the opaque mass it admits — at most 16
+ *  lowercase-alnum characters, ~83 bits — is LESS than the ~141 bits
+ *  `isLexicalIdentifier` already exonerates under EVERY name (three 10-letter
+ *  random segments, hyphenated, is clean today). The name anchor is what
+ *  carries this rule; the shape alone was never going to.
+ *
+ *  THE CORPUS. 556 distinct `pod` values, 145 `name`, 58 `instance`, 39
+ *  `cronjob` across Blockcast/onprem-k8s, Blockcast/paperclip and
+ *  Blockcast/penstock-llm-proxy-core: 262 are refused today and this rule
+ *  exonerates 204 of them, every one an ordinary Kubernetes name. Loosening
+ *  to 3 generated segments and a mass of 21 — the corpus maxima — buys three
+ *  more values, so the caps sit at the knee.
+ *  Held against the same corpus, the four-name anchor withholds this shape
+ *  from 23 other binding names that would gain it under a name-free rule,
+ *  among them `uid`, `evidence`, `claim` and `RULE_ID`.
+ *
+ *  Do not widen the NAME set without re-reading PEN-3920 section 4, and never
+ *  move this shape into a name-free rule. */
+const K8S_DNS_LABEL_RE = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/;
+/** Longest value admitted. The longest real name in the corpus above is 61. */
+const K8S_NAME_MAX_LENGTH = 64;
+/** Dot-separated labels. A Service address reaches five —
+ *  `<service>.<namespace>.svc.cluster.local` — and that is the corpus maximum. */
+const K8S_NAME_MAX_LABELS = 5;
+/** Summed length of the letters-only segments. 16 is the conjunct that holds
+ *  this rule: the corpus minimum is 16 exactly (a CronJob self-test name
+ *  musters 17), so there is one character of headroom and raising it to 18
+ *  would drop that value. */
+const K8S_NAME_MIN_WORD_MASS = 16;
+/** A pod carries two generated segments — the ReplicaSet's pod-template-hash
+ *  and its own suffix — and nothing in the corpus needs a third under the
+ *  mass bound below. */
+const K8S_NAME_MAX_GENERATED_SEGMENTS = 2;
+/** Widest generated segment: a pod-template-hash is up to 10 characters. */
+const K8S_NAME_MAX_GENERATED_LENGTH = 10;
+/** Total opaque mass. This is the entropy budget the rule spends; see the
+ *  residual note above for what it buys and what it costs. */
+const K8S_NAME_MAX_GENERATED_MASS = 16;
+/** PEN-4438 (D7): names whose values take the Kubernetes object-name shape. */
+const K8S_OBJECT_NAME_VALUE_NAMES = new Set(["cronjob", "instance", "name", "pod"]);
+
+/** True when a value is a Kubernetes object name or in-cluster DNS name. */
+function isKubernetesObjectName(value: string): boolean {
+  if (value.length > K8S_NAME_MAX_LENGTH) return false;
+  const labels = value.split(".");
+  if (labels.length > K8S_NAME_MAX_LABELS) return false;
+  let wordMass = 0;
+  let generatedSegments = 0;
+  let generatedMass = 0;
+  for (const label of labels) {
+    if (!K8S_DNS_LABEL_RE.test(label)) return false;
+    for (const segment of label.split("-")) {
+      if (/^[a-z]+$/.test(segment)) {
+        wordMass += segment.length;
+        continue;
+      }
+      if (/^[0-9]+$/.test(segment)) continue;
+      if (segment.length > K8S_NAME_MAX_GENERATED_LENGTH) return false;
+      generatedSegments += 1;
+      generatedMass += segment.length;
+    }
+  }
+  return (
+    wordMass >= K8S_NAME_MIN_WORD_MASS &&
+    generatedSegments <= K8S_NAME_MAX_GENERATED_SEGMENTS &&
+    generatedMass <= K8S_NAME_MAX_GENERATED_MASS
+  );
+}
+
 /** True when a NAME=VALUE pair is a content digest pin rather than a secret. */
 function isContentDigestAssignment(name: string, value: string): boolean {
   if (name === "patch_hash" && PNPM_PATCH_HASH_RE.test(value)) return true;
@@ -275,6 +402,7 @@ function isContentDigestAssignment(name: string, value: string): boolean {
     if (CAMEL_CASE_VALUE_NAMES.has(name) && ALERT_NAME_RE.test(value)) return true;
     if (SNAKE_CASE_VALUE_NAMES.has(name) && JOB_NAME_RE.test(value)) return true;
   }
+  if (K8S_OBJECT_NAME_VALUE_NAMES.has(name) && isKubernetesObjectName(value)) return true;
   if (name === "rev" && GIT_COMMIT_SHA_RE.test(value)) return true;
   return DIGEST_NAME_RE.test(name) && HEX_DIGEST_RE.test(value);
 }
