@@ -1,6 +1,7 @@
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { and, asc, desc, eq, exists, gt, gte, inArray, isNotNull, isNull, like, lt, lte, ne, notInArray, or, sql, type SQL } from "drizzle-orm";
+import { alias } from "drizzle-orm/pg-core";
 import type { Db, DbTransaction } from "@paperclipai/db";
 import {
   activityLog,
@@ -77,7 +78,7 @@ import {
   type ExecutionWorkspaceConfig,
   type IssueExecutionState,
 } from "@paperclipai/shared";
-import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
+import { badRequest, conflict, HttpError, notFound, unprocessable } from "../errors.js";
 import {
   assertPluginFencingGeneration,
   type ResolvedPluginFencingPrecondition,
@@ -192,6 +193,7 @@ type PendingRoutineCancellationReceipt =
 const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
 const OPEN_ROUTINE_EXECUTION_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"] as const;
 const ISSUE_PARENT_ANCESTRY_VALIDATION_MAX_DEPTH = 256;
+const ANCHOR_ALIAS = "after_cursor_anchor";
 const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
 export const ISSUE_LIST_DEFAULT_LIMIT = 500;
 export const ISSUE_LIST_MAX_LIMIT = 1000;
@@ -13390,36 +13392,72 @@ export function issueService(db: Db) {
 
       const conditions = [eq(issueComments.issueId, issueId)];
       if (afterCommentId) {
-        const anchor = await db
-          .select({
-            id: issueComments.id,
-            createdAt: issueComments.createdAt,
-          })
+        const anchorExists = await db
+          .select({ id: issueComments.id })
           .from(issueComments)
           .where(and(eq(issueComments.issueId, issueId), eq(issueComments.id, afterCommentId)))
           .then((rows) => rows[0] ?? null);
 
-        if (!anchor) return [];
-        const anchorCreatedAt =
-          anchor.createdAt instanceof Date
-            ? anchor.createdAt
-            : new Date(String(anchor.createdAt));
+        // PEN-4458: an `after` cursor that names no comment on this issue used
+        // to `return []`. That made the row count uninterpretable, because an
+        // empty array is the ONE answer this endpoint can never produce
+        // honestly: a live cursor with no later comments returns zero rows in
+        // `asc` only when it is genuinely the newest, and a bad cursor returned
+        // the same thing. The caller's question is "has anyone replied since my
+        // comment?", so the failure direction was "nobody has answered you" --
+        // permanent, silent, and indistinguishable from the all-clear.
+        //
+        // 400 rather than 404: the issue resolved fine and the route already
+        // spends 404 on "Issue not found", so reusing it would require the
+        // caller to read `code` to tell a missing THREAD from a missing CURSOR.
+        // It also puts this beside the malformed-cursor refusal the route
+        // raises, so every bad-`after` answer is one family with one code to
+        // branch on.
+        if (!anchorExists) {
+          throw badRequest("after cursor does not name a comment on this issue", {
+            code: "after_cursor_not_found",
+            after: afterCommentId,
+          });
+        }
+
+        // PEN-4458: the keyset boundary is compared INSIDE Postgres and the
+        // anchor's timestamp never round-trips through JavaScript.
+        //
+        // It used to. `created_at` is `timestamptz`, which Postgres stores at
+        // MICROSECOND precision, and the anchor was read back into a JS `Date`,
+        // which holds MILLISECONDS. Re-binding that truncated value moved the
+        // boundary strictly below the anchor's real timestamp, so the
+        // comparison stopped meaning what it reads as:
+        //
+        //   asc  -- `created_at > $truncated` is TRUE for the anchor ITSELF
+        //           (its sub-millisecond digits are above the bound), so the
+        //           cursor comment came back at the head of every page. ~999
+        //           rows in 1000 carry a non-zero microsecond remainder, so
+        //           this fired essentially always, and it also re-emitted any
+        //           sibling written earlier within the same millisecond.
+        //   desc -- the mirror image, and the dangerous one: rows in the
+        //           anchor's millisecond that are genuinely EARLIER than it sit
+        //           between the truncated bound and the anchor, satisfy neither
+        //           `< $truncated` nor `= $truncated`, and were silently
+        //           DROPPED from the page.
+        //
+        // So the two orders disagreed -- `asc` over-returned, `desc`
+        // under-returned -- which is the tell that this was never a deliberate
+        // inclusive-cursor design. Comparing row-wise against a subquery keeps
+        // the boundary at full precision and restores the documented contract:
+        // strictly after the cursor, in both orders.
+        //
+        // The subquery scans the same table as the outer query, so it is
+        // aliased: an unqualified self-reference would resolve to the inner
+        // range table by shadowing, which is correct but reads as a bug.
+        // `alias()` renders the alias in the column list but not in `from`,
+        // hence the explicit `as`.
+        const anchor = alias(issueComments, ANCHOR_ALIAS);
+        const anchorKey = sql`(select ${anchor.createdAt}, ${anchor.id} from ${issueComments} as ${sql.identifier(ANCHOR_ALIAS)} where ${anchor.id} = ${afterCommentId} and ${anchor.issueId} = ${issueId})`;
         conditions.push(
           order === "asc"
-            ? or(
-                gt(issueComments.createdAt, anchorCreatedAt),
-                and(
-                  eq(issueComments.createdAt, anchorCreatedAt),
-                  gt(issueComments.id, anchor.id),
-                ),
-              )!
-            : or(
-                lt(issueComments.createdAt, anchorCreatedAt),
-                and(
-                  eq(issueComments.createdAt, anchorCreatedAt),
-                  lt(issueComments.id, anchor.id),
-                ),
-              )!,
+            ? sql`(${issueComments.createdAt}, ${issueComments.id}) > ${anchorKey}`
+            : sql`(${issueComments.createdAt}, ${issueComments.id}) < ${anchorKey}`,
         );
       }
 

@@ -3088,6 +3088,51 @@ describe("agent issue mutation checkout ownership", () => {
     });
   });
 
+  it("refuses a malformed after cursor with 400 rather than a bare 500", async () => {
+    // PEN-4458: `after` is compared against a `uuid` column, so a non-UUID
+    // value used to reach Postgres and surface as `500 Internal server error`
+    // from `22P02` -- a caller mistake reported as a server fault, with
+    // nothing in the body naming the offending parameter. The guard runs
+    // ahead of the service, so no query is issued at all.
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: input.action === "issue:read",
+      action: input.action,
+      reason: input.action === "issue:read" ? "allow_issue_mention_grant" : "deny_missing_grant",
+      explanation:
+        input.action === "issue:read"
+          ? "Allowed by a mention-scoped issue comment grant."
+          : "Missing permission.",
+    }));
+
+    const res = await request(await createApp(peerActor()))
+      .get(`/api/issues/${issueId}/comments?after=not-a-uuid`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(400);
+    expect(res.body.code).toBe("after_cursor_malformed");
+    expect(mockIssueService.listComments).not.toHaveBeenCalled();
+  });
+
+  it("refuses a malformed legacy afterCommentId cursor as well", async () => {
+    // The legacy spelling funnels into the same variable, so it must not be a
+    // way back to the 500.
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: input.action === "issue:read",
+      action: input.action,
+      reason: input.action === "issue:read" ? "allow_issue_mention_grant" : "deny_missing_grant",
+      explanation:
+        input.action === "issue:read"
+          ? "Allowed by a mention-scoped issue comment grant."
+          : "Missing permission.",
+    }));
+
+    const res = await request(await createApp(peerActor()))
+      .get(`/api/issues/${issueId}/comments?afterCommentId=12345`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(400);
+    expect(res.body.code).toBe("after_cursor_malformed");
+    expect(mockIssueService.listComments).not.toHaveBeenCalled();
+  });
+
   it("rejects peer agents from reading a specific comment when issue read is outside their boundary", async () => {
     mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
       allowed: false,
