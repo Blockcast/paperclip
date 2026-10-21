@@ -2952,6 +2952,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     // Pre-created like the rw targets: a kubelet-created subPath dir is
     // root:root and would EACCES the server's own skill materializer later.
     ...(companySkillsMount?.subPath ? [companySkillsMount.subPath] : []),
+    ...rootMounts.flatMap((m) => (m.subPath ? [m.subPath] : [])),
   ].map((subPath) => path.posix.join(SELF_POD_DATA_MOUNT_PATH, subPath));
   // Deliberately NOT checked against `claimedMountPaths` here. A scoped mount
   // landing exactly on an already-claimed path (an inherited secret mount under
