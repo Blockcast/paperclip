@@ -139,6 +139,27 @@ export const IMAGE_WRAPPER_BINARIES = [
 export const IMAGE_WRAPPER_PATH_RESOLVED = ["gh", "git", "github-mcp-server"] as const;
 
 /**
+ * The shells the resolution half of the preflight asks, in report order. Only
+ * the ones that resolve are probed; the verdict names which answered.
+ *
+ * `sh` is the baseline and proves the least: it is the Job's own shell, where
+ * PATH is the Job env value `job-manifest.ts` has already forced to lead with
+ * IMAGE_WRAPPER_BIN_DIR, and a non-interactive POSIX `sh` (dash on this image)
+ * reads no startup file at all. So whenever the presence loop passes, `sh`
+ * resolution agrees with it by construction — it is a tautology, kept only
+ * because a disagreement would mean the forced PATH itself had been lost.
+ *
+ * `bash` and `zsh` are the shells that can actually dissent, and they are the
+ * ones the agent's own commands run under — zsh is the tool shell on today's
+ * image, bash is what a Bash-tool child gets. Both re-enter the PVC shell
+ * dotfiles on every start (zsh reads `.zshenv` unconditionally; bash reads
+ * `$BASH_ENV`, which this manifest sets and keeps reachable with `SHLVL=2`),
+ * and those dotfiles front-prepend agent-writable directories. That is the
+ * PEN-4357 hazard, and it is visible from here only by asking those shells.
+ */
+export const IMAGE_WRAPPER_PROBE_SHELLS = ["sh", "bash", "zsh"] as const;
+
+/**
  * Stable leading tokens of the three preflight verdicts. Exported rather than
  * spelled inline because operators key log alerts to them: changing one is then
  * an edit to a value with a test on it, not a silent change to a string literal
@@ -152,8 +173,8 @@ export const IMAGE_WRAPPER_PREFLIGHT_NOT_ON_PATH = `${IMAGE_WRAPPER_PREFLIGHT_MA
 /**
  * POSIX sh snippet (no trailing separator) that makes every agent Job state, in
  * its own pod log, whether the root-owned GitHub egress wrappers are present in
- * this image and whether they actually own `gh`/`git`/`github-mcp-server`
- * resolution. PEN-4446.
+ * this image and whether they still own `gh`/`git`/`github-mcp-server`
+ * resolution in the shells the agent's own commands run under. PEN-4446.
  *
  * Why this is a *runtime* check when a static one already exists.
  * `deploy/helm/paperclip/tests/agent-egress-path.test.mjs` pins
@@ -182,11 +203,24 @@ export const IMAGE_WRAPPER_PREFLIGHT_NOT_ON_PATH = `${IMAGE_WRAPPER_PREFLIGHT_MA
  * registry credential and no commit archaeology, and it covers forks and digest
  * pins because it interrogates the filesystem rather than the reference.
  *
- * Why it also checks resolution and not merely presence. PEN-4357: the
- * directory can be present and still lose. job-manifest.ts makes it `PATH[0]`
- * on the *Job env*, but the agent's commands run under shells that re-prepend
- * PVC directories from dotfiles this repo does not own, so presence and victory
- * are separate facts and only the second one is the control.
+ * Why the resolution half spawns shells instead of asking this one. Because
+ * asking this one is a tautology, and an `ok` built on it would overclaim. The
+ * snippet runs inside the Job's `sh -c`, whose PATH is the Job env value
+ * `job-manifest.ts` has already forced to lead with IMAGE_WRAPPER_BIN_DIR, and
+ * a non-interactive POSIX `sh` reads no startup file — so a `command -v` here
+ * cannot answer anything the `[ -x ]` loop above did not already answer, and a
+ * dotfile-shadowed PATH is unreachable from it. The PEN-4357 hazard is in the
+ * *agent's* shells: zsh is the tool shell on today's image and reads `.zshenv`
+ * unconditionally, a Bash-tool child reads `$BASH_ENV`, and the PVC dotfiles
+ * both of those chain front-prepend agent-writable directories. Measured
+ * 2026-10-21 against this snippet with PATH leading with the wrapper directory
+ * and a dotfile prepending a shadow dir: `sh` reported the wrapper, `bash` and
+ * `zsh` both reported the shadow. So the probe asks each of
+ * IMAGE_WRAPPER_PROBE_SHELLS that resolves, and the `ok` verdict names which
+ * ones answered rather than claiming a victory it did not measure. It is still
+ * a lower bound — it cannot speak for a shell it did not run, or for a PATH an
+ * agent edits later in its own session — and the verdict is worded to say only
+ * what it tested.
  *
  * Why it reports and does not refuse. Two reasons, and the second is the
  * binding one. (a) job-manifest.ts already settled the disposition at this seam
@@ -209,6 +243,7 @@ export function buildImageWrapperPreflightShell(): string {
   const dir = shellSingleQuote(IMAGE_WRAPPER_BIN_DIR);
   const all = IMAGE_WRAPPER_BINARIES.join(" ");
   const resolved = IMAGE_WRAPPER_PATH_RESOLVED.join(" ");
+  const shells = IMAGE_WRAPPER_PROBE_SHELLS.join(" ");
   return [
     `__pcwrapdir=${dir}`,
     "__pcwrapmiss=",
@@ -216,18 +251,30 @@ export function buildImageWrapperPreflightShell(): string {
     'if [ -n "$__pcwrapmiss" ]; then ' +
       `echo "${IMAGE_WRAPPER_PREFLIGHT_MISSING} dir=$__pcwrapdir absent:$__pcwrapmiss - this image does not carry the root-owned GitHub egress wrappers, so GitHub traffic from this pod is NOT scrubbed (PEN-2527, PEN-4446)" >&2; ` +
     "else " +
-      "__pcwrapbad=; " +
-      `for __pcwrapbin in ${resolved}; do ` +
-        '__pcwrapres=$(command -v "$__pcwrapbin" 2>/dev/null); ' +
-        'case "$__pcwrapres" in "$__pcwrapdir/"*) ;; *) __pcwrapbad="$__pcwrapbad $__pcwrapbin=${__pcwrapres:-unresolved}" ;; esac; ' +
+      "__pcwrapbad=; __pcwrapshells=; " +
+      `for __pcwrapsh in ${shells}; do ` +
+        'command -v "$__pcwrapsh" >/dev/null 2>&1 || continue; ' +
+        '__pcwrapshells="$__pcwrapshells $__pcwrapsh"; ' +
+        `for __pcwrapbin in ${resolved}; do ` +
+          // The binary travels as an environment variable rather than a
+          // positional parameter: `sh -c script name arg` assigns from `$0` in
+          // POSIX shells but zsh numbers the same arguments from `$1`, so one
+          // spelling cannot address both. An exported name reads identically in
+          // dash, bash and zsh, and an assignment prefix on an external command
+          // does not leak into this shell.
+          "__pcwrapres=$(__pcwrapq=\"$__pcwrapbin\" \"$__pcwrapsh\" -c 'command -v \"$__pcwrapq\" 2>/dev/null' 2>/dev/null); " +
+          'case "$__pcwrapres" in "$__pcwrapdir/"*) ;; *) __pcwrapbad="$__pcwrapbad $__pcwrapsh:$__pcwrapbin=${__pcwrapres:-unresolved}" ;; esac; ' +
+        "done; " +
       "done; " +
-      'if [ -n "$__pcwrapbad" ]; then ' +
-        `echo "${IMAGE_WRAPPER_PREFLIGHT_NOT_ON_PATH} dir=$__pcwrapdir resolved:$__pcwrapbad - the wrappers are present but do not own resolution, so GitHub traffic bypasses the scrub (PEN-4357, PEN-4446)" >&2; ` +
+      'if [ -z "$__pcwrapshells" ]; then ' +
+        `echo "${IMAGE_WRAPPER_PREFLIGHT_NOT_ON_PATH} dir=$__pcwrapdir resolved:none - the wrappers are present but no probe shell resolved, so nothing here established that they own resolution (PEN-4357, PEN-4446)" >&2; ` +
+      'elif [ -n "$__pcwrapbad" ]; then ' +
+        `echo "${IMAGE_WRAPPER_PREFLIGHT_NOT_ON_PATH} dir=$__pcwrapdir resolved:$__pcwrapbad - the wrappers are present but do not own resolution in every shell asked, so GitHub traffic from that shell bypasses the scrub (PEN-4357, PEN-4446)" >&2; ` +
       "else " +
-        `echo "${IMAGE_WRAPPER_PREFLIGHT_OK} dir=$__pcwrapdir" >&2; ` +
+        `echo "${IMAGE_WRAPPER_PREFLIGHT_OK} dir=$__pcwrapdir shells:$__pcwrapshells" >&2; ` +
       "fi; " +
     "fi",
-    "unset __pcwrapdir __pcwrapmiss __pcwrapbin __pcwrapres __pcwrapbad",
+    "unset __pcwrapdir __pcwrapmiss __pcwrapbin __pcwrapres __pcwrapbad __pcwrapsh __pcwrapshells __pcwrapq",
   ].join("; ");
 }
 

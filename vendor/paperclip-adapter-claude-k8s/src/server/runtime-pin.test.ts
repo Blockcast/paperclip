@@ -10,6 +10,7 @@ import {
   claudeCodeRuntimeDir,
   IMAGE_WRAPPER_BINARIES,
   IMAGE_WRAPPER_PATH_RESOLVED,
+  IMAGE_WRAPPER_PROBE_SHELLS,
   IMAGE_WRAPPER_PREFLIGHT_OK,
   IMAGE_WRAPPER_PREFLIGHT_MISSING,
   IMAGE_WRAPPER_PREFLIGHT_NOT_ON_PATH,
@@ -407,11 +408,33 @@ describe("buildImageWrapperPreflightShell (PEN-4446)", () => {
     expect(swapped).not.toBe(snippet);
     return swapped;
   };
-  const run = (script: string, pathEnv?: string) =>
+  const run = (script: string, pathEnv?: string, extraEnv: Record<string, string> = {}) =>
     spawnSync("sh", ["-c", script], {
       encoding: "utf8",
-      env: { PATH: pathEnv ?? "/usr/bin:/bin", HOME: tmpdir() },
+      env: { PATH: pathEnv ?? "/usr/bin:/bin", HOME: tmpdir(), ...extraEnv },
     });
+  const shellAvailable = (shell: string) =>
+    spawnSync("sh", ["-c", `command -v ${shell}`], { encoding: "utf8" }).status === 0;
+
+  /**
+   * A `$BASH_ENV` file and a `$ZDOTDIR` holding `.zshenv`, each front-prepending
+   * `shadow` exactly the way the PVC shell dotfiles do. Production never sets
+   * `shadow` on the Job env PATH — the prepend IS the hazard, and it happens
+   * after the Job env is fixed.
+   */
+  const dotfiles = (shadow: string) => {
+    const dir = mkdtempSync(path.join(tmpdir(), "pcdot-"));
+    const stanza = `export PATH="${shadow}:$PATH"\n`;
+    const zdotdir = path.join(dir, "zdotdir");
+    mkdirSync(zdotdir);
+    writeFileSync(path.join(dir, "bashenv.sh"), stanza);
+    writeFileSync(path.join(zdotdir, ".zshenv"), stanza);
+    // SHLVL=2 is not padding: bash skips `$BASH_ENV` entirely when stdin is a
+    // socket and SHLVL < 2, and Node spawns stdio over socketpair, so without
+    // it this fixture would silently test nothing. job-manifest.ts sets the
+    // same value on the Job for the same reason (BLO-34477).
+    return { BASH_ENV: path.join(dir, "bashenv.sh"), ZDOTDIR: zdotdir, SHLVL: "2", _dir: dir };
+  };
 
   const fixture = (binaries: readonly string[]) => {
     const dir = mkdtempSync(path.join(tmpdir(), "pcwrap-"));
@@ -431,6 +454,11 @@ describe("buildImageWrapperPreflightShell (PEN-4446)", () => {
     try {
       const r = run(against(dir), `${dir}:/usr/bin:/bin`);
       expect(r.stderr).toContain(IMAGE_WRAPPER_PREFLIGHT_OK);
+      // The verdict claims only the shells it asked, so an operator reading
+      // `ok` can tell what was established from what was not.
+      for (const shell of IMAGE_WRAPPER_PROBE_SHELLS.filter(shellAvailable)) {
+        expect(r.stderr).toMatch(new RegExp(`shells:[^\n]*\\b${shell}\\b`));
+      }
       expect(r.status).toBe(0);
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -483,13 +511,71 @@ describe("buildImageWrapperPreflightShell (PEN-4446)", () => {
   });
 
   it("leaves no scratch variable behind, in any arm", () => {
-    const probe = 'printf "[%s][%s][%s][%s][%s]" "$__pcwrapdir" "$__pcwrapmiss" "$__pcwrapbin" "$__pcwrapres" "$__pcwrapbad"';
+    const probe =
+      'printf "[%s][%s][%s][%s][%s][%s][%s][%s]" "$__pcwrapdir" "$__pcwrapmiss" "$__pcwrapbin" "$__pcwrapres" "$__pcwrapbad" "$__pcwrapsh" "$__pcwrapshells" "$__pcwrapq"';
     const dir = fixture(IMAGE_WRAPPER_BINARIES);
     try {
       for (const script of [against(dir), against(path.join(tmpdir(), "pcwrap-absent-does-not-exist"))]) {
         const r = run(`${script}; ${probe}`, `${dir}:/usr/bin:/bin`);
-        expect(r.stdout).toBe("[][][][][]");
+        expect(r.stdout).toBe("[][][][][][][][]");
       }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+it("sees a dotfile that shadows the wrappers in bash, which the Job's own sh cannot (PEN-4357)", () => {
+    const dir = fixture(IMAGE_WRAPPER_BINARIES);
+    const shadow = fixture(IMAGE_WRAPPER_PATH_RESOLVED);
+    const dot = dotfiles(shadow);
+    try {
+      // The production shape, which the PATH-ordering case above does not
+      // reach: the Job env PATH leads with the wrapper directory, and the
+      // shadow arrives only from a startup file the agent's shells read. A
+      // probe that asked the Job's own `sh` would report ok here.
+      const r = run(against(dir), `${dir}:/usr/bin:/bin`, dot);
+      expect(r.stderr).toContain(IMAGE_WRAPPER_PREFLIGHT_NOT_ON_PATH);
+      expect(r.stderr).toContain(`bash:gh=${path.join(shadow, "gh")}`);
+      // ...and says which shell dissented. `sh` is clean, so a verdict naming
+      // it too would mean the Job env PATH itself had been lost.
+      expect(r.stderr).not.toMatch(/(^| )sh:gh=/m);
+      expect(r.stderr).not.toContain(IMAGE_WRAPPER_PREFLIGHT_OK);
+      expect(r.status).toBe(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(shadow, { recursive: true, force: true });
+      rmSync(dot._dir, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(!shellAvailable("zsh"))("sees the same shadow in zsh, which is the tool shell on today's image", () => {
+    const dir = fixture(IMAGE_WRAPPER_BINARIES);
+    const shadow = fixture(IMAGE_WRAPPER_PATH_RESOLVED);
+    const dot = dotfiles(shadow);
+    try {
+      const r = run(against(dir), `${dir}:/usr/bin:/bin`, dot);
+      expect(r.stderr).toContain(IMAGE_WRAPPER_PREFLIGHT_NOT_ON_PATH);
+      expect(r.stderr).toContain(`zsh:gh=${path.join(shadow, "gh")}`);
+      expect(r.status).toBe(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(shadow, { recursive: true, force: true });
+      rmSync(dot._dir, { recursive: true, force: true });
+    }
+  });
+
+  it("reports NOT-ON-PATH rather than ok when no probe shell resolves at all", () => {
+    const dir = fixture(IMAGE_WRAPPER_BINARIES);
+    try {
+      // Presence passes off absolute paths, so an empty PATH leaves the
+      // resolution half with nothing to ask. Claiming `ok` from zero probes
+      // would be the overclaim this arm exists to refuse. PATH is cleared
+      // inside the script rather than in the spawn env, which would stop the
+      // harness resolving `sh` and test nothing.
+      const r = run(`PATH=''; export PATH; ${against(dir)}`);
+      expect(r.stderr).toContain(`${IMAGE_WRAPPER_PREFLIGHT_NOT_ON_PATH} dir=${dir} resolved:none`);
+      expect(r.stderr).not.toContain(IMAGE_WRAPPER_PREFLIGHT_OK);
+      expect(r.status).toBe(0);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
