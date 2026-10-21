@@ -45,6 +45,24 @@ const BEDROCK_MODELS: AdapterModel[] = [
 
 export const models = isBedrockEnv() ? BEDROCK_MODELS : DIRECT_MODELS;
 
+// BLO-32843: without this the server resolves `cheap` (requested by every
+// recovery and productivity-review run) to `adapter_profile_not_supported`,
+// so those runs were write-restricted as cheap while still billing the agent
+// default (opus). Sonnet keeps the 1M window: agent instruction bundles alone
+// can exceed a large fraction of 200k.
+export const modelProfiles = [
+  {
+    key: "cheap",
+    label: "Cheap",
+    description: "Lower-cost Claude Sonnet lane for recovery and review runs; the agent's primary model is unchanged.",
+    adapterConfig: {
+      model: isBedrockEnv() ? "us.anthropic.claude-sonnet-5" : "claude-sonnet-5-5[1m]",
+      effort: "low",
+    },
+    source: "adapter_default" as const,
+  },
+];
+
 export const agentConfigurationDoc = `# claude_k8s agent configuration
 
 Adapter: claude_k8s

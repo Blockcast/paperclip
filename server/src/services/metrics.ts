@@ -889,6 +889,10 @@ const PENSTOCK_PROBE_DURATION_BUCKETS_SECONDS = [
   0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 3, 5,
 ] as const;
 
+// BLO-32843: a run requested a model profile (e.g. `cheap`) that did not apply,
+// so it ran on the agent's primary model. Labels are all bounded.
+export const MODEL_PROFILE_UNAPPLIED_METRIC = "paperclip_model_profile_unapplied_total";
+
 export const HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC =
   "paperclip_heartbeat_timer_scheduler_exclusion_total";
 /**
@@ -3896,6 +3900,7 @@ let orphanReapStageSeconds: Histogram<"stage"> | null = null;
 let penstockGateProbe: Counter<"path" | "outcome" | "provider" | "model"> | null = null;
 let penstockGateProbeDuration: Histogram<"path" | "provider"> | null = null;
 let heartbeatTimerSchedulerExclusion: Counter<"reason"> | null = null;
+let modelProfileUnapplied: Counter<"adapter" | "requested" | "reason"> | null = null;
 let heartbeatPostTerminalRunEventDropped: Counter<"status"> | null = null;
 let heartbeatTimerChecked: Counter | null = null;
 let heartbeatTimerEnqueued: Counter | null = null;
@@ -4088,6 +4093,7 @@ function ensureRegistry(): {
   penstockGateProbeCounter: Counter<"path" | "outcome" | "provider" | "model">;
   penstockGateProbeDurationHistogram: Histogram<"path" | "provider">;
   heartbeatTimerSchedulerExclusionCounter: Counter<"reason">;
+  modelProfileUnappliedCounter: Counter<"adapter" | "requested" | "reason">;
   heartbeatPostTerminalRunEventDroppedCounter: Counter<"status">;
   heartbeatTimerCheckedCounter: Counter;
   heartbeatTimerEnqueuedCounter: Counter;
@@ -4219,6 +4225,7 @@ function ensureRegistry(): {
     || !penstockGateProbe
     || !penstockGateProbeDuration
     || !heartbeatTimerSchedulerExclusion
+    || !modelProfileUnapplied
     || !heartbeatPostTerminalRunEventDropped
     || !heartbeatTimerChecked
     || !heartbeatTimerEnqueued
@@ -4430,6 +4437,15 @@ function ensureRegistry(): {
         + "Buckets run to 5s so a probe aborted at the gate's 3s timeout stays visible.",
       labelNames: ["path", "provider"],
       buckets: [...PENSTOCK_PROBE_DURATION_BUCKETS_SECONDS],
+      registers: [registry],
+    });
+    modelProfileUnapplied = new Counter({
+      name: MODEL_PROFILE_UNAPPLIED_METRIC,
+      help:
+        "Count of heartbeat runs whose requested model profile was not applied (BLO-32843), "
+        + "so the run executed on the agent's primary model. reason is the resolver's "
+        + "fallbackReason, e.g. adapter_profile_not_supported.",
+      labelNames: ["adapter", "requested", "reason"],
       registers: [registry],
     });
     heartbeatTimerSchedulerExclusion = new Counter({
@@ -6306,6 +6322,7 @@ function ensureRegistry(): {
     penstockGateProbeCounter: penstockGateProbe,
     penstockGateProbeDurationHistogram: penstockGateProbeDuration,
     heartbeatTimerSchedulerExclusionCounter: heartbeatTimerSchedulerExclusion,
+    modelProfileUnappliedCounter: modelProfileUnapplied,
     heartbeatPostTerminalRunEventDroppedCounter: heartbeatPostTerminalRunEventDropped,
     heartbeatTimerCheckedCounter: heartbeatTimerChecked,
     heartbeatTimerEnqueuedCounter: heartbeatTimerEnqueued,
@@ -6770,6 +6787,18 @@ export function recordPenstockAvailabilityGateProbe(
     );
   }
   return labels;
+}
+
+export function recordModelProfileUnapplied(input: {
+  adapter: string;
+  requested: string;
+  reason: string | null;
+}): void {
+  ensureRegistry().modelProfileUnappliedCounter.inc({
+    adapter: input.adapter || "unknown",
+    requested: input.requested,
+    reason: input.reason ?? "unknown",
+  });
 }
 
 export function recordHeartbeatTimerSchedulerExclusion(reason: string | null | undefined): string {
@@ -9025,6 +9054,7 @@ export function __resetMetricsForTest(): void {
   penstockGateProbe = null;
   penstockGateProbeDuration = null;
   heartbeatTimerSchedulerExclusion = null;
+  modelProfileUnapplied = null;
   heartbeatPostTerminalRunEventDropped = null;
   heartbeatTimerChecked = null;
   heartbeatTimerEnqueued = null;
