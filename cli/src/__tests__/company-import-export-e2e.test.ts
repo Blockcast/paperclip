@@ -38,7 +38,14 @@ async function getAvailablePort(): Promise<number> {
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
-const SERVER_STARTUP_TIMEOUT_MS = 120_000;
+// BLO-48155: boot is dominated by tsx importing server/src/index.ts, ~18 s of
+// CPU even on an idle runner with no single hotspot. Measured spawn-to-healthy:
+// 22-36 s idle, ~105 s at a 1:5 CPU share; loaded CI runners crossed 120 s with
+// the child alive and no error. A real hang still fails, naming its phase.
+const SERVER_STARTUP_TIMEOUT_MS = 300_000;
+// Each of the body's `pnpm paperclipai` calls pays its own tsx cold start, so
+// the body is load-sensitive in the same way (it timed out at 180 s under load).
+const TEST_BODY_TIMEOUT_MS = 600_000;
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
@@ -253,7 +260,7 @@ async function runCliJson<T>(
 async function waitForServer(
   apiBase: string,
   child: ServerProcess,
-  output: { stdout: string[]; stderr: string[] },
+  output: ServerOutput,
   logDir: string,
 ) {
   const startedAt = Date.now();
@@ -276,7 +283,10 @@ async function waitForServer(
 
     try {
       const res = await fetch(`${apiBase}/api/health`);
-      if (res.ok) return;
+      if (res.ok) {
+        console.log(`[company-import-export-e2e] server healthy ${Date.now() - startedAt}ms after spawn`);
+        return;
+      }
     } catch {
       // Server is still starting.
     }
@@ -288,10 +298,40 @@ async function waitForServer(
   // loop above should have caught a death, but a diagnostic that states
   // liveness as fact is exactly the kind of claim that sent this investigation
   // down the wrong path once already.
+  const phase = output.lastLine
+    ? `stalled phase: ${JSON.stringify(output.lastLine.text)} (since +${output.lastLine.at}ms)`
+    : "stalled phase: none (child printed nothing)";
   throw new Error(
     `Timed out waiting for ${apiBase}/api/health after ${SERVER_STARTUP_TIMEOUT_MS}ms ` +
-      `(exitCode=${child.exitCode} signalCode=${child.signalCode}).\n${diagnostics()}`,
+      `(exitCode=${child.exitCode} signalCode=${child.signalCode}); ${phase}.\n${diagnostics()}`,
   );
+}
+
+type ServerOutput = {
+  stdout: string[];
+  stderr: string[];
+  lastLine?: { text: string; at: number };
+};
+
+// Stamps each chunk with ms-since-spawn and remembers the last stdout line, so
+// a startup timeout reports which CLI step it stalled in and since when.
+function captureOutput(child: ServerProcess, output: ServerOutput) {
+  const spawnedAt = Date.now();
+  const record = (stream: string[], chunk: unknown, trackPhase: boolean) => {
+    const at = Date.now() - spawnedAt;
+    const text = String(chunk);
+    stream.push(`[+${at}ms] ${text}`);
+    if (!trackPhase) return;
+    const line = text
+      .replace(/\u001b\[[0-9;]*m/g, "")
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean)
+      .pop();
+    if (line) output.lastLine = { text: line, at };
+  };
+  child.stdout?.on("data", (chunk) => record(output.stdout, chunk, true));
+  child.stderr?.on("data", (chunk) => record(output.stderr, chunk, false));
 }
 
 describeEmbeddedPostgres("paperclipai company import/export e2e", () => {
@@ -322,7 +362,7 @@ describeEmbeddedPostgres("paperclipai company import/export e2e", () => {
     apiBase = `http://127.0.0.1:${port}`;
 
     const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
-    const output = { stdout: [] as string[], stderr: [] as string[] };
+    const output: ServerOutput = { stdout: [], stderr: [] };
     const child = spawn(
       "pnpm",
       ["paperclipai", "run", "--config", configPath],
@@ -337,15 +377,10 @@ describeEmbeddedPostgres("paperclipai company import/export e2e", () => {
       },
     );
     serverProcess = child;
-    child.stdout?.on("data", (chunk) => {
-      output.stdout.push(String(chunk));
-    });
-    child.stderr?.on("data", (chunk) => {
-      output.stderr.push(String(chunk));
-    });
+    captureOutput(child, output);
 
     await waitForServer(apiBase, child, output, serverLogDir(tempRoot));
-  }, 180_000);
+  }, SERVER_STARTUP_TIMEOUT_MS + 60_000);
 
   afterAll(async () => {
     await stopServerProcess(serverProcess);
@@ -644,5 +679,5 @@ describeEmbeddedPostgres("paperclipai company import/export e2e", () => {
     // Spawns a real server process and drives a full export + double import. The
     // prior 90s override sat below this project's own 120s ARC default and
     // flaked under shared-runner contention (BLO-17053); give it real headroom.
-  }, 180_000);
+  }, TEST_BODY_TIMEOUT_MS);
 });
