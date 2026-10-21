@@ -11,6 +11,7 @@
     "src/__tests__/accepted-interaction-outcome-sweep-postgres.test.ts",
     "src/__tests__/app-plugin-takeover-resync.test.ts",
     "src/__tests__/github-webhook-dedicated-pool.test.ts",
+    "src/__tests__/heartbeat-pending-image-bump-dispatch.test.ts",
     "src/__tests__/heartbeat-strict-git-probe-stderr.test.ts",
     "src/__tests__/issue-park-expiry-sweep.test.ts",
     "src/__tests__/issue-tree-hold-metrics.test.ts",
