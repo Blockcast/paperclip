@@ -31354,25 +31354,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         );
       }
 
-      // BLO-8746/BLO-8827: we hold the agent start lock, orphans have been
-      // reaped, and (for external-lifecycle agents) the early return above
-      // guarantees no run is currently executing. Apply any pending image bump
-      // NOW, before dispatching the next queued run, so that run's Job is
-      // created on the new image. The setRunStatus completion hook also retries
+      // BLO-8746/BLO-8827: we hold the agent start lock and orphans have been
+      // reaped. Apply any pending image bump NOW, before dispatching the next
+      // queued run, so that run's Job is created on the new image. The setRunStatus completion hook also retries
       // a pending bump, but it is fire-and-forget and can lose the race to this
       // synchronous dispatch — applying here makes convergence deterministic
       // and stops a perpetually-backlogged maxConcurrentRuns=1 agent from
       // starving the bump (which previously pinned it to a stale image until
       // its queue drained to empty, i.e. never under steady automation).
       if (externalLifecycle && agent.pendingImageBump) {
-        // Image changes are agent-wide. Drain all active slots before applying
-        // the bump so a concurrent dispatch cannot launch an older image after
-        // the operator requested convergence.
-        if (runningCount > 0 || hasActiveExternalJob) {
-          await noteDispatchDeclined(agentId, "pending_image_bump", agent.companyId);
-          return [];
-        }
-        await processPendingImageBumpForAgent(db, agentId);
+        // BLO-42411: apply even while runs are executing. The image is read only
+        // when a Job is created, and a re-executed run adopts its existing Job
+        // rather than recreating it, so in-flight Jobs keep their image. Holding
+        // the start lock means no dispatch for this agent can launch the old
+        // image after this point, which is all convergence needs. The previous
+        // drain (decline until runningCount hit 0) froze every free slot of a
+        // multi-slot agent behind its slowest run, for up to timeoutSec.
+        await processPendingImageBumpForAgent(db, agentId, { applyWhileExecuting: true });
         agent = (await getAgent(agentId)) ?? agent;
       }
 

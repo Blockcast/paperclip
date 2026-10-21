@@ -268,7 +268,8 @@ describe("startNextQueuedRunForAgent decline instrumentation", () => {
   it("records a reason at every path that returns without claiming a run", () => {
     // Guards the slice itself: if this drops to 0 the scan below passes
     // vacuously, which is the failure mode a source-level test must not have.
-    expect(returnCount).toBeGreaterThanOrEqual(16);
+    // 15 since BLO-42411 removed the `pending_image_bump` decline.
+    expect(returnCount).toBeGreaterThanOrEqual(15);
     expect(findUninstrumentedReturns(functionSource)).toEqual([]);
   });
 
