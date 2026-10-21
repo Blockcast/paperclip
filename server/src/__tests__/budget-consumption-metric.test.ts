@@ -10,10 +10,10 @@ import {
   costEvents,
   createDb,
 } from "@paperclipai/db";
-import { agentService } from "../services/agents.ts";
-import { budgetService } from "../services/budgets.ts";
-import { companyService } from "../services/companies.ts";
-import { costService } from "../services/costs.ts";
+import { agentService } from "../services/agents.js";
+import { budgetService } from "../services/budgets.js";
+import { companyService } from "../services/companies.js";
+import { costService } from "../services/costs.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
