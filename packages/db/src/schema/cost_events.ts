@@ -40,6 +40,19 @@ export const costEvents = pgTable(
     cacheCreationInputTokens: integer("cache_creation_input_tokens").notNull().default(0),
     outputTokens: integer("output_tokens").notNull().default(0),
     costCents: integer("cost_cents").notNull(),
+    // PEN-4466: list-price CONSUMPTION, the quantity every hard gate enforces on.
+    // `cost_cents` is written through normalizeBilledCostCents() (services/heartbeat.ts),
+    // which returns 0 for billingType "subscription_included" -- so the day an adapter
+    // classifies subscription lanes correctly, every cap that sums cost_cents reads 0
+    // forever. This column is computed from the same costUsd with NO billingType branch,
+    // which is what makes correcting classification safe.
+    //
+    // NULLABLE on purpose: NULL means "this row predates the column", 0 means "this run
+    // genuinely cost nothing". A NOT NULL DEFAULT 0 cannot tell those apart, which would
+    // force readers into nullif(consumption_cents, 0) and silently re-read cost_cents for
+    // every free row forever. Readers use coalesce(consumption_cents, cost_cents) --
+    // see computeObservedAmount (services/budgets.ts) for the ordering constraint.
+    consumptionCents: integer("consumption_cents"),
     occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull(),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
