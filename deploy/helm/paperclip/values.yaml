@@ -137,12 +137,9 @@ worker:
   # (BLO-43292, BLO-46694). Every replica mounts the same `/paperclip`, so it
   # also needs `persistence.existingClaim` on a ReadWriteMany volume — with
   # volumeClaimTemplates each pod would get its own empty data directory.
-  # NOT YET SAFE above 1 (BLO-45764 review): every worker runs its own plugin
-  # subprocesses (`loader.loadAll()` is not lease-gated), the `-workers`
-  # Service spreads plugin routes across pods, and plugin install/enable/
-  # upgrade/config only reach the pod that served the request. The plugin
-  # event outbox also runs on the lease holder only, so bridge streams on the
-  # other pod get no events. Keep 1 until plugin hosting follows the lease.
+  # Plugin routes are forwarded to the lease holder and a new holder resyncs
+  # its plugin set on takeover (BLO-47803), so plugin lifecycle changes no
+  # longer split across pods.
   replicas: 1
 
 # -- Kubernetes Service exposing the HTTP UI/API.

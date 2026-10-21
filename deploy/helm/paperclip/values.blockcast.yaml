@@ -564,6 +564,11 @@ api:
 # move this entry into env.extra: that list is rendered on the API Deployment
 # as well, and the chart rejects that configuration.
 worker:
+  # BLO-45764: second worker for scheduler-lease failover. Every replicas>1
+  # precondition is merged and deployed (BLO-43292, BLO-44457, BLO-45212,
+  # BLO-45763, BLO-46694, BLO-47803); `/paperclip` is the RWX existingClaim
+  # `paperclip-data`. Rollback: set back to 1.
+  replicas: 2
   extraEnv:
     - name: PENSTOCK_API_KEY
       valueFrom:
