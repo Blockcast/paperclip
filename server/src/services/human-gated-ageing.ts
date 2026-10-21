@@ -273,6 +273,20 @@ export type HumanGatedAgeingReport = {
   escalateAfterDaysByPriority: Readonly<Record<string, number>>;
   countsByWaitKind: Record<HumanGatedWaitKind, number>;
   countsByPriority: Record<string, number>;
+  /**
+   * Priority composition of the rows the `maxEscalated` cap dropped (PEN-4489).
+   *
+   * `countsByPriority` counts the whole past-threshold pool and `escalated`
+   * lists the head that survived the cap, so the difference between them — the
+   * rows a human is *not* being shown — was derivable but never derived, and
+   * the rendered notice reported it as an undifferentiated count. Priority is
+   * honoured at the threshold and then discarded at the cut, so that count can
+   * hide a `critical` row past its threshold by 4x behind a bare "36 further
+   * issues". Materialising it here is what lets the renderer say so.
+   *
+   * This changes no selection: which rows escalate is untouched.
+   */
+  omittedCountsByPriority: Record<string, number>;
 };
 
 function comparePriority(a: string | null | undefined, b: string | null | undefined): number {
@@ -490,10 +504,25 @@ export function selectAgedHumanGatedIssues(
   // `totalOverThreshold` still counts it. That is a false all-clear by another
   // route, which is exactly what this module exists to make impossible.
   const countsByPriority: Record<string, number> = Object.create(null) as Record<string, number>;
-  for (const issue of overThreshold) {
+  // Same null-prototype reasoning as above: this is keyed by issue-controlled
+  // priority too, and a swallowed write here under-reports what was withheld —
+  // which is the exact failure direction this counter exists to close.
+  const omittedCountsByPriority: Record<string, number> = Object.create(null) as Record<
+    string,
+    number
+  >;
+  // `escalated` is a prefix of `overThreshold` (slice from 0), so the omitted
+  // set is its tail. Counted by walking the tail rather than by subtracting two
+  // tallies: a subtraction would silently emit a negative count if that prefix
+  // relationship ever stopped holding, and a negative "withheld" count renders
+  // as a confident falsehood instead of an error.
+  for (const [index, issue] of overThreshold.entries()) {
     countsByWaitKind[issue.waitKind] += 1;
     const priority = issue.priority ?? "unset";
     countsByPriority[priority] = (countsByPriority[priority] ?? 0) + 1;
+    if (index >= escalated.length) {
+      omittedCountsByPriority[priority] = (omittedCountsByPriority[priority] ?? 0) + 1;
+    }
   }
 
   return {
@@ -506,6 +535,7 @@ export function selectAgedHumanGatedIssues(
     escalateAfterDaysByPriority,
     countsByWaitKind,
     countsByPriority,
+    omittedCountsByPriority,
   };
 }
 
@@ -616,6 +646,26 @@ function formatMalformedIssueRef(issue: HumanGatedIssue): string {
   return sanitizeRenderedField(issue.identifier ?? issue.id, "(unidentified issue)");
 }
 
+/**
+ * Render a priority tally as ", including critical 7, high 12" — or "" when the
+ * tally is empty.
+ *
+ * Priority is issue-controlled data, so every key goes through
+ * {@link sanitizeRenderedField} for the same reason the priority headings do:
+ * an unsanitised key here would be a backtick-bearing span inside the untrusted
+ * region, which is exactly the delimiter forgery the region markers exist to
+ * make impossible.
+ */
+function formatPriorityBreakdown(counts: Record<string, number>): string {
+  const parts = orderedPriorityKeys(Object.keys(counts))
+    .map((priority) => {
+      const count = counts[priority] ?? 0;
+      return count > 0 ? `${sanitizeRenderedField(priority, "unset")} ${count}` : null;
+    })
+    .filter((part): part is string => part !== null);
+  return parts.length === 0 ? "" : `, including ${parts.join(", ")}`;
+}
+
 function orderedPriorityKeys(keys: Iterable<string>): string[] {
   const present = new Set(keys);
   return [
@@ -702,8 +752,28 @@ export function formatHumanGatedAgeingSections(report: HumanGatedAgeingReport): 
 
   if (report.escalatedOmitted > 0) {
     if (body.length > 0) body.push("");
+    // The old notice was "Showing the N oldest; M further issues are also past
+    // threshold." — true, and read as a reassurance. "Also past threshold"
+    // describes the rows' state, not their fate, so nothing in it says the M
+    // are *not shown*, and nothing says what they are. Underneath it the list
+    // is grouped under `critical` / `high` headings, which invites the reading
+    // that the urgent ones are the ones on display. They are the urgent ones
+    // *among the oldest N*; priority is honoured at the threshold and then
+    // discarded at the cut, so a `critical` row past its threshold by 4x is
+    // withheld in silence while a `low` row that cleared a 45d bar on age
+    // occupies a slot (PEN-4489).
+    //
+    // This says what was withheld and on what rule. It does not change which
+    // rows are selected — whether age alone is the right rationing rule is a
+    // product decision that is open, not one this renderer should pre-empt.
     body.push(
-      `Showing the ${report.escalated.length} oldest; ${report.escalatedOmitted} further issues are also past threshold.`,
+      `Showing the ${report.escalated.length} oldest of ${report.totalOverThreshold} past threshold; ${report.escalatedOmitted} ${report.escalatedOmitted === 1 ? "row is" : "rows are"} withheld by the cap and not listed below${formatPriorityBreakdown(report.omittedCountsByPriority)}.`,
+    );
+    const cutRow = report.escalated[report.escalated.length - 1];
+    body.push(
+      cutRow
+        ? `The cut is by age alone: priority sets each row's threshold but is not consulted here, so a past-threshold row quieter for less than ${formatAge(cutRow.humanSilenceDays)} does not appear whatever its priority or what it blocks.`
+        : "The cut is by age alone: priority sets each row's threshold but is not consulted here. The cap is 0, so no past-threshold row appears whatever its priority or what it blocks.",
     );
   }
 

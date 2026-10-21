@@ -483,7 +483,12 @@ describeEmbeddedPostgres("humanGatedDigestTick (wired)", () => {
     const body = (await digestRow(companyId))[0]?.description ?? "";
     const listed = (body.match(/^- HGD-B\d+ —/gm) ?? []).length;
     expect(listed).toBe(DEFAULT_MAX_ESCALATED);
-    expect(body).toContain("5 further issues are also past threshold");
+    // PEN-4489 reworded this notice; the wired property is unchanged — the
+    // delivered digest must still state how many rows the cap dropped. The cut
+    // rule is asserted too, so a notice that kept the count while losing what
+    // was withheld would fail here rather than read as a pass.
+    expect(body).toContain("5 rows are withheld by the cap and not listed below");
+    expect(body).toContain("The cut is by age alone");
   });
 
   // -- A failing producer must not read as an all-clear -----------------------
