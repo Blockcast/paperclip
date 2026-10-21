@@ -10012,10 +10012,18 @@ export function recoveryService(
           retryReason: reason,
           source: "issue.stale_unblock_recovery",
           retryOfRunId: staleRun?.id ?? null,
-          extraContext: reviewStageId ? { currentStageId: reviewStageId } : undefined,
+          extraContext: reviewStageId
+            ? {
+              currentStageId: reviewStageId,
+              currentStageType: pendingExecutionState?.currentStageType ?? null,
+              reviewRecoveryInstruction:
+                "This issue was unblocked while its execution-review stage was still pending. Submit the review decision now, or mark the issue blocked with the exact unblock action.",
+            }
+            : undefined,
         });
         if (queued) {
-          result.continuationRequeued += 1;
+          if (reviewStageId) result.reviewParticipantRequeued += 1;
+          else result.continuationRequeued += 1;
           result.issueIds.push(issue.id);
         } else {
           result.skipped += 1;

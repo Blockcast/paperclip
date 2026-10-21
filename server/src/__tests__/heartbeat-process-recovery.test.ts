@@ -15412,6 +15412,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       result: Awaited<ReturnType<ReturnType<typeof createHeartbeat>["reconcileStrandedAssignedIssues"]>>,
       issueId: string,
       status: string,
+      sweep: () => ReturnType<ReturnType<typeof createHeartbeat>["reconcileStrandedAssignedIssues"]> =
+        () => createHeartbeat({ penstockAvailabilityGate: allowPenstockGate }).reconcileStrandedAssignedIssues(),
     ) {
       // Branch-specific counter too: the handoff arm increments
       // `successfulRunHandoffEscalated`, not `escalated`.
@@ -15425,17 +15427,42 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       // with no run and no wake forever (the unblock PATCH only wakes on `blocked` ->
       // `todo`), so each gate must instead leave a live execution path: one queued wake
       // whose run will postdate the unblock.
-      expect(result.continuationRequeued).toBe(1);
-      const requeued = await db.select().from(heartbeatRuns).where(and(
+      const staleUnblockRuns = () => db.select().from(heartbeatRuns).where(and(
         sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
         sql`${heartbeatRuns.contextSnapshot} ->> 'source' = 'issue.stale_unblock_recovery'`,
       ));
+      const requeued = await staleUnblockRuns();
       expect(requeued).toHaveLength(1);
+      // A pending review stage is a participant wake, counted where the native
+      // participant-recovery arm counts it; anything else is a plain continuation.
+      const pendingStageId = (issue?.executionState as { currentStageId?: string } | null)?.currentStageId ?? null;
+      expect((requeued[0]!.contextSnapshot as { currentStageId?: string } | null)?.currentStageId ?? null)
+        .toBe(pendingStageId);
+      expect(result.continuationRequeued).toBe(pendingStageId ? 0 : 1);
+      expect(result.reviewParticipantRequeued).toBe(pendingStageId ? 1 : 0);
       expect(requeued[0]!.createdAt.getTime()).toBeGreaterThan(unblockAt.getTime());
       expect(requeued[0]?.agentId).toBe(
         (issue?.executionState as { currentParticipant?: { agentId?: string } } | null)?.currentParticipant?.agentId ??
           issue?.assigneeAgentId,
       );
+
+      // Self-limiting across sweeps: while the wake is pending the next sweep must not
+      // stack a second one, and once its run is terminal it postdates the unblock, so the
+      // gate cannot match again for this unblock.
+      const second = await sweep();
+      expect(second.continuationRequeued + second.reviewParticipantRequeued).toBe(0);
+      expect(await staleUnblockRuns()).toHaveLength(1);
+      const finishedAt = new Date();
+      await db.update(heartbeatRuns).set({ status: "succeeded", startedAt: finishedAt, finishedAt })
+        .where(eq(heartbeatRuns.id, requeued[0]!.id));
+      if (requeued[0]!.wakeupRequestId) {
+        await db.update(agentWakeupRequests).set({ status: "completed", claimedAt: finishedAt, finishedAt })
+          .where(eq(agentWakeupRequests.id, requeued[0]!.wakeupRequestId));
+      }
+      await db.update(issues).set({ executionRunId: null, executionLockedAt: null, checkoutRunId: null })
+        .where(eq(issues.id, issueId));
+      await sweep();
+      expect(await staleUnblockRuns()).toHaveLength(1);
     }
 
     it("non-in_review configuration_incomplete adapter failure", async () => {
@@ -15538,14 +15565,16 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     it("in_review participant configuration_incomplete adapter failure", async () => {
       const { issueId } = await seedFailedParticipant("configuration_incomplete");
-      const result = await createHeartbeat().reconcileStrandedAssignedIssues();
-      await expectNotReescalated(result, issueId, "in_review");
+      const sweep = () => createHeartbeat().reconcileStrandedAssignedIssues();
+      const result = await sweep();
+      await expectNotReescalated(result, issueId, "in_review", sweep);
     });
 
     it("in_review participant whose automatic recovery already failed", async () => {
       const { issueId } = await seedFailedParticipant("process_lost", "execution_review_participant_recovery");
-      const result = await createHeartbeat().reconcileStrandedAssignedIssues();
-      await expectNotReescalated(result, issueId, "in_review");
+      const sweep = () => createHeartbeat().reconcileStrandedAssignedIssues();
+      const result = await sweep();
+      await expectNotReescalated(result, issueId, "in_review", sweep);
     });
 
     it("accepted-interaction continuation cancelled waiting on review three times", async () => {
@@ -15626,8 +15655,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       }
       await recordUnblock(companyId, issueId, "in_review");
 
-      const result = await createHeartbeat().reconcileStrandedAssignedIssues();
-      await expectNotReescalated(result, issueId, "in_review");
+      const sweep = () => createHeartbeat().reconcileStrandedAssignedIssues();
+      const result = await sweep();
+      await expectNotReescalated(result, issueId, "in_review", sweep);
     });
   });
 
