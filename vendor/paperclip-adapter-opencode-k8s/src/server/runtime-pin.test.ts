@@ -5,6 +5,12 @@ import path from "node:path";
 import { describe, it, expect } from "vitest";
 import {
   DEFAULT_OPENCODE_VERSION,
+  IMAGE_WRAPPER_BINARIES,
+  IMAGE_WRAPPER_PATH_RESOLVED,
+  IMAGE_WRAPPER_PREFLIGHT_OK,
+  IMAGE_WRAPPER_PREFLIGHT_MISSING,
+  IMAGE_WRAPPER_PREFLIGHT_NOT_ON_PATH,
+  buildImageWrapperPreflightShell,
   IMAGE_WRAPPER_BIN_DIR,
   OPENCODE_PACKAGE,
   buildOpencodeRuntimeShell,
@@ -200,5 +206,116 @@ describe("buildOpencodeRuntimeShell PATH precedence (PEN-3925)", () => {
     } finally {
       rmSync(base, { recursive: true, force: true });
     }
+  });
+});
+
+describe("buildImageWrapperPreflightShell (PEN-4446)", () => {
+  const snippet = buildImageWrapperPreflightShell();
+
+  /**
+   * The snippet hardcodes IMAGE_WRAPPER_BIN_DIR, which exists on the machine
+   * running these tests only by accident. Point it at a fixture instead so the
+   * arms are reachable, and pin the real literal separately below — together
+   * those two are equivalent to exercising the shipped string.
+   */
+  const against = (dir: string) => {
+    const swapped = snippet.replace(`__pcwrapdir='${IMAGE_WRAPPER_BIN_DIR}'`, `__pcwrapdir='${dir}'`);
+    expect(swapped).not.toBe(snippet);
+    return swapped;
+  };
+  const run = (script: string, pathEnv?: string) =>
+    spawnSync("sh", ["-c", script], {
+      encoding: "utf8",
+      env: { PATH: pathEnv ?? "/usr/bin:/bin", HOME: tmpdir() },
+    });
+
+  const fixture = (binaries: readonly string[]) => {
+    const dir = mkdtempSync(path.join(tmpdir(), "pcwrap-"));
+    for (const name of binaries) {
+      writeFileSync(path.join(dir, name), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    }
+    return dir;
+  };
+
+  it("names the real wrapper directory, so the fixture swap above cannot hide a wrong constant", () => {
+    expect(snippet).toContain(`__pcwrapdir='${IMAGE_WRAPPER_BIN_DIR}'`);
+    expect(IMAGE_WRAPPER_BIN_DIR).toBe("/usr/local/libexec/paperclip/bin");
+  });
+
+  it("reports ok when every wrapper is present and owns resolution", () => {
+    const dir = fixture(IMAGE_WRAPPER_BINARIES);
+    try {
+      const r = run(against(dir), `${dir}:/usr/bin:/bin`);
+      expect(r.stderr).toContain(IMAGE_WRAPPER_PREFLIGHT_OK);
+      expect(r.status).toBe(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("reports MISSING on a pre-cutover image, where the directory does not exist at all", () => {
+    const r = run(against(path.join(tmpdir(), "pcwrap-absent-does-not-exist")));
+    expect(r.stderr).toContain(IMAGE_WRAPPER_PREFLIGHT_MISSING);
+    // Names every wrapper, which is what tells an operator it is the cutover
+    // rather than a single corrupted file.
+    for (const name of IMAGE_WRAPPER_BINARIES) expect(r.stderr).toContain(name);
+    expect(r.status).toBe(0);
+  });
+
+  it("reports MISSING when only the chained wrappers are absent", () => {
+    // The mutation guard for IMAGE_WRAPPER_BINARIES: `gh`/`git`/
+    // `github-mcp-server` all resolve correctly here, so a check written
+    // against only the PATH-resolved subset calls this image healthy — while
+    // the `git` wrapper execs `paperclip-github-token-env` and would fail.
+    const dir = fixture(IMAGE_WRAPPER_PATH_RESOLVED);
+    try {
+      const r = run(against(dir), `${dir}:/usr/bin:/bin`);
+      expect(r.stderr).toContain(IMAGE_WRAPPER_PREFLIGHT_MISSING);
+      expect(r.stderr).toContain("paperclip-github-token-env");
+      expect(r.stderr).toContain("github-token-credential-helper");
+      expect(r.stderr).not.toContain(IMAGE_WRAPPER_PREFLIGHT_OK);
+      expect(r.status).toBe(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("reports NOT-ON-PATH when the wrappers are present but something else wins (PEN-4357)", () => {
+    const dir = fixture(IMAGE_WRAPPER_BINARIES);
+    const shadow = fixture(IMAGE_WRAPPER_PATH_RESOLVED);
+    try {
+      // Presence alone is satisfied; resolution is not. A check that stopped at
+      // `[ -x ... ]` would report ok on a pod whose GitHub traffic is
+      // unscrubbed, which is the defect PEN-4357 found live.
+      const r = run(against(dir), `${shadow}:${dir}:/usr/bin:/bin`);
+      expect(r.stderr).toContain(IMAGE_WRAPPER_PREFLIGHT_NOT_ON_PATH);
+      expect(r.stderr).toContain(`gh=${path.join(shadow, "gh")}`);
+      expect(r.stderr).not.toContain(IMAGE_WRAPPER_PREFLIGHT_OK);
+      expect(r.status).toBe(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      rmSync(shadow, { recursive: true, force: true });
+    }
+  });
+
+  it("leaves no scratch variable behind, in any arm", () => {
+    const probe = 'printf "[%s][%s][%s][%s][%s]" "$__pcwrapdir" "$__pcwrapmiss" "$__pcwrapbin" "$__pcwrapres" "$__pcwrapbad"';
+    const dir = fixture(IMAGE_WRAPPER_BINARIES);
+    try {
+      for (const script of [against(dir), against(path.join(tmpdir(), "pcwrap-absent-does-not-exist"))]) {
+        const r = run(`${script}; ${probe}`, `${dir}:/usr/bin:/bin`);
+        expect(r.stdout).toBe("[][][][][]");
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("is spliceable: no trailing separator and never exits non-zero", () => {
+    expect(snippet.trimEnd().endsWith(";")).toBe(false);
+    // `set -e` is not in force in the Job command, but a snippet that can fail
+    // would still poison a `&&` chain if one is ever added around it.
+    const r = run(`${against(path.join(tmpdir(), "pcwrap-absent-does-not-exist"))} && echo REACHED`);
+    expect(r.stdout).toContain("REACHED");
   });
 });
