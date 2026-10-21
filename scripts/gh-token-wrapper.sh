@@ -86,8 +86,10 @@ strip_ai_trailers() {
 
 # Attribution shapes only: a bare "model used" or "generated with" also appears
 # in the PR template's checklist and in codegen prose, and refusing on those
-# refused every templated PR.
-AI_ATTRIBUTION_RE='co-authored-by:|noreply@anthropic\.com|noreply@paperclip\.ing|generated with \[?claude|^[-*_> \t]*model used'
+# refused every templated PR. `co-authored-by:` counts only at the start of a
+# line (after list/quote markers): prose that documents the trailer, e.g.
+# "drops the `Co-authored-by:` line", is not attribution (BLO-48206).
+AI_ATTRIBUTION_RE='^[-*_> \t]*co-authored-by:|noreply@anthropic\.com|noreply@paperclip\.ing|generated with \[?claude|^[-*_> \t]*model used'
 refuse_if_ai_attribution_left() {
   if grep -qiE "${AI_ATTRIBUTION_RE}" "$1"; then
     grep -niE "${AI_ATTRIBUTION_RE}" "$1" >&2 || true

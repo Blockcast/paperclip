@@ -990,6 +990,26 @@ for (const [label, leftover] of [
   });
 }
 
+test("prose that documents the Co-authored-by trailer does not refuse the merge (BLO-48206)", () => {
+  withTempDir((dir) => {
+    const prose = "This PR drops the `Co-authored-by:` trailer from squash bodies.";
+    const { body } = runMerge(dir, ["pr", "merge", "-s"], { prBody: `Fix.\n${prose}` });
+    assert.ok(body !== null);
+    assert.match(body, /^This PR drops the `Co-authored-by:` trailer/m);
+  });
+});
+
+test("a quoted Co-authored-by trailer is still refused after the scrub (BLO-48206)", () => {
+  withTempDir((dir) => {
+    const { proc, args } = runMerge(dir, ["pr", "merge", "-s"], {
+      prBody: "Fix.\n> Co-authored-by: Dev <dev@example.com>",
+      status: 1,
+    });
+    assert.equal(args, undefined, "the real merge must not run");
+    assert.match(proc.stderr, /refusing the squash merge/);
+  });
+});
+
 test("a `-ds` short-flag cluster is treated as a squash (BLO-47692)", () => {
   withTempDir((dir) => {
     const { body } = runMerge(dir, ["pr", "merge", "7", "-ds"]);
