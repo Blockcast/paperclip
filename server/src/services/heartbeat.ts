@@ -27099,12 +27099,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     failures: RuntimeResourceReconciliationFailures = { failedRowCount: 0 },
     options: { suppressDispatch?: boolean; recordStageTiming?: boolean } = {},
   ) {
-    // PEN-4380 pass 2. Only the sweep's own call records these, so the three
-    // sub-stages keep summing to `reconcile_release_pending` the way the pass-1
-    // split sums to `reconcile_reservations`. The single-run callers
-    // (`onlyRunId`) share this function but are a different population, and
-    // mixing them would silently break that identity -- which is the property
-    // that makes the split checkable at all.
+    // PEN-4380 pass 2. Only the sweep's own call records these: the single-run
+    // callers (`onlyRunId`) share this function but are a different population,
+    // and mixing them would leave the sub-stages incomparable with the parent
+    // `reconcile_release_pending` -- the property that makes the split
+    // checkable at all.
+    //
+    // Ally (PR #2906, suggestion 2): that relation is `<=`, NOT equality. An
+    // earlier draft of this comment said the three "keep summing to"
+    // `reconcile_release_pending`, which overstates it -- a later reader who
+    // expects equality will read the shortfall as a bug. The parent also spans
+    // the loop's synchronous work (`noteStuckSkip`, logging) and every
+    // `continue` path that returns before `actStartedAt`. So read
+    // `parent - (select + job_reads + act)` as unattributed residual, and note
+    // that if that residual is ever LARGE it is itself the signal: it means the
+    // pass is spending its time somewhere none of these three awaits can see.
     const recordSubStage = options.recordStageTiming
       ? (stage: Parameters<typeof recordOrphanReapStage>[0], seconds: number) =>
         recordOrphanReapStage(stage, seconds)
@@ -27341,65 +27350,77 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const terminalPrelaunchOrphan =
           reservation.state === "reserved" || reservation.state === "launching";
         const actStartedAt = Date.now();
-        const released = await releaseExternalRuntimeReservation(db, {
-          runId: reservation.runId,
-          reason:
-            reservation.releaseReason ??
-            (terminalPrelaunchOrphan ? "terminal_prelaunch_orphan" : "job_terminal_or_missing"),
-        });
-        // PEN-3640: the row is drained, so its rate-limit entry can never
-        // suppress anything again. Dropping it here keeps the common case off
-        // the age-based prune path entirely.
-        if (released) stuckReservationLastLoggedAtMs.delete(reservation.id);
-        if (released && isHeartbeatRunTerminalStatus(run.status)) {
-          await releaseIssueExecutionAndPromote(run, {
-            externalWaitYield: run.errorCode === "external_wait_yield",
-          }).catch((error) => {
-            logger.warn(
-              { error, runId: run.id },
-              "reservation reconciler released runtime slot but issue-lock cleanup remains pending",
-            );
+        // Ally (PR #2906, suggestion 1): the `finally` is load-bearing, not
+        // tidiness. `failedRowCount` accounts for the row when this path throws,
+        // but a bare `actMs +=` after the block accounts for its TIME only on the
+        // success path -- so a row that hangs in `releaseExternalRuntimeReservation`
+        // and then throws contributes 0 to `release_pending_act`. That is exactly
+        // the shape this instrument exists to catch: a lock wait cut off by
+        // `statement_timeout`/`lock_timeout`, or a pool-acquire timeout. It is also
+        // the one shape `pg_stat_statements` cannot see either, because it does not
+        // record statements that end in an error -- which is why the "slow SQL
+        // refuted" evidence on PEN-4380 does not cover it. Without this `finally`
+        // the two instruments would share a blind spot over the only SQL hypothesis
+        // still standing. Matches how `jobReadMs` already uses `.finally`.
+        try {
+          const released = await releaseExternalRuntimeReservation(db, {
+            runId: reservation.runId,
+            reason:
+              reservation.releaseReason ??
+              (terminalPrelaunchOrphan ? "terminal_prelaunch_orphan" : "job_terminal_or_missing"),
           });
-          await finalizeAgentStatus(run.agentId, run.status).catch((error) => {
-            logger.warn(
-              { error, runId: run.id, agentId: run.agentId },
-              "reservation reconciler released runtime slot but agent finalization failed",
-            );
-          });
-          // PEN-2400 (Ally non-blocking 1): guard this the same way as the two
-          // siblings above. By this line the release has already COMMITTED, so
-          // the row is drained. An unguarded throw here lands in the per-row
-          // `catch` below, whose meaning is "this reservation may still be
-          // held" — it increments `failedRowCount`, clears
-          // `paperclip_orphaned_runtime_resource_metrics_refresh_success` and
-          // pages PaperclipRuntimeResourceReconciliationStuck about a backlog
-          // that does not exist. Dispatch is follow-on work with its own retry
-          // (the next `resumeQueuedRuns` pass), so log it and let the sweep
-          // report the truth about the reservation.
-          if (!options.suppressDispatch) {
-            await startNextQueuedRunForAgent(run.agentId).catch((error) => {
+          // PEN-3640: the row is drained, so its rate-limit entry can never
+          // suppress anything again. Dropping it here keeps the common case off
+          // the age-based prune path entirely.
+          if (released) stuckReservationLastLoggedAtMs.delete(reservation.id);
+          if (released && isHeartbeatRunTerminalStatus(run.status)) {
+            await releaseIssueExecutionAndPromote(run, {
+              externalWaitYield: run.errorCode === "external_wait_yield",
+            }).catch((error) => {
               logger.warn(
-                { error, runId: run.id, agentId: run.agentId },
-                "reservation reconciler released runtime slot but follow-on queued dispatch failed",
+                { error, runId: run.id },
+                "reservation reconciler released runtime slot but issue-lock cleanup remains pending",
               );
             });
+            await finalizeAgentStatus(run.agentId, run.status).catch((error) => {
+              logger.warn(
+                { error, runId: run.id, agentId: run.agentId },
+                "reservation reconciler released runtime slot but agent finalization failed",
+              );
+            });
+            // PEN-2400 (Ally non-blocking 1): guard this the same way as the two
+            // siblings above. By this line the release has already COMMITTED, so
+            // the row is drained. An unguarded throw here lands in the per-row
+            // `catch` below, whose meaning is "this reservation may still be
+            // held" — it increments `failedRowCount`, clears
+            // `paperclip_orphaned_runtime_resource_metrics_refresh_success` and
+            // pages PaperclipRuntimeResourceReconciliationStuck about a backlog
+            // that does not exist. Dispatch is follow-on work with its own retry
+            // (the next `resumeQueuedRuns` pass), so log it and let the sweep
+            // report the truth about the reservation.
+            if (!options.suppressDispatch) {
+              await startNextQueuedRunForAgent(run.agentId).catch((error) => {
+                logger.warn(
+                  { error, runId: run.id, agentId: run.agentId },
+                  "reservation reconciler released runtime slot but follow-on queued dispatch failed",
+                );
+              });
+            }
           }
+          if (released && terminalPrelaunchOrphan) {
+            logger.warn(
+              {
+                reservationId: reservation.id,
+                runId: reservation.runId,
+                runStatus: run.status,
+                reservationState: reservation.state,
+              },
+              "released prelaunch external-runtime reservation left behind by terminal run",
+            );
+          }
+        } finally {
+          actMs += Date.now() - actStartedAt;
         }
-        if (released && terminalPrelaunchOrphan) {
-          logger.warn(
-            {
-              reservationId: reservation.id,
-              runId: reservation.runId,
-              runStatus: run.status,
-              reservationState: reservation.state,
-            },
-            "released prelaunch external-runtime reservation left behind by terminal run",
-          );
-        }
-        // No `finally`: nothing between `actStartedAt` and here can `continue`
-        // or `break`, and a throw is already reported as `failedRowCount` by
-        // the per-row catch below, so the row is accounted for either way.
-        actMs += Date.now() - actStartedAt;
       } catch (error) {
         failures.failedRowCount += 1;
         logger.warn(
