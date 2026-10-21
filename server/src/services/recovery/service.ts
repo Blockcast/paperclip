@@ -2882,6 +2882,8 @@ export function recoveryService(
   // first instance of this gate for stranded-recovery-origin issues; BLO-8050
   // extended it to the branches it covered, and later work (e.g. the
   // BLO-31913 exhausted-handoff arm) has kept adding them one at a time.
+  // A gate that matches must call `requeueAfterStaleUnblock`, never bare-skip:
+  // a skip creates no newer run, so the gate would match forever (BLO-48133).
   //
   // No count is pinned here: two earlier revisions of this comment pinned one
   // ("all six escalation callsites"), both drifted, and that drift is how the
@@ -9984,6 +9986,41 @@ export function recoveryService(
       // Non-null only on the handover path; every recovery mutation below CASes
       // against it so a lost race takes no side effect.
       const adoptionHandoverLockGuard = adoptionHandover?.lockOwnerState ?? null;
+      // BLO-48133: what every BLO-8050 gate does instead of a bare skip. The gate holds
+      // back escalation on pre-unblock evidence, but a bare skip never creates the newer
+      // run that would release it: the unblock PATCH only wakes on `blocked` -> `todo`, so
+      // an unblock to `in_progress`/`in_review` (or an agent's own self-unblock) left the
+      // row with no run, no wake and no escalation, forever. Queue one wake instead. Its
+      // run postdates the unblock, so the gate stops matching and that run's own outcome
+      // -- not the pre-unblock one -- decides any later escalation. Self-limiting for the
+      // same reason: once that run exists the gate cannot match again for this unblock.
+      // The queued-wake check only stops it stacking on a wake already pending (e.g. the
+      // route's own `blocked` -> `todo` wake, not yet claimed).
+      const requeueAfterStaleUnblock = async (staleRun: LatestIssueRun) => {
+        if (await hasQueuedIssueWake(issue.companyId, issue.id, agentId) ||
+          await isInvocationBudgetBlocked(issue, agentId)) {
+          result.skipped += 1;
+          return;
+        }
+        const reviewStageId = issue.status === "in_review" ? pendingExecutionState?.currentStageId ?? null : null;
+        const reason = reviewStageId ? EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON : "issue_continuation_needed";
+        const queued = await enqueueStrandedIssueRecovery({
+          expectedLockOwnerState: adoptionHandoverLockGuard,
+          issueId: issue.id,
+          agentId,
+          reason,
+          retryReason: reason,
+          source: "issue.stale_unblock_recovery",
+          retryOfRunId: staleRun?.id ?? null,
+          extraContext: reviewStageId ? { currentStageId: reviewStageId } : undefined,
+        });
+        if (queued) {
+          result.continuationRequeued += 1;
+          result.issueIds.push(issue.id);
+        } else {
+          result.skipped += 1;
+        }
+      };
       // Counted BEFORE the reads, for the same reason the prefilter counts on entry: this
       // sizes the population that reaches the two round-trips below, and a candidate whose
       // `getAgent` throws still paid for one.
@@ -10186,7 +10223,7 @@ export function recoveryService(
         // fresh run window before re-escalating. See
         // `latestRunPredatesLatestUnblock` for the full rationale.
         if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestRun)) {
-          result.skipped += 1;
+          await requeueAfterStaleUnblock(latestRun);
           return;
         }
         const updated = await escalateStrandedRecoveryIssueInPlace({
@@ -10235,7 +10272,7 @@ export function recoveryService(
           // arm would re-flip the issue on evidence already known when they chose to unblock.
           if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestRun)) {
             // BLO-8050: operator just unblocked; skip re-escalation on stale evidence.
-            result.skipped += 1;
+            await requeueAfterStaleUnblock(latestRun);
             return;
           }
           const isGitTransport = adapterFailureClassification.kind === "workspace_git_transport";
@@ -10297,7 +10334,7 @@ export function recoveryService(
             : null;
           if (postResolutionClassification?.kind === "non_retryable") {
             if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestPostResolutionRun)) {
-              result.skipped += 1;
+              await requeueAfterStaleUnblock(latestPostResolutionRun);
               return;
             }
             const failureSummary = summarizeRunFailureForIssueComment(latestPostResolutionRun);
@@ -10355,7 +10392,7 @@ export function recoveryService(
             // above keys off the same run and was already gated.
             if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestPostResolutionRun)) {
               // BLO-8050: operator just unblocked; skip re-escalation on stale evidence.
-              result.skipped += 1;
+              await requeueAfterStaleUnblock(latestPostResolutionRun);
               return;
             }
             const updated = await escalateStrandedAssignedIssue({
@@ -10485,7 +10522,7 @@ export function recoveryService(
             return;
           }
           if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, participantLatestRun)) {
-            result.skipped += 1;
+            await requeueAfterStaleUnblock(participantLatestRun);
             return;
           }
           const failureSummary = summarizeRunFailureForIssueComment(participantLatestRun);
@@ -10540,7 +10577,7 @@ export function recoveryService(
           // adapter-failure arm: the classification is a pure function of `participantLatestRun`.
           if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, participantLatestRun)) {
             // BLO-8050: operator just unblocked; skip re-escalation on stale evidence.
-            result.skipped += 1;
+            await requeueAfterStaleUnblock(participantLatestRun);
             return;
           }
           const updated = await escalateStrandedAssignedIssue({
@@ -10607,7 +10644,7 @@ export function recoveryService(
           // contextSnapshot and never expires, so the verdict outlives an unblock.
           if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, participantLatestRun)) {
             // BLO-8050: operator just unblocked; skip re-escalation on stale evidence.
-            result.skipped += 1;
+            await requeueAfterStaleUnblock(participantLatestRun);
             return;
           }
           const updated = await escalateStrandedAssignedIssue({
@@ -10749,7 +10786,7 @@ export function recoveryService(
             // needs it most: the handoff evidence lives on the run's contextSnapshot and
             // never expires, so without this an operator moving the row back to `todo`
             // is met with an immediate re-flip to `blocked` on the same pre-unblock run.
-            result.skipped += 1;
+            await requeueAfterStaleUnblock(latestRun);
             return;
           }
 
@@ -10773,7 +10810,7 @@ export function recoveryService(
         const assignmentContinuationClassification = classifyContinuationFailure(latestRun);
         if (assignmentContinuationClassification.kind === "non_retryable") {
           if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestRun)) {
-            result.skipped += 1;
+            await requeueAfterStaleUnblock(latestRun);
             return;
           }
           const failureSummary = summarizeRunFailureForIssueComment(latestRun);
@@ -10821,7 +10858,7 @@ export function recoveryService(
         if (isNonRetryableTerminalRun(latestRun)) {
           if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestRun)) {
             // BLO-8050: operator just unblocked; skip re-escalation on stale evidence.
-            result.skipped += 1;
+            await requeueAfterStaleUnblock(latestRun);
             return;
           }
           const updated = await escalateStrandedAssignedIssue({
@@ -10850,7 +10887,7 @@ export function recoveryService(
         if (todoSessionUnavailableAdapterMismatch) {
           if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestRun)) {
             // BLO-8050: operator just unblocked; skip re-escalation on stale evidence.
-            result.skipped += 1;
+            await requeueAfterStaleUnblock(latestRun);
             return;
           }
           const updated = await escalateStrandedAssignedIssue({
@@ -10880,7 +10917,7 @@ export function recoveryService(
         ) {
           if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestRun)) {
             // BLO-8050: operator just unblocked; skip re-escalation on stale evidence.
-            result.skipped += 1;
+            await requeueAfterStaleUnblock(latestRun);
             return;
           }
           if (isZeroTokenSessionResetRetryRun(latestRun)) {
@@ -10916,7 +10953,7 @@ export function recoveryService(
         if (didAutomaticRecoveryFail(latestRun, "assignment_recovery")) {
           if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestRun)) {
             // BLO-8050: operator just unblocked; skip re-escalation on stale evidence.
-            result.skipped += 1;
+            await requeueAfterStaleUnblock(latestRun);
             return;
           }
           const failureSummary = summarizeRunFailureForIssueComment(latestRun);
@@ -10994,7 +11031,7 @@ export function recoveryService(
         // re-flipped to `blocked` on the same pre-unblock run.
         if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestRun)) {
           // BLO-8050: operator just unblocked; skip re-escalation on stale evidence.
-          result.skipped += 1;
+          await requeueAfterStaleUnblock(latestRun);
           return;
         }
         const updated = await escalateStrandedAssignedIssue({
@@ -11049,7 +11086,7 @@ export function recoveryService(
               // exemption above asks a different question (recent progress), not "was it unblocked".
               if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, successfulRun)) {
                 // BLO-8050: operator just unblocked; skip re-escalation on stale evidence.
-                result.skipped += 1;
+                await requeueAfterStaleUnblock(successfulRun);
                 return;
               }
               const updated = await escalateStrandedAssignedIssue({
@@ -11147,7 +11184,7 @@ export function recoveryService(
       if (isNonRetryableTerminalRun(latestRun)) {
         if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestRun)) {
           // BLO-8050: operator just unblocked; skip re-escalation on stale evidence.
-          result.skipped += 1;
+          await requeueAfterStaleUnblock(latestRun);
           return;
         }
         const updated = await escalateStrandedAssignedIssue({
@@ -11177,7 +11214,7 @@ export function recoveryService(
       if (continuationSessionUnavailableAdapterMismatch) {
         if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestRun)) {
           // BLO-8050: operator just unblocked; skip re-escalation on stale evidence.
-          result.skipped += 1;
+          await requeueAfterStaleUnblock(latestRun);
           return;
         }
         const updated = await escalateStrandedAssignedIssue({
@@ -11206,7 +11243,7 @@ export function recoveryService(
       ) {
         if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestRun)) {
           // BLO-8050: operator just unblocked; skip re-escalation on stale evidence.
-          result.skipped += 1;
+          await requeueAfterStaleUnblock(latestRun);
           return;
         }
         if (isZeroTokenSessionResetRetryRun(latestRun)) {
@@ -11241,7 +11278,7 @@ export function recoveryService(
       if (isUnsuccessfulTerminalIssueRun(latestRun)) {
         if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestRun)) {
           // BLO-8050: operator just unblocked; skip re-escalation on stale evidence.
-          result.skipped += 1;
+          await requeueAfterStaleUnblock(latestRun);
           return;
         }
         const classification = classifyContinuationFailure(latestRun);

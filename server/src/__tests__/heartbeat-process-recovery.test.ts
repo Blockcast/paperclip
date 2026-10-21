@@ -6945,7 +6945,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     // would pass whether or not the guard fired.
     expect(result.successfulRunHandoffEscalated).toBe(0);
     expect(result.escalated).toBe(0);
-    expect(result.issueIds).toEqual([]);
+    // BLO-48133: the gate requeues instead of bare-skipping, so the row gets one
+    // fresh wake whose run postdates the unblock.
+    expect(result.continuationRequeued).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
 
     const sourceIssue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
     expect(sourceIssue?.status).toBe("todo");
@@ -15418,6 +15421,21 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       expect(issue?.status).toBe(status);
       expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId)))
         .toHaveLength(0);
+      // BLO-48133: not escalating is only half the guarantee. A bare skip left these rows
+      // with no run and no wake forever (the unblock PATCH only wakes on `blocked` ->
+      // `todo`), so each gate must instead leave a live execution path: one queued wake
+      // whose run will postdate the unblock.
+      expect(result.continuationRequeued).toBe(1);
+      const requeued = await db.select().from(heartbeatRuns).where(and(
+        sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+        sql`${heartbeatRuns.contextSnapshot} ->> 'source' = 'issue.stale_unblock_recovery'`,
+      ));
+      expect(requeued).toHaveLength(1);
+      expect(requeued[0]!.createdAt.getTime()).toBeGreaterThan(unblockAt.getTime());
+      expect(requeued[0]?.agentId).toBe(
+        (issue?.executionState as { currentParticipant?: { agentId?: string } } | null)?.currentParticipant?.agentId ??
+          issue?.assigneeAgentId,
+      );
     }
 
     it("non-in_review configuration_incomplete adapter failure", async () => {
