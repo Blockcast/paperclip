@@ -18,8 +18,10 @@ import {
 // their wall time scales with runner load, not with the code under test. Idle,
 // the slowest case takes ~1.7 s; on an oversubscribed CI runner one spawn alone
 // has taken >5 s, which tripped vitest's 5 s default and ejected unrelated PRs
-// from the merge queue. 30 s still fails a genuine hang: every network call the
-// guard makes is itself capped at 10 s (AbortSignal.timeout in env-guard.ts).
+// from the merge queue. For the async `spawn` cases 30 s still fails a genuine
+// hang (every network call the guard makes is capped at 10 s by
+// AbortSignal.timeout in env-guard.ts). The `spawnSync` cases block the event
+// loop, so no vitest timeout can interrupt a hung child there, at 5 s or 30 s.
 vi.setConfig({ testTimeout: 30_000 });
 
 const blocked = [
