@@ -1,6 +1,6 @@
 import type { ServerAdapterModule } from "@paperclipai/adapter-utils";
 import { getAdapterSessionManagement } from "@paperclipai/adapter-utils";
-import { type, agentConfigurationDoc } from "../index.js";
+import { type, agentConfigurationDoc, modelProfiles } from "../index.js";
 import { listK8sModels, STATIC_MODELS } from "./models.js";
 import { execute } from "./execute.js";
 import { testEnvironment } from "./test.js";
@@ -15,6 +15,7 @@ export function createServerAdapter(): ServerAdapterModule {
     testEnvironment,
     sessionCodec,
     models: STATIC_MODELS,
+    modelProfiles,
     listModels: listK8sModels,
     listSkills: listOpenCodeSkills,
     syncSkills: syncOpenCodeSkills,

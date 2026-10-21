@@ -70,4 +70,23 @@ Notes:
 - The Caveman/Penstock launcher and Ponytail assets are not activated by this configuration alone. Verify executable/plugin availability and a non-production smoke run before fleet rollout.
 `;
 
+// BLO-32843: see the claude_k8s twin. OpenCode model ids are provider-scoped,
+// so the default follows this adapter's default provider (openai) and
+// PAPERCLIP_OPENCODE_CHEAP_MODEL overrides it, same knob as opencode_local.
+// An agent on another provider should pin runtimeConfig.modelProfiles.cheap.
+export function buildModelProfiles(env: Record<string, string | undefined> = process.env) {
+  const override = env.PAPERCLIP_OPENCODE_CHEAP_MODEL?.trim();
+  return [
+    {
+      key: "cheap",
+      label: "Cheap",
+      description: "Budget lane model for recovery retries and review runs.",
+      adapterConfig: override ? { model: override } : { model: "openai/gpt-6-luna", variant: "low" },
+      source: "adapter_default" as const,
+    },
+  ];
+}
+
+export const modelProfiles = buildModelProfiles();
+
 export { createServerAdapter } from "./server/index.js";

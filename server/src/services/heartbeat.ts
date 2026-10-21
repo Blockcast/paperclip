@@ -440,6 +440,7 @@ import {
   normalizeIsolationMode,
   recordAgentZeroTokenCompletedRunStreak,
   recordCcrotateCapacityDeferred,
+  recordModelProfileUnapplied,
   recordHeartbeatTimerSchedulerExclusion,
   recordHeartbeatPostTerminalRunEventDropped,
   recordHeartbeatTimerTick,
@@ -33470,6 +33471,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       contextSnapshot: context,
       profileResolutionFallbackReason,
     });
+    if (modelProfileApplication.requested && !modelProfileApplication.applied) {
+      // BLO-32843: this used to be visible only inside paperclipModelProfile.
+      recordModelProfileUnapplied({
+        adapter: agent.adapterType,
+        requested: modelProfileApplication.requested,
+        reason: modelProfileApplication.fallbackReason,
+      });
+      logger.warn(
+        {
+          agentId: agent.id,
+          adapterType: agent.adapterType,
+          runId: run.id,
+          requested: modelProfileApplication.requested,
+          fallbackReason: modelProfileApplication.fallbackReason,
+        },
+        "Requested model profile was not applied; run uses the agent's primary model",
+      );
+    }
     const modelProfileMetadata = modelProfileRunMetadata(modelProfileApplication);
     if (modelProfileMetadata) {
       context.paperclipModelProfile = modelProfileMetadata;
