@@ -333,6 +333,7 @@ import {
   type ExecutionWorkspaceInput,
   type RealizedExecutionWorkspace,
   sanitizeRuntimeServiceBaseEnv,
+  WorkspaceBaseRefUnresolvableError,
   WorkspaceGitSubmoduleError,
   WorkspaceRepoMismatchError,
 } from "./workspace-runtime.js";
@@ -37038,7 +37039,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               ? outerErr.code
               : outerErr instanceof EnvironmentRunError
               ? outerErr.code
-              : outerErr instanceof WorkspaceRepoMismatchError || outerErr instanceof WorkspaceGitSubmoduleError
+              : outerErr instanceof WorkspaceRepoMismatchError ||
+                  outerErr instanceof WorkspaceGitSubmoduleError ||
+                  outerErr instanceof WorkspaceBaseRefUnresolvableError
                 ? outerErr.code
                 : "setup_failed");
           const setupFailureWrite = await setRunStatusIfRunning(runId, "failed", {

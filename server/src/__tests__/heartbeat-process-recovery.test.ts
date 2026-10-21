@@ -13617,7 +13617,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   // workspace precondition, the recovery sweep must escalate to `blocked` on
   // the FIRST failure. Retrying would re-hit the same precondition and produce
   // another doomed run.
-  it.each(["workspace_import_conflict", "workspace_repo_mismatch"])(
+  it.each(["workspace_import_conflict", "workspace_repo_mismatch", "workspace_base_ref_unresolvable"])(
     "blocks stranded in-progress work immediately on non-retryable %s (no retry burnt)",
     async (runErrorCode) => {
     const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
@@ -13662,7 +13662,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   // BLO-1498: same non-retryable rule applies to assigned `todo` work that
   // failed in dispatch. We must not burn the single dispatch retry against a
   // precondition that won't change.
-  it.each(["workspace_import_conflict", "workspace_repo_mismatch"])(
+  it.each(["workspace_import_conflict", "workspace_repo_mismatch", "workspace_base_ref_unresolvable"])(
     "blocks assigned todo work immediately on non-retryable %s (no retry burnt)",
     async (runErrorCode) => {
     const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({

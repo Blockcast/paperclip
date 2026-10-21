@@ -53,6 +53,7 @@ import {
   type RealizedExecutionWorkspace,
   type LockHolderScan,
   WorkspaceGitSubmoduleError,
+  WorkspaceBaseRefUnresolvableError,
   WorkspaceRepoMismatchError,
 } from "../services/workspace-runtime.ts";
 import {
@@ -1148,6 +1149,61 @@ describe("realizeExecutionWorkspace", () => {
     expect(workspace.repoRef).toBe("origin/master");
     expect(workspace.baseRefSha).toBe(originHead);
     expect(await readGit(workspace.cwd, ["rev-parse", "HEAD"])).toBe(originHead);
+  });
+
+  describe("project-wide base ref vs a secondary workspace with a different default branch (BLO-48207)", () => {
+    async function createClonedMainRepo() {
+      const sourceRepo = await createTempRepo("main");
+      // `git init` may have created master; the real hindsight repo has none.
+      await execFileAsync("git", ["branch", "-D", "master"], { cwd: sourceRepo }).catch(() => undefined);
+      const remotePath = path.join(await makeTempDir("paperclip-worktree-remote-"), "hindsight.git");
+      await execFileAsync("git", ["clone", "--bare", sourceRepo, remotePath]);
+      const repoRoot = path.join(await makeTempDir("paperclip-worktree-clone-"), "hindsight");
+      await execFileAsync("git", ["clone", remotePath, repoRoot]);
+      return repoRoot;
+    }
+
+    function realizeWithProjectBaseRef(repoRoot: string, workspaceRepoRef: string | null, identifier: string) {
+      return realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-1",
+          workspaceId: "workspace-hindsight",
+          repoUrl: null,
+          repoRef: workspaceRepoRef,
+        },
+        config: {
+          workspaceStrategy: { type: "git_worktree", baseRef: "origin/master" },
+        },
+        issue: { id: `issue-${identifier}`, identifier, title: "Hindsight soak" },
+        agent: { id: "agent-1", name: "Codex Coder", companyId: "company-1" },
+      });
+    }
+
+    it("bases each workspace's worktree on a ref that exists in its own repo", async () => {
+      // Primary workspace: the project-wide origin/master resolves and is used.
+      const { repoRoot: primaryRoot } = await createClonedRepoWithRemote();
+      const primary = await realizeWithProjectBaseRef(primaryRoot, "master", "PAP-1");
+      expect(primary.repoRef).toBe("origin/master");
+
+      // Secondary workspace defaults to `main` and has no master branch at all.
+      const secondaryRoot = await createClonedMainRepo();
+      await expect(readGit(secondaryRoot, ["rev-parse", "--verify", "origin/master"])).rejects.toThrow();
+      const originMain = await readGit(secondaryRoot, ["rev-parse", "origin/main"]);
+      const secondary = await realizeWithProjectBaseRef(secondaryRoot, "main", "PAP-2");
+      expect(secondary.repoRef).toBe("origin/main");
+      expect(await readGit(secondary.cwd, ["rev-parse", "HEAD"])).toBe(originMain);
+      expect(secondary.warnings).toEqual(
+        expect.arrayContaining([expect.stringContaining('using the workspace ref "origin/main"')]),
+      );
+    });
+
+    it("raises a typed, non-retryable error when no candidate base ref resolves", async () => {
+      const secondaryRoot = await createClonedMainRepo();
+      await expect(realizeWithProjectBaseRef(secondaryRoot, "develop", "PAP-3"))
+        .rejects.toBeInstanceOf(WorkspaceBaseRefUnresolvableError);
+    });
   });
 
   it("fast-forwards an unstarted reused worktree to the advanced origin/master", async () => {

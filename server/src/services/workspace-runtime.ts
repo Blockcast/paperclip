@@ -147,6 +147,16 @@ export class WorkspaceRepoMismatchError extends Error {
   }
 }
 
+// BLO-48207: deterministic — re-dispatching cannot make a missing branch appear.
+export class WorkspaceBaseRefUnresolvableError extends Error {
+  code = "workspace_base_ref_unresolvable";
+
+  constructor(message: string) {
+    super(message);
+    this.name = "WorkspaceBaseRefUnresolvableError";
+  }
+}
+
 export class WorkspaceGitSubmoduleError extends Error {
   code = "workspace_git_submodule_unavailable";
 
@@ -4712,16 +4722,32 @@ export async function realizeExecutionWorkspace(input: {
   const configuredBaseRef = typeof rawStrategy.baseRef === "string" && rawStrategy.baseRef.length > 0
     ? rawStrategy.baseRef
     : input.base.repoRef ?? null;
-  const {
-    baseRef,
-    warnings: baseRefResolutionWarnings,
-    refreshed: baseRefAlreadyRefreshed,
-  } = await resolveAuthoritativeBaseRef(repoRoot, configuredBaseRef);
-  const baseRefreshWarnings = [
-    ...baseRefResolutionWarnings,
-    ...(baseRefAlreadyRefreshed ? [] : await refreshRemoteTrackingBaseRef(repoRoot, baseRef)),
-  ];
-  const currentBaseRefSha = await resolveBaseRefSha(repoRoot, baseRef);
+  const resolveBase = async (ref: string | null) => {
+    const resolved = await resolveAuthoritativeBaseRef(repoRoot, ref);
+    const warnings = [
+      ...resolved.warnings,
+      ...(resolved.refreshed ? [] : await refreshRemoteTrackingBaseRef(repoRoot, resolved.baseRef)),
+    ];
+    return { baseRef: resolved.baseRef, warnings, sha: await resolveBaseRefSha(repoRoot, resolved.baseRef) };
+  };
+  let { baseRef, warnings: baseRefreshWarnings, sha: currentBaseRefSha } = await resolveBase(configuredBaseRef);
+  // BLO-48207: `workspaceStrategy.baseRef` is project-wide, but a project can hold
+  // several repos with different default branches (hindsight is `main`, paperclip
+  // is `master`). When the project ref does not exist in this repo, base the
+  // worktree on the workspace's own ref instead of failing every run.
+  const workspaceRepoRef = input.base.repoRef?.trim() || null;
+  if (!currentBaseRefSha && workspaceRepoRef && workspaceRepoRef !== configuredBaseRef) {
+    const fallback = await resolveBase(workspaceRepoRef);
+    if (fallback.sha) {
+      baseRefreshWarnings = [
+        ...baseRefreshWarnings,
+        ...fallback.warnings,
+        `Configured base ref "${baseRef}" does not resolve in ${repoRoot}; using the workspace ref "${fallback.baseRef}" instead.`,
+      ];
+      baseRef = fallback.baseRef;
+      currentBaseRefSha = fallback.sha;
+    }
+  }
 
   await fs.mkdir(worktreeParentDir, { recursive: true });
 
@@ -4889,6 +4915,12 @@ export async function realizeExecutionWorkspace(input: {
       failureLabel: `git worktree add ${worktreePath}`,
     });
   } catch (error) {
+    if (gitErrorIncludes(error, "invalid reference")) {
+      throw new WorkspaceBaseRefUnresolvableError(
+        `Base ref "${baseRef}" does not resolve in ${repoRoot}, so git worktree add cannot create ${worktreePath}. ` +
+          `Set the project's workspaceStrategy.baseRef or the workspace's repoRef to a branch that exists in this repository.`,
+      );
+    }
     if (!gitErrorIncludes(error, "already exists")) {
       throw error;
     }

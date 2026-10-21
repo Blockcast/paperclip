@@ -1578,6 +1578,7 @@ export function summarizeRunFailureForIssueComment(run: LatestIssueRun, now = Da
 const NON_RETRYABLE_RUN_ERROR_CODES = new Set<string>([
   "workspace_import_conflict",
   "workspace_repo_mismatch",
+  "workspace_base_ref_unresolvable",
 ]);
 
 function isNonRetryableTerminalRun(latestRun: LatestIssueRun) {
@@ -1897,6 +1898,10 @@ const WORKSPACE_PREFLIGHT_RECOVERY_GUIDANCE: Record<string, string> = {
   workspace_repo_mismatch:
     "the execution workspace is checked out from a different repository than the issue expects. " +
     "Repoint or re-provision the workspace, then re-run.",
+  workspace_base_ref_unresolvable:
+    "the git worktree base ref does not exist in the workspace's repository (e.g. a project-wide " +
+    "`origin/master` against a repo whose default branch is `main`). Fix the project's " +
+    "workspaceStrategy.baseRef or the workspace's repoRef, then re-run.",
 };
 
 function describeWorkspacePreflightRecoveryCause(latestRun: LatestIssueRun): string | null {
