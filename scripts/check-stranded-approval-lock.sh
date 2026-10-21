@@ -116,9 +116,9 @@ fi
 #
 # This is what makes the check safe against `helm upgrade --atomic`. A lock is
 # only ever held by a running deploy job, and docker.yml caps that job at
-# `timeout-minutes: 118` -- so a lock older than that is held by nothing, and the
+# `timeout-minutes: 133` -- so a lock older than that is held by nothing, and the
 # --atomic window (which lives entirely inside the job) is long over. The
-# default is 140m: 118m plus the same 22m margin for the runner queueing before
+# default is 155m: 133m plus the same 22m margin for the runner queueing before
 # the job's own clock starts that the original 120m carried over 98m.
 # scripts/check-stranded-approval-lock.test.js pins it at or above the deploy
 # job's timeout, so raising that timeout fails there rather than silently
@@ -131,11 +131,14 @@ fi
 # job ever shortens again, bring this back down with it rather than leaving a
 # window wider than the race it bounds.
 #
+# Raised 140 -> 155 with the deploy job's 118 -> 133 (BLO-45764: Helm's --wait
+# grew 30m -> 45m to cover a two-replica worker rollout).
+#
 # It is also what makes the BLO-31598 shape decidable at all. A lock taken
 # seconds ago whose `helm upgrade` has not run yet is indistinguishable from one
 # whose deploy died before it ever would: in both the Deployment is healthy and
 # has not advanced. Only elapsed time separates them.
-GRACE_MINUTES="${PAPERCLIP_STRANDED_LOCK_GRACE_MINUTES:-140}"
+GRACE_MINUTES="${PAPERCLIP_STRANDED_LOCK_GRACE_MINUTES:-155}"
 if [[ ! "$GRACE_MINUTES" =~ ^[0-9]+$ ]]; then
   echo "PAPERCLIP_STRANDED_LOCK_GRACE_MINUTES='${GRACE_MINUTES}' is not a non-negative integer" >&2
   exit 2

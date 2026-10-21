@@ -335,7 +335,7 @@ test("an unreadable Deployment fails closed rather than reporting clean", () => 
 // The deploy job is dispatched before a runner picks it up, so the grace
 // window must cover the job's own timeout PLUS the time it can sit queued.
 // 22m is the margin the pairing has carried since it was introduced (98m job /
-// 120m grace) and still carries today (118m / 140m).
+// 120m grace) and still carries today (133m / 155m).
 const RUNNER_QUEUEING_MARGIN_MINUTES = 22;
 
 // docker.yml caps the deploy job; raising that cap must fail here rather than

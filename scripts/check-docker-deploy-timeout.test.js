@@ -361,7 +361,7 @@ test("Docker deploy approves the exact stamped plan before Helm mutates producti
       deployJob.lastIndexOf("reconcile_approved_api_plan"),
     "Helm must apply release dependencies before exact API reconciliation",
   );
-  assert.match(deployJob, /--wait --timeout 30m &\n          helm_pid=\$!/);
+  assert.match(deployJob, /--wait --timeout 45m &\n          helm_pid=\$!/);
   assert.match(deployJob, /while kill -0 "\$\{helm_pid\}"/);
   assert.ok(
     deployJob.lastIndexOf("reconcile_approved_api_plan") <
