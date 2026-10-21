@@ -2883,29 +2883,32 @@ export function recoveryService(
   // extended it to the branches it covered, and later work (e.g. the
   // BLO-31913 exhausted-handoff arm) has kept adding them one at a time.
   //
-  // The gate is NOT on every escalation callsite today, and no count is pinned
-  // here: two earlier revisions of this comment pinned one ("all six
-  // escalation callsites"), both had drifted by the time anyone read them, and
-  // that drift is how the BLO-31913 arm shipped ungated. Ask the code instead,
-  // and note it takes TWO greps — the must-be-gated set first, the is-gated set
-  // second, because an ungated callsite is by construction invisible to the
-  // second one alone:
-  //   grep -n 'await escalateStrandedAssignedIssue({' server/src/services/recovery/service.ts
-  //   grep -n 'await latestRunPredatesLatestUnblock' server/src/services/recovery/service.ts
-  // Each grep also matches its own prescription line above, so subtract one
-  // from each before comparing. Diff the two before adding a callsite, and
-  // check YOUR OWN rather than inferring safety from the gated set's size.
-  // The sets differ today; which omissions are deliberate has not been
-  // audited, so treat an ungated callsite as unreviewed rather than as either
-  // intended or defective. In particular the direct sibling of the BLO-31913
-  // arm — the `in_progress` exhausted-handoff escalation, which reads the same
-  // `isExhaustedSuccessfulRunHandoff` evidence and increments the same
-  // `successfulRunHandoffEscalated` counter — carries no gate. An earlier
-  // review of that arm reasoned it was "not reachable by an unblock"; that
-  // reasoning does not hold against `getLatestUnblockedAt` above, which keys
-  // on any `issue.updated` carrying `previousStatus = 'blocked'` and does not
-  // filter on the resulting status, so `blocked` -> `in_progress` sets an
-  // unblock timestamp too.
+  // No count is pinned here: two earlier revisions of this comment pinned one
+  // ("all six escalation callsites"), both drifted, and that drift is how the
+  // BLO-31913 arm shipped ungated. Ask the code instead. It takes TWO greps --
+  // the must-be-gated set first, the is-gated set second, because an ungated
+  // callsite is by construction invisible to the second one alone:
+  //   grep -nE '= await escalate[A-Za-z]*\(\{' server/src/services/recovery/service.ts
+  //   grep -nE 'if \(await latestRunPredatesLatestUnblock\(' server/src/services/recovery/service.ts
+  // The first matches ALL THREE sweep escalation helpers --
+  // `escalateStrandedAssignedIssue`, `escalateStrandedRecoveryIssueInPlace` and
+  // `escalateZeroTokenStartupFailureIssue` -- not just the first. Neither grep
+  // matches a comment line, so no self-match to subtract. One gate can cover more than one
+  // callsite (the `in_progress` unsuccessful-terminal gate covers two), so the
+  // counts are not expected to be equal -- compare per callsite.
+  //
+  // BLO-32819 audited every callsite. Each ungated one carries a
+  // `BLO-32819 audit: DELIBERATELY UNGATED` comment stating why (present-tense
+  // participant availability, or evidence already scoped to the unblock at its
+  // query); every other one is gated. `grep -n 'BLO-32819 audit'` lists the
+  // verdicts. When you add a callsite, gate it or write its own reason -- an
+  // unexplained ungated callsite is a defect by default now, not "unreviewed".
+  // The `in_progress` exhausted-handoff arm was one of six found defective; the
+  // earlier claim that it was "not reachable by an unblock" was wrong, because
+  // `getLatestUnblockedAt` above keys only on `previousStatus = 'blocked'` and
+  // does not filter on the resulting status. External callers of
+  // `.escalateStrandedAssignedIssue(` in `services/heartbeat.ts` are
+  // event-driven (not sweep evidence) and out of this gate's scope.
   async function latestRunPredatesLatestUnblock(
     companyId: string,
     issueId: string,
@@ -8229,7 +8232,8 @@ export function recoveryService(
   }
 
   // BLO-27463: incremented by the dependency-wait gate inside
-  // `escalateStrandedAssignedIssue`, which has 22 direct call sites and no `result` in
+  // `escalateStrandedAssignedIssue`, which has many direct call sites (count them with the
+  // grep in `latestRunPredatesLatestUnblock`'s docstring, not here) and no `result` in
   // scope. `reconcileStrandedAssignedIssues` snapshots and diffs it rather than threading
   // an out-param through every caller. Diagnostic only: two overlapping sweeps would split
   // the delta between them, which does not affect any control-flow decision.
@@ -8263,7 +8267,7 @@ export function recoveryService(
   //
   // ⚠ It is NOT true that every call site is inside the sweep, and an earlier revision
   // of this comment claimed it was. The direct-call grep
-  //   grep -n 'await escalateStrandedAssignedIssue({' server/src/services/recovery/service.ts
+  //   grep -nE '= await escalateStrandedAssignedIssue\(\{' server/src/services/recovery/service.ts
   // only covers internal calls; this function is also re-exported on the object
   // `recoveryService()` returns, so an external consumer calls it as a member and matches
   // no direct-call grep at all. That half:
@@ -10225,6 +10229,15 @@ export function recoveryService(
           result.skipped += 1;
           return;
         } else {
+          // BLO-32819 audit: GATED (was defective). The classification is a pure function of
+          // `latestRun` (`now` only feeds the provider_quota retryAt, which never reaches this
+          // arm), so after an operator unblock the same terminal run is still newest and this
+          // arm would re-flip the issue on evidence already known when they chose to unblock.
+          if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestRun)) {
+            // BLO-8050: operator just unblocked; skip re-escalation on stale evidence.
+            result.skipped += 1;
+            return;
+          }
           const isGitTransport = adapterFailureClassification.kind === "workspace_git_transport";
           const updated = await escalateStrandedAssignedIssue({
             expectedLockOwnerState: adoptionHandoverLockGuard,
@@ -10336,6 +10349,15 @@ export function recoveryService(
               return;
             }
 
+            // BLO-32819 audit: GATED (was defective). `summarizeRecentContinuationRetries` is
+            // scoped to the interaction resolution, NOT to the unblock, so a `consecutive` count
+            // accumulated before an operator unblock survives it. The `non_retryable` sibling
+            // above keys off the same run and was already gated.
+            if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestPostResolutionRun)) {
+              // BLO-8050: operator just unblocked; skip re-escalation on stale evidence.
+              result.skipped += 1;
+              return;
+            }
             const updated = await escalateStrandedAssignedIssue({
               expectedLockOwnerState: adoptionHandoverLockGuard,
               issue,
@@ -10391,6 +10413,10 @@ export function recoveryService(
 
         if (!participantLatestRun || !isTerminalIssueRun(participantLatestRun)) {
           if (!agentInvokable) {
+            // BLO-32819 audit: DELIBERATELY UNGATED. The trigger is present-tense participant
+            // availability (`!agentInvokable`), not run evidence, so there is nothing stale to
+            // suppress: an unblock does not make a paused or budget-blocked reviewer invokable.
+            // (The gate is also inert when the run is null -- it returns false.)
             const updated = await escalateStrandedAssignedIssue({
               expectedLockOwnerState: adoptionHandoverLockGuard,
               issue,
@@ -10510,6 +10536,13 @@ export function recoveryService(
           return;
         }
         if (participantAdapterFailureClassification?.kind === "configuration_incomplete") {
+          // BLO-32819 audit: GATED (was defective). Same reasoning as the non-`in_review`
+          // adapter-failure arm: the classification is a pure function of `participantLatestRun`.
+          if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, participantLatestRun)) {
+            // BLO-8050: operator just unblocked; skip re-escalation on stale evidence.
+            result.skipped += 1;
+            return;
+          }
           const updated = await escalateStrandedAssignedIssue({
             expectedLockOwnerState: adoptionHandoverLockGuard,
             issue,
@@ -10536,6 +10569,10 @@ export function recoveryService(
         }
 
         if (!agentInvokable) {
+          // BLO-32819 audit: DELIBERATELY UNGATED. The trigger is present-tense participant
+          // availability (`!agentInvokable`), not run evidence, so there is nothing stale to
+          // suppress: an unblock does not make a paused or budget-blocked reviewer invokable.
+          // (The gate is also inert when the run is null -- it returns false.)
           const updated = await escalateStrandedAssignedIssue({
             expectedLockOwnerState: adoptionHandoverLockGuard,
             issue,
@@ -10565,6 +10602,14 @@ export function recoveryService(
         }
 
         if (didAutomaticRecoveryFail(participantLatestRun, EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON)) {
+          // BLO-32819 audit: GATED (was defective). In-review twin of the `todo`
+          // `assignment_recovery` arm, gated since BLO-8050: the retryReason lives on the run's
+          // contextSnapshot and never expires, so the verdict outlives an unblock.
+          if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, participantLatestRun)) {
+            // BLO-8050: operator just unblocked; skip re-escalation on stale evidence.
+            result.skipped += 1;
+            return;
+          }
           const updated = await escalateStrandedAssignedIssue({
             expectedLockOwnerState: adoptionHandoverLockGuard,
             issue,
@@ -10941,6 +10986,17 @@ export function recoveryService(
           return;
         }
 
+        // BLO-32819 audit: GATED (was defective). `in_progress` twin of the BLO-31913 `todo`
+        // arm: same evidence, same counter. The #1692 review claim that this arm is "not
+        // reachable by an unblock" is RETRACTED: `getLatestUnblockedAt` keys only on
+        // `previousStatus = 'blocked'`, so `blocked` -> `in_progress` records an unblock, and the
+        // handoff markers never expire -- an operator moving the row back to `in_progress` was
+        // re-flipped to `blocked` on the same pre-unblock run.
+        if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestRun)) {
+          // BLO-8050: operator just unblocked; skip re-escalation on stale evidence.
+          result.skipped += 1;
+          return;
+        }
         const updated = await escalateStrandedAssignedIssue({
           expectedLockOwnerState: adoptionHandoverLockGuard,
           issue,
@@ -10988,6 +11044,14 @@ export function recoveryService(
               STRANDED_RECENT_PROGRESS_EXEMPTION_MS,
             );
             if (!exempted) {
+              // BLO-32819 audit: GATED (was defective). `isRepeatedProductiveContinuationRecovery`
+              // reads only the run's contextSnapshot, so the verdict survives an unblock. The GGU-809
+              // exemption above asks a different question (recent progress), not "was it unblocked".
+              if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, successfulRun)) {
+                // BLO-8050: operator just unblocked; skip re-escalation on stale evidence.
+                result.skipped += 1;
+                return;
+              }
               const updated = await escalateStrandedAssignedIssue({
                 expectedLockOwnerState: adoptionHandoverLockGuard,
                 issue,
@@ -11046,6 +11110,9 @@ export function recoveryService(
           issue.id,
           NON_PRODUCTIVE_RUN_NOOP_THRESHOLD,
         );
+        // BLO-32819 audit: DELIBERATELY UNGATED -- gated at the evidence query instead.
+        // `countConsecutiveNonProductiveSuccessfulRuns` only counts runs created after
+        // `getLatestUnblockedAt` (BLO-3182), so pre-unblock runs cannot reach this threshold.
         if (nonProductiveStreak >= NON_PRODUCTIVE_RUN_NOOP_THRESHOLD) {
           const updated = await escalateStrandedAssignedIssue({
             expectedLockOwnerState: adoptionHandoverLockGuard,
