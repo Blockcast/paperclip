@@ -4306,7 +4306,7 @@ describe("scoped writable mounts (BLO-32734)", () => {
   it("mounts the data volume read-only and re-mounts only the run's own trees rw", () => {
     const { main } = mountsFor(isolatedCtx());
     const parent = main.find((m) => m.mountPath === "/paperclip" && !m.subPath);
-    expect(parent?.readOnly).toBe(true);
+    expect(parent?.name).toBe("root-overlay");
 
     // The company skills bind is the one read-only re-mount (Phase 2a).
     const scoped = main.filter((m) => m.name === "data" && m.subPath && !m.readOnly);
@@ -4410,10 +4410,42 @@ describe("scoped writable mounts (BLO-32734)", () => {
     expect(scopedWritableDirs).toContain("/paperclip/instances/default/skills/co1");
   });
 
+  // Phase 2b: the PVC root is the server's home. Credential dirs and foreign
+  // worktrees there must resolve to the per-pod root overlay; only the
+  // toolchain allowlist reaches the shared volume, read-only.
+  it("hides the PVC root behind the root overlay except the read-only toolchain", () => {
+    const { job } = buildJobManifest({ ctx: isolatedCtx(), selfPod: makeSelfPod() });
+    const spec = job.spec?.template?.spec;
+    expect(spec?.volumes?.find((v) => v.name === "root-overlay")?.emptyDir).toBeTruthy();
+    const unreachable = [
+      "/paperclip/.ssh/id_ed25519",
+      "/paperclip/.kube/config",
+      "/paperclip/.secrets/x",
+      "/paperclip/.claude/.credentials.json",
+      "/paperclip/.local/share/mkcert/rootCA-key.pem",
+      "/paperclip/.ccrotate/state.json",
+      "/paperclip/wt-pen1234/README.md",
+      "/paperclip/.mcp.json",
+    ];
+    const toolchain = ["/paperclip/bin/go", "/paperclip/tools/go1.25.6/bin/go", "/paperclip/.local/bin/trivy"];
+    for (const container of [spec?.containers[0], spec?.initContainers?.[0]]) {
+      const mounts = container?.volumeMounts ?? [];
+      for (const target of unreachable) {
+        expect(deepestMount(mounts, target)?.name, target).toBe("root-overlay");
+      }
+      for (const target of toolchain) {
+        const seen = deepestMount(mounts, target);
+        expect(seen?.name, target).toBe("data");
+        expect(seen?.readOnly, target).toBe(true);
+      }
+    }
+  });
+
   it("adds no instance overlay when the data mount stays broad", () => {
     const { job } = buildJobManifest({ ctx: makeCtx(), selfPod: makeSelfPod() });
     const spec = job.spec?.template?.spec;
     expect(spec?.volumes?.some((v) => v.name === "instance-overlay")).toBe(false);
+    expect(spec?.volumes?.some((v) => v.name === "root-overlay")).toBe(false);
     expect(spec?.containers[0]?.volumeMounts?.some((m) => m.mountPath.startsWith("/paperclip/instances/default"))).toBe(false);
   });
 
@@ -4664,7 +4696,7 @@ describe("scoped writable mounts (BLO-32734)", () => {
     // The init container mkdir -p's the isolation roots INSIDE this mount, so a
     // missing re-mount there is an EACCES on every run rather than a drift.
     expect(scopedOf(init)).toEqual(scopedOf(main));
-    expect(init.find((m) => m.mountPath === "/paperclip" && !m.subPath)?.readOnly).toBe(true);
+    expect(init.find((m) => m.mountPath === "/paperclip" && !m.subPath)?.name).toBe("root-overlay");
   });
 
   it("reports every scoped dir so the caller can pre-create it", () => {
@@ -4839,7 +4871,7 @@ describe("scoped writable mounts (BLO-32734)", () => {
     const result = buildJobManifest({ ctx, selfPod: makeSelfPod() });
     const container = result.job.spec?.template?.spec?.containers[0];
     const main = container?.volumeMounts ?? [];
-    expect(main.find((m) => m.mountPath === "/paperclip" && !m.subPath)?.readOnly).toBe(true);
+    expect(main.find((m) => m.mountPath === "/paperclip" && !m.subPath)?.name).toBe("root-overlay");
     const rw = main.filter((m) => m.subPath).map((m) => m.mountPath);
     // The handed shared checkout stays the cwd and stays writable...
     expect(container?.workingDir).toBe("/paperclip/instances/default/projects/co1/p1/_default");

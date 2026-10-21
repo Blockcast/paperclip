@@ -604,13 +604,27 @@ const SHARED_PNPM_STORE_SUBPATH = "instances/default/data/k8s-isolation/pnpm";
  * tree — every foreign company's `companies/`, `run-logs/`, `projects/` and
  * `k8s-isolation/`, plus `secrets/master.key`, `data/backups/` (DB dumps),
  * `.env`, `config.json` and `db/` — and the run's own subPath binds are
- * re-applied on top of it. Root-level toolchain dirs stay visible through the
- * read-only parent. The overlay is rw only so the runtime can create mountpoint
+ * re-applied on top of it. Root-level toolchain dirs are re-exposed by the root
+ * overlay below. The overlay is rw only so the runtime can create mountpoint
  * dirs inside it for those binds; nothing persists past the pod.
  */
 const INSTANCE_ROOT_SUBPATH = "instances/default";
 const INSTANCE_OVERLAY_VOLUME_NAME = "instance-overlay";
 const INSTANCE_OVERLAY_SIZE_LIMIT = "16Mi";
+
+/**
+ * BLO-32734 phase 2b. The PVC ROOT is the server's `node` home: `.ssh`, `.kube`,
+ * `.secrets`, `.claude/.credentials.json`, mkcert's CA key under `.local/share`,
+ * and every tenant's `wt-*` worktrees. A read-only parent still let every
+ * narrowed pod READ all of it, so the root gets an emptyDir as well, and only
+ * the toolchain a narrowed run resolves is re-exposed read-only. Measured
+ * 2026-10-21 from a narrowed pod: HOME, XDG_* and CLAUDE_CONFIG_DIR are per-run,
+ * and the only root references are PATH (`.local/bin`, `bin`) plus the symlink
+ * targets inside those two dirs. Allowlist, not denylist: the root has ~440
+ * entries and gains new `wt-*` dirs weekly.
+ */
+const ROOT_OVERLAY_VOLUME_NAME = "root-overlay";
+const ROOT_TOOLCHAIN_SUBPATHS = ["bin", "tools", "jre", ".local/bin", ".bun/bin", ".cache/puppeteer-browsers"];
 
 function sharedPnpmStorePath(rawCompanyId: string, dataMountPath: string): string {
   const companyId = sanitizeForK8sPath(rawCompanyId);
@@ -2740,11 +2754,22 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
       }),
     );
   }
-  volumeMounts.push({
-    name: "data",
-    mountPath: dataMountPath,
-    ...(narrowWritableSurface ? { readOnly: true } : {}),
-  });
+  // Parent-first, so the BLO-40401 backstop below accepts every bind under it.
+  const rootMounts: k8s.V1VolumeMount[] = narrowWritableSurface
+    ? [
+        { name: ROOT_OVERLAY_VOLUME_NAME, mountPath: dataMountPath },
+        ...ROOT_TOOLCHAIN_SUBPATHS.map((subPath) => ({
+          name: "data",
+          mountPath: path.posix.join(dataMountPath, subPath),
+          subPath,
+          readOnly: true,
+        })),
+      ]
+    : [{ name: "data", mountPath: dataMountPath }];
+  if (narrowWritableSurface) {
+    volumes.push({ name: ROOT_OVERLAY_VOLUME_NAME, emptyDir: { sizeLimit: INSTANCE_OVERLAY_SIZE_LIMIT } });
+  }
+  volumeMounts.push(...rootMounts);
   // Declared right after its read-only parent and before every subPath bind
   // under it, so the BLO-40401 backstop rejects any derived mount that would
   // land on or above the instance root instead of silently hiding it.
@@ -3382,11 +3407,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     // Needed so the BrowserMetrics symlink target above resolves in the init
     // container; same emptyDir instance the main container mounts.
     { name: RUNTIME_CACHE_VOLUME_NAME, mountPath: RUNTIME_CACHE_MOUNT_PATH },
-    {
-      name: "data",
-      mountPath: dataMountPath,
-      ...(narrowWritableSurface ? { readOnly: true } : {}),
-    },
+    ...rootMounts,
     // Same nested rw re-mounts as the main container. The init container creates
     // the isolation roots and the Chrome profile dir INSIDE this mount, so
     // without these it would EACCES against the read-only parent on every run.
