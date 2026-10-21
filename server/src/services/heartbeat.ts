@@ -41841,6 +41841,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               reason: githubReviewReason,
               cause: suppression.durableSkipReason ?? GITHUB_SUPPRESSION_CAUSE_DISPATCH_REJECTED,
             });
+            // The inline path logs `github webhook reviewer wake failed`; this
+            // path logged nothing, so the outage alert's dispatch_rejected
+            // cause was only attributable with a DB read (BLO-48170).
+            const reviewPayload = parseObject(originalOpts.payload);
+            logger.warn(
+              {
+                wakeupRequestId: row.id,
+                agentId: row.agentId,
+                reason: githubReviewReason,
+                cause: suppression.durableSkipReason ?? GITHUB_SUPPRESSION_CAUSE_DISPATCH_REJECTED,
+                taskKey: reviewPayload.taskKey ?? null,
+                repoFullName: reviewPayload.repoFullName ?? reviewPayload.githubRepoFullName ?? null,
+                prNumber: reviewPayload.prNumber ?? reviewPayload.githubPrNumber ?? null,
+                headSha: reviewPayload.headSha ?? reviewPayload.githubHeadSha ?? null,
+                error: err.message,
+              },
+              "github review wake redelivery rejected; row superseded and terminal",
+            );
           }
           continue;
         }
