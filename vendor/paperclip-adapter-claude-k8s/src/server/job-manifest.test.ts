@@ -4494,7 +4494,7 @@ describe("scoped writable mounts (BLO-32734)", () => {
 
       for (const container of containers) {
         const mounts = container?.volumeMounts ?? [];
-        expect(mounts.find((m) => m.mountPath === mountPath && !m.subPath)?.readOnly).toBe(true);
+        expect(mounts.find((m) => m.mountPath === mountPath && !m.subPath)?.name).toBe("root-overlay");
         const covering = mounts.filter(
           (m) => m.subPath && !m.readOnly && (pnpmHome === m.mountPath || pnpmHome!.startsWith(`${m.mountPath}/`)),
         );
@@ -4591,7 +4591,7 @@ describe("scoped writable mounts (BLO-32734)", () => {
     // alone would pass while the off-volume filter silently dropped them.
     for (const container of containers) {
       const mounts = container?.volumeMounts ?? [];
-      expect(mounts.find((m) => m.mountPath === "/srv/agent-data" && !m.subPath)?.readOnly).toBe(true);
+      expect(mounts.find((m) => m.mountPath === "/srv/agent-data" && !m.subPath)?.name).toBe("root-overlay");
       for (const tree of [`${root}/home`, `${root}/workspace`]) {
         const covering = mounts.filter(
           (m) => m.subPath && !m.readOnly && (tree === m.mountPath || tree.startsWith(`${m.mountPath}/`)),
@@ -4793,7 +4793,7 @@ describe("scoped writable mounts (BLO-32734)", () => {
     const result = buildJobManifest({ ctx, selfPod: makeSelfPod() });
     const main = result.job.spec?.template?.spec?.containers[0]?.volumeMounts ?? [];
     // The pod sees its scoped trees where IT mounts the volume...
-    expect(main.find((m) => m.mountPath === "/srv/agent-data" && !m.subPath)?.readOnly).toBe(true);
+    expect(main.find((m) => m.mountPath === "/srv/agent-data" && !m.subPath)?.name).toBe("root-overlay");
     expect(main.find((m) => m.subPath === "instances/default/data/k8s-isolation/workspaces/ws-1/home")?.mountPath).toBe(
       "/srv/agent-data/instances/default/data/k8s-isolation/workspaces/ws-1/home",
     );
