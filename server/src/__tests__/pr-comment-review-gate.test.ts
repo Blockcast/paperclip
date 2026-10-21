@@ -3961,6 +3961,73 @@ describe("PEN-4431 — what may CREDIT a head", () => {
     }
   });
 
+  it("hears a NEWER issue-comment deferral over an older clean review submission", () => {
+    // The chronological twin of the case above, and the direction the surface
+    // rank got wrong when it was introduced.
+    //
+    // A clean review submission lands at T1; an issue comment attesting the
+    // SAME head lands at T2 carrying a `tracked` ledger line. The surface rank
+    // makes the review the winner, and a `tracked` body counts 0 critical and
+    // 0 important — so it is invisible to `hasActionablePrReviewFeedback` and
+    // used to be dropped. The deferral was then read off the review's empty
+    // ledger as 0 and the gate published `clean` over an accepted residual:
+    // the BLO-36903 class, reached through a fail-OPEN this PR introduced.
+    //
+    // The ordering is the whole point — reverse the two timestamps and the
+    // clean review legitimately wins, because a later clean attestation of the
+    // same head means Ally re-examined that exact tree.
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: DISTINCT_PR_AUTHOR,
+      prAuthorLane: null,
+      comments: [
+        allyComment(cleanReview(CURRENT_HEAD), "2026-10-20T10:00:00Z"),
+        allyIssueComment(dispositioningReview(CURRENT_HEAD, OLD_HEAD, "tracked"), "2026-10-20T11:00:00Z"),
+      ],
+    });
+
+    expect(verdict.outcome).not.toBe("clean");
+    expect(verdict).toMatchObject({ state: "success", outcome: "deferred_finding" });
+  });
+
+  it("still lets an OLDER issue-comment deferral lose to a later clean review of the same head", () => {
+    // The control that keeps the case above from passing for the wrong reason.
+    // Only the two timestamps are swapped. A later clean attestation of this
+    // exact head disposes the residual, so `clean` is correct here — the
+    // eligible set admits issue comments at least as new as the winner, and
+    // this one is strictly older.
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: DISTINCT_PR_AUTHOR,
+      prAuthorLane: null,
+      comments: [
+        allyIssueComment(dispositioningReview(CURRENT_HEAD, OLD_HEAD, "tracked"), "2026-10-20T10:00:00Z"),
+        allyComment(cleanReview(CURRENT_HEAD), "2026-10-20T11:00:00Z"),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "success", outcome: "clean" });
+  });
+
+  it("keeps a carried red ahead of a newer issue-comment deferral", () => {
+    // The promotion direction, pinned. Choosing the issue comment as `forHead`
+    // must not let a `tracked` line outrank a finding carried from an earlier
+    // head: off the review surface the deferral is HELD, and the carry-forward
+    // ledger runs first.
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLogin: DISTINCT_PR_AUTHOR,
+      prAuthorLane: null,
+      comments: [
+        allyComment(blockingReview(OLD_HEAD), "2026-10-20T09:00:00Z"),
+        allyComment(cleanReview(CURRENT_HEAD), "2026-10-20T10:00:00Z"),
+        allyIssueComment(dispositioningReview(CURRENT_HEAD, OLD_HEAD, "tracked"), "2026-10-20T11:00:00Z"),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+  });
+
   it("refuses a ledger retirement written as an issue comment, and names that as the cause", () => {
     // The merge-facing one. A finding carried from an earlier head is a
     // `failure`; a ledger entry retiring it turns that red green. Restricting
