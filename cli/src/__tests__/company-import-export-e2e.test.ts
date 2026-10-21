@@ -195,17 +195,27 @@ function collectTextFiles(root: string, current: string, files: Record<string, s
   }
 }
 
+// The child is `pnpm`, and the real server is a tsx/node grandchild. Signalling
+// only `pnpm` left the server running after the suite, with agents it spawned
+// for the imported company (BLO-48155), so kill the whole process group.
+function killServerGroup(child: ServerProcess, signal: NodeJS.Signals) {
+  try {
+    if (child.pid) process.kill(-child.pid, signal);
+  } catch {
+    // Group already gone.
+  }
+}
+
 async function stopServerProcess(child: ServerProcess | null) {
-  if (!child || child.exitCode !== null) return;
-  child.kill("SIGTERM");
-  await new Promise<void>((resolve) => {
-    child.once("exit", () => resolve());
-    setTimeout(() => {
-      if (child.exitCode === null) {
-        child.kill("SIGKILL");
-      }
-    }, 120_000);
-  });
+  if (!child) return;
+  if (child.exitCode === null && child.signalCode === null) {
+    killServerGroup(child, "SIGTERM");
+    await new Promise<void>((resolve) => {
+      child.once("exit", () => resolve());
+      setTimeout(() => resolve(), 120_000);
+    });
+  }
+  killServerGroup(child, "SIGKILL");
 }
 
 async function api<T>(baseUrl: string, pathname: string, init?: RequestInit): Promise<T> {
@@ -374,6 +384,7 @@ describeEmbeddedPostgres("paperclipai company import/export e2e", () => {
           shellHome: cliShellHome,
         }),
         stdio: ["ignore", "pipe", "pipe"],
+        detached: true,
       },
     );
     serverProcess = child;
