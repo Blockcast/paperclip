@@ -196,24 +196,29 @@ function collectTextFiles(root: string, current: string, files: Record<string, s
 }
 
 // The child is `pnpm`, and the real server is a tsx/node grandchild. Signalling
-// only `pnpm` left the server running after the suite, with agents it spawned
-// for the imported company (BLO-48155), so kill the whole process group.
-function killServerGroup(child: ServerProcess, signal: NodeJS.Signals) {
+// only `pnpm` left the server running after the suite (BLO-48155), so signal the
+// whole process group. Agents the server spawns lead their own groups and are not
+// reached by this; only the server's own SIGTERM drain reaps them, so wait for the
+// group to empty (not just for `pnpm` to exit) before escalating to SIGKILL.
+// `detached` also means a Ctrl-C or hard kill of the vitest worker no longer
+// reaches the server; if afterAll never runs locally, kill the group by hand.
+const SERVER_STOP_TIMEOUT_MS = 120_000;
+
+function killServerGroup(child: ServerProcess, signal: NodeJS.Signals | 0) {
   try {
     if (child.pid) process.kill(-child.pid, signal);
+    return true;
   } catch {
-    // Group already gone.
+    return false; // ESRCH: group already gone.
   }
 }
 
 async function stopServerProcess(child: ServerProcess | null) {
   if (!child) return;
-  if (child.exitCode === null && child.signalCode === null) {
-    killServerGroup(child, "SIGTERM");
-    await new Promise<void>((resolve) => {
-      child.once("exit", () => resolve());
-      setTimeout(() => resolve(), 120_000);
-    });
+  killServerGroup(child, "SIGTERM");
+  const deadline = Date.now() + SERVER_STOP_TIMEOUT_MS;
+  while (killServerGroup(child, 0) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 250));
   }
   killServerGroup(child, "SIGKILL");
 }
@@ -399,7 +404,7 @@ describeEmbeddedPostgres("paperclipai company import/export e2e", () => {
     if (tempRoot) {
       rmSync(tempRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
     }
-  });
+  }, SERVER_STOP_TIMEOUT_MS + 60_000);
 
   it("exports a company package and imports it into new and existing companies", async () => {
     expect(serverProcess).not.toBeNull();
