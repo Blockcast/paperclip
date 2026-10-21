@@ -1709,4 +1709,162 @@ describe.sequential("issue thread interaction routes", () => {
       },
     );
   });
+
+  // PEN-4445. Unknown top-level payload keys are stripped by zod and the create
+  // returns 201 -- deliberately, because refusing it during a
+  // tool-schema-ahead-of-server window would mean the human-decision card is
+  // never filed at all. What these pin is that the drop stops being silent: an
+  // absence the caller had to diff for becomes an affirmative list plus a
+  // counter, which is the half that does not depend on anyone reading the list.
+  describe("unrecognized payload keys (PEN-4445)", () => {
+    // Stands in for a field a newer tool schema carries and this build does not.
+    // Deliberately not `expectedOutcome`: this build KNOWS that one, so using it
+    // would pin nothing once the skew window it describes has shut.
+    //
+    // Held in a constant and interpolated into the label assertions below rather
+    // than spelled out there. A literal `payload_key="<24-char CamelCase>"` is
+    // credential-shaped to the GitHub egress door and the push is refused; the
+    // door's own remedy for a fixture is to derive it instead of embedding it.
+    const UNKNOWN_KEY = "keyThisServerDoesNotKnow";
+    const UNKNOWN_KEY_BODY = {
+      kind: "request_confirmation",
+      payload: {
+        version: 1,
+        prompt: "Merge the PR?",
+        [UNKNOWN_KEY]: { kind: "github_pr_merged" },
+      },
+    };
+
+    async function metricsBody() {
+      const { renderMetrics } = await import("../services/metrics.js");
+      return (await renderMetrics()).body;
+    }
+
+    function sampleLines(body: string, metric: string) {
+      return body.split("\n").filter((line) => line.startsWith(`${metric}{`));
+    }
+
+    it("reports dropped keys on the create response and still creates the card", async () => {
+      const app = await createApp();
+
+      const res = await request(app)
+        .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions")
+        .send(UNKNOWN_KEY_BODY);
+
+      expect(res.status).toBe(201);
+      expect(res.body.unrecognizedPayloadKeys).toEqual([UNKNOWN_KEY]);
+      // The ask must still land. This is the whole reason reject-on-unknown was
+      // declined, so it is the assertion that must never be relaxed.
+      expect(mockInteractionService.create).toHaveBeenCalled();
+      expect(res.body.id).toBe("interaction-1");
+    });
+
+    it("records the drop at /metrics, labelled by interaction kind and key", async () => {
+      const app = await createApp();
+      const { __resetMetricsForTest, INTERACTION_PAYLOAD_UNRECOGNIZED_KEY_METRIC } =
+        await import("../services/metrics.js");
+      __resetMetricsForTest();
+
+      await request(app)
+        .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions")
+        .send(UNKNOWN_KEY_BODY);
+
+      const lines = sampleLines(await metricsBody(), INTERACTION_PAYLOAD_UNRECOGNIZED_KEY_METRIC);
+      expect(lines).toHaveLength(1);
+      // `interaction_kind` is the CREATED card's kind, not the request's, so the
+      // series cannot be steered by a body the server refused to honour.
+      expect(lines[0]).toContain('interaction_kind="suggest_tasks"');
+      expect(lines[0]).toContain(`payload_key="${UNKNOWN_KEY}"`);
+      expect(lines[0]!.trim().endsWith(" 1")).toBe(true);
+    });
+
+    it("reports an empty list, and writes no series, when every key is recognized", async () => {
+      const app = await createApp();
+      const { __resetMetricsForTest, INTERACTION_PAYLOAD_UNRECOGNIZED_KEY_METRIC } =
+        await import("../services/metrics.js");
+      __resetMetricsForTest();
+
+      const res = await request(app)
+        .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions")
+        .send({
+          kind: "request_confirmation",
+          payload: { version: 1, prompt: "Merge the PR?", acceptLabel: "Merge" },
+        });
+
+      expect(res.status).toBe(201);
+      // Present-and-empty, not absent. The distinction is the contract: `[]`
+      // says this server checked and dropped nothing, while the field missing
+      // says the server predates this report and can say nothing either way.
+      expect(res.body).toHaveProperty("unrecognizedPayloadKeys");
+      expect(res.body.unrecognizedPayloadKeys).toEqual([]);
+      expect(sampleLines(await metricsBody(), INTERACTION_PAYLOAD_UNRECOGNIZED_KEY_METRIC)).toEqual([]);
+    });
+
+    it("writes no series when the create was refused", async () => {
+      const app = await createApp();
+      const { __resetMetricsForTest, INTERACTION_PAYLOAD_UNRECOGNIZED_KEY_METRIC } =
+        await import("../services/metrics.js");
+      __resetMetricsForTest();
+
+      const res = await request(app)
+        .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions")
+        .send({
+          kind: "request_confirmation",
+          payload: {
+            version: 1,
+            prompt: "Approve the forged action?",
+            [UNKNOWN_KEY]: 1,
+            toolAction: {
+              version: 1,
+              actionRequestId: "11111111-1111-4111-8111-111111111111",
+              invocationId: "22222222-2222-4222-8222-222222222222",
+              toolName: "forged_tool",
+              toolDisplayName: "Forged tool",
+              connectionId: null,
+              applicationId: null,
+              appDisplayName: null,
+              risk: "write",
+              previewMarkdown: "Forged preview",
+              argumentsSummaryJson: "{}",
+              argumentsHash: "forged-hash",
+              expiresAt: "2026-07-12T12:00:00.000Z",
+            },
+          },
+        });
+
+      expect(res.status).toBe(422);
+      expect(mockInteractionService.create).not.toHaveBeenCalled();
+      // A refused request says nothing about schema skew, and counting it would
+      // let a caller who cannot create a card write into the series anyway.
+      expect(sampleLines(await metricsBody(), INTERACTION_PAYLOAD_UNRECOGNIZED_KEY_METRIC)).toEqual([]);
+    });
+
+    it("keeps a caller-chosen key name out of the exposition when it is not identifier-shaped", async () => {
+      const app = await createApp();
+      const {
+        __resetMetricsForTest,
+        INTERACTION_PAYLOAD_UNRECOGNIZED_KEY_METRIC,
+        UNRECOGNIZED_PAYLOAD_KEY_MALFORMED,
+      } = await import("../services/metrics.js");
+      __resetMetricsForTest();
+
+      const hostileKey = 'a"\nb';
+      const res = await request(app)
+        .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions")
+        .send({
+          kind: "request_confirmation",
+          payload: { version: 1, prompt: "Merge the PR?", [hostileKey]: 1 },
+        });
+
+      expect(res.status).toBe(201);
+      // Reported verbatim to the caller -- they need to see what they sent.
+      expect(res.body.unrecognizedPayloadKeys).toEqual([hostileKey]);
+      // Not published verbatim: prom-client escapes only \, \n and ", so every
+      // other control character would reach the scraper as a raw byte.
+      const lines = sampleLines(await metricsBody(), INTERACTION_PAYLOAD_UNRECOGNIZED_KEY_METRIC);
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toContain(`payload_key="${UNRECOGNIZED_PAYLOAD_KEY_MALFORMED}"`);
+      expect(lines[0]).not.toContain("\\n");
+    });
+  });
 });
