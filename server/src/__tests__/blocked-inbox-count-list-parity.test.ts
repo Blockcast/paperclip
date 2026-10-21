@@ -32,9 +32,10 @@ if (!embeddedPostgresSupport.supported) {
   );
 }
 
-// `listBlockedInboxIssues` projects `substring(description, 1, ISSUE_LIST_DESCRIPTION_MAX_CHARS)`
-// to bound payload size. Anything the blocked-inbox classifier reads out of a description has to
-// survive that cutoff, so the fixtures below deliberately straddle it.
+// `listBlockedInboxIssues` projects the description prefix to bound payload size (PEN-4450 made
+// that slice one code point wider than the cap so the row can report whether it was clipped; the
+// cap a caller sees is unchanged). Anything the blocked-inbox classifier reads out of a
+// description has to survive that cutoff, so the fixtures below deliberately straddle it.
 const ISSUE_LIST_DESCRIPTION_MAX_CHARS = 1200;
 
 const EXTERNAL_WAIT_DECLARATION = [
@@ -464,6 +465,12 @@ describeEmbeddedPostgres("blocked-inbox count/list parity (BLO-31839)", () => {
     const general = blockedInboxRow(generalRows, parkedId);
     expect(general.description).toBe(blocked.description);
     expect(general.description ?? "").not.toContain(EXTERNAL_OWNER);
+    // PEN-4450: the two paths now share `projectIssueListDescription`, and this row's
+    // description is past the cap by construction, so both must also agree that it is a
+    // prefix. The flag describes the STORED column, so redaction — which rewrites inside
+    // the preview — must not change it.
+    expect((blocked as any).descriptionTruncated).toBe(true);
+    expect((general as any).descriptionTruncated).toBe((blocked as any).descriptionTruncated);
   });
 
   it("leaves the description untouched for a row with no external-wait redaction", async () => {
