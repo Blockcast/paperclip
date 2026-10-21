@@ -40776,6 +40776,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
       if (outcome.kind === "deferred" || outcome.kind === "skipped") return null;
       if (outcome.kind === "coalesced") {
+        if (suppression) suppression.coalesced = true;
         // BLO-22048: only the FIRST dep-blocked fire creates the park and returns
         // `dep_blocked_scheduled` above. Every later fire meets that park and
         // coalesces into it instead — still a deferral, since the merged run stays
@@ -41230,7 +41231,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     if (queueOutcome.kind === "skipped") return null;
-    if (queueOutcome.kind === "coalesced") return queueOutcome.run;
+    if (queueOutcome.kind === "coalesced") {
+      if (suppression) suppression.coalesced = true;
+      return queueOutcome.run;
+    }
     if (queueOutcome.kind === "already_delivered") {
       // Tell the caller this was NOT a new queue, so it does not count a second
       // `queued` for a delivery already counted (see WakeSuppressionOutcome).
@@ -41443,6 +41447,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
      * BLO-18859 comments treat as load-bearing.
      */
     alreadyDelivered: boolean;
+    /**
+     * BLO-31961: set when the wake merged into an existing pending run instead
+     * of creating one. The caller still gets a truthy run, so without this a
+     * PR absorbing repeated review requests reads as N fresh queues.
+     */
+    coalesced?: boolean;
   };
 
   /**
@@ -41489,8 +41499,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       suppression.providerCapacityDeferred = false;
       suppression.dependencyBlockedRetryAt = null;
       suppression.alreadyDelivered = false;
+      suppression.coalesced = false;
       try {
         const result = await enqueueWakeup(agentId, opts, suppression);
+        if (result && suppression.coalesced && githubReviewReason !== null) {
+          // A sub-count of `queued`, not a disjoint state: the webhook still
+          // records `queued` for this delivery, so the funnel arithmetic holds.
+          recordGithubReviewRequestDelivery({ state: "coalesced", reason: githubReviewReason });
+        }
         if (!result && githubReviewReason !== null) {
           if (suppression.providerCapacityDeferred) {
             // Late, not lost: a scheduled_retry run is committed and the

@@ -2160,6 +2160,10 @@ export function normalizeGbrainRecallStatus(status: string | null | undefined): 
  *   `wakeupWithDispatchRetry` failing to persist its durable safety-net row at
  *   all (agent unresolvable, or the insert itself threw) — the latter is the
  *   original "lost forever, no record" mode and is the more urgent of the two.
+ * - `coalesced` (BLO-31961): a `queued` delivery that merged into an existing
+ *   pending run for the same PR instead of creating one. A sub-count of
+ *   `queued`, outside the invariant below. A PR with repeated coalesces and no
+ *   review is the signature of an absorbing run that never dispatches.
  *
  * The invariant an operator reads: every `received` delivery reaches exactly one
  * terminal state, so `received == queued + suppressed + dead_lettered` once the
@@ -2172,7 +2176,7 @@ export function normalizeGbrainRecallStatus(status: string | null | undefined): 
  *
  * Cardinality: `state` is closed at 6 and `reason` is coerced to
  * {@link KNOWN_GITHUB_WAKE_REASONS} (else "other"), so the series count is
- * bounded at `6 * (KNOWN_GITHUB_WAKE_REASONS.length + 1)` — independent of
+ * bounded at `7 * (KNOWN_GITHUB_WAKE_REASONS.length + 1)` — independent of
  * repo, PR number, delivery id, and agent roster. Those high-cardinality
  * identifiers stay on the structured log lines, matching the guardrail
  * {@link CONCURRENT_RUN_BLOCKED_METRIC} documents above.
@@ -2191,6 +2195,9 @@ export const KNOWN_GITHUB_DELIVERY_STATES = [
   "deferred",
   "retried",
   "dead_lettered",
+  // BLO-31961: a `queued` delivery that merged into an existing pending run
+  // instead of creating one. Counted in addition to `queued`, not instead.
+  "coalesced",
 ] as const;
 
 export type GithubReviewRequestDeliveryState = (typeof KNOWN_GITHUB_DELIVERY_STATES)[number];
@@ -5409,7 +5416,7 @@ function ensureRegistry(): {
     // entirely and a healthy fleet renders as "No data" on the funnel panel —
     // indistinguishable from a broken scrape. It matters most for
     // `dead_lettered`, where absent-vs-zero is exactly the difference between
-    // "nothing was lost" and "we cannot tell". 6 states x 8 reasons = 48
+    // "nothing was lost" and "we cannot tell". 7 states x 8 reasons = 56
     // constant-zero series, which is negligible next to the roster-scaled
     // counters above.
     for (const state of KNOWN_GITHUB_DELIVERY_STATES) {

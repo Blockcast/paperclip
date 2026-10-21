@@ -487,6 +487,22 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
       expect(failedRows).toHaveLength(1);
     });
 
+    it("counts `coalesced` when a review request merges into an existing queued run (BLO-31961)", async () => {
+      const { agentId } = await seedCompanyAndAgent();
+      const wake = () =>
+        heartbeat.wakeup(agentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "github_pr_review_requested",
+          payload: GITHUB_REVIEW_PAYLOAD,
+        });
+      const first = await wake();
+      expect(await deliveryCount("coalesced")).toBe(0);
+      const second = await wake();
+      expect(second?.id).toBe(first?.id);
+      expect(await deliveryCount("coalesced")).toBe(1);
+    });
+
     it("leaves the counter untouched for a non-GitHub wake that fails the same way", async () => {
       const { agentId } = await seedCompanyAndAgent();
       // Same failure, but no source/reviewKind markers: wakeupWithDispatchRetry

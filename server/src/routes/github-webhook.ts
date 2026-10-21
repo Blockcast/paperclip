@@ -3121,8 +3121,11 @@ function buildPrReviewerWakeIdempotencyKey(
 // Deliberately PR-scoped, with no head sha: this key also scopes the reviewer
 // affinity lookup (findInvokablePrReviewerForTask), the withPrReviewerTaskLock
 // serialization, and the cancel-queued-runs-on-close sweep, all of which must
-// stay stable across heads for one PR. Head-awareness for review requests lives
-// in heartbeat's coalescing decision instead (BLO-18953).
+// stay stable across heads for one PR. Coalescing is NOT head-aware (BLO-31961):
+// a later request merges into any pending (queued / scheduled_retry) run for the
+// PR, and the merged snapshot takes the newer head, so that run reviews the
+// current head when it dispatches. Each such merge is counted as
+// `state="coalesced"` on the delivery metric.
 function buildPrReviewerTaskKey(context: ResolvedEventContext & { prNumber: number }) {
   // Keep the legacy spelling during the compatibility rollout. New pods can
   // read either spelling; pre-normalization pods can only read this one.
