@@ -1072,3 +1072,43 @@ An earlier revision of this section stated the sweep had **not** fired as of 202
 started at `15:32:01.144Z` and is `done` (`completedAt: 2026-09-07T18:45:52.507Z`). The 09:00:00Z
 boundary run `358312e5-7c6c-47eb-96fd-431f083e2d81` was `skipped` and coalesced into `b711b104`.
 The human-gated ageing rows are BLO-32535's own output and are deliberately not transcribed here.
+
+# Track B landing log: evidence-gate truth shapes
+
+Tracking issue: [BLO-32239](https://paperclip.blockcast.net/BLO/issues/BLO-32239), `done`.
+
+| item | evidence |
+|---|---|
+| PRs merged to `master` | #1841, #1857, #1874, #1875, #2067, #2072 |
+| Last PR | #2067 (B8 runbook), merged 2026-10-01T11:32:29Z by `kkroo`, merge commit `cf55542b`. `docs/runbooks/evidence-gate-unlabeled-block.md` is present on `master`. |
+| Flag ships off | `deploy/helm/paperclip/tests/evidence-gate-unlabeled-block.test.mjs` asserts the flag renders exactly twice as `"0"`. #2072 adds `server/src/__tests__/config-evidence-unlabeled-block.test.ts` for the env → `loadConfig()` hop. |
+| Post-deploy probe | BLO-37156, `evaluatedAt 2026-09-28T15:08:15.123Z`: `deploy:landed` detected, `review:ally-clean` evaluated, `diagnostics: []`. BLO-38513 (2026-09-30T22:19Z) also reads `diagnostics: []`. |
+| `skills/**` CODEOWNERS | #1875 was merged by `kkroo`. |
+| Routines | None. Track B ships code and a flag. It does not create a routine. |
+
+The unlabeled truth block stays off. Turning it on is gated on BLO-24843, as recorded in the runbook.
+
+# Track D landing log: evidence skill synced to agents
+
+Tracking issue: [BLO-32242](https://paperclip.blockcast.net/BLO/issues/BLO-32242), `done`. The execution row is [BLO-32259](https://paperclip.blockcast.net/BLO/issues/BLO-32259), also `done`.
+
+| item | evidence |
+|---|---|
+| PR | #1684, merged 2026-09-09T16:20:59Z by `kkroo`, merge commit `0ef70683` |
+| Deploy | `0ef70683` is an ancestor of the deployed commit on both tiers (verified on BLO-32259) |
+| Agents carrying the skill | 16 agents have `paperclipai/paperclip/paperclip-evidence-before-in-review` in `desiredSkills` (re-measured 2026-10-21) |
+| Rollback proof | `scripts/ops/sync-agent-skill.py` ran strip → dry-run → apply → `--rollback` → re-apply on Players Engineer `0b4ec33c`. It printed `ROLLBACK ROUND-TRIP OK`, and the adapterConfig diff from before to after was empty. The output is in the #1684 body. |
+| Accepted substitutes | On 2026-10-21 the responsible human accepted the code-owner merge in place of an APPROVED review, and the `/skills` API state in place of a 1440x900 screenshot. |
+| Routines | None |
+
+# Track E landing log: agent elevation request runbook
+
+Tracking issue: [BLO-32243](https://paperclip.blockcast.net/BLO/issues/BLO-32243), `done`.
+
+| item | evidence |
+|---|---|
+| PR | #1708, merged 2026-09-10T03:06:40Z, merge commit `afcbb4a8` |
+| Artifact | `docs/runbooks/agent-elevation-request.md` on `master`, with a `## Verification log` of nine subsections |
+| Precondition | Verified, and the result is negative. The controller builds subjects from `SubjectEmail` + `oidc:`, so a ServiceAccount cannot match a grant. The runbook records this. |
+| Deploy | None needed. The change is docs only. |
+| Routines | None |
