@@ -16,7 +16,8 @@
 //     into a business-rule outcome instead.
 import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { logger } from "../middleware/logger.js";
 import { agents, agentWakeupRequests, companies, createDb, heartbeatRuns, issues } from "@paperclipai/db";
 import {
   CCROTATE_CAPACITY_RETRY_REASON,
@@ -919,10 +920,16 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
           status: "dispatch_failed",
         });
 
-        const result = await heartbeat.reconcileFailedWakeDispatches(now);
+        const warn = vi.spyOn(logger, "warn");
+        const result = await heartbeat.reconcileFailedWakeDispatches(now).finally(() => warn.mockRestore());
         expect(result.superseded).toBe(1);
         expect(result.recovered).toBe(0);
         expect(result.exhausted).toBe(0);
+        // BLO-48170: the rejection must be attributable from logs alone.
+        expect(warn).toHaveBeenCalledWith(
+          expect.objectContaining({ wakeupRequestId, taskKey: GITHUB_REVIEW_PAYLOAD.taskKey }),
+          expect.stringContaining("redelivery rejected"),
+        );
 
         // The pass is a re-dispatch attempt, so `retried` still moves...
         expect(await deliveryCount("retried")).toBe(1);
