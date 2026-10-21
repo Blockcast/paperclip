@@ -481,6 +481,37 @@ export interface ServerAdapterModule {
    * or a Paperclip code update.
    */
   refreshModels?: () => Promise<AdapterModel[]>;
+  /**
+   * Optional: resolve the admissible model set for ONE agent's configuration.
+   *
+   * `listModels()` answers "what should the picker show on this server", which
+   * is a different question from "may this agent be written with this model id"
+   * whenever the admissible set depends on the agent's own environment. The
+   * Claude adapters are the worked example: both swap their whole registry for
+   * Bedrock-native ids when `CLAUDE_CODE_USE_BEDROCK` / `ANTHROPIC_BEDROCK_BASE_URL`
+   * is set, and for a pod-per-agent adapter that variable can come from the
+   * agent's own `adapterConfig.env`, which outranks the server's env in the pod.
+   * Validating such an agent against `listModels()` alone would refuse a model
+   * id that is correct for the lane it runs on.
+   *
+   * Return the complete set admissible for this config. When absent the server
+   * falls back to `listModels()` / `models`.
+   */
+  listModelsForConfig?: (adapterConfig: Record<string, unknown>) => Promise<AdapterModel[]>;
+  /**
+   * Declares that the resolved model registry is the COMPLETE admissible set,
+   * so the server may refuse a write naming a model outside it (PEN-4447).
+   *
+   * Opt-in, and deliberately so. `PATCH /agents/:id` accepted any string as
+   * `adapterConfig.model` with a 200; the model then failed at CLI exec on the
+   * next pod boot, hours later, with nothing connecting the two. But many
+   * adapters discover models from a live provider API or a CLI and fall back to
+   * a static list when that lookup fails, so for them a missing id means
+   * "discovery is down", not "invalid" — refusing those writes would trade a
+   * late failure for an immediate wrong one. Only declare this where the list
+   * genuinely enumerates everything the runtime accepts.
+   */
+  modelRegistryIsClosed?: boolean;
   agentConfigurationDoc?: string;
   /**
    * Optional lifecycle hook when an agent is approved/hired (join-request or hire_agent approval).

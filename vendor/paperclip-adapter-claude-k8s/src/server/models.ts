@@ -31,15 +31,68 @@ const BEDROCK_MODELS: AdapterModel[] = [
   { id: "us.anthropic.claude-haiku-4-5-20251001-v1:0", label: "Bedrock Haiku 4.5" },
 ];
 
-function isBedrockEnv(): boolean {
+function isBedrockValues(useBedrock: string | undefined, bedrockBaseUrl: string | undefined): boolean {
   return (
-    process.env.CLAUDE_CODE_USE_BEDROCK === "1" ||
-    process.env.CLAUDE_CODE_USE_BEDROCK === "true" ||
-    (typeof process.env.ANTHROPIC_BEDROCK_BASE_URL === "string" &&
-      process.env.ANTHROPIC_BEDROCK_BASE_URL.trim().length > 0)
+    useBedrock === "1" ||
+    useBedrock === "true" ||
+    (typeof bedrockBaseUrl === "string" && bedrockBaseUrl.trim().length > 0)
   );
+}
+
+function isBedrockEnv(): boolean {
+  return isBedrockValues(
+    process.env.CLAUDE_CODE_USE_BEDROCK,
+    process.env.ANTHROPIC_BEDROCK_BASE_URL,
+  );
+}
+
+/**
+ * Bedrock-ness of ONE agent's configuration, not of the server process.
+ *
+ * This adapter runs each agent in its own Job pod, whose env is the server's
+ * inherited env with `adapterConfig.env` layered OVER it (job-manifest.ts layer
+ * 4 "wins over everything"; both `CLAUDE_CODE_*` and `ANTHROPIC_*` are in the
+ * inherit allowlist). So an agent can be a Bedrock lane on a non-Bedrock server
+ * and the reverse, and `process.env` alone is the wrong oracle for "which model
+ * ids may this agent be written with".
+ *
+ * A key PRESENT in `adapterConfig.env` wins even when its value is empty — that
+ * is how an agent opts out of an inherited setting, and the pod merge behaves
+ * the same way. A managed-secret reference reads as a non-empty string, which
+ * is the safe direction: a config that names a Bedrock base URL at all resolves
+ * to the Bedrock registry.
+ */
+export function isBedrockAdapterConfig(
+  adapterConfig: Record<string, unknown>,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  const configEnv =
+    typeof adapterConfig.env === "object" && adapterConfig.env !== null
+      ? (adapterConfig.env as Record<string, unknown>)
+      : {};
+  const read = (key: string): string | undefined => {
+    if (Object.prototype.hasOwnProperty.call(configEnv, key)) {
+      const value = configEnv[key];
+      return typeof value === "string" ? value : value == null ? "" : String(value);
+    }
+    return env[key];
+  };
+  return isBedrockValues(read("CLAUDE_CODE_USE_BEDROCK"), read("ANTHROPIC_BEDROCK_BASE_URL"));
 }
 
 export async function listK8sModels(): Promise<AdapterModel[]> {
   return isBedrockEnv() ? BEDROCK_MODELS : DIRECT_MODELS;
+}
+
+/**
+ * Model set admissible for ONE agent's configuration (PEN-4447).
+ *
+ * Paperclip calls this when validating a write to `adapterConfig.model`, so
+ * that an agent is judged against the registry its own pod will use rather than
+ * against whichever branch this server process happens to be on.
+ */
+export async function listK8sModelsForConfig(
+  adapterConfig: Record<string, unknown>,
+): Promise<AdapterModel[]> {
+  return isBedrockAdapterConfig(adapterConfig) ? BEDROCK_MODELS : DIRECT_MODELS;
 }
