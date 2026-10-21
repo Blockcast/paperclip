@@ -1972,3 +1972,42 @@ describe("merge-gate reader", () => {
     });
   });
 });
+
+// `review/ally-ledger` is the review gate's finding ledger, stored as commit
+// statuses that are written `pending` and resolved only after merge. Reading
+// it as STOP refused every PR that ever had a blocking finding (14 open in
+// onprem-k8s on 2026-10-21). It is non-blocking only while the verdict it
+// feeds, `review/ally-complete`, is `success` at the same head.
+describe("review/ally-ledger", () => {
+  const build = ["build", "success", "2026-10-21T20:00Z", "111"];
+  const ledger = (state) => ["review/ally-ledger", state, "2026-10-21T20:09Z", "status"];
+  const complete = (state, at = "2026-10-21T20:31Z") => ["review/ally-complete", state, at, "status"];
+  const stops = (lines) => lines.filter((l) => l.startsWith("STOP"));
+
+  it("is ADVISORY, not STOP, when review/ally-complete is success at the head", () => {
+    const lines = read([build, complete("success"), ledger("pending")]);
+    assert.deepEqual(lines, ["ADVISORY\treview/ally-ledger\tpending\trun=status"]);
+  });
+
+  it("stays STOP while review/ally-complete is pending", () => {
+    const lines = read([build, complete("pending"), ledger("pending")]);
+    assert.deepEqual(stops(lines), [
+      "STOP\treview/ally-complete\tpending\trun=status",
+      "STOP\treview/ally-ledger\tpending\trun=status",
+    ]);
+  });
+
+  it("stays STOP when review/ally-complete is absent", () => {
+    assert.deepEqual(read([build, ledger("pending")]), ["STOP\treview/ally-ledger\tpending\trun=status"]);
+  });
+
+  it("stays STOP when the newest review/ally-complete is not success", () => {
+    const lines = read([build, complete("success", "2026-10-21T20:26Z"), complete("pending"), ledger("pending")]);
+    assert.ok(stops(lines).includes("STOP\treview/ally-ledger\tpending\trun=status"));
+  });
+
+  it("is never relaxed for a non-pending ledger state", () => {
+    const lines = read([build, complete("success"), ledger("failure")]);
+    assert.deepEqual(lines, ["STOP\treview/ally-ledger\tfailure\trun=status"]);
+  });
+});
