@@ -141,10 +141,60 @@ async function resolveScopeRecord(db: Db, scopeType: BudgetScopeType, scopeId: s
   };
 }
 
+/**
+ * The quantity every budget control enforces on: list-price CONSUMPTION, in cents.
+ *
+ * `coalesce` and not `coalesce(nullif(consumption_cents, 0), ...)`: `consumption_cents` is
+ * nullable precisely so that NULL ("row predates the column") stays distinguishable from 0
+ * ("this run genuinely cost nothing"). `nullif` would collapse those and re-read
+ * `cost_cents` for every free row forever. The fallback also covers rows inserted between
+ * migration 0263 and the deploy that starts populating the column.
+ */
+const consumptionCentsExpr = sql<number>`coalesce(${costEvents.consumptionCents}, ${costEvents.costCents})`;
+
+/**
+ * ⚠️ ORDERING CONSTRAINT -- read this before "fixing" adapter billingType classification.
+ *
+ * This is the sole input to every hardStopEnabled budget policy. Until PEN-4466 it summed
+ * costEvents.costCents with NO billingType filter -- and upstream, normalizeBilledCostCents()
+ * (services/heartbeat.ts) zeroes costCents at ledger-write time whenever billingType is
+ * "subscription_included".
+ *
+ * Consequence, had this not moved: on the day an adapter starts classifying subscription
+ * lanes correctly, every such lane books $0, this function returns 0 forever, and every
+ * hard stop becomes silently unreachable while all dashboards read healthy. That is
+ * strictly worse than the status quo it would replace, in which billed_cents is a
+ * list-price CONSUMPTION figure wearing a cash label -- usable as a throttle because list
+ * price is monotone in work and model-weighted, but NOT a cash figure. Recorded cash for
+ * this company is $0.00 across 0 events; the marginal cash cost of a run on an
+ * already-purchased seat is $0. No cash multiplier is quoted here because none is
+ * measurable. See PEN-4463 step 1.
+ *
+ * Therefore: a billingType classification change must not reach normalizeBilledCostCents
+ * until every gate reads a field that function cannot zero. Classification goes LAST.
+ * The gates, all three of which this change moved to `consumptionCentsExpr`:
+ *
+ *   * this function                -- the five hardStopEnabled budget policies
+ *   * `heartbeat.daily_cost_limit` -- services/heartbeat.ts, per-agent daily cost cap
+ *   * `getMonthlySpendTotal`       -- services/costs.ts, agents/companies.spentMonthlyCents
+ *
+ * Still outstanding when classification lands, and NOT covered by PEN-4466: the reporting
+ * surfaces (`/costs/*`, `dashboard.ts`, `issue-efficiency.ts`) still read `cost_cents`
+ * directly. They carry no gate, so they fail visibly rather than silently -- but whoever
+ * lands classification must expose both quantities there, labelled, or those read 0.
+ *
+ * Invariant held by `budget-consumption-metric.test.ts`, which fails if a future change
+ * repoints this at a zeroable column.
+ *
+ * Ruling: Penstock PEN-4463 (@Ceo, 2026-10-21). Trace: PEN-4397 doc billing-classification-trace.
+ */
 async function computeObservedAmount(
   db: Db,
   policy: Pick<PolicyRow, "companyId" | "scopeType" | "scopeId" | "windowKind" | "metric">,
 ) {
+  // NB: the `billed_cents` metric NAME is unchanged and still means consumption -- renaming
+  // the BUDGET_METRICS enum needs a budget_policies data migration plus an API/UI contract
+  // change, moves no number, and ships independently (PEN-4466, deliberately deferred).
   if (policy.metric !== "billed_cents") return 0;
 
   const conditions = [eq(costEvents.companyId, policy.companyId)];
@@ -158,7 +208,7 @@ async function computeObservedAmount(
 
   const [row] = await db
     .select({
-      total: sql<number>`coalesce(sum(${costEvents.costCents}), 0)::double precision`,
+      total: sql<number>`coalesce(sum(${consumptionCentsExpr}), 0)::double precision`,
     })
     .from(costEvents)
     .where(and(...conditions));

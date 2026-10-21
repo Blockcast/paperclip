@@ -6800,8 +6800,25 @@ function resolveLedgerBiller(result: AdapterExecutionResult): string {
   return readNonEmptyString(result.biller) ?? readNonEmptyString(result.provider) ?? "unknown";
 }
 
+/**
+ * ⚠️ This zeroes the ledger's cash column for subscription lanes, which is correct --
+ * but it is also why no budget gate may read `cost_cents`. Before changing adapter
+ * billingType classification, read the ORDERING CONSTRAINT block above
+ * `computeObservedAmount` in `services/budgets.ts`. (PEN-4466 / PEN-4463.)
+ */
 function normalizeBilledCostCents(costUsd: number | null | undefined, billingType: BillingType): number {
   if (billingType === "subscription_included") return 0;
+  if (typeof costUsd !== "number" || !Number.isFinite(costUsd)) return 0;
+  return Math.max(0, Math.round(costUsd * 100));
+}
+
+/**
+ * List-price CONSUMPTION in cents, deliberately with NO billingType branch -- this is the
+ * quantity the budget gates enforce on, and it must survive a correct classification of
+ * subscription lanes. `result.costUsd` is never mutated between here and the ledger insert,
+ * so this reads list price by construction. (PEN-4466.)
+ */
+function normalizeConsumptionCostCents(costUsd: number | null | undefined): number {
   if (typeof costUsd !== "number" || !Number.isFinite(costUsd)) return 0;
   return Math.max(0, Math.round(costUsd * 100));
 }
@@ -23897,7 +23914,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     if (checkCostCap && policy.maxDailyCostCents !== null) {
       const [row] = await client
-        .select({ total: sql<number>`coalesce(sum(${costEvents.costCents})::bigint, 0)` })
+        // PEN-4466: consumption, not the zeroable cash column -- see the ORDERING
+        // CONSTRAINT block above `computeObservedAmount` in services/budgets.ts.
+        .select({
+          total: sql<number>`coalesce(sum(coalesce(${costEvents.consumptionCents}, ${costEvents.costCents}))::bigint, 0)`,
+        })
         .from(costEvents)
         .where(
           and(
@@ -30527,6 +30548,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const cacheCreationInputTokens = usage?.cacheCreationInputTokens ?? 0;
     const billingType = normalizeLedgerBillingType(result.billingType);
     const additionalCostCents = normalizeBilledCostCents(result.costUsd, billingType);
+    const consumptionCents = normalizeConsumptionCostCents(result.costUsd);
     const hasTokenUsage =
       inputTokens > 0 || outputTokens > 0 || cachedInputTokens > 0 || cacheCreationInputTokens > 0;
     const costStatus = resolveLedgerCostStatus({
@@ -30590,7 +30612,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       })
       .where(eq(agentRuntimeState.agentId, agent.id));
 
-    if (additionalCostCents > 0 || hasTokenUsage) {
+    // PEN-4466: `consumptionCents > 0` is the clause that matters once classification is
+    // correct. `additionalCostCents` is 0 for every subscription lane, so without this a
+    // priced subscription run that reported no token usage would write no ledger row at
+    // all and the gates would never see it. Token usage normally carries such runs in on
+    // its own; this makes that incidental coverage explicit.
+    if (additionalCostCents > 0 || consumptionCents > 0 || hasTokenUsage) {
       const costs = costService(db, budgetHooks);
       await costs.createEvent(agent.companyId, {
         heartbeatRunId: run.id,
@@ -30607,6 +30634,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         cacheCreationInputTokens,
         outputTokens,
         costCents: additionalCostCents,
+        consumptionCents,
         occurredAt: new Date(),
       });
     }

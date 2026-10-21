@@ -34,6 +34,20 @@ function currentUtcMonthWindow(now = new Date()) {
   };
 }
 
+/**
+ * PEN-4466: list-price CONSUMPTION in cents -- the quantity the gates enforce on.
+ * See the ORDERING CONSTRAINT block above `computeObservedAmount` in `budgets.ts`;
+ * `cost_cents` alone is zeroed by `normalizeBilledCostCents` for subscription lanes.
+ */
+const consumptionCentsExpr = sql<number>`coalesce(${costEvents.consumptionCents}, ${costEvents.costCents})`;
+
+/**
+ * Feeds `agents.spentMonthlyCents` and `companies.spentMonthlyCents`, which are the
+ * monthly burn series the fleet is tracked by -- so this is the third gate-adjacent
+ * reader and it moves with the other two. Reading `cost_cents` here would not collapse
+ * retroactively on the day classification lands; it would FLATLINE forward, which reads
+ * as "the fleet stopped" rather than "the meter broke". (PEN-4466 §4.)
+ */
 async function getMonthlySpendTotal(
   db: Db,
   scope: { companyId: string; agentId?: string | null },
@@ -49,7 +63,7 @@ async function getMonthlySpendTotal(
   }
   const [row] = await db
     .select({
-      total: sumAsNumber(costEvents.costCents),
+      total: sql<number>`coalesce(sum(${consumptionCentsExpr}), 0)::double precision`,
     })
     .from(costEvents)
     .where(and(...conditions));
@@ -82,6 +96,13 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
           // BLO-29842: cache WRITE. Adapters that report no cache-creation field
           // omit it and land on 0, which is the same value pre-migration rows carry.
           cacheCreationInputTokens: data.cacheCreationInputTokens ?? 0,
+          // PEN-4466: callers that do not report consumption separately fall back to
+          // costCents, which is the right value for every metered_api lane. The heartbeat
+          // ledger writer passes this explicitly, computed with no billingType branch, so
+          // subscription lanes do NOT inherit the zero that normalizeBilledCostCents
+          // returns. Deliberately `??` and not `|| `: a genuinely-zero consumption must
+          // stay 0 rather than silently re-deriving from costCents.
+          consumptionCents: data.consumptionCents ?? data.costCents,
         })
         .returning()
         .then((rows) => rows[0]);
