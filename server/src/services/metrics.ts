@@ -1425,6 +1425,48 @@ export const KNOWN_ORPHAN_REAP_STAGES = [
   // nothing to iterate, and the real spender -- one of these three -- was not
   // separable from the metric. Do not re-merge these.
   "reconcile_release_pending",
+  // PEN-4380 pass 2: `reconcile_release_pending` is where the split bottomed
+  // out, and it was not enough -- it names a function, not a wait. Measured
+  // 2026-10-21 on two excursions (211.209 s completing 07:31:58 on
+  // `10.244.3.92`; 132.107 s completing 08:06:28 on `10.244.17.123`), FIVE
+  // candidate homes for that time were refuted, each against a positive
+  // control:
+  //
+  //   - Slow SQL / a plan cliff. `pg_stat_statements` (unblinded 2026-10-20) is
+  //     readable per `queryid`. Across a 12-minute bracket around each
+  //     excursion the LARGEST per-call exec time of ANY of the 200 tracked
+  //     statements was 13.19 s and 10.94 s. No statement in the database ran
+  //     for 211 s, so the stage is not waiting on one. This is also why there
+  //     is no index change here: the earlier `environment_leases (status)`
+  //     proposal rested on this hypothesis.
+  //   - Connection-pool starvation. `paperclip_db_pool_waiting_queries` was 0
+  //     at every sample through both excursions, with `active` 0-5 of max 18 --
+  //     two consecutive samples read `active=0` WHILE a 132 s stage was open.
+  //   - Event-loop blocking / CPU starvation. `nodejs_eventloop_lag_max_seconds`
+  //     peaked at 1.223 s and p99 at 0.155 s. The process was scheduling fine.
+  //   - A nested re-entrant sweep (reap -> promote -> dispatch -> reap). The
+  //     `nested` disposition is EXACTLY 0 for the ten consecutive cliff hours
+  //     of 2026-10-19 16:00-10-20 01:00Z, against 6-41/h immediately before.
+  //     That path was never taken.
+  //   - In-pod kube client saturation (the BLO-36922 signature). Zero
+  //     `k8s_concurrency_guard_unreachable` lines in the cliff window, against
+  //     a 3,474-line positive control from the same window and stream.
+  //
+  // What is left is inside the per-row loop, at ~4.5 s/row over a driving set
+  // (`paperclip_external_runtime_reservations_active`) of only 5-40 rows. These
+  // three separate the loop's two awaits from the query that feeds it, which is
+  // the one distinction the refutations above cannot make from outside:
+  // `release_pending_select` is the driving SELECT, `release_pending_job_reads`
+  // is the per-row `readAgentJobRunStatusByName` kube lookup summed over the
+  // pass, and `release_pending_act` is the release/promote/finalize work summed
+  // over the rows that were actually acted on.
+  //
+  // Additive, like the pass-1 split above: the three are recorded only for the
+  // sweep's own call, so `reconcile_release_pending` still measures the
+  // identical span and its history stays comparable.
+  "release_pending_select",
+  "release_pending_job_reads",
+  "release_pending_act",
   "reconcile_env_leases",
   "refresh_resource_metrics",
   "pod_cleanup",

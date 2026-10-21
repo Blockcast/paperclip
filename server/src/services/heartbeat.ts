@@ -27075,8 +27075,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     ambiguousRunIds: ReadonlySet<string> = new Set(),
     onlyRunId?: string,
     failures: RuntimeResourceReconciliationFailures = { failedRowCount: 0 },
-    options: { suppressDispatch?: boolean } = {},
+    options: { suppressDispatch?: boolean; recordStageTiming?: boolean } = {},
   ) {
+    // PEN-4380 pass 2. Only the sweep's own call records these, so the three
+    // sub-stages keep summing to `reconcile_release_pending` the way the pass-1
+    // split sums to `reconcile_reservations`. The single-run callers
+    // (`onlyRunId`) share this function but are a different population, and
+    // mixing them would silently break that identity -- which is the property
+    // that makes the split checkable at all.
+    const recordSubStage = options.recordStageTiming
+      ? (stage: Parameters<typeof recordOrphanReapStage>[0], seconds: number) =>
+        recordOrphanReapStage(stage, seconds)
+      : () => {};
+    // Summed across the pass, not per row: a per-row series would carry an
+    // `agent_id`-shaped cardinality in all but name, and the question is which
+    // of the two awaits owns the pass, not which row was unlucky.
+    let jobReadMs = 0;
+    let actMs = 0;
+    const selectStartedAt = Date.now();
     const pending = await db
       .select({
         reservation: externalRuntimeReservations,
@@ -27135,6 +27151,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ),
         ),
       );
+    // Recorded on the success path only. A throw here aborts the whole
+    // function, and the parent `reconcile_release_pending` timer already
+    // records from a `finally`, so the failed pass is still attributed -- one
+    // level up, where it is just as legible and costs no control flow here.
+    recordSubStage("release_pending_select", (Date.now() - selectStartedAt) / 1000);
     // PEN-3640: name the branch that is refusing to release a long-held
     // reservation, so a strand is attributable from the logs alone instead of
     // only showing up as a rising gauge.
@@ -27277,7 +27298,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           terminalOrMissing = true;
         }
         if (!terminalOrMissing && jobName) {
-          const exact = await readAgentJobRunStatusByName(jobName);
+          const jobReadStartedAt = Date.now();
+          const exact = await readAgentJobRunStatusByName(jobName)
+            .finally(() => { jobReadMs += Date.now() - jobReadStartedAt; });
           terminalOrMissing = Boolean(
             exact
             && exact.phase !== "active"
@@ -27295,6 +27318,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
         const terminalPrelaunchOrphan =
           reservation.state === "reserved" || reservation.state === "launching";
+        const actStartedAt = Date.now();
         const released = await releaseExternalRuntimeReservation(db, {
           runId: reservation.runId,
           reason:
@@ -27350,6 +27374,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             "released prelaunch external-runtime reservation left behind by terminal run",
           );
         }
+        // No `finally`: nothing between `actStartedAt` and here can `continue`
+        // or `break`, and a throw is already reported as `failedRowCount` by
+        // the per-row catch below, so the row is accounted for either way.
+        actMs += Date.now() - actStartedAt;
       } catch (error) {
         failures.failedRowCount += 1;
         logger.warn(
@@ -27362,6 +27390,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         );
       }
     }
+    // Recorded after the loop rather than per row, so one observation covers
+    // the pass and the three sub-stages stay comparable with the parent.
+    recordSubStage("release_pending_job_reads", jobReadMs / 1000);
+    recordSubStage("release_pending_act", actMs / 1000);
   }
 
   // BLO-21460: environment leases have no DB trigger tying them to
@@ -28461,7 +28493,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ambiguousExternalRunIds,
           undefined,
           reconciliationFailures,
-          { suppressDispatch: opts?.suppressDispatchAfterReap },
+          { suppressDispatch: opts?.suppressDispatchAfterReap, recordStageTiming: true },
         ));
       await timeOrphanReapCall(
         "reconcile_env_leases",
