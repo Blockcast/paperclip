@@ -1086,7 +1086,7 @@ Tracking issue: [BLO-32239](https://paperclip.blockcast.net/BLO/issues/BLO-32239
 | `skills/**` CODEOWNERS | #1875 was merged by `kkroo`. |
 | Routines | None. Track B ships code and a flag. It does not create a routine. |
 
-The unlabeled truth block stays off. Turning it on is gated on BLO-24843, as recorded in the runbook.
+The unlabeled truth block stays off. Turning it on is an operator action that follows `docs/runbooks/evidence-gate-unlabeled-block.md`. The older BLO-24843 flip criterion is retired (runbook line 247).
 
 # Track D landing log: evidence skill synced to agents
 
