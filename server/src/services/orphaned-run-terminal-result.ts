@@ -41,7 +41,7 @@ export type OrphanedRunTerminalResult =
   | { outcome: "absent"; reason: "no_artifact" | "empty_artifact" | "no_result_event" | "unreadable" }
   | { outcome: "found"; succeeded: boolean; subtype: string | null; artifactPath: string };
 
-function runLogBasePath() {
+export function runLogBasePath() {
   return process.env.RUN_LOG_BASE_PATH ?? path.resolve(resolvePaperclipInstanceRoot(), "data", "run-logs");
 }
 
