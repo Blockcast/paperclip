@@ -351,6 +351,35 @@ describe("openapi routes", () => {
     expect(spec.paths["/api/companies/import"].post.responses["202"]).toBeDefined();
   });
 
+  it("publishes the interaction-decision family at the actor level each route enforces", () => {
+    // PEN-4409: `acknowledge-outcome` shipped inside `BOARD_ONLY_OPERATIONS` while its
+    // handler deliberately omits `assertBoard` — the party that knows an action went
+    // moot is usually the agent that filed the ask, and requiring a human for every
+    // superseded card reproduces the un-clearable backlog the endpoint exists to fix.
+    // The spec therefore told agent and codegen consumers they could not call the one
+    // operation in this family built for them.
+    //
+    // Pinned against its board-only siblings rather than on its own, because the two
+    // regressions are opposite and a single-operation assertion only catches one:
+    // re-listing `acknowledge-outcome` (narrowing a contract the handler does not
+    // enforce), and dropping `accept`/`reject`/`respond` (publishing three routes as
+    // agent-callable when they do call `assertBoard`).
+    const { spec } = loadSpecRoutes();
+
+    const interaction = "/api/issues/{id}/interactions/{interactionId}";
+    const boardSecurity = [{ BoardSessionAuth: [] }, { BoardApiKeyAuth: [] }];
+
+    for (const decision of ["accept", "reject", "respond"]) {
+      const operation = spec.paths[`${interaction}/${decision}`].post;
+      expect(operation["x-paperclip-authorization"]).toEqual({ actor: "board" });
+      expect(operation.security).toEqual(boardSecurity);
+    }
+
+    const acknowledge = spec.paths[`${interaction}/acknowledge-outcome`].post;
+    expect(acknowledge["x-paperclip-authorization"]).toEqual({ actor: "board_or_agent" });
+    expect(acknowledge.security).toEqual([...boardSecurity, { AgentBearerAuth: [] }]);
+  });
+
   it("keeps the issue aggregates' response codes in line with their /search siblings", () => {
     const { spec } = loadSpecRoutes();
     // BLO-41592: issues/count and the census refuse time-bound params with a 400, and both
