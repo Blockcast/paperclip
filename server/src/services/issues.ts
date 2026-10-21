@@ -1349,6 +1349,12 @@ function isReapableHeartbeatRunRow(
   return NEVER_STARTED_HEARTBEAT_RUN_STATUSES.has(run.status) && run.startedAt == null;
 }
 const ISSUE_LIST_DESCRIPTION_MAX_CHARS = 1200;
+// PEN-4450: one code point past the cap, so a list row can be told apart from a
+// description that merely happens to be exactly `MAX` long. The probe is what makes
+// `descriptionTruncated` answerable without `length(description)`, which cannot be
+// served from a TOAST slice — it detoasts the whole column and reintroduces the
+// ~14% pg-CPU regression the cap exists to prevent (see `issueListSelect`).
+const ISSUE_LIST_DESCRIPTION_PROBE_CHARS = ISSUE_LIST_DESCRIPTION_MAX_CHARS + 1;
 
 function escapeLikePattern(value: string): string {
   return value.replace(/[\\%_]/g, "\\$&");
@@ -1363,9 +1369,46 @@ function truncateByCodePoint(value: string, maxChars: number): string {
   return Array.from(value).slice(0, maxChars).join("");
 }
 
-function decodeDatabaseTextPreview(value: string | null | undefined, maxChars: number): string | null {
-  if (value == null) return null;
-  return truncateByCodePoint(value, maxChars);
+function exceedsCodePointLimit(value: string, maxChars: number): boolean {
+  // `value.length` counts UTF-16 units and a surrogate pair counts twice, so it is an
+  // upper bound on the code-point count and never an under-count. That makes the cheap
+  // test sound in one direction only: `length <= max` proves `codePoints <= max`, while
+  // `length > max` proves nothing and has to be counted properly.
+  if (value.length <= maxChars) return false;
+  let count = 0;
+  for (const _ of value) {
+    count += 1;
+    if (count > maxChars) return true;
+  }
+  return false;
+}
+
+/**
+ * PEN-4450: the one place that turns the `issueListSelect` description probe into the
+ * two fields a list row publishes.
+ *
+ * The cap was silent: a caller holding 1200 characters could not tell a complete
+ * description from the first 8% of a 15,908-character one, and in this corpus the
+ * discarded tail is structurally where acceptance criteria live (24 of 26 sampled rows
+ * had their whole `Done when` checklist past the boundary). A marker in the text is not
+ * enough — PEN-4258 established that a marker is indistinguishable from stored text on a
+ * single read — so the signal is an out-of-band boolean.
+ *
+ * `truncated` counts CODE POINTS, not UTF-16 units. `raw.length > MAX` is wrong in the
+ * silent direction for astral characters: a row whose first `MAX` code points contain one
+ * emoji arrives with `.length === MAX + 1` and would be reported truncated when it is
+ * whole. PG `substring(text, 1, n)` counts code points, so the probe and this check agree.
+ */
+function projectIssueListDescription(value: string | null | undefined): {
+  description: string | null;
+  descriptionTruncated: boolean;
+} {
+  if (value == null) return { description: null, descriptionTruncated: false };
+  const truncated = exceedsCodePointLimit(value, ISSUE_LIST_DESCRIPTION_MAX_CHARS);
+  return {
+    description: truncateByCodePoint(value, ISSUE_LIST_DESCRIPTION_MAX_CHARS),
+    descriptionTruncated: truncated,
+  };
 }
 
 function chunkList<T>(values: T[], size: number): T[][] {
@@ -3975,7 +4018,12 @@ const issueListSelect = {
   // chunks to satisfy them. The earlier convert_to-based approach forced a
   // full detoast on every list row (eBPF profile showed pglz_decompress at
   // ~14% of pg CPU under list load with 66% of issues > 2KB description).
-  description: sql<string | null>`substring(${issues.description}, 1, ${ISSUE_LIST_DESCRIPTION_MAX_CHARS})`,
+  // PEN-4450: slice one past the cap. `projectIssueListDescription` trims the probe
+  // back to `ISSUE_LIST_DESCRIPTION_MAX_CHARS` and reports whether it was there, so the
+  // wire value is unchanged in length and the extra code point never reaches a caller.
+  // EVERY consumer of this projection must apply that mapper — selecting the probe
+  // without it emits 1201 code points.
+  description: sql<string | null>`substring(${issues.description}, 1, ${ISSUE_LIST_DESCRIPTION_PROBE_CHARS})`,
   status: issues.status,
   workMode: issues.workMode,
   harnessKind: issues.harnessKind,
@@ -5026,12 +5074,16 @@ function blockedInboxResponseDescription(entry: BlockedInboxAttentionEntry, row:
  *    the row — body redacted, presence confirming the guess. The same string is also available
  *    by simply omitting the flag. The blocked-inbox path does not have this property: its `q`
  *    filters in JS over `blockedInboxSearchText`, which reads the redacted description.
- * 2. The two paths agree on the returned description **only because `decodeDatabaseTextPreview`
- *    is provably the identity here** — PG `substring(text, 1, n)` already counts code points, so
- *    `truncateByCodePoint` is a no-op even for astral characters. `listBlockedInboxIssues`
- *    applies it before redacting and `list()` does not. The cross-endpoint equality test couples
- *    them, so if that step ever stops being an identity, `list()` becomes the wrong one and that
- *    test fails some distance from the cause — mirror the decode into this helper at that point.
+ * 2. The two paths agree on the returned description because **both now apply
+ *    `projectIssueListDescription`**. PEN-4450 is the point this stopped being free: the
+ *    projection selects one code point past the cap, so the mapper is a real trim rather
+ *    than the identity, and `list()` — which previously had no post-step at all — would
+ *    have become the wrong one. Both apply it before redaction, which operates on the
+ *    trimmed preview. `descriptionTruncated` describes the STORED column, not the redacted
+ *    value, and so survives redaction unchanged: "there is more text than you were given"
+ *    and "some of what you were given was removed" are independent claims and both are
+ *    true here. The cross-endpoint equality test couples the two paths; if a third
+ *    consumer of `issueListSelect` appears without the mapper, it fails there.
  */
 function blockedInboxAttentionResponseFields(
   entry: BlockedInboxAttentionEntry | undefined,
@@ -5836,7 +5888,7 @@ async function listBlockedInboxIssues(
     .orderBy(desc(issueCanonicalLastActivityAtExpr(companyId)), desc(issues.updatedAt), desc(issues.id)))
     .map((row: any) => ({
       ...row,
-      description: decodeDatabaseTextPreview(row.description, ISSUE_LIST_DESCRIPTION_MAX_CHARS),
+      ...projectIssueListDescription(row.description),
     }));
   const withLabels = await withIssueLabels(dbOrTx, rows);
   const withRuns = withActiveRuns(
@@ -5942,21 +5994,20 @@ async function listBlockedInboxIssues(
 async function countBlockedInboxIssues(dbOrTx: any, companyId: string, filters?: IssueFilters): Promise<number> {
   const { conditions } = await blockedInboxIssueConditions(dbOrTx, companyId, filters);
   // BLO-31839: project exactly what `listBlockedInboxIssues` projects, including its
-  // `decodeDatabaseTextPreview` post-step. This count is the oracle for that list, so it has to
+  // `projectIssueListDescription` post-step. This count is the oracle for that list, so it has to
   // see the same row shape: `blockedInboxSearchText` reads `row.description`, and selecting the
   // full column here made a `q` term past ISSUE_LIST_DESCRIPTION_MAX_CHARS countable but not
-  // enumerable — the mirror image of the external-wait divergence fixed above. The post-step is
-  // a no-op on this input today (PG `substring(text, 1, n)` already counts code points, so the
-  // truncation is the identity even for astral characters, and the column is never `undefined`),
-  // but it is mirrored rather than argued away: leaving the one unmirrored step in a projection
-  // whose whole contract is "same shape as the list" is how this divergence happens again.
+  // enumerable — the mirror image of the external-wait divergence fixed above. PEN-4450 turned
+  // that post-step from a no-op into a load-bearing trim (the projection now selects one code
+  // point past the cap), which is exactly why mirroring it rather than arguing it away was
+  // right: the argument for skipping it expired and the code did not.
   const rows = (await dbOrTx
     .select(issueListSelect)
     .from(issues)
     .where(and(...conditions)))
     .map((row: any) => ({
       ...row,
-      description: decodeDatabaseTextPreview(row.description, ISSUE_LIST_DESCRIPTION_MAX_CHARS),
+      ...projectIssueListDescription(row.description),
     })) as IssueRow[];
   if (rows.length === 0) return 0;
 
@@ -8365,7 +8416,15 @@ export function issueService(db: Db) {
       const pageQuery = offset > 0
         ? (limit === undefined ? baseQuery.offset(offset) : baseQuery.limit(limit).offset(offset))
         : (limit === undefined ? baseQuery : baseQuery.limit(limit));
-      const rows = await pageQuery;
+      // PEN-4450: this is the primary list surface and it had NO description post-step —
+      // it returned the raw `issueListSelect` slice. With the probe in that slice, omitting
+      // the mapper here would ship 1201 code points and no flag; it is also the path whose
+      // description must stay byte-identical to `listBlockedInboxIssues` (the cross-endpoint
+      // equality test couples them).
+      const rows = (await pageQuery).map((row: any) => ({
+        ...row,
+        ...projectIssueListDescription(row.description),
+      }));
       // BLO-44407: list rows carry no `executionPolicy` key at runtime (see issueListSelect).
       const withLabels = await withIssueLabels(db, rows as IssueRow[]);
       // Both derived maps are built from the already-paginated page, so this
