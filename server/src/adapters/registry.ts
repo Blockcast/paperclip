@@ -26,6 +26,7 @@ import {
   execute as claudeExecute,
   listClaudeSkills,
   syncClaudeSkills,
+  acceptsClaudeModelForConfig,
   listClaudeModels,
   listClaudeModelsForConfig,
   refreshClaudeModels,
@@ -277,6 +278,7 @@ const claudeLocalAdapter: ServerAdapterModule = {
   modelProfiles: claudeModelProfiles,
   listModels: listClaudeModels,
   listModelsForConfig: listClaudeModelsForConfig,
+  acceptsModelForConfig: acceptsClaudeModelForConfig,
   refreshModels: refreshClaudeModels,
   // PEN-4447: `models` here plus whatever /v1/models discovery adds is the
   // complete set this adapter will accept, so an unlisted id is refused at the
@@ -774,6 +776,21 @@ export async function listAdapterModelsForConfig(
     }
   }
   return listAdapterModels(type);
+}
+
+/**
+ * Ask the adapter to accept a model id that its enumerable list cannot cover
+ * (Bedrock region-prefixed inference profiles, ARNs). Consulted only after list
+ * membership has failed, so it can only widen admission, never narrow it.
+ */
+export async function adapterAcceptsModelForConfig(
+  type: string,
+  model: string,
+  adapterConfig: Record<string, unknown>,
+): Promise<boolean> {
+  const adapter = findActiveServerAdapter(type);
+  if (!adapter?.acceptsModelForConfig) return false;
+  return (await adapter.acceptsModelForConfig(model, adapterConfig)) === true;
 }
 
 /**

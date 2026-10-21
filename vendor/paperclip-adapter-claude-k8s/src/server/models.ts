@@ -31,6 +31,20 @@ const BEDROCK_MODELS: AdapterModel[] = [
   { id: "us.anthropic.claude-haiku-4-5-20251001-v1:0", label: "Bedrock Haiku 4.5" },
 ];
 
+/**
+ * Aliases the Claude CLI resolves itself (`claude --model opus`). They are
+ * deliberately absent from the lists above, which feed the model picker and
+ * should show canonical ids — but they ARE valid configuration, so admission
+ * has to include them or a working lane gets a 422 on its next write.
+ * The `[1m]` suffix is accepted on an alias the same way it is on a full id.
+ */
+const CLI_ALIASES = ["opus", "sonnet", "haiku", "opusplan"] as const;
+
+const CLI_ALIAS_MODELS: AdapterModel[] = CLI_ALIASES.flatMap((alias) => [
+  { id: alias, label: `${alias} (CLI alias)` },
+  { id: `${alias}[1m]`, label: `${alias} (CLI alias, 1M)` },
+]);
+
 function isBedrockValues(useBedrock: string | undefined, bedrockBaseUrl: string | undefined): boolean {
   return (
     useBedrock === "1" ||
@@ -94,5 +108,27 @@ export async function listK8sModels(): Promise<AdapterModel[]> {
 export async function listK8sModelsForConfig(
   adapterConfig: Record<string, unknown>,
 ): Promise<AdapterModel[]> {
-  return isBedrockAdapterConfig(adapterConfig) ? BEDROCK_MODELS : DIRECT_MODELS;
+  const base = isBedrockAdapterConfig(adapterConfig) ? BEDROCK_MODELS : DIRECT_MODELS;
+  return [...base, ...CLI_ALIAS_MODELS];
+}
+
+/**
+ * Accept an id no list can enumerate.
+ *
+ * Bedrock inference profiles are region-prefixed (`us.` / `eu.` / `apac.`) and
+ * may be a full ARN, so `BEDROCK_MODELS` is a convenience list and never the
+ * admissible set. Gated on the config actually resolving to Bedrock: a
+ * Bedrock-shaped id on a direct lane is still a real mistake.
+ */
+export function acceptsK8sModelForConfig(
+  model: string,
+  adapterConfig: Record<string, unknown>,
+): boolean {
+  if (!isBedrockAdapterConfig(adapterConfig)) return false;
+  return isBedrockModelId(model.trim());
+}
+
+/** Region-qualified inference profile, bare Bedrock id, or an inference-profile ARN. */
+export function isBedrockModelId(model: string): boolean {
+  return /^(\w+\.)?anthropic\./.test(model) || model.startsWith("arn:aws:bedrock:");
 }

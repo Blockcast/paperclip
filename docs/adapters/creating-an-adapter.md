@@ -247,8 +247,9 @@ If capability flags are not set, the server falls back to legacy hardcoded lists
 
 | Field | Type | Default | What it controls |
 |------|------|---------|------------------|
-| `modelRegistryIsClosed` | `boolean` | `false` | Whether the resolved registry is the COMPLETE admissible set, so an unlisted id is refused at the write |
-| `listModelsForConfig` | `(adapterConfig) => Promise<AdapterModel[]>` | — | Resolve the admissible set for ONE agent, when it depends on that agent's own configuration |
+| `modelRegistryIsClosed` | `boolean` | `false` | Whether admission is the COMPLETE set the runtime accepts, so an unlisted id is refused at the write |
+| `listModelsForConfig` | `(adapterConfig) => Promise<AdapterModel[]>` | — | The admissible set for ONE agent — picker list plus aliases, resolved against that agent's own configuration |
+| `acceptsModelForConfig` | `(model, adapterConfig) => boolean` | — | Accept an id no list can enumerate (a Bedrock region prefix, an ARN). Consulted only after list membership fails, so it can only widen |
 
 ### Why this is opt-in
 
@@ -261,9 +262,21 @@ near-miss: `claude-haiku-4-5` is registered by `claude_local` and is absent from
 cheap floor is `claude-haiku-4-6`. An id chosen *because* it looked like the safest possible write
 was the one that would have bricked a `claude_k8s` lane.
 
-Declaring `modelRegistryIsClosed: true` is what lets the server refuse that write. Do **not** declare
-it if your adapter discovers models from a live provider API or a CLI and falls back to a static list
-when that lookup fails — there, "absent from the registry" means "discovery is down" at least as
+Declaring `modelRegistryIsClosed: true` is what lets the server refuse that write.
+
+**Before you declare it, check that admission covers every id your runtime accepts — not every id
+your picker shows.** Two classes get missed, and both of them boot fine today:
+
+- **Aliases.** `claude --model opus` is valid and is in no registry. Put aliases in
+  `listModelsForConfig` (never in `models` — that feeds the picker, which should show canonical ids).
+- **Shapes.** A Bedrock inference profile carries a region prefix (`us.` / `eu.` / `apac.`) or is a
+  full `arn:aws:bedrock:` ARN, so no list can cover it. That is what `acceptsModelForConfig` is for.
+
+A registry that merely covers what operators *usually* pick is not closed; the gap surfaces as a 422
+on a working configuration.
+
+Do **not** declare it at all if your adapter discovers models from a live provider API or a CLI and
+falls back to a static list when that lookup fails — there, "absent from the registry" means "discovery is down" at least as
 often as it means "invalid", and refusing the write would trade a late failure for an immediate
 wrong one. `claude_local` does discover, but only ever *adds* to its shipped list, so a discovery
 outage cannot narrow what it accepts; that is the property that makes it safe to declare.
@@ -292,6 +305,14 @@ GET /api/companies/:companyId/adapters/:type/models
 
 That endpoint resolves through the same precedence the validator uses, so it is the authoritative
 answer to "what may I set on this lane", and it does not require reading an adapter's source.
+
+### Only what the write introduces
+
+The server applies this to a model id a write **introduces**, never to one the agent already stores.
+An agent whose model has since left its adapter's registry can still take unrelated `adapterConfig`
+repairs instead of 422-ing on every one of them. Re-pointing an agent at a different adapter *is* an
+introduction — the (adapter, model) pair changed even though the string did not, and that is the
+sideways route to the same dead lane. A create introduces everything it sets.
 
 ### Escape hatches
 

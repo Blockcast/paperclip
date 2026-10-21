@@ -1,5 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { isBedrockAdapterConfig, listK8sModels, listK8sModelsForConfig } from "./models.js";
+import {
+  acceptsK8sModelForConfig,
+  isBedrockAdapterConfig,
+  isBedrockModelId,
+  listK8sModels,
+  listK8sModelsForConfig,
+} from "./models.js";
 
 describe("listK8sModels", () => {
   const savedEnv: Record<string, string | undefined> = {};
@@ -93,10 +99,25 @@ describe("listK8sModelsForConfig", () => {
     expect(ids).toContain("claude-haiku-4-6");
   });
 
-  it("matches listK8sModels when the agent declares no env", async () => {
+  it("is the picker list plus the ids the CLI accepts but the picker should not show", async () => {
     const forConfig = (await listK8sModelsForConfig({})).map((m) => m.id);
     const listed = (await listK8sModels()).map((m) => m.id);
-    expect(forConfig).toEqual(listed);
+    expect(forConfig.slice(0, listed.length)).toEqual(listed);
+    // `claude --model opus` is valid configuration and is in no registry.
+    // Admission has to carry it or a working lane 422s on its next write.
+    for (const alias of ["opus", "sonnet", "haiku", "opusplan"]) {
+      expect(forConfig).toContain(alias);
+      expect(forConfig).toContain(`${alias}[1m]`);
+      expect(listed).not.toContain(alias);
+    }
+  });
+
+  it("carries the aliases on the Bedrock branch too", async () => {
+    const ids = (
+      await listK8sModelsForConfig({ env: { CLAUDE_CODE_USE_BEDROCK: "1" } })
+    ).map((m) => m.id);
+    expect(ids).toContain("opus");
+    expect(ids).toContain("us.anthropic.claude-opus-5");
   });
 
   it("resolves the Bedrock branch from the agent env, not the server env", async () => {
@@ -126,8 +147,39 @@ describe("listK8sModelsForConfig", () => {
   });
 
   it("treats a non-object env as absent", async () => {
-    await expect(listK8sModelsForConfig({ env: "nope" })).resolves.toHaveLength(
-      (await listK8sModels()).length,
-    );
+    const ids = (await listK8sModelsForConfig({ env: "nope" })).map((m) => m.id);
+    expect(ids).toEqual((await listK8sModelsForConfig({})).map((m) => m.id));
+    expect(ids).toContain("claude-opus-5");
+    expect(ids).not.toContain("us.anthropic.claude-opus-5");
+  });
+});
+
+// Bedrock inference profiles are region-prefixed and may be ARNs, so no list
+// can enumerate them — `BEDROCK_MODELS` is a convenience list, not the
+// admissible set.
+describe("acceptsK8sModelForConfig", () => {
+  const bedrock = { env: { CLAUDE_CODE_USE_BEDROCK: "1" } };
+
+  it("accepts any region prefix, a bare id, and an ARN, on a Bedrock lane", () => {
+    for (const model of [
+      "us.anthropic.claude-opus-5",
+      "eu.anthropic.claude-opus-5",
+      "apac.anthropic.claude-sonnet-5",
+      "anthropic.claude-opus-5",
+      "arn:aws:bedrock:us-east-1:123456789012:inference-profile/custom",
+    ]) {
+      expect(isBedrockModelId(model), model).toBe(true);
+      expect(acceptsK8sModelForConfig(model, bedrock), model).toBe(true);
+    }
+  });
+
+  it("refuses a Bedrock-shaped id on a direct lane", () => {
+    // Widening admission must not dissolve the Direct/Bedrock distinction.
+    expect(acceptsK8sModelForConfig("eu.anthropic.claude-opus-5", {})).toBe(false);
+  });
+
+  it("refuses an id that is neither listed nor Bedrock-shaped", () => {
+    expect(acceptsK8sModelForConfig("claude-haiku-4-5", bedrock)).toBe(false);
+    expect(isBedrockModelId("claude-haiku-4-5")).toBe(false);
   });
 });
