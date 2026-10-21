@@ -255,6 +255,7 @@ import type {
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { parseObject, asBoolean, asNumber, asString, appendWithByteCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
 import { costService } from "./costs.js";
+import { consumptionCentsSum } from "./consumption-metric.js";
 import { incrementDepBlockedMetric } from "./dep-blocked-metrics.js";
 import { incrementBlockerResolvedWakeMetric } from "./blocker-resolved-wake-metrics.js";
 import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
@@ -6808,8 +6809,7 @@ function resolveLedgerBiller(result: AdapterExecutionResult): string {
  */
 function normalizeBilledCostCents(costUsd: number | null | undefined, billingType: BillingType): number {
   if (billingType === "subscription_included") return 0;
-  if (typeof costUsd !== "number" || !Number.isFinite(costUsd)) return 0;
-  return Math.max(0, Math.round(costUsd * 100));
+  return normalizeConsumptionCostCents(costUsd);
 }
 
 /**
@@ -6817,6 +6817,9 @@ function normalizeBilledCostCents(costUsd: number | null | undefined, billingTyp
  * quantity the budget gates enforce on, and it must survive a correct classification of
  * subscription lanes. `result.costUsd` is never mutated between here and the ledger insert,
  * so this reads list price by construction. (PEN-4466.)
+ *
+ * `normalizeBilledCostCents` delegates to this after its one subscription branch, so the
+ * two columns share a single rounding rule and cannot drift if that rule ever changes.
  */
 function normalizeConsumptionCostCents(costUsd: number | null | undefined): number {
   if (typeof costUsd !== "number" || !Number.isFinite(costUsd)) return 0;
@@ -23914,11 +23917,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     if (checkCostCap && policy.maxDailyCostCents !== null) {
       const [row] = await client
-        // PEN-4466: consumption, not the zeroable cash column -- see the ORDERING
-        // CONSTRAINT block above `computeObservedAmount` in services/budgets.ts.
-        .select({
-          total: sql<number>`coalesce(sum(coalesce(${costEvents.consumptionCents}, ${costEvents.costCents}))::bigint, 0)`,
-        })
+        // PEN-4466: consumption, not the zeroable cash column. See
+        // `services/consumption-metric.ts` for the ordering constraint and reader inventory.
+        .select({ total: consumptionCentsSum })
         .from(costEvents)
         .where(
           and(

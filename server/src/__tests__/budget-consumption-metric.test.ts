@@ -10,7 +10,10 @@ import {
   costEvents,
   createDb,
 } from "@paperclipai/db";
+import { agentService } from "../services/agents.ts";
 import { budgetService } from "../services/budgets.ts";
+import { companyService } from "../services/companies.ts";
+import { costService } from "../services/costs.ts";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -242,5 +245,57 @@ describeEmbeddedPostgres("budget control reads consumption, not the zeroable cas
 
     const incidents = await db.select().from(budgetIncidents);
     expect(incidents.some((incident) => incident.thresholdType === "hard")).toBe(true);
+  });
+
+  /**
+   * The SERVED monthly burn, which is a different number from the stored one.
+   * `hydrateAgentSpend` / `hydrateCompanySpend` overwrite `spent_monthly_cents` with a live
+   * re-sum on every read, so repointing `getMonthlySpendTotal` alone fixes what is WRITTEN
+   * and not what is SERVED. Without these two assertions the hydration paths could be
+   * reverted to `cost_cents` with the rest of this suite still green — which is exactly how
+   * they were missed on the first pass.
+   */
+  it("serves agent and company monthly spend from consumption, not the zeroed cash column", async () => {
+    const { companyId, agentId } = await createFixture();
+    await insertLedgerRow({
+      companyId,
+      agentId,
+      billingType: "subscription_included",
+      costCents: 0,
+      consumptionCents: 3_100,
+    });
+
+    const servedAgent = await agentService(db).getById(agentId);
+    expect(servedAgent?.spentMonthlyCents).toBe(3_100);
+
+    const servedCompany = await companyService(db).getById(companyId);
+    expect(servedCompany?.spentMonthlyCents).toBe(3_100);
+  });
+
+  /**
+   * `getMonthlySpendTotal` writes the STORED column on every cost event. Asserted through
+   * `costService.createEvent`, which is the only writer.
+   */
+  it("stores agent and company monthly spend from consumption on a subscription cost event", async () => {
+    const { companyId, agentId } = await createFixture();
+
+    await costService(db, {}).createEvent(companyId, {
+      agentId,
+      provider: "anthropic",
+      biller: "anthropic",
+      billingType: "subscription_included",
+      model: "claude-opus-5",
+      inputTokens: 1_000,
+      outputTokens: 200,
+      costCents: 0,
+      consumptionCents: 2_200,
+      occurredAt: new Date(),
+    });
+
+    const [storedAgent] = await db.select().from(agents).where(eq(agents.id, agentId));
+    expect(storedAgent?.spentMonthlyCents).toBe(2_200);
+
+    const [storedCompany] = await db.select().from(companies).where(eq(companies.id, companyId));
+    expect(storedCompany?.spentMonthlyCents).toBe(2_200);
   });
 });

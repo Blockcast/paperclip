@@ -1150,6 +1150,62 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     });
   });
 
+  /**
+   * PEN-4466: the same cap, reached entirely by a subscription lane. `cost_cents` is 0
+   * because `normalizeBilledCostCents` zeroes it for `subscription_included`, so a gate
+   * that summed that column would read 0 and wake the agent forever. The cap must bind on
+   * `consumption_cents` instead. Reverting the sum in `getHeartbeatDailyCapBlock` to
+   * `cost_cents` fails this test and not the one above it.
+   */
+  it("skips wakes when the daily cost cap is reached by subscription consumption alone", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({
+      heartbeatConfig: {
+        maxDailyCostCents: 75,
+      },
+    });
+    await db.insert(costEvents).values({
+      companyId,
+      agentId,
+      provider: "test",
+      biller: "test",
+      billingType: "subscription_included",
+      model: "test-model",
+      inputTokens: 100,
+      outputTokens: 50,
+      costCents: 0,
+      consumptionCents: 75,
+      occurredAt: new Date(),
+    });
+
+    const run = await heartbeat.wakeup(agentId, {
+      source: "on_demand",
+      triggerDetail: "manual",
+    });
+
+    expect(run).toBeNull();
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+
+    const [wakeup] = await db
+      .select({
+        status: agentWakeupRequests.status,
+        reason: agentWakeupRequests.reason,
+        payload: agentWakeupRequests.payload,
+      })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+
+    expect(wakeup).toMatchObject({
+      status: "skipped",
+      reason: "heartbeat.daily_cost_limit",
+    });
+    expect(wakeup?.payload).toMatchObject({
+      heartbeatSkip: {
+        observed: 75,
+        limit: 75,
+      },
+    });
+  });
+
   it("treats zero daily cost cap as a hard stop", async () => {
     const { agentId } = await seedCompanyAndAgent({
       heartbeatConfig: {
