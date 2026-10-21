@@ -434,7 +434,7 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' && vars.PAPERCLIP_CI_DEPLOY == 'true' && github.ref == 'refs/heads/master' && needs.build-and-push.result == 'success' && needs.guard-pending-deploy.result == 'success' && needs.guard-pending-deploy.outputs.blocked != 'true' && needs.guard-pending-deploy-final.result == 'success' && needs.guard-pending-deploy-final.outputs.blocked != 'true' }}
     environment:
       name: paperclip-production
-    # Covers the sequential 30m Helm wait, 30m api rollout wait and 15m worker
+    # Covers the sequential 45m Helm wait, 30m api rollout wait and 15m worker
     # rollout wait (BLO-29008), plus the pending-migration pre-flight's 600s
     # startup + 180s run budgets (BLO-31254), plus the online-index
     # precreation's 600s startup + 600s run budgets (PEN-4179), plus checkout,
@@ -454,7 +454,7 @@ jobs:
     # PAPERCLIP_STRANDED_LOCK_GRACE_MINUTES as stranded, on the premise that
     # such a lock is only ever held by a running deploy job. That window must
     # stay above this timeout PLUS the runner-queueing margin it was given
-    # (today 140m = this job's 118m + 22m), or a lock held by a live deploy --
+    # (today 155m = this job's 133m + 22m), or a lock held by a live deploy --
     # including one inside a `helm upgrade --atomic` rollback -- reads as
     # abandoned. scripts/check-stranded-approval-lock.test.js pins BOTH halves:
     # that the grace window covers this timeout, and that it clears it by at
@@ -469,7 +469,7 @@ jobs:
     # over an invalid index -- so a slow build costs this deploy and not the
     # index. The common case prints "No pending migration requires online index
     # precreation" and exits in seconds.
-    timeout-minutes: 118
+    timeout-minutes: 133
     concurrency:
       # Serialize deploys to the same target so a fast-followup push doesn't
       # race with an in-flight upgrade.
@@ -1111,6 +1111,14 @@ jobs:
           # a script bug. --atomic placed ahead of --wait --timeout (rather
           # than between them) so scripts/check-docker-deploy-timeout.test.js's
           # `--wait --timeout` match still finds it.
+          #
+          # 45m (was 30m), BLO-45764: --wait covers statefulset/paperclip too,
+          # and with worker.replicas: 2 the OrderedReady RollingUpdate replaces
+          # the pods one at a time, each waiting for Ready. Per-pod worst case is
+          # ~20m (image pull, measured ~5m on a cold node, + seed init ~9m45s +
+          # startup probe 5m), so two pods can need ~40m -- past 30m, where
+          # --atomic would ROLL BACK a release that was converging. Typical is
+          # ~6m per pod. Scale this with worker.replicas.
           helm_pid=""
           stop_background_helm() {
             if [ -n "${helm_pid}" ] && kill -0 "${helm_pid}" 2>/dev/null; then
@@ -1129,7 +1137,7 @@ jobs:
             --set-string api.deployedCommit="${COMMIT}" \
             --set-string worker.deployedCommit="${COMMIT}" \
             --post-renderer "${STAMP_SCRIPT}" \
-            --atomic --wait --timeout 30m &
+            --atomic --wait --timeout 45m &
           helm_pid=$!
 
           # Helm applies release resources before entering its wait loop. As
@@ -1184,6 +1192,10 @@ jobs:
           # behind has shipped nothing for every heartbeat-path fix. Waiting on
           # it here is what makes the job's `success` mean "both tiers are on
           # this build" instead of "the HTTP tier is".
+          #
+          # This runs after Helm's --wait (above), which already waited for every
+          # worker pod, so it is normally instant; the per-replica arithmetic
+          # lives on the Helm --timeout, not here.
           #
           # 15m, not the api's 30m, and the tighter bound is deliberate: this
           # wait is serial with the two above it, and

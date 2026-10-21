@@ -139,7 +139,11 @@ worker:
   # volumeClaimTemplates each pod would get its own empty data directory.
   # Plugin routes are forwarded to the lease holder and a new holder resyncs
   # its plugin set on takeover (BLO-47803), so plugin lifecycle changes no
-  # longer split across pods.
+  # longer split across pods. Remaining caveat (#2853): warm-standby plugin
+  # workers on a follower still run their own in-process timers.
+  # Each extra replica adds a full pod cold start to the serial rollout; the
+  # deploy's `helm upgrade --wait --timeout` (.github/workflows/docker.yml) is
+  # sized for 2.
   replicas: 1
 
 # -- Kubernetes Service exposing the HTTP UI/API.
