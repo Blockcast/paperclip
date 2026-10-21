@@ -140,11 +140,26 @@ export type GateProbeKind =
  *   story. The ask was answered "no"; nothing further is owed by the gate and
  *   the row needs closing, not escalating. A refusal alongside a withdrawn card
  *   is `approval-abandoned` instead: answering ask A does not answer ask B.
- * - `interaction-answered` is a row where at least one question card got a real
- *   human decision (accepted / rejected / answered) and which is still open
- *   anyway. Deliberately *not* "every card": a row whose remaining cards were
- *   cancelled or expired still lands here, because a human did engage. The
- *   evidence line names how many were decided and what became of the rest.
+ * - `interaction-authorised` is a row where a human *accepted* a confirmation
+ *   card: the question path's `approval-granted`, and it carries that kind's
+ *   obligation unchanged. Accepting authorises something; it does not perform
+ *   it. See {@link ACTION_OWED_RESOLUTION_KINDS}.
+ * - `interaction-answered` is a row where a human supplied the content an
+ *   `ask_user_questions` card asked for, and no card on the row was accepted.
+ *   An answer is an input to the work rather than the work, so this kind too
+ *   leaves the row informed and unperformed. Deliberately *not* "every card":
+ *   a row whose remaining cards expired still lands here, because a human did
+ *   answer — the evidence line names what became of the rest.
+ * - `interaction-refused` is a row whose every card was `rejected` — no
+ *   acceptance, no answer, and no abandoned sibling. The human said no, so the
+ *   row needs closing rather than re-asking, exactly as `approval-refused`
+ *   does. A refusal alongside an expired card is `interaction-abandoned`
+ *   instead: answering ask A does not answer ask B.
+ *
+ * Before PEN-4487 the last three were one kind, `interaction-answered`, whose
+ * heading asserted an answer over cards that had in fact been refused — the
+ * two-way split this module drew on the interaction path while drawing a
+ * four-way one, for the same underlying event, on the approval path.
  */
 export type GateResolutionKind =
   | "blocker-cancelled-edge-stuck"
@@ -153,7 +168,9 @@ export type GateResolutionKind =
   | "blocker-done-row-not-moved"
   | "approval-granted"
   | "approval-refused"
-  | "interaction-answered";
+  | "interaction-authorised"
+  | "interaction-answered"
+  | "interaction-refused";
 
 /**
  * Why a row was `unverifiable` — the named residual BLO-30627 asked for.
@@ -229,11 +246,40 @@ const APPROVAL_ABANDONED: ReadonlySet<string> = new Set(["withdrawn", "cancelled
  */
 const INTERACTION_PENDING: ReadonlySet<string> = new Set(["pending"]);
 
-/** Interaction statuses where a human actually decided something. */
+/**
+ * Interaction statuses where a human decided something, split by *what* they
+ * decided (PEN-4487).
+ *
+ * These three used to be one set, and collapsing them is what let a `rejected`
+ * card render under a heading asserting it was answered. The approval path has
+ * drawn the same distinction since PEN-3089 for the same reason: a gate does
+ * not merely "resolve", it resolves *into* an obligation, and the three
+ * obligations here are not interchangeable.
+ *
+ * - `accepted` — a `request_confirmation` / `request_checkbox_confirmation`
+ *   card the human said yes to. This is an authorisation, the exact analogue of
+ *   an `approved` board card.
+ * - `rejected` — the same card said no to. The ask is over.
+ * - `answered` — an `ask_user_questions` card the human supplied content for.
+ *   An input to the work, not the work.
+ */
+const INTERACTION_AUTHORISED: ReadonlySet<string> = new Set(["accepted"]);
+const INTERACTION_REFUSED: ReadonlySet<string> = new Set(["rejected"]);
+const INTERACTION_ANSWERED: ReadonlySet<string> = new Set(["answered"]);
+
+/**
+ * Every status above, as one set.
+ *
+ * Derived rather than re-listed so the live/drift check in
+ * {@link probePendingInteraction} cannot fall out of step with the three sets
+ * it is the union of. That check is property 2 — an unrecognised status must
+ * read as still-gated — and it stays byte-identical in behaviour to the single
+ * set this replaced.
+ */
 const INTERACTION_HUMAN_DECIDED: ReadonlySet<string> = new Set([
-  "accepted",
-  "rejected",
-  "answered",
+  ...INTERACTION_AUTHORISED,
+  ...INTERACTION_REFUSED,
+  ...INTERACTION_ANSWERED,
 ]);
 
 /**
@@ -630,13 +676,22 @@ export function probeApprovalGate(input: GateEvidenceInput): ProbeResult | null 
  * unprobed category: "waiting on a person to answer" *is* expressed in a table,
  * it was just never read.
  *
- * Three outcomes, and the split between the last two is the point:
+ * Five outcomes, in this order (PEN-4487 split the middle three out of one):
  *
  * - any card still pending (or carrying a status this module does not
  *   recognise) → `still-gated`;
- * - otherwise, any card a human actually decided → `interaction-answered`;
- * - otherwise every card was withdrawn, expired, or failed → the human was
- *   asked and never replied, and no reply is coming (`interaction-abandoned`).
+ * - otherwise, any card the human *accepted* → `interaction-authorised`;
+ * - otherwise, any card the human *answered* → `interaction-answered`;
+ * - otherwise, any card withdrawn / expired / failed → `interaction-abandoned`;
+ * - otherwise every card was `rejected` → `interaction-refused`.
+ *
+ * The ordering is the approval path's, for the approval path's reasons. The
+ * two action-owed decisions lead, so a row that was authorised or answered is
+ * filed as such even when a sibling card died — both escalate either way, and
+ * the evidence names the dead siblings rather than losing them. The abandoned
+ * branch then sits *ahead* of the refusal branch so a sibling `rejected` card
+ * cannot mask an ask that died unanswered: refusal is the one interaction
+ * outcome that withholds the row, so it is the one a dead sibling must veto.
  */
 export function probePendingInteraction(input: GateEvidenceInput): ProbeResult | null {
   if (input.interactions.length === 0) return null;
@@ -660,33 +715,87 @@ export function probePendingInteraction(input: GateEvidenceInput): ProbeResult |
     };
   }
 
-  const decided = input.interactions.filter((interaction) =>
-    INTERACTION_HUMAN_DECIDED.has(interaction.interactionStatus),
+  const total = input.interactions.length;
+  const cards = total === 1 ? "" : "s";
+  const abandoned = input.interactions.filter((interaction) =>
+    INTERACTION_ABANDONED.has(interaction.interactionStatus),
   );
 
-  if (decided.length > 0) {
-    // Phrased as "closed, N by a human decision" rather than "all answered":
-    // this branch is reached when *at least one* card got a real decision, so
-    // the rest may have expired or been withdrawn. Saying they were all
-    // answered would be false on exactly the mixed rows this branch exists to
-    // separate from `interaction-abandoned`, and the evidence line is the part
-    // a reader audits.
+  // Named on the two action-owed branches below rather than allowed to re-file
+  // the row: a card that died unanswered is a real residual ask, but it does
+  // not undo an acceptance or an answer, and both of those kinds escalate
+  // anyway. Counted, not ordered — this probe reads no timestamp, so it cannot
+  // say whether the dead card was filed before or after the decision.
+  const abandonedContext =
+    abandoned.length > 0
+      ? ` — ${abandoned.length === 1 ? "a further card" : `${abandoned.length} further cards`} died unanswered (${abandoned.map(describeInteraction).join(", ")}), ${abandoned.length === 1 ? "a separate ask that was" : "separate asks that were"} never discharged`
+      : "";
+
+  const authorised = input.interactions.filter((interaction) =>
+    INTERACTION_AUTHORISED.has(interaction.interactionStatus),
+  );
+
+  if (authorised.length > 0) {
+    return {
+      probe: "pending-interaction",
+      verdict: "resolved-but-open",
+      resolutionKind: "interaction-authorised",
+      evidence: `${authorised.map(describeInteraction).join(", ")} — ${authorised.length} of ${total} thread interaction${cards} ${authorised.length === 1 ? "was" : "were"} accepted and the row has not moved since, so it is authorised and unperformed: the human said yes and whoever the row is assigned to still owes the work${abandonedContext}`,
+    };
+  }
+
+  const answered = input.interactions.filter((interaction) =>
+    INTERACTION_ANSWERED.has(interaction.interactionStatus),
+  );
+
+  if (answered.length > 0) {
+    // "Answered, N of M" rather than "all answered": this branch is reached
+    // whenever *at least one* card was answered, so the rest may have expired
+    // or been refused. Claiming they were all answered would be false on
+    // exactly the mixed rows, and the evidence line is the part a reader
+    // audits.
     return {
       probe: "pending-interaction",
       verdict: "resolved-but-open",
       resolutionKind: "interaction-answered",
-      evidence: `all ${input.interactions.length} thread interaction${input.interactions.length === 1 ? " is" : "s are"} closed, ${decided.length} by a human decision: ${input.interactions.map(describeInteraction).join(", ")}`,
+      evidence: `${answered.map(describeInteraction).join(", ")} — ${answered.length} of ${total} thread interaction${cards} ${answered.length === 1 ? "was" : "were"} answered and the row has not moved since: the input the row asked for is on the row and the work it was an input to is still outstanding${abandonedContext}`,
     };
   }
 
-  // The card refs lead, for the same reason they do in the cancelled-blocker
+  // Ahead of the refusal branch, so a sibling `rejected` card cannot mask an
+  // ask that died unanswered — see the ordering argument in the docblock. The
+  // card refs lead, for the same reason they do in the cancelled-blocker
   // branch: the rendered evidence is length-bounded, and *which* ask was
-  // dropped is the only part a reader can act on.
+  // dropped is the only part a reader can act on. Every card still in play
+  // here is abandoned or refused, so the non-abandoned remainder on a mixed
+  // row is exactly the refused set and can be named as such.
+  if (abandoned.length > 0) {
+    const scope =
+      abandoned.length === total
+        ? `all ${total} thread interaction${cards} ${total === 1 ? "was" : "were"} withdrawn, expired, or failed`
+        : `${abandoned.length} of ${total} thread interactions ${abandoned.length === 1 ? "was" : "were"} withdrawn, expired, or failed and the remaining ${total - abandoned.length} refused`;
+    return {
+      probe: "pending-interaction",
+      verdict: "resolved-but-open",
+      resolutionKind: "interaction-abandoned",
+      evidence: `${abandoned.map(describeInteraction).join(", ")} — ${scope}, so the human was asked and never answered and no answer is coming; someone must re-ask or drop the row`,
+    };
+  }
+
+  // Terminal: the live guard, the authorised branch, the answered branch and
+  // the abandoned branch have each returned, so every card is `rejected` —
+  // which is what lets this evidence say "all were refused" without
+  // qualification.
+  //
+  // Phrased as "refused", never "answered": on this path `answered` is a
+  // status value in its own right, so describing a rejection as answered is
+  // the exact conflation PEN-4487 removed from the heading and must not be
+  // reintroduced one line below it.
   return {
     probe: "pending-interaction",
     verdict: "resolved-but-open",
-    resolutionKind: "interaction-abandoned",
-    evidence: `${input.interactions.map(describeInteraction).join(", ")} — all ${input.interactions.length} thread interaction${input.interactions.length === 1 ? " was" : "s were"} withdrawn, expired, or failed, so the human was asked and never answered and no answer is coming; someone must re-ask or drop the row`,
+    resolutionKind: "interaction-refused",
+    evidence: `all ${total} thread interaction${cards} ${total === 1 ? "was" : "were"} refused and none authorised anything: ${input.interactions.map(describeInteraction).join(", ")} — the human said no, so this row needs closing rather than re-asking`,
   };
 }
 
@@ -744,17 +853,46 @@ const NON_SELF_CLEARING_RESOLUTION_KINDS: readonly GateResolutionKind[] = Object
  *   but a single wake at decision time is not a standing watch, and it reaches
  *   the asker rather than whoever the row is assigned to.
  *
+ * - `interaction-authorised` and `interaction-answered` — the same argument,
+ *   carried onto the question path by PEN-4487. Accepting a confirmation
+ *   authorises work; answering a question supplies an input to work. Neither
+ *   is the work. The exclusion these two replace read "a human engaged and the
+ *   answer is on the row", which is true and does not follow: engagement is
+ *   not performance, and the sentence quietly assumed some other surface was
+ *   left watching.
+ *
+ *   It is not. Resolving an interaction fires one continuation wake
+ *   (`queueResolvedInteractionContinuationWakeup`, `routes/issues.ts`), and
+ *   that wake returns early unless the row has an `assigneeAgentId`. Measured
+ *   2026-10-21 against the live bucket on PEN-4487: all 10 rows whose gate had
+ *   resolved this way were assigned to a *human*, so `assigneeAgentId` was
+ *   null on every one and the wake fired for none of them. The approval path
+ *   at least has a one-shot wake at the requester to discount; here there was
+ *   no other watcher to discount at all, so withholding the row left the
+ *   answer observed by nobody.
+ *
  * Deliberately excluded, so this stays a narrowing and not an "escalate
- * everything": `approval-refused` (the ask was answered "no" — nothing further
- * is owed by the gate), `interaction-answered` (a human engaged and the answer
- * is on the row), and `blocker-done-row-not-moved` (the platform already treats
+ * everything": `approval-refused` and `interaction-refused` (the ask was
+ * answered "no" — nothing further is owed by the gate, and what the row needs
+ * is closing), and `blocker-done-row-not-moved` (the platform already treats
  * the row as dependency-ready, so it is ordinary un-started work that every
  * agent-side sweep can already see). All three keep rendering in the
  * resolved-but-open section with their age; they are simply not escalated.
+ *
+ * Known cost of including `interaction-answered`, measured on the same bucket
+ * rather than estimated: of the 9 past-threshold rows, 8 owe an action and 1
+ * (PEN-2031, `low`, "not blocking anything") does not. That row now escalates
+ * and should not. One false positive against seven recovered rows — five of
+ * them `critical` and five load-bearing blockers on other rows — is the trade
+ * this set is making, and it is the direction this module errs in everywhere
+ * else: a row wrongly escalated costs a reader one glance, a row wrongly
+ * withheld costs whatever it was blocking.
  */
 const ACTION_OWED_RESOLUTION_KINDS: ReadonlySet<GateResolutionKind> = new Set<GateResolutionKind>([
   ...NON_SELF_CLEARING_RESOLUTION_KINDS,
   "approval-granted",
+  "interaction-authorised",
+  "interaction-answered",
 ]);
 
 /** Statuses whose `unverifiable` residual is a contradiction, not an absence. */
@@ -941,7 +1079,9 @@ export function revalidateGates(
     "blocker-done-row-not-moved": 0,
     "approval-granted": 0,
     "approval-refused": 0,
+    "interaction-authorised": 0,
     "interaction-answered": 0,
+    "interaction-refused": 0,
   };
   const countsByUnverifiableReason: Record<UnverifiableReason, number> = {
     "blocked-status-without-blocker-edge": 0,
@@ -1037,14 +1177,18 @@ const RESOLUTION_KIND_HEADINGS: Record<GateResolutionKind, string> = {
   "approval-granted":
     "The board granted the ask and the row has not moved since — authorised, unperformed",
   "approval-refused": "The board refused the ask — this row needs closing, not re-asking",
+  "interaction-authorised":
+    "A question card was accepted and the row has not moved since — authorised, unperformed",
   // Not "every card was answered": the branch that assigns this kind fires
-  // whenever *at least one* card got a real decision, so the rest may have been
-  // cancelled, expired, or failed. The evidence line already says "closed, N by
-  // a human decision"; a heading claiming otherwise would contradict the line
-  // directly beneath it and hide an abandoned ask on exactly the mixed rows
-  // this kind exists to separate from `interaction-abandoned`.
+  // whenever *at least one* card was answered, so the rest may have been
+  // cancelled, expired, or failed. The evidence line already names them; a
+  // heading claiming otherwise would contradict the line directly beneath it
+  // and hide an abandoned ask on exactly the mixed rows this kind exists to
+  // separate from `interaction-abandoned`. Since PEN-4487 it can no longer be
+  // reached by a card that was *refused* — that is `interaction-refused`.
   "interaction-answered":
-    "At least one question card was answered — any remaining cards closed without an answer",
+    "A question card was answered and the row has not moved since — the input arrived, the work did not",
+  "interaction-refused": "The human refused the ask — this row needs closing, not re-asking",
 };
 
 /**
@@ -1066,9 +1210,11 @@ const RESOLUTION_KIND_RENDER_RANK: Record<GateResolutionKind, number> = {
   "interaction-abandoned": 1,
   "approval-abandoned": 2,
   "approval-granted": 3,
-  "blocker-done-row-not-moved": 4,
-  "approval-refused": 5,
-  "interaction-answered": 6,
+  "interaction-authorised": 4,
+  "interaction-answered": 5,
+  "blocker-done-row-not-moved": 6,
+  "approval-refused": 7,
+  "interaction-refused": 8,
 };
 
 /** Every resolution kind, in render order. Total by construction. */

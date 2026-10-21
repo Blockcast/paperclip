@@ -370,9 +370,17 @@ describe("probePendingInteraction (BLO-30627)", () => {
     expect(result?.evidence).toContain("1 of 2");
   });
 
-  it.each(["accepted", "rejected", "answered"])(
-    "treats %s as a real human decision, so the gate resolved",
-    (status) => {
+  it.each([
+    ["accepted", "interaction-authorised"],
+    ["rejected", "interaction-refused"],
+    ["answered", "interaction-answered"],
+  ])(
+    "treats %s as a real human decision and files it as %s",
+    (status, kind) => {
+      // PEN-4487: these three used to collapse into `interaction-answered`, so
+      // a card the human *refused* was reported under a heading asserting it
+      // was answered. They resolve the gate into three different obligations
+      // and the approval path has distinguished its equivalents since PEN-3089.
       const result = probePendingInteraction(
         evidence({
           interactions: [
@@ -381,9 +389,67 @@ describe("probePendingInteraction (BLO-30627)", () => {
         }),
       );
       expect(result?.verdict).toBe("resolved-but-open");
-      expect(result?.resolutionKind).toBe("interaction-answered");
+      expect(result?.resolutionKind).toBe(kind);
     },
   );
+
+  it("files an accepted card as authorised-and-unperformed, not as answered", () => {
+    // The `approval-granted` argument, carried onto the question path: an
+    // acceptance authorises work and does not perform it.
+    const result = probePendingInteraction(
+      evidence({
+        interactions: [
+          { interactionId: "i1", interactionKind: "request_confirmation", interactionStatus: "accepted" },
+        ],
+      }),
+    );
+    expect(result?.resolutionKind).toBe("interaction-authorised");
+    expect(result?.evidence).toContain("authorised and unperformed");
+  });
+
+  it("prefers an acceptance over an answer when the row carries both", () => {
+    // Mirrors the approval probe checking `granted` before anything else: the
+    // acceptance is the load-bearing decision, so it names the kind.
+    const result = probePendingInteraction(
+      evidence({
+        interactions: [
+          { interactionId: "i1", interactionKind: "ask_user_questions", interactionStatus: "answered" },
+          { interactionId: "i2", interactionKind: "request_confirmation", interactionStatus: "accepted" },
+        ],
+      }),
+    );
+    expect(result?.resolutionKind).toBe("interaction-authorised");
+  });
+
+  it("lets an expired sibling veto a refusal, but not an acceptance or an answer", () => {
+    // The approval path's ordering rule, and its reason: refusal is the one
+    // interaction outcome that withholds the row from escalation, so it is the
+    // one a card that died unanswered must be allowed to overrule. The two
+    // action-owed kinds escalate either way, so the dead sibling is reported as
+    // context rather than allowed to re-file the row.
+    const refusedPlusExpired = probePendingInteraction(
+      evidence({
+        interactions: [
+          { interactionId: "i1", interactionKind: "request_confirmation", interactionStatus: "rejected" },
+          { interactionId: "i2", interactionKind: "ask_user_questions", interactionStatus: "expired" },
+        ],
+      }),
+    );
+    expect(refusedPlusExpired?.resolutionKind).toBe("interaction-abandoned");
+    expect(refusedPlusExpired?.evidence).toContain("the remaining 1 refused");
+
+    const acceptedPlusExpired = probePendingInteraction(
+      evidence({
+        interactions: [
+          { interactionId: "i1", interactionKind: "request_confirmation", interactionStatus: "accepted" },
+          { interactionId: "i2", interactionKind: "ask_user_questions", interactionStatus: "expired" },
+        ],
+      }),
+    );
+    expect(acceptedPlusExpired?.resolutionKind).toBe("interaction-authorised");
+    expect(acceptedPlusExpired?.evidence).toContain("died unanswered");
+    expect(acceptedPlusExpired?.evidence).toContain("i2=expired");
+  });
 
   it.each(["cancelled", "expired", "failed"])(
     "treats %s as an abandoned ask — the human was never answered",
@@ -419,7 +485,8 @@ describe("probePendingInteraction (BLO-30627)", () => {
     // wording claimed "all 2 have been answered" over a card that had actually
     // expired. The evidence line is what a reader audits, so a mixed row must
     // not be described as uniformly answered.
-    expect(result?.evidence).toContain("closed, 1 by a human decision");
+    expect(result?.evidence).toContain("1 of 2");
+    expect(result?.evidence).toContain("died unanswered");
     expect(result?.evidence).toContain("i1=cancelled");
   });
 
@@ -684,7 +751,9 @@ describe("revalidateGates", () => {
       "blocker-done-row-not-moved": 1,
       "approval-granted": 1,
       "approval-refused": 0,
+      "interaction-authorised": 0,
       "interaction-answered": 0,
+      "interaction-refused": 0,
     });
   });
 
@@ -778,20 +847,48 @@ describe("withheldFromAgeRankingIssueIds (PEN-3089)", () => {
   });
 
   it("still withholds the kinds whose resolution leaves nothing owed", () => {
-    // The narrowing has to stay a narrowing. A refused ask, an answered
-    // question and a done blocker chain are all genuinely finished as gates;
-    // escalating them would flood the list and teach the reader to mute it.
+    // The narrowing has to stay a narrowing. A refused board ask, a refused
+    // question card and a done blocker chain are all genuinely finished as
+    // gates; escalating them would flood the list and teach the reader to mute
+    // it.
+    //
+    // PEN-4487 moved `interaction-answered` *out* of this set, so the answered
+    // row that used to sit here now belongs to the assertion below. Its
+    // exclusion read "a human engaged and the answer is on the row", which
+    // assumed some other surface kept watching. Measured on the live bucket,
+    // none did: resolving an interaction wakes only `assigneeAgentId`, and all
+    // 10 rows in that bucket were assigned to a human, so the wake fired for
+    // none of them.
     const report = revalidateGates([
       evidence({ issueId: "refused", approvals: [{ approvalId: "a", approvalStatus: "rejected" }] }),
       evidence({
-        issueId: "answered",
-        interactions: [{ interactionId: "i", interactionStatus: "answered" }],
+        issueId: "refused-card",
+        interactions: [{ interactionId: "i", interactionStatus: "rejected" }],
       }),
       evidence({ issueId: "done", blockers: [{ blockerIssueId: "b", blockerStatus: "done" }] }),
     ]);
     expect(withheldFromAgeRankingIssueIds(report)).toEqual(
-      new Set(["refused", "answered", "done"]),
+      new Set(["refused", "refused-card", "done"]),
     );
+  });
+
+  it("no longer withholds a row whose question card was answered or accepted", () => {
+    // PEN-4487 Ask 2. An acceptance authorises work and an answer supplies an
+    // input to work; neither is the work, so the row is informed-and-unperformed
+    // in the same way `approval-granted` leaves it authorised-and-unperformed.
+    // Live instances: PEN-1687 (critical, privileged purge never performed) and
+    // PEN-1871 (critical, routed to a human and never moved).
+    const report = revalidateGates([
+      evidence({
+        issueId: "answered",
+        interactions: [{ interactionId: "i1", interactionStatus: "answered" }],
+      }),
+      evidence({
+        issueId: "accepted",
+        interactions: [{ interactionId: "i2", interactionStatus: "accepted" }],
+      }),
+    ]);
+    expect(withheldFromAgeRankingIssueIds(report)).toEqual(new Set());
   });
 
   it("escalates on any action-owed probe, not just the one elected primary", () => {
@@ -979,10 +1076,10 @@ describe("formatGateRevalidationSections", () => {
 
   it("does not head a mixed answered/expired row as if every card was answered", () => {
     // The `interaction-answered` kind is assigned whenever *at least one* card
-    // got a decision, so this row — one answered, one expired — lands under
-    // that heading. An earlier wording read "Every question card has been
+    // was answered, so this row — one answered, one expired — lands under that
+    // heading. An earlier wording read "Every question card has been
     // answered", which contradicted the evidence line printed directly beneath
-    // it ("closed, 1 by a human decision") and hid the abandoned ask.
+    // it and hid the abandoned ask.
     const report = revalidateGates([
       evidence({
         issueId: "mixed",
@@ -994,11 +1091,62 @@ describe("formatGateRevalidationSections", () => {
       }),
     ]);
     const markdown = formatGateRevalidationSections(report);
-    expect(markdown).toContain("At least one question card was answered");
+    expect(markdown).toContain("A question card was answered");
     expect(markdown).not.toContain("Every question card has been answered");
     // Heading and evidence must agree: the expired card is still reported.
-    expect(markdown).toContain("closed, 1 by a human decision");
+    expect(markdown).toContain("died unanswered");
     expect(markdown).toContain("i1=expired");
+  });
+
+  it("never renders a refused card under a heading asserting it was answered", () => {
+    // PEN-4487 Ask 1, measured live: PEN-2176 (high, in_review, 73.5d) and
+    // PEN-2631 (52.7d) each reached the `interaction-answered` heading — "At
+    // least one question card was answered" — carrying a rejection as their
+    // only card. The approval path has said the opposite about the same event
+    // since PEN-3089 ("the ask was refused, so this row needs closing rather
+    // than re-asking"); the interaction path asserted an answer over a refusal.
+    const report = revalidateGates([
+      evidence({
+        issueId: "refused",
+        identifier: "PEN-2176",
+        interactions: [
+          { interactionId: "e6ee11ed", interactionKind: "request_confirmation", interactionStatus: "rejected" },
+        ],
+      }),
+    ]);
+    const markdown = formatGateRevalidationSections(report);
+    expect(markdown).toContain("The human refused the ask");
+    expect(markdown).toContain("needs closing, not re-asking");
+    expect(markdown).not.toContain("card was answered");
+    expect(markdown).toContain("e6ee11ed=rejected");
+  });
+
+  it("escalates an accepted or answered card and withholds a refused one", () => {
+    // PEN-4487 Ask 2. An acceptance authorises work and an answer supplies an
+    // input to work; neither is the work, so both keep the row in the
+    // age-ranked list. A refusal ends the ask, so it does not — what that row
+    // needs is closing, and it keeps rendering with its age either way.
+    const report = revalidateGates([
+      evidence({
+        issueId: "authorised",
+        interactions: [{ interactionId: "i1", interactionStatus: "accepted" }],
+      }),
+      evidence({
+        issueId: "answered",
+        interactions: [{ interactionId: "i2", interactionStatus: "answered" }],
+      }),
+      evidence({
+        issueId: "refused",
+        interactions: [{ interactionId: "i3", interactionStatus: "rejected" }],
+      }),
+    ]);
+    const withheld = withheldFromAgeRankingIssueIds(report);
+    expect(withheld.has("authorised")).toBe(false);
+    expect(withheld.has("answered")).toBe(false);
+    expect(withheld.has("refused")).toBe(true);
+    // All three still render with their age — withholding is from the
+    // escalation list, never from the report.
+    expect(resolvedButOpenIssueIds(report).size).toBe(3);
   });
 
   it("says so explicitly when nothing was found resolved", () => {
