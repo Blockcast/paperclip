@@ -217,7 +217,8 @@ describe("github review-gate authority route", () => {
             }),
           };
         }
-        return { from: () => Promise.resolve([]) };
+        // The issue lookup filters by identifier in SQL (BLO-47034).
+        return { from: () => Object.assign(Promise.resolve([]), { where: () => Promise.resolve([]) }) };
       },
     } as unknown as Db;
 
