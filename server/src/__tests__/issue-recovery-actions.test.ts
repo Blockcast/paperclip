@@ -2620,6 +2620,130 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(finalIssue?.assigneeAgentId).toBe(newOwnerId);
   });
 
+  // PEN-4435: the sweep is not idempotent against its own writes. On 2026-07-29 two
+  // passes fired on PEN-606 3.540s apart; the second read the ownership the first had
+  // just installed, treated it as the pre-existing owner, and recorded it as
+  // `returnOwnerAgentId`. The true pre-recovery owner was destroyed, drove a permanent
+  // reassignment 74 days later, and became a false factual claim in a resolution note
+  // ("Returning it to Ceo, who held it before recovery" — the platform's own event
+  // records the note's author as that owner).
+  //
+  // Measured, from the two `issue.updated` event details on action `b0078c44`:
+  //
+  //            | pass 1 (19:47:29.206) | pass 2 (19:47:32.746)
+  //   attempt  | 2                     | 3
+  //   previous | Cto                   | Ceo   <-- pass 1's taker, read back as "previous"
+  //   recovery | Ceo                   | Cto
+  //   return   | Cto                   | Ceo   <-- the corruption
+  //
+  // This is NOT the shape `keeps the original return owner after a temporary
+  // invocability fallback` covers. There the ladder has somewhere to go, so pass 2
+  // re-derives the SAME manager and the pin is never asked a hard question. Here the
+  // assignee after pass 1 is the CEO, who has no `reportsTo`, so
+  // `resolveStrandedIssueRecoveryOwnerAgentId` falls through to its role candidates —
+  // ordered cto-first — and the owner bounces back DOWN to the original agent. Pass 2
+  // therefore computes a fresh, fully-inverted view of the world in which the taker
+  // looks like the previous owner. The seeded ladder must be three deep for this to
+  // reproduce at all.
+  it("preserves the true pre-recovery owner when a second pass fires in the same cycle", async () => {
+    const { companyId, managerId, coderId, sourceIssue } = await seedCompany();
+    // The rung above the CTO that the live ladder had and `seedCompany` does not.
+    const ceoId = randomUUID();
+    await db.insert(agents).values({
+      id: ceoId,
+      companyId,
+      name: "CEO",
+      role: "ceo",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.update(agents).set({ reportsTo: ceoId }).where(eq(agents.id, managerId));
+    // PEN-606 was assigned to the CTO, not to a leaf engineer.
+    await db.update(issues)
+      .set({ assigneeAgentId: managerId })
+      .where(eq(issues.id, sourceIssue.id));
+    const [ctoIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+
+    const enqueueWakeup = vi.fn<
+      (agentId: string, opts?: { payload?: unknown }) => Promise<{ id: string }>
+    >(async () => ({ id: randomUUID() }));
+    const recovery = recoveryService(db, { enqueueWakeup });
+    // The live rows carried `issue_dependencies_blocked` — correctly-blocked rows the
+    // sweep mislabelled as stranded (PEN-3275). That cause can no longer reach here:
+    // BLO-19124/BLO-27463 refuse it outright at the transactional gate in
+    // `escalateStrandedAssignedIssue`, so a replay using it creates no action at all.
+    // The double-pass hazard is independent of the cause that opened the action — it
+    // needs only a cause that routes up the manager ladder — so this uses the nearest
+    // still-reachable one.
+    //
+    // The cause must be agent-side, and `claude_truncated` is agent-side only by its
+    // MESSAGE: `isInfraClassStrandedFailure` promotes the same code to infra-class when
+    // the text carries pod-removal or k8s-container wording, and `adapter_failed` and
+    // `job_failed` are infra-class by code alone (`ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES`).
+    // Any of those takes the `routeToOriginal` branch, which leaves the assignee in
+    // place — so ownership never moves, pass 2 sees nothing new, and the replay would
+    // pass vacuously no matter what the pin did. The plain mid-stream wording below is
+    // what keeps this on the manager-ladder branch that creates the hazard.
+    const latestRun = {
+      id: randomUUID(),
+      agentId: managerId,
+      status: "failed",
+      error: "Claude run was truncated mid-stream — assistant produced content but no " +
+        "result event arrived",
+      errorCode: "claude_truncated",
+      contextSnapshot: { retryReason: "issue_continuation_needed" },
+      livenessState: "needs_followup",
+      resultJson: null,
+      usageJson: null,
+      createdAt: new Date(),
+    } as const;
+
+    // Pass 1 — ownership moves CTO -> CEO, and the CTO is recorded as the return owner.
+    await recovery.escalateStrandedAssignedIssue({
+      issue: ctoIssue!,
+      previousStatus: "in_progress",
+      latestRun,
+      comment: "Automatic continuation recovery failed.",
+    });
+    const [firstAction] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    expect(firstAction).toMatchObject({
+      ownerAgentId: ceoId,
+      returnOwnerAgentId: managerId,
+    });
+    const [afterFirst] = await db.select().from(issues).where(eq(issues.id, sourceIssue.id));
+    // The precondition for the defect: pass 1 put its own taker on the issue, so pass 2
+    // reads the CEO as the current assignee. Without this the replay proves nothing.
+    expect(afterFirst?.assigneeAgentId).toBe(ceoId);
+
+    // Pass 2 — the same sweep, ~3s later, re-reading the issue pass 1 just wrote. Same
+    // run, so this is one failure observed twice, not a second failure.
+    await recovery.escalateStrandedAssignedIssue({
+      issue: afterFirst!,
+      previousStatus: "in_progress",
+      latestRun,
+      comment: "Automatic continuation recovery failed.",
+    });
+
+    const [secondAction] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.sourceIssueId, sourceIssue.id));
+    // The assertion the live data violated: the return owner must still name the agent
+    // who held the issue BEFORE recovery touched it, not the one recovery installed.
+    expect(secondAction?.returnOwnerAgentId).toBe(managerId);
+    expect(secondAction?.returnOwnerAgentId).not.toBe(ceoId);
+    // And it must be the same action row throughout — a second row would mean the
+    // uniqueness slot moved and the assertion above was reading a different object.
+    expect(secondAction?.id).toBe(firstAction?.id);
+    expect(coderId).toBeTruthy();
+  });
+
   // Recovery dispatch is post-commit. A reassignment performed by the injected
   // wake therefore cannot race the transactional issue UPDATE or be overwritten.
   it("keeps a post-commit reassignment from being overwritten by recovery", async () => {
