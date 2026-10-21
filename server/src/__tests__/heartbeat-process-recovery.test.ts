@@ -15344,7 +15344,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     },
   );
 
-  it("skips non-retryable review-participant escalation when the failure predates an operator unblock", async () => {
+  // BLO-48133: the gate no longer bare-skips -- no escalation on pre-unblock
+  // evidence, but blocked->in_review still needs a live path, so requeue.
+  it("requeues (not escalates) a review participant when the failure predates an operator unblock", async () => {
     const { companyId, agentId, issueId, runId, wakeupRequestId } =
       await seedInReviewParticipantRunFixture();
     const failedAt = new Date("2026-03-19T00:05:00.000Z");
@@ -15379,7 +15381,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     const result = await createHeartbeat().reconcileStrandedAssignedIssues();
 
-    expect(result).toMatchObject({ reviewParticipantRequeued: 0, escalated: 0 });
+    expect(result).toMatchObject({ reviewParticipantRequeued: 1, escalated: 0 });
     const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
     expect(issue).toMatchObject({ status: "in_review", assigneeAgentId: agentId });
     expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
