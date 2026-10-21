@@ -40,6 +40,7 @@ import {
   EXTERNAL_LIFECYCLE_MAX_CONCURRENT_RUNS,
 } from "@paperclipai/shared/validators/agent";
 import { conflict, notFound, unprocessable } from "../errors.js";
+import { consumptionCentsSum } from "./consumption-metric.js";
 import { describeAgentStartLockDispatchHealth } from "./agent-start-lock.js";
 import { syncAgentAdapterEnvBindings } from "./agent-secret-bindings.js";
 import { normalizeAgentPermissions } from "./agent-permissions.js";
@@ -493,13 +494,17 @@ export function agentService(db: Db) {
     return db.select().from(agents).where(eq(agents.companyId, companyId));
   }
 
+  // PEN-4466: this OVERWRITES the stored `agents.spent_monthly_cents` on every read, so it
+  // -- not `getMonthlySpendTotal` -- is what the API actually serves. It must read
+  // CONSUMPTION, or the served burn series flatlines forward the day adapter billingType
+  // classification is corrected. See `services/consumption-metric.ts`.
   async function getMonthlySpendByAgentIds(companyId: string, agentIds: string[]) {
     if (agentIds.length === 0) return new Map<string, number>();
     const { start, end } = currentUtcMonthWindow();
     const rows = await db
       .select({
         agentId: costEvents.agentId,
-        spentMonthlyCents: sql<number>`coalesce(sum(${costEvents.costCents}), 0)::double precision`,
+        spentMonthlyCents: consumptionCentsSum,
       })
       .from(costEvents)
       .where(

@@ -23,6 +23,7 @@ import type {
   BudgetWindowKind,
 } from "@paperclipai/shared";
 import { notFound, unprocessable } from "../errors.js";
+import { consumptionCentsExpr } from "./consumption-metric.js";
 import { logActivity } from "./activity-log.js";
 import { insertApproval } from "./approval-insert.js";
 
@@ -142,17 +143,6 @@ async function resolveScopeRecord(db: Db, scopeType: BudgetScopeType, scopeId: s
 }
 
 /**
- * The quantity every budget control enforces on: list-price CONSUMPTION, in cents.
- *
- * `coalesce` and not `coalesce(nullif(consumption_cents, 0), ...)`: `consumption_cents` is
- * nullable precisely so that NULL ("row predates the column") stays distinguishable from 0
- * ("this run genuinely cost nothing"). `nullif` would collapse those and re-read
- * `cost_cents` for every free row forever. The fallback also covers rows inserted between
- * migration 0263 and the deploy that starts populating the column.
- */
-const consumptionCentsExpr = sql<number>`coalesce(${costEvents.consumptionCents}, ${costEvents.costCents})`;
-
-/**
  * ⚠️ ORDERING CONSTRAINT -- read this before "fixing" adapter billingType classification.
  *
  * This is the sole input to every hardStopEnabled budget policy. Until PEN-4466 it summed
@@ -171,17 +161,13 @@ const consumptionCentsExpr = sql<number>`coalesce(${costEvents.consumptionCents}
  * measurable. See PEN-4463 step 1.
  *
  * Therefore: a billingType classification change must not reach normalizeBilledCostCents
- * until every gate reads a field that function cannot zero. Classification goes LAST.
- * The gates, all three of which this change moved to `consumptionCentsExpr`:
+ * until EVERY gate reads a field that function cannot zero. Classification goes LAST.
  *
- *   * this function                -- the five hardStopEnabled budget policies
- *   * `heartbeat.daily_cost_limit` -- services/heartbeat.ts, per-agent daily cost cap
- *   * `getMonthlySpendTotal`       -- services/costs.ts, agents/companies.spentMonthlyCents
- *
- * Still outstanding when classification lands, and NOT covered by PEN-4466: the reporting
- * surfaces (`/costs/*`, `dashboard.ts`, `issue-efficiency.ts`) still read `cost_cents`
- * directly. They carry no gate, so they fail visibly rather than silently -- but whoever
- * lands classification must expose both quantities there, labelled, or those read 0.
+ * The full reader inventory -- and the reason this expression is a shared constant rather
+ * than a local copy in each service -- lives on `consumptionCentsExpr` in
+ * `services/consumption-metric.ts`. Audit there, not here: five hand-rolled copies of the
+ * list is how a reader gets missed, which is exactly what happened to the two
+ * `spentMonthlyCents` hydration paths on the first pass of PEN-4466.
  *
  * Invariant held by `budget-consumption-metric.test.ts`, which fails if a future change
  * repoints this at a zeroable column.

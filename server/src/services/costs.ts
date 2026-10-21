@@ -5,6 +5,7 @@ import { activityLog, agents, companies, costEvents, heartbeatRuns, issues, proj
 import { notFound, unprocessable } from "../errors.js";
 import { budgetService, type BudgetServiceHooks } from "./budgets.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
+import { consumptionCentsExpr } from "./consumption-metric.js";
 
 export interface CostDateRange {
   from?: Date;
@@ -35,18 +36,14 @@ function currentUtcMonthWindow(now = new Date()) {
 }
 
 /**
- * PEN-4466: list-price CONSUMPTION in cents -- the quantity the gates enforce on.
- * See the ORDERING CONSTRAINT block above `computeObservedAmount` in `budgets.ts`;
- * `cost_cents` alone is zeroed by `normalizeBilledCostCents` for subscription lanes.
- */
-const consumptionCentsExpr = sql<number>`coalesce(${costEvents.consumptionCents}, ${costEvents.costCents})`;
-
-/**
- * Feeds `agents.spentMonthlyCents` and `companies.spentMonthlyCents`, which are the
- * monthly burn series the fleet is tracked by -- so this is the third gate-adjacent
- * reader and it moves with the other two. Reading `cost_cents` here would not collapse
- * retroactively on the day classification lands; it would FLATLINE forward, which reads
- * as "the fleet stopped" rather than "the meter broke". (PEN-4466 §4.)
+ * PEN-4466: writes the STORED `agents`/`companies.spent_monthly_cents`.
+ *
+ * The stored value is not what the API serves: `hydrateAgentSpend` (`services/agents.ts`)
+ * and `hydrateCompanySpend` (`services/companies.ts`) overwrite it with a live re-sum on
+ * every read. All three must stay on `consumptionCentsExpr` together, or
+ * `spentMonthlyCents` FLATLINES FORWARD on the day classification lands -- which reads as
+ * "the fleet stopped" rather than "the meter broke", and is the harder of the two to
+ * notice. See `services/consumption-metric.ts`.
  */
 async function getMonthlySpendTotal(
   db: Db,

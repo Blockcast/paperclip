@@ -22,8 +22,12 @@
 -- Readers therefore use `coalesce(consumption_cents, cost_cents)`, which also covers
 -- rows inserted between this migration and the deploy that starts populating it.
 --
--- ORDERING GATE. The backfill below is correct only while no subscription-typed row has
--- ever been written: today every row in the table IS list price, because
+-- ORDERING GATE. The backfill below is correct only while no row whose `cost_cents` has
+-- been ZEROED exists -- i.e. no `subscription_included` row. `subscription_overage` is
+-- deliberately NOT caught here: `normalizeBilledCostCents` does not zero it, so an overage
+-- row keeps a correct list-price `cost_cents` and backfilling from it is safe. Catching it
+-- would wedge this migration on the first legitimately-classified overage row for no
+-- correctness reason. Today every row in the table IS list price, because
 -- `/companies/:id/costs/by-biller` reports subscriptionRunCount = 0 on both billers
 -- (anthropic 28,627 api runs, openai 328, 28,955 total, 0 subscription -- measured
 -- 2026-10-21). If classification landed first, `cost_cents` is already zeroed for those
@@ -36,11 +40,11 @@ DECLARE
 BEGIN
   SELECT count(*) INTO misclassified
     FROM cost_events
-   WHERE billing_type IN ('subscription_included', 'subscription_overage');
+   WHERE billing_type = 'subscription_included';
 
   IF misclassified > 0 THEN
     RAISE EXCEPTION
-      'PEN-4466: % cost_events rows already carry a subscription billing_type. The adapter classification fix landed BEFORE this control, so cost_cents is already zeroed for those rows and backfilling consumption_cents from it would make the zeros permanent. Stop and escalate on PEN-4466 before re-running.',
+      'PEN-4466: % cost_events rows already carry billing_type = subscription_included. The adapter classification fix landed BEFORE this control, so cost_cents is already zeroed for those rows and backfilling consumption_cents from it would make the zeros permanent. Stop and escalate on PEN-4466 before re-running.',
       misclassified;
   END IF;
 END

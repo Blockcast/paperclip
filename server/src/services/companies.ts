@@ -36,6 +36,7 @@ import {
   routines,
 } from "@paperclipai/db";
 import { notFound, unprocessable } from "../errors.js";
+import { consumptionCentsSum } from "./consumption-metric.js";
 import { environmentService } from "./environments.js";
 import { heartbeatService } from "./heartbeat.js";
 import { logActivity } from "./activity-log.js";
@@ -165,6 +166,10 @@ export function companyService(db: Db) {
     };
   }
 
+  // PEN-4466: this OVERWRITES the stored `companies.spent_monthly_cents` on every read, so
+  // it -- not `getMonthlySpendTotal` -- is what the API actually serves. It must read
+  // CONSUMPTION, or the served burn series flatlines forward the day adapter billingType
+  // classification is corrected. See `services/consumption-metric.ts`.
   async function getMonthlySpendByCompanyIds(
     companyIds: string[],
     database: Pick<Db, "select"> = db,
@@ -174,7 +179,7 @@ export function companyService(db: Db) {
     const rows = await database
         .select({
           companyId: costEvents.companyId,
-          spentMonthlyCents: sql<number>`coalesce(sum(${costEvents.costCents}), 0)::double precision`,
+          spentMonthlyCents: consumptionCentsSum,
         })
       .from(costEvents)
       .where(

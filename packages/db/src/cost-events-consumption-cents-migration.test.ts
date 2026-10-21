@@ -86,7 +86,7 @@ describeEmbeddedPostgres("cost_events consumption_cents migration", () => {
     await seedLedgerRow(sql, "subscription_included", 0);
 
     await expect(applyPendingMigrations(database.connectionString)).rejects.toThrow(
-      /PEN-4466: 1 cost_events rows already carry a subscription billing_type/,
+      /PEN-4466: 1 cost_events rows already carry billing_type = subscription_included/,
     );
 
     // The column must not exist and the migration must still read as pending -- a partial
