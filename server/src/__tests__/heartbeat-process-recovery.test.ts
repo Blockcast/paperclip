@@ -15382,6 +15382,237 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(await db.select().from(issueRecoveryActions)).toHaveLength(0);
   });
 
+  // BLO-32819: one test per escalation arm the audit found ungated and gated.
+  // Each seeds terminal evidence strictly BEFORE an operator unblock and
+  // asserts no re-escalation. Every one was shown to fail with its gate block
+  // deleted from `recovery/service.ts` -- a row here that cannot fail pins
+  // nothing, so re-run that check when touching these arms.
+  describe("BLO-32819: stale-unblock gate on previously ungated escalation arms", () => {
+    const preUnblockRunAt = new Date("2026-03-19T00:00:00.000Z");
+    const unblockAt = new Date("2026-03-19T01:00:00.000Z");
+
+    async function recordUnblock(companyId: string, issueId: string, status: string) {
+      await db.insert(activityLog).values({
+        id: randomUUID(),
+        companyId,
+        actorType: "user",
+        actorId: "operator",
+        action: "issue.updated",
+        entityType: "issue",
+        entityId: issueId,
+        details: { previousStatus: "blocked", status },
+        createdAt: unblockAt,
+      });
+    }
+
+    async function expectNotReescalated(
+      result: Awaited<ReturnType<ReturnType<typeof createHeartbeat>["reconcileStrandedAssignedIssues"]>>,
+      issueId: string,
+      status: string,
+    ) {
+      // Branch-specific counter too: the handoff arm increments
+      // `successfulRunHandoffEscalated`, not `escalated`.
+      expect(result.escalated).toBe(0);
+      expect(result.successfulRunHandoffEscalated).toBe(0);
+      const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+      expect(issue?.status).toBe(status);
+      expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId)))
+        .toHaveLength(0);
+    }
+
+    it("non-in_review configuration_incomplete adapter failure", async () => {
+      const { companyId, issueId, runId } = await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "failed",
+        runErrorCode: "configuration_incomplete",
+        runError: "configuration incomplete: env.UNBOUND_API_KEY is unbound",
+      });
+      await db.update(heartbeatRuns).set({ createdAt: preUnblockRunAt }).where(eq(heartbeatRuns.id, runId));
+      await recordUnblock(companyId, issueId, "in_progress");
+
+      const result = await createHeartbeat({ penstockAvailabilityGate: allowPenstockGate })
+        .reconcileStrandedAssignedIssues();
+      await expectNotReescalated(result, issueId, "in_progress");
+    });
+
+    it("in_progress exhausted successful-run handoff", async () => {
+      const { companyId, issueId, runId } = await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "succeeded",
+      });
+      const sourceRunId = randomUUID();
+      await db
+        .update(heartbeatRuns)
+        .set({
+          createdAt: preUnblockRunAt,
+          contextSnapshot: {
+            issueId,
+            taskId: issueId,
+            wakeReason: "finish_successful_run_handoff",
+            sourceRunId,
+            resumeFromRunId: sourceRunId,
+            handoffRequired: true,
+            handoffReason: "successful_run_missing_state",
+            missingDisposition: "clear_next_step",
+            handoffAttempt: 1,
+            maxHandoffAttempts: 1,
+          },
+        })
+        .where(eq(heartbeatRuns.id, runId));
+      await recordUnblock(companyId, issueId, "in_progress");
+
+      const result = await createHeartbeat({ penstockAvailabilityGate: allowPenstockGate })
+        .reconcileStrandedAssignedIssues();
+      await expectNotReescalated(result, issueId, "in_progress");
+    });
+
+    it("repeated productive continuation recovery", async () => {
+      const { companyId, issueId, runId } = await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "succeeded",
+        livenessState: "advanced",
+      });
+      await db
+        .update(heartbeatRuns)
+        .set({
+          createdAt: preUnblockRunAt,
+          contextSnapshot: {
+            issueId,
+            taskId: issueId,
+            wakeReason: "issue_continuation_needed",
+            retryReason: "issue_continuation_needed",
+            source: "issue.productive_terminal_continuation_recovery",
+          },
+        })
+        .where(eq(heartbeatRuns.id, runId));
+      await recordUnblock(companyId, issueId, "in_progress");
+
+      const result = await createHeartbeat({ penstockAvailabilityGate: allowPenstockGate })
+        .reconcileStrandedAssignedIssues();
+      await expectNotReescalated(result, issueId, "in_progress");
+    });
+
+    async function seedFailedParticipant(errorCode: string, retryReason?: string) {
+      const fixture = await seedInReviewParticipantRunFixture(retryReason
+        ? { wakeReason: retryReason, retryReason }
+        : undefined);
+      await db.update(issues).set({ executionRunId: null }).where(eq(issues.id, fixture.issueId));
+      await db.update(heartbeatRuns).set({
+        status: "failed",
+        createdAt: preUnblockRunAt,
+        startedAt: preUnblockRunAt,
+        finishedAt: preUnblockRunAt,
+        updatedAt: preUnblockRunAt,
+        errorCode,
+        error: errorCode === "configuration_incomplete"
+          ? "configuration incomplete: env.UNBOUND_API_KEY is unbound"
+          : "Process lost",
+      }).where(eq(heartbeatRuns.id, fixture.runId));
+      await db.update(agentWakeupRequests).set({
+        status: "failed",
+        claimedAt: preUnblockRunAt,
+        finishedAt: preUnblockRunAt,
+        updatedAt: preUnblockRunAt,
+      }).where(eq(agentWakeupRequests.id, fixture.wakeupRequestId));
+      await recordUnblock(fixture.companyId, fixture.issueId, "in_review");
+      return fixture;
+    }
+
+    it("in_review participant configuration_incomplete adapter failure", async () => {
+      const { issueId } = await seedFailedParticipant("configuration_incomplete");
+      const result = await createHeartbeat().reconcileStrandedAssignedIssues();
+      await expectNotReescalated(result, issueId, "in_review");
+    });
+
+    it("in_review participant whose automatic recovery already failed", async () => {
+      const { issueId } = await seedFailedParticipant("process_lost", "execution_review_participant_recovery");
+      const result = await createHeartbeat().reconcileStrandedAssignedIssues();
+      await expectNotReescalated(result, issueId, "in_review");
+    });
+
+    it("accepted-interaction continuation cancelled waiting on review three times", async () => {
+      const companyId = randomUUID();
+      const agentId = randomUUID();
+      const issueId = randomUUID();
+      const interactionId = randomUUID();
+      const resolvedAt = new Date("2026-03-19T00:05:00.000Z");
+      const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+      await db.insert(companies).values({
+        id: companyId,
+        name: "Paperclip",
+        issuePrefix,
+        defaultResponsibleUserId: "responsible-user",
+        requireBoardApprovalForNewAgents: false,
+      });
+      await db.insert(agents).values({
+        id: agentId,
+        companyId,
+        name: "CodexCoder",
+        role: "engineer",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+        permissions: {},
+      });
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Accepted plan cancellation loop",
+        status: "in_review",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        responsibleUserId: "responsible-user",
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+      });
+      await db.insert(issueThreadInteractions).values({
+        id: interactionId,
+        companyId,
+        issueId,
+        kind: "request_confirmation",
+        status: "accepted",
+        continuationPolicy: "wake_assignee_on_accept",
+        createdByAgentId: agentId,
+        resolvedByUserId: "responsible-user",
+        resolvedAt,
+        updatedAt: resolvedAt,
+        payload: { version: 1, prompt: "Approve the plan?" },
+        result: { outcome: "accepted" },
+      });
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
+        const finishedAt = new Date(resolvedAt.getTime() + attempt * 60_000);
+        await db.insert(heartbeatRuns).values({
+          id: randomUUID(),
+          companyId,
+          agentId,
+          invocationSource: "automation",
+          triggerDetail: "system",
+          status: "cancelled",
+          errorCode: "issue_continuation_waiting_on_review",
+          error: "Continuation summary still says to wait for review",
+          contextSnapshot: {
+            issueId,
+            taskId: issueId,
+            wakeReason: "issue_continuation_needed",
+            retryReason: "issue_continuation_needed",
+            mutation: "interaction",
+            interactionId,
+            interactionResolvedAt: resolvedAt.toISOString(),
+          },
+          createdAt: finishedAt,
+          startedAt: finishedAt,
+          finishedAt,
+          updatedAt: finishedAt,
+        });
+      }
+      await recordUnblock(companyId, issueId, "in_review");
+
+      const result = await createHeartbeat().reconcileStrandedAssignedIssues();
+      await expectNotReescalated(result, issueId, "in_review");
+    });
+  });
+
   it("does not treat a productive terminal run as healthy when in-progress work has no live path", async () => {
     const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
       status: "in_progress",
