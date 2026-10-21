@@ -1982,10 +1982,20 @@ async function inspectGitWorktreeBranchIncoherence(input: {
   // `sameHead` repair from paying for a lookup it never reads.
   const registeredWorktrees = await listRegisteredGitWorktrees(input.repoRoot);
   const resolvedWorktreePath = await resolvePathForWorktreeComparison(input.worktreePath);
+  const actualBranchRef = input.actualBranchName ? `refs/heads/${input.actualBranchName}` : null;
+  // BLO-48176: a failed or timed-out list is not absence (same defect as
+  // BLO-42089). On multicast the list took 49.7s for 302 worktrees against a 30s
+  // bound, so every safe repair there read "not registered". Read this one
+  // registration directly instead. The list's `branch` line is read from the
+  // worktree's own HEAD, which is what `actualBranchName` already is.
+  const directRegistration = registeredWorktrees
+    ? null
+    : await hasLinkedGitWorktreeRegistration(input.repoRoot, input.worktreePath);
   const registered = registeredWorktrees
     ? await findGitWorktreeEntryByResolvedPath(registeredWorktrees, resolvedWorktreePath)
-    : null;
-  const actualBranchRef = input.actualBranchName ? `refs/heads/${input.actualBranchName}` : null;
+    : directRegistration
+      ? { worktree: resolvedWorktreePath, branch: actualBranchRef }
+      : null;
   const registeredBranchRef = registered?.branch ?? null;
   const registeredBranchMatchesHead = Boolean(registered && registeredBranchRef === actualBranchRef);
   const sameHead = Boolean(expectedHeadSha && actualHeadSha && expectedHeadSha === actualHeadSha);
@@ -2074,6 +2084,9 @@ async function inspectGitWorktreeBranchIncoherence(input: {
     // reach over either observed shape.
     !inProgressOperation &&
     !workspaceIsContended &&
+    // Without a listing, whether another worktree holds the recorded branch is
+    // unknown; fail closed rather than let `git checkout` refuse it later.
+    registeredWorktrees !== null &&
     !expectedBranchHeldByOtherWorktree;
   const eligible =
     canCheckoutRecordedBranch ||
@@ -2093,7 +2106,9 @@ async function inspectGitWorktreeBranchIncoherence(input: {
         ? `worktree is not clean and a git ${GIT_IN_PROGRESS_OPERATION_LABELS[inProgressOperation]} is in progress`
         : "worktree is not clean"
       : !registered
-        ? "worktree path is not registered"
+        ? !registeredWorktrees && directRegistration === null
+          ? `could not enumerate worktrees within ${WORKTREE_RECLAIM_GIT_TIMEOUT_MS / 1000}s and the direct registration read stalled, so registration is unknown`
+          : "worktree path is not registered"
       : !registeredBranchMatchesHead
         ? "registered worktree branch does not match HEAD"
       : !expectedBranchExists
@@ -2109,6 +2124,8 @@ async function inspectGitWorktreeBranchIncoherence(input: {
               workspaceClaimants,
               workspaceClaimantLookup.status === "ok" && workspaceClaimantLookup.truncated,
             )
+            : !registeredWorktrees
+              ? `could not enumerate worktrees within ${WORKTREE_RECLAIM_GIT_TIMEOUT_MS / 1000}s, so whether another worktree holds the recorded branch is unknown`
             : expectedBranchHeldByOtherWorktree
               ? `recorded branch is already checked out in another worktree at ${expectedBranchWorktreePath}`
               : !sameHead

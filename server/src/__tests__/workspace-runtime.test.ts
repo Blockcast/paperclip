@@ -5851,6 +5851,64 @@ describe("inspectManagedGitWorktreeBranch when `git worktree list` fails (BLO-42
     const outcome = await inspectWithListAndReadStalled("BLO-42089-finalize", false);
     expect(outcome).toMatchObject({ value: { valid: false, reasonCode: "not_registered" } });
   }, 30_000);
+
+  // BLO-48176: the branch-incoherence evidence read a timed-out list as
+  // "worktree path is not registered", so no safe repair could ever run on a
+  // checkout whose list outlives the 30s bound (multicast: 302 worktrees, 49.7s).
+  async function stallListUntilSettled<T>(run: () => Promise<T>) {
+    const realSetTimeout = globalThis.setTimeout;
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      return await withFailingWorktreeList(async () => {
+        const settled = run().then((value) => ({ value }), (error: unknown) => ({ error }));
+        for (let step = 0; step < 300; step += 1) {
+          const done = await Promise.race([settled, new Promise<null>((resolve) => realSetTimeout(() => resolve(null), 20))]);
+          if (done) return done;
+          await vi.advanceTimersByTimeAsync(5_000);
+        }
+        throw new Error("never settled");
+      }, "stall");
+    } finally {
+      vi.useRealTimers();
+    }
+  }
+
+  it("still runs the sameHead safe repair when `git worktree list` times out (BLO-48176)", async () => {
+    const { repoRoot, worktreePath } = await createLinkedWorktree("BLO-48176-live");
+    await runGit(repoRoot, ["branch", "BLO-48176-recorded", "BLO-48176-live"]);
+
+    const outcome = await stallListUntilSettled(() => ensureGitWorktreeBranchCoherent({
+      db: null,
+      repoRoot,
+      worktreePath,
+      expectedBranchName: "BLO-48176-recorded",
+      sourceIssue: null,
+      enableWorkspaceBranchReconcileForward: true,
+    }));
+
+    expect(outcome).toMatchObject({ value: { branchName: "BLO-48176-recorded" } });
+    expect(await readGit(worktreePath, ["symbolic-ref", "--short", "HEAD"])).toBe("BLO-48176-recorded");
+  }, 30_000);
+
+  it("names the failed enumeration, not \"not registered\", when a diverged repair needs the list (BLO-48176)", async () => {
+    const { repoRoot, worktreePath } = await createLinkedWorktree("BLO-48176-diverged-live");
+    // Each branch carries a commit the other lacks, so only the diverged arm applies.
+    await runGit(repoRoot, ["commit", "--allow-empty", "-m", "recorded work"]);
+    await runGit(repoRoot, ["branch", "BLO-48176-diverged-recorded"]);
+    await runGit(worktreePath, ["commit", "--allow-empty", "-m", "live work"]);
+
+    const error = await withFailingWorktreeList(() => captureBranchCoherenceRefusal({
+      db: createClaimantLookupDb({ kind: "rows", rows: [] }),
+      repoRoot,
+      worktreePath,
+      expectedBranch: "BLO-48176-diverged-recorded",
+    }));
+
+    const reason = (error as { resultJson?: { workspaceValidation?: { safeRepair?: { reason?: string } } } })
+      ?.resultJson?.workspaceValidation?.safeRepair?.reason;
+    expect(reason).toContain("could not enumerate worktrees");
+    expect(reason).not.toContain("not registered");
+  }, 30_000);
 });
 
 describe("ensureRuntimeServicesForRun", () => {
