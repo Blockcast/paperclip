@@ -167,4 +167,27 @@ describe("recordOrphanReapStage", () => {
     expect(await stageCount("bogus")).toBeNull();
     expect(await stageCount("total")).toBeNull();
   });
+
+  /**
+   * PEN-4380 pass 2. These three decompose `reconcile_release_pending`, which
+   * pass 1 left as the deepest label and which turned out to name a function
+   * rather than a wait: on 2026-10-21 two excursions of 211.209 s and 132.107 s
+   * were measured there while the largest per-call exec time of ANY of the 200
+   * statements `pg_stat_statements` tracks, in a 12-minute bracket around each,
+   * was 13.19 s and 10.94 s. The pool never had a waiter and event-loop lag
+   * peaked at 1.223 s, so the time is in neither SQL, nor a connection wait,
+   * nor the event loop -- it is in one of the loop's two awaits, and only this
+   * split can say which.
+   *
+   * Asserted by name rather than left to the loop above because the risk here
+   * is deletion, not mis-recording: re-merging them restores exactly the blind
+   * spot that cost this investigation two wrong attributions.
+   */
+  it("keeps the release_pending decomposition separable", async () => {
+    for (const stage of ["release_pending_select", "release_pending_job_reads", "release_pending_act"] as const) {
+      expect(KNOWN_ORPHAN_REAP_STAGES).toContain(stage);
+      recordOrphanReapStage(stage, 0.25);
+      expect(await stageCount(stage)).toBe(1);
+    }
+  });
 });
