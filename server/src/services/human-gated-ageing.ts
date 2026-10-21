@@ -277,14 +277,16 @@ export type HumanGatedAgeingReport = {
    * Priority composition of the rows the `maxEscalated` cap dropped (PEN-4489).
    *
    * `countsByPriority` counts the whole past-threshold pool and `escalated`
-   * lists the head that survived the cap, so the difference between them — the
+   * lists the rows that survived the cap, so the difference between them — the
    * rows a human is *not* being shown — was derivable but never derived, and
-   * the rendered notice reported it as an undifferentiated count. Priority is
-   * honoured at the threshold and then discarded at the cut, so that count can
-   * hide a `critical` row past its threshold by 4x behind a bare "36 further
-   * issues". Materialising it here is what lets the renderer say so.
+   * the rendered notice reported it as an undifferentiated count: a bare "36
+   * further issues" that could hide a `critical` row past its threshold by 4x.
+   * Materialising it here is what lets the renderer say so.
    *
-   * This changes no selection: which rows escalate is untouched.
+   * Still needed now that the cut fills slots critical-first. Priority order
+   * decides *which* rows are withheld, not *how many*: once more rows are past
+   * threshold than the cap allows, a tier can still be cut into — and then this
+   * is the only place the digest can say which tier that was.
    */
   omittedCountsByPriority: Record<string, number>;
 };
@@ -489,7 +491,31 @@ export function selectAgedHumanGatedIssues(
       issue.humanSilenceDays >
       escalateAfterDaysFor(issue.priority, escalateAfterDaysByPriority),
   );
-  const escalated = maxEscalated === null ? overThreshold : overThreshold.slice(0, maxEscalated);
+  // PEN-4489. The cap is an attention budget, so the order it is spent in is a
+  // rationing rule. Sorting the pool by age alone honoured priority at the
+  // *threshold* and then discarded it at the *cut*: measured on the live
+  // digest, 36 of 51 past-threshold rows never printed, three `critical` rows
+  // 4x past their own 14d bar were structurally unreachable, and a `low` row
+  // whose title says "OFF beta critical path" held the top slot at 142d.
+  // Filling critical-first, oldest-first within each tier, keeps the cap (the
+  // list still rations) while making a lower-priority row unable to displace a
+  // higher-priority one. Decided on PEN-4489 against three alternatives: a
+  // per-priority floor needs a reserve size nobody has measured, raising the
+  // cap trades invisibility for mutedness, and accepting age-only leaves those
+  // three `critical` rows unreachable.
+  //
+  // `scanned` keeps its clock ordering: it is the whole population, reported
+  // for the histogram and the never-touched tally, and nothing about it is a
+  // rationing decision. Only the cut is reordered, on a copy.
+  const byPriorityThenAge = [...overThreshold].sort((a, b) => {
+    const byPriority = comparePriority(a.priority, b.priority);
+    if (byPriority !== 0) return byPriority;
+    const byClock = a.humanClockAt.getTime() - b.humanClockAt.getTime();
+    if (byClock !== 0) return byClock;
+    return (a.identifier ?? a.id).localeCompare(b.identifier ?? b.id);
+  });
+  const escalated =
+    maxEscalated === null ? byPriorityThenAge : byPriorityThenAge.slice(0, maxEscalated);
 
   const countsByWaitKind: Record<HumanGatedWaitKind, number> = {
     waiting_on_review: 0,
@@ -511,16 +537,20 @@ export function selectAgedHumanGatedIssues(
     string,
     number
   >;
-  // `escalated` is a prefix of `overThreshold` (slice from 0), so the omitted
-  // set is its tail. Counted by walking the tail rather than by subtracting two
-  // tallies: a subtraction would silently emit a negative count if that prefix
-  // relationship ever stopped holding, and a negative "withheld" count renders
-  // as a confident falsehood instead of an error.
-  for (const [index, issue] of overThreshold.entries()) {
+  // Membership, not position. `escalated` used to be a prefix of
+  // `overThreshold` and the omitted set was its tail, so an index comparison
+  // was enough. Since PEN-4489 the cut is taken from a *reordered* copy, so the
+  // withheld rows are no longer a contiguous tail of this array and an index
+  // test would attribute the omissions to the wrong priorities — naming the
+  // withheld rows wrongly is the same class of confident falsehood this counter
+  // exists to close. Keyed on object identity rather than `id` so that a
+  // duplicated identifier cannot make a withheld row read as a shown one.
+  const escalatedRows = new Set<AgedHumanGatedIssue>(escalated);
+  for (const issue of overThreshold) {
     countsByWaitKind[issue.waitKind] += 1;
     const priority = issue.priority ?? "unset";
     countsByPriority[priority] = (countsByPriority[priority] ?? 0) + 1;
-    if (index >= escalated.length) {
+    if (!escalatedRows.has(issue)) {
       omittedCountsByPriority[priority] = (omittedCountsByPriority[priority] ?? 0) + 1;
     }
   }
@@ -757,23 +787,28 @@ export function formatHumanGatedAgeingSections(report: HumanGatedAgeingReport): 
     // describes the rows' state, not their fate, so nothing in it says the M
     // are *not shown*, and nothing says what they are. Underneath it the list
     // is grouped under `critical` / `high` headings, which invites the reading
-    // that the urgent ones are the ones on display. They are the urgent ones
-    // *among the oldest N*; priority is honoured at the threshold and then
-    // discarded at the cut, so a `critical` row past its threshold by 4x is
-    // withheld in silence while a `low` row that cleared a 45d bar on age
-    // occupies a slot (PEN-4489).
+    // that the urgent ones are the ones on display. Under the old flat age sort
+    // they were only the urgent ones *among the oldest N*: priority was
+    // honoured at the threshold and then discarded at the cut, so a `critical`
+    // row past its threshold by 4x was withheld in silence while a `low` row
+    // that cleared a 45d bar on age occupied a slot. The cut now fills slots
+    // critical-first, so that particular inversion is gone — but the cap still
+    // withholds, and a cap that withholds silently is the original defect
+    // whatever rule it rations by (PEN-4489).
     //
-    // This says what was withheld and on what rule. It does not change which
-    // rows are selected — whether age alone is the right rationing rule is a
-    // product decision that is open, not one this renderer should pre-empt.
+    // This says what was withheld and on what rule. The rule changed with the
+    // selection change in this same commit: "Showing the N *oldest*" and "the
+    // cut is by age alone" were both true of the old flat age sort and are both
+    // false now, so they move together. A notice that describes a rationing
+    // rule the selector no longer uses is worse than the silence it replaced.
     body.push(
-      `Showing the ${report.escalated.length} oldest of ${report.totalOverThreshold} past threshold; ${report.escalatedOmitted} ${report.escalatedOmitted === 1 ? "row is" : "rows are"} withheld by the cap and not listed below${formatPriorityBreakdown(report.omittedCountsByPriority)}.`,
+      `Showing ${report.escalated.length} of ${report.totalOverThreshold} past threshold; ${report.escalatedOmitted} ${report.escalatedOmitted === 1 ? "row is" : "rows are"} withheld by the cap and not listed below${formatPriorityBreakdown(report.omittedCountsByPriority)}.`,
     );
     const cutRow = report.escalated[report.escalated.length - 1];
     body.push(
       cutRow
-        ? `The cut is by age alone: priority sets each row's threshold but is not consulted here, so a past-threshold row quieter for less than ${formatAge(cutRow.humanSilenceDays)} does not appear whatever its priority or what it blocks.`
-        : "The cut is by age alone: priority sets each row's threshold but is not consulted here. The cap is 0, so no past-threshold row appears whatever its priority or what it blocks.",
+        ? `The cut is by priority first, then age: slots go to \`critical\` before \`high\` before \`medium\` before \`low\`, and to the longest-quiet row within each tier. Every withheld row is therefore of equal or lower priority than every row listed below, the last of which is ${sanitizeRenderedField(cutRow.priority, "unset")} at ${formatAge(cutRow.humanSilenceDays)}.`
+        : "The cut is by priority first, then age. The cap is 0, so no past-threshold row appears whatever its priority or what it blocks.",
     );
   }
 

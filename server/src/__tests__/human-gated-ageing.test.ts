@@ -511,21 +511,29 @@ describe("threshold and reporting", () => {
         maxEscalated: 2,
       });
 
-      // Age alone decides: the `low` row and the oldest `high` take both slots.
-      expect(report.escalated.map((row) => row.id)).toEqual(["low-ancient", "high-mid-0"]);
-      expect(report.omittedCountsByPriority).toEqual({ critical: 2, high: 2 });
+      // Priority decides, age breaks ties within a tier: both `critical` rows
+      // take the slots even though all four other rows are older.
+      expect(report.escalated.map((row) => row.id)).toEqual([
+        "critical-young-0",
+        "critical-young-1",
+      ]);
+      expect(report.omittedCountsByPriority).toEqual({ high: 3, low: 1 });
 
       const rendered = formatHumanGatedAgeingSections(report);
       expect(rendered).toContain("4 rows are withheld by the cap and not listed below");
-      expect(rendered).toContain("critical 2");
-      expect(rendered).toContain("high 2");
-      // Positive control: the breakdown must be of the *withheld* rows, not of
-      // the whole pool. The pool holds one `low`; the withheld set holds none,
-      // so a breakdown computed over `countsByPriority` would say "low 1" here.
-      expect(rendered).not.toContain("low 1");
+      expect(rendered).toContain("high 3");
+      expect(rendered).toContain("low 1");
+      // Positive control on the counting *method*, not just the total. The cut
+      // is taken from a reordered copy, so the withheld rows are no longer a
+      // contiguous tail of `overThreshold`. The old index test (`index >=
+      // escalated.length`) would walk that array in age order and attribute the
+      // omissions to the first two rows it saw — reporting `critical 2`, naming
+      // as withheld the two rows actually on display.
+      expect(rendered).not.toContain("critical 2");
+      expect(report.omittedCountsByPriority.critical).toBeUndefined();
     });
 
-    it("states the age below which no row appears, whatever its priority", () => {
+    it("states the rule the cut actually used, and the row it stopped at", () => {
       const report = selectAgedHumanGatedIssues(pooledByPriority(), {
         now: NOW,
         escalateAfterDaysByPriority: BY_PRIORITY,
@@ -533,9 +541,15 @@ describe("threshold and reporting", () => {
       });
 
       const rendered = formatHumanGatedAgeingSections(report);
-      expect(rendered).toContain("The cut is by age alone");
-      // 90.0d is the last printed row, so it is the real cut line.
-      expect(rendered).toContain("quieter for less than 90.0d does not appear");
+      expect(rendered).toContain("The cut is by priority first, then age");
+      // The marginal row is the second `critical` at 59.0d, not the oldest row
+      // in the pool. Stating it is what tells a reader what it takes to appear.
+      expect(rendered).toContain("the last of which is critical at 59.0d");
+      // The old age-only wording must be gone, not merely unasserted: a notice
+      // describing a rationing rule the selector no longer uses is worse than
+      // the silence it replaced.
+      expect(rendered).not.toContain("by age alone");
+      expect(rendered).not.toContain("oldest of");
     });
 
     it("does not emit a cut line it cannot measure when the cap is zero", () => {
@@ -565,25 +579,59 @@ describe("threshold and reporting", () => {
       expect(report.omittedCountsByPriority).toEqual({});
       const rendered = formatHumanGatedAgeingSections(report);
       expect(rendered).not.toContain("withheld by the cap");
-      expect(rendered).not.toContain("The cut is by age alone");
+      expect(rendered).not.toContain("The cut is by priority first");
       // Positive control: the rows really are all rendered, so the two absences
       // above are the cap not biting rather than an empty report.
       expect(rendered).toContain("CRITICAL-YOUNG-1");
     });
 
-    it("keeps selection unchanged — this is a reporting change only", () => {
+    it("promotes a critical row over older lower-priority rows (PEN-4489)", () => {
       const report = selectAgedHumanGatedIssues(pooledByPriority(), {
         now: NOW,
         escalateAfterDaysByPriority: BY_PRIORITY,
         maxEscalated: 2,
       });
 
-      // The withheld `critical` rows are named in the count and nowhere else:
-      // the cap still rations by age, and this change does not promote them.
+      // This is the defect the row was filed for, as a fixture: under the old
+      // flat age sort `low-ancient` (142d, the live PEN-188 shape — a `low` row
+      // whose title says it is off the critical path) and the oldest `high`
+      // took both slots, and the two `critical` rows 4x past their own 14d bar
+      // could not print at any age below the cut. Both now print.
       const rendered = formatHumanGatedAgeingSections(report);
-      expect(rendered).not.toContain("CRITICAL-YOUNG-0");
+      expect(rendered).toContain("CRITICAL-YOUNG-0");
+      expect(rendered).toContain("CRITICAL-YOUNG-1");
+      expect(rendered).not.toContain("LOW-ANCIENT");
       expect(report.totalOverThreshold).toBe(6);
       expect(report.escalated).toHaveLength(2);
+      // The cap is still a cap: interleaving changes who is rationed, not
+      // whether rationing happens.
+      expect(report.escalatedOmitted).toBe(4);
+    });
+
+    it("never withholds a row while showing a lower-priority one", () => {
+      // The property the ordering buys, asserted directly rather than through
+      // one fixture's ids: for every cap, the worst-priority row shown is no
+      // worse than the best-priority row withheld.
+      const rank = (priority: string | null | undefined) =>
+        ["critical", "high", "medium", "low"].indexOf(priority ?? "low");
+
+      for (const maxEscalated of [1, 2, 3, 4, 5]) {
+        const report = selectAgedHumanGatedIssues(pooledByPriority(), {
+          now: NOW,
+          escalateAfterDaysByPriority: BY_PRIORITY,
+          maxEscalated,
+        });
+        const shown = new Set(report.escalated);
+        const withheld = report.scanned.filter(
+          (row) =>
+            !shown.has(row) &&
+            row.humanSilenceDays > BY_PRIORITY[row.priority as keyof typeof BY_PRIORITY],
+        );
+        const worstShown = Math.max(...report.escalated.map((row) => rank(row.priority)));
+        const bestWithheld = Math.min(...withheld.map((row) => rank(row.priority)));
+        expect(report.escalated).toHaveLength(maxEscalated);
+        expect(worstShown).toBeLessThanOrEqual(bestWithheld);
+      }
     });
 
     it("sanitizes a hostile priority before it reaches the withheld breakdown", () => {

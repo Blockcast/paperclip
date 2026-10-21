@@ -498,7 +498,7 @@ export async function loadGateEvidence(
  * its age, rather than aged another day as if the gate were still live.
  *
  * PEN-3089 narrowed what that section *exempts*. Being resolved no longer
- * removes a row from the age-ranked list on its own: only a resolution that
+ * removes a row from the escalation list on its own: only a resolution that
  * left nothing owed does ({@link withheldFromAgeRankingIssueIds}). A gate that
  * resolved by the requester withdrawing the ask, or by the board granting work
  * nobody then performed, keeps the row escalated — those are the states where
@@ -533,7 +533,7 @@ export const humanGatedAgeingProducer: DigestProducer = {
     // rendered with its age, so `resolvedRows` drives the age map; only the
     // rows whose resolution left nothing owed are exempted from escalation, so
     // the narrower `withheld` drives the filter. Using one set for both is what
-    // let an ask the requester withdrew delete its row from the age-ranked list.
+    // let an ask the requester withdrew delete its row from the escalation list.
     const resolvedRows = resolvedButOpenIssueIds(revalidation);
     const withheld = withheldFromAgeRankingIssueIds(revalidation);
 
@@ -580,7 +580,7 @@ export const humanGatedAgeingProducer: DigestProducer = {
       markdown,
       // Item *mentions* across the two rendered sections, not distinct rows.
       // Before PEN-3089 the two addends were disjoint — every resolved-but-open
-      // row was withheld from the age-ranked list — so the sum was an exact row
+      // row was withheld from the escalation list — so the sum was an exact row
       // count. Now an action-owed resolved row is rendered in both sections and
       // counted twice, and since escalation also requires passing the silence
       // threshold, that overlap covers most of the newly-escalated population.
