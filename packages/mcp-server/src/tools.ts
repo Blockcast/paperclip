@@ -593,11 +593,31 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       z.object({ issueId: issueIdSchema }),
       async ({ issueId }) => client.requestJson("GET", `/issues/${encodeURIComponent(issueId)}/approvals`),
     ),
+    // PEN-4484: this list omits system documents by default, and nothing in the
+    // response says so. `[]` is byte-identical to "this issue has no
+    // documents", so the omission fails toward the reassuring direction and
+    // leaves no trace — a CEO run read `[]` on three issues and was about to
+    // publish "continuation summaries are not universal" off reads that could
+    // never have shown one. The HTTP route and the UI client have carried
+    // `includeSystem` since the filter landed; only this surface lacked it, and
+    // `makeTool` is `.strict()`, so a caller could not even pass it blind.
     makeTool(
       "paperclipListDocuments",
-      "List issue documents",
-      z.object({ issueId: issueIdSchema }),
-      async ({ issueId }) => client.requestJson("GET", `/issues/${encodeURIComponent(issueId)}/documents`),
+      "List issue documents. ⚠ SYSTEM DOCUMENTS ARE OMITTED BY DEFAULT, so this is NOT an enumeration of what the issue holds. Two keys are filtered out unless you pass `includeSystem: true`: `continuation-summary` — the resume surface a waking run reads first, and the most-read document type there is — and `pipeline-case-body`. The omission is silent and fails toward 'nothing there': a short list, or `[]`, is indistinguishable at the call site from an issue that genuinely has no documents, and no field reports that a key was filtered. **Never conclude 'this issue has no continuation summary' from this call.** Measured on PEN-2111, which returned exactly 2 documents (`plan`, `vault-binding-lifetime-policy`) while its `continuation-summary` stood at revision 167 and was returned by both paperclipGetDocument and paperclipGetHeartbeatContext. Any audit, migration or staleness sweep that enumerates documents through this tool MUST pass `includeSystem: true`, or it silently skips those keys and reports clean. The filter is presentation-only and not an authorization boundary — paperclipGetDocument applies no filter at all and returns a system document to any caller that already knows its literal key.",
+      z.object({
+        issueId: issueIdSchema,
+        includeSystem: z
+          .boolean()
+          .optional()
+          .describe(
+            "Include system-generated documents (`continuation-summary`, `pipeline-case-body`) in the result. Defaults to FALSE, in which case those keys are absent from the list with no marker saying so. Pass true for any enumeration, audit or sweep whose conclusion depends on the list being complete.",
+          ),
+      }),
+      async ({ issueId, includeSystem }) =>
+        client.requestJson(
+          "GET",
+          `/issues/${encodeURIComponent(issueId)}/documents${includeSystem ? "?includeSystem=true" : ""}`,
+        ),
     ),
     makeTool(
       "paperclipGetDocument",

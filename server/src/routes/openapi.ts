@@ -2019,8 +2019,24 @@ registry.registerPath({
   method: "get",
   path: "/api/issues/{id}/documents",
   tags: ["issues"],
-  summary: "List issue documents",
-  request: { params: z.object({ id: z.string() }) },
+  summary: "List issue documents (system documents omitted unless includeSystem=true)",
+  // PEN-4484: the filter was undiscoverable from the contract as well as from
+  // the response, so a caller had no way to learn the param exists.
+  description:
+    "System-generated documents (`continuation-summary`, `pipeline-case-body`) are filtered out " +
+    "unless `includeSystem=true`. The response carries no marker saying a key was filtered, so a " +
+    "short list or `[]` must not be read as 'this issue has no documents'. The filter is " +
+    "presentation-only, not an authorization boundary: `GET /api/issues/{id}/documents/{key}` " +
+    "returns a system document to any caller permitted to read the issue.",
+  request: {
+    params: z.object({ id: z.string() }),
+    query: z.object({
+      includeSystem: z
+        .enum(["true", "false"])
+        .optional()
+        .describe("Set to \"true\" to include system-generated documents. Defaults to false."),
+    }),
+  },
   responses: { 200: r.ok(), 401: r.unauthorized },
 });
 
