@@ -6710,7 +6710,11 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         // already runs, against a per-issue round trip inside the hot path.
         parkedUntil: issues.parkedUntil,
       })
-      .from(issues);
+      // BLO-47034/BLO-48178: filter in SQL (unique `issues_identifier_idx`).
+      // This used to load every issue in every company and filter in JS --
+      // ~3s per delivery, the dominant DB cost during check_run bursts.
+      .from(issues)
+      .where(inArray(issues.identifier, context.identifiers.length > 0 ? context.identifiers : [""]));
     const matched = matchedIssues.filter(
       (row) => row.identifier && context.identifiers.includes(row.identifier),
     );
