@@ -19,6 +19,13 @@ export default defineConfig({
   },
   test: {
     globals: true,
+    // BLO-48145: many suites (env-guard, prompt-cache, runtime-pin) spawn real
+    // node processes, so their wall time follows runner load rather than the
+    // code under test. On oversubscribed CI runners single spawns have taken
+    // >5 s, tripping vitest's 5 s default and ejecting unrelated PRs from the
+    // merge queue. 30 s still fails a hang in async code; a hung `spawnSync`
+    // child blocks the event loop, so no vitest timeout can interrupt it.
+    testTimeout: 30_000,
     include: ["src/**/*.test.ts"],
     coverage: {
       reporter: ["text", "lcov"],

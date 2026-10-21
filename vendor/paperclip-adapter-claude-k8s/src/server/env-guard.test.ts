@@ -4,7 +4,7 @@ import type { AddressInfo } from "node:net";
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 
 import {
   ENV_GUARD_SCRIPT,
@@ -13,16 +13,6 @@ import {
   buildEnvGuardSetupShell,
   classifyAgentShellCommand,
 } from "./env-guard.js";
-
-// BLO-48145: most cases here spawn real node processes (some ten in a row), so
-// their wall time scales with runner load, not with the code under test. Idle,
-// the slowest case takes ~1.7 s; on an oversubscribed CI runner one spawn alone
-// has taken >5 s, which tripped vitest's 5 s default and ejected unrelated PRs
-// from the merge queue. For the async `spawn` cases 30 s still fails a genuine
-// hang (every network call the guard makes is capped at 10 s by
-// AbortSignal.timeout in env-guard.ts). The `spawnSync` cases block the event
-// loop, so no vitest timeout can interrupt a hung child there, at 5 s or 30 s.
-vi.setConfig({ testTimeout: 30_000 });
 
 const blocked = [
   "env",
