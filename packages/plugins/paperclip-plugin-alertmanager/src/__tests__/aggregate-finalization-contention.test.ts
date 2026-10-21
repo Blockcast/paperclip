@@ -525,9 +525,26 @@ describe("PEN-4405 — a resolution refused by its own aggregate", () => {
       [COMPANY_ID, AGGREGATE_KEY, "foreign-firing-token"],
     );
 
+    // Virtual clock: `sleep` advances fake time instead of waiting, and jitter
+    // is pinned, so one budget admits a fixed number of sleeps however slow the
+    // DB round-trips are. Counting sleeps inside a wall-clock budget was not a
+    // stable proxy for budgets spent (BLO-48051).
+    const virtualPolicy = (onSleep: () => void) => {
+      let t = 0;
+      return fastPolicy({
+        budgetMs: 60,
+        now: () => t,
+        random: () => 1,
+        sleep: async (ms) => {
+          onSleep();
+          t += ms;
+          await new Promise((r) => setImmediate(r));
+        },
+      });
+    };
+
     const { ctx } = mkCtx(store);
-    const budgets: number[] = [];
-    let spentInCurrentBudget = 0;
+    let batchSleeps = 0;
     await expect(
       deliver(
         ctx,
@@ -539,16 +556,11 @@ describe("PEN-4405 — a resolution refused by its own aggregate", () => {
           status: "firing",
         },
         "req-memo",
-        fastPolicy({
-          budgetMs: 60,
-          sleep: async (ms) => {
-            spentInCurrentBudget += 1;
-            await new Promise((r) => setTimeout(r, ms));
-          },
+        virtualPolicy(() => {
+          batchSleeps += 1;
         }),
       ),
     ).rejects.toThrow();
-    budgets.push(spentInCurrentBudget);
 
     // The firing alert spends the budget and marks the key; the resolved alert
     // that follows gets one attempt and no wait. So the delivery slept for ONE
@@ -561,12 +573,8 @@ describe("PEN-4405 — a resolution refused by its own aggregate", () => {
         soloCtx,
         payload("resolved"),
         "req-memo-solo",
-        fastPolicy({
-          budgetMs: 60,
-          sleep: async (ms) => {
-            soloSleeps += 1;
-            await new Promise((r) => setTimeout(r, ms));
-          },
+        virtualPolicy(() => {
+          soloSleeps += 1;
         }),
       ),
     ).rejects.toThrow(/could not be processed/);
@@ -574,12 +582,12 @@ describe("PEN-4405 — a resolution refused by its own aggregate", () => {
       "finalization is held in phase 'firing'",
     );
 
-    expect(
-      budgets[0],
-      `a two-alert batch against one wedged key slept ${budgets[0]} times, versus ` +
-        `${soloSleeps} for a single alert spending one budget alone; the shared ` +
-        `wedged memo must keep the batch at roughly one budget, not two`,
-    ).toBeLessThanOrEqual(soloSleeps * 2);
     expect(soloSleeps).toBeGreaterThan(0);
+    expect(
+      batchSleeps,
+      `a two-alert batch against one wedged key slept ${batchSleeps} times, versus ` +
+        `${soloSleeps} for a single alert spending one budget alone; the shared ` +
+        `wedged memo must keep the batch at exactly one budget, not two`,
+    ).toBe(soloSleeps);
   });
 });
