@@ -32,7 +32,13 @@ import {
   resolveScopedWritableMounts,
 } from "./job-manifest.js";
 import type { JobIsolation } from "./job-manifest.js";
-import { DEFAULT_CLAUDE_CODE_VERSION } from "./runtime-pin.js";
+import {
+  DEFAULT_CLAUDE_CODE_VERSION,
+  IMAGE_WRAPPER_BINARIES,
+  IMAGE_WRAPPER_PATH_RESOLVED,
+  IMAGE_WRAPPER_PREFLIGHT_MISSING,
+  IMAGE_WRAPPER_PREFLIGHT_OK,
+} from "./runtime-pin.js";
 import type { SelfPodInfo } from "./k8s-client.js";
 
 // PEN-4357: resolved once, as an absolute path, so the bash-resolution cases
@@ -1275,6 +1281,12 @@ describe("buildJobManifest", () => {
       // but the coupling runs the other way too, so an unrelated file can redden
       // this assertion. If that happens the fix is to classify the new call, not
       // to narrow this match back to the block.
+      // The preflight's `for ... in <binaries>; do` lists, from `git` onward:
+      // the regex can only match at the first list entry that IS `git`, and
+      // everything before it in the list is consumed by the preceding text.
+      const preflightOperandTails = [IMAGE_WRAPPER_BINARIES, IMAGE_WRAPPER_PATH_RESOLVED].map((names) =>
+        names.slice(names.indexOf("git")).join(" "),
+      );
       const unclassifiedGitCalls = [...command.matchAll(/(?<![-.`\w])git\b/g)]
         .map((m) => command.slice(m.index))
         .filter(
@@ -1282,7 +1294,15 @@ describe("buildJobManifest", () => {
             // The three shapes this block is allowed to use.
             !call.startsWith(`git -C '${workspaceRoot}'`) &&
             !call.startsWith(`git -C '${sourceCheckout}'`) &&
-            !call.startsWith("git clone "),
+            !call.startsWith("git clone ") &&
+            // PEN-4446: not calls at all. The wrapper preflight names its
+            // binaries as `for` operands, so `git` appears here as a DATA
+            // value in a list, never in command position — there is nothing to
+            // bound. Derived from the exported constants rather than written
+            // out, so reordering or extending that list carries the exemption
+            // with it, while a genuine `git` call added to the preflight still
+            // lands in this assertion.
+            !preflightOperandTails.some((tail) => call.startsWith(tail)),
         )
         .map((call) => call.slice(0, 60));
       expect(unclassifiedGitCalls).toEqual([]);
@@ -2792,6 +2812,35 @@ describe("buildJobManifest", () => {
       expect(command).not.toContain("__pcver=");
       expect(command).not.toContain("paperclip-k8s-runtimes");
       expect(command).toMatch(/^set -o pipefail; .*\(command -v ccrotate .*cat \/tmp\/prompt\/prompt\.txt \| claude /);
+    });
+
+    it("states this image's GitHub-wrapper verdict before any stage can reach GitHub (PEN-4446)", () => {
+      const built = buildJobManifest({ ctx, selfPod });
+      const command = built.job.spec?.template?.spec?.containers[0]?.command?.[2] ?? "";
+      const preflightIdx = command.indexOf("__pcwrapdir=");
+      expect(preflightIdx).toBeGreaterThan(-1);
+      // Both verdict markers are in the emitted string, so an operator alert
+      // keyed to either is pinned by this assertion rather than by prose.
+      expect(command).toContain(IMAGE_WRAPPER_PREFLIGHT_OK);
+      expect(command).toContain(IMAGE_WRAPPER_PREFLIGHT_MISSING);
+      // First stage after `set -o pipefail`. `workspaceSetup` runs `git fetch`
+      // against origin, so a verdict emitted later would be describing a pod
+      // that had already made unscrubbed egress.
+      expect(command.indexOf("set -o pipefail;")).toBe(0);
+      for (const later of ['GUARD_DIR="', "__pcver=", "ccrotate next", "cat /tmp/prompt/prompt.txt"]) {
+        expect(command.indexOf(later)).toBeGreaterThan(preflightIdx);
+      }
+    });
+
+    it('runs the wrapper preflight even when claudeCodeVersion is "image" (PEN-4446)', () => {
+      // The preflight must not ride along inside the runtime bootstrap, whose
+      // string is empty on this config — and a pre-cutover image is exactly
+      // the thing most likely to be pinned to the legacy bundled-CLI path.
+      ctx.config = { claudeCodeVersion: "image" };
+      const built = buildJobManifest({ ctx, selfPod });
+      const command = built.job.spec?.template?.spec?.containers[0]?.command?.[2] ?? "";
+      expect(command).not.toContain("__pcver=");
+      expect(command).toContain("__pcwrapdir=");
     });
 
     it("rejects a non-exact version instead of interpolating it into the shell", () => {

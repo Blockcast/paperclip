@@ -1,7 +1,7 @@
 import { createHash } from "crypto";
 import { readFileSync } from "node:fs";
 import path from "node:path";
-import { buildOpencodeRuntimeShell, IMAGE_WRAPPER_BIN_DIR, resolveOpencodeVersion } from "./runtime-pin.js";
+import { buildImageWrapperPreflightShell, buildOpencodeRuntimeShell, IMAGE_WRAPPER_BIN_DIR, resolveOpencodeVersion } from "./runtime-pin.js";
 import type * as k8s from "@kubernetes/client-node";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import {
@@ -1571,7 +1571,14 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const opencodeRuntime = opencodeVersion
     ? `${buildOpencodeRuntimeShell({ version: opencodeVersion, dataMountPath: workspaceMountPath })}; `
     : "";
-  const baseMainCommand = `set -o pipefail; ${isolatedRuntimePrep}${opencodeRuntime}${workspaceSetup}${credentialSetup}${envGuardPluginSetup}${configSetup}${dbResetGuard}${compactPrefix}${sharedDocsBridge}mkdir -p $(dirname ${shellQuote(podLogPath)}) && : > ${shellQuote(podLogPath)} && cat /tmp/prompt/prompt.txt | ${launcherCommand} ${opencodeArgsEscaped} | tee -a ${shellQuote(podLogPath)}`;
+  // PEN-4446: state, in this pod's own log, whether this image carries the
+  // root-owned GitHub egress wrappers and whether they win resolution. Placed
+  // ahead of `workspaceSetup` because that stage already runs `git` against
+  // origin, so a verdict emitted after it would describe a pod that had
+  // already made unscrubbed egress. Unconditional by design: it must cover the
+  // `opencodeVersion: "image"` runs too, where `opencodeRuntime` is empty.
+  const imageWrapperPreflight = buildImageWrapperPreflightShell();
+  const baseMainCommand = `set -o pipefail; ${imageWrapperPreflight}; ${isolatedRuntimePrep}${opencodeRuntime}${workspaceSetup}${credentialSetup}${envGuardPluginSetup}${configSetup}${dbResetGuard}${compactPrefix}${sharedDocsBridge}mkdir -p $(dirname ${shellQuote(podLogPath)}) && : > ${shellQuote(podLogPath)} && cat /tmp/prompt/prompt.txt | ${launcherCommand} ${opencodeArgsEscaped} | tee -a ${shellQuote(podLogPath)}`;
   // Redirect Chrome's BrowserMetrics spool off the shared CephFS HOME to the
   // main container's per-pod runtime-cache emptyDir. The
   // agent-browser designer tool launches system Chrome with the default

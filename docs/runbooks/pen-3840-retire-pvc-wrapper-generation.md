@@ -205,6 +205,33 @@ All four must be true. Measure them; do not assume.
    > pre-cutover) forever and never run `gh`. Counting them makes this
    > precondition unsatisfiable by construction. Scope to agent Jobs, as above.
 
+   > **Since PEN-4446 this precondition has a standing answer; prefer it.**
+   > Every agent Job now runs the filesystem check above on itself, at startup,
+   > and writes one verdict line to its pod log:
+   >
+   > ```text
+   > [paperclip] github-egress-wrappers ok dir=/usr/local/libexec/paperclip/bin
+   > [paperclip] github-egress-wrappers MISSING dir=... absent:...
+   > [paperclip] github-egress-wrappers NOT-ON-PATH dir=... resolved:...
+   > ```
+   >
+   > That is the same question this precondition asks, asked by the pod rather
+   > than by an operator, so it covers forks, `@sha256:` digest pins and tags
+   > whose commits were rewritten — every reference the ancestry check cannot
+   > place. It also removes the race that made the manual form fail: `exec`
+   > needs a **Running** pod on the reference, and the reference you most want
+   > to check is typically the one whose pods have already been reaped.
+   > Measured 2026-10-21 — `sha-3ec50bd` ran 150 samples, resolved to no commit
+   > in `Blockcast/paperclip`, and by the time it was investigated had no
+   > Running pod left, so it is now **permanently unclassifiable** by either
+   > route that existed before.
+   >
+   > A `MISSING` verdict is the live PEN-2527 regression this precondition
+   > exists to prevent. The preflight reports it and does not refuse — see the
+   > `buildImageWrapperPreflightShell` docblock in both adapters'
+   > `runtime-pin.ts` for why, and for what evidence would justify escalating
+   > to fail-closed.
+
 3. **No agent Job is on a broad read-write data mount.** A broad-mount Job is
    one that *could* be relying on these files being writable:
 
@@ -314,3 +341,6 @@ and should be treated as one.
   shell-dotfile stanza a no-op by construction.
 - PEN-4367 — the agent-writable shell dotfiles, which this does not close.
 - BLO-32734 — the read-only data mount plus `subPath` narrowing relied on above.
+- PEN-4446 — the standing per-Job wrapper preflight that replaces precondition 2's
+  hand-run census, and the carrier for the cross-company images this runbook
+  cannot enumerate.

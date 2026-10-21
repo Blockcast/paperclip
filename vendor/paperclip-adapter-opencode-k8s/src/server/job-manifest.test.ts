@@ -2088,14 +2088,20 @@ describe("buildJobManifest — adapter-managed OpenCode runtime (opencodeVersion
   const shell = (r: ReturnType<typeof buildJobManifest>) =>
     r.job.spec?.template?.spec?.containers?.find((c) => c.name === "opencode")?.command?.[2] ?? "";
 
-  it("bootstraps the default pin right after pipefail and before every opencode call", () => {
+  it("bootstraps the default pin right after the wrapper preflight and before every opencode call", () => {
     const built = buildJobManifest({ ctx: mockCtx, selfPod: mockSelfPod });
     const command = shell(built);
     expect(built.opencodeVersion).toBe(DEFAULT_OPENCODE_VERSION);
     // The main command opens with the Chrome BrowserMetrics redirect (and the
-    // DinD wait when enabled); the runtime bootstrap is the first thing after
-    // `set -o pipefail;` so every later `opencode` resolves through its PATH.
-    expect(command).toContain("set -o pipefail; __pover=");
+    // DinD wait when enabled); then `set -o pipefail;`, then PEN-4446's
+    // GitHub-wrapper preflight, then the runtime bootstrap — so every later
+    // `opencode` resolves through its PATH. The preflight takes the first slot
+    // because it must report before any stage can reach GitHub; it exports
+    // nothing and unsets its own scratch, so it cannot perturb the bootstrap.
+    expect(command).toContain("set -o pipefail; __pcwrapdir=");
+    const preflightIdx = command.indexOf("__pcwrapdir=");
+    expect(preflightIdx).toBeGreaterThan(-1);
+    expect(command.indexOf("__pover=")).toBeGreaterThan(preflightIdx);
     expect(command).toContain(`__pover='${DEFAULT_OPENCODE_VERSION}'`);
     expect(command).toContain(poroot("/paperclip"));
     // PEN-3925: the bootstrap re-asserts the wrapper ordering instead of
