@@ -3,6 +3,7 @@ export * from "./acp.js";
 export { getConfigSchema } from "./config-schema.js";
 export { listClaudeSkills, syncClaudeSkills } from "./skills.js";
 export {
+  acceptsClaudeModelForConfig,
   isBedrockAdapterConfig,
   listClaudeModels,
   listClaudeModelsForConfig,

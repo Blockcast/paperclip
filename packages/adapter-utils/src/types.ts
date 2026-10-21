@@ -486,18 +486,40 @@ export interface ServerAdapterModule {
    *
    * `listModels()` answers "what should the picker show on this server", which
    * is a different question from "may this agent be written with this model id"
-   * whenever the admissible set depends on the agent's own environment. The
-   * Claude adapters are the worked example: both swap their whole registry for
-   * Bedrock-native ids when `CLAUDE_CODE_USE_BEDROCK` / `ANTHROPIC_BEDROCK_BASE_URL`
-   * is set, and for a pod-per-agent adapter that variable can come from the
-   * agent's own `adapterConfig.env`, which outranks the server's env in the pod.
-   * Validating such an agent against `listModels()` alone would refuse a model
-   * id that is correct for the lane it runs on.
+   * in two ways.
    *
-   * Return the complete set admissible for this config. When absent the server
-   * falls back to `listModels()` / `models`.
+   * It depends on the agent's own environment. The Claude adapters are the
+   * worked example: both swap their whole registry for Bedrock-native ids when
+   * `CLAUDE_CODE_USE_BEDROCK` / `ANTHROPIC_BEDROCK_BASE_URL` is set, and for a
+   * pod-per-agent adapter that variable can come from the agent's own
+   * `adapterConfig.env`, which outranks the server's env in the pod.
+   *
+   * And it is WIDER than the picker. A picker should show canonical ids; a
+   * runtime typically also accepts aliases and legacy spellings (`claude
+   * --model opus` is valid and is in no registry). Return everything the
+   * runtime accepts and can be enumerated, aliases included — the server uses
+   * this list for admission and for naming the valid set in its refusal, and
+   * never for the picker.
+   *
+   * When absent the server falls back to `listModels()` / `models`.
    */
   listModelsForConfig?: (adapterConfig: Record<string, unknown>) => Promise<AdapterModel[]>;
+  /**
+   * Optional: accept a model id that cannot be enumerated.
+   *
+   * Some admissible ids are a SHAPE rather than a member of a list — Bedrock
+   * inference profiles carry a region prefix (`us.` / `eu.` / `apac.`) and may
+   * be a full `arn:aws:bedrock:` ARN, so no list can cover them. Return true
+   * for an id this config's runtime will accept; the server consults it only
+   * after list membership has already failed, so it can only widen admission.
+   *
+   * Keep it as narrow as the runtime is. Returning true unconditionally is the
+   * same as not declaring `modelRegistryIsClosed` at all, but less legible.
+   */
+  acceptsModelForConfig?: (
+    model: string,
+    adapterConfig: Record<string, unknown>,
+  ) => boolean | Promise<boolean>;
   /**
    * Declares that the resolved model registry is the COMPLETE admissible set,
    * so the server may refuse a write naming a model outside it (PEN-4447).
@@ -508,8 +530,18 @@ export interface ServerAdapterModule {
    * adapters discover models from a live provider API or a CLI and fall back to
    * a static list when that lookup fails, so for them a missing id means
    * "discovery is down", not "invalid" — refusing those writes would trade a
-   * late failure for an immediate wrong one. Only declare this where the list
-   * genuinely enumerates everything the runtime accepts.
+   * late failure for an immediate wrong one.
+   *
+   * Declare this only once admission — `listModelsForConfig` plus
+   * `acceptsModelForConfig` together, not the picker list — covers every id
+   * your runtime accepts. A registry that merely covers the ids an operator
+   * *usually* picks is not closed: the gap shows up as a 422 on a configuration
+   * that boots fine. Aliases and non-enumerable id shapes are the two that get
+   * missed; check for both before declaring.
+   *
+   * The server only ever applies this to a model id the write INTRODUCES. An id
+   * already stored on the agent is tolerated, so a registry that has since
+   * narrowed cannot wedge an agent out of unrelated repairs.
    */
   modelRegistryIsClosed?: boolean;
   agentConfigurationDoc?: string;

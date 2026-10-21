@@ -203,12 +203,19 @@ describe("PATCH /agents/:id refuses an unregistered model (PEN-4447)", () => {
       typeof import("../adapters/model-validation.js")
     >("../adapters/model-validation.js");
     mockFindUnregisteredAdapterModel.mockImplementation(
-      async (adapterType: string | null | undefined, adapterConfig: Record<string, unknown>) =>
+      async (
+        adapterType: string | null | undefined,
+        adapterConfig: Record<string, unknown>,
+        previous?: { adapterType?: string | null; adapterConfig?: Record<string, unknown> | null } | null,
+      ) =>
         findUnregisteredModel({
           adapterType: adapterType ?? "",
           model: adapterConfig.model,
           registry: (REGISTRIES[adapterType ?? ""] ?? []).map((id) => ({ id })),
           registryIsClosed: Boolean(REGISTRIES[adapterType ?? ""]),
+          previous: previous
+            ? { adapterType: previous.adapterType, model: previous.adapterConfig?.model }
+            : null,
           env: {},
         }),
     );
@@ -250,6 +257,12 @@ describe("PATCH /agents/:id refuses an unregistered model (PEN-4447)", () => {
         model: "claude-haiku-4-6",
         env: expect.objectContaining({ CLAUDE_CONFIG_DIR: "/tmp/claude" }),
       }),
+      // ...and the stored pair, so the check can tell an id this write
+      // INTRODUCES from the one the agent already had.
+      expect.objectContaining({
+        adapterType: "claude_k8s",
+        adapterConfig: expect.objectContaining({ model: "claude-opus-5" }),
+      }),
     );
   });
 
@@ -281,6 +294,35 @@ describe("PATCH /agents/:id refuses an unregistered model (PEN-4447)", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(mockFindUnregisteredAdapterModel).not.toHaveBeenCalled();
+  });
+
+
+  it("lets an agent already on an unregistered model take an unrelated adapterConfig write", async () => {
+    // Ally's finding on #2901: validating the stored id too would 422 every
+    // repair on a lane whose model has since left the registry.
+    mockAgentService.getById.mockResolvedValue(
+      makeAgent({ adapterConfig: { model: "claude-haiku-4-5" } }),
+    );
+
+    const res = await requestApp(await createApp(), (baseUrl) => request(baseUrl)
+      .patch(`/api/agents/${AGENT_ID}?companyId=company-1`)
+      .send({ adapterConfig: { model: "claude-haiku-4-5", cwd: "/repaired/path" } }));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockAgentService.update).toHaveBeenCalled();
+  });
+
+  it("still refuses a CHANGE away from that stored model to another unregistered one", async () => {
+    mockAgentService.getById.mockResolvedValue(
+      makeAgent({ adapterConfig: { model: "claude-haiku-4-5" } }),
+    );
+
+    const res = await requestApp(await createApp(), (baseUrl) => request(baseUrl)
+      .patch(`/api/agents/${AGENT_ID}?companyId=company-1`)
+      .send({ adapterConfig: { model: "claude-mythos-5" } }));
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(mockAgentService.update).not.toHaveBeenCalled();
   });
 
   it("refuses an unregistered model inside a runtimeConfig model profile", async () => {

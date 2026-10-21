@@ -19,6 +19,31 @@ const BEDROCK_MODELS: AdapterModel[] = [
   { id: "us.anthropic.claude-haiku-4-5-20251001-v1:0", label: "Bedrock Haiku 4.5" },
 ];
 
+/**
+ * Aliases the Claude CLI resolves itself (`claude --model opus`). They are
+ * deliberately absent from `models`, which feeds the model picker and should
+ * show canonical ids — but they ARE valid configuration, so admission has to
+ * include them or a working lane gets a 422 on its next write.
+ */
+const CLI_ALIASES = ["opus", "sonnet", "haiku", "opusplan"] as const;
+
+const CLI_ALIAS_MODELS: AdapterModel[] = CLI_ALIASES.flatMap((alias) => [
+  { id: alias, label: `${alias} (CLI alias)` },
+  { id: `${alias}[1m]`, label: `${alias} (CLI alias, 1M)` },
+]);
+
+/**
+ * Dated spellings the CLI accepts and `models` does not carry.
+ *
+ * Discovery would supply these from `/v1/models`, but it only runs when an
+ * `ANTHROPIC_API_KEY` is present — a subscription/OAuth lane validates against
+ * the static fallback alone, where they are missing.
+ */
+const DATED_MODELS: AdapterModel[] = [
+  { id: "claude-sonnet-4-5-20250929", label: "Claude Sonnet 4.5 (dated)" },
+  { id: "claude-haiku-4-5-20251001", label: "Claude Haiku 4.5 (dated)" },
+];
+
 let cached: { keyFingerprint: string; baseUrl: string; expiresAt: number; models: AdapterModel[] } | null = null;
 
 function isBedrockValues(values: {
@@ -210,7 +235,24 @@ export async function refreshClaudeModels(): Promise<AdapterModel[]> {
 export async function listClaudeModelsForConfig(
   adapterConfig: Record<string, unknown>,
 ): Promise<AdapterModel[]> {
-  return loadClaudeModels({ bedrock: isBedrockAdapterConfig(adapterConfig) });
+  const discovered = await loadClaudeModels({ bedrock: isBedrockAdapterConfig(adapterConfig) });
+  return dedupeModels([...discovered, ...CLI_ALIAS_MODELS, ...DATED_MODELS]);
+}
+
+/**
+ * Accept an id no list can enumerate.
+ *
+ * Bedrock inference profiles are region-prefixed (`us.` / `eu.` / `apac.`) and
+ * may be a full ARN, so `BEDROCK_MODELS` is a convenience list and never the
+ * admissible set. Gated on the config actually resolving to Bedrock: a
+ * Bedrock-shaped id on a direct lane is still a real mistake.
+ */
+export function acceptsClaudeModelForConfig(
+  model: string,
+  adapterConfig: Record<string, unknown>,
+): boolean {
+  if (!isBedrockAdapterConfig(adapterConfig)) return false;
+  return isBedrockModelId(model.trim());
 }
 
 export function resetClaudeModelsCacheForTests() {
@@ -220,5 +262,7 @@ export function resetClaudeModelsCacheForTests() {
 /** Check whether a model ID is a Bedrock-native identifier (not an Anthropic API short name). */
 /** Bedrock model IDs use region-qualified prefixes (e.g. us.anthropic.*, eu.anthropic.*) or ARNs. */
 export function isBedrockModelId(model: string): boolean {
-  return /^\w+\.anthropic\./.test(model) || model.startsWith("arn:aws:bedrock:");
+  // The region prefix is optional: `anthropic.claude-...` is a valid bare
+  // Bedrock model id, not only `us.anthropic.claude-...`.
+  return /^(\w+\.)?anthropic\./.test(model) || model.startsWith("arn:aws:bedrock:");
 }

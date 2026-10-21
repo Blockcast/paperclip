@@ -1546,6 +1546,7 @@ export function agentRoutes(
     adapterType: string | null | undefined;
     adapterConfig: Record<string, unknown>;
     constraintAdapterConfig?: Record<string, unknown>;
+    previous?: { adapterType?: string | null; adapterConfig?: Record<string, unknown> | null } | null;
     actor?: { userId?: string | null; agentId?: string | null };
   }): Promise<Record<string, unknown>> {
     const normalizedAdapterConfig = await secretsSvc.normalizeAdapterConfigForPersistence(
@@ -1562,6 +1563,7 @@ export function agentRoutes(
       input.constraintAdapterConfig
         ? { ...input.constraintAdapterConfig, ...normalizedAdapterConfig }
         : normalizedAdapterConfig,
+      input.previous,
     );
     return normalizedAdapterConfig;
   }
@@ -1572,6 +1574,7 @@ export function agentRoutes(
     runtimeConfig: Record<string, unknown>,
     baseAdapterConfig: Record<string, unknown>,
     actor?: { userId?: string | null; agentId?: string | null },
+    previous?: { adapterType?: string | null; runtimeConfig?: unknown } | null,
   ): Promise<Record<string, unknown>> {
     const entries = listRuntimeModelProfileAdapterConfigs(runtimeConfig);
     if (entries.length === 0) return runtimeConfig;
@@ -1585,6 +1588,11 @@ export function agentRoutes(
     for (const entry of entries) {
       const adapterProfile = adapterModelProfiles.find((profile) => profile.key === entry.profileKey);
       const adapterDefaultConfig = asRecord(adapterProfile?.adapterConfig) ?? {};
+      const previousProfileAdapterConfig = previous
+        ? asRecord(
+          asRecord(asRecord(previous.runtimeConfig)?.modelProfiles)?.[entry.profileKey],
+        )?.adapterConfig
+        : undefined;
       const normalizedAdapterConfig = await normalizeMediatedAdapterConfigForPersistence({
         companyId,
         adapterType,
@@ -1594,6 +1602,11 @@ export function agentRoutes(
           ...baseAdapterConfig,
           ...adapterDefaultConfig,
         },
+        // A profile's model is introduced relative to the SAME profile's stored
+        // config, not the agent's top-level one.
+        previous: previous
+          ? { adapterType: previous.adapterType, adapterConfig: asRecord(previousProfileAdapterConfig) ?? null }
+          : null,
       });
       normalizedModelProfiles[entry.profileKey] = {
         ...entry.profile,
@@ -1689,12 +1702,18 @@ export function agentRoutes(
   async function assertAdapterConfigConstraints(
     adapterType: string | null | undefined,
     adapterConfig: Record<string, unknown>,
+    previous?: { adapterType?: string | null; adapterConfig?: Record<string, unknown> | null } | null,
   ) {
     // PEN-4447: a model id the target adapter does not register is accepted
     // here and then kills the lane at its next pod boot, so refuse it at the
     // write instead. Runs for every adapter that declares a closed registry,
     // and is a no-op for the rest — see adapters/model-validation.ts.
-    const unregisteredModel = await findUnregisteredAdapterModel(adapterType, adapterConfig);
+    //
+    // `previous` is what the agent already stores. Only an id this write
+    // INTRODUCES is refused; one already on the agent is tolerated, so a
+    // registry that has since narrowed cannot wedge the agent out of unrelated
+    // repairs. Creates pass no `previous`, so everything they set is new.
+    const unregisteredModel = await findUnregisteredAdapterModel(adapterType, adapterConfig, previous);
     if (unregisteredModel) {
       throw unprocessable(describeUnregisteredModel(unregisteredModel));
     }
@@ -3887,6 +3906,7 @@ export function agentRoutes(
         adapterType: requestedAdapterType,
         adapterConfig: effectiveAdapterConfig,
         actor: req.actor,
+        previous: { adapterType: existing.adapterType, adapterConfig: existingAdapterConfig },
       });
       // Normalization can turn a plain schema-secret value into a managed
       // secret_ref. Check the result as well as the raw request so that a
@@ -3958,6 +3978,7 @@ export function agentRoutes(
         requestedRuntimeConfig,
         baseAdapterConfig,
         req.actor,
+        { adapterType: existing.adapterType, runtimeConfig: existing.runtimeConfig },
       );
     }
     if (touchesAdapterConfiguration || Object.prototype.hasOwnProperty.call(patchData, "defaultEnvironmentId")) {

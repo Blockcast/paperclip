@@ -55,6 +55,16 @@ function readVendoredModelIds(constName: string): string[] {
 const K8S_DIRECT_MODEL_IDS = readVendoredModelIds("DIRECT_MODELS");
 const K8S_BEDROCK_MODEL_IDS = readVendoredModelIds("BEDROCK_MODELS");
 
+const CLI_ALIASES = ["opus", "sonnet", "haiku", "opusplan"];
+
+function isBedrockStub(adapterConfig: Record<string, unknown>): boolean {
+  const env =
+    typeof adapterConfig.env === "object" && adapterConfig.env !== null
+      ? (adapterConfig.env as Record<string, unknown>)
+      : {};
+  return env.CLAUDE_CODE_USE_BEDROCK === "1";
+}
+
 function asModels(ids: string[]): AdapterModel[] {
   return ids.map((id) => ({ id, label: id }));
 }
@@ -71,14 +81,13 @@ function claudeK8sStub(overrides: Partial<ServerAdapterModule> = {}): ServerAdap
     testEnvironment: vi.fn(),
     models: asModels(K8S_DIRECT_MODEL_IDS),
     listModels: async () => asModels(K8S_DIRECT_MODEL_IDS),
-    listModelsForConfig: async (adapterConfig: Record<string, unknown>) => {
-      const env =
-        typeof adapterConfig.env === "object" && adapterConfig.env !== null
-          ? (adapterConfig.env as Record<string, unknown>)
-          : {};
-      const bedrock = env.CLAUDE_CODE_USE_BEDROCK === "1";
-      return asModels(bedrock ? K8S_BEDROCK_MODEL_IDS : K8S_DIRECT_MODEL_IDS);
-    },
+    listModelsForConfig: async (adapterConfig: Record<string, unknown>) =>
+      asModels([
+        ...(isBedrockStub(adapterConfig) ? K8S_BEDROCK_MODEL_IDS : K8S_DIRECT_MODEL_IDS),
+        ...CLI_ALIASES,
+      ]),
+    acceptsModelForConfig: (model: string, adapterConfig: Record<string, unknown>) =>
+      isBedrockStub(adapterConfig) && /^(\w+\.)?anthropic\.|^arn:aws:bedrock:/.test(model),
     modelRegistryIsClosed: true,
     ...overrides,
   } as ServerAdapterModule;
@@ -175,7 +184,8 @@ describe("adapter model write validation (PEN-4447)", () => {
         env: { CLAUDE_CODE_USE_BEDROCK: "1" },
       });
       expect(refused).not.toBeNull();
-      expect(refused?.validModelIds).toEqual(K8S_BEDROCK_MODEL_IDS);
+      expect(refused?.validModelIds).toEqual(expect.arrayContaining(K8S_BEDROCK_MODEL_IDS));
+      expect(refused?.validModelIds).not.toContain("claude-opus-5");
     });
 
     it("refuses a Bedrock id on a direct lane", async () => {
@@ -231,6 +241,89 @@ describe("adapter model write validation (PEN-4447)", () => {
       await expect(
         findUnregisteredAdapterModel("claude_k8s", { model: "not-a-model-at-all" }),
       ).resolves.toBeNull();
+    });
+  });
+
+
+  // Ally's Important finding on #2901: a closed registry has to admit every id
+  // the runtime accepts, not every id the picker shows. Both shapes below boot
+  // fine today and were refused by the first cut.
+  describe("ids no picker list carries", () => {
+    it("accepts a CLI alias", async () => {
+      for (const alias of CLI_ALIASES) {
+        await expect(
+          findUnregisteredAdapterModel("claude_k8s", { model: alias }),
+        ).resolves.toBeNull();
+      }
+    });
+
+    it("accepts a Bedrock inference profile in any region, and an ARN", async () => {
+      const bedrockEnv = { CLAUDE_CODE_USE_BEDROCK: "1" };
+      for (const model of [
+        "eu.anthropic.claude-opus-5",
+        "apac.anthropic.claude-sonnet-5",
+        "anthropic.claude-opus-5",
+        "arn:aws:bedrock:us-east-1:123456789012:inference-profile/custom",
+      ]) {
+        await expect(
+          findUnregisteredAdapterModel("claude_k8s", { model, env: bedrockEnv }),
+        ).resolves.toBeNull();
+      }
+    });
+
+    it("still refuses a Bedrock-shaped id on a direct lane", async () => {
+      // The predicate widens admission, it does not disable the Direct/Bedrock
+      // distinction — that id is a real mistake on a lane with no Bedrock env.
+      await expect(
+        findUnregisteredAdapterModel("claude_k8s", { model: "eu.anthropic.claude-opus-5" }),
+      ).resolves.not.toBeNull();
+    });
+
+    it("still refuses a plausible non-id", async () => {
+      await expect(
+        findUnregisteredAdapterModel("claude_k8s", { model: "opus-5" }),
+      ).resolves.not.toBeNull();
+    });
+  });
+
+  // Only what the write INTRODUCES is judged, so a registry that has since
+  // narrowed cannot wedge an agent out of unrelated repairs.
+  describe("already-stored ids", () => {
+    it("tolerates an unregistered model the agent already carries", async () => {
+      await expect(
+        findUnregisteredAdapterModel(
+          "claude_k8s",
+          { model: "claude-haiku-4-5", cwd: "/new/path" },
+          { adapterType: "claude_k8s", adapterConfig: { model: "claude-haiku-4-5" } },
+        ),
+      ).resolves.toBeNull();
+    });
+
+    it("refuses a CHANGE to another unregistered model", async () => {
+      await expect(
+        findUnregisteredAdapterModel(
+          "claude_k8s",
+          { model: "claude-mythos-5" },
+          { adapterType: "claude_k8s", adapterConfig: { model: "claude-haiku-4-5" } },
+        ),
+      ).resolves.not.toBeNull();
+    });
+
+    it("refuses re-pointing the agent at an adapter that does not register the stored model", async () => {
+      // The string did not change; the PAIR did, and that is the introduction.
+      await expect(
+        findUnregisteredAdapterModel(
+          "claude_k8s",
+          { model: "claude-haiku-4-5" },
+          { adapterType: "claude_local", adapterConfig: { model: "claude-haiku-4-5" } },
+        ),
+      ).resolves.not.toBeNull();
+    });
+
+    it("treats a create (no previous) as introducing everything", async () => {
+      await expect(
+        findUnregisteredAdapterModel("claude_k8s", { model: "claude-haiku-4-5" }, null),
+      ).resolves.not.toBeNull();
     });
   });
 
