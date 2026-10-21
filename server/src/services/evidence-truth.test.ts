@@ -886,10 +886,20 @@ describe("buildGithubTruthProbe", () => {
       "### Prior Findings Dispositioned (1)\n- **prior:abcdef0 important 1** - tracked - accepted onto BLO-36822.\n\n### Recommended Action",
     );
     // Comment surface deferred, formal surface clean at the same head.
+    //
+    // Both rows carry a real `submittedAt`, so the review is actually spread
+    // into the gate's merged comment list. With `submittedAt: null` the review
+    // was dropped at the filter in `evidence-truth.ts` and this case degraded
+    // to a single-comment fixture that never exercised the cross-surface
+    // ordering it names (Ally, #2875 at 79949bbe). The review is the OLDER of
+    // the two, which is the direction that matters: a newer deferral must
+    // still veto an older clean vouch.
     const a = await buildGithubTruthProbe(
       deps({
         listReviewerSurfaces: async () => ({
-          reviews: [{ login: ALLY, body: clean, state: "COMMENTED", commitId: HEAD, submittedAt: null }],
+          reviews: [
+            { login: ALLY, body: clean, state: "COMMENTED", commitId: HEAD, submittedAt: "2026-09-05T00:00:00Z" },
+          ],
           comments: [{ login: ALLY, body: tracked, createdAt: "2026-09-06T00:00:00Z" }],
         }),
       }),
@@ -901,7 +911,9 @@ describe("buildGithubTruthProbe", () => {
     const b = await buildGithubTruthProbe(
       deps({
         listReviewerSurfaces: async () => ({
-          reviews: [{ login: ALLY, body: tracked, state: "COMMENTED", commitId: HEAD, submittedAt: null }],
+          reviews: [
+            { login: ALLY, body: tracked, state: "COMMENTED", commitId: HEAD, submittedAt: "2026-09-05T00:00:00Z" },
+          ],
           comments: [{ login: ALLY, body: clean, createdAt: "2026-09-06T00:00:00Z" }],
         }),
       }),

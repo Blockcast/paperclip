@@ -484,8 +484,28 @@ function latestAttestingAllyComment(
         ]
       : tied;
 
+  // A finding first, then a deferral, then the winner. Both of the preferred
+  // shapes can only make the verdict LESS positive, which is the same rule the
+  // eligible set itself is built on -- an issue comment may ADD a downgrade,
+  // never take a credit.
+  //
+  // The deferral pass is NOT redundant with the finding pass: a `tracked`
+  // ledger line sits in a body that counts 0 critical and 0 important, so
+  // `hasActionablePrReviewFeedback` does not match it. Without this pass a
+  // newer issue-comment deferral lost to an older clean review submission,
+  // `countAllyDeferredPriorFindings` read the review's empty ledger, and the
+  // gate published `clean` over an accepted residual -- the BLO-36903 class,
+  // and a fail-OPEN introduced by the surface rank above (Ally, #2875 at
+  // 79949bbe). The deferral is the only thing that tells a reader a residual
+  // was accepted rather than fixed, and the evidence probe reads it as a veto
+  // on a clean vouch, so dropping it is strictly more permissive.
+  //
+  // Choosing an issue comment here cannot PROMOTE anything: off the review
+  // surface the deferral goes through the `heldDeferral` path below, so it
+  // still loses to a carried red and is only returned once nothing carries.
   const chosen =
     eligible.find((candidate) => hasActionablePrReviewFeedback(candidate.attesting.comment.body)) ??
+    eligible.find((candidate) => countAllyDeferredPriorFindings(candidate.attesting.comment.body) > 0) ??
     winner;
   return chosen.attesting;
 }
