@@ -21,13 +21,54 @@ const BEDROCK_MODELS: AdapterModel[] = [
 
 let cached: { keyFingerprint: string; baseUrl: string; expiresAt: number; models: AdapterModel[] } | null = null;
 
-function isBedrockEnv(): boolean {
+function isBedrockValues(values: {
+  useBedrock?: string | undefined;
+  bedrockBaseUrl?: string | undefined;
+}): boolean {
   return (
-    process.env.CLAUDE_CODE_USE_BEDROCK === "1" ||
-    process.env.CLAUDE_CODE_USE_BEDROCK === "true" ||
-    (typeof process.env.ANTHROPIC_BEDROCK_BASE_URL === "string" &&
-      process.env.ANTHROPIC_BEDROCK_BASE_URL.trim().length > 0)
+    values.useBedrock === "1" ||
+    values.useBedrock === "true" ||
+    (typeof values.bedrockBaseUrl === "string" && values.bedrockBaseUrl.trim().length > 0)
   );
+}
+
+function isBedrockEnv(): boolean {
+  return isBedrockValues({
+    useBedrock: process.env.CLAUDE_CODE_USE_BEDROCK,
+    bedrockBaseUrl: process.env.ANTHROPIC_BEDROCK_BASE_URL,
+  });
+}
+
+/**
+ * Bedrock-ness of ONE agent's configuration, not of this server process.
+ *
+ * `adapterConfig.env` is the agent's own environment and outranks the server's
+ * where both name a key, so an agent can run against Bedrock on a server that
+ * does not, and vice versa. A key PRESENT in `adapterConfig.env` wins even when
+ * its value is empty — that is how an agent opts out of an inherited setting.
+ * A managed-secret reference reads as a non-empty string here, which is the
+ * safe direction: a config that names a Bedrock base URL at all resolves to the
+ * Bedrock registry.
+ */
+export function isBedrockAdapterConfig(
+  adapterConfig: Record<string, unknown>,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  const configEnv =
+    typeof adapterConfig.env === "object" && adapterConfig.env !== null
+      ? (adapterConfig.env as Record<string, unknown>)
+      : {};
+  const read = (key: string): string | undefined => {
+    if (Object.prototype.hasOwnProperty.call(configEnv, key)) {
+      const value = configEnv[key];
+      return typeof value === "string" ? value : value == null ? "" : String(value);
+    }
+    return env[key];
+  };
+  return isBedrockValues({
+    useBedrock: read("CLAUDE_CODE_USE_BEDROCK"),
+    bedrockBaseUrl: read("ANTHROPIC_BEDROCK_BASE_URL"),
+  });
 }
 
 function fingerprint(apiKey: string): string {
@@ -104,8 +145,10 @@ async function fetchAnthropicModels(apiKey: string, baseUrl: string): Promise<Ad
   }
 }
 
-async function loadClaudeModels(options?: { forceRefresh?: boolean }): Promise<AdapterModel[]> {
-  if (isBedrockEnv()) return dedupeModels(BEDROCK_MODELS);
+async function loadClaudeModels(
+  options?: { forceRefresh?: boolean; bedrock?: boolean },
+): Promise<AdapterModel[]> {
+  if (options?.bedrock ?? isBedrockEnv()) return dedupeModels(BEDROCK_MODELS);
 
   const fallback = dedupeModels(DIRECT_MODELS);
   const apiKey = resolveAnthropicApiKey();
@@ -154,6 +197,20 @@ export async function listClaudeModels(): Promise<AdapterModel[]> {
 
 export async function refreshClaudeModels(): Promise<AdapterModel[]> {
   return loadClaudeModels({ forceRefresh: true });
+}
+
+/**
+ * Model set admissible for ONE agent's configuration (PEN-4447).
+ *
+ * Same list as `listClaudeModels()` except that the Bedrock branch is decided
+ * from the agent's own `adapterConfig.env` rather than this process's env, so
+ * write-time validation judges an agent against the registry its own lane will
+ * use.
+ */
+export async function listClaudeModelsForConfig(
+  adapterConfig: Record<string, unknown>,
+): Promise<AdapterModel[]> {
+  return loadClaudeModels({ bedrock: isBedrockAdapterConfig(adapterConfig) });
 }
 
 export function resetClaudeModelsCacheForTests() {

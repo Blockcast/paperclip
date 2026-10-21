@@ -9,6 +9,7 @@
   "include": [
     "src/types/express.d.ts",
     "src/__tests__/accepted-interaction-outcome-sweep-postgres.test.ts",
+    "src/__tests__/agent-model-registry-validation.test.ts",
     "src/__tests__/app-plugin-takeover-resync.test.ts",
     "src/__tests__/github-webhook-dedicated-pool.test.ts",
     "src/__tests__/github-webhook-issue-lookup-filtered.test.ts",

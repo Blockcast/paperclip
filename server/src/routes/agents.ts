@@ -128,6 +128,10 @@ import { DEFAULT_GEMINI_LOCAL_MODEL } from "@paperclipai/adapter-gemini-local";
 import { DEFAULT_OPENCODE_LOCAL_MODEL } from "@paperclipai/adapter-opencode-local";
 import { requireOpenCodeModelId } from "@paperclipai/adapter-opencode-local/server";
 import {
+  describeUnregisteredModel,
+  findUnregisteredAdapterModel,
+} from "../adapters/model-validation.js";
+import {
   loadDefaultAgentInstructionsBundle,
   resolveDefaultAgentInstructionsBundleRole,
 } from "../services/default-agent-instructions.js";
@@ -1686,6 +1690,14 @@ export function agentRoutes(
     adapterType: string | null | undefined,
     adapterConfig: Record<string, unknown>,
   ) {
+    // PEN-4447: a model id the target adapter does not register is accepted
+    // here and then kills the lane at its next pod boot, so refuse it at the
+    // write instead. Runs for every adapter that declares a closed registry,
+    // and is a no-op for the rest — see adapters/model-validation.ts.
+    const unregisteredModel = await findUnregisteredAdapterModel(adapterType, adapterConfig);
+    if (unregisteredModel) {
+      throw unprocessable(describeUnregisteredModel(unregisteredModel));
+    }
     if (adapterType !== "opencode_local") return;
     try {
       requireOpenCodeModelId(adapterConfig.model);

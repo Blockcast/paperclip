@@ -240,6 +240,69 @@ With these flags set, the Paperclip UI will automatically show the instructions 
 
 If capability flags are not set, the server falls back to legacy hardcoded lists for built-in adapter types. External adapters that omit the flags will default to `false` for all capabilities.
 
+## Model Registry
+
+`models` / `listModels()` populate the model picker. Two further fields decide whether Paperclip may
+*refuse a write* to `adapterConfig.model`, and which list it judges that write against.
+
+| Field | Type | Default | What it controls |
+|------|------|---------|------------------|
+| `modelRegistryIsClosed` | `boolean` | `false` | Whether the resolved registry is the COMPLETE admissible set, so an unlisted id is refused at the write |
+| `listModelsForConfig` | `(adapterConfig) => Promise<AdapterModel[]>` | — | Resolve the admissible set for ONE agent, when it depends on that agent's own configuration |
+
+### Why this is opt-in
+
+`PATCH /api/agents/:id` used to accept any string as `adapterConfig.model` and return 200. Nothing
+reads the id until the agent's next pod boot, so a wrong one kills the lane hours later with nothing
+connecting it to the write (PEN-4447).
+
+It is not merely a typo class, because **model registries differ between adapters.** The measured
+near-miss: `claude-haiku-4-5` is registered by `claude_local` and is absent from `claude_k8s`, whose
+cheap floor is `claude-haiku-4-6`. An id chosen *because* it looked like the safest possible write
+was the one that would have bricked a `claude_k8s` lane.
+
+Declaring `modelRegistryIsClosed: true` is what lets the server refuse that write. Do **not** declare
+it if your adapter discovers models from a live provider API or a CLI and falls back to a static list
+when that lookup fails — there, "absent from the registry" means "discovery is down" at least as
+often as it means "invalid", and refusing the write would trade a late failure for an immediate
+wrong one. `claude_local` does discover, but only ever *adds* to its shipped list, so a discovery
+outage cannot narrow what it accepts; that is the property that makes it safe to declare.
+
+### Why a config-aware list
+
+`listModels()` answers "what should the picker show on this server". That is a different question
+from "may this agent be written with this id" whenever the admissible set depends on the agent's own
+environment. Both Claude adapters swap their whole registry for Bedrock-native ids when
+`CLAUDE_CODE_USE_BEDROCK` / `ANTHROPIC_BEDROCK_BASE_URL` is set — and for a pod-per-agent adapter
+that variable can come from the agent's own `adapterConfig.env`, which outranks the server's env
+inside the pod. Validating such an agent against `listModels()` alone would refuse an id that is
+correct for the lane it runs on. Implement `listModelsForConfig` for that case; Paperclip falls back
+to `listModels()` / `models` when it is absent.
+
+### Divergent registries are expected, and are readable from the API
+
+Two adapters for the same provider are not required to ship the same list — `claude_local` and
+`claude_k8s` deliberately do not, because they pin different runtimes. Do not copy a model id from
+one adapter's source into another adapter's config. Read the registry that the target agent's own
+adapter reports:
+
+```
+GET /api/companies/:companyId/adapters/:type/models
+```
+
+That endpoint resolves through the same precedence the validator uses, so it is the authoritative
+answer to "what may I set on this lane", and it does not require reading an adapter's source.
+
+### Escape hatches
+
+A closed registry can be wrong in one direction: a model the provider has shipped and the adapter has
+not listed yet. Two exits, neither needing a release:
+
+- `PAPERCLIP_ADAPTER_MODELS` — declare the list for one adapter type. It **replaces** the adapter's
+  registry (pre-existing `listAdapterModels` precedence), so declare the full set, not just the new id.
+- `PAPERCLIP_ALLOW_UNLISTED_ADAPTER_MODELS=1` — accept unlisted ids fleet-wide. Blunt; prefer the
+  first.
+
 ## Skills Injection
 
 Make Paperclip skills discoverable to your agent runtime without writing to the agent's working directory:

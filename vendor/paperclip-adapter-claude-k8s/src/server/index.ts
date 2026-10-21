@@ -5,7 +5,7 @@ import { testEnvironment } from "./test.js";
 import { sessionCodec } from "./session.js";
 import { getConfigSchema } from "./config-schema.js";
 import { listK8sSkills, syncK8sSkills } from "./skills.js";
-import { listK8sModels } from "./models.js";
+import { listK8sModels, listK8sModelsForConfig } from "./models.js";
 
 // Hoisted (not inline in `sessionManagement`) so the extra field passes the
 // excess-property check when compiled against published adapter-utils
@@ -39,6 +39,13 @@ export function createServerAdapter(): ServerAdapterModule {
     models,
     modelProfiles,
     listModels: listK8sModels,
+    // PEN-4447: Paperclip refuses a write to `adapterConfig.model` naming an id
+    // this registry does not list, instead of accepting it with a 200 and
+    // failing at the next pod boot. `listModelsForConfig` resolves the
+    // Direct/Bedrock branch from the AGENT's env, which outranks the server's
+    // inside the Job pod.
+    listModelsForConfig: listK8sModelsForConfig,
+    modelRegistryIsClosed: true,
     listSkills: listK8sSkills,
     syncSkills: syncK8sSkills,
     supportsLocalAgentJwt: true,

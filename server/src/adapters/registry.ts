@@ -27,6 +27,7 @@ import {
   listClaudeSkills,
   syncClaudeSkills,
   listClaudeModels,
+  listClaudeModelsForConfig,
   refreshClaudeModels,
   testEnvironment as claudeTestEnvironment,
   sessionCodec as claudeSessionCodec,
@@ -275,7 +276,14 @@ const claudeLocalAdapter: ServerAdapterModule = {
   models: claudeModels,
   modelProfiles: claudeModelProfiles,
   listModels: listClaudeModels,
+  listModelsForConfig: listClaudeModelsForConfig,
   refreshModels: refreshClaudeModels,
+  // PEN-4447: `models` here plus whatever /v1/models discovery adds is the
+  // complete set this adapter will accept, so an unlisted id is refused at the
+  // write rather than at the next exec. Discovery only ever ADDS to the static
+  // list (it falls back to it on any failure), so a discovery outage cannot
+  // narrow what is accepted below the shipped ids.
+  modelRegistryIsClosed: true,
   supportsLocalAgentJwt: true,
   supportsInstructionsBundle: true,
   instructionsPathKey: "instructionsFilePath",
@@ -736,6 +744,48 @@ export async function listAdapterModels(type: string): Promise<{ id: string; lab
     }
   }
   return filterAdapterModelsForConfiguredAllowlist(type, adapter.models ?? []);
+}
+
+/**
+ * Resolve the admissible model set for ONE agent's configuration (PEN-4447).
+ *
+ * Same precedence as `listAdapterModels`, with one extra step: an adapter may
+ * expose `listModelsForConfig` when its registry depends on the agent's own
+ * environment rather than only on the server's. The operator declaration in
+ * `PAPERCLIP_ADAPTER_MODELS` still wins over both — it is the escape hatch for
+ * a model the adapter has not shipped yet.
+ */
+export async function listAdapterModelsForConfig(
+  type: string,
+  adapterConfig: Record<string, unknown>,
+): Promise<{ id: string; label: string }[]> {
+  const declaredModels = getDeclaredAdapterModels();
+  if (declaredModels && declaredModels[type]?.length) {
+    return filterAdapterModelsForConfiguredAllowlist(
+      type,
+      declaredModels[type].map((m) => ({ id: m.id, label: m.label ?? m.id })),
+    );
+  }
+  const adapter = findActiveServerAdapter(type);
+  if (adapter?.listModelsForConfig) {
+    const resolved = await adapter.listModelsForConfig(adapterConfig);
+    if (resolved.length > 0) {
+      return filterAdapterModelsForConfiguredAllowlist(type, resolved);
+    }
+  }
+  return listAdapterModels(type);
+}
+
+/**
+ * Whether this adapter declares its model registry to be the complete
+ * admissible set, so a write naming a model outside it may be refused.
+ *
+ * Defaults to `false` for every adapter that has not opted in, including
+ * unknown types: validation is a strict addition to what this route used to
+ * accept, so the absence of a declaration must read as "do not enforce".
+ */
+export function adapterModelRegistryIsClosed(type: string): boolean {
+  return findActiveServerAdapter(type)?.modelRegistryIsClosed === true;
 }
 
 export async function refreshAdapterModels(type: string): Promise<{ id: string; label: string }[]> {
