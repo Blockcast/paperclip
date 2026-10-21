@@ -4680,7 +4680,8 @@ export function agentRoutes(
 
   router.get("/companies/:companyId/pr-review-queue", async (req, res) => {
     const companyId = req.params.companyId as string;
-    assertBoard(req);
+    // Read-only and company-scoped: agents need it to see which run holds a
+    // `pr_review:<repo>:<n>` key without cluster access (BLO-31961).
     assertCompanyAccess(req, companyId);
 
     const { lookbackHours = 24, limit = 200 } = z.object({
