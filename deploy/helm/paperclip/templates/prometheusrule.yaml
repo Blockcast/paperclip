@@ -25,8 +25,13 @@
        prometheus-operator runs on this cluster, so the CRD is an orphaned
        no-op, kept so a future operator install picks it up.
 
-  Those two are lockstep-enforced by onprem-k8s scripts/check-prometheus-rules-lockstep.sh
-  (edit both or CI fails). Nothing enforces lockstep with THIS chart file.
+  Those two are lockstep-enforced by a PAIR of onprem-k8s guards -- edit both
+  files or CI there fails:
+    - scripts/check-prometheus-rules-lockstep.sh      (parsed rule data)
+    - scripts/check-prometheus-rules-comment-lockstep.py  (rationale comments)
+  Nothing enforces lockstep with THIS chart file, in either repo. That is a
+  measured gap, not a theoretical one -- see the PEN-4479 ledger at the end of
+  this header for what it has already cost.
 
   Groups below are therefore mirrors, kept so the chart stays coherent for a
   cluster that does grant the RBAC. When you change a rule here, change it in
@@ -63,10 +68,12 @@
         gh api repos/Blockcast/onprem-k8s/contents/monitoring/prometheus-rules-2-configmap.yaml \
           --jq '.content' | base64 -d | grep PaperclipPrReviewWakeTerminalFailed
 
-    - NOT yet merged and NOT yet live as of 2026-08-02. It reads a metric this
-      PR adds, so it is inert until both land. Same manual `monitoring-rules`
-      Argo sync gate as above applies afterwards. Re-checked 2026-09-12: still
-      absent from all of monitoring/prometheus-rules-{1..5}-configmap.yaml.
+    - LANDED. This block read "NOT yet merged and NOT yet live as of
+      2026-08-02 ... re-checked 2026-09-12: still absent" until 2026-10-21,
+      when PaperclipPrReviewWakeTerminalFailed was re-measured as PRESENT in
+      monitoring/prometheus-rules-2-configmap.yaml. The manual
+      `monitoring-rules` Argo sync gate (BLO-19095) still applies: a merged
+      rule is not a deployed one.
 
   STATUS of the BLO-21092 plugin-error alert, same auditability rule:
 
@@ -86,9 +93,11 @@
   auditability rule:
 
     - Proposed in Blockcast/onprem-k8s#2119 (branch
-      platformsre/blo-21460-runtime-resource-reconciliation-alert), currently
-      OPEN as of 2026-08-27 at head `ed177e5a8b7b`; it is not merged or live.
-      Verify the proposed rule before merge:
+      platformsre/blo-21460-runtime-resource-reconciliation-alert). This block
+      read "currently OPEN as of 2026-08-27 ... not merged or live" until
+      2026-10-21, when PaperclipRuntimeResourceReconciliationStuck was
+      re-measured as PRESENT in monitoring/prometheus-rules-2-configmap.yaml.
+      LANDED. Verify:
         gh api repos/Blockcast/onprem-k8s/contents/monitoring/prometheus-configmap.yaml \
           --jq '.content' | base64 -d | grep PaperclipRuntimeResourceReconciliationStuck
 
@@ -104,10 +113,13 @@
   auditability rule:
 
     - Proposed in Blockcast/onprem-k8s#4050 (branch
-      platform/blo-36814-reaper-alert-onprem), opened 2026-09-27. OPEN, not
-      merged, NOT live. It landed in this chart file first and nowhere else,
-      which is exactly the failure this header warns about -- caught in Ally
-      review on Blockcast/paperclip#2054, hence the companion PR. Verify:
+      platform/blo-36814-reaper-alert-onprem), opened 2026-09-27. This block
+      read "OPEN, not merged, NOT live" until 2026-10-21, when
+      PaperclipIsolationWorkspaceReaperStopped was re-measured as PRESENT in
+      monitoring/prometheus-rules-2-configmap.yaml. LANDED. It had landed in
+      this chart file first and nowhere else, which is exactly the failure
+      this header warns about -- caught in Ally review on
+      Blockcast/paperclip#2054, hence the companion PR. Verify:
         gh api repos/Blockcast/onprem-k8s/contents/monitoring/prometheus-rules-2-configmap.yaml \
           --jq '.content' | base64 -d | grep PaperclipIsolationWorkspaceReaperStopped
 
@@ -138,11 +150,86 @@
             | grep -c PaperclipGithubWorkflowRunMassCancellation
         done
 
-    - So BLO-21078 has no detector in production. The chart rule below is
-      the only copy anywhere, and it renders nowhere live. Landing it in both
-      onprem-k8s files (then the manual `monitoring-rules` Argo sync,
-      BLO-19095) is the change that closes BLO-21078; until then the chart
-      rule is the reviewed source for that change, not a mirror of one.
+    - SUPERSEDED 2026-10-21 -- do not act on the paragraph above. It
+      concluded "BLO-21078 has no detector in production ... the chart rule
+      below is the only copy anywhere", which was true when written and is now
+      false: PaperclipGithubWorkflowRunMassCancellation was re-measured as
+      PRESENT in monitoring/prometheus-rules-2-configmap.yaml AND in
+      paperclip/paperclip-runtime-alerts-prometheusrule.yaml. It LANDED after
+      the 2026-09-29 re-check, by some route the closed #1968 does not
+      explain. A reader who trusted that verdict would have gone and built a
+      detector that already exists. The manual Argo sync gate (BLO-19095)
+      still separates "in the ConfigMap" from "deployed".
+  ============================================================================
+  PEN-4479 -- MEASURED DRIFT LEDGER, and the recorded decision on a guard
+  ============================================================================
+
+  Measured 2026-10-21 against Blockcast/onprem-k8s master a2b4a40f. This file
+  carries 44 alerts. Of those:
+
+    - 7 are ABSENT from every monitoring/prometheus-rules-*-configmap.yaml,
+      i.e. in this chart and nowhere live. Listed below.
+    - 4 of the per-alert STATUS blocks above were STALE IN THE OTHER
+      DIRECTION -- they claimed "NOT merged / NOT live / no detector in
+      production" for alerts that had since landed. All four are corrected
+      above; the BLO-21078 one had been telling readers to go build a
+      detector that already exists.
+
+  So 11 of 44 (25%) of this file's alert inventory was mis-described. Note
+  the header you are reading has been here since 2026-07-31 (a2472e342) and
+  already said, in as many words, that a rule added only here is dead code --
+  and ALL 7 omissions below post-date it. The file is edited often (73
+  commits in 103 days, ~0.7/day), so this is not a rare path.
+
+  Nor is this the first time. Blockcast/paperclip#1805 ("docs(helm): fix stale
+  AUTHORITATIVE pointer in prometheusrule.yaml header", merged 2026-09-16) was
+  already a dedicated PR spent correcting staleness in this same header. Two
+  recorded instances, and the prose has drifted again in the five weeks since.
+
+  UNPORTED AS OF 2026-10-21 -- present here, absent from the loaded ConfigMaps:
+
+    PaperclipScheduledRetryParkHorizonMetricsRefreshFailed      added 2026-08-25  (57d)
+    PaperclipDeferredIssueExecutionWakeOverdue                  added 2026-10-03  (18d)
+    PaperclipDeferredIssueExecutionWakeAgeMetricsRefreshFailed  added 2026-10-03  (18d)
+    PaperclipOrphanReapWaitBoundExceeded                        added 2026-10-19  ( 2d)  PEN-4380, port recorded as needed
+    PaperclipAcceptedInteractionUntracked                       added 2026-10-20  ( 1d)  PEN-4409, port OPEN as onprem-k8s#6417
+    PaperclipAcceptedInteractionActionUnobserved                added 2026-10-20  ( 1d)  PEN-4409, port OPEN as onprem-k8s#6417
+    PaperclipAcceptedInteractionOutcomeMetricsRefreshFailed     added 2026-10-20  ( 1d)  PEN-4409, port OPEN as onprem-k8s#6417
+
+  Re-measure from an onprem-k8s checkout (CHART = this file):
+
+    grep -oP '^\s*-?\s*alert:\s*\K[A-Za-z0-9_]+' "$CHART" | sort -u | while read -r a; do
+      grep -rq "$a" monitoring/prometheus-rules-*-configmap.yaml || echo "UNPORTED $a"
+    done
+
+  Grep for the LITERAL alert name, as above. Do NOT extract names out of the
+  ConfigMaps with an `alert:` regex and diff the two lists -- those rules are
+  embedded as JSON-escaped ConfigMap values, so that under-counts the
+  ConfigMap side and reports already-ported alerts as missing. It produced 2
+  false positives out of 9 on the first pass of this very measurement.
+
+  DECISION (PEN-4479, 2026-10-21): a mechanical check IS warranted, and it
+  should be LOCAL. Recorded so the question is not reopened from scratch:
+
+    - REJECTED -- a cross-repo lockstep check run from paperclip CI. It needs
+      network and auth to the other repo and cannot be run locally, which is
+      the one property PEN-4479 named as making a guard worse than a header.
+    - REJECTED -- requiring the PR body to name the onprem-k8s counterpart.
+      A PR body is written once and never re-read, so it would not have
+      caught any of the 4 stale blocks, and nothing re-checks it later.
+    - ACCEPTED -- an in-repo port-status ledger plus a test in
+      deploy/helm/paperclip/tests/ that parses `- alert:` out of this
+      template and fails when an alert appears in neither. Offline, no second
+      checkout, runs in the chart-test job that already exists, and not a
+      body-comparing lockstep so it cannot go fragile on formatting drift.
+      It does not prove the port happened -- it converts a SILENT OMISSION
+      into a REQUIRED DECLARATION, which is the measured failure mode: in all
+      7 cases above nobody decided not to port, nobody was asked.
+
+  Tracked as PEN-4488. Until it lands, this ledger is the only coverage copy
+  3 has, and it is manual -- re-measure with the command above rather than
+  trusting the dates.
+
 */}}
 {{- if .Values.prometheusRule.enabled }}
 apiVersion: monitoring.coreos.com/v1
