@@ -44,7 +44,7 @@ describe("sweepTerminalRunPodLogs", () => {
     await fs.writeFile(notALog, "{}\n");
     await fs.utimes(notALog, new Date(now.getTime() - 72 * HOUR), new Date(now.getTime() - 72 * HOUR));
 
-    const statuses = new Map([
+    const statuses = new Map<string, string>([
       [finalized.runId, "succeeded"],
       [isolated.runId, "failed"],
       [running.runId, "running"],

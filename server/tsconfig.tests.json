@@ -17,6 +17,7 @@
     "src/__tests__/metrics-help-cross-reference.test.ts",
     "src/__tests__/pen3288-null-prototype-accumulators.test.ts",
     "src/__tests__/plugin-holder-forward.test.ts",
+    "src/__tests__/pod-log-sweeper.test.ts",
     "src/__tests__/pr-comment-review-gate.test.ts",
     "src/__tests__/process-mapping-metrics.test.ts",
     "src/__tests__/recovery-chain-pass-timing-wiring.test.ts",
