@@ -921,15 +921,23 @@ describeEmbeddedPostgres("heartbeat wake dispatch retry (BLO-14395)", () => {
         });
 
         const warn = vi.spyOn(logger, "warn");
-        const result = await heartbeat.reconcileFailedWakeDispatches(now).finally(() => warn.mockRestore());
+        let result: Awaited<ReturnType<typeof heartbeat.reconcileFailedWakeDispatches>>;
+        let warnCalls: unknown[][];
+        try {
+          result = await heartbeat.reconcileFailedWakeDispatches(now);
+        } finally {
+          // Snapshot before restore: mockRestore() clears mock.calls in Vitest 4.
+          warnCalls = [...warn.mock.calls];
+          warn.mockRestore();
+        }
         expect(result.superseded).toBe(1);
         expect(result.recovered).toBe(0);
         expect(result.exhausted).toBe(0);
         // BLO-48170: the rejection must be attributable from logs alone.
-        expect(warn).toHaveBeenCalledWith(
+        expect(warnCalls).toContainEqual([
           expect.objectContaining({ wakeupRequestId, taskKey: GITHUB_REVIEW_PAYLOAD.taskKey }),
           expect.stringContaining("redelivery rejected"),
-        );
+        ]);
 
         // The pass is a re-dispatch attempt, so `retried` still moves...
         expect(await deliveryCount("retried")).toBe(1);
