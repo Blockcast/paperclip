@@ -50,6 +50,10 @@ const mockHasActiveJobForAgent = vi.hoisted(() => vi.fn(async () => false));
 // overrides this once to inject a release between the reservation read and
 // the identity stamp, mirroring the production race this module documents.
 const mockGetActiveExternalRuntimeReservation = vi.hoisted(() => vi.fn());
+// Passthrough by default, exactly like the mock above. Only the
+// `release_pending_act` throw-path test overrides it, to make the one
+// unguarded await in the act block hang and then reject.
+const mockReleaseExternalRuntimeReservation = vi.hoisted(() => vi.fn());
 
 vi.mock("../telemetry.ts", () => ({
   getTelemetryClient: () => ({ track: vi.fn() }),
@@ -92,6 +96,9 @@ vi.mock("../services/external-runtime-reservations.ts", async () => {
     getActiveExternalRuntimeReservation: (...args: Parameters<
       typeof actualExternalRuntimeReservationsRef.current.getActiveExternalRuntimeReservation
     >) => mockGetActiveExternalRuntimeReservation(...args),
+    releaseExternalRuntimeReservation: (...args: Parameters<
+      typeof actualExternalRuntimeReservationsRef.current.releaseExternalRuntimeReservation
+    >) => mockReleaseExternalRuntimeReservation(...args),
   };
 });
 
@@ -148,6 +155,9 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
     mockGetActiveExternalRuntimeReservation.mockImplementation((...args: Parameters<
       typeof actualExternalRuntimeReservationsRef.current.getActiveExternalRuntimeReservation
     >) => actualExternalRuntimeReservationsRef.current.getActiveExternalRuntimeReservation(...args));
+    mockReleaseExternalRuntimeReservation.mockImplementation((...args: Parameters<
+      typeof actualExternalRuntimeReservationsRef.current.releaseExternalRuntimeReservation
+    >) => actualExternalRuntimeReservationsRef.current.releaseExternalRuntimeReservation(...args));
   }, 120_000);
 
   afterEach(async () => {
@@ -164,6 +174,11 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
       .mockImplementation((...args: Parameters<
         typeof actualExternalRuntimeReservationsRef.current.getActiveExternalRuntimeReservation
       >) => actualExternalRuntimeReservationsRef.current.getActiveExternalRuntimeReservation(...args));
+    mockReleaseExternalRuntimeReservation
+      .mockReset()
+      .mockImplementation((...args: Parameters<
+        typeof actualExternalRuntimeReservationsRef.current.releaseExternalRuntimeReservation
+      >) => actualExternalRuntimeReservationsRef.current.releaseExternalRuntimeReservation(...args));
     await cleanupHeartbeatTestState(db, heartbeat);
   }, 120_000);
 
@@ -199,6 +214,25 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
     if (!line) return null;
     const value = Number(line.trim().split(/\s+/).at(-1));
     return Number.isFinite(value) ? value : null;
+  }
+
+  /**
+   * PEN-4380 pass 2: the `_sum` of one orphan-reap sub-stage, read off the same
+   * exposition Prometheus scrapes. `_sum` rather than `_count`, because the
+   * sweep observes every sub-stage once per pass even when it totals 0 -- so
+   * the count moves whether or not the time was attributed, and only the sum
+   * can tell those apart.
+   */
+  async function readOrphanReapStageSum(stage: string): Promise<number> {
+    const { body } = await renderMetrics();
+    const line = body
+      .split("\n")
+      .find((row) =>
+        row.startsWith("paperclip_orphan_reap_stage_seconds_sum{")
+        && row.includes(`stage="${stage}"`));
+    if (!line) return 0;
+    const value = Number(line.trim().split(/\s+/).at(-1));
+    return Number.isFinite(value) ? value : 0;
   }
 
   // PEN-2400: the sibling gauge for the reconciliation sweep itself (BLO-21460).
@@ -1662,6 +1696,63 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
     }
     return { companyId, agentId, runId, reservationId };
   }
+
+  /**
+   * PEN-4380 pass 2, Ally follow-up on PR #2906 (suggestion 1).
+   *
+   * The act block ended with a bare `actMs += Date.now() - actStartedAt` placed
+   * AFTER the work, on the reasoning that a throw is already reported through
+   * `failedRowCount`. That is true of the row but not of its TIME: on the throw
+   * path the `+=` is never reached, so a reservation that hangs in
+   * `releaseExternalRuntimeReservation` and then rejects contributes 0 s to
+   * `release_pending_act`.
+   *
+   * That is the one shape this instrument exists to catch. A lock wait cut off
+   * by `statement_timeout`/`lock_timeout` -- or a pool-acquire timeout -- ends
+   * in a rejection, and `pg_stat_statements` does not record statements that
+   * end in an error either. So the "slow SQL refuted" evidence on PEN-4380
+   * cannot see this case, and before the `finally` neither could the metric
+   * built to replace it: both instruments shared a blind spot over the only SQL
+   * hypothesis still standing.
+   *
+   * The assertion is on the SUM, not the count: the sweep observes each
+   * sub-stage once per pass regardless, so the count moves either way and would
+   * pass against the very bug this pins.
+   */
+  it("records act time in release_pending_act even when the per-row release throws (PEN-4380)", async () => {
+    await seedRunningRunWithObservedJob({
+      name: "ActTimingThrowPathCo",
+      slotId: 0,
+      reservation: { kind: "release_pending" },
+    });
+
+    // Carry the row past every `continue` and into the act block. `missing`
+    // short-circuits the jobUid comparison, so this needs no identity setup.
+    mockReadAgentJobRunStatusByName.mockImplementation(async (name: string) => ({
+      phase: "missing" as const,
+      reason: "NotFound",
+      message: `Kubernetes Job ${name} was not found`,
+      name,
+    }));
+
+    // The only unguarded await in the act block -- the three follow-ons all
+    // `.catch`. Hang first, THEN reject: an instantaneous rejection would leave
+    // the delta at ~0 ms, and the assertion could not tell the fix from the bug.
+    const HANG_MS = 120;
+    mockReleaseExternalRuntimeReservation.mockImplementation(async () => {
+      await new Promise((resolve) => setTimeout(resolve, HANG_MS));
+      throw new Error("simulated lock wait cut off by statement_timeout");
+    });
+
+    const before = await readOrphanReapStageSum("release_pending_act");
+    await heartbeat.reapOrphanedRuns();
+    const after = await readOrphanReapStageSum("release_pending_act");
+
+    expect(mockReleaseExternalRuntimeReservation).toHaveBeenCalled();
+    // Half the hang is generous slop for a loaded CI box, while still sitting
+    // far above the ~0 s a missing `finally` would record.
+    expect(after - before).toBeGreaterThanOrEqual((HANG_MS / 1000) * 0.5);
+  }, 120_000);
 
   it("does not log an identity mismatch when a terminal Job's reservation is already released (BLO-29133)", async () => {
     const { agentId, runId } = await seedRunningRunWithObservedJob({
