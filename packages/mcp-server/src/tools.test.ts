@@ -419,6 +419,34 @@ describe("paperclip MCP tools", () => {
     expect(payload.body).toBe(storedBody);
   });
 
+  // PEN-4484: the list filters `continuation-summary` and `pipeline-case-body`
+  // out by default and reports nothing about having done so, so `[]` reads as
+  // "no documents". These two pin that the escape hatch exists on this surface
+  // and that the default stays filtered.
+  it("omits the includeSystem query param by default when listing documents", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(mockJsonResponse([{ key: "plan" }]));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await getTool("paperclipListDocuments").execute({ issueId: "PEN-2111" });
+
+    const url = String(fetchMock.mock.calls[0]![0]);
+    expect(url).toContain("/issues/PEN-2111/documents");
+    expect(url).not.toContain("includeSystem");
+  });
+
+  it("requests system documents when includeSystem is set", async () => {
+    const rows = [{ key: "continuation-summary" }, { key: "plan" }];
+    const fetchMock = vi.fn().mockResolvedValue(mockJsonResponse(rows));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const payload = payloadOf(
+      await getTool("paperclipListDocuments").execute({ issueId: "PEN-2111", includeSystem: true }),
+    );
+
+    expect(String(fetchMock.mock.calls[0]![0])).toContain("includeSystem=true");
+    expect(payload).toEqual(rows);
+  });
+
   it("echoes a written comment body byte-for-byte", async () => {
     const storedBody = "Recorded on [PEN-2111](/PEN/issues/PEN-2111) and [PEN-2508](/PEN/issues/PEN-2508).";
     const fetchMock = vi.fn().mockResolvedValue(
