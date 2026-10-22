@@ -7785,12 +7785,13 @@ export function setCgroupMemoryMetrics(snapshot: CgroupMemorySnapshot | null): v
   for (const [component, bytes] of snapshot.components) {
     metrics.cgroupMemoryComponentBytesGauge.set({ component }, bytes);
   }
-  // Each scalar is independently optional, and `null` means "this file was not
-  // readable" or, for the limit, "this cgroup is unlimited". Publish nothing in
-  // either case; see the gauges' help text.
-  if (snapshot.currentBytes !== null) {
-    metrics.cgroupMemoryCurrentBytesGauge.set(snapshot.currentBytes);
-  }
+  // `currentBytes` is non-null by construction: the collector refuses the whole
+  // snapshot without it, because its absence is how a root-cgroup read is told
+  // apart from our own. A non-null snapshot therefore always has a charge.
+  metrics.cgroupMemoryCurrentBytesGauge.set(snapshot.currentBytes);
+  // The remaining scalars ARE independently optional, and `null` means "this
+  // file was not readable" or, for the limit, "this cgroup is unlimited".
+  // Publish nothing in either case; see the gauges' help text.
   if (snapshot.maxBytes !== null) {
     metrics.cgroupMemoryMaxBytesGauge.set(snapshot.maxBytes);
   }
