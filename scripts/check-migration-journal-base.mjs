@@ -55,6 +55,11 @@ const numberOf = (name) => name.match(/^(\d{4})_/)?.[1] ?? null;
  * @param {{entries?: Array<{idx: number, tag: string}>}} args.baseJournal base journal
  * @param {string[]} args.sqlFiles head `.sql` file names, with suffix
  * @param {string[]} args.baseSqlFiles base `.sql` file names, with suffix
+ * @param {{entries?: Array<{idx: number, tag: string}>}} [args.mergeBaseJournal] journal at
+ *   `git merge-base base head`. Omit to keep the strict pre-BLO-48352 behaviour, in which
+ *   every base claimant counts -- that is the fail-closed direction, so a merge base this
+ *   guard could not read costs a false red, never a false green.
+ * @param {string[]} [args.mergeBaseSqlFiles] `.sql` file names at that same merge base
  * @param {string} [args.baseLabel]
  * @returns {string[]} one message per problem; empty means no base collision
  */
@@ -63,6 +68,8 @@ export function checkAgainstBase({
   baseJournal,
   sqlFiles,
   baseSqlFiles,
+  mergeBaseJournal,
+  mergeBaseSqlFiles,
   baseLabel = "the base branch",
 }) {
   const entries = journal?.entries;
@@ -77,8 +84,43 @@ export function checkAgainstBase({
   }
 
   const problems = [];
+  const headFiles = new Set(sqlFiles);
   const baseTagByIdx = new Map(baseEntries.map((e) => [e.idx, e.tag]));
   const baseIdxByTag = new Map(baseEntries.map((e) => [e.tag, e.idx]));
+
+  // --- rename-in-place is not a collision (BLO-48352) ----------------------
+  // Both arms exist to predict a DUPLICATE in the post-merge tree. A branch
+  // that REPLACES the base's migration at a number -- deletes its .sql and
+  // retags its journal entry -- leaves exactly one claimant there, so there is
+  // nothing for `ensureNoDuplicateFileNumbers` or the merge queue to trip on.
+  //
+  // "absent from the head" is NOT the test, and getting this wrong re-opens
+  // the incident this guard was built for. In BLO-39490 PR_1741 branched
+  // BEFORE PR_1864 landed, so PR_1864's claimant is absent from its head too --
+  // byte-identical to a rename, and a real collision. The discriminator is the
+  // MERGE BASE: a claimant the branch point already carried, and which the head
+  // no longer has, was deliberately retired by this branch. One the merge base
+  // never had was acquired by the base afterwards, and the head has simply not
+  // seen it yet.
+  //
+  // It is also why this is keyed on the merge base rather than on the checked-
+  // out tree being the merge commit. `pr.yml` does check out `refs/pull/N/merge`
+  // today, but that ref goes stale the moment a PR stops being mergeable --
+  // which is exactly when a second claimant appears -- so a rule resting on it
+  // would fail in the one case it has to catch.
+  //
+  // No merge base supplied => every base claimant is genuine, i.e. the strict
+  // pre-BLO-48352 behaviour. That is the fail-closed direction.
+  const headTags = new Set(entries.map((e) => e?.tag).filter((t) => typeof t === "string"));
+  const mergeBaseTags = Array.isArray(mergeBaseJournal?.entries)
+    ? new Set(mergeBaseJournal.entries.map((e) => e?.tag).filter((t) => typeof t === "string"))
+    : null;
+  const mergeBaseFiles = Array.isArray(mergeBaseSqlFiles) ? new Set(mergeBaseSqlFiles) : null;
+
+  /** @param {string} tag */
+  const tagStillClaims = (tag) => headTags.has(tag) || mergeBaseTags === null || !mergeBaseTags.has(tag);
+  /** @param {string} file */
+  const fileStillClaims = (file) => headFiles.has(file) || mergeBaseFiles === null || !mergeBaseFiles.has(file);
 
   // The next number free on BOTH sides, so the suggestion survives the merge.
   // Non-integer `idx` is dropped BEFORE the max: this runs ahead of the
@@ -101,7 +143,7 @@ export function checkAgainstBase({
     }
     // Carried over from the base unchanged: not a collision.
     if (baseTagByIdx.get(entry.idx) === entry.tag) continue;
-    if (baseTagByIdx.has(entry.idx)) {
+    if (baseTagByIdx.has(entry.idx) && tagStillClaims(baseTagByIdx.get(entry.idx))) {
       problems.push(`${JOURNAL_PATH}: adds idx ${entry.idx} ("${entry.tag}"), but ${baseLabel} already has idx ${entry.idx} ("${baseTagByIdx.get(entry.idx)}"). Renumber this migration -- journal entry AND .sql file -- to ${nextFreeIdx}.`);
     } else if (baseIdxByTag.has(entry.tag)) {
       problems.push(`${JOURNAL_PATH}: adds tag "${entry.tag}" at idx ${entry.idx}, but ${baseLabel} already has that tag at idx ${baseIdxByTag.get(entry.tag)}.`);
@@ -126,8 +168,8 @@ export function checkAgainstBase({
       problems.push(`${MIGRATIONS_DIR}/${file} does not start with a 4-digit migration number.`);
       continue;
     }
-    const taken = baseByNumber.get(number);
-    if (taken) {
+    const taken = (baseByNumber.get(number) ?? []).filter(fileStillClaims);
+    if (taken.length > 0) {
       problems.push(`${MIGRATIONS_DIR}/${file} takes number ${number}, but ${baseLabel} already has ${taken.join(", ")} at that number. Renumber to ${nextFreeFileNumber}.`);
     }
   }
@@ -150,6 +192,27 @@ export function readAtRef({ repoRoot, ref, path, exec = execFileSync }) {
     });
   } catch (err) {
     throw new Error(`cannot read ${path} at ${ref}: ${err.message}. This guard's only arm compares against the base, so a missing base is a failure, not a skip -- pr.yml uses fetch-depth: 0.`);
+  }
+}
+
+/**
+ * `git merge-base <baseRef> HEAD`, or null when it cannot be resolved.
+ *
+ * Unlike `readAtRef` this does NOT throw. A merge base is what lets the two
+ * arms tell a rename-in-place from a second claimant; without one they fall
+ * back to treating every base claimant as genuine, which is the strict,
+ * fail-closed direction. So an unresolvable merge base costs a false red that
+ * names the renumber, never a false green.
+ */
+export function readMergeBaseRef({ repoRoot, ref, head = "HEAD", exec = execFileSync }) {
+  try {
+    return exec("git", ["merge-base", ref, head], {
+      encoding: "utf8",
+      cwd: repoRoot,
+      stdio: ["ignore", "pipe", "pipe"],
+    }).trim() || null;
+  } catch {
+    return null;
   }
 }
 
@@ -181,11 +244,29 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     process.exit(0);
   }
 
+  // A migration this branch RETIRED is only distinguishable from one the base
+  // landed after the branch point by looking at the merge base (BLO-48352).
+  // Degrades to the strict comparison rather than failing: see readMergeBaseRef.
+  const mergeBaseRef = readMergeBaseRef({ repoRoot, ref: baseRef });
+  let mergeBaseJournal;
+  let mergeBaseSqlFiles;
+  if (mergeBaseRef) {
+    try {
+      mergeBaseJournal = JSON.parse(readAtRef({ repoRoot, ref: mergeBaseRef, path: JOURNAL_PATH }));
+      mergeBaseSqlFiles = readBaseSqlFiles({ repoRoot, ref: mergeBaseRef });
+    } catch {
+      mergeBaseJournal = undefined;
+      mergeBaseSqlFiles = undefined;
+    }
+  }
+
   const problems = checkAgainstBase({
     journal: JSON.parse(readFileSync(join(repoRoot, JOURNAL_PATH), "utf8")),
     baseJournal: JSON.parse(readAtRef({ repoRoot, ref: baseRef, path: JOURNAL_PATH })),
     sqlFiles: readSqlFiles(repoRoot),
     baseSqlFiles: readBaseSqlFiles({ repoRoot, ref: baseRef }),
+    mergeBaseJournal,
+    mergeBaseSqlFiles,
     baseLabel: `the base branch (${baseRef.slice(0, 9)})`,
   });
 
