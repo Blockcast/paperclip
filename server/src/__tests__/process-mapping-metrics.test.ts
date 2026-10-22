@@ -36,14 +36,20 @@ import {
   SECONDARY_ARENA_CLASS,
   SPECIAL_CLASS,
   STACK_CLASS,
+  MAPPING_SIZE_BUCKETS,
+  SIZE_BUCKET_MAX_BYTES,
+  SIZE_BUCKET_MIN_BYTES,
   TRUNCATED_CLASS,
   collectProcessMappingSnapshot,
+  sizeBucketFor,
 } from "../services/process-mapping-metrics.js";
 import {
   PROCESS_GLIBC_SECONDARY_ARENA_HEAP_COUNT_METRIC,
   PROCESS_MAPPING_COUNT_METRIC,
   PROCESS_MAPPING_RSS_BYTES_METRIC,
   PROCESS_MAPPING_SCAN_SECONDS_METRIC,
+  PROCESS_MAPPING_SIZE_BUCKET_BYTES_METRIC,
+  PROCESS_MAPPING_SIZE_BUCKET_COUNT_METRIC,
   PROCESS_MAPPING_SCAN_TIMESTAMP_METRIC,
   __resetMetricsForTest,
   renderMetrics,
@@ -363,6 +369,8 @@ describe("setProcessMappingMetrics (the publish path)", () => {
     fullAlignedBlockCount: 0,
     scanSeconds: 0.108,
     scanTimestampSeconds: 1_700_000_000,
+    sizeBucketCount: new Map([["262144", 2]]),
+    sizeBucketBytes: new Map([["262144", 524_288]]),
   };
 
   it("publishes every series, including a zero arena count", async () => {
@@ -394,6 +402,8 @@ describe("setProcessMappingMetrics (the publish path)", () => {
     setProcessMappingMetrics(null);
     const all = await lines();
     expect(all.some((l) => l.startsWith(PROCESS_MAPPING_RSS_BYTES_METRIC))).toBe(false);
+    expect(all.some((l) => l.startsWith(PROCESS_MAPPING_SIZE_BUCKET_COUNT_METRIC))).toBe(false);
+    expect(all.some((l) => l.startsWith(PROCESS_MAPPING_SIZE_BUCKET_BYTES_METRIC))).toBe(false);
     expect(all.some((l) => l.startsWith(PROCESS_GLIBC_SECONDARY_ARENA_HEAP_COUNT_METRIC))).toBe(false);
     expect(all.some((l) => l.startsWith(PROCESS_MAPPING_SCAN_TIMESTAMP_METRIC))).toBe(false);
   });
@@ -437,4 +447,108 @@ describe("refreshProcessMappingMetrics (the cadence)", () => {
       expect(await read()).toBeGreaterThanOrEqual(first!);
     },
   );
+});
+
+describe("anon_other size buckets — PEN-3314", () => {
+  const V8_PAGE = 262144;
+
+  it("floors to a power of two, with the exact boundary landing in its own bucket", () => {
+    // Computed by doubling rather than Math.log2 precisely so this holds: a V8
+    // regular page is exactly 262144 bytes, and rounding it down one bucket
+    // would hide the fixed-size signature this instrument exists to find.
+    expect(sizeBucketFor(V8_PAGE)).toBe("262144");
+    expect(sizeBucketFor(V8_PAGE - 1)).toBe("131072");
+    expect(sizeBucketFor(V8_PAGE + 1)).toBe("262144");
+    expect(sizeBucketFor(2 * V8_PAGE)).toBe("524288");
+  });
+
+  it("folds the tails in rather than dropping them", () => {
+    expect(sizeBucketFor(0)).toBe(String(SIZE_BUCKET_MIN_BYTES));
+    expect(sizeBucketFor(1)).toBe(String(SIZE_BUCKET_MIN_BYTES));
+    expect(sizeBucketFor(SIZE_BUCKET_MAX_BYTES * 4)).toBe(String(SIZE_BUCKET_MAX_BYTES));
+    expect(sizeBucketFor(Number.NaN)).toBe(String(SIZE_BUCKET_MIN_BYTES));
+    expect(sizeBucketFor(Number.POSITIVE_INFINITY)).toBe(String(SIZE_BUCKET_MIN_BYTES));
+  });
+
+  it("separates a fixed-size population from a payload-sized one in the SAME bucket", () => {
+    // The discrimination the pair exists for. Both fixtures put four mappings in
+    // the 262144 bucket, so the COUNT alone cannot tell them apart; only
+    // bytes/count can, and that is why neither series is published alone.
+    const fixed = snapshotOf([
+      vma(0x1000000000n, 0x1000000000n + BigInt(V8_PAGE), "rw-p", 256),
+      vma(0x1100000000n, 0x1100000000n + BigInt(V8_PAGE), "rw-p", 256),
+      vma(0x1200000000n, 0x1200000000n + BigInt(V8_PAGE), "rw-p", 256),
+      vma(0x1300000000n, 0x1300000000n + BigInt(V8_PAGE), "rw-p", 256),
+    ])!;
+    const payload = snapshotOf([
+      vma(0x1000000000n, 0x1000000000n + BigInt(V8_PAGE + 4096), "rw-p", 256),
+      vma(0x1100000000n, 0x1100000000n + BigInt(V8_PAGE + 40960), "rw-p", 256),
+      vma(0x1200000000n, 0x1200000000n + BigInt(V8_PAGE + 81920), "rw-p", 256),
+      vma(0x1300000000n, 0x1300000000n + BigInt(V8_PAGE + 122880), "rw-p", 256),
+    ])!;
+
+    expect(fixed.sizeBucketCount.get("262144")).toBe(4);
+    expect(payload.sizeBucketCount.get("262144")).toBe(4);
+
+    const meanOf = (s: typeof fixed) =>
+      s.sizeBucketBytes.get("262144")! / s.sizeBucketCount.get("262144")!;
+    expect(meanOf(fixed)).toBe(V8_PAGE);
+    expect(meanOf(payload)).toBeGreaterThan(V8_PAGE);
+  });
+
+  it("buckets VIRTUAL size, not resident size", () => {
+    // A 256 KiB mapping with one resident page is still a 256 KiB allocation.
+    // Bucketing by RSS would file it under 4096 and misreport the allocator.
+    const snapshot = snapshotOf([
+      vma(0x1000000000n, 0x1000000000n + BigInt(V8_PAGE), "rw-p", 4),
+    ])!;
+    expect(snapshot.sizeBucketCount.get("262144")).toBe(1);
+    expect(snapshot.sizeBucketBytes.get("262144")).toBe(V8_PAGE);
+    expect(snapshot.rssByClass.get(ANON_OTHER_CLASS)).toBe(4 * 1024);
+  });
+
+  it("counts only anon_other, so a same-sized mapping in another class is excluded", () => {
+    const snapshot = snapshotOf([
+      vma(0x1000000000n, 0x1000000000n + BigInt(V8_PAGE), "rw-p", 64, "[heap]"),
+      vma(0x1100000000n, 0x1100000000n + BigInt(V8_PAGE), "r-xp", 64, "/usr/bin/node"),
+      vma(0x1200000000n, 0x1200000000n + BigInt(V8_PAGE), "rw-p", 64),
+    ])!;
+    expect(snapshot.sizeBucketCount.get("262144")).toBe(1);
+  });
+
+  it("publishes a measured zero for every bucket this process has none of", () => {
+    const snapshot = snapshotOf([vma(0x1200000000n, 0x1200000000n + BigInt(V8_PAGE), "rw-p", 64)])!;
+    for (const bucket of MAPPING_SIZE_BUCKETS) {
+      expect(snapshot.sizeBucketCount.get(bucket)).toBe(bucket === "262144" ? 1 : 0);
+      expect(snapshot.sizeBucketBytes.get(bucket)).toBe(bucket === "262144" ? V8_PAGE : 0);
+    }
+  });
+
+  it("renders both series, and renders neither when the scan is unmeasurable", async () => {
+    __resetMetricsForTest();
+    __resetProcessMappingCacheForTest();
+    setProcessMappingMetrics(snapshotOf([
+      vma(0x1200000000n, 0x1200000000n + BigInt(V8_PAGE), "rw-p", 64),
+    ]));
+    const { body } = await renderMetrics();
+    expect(body).toContain(
+      `${PROCESS_MAPPING_SIZE_BUCKET_COUNT_METRIC}{size_bucket="262144"} 1`,
+    );
+    expect(body).toContain(
+      `${PROCESS_MAPPING_SIZE_BUCKET_BYTES_METRIC}{size_bucket="262144"} ${V8_PAGE}`,
+    );
+
+    // Unmeasurable publishes NOTHING -- never a zeroed bucket set, which would
+    // read as "scanned, and the population is empty".
+    __resetMetricsForTest();
+    __resetProcessMappingCacheForTest();
+    setProcessMappingMetrics(null);
+    const empty = await renderMetrics();
+    // SAMPLE lines only: a registered-but-empty gauge still renders its # HELP
+    // and # TYPE, so asserting on the raw body would pass on the help text and
+    // never test the thing this case is about.
+    const samples = empty.body.split("\n").filter((line) => line && !line.startsWith("#"));
+    expect(samples.some((l) => l.startsWith(PROCESS_MAPPING_SIZE_BUCKET_COUNT_METRIC))).toBe(false);
+    expect(samples.some((l) => l.startsWith(PROCESS_MAPPING_SIZE_BUCKET_BYTES_METRIC))).toBe(false);
+  });
 });

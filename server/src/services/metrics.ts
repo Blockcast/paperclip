@@ -1788,6 +1788,20 @@ export const PROCESS_MAPPING_RSS_BYTES_METRIC = "paperclip_process_mapping_rss_b
 export const PROCESS_MAPPING_COUNT_METRIC = "paperclip_process_mapping_count";
 
 /**
+ * Size distribution of the `anon_other` mappings (PEN-3314): counts per
+ * power-of-two `size_bucket`.
+ *
+ * Read with {@link PROCESS_MAPPING_SIZE_BUCKET_BYTES_METRIC}; neither is
+ * interpretable alone. The help strings carry what the pair discriminates.
+ */
+export const PROCESS_MAPPING_SIZE_BUCKET_COUNT_METRIC =
+  "paperclip_process_mapping_size_bucket_count";
+
+/** Summed VIRTUAL bytes per `size_bucket` (PEN-3314). Virtual, not resident. */
+export const PROCESS_MAPPING_SIZE_BUCKET_BYTES_METRIC =
+  "paperclip_process_mapping_size_bucket_bytes";
+
+/**
  * Distinct glibc secondary-arena heaps (PEN-3314). The population the
  * 64-CPU/512-arena hypothesis is about, counted rather than argued.
  */
@@ -4073,6 +4087,8 @@ let processMemoryComponentBytes: Gauge<"component"> | null = null;
 let processV8ContextCount: Gauge<"kind"> | null = null;
 let processMappingRssBytes: Gauge<"mapping_class"> | null = null;
 let processMappingCount: Gauge<"mapping_class"> | null = null;
+let processMappingSizeBucketCount: Gauge<"size_bucket"> | null = null;
+let processMappingSizeBucketBytes: Gauge<"size_bucket"> | null = null;
 let processGlibcSecondaryArenaHeapCount: Gauge | null = null;
 let processMappingScanSeconds: Gauge | null = null;
 let processMappingScanTimestamp: Gauge | null = null;
@@ -4245,6 +4261,8 @@ function ensureRegistry(): {
   processV8ContextCountGauge: Gauge<"kind">;
   processMappingRssBytesGauge: Gauge<"mapping_class">;
   processMappingCountGauge: Gauge<"mapping_class">;
+  processMappingSizeBucketCountGauge: Gauge<"size_bucket">;
+  processMappingSizeBucketBytesGauge: Gauge<"size_bucket">;
   processGlibcSecondaryArenaHeapCountGauge: Gauge;
   processMappingScanSecondsGauge: Gauge;
   processMappingScanTimestampGauge: Gauge;
@@ -4398,6 +4416,8 @@ function ensureRegistry(): {
     || !processV8ContextCount
     || !processMappingRssBytes
     || !processMappingCount
+    || !processMappingSizeBucketCount
+    || !processMappingSizeBucketBytes
     || !processGlibcSecondaryArenaHeapCount
     || !processMappingScanSeconds
     || !processMappingScanTimestamp
@@ -4878,6 +4898,37 @@ function ensureRegistry(): {
         + "the full class rising while the heap count plateaus, and NO series here is the heap "
         + "count. Published at a measured 0 for classes this process currently has none of.",
       labelNames: ["mapping_class"],
+      registers: [registry],
+    });
+    processMappingSizeBucketCount = new Gauge({
+      name: PROCESS_MAPPING_SIZE_BUCKET_COUNT_METRIC,
+      help:
+        "Size distribution of the mapping_class=anon_other population (PEN-3314), bucketed by "
+        + "VIRTUAL size floored to a power of two. size_bucket is the bucket's inclusive lower "
+        + "bound in BYTES; the bucket spans [size_bucket, 2*size_bucket). ONLY anon_other is "
+        + "bucketed -- the other classes are not published here at all, which is ABSENCE and not "
+        + "a measured 0. USELESS ALONE: read it with paperclip_process_mapping_size_bucket_bytes, "
+        + "whose quotient is the MEAN SIZE WITHIN a bucket. That quotient is the point -- a mean "
+        + "of exactly 262144 in the 262144 bucket is a FIXED-SIZE allocator (a V8 regular page is "
+        + "exactly 262144 bytes), while a mean strictly inside the bounds is a PAYLOAD-SIZED one. "
+        + "Those two send the fix to different places and occupy the same bucket. Virtual size, "
+        + "NOT resident: residency is already published per class by "
+        + "paperclip_process_mapping_rss_bytes, and a partially-resident 256KiB mapping is still "
+        + "a 256KiB allocation. Published at a measured 0 for buckets this process has none of.",
+      labelNames: ["size_bucket"],
+      registers: [registry],
+    });
+    processMappingSizeBucketBytes = new Gauge({
+      name: PROCESS_MAPPING_SIZE_BUCKET_BYTES_METRIC,
+      help:
+        "Summed VIRTUAL bytes of the mapping_class=anon_other mappings in each size_bucket "
+        + "(PEN-3314). The denominator's partner: see "
+        + "paperclip_process_mapping_size_bucket_count for what the quotient discriminates, and "
+        + "for why this is virtual rather than resident size. It does NOT sum to "
+        + "paperclip_process_mapping_rss_bytes{mapping_class=\"anon_other\"} and is not meant to "
+        + "-- that series is resident bytes and this one is mapped bytes, so the gap between them "
+        + "is mapped-but-not-resident address space.",
+      labelNames: ["size_bucket"],
       registers: [registry],
     });
     processGlibcSecondaryArenaHeapCount = new Gauge({
@@ -6517,6 +6568,8 @@ function ensureRegistry(): {
     processV8ContextCountGauge: processV8ContextCount,
     processMappingRssBytesGauge: processMappingRssBytes,
     processMappingCountGauge: processMappingCount,
+    processMappingSizeBucketCountGauge: processMappingSizeBucketCount,
+    processMappingSizeBucketBytesGauge: processMappingSizeBucketBytes,
     processGlibcSecondaryArenaHeapCountGauge: processGlibcSecondaryArenaHeapCount,
     processMappingScanSecondsGauge: processMappingScanSeconds,
     processMappingScanTimestampGauge: processMappingScanTimestamp,
@@ -7599,6 +7652,8 @@ export function setProcessMappingMetrics(snapshot: ProcessMappingSnapshot | null
   const metrics = ensureRegistry();
   metrics.processMappingRssBytesGauge.reset();
   metrics.processMappingCountGauge.reset();
+  metrics.processMappingSizeBucketCountGauge.reset();
+  metrics.processMappingSizeBucketBytesGauge.reset();
   metrics.processGlibcSecondaryArenaHeapCountGauge.remove();
   metrics.processMappingScanSecondsGauge.remove();
   metrics.processMappingScanTimestampGauge.remove();
@@ -7608,6 +7663,12 @@ export function setProcessMappingMetrics(snapshot: ProcessMappingSnapshot | null
   }
   for (const [mappingClass, count] of snapshot.countByClass) {
     metrics.processMappingCountGauge.set({ mapping_class: mappingClass }, count);
+  }
+  for (const [bucket, count] of snapshot.sizeBucketCount) {
+    metrics.processMappingSizeBucketCountGauge.set({ size_bucket: bucket }, count);
+  }
+  for (const [bucket, bytes] of snapshot.sizeBucketBytes) {
+    metrics.processMappingSizeBucketBytesGauge.set({ size_bucket: bucket }, bytes);
   }
   metrics.processGlibcSecondaryArenaHeapCountGauge.set(snapshot.secondaryArenaHeapCount);
   metrics.processMappingScanSecondsGauge.set(snapshot.scanSeconds);
@@ -9280,6 +9341,8 @@ export function __resetMetricsForTest(): void {
   processV8ContextCount = null;
   processMappingRssBytes = null;
   processMappingCount = null;
+  processMappingSizeBucketCount = null;
+  processMappingSizeBucketBytes = null;
   processGlibcSecondaryArenaHeapCount = null;
   processMappingScanSeconds = null;
   processMappingScanTimestamp = null;
