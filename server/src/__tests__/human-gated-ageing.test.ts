@@ -612,8 +612,15 @@ describe("threshold and reporting", () => {
       // The property the ordering buys, asserted directly rather than through
       // one fixture's ids: for every cap, the worst-priority row shown is no
       // worse than the best-priority row withheld.
-      const rank = (priority: string | null | undefined) =>
-        ["critical", "high", "medium", "low"].indexOf(priority ?? "low");
+      // Mirrors `comparePriority`: an unrecognised or unset priority ranks
+      // *after* `low`, not before `critical`. `indexOf` alone returns -1 for
+      // one, which would rank it most urgent and let the assertion pass on a
+      // row the selector had actually ranked last.
+      const PRIORITY_ORDER = ["critical", "high", "medium", "low"];
+      const rank = (priority: string | null | undefined) => {
+        const index = PRIORITY_ORDER.indexOf(priority ?? "");
+        return index === -1 ? PRIORITY_ORDER.length : index;
+      };
 
       for (const maxEscalated of [1, 2, 3, 4, 5]) {
         const report = selectAgedHumanGatedIssues(pooledByPriority(), {
