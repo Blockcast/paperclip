@@ -1,4 +1,4 @@
-import { and, eq, inArray, isNotNull, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { activityLog, approvals } from "@paperclipai/db";
 import {
@@ -70,77 +70,88 @@ const PENDING_STATUS = "pending";
  * new scrape target. Same reasoning, and the same collector, as every other
  * DB-derived queue gauge in `scrape-metrics-collector.ts`.
  *
- * Deliberately UNLABELLED BY COMPANY. These feed a single "is the escalation path
- * serving?" alert for the installation, matching the other control-plane queue
- * gauges; a per-company split is a different question and would need its own
- * cardinality argument.
+ * Labelled by company_id + requester (BLO-48410). PEN-3652 forbids reading the
+ * cross-company aggregate: a decision in company B must never mask starvation in
+ * company A, so the rules join `on(company_id)`. `requester` is "agent" when the
+ * card has a requesting agent, else "board". Cardinality is companies x 2 x types.
  */
 export async function refreshApprovalQueueMetrics(db: Db, now = new Date()): Promise<void> {
   try {
-    const [pendingByType, lastDecision, lastRevisionRequest] = await Promise.all([
+    const requester = sql<string>`case when ${approvals.requestedByAgentId} is not null then 'agent' else 'board' end`;
+    const [pendingRows, channelRows, revisionRows] = await Promise.all([
       db
         .select({
+          companyId: approvals.companyId,
+          requester,
           type: approvals.type,
           pending: sql<number | string>`count(*)`,
           oldestCreatedAt: sql<Date | string | null>`min(${approvals.createdAt})`,
         })
         .from(approvals)
         .where(eq(approvals.status, PENDING_STATUS))
-        .groupBy(approvals.type),
+        .groupBy(approvals.companyId, requester, approvals.type),
+      // One row per (company, requester) with ANY history, so a channel that was
+      // never decided still gets a series (at 0) -- the rule contract (BLO-48410).
+      // A decided row with a null `decided_at` carries no timing information and
+      // must not collapse the MAX; the FILTER keeps "never decided" as null.
       db
         .select({
-          decidedAt: sql<Date | string | null>`max(${approvals.decidedAt})`,
+          companyId: approvals.companyId,
+          requester,
+          decidedAt: sql<Date | string | null>`max(${approvals.decidedAt}) filter (where ${inArray(approvals.status, [...BOARD_DECISION_STATUSES])} and ${approvals.decidedAt} is not null)`,
         })
         .from(approvals)
-        .where(
-          and(
-            inArray(approvals.status, [...BOARD_DECISION_STATUSES]),
-            // A decided row with a null `decided_at` carries no timing
-            // information, so it must not collapse the MAX. Filtering here
-            // rather than coalescing to epoch keeps "never decided" distinct
-            // from "decided in 1970".
-            isNotNull(approvals.decidedAt),
-          ),
-        ),
-      // ponytail: no index matches either filter shape. This one can narrow to
-      // approval rows through activity_log_entity_type_id_idx's leading column;
-      // the two approvals aggregates above filter on status alone, so they
-      // seq-scan the table (~1k rows) every tick. Add a status-leading approvals
-      // index, or an (entity_type, action, created_at) activity_log index, if
-      // either aggregate shows up in collector latency.
+        .groupBy(approvals.companyId, requester),
+      // ponytail: no index matches either filter shape; the approvals aggregates
+      // seq-scan (~1k rows) every tick. Add a status-leading approvals index, or an
+      // (entity_type, action, created_at) activity_log index, if collector latency shows it.
       db
         .select({
+          companyId: approvals.companyId,
+          requester,
           createdAt: sql<Date | string | null>`max(${activityLog.createdAt})`,
         })
         .from(activityLog)
+        .innerJoin(approvals, eq(activityLog.entityId, sql`${approvals.id}::text`))
         .where(
           and(
             eq(activityLog.entityType, "approval"),
             eq(activityLog.action, REVISION_REQUESTED_ACTIVITY),
           ),
-        ),
+        )
+        .groupBy(approvals.companyId, requester),
     ]);
 
-    const entries = pendingByType.map((row) => ({
-      type: row.type,
-      pending: Number(row.pending),
-      oldestAgeSeconds: row.oldestCreatedAt
-        ? Math.max(0, (now.getTime() - new Date(row.oldestCreatedAt).getTime()) / 1000)
-        : 0,
-    }));
-
-    const decidedAtMs = Math.max(
-      ...[lastDecision[0]?.decidedAt, lastRevisionRequest[0]?.createdAt]
-        .filter((at): at is Date | string => at != null)
-        .map((at) => new Date(at).getTime()),
+    const key = (companyId: string, req: string) => `${companyId}:${req}`;
+    const revisionAt = new Map(
+      revisionRows.map((row) => [key(row.companyId, row.requester), row.createdAt]),
     );
+    const channels = channelRows.map((row) => {
+      const decidedAtMs = Math.max(
+        ...[row.decidedAt, revisionAt.get(key(row.companyId, row.requester))]
+          .filter((at): at is Date | string => at != null)
+          .map((at) => new Date(at).getTime()),
+      );
+      return {
+        companyId: row.companyId,
+        requester: row.requester,
+        // Seconds, not ms: `time() - <gauge>` only type-checks against Unix seconds.
+        // Math.max() of nothing is -Infinity: never decided, published as 0.
+        lastDecisionTimestampSeconds: Number.isFinite(decidedAtMs) ? decidedAtMs / 1000 : null,
+      };
+    });
 
     setApprovalQueuePendingMetrics({
-      entries,
-      // Seconds, not ms: `time() - <gauge>` in the alert expression only type-checks
-      // against a Unix-seconds series.
-      // Math.max() of nothing is -Infinity: no decision from either source.
-      lastDecisionTimestampSeconds: Number.isFinite(decidedAtMs) ? decidedAtMs / 1000 : null,
+      channels,
+      entries: pendingRows.map((row) => ({
+        companyId: row.companyId,
+        requester: row.requester,
+        type: row.type,
+        pending: Number(row.pending),
+        oldestAgeSeconds: row.oldestCreatedAt
+          ? Math.max(0, (now.getTime() - new Date(row.oldestCreatedAt).getTime()) / 1000)
+          : 0,
+      })),
     });
     setApprovalQueueMetricsRefreshSuccess(true);
   } catch (error) {
