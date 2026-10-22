@@ -1,12 +1,11 @@
 /**
  * PEN-4466: migration 0263 adds the consumption column the budget gates enforce on.
  *
- * Two properties, and the first one is the point. The backfill
- * `consumption_cents := cost_cents` is correct only while no subscription-typed row has
- * ever been written -- once `normalizeBilledCostCents` has zeroed any, copying `cost_cents`
- * bakes the zeros in permanently. The migration states that as a RAISE rather than as a
- * SELECT in a runbook, so this suite exists to prove the gate actually fires rather than
- * sitting in the file as decoration.
+ * `subscription_included` rows already had `cost_cents` zeroed by `normalizeBilledCostCents`,
+ * so copying it would record a false $0. They are left NULL ("not recorded") instead. An
+ * earlier revision RAISEd on such rows; production held ~4k of them, so the worker
+ * crash-looped on deploy and helm rolled back (BLO-48352). The second test pins that the
+ * migration now applies on exactly that data.
  */
 import { createHash } from "node:crypto";
 import fs from "node:fs";
@@ -18,7 +17,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./test-embedded-postgres.js";
 
-const MIGRATION_FILE = "0263_cost_events_consumption_cents.sql";
+const MIGRATION_FILE = "0263_cost_events_add_consumption_cents.sql";
 const COMPANY = "11111111-1111-4111-8111-111111111111";
 const cleanups: Array<() => Promise<void>> = [];
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -77,28 +76,23 @@ describeEmbeddedPostgres("cost_events consumption_cents migration", () => {
     expect(rows[0]!.consumption_cents).toBe(rows[0]!.cost_cents);
   }, 120_000);
 
-  it("refuses to run if the classification fix landed first, rather than backfilling zeros", async () => {
+  it("applies over subscription_included rows, leaving them NULL rather than a baked-in zero", async () => {
     const { database, sql } = await startDatabase("paperclip-consumption-ordering-");
     await rewindToBeforeMigration(sql);
-    // What a CORRECTLY classifying adapter writes: subscription lane, cash column already
-    // zeroed by normalizeBilledCostCents. Backfilling from cost_cents here would make the
-    // zero permanent and leave every hard stop unreachable.
+    // What production held on 2026-10-22 (BLO-48352): subscription rows whose cash column
+    // normalizeBilledCostCents already zeroed, alongside ordinary metered and overage rows.
     await seedLedgerRow(sql, "subscription_included", 0);
+    await seedLedgerRow(sql, "subscription_overage", 900);
+    await seedLedgerRow(sql, "metered_api", 4_271);
 
-    await expect(applyPendingMigrations(database.connectionString)).rejects.toThrow(
-      /PEN-4466: 1 cost_events rows already carry billing_type = subscription_included/,
-    );
+    await applyPendingMigrations(database.connectionString);
+    expect((await inspectMigrations(database.connectionString)).status).toBe("upToDate");
 
-    // The column must not exist and the migration must still read as pending -- a partial
-    // apply that left the column behind would make a re-run look like a clean no-op.
-    const columns = await sql`
-      SELECT 1 FROM information_schema.columns
-       WHERE table_name = 'cost_events' AND column_name = 'consumption_cents'
-    `;
-    expect(columns).toHaveLength(0);
-    expect(await inspectMigrations(database.connectionString)).toMatchObject({
-      status: "needsMigrations",
-      pendingMigrations: expect.arrayContaining([MIGRATION_FILE]),
-    });
+    const rows = await sql`SELECT billing_type, consumption_cents FROM cost_events ORDER BY billing_type`;
+    expect(rows.map((r) => [r.billing_type, r.consumption_cents])).toEqual([
+      ["metered_api", 4_271],
+      ["subscription_included", null],
+      ["subscription_overage", 900],
+    ]);
   }, 120_000);
 });

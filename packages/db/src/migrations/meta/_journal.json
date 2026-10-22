@@ -1791,7 +1791,7 @@
       "idx": 263,
       "version": "7",
       "when": 1792003001477,
-      "tag": "0263_cost_events_consumption_cents",
+      "tag": "0263_cost_events_add_consumption_cents",
       "breakpoints": true
     }
   ]
