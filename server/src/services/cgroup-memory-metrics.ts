@@ -293,10 +293,12 @@ function parseStatFile(contents: string): Map<string, number> {
  * to someone else: it has a `memory.current`, so the backstop does NOT fire, and
  * falling back to it would publish another cgroup's charge as ours. That is the
  * same confident-wrong-answer class this module exists to prevent, so it is the
- * one case worth failing closed for, and it is tested before every other shape
- * check so that a malformed path carrying `..` is still refused. Every other odd
- * reading — unreadable file, v1-only lines, a non-absolute path with no `..` —
- * is merely unverified rather than known wrong, and stays fail-open.
+ * one case worth failing closed for, and it is tested before the absolute-path
+ * check so that a malformed path carrying `..` is still refused. (The `""` and
+ * `"/"` early returns precede it, which is harmless: neither can contain a `..`
+ * segment.) Every other odd reading — unreadable file, v1-only lines, a
+ * non-absolute path with no `..` — is merely unverified rather than known
+ * wrong, and stays fail-open.
  */
 function resolveCgroupDir(
   read: (path: string) => string,
