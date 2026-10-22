@@ -222,12 +222,32 @@ describe("collectCgroupMemorySnapshot", () => {
     expect(snapshot.currentBytes).toBe(563_560_448);
   });
 
-  it("ignores a cgroup v1 /proc/self/cgroup line and does not walk out of the mount", () => {
+  it("falls back to the mount root for readings that are odd but not evidence", () => {
     // A v1 line has the shape `N:controllers:/path` and must not be parsed as a
-    // v2 path; a `..` segment must never escape the cgroup mount.
+    // v2 path. None of these say the mount root is someone else's cgroup, so
+    // they stay fail-open and let the required `memory.current` decide.
     expect(collect({ "/proc/self/cgroup": "3:memory:/kubepods/podabc\n" })!.currentBytes).toBe(563_560_448);
-    expect(collect({ "/proc/self/cgroup": "0::/../../etc\n" })!.currentBytes).toBe(563_560_448);
+    expect(collect({ "/proc/self/cgroup": "0::relative/path\n" })!.currentBytes).toBe(563_560_448);
     expect(collect({ "/proc/self/cgroup": undefined })!.currentBytes).toBe(563_560_448);
+  });
+
+  it("⛔ REFUSES a `..` path instead of falling back to a cgroup that is not ours", () => {
+    // The kernel emits `../` when the process sits OUTSIDE its cgroup namespace
+    // root. The mount root is then a NON-root cgroup belonging to someone else:
+    // it HAS a memory.current, so the root-read backstop cannot catch it, and
+    // falling back would publish another cgroup's charge as ours.
+    expect(collect({ "/proc/self/cgroup": "0::/../sibling\n" })).toBeNull();
+    expect(collect({ "/proc/self/cgroup": "0::/../../etc\n" })).toBeNull();
+  });
+
+  it("refuses a `..` path even though the fallback directory is fully readable", () => {
+    // Guards the regression directly: /cg here is a complete, valid, NON-root
+    // cgroup. The only thing wrong with publishing it is that it is not ours,
+    // so a resolver that fell back would produce a clean-looking wrong answer.
+    const snapshot = collect({ "/proc/self/cgroup": "0::/../sibling\n" });
+    expect(snapshot).toBeNull();
+    // Positive control on the identical fixture: with a benign path it DOES publish.
+    expect(collect({ "/proc/self/cgroup": "0::/\n" })!.currentBytes).toBe(563_560_448);
   });
 
   it("skips malformed memory.stat lines without failing the whole read", () => {

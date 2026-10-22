@@ -199,8 +199,12 @@ const PROC_SELF_CGROUP = "/proc/self/cgroup";
 export interface CgroupMemorySnapshot {
   /** `memory.stat` components, keyed by the label value published for each. */
   readonly components: ReadonlyMap<string, number>;
-  /** `memory.current`, or `null` when unreadable. */
-  readonly currentBytes: number | null;
+  /**
+   * `memory.current`. Never `null`: it is REQUIRED, and an unreadable one makes
+   * the whole snapshot `null` (see {@link collectCgroupMemorySnapshot}), because
+   * its absence is what tells our own cgroup apart from the v2 root.
+   */
+  readonly currentBytes: number;
   /** `memory.max`, or `null` when unreadable OR unlimited (literal `max`). */
   readonly maxBytes: number | null;
   /** `memory.peak` high-water mark, or `null` when unreadable. */
@@ -277,11 +281,28 @@ function parseStatFile(contents: string): Map<string, number> {
  * Returns the mount root unchanged when the file is unreadable or not v2-shaped.
  * That is deliberately permissive rather than fatal: it is the status quo for
  * every runtime where this already worked, and the required `memory.current`
- * check in {@link collectCgroupMemorySnapshot} is what actually refuses a root
- * read. Keeping the refusal in one place stops a parsing quirk here from
- * silently disabling the whole instrument.
+ * check in {@link collectCgroupMemorySnapshot} is the backstop that refuses a
+ * root read. Keeping the refusal there stops a parsing quirk here from silently
+ * disabling the whole instrument.
+ *
+ * Returns `null` — "unresolvable, publish nothing" — for exactly one input: a
+ * path containing a `..` segment. The discriminator is **positive evidence that
+ * the mount root is not ours**, not mere malformedness. The kernel emits `../`
+ * when a process sits OUTSIDE its own cgroup namespace root (migrated after an
+ * `unshare`), and in that case the mount root is a *non-root* cgroup belonging
+ * to someone else: it has a `memory.current`, so the backstop does NOT fire, and
+ * falling back to it would publish another cgroup's charge as ours. That is the
+ * same confident-wrong-answer class this module exists to prevent, so it is the
+ * one case worth failing closed for, and it is tested before every other shape
+ * check so that a malformed path carrying `..` is still refused. Every other odd
+ * reading — unreadable file, v1-only lines, a non-absolute path with no `..` —
+ * is merely unverified rather than known wrong, and stays fail-open.
  */
-function resolveCgroupDir(read: (path: string) => string, root: string, procSelfCgroup: string): string {
+function resolveCgroupDir(
+  read: (path: string) => string,
+  root: string,
+  procSelfCgroup: string,
+): string | null {
   const contents = readOptional(read, procSelfCgroup);
   if (contents === null) return root;
   for (const line of contents.split("\n")) {
@@ -291,9 +312,12 @@ function resolveCgroupDir(read: (path: string) => string, root: string, procSelf
     if (!line.startsWith("0::")) continue;
     const path = line.slice(3).trim();
     if (path === "" || path === "/") return root;
-    // Refuse anything that is not a plain absolute path. `..` is the case that
-    // matters: a crafted value must not walk out of the cgroup mount.
-    if (!path.startsWith("/") || path.split("/").includes("..")) return root;
+    // Known wrong, not merely malformed: we are outside our namespace root, so
+    // the mount root is someone else's cgroup. Refuse rather than fall back.
+    if (path.split("/").includes("..")) return null;
+    // Malformed but not evidence of anything. Fall back to the mount root and
+    // let the required `memory.current` check decide.
+    if (!path.startsWith("/")) return root;
     return `${root}${path}`;
   }
   return root;
@@ -318,6 +342,10 @@ export function collectCgroupMemorySnapshot(
   // the mount root is the host's root cgroup, and reading it would publish
   // node-wide slab as this cgroup's charge.
   const root = resolveCgroupDir(read, mountRoot, procSelfCgroup);
+  // `null` means the resolver has positive evidence the mount root is NOT ours
+  // (a `..` segment). Unlike a root read, that cgroup would have a
+  // `memory.current`, so the backstop below cannot catch it. Publish nothing.
+  if (root === null) return null;
 
   const statContents = readOptional(read, `${root}/memory.stat`);
   // No `memory.stat` at all: not under cgroup v2, or the mount is not visible.
