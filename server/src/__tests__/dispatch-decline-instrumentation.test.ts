@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
   AGENT_DISPATCH_DECLINED_METRIC,
+  HEARTBEAT_RUN_FAILED_METRIC,
   KNOWN_DISPATCH_DECLINE_REASONS,
   UNKNOWN_AGENT_ID,
   UNKNOWN_DISPATCH_DECLINE_REASON,
@@ -248,6 +249,61 @@ describe("recordAgentDispatchDeclined", () => {
     });
     expect(labels.agent_id).toBe(UNKNOWN_AGENT_ID);
     expect(labels.reason).toBe("agent_not_invokable");
+  });
+
+  /**
+   * PEN-4532. `api_tier_fence` ran at ~115-145/h against `agent_id="unknown"`
+   * and was flagged as an unowned anomaly twice on PEN-4529 before anyone
+   * re-derived, from a code comment in metrics.ts, that the collapse is
+   * deliberate. An operator reading Prometheus never sees that comment — the
+   * help text is the only explanation at the metrics surface, and it said
+   * nothing about the collapse at all.
+   *
+   * The ambiguity is what made the re-derivation necessary: `unknown` means
+   * "collapsed by design" here and "attribution genuinely missing" on
+   * HEARTBEAT_RUN_FAILED_METRIC, and nothing on the wire distinguished them.
+   *
+   * Pinned as separate assertions rather than one fixed string so that
+   * rewording stays free and DELETING a load-bearing fact does not. Each
+   * assertion is one fact an operator needs to not re-open this question:
+   * which reasons collapse, that the collapse is intentional and not a
+   * telemetry bug, that `agent_missing` is the unfixable one that must be read
+   * from logs, and that a collapsed series is a fleet-wide total — the last is
+   * what made the original "2.5x the worst seat" comparison overstate it.
+   */
+  it("documents the agent_id='unknown' collapse in the exported help text", async () => {
+    const { body } = await renderMetrics();
+    const help = body
+      .split("\n")
+      .find((line) => line.startsWith(`# HELP ${AGENT_DISPATCH_DECLINED_METRIC} `));
+    expect(help, `no HELP line for ${AGENT_DISPATCH_DECLINED_METRIC}`).toBeDefined();
+    const text = help as string;
+
+    // Every reason that collapses must be named, or an operator cannot tell
+    // which series to stop treating as per-agent facts.
+    for (const reason of [
+      "dispatch_stopped",
+      "api_tier_fence",
+      "scheduling_suppressed",
+      "agent_missing",
+    ] as const) {
+      expect(text, `help text must name the collapsing reason ${reason}`).toContain(reason);
+    }
+
+    // The collapse is a policy choice; the help must say so, and must point at
+    // the metric whose identical label value means the opposite.
+    expect(text).toContain(UNKNOWN_AGENT_ID);
+    expect(text).toContain(HEARTBEAT_RUN_FAILED_METRIC);
+
+    // agent_missing is the one that cannot be fixed by threading a company id,
+    // and the one whose datum lives only in the logs.
+    expect(text).toMatch(/agent_missing collapses permanently/);
+    expect(text).toMatch(/from the logs/);
+
+    // A collapsed reason sums over the whole fleet. Without this an operator
+    // compares it against a single seat's slice and reads a 20x artifact as a
+    // 20x anomaly — which is exactly what PEN-4532 was filed on.
+    expect(text).toMatch(/FLEET-WIDE TOTAL/);
   });
 
   it("collapses a reason outside the allow-list rather than minting a new series", () => {
