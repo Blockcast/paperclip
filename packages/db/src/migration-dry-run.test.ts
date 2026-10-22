@@ -15,7 +15,9 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./test-embedded-postgres.js";
 
-const MIGRATION_FILE = "0263_cost_events_consumption_cents.sql";
+// 0263 was deleted and replaced by 0264 (BLO-48352); 0264 is the pending slot the
+// pre-fix 0263 bytes are substituted into, which reproduces the outage exactly.
+const MIGRATION_FILE = "0264_cost_events_add_consumption_cents.sql";
 const COMPANY = "11111111-1111-4111-8111-111111111111";
 // `git show 9ded350:packages/db/src/migrations/0263_cost_events_consumption_cents.sql`,
 // pinned as a fixture so this test keeps exercising the outage after 0263 is fixed.
@@ -32,7 +34,7 @@ async function startDatabase() {
   cleanups.push(database.cleanup);
   const sql = postgres(database.connectionString, { max: 1, onnotice: () => {} });
   cleanups.push(async () => sql.end());
-  // Rewind to just before 0263 so it is the pending set.
+  // Rewind to just before 0264 so it is the pending set.
   const current = fs.readFileSync(new URL(`./migrations/${MIGRATION_FILE}`, import.meta.url), "utf8");
   await sql.unsafe(`ALTER TABLE cost_events DROP COLUMN IF EXISTS consumption_cents`);
   await sql`DELETE FROM "drizzle"."__drizzle_migrations"
@@ -80,7 +82,7 @@ describeEmbeddedPostgres("pending-migration dry-run (BLO-48353)", () => {
     expect(await untouched(sql)).toEqual({ ...before, column: 0 });
   }, 120_000);
 
-  it("PASSES on the repo's 0263 against a clean ledger, executing it and rolling it back", async () => {
+  it("PASSES on the repo's 0264 against a clean ledger, executing it and rolling it back", async () => {
     const { url, sql } = await startDatabase();
     await seed(sql, "metered_api");
     const before = await untouched(sql);
