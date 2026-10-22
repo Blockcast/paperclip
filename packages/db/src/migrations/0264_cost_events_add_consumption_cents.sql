@@ -1,4 +1,4 @@
--- PEN-4466: give the budget controls a consumption column that cannot be zeroed.
+-- PEN-4466 (as 0264, BLO-48352): give the budget controls a consumption column that cannot be zeroed.
 --
 -- `cost_events` has exactly one money column, `cost_cents`, and it is written through
 -- `normalizeBilledCostCents()` (server/src/services/heartbeat.ts), which returns 0
@@ -29,12 +29,13 @@
 -- and leaves the rows distinguishable for a later list-price repair. `subscription_overage`
 -- is not zeroed, so it is backfilled like any other row.
 --
--- This replaces an earlier revision of 0263 (same number, original file name
--- `0263_cost_events_consumption_cents.sql`) that RAISEd when any `subscription_included`
--- row existed. Production held ~4k such runs, so the RAISE crash-looped the worker on the
--- 2026-10-22 deploy and helm rolled back (BLO-48352). That revision never applied to any
--- persistent database; the rename keeps a dev DB that did apply it from silently matching
--- a different file. `IF NOT EXISTS` makes a re-run on such a DB a no-op.
+-- This replaces `0263_cost_events_consumption_cents.sql`, which RAISEd when any
+-- `subscription_included` row existed. Production held ~4k such runs, so the RAISE
+-- crash-looped the worker on the 2026-10-22 deploy and helm rolled back (BLO-48352).
+-- 0263 is deleted rather than edited (applied migration bytes are frozen by
+-- check-migration-immutability, and the journal-base guard refuses re-using its number).
+-- It never applied to any persistent database; `IF NOT EXISTS` makes this a no-op on a
+-- dev DB that did apply it.
 ALTER TABLE "cost_events" ADD COLUMN IF NOT EXISTS "consumption_cents" integer;
 
 -- Single-pass backfill. `cost_events` is a medium table (est. ~832k rows; the large-table

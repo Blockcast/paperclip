@@ -1,5 +1,5 @@
 /**
- * PEN-4466: migration 0263 adds the consumption column the budget gates enforce on.
+ * PEN-4466: migration 0264 adds the consumption column the budget gates enforce on.
  *
  * `subscription_included` rows already had `cost_cents` zeroed by `normalizeBilledCostCents`,
  * so copying it would record a false $0. They are left NULL ("not recorded") instead. An
@@ -17,7 +17,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./test-embedded-postgres.js";
 
-const MIGRATION_FILE = "0263_cost_events_add_consumption_cents.sql";
+const MIGRATION_FILE = "0264_cost_events_add_consumption_cents.sql";
 const COMPANY = "11111111-1111-4111-8111-111111111111";
 const cleanups: Array<() => Promise<void>> = [];
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -40,7 +40,7 @@ async function startDatabase(prefix: string) {
 }
 
 /**
- * Rewind to just before 0263: drop the column and un-journal the migration, so
+ * Rewind to just before 0264: drop the column and un-journal the migration, so
  * `applyPendingMigrations` replays it against whatever rows the test seeded.
  */
 async function rewindToBeforeMigration(sql: postgres.Sql) {

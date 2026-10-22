@@ -1788,10 +1788,10 @@
       "breakpoints": true
     },
     {
-      "idx": 263,
+      "idx": 264,
       "version": "7",
-      "when": 1792003001477,
-      "tag": "0263_cost_events_add_consumption_cents",
+      "when": 1792003101477,
+      "tag": "0264_cost_events_add_consumption_cents",
       "breakpoints": true
     }
   ]
