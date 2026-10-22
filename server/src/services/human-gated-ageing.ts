@@ -264,7 +264,10 @@ export type HumanGatedAgeingReport = {
   scanned: AgedHumanGatedIssue[];
   /** Open human-gated rows skipped because the prompt/input shape is not trustworthy. */
   malformed: MalformedHumanGatedIssue[];
-  /** Issues past their priority's threshold, oldest first, truncated to `maxEscalated`. */
+  /**
+   * Issues past their priority's threshold, ordered priority first and then
+   * oldest first within each tier, truncated to `maxEscalated` (PEN-4489).
+   */
   escalated: AgedHumanGatedIssue[];
   /** How many issues were past threshold but dropped by `maxEscalated`. */
   escalatedOmitted: number;
