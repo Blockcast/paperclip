@@ -1,5 +1,8 @@
 import { defineConfig } from "vitest/config";
+import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+
+import { buildAdapterUtilsAlias } from "./src/server/adapter-utils-alias.js";
 
 // `@paperclipai/adapter-utils` is imported by src/ (job-manifest.ts,
 // runtime-pin.ts) and by several suites, but this package neither declares it
@@ -15,18 +18,17 @@ const adapterUtilsSrc = (sub: string) =>
     new URL(`../../packages/adapter-utils/src/${sub}`, import.meta.url),
   );
 
+// Monorepo-only: see src/server/adapter-utils-alias.ts for why this must not
+// apply when the adapter directory is built on its own, and for the test that
+// holds the absent branch down.
+const adapterUtilsAlias = buildAdapterUtilsAlias({
+  resolveSrc: adapterUtilsSrc,
+  exists: existsSync,
+});
+
 export default defineConfig({
   resolve: {
-    alias: [
-      {
-        find: /^@paperclipai\/adapter-utils$/,
-        replacement: adapterUtilsSrc("index.ts"),
-      },
-      {
-        find: /^@paperclipai\/adapter-utils\/(.*)$/,
-        replacement: adapterUtilsSrc("$1.ts"),
-      },
-    ],
+    alias: adapterUtilsAlias,
   },
   test: {
     include: ["src/**/*.test.ts"],
