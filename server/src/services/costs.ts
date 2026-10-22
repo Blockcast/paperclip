@@ -5,7 +5,7 @@ import { activityLog, agents, companies, costEvents, heartbeatRuns, issues, proj
 import { notFound, unprocessable } from "../errors.js";
 import { budgetService, type BudgetServiceHooks } from "./budgets.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
-import { consumptionCentsExpr } from "./consumption-metric.js";
+import { consumptionCentsExpr, consumptionCentsSum } from "./consumption-metric.js";
 
 export interface CostDateRange {
   from?: Date;
@@ -143,24 +143,39 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
       if (range?.from) conditions.push(gte(costEvents.occurredAt, range.from));
       if (range?.to) conditions.push(lte(costEvents.occurredAt, range.to));
 
-      const [{ total }] = await db
+      const [{ total, consumptionTotal }] = await db
         .select({
           total: sumAsNumber(costEvents.costCents),
+          consumptionTotal: consumptionCentsSum,
         })
         .from(costEvents)
         .where(and(...conditions));
 
       const spendCents = Number(total);
+      // PEN-4515: CASH and CONSUMPTION side by side, each named for what it is.
+      // `spendCents` keeps summing `cost_cents` -- the cash column, which
+      // normalizeBilledCostCents zeroes for subscription_included. `consumptionCents` is
+      // list price with no billingType branch, and is what every hard gate enforces on
+      // (services/consumption-metric.ts). They are equal for every row written to date;
+      // they diverge the moment any lane is classified as a subscription, and this is what
+      // stops that divergence from being silent.
+      const consumptionCents = Number(consumptionTotal);
       const utilization =
         company.budgetMonthlyCents > 0
           ? (spendCents / company.budgetMonthlyCents) * 100
+          : 0;
+      const consumptionUtilization =
+        company.budgetMonthlyCents > 0
+          ? (consumptionCents / company.budgetMonthlyCents) * 100
           : 0;
 
       return {
         companyId,
         spendCents,
+        consumptionCents,
         budgetCents: company.budgetMonthlyCents,
         utilizationPercent: Number(utilization.toFixed(2)),
+        consumptionUtilizationPercent: Number(consumptionUtilization.toFixed(2)),
       };
     },
 
@@ -265,6 +280,7 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
           .select({
             issueCount: sql<number>`count(distinct ${issues.id})::int`,
             costCents: sumAsNumber(costEvents.costCents),
+            consumptionCents: consumptionCentsSum,
             inputTokens: sumAsNumber(costEvents.inputTokens),
             cachedInputTokens: sumAsNumber(costEvents.cachedInputTokens),
             cacheCreationInputTokens: sumAsNumber(costEvents.cacheCreationInputTokens),
@@ -298,6 +314,7 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
         issueCount: Number(costRow?.issueCount ?? 0),
         includeDescendants: true,
         costCents: Number(costRow?.costCents ?? 0),
+        consumptionCents: Number(costRow?.consumptionCents ?? 0),
         inputTokens: Number(costRow?.inputTokens ?? 0),
         cachedInputTokens: Number(costRow?.cachedInputTokens ?? 0),
         cacheCreationInputTokens: Number(costRow?.cacheCreationInputTokens ?? 0),
@@ -318,6 +335,7 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
           agentName: agents.name,
           agentStatus: agents.status,
           costCents: sumAsNumber(costEvents.costCents),
+          consumptionCents: consumptionCentsSum,
           inputTokens: sumAsNumber(costEvents.inputTokens),
           cachedInputTokens: sumAsNumber(costEvents.cachedInputTokens),
           cacheCreationInputTokens: sumAsNumber(costEvents.cacheCreationInputTokens),
@@ -356,6 +374,7 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
           billingType: costEvents.billingType,
           model: costEvents.model,
           costCents: sumAsNumber(costEvents.costCents),
+          consumptionCents: consumptionCentsSum,
           inputTokens: sumAsNumber(costEvents.inputTokens),
           cachedInputTokens: sumAsNumber(costEvents.cachedInputTokens),
           cacheCreationInputTokens: sumAsNumber(costEvents.cacheCreationInputTokens),
@@ -390,6 +409,7 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
         .select({
           biller: costEvents.biller,
           costCents: sumAsNumber(costEvents.costCents),
+          consumptionCents: consumptionCentsSum,
           inputTokens: sumAsNumber(costEvents.inputTokens),
           cachedInputTokens: sumAsNumber(costEvents.cachedInputTokens),
           cacheCreationInputTokens: sumAsNumber(costEvents.cacheCreationInputTokens),
@@ -437,6 +457,7 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
               provider: costEvents.provider,
               biller: sql<string>`case when count(distinct ${costEvents.biller}) = 1 then min(${costEvents.biller}) else 'mixed' end`,
               costCents: sumAsNumber(costEvents.costCents),
+              consumptionCents: consumptionCentsSum,
               inputTokens: sumAsNumber(costEvents.inputTokens),
               cachedInputTokens: sumAsNumber(costEvents.cachedInputTokens),
               cacheCreationInputTokens: sumAsNumber(costEvents.cacheCreationInputTokens),
@@ -458,6 +479,7 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
             window: label as string,
             windowHours: hours,
             costCents: row.costCents,
+            consumptionCents: row.consumptionCents,
             inputTokens: row.inputTokens,
             cachedInputTokens: row.cachedInputTokens,
             cacheCreationInputTokens: row.cacheCreationInputTokens,
@@ -487,6 +509,7 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
           billingType: costEvents.billingType,
           model: costEvents.model,
           costCents: sumAsNumber(costEvents.costCents),
+          consumptionCents: consumptionCentsSum,
           inputTokens: sumAsNumber(costEvents.inputTokens),
           cachedInputTokens: sumAsNumber(costEvents.cachedInputTokens),
           cacheCreationInputTokens: sumAsNumber(costEvents.cacheCreationInputTokens),
@@ -544,6 +567,7 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
           projectId: effectiveProjectId,
           projectName: projects.name,
           costCents: costCentsExpr,
+          consumptionCents: consumptionCentsSum,
           inputTokens: sumAsNumber(costEvents.inputTokens),
           cachedInputTokens: sumAsNumber(costEvents.cachedInputTokens),
           cacheCreationInputTokens: sumAsNumber(costEvents.cacheCreationInputTokens),

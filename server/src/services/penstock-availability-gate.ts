@@ -6,6 +6,7 @@ import {
   type PenstockProbePathLabel,
   recordPenstockAvailabilityGateProbe,
 } from "./metrics.js";
+import { isPenstockBaseUrl } from "./billing-classification.js";
 
 export interface PenstockAvailabilityGateLogger {
   info(payload: Record<string, unknown>, msg: string): void;
@@ -511,15 +512,6 @@ function resolvePenstockCheck(
     };
   } catch {
     return null;
-  }
-}
-
-function isPenstockBaseUrl(baseUrl: string): boolean {
-  try {
-    const url = new URL(baseUrl);
-    return url.hostname === "api.penstock.run" || url.hostname.endsWith(".penstock.run");
-  } catch {
-    return false;
   }
 }
 

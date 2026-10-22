@@ -256,6 +256,7 @@ import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 import { parseObject, asBoolean, asNumber, asString, appendWithByteCap, MAX_EXCERPT_BYTES } from "../adapters/utils.js";
 import { costService } from "./costs.js";
 import { consumptionCentsSum } from "./consumption-metric.js";
+import { resolveLedgerBillingType } from "./billing-classification.js";
 import { incrementDepBlockedMetric } from "./dep-blocked-metrics.js";
 import { incrementBlockerResolvedWakeMetric } from "./blocker-resolved-wake-metrics.js";
 import { trackAgentFirstHeartbeat } from "@paperclipai/shared/telemetry";
@@ -6776,26 +6777,6 @@ function isExecutionReviewParticipantRecoveryEligibleRun(
     wakeReason === "execution_approval_requested" ||
     isExecutionReviewParticipantRecoveryRun(run)
   );
-}
-
-function normalizeLedgerBillingType(value: unknown): BillingType {
-  const raw = readNonEmptyString(value);
-  switch (raw) {
-    case "api":
-    case "metered_api":
-      return "metered_api";
-    case "subscription":
-    case "subscription_included":
-      return "subscription_included";
-    case "subscription_overage":
-      return "subscription_overage";
-    case "credits":
-      return "credits";
-    case "fixed":
-      return "fixed";
-    default:
-      return "unknown";
-  }
 }
 
 function resolveLedgerBiller(result: AdapterExecutionResult): string {
@@ -30601,7 +30582,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const outputTokens = usage?.outputTokens ?? 0;
     const cachedInputTokens = usage?.cachedInputTokens ?? 0;
     const cacheCreationInputTokens = usage?.cacheCreationInputTokens ?? 0;
-    const billingType = normalizeLedgerBillingType(result.billingType);
+    // PEN-4515: classify against the LANE, not the adapter's self-report. Every Penstock-
+    // brokered run booked as `metered_api` ("the provider bills us per token"), which is
+    // false for all 11 live lanes. See services/billing-classification.ts for the evidence
+    // and for why this resolves to `unknown` rather than asserting a subscription.
+    const billingType = resolveLedgerBillingType({
+      reported: result.billingType,
+      provider: result.provider,
+      adapterConfig: agent.adapterConfig,
+    });
     const additionalCostCents = normalizeBilledCostCents(result.costUsd, billingType);
     const consumptionCents = normalizeConsumptionCostCents(result.costUsd);
     const hasTokenUsage =
@@ -36506,7 +36495,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 cacheCreationInputTokens: normalizedUsage?.cacheCreationInputTokens ?? 0,
                 outputTokens: normalizedUsage?.outputTokens ?? 0,
               }),
-              billingType: normalizeLedgerBillingType(adapterResult.billingType),
+              // PEN-4515: same lane-aware classification as the cost_events write below.
+              // `services/activity.ts` surfaces this field, so leaving it on the raw
+              // self-report would make the run feed contradict the ledger.
+              billingType: resolveLedgerBillingType({
+                reported: adapterResult.billingType,
+                provider: adapterResult.provider,
+                adapterConfig: agent.adapterConfig,
+              }),
             } as Record<string, unknown>)
           : null;
 
