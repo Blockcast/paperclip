@@ -1065,10 +1065,28 @@ describe.sequential("issue comment reopen routes", () => {
         .send({ body: "Please continue this closed issue.", ...intent });
 
       expect(res.status, JSON.stringify(res.body)).toBe(403);
+      // PEN-4495 attached a mutation remediation to this denial — the same
+      // `deny_missing_grant` / `grant` pair, now carrying the route out. Keep
+      // the match exact so a further unexpected key is still a failure, but
+      // hold `remediation` open as a string and pin it below by what it has to
+      // *do* rather than by its wording, so the prose stays editable while the
+      // actionable half cannot vanish unasserted (PEN-2427).
       expect(res.body).toEqual({
         error: "Issue is outside this actor's authorization boundary (grant)",
-        details: { reason: "deny_missing_grant", boundary: "grant" },
+        details: {
+          reason: "deny_missing_grant",
+          boundary: "grant",
+          remediation: expect.any(String),
+        },
       });
+      // Chasing the mention named in the COMMENT remediation is what cost three
+      // agents a run each; this denial has to close that door and name the two
+      // routes that work, including who to ask.
+      expect(res.body.details.remediation).toMatch(/no grant can satisfy issue:mutate/i);
+      expect(res.body.details.remediation).toMatch(/being @-mentioned here does not authorize it/i);
+      expect(res.body.details.remediation).toMatch(/ask the assignee to make the write for you/i);
+      expect(res.body.details.remediation).toMatch(/have the issue assigned to you/i);
+      expect(res.body.details.remediation).toContain("agent://22222222-2222-4222-8222-222222222222");
       expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({ action: "issue:comment" }));
       expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({ action: "issue:mutate" }));
       expect(mockIssueService.update).not.toHaveBeenCalled();
