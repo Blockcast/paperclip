@@ -3652,6 +3652,18 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     sessionDisplayId: resolvedSessionId || null,
     provider: "anthropic",
     model: parsedStream.model || asString(parsed.model as string, model),
+    // WARNING PEN-4515 - DO NOT "fix" this to "subscription". It looks wrong because it is:
+    // this lane runs through Penstock, so nothing here is billed per-token by Anthropic.
+    // But this adapter CANNOT classify. The ANTHROPIC_BASE_URL that decides the lane is
+    // supplied by the Job pod's image ($HOME/.bashrc, see job-manifest.ts) and is not in
+    // anything this process holds, so any answer written here is a guess.
+    //
+    // Classification therefore happens server-side, where the lane IS resolvable, in
+    // `server/src/services/billing-classification.ts` - which rewrites this very value to
+    // `unknown` for a brokered lane. Changing it here to "subscription" would instead reach
+    // `normalizeBilledCostCents`, which zeroes `cost_cents` for `subscription_included`, and
+    // take every budget cap in the fleet to $0 silently. That is the failure the PEN-4463
+    // ruling exists to prevent.
     billingType: "api",
     costUsd: parsedStream.costUsd ?? asNumber(parsed.total_cost_usd, 0),
     resultJson,

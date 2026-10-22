@@ -716,6 +716,11 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
       issueCount: 3,
       includeDescendants: true,
       costCents: 600,
+      // PEN-4515: CONSUMPTION reported beside CASH. These fixtures write no
+      // `consumption_cents`, so the column is NULL and the reader's
+      // `coalesce(consumption_cents, cost_cents)` fallback must land on the cash figure --
+      // which is exactly the pre-migration-0264 row shape this has to keep serving.
+      consumptionCents: 600,
       inputTokens: 60,
       cachedInputTokens: 6,
       // BLO-29842: 7+8+9 from the tree; the sibling's 1000 must not leak in, and

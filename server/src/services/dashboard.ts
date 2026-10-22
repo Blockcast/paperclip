@@ -6,6 +6,7 @@ import type { DashboardIssueActivityDay, DashboardRecentIssue } from "@paperclip
 import { logger } from "../middleware/logger.js";
 import { notFound } from "../errors.js";
 import { budgetService } from "./budgets.js";
+import { consumptionCentsSum } from "./consumption-metric.js";
 import {
   computeAgentScorecards,
   MIN_SAMPLE_DONE,
@@ -119,9 +120,13 @@ export function dashboardService(db: Db) {
     const monthStart = getUtcMonthStart(now);
     const runActivityDays = getRecentUtcDateKeys(now, DASHBOARD_RUN_ACTIVITY_DAYS);
     const runActivityStart = new Date(`${runActivityDays[0]}T00:00:00.000Z`);
-    const [{ monthSpend }] = await db
+    // PEN-4515: the headline burn tile reports CASH and CONSUMPTION, labelled. See
+    // services/consumption-metric.ts -- `cost_cents` is zeroed for subscription lanes, so a
+    // cash-only tile silently under-reports the work done the day classification lands.
+    const [{ monthSpend, monthConsumption }] = await db
       .select({
         monthSpend: sql<number>`coalesce(sum(${costEvents.costCents}), 0)::double precision`,
+        monthConsumption: consumptionCentsSum,
       })
       .from(costEvents)
       .where(
@@ -213,9 +218,14 @@ export function dashboardService(db: Db) {
       bucket.total += count;
     }
 
+    const monthConsumptionCents = Number(monthConsumption);
     const utilization =
       company.budgetMonthlyCents > 0
         ? (monthSpendCents / company.budgetMonthlyCents) * 100
+        : 0;
+    const consumptionUtilization =
+      company.budgetMonthlyCents > 0
+        ? (monthConsumptionCents / company.budgetMonthlyCents) * 100
         : 0;
     const budgetOverview = await budgets.overview(companyId);
 
@@ -230,8 +240,10 @@ export function dashboardService(db: Db) {
       tasks: taskCounts,
       costs: {
         monthSpendCents,
+        monthConsumptionCents,
         monthBudgetCents: company.budgetMonthlyCents,
         monthUtilizationPercent: Number(utilization.toFixed(2)),
+        monthConsumptionUtilizationPercent: Number(consumptionUtilization.toFixed(2)),
       },
       pendingApprovals,
       budgets: {

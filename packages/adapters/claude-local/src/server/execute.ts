@@ -159,6 +159,20 @@ function isBedrockAuth(env: Record<string, string>): boolean {
   );
 }
 
+/**
+ * WARNING PEN-4515 - on a Penstock-proxied lane this answer is not merely wrong, it is
+ * derived from a signal the platform itself manufactured. `applyPaperclipRunAuthAnthropicEnv`
+ * below WRITES `ANTHROPIC_API_KEY` on exactly the proxied lane, and the deployment supplies
+ * it from the `paperclip-penstock-org-key` secret (measured live: a 47-char `psk_...` value,
+ * not an `sk-ant-...` Anthropic key). So "an API key is present" carries no information about
+ * the upstream billing relationship, and this returns "api" for a run Anthropic never meters.
+ *
+ * Left as-is on purpose. The correction belongs where the lane is actually resolvable and
+ * where it covers every adapter at once - `server/src/services/billing-classification.ts`,
+ * which rewrites this value to `unknown` for a brokered lane before it reaches the ledger.
+ * Do NOT "fix" this to return "subscription": that maps to `subscription_included`, which is
+ * the one value `normalizeBilledCostCents` zeroes, and would take every cap to $0 silently.
+ */
 function resolveClaudeBillingType(env: Record<string, string>): "api" | "subscription" | "metered_api" {
   if (isBedrockAuth(env)) return "metered_api";
   return hasNonEmptyEnvValue(env, "ANTHROPIC_API_KEY") ? "api" : "subscription";
