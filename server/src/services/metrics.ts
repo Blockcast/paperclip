@@ -50,6 +50,7 @@ import {
   snapshotRoutineDispatchMetrics,
 } from "./routine-dispatch-metrics.js";
 import type { FdClassSnapshot } from "./fd-class-metrics.js";
+import type { CgroupMemorySnapshot } from "./cgroup-memory-metrics.js";
 import type { NativeMemorySnapshot } from "./native-memory-metrics.js";
 import type { ProcessMappingSnapshot } from "./process-mapping-metrics.js";
 
@@ -1773,6 +1774,38 @@ export const PROCESS_MEMORY_COMPONENT_BYTES_METRIC = "paperclip_process_memory_c
  * steady state is 0, which is why it is published at 0 rather than omitted.
  */
 export const PROCESS_V8_CONTEXT_COUNT_METRIC = "paperclip_process_v8_context_count";
+
+/**
+ * The worker's own cgroup memory charge, decomposed (PEN-3692).
+ *
+ * A different layer from {@link PROCESS_MEMORY_COMPONENT_BYTES_METRIC}: that one
+ * partitions THIS PROCESS's resident footprint, this one reports what the KERNEL
+ * charges the whole cgroup — slab, page cache and page tables included, none of
+ * which any process-level gauge can see. The 09-25..09-28 excursion this exists
+ * for had a JS-heap component of 0.6%. See `services/cgroup-memory-metrics.ts`.
+ */
+export const CGROUP_MEMORY_COMPONENT_BYTES_METRIC = "paperclip_cgroup_memory_component_bytes";
+
+/** cgroup v2 `memory.current` — the charge the kernel enforces against (PEN-3692). */
+export const CGROUP_MEMORY_CURRENT_BYTES_METRIC = "paperclip_cgroup_memory_current_bytes";
+
+/**
+ * cgroup v2 `memory.max` — the hard limit (PEN-3692).
+ *
+ * ABSENT when unlimited, never 0 and never `+Inf`: both render as a usable
+ * number in a `current / max` ratio and silently produce a wrong one.
+ */
+export const CGROUP_MEMORY_MAX_BYTES_METRIC = "paperclip_cgroup_memory_max_bytes";
+
+/**
+ * cgroup v2 `memory.peak` — kernel-maintained high-water mark (PEN-3692).
+ *
+ * The field that survives an excursion every scrape missed, which is the
+ * measured 09-28 failure mode: cAdvisor scrapes at 30 s and a 15-min step sees
+ * 1 sample in 30. Monotonic within a cgroup's life, so read it as a level, not
+ * with rate().
+ */
+export const CGROUP_MEMORY_PEAK_BYTES_METRIC = "paperclip_cgroup_memory_peak_bytes";
 
 /**
  * Resident memory partitioned by the allocator region it lives in (PEN-3314).
@@ -4100,6 +4133,10 @@ let processGlibcSecondaryArenaHeapCount: Gauge | null = null;
 let processMappingScanSeconds: Gauge | null = null;
 let processMappingScanTimestamp: Gauge | null = null;
 let processHeapPeakSamples: Gauge | null = null;
+let cgroupMemoryComponentBytes: Gauge<"component"> | null = null;
+let cgroupMemoryCurrentBytes: Gauge | null = null;
+let cgroupMemoryMaxBytes: Gauge | null = null;
+let cgroupMemoryPeakBytes: Gauge | null = null;
 let pluginError: Gauge<"plugin_id" | "plugin_key"> | null = null;
 let crashRecoveryCandidateIndexPresent: Gauge<"index"> | null = null;
 let pluginMetric: Counter<
@@ -4274,6 +4311,10 @@ function ensureRegistry(): {
   processMappingScanSecondsGauge: Gauge;
   processMappingScanTimestampGauge: Gauge;
   processHeapPeakSamplesGauge: Gauge;
+  cgroupMemoryComponentBytesGauge: Gauge<"component">;
+  cgroupMemoryCurrentBytesGauge: Gauge;
+  cgroupMemoryMaxBytesGauge: Gauge;
+  cgroupMemoryPeakBytesGauge: Gauge;
   pluginErrorGauge: Gauge<"plugin_id" | "plugin_key">;
   crashRecoveryCandidateIndexPresentGauge: Gauge<"index">;
   pluginMetricCounter: Counter<
@@ -4429,6 +4470,10 @@ function ensureRegistry(): {
     || !processMappingScanSeconds
     || !processMappingScanTimestamp
     || !processHeapPeakSamples
+    || !cgroupMemoryComponentBytes
+    || !cgroupMemoryCurrentBytes
+    || !cgroupMemoryMaxBytes
+    || !cgroupMemoryPeakBytes
     || !pluginError
     || !crashRecoveryCandidateIndexPresent
     || !pluginMetric
@@ -5021,6 +5066,81 @@ function ensureRegistry(): {
     // scrape onward, and so that property belongs to the metric rather than to
     // the order in which `/metrics` happens to call its refreshers.
     processHeapPeakSamples.remove();
+    cgroupMemoryComponentBytes = new Gauge({
+      name: CGROUP_MEMORY_COMPONENT_BYTES_METRIC,
+      help:
+        "The worker's OWN cgroup memory charge, decomposed from cgroup v2 memory.stat "
+        + "(PEN-3692). A DIFFERENT LAYER from "
+        + PROCESS_MEMORY_COMPONENT_BYTES_METRIC
+        + ", which partitions this process's resident footprint: this reports what the kernel "
+        + "charges the whole cgroup, including slab and page cache that no process-level gauge "
+        + "can see. component=slab_reclaimable is the headline -- dentry and inode cache, the "
+        + "quantity node-level correlation (r=0.9802, n=672) attributed the 2026-09-25..09-28 "
+        + "excursion to, when this cgroup sat 16384 B below its 10 GiB limit for a day. "
+        + "component=shmem keeps an exclusion checkable: the pod's emptyDirs set no "
+        + "medium: Memory, so a non-zero reading REFUTES that and is itself a finding. "
+        + "NOT A PARTITION -- slab is the kernel's own total of slab_reclaimable + "
+        + "slab_unreclaimable, published beside its parts rather than derived, so do not sum "
+        + "these and expect "
+        + CGROUP_MEMORY_CURRENT_BYTES_METRIC
+        + ". It CONFIRMS THE CLASS ONLY and cannot name the slab cache: cgroup v2 reports "
+        + "slab_reclaimable as one scalar with no per-cache breakdown, so dentry vs inode vs "
+        + "buffer_head still needs host /proc/slabinfo. An absent component means this kernel "
+        + "does not report that field; absence of the whole metric means memory.stat was "
+        + "unreadable or not v2-shaped, deliberately distinct from a measured zero -- a flat "
+        + "slab_reclaimable 0 is exactly the reading that would be cited as refuting PEN-3692. "
+        + "NOT an alert source: detection is the PaperclipWorkerCgroupNearMemoryMax rule.",
+      labelNames: ["component"],
+      registers: [registry],
+    });
+    cgroupMemoryCurrentBytes = new Gauge({
+      name: CGROUP_MEMORY_CURRENT_BYTES_METRIC,
+      help:
+        "cgroup v2 memory.current -- the charge the kernel actually enforces against "
+        + CGROUP_MEMORY_MAX_BYTES_METRIC
+        + " (PEN-3692). Read with "
+        + CGROUP_MEMORY_PEAK_BYTES_METRIC
+        + ", which catches the excursions between scrapes that this one misses. Absent rather "
+        + "than 0 when unreadable.",
+      registers: [registry],
+    });
+    cgroupMemoryMaxBytes = new Gauge({
+      name: CGROUP_MEMORY_MAX_BYTES_METRIC,
+      help:
+        "cgroup v2 memory.max -- the hard limit, for headroom against "
+        + CGROUP_MEMORY_CURRENT_BYTES_METRIC
+        + " (PEN-3692). ABSENT when the cgroup is unlimited (memory.max is the literal string "
+        + "max), never 0 and never +Inf: both of those render as a usable number in a "
+        + "current/max ratio and silently produce a wrong one, where an absent series makes the "
+        + "expression return no data. Raising this limit is NOT the remedy for PEN-3692 -- "
+        + "reclaimable cache grows to fill whatever headroom exists, so a larger limit buys a "
+        + "longer climb to the same wedged state.",
+      registers: [registry],
+    });
+    cgroupMemoryPeakBytes = new Gauge({
+      name: CGROUP_MEMORY_PEAK_BYTES_METRIC,
+      help:
+        "cgroup v2 memory.peak -- the kernel-maintained high-water mark of "
+        + CGROUP_MEMORY_CURRENT_BYTES_METRIC
+        + " (PEN-3692). THE FIELD THAT SURVIVES AN EXCURSION EVERY SCRAPE MISSED, which is the "
+        + "measured failure mode here: cAdvisor scrapes at 30s and a 15-min evaluation step "
+        + "sees 1 sample in 30. Demonstrated incidentally on the authoring pod -- "
+        + "memory.current 2.60 GB against a peak of 3.88 GB, a 1.28 GB excursion no sampled "
+        + "series recorded. Monotonic within one cgroup's life, so read it as a LEVEL and never "
+        + "with rate(); on pod replacement it goes absent and reappears low rather than "
+        + "stepping down. Absent rather than 0 when unreadable.",
+      registers: [registry],
+    });
+    // Same reasoning as processHeapPeakSamples above: prom-client publishes a
+    // LABEL-LESS gauge as `name 0` from registration, before anything has been
+    // measured. Here that zero is actively misleading in three different ways --
+    // a zero-byte limit, a cgroup charging nothing, and a high-water mark of
+    // nothing ever -- and the max one additionally poisons any current/max ratio.
+    // Drop them at construction so "not measurable" is ABSENT from the first
+    // scrape onward, independent of the order `/metrics` calls its refreshers in.
+    cgroupMemoryCurrentBytes.remove();
+    cgroupMemoryMaxBytes.remove();
+    cgroupMemoryPeakBytes.remove();
     agentStartLockHeldSeconds = new Gauge({
       name: AGENT_START_LOCK_HELD_SECONDS_METRIC,
       help:
@@ -6581,6 +6701,10 @@ function ensureRegistry(): {
     processMappingScanSecondsGauge: processMappingScanSeconds,
     processMappingScanTimestampGauge: processMappingScanTimestamp,
     processHeapPeakSamplesGauge: processHeapPeakSamples,
+    cgroupMemoryComponentBytesGauge: cgroupMemoryComponentBytes,
+    cgroupMemoryCurrentBytesGauge: cgroupMemoryCurrentBytes,
+    cgroupMemoryMaxBytesGauge: cgroupMemoryMaxBytes,
+    cgroupMemoryPeakBytesGauge: cgroupMemoryPeakBytes,
     pluginErrorGauge: pluginError,
     crashRecoveryCandidateIndexPresentGauge: crashRecoveryCandidateIndexPresent,
     pluginMetricCounter: pluginMetric,
@@ -7629,6 +7753,49 @@ export function setNativeMemoryMetrics(snapshot: NativeMemorySnapshot | null): v
   // sample), which is what keeps "absent" unambiguous.
   if (snapshot.heapPeakSampleCount !== null) {
     metrics.processHeapPeakSamplesGauge.set(snapshot.heapPeakSampleCount);
+  }
+}
+
+/**
+ * PEN-3692: publish the worker cgroup's own memory decomposition.
+ *
+ * `reset()` on the labelled gauge so a component this kernel stops reporting
+ * stops being published rather than freezing its last value.
+ *
+ * The three scalars use `remove()`, NOT `reset()`, for the reason spelled out on
+ * {@link setNativeMemoryMetrics}: `reset()` returns a label-less gauge to a
+ * *published* 0. Here each of those zeroes is a specific wrong answer rather
+ * than merely a vague one — a zero-byte limit, a cgroup charging nothing, and a
+ * high-water mark of nothing ever — and the limit's zero additionally turns any
+ * `current / max` headroom expression into a division by zero instead of leaving
+ * it with no data.
+ *
+ * A `null` snapshot publishes NOTHING. That is the module's central property,
+ * not housekeeping: `memory.stat` unreadable, or readable but cgroup v1, must
+ * never render as a measured `slab_reclaimable 0` — which is precisely the
+ * reading someone would cite as refuting PEN-3692's hypothesis.
+ */
+export function setCgroupMemoryMetrics(snapshot: CgroupMemorySnapshot | null): void {
+  const metrics = ensureRegistry();
+  metrics.cgroupMemoryComponentBytesGauge.reset();
+  metrics.cgroupMemoryCurrentBytesGauge.remove();
+  metrics.cgroupMemoryMaxBytesGauge.remove();
+  metrics.cgroupMemoryPeakBytesGauge.remove();
+  if (!snapshot) return;
+  for (const [component, bytes] of snapshot.components) {
+    metrics.cgroupMemoryComponentBytesGauge.set({ component }, bytes);
+  }
+  // Each scalar is independently optional, and `null` means "this file was not
+  // readable" or, for the limit, "this cgroup is unlimited". Publish nothing in
+  // either case; see the gauges' help text.
+  if (snapshot.currentBytes !== null) {
+    metrics.cgroupMemoryCurrentBytesGauge.set(snapshot.currentBytes);
+  }
+  if (snapshot.maxBytes !== null) {
+    metrics.cgroupMemoryMaxBytesGauge.set(snapshot.maxBytes);
+  }
+  if (snapshot.peakBytes !== null) {
+    metrics.cgroupMemoryPeakBytesGauge.set(snapshot.peakBytes);
   }
 }
 

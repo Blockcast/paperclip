@@ -74,6 +74,7 @@ import {
   expireStaleRefreshFreshness,
   refreshAgentStartLockMetrics,
   refreshDbPoolMetrics,
+  refreshCgroupMemoryMetrics,
   refreshFdClassMetrics,
   refreshNativeMemoryMetrics,
   refreshProcessMappingMetrics,
@@ -360,6 +361,7 @@ export async function createApp(
       refreshAgentStartLockMetrics();
       refreshFdClassMetrics();
       refreshNativeMemoryMetrics();
+      refreshCgroupMemoryMetrics();
       refreshProcessMappingMetrics();
       const { contentType, body } = await renderMetrics();
       res.status(200).set("Content-Type", contentType).send(body);
