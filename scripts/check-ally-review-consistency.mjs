@@ -1579,7 +1579,11 @@ export function prDormancy(pr, now = Date.now()) {
 export function assertLiveScopeNonVacuous(prs, repo, now = Date.now()) {
   const rows = prs ?? [];
   const { live, reasons, states } = classifyScope(rows, now);
-  if (rows.length > 0 && live === 0) {
+  // An all-draft queue is a real population, not a scoping bug: `draft` is only
+  // ever derived from a literal `isDraft: true` the API returned, so a dropped
+  // field or a bad edit cannot manufacture it (BLO-48423: 4 open, 4 drafts).
+  const allExplicitDrafts = rows.every((pr) => pr?.isDraft === true);
+  if (rows.length > 0 && live === 0 && !allExplicitDrafts) {
     throw new Error(
       `every one of the ${rows.length} open PR(s) in ${repo} classified as unmergeable, ` +
         `so no finding could fail this run. That is a scoping bug, not a clean repo: ` +

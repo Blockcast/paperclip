@@ -2396,6 +2396,20 @@ describe("assertLiveScopeNonVacuous", () => {
     assert.doesNotThrow(() => assertLiveScopeNonVacuous(mixed, "o/r"));
   });
 
+  it("does not fire when every open PR is an explicit draft (BLO-48423)", () => {
+    const allDrafts = [
+      { number: 1, isDraft: true, mergeStateStatus: "CLEAN" },
+      { number: 2, isDraft: true, mergeStateStatus: "BEHIND" },
+    ];
+    assert.doesNotThrow(() => assertLiveScopeNonVacuous(allDrafts, "o/r"));
+  });
+
+  it("still fires when isDraft is missing, not true", () => {
+    // A dropped field must not read as an all-draft queue.
+    const fieldDropped = [{ number: 1, mergeStateStatus: "DIRTY", isDraft: undefined }];
+    assert.throws(() => assertLiveScopeNonVacuous(fieldDropped, "o/r"), /scoping bug/);
+  });
+
   it("does not fire on a repo with no open PRs at all", () => {
     assert.doesNotThrow(() => assertLiveScopeNonVacuous([], "o/r"));
     assert.doesNotThrow(() => assertLiveScopeNonVacuous(undefined, "o/r"));
