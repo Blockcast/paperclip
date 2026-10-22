@@ -73,6 +73,16 @@ describe("runCoverageCheck (BLO-40673 AC4)", () => {
     expect(write).toHaveBeenCalledWith("alertmanager.coverage.checked", 1);
   });
 
+  it("exempts a re-fire still inside one notification cycle, and flags it once past it (BLO-48332)", async () => {
+    const opts = { records: { fp1: record() }, issues: { "issue-1": { id: "issue-1", status: "cancelled" } } };
+    const young = harness(opts);
+    await runCoverageCheck(young.ctx, config, NOW, async () => [{ ...amAlert("fp1"), startsAt: "2026-10-13T18:14:09Z" }]);
+    expect(uncoveredCalls(young.write)).toEqual([]);
+    const old = harness(opts);
+    await runCoverageCheck(old.ctx, config, NOW, async () => [{ ...amAlert("fp1"), startsAt: "2026-10-13T18:08:59Z" }]);
+    expect(uncoveredCalls(old.write)).toHaveLength(1);
+  });
+
   it("keeps per-severity counts separate for one alertname", async () => {
     const { ctx, write } = harness({
       records: { fp1: record(), fp2: record(), fp3: record() },

@@ -35,6 +35,19 @@ import { decideRefire, findActiveAggregateIssue } from "./webhook-handler.js";
 export const COVERAGE_CHECK_EVERY_MINUTES = 15;
 const READ_TIMEOUT_MS = 10_000;
 
+/**
+ * BLO-48332 — a firing episode younger than one Alertmanager notification
+ * cycle (group_wait 30s + group_interval 5m, plus webhook handling) may simply
+ * not have been delivered yet, so its closed row is in flight to reopen, not
+ * stranded. Measured 2026-10-22: re-fires reopened at the next 5m group flush
+ * (06:06:25 -> 06:10:27), and the 06:00:16 pass flagged one 51s after its
+ * startsAt. With many flapping fingerprints under one alertname, two such
+ * races on consecutive passes paged the per-alertname rule. A young alert is
+ * judged on the next pass instead; one whose reopen genuinely failed keeps its
+ * startsAt and is flagged then.
+ */
+export const IN_FLIGHT_GRACE_MS = 6 * 60_000; // ponytail: hard-coded to the AM route timings; read them if they change
+
 /** `/api/v2/alerts` shape: `status` is an object there, not the webhook's string. */
 type AmAlert = Omit<AlertmanagerAlert, "status"> & { status?: { state?: string } };
 
@@ -49,6 +62,7 @@ export async function classifyAlertCoverage(
 ): Promise<CoverageVerdict> {
   // Terminal severities are routed straight to `done` by design (BLO-24177).
   if (isTerminalSeverity(alert.labels.severity)) return "exempt";
+  if (now.getTime() - Date.parse(alert.startsAt ?? "") < IN_FLIGHT_GRACE_MS) return "exempt";
   const record = (await ctx.state.get(alertStateRef(companyId, alert.fingerprint))) as AlertStateRecord | null;
   if (!record?.paperclipIssueId) return "exempt";
   const issue = await ctx.issues.get(record.paperclipIssueId, companyId);
