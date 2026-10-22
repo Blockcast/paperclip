@@ -15,7 +15,7 @@ import path from "node:path";
 import type { ClaudePromptBundle } from "./prompt-cache.js";
 import { buildEnvGuardSetupShell } from "./env-guard.js";
 import { buildClaudeCodeRuntimeShell, buildImageWrapperPreflightShell, buildPrePushHookPreflightShell, claudeCodeRuntimeRoot, IMAGE_WRAPPER_BIN_DIR, resolveClaudeCodeVersion } from "./runtime-pin.js";
-import { GIT_HOOKS_SUBPATH } from "@paperclipai/adapter-utils/github-git-hooks-path";
+import { GIT_HOOKS_SUBPATH } from "./github-git-hooks-path.js";
 import { buildPodLogRedactorSetupShell, POD_LOG_FILTER_ARG_VAR, POD_LOG_FILTER_VAR } from "./pod-log-redactor.js";
 import { SERVER_ONLY_ENV_DENY } from "./inherit-allowlist.js";
 import { SELF_POD_DATA_MOUNT_PATH } from "./k8s-client.js";

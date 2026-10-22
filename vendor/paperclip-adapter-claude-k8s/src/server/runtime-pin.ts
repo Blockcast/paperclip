@@ -47,7 +47,7 @@
  * contract in job-manifest.ts (where HOME is set) points back here.
  */
 
-import { DEFAULT_HOOKS_DIR, hooksDirForDataMount } from "@paperclipai/adapter-utils/github-git-hooks-path";
+import { DEFAULT_HOOKS_DIR, hooksDirForDataMount } from "./github-git-hooks-path.js";
 
 /** npm package that ships the Claude Code CLI. */
 export const CLAUDE_CODE_PACKAGE = "@anthropic-ai/claude-code";
@@ -446,8 +446,11 @@ export const PRE_PUSH_HOOK_PREFLIGHT_NOT_EXECUTABLE = `${PRE_PUSH_HOOK_PREFLIGHT
  *                     looks. `persistence.mountPath` has diverged from
  *                     `DEFAULT_DATA_MOUNT_PATH`; the runtime cannot read chart
  *                     values, so it will keep looking at the default.
- *   NOT-EXECUTABLE  — present but without +x. git runs no hook and reports
- *                     nothing, so this one is otherwise entirely silent.
+ *   NOT-EXECUTABLE  — present but without +x. The runtime's presence check is
+ *                     an `X_OK` access, so this refuses pushes exactly as
+ *                     MASKED does — it is not a silent unscanned-publish. The
+ *                     remedy differs, though, which is why it is its own
+ *                     verdict: the mount is fine, the file needs +x.
  *
  * The verdict text deliberately carries no bare `git` token — not style:
  * `job-manifest.test.ts` scans the whole container command for unclassified
@@ -471,7 +474,7 @@ export function buildPrePushHookPreflightShell(opts: { dataMountPath: string }):
     'if [ -x "$__pchookrt/pre-push" ]; then ' +
       `echo "${PRE_PUSH_HOOK_PREFLIGHT_OK} dir=$__pchookrt" >&2; ` +
     'elif [ -e "$__pchookrt/pre-push" ]; then ' +
-      `echo "${PRE_PUSH_HOOK_PREFLIGHT_NOT_EXECUTABLE} dir=$__pchookrt - a pre-push file is there but is not executable, so no hook runs and nothing is reported; every push from this pod publishes unscanned (PEN-3156, PEN-4518)" >&2; ` +
+      `echo "${PRE_PUSH_HOOK_PREFLIGHT_NOT_EXECUTABLE} dir=$__pchookrt - a pre-push file is there but is not executable, so the egress runtime will refuse every push from this pod; restore +x on the seeded hook — the mount is fine, unlike MASKED (PEN-3156, PEN-4518)" >&2; ` +
     'elif [ -e "$__pchookmnt/pre-push" ]; then ' +
       `echo "${PRE_PUSH_HOOK_PREFLIGHT_OFF_MOUNT} runtime=$__pchookrt data=$__pchookmnt - the hook is on the data volume but not where the egress runtime looks, which it resolves from a constant and cannot learn from chart values; pushes from this pod will be refused (PEN-4518)" >&2; ` +
     "else " +
