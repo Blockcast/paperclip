@@ -127,11 +127,14 @@ refuse_api_merge() {
 
 # BLO-48359: a draft can be a human HOLD (merging publishes to production), and
 # agents un-drafted three of them on 10-22 because green CI + a clean review read
-# like a barrier to clear. `gh pr ready` refuses when the latest
-# ConvertToDraftEvent was made by someone other than the PR author, or when a
-# non-author comment carries hold language. `--undo` (back to draft) is always
-# allowed. Fails closed if the PR cannot be read.
-HOLD_RE='do not merge|don.t merge|hold until|production hold|user hold|only omar|code-owner hold|needs [^ ]+.s go|needs the user.s go'
+# like a barrier to clear. On a draft, `gh pr ready` refuses when a human (any
+# non-Bot actor) made the latest ConvertToDraftEvent, or opened the PR as a draft,
+# or left a comment with hold language. Keyed on `__typename`, not on the author,
+# so a human's own draft of their own PR is a hold too. `--undo` (back to draft)
+# is always allowed. Fails closed if the PR cannot be read.
+# ponytail: reads only the last 100 issue comments, not review bodies or threads;
+# the drafted-by arm is the backstop.
+HOLD_RE='do not merge|don.t merge|hold until|production hold|user hold|code-owner hold|needs [^ ]+.s go|needs the user.s go'
 refuse_ready_on_held_draft() {
   shift 2
   selector="" repo=""
@@ -155,19 +158,23 @@ refuse_ready_on_held_draft() {
     exit 1 ;;
   esac
   # shellcheck disable=SC2016
-  reason="$("${REAL_GH}" api graphql -F n="${number}" -f o="${owner}" -f r="${name}" -f query='query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n){author{login} timelineItems(last:1,itemTypes:[CONVERT_TO_DRAFT_EVENT]){nodes{... on ConvertToDraftEvent{createdAt actor{login}}}} comments(last:100){nodes{author{login} createdAt url body}}}}}' \
-    --jq '.data.repository.pullRequest as $p | ($p.author.login // "") as $a
-      | ([$p.timelineItems.nodes[] | select((.actor.login // "") != $a)
-          | "drafted by \(.actor.login // "unknown") at \(.createdAt)"]
-        + [$p.comments.nodes[] | select((.author.login // "") != $a)
+  reason="$("${REAL_GH}" api graphql -F n="${number}" -f o="${owner}" -f r="${name}" -f query='query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n){isDraft author{__typename login} timelineItems(last:1,itemTypes:[CONVERT_TO_DRAFT_EVENT]){nodes{... on ConvertToDraftEvent{createdAt actor{__typename login}}}} comments(last:100){nodes{author{__typename login} createdAt url body}}}}}' \
+    --jq '.data.repository.pullRequest as $p
+      | if $p.isDraft == false then "" else
+        [$p.timelineItems.nodes[]] as $d
+        | (if ($d | length) > 0
+            then [$d[] | select(.actor.__typename != "Bot") | "drafted by \(.actor.login // "unknown") at \(.createdAt)"]
+            elif $p.author.__typename != "Bot" then ["opened as a draft by \($p.author.login // "unknown")"]
+            else [] end)
+        + [$p.comments.nodes[] | select(.author.__typename != "Bot")
           | select(.body | test("'"${HOLD_RE}"'"; "i"))
-          | "hold comment by \(.author.login // "unknown") at \(.createdAt): \(.url)"])
-      | join("; ")')" || {
+          | "hold comment by \(.author.login // "unknown") at \(.createdAt): \(.url)"]
+        | join("; ") end')" || {
     echo "gh-token-wrapper: refusing \`gh pr ready\`: could not read ${owner}/${name}#${number} to check it for a human draft hold (BLO-48359)" >&2
     exit 1
   }
   if [ -n "${reason}" ]; then
-    echo "gh-token-wrapper: refusing to mark ${owner}/${name}#${number} ready for review: it is a human hold (${reason}). Leave it a draft and record the hold on your issue; only the person who drafted it takes it out (BLO-48359)" >&2
+    echo "gh-token-wrapper: refusing to mark ${owner}/${name}#${number} ready for review: it is a human hold (${reason}). Leave it a draft and record the hold on your issue; only a human takes it out; this refusal does not expire, so do not retry it (BLO-48359)" >&2
     exit 1
   fi
 }

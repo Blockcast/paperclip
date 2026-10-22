@@ -1062,11 +1062,15 @@ fi
 echo "ARGS=$*"
 `;
 
-function prJson({ author = "allyblockcast", draftedBy, comments = [] }) {
+// `allyblockcast` is the App (GraphQL `Bot`); every other login is a human `User`.
+const who = (login) => ({ login, __typename: login === "allyblockcast" ? "Bot" : "User" });
+
+function prJson({ author = "allyblockcast", draftedBy, comments = [], isDraft = true }) {
   return JSON.stringify({ data: { repository: { pullRequest: {
-    author: { login: author },
-    timelineItems: { nodes: draftedBy ? [{ createdAt: "2026-10-22T03:51:35Z", actor: { login: draftedBy } }] : [] },
-    comments: { nodes: comments.map(([login, body]) => ({ author: { login }, createdAt: "2026-10-22T03:51:04Z", url: "u", body })) },
+    isDraft,
+    author: who(author),
+    timelineItems: { nodes: draftedBy ? [{ createdAt: "2026-10-22T03:51:35Z", actor: who(draftedBy) }] : [] },
+    comments: { nodes: comments.map(([login, body]) => ({ author: who(login), createdAt: "2026-10-22T03:51:04Z", url: "u", body })) },
   } } } });
 }
 
@@ -1087,6 +1091,10 @@ for (const [label, pr] of [
   ["drafted by someone other than the author", prJson({ draftedBy: "kkroo" })],
   ["a non-author hold comment", prJson({ comments: [["kkroo", "Production hold: this needs the user's go before landing."]] })],
   ["a non-author 'do not merge'", prJson({ comments: [["kkroo", "Do NOT merge until the gitlink moves."]] })],
+  // paperclip#2910: human-authored, drafted by that same human.
+  ["a human's own draft of their own PR", prJson({ author: "kkroo", draftedBy: "kkroo" })],
+  ["a PR a human opened as a draft", prJson({ author: "kkroo" })],
+  ["a human author's own hold comment", prJson({ author: "kkroo", draftedBy: "allyblockcast", comments: [["kkroo", "do not merge yet"]] })],
 ]) {
   test(`gh pr ready is refused on ${label} (BLO-48359)`, () => {
     withTempDir((dir) => {
@@ -1100,7 +1108,9 @@ for (const [label, pr] of [
 for (const [label, pr] of [
   ["a plain draft", prJson({})],
   ["a draft the author itself drafted", prJson({ draftedBy: "allyblockcast" })],
-  ["hold language only in the author's own comments", prJson({ comments: [["allyblockcast", "do not merge yet"]] })],
+  ["hold language only in the agent's own comments", prJson({ comments: [["allyblockcast", "do not merge yet"]] })],
+  ["a human PR the agent itself drafted", prJson({ author: "kkroo", draftedBy: "allyblockcast" })],
+  ["a PR that is not a draft", prJson({ author: "kkroo", draftedBy: "kkroo", isDraft: false })],
 ]) {
   test(`gh pr ready passes through on ${label} (BLO-48359)`, () => {
     withTempDir((dir) => {
@@ -1118,6 +1128,13 @@ test("gh pr ready --undo is never checked (BLO-48359)", () => {
 test("gh pr ready fails closed when the PR cannot be read (BLO-48359)", () => {
   withTempDir((dir) => {
     const { ran } = runReady(dir, ["pr", "ready", "7"], "not json", 1);
+    assert.equal(ran, undefined);
+  });
+});
+
+test("gh pr ready fails closed on a GraphQL error with no PR (BLO-48359)", () => {
+  withTempDir((dir) => {
+    const { ran } = runReady(dir, ["pr", "ready", "7"], JSON.stringify({ data: { repository: null } }), 1);
     assert.equal(ran, undefined);
   });
 });
