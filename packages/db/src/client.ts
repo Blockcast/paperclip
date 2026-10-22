@@ -851,6 +851,33 @@ async function recordMigrationHistoryEntry(
   );
 }
 
+/**
+ * One migration statement, tolerating the "already applied" SQLSTATEs. Shared
+ * by the runner and the deploy dry-run so the dry-run cannot block a deploy
+ * the runner would have let through (or pass one it would have failed).
+ */
+async function executeMigrationStatement(sql: SqlExecutor, statement: string): Promise<void> {
+  // Use savepoints so a single "already exists" error doesn't abort the transaction.
+  const savepointName = `sp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  await sql.unsafe(`SAVEPOINT ${savepointName}`);
+  try {
+    await sql.unsafe(statement);
+    await sql.unsafe(`RELEASE SAVEPOINT ${savepointName}`);
+  } catch (error: unknown) {
+    const pgError = error as { code?: string };
+    // PostgreSQL error codes for "already applied" scenarios:
+    // 42P07 = duplicate_table, 42701 = duplicate_column, 42710 = duplicate_object,
+    // 42703 = undefined_column (DROP COLUMN on already-dropped column),
+    // 42P01 = undefined_table (operations on already-dropped table)
+    if (pgError.code === "42P07" || pgError.code === "42701" || pgError.code === "42710" || pgError.code === "42703" || pgError.code === "42P01") {
+      await sql.unsafe(`ROLLBACK TO SAVEPOINT ${savepointName}`);
+      await sql.unsafe(`RELEASE SAVEPOINT ${savepointName}`);
+      return;
+    }
+    throw error;
+  }
+}
+
 async function applyPendingMigrationsManually(
   url: string,
   pendingMigrations: string[],
@@ -910,25 +937,7 @@ async function applyPendingMigrationsManually(
 
         await runInTransaction(sql, async () => {
           for (const statement of splitMigrationStatements(migrationContent)) {
-            // Use savepoints so a single "already exists" error doesn't abort the transaction.
-            const savepointName = `sp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-            await sql.unsafe(`SAVEPOINT ${savepointName}`);
-            try {
-              await sql.unsafe(statement);
-              await sql.unsafe(`RELEASE SAVEPOINT ${savepointName}`);
-            } catch (error: unknown) {
-              const pgError = error as { code?: string };
-              // PostgreSQL error codes for "already applied" scenarios:
-              // 42P07 = duplicate_table, 42701 = duplicate_column, 42710 = duplicate_object,
-              // 42703 = undefined_column (DROP COLUMN on already-dropped column),
-              // 42P01 = undefined_table (operations on already-dropped table)
-              if (pgError.code === "42P07" || pgError.code === "42701" || pgError.code === "42710" || pgError.code === "42703" || pgError.code === "42P01") {
-                await sql.unsafe(`ROLLBACK TO SAVEPOINT ${savepointName}`);
-                await sql.unsafe(`RELEASE SAVEPOINT ${savepointName}`);
-                continue;
-              }
-              throw error;
-            }
+            await executeMigrationStatement(sql, statement);
           }
 
           await recordMigrationHistoryEntry(
@@ -1342,6 +1351,149 @@ export async function inspectMigrations(url: string): Promise<MigrationState> {
       pendingMigrations,
       reason: "pending-migrations",
     };
+  } finally {
+    await sql.end();
+  }
+}
+
+/**
+ * Deploy pre-flight (BLO-48353): execute every pending migration against the
+ * TARGET database inside one transaction, then roll it back.
+ *
+ * Exists because a data-dependent guard (`DO $$ ... RAISE`) or a constraint
+ * violation only surfaces when the SQL actually runs. Migration 0263 RAISEd on
+ * 3,992 live `subscription_included` rows during worker boot on 2026-10-22,
+ * crash-looping `paperclip-0` for ~30 min, while the catalog-only index
+ * pre-flight passed. Here the same RAISE fails the deploy before `helm upgrade`.
+ *
+ * Runs against production, so it is bounded and biased toward NOT blocking:
+ *  - Every statement runs under `lock_timeout` and a `statement_timeout` capped
+ *    at what is left of `budgetMs`, so the locks the real migration takes (0263:
+ *    ACCESS EXCLUSIVE on `cost_events` + a full-table UPDATE) are held for at
+ *    most `budgetMs`, never minutes.
+ *  - A timeout, deadlock or an error the single-transaction shape itself causes
+ *    (55P04: an enum value added by one pending migration used by a later one,
+ *    which the runner commits in between) is INCONCLUSIVE, not FAIL.
+ *  - Non-transactional statements (`... CONCURRENTLY`, `VACUUM`) are skipped and
+ *    reported; the runner cannot execute them inside its transaction either.
+ *  - Nothing is recorded in the migration journal; the journal row count is
+ *    re-read after ROLLBACK and a change throws.
+ */
+export type MigrationDryRunOptions = {
+  readonly budgetMs?: number;
+  readonly statementTimeoutMs?: number;
+  readonly lockTimeoutMs?: number;
+  /** Test seam: substitute a migration's bytes (e.g. a pre-fix version). */
+  readonly readMigration?: (migrationFile: string) => Promise<string>;
+};
+
+export type MigrationDryRunResult = {
+  readonly verdict: "pass" | "fail" | "inconclusive" | "nothing-pending";
+  readonly executed: readonly string[];
+  readonly skippedStatements: readonly { migration: string; statement: string }[];
+  /** Set on fail/inconclusive: the migration being executed and what happened. */
+  readonly migration?: string;
+  readonly detail?: string;
+};
+
+export const MIGRATION_DRY_RUN_BUDGET_MS = 60_000;
+export const MIGRATION_DRY_RUN_STATEMENT_TIMEOUT_MS = 30_000;
+export const MIGRATION_DRY_RUN_LOCK_TIMEOUT_MS = 5_000;
+
+// 55P03 lock_not_available, 57014 query_canceled (statement_timeout),
+// 40P01 deadlock_detected, 40001 serialization_failure, 55P04 unsafe_new_enum_value_usage.
+const DRY_RUN_INCONCLUSIVE_CODES = new Set(["55P03", "57014", "40P01", "40001", "55P04"]);
+const NON_TRANSACTIONAL_STATEMENT = /^\s*(?:(?:CREATE|DROP)\s+(?:UNIQUE\s+)?INDEX\s+CONCURRENTLY|REINDEX\b[^;]*\bCONCURRENTLY|VACUUM\b|ALTER\s+SYSTEM\b|(?:CREATE|DROP)\s+DATABASE\b|ALTER\s+TABLE\b[^;]*\bDETACH\s+PARTITION\b[^;]*\bCONCURRENTLY)/i;
+
+function stripLeadingComments(statement: string): string {
+  return statement.replace(/^(?:\s*--[^\n]*\n)+/, "");
+}
+
+export async function dryRunPendingMigrations(
+  url: string,
+  options: MigrationDryRunOptions = {},
+): Promise<MigrationDryRunResult> {
+  const budgetMs = options.budgetMs ?? MIGRATION_DRY_RUN_BUDGET_MS;
+  const statementTimeoutMs = options.statementTimeoutMs ?? MIGRATION_DRY_RUN_STATEMENT_TIMEOUT_MS;
+  const lockTimeoutMs = options.lockTimeoutMs ?? MIGRATION_DRY_RUN_LOCK_TIMEOUT_MS;
+  const readMigration = options.readMigration ?? readMigrationFileContent;
+
+  const state = await inspectMigrations(url);
+  const executed: string[] = [];
+  const skippedStatements: { migration: string; statement: string }[] = [];
+  if (state.status === "upToDate") return { verdict: "nothing-pending", executed, skippedStatements };
+  if (state.reason !== "pending-migrations") {
+    // Fresh bootstrap or a journal-less database: the runner takes a different
+    // path there (drizzle's own migrator), so a dry-run of this one proves nothing.
+    return {
+      verdict: "inconclusive",
+      executed,
+      skippedStatements,
+      detail: `database has no migration journal (${state.reason}); dry-run covers incremental deploys only`,
+    };
+  }
+
+  const sql = createUtilitySql(url);
+  try {
+    const migrationTableSchema = await discoverMigrationTableSchema(sql);
+    const qualifiedTable = `${quoteIdentifier(migrationTableSchema ?? "drizzle")}.${quoteIdentifier(DRIZZLE_MIGRATIONS_TABLE)}`;
+    const journalRows = async () =>
+      (await sql.unsafe<{ count: number }[]>(`SELECT count(*)::int AS count FROM ${qualifiedTable}`))[0]?.count;
+    const journalBefore = await journalRows();
+
+    // Mirror the runner, which first reconciles (journals without executing)
+    // any pending migration whose content is already present, then applies the rest.
+    const toRun: { migrationFile: string; content: string }[] = [];
+    for (const migrationFile of await orderMigrationsByJournal(state.pendingMigrations)) {
+      const content = await readMigration(migrationFile);
+      if (!(await migrationContentAlreadyApplied(sql, content))) toRun.push({ migrationFile, content });
+    }
+
+    let current: string | undefined;
+    let outcome: MigrationDryRunResult | undefined;
+    const started = Date.now();
+    await sql.unsafe("BEGIN");
+    try {
+      await sql.unsafe(`SET LOCAL lock_timeout = '${Math.trunc(lockTimeoutMs)}ms'`);
+      for (const { migrationFile, content } of toRun) {
+        current = migrationFile;
+        for (const statement of splitMigrationStatements(content)) {
+          if (NON_TRANSACTIONAL_STATEMENT.test(stripLeadingComments(statement))) {
+            skippedStatements.push({ migration: migrationFile, statement: statement.split("\n")[0]!.slice(0, 160) });
+            continue;
+          }
+          const remainingMs = budgetMs - (Date.now() - started);
+          if (remainingMs <= 0) {
+            throw Object.assign(new Error(`dry-run exceeded its ${budgetMs}ms budget`), { code: "57014" });
+          }
+          await sql.unsafe(`SET LOCAL statement_timeout = '${Math.trunc(Math.min(statementTimeoutMs, remainingMs))}ms'`);
+          await executeMigrationStatement(sql, statement);
+        }
+        executed.push(migrationFile);
+      }
+      outcome = { verdict: "pass", executed, skippedStatements };
+    } catch (error: unknown) {
+      const { code, message } = error as { code?: string; message?: string };
+      const isPostgres = error instanceof postgres.PostgresError || code === "57014";
+      if (!isPostgres) throw error;
+      outcome = {
+        verdict: DRY_RUN_INCONCLUSIVE_CODES.has(code ?? "") ? "inconclusive" : "fail",
+        executed,
+        skippedStatements,
+        migration: current,
+        detail: `${code ?? "?"}: ${message ?? String(error)}`,
+      };
+    } finally {
+      await sql.unsafe("ROLLBACK");
+    }
+
+    const journalAfter = await journalRows();
+    if (journalAfter !== journalBefore) {
+      throw new Error(
+        `migration dry-run left ${qualifiedTable} at ${journalAfter} rows (was ${journalBefore}); ROLLBACK did not cover it`,
+      );
+    }
+    return outcome;
   } finally {
     await sql.end();
   }

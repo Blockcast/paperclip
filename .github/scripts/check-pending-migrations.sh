@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Read-only deploy gate: refuse to start a rollout whose pending migrations
-# need an index precreated online.
+# Deploy gate: refuse to start a rollout whose pending migrations need an index
+# precreated online, or that error when executed against the target database in
+# a rolled-back transaction (BLO-48353; writes nothing, but takes the
+# migrations' locks for at most MIGRATION_DRY_RUN_BUDGET_MS in client.ts).
 #
 # Runs the check inside the cluster using the CANDIDATE image, not the running
 # one. The pending set is (migrations shipped in the new image) minus (already
@@ -256,7 +258,7 @@ case "${pod_reason}" in
     exit 1 ;;
 esac
 if kubectl -n "${NS}" wait --for=condition=failed "job/${JOB_NAME}" --timeout=10s >/dev/null 2>&1; then
-  echo "pending-migration pre-flight: FAILED — a pending migration needs its index precreated (see remediation above)" >&2
+  echo "pending-migration pre-flight: FAILED — a pending migration needs its index precreated, or failed its rolled-back dry-run (see pre-flight output above)" >&2
 else
   echo "pending-migration pre-flight: INCONCLUSIVE — the container started within ${startup_seconds}s but the migration check produced no result within its ${TIMEOUT_SECONDS}s run budget. The image pull is NOT implicated; treat this as migrations actually in trouble. Not starting the rollout blind" >&2
 fi
