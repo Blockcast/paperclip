@@ -154,7 +154,7 @@ export type AuthorizationDecision = {
     | "deny_low_trust_boundary"
     | "deny_scope"
     | "deny_unsupported_action";
-  /** issue:comment denials only: the relations that were checked (BLO-30968). */
+  /** issue:comment and issue:mutate denials: the relations that were checked (BLO-30968). */
   evaluatedRelations?: string[];
   grant?: {
     principalType: PrincipalType;
