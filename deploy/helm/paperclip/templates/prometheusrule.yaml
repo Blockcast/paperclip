@@ -98,7 +98,7 @@
       2026-10-21, when PaperclipRuntimeResourceReconciliationStuck was
       re-measured as PRESENT in monitoring/prometheus-rules-2-configmap.yaml.
       LANDED. Verify:
-        gh api repos/Blockcast/onprem-k8s/contents/monitoring/prometheus-configmap.yaml \
+        gh api repos/Blockcast/onprem-k8s/contents/monitoring/prometheus-rules-2-configmap.yaml \
           --jq '.content' | base64 -d | grep PaperclipRuntimeResourceReconciliationStuck
 
     - It reads two metrics this PR adds
@@ -160,6 +160,7 @@
       explain. A reader who trusted that verdict would have gone and built a
       detector that already exists. The manual Argo sync gate (BLO-19095)
       still separates "in the ConfigMap" from "deployed".
+
   ============================================================================
   PEN-4479 -- MEASURED DRIFT LEDGER, and the recorded decision on a guard
   ============================================================================
