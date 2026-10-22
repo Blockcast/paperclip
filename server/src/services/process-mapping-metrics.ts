@@ -195,6 +195,56 @@ export const TRUNCATED_CLASS = "unclassified_truncated";
 export const MAPPING_RSS_TOTAL_CLASS = "total";
 
 /** Every class this module can publish, so the publish path can emit measured zeroes. */
+/**
+ * The one class the size histogram is computed for: {@link ANON_OTHER_CLASS}.
+ *
+ * Scoped to a single class on purpose. The histogram exists to answer one
+ * question about one population, and bucketing all nine classes would multiply
+ * the series count by fifteen to publish fourteen distributions nobody has a
+ * question about. Widening it is a one-line change if another class ever
+ * becomes the suspect.
+ */
+export const SIZE_BUCKETED_CLASS = ANON_OTHER_CLASS;
+
+/** Smallest bucket: the 4 KiB page. Everything at or below it folds in here. */
+export const SIZE_BUCKET_MIN_BYTES = 4096;
+
+/** Largest bucket: 64 MiB. Everything at or above it folds in here. */
+export const SIZE_BUCKET_MAX_BYTES = 64 * 1024 * 1024;
+
+/**
+ * Bucket a mapping by its *virtual size*, floored to a power of two.
+ *
+ * The label is the bucket's inclusive lower bound in bytes, and the bucket
+ * spans `[label, 2 * label)`. Raw bytes rather than `"256KiB"` so the label
+ * sorts and compares numerically wherever it is read.
+ *
+ * ⚠ Virtual size (`end - start`), NOT resident size. The question is what
+ * *allocation unit* produced these mappings, and residency is already published
+ * per class by {@link ProcessMappingSnapshot.rssByClass}. A partially-resident
+ * 256 KiB mapping is still a 256 KiB allocation and must bucket as one.
+ *
+ * Computed by doubling rather than by `Math.log2` so the boundary is exact: a
+ * mapping of exactly 262144 bytes must land in the 262144 bucket and never in
+ * the one below it on a floating-point rounding.
+ */
+export function sizeBucketFor(sizeBytes: number): string {
+  if (!Number.isFinite(sizeBytes) || sizeBytes <= SIZE_BUCKET_MIN_BYTES) {
+    return String(SIZE_BUCKET_MIN_BYTES);
+  }
+  if (sizeBytes >= SIZE_BUCKET_MAX_BYTES) return String(SIZE_BUCKET_MAX_BYTES);
+  let bucket = SIZE_BUCKET_MIN_BYTES;
+  while (bucket * 2 <= sizeBytes) bucket *= 2;
+  return String(bucket);
+}
+
+/** Every bucket label, so the publish path can emit measured zeroes. */
+export const MAPPING_SIZE_BUCKETS: readonly string[] = (() => {
+  const buckets: string[] = [];
+  for (let b = SIZE_BUCKET_MIN_BYTES; b <= SIZE_BUCKET_MAX_BYTES; b *= 2) buckets.push(String(b));
+  return buckets;
+})();
+
 export const MAPPING_CLASSES: readonly string[] = [
   MAIN_ARENA_CLASS,
   SECONDARY_ARENA_CLASS,
@@ -232,6 +282,26 @@ export interface ProcessMappingSnapshot {
    * the one thing this field exists to prevent.
    */
   scanTimestampSeconds: number;
+  /**
+   * Size bucket -> number of {@link SIZE_BUCKETED_CLASS} mappings in it.
+   *
+   * ⚠ Read this together with {@link ProcessMappingSnapshot.sizeBucketBytes}:
+   * the count alone says which bucket the population sits in, and the two
+   * together give the mean size *within* a bucket, which is what separates
+   * "every one of these is exactly 262144 bytes" from "these are spread across
+   * [256 KiB, 512 KiB)". That distinction is the entire discriminating power of
+   * the pair — a fixed-size allocator and a payload-sized one occupy the same
+   * bucket and need different fixes.
+   */
+  sizeBucketCount: ReadonlyMap<string, number>;
+  /**
+   * Size bucket -> summed *virtual* bytes of those mappings.
+   *
+   * See {@link ProcessMappingSnapshot.sizeBucketCount}. Does not sum to the
+   * `anon_other` entry of {@link ProcessMappingSnapshot.rssByClass} and is not
+   * meant to: that is resident bytes, this is mapped bytes.
+   */
+  sizeBucketBytes: ReadonlyMap<string, number>;
 }
 
 interface Vma {
@@ -476,9 +546,25 @@ export function collectProcessMappingSnapshot(
     countByClass.set(mappingClass, 0);
   }
 
+  const sizeBucketCount = new Map<string, number>();
+  const sizeBucketBytes = new Map<string, number>();
+  for (const bucket of MAPPING_SIZE_BUCKETS) {
+    sizeBucketCount.set(bucket, 0);
+    sizeBucketBytes.set(bucket, 0);
+  }
+
   let total = 0;
   for (const vma of vmas) {
     const mappingClass = classify(vma, confirmed, full);
+    if (mappingClass === SIZE_BUCKETED_CLASS) {
+      // Virtual size, deliberately; see `sizeBucketFor`. Truncated mappings are
+      // not classified and so are absent here, exactly as they are absent from
+      // every other per-class figure except TRUNCATED_CLASS itself.
+      const size = Number(vma.end - vma.start);
+      const bucket = sizeBucketFor(size);
+      sizeBucketCount.set(bucket, sizeBucketCount.get(bucket)! + 1);
+      sizeBucketBytes.set(bucket, sizeBucketBytes.get(bucket)! + size);
+    }
     rssByClass.set(mappingClass, rssByClass.get(mappingClass)! + vma.rss);
     countByClass.set(mappingClass, countByClass.get(mappingClass)! + 1);
     total += vma.rss;
@@ -493,6 +579,8 @@ export function collectProcessMappingSnapshot(
   return {
     rssByClass,
     countByClass,
+    sizeBucketCount,
+    sizeBucketBytes,
     secondaryArenaHeapCount: confirmed.size,
     fullAlignedBlockCount: full.size,
     scanSeconds: Math.max(0, monotonic() - started),

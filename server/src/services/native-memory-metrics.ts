@@ -123,6 +123,42 @@ export const V8_GLOBAL_HANDLES_TOTAL_COMPONENT = "v8_global_handles_total";
 /** `v8.getHeapStatistics().used_global_handles_size` — persistent handles actually in use. */
 export const V8_GLOBAL_HANDLES_USED_COMPONENT = "v8_global_handles_used";
 
+/**
+ * `v8.getHeapStatistics().total_physical_size` — the heap V8 has actually
+ * committed physical pages for, as against `heapTotal`'s *reserved* size.
+ *
+ * ## Why this component and not another subtraction
+ *
+ * The 2026-10-21 generation of `paperclip-0` (born 08:03:09Z, 0 restarts) grew
+ * `mapping_class=anon_other` by **+460 MB over 15.4 h while `heapTotal` moved
+ * +21 MB**, and RSS rose +555 MB. The two same-image `paperclip-api` siblings
+ * over the identical window moved `anon_other` by **−450 and −375 MB**. So the
+ * worker accrues anonymous mappings that V8's *reserved* heap does not account
+ * for and the siblings do not — but `heapTotal` alone cannot say whether those
+ * pages are still physically committed inside V8, or were handed back by V8 and
+ * retained below it.
+ *
+ * That is the whole remaining question, and it has exactly two answers:
+ *
+ *   - `total_physical_size` **stays high while `heapTotal` falls** ⇒ the pages
+ *     are committed inside V8 and the retention is V8's own (its page pool, or
+ *     a heap it declines to shrink). The fix is a V8 flag or an explicit
+ *     release.
+ *   - `total_physical_size` **tracks `heapTotal` down while RSS stays up** ⇒ V8
+ *     released them and something *below* V8 — the page allocator, glibc, the
+ *     kernel — kept them resident. The fix is at that layer instead.
+ *
+ * Those point at different subsystems, and nothing already published separates
+ * them: `heapTotal` is reserved rather than committed, and
+ * {@link NATIVE_UNACCOUNTED_COMPONENT} subtracts that reserved figure, so it
+ * charges V8-committed-but-unreserved bytes to "native" where they are not
+ * native at all.
+ *
+ * ⛔ Not a fix and not an alert source. It is the discriminator that tells the
+ * next change which layer to go to.
+ */
+export const V8_HEAP_PHYSICAL_COMPONENT = "v8_heap_physical";
+
 /** `number_of_native_contexts` — a steady-state value; growth means contexts are retained. */
 export const NATIVE_CONTEXT_KIND = "native";
 /** `number_of_detached_contexts` — non-zero is a leak signature with no healthy steady state. */
@@ -170,6 +206,7 @@ export interface HeapStatisticsReading {
   peak_malloced_memory?: number;
   total_global_handles_size?: number;
   used_global_handles_size?: number;
+  total_physical_size?: number;
   number_of_native_contexts?: number;
   number_of_detached_contexts?: number;
 }
@@ -263,6 +300,13 @@ export function collectNativeMemorySnapshot(
   }
   if (finite(heap.used_global_handles_size)) {
     components.set(V8_GLOBAL_HANDLES_USED_COMPONENT, heap.used_global_handles_size);
+  }
+  // PEN-3314: committed-vs-reserved. Guarded by `finite` like every other field
+  // here because a Node version that does not report it must leave the series
+  // ABSENT -- a published 0 would read as "V8 has committed nothing", which is
+  // precisely the wrong half of the discrimination this component exists to make.
+  if (finite(heap.total_physical_size)) {
+    components.set(V8_HEAP_PHYSICAL_COMPONENT, heap.total_physical_size);
   }
 
   // PEN-3314: the lifetime heap peaks, which are the whole reason this row's

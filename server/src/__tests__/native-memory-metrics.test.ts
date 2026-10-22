@@ -30,6 +30,7 @@ import {
   NATIVE_UNACCOUNTED_COMPONENT,
   V8_GLOBAL_HANDLES_TOTAL_COMPONENT,
   V8_GLOBAL_HANDLES_USED_COMPONENT,
+  V8_HEAP_PHYSICAL_COMPONENT,
   V8_MALLOCED_COMPONENT,
   V8_PEAK_MALLOCED_COMPONENT,
   collectNativeMemorySnapshot,
@@ -52,6 +53,7 @@ const HEAP = {
   used_global_handles_size: 32_768,
   number_of_native_contexts: 3,
   number_of_detached_contexts: 0,
+  total_physical_size: 900_000_000,
 };
 
 function collect(usage: Record<string, number> = USAGE, heap: Record<string, number> = HEAP) {
@@ -107,6 +109,25 @@ describe("collectNativeMemorySnapshot", () => {
     expect(components.get(V8_PEAK_MALLOCED_COMPONENT)).toBe(8_192);
     expect(components.get(V8_GLOBAL_HANDLES_TOTAL_COMPONENT)).toBe(65_536);
     expect(components.get(V8_GLOBAL_HANDLES_USED_COMPONENT)).toBe(32_768);
+  });
+
+  it("publishes V8's committed heap separately from its reserved heap", () => {
+    // PEN-3314. `heapTotal` is RESERVED; this is COMMITTED. The gap between them
+    // is the whole question on that row: committed-but-unreserved bytes are
+    // charged to `native_unaccounted` by its subtraction, where they are not
+    // native at all.
+    const components = collect()!.components;
+    expect(components.get(V8_HEAP_PHYSICAL_COMPONENT)).toBe(900_000_000);
+    expect(components.get(V8_HEAP_PHYSICAL_COMPONENT))
+      .not.toBe(components.get(NATIVE_UNACCOUNTED_COMPONENT));
+  });
+
+  it("omits the committed-heap component on a runtime that does not report it", () => {
+    // Absence, never 0: a published 0 reads as "V8 has committed nothing", which
+    // is the exact wrong half of the discrimination this component exists for.
+    const { total_physical_size: _dropped, ...heap } = HEAP;
+    const components = collect(USAGE, heap)!.components;
+    expect(components.has(V8_HEAP_PHYSICAL_COMPONENT)).toBe(false);
   });
 
   it("reports a zero detached-context count rather than omitting it", () => {
