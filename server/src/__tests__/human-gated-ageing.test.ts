@@ -770,7 +770,6 @@ describe("threshold and reporting", () => {
     });
   });
 
-
   it("treats snake_case human-touch input as malformed instead of falling back to createdAt", () => {
     const snakeCaseRow = {
       ...issue({

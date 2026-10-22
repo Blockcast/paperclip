@@ -146,9 +146,14 @@ export const DEFAULT_ESCALATE_AFTER_DAYS_BY_PRIORITY: Readonly<Record<string, nu
  *
  * - **Raising the cap** cannot stop the list being a tier filter at any size
  *   that is not effectively uncapped. For the cut to land *inside* a tier it
- *   must exceed the deepest tier, and the deepest tier is `high` at 35 — so the
- *   smallest non-filtering cap is 36, and since `critical` + `high` is 57 of
- *   the 68, any cap that reaches `medium` at all is ~58. **There is no value
+ *   must exceed the deepest tier, and the deepest tier is `high` — so on the
+ *   counts above the smallest non-filtering cap is 36, and since `critical` +
+ *   `high` is 57 of the 68, any cap that reaches `medium` at all is ~58.
+ *   Those two integers inherit the table's ceiling: they are derived from
+ *   upper bounds, so the true values can only be lower. The *shape* of the
+ *   argument does not depend on them — a cap that reaches `medium` must exceed
+ *   `critical` + `high` whatever the exact counts are, and `high` is the
+ *   deepest tier on every measurement taken so far. **There is no value
  *   between "tier filter" and "muted."** That is the fact that closes this
  *   option, and it was not available when PEN-4489 chose; the day-one reasoning
  *   it rejected the option on is reproduced under
