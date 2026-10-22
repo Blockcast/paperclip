@@ -624,7 +624,19 @@ const INSTANCE_OVERLAY_SIZE_LIMIT = "16Mi";
  * entries and gains new `wt-*` dirs weekly.
  */
 const ROOT_OVERLAY_VOLUME_NAME = "root-overlay";
-const ROOT_TOOLCHAIN_SUBPATHS = ["bin", "tools", "jre", ".local/bin", ".bun/bin", ".cache/puppeteer-browsers"];
+// `.local/share/paperclip-git-hooks` holds the PEN-3156 pre-push publish guard
+// the image `git` wrapper points core.hooksPath at; without it every push from
+// a narrowed pod fails closed (BLO-48361). Only that dir, never `.local/share`,
+// which also holds mkcert's CA key.
+const ROOT_TOOLCHAIN_SUBPATHS = [
+  "bin",
+  "tools",
+  "jre",
+  ".local/bin",
+  ".local/share/paperclip-git-hooks",
+  ".bun/bin",
+  ".cache/puppeteer-browsers",
+];
 
 function sharedPnpmStorePath(rawCompanyId: string, dataMountPath: string): string {
   const companyId = sanitizeForK8sPath(rawCompanyId);
