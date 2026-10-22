@@ -5119,7 +5119,7 @@ export function issueRoutes(
       `Writes to this issue — including its documents — are relationship-gated, not ` +
       `grant-gated. ${assigneeClause}Unlike issue:comment, no grant can satisfy issue:mutate: ` +
       `being @-mentioned here does not authorize it, and neither does managing the assignee, ` +
-      `creating the issue, or holding a blocks edge to it — those carry comment access only. ` +
+      `creating the issue, or holding a blocks edge to it — those do not authorize this write. ` +
       `Do not post an agent:// mention expecting it to grant this; it will not. The routes that ` +
       `do work: ask the assignee to make the write for you (they hold every field), or have the ` +
       `issue assigned to you. If you need to record findings the assignee has not promoted yet, ` +
