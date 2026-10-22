@@ -95,9 +95,9 @@ const PRIORITY_RANK = new Map<string, number>(
  * answering a question about a different queue.
  *
  * Re-deriving these values changes what "overdue" means, so it is a decision in
- * its own right rather than a tuning pass, and it is tracked separately rather
- * than folded in here. Until then, read a past-threshold count from this digest
- * as "open and older than two weeks", not as a triage verdict.
+ * its own right rather than a tuning pass, and it is tracked on **PEN-4500**
+ * rather than folded in here. Until then, read a past-threshold count from this
+ * digest as "open and older than two weeks", not as a triage verdict.
  */
 export const DEFAULT_ESCALATE_AFTER_DAYS_BY_PRIORITY: Readonly<Record<string, number>> =
   Object.freeze({
