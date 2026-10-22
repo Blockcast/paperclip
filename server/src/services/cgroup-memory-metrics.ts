@@ -35,11 +35,28 @@
  *
  * ## Why this is the only place the read can happen
  *
- * `/sys/fs/cgroup/memory.stat` always resolves to the *reading process's* own
- * cgroup. An agent seat reading it learns about the agent pod and nothing about
- * the worker, and no agent seat reaches another pod's cgroup at all. A collector
- * inside the worker process is therefore the one place the worker's cgroup is
- * addressable — the limitation was always scope, never permission.
+ * A process can only read cgroup accounting for its own cgroup: an agent seat
+ * reading it learns about the agent pod and nothing about the worker, and no
+ * agent seat reaches another pod's cgroup at all. A collector inside the worker
+ * process is therefore the one place the worker's cgroup is addressable — the
+ * limitation was always scope, never permission.
+ *
+ * ⚠ **`/sys/fs/cgroup` is NOT unconditionally this process's own cgroup**, and
+ * getting that wrong is the one way this module could produce the confident
+ * wrong answer it exists to prevent. The mount shows our own cgroup as the root
+ * only under a *private cgroup namespace* (the Kubernetes default since 1.25,
+ * and what this cluster uses — `/proc/self/cgroup` reads `0::/`). Under
+ * `cgroupns=host` the same path is the **host root cgroup**, whose `memory.stat`
+ * is v2-shaped and would sail through {@link V2_REQUIRED_KEYS} — publishing
+ * **node-wide slab as this cgroup's charge**. Two guards, both load-bearing:
+ *
+ *   1. The cgroup path is resolved from `/proc/self/cgroup` rather than assumed,
+ *      so a host-namespace deployment reads the right subdirectory instead of
+ *      the root.
+ *   2. `memory.current` is **required**. The v2 root cgroup does not have it (the
+ *      memory controller creates no interface files there), so requiring it
+ *      refuses a root read outright — a backstop that holds even if the path
+ *      resolution above is defeated some other way.
  *
  * The teardown path this row suspects runs in exactly this cgroup, which is what
  * makes the read attributable: `execFile` children share the parent's cgroup, and
@@ -176,6 +193,9 @@ const V2_REQUIRED_KEYS: readonly string[] = [
 /** Default cgroup v2 mount point. */
 const CGROUP_ROOT = "/sys/fs/cgroup";
 
+/** Where the kernel reports this process's cgroup membership. */
+const PROC_SELF_CGROUP = "/proc/self/cgroup";
+
 export interface CgroupMemorySnapshot {
   /** `memory.stat` components, keyed by the label value published for each. */
   readonly components: ReadonlyMap<string, number>;
@@ -192,6 +212,8 @@ export interface CollectCgroupMemoryOptions {
   readonly readFile?: (path: string) => string;
   /** Override the cgroup mount root. */
   readonly cgroupRoot?: string;
+  /** Override the `/proc/self/cgroup` path. Injected for tests. */
+  readonly procSelfCgroup?: string;
 }
 
 /**
@@ -243,6 +265,41 @@ function parseStatFile(contents: string): Map<string, number> {
 }
 
 /**
+ * Resolve the directory holding *this process's* cgroup interface files.
+ *
+ * `/proc/self/cgroup` on a v2 host is a single line `0::<path>`, where `<path>`
+ * is relative to the cgroup root **as this process's namespace sees it**. Under
+ * the private namespace Kubernetes gives a pod by default that is `/`, so the
+ * mount root is already ours. Under `cgroupns=host` it is the full path
+ * (`/kubepods/burstable/pod…/…`), and the mount root is the HOST root — reading
+ * it would report the whole node.
+ *
+ * Returns the mount root unchanged when the file is unreadable or not v2-shaped.
+ * That is deliberately permissive rather than fatal: it is the status quo for
+ * every runtime where this already worked, and the required `memory.current`
+ * check in {@link collectCgroupMemorySnapshot} is what actually refuses a root
+ * read. Keeping the refusal in one place stops a parsing quirk here from
+ * silently disabling the whole instrument.
+ */
+function resolveCgroupDir(read: (path: string) => string, root: string, procSelfCgroup: string): string {
+  const contents = readOptional(read, procSelfCgroup);
+  if (contents === null) return root;
+  for (const line of contents.split("\n")) {
+    // v2 is the unified hierarchy, always controller-list-empty: `0::<path>`.
+    // A v1 line (`N:controllers:<path>`) is skipped rather than parsed; this
+    // module publishes nothing on v1 anyway.
+    if (!line.startsWith("0::")) continue;
+    const path = line.slice(3).trim();
+    if (path === "" || path === "/") return root;
+    // Refuse anything that is not a plain absolute path. `..` is the case that
+    // matters: a crafted value must not walk out of the cgroup mount.
+    if (!path.startsWith("/") || path.split("/").includes("..")) return root;
+    return `${root}${path}`;
+  }
+  return root;
+}
+
+/**
  * Read the cgroup memory accounting.
  *
  * Returns `null` when the cgroup is not measurable at all — `memory.stat`
@@ -255,7 +312,12 @@ export function collectCgroupMemorySnapshot(
   options: CollectCgroupMemoryOptions = {},
 ): CgroupMemorySnapshot | null {
   const read = options.readFile ?? ((path: string) => readFileSync(path, "utf8"));
-  const root = options.cgroupRoot ?? CGROUP_ROOT;
+  const mountRoot = options.cgroupRoot ?? CGROUP_ROOT;
+  const procSelfCgroup = options.procSelfCgroup ?? PROC_SELF_CGROUP;
+  // NOT necessarily the mount root -- see the docblock. Under `cgroupns=host`
+  // the mount root is the host's root cgroup, and reading it would publish
+  // node-wide slab as this cgroup's charge.
+  const root = resolveCgroupDir(read, mountRoot, procSelfCgroup);
 
   const statContents = readOptional(read, `${root}/memory.stat`);
   // No `memory.stat` at all: not under cgroup v2, or the mount is not visible.
@@ -278,6 +340,14 @@ export function collectCgroupMemorySnapshot(
   }
 
   const currentBytes = parseBytes(readOptional(read, `${root}/memory.current`) ?? undefined);
+  // REQUIRED, and the backstop against reporting the whole node. The cgroup v2
+  // ROOT has a v2-shaped `memory.stat` -- it passes every check above -- but the
+  // memory controller creates no `memory.current` there. So an unreadable
+  // `memory.current` means either "this is the root" or "the memory controller
+  // is not enabled here", and in both cases the components just parsed describe
+  // something other than this process's own charge. Publish nothing.
+  if (currentBytes === null) return null;
+
   const peakBytes = parseBytes(readOptional(read, `${root}/memory.peak`) ?? undefined);
 
   // `memory.max` is the literal string `max` when no limit is set. `parseBytes`
@@ -288,7 +358,8 @@ export function collectCgroupMemorySnapshot(
   const maxBytes = parseBytes(readOptional(read, `${root}/memory.max`) ?? undefined);
 
   // `memory.stat` was v2-shaped, so the components map is non-empty by
-  // construction (the required keys are themselves published components). The
-  // three scalars are each independently optional.
+  // construction (the required keys are themselves published components), and
+  // `currentBytes` is non-null by the guard above. `maxBytes` and `peakBytes`
+  // stay independently optional.
   return { components, currentBytes, maxBytes, peakBytes };
 }

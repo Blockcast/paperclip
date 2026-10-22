@@ -84,6 +84,9 @@ const V1_STAT = [
 ].join("\n");
 
 const FILES: Record<string, string> = {
+  // `0::/` is the private cgroup namespace Kubernetes gives a pod by default:
+  // the mount root IS our own cgroup. See HOST_NS_FILES for the other case.
+  "/proc/self/cgroup": "0::/\n",
   "/cg/memory.stat": V2_STAT,
   "/cg/memory.current": "563560448\n",
   "/cg/memory.max": "8589934592\n",
@@ -94,6 +97,7 @@ function collect(overrides: Record<string, string | undefined> = {}) {
   const files = { ...FILES, ...overrides };
   return collectCgroupMemorySnapshot({
     cgroupRoot: "/cg",
+    procSelfCgroup: "/proc/self/cgroup",
     readFile: (path) => {
       const value = files[path];
       // Mirror `readFileSync`, which throws rather than returning undefined.
@@ -168,9 +172,62 @@ describe("collectCgroupMemorySnapshot", () => {
   });
 
   it("rejects malformed and negative scalar readings rather than publishing them", () => {
-    expect(collect({ "/cg/memory.current": "not-a-number\n" })!.currentBytes).toBeNull();
-    expect(collect({ "/cg/memory.current": "-1\n" })!.currentBytes).toBeNull();
-    expect(collect({ "/cg/memory.current": "\n" })!.currentBytes).toBeNull();
+    // memory.max is optional, so a malformed one leaves the rest measurable.
+    expect(collect({ "/cg/memory.max": "not-a-number\n" })!.maxBytes).toBeNull();
+    expect(collect({ "/cg/memory.max": "-1\n" })!.maxBytes).toBeNull();
+    expect(collect({ "/cg/memory.peak": "\n" })!.peakBytes).toBeNull();
+  });
+
+  it("refuses the whole snapshot when memory.current is malformed or unreadable", () => {
+    // memory.current is REQUIRED: it is the backstop that tells our own cgroup
+    // apart from the v2 root, which has a v2-shaped memory.stat and no
+    // memory.current. An unparseable one is as uninformative as a missing one.
+    expect(collect({ "/cg/memory.current": undefined })).toBeNull();
+    expect(collect({ "/cg/memory.current": "not-a-number\n" })).toBeNull();
+    expect(collect({ "/cg/memory.current": "-1\n" })).toBeNull();
+  });
+
+  it("⛔ REFUSES a root-cgroup read — v2-shaped memory.stat but no memory.current", () => {
+    // The cgroupns=host failure mode, and the most expensive one available:
+    // the host root cgroup passes every memory.stat check and would publish
+    // NODE-WIDE slab as this cgroup's charge.
+    const root = collect({ "/cg/memory.current": undefined, "/cg/memory.max": undefined });
+    expect(root).toBeNull();
+  });
+
+  it("resolves our own cgroup under a host cgroup namespace instead of reading the root", () => {
+    // /proc/self/cgroup names a real path ⇒ the mount root is the HOST root and
+    // our files live underneath it. Root-level values are deliberately given
+    // DIFFERENT numbers, so reading the wrong directory cannot pass.
+    const sub = "/cg/kubepods/burstable/podabc/container1";
+    const snapshot = collectCgroupMemorySnapshot({
+      cgroupRoot: "/cg",
+      procSelfCgroup: "/proc/self/cgroup",
+      readFile: (path) => {
+        const files: Record<string, string> = {
+          "/proc/self/cgroup": "0::/kubepods/burstable/podabc/container1\n",
+          // host root: v2-shaped stat, no memory.current (as the kernel has it)
+          "/cg/memory.stat": V2_STAT.replace("slab_reclaimable 16910600", "slab_reclaimable 99999999999"),
+          [`${sub}/memory.stat`]: V2_STAT,
+          [`${sub}/memory.current`]: "563560448\n",
+          [`${sub}/memory.max`]: "8589934592\n",
+          [`${sub}/memory.peak`]: "595288064\n",
+        };
+        const value = files[path];
+        if (value === undefined) throw new Error(`ENOENT: ${path}`);
+        return value;
+      },
+    })!;
+    expect(snapshot.components.get(CGROUP_SLAB_RECLAIMABLE_COMPONENT)).toBe(16_910_600);
+    expect(snapshot.currentBytes).toBe(563_560_448);
+  });
+
+  it("ignores a cgroup v1 /proc/self/cgroup line and does not walk out of the mount", () => {
+    // A v1 line has the shape `N:controllers:/path` and must not be parsed as a
+    // v2 path; a `..` segment must never escape the cgroup mount.
+    expect(collect({ "/proc/self/cgroup": "3:memory:/kubepods/podabc\n" })!.currentBytes).toBe(563_560_448);
+    expect(collect({ "/proc/self/cgroup": "0::/../../etc\n" })!.currentBytes).toBe(563_560_448);
+    expect(collect({ "/proc/self/cgroup": undefined })!.currentBytes).toBe(563_560_448);
   });
 
   it("skips malformed memory.stat lines without failing the whole read", () => {

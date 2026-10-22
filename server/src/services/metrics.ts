@@ -9461,6 +9461,10 @@ export async function renderMetrics(): Promise<{ contentType: string; body: stri
 /** Test-only: drop the registry so each test starts from a clean counter. */
 export function __resetMetricsForTest(): void {
   registry = null;
+  cgroupMemoryComponentBytes = null;
+  cgroupMemoryCurrentBytes = null;
+  cgroupMemoryMaxBytes = null;
+  cgroupMemoryPeakBytes = null;
   interactionPayloadUnrecognizedKey = null;
   publishedUnrecognizedPayloadKeys.clear();
   executionWorkspaceTeardown = null;
