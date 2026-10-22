@@ -17,7 +17,14 @@ import {
   buildOpencodeRuntimeShell,
   opencodeRuntimeDir,
   resolveOpencodeVersion,
+  buildPrePushHookPreflightShell,
+  PRE_PUSH_HOOK_PREFLIGHT_MARKER,
+  PRE_PUSH_HOOK_PREFLIGHT_OK,
+  PRE_PUSH_HOOK_PREFLIGHT_MASKED,
+  PRE_PUSH_HOOK_PREFLIGHT_OFF_MOUNT,
+  PRE_PUSH_HOOK_PREFLIGHT_NOT_EXECUTABLE,
 } from "./runtime-pin.js";
+import { DEFAULT_HOOKS_DIR, hooksDirForDataMount } from "@paperclipai/adapter-utils/github-git-hooks-path";
 
 // PEN-3916 (Blockcast-local, not upstream). The runtime root is ASSEMBLED here
 // rather than written as one literal. Paperclip's GitHub egress guard refuses
@@ -403,5 +410,157 @@ it("sees a dotfile that shadows the wrappers in bash, which the Job's own sh can
     // would still poison a `&&` chain if one is ever added around it.
     const r = run(`${against(path.join(tmpdir(), "pcwrap-absent-does-not-exist"))} && echo REACHED`);
     expect(r.stdout).toContain("REACHED");
+  });
+});
+
+describe("buildPrePushHookPreflightShell (PEN-4518)", () => {
+  const DATA_MOUNT = "/paperclip";
+  const snippet = buildPrePushHookPreflightShell({ dataMountPath: DATA_MOUNT });
+
+  /**
+   * The snippet hardcodes the real deployed paths, which exist on the machine
+   * running these tests only by accident — and in an agent pod they exist and
+   * are CORRECT, so an unswapped run would pass for the wrong reason and could
+   * never reach the failure arms. Point both at fixtures, and pin the real
+   * literals separately below; together those are equivalent to exercising the
+   * shipped string.
+   */
+  const against = (runtimeDir: string, mountDir: string) => {
+    let swapped = snippet.replace(`__pchookrt='${DEFAULT_HOOKS_DIR}'`, `__pchookrt='${runtimeDir}'`);
+    expect(swapped).not.toBe(snippet);
+    const before = swapped;
+    swapped = swapped.replace(
+      `__pchookmnt='${hooksDirForDataMount(DATA_MOUNT)}'`,
+      `__pchookmnt='${mountDir}'`,
+    );
+    expect(swapped).not.toBe(before);
+    return swapped;
+  };
+  const run = (script: string) =>
+    spawnSync("sh", ["-c", script], { encoding: "utf8", env: { PATH: "/usr/bin:/bin" } });
+
+  const fixture = () => {
+    const root = mkdtempSync(path.join(tmpdir(), "pchook-"));
+    return {
+      root,
+      runtime: path.join(root, "runtime-hooks"),
+      mount: path.join(root, "mount-hooks"),
+      cleanup: () => rmSync(root, { recursive: true, force: true }),
+    };
+  };
+
+  it("reports ok for an executable hook where the runtime will look", () => {
+    const f = fixture();
+    try {
+      mkdirSync(f.runtime, { recursive: true });
+      writeFileSync(path.join(f.runtime, "pre-push"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      const res = run(against(f.runtime, f.mount));
+      expect(res.status).toBe(0);
+      expect(res.stderr).toContain(PRE_PUSH_HOOK_PREFLIGHT_OK);
+      expect(res.stdout).toBe("");
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  it("reports MASKED when no hook is visible at either path — the PEN-4518 shape", () => {
+    const f = fixture();
+    try {
+      mkdirSync(f.runtime, { recursive: true });
+      mkdirSync(f.mount, { recursive: true });
+      const res = run(against(f.runtime, f.mount));
+      expect(res.stderr).toContain(PRE_PUSH_HOOK_PREFLIGHT_MASKED);
+      expect(res.stderr).not.toContain(PRE_PUSH_HOOK_PREFLIGHT_OK);
+      // It must send the reader at the mount, not at the seed log, because the
+      // seed log said "installed" throughout the outage and was not lying.
+      expect(res.stderr).toContain("ROOT_TOOLCHAIN_SUBPATHS");
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  it("reports MASKED when the directory itself does not exist", () => {
+    const f = fixture();
+    try {
+      const res = run(against(f.runtime, f.mount));
+      expect(res.stderr).toContain(PRE_PUSH_HOOK_PREFLIGHT_MASKED);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  it("reports OFF-MOUNT when the hook is on the data volume but not where the runtime looks", () => {
+    const f = fixture();
+    try {
+      mkdirSync(f.runtime, { recursive: true });
+      mkdirSync(f.mount, { recursive: true });
+      writeFileSync(path.join(f.mount, "pre-push"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      const res = run(against(f.runtime, f.mount));
+      expect(res.stderr).toContain(PRE_PUSH_HOOK_PREFLIGHT_OFF_MOUNT);
+      expect(res.stderr).not.toContain(PRE_PUSH_HOOK_PREFLIGHT_MASKED);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  it("reports NOT-EXECUTABLE for a present hook without +x — git runs it silently as a no-op", () => {
+    const f = fixture();
+    try {
+      mkdirSync(f.runtime, { recursive: true });
+      writeFileSync(path.join(f.runtime, "pre-push"), "#!/bin/sh\nexit 0\n", { mode: 0o644 });
+      const res = run(against(f.runtime, f.mount));
+      expect(res.stderr).toContain(PRE_PUSH_HOOK_PREFLIGHT_NOT_EXECUTABLE);
+      expect(res.stderr).not.toContain(PRE_PUSH_HOOK_PREFLIGHT_OK);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  it("emits exactly one verdict line", () => {
+    const f = fixture();
+    try {
+      mkdirSync(f.runtime, { recursive: true });
+      writeFileSync(path.join(f.runtime, "pre-push"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      const res = run(against(f.runtime, f.mount));
+      const verdicts = res.stderr
+        .split("\n")
+        .filter((line) => line.includes(PRE_PUSH_HOOK_PREFLIGHT_MARKER));
+      expect(verdicts).toHaveLength(1);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  it("is advisory: a MASKED verdict does not fail the shell", () => {
+    // The push path already fails closed. Killing the Job here would convert a
+    // false positive into a fleet-wide outage, which is the wrong trade.
+    const f = fixture();
+    try {
+      const res = run(`${against(f.runtime, f.mount)}; echo STILL-RUNNING`);
+      expect(res.stderr).toContain(PRE_PUSH_HOOK_PREFLIGHT_MASKED);
+      expect(res.stdout).toContain("STILL-RUNNING");
+      expect(res.status).toBe(0);
+    } finally {
+      f.cleanup();
+    }
+  });
+
+  it("ships the real deployed paths, not the fixtures the arms were exercised with", () => {
+    expect(snippet).toContain(`__pchookrt='${DEFAULT_HOOKS_DIR}'`);
+    expect(snippet).toContain(`__pchookmnt='${hooksDirForDataMount(DATA_MOUNT)}'`);
+  });
+
+  it("follows a custom persistence.mountPath on the data side only", () => {
+    // The runtime resolves its path from a constant and cannot read chart
+    // values, so relocating the PVC must NOT move the runtime side — that
+    // divergence is precisely what the OFF-MOUNT verdict exists to name.
+    const custom = buildPrePushHookPreflightShell({ dataMountPath: "/mnt/agent-data" });
+    expect(custom).toContain(`__pchookrt='${DEFAULT_HOOKS_DIR}'`);
+    expect(custom).toContain(`__pchookmnt='${hooksDirForDataMount("/mnt/agent-data")}'`);
+  });
+
+  it("leaves no variables behind for the stages that follow it", () => {
+    const res = run(`${snippet}; echo "rt=[${"$"}{__pchookrt-unset}] mnt=[${"$"}{__pchookmnt-unset}]"`);
+    expect(res.stdout).toContain("rt=[unset] mnt=[unset]");
   });
 });

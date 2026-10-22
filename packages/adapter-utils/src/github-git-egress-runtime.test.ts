@@ -1101,17 +1101,27 @@ describe.skipIf(!SPAWNED_GIT)("pre-push hook bootstrap, spawned as git spawns it
     // installed in the sandbox.
     const ts = (await import("typescript")).default;
     const out = tempDir("git-egress-boot-");
-    for (const name of [
-      "github-egress-scrub",
-      "github-git-egress-shim",
-      "github-git-egress-runtime",
-    ]) {
+    // Walk the runtime's relative-import graph rather than listing its modules.
+    // This was a hardcoded array of three names, and PEN-4518 added a fourth
+    // (`github-git-hooks-path`) — the staged boot directory then threw
+    // ERR_MODULE_NOT_FOUND, and all three end-to-end assertions below failed
+    // with a message that looked nothing like a scan result. The deployed hook
+    // is immune, because it runs out of a whole-directory `tsc` dist and
+    // nothing stages it file by file; this list was the only enumeration, and
+    // an enumeration that has to agree with a graph is exactly the drift this
+    // ticket is about.
+    const staged = new Set<string>();
+    const stage = (name: string) => {
+      if (staged.has(name)) return;
+      staged.add(name);
       const source = readFileSync(path.join(import.meta.dirname, `${name}.ts`), "utf8");
       const js = ts.transpileModule(source, {
         compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
       }).outputText;
       writeFileSync(path.join(out, `${name}.js`), js);
-    }
+      for (const [, dep] of source.matchAll(/from\s+"\.\/([\w.-]+)\.js"/g)) stage(dep);
+    };
+    stage("github-git-egress-runtime");
     built = path.join(out, "github-git-egress-runtime.js");
 
     // The shape the finding names: the package directory is a symlink, as it is

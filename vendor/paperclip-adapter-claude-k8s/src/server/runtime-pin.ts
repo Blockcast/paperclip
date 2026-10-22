@@ -47,6 +47,8 @@
  * contract in job-manifest.ts (where HOME is set) points back here.
  */
 
+import { DEFAULT_HOOKS_DIR, hooksDirForDataMount } from "@paperclipai/adapter-utils/github-git-hooks-path";
+
 /** npm package that ships the Claude Code CLI. */
 export const CLAUDE_CODE_PACKAGE = "@anthropic-ai/claude-code";
 
@@ -386,5 +388,95 @@ export function buildClaudeCodeRuntimeShell(opts: { version: string; dataMountPa
     'else ' +
       'echo "[paperclip] claude-code $__pcver unavailable; falling back to the image claude $(claude --version 2>/dev/null)" >&2; ' +
     'fi',
+  ].join("; ");
+}
+
+/**
+ * Stable leading tokens of the pre-push hook preflight verdicts. Same contract
+ * as the wrapper markers above: operators key alerts to them, so they are
+ * exported values with tests rather than inline literals.
+ */
+export const PRE_PUSH_HOOK_PREFLIGHT_MARKER = "[paperclip] pre-push-publish-guard";
+export const PRE_PUSH_HOOK_PREFLIGHT_OK = `${PRE_PUSH_HOOK_PREFLIGHT_MARKER} ok`;
+export const PRE_PUSH_HOOK_PREFLIGHT_MASKED = `${PRE_PUSH_HOOK_PREFLIGHT_MARKER} MASKED`;
+export const PRE_PUSH_HOOK_PREFLIGHT_OFF_MOUNT = `${PRE_PUSH_HOOK_PREFLIGHT_MARKER} OFF-MOUNT`;
+export const PRE_PUSH_HOOK_PREFLIGHT_NOT_EXECUTABLE = `${PRE_PUSH_HOOK_PREFLIGHT_MARKER} NOT-EXECUTABLE`;
+
+/**
+ * POSIX sh snippet (no trailing separator) that makes every agent Job state, in
+ * its own pod log, whether the PEN-3156 pre-push publish guard is actually
+ * reachable FROM INSIDE THIS POD. PEN-4518.
+ *
+ * Why a runtime check when three static ones already exist. The path is
+ * spelled by four consumers (see `github-git-hooks-path.ts`), and each of the
+ * three suites that touch it compares SOURCE STRINGS:
+ *
+ *   - the chart suite joins the seed to the runtime constant by regex;
+ *   - the Job-manifest suite pins the subPath into `ROOT_TOOLCHAIN_SUBPATHS`;
+ *   - the runtime suite pins `hooksDirectory()`.
+ *
+ * All three were green throughout PEN-4518. They had to be: every string was
+ * individually correct. What was wrong was the composition — an emptyDir over
+ * the PVC root (BLO-32734 phase 2b) masked a path that all four consumers
+ * agreed on, and no suite owns the join between "the seed wrote it" and "the
+ * Job can see it". The seed's own success log is not evidence of the latter:
+ * it writes to the PVC, and the Job pod sees an overlay.
+ *
+ * This asks the deployed pod instead of comparing strings, which is the only
+ * form that survives a change in any of the four spellings OR in the mount
+ * topology underneath them.
+ *
+ * ADVISORY, NOT FATAL, and the asymmetry is deliberate. The push path already
+ * fails closed — that is how PEN-4518 was found — so this cannot be what makes
+ * the guard binding, and there is nothing to gain by also killing the Job.
+ * There is something to lose: a false positive here would take the whole fleet
+ * down at second zero, whereas a missed verdict costs one confusing push
+ * refusal. What this buys is TIME-TO-DIAGNOSIS. During PEN-4518 the verdict
+ * arrived as a push refusal 90 minutes into a run, in one agent's transcript,
+ * and cost ~2h17m of fleet-wide publishing to trace back to a mount. The same
+ * fact, emitted at startup by every pod, is greppable across the fleet before
+ * any work is stranded.
+ *
+ * Four verdicts, each naming a different fix:
+ *   ok              — executable hook where the runtime will look. Nothing to do.
+ *   MASKED          — nothing at either path. The PEN-4518 shape: the mount does
+ *                     not reach this pod, or the seed never ran. Check
+ *                     `ROOT_TOOLCHAIN_SUBPATHS` and `/proc/mounts`.
+ *   OFF-MOUNT       — the hook is on the data volume but NOT where the runtime
+ *                     looks. `persistence.mountPath` has diverged from
+ *                     `DEFAULT_DATA_MOUNT_PATH`; the runtime cannot read chart
+ *                     values, so it will keep looking at the default.
+ *   NOT-EXECUTABLE  — present but without +x. git runs no hook and reports
+ *                     nothing, so this one is otherwise entirely silent.
+ *
+ * The verdict text deliberately carries no bare `git` token — not style:
+ * `job-manifest.test.ts` scans the whole container command for unclassified
+ * `git` in command position, and prose in an echo is indistinguishable from a
+ * call to that scan. Backtick-quoting it the way the breadcrumbs do is not
+ * available here either, since these strings sit inside a double-quoted
+ * `echo` where a backtick is command substitution. Reword instead; do not
+ * widen the scanner, which is what bounds every real `git` call in the Job.
+ *
+ * It reports presence and executability, NOT that the file is the real scanner
+ * — exactly the limit `prePushHookPresent` documents, for the same reason: the
+ * seed runs as uid 1000 and cannot write a file the agent could not rewrite.
+ * Named for what it observes.
+ */
+export function buildPrePushHookPreflightShell(opts: { dataMountPath: string }): string {
+  const runtimeDir = shellSingleQuote(DEFAULT_HOOKS_DIR);
+  const mountDir = shellSingleQuote(hooksDirForDataMount(opts.dataMountPath));
+  return [
+    `__pchookrt=${runtimeDir}`,
+    `__pchookmnt=${mountDir}`,
+    'if [ -x "$__pchookrt/pre-push" ]; then ' +
+      `echo "${PRE_PUSH_HOOK_PREFLIGHT_OK} dir=$__pchookrt" >&2; ` +
+    'elif [ -e "$__pchookrt/pre-push" ]; then ' +
+      `echo "${PRE_PUSH_HOOK_PREFLIGHT_NOT_EXECUTABLE} dir=$__pchookrt - a pre-push file is there but is not executable, so no hook runs and nothing is reported; every push from this pod publishes unscanned (PEN-3156, PEN-4518)" >&2; ` +
+    'elif [ -e "$__pchookmnt/pre-push" ]; then ' +
+      `echo "${PRE_PUSH_HOOK_PREFLIGHT_OFF_MOUNT} runtime=$__pchookrt data=$__pchookmnt - the hook is on the data volume but not where the egress runtime looks, which it resolves from a constant and cannot learn from chart values; pushes from this pod will be refused (PEN-4518)" >&2; ` +
+    "else " +
+      `echo "${PRE_PUSH_HOOK_PREFLIGHT_MASKED} runtime=$__pchookrt data=$__pchookmnt - no pre-push hook is visible at either path, so this pod cannot publish at all; the seed writes it to the PVC and a narrowed Job pod sees an overlay, so check ROOT_TOOLCHAIN_SUBPATHS against /proc/mounts rather than the seed log (PEN-4518, BLO-32734)" >&2; ` +
+    "fi",
+    "unset __pchookrt __pchookmnt",
   ].join("; ");
 }
