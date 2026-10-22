@@ -39223,7 +39223,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           provider: penstockGateResult.provider,
         });
         const capacityRetry = await persistProviderCapacityRetry(penstockGateResult);
-        if (!capacityRetry.deferred) return capacityRetry.run;
+        if (!capacityRetry.deferred) {
+          if (capacityRetry.coalesced && suppression) suppression.coalesced = true;
+          return capacityRetry.run;
+        }
         // Signal the deferral to the caller *after* the scheduled_retry run is
         // committed, so nothing can read "deferred" for a retry that does not
         // exist. This is the only `return null` below that leaves
@@ -40921,6 +40924,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           runId: mergedRun.id,
           finishedAt: new Date(),
         });
+        if (suppression) suppression.coalesced = true;
         return mergedRun;
       }
     }
