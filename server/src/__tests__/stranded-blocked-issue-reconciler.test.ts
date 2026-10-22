@@ -562,6 +562,126 @@ describeEmbeddedPostgres("reconcileStrandedBlockedIssues", () => {
     expect(await statusOf(declared)).toBe("blocked");
   });
 
+  // PEN-4503 — the retirement contract for `paperclip-blocked-rechecker`.
+  //
+  // That CronJob (onprem-k8s `paperclip/blocked-rechecker.yaml`) flipped
+  // `blocked` -> `todo` in raw SQL through `kubectl exec paperclip-pg-0`, so
+  // none of this module's suppressions ever reached it. Its eligibility CTE
+  // carried exactly one hand-transcribed guard — BLO-47467's unresolved-edge
+  // check — and no external-wait, interaction, approval, executive-hold,
+  // recovery-action or monitor clause at all.
+  //
+  // Its whole predicate (`blocked`, `origin_kind = 'manual'`, assigned to an
+  // agent and not a user, `updated_at` older than 24h, no unresolved blocker
+  // edge) is a SUBSET of the population this reconciler already sweeps every
+  // 15 minutes. So by the time a row was 24h old and still `blocked`, this
+  // reconciler had already looked at it ~96 times and declined — which means
+  // the only rows the CronJob could still flip were rows this module had
+  // deliberately parked. Measured 2026-10-22 across 462 recently-updated
+  // issues: all 9 rechecker flips since 2026-10-15 landed on rows this
+  // reconciler had not flipped in the preceding 24h, and 6 of those 9 carry a
+  // two-line external-wait declaration.
+  //
+  // These cases pin both halves of that argument in CI, which is exactly what
+  // the SQL copy never had a surface for: nothing is lost by retiring the job
+  // (first case), and what it was doing instead was overriding this module
+  // (second and third). Keep them if the CronJob is ever deleted outright —
+  // they are the contract, not a reference to the manifest.
+  describe("covers the retired paperclip-blocked-rechecker's eligibility predicate (PEN-4503)", () => {
+    /** Comfortably past the CronJob's `updated_at < NOW() - INTERVAL '24 hours'`. */
+    const RECHECKER_STALENESS_MS = 48 * 60 * 60 * 1000;
+
+    /**
+     * A row the retired CronJob would have picked up on its next tick: manual
+     * origin (`insertIssue`'s default), assigned to an agent, never assigned to
+     * a user, `blocked`, stale past 24h, and carrying no blocker edge.
+     */
+    async function insertRecheckerEligibleIssue(input: {
+      companyId: string;
+      agentId: string;
+      identifier: string;
+      description?: string | null;
+      monitorNextCheckAt?: Date | null;
+    }) {
+      const issueId = await insertIssue({
+        companyId: input.companyId,
+        identifier: input.identifier,
+        status: "blocked",
+        assigneeAgentId: input.agentId,
+        description: input.description ?? null,
+        monitorNextCheckAt: input.monitorNextCheckAt ?? null,
+      });
+      // `insertIssue` defaults `updated_at` to now; the CronJob only considered
+      // rows already stale by a day.
+      await db
+        .update(issues)
+        .set({ updatedAt: new Date(Date.now() - RECHECKER_STALENESS_MS) })
+        .where(eq(issues.id, issueId));
+      const [row] = await db
+        .select({ originKind: issues.originKind, assigneeUserId: issues.assigneeUserId })
+        .from(issues)
+        .where(eq(issues.id, issueId));
+      // Pin the two predicate legs the fixture gets implicitly, so a schema
+      // default change cannot quietly make this fixture stop being eligible.
+      expect(row?.originKind).toBe("manual");
+      expect(row?.assigneeUserId).toBeNull();
+      return issueId;
+    }
+
+    it("sweeps a row matching the CronJob's full eligibility predicate", async () => {
+      const { companyId, agentId } = await createCompany("SBRC1");
+      const eligible = await insertRecheckerEligibleIssue({
+        companyId,
+        agentId,
+        identifier: "SBRC1-1",
+      });
+
+      const result = await reconcileStrandedBlockedIssues(db);
+
+      expect(result.reconciled).toBe(1);
+      expect(await statusOf(eligible)).toBe("todo");
+      expect(await listBlockedIssueAutoResumeSuppressions(db, companyId, [eligible])).toEqual(new Map());
+    });
+
+    it("holds a declared external wait that the CronJob's predicate would have flipped", async () => {
+      const { companyId, agentId } = await createCompany("SBRC2");
+      const declared = await insertRecheckerEligibleIssue({
+        companyId,
+        agentId,
+        identifier: "SBRC2-1",
+        description: [
+          "Everything else on this row is done.",
+          "external owner: Omar",
+          "external action: post a go that names onprem-k8s#6463",
+        ].join("\n"),
+      });
+
+      const result = await reconcileStrandedBlockedIssues(db);
+
+      expect(result.reconciled).toBe(0);
+      expect(await statusOf(declared)).toBe("blocked");
+      expect(
+        (await listBlockedIssueAutoResumeSuppressions(db, companyId, [declared])).get(declared),
+      ).toMatchObject({ reason: "external_wait" });
+    });
+
+    it("holds a live monitor gate, which the CronJob's predicate never checked at all", async () => {
+      const { companyId, agentId } = await createCompany("SBRC3");
+      const gated = await insertRecheckerEligibleIssue({
+        companyId,
+        agentId,
+        identifier: "SBRC3-1",
+        monitorNextCheckAt: new Date(Date.now() + 6 * 60 * 60 * 1000),
+      });
+
+      const result = await reconcileStrandedBlockedIssues(db);
+
+      expect(result.reconciled).toBe(0);
+      expect(await statusOf(gated)).toBe("blocked");
+      expect(await db.select().from(activityLog)).toHaveLength(0);
+    });
+  });
+
   // PEN-3974, reproducing PEN-3789 exactly: a card set `blocked` with its unblock
   // owner and action named in a COMMENT, whose blocker edges have all reached
   // `done`, while the real gate (a human approving a PR) is still held.
