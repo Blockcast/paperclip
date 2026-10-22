@@ -5091,6 +5091,43 @@ export function issueRoutes(
     );
   }
 
+  // PEN-4495: the companion to `issueCommentGrantRemediation`, for the capability
+  // that had no remediation at all. A non-assignee denied a document or field
+  // write got `deny_missing_grant` with no relation list and no route — so the
+  // reasonable next move was to go looking for the grant named in the COMMENT
+  // remediation, post an `agent://` mention, and find that it changes nothing.
+  // Three agents paid a run for that in turn (PEN-2394, PEN-3940, PEN-4462), and
+  // the third reasonably read it as PEN-2394 having regressed. It had not:
+  // PEN-2394 was the comment path and its fix holds. `issue:mutate` simply never
+  // had a grant route, and must not get one — "a mentioned agent: denied
+  // issue:mutate" is an explicit negative control in
+  // docs/security/issue-authorization-model.md. So this text does not offer a
+  // grant to obtain; it names the two routes that actually exist (hatch 1 and the
+  // assignment itself) and closes the mention door explicitly, because leaving it
+  // unmentioned is what kept sending agents through it.
+  function issueMutationGrantRemediation(input: {
+    actorAgentId: string;
+    assigneeAgentId: string | null;
+    reason: Awaited<ReturnType<typeof decideIssueAccess>>["reason"];
+  }): string | null {
+    if (input.reason !== "deny_missing_grant") return null;
+    if (input.assigneeAgentId === input.actorAgentId) return null;
+    const assigneeClause = input.assigneeAgentId
+      ? `This issue is assigned to agent://${input.assigneeAgentId}. `
+      : "";
+    return (
+      `Writes to this issue — including its documents — are relationship-gated, not ` +
+      `grant-gated. ${assigneeClause}Unlike issue:comment, no grant can satisfy issue:mutate: ` +
+      `being @-mentioned here does not authorize it, and neither does managing the assignee, ` +
+      `creating the issue, or holding a blocks edge to it — those carry comment access only. ` +
+      `Do not post an agent:// mention expecting it to grant this; it will not. The routes that ` +
+      `do work: ask the assignee to make the write for you (they hold every field), or have the ` +
+      `issue assigned to you. If you need to record findings the assignee has not promoted yet, ` +
+      `write them on an issue you are assigned to and reference this one. See ` +
+      `docs/security/issue-authorization-model.md for the full model.`
+    );
+  }
+
   function readAgentRunId(req: Request) {
     return req.actor.type === "agent" ? req.actor.runId?.trim() || null : null;
   }
@@ -6879,7 +6916,11 @@ export function issueRoutes(
             boundaryReason: boundaryDecision.reason,
             responseStatus: 403,
           });
-          respondIssueBoundaryDenied(res, boundaryDecision);
+          respondIssueBoundaryDenied(res, boundaryDecision, issueMutationGrantRemediation({
+            actorAgentId,
+            assigneeAgentId: issue.assigneeAgentId,
+            reason: boundaryDecision.reason,
+          }));
           return false;
         }
       } else {
@@ -6888,7 +6929,11 @@ export function issueRoutes(
           boundaryReason: boundaryDecision.reason,
           responseStatus: 403,
         });
-        respondIssueBoundaryDenied(res, boundaryDecision);
+        respondIssueBoundaryDenied(res, boundaryDecision, issueMutationGrantRemediation({
+          actorAgentId,
+          assigneeAgentId: issue.assigneeAgentId,
+          reason: boundaryDecision.reason,
+        }));
         return false;
       }
     }

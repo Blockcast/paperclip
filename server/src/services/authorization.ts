@@ -674,6 +674,22 @@ export const ISSUE_COMMENT_EVALUATED_RELATIONS = [
   "productivity_review",
 ] as const;
 
+// Every relation `decideBase` evaluates for an agent's `issue:mutate`, in
+// order. Deliberately three where `issue:comment` has eight: creator, manager,
+// mention, recovery handoff and dependency edge each grant comment and stop
+// there (docs/security/issue-authorization-model.md, "Why `comment` and
+// `description` are deliberately asymmetric"). Returned on denial for the same
+// reason the comment list is — so "why was I refused" is answerable from the
+// 403 rather than from this file. The narrower set is exactly why it has to be
+// stated: until PEN-4495 an `issue:mutate` denial named no relation at all, so
+// three agents in turn read it as a missing grant and went looking for the
+// grant that would satisfy it. There is none, and there is not meant to be.
+export const ISSUE_MUTATE_EVALUATED_RELATIONS = [
+  "assignee",
+  "unassigned_issue",
+  "productivity_review",
+] as const;
+
 export function authorizationDeniedDetails(decision: AuthorizationDecision) {
   return {
     ...(decision.code ? { code: decision.code } : {}),
@@ -2745,6 +2761,22 @@ export function authorizationService(db: Db) {
           evaluatedRelations: [...ISSUE_COMMENT_EVALUATED_RELATIONS],
         });
       }
+      // Message-only (PEN-4495): same `deny_missing_grant` reason and the same
+      // refusal this block already fell through to at the end of `decideBase`.
+      // Returning it here instead only attaches the relation list and a truthful
+      // explanation. Safe because no arm between this point and that fallthrough
+      // can allow `issue:mutate`: the remaining arms match other actions, and
+      // `permissionForAction` returns null for every issue action (`:191`), so
+      // the generic `permissionKey` grant fallback never fires for it.
+      return deny({
+        action: input.action,
+        reason: "deny_missing_grant",
+        explanation:
+          "No issue:mutate relation holds between the actor and this issue. " +
+          "issue:mutate is relationship-gated, not grant-gated: no permission grant " +
+          "and no @-mention can satisfy it. Ask the assignee to make the write, or take assignment.",
+        evaluatedRelations: [...ISSUE_MUTATE_EVALUATED_RELATIONS],
+      });
     }
     if (
       input.action === "agent_config:update" &&
