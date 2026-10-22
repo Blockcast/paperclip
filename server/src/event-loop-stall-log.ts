@@ -49,6 +49,16 @@ export interface EventLoopStallLogOptions {
   log?: (fields: Record<string, number>, message: string) => void;
 }
 
+/**
+ * One listener, called after each logged stall. A setter rather than a start
+ * option because the sampler starts before config loads and later starts are
+ * no-ops (see below). Used by the worker's stall-triggered profile (BLO-45336).
+ */
+let stallListener: ((stallMs: number) => void) | null = null;
+export function setEventLoopStallListener(fn: ((stallMs: number) => void) | null): void {
+  stallListener = fn;
+}
+
 /** Non-null while a sampler is running. See the idempotency note below. */
 let activeStop: (() => void) | null = null;
 
@@ -97,6 +107,7 @@ export function startEventLoopStallLogging(
         { stallMs: Math.round(stallMs), windowMs, thresholdMs },
         "event loop stalled",
       );
+      stallListener?.(stallMs);
     }
   }, sampleMs);
   timer.unref();

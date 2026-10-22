@@ -1,4 +1,5 @@
-import { existsSync, mkdirSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, unlinkSync } from "node:fs";
+import { rename, writeFile } from "node:fs/promises";
 import { Session } from "node:inspector";
 import path from "node:path";
 
@@ -43,6 +44,34 @@ export async function maybeTakeCpuProfile(opts: {
   const sentinel = path.join(opts.dir, CPU_PROFILE_SENTINEL_BASENAME);
   if (capturing || !existsSync(sentinel)) return null;
   unlinkSync(sentinel);
+  return takeCpuProfile(opts);
+}
+
+/** Minimum stall that auto-starts a profile, and the gap between two auto-starts. */
+export const STALL_PROFILE_MIN_STALL_MS = 3_000;
+export const STALL_PROFILE_COOLDOWN_MS = 60 * 60_000;
+let lastStallProfileAt = Number.NEGATIVE_INFINITY;
+
+/**
+ * Stall-triggered capture (BLO-45336). A profile cannot look backwards, so it
+ * cannot catch the stall that triggers it — but >=3 s stalls arrive in clusters
+ * (12 between 11:49Z and 12:10Z on 2026-10-21), so a long window opened by the
+ * first one catches the next. An off-CPU block (sync fs on CephFS) should still
+ * show as a sample gap whose next sample carries the calling frame — unverified.
+ * Resolves null when skipped.
+ */
+export function maybeStartStallCpuProfile(
+  stallMs: number,
+  opts: { dir: string; durationMs: number; keep: number; now?: number },
+): Promise<string | null> {
+  const now = opts.now ?? Date.now();
+  if (capturing || stallMs < STALL_PROFILE_MIN_STALL_MS) return Promise.resolve(null);
+  if (now - lastStallProfileAt < STALL_PROFILE_COOLDOWN_MS) return Promise.resolve(null);
+  lastStallProfileAt = now;
+  return takeCpuProfile(opts);
+}
+
+async function takeCpuProfile(opts: { dir: string; durationMs: number; keep: number }): Promise<string> {
   capturing = true;
   const session = new Session();
   try {
@@ -60,8 +89,9 @@ export async function maybeTakeCpuProfile(opts: {
       opts.dir,
       `${new Date().toISOString().replace(/[:.]/g, "-")}-pid${process.pid}${CPU_PROFILE_EXTENSION}`,
     );
-    writeFileSync(`${file}.partial`, JSON.stringify(profile));
-    renameSync(`${file}.partial`, file);
+    // Async: a 10-minute profile is megabytes, and this directory is CephFS.
+    await writeFile(`${file}.partial`, JSON.stringify(profile));
+    await rename(`${file}.partial`, file);
     pruneCpuProfiles(opts.dir, opts.keep);
     return file;
   } finally {

@@ -44,7 +44,7 @@ import { createApp } from "./app.js";
 import { withAgentStartLockAbortableDb } from "./services/agent-start-lock-db.js";
 import { loadConfig } from "./config.js";
 import { dbInheritedTimeoutSeries } from "./db-inherited-timeouts.js";
-import { startEventLoopStallLogging } from "./event-loop-stall-log.js";
+import { setEventLoopStallListener, startEventLoopStallLogging } from "./event-loop-stall-log.js";
 import { logger } from "./middleware/logger.js";
 import { setupEnvironmentCustomImageTerminalWebSocketServer } from "./realtime/environment-custom-image-terminal-ws.js";
 import { setupLiveEventsWebSocketServer } from "./realtime/live-events-ws.js";
@@ -107,7 +107,11 @@ import {
   seedLastAutoSnapshotAtMs,
   takeHeapSnapshot,
 } from "./services/heap-snapshot.js";
-import { CPU_PROFILE_SENTINEL_BASENAME, maybeTakeCpuProfile } from "./services/cpu-profile.js";
+import {
+  CPU_PROFILE_SENTINEL_BASENAME,
+  maybeStartStallCpuProfile,
+  maybeTakeCpuProfile,
+} from "./services/cpu-profile.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
@@ -1400,6 +1404,17 @@ export async function startServer(): Promise<StartedServer> {
           ),
         );
     }, 60_000).unref?.();
+    // Auto-capture on a >=3 s stall, 1 h cooldown: the operator sentinel needs
+    // someone watching when a stall cluster happens, and nobody is (BLO-45336).
+    setEventLoopStallListener((stallMs) => {
+      maybeStartStallCpuProfile(stallMs, { dir: config.heapSnapshotDir, durationMs: 600_000, keep: 3 })
+        .then((file) => {
+          if (file) logger.warn({ file, triggerStallMs: stallMs }, "CPU profile written");
+        })
+        .catch((err) =>
+          logger.error({ err, dir: config.heapSnapshotDir }, "stall-triggered CPU profile capture failed"),
+        );
+    });
   }
 
   if (config.heartbeatSchedulerEnabled) {
