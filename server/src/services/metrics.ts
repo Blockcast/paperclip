@@ -4540,7 +4540,29 @@ function ensureRegistry(): {
         + "fifteen were silent and a wedged seat was unexplainable from outside the "
         + "process. Dispatch retries every scheduler tick, so a wedged seat shows as a "
         + "SUSTAINED RATE on one reason rather than as an absence — read it with "
-        + "rate()/increase(), and never infer a cause from a series that stopped.",
+        + "rate()/increase(), and never infer a cause from a series that stopped. "
+        + "agent_id='unknown' on THIS metric normally means attribution was collapsed BY "
+        + "DESIGN — the OPPOSITE of what the same label value means on "
+        + HEARTBEAT_RUN_FAILED_METRIC + ", where it means the id was genuinely missing or "
+        + "unrecognized. Do not read the two alike (PEN-4532). Four reasons always "
+        + "collapse. dispatch_stopped, api_tier_fence and scheduling_suppressed are "
+        + "process-wide guards that fire before the agent row is loaded: they pass "
+        + "companyId=null, so the roster read is skipped and normalizeAgentId has no set "
+        + "to match against. The real agent id IS known at those three call sites and is "
+        + "withheld deliberately — the refusal is a fact about the PROCESS, so a "
+        + "per-agent series would partition it by which seat's wake happened to land "
+        + "there rather than by seat health, and would alert on healthy seats. "
+        + "agent_missing collapses permanently and is NOT fixable by threading a company "
+        + "id (the agents row does not exist, so no roster can contain it); that is the "
+        + "one reason where WHICH agent vanished is the whole datum, and it must be read "
+        + "from the logs. Operator consequence: a collapsed reason is a FLEET-WIDE TOTAL "
+        + "summed over every agent, so comparing it against one seat's slice of an "
+        + "attributed reason overstates it by roughly the seat count — aggregate both "
+        + "sides before comparing. On a split api/worker deployment a steady "
+        + "api_tier_fence rate is EXPECTED and benign: PAPERCLIP_NODE_ROLE=api disables "
+        + "the scheduler, so the api tier never claims runs and every HTTP/webhook-path "
+        + "dispatch kick lands here, leaving the run for the worker tick "
+        + "(heartbeatSchedulerIntervalMs, default 30s) to claim.",
       labelNames: ["agent_id", "reason"],
       registers: [registry],
     });
