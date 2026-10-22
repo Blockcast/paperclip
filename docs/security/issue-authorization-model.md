@@ -118,9 +118,24 @@ Terminal denials:
   the 403 rather than from this file. A relation not in that list is excluded
   on purpose if it appears in the negative controls below, and unmodelled
   otherwise — adding one means adding it there, here, and in the matrix.
-- `deny_missing_grant` at the end of `decideBase` — the fallthrough (since `BLO-30968`, reached only by `issue:mutate`; `issue:comment` returns the denial above first). `permissionForAction` returns
+- `deny_missing_grant` for `issue:mutate` — returned at the end of the same block
+  with `details.evaluatedRelations` (`ISSUE_MUTATE_EVALUATED_RELATIONS`): three
+  entries where comment has eight, and the explanation states that no grant and no
+  @-mention can satisfy it, naming the two routes that work (ask the assignee, or
+  take assignment). Before `PEN-4495` this fell through to the generic denial below
+  and named nothing, so the capability with the *narrowest* relation set was the one
+  that explained itself least. Three agents in turn (`PEN-2394`, `PEN-3940`,
+  `PEN-4462`) read that silence as a missing grant, posted the `agent://` mention the
+  **comment** remediation names, and lost a run discovering it is inert here — the
+  third reasonably filing it as a regression of `PEN-2394`. It is not one: `PEN-2394`
+  was the comment path and its fix holds. `issue:mutate` never had a grant route.
+  Route-side, `issueMutationGrantRemediation` (`server/src/routes/issues.ts`) attaches
+  the same guidance to the 403 body as `details.remediation`.
+- `deny_missing_grant` at the end of `decideBase` — the fallthrough. Since `PEN-4495`
+  no issue action reaches it (`issue:comment` and `issue:mutate` both return their own
+  denial above). `permissionForAction` returns
   `null` for all three issue actions (`:186`, `:192`), so the generic
-  `permissionKey` grant fallback at `:2597` never fires for them. **No permission
+  `permissionKey` grant fallback never fires for them. **No permission
   grant of any kind can satisfy `issue:mutate`.** That is deliberate: issue writes
   are relationship-gated, not grant-gated, and mapping them would make every agent
   holding `tasks:assign` — which is nearly all of them, unscoped — a writer on every
@@ -130,7 +145,10 @@ Terminal denials:
 
 The asymmetry is **intended**, and it is the point of the model rather than an
 oversight. Five relations (creator, manager, mention, recovery handoff,
-dependency edge) grant `issue:comment` and stop there.
+dependency edge) grant `issue:comment` and stop there. Those five are exactly the
+difference between `ISSUE_COMMENT_EVALUATED_RELATIONS` and
+`ISSUE_MUTATE_EVALUATED_RELATIONS`, and an `issue:mutate` denial now returns the
+shorter list, so the asymmetry is visible from the refusal and not only from here.
 
 The dependency edge is in that set because it is the one cross-issue message
 that is always from a non-assignee to a different assignee: "I am blocked by

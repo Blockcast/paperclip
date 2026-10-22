@@ -5228,6 +5228,70 @@ describeEmbeddedPostgres("authorization service", () => {
       expect((await decideComment()).reason).toBe("allow_dependency_edge");
     });
 
+    it("names the mutate relations on an issue:mutate denial, and the mention is not one of them (PEN-4495)", async () => {
+      // Three agents in turn read a bare `deny_missing_grant` on a document
+      // write as a missing grant, posted the `agent://` mention the COMMENT
+      // remediation names, and found it changed nothing — each losing a run.
+      // The mention genuinely does nothing here and must not: "a mentioned
+      // agent: denied issue:mutate" is a negative control in
+      // docs/security/issue-authorization-model.md. What was missing was any
+      // way to learn that from the refusal. This pins both halves.
+      const company = await createCompany(db, "MutateDenialNamesRelations");
+      const owner = await createAgent(db, company.id, { role: "engineer" });
+      const mentioned = await createAgent(db, company.id, { role: "engineer" });
+      const issue = await createIssue(db, company.id, { title: "Owner's row", assigneeAgentId: owner.id });
+      const authorization = authorizationService(db);
+      const actor = {
+        type: "agent", agentId: mentioned.id, companyId: company.id, source: "agent_jwt",
+      } as const;
+      const resource = {
+        type: "issue", companyId: company.id, issueId: issue.id,
+        assigneeAgentId: owner.id, createdByAgentId: null, status: issue.status,
+      } as const;
+
+      // The by-the-book grant: a markdown-link mention posted by the assignee.
+      await db.insert(issueComments).values({
+        companyId: company.id,
+        issueId: issue.id,
+        body: `[@Mentioned](agent://${mentioned.id}) please take a look`,
+        authorAgentId: owner.id,
+      });
+
+      // POSITIVE CONTROL: that mention really is a working grant — for comment.
+      // Without this the test would pass against a boundary that denied the
+      // actor everything for an unrelated reason.
+      await expect(authorization.decide({ actor, action: "issue:comment", resource }))
+        .resolves.toMatchObject({ allowed: true, reason: "allow_issue_mention_grant" });
+
+      // The same mention, the same row, the same actor: mutate is still denied.
+      const denied = await authorization.decide({ actor, action: "issue:mutate", resource });
+      expect(denied.allowed).toBe(false);
+      expect(denied.reason).toBe("deny_missing_grant");
+
+      // The denial now says what was checked. Falsifiable in both directions:
+      // the three relations that can satisfy mutate are named, and the five
+      // comment-only relations are absent — `agent_mention` above all, since
+      // chasing it is what cost the three runs.
+      const relations = authorizationDeniedDetails(denied).evaluatedRelations;
+      expect(relations).toEqual(["assignee", "unassigned_issue", "productivity_review"]);
+      for (const commentOnly of [
+        "agent_mention", "creator", "manager_of_assignee", "recovery_handoff", "dependency_edge",
+      ]) {
+        expect(relations).not.toContain(commentOnly);
+      }
+      // And the explanation names the routes that do work, so the reader does
+      // not have to open this file to find them.
+      expect(denied.explanation).toMatch(/no permission grant and no @-mention can satisfy it/i);
+      expect(denied.explanation).toMatch(/ask the assignee to make the write, or take assignment/i);
+
+      // The comment denial keeps its own, longer list — this did not flatten
+      // the two capabilities into one.
+      await db.delete(issueComments).where(eq(issueComments.issueId, issue.id));
+      const commentDenied = await authorization.decide({ actor, action: "issue:comment", resource });
+      expect(commentDenied.allowed).toBe(false);
+      expect(authorizationDeniedDetails(commentDenied).evaluatedRelations).toContain("agent_mention");
+    });
+
     it("rewriting a blocker set keeps the original creator stamp on unchanged edges (BLO-30968)", async () => {
       const company = await createCompany(db, "Matrix-dependency-edge-stamp");
       const owner = await createAgent(db, company.id, { role: "engineer" });
