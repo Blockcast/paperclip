@@ -5,6 +5,7 @@ import {
   escalateAfterDaysFor,
   classifyHumanGatedWait,
   formatHumanGatedAgeingSections,
+  HUMAN_GATED_PRIORITY_ORDER,
   humanClockAt,
   humanGatedAgeHistogram,
   humanSilenceDays,
@@ -616,7 +617,9 @@ describe("threshold and reporting", () => {
       // *after* `low`, not before `critical`. `indexOf` alone returns -1 for
       // one, which would rank it most urgent and let the assertion pass on a
       // row the selector had actually ranked last.
-      const PRIORITY_ORDER = ["critical", "high", "medium", "low"];
+      // Imported rather than re-declared, so adding a tier cannot drift the
+      // helper off the selector — the same drift class this PR removes.
+      const PRIORITY_ORDER: readonly string[] = HUMAN_GATED_PRIORITY_ORDER;
       const rank = (priority: string | null | undefined) => {
         const index = PRIORITY_ORDER.indexOf(priority ?? "");
         return index === -1 ? PRIORITY_ORDER.length : index;
