@@ -82,6 +82,79 @@ test("re-using a base tag at a different idx is a collision", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Rename-in-place vs. second claimant (BLO-48352)
+//
+// Fixtures are the real BLO-48352 shapes. `0263_cost_events_consumption_cents`
+// RAISEd whenever a `subscription_included` row existed; production held ~4k,
+// so it crash-looped the worker on the 2026-10-22 deploy and helm rolled back.
+// PR #2923 replaced it AT THE SAME NUMBER -- delete the .sql, retag the entry --
+// and the guard refused it, naming a duplicate that the post-merge tree does
+// not contain (verified: merge ref cf17ccf9 holds exactly one `0263_*.sql`).
+//
+// The pair below is the whole point: these two are byte-identical from the head
+// tree alone -- in both the base's claimant is simply missing -- and only the
+// merge base separates them.
+// ---------------------------------------------------------------------------
+const RAISING_263 = { idx: 263, version: "7", when: 1792003001477, tag: "0263_cost_events_consumption_cents", breakpoints: true };
+const FIXED_263 = { ...RAISING_263, tag: "0263_cost_events_add_consumption_cents" };
+
+const checkWithMergeBase = (head, base, mergeBase) =>
+  checkAgainstBase({
+    journal: head.journal,
+    baseJournal: base.journal,
+    sqlFiles: head.sqlFiles,
+    baseSqlFiles: base.sqlFiles,
+    mergeBaseJournal: mergeBase.journal,
+    mergeBaseSqlFiles: mergeBase.sqlFiles,
+    baseLabel: "master",
+  });
+
+test("BLO-48352: replacing a migration at its own number is not a collision", () => {
+  const base = treeOf(TAIL, RAISING_263);
+  // Branched from that base, then retired the entry and the file together.
+  assert.deepEqual(checkWithMergeBase(treeOf(TAIL, FIXED_263), base, base), []);
+});
+
+test("BLO-48352: the retirement must be the branch's -- a claimant the base landed later still fails", () => {
+  // Same head shape as BLO-39490's losers: branched before the rival landed, so
+  // the rival is absent from the head for a completely different reason.
+  const branchPoint = treeOf(TAIL);
+  const base = treeOf(TAIL, PR_1864);
+  const problems = checkWithMergeBase(treeOf(TAIL, PR_1741), base, branchPoint);
+
+  assert.equal(problems.length, 2, problems.join("\n"));
+  assert.match(problems[0], /adds idx 248/);
+  assert.match(problems[1], /takes number 0248/);
+});
+
+test("BLO-48352: a branch that KEEPS the base claimant and adds a second still fails", () => {
+  // The post-merge shape: both entries present at idx 248. Nothing was retired.
+  const base = treeOf(TAIL, PR_1864);
+  const problems = checkWithMergeBase(treeOf(TAIL, PR_1864, PR_1741), base, base);
+
+  assert.equal(problems.length, 2, problems.join("\n"));
+  assert.match(problems[0], /adds idx 248 \("0248_runs_read_transcript_grant_seed"\)/);
+  assert.match(problems[1], /takes number 0248/);
+});
+
+test("BLO-48352: no merge base keeps the strict comparison, so the fallback is a red not a green", () => {
+  const base = treeOf(TAIL, RAISING_263);
+  // Identical to the first case except the merge base is unavailable.
+  const problems = check(treeOf(TAIL, FIXED_263), base);
+  assert.equal(problems.length, 2, problems.join("\n"));
+  assert.match(problems[0], /already has idx 263 \("0263_cost_events_consumption_cents"\)/);
+});
+
+test("BLO-48352: a rename onto a number a DIFFERENT base migration holds still fails", () => {
+  // Retires 263 legitimately, but lands the replacement on 247, which TAIL holds
+  // and which this branch did not retire.
+  const base = treeOf(TAIL, RAISING_263);
+  const collide = { ...RAISING_263, idx: 247, tag: "0247_cost_events_add_consumption_cents" };
+  const problems = checkWithMergeBase(treeOf(TAIL, collide), base, base);
+  assert.match(problems.join("\n"), /already has idx 247 \("0247_agent_wakeup_requests_timer_baseline_index"\)/);
+});
+
+// ---------------------------------------------------------------------------
 // Arm 2 on its own: the .sql number is what the post-merge tree trips on, so
 // it must fire even when the journal is clean.
 // ---------------------------------------------------------------------------
