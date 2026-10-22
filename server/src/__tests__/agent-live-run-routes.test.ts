@@ -1610,12 +1610,27 @@ describe("PR review queue observability route", () => {
     expect(res.body.error).toBe("Validation error");
   });
 
-  it("rejects agent credentials", async () => {
+  // BLO-31961: agents read this route to find which run holds a
+  // `pr_review:<repo>:<n>` key; it stays company-scoped.
+  it("allows agent credentials for their own company", async () => {
     const { db } = createLiveRunsDbStub([]);
     const app = await createApp(db, {
       type: "agent",
       agentId: routeAgentId,
       companyId: "company-1",
+      source: "agent_jwt",
+      runId: "run-1",
+    });
+    const res = await request(app).get("/api/companies/company-1/pr-review-queue");
+    expect(res.status).toBe(200);
+  });
+
+  it("rejects agent credentials for another company", async () => {
+    const { db } = createLiveRunsDbStub([]);
+    const app = await createApp(db, {
+      type: "agent",
+      agentId: routeAgentId,
+      companyId: "company-2",
       source: "agent_jwt",
       runId: "run-1",
     });
