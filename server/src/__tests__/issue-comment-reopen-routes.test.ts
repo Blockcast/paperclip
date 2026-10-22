@@ -1086,6 +1086,17 @@ describe.sequential("issue comment reopen routes", () => {
       expect(res.body.details.remediation).toMatch(/being @-mentioned here does not authorize it/i);
       expect(res.body.details.remediation).toMatch(/ask the assignee to make the write for you/i);
       expect(res.body.details.remediation).toMatch(/have the issue assigned to you/i);
+      // PEN-4524: pin the regression NEGATIVELY, in the same spirit as the note
+      // above — the prose stays editable, but it may not go back to claiming
+      // that managing the assignee / creating the issue / holding a blocks edge
+      // "carry comment access only". `PATCH /issues/:id` opts into
+      // `allowCreatorOrManagerChainOwnership` (BLO-18797) and
+      // `allowParkedDisposition` (BLO-27912), so a creator or manager-chain
+      // actor holds two shape-gated `issue:mutate` writes and that clause told
+      // them park/unpark was closed when it is open. Nothing pinned this, which
+      // is why it survived two reviews: a denial that explains itself *wrongly*
+      // is the defect this remediation exists to fix, wearing a fix's clothing.
+      expect(res.body.details.remediation).not.toMatch(/comment access only/i);
       expect(res.body.details.remediation).toContain("agent://22222222-2222-4222-8222-222222222222");
       expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({ action: "issue:comment" }));
       expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({ action: "issue:mutate" }));
