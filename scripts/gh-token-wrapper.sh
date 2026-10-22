@@ -44,7 +44,8 @@ GIT_BIN="${GH_TOKEN_WRAPPER_GIT:-/usr/bin/git}"
 exec_real_gh() {
   case "${1:-} ${2:-}" in
     "pr merge") squash_merge_without_ai_trailers "$@" ;;
-    "api "*) refuse_api_merge "$@" ;;
+    "pr ready") refuse_ready_on_held_draft "$@" ;;
+    "api "*) refuse_api_merge "$@"; refuse_api_ready "$@" ;;
   esac
   case "${1:-} ${2:-}" in
     "auth setup-git" | "auth login")
@@ -122,6 +123,64 @@ refuse_api_merge() {
     echo "gh-token-wrapper: refusing a pull-request merge through \`gh api\`: it would land GitHub's default squash message with AI co-author trailers (BLO-47692); use \`gh pr merge --squash\`" >&2
     exit 1
   fi
+}
+
+# BLO-48359: a draft can be a human HOLD (merging publishes to production), and
+# agents un-drafted three of them on 10-22 because green CI + a clean review read
+# like a barrier to clear. `gh pr ready` refuses when the latest
+# ConvertToDraftEvent was made by someone other than the PR author, or when a
+# non-author comment carries hold language. `--undo` (back to draft) is always
+# allowed. Fails closed if the PR cannot be read.
+HOLD_RE='do not merge|don.t merge|hold until|production hold|user hold|only omar|code-owner hold|needs [^ ]+.s go|needs the user.s go'
+refuse_ready_on_held_draft() {
+  shift 2
+  selector="" repo=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --undo) return 0 ;;
+      -R | --repo) repo="${2:-}"; shift ;;
+      --repo=*) repo="${1#*=}" ;;
+      -R?*) repo="${1#-R}" ;;
+      -*) ;;
+      *) [ -n "${selector}" ] || selector="$1" ;;
+    esac
+    shift
+  done
+  url="$("${REAL_GH}" pr view ${selector:+"${selector}"} ${repo:+--repo "${repo}"} --json url --jq .url)" || url=""
+  pr_path="${url#https://github.com/}"
+  owner="${pr_path%%/*}" rest="${pr_path#*/}"
+  name="${rest%%/*}" number="${pr_path##*/}"
+  case "${url}" in https://github.com/*/*/pull/[0-9]*) ;; *)
+    echo "gh-token-wrapper: refusing \`gh pr ready\`: could not resolve the PR to check it for a human draft hold (BLO-48359)" >&2
+    exit 1 ;;
+  esac
+  # shellcheck disable=SC2016
+  reason="$("${REAL_GH}" api graphql -F n="${number}" -f o="${owner}" -f r="${name}" -f query='query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n){author{login} timelineItems(last:1,itemTypes:[CONVERT_TO_DRAFT_EVENT]){nodes{... on ConvertToDraftEvent{createdAt actor{login}}}} comments(last:100){nodes{author{login} createdAt url body}}}}}' \
+    --jq '.data.repository.pullRequest as $p | ($p.author.login // "") as $a
+      | ([$p.timelineItems.nodes[] | select((.actor.login // "") != $a)
+          | "drafted by \(.actor.login // "unknown") at \(.createdAt)"]
+        + [$p.comments.nodes[] | select((.author.login // "") != $a)
+          | select(.body | test("'"${HOLD_RE}"'"; "i"))
+          | "hold comment by \(.author.login // "unknown") at \(.createdAt): \(.url)"])
+      | join("; ")')" || {
+    echo "gh-token-wrapper: refusing \`gh pr ready\`: could not read ${owner}/${name}#${number} to check it for a human draft hold (BLO-48359)" >&2
+    exit 1
+  }
+  if [ -n "${reason}" ]; then
+    echo "gh-token-wrapper: refusing to mark ${owner}/${name}#${number} ready for review: it is a human hold (${reason}). Leave it a draft and record the hold on your issue; only the person who drafted it takes it out (BLO-48359)" >&2
+    exit 1
+  fi
+}
+
+# BLO-48359: the GraphQL mutation skips the hold check above. Route it through
+# `gh pr ready`. ponytail: like refuse_api_merge, only argv is read.
+refuse_api_ready() {
+  for a in "$@"; do
+    case "${a}" in *markPullRequestReadyForReview*)
+      echo "gh-token-wrapper: refusing markPullRequestReadyForReview through \`gh api\`: use \`gh pr ready\`, which checks the draft is not a human hold (BLO-48359)" >&2
+      exit 1 ;;
+    esac
+  done
 }
 
 squash_merge_without_ai_trailers() {

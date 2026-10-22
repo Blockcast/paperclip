@@ -1050,6 +1050,86 @@ test("non-squash merge is passed through untouched (BLO-47692)", () => {
   });
 });
 
+// BLO-48359: `gh pr ready` must not un-draft a human hold. The stub answers
+// `pr view` with a PR url and `api graphql` with PR_JSON run through the real
+// --jq expression, so the hold logic itself is exercised, not a canned verdict.
+const READY_STUB_GH = `#!/bin/sh
+if [ "$1 $2" = "pr view" ]; then echo https://github.com/Blockcast/pim-multicast-gateway/pull/4057; exit 0; fi
+if [ "$1 $2" = "api graphql" ]; then
+  prev=""; for a; do [ "$prev" = --jq ] && q="$a"; prev="$a"; done
+  printf '%s' "$PR_JSON" | jq -r "$q"; exit $?
+fi
+echo "ARGS=$*"
+`;
+
+function prJson({ author = "allyblockcast", draftedBy, comments = [] }) {
+  return JSON.stringify({ data: { repository: { pullRequest: {
+    author: { login: author },
+    timelineItems: { nodes: draftedBy ? [{ createdAt: "2026-10-22T03:51:35Z", actor: { login: draftedBy } }] : [] },
+    comments: { nodes: comments.map(([login, body]) => ({ author: { login }, createdAt: "2026-10-22T03:51:04Z", url: "u", body })) },
+  } } } });
+}
+
+function runReady(dir, args, pr, status) {
+  const stub = path.join(dir, "gh.real");
+  writeFileSync(stub, READY_STUB_GH);
+  chmodSync(stub, 0o755);
+  const tokenFile = path.join(dir, "token");
+  writeFileSync(tokenFile, "ghs_test");
+  const env = sanitizedEnv({ GH_TOKEN_WRAPPER_REAL_GH: stub, PAPERCLIP_GITHUB_TOKEN_FILE: tokenFile, PR_JSON: pr });
+  const proc = spawnSync("sh", [WRAPPER, ...args], { env, encoding: "utf8" });
+  assert.equal(proc.status, status, proc.stderr);
+  return { proc, ran: /^ARGS=(.*)$/m.exec(proc.stdout)?.[1] };
+}
+
+for (const [label, pr] of [
+  // The #4057 replay: Ally-authored, green, C0/I0, drafted by the drive session.
+  ["drafted by someone other than the author", prJson({ draftedBy: "kkroo" })],
+  ["a non-author hold comment", prJson({ comments: [["kkroo", "Production hold: this needs the user's go before landing."]] })],
+  ["a non-author 'do not merge'", prJson({ comments: [["kkroo", "Do NOT merge until the gitlink moves."]] })],
+]) {
+  test(`gh pr ready is refused on ${label} (BLO-48359)`, () => {
+    withTempDir((dir) => {
+      const { proc, ran } = runReady(dir, ["pr", "ready", "4057", "-R", "Blockcast/pim-multicast-gateway"], pr, 1);
+      assert.equal(ran, undefined, "the real gh must not un-draft");
+      assert.match(proc.stderr, /human hold/);
+    });
+  });
+}
+
+for (const [label, pr] of [
+  ["a plain draft", prJson({})],
+  ["a draft the author itself drafted", prJson({ draftedBy: "allyblockcast" })],
+  ["hold language only in the author's own comments", prJson({ comments: [["allyblockcast", "do not merge yet"]] })],
+]) {
+  test(`gh pr ready passes through on ${label} (BLO-48359)`, () => {
+    withTempDir((dir) => {
+      assert.equal(runReady(dir, ["pr", "ready", "7"], pr, 0).ran, "pr ready 7");
+    });
+  });
+}
+
+test("gh pr ready --undo is never checked (BLO-48359)", () => {
+  withTempDir((dir) => {
+    assert.equal(runReady(dir, ["pr", "ready", "7", "--undo"], prJson({ draftedBy: "kkroo" }), 0).ran, "pr ready 7 --undo");
+  });
+});
+
+test("gh pr ready fails closed when the PR cannot be read (BLO-48359)", () => {
+  withTempDir((dir) => {
+    const { ran } = runReady(dir, ["pr", "ready", "7"], "not json", 1);
+    assert.equal(ran, undefined);
+  });
+});
+
+test("markPullRequestReadyForReview through gh api is refused (BLO-48359)", () => {
+  withTempDir((dir) => {
+    const { proc, ran } = runReady(dir, ["api", "graphql", "-f", "query=mutation{markPullRequestReadyForReview(input:{pullRequestId:\"x\"}){clientMutationId}}"], prJson({}), 1);
+    assert.equal(ran, undefined);
+    assert.match(proc.stderr, /use `gh pr ready`/);
+  });
+});
+
 // Pins the isolation the helper above provides, by re-running this whole file
 // in a child process with every credential input already set in the ambient
 // environment. Before the sanitized-env helper, that run failed two tests: the
