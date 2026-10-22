@@ -14,7 +14,8 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import type { ClaudePromptBundle } from "./prompt-cache.js";
 import { buildEnvGuardSetupShell } from "./env-guard.js";
-import { buildClaudeCodeRuntimeShell, buildImageWrapperPreflightShell, claudeCodeRuntimeRoot, IMAGE_WRAPPER_BIN_DIR, resolveClaudeCodeVersion } from "./runtime-pin.js";
+import { buildClaudeCodeRuntimeShell, buildImageWrapperPreflightShell, buildPrePushHookPreflightShell, claudeCodeRuntimeRoot, IMAGE_WRAPPER_BIN_DIR, resolveClaudeCodeVersion } from "./runtime-pin.js";
+import { GIT_HOOKS_SUBPATH } from "@paperclipai/adapter-utils/github-git-hooks-path";
 import { buildPodLogRedactorSetupShell, POD_LOG_FILTER_ARG_VAR, POD_LOG_FILTER_VAR } from "./pod-log-redactor.js";
 import { SERVER_ONLY_ENV_DENY } from "./inherit-allowlist.js";
 import { SELF_POD_DATA_MOUNT_PATH } from "./k8s-client.js";
@@ -633,7 +634,7 @@ const ROOT_TOOLCHAIN_SUBPATHS = [
   "tools",
   "jre",
   ".local/bin",
-  ".local/share/paperclip-git-hooks",
+  GIT_HOOKS_SUBPATH,
   ".bun/bin",
   ".cache/puppeteer-browsers",
 ];
@@ -3298,7 +3299,16 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // already made unscrubbed egress. Unconditional by design: it must cover the
   // `claudeCodeVersion: "image"` runs too, where `claudeRuntime` is empty.
   const imageWrapperPreflight = buildImageWrapperPreflightShell();
-  const claudeInvocation = `set -o pipefail; ${imageWrapperPreflight}; ${workspaceSetup ? `${workspaceSetup} || exit $?; ` : ""}${buildEnvGuardSetupShell()}; ${claudeRuntime}${ccrotateRefresh ? `${ccrotateRefresh}; ` : ""}${preparePodLog}; ${buildPodLogRedactorSetupShell(containerLogPath)}; cat /tmp/prompt/prompt.txt | ${launcherCommand} ${claudeArgsEscaped} | "$${POD_LOG_FILTER_VAR}" \${${POD_LOG_FILTER_ARG_VAR}:+"$${POD_LOG_FILTER_ARG_VAR}"} | tee ${quoteShellArg(containerLogPath)} | ${failFastFilter} > /dev/null`;
+  // PEN-4518: state, in this pod's own log, whether the pre-push publish guard
+  // is reachable FROM HERE. The seed writes it to the PVC and a narrowed Job
+  // pod sees an overlay, so the seed's success log cannot answer this and the
+  // three source-string suites that cover the path were all green while the
+  // fleet could not push. Placed beside the wrapper preflight and ahead of
+  // `workspaceSetup` for the same reason: that stage runs `git` against origin,
+  // so a verdict after it would describe a pod that had already reached GitHub.
+  // Advisory — the push path already fails closed; this buys time-to-diagnosis.
+  const prePushHookPreflight = buildPrePushHookPreflightShell({ dataMountPath });
+  const claudeInvocation = `set -o pipefail; ${imageWrapperPreflight}; ${prePushHookPreflight}; ${workspaceSetup ? `${workspaceSetup} || exit $?; ` : ""}${buildEnvGuardSetupShell()}; ${claudeRuntime}${ccrotateRefresh ? `${ccrotateRefresh}; ` : ""}${preparePodLog}; ${buildPodLogRedactorSetupShell(containerLogPath)}; cat /tmp/prompt/prompt.txt | ${launcherCommand} ${claudeArgsEscaped} | "$${POD_LOG_FILTER_VAR}" \${${POD_LOG_FILTER_ARG_VAR}:+"$${POD_LOG_FILTER_ARG_VAR}"} | tee ${quoteShellArg(containerLogPath)} | ${failFastFilter} > /dev/null`;
   // When the DinD sidecar is wired in, prepend the wait-for-socket loop
   // so the agent never starts before dockerd is listening on the shared
   // unix socket. Mirrors the opencode_k8s adapter.

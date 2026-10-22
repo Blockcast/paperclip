@@ -76,6 +76,8 @@ import { accessSync, constants, realpathSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { DEFAULT_HOOKS_DIR } from "./github-git-hooks-path.js";
+
 import {
   ALIAS_HOP_LIMIT,
   classifyGitInvocation,
@@ -89,8 +91,15 @@ import {
   type GitReader,
 } from "./github-git-egress-shim.js";
 
-/** Where the Helm seed writes the pre-push hook. */
-export const DEFAULT_HOOKS_DIR = "/paperclip/.local/share/paperclip-git-hooks";
+/**
+ * Where the Helm seed writes the pre-push hook.
+ *
+ * Re-exported from `github-git-hooks-path.ts` rather than declared here: the
+ * Job manifest and the per-Job preflight need the same path, and that module
+ * is importable from the server (this one is not — see its header, and the
+ * entry block at the bottom of this file).
+ */
+export { DEFAULT_HOOKS_DIR };
 
 /** The real git, for the hook's own read-only queries. */
 export const DEFAULT_GIT_BINARY = "/usr/bin/git";

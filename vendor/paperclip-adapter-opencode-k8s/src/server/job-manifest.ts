@@ -1,7 +1,7 @@
 import { createHash } from "crypto";
 import { readFileSync } from "node:fs";
 import path from "node:path";
-import { buildImageWrapperPreflightShell, buildOpencodeRuntimeShell, IMAGE_WRAPPER_BIN_DIR, resolveOpencodeVersion } from "./runtime-pin.js";
+import { buildImageWrapperPreflightShell, buildOpencodeRuntimeShell, buildPrePushHookPreflightShell, IMAGE_WRAPPER_BIN_DIR, resolveOpencodeVersion } from "./runtime-pin.js";
 import type * as k8s from "@kubernetes/client-node";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import {
@@ -1578,7 +1578,16 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // already made unscrubbed egress. Unconditional by design: it must cover the
   // `opencodeVersion: "image"` runs too, where `opencodeRuntime` is empty.
   const imageWrapperPreflight = buildImageWrapperPreflightShell();
-  const baseMainCommand = `set -o pipefail; ${imageWrapperPreflight}; ${isolatedRuntimePrep}${opencodeRuntime}${workspaceSetup}${credentialSetup}${envGuardPluginSetup}${configSetup}${dbResetGuard}${compactPrefix}${sharedDocsBridge}mkdir -p $(dirname ${shellQuote(podLogPath)}) && : > ${shellQuote(podLogPath)} && cat /tmp/prompt/prompt.txt | ${launcherCommand} ${opencodeArgsEscaped} | tee -a ${shellQuote(podLogPath)}`;
+  // PEN-4518: state, in this pod's own log, whether the pre-push publish guard
+  // is reachable FROM HERE. The seed writes it to the PVC and a narrowed Job
+  // pod sees an overlay, so the seed's success log cannot answer this and the
+  // three source-string suites that cover the path were all green while the
+  // fleet could not push. Placed beside the wrapper preflight and ahead of
+  // `workspaceSetup` for the same reason: that stage runs `git` against origin,
+  // so a verdict after it would describe a pod that had already reached GitHub.
+  // Advisory — the push path already fails closed; this buys time-to-diagnosis.
+  const prePushHookPreflight = buildPrePushHookPreflightShell({ dataMountPath: workspaceMountPath });
+  const baseMainCommand = `set -o pipefail; ${imageWrapperPreflight}; ${prePushHookPreflight}; ${isolatedRuntimePrep}${opencodeRuntime}${workspaceSetup}${credentialSetup}${envGuardPluginSetup}${configSetup}${dbResetGuard}${compactPrefix}${sharedDocsBridge}mkdir -p $(dirname ${shellQuote(podLogPath)}) && : > ${shellQuote(podLogPath)} && cat /tmp/prompt/prompt.txt | ${launcherCommand} ${opencodeArgsEscaped} | tee -a ${shellQuote(podLogPath)}`;
   // Redirect Chrome's BrowserMetrics spool off the shared CephFS HOME to the
   // main container's per-pod runtime-cache emptyDir. The
   // agent-browser designer tool launches system Chrome with the default

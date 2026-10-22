@@ -425,18 +425,25 @@ test("the seeded hooks directory is the one the runtime actually looks in", () =
   assert.ok(hooks, "could not find GIT_HOOKS_DIR in the rendered seed script");
   const seeded = `${baseValue}${hooks[1]}`;
 
-  // Read the constant from source rather than restating it: a test that
+  // Read the constants from source rather than restating them: a test that
   // hardcodes both sides of an equality cannot observe either one moving.
-  const runtimeSource = fs.readFileSync(
-    path.join(repoRoot, "packages/adapter-utils/src/github-git-egress-runtime.ts"),
+  // They live in `github-git-hooks-path.ts` as of PEN-4518 — the runtime now
+  // re-exports `DEFAULT_HOOKS_DIR` from there, because the Job manifest and
+  // the per-Job preflight need the same path and cannot import the runtime
+  // (it selects its hook leg on process.argv at import time). Helm renders
+  // shell and cannot import either, so this regex is the chart's only join.
+  const pathSource = fs.readFileSync(
+    path.join(repoRoot, "packages/adapter-utils/src/github-git-hooks-path.ts"),
     "utf8",
   );
-  const declared = runtimeSource.match(/DEFAULT_HOOKS_DIR\s*=\s*"([^"]+)"/);
-  assert.ok(declared, "could not read DEFAULT_HOOKS_DIR from the runtime source");
+  const declaredBase = pathSource.match(/DEFAULT_DATA_MOUNT_PATH\s*=\s*"([^"]+)"/);
+  const declaredSub = pathSource.match(/GIT_HOOKS_SUBPATH\s*=\s*"([^"]+)"/);
+  assert.ok(declaredBase, "could not read DEFAULT_DATA_MOUNT_PATH from github-git-hooks-path.ts");
+  assert.ok(declaredSub, "could not read GIT_HOOKS_SUBPATH from github-git-hooks-path.ts");
 
   assert.equal(
     seeded,
-    declared[1],
+    `${declaredBase[1]}/${declaredSub[1]}`,
     "the seed writes the pre-push hook somewhere the runtime will not look",
   );
 });
