@@ -5,7 +5,10 @@ import { describe, expect, it } from "vitest";
 import {
   CPU_PROFILE_EXTENSION,
   CPU_PROFILE_SENTINEL_BASENAME,
+  maybeStartStallCpuProfile,
   maybeTakeCpuProfile,
+  STALL_PROFILE_COOLDOWN_MS,
+  STALL_PROFILE_MIN_STALL_MS,
 } from "../services/cpu-profile.js";
 
 describe("maybeTakeCpuProfile (BLO-45336)", () => {
@@ -34,5 +37,22 @@ describe("maybeTakeCpuProfile (BLO-45336)", () => {
     );
     // Sentinel consumed: a second poll is a no-op.
     expect(await maybeTakeCpuProfile({ dir, durationMs: 10, keep: 2 })).toBeNull();
+  });
+});
+
+describe("maybeStartStallCpuProfile (BLO-45336)", () => {
+  it("ignores short stalls, captures on a long one, then honours the cooldown", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "cpuprof-"));
+    const opts = { dir, durationMs: 10, keep: 3 };
+    expect(await maybeStartStallCpuProfile(STALL_PROFILE_MIN_STALL_MS - 1, { ...opts, now: 1e12 })).toBeNull();
+    const file = await maybeStartStallCpuProfile(STALL_PROFILE_MIN_STALL_MS, { ...opts, now: 1e12 });
+    expect(file).not.toBeNull();
+    expect(Array.isArray(JSON.parse(readFileSync(file!, "utf8")).nodes)).toBe(true);
+    expect(
+      await maybeStartStallCpuProfile(60_000, { ...opts, now: 1e12 + STALL_PROFILE_COOLDOWN_MS - 1 }),
+    ).toBeNull();
+    expect(
+      await maybeStartStallCpuProfile(60_000, { ...opts, now: 1e12 + STALL_PROFILE_COOLDOWN_MS }),
+    ).not.toBeNull();
   });
 });
