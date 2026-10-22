@@ -4082,9 +4082,9 @@ let projectCheckoutOriginMismatch:
   | null = null;
 let projectCheckoutOriginReconcileCompared: Gauge | null = null;
 let projectCheckoutOriginReconcileMetricsRefreshSuccess: Gauge | null = null;
-let approvalsPending: Gauge<"type"> | null = null;
-let approvalOldestPendingAge: Gauge<"type"> | null = null;
-let approvalLastDecisionTimestamp: Gauge | null = null;
+let approvalsPending: Gauge<"type" | "company_id" | "requester"> | null = null;
+let approvalOldestPendingAge: Gauge<"type" | "company_id" | "requester"> | null = null;
+let approvalLastDecisionTimestamp: Gauge<"company_id" | "requester"> | null = null;
 let approvalQueueMetricsRefreshSuccess: Gauge | null = null;
 let acceptedInteractionOutcome: Gauge<"bucket"> | null = null;
 let acceptedInteractionOutcomeOldestAge: Gauge<"bucket"> | null = null;
@@ -4329,9 +4329,9 @@ function ensureRegistry(): {
   projectCheckoutOriginMismatchGauge: Gauge<"project_workspace_id" | "company_id" | "project_id">;
   projectCheckoutOriginReconcileComparedGauge: Gauge;
   projectCheckoutOriginReconcileMetricsRefreshSuccessGauge: Gauge;
-  approvalsPendingGauge: Gauge<"type">;
-  approvalOldestPendingAgeGauge: Gauge<"type">;
-  approvalLastDecisionTimestampGauge: Gauge;
+  approvalsPendingGauge: Gauge<"type" | "company_id" | "requester">;
+  approvalOldestPendingAgeGauge: Gauge<"type" | "company_id" | "requester">;
+  approvalLastDecisionTimestampGauge: Gauge<"company_id" | "requester">;
   approvalQueueMetricsRefreshSuccessGauge: Gauge;
   acceptedInteractionOutcomeGauge: Gauge<"bucket">;
   acceptedInteractionOutcomeOldestAgeGauge: Gauge<"bucket">;
@@ -5330,8 +5330,10 @@ function ensureRegistry(): {
         + "refresh, so a drained type -- and an empty queue -- reads back an explicit 0 rather than "
         + "an absent series or a frozen stale value. This gauge is the "
         + "alert's GATE, never its trigger -- depth alone is a staffing opinion; see "
-        + APPROVAL_LAST_DECISION_TIMESTAMP_METRIC + " for the fault signal.",
-      labelNames: ["type"],
+        + APPROVAL_LAST_DECISION_TIMESTAMP_METRIC + " for the fault signal. Labelled by company_id "
+        + "and requester ('agent' when requested_by_agent_id is set, else 'board'); the type seed "
+        + "covers every (company_id, requester) pair with any approval history (BLO-48410).",
+      labelNames: ["type", "company_id", "requester"],
       registers: [registry],
     });
     approvalOldestPendingAge = new Gauge({
@@ -5342,8 +5344,8 @@ function ensureRegistry(): {
         + "healthy rate can still strand one card forever, which the last-decision timestamp alone "
         + "cannot see. Reset-then-set every refresh; a type with nothing pending has no series here "
         + "(its " + APPROVALS_PENDING_METRIC + " reads 0), because 0 would read as a card filed this "
-        + "instant.",
-      labelNames: ["type"],
+        + "instant. Labelled by company_id + requester like " + APPROVALS_PENDING_METRIC + ".",
+      labelNames: ["type", "company_id", "requester"],
       registers: [registry],
     });
     approvalLastDecisionTimestamp = new Gauge({
@@ -5356,12 +5358,14 @@ function ensureRegistry(): {
         + "depth-only metric scores that as progress. Excluding them here is what makes "
         + "`time() - <this>` a true service-liveness signal. A revision request is also read from "
         + "the append-only activity log, because the requester's resubmit/withdraw erases it from "
-        + "the approval row. 0 means no board decision has ever "
-        + "been recorded, so alerts must gate on " + APPROVAL_QUEUE_METRICS_REFRESH_SUCCESS_METRIC
-        + " rather than reading 0 as an infinitely stale queue.",
+        + "the approval row. Labelled by company_id + requester (BLO-48410). Every "
+        + "(company_id, requester) pair with any approval history is emitted, at 0 when it has never "
+        + "been decided, so a never-served channel reads as maximally stale instead of dropping out "
+        + "of the vector; alerts gate on " + APPROVAL_QUEUE_METRICS_REFRESH_SUCCESS_METRIC
+        + " so a failed refresh is not read as either.",
+      labelNames: ["company_id", "requester"],
       registers: [registry],
     });
-    approvalLastDecisionTimestamp.set(0);
     approvalQueueMetricsRefreshSuccess = new Gauge({
       name: APPROVAL_QUEUE_METRICS_REFRESH_SUCCESS_METRIC,
       help:
@@ -8029,25 +8033,44 @@ export function setProjectCheckoutOriginReconcileMetricsRefreshSuccess(success: 
  * 0 and the freshness gate distinguishes the two cases.
  */
 export function setApprovalQueuePendingMetrics(input: {
-  entries: ReadonlyArray<{ type: string; pending: number; oldestAgeSeconds: number }>;
-  lastDecisionTimestampSeconds: number | null;
+  /** Every (company_id, requester) pair with any approval history; seeded with 0s. */
+  channels: ReadonlyArray<{
+    companyId: string;
+    requester: string;
+    lastDecisionTimestampSeconds: number | null;
+  }>;
+  entries: ReadonlyArray<{
+    companyId: string;
+    requester: string;
+    type: string;
+    pending: number;
+    oldestAgeSeconds: number;
+  }>;
 }): void {
   const metrics = ensureRegistry();
   metrics.approvalsPendingGauge.reset();
   metrics.approvalOldestPendingAgeGauge.reset();
-  for (const type of APPROVAL_TYPES) metrics.approvalsPendingGauge.set({ type }, 0);
+  metrics.approvalLastDecisionTimestampGauge.reset();
+  for (const channel of input.channels) {
+    const labels = { company_id: channel.companyId, requester: channel.requester };
+    for (const type of APPROVAL_TYPES) metrics.approvalsPendingGauge.set({ ...labels, type }, 0);
+    const at = channel.lastDecisionTimestampSeconds;
+    // 0 = never decided. The rule contract needs the series present (BLO-48410).
+    metrics.approvalLastDecisionTimestampGauge.set(
+      labels,
+      at !== null && Number.isFinite(at) ? Math.max(0, at) : 0,
+    );
+  }
   for (const entry of input.entries) {
-    const type = entry.type || "unknown";
+    const labels = {
+      company_id: entry.companyId,
+      requester: entry.requester,
+      type: entry.type || "unknown",
+    };
     const pending = Number.isFinite(entry.pending) ? Math.max(0, entry.pending) : 0;
     const age = Number.isFinite(entry.oldestAgeSeconds) ? Math.max(0, entry.oldestAgeSeconds) : 0;
-    metrics.approvalsPendingGauge.set({ type }, pending);
-    metrics.approvalOldestPendingAgeGauge.set({ type }, age);
-  }
-  if (
-    input.lastDecisionTimestampSeconds !== null
-    && Number.isFinite(input.lastDecisionTimestampSeconds)
-  ) {
-    metrics.approvalLastDecisionTimestampGauge.set(Math.max(0, input.lastDecisionTimestampSeconds));
+    metrics.approvalsPendingGauge.set(labels, pending);
+    metrics.approvalOldestPendingAgeGauge.set(labels, age);
   }
 }
 
