@@ -73,6 +73,31 @@ const PRIORITY_RANK = new Map<string, number>(
  *
  * These values fire on 45 of 237 on day one (critical 2, high 15, medium 6,
  * low 22) with the actionable list capped at {@link DEFAULT_MAX_ESCALATED}.
+ *
+ * ## ⚠ That derivation no longer describes the queue these values are applied to
+ *
+ * PEN-4497. The digest is collected **per company**
+ * (`collectHumanGatedAgeingDigest` scopes every query by `companyId`), but this
+ * table is a single global default. It was calibrated once, on the Blockcast
+ * queue above; it is applied unchanged to every other company's queue, which
+ * has no reason to share that shape — and measurably does not.
+ *
+ * Re-measured on the Penstock queue 2026-10-22 (n=74 human-gated open rows):
+ * **68 of 74 are past threshold**, and `high` is **35 of 35** — every single
+ * `high` row older than two weeks clears its bar. A threshold that fires on 92%
+ * of the population is not discriminating; it has handed all of the selection
+ * work to {@link DEFAULT_MAX_ESCALATED}, which can only rank, not filter.
+ *
+ * Day-one shape was `critical 2, high 15, medium 6, low 22` — bottom-heavy, and
+ * the 14d/30d/45d weighting exists to stop `low` drowning the report. Penstock's
+ * shape is `critical 22, high 35, medium 5, low 6` — top-heavy, where the same
+ * weighting admits nearly everything. The weighting is not wrong; it is
+ * answering a question about a different queue.
+ *
+ * Re-deriving these values changes what "overdue" means, so it is a decision in
+ * its own right rather than a tuning pass, and it is tracked separately rather
+ * than folded in here. Until then, read a past-threshold count from this digest
+ * as "open and older than two weeks", not as a triage verdict.
  */
 export const DEFAULT_ESCALATE_AFTER_DAYS_BY_PRIORITY: Readonly<Record<string, number>> =
   Object.freeze({
@@ -87,6 +112,64 @@ export const DEFAULT_ESCALATE_AFTER_DAYS_BY_PRIORITY: Readonly<Record<string, nu
  * Attention budget for one weekly digest. The threshold decides what counts as
  * overdue; this decides how much of it a human is asked to look at in one
  * sitting. The remainder is reported as a count, never silently dropped.
+ *
+ * ## Why this is still 15, and why the list it produces is all `critical`
+ *
+ * PEN-4497. PEN-4489 made the cut fill slots `critical` first (see
+ * {@link selectAgedHumanGatedIssues}) and named the boundary case it could not
+ * then price: if more than 15 `critical` rows are past threshold, no `high`,
+ * `medium` or `low` row prints at all. That case is not hypothetical — it was
+ * the live state on the day the change merged, and the all-`critical` list is
+ * **accepted as the intended rationing**. The measurement behind that, taken on
+ * the Penstock queue 2026-10-22 over all five open statuses (n=74 human-gated
+ * open rows, complete pages, past-threshold counts bounded above by `createdAt`
+ * age since the human clock is `max(createdAt, lastHumanTouchAt)`):
+ *
+ * | tier     | past threshold | deepest silence |
+ * |----------|----------------|-----------------|
+ * | critical |             22 |           129.1d |
+ * | high     |             35 |           131d   |
+ * | medium   |              5 |                  |
+ * | low      |              6 |                  |
+ *
+ * The live digest (`p2964`) renders 51 past threshold against this cap of 15.
+ *
+ * Two alternatives were costed against those numbers and rejected:
+ *
+ * - **A per-tier floor** reserves slots for `high`/`medium`/`low`, which means
+ *   a `medium` row at 82d takes a slot from a `critical` row at 58d. That is
+ *   the inversion PEN-4489 was filed to remove, re-introduced deliberately. The
+ *   only thing it buys is a more varied report, which is a presentation
+ *   preference rather than a rationing principle — and it does not even buy the
+ *   thing it is usually reached for, because reserving 3 of 15 slots leaves 12
+ *   rows static week over week.
+ *
+ * - **Raising the cap** cannot stop the list being a tier filter at any size
+ *   that is not effectively uncapped. For the cut to land *inside* a tier it
+ *   must exceed the deepest tier, and the deepest tier is `high` at 35 — so the
+ *   smallest non-filtering cap is 36, and since `critical` + `high` is 57 of
+ *   the 68, any cap that reaches `medium` at all is ~58. **There is no value
+ *   between "tier filter" and "muted."** That is the fact that closes this
+ *   option, and it was not available when PEN-4489 chose; the day-one reasoning
+ *   it rejected the option on is reproduced under
+ *   {@link DEFAULT_ESCALATE_AFTER_DAYS_BY_PRIORITY} and still holds.
+ *
+ * What makes the all-`critical` outcome acceptable is **not** that it is
+ * pleasant: it is that every row it displaces has a weaker claim. No `high`,
+ * `medium` or `low` row has a better claim on a human's next hour than a
+ * `critical` row that has been silent for two months, and the shallowest row in
+ * the `critical` tier is 58 days silent. The list is reporting the queue's
+ * shape, not distorting it.
+ *
+ * The withheld rows are legible rather than silent: the truncation notice names
+ * the count per priority (PEN-4489), so the tiers that do not print are stated
+ * rather than merely absent.
+ *
+ * ⚠ **Do not re-derive this number without re-reading the tier depths above.**
+ * A reader who sees "all `critical`" and reaches for a bigger cap is solving
+ * the wrong problem: with 68 of 74 rows past threshold the binding constraint
+ * is the *threshold*, not the budget — see
+ * {@link DEFAULT_ESCALATE_AFTER_DAYS_BY_PRIORITY}.
  */
 export const DEFAULT_MAX_ESCALATED = 15;
 

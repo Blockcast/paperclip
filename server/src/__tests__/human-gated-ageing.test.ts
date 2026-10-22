@@ -669,6 +669,108 @@ describe("threshold and reporting", () => {
     });
   });
 
+  /**
+   * PEN-4497. With the `critical` tier alone deeper than the cap, the escalation
+   * list is entirely `critical` and the other three tiers do not print. That was
+   * measured on the live queue and **accepted** as the intended rationing, not
+   * tolerated as a known gap — the reasoning is on {@link DEFAULT_MAX_ESCALATED}.
+   *
+   * These tests exist so the decision cannot be reversed by accident. The
+   * obvious "fix" on reading an all-`critical` digest is to reserve slots for
+   * the lower tiers, which re-introduces exactly the inversion PEN-4489
+   * removed. Anyone who adds a floor has to delete a test that says so.
+   */
+  describe("an all-critical escalation list is the accepted rationing (PEN-4497)", () => {
+    const BY_PRIORITY = { critical: 14, high: 14, medium: 30, low: 45, unset: 45 };
+
+    /**
+     * The live shape: a `critical` tier deeper than the cap, under lower-priority
+     * rows that are *older*. The ages are the measured ones — the shallowest
+     * `critical` row is far older than its own 14d bar, and the displaced rows
+     * are older still, so this is the hard case rather than a flattering one.
+     */
+    function criticalTierDeeperThanCap(): HumanGatedIssue[] {
+      return [
+        // Older than every `critical` row below, and still displaced.
+        issue({ id: "low-ancient", priority: "low", lastHumanTouchAt: daysAgo(142) }),
+        issue({ id: "high-oldest", priority: "high", lastHumanTouchAt: daysAgo(130) }),
+        issue({ id: "medium-authorised", priority: "medium", lastHumanTouchAt: daysAgo(82) }),
+        ...Array.from({ length: DEFAULT_MAX_ESCALATED + 2 }, (_, index) =>
+          issue({
+            id: `critical-${String(index).padStart(2, "0")}`,
+            priority: "critical",
+            lastHumanTouchAt: daysAgo(75 - index),
+          }),
+        ),
+      ];
+    }
+
+    it("spends every slot on critical and prints no lower tier", () => {
+      const report = selectAgedHumanGatedIssues(criticalTierDeeperThanCap(), {
+        now: NOW,
+        escalateAfterDaysByPriority: BY_PRIORITY,
+      });
+
+      expect(report.escalated).toHaveLength(DEFAULT_MAX_ESCALATED);
+      expect(report.escalated.every((row) => row.priority === "critical")).toBe(true);
+
+      // Asserted on the rendered digest too: the tiers are absent from the
+      // output a human reads, not merely from the selected array.
+      const rendered = formatHumanGatedAgeingSections(report);
+      expect(rendered).not.toContain("LOW-ANCIENT");
+      expect(rendered).not.toContain("HIGH-OLDEST");
+      expect(rendered).not.toContain("MEDIUM-AUTHORISED");
+    });
+
+    it("names every withheld tier in the truncation notice rather than dropping it silently", () => {
+      // What makes total displacement acceptable is that it is stated. If the
+      // breakdown ever stops naming the displaced tiers, the accepted trade is
+      // no longer the one that was accepted.
+      const report = selectAgedHumanGatedIssues(criticalTierDeeperThanCap(), {
+        now: NOW,
+        escalateAfterDaysByPriority: BY_PRIORITY,
+      });
+
+      expect(report.omittedCountsByPriority).toEqual({ critical: 2, high: 1, medium: 1, low: 1 });
+
+      const rendered = formatHumanGatedAgeingSections(report);
+      expect(rendered).toContain("5 rows are withheld by the cap");
+      expect(rendered).toContain("critical 2");
+      expect(rendered).toContain("high 1");
+      expect(rendered).toContain("medium 1");
+      expect(rendered).toContain("low 1");
+    });
+
+    it("keeps the cap a budget rather than a tier allowance", () => {
+      // The rejected alternative, as a property: no reserved slot for a lower
+      // tier. Raising the cap must admit the rest of `critical` first — a floor
+      // would surface `high`/`medium`/`low` while `critical` rows are still
+      // withheld, which is the inversion PEN-4489 removed.
+      for (const maxEscalated of [1, 5, DEFAULT_MAX_ESCALATED, DEFAULT_MAX_ESCALATED + 1]) {
+        const report = selectAgedHumanGatedIssues(criticalTierDeeperThanCap(), {
+          now: NOW,
+          escalateAfterDaysByPriority: BY_PRIORITY,
+          maxEscalated,
+        });
+        expect(report.escalated).toHaveLength(maxEscalated);
+        expect(report.escalated.every((row) => row.priority === "critical")).toBe(true);
+      }
+
+      // ...and only once `critical` is exhausted does the next tier appear, in
+      // priority order. This is the positive control for the assertion above:
+      // without it, a selector that returned nothing but `critical` *forever*
+      // would also pass.
+      const exhausted = selectAgedHumanGatedIssues(criticalTierDeeperThanCap(), {
+        now: NOW,
+        escalateAfterDaysByPriority: BY_PRIORITY,
+        maxEscalated: DEFAULT_MAX_ESCALATED + 3,
+      });
+      expect(exhausted.escalated.at(-1)!.priority).toBe("high");
+      expect(exhausted.omittedCountsByPriority.critical).toBeUndefined();
+    });
+  });
+
+
   it("treats snake_case human-touch input as malformed instead of falling back to createdAt", () => {
     const snakeCaseRow = {
       ...issue({
