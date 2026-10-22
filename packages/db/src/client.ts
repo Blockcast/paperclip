@@ -1374,8 +1374,8 @@ export async function inspectMigrations(url: string): Promise<MigrationState> {
  *  - A timeout, deadlock or an error the single-transaction shape itself causes
  *    (55P04: an enum value added by one pending migration used by a later one,
  *    which the runner commits in between) is INCONCLUSIVE, not FAIL.
- *  - Non-transactional statements (`... CONCURRENTLY`, `VACUUM`) are skipped and
- *    reported; the runner cannot execute them inside its transaction either.
+ *  - Non-transactional statements (`... CONCURRENTLY`, `VACUUM`) are NOT skipped:
+ *    the runner executes them inside a transaction too, so their 25001 is a real FAIL.
  *  - Nothing is recorded in the migration journal; the journal row count is
  *    re-read after ROLLBACK and a change throws.
  */
@@ -1390,7 +1390,6 @@ export type MigrationDryRunOptions = {
 export type MigrationDryRunResult = {
   readonly verdict: "pass" | "fail" | "inconclusive" | "nothing-pending";
   readonly executed: readonly string[];
-  readonly skippedStatements: readonly { migration: string; statement: string }[];
   /** Set on fail/inconclusive: the migration being executed and what happened. */
   readonly migration?: string;
   readonly detail?: string;
@@ -1403,12 +1402,6 @@ export const MIGRATION_DRY_RUN_LOCK_TIMEOUT_MS = 5_000;
 // 55P03 lock_not_available, 57014 query_canceled (statement_timeout),
 // 40P01 deadlock_detected, 40001 serialization_failure, 55P04 unsafe_new_enum_value_usage.
 const DRY_RUN_INCONCLUSIVE_CODES = new Set(["55P03", "57014", "40P01", "40001", "55P04"]);
-const NON_TRANSACTIONAL_STATEMENT = /^\s*(?:(?:CREATE|DROP)\s+(?:UNIQUE\s+)?INDEX\s+CONCURRENTLY|REINDEX\b[^;]*\bCONCURRENTLY|VACUUM\b|ALTER\s+SYSTEM\b|(?:CREATE|DROP)\s+DATABASE\b|ALTER\s+TABLE\b[^;]*\bDETACH\s+PARTITION\b[^;]*\bCONCURRENTLY)/i;
-
-function stripLeadingComments(statement: string): string {
-  return statement.replace(/^(?:\s*--[^\n]*\n)+/, "");
-}
-
 export async function dryRunPendingMigrations(
   url: string,
   options: MigrationDryRunOptions = {},
@@ -1420,15 +1413,13 @@ export async function dryRunPendingMigrations(
 
   const state = await inspectMigrations(url);
   const executed: string[] = [];
-  const skippedStatements: { migration: string; statement: string }[] = [];
-  if (state.status === "upToDate") return { verdict: "nothing-pending", executed, skippedStatements };
+  if (state.status === "upToDate") return { verdict: "nothing-pending", executed };
   if (state.reason !== "pending-migrations") {
     // Fresh bootstrap or a journal-less database: the runner takes a different
     // path there (drizzle's own migrator), so a dry-run of this one proves nothing.
     return {
       verdict: "inconclusive",
       executed,
-      skippedStatements,
       detail: `database has no migration journal (${state.reason}); dry-run covers incremental deploys only`,
     };
   }
@@ -1458,10 +1449,9 @@ export async function dryRunPendingMigrations(
       for (const { migrationFile, content } of toRun) {
         current = migrationFile;
         for (const statement of splitMigrationStatements(content)) {
-          if (NON_TRANSACTIONAL_STATEMENT.test(stripLeadingComments(statement))) {
-            skippedStatements.push({ migration: migrationFile, statement: statement.split("\n")[0]!.slice(0, 160) });
-            continue;
-          }
+          // No skip for non-transactional statements (CONCURRENTLY, VACUUM, ...): the runner
+          // also wraps every statement in a transaction, so Postgres's 25001 here is the
+          // same error the worker would crash-loop on, and it correctly FAILs.
           const remainingMs = budgetMs - (Date.now() - started);
           if (remainingMs <= 0) {
             throw Object.assign(new Error(`dry-run exceeded its ${budgetMs}ms budget`), { code: "57014" });
@@ -1471,7 +1461,7 @@ export async function dryRunPendingMigrations(
         }
         executed.push(migrationFile);
       }
-      outcome = { verdict: "pass", executed, skippedStatements };
+      outcome = { verdict: "pass", executed };
     } catch (error: unknown) {
       const { code, message } = error as { code?: string; message?: string };
       const isPostgres = error instanceof postgres.PostgresError || code === "57014";
@@ -1479,12 +1469,16 @@ export async function dryRunPendingMigrations(
       outcome = {
         verdict: DRY_RUN_INCONCLUSIVE_CODES.has(code ?? "") ? "inconclusive" : "fail",
         executed,
-        skippedStatements,
         migration: current,
         detail: `${code ?? "?"}: ${message ?? String(error)}`,
       };
     } finally {
-      await sql.unsafe("ROLLBACK");
+      try {
+        await sql.unsafe("ROLLBACK");
+      } catch (rollbackError) {
+        // Connection lost mid-transaction rolls back server-side; keep the real cause.
+        if (outcome) throw rollbackError;
+      }
     }
 
     const journalAfter = await journalRows();

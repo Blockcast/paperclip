@@ -109,4 +109,18 @@ describeEmbeddedPostgres("pending-migration dry-run (BLO-48353)", () => {
     expect(result.detail).toMatch(/^55P03/);
     expect((await untouched(sql)).column).toBe(0);
   }, 120_000);
+
+  it("FAILS (25001), not skips, a non-transactional statement the runner would also crash on", async () => {
+    const { url, sql } = await startDatabase();
+    await seed(sql, "metered_api");
+    const before = await untouched(sql);
+
+    const result = await dryRunPendingMigrations(url, {
+      readMigration: async () => 'CREATE INDEX CONCURRENTLY "cost_events_dry_run_probe" ON "cost_events" ("id");',
+    });
+
+    expect(result.verdict).toBe("fail");
+    expect(result.detail).toMatch(/^25001/);
+    expect(await untouched(sql)).toEqual(before);
+  }, 120_000);
 });

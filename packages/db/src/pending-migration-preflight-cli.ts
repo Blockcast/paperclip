@@ -41,9 +41,6 @@ async function main(): Promise<void> {
     console.log("pending-migration pre-flight: OK — no migration is waiting on a missing index");
 
     const dryRun = await dryRunPendingMigrations(resolved.connectionString);
-    for (const skipped of dryRun.skippedStatements) {
-      console.log(`migration dry-run: SKIPPED non-transactional statement in ${skipped.migration}: ${skipped.statement}`);
-    }
     switch (dryRun.verdict) {
       case "pass":
       case "nothing-pending":
