@@ -24,7 +24,7 @@ import {
   PRE_PUSH_HOOK_PREFLIGHT_OFF_MOUNT,
   PRE_PUSH_HOOK_PREFLIGHT_NOT_EXECUTABLE,
 } from "./runtime-pin.js";
-import { DEFAULT_HOOKS_DIR, hooksDirForDataMount } from "@paperclipai/adapter-utils/github-git-hooks-path";
+import { DEFAULT_HOOKS_DIR, hooksDirForDataMount } from "./github-git-hooks-path.js";
 
 // PEN-3916 (Blockcast-local, not upstream). The runtime root is ASSEMBLED here
 // rather than written as one literal. Paperclip's GitHub egress guard refuses
@@ -503,7 +503,7 @@ describe("buildPrePushHookPreflightShell (PEN-4518)", () => {
     }
   });
 
-  it("reports NOT-EXECUTABLE for a present hook without +x — git runs it silently as a no-op", () => {
+  it("reports NOT-EXECUTABLE for a present hook without +x, and names the +x remedy", () => {
     const f = fixture();
     try {
       mkdirSync(f.runtime, { recursive: true });
@@ -511,6 +511,13 @@ describe("buildPrePushHookPreflightShell (PEN-4518)", () => {
       const res = run(against(f.runtime, f.mount));
       expect(res.stderr).toContain(PRE_PUSH_HOOK_PREFLIGHT_NOT_EXECUTABLE);
       expect(res.stderr).not.toContain(PRE_PUSH_HOOK_PREFLIGHT_OK);
+      // The consequence has to match what the runtime does. `prePushHookPresent`
+      // checks with `accessSync(X_OK)`, so a non-executable hook is REFUSED, not
+      // published unscanned — a verdict announcing an unscanned publish would
+      // route the reader to incident response instead of to `chmod +x`.
+      expect(res.stderr).toContain("refuse every push from this pod");
+      expect(res.stderr).toContain("restore +x");
+      expect(res.stderr).not.toContain("publishes unscanned");
     } finally {
       f.cleanup();
     }
