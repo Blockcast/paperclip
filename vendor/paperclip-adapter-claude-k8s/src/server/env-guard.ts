@@ -1423,7 +1423,7 @@ function isOutward(command, depth) {
 }
 // BLO-46113: the GitHub MCP write tools reach the same side effects without
 // Bash. Keep in lockstep with GUARD_HOOK_MATCHER, which routes them here.
-const MCP_GITHUB_WRITE_RE = /^mcp__github__(?:create_pull_request|merge_pull_request|push_files|create_or_update_file|delete_file|create_branch|update_pull_request_branch)$/;
+const MCP_GITHUB_WRITE_RE = /^mcp__github__(?:create_pull_request|merge_pull_request|push_files|create_or_update_file|delete_file|create_branch|update_pull_request_branch|update_pull_request)$/;
 // PEN-4315: does THIS run hold the execution lock on any issue? 'activeRun' is
 // hydrated from 'issues.executionRunId', so 'activeRun.id === run' IS the lock
 // rather than a stand-in for it. Every uncertainty — error status, timeout,
@@ -1494,6 +1494,19 @@ process.stdin.on("end", async () => {
       );
       process.exit(2);
     }
+    // BLO-48402: MCP update_pull_request(draft:false) un-drafts without the
+    // BLO-48359 human-hold check, which lives only in gh-token-wrapper.sh. Send
+    // it there rather than fork the predicate.
+    if (tool === "mcp__github__update_pull_request" && input.draft === false) {
+      process.stderr.write(
+        "Blocked by Paperclip hold guard (BLO-48402): the GitHub MCP tool cannot mark a PR " +
+          "ready for review, because a draft can be a human production hold (BLO-48359). " +
+          "Run 'gh pr ready " + (input.pullNumber || "<n>") + " -R " + (input.owner || "<owner>") +
+          "/" + (input.repo || "<repo>") + "', which refuses if a human drafted it or left a hold " +
+          "comment. If that refuses, leave the PR a draft and record the hold on your issue.\n",
+      );
+      process.exit(2);
+    }
     const outward = /^(?:Bash|Shell)$/i.test(String(tool))
       ? Boolean(command) && isOutward(String(command), 0)
       : MCP_GITHUB_WRITE_RE.test(String(tool));
@@ -1538,7 +1551,7 @@ for (const name of Object.keys(process.env).sort()) console.log(name);
  * Code's installed Stop hook). Also forces commit/PR attribution off (BLO-47692).
  */
 export const GUARD_HOOK_MATCHER =
-  "Bash|mcp__github__(?:create_pull_request|merge_pull_request|push_files|create_or_update_file|delete_file|create_branch|update_pull_request_branch)";
+  "Bash|mcp__github__(?:create_pull_request|merge_pull_request|push_files|create_or_update_file|delete_file|create_branch|update_pull_request_branch|update_pull_request)";
 const SETTINGS_MERGE_SCRIPT = String.raw`const fs=require("fs"),p=require("path");
 const dir=process.env.CLAUDE_CONFIG_DIR||(process.env.HOME||"/paperclip")+"/.claude";
 const f=p.join(dir,"settings.json");

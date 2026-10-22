@@ -436,6 +436,17 @@ describe("embedded guard script (real node process)", () => {
     expect(stderr).toContain("safe-env-inspect.mjs");
   });
 
+  it("refuses MCP update_pull_request draft:false and routes it to the gh hold check (BLO-48402)", () => {
+    const tool = "mcp__github__update_pull_request";
+    expect(new RegExp(`^(?:${GUARD_HOOK_MATCHER})$`).test(tool)).toBe(true);
+    const pr = { owner: "O", repo: "R", pullNumber: 7 };
+    const undraft = runGuardScript({ tool_name: tool, tool_input: { ...pr, draft: false } });
+    expect(undraft.status).toBe(2);
+    expect(undraft.stderr).toContain("gh pr ready 7 -R O/R");
+    expect(runGuardScript({ tool_name: tool, tool_input: { ...pr, draft: true } }).status).toBe(0);
+    expect(runGuardScript({ tool_name: tool, tool_input: { ...pr, title: "t" } }).status).toBe(0);
+  });
+
   it("exits 0 for a benign Bash command", () => {
     expect(runGuardScript({ tool_name: "Bash", tool_input: { command: "ls -la" } }).status).toBe(0);
   });
