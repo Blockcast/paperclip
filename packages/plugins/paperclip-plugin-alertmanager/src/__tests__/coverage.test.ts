@@ -176,4 +176,18 @@ describe("runCoverageCheck (BLO-40673 AC4)", () => {
       vi.unstubAllGlobals();
     }
   });
+  it("exempts an alert re-routed away from the company's receivers, e.g. to blackhole (BLO-48499)", async () => {
+    const opts = { records: { fp1: record() }, issues: { "issue-1": { id: "issue-1", status: "cancelled" } } };
+    const scoped = { ...config, reconcileReceivers: ["paperclip"] };
+    const blackholed = harness(opts);
+    await runCoverageCheck(blackholed.ctx, scoped, NOW, async () => [{ ...amAlert("fp1"), receivers: [{ name: "blackhole" }] }]);
+    expect(uncoveredCalls(blackholed.write)).toEqual([]);
+    const routed = harness(opts);
+    await runCoverageCheck(routed.ctx, scoped, NOW, async () => [{ ...amAlert("fp1"), receivers: [{ name: "paperclip" }] }]);
+    expect(uncoveredCalls(routed.write)).toHaveLength(1);
+    // Unset receivers keeps the pre-BLO-48499 behaviour: no tenant to compare against.
+    const unscoped = harness(opts);
+    await runCoverageCheck(unscoped.ctx, config, NOW, async () => [{ ...amAlert("fp1"), receivers: [{ name: "blackhole" }] }]);
+    expect(uncoveredCalls(unscoped.write)).toHaveLength(1);
+  });
 });

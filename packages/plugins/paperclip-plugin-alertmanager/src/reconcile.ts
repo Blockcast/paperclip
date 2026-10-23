@@ -77,7 +77,7 @@ function toWebhookAlert(entry: ActiveApiAlert): AlertmanagerAlert | null {
   };
 }
 
-function routedTo(entry: ActiveApiAlert, receivers: Set<string>): boolean {
+export function routedTo(entry: { receivers?: unknown }, receivers: Set<string>): boolean {
   if (!Array.isArray(entry.receivers)) return false;
   return entry.receivers.some(
     (r) => typeof (r as { name?: unknown })?.name === "string" && receivers.has((r as { name: string }).name),
