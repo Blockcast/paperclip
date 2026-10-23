@@ -295,18 +295,18 @@ receive the formal reviews branch protection needs:
 - **Cluster SSH key** — `/paperclip/.ssh/id_ed25519`, readable by any agent pod
   that mounts the shared `/paperclip` PVC. It exists to reach cluster hosts
   (`sfo12-public`, `home-residential`) per `/paperclip/.ssh/config` — that is its
-  only sanctioned use. It is *also* registered on a human's personal GitHub
-  **user** account (`kkroo`), an unintended side effect of that cluster
-  provisioning and not a GitHub authoring grant: `ssh -T git@github.com` with it
-  authenticates as that human, and it can push to every repo that account can
-  write — including repos entirely outside the App installation, where neither of
-  the two credentials above has any write path.
+  only sanctioned use, and that use is unchanged. It *was* also registered on a
+  human's personal GitHub **user** account (`kkroo`) — an unintended side effect
+  of that cluster provisioning, never a GitHub authoring grant. **That
+  registration was revoked on 2026-10-23** (key id `150101597`, ed25519), so the
+  key no longer authenticates to GitHub at all.
 
   **Never use this key for any GitHub operation** — no `git push`, no
   `git clone`/`fetch` over an `ssh://git@github.com` or `git@github.com:` remote,
-  no `ssh -T git@github.com`. A push made with it is attributed to that human's
-  account, not the agent, and is indistinguishable from one they made themselves.
-  See BLO-21854.
+  no `ssh -T git@github.com`. This prohibition does not depend on the revocation
+  and is not relaxed by it: while the registration was live, a push made with it
+  was attributed to that human's account, not the agent, and was
+  indistinguishable from one they made themselves. See BLO-21854 and PEN-4301.
 
 GitHub forbids an identity from submitting a **formal review** (`APPROVE` /
 `REQUEST_CHANGES`) on a PR it authored, so the author and the reviewer must be
@@ -342,6 +342,37 @@ and never over the cluster SSH key either.** Use the default App token for norma
 automation writes that are allowed under that repo's rules — comments, status,
 routine branch maintenance, and merges after the review gate is satisfied.
 GitHub operations must never go over SSH in these pods.
+
+### `Permission denied (publickey)` on a `git@` remote
+
+A git operation that fails with:
+
+```text
+git@github.com: Permission denied (publickey).
+fatal: Could not read from remote repository.
+```
+
+means the checkout's `origin` is a legacy SSH remote (`git@github.com:OWNER/REPO`)
+left over from before the revocation above. **This is dead by design.** It is not
+a transient auth fault, not a network blip, and not a missing credential — so
+retrying will never succeed, and hunting for an SSH key to restore is the wrong
+direction: that key's GitHub registration was deliberately retired (PEN-4301).
+The App token is already mounted and works over HTTPS.
+
+Repoint the remote so the credential helper fires:
+
+```bash
+git -C "$REPO" remote -v    # a git@github.com: or ssh://git@github.com/ origin is the defect
+git -C "$REPO" remote set-url origin https://github.com/OWNER/REPO.git
+git -C "$REPO" remote -v    # confirm it now reads https://
+```
+
+Fix the checkout you are in and move on. Legacy `git@` origins were widespread on
+the shared `/paperclip` PVC when the registration was revoked — 50 of 91
+checkouts in one seat's tree, measured 2026-10-21; that is a dated floor from a
+single seat, not a current fleet count — and the agreed disposition is
+fix-on-touch. Do **not** bulk-rewrite remotes across the PVC: other runs hold
+checkouts there mid-flight. See PEN-4570.
 
 ### Why shared-identity authoring breaks review
 
@@ -609,5 +640,11 @@ review had caught.
   the seat is not a substitute for the Bot/App review.
 - Reaching for the cluster SSH key (`/paperclip/.ssh/id_ed25519`) because the App
   token lacks write access to some repo. A repo the App isn't installed on is a
-  permission gate, not a credential puzzle — the SSH key's GitHub registration is
-  a human's personal account, not a sanctioned bypass. Note the gap and escalate.
+  permission gate, not a credential puzzle — the SSH key's GitHub registration was
+  a human's personal account, not a sanctioned bypass, and it is revoked besides.
+  Note the gap and escalate.
+- Reading `Permission denied (publickey)` from a `git@github.com:` remote as a
+  transient fault and retrying it, or as a missing key and trying to restore one.
+  The remote is legacy and the key's GitHub registration is gone by design —
+  repoint the remote at HTTPS. See "`Permission denied (publickey)` on a `git@`
+  remote" above.
