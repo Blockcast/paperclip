@@ -180,7 +180,26 @@ export function execLines(body) {
 }
 
 /**
- * The ordered list of values passed as `-c <value>` on a wrapper's exec lines.
+ * The ordered list of git config overrides passed on a wrapper's exec lines.
+ *
+ * Covers BOTH argv spellings git accepts, because they have identical force and
+ * a check that reads only one is defeated by typing the other (PEN-4541, Ally
+ * review at b70c7aae):
+ *
+ *   -c <value>                  the familiar one
+ *   --config-env=<key>=<ENVVAR> git >= 2.31; takes the VALUE from an env var,
+ *   --config-env <key>=<ENVVAR> so the config never appears in the exec line
+ *
+ * Both `--config-env` spellings are honoured by git and both were measured
+ * live against git 2.47.3: each adds its key to `git config --get-all`. The
+ * separated form is NOT a theoretical nicety -- it is a plain parse-options
+ * string argument, and only the attached form was named in review.
+ * `--config-env` values are normalised to the attached spelling so the two
+ * cannot be used to produce different-looking equal flag sets.
+ *
+ * There is deliberately no sticky `-c<value>` case: git rejects it outright
+ * (`unknown option: -ccredential...`), as its own usage string documents, so
+ * accepting it here would invent a shape the thing under test cannot have.
  *
  * Scoped to exec lines on purpose: `-c` is not a git-only spelling. Two of
  * these wrappers legitimately run `stat -L -c %d` to compare filesystem
@@ -197,7 +216,13 @@ export function configFlags(body) {
   for (const line of execLines(body)) {
     const tokens = line.split(" ");
     for (let i = 0; i < tokens.length; i += 1) {
-      if (tokens[i] === "-c" && i + 1 < tokens.length) flags.push(tokens[i + 1]);
+      if (tokens[i] === "-c" && i + 1 < tokens.length) {
+        flags.push(tokens[i + 1]);
+      } else if (tokens[i] === "--config-env" && i + 1 < tokens.length) {
+        flags.push(`--config-env=${tokens[i + 1]}`);
+      } else if (tokens[i].startsWith("--config-env=")) {
+        flags.push(tokens[i]);
+      }
     }
   }
   return flags;
@@ -259,10 +284,24 @@ export const EXPECTED_SYSTEM_CONFIG_ENTRIES = [
 // `-c` flag, and would therefore carry correction C3's mutation straight past a
 // flag-set equality that only reads `-c`. GIT_CONFIG_COUNT/KEY_n/VALUE_n is the
 // documented argv-free equivalent of `-c`; GIT_CONFIG_GLOBAL/SYSTEM repoint a
-// whole scope at an attacker-chosen file. Named here so both consumers refuse
-// them, rather than left as an unstated assumption that wrappers never set them.
-const CONFIG_INJECTION_ENV =
-  /\bGIT_CONFIG(?:_COUNT|_KEY_\d+|_VALUE_\d+|_GLOBAL|_SYSTEM|_NOSYSTEM)?\b/;
+// whole scope at an attacker-chosen file; GIT_CONFIG_PARAMETERS is git's own
+// internal carrier for `-c` values and is honoured on the way in. Named here so
+// both consumers refuse them, rather than left as an unstated assumption that
+// wrappers never set them.
+//
+// A PREFIX match, not an enumeration of the names known today. The enumerated
+// form shipped at b70c7aae and was wrong in the one way that matters: the
+// trailing `\b` could not sit between the `G` of `GIT_CONFIG` and the `_` of a
+// name the alternation did not list, so `GIT_CONFIG_PARAMETERS` -- the most
+// direct carrier of the lot -- returned null and walked straight past both
+// assertions (PEN-4541, Ally review at b70c7aae; measured, not inferred).
+//
+// The failure direction is what argues for the prefix: an enumeration is
+// silently defeated by any name git adds or that review did not think of,
+// whereas a prefix over-matches at worst. No wrapper has any business naming a
+// GIT_CONFIG* variable at all, so over-matching costs nothing here and the
+// control below proves the widened form still fires on every enumerated name.
+const CONFIG_INJECTION_ENV = /\bGIT_CONFIG\w*/;
 
 export function configInjectionEnv(text) {
   return CONFIG_INJECTION_ENV.exec(text)?.[0] ?? null;
@@ -294,7 +333,14 @@ export function dockerfileGitConfigInvocations(dockerfile) {
   const found = [];
   for (const line of joined.split("\n")) {
     const normalised = line.trim().replace(/\s+/g, " ");
-    const at = normalised.indexOf("git config");
+    // Not `indexOf("git config")`: `git -C / config --system ...` and
+    // `git --no-pager config --system ...` write the same scope with the same
+    // force and are invisible to a literal scan (PEN-4541, Ally review at
+    // b70c7aae, Suggestion 1). `[^&;|]*?` keeps the match inside ONE shell
+    // command, so `git clone x && git config y` matches at the SECOND `git`
+    // rather than swallowing the first; non-greedy so it stops at the first
+    // `config` rather than spanning to a later one.
+    const at = /\bgit\b[^&;|]*?\bconfig\b/.exec(normalised)?.index ?? -1;
     if (at !== -1) found.push(normalised.slice(at));
   }
   return found;

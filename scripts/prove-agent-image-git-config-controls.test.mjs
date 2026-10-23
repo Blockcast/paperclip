@@ -84,6 +84,13 @@ function runDriver(systemGitconfig) {
   }
 }
 
+// The controls this run actually attempted, read back from the driver's own
+// transcript. Every control prints this banner before it is built, so the list
+// is the driver's, not a copy of it that can drift.
+function attemptedControls(out) {
+  return [...out.matchAll(/^--- control '([^']+)'/gm)].map((match) => match[1]);
+}
+
 test("the control driver passes when the checker reds on every control", () => {
   // The shim serves a poisoned system scope for every tag, which is what a
   // correctly-mutated control image looks like to the checker.
@@ -91,7 +98,15 @@ test("the control driver passes when the checker reds on every control", () => {
     `${EXPECTED_SYSTEM_GITCONFIG}[url "https://control.invalid/"]\n\tinsteadOf = https://github.com/\n`,
   );
   assert.equal(status, 0, out);
-  assert.match(out, /all 4 positive controls red the checker/);
+  // Derived from the driver's own output, not restated here. The count used to
+  // be a literal `4`, which made adding a control to the driver fail THIS test
+  // for a reason that has nothing to do with what it checks -- the same
+  // enumerate-don't-restate rule the wrapper test follows when it reads the
+  // directory instead of listing it.
+  assert.match(
+    out,
+    new RegExp(`all ${attemptedControls(out).length} positive controls red the checker`),
+  );
   assert.doesNotMatch(out, /did NOT red/);
 });
 
@@ -108,10 +123,19 @@ test("the control driver FAILS when the checker stays green on a poisoned image"
     `the driver accepted a checker that never reds. That is the failure mode PEN-4541's positive controls exist to catch, and it would manufacture evidence that the agent image had been checked:\n${out}`,
   );
   assert.match(out, /did NOT red the checker/);
-  assert.match(out, /4 positive control\(s\) stayed green/);
-  // Every control must be named, not just the first: a driver that stopped at
-  // the first green one would under-report which assertions are dead.
-  for (const name of ["insteadof", "credential", "extra-key", "wrapper"]) {
-    assert.ok(out.includes(name), `control '${name}' was not reported as green:\n${out}`);
+
+  // EVERY control the driver attempted must be reported green -- derived from
+  // the run, not from a list written here. A driver that stopped at the first
+  // green one would under-report which assertions are dead, and a hardcoded
+  // subset could not see that: it would keep passing while a newly added
+  // control went unreported.
+  const attempted = attemptedControls(out);
+  assert.ok(
+    attempted.length >= 6,
+    `the driver attempted only ${attempted.length} control(s); this assertion goes vacuous if the control list is emptied, so it carries a floor:\n${out}`,
+  );
+  assert.match(out, new RegExp(`${attempted.length} positive control\\(s\\) stayed green`));
+  for (const name of attempted) {
+    assert.ok(out.includes(`'${name}' did NOT red`), `control '${name}' was not reported as green:\n${out}`);
   }
 });

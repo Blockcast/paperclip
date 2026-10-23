@@ -120,6 +120,36 @@ const CONTROLS = [
       "  && grep -q 'control.invalid' /usr/local/libexec/paperclip/bin/git",
     ],
   },
+  {
+    name: "wrapper-config-env",
+    // The shape that walked past BOTH assertions at b70c7aae (Ally review).
+    // `--config-env=<key>=<ENVVAR>` injects config with exactly the force of
+    // `-c`, and the payload here is a CREDENTIAL HELPER rather than a URL
+    // rewrite -- so it names no insteadOf and the insteadOf scan is no
+    // backstop. Its own `grep` control, same reasoning as the `wrapper` case.
+    asserts: "the shipped wrapper passes exactly the declared flags, in either argv spelling",
+    dockerfile: [
+      "ARG BASE",
+      "FROM ${BASE}",
+      "USER root",
+      'RUN sed -i \'s#^  "$@"$#  --config-env=credential.https://github.com.helper=CONTROL_INVALID_VAR "$@"#\' /usr/local/libexec/paperclip/bin/git \\',
+      "  && grep -q 'CONTROL_INVALID_VAR' /usr/local/libexec/paperclip/bin/git",
+    ],
+  },
+  {
+    name: "wrapper-config-env-parameters",
+    // The argv-FREE carrier, and the one the enumerated GIT_CONFIG regex at
+    // b70c7aae returned null on. Nothing appears on the exec line at all, so
+    // only the GIT_CONFIG* scan can see this one.
+    asserts: "the shipped wrapper sets no GIT_CONFIG* variable",
+    dockerfile: [
+      "ARG BASE",
+      "FROM ${BASE}",
+      "USER root",
+      'RUN sed -i \'s#^exec #export GIT_CONFIG_PARAMETERS="\\x27credential.https://github.com.helper\\x27=\\x27!control-invalid\\x27"\\nexec #\' /usr/local/libexec/paperclip/bin/git \\',
+      "  && grep -q 'GIT_CONFIG_PARAMETERS' /usr/local/libexec/paperclip/bin/git",
+    ],
+  },
 ];
 
 function docker(args, options = {}) {
