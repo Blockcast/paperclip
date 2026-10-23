@@ -248,6 +248,189 @@ origins and BLO-24843: those issues have no PR by design and would have 422'd
 forever. The code now covers the general case, so the operator does not have to
 remember the instance.
 
+### RULED 2026-10-23 (CTO, PEN-4539) — a `done` row's verdict is not a statement about its closure
+
+The blockquote above gives one half of this field's contract. Here is the other
+half, and it is the half that costs operator time.
+
+**The mechanism.** `lastEvidenceVerdict` is written on a PATCH carrying
+`status: "in_review"` (`server/src/services/issues.ts:11552`, refreshed on
+*every* such PATCH since BLO-19047). The `done` path has exactly one refresh and
+it sits **inside** the blocking branch:
+
+```js
+// server/src/services/issues.ts:11378
+if (experimental.enableDoneExecutionGate && shouldBlockNarratedDone(doneGateInput)) {
+  …  doneTransitionEvidenceVerdict = await runEvidenceGate(…)
+}
+// :11448 — the write happens only if that ran
+if (doneTransitionEvidenceVerdict) { patch.lastEvidenceVerdict = … }
+```
+
+Two independent reasons it almost never runs: the refresh is deliberately lazy
+(the in-code comment at `:11359` states both expensive lookups run *"ONLY once
+the cheap checks have already decided to block, so the ordinary update path is
+unaffected"*), and `enableDoneExecutionGate` **defaults to `false`**
+(`server/src/services/instance-settings.ts:228,261`). On a default instance an
+unblocked `done` transition therefore never refreshes, and the row closes
+carrying whatever its last `in_review` evaluation left, or nothing at all.
+
+**This is not a defect in the write path.** The field's contract is "the verdict
+as of `lastEvidenceVerdictEvaluatedAt`", never "as of now" — uniform across
+`in_review` and `done`. What was missing was the reader's side of it.
+
+**Measured 2026-10-23**, company `b1d3f3d3`, the **complete** `done` population
+paged to exhaustion — 3,066 rows in four pages of 1000/1000/1000/66. Do not
+measure this on one page: a single `limit=1000` call returns a bare array of
+exactly 1000 and looks complete, and the first page alone reports the phantom
+signature below as **1 row instead of 38**.
+
+| | count | share |
+|---|---|---|
+| no verdict at all — step-2 triage returns nothing | 1,790 | **58.3%** of 3,066 |
+| have a verdict, comparable against `completedAt` | 1,276 | 41.7% |
+| …evaluated >=3d before completion | 238 | **18.6%** of 1,276 |
+| …of those, stored verdict reads `pass` | 42 | — |
+| worst case — PEN-1274 | 1 | **110d** stale |
+
+Verdict age at completion (n=1,276): same-day 820 (64.3%), 1–2d 218 (17.1%),
+3–7d 131 (10.3%), 8–30d 83 (6.5%), >30d 24 (1.9%).
+
+**Unusable on 2,028 / 3,066 = 66.1%** (1,790 absent + 238 materially stale).
+
+**The failure direction is a false FAIL, not a missed phantom.** A months-old
+`warn` makes a correctly-closed row look like a phantom-done and costs an
+investigation to clear.
+
+Reproduce it — page to exhaustion first, then measure the union:
+
+```sh
+# 1. page until a page comes back short; do NOT stop at the first 1000
+for off in 0 1000 2000 3000; do
+  curl -sS -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+    "$PAPERCLIP_API_URL/api/companies/$COMPANY/issues?status=done&limit=1000&offset=$off" \
+    -o "/tmp/done-$off.json"
+done
+jq -s 'add | unique_by(.id)' /tmp/done-*.json > /tmp/all-done.json
+
+# 2. verdict age at completion, and the phantom-signature decomposition
+jq -r 'def ts: sub("\\.[0-9]+Z$"; "Z") | fromdate;
+  [.[] | select(.lastEvidenceVerdict.verdict=="warn"
+                and ((.lastEvidenceVerdict.missing//[]) | index("pr-link")))] as $p
+  | { total: length,
+      noVerdict: ([.[] | select(.lastEvidenceVerdict==null)] | length),
+      phantomSignature: ($p | length),
+      noProject: ([$p[] | select(.projectId==null)] | length),
+      stale3d: ([$p[] | select(.lastEvidenceVerdictEvaluatedAt != null and .completedAt != null
+                 and (((.completedAt|ts)-(.lastEvidenceVerdictEvaluatedAt|ts))/86400) >= 3)] | length) }' \
+  /tmp/all-done.json
+```
+
+The `.[0-9]+Z` strip is required: `fromdate` rejects the fractional seconds these
+timestamps carry.
+
+#### Screen in this order — staleness is NOT the dominant noise source
+
+38 `done` rows carry the phantom-done signature (`verdict: warn`, `missing`
+includes `pr-link`). Decomposed:
+
+| screen | removes | note |
+|---|---|---|
+| `projectId == null` | **32 of 38 (84%)** | no repo is wired, so `pr-link` is **structurally unsatisfiable** and correctly absent |
+| verdict >=3d older than `completedAt` | 8 of 38 (21%) | 6 of these also have `projectId == null` |
+| **residual — fresh verdict AND a real project** | **4** | PEN-663, PEN-1195, PEN-1216, PEN-1162 |
+
+So the raw signal's precision as a phantom-done detector is **4/38 ≈ 10.5%**,
+and the biggest single noise source is **`projectId == null`, not staleness**.
+Screen on `projectId` first: it is deterministic, costs nothing, and removes
+five sixths of the candidates on its own. PEN-1274 (110d stale) and PEN-529 (45d
+stale) are *both* also `projectId: null`, so either screen alone would have
+cleared them without the investigation they actually cost.
+
+#### The reader rule
+
+- On an **`in_review`** row, `lastEvidenceVerdict` is refreshed on every
+  transition into the status, so it is current and usable as a grace-window
+  signal.
+- On a **`done`** row, treat it as **undefined until proven otherwise**: screen
+  `projectId == null`, then compare `lastEvidenceVerdictEvaluatedAt` against
+  `completedAt`. If the verdict predates the work, it describes an earlier state
+  and carries no information about the closure.
+- The artifact — a PR with a merged commit SHA — is the only authority on
+  whether a row is correctly `done`. The verdict is a triage hint that narrows
+  where to look; it never substitutes for the artifact.
+
+#### Two changes considered and rejected
+
+- **Refresh the verdict on every `done` transition.** Rejected: it moves
+  `runEvidenceGate` plus a GitHub truth probe onto every `done` write, a network
+  round trip on a hot path. The laziness at `:11359` exists to avoid exactly
+  that, and it is correct — `hasDurableArtifactEvidence: false` in the pre-check
+  means the shortcut can only cause the gate to look *harder*, never to skip a
+  block.
+- **Null the verdict when a `done` transition does not refresh it.** A null does
+  read more honestly than a stale `warn`, but it destroys data two other
+  consumers need. `dashboard.ts:409,482` windows its scorecard on
+  `lastEvidenceVerdictEvaluatedAt` and reads the verdict; and
+  `done-gate.ts:195` (`hasPrLinkEvidence`) deliberately asks the **historical**
+  question *"was a real PR ever attached"* (BLO-16325) — for that consumer a
+  stale verdict is the correct input, not a bug. Do not "fix" it.
+
+> **Consequence worth stating once:** the same staleness is *correct* for
+> `done-gate.ts`, which asks a historical question, and *wrong* for a heartbeat
+> sweep, which asks a current one. The field is not broken for either; the two
+> readers are asking different questions of the same column.
+
+#### Where this guidance lives — and where it does not
+
+The reader rule above is operator guidance, so the obvious place for it is an
+agent's `HEARTBEAT.md`. **There is no repo-side source for one, for any role but
+CEO.** `DEFAULT_AGENT_BUNDLE_FILES`
+(`server/src/services/default-agent-instructions.ts:3-6`) declares exactly two
+roles: `ceo`, which ships `AGENTS.md`/`HEARTBEAT.md`/`SOUL.md`/`TOOLS.md` from
+`server/src/onboarding-assets/ceo/`, and `default`, which ships `AGENTS.md`
+alone. Every non-CEO role — CTO included — resolves to `default`
+(`resolveDefaultAgentInstructionsBundleRole`, `:39-41`). So a CTO `HEARTBEAT.md`
+on a live instance is instance-authored content with no stock source, no version
+history, and no review trail, and a **newly provisioned** CTO gets none of it.
+
+That is the durable gap. The *overwrite* risk that this was first reported as
+turns out not to exist, and the checks are worth recording so nobody re-derives
+them:
+
+- The default path materializes with `replaceExisting: false`
+  (`server/src/routes/agents.ts:1790-1793`), and `materializeManagedBundle`
+  only wipes the bundle root when that flag is **true**
+  (`agent-instructions.ts:713-715`). It then writes only the files in the map —
+  for a non-CEO role, `AGENTS.md` alone. `HEARTBEAT.md` is never touched.
+- `built-in-agents.ts:997` *does* pass `replaceExisting: true`, but only for the
+  four built-in bundle keys (`briefs`, `learning`, `reflection-coach`,
+  `summarizer`). There is no `cto` built-in, so that wipe never reaches it.
+- Company import (`company-portability.ts:5055,5102`) also passes
+  `replaceExisting: true`, but `exportFiles` walks the bundle root recursively
+  (`agent-instructions.ts:678-686`) and import restores every file under
+  `agents/<slug>/` (`company-portability.ts:4970-4976`). An export → import
+  round trip preserves the file.
+
+**Verified 2026-10-23: no peer heartbeat doc carries the superseded guidance.**
+The only `HEARTBEAT.md` in the repo is `onboarding-assets/ceo/HEARTBEAT.md`, and
+it contains no `lastEvidenceVerdict`, done-gate or release-verification section
+at all — its §4 is "Get Assignments". There is nothing else to correct, and this
+runbook is therefore the version-controlled home of the rule.
+
+#### Known inconsistency, flagged not ruled
+
+The scorecard's two legs run on two different clocks. The `doneIssues` leg
+(`dashboard.ts:433-443`) filters `status = "done"` and windows on
+`completedAt >= windowStart`; the verdict leg (`:476-486`) windows on
+`lastEvidenceVerdictEvaluatedAt >= windowStart` and carries **no status filter
+at all**, so its population is every row with a verdict in any status. Two
+consequences: a row that sat a long time between `in_review` and `done` lands in
+one leg and not the other, and the verdict leg mixes `in_review` and `done` rows
+into one rate. Windowing a verdict metric on verdict time is a defensible
+reading, so this is **not** being called a defect here; it is recorded for
+whoever owns the metric's definition.
+
 ## Before anything: two baselines, both on the day the truth shapes deploy
 
 **Precondition: `PAPERCLIP_API_KEY` must hold `company_scope:read`.** Without it
