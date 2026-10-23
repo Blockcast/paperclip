@@ -389,6 +389,57 @@ cleared them without the investigation they actually cost.
   whether a row is correctly `done`. The verdict is a triage hint that narrows
   where to look; it never substitutes for the artifact.
 
+#### Reading the artifact cheaply — and the one field that currently lies
+
+The reader rule ends at "the artifact is the only authority" without saying how
+to *reach* it. A heartbeat sweep cannot afford a GitHub round trip per candidate,
+and it does not need one: `GET /issues/:id/work-products`
+(`server/src/routes/issues.ts:10291`) returns the platform's own PR rows for an
+issue, already keyed to it by `owningIdentifiers`.
+
+**Measured 2026-10-23 (CTO), the 35 rows that closed `done` in the preceding
+12h.** The verdict screen from the section above flagged **3**; all three were
+**false positives**, and the work-product read cleared each in a single call:
+
+| row | verdict screen | work products | truth |
+|---|---|---|---|
+| PEN-4515 | `null` → flagged | #2930 `merged`, `4df0de8f` | PASS |
+| PEN-3260 | `null` → flagged | 4 merged PRs owning the row | PASS |
+| PEN-4528 | `null` → flagged | none of its own | PASS — coordination row, no code deliverable; its decision was routed and **ruled** |
+
+Precision of the verdict screen on that cohort: **0/3**. This is the
+`noVerdict` 58% from the census above arriving as false FAILs, exactly as the
+failure-direction note predicts — so on a `done` row, go to the work products
+first and treat the verdict as a hint about *where* to look, not *whether* to.
+
+> **⚠️ Do NOT screen on `status == "merged"` or on `metadata.merged`.** Both are
+> currently wrong for every merge that arrives through a mandatory merge queue.
+> GitHub delivers such a merge as `dequeued`, not `closed`, and the pre-PEN-4550
+> webhook populated `prMerged` only on `action === "closed"` — so the event
+> *carrying* the merge wrote `ready_for_review` / `merged: false` while
+> `metadata.mergedAt` was populated from the same payload. A row contradicting
+> itself on its face.
+>
+> **Screen on `metadata.mergedAt` being populated.** That is not a workaround;
+> it is the server's own canonical predicate, `pullRequestHasMerged`
+> (`server/src/services/pull-request-work-products.ts:183`) — `prMerged === true
+> || prMergedAt` non-empty — chosen because GitHub sets `merged_at` on a real
+> merge, never clears it, and a merged PR cannot be reopened. A genuine queue
+> **ejection** carries `merged_at: null` and is correctly excluded.
+>
+> Measured the same day: PEN-4553's own #2955 read `status: ready_for_review`,
+> `merged: false`, `mergedAt: 2026-10-23T13:35:53Z` while GitHub reported
+> `merged: true`. A `status`-only screen false-FAILs it — and #2955 is the
+> backfill for this very defect, demoted by the defect it repairs.
+
+**This trap has a dated expiry, and the predicate outlives it.** The forward fix
+(PEN-4550, `8633c02`) and the backfill (PEN-4553, migration `0265`) are both on
+`master` as of 2026-10-23, so once a dispatched deploy carries them, `status`
+becomes trustworthy again and already-demoted rows are repaired in that same
+startup. Until then it is not — and `mergedAt` is the correct screen on both
+sides of that deploy, which is why it is the one to write down.
+
+
 #### Two changes considered and rejected
 
 - **Refresh the verdict on every `done` transition.** Rejected: it moves
