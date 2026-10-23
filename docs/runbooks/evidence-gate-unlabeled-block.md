@@ -397,16 +397,21 @@ stale_active_run_evaluation    routine_execution
 ```
 
 **This list is deliberate, not exhaustive — do not treat it as the whole set.**
-The authoritative enumeration is `ISSUE_ORIGIN_KINDS` in
-`packages/shared/src/constants.ts`, which also carries `stranded_issue_recovery`,
-`task_watchdog`, `task_watchdog_product_bug` and the open-ended `plugin:*` family.
-Those are left out because they are **not all decidable the same way**: some are
-plausibly no-code-scope too, but `task_watchdog_product_bug` is a *product bug the
-watchdog found*, which is normally fixed by a commit and so **does** have code
-scope — screening it out would suppress a real hit. Adding a kind to this list is
-a claim that **no commit could ever close that row**; check it against
-`ISSUE_ORIGIN_KINDS` and make that claim deliberately rather than by pattern-match
-on the name.
+The authoritative enumeration is `packages/shared/src/constants.ts`, in two
+parts: the `ISSUE_ORIGIN_KINDS` **array** holds the 8 built-ins — which beyond
+the four above are `manual`, `stranded_issue_recovery`, `task_watchdog` and
+`task_watchdog_product_bug` — while the open-ended `plugin:*` family is a
+separate type, `PluginIssueOriginKind`, joined to the built-ins as
+`IssueOriginKind` in the same file. **Grepping the array alone will not show you
+`plugin:*`**; read the union type, not just the list.
+
+The omitted kinds are left out because they are **not all decidable the same
+way**: some are plausibly no-code-scope too, but `task_watchdog_product_bug` is
+a *product bug the watchdog found*, which is normally fixed by a commit and so
+**does** have code scope — screening it out would suppress a real hit. Adding a
+kind to this list is a claim that **no commit could ever close that row**; check
+it against `ISSUE_ORIGIN_KINDS` and make that claim deliberately rather than by
+pattern-match on the name.
 
 The class is not rare, and the overlap with `projectId` is only partial — which
 is exactly why it needs its own screen. Measured over one agent's 807 `done`
@@ -434,8 +439,11 @@ jq -r 'def ts: sub("\\.[0-9]+Z$"; "Z") | fromdate;
 ⚠️ **Bind `originKind` to a variable — do not write `index(.originKind)` inline.**
 Inside `[ ... ] | index(.originKind)` the `.` has rebound to the *array literal*,
 not the issue, so jq fails with `Cannot index array with string "originKind"`.
-The `. as $ok` form above is the one that works; this bit the first draft of this
-very section.
+The working form is the exact one above — **`(.originKind // "") as $ok`**, not a
+bare `. as $ok`, which would bind the whole issue and reproduce a variant of the
+same bug. The `// ""` is load-bearing too: it maps a null `originKind` to `""`,
+which is absent from the list and so passes through as *non-harness* rather than
+erroring. This bit the first draft of this very section.
 
 ⚠️ **Do not oversell this screen — a tempting hypothesis here is false.** It is
 natural to guess that the residual is *largely* harness rows, which would mean
