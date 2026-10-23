@@ -3,6 +3,7 @@ import { aggregateKeyForAlert } from "./aggregate-key.js";
 import { alertStateRef } from "./constants.js";
 import { resolveAlertmanagerApiUrl } from "./escalation.js";
 import { isTerminalSeverity } from "./issue-mapping.js";
+import { routedTo } from "./reconcile.js";
 import type { AlertmanagerAlert, AlertmanagerPluginConfig, AlertStateRecord } from "./types.js";
 import { decideRefire, findActiveAggregateIssue } from "./webhook-handler.js";
 
@@ -49,7 +50,7 @@ const READ_TIMEOUT_MS = 10_000;
 export const IN_FLIGHT_GRACE_MS = 6 * 60_000; // ponytail: hard-coded to the AM route timings; read them if they change
 
 /** `/api/v2/alerts` shape: `status` is an object there, not the webhook's string. */
-type AmAlert = Omit<AlertmanagerAlert, "status"> & { status?: { state?: string } };
+type AmAlert = Omit<AlertmanagerAlert, "status"> & { status?: { state?: string }; receivers?: unknown };
 
 export type CoverageVerdict = "covered" | "exempt" | "uncovered";
 
@@ -62,6 +63,11 @@ export async function classifyAlertCoverage(
 ): Promise<CoverageVerdict> {
   // Terminal severities are routed straight to `done` by design (BLO-24177).
   if (isTerminalSeverity(alert.labels.severity)) return "exempt";
+  // BLO-48499 — an alert re-routed away from this company's receivers (e.g. to
+  // `blackhole`) is never delivered, so its last row is closed by design. Same
+  // receiver set the reconcile backfill uses; unset keeps the old behaviour.
+  const receivers = new Set(config.reconcileReceivers ?? []);
+  if (receivers.size > 0 && !routedTo(alert, receivers)) return "exempt";
   if (now.getTime() - Date.parse(alert.startsAt ?? "") < IN_FLIGHT_GRACE_MS) return "exempt";
   const record = (await ctx.state.get(alertStateRef(companyId, alert.fingerprint))) as AlertStateRecord | null;
   if (!record?.paperclipIssueId) return "exempt";
