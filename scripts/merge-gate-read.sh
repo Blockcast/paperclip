@@ -17,6 +17,14 @@
 #                          blocking (BLO-34035), and not evidence of a review.
 #   MALFORMED            — an un-expanded `${{` workflow template, i.e. a
 #                          registration that can never report. NOT blocking.
+#   REFUSED-LEGACY       — a `failure` check-run named `<job> (legacy arm -
+#                          refused, nothing ran)`. penstock-llm-proxy-core
+#                          ci.yml (PEN-4416) publishes these on the legacy
+#                          `pull_request` arm by design: they refuse without
+#                          running, under a non-required name, so a refusal can
+#                          never overwrite the trusted arm's verdict. NOT
+#                          blocking, and not a surviving verdict either. Any
+#                          other conclusion under that name still STOPs.
 # LOOKUP-FAILED is blocking but is NOT a label: require_sha's printf emits it
 # in the CONCLUSION column ($3) under a $1 of STOP. A consumer filtering $1
 # for blocking labels must match STOP and will never see it; listing it here
@@ -640,6 +648,14 @@ verdicts() { # $1 = DEAD alternation, $2 = PENDING rows, $3 = WDEAD (all may be 
         # literal `status` or `app:<slug>`, never a numeric `actions/runs[].id`,
         # so they cannot collide with a pend key.
         $2!="neutral"&&$1!~/\$\{\{/{contributed[$4] = 1}
+        # REFUSED-LEGACY (PEN-4416): the legacy pull_request arm of a workflow
+        # that refuses by design, publishing <job> (legacy arm - refused, nothing
+        # ran) as failure under a NON-required name. Its run did speak (credited
+        # above, so it is not NO-VERDICT), but the row is not a verdict on this
+        # head: labelled, not counted in n, so a head carrying only these rows
+        # still reads ABSENT. Exact suffix AND failure only; the same name in any
+        # other state (in flight, cancelled) stays a STOP.
+        { legacy = ($2 == "failure" && $1 ~ / \(legacy arm - refused, nothing ran\)$/) }
         # Survivors are check-run verdicts only. On a repo that publishes ONLY
         # legacy statuses this fires ABSENT on every head — the documented
         # single-surface false RED. Control: run the same read against 3-8
@@ -659,8 +675,8 @@ verdicts() { # $1 = DEAD alternation, $2 = PENDING rows, $3 = WDEAD (all may be 
         # got a permanent false RED and every consumer re-derived the exception
         # by hand. Labelled, not dropped, exactly like `neutral`; and it is not a
         # verdict, so it does not count toward the survivor total either.
-        $4!="status"&&$2!="neutral"&&$1!~/\$\{\{/&&(dead=="__none__"||$4!~/^app:/){n++}
-        $2!="success"&&$2!="skipped"{print ($1~/\$\{\{/?"MALFORMED":($2=="neutral"?"NOT-EVALUATED":"STOP"))"\t"$1"\t"$2"\trun="$4}
+        $4!="status"&&$2!="neutral"&&$1!~/\$\{\{/&&!legacy&&(dead=="__none__"||$4!~/^app:/){n++}
+        $2!="success"&&$2!="skipped"{print (legacy?"REFUSED-LEGACY":($1~/\$\{\{/?"MALFORMED":($2=="neutral"?"NOT-EVALUATED":"STOP")))"\t"$1"\t"$2"\trun="$4}
         END{if(!n) print "STOP\t<" (dead!="__none__" \
               ? "every check-run at this head dropped as superseded-run" \
               : "no check-run verdict at this head") ">\tABSENT\trun=-"
