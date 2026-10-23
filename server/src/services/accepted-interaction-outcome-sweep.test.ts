@@ -7,6 +7,7 @@ import {
   refreshAcceptedInteractionOutcomeMetrics,
   type ClassifiedRow,
 } from "./accepted-interaction-outcome-sweep.js";
+import { __resetMetricsForTest, renderMetrics } from "./metrics.js";
 
 /**
  * PEN-4409 — bucketing rules for the accepted-interaction outcome sweep.
@@ -314,5 +315,34 @@ describe("refreshAcceptedInteractionOutcomeMetrics logging", () => {
     await refreshAcceptedInteractionOutcomeMetrics(dbReturning(rows), { now: NOW, logger: log });
 
     expect((log as unknown as { info: { mock: { calls: unknown[] } } }).info.mock.calls).toHaveLength(0);
+  });
+});
+
+/**
+ * BLO-48606. The oldest-age gauge was fleet-wide, so every tenant's unobserved
+ * card paged Blockcast (which cannot read another tenant's issues) and one
+ * company's moot card masked every other company's. It must carry company_id.
+ */
+describe("refreshAcceptedInteractionOutcomeMetrics per-company oldest age", () => {
+  it("emits one oldest-age series per (bucket, company_id), not one fleet-wide max", async () => {
+    __resetMetricsForTest();
+    const A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const B = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const rows = [
+      row({ interactionId: "a-old", companyId: A, resolvedAt: new Date(NOW.getTime() - 50 * HOUR).toISOString() }),
+      row({ interactionId: "a-new", companyId: A, resolvedAt: new Date(NOW.getTime() - 2 * HOUR).toISOString() }),
+      row({ interactionId: "b", companyId: B, resolvedAt: new Date(NOW.getTime() - 30 * HOUR).toISOString() }),
+    ];
+    await refreshAcceptedInteractionOutcomeMetrics({ execute: async () => rows } as never, {
+      now: NOW,
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } as never,
+    });
+    const series = (await renderMetrics()).body
+      .split("\n")
+      .filter((line) => line.startsWith("paperclip_accepted_interaction_outcome_oldest_age_seconds{"));
+    expect(series.sort()).toEqual([
+      `paperclip_accepted_interaction_outcome_oldest_age_seconds{bucket="unobserved",company_id="${A}"} ${50 * 3600}`,
+      `paperclip_accepted_interaction_outcome_oldest_age_seconds{bucket="unobserved",company_id="${B}"} ${30 * 3600}`,
+    ]);
   });
 });
