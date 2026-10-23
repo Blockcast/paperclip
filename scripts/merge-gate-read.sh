@@ -29,6 +29,14 @@
 #                          no twin, or in any other conclusion, it STOPs: the
 #                          refusal is then the only signal that the trusted
 #                          arm never spoke for that job.
+#   ADVISORY             — `review/ally-ledger` reading `pending` while
+#                          `review/ally-complete` is `success` at the same head.
+#                          The review gate stores its finding ledger in that
+#                          context and writes every marker `pending`; only the
+#                          post-merge retire job ever resolves it, so the row
+#                          is storage, not a check in flight, and the verdict it
+#                          feeds is `review/ally-complete`. NOT blocking. With
+#                          any other `review/ally-complete` state it stays STOP.
 # LOOKUP-FAILED is blocking but is NOT a label: require_sha's printf emits it
 # in the CONCLUSION column ($3) under a $1 of STOP. A consumer filtering $1
 # for blocking labels must match STOP and will never see it; listing it here
@@ -685,8 +693,19 @@ verdicts() { # $1 = DEAD alternation, $2 = PENDING rows, $3 = WDEAD (all may be 
         # by hand. Labelled, not dropped, exactly like `neutral`; and it is not a
         # verdict, so it does not count toward the survivor total either.
         $4!="status"&&$2!="neutral"&&$1!~/\$\{\{/&&(dead=="__none__"||$4!~/^app:/){n++}
+        # The review gate writes every `review/ally-ledger` marker as `pending` and
+        # resolves none of them before merge (require-ally-review.py, retired by its
+        # `retire-merged-statuses` job), so a pending ledger is permanent on any head
+        # that ever had a blocking finding, and reading it as STOP refused every
+        # such PR forever (onprem-k8s, 14 open on 2026-10-21; one was cleared by a
+        # session posting a forged `success` to the context). The verdict over that
+        # ledger is `review/ally-complete`, so the ledger row is held to END and
+        # stays STOP unless that verdict is `success` at this same head.
+        $4=="status"&&$1=="review/ally-complete"{acs = $2}
+        $4=="status"&&$1=="review/ally-ledger"&&$2=="pending"{ledger = 1; next}
         $2!="success"&&$2!="skipped"{print ($1~/\$\{\{/?"MALFORMED":($2=="neutral"?"NOT-EVALUATED":"STOP"))"\t"$1"\t"$2"\trun="$4}
-        END{for (i = 1; i <= lq; i++)
+        END{if(ledger) print (acs == "success" ? "ADVISORY" : "STOP") "\treview/ally-ledger\tpending\trun=status"
+            for (i = 1; i <= lq; i++)
               print ((substr(lname[i], 1, length(lname[i]) - 36) in twin) ? "REFUSED-LEGACY" : "STOP") "\t" lrow[i]
             if(!n) print "STOP\t<" (dead!="__none__" \
               ? "every check-run at this head dropped as superseded-run" \
