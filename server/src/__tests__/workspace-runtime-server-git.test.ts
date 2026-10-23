@@ -1,3 +1,5 @@
+import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -60,6 +62,10 @@ describe("resolveServerGitInvocation", () => {
       "credential.https://github.com.helper=",
       "-c",
       `credential.https://github.com.helper=${fakeHelper}`,
+      "-c",
+      "url.https://github.com/.insteadOf=ssh://git@github.com/",
+      "-c",
+      "url.https://github.com/.insteadOf=git@github.com:",
       "fetch",
       "--prune",
       "origin",
@@ -121,5 +127,27 @@ describe("resolveServerGitInvocation", () => {
       credentialHelper: missing,
     });
     expect(resolved.command).toBe("git");
+  });
+
+  // BLO-48539: real git, offline. The SSH key the server borrowed was revoked, so
+  // SSH-form `.gitmodules` URLs must resolve to https (where the helper works).
+  it.skipIf(!existsSync("/usr/bin/git"))("rewrites SSH-form GitHub URLs to https", async () => {
+    const globalConfig = path.join(tmpDir, "gitconfig");
+    // The shared /paperclip/.gitconfig rule; must not re-rewrite our result.
+    await fs.writeFile(globalConfig, '[url "git@github.com:Blockcast/"]\n\tinsteadOf = https://github.com/Blockcast/\n');
+    const getUrl = (url: string) => {
+      const { command, args } = resolveServerGitInvocation(["ls-remote", "--get-url", url], {
+        gitBinary: "/usr/bin/git",
+        credentialHelper: fakeHelper,
+      });
+      return execFileSync(command, args, {
+        env: { ...process.env, GIT_CONFIG_GLOBAL: globalConfig, GIT_CONFIG_NOSYSTEM: "1" },
+        encoding: "utf8",
+      }).trim();
+    };
+    expect(getUrl("ssh://git@github.com/blockcast/amt-protocol.git")).toBe("https://github.com/blockcast/amt-protocol.git");
+    expect(getUrl("ssh://git@github.com/Blockcast/FFmpeg.git")).toBe("https://github.com/Blockcast/FFmpeg.git");
+    expect(getUrl("git@github.com:Blockcast/shaka-player.git")).toBe("https://github.com/Blockcast/shaka-player.git");
+    expect(getUrl("https://github.com/other/repo.git")).toBe("https://github.com/other/repo.git");
   });
 });

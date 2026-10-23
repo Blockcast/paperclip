@@ -1160,10 +1160,26 @@ export function resolveServerGitInvocation(
       "credential.https://github.com.helper=",
       "-c",
       `credential.https://github.com.helper=${credentialHelper}`,
+      // BLO-48539: GitHub SSH is not a credential the server holds (the key it
+      // borrowed was revoked 2026-10-23), so route SSH-form GitHub URLs --
+      // chiefly `.gitmodules` entries -- over https through the helper above.
+      // `-c` reaches the `submodule update --init` clone via GIT_CONFIG_PARAMETERS.
+      // git applies one rewrite, not a chain, so the result is not re-rewritten.
+      // ponytail: cannot beat /paperclip/.gitconfig's equal-length
+      // `url.git@github.com:Blockcast/.insteadOf=https://github.com/Blockcast/`
+      // (first-defined wins a tie); that line must be deleted on the PVC.
+      ...SERVER_GIT_SSH_TO_HTTPS_ARGS,
       ...args,
     ],
   };
 }
+
+const SERVER_GIT_SSH_TO_HTTPS_ARGS = [
+  "-c",
+  "url.https://github.com/.insteadOf=ssh://git@github.com/",
+  "-c",
+  "url.https://github.com/.insteadOf=git@github.com:",
+] as const;
 
 /**
  * Raised when a git subprocess exceeded its wall-clock budget. Distinguished from
