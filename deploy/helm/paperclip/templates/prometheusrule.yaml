@@ -1302,7 +1302,7 @@ spec:
           # been acted on", the one conclusion a failed sweep cannot support),
           # so the gate drops a stale series here and the strand alert below
           # pages the sweep instead.
-          expr: max(paperclip_accepted_interaction_outcome_oldest_age_seconds{bucket="unobserved"} and on(instance) (paperclip_accepted_interaction_outcome_metrics_refresh_success == 1)) > {{ .Values.prometheusRule.acceptedInteractionUnobservedAgeSeconds }}
+          expr: max by (company_id) (paperclip_accepted_interaction_outcome_oldest_age_seconds{bucket="unobserved"} and on(instance) (paperclip_accepted_interaction_outcome_metrics_refresh_success == 1)) > {{ .Values.prometheusRule.acceptedInteractionUnobservedAgeSeconds }}
           for: {{ .Values.prometheusRule.acceptedInteractionUnobservedFor }}
           labels:
             severity: warning

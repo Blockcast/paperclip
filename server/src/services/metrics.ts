@@ -4180,7 +4180,7 @@ let approvalOldestPendingAge: Gauge<"type" | "company_id" | "requester"> | null 
 let approvalLastDecisionTimestamp: Gauge<"company_id" | "requester"> | null = null;
 let approvalQueueMetricsRefreshSuccess: Gauge | null = null;
 let acceptedInteractionOutcome: Gauge<"bucket"> | null = null;
-let acceptedInteractionOutcomeOldestAge: Gauge<"bucket"> | null = null;
+let acceptedInteractionOutcomeOldestAge: Gauge<"bucket" | "company_id"> | null = null;
 let acceptedInteractionOutcomeRecent: Gauge<"bucket"> | null = null;
 let acceptedInteractionOutcomeMetricsRefreshSuccess: Gauge | null = null;
 let interactionPayloadUnrecognizedKey: Counter<"interaction_kind" | "payload_key"> | null = null;
@@ -4431,7 +4431,7 @@ function ensureRegistry(): {
   approvalLastDecisionTimestampGauge: Gauge<"company_id" | "requester">;
   approvalQueueMetricsRefreshSuccessGauge: Gauge;
   acceptedInteractionOutcomeGauge: Gauge<"bucket">;
-  acceptedInteractionOutcomeOldestAgeGauge: Gauge<"bucket">;
+  acceptedInteractionOutcomeOldestAgeGauge: Gauge<"bucket" | "company_id">;
   acceptedInteractionOutcomeRecentGauge: Gauge<"bucket">;
   acceptedInteractionOutcomeMetricsRefreshSuccessGauge: Gauge;
   interactionPayloadUnrecognizedKeyCounter: Counter<"interaction_kind" | "payload_key">;
@@ -5528,8 +5528,10 @@ function ensureRegistry(): {
         + "population. Reset-then-set; an empty bucket has NO series here rather than 0, because 0 "
         + "would read as an acceptance made this instant. Its "
         + ACCEPTED_INTERACTION_OUTCOME_METRIC + " reads an explicit 0 alongside, so the absence is "
-        + "unambiguous.",
-      labelNames: ["bucket"],
+        + "unambiguous. One series per (bucket, company_id) (BLO-48606): the card belongs to "
+        + "one tenant, so the alert must group by company_id to page the tenant that can act "
+        + "on it, and so one company's moot card cannot mask another company's.",
+      labelNames: ["bucket", "company_id"],
       registers: [registry],
     });
     acceptedInteractionOutcomeRecent = new Gauge({
@@ -8281,7 +8283,8 @@ export function setAcceptedInteractionOutcomeMetrics(input: {
   entries: ReadonlyArray<{
     bucket: string;
     count: number;
-    oldestAgeSeconds: number | null;
+    /** Oldest age per owning company id (BLO-48606). */
+    oldestAgeSecondsByCompany: Readonly<Record<string, number>>;
     recentCount?: number;
   }>;
 }): void {
@@ -8302,10 +8305,11 @@ export function setAcceptedInteractionOutcomeMetrics(input: {
     metrics.acceptedInteractionOutcomeGauge.set({ bucket }, count);
     const recent = Number.isFinite(entry.recentCount) ? Math.max(0, entry.recentCount as number) : 0;
     metrics.acceptedInteractionOutcomeRecentGauge.set({ bucket }, recent);
-    if (entry.oldestAgeSeconds !== null && Number.isFinite(entry.oldestAgeSeconds)) {
+    for (const [companyId, ageSeconds] of Object.entries(entry.oldestAgeSecondsByCompany)) {
+      if (!Number.isFinite(ageSeconds)) continue;
       metrics.acceptedInteractionOutcomeOldestAgeGauge.set(
-        { bucket },
-        Math.max(0, entry.oldestAgeSeconds),
+        { bucket, company_id: companyId },
+        Math.max(0, ageSeconds),
       );
     }
   }

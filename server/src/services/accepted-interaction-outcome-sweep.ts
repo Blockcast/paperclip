@@ -158,6 +158,13 @@ export interface AcceptedInteractionOutcomeBucketReport {
   count: number;
   /** Null when the bucket is empty — never 0, which would read as "resolved this instant". */
   oldestAgeSeconds: number | null;
+  /**
+   * `oldestAgeSeconds` split by owning company (BLO-48606). The alert thresholds
+   * this, not the fleet-wide max: a fleet-wide age paged one tenant (Blockcast)
+   * for another tenant's cards it cannot read, and let one company's moot card
+   * mask every other company's. Companies with no ageable card are absent.
+   */
+  oldestAgeSecondsByCompany: Record<string, number>;
   /** How many of `count` are older than the reporting threshold. */
   beyondThresholdCount: number;
   /**
@@ -319,6 +326,7 @@ function emptyBucket(bucket: AcceptedInteractionOutcomeBucket): AcceptedInteract
     bucket,
     count: 0,
     oldestAgeSeconds: null,
+    oldestAgeSecondsByCompany: {},
     beyondThresholdCount: 0,
     recentCount: 0,
     samples: [],
@@ -393,6 +401,10 @@ export function buildAcceptedInteractionOutcomeReport(
       report.oldestAgeSeconds = report.oldestAgeSeconds === null
         ? ageSeconds
         : Math.max(report.oldestAgeSeconds, ageSeconds);
+      report.oldestAgeSecondsByCompany[row.companyId] = Math.max(
+        report.oldestAgeSecondsByCompany[row.companyId] ?? 0,
+        ageSeconds,
+      );
     }
 
     samplesByBucket[bucket].push({
@@ -539,7 +551,7 @@ export async function refreshAcceptedInteractionOutcomeMetrics(
       entries: ACCEPTED_INTERACTION_OUTCOME_BUCKETS.map((bucket) => ({
         bucket,
         count: report.buckets[bucket].count,
-        oldestAgeSeconds: report.buckets[bucket].oldestAgeSeconds,
+        oldestAgeSecondsByCompany: report.buckets[bucket].oldestAgeSecondsByCompany,
         recentCount: report.buckets[bucket].recentCount,
       })),
     });
