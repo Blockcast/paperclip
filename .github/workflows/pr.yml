@@ -359,6 +359,22 @@ jobs:
         run: node --test ./scripts/check-test-typecheck-allowlist.test.mjs
         timeout-minutes: 1
 
+      # PEN-4541. The agent image's git-config surface is gated in two places
+      # and only one of them runs on a PR: assertion (a) is in the `Helm chart`
+      # job (agent-egress-path.test.mjs), and assertion (b) runs against the
+      # built image in docker-agent.yml, which needs a daemon this lane has
+      # not got. These two suites are what keeps (b)'s logic -- the extraction,
+      # every assertion, the credential redaction in its own failure output,
+      # and the positive-control inversion -- reviewed on every PR rather than
+      # only at the next image build, where a regression would surface as a
+      # red delivery lane instead of as a red diff.
+      - name: Test agent-image git-config surface checks (PEN-4541)
+        if: ${{ !cancelled() }}
+        run: |
+          node --test ./scripts/check-agent-image-git-config.test.mjs
+          node --test ./scripts/prove-agent-image-git-config-controls.test.mjs
+        timeout-minutes: 2
+
       - name: Validate Dockerfile deps stage
         if: ${{ !cancelled() }}
         run: |

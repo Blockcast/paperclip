@@ -38,11 +38,18 @@ jobs:
     #   84.7 (job start -> overlay pushed, worst observed)
     # + 25.6 (smoke test p100, n=22)
     # +  2.7 (promote + bump + post steps, worst observed)
-    # = 113.0 -> 115
+    # +  3.0 (PEN-4541 git-config surface assertion + its 4 positive controls.
+    #         An ESTIMATE, not a measurement -- there is no history for a step
+    #         that has never run, and this budget is otherwise entirely
+    #         observed. It is a `docker create`/`cp`/`rm` against an
+    #         already-pulled image, plus four one-layer builds on a base that
+    #         is already local. Re-derive it from observed durations once this
+    #         lane has run a few times, the way every other term here was.)
+    # = 116.0 -> 119
     # A wedged buildkitd (run 39003886559: zero BuildKit output for 89 min,
     # scheduler loop stuck on a cache import) is NOT covered by any timeout;
     # that is tracked as a daemon fault (BLO-47180), not budget.
-    timeout-minutes: 115
+    timeout-minutes: 119
     # BLO-43939. `github.ref` is constant here — the trigger is `workflow_run`
     # on master only — so this is ONE group for the whole of trunk, and
     # `cancel-in-progress: true` meant the next successful server build killed
@@ -325,6 +332,53 @@ jobs:
             --env HOME=/tmp \
             "$AGENT_IMAGE" \
             paperclip-browser-smoke
+
+      # PEN-4541 assertion (b): the agent image's git-config surface, measured
+      # on the artifact rather than on the sources, before it is promoted or
+      # rolled out to any agent.
+      #
+      # WHY HERE AND NOT ONLY IN THE PR LANE. Its pair, assertion (a), runs on
+      # every PR (`Helm chart` -> deploy/helm/paperclip/tests/
+      # agent-egress-path.test.mjs) and asserts what THIS REPO DECLARES: the
+      # `-c` flags in docker/github-wrappers/ and the single
+      # `git config --system` line in Dockerfile.runtime. That check is
+      # structurally blind to anything writing /etc/gitconfig from outside
+      # those lines -- a SERVER_IMAGE or TOOLCHAIN_IMAGE bump, a toolchain
+      # layer, a package postinst. Those reach the image with every
+      # source-level assertion still green, and this is the only lane where a
+      # built agent image exists to measure. Neither check is sufficient alone.
+      #
+      # WHERE THE GATE ACTUALLY BITES, stated so a green run is not over-read:
+      # buildx has already pushed the immutable `sha-...` candidate tag by the
+      # time this runs -- the same position as the smoke test above, and the
+      # same bargain this workflow already documents ("Publish only the
+      # immutable candidate tag here"). What a red step prevents is the
+      # promotion to `latest-k8s-vendored` and the `bump-agent-image` rollout
+      # below, so no agent pod receives the image. It does not unpublish the
+      # candidate tag.
+      #
+      # ⛔ AND IT DOES NOT COVER: mutation of an ALREADY-published image (a
+      # Harbor retag, or an overwrite of a tag that already passed this gate)
+      # or drift of an already-running pod. Registry-side immutability is a
+      # separate control and was deliberately NOT assigned with PEN-4541. If
+      # you want it, file it -- do not assume this step grew to cover it.
+      - name: Assert the agent image's git-config surface (PEN-4541)
+        env:
+          AGENT_IMAGE: harbor.blockcast.net/paperclip-agent/paperclip-agent@${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker pull "$AGENT_IMAGE"
+          node scripts/check-agent-image-git-config.mjs "$AGENT_IMAGE"
+
+      # The other half, and PEN-4541 makes it a requirement: each assertion
+      # above gets an input that must RED it, so a green verdict on the real
+      # image means something. A control that comes back green is a FAILURE --
+      # see the script's header for the inversion and for which control proves
+      # the checker reads the agent image and not this runner.
+      - name: Prove the git-config assertion reds on a bad image (PEN-4541 positive controls)
+        env:
+          AGENT_IMAGE: harbor.blockcast.net/paperclip-agent/paperclip-agent@${{ steps.build.outputs.digest }}
+        run: node scripts/prove-agent-image-git-config-controls.mjs "$AGENT_IMAGE"
 
       - name: Promote verified agent image
         env:

