@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { compareQueuedRunDispatchOrder } from "../services/heartbeat.js";
+import { compareQueuedRunDispatchOrder, readRunDispatchSeniorityAt } from "../services/heartbeat.js";
 
 /**
  * BLO-28886 ask 1. Deliberately a PURE test with no embedded Postgres: the
@@ -65,5 +65,35 @@ describe("queued-run dispatch order is total (BLO-28886)", () => {
         ).toBe(-Math.sign(compareQueuedRunDispatchOrder(right, left, ranks, null)));
       }
     }
+  });
+});
+
+describe("a retry keeps its chain's queue seniority (BLO-44372)", () => {
+  const original = new Date("2026-10-11T07:01:06.000Z");
+  const failedAt = new Date("2026-10-11T22:06:26.000Z");
+
+  it("reads retryChainCreatedAt, never later than createdAt", () => {
+    expect(readRunDispatchSeniorityAt({
+      createdAt: failedAt,
+      contextSnapshot: { retryChainCreatedAt: original.toISOString() },
+    })).toEqual(original);
+    // Missing, malformed, or future stamps fall back to createdAt.
+    for (const contextSnapshot of [{}, null, { retryChainCreatedAt: "garbage" }, {
+      retryChainCreatedAt: new Date(failedAt.getTime() + 1).toISOString(),
+    }]) {
+      expect(readRunDispatchSeniorityAt({ createdAt: failedAt, contextSnapshot })).toEqual(failedAt);
+    }
+  });
+
+  it("ties on seniority, not on the retry row's fresh createdAt", () => {
+    const retry = { id: "zzz", createdAt: failedAt };
+    const fresher = { id: "aaa", createdAt: new Date(original.getTime() + 60_000) };
+    const ranks = new Map([[retry.id, 10], [fresher.id, 10]]);
+    const seniority = new Map([[retry.id, original.getTime()], [fresher.id, fresher.createdAt.getTime()]]);
+    const order = (s?: Map<string, number>) =>
+      [fresher, retry].sort((l, r) => compareQueuedRunDispatchOrder(l, r, ranks, null, s)).map((r) => r.id);
+    // The assertion that fails if the seniority map is ignored.
+    expect(order(seniority)).toEqual(["zzz", "aaa"]);
+    expect(order()).toEqual(["aaa", "zzz"]);
   });
 });
