@@ -181,6 +181,7 @@
     },
     "overrides": {
       "rollup": ">=4.59.0",
+      "dompurify": ">=3.4.17 <4",
       "kysely": "^0.28.17",
       "fast-uri": "^3.1.6",
       "vite@6": "^6.4.4",
