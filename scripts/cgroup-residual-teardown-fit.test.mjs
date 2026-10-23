@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 
 import {
   MIN_FIT_POINTS,
+  assertMeasurable,
   buildSegmentFits,
   cumulativeSum,
   fitOls,
@@ -11,6 +12,7 @@ import {
   residualQuery,
   restartQuery,
   segmentsFromRestarts,
+  median,
   sliceWindow,
   summarizeDiscrimination,
   teardownQuery,
@@ -338,5 +340,123 @@ describe("formatFitTable", () => {
     ]);
     const row = table.split("\n")[1];
     assert.match(row, /\| - \| -$/);
+  });
+});
+
+describe("assertMeasurable (an UNMEASURABLE window is not a non-result)", () => {
+  const ok = {
+    residual: [{ t: 1000, value: 1 }],
+    teardown: [{ t: 1000, value: 1 }],
+    restarts: [{ t: 1000, value: 500 }],
+    start: 1000,
+    end: 2000,
+  };
+
+  it("passes when all three series carry samples", () => {
+    assert.doesNotThrow(() => assertMeasurable(ok));
+  });
+
+  // ⛔ THE REGRESSION PIN. Without the guard this window does not throw: it
+  // flows into buildSegmentFits, every bucket becomes zero work, and the
+  // script exits 0 reporting "NOT discriminating" -- announcing a property of
+  // the REGIME when in truth the independent variable was never measured.
+  it("refuses an empty teardown series rather than reporting a non-result", () => {
+    assert.throws(
+      () => assertMeasurable({ ...ok, teardown: [] }),
+      /independent variable is absent.*measurement failure, not a non-result/s,
+    );
+  });
+
+  it("refuses an empty residual or restart series as retention loss", () => {
+    assert.throws(() => assertMeasurable({ ...ok, residual: [] }), /past retention/);
+    assert.throws(() => assertMeasurable({ ...ok, restarts: [] }), /past retention/);
+  });
+
+  // The two causes get DIFFERENT messages on purpose: "past retention" sends
+  // the reader to the window, "independent variable is absent" to #2175.
+  it("distinguishes the absent-variable cause from retention loss", () => {
+    assert.throws(
+      () => assertMeasurable({ ...ok, teardown: [] }),
+      (e) => !/past retention/.test(e.message),
+    );
+  });
+});
+
+describe("teardown coverage (`?? 0` must not be silent)", () => {
+  const restarts = Array.from({ length: 6 }, (_, i) => ({
+    t: (i + 1) * 1000,
+    value: 500,
+  }));
+  const residual = Array.from({ length: 6 }, (_, i) => ({
+    t: (i + 1) * 1000,
+    value: (i + 1) * GIB,
+  }));
+
+  it("reports how many interior buckets actually carried a teardown sample", () => {
+    const teardown = [
+      { t: 2000, value: 100 },
+      { t: 3000, value: 100 },
+    ];
+    const [fit] = buildSegmentFits({ residual, teardown, restarts });
+    assert.equal(fit.teardownCovered, 2);
+    assert.equal(fit.teardownBuckets, 5);
+  });
+
+  it("reports zero coverage rather than zero work when teardown is empty", () => {
+    const [fit] = buildSegmentFits({ residual, teardown: [], restarts });
+    assert.equal(fit.teardownCovered, 0);
+    assert.ok(fit.teardownBuckets > 0);
+    assert.equal(fit.teardownSeconds, 0);
+  });
+
+  it("surfaces coverage in the table", () => {
+    const teardown = [{ t: 2000, value: 100 }];
+    const table = formatFitTable(buildSegmentFits({ residual, teardown, restarts }));
+    assert.match(table.split("\n")[0], /\| cov \|/);
+    assert.match(table.split("\n")[1], /\| 1\/5 \|/);
+  });
+});
+
+describe("median", () => {
+  it("returns the middle element for odd length", () => {
+    assert.equal(median([1, 2, 3]), 2);
+  });
+  it("averages the middle pair for even length", () => {
+    assert.equal(median([1, 2, 3, 4]), 2.5);
+  });
+  it("returns null for an empty array", () => {
+    assert.equal(median([]), null);
+  });
+});
+
+describe("summarizeDiscrimination r2 spread", () => {
+  // max(r2) gates the verdict, so ONE clean segment can carry it. That is
+  // intended -- but the spread must be reported so it cannot be misread as
+  // "every segment agrees".
+  const fits = [
+    { slope: 1, r2: 0.9 },
+    { slope: 1, r2: 0.01 },
+    { slope: 1, r2: 0.02 },
+  ];
+
+  it("still discriminates on one well-explained segment", () => {
+    assert.equal(summarizeDiscrimination(fits).discriminating, true);
+  });
+
+  it("reports min and median alongside the max that gates", () => {
+    const v = summarizeDiscrimination(fits);
+    assert.equal(v.maxR2, 0.9);
+    assert.equal(v.minR2, 0.01);
+    assert.equal(v.medianR2, 0.02);
+  });
+
+  it("reports the spread on a low-explanatory-power refusal too", () => {
+    const v = summarizeDiscrimination([
+      { slope: 1, r2: 0.1 },
+      { slope: 1, r2: 0.3 },
+    ]);
+    assert.equal(v.reason, "low-explanatory-power");
+    assert.equal(v.maxR2, 0.3);
+    assert.equal(v.minR2, 0.1);
   });
 });
