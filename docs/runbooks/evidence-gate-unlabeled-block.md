@@ -357,7 +357,15 @@ timestamps carry.
 38 `done` rows carry the phantom-done signature (`verdict: warn`, `missing`
 includes `pr-link`). Decomposed:
 
-| screen | removes | note |
+The **`removes`** column counts each screen against the **full 38 independently**,
+so the rows overlap and the figures deliberately over-count: 32 + 1 + 8 = **41**,
+because 6 rows are *both* `projectId: null` and stale. The distinct union is
+32 + 1 + 8 − 6 = **35**, leaving the 3 residuals. Applied in order — `projectId`,
+then `originKind`, then staleness — the population runs **38 → 6 → 5 → 3**; the
+`originKind` row's **1** is stated post-`projectId` because that is the only row
+it removes which screen 1 did not already take.
+
+| screen | removes (vs. the full 38) | note |
 |---|---|---|
 | `projectId == null` | **32 of 38 (84%)** | no repo is wired, so `pr-link` is **structurally unsatisfiable** and correctly absent |
 | harness-generated `originKind` | **1 of 38** | same structural reason, but these *do* carry a `projectId`, so the `projectId` screen cannot see them; this is the only one that survives both other screens — see below |
@@ -387,6 +395,18 @@ Treat these `originKind` values as having no code scope:
 issue_productivity_review      harness_liveness_escalation
 stale_active_run_evaluation    routine_execution
 ```
+
+**This list is deliberate, not exhaustive — do not treat it as the whole set.**
+The authoritative enumeration is `ISSUE_ORIGIN_KINDS` in
+`packages/shared/src/constants.ts`, which also carries `stranded_issue_recovery`,
+`task_watchdog`, `task_watchdog_product_bug` and the open-ended `plugin:*` family.
+Those are left out because they are **not all decidable the same way**: some are
+plausibly no-code-scope too, but `task_watchdog_product_bug` is a *product bug the
+watchdog found*, which is normally fixed by a commit and so **does** have code
+scope — screening it out would suppress a real hit. Adding a kind to this list is
+a claim that **no commit could ever close that row**; check it against
+`ISSUE_ORIGIN_KINDS` and make that claim deliberately rather than by pattern-match
+on the name.
 
 The class is not rare, and the overlap with `projectId` is only partial — which
 is exactly why it needs its own screen. Measured over one agent's 807 `done`
