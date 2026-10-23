@@ -593,8 +593,8 @@ describeEmbeddedPostgres("reconcileStrandedBlockedIssues", () => {
 
     /**
      * A row the retired CronJob would have picked up on its next tick: manual
-     * origin (`insertIssue`'s default), assigned to an agent, never assigned to
-     * a user, `blocked`, stale past 24h, and carrying no blocker edge.
+     * origin (written by `insertIssue`), assigned to an agent, never assigned
+     * to a user, `blocked`, stale past 24h, and carrying no blocker edge.
      */
     async function insertRecheckerEligibleIssue(input: {
       companyId: string;
@@ -621,8 +621,10 @@ describeEmbeddedPostgres("reconcileStrandedBlockedIssues", () => {
         .select({ originKind: issues.originKind, assigneeUserId: issues.assigneeUserId })
         .from(issues)
         .where(eq(issues.id, issueId));
-      // Pin the two predicate legs the fixture gets implicitly, so a schema
-      // default change cannot quietly make this fixture stop being eligible.
+      // Pin the two predicate legs this fixture never sets itself: `originKind`
+      // comes from `insertIssue`'s hardcoded value and `assigneeUserId` from the
+      // column default. Changing either would quietly make the fixture
+      // ineligible, and the `reconciled === 0` cases below would pass vacuously.
       expect(row?.originKind).toBe("manual");
       expect(row?.assigneeUserId).toBeNull();
       return issueId;
