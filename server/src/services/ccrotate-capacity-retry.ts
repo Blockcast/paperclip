@@ -789,33 +789,40 @@ export function clampTransientRetryHorizon(input: {
  * editing this one in isolation — decoupling a cap from the measurement it was
  * sized against is BLO-23525's failure mode, repeated.
  *
- * Measured 2026-08-19T23:06-23:22Z over a fixed 5.4h span, 13 agents (BLO-28863
- * findings). Two statistics were available and they disagree, so the choice
- * matters:
+ * Re-measured 2026-10-23T10:4xZ (BLO-48491), company BLO, all agents,
+ * per-agent `heartbeat-runs?limit=1000`, window from the #2898 rollout
+ * (2026-10-22T10:12:07Z) to the measurement:
  *
- * - Rows carrying both `scheduledRetryAt` and `startedAt` (n=197): median
- *   `4m30s`, p95 **`42m04s`**, max `2h39m32s`, 44% late by >10m.
- * - Rows still parked and overdue at the snapshot (`paperclipListParkedAgents`,
- *   40/40 overdue): `overdueMs` spanning **55-71 min**, all with `retryInMs: 0`.
+ * - Retry lateness `startedAt - scheduledRetryAt`: n=2, max 0.6m — too thin
+ *   for a direct p95, so the bound is built from its two components.
+ * - Promotion lag `queuedAt - scheduledRetryAt`: <=25s on all 11 retries since
+ *   2026-10-20; censored side
+ *   `max_over_time(paperclip_overdue_scheduled_retry_oldest_age_seconds[24h])`
+ *   = 69s. This was the 55-71 min tail the 2026-08-19 value was sized against
+ *   (BLO-28863 defect 1), and it is gone.
+ * - Dispatch wait `startedAt - coalesce(queuedAt, createdAt)`: n=1714, p50 2s,
+ *   p95 32s, p99 2.5m, max 23m.
+ * - Unresolved: `histogram_quantile(0.95, paperclip_run_dispatch_wait_seconds)`
+ *   over 24h reads 9.2m on ~2400 observations. The metric has no company label
+ *   and probably includes another company; not established.
  *
- * The first is survivor-biased *downward*: it can only measure retries that
- * eventually dispatched, and every row still stuck in the queue is excluded
- * precisely because it is the latest. The second is right-censored — those rows
- * had already waited 55-71 min and had not started, so their eventual lateness
- * is a lower bound, not a value. Taking the survivor p95 (42m) would therefore
- * under-size the margin against the failure mode that matters, so this uses the
- * top of the censored band. Sizing this too small strands the retry after the
- * window, which is the BLO-28785 loss this whole change exists to prevent.
+ * Rounded up to 10m so it covers the 9.2m metric reading, well above the
+ * in-company decomposition (69s + 2.5m). Undersizing strands the retry after the
+ * window — the BLO-28785 loss — while oversizing only costs a few minutes of
+ * abandon window, so the error is deliberately on the large side.
+ *
+ * History: 71m on the 2026-08-19 sample (top of the censored 55-71 min band).
  */
-export const DISPATCH_LATENESS_P95_MS = 71 * 60 * 1000;
+export const DISPATCH_LATENESS_P95_MS = 10 * 60 * 1000;
 
 /**
- * Median heartbeat run duration over the same 2026-08-19 sample (p95 `26m49s`).
- * A retry has to do more than *start* before the window closes — it has to have
- * time to finish the window's work — so the margin carries one median run on top
- * of the lateness it must survive.
+ * Median heartbeat run duration, `finishedAt - startedAt`, over the same
+ * 2026-10-23 sample (n=1712, p95 `8m39s`; was `7m41s` on 2026-08-19). A retry
+ * has to do more than *start* before the window closes — it has to have time to
+ * finish the window's work — so the margin carries one median run on top of the
+ * lateness it must survive.
  */
-export const MEDIAN_HEARTBEAT_RUN_DURATION_MS = (7 * 60 + 41) * 1000;
+export const MEDIAN_HEARTBEAT_RUN_DURATION_MS = (1 * 60 + 35) * 1000;
 
 /**
  * Lead time subtracted from a windowed retry's deadline before it is considered
@@ -824,20 +831,19 @@ export const MEDIAN_HEARTBEAT_RUN_DURATION_MS = (7 * 60 + 41) * 1000;
  * Derived, not hand-picked, following this file's precedent for
  * {@link TRANSIENT_HORIZON_CLAMP_MIN_ATTEMPTS}: a retry is worth scheduling only
  * if it can be expected to *start* despite this fleet's dispatch lateness and
- * still have time to do the window's work. At the 2026-08-19 measurement that
- * is `71m + 7m41s = 78m41s`.
+ * still have time to do the window's work. At the 2026-10-23 measurement that
+ * is `10m + 1m35s = 11m35s` (was `71m + 7m41s = 78m41s` on 2026-08-19, before
+ * BLO-28863 defect 1 was fixed).
  *
- * This is re-tunable and expected to shrink: it is a function of how late the
- * fleet dispatches, not a policy preference. Once BLO-28863 defect 1 meets its
- * acceptance criterion of p95 <= 5 min, the same formula yields ~12m40s. Do not
- * edit the total directly — re-measure the two inputs above.
+ * This is re-tunable: it is a function of how late the fleet dispatches, not a
+ * policy preference. Do not edit the total directly — re-measure the two inputs
+ * above.
  *
- * Be clear-eyed about the consequence at today's value: a 6h routine that fails
- * inside the last ~79 min of a window will *always* abandon. That is the
- * intended contract — the routine's next scheduled fire owns that work — but it
- * does mean the `clamp` branch is mostly an abandon-machine until defect 1
- * lands, and it is strictly better than today's behaviour of scheduling the
- * retry anyway, stranding it, and burning a run slot and an attempt en route.
+ * Consequence at today's value: a 6h routine that fails inside the last ~12 min
+ * of a window will *always* abandon. That is the intended contract — the
+ * routine's next scheduled fire owns that work — and it is strictly better than
+ * scheduling the retry anyway, stranding it, and burning a run slot and an
+ * attempt en route.
  */
 export const MIN_USEFUL_RETRY_MARGIN_MS =
   DISPATCH_LATENESS_P95_MS + MEDIAN_HEARTBEAT_RUN_DURATION_MS;
