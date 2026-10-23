@@ -8015,22 +8015,23 @@ export function setProjectCheckoutOriginReconcileMetricsRefreshSuccess(success: 
  * timestamp (BLO-29850). Reset-then-set like
  * {@link setExternalRuntimeReservationStrandedOldestAgeMetrics}, plus one thing
  * that setter cannot do: the pending gauge is SEEDED with 0 for every known
- * `APPROVAL_TYPES` value before the query rows are applied. The query only
+ * `APPROVAL_TYPES` value under every `(company_id, requester)` channel that has
+ * any approval history, before the query rows are applied. The query only
  * returns types that have pending rows, so without the seed a drained type (and
- * the whole family, on an empty queue) is absent rather than 0 -- and an absent
- * series is exactly what "never exported" looks like. The type set is bounded, so
- * seeding it costs nothing in cardinality; a row outside the enum still gets its
- * own series.
+ * a drained channel) is absent rather than 0 -- and an absent series is exactly
+ * what "never exported" looks like. Cardinality is channels x types, which is
+ * small; a row outside the enum still gets its own series.
  *
  * The oldest-pending-age gauge is deliberately NOT seeded: a type with nothing
  * pending has no oldest card, and 0 would read as "a card filed this instant".
  * Its absence is unambiguous because the seeded pending gauge reads 0 alongside.
  *
- * `lastDecisionTimestampSeconds` is left UNTOUCHED when null rather than zeroed.
- * Zeroing it would make `time() - <gauge>` enormous and fire the staleness alert
- * on an installation that has simply never recorded a board decision, which is a
- * cold-start artifact rather than an outage. The gauge's initial value is already
- * 0 and the freshness gate distinguishes the two cases.
+ * The last-decision gauge is reset every refresh and written for EVERY channel
+ * with history, as `0` when that channel has never had a decision. That 0 is the
+ * rule contract (BLO-48410): a never-served agent channel must read as maximally
+ * stale, not drop out of the vector. Do NOT "restore" leaving it absent. The
+ * cold-start false positive is prevented by the rules' gates -- per-channel
+ * `paperclip_approvals_pending > 0` plus `refresh_success == 1` -- not here.
  */
 export function setApprovalQueuePendingMetrics(input: {
   /** Every (company_id, requester) pair with any approval history; seeded with 0s. */
