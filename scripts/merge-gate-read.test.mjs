@@ -203,8 +203,38 @@ describe("merge-gate reader", () => {
   });
 
   it("does not count a refused legacy-arm row as a surviving verdict", () => {
-    const lines = read([["portal-tests" + LEGACY, "failure", "2026-10-23T02:03Z", "501"]]);
+    // The twin is DEAD (superseded), so the refusal is the only survivor.
+    const lines = read(
+      [
+        ["portal-tests", "success", "2026-10-23T02:01Z", "500"],
+        ["portal-tests" + LEGACY, "failure", "2026-10-23T02:03Z", "501"],
+      ],
+      "500",
+    );
     assert.match(lines.join("\n"), /ABSENT/);
+  });
+
+  // Raised by @ally on #2956: without a twin, the refusal is the only sign that
+  // the trusted arm never ran that job (trigger or path filter, or a workflow-file
+  // change), and an unrelated green workflow satisfies n. It must STOP.
+  it("keeps a refused legacy-arm row with no surviving twin as a STOP", () => {
+    const lines = read([
+      ["lint", "success", "t1", "500"],
+      ["security-tests" + LEGACY, "failure", "t1", "501"],
+    ]);
+    assert.deepEqual(lines, ["STOP\tsecurity-tests" + LEGACY + "\tfailure\trun=501"]);
+  });
+
+  it("labels each refusal by its own twin, whatever the row order", () => {
+    const lines = read([
+      ["ci-preflight" + LEGACY, "failure", "t1", "501"],
+      ["secret-scan" + LEGACY, "failure", "t1", "501"],
+      ["ci-preflight", "success", "t1", "500"],
+    ]);
+    assert.deepEqual(lines.sort(), [
+      "REFUSED-LEGACY\tci-preflight" + LEGACY + "\tfailure\trun=501",
+      "STOP\tsecret-scan" + LEGACY + "\tfailure\trun=501",
+    ]);
   });
 
   it("credits the refused legacy run as having spoken, so it is not NO-VERDICT", () => {
