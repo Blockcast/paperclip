@@ -85,7 +85,7 @@ whitespace. The per-line trim is load-bearing rather than incidental — the see
 copy is a heredoc nested inside YAML and carries that indentation — but it does
 mean a pure-indentation change will not be reported as drift.
 
-## The `-c` flags are pinned as an exact set (PEN-4541)
+## The git config overrides are pinned as an exact set (PEN-4541)
 
 `git` passes two `-c` flags — one clearing any inherited
 `credential.https://github.com.helper`, one pointing it at
@@ -104,10 +104,27 @@ occurrences of `/usr/local/libexec/paperclip/bin`, so the older path-count guard
 in the same file (PEN-3748) stays green on it. Those two assertions look alike
 and catch different things; neither replaces the other.
 
-The same test also refuses any `insteadOf` (any casing) and any `GIT_CONFIG_*`
-variable anywhere in a wrapper body — `GIT_CONFIG_COUNT`/`KEY_n`/`VALUE_n` is
-the argv-free equivalent of `-c` and would otherwise walk straight past a
-flag-set check.
+`-c` is not the only spelling, and the equality covers all of them. git also
+accepts `--config-env=<key>=<ENVVAR>` and `--config-env <key>=<ENVVAR>` (>=2.31),
+which take the VALUE from an environment variable so the injected config never
+appears on the exec line at all. Both forms are read and normalised to the
+attached spelling, so they cannot be used to produce two different-looking but
+equal flag sets. There is deliberately no sticky `-c<value>` case: git rejects
+that outright, so accepting it would invent a shape the wrapper cannot have.
+
+The same test also refuses any `insteadOf` (any casing) and any `GIT_CONFIG*`
+variable anywhere in a wrapper body. `GIT_CONFIG_COUNT`/`KEY_n`/`VALUE_n` is the
+argv-free equivalent of `-c`, and `GIT_CONFIG_PARAMETERS` is git's own internal
+carrier for `-c` values; either would otherwise walk straight past a flag-set
+check. That scan is a PREFIX match (`/\bGIT_CONFIG\w*/`) rather than a list of
+the names known today — the list form shipped briefly and missed
+`GIT_CONFIG_PARAMETERS`, which is the most direct carrier of the lot.
+
+Those two spellings are what review caught at head `b70c7aae`: the first cut
+read only `-c` and enumerated the env names, so a **credential-helper swap** —
+not a URL rewrite, so the `insteadOf` scan was no backstop — passed both
+assertions. Each shape now has a positive control that reds the check, and each
+control was mutation-tested by reverting the fix.
 
 A second, independent check asserts the same thing about the image as built,
 rather than as declared here: `scripts/check-agent-image-git-config.mjs` runs in

