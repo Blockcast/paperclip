@@ -112,6 +112,8 @@ export async function refreshApprovalQueueMetrics(db: Db, now = new Date()): Pro
           createdAt: sql<Date | string | null>`max(${activityLog.createdAt})`,
         })
         .from(activityLog)
+        // Cast the approvals side on purpose: `entity_id::uuid` throws on non-UUID ids
+        // before the entity_type filter applies.
         .innerJoin(approvals, eq(activityLog.entityId, sql`${approvals.id}::text`))
         .where(
           and(
