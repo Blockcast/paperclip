@@ -306,7 +306,8 @@ receive the formal reviews branch protection needs:
   no `ssh -T git@github.com`. This prohibition does not depend on the revocation
   and is not relaxed by it: while the registration was live, a push made with it
   was attributed to that human's account, not the agent, and was
-  indistinguishable from one they made themselves. See BLO-21854 and PEN-4301.
+  indistinguishable from one they made themselves. See BLO-21854. The
+  revocation itself is recorded on PEN-4301.
 
 GitHub forbids an identity from submitting a **formal review** (`APPROVE` /
 `REQUEST_CHANGES`) on a PR it authored, so the author and the reviewer must be
