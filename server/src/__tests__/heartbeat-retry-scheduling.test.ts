@@ -925,6 +925,9 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     });
     expect(retryRun?.contextSnapshot as Record<string, unknown>).not.toHaveProperty("modelProfile");
     expect(retryRun?.scheduledRetryAt?.toISOString()).toBe(expectedDueAt.toISOString());
+    // BLO-44372: the retry carries the chain's first createdAt so dispatch
+    // keeps its queue seniority instead of ranking it from the failure time.
+    expect((retryRun?.contextSnapshot as Record<string, unknown>).retryChainCreatedAt).toBe(now.toISOString());
 
     // BLO-17456 follow-up: the scheduled-retry event carries the failing
     // errorCode so a recurring code-specific failure is distinguishable from a

@@ -2003,16 +2003,40 @@ export function selectAgedPrReviewRunForFairDispatch(
 
   const cutoff = now.getTime() - PR_REVIEW_QUEUE_FAIRNESS_MAX_WAIT_MS;
   return queuedRuns
+    .map((run) => ({ run, seniorityMs: readRunDispatchSeniorityAt(run).getTime() }))
     .filter(
-      (run) =>
-        run.createdAt.getTime() <= cutoff &&
+      ({ run, seniorityMs }) =>
+        seniorityMs <= cutoff &&
         isPrReviewRetryContext(parseObject(run.contextSnapshot)),
     )
     .sort(
       (left, right) =>
-        left.createdAt.getTime() - right.createdAt.getTime() ||
-        left.id.localeCompare(right.id),
-    )[0]?.id ?? null;
+        left.seniorityMs - right.seniorityMs ||
+        left.run.id.localeCompare(right.run.id),
+    )[0]?.run.id ?? null;
+}
+
+/**
+ * BLO-44372: when a queued run's wait started, for dispatch seniority.
+ *
+ * A bounded retry is a NEW `heartbeat_runs` row, so its `createdAt` is the
+ * failure time: a run that waited 14h, started, and hit a transient error used
+ * to re-enter at the back of the backlog with its anti-starvation clock reset.
+ * `scheduleBoundedRetryForRun` stamps the chain's first `createdAt` into the
+ * snapshot as `retryChainCreatedAt`; dispatch ranks and ties on that instead.
+ * `scheduledRetryAt` still decides WHEN a retry is eligible; this only keeps
+ * its seniority once it is. Never later than `createdAt`, so a malformed or
+ * future stamp cannot demote a run.
+ */
+export function readRunDispatchSeniorityAt(run: {
+  createdAt: Date;
+  contextSnapshot: unknown;
+}): Date {
+  const stamp = readNonEmptyString(parseObject(run.contextSnapshot).retryChainCreatedAt);
+  const chainMs = stamp ? Date.parse(stamp) : Number.NaN;
+  return Number.isFinite(chainMs) && chainMs < run.createdAt.getTime()
+    ? new Date(chainMs)
+    : run.createdAt;
 }
 
 type QueuedRunDispatchOrderRun = Pick<
@@ -2038,13 +2062,15 @@ export function compareQueuedRunDispatchOrder(
   right: QueuedRunDispatchOrderRun,
   rankByRunId: ReadonlyMap<string, number>,
   fairnessPromotedRunId: string | null,
+  seniorityMsByRunId?: ReadonlyMap<string, number>,
 ) {
   if (left.id === fairnessPromotedRunId && right.id !== fairnessPromotedRunId) return -1;
   if (right.id === fairnessPromotedRunId && left.id !== fairnessPromotedRunId) return 1;
   const leftRank = rankByRunId.get(left.id) ?? Number.MAX_SAFE_INTEGER;
   const rightRank = rankByRunId.get(right.id) ?? Number.MAX_SAFE_INTEGER;
   return (leftRank - rightRank)
-    || (left.createdAt.getTime() - right.createdAt.getTime())
+    || ((seniorityMsByRunId?.get(left.id) ?? left.createdAt.getTime())
+      - (seniorityMsByRunId?.get(right.id) ?? right.createdAt.getTime()))
     || left.id.localeCompare(right.id);
 }
 
@@ -22911,9 +22937,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       delete carriedRetryContextSnapshot.resumeSessionDisplayId;
       delete carriedRetryContextSnapshot.resumeSessionParams;
     }
+    // BLO-44372: a retry keeps its chain's queue seniority (stamped below). A
+    // max-turn continuation already used its slot in full, so it re-queues
+    // fresh rather than letting one issue loop at the head of the backlog.
+    if (retryReason === MAX_TURN_CONTINUATION_RETRY_REASON) {
+      delete carriedRetryContextSnapshot.retryChainCreatedAt;
+    }
     const retryContextSnapshot: Record<string, unknown> = withRecoveryModelProfileHint({
       ...carriedRetryContextSnapshot,
       retryOfRunId: run.id,
+      ...(retryReason === MAX_TURN_CONTINUATION_RETRY_REASON
+        ? {}
+        : { retryChainCreatedAt: readRunDispatchSeniorityAt(run).toISOString() }),
       ...(providerDeathResume
         ? {
             resumeFromRunId: run.id,
@@ -31942,7 +31977,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               // Mirrors `waitedMs >= STARVATION_ABSOLUTE_ESCALATION_MS` in
               // dispatchRank, against the same `dispatchNow`, so the lane and the
               // rank can never disagree about which rows are absolute.
-              lte(heartbeatRuns.createdAt, absoluteFloorCutoff),
+              // BLO-44372: a retry ages from its chain's first createdAt, as in
+              // dispatchRank. ISO-8601 text from toISOString() orders
+              // lexically, so no cast can throw on a malformed stamp.
+              or(
+                lte(heartbeatRuns.createdAt, absoluteFloorCutoff),
+                sql`${heartbeatRuns.contextSnapshot}->>'retryChainCreatedAt' COLLATE "C" <= ${absoluteFloorCutoff.toISOString()}`,
+              ),
               absoluteLaneCursor
                 ? sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (${absoluteLaneCursor.createdAt}::timestamptz, ${absoluteLaneCursor.id}::uuid)`
                 : undefined,
@@ -32294,6 +32335,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // `contextSnapshot` on every comparison, so an N-row sort cost
       // O(N log N) JSON parses. It is now O(N).
       const dispatchRankByRunId = new Map<string, number>();
+      const dispatchSeniorityMsByRunId = new Map<string, number>();
       for (const queuedRun of queuedRuns) {
         const snapshot = parseObject(queuedRun.contextSnapshot);
         const issueId = readNonEmptyString(snapshot.issueId);
@@ -32317,13 +32359,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // path inheriting the fast track by incidentally reusing the bare field.
         const isRecoveryWake = Boolean(readNonEmptyString(snapshot.recoveryActionId))
           && snapshot.source === "issue_recovery_action";
+        const seniorityMs = readRunDispatchSeniorityAt(queuedRun).getTime();
+        dispatchSeniorityMsByRunId.set(queuedRun.id, seniorityMs);
         dispatchRankByRunId.set(
           queuedRun.id,
           dispatchRank(
             issue,
             ready,
             Boolean(issueId),
-            dispatchNow.getTime() - queuedRun.createdAt.getTime(),
+            dispatchNow.getTime() - seniorityMs,
             isRecoveryWake,
           ),
         );
@@ -32334,6 +32378,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           right,
           dispatchRankByRunId,
           fairnessPromotedPrReviewRunId,
+          dispatchSeniorityMsByRunId,
         ));
 
       // Per-issue dedupe: if a queued run targets an issue that already has a
