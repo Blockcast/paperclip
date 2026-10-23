@@ -1793,6 +1793,13 @@
       "when": 1792003101477,
       "tag": "0264_cost_events_add_consumption_cents",
       "breakpoints": true
+    },
+    {
+      "idx": 265,
+      "version": "7",
+      "when": 1792003201477,
+      "tag": "0265_repair_merge_queue_demoted_pull_request_work_products",
+      "breakpoints": true
     }
   ]
 }
