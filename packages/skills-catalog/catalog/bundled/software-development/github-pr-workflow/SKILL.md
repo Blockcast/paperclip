@@ -363,9 +363,11 @@ The App token is already mounted and works over HTTPS.
 Repoint the remote so the credential helper fires:
 
 ```bash
-git -C "$REPO" remote -v    # a git@github.com: or ssh://git@github.com/ origin is the defect
-git -C "$REPO" remote set-url origin https://github.com/OWNER/REPO.git
-git -C "$REPO" remote -v    # confirm it now reads https://
+CHECKOUT=/path/to/working/tree   # a filesystem path, NOT the <org>/<repo> slug $REPO holds below
+
+git -C "$CHECKOUT" remote -v    # a git@github.com: or ssh://git@github.com/ origin is the defect
+git -C "$CHECKOUT" remote set-url origin https://github.com/OWNER/REPO.git
+git -C "$CHECKOUT" remote -v    # confirm it now reads https://
 ```
 
 Fix the checkout you are in and move on. Legacy `git@` origins were widespread on
