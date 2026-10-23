@@ -21,11 +21,14 @@ import {
 const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
 
 /**
- * The derived margin at the 2026-08-19 measurement: 71m dispatch-lateness p95
- * plus one 7m41s median run. Spelled out here so a re-tune of either input
+ * The derived margin at the 2026-10-23 measurement: 10m dispatch-lateness p95
+ * plus one 1m35s median run (was 78m41s on 2026-08-19). Spelled out here so a re-tune of either input
  * shows up as a failing expectation rather than as silently shifted boundaries.
  */
-const MARGIN_MS = 78 * 60 * 1000 + 41 * 1000;
+const MARGIN_MS = 11 * 60 * 1000 + 35 * 1000;
+
+/** The 2026-08-19 margin (71m + 7m41s), kept to pin the BLO-28785 regression. */
+const AUGUST_MARGIN_MS = 78 * 60 * 1000 + 41 * 1000;
 
 describe("routine-period awareness of the transient horizon (BLO-28863)", () => {
   it("derives the minimum useful margin from the measurement rather than picking it", () => {
@@ -65,8 +68,8 @@ describe("routine-period awareness of the transient horizon (BLO-28863)", () => 
     const result = resolveRoutineScopedRetry({ dueAt, failedAt, routinePeriodMs: SIX_HOURS_MS });
 
     expect(result.decision).toBe("clamp");
-    // Period deadline 10:24:00Z, less the 78m41s lead.
-    expect(result.dueAt?.toISOString()).toBe("2026-08-19T09:05:19.000Z");
+    // Period deadline 10:24:00Z, less the 11m35s lead.
+    expect(result.dueAt?.toISOString()).toBe("2026-08-19T10:12:25.000Z");
     expect(result.decision === "clamp" && result.clampedFromIso).toBe(dueAt.toISOString());
     // The invariant the acceptance criteria names: never later than one period.
     expect(result.dueAt!.getTime() - failedAt.getTime()).toBeLessThanOrEqual(SIX_HOURS_MS);
@@ -102,6 +105,9 @@ describe("routine-period awareness of the transient horizon (BLO-28863)", () => 
       failedAt,
       routinePeriodMs: SIX_HOURS_MS,
       windowClosesAt,
+      // Pinned to the 2026-08-19 margin (71m lateness + 7m41s run), the fleet
+      // this loss happened on. The current margin honours it; see below.
+      minUsefulMarginMs: AUGUST_MARGIN_MS,
     });
 
     expect(result.decision).toBe("clamp");
@@ -111,7 +117,27 @@ describe("routine-period awareness of the transient horizon (BLO-28863)", () => 
     // The window deadline binds, not the period: the period alone would have
     // allowed 06:19:17Z, past the close.
     expect(result.dueAt!.getTime()).toBeLessThan(windowClosesAt.getTime());
-    expect(windowClosesAt.getTime() - result.dueAt!.getTime()).toBe(MARGIN_MS);
+    expect(windowClosesAt.getTime() - result.dueAt!.getTime()).toBe(AUGUST_MARGIN_MS);
+  });
+
+  it("honours the BLO-28785 schedule once dispatch lateness is fixed", () => {
+    // Same inputs as above, at the 2026-10-23 margin. 04:50Z leaves 70 minutes
+    // before the close, which now survives the fleet's 10m lateness p95 plus a
+    // median run, so the advertised reset is honoured rather than pulled forward.
+    // If this flips back to clamp, the margin has been re-grown past ~70m.
+    const failedAt = new Date("2026-08-19T00:19:17.166Z");
+    const windowClosesAt = new Date("2026-08-19T06:00:00.000Z");
+    const advertised = new Date("2026-08-19T04:50:00.028Z");
+
+    const result = resolveRoutineScopedRetry({
+      dueAt: advertised,
+      failedAt,
+      routinePeriodMs: SIX_HOURS_MS,
+      windowClosesAt,
+    });
+
+    expect(result.decision).toBe("honour");
+    expect(result.dueAt?.getTime()).toBe(advertised.getTime());
   });
 
   it("leaves a trace when the requested due time is exactly the window close", () => {
@@ -131,17 +157,17 @@ describe("routine-period awareness of the transient horizon (BLO-28863)", () => 
 
     expect(result.decision).toBe("clamp");
     expect(result.decision === "clamp" && result.clampedFromIso).toBe(windowClosesAt.toISOString());
-    expect(result.dueAt?.toISOString()).toBe("2026-08-19T04:41:19.000Z");
+    expect(result.dueAt?.toISOString()).toBe("2026-08-19T05:48:25.000Z");
   });
 
   it("abandons a failure late inside a still-open window", () => {
     // The shape that actually loses windows, and the one the first cut of this
     // function could never reach: the window is *open* at the failure instant,
     // but too little of it remains for a retry to start and finish. Under the
-    // pre-ruling code `marginMs = deadline - failedAt` was 60 minutes here, so
+    // pre-ruling code `marginMs = deadline - failedAt` was 10 minutes here, so
     // this clamped to the 06:00Z close and burned a slot and an attempt on a
     // wake with 0ms of usable window.
-    const failedAt = new Date("2026-08-19T05:00:00.000Z");
+    const failedAt = new Date("2026-08-19T05:50:00.000Z");
     const windowClosesAt = new Date("2026-08-19T06:00:00.000Z");
 
     const result = resolveRoutineScopedRetry({
@@ -165,14 +191,15 @@ describe("routine-period awareness of the transient horizon (BLO-28863)", () => 
   });
 
   it("abandons every failure inside the final margin of a window", () => {
-    // Ally's 360-case reproduction, inverted. Over this 60-minute sweep the
-    // pre-ruling function clamped 59 cases to exactly the window close and
+    // Ally's 360-case reproduction, inverted, swept over the final MARGIN_MS of
+    // the window. Over a 60-minute sweep the pre-ruling function clamped 59
+    // cases to exactly the window close and
     // abandoned only the m=0 boundary, where `failedAt` coincides with the
     // close and the degenerate already-closed guard happens to fire. Every one
     // of those 59 was a wake with 0ms of usable window.
     const windowClosesAt = new Date("2026-08-19T06:00:00.000Z");
     const decisions = new Set<string>();
-    for (let minutesBeforeClose = 0; minutesBeforeClose < 60; minutesBeforeClose += 1) {
+    for (let minutesBeforeClose = 0; minutesBeforeClose * 60 * 1000 < MARGIN_MS; minutesBeforeClose += 1) {
       const failedAt = new Date(windowClosesAt.getTime() - minutesBeforeClose * 60 * 1000);
       decisions.add(
         resolveRoutineScopedRetry({
@@ -277,8 +304,8 @@ describe("routine-period awareness of the transient horizon (BLO-28863)", () => 
   });
 
   it("lets the caller pin the margin independently of the measured constant", () => {
-    // The constant is expected to shrink to ~12m40s once BLO-28863 defect 1
-    // meets its p95 <= 5m criterion. Callers and tests that care about a
+    // The constant is re-measured as dispatch lateness moves (78m41s on
+    // 2026-08-19, 11m35s on 2026-10-23). Callers and tests that care about a
     // boundary should not have to be rewritten when it does.
     const failedAt = new Date("2026-08-19T00:00:00.000Z");
     const result = resolveRoutineScopedRetry({

@@ -1082,7 +1082,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
 
     expect(scheduled.outcome).toBe("scheduled");
     if (scheduled.outcome !== "scheduled") return;
-    expect(scheduled.dueAt.toISOString()).toBe("2026-08-19T04:41:19.000Z");
+    expect(scheduled.dueAt.toISOString()).toBe("2026-08-19T05:48:25.000Z");
     expect(scheduled.dueAt.getTime() - failedAt.getTime()).toBeLessThanOrEqual(6 * 60 * 60 * 1000);
 
     const retryRun = await db
@@ -1090,7 +1090,7 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, scheduled.run.id))
       .then((rows) => rows[0] ?? null);
-    expect(retryRun?.scheduledRetryAt?.toISOString()).toBe("2026-08-19T04:41:19.000Z");
+    expect(retryRun?.scheduledRetryAt?.toISOString()).toBe("2026-08-19T05:48:25.000Z");
     expect(retryRun?.contextSnapshot).toMatchObject({
       routineRetryDecision: "clamp",
       routineRetryPreClampAt: "2026-08-20T00:19:17.166Z",
