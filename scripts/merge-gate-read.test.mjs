@@ -187,6 +187,57 @@ describe("merge-gate reader", () => {
     assert.match(lines.join("\n"), /ABSENT/);
   });
 
+  // PEN-4416: penstock-llm-proxy-core publishes `<job> (legacy arm - refused,
+  // nothing ran)` as `failure` on its legacy `pull_request` arm by design,
+  // under a NON-required name. Every penstock PR head carries ~45 of these, so
+  // a STOP here is a permanent false RED. Labelled, not dropped, and not a
+  // surviving verdict: the trusted arm must still speak for the head.
+  const LEGACY = " (legacy arm - refused, nothing ran)";
+  it("labels a refused legacy-arm check-run as REFUSED-LEGACY, not STOP", () => {
+    const lines = read([
+      ["ci-preflight", "success", "2026-10-23T02:05Z", "500"],
+      ["ci-preflight" + LEGACY, "failure", "2026-10-23T02:03Z", "501"],
+    ]);
+    assert.deepEqual(lines, ["REFUSED-LEGACY\tci-preflight" + LEGACY + "\tfailure\trun=501"]);
+    assert.equal(stops(lines).length, 0);
+  });
+
+  it("does not count a refused legacy-arm row as a surviving verdict", () => {
+    const lines = read([["portal-tests" + LEGACY, "failure", "2026-10-23T02:03Z", "501"]]);
+    assert.match(lines.join("\n"), /ABSENT/);
+  });
+
+  it("credits the refused legacy run as having spoken, so it is not NO-VERDICT", () => {
+    const lines = read(
+      [
+        ["ci-preflight", "success", "t1", "500"],
+        ["ci-preflight" + LEGACY, "failure", "t1", "501"],
+      ],
+      "__none__",
+      pend(["501", "failure", "CI"]),
+    );
+    assert.equal(stops(lines).length, 0);
+  });
+
+  for (const state of ["in_progress", "queued", "cancelled", "timed_out"]) {
+    it(`keeps a legacy-arm row that is ${state} as a STOP`, () => {
+      const lines = read([
+        ["ci-preflight", "success", "t1", "500"],
+        ["ci-preflight" + LEGACY, state, "t1", "501"],
+      ]);
+      assert.deepEqual(lines, ["STOP\tci-preflight" + LEGACY + "\t" + state + "\trun=501"]);
+    });
+  }
+
+  it("keeps the suffix exact: anything after it is still a STOP", () => {
+    const name = "ci-preflight" + LEGACY + " (retry)";
+    const lines = read([
+      ["ci-preflight", "success", "t1", "500"],
+      [name, "failure", "t1", "501"],
+    ]);
+    assert.deepEqual(lines, ["STOP\t" + name + "\tfailure\trun=501"]);
+  });
+
   // The guard must not manufacture a false RED. Both of these are genuinely fine.
   it("stays silent on an all-green head", () => {
     assert.deepEqual(
