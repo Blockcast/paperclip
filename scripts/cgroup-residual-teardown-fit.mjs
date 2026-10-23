@@ -62,6 +62,9 @@
 // Exit status is 0 whenever the fit ran; a non-discriminating window is a
 // RESULT, not an error. It exits non-zero only when it could not measure.
 
+import { realpathSync } from "node:fs";
+import { pathToFileURL } from "node:url";
+
 const DEFAULT_POD = "paperclip-0";
 const DEFAULT_CONTAINER = "paperclip";
 const DEFAULT_STEP_SECONDS = 3600;
@@ -161,8 +164,10 @@ export function fitOls(points) {
  * (trap 2).
  *
  * A change in VALUE is a restart. The bucket in which the value changes is
- * dropped from both the segment it ends and the one it begins: it straddles the
- * reset, so it holds pre-restart residual against post-restart counters.
+ * dropped from the segment it BEGINS, not from the one it ends (`t > fromT`,
+ * `t <= toT`): that bucket straddles the reset, so its `increase()` counts
+ * post-restart work against pre-restart residual. The old segment's last
+ * bucket is wholly pre-restart and is kept.
  */
 export function segmentsFromRestarts(samples) {
   const ordered = [...samples]
@@ -182,6 +187,15 @@ export function segmentsFromRestarts(samples) {
   if (current !== null) segments.push(current);
   // A single-sample segment has no interior and cannot be fitted.
   return segments.filter((s) => s.toT > s.fromT);
+}
+
+/** Median of an ASCENDING-sorted numeric array. Even length averages the pair. */
+export function median(sorted) {
+  if (sorted.length === 0) return null;
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1
+    ? sorted[mid]
+    : (sorted[mid - 1] + sorted[mid]) / 2;
 }
 
 /** Running total, in order. Used to accumulate teardown work WITHIN a segment. */
@@ -221,6 +235,10 @@ export function buildSegmentFits({ residual, teardown, restarts }) {
       .filter((t) => t > segment.fromT && t <= segment.toT)
       .sort((a, b) => a - b);
 
+    // `?? 0` cannot tell "no teardown work in this bucket" from "no teardown
+    // sample for this bucket". Count the latter so an absent independent
+    // variable is visible in the table instead of reading as zero work.
+    const covered = timestamps.filter((t) => teardownAt.has(t)).length;
     const work = cumulativeSum(timestamps.map((t) => teardownAt.get(t) ?? 0));
     const points = timestamps.map((t, i) => ({
       x: work[i],
@@ -235,6 +253,8 @@ export function buildSegmentFits({ residual, teardown, restarts }) {
       toT: segment.toT,
       uptimeHours: (segment.toT - segment.fromT) / 3600,
       teardownSeconds: work.length > 0 ? work[work.length - 1] : 0,
+      teardownCovered: covered,
+      teardownBuckets: timestamps.length,
       residualStartGib: ys.length > 0 ? ys[0] : null,
       residualEndGib: ys.length > 0 ? ys[ys.length - 1] : null,
       ...fit,
@@ -267,16 +287,22 @@ export function summarizeDiscrimination(fits, { minR2 = 0.5 } = {}) {
       negative,
     };
   }
-  const best = Math.max(...fitted.map((f) => f.r2));
+  // The gate is max(r2): ONE well-explained segment can carry the verdict even
+  // when its same-sign siblings are r2~0. That is deliberate -- a single clean
+  // segment is evidence -- but it must not read as "every segment agrees", so
+  // the spread is reported alongside the figure that actually gates.
+  const r2s = fitted.map((f) => f.r2).sort((a, b) => a - b);
+  const best = r2s[r2s.length - 1];
+  const spread = { maxR2: best, minR2: r2s[0], medianR2: median(r2s) };
   if (best < minR2) {
     return {
       discriminating: false,
       reason: "low-explanatory-power",
       fitted: fitted.length,
-      maxR2: best,
+      ...spread,
     };
   }
-  return { discriminating: true, fitted: fitted.length, maxR2: best };
+  return { discriminating: true, fitted: fitted.length, ...spread };
 }
 
 const iso = (t) => new Date(t * 1000).toISOString().replace(".000", "");
@@ -288,6 +314,7 @@ export function formatFitTable(fits) {
     "n",
     "uptime h",
     "teardown s",
+    "cov",
     "residual GiB start->end",
     "slope GiB/1000s",
     "r2",
@@ -298,12 +325,48 @@ export function formatFitTable(fits) {
       String(f.n),
       num(f.uptimeHours, 1),
       num(f.teardownSeconds, 0),
+      `${f.teardownCovered}/${f.teardownBuckets}`,
       `${num(f.residualStartGib, 4)}->${num(f.residualEndGib, 4)}`,
       f.slope === null ? "-" : (f.slope * 1000).toFixed(6),
       num(f.r2, 3),
     ].join(" | "),
   );
   return [header, ...rows].join("\n");
+}
+
+/**
+ * Refuse to report a verdict when an input series is absent.
+ *
+ * ⛔ The distinction this enforces is the whole point of the script: a window
+ * that CANNOT be measured must not be reported as a window that measured
+ * nothing. Both inputs fail silently in the same direction if unguarded:
+ *
+ * - `residual`/`restarts` empty -> no segments at all.
+ * - `teardown` empty -> `teardownAt.get(t) ?? 0` makes every bucket zero work,
+ *   so every segment is degenerate (`sxx === 0`), `summarizeDiscrimination`
+ *   returns `no-fittable-segment`, and the script exits 0 announcing "NOT
+ *   discriminating". The absent independent variable reads as "the quiet
+ *   regime does not discriminate", which is a confident wrong answer.
+ *
+ * `teardown` is introduced by #2175, so a window predating it, a renamed
+ * metric, or an unscraped `_sum` all land here.
+ */
+export function assertMeasurable({ residual, teardown, restarts, start, end }) {
+  const window = `${iso(start)}..${iso(end)}`;
+  if (residual.length === 0 || restarts.length === 0) {
+    // Retention is ~7 days. An empty window is almost always the window having
+    // aged out, which is NOT the same as the excursion being absent.
+    throw new Error(
+      `no samples in ${window} -- past retention, or wrong pod/container`,
+    );
+  }
+  if (teardown.length === 0) {
+    throw new Error(
+      `no teardown samples in ${window} -- the independent variable is absent ` +
+        "(window predates #2175, metric renamed, or `_sum` not scraped). " +
+        "This is a measurement failure, not a non-result.",
+    );
+  }
 }
 
 /** Split a window so no single range query exceeds the server's timeout. */
@@ -389,13 +452,7 @@ async function main() {
     queryRange(baseUrl, restartQuery(pod, container), start, end, step, fetch),
   ]);
 
-  if (residual.length === 0 || restarts.length === 0) {
-    // Retention is ~7 days. An empty window is almost always the window having
-    // aged out, which is NOT the same as the excursion being absent.
-    throw new Error(
-      `no samples in ${iso(start)}..${iso(end)} -- past retention, or wrong pod/container`,
-    );
-  }
+  assertMeasurable({ residual, teardown, restarts, start, end });
 
   const fits = buildSegmentFits({ residual, teardown, restarts });
   const verdict = summarizeDiscrimination(fits);
@@ -419,8 +476,12 @@ async function main() {
   }
 }
 
+// `file://${process.argv[1]}` misses when the path holds URL-encoded characters
+// (spaces, `%`) or is reached through a symlink -- and the failure is silent:
+// the script would do nothing and exit 0.
 const invokedDirectly =
-  process.argv[1] !== undefined && import.meta.url === `file://${process.argv[1]}`;
+  process.argv[1] !== undefined &&
+  import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href;
 if (invokedDirectly) {
   main().catch((error) => {
     console.error(error instanceof Error ? error.message : String(error));
