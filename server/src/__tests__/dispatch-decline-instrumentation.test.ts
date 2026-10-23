@@ -304,6 +304,14 @@ describe("recordAgentDispatchDeclined", () => {
     // compares it against a single seat's slice and reads a 20x artifact as a
     // 20x anomaly — which is exactly what PEN-4532 was filed on.
     expect(text).toMatch(/FLEET-WIDE TOTAL/);
+
+    // The by-design reading is bounded to the four collapsing reasons. On the
+    // attributed reasons an `unknown` means what it means on
+    // HEARTBEAT_RUN_FAILED_METRIC — a genuine roster miss — so a help text that
+    // claims the contrast metric-wide sends an operator looking for a design
+    // decision behind a real attribution gap (Ally review, PR #2941).
+    expect(text).toMatch(/ON THE FOUR REASONS NAMED BELOW/);
+    expect(text).toMatch(/PER-REASON, not per-metric/);
   });
 
   it("collapses a reason outside the allow-list rather than minting a new series", () => {
