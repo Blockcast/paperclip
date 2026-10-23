@@ -311,21 +311,30 @@ Reproduce it — page to exhaustion first, then measure the union:
 # 1. page until a page comes back short; do NOT stop at the first 1000.
 #    A fixed offset list silently returns a capped prefix the moment the
 #    population outgrows it -- the exact trap described above. Loop on the
-#    page length instead, and keep `-f` so a 4xx/429 fails the run rather
-#    than writing an error body that `jq -s add` merges into the union.
+#    page length instead. `-f` makes a 4xx/429 stop the paging rather than
+#    write an error body for `jq` to merge; the `incomplete` flag then
+#    suppresses the union, because a short read and a failed read are
+#    indistinguishable once the pages are on disk.
 rm -f /tmp/done-*.json /tmp/all-done.json
-off=0
+off=0 incomplete=
 while :; do
   curl -fsS -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
     "$PAPERCLIP_API_URL/api/companies/$COMPANY/issues?status=done&limit=1000&offset=$off" \
-    -o "/tmp/done-$off.json" || { echo "page at offset $off failed" >&2; break; }
+    -o "/tmp/done-$off.json" || { incomplete="request failed at offset $off"; break; }
   # the row cap may answer with a bare array or a {truncated, issues} envelope
-  n=$(jq 'if type=="array" then length else (.issues | length) end' "/tmp/done-$off.json" || echo 0)
+  n=$(jq 'if type=="array" then length else (.issues | length) end' "/tmp/done-$off.json") \
+    || { incomplete="unparseable page at offset $off"; break; }
   [ "${n:-0}" -lt 1000 ] && break
   off=$((off + 1000))
 done
-jq -s 'map(if type=="array" then . else .issues end) | add | unique_by(.id)' \
-  /tmp/done-*.json > /tmp/all-done.json
+# refuse to build the union from a known-partial read -- an incomplete census
+# that measures cleanly is worse than one that does not measure at all.
+if [ -n "$incomplete" ]; then
+  echo "INCOMPLETE CENSUS: $incomplete -- not unioning; fix and re-run" >&2
+else
+  jq -s 'map(if type=="array" then . else .issues end) | add | unique_by(.id)' \
+    /tmp/done-*.json > /tmp/all-done.json
+fi
 
 # 2. verdict age at completion, and the phantom-signature decomposition
 jq -r 'def ts: sub("\\.[0-9]+Z$"; "Z") | fromdate;
