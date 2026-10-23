@@ -360,15 +360,80 @@ includes `pr-link`). Decomposed:
 | screen | removes | note |
 |---|---|---|
 | `projectId == null` | **32 of 38 (84%)** | no repo is wired, so `pr-link` is **structurally unsatisfiable** and correctly absent |
+| harness-generated `originKind` | **1 of 38** | same structural reason, but these *do* carry a `projectId`, so the `projectId` screen cannot see them; this is the only one that survives both other screens — see below |
 | verdict >=3d older than `completedAt` | 8 of 38 (21%) | 6 of these also have `projectId == null` |
-| **residual — fresh verdict AND a real project** | **4** | PEN-663, PEN-1195, PEN-1216, PEN-1162 |
+| **residual — fresh verdict, real project, author-generated** | **3** | PEN-663, PEN-1195, PEN-1162 |
 
-So the raw signal's precision as a phantom-done detector is **4/38 ≈ 10.5%**,
+So the raw signal's precision as a phantom-done detector is **4/38 ≈ 10.5%**
+before the `originKind` screen and **3/38 ≈ 7.9%** after,
 and the biggest single noise source is **`projectId == null`, not staleness**.
 Screen on `projectId` first: it is deterministic, costs nothing, and removes
 five sixths of the candidates on its own. PEN-1274 (110d stale) and PEN-529 (45d
 stale) are *both* also `projectId: null`, so either screen alone would have
 cleared them without the investigation they actually cost.
+
+#### Screen 2 — a harness-generated row can never satisfy `pr-link`
+
+`PEN-1216` reaches the residual set carrying `projectId: 1eb0ea12…`, so the
+`projectId` screen passes it through. But its `originKind` is
+`stale_active_run_evaluation`: it is a **row the harness filed about a run**, not
+a unit of work with code scope. Its done-when is a judgement, and there is no
+commit that could ever satisfy `pr-link`. Flagging it is not a low-precision
+hit — it is **always wrong**, for the same structural reason as `projectId: null`.
+
+Treat these `originKind` values as having no code scope:
+
+```
+issue_productivity_review      harness_liveness_escalation
+stale_active_run_evaluation    routine_execution
+```
+
+The class is not rare, and the overlap with `projectId` is only partial — which
+is exactly why it needs its own screen. Measured over one agent's 807 `done`
+rows (CTO, 2026-10-23): **258 (32%)** are harness-generated, and **129 of those
+carry a `projectId`** and are therefore invisible to screen 1.
+
+The full residual query — all three screens, verified against the 3,135-row
+population on 2026-10-23, returns exactly the three rows named in the table:
+
+```bash
+jq -r 'def ts: sub("\\.[0-9]+Z$"; "Z") | fromdate;
+ [.[] | select(.lastEvidenceVerdict.verdict=="warn"
+          and ((.lastEvidenceVerdict.missing//[]) | index("pr-link"))
+          and .projectId != null
+          and ((.originKind // "") as $ok
+               | [ "issue_productivity_review","harness_liveness_escalation",
+                   "stale_active_run_evaluation","routine_execution" ]
+               | index($ok) | not)
+          and ((.lastEvidenceVerdictEvaluatedAt == null) or (.completedAt == null)
+               or ((((.completedAt|ts)-(.lastEvidenceVerdictEvaluatedAt|ts))/86400) < 3)))
+        | {id:.identifier, completed:.completedAt[0:10], origin:.originKind}]' \
+  /tmp/all-done.json
+```
+
+⚠️ **Bind `originKind` to a variable — do not write `index(.originKind)` inline.**
+Inside `[ ... ] | index(.originKind)` the `.` has rebound to the *array literal*,
+not the issue, so jq fails with `Cannot index array with string "originKind"`.
+The `. as $ok` form above is the one that works; this bit the first draft of this
+very section.
+
+⚠️ **Do not oversell this screen — a tempting hypothesis here is false.** It is
+natural to guess that the residual is *largely* harness rows, which would mean
+the detector's real precision is near zero. **It is not: only 1 of the 4.** The
+other three are `originKind: manual` and are genuine residuals. This was tested
+over the full 3,135-row population on 2026-10-23 and the guess was refuted; the
+screen is worth running for **correctness** (it removes a class that can never be
+a true positive, deterministically and for free), not for yield. Recorded so the
+next reader does not re-run the same refutation.
+
+#### What the residual actually contains right now
+
+All three surviving residuals completed in **June 2026** — `PEN-663`
+(2026-06-19), `PEN-1195` and `PEN-1162` (2026-06-27), with the screened-out
+`PEN-1216` on 2026-06-28. **There is no recent phantom-done candidate anywhere in
+the company.** Before spending a sweep on this detector, check whether its
+residual still consists entirely of rows months old: if it does, the signature is
+currently yielding nothing actionable and the sweep is better spent elsewhere.
 
 #### The reader rule
 
@@ -382,9 +447,11 @@ cleared them without the investigation they actually cost.
   80 seconds before the clean review it was waiting on landed at 03:08, and
   nothing refreshed it.
 - On a **`done`** row, treat it as **undefined until proven otherwise**: screen
-  `projectId == null`, then compare `lastEvidenceVerdictEvaluatedAt` against
-  `completedAt`. If the verdict predates the work, it describes an earlier state
-  and carries no information about the closure.
+  `projectId == null`, then screen harness-generated `originKind` values (both
+  mean `pr-link` is structurally unsatisfiable), then compare
+  `lastEvidenceVerdictEvaluatedAt` against `completedAt`. If the verdict
+  predates the work, it describes an earlier state and carries no information
+  about the closure.
 - The artifact — a PR with a merged commit SHA — is the only authority on
   whether a row is correctly `done`. The verdict is a triage hint that narrows
   where to look; it never substitutes for the artifact.
