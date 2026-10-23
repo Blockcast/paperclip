@@ -393,9 +393,10 @@ cleared them without the investigation they actually cost.
 
 The reader rule ends at "the artifact is the only authority" without saying how
 to *reach* it. A heartbeat sweep cannot afford a GitHub round trip per candidate,
-and it does not need one: `GET /issues/:id/work-products`
-(`server/src/routes/issues.ts:10291`) returns the platform's own PR rows for an
-issue, already keyed to it by `owningIdentifiers`.
+and it does not need one: `GET /issues/:id/work-products` (registered as
+`router.get("/issues/:id/work-products"` in `server/src/routes/issues.ts`)
+returns the platform's own PR rows for an issue, already keyed to it by
+`owningIdentifiers`.
 
 **Measured 2026-10-23 (CTO), the 35 rows that closed `done` in the preceding
 12h.** The verdict screen from the section above flagged **3**; all three were
@@ -412,17 +413,24 @@ Precision of the verdict screen on that cohort: **0/3**. This is the
 failure-direction note predicts — so on a `done` row, go to the work products
 first and treat the verdict as a hint about *where* to look, not *whether* to.
 
-> **⚠️ Do NOT screen on `status == "merged"` or on `metadata.merged`.** Both are
-> currently wrong for every merge that arrives through a mandatory merge queue.
+> **⚠️ Do NOT screen on `status == "merged"` or on `metadata.merged`.** Either
+> can be wrong for any merge that arrives through a mandatory merge queue.
 > GitHub delivers such a merge as `dequeued`, not `closed`, and the pre-PEN-4550
 > webhook populated `prMerged` only on `action === "closed"` — so the event
 > *carrying* the merge wrote `ready_for_review` / `merged: false` while
 > `metadata.mergedAt` was populated from the same payload. A row contradicting
 > itself on its face.
 >
+> Every queue merge is *exposed* to this — the queue is mandatory, so every merge
+> fires a `dequeued` — but whether a given row was actually demoted turns on a
+> second-granular tie, which 3 of 6 directly-inspected rows lost: "a coin flip on
+> a second-granular clock, not a rare race" (`pullRequestHasMerged`'s own doc
+> block). Screen as though any queue merge could be wrong, because the row does
+> not record which side of that coin it landed on.
+>
 > **Screen on `metadata.mergedAt` being populated.** That is not a workaround;
-> it is the server's own canonical predicate, `pullRequestHasMerged`
-> (`server/src/services/pull-request-work-products.ts:183`) — `prMerged === true
+> it is the server's own canonical predicate, `pullRequestHasMerged` in
+> `server/src/services/pull-request-work-products.ts` — `prMerged === true
 > || prMergedAt` non-empty — chosen because GitHub sets `merged_at` on a real
 > merge, never clears it, and a merged PR cannot be reopened. A genuine queue
 > **ejection** carries `merged_at: null` and is correctly excluded.
@@ -438,7 +446,6 @@ first and treat the verdict as a hint about *where* to look, not *whether* to.
 becomes trustworthy again and already-demoted rows are repaired in that same
 startup. Until then it is not — and `mergedAt` is the correct screen on both
 sides of that deploy, which is why it is the one to write down.
-
 
 #### Two changes considered and rejected
 
