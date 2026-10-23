@@ -9,6 +9,7 @@ import {
   OPEN_PULL_REQUEST_WORK_PRODUCT_STATUSES,
   PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID,
   pullRequestExternalId,
+  pullRequestHasMerged,
   pullRequestMergeQueueState,
   pullRequestWorkProductSourceEventActionOrder,
   pullRequestWorkProductStatus,
@@ -31,6 +32,11 @@ describe("open/terminal pull request status partition", () => {
     { action: "closed", prDraft: false, prMerged: false },
     { action: "closed", prDraft: false, prMerged: true },
     { action: "closed", prDraft: true, prMerged: true },
+    { action: "enqueued", prDraft: false, prMerged: false },
+    // The merge-queue merge and the merge-queue ejection: same action, told
+    // apart only by `merged_at` (PEN-4550). Both must land inside the partition.
+    { action: "dequeued", prDraft: false, prMergedAt: "2026-10-23T03:57:49Z" },
+    { action: "dequeued", prDraft: false, prMergedAt: null },
   ];
 
   it("classifies every status the producer can emit as exactly one of open or terminal", () => {
@@ -229,6 +235,113 @@ describe("buildPullRequestWorkProductFields", () => {
         expect(open.has(pullRequestWorkProductStatus({ action, prDraft: false, prMerged: false }))).toBe(true);
       }
     });
+  });
+});
+
+// PEN-4550. `github-webhook.ts` populates `prMerged` only for `action === "closed"`,
+// but a merge queue merges a PR via `dequeued` — so on a queue-merged repo the event
+// that CARRIES the merge has no flag, only `merged_at`. The row then stored
+// `ready_for_review`/rank 46 and, because `acceptIncoming` orders on the
+// second-granular `updated_at` BEFORE it reaches the terminal-state tie-break, the
+// +2s dequeue overwrote a correct `merged` row outright. Measured on
+// `Blockcast/paperclip` 2026-10-23: 3 of 6 inspected merged-PR rows demoted.
+describe("merge-queue merge delivered as dequeued (PEN-4550)", () => {
+  const QUEUE_MERGE = {
+    action: "dequeued",
+    prDraft: false,
+    // Exactly the shape the webhook builds for a queue merge: no flag (the
+    // handler gates it on `closed`), but `merged_at` is read unconditionally.
+    prMerged: undefined,
+    prMergedAt: "2026-10-23T03:57:49Z",
+  };
+  // A genuine ejection — the queue dropped the PR without merging it. Same
+  // action, no `merged_at`. This is the case that must NOT be promoted.
+  const QUEUE_EJECTION = { action: "dequeued", prDraft: false, prMerged: undefined, prMergedAt: null };
+
+  it("reads a populated merged_at as the merge witness", () => {
+    expect(pullRequestHasMerged(QUEUE_MERGE)).toBe(true);
+    expect(pullRequestHasMerged(QUEUE_EJECTION)).toBe(false);
+    // `undefined` is "this event said nothing", not "not merged".
+    expect(pullRequestHasMerged({ prMerged: undefined, prMergedAt: undefined })).toBe(false);
+    // The flag still stands on its own, so the `closed` path is untouched.
+    expect(pullRequestHasMerged({ prMerged: true, prMergedAt: null })).toBe(true);
+    // A blank string is not a timestamp. Guards against a payload that carries
+    // the key with an empty value being read as a merge.
+    expect(pullRequestHasMerged({ prMerged: false, prMergedAt: "   " })).toBe(false);
+  });
+
+  it("maps the queue merge to merged / rank 50 / metadata.merged", () => {
+    expect(pullRequestWorkProductStatus(QUEUE_MERGE)).toBe("merged");
+    expect(pullRequestWorkProductSourceEventActionOrder(QUEUE_MERGE)).toBe(50);
+    expect(TERMINAL_PULL_REQUEST_WORK_PRODUCT_STATUSES).toContain(
+      pullRequestWorkProductStatus(QUEUE_MERGE),
+    );
+
+    const fields = buildPullRequestWorkProductFields({
+      repoFullName: "Blockcast/paperclip",
+      prNumber: 2946,
+      prTitle: "docs(runbooks): a `done` row's evidence verdict is not about its closure",
+      ...QUEUE_MERGE,
+      prUpdatedAt: "2026-10-23T03:57:51Z",
+    });
+    expect(fields.status).toBe("merged");
+    expect(fields.metadata.merged).toBe(true);
+    expect(fields.metadata.sourceEventActionOrder).toBe(50);
+    // The queue signal itself is still recorded factually: the PR did leave the
+    // queue. Only the lifecycle state it was demoting is corrected.
+    expect(fields.metadata.mergeQueueState).toBe("dequeued");
+    expect(fields.metadata.lastEventAction).toBe("dequeued");
+  });
+
+  it("leaves a genuine queue ejection at ready_for_review / rank 46", () => {
+    // The whole point of reading `merged_at` rather than the action: an ejected
+    // PR is still open and WILL emit further webhooks, so promoting it to a
+    // terminal state would strip the event-wake path PEN-2791's sweep reads.
+    expect(pullRequestWorkProductStatus(QUEUE_EJECTION)).toBe("ready_for_review");
+    expect(pullRequestWorkProductSourceEventActionOrder(QUEUE_EJECTION)).toBe(46);
+    expect(OPEN_PULL_REQUEST_WORK_PRODUCT_STATUSES).toContain(
+      pullRequestWorkProductStatus(QUEUE_EJECTION),
+    );
+
+    const fields = buildPullRequestWorkProductFields({
+      repoFullName: "Blockcast/paperclip",
+      prNumber: 2946,
+      prTitle: "ejected",
+      ...QUEUE_EJECTION,
+      prUpdatedAt: "2026-10-23T03:57:51Z",
+    });
+    expect(fields.status).toBe("ready_for_review");
+    expect(fields.metadata.merged).toBe(false);
+    expect(fields.metadata.sourceEventActionOrder).toBe(46);
+  });
+
+  it("leaves every non-merge mapping exactly as it was", () => {
+    // The done-when's third bullet, pinned: this change may only move the row
+    // for an event that carries a real `merged_at`.
+    expect(pullRequestWorkProductStatus({ action: "closed", prDraft: false, prMergedAt: null })).toBe("closed");
+    expect(pullRequestWorkProductStatus({ action: "opened", prDraft: true, prMergedAt: null })).toBe("draft");
+    expect(
+      pullRequestWorkProductStatus({ action: "converted_to_draft", prDraft: true, prMergedAt: null }),
+    ).toBe("draft");
+    expect(
+      pullRequestWorkProductStatus({ action: "synchronize", prDraft: false, prMergedAt: null }),
+    ).toBe("ready_for_review");
+    expect(
+      pullRequestWorkProductStatus({ action: "reopened", prDraft: false, prMergedAt: null }),
+    ).toBe("ready_for_review");
+
+    expect(pullRequestWorkProductSourceEventActionOrder({ action: "closed", prMergedAt: null })).toBe(30);
+    expect(pullRequestWorkProductSourceEventActionOrder({ action: "reopened", prMergedAt: null })).toBe(40);
+    expect(
+      pullRequestWorkProductSourceEventActionOrder({ action: "ready_for_review", prMergedAt: null }),
+    ).toBe(40);
+    expect(pullRequestWorkProductSourceEventActionOrder({ action: "enqueued", prMergedAt: null })).toBe(45);
+    expect(
+      pullRequestWorkProductSourceEventActionOrder({ action: "converted_to_draft", prMergedAt: null }),
+    ).toBe(20);
+    expect(
+      pullRequestWorkProductSourceEventActionOrder({ action: "synchronize", prMergedAt: null }),
+    ).toBe(10);
   });
 });
 

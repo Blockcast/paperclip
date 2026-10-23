@@ -22,7 +22,13 @@ if (!embeddedPostgresSupport.supported) {
 // on sourceEventTimestampMs and are ordered by action rank alone (BLO-35779).
 // The pure builder and the productivity-review tests both bypass that seam, so
 // these drive real events through upsertByExternalId.
-describeEmbeddedPostgres("PR work-product upsert: same-second merge-queue events", () => {
+//
+// PEN-4550 added the cases where the two events are NOT in the same second.
+// Those never reach the tie-break at all — `acceptIncoming` compares
+// `sourceEventTimestampMs` FIRST and the later arrival wins outright — which is
+// exactly why the dequeue could overwrite a merged row, and why only the pure
+// mapping (not the tie-break) can fix it.
+describeEmbeddedPostgres("PR work-product upsert: merge-queue events", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   let db: ReturnType<typeof createDb>;
 
@@ -56,7 +62,12 @@ describeEmbeddedPostgres("PR work-product upsert: same-second merge-queue events
     return { companyId, issueId };
   }
 
-  async function deliver(companyId: string, issueId: string, action: string) {
+  async function deliver(
+    companyId: string,
+    issueId: string,
+    action: string,
+    overrides: { prUpdatedAt?: string; prMerged?: boolean; prMergedAt?: string | null } = {},
+  ) {
     const fields = buildPullRequestWorkProductFields({
       repoFullName: "Blockcast/paperclip",
       prNumber: 4242,
@@ -64,6 +75,7 @@ describeEmbeddedPostgres("PR work-product upsert: same-second merge-queue events
       headSha: "a".repeat(40),
       prUpdatedAt: "2026-09-25T10:00:00Z",
       action,
+      ...overrides,
     });
     await workProductService(db).upsertByExternalId(
       issueId,
@@ -82,6 +94,15 @@ describeEmbeddedPostgres("PR work-product upsert: same-second merge-queue events
   async function storedQueueState(issueId: string) {
     const [row] = await db.select().from(issueWorkProducts).where(eq(issueWorkProducts.issueId, issueId));
     return (row?.metadata as Record<string, unknown> | null)?.mergeQueueState;
+  }
+
+  async function storedRow(issueId: string) {
+    const [row] = await db.select().from(issueWorkProducts).where(eq(issueWorkProducts.issueId, issueId));
+    return {
+      status: row?.status,
+      merged: (row?.metadata as Record<string, unknown> | null)?.merged,
+      lastEventAction: (row?.metadata as Record<string, unknown> | null)?.lastEventAction,
+    };
   }
 
   it("records the queue entry when ready_for_review and enqueued share a second", async () => {
@@ -120,6 +141,76 @@ describeEmbeddedPostgres("PR work-product upsert: same-second merge-queue events
     const { companyId, issueId } = await seedIssue();
     await deliver(companyId, issueId, "dequeued");
     await deliver(companyId, issueId, "enqueued");
+    expect(await storedQueueState(issueId)).toBe("dequeued");
+  });
+
+  // PEN-4550, reproduced end to end. On a mandatory merge queue EVERY merge
+  // fires a `dequeued`, and its `updated_at` routinely lands 1-2s AFTER the
+  // merge, so it beats the `closed` event outright — the tie-break that prefers
+  // a terminal state is never consulted. Measured on `Blockcast/paperclip`
+  // 2026-10-23: 3 of 6 inspected merged-PR rows had been demoted this way,
+  // including #2946, whose stored row read `ready_for_review`/`merged:false`
+  // while carrying its own `mergedAt: 2026-10-23T03:57:49Z`.
+  const MERGED_AT = "2026-09-25T10:00:00Z";
+
+  it("keeps the merge when the queue dequeue lands two seconds after it", async () => {
+    const { companyId, issueId } = await seedIssue();
+    // The merge, as `closed` reports it.
+    await deliver(companyId, issueId, "closed", {
+      prMerged: true,
+      prMergedAt: MERGED_AT,
+      prUpdatedAt: MERGED_AT,
+    });
+    expect((await storedRow(issueId)).status).toBe("merged");
+
+    // The queue's own ejection event, strictly later. It carries `merged_at`
+    // but no `merged` flag — the webhook gates that on `action === "closed"`.
+    await deliver(companyId, issueId, "dequeued", {
+      prMergedAt: MERGED_AT,
+      prUpdatedAt: "2026-09-25T10:00:02Z",
+    });
+
+    const row = await storedRow(issueId);
+    expect(row.lastEventAction).toBe("dequeued");
+    // Before the fix this read `ready_for_review` / false: the later dequeue was
+    // accepted outright and overwrote the merge. The demotion is PERMANENT —
+    // a merged PR emits no further webhook to correct it.
+    expect(row.status).toBe("merged");
+    expect(row.merged).toBe(true);
+  });
+
+  it("records the merge when the dequeue arrives first and the close is older", async () => {
+    const { companyId, issueId } = await seedIssue();
+    await deliver(companyId, issueId, "dequeued", {
+      prMergedAt: MERGED_AT,
+      prUpdatedAt: "2026-09-25T10:00:02Z",
+    });
+    // The dequeue alone must already be enough: GitHub's delivery order between
+    // the two is not guaranteed, so the merge cannot depend on `closed` landing.
+    expect(await storedRow(issueId)).toMatchObject({ status: "merged", merged: true });
+
+    await deliver(companyId, issueId, "closed", {
+      prMerged: true,
+      prMergedAt: MERGED_AT,
+      prUpdatedAt: MERGED_AT,
+    });
+    expect(await storedRow(issueId)).toMatchObject({ status: "merged", merged: true });
+  });
+
+  it("does not promote a genuine queue ejection, which is still an open PR", async () => {
+    const { companyId, issueId } = await seedIssue();
+    await deliver(companyId, issueId, "enqueued", { prUpdatedAt: MERGED_AT });
+    // Ejected, not merged: no `merged_at`. Promoting this would strip the
+    // event-wake path PEN-2791's stranded-assigned sweep reads, on a PR that
+    // demonstrably will emit more events.
+    await deliver(companyId, issueId, "dequeued", {
+      prMergedAt: null,
+      prUpdatedAt: "2026-09-25T10:00:02Z",
+    });
+
+    const row = await storedRow(issueId);
+    expect(row.status).toBe("ready_for_review");
+    expect(row.merged).toBe(false);
     expect(await storedQueueState(issueId)).toBe("dequeued");
   });
 });
