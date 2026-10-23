@@ -362,7 +362,12 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
 
   it("keeps the agent image build timeout above the measured slow-overlay + smoke budget", () => {
     // BLO-47194: 84.7 (worst overlay) + 25.6 (smoke p100) + 2.7 (post steps) = 113.0 -> 115.
-    expect(dockerAgentWorkflow).toContain("timeout-minutes: 115");
+    // PEN-4541 adds +3.0 for the git-config surface assertion and its 4 positive
+    // controls = 116.0 -> 119. That term is an ESTIMATE, not a measurement: the step
+    // had never run when it was written. Every other term here is observed, so
+    // re-derive it from real durations once the lane has a few runs behind it, and
+    // move this pin with the workflow when you do.
+    expect(dockerAgentWorkflow).toContain("timeout-minutes: 119");
   });
 
   it("gates agent rollout on a restricted-container screenshot smoke test", () => {
