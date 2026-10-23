@@ -68,6 +68,17 @@ RUN mv /usr/bin/gh /usr/bin/gh.real \
 # helper returns no credential and git falls through to prompting. Writing
 # /etc/gitconfig rather than ~/.gitconfig because each agent run gets a fresh
 # HOME, so a per-user config would not survive.
+#
+# GUARDED (PEN-4541). This line is the ONLY write to the agent image's system
+# git scope, and two checks hold it that way: assertion (a) in
+# deploy/helm/paperclip/tests/agent-egress-path.test.mjs asserts this exact
+# invocation is the only `git config` in the whole build chain, and assertion
+# (b) in scripts/check-agent-image-git-config.mjs asserts the BUILT image's
+# /etc/gitconfig is byte-exactly what this produces. Change either half of this
+# line and update EXPECTED_DOCKERFILE_GIT_CONFIG / EXPECTED_SYSTEM_GITCONFIG in
+# scripts/git-config-surface.mjs in the same commit. Note this scope carries the
+# **gh** helper; the **paperclip** credential helper is a different helper in a
+# different scope -- docker/github-wrappers/git injects it on git's command line.
 RUN git config --system credential.https://github.com.helper \
   '!/usr/bin/gh auth git-credential'
 

