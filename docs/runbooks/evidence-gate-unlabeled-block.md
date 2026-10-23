@@ -255,8 +255,11 @@ half, and it is the half that costs operator time.
 
 **The mechanism.** `lastEvidenceVerdict` is written on a PATCH carrying
 `status: "in_review"` (`server/src/services/issues.ts:11552`, refreshed on
-*every* such PATCH since BLO-19047). The `done` path has exactly one refresh and
-it sits **inside** the blocking branch:
+*every* such PATCH since BLO-19047 — including `in_review` → `in_review`) **or**
+on a PATCH that edits labels while the row is already `in_review`
+(`issues.ts:11530-11532`, `nextLabelIds !== undefined && existing.status === "in_review"`).
+Both are discrete writes, not a continuous subscription. The `done` path has
+exactly one refresh and it sits **inside** the blocking branch:
 
 ```js
 // server/src/services/issues.ts:11378
@@ -305,13 +308,24 @@ investigation to clear.
 Reproduce it — page to exhaustion first, then measure the union:
 
 ```sh
-# 1. page until a page comes back short; do NOT stop at the first 1000
-for off in 0 1000 2000 3000; do
-  curl -sS -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
+# 1. page until a page comes back short; do NOT stop at the first 1000.
+#    A fixed offset list silently returns a capped prefix the moment the
+#    population outgrows it -- the exact trap described above. Loop on the
+#    page length instead, and keep `-f` so a 4xx/429 fails the run rather
+#    than writing an error body that `jq -s add` merges into the union.
+rm -f /tmp/done-*.json /tmp/all-done.json
+off=0
+while :; do
+  curl -fsS -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
     "$PAPERCLIP_API_URL/api/companies/$COMPANY/issues?status=done&limit=1000&offset=$off" \
-    -o "/tmp/done-$off.json"
+    -o "/tmp/done-$off.json" || { echo "page at offset $off failed" >&2; break; }
+  # the row cap may answer with a bare array or a {truncated, issues} envelope
+  n=$(jq 'if type=="array" then length else (.issues | length) end' "/tmp/done-$off.json" || echo 0)
+  [ "${n:-0}" -lt 1000 ] && break
+  off=$((off + 1000))
 done
-jq -s 'add | unique_by(.id)' /tmp/done-*.json > /tmp/all-done.json
+jq -s 'map(if type=="array" then . else .issues end) | add | unique_by(.id)' \
+  /tmp/done-*.json > /tmp/all-done.json
 
 # 2. verdict age at completion, and the phantom-signature decomposition
 jq -r 'def ts: sub("\\.[0-9]+Z$"; "Z") | fromdate;
@@ -349,9 +363,15 @@ cleared them without the investigation they actually cost.
 
 #### The reader rule
 
-- On an **`in_review`** row, `lastEvidenceVerdict` is refreshed on every
-  transition into the status, so it is current and usable as a grace-window
-  signal.
+- On an **`in_review`** row, `lastEvidenceVerdict` is current **as of its last
+  `in_review` PATCH** (or last label edit in that status) — not continuously. It
+  is usable as a grace-window signal, but a row that has sat idle in `in_review`
+  for days still carries its entry-time verdict, so the same
+  "as of `lastEvidenceVerdictEvaluatedAt`" contract applies here too, just with a
+  shorter half-life. This row is its own example: PEN-4539's verdict was written
+  at `2026-10-23T03:06:48Z` reading `warn` / `missing: ["review:ally-clean"]`,
+  80 seconds before the clean review it was waiting on landed at 03:08, and
+  nothing refreshed it.
 - On a **`done`** row, treat it as **undefined until proven otherwise**: screen
   `projectId == null`, then compare `lastEvidenceVerdictEvaluatedAt` against
   `completedAt`. If the verdict predates the work, it describes an earlier state
