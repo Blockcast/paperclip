@@ -1160,6 +1160,16 @@ export function resolveServerGitInvocation(
       "credential.https://github.com.helper=",
       "-c",
       `credential.https://github.com.helper=${credentialHelper}`,
+      // BLO-48535: the server holds no SSH key, so a GitHub SSH URL can only
+      // fail with `Permission denied (publickey)`. Repos whose `.gitmodules`
+      // pin `ssh://git@github.com/...` (Blockcast/multicast) therefore made
+      // `submodule update --init` fail with `workspace_git_submodule_unavailable`.
+      // Rewrite both SSH spellings to https, which the helper above authenticates.
+      // `-c` reaches the child clones `submodule update` spawns (measured on git 2.47).
+      "-c",
+      "url.https://github.com/.insteadOf=ssh://git@github.com/",
+      "-c",
+      "url.https://github.com/.insteadOf=git@github.com:",
       ...args,
     ],
   };
