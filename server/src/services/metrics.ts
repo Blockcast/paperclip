@@ -2450,6 +2450,99 @@ export function normalizeGithubReviewCompletionStatus(status: string | null | un
 }
 
 /**
+ * Refusals GitHub returned to the control plane's own API calls (PEN-3852),
+ * split by WHY it refused.
+ *
+ * This exists because "the installation ran out of budget" and "this App may
+ * not read that" are the same HTTP status, and PEN-3776 measured the first one
+ * happening: an ordinary agent seat's `gh` reads came back
+ * `403 API rate limit exceeded for installation ID 138085375` while eight
+ * monitoring exporters swept the same shared installation. PEN-3852's
+ * acceptance test is that the INTERACTIVE installation never reaches that
+ * state, and nothing in this process could answer that question — the shared
+ * GitHub fetch wrapper in `github-fetch.ts` had no rate-limit awareness of any
+ * kind.
+ *
+ * The identifier itself is deliberately not spelled here. `github-writer-
+ * derivation.ts` puts EVERY file naming that symbol into the suspected-writer
+ * set, comments included, and then demands the outbound scrub of anything it
+ * cannot prove read-only. This module issues no GitHub request at all;
+ * naming the function would add a false positive to a fail-closed security
+ * guard purely through prose.
+ *
+ * Why a refusal counter rather than a `remaining` gauge: the budget probe on
+ * PEN-3852 measured `/rate_limit` reporting one counter while GitHub enforces
+ * several (a `/actions/workflows` call and a `/contents` call draw on different
+ * ones, resets 1,905s apart — reproduced twice, 15 days apart, at different
+ * ceilings). Tooling was also observed reporting "rate limit exceeded" in the
+ * same minute `/rate_limit` read 8,582/9,450 remaining. A remaining gauge can
+ * therefore read healthy through a real refusal; a refusal cannot be refused
+ * and also not happen. Count the thing the outage IS.
+ *
+ * `rate_limited` is the one PEN-3852's done-when keys on — primary installation
+ * budget exhaustion. `secondary_limit` is a different GitHub mechanism (abuse
+ * detection, independent of the hourly budget) and is counted separately rather
+ * than folded in, because the remedy differs: the first needs capacity or
+ * isolation, the second needs the caller to slow down. `forbidden` is the
+ * contrast class and the reason this metric is worth more than a bare 403
+ * count — a permission problem must never be read as budget exhaustion, which
+ * is exactly the merge `docs/runbooks/github-app-credential-ownership.md`
+ * warns against.
+ *
+ * Cardinality: `reason` is closed at the three members of
+ * {@link KNOWN_GITHUB_API_REFUSAL_REASONS}. Nothing caller-supplied reaches the
+ * label — the classifier maps every response onto that set or onto no refusal
+ * at all. No URL, repo or installation id is labelled here; they stay on the
+ * structured log line, per the guardrail
+ * {@link GITHUB_REVIEW_REQUEST_DELIVERY_METRIC} documents.
+ */
+export const GITHUB_API_REFUSALS_METRIC = "paperclip_github_api_refusals_total";
+
+/**
+ * Every GitHub API call this process attempted — the denominator for
+ * {@link GITHUB_API_REFUSALS_METRIC}, and its liveness signal.
+ *
+ * NOT optional, and not a nicety. A refusal counter reading zero has two
+ * readings that render identically — "GitHub refused nothing" and "this
+ * instrument is dead, or this build does not carry it" — and PEN-3852's
+ * acceptance test is a claim of the first kind. The denominator is what tells
+ * them apart: zero refusals over a window in which the denominator climbed is
+ * evidence, zero refusals over a flat denominator is an unproven instrument.
+ * This is the same drop-counter/denominator pairing the Alloy log counters in
+ * `Blockcast/onprem-k8s` enforce via `scripts/check-alloy-log-counters.py`.
+ *
+ * Counted per ATTEMPT, immediately before the request leaves — not per
+ * response. A call that never resolves is still an attempt: a DNS failure, a
+ * refused connection, or the 30s `GITHUB_FETCH_DEADLINE_MS` abort in
+ * `github-fetch.ts`. A denominator that only advanced on success would freeze
+ * during exactly the network-level outage an operator is trying to read it
+ * through.
+ *
+ * SCOPE, stated so nobody over-reads it: this counts every call through the
+ * shared GitHub fetch wrapper, including calls to a GitHub Enterprise host, and
+ * it is not labelled by host or installation. It is a liveness and volume signal for THIS process's
+ * GitHub egress, not a per-installation budget ledger. The per-installation
+ * question is answered by the exporter on the installation itself.
+ */
+export const GITHUB_API_REQUESTS_METRIC = "paperclip_github_api_requests_total";
+
+/**
+ * Why GitHub refused. Closed set — see {@link GITHUB_API_REFUSALS_METRIC}.
+ *
+ * Deliberately NOT a catch-all `other`: every 403/429 lands on exactly one of
+ * these three, because `forbidden` already IS the residual (a refusal that is
+ * not either quota mechanism). A fourth `unknown` child would only ever mean
+ * "the classifier changed and this list did not", which a test pins instead.
+ */
+export const KNOWN_GITHUB_API_REFUSAL_REASONS = [
+  "rate_limited",
+  "secondary_limit",
+  "forbidden",
+] as const;
+
+export type GithubApiRefusalReason = (typeof KNOWN_GITHUB_API_REFUSAL_REASONS)[number];
+
+/**
  * Restart-safe gauge of `agent_wakeup_requests` rows sitting in the terminal
  * `status = 'failed'` state (BLO-20255).
  *
@@ -4106,6 +4199,8 @@ let githubReviewRequestSuppression: Counter<"cause" | "reason"> | null = null;
 let githubReviewRequestDeadLetterUnresolved: Gauge<"reason"> | null = null;
 let githubReviewPosted: Counter<"repo" | "surface"> | null = null;
 let githubReviewCompletion: Counter<"status"> | null = null;
+let githubApiRefusals: Counter<"reason"> | null = null;
+let githubApiRequests: Counter | null = null;
 let agentWakeupTerminalFailedUnresolved: Gauge<"error_code" | "scope"> | null = null;
 let agentWakeupTerminalFailedOldestAge: Gauge<"scope"> | null = null;
 let githubWorkflowRunConclusion: Counter<"conclusion" | "supersession"> | null = null;
@@ -4281,6 +4376,8 @@ function ensureRegistry(): {
   githubReviewRequestDeadLetterUnresolvedGauge: Gauge<"reason">;
   githubReviewPostedCounter: Counter<"repo" | "surface">;
   githubReviewCompletionCounter: Counter<"status">;
+  githubApiRefusalsCounter: Counter<"reason">;
+  githubApiRequestsCounter: Counter;
   agentWakeupTerminalFailedUnresolvedGauge: Gauge<"error_code" | "scope">;
   agentWakeupTerminalFailedOldestAgeGauge: Gauge<"scope">;
   githubWorkflowRunConclusionCounter: Counter<"conclusion" | "supersession">;
@@ -4441,6 +4538,8 @@ function ensureRegistry(): {
     || !githubReviewRequestDeadLetterUnresolved
     || !githubReviewPosted
     || !githubReviewCompletion
+    || !githubApiRefusals
+    || !githubApiRequests
     || !agentWakeupTerminalFailedUnresolved
     || !agentWakeupTerminalFailedOldestAge
     || !githubWorkflowRunConclusion
@@ -5668,6 +5767,59 @@ function ensureRegistry(): {
     ]) {
       githubReviewCompletion.inc({ status }, 0);
     }
+    githubApiRefusals = new Counter({
+      name: GITHUB_API_REFUSALS_METRIC,
+      help:
+        "Count of GitHub API responses that REFUSED a control-plane call, by why (PEN-3852). "
+        + "reason='rate_limited' is primary installation-budget exhaustion (403/429 with "
+        + "x-ratelimit-remaining: 0) — the condition PEN-3776 measured refusing an ordinary "
+        + "agent seat's reads while monitoring exporters swept the same shared installation. "
+        + "reason='secondary_limit' is GitHub's separate abuse-detection mechanism, which is "
+        + "independent of the hourly budget and needs the caller to slow down rather than more "
+        + "capacity. reason='forbidden' is a 403 that is a PERMISSION problem and no kind of "
+        + "quota — counted so it can never be read as budget exhaustion, which is the merge "
+        + "that makes a 403 rate uninterpretable. Read against the denominator "
+        + GITHUB_API_REQUESTS_METRIC
+        + ": zero refusals is only evidence while that counter is climbing, because an absent "
+        + "or dead instrument renders the same zero. All three children are present from "
+        + "process start for that reason.",
+      labelNames: ["reason"],
+      registers: [registry],
+    });
+    // Zero-initialize all three reasons. Load-bearing, not tidiness: PEN-3852's
+    // acceptance test asserts that quota refusals are ZERO over a multi-day
+    // window, and prom-client does not create a labelled child until its first
+    // `inc()`. A counter touched only on a refusal therefore publishes NO
+    // series in the healthy case, `sum(increase(...))` over no series is an
+    // empty vector, and the criterion neither passes nor fails — it returns
+    // nothing, which is the exact defect that made the row's original
+    // done-when #4 unsatisfiable. An instrument built to prove "zero refusals"
+    // must render zero when there are zero. Same reasoning as the review-posted
+    // counter above. 3 constant-zero series.
+    for (const reason of KNOWN_GITHUB_API_REFUSAL_REASONS) {
+      githubApiRefusals.inc({ reason }, 0);
+    }
+    githubApiRequests = new Counter({
+      name: GITHUB_API_REQUESTS_METRIC,
+      help:
+        "Count of GitHub API calls this process ATTEMPTED, incremented before the request "
+        + "leaves (PEN-3852). The denominator and liveness signal for "
+        + GITHUB_API_REFUSALS_METRIC
+        + " — a zero refusal count means 'GitHub refused nothing' only while this is climbing, "
+        + "and means 'the instrument is dead or absent' when it is flat. Counted per attempt "
+        + "rather than per response so a call that never resolves (DNS, connect refused, the "
+        + "30s fetch deadline) still advances it; a denominator that only moved on success "
+        + "would freeze during exactly the outage it is being read through. Covers every "
+        + "GitHub call this process makes, including GitHub Enterprise hosts, and is NOT "
+        + "labelled by host or installation: this is egress liveness for this process, not a "
+        + "per-installation budget ledger.",
+      registers: [registry],
+    });
+    // Explicit, though prom-client materializes an unlabelled counter at
+    // registration: the zero is what the denominator MEANS here, so it is
+    // asserted at the source rather than inherited from library behaviour that
+    // a future version is free to change. 1 constant-zero series.
+    githubApiRequests.inc(0);
     agentWakeupTerminalFailedUnresolved = new Gauge({
       name: AGENT_WAKEUP_TERMINAL_FAILED_UNRESOLVED_METRIC,
       help:
@@ -6693,6 +6845,8 @@ function ensureRegistry(): {
     githubReviewRequestDeadLetterUnresolvedGauge: githubReviewRequestDeadLetterUnresolved,
     githubReviewPostedCounter: githubReviewPosted,
     githubReviewCompletionCounter: githubReviewCompletion,
+    githubApiRefusalsCounter: githubApiRefusals,
+    githubApiRequestsCounter: githubApiRequests,
     agentWakeupTerminalFailedUnresolvedGauge: agentWakeupTerminalFailedUnresolved,
     agentWakeupTerminalFailedOldestAgeGauge: agentWakeupTerminalFailedOldestAge,
     githubWorkflowRunConclusionCounter: githubWorkflowRunConclusion,
@@ -8448,6 +8602,32 @@ export function recordGithubReviewCompletion(status: string | null | undefined):
   const label = normalizeGithubReviewCompletionStatus(status);
   ensureRegistry().githubReviewCompletionCounter.inc({ status: label });
   return label;
+}
+
+/**
+ * Record one attempted GitHub API call (PEN-3852).
+ *
+ * Called from the shared GitHub fetch wrapper immediately BEFORE the request
+ * leaves, so the
+ * denominator counts attempts rather than successes — see
+ * {@link GITHUB_API_REQUESTS_METRIC} for why that distinction is what keeps the
+ * signal readable during a network-level outage.
+ */
+export function recordGithubApiRequest(): void {
+  ensureRegistry().githubApiRequestsCounter.inc();
+}
+
+/**
+ * Record one GitHub refusal, already classified (PEN-3852).
+ *
+ * Takes the narrow {@link GithubApiRefusalReason} rather than a string, so an
+ * unclassifiable response is a compile error at the call site instead of a new
+ * label child appearing in production. The shared GitHub fetch wrapper is the
+ * only caller; the classification itself lives there, next to the response it
+ * reads.
+ */
+export function recordGithubApiRefusal(reason: GithubApiRefusalReason): void {
+  ensureRegistry().githubApiRefusalsCounter.inc({ reason });
 }
 
 /**
