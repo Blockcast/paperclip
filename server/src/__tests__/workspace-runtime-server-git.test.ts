@@ -60,6 +60,10 @@ describe("resolveServerGitInvocation", () => {
       "credential.https://github.com.helper=",
       "-c",
       `credential.https://github.com.helper=${fakeHelper}`,
+      "-c",
+      "url.https://github.com/.insteadOf=ssh://git@github.com/",
+      "-c",
+      "url.https://github.com/.insteadOf=git@github.com:",
       "fetch",
       "--prune",
       "origin",
@@ -80,6 +84,47 @@ describe("resolveServerGitInvocation", () => {
     expect(helperArgs).toHaveLength(2);
     expect(helperArgs[0]).toBe("credential.https://github.com.helper=");
     expect(helperArgs[1]).toBe(`credential.https://github.com.helper=${fakeHelper}`);
+  });
+
+  it("rewrites GitHub SSH submodule URLs to https, because the server has no SSH key (BLO-48535)", async () => {
+    // Real git and a real submodule clone, because the property that matters is
+    // that the `-c` rewrite reaches the CHILD clone `submodule update` spawns --
+    // an argv assertion cannot show that. Every transport is forbidden, so the
+    // clone fails without touching the network and its error names the
+    // transport it tried: https with the rewrite, ssh without it.
+    const { execFileSync, spawnSync } = await import("node:child_process");
+    const { existsSync } = await import("node:fs");
+    const gitBin = existsSync("/usr/bin/git") ? "/usr/bin/git" : "git";
+    const git = (cwd: string, ...a: string[]) =>
+      execFileSync(gitBin, ["-c", "protocol.file.allow=always", "-c", "user.name=t", "-c", "user.email=t@t", ...a], {
+        cwd,
+        stdio: "pipe",
+      });
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-blo48535-"));
+    try {
+      const sub = path.join(root, "sub");
+      const sup = path.join(root, "super");
+      await fs.mkdir(sub);
+      await fs.mkdir(sup);
+      git(sub, "init", "-q");
+      git(sub, "commit", "-q", "--allow-empty", "-m", "s");
+      git(sup, "init", "-q");
+      git(sup, "submodule", "add", "-q", sub, "sub");
+      git(sup, "config", "-f", ".gitmodules", "submodule.sub.url", "ssh://git@github.com/Org/sub.git");
+      git(sup, "commit", "-qam", "ssh url");
+      const clone = path.join(root, "clone");
+      git(root, "clone", "-q", sup, clone);
+      const resolved = resolveServerGitInvocation(["submodule", "update", "--init"], {
+        gitBinary: gitBin,
+        credentialHelper: fakeHelper,
+      });
+      const run = spawnSync(gitBin, ["-c", "protocol.allow=never", ...resolved.args], { cwd: clone, encoding: "utf8" });
+      expect(run.status).not.toBe(0);
+      expect(run.stderr).toContain("transport 'https' not allowed");
+      expect(run.stderr).not.toContain("transport 'ssh' not allowed");
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
   });
 
   it("falls back to bare `git` off-image, where there is no wrapper to bypass", () => {
