@@ -75,6 +75,15 @@ export type PullRequestMergeQueueState = "enqueued" | "dequeued";
  * first — GitHub emits `dequeued` before `closed` on a merge (observed 1s
  * apart on #1948), and a push to a queued PR ejects it. A lost `dequeued`
  * delivery is bounded by the reader's own cap, not carried here.
+ *
+ * ⚠️ PEN-4550 — that "`dequeued` before `closed`" observation is about DELIVERY
+ * order and must not be read as an ordering of the `updated_at` stamps the
+ * rows are ranked by. On a queue merge the `dequeued` payload's `updated_at`
+ * is frequently LATER than the merge (measured at merge+2s on #2931, #2933 and
+ * #2946), so it beats `closed` in the timestamp-first comparison regardless of
+ * which arrived first. Statelessness here is still correct — queue occupancy is
+ * genuinely per-event — but it is `pullRequestHasMerged` below, not this
+ * ordering assumption, that keeps a queue merge from demoting a merged row.
  */
 export function pullRequestMergeQueueState(
   input: Pick<PullRequestWorkProductInput, "action">,
@@ -143,6 +152,39 @@ export type PullRequestWorkProductStatus =
   | (typeof TERMINAL_PULL_REQUEST_WORK_PRODUCT_STATUSES)[number];
 
 /**
+ * Did the PR this event describes actually merge?
+ *
+ * Reads `merged_at` as well as the `merged` flag, and that is the whole point
+ * (PEN-4550). The webhook only populates `prMerged` for `action === "closed"`
+ * (`github-webhook.ts`: `prMerged: action === "closed" ? merged : undefined`),
+ * because that flag also drives merged-PR forward-capture and the stacked-PR
+ * scan, which must fire exactly once. Every OTHER action therefore arrives with
+ * `prMerged === undefined` no matter what the PR's real state is — including
+ * the `dequeued` that GitHub emits when the merge queue MERGES a PR, whose
+ * payload does carry a populated `merged_at`.
+ *
+ * Without this, that `dequeued` maps to `ready_for_review`/rank 46, and because
+ * its `updated_at` can be LATER than the merge's it wins the timestamp-first
+ * comparison in `work-products.ts` outright — overwriting a correct `merged`
+ * row. Measured on Blockcast/paperclip 2026-10-23: the queue is mandatory
+ * (59/59 recent merges passed through it) and 3 of 6 inspected merged-PR rows
+ * had been demoted this way, every one with the dequeue landing merge+2s while
+ * every surviving row had `closed` win at +0/+1s. It is a coin flip on a
+ * second-granular clock, not a rare race.
+ *
+ * `merged_at` is a sound witness: GitHub sets it only on a real merge and never
+ * clears it, and a merged PR cannot be reopened — so this can only ever promote
+ * a row that genuinely merged. A closed-unmerged PR has `merged_at: null` and
+ * still maps to `closed`.
+ */
+export function pullRequestHasMerged(
+  input: Pick<PullRequestWorkProductInput, "prMerged" | "prMergedAt">,
+): boolean {
+  if (input.prMerged === true) return true;
+  return typeof input.prMergedAt === "string" && input.prMergedAt.trim().length > 0;
+}
+
+/**
  * Map a PR's current state onto the work-product status enum.
  *
  * Reads the PR's *state* (merged/draft) in preference to the triggering action,
@@ -150,9 +192,9 @@ export type PullRequestWorkProductStatus =
  * the row should describe the PR, not the event that last touched it.
  */
 export function pullRequestWorkProductStatus(
-  input: Pick<PullRequestWorkProductInput, "action" | "prDraft" | "prMerged">,
+  input: Pick<PullRequestWorkProductInput, "action" | "prDraft" | "prMerged" | "prMergedAt">,
 ): PullRequestWorkProductStatus {
-  if (input.prMerged === true) return "merged";
+  if (pullRequestHasMerged(input)) return "merged";
   if (input.action === "closed") return "closed";
   if (input.prDraft === true) return "draft";
   return "ready_for_review";
@@ -167,9 +209,9 @@ export function pullRequestWorkProductSourceEventOrder(
 }
 
 export function pullRequestWorkProductSourceEventActionOrder(
-  input: Pick<PullRequestWorkProductInput, "action" | "prMerged">,
+  input: Pick<PullRequestWorkProductInput, "action" | "prMerged" | "prMergedAt">,
 ): number {
-  if (input.prMerged === true) return 50;
+  if (pullRequestHasMerged(input)) return 50;
   switch (input.action) {
     // Merge-queue events rank above ready_for_review because a PR must be
     // ready before it can be queued, and a dequeue above the enqueue it ends.
@@ -254,7 +296,7 @@ export function buildPullRequestWorkProductFields(
       previousHeadSha: input.previousHeadSha ?? null,
       branch: input.prBranch ?? null,
       draft: input.prDraft === true,
-      merged: input.prMerged === true,
+      merged: pullRequestHasMerged(input),
       mergedAt: input.prMergedAt ?? null,
       lastEventAction: input.action,
       // BLO-35779. Null = "this event carried no queue signal", not "not queued".

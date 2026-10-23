@@ -9,6 +9,7 @@ import {
   OPEN_PULL_REQUEST_WORK_PRODUCT_STATUSES,
   PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID,
   pullRequestExternalId,
+  pullRequestHasMerged,
   pullRequestMergeQueueState,
   pullRequestWorkProductSourceEventActionOrder,
   pullRequestWorkProductStatus,
@@ -105,6 +106,74 @@ describe("pullRequestWorkProductSourceEventActionOrder", () => {
     expect(pullRequestWorkProductSourceEventActionOrder({ action: "closed", prMerged: false })).toBe(30);
     expect(pullRequestWorkProductSourceEventActionOrder({ action: "converted_to_draft" })).toBe(20);
     expect(pullRequestWorkProductSourceEventActionOrder({ action: "synchronize" })).toBe(10);
+  });
+});
+
+// PEN-4550: a merge-queue merge arrives as `dequeued`, NOT as `closed`, so the
+// webhook leaves `prMerged` undefined and only `merged_at` witnesses the merge.
+// Measured on Blockcast/paperclip 2026-10-23: the queue is mandatory (59/59
+// recent merges went through it) and 3 of 6 inspected merged-PR rows had been
+// demoted to `ready_for_review` because the dequeue's `updated_at` landed
+// merge+2s and won the timestamp-first comparison in work-products.ts.
+describe("merge-queue merge (PEN-4550)", () => {
+  const DEQUEUED_MERGE = {
+    action: "dequeued",
+    prDraft: false,
+    // Exactly what the webhook builds for a non-`closed` action: the flag is
+    // undefined by construction, the timestamp is read unconditionally.
+    prMerged: undefined,
+    prMergedAt: "2026-10-22T17:23:32Z",
+  } as const;
+
+  it("treats a populated merged_at as merged even when the flag is absent", () => {
+    expect(pullRequestHasMerged(DEQUEUED_MERGE)).toBe(true);
+    expect(pullRequestHasMerged({ prMerged: true, prMergedAt: null })).toBe(true);
+  });
+
+  it("does not invent a merge from an absent or blank merged_at", () => {
+    expect(pullRequestHasMerged({ prMerged: false, prMergedAt: null })).toBe(false);
+    expect(pullRequestHasMerged({ prMerged: undefined, prMergedAt: undefined })).toBe(false);
+    expect(pullRequestHasMerged({ prMerged: undefined, prMergedAt: "   " })).toBe(false);
+  });
+
+  it("maps the dequeued merge to the terminal merged status, not ready_for_review", () => {
+    expect(pullRequestWorkProductStatus(DEQUEUED_MERGE)).toBe("merged");
+  });
+
+  it("ranks the dequeued merge at the merged rank so it cannot be outranked by the dequeue rank", () => {
+    // 46 was the old answer, and 46 < the `closed`+merged 50 it had to beat.
+    expect(pullRequestWorkProductSourceEventActionOrder(DEQUEUED_MERGE)).toBe(50);
+  });
+
+  it("records merged:true in metadata, which is what the done-gate reads", () => {
+    const fields = buildPullRequestWorkProductFields({
+      repoFullName: "Blockcast/paperclip",
+      prNumber: 2933,
+      prUpdatedAt: "2026-10-22T17:23:34Z",
+      ...DEQUEUED_MERGE,
+    });
+    expect(fields.status).toBe("merged");
+    expect(fields.metadata.merged).toBe(true);
+    // The queue signal itself is still recorded — this fix promotes the
+    // lifecycle state without erasing the occupancy reading (BLO-35779).
+    expect(fields.metadata.mergeQueueState).toBe("dequeued");
+  });
+
+  it("leaves a genuine queue EJECTION open — merged_at is null when the queue drops an unmerged PR", () => {
+    const ejected = {
+      action: "dequeued",
+      prDraft: false,
+      prMerged: undefined,
+      prMergedAt: null,
+    } as const;
+    expect(pullRequestWorkProductStatus(ejected)).toBe("ready_for_review");
+    expect(pullRequestWorkProductSourceEventActionOrder(ejected)).toBe(46);
+  });
+
+  it("still maps a closed-unmerged PR to closed", () => {
+    expect(
+      pullRequestWorkProductStatus({ action: "closed", prMerged: false, prMergedAt: null }),
+    ).toBe("closed");
   });
 });
 
