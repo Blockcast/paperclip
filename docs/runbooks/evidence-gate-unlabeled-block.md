@@ -439,11 +439,26 @@ jq -r 'def ts: sub("\\.[0-9]+Z$"; "Z") | fromdate;
 ⚠️ **Bind `originKind` to a variable — do not write `index(.originKind)` inline.**
 Inside `[ ... ] | index(.originKind)` the `.` has rebound to the *array literal*,
 not the issue, so jq fails with `Cannot index array with string "originKind"`.
-The working form is the exact one above — **`(.originKind // "") as $ok`**, not a
-bare `. as $ok`, which would bind the whole issue and reproduce a variant of the
-same bug. The `// ""` is load-bearing too: it maps a null `originKind` to `""`,
-which is absent from the list and so passes through as *non-harness* rather than
-erroring. This bit the first draft of this very section.
+The working form is the exact one above — **`(.originKind // "") as $ok`**. This
+bit the first draft of this very section.
+
+The two near-misses fail in **opposite** ways, and the quiet one is the dangerous
+one (all three behaviours verified with `jq` on 2026-10-23):
+
+| form | behaviour |
+|---|---|
+| `index(.originKind)` inline | **errors loudly** — `Cannot index array with string "originKind"`, exit 5. You cannot miss it |
+| bare `. as $ok` | **silently fails open.** `$ok` binds the whole issue; `index(<object>)` returns `null`, so `| not` is `true` for *every* row — including harness rows. The screen removes nothing and the query still exits 0 |
+| `(.originKind // "") as $ok` | correct — `false` for a harness row, `true` otherwise |
+
+So the mistake to actually fear is not the error, it is the bare bind: it leaves a
+query that runs clean and screens nothing. If this screen ever appears to remove
+**0 of 38**, suspect the binding before you conclude the population changed.
+
+`// ""` is **not** what prevents an error — nothing errors here. `index(null)`
+also returns `null` (exit 0), so a null `originKind` already passes through as
+non-harness without it. It is defensive code that makes the null case explicit,
+not load-bearing.
 
 ⚠️ **Do not oversell this screen — a tempting hypothesis here is false.** It is
 natural to guess that the residual is *largely* harness rows, which would mean
