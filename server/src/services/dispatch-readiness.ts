@@ -113,6 +113,10 @@ export function isEffectivelyDependencyReadyForDispatch(
  */
 export const K8S_ISOLATION_RETRY_AT_CONTEXT_KEY = "paperclipK8sIsolationRetryAt";
 export const BRANCH_CLAIM_RETRY_AT_CONTEXT_KEY = "paperclipBranchClaimRetryAt";
+// BLO-48769: the non-run isolation key a K8s-deferred run is waiting on. Unlike
+// `paperclipK8sIsolation` (dropped on deferral), this survives in `queued`, so
+// the writer lock can admit waiters on one key oldest-first.
+export const K8S_ISOLATION_WAIT_KEY_CONTEXT_KEY = "paperclipK8sIsolationWaitKey";
 
 function isRetryStampDeferred(
   context: Record<string, unknown> | null | undefined,
