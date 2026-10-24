@@ -1765,8 +1765,13 @@ export function routineService(
   // BLO-48716: but an escalated action past its horizon wakes nobody, so as an
   // unbounded protection it wedged `skip_if_active` until someone closed the
   // row by hand (BLO-47801 ~39h, BLO-48616). It keeps protecting for one
-  // fire-age horizon past its `timeoutAt` (or last update, when it has none),
-  // then stops. Gate and supersede both call this with the same `now` and
+  // fire-age horizon past its `timeoutAt` (or `createdAt`, when it has none),
+  // then stops. Not `updatedAt`: the recovery upsert keeps `escalated` sticky
+  // but rewrites `updatedAt` on every sweep, so a stranded source the sweep
+  // keeps re-visiting would never age out (Ally review). Guarded column
+  // comparisons rather than `coalesce(...) > $cutoff`, so the cutoff binds as a
+  // timestamp parameter (see the note on the fire-age arm above) and the
+  // predicate stays two-valued (`status` and `created_at` are NOT NULL). Gate and supersede both call this with the same `now` and
   // horizon, so the gated set and the refused set still cannot drift apart.
   function hasLiveRecoveryAction(now: Date, fireAgeHorizonMs: number) {
     const escalatedCutoff = new Date(now.getTime() - fireAgeHorizonMs);
@@ -1776,10 +1781,11 @@ export function routineService(
           where ${issueRecoveryActions.sourceIssueId} = ${issues.id}
             and ${issueRecoveryActions.companyId} = ${issues.companyId}
             and ${inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES])}
-            and (
-              ${issueRecoveryActions.status} <> 'escalated'
-              or coalesce(${issueRecoveryActions.timeoutAt}, ${issueRecoveryActions.updatedAt}) > ${escalatedCutoff}
-            )
+            and ${or(
+              ne(issueRecoveryActions.status, "escalated"),
+              and(isNotNull(issueRecoveryActions.timeoutAt), gt(issueRecoveryActions.timeoutAt, escalatedCutoff)),
+              and(isNull(issueRecoveryActions.timeoutAt), gt(issueRecoveryActions.createdAt, escalatedCutoff)),
+            )}
         )`;
   }
 
@@ -1864,8 +1870,9 @@ export function routineService(
     // cancel must gate the fire too. It stays open, so proceeding would put a
     // successor beside it (the INSERT carries no run yet, so the unique index
     // does not stop it) -- where before the fire-age arm this same row read as
-    // live and the fire coalesced. Age is deliberately not a condition, since a
-    // protected row is never cancelled at any age. A protection that commits
+    // live and the fire coalesced. Issue age is deliberately not a condition; the
+    // only bound is the escalated-action horizon inside `hasLiveRecoveryAction`
+    // (BLO-48716), shared with the supersede. A protection that commits
     // after this snapshot is caught by the second gate `dispatchRoutineRun`
     // runs after the supersede's row lock.
     //
@@ -2106,8 +2113,10 @@ export function routineService(
     // terminalise the work the recovery owner was handed while leaving the
     // action's own lifecycle untouched, so it could never resume. The live set
     // is the recovery service's own (`active` + `escalated`, recovery/service.ts
-    // waiting-path and hand-back drain queries): an escalated action is still
-    // owned by an operator who resolves it, so its source is protected here.
+    // waiting-path and hand-back drain queries). An escalated action protects
+    // its source only for one fire-age horizon past its own horizon -- see the
+    // BLO-48716 note on `hasLiveRecoveryAction`. Do not restore unbounded
+    // protection: an escalated action past its horizon wakes nobody.
     const noLiveRecoveryAction = sql`not ${hasLiveRecoveryAction(input.now, input.fireAgeHorizonMs)}`;
     const staleCondition = and(
       eq(issues.companyId, input.routine.companyId),
