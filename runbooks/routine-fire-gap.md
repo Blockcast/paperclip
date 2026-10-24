@@ -30,8 +30,8 @@ paperclip_routine_last_done_fire_age_seconds{routine_id="<routine_id>"}
 
 | firing age | completion age | what it means | what to do |
 |---|---|---|---|
-| high | high | the routine has **stopped dispatching** | Triage §1 then §2's first row — scheduler/trigger fault. |
-| **low** | high | it **is** still dispatching and its runs **die or wedge** before reaching `done` — the original BLO-32638 condition | Find the open execution row, inspect it, and **close it only if it is stale** — it may be a legitimately long-running execution, so do not close live work (§2, second and third rows). Do **not** re-create the routine; the routine is fine. |
+| high | high | no fire is **producing work** | **Two causes, and §1 separates neither.** Either a scheduler/trigger fault (§2, **first** row — no `routine_runs` at all), **or** a live execution row eating the fires queued behind it under `skip_if_active` / `coalesce_if_active` (§2, **second** row — rows present but all `skipped` / `coalesced`). A stood-down fire is not counted, so the second cause drives the firing age up too. For that one: find the row holding the lock, inspect it, and **close it only if it is stale**. |
+| **low** | high | it **is** still dispatching and its runs **die or wedge** before reaching `done` — the original BLO-32638 condition | Read `routine_runs.failure_reason`, then the execution issue's own run history (§2, **third** row). If a row is still open it may be a legitimately long-running execution — inspect it and **close it only if it is stale**; do not close live work. Do **not** re-create the routine; the routine is fine. |
 | high | low | a **stale row just completed**. No fire has occurred. | This is the PEN-4647 case. The alert is correct to stay firing — treat it as "still not firing", not as recovery. |
 
 ### Why there are two gauges at all
