@@ -11,6 +11,15 @@
 # Run:  promtool test rules deploy/helm/paperclip/tests/routine-fire-gap.promtool.yaml
 # (the rule_files path is the rendered chart output; see the mjs harness that
 # renders it next to this file).
+# PEN-4647 added four cases, one replaying a 48h window at this file's 1m
+# step. Measured locally on promtool 3.2.1: 293s before, 322s after (+10%) --
+# the bulk of that is the pre-existing 30.7h ramp, not the addition. This
+# whole harness SKIPS when promtool is absent, which is the case in the job
+# that runs the chart's other tests, so the cost is borne by local runs only.
+# The authoritative copy of this replay is in Blockcast/onprem-k8s
+# (monitoring/paperclip-routine-fire-gap/prometheus-rule_test.yml), which
+# tests the rules Prometheus ACTUALLY loads and runs at a 10m step in 27s.
+#
 rule_files:
   - rendered-rules.yaml
 
@@ -39,8 +48,8 @@ tests:
               routine_id: bridge-watchdog
               company_id: tenant-a
             exp_annotations:
-              summary: "Paperclip routine bridge-watchdog has not completed a fire in 2x its own cadence"
-              description: "Routine bridge-watchdog last completed a fire 110520s ago, more than 2x the longest gap its own cron schedules (BLO-32638). The age is only trusted while paperclip_routine_fire_gap_metrics_refresh_success is 1. The routine is still `active` with an enabled schedule trigger, so this is not a deliberate pause -- it is either not dispatching, or its fires are dispatching and then dying before the execution issue reaches `done`. Those are different faults with different evidence: check paperclip_routine_dispatch_total for the first, and the routine's recent `routine_runs` rows for the second. A never-fired routine reports its age from creation, so a large value on a young routine means it has never worked at all rather than that it stopped."
+              summary: "Paperclip routine bridge-watchdog has not fired, or not completed a fire, in 2x its own cadence"
+              description: "Routine bridge-watchdog last fired, or last completed a fire, 110520s ago -- more than 2x the longest gap its own cron schedules (BLO-32638, PEN-4647). That value is the WORSE of two ages; read both before triaging.\n\nThe two are paperclip_routine_last_fire_start_age_seconds and paperclip_routine_last_done_fire_age_seconds, both keyed on this routine_id. FIRING age high (both high) means it has STOPPED DISPATCHING -- check paperclip_routine_dispatch_total and the trigger's nextRunAt. FIRING age low but COMPLETION age high means it dispatches fine and the work then dies or wedges before the execution issue reaches `done`: find the open row with originKind=routine_execution and originId equal to this routine_id and CLOSE IT, rather than re-creating the routine. The ages are only trusted while paperclip_routine_fire_gap_metrics_refresh_success is 1. The routine is still `active` with an enabled schedule trigger, so this is not a deliberate pause. A routine that has never fired reports its age from creation, so a large value on a young routine means it has never worked at all rather than that it stopped."
               runbook_url: "https://github.com/Blockcast/paperclip/blob/master/runbooks/routine-fire-gap.md"
       # The smallest of the 11 measured gaps, 12h, also fires -- so the rule
       # covers the whole measured cohort and not just its worst member.
@@ -52,8 +61,8 @@ tests:
               routine_id: bridge-watchdog
               company_id: tenant-a
             exp_annotations:
-              summary: "Paperclip routine bridge-watchdog has not completed a fire in 2x its own cadence"
-              description: "Routine bridge-watchdog last completed a fire 43200s ago, more than 2x the longest gap its own cron schedules (BLO-32638). The age is only trusted while paperclip_routine_fire_gap_metrics_refresh_success is 1. The routine is still `active` with an enabled schedule trigger, so this is not a deliberate pause -- it is either not dispatching, or its fires are dispatching and then dying before the execution issue reaches `done`. Those are different faults with different evidence: check paperclip_routine_dispatch_total for the first, and the routine's recent `routine_runs` rows for the second. A never-fired routine reports its age from creation, so a large value on a young routine means it has never worked at all rather than that it stopped."
+              summary: "Paperclip routine bridge-watchdog has not fired, or not completed a fire, in 2x its own cadence"
+              description: "Routine bridge-watchdog last fired, or last completed a fire, 43200s ago -- more than 2x the longest gap its own cron schedules (BLO-32638, PEN-4647). That value is the WORSE of two ages; read both before triaging.\n\nThe two are paperclip_routine_last_fire_start_age_seconds and paperclip_routine_last_done_fire_age_seconds, both keyed on this routine_id. FIRING age high (both high) means it has STOPPED DISPATCHING -- check paperclip_routine_dispatch_total and the trigger's nextRunAt. FIRING age low but COMPLETION age high means it dispatches fine and the work then dies or wedges before the execution issue reaches `done`: find the open row with originKind=routine_execution and originId equal to this routine_id and CLOSE IT, rather than re-creating the routine. The ages are only trusted while paperclip_routine_fire_gap_metrics_refresh_success is 1. The routine is still `active` with an enabled schedule trigger, so this is not a deliberate pause. A routine that has never fired reports its age from creation, so a large value on a young routine means it has never worked at all rather than that it stopped."
               runbook_url: "https://github.com/Blockcast/paperclip/blob/master/runbooks/routine-fire-gap.md"
 
   # ── Negative control: the healthy intervals in that same history. ─────────
@@ -172,8 +181,8 @@ tests:
               severity: warning
               routine_id: weekday-triage
             exp_annotations:
-              summary: "Paperclip routine weekday-triage has not completed a fire in 2x its own cadence"
-              description: "Routine weekday-triage last completed a fire 522000s ago, more than 2x the longest gap its own cron schedules (BLO-32638). The age is only trusted while paperclip_routine_fire_gap_metrics_refresh_success is 1. The routine is still `active` with an enabled schedule trigger, so this is not a deliberate pause -- it is either not dispatching, or its fires are dispatching and then dying before the execution issue reaches `done`. Those are different faults with different evidence: check paperclip_routine_dispatch_total for the first, and the routine's recent `routine_runs` rows for the second. A never-fired routine reports its age from creation, so a large value on a young routine means it has never worked at all rather than that it stopped."
+              summary: "Paperclip routine weekday-triage has not fired, or not completed a fire, in 2x its own cadence"
+              description: "Routine weekday-triage last fired, or last completed a fire, 522000s ago -- more than 2x the longest gap its own cron schedules (BLO-32638, PEN-4647). That value is the WORSE of two ages; read both before triaging.\n\nThe two are paperclip_routine_last_fire_start_age_seconds and paperclip_routine_last_done_fire_age_seconds, both keyed on this routine_id. FIRING age high (both high) means it has STOPPED DISPATCHING -- check paperclip_routine_dispatch_total and the trigger's nextRunAt. FIRING age low but COMPLETION age high means it dispatches fine and the work then dies or wedges before the execution issue reaches `done`: find the open row with originKind=routine_execution and originId equal to this routine_id and CLOSE IT, rather than re-creating the routine. The ages are only trusted while paperclip_routine_fire_gap_metrics_refresh_success is 1. The routine is still `active` with an enabled schedule trigger, so this is not a deliberate pause. A routine that has never fired reports its age from creation, so a large value on a young routine means it has never worked at all rather than that it stopped."
               runbook_url: "https://github.com/Blockcast/paperclip/blob/master/runbooks/routine-fire-gap.md"
 
   # ── A paused / webhook-only routine has no interval and cannot page. ──────
@@ -251,8 +260,8 @@ tests:
               severity: warning
               routine_id: bridge-watchdog
             exp_annotations:
-              summary: "Paperclip routine bridge-watchdog has not completed a fire in 2x its own cadence"
-              description: "Routine bridge-watchdog last completed a fire 110520s ago, more than 2x the longest gap its own cron schedules (BLO-32638). The age is only trusted while paperclip_routine_fire_gap_metrics_refresh_success is 1. The routine is still `active` with an enabled schedule trigger, so this is not a deliberate pause -- it is either not dispatching, or its fires are dispatching and then dying before the execution issue reaches `done`. Those are different faults with different evidence: check paperclip_routine_dispatch_total for the first, and the routine's recent `routine_runs` rows for the second. A never-fired routine reports its age from creation, so a large value on a young routine means it has never worked at all rather than that it stopped."
+              summary: "Paperclip routine bridge-watchdog has not fired, or not completed a fire, in 2x its own cadence"
+              description: "Routine bridge-watchdog last fired, or last completed a fire, 110520s ago -- more than 2x the longest gap its own cron schedules (BLO-32638, PEN-4647). That value is the WORSE of two ages; read both before triaging.\n\nThe two are paperclip_routine_last_fire_start_age_seconds and paperclip_routine_last_done_fire_age_seconds, both keyed on this routine_id. FIRING age high (both high) means it has STOPPED DISPATCHING -- check paperclip_routine_dispatch_total and the trigger's nextRunAt. FIRING age low but COMPLETION age high means it dispatches fine and the work then dies or wedges before the execution issue reaches `done`: find the open row with originKind=routine_execution and originId equal to this routine_id and CLOSE IT, rather than re-creating the routine. The ages are only trusted while paperclip_routine_fire_gap_metrics_refresh_success is 1. The routine is still `active` with an enabled schedule trigger, so this is not a deliberate pause. A routine that has never fired reports its age from creation, so a large value on a young routine means it has never worked at all rather than that it stopped."
               runbook_url: "https://github.com/Blockcast/paperclip/blob/master/runbooks/routine-fire-gap.md"
 
   # ── One replica's stale snapshot must not bless or suppress the others. ───
@@ -286,8 +295,8 @@ tests:
               severity: warning
               routine_id: bridge-watchdog
             exp_annotations:
-              summary: "Paperclip routine bridge-watchdog has not completed a fire in 2x its own cadence"
-              description: "Routine bridge-watchdog last completed a fire 110520s ago, more than 2x the longest gap its own cron schedules (BLO-32638). The age is only trusted while paperclip_routine_fire_gap_metrics_refresh_success is 1. The routine is still `active` with an enabled schedule trigger, so this is not a deliberate pause -- it is either not dispatching, or its fires are dispatching and then dying before the execution issue reaches `done`. Those are different faults with different evidence: check paperclip_routine_dispatch_total for the first, and the routine's recent `routine_runs` rows for the second. A never-fired routine reports its age from creation, so a large value on a young routine means it has never worked at all rather than that it stopped."
+              summary: "Paperclip routine bridge-watchdog has not fired, or not completed a fire, in 2x its own cadence"
+              description: "Routine bridge-watchdog last fired, or last completed a fire, 110520s ago -- more than 2x the longest gap its own cron schedules (BLO-32638, PEN-4647). That value is the WORSE of two ages; read both before triaging.\n\nThe two are paperclip_routine_last_fire_start_age_seconds and paperclip_routine_last_done_fire_age_seconds, both keyed on this routine_id. FIRING age high (both high) means it has STOPPED DISPATCHING -- check paperclip_routine_dispatch_total and the trigger's nextRunAt. FIRING age low but COMPLETION age high means it dispatches fine and the work then dies or wedges before the execution issue reaches `done`: find the open row with originKind=routine_execution and originId equal to this routine_id and CLOSE IT, rather than re-creating the routine. The ages are only trusted while paperclip_routine_fire_gap_metrics_refresh_success is 1. The routine is still `active` with an enabled schedule trigger, so this is not a deliberate pause. A routine that has never fired reports its age from creation, so a large value on a young routine means it has never worked at all rather than that it stopped."
               runbook_url: "https://github.com/Blockcast/paperclip/blob/master/runbooks/routine-fire-gap.md"
 
   # ── The age-side gate, pinned. A stale replica must not MANUFACTURE a page. ─
@@ -324,3 +333,208 @@ tests:
       - eval_time: 30m
         alertname: PaperclipRoutineFireGap
         exp_alerts: []
+
+  # ── PEN-4647: a late completion must NOT resolve the alert. ───────────────
+  #
+  # THE REGRESSION THIS FIXTURE EXISTS TO HOLD. Until PEN-4647 the rule read
+  # paperclip_routine_last_done_fire_age_seconds ALONE -- time since a fire
+  # reached `done`, not time since one STARTED. A wedged long-open execution
+  # row eats the fires behind it (`skip_if_active` + `skip_missed`), and when
+  # that row finally completes the completion age resets to ~0 and the alert
+  # RESOLVES with no fire having occurred. It failed OPEN, mid-outage.
+  #
+  # Replay of the measured window on routine b3ba3b33 ("CI pipeline health
+  # check", `0 9 * * 1-5`). t=0 is 2026-10-19T09:30:00Z. Both gauge values at
+  # t=0 and both reset magnitudes are what Prometheus actually recorded; the
+  # +60/step ramps between them are not interpolation but what an age gauge
+  # does by construction -- it advances with wall-clock.
+  #
+  #   t=0         2026-10-19T09:30Z  completion age 278.34h (1002037s), firing
+  #   t=26m10s    2026-10-19T09:56Z  PEN-3866 reaches `done`, 11 days open
+  #   t=30m       2026-10-19T10:00Z  completion age RESETS to 222s
+  #   t=24h3m19s  2026-10-20T09:33Z  PEN-3178 reaches `done`, 36 days open
+  #   t=24h10m    2026-10-20T09:40Z  completion age RESETS again, to 401s
+  #   t=47h30m30s 2026-10-21T09:00Z  PEN-4461, the first GENUINE firing since
+  #                                  PEN-3866 was created 2026-10-07T09:00:34Z
+  #
+  # 1038566s at t=0 is exactly 2026-10-19T09:30Z minus that creation instant,
+  # and the firing series reaches 1209600s (14d) at 2026-10-21T09:00Z. Nine
+  # weekday firings were lost in the window (2026-10-08..10-20 inclusive),
+  # enumerated from all 80 of the routine's execution rows.
+  #
+  # Threshold is 2 x 259200s (the Fri->Mon gap `0 9 * * 1-5` schedules). The
+  # completion arm falls ~1000x below it at both resets; the firing arm never
+  # does.
+  - interval: 1m
+    name: "PEN-4647: two late completions do not resolve the alert"
+    input_series:
+      - series: 'paperclip_routine_last_done_fire_age_seconds{routine_id="ci-pipeline-health-check", company_id="penstock", instance="pod-a", job="paperclip-control-plane"}'
+        values: "1002037+60x29 222+60x1449 401+60x1400"
+      - series: 'paperclip_routine_last_fire_start_age_seconds{routine_id="ci-pipeline-health-check", company_id="penstock", instance="pod-a", job="paperclip-control-plane"}'
+        values: "1038566+60x2880"
+      - series: 'paperclip_routine_fire_interval_seconds{routine_id="ci-pipeline-health-check", company_id="penstock", instance="pod-a", job="paperclip-control-plane"}'
+        values: "259200+0x2880"
+      - series: 'paperclip_routine_fire_gap_metrics_refresh_success{instance="pod-a", job="paperclip-control-plane"}'
+        values: "1+0x2880"
+    promql_expr_test:
+      # THE CONTROL. Without it the case below could pass for the wrong reason
+      # -- a rule that never resolves anything also "stays firing". This is the
+      # OLD expression's left-hand side 40m in, i.e. 10m after the first late
+      # completion and past `for: 10m`. 822s against a 518400s threshold: the
+      # pre-PEN-4647 rule did not dip, it went green by three orders of
+      # magnitude, and stayed green across the 10-20 firing too.
+      - expr: 'max by (routine_id, company_id) (paperclip_routine_last_done_fire_age_seconds and on(instance) (paperclip_routine_fire_gap_metrics_refresh_success == 1))'
+        eval_time: 40m
+        exp_samples:
+          - labels: '{routine_id="ci-pipeline-health-check", company_id="penstock"}'
+            value: 822
+      # And the arm that replaces it, at the same instant.
+      - expr: 'max by (routine_id, company_id) ({__name__=~"paperclip_routine_last_(done_fire|fire_start)_age_seconds"} and on(instance) (paperclip_routine_fire_gap_metrics_refresh_success == 1))'
+        eval_time: 40m
+        exp_samples:
+          - labels: '{routine_id="ci-pipeline-health-check", company_id="penstock"}'
+            value: 1040966
+    alert_rule_test:
+      # Mid-outage, before either late completion, past `for: 10m`. Firing.
+      # (t=0 is deliberately not asserted: the alert is PENDING there.)
+      - eval_time: 20m
+        alertname: PaperclipRoutineFireGap
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              routine_id: ci-pipeline-health-check
+              company_id: penstock
+            exp_annotations:
+              summary: "Paperclip routine ci-pipeline-health-check has not fired, or not completed a fire, in 2x its own cadence"
+              description: "Routine ci-pipeline-health-check last fired, or last completed a fire, 1.039766e+06s ago -- more than 2x the longest gap its own cron schedules (BLO-32638, PEN-4647). That value is the WORSE of two ages; read both before triaging.\n\nThe two are paperclip_routine_last_fire_start_age_seconds and paperclip_routine_last_done_fire_age_seconds, both keyed on this routine_id. FIRING age high (both high) means it has STOPPED DISPATCHING -- check paperclip_routine_dispatch_total and the trigger's nextRunAt. FIRING age low but COMPLETION age high means it dispatches fine and the work then dies or wedges before the execution issue reaches `done`: find the open row with originKind=routine_execution and originId equal to this routine_id and CLOSE IT, rather than re-creating the routine. The ages are only trusted while paperclip_routine_fire_gap_metrics_refresh_success is 1. The routine is still `active` with an enabled schedule trigger, so this is not a deliberate pause. A routine that has never fired reports its age from creation, so a large value on a young routine means it has never worked at all rather than that it stopped."
+              runbook_url: "https://github.com/Blockcast/paperclip/blob/master/runbooks/routine-fire-gap.md"
+      # 10m after PEN-3866 completed. The OLD rule is green here; this is the
+      # assertion PEN-4647 turns on.
+      - eval_time: 40m
+        alertname: PaperclipRoutineFireGap
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              routine_id: ci-pipeline-health-check
+              company_id: penstock
+            exp_annotations:
+              summary: "Paperclip routine ci-pipeline-health-check has not fired, or not completed a fire, in 2x its own cadence"
+              description: "Routine ci-pipeline-health-check last fired, or last completed a fire, 1.040966e+06s ago -- more than 2x the longest gap its own cron schedules (BLO-32638, PEN-4647). That value is the WORSE of two ages; read both before triaging.\n\nThe two are paperclip_routine_last_fire_start_age_seconds and paperclip_routine_last_done_fire_age_seconds, both keyed on this routine_id. FIRING age high (both high) means it has STOPPED DISPATCHING -- check paperclip_routine_dispatch_total and the trigger's nextRunAt. FIRING age low but COMPLETION age high means it dispatches fine and the work then dies or wedges before the execution issue reaches `done`: find the open row with originKind=routine_execution and originId equal to this routine_id and CLOSE IT, rather than re-creating the routine. The ages are only trusted while paperclip_routine_fire_gap_metrics_refresh_success is 1. The routine is still `active` with an enabled schedule trigger, so this is not a deliberate pause. A routine that has never fired reports its age from creation, so a large value on a young routine means it has never worked at all rather than that it stopped."
+              runbook_url: "https://github.com/Blockcast/paperclip/blob/master/runbooks/routine-fire-gap.md"
+      # 10m after the SECOND late completion (PEN-3178). Still firing.
+      - eval_time: 24h20m
+        alertname: PaperclipRoutineFireGap
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              routine_id: ci-pipeline-health-check
+              company_id: penstock
+            exp_annotations:
+              summary: "Paperclip routine ci-pipeline-health-check has not fired, or not completed a fire, in 2x its own cadence"
+              description: "Routine ci-pipeline-health-check last fired, or last completed a fire, 1.126166e+06s ago -- more than 2x the longest gap its own cron schedules (BLO-32638, PEN-4647). That value is the WORSE of two ages; read both before triaging.\n\nThe two are paperclip_routine_last_fire_start_age_seconds and paperclip_routine_last_done_fire_age_seconds, both keyed on this routine_id. FIRING age high (both high) means it has STOPPED DISPATCHING -- check paperclip_routine_dispatch_total and the trigger's nextRunAt. FIRING age low but COMPLETION age high means it dispatches fine and the work then dies or wedges before the execution issue reaches `done`: find the open row with originKind=routine_execution and originId equal to this routine_id and CLOSE IT, rather than re-creating the routine. The ages are only trusted while paperclip_routine_fire_gap_metrics_refresh_success is 1. The routine is still `active` with an enabled schedule trigger, so this is not a deliberate pause. A routine that has never fired reports its age from creation, so a large value on a young routine means it has never worked at all rather than that it stopped."
+              runbook_url: "https://github.com/Blockcast/paperclip/blob/master/runbooks/routine-fire-gap.md"
+      # Minutes before PEN-4461, the first genuine firing in 14 days.
+      - eval_time: 47h20m
+        alertname: PaperclipRoutineFireGap
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              routine_id: ci-pipeline-health-check
+              company_id: penstock
+            exp_annotations:
+              summary: "Paperclip routine ci-pipeline-health-check has not fired, or not completed a fire, in 2x its own cadence"
+              description: "Routine ci-pipeline-health-check last fired, or last completed a fire, 1.208966e+06s ago -- more than 2x the longest gap its own cron schedules (BLO-32638, PEN-4647). That value is the WORSE of two ages; read both before triaging.\n\nThe two are paperclip_routine_last_fire_start_age_seconds and paperclip_routine_last_done_fire_age_seconds, both keyed on this routine_id. FIRING age high (both high) means it has STOPPED DISPATCHING -- check paperclip_routine_dispatch_total and the trigger's nextRunAt. FIRING age low but COMPLETION age high means it dispatches fine and the work then dies or wedges before the execution issue reaches `done`: find the open row with originKind=routine_execution and originId equal to this routine_id and CLOSE IT, rather than re-creating the routine. The ages are only trusted while paperclip_routine_fire_gap_metrics_refresh_success is 1. The routine is still `active` with an enabled schedule trigger, so this is not a deliberate pause. A routine that has never fired reports its age from creation, so a large value on a young routine means it has never worked at all rather than that it stopped."
+              runbook_url: "https://github.com/Blockcast/paperclip/blob/master/runbooks/routine-fire-gap.md"
+
+  # ── The alert must still be able to CLEAR. ────────────────────────────────
+  # A check whose red has never been shown to go green is not a check. Once a
+  # genuine fire lands AND completes, both ages reset and this resolves.
+  - interval: 1m
+    name: "PEN-4647: a genuine fire that completes does resolve it"
+    input_series:
+      - series: 'paperclip_routine_last_done_fire_age_seconds{routine_id="ci-pipeline-health-check", company_id="penstock", instance="pod-a", job="paperclip-control-plane"}'
+        values: "1002037+60x29 222+60x90"
+      - series: 'paperclip_routine_last_fire_start_age_seconds{routine_id="ci-pipeline-health-check", company_id="penstock", instance="pod-a", job="paperclip-control-plane"}'
+        values: "1038566+60x29 180+60x90"
+      - series: 'paperclip_routine_fire_interval_seconds{routine_id="ci-pipeline-health-check", company_id="penstock", instance="pod-a", job="paperclip-control-plane"}'
+        values: "259200+0x120"
+      - series: 'paperclip_routine_fire_gap_metrics_refresh_success{instance="pod-a", job="paperclip-control-plane"}'
+        values: "1+0x120"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: PaperclipRoutineFireGap
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              routine_id: ci-pipeline-health-check
+              company_id: penstock
+            exp_annotations:
+              summary: "Paperclip routine ci-pipeline-health-check has not fired, or not completed a fire, in 2x its own cadence"
+              description: "Routine ci-pipeline-health-check last fired, or last completed a fire, 1.039766e+06s ago -- more than 2x the longest gap its own cron schedules (BLO-32638, PEN-4647). That value is the WORSE of two ages; read both before triaging.\n\nThe two are paperclip_routine_last_fire_start_age_seconds and paperclip_routine_last_done_fire_age_seconds, both keyed on this routine_id. FIRING age high (both high) means it has STOPPED DISPATCHING -- check paperclip_routine_dispatch_total and the trigger's nextRunAt. FIRING age low but COMPLETION age high means it dispatches fine and the work then dies or wedges before the execution issue reaches `done`: find the open row with originKind=routine_execution and originId equal to this routine_id and CLOSE IT, rather than re-creating the routine. The ages are only trusted while paperclip_routine_fire_gap_metrics_refresh_success is 1. The routine is still `active` with an enabled schedule trigger, so this is not a deliberate pause. A routine that has never fired reports its age from creation, so a large value on a young routine means it has never worked at all rather than that it stopped."
+              runbook_url: "https://github.com/Blockcast/paperclip/blob/master/runbooks/routine-fire-gap.md"
+      # Both arms reset together -- a real fire that completed. Clear.
+      - eval_time: 1h
+        alertname: PaperclipRoutineFireGap
+        exp_alerts: []
+
+  # ── Back-compat: the legacy metric ALONE behaves exactly as before. ───────
+  # The ordering proof. This chart copy never deploys (prometheusRule.enabled
+  # is false here for the RBAC reason in its header) but the onprem-k8s copy
+  # it mirrors does, and those two repos ship on different cadences. While the
+  # control plane has not yet shipped the firing gauge, the regex matches ONE
+  # series and the expression reduces to the pre-PEN-4647 rule -- no blind
+  # window, nothing to clean up later. Asserted rather than assumed: `or`
+  # would NOT have this property in the other direction, because the
+  # set-operator signature ignores __name__, so `a or b` keeps a and drops b
+  # when both are present.
+  - interval: 1m
+    name: "PEN-4647: legacy metric alone still fires, unchanged"
+    input_series:
+      - series: 'paperclip_routine_last_done_fire_age_seconds{routine_id="ci-pipeline-health-check", company_id="penstock", instance="pod-a", job="paperclip-control-plane"}'
+        values: "600000+60x30"
+      - series: 'paperclip_routine_fire_interval_seconds{routine_id="ci-pipeline-health-check", company_id="penstock", instance="pod-a", job="paperclip-control-plane"}'
+        values: "259200+0x30"
+      - series: 'paperclip_routine_fire_gap_metrics_refresh_success{instance="pod-a", job="paperclip-control-plane"}'
+        values: "1+0x30"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: PaperclipRoutineFireGap
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              routine_id: ci-pipeline-health-check
+              company_id: penstock
+            exp_annotations:
+              summary: "Paperclip routine ci-pipeline-health-check has not fired, or not completed a fire, in 2x its own cadence"
+              description: "Routine ci-pipeline-health-check last fired, or last completed a fire, 601200s ago -- more than 2x the longest gap its own cron schedules (BLO-32638, PEN-4647). That value is the WORSE of two ages; read both before triaging.\n\nThe two are paperclip_routine_last_fire_start_age_seconds and paperclip_routine_last_done_fire_age_seconds, both keyed on this routine_id. FIRING age high (both high) means it has STOPPED DISPATCHING -- check paperclip_routine_dispatch_total and the trigger's nextRunAt. FIRING age low but COMPLETION age high means it dispatches fine and the work then dies or wedges before the execution issue reaches `done`: find the open row with originKind=routine_execution and originId equal to this routine_id and CLOSE IT, rather than re-creating the routine. The ages are only trusted while paperclip_routine_fire_gap_metrics_refresh_success is 1. The routine is still `active` with an enabled schedule trigger, so this is not a deliberate pause. A routine that has never fired reports its age from creation, so a large value on a young routine means it has never worked at all rather than that it stopped."
+              runbook_url: "https://github.com/Blockcast/paperclip/blob/master/runbooks/routine-fire-gap.md"
+
+  # ── The completion arm is NOT redundant and must not be "simplified" away. ─
+  # The opposite fault to PEN-4647: fires dispatch on cadence and then die
+  # before the execution issue reaches `done`. Firing age stays LOW throughout,
+  # so a rule reading firing age alone -- the literal reading of PEN-4647's
+  # candidate fix #1 -- goes silent on it. That is the original BLO-32638
+  # condition, and taking the max is what keeps both covered.
+  - interval: 1m
+    name: "PEN-4647: fires that dispatch but never complete still page"
+    input_series:
+      - series: 'paperclip_routine_last_fire_start_age_seconds{routine_id="ci-pipeline-health-check", company_id="penstock", instance="pod-a", job="paperclip-control-plane"}'
+        values: "300+60x30"
+      - series: 'paperclip_routine_last_done_fire_age_seconds{routine_id="ci-pipeline-health-check", company_id="penstock", instance="pod-a", job="paperclip-control-plane"}'
+        values: "600000+60x30"
+      - series: 'paperclip_routine_fire_interval_seconds{routine_id="ci-pipeline-health-check", company_id="penstock", instance="pod-a", job="paperclip-control-plane"}'
+        values: "259200+0x30"
+      - series: 'paperclip_routine_fire_gap_metrics_refresh_success{instance="pod-a", job="paperclip-control-plane"}'
+        values: "1+0x30"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: PaperclipRoutineFireGap
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              routine_id: ci-pipeline-health-check
+              company_id: penstock
+            exp_annotations:
+              summary: "Paperclip routine ci-pipeline-health-check has not fired, or not completed a fire, in 2x its own cadence"
+              description: "Routine ci-pipeline-health-check last fired, or last completed a fire, 601200s ago -- more than 2x the longest gap its own cron schedules (BLO-32638, PEN-4647). That value is the WORSE of two ages; read both before triaging.\n\nThe two are paperclip_routine_last_fire_start_age_seconds and paperclip_routine_last_done_fire_age_seconds, both keyed on this routine_id. FIRING age high (both high) means it has STOPPED DISPATCHING -- check paperclip_routine_dispatch_total and the trigger's nextRunAt. FIRING age low but COMPLETION age high means it dispatches fine and the work then dies or wedges before the execution issue reaches `done`: find the open row with originKind=routine_execution and originId equal to this routine_id and CLOSE IT, rather than re-creating the routine. The ages are only trusted while paperclip_routine_fire_gap_metrics_refresh_success is 1. The routine is still `active` with an enabled schedule trigger, so this is not a deliberate pause. A routine that has never fired reports its age from creation, so a large value on a young routine means it has never worked at all rather than that it stopped."
+              runbook_url: "https://github.com/Blockcast/paperclip/blob/master/runbooks/routine-fire-gap.md"

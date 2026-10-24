@@ -15,7 +15,9 @@
  * deep enough that a scan would be the obvious alternative.
  *
  * The probe below mirrors the correlated subquery in
- * selectScheduledRoutinesWithLastCompletedFire
+ * selectScheduledRoutinesWithFireReceipts (named
+ * selectScheduledRoutinesWithLastCompletedFire until PEN-4647 gave it a second
+ * probe; this migration still backs only the `completed` one)
  * (server/src/services/routine-fire-gap-metrics.ts, paperclip#2352) by hand,
  * including the LITERAL status (a bind parameter would stop a generic plan
  * from proving the index predicate). Re-check that file when this one

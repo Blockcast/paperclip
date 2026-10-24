@@ -1067,6 +1067,7 @@ export const QUEUED_RUN_AGE_METRICS_REFRESH_SUCCESS_METRIC = "paperclip_queued_r
 // routine: `age > 2 * interval`. A hand-maintained per-routine threshold is
 // the thing that rots silently when a cron is edited.
 export const ROUTINE_LAST_DONE_FIRE_AGE_METRIC = "paperclip_routine_last_done_fire_age_seconds";
+export const ROUTINE_LAST_FIRE_START_AGE_METRIC = "paperclip_routine_last_fire_start_age_seconds";
 export const ROUTINE_FIRE_INTERVAL_METRIC = "paperclip_routine_fire_interval_seconds";
 export const ROUTINE_FIRE_GAP_METRICS_REFRESH_SUCCESS_METRIC = "paperclip_routine_fire_gap_metrics_refresh_success";
 // PEN-3734: age of the oldest *pending* `deferred_issue_execution` wake per
@@ -4208,6 +4209,7 @@ let githubWebhookDelivery: Counter<"event" | "outcome"> | null = null;
 let queuedRunOldestAge: QueuedRunAgeGauge | null = null;
 let queuedRunOldestClaimableAge: QueuedRunAgeGauge | null = null;
 let routineLastDoneFireAge: Gauge<"routine_id"> | null = null;
+let routineLastFireStartAge: Gauge<"routine_id"> | null = null;
 let routineFireInterval: Gauge<"routine_id"> | null = null;
 let routineFireGapMetricsRefreshSuccess: Gauge | null = null;
 let overdueScheduledRetryOldestAge: Gauge<"agent_id"> | null = null;
@@ -4385,6 +4387,7 @@ function ensureRegistry(): {
   queuedRunOldestAgeGauge: QueuedRunAgeGauge;
   queuedRunOldestClaimableAgeGauge: QueuedRunAgeGauge;
   routineLastDoneFireAgeGauge: Gauge<"routine_id">;
+  routineLastFireStartAgeGauge: Gauge<"routine_id">;
   routineFireIntervalGauge: Gauge<"routine_id">;
   routineFireGapMetricsRefreshSuccessGauge: Gauge;
   queuedRunAgeMetricsRefreshSuccessGauge: Gauge;
@@ -4547,6 +4550,7 @@ function ensureRegistry(): {
     || !queuedRunOldestAge
     || !queuedRunOldestClaimableAge
     || !routineLastDoneFireAge
+    || !routineLastFireStartAge
     || !routineFireInterval
     || !routineFireGapMetricsRefreshSuccess
     || !deferredIssueExecutionWakeOldestAge
@@ -5961,6 +5965,33 @@ function ensureRegistry(): {
       labelNames: ["routine_id", "company_id"],
       registers: [registry],
     });
+    routineLastFireStartAge = new Gauge({
+      name: ROUTINE_LAST_FIRE_START_AGE_METRIC,
+      help:
+        "Seconds since the most recent fire of an active, schedule-triggered routine that "
+        + "DISPATCHED ITS OWN execution issue (PEN-4647). Sibling of "
+        + ROUTINE_LAST_DONE_FIRE_AGE_METRIC
+        + ", and the two answer different questions: that one ages a COMPLETION, this one ages a "
+        + "FIRING. They diverge precisely in the failure mode that matters -- a wedged, "
+        + "long-open execution row eats the firings behind it, and when that row finally reaches "
+        + "`done` the completion age RESETS TO ~0 while no new fire has occurred, so an alert "
+        + "reading completion age alone goes green mid-outage. Measured on routine "
+        + "b3ba3b33 (`0 9 * * 1-5`): the completion gauge fell 278.34h -> 0.06h at "
+        + "2026-10-19T10:00Z and 23.56h -> 0.44h at 2026-10-20T10:00Z, neither a firing, while "
+        + "the next real execution row did not land until 2026-10-21T09:00Z. This gauge does not "
+        + "move on either of those. Alert on the MAX of the pair: completion age alone fails open "
+        + "on the wedge, and firing age alone is blind to fires that dispatch and then die before "
+        + "reaching `done`.\n\n"
+        + "A `skipped` or `coalesced` run is NOT a firing for this purpose and does not reset it: "
+        + "both mean the fire stood down behind an already-open row, which is the loss itself. "
+        + "Both nonetheless carry a linked_issue_id (the row they stood down behind), so the age "
+        + "comes off runs that are neither -- see the 0266 partial index. A dispatch that failed "
+        + "before creating its issue carries no link and likewise does not count. A routine that "
+        + "has NEVER dispatched ages from routines.created_at rather than going absent, for the "
+        + "reason on the sibling gauge: absent and `nothing is wrong` render identically.",
+      labelNames: ["routine_id", "company_id"],
+      registers: [registry],
+    });
     routineFireInterval = new Gauge({
       name: ROUTINE_FIRE_INTERVAL_METRIC,
       help:
@@ -6866,6 +6897,7 @@ function ensureRegistry(): {
     queuedRunOldestAgeGauge: queuedRunOldestAge,
     queuedRunOldestClaimableAgeGauge: queuedRunOldestClaimableAge,
     routineLastDoneFireAgeGauge: routineLastDoneFireAge,
+    routineLastFireStartAgeGauge: routineLastFireStartAge,
     routineFireIntervalGauge: routineFireInterval,
     routineFireGapMetricsRefreshSuccessGauge: routineFireGapMetricsRefreshSuccess,
     deferredIssueExecutionWakeOldestAgeGauge: deferredIssueExecutionWakeOldestAge,
@@ -7562,8 +7594,8 @@ export function setQueuedRunAgeMetricsRefreshSuccess(success: boolean): void {
 }
 
 /**
- * Publish the fire-gap pair for every active, schedule-triggered routine
- * (BLO-32638).
+ * Publish the fire-gap gauges for every active, schedule-triggered routine
+ * (BLO-32638; the firing-age member added by PEN-4647).
  *
  * `company_id` rides along (BLO-46511) because the exporter reads the shared
  * multi-tenant database: without it Alertmanager cannot route a routine's
@@ -7579,10 +7611,13 @@ export function setQueuedRunAgeMetricsRefreshSuccess(success: boolean): void {
  * did not, the alert would keep a right-hand side for a routine that is
  * deliberately not firing and page forever on an intentional pause.
  *
- * Both gauges are written from the same `entries` list, so a routine can never
- * have an age without an interval or vice versa -- a half-published pair would
- * make `age > 2 * interval` either silently drop a real routine (no RHS) or
- * compare against another routine's cadence.
+ * All three gauges are written from the same `entries` list and the same
+ * clock, so a routine can never have an age without an interval or vice versa
+ * -- a half-published set would make `age > 2 * interval` either silently drop
+ * a real routine (no RHS) or compare against another routine's cadence. The
+ * two age gauges travel together for the same reason: PEN-4647's rule takes
+ * the MAX of them, and a routine present in one but not the other would have
+ * that max silently fall back to whichever arm happened to be published.
  *
  * `intervalSeconds: null` means "scheduled but no derivable cadence" -- a cron
  * that fires once and never again. That still gets an age series (it is an
@@ -7594,16 +7629,26 @@ export function setRoutineFireGapMetrics(
     routineId: string;
     companyId: string;
     ageSeconds: number;
+    fireStartAgeSeconds: number;
     intervalSeconds: number | null;
   }>,
 ): void {
   const metrics = ensureRegistry();
   metrics.routineLastDoneFireAgeGauge.reset();
+  metrics.routineLastFireStartAgeGauge.reset();
   metrics.routineFireIntervalGauge.reset();
   for (const entry of entries) {
     const ageSeconds = Number.isFinite(entry.ageSeconds) ? Math.max(0, entry.ageSeconds) : 0;
+    // PEN-4647: published from the same `entries` list and the same clock as
+    // the completion age, so the alert's `max()` of the two can never compare
+    // one routine's firing age against another's completion age, and neither
+    // can be present without the other.
+    const fireStartAgeSeconds = Number.isFinite(entry.fireStartAgeSeconds)
+      ? Math.max(0, entry.fireStartAgeSeconds)
+      : 0;
     const labels = { routine_id: entry.routineId, company_id: entry.companyId };
     metrics.routineLastDoneFireAgeGauge.set(labels, ageSeconds);
+    metrics.routineLastFireStartAgeGauge.set(labels, fireStartAgeSeconds);
     if (entry.intervalSeconds !== null && Number.isFinite(entry.intervalSeconds) && entry.intervalSeconds > 0) {
       metrics.routineFireIntervalGauge.set(labels, entry.intervalSeconds);
     }
@@ -9778,6 +9823,7 @@ export function __resetMetricsForTest(): void {
   queuedRunOldestAge = null;
   queuedRunOldestClaimableAge = null;
   routineLastDoneFireAge = null;
+  routineLastFireStartAge = null;
   routineFireInterval = null;
   routineFireGapMetricsRefreshSuccess = null;
   deferredIssueExecutionWakeOldestAge = null;
