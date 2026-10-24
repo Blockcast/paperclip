@@ -60,7 +60,7 @@ export interface ReconcileResult {
   backfilled: string[];
 }
 
-function toWebhookAlert(entry: ActiveApiAlert): AlertmanagerAlert | null {
+export function toWebhookAlert(entry: ActiveApiAlert): AlertmanagerAlert | null {
   if (typeof entry.fingerprint !== "string" || typeof entry.startsAt !== "string") return null;
   if (!entry.labels || typeof entry.labels !== "object") return null;
   return {
