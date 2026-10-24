@@ -113,13 +113,14 @@ describe("runCoverageCheck (BLO-40673 AC4)", () => {
   });
 
   it("reopens an expired operator suppression in-pass instead of flagging it until the next repeat delivery (BLO-48819)", async () => {
-    const opts = {
+    const opts = () => ({
       records: { fp1: record({ pluginClosedAt: null, operatorSuppressedAt: "2026-10-12T18:00:00Z" }) },
       issues: { "issue-1": { id: "issue-1", status: "cancelled" } },
-    };
+    });
     const cfg = { ...config, operatorSuppressionHours: 24 };
-    const ok = harness(opts);
-    const replay = vi.fn(async () => {});
+    const okOpts = opts();
+    const ok = harness(okOpts);
+    const replay = vi.fn(async () => { okOpts.issues["issue-1"].status = "todo"; });
     await runCoverageCheck(ok.ctx, cfg, NOW, async () => [amAlert("fp1")], replay);
     expect(replay).toHaveBeenCalledTimes(1);
     expect((replay.mock.calls[0] as unknown[])[3]).toEqual([expect.objectContaining({ fingerprint: "fp1" })]);
@@ -127,9 +128,15 @@ describe("runCoverageCheck (BLO-40673 AC4)", () => {
     expect(ok.write).toHaveBeenCalledWith("alertmanager.coverage.checked", 1);
 
     // A reopen that did not land is a real gap.
-    const failed = harness(opts);
+    const failed = harness(opts());
     await runCoverageCheck(failed.ctx, cfg, NOW, async () => [amAlert("fp1")], async () => { throw new Error("boom"); });
     expect(uncoveredCalls(failed.write)).toHaveLength(1);
+
+    // So is a replay that returns normally but reopens nothing (label filter,
+    // opt-out, PermanentAlertError): judged by outcome, not by "did not throw".
+    const noop = harness(opts());
+    await runCoverageCheck(noop.ctx, cfg, NOW, async () => [amAlert("fp1")], async () => {});
+    expect(uncoveredCalls(noop.write)).toHaveLength(1);
   });
 
   it("does not replay plugin-closed or missing rows, only expired operator suppressions", async () => {
