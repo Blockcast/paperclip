@@ -130,8 +130,17 @@ const PULL_REQUEST_GATE_PATTERN = /^pr:([a-z0-9._-]+\/[a-z0-9._-]+)#(\d{1,9}):([
  * `heap:`, `argo:`, `cron:`, `insync:` and `deploy:` — all of which the
  * assignee's own poll does resolve, and none of which a human is expected to
  * clear. The fleet census in `listCandidateIssues` observed exactly those six
- * machine prefixes alongside `approval:` and `cto-ruling:`, so the split is
- * drawn from measured tokens rather than guessed at.
+ * machine prefixes alongside `approval:`, `cto-ruling:` and `hold:`, so the
+ * split is drawn from measured tokens rather than guessed at.
+ *
+ * ## What this list still cannot see, stated rather than implied
+ *
+ * A human gate is visible here only when it is written as its own token. A row
+ * declaring nothing but `pr:owner/repo#N:merged`, carrying "needs one human
+ * approval" in `monitorNotes`, is indistinguishable from a row waiting on CI —
+ * PEN-4410 is live in exactly that shape. Those rows keep today's silence,
+ * which is the fail-safe direction, and reaching them means reading the pull
+ * request's own review state rather than lengthening this list.
  *
  * Conservative in the safe direction: a human-gate token this list does not
  * know keeps today's behaviour exactly (silent `unresolvable_signal`), so the
@@ -140,6 +149,9 @@ const PULL_REQUEST_GATE_PATTERN = /^pr:([a-z0-9._-]+\/[a-z0-9._-]+)#(\d{1,9}):([
  */
 const HUMAN_GATE_TOKEN_PREFIXES = [
   "omar-go",
+  // `hold:f35d6c:pr-2655:omar-go` — PEN-2619's live token, and the reason
+  // `parseHumanGateSubject` reads `pr-2655` as well as `#2655`.
+  "hold",
   "hold-lift",
   "hold-lifted",
   "human-go",
@@ -164,24 +176,78 @@ const HUMAN_GATE_TOKEN_PREFIXES = [
 const HUMAN_GATE_TOKEN_ALTERNATION = HUMAN_GATE_TOKEN_PREFIXES.join("|");
 const HUMAN_GATE_TOKEN_PATTERN = new RegExp(`^(${HUMAN_GATE_TOKEN_ALTERNATION})(:.*)?$`);
 
+/**
+ * The pull request a human-gate token names, in the two spellings the fleet
+ * actually writes: `omar-go:#2686` (PEN-4475) and `hold:f35d6c:pr-2655:omar-go`
+ * (PEN-2619). Both say the same thing — *a person must release pull request N*
+ * — and which of the two a row uses is an accident of who armed the monitor.
+ *
+ * This is the join that was missing, and its absence is the whole of the
+ * mis-ordering PEN-4545's review caught: without it the module cannot tell
+ * `omar-go:#2686` sitting beside `pr:owner/repo#2686:merged` (the person gates
+ * *this* pull request, so the wait is live while it is open and over once it
+ * merges) from `omar-go:#2686` beside `pr:owner/repo#1281:merged` (unrelated
+ * artifacts, so the machine half is genuinely outstanding).
+ */
+const HUMAN_GATE_SUBJECT_PATTERN = /(?:^|[:_-])(?:#|pr-|pr#)(\d{1,9})(?=$|[:_-])/g;
+
+/**
+ * Fail closed on anything ambiguous. A token naming two different numbers, or
+ * none, yields `null` and every branch downstream then takes the behaviour it
+ * had before this join existed — silence — rather than guessing which pull
+ * request a person meant.
+ */
+export function parseHumanGateSubject(token: string): number | null {
+  const found = new Set<number>();
+  for (const match of token.matchAll(HUMAN_GATE_SUBJECT_PATTERN)) {
+    const parsed = Number.parseInt(match[1]!, 10);
+    if (Number.isSafeInteger(parsed) && parsed > 0) found.add(parsed);
+  }
+  return found.size === 1 ? [...found][0]! : null;
+}
+
 export type ParsedTerminalGateSignal =
   | { kind: "pull_request"; raw: string; repoFullName: string; prNumber: number; aspect: string }
-  | { kind: "human_gate"; raw: string }
+  | { kind: "human_gate"; raw: string; subjectPullRequestNumber: number | null }
   | { kind: "unresolvable"; raw: string };
 
 export type TerminalGateVerdict =
-  | { kind: "satisfied"; signals: string[]; mergedPullRequests: string[] }
+  | {
+      kind: "satisfied";
+      signals: string[];
+      mergedPullRequests: string[];
+      /**
+       * Human gates discharged by the merge of the very pull request they
+       * named. The hold protocol these tokens encode is "do not merge until
+       * the go arrives", so the merge is itself the evidence the go arrived —
+       * and telling the owner to chase it would be asking for a decision
+       * already made. Named in the comment so the inference is auditable
+       * rather than silent.
+       */
+      dischargedHumanGates: string[];
+    }
   /**
-   * Every machine-checkable gate is satisfied and the only thing left is a
-   * person. Deliberately NOT `satisfied`: the issue's gate is not met, so this
-   * must never suppress oversight or read as "go close this". It exists to be
-   * *announced* — the row's owner is the one party who can escalate the human
-   * gate, and before PEN-4545 nothing told them.
+   * Nothing a re-check could change is outstanding, and what remains is a
+   * person. That covers two shapes, and conflating them was the defect review
+   * caught on #2974:
+   *
+   *   - every declared pull request merged and a human gate still stands; and
+   *   - a declared pull request is *open because a human gate on this same
+   *     issue holds it there* (`heldPullRequests`), which is the live wait in
+   *     the hold-protocol shape and used to resolve to a silent
+   *     `unresolved/pull_request_open`.
+   *
+   * Deliberately NOT `satisfied` in either shape: the issue's gate is not met,
+   * so this must never suppress oversight or read as "go close this". It
+   * exists to be *announced* — the row's owner is the one party who can
+   * escalate the human gate, and before PEN-4545 nothing told them.
    */
   | {
       kind: "human_gate_only";
       signals: string[];
       humanGates: string[];
+      /** Declared pull requests open because a listed human gate holds them. */
+      heldPullRequests: string[];
       mergedPullRequests: string[];
     }
   | { kind: "unresolved"; reason: string; detail?: string };
@@ -216,7 +282,9 @@ export function parseTerminalGateSignal(raw: unknown): ParsedTerminalGateSignal 
     // Classify before giving up. A human-gate token is no more *readable* than
     // any other unparseable one — the difference is that nobody on a timer can
     // ever clear it, which is a different disposition, not a weaker one.
-    if (HUMAN_GATE_TOKEN_PATTERN.test(token)) return { kind: "human_gate", raw: token };
+    if (HUMAN_GATE_TOKEN_PATTERN.test(token)) {
+      return { kind: "human_gate", raw: token, subjectPullRequestNumber: parseHumanGateSubject(token) };
+    }
     return { kind: "unresolvable", raw: token };
   }
   const prNumber = Number.parseInt(match[2]!, 10);
@@ -318,11 +386,11 @@ export async function resolveTerminalGate(input: {
   if (signals.length === 0) return { kind: "unresolved", reason: "no_gate_signals" };
 
   const parsed: Array<Extract<ParsedTerminalGateSignal, { kind: "pull_request" }>> = [];
-  const humanGates: string[] = [];
+  const humanGates: Array<Extract<ParsedTerminalGateSignal, { kind: "human_gate" }>> = [];
   for (const signal of signals) {
     const gate = parseTerminalGateSignal(signal);
     if (gate?.kind === "human_gate") {
-      humanGates.push(gate.raw);
+      humanGates.push(gate);
       continue;
     }
     if (!gate || gate.kind !== "pull_request") {
@@ -335,8 +403,39 @@ export async function resolveTerminalGate(input: {
     parsed.push(gate);
   }
 
+  // Join each human gate to the declared pull request it names. A bare
+  // `#2686` carries no repository, so a number two different repos both
+  // declare is ambiguous; such a gate is left unjoined and every branch below
+  // then behaves exactly as it did before this join existed.
+  const declaredKeysByNumber = new Map<number, Set<string>>();
+  for (const gate of parsed) {
+    const keys = declaredKeysByNumber.get(gate.prNumber) ?? new Set<string>();
+    keys.add(pullRequestKey(gate.repoFullName, gate.prNumber));
+    declaredKeysByNumber.set(gate.prNumber, keys);
+  }
+  /** Human-gate token -> the one declared pull request it unambiguously names. */
+  const subjectKeyByGate = new Map<string, string>();
+  /** The inverse: a declared pull request -> the human gates holding it. */
+  const gatedPullRequestKeys = new Set<string>();
+  for (const gate of humanGates) {
+    if (gate.subjectPullRequestNumber == null) continue;
+    const keys = declaredKeysByNumber.get(gate.subjectPullRequestNumber);
+    if (!keys || keys.size !== 1) continue;
+    const key = [...keys][0]!;
+    subjectKeyByGate.set(gate.raw, key);
+    gatedPullRequestKeys.add(key);
+  }
+
   const cache = input.gateCache ?? new Map<string, PullRequestGateResult>();
   const merged = new Set<string>();
+  /**
+   * Open, and open *because* a human gate on this issue holds it. Collecting
+   * these rather than returning at the first one is the only place this costs
+   * an extra read, and it is bounded to rows that declare a human gate naming
+   * a declared pull request — a row with no human gate still short-circuits on
+   * its first open pull request exactly as before.
+   */
+  const heldOpen = new Set<string>();
   for (const gate of parsed) {
     const key = pullRequestKey(gate.repoFullName, gate.prNumber);
     let result = cache.get(key);
@@ -359,6 +458,19 @@ export async function resolveTerminalGate(input: {
     // Merge is the only satisfied state. `closed` without merge is terminal but
     // the work did not land, so it must not read as "resolved, go close this".
     if (!result.merged) {
+      // An open pull request a declared human gate names is not an outstanding
+      // machine gate — it is the human wait itself, wearing a `pr:` token.
+      // Before this branch that row resolved to `unresolved/pull_request_open`
+      // and was skipped in silence for the entire time it was blocked on a
+      // person, and the notice arrived only after the merge, by which point it
+      // was telling the owner to chase a go that had necessarily already
+      // arrived. A *closed-unmerged* pull request is excluded deliberately:
+      // the work did not land, which is not a thing to announce as "a person
+      // is holding this open".
+      if (result.state !== "closed" && gatedPullRequestKeys.has(key)) {
+        heldOpen.add(key);
+        continue;
+      }
       return {
         kind: "unresolved",
         reason: result.state === "closed" ? "pull_request_closed_unmerged" : "pull_request_open",
@@ -368,24 +480,51 @@ export async function resolveTerminalGate(input: {
     merged.add(key);
   }
 
-  // Reached only when every PR gate merged. A human gate still standing means
-  // the issue is not satisfied — but it is also not *waiting on anything a
-  // re-check could change*, which is the distinction worth announcing.
-  if (humanGates.length > 0) {
+  // Reached when every declared pull request either merged or is held open by
+  // a human gate on this issue. A gate whose named pull request merged is
+  // discharged — under the hold protocol the merge cannot precede the go, so
+  // the merge is the evidence the go arrived. Anything else still stands, and
+  // a standing gate means the issue is not satisfied but is also not *waiting
+  // on anything a re-check could change*, which is the distinction worth
+  // announcing.
+  const standingHumanGates: string[] = [];
+  const dischargedHumanGates: string[] = [];
+  for (const gate of humanGates) {
+    const subjectKey = subjectKeyByGate.get(gate.raw);
+    if (subjectKey && merged.has(subjectKey)) dischargedHumanGates.push(gate.raw);
+    else standingHumanGates.push(gate.raw);
+  }
+
+  // Every held-open pull request is held by some gate, and such a gate is
+  // never discharged, so a non-empty `heldOpen` always lands here.
+  if (standingHumanGates.length > 0) {
     return {
       kind: "human_gate_only",
       signals,
-      humanGates: [...humanGates].sort(),
+      humanGates: standingHumanGates.sort(),
+      heldPullRequests: [...heldOpen].sort(),
       mergedPullRequests: [...merged].sort(),
     };
   }
 
-  return { kind: "satisfied", signals, mergedPullRequests: [...merged].sort() };
+  return {
+    kind: "satisfied",
+    signals,
+    mergedPullRequests: [...merged].sort(),
+    dischargedHumanGates: dischargedHumanGates.sort(),
+  };
 }
 
 export function buildTerminalGateResolvedComment(input: {
   signals: readonly string[];
   mergedPullRequests: readonly string[];
+  /**
+   * Human gates discharged by the merge of the pull request they named. Spelt
+   * out in the comment because it is an *inference* — merge implies the go,
+   * under the hold protocol these tokens encode — and an inference a reader
+   * cannot see is one nobody can check.
+   */
+  dischargedHumanGates?: readonly string[];
   /**
    * The monitor's pending first check, for a row admitted by the never-polled
    * arm (BLO-36289). Non-null means the monitor is **armed** — it has a live
@@ -404,6 +543,7 @@ export function buildTerminalGateResolvedComment(input: {
   const armed = input.armedNextCheckAt != null;
   const prLines = input.mergedPullRequests.map((pr) => `- \`${pr}\` — **merged**`).join("\n");
   const signalLines = input.signals.map((signal) => `\`${signal}\``).join(", ");
+  const discharged = input.dischargedHumanGates ?? [];
   return [
     armed
       ? "**Terminal gate resolved — this issue's gate was already satisfied when its monitor was armed.**"
@@ -415,6 +555,16 @@ export function buildTerminalGateResolvedComment(input: {
     "",
     prLines,
     "",
+    ...(discharged.length > 0
+      ? [
+          "This issue also declared a human gate naming one of those pull requests. A hold of that shape cannot be merged through until the go arrives, so the merge is itself the record that it did — there is nothing left to chase:",
+          "",
+          ...discharged.map(
+            (gate) => `- \`${gate}\` — **discharged** by the merge of the pull request it names`,
+          ),
+          "",
+        ]
+      : []),
     `Declared gate signals: ${signalLines}`,
     "",
     armed
@@ -444,6 +594,14 @@ export function buildTerminalGateResolvedComment(input: {
 export function buildTerminalGateHumanOnlyComment(input: {
   signals: readonly string[];
   humanGates: readonly string[];
+  /**
+   * Declared pull requests that are open *because* one of `humanGates` holds
+   * them there. This is the live wait in the hold-protocol shape, and the
+   * notice has to read differently for it: the go has not arrived, so chasing
+   * it is exactly right — whereas the same words after the merge were telling
+   * the owner to chase a decision already made.
+   */
+  heldPullRequests?: readonly string[];
   mergedPullRequests: readonly string[];
   /** See `buildTerminalGateResolvedComment` — same armed/stranded distinction, same reason. */
   armedNextCheckAt?: Date | null;
@@ -451,20 +609,40 @@ export function buildTerminalGateHumanOnlyComment(input: {
   const armed = input.armedNextCheckAt != null;
   const humanLines = input.humanGates.map((gate) => `- \`${gate}\` — **waiting on a person**`);
   const prLines = input.mergedPullRequests.map((pr) => `- \`${pr}\` — merged`);
+  const held = input.heldPullRequests ?? [];
+  const heldLines = held.map((pr) => `- \`${pr}\` — **open, and held open by the gate below**`);
   // With no PR gates declared, "every machine-checkable gate is satisfied" is
   // vacuously true and reads as a claim about landed work that nothing here
   // checked. Say what was actually established instead: the declared gate is
   // a person, start to finish.
   const anyMachineGate = prLines.length > 0;
+  const anyHeld = heldLines.length > 0;
   return [
-    anyMachineGate
-      ? "**Human gate — every machine-checkable gate on this issue is satisfied; what is left is a person.**"
-      : "**Human gate — every gate this issue declares names a person. Nothing here is machine-checkable.**",
+    anyHeld
+      ? "**Human gate — a pull request this issue declares is open because a person has not released it. That wait is the whole of the gate.**"
+      : anyMachineGate
+        ? "**Human gate — every machine-checkable gate on this issue is satisfied; what is left is a person.**"
+        : "**Human gate — every gate this issue declares names a person. Nothing here is machine-checkable.**",
     "",
-    ...(anyMachineGate
-      ? ["A board-side re-read finds the declared pull-request gates already satisfied:", "", ...prLines, ""]
+    ...(anyHeld
+      ? [
+          "A board-side re-read finds these declared pull requests still open — not because work or CI is outstanding, but because a human gate declared on this same issue names them:",
+          "",
+          ...heldLines,
+          "",
+        ]
       : []),
-    anyMachineGate
+    ...(anyMachineGate
+      ? [
+          anyHeld
+            ? "The other declared pull-request gates are already satisfied:"
+            : "A board-side re-read finds the declared pull-request gates already satisfied:",
+          "",
+          ...prLines,
+          "",
+        ]
+      : []),
+    anyMachineGate || anyHeld
       ? "The remaining declared gates name a human decision, which nothing on a timer can clear:"
       : "The declared gates name a human decision, which nothing on a timer can clear:",
     "",
@@ -476,7 +654,9 @@ export function buildTerminalGateHumanOnlyComment(input: {
       ? `The monitor is armed and its next check is due \`${input.armedNextCheckAt!.toISOString()}\`. That check will return this same answer: polling cannot move a human gate, and three unchanged re-checks converge to a stall (BLO-18294). **The monitor still gives this issue a live wake path — do not treat it as stranded and do not repair it as one** — but the wake has no gate left to read.`
       : "The monitor has stopped re-checking (converged to a stall, was cleared, or its run was killed). Nothing is scheduled to look at this issue again, and the gate it stopped on is one no re-check could ever have cleared.",
     "",
-    anyMachineGate
+    anyHeld
+      ? "**This is not a resolution and nothing here closes the issue.** It is the notice that the pull request is waiting on a person and nothing else, which is the one thing an armed monitor makes invisible: the row reads as attended on every dashboard while no mechanism on the owner's side can answer. Escalate the ask — extend a pending approval card, record a named owner and the exact action on the row, or accept the row as frozen and stop re-checking — rather than re-arming against the same gate. Once the named pull request merges this gate is discharged, and no further notice will ask you to chase it."
+      : anyMachineGate
       ? "**This is not a resolution and nothing here closes the issue.** It is the notice that the wait is now entirely on a named human, which is the one thing an armed monitor makes invisible: the row reads as attended on every dashboard while no mechanism on the owner's side can answer. Escalate the ask — extend a pending approval card, record a named owner and the exact action on the row, or accept the row as frozen and stop re-checking — rather than re-arming against the same gate."
       : "**This is not a resolution, says nothing about whether the work is finished, and nothing here closes the issue.** No pull-request gate was declared, so this notice is only about the gate: it is one a person must clear, which is the thing an armed monitor makes invisible — the row reads as attended on every dashboard while no mechanism on the owner's side can answer. Escalate the ask — extend a pending approval card, record a named owner and the exact action on the row, or accept the row as frozen and stop re-checking — rather than re-arming against the same gate.",
     "",
@@ -997,12 +1177,14 @@ export async function reconcileTerminalGates(
           ? buildTerminalGateHumanOnlyComment({
               signals: verdict.signals,
               humanGates: verdict.humanGates,
+              heldPullRequests: verdict.heldPullRequests,
               mergedPullRequests: verdict.mergedPullRequests,
               armedNextCheckAt,
             })
           : buildTerminalGateResolvedComment({
               signals: verdict.signals,
               mergedPullRequests: verdict.mergedPullRequests,
+              dischargedHumanGates: verdict.dischargedHumanGates,
               armedNextCheckAt,
             }),
       })
