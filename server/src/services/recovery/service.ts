@@ -136,6 +136,7 @@ import {
   parseIssueGraphLivenessIncidentKey,
 } from "./origins.js";
 import { postRoutineSchedulerFailureHeartbeat } from "./routine-scheduler-heartbeat.js";
+import { coldInReviewGaugeEntries } from "./cold-in-review-gauge.js";
 import {
   PENDING_INTERACTION_MAX_AGE_MS,
   classifyIssueGraphLiveness,
