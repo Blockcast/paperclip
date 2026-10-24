@@ -36,7 +36,6 @@ import {
   refreshDeferredIssueExecutionWakeAgeMetrics,
   refreshOverdueScheduledRetryAgeMetrics,
   refreshQueuedRunAgeMetrics,
-  refreshColdInReviewIssueMetrics,
   refreshScheduledRetryParkHorizonMetrics,
 } from "./queued-run-age-metrics.js";
 import { refreshRoutineFireGapMetrics } from "./routine-fire-gap-metrics.js";
@@ -44,7 +43,6 @@ import {
   setAgentStartLockHeldMetrics,
   setAcceptedInteractionOutcomeMetricsRefreshSuccess,
   setApprovalQueueMetricsRefreshSuccess,
-  setColdInReviewIssueMetricsRefreshSuccess,
   setDbPoolStats,
   setDeferredIssueExecutionWakeAgeMetricsRefreshSuccess,
   setExternalRuntimeReservationStrandMetricsRefreshSuccess,
@@ -136,15 +134,6 @@ const REFRESHES: readonly ScrapeRefresh[] = [
     name: "scheduled-retry-park-horizon",
     run: (db) => refreshScheduledRetryParkHorizonMetrics(db),
     setFresh: setScheduledRetryParkHorizonRefreshSuccess,
-  },
-  {
-    // PEN-4545. Not a run-table refresh: it ages an `issues` row that has no
-    // run, no wake and no park by definition, so every refresh above is
-    // structurally blind to it. A cold `in_review` row reads identically to a
-    // healthy one under review without it.
-    name: "cold-in-review-issues",
-    run: (db) => refreshColdInReviewIssueMetrics(db),
-    setFresh: setColdInReviewIssueMetricsRefreshSuccess,
   },
   {
     // BLO-32638. Not a run-table refresh: the receipt it ages is a `done`
