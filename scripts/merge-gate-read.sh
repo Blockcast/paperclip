@@ -147,11 +147,37 @@ gated_lanes() { # stdin: run rows; $1 = head sha, $2 non-empty = repo is gated
   # 9 of 15 merged onprem-k8s PRs, including #6319 @ 5d11d645 with 14 green
   # dispatched runs. Existence only: those runs' own check-runs (and their
   # NO-VERDICT rows) already carry the verdict through verdicts().
-  # No exemption for "the dispatcher legitimately dispatched nothing": none has
-  # been measured. Fails closed — a false STOP costs a wait.
+  # BLO-48830: "the dispatcher legitimately dispatched nothing" is real
+  # (Network-Operator-Portal#1450 @ 82913582, docs-only: `Scheduled: none`), and
+  # absence of runs cannot tell it from "never fired". $3 is the POSITIVE
+  # witness from empty_witness(); without it this still fails closed.
   [ -n "${2:-}" ] || return 0
+  [ -z "${3:-}" ] || return 0
   awk -F'\t' -v h="$1" '$2 == "workflow_dispatch" && $9 ~ ("^CI PR #[0-9]+ @" h "$") { found = 1 }
     END { if (!found) printf "STOP\t<approval-gated CI lanes: no dispatched CI PR run at this head>\tABSENT\trun=-\n" }'
+}
+
+empty_witness() { # stdin: commit statuses LIST pages + check-runs pages -> "1" or nothing
+  # BLO-48830. pr-ci-dispatch (`post-status: "true"`) posts `ci/dispatched-lanes`
+  # = success "(base <ref>) no dispatched lane applies to this head" when it
+  # selects no lane. Accepted only when the ACTIONS app wrote it: a session
+  # writes as allyblockcast[bot] (290875700) or its User seat, never as
+  # github-actions[bot] (41898282) / app `github-actions` — the same identity
+  # fence as the shim's review/ally-* guard. Newest Actions-written entry per
+  # surface wins, so a later pending/failure re-judge withdraws the witness.
+  # Residual: any workflow in the repo holding statuses/checks write can still
+  # write as the Actions app.
+  # Only the EMPTY wording counts: "N lane(s) passed" means runs exist, and
+  # those are judged by the title match and by verdicts(), not by this.
+  # Status LIST endpoint, not the combined one: combined drops `creator`.
+  jq -rs --arg p "no dispatched lane applies to this head" '
+    ([.[]|arrays|.[]|select(type=="object" and .context=="ci/dispatched-lanes"
+                             and .creator.id==41898282)]|max_by(.id)) as $s
+    | ([.[]|objects|.check_runs[]?|select(.name=="ci/dispatched-lanes"
+                                          and .app.slug=="github-actions")]|max_by(.id)) as $c
+    | if ($s.state=="success" and (($s.description // "")|contains($p)))
+         or ($c.conclusion=="success" and (($c.output.title // "")|contains($p)))
+      then "1" else empty end' 2>/dev/null
 }
 
 pending_runs() { # stdin: run rows -> stdout: pend rows for runs owing a verdict
@@ -743,7 +769,8 @@ if [ "${1:-}" = "--extract" ]; then extract; exit 0; fi
 if [ "${1:-}" = "--status-extract" ]; then status_extract; exit 0; fi
 if [ "${1:-}" = "--witness-extract" ]; then witness_extract; exit 0; fi
 if [ "${1:-}" = "--runs-extract" ]; then run_extract; exit 0; fi
-if [ "${1:-}" = "--gated" ]; then gated_lanes "${2:-}" "${3:-}"; exit 0; fi
+if [ "${1:-}" = "--gated" ]; then gated_lanes "${2:-}" "${3:-}" "${4:-}"; exit 0; fi
+if [ "${1:-}" = "--empty-witness" ]; then empty_witness; exit 0; fi
 if [ "${1:-}" = "--sha-guard" ]; then require_sha "${2:-}"; exit $?; fi
 
 R="$1"
@@ -808,9 +835,16 @@ PENDING=$(printf '%s\n' "$RUNS" | pending_runs)
 # status fetch silently drops the 31st context onward — and a dropped `failure`
 # prints no STOP. The ABSENT guard cannot catch it: `$4!="status"` excludes
 # status rows from the survivor count, so one surviving check-run keeps the guard quiet.
+CHECKS=$(gh api "repos/$R/commits/$H/check-runs?per_page=100" --paginate)
 { printf '%s' "$STATUSES" | status_extract
-  gh api "repos/$R/commits/$H/check-runs?per_page=100" --paginate | extract
+  printf '%s' "$CHECKS" | extract
 } | verdicts "$DEAD" "$PENDING" "$WDEAD"
 rc=$?
-printf '%s\n' "$RUNS" | gated_lanes "$H" "$GATED"
+# BLO-48830: the status LIST (it carries `creator`) costs a call, so only on a
+# gated head whose combined status names the context at all.
+SLIST='[]'
+[ -n "$GATED" ] && printf '%s' "$STATUSES" | grep -q '"ci/dispatched-lanes"' \
+  && SLIST=$(gh api "repos/$R/commits/$H/statuses?per_page=100" --paginate)
+EMPTY=$(printf '%s\n%s\n' "$SLIST" "$CHECKS" | empty_witness)
+printf '%s\n' "$RUNS" | gated_lanes "$H" "$GATED" "$EMPTY"
 exit $rc

@@ -93,13 +93,19 @@ function pending(runs) {
 }
 
 /** BLO-47984: the approval-gated-lanes check over run rows at `head`. */
-function gated(runs, head, isGated) {
+function gated(runs, head, isGated, witness = "") {
   const stdin = runs.map((r) => r.join("\t")).join("\n") + "\n";
-  const out = execFileSync("bash", [READER, "--gated", head, isGated ? "1" : ""], {
+  const out = execFileSync("bash", [READER, "--gated", head, isGated ? "1" : "", witness], {
     input: stdin,
     encoding: "utf8",
   });
   return out.split("\n").filter(Boolean);
+}
+
+/** BLO-48830: the empty-dispatch witness over status-list + check-runs pages. */
+function emptyWitness(pages) {
+  const stdin = pages.map((p) => JSON.stringify(p)).join("\n") + "\n";
+  return execFileSync("bash", [READER, "--empty-witness"], { input: stdin, encoding: "utf8" }).trim();
 }
 
 /** Validate a candidate head sha. Returns { rc, out }. */
@@ -1811,7 +1817,7 @@ describe("merge-gate reader", () => {
       const fetches = SOURCE.split("\n").filter(
         (l) => l.includes('gh api "repos/') && !isSingle(l),
       );
-      assert.equal(fetches.length, 3, `unguarded fetch added? got ${JSON.stringify(fetches)}`);
+      assert.equal(fetches.length, 4, `unguarded fetch added? got ${JSON.stringify(fetches)}`);
       // The collector matches `gh api "repos/` on ONE line, so a fetch written
       // `gh api "$url"` or split across a continuation is collected by NEITHER
       // line: the count above stays 3 and this test passes while that fetch goes
@@ -1968,7 +1974,76 @@ describe("merge-gate reader", () => {
     // require_sha check does: a deleted call would leave every fixture green.
     it("wires the probe and the guard into the live path", () => {
       assert.match(SOURCE, /contents\/\.github\/workflows\/dispatch-approved-pr-ci\.yml/);
-      assert.match(SOURCE, /^printf '%s\\n' "\$RUNS" \| gated_lanes "\$H" "\$GATED"$/m);
+      assert.match(SOURCE, /^printf '%s\\n' "\$RUNS" \| gated_lanes "\$H" "\$GATED" "\$EMPTY"$/m);
+      assert.match(SOURCE, /^EMPTY=\$\(printf .*\| empty_witness\)$/m);
+    });
+
+    // BLO-48830. Network-Operator-Portal#1450 @ 82913582 is docs-only: the
+    // dispatcher ran, logged `Scheduled: none`, and dispatched no CI PR run, so
+    // the title match alone STOPs forever. pr-ci-dispatch's own empty verdict
+    // is the positive witness, but only from the Actions app.
+    const EMPTY_DESC = "(base main) no dispatched lane applies to this head";
+    const ACTIONS = { login: "github-actions[bot]", id: 41898282, type: "Bot" };
+    const ALLY_APP = { login: "allyblockcast[bot]", id: 290875700, type: "Bot" };
+    const st = (id, state, description, creator = ACTIONS, context = "ci/dispatched-lanes") =>
+      ({ id, context, state, description, creator });
+    const cr = (id, conclusion, title, slug = "github-actions", status = "completed") =>
+      ({ check_runs: [{ id, name: "ci/dispatched-lanes", status, conclusion, output: { title }, app: { slug } }] });
+    const H1450 = "829135824992ab12fb60e6d0406fa9acb7236aec";
+    const nop = [
+      "3", "pull_request", "40048568051", "success", "2026-10-24T18:00:00Z", "completed",
+      "Migrations Append-Only Gate", "2026-10-24T18:01:00Z",
+      "docs(adr): accept ADR-0007 and record the commitment-row consumer",
+    ];
+
+    it("proceeds on a docs-only head the dispatcher witnessed as empty (NOP#1450)", () => {
+      const w = emptyWitness([[st(2, "success", EMPTY_DESC)], { check_runs: [] }]);
+      assert.equal(w, "1");
+      assert.deepEqual(gated([nop], H1450, true, w), []);
+    });
+
+    it("accepts the check-run form (onprem-k8s report: check-run)", () => {
+      assert.equal(emptyWitness([[], cr(5, "success", EMPTY_DESC)]), "1");
+    });
+
+    it("still stops at #6335: no witness, no dispatched run", () => {
+      const w = emptyWitness([[], { check_runs: [] }]);
+      assert.equal(w, "");
+      assert.equal(stops(gated([review(H6335, 6335)], H6335, true, w)).length, 1);
+    });
+
+    it("rejects a session-written status or check-run", () => {
+      const w = emptyWitness([[st(9, "success", EMPTY_DESC, ALLY_APP)], cr(9, "success", EMPTY_DESC, "allyblockcast")]);
+      assert.equal(w, "");
+      assert.equal(stops(gated([nop], H1450, true, w)).length, 1);
+    });
+
+    it("lets a newer Actions re-judge withdraw the witness", () => {
+      assert.equal(emptyWitness([[st(7, "pending", "waiting: ci=not dispatched"), st(2, "success", EMPTY_DESC)]]), "");
+      assert.equal(emptyWitness([[], { check_runs: [
+        { id: 8, name: "ci/dispatched-lanes", status: "in_progress", conclusion: null, output: { title: "waiting" }, app: { slug: "github-actions" } },
+        { id: 3, name: "ci/dispatched-lanes", status: "completed", conclusion: "success", output: { title: EMPTY_DESC }, app: { slug: "github-actions" } },
+      ] }]), "");
+    });
+
+    it("ignores a session entry newer than the Actions witness", () => {
+      assert.equal(emptyWitness([[st(9, "failure", "forged", ALLY_APP), st(2, "success", EMPTY_DESC)]]), "1");
+    });
+
+    it("counts only the empty wording, the right context, and success", () => {
+      assert.equal(emptyWitness([[st(2, "success", "(base main) 3 dispatched lane(s) passed at this head")]]), "");
+      assert.equal(emptyWitness([[st(2, "success", EMPTY_DESC, ACTIONS, "ci/web-lanes")]]), "");
+      assert.equal(emptyWitness([[st(2, "failure", EMPTY_DESC)]]), "");
+      assert.equal(emptyWitness([[], cr(5, "failure", EMPTY_DESC)]), "");
+      assert.equal(emptyWitness([[], cr(5, "success", "(base main) 3 dispatched lane(s) passed at this head")]), "");
+      const renamed = cr(5, "success", EMPTY_DESC);
+      renamed.check_runs[0].name = "ci/web-lanes";
+      assert.equal(emptyWitness([[], renamed]), "");
+    });
+
+    it("fails closed on an API error body or garbage", () => {
+      assert.equal(emptyWitness([{ message: "API rate limit exceeded", status: "403" }]), "");
+      assert.equal(execFileSync("bash", [READER, "--empty-witness"], { input: "not json\n", encoding: "utf8" }), "");
     });
   });
 });
