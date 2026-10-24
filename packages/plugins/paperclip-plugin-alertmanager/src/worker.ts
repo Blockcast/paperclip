@@ -94,8 +94,14 @@ export const plugin = definePlugin({
         );
       }
       const result = await reconcileActiveAlerts(ctx, config);
+      // info, not debug: a disabled reconciler otherwise reads as "job completed
+      // successfully" every 5 min, indistinguishable from a working one (BLO-44820).
       if (result.skipped) {
-        ctx.logger.debug(`paperclip-plugin-alertmanager: alert reconcile skipped: ${result.skipped}`);
+        ctx.logger.info(`paperclip-plugin-alertmanager: alert reconcile skipped: ${result.skipped}`);
+      } else {
+        ctx.logger.info(
+          `paperclip-plugin-alertmanager: alert reconcile routed=${result.routed} backfilled=${result.backfilled.length}`,
+        );
       }
     });
     ctx.logger.info("paperclip-plugin-alertmanager started");
