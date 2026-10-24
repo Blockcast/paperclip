@@ -1145,8 +1145,11 @@ export const DEFERRED_ISSUE_EXECUTION_WAKE_AGE_METRICS_REFRESH_SUCCESS_METRIC =
 // file: it is published from `reconcileIssueGraphLiveness` where the classifier
 // verdicts already exist, so it lives on the WORKERS tier only, and refreshes
 // once per recovery CHAIN rather than once per 30s tick -- a chain routinely
-// outlives one interval. Scope any query to `service="paperclip-workers"`, and
-// do not size a `for:` off the tick interval.
+// outlives one interval. Scope any query to `service="paperclip-workers"` -- but
+// that selector is necessary, not sufficient: the chain is single-leader WITHIN
+// that tier, so every non-leader worker replica also sits at a permanent 0.
+// Aggregate across replicas (`max by (service) (...)`) rather than alerting
+// per-replica, and do not size a `for:` off the tick interval.
 export const COLD_IN_REVIEW_ISSUE_OLDEST_AGE_METRIC =
   "paperclip_cold_in_review_issue_oldest_age_seconds";
 export const COLD_IN_REVIEW_ISSUE_METRICS_REFRESH_SUCCESS_METRIC =
@@ -6188,13 +6191,25 @@ function ensureRegistry(): {
         + "could not be read, so a stale cold-row age cannot be read as fresh (PEN-4652). "
         + "Note this tracks the heartbeat recovery chain, NOT the scrape-metrics collector "
         + "that carries the other refresh-success gauges in this file -- it can be 1 while "
-        + "every one of those is 0, and the reverse. ⚠ ANY ALERT OVER THIS SERIES MUST "
-        + "CARRY service=\"paperclip-workers\". The recovery chain runs on the workers "
-        + "tier alone, but the registry is constructed on every tier and seeds this gauge "
-        + "to 0, so an api replica exports a PERMANENT 0 that it will never refresh. A "
-        + "bare `== 0` rule therefore pages forever against replicas that are behaving "
-        + "correctly -- the same shape as the pre-seeded backstop counters documented "
-        + "above.",
+        + "every one of those is 0, and the reverse. ⚠ A service=\"paperclip-workers\" "
+        + "selector is NECESSARY BUT NOT SUFFICIENT on this series, and an alert that "
+        + "stops there still pages forever. Two things make a replica read a permanent "
+        + "0. First the tier: the registry is constructed everywhere and seeds this "
+        + "gauge to 0, but only the workers tier runs the recovery chain, so every api "
+        + "replica exports a 0 it will never refresh. Second, and the one the selector "
+        + "does NOT cover: the chain is a SINGLE-LEADER process within the workers tier "
+        + "too, so at any instant exactly one worker replica refreshes this gauge and "
+        + "every other worker replica is also sitting at a permanent 0 while behaving "
+        + "correctly. Measured 2026-10-24 against live Prometheus: "
+        + "paperclip_heartbeat_recovery_chain_duration_seconds read 645s on "
+        + "`paperclip-1` and 0 on `paperclip-0` -- both workers -- having been the "
+        + "other way round before leadership moved at ~07:30Z, while both "
+        + "`paperclip-api-*` replicas held 0 throughout. So the predicate must "
+        + "AGGREGATE ACROSS REPLICAS and ask whether NO worker refreshed, e.g. `max by "
+        + "(service) (<series>{service=\"paperclip-workers\"}) == 0`; any per-replica "
+        + "`== 0`, scoped or not, fires on the standby. Same shape as the pre-seeded "
+        + "backstop counters documented above, which were likewise measured on one "
+        + "worker replica alone.",
       registers: [registry],
     });
     coldInReviewIssueMetricsRefreshSuccess.set(0);
