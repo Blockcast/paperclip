@@ -1,11 +1,11 @@
-import type { PluginContext } from "@paperclipai/plugin-sdk";
+import type { PluginContext, PluginWebhookInput } from "@paperclipai/plugin-sdk";
 import { aggregateKeyForAlert } from "./aggregate-key.js";
-import { alertStateRef } from "./constants.js";
+import { alertStateRef, WEBHOOK_KEYS } from "./constants.js";
 import { resolveAlertmanagerApiUrl } from "./escalation.js";
 import { isTerminalSeverity } from "./issue-mapping.js";
-import { routedTo } from "./reconcile.js";
+import { routedTo, toWebhookAlert } from "./reconcile.js";
 import type { AlertmanagerAlert, AlertmanagerPluginConfig, AlertStateRecord } from "./types.js";
-import { decideRefire, findActiveAggregateIssue } from "./webhook-handler.js";
+import { decideRefire, findActiveAggregateIssue, handleWebhook } from "./webhook-handler.js";
 
 /**
  * BLO-40673 AC4 — "an Alertmanager alert is active and nothing open tracks it"
@@ -26,6 +26,13 @@ import { decideRefire, findActiveAggregateIssue } from "./webhook-handler.js";
  * webhook uses, so this check and the re-fire path cannot disagree about
  * whether a closed row ought to be open: an operator close inside its
  * suppression window is exempt; `reopen` / `issue_missing` is the gap.
+ *
+ * BLO-48819 — an operator close whose suppression window has expired is not
+ * reported straight away: the webhook would reopen it, but only on its next
+ * delivery, which for an already-firing alert is one `repeat_interval` (1h)
+ * away. That gap paged critical on its own. The pass instead hands the alert to
+ * the webhook path itself, so the reopen happens now; only a replay that fails
+ * counts as uncovered.
  *
  * Known limit: an operator-closed row whose state record carries no
  * suppression anchor stays exempt, because `decideRefire` says so. That is the
@@ -52,7 +59,7 @@ export const IN_FLIGHT_GRACE_MS = 6 * 60_000; // ponytail: hard-coded to the AM 
 /** `/api/v2/alerts` shape: `status` is an object there, not the webhook's string. */
 type AmAlert = Omit<AlertmanagerAlert, "status"> & { status?: { state?: string }; receivers?: unknown };
 
-export type CoverageVerdict = "covered" | "exempt" | "uncovered";
+export type CoverageVerdict = "covered" | "exempt" | "uncovered" | "reopen";
 
 export async function classifyAlertCoverage(
   ctx: PluginContext,
@@ -78,7 +85,8 @@ export async function classifyAlertCoverage(
   const aggregateKey = record.aggregateKey ?? aggregateKeyForAlert({ ...alert, annotations: alert.annotations ?? {}, status: "firing" });
   if (await findActiveAggregateIssue(ctx, companyId, aggregateKey)) return "covered";
   const decision = decideRefire(issue, record, config, now.getTime());
-  return decision.kind === "suppressed" ? "exempt" : "uncovered";
+  if (decision.kind === "suppressed") return "exempt";
+  return decision.kind === "reopen" && decision.reason === "suppression_expired" ? "reopen" : "uncovered";
 }
 
 /**
@@ -115,11 +123,26 @@ async function readActiveAlerts(config: AlertmanagerPluginConfig, logger: Plugin
   }
 }
 
+/** Deliver alerts through the webhook path, exactly as the reconcile backfill does. */
+async function replayAsDelivery(ctx: PluginContext, config: AlertmanagerPluginConfig, companyId: string, alerts: AmAlert[]): Promise<void> {
+  await handleWebhook(ctx, config, true, {
+    endpointKey: WEBHOOK_KEYS.alertmanager,
+    companyId,
+    parsedBody: {
+      version: "4",
+      status: "firing",
+      receiver: "paperclip-plugin-alertmanager/coverage",
+      alerts: alerts.map((a) => toWebhookAlert(a as Parameters<typeof toWebhookAlert>[0])).filter((a) => a !== null),
+    },
+  } as unknown as PluginWebhookInput);
+}
+
 export async function runCoverageCheck(
   ctx: PluginContext,
   config: AlertmanagerPluginConfig,
   now = new Date(),
   readAlerts: typeof readActiveAlerts = readActiveAlerts,
+  replay: typeof replayAsDelivery = replayAsDelivery,
 ): Promise<void> {
   const companyId = config.defaultCompanyId;
   if (!companyId || now.getUTCMinutes() % COVERAGE_CHECK_EVERY_MINUTES !== 0) return;
@@ -128,6 +151,16 @@ export async function runCoverageCheck(
   // Keyed on alertname AND severity: one rule with severity tiers must not
   // file its critical count under whichever tier was seen first.
   const uncovered = new Map<string, { alertname: string; severity: string; count: number }>();
+  const toReopen: AmAlert[] = [];
+  const flag = (alert: AmAlert) => {
+    const alertname = alert.labels.alertname ?? "UnnamedAlert";
+    const severity = alert.labels.severity ?? "";
+    const key = JSON.stringify([alertname, severity]);
+    const entry = uncovered.get(key) ?? { alertname, severity, count: 0 };
+    entry.count += 1;
+    uncovered.set(key, entry);
+    ctx.logger.warn(`alert-coverage: ${alertname} (${alert.fingerprint}) is active with no open tracking row`);
+  };
   for (const alert of alerts) {
     let verdict: CoverageVerdict;
     try {
@@ -137,14 +170,18 @@ export async function runCoverageCheck(
       ctx.logger.warn(`alert-coverage: could not classify ${alert.fingerprint}, skipping this pass: ${String(err)}`);
       return;
     }
-    if (verdict !== "uncovered") continue;
-    const alertname = alert.labels.alertname ?? "UnnamedAlert";
-    const severity = alert.labels.severity ?? "";
-    const key = JSON.stringify([alertname, severity]);
-    const entry = uncovered.get(key) ?? { alertname, severity, count: 0 };
-    entry.count += 1;
-    uncovered.set(key, entry);
-    ctx.logger.warn(`alert-coverage: ${alertname} (${alert.fingerprint}) is active with no open tracking row`);
+    if (verdict === "reopen") toReopen.push(alert);
+    else if (verdict === "uncovered") flag(alert);
+  }
+  if (toReopen.length > 0) {
+    try {
+      await replay(ctx, config, companyId, toReopen);
+      ctx.logger.info(`alert-coverage: reopened ${toReopen.length} row(s) whose operator suppression expired`);
+    } catch (err) {
+      // The reopen did not land, so the gap is real: report it.
+      ctx.logger.warn(`alert-coverage: suppression-expiry reopen failed: ${String(err)}`);
+      toReopen.forEach(flag);
+    }
   }
   for (const { alertname, severity, count } of uncovered.values()) {
     await ctx.metrics.write("alertmanager.coverage.uncovered", count, { alertname, severity });

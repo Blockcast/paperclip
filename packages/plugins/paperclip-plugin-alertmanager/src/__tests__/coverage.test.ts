@@ -112,6 +112,37 @@ describe("runCoverageCheck (BLO-40673 AC4)", () => {
     expect(write).toHaveBeenCalledWith("alertmanager.coverage.checked", 1);
   });
 
+  it("reopens an expired operator suppression in-pass instead of flagging it until the next repeat delivery (BLO-48819)", async () => {
+    const opts = {
+      records: { fp1: record({ pluginClosedAt: null, operatorSuppressedAt: "2026-10-12T18:00:00Z" }) },
+      issues: { "issue-1": { id: "issue-1", status: "cancelled" } },
+    };
+    const cfg = { ...config, operatorSuppressionHours: 24 };
+    const ok = harness(opts);
+    const replay = vi.fn(async () => {});
+    await runCoverageCheck(ok.ctx, cfg, NOW, async () => [amAlert("fp1")], replay);
+    expect(replay).toHaveBeenCalledTimes(1);
+    expect((replay.mock.calls[0] as unknown[])[3]).toEqual([expect.objectContaining({ fingerprint: "fp1" })]);
+    expect(uncoveredCalls(ok.write)).toEqual([]);
+    expect(ok.write).toHaveBeenCalledWith("alertmanager.coverage.checked", 1);
+
+    // A reopen that did not land is a real gap.
+    const failed = harness(opts);
+    await runCoverageCheck(failed.ctx, cfg, NOW, async () => [amAlert("fp1")], async () => { throw new Error("boom"); });
+    expect(uncoveredCalls(failed.write)).toHaveLength(1);
+  });
+
+  it("does not replay plugin-closed or missing rows, only expired operator suppressions", async () => {
+    const { ctx, write } = harness({
+      records: { fp1: record(), fp2: record({ paperclipIssueId: "gone" }) },
+      issues: { "issue-1": { id: "issue-1", status: "cancelled" } },
+    });
+    const replay = vi.fn(async () => {});
+    await runCoverageCheck(ctx, config, NOW, async () => [amAlert("fp1"), amAlert("fp2")], replay);
+    expect(replay).not.toHaveBeenCalled();
+    expect(uncoveredCalls(write)).toEqual([["alertmanager.coverage.uncovered", 2, { alertname: "Synthetic", severity: "critical" }]]);
+  });
+
   it("treats an open aggregate winner as coverage even when the member's own row is closed", async () => {
     const { ctx, write } = harness({
       records: { fp1: record() },
