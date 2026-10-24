@@ -419,6 +419,223 @@ function shannonEntropyBitsPerChar(value: string): number {
   return bits;
 }
 
+/**
+ * PEN-4637: an absolute POSIX path is a filesystem location, not a credential,
+ * and neither `isLexicalIdentifier` nor `GRPC_METHOD_PATH_RE` can reach one.
+ *
+ * `isLexicalIdentifier` splits on `[-._]` only, so a path's `/` separators
+ * leave one oversized segment and it bails on LEXICAL_SEGMENT_MAX_LENGTH;
+ * `GRPC_METHOD_PATH_RE` wants a dotted package then exactly one more `/`. So
+ * every path long enough to clear HIGH_ENTROPY_MIN_LENGTH and carrying two
+ * character classes is refused — and "derive it at runtime" is unavailable
+ * when the literal is a PromQL label matcher, a systemd `ExecStart`, or a
+ * runbook command a reader has to be able to paste.
+ *
+ * SHAPE ALONE, WITH NO NAME CONJUNCTION — and that is a deliberate departure
+ * from the CamelCase / snake_case / Kubernetes rules above, so it needs the
+ * argument PEN-3920 section 4 demands. That section says to widen under a
+ * name anchor and never under a name-free rule. The anchor is UNAVAILABLE
+ * here, measured rather than assumed: across Blockcast/paperclip,
+ * Blockcast/onprem-k8s and Blockcast/penstock-llm-proxy-core, 782 assignments
+ * bind a slash-rooted value under 250 distinct names, and the 69 values
+ * refused today sit under 52 of them. Those names are not a vocabulary anyone
+ * could enumerate — `new`, `prev`, `src`, `raw`, `href`, `CAP`, `MAP`, `DLL`,
+ * `SDF`, `backup`, `override` — and the next one nobody listed reproduces the
+ * false positive. That is the same drift `GRPC_METHOD_PATH_RE` records for
+ * `method` / `rpc` / `grpc_method` / `full_method`, one order of magnitude
+ * worse. PEN-4637 was filed asking only for `config`; `config` is not even
+ * among the 52.
+ *
+ * So the SHAPE has to carry the whole decision, which means this rule may
+ * admit NO opaque mass at all — unlike the Kubernetes rule above, which spends
+ * a 16-character opaque budget it can afford because its name anchor is doing
+ * the other half. Every run here must be a word, a number, or a tightly
+ * bounded word-with-digits. A path carrying a uuid, a pod-template hash or a
+ * disk serial stays REFUSED, deliberately: that is 17 of the 69, and it is the
+ * class where a path is most likely to be carrying something that should not
+ * be published anyway — the refusal that produced PEN-4637 was exactly that
+ * case, a per-seat home holding another company's execution-workspace uuid.
+ *
+ * THE CONJUNCTS, and what each one holds.
+ *
+ *  - Slash-rooted, at least POSIX_PATH_MIN_SEGMENTS segments. This is the
+ *    gate, and it is why no credential ENCODING reaches this rule: the value
+ *    must begin with `/` and carry an interior `/`. Of the alphabets a secret
+ *    is drawn from, only standard base64 emits `/` at all, at 1 character in
+ *    64. base64url, base62, base32, hex and every vendor prefix cannot produce
+ *    the first character, let alone the second.
+ *  - Every run — the text between `/`, `-`, `_` and `.` — must be lowercase,
+ *    uppercase, digits, CamelCase of at most POSIX_PATH_MAX_CAMEL_WORDS words,
+ *    or a bounded mixed run. The CASE conjunct is the one that does the work
+ *    against a chopped token, and it has two halves, each measured by removing
+ *    it: an unbounded CamelCase run leaves mixed-case letters chopped into
+ *    16-character runs exonerated at 1.31e-1 (the 2.3e-1 shape residual
+ *    PEN-3920 section 3 measured, reappearing per-run) against 0 with the word
+ *    cap, and dropping POSIX_PATH_CAMEL_RUN_MIN_LENGTH takes 4-character runs
+ *    from 0 to 1.1e-3.
+ *  - POSIX_PATH_MAX_MIXED_RUNS bounds how many runs may mix letters and
+ *    digits. Measured over all 421 shape-matching slash-rooted values in the
+ *    three repos the maximum is exactly 2, and this is the conjunct that
+ *    closes the chopped-token families: it takes a random base36 token sliced
+ *    into 4-character runs from 9.8e-3 to the figure in the table below.
+ *  - POSIX_PATH_MAX_RUNS and POSIX_PATH_MAX_CONTENT_LENGTH bound the total
+ *    admitted mass, as LEXICAL_IDENTIFIER_MAX_CONTENT_LENGTH does for
+ *    `isLexicalIdentifier`. The corpus maxima are 16 runs and 93 characters;
+ *    the run cap sits on that maximum and the content cap three above it.
+ *    They are headroom bounds, not entropy bounds.
+ *
+ * THE RESIDUAL. 250,000 random values per family unless noted, fraction NEWLY
+ * exonerated — values the detector refuses today that this rule admits.
+ * Varying generators per PEN-4425's measurement trap.
+ *
+ *   Every flat token family, bare AND slash-prefixed: base64url, base62,
+ *   base36, base32, hex upper and lower, mixed-case letters, alphanumeric, at
+ *   24 / 32 / 43 / 64 characters; UUID v4; and a standard base64 blob filtered
+ *   to those carrying two or more interior slashes .................... 0 each
+ *
+ *   29 real credential formats — GitHub PAT classic, fine-grained and OAuth,
+ *   Slack bot, Stripe live and restricted, AWS key id and secret, Google API,
+ *   Anthropic, OpenAI key and project key, Vault, GitLab PAT, npm, Grafana,
+ *   JWT, base32 TOTP seed, Kubernetes bootstrap token, DigitalOcean, Paperclip
+ *   service key, Azure SAS, UUID, raw hex and base64 blobs — each measured
+ *   bare and slash-prefixed ........................................... 0 each
+ *
+ *   Standard base64, the ONLY real credential alphabet that emits `/` at all
+ *   and therefore the only one that can reach this rule, 3,000,000 samples:
+ *     24 characters, leading slash FORCED ............................ 3.0e-6
+ *     24 characters, as generated .................................... 0
+ *     32 / 43 / 64 characters, forced and as generated ............... 0 each
+ *
+ *   Synthetic "chopped token" families — a random token sliced into equal runs
+ *   by `/`, the only other construction that reaches this rule:
+ *     base36 / lowercase-alnum, 4- 6- and 8-character runs ... 4.0e-5–7.2e-5
+ *     mixed-case letters, 6- and 8-character runs ........... 8.0e-6–3.2e-5
+ *     mixed-case letters or base62, 4-character runs ................. 0
+ *
+ * For scale: `isLexicalIdentifier` carries 2.96e-3 to 3.57e-3 name-free today,
+ * and the name-ANCHORED Kubernetes rule above carries up to 9.85e-3. The worst
+ * family here is 7.2e-5, roughly forty times below the name-free exemption
+ * this file already ships.
+ *
+ * WHAT IT ADMITS, stated plainly. A deliberately constructed value — a secret
+ * sliced into short slash-separated runs, each one case-homogeneous — is
+ * admitted at the rate in the last block. No encoder emits that; producing it
+ * means setting out to, which PEN-3920 section 4 and PEN-3183 put outside this
+ * control's threat model. The honest statement of the bound is that this rule
+ * admits more total WORD mass than any other exemption in this file (96
+ * characters against `isLexicalIdentifier`'s 30) and zero OPAQUE mass, where
+ * the Kubernetes rule admits 16. Those move in opposite directions on purpose:
+ * word mass is what a path is made of, opaque mass is what a secret is made
+ * of, and only the second is an entropy budget.
+ *
+ * COVERAGE. 52 of the 69 refused values, across 42 distinct binding names. The
+ * 17 left all carry a segment this rule calls opaque — a uuid, a disk serial,
+ * a pod-template hash, an 8-hex chart digest — or a run whose digits the
+ * mixed-run bound does not admit (`st2059`, `v1alpha1`). PEN-3920 section
+ * 10.4.1 measures the `v1alpha1` widening and DECLINES it: 2-3x on the chopped
+ * families to buy four values of one shape.
+ *
+ * Do not relax the case conjunct, the mixed-run cap, or the leading-slash
+ * requirement without re-measuring: each of the three is pinned by a failing
+ * mutation in the test file, because each one is load-bearing on its own.
+ */
+/** Cheap early-out before the split work, NOT a security bound and not
+ *  reachable: POSIX_PATH_MAX_RUNS runs summing to POSIX_PATH_MAX_CONTENT_LENGTH
+ *  admit at most 96 content characters, 15 interior separators, the leading
+ *  slash and one trailing separator — 113. A test pins that arithmetic so a
+ *  future reader does not mistake this for the bound that holds the rule.
+ *  The longest real path in the corpus is 109. */
+const POSIX_PATH_MAX_LENGTH = 128;
+/** A credential needs an interior `/` as well as a leading one to reach here. */
+const POSIX_PATH_MIN_SEGMENTS = 2;
+/** Longest single run. Matches LEXICAL_SEGMENT_MAX_LENGTH; corpus maximum 12. */
+const POSIX_PATH_MAX_RUN_LENGTH = 16;
+/** Longest digits-only run. A date-stamped or epoch-suffixed path is the
+ *  reason this is not smaller; digits carry one character class, so a run of
+ *  them cannot reach the entropy test alone. */
+const POSIX_PATH_MAX_DIGIT_RUN = 12;
+/** Words a CamelCase run may carry, counting an acronym's capitals
+ *  individually (`PaperclipAI` is three). Unbounded, this run shape is the
+ *  2.3e-1 hole PEN-3920 section 3 measured; the corpus needs exactly 3. */
+const POSIX_PATH_MAX_CAMEL_WORDS = 3;
+/** Shortest CamelCase run. `Users` is the corpus minimum at exactly 5, and 6
+ *  drops nine real values, so this sits on the knee. It is the conjunct that
+ *  closes the mixed-case chopped-token family: a 4-character run of random
+ *  mixed-case letters is CamelCase-shaped about a third of the time, and a
+ *  token sliced into such runs was exonerated at 1.1e-3 without this bound
+ *  and at 0 with it. A single capital followed by one letter is not a word. */
+const POSIX_PATH_CAMEL_RUN_MIN_LENGTH = 5;
+/** Longest run that may mix letters and digits (`armv7`, `vlan33`, `v2`). */
+const POSIX_PATH_MIXED_RUN_MAX_LENGTH = 8;
+/** Digits such a run may carry, as ALERT_NAME_RE bounds its own. */
+const POSIX_PATH_MIXED_RUN_MAX_DIGITS = 2;
+/** How many runs in one value may mix letters and digits. The corpus maximum
+ *  over all 421 shape-matching values is exactly 2, and this is the conjunct
+ *  that closes the chopped-token families. */
+const POSIX_PATH_MAX_MIXED_RUNS = 2;
+/** Runs one value may carry. Corpus maximum 16. */
+const POSIX_PATH_MAX_RUNS = 16;
+/** Summed run length, separators excluded. Corpus maximum 93. */
+const POSIX_PATH_MAX_CONTENT_LENGTH = 96;
+
+/** Capitalised words and acronym runs: `Users`, `PaperclipAI`, `MegaRAID`. */
+const POSIX_PATH_CAMEL_RUN_RE = /^(?:[A-Z][a-z]+|[A-Z]{1,5})+$/;
+/** Single-case and letter-initial: `armv7`, `v2`, `PVE2`. How many digits the
+ *  run may carry, and in how many groups, is checked separately — the single
+ *  group is what keeps `v1alpha1` out (PEN-3920 section 10.4.1). */
+const POSIX_PATH_MIXED_RUN_RE = /^(?:[a-z][a-z0-9]*|[A-Z][A-Z0-9]*)$/;
+
+/** True when a run between path separators is a word, a number, or a bounded
+ *  word-with-digits — never anything opaque. */
+function isPosixPathRun(run: string): boolean {
+  if (run.length === 0 || run.length > POSIX_PATH_MAX_RUN_LENGTH) return false;
+  if (/^[0-9]+$/.test(run)) return run.length <= POSIX_PATH_MAX_DIGIT_RUN;
+  if (/^[a-z]+$/.test(run) || /^[A-Z]+$/.test(run)) return true;
+  if (run.length >= POSIX_PATH_CAMEL_RUN_MIN_LENGTH && POSIX_PATH_CAMEL_RUN_RE.test(run)) {
+    return (run.match(/[A-Z][a-z]*/g) ?? []).length <= POSIX_PATH_MAX_CAMEL_WORDS;
+  }
+  if (run.length < 2 || run.length > POSIX_PATH_MIXED_RUN_MAX_LENGTH) return false;
+  if (!POSIX_PATH_MIXED_RUN_RE.test(run)) return false;
+  const digits = run.match(/[0-9]+/g) ?? [];
+  return digits.length === 1 && digits[0]!.length <= POSIX_PATH_MIXED_RUN_MAX_DIGITS;
+}
+
+/** True when a value is an absolute POSIX path built entirely of words. */
+function isPosixPathValue(value: string): boolean {
+  if (value.length < 2 || value.length > POSIX_PATH_MAX_LENGTH) return false;
+  if (!value.startsWith("/")) return false;
+  let body = value.slice(1);
+  // ASSIGNMENT_RE's capture stops at the first character outside the token
+  // alphabet, so a path interpolated with `$(…)` or `${…}` arrives here as a
+  // prefix ending in its own separator. One trailing separator is tolerated;
+  // an interior empty segment is not.
+  if (/[-._/]$/.test(body)) body = body.slice(0, -1);
+  const segments = body.split("/");
+  if (segments.length < POSIX_PATH_MIN_SEGMENTS) return false;
+  let runCount = 0;
+  let contentLength = 0;
+  let mixedRuns = 0;
+  for (const segment of segments) {
+    if (segment === "") return false;
+    // A dotfile segment opens with `.`; `/paperclip/.gitconfig` is the case
+    // PEN-4402 pins inside an `absent(...)` matcher.
+    const named = segment.startsWith(".") ? segment.slice(1) : segment;
+    if (named === "") return false;
+    for (const run of named.split(/[-._]/)) {
+      if (!isPosixPathRun(run)) return false;
+      runCount += 1;
+      contentLength += run.length;
+      if (runCount > POSIX_PATH_MAX_RUNS) return false;
+      if (contentLength > POSIX_PATH_MAX_CONTENT_LENGTH) return false;
+      if (/[0-9]/.test(run) && /[A-Za-z]/.test(run)) {
+        mixedRuns += 1;
+        if (mixedRuns > POSIX_PATH_MAX_MIXED_RUNS) return false;
+      }
+    }
+  }
+  return true;
+}
+
 /** A segment is "lexical" when it is a plain word or a plain number — the
  *  shape hyphenated identifiers are built from, and the shape a random token's
  *  segments essentially never take, because a token mixes letters with digits
@@ -651,6 +868,7 @@ function isOpaqueSecretValue(value: string): boolean {
   if (classIndex(value) < 2) return false;
   if (isLexicalIdentifier(value)) return false;
   if (GRPC_METHOD_PATH_RE.test(value)) return false;
+  if (isPosixPathValue(value)) return false;
   return shannonEntropyBitsPerChar(value) >= HIGH_ENTROPY_MIN_BITS_PER_CHAR;
 }
 

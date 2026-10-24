@@ -1,0 +1,63 @@
+# PEN-4637 corpus: absolute POSIX paths that the entropy rule refused before
+# this exemption, one per line. Structurally faithful to the 69 values measured
+# across Blockcast/paperclip, Blockcast/onprem-k8s and
+# Blockcast/penstock-llm-proxy-core; home-directory and operator-identifying
+# components are replaced with neutral stand-ins, because a corpus fixture is
+# not a reason to republish someone's home layout. Every structural class the
+# rule admits is represented, and every line here is refused by the detector
+# without this exemption -- the test asserts that, so a line that drifts below
+# the entropy floor cannot silently become a vacuous pass.
+#
+# NOT represented, because they are the documented residue the rule still
+# refuses: a path carrying a uuid, a pod-template hash, a disk serial or any
+# other opaque segment, and a run with a digit group longer than two
+# (`st2059`, `ct140`). Those are negative controls in the test file instead.
+#
+# No line carries a `name=value` pair, so this file is not itself the material
+# the rule under test refuses.
+/tmp/magmad-armv7.xz.new
+/tmp/e5-test-talosconfig
+/root/.ssh/known_hosts-e5
+/absolute/path/to/run-l15
+/tmp/profile-pruned/Default
+/absolute/path/to/AGENTS.md
+/root/interfaces.pre-vlan33-
+/opt/blockcast/ix1/bird.conf
+/var/tmp/ix1-configsync-kit-
+/PAP/company/settings/secrets
+/apps/advanced/profiles/prof-1
+/companies/BLO/issues/BLO-1234
+/usr/sbin/dimt-reconcile-v3.sh
+/tmp/e5-test-controlplane.yaml
+/opt/account-feed/node-v22.23.3
+/etc/sysctl.d/99-arc-tuning.conf
+/data/scratch/gprod/s5-mx-dryrun-
+/usr/lib/jvm/java-11-openjdk-amd64
+/usr/local/sbin/vlan40-snooping.sh
+/runtime/psk/interconnect-101.conf
+/usr/lib/faketime/libfaketime.so.1
+/Users/example/.paperclip-worktrees
+/opt/traffic_router/conf/log4j.xml
+/home/example/src/blockcast/onprem-k8s
+/sys/block/mmcblk0/queue/max_sectors_kb
+/execution-workspaces/workspace-1/issues
+/var/opt/magma/configs/orc8r/tenants.yml
+/runtime-cache/tmp/opencode/pen-1650-cargo
+/runtime-cache/tmp/opencode/pen-1650-target
+/opt/blockcast/ix1/bird-root/usr/sbin/bird
+/opt/blockcast/ix1/bird-root/usr/sbin/birdc
+/usr/local/sbin/pve-ct14-shred-textfile.sh
+/sys/fs/bpf/tc/globals/cilium_lb4_services_v2
+/sys/fs/bpf/tc/globals/cilium_lb6_services_v2
+/projects/paperclip-app/workspaces/workspace-1
+/etc/udev/rules.d/99-perc-ssd-rotational.rules
+/etc/network/interfaces.bak.data5-linux-bridge.
+/api/v1/namespaces/monitoring/services/prometheus
+/home/runner/actions-runner/bin/Runner.Worker.dll
+/dev/disk/by-id/REPLACE_WITH_INTEL_SERIAL_FOR_PVE2_CP3
+/tmp/track-a/wt/docs/plans/2026-09-05-landing-log.md
+/Users/example/Documents/Paperclip/paperclip/tmp/parity/home
+/Users/example/Documents/Paperclip/paperclip/tmp/parity/codex-home
+/Users/example/Documents/Paperclip/paperclip/tmp/parity/home/auth.json
+/old/home/paperclip/.paperclip/worktrees/PAP-9940-what-to-learn/.paperclip/config.json
+/Users/example/Documents/Paperclip/paperclip/tmp/parity/home/instances/parity/config.json
