@@ -1761,13 +1761,25 @@ export function routineService(
   // The live set is the recovery service's own (`active` + `escalated`,
   // recovery/service.ts waiting-path and hand-back drain queries): an
   // escalated action is still owned by an operator who resolves it.
-  function hasLiveRecoveryAction() {
+  //
+  // BLO-48716: but an escalated action past its horizon wakes nobody, so as an
+  // unbounded protection it wedged `skip_if_active` until someone closed the
+  // row by hand (BLO-47801 ~39h, BLO-48616). It keeps protecting for one
+  // fire-age horizon past its `timeoutAt` (or last update, when it has none),
+  // then stops. Gate and supersede both call this with the same `now` and
+  // horizon, so the gated set and the refused set still cannot drift apart.
+  function hasLiveRecoveryAction(now: Date, fireAgeHorizonMs: number) {
+    const escalatedCutoff = new Date(now.getTime() - fireAgeHorizonMs);
     return sql`exists (
           select 1
           from ${issueRecoveryActions}
           where ${issueRecoveryActions.sourceIssueId} = ${issues.id}
             and ${issueRecoveryActions.companyId} = ${issues.companyId}
             and ${inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES])}
+            and (
+              ${issueRecoveryActions.status} <> 'escalated'
+              or coalesce(${issueRecoveryActions.timeoutAt}, ${issueRecoveryActions.updatedAt}) > ${escalatedCutoff}
+            )
         )`;
   }
 
@@ -1878,7 +1890,7 @@ export function routineService(
           or(
             inArray(issues.status, SUPERSEDE_PROTECTED_STATUSES),
             hasUnresolvedBlockerEdge(),
-            hasLiveRecoveryAction(),
+            hasLiveRecoveryAction(now, fireAgeHorizonMs),
           ),
         ),
       )
@@ -2096,7 +2108,7 @@ export function routineService(
     // is the recovery service's own (`active` + `escalated`, recovery/service.ts
     // waiting-path and hand-back drain queries): an escalated action is still
     // owned by an operator who resolves it, so its source is protected here.
-    const noLiveRecoveryAction = sql`not ${hasLiveRecoveryAction()}`;
+    const noLiveRecoveryAction = sql`not ${hasLiveRecoveryAction(input.now, input.fireAgeHorizonMs)}`;
     const staleCondition = and(
       eq(issues.companyId, input.routine.companyId),
       eq(issues.originKind, input.originKind),
