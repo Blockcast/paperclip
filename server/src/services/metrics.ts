@@ -1112,10 +1112,15 @@ export const DEFERRED_ISSUE_EXECUTION_WAKE_AGE_METRICS_REFRESH_SUCCESS_METRIC =
 // "cold" means, and that is load-bearing rather than tidy. The first revision
 // re-derived the predicate in SQL from four signals (live run, future monitor
 // check, unexpired park, active recovery action). `hasExplicitWaitingPath`
-// honours eight: it also counts a queued wake request, a live pending
-// interaction, a pending approval, an open recovery issue, a recent open pull
-// request, and a user assignee. Those last few are the COMMONEST legitimate
-// `in_review` waits, so the SQL published every one of them as cold -- an upper
+// honours eight satisfiers, and that approximation could see none of these: a
+// queued wake request, a live pending interaction, a pending approval, an open
+// recovery issue, a recent open pull request, a user assignee. (It is not a
+// clean 4-of-8 subset -- the SQL's `issue_recovery_actions` probe is a
+// different table from the classifier's open-recovery-ISSUE arm, and its run
+// probe covers only part of one arm -- which is itself the reason a
+// hand-rolled restatement of this predicate is a bad idea.) Those missing
+// satisfiers are the COMMONEST legitimate `in_review` waits, so the SQL
+// published every one of them as cold -- an upper
 // bound wearing the name of a strand rate, on the one instrument built to
 // inform escalation policy. `recovery/service.ts` warns (PEN-3198) that two
 // copies of this predicate drift silently; there is now one.
@@ -6183,7 +6188,13 @@ function ensureRegistry(): {
         + "could not be read, so a stale cold-row age cannot be read as fresh (PEN-4652). "
         + "Note this tracks the heartbeat recovery chain, NOT the scrape-metrics collector "
         + "that carries the other refresh-success gauges in this file -- it can be 1 while "
-        + "every one of those is 0, and the reverse.",
+        + "every one of those is 0, and the reverse. ⚠ ANY ALERT OVER THIS SERIES MUST "
+        + "CARRY service=\"paperclip-workers\". The recovery chain runs on the workers "
+        + "tier alone, but the registry is constructed on every tier and seeds this gauge "
+        + "to 0, so an api replica exports a PERMANENT 0 that it will never refresh. A "
+        + "bare `== 0` rule therefore pages forever against replicas that are behaving "
+        + "correctly -- the same shape as the pre-seeded backstop counters documented "
+        + "above.",
       registers: [registry],
     });
     coldInReviewIssueMetricsRefreshSuccess.set(0);
@@ -7793,7 +7804,7 @@ export function setDeferredIssueExecutionWakeAgeMetricsRefreshSuccess(success: b
 }
 
 /**
- * Publish the oldest cold-`in_review` age for each agent (PEN-4545). Same
+ * Publish the oldest cold-`in_review` age for each agent (PEN-4652). Same
  * bounded-label and explicit-zero contract as
  * {@link setDeferredIssueExecutionWakeOldestAgeMetrics}: every known agent is
  * written on every refresh so a repaired fleet reads 0 rather than going

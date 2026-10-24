@@ -11942,6 +11942,13 @@ export function recoveryService(
       // timestamp, and both already sit in this snapshot (PEN-4652).
       issues: issueRows,
       agents: agentRows,
+      // The instant the classifier judged against. Returned so a caller aging a
+      // finding uses the SAME clock the verdict was reached on, rather than a
+      // second `new Date()` taken after the pass (PEN-4652). In production the
+      // gap is only collect latency -- minutes on a long pass, harmless against
+      // hour-to-week ages -- but it is unbounded in principle and, in a test
+      // injecting a fixed clock, verdicts and ages would run on different ones.
+      now: sharedInput.now,
       // The MINTING view. An open escalation contributes a waiting path for its own
       // subject and leaf, which is what stops the detector re-firing the same incident
       // every 30s tick while somebody is already on it (BLO-15200). Everything that
@@ -15446,7 +15453,7 @@ export function recoveryService(
       coldInReviewGaugeEntries(
         collected.findings,
         new Map(collected.issues.map((issue) => [issue.id, issue])),
-        opts?.now ?? new Date(),
+        collected.now,
       ),
       new Set(collected.agents.map((agent) => agent.id)),
     );
