@@ -585,6 +585,32 @@ describe("issue validators", () => {
       // A green gate-workflow run is not evidence a review is coming — the producer is the
       // control plane's webhook, not repo CI. This is the inference that cost the wasted wakes.
       expect(text).toMatch(/authors NO review/i);
+
+      // Ally review of paperclip#2980, Important 1. An earlier draft of this clause told agents to
+      // "quote a prior review as an indented block" to dodge the BLO-21618 self-echo drop. That
+      // advice FAILS SILENTLY — the same defect class the clause exists to remove.
+      // ALLY_CONSOLIDATED_REVIEW_HEADING_PATTERN (`ally-review-detection.ts`) is
+      // `(?:^|\n)(?! *\t)(?! {4}) {0,3}(?:#{1,6}[ \t]+|\*\*[ \t]*)?Ally…`: it ALLOWS 0-3 spaces and
+      // makes the `#`/`**` prefix optional, so a two-space indent and a bare `Ally — Consolidated
+      // PR Review` line both match. Only a 4+-space/tab indent (NOT_INDENTED_CODE), a fenced block
+      // (stripped by emittedReviewText) and a `>` blockquote (absent from the pattern) escape.
+      expect(text).toMatch(/INDENTING DOES NOT AVOID IT/i);
+      expect(text).toMatch(/fenced block or behind `>`/i);
+      // The numeric boundary must survive a trim: "indent it" is wrong, "four spaces" is the line.
+      expect(text).toMatch(/four-space indent/i);
+      // ...and the clause must not reacquire the unqualified advice it replaced.
+      expect(text).not.toMatch(/quote[^.]{0,40}as an indented block/i);
+
+      // Ally review of paperclip#2980, suggestion 2. A push to a non-draft PR DOES wake the
+      // reviewer (`pull_request.synchronize` → `github_pr_synchronized`), so the case against
+      // moving the head is COST, not ineffectiveness. An earlier draft also claimed a new head
+      // "voids every pending review-request marker at the old head"; it does not — the marker wake
+      // is scoped to the COMMENT ID, and only `github_pr_synchronized` is head-scoped (PEN-2865).
+      // Stating a false mechanism here invites the next reader to disprove it and discard the
+      // (correct) conclusion with it.
+      expect(text).toMatch(/A push DOES wake the reviewer/i);
+      expect(text).toMatch(/argument from COST, not from ineffectiveness/i);
+      expect(text).not.toMatch(/voids every pending review-request marker/i);
     });
 
     // PEN-3415: `monitor.kind` is the trigger for the #1195 external-wait slot yield. Measured
