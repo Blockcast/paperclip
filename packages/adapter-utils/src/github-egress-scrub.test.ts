@@ -1100,6 +1100,212 @@ describe("scrubGitHubEgressText", () => {
     });
   });
 
+  describe("PEN-4637 regression: an absolute POSIX path is not a credential", () => {
+    // Derived, not embedded, throughout. Every positive below is the exact
+    // material the SHIPPED rule refuses, so a contiguous `name=value` literal
+    // here would make this file unpushable until the fix deploys. Same
+    // convention as the PEN-3920, PEN-4438 and PEN-3907 blocks above.
+    const pair = (name: string, value: string) => [name, value].join("=");
+    const path = (...segments: string[]) => `/${segments.join("/")}`;
+    // A UUID stays opaque here for the same reason it does in
+    // isLexicalIdentifier: its groups are neither words nor numbers.
+    const UUID_SEGMENT = ["386c81e8", "e454", "4f2a", "9b31", "7c5d2e8a1f04"].join("-");
+    // Guards the negative controls below against vacuity: a value that never
+    // reaches the entropy test proves nothing about a bound on the exemption.
+    const reachesEntropyTest = (value: string) =>
+      value.length >= 24 && [/[a-z]/, /[A-Z]/, /[0-9]/].filter((re) => re.test(value)).length >= 2;
+
+    // The shapes this rule unblocks, one per structural class in the measured
+    // corpus. A PromQL label matcher, a systemd unit and a runbook command all
+    // have to spell the literal out; none of them can derive it at runtime.
+    const HOME_CONFIG = path("paperclip", ".gitconfig.backup.2026-10-24");
+    const UNIT_EXEC = path("usr", "local", "sbin", "vlan40-snooping.sh");
+    const BPF_MAP = path("sys", "fs", "bpf", "tc", "globals", "cilium_lb4_services_v2");
+    const JVM_HOME = path("usr", "lib", "jvm", "java-11-openjdk-amd64");
+    const DEV_HOME = path("Users", "example", "Documents", "Paperclip", "tmp", "parity", "home");
+    const API_ROUTE = path("api", "v1", "namespaces", "monitoring", "services", "prometheus");
+    // The capture stops at the first character outside the token alphabet, so
+    // a path interpolated with `$(date …)` arrives as a prefix ending in `-`.
+    const TRUNCATED_PREFIX = `${path("root", "interfaces.pre-vlan33")}-`;
+
+    const PATHS = [HOME_CONFIG, UNIT_EXEC, BPF_MAP, JVM_HOME, DEV_HOME, API_ROUTE, TRUNCATED_PREFIX];
+
+    it.each(PATHS)("passes %s through byte-exact", (value) => {
+      const text = pair("config", value);
+      const result = scrubGitHubEgressText(text);
+      expect(result.text).toBe(text);
+      expect(result.redacted).toBe(false);
+      expect(locateGitHubEgressMatches(text)).toEqual([]);
+    });
+
+    it("passes the PromQL matcher PEN-4402 pins", () => {
+      const text = `        expr: absent(git_credential_at_rest_present{${pair("config", `"${HOME_CONFIG}"`)}})`;
+      expect(scrubGitHubEgressText(text).text).toBe(text);
+      expect(locateGitHubEgressMatches(text)).toEqual([]);
+    });
+
+    // The exemption is deliberately NAME-FREE, and this is the test that says
+    // so. PEN-3920 section 4 prefers a name anchor; here it is unavailable,
+    // measured rather than assumed. Across the three repos, 782 assignments
+    // bind a slash-rooted value under 250 distinct names and the 69 values
+    // refused today sit under 52 of them — `new`, `prev`, `raw`, `href`,
+    // `CAP`, `MAP`, `DLL`, `backup`, `override` among them. `config`, the one
+    // name PEN-4637 was filed about, is not even in that set. A name list
+    // would drift on its first omission, exactly as GRPC_METHOD_PATH_RE
+    // records for `method` / `rpc` / `grpc_method` / `full_method`.
+    it.each(["config", "path", "ExecStart", "href", "raw", "SDF", "password", "token", "SA_TOKEN"])(
+      "exempts on shape, not on the name %s",
+      (name) => {
+        const text = pair(name, UNIT_EXEC);
+        expect(scrubGitHubEgressText(text).text).toBe(text);
+      },
+    );
+
+    it("passes the measured corpus through byte-exact", () => {
+      // Every structural class in the 69 values the detector refused across
+      // Blockcast/paperclip, Blockcast/onprem-k8s and
+      // Blockcast/penstock-llm-proxy-core, with home-directory and
+      // operator-identifying components replaced by stand-ins.
+      const corpus = readFileSync(
+        new URL("./github-egress-scrub.posix-paths.txt", import.meta.url),
+        "utf8",
+      )
+        .split("\n")
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0 && !line.startsWith("#"));
+      expect(corpus.length).toBeGreaterThan(40);
+      // Guard against a vacuous corpus: every line must still be a value the
+      // entropy rule would test, or this asserts nothing.
+      expect(corpus.filter((value) => !reachesEntropyTest(value))).toEqual([]);
+      const flagged = corpus.filter((value) => {
+        const text = pair("config", value);
+        return scrubGitHubEgressText(text).text !== text;
+      });
+      expect(flagged).toEqual([]);
+    });
+
+    // Each bound is a cap, not a licence: one case per conjunct, each failing
+    // on a different one, so loosening any single constant fails a test. This
+    // rule is name-free, so every one of these is a value that would be
+    // exonerated under EVERY binding name in the fleet if the bound moved.
+    // Every case below is asserted to reach the entropy test first, so each
+    // is a real mutation test and not a value that was never in scope.
+    const WORDS = [
+      "workspace", "instances", "prometheus", "monitoring", "kubernetes",
+      "controller", "execution", "telemetry", "forwarder", "dashboards",
+      "collector", "aggregator", "namespace",
+    ];
+    it.each([
+      // No leading slash: the gate that keeps every credential alphabet out.
+      // base64url, base62, base32 and hex cannot produce the first character.
+      ["no leading slash", "etc/sysctl.d/99-arc-tuning-profile.conf"],
+      // One segment. A credential needs an interior `/` as well as a leading
+      // one, and standard base64 emits `/` at one character in sixty-four.
+      ["single segment", path("Qk9SSU5HdGVzdHZhbHVlMTIzNDU2Nzg5")],
+      // An interior empty segment — `//` — is not a path this rule admits.
+      ["empty interior segment", "/etc//sysctl.d/99-arc-tuning-profile.conf"],
+      // An opaque run. This is the whole point of the per-run bound: the rule
+      // admits ZERO opaque mass, because it has no name anchor carrying the
+      // other half of the decision.
+      ["opaque run", path("api", "attachments", SYNTHETIC_OPAQUE_VALUE, "content")],
+      // A UUID segment. The refusal that produced PEN-4637 was exactly this:
+      // a per-seat home carrying an execution-workspace uuid.
+      ["uuid run", path("workspaces", UUID_SEGMENT, "home")],
+      // A hex digest segment.
+      ["hex digest run", path("var", "cache", "a3f91c8e2b7d405fa6c19e83bd27f04a1c6e59b8")],
+      // A five-word CamelCase run against a cap of three. Unbounded, this run
+      // shape is the 2.3e-1 residual PEN-3920 section 3 measured.
+      ["camel word count", path("opt", "vendor8", "AlphaBetaGammaDeltaEpsilon")],
+      // Two-character CamelCase runs against a five-character floor. Without
+      // the floor a mixed-case token sliced into 4-character runs is
+      // exonerated at 1.1e-3; with it, at 0.
+      ["camel run length", path("opt", "vendor8", "Ab", "Cd", "Ef", "Gh", "Ij", "Kl", "Mn", "Op")],
+      // A third run mixing letters and digits, against a cap of two. The
+      // corpus maximum over all 421 shape-matching values is exactly 2, and
+      // this is the conjunct that closes the chopped-token families.
+      ["mixed run count", path("opt", "lb4", "v2", "arm7", "bin", "libexec", "share")],
+      // A mixed run carrying four digits against a cap of two. Measured:
+      // allowing three puts a standard-base64 alphabet back above zero, so
+      // this real systemd path stays refused and is named in the residue.
+      ["mixed run digits", path("usr", "local", "libexec", "st2059-sm-tlv-profile")],
+      // A nine-character mixed run against a cap of eight.
+      ["mixed run length", path("opt", "megaraid8", "storcli64x", "bin", "libexec")],
+      // A mixed run opening with a digit: the shape a generated suffix takes.
+      ["digit-initial mixed run", path("opt", "vendor8", "7fdd5ff6a", "libexec", "share")],
+      // A seventeen-character run against a cap of sixteen.
+      ["run length", path("opt", "vendor8", "abcdefghijklmnopq", "libexec")],
+      // Content 108 against a cap of 96, every run a real word and only
+      // twelve of them — so this fails on mass alone, not on run count.
+      ["content length", path("opt9", ...WORDS.slice(0, 11))],
+      // Eighteen runs against a cap of sixteen, content 82 — under the mass
+      // cap, so this fails on count alone.
+      ["run count", path(
+        "opt9", "alpha", "bravo", "delta", "echo", "fox", "golf", "hotel",
+        "india", "juliet", "kilo", "lima", "mike", "nov", "oscar", "papa",
+        "quebec", "sierra",
+      )],
+    ])("still refuses a value failing the %s bound", (_why, value) => {
+      expect(reachesEntropyTest(value)).toBe(true);
+      const result = scrubGitHubEgressText(pair("config", value));
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(value);
+    });
+
+    it("keeps the length cap unreachable, so it is not mistaken for a bound", () => {
+      // POSIX_PATH_MAX_LENGTH is a cost guard, not a security bound: the run
+      // and content caps already imply a shorter ceiling. 96 content
+      // characters across at most 16 runs leaves 15 interior separators, plus
+      // the leading slash and one tolerated trailing separator.
+      const impliedCeiling = 96 + 15 + 1 + 1;
+      expect(impliedCeiling).toBeLessThan(128);
+    });
+
+    it("still refuses a credential with a real path appended", () => {
+      // Pins the start anchor. Unanchored, the predicate would find the valid
+      // path in the tail and exonerate the whole value, token and all.
+      const token = `${SYNTHETIC_OPAQUE_VALUE}${UNIT_EXEC}`;
+      const result = scrubGitHubEgressText(pair("config", token));
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(SYNTHETIC_OPAQUE_VALUE);
+    });
+
+    it("still refuses a real path with a credential appended", () => {
+      // Pins the end anchor: a real path is not a prefix a token can ride in
+      // on. Appended inside the token alphabet deliberately — an
+      // out-of-alphabet joiner would be stopped by the capture upstream and
+      // would not exercise the anchoring at all.
+      const token = `${UNIT_EXEC}/${SYNTHETIC_OPAQUE_VALUE}`;
+      const result = scrubGitHubEgressText(pair("config", token));
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(SYNTHETIC_OPAQUE_VALUE);
+    });
+
+    it("leaves a standard-base64 value starting with a slash refused", () => {
+      // The family this rule is measured hardest against: standard base64 is
+      // the only credential alphabet that emits `/` at all. 300k random
+      // values per length, slash-prefixed, newly exonerated: 0.
+      const b64 = `/${"QUJDREVGR0hJSktMTU5PUFFSU1RVVld".slice(0, 28)}`;
+      const result = scrubGitHubEgressText(pair("key", b64));
+      expect(result.classes).toContain("high-entropy-assignment");
+    });
+
+    it("does not change the verdict on a value the other detectors own", () => {
+      // A credentialed URI is full of slashes and must still be caught by its
+      // own detector; this rule only ever runs inside isOpaqueSecretValue.
+      // Assembled at runtime with the scheme split across the join, not
+      // written out: interpolating the password is not enough, because
+      // CREDENTIALED_URI_RE matches the template literal itself and this file
+      // would not push. Breaking `://` is the minimal cut that avoids it.
+      const text = [
+        "clone https:/",
+        `/dbuser:${SYNTHETIC_OPAQUE_VALUE}@github.example.com/org/repo.git now`,
+      ].join("");
+      const result = scrubGitHubEgressText(text);
+      expect(result.classes).toContain("credentialed-uri");
+      expect(result.text).not.toContain(SYNTHETIC_OPAQUE_VALUE);
+    });
+  });
+
   describe("BLO-46892 regression: a flake input git commit pin is not a credential", () => {
     // Derived, not embedded: until this fix deploys, the pre-push guard refuses the literal.
     const sha = ["2515e5ca485854475eb2739d", "73aef58d765564f2"].join("");

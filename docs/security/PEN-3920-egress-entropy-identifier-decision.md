@@ -477,3 +477,166 @@ rule, among them `uid`, `evidence`, `claim` and `RULE_ID`.
 - `HIGH_ENTROPY_MIN_BITS_PER_CHAR` stays at 3.5 (section 1).
 - The push door keeps the comment door's threshold (section 5).
 - No allowlist, env override or bypass.
+
+## 10. PEN-4637 (D8) — absolute POSIX paths, and the first name-free widening
+
+Added 2026-10-24 by the Security Engineer, from PEN-4637. Same method as above:
+read-only against the shipped bundle (`/opt/paperclip-bundled-adapters/...`, mtime
+2026-10-22 19:46) through the exported `scrubGitHubEgressText`, with a fast mirror of the
+entropy predicate validated at 0 divergences over 200,000 random values and re-validated
+against the patched source at 1 divergence in 300,000 (a `sk-` value the vendor-key
+detector owns first — the safe direction). Convention of section 2 applies: no
+`name = value` pair below is written contiguously.
+
+### 10.1 What PEN-4637 asked, and why the answer is different
+
+The row asked for a name anchor on `config`, by analogy with D7: *"name: `config` (and
+plausibly the other path-bearing label names this fleet uses — worth enumerating from the
+live label sets rather than guessing)."* That enumeration is the whole finding.
+
+Harvested with the shipped `ASSIGNMENT_RE` across Blockcast/paperclip, Blockcast/onprem-k8s
+and Blockcast/penstock-llm-proxy-core — 20,453 assignments:
+
+| measure | count |
+|---|---|
+| assignments binding a slash-rooted value | 782 |
+| distinct binding names doing so | ~250 |
+| distinct (name, value) pairs | 475 |
+| **refused today as `high-entropy-assignment`** | **69** |
+| **distinct binding names those 69 sit under** | **52** |
+
+`config` is not one of the 52. The paths that happen to be bound to it today are short and
+digit-free, exactly as the row predicted; the class is real but the name is not where it
+lives. The 52 are not a vocabulary anyone could enumerate — `new`, `prev`, `src`, `raw`,
+`href`, `name`, `CAP`, `MAP`, `MAP6`, `DLL`, `SDF`, `CONF`, `DRY`, `PROG`, `backup`,
+`override`, `remote`, `credential`, `ExecStart`, `JAVA_HOME`, `LD_PRELOAD` — and the wider
+250 include `key`, `cert`, `SA_TOKEN`, `secretsPath` and `SSH_KEY_PATH`.
+
+So D7's instrument is unavailable. A 52-name list is not an anchor, it is a snapshot, and
+the first name nobody listed reproduces the false positive. This is the drift
+`GRPC_METHOD_PATH_RE` already records for `method` / `rpc` / `grpc_method` / `full_method`,
+an order of magnitude worse.
+
+### 10.2 Verdict
+
+| # | Decision |
+|---|---|
+| D8 | **ADMIT absolute POSIX paths, SHAPE-ONLY, with no name conjunction** — the second name-free exemption in this file after `GRPC_METHOD_PATH_RE`, and permitted for the same reason: nothing of this shape is a credential, and a name list would drift. |
+| D8a | Because the shape carries the WHOLE decision, the rule admits **zero opaque mass**. Every run must be a word, a number, or a tightly bounded word-with-digits. This is the conjunct that makes a name-free widening safe, and it is what distinguishes D8 from D7 — D7 spends a 16-character opaque budget it can afford because its name anchor carries the other half. |
+| D8b | **Refused, unchanged:** `isLexicalIdentifier`'s mixed-segment cap, `HIGH_ENTROPY_MIN_BITS_PER_CHAR`, door parity, and any allowlist, env override or bypass. |
+
+Section 4's governing rule — *widen under a name anchor; never under a name-free rule* —
+is not overturned. It is a rule about where the SAFETY ARGUMENT comes from, and it says a
+name-free exemption "must be held tight". D8 is held tight by construction rather than by
+a name: the measured residual below is roughly forty times smaller than what
+`isLexicalIdentifier` already carries name-free today.
+
+### 10.3 The shape, and what each conjunct holds
+
+A value is admitted when it is slash-rooted, carries at least two segments, and every RUN
+— the text between `/`, `-`, `_` and `.` — is one of: a lowercase word, an uppercase word,
+a digit group, a CamelCase word of at least 5 characters and at most 3 words, or a
+single-case letter-initial run carrying exactly one digit group of at most 2 digits. A
+leading `.` on a segment (a dotfile) and one trailing separator (the capture of a path
+interpolated with `$(…)`) are tolerated. Totals are capped at 16 runs and 96 content
+characters.
+
+Each conjunct was measured by removing it:
+
+| conjunct | what it holds | residual without it |
+|---|---|---|
+| slash-rooted, 2+ segments | the gate. Only standard base64 emits `/` at all, at 1 char in 64; base64url, base62, base32, hex and every vendor prefix cannot produce the first character | the rule would not be reachable without it |
+| CamelCase run ≥ 5 characters | mixed-case tokens sliced into 4-character runs. `Users` is the corpus minimum at exactly 5; 6 drops nine real values | `/letters-chop@4` 1.1e-3 → **0** |
+| CamelCase ≤ 3 words | the 2.3e-1 bare-shape residual of section 3, reappearing per-run | `/letters-chop@16` **1.31e-1** (39436/300000) |
+| ≤ 2 runs mixing letters and digits | chopped base36/alphanumeric tokens. Corpus maximum over all 421 shape-matching values is exactly 2 | `/base36-chop@4` 9.8e-3 → 4.8e-5 |
+| one digit group per mixed run, ≤ 2 digits | see 10.5 — the corpus needs exactly this, and the measured alternative is in the table there | — |
+| 16 runs / 96 content characters | total admitted mass, as `LEXICAL_IDENTIFIER_MAX_CONTENT_LENGTH` does for `isLexicalIdentifier`. Corpus maxima are 16 and 93 | headroom bounds, not entropy bounds |
+
+`POSIX_PATH_MAX_LENGTH` is a cost guard and NOT a bound: 16 runs summing to 96 characters
+admit at most 113 characters in total, so the 128 cap is unreachable. A test pins that
+arithmetic so a future reader does not mistake it for load-bearing.
+
+### 10.4 Residual, 250,000 random values per family
+
+Fraction NEWLY exonerated — values the detector refuses today that this rule admits.
+Varying generators per the measurement trap in 6.3.
+
+| family | newly exonerated |
+|---|---|
+| Every flat token family, bare AND slash-prefixed — base64 url-safe, base62, base36, base32, hex upper and lower, mixed-case letters, alphanumeric, at 24 / 32 / 43 / 64 characters; UUID v4; standard base64 filtered to two or more interior slashes | **0** each |
+| 29 real credential formats, each measured bare AND slash-prefixed — GitHub PAT classic / fine-grained / OAuth, Slack bot, Stripe live and restricted, AWS key id and secret, Google API, Anthropic, OpenAI key and project key, Vault, GitLab PAT, npm, Grafana, JWT, base32 TOTP seed, Kubernetes bootstrap token, DigitalOcean, Paperclip service key, Azure SAS, UUID, raw hex and base64 blobs | **0** each |
+| **standard base64 at 24 characters, leading slash FORCED** — see below | **3.0e-6** |
+| standard base64 at 24 characters, as generated | **0** (0 / 3,000,000) |
+| standard base64 at 32 / 43 / 64 characters, forced and as generated | **0** each (0 / 3,000,000) |
+| synthetic chopped tokens — base36 / lowercase-alnum sliced into 4, 6 and 8-character slash-separated runs | 4.0e-5 to 7.2e-5 |
+| synthetic chopped tokens — mixed-case letters, 6 and 8-character runs | 8.0e-6 to 3.2e-5 |
+| synthetic chopped tokens — mixed-case letters or base62, 4-character runs | 0 |
+
+Standard base64 is the ONLY real credential alphabet that can reach this rule, because it
+is the only one that emits `/`. Measured over 3,000,000 samples per length: forcing the
+leading slash — which a generator does one time in 64 — it is admitted at 3.0e-6 at 24
+characters and at 0 for every longer length. **As actually generated, including the cost
+of the leading slash, 0 of 3,000,000 at every length.** That is the number that matters,
+and the forced-slash row is reported beside it so the margin is visible rather than hidden
+inside a probability nobody re-derived.
+
+For scale: `isLexicalIdentifier` carries 2.96e-3 to 3.57e-3 **name-free** today, and the
+name-ANCHORED D7 rule carries up to 9.85e-3. D8's worst family is 7.2e-5 — roughly forty
+times below the name-free exemption this file already ships. It is the loosest-looking
+exemption here by vocabulary and the tightest by measurement.
+
+### 10.4.1 Measured and DECLINED: a second digit group inside a mixed run
+
+`v1alpha1` — a Kubernetes API version, and 4 of the 17 values in 10.6 — needs a mixed run
+to carry TWO digit groups rather than one. Measured at 250,000 per family:
+
+| | corpus | `/base36-chop@6` | `/base36-chop@8` | `/letters-chop@6` |
+|---|---|---|---|---|
+| one digit group (shipped) | 52/69 | 4.0e-5 | 7.2e-5 | 3.2e-5 |
+| two digit groups | 56/69 | 1.4e-4 | 1.1e-4 | 6.0e-5 |
+
+A consistent 2-3x widening to buy four values of one shape, all in one path family in one
+repo. Section 6.1 declined a 1.6x widening to buy one corpus member; the same reasoning
+declines this one. It is recorded rather than omitted because it is the first thing a
+future reader will reach for, and the measurement should not have to be redone.
+
+### 10.5 What it admits, stated plainly
+
+A **deliberately constructed** value — a secret sliced into short slash-separated runs,
+each one case-homogeneous — is admitted at the rates in the last two rows. No encoder emits
+that; producing it means setting out to, which section 4 and PEN-3183 put outside this
+control's threat model.
+
+The honest statement of the bound is that this rule admits more total WORD mass than any
+other exemption here — 96 characters against `isLexicalIdentifier`'s 30 — and **zero**
+opaque mass, where D7 admits 16 characters of it. Those two numbers move in opposite
+directions on purpose: word mass is what a path is made of, opaque mass is what a secret is
+made of, and only the second is an entropy budget.
+
+### 10.6 Coverage, and the residue that stays refused
+
+Of the 69 refused values, **52 are exonerated across 42 distinct binding names**. The
+remaining 17 all carry a segment the rule calls opaque, and that is the intended outcome
+rather than a shortfall:
+
+- a uuid, a pod-template hash, a `kubepods` slice id, a container id, an 8-hex chart digest;
+- a disk serial (`ata-INTEL_SSDSC2KG240G8_PHY…`, `ata-Samsung_SSD_870_EVO_4TB_S8HT…`);
+- a run whose digits the mixed-run bound does not admit — `st2059` and `ct140` (a group
+  longer than two), `storcli64` (nine characters against a cap of eight), and `log4j2` and
+  `v1alpha1` (two digit groups in one run; see 10.4.1, measured and declined);
+- a literal `...` elision inside a documentation path.
+
+This is the right line, and PEN-4637 drew it itself: *"no segment that is itself opaque."*
+It is also the right outcome for the refusal that produced the row — those paths were
+per-seat homes carrying an execution-workspace uuid belonging to **another company**, seen
+from a Penstock seat. A rule that exonerated them would have helped publish them. The door
+failed closed on the material question as well as the shape one, and after D8 it still
+does.
+
+### 10.7 Reachable from a repo checkout
+
+PEN-4637 notes that the refusal text points at this document and that it is not present in
+`Blockcast/onprem-k8s` — it lives only at `/app/docs/security/` on the agent image and in
+`Blockcast/paperclip`. That is accurate and worth recording for anyone following the
+pointer from another checkout. Resolving it is not in D8's scope; it is a property of the
+refusal text, which D6/PEN-4428 already own.
