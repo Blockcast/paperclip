@@ -246,6 +246,46 @@ RUN curl -fsSLo /tmp/chrome-headless-shell.zip \
   && rm -f /tmp/chrome-headless-shell.zip \
   && google-chrome --version | grep -Fq "${CHROME_HEADLESS_SHELL_VERSION}"
 
+# PEN-4682. Resolve `google-chrome` by NAME to the pinned headless shell above,
+# whatever a PVC left lying on PATH. An agent Job's `/paperclip/bin` is
+# persistent fleet state that both k8s adapters place AFTER this directory, and
+# it carried a June-2026 symlink to an ad hoc puppeteer Chrome 149 download —
+# precisely the desktop-surface build the pin above exists to avoid. Measured
+# 2026-10-24 in a live Job pod, that binary hangs (rc 124, no PNG) under
+# `--user-data-dir`, the form the docs and paperclip-browser-smoke both use.
+#
+# WHY THIS DIRECTORY, which is otherwise the GitHub egress wrappers' home
+# (PEN-3713/PEN-3925): it is the one image-owned directory both adapters force
+# to PATH[0], off a single IMAGE_WRAPPER_BIN_DIR constant. Winning there is the
+# same mechanism that makes the `gh`/`git` wrappers beat agent-writable PVC
+# copies. Unlike those, this one IS a name a human types — shadowing the PVC
+# copy is the entire purpose.
+#
+# WHY NOT REPOINT /paperclip/bin/google-chrome INSTEAD: nothing inside a Job
+# can. Under BLO-32734 subPath narrowing `bin` is one of ROOT_TOOLCHAIN_SUBPATHS
+# and is re-mounted read-only in both the init and main containers, so
+# `install_browser_link` in scripts/docker-entrypoint.sh would fail there even
+# if a Job's `command:` override ever reached it — and non-fatally, so
+# silently. A PATH win needs no write at all and holds on fresh, stale and
+# read-only PVCs alike.
+#
+# WHY HERE AND NOT Dockerfile.agent, which is where this directory is otherwise
+# populated: that file is asserted to be a pure COPY overlay with no RUN
+# ("keeps the per-commit agent image as a toolchain overlay",
+# packages/adapter-utils/src/agent-dockerfile.test.ts), so the per-commit build
+# stays cheap. `COPY --from=server .../libexec/paperclip/bin` there MERGES into
+# this directory rather than replacing it, so the shim survives that copy. The
+# PEN-4682 control in docker-agent.yml measures that on the built agent image
+# rather than trusting the merge semantics.
+#
+# Targets $CHROME_BIN's own path, not /opt/..., so the version pin above stays
+# the single source of truth.
+RUN set -eu; \
+  mkdir -p /usr/local/libexec/paperclip/bin; \
+  ln -sfn /usr/local/bin/google-chrome /usr/local/libexec/paperclip/bin/google-chrome; \
+  test "$(realpath /usr/local/libexec/paperclip/bin/google-chrome)" \
+     = "$(realpath /opt/chrome-headless-shell/chrome-headless-shell)"
+
 COPY scripts/smoke/agent-browser-screenshot.sh /usr/local/bin/paperclip-browser-smoke
 RUN chmod 0755 /usr/local/bin/paperclip-browser-smoke
 ENV CHROME_BIN=/usr/local/bin/google-chrome
