@@ -17,12 +17,14 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import {
+  buildTerminalGateHumanOnlyComment,
   buildTerminalGateResolvedComment,
   listResolvedTerminalGates,
   parseTerminalGateSignal,
   readIssueMonitorGateSignals,
   reconcileTerminalGates,
   resolveTerminalGate,
+  terminalGateHumanOnlyIdempotencyKey,
   terminalGateResolutionIdempotencyKey,
   type ReadPullRequestGate,
 } from "../services/terminal-gate-reconciler.js";
@@ -66,6 +68,47 @@ describe("parseTerminalGateSignal", () => {
     for (const token of ["deploy:paperclip-api", "pr:blockcast/paperclip:merged", "pr:nope#1:merged", ""]) {
       const parsed = parseTerminalGateSignal(token);
       expect(parsed === null || parsed.kind === "unresolvable").toBe(true);
+    }
+  });
+
+  // PEN-4545. A human-gate token is no more *readable* than an infra token —
+  // the split is about who can ever clear it, because that decides whether
+  // waiting is a strategy or is itself the failure.
+  it("classifies a token naming a human decision as `human_gate`, not `unresolvable`", () => {
+    expect(parseTerminalGateSignal("omar-go:#2686")).toEqual({
+      kind: "human_gate",
+      raw: "omar-go:#2686",
+      owner: "omar-go",
+    });
+    for (const token of [
+      "omar-go",
+      "hold-lift:#2688",
+      "human-go:pen-4475",
+      "approval:dcb2b957",
+      "board-approval:6b0a2bff",
+      "card:dcb2b957",
+      "signoff:security",
+      "cto-ruling:pen-4545",
+    ]) {
+      expect(parseTerminalGateSignal(token)).toMatchObject({ kind: "human_gate" });
+    }
+  });
+
+  it("keeps machine-resolvable infra tokens OUT of the human-gate class", () => {
+    // These are unparseable *here* but the assignee's own poll does resolve
+    // them, and no human is expected to clear them. Announcing "waiting on a
+    // person" over one would be a false claim, so the allowlist must not widen
+    // to "anything unparseable". Census from `listCandidateIssues`.
+    for (const token of [
+      "mq:drained",
+      "heap:stable",
+      "argo:synced",
+      "cron:nightly",
+      "insync:true",
+      "deploy:landed",
+      "deploy:paperclip-api",
+    ]) {
+      expect(parseTerminalGateSignal(token)).toMatchObject({ kind: "unresolvable" });
     }
   });
 });
@@ -117,8 +160,75 @@ describe("resolveTerminalGate", () => {
     expect(verdict).toMatchObject({ kind: "unresolved", reason: "unresolvable_signal" });
   });
 
-  it("fails closed when the gate read errors", async () => {
+  // PEN-4545: the verdict between "satisfied" and "unresolved".
+  it("reports `human_gate_only` when the machine half is satisfied and a person is all that remains", async () => {
     const verdict = await resolveTerminalGate({
+      gateSignals: ["omar-go:#2686", "pr:blockcast/penstock-llm-proxy-core#2686:merged"],
+      readPullRequestGate: mergedReader(new Set(["blockcast/penstock-llm-proxy-core#2686"])),
+    });
+    expect(verdict).toEqual({
+      kind: "human_gate_only",
+      signals: ["omar-go:#2686", "pr:blockcast/penstock-llm-proxy-core#2686:merged"],
+      humanGates: ["omar-go:#2686"],
+      mergedPullRequests: ["blockcast/penstock-llm-proxy-core#2686"],
+    });
+  });
+
+  it("reports `human_gate_only` for a gate set that is nothing BUT a human decision", async () => {
+    // The literal PEN-4545 specimen: a monitor whose whole declared gate is a
+    // go from one person. Vacuously "every machine gate satisfied", and the
+    // row most in need of the notice — nothing it waits on is pollable.
+    let reads = 0;
+    const verdict = await resolveTerminalGate({
+      gateSignals: ["hold-lift:#6493"],
+      readPullRequestGate: async () => {
+        reads += 1;
+        return { state: "open", merged: false };
+      },
+    });
+    expect(verdict).toMatchObject({ kind: "human_gate_only", humanGates: ["hold-lift:#6493"] });
+    expect(reads).toBe(0);
+  });
+
+  it("does NOT announce a human gate while a declared pull request is still open", async () => {
+    // The machine half is genuinely outstanding, so the row IS waiting on
+    // something a re-check can change. Claiming "only a person is left" here
+    // would be false and would mis-route the escalation.
+    const verdict = await resolveTerminalGate({
+      gateSignals: ["omar-go:#2686", "pr:blockcast/paperclip#1281:merged"],
+      readPullRequestGate: mergedReader(new Set()),
+    });
+    expect(verdict).toMatchObject({ kind: "unresolved", reason: "pull_request_open" });
+  });
+
+  it("does NOT announce a human gate when a closed-unmerged pull request is in the set", async () => {
+    const verdict = await resolveTerminalGate({
+      gateSignals: ["approval:dcb2b957", "pr:blockcast/paperclip#1281:merged"],
+      readPullRequestGate: async () => ({ state: "closed", merged: false }),
+    });
+    expect(verdict).toMatchObject({ kind: "unresolved", reason: "pull_request_closed_unmerged" });
+  });
+
+  it("an infra token alongside a human gate still fails closed, and still costs zero reads", async () => {
+    // The parse loop must run to completion before any read, so the documented
+    // "unparseable tokens cost zero network calls" property survives PEN-4545.
+    let reads = 0;
+    const verdict = await resolveTerminalGate({
+      gateSignals: [
+        "omar-go:#2686",
+        "deploy:paperclip-api",
+        "pr:blockcast/paperclip#1281:merged",
+      ],
+      readPullRequestGate: async () => {
+        reads += 1;
+        return { state: "closed", merged: true };
+      },
+    });
+    expect(verdict).toMatchObject({ kind: "unresolved", reason: "unresolvable_signal" });
+    expect(reads).toBe(0);
+  });
+
+  it("fails closed when the gate read errors", async () => {    const verdict = await resolveTerminalGate({
       gateSignals: ["pr:blockcast/paperclip#1281:merged"],
       readPullRequestGate: async () => ({ error: "missing_github_app_credentials" }),
     });
@@ -220,6 +330,47 @@ describe("buildTerminalGateResolvedComment", () => {
     });
     expect(stranded).toContain("nothing is polling it");
     expect(stranded).toContain("re-arm the monitor");
+    expect(stranded).not.toContain("live wake path");
+  });
+});
+
+describe("buildTerminalGateHumanOnlyComment", () => {
+  it("names the human gate and states plainly that it is not a resolution", () => {
+    const body = buildTerminalGateHumanOnlyComment({
+      signals: ["omar-go:#2686", "pr:blockcast/penstock-llm-proxy-core#2686:merged"],
+      humanGates: ["omar-go:#2686"],
+      mergedPullRequests: ["blockcast/penstock-llm-proxy-core#2686"],
+    });
+    expect(body).toContain("omar-go:#2686");
+    expect(body).toContain("blockcast/penstock-llm-proxy-core#2686");
+    expect(body).toContain("PEN-4545");
+    // The whole point: an agent reading this must not act on it as a closure.
+    expect(body).toContain("nothing here closes the issue");
+    expect(body).not.toContain("Terminal gate resolved");
+  });
+
+  it("tells an armed row its next check cannot help, without calling it stranded", () => {
+    // Same hazard as BLO-36289 on the resolved builder: the documented repair
+    // for a stranded row destroys the wake path it already has. A human-gated
+    // row usually IS armed — that is exactly what made PEN-4545's six rows
+    // read as attended — so this branch carries more traffic than its sibling.
+    const nextCheckAt = new Date("2026-10-26T09:00:00.000Z");
+    const armed = buildTerminalGateHumanOnlyComment({
+      signals: ["omar-go:#2686"],
+      humanGates: ["omar-go:#2686"],
+      mergedPullRequests: [],
+      armedNextCheckAt: nextCheckAt,
+    });
+    expect(armed).toContain(nextCheckAt.toISOString());
+    expect(armed).toContain("live wake path");
+    expect(armed).not.toContain("has stopped re-checking");
+
+    const stranded = buildTerminalGateHumanOnlyComment({
+      signals: ["omar-go:#2686"],
+      humanGates: ["omar-go:#2686"],
+      mergedPullRequests: [],
+    });
+    expect(stranded).toContain("has stopped re-checking");
     expect(stranded).not.toContain("live wake path");
   });
 });
@@ -917,8 +1068,125 @@ describeEmbeddedPostgres("reconcileTerminalGates", () => {
     expect(await commentsFor(issueId)).toHaveLength(0);
   });
 
-  it("exposes the recorded resolution to the productivity-review detector, keyed on the current signal set", async () => {
-    const { companyId, agentId } = await createCompany("TG7");
+  // ---------------------------------------------------------------------
+  // PEN-4545: the human-gate announcement.
+  //
+  // Worked example these replay: PEN-4475 / #2686 and PEN-4304 / #2688 sat
+  // `in_review` for ~24h behind "do not merge until Omar gives an explicit go",
+  // declared on the monitor as an `omar-go` gate signal. Each had an armed
+  // `monitorNextCheckAt`, so every dashboard read them as attended. The sweep
+  // that would have seen them dropped each one at `unresolvable_signal` — the
+  // same silent branch an infra token takes — so the one board-side audit that
+  // reads `gateSignals` was structurally blind to the gate class that most
+  // needs a reader.
+  // ---------------------------------------------------------------------
+
+  it("announces a row whose declared PR merged but whose human gate still stands", async () => {
+    const { companyId, agentId } = await createCompany("TG8");
+    const issueId = await insertStrandedGateIssue({
+      companyId,
+      agentId,
+      identifier: "TG8-1",
+      gateSignals: ["omar-go:#2686", "pr:blockcast/penstock-llm-proxy-core#2686:merged"],
+    });
+
+    const result = await reconcileTerminalGates(db, {
+      now: NOW,
+      readPullRequestGate: mergedReader(new Set(["blockcast/penstock-llm-proxy-core#2686"])),
+    });
+
+    expect(result).toMatchObject({ scanned: 1, resolved: 0, humanGateOnly: 1 });
+    const comments = await commentsFor(issueId);
+    expect(comments).toHaveLength(1);
+    expect(comments[0]!.authorType).toBe("system");
+    expect(comments[0]!.key).toBe(
+      terminalGateHumanOnlyIdempotencyKey([
+        "omar-go:#2686",
+        "pr:blockcast/penstock-llm-proxy-core#2686:merged",
+      ]),
+    );
+    expect(comments[0]!.body).toContain("omar-go:#2686");
+    // Must never read as a closure: `resolved` stayed 0 and the copy says so.
+    expect(comments[0]!.body).toContain("nothing here closes the issue");
+  });
+
+  it("announces a row whose whole gate is a human go, which is the shape that was invisible", async () => {
+    const { companyId, agentId } = await createCompany("TG9");
+    const issueId = await insertStrandedGateIssue({
+      companyId,
+      agentId,
+      identifier: "TG9-1",
+      gateSignals: ["omar-go:#2688"],
+    });
+
+    const result = await reconcileTerminalGates(db, {
+      now: NOW,
+      readPullRequestGate: mergedReader(new Set()),
+    });
+
+    // Zero GitHub reads: there is no PR gate to read, so the notice is free.
+    expect(result).toMatchObject({ scanned: 1, humanGateOnly: 1, pullRequestReads: 0 });
+    expect(await commentsFor(issueId)).toHaveLength(1);
+  });
+
+  it("is idempotent, and the SQL anti-join keeps an announced human-gate row out of the scan window", async () => {
+    // Without the human-only prefix in the anti-join, this row would be
+    // re-admitted on every pass forever, consuming a SCAN_LIMIT slot it can
+    // never clear — the starvation vector the resolved-side anti-join exists
+    // to remove, reached through the new door. `scanned: 0` is the assertion
+    // that matters; `humanGateOnly: 0` alone would pass on a JS-side filter.
+    const { companyId, agentId } = await createCompany("TGA");
+    const issueId = await insertStrandedGateIssue({
+      companyId,
+      agentId,
+      identifier: "TGA-1",
+      gateSignals: ["hold-lift:#2655", "pr:blockcast/penstock-llm-proxy-core#2655:merged"],
+    });
+
+    const first = await reconcileTerminalGates(db, {
+      now: NOW,
+      readPullRequestGate: mergedReader(new Set(["blockcast/penstock-llm-proxy-core#2655"])),
+    });
+    expect(first).toMatchObject({ scanned: 1, humanGateOnly: 1 });
+
+    const second = await reconcileTerminalGates(db, {
+      now: NOW,
+      readPullRequestGate: async () => {
+        throw new Error("a re-announced human gate must not re-read GitHub");
+      },
+    });
+    expect(second).toMatchObject({ scanned: 0, resolved: 0, humanGateOnly: 0, pullRequestReads: 0 });
+    expect(await commentsFor(issueId)).toHaveLength(1);
+  });
+
+  it("does NOT let a human-gate announcement suppress a productivity review", async () => {
+    // A human-gated row is the case where oversight is MOST warranted: the
+    // work is finished and unreachable, and nobody has been told. Folding it
+    // into the resolution map would retire the accountability that is the only
+    // remaining pressure on the gate.
+    const { companyId, agentId } = await createCompany("TGB");
+    const issueId = await insertStrandedGateIssue({
+      companyId,
+      agentId,
+      identifier: "TGB-1",
+      gateSignals: ["omar-go:#2686", "pr:blockcast/penstock-llm-proxy-core#2686:merged"],
+    });
+
+    await reconcileTerminalGates(db, {
+      now: NOW,
+      readPullRequestGate: mergedReader(new Set(["blockcast/penstock-llm-proxy-core#2686"])),
+    });
+    expect(await commentsFor(issueId)).toHaveLength(1);
+
+    const [row] = await db
+      .select({ id: issues.id, executionState: issues.executionState })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    const resolvedMap = await listResolvedTerminalGates(db, [row!]);
+    expect(resolvedMap.has(issueId)).toBe(false);
+  });
+
+  it("exposes the recorded resolution to the productivity-review detector, keyed on the current signal set", async () => {    const { companyId, agentId } = await createCompany("TG7");
     const issueId = await insertStrandedGateIssue({
       companyId,
       agentId,
