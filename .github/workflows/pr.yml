@@ -323,8 +323,10 @@ jobs:
         # The tests this runs are regression pins on exactly those traps, not
         # coverage of the arithmetic — they assert that the whole-window fit
         # collapses against the segmented one, that the teardown query carries
-        # no `by (...)` clause, and that a sign-unstable window is reported as
-        # a non-result rather than averaged into one slope.
+        # no `by (...)` clause but DOES carry the same `pod` selector as the
+        # residual it is regressed against (the worker runs 2 replicas and the
+        # collector migrates between them), and that a sign-unstable window is
+        # reported as a non-result rather than averaged into one slope.
         if: ${{ !cancelled() }}
         run: node --test ./scripts/cgroup-residual-teardown-fit.test.mjs
         timeout-minutes: 1
