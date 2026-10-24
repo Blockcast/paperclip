@@ -1167,6 +1167,20 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
       throw unprocessable("Only the active reviewer or approver can advance the current execution stage");
     }
 
+    // BLO-36237: drift repair rewrites the issue back to `in_review`, which
+    // silently discards a requested terminal status and still returns 200 —
+    // a split-comment approve (or an approve from the wrong seat) then reads
+    // as success while the stage re-pends and the recovery sweep loops.
+    // Fail loudly with the shape that would actually record the decision.
+    if (stageStateDrifted && (requestedStatus === "done" || requestedStatus === "cancelled")) {
+      throw unprocessable(
+        `Cannot move to ${requestedStatus}: the ${activeStage.type} stage is pending on its participant. ` +
+          'Only that participant (or an authorized override) can decide it, with {"status":"done","comment":"..."} ' +
+          "in ONE PATCH; a comment posted separately is not a stage decision",
+        { currentParticipant, stageType: activeStage.type },
+      );
+    }
+
     if (stageStateDrifted) {
       buildPendingStagePatch({
         patch,

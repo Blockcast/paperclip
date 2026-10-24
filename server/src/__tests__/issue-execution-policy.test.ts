@@ -695,6 +695,55 @@ describe("issue execution policy transitions", () => {
       ).toThrow("Only the active reviewer or approver can advance");
     });
 
+    // BLO-36237: the measured BLO-31634 loop. The row sat in_review but was
+    // assigned to the executor (drift), so `{status:"done"}` with the comment
+    // posted separately fell into drift repair, was rewritten to in_review,
+    // and returned 200 — indistinguishable from success.
+    const driftedIssue = {
+      status: "in_review",
+      assigneeAgentId: coderAgentId,
+      assigneeUserId: null,
+      executionPolicy: policy,
+      executionState: {
+        status: "pending" as const,
+        currentStageId: reviewStageId,
+        currentStageIndex: 0,
+        currentStageType: "review" as const,
+        currentParticipant: { type: "agent" as const, agentId: qaAgentId },
+        returnAssignee: { type: "agent" as const, agentId: coderAgentId },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    };
+
+    for (const requestedStatus of ["done", "cancelled"]) {
+      it(`rejects ${requestedStatus} on a drifted stage instead of silently re-pending it`, () => {
+        expect(() =>
+          applyIssueExecutionPolicyTransition({
+            issue: driftedIssue,
+            policy,
+            requestedStatus,
+            requestedAssigneePatch: {},
+            actor: { agentId: coderAgentId },
+          }),
+        ).toThrow(/Cannot move to .*in ONE PATCH/);
+      });
+    }
+
+    it("still repairs a drifted stage on a comment-only update", () => {
+      const result = applyIssueExecutionPolicyTransition({
+        issue: driftedIssue,
+        policy,
+        requestedStatus: undefined,
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+        commentBody: "Approved, see PR",
+      });
+      expect(result.patch).toMatchObject({ status: "in_review", assigneeAgentId: qaAgentId });
+      expect(result.decision).toBeUndefined();
+    });
+
     it("non-participant can still post non-advancing updates", () => {
       const result = applyIssueExecutionPolicyTransition({
         issue: {
