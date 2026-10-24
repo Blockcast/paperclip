@@ -19,6 +19,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  KNOWN_PENSTOCK_PROBE_OUTCOMES,
   PENSTOCK_AVAILABILITY_GATE_PROBE_DURATION_METRIC,
   PENSTOCK_AVAILABILITY_GATE_PROBE_METRIC,
   __resetMetricsForTest,
@@ -72,14 +73,25 @@ async function probeSeries(): Promise<ProbeSeries[]> {
 
 /**
  * Sum of series matching every supplied label. Returns 0 for "no such series",
- * so an assertion of 0 covers both "counted zero" and "never minted" — which is
- * the honest reading, since the counter is deliberately not pre-seeded.
+ * so an assertion of 0 covers both "counted zero" and "never minted". Since
+ * PEN-4675 those two are no longer the same thing for an outcome inside a tuple
+ * that has probed at least once — use {@link outcomesFor} when the question is
+ * whether the series exists rather than what it counts.
  */
 async function probeCount(match: Record<string, string>): Promise<number> {
   const series = await probeSeries();
   return series
     .filter((entry) => Object.entries(match).every(([key, value]) => entry.labels[key] === value))
     .reduce((total, entry) => total + entry.value, 0);
+}
+
+/** Outcome labels that have a materialised series for one tuple, sorted. */
+async function outcomesFor(match: Record<string, string>): Promise<string[]> {
+  const series = await probeSeries();
+  return series
+    .filter((entry) => Object.entries(match).every(([key, value]) => entry.labels[key] === value))
+    .map((entry) => String(entry.labels.outcome))
+    .sort();
 }
 
 async function observedPaths(): Promise<string[]> {
@@ -388,5 +400,78 @@ describe("penstock availability gate probe instrumentation (BLO-29900)", () => {
       provider: "unknown",
       model: "unknown",
     });
+  });
+
+  // PEN-4675. The defect these cover is not a wrong number, it is a missing
+  // series that reads as a reassuring one: on PEN-2514/PEN-4462
+  // `outcome="deny_capacity"` was absent for 80 consecutive hours while the
+  // gate was demonstrably probing, so "no denials" and "no exporter" were the
+  // same observation. Asserting only that a fired outcome counts 1 cannot catch
+  // that — the assertions below are about which children EXIST.
+  it("materialises every outcome at zero for a tuple on its first probe", async () => {
+    recordPenstockAvailabilityGateProbe({
+      path: "capacity",
+      outcome: "ok",
+      provider: "anthropic",
+      model: MODEL,
+    });
+
+    const tuple = { path: "capacity", provider: "anthropic", model: MODEL };
+    expect(await outcomesFor(tuple)).toEqual([...KNOWN_PENSTOCK_PROBE_OUTCOMES].sort());
+    // The one that fired counts; the rest are present and zero, which is what
+    // makes `absent()` and `== 0` different readings again.
+    expect(await probeCount({ ...tuple, outcome: "ok" })).toBe(1);
+    expect(await probeCount({ ...tuple, outcome: "deny_capacity" })).toBe(0);
+
+    const { body } = await renderMetrics();
+    expect(body).toMatch(
+      new RegExp(
+        `${PENSTOCK_AVAILABILITY_GATE_PROBE_METRIC}\\{[^\\n]*outcome="deny_capacity"[^\\n]*\\} 0`,
+      ),
+    );
+  });
+
+  it("seeds per tuple, so it never mints a path, provider or model that has not probed", async () => {
+    recordPenstockAvailabilityGateProbe({
+      path: "capacity",
+      outcome: "ok",
+      provider: "anthropic",
+      model: MODEL,
+    });
+
+    // Seeding must not fabricate the expensive path: an absent
+    // messages_fallback series still means the fallback has not been taken.
+    expect(await observedPaths()).toEqual(["capacity"]);
+    // Nor a provider/model tuple nothing has probed. `provider` is uncoerced
+    // and `model` comes from operator config, so neither is enumerable up front
+    // — which is why seeding is lazy rather than done at process start.
+    expect(await outcomesFor({ provider: "codex" })).toEqual([]);
+    expect(await outcomesFor({ model: "some-other-model" })).toEqual([]);
+
+    recordPenstockAvailabilityGateProbe({
+      path: "messages_fallback",
+      outcome: "deny_capacity",
+      provider: "anthropic",
+      model: MODEL,
+    });
+    expect(await observedPaths()).toEqual(["capacity", "messages_fallback"]);
+    expect(await outcomesFor({ path: "messages_fallback", provider: "anthropic", model: MODEL }))
+      .toEqual([...KNOWN_PENSTOCK_PROBE_OUTCOMES].sort());
+  });
+
+  it("does not re-zero a seeded tuple on later probes", async () => {
+    for (let i = 0; i < 3; i += 1) {
+      recordPenstockAvailabilityGateProbe({
+        path: "capacity",
+        outcome: "deny_capacity",
+        provider: "anthropic",
+        model: MODEL,
+      });
+    }
+
+    // Seeding uses inc(labels, 0), so a repeat pass would be harmless to the
+    // value — but it would be three redundant children per probe. This asserts
+    // the accumulated count survives, which is the part a bad reset would break.
+    expect(await probeCount({ path: "capacity", outcome: "deny_capacity" })).toBe(3);
   });
 });
