@@ -14501,9 +14501,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       "",
       // BLO-37268: the remedy is the non-destructive one, and the destructive
       // one is named only to be warned against. Moving the head was measured to
-      // cost all three of these at once on Blockcast/multicast#778, where the
+      // cost both of these at once on Blockcast/multicast#778, where the
       // review the notice declared absent landed 72 minutes later.
-      "If nothing is queued, re-request the review on the PR: a start-of-body `<!-- paperclip:review-request -->` marker **and** a bare `@ally` mention (the marker alone is silently dropped). Do not move the head to force a re-review — a new head voids any review still in flight, voids every pending review-request marker at the old head, and re-burns the entire green required-check set.",
+      //
+      // PEN-4663: this used to assert a THIRD cost -- that a new head "voids
+      // every pending review-request marker at the old head". No such mechanism
+      // exists. A marker request wakes under `github_pr_review_requested`, which
+      // buildPrReviewerWakeIdempotencyKey scopes to the GitHub COMMENT ID
+      // (`...:comment:<id>`), precisely so "a later explicit re-review comment
+      // can wake Ally again"; only `github_pr_synchronized` is head-scoped
+      // (PEN-2865). There is no head in the marker's key, so a push cannot void
+      // it -- the only thing that retires pending reviewer runs is
+      // converted_to_draft, via cancelPendingRunsForTask.
+      //
+      // The conclusion is unchanged and still correct; only its support moves.
+      // A push DOES wake the reviewer (`pull_request.synchronize`), so the
+      // honest argument is COST, not ineffectiveness. That matters because a
+      // false support under true advice is worse than no support: the next
+      // reader to disprove the clause in one grep discards the warning with it
+      // and goes on to burn a head. Caught by Ally on Blockcast/paperclip#2980.
+      "If nothing is queued, re-request the review on the PR: a start-of-body `<!-- paperclip:review-request -->` marker **and** a bare `@ally` mention (the marker alone is silently dropped). Do not move the head to force a re-review. A push DOES wake the reviewer (`synchronize`), so this is an argument from cost, not from ineffectiveness: it voids any review still in flight and re-burns the entire green required-check set, to buy what the marker buys for one comment.",
     ].join("\n");
 
     for (const issue of linked) {
