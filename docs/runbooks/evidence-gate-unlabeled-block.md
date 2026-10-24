@@ -352,15 +352,39 @@ jq -r 'def ts: sub("\\.[0-9]+Z$"; "Z") | fromdate;
 The `.[0-9]+Z` strip is required: `fromdate` rejects the fractional seconds these
 timestamps carry.
 
-#### ⛔ RULED 2026-10-24 (CTO, PEN-4624) — this signature is FROZEN: it cannot fire on a verdict newer than 2026-07-11
+#### ⛔ RULED 2026-10-24 (CTO, PEN-4624) — this signature has gone silent: it has not fired on any verdict since 2026-07-11, and on today's rows it structurally cannot
 
 **Read this before running the decomposition below.** The signature the next
-section decomposes — `verdict: warn` ∧ `missing ∋ pr-link` — is produced by an
-evaluator that was replaced on 2026-07-12. **The current evaluator has never
-emitted `pr-link` in `missing`, not once.** So an empty or all-ancient result
-from that recipe means the instrument is **blind**, not that the fleet is clean.
-That is a false-*reassurance* failure, and it runs opposite to the false-FAIL
-risk this document warns about everywhere else.
+section decomposes — `verdict: warn` ∧ `missing ∋ pr-link` — **has not appeared
+on a single one of the 1,071 verdicts written since 2026-07-12.** So an empty or
+all-ancient result from that recipe means the instrument is **silent**, not that
+the fleet is clean. That is a false-*reassurance* failure, and it runs opposite
+to the false-FAIL risk this document warns about everywhere else.
+
+⚠️ **Be precise about why, because the loose version of this claim is false.**
+The evaluator is perfectly capable of emitting `pr-link`: `missing` is computed
+as `required.filter((s) => !detections[s])` (`server/src/services/evidence-gate.ts:881`),
+and `DEFAULT_EVIDENCE_REGISTRY.pr.required = ["pr-link"]`
+(`server/src/services/evidence-shapes.ts:115-117`), so a **`pr`-labelled** issue
+closing without a detected PR link *does* put `pr-link` in `missing` today.
+
+What makes the signature silent here is the **required set actually in force**:
+
+- A row whose labels match no registry entry falls back to
+  `DEFAULT_UNLABELED_REQUIRED`, which is exactly
+  `["checklist:done-when", "review:ally-clean"]`
+  (`evidence-shapes.ts:212-215`, `evidence-gate.ts:195`). `pr-link` is **not in
+  it**, so on that path it cannot enter `missing` by construction.
+- **All 1,071 post-cutover verdicts in this company are `unlabeledFallback: true`
+  — every single one.** Not one row in the window matched a registry label.
+
+So the silence is structural *for the rows this company actually produces*, and
+contingent on labelling rather than permanent: **the day someone labels an issue
+`pr`, this signature can fire again.** Do not read the measurement below as a
+property of the evaluator, and do not write "cannot" without the labelling
+qualifier — this is exactly the negative-existence over-read the rest of this
+document warns against. (Caught in review on #2964; the first draft of this
+ruling made precisely that error.)
 
 **Measured 2026-10-24**, company `b1d3f3d3`, the complete `done` population paged
 to exhaustion — 3,161 rows in four pages of 1000/1000/1000/**161**. 1,346 carry a
@@ -375,7 +399,9 @@ verdict. The boundary is sharp:
 "this verdict predates the current evaluator" test, and it is cheaper than a
 date comparison.
 
-The two evaluators report in disjoint vocabularies:
+The two eras report in disjoint vocabularies. These are the **complete**
+observed token sets, not a selection — each era emitted exactly two distinct
+`missing` tokens across its whole population, and the table is their union:
 
 | `missing` token | PRE (n=275) | POST (n=1,071) |
 |---|---|---|
@@ -386,9 +412,13 @@ The two evaluators report in disjoint vocabularies:
 The current evaluator reports PR evidence through **`allDetected`** instead:
 `pr-link` appears there on **918 of 1,071 (85.7%)** post-cutover rows.
 
+Note the POST column is `DEFAULT_UNLABELED_REQUIRED` exactly — which is the
+mechanism above showing up in the data, not a coincidence.
+
 **Consequence: all 38 signature rows are pre-cutover.** The decomposition below
-is still arithmetically correct, but it describes a candidate pool that has been
-frozen since 2026-07-11 and can never grow.
+is still arithmetically correct, but it describes a candidate pool that has not
+grown since 2026-07-11 and will not grow while every row keeps taking the
+unlabeled fallback.
 
 ##### The live predicate, and its decomposition
 
@@ -547,7 +577,8 @@ All three surviving residuals completed in **June 2026** — `PEN-663`
 *"There is no recent phantom-done candidate anywhere in the company."* That was
 **true of the residual and wrong as an inference about the fleet**, and the
 difference is the whole point: the residual is ancient because the signature
-stopped being emitted on 2026-07-11, not because closures got cleaner.
+stopped being emitted on 2026-07-11 (see the ruling above for the mechanism),
+not because closures got cleaner.
 Re-measured on 2026-10-24 the residual is unchanged — the same four June rows
 (three after the `originKind` screen) — even though the `done` population has
 grown by **95 rows since that residual was first measured** (3,066 at PEN-4539 →
@@ -578,11 +609,12 @@ predicate in the 2026-10-24 ruling above instead.
   about the closure.
 - **Check which evaluator wrote the verdict before reading its `missing` list.**
   `allDetected == null` means the verdict predates the 2026-07-12 cutover and
-  speaks a different vocabulary — it *can* say `pr-link`, and the current
-  evaluator never does. Conversely a post-cutover verdict reports PR evidence by
-  its **presence in `allDetected`**, so "`pr-link` is not in `missing`" is not
-  evidence that a PR was found. Reading the two shapes as one field is what left
-  this detector frozen and unnoticed for 3.5 months (PEN-4624).
+  speaks a different vocabulary — it *can* say `pr-link`, whereas a post-cutover
+  verdict on the unlabeled fallback cannot, because `pr-link` is not in
+  `DEFAULT_UNLABELED_REQUIRED`. A post-cutover verdict reports PR evidence by
+  **presence in `allDetected`** instead, so "`pr-link` is not in `missing`" is
+  not evidence that a PR was found. Reading the two shapes as one field is what
+  left this detector silent and unnoticed for 3.5 months (PEN-4624).
 - The artifact — a PR with a merged commit SHA — is the only authority on
   whether a row is correctly `done`. The verdict is a triage hint that narrows
   where to look; it never substitutes for the artifact.
