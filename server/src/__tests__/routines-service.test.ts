@@ -2549,6 +2549,42 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     });
   }
 
+  // Ally review: with no `timeoutAt`, the fallback anchor must be immutable.
+  // The recovery sweep rewrites `updatedAt` on every pass, so a fresh
+  // `updatedAt` on an old action must not keep it protecting forever.
+  it("fires past an escalated recovery action with no timeoutAt and a sweep-fresh updatedAt", async () => {
+    const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
+    const held = await seedGatingExecutionIssue({
+      companyId,
+      agentId,
+      routine,
+      issueSvc,
+      runStatus: "succeeded",
+      runStartedAt: new Date(Date.now() - STALE_FIRE_AGE_MS),
+      issueCreatedAt: new Date(Date.now() - STALE_FIRE_AGE_MS),
+      updatedAt: new Date("2026-03-20T12:01:00.000Z"),
+      bindExecutionRun: true,
+    });
+    await db.insert(issueRecoveryActions).values({
+      companyId,
+      sourceIssueId: held.issue.id,
+      kind: "missing_disposition",
+      status: "escalated",
+      cause: "successful_run_missing_state",
+      fingerprint: randomUUID(),
+      nextAction: "wait",
+      timeoutAt: null,
+      createdAt: new Date(Date.now() - STALE_FIRE_AGE_MS),
+      updatedAt: new Date(),
+    });
+    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, held.issue.id));
+
+    const run = await svc.runRoutine(routine.id, { source: "schedule" });
+
+    expect(run.status).toBe("issue_created");
+    expect(run.linkedIssueId).not.toBe(held.issue.id);
+  });
+
   it("still gates on an escalated recovery action inside its horizon", async () => {
     const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
     const held = await seedGatingExecutionIssue({
