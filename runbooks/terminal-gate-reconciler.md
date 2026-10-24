@@ -6,11 +6,14 @@ Re-reads the pull-request gates an issue monitor declared in
 `executionPolicy.monitor.gateSignals`, and — when every one of them is merged —
 posts a system comment on the issue naming the resolved gate.
 
-When the pull-request gates are all merged but the monitor also declared a gate
-naming a **human** (`omar-go`, `hold-lift`, `approval:…`), it posts a different
-comment instead, saying so: the machine half is done and the remainder is a
-person who has not been told this row exists. See *The human-gate announcement
-(PEN-4545)* below. That is a report, never a resolution.
+When nothing a re-check could change is outstanding and the monitor also
+declared a gate naming a **human** (`omar-go`, `hold:…`, `hold-lift`,
+`approval:…`), it posts a different comment instead, saying so: the remainder
+is a person who has not been told this row exists. That covers a pull request
+held **open** by a named person as well as a human gate standing after every
+pull request merged — see *The human-gate announcement (PEN-4545)* below, and
+in particular *the gate and the pull request it names are one statement*. That
+is a report, never a resolution.
 
 Three populations qualify (`listCandidateIssues`): a **terminated** monitor,
 which has stopped polling (`monitorNextCheckAt IS NULL`); an **armed but never
@@ -180,13 +183,54 @@ were waiting for.
 
 `parseTerminalGateSignal` now returns a third kind, `human_gate`, for tokens on
 an explicit allowlist — `HUMAN_GATE_TOKEN_PREFIXES` in the module, currently
-`omar-go`, `hold-lift`, `hold-lifted`, `human-go`, `founder-go`, `approval`,
-`board-approval`, `card`, `signoff`, `sign-off`, `cto-ruling`, `ceo-ruling`,
-each with an optional `:suffix`. That array is the single source for both the
-JS matcher and the SQL candidate predicate; do not write either by hand. When
-**every** other declared gate is satisfied and only human gates remain,
-`resolveTerminalGate` returns `human_gate_only` and the sweep posts a distinct
-comment under the `terminal-gate-human-only:` idempotency prefix.
+`omar-go`, `hold`, `hold-lift`, `hold-lifted`, `human-go`, `founder-go`,
+`approval`, `board-approval`, `card`, `signoff`, `sign-off`, `cto-ruling`,
+`ceo-ruling`, each with an optional `:suffix`. That array is the single source
+for both the JS matcher and the SQL candidate predicate; do not write either by
+hand. When **every** other declared gate is satisfied and only human gates
+remain, `resolveTerminalGate` returns `human_gate_only` and the sweep posts a
+distinct comment under the `terminal-gate-human-only:` idempotency prefix.
+
+A human gate written only as a plain `pr:` gate, with "needs one human
+approval" living in `monitorNotes`, stays invisible here — PEN-4410 is live in
+that shape. Those rows keep today's silence, which is the fail-safe direction;
+reaching them means reading the pull request's own review state, not a longer
+allowlist.
+
+### ⭐ The gate and the pull request it names are one statement, not two
+
+This is the half the first cut got backwards, and it inverted the notice end to
+end for exactly the shape the issue measured.
+
+A human-gate token usually *names a pull request*: `omar-go:#2686`,
+`hold:f35d6c:pr-2655:omar-go`. When that pull request is **also** a declared
+`pr:` gate on the same row, the two tokens say one thing — *a person must
+release this pull request*. Reading them independently produced the worst
+available ordering:
+
+| state of the named PR | what the row waits for | first cut | now |
+|---|---|---|---|
+| **open** | the person — this is the entire wait | `unresolved/pull_request_open`, **skipped in silence** | `human_gate_only` carrying `heldPullRequests`; announced, escalate the ask |
+| **merged** | nothing: under the hold protocol the merge cannot precede the go | `human_gate_only` — *"Escalate the ask"* for a go already given | `satisfied` carrying `dischargedHumanGates`; verify-and-close |
+
+`parseHumanGateSubject` reads the pull request number out of the token, in both
+spellings the fleet writes (`#2686` on PEN-4475, `pr-2655` on PEN-2619). It
+fails closed: a token naming no number, or two, stays unjoined — and so does a
+bare `#N` that two different repositories both declare in the same gate set,
+because a bare number carries no repository and that join is ambiguous. An
+unjoined gate keeps precisely the behaviour it had before the join existed.
+
+Three invariants this must keep, each pinned by a test:
+
+- a pull request open **on its own account**, co-declared beside an unrelated
+  human gate, still returns `unresolved/pull_request_open`. Only the pull
+  request a gate *names* is held — otherwise the sweep would announce over the
+  whole polling fleet;
+- a **closed-unmerged** pull request is never reported as "held open by a
+  person". The work did not land, and that fail-closed rule outranks the new
+  branch;
+- discharge requires the merge of *that* pull request, so `satisfied` still
+  means every declared gate is met.
 
 `listCandidateIssues` gained a **third arm** for this class, and it is the half
 that makes the feature meet its own description. The first two arms admit a
@@ -228,7 +272,11 @@ prefixes on evidence.
   path. A human-gated row is the case where oversight is *most* warranted: the
   work is finished, unreachable, and nobody has been told. Two independent
   guards hold this — the `kind === "pull_request"` filter and the separate
-  idempotency prefix — and both are deliberate.
+  idempotency prefix — and both are deliberate. A row whose gate is
+  *discharged* is a different thing and is deliberately not covered: once the
+  named pull request merges there is nobody left to chase, so it becomes an
+  ordinary `satisfied` row and may suppress review exactly as any other
+  resolved row does.
 - **The anti-join must test both prefixes.** `listCandidateIssues` excludes a
   row announced under *either* key for its current signal set. Testing only the
   resolved prefix would re-admit every announced human-gate row on every pass,
@@ -254,7 +302,13 @@ prefixes on evidence.
   actively-polling one does so on every pass until its PRs merge or it is
   announced. Bounded by `MAX_PULL_REQUEST_READS_PER_PASS`, deduped per pass by
   `gateCache`, and confined to the human-gate class — a row whose unparseable
-  tokens are not human gates is unchanged and still costs zero.
+  tokens are not human gates is unchanged and still costs zero. The held-open
+  branch adds one more effect worth knowing: because a held pull request no
+  longer short-circuits the loop, such a row reads *every* declared pull
+  request rather than stopping at the first open one. That is the price of
+  distinguishing "held by a person" from "open on its own account", it is
+  capped by the same budget, and a row with no human gate still short-circuits
+  exactly as before.
 
 ## Operational notes
 

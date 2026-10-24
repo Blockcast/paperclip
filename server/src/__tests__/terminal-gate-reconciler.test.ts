@@ -20,6 +20,7 @@ import {
   buildTerminalGateHumanOnlyComment,
   buildTerminalGateResolvedComment,
   listResolvedTerminalGates,
+  parseHumanGateSubject,
   parseTerminalGateSignal,
   readIssueMonitorGateSignals,
   reconcileTerminalGates,
@@ -78,6 +79,7 @@ describe("parseTerminalGateSignal", () => {
     expect(parseTerminalGateSignal("omar-go:#2686")).toEqual({
       kind: "human_gate",
       raw: "omar-go:#2686",
+      subjectPullRequestNumber: 2686,
     });
     for (const token of [
       "omar-go",
@@ -88,8 +90,32 @@ describe("parseTerminalGateSignal", () => {
       "card:dcb2b957",
       "signoff:security",
       "cto-ruling:pen-4545",
+      // PEN-2619's live token — the `hold:` prefix the first cut of the
+      // allowlist left out while claiming to be drawn from measured tokens.
+      "hold:f35d6c:pr-2655:omar-go",
     ]) {
       expect(parseTerminalGateSignal(token)).toMatchObject({ kind: "human_gate" });
+    }
+  });
+
+  // The join that lets the resolver tell "this person gates THIS pull request"
+  // from "this person gates something else". Both spellings are live: PEN-4475
+  // writes `#2686`, PEN-2619 writes `pr-2655`.
+  it("reads the pull request a human-gate token names, in both spellings the fleet writes", () => {
+    expect(parseHumanGateSubject("omar-go:#2686")).toBe(2686);
+    expect(parseHumanGateSubject("hold:f35d6c:pr-2655:omar-go")).toBe(2655);
+    expect(parseHumanGateSubject("hold-lift:#6493")).toBe(6493);
+  });
+
+  it("refuses to guess a subject it cannot read unambiguously", () => {
+    for (const token of [
+      "omar-go", // names nothing
+      "approval:dcb2b957", // an opaque card id, not a pull request
+      "human-go:pen-4475", // an issue key, not a pull request
+      "hold:f35d6c", // a session id whose digits are not a pull request
+      "omar-go:#2686:#2688", // two subjects — ambiguous, so neither
+    ]) {
+      expect(parseHumanGateSubject(token)).toBeNull();
     }
   });
 
@@ -122,6 +148,7 @@ describe("resolveTerminalGate", () => {
       kind: "satisfied",
       signals: ["pr:blockcast/paperclip#1281:merged"],
       mergedPullRequests: ["blockcast/paperclip#1281"],
+      dischargedHumanGates: [],
     });
   });
 
@@ -159,17 +186,132 @@ describe("resolveTerminalGate", () => {
     expect(verdict).toMatchObject({ kind: "unresolved", reason: "unresolvable_signal" });
   });
 
-  // PEN-4545: the verdict between "satisfied" and "unresolved".
+  // PEN-4545: the verdict between "satisfied" and "unresolved". The human gate
+  // here names an artifact that is NOT among the declared pull requests, so
+  // nothing discharges it and a person really is all that remains.
   it("reports `human_gate_only` when the machine half is satisfied and a person is all that remains", async () => {
     const verdict = await resolveTerminalGate({
-      gateSignals: ["omar-go:#2686", "pr:blockcast/penstock-llm-proxy-core#2686:merged"],
+      gateSignals: ["approval:dcb2b957", "pr:blockcast/penstock-llm-proxy-core#2686:merged"],
       readPullRequestGate: mergedReader(new Set(["blockcast/penstock-llm-proxy-core#2686"])),
+    });
+    expect(verdict).toEqual({
+      kind: "human_gate_only",
+      signals: ["approval:dcb2b957", "pr:blockcast/penstock-llm-proxy-core#2686:merged"],
+      humanGates: ["approval:dcb2b957"],
+      heldPullRequests: [],
+      mergedPullRequests: ["blockcast/penstock-llm-proxy-core#2686"],
+    });
+  });
+
+  // ---------------------------------------------------------------------
+  // The ordering defect caught reviewing #2974, and the reason the two tests
+  // below assert the opposite of what the first cut asserted.
+  //
+  // `omar-go:#2686` beside `pr:...#2686:merged` is one statement, not two: a
+  // person must release THAT pull request. The first cut read the two tokens
+  // independently, which inverted the notice end to end. While #2686 was open
+  // — the entire time the row was blocked on a person — the resolver returned
+  // `unresolved/pull_request_open` and the sweep skipped it in silence. The
+  // notice could fire only once #2686 merged, which under the hold protocol
+  // means the go had already been given, and it then told the owner to
+  // "escalate the ask" for a decision already made.
+  // ---------------------------------------------------------------------
+
+  it("announces the human gate WHILE the pull request it names is open — the live wait", async () => {
+    const verdict = await resolveTerminalGate({
+      gateSignals: ["omar-go:#2686", "pr:blockcast/penstock-llm-proxy-core#2686:merged"],
+      readPullRequestGate: mergedReader(new Set()),
     });
     expect(verdict).toEqual({
       kind: "human_gate_only",
       signals: ["omar-go:#2686", "pr:blockcast/penstock-llm-proxy-core#2686:merged"],
       humanGates: ["omar-go:#2686"],
+      heldPullRequests: ["blockcast/penstock-llm-proxy-core#2686"],
+      mergedPullRequests: [],
+    });
+  });
+
+  it("treats the merge of the named pull request as discharging the gate, not as the moment to chase it", async () => {
+    const verdict = await resolveTerminalGate({
+      gateSignals: ["omar-go:#2686", "pr:blockcast/penstock-llm-proxy-core#2686:merged"],
+      readPullRequestGate: mergedReader(new Set(["blockcast/penstock-llm-proxy-core#2686"])),
+    });
+    expect(verdict).toEqual({
+      kind: "satisfied",
+      signals: ["omar-go:#2686", "pr:blockcast/penstock-llm-proxy-core#2686:merged"],
       mergedPullRequests: ["blockcast/penstock-llm-proxy-core#2686"],
+      dischargedHumanGates: ["omar-go:#2686"],
+    });
+  });
+
+  it("discharges PEN-2619's `hold:` spelling the same way", async () => {
+    const signals = [
+      "hold:f35d6c:pr-2655:omar-go",
+      "pr:blockcast/penstock-llm-proxy-core#2655:merged",
+    ];
+    expect(
+      await resolveTerminalGate({
+        gateSignals: signals,
+        readPullRequestGate: mergedReader(new Set()),
+      }),
+    ).toMatchObject({
+      kind: "human_gate_only",
+      heldPullRequests: ["blockcast/penstock-llm-proxy-core#2655"],
+    });
+    expect(
+      await resolveTerminalGate({
+        gateSignals: signals,
+        readPullRequestGate: mergedReader(new Set(["blockcast/penstock-llm-proxy-core#2655"])),
+      }),
+    ).toMatchObject({
+      kind: "satisfied",
+      dischargedHumanGates: ["hold:f35d6c:pr-2655:omar-go"],
+    });
+  });
+
+  it("holds open only the pull request the gate NAMES, never a co-declared one", async () => {
+    // #2686 is held by the person; #1281 is open on its own account, so the
+    // row IS still waiting on something a re-check can change and must stay
+    // silent. Getting this wrong would announce over the whole polling fleet.
+    const verdict = await resolveTerminalGate({
+      gateSignals: [
+        "omar-go:#2686",
+        "pr:blockcast/penstock-llm-proxy-core#2686:merged",
+        "pr:blockcast/paperclip#1281:merged",
+      ],
+      readPullRequestGate: mergedReader(new Set()),
+    });
+    expect(verdict).toMatchObject({ kind: "unresolved", reason: "pull_request_open" });
+  });
+
+  it("refuses to discharge a bare number two repositories both declare", async () => {
+    // `#2686` carries no repository. With two candidates the join is
+    // ambiguous, so the gate stays unjoined and the row keeps the behaviour it
+    // had before the join existed.
+    const verdict = await resolveTerminalGate({
+      gateSignals: [
+        "omar-go:#2686",
+        "pr:blockcast/paperclip#2686:merged",
+        "pr:blockcast/penstock-llm-proxy-core#2686:merged",
+      ],
+      readPullRequestGate: mergedReader(
+        new Set(["blockcast/paperclip#2686", "blockcast/penstock-llm-proxy-core#2686"]),
+      ),
+    });
+    expect(verdict).toMatchObject({ kind: "human_gate_only", humanGates: ["omar-go:#2686"] });
+  });
+
+  it("does NOT read a closed-unmerged pull request as one a person is holding open", async () => {
+    // The work did not land. "A person is holding this open" would be false,
+    // and the fail-closed rule for an abandoned pull request must survive the
+    // held-open branch.
+    const verdict = await resolveTerminalGate({
+      gateSignals: ["omar-go:#2686", "pr:blockcast/penstock-llm-proxy-core#2686:merged"],
+      readPullRequestGate: async () => ({ state: "closed", merged: false }),
+    });
+    expect(verdict).toMatchObject({
+      kind: "unresolved",
+      reason: "pull_request_closed_unmerged",
     });
   });
 
@@ -1112,7 +1254,9 @@ describeEmbeddedPostgres("reconcileTerminalGates", () => {
       companyId,
       agentId,
       identifier: "TG8-1",
-      gateSignals: ["omar-go:#2686", "pr:blockcast/penstock-llm-proxy-core#2686:merged"],
+      // The human gate names a card, not the declared pull request, so the
+      // merge cannot discharge it and a person really is all that is left.
+      gateSignals: ["approval:dcb2b957", "pr:blockcast/penstock-llm-proxy-core#2686:merged"],
     });
 
     const result = await reconcileTerminalGates(db, {
@@ -1126,13 +1270,40 @@ describeEmbeddedPostgres("reconcileTerminalGates", () => {
     expect(comments[0]!.authorType).toBe("system");
     expect(comments[0]!.key).toBe(
       terminalGateHumanOnlyIdempotencyKey([
-        "omar-go:#2686",
+        "approval:dcb2b957",
         "pr:blockcast/penstock-llm-proxy-core#2686:merged",
       ]),
     );
-    expect(comments[0]!.body).toContain("omar-go:#2686");
+    expect(comments[0]!.body).toContain("approval:dcb2b957");
     // Must never read as a closure: `resolved` stayed 0 and the copy says so.
     expect(comments[0]!.body).toContain("nothing here closes the issue");
+  });
+
+  // The post-merge half of the ordering defect, at the sweep level: once the
+  // held pull request merges the go has necessarily been given, so the row
+  // must get the verify-and-close notice and must NOT be told to escalate.
+  it("does not tell the owner to escalate a go the merge already proves was given", async () => {
+    const { companyId, agentId } = await createCompany("TGE");
+    const issueId = await insertStrandedGateIssue({
+      companyId,
+      agentId,
+      identifier: "TGE-1",
+      gateSignals: ["omar-go:#2686", "pr:blockcast/penstock-llm-proxy-core#2686:merged"],
+    });
+
+    const result = await reconcileTerminalGates(db, {
+      now: NOW,
+      readPullRequestGate: mergedReader(new Set(["blockcast/penstock-llm-proxy-core#2686"])),
+    });
+
+    expect(result).toMatchObject({ scanned: 1, resolved: 1, humanGateOnly: 0 });
+    const comments = await commentsFor(issueId);
+    expect(comments).toHaveLength(1);
+    expect(comments[0]!.body).toContain("discharged");
+    expect(comments[0]!.body).not.toContain("Escalate the ask");
+    expect(comments[0]!.body).not.toContain("waiting on a person");
+    // Still not a closure — the gate resolved, the acceptance criteria did not.
+    expect(comments[0]!.body).toContain("Nothing here closes the issue");
   });
 
   it("announces a row whose whole gate is a human go, which is the shape that was invisible", async () => {
@@ -1163,7 +1334,14 @@ describeEmbeddedPostgres("reconcileTerminalGates", () => {
   // human-gate arm the notice would fire only before the first poll or after
   // the monitor had already converged to a stall (~3 polls later) — i.e. only
   // once the row was already stranded, never while it still looked healthy.
-  it("announces an ACTIVELY-POLLING armed monitor whose gate is a human go", async () => {
+  //
+  // ⚠️ The pull request is OPEN here, and that is the fixture's whole point.
+  // Every row the issue reported was `OPEN`, `draft`, `MERGEABLE`, carrying a
+  // hold that read "do not merge until Omar gives an explicit go". The first
+  // cut of this test merged #2686, which is the one state in which those rows
+  // were NOT waiting — it asserted the notice at the only moment the wait was
+  // already over, and pinned silence over the ~24h the rows were unreachable.
+  it("announces an ACTIVELY-POLLING armed monitor while the held pull request is still OPEN", async () => {
     const { companyId, agentId } = await createCompany("TGC");
     const issueId = await insertStrandedGateIssue({
       companyId,
@@ -1179,12 +1357,17 @@ describeEmbeddedPostgres("reconcileTerminalGates", () => {
 
     const result = await reconcileTerminalGates(db, {
       now: NOW,
-      readPullRequestGate: mergedReader(new Set(["blockcast/penstock-llm-proxy-core#2686"])),
+      readPullRequestGate: mergedReader(new Set()),
     });
 
-    expect(result).toMatchObject({ scanned: 1, humanGateOnly: 1 });
+    expect(result).toMatchObject({ scanned: 1, resolved: 0, humanGateOnly: 1 });
     const comments = await commentsFor(issueId);
     expect(comments).toHaveLength(1);
+    // Names the pull request AND the person holding it, and asks for the go.
+    expect(comments[0]!.body).toContain("blockcast/penstock-llm-proxy-core#2686");
+    expect(comments[0]!.body).toContain("omar-go:#2686");
+    expect(comments[0]!.body).toContain("Escalate the ask");
+    expect(comments[0]!.body).toContain("nothing here closes the issue");
     // Armed and able to fire, so it must NOT claim the row is stranded — the
     // documented repair for a stranded row destroys the wake path it has.
     expect(comments[0]!.body).toContain("live wake path");
@@ -1313,12 +1496,15 @@ describeEmbeddedPostgres("reconcileTerminalGates", () => {
       companyId,
       agentId,
       identifier: "TGA-1",
+      // Held open, not merged: the merged form now discharges the gate and
+      // takes the resolved path, which is a different anti-join. This test is
+      // about the human-only key, so it has to stay on the human-only path.
       gateSignals: ["hold-lift:#2655", "pr:blockcast/penstock-llm-proxy-core#2655:merged"],
     });
 
     const first = await reconcileTerminalGates(db, {
       now: NOW,
-      readPullRequestGate: mergedReader(new Set(["blockcast/penstock-llm-proxy-core#2655"])),
+      readPullRequestGate: mergedReader(new Set()),
     });
     expect(first).toMatchObject({ scanned: 1, humanGateOnly: 1 });
 
@@ -1345,9 +1531,13 @@ describeEmbeddedPostgres("reconcileTerminalGates", () => {
       gateSignals: ["omar-go:#2686", "pr:blockcast/penstock-llm-proxy-core#2686:merged"],
     });
 
+    // Still open, so the person has not released it — the state in which the
+    // row is unreachable and oversight matters most. Once it merges the gate
+    // is discharged and the row becomes an ordinary resolved one, which may
+    // suppress review exactly as any other resolved row does.
     await reconcileTerminalGates(db, {
       now: NOW,
-      readPullRequestGate: mergedReader(new Set(["blockcast/penstock-llm-proxy-core#2686"])),
+      readPullRequestGate: mergedReader(new Set()),
     });
     expect(await commentsFor(issueId)).toHaveLength(1);
 
