@@ -150,12 +150,16 @@ renamed_jobs() { # stdin: twin-less legacy bare names; $1 = file of base workflo
   # missing or EMPTY file prints nothing, so an unreadable base fails CLOSED
   # (STOP). Substring match on raw text: a mention anywhere (job id, name,
   # comment) keeps the STOP, which is the safe direction.
+  # The stem before the first " (" is matched too: a matrix job named
+  # `postgres-tests (${{ matrix.shard }}/...)` renders `postgres-tests (1/4)`,
+  # which never appears literally, but its stem does -> STOP.
   # ponytail: textual, not YAML-parsed. A job whose name is built ONLY from an
   # expression (`name: ${{ x }}`) has no literal to find and would read as a
   # rename; parse job names if such a workflow appears on a gated repo.
   [ -s "${1:-}" ] || return 0
   while IFS= read -r j; do
-    [ -n "$j" ] && ! grep -qF -- "$j" "$1" && printf '%s\n' "$j"
+    [ -n "$j" ] && ! grep -qF -- "$j" "$1" && ! grep -qF -- "${j%% (*}" "$1" \
+      && printf '%s\n' "$j"
   done
   return 0
 }
@@ -847,6 +851,10 @@ CHECKS=$(gh api "repos/$R/commits/$H/check-runs?per_page=100" --paginate | extra
 # BLO-48833: only when a legacy red has no twin, read the base workflows at the
 # head's PR base sha. Zero extra calls on every other head. Any failure (no PR,
 # several base shas, unreadable file) leaves BASE empty -> STOP.
+# base.sha, not the base branch tip the trusted arm actually runs: base.sha can
+# lag until the PR is next synchronized. A job renamed on master since then only
+# ADDS text here (fails closed); a job ADDED to master since then can read as a
+# rename until the PR is rebased. Accepted: that legacy red clears on the rebase.
 RENAMED=
 ORPHANS=$(printf '%s\n' "$CHECKS" | legacy_orphans)
 if [ -n "$ORPHANS" ]; then
@@ -856,11 +864,11 @@ if [ -n "$ORPHANS" ]; then
   if [ "$(printf '%s\n' "$B" | grep -c .)" = 1 ] && require_sha "$B" >/dev/null 2>&1 \
      && WF=$(gh api "repos/$R/contents/.github/workflows?ref=$B" \
                --jq '.[]|select(.type=="file")|.path' 2>/dev/null) && [ -n "$WF" ]; then
-    for p in $WF; do
+    while IFS= read -r p; do
       body=$(gh api "repos/$R/contents/$p?ref=$B" -H "Accept: application/vnd.github.raw" 2>/dev/null) \
         || { : > "$BASE_FILE"; break; }
       printf '%s\n' "$body" >> "$BASE_FILE"
-    done
+    done <<< "$WF"
     RENAMED=$(printf '%s\n' "$ORPHANS" | renamed_jobs "$BASE_FILE")
   fi
 fi

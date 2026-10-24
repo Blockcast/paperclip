@@ -273,6 +273,11 @@ describe("merge-gate reader", () => {
       ]);
     });
 
+    it("keeps STOP for a matrix-shaped name whose templated job base declares", () => {
+      const base = baseFile("jobs:\n  pg:\n    name: postgres-tests (${{ matrix.shard }}/${{ strategy.job-total }})\n");
+      assert.deepEqual(renamed(["postgres-tests (1/4)", "ci-secret-scan"], base), ["ci-secret-scan"]);
+    });
+
     for (const [what, file] of [
       ["missing", join(tmp, "nope")],
       ["empty", null],
