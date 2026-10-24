@@ -29,6 +29,14 @@
 #                          no twin, or in any other conclusion, it STOPs: the
 #                          refusal is then the only signal that the trusted
 #                          arm never spoke for that job.
+#   RENAMED-LEGACY       — a twin-less REFUSED-LEGACY row whose `<job>` appears
+#                          in NO workflow file on the PR's base sha (BLO-48833).
+#                          The PR renames that job: the trusted
+#                          `pull_request_target` arm runs the BASE workflows, so
+#                          the new name's twin cannot exist until after merge.
+#                          NOT blocking. Base still declares `<job>`, or base
+#                          workflows unreadable, or no unique PR for the head:
+#                          STOP.
 #   ADVISORY             — `review/ally-ledger` reading `pending` while
 #                          `review/ally-complete` is `success` at the same head.
 #                          The review gate stores its finding ledger in that
@@ -61,7 +69,8 @@
 # one-way signal at best. Never write `merge-gate-read.sh … && merge`.
 #
 #   merge-gate-read.sh <owner/repo> <sha|pr-head>     # live
-#   merge-gate-read.sh --rows <DEAD> [PENDING] [WDEAD] # fixture mode, rows on stdin
+#   merge-gate-read.sh --rows <DEAD> [PENDING] [WDEAD] [RENAMED] # fixture mode, rows on stdin
+#   merge-gate-read.sh --renamed <base-text-file>     # fixture mode, bare job names on stdin
 #   merge-gate-read.sh --dead [witnesses] [w]         # fixture mode, runs on stdin;
 #                                                     # any 3rd arg: witness arm only
 #   merge-gate-read.sh --pending                      # fixture mode, runs on stdin
@@ -134,6 +143,31 @@ run_extract() { # stdin: actions/runs API body (one object per page) -> run rows
   # $9 is `display_title`, appended for gated_lanes() (BLO-47984).
   jq -r '.workflow_runs[]|[.workflow_id,.event,.id,.conclusion,.run_started_at,
                            .status,.name,.updated_at,.display_title]|@tsv'
+}
+
+renamed_jobs() { # stdin: twin-less legacy bare names; $1 = file of base workflow text
+  # BLO-48833. Prints the names that appear NOWHERE in the base workflows. A
+  # missing or EMPTY file prints nothing, so an unreadable base fails CLOSED
+  # (STOP). Substring match on raw text: a mention anywhere (job id, name,
+  # comment) keeps the STOP, which is the safe direction.
+  # The stem before the first " (" is matched too: a matrix job named
+  # `postgres-tests (${{ matrix.shard }}/...)` renders `postgres-tests (1/4)`,
+  # which never appears literally, but its stem does -> STOP.
+  # ponytail: textual, not YAML-parsed. A job whose name is built ONLY from an
+  # expression (`name: ${{ x }}`) has no literal to find and would read as a
+  # rename; parse job names if such a workflow appears on a gated repo.
+  [ -s "${1:-}" ] || return 0
+  while IFS= read -r j; do
+    [ -n "$j" ] && ! grep -qF -- "$j" "$1" && ! grep -qF -- "${j%% (*}" "$1" \
+      && printf '%s\n' "$j"
+  done
+  return 0
+}
+
+legacy_orphans() { # stdin: rows -> bare names of legacy reds with no same-name twin row
+  awk -F'\t' '{ twin[$1] = 1 }
+    $2 == "failure" && $1 ~ / \(legacy arm - refused, nothing ran\)$/ { l[substr($1, 1, length($1) - 36)] = 1 }
+    END { for (b in l) if (!(b in twin)) print b }'
 }
 
 gated_lanes() { # stdin: run rows; $1 = head sha, $2 non-empty = repo is gated
@@ -620,7 +654,7 @@ verdicts() { # $1 = DEAD alternation, $2 = PENDING rows, $3 = WDEAD (all may be 
       END { exit !k }' \
     | sort -t$'\t' -k1,1 -k4,4 -k3,3r \
     | awk -F'\t' '!seen[$1 FS $4]++' \
-    | PEND="${2:-}" awk -F'\t' -v dead="$dead" '
+    | PEND="${2:-}" RENAMED="${4:-}" awk -F'\t' -v dead="$dead" '
         # NO APOSTROPHES anywhere below: this awk program is single-quoted in the
         # surrounding shell, so one inside a comment ends the script mid-word and
         # bash reports a syntax error on an unrelated line further down.
@@ -644,7 +678,9 @@ verdicts() { # $1 = DEAD alternation, $2 = PENDING rows, $3 = WDEAD (all may be 
                  # and shifts the page boundary. Idempotent, so one line per run.
                  if (f[1] in pseen) continue
                  pseen[f[1]] = 1; k++
-                 prid[k] = f[1]; pstat[k] = f[2]; pname[k] = f[3] } }
+                 prid[k] = f[1]; pstat[k] = f[2]; pname[k] = f[3] }
+               nr = split(ENVIRON["RENAMED"], rl, "\n")
+               for (i = 1; i <= nr; i++) if (rl[i] != "") renamed[rl[i]] = 1 }
         NF==0{next}
         # Set on SURVIVING rows only — after DEAD, after dedup — so "contributed"
         # means "this run published a check-run that is still standing", which is
@@ -706,7 +742,8 @@ verdicts() { # $1 = DEAD alternation, $2 = PENDING rows, $3 = WDEAD (all may be 
         $2!="success"&&$2!="skipped"{print ($1~/\$\{\{/?"MALFORMED":($2=="neutral"?"NOT-EVALUATED":"STOP"))"\t"$1"\t"$2"\trun="$4}
         END{if(ledger) print (acs == "success" ? "ADVISORY" : "STOP") "\treview/ally-ledger\tpending\trun=status"
             for (i = 1; i <= lq; i++)
-              print ((substr(lname[i], 1, length(lname[i]) - 36) in twin) ? "REFUSED-LEGACY" : "STOP") "\t" lrow[i]
+              { b = substr(lname[i], 1, length(lname[i]) - 36)
+                print ((b in twin) ? "REFUSED-LEGACY" : (b in renamed) ? "RENAMED-LEGACY" : "STOP") "\t" lrow[i] }
             if(!n) print "STOP\t<" (dead!="__none__" \
               ? "every check-run at this head dropped as superseded-run" \
               : "no check-run verdict at this head") ">\tABSENT\trun=-"
@@ -736,7 +773,8 @@ verdicts() { # $1 = DEAD alternation, $2 = PENDING rows, $3 = WDEAD (all may be 
 # `--rows` propagates the pipeline status rather than swallowing it. Hardcoding
 # `exit 0` here made the exit contract unobservable by construction, so no
 # fixture could catch the header claiming an exactness it did not have.
-if [ "${1:-}" = "--rows" ]; then verdicts "${2:-}" "${3:-}" "${4:-}"; exit $?; fi
+if [ "${1:-}" = "--rows" ]; then verdicts "${2:-}" "${3:-}" "${4:-}" "${5:-}"; exit $?; fi
+if [ "${1:-}" = "--renamed" ]; then renamed_jobs "${2:-}"; exit 0; fi
 if [ "${1:-}" = "--dead" ]; then dead_runs "${2:-}" "${3:-}"; exit 0; fi
 if [ "${1:-}" = "--pending" ]; then pending_runs; exit 0; fi
 if [ "${1:-}" = "--extract" ]; then extract; exit 0; fi
@@ -808,9 +846,36 @@ PENDING=$(printf '%s\n' "$RUNS" | pending_runs)
 # status fetch silently drops the 31st context onward — and a dropped `failure`
 # prints no STOP. The ABSENT guard cannot catch it: `$4!="status"` excludes
 # status rows from the survivor count, so one surviving check-run keeps the guard quiet.
+CHECKS=$(gh api "repos/$R/commits/$H/check-runs?per_page=100" --paginate | extract)
+
+# BLO-48833: only when a legacy red has no twin, read the base workflows at the
+# head's PR base sha. Zero extra calls on every other head. Any failure (no PR,
+# several base shas, unreadable file) leaves BASE empty -> STOP.
+# base.sha, not the base branch tip the trusted arm actually runs: base.sha can
+# lag until the PR is next synchronized. A job renamed on master since then only
+# ADDS text here (fails closed); a job ADDED to master since then can read as a
+# rename until the PR is rebased. Accepted: that legacy red clears on the rebase.
+RENAMED=
+ORPHANS=$(printf '%s\n' "$CHECKS" | legacy_orphans)
+if [ -n "$ORPHANS" ]; then
+  BASE_FILE=$(mktemp); trap 'rm -f "$BASE_FILE"' EXIT
+  B=$(gh api "repos/$R/commits/$H/pulls?per_page=100" --paginate \
+        --jq ".[]|select(.head.sha==\"$H\")|.base.sha" 2>/dev/null | sort -u)
+  if [ "$(printf '%s\n' "$B" | grep -c .)" = 1 ] && require_sha "$B" >/dev/null 2>&1 \
+     && WF=$(gh api "repos/$R/contents/.github/workflows?ref=$B" \
+               --jq '.[]|select(.type=="file")|.path' 2>/dev/null) && [ -n "$WF" ]; then
+    while IFS= read -r p; do
+      body=$(gh api "repos/$R/contents/$p?ref=$B" -H "Accept: application/vnd.github.raw" 2>/dev/null) \
+        || { : > "$BASE_FILE"; break; }
+      printf '%s\n' "$body" >> "$BASE_FILE"
+    done <<< "$WF"
+    RENAMED=$(printf '%s\n' "$ORPHANS" | renamed_jobs "$BASE_FILE")
+  fi
+fi
+
 { printf '%s' "$STATUSES" | status_extract
-  gh api "repos/$R/commits/$H/check-runs?per_page=100" --paginate | extract
-} | verdicts "$DEAD" "$PENDING" "$WDEAD"
+  printf '%s\n' "$CHECKS"
+} | verdicts "$DEAD" "$PENDING" "$WDEAD" "$RENAMED"
 rc=$?
 printf '%s\n' "$RUNS" | gated_lanes "$H" "$GATED"
 exit $rc
