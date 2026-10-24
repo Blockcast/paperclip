@@ -212,6 +212,10 @@ describe("cold in_review issue gauge (PEN-4652)", () => {
     const row = coldReview();
     const base = { issues: [row], relations: [], agents: [agent(), manager] };
     const waiting = [{ companyId, issueId: reviewId, status: "pending" }];
+    // A pending interaction only suppresses while it is FRESH: past
+    // PENDING_INTERACTION_MAX_AGE_MS (24h) the classifier routes it to the
+    // stale set, which un-suppresses the row instead.
+    const freshInteraction = [{ ...waiting[0], createdAt: NOW }];
 
     // Sanity: without a path the row IS cold, so a suppression below cannot
     // pass vacuously.
@@ -220,7 +224,7 @@ describe("cold in_review issue gauge (PEN-4652)", () => {
     const suppressed: Array<[string, Parameters<typeof publish>[0]]> = [
       ["active run", { ...base, activeRuns: [{ companyId, issueId: reviewId, agentId: coderId, status: "running" }] }],
       ["queued wake request", { ...base, queuedWakeRequests: [{ companyId, issueId: reviewId, agentId: coderId, status: "queued" }] }],
-      ["pending interaction", { ...base, pendingInteractions: waiting }],
+      ["pending interaction", { ...base, pendingInteractions: freshInteraction }],
       ["pending approval", { ...base, pendingApprovals: waiting }],
       ["open recovery issue", { ...base, openRecoveryIssues: waiting }],
       ["recent open pull request", { ...base, openPullRequestAttendance: waiting }],
