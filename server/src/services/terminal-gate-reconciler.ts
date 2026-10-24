@@ -1426,6 +1426,18 @@ export async function reconcileTerminalGates(
       //
       // Only the held key is refreshed. The two terminal keys suppress
       // unconditionally and must not acquire a cadence by accident.
+      //
+      // This write is deliberately invisible to everything that measures
+      // activity, and both halves of that are load-bearing. The
+      // `last_activity_at` bump on `issue_comments` is AFTER INSERT only, so
+      // re-checking a stranded row does not make it look freshly active to a
+      // staleness audit — the row is exactly as stuck after the look as
+      // before it, and should read that way. The digest touch-lock
+      // (`human_gated_digest_lock_updated_comment_issues`) is AFTER UPDATE but
+      // only locks issues touched by a *user*-authored comment; this one is
+      // system-authored with both author columns null, so it takes no lock. A
+      // change that widened either trigger, or that touched `updatedAt` here,
+      // would turn a cheap bookkeeping stamp into a visible edit.
       if (isHeld) {
         await db
           .update(issueComments)
