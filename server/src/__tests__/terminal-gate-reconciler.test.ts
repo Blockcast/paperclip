@@ -1274,6 +1274,34 @@ describeEmbeddedPostgres("reconcileTerminalGates", () => {
     expect(comments[0]!.body).not.toContain("live wake path");
   });
 
+  it("admits a human-gate token stored with surrounding whitespace", async () => {
+    // `parseTerminalGateSignal` classifies `raw.trim()`, so an untrimmed SQL
+    // matcher would classify this `human_gate` in TS and never admit it while
+    // polling — fail-closed, but exactly the JS/SQL drift the shared array
+    // exists to prevent. `normalizeIssueMonitorGateSignals` trims on write, so
+    // only a legacy or hand-edited row reaches this; that is the case nobody
+    // would think to check. Dropping `btrim` from the predicate must fail this.
+    const { companyId, agentId } = await createCompany("TGG");
+    const issueId = await insertStrandedGateIssue({
+      companyId,
+      agentId,
+      identifier: "TGG-1",
+      status: "in_review",
+      gateSignals: [" omar-go:#2686 "],
+      monitorAttemptCount: 3,
+      monitorLastTriggeredAt: LAST_POLL_AT,
+      monitorNextCheckAt: new Date(NOW.getTime() + 6 * 60 * 60 * 1000),
+    });
+
+    const result = await reconcileTerminalGates(db, {
+      now: NOW,
+      readPullRequestGate: mergedReader(new Set()),
+    });
+
+    expect(result).toMatchObject({ scanned: 1, humanGateOnly: 1 });
+    expect(await commentsFor(issueId)).toHaveLength(1);
+  });
+
   it("is idempotent, and the SQL anti-join keeps an announced human-gate row out of the scan window", async () => {
     // Without the human-only prefix in the anti-join, this row would be
     // re-admitted on every pass forever, consuming a SCAN_LIMIT slot it can
