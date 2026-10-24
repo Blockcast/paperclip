@@ -65,7 +65,7 @@
 // replacements run ~daily), so the pod that exported the series last week is
 // often not the one exporting it today. Passing it re-points residual, restart
 // AND teardown together, which is what keeps the pairing on one pod (trap 5).
-// Get it wrong and the run fails loudly naming the replicas that do have data
+// Get it wrong and the run fails loudly naming the replicas the index matched
 // -- it never silently fits the wrong pod.
 //
 // Exit status is 0 whenever the fit ran; a non-discriminating window is a
@@ -77,7 +77,7 @@ import { pathToFileURL } from "node:url";
 /**
  * ⚠️ Right only by luck on any given day -- the collector migrates between
  * replicas (see the `--pod` note above). A wrong value is caught loudly by
- * `assertMeasurable`, which names the replicas that did export the series.
+ * `assertMeasurable`, which names the replicas the index matched.
  */
 const DEFAULT_POD = "paperclip-0";
 

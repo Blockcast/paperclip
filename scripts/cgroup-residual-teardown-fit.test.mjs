@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -553,6 +554,37 @@ describe("assertMeasurable names the replica (collector migrates between pods)",
       assert.ok(!/exported data/.test(hint), `overclaims for ${pods}`);
       assert.match(hint, /index matched/);
     }
+  });
+
+  // ⛔ SOURCE PIN, and it exists because the runtime pins above were not
+  // enough. The same overclaim shipped THREE times in three places -- the
+  // single-pod hint, the sibling hint, then the module docblock and the
+  // `--pod` usage note -- each fixed only where it was spotted. Message pins
+  // cannot see prose, so the prose kept contradicting the behaviour the pins
+  // enforce, and a reader trusts the docblock exactly as much as the error.
+  //
+  // Narrow on purpose: only the two RETIRED phrasings are banned, not the
+  // word "export". Legitimate uses survive and must -- the `--pod` note
+  // describing the collector genuinely migrating between replicas, the
+  // comment QUOTING "exported data in this window" as the thing `/series`
+  // cannot establish, and the error listing "exported no teardown series" as
+  // one candidate CAUSE. The ban is on asserting, as fact, that the index
+  // told us a replica exported something.
+  it("keeps the prose honest too: no retired overclaim survives in the source", () => {
+    const source = readFileSync(
+      fileURLToPath(new URL("./cgroup-residual-teardown-fit.mjs", import.meta.url)),
+      "utf8",
+    );
+    for (const retired of ["did export the series", "do have data"]) {
+      assert.ok(
+        !source.includes(retired),
+        `retired overclaim "${retired}" is back in the module source`,
+      );
+    }
+    // Positive control: the pin reads a real file with the real vocabulary,
+    // so an empty/misread source cannot pass it vacuously.
+    assert.ok(source.includes("index matched"));
+    assert.ok(source.length > 10_000);
   });
 
   // The enrichment must not soften the failure into a non-result.
