@@ -25,6 +25,7 @@ import {
   readIssueMonitorGateSignals,
   reconcileTerminalGates,
   resolveTerminalGate,
+  terminalGateHeldIdempotencyKey,
   terminalGateHumanOnlyIdempotencyKey,
   terminalGateResolutionIdempotencyKey,
   type ReadPullRequestGate,
@@ -80,6 +81,7 @@ describe("parseTerminalGateSignal", () => {
       kind: "human_gate",
       raw: "omar-go:#2686",
       subjectPullRequestNumber: 2686,
+      holdProtocol: true,
     });
     for (const token of [
       "omar-go",
@@ -95,6 +97,38 @@ describe("parseTerminalGateSignal", () => {
       "hold:f35d6c:pr-2655:omar-go",
     ]) {
       expect(parseTerminalGateSignal(token)).toMatchObject({ kind: "human_gate" });
+    }
+  });
+
+  // The hold protocol is a strict subset of the human-gate allowlist, and the
+  // split is what licenses the two inferences the subject join feeds. A token
+  // misfiled into the hold subset would be discharged by a merge it has no
+  // relationship to.
+  it("marks only hold-protocol tokens as hold-protocol", () => {
+    for (const token of [
+      "omar-go:#2686",
+      "hold:f35d6c:pr-2655:omar-go",
+      "hold-lift:#2688",
+      "hold-lifted:#2688",
+      "human-go:pen-4475",
+      "founder-go:#1",
+    ]) {
+      expect(parseTerminalGateSignal(token)).toMatchObject({ holdProtocol: true });
+    }
+    // A decision a person must make, with no claim that it precedes any merge.
+    for (const token of [
+      "approval:dcb2b957",
+      "board-approval:6b0a2bff",
+      "card:dcb2b957",
+      "signoff:pr-2686",
+      "sign-off:pr-2686",
+      "cto-ruling:pen-4545",
+      "ceo-ruling:pen-4545",
+    ]) {
+      expect(parseTerminalGateSignal(token)).toMatchObject({
+        kind: "human_gate",
+        holdProtocol: false,
+      });
     }
   });
 
@@ -266,6 +300,75 @@ describe("resolveTerminalGate", () => {
     ).toMatchObject({
       kind: "satisfied",
       dischargedHumanGates: ["hold:f35d6c:pr-2655:omar-go"],
+    });
+  });
+
+  // The discharge inference is "the merge could not have preceded the go", and
+  // that is a property of the HOLD PROTOCOL, not of human gates generally. A
+  // `signoff:`/`approval:`/`card:`/`*-ruling:` token can name a decision due
+  // AFTER the merge — `signoff:pr-2686:rollout`, `approval:prod-deploy` — so
+  // discharging it would resolve a still-standing human gate to `satisfied`
+  // and post "nothing left to chase" over a decision nobody has made.
+  it("does NOT discharge a standing human gate when the pull request it names merges", async () => {
+    const verdict = await resolveTerminalGate({
+      gateSignals: ["pr:blockcast/paperclip#2686:merged", "signoff:pr-2686"],
+      readPullRequestGate: mergedReader(new Set(["blockcast/paperclip#2686"])),
+    });
+    expect(verdict).toEqual({
+      kind: "human_gate_only",
+      signals: ["pr:blockcast/paperclip#2686:merged", "signoff:pr-2686"],
+      humanGates: ["signoff:pr-2686"],
+      heldPullRequests: [],
+      mergedPullRequests: ["blockcast/paperclip#2686"],
+    });
+  });
+
+  it("covers every standing prefix, so none can be moved into the hold subset unnoticed", async () => {
+    for (const token of [
+      "approval:pr-2686",
+      "board-approval:pr-2686",
+      "card:pr-2686",
+      "signoff:pr-2686",
+      "sign-off:pr-2686",
+      "cto-ruling:pr-2686",
+      "ceo-ruling:pr-2686",
+    ]) {
+      expect(
+        await resolveTerminalGate({
+          gateSignals: ["pr:blockcast/paperclip#2686:merged", token],
+          readPullRequestGate: mergedReader(new Set(["blockcast/paperclip#2686"])),
+        }),
+      ).toMatchObject({ kind: "human_gate_only", humanGates: [token] });
+    }
+  });
+
+  // The other half of the same restriction: "this pull request is open because
+  // a person has not released it" is a claim about WHY it is open, and only
+  // the hold protocol establishes it. Everything else keeps the fail-closed
+  // silence it had before the join existed.
+  it("does NOT read a pull request as held open by a standing human gate", async () => {
+    const verdict = await resolveTerminalGate({
+      gateSignals: ["pr:blockcast/paperclip#2686:merged", "signoff:pr-2686"],
+      readPullRequestGate: mergedReader(new Set()),
+    });
+    expect(verdict).toMatchObject({ kind: "unresolved", reason: "pull_request_open" });
+  });
+
+  it("discharges the hold gate and keeps a standing gate on the same row", async () => {
+    // Mixed set: the merge proves the go arrived, and says nothing at all
+    // about the signoff. The row is announced for the signoff alone.
+    const verdict = await resolveTerminalGate({
+      gateSignals: [
+        "omar-go:#2686",
+        "pr:blockcast/paperclip#2686:merged",
+        "signoff:security",
+      ],
+      readPullRequestGate: mergedReader(new Set(["blockcast/paperclip#2686"])),
+    });
+    expect(verdict).toMatchObject({
+      kind: "human_gate_only",
+      humanGates: ["signoff:security"],
+      mergedPullRequests: ["blockcast/paperclip#2686"],
     });
   });
 
@@ -1485,20 +1588,163 @@ describeEmbeddedPostgres("reconcileTerminalGates", () => {
     expect(await commentsFor(issueId)).toHaveLength(1);
   });
 
+  // TGS — the fail-open direction review caught on #2974. A standing human
+  // gate naming a merged pull request must NOT become `satisfied`: that posts
+  // "Terminal gate resolved ... nothing left to chase" over a decision nobody
+  // has made. Every discharge fixture before this used `omar-go`/`hold*`, so
+  // widening the discharge back to the whole allowlist passed the suite.
+  it("does not resolve a row whose standing human gate names the merged pull request", async () => {
+    const { companyId, agentId } = await createCompany("TGS");
+    const gateSignals = ["pr:blockcast/paperclip#2686:merged", "signoff:pr-2686"];
+    const issueId = await insertStrandedGateIssue({
+      companyId,
+      agentId,
+      identifier: "TGS-1",
+      gateSignals,
+    });
+
+    const result = await reconcileTerminalGates(db, {
+      now: NOW,
+      readPullRequestGate: mergedReader(new Set(["blockcast/paperclip#2686"])),
+    });
+
+    expect(result).toMatchObject({ scanned: 1, resolved: 0, humanGateOnly: 1 });
+    const comments = await commentsFor(issueId);
+    expect(comments).toHaveLength(1);
+    expect(comments[0]!.key).toBe(terminalGateHumanOnlyIdempotencyKey(gateSignals));
+    expect(comments[0]!.body).toContain("signoff:pr-2686");
+    expect(comments[0]!.body).toContain("nothing here closes the issue");
+    // The resolved copy's two load-bearing phrases must be absent.
+    expect(comments[0]!.body).not.toContain("Terminal gate resolved");
+    expect(comments[0]!.body).not.toContain("nothing left to chase");
+  });
+
+  // TGH — the lost post-merge notice, also from #2974. The held finding is
+  // PROVISIONAL: the merge that ends it writes nothing to the database, so a
+  // permanent anti-join on the held key made the documented merged ->
+  // verify-and-close transition unreachable for every row a sweep saw while
+  // it was open. Which, for the PEN-4545 population, is all of them.
+  it("re-admits a held-open row after its re-check window so the merge still gets the resolved notice", async () => {
+    const { companyId, agentId } = await createCompany("TGH");
+    const gateSignals = [
+      "omar-go:#2686",
+      "pr:blockcast/penstock-llm-proxy-core#2686:merged",
+    ];
+    const issueId = await insertStrandedGateIssue({
+      companyId,
+      agentId,
+      identifier: "TGH-1",
+      status: "in_review",
+      gateSignals,
+      // The measured shape: actively polling, held open, reads as attended.
+      monitorAttemptCount: 3,
+      monitorLastTriggeredAt: LAST_POLL_AT,
+      monitorNextCheckAt: new Date(NOW.getTime() + 6 * 60 * 60 * 1000),
+    });
+
+    const held = await reconcileTerminalGates(db, {
+      now: NOW,
+      readPullRequestGate: mergedReader(new Set()),
+    });
+    expect(held).toMatchObject({ scanned: 1, resolved: 0, humanGateOnly: 1 });
+    expect(await commentsFor(issueId)).toHaveLength(1);
+    expect((await commentsFor(issueId))[0]!.key).toBe(
+      terminalGateHeldIdempotencyKey(gateSignals),
+    );
+
+    // Inside the window the row is out of the scan set entirely — the held
+    // notice still pays for itself, and a thrown reader proves no GitHub read.
+    const insideWindow = await reconcileTerminalGates(db, {
+      now: NOW,
+      readPullRequestGate: async () => {
+        throw new Error("a held row inside its re-check window must not re-read GitHub");
+      },
+    });
+    expect(insideWindow).toMatchObject({ scanned: 0, pullRequestReads: 0 });
+
+    // Age the announcement past the window. Back-dated rather than advancing
+    // `now`, so the assertion does not depend on wall-clock time.
+    await db
+      .update(issueComments)
+      .set({ createdAt: new Date(NOW.getTime() - 7 * 60 * 60 * 1000) })
+      .where(eq(issueComments.issueId, issueId));
+
+    // Still held: one read, and NO second comment — the held key conflicts.
+    const stillHeld = await reconcileTerminalGates(db, {
+      now: NOW,
+      readPullRequestGate: mergedReader(new Set()),
+    });
+    expect(stillHeld).toMatchObject({ scanned: 1, resolved: 0, humanGateOnly: 0 });
+    expect(await commentsFor(issueId)).toHaveLength(1);
+
+    // Merged: the verdict changes, so the key changes, so the row is admitted
+    // and gets the verify-and-close notice the runbook promises.
+    const merged = await reconcileTerminalGates(db, {
+      now: NOW,
+      readPullRequestGate: mergedReader(new Set(["blockcast/penstock-llm-proxy-core#2686"])),
+    });
+    expect(merged).toMatchObject({ scanned: 1, resolved: 1, humanGateOnly: 0 });
+    const after = await commentsFor(issueId);
+    expect(after).toHaveLength(2);
+    const resolvedComment = after.find(
+      (comment) => comment.key === terminalGateResolutionIdempotencyKey(gateSignals),
+    );
+    expect(resolvedComment).toBeDefined();
+    expect(resolvedComment!.body).toContain("Terminal gate resolved");
+    expect(resolvedComment!.body).toContain("discharged");
+    expect(resolvedComment!.body).toContain("omar-go:#2686");
+  });
+
+  // A TERMINAL human-only finding is the opposite case and must still retire
+  // the row for good: every declared pull request has merged, so no later
+  // sweep can read anything different, and re-admitting it would camp on a
+  // SCAN_LIMIT slot forever. Separating the two keys must not leak the held
+  // key's cadence onto this one.
+  it("never re-admits a terminal human-only row, however old the announcement", async () => {
+    const { companyId, agentId } = await createCompany("TGT");
+    const gateSignals = ["approval:dcb2b957", "pr:blockcast/paperclip#2686:merged"];
+    const issueId = await insertStrandedGateIssue({
+      companyId,
+      agentId,
+      identifier: "TGT-1",
+      gateSignals,
+    });
+    const reader = mergedReader(new Set(["blockcast/paperclip#2686"]));
+
+    expect(await reconcileTerminalGates(db, { now: NOW, readPullRequestGate: reader }))
+      .toMatchObject({ scanned: 1, humanGateOnly: 1 });
+    await db
+      .update(issueComments)
+      .set({ createdAt: new Date(NOW.getTime() - 30 * 24 * 60 * 60 * 1000) })
+      .where(eq(issueComments.issueId, issueId));
+
+    const second = await reconcileTerminalGates(db, {
+      now: NOW,
+      readPullRequestGate: async () => {
+        throw new Error("a terminal human-only row must never be re-read");
+      },
+    });
+    expect(second).toMatchObject({ scanned: 0, resolved: 0, humanGateOnly: 0 });
+    expect(await commentsFor(issueId)).toHaveLength(1);
+  });
+
   it("is idempotent, and the SQL anti-join keeps an announced human-gate row out of the scan window", async () => {
-    // Without the human-only prefix in the anti-join, this row would be
-    // re-admitted on every pass forever, consuming a SCAN_LIMIT slot it can
-    // never clear — the starvation vector the resolved-side anti-join exists
-    // to remove, reached through the new door. `scanned: 0` is the assertion
-    // that matters; `humanGateOnly: 0` alone would pass on a JS-side filter.
+    // Without the held prefix in the anti-join, this row would be re-admitted
+    // on every pass — a SCAN_LIMIT slot and a GitHub read every 10 minutes for
+    // a wait measured in days, which is the starvation vector the
+    // resolved-side anti-join exists to remove, reached through the new door.
+    // `scanned: 0` is the assertion that matters; `humanGateOnly: 0` alone
+    // would pass on a JS-side filter. TGH covers the complement — that the
+    // suppression is a 6h window and not permanent, so the merge is still
+    // seen.
     const { companyId, agentId } = await createCompany("TGA");
     const issueId = await insertStrandedGateIssue({
       companyId,
       agentId,
       identifier: "TGA-1",
-      // Held open, not merged: the merged form now discharges the gate and
-      // takes the resolved path, which is a different anti-join. This test is
-      // about the human-only key, so it has to stay on the human-only path.
+      // Held open, not merged: the merged form discharges this hold-protocol
+      // gate and takes the resolved path, which is a different anti-join.
+      // This test is about the held key, so it has to stay on the held path.
       gateSignals: ["hold-lift:#2655", "pr:blockcast/penstock-llm-proxy-core#2655:merged"],
     });
 
@@ -1532,21 +1778,39 @@ describeEmbeddedPostgres("reconcileTerminalGates", () => {
     });
 
     // Still open, so the person has not released it — the state in which the
-    // row is unreachable and oversight matters most. Once it merges the gate
-    // is discharged and the row becomes an ordinary resolved one, which may
-    // suppress review exactly as any other resolved row does.
+    // row is unreachable and oversight matters most.
     await reconcileTerminalGates(db, {
       now: NOW,
       readPullRequestGate: mergedReader(new Set()),
     });
     expect(await commentsFor(issueId)).toHaveLength(1);
 
-    const [row] = await db
-      .select({ id: issues.id, executionState: issues.executionState })
-      .from(issues)
-      .where(eq(issues.id, issueId));
-    const resolvedMap = await listResolvedTerminalGates(db, [row!]);
-    expect(resolvedMap.has(issueId)).toBe(false);
+    const readRow = async () => {
+      const [row] = await db
+        .select({ id: issues.id, executionState: issues.executionState })
+        .from(issues)
+        .where(eq(issues.id, issueId));
+      return row!;
+    };
+    expect((await listResolvedTerminalGates(db, [await readRow()])).has(issueId)).toBe(false);
+
+    // TGP: and after the merge DISCHARGES the gate, still false. The row is
+    // `satisfied` and gets the verify-and-close notice, but the discharged
+    // `omar-go:` token is still a signal on it, so `listResolvedTerminalGates`
+    // — whose filter is `every(kind === "pull_request")` over the whole set —
+    // never admits it. Stricter than this module needs; pinned because the
+    // runbook used to claim the opposite, and a reader could reasonably
+    // "fix" the filter to match the prose.
+    await db
+      .update(issueComments)
+      .set({ createdAt: new Date(NOW.getTime() - 7 * 60 * 60 * 1000) })
+      .where(eq(issueComments.issueId, issueId));
+    const merged = await reconcileTerminalGates(db, {
+      now: NOW,
+      readPullRequestGate: mergedReader(new Set(["blockcast/penstock-llm-proxy-core#2686"])),
+    });
+    expect(merged).toMatchObject({ resolved: 1 });
+    expect((await listResolvedTerminalGates(db, [await readRow()])).has(issueId)).toBe(false);
   });
 
   it("exposes the recorded resolution to the productivity-review detector, keyed on the current signal set", async () => {    const { companyId, agentId } = await createCompany("TG7");

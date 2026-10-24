@@ -202,7 +202,7 @@ allowlist.
 This is the half the first cut got backwards, and it inverted the notice end to
 end for exactly the shape the issue measured.
 
-A human-gate token usually *names a pull request*: `omar-go:#2686`,
+A **hold-protocol** token usually *names a pull request*: `omar-go:#2686`,
 `hold:f35d6c:pr-2655:omar-go`. When that pull request is **also** a declared
 `pr:` gate on the same row, the two tokens say one thing — *a person must
 release this pull request*. Reading them independently produced the worst
@@ -212,6 +212,30 @@ available ordering:
 |---|---|---|---|
 | **open** | the person — this is the entire wait | `unresolved/pull_request_open`, **skipped in silence** | `human_gate_only` carrying `heldPullRequests`; announced, escalate the ask |
 | **merged** | nothing: under the hold protocol the merge cannot precede the go | `human_gate_only` — *"Escalate the ask"* for a go already given | `satisfied` carrying `dischargedHumanGates`; verify-and-close |
+
+#### Only the hold protocol, and that restriction is the whole safety argument
+
+Both cells of that table rest on one premise — *the person's decision is the
+thing standing between this pull request and its merge* — and that premise is
+a property of the **hold protocol** (`omar-go`, `hold`, `hold-lift`,
+`hold-lifted`, `human-go`, `founder-go`), not of human gates in general.
+
+`HOLD_PROTOCOL_TOKEN_PREFIXES` is therefore a strict subset of
+`HUMAN_GATE_TOKEN_PREFIXES`, and only it feeds the subject join. A standing
+gate — `approval:`, `board-approval:`, `card:`, `signoff:`/`sign-off:`,
+`cto-ruling:`, `ceo-ruling:` — can perfectly well name a decision due *after*
+the merge (`signoff:pr-2686:rollout`, `approval:prod-deploy:pr-2686`), so:
+
+| | hold-protocol gate | standing gate |
+|---|---|---|
+| named PR **open** | `human_gate_only`, PR listed under `heldPullRequests` | `unresolved/pull_request_open` — fail closed; "open because a person has not released it" is unestablished |
+| named PR **merged** | discharged; row becomes `satisfied` | **still stands**; row is `human_gate_only` and the gate is announced |
+
+Discharging a standing gate on merge would turn a decision nobody has made
+into `satisfied` and post *"there is nothing left to chase"* over it — the
+fail-open direction this module is built to refuse. `TGS` pins
+`signoff:pr-2686` + merged `#2686` -> `human_gate_only`, and its open-PR twin
+pins the fail-closed side.
 
 `parseHumanGateSubject` reads the pull request number out of the token, in both
 spellings the fleet writes (`#2686` on PEN-4475, `pr-2655` on PEN-2619). It
@@ -230,7 +254,9 @@ Three invariants this must keep, each pinned by a test:
   person". The work did not land, and that fail-closed rule outranks the new
   branch;
 - discharge requires the merge of *that* pull request, so `satisfied` still
-  means every declared gate is met.
+  means every declared gate is met;
+- discharge requires a **hold-protocol** token. A standing human gate survives
+  the merge of a pull request it names.
 
 `listCandidateIssues` gained a **third arm** for this class, and it is the half
 that makes the feature meet its own description. The first two arms admit a
@@ -272,17 +298,34 @@ prefixes on evidence.
   path. A human-gated row is the case where oversight is *most* warranted: the
   work is finished, unreachable, and nobody has been told. Two independent
   guards hold this — the `kind === "pull_request"` filter and the separate
-  idempotency prefix — and both are deliberate. A row whose gate is
-  *discharged* is a different thing and is deliberately not covered: once the
-  named pull request merges there is nobody left to chase, so it becomes an
-  ordinary `satisfied` row and may suppress review exactly as any other
-  resolved row does.
-- **The anti-join must test both prefixes.** `listCandidateIssues` excludes a
-  row announced under *either* key for its current signal set. Testing only the
-  resolved prefix would re-admit every announced human-gate row on every pass,
-  where it can never clear — the `SCAN_LIMIT` starvation vector the resolved-side
-  anti-join exists to remove, reached through a new door. `TGA` pins this on
-  `scanned: 0`, which a JS-side filter cannot fake.
+  idempotency prefix — and both are deliberate. Note the first guard is
+  `every` over the *whole* signal set, so it also keeps a **discharged** row
+  out of the suppression map: the discharged hold token is still a
+  `human_gate` signal on that row, so the row is `satisfied` and gets the
+  verify-and-close notice but never suppresses a productivity review. That is
+  stricter than this module needs and is left as is — `TGP` pins it.
+- **The anti-join must test all three prefixes, and only two of them retire a
+  row for good.** `listCandidateIssues` excludes a row announced under any key
+  for its current signal set. Testing only the resolved prefix would re-admit
+  every announced human-gate row on every pass, where it can never clear — the
+  `SCAN_LIMIT` starvation vector the resolved-side anti-join exists to remove,
+  reached through a new door. `TGA` pins this on `scanned: 0`, which a JS-side
+  filter cannot fake.
+
+  The **held-open** finding is the exception, and the reason it has its own
+  prefix. It is *provisional*: it describes a pull request that is open right
+  now, and the event that ends it — the merge — writes nothing to the
+  database, so the gate signals, and therefore the digest, are identical
+  before and after. Retiring the row permanently on it meant the merged ->
+  `satisfied` verify-and-close transition in the table above could only fire
+  for a row whose pull request merged before any sweep saw it open; for the
+  population PEN-4545 measured (held open ~24h while actively polling) the
+  held notice always lands first, so that transition was dead for exactly the
+  rows it was written for. A held announcement therefore suppresses its row
+  only for `HELD_GATE_RECHECK_INTERVAL_MS` (6h), after which the sweep
+  re-reads the pull request. Still held: the insert conflicts on the held key
+  and nothing is posted — one read, no second comment. Merged: the verdict and
+  the key both change, and the resolved notice lands. `TGH` pins both halves.
 - **The third arm must stay guarded by the allowlist.** Dropping
   `humanGateSignalExistsSql` from it readmits the entire actively-polling
   fleet, spending a PR read per row per pass on rows the scheduler is already
