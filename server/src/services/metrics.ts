@@ -795,11 +795,23 @@ export const CCROTATE_CAPACITY_DEFERRED_METRIC = "paperclip_ccrotate_capacity_de
  *   `{path="messages_fallback"} / {path="capacity"}`.
  * - `path="messages_fallback"` counts the provider-inference probes actually
  *   paid for. **An absent series means the fallback has not been taken since
- *   process start** — the counter is not pre-seeded, deliberately, so a zero
- *   cannot be confused with a series that was minted by seeding rather than by
- *   a real probe. Confirm the gate is probing at all by checking the
- *   `path="capacity"` series is advancing; do not read fallback silence alone
- *   as health.
+ *   process start.** Seeding (next bullet) is per `(path, provider, model)`
+ *   tuple, so it does not mint a fallback tuple that has never been taken.
+ *   Confirm the gate is probing at all by checking the `path="capacity"`
+ *   series is advancing; do not read fallback silence alone as health.
+ * - **Outcomes are seeded at zero per tuple (PEN-4675).** The first probe
+ *   recorded for a `(path, provider, model)` materialises all six
+ *   {@link KNOWN_PENSTOCK_PROBE_OUTCOMES} children for that tuple at `0`, so
+ *   *within a tuple that has probed at least once* an outcome that never fired
+ *   reads `0` instead of having no series. Without it `absent(...)` and `== 0`
+ *   were indistinguishable and the ambiguity failed in the reassuring
+ *   direction — on PEN-2514/PEN-4462 `outcome="deny_capacity"` was absent for
+ *   80 consecutive hours while the gate was demonstrably probing, and a
+ *   `deny_temporary` child was observed alive at a flat `0` for 16 h and then
+ *   gone with its pod, i.e. child presence was tracking pod lifetime rather
+ *   than denial activity. **Seeding does not survive a restart**: series are
+ *   per process, so absence across a pod boundary is still uninformative and a
+ *   verdict over a window spanning one must say so.
  * - Cache hits do **not** increment. Only real network probes are counted, so
  *   the ratio above is over re-probes rather than over gate calls.
  * - **The fail-open set is path-qualified:** `path="messages_fallback"` with
@@ -822,7 +834,11 @@ export const CCROTATE_CAPACITY_DEFERRED_METRIC = "paperclip_ccrotate_capacity_de
  *   and misses **all** of codex, which has no fallback series at all.
  *
  * Cardinality: `path` and `outcome` are fixed allow-lists (2 x 6), coerced
- * here. `provider` is deliberately **not** coerced: it is bounded by its
+ * here. Per-tuple seeding realises all 6 outcomes for every observed
+ * `(path, provider, model)` rather than only the ones that fired, so the live
+ * series count is the tuple count x 6 — bounded by the same tuple space the
+ * counter already pays for, and tens of series at current fleet shape.
+ * `provider` is deliberately **not** coerced: it is bounded by its
  * caller's own `PenstockProvider` union instead, because collapsing a
  * genuinely new third provider to "unknown" would hide exactly the per-provider
  * probe cost this series exists to attribute. `model` comes from
@@ -4208,6 +4224,12 @@ let startLockReapDisposition: Counter<"disposition"> | null = null;
 let orphanReapStageSeconds: Histogram<"stage"> | null = null;
 let penstockGateProbe: Counter<"path" | "outcome" | "provider" | "model"> | null = null;
 let penstockGateProbeDuration: Histogram<"path" | "provider"> | null = null;
+/**
+ * `path|provider|model` tuples whose full outcome allow-list has already been
+ * materialised at zero (PEN-4675). Keeps the seeding to one pass per tuple
+ * instead of six redundant `inc(..., 0)` calls on every probe.
+ */
+const penstockGateProbeSeededTuples = new Set<string>();
 let heartbeatTimerSchedulerExclusion: Counter<"reason"> | null = null;
 let modelProfileUnapplied: Counter<"adapter" | "requested" | "reason"> | null = null;
 let heartbeatPostTerminalRunEventDropped: Counter<"status"> | null = null;
@@ -4787,10 +4809,15 @@ function ensureRegistry(): {
         + "(capacity = the cached GET /v1/pools/default/capacity; messages_fallback = the "
         + "real POST /v1/messages taken when that GET yields no verdict), bounded outcome, "
         + "provider, and model. path=capacity counts every attempt and is the denominator "
-        + "for fallback share. Not pre-seeded: an absent messages_fallback series means the "
-        + "fallback has not been taken since process start, so confirm path=capacity is "
-        + "advancing before reading that silence as health. Cache hits are not counted, so "
-        + "the ratio is over real re-probes. The fail-open set is path-qualified: "
+        + "for fallback share. Seeded per tuple (PEN-4675): the first probe recorded for a "
+        + "(path, provider, model) materialises all six outcomes for that tuple at zero, so "
+        + "within that tuple an unfired outcome reads 0 rather than vanishing and a quiet "
+        + "hour is distinguishable from a dead exporter. Seeding is still per tuple, not "
+        + "global: an absent messages_fallback series means the fallback has not been taken "
+        + "since process start, so confirm path=capacity is advancing before reading that "
+        + "silence as health. Series are also per process, so a pod restart resets them and "
+        + "absence across a restart boundary stays uninformative. Cache hits are not counted, "
+        + "so the ratio is over real re-probes. The fail-open set is path-qualified: "
         + "path=messages_fallback with outcome=error|auth_fault allows dispatch with no "
         + "verdict, and so does path=capacity with outcome=error, which no longer falls "
         + "through to the fallback (BLO-29900 item 3) - a transport failure says nothing "
@@ -7398,6 +7425,39 @@ function normalizePenstockProbeLabel<T extends string>(
 }
 
 /**
+ * Materialise every {@link KNOWN_PENSTOCK_PROBE_OUTCOMES} child at zero for one
+ * `(path, provider, model)` tuple (PEN-4675).
+ *
+ * A prom-client counter mints a child on its first `inc`, so an outcome that
+ * has not fired has **no series at all** rather than a series reading zero.
+ * `absent(...)` and `== 0` are then indistinguishable over any window, and the
+ * reading fails in the reassuring direction: a healthy quiet hour and an
+ * exporter that stopped emitting look identical. Measured on PEN-2514/PEN-4462,
+ * `outcome="deny_capacity"` was absent for 80 consecutive hours while the gate
+ * was demonstrably probing, and the `deny_temporary` child independently
+ * demonstrated the converse — born, flat zero for 16 h, then gone with the pod.
+ *
+ * Seeding is lazy and per tuple rather than at process start because `model`
+ * comes from operator-managed adapter config and `provider` is deliberately
+ * uncoerced, so neither is enumerable before the first probe. Cost is bounded
+ * by the same tuple space the counter already pays for: six children per
+ * observed tuple instead of one, and `path`/`outcome` are fixed allow-lists.
+ */
+function seedPenstockProbeOutcomes(
+  counter: Counter<"path" | "outcome" | "provider" | "model">,
+  path: PenstockProbePathLabel,
+  provider: string,
+  model: string,
+): void {
+  const key = `${path}|${provider}|${model}`;
+  if (penstockGateProbeSeededTuples.has(key)) return;
+  penstockGateProbeSeededTuples.add(key);
+  for (const outcome of KNOWN_PENSTOCK_PROBE_OUTCOMES) {
+    counter.inc({ path, outcome, provider, model }, 0);
+  }
+}
+
+/**
  * Increment {@link PENSTOCK_AVAILABILITY_GATE_PROBE_METRIC} and observe
  * {@link PENSTOCK_AVAILABILITY_GATE_PROBE_DURATION_METRIC} for one probe.
  *
@@ -7426,6 +7486,7 @@ export function recordPenstockAvailabilityGateProbe(
     : "unknown";
   const labels = { path, outcome, provider, model };
   const registryHandles = ensureRegistry();
+  seedPenstockProbeOutcomes(registryHandles.penstockGateProbeCounter, path, provider, model);
   registryHandles.penstockGateProbeCounter.inc(labels);
   if (typeof input.durationSeconds === "number" && Number.isFinite(input.durationSeconds)) {
     registryHandles.penstockGateProbeDurationHistogram.observe(
@@ -9916,6 +9977,7 @@ export function __resetMetricsForTest(): void {
   orphanReapStageSeconds = null;
   penstockGateProbe = null;
   penstockGateProbeDuration = null;
+  penstockGateProbeSeededTuples.clear();
   heartbeatTimerSchedulerExclusion = null;
   modelProfileUnapplied = null;
   heartbeatPostTerminalRunEventDropped = null;
