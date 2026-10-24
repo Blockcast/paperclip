@@ -57,7 +57,16 @@
 // Usage:
 //   node scripts/cgroup-residual-teardown-fit.mjs \
 //     --prometheus-url http://prometheus.monitoring.svc.cluster.local:9090 \
-//     --start 2026-10-16T00:00:00Z --end 2026-10-22T20:00:00Z
+//     --start 2026-10-16T00:00:00Z --end 2026-10-22T20:00:00Z \
+//     --pod paperclip-1
+//
+// ⚠️ `--pod` is the flag you are most likely to need. The teardown collector
+// MIGRATES between worker replicas on pod replacement (measured 2026-10-24:
+// replacements run ~daily), so the pod that exported the series last week is
+// often not the one exporting it today. Passing it re-points residual, restart
+// AND teardown together, which is what keeps the pairing on one pod (trap 5).
+// Get it wrong and the run fails loudly naming the replicas that do have data
+// -- it never silently fits the wrong pod.
 //
 // Exit status is 0 whenever the fit ran; a non-discriminating window is a
 // RESULT, not an error. It exits non-zero only when it could not measure.
@@ -65,7 +74,16 @@
 import { realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
+/**
+ * ⚠️ Right only by luck on any given day -- the collector migrates between
+ * replicas (see the `--pod` note above). A wrong value is caught loudly by
+ * `assertMeasurable`, which names the replicas that did export the series.
+ */
 const DEFAULT_POD = "paperclip-0";
+
+/** Single spelling, shared by the range query and the discovery matcher. */
+export const TEARDOWN_METRIC =
+  "paperclip_execution_workspace_teardown_duration_seconds_sum";
 const DEFAULT_CONTAINER = "paperclip";
 const DEFAULT_STEP_SECONDS = 3600;
 const GIB = 1024 ** 3;
@@ -118,10 +136,7 @@ export function residualQuery(pod = DEFAULT_POD, container = DEFAULT_CONTAINER) 
  * still a sample, so coverage reports 7/7 on a pairing that is entirely wrong.
  */
 export function teardownQuery(stepSeconds = DEFAULT_STEP_SECONDS, pod = DEFAULT_POD) {
-  return (
-    "sum(increase(paperclip_execution_workspace_teardown_duration_seconds_sum" +
-    `{pod="${pod}"}[${stepSeconds}s]))`
-  );
+  return `sum(increase(${TEARDOWN_METRIC}{pod="${pod}"}[${stepSeconds}s]))`;
 }
 
 /** The segmentation key (trap 2). Never deploy commits. */
@@ -369,7 +384,15 @@ export function formatFitTable(fits) {
  * `teardown` is introduced by #2175, so a window predating it, a renamed
  * metric, or an unscraped `_sum` all land here.
  */
-export function assertMeasurable({ residual, teardown, restarts, start, end, pod = DEFAULT_POD }) {
+export function assertMeasurable({
+  residual,
+  teardown,
+  restarts,
+  start,
+  end,
+  pod = DEFAULT_POD,
+  teardownPods = [],
+}) {
   const window = `${iso(start)}..${iso(end)}`;
   if (residual.length === 0 || restarts.length === 0) {
     // Retention is ~7 days. An empty window is almost always the window having
@@ -383,12 +406,33 @@ export function assertMeasurable({ residual, teardown, restarts, start, end, pod
     // which is indistinguishable from the metric not being scraped at all. So
     // this stays a hard error even though "that replica simply did no teardown
     // work" is now one of the causes: a silent zero would be read as a regime.
+    // The operator hitting this is usually mid-incident with ~7 days of
+    // retention burning, and "check the sibling replica" still leaves them a
+    // query to write. Name the replicas instead. This is enrichment only:
+    // `teardownPods` empty reproduces the previous message byte for byte, so a
+    // failed discovery degrades to the old behaviour rather than to silence.
+    const others = teardownPods.filter((candidate) => candidate !== pod);
+    let hint = "";
+    if (others.length > 0) {
+      hint =
+        ` Replicas that DID export it in this window: ${others.join(", ")}` +
+        " -- re-run with `--pod <name>`, which re-points residual and restarts" +
+        " with it so the pairing stays on one pod (trap 5).";
+    } else if (teardownPods.includes(pod)) {
+      // Series present but `increase()` yielded nothing: a range/step problem,
+      // NOT the wrong pod. Sending this reader to the sibling would waste the
+      // one thing they are short of.
+      hint =
+        ` The series DOES exist for ${pod} here, so this is the window or step` +
+        " (`increase()` needs two points in a bucket), not the wrong replica.";
+    }
     throw new Error(
       `no teardown samples for pod ${pod} in ${window} -- the independent ` +
         "variable is absent (window predates #2175, metric renamed, `_sum` " +
         `not scraped, or ${pod} exported no teardown series in this window -- ` +
         "check the sibling replica). " +
-        "This is a measurement failure, not a non-result.",
+        "This is a measurement failure, not a non-result." +
+        hint,
     );
   }
 }
@@ -413,6 +457,45 @@ export function parseMatrix(body) {
     }
   }
   return out.sort((a, b) => a.t - b.t);
+}
+
+/**
+ * Distinct `pod` label values on the teardown series, from a `/series` body.
+ *
+ * Deliberately NOT an aggregation query: `/series` enumerates label sets
+ * without touching samples, so it answers "which replica exported this" for a
+ * 7-day window at a fraction of the cost of `sum by (pod) (increase(...))`,
+ * and it still reports a replica whose counter never advanced.
+ */
+export function parseSeriesPods(body) {
+  if (body?.status !== "success" || !Array.isArray(body.data)) return [];
+  const pods = new Set();
+  for (const labels of body.data) {
+    const pod = labels?.pod;
+    if (typeof pod === "string" && pod !== "") pods.add(pod);
+  }
+  return [...pods].sort();
+}
+
+/**
+ * Best-effort: which replicas exported teardown in this window.
+ *
+ * ⛔ Enrichment for an error path that has ALREADY failed. It must never throw
+ * and never decide anything -- returning `[]` simply restores the pre-existing
+ * message. Never let it gate the measurement.
+ */
+async function discoverTeardownPods(baseUrl, from, to, fetchImpl) {
+  try {
+    const url = new URL("/api/v1/series", baseUrl);
+    url.searchParams.set("match[]", TEARDOWN_METRIC);
+    url.searchParams.set("start", String(from));
+    url.searchParams.set("end", String(to));
+    const response = await fetchImpl(url, { headers: { accept: "application/json" } });
+    if (!response.ok) return [];
+    return parseSeriesPods(await response.json());
+  } catch {
+    return [];
+  }
 }
 
 async function queryRange(baseUrl, query, from, to, step, fetchImpl) {
@@ -476,7 +559,11 @@ async function main() {
     queryRange(baseUrl, restartQuery(pod, container), start, end, step, fetch),
   ]);
 
-  assertMeasurable({ residual, teardown, restarts, start, end, pod });
+  // Only pay for discovery when the run is already going to fail.
+  const teardownPods =
+    teardown.length === 0 ? await discoverTeardownPods(baseUrl, start, end, fetch) : [];
+
+  assertMeasurable({ residual, teardown, restarts, start, end, pod, teardownPods });
 
   const fits = buildSegmentFits({ residual, teardown, restarts });
   const verdict = summarizeDiscrimination(fits);

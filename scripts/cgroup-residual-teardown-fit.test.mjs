@@ -11,12 +11,14 @@ import {
   fitOls,
   formatFitTable,
   parseMatrix,
+  parseSeriesPods,
   residualQuery,
   restartQuery,
   segmentsFromRestarts,
   median,
   sliceWindow,
   summarizeDiscrimination,
+  TEARDOWN_METRIC,
   teardownQuery,
 } from "./cgroup-residual-teardown-fit.mjs";
 
@@ -427,6 +429,99 @@ describe("assertMeasurable (an UNMEASURABLE window is not a non-result)", () => 
     assert.throws(
       () => assertMeasurable({ ...ok, teardown: [] }),
       (e) => !/past retention/.test(e.message),
+    );
+  });
+});
+
+describe("parseSeriesPods (naming the replica that HAS the data)", () => {
+  const body = (data) => ({ status: "success", data });
+
+  it("returns distinct pods, sorted", () => {
+    assert.deepEqual(
+      parseSeriesPods(
+        body([
+          { __name__: TEARDOWN_METRIC, pod: "paperclip-1", method: "worktree_remove" },
+          { __name__: TEARDOWN_METRIC, pod: "paperclip-1", method: "inspect_safety" },
+          { __name__: TEARDOWN_METRIC, pod: "paperclip-0", method: "inspect_safety" },
+        ]),
+      ),
+      ["paperclip-0", "paperclip-1"],
+    );
+  });
+
+  // Discovery runs on a path that has ALREADY failed, so a malformed or error
+  // body must degrade to "I cannot name one", never to a throw that would
+  // replace the real measurement failure with a parse error.
+  it("degrades to [] on an error, malformed or pod-less body", () => {
+    assert.deepEqual(parseSeriesPods({ status: "error", error: "boom" }), []);
+    assert.deepEqual(parseSeriesPods({ status: "success", data: "not-an-array" }), []);
+    assert.deepEqual(parseSeriesPods(undefined), []);
+    assert.deepEqual(parseSeriesPods(body([{ __name__: TEARDOWN_METRIC }, null, { pod: "" }])), []);
+  });
+});
+
+describe("assertMeasurable names the replica (collector migrates between pods)", () => {
+  const broken = {
+    residual: [{ t: 1000, value: 1 }],
+    teardown: [],
+    restarts: [{ t: 1000, value: 500 }],
+    start: 1000,
+    end: 2000,
+    pod: "paperclip-0",
+  };
+  const messageOf = (input) => {
+    try {
+      assertMeasurable(input);
+    } catch (error) {
+      return error.message;
+    }
+    throw new Error("expected assertMeasurable to throw");
+  };
+  // Everything after the stable sentence is the enrichment.
+  const hintOf = (input) => messageOf(input).split("not a non-result.")[1] ?? "";
+
+  it("names the OTHER replicas and the flag that re-points the pairing", () => {
+    const hint = hintOf({ ...broken, teardownPods: ["paperclip-0", "paperclip-1"] });
+    assert.match(hint, /paperclip-1/);
+    assert.match(hint, /--pod/);
+    // The queried pod is the one WITHOUT data; listing it would send the
+    // reader straight back to the replica that just failed them.
+    assert.ok(!/paperclip-0/.test(hint));
+  });
+
+  // ⛔ DEGRADATION PIN. Discovery is best-effort: a 404, a timeout or a
+  // Prometheus without the series all yield []. That path must reproduce the
+  // previous message EXACTLY, so a failed enrichment can never be mistaken for
+  // a different diagnosis.
+  it("reproduces the pre-enrichment message byte for byte when discovery found nothing", () => {
+    const omitted = messageOf({ ...broken });
+    const empty = messageOf({ ...broken, teardownPods: [] });
+    assert.equal(empty, omitted);
+    assert.equal(hintOf({ ...broken, teardownPods: [] }), "");
+    assert.ok(!/Replicas that DID export/.test(empty));
+  });
+
+  // Series present but no samples is a WINDOW problem. Sending that reader to
+  // the sibling costs them the retention they are racing.
+  it("distinguishes a window/step problem from the wrong replica", () => {
+    const hint = hintOf({ ...broken, teardownPods: ["paperclip-0"] });
+    assert.match(hint, /window or step/);
+    assert.ok(!/Replicas that DID export/.test(hint));
+  });
+
+  // The enrichment must not soften the failure into a non-result.
+  it("still throws, and still reads as a measurement failure", () => {
+    assert.throws(
+      () => assertMeasurable({ ...broken, teardownPods: ["paperclip-1"] }),
+      /independent variable is absent.*measurement failure, not a non-result/s,
+    );
+  });
+
+  // Retention loss is a different cause and must not acquire a replica hint.
+  it("leaves the retention message alone", () => {
+    assert.throws(
+      () => assertMeasurable({ ...broken, residual: [], teardownPods: ["paperclip-1"] }),
+      (e) => /past retention/.test(e.message) && !/Replicas that DID export/.test(e.message),
     );
   });
 });
