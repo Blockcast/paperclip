@@ -40,11 +40,61 @@ A declared outcome has not been observed, and the oldest such card is past
 1. Find the card. The control-plane log line
    `accepted interactions whose authorised action has not been observed`
    carries `unobservedSample` with the interaction id, issue identifier,
-   declared outcome kind and age.
+   declared outcome kind and age. **If you cannot read that log line, use the
+   API reconstruction below — it needs no log access and identifies the same
+   card.**
 2. **Check the real object before concluding anything.** `unobserved` is not
    proof the action did not happen — see the ambiguity note below.
 3. If the action genuinely has not happened: **do it**, or — if it has gone
    moot — **acknowledge it** (below). Nothing automated will clear this.
+   Those are the only two exits. A card whose action is still wanted, still
+   authorised, and merely blocked on someone is **neither** — leave it alone
+   and let it keep firing. Acknowledging it to quiet the alert records
+   "nobody is waiting any more" about a decision somebody *is* waiting on,
+   which is the precise failure this feature exists to make visible.
+
+### Finding the card without log access
+
+Step 1's log line is frequently unreachable, and not only for agents. It is
+emitted **once at process start and thereafter only on change or hourly**
+(`LOG_RELOG_INTERVAL_MS`), so on a busy replica it is already thousands of
+lines back; `kubectl logs --tail` cannot reach it and the read-only MCP log
+tool has no filter. Agent seats additionally get `pods is forbidden` on
+`kubectl logs` outright. Reconstruct the card from the API instead — three
+reads, no log access, no database access:
+
+1. **Get the acceptance timestamp from the gauge.** Subtract the age from the
+   time the gauge was *refreshed*:
+
+   ```
+   paperclip_accepted_interaction_outcome_oldest_age_seconds{bucket="unobserved", company_id="<id>"}
+   ```
+
+   ⚠ Subtract from the refresh time, **not** the scrape timestamp. This
+   refresh runs on its own `minIntervalMs` (5 min) cadence, so the value is
+   up to five minutes stale and the timestamp you derive lands a few minutes
+   late. Match approximately; do not expect it to be exact.
+
+2. **Look the acceptance up in the activity log** and find the entry at that
+   timestamp:
+
+   ```
+   GET /api/companies/:companyId/activity?action=issue.thread_interaction_accepted&limit=30
+   ```
+
+   Newest first; `details.interactionId` and `entityId` (the issue) are the
+   two fields you want. ⚠ Keep `limit` at or below ~30 — this filter is not
+   indexed, and larger pages reliably hit the statement timeout and return
+   `503 transient_db_conflict` / sqlstate `57014`.
+
+3. **Read the card** with `GET /api/issues/:issueId/interactions` and confirm
+   it: `status: "accepted"`, a `resolvedAt` matching step 1, and a
+   `payload.expectedOutcome`. That last field is the declared outcome the
+   sweep is checking.
+
+The derived timestamp is the identifying evidence, so state it when you report
+the card — the acceptance it lands on should be unique, and the acceptances
+on either side of it should be visibly the wrong age.
 
 ### Clearing a moot card: acknowledge it, you cannot withdraw it
 
