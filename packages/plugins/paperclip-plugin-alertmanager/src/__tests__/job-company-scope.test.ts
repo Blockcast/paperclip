@@ -42,6 +42,16 @@ vi.mock("../config-scope.js", async (importOriginal) => {
   };
 });
 
+type ReconcileResult = { skipped?: string; routed: number; backfilled: string[] };
+const reconcileActiveAlerts = vi.fn<(ctx: unknown, config: SweepConfig) => Promise<ReconcileResult>>();
+vi.mock("../reconcile.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../reconcile.js")>();
+  return {
+    ...actual,
+    reconcileActiveAlerts: (ctx: unknown, config: SweepConfig) => reconcileActiveAlerts(ctx, config),
+  };
+});
+
 const { plugin } = await import("../worker.js");
 
 type JobHandler = (job: PluginJobContext) => Promise<void>;
@@ -140,5 +150,30 @@ describe("alertmanager check-alert-escalations job scope (BLO-20957 review)", ()
 
     expect(runAlertEscalationSweep).not.toHaveBeenCalled();
     expect(warn).not.toHaveBeenCalled();
+  });
+});
+
+// BLO-44820: a skipped reconcile used to log at debug, so a reconciler with no
+// `reconcileReceivers` read as "job completed successfully" in production.
+describe("alertmanager reconcile-active-alerts outcome is visible at info (BLO-44820)", () => {
+  async function runReconcile(result: ReconcileResult) {
+    resolveEscalationSweepConfig.mockResolvedValue({ defaultCompanyId: "company-a" });
+    reconcileActiveAlerts.mockResolvedValue(result);
+    const { ctx, registered } = mkCtx();
+    await plugin.definition.setup!(ctx);
+    const handler = registered.get("reconcile-active-alerts");
+    if (!handler) throw new Error("reconcile-active-alerts was never registered");
+    await handler({ companyId: "company-a" } as unknown as PluginJobContext);
+    return (ctx.logger.info as ReturnType<typeof vi.fn>).mock.calls.map((c) => String(c[0]));
+  }
+
+  it("logs a skip reason at info", async () => {
+    const lines = await runReconcile({ skipped: "no reconcileReceivers configured", routed: 0, backfilled: [] });
+    expect(lines).toContain("paperclip-plugin-alertmanager: alert reconcile skipped: no reconcileReceivers configured");
+  });
+
+  it("logs routed/backfilled counts at info on a real pass", async () => {
+    const lines = await runReconcile({ routed: 3, backfilled: ["fp1"] });
+    expect(lines).toContain("paperclip-plugin-alertmanager: alert reconcile routed=3 backfilled=1");
   });
 });
