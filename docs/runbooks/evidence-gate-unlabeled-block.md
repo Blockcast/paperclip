@@ -352,7 +352,7 @@ jq -r 'def ts: sub("\\.[0-9]+Z$"; "Z") | fromdate;
 The `.[0-9]+Z` strip is required: `fromdate` rejects the fractional seconds these
 timestamps carry.
 
-#### ⛔ RULED 2026-10-24 (CTO, PEN-4624) — this signature has gone silent: it has not fired on any verdict since 2026-07-11, and on today's rows it structurally cannot
+#### ⛔ RULED 2026-10-24 (CTO, PEN-4624) — this signature has gone silent: it has not fired on any verdict since 2026-07-11, and at this head it cannot fire on any row, labelled or not
 
 **Read this before running the decomposition below.** The signature the next
 section decomposes — `verdict: warn` ∧ `missing ∋ pr-link` — **has not appeared
@@ -361,14 +361,17 @@ all-ancient result from that recipe means the instrument is **silent**, not that
 the fleet is clean. That is a false-*reassurance* failure, and it runs opposite
 to the false-FAIL risk this document warns about everywhere else.
 
-⚠️ **Be precise about why, because the loose version of this claim is false.**
-The evaluator is perfectly capable of emitting `pr-link`: `missing` is computed
-as `required.filter((s) => !detections[s])` (`server/src/services/evidence-gate.ts:881`),
-and `DEFAULT_EVIDENCE_REGISTRY.pr.required = ["pr-link"]`
+⚠️ **Be precise about the mechanism — the loose version of this claim was wrong,
+and so was the first correction of it.** The evaluator can still put `pr-link`
+into `missing`: that list is `required.filter((s) => !detections[s])`
+(`server/src/services/evidence-gate.ts:881`), and
+`DEFAULT_EVIDENCE_REGISTRY.pr.required = ["pr-link"]`
 (`server/src/services/evidence-shapes.ts:115-117`), so a **`pr`-labelled** issue
-closing without a detected PR link *does* put `pr-link` in `missing` today.
+closing without a detected PR link *does* emit the token today. **But it emits it
+under `verdict: block`, never under `warn`** — so it does not bring the
+documented signature back. See *Labelling does not revive the signature* below.
 
-What makes the signature silent here is the **required set actually in force**:
+What makes the signature silent is the **required set actually in force**:
 
 - A row whose labels match no registry entry falls back to
   `DEFAULT_UNLABELED_REQUIRED`, which is exactly
@@ -378,13 +381,41 @@ What makes the signature silent here is the **required set actually in force**:
 - **All 1,071 post-cutover verdicts in this company are `unlabeledFallback: true`
   — every single one.** Not one row in the window matched a registry label.
 
-So the silence is structural *for the rows this company actually produces*, and
-contingent on labelling rather than permanent: **the day someone labels an issue
-`pr`, this signature can fire again.** Do not read the measurement below as a
-property of the evaluator, and do not write "cannot" without the labelling
-qualifier — this is exactly the negative-existence over-read the rest of this
-document warns against. (Caught in review on #2964; the first draft of this
-ruling made precisely that error.)
+###### Labelling does not revive the signature — it produces `block`, not `warn`
+
+The documented detector is a *pair*: `verdict: warn` **∧** `missing ∋ pr-link`.
+At this head no label set produces that pair, because the two conjuncts are
+reachable only on mutually exclusive paths:
+
+- **Labelled ⇒ `block`.** Once any registry label matches, `unlabeledFallback`
+  is `false`, so a non-empty gap falls through to the last arm of the verdict
+  chain and the verdict is `block` (`evidence-gate.ts:883-892`). `warn` on that
+  chain is the `unlabeledFallback` arm only.
+- **The demotion cannot rescue it.** The one `block` → `warn` demotion fires
+  only when the gap is made *entirely* of truth shapes (`truthOnlyGap`,
+  `evidence-gate.ts:912-916`), and `TRUTH_SHAPES` is
+  `["review:ally-clean", "deploy:landed"]` (`evidence-gate.ts:148`). `pr-link`
+  is not one of them, so any gap containing it is never truth-only and stays
+  `block`.
+- **Unlabelled ⇒ `pr-link` is never required**, per the fallback set above —
+  and that set is not registry-overridable: `resolveRequiredShapes` returns
+  `[...DEFAULT_UNLABELED_REQUIRED]` whenever no label matched
+  (`evidence-gate.ts:194-196`), and the only later mutation of `required` is a
+  *filter* that drops shapes (`evidence-gate.ts:837-838`), never one that adds
+  them.
+
+So labelling an issue `pr` revives `missing ∋ pr-link` **only under
+`verdict: block`**. The `warn` half of the signature died at the cutover and is
+unreachable at this head *regardless of labels, and for any registry* — so when
+you are hunting a labelled row, **screen on `verdict: block`**, not `warn`. The
+jq recipe above and the live predicate below both condition on `warn` and will
+therefore read a labelled phantom-done row as clean.
+
+(Worth recording in both directions, because the error reversed under
+correction. The first draft of this ruling called the evaluator incapable of
+emitting `pr-link` at all — false. The correction then claimed labelling would
+revive the *signature* — also false, and it had already merged before the second
+catch. Both were found in review on #2964.)
 
 **Measured 2026-10-24**, company `b1d3f3d3`, the complete `done` population paged
 to exhaustion — 3,161 rows in four pages of 1000/1000/1000/**161**. 1,346 carry a
@@ -398,6 +429,25 @@ verdict. The boundary is sharp:
 **Zero overlap across all 1,346.** `allDetected == null` is therefore a reliable
 "this verdict predates the current evaluator" test, and it is cheaper than a
 date comparison.
+
+**One commit explains both halves of that boundary** — `c6145736`,
+*"fix: harden evidence gate detectors (#641)"*, committed 2026-07-12T10:00:29Z,
+between the last PRE verdict (2026-07-11T14:26:53Z) and the first POST one
+(2026-07-12T11:04:16Z). It did two things at once:
+
+- It **added `allDetected: found`** to the returned verdict — which is why the
+  field is `null` before it and populated after, giving the sharp boundary.
+- It **removed the `pr-link` substitution on the unlabeled path.** Before #641,
+  when a row had no `done-when` bullets, `checklist:done-when` was dropped from
+  `required` and `pr-link` was *pushed in to replace it* on the fallback path
+  ("with no criteria to check, a PR is the only reviewable receipt"). That
+  substitution is the mechanism that produced all **38** historical signature
+  rows: unlabeled ⇒ `warn`, with `pr-link` required. #641 replaced the push with
+  a `missing-done-when-bullets` diagnostic, so `pr-link` can no longer enter the
+  unlabeled `required` set at all.
+
+So the signature did not drift out of use — it was retired by a specific change,
+on a specific day, and the 38 rows are the complete record of it.
 
 The two eras report in disjoint vocabularies. These are the **complete**
 observed token sets, not a selection — each era emitted exactly two distinct
@@ -416,14 +466,33 @@ Note the POST column is `DEFAULT_UNLABELED_REQUIRED` exactly — which is the
 mechanism above showing up in the data, not a coincidence.
 
 **Consequence: all 38 signature rows are pre-cutover.** The decomposition below
-is still arithmetically correct, but it describes a candidate pool that has not
-grown since 2026-07-11 and will not grow while every row keeps taking the
-unlabeled fallback.
+is still arithmetically correct, but it describes a **closed** candidate pool:
+one that has not grown since 2026-07-11 and cannot grow at this head, because
+the `warn` ∧ `missing ∋ pr-link` pair is unreachable on every path (above).
+Labelling does not reopen it — it moves such a row to `block`, which this
+pool's recipe does not select.
 
 ##### The live predicate, and its decomposition
 
-Use **`verdict: warn` ∧ `pr-link ∉ allDetected`** — *absent from `allDetected`*,
-**not** *present in `missing`*. Same screens, re-measured 2026-10-24:
+Use **`pr-link ∉ allDetected`** — *absent from `allDetected`*, **not** *present
+in `missing`*. `allDetected` is what the current evaluator actually reports PR
+evidence through, so this is the conjunct that carries the signal.
+
+**Pair it with the right verdict for the row you are hunting, because the two
+cases land on different verdicts:**
+
+| row | verdict to screen on |
+|---|---|
+| unlabelled (every row this company produces today — 1,071/1,071) | **`warn`** |
+| labelled with a registry entry requiring `pr-link` (e.g. `pr`) | **`block`** |
+
+Screening on `warn` alone is correct for today's estate and is what the
+decomposition below measures, but it is **not** future-proof: the moment
+labelling starts, a phantom-done labelled row lands on `block` and a `warn`-only
+sweep reads it as clean. If you cannot rule out labelled rows in your window,
+screen `verdict != "pass"` and keep both.
+
+Same screens as before, `warn` ∧ `pr-link ∉ allDetected`, re-measured 2026-10-24:
 
 | screen | remaining |
 |---|---|
