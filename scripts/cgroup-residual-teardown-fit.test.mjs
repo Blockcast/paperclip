@@ -509,6 +509,36 @@ describe("assertMeasurable names the replica (collector migrates between pods)",
     assert.ok(!/Replicas that DID export/.test(hint));
   });
 
+  // ⛔ The hint must not out-claim its instrument. `/api/v1/series` resolves
+  // against every block OVERLAPPING [start,end], so an index hit does NOT prove
+  // a sample inside the window: a replica whose series ended just before
+  // `--start` still comes back "present". Excluding that replica would be a
+  // confident wrong answer handed to someone mid-incident -- the exact failure
+  // this script exists to refuse. Hedge language is load-bearing, not padding.
+  it("hedges the window/step reading instead of excluding the replica", () => {
+    const hint = hintOf({ ...broken, teardownPods: ["paperclip-0"] });
+    assert.match(hint, /LIKELY/);
+    assert.match(hint, /overlapping/i);
+    assert.match(hint, /unconfirmed, not excluded/);
+    // The retired wording asserted the replica was ruled out.
+    assert.ok(!/not the wrong replica\./.test(hint));
+    assert.ok(!/DOES exist/.test(hint));
+  });
+
+  // ⛔ PRECEDENCE PIN. Both signals can be true at once: the index matched the
+  // queried pod AND a sibling. The sibling must win (it is the actionable
+  // lead), but the window signal must not vanish -- otherwise a reader whose
+  // `--pod` re-run also comes back empty has been told nothing about the window.
+  it("prefers the sibling lead but keeps the window signal when both apply", () => {
+    const hint = hintOf({ ...broken, teardownPods: ["paperclip-0", "paperclip-1"] });
+    assert.match(hint, /Replicas that DID export/);
+    assert.match(hint, /paperclip-1/);
+    assert.match(hint, /stronger lead/);
+    assert.match(hint, /suspect the window/);
+    // Still must not name the replica that just failed them as a destination.
+    assert.ok(!/paperclip-0/.test(hint));
+  });
+
   // The enrichment must not soften the failure into a non-result.
   it("still throws, and still reads as a measurement failure", () => {
     assert.throws(
