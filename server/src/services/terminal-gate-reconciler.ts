@@ -568,6 +568,13 @@ const gateSignalDigestSql = sql`substr(encode(sha256(convert_to((
  * `:suffix`, so `cardinality` does not match `card` and `approvals` does not
  * match `approval`.
  *
+ * `btrim` because `parseTerminalGateSignal` classifies `raw.trim()`. Without
+ * it a signal stored with surrounding whitespace classifies as `human_gate` in
+ * TS and is never admitted here — fail-closed, but precisely the drift the
+ * shared array exists to prevent. `normalizeIssueMonitorGateSignals` trims on
+ * write, so this only covers a legacy or hand-edited row; that is the case
+ * worth covering, since it is the one nobody would think to check.
+ *
  * Wrapped in the same `CASE` as the other JSONB predicates, for the same
  * reason: PostgreSQL does not promise to evaluate a conjunct only after its
  * neighbour, so `jsonb_array_elements_text` must never see a malformed
@@ -579,7 +586,7 @@ const humanGateSignalExistsSql = sql`case
     then exists (
       select 1
       from jsonb_array_elements_text(${issues.executionState} -> 'monitor' -> 'gateSignals') as t(signal)
-      where t.signal ~ ${`^(${HUMAN_GATE_TOKEN_ALTERNATION})(:.*)?$`}
+      where btrim(t.signal) ~ ${`^(${HUMAN_GATE_TOKEN_ALTERNATION})(:.*)?$`}
     )
   else false end`;
 
@@ -690,6 +697,17 @@ async function listCandidateIssues(db: Pick<Db, "select">, limit: number): Promi
       // for an actively-polling human-gate row whose PRs have not all merged
       // (it reaches `resolveTerminalGate` and fails closed there); that is
       // bounded by `MAX_PULL_REQUEST_READS_PER_PASS` and deduped by `gateCache`.
+      //
+      // ⚠ Known, accepted, and worth re-reading if the class grows: such a row
+      // is never announced, so the anti-join never retires it, and under
+      // `updatedAt ASC` the oldest of them sit at the head of both the
+      // `SCAN_LIMIT` window and the read budget — ahead of the stranded
+      // population this module was built for. That is the same starvation
+      // shape the anti-join's own comment describes, reached by a row that is
+      // legitimately unresolvable rather than by a bookkeeping bug. At the six
+      // rows PEN-4545 measured it is noise. If this class reaches a scale
+      // where it can crowd out the other two arms, give it its own share of
+      // the budget or order it last, rather than widening the caps.
       sql`(${issues.monitorNextCheckAt} is null
             or (${issues.monitorAttemptCount} = 0 and ${issues.monitorLastTriggeredAt} is null)
             or ${humanGateSignalExistsSql})`,
