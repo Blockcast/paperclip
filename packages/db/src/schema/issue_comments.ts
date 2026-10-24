@@ -30,6 +30,22 @@ export const issueComments = pgTable(
     derivedCreatedByRunId: uuid("derived_created_by_run_id").references(() => heartbeatRuns.id, { onDelete: "set null" }),
     derivedAuthorSource: text("derived_author_source").$type<IssueCommentDerivedAuthorSource>(),
     idempotencyKey: text("idempotency_key"),
+    // Primarily the comment-effects settlement marker: set once when a
+    // comment's side effects have been processed, and read everywhere else
+    // only as `IS NULL` / truthy (issue-comment-effects.ts, issues.ts,
+    // routes/issues.ts).
+    //
+    // It carries a SECOND meaning for the terminal-gate reconciler's
+    // held-open announcements (`terminal-gate-human-only-held:`): a still-held
+    // re-check REWRITES this column to `now` without posting a comment, so the
+    // 6h re-check window measures time since the last look rather than since
+    // the first announcement. See `HELD_GATE_RECHECK_INTERVAL_MS` in
+    // server/src/services/terminal-gate-reconciler.ts.
+    //
+    // Safe for the null-testing readers, since it never goes from set back to
+    // null. But a sweep that ORDERS or AGES comments by this column would
+    // silently pick up those re-stamps and read a stale held row as recent —
+    // use `created_at` for "when was this posted".
     idempotencyProcessedAt: timestamp("idempotency_processed_at", { withTimezone: true }),
     body: text("body").notNull(),
     presentation: jsonb("presentation").$type<IssueCommentPresentation | null>(),
