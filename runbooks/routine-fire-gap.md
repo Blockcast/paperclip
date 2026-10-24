@@ -31,7 +31,7 @@ paperclip_routine_last_done_fire_age_seconds{routine_id="<routine_id>"}
 | firing age | completion age | what it means | what to do |
 |---|---|---|---|
 | high | high | the routine has **stopped dispatching** | Triage §1 then §2's first row — scheduler/trigger fault. |
-| **low** | high | it dispatches fine and the work then **dies or wedges** before reaching `done` | Find the open execution row and **close it** (§2, second and third rows). Do **not** re-create the routine; the routine is fine. |
+| **low** | high | it **is** still dispatching and its runs **die or wedge** before reaching `done` — the original BLO-32638 condition | Find the open execution row, inspect it, and **close it only if it is stale** — it may be a legitimately long-running execution, so do not close live work (§2, second and third rows). Do **not** re-create the routine; the routine is fine. |
 | high | low | a **stale row just completed**. No fire has occurred. | This is the PEN-4647 case. The alert is correct to stay firing — treat it as "still not firing", not as recovery. |
 
 ### Why there are two gauges at all
