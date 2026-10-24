@@ -5,6 +5,7 @@ import { resolveAlertmanagerApiUrl } from "./escalation.js";
 import { isTerminalSeverity } from "./issue-mapping.js";
 import { routedTo } from "./reconcile.js";
 import type { AlertmanagerAlert, AlertmanagerPluginConfig, AlertStateRecord } from "./types.js";
+import { DEFAULT_RECONCILE_RECEIVERS } from "./types.js";
 import { decideRefire, findActiveAggregateIssue } from "./webhook-handler.js";
 
 /**
@@ -65,9 +66,10 @@ export async function classifyAlertCoverage(
   if (isTerminalSeverity(alert.labels.severity)) return "exempt";
   // BLO-48499 — an alert re-routed away from this company's receivers (e.g. to
   // `blackhole`) is never delivered, so its last row is closed by design. Same
-  // receiver set the reconcile backfill uses; unset keeps the old behaviour.
-  const receivers = new Set(config.reconcileReceivers ?? []);
-  if (receivers.size > 0 && !routedTo(alert, receivers)) return "exempt";
+  // receiver set the reconcile backfill uses (default ["paperclip"], BLO-48574).
+  const receivers = new Set(config.reconcileReceivers ?? DEFAULT_RECONCILE_RECEIVERS);
+  // Unknown routing (no `receivers` on the read) never exempts: fail loud.
+  if (receivers.size > 0 && Array.isArray(alert.receivers) && !routedTo(alert, receivers)) return "exempt";
   if (now.getTime() - Date.parse(alert.startsAt ?? "") < IN_FLIGHT_GRACE_MS) return "exempt";
   const record = (await ctx.state.get(alertStateRef(companyId, alert.fingerprint))) as AlertStateRecord | null;
   if (!record?.paperclipIssueId) return "exempt";
