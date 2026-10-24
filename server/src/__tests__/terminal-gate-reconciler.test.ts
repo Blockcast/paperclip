@@ -78,7 +78,6 @@ describe("parseTerminalGateSignal", () => {
     expect(parseTerminalGateSignal("omar-go:#2686")).toEqual({
       kind: "human_gate",
       raw: "omar-go:#2686",
-      owner: "omar-go",
     });
     for (const token of [
       "omar-go",
@@ -373,6 +372,29 @@ describe("buildTerminalGateHumanOnlyComment", () => {
     expect(stranded).toContain("has stopped re-checking");
     expect(stranded).not.toContain("live wake path");
   });
+
+  it("does not claim satisfied machine gates on a row that declared none", () => {
+    // With no `pr:` token, "every machine-checkable gate is satisfied" is
+    // vacuously true and reads as a statement about landed work that nothing
+    // here checked. A freshly-armed monitor declaring only `omar-go` must not
+    // be told its work is done.
+    const body = buildTerminalGateHumanOnlyComment({
+      signals: ["omar-go:#2686"],
+      humanGates: ["omar-go:#2686"],
+      mergedPullRequests: [],
+    });
+    expect(body).not.toContain("every machine-checkable gate on this issue is satisfied");
+    expect(body).toContain("Nothing here is machine-checkable");
+    expect(body).toContain("says nothing about whether the work is finished");
+
+    // The satisfied-machine-half wording stays for the case that earned it.
+    const withPr = buildTerminalGateHumanOnlyComment({
+      signals: ["omar-go:#2686", "pr:blockcast/paperclip#2686:merged"],
+      humanGates: ["omar-go:#2686"],
+      mergedPullRequests: ["blockcast/paperclip#2686"],
+    });
+    expect(withPr).toContain("every machine-checkable gate on this issue is satisfied");
+  });
 });
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -454,6 +476,8 @@ describeEmbeddedPostgres("reconcileTerminalGates", () => {
     monitorLastTriggeredAt?: Date | null;
     /** BLO-36289: the monitor's own horizon, independent of `nextCheckAt`. */
     monitorTimeoutAt?: Date | null;
+    /** PEN-4545: the monitor's own attempt ceiling, read by `exhaustedMonitorClearReason`. */
+    monitorMaxAttempts?: number | null;
   }) {
     const id = randomUUID();
     const lastTriggeredAt = "monitorLastTriggeredAt" in input
@@ -494,6 +518,7 @@ describeEmbeddedPostgres("reconcileTerminalGates", () => {
           nextCheckAt: input.monitorNextCheckAt?.toISOString() ?? null,
           lastTriggeredAt: lastTriggeredAt?.toISOString() ?? null,
           timeoutAt: input.monitorTimeoutAt?.toISOString() ?? null,
+          maxAttempts: input.monitorMaxAttempts ?? null,
           attemptCount,
           notes: "merged=NO",
           scheduledBy: "assignee",
@@ -1127,6 +1152,126 @@ describeEmbeddedPostgres("reconcileTerminalGates", () => {
     // Zero GitHub reads: there is no PR gate to read, so the notice is free.
     expect(result).toMatchObject({ scanned: 1, humanGateOnly: 1, pullRequestReads: 0 });
     expect(await commentsFor(issueId)).toHaveLength(1);
+  });
+
+  // ⭐ The population PEN-4545 actually measured, and the one the first cut of
+  // this feature missed (caught in review on #2974). The six reported rows did
+  // not have terminated or never-polled monitors — they were *actively
+  // re-checking*, which is exactly what made them read as attended. Those rows
+  // have `monitorAttemptCount > 0` AND a future `monitorNextCheckAt`, so both
+  // pre-existing candidate arms exclude them by construction. Without the
+  // human-gate arm the notice would fire only before the first poll or after
+  // the monitor had already converged to a stall (~3 polls later) — i.e. only
+  // once the row was already stranded, never while it still looked healthy.
+  it("announces an ACTIVELY-POLLING armed monitor whose gate is a human go", async () => {
+    const { companyId, agentId } = await createCompany("TGC");
+    const issueId = await insertStrandedGateIssue({
+      companyId,
+      agentId,
+      identifier: "TGC-1",
+      status: "in_review",
+      gateSignals: ["omar-go:#2686", "pr:blockcast/penstock-llm-proxy-core#2686:merged"],
+      // Three polls in, next check hours away: healthy on every dashboard.
+      monitorAttemptCount: 3,
+      monitorLastTriggeredAt: LAST_POLL_AT,
+      monitorNextCheckAt: new Date(NOW.getTime() + 6 * 60 * 60 * 1000),
+    });
+
+    const result = await reconcileTerminalGates(db, {
+      now: NOW,
+      readPullRequestGate: mergedReader(new Set(["blockcast/penstock-llm-proxy-core#2686"])),
+    });
+
+    expect(result).toMatchObject({ scanned: 1, humanGateOnly: 1 });
+    const comments = await commentsFor(issueId);
+    expect(comments).toHaveLength(1);
+    // Armed and able to fire, so it must NOT claim the row is stranded — the
+    // documented repair for a stranded row destroys the wake path it has.
+    expect(comments[0]!.body).toContain("live wake path");
+    expect(comments[0]!.body).not.toContain("has stopped re-checking");
+  });
+
+  it("does NOT readmit an actively-polling row whose gates are all machine-readable", async () => {
+    // The human-gate arm must stay narrow. An armed, polling row with only
+    // `pr:` gates is the scheduler's business; readmitting it here would widen
+    // the sweep to the whole polling fleet and spend a PR read per row per
+    // pass. Deleting the `humanGateSignalExistsSql` guard from the third arm
+    // must fail this.
+    const { companyId, agentId } = await createCompany("TGD");
+    const issueId = await insertStrandedGateIssue({
+      companyId,
+      agentId,
+      identifier: "TGD-1",
+      status: "in_review",
+      gateSignals: ["pr:blockcast/paperclip#1281:merged"],
+      monitorAttemptCount: 3,
+      monitorLastTriggeredAt: LAST_POLL_AT,
+      monitorNextCheckAt: new Date(NOW.getTime() + 6 * 60 * 60 * 1000),
+    });
+
+    const result = await reconcileTerminalGates(db, {
+      now: NOW,
+      readPullRequestGate: mergedReader(new Set(["blockcast/paperclip#1281"])),
+    });
+
+    expect(result).toMatchObject({ scanned: 0, resolved: 0, humanGateOnly: 0 });
+    expect(await commentsFor(issueId)).toHaveLength(0);
+  });
+
+  it("does not match a human-gate prefix that is merely a prefix of a longer token", async () => {
+    // `card` must not match `cardinality:ready`, and the SQL arm must agree
+    // with the JS matcher — they are generated from one array precisely so a
+    // row cannot be admitted by one and classified by the other.
+    const { companyId, agentId } = await createCompany("TGE");
+    const issueId = await insertStrandedGateIssue({
+      companyId,
+      agentId,
+      identifier: "TGE-1",
+      status: "in_review",
+      gateSignals: ["cardinality:ready", "approvals-done"],
+      monitorAttemptCount: 3,
+      monitorLastTriggeredAt: LAST_POLL_AT,
+      monitorNextCheckAt: new Date(NOW.getTime() + 6 * 60 * 60 * 1000),
+    });
+
+    const result = await reconcileTerminalGates(db, {
+      now: NOW,
+      readPullRequestGate: mergedReader(new Set()),
+    });
+
+    expect(result).toMatchObject({ scanned: 0, humanGateOnly: 0 });
+    expect(await commentsFor(issueId)).toHaveLength(0);
+  });
+
+  it("does not promise a live wake path to a polling monitor that is out of attempts", async () => {
+    // `armedMonitorNextCheckAt` used to hardcode `attemptCount: 0`, which was
+    // the literal truth while only the never-polled arm could carry a non-null
+    // `monitorNextCheckAt`. The human-gate arm admits polling rows, so a
+    // hardcoded 0 would under-report `max_attempts_exhausted` and tell this row
+    // it has a wake path the scheduler will never honour.
+    const { companyId, agentId } = await createCompany("TGF");
+    const issueId = await insertStrandedGateIssue({
+      companyId,
+      agentId,
+      identifier: "TGF-1",
+      status: "in_review",
+      gateSignals: ["omar-go:#2686"],
+      monitorAttemptCount: 5,
+      monitorLastTriggeredAt: LAST_POLL_AT,
+      monitorNextCheckAt: new Date(NOW.getTime() + 6 * 60 * 60 * 1000),
+      monitorMaxAttempts: 5,
+    });
+
+    const result = await reconcileTerminalGates(db, {
+      now: NOW,
+      readPullRequestGate: mergedReader(new Set()),
+    });
+
+    expect(result).toMatchObject({ scanned: 1, humanGateOnly: 1 });
+    const comments = await commentsFor(issueId);
+    expect(comments).toHaveLength(1);
+    expect(comments[0]!.body).toContain("has stopped re-checking");
+    expect(comments[0]!.body).not.toContain("live wake path");
   });
 
   it("is idempotent, and the SQL anti-join keeps an announced human-gate row out of the scan window", async () => {

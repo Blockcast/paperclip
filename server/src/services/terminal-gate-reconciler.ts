@@ -138,12 +138,35 @@ const PULL_REQUEST_GATE_PATTERN = /^pr:([a-z0-9._-]+\/[a-z0-9._-]+)#(\d{1,9}):([
  * worst case of an omission is the status quo, while a false *positive* would
  * post a wrong-headed comment. New prefixes should be added on evidence.
  */
-const HUMAN_GATE_TOKEN_PATTERN =
-  /^(omar-go|hold-lift|hold-lifted|human-go|founder-go|approval|board-approval|card|signoff|sign-off|cto-ruling|ceo-ruling)(:.*)?$/;
+const HUMAN_GATE_TOKEN_PREFIXES = [
+  "omar-go",
+  "hold-lift",
+  "hold-lifted",
+  "human-go",
+  "founder-go",
+  "approval",
+  "board-approval",
+  "card",
+  "signoff",
+  "sign-off",
+  "cto-ruling",
+  "ceo-ruling",
+] as const;
+
+/**
+ * Both the TS matcher and the SQL candidate predicate are generated from
+ * `HUMAN_GATE_TOKEN_PREFIXES` rather than written twice. The two run in
+ * different engines over the same contract, and a drift between them is
+ * exactly the silent failure this module exists to stop: a prefix added here
+ * but not there would be classified `human_gate` and never admitted to the
+ * sweep, so it would read as supported and announce nothing.
+ */
+const HUMAN_GATE_TOKEN_ALTERNATION = HUMAN_GATE_TOKEN_PREFIXES.join("|");
+const HUMAN_GATE_TOKEN_PATTERN = new RegExp(`^(${HUMAN_GATE_TOKEN_ALTERNATION})(:.*)?$`);
 
 export type ParsedTerminalGateSignal =
   | { kind: "pull_request"; raw: string; repoFullName: string; prNumber: number; aspect: string }
-  | { kind: "human_gate"; raw: string; owner: string }
+  | { kind: "human_gate"; raw: string }
   | { kind: "unresolvable"; raw: string };
 
 export type TerminalGateVerdict =
@@ -193,8 +216,7 @@ export function parseTerminalGateSignal(raw: unknown): ParsedTerminalGateSignal 
     // Classify before giving up. A human-gate token is no more *readable* than
     // any other unparseable one — the difference is that nobody on a timer can
     // ever clear it, which is a different disposition, not a weaker one.
-    const humanGate = HUMAN_GATE_TOKEN_PATTERN.exec(token);
-    if (humanGate) return { kind: "human_gate", raw: token, owner: humanGate[1]! };
+    if (HUMAN_GATE_TOKEN_PATTERN.test(token)) return { kind: "human_gate", raw: token };
     return { kind: "unresolvable", raw: token };
   }
   const prNumber = Number.parseInt(match[2]!, 10);
@@ -429,13 +451,22 @@ export function buildTerminalGateHumanOnlyComment(input: {
   const armed = input.armedNextCheckAt != null;
   const humanLines = input.humanGates.map((gate) => `- \`${gate}\` — **waiting on a person**`);
   const prLines = input.mergedPullRequests.map((pr) => `- \`${pr}\` — merged`);
+  // With no PR gates declared, "every machine-checkable gate is satisfied" is
+  // vacuously true and reads as a claim about landed work that nothing here
+  // checked. Say what was actually established instead: the declared gate is
+  // a person, start to finish.
+  const anyMachineGate = prLines.length > 0;
   return [
-    "**Human gate — every machine-checkable gate on this issue is satisfied; what is left is a person.**",
+    anyMachineGate
+      ? "**Human gate — every machine-checkable gate on this issue is satisfied; what is left is a person.**"
+      : "**Human gate — every gate this issue declares names a person. Nothing here is machine-checkable.**",
     "",
-    ...(prLines.length > 0
+    ...(anyMachineGate
       ? ["A board-side re-read finds the declared pull-request gates already satisfied:", "", ...prLines, ""]
       : []),
-    "The remaining declared gates name a human decision, which nothing on a timer can clear:",
+    anyMachineGate
+      ? "The remaining declared gates name a human decision, which nothing on a timer can clear:"
+      : "The declared gates name a human decision, which nothing on a timer can clear:",
     "",
     ...humanLines,
     "",
@@ -445,7 +476,9 @@ export function buildTerminalGateHumanOnlyComment(input: {
       ? `The monitor is armed and its next check is due \`${input.armedNextCheckAt!.toISOString()}\`. That check will return this same answer: polling cannot move a human gate, and three unchanged re-checks converge to a stall (BLO-18294). **The monitor still gives this issue a live wake path — do not treat it as stranded and do not repair it as one** — but the wake has no gate left to read.`
       : "The monitor has stopped re-checking (converged to a stall, was cleared, or its run was killed). Nothing is scheduled to look at this issue again, and the gate it stopped on is one no re-check could ever have cleared.",
     "",
-    "**This is not a resolution and nothing here closes the issue.** It is the notice that the wait is now entirely on a named human, which is the one thing an armed monitor makes invisible: the row reads as attended on every dashboard while no mechanism on the owner's side can answer. Escalate the ask — extend a pending approval card, record a named owner and the exact action on the row, or accept the row as frozen and stop re-checking — rather than re-arming against the same gate.",
+    anyMachineGate
+      ? "**This is not a resolution and nothing here closes the issue.** It is the notice that the wait is now entirely on a named human, which is the one thing an armed monitor makes invisible: the row reads as attended on every dashboard while no mechanism on the owner's side can answer. Escalate the ask — extend a pending approval card, record a named owner and the exact action on the row, or accept the row as frozen and stop re-checking — rather than re-arming against the same gate."
+      : "**This is not a resolution, says nothing about whether the work is finished, and nothing here closes the issue.** No pull-request gate was declared, so this notice is only about the gate: it is one a person must clear, which is the thing an armed monitor makes invisible — the row reads as attended on every dashboard while no mechanism on the owner's side can answer. Escalate the ask — extend a pending approval card, record a named owner and the exact action on the row, or accept the row as frozen and stop re-checking — rather than re-arming against the same gate.",
     "",
     "_Posted by the terminal-gate reconciler (PEN-4545)._",
   ].join("\n");
@@ -521,13 +554,49 @@ const gateSignalDigestSql = sql`substr(encode(sha256(convert_to((
   ) as t(signal)
 ), 'UTF8')), 'hex'), 1, 32)`;
 
+/**
+ * "Does this row declare at least one human-gate signal?", in SQL (PEN-4545).
+ *
+ * Generated from `HUMAN_GATE_TOKEN_PREFIXES`, the same array behind
+ * `HUMAN_GATE_TOKEN_PATTERN`, so the two matchers cannot drift. The prefixes
+ * are a fixed literal list of `[a-z-]` tokens, so the interpolated alternation
+ * carries no user input and nothing needs escaping; a prefix containing a
+ * regex metacharacter would break this, which is why the list is `as const`
+ * and not configuration.
+ *
+ * The POSIX `~` pattern mirrors the JS regex exactly, including the optional
+ * `:suffix`, so `cardinality` does not match `card` and `approvals` does not
+ * match `approval`.
+ *
+ * Wrapped in the same `CASE` as the other JSONB predicates, for the same
+ * reason: PostgreSQL does not promise to evaluate a conjunct only after its
+ * neighbour, so `jsonb_array_elements_text` must never see a malformed
+ * object/scalar `gateSignals` — that raises and aborts the whole pass rather
+ * than skipping the one bad row.
+ */
+const humanGateSignalExistsSql = sql`case
+  when jsonb_typeof(${issues.executionState} -> 'monitor' -> 'gateSignals') = 'array'
+    then exists (
+      select 1
+      from jsonb_array_elements_text(${issues.executionState} -> 'monitor' -> 'gateSignals') as t(signal)
+      where t.signal ~ ${`^(${HUMAN_GATE_TOKEN_ALTERNATION})(:.*)?$`}
+    )
+  else false end`;
+
 type CandidateRow = {
   id: string;
   companyId: string;
   identifier: string | null;
   executionState: unknown;
-  /** Non-null == admitted by the never-polled arm. Armed only if it can also fire; see the call site. */
+  /**
+   * Non-null means the monitor has a next check scheduled. Before PEN-4545
+   * that implied "admitted by the never-polled arm"; the human-gate arm also
+   * admits actively-polling rows, so it no longer does. Armed only if it can
+   * also fire — see `armedMonitorNextCheckAt`.
+   */
   monitorNextCheckAt: Date | null;
+  /** Real attempt count. The human-gate arm admits rows where this is > 0. */
+  monitorAttemptCount: number | null;
   /** The scheduler's eligibility tuple (`issueAllowsMonitor`); this query does not filter on it. */
   status: string;
   assigneeAgentId: string | null;
@@ -590,6 +659,7 @@ async function listCandidateIssues(db: Pick<Db, "select">, limit: number): Promi
       identifier: issues.identifier,
       executionState: issues.executionState,
       monitorNextCheckAt: issues.monitorNextCheckAt,
+      monitorAttemptCount: issues.monitorAttemptCount,
       status: issues.status,
       assigneeAgentId: issues.assigneeAgentId,
       assigneeUserId: issues.assigneeUserId,
@@ -597,8 +667,32 @@ async function listCandidateIssues(db: Pick<Db, "select">, limit: number): Promi
     .from(issues)
     .where(and(
       notInArray(issues.status, ["done", "cancelled"]),
+      // Three arms. The first two are "the monitor is not polling": terminated,
+      // or armed and not yet evaluated.
+      //
+      // The third (PEN-4545) is the opposite population and is the whole point
+      // of that fix: a monitor that IS actively re-checking, on a gate only a
+      // human can clear. Those rows have `monitorAttemptCount > 0` and a future
+      // `monitorNextCheckAt`, so the first two arms exclude them by
+      // construction — and they are precisely the six rows PEN-4545 measured,
+      // the ones that "politely re-check a gate on a timer while nothing on the
+      // owner's side can ever answer". Without this arm the notice would fire
+      // only before the first poll or after the monitor had already converged
+      // to a stall (~3 polls later, BLO-18294), i.e. only once the row was
+      // already stranded — never in the "reads as actively attended" state that
+      // is the reported defect.
+      //
+      // It is narrow by construction: it admits a row only when a stored gate
+      // signal matches the human-gate allowlist, so an actively-polling row
+      // with only `pr:`/`deploy:`/`mq:` gates is not readmitted and its polling
+      // cadence is untouched. Re-announcement is bounded by the anti-join
+      // below, once per signal set. The cost it does add is a PR read per pass
+      // for an actively-polling human-gate row whose PRs have not all merged
+      // (it reaches `resolveTerminalGate` and fails closed there); that is
+      // bounded by `MAX_PULL_REQUEST_READS_PER_PASS` and deduped by `gateCache`.
       sql`(${issues.monitorNextCheckAt} is null
-            or (${issues.monitorAttemptCount} = 0 and ${issues.monitorLastTriggeredAt} is null))`,
+            or (${issues.monitorAttemptCount} = 0 and ${issues.monitorLastTriggeredAt} is null)
+            or ${humanGateSignalExistsSql})`,
       visibleIssueCondition(),
       // One CASE, not two ANDed predicates: PostgreSQL does not promise to
       // evaluate a WHERE conjunct only after its neighbour, so a separate
@@ -757,11 +851,14 @@ export async function listResolvedTerminalGates(
  * than firing it. Either way a future check is a wake that will never happen,
  * so it gets the stranded copy too.
  *
- * `attemptCount: 0` is the literal truth here rather than a simplification: a
- * non-null `monitorNextCheckAt` can only have come in via the never-polled arm,
- * whose predicate *is* `monitorAttemptCount = 0`. `defaultMaxAttempts` is
- * deliberately omitted — the scheduler's ceiling is about repeated polling, and
- * nothing has polled yet.
+ * The row's REAL `monitorAttemptCount` is passed, not a literal `0`. Before
+ * PEN-4545 the two were the same thing — a non-null `monitorNextCheckAt` could
+ * only have come in via the never-polled arm, whose predicate *is*
+ * `monitorAttemptCount = 0` — but the human-gate arm admits actively-polling
+ * rows, where hardcoding `0` would under-report `max_attempts_exhausted` and
+ * promise a live wake path to a monitor that has none. `defaultMaxAttempts`
+ * stays omitted: an issue-level `maxAttempts` is a declared bound this module
+ * should honour, while the scheduler's fleet-wide ceiling is its own business.
  */
 function armedMonitorNextCheckAt(candidate: CandidateRow, now: Date): Date | null {
   if (candidate.monitorNextCheckAt === null) return null;
@@ -771,7 +868,7 @@ function armedMonitorNextCheckAt(candidate: CandidateRow, now: Date): Date | nul
   }
   const exhausted = exhaustedMonitorClearReason({
     monitor: readIssueMonitorBounds(candidate.executionState),
-    attemptCount: 0,
+    attemptCount: candidate.monitorAttemptCount ?? 0,
     now,
   });
   return exhausted === null ? candidate.monitorNextCheckAt : null;
