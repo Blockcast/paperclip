@@ -1213,9 +1213,13 @@ describe("scrubGitHubEgressText", () => {
       ["uuid run", path("workspaces", UUID_SEGMENT, "home")],
       // A hex digest segment.
       ["hex digest run", path("var", "cache", "a3f91c8e2b7d405fa6c19e83bd27f04a1c6e59b8")],
-      // A five-word CamelCase run against a cap of three. Unbounded, this run
-      // shape is the 2.3e-1 residual PEN-3920 section 3 measured.
-      ["camel word count", path("opt", "vendor8", "AlphaBetaGammaDeltaEpsilon")],
+      // A four-word CamelCase run against a cap of three. Unbounded, this run
+      // shape is the 2.3e-1 residual PEN-3920 section 3 measured. The run is
+      // 12 characters so it clears POSIX_PATH_MAX_RUN_LENGTH (16) and the
+      // word cap is the only conjunct left to refuse it — the earlier
+      // 26-character fixture died on the run-length cap and left the word cap
+      // unpinned (Ally, review 5637058490).
+      ["camel word count", path("opt", "vendor8", "AbcDefGhiJkl")],
       // Two-character CamelCase runs against a five-character floor. Without
       // the floor a mixed-case token sliced into 4-character runs is
       // exonerated at 1.1e-3; with it, at 0.
@@ -1231,7 +1235,15 @@ describe("scrubGitHubEgressText", () => {
       // A nine-character mixed run against a cap of eight.
       ["mixed run length", path("opt", "megaraid8", "storcli64x", "bin", "libexec")],
       // A mixed run opening with a digit: the shape a generated suffix takes.
-      ["digit-initial mixed run", path("opt", "vendor8", "7fdd5ff6a", "libexec", "share")],
+      // Deliberately short with ONE one-character digit group, so it clears
+      // POSIX_PATH_MIXED_RUN_MAX_LENGTH and the single-group digit rule and
+      // fails only on the letter-initial requirement of
+      // POSIX_PATH_MIXED_RUN_RE. That conjunct is NOT redundant with the
+      // digit-group rule: this run carries one group of one digit, which the
+      // digit rule admits (Ally, review 5637058490). The earlier `7fdd5ff6a`
+      // fixture was 9 characters with 3 digit groups and tripped both of the
+      // other bounds first.
+      ["digit-initial mixed run", path("opt", "vendor8", "7abc", "libexec", "share")],
       // A seventeen-character run against a cap of sixteen.
       ["run length", path("opt", "vendor8", "abcdefghijklmnopq", "libexec")],
       // Content 108 against a cap of 96, every run a real word and only
@@ -1253,11 +1265,31 @@ describe("scrubGitHubEgressText", () => {
 
     it("keeps the length cap unreachable, so it is not mistaken for a bound", () => {
       // POSIX_PATH_MAX_LENGTH is a cost guard, not a security bound: the run
-      // and content caps already imply a shorter ceiling. 96 content
-      // characters across at most 16 runs leaves 15 interior separators, plus
-      // the leading slash and one tolerated trailing separator.
-      const impliedCeiling = 96 + 15 + 1 + 1;
-      expect(impliedCeiling).toBeLessThan(128);
+      // and content caps already imply a shorter ceiling, so the length cap
+      // can never be the conjunct that refuses a value.
+      //
+      // Asserted behaviourally rather than as arithmetic on literals, which
+      // could not fail if the constants moved (Ally, review 5637058490).
+      // This is the largest value the run and content caps admit: 16 runs of
+      // 6 characters hits POSIX_PATH_MAX_RUNS and POSIX_PATH_MAX_CONTENT_
+      // LENGTH exactly, giving 96 content characters, 15 interior separators
+      // and the leading slash — 112. Exonerating it pins the length cap at or
+      // above the ceiling the other caps imply; lower it and this fails.
+      //
+      // The opposite drift — raising the run or content cap until the length
+      // cap starts to bite — is caught by the `run count` and `content
+      // length` negative controls above, which sit one run and twelve
+      // characters past those caps respectively.
+      const maximal = path(
+        "alphas", "bravos", "charli", "deltas", "echoes", "foxtro", "golfer",
+        "hotels", "indias", "juliet", "kilose", "limase", "mikens", "novemb",
+        "oscars", "QUEBEC",
+      );
+      expect(maximal).toHaveLength(112);
+      // Vacuity guard, as for every other case in this block.
+      expect(reachesEntropyTest(maximal)).toBe(true);
+      const text = pair("config", maximal);
+      expect(scrubGitHubEgressText(text).text).toBe(text);
     });
 
     it("still refuses a credential with a real path appended", () => {
