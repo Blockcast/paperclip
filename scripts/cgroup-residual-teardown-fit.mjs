@@ -414,19 +414,23 @@ export function assertMeasurable({
     const others = teardownPods.filter((candidate) => candidate !== pod);
     let hint = "";
     if (others.length > 0) {
-      // ⛔ PRECEDENCE, deliberate: when the index matched the queried pod AND a
-      // sibling, the sibling wins. A replica with data is an actionable lead; a
-      // bare index hit on this pod is not (see the hedge below for why). The
-      // weaker signal is acknowledged rather than dropped, so a reader whose
-      // `--pod` re-run also comes back empty knows the window is still suspect.
+      // ⛔ PRECEDENCE, deliberate -- and note WHY, because the obvious reason is
+      // wrong. These are ALL bare index hits (see the hedge below): `/series`
+      // cannot tell "exported data in this window" from "a block overlapping it
+      // did". So the sibling is NOT preferred for having data. It is preferred
+      // because it is UNTESTED, while the queried pod has already come back
+      // empty -- an untried lead beats a retried one. The weaker signal is
+      // appended rather than dropped, so a reader whose `--pod` re-run also
+      // comes back empty knows the window is still suspect.
       hint =
-        ` Replicas that DID export it in this window: ${others.join(", ")}` +
+        ` Replicas the index matched in this window: ${others.join(", ")}` +
         " -- re-run with `--pod <name>`, which re-points residual and restarts" +
         " with it so the pairing stays on one pod (trap 5).";
       if (teardownPods.includes(pod)) {
         hint +=
-          " The index also matched this pod, but a replica that exported data" +
-          " is the stronger lead; if `--pod` does not help, suspect the window.";
+          " The index also matched this pod, but a sibling that has not yet" +
+          " failed you is the stronger lead; if `--pod` does not help, suspect" +
+          " the window.";
       }
     } else if (teardownPods.includes(pod)) {
       // ⛔ HEDGED ON PURPOSE -- `/series` CANNOT rule the replica out.
