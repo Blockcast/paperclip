@@ -478,6 +478,12 @@ Use **`pr-link ∉ allDetected`** — *absent from `allDetected`*, **not** *pres
 in `missing`*. `allDetected` is what the current evaluator actually reports PR
 evidence through, so this is the conjunct that carries the signal.
 
+⛔ **ADVISORY ONLY — measured precision 0/4 (PEN-4643, ruling below at
+`:530`).** This predicate is a cheap pre-filter, not a verdict. It is satisfied
+vacuously whenever `allDetected` is `null` or `[]`, and even its informative
+residual was 100% false-positive on measurement. **Never fail a row on it
+alone — confirm against the `workProducts` table first.**
+
 **Pair it with the right verdict for the row you are hunting, because the two
 cases land on different verdicts:**
 
@@ -514,10 +520,166 @@ webhook writes, which is stronger than scraping comments for a URL:
 - **PEN-3713** — correctly `done`: `Blockcast/paperclip#2185`, `merged: true`,
   `mergedAt: 2026-10-06T07:49:45Z`, `owningIdentifiers: ["PEN-3713"]`.
 
-The other 11 were **not** individually cleared, so this predicate's precision is
-**unmeasured** — do not quote one. A `gh search prs <identifier>` pass is *not* a
-substitute: it is full-text matching and scored `PEN-4036` against
-`onprem-k8s#4036` on the number alone.
+The other 11 were **not** individually cleared, so this predicate's precision was
+**unmeasured** when this paragraph was written. ⛔ **It has since been measured at
+0/4 — see the PEN-4643 ruling immediately below, which supersedes this
+paragraph.** A `gh search prs <identifier>` pass is *not* a substitute: it is
+full-text matching and scored `PEN-4036` against `onprem-k8s#4036` on the number
+alone.
+
+##### ⛔⛔ RULED 2026-10-24 (CTO, PEN-4643) — the live predicate's precision is now measured, and it is 0/4. Treat it as ADVISORY; `workProducts` is the discriminator
+
+The "unmeasured" above is resolved: it was measured over the complete `done`
+population and **every informative candidate it selected was a false positive.**
+Do not lift `pr-link ∉ allDetected` as a standalone sweep. It fails *noisy*
+where the pre-cutover signature failed *silent*; neither form has yet produced a
+single demonstrated true positive.
+
+**Measured 2026-10-24**, company `b1d3f3d3`, complete `done` population paged to
+exhaustion — 3,174 rows in four pages of 1000/1000/1000/**174**, deduped by id.
+
+| | count | share |
+|---|---|---|
+| `done` rows | 3,174 | |
+| …no `lastEvidenceVerdict` at all | 1,819 | **57.3%** |
+| …with a verdict | 1,355 | 42.7% |
+| of those, `unlabeledFallback: true` | **1,355** | **100%** |
+| verdict mix | 1,061 `warn` / 294 `pass` / **0 `block`** | |
+
+⛔ **There is not one `verdict: "block"` row in the corpus.** The labelled half of
+the predicate recommended above (*"screen on `block` for labelled rows"*) is
+**structurally correct but currently inert** — it selects nothing fleet-wide,
+because all 1,355 verdict-bearing `done` rows took the unlabeled fallback, so
+none matched a registry label. Keep it for future-proofing, but do not count a
+clean `block` sweep as evidence of anything.
+
+###### The predicate conflates three states, and only the third is informative
+
+`pr-link ∉ allDetected` is satisfied **vacuously** in two of them:
+
+| class | meaning | n (of the 230 raw) |
+|---|---|---|
+| `allDetected == null` | verdict predates the 2026-07-12 evaluator; the field did not exist | **89** |
+| `allDetected == []` | evaluator ran and detected **no shape at all** | majority of the rest |
+| `allDetected` non-empty, no `pr-link` | detector demonstrably ran and still found no PR | **4** |
+
+Decomposition, same screens as above, re-measured over the whole `warn`
+population (1,061 rows):
+
+| step | count |
+|---|---|
+| dead signature (`warn` ∧ `pr-link ∈ missing`) | 38 |
+| **live predicate** (`warn` ∧ `pr-link ∉ allDetected`) | **230** |
+| − screen `projectId == null` | −111 → 119 |
+| − screen verdict ≥3d older than `completedAt` | −18 → **101** |
+| of that residual: `allDetected == []` (uninformative) | **97** |
+| of that residual: `allDetected` non-empty (informative) | **4** |
+
+> The earlier figure of 153 in the table above is **post-cutover rows only**
+> (`allDetected != null`; 141 on today's population). This decomposition screens
+> the whole `warn` population, which is why it starts at 230 — the extra 89 are
+> the pre-cutover `allDetected == null` rows, which satisfy the predicate
+> vacuously. Both are correct for their stated scope; use this one.
+
+###### All four informative residuals are FALSE POSITIVES — precision 0/4
+
+Each checked against `GET /api/issues/{key}` → `workProducts`:
+
+| row | completed | `allDetected` | merged PR work products |
+|---|---|---|---|
+| PEN-2638 | 2026-10-21 | `['checklist:done-when']` | **9 merged** (llm-proxy #1730 #1714 #1700 #1697 #1696 #1674 #1650 #1640 #1626) |
+| PEN-4332 | 2026-10-19 | `['deploy:landed']` | **4 merged** + 1 open (llm-proxy #2601 #2661 #2607 #2592) |
+| PEN-4036 | 2026-10-17 | `['checklist:done-when']` | **3 merged** (paperclip #2964 #2789 #2721) |
+| PEN-3164 | 2026-10-03 | `['checklist:done-when']` | **3 merged** (paperclip #2201 #2199, llm-proxy #2186) |
+
+A row can carry **nine merged PRs** and still read `pr-link ∉ allDetected`.
+
+The contamination is not confined to those 4. Across the **whole 101-row
+residual**, 36 rows carry a `pull_request` work product and **33 (33%) carry a
+merged one** — including 29 of the 97 `allDetected == []` rows. So the
+`allDetected == []` class is not a clean "planning row" bucket either; a third
+of it is code work whose PR the field never saw.
+
+###### Root cause — `detectPrLink` is text-only, over a 10-comment window
+
+`pr-link` is detected by regex-scraping comment text and **nothing else**:
+
+```ts
+"pr-link": detectPrLink(text, allowedPrRepos),   // evidence-gate.ts:764
+```
+
+where `text` is `buildAgentEvidenceText(comments, DEFAULT_RECENT_COMMENT_LIMIT)`
+— the **10 most recent agent comments**, newest first
+(`evidence-gate.ts:207-230`, limit `:119`). `workProducts` *is* passed into
+`detectAll` and *is* consulted by `detectE2eRun`, `detectE2eScript` and
+`detectScreenshotViewport` — but **not** by `detectPrLink` or
+`detectLandingArtifact`. So the one shape that names the deliverable is the one
+that cannot see the deliverable's own table.
+
+`preserveDurableLandingEvidence` (`issues.ts:2478-2516`) already documents this
+exact decay and compensates for it *within* the `in_review` lifecycle. It does
+not help a sweep: it only carries `allDetected` forward across re-evaluations,
+and the shape has to have been scraped successfully at least once.
+
+###### Why we are NOT fixing this by populating `allDetected.pr-link` from `workProducts`
+
+That is the obvious repair and it would measurably help — all four rows above
+have at least one PR created **before** their verdict, so a `workProducts` arm
+in `detectPrLink` would have cleared **4/4**. We are still not adopting it as
+the sweep's answer, for two reasons:
+
+1. **The codebase already ruled on this trade-off, in the opposite direction.**
+   `issues.ts:2496-2503` (BLO-19081): *"the done gate's third evidence path …
+   deliberately does NOT rely on this carry-forward. It queries the artifact
+   rows **live** at close time… If you add a fourth shape, **prefer that pattern
+   over widening `DURABLE_LANDING_SHAPES`: a live row is a stronger record than
+   a cached verdict field**, which is only needed for shapes scraped from comment
+   text."* `workProducts` is precisely that live row.
+
+2. **`allDetected` is a snapshot and can never answer a question about later
+   state.** The verdict is written only on a PATCH carrying `status:
+   "in_review"` (`issues.ts:11531`); the single `done`-path refresh sits behind
+   `experimental.enableDoneExecutionGate`, which defaults **off**. So it freezes
+   at the last `in_review` evaluation and never moves again. **Three of the four
+   rows above gained merged PRs *after* their verdict was written** — PEN-4332
+   three, PEN-4036 and PEN-3164 two each. No detector improvement reaches those,
+   because nothing re-evaluates. (PEN-2638 is the exception: all nine of its
+   merged PRs predate its verdict, so it is purely a detector failure.)
+
+**Decision (CTO, 2026-10-24).** `warn` ∧ `pr-link ∉ allDetected` is **advisory
+only** — a cheap pre-filter that narrows ~3,174 rows to ~101, with **0/4
+demonstrated precision and no authority to fail a row**. The authoritative
+discriminator for "did this issue actually ship" is the **`workProducts`
+table**, read live. Fixing `detectPrLink` to consult `workProducts` remains a
+worthwhile *separate* correctness fix to the snapshot — it would stop the field
+asserting something false at evaluation time — but it is **not** a prerequisite
+for the sweep and does **not** change this ruling. Per the scope fence on
+PEN-4643, no change is made to `runEvidenceGate` or `shouldBlockNarratedDone`
+under this decision.
+
+###### The sweep recipe that is actually supported
+
+1. Pre-filter with the live predicate (cheap, local, no API calls per row).
+2. Drop `projectId == null`, then verdicts ≥3d stale vs `completedAt`.
+3. Drop `allDetected == null` **and** `allDetected == []` — both vacuous.
+4. **For every survivor, `GET /api/issues/{key}` and read `workProducts`.** A row
+   with a `type: "pull_request"` work product carrying `metadata.merged == true`
+   is **not** a phantom-done, whatever its verdict says. This step is mandatory;
+   on the measured population it rejects 100% of what step 3 hands it.
+5. Only a survivor of step 4 is worth a human look — and it is still a
+   *candidate*, because a planning/decision row legitimately has no PR.
+
+`gh search prs <identifier>` is **not** a substitute for step 4: it is full-text
+matching and scored `PEN-4036` against `onprem-k8s#4036` on the number alone.
+
+###### Paging: the REST route has no truncation envelope
+
+`GET /api/companies/{id}/issues?status=done&limit=1000` returns a **bare array**
+of exactly 1000. The `{truncated, appliedLimit, …}` envelope is added by the
+**MCP layer only**, so a script hitting REST directly sees no truncation signal
+and silently under-reports by ~3×. Confirmed again 2026-10-24: offsets
+0/1000/2000 each returned a bare 1000, offset 3000 returned 174. **Page until a
+page comes back short** — do not trust a single `limit=1000` call.
 
 #### Screen in this order — staleness is NOT the dominant noise source
 
@@ -604,6 +766,12 @@ with a registry entry requiring `pr-link`, or `verdict != "pass"` when your
 window may contain both. The three screens below are predicate-independent —
 `projectId`, `originKind` and staleness carry over to the live predicate
 unchanged, which is what the re-measured table at `:475` applies them to.
+
+⛔ **But that predicate is ADVISORY ONLY — measured precision 0/4 (PEN-4643,
+`:530`).** It fires, which the dead signature does not, but every informative
+row it selected on measurement carried merged PRs. It narrows the population; it
+does not decide anything. Confirm every survivor against `workProducts` before
+treating it as a phantom-done.
 
 The full residual query over that closed pool — all three screens, verified
 against the 3,135-row population on 2026-10-23, returns exactly the three rows
