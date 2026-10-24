@@ -12,17 +12,20 @@ comment instead, saying so: the machine half is done and the remainder is a
 person who has not been told this row exists. See *The human-gate announcement
 (PEN-4545)* below. That is a report, never a resolution.
 
-Two populations qualify (`listCandidateIssues`): a **terminated** monitor, which
-has stopped polling (`monitorNextCheckAt IS NULL`); and an **armed but never
+Three populations qualify (`listCandidateIssues`): a **terminated** monitor,
+which has stopped polling (`monitorNextCheckAt IS NULL`); an **armed but never
 evaluated** monitor (`monitorAttemptCount = 0 AND monitorLastTriggeredAt IS
 NULL`), which was armed on a gate that was already satisfied and would otherwise
-wait out its whole window before anything looked — BLO-36289. The comment copy
+wait out its whole window before anything looked — BLO-36289; and an
+**actively-polling** monitor that declares a human gate (PEN-4545), which the
+first two exclude by construction and which is the population that reads as
+attended while nothing can move it. The comment copy
 branches on whether the monitor can still wake the issue: the armed variant, which
 states the monitor is still armed and must not be treated as stranded, is used
 only when the first check is still in the future, AND the row is one the
 scheduler will fire (`issueAllowsMonitor`: agent-assigned, no user assignee,
 `in_progress`/`in_review`), AND the monitor has road left to run
-(`exhaustedMonitorClearReason`, evaluated at `attemptCount 0`). An overdue check,
+(`exhaustedMonitorClearReason`, evaluated at the row's real `monitorAttemptCount`). An overdue check,
 a `todo`/`blocked`/human-assigned row, or a monitor already past its own
 `timeoutAt` — nothing constrains `nextCheckAt <= timeoutAt`, so "check in 6h,
 give up after 2h" arms fine and is cleared rather than fired — gets the stranded
@@ -176,19 +179,34 @@ were waiting for.
 ### What it does
 
 `parseTerminalGateSignal` now returns a third kind, `human_gate`, for tokens on
-an explicit allowlist (`omar-go`, `hold-lift`, `human-go`, `founder-go`,
-`approval`, `board-approval`, `card`, `signoff`, `sign-off`, `cto-ruling`,
-`ceo-ruling`, each with an optional `:suffix`). When **every** other declared
-gate is satisfied and only human gates remain, `resolveTerminalGate` returns
-`human_gate_only` and the sweep posts a distinct comment under the
-`terminal-gate-human-only:` idempotency prefix.
+an explicit allowlist — `HUMAN_GATE_TOKEN_PREFIXES` in the module, currently
+`omar-go`, `hold-lift`, `hold-lifted`, `human-go`, `founder-go`, `approval`,
+`board-approval`, `card`, `signoff`, `sign-off`, `cto-ruling`, `ceo-ruling`,
+each with an optional `:suffix`. That array is the single source for both the
+JS matcher and the SQL candidate predicate; do not write either by hand. When
+**every** other declared gate is satisfied and only human gates remain,
+`resolveTerminalGate` returns `human_gate_only` and the sweep posts a distinct
+comment under the `terminal-gate-human-only:` idempotency prefix.
+
+`listCandidateIssues` gained a **third arm** for this class, and it is the half
+that makes the feature meet its own description. The first two arms admit a
+monitor that is *not polling*; the reported population is the opposite — rows
+actively re-checking a human gate, with `monitorAttemptCount > 0` and a future
+`monitorNextCheckAt`, which is precisely what made them read as attended. The
+third arm admits a row whose stored `gateSignals` contain an allowlisted
+human-gate token regardless of attempt count. Without it the notice fires only
+before the first poll or after convergence-to-stall (~3 polls later) — only
+once the row is already stranded, never while it still looks healthy.
 
 The comment names the gate tokens, says the machine half is done, and says
 plainly that a re-check will return the same answer forever. It closes nothing,
 clears no monitor, dispatches no run, and files no card — picking between
 extending a pending card, recording a named owner on the row, and accepting the
 row as frozen is the owner's judgement, and guessing from here would reproduce
-the same defect one level out.
+the same defect one level out. On a gate set with no `pr:` token at all the
+headline drops the "every machine-checkable gate is satisfied" claim, which
+would be vacuously true and would read as a statement about landed work that
+nothing here checked.
 
 ### Why an allowlist and not "anything unparseable"
 
@@ -217,10 +235,26 @@ prefixes on evidence.
   where it can never clear — the `SCAN_LIMIT` starvation vector the resolved-side
   anti-join exists to remove, reached through a new door. `TGA` pins this on
   `scanned: 0`, which a JS-side filter cannot fake.
+- **The third arm must stay guarded by the allowlist.** Dropping
+  `humanGateSignalExistsSql` from it readmits the entire actively-polling
+  fleet, spending a PR read per row per pass on rows the scheduler is already
+  attending. `TGD` pins this.
+- **The JS and SQL matchers come from one array.** A prefix added to one and
+  not the other is the module's own failure mode in miniature: it would be
+  classified `human_gate`, never admitted by the sweep, and read as supported
+  while announcing nothing. `TGE` pins that the two agree on prefix boundaries
+  (`card` must not match `cardinality:ready`).
+- **`armedMonitorNextCheckAt` must use the row's real `monitorAttemptCount`.**
+  The hardcoded `0` was literally true while only the never-polled arm could
+  carry a non-null `monitorNextCheckAt`; with the third arm it under-reports
+  `max_attempts_exhausted` and promises a live wake path to a monitor that has
+  none. `TGF` pins this.
 - **Read cost.** A human-gated row with PR tokens now *does* spend PR reads
-  (previously it bailed at parse time). Bounded by the existing per-pass cap and
-  deduped by `gateCache`; a row whose unparseable tokens are not human gates is
-  unchanged and still costs zero.
+  (previously it bailed at parse time), and the third arm means an
+  actively-polling one does so on every pass until its PRs merge or it is
+  announced. Bounded by `MAX_PULL_REQUEST_READS_PER_PASS`, deduped per pass by
+  `gateCache`, and confined to the human-gate class — a row whose unparseable
+  tokens are not human gates is unchanged and still costs zero.
 
 ## Operational notes
 
