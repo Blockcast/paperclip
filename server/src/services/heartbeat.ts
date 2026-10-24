@@ -524,6 +524,7 @@ import {
   isQueuedRunAdmissionDeferred,
   isRunClaimable,
   K8S_ISOLATION_RETRY_AT_CONTEXT_KEY,
+  K8S_ISOLATION_WAIT_KEY_CONTEXT_KEY,
   TERMINAL_ISSUE_STATUSES,
 } from "./dispatch-readiness.js";
 import {
@@ -32731,6 +32732,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     delete context.paperclipK8sIsolation;
     context[K8S_ISOLATION_RETRY_ATTEMPT_CONTEXT_KEY] = retryAttempt;
     context[K8S_ISOLATION_RETRY_AT_CONTEXT_KEY] = retryAt.toISOString();
+    context[K8S_ISOLATION_WAIT_KEY_CONTEXT_KEY] = conflict.isolationKey;
 
     const releasedReservation = await releaseExternalRuntimeReservation(db, {
       runId: run.id,
@@ -34552,6 +34554,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (k8sRunIsolation) {
       delete context[K8S_ISOLATION_RETRY_ATTEMPT_CONTEXT_KEY];
       delete context[K8S_ISOLATION_RETRY_AT_CONTEXT_KEY];
+      delete context[K8S_ISOLATION_WAIT_KEY_CONTEXT_KEY];
       context.paperclipK8sIsolation = k8sRunIsolation;
       runtimeConfig = {
         ...stripK8sIsolationOwnedEnv(runtimeConfig, k8sRunIsolation),
