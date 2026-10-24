@@ -805,6 +805,23 @@ describeEmbeddedPostgres("reconcileTerminalGates", () => {
       .where(eq(issueComments.issueId, issueId));
   }
 
+  /**
+   * Back-date an announcement out of its re-check window, rather than
+   * advancing `now`, so no assertion depends on wall-clock time.
+   *
+   * Both columns move together because the suppression test reads
+   * `coalesce(idempotency_processed_at, created_at)`: ageing only `created_at`
+   * would leave a fresh `idempotency_processed_at` behind and silently keep
+   * the row suppressed, so the test would pass for the wrong reason.
+   */
+  async function ageHeldAnnouncement(issueId: string, byMs: number) {
+    const agedTo = new Date(NOW.getTime() - byMs);
+    await db
+      .update(issueComments)
+      .set({ createdAt: agedTo, idempotencyProcessedAt: agedTo })
+      .where(eq(issueComments.issueId, issueId));
+  }
+
   it("records a gate that resolved after the last poll, and dispatches no run to do it", async () => {
     const { companyId, agentId } = await createCompany("TG1");
     const issueId = await insertStrandedGateIssue({
@@ -1664,10 +1681,7 @@ describeEmbeddedPostgres("reconcileTerminalGates", () => {
 
     // Age the announcement past the window. Back-dated rather than advancing
     // `now`, so the assertion does not depend on wall-clock time.
-    await db
-      .update(issueComments)
-      .set({ createdAt: new Date(NOW.getTime() - 7 * 60 * 60 * 1000) })
-      .where(eq(issueComments.issueId, issueId));
+    await ageHeldAnnouncement(issueId, 7 * 60 * 60 * 1000);
 
     // Still held: one read, and NO second comment — the held key conflicts.
     const stillHeld = await reconcileTerminalGates(db, {
@@ -1676,6 +1690,25 @@ describeEmbeddedPostgres("reconcileTerminalGates", () => {
     });
     expect(stillHeld).toMatchObject({ scanned: 1, resolved: 0, humanGateOnly: 0 });
     expect(await commentsFor(issueId)).toHaveLength(1);
+
+    // ...and that re-check RESTARTS the window. Without this the interval
+    // throttles only the first re-read: `created_at` is fixed at the first
+    // announcement, so once it ages past the cutoff it stays past it and the
+    // row is re-admitted on every pass until the merge — ~144 reads a day
+    // against the ~4 the constant and the runbook promise, camped ahead of
+    // the stranded population under `updatedAt ASC`. The thrown reader is the
+    // assertion that matters; `scanned: 0` alone would pass on a JS-side
+    // filter that still paid for the SQL window.
+    const reHeldInsideWindow = await reconcileTerminalGates(db, {
+      now: NOW,
+      readPullRequestGate: async () => {
+        throw new Error("a still-held re-check must restart the window, not re-read every pass");
+      },
+    });
+    expect(reHeldInsideWindow).toMatchObject({ scanned: 0, pullRequestReads: 0 });
+
+    // Age it again so the merge is visible on the next cadence tick.
+    await ageHeldAnnouncement(issueId, 7 * 60 * 60 * 1000);
 
     // Merged: the verdict changes, so the key changes, so the row is admitted
     // and gets the verify-and-close notice the runbook promises.
@@ -1713,10 +1746,7 @@ describeEmbeddedPostgres("reconcileTerminalGates", () => {
 
     expect(await reconcileTerminalGates(db, { now: NOW, readPullRequestGate: reader }))
       .toMatchObject({ scanned: 1, humanGateOnly: 1 });
-    await db
-      .update(issueComments)
-      .set({ createdAt: new Date(NOW.getTime() - 30 * 24 * 60 * 60 * 1000) })
-      .where(eq(issueComments.issueId, issueId));
+    await ageHeldAnnouncement(issueId, 30 * 24 * 60 * 60 * 1000);
 
     const second = await reconcileTerminalGates(db, {
       now: NOW,
@@ -1801,10 +1831,7 @@ describeEmbeddedPostgres("reconcileTerminalGates", () => {
     // never admits it. Stricter than this module needs; pinned because the
     // runbook used to claim the opposite, and a reader could reasonably
     // "fix" the filter to match the prose.
-    await db
-      .update(issueComments)
-      .set({ createdAt: new Date(NOW.getTime() - 7 * 60 * 60 * 1000) })
-      .where(eq(issueComments.issueId, issueId));
+    await ageHeldAnnouncement(issueId, 7 * 60 * 60 * 1000);
     const merged = await reconcileTerminalGates(db, {
       now: NOW,
       readPullRequestGate: mergedReader(new Set(["blockcast/penstock-llm-proxy-core#2686"])),
