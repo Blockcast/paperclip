@@ -498,7 +498,7 @@ describe("assertMeasurable names the replica (collector migrates between pods)",
     const empty = messageOf({ ...broken, teardownPods: [] });
     assert.equal(empty, omitted);
     assert.equal(hintOf({ ...broken, teardownPods: [] }), "");
-    assert.ok(!/Replicas that DID export/.test(empty));
+    assert.ok(!/Replicas the index matched/.test(empty));
   });
 
   // Series present but no samples is a WINDOW problem. Sending that reader to
@@ -506,7 +506,7 @@ describe("assertMeasurable names the replica (collector migrates between pods)",
   it("distinguishes a window/step problem from the wrong replica", () => {
     const hint = hintOf({ ...broken, teardownPods: ["paperclip-0"] });
     assert.match(hint, /window or step/);
-    assert.ok(!/Replicas that DID export/.test(hint));
+    assert.ok(!/Replicas the index matched/.test(hint));
   });
 
   // ⛔ The hint must not out-claim its instrument. `/api/v1/series` resolves
@@ -531,12 +531,28 @@ describe("assertMeasurable names the replica (collector migrates between pods)",
   // `--pod` re-run also comes back empty has been told nothing about the window.
   it("prefers the sibling lead but keeps the window signal when both apply", () => {
     const hint = hintOf({ ...broken, teardownPods: ["paperclip-0", "paperclip-1"] });
-    assert.match(hint, /Replicas that DID export/);
+    assert.match(hint, /Replicas the index matched/);
     assert.match(hint, /paperclip-1/);
     assert.match(hint, /stronger lead/);
     assert.match(hint, /suspect the window/);
     // Still must not name the replica that just failed them as a destination.
     assert.ok(!/paperclip-0/.test(hint));
+  });
+
+  // ⛔ The sibling list rests on the SAME `/series` index evidence as the
+  // single-pod hedge, so it must not claim the siblings exported anything. The
+  // asymmetry that justifies preferring them is that they are UNTRIED, not that
+  // they have data -- a bare index hit is a bare index hit on either side.
+  // Hedging one branch and leaving the overclaim in the other would be worse
+  // than not hedging at all: the file would explain the mechanism in one
+  // comment and contradict it two lines up.
+  it("does not claim the siblings exported data -- it is the same index evidence", () => {
+    for (const pods of [["paperclip-1"], ["paperclip-0", "paperclip-1"]]) {
+      const hint = hintOf({ ...broken, teardownPods: pods });
+      assert.ok(!/DID export/.test(hint), `overclaims for ${pods}`);
+      assert.ok(!/exported data/.test(hint), `overclaims for ${pods}`);
+      assert.match(hint, /index matched/);
+    }
   });
 
   // The enrichment must not soften the failure into a non-result.
@@ -551,7 +567,7 @@ describe("assertMeasurable names the replica (collector migrates between pods)",
   it("leaves the retention message alone", () => {
     assert.throws(
       () => assertMeasurable({ ...broken, residual: [], teardownPods: ["paperclip-1"] }),
-      (e) => /past retention/.test(e.message) && !/Replicas that DID export/.test(e.message),
+      (e) => /past retention/.test(e.message) && !/Replicas the index matched/.test(e.message),
     );
   });
 });
