@@ -8,10 +8,10 @@ import type { IssueLivenessFinding } from "./issue-graph-liveness.js";
  * a second predicate. An earlier revision of this gauge re-derived "cold" in SQL
  * from four signals (live run, future monitor check, unexpired park, active
  * recovery action). That was not the classified state: `hasExplicitWaitingPath`
- * honours eight satisfiers, and the four it adds — a queued wake request, a live
- * pending interaction, a pending approval, an open recovery issue, a recent open
- * pull request, a user assignee — are the COMMONEST legitimate `in_review`
- * waits. The SQL read every one of those rows as cold, so the number it
+ * honours eight satisfiers, and the ones that approximation could not see — a
+ * queued wake request, a live pending interaction, a pending approval, an open
+ * recovery issue, a recent open pull request, a user assignee — are the
+ * COMMONEST legitimate `in_review` waits. The SQL read every one of those rows as cold, so the number it
  * published was an upper bound wearing the name of a strand rate, which is the
  * one way an instrument built to inform escalation policy can actively mislead
  * it. `recovery/service.ts` already warns (PEN-3198) that two copies of this
