@@ -6,6 +6,12 @@ Re-reads the pull-request gates an issue monitor declared in
 `executionPolicy.monitor.gateSignals`, and — when every one of them is merged —
 posts a system comment on the issue naming the resolved gate.
 
+When the pull-request gates are all merged but the monitor also declared a gate
+naming a **human** (`omar-go`, `hold-lift`, `approval:…`), it posts a different
+comment instead, saying so: the machine half is done and the remainder is a
+person who has not been told this row exists. See *The human-gate announcement
+(PEN-4545)* below. That is a report, never a resolution.
+
 Two populations qualify (`listCandidateIssues`): a **terminated** monitor, which
 has stopped polling (`monitorNextCheckAt IS NULL`); and an **armed but never
 evaluated** monitor (`monitorAttemptCount = 0 AND monitorLastTriggeredAt IS
@@ -118,9 +124,13 @@ network call of its own — and owns none of the re-evaluation.
   response. It must not read as "done, go close the issue", and must not
   suppress oversight.
 - **Every declared signal must resolve.** One unparseable token
-  (`deploy:paperclip-api`, `approval:board`) means the issue is still waiting on
+  (`deploy:paperclip-api`, `mq:drained`) means the issue is still waiting on
   something the reconciler cannot see, so the issue is left alone. There is no
-  partial resolution.
+  partial resolution. The parse loop runs to completion *before* the read loop,
+  so an unparseable token costs zero GitHub calls.
+- **A human gate is reported, never resolved** (PEN-4545; see below). It is the
+  one unparseable class that gets a verdict of its own, and that verdict is
+  still not `satisfied`.
 - **Merge subsumes the sub-gates.** A merged PR satisfies `:checks` and
   `:review` as well as `:merged`, because merge is strictly stronger than any of
   them. Checks passing is *not* itself terminal — a green check can go red on
@@ -134,6 +144,83 @@ network call of its own — and owns none of the re-evaluation.
   not make either untrue. `no_comment_streak` is excluded too — unlike a
   dependency gate, which *causes* silence by cancelling queued runs before
   dispatch, a monitor gate does not stop the assignee from commenting.
+
+## The human-gate announcement (PEN-4545)
+
+### The gap
+
+The fail-closed rule above is correct as a *resolution* rule and was silent as a
+*reporting* rule. Any token the parser could not read sent the whole issue down
+one branch — `unresolvable_signal`, no comment, no log line, nothing — and the
+tokens agents write to say "a person must act" went down it with the rest.
+
+That made this sweep, the one board-side audit that reads `gateSignals` at all,
+structurally blind to the gate class that most needs a reader. Measured
+2026-10-23: six `in_review` rows across three agents, each with a PR that was
+`OPEN`, `MERGEABLE` and green, each carrying *"do not merge until Omar gives an
+explicit go"*, each declaring that go on its monitor. Every one had an armed
+`monitorNextCheckAt`, so:
+
+- not `blocked` → zero-blocker sweeps skipped them;
+- no `external owner:` lines → the declaration regex never saw them;
+- armed monitor → every dashboard read them as **actively attended**.
+
+The rows politely re-checked a gate nothing on the owner's side could ever
+answer. **Silence was indistinguishable from progress**, and the row looked
+better cared-for than a silent one. The complement is worse: when the go
+finally arrived — a blanket *"go for all"* at 12:16Z, thirteen PRs merged
+inside fifteen minutes — nothing connected that event to the rows parked
+against it. Two were parked to dates three and six days past the event they
+were waiting for.
+
+### What it does
+
+`parseTerminalGateSignal` now returns a third kind, `human_gate`, for tokens on
+an explicit allowlist (`omar-go`, `hold-lift`, `human-go`, `founder-go`,
+`approval`, `board-approval`, `card`, `signoff`, `sign-off`, `cto-ruling`,
+`ceo-ruling`, each with an optional `:suffix`). When **every** other declared
+gate is satisfied and only human gates remain, `resolveTerminalGate` returns
+`human_gate_only` and the sweep posts a distinct comment under the
+`terminal-gate-human-only:` idempotency prefix.
+
+The comment names the gate tokens, says the machine half is done, and says
+plainly that a re-check will return the same answer forever. It closes nothing,
+clears no monitor, dispatches no run, and files no card — picking between
+extending a pending card, recording a named owner on the row, and accepting the
+row as frozen is the owner's judgement, and guessing from here would reproduce
+the same defect one level out.
+
+### Why an allowlist and not "anything unparseable"
+
+`deploy:landed`, `mq:drained`, `argo:synced`, `cron:nightly`, `heap:stable` and
+`insync:true` are unparseable here but *are* resolved by the assignee's own
+poll, and no human is expected to clear them. Announcing "waiting on a person"
+over one would be false. The split is drawn from the token census in
+`listCandidateIssues`, not guessed at.
+
+It fails in the safe direction: a human-gate token the list does not know keeps
+the old behaviour exactly — silent `unresolvable_signal` — so an omission costs
+the status quo, while a false positive would post a wrong-headed comment. Add
+prefixes on evidence.
+
+### Invariants a later change must not break
+
+- **`human_gate_only` is not `satisfied`.** It must never enter
+  `listResolvedTerminalGates`, which is the productivity-review suppression
+  path. A human-gated row is the case where oversight is *most* warranted: the
+  work is finished, unreachable, and nobody has been told. Two independent
+  guards hold this — the `kind === "pull_request"` filter and the separate
+  idempotency prefix — and both are deliberate.
+- **The anti-join must test both prefixes.** `listCandidateIssues` excludes a
+  row announced under *either* key for its current signal set. Testing only the
+  resolved prefix would re-admit every announced human-gate row on every pass,
+  where it can never clear — the `SCAN_LIMIT` starvation vector the resolved-side
+  anti-join exists to remove, reached through a new door. `TGA` pins this on
+  `scanned: 0`, which a JS-side filter cannot fake.
+- **Read cost.** A human-gated row with PR tokens now *does* spend PR reads
+  (previously it bailed at parse time). Bounded by the existing per-pass cap and
+  deduped by `gateCache`; a row whose unparseable tokens are not human gates is
+  unchanged and still costs zero.
 
 ## Operational notes
 
