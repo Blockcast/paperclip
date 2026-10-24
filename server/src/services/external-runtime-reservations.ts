@@ -30,7 +30,9 @@ function liveIsolationWaiters(isolationKey: string, now: Date) {
   return and(
     eq(heartbeatRuns.status, "queued"),
     sql`${heartbeatRuns.contextSnapshot} ->> ${K8S_ISOLATION_WAIT_KEY_CONTEXT_KEY} = ${isolationKey}`,
-    sql`(${heartbeatRuns.contextSnapshot} ->> ${K8S_ISOLATION_RETRY_AT_CONTEXT_KEY})::timestamptz > ${new Date(now.getTime() - ISOLATION_WAITER_LIVENESS_MS).toISOString()}::timestamptz`,
+    // Postgres does not order predicate evaluation, so the cast can see any
+    // queued row; guard it so one malformed stamp cannot fail every bind.
+    sql`(CASE WHEN (${heartbeatRuns.contextSnapshot} ->> ${K8S_ISOLATION_RETRY_AT_CONTEXT_KEY}) ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T' THEN (${heartbeatRuns.contextSnapshot} ->> ${K8S_ISOLATION_RETRY_AT_CONTEXT_KEY})::timestamptz END) > ${new Date(now.getTime() - ISOLATION_WAITER_LIVENESS_MS).toISOString()}::timestamptz`,
   );
 }
 

@@ -161,4 +161,31 @@ describeEmbeddedPostgres("isolation writer admits waiters oldest-first (BLO-4876
     expect(await retryAt(oldest)).toBeLessThanOrEqual(Date.now());
     expect(await retryAt(next)).toBe(later.getTime());
   });
+
+  it("treats a waiter with a malformed retry stamp as not live instead of failing the bind", async () => {
+    const key = `workspace-tree:project-primary:${randomUUID()}`;
+    await insertRun({
+      createdAt: new Date(Date.now() - 3600_000),
+      status: "queued",
+      context: { paperclipK8sIsolationWaitKey: key, paperclipK8sIsolationRetryAt: "not-a-date" },
+    });
+    const run = await insertRun({ createdAt: new Date(), status: "running" });
+    const res = await reserve(run);
+    expect((await bind(run, res.id, key)).isolationKey).toBe(key);
+  });
+
+  it("releasing a yielded run's still-pending reservation does not refresh the elder's stamp", async () => {
+    const key = `workspace-tree:project-primary:${randomUUID()}`;
+    const now = Date.now();
+    const stamp = new Date(now + 4 * 60_000);
+    const elder = await insertRun({ createdAt: new Date(now - 6 * 3600_000), status: "queued", context: waiting(key, stamp) });
+    const young = await insertRun({ createdAt: new Date(now - 60_000), status: "running" });
+    const youngRes = await reserve(young);
+    await expect(bind(young, youngRes.id, key)).rejects.toBeInstanceOf(ExternalRuntimeIsolationConflictError);
+
+    await releaseExternalRuntimeReservation(db, { runId: young, reason: "test" });
+
+    const [row] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, elder));
+    expect(row!.contextSnapshot!.paperclipK8sIsolationRetryAt).toBe(stamp.toISOString());
+  });
 });
