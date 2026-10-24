@@ -324,8 +324,17 @@ prefixes on evidence.
   rows it was written for. A held announcement therefore suppresses its row
   only for `HELD_GATE_RECHECK_INTERVAL_MS` (6h), after which the sweep
   re-reads the pull request. Still held: the insert conflicts on the held key
-  and nothing is posted — one read, no second comment. Merged: the verdict and
-  the key both change, and the resolved notice lands. `TGH` pins both halves.
+  and nothing is posted — one read, no second comment — and the conflict
+  stamps `idempotency_processed_at`, which **restarts the window**. That stamp
+  is what makes 6h a cadence rather than a one-shot delay: the suppression
+  test reads `coalesce(idempotency_processed_at, created_at)`, and `created_at`
+  is fixed at the first announcement, so keyed on it alone a held row would
+  age out once and then be re-admitted on *every* pass until the merge — ~144
+  reads a day against the ~4 this interval promises, at the head of an
+  `updatedAt ASC` scan ahead of the stranded population. Merged: the verdict
+  and the key both change, and the resolved notice lands. `TGH` pins all
+  three — suppressed inside the window, re-read and re-suppressed once past
+  it, and the merge still seen on the next tick.
 - **The third arm must stay guarded by the allowlist.** Dropping
   `humanGateSignalExistsSql` from it readmits the entire actively-polling
   fleet, spending a PR read per row per pass on rows the scheduler is already

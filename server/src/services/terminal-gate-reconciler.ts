@@ -138,6 +138,16 @@ export const TERMINAL_GATE_HELD_IDEMPOTENCY_PREFIX = "terminal-gate-human-only-h
  * notice lands within six hours of the merge. Nothing downstream is
  * time-critical — the notice says "verify the acceptance criteria and close",
  * which is not an outage response.
+ *
+ * The ~4/day figure only holds because every still-held re-check *restarts*
+ * the window, by stamping `idempotency_processed_at` on the held comment when
+ * its key conflicts. Keyed on `created_at` instead this would be a one-shot
+ * delay, not an interval: that timestamp is fixed at the first announcement,
+ * so once it aged past the cutoff it would stay past it and the row would be
+ * re-admitted every pass — the ~144/day this constant exists to avoid, and
+ * the starvation vector reached through a new door. Both the SQL anti-join
+ * and the JS filter therefore compare against the affirmation time, and `TGH`
+ * pins a still-held re-check leaving the row out of the next pass.
  */
 const HELD_GATE_RECHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
 
@@ -1078,7 +1088,8 @@ async function listCandidateIssues(
             or (
               resolved_comment.idempotency_key
                 = ${TERMINAL_GATE_HELD_IDEMPOTENCY_PREFIX}::text || ${gateSignalDigestSql}
-              and resolved_comment.created_at > ${heldRecheckCutoff.toISOString()}::timestamptz
+              and coalesce(resolved_comment.idempotency_processed_at, resolved_comment.created_at)
+                    > ${heldRecheckCutoff.toISOString()}::timestamptz
             )
           )
           and resolved_comment.author_agent_id is null
@@ -1092,9 +1103,19 @@ async function listCandidateIssues(
 
 /**
  * Announcement keys already recorded for these issues, with the time each was
- * posted, so each finding is reported once per signal set. Callers pass every
- * key an issue could be suppressed by — resolved, human-only and held-open —
- * because any of them means this signal set has already been announced.
+ * last *affirmed*, so each finding is reported once per signal set. Callers
+ * pass every key an issue could be suppressed by — resolved, human-only and
+ * held-open — because any of them means this signal set has already been
+ * announced.
+ *
+ * "Last affirmed" is `idempotency_processed_at`, falling back to `created_at`.
+ * For the two terminal keys the two are the same instant and the distinction
+ * is irrelevant: nothing ever re-admits those rows. For the held key they
+ * diverge on purpose — a still-held re-check refreshes
+ * `idempotency_processed_at` without posting a second comment, so the window
+ * measures time since the last *look*, not since the first announcement. The
+ * `coalesce` is what keeps a row written before this column was set behaving
+ * as it did, rather than becoming permanently eligible.
  *
  * The timestamp is returned rather than folded into a boolean here because
  * only one of the three keys is time-bounded, and the caller is the layer that
@@ -1109,7 +1130,7 @@ async function listExistingResolutionKeys(
     .select({
       issueId: issueComments.issueId,
       idempotencyKey: issueComments.idempotencyKey,
-      createdAt: issueComments.createdAt,
+      affirmedAt: sql<Date>`coalesce(${issueComments.idempotencyProcessedAt}, ${issueComments.createdAt})`,
     })
     .from(issueComments)
     .where(and(
@@ -1120,7 +1141,7 @@ async function listExistingResolutionKeys(
       isNull(issueComments.deletedAt),
     ));
   return new Map(
-    rows.map((row) => [`${row.issueId}\u0000${row.idempotencyKey ?? ""}`, row.createdAt]),
+    rows.map((row) => [`${row.issueId}\u0000${row.idempotencyKey ?? ""}`, new Date(row.affirmedAt)]),
   );
 }
 
@@ -1392,7 +1413,33 @@ export async function reconcileTerminalGates(
       })
       .onConflictDoNothing()
       .returning({ id: issueComments.id });
-    if (inserted.length === 0) continue;
+    if (inserted.length === 0) {
+      // A still-held re-check: the comment already says what this pass would
+      // say, so nothing is posted — but the *window* has to restart here or
+      // the interval throttles only the first re-read. `created_at` is fixed
+      // at the first announcement, so once it ages past the cutoff it stays
+      // past it, and the row is re-admitted on every pass until the pull
+      // request merges — ~144 reads a day against the ~4 this interval and
+      // the runbook promise, camped at the head of an `updatedAt ASC` scan
+      // ahead of the stranded population. Stamping the affirmation time is
+      // what makes the cadence a real cadence rather than a one-shot delay.
+      //
+      // Only the held key is refreshed. The two terminal keys suppress
+      // unconditionally and must not acquire a cadence by accident.
+      if (isHeld) {
+        await db
+          .update(issueComments)
+          .set({ idempotencyProcessedAt: now })
+          .where(and(
+            eq(issueComments.issueId, entry.candidate.id),
+            eq(issueComments.idempotencyKey, idempotencyKey),
+            isNull(issueComments.authorAgentId),
+            isNull(issueComments.authorUserId),
+            isNull(issueComments.deletedAt),
+          ));
+      }
+      continue;
+    }
 
     if (isHumanOnly) {
       humanGateOnly += 1;
