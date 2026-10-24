@@ -352,6 +352,74 @@ jq -r 'def ts: sub("\\.[0-9]+Z$"; "Z") | fromdate;
 The `.[0-9]+Z` strip is required: `fromdate` rejects the fractional seconds these
 timestamps carry.
 
+#### ⛔ RULED 2026-10-24 (CTO, PEN-4624) — this signature is FROZEN: it cannot fire on a verdict newer than 2026-07-11
+
+**Read this before running the decomposition below.** The signature the next
+section decomposes — `verdict: warn` ∧ `missing ∋ pr-link` — is produced by an
+evaluator that was replaced on 2026-07-12. **The current evaluator has never
+emitted `pr-link` in `missing`, not once.** So an empty or all-ancient result
+from that recipe means the instrument is **blind**, not that the fleet is clean.
+That is a false-*reassurance* failure, and it runs opposite to the false-FAIL
+risk this document warns about everywhere else.
+
+**Measured 2026-10-24**, company `b1d3f3d3`, the complete `done` population paged
+to exhaustion — 3,161 rows in four pages of 1000/1000/1000/**161**. 1,346 carry a
+verdict. The boundary is sharp:
+
+| verdict shape | n | `lastEvidenceVerdictEvaluatedAt` range |
+|---|---|---|
+| `allDetected` **null** (old evaluator) | 275 | 2026-05-31 → **2026-07-11T14:26:53Z** |
+| `allDetected` **populated** (current) | 1,071 | **2026-07-12T11:04:16Z** → 2026-10-23 |
+
+**Zero overlap across all 1,346.** `allDetected == null` is therefore a reliable
+"this verdict predates the current evaluator" test, and it is cheaper than a
+date comparison.
+
+The two evaluators report in disjoint vocabularies:
+
+| `missing` token | PRE (n=275) | POST (n=1,071) |
+|---|---|---|
+| `checklist:done-when` | 51 (18.5%) | 825 (77.0%) |
+| `pr-link` | **38 (13.8%)** | **0 (0.0%)** |
+| `review:ally-clean` | 0 | 409 (38.2%) |
+
+The current evaluator reports PR evidence through **`allDetected`** instead:
+`pr-link` appears there on **918 of 1,071 (85.7%)** post-cutover rows.
+
+**Consequence: all 38 signature rows are pre-cutover.** The decomposition below
+is still arithmetically correct, but it describes a candidate pool that has been
+frozen since 2026-07-11 and can never grow.
+
+##### The live predicate, and its decomposition
+
+Use **`verdict: warn` ∧ `pr-link ∉ allDetected`** — *absent from `allDetected`*,
+**not** *present in `missing`*. Same screens, re-measured 2026-10-24:
+
+| screen | remaining |
+|---|---|
+| raw | 153 |
+| `projectId != null` | 94 |
+| `originKind` not harness-generated | 87 |
+| verdict <3d stale vs `completedAt` | 72 |
+| `allDetected` non-empty | **12** |
+
+The last screen is the one that does the work: **60 of the 72** have
+`allDetected: []`, i.e. the gate detected no evidence shape at all. That is the
+signature of a decision/planning row, for which a merged code PR is not the
+done-when, rather than of a code row missing its PR.
+
+⚠️ **The 12 are unverified candidates, not confirmed phantoms.** One was checked
+authoritatively via `GET /api/issues/{id}/work-products` — the record the GitHub
+webhook writes, which is stronger than scraping comments for a URL:
+
+- **PEN-3713** — correctly `done`: `Blockcast/paperclip#2185`, `merged: true`,
+  `mergedAt: 2026-10-06T07:49:45Z`, `owningIdentifiers: ["PEN-3713"]`.
+
+The other 11 were **not** individually cleared, so this predicate's precision is
+**unmeasured** — do not quote one. A `gh search prs <identifier>` pass is *not* a
+substitute: it is full-text matching and scored `PEN-4036` against
+`onprem-k8s#4036` on the number alone.
+
 #### Screen in this order — staleness is NOT the dominant noise source
 
 38 `done` rows carry the phantom-done signature (`verdict: warn`, `missing`
@@ -473,10 +541,23 @@ next reader does not re-run the same refutation.
 
 All three surviving residuals completed in **June 2026** — `PEN-663`
 (2026-06-19), `PEN-1195` and `PEN-1162` (2026-06-27), with the screened-out
-`PEN-1216` on 2026-06-28. **There is no recent phantom-done candidate anywhere in
-the company.** Before spending a sweep on this detector, check whether its
-residual still consists entirely of rows months old: if it does, the signature is
-currently yielding nothing actionable and the sweep is better spent elsewhere.
+`PEN-1216` on 2026-06-28.
+
+⛔ **CORRECTED 2026-10-24 (PEN-4624).** This section previously concluded
+*"There is no recent phantom-done candidate anywhere in the company."* That was
+**true of the residual and wrong as an inference about the fleet**, and the
+difference is the whole point: the residual is ancient because the signature
+stopped being emitted on 2026-07-11, not because closures got cleaner.
+Re-measured on 2026-10-24 the residual is unchanged — the same four June rows
+(three after the `originKind` screen) — even though the `done` population has
+grown by **95 rows since that residual was first measured** (3,066 at PEN-4539 →
+3,135 at PEN-4601 → 3,161 now). The pool is frozen, not quiet.
+
+So the superseded advice — *"check whether its residual still consists entirely
+of rows months old; if it does the sweep is better spent elsewhere"* — reaches
+the right answer by the wrong route, and would keep returning "spend it
+elsewhere" forever however many real phantoms accumulated. Use the live
+predicate in the 2026-10-24 ruling above instead.
 
 #### The reader rule
 
@@ -495,6 +576,13 @@ currently yielding nothing actionable and the sweep is better spent elsewhere.
   `lastEvidenceVerdictEvaluatedAt` against `completedAt`. If the verdict
   predates the work, it describes an earlier state and carries no information
   about the closure.
+- **Check which evaluator wrote the verdict before reading its `missing` list.**
+  `allDetected == null` means the verdict predates the 2026-07-12 cutover and
+  speaks a different vocabulary — it *can* say `pr-link`, and the current
+  evaluator never does. Conversely a post-cutover verdict reports PR evidence by
+  its **presence in `allDetected`**, so "`pr-link` is not in `missing`" is not
+  evidence that a PR was found. Reading the two shapes as one field is what left
+  this detector frozen and unnoticed for 3.5 months (PEN-4624).
 - The artifact — a PR with a merged commit SHA — is the only authority on
   whether a row is correctly `done`. The verdict is a triage hint that narrows
   where to look; it never substitutes for the artifact.
