@@ -449,6 +449,39 @@ describe("paperclip agent Dockerfile", () => {
     expect(dockerfileAgent).not.toContain("RUN ");
   });
 
+  it("makes the pinned headless shell win `google-chrome` on the agent PATH (PEN-4682)", () => {
+    // The image ships the shim into the one directory both k8s adapters force
+    // to PATH[0] (IMAGE_WRAPPER_BIN_DIR, PEN-3713/PEN-3925), so a browser left
+    // on the /paperclip PVC cannot outrank it. Without this, `google-chrome`
+    // resolved to a stale puppeteer Chrome 149 symlink on the shared PVC that
+    // hangs under --user-data-dir instead of rendering.
+    expect(dockerfileToolchain).toContain(
+      "ln -sfn /usr/local/bin/google-chrome /usr/local/libexec/paperclip/bin/google-chrome",
+    );
+
+    // It must come from the TOOLCHAIN, not Dockerfile.agent: that file is
+    // asserted above to be a pure COPY overlay with no RUN. Dockerfile.agent's
+    // `COPY --from=server` of the same directory merges rather than replaces,
+    // so the shim survives — the PEN-4682 control in docker-agent.yml measures
+    // that on the built image rather than trusting the merge semantics here.
+    expect(dockerfileAgent).not.toContain("libexec/paperclip/bin/google-chrome");
+
+    // After the pin, so the link target exists when the RUN verifies it.
+    expect(dockerfileToolchain.indexOf("ARG CHROME_HEADLESS_SHELL_VERSION=")).toBeLessThan(
+      dockerfileToolchain.indexOf("/usr/local/libexec/paperclip/bin/google-chrome"),
+    );
+
+    // The canary must resolve the browser through PATH. Reading $CHROME_BIN
+    // directly measures a binary the agent does not reach by name, which is
+    // exactly how this defect survived a green smoke test.
+    const smoke = readFileSync(
+      path.join(repoRoot, "scripts/smoke/agent-browser-screenshot.sh"),
+      "utf8",
+    );
+    expect(smoke).toContain('command -v "$browser_name"');
+    expect(smoke).toContain("89504e470d0a1a0a");
+  });
+
   it("tracks the resolved MMTP FFmpeg image in the stable toolchain", () => {
     expect(dockerfileToolchain).toContain("ARG FFMPEG_IMAGE=");
     expect(dockerfileToolchain).toContain("FROM ${FFMPEG_IMAGE} AS ffmpeg-publisher");
