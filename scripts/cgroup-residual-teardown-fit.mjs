@@ -414,17 +414,36 @@ export function assertMeasurable({
     const others = teardownPods.filter((candidate) => candidate !== pod);
     let hint = "";
     if (others.length > 0) {
+      // ⛔ PRECEDENCE, deliberate: when the index matched the queried pod AND a
+      // sibling, the sibling wins. A replica with data is an actionable lead; a
+      // bare index hit on this pod is not (see the hedge below for why). The
+      // weaker signal is acknowledged rather than dropped, so a reader whose
+      // `--pod` re-run also comes back empty knows the window is still suspect.
       hint =
         ` Replicas that DID export it in this window: ${others.join(", ")}` +
         " -- re-run with `--pod <name>`, which re-points residual and restarts" +
         " with it so the pairing stays on one pod (trap 5).";
+      if (teardownPods.includes(pod)) {
+        hint +=
+          " The index also matched this pod, but a replica that exported data" +
+          " is the stronger lead; if `--pod` does not help, suspect the window.";
+      }
     } else if (teardownPods.includes(pod)) {
-      // Series present but `increase()` yielded nothing: a range/step problem,
-      // NOT the wrong pod. Sending this reader to the sibling would waste the
-      // one thing they are short of.
+      // ⛔ HEDGED ON PURPOSE -- `/series` CANNOT rule the replica out.
+      // Prometheus resolves `/api/v1/series` against the index of every block
+      // OVERLAPPING [start,end] (2h head-block granularity), so a label set is
+      // returned when a block straddles the boundary even if no sample landed
+      // inside the window. A replica whose teardown series stopped just before
+      // `--start` therefore reads as "present" here. The window/step reading is
+      // the likelier one and is offered as such -- but stating it as fact would
+      // excuse the one replica the reader should still be able to suspect, and
+      // an over-confident exclusion mid-incident is the costlier error.
       hint =
-        ` The series DOES exist for ${pod} here, so this is the window or step` +
-        " (`increase()` needs two points in a bucket), not the wrong replica.";
+        ` The index also matched ${pod} for this window, so this is LIKELY the` +
+        " window or step (`increase()` needs two points in a bucket) rather than" +
+        " the wrong replica -- but `/series` matches any block overlapping the" +
+        " range, so it cannot prove samples landed inside it. Treat this replica" +
+        " as unconfirmed, not excluded.";
     }
     throw new Error(
       `no teardown samples for pod ${pod} in ${window} -- the independent ` +
