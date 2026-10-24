@@ -167,6 +167,8 @@ import {
   recordRecoveryActionAutoDischarged,
   recordRecoveryHorizonExpired,
   setBackstopDeferredCandidates,
+  setColdInReviewIssueMetricsRefreshSuccess,
+  setColdInReviewIssueOldestAgeMetrics,
 } from "../metrics.js";
 import {
   isInfraFailureRun,
@@ -11934,6 +11936,11 @@ export function recoveryService(
       .concat(recoveryActionRows);
 
     return {
+      // Carried out so `reconcileIssueGraphLiveness` can age a finding without
+      // re-reading `issues`: `IssueLivenessFinding` has no assignee and no
+      // timestamp, and both already sit in this snapshot (PEN-4652).
+      issues: issueRows,
+      agents: agentRows,
       // The MINTING view. An open escalation contributes a waiting path for its own
       // subject and leaf, which is what stops the detector re-firing the same incident
       // every 30s tick while somebody is already on it (BLO-15200). Everything that
@@ -15400,7 +15407,50 @@ export function recoveryService(
     /** Idle bound after which an untouched recovery row is retired (BLO-28957). 0 disables. */
     abandonedRecoveryMs?: number;
   }) {
-    const collected = await collectIssueGraphLiveness();
+    const collected = await collectIssueGraphLiveness().catch((error: unknown) => {
+      // PEN-4652: the cold-`in_review` gauge is published from this snapshot, so
+      // a failed collect has to mark it stale. Without this the previous pass's
+      // ages keep being served and read as current — the freezing-at-last-value
+      // failure the freshness gauge exists to make visible.
+      setColdInReviewIssueMetricsRefreshSuccess(false);
+      throw error;
+    });
+
+    // PEN-4652: publish the cold-`in_review` gauge from the verdicts this pass
+    // has ALREADY computed, before anything narrows them.
+    //
+    // Unfiltered by `issueCreatedAtGte` on purpose, for the same reason the
+    // stale-escalation re-check below is: that knob narrows which findings may
+    // CREATE escalations, and the pre-cutoff backlog is precisely the
+    // population this gauge exists to make visible. Filtering here would hide
+    // the oldest rows — the ones whose invisibility is the defect.
+    //
+    // Reads the MINTING view (`findings`) rather than `escalationBlindFindings`:
+    // an open escalation is a real, owned action path, so a row somebody is
+    // already on is attended and should leave the gauge. That makes the series
+    // measure the UNATTENDED backlog, which is the number escalation policy
+    // should be set against. The escalation-blind view deliberately pretends
+    // those paths are absent and would double-count them.
+    //
+    // Emitted here rather than on the scrape-metrics collector tick, which is
+    // where this gauge first lived: the collector would have had to re-derive
+    // "cold" in SQL as a second copy of `hasExplicitWaitingPath`, and that copy
+    // was measurably wrong (see cold-in-review-gauge.ts). The cost is that the
+    // series exists on the workers tier only and refreshes once per recovery
+    // chain, NOT once per 30s tick — the chain routinely outlives one interval.
+    // That is the right cadence anyway: the state it measures moves in hours to
+    // weeks, and tying it to the classifier means it cannot report a verdict the
+    // classifier did not reach.
+    setColdInReviewIssueOldestAgeMetrics(
+      coldInReviewGaugeEntries(
+        collected.findings,
+        new Map(collected.issues.map((issue) => [issue.id, issue])),
+        opts?.now ?? new Date(),
+      ),
+      new Set(collected.agents.map((agent) => agent.id)),
+    );
+    setColdInReviewIssueMetricsRefreshSuccess(true);
+
     let findings = collected.findings;
     // BLO-29601: run the premise re-check FIRST, so a sweep that closes a dead
     // escalation does it before anything downstream reads the escalation as an owned

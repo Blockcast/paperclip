@@ -1096,31 +1096,52 @@ export const DEFERRED_ISSUE_EXECUTION_WAKE_OLDEST_AGE_METRIC =
   "paperclip_deferred_issue_execution_wake_oldest_age_seconds";
 export const DEFERRED_ISSUE_EXECUTION_WAKE_AGE_METRICS_REFRESH_SUCCESS_METRIC =
   "paperclip_deferred_issue_execution_wake_age_metrics_refresh_success";
-// PEN-4545. An `in_review` issue with NO waiting path at all: no live run, no
-// future monitor check, no unexpired park, and no active recovery action. The
-// classifier for this already exists and is correct --
-// `in_review_without_action_path` in recovery/issue-graph-liveness.ts -- but its
-// only consumer is the blocked-inbox attention projection, which is reached
-// solely by an explicit `attention=blocked` list filter. That is a PULL surface,
-// so it renders the state only when some OTHER blocked row happens to depend on
-// the cold one. The agent-facing push surface cannot cover the gap either:
-// `inboxLite` excludes `in_review` BY DESIGN, because review waits are meant to
-// resume on a comment, interaction or monitor wake -- which is exactly what a
-// row in this state no longer has. So the state was computable and unobservable
-// at the same time, and nothing escalated it.
+// PEN-4652. An `in_review` issue with NO waiting path at all. The classifier
+// for this already exists and is correct -- `in_review_without_action_path` in
+// recovery/issue-graph-liveness.ts -- but its only consumer is the
+// blocked-inbox attention projection, which is reached solely by an explicit
+// `attention=blocked` list filter. That is a PULL surface, so it renders the
+// state only when some OTHER blocked row happens to depend on the cold one. The
+// agent-facing push surface cannot cover the gap either: `inboxLite` excludes
+// `in_review` BY DESIGN, because review waits are meant to resume on a comment,
+// interaction or monitor wake -- which is exactly what a row in this state no
+// longer has. So the state was computable and unobservable at the same time,
+// and nothing escalated it.
+//
+// THE GAUGE IS A PROJECTION OF THE CLASSIFIER, not a second opinion about what
+// "cold" means, and that is load-bearing rather than tidy. The first revision
+// re-derived the predicate in SQL from four signals (live run, future monitor
+// check, unexpired park, active recovery action). `hasExplicitWaitingPath`
+// honours eight: it also counts a queued wake request, a live pending
+// interaction, a pending approval, an open recovery issue, a recent open pull
+// request, and a user assignee. Those last few are the COMMONEST legitimate
+// `in_review` waits, so the SQL published every one of them as cold -- an upper
+// bound wearing the name of a strand rate, on the one instrument built to
+// inform escalation policy. `recovery/service.ts` warns (PEN-3198) that two
+// copies of this predicate drift silently; there is now one.
 //
 // Measured 2026-10-24T08:5xZ, company b1d3f3d3, complete 63-row `in_review`
-// population: 25 cold (40%) -- 14 lapsed (monitor fired, never re-armed) and 11
-// never armed (both monitor timestamps null). Oldest 1,366 h. Over the same
-// window exactly ONE `harness_liveness_escalation` was open across 187 ever
-// minted, and it named none of the 25, with the most recent mint 39 h earlier
-// against a 1-5/day baseline.
+// population: 25 (40%) matched that four-signal approximation -- 14 lapsed
+// (monitor fired, never re-armed) and 11 never armed (both monitor timestamps
+// null), oldest 1,366 h. READ THAT AS AN UPPER BOUND on the strand rate, not as
+// the rate: it predates this gauge and was taken with the wider predicate. Over
+// the same window exactly ONE `harness_liveness_escalation` was open across 187
+// ever minted, and it named none of the 25, with the most recent mint 39 h
+// earlier against a 1-5/day baseline -- which is the part that stands
+// regardless of predicate, and the reason for a carrier.
 //
-// Ages off `updated_at` -- the last time anything at all happened to the row --
-// so the reading is "this row has had neither activity nor a waiting path for N
-// seconds". Labeled by bounded agent_id; the issue id is unbounded cardinality
-// and is logged by the refresh instead, the same split as the deferred-wake
-// gauge above.
+// Ages off `last_activity_at` -- the last MEANINGFUL change, which is the clock
+// the escalation staleness gate already reads, rather than `updated_at`, which
+// metadata-only writes reset. Labeled by bounded agent_id; an unassigned cold
+// row folds into the UNKNOWN_AGENT_ID bucket, and the issue id is unbounded
+// cardinality so it never becomes a label.
+//
+// TIER AND CADENCE, because they are not the usual ones for a gauge in this
+// file: it is published from `reconcileIssueGraphLiveness` where the classifier
+// verdicts already exist, so it lives on the WORKERS tier only, and refreshes
+// once per recovery CHAIN rather than once per 30s tick -- a chain routinely
+// outlives one interval. Scope any query to `service="paperclip-workers"`, and
+// do not size a `for:` off the tick interval.
 export const COLD_IN_REVIEW_ISSUE_OLDEST_AGE_METRIC =
   "paperclip_cold_in_review_issue_oldest_age_seconds";
 export const COLD_IN_REVIEW_ISSUE_METRICS_REFRESH_SUCCESS_METRIC =
@@ -6135,28 +6156,34 @@ function ensureRegistry(): {
     coldInReviewIssueOldestAge = new Gauge({
       name: COLD_IN_REVIEW_ISSUE_OLDEST_AGE_METRIC,
       help:
-        "Age in seconds since `updated_at` of the oldest `in_review` issue assigned to an "
-        + "agent that has NO waiting path at all: no live run, no future monitor check, no "
-        + "unexpired park, and no active recovery action (PEN-4545). Such a row is finished "
-        + "work that nothing will ever come back to -- `inboxLite` excludes `in_review` by "
-        + "design, so no heartbeat re-picks it, and the existing "
-        + "`in_review_without_action_path` classifier renders only through the "
-        + "`attention=blocked` pull filter, i.e. only when some OTHER blocked row depends on "
-        + "it. Reads 0 for an agent with nothing cold rather than going absent, because an "
-        + "absent series and \"nothing stuck\" render identically on a dashboard. Refreshed "
-        + "on the scrape-metrics collector tick and reset-then-set every refresh, so a "
-        + "repaired row drops the agent back to 0 instead of freezing at its last value.",
+        "Age in seconds since `last_activity_at` of the oldest `in_review` issue the "
+        + "liveness classifier reports as `in_review_without_action_path` (PEN-4652) -- a "
+        + "row with no live run, no scheduled monitor, no unexpired park, no queued wake, "
+        + "no pending interaction or approval, no open recovery issue and no recent open "
+        + "pull request. Such a row is finished work that nothing will ever come back to: "
+        + "`inboxLite` excludes `in_review` by design, so no heartbeat re-picks it, and the "
+        + "classifier itself renders only through the `attention=blocked` pull filter, i.e. "
+        + "only when some OTHER blocked row depends on it. This gauge is a PROJECTION of "
+        + "that classifier, never a second predicate -- an earlier SQL re-derivation "
+        + "honoured four of its eight waiting paths and so published every approval-, "
+        + "interaction- and pull-request-waiting row as cold. Reads 0 for an agent with "
+        + "nothing cold rather than going absent, because an absent series and \"nothing "
+        + "stuck\" render identically on a dashboard. Published from the heartbeat recovery "
+        + "chain, so it exists on the workers tier only and refreshes per chain rather than "
+        + "per tick; reset-then-set every refresh, so a repaired row drops the agent back "
+        + "to 0 instead of freezing at its last value.",
       labelNames: ["agent_id"],
       registers: [registry],
     });
     coldInReviewIssueMetricsRefreshSuccess = new Gauge({
       name: COLD_IN_REVIEW_ISSUE_METRICS_REFRESH_SUCCESS_METRIC,
       help:
-        "1 when the most recent cold-`in_review` database refresh completed before metrics "
-        + "exposition; 0 when it failed, so a stale cold-row age cannot be read as fresh. "
-        + "Separate from " + DEFERRED_ISSUE_EXECUTION_WAKE_AGE_METRICS_REFRESH_SUCCESS_METRIC
-        + " because the two refreshes run different aggregates against different indexes and "
-        + "can fail independently.",
+        "1 when the most recent liveness pass published "
+        + COLD_IN_REVIEW_ISSUE_OLDEST_AGE_METRIC + "; 0 when the snapshot it is derived from "
+        + "could not be read, so a stale cold-row age cannot be read as fresh (PEN-4652). "
+        + "Note this tracks the heartbeat recovery chain, NOT the scrape-metrics collector "
+        + "that carries the other refresh-success gauges in this file -- it can be 1 while "
+        + "every one of those is 0, and the reverse.",
       registers: [registry],
     });
     coldInReviewIssueMetricsRefreshSuccess.set(0);
