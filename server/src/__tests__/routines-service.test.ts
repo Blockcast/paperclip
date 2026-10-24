@@ -2508,6 +2508,79 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(recoveryAction.status).toBe("active");
   });
 
+  // BLO-48716: an escalated recovery action past its horizon wakes nobody, so it
+  // must stop protecting its source once a fire-age horizon has passed since its
+  // `timeoutAt`. Before the fix it gated `skip_if_active` until someone closed
+  // the row by hand (BLO-47801 ~39h; BLO-48616, unbound, `blocked`, no edge).
+  for (const bindExecutionRun of [true, false]) {
+    it(`fires past an escalated recovery action whose horizon has expired (bound run: ${bindExecutionRun})`, async () => {
+      const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
+      const held = await seedGatingExecutionIssue({
+        companyId,
+        agentId,
+        routine,
+        issueSvc,
+        runStatus: "succeeded",
+        runStartedAt: new Date(Date.now() - STALE_FIRE_AGE_MS),
+        issueCreatedAt: new Date(Date.now() - STALE_FIRE_AGE_MS),
+        updatedAt: new Date("2026-03-20T12:01:00.000Z"),
+        bindExecutionRun,
+      });
+      await db.insert(issueRecoveryActions).values({
+        companyId,
+        sourceIssueId: held.issue.id,
+        kind: "missing_disposition",
+        status: "escalated",
+        cause: "successful_run_missing_state",
+        fingerprint: randomUUID(),
+        nextAction: "wait",
+        timeoutAt: new Date(Date.now() - STALE_FIRE_AGE_MS),
+      });
+      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, held.issue.id));
+
+      const run = await svc.runRoutine(routine.id, { source: "schedule" });
+
+      expect(run.status).toBe("issue_created");
+      expect(run.linkedIssueId).not.toBe(held.issue.id);
+      const [predecessor] = await db.select().from(issues).where(eq(issues.id, held.issue.id));
+      // A bound row is retired by the supersede; an unbound one cannot block the
+      // successor's INSERT and is left to its recovery owner.
+      expect(predecessor.status).toBe(bindExecutionRun ? "cancelled" : "blocked");
+    });
+  }
+
+  it("still gates on an escalated recovery action inside its horizon", async () => {
+    const { agentId, companyId, issueSvc, routine, svc } = await seedFixture();
+    const held = await seedGatingExecutionIssue({
+      companyId,
+      agentId,
+      routine,
+      issueSvc,
+      runStatus: "succeeded",
+      runStartedAt: new Date(Date.now() - STALE_FIRE_AGE_MS),
+      issueCreatedAt: new Date(Date.now() - STALE_FIRE_AGE_MS),
+      updatedAt: new Date("2026-03-20T12:01:00.000Z"),
+      bindExecutionRun: true,
+    });
+    await db.insert(issueRecoveryActions).values({
+      companyId,
+      sourceIssueId: held.issue.id,
+      kind: "missing_disposition",
+      status: "escalated",
+      cause: "successful_run_missing_state",
+      fingerprint: randomUUID(),
+      nextAction: "wait",
+      timeoutAt: new Date(Date.now() - 60 * 1000),
+    });
+    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, held.issue.id));
+
+    const run = await svc.runRoutine(routine.id, { source: "schedule" });
+
+    expect(run.linkedIssueId).toBe(held.issue.id);
+    const [predecessor] = await db.select().from(issues).where(eq(issues.id, held.issue.id));
+    expect(predecessor.status).toBe("blocked");
+  });
+
   // Ally review, BLO-31996: the recovery-action guard must also be decided after
   // the row lock. A recovery upsert never writes the `issues` row, so the issue
   // lock does not serialise it, and a `for update` that blocked on that lock
