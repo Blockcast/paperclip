@@ -192,7 +192,7 @@ const manifest: PaperclipPluginManifestV1 = {
         type: "array",
         title: "Alertmanager receivers to reconcile (lost-webhook backfill)",
         description:
-          "Alertmanager receiver names whose alerts belong to this company, e.g. [\"paperclip\"]. Every 5 minutes the reconcile job reads active alerts from alertmanagerApiUrl and files any routed to one of these receivers that has no issue yet — the alerts whose webhook Alertmanager gave up on while the control plane was down (BLO-44820). Leave unset to disable.",
+          "Alertmanager receiver names whose alerts belong to this company. Defaults to [\"paperclip\"] when unset; set [] to disable. Every 5 minutes the reconcile job reads active alerts from alertmanagerApiUrl and files any routed to one of these receivers that has no issue yet — the alerts whose webhook Alertmanager gave up on while the control plane was down (BLO-44820).",
         items: { type: "string", minLength: 1 },
       },
     },

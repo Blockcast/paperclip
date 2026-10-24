@@ -185,9 +185,13 @@ describe("runCoverageCheck (BLO-40673 AC4)", () => {
     const routed = harness(opts);
     await runCoverageCheck(routed.ctx, scoped, NOW, async () => [{ ...amAlert("fp1"), receivers: [{ name: "paperclip" }] }]);
     expect(uncoveredCalls(routed.write)).toHaveLength(1);
-    // Unset receivers keeps the pre-BLO-48499 behaviour: no tenant to compare against.
+    // BLO-48574: unset defaults to ["paperclip"], so the exemption applies...
     const unscoped = harness(opts);
     await runCoverageCheck(unscoped.ctx, config, NOW, async () => [{ ...amAlert("fp1"), receivers: [{ name: "blackhole" }] }]);
-    expect(uncoveredCalls(unscoped.write)).toHaveLength(1);
+    expect(uncoveredCalls(unscoped.write)).toEqual([]);
+    // ...and an explicit [] still opts out and keeps the pre-BLO-48499 behaviour.
+    const optedOut = harness(opts);
+    await runCoverageCheck(optedOut.ctx, { ...config, reconcileReceivers: [] }, NOW, async () => [{ ...amAlert("fp1"), receivers: [{ name: "blackhole" }] }]);
+    expect(uncoveredCalls(optedOut.write)).toHaveLength(1);
   });
 });

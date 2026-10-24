@@ -325,3 +325,8 @@ export interface OwnerResolution {
     | "annotation-override"
     | "no-match";
 }
+
+// BLO-48574 — applied when `reconcileReceivers` is UNSET (explicit [] still
+// disables). Unset made the coverage blackhole exemption (#2957) inert, so
+// alerts deliberately routed away from Paperclip paged as "untracked".
+export const DEFAULT_RECONCILE_RECEIVERS: readonly string[] = ["paperclip"];
