@@ -585,8 +585,29 @@ is exactly why it needs its own screen. Measured over one agent's 807 `done`
 rows (CTO, 2026-10-23): **258 (32%)** are harness-generated, and **129 of those
 carry a `projectId`** and are therefore invisible to screen 1.
 
-The full residual query — all three screens, verified against the 3,135-row
-population on 2026-10-23, returns exactly the three rows named in the table:
+⛔ **The query below measures the CLOSED pre-cutover pool — it is not a live
+sweep, and lifting it as one reproduces this document's own subject matter.**
+Its first two conjuncts *are* the retired signature: `verdict == "warn"` ∧
+`missing ∋ pr-link`. That pair is unreachable at this head on every path,
+labelled or not (ruling at `:355`), so against post-cutover rows — those with
+`allDetected` populated, i.e. every verdict written after
+**2026-07-11T14:26:53Z** — it returns **nothing by construction**. An empty
+result from it is the instrument being silent, not the fleet being clean.
+`c6145736` (*"fix: harden evidence gate detectors"*, #641,
+2026-07-12T10:00:29Z) is the commit that retired it; the 38 rows it selects
+over are a closed set that has not grown since 2026-07-11 and cannot grow.
+
+**For a sweep that can actually fire, use the live predicate** — *"The live
+predicate, and its decomposition"* (`:475`): **`pr-link ∉ allDetected`**, paired
+with `verdict: warn` for unlabelled rows, `verdict: block` for rows labelled
+with a registry entry requiring `pr-link`, or `verdict != "pass"` when your
+window may contain both. The three screens below are predicate-independent —
+`projectId`, `originKind` and staleness carry over to the live predicate
+unchanged, which is what the re-measured table at `:475` applies them to.
+
+The full residual query over that closed pool — all three screens, verified
+against the 3,135-row population on 2026-10-23, returns exactly the three rows
+named in the table:
 
 ```bash
 jq -r 'def ts: sub("\\.[0-9]+Z$"; "Z") | fromdate;
