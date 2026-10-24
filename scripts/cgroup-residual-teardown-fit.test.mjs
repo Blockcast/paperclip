@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { describe, it } from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   MIN_FIT_POINTS,
@@ -273,13 +275,60 @@ describe("queries", () => {
     assert.doesNotMatch(query, /\bby\s*\(/);
     assert.doesNotMatch(query, /without\s*\(/);
     // increase(), not a raw _sum read: the counter resets on restart.
-    assert.match(query, /_sum\[3600s\]/);
+    // The `\{...\}` is required, not incidental: a bare `/_sum\[3600s\]/`
+    // silently stops matching the moment a selector sits before the range,
+    // which is exactly the shape trap 5 below requires.
+    assert.match(query, /_sum\{[^}]*\}\[3600s\]/);
+  });
+
+  // ⛔ THE TRAP-5 PIN. The worker StatefulSet runs 2 replicas and the collector
+  // migrates between them on a pod replacement (measured 2026-10-24 ~07:48Z).
+  // An unscoped teardown sum therefore charges BOTH pods' work against ONE
+  // pod's residual, and nothing downstream can catch it: `teardownCovered`
+  // counts samples, and a sample from the wrong pod is still a sample, so the
+  // table reported 7/7 coverage and r2 0.589 on a pairing where the measured
+  // pod had done 23 s of the 746 s being regressed against it.
+  it("REGRESSION (trap 5): all three queries select the SAME pod", () => {
+    const pod = "paperclip-7";
+    const sel = `pod="${pod}"`;
+    for (const query of [residualQuery(pod), restartQuery(pod), teardownQuery(3600, pod)]) {
+      assert.ok(
+        query.includes(sel),
+        `query is not scoped to ${pod}, so it cannot be paired with one: ${query}`,
+      );
+    }
+    // And they agree by default, which is the case main() actually runs.
+    for (const query of [residualQuery(), restartQuery(), teardownQuery(3600)]) {
+      assert.match(query, /pod="paperclip-0"/);
+    }
   });
 
   it("segments on container_start_time_seconds, never on a deploy commit", () => {
     const query = restartQuery();
     assert.match(query, /container_start_time_seconds/);
     assert.doesNotMatch(query, /deploy/);
+  });
+});
+
+describe("module import is independent of argv[1]", () => {
+  // ⛔ A module-scope `realpathSync(process.argv[1])` throws ENOENT when
+  // argv[1] is SET but missing, which turns a plain `import` of this file into
+  // a throw -- so the runner cannot even load the suite. Reproduced on the
+  // pre-fix head: `IMPORT THREW -> ENOENT`. Needs a subprocess, because argv
+  // cannot be rewritten once this module is in the cache.
+  it("imports cleanly when argv[1] is set but does not exist", () => {
+    const target = fileURLToPath(
+      new URL("./cgroup-residual-teardown-fit.mjs", import.meta.url),
+    );
+    const probe = [
+      'process.argv[1] = "/nonexistent-" + process.pid;',
+      `await import(${JSON.stringify(target)});`,
+      'console.log("ok");',
+    ].join("\n");
+    const out = execFileSync(process.execPath, ["--input-type=module", "-e", probe], {
+      encoding: "utf8",
+    });
+    assert.equal(out.trim(), "ok");
   });
 });
 

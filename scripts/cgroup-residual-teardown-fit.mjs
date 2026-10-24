@@ -96,14 +96,32 @@ export function residualQuery(pod = DEFAULT_POD, container = DEFAULT_CONTAINER) 
 }
 
 /**
- * Teardown work per bucket, summed over EVERY label dimension (trap 3).
+ * Teardown work per bucket, summed over EVERY label dimension (trap 3) but
+ * scoped to ONE pod (trap 5).
  *
  * A bare `sum(...)` with no `by` clause is load-bearing here: it collapses
  * `method`, `cleanup_reason` and `trigger` together. `increase()` rather than a
  * raw `_sum` read because the counter resets on restart.
+ *
+ * The `pod` selector is equally load-bearing, and for the opposite reason: the
+ * worker StatefulSet runs 2 replicas, so a bare sum charges BOTH pods' teardown
+ * work against ONE pod's residual. That is not a wider window on the same
+ * quantity -- it is a different quantity. PEN-3692 established that teardown
+ * runs in the worker's OWN cgroup (execFile children share it; provisioning is
+ * not dispatched to agent pods), so the residual and the work that drives it
+ * must come from the same pod or the pairing is meaningless.
+ *
+ * Measured 2026-10-24: the collector moved from paperclip-0 to paperclip-1 at
+ * the ~07:48Z replacement. Over 07:00..15:00Z the unscoped sum reads 746 s and
+ * fits at r2 0.589; paperclip-0, whose residual was being regressed on it, did
+ * 23 s. `teardownCovered` cannot catch this -- a sample from the WRONG pod is
+ * still a sample, so coverage reports 7/7 on a pairing that is entirely wrong.
  */
-export function teardownQuery(stepSeconds = DEFAULT_STEP_SECONDS) {
-  return `sum(increase(paperclip_execution_workspace_teardown_duration_seconds_sum[${stepSeconds}s]))`;
+export function teardownQuery(stepSeconds = DEFAULT_STEP_SECONDS, pod = DEFAULT_POD) {
+  return (
+    "sum(increase(paperclip_execution_workspace_teardown_duration_seconds_sum" +
+    `{pod="${pod}"}[${stepSeconds}s]))`
+  );
 }
 
 /** The segmentation key (trap 2). Never deploy commits. */
@@ -351,7 +369,7 @@ export function formatFitTable(fits) {
  * `teardown` is introduced by #2175, so a window predating it, a renamed
  * metric, or an unscraped `_sum` all land here.
  */
-export function assertMeasurable({ residual, teardown, restarts, start, end }) {
+export function assertMeasurable({ residual, teardown, restarts, start, end, pod = DEFAULT_POD }) {
   const window = `${iso(start)}..${iso(end)}`;
   if (residual.length === 0 || restarts.length === 0) {
     // Retention is ~7 days. An empty window is almost always the window having
@@ -361,9 +379,15 @@ export function assertMeasurable({ residual, teardown, restarts, start, end }) {
     );
   }
   if (teardown.length === 0) {
+    // `increase()` over a series this pod never exported returns no samples,
+    // which is indistinguishable from the metric not being scraped at all. So
+    // this stays a hard error even though "that replica simply did no teardown
+    // work" is now one of the causes: a silent zero would be read as a regime.
     throw new Error(
-      `no teardown samples in ${window} -- the independent variable is absent ` +
-        "(window predates #2175, metric renamed, or `_sum` not scraped). " +
+      `no teardown samples for pod ${pod} in ${window} -- the independent ` +
+        "variable is absent (window predates #2175, metric renamed, `_sum` " +
+        `not scraped, or ${pod} exported no teardown series in this window -- ` +
+        "check the sibling replica). " +
         "This is a measurement failure, not a non-result.",
     );
   }
@@ -448,11 +472,11 @@ async function main() {
 
   const [residual, teardown, restarts] = await Promise.all([
     queryRange(baseUrl, residualQuery(pod, container), start, end, step, fetch),
-    queryRange(baseUrl, teardownQuery(step), start, end, step, fetch),
+    queryRange(baseUrl, teardownQuery(step, pod), start, end, step, fetch),
     queryRange(baseUrl, restartQuery(pod, container), start, end, step, fetch),
   ]);
 
-  assertMeasurable({ residual, teardown, restarts, start, end });
+  assertMeasurable({ residual, teardown, restarts, start, end, pod });
 
   const fits = buildSegmentFits({ residual, teardown, restarts });
   const verdict = summarizeDiscrimination(fits);
@@ -479,9 +503,18 @@ async function main() {
 // `file://${process.argv[1]}` misses when the path holds URL-encoded characters
 // (spaces, `%`) or is reached through a symlink -- and the failure is silent:
 // the script would do nothing and exit 0.
-const invokedDirectly =
-  process.argv[1] !== undefined &&
-  import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href;
+function invokedAsScript() {
+  if (process.argv[1] === undefined) return false;
+  try {
+    return import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href;
+  } catch {
+    // `realpathSync` throws when argv[1] points at nothing. At module scope
+    // that turns a plain `import` of this file into a throw, so the test
+    // runner cannot load it. An unresolvable argv[1] is never this file.
+    return false;
+  }
+}
+const invokedDirectly = invokedAsScript();
 if (invokedDirectly) {
   main().catch((error) => {
     console.error(error instanceof Error ? error.message : String(error));
