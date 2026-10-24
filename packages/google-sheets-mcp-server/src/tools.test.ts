@@ -133,6 +133,18 @@ describe("Google Sheets MCP tools", () => {
     expect(client[clientMethod as keyof GoogleSheetsClient]).toHaveBeenCalled();
   });
 
+  it("surfaces schema validation issues as tool errors without calling Google", async () => {
+    const client = makeClient();
+    const response = await getTool("read_values", client).execute({
+      spreadsheetId: "sheet-1",
+      range: "Sheet1!A1\nB2",
+    });
+
+    expect(response.isError).toBe(true);
+    expect(responseText(response)).toContain("Range must be a single-line A1 notation range.");
+    expect(client.readValues).not.toHaveBeenCalled();
+  });
+
   it("surfaces malformed Google range errors as tool errors", async () => {
     const client = makeClient();
     vi.mocked(client.readValues).mockRejectedValueOnce(new Error("Unable to parse range: Sheet1!bad"));
