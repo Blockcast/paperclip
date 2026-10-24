@@ -1,6 +1,6 @@
-import { and, asc, eq, isNotNull, isNull, lte, not, or, sql } from "drizzle-orm";
+import { and, asc, eq, isNotNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agents, agentWakeupRequests, heartbeatRuns, issueRecoveryActions, issues } from "@paperclipai/db";
+import { agents, agentWakeupRequests, heartbeatRuns } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 import { CCROTATE_CAPACITY_ADVERTISED_RESUME_AT_KEY } from "./ccrotate-capacity-retry.js";
 import { isDispatchRankReady } from "./dispatch-readiness.js";
@@ -815,4 +815,3 @@ export async function refreshScheduledRetryParkHorizonMetrics(db: Db): Promise<v
     throw error;
   }
 }
-
