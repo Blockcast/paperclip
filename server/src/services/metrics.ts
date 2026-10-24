@@ -1096,6 +1096,35 @@ export const DEFERRED_ISSUE_EXECUTION_WAKE_OLDEST_AGE_METRIC =
   "paperclip_deferred_issue_execution_wake_oldest_age_seconds";
 export const DEFERRED_ISSUE_EXECUTION_WAKE_AGE_METRICS_REFRESH_SUCCESS_METRIC =
   "paperclip_deferred_issue_execution_wake_age_metrics_refresh_success";
+// PEN-4545. An `in_review` issue with NO waiting path at all: no live run, no
+// future monitor check, no unexpired park, and no active recovery action. The
+// classifier for this already exists and is correct --
+// `in_review_without_action_path` in recovery/issue-graph-liveness.ts -- but its
+// only consumer is the blocked-inbox attention projection, which is reached
+// solely by an explicit `attention=blocked` list filter. That is a PULL surface,
+// so it renders the state only when some OTHER blocked row happens to depend on
+// the cold one. The agent-facing push surface cannot cover the gap either:
+// `inboxLite` excludes `in_review` BY DESIGN, because review waits are meant to
+// resume on a comment, interaction or monitor wake -- which is exactly what a
+// row in this state no longer has. So the state was computable and unobservable
+// at the same time, and nothing escalated it.
+//
+// Measured 2026-10-24T08:5xZ, company b1d3f3d3, complete 63-row `in_review`
+// population: 25 cold (40%) -- 14 lapsed (monitor fired, never re-armed) and 11
+// never armed (both monitor timestamps null). Oldest 1,366 h. Over the same
+// window exactly ONE `harness_liveness_escalation` was open across 187 ever
+// minted, and it named none of the 25, with the most recent mint 39 h earlier
+// against a 1-5/day baseline.
+//
+// Ages off `updated_at` -- the last time anything at all happened to the row --
+// so the reading is "this row has had neither activity nor a waiting path for N
+// seconds". Labeled by bounded agent_id; the issue id is unbounded cardinality
+// and is logged by the refresh instead, the same split as the deferred-wake
+// gauge above.
+export const COLD_IN_REVIEW_ISSUE_OLDEST_AGE_METRIC =
+  "paperclip_cold_in_review_issue_oldest_age_seconds";
+export const COLD_IN_REVIEW_ISSUE_METRICS_REFRESH_SUCCESS_METRIC =
+  "paperclip_cold_in_review_issue_metrics_refresh_success";
 // BLO-28865. Deliberately NOT a threshold over the pre-existing
 // EXTERNAL_RUNTIME_RESERVATION_OLDEST_AGE_METRIC: that gauge is unlabelled and
 // measures reservation age only, so it cannot separate a stranded row from a
@@ -4162,6 +4191,8 @@ let externalRuntimeReservationOldestAge: Gauge | null = null;
 let queuedRunAgeMetricsRefreshSuccess: Gauge | null = null;
 let deferredIssueExecutionWakeOldestAge: Gauge<"agent_id"> | null = null;
 let deferredIssueExecutionWakeAgeMetricsRefreshSuccess: Gauge | null = null;
+let coldInReviewIssueOldestAge: Gauge<"agent_id"> | null = null;
+let coldInReviewIssueMetricsRefreshSuccess: Gauge | null = null;
 let externalRuntimeReservationsReleasePending: Gauge | null = null;
 let externalRuntimeReservationReleasePendingOldestAge: Gauge | null = null;
 let environmentLeasesOrphanedActive: Gauge | null = null;
@@ -4393,6 +4424,8 @@ function ensureRegistry(): {
   queuedRunAgeMetricsRefreshSuccessGauge: Gauge;
   deferredIssueExecutionWakeOldestAgeGauge: Gauge<"agent_id">;
   deferredIssueExecutionWakeAgeMetricsRefreshSuccessGauge: Gauge;
+  coldInReviewIssueOldestAgeGauge: Gauge<"agent_id">;
+  coldInReviewIssueMetricsRefreshSuccessGauge: Gauge;
   overdueScheduledRetryOldestAgeGauge: Gauge<"agent_id">;
   overdueScheduledRetryAgeMetricsRefreshSuccessGauge: Gauge;
   scheduledRetryParkHorizonGauge: Gauge<"agent_id" | "reason">;
@@ -4555,6 +4588,8 @@ function ensureRegistry(): {
     || !routineFireGapMetricsRefreshSuccess
     || !deferredIssueExecutionWakeOldestAge
     || !deferredIssueExecutionWakeAgeMetricsRefreshSuccess
+    || !coldInReviewIssueOldestAge
+    || !coldInReviewIssueMetricsRefreshSuccess
     || !overdueScheduledRetryOldestAge
     || !overdueScheduledRetryAgeMetricsRefreshSuccess
     || !scheduledRetryParkHorizon
@@ -6097,6 +6132,34 @@ function ensureRegistry(): {
       registers: [registry],
     });
     deferredIssueExecutionWakeAgeMetricsRefreshSuccess.set(0);
+    coldInReviewIssueOldestAge = new Gauge({
+      name: COLD_IN_REVIEW_ISSUE_OLDEST_AGE_METRIC,
+      help:
+        "Age in seconds since `updated_at` of the oldest `in_review` issue assigned to an "
+        + "agent that has NO waiting path at all: no live run, no future monitor check, no "
+        + "unexpired park, and no active recovery action (PEN-4545). Such a row is finished "
+        + "work that nothing will ever come back to -- `inboxLite` excludes `in_review` by "
+        + "design, so no heartbeat re-picks it, and the existing "
+        + "`in_review_without_action_path` classifier renders only through the "
+        + "`attention=blocked` pull filter, i.e. only when some OTHER blocked row depends on "
+        + "it. Reads 0 for an agent with nothing cold rather than going absent, because an "
+        + "absent series and \"nothing stuck\" render identically on a dashboard. Refreshed "
+        + "on the scrape-metrics collector tick and reset-then-set every refresh, so a "
+        + "repaired row drops the agent back to 0 instead of freezing at its last value.",
+      labelNames: ["agent_id"],
+      registers: [registry],
+    });
+    coldInReviewIssueMetricsRefreshSuccess = new Gauge({
+      name: COLD_IN_REVIEW_ISSUE_METRICS_REFRESH_SUCCESS_METRIC,
+      help:
+        "1 when the most recent cold-`in_review` database refresh completed before metrics "
+        + "exposition; 0 when it failed, so a stale cold-row age cannot be read as fresh. "
+        + "Separate from " + DEFERRED_ISSUE_EXECUTION_WAKE_AGE_METRICS_REFRESH_SUCCESS_METRIC
+        + " because the two refreshes run different aggregates against different indexes and "
+        + "can fail independently.",
+      registers: [registry],
+    });
+    coldInReviewIssueMetricsRefreshSuccess.set(0);
     overdueScheduledRetryOldestAge = new Gauge({
       name: OVERDUE_SCHEDULED_RETRY_OLDEST_AGE_METRIC,
       help:
@@ -6903,6 +6966,8 @@ function ensureRegistry(): {
     deferredIssueExecutionWakeOldestAgeGauge: deferredIssueExecutionWakeOldestAge,
     deferredIssueExecutionWakeAgeMetricsRefreshSuccessGauge:
       deferredIssueExecutionWakeAgeMetricsRefreshSuccess,
+    coldInReviewIssueOldestAgeGauge: coldInReviewIssueOldestAge,
+    coldInReviewIssueMetricsRefreshSuccessGauge: coldInReviewIssueMetricsRefreshSuccess,
     overdueScheduledRetryOldestAgeGauge: overdueScheduledRetryOldestAge,
     overdueScheduledRetryAgeMetricsRefreshSuccessGauge: overdueScheduledRetryAgeMetricsRefreshSuccess,
     scheduledRetryParkHorizonGauge: scheduledRetryParkHorizon,
@@ -7698,6 +7763,39 @@ export function setDeferredIssueExecutionWakeOldestAgeMetrics(
 /** Mark whether the deferred-issue-execution wake age gauge was refreshed from the database. */
 export function setDeferredIssueExecutionWakeAgeMetricsRefreshSuccess(success: boolean): void {
   ensureRegistry().deferredIssueExecutionWakeAgeMetricsRefreshSuccessGauge.set(success ? 1 : 0);
+}
+
+/**
+ * Publish the oldest cold-`in_review` age for each agent (PEN-4545). Same
+ * bounded-label and explicit-zero contract as
+ * {@link setDeferredIssueExecutionWakeOldestAgeMetrics}: every known agent is
+ * written on every refresh so a repaired fleet reads 0 rather than going
+ * absent, and an unrecognised assignee folds into the single UNKNOWN_AGENT_ID
+ * bucket, published only when something actually landed in it.
+ */
+export function setColdInReviewIssueOldestAgeMetrics(
+  entries: ReadonlyArray<{ agentId: string | null | undefined; ageSeconds: number }>,
+  knownAgentIds: ReadonlySet<string>,
+): void {
+  const gauge = ensureRegistry().coldInReviewIssueOldestAgeGauge;
+  gauge.reset();
+  const oldestByAgentId = new Map<string, number>();
+  for (const entry of entries) {
+    const agentId = normalizeAgentId(entry.agentId, knownAgentIds);
+    const ageSeconds = Number.isFinite(entry.ageSeconds) ? Math.max(0, entry.ageSeconds) : 0;
+    const current = oldestByAgentId.get(agentId);
+    if (current === undefined || ageSeconds > current) oldestByAgentId.set(agentId, ageSeconds);
+  }
+  for (const agentId of knownAgentIds) {
+    gauge.set({ agent_id: agentId }, oldestByAgentId.get(agentId) ?? 0);
+  }
+  const unknownAge = oldestByAgentId.get(UNKNOWN_AGENT_ID);
+  if (unknownAge !== undefined) gauge.set({ agent_id: UNKNOWN_AGENT_ID }, unknownAge);
+}
+
+/** Mark whether the cold-`in_review` age gauge was refreshed from the database. */
+export function setColdInReviewIssueMetricsRefreshSuccess(success: boolean): void {
+  ensureRegistry().coldInReviewIssueMetricsRefreshSuccessGauge.set(success ? 1 : 0);
 }
 
 /**
@@ -9828,6 +9926,8 @@ export function __resetMetricsForTest(): void {
   routineFireGapMetricsRefreshSuccess = null;
   deferredIssueExecutionWakeOldestAge = null;
   deferredIssueExecutionWakeAgeMetricsRefreshSuccess = null;
+  coldInReviewIssueOldestAge = null;
+  coldInReviewIssueMetricsRefreshSuccess = null;
   overdueScheduledRetryOldestAge = null;
   overdueScheduledRetryAgeMetricsRefreshSuccess = null;
   scheduledRetryParkHorizon = null;

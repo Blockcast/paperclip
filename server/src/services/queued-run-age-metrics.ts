@@ -1,6 +1,6 @@
-import { and, asc, eq, isNotNull, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNotNull, isNull, lte, not, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agents, agentWakeupRequests, heartbeatRuns } from "@paperclipai/db";
+import { agents, agentWakeupRequests, heartbeatRuns, issueRecoveryActions, issues } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 import { CCROTATE_CAPACITY_ADVERTISED_RESUME_AT_KEY } from "./ccrotate-capacity-retry.js";
 import { isDispatchRankReady } from "./dispatch-readiness.js";
@@ -8,6 +8,8 @@ import { listIssueDependencyReadinessMap } from "./issues.js";
 import type { QueuedRunAgentIdentity } from "./metrics.js";
 import {
   UNKNOWN_AGENT_ID,
+  setColdInReviewIssueMetricsRefreshSuccess,
+  setColdInReviewIssueOldestAgeMetrics,
   setDeferredIssueExecutionWakeAgeMetricsRefreshSuccess,
   setDeferredIssueExecutionWakeOldestAgeMetrics,
   setOverdueScheduledRetryAgeMetrics,
@@ -812,6 +814,122 @@ export async function refreshScheduledRetryParkHorizonMetrics(db: Db): Promise<v
     setScheduledRetryParkHorizonRefreshSuccess(true);
   } catch (error) {
     setScheduledRetryParkHorizonRefreshSuccess(false);
+    throw error;
+  }
+}
+
+/** Run statuses that still constitute a live claim on an issue. */
+const COLD_IN_REVIEW_LIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
+/** Recovery-action statuses that still constitute an owned action path. */
+const COLD_IN_REVIEW_ACTIVE_RECOVERY_STATUSES = ["active", "escalated"] as const;
+
+/**
+ * Refresh the per-agent oldest cold-`in_review`-issue gauge (PEN-4545).
+ *
+ * "Cold" is the five-signal predicate the agent-facing liveness discipline
+ * already uses, evaluated in SQL: an `in_review` row assigned to an agent with
+ * no live run, no future `monitor_next_check_at`, no unexpired `parked_until`,
+ * and no active `issue_recovery_actions` row. It is the same state the
+ * `in_review_without_action_path` classifier computes in
+ * `recovery/issue-graph-liveness.ts` -- this function does NOT re-decide it,
+ * it makes it observable. That classifier's only consumer is the blocked-inbox
+ * attention projection, reached solely by an explicit `attention=blocked` list
+ * filter, so today the state renders only when some OTHER blocked row depends
+ * on the cold one. A cold row nothing depends on is computed and displayed
+ * nowhere.
+ *
+ * Deliberately a gauge rather than an escalation: minting is already wired
+ * (`harness_liveness_escalation`) and is not what failed. Measured 2026-10-24,
+ * company b1d3f3d3: 25 of 63 `in_review` rows cold, against exactly ONE open
+ * escalation out of 187 ever minted, naming none of them. An unobservable
+ * detector cannot be tuned, and a gauge is the cheapest thing that makes the
+ * rate visible before anyone changes minting policy.
+ *
+ * A monitor whose `next_check_at` has already PASSED counts as cold, not
+ * attended -- that is the dominant "lapsed" signature (14 of the 25 measured),
+ * where a monitor fired and the waking run never re-armed it. Treating a past
+ * timestamp as attendance would make the gauge blind to exactly the half that
+ * fails most often. The same `<= now` rule applies to `parked_until`, matching
+ * the schema's own note that park suppression is keyed on the timestamp being
+ * in the future so a park expires rather than persisting by default.
+ *
+ * Ages off `updated_at` rather than a monitor timestamp because half the
+ * population never armed one at all (11 of 25, both monitor columns null), so
+ * any monitor-derived age is null for precisely the rows with no carrier.
+ *
+ * Queries every agent id, like the queued-run sibling, so an agent with
+ * nothing cold reads back an explicit 0 rather than an absent series.
+ */
+export async function refreshColdInReviewIssueMetrics(db: Db, now = new Date()): Promise<void> {
+  try {
+    const [agentRows, coldRows] = await Promise.all([
+      db.select({ id: agents.id }).from(agents),
+      db
+        .select({
+          agentId: issues.assigneeAgentId,
+          issueId: issues.id,
+          identifier: issues.identifier,
+          ageSeconds: sql<number | string>`extract(epoch from ${now.toISOString()}::timestamptz - ${issues.updatedAt})`,
+        })
+        .from(issues)
+        .where(
+          and(
+            eq(issues.status, "in_review"),
+            isNotNull(issues.assigneeAgentId),
+            isNull(issues.hiddenAt),
+            or(isNull(issues.monitorNextCheckAt), lte(issues.monitorNextCheckAt, now)),
+            or(isNull(issues.parkedUntil), lte(issues.parkedUntil, now)),
+            not(
+              sql`exists (
+                select 1 from ${heartbeatRuns} hr
+                where (hr.id = ${issues.executionRunId}
+                       or hr.id = ${issues.checkoutRunId}
+                       or hr.context_issue_id = ${issues.id}::text)
+                  and hr.status in ${COLD_IN_REVIEW_LIVE_RUN_STATUSES}
+              )`,
+            ),
+            not(
+              sql`exists (
+                select 1 from ${issueRecoveryActions} ira
+                where ira.source_issue_id = ${issues.id}
+                  and ira.status in ${COLD_IN_REVIEW_ACTIVE_RECOVERY_STATUSES}
+              )`,
+            ),
+          ),
+        ),
+    ]);
+
+    const knownAgentIds = new Set(agentRows.map((row) => row.id));
+    setColdInReviewIssueOldestAgeMetrics(
+      coldRows.map((row) => ({
+        agentId: row.agentId,
+        // Clamp: `updated_at` can sit marginally ahead of `now` across a clock
+        // skew between the writer and this refresh, which would otherwise
+        // publish a negative age.
+        ageSeconds: Math.max(0, Number(row.ageSeconds)),
+      })),
+      knownAgentIds,
+    );
+    setColdInReviewIssueMetricsRefreshSuccess(true);
+    if (coldRows.length > 0) {
+      // The issue id is unbounded cardinality and must not become a label, so
+      // the identifiers go to the log instead -- the same split the
+      // deferred-wake refresh uses. Bounded to keep a fleet-wide regression
+      // from writing an unbounded log line every tick.
+      logger.info(
+        {
+          coldCount: coldRows.length,
+          sample: coldRows
+            .slice()
+            .sort((a, b) => Number(b.ageSeconds) - Number(a.ageSeconds))
+            .slice(0, 20)
+            .map((row) => ({ issueId: row.issueId, identifier: row.identifier })),
+        },
+        "cold in_review issues have no waiting path (PEN-4545)",
+      );
+    }
+  } catch (error) {
+    setColdInReviewIssueMetricsRefreshSuccess(false);
     throw error;
   }
 }
