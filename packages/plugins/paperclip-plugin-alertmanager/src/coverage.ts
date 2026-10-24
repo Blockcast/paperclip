@@ -32,7 +32,8 @@ import { decideRefire, findActiveAggregateIssue, handleWebhook } from "./webhook
  * delivery, which for an already-firing alert is one `repeat_interval` (1h)
  * away. That gap paged critical on its own. The pass instead hands the alert to
  * the webhook path itself, so the reopen happens now; only a replay that fails
- * counts as uncovered.
+ * counts as uncovered, judged by re-classifying afterwards — a replay that
+ * returns without reopening (filter, opt-out, permanent error) is a gap too.
  *
  * Known limit: an operator-closed row whose state record carries no
  * suppression anchor stays exempt, because `decideRefire` says so. That is the
@@ -176,12 +177,19 @@ export async function runCoverageCheck(
   if (toReopen.length > 0) {
     try {
       await replay(ctx, config, companyId, toReopen);
-      ctx.logger.info(`alert-coverage: reopened ${toReopen.length} row(s) whose operator suppression expired`);
     } catch (err) {
-      // The reopen did not land, so the gap is real: report it.
       ctx.logger.warn(`alert-coverage: suppression-expiry reopen failed: ${String(err)}`);
-      toReopen.forEach(flag);
     }
+    // "replay did not throw" is not "row reopened": handleWebhook returns
+    // normally on label-filter / opt-out / permanent-error no-ops. Judge by
+    // the outcome — re-classify, and anything not now covered is the gap.
+    let reopened = 0;
+    for (const alert of toReopen) {
+      const after = await classifyAlertCoverage(ctx, companyId, alert, config, now).catch(() => "uncovered" as const);
+      if (after === "covered") reopened += 1;
+      else flag(alert);
+    }
+    ctx.logger.info(`alert-coverage: reopened ${reopened}/${toReopen.length} row(s) whose operator suppression expired`);
   }
   for (const { alertname, severity, count } of uncovered.values()) {
     await ctx.metrics.write("alertmanager.coverage.uncovered", count, { alertname, severity });
