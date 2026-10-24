@@ -16,7 +16,12 @@ import test from "node:test";
 // package.json's securityAuditRemediations ledger (GHSA-72gw-mp4g-v24j,
 // GHSA-3p4h-7m6x-2hcm) were patched in 2.2.0 and remain addressed, since
 // 2.3.0 is above their floor too.
-const PATCHED_FLOOR = [2, 3, 0];
+//
+// BLO-48924 / Dependabot alert Blockcast/paperclip#258: GHSA-q7qp-rjg7-q26m
+// (CVE-2026-113872), DoS via a pending async fileFilter after request
+// teardown, moved the floor 2.3.0 -> 2.5.0. Every advisory above patches
+// lower, so they all remain addressed.
+const PATCHED_FLOOR = [2, 5, 0];
 
 function isBelowFloor([major, minor, patch]) {
   const [floorMajor, floorMinor, floorPatch] = PATCHED_FLOOR;
@@ -25,24 +30,28 @@ function isBelowFloor([major, minor, patch]) {
   return patch < floorPatch;
 }
 
-test("multer resolves above the GHSA-535w-7cp7-47q4 patched floor", async () => {
+test("multer resolves above the GHSA-q7qp-rjg7-q26m patched floor", async () => {
   const packageJson = JSON.parse(await readFile("package.json", "utf8"));
   const serverPackageJson = JSON.parse(
     await readFile("server/package.json", "utf8"),
   );
   const lockfile = await readFile("pnpm-lock.yaml", "utf8");
 
-  assert.equal(packageJson.pnpm.overrides.multer, ">=2.3.0 <3");
-  assert.equal(serverPackageJson.dependencies.multer, "^2.3.0");
+  assert.equal(packageJson.pnpm.overrides.multer, ">=2.5.0 <3");
+  assert.equal(serverPackageJson.dependencies.multer, "^2.5.0");
 
   // Keep the advisory ledger honest about why the floor is where it is: a
   // range bump with no recorded advisory is indistinguishable from a
   // routine version bump, and the next person to widen it has nothing to read.
   const ledger = packageJson.securityAuditRemediations["PEN-1198"].multer;
-  assert.equal(ledger.patchedRange, ">=2.3.0 <3");
+  assert.equal(ledger.patchedRange, ">=2.5.0 <3");
   assert.ok(
     ledger.advisories.includes("GHSA-535w-7cp7-47q4"),
     "securityAuditRemediations ledger missing GHSA-535w-7cp7-47q4",
+  );
+  assert.ok(
+    ledger.advisories.includes("GHSA-q7qp-rjg7-q26m"),
+    "securityAuditRemediations ledger missing GHSA-q7qp-rjg7-q26m",
   );
 
   // Match a trailing ':' or '(' so a peer-suffixed entry is not skipped —

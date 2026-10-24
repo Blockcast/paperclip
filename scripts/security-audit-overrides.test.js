@@ -107,7 +107,7 @@ async function main() {
     }
     assertIncludes(lockfile, "undici@6.29.0:", "lockfile");
     assertIncludes(lockfile, "undici@7.30.0:", "lockfile");
-    assertIncludes(lockfile, "multer@2.3.0:", "lockfile");
+    assertIncludes(lockfile, "multer@2.5.0:", "lockfile");
     assertIncludes(lockfile, "'@babel/core@7.29.7':", "lockfile");
     assertIncludes(lockfile, "esbuild@0.28.1:", "lockfile");
     assertIncludes(lockfile, "js-yaml@4.3.2:", "lockfile");
