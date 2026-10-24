@@ -1,4 +1,4 @@
-import { and, asc, eq, inArray, isNotNull, isNull, lte, not, or, sql } from "drizzle-orm";
+import { and, asc, eq, isNotNull, isNull, lte, not, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agents, agentWakeupRequests, heartbeatRuns, issueRecoveryActions, issues } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
@@ -818,10 +818,20 @@ export async function refreshScheduledRetryParkHorizonMetrics(db: Db): Promise<v
   }
 }
 
-/** Run statuses that still constitute a live claim on an issue. */
+/**
+ * Run statuses that still constitute a live claim on an issue, and
+ * recovery-action statuses that still constitute an owned action path.
+ *
+ * Expanded through `sql.join` at the use site, never interpolated as a bare
+ * JS array: `sql`... in ${["a", "b"]}`` binds the whole array as ONE parameter
+ * rather than expanding an IN list, which silently matches nothing and would
+ * make every attended row read as cold.
+ */
 const COLD_IN_REVIEW_LIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
-/** Recovery-action statuses that still constitute an owned action path. */
 const COLD_IN_REVIEW_ACTIVE_RECOVERY_STATUSES = ["active", "escalated"] as const;
+
+const sqlStatusList = (statuses: ReadonlyArray<string>) =>
+  sql.join(statuses.map((status) => sql`${status}`), sql`, `);
 
 /**
  * Refresh the per-agent oldest cold-`in_review`-issue gauge (PEN-4545).
@@ -885,14 +895,14 @@ export async function refreshColdInReviewIssueMetrics(db: Db, now = new Date()):
                 where (hr.id = ${issues.executionRunId}
                        or hr.id = ${issues.checkoutRunId}
                        or hr.context_issue_id = ${issues.id}::text)
-                  and hr.status in ${COLD_IN_REVIEW_LIVE_RUN_STATUSES}
+                  and hr.status in (${sqlStatusList(COLD_IN_REVIEW_LIVE_RUN_STATUSES)})
               )`,
             ),
             not(
               sql`exists (
                 select 1 from ${issueRecoveryActions} ira
                 where ira.source_issue_id = ${issues.id}
-                  and ira.status in ${COLD_IN_REVIEW_ACTIVE_RECOVERY_STATUSES}
+                  and ira.status in (${sqlStatusList(COLD_IN_REVIEW_ACTIVE_RECOVERY_STATUSES)})
               )`,
             ),
           ),
