@@ -562,3 +562,27 @@ describe("successful run handoff decision", () => {
     expect(isSuccessfulRunHandoffRequiredNoticeBody("Unrelated comment")).toBe(false);
   });
 });
+
+describe("successful run handoff notice metadata bounds (BLO-48950)", () => {
+  it("truncates over-long issue titles and agent names so the notice passes the comment-metadata schema", async () => {
+    const { issueCommentMetadataSchema } = await import("@paperclipai/shared");
+    const longIssue = { id: "11111111-1111-4111-8111-111111111111", identifier: "BLO-1", title: "x".repeat(300), status: "in_progress" };
+    const longAgent = { id: "22222222-2222-4222-8222-222222222222", name: "a".repeat(200) };
+    const notice = buildSuccessfulRunHandoffExhaustedNotice({
+      issue: longIssue,
+      sourceRun: null,
+      correctiveRun: null,
+      sourceAssignee: longAgent,
+      recoveryIssue: longIssue,
+      recoveryOwner: longAgent,
+      latestIssueStatus: "in_progress",
+      latestHandoffRunStatus: "succeeded",
+      missingDisposition: "none",
+    });
+    const parsed = issueCommentMetadataSchema.safeParse(notice.metadata);
+    expect(parsed.success).toBe(true);
+    const row = notice.metadata.sections[0]!.rows[0] as { title?: string };
+    expect(row.title).toHaveLength(240);
+    expect(row.title!.endsWith("...")).toBe(true);
+  });
+});

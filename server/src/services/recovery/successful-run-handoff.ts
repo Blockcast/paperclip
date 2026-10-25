@@ -113,6 +113,17 @@ function metadataText(value: unknown, fallback = "unknown") {
   return resolved.length > 2000 ? `${resolved.slice(0, 1997)}...` : resolved;
 }
 
+// BLO-48950: link-row titles/names are capped by `issueCommentMetadataRowSchema`
+// (issue_link title 240, agent_link name 160) but the values come from unbounded
+// columns. One ~300-char issue title failed the whole notice on every stranded pass,
+// so that issue was never escalated. Returns undefined for blank input because the
+// schema also requires min(1) after trim.
+function boundedLinkText(value: string | null | undefined, max: number) {
+  const text = value?.trim() ?? "";
+  if (!text) return undefined;
+  return text.length > max ? `${text.slice(0, max - 3).trimEnd()}...` : text;
+}
+
 function keyValueRow(label: string, value: unknown): IssueCommentMetadata["sections"][number]["rows"][number] {
   return { type: "key_value", label, value: metadataText(value) };
 }
@@ -127,7 +138,7 @@ function issueLinkRow(
     label,
     issueId: issue.id,
     identifier: issue.identifier,
-    title: issue.title,
+    title: boundedLinkText(issue.title, 240),
   };
 }
 
@@ -144,7 +155,7 @@ function agentLinkRow(
   agent: NullableNoticeAgent,
 ): IssueCommentMetadata["sections"][number]["rows"][number] {
   if (!agent) return keyValueRow(label, "unknown");
-  return { type: "agent_link", label, agentId: agent.id, name: agent.name };
+  return { type: "agent_link", label, agentId: agent.id, name: boundedLinkText(agent.name, 160) };
 }
 
 function systemNoticePresentation(input: {
