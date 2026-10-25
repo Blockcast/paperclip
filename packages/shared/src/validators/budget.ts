@@ -8,14 +8,14 @@ import {
 
 export const upsertBudgetPolicySchema = z.object({
   scopeType: z.enum(BUDGET_SCOPE_TYPES),
-  scopeId: z.string().uuid(),
-  metric: z.enum(BUDGET_METRICS).optional().default("billed_cents"),
-  windowKind: z.enum(BUDGET_WINDOW_KINDS).optional().default("calendar_month_utc"),
+  scopeId: z.string().guid(),
+  metric: z.enum(BUDGET_METRICS).prefault("billed_cents"),
+  windowKind: z.enum(BUDGET_WINDOW_KINDS).prefault("calendar_month_utc"),
   amount: z.number().int().nonnegative(),
-  warnPercent: z.number().int().min(1).max(99).optional().default(80),
-  hardStopEnabled: z.boolean().optional().default(true),
-  notifyEnabled: z.boolean().optional().default(true),
-  isActive: z.boolean().optional().default(true),
+  warnPercent: z.number().int().min(1).max(99).prefault(80),
+  hardStopEnabled: z.boolean().prefault(true),
+  notifyEnabled: z.boolean().prefault(true),
+  isActive: z.boolean().prefault(true),
 });
 
 export type UpsertBudgetPolicy = z.infer<typeof upsertBudgetPolicySchema>;

@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { optionalNoDefault } from "../zod-compat.js";
 
 const workspaceFileListSearchMaxBytes = 128;
 
@@ -7,18 +8,18 @@ function utf8ByteLength(value: string) {
 }
 
 export const workspaceFileWorkspaceKindSchema = z.enum(["execution_workspace", "project_workspace"]);
-export const workspaceFileSelectorSchema = z.enum(["auto", "execution", "project"]).default("auto");
-export const workspaceFileListModeSchema = z.enum(["all", "recent", "changed"]).default("all");
+export const workspaceFileSelectorSchema = z.enum(["auto", "execution", "project"]).prefault("auto");
+export const workspaceFileListModeSchema = z.enum(["all", "recent", "changed"]).prefault("all");
 export const workspaceFilePreviewKindSchema = z.enum(["text", "image", "video", "pdf", "unsupported"]);
 export const workspaceFileResourceKindSchema = z.enum(["file", "directory", "remote_resource"]);
 
 export const workspaceFileRefSchema = z.object({
   kind: z.literal("workspace_file"),
-  issueId: z.string().uuid().optional(),
-  projectId: z.string().uuid().optional(),
+  issueId: z.string().guid().optional(),
+  projectId: z.string().guid().optional(),
   projectName: z.string().min(1).optional(),
   workspaceKind: workspaceFileWorkspaceKindSchema,
-  workspaceId: z.string().uuid(),
+  workspaceId: z.string().guid(),
   relativePath: z.string().min(1),
   line: z.number().int().positive().nullable().optional(),
   column: z.number().int().positive().nullable().optional(),
@@ -26,8 +27,8 @@ export const workspaceFileRefSchema = z.object({
 });
 
 export const workspaceFileResourceQuerySchema = z.object({
-  projectId: z.string().uuid().optional(),
-  workspaceId: z.string().uuid().optional(),
+  projectId: z.string().guid().optional(),
+  workspaceId: z.string().guid().optional(),
   path: z
     .string()
     .min(1)
@@ -35,7 +36,7 @@ export const workspaceFileResourceQuerySchema = z.object({
       message: "Workspace file path contains an invalid character",
       params: { code: "invalid_path" },
     }),
-  workspace: workspaceFileSelectorSchema.optional(),
+  workspace: optionalNoDefault(workspaceFileSelectorSchema),
 }).refine((value) => Boolean(value.projectId) === Boolean(value.workspaceId), {
   message: "Workspace file target requires both projectId and workspaceId",
   path: ["workspaceId"],
@@ -43,9 +44,9 @@ export const workspaceFileResourceQuerySchema = z.object({
 });
 
 export const workspaceFileListQuerySchema = z.object({
-  projectId: z.string().uuid().optional(),
-  workspaceId: z.string().uuid().optional(),
-  workspace: workspaceFileSelectorSchema.optional(),
+  projectId: z.string().guid().optional(),
+  workspaceId: z.string().guid().optional(),
+  workspace: optionalNoDefault(workspaceFileSelectorSchema),
   path: z
     .string()
     .min(1)
@@ -54,7 +55,7 @@ export const workspaceFileListQuerySchema = z.object({
       params: { code: "invalid_path" },
     })
     .optional(),
-  mode: workspaceFileListModeSchema.optional(),
+  mode: optionalNoDefault(workspaceFileListModeSchema),
   q: z
     .string()
     .refine((value) => !/[\x00-\x1f\x7f]/.test(value), {
@@ -66,8 +67,8 @@ export const workspaceFileListQuerySchema = z.object({
       params: { code: "invalid_query" },
     })
     .optional(),
-  limit: z.coerce.number().int().min(1).max(100).default(25),
-  offset: z.coerce.number().int().min(0).max(10_000).default(0),
+  limit: z.coerce.number().int().min(1).max(100).prefault(25),
+  offset: z.coerce.number().int().min(0).max(10_000).prefault(0),
 }).refine((value) => Boolean(value.projectId) === Boolean(value.workspaceId), {
   message: "Workspace file target requires both projectId and workspaceId",
   path: ["workspaceId"],
@@ -81,8 +82,8 @@ export const resolvedWorkspaceResourceSchema = z.object({
   displayPath: z.string().min(1),
   workspaceLabel: z.string().min(1),
   workspaceKind: workspaceFileWorkspaceKindSchema,
-  workspaceId: z.string().uuid(),
-  projectId: z.string().uuid().nullable().optional(),
+  workspaceId: z.string().guid(),
+  projectId: z.string().guid().nullable().optional(),
   projectName: z.string().min(1).nullable().optional(),
   contentType: z.string().nullable().optional(),
   byteSize: z.number().int().nonnegative().nullable().optional(),

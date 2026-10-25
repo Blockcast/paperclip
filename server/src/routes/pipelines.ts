@@ -68,6 +68,7 @@ import {
   type PipelineCaseLiveness,
   type PipelineHealthFailedAutomationInput,
   type PipelineHealthStageInput,
+  optionalNoDefault,
 } from "@paperclipai/shared";
 import {
   publicPipelineStageConfig,
@@ -95,15 +96,15 @@ type PipelineRouteDb = Db | DbTransaction;
 
 const stageKindSchema = z.enum(["open", "working", "review", "done", "cancelled"]);
 const jsonObjectSchema = z.record(z.string(), z.unknown());
-const stageConfigSchema = z.record(z.string(), z.unknown()).default({});
+const stageConfigSchema = z.record(z.string(), z.unknown()).prefault({});
 const casePatchSchema = z.object({
   title: z.string().trim().min(1).max(500).optional(),
   summary: z.string().max(8_000).nullable().optional(),
   fields: jsonObjectSchema.optional(),
   workspaceRef: jsonObjectSchema.nullable().optional(),
-  parentCaseId: z.string().uuid().nullable().optional(),
+  parentCaseId: z.string().guid().nullable().optional(),
   expectedVersion: z.number().int().positive().optional(),
-  leaseToken: z.string().uuid().nullable().optional(),
+  leaseToken: z.string().guid().nullable().optional(),
 });
 const ingestCaseSchema = z.object({
   caseKey: z.string().max(1_024).nullable().optional(),
@@ -111,24 +112,24 @@ const ingestCaseSchema = z.object({
   summary: z.string().max(8_000).nullable().optional(),
   fields: jsonObjectSchema.optional(),
   stageKey: z.string().trim().min(1).max(120).optional(),
-  parentCaseId: z.string().uuid().nullable().optional(),
+  parentCaseId: z.string().guid().nullable().optional(),
   requestKey: z.string().trim().min(1).max(512).optional(),
   workspaceRef: jsonObjectSchema.nullable().optional(),
-  blockedByCaseIds: z.array(z.string().uuid()).max(100).optional(),
+  blockedByCaseIds: z.array(z.string().guid()).max(100).optional(),
   blockedByCaseKeys: z.array(z.string().max(1_024)).max(100).optional(),
 });
 const createPipelineSchema = z.object({
   key: z.string().trim().min(1).max(120),
   name: z.string().trim().min(1).max(200),
   description: z.string().max(8_000).nullable().optional(),
-  projectId: z.string().uuid().nullable().optional(),
+  projectId: z.string().guid().nullable().optional(),
   enforceTransitions: z.boolean().optional(),
   stages: z.array(z.object({
     key: z.string().trim().min(1).max(120),
     name: z.string().trim().min(1).max(200),
     kind: stageKindSchema,
     position: z.number().int().optional(),
-    config: stageConfigSchema.optional(),
+    config: optionalNoDefault(stageConfigSchema),
   })).optional(),
 });
 const updatePipelineSchema = z.object({
@@ -142,18 +143,18 @@ const createStageSchema = z.object({
   name: z.string().trim().min(1).max(200),
   kind: stageKindSchema,
   position: z.number().int(),
-  config: stageConfigSchema.optional(),
+  config: optionalNoDefault(stageConfigSchema),
 });
 const updateStageSchema = z.object({
   key: z.string().trim().min(1).max(120).optional(),
   name: z.string().trim().min(1).max(200).optional(),
   kind: stageKindSchema.optional(),
   position: z.number().int().optional(),
-  config: stageConfigSchema.optional(),
+  config: optionalNoDefault(stageConfigSchema),
 });
 const updateStageAutomationEnvSchema = z.object({
   env: envConfigSchema.nullable(),
-  baseRoutineRevisionId: z.string().uuid().nullable().optional(),
+  baseRoutineRevisionId: z.string().guid().nullable().optional(),
 });
 const replaceTransitionsSchema = z.object({
   transitions: z.array(z.object({
@@ -174,16 +175,16 @@ const breakdownCaseSchema = z.object({
 });
 const claimCaseSchema = z.object({ leaseSeconds: z.number().int().positive().max(86_400).optional() });
 const releaseCaseSchema = z.object({
-  leaseToken: z.string().uuid().nullable().optional(),
+  leaseToken: z.string().guid().nullable().optional(),
   force: z.boolean().optional(),
 });
 const transitionCaseSchema = z.object({
   toStageKey: z.string().trim().min(1).max(120),
   expectedVersion: z.number().int().positive(),
-  leaseToken: z.string().uuid().nullable().optional(),
+  leaseToken: z.string().guid().nullable().optional(),
   reason: z.string().max(4_000).nullable().optional(),
   force: z.boolean().optional(),
-  acceptSuggestionId: z.string().uuid().optional(),
+  acceptSuggestionId: z.string().guid().optional(),
 });
 const suggestTransitionSchema = z.object({
   toStageKey: z.string().trim().min(1).max(120),
@@ -191,52 +192,52 @@ const suggestTransitionSchema = z.object({
   confidence: z.number().min(0).max(1).optional(),
 });
 const resolveSuggestionSchema = z.object({
-  suggestionId: z.string().uuid(),
+  suggestionId: z.string().guid(),
   resolution: z.enum(["accept", "dismiss"]),
   expectedVersion: z.number().int().positive().optional(),
   reason: z.string().max(4_000).nullable().optional(),
-  leaseToken: z.string().uuid().nullable().optional(),
+  leaseToken: z.string().guid().nullable().optional(),
 });
 const acknowledgeDriftSchema = z.object({
   expectedVersion: z.number().int().positive().optional(),
 });
 const retryAutomationQuerySchema = z.object({
-  scope: pipelineAutomationRetryScopeSchema.default("previous_stage"),
-  targetStageId: z.string().uuid().optional(),
+  scope: pipelineAutomationRetryScopeSchema.prefault("previous_stage"),
+  targetStageId: z.string().guid().optional(),
 });
 const reviewEditsSchema = z.object({
   title: z.string().trim().min(1).max(500).optional(),
   summary: z.string().max(8_000).nullable().optional(),
   fields: jsonObjectSchema.optional(),
-  parentCaseId: z.string().uuid().nullable().optional(),
+  parentCaseId: z.string().guid().nullable().optional(),
 });
 const reviewCaseSchema = z.object({
   decision: z.enum(["approve", "reject", "request_changes"]),
   reason: z.string().max(4_000).nullable().optional(),
   edits: reviewEditsSchema.optional(),
   expectedVersion: z.number().int().positive(),
-  leaseToken: z.string().uuid().nullable().optional(),
+  leaseToken: z.string().guid().nullable().optional(),
 });
-const blockersSchema = z.object({ blockedByCaseIds: z.array(z.string().uuid()).max(100) });
+const blockersSchema = z.object({ blockedByCaseIds: z.array(z.string().guid()).max(100) });
 const issueLinkRoleSchema = z.enum(["origin", "conversation", "work", "automation"]);
 const createIssueLinkSchema = z.object({
-  issueId: z.string().uuid(),
+  issueId: z.string().guid(),
   role: issueLinkRoleSchema,
 });
 const bulkReviewSchema = z.object({
-  items: z.array(reviewCaseSchema.extend({ caseId: z.string().uuid() })).max(100),
+  items: z.array(reviewCaseSchema.extend({ caseId: z.string().guid() })).max(100),
 });
 const upsertPipelineDocumentSchema = z.object({
   title: z.string().trim().min(1).max(200).optional(),
   body: z.string().max(200_000),
-  baseRevisionId: z.string().uuid().nullable().optional(),
+  baseRevisionId: z.string().guid().nullable().optional(),
 });
 const upsertPipelineCaseDocumentSchema = z.object({
   title: z.string().trim().min(1).max(200).optional(),
-  format: z.string().trim().min(1).max(80).optional().default("markdown"),
+  format: z.string().trim().min(1).max(80).prefault("markdown"),
   body: z.string().max(200_000),
   changeSummary: z.string().trim().max(1_000).nullable().optional(),
-  baseRevisionId: z.string().uuid().nullable().optional(),
+  baseRevisionId: z.string().guid().nullable().optional(),
 });
 const intakeFieldTypes = new Set(["select", "text", "multiline"]);
 

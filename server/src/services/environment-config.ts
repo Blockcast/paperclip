@@ -33,28 +33,28 @@ import { resolveActiveEnvironmentCustomImageTemplateForRuntime } from "./environ
 
 const secretRefSchema = z.object({
   type: z.literal("secret_ref"),
-  secretId: z.string().uuid(),
-  version: z.union([z.literal("latest"), z.number().int().positive()]).optional().default("latest"),
+  secretId: z.string().guid(),
+  version: z.union([z.literal("latest"), z.number().int().positive()]).prefault("latest"),
 }).strict();
 
 const sshEnvironmentConfigSchema = z.object({
-  host: z.string({ required_error: "SSH environments require a host." }).trim().min(1, "SSH environments require a host."),
-  port: z.coerce.number().int().min(1).max(65535).default(22),
-  username: z.string({ required_error: "SSH environments require a username." }).trim().min(1, "SSH environments require a username."),
+  host: z.string({ error: (issue) => (issue.input === undefined ? "SSH environments require a host." : undefined) }).trim().min(1, "SSH environments require a host."),
+  port: z.coerce.number().int().min(1).max(65535).prefault(22),
+  username: z.string({ error: (issue) => (issue.input === undefined ? "SSH environments require a username." : undefined) }).trim().min(1, "SSH environments require a username."),
   remoteWorkspacePath: z
-    .string({ required_error: "SSH environments require a remote workspace path." })
+    .string({ error: (issue) => (issue.input === undefined ? "SSH environments require a remote workspace path." : undefined) })
     .trim()
     .min(1, "SSH environments require a remote workspace path.")
     .refine((value) => value.startsWith("/"), "SSH remote workspace path must be absolute."),
-  privateKey: z.null().optional().default(null),
-  privateKeySecretRef: secretRefSchema.optional().nullable().default(null),
+  privateKey: z.null().prefault(null),
+  privateKeySecretRef: secretRefSchema.nullable().prefault(null),
   knownHosts: z
     .string()
     .trim()
     .optional()
     .nullable()
     .transform((value) => (value && value.length > 0 ? value : null)),
-  strictHostKeyChecking: z.boolean().optional().default(true),
+  strictHostKeyChecking: z.boolean().prefault(true),
 }).strict();
 
 const sshEnvironmentConfigProbeSchema = sshEnvironmentConfigSchema.extend({
@@ -69,13 +69,13 @@ const sshEnvironmentConfigProbeSchema = sshEnvironmentConfigSchema.extend({
 const sshEnvironmentConfigPersistenceSchema = sshEnvironmentConfigProbeSchema;
 
 const fakeSandboxEnvironmentConfigSchema = z.object({
-  provider: z.literal("fake").default("fake"),
+  provider: z.literal("fake").prefault("fake"),
   image: z
     .string()
     .trim()
     .min(1, "Fake sandbox environments require an image.")
-    .default("ubuntu:24.04"),
-  reuseLease: z.boolean().optional().default(false),
+    .prefault("ubuntu:24.04"),
+  reuseLease: z.boolean().prefault(false),
   streamRunLogs: z.boolean().optional(),
   archiveOnRelease: z.boolean().optional(),
 }).strict();
@@ -91,7 +91,7 @@ const pluginSandboxProviderKeySchema = z.string()
 const pluginSandboxEnvironmentConfigSchema = z.object({
   provider: pluginSandboxProviderKeySchema,
   timeoutMs: z.coerce.number().int().min(1).max(86_400_000).optional(),
-  reuseLease: z.boolean().optional().default(false),
+  reuseLease: z.boolean().prefault(false),
   streamRunLogs: z.boolean().optional(),
   archiveOnRelease: z.boolean().optional(),
 }).catchall(z.unknown());
@@ -102,7 +102,7 @@ const pluginEnvironmentConfigSchema = z.object({
     /^[a-z0-9][a-z0-9._-]*$/,
     "Environment driver key must start with a lowercase alphanumeric and contain only lowercase letters, digits, dots, hyphens, or underscores",
   ),
-  driverConfig: z.record(z.unknown()).optional().default({}),
+  driverConfig: z.record(z.string(), z.unknown()).prefault({}),
 }).strict();
 
 export type ParsedEnvironmentConfig =
