@@ -53,6 +53,7 @@ import type { FdClassSnapshot } from "./fd-class-metrics.js";
 import type { CgroupMemorySnapshot } from "./cgroup-memory-metrics.js";
 import type { NativeMemorySnapshot } from "./native-memory-metrics.js";
 import type { ProcessMappingSnapshot } from "./process-mapping-metrics.js";
+import { registerGcFlagsCollector } from "./gc-flags-metrics.js";
 
 export const CONCURRENT_RUN_BLOCKED_METRIC = "claude_k8s_concurrent_run_blocked_total";
 /**
@@ -6970,6 +6971,11 @@ function ensureRegistry(): {
     // Process/runtime metrics make the scrape target carry meaningful data even
     // before any refusal is reported (manual-verification check #3 on BLO-8328).
     collectDefaultMetrics({ register: registry });
+    // That default set labels GC by `kind` alone and discards V8's `flags`
+    // bitfield, which is the dimension PEN-3314 needs to tell a memory-reducing
+    // full GC from an ordinary major. Observes the same event stream; no extra
+    // syscall and no cadence change. See `services/gc-flags-metrics.ts`.
+    registerGcFlagsCollector({ registry });
   }
   return {
     registry,

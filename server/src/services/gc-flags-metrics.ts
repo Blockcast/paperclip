@@ -1,0 +1,238 @@
+/**
+ * @fileoverview Publish the GC dimension prom-client throws away — V8's
+ * per-cycle `flags` bitfield — so a page-pool release can be attributed to a
+ * *class* of GC cycle rather than to "a major GC happened" (PEN-3314).
+ *
+ * ## Why a new series, when `nodejs_gc_duration_seconds` already exists
+ *
+ * prom-client's default GC collector observes `perf_hooks` `gc` entries and
+ * labels them by `entry.detail.kind` only. The sibling field `entry.detail.flags`
+ * — V8's `GCCallbackFlags` — is read by nobody and never leaves the process.
+ * That discarded field is the one PEN-3314 needs, and the measurement below is
+ * what establishes it rather than taste.
+ *
+ * On 2026-10-25 the four known page-pool release events (RSS drops of 619–789 MB
+ * on `10.244.3.43` and `10.244.3.83`) were cross-tabulated at 30 s resolution
+ * against every series this process already exports. The result:
+ *
+ *   - **A V8 heap-used ceiling (>=1048 MB) is NECESSARY.** All four releases are
+ *     preceded by a ceiling sample at *exactly* the prior 30 s scrape, 4/4, and
+ *     no instance that never reached the ceiling ever released.
+ *   - **It is NOT SUFFICIENT.** 11 ceiling samples produced 4 releases (36%).
+ *   - **Nothing exported discriminates the other 64%.** Across the 7 ceiling
+ *     samples that did *not* release:
+ *       * major-GC count in the following sample was `2,4,2,4,4,2,2` against
+ *         `4,4,4,2` for the four that did — the same support;
+ *       * heap magnitude overlaps (the single highest ceiling sample of all,
+ *         1175.9 MB, did not release, while 1048.0 MB did);
+ *       * RSS level overlaps (1558–1692 MB non-releasing vs 1563–1730 MB
+ *         releasing — 1692 did not release, 1563 did).
+ *
+ * So the missing variable is not *timing* and not *magnitude*. Major GC at event
+ * magnitude is simply the ambient state of this process — it holds in 93.4% of
+ * all 30 s samples on the two instances that released (3347/3582), giving a
+ * 0.12% precision for "release", and it fires 2148 times on a worker that
+ * released zero times. A signal that is true almost always cannot be the thing
+ * that distinguishes the rare event.
+ *
+ * What remains unmeasured is *which kind of major cycle ran*, and that is
+ * exactly what `kind` collapses: a memory-reducing full GC and an ordinary
+ * incremental-marking major are both `kind: "major"`. V8 runs the unmapper's
+ * page-release path on the former. `NODE_PERFORMANCE_GC_FLAGS_ALL_AVAILABLE_GARBAGE`
+ * marks it, and this module is the only place it becomes visible.
+ *
+ * ## Cost
+ *
+ * One additional `PerformanceObserver` on an event stream Node already emits and
+ * prom-client already observes. No syscall, no `smaps` walk, no scrape-cadence
+ * change, no timer. This deliberately supersedes the earlier PEN-3314 proposal
+ * to resample RSS at 5 s, which was both more expensive and — per the ordering
+ * result above, which is already clean at 30 s — aimed at the wrong axis.
+ *
+ * ## What it is not
+ *
+ * ⛔ Not an alert source, not a fix, and not a claim that the memory-reducing
+ * cycle *is* the discriminator. It is the instrument that can decide it. If
+ * `all_available_garbage` turns out to fire on the non-releasing ceiling samples
+ * too, that is a real answer and this series is how it gets read.
+ *
+ * ⛔ Does not replace `nodejs_gc_duration_seconds`. That histogram keeps its
+ * duration distribution; this counts cycles by class.
+ *
+ * @module server/services/gc-flags-metrics
+ */
+
+import { PerformanceObserver, constants } from "node:perf_hooks";
+import type { PerformanceEntry } from "node:perf_hooks";
+
+import { Counter, type Registry } from "prom-client";
+
+export const GC_CYCLES_METRIC = "paperclip_gc_cycles_total";
+
+/** `entry.detail.kind` values, per `perf_hooks` constants. */
+const GC_KINDS: ReadonlyArray<readonly [number, string]> = [
+  [constants.NODE_PERFORMANCE_GC_MAJOR, "major"],
+  [constants.NODE_PERFORMANCE_GC_MINOR, "minor"],
+  [constants.NODE_PERFORMANCE_GC_INCREMENTAL, "incremental"],
+  [constants.NODE_PERFORMANCE_GC_WEAKCB, "weakcb"],
+];
+
+/**
+ * `entry.detail.flags` bits. This is a bitfield, not an enum — a single cycle
+ * can carry several — so the label is the set, joined in this fixed order so
+ * that one combination always renders as one series rather than as a permutation
+ * family.
+ */
+const GC_FLAG_BITS: ReadonlyArray<readonly [number, string]> = [
+  [constants.NODE_PERFORMANCE_GC_FLAGS_CONSTRUCT_RETAINED, "construct_retained"],
+  [constants.NODE_PERFORMANCE_GC_FLAGS_FORCED, "forced"],
+  [
+    constants.NODE_PERFORMANCE_GC_FLAGS_SYNCHRONOUS_PHANTOM_PROCESSING,
+    "synchronous_phantom_processing",
+  ],
+  [constants.NODE_PERFORMANCE_GC_FLAGS_ALL_AVAILABLE_GARBAGE, "all_available_garbage"],
+  [constants.NODE_PERFORMANCE_GC_FLAGS_ALL_EXTERNAL_MEMORY, "all_external_memory"],
+  [constants.NODE_PERFORMANCE_GC_FLAGS_SCHEDULE_IDLE, "schedule_idle"],
+];
+
+export const GC_KIND_UNKNOWN = "unknown";
+export const GC_FLAGS_NONE = "none";
+
+/** Every bit this module knows how to name, as a mask. */
+const KNOWN_FLAG_MASK = GC_FLAG_BITS.reduce((mask, [bit]) => mask | bit, 0);
+
+/**
+ * Map `entry.detail.kind` to a stable label.
+ *
+ * Unrecognised kinds collapse to {@link GC_KIND_UNKNOWN} rather than leaking the
+ * raw integer: a future Node could add one, and an unbounded label value is how
+ * a metric becomes a cardinality incident.
+ */
+export function gcKindLabel(kind: number | undefined): string {
+  for (const [value, label] of GC_KINDS) {
+    if (kind === value) return label;
+  }
+  return GC_KIND_UNKNOWN;
+}
+
+/**
+ * Render `entry.detail.flags` as a canonical, bounded label.
+ *
+ * Returns {@link GC_FLAGS_NONE} for the no-flags cycle (the common case —
+ * every scavenge observed in practice carries 0), otherwise the set bits joined
+ * by `|` in {@link GC_FLAG_BITS} order. Bits outside {@link KNOWN_FLAG_MASK} are
+ * folded into a single `other` term instead of being rendered numerically, which
+ * keeps the label set finite no matter what a future V8 sets.
+ */
+export function gcFlagsLabel(flags: number | undefined): string {
+  if (flags === undefined || !Number.isFinite(flags) || flags <= 0) return GC_FLAGS_NONE;
+  const parts: string[] = [];
+  for (const [bit, label] of GC_FLAG_BITS) {
+    if ((flags & bit) !== 0) parts.push(label);
+  }
+  if ((flags & ~KNOWN_FLAG_MASK) !== 0) parts.push("other");
+  return parts.length > 0 ? parts.join("|") : GC_FLAGS_NONE;
+}
+
+interface GcEntryDetail {
+  readonly kind?: number;
+  readonly flags?: number;
+}
+
+/**
+ * Read the `gc` entry's detail without trusting its shape.
+ *
+ * `PerformanceEntry.detail` is typed `unknown` and is `null` for non-GC entry
+ * types, so this narrows rather than casts. A malformed entry must not throw
+ * inside an observer callback — that would surface as an unhandled rejection in
+ * the metrics path and take down the scrape it was added to serve.
+ */
+function readGcDetail(entry: PerformanceEntry): GcEntryDetail {
+  const detail: unknown = (entry as { detail?: unknown }).detail;
+  if (typeof detail !== "object" || detail === null) return {};
+  const { kind, flags } = detail as { kind?: unknown; flags?: unknown };
+  return {
+    kind: typeof kind === "number" ? kind : undefined,
+    flags: typeof flags === "number" ? flags : undefined,
+  };
+}
+
+export interface GcFlagsCollectorHandle {
+  /** Stop observing. Idempotent. */
+  readonly stop: () => void;
+}
+
+export interface RegisterGcFlagsCollectorOptions {
+  readonly registry: Registry;
+  /**
+   * Observer factory, injected only so the test can drive entries without
+   * provoking real garbage collection — which is not reliably schedulable and
+   * would make the test flaky on a loaded CI box.
+   */
+  readonly createObserver?: (
+    onEntries: (entries: readonly PerformanceEntry[]) => void,
+  ) => { observe: () => void; disconnect: () => void };
+}
+
+/**
+ * Register the GC-class counter on `registry` and begin observing.
+ *
+ * Safe to call once per registry; the caller owns lifetime via the returned
+ * handle. The observer is `unref`-free by construction because
+ * `PerformanceObserver` does not hold the event loop open.
+ */
+export function registerGcFlagsCollector(
+  options: RegisterGcFlagsCollectorOptions,
+): GcFlagsCollectorHandle {
+  const { registry, createObserver } = options;
+
+  const cycles = new Counter({
+    name: GC_CYCLES_METRIC,
+    help:
+      "Garbage-collection cycles by kind and by V8's GCCallbackFlags bitfield "
+      + "(PEN-3314). prom-client's default collector labels GC by 'kind' only "
+      + "and discards 'flags', which collapses a memory-reducing full GC and an "
+      + "ordinary incremental-marking major into the same series. That "
+      + "distinction is the open question on PEN-3314: a V8 heap-used ceiling is "
+      + "NECESSARY for a page-pool release (4/4, one 30s sample ahead) but only "
+      + "36% sufficient, and neither major-GC count, heap magnitude nor RSS level "
+      + "separates the ceilings that release from the ones that do not. "
+      + "'all_available_garbage' marks the cycle class that runs V8's unmapper "
+      + "page-release path and is the remaining candidate. The 'flags' label is "
+      + "a set, joined by '|' in a fixed order, so one bit combination is one "
+      + "series; unknown bits fold into 'other' and unknown kinds into "
+      + "'unknown' rather than rendering raw integers, which bounds cardinality.",
+    labelNames: ["kind", "flags"],
+    registers: [registry],
+  });
+
+  const onEntries = (entries: readonly PerformanceEntry[]): void => {
+    for (const entry of entries) {
+      const { kind, flags } = readGcDetail(entry);
+      cycles.inc({ kind: gcKindLabel(kind), flags: gcFlagsLabel(flags) });
+    }
+  };
+
+  const observer = createObserver
+    ? createObserver(onEntries)
+    : (() => {
+        const real = new PerformanceObserver(list => {
+          onEntries(list.getEntries());
+        });
+        return {
+          observe: () => real.observe({ entryTypes: ["gc"] }),
+          disconnect: () => real.disconnect(),
+        };
+      })();
+
+  observer.observe();
+
+  let stopped = false;
+  return {
+    stop: () => {
+      if (stopped) return;
+      stopped = true;
+      observer.disconnect();
+    },
+  };
+}
