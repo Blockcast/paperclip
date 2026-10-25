@@ -20,7 +20,9 @@ import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   agents,
+  budgetPolicies,
   companies,
+  costEvents,
   createDb,
   heartbeatRuns,
   issues,
@@ -320,12 +322,18 @@ describeEmbeddedPostgres("quota-recovery wake task scoping (BLO-28992)", () => {
 
   it("still wakes — unscoped — when the scope itself trips project budget suppression", async () => {
     const { companyId, agentId } = await seedAgent();
-    // A project paused for budget makes `budgets.getInvocationBlock` return a
-    // block, which `enqueueWakeup` turns into a thrown conflict. Crucially this
-    // gate is only REACHABLE once an issueId is attached: projectId is derived
-    // from the issue, and getInvocationBlock early-returns null on a falsy
-    // candidateProjectId. So this suppression is one the pre-fix unscoped wake
-    // could never hit — it is a hazard introduced by scoping.
+    // A project over its budget hard stop makes `budgets.getInvocationBlock`
+    // return a block, which `enqueueWakeup` turns into a thrown conflict.
+    // Crucially this gate is only REACHABLE once an issueId is attached:
+    // projectId is derived from the issue, and getInvocationBlock early-returns
+    // null on a falsy candidateProjectId. So this suppression is one the pre-fix
+    // unscoped wake could never hit — it is a hazard introduced by scoping.
+    //
+    // The policy and the cost event are load-bearing, not scenery: since
+    // PEN-1972 the pause flag alone no longer blocks, because a flag whose
+    // window has rolled — or whose policy is gone — is cleared on the next check
+    // rather than latched forever. Suppressing work here needs spend that is
+    // genuinely over cap in the current window.
     const projectId = randomUUID();
     await db.insert(projects).values({
       id: projectId,
@@ -334,6 +342,32 @@ describeEmbeddedPostgres("quota-recovery wake task scoping (BLO-28992)", () => {
       status: "active",
       pauseReason: "budget",
       pausedAt: new Date(),
+    });
+    await db.insert(budgetPolicies).values({
+      companyId,
+      scopeType: "project",
+      scopeId: projectId,
+      metric: "billed_cents",
+      windowKind: "calendar_month_utc",
+      amount: 100,
+      warnPercent: 80,
+      hardStopEnabled: true,
+      notifyEnabled: true,
+      isActive: true,
+    });
+    await db.insert(costEvents).values({
+      companyId,
+      agentId,
+      projectId,
+      provider: "openai",
+      biller: "openai",
+      billingType: "metered_api",
+      model: "gpt-5-quota-recovery-wake-scope",
+      inputTokens: 100,
+      cachedInputTokens: 0,
+      outputTokens: 20,
+      costCents: 250,
+      occurredAt: new Date(),
     });
     const issueId = await seedIssue({
       companyId,

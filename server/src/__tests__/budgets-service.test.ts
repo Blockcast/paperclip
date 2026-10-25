@@ -281,6 +281,20 @@ describe("budgetService", () => {
   });
 
   it("surfaces a budget-owned company pause distinctly from a manual pause", async () => {
+    const companyPolicy = {
+      id: "policy-company-1",
+      companyId: "company-1",
+      scopeType: "company",
+      scopeId: "company-1",
+      metric: "billed_cents",
+      windowKind: "calendar_month_utc",
+      amount: 100,
+      warnPercent: 80,
+      hardStopEnabled: true,
+      notifyEnabled: true,
+      isActive: true,
+    };
+
     const dbStub = createDbStub([
       [{
         status: "idle",
@@ -293,6 +307,9 @@ describe("budgetService", () => {
         pauseReason: "budget",
         name: "Paperclip",
       }],
+      [companyPolicy],
+      // Still over cap in the current window, so the pause is still earned.
+      [{ total: 120 }],
     ]);
 
     const service = budgetService(dbStub.db as any);
@@ -303,6 +320,33 @@ describe("budgetService", () => {
       scopeId: "company-1",
       scopeName: "Paperclip",
       reason: "Company is paused because its budget hard-stop was reached.",
+    });
+  });
+
+  it("keeps blocking a manually paused company without re-checking its budget", async () => {
+    // A manual pause is not the budget service's to lift, so it must never reach
+    // the re-evaluation path -- hence no policy or observed-spend rows stubbed.
+    const dbStub = createDbStub([
+      [{
+        status: "idle",
+        pauseReason: null,
+        companyId: "company-1",
+        name: "Budget Agent",
+      }],
+      [{
+        status: "paused",
+        pauseReason: "manual",
+        name: "Paperclip",
+      }],
+    ]);
+
+    const service = budgetService(dbStub.db as any);
+
+    expect(await service.getInvocationBlock("company-1", "agent-1")).toEqual({
+      scopeType: "company",
+      scopeId: "company-1",
+      scopeName: "Paperclip",
+      reason: "Company is paused and cannot start new work.",
     });
   });
 
@@ -1450,5 +1494,190 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
     const cardsAfterStale = await db.select().from(approvals).where(eq(approvals.companyId, companyId));
     expect(cardsAfterStale.filter((card) => card.status === "pending")).toHaveLength(0);
     expect(cardsAfterStale.map((card) => card.status).sort()).toEqual(["rejected", "withdrawn"]);
+  });
+
+  // --- PEN-1972: the budget pause is a latch, not a thermostat -------------
+  //
+  // Observed spend is window-scoped and the pause flag is not, so at the window
+  // roll the condition that set the flag evaporates while the flag survives. A
+  // paused scope emits no cost events, so evaluateCostEvent can never re-fire
+  // for it either -- before this, only an explicit human resume could clear it.
+
+  async function rollWindowBackwards(companyId: string) {
+    // Move every cost event into the previous calendar month. That is what a
+    // window roll looks like to computeObservedAmount, which filters on
+    // occurredAt, and it is the only part of the roll that matters here.
+    const now = new Date();
+    const previousWindow = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 15));
+    await db
+      .update(costEvents)
+      .set({ occurredAt: previousWindow })
+      .where(eq(costEvents.companyId, companyId));
+  }
+
+  async function latchAgentOnBudget(amount = 100, spend = 125) {
+    const fixture = await createBudgetFixture();
+    const cancelWorkForScope = vi.fn().mockResolvedValue(undefined);
+    const service = budgetService(db, { cancelWorkForScope });
+    const [policy] = await db
+      .insert(budgetPolicies)
+      .values({
+        companyId: fixture.companyId,
+        scopeType: "agent",
+        scopeId: fixture.agentId,
+        metric: "billed_cents",
+        windowKind: "calendar_month_utc",
+        amount,
+        warnPercent: 80,
+        hardStopEnabled: true,
+        notifyEnabled: true,
+        isActive: true,
+      })
+      .returning();
+
+    const event = await insertCostEvent({
+      companyId: fixture.companyId,
+      agentId: fixture.agentId,
+      costCents: spend,
+    });
+    await service.evaluateCostEvent(event);
+
+    const [agentRow] = await db
+      .select({ status: agents.status, pauseReason: agents.pauseReason })
+      .from(agents);
+    expect(agentRow).toMatchObject({ status: "paused", pauseReason: "budget" });
+
+    return { ...fixture, service, policy: policy! };
+  }
+
+  it("clears a budget pause whose window has rolled, on the next invocation check (PEN-1972)", async () => {
+    const { companyId, agentId, service } = await latchAgentOnBudget();
+
+    const blockedWhileOverCap = await service.getInvocationBlock(companyId, agentId);
+    expect(blockedWhileOverCap).toMatchObject({
+      scopeType: "agent",
+      reason: "Agent is paused because its budget hard-stop was reached.",
+    });
+
+    await rollWindowBackwards(companyId);
+    mockLogActivity.mockClear();
+
+    // The same call that used to report the latch forever is the one that lifts
+    // it: no scheduler, no human, just the next time anything asks whether this
+    // agent may run.
+    expect(await service.getInvocationBlock(companyId, agentId)).toBeNull();
+
+    const [resumed] = await db
+      .select({ status: agents.status, pauseReason: agents.pauseReason, pausedAt: agents.pausedAt })
+      .from(agents);
+    expect(resumed).toMatchObject({ status: "idle", pauseReason: null, pausedAt: null });
+
+    // The incident and its card asked the board to choose between raising the
+    // budget and staying paused. Neither branch means anything now, so the card
+    // must not be left pending against a condition that no longer exists.
+    const incidentRows = await db.select().from(budgetIncidents);
+    expect(incidentRows.filter((incident) => incident.status === "open")).toHaveLength(0);
+    const [card] = await db.select().from(approvals);
+    expect(card).toMatchObject({ status: "withdrawn" });
+
+    // A resume is a fiscal event and has to leave a trace, the same way the
+    // pause did -- otherwise a scope that came back on its own is
+    // indistinguishable from one that was never stopped.
+    expect(mockLogActivity.mock.calls.map(([, input]) => input)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          action: "budget.pause_auto_cleared",
+          details: expect.objectContaining({ scopeType: "agent", scopeId: agentId }),
+        }),
+      ]),
+    );
+  });
+
+  it("keeps a budget pause that is still earned in the current window (PEN-1972)", async () => {
+    const { companyId, agentId, service } = await latchAgentOnBudget();
+
+    // No window roll: the spend that caused the pause is still inside the
+    // window, so re-evaluating must reach the same verdict rather than treating
+    // every check as an excuse to resume.
+    expect(await service.getInvocationBlock(companyId, agentId)).toMatchObject({
+      scopeType: "agent",
+      scopeId: agentId,
+      reason: "Agent is paused because its budget hard-stop was reached.",
+    });
+
+    const [stillPaused] = await db
+      .select({ status: agents.status, pauseReason: agents.pauseReason })
+      .from(agents);
+    expect(stillPaused).toMatchObject({ status: "paused", pauseReason: "budget" });
+    expect(
+      (await db.select().from(budgetIncidents)).filter((incident) => incident.status === "open"),
+    ).toHaveLength(1);
+  });
+
+  it("clears a budget pause left behind by a policy that is no longer active (PEN-1972)", async () => {
+    const { companyId, agentId, service, policy } = await latchAgentOnBudget();
+
+    // Deactivating the policy removes the cap that justified the flag. Nothing
+    // else would ever clear it: the scope emits no cost events while paused, and
+    // the policy it was filed against no longer governs anything.
+    await db
+      .update(budgetPolicies)
+      .set({ isActive: false })
+      .where(eq(budgetPolicies.id, policy.id));
+
+    expect(await service.getInvocationBlock(companyId, agentId)).toBeNull();
+
+    const [resumed] = await db
+      .select({ status: agents.status, pauseReason: agents.pauseReason })
+      .from(agents);
+    expect(resumed).toMatchObject({ status: "idle", pauseReason: null });
+  });
+
+  it("never lifts a pause it does not own (PEN-1972)", async () => {
+    const { companyId, agentId, service } = await latchAgentOnBudget();
+    await db.update(agents).set({ pauseReason: "manual" }).where(eq(agents.id, agentId));
+
+    await rollWindowBackwards(companyId);
+    await service.getInvocationBlock(companyId, agentId);
+
+    // The window rolled and the budget condition is gone, but this pause was
+    // never the budget service's to lift.
+    const [stillPaused] = await db
+      .select({ status: agents.status, pauseReason: agents.pauseReason })
+      .from(agents);
+    expect(stillPaused).toMatchObject({ status: "paused", pauseReason: "manual" });
+  });
+
+  it("clears a rolled-over budget pause on a project scope too (PEN-1972)", async () => {
+    const { companyId, agentId, projectId } = await createBudgetFixture();
+    const cancelWorkForScope = vi.fn().mockResolvedValue(undefined);
+    const service = budgetService(db, { cancelWorkForScope });
+    await db.insert(budgetPolicies).values({
+      companyId,
+      scopeType: "project",
+      scopeId: projectId,
+      metric: "billed_cents",
+      windowKind: "calendar_month_utc",
+      amount: 100,
+      warnPercent: 80,
+      hardStopEnabled: true,
+      notifyEnabled: true,
+      isActive: true,
+    });
+
+    const event = await insertCostEvent({ companyId, agentId, projectId, costCents: 125 });
+    await service.evaluateCostEvent(event);
+    expect(await service.getInvocationBlock(companyId, agentId, { projectId })).toMatchObject({
+      scopeType: "project",
+      scopeId: projectId,
+    });
+
+    await rollWindowBackwards(companyId);
+
+    expect(await service.getInvocationBlock(companyId, agentId, { projectId })).toBeNull();
+    const [resumedProject] = await db
+      .select({ pauseReason: projects.pauseReason, pausedAt: projects.pausedAt })
+      .from(projects);
+    expect(resumedProject).toMatchObject({ pauseReason: null, pausedAt: null });
   });
 });
