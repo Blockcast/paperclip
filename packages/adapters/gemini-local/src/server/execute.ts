@@ -1,3 +1,4 @@
+import { formatTimeoutMessage } from "@paperclipai/adapter-utils/server-utils";
 import fs from "node:fs/promises";
 import type { Dirent } from "node:fs";
 import os from "node:os";
@@ -652,6 +653,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         timedOut: boolean;
         stdout: string;
         stderr: string;
+        startedAt?: string | null;
       };
       parsed: ReturnType<typeof parseGeminiJsonl>;
     },
@@ -670,7 +672,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         exitCode: attempt.proc.exitCode,
         signal: attempt.proc.signal,
         timedOut: true,
-        errorMessage: `Timed out after ${timeoutSec}s`,
+        errorMessage: formatTimeoutMessage(timeoutSec, attempt.proc.startedAt),
         errorCode: authMeta.requiresAuth
           ? "gemini_auth_required"
           : networkUnavailable
