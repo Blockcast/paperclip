@@ -55,11 +55,15 @@ const OPTIONS = {
   kubectl: "kubectl",
 };
 
-// `pods` maps namespace -> pod names; `files` maps "ns/pod" -> file contents.
+// `pods` maps namespace -> pod names (or full pod objects); `files` maps
+// "ns/pod" -> file contents.
 function fakeKubectl(pods, files = {}) {
   return (args) => {
     const namespace = args[args.indexOf("-n") + 1];
-    if (args.includes("get")) return (pods[namespace] ?? []).join("\n") + "\n";
+    if (args.includes("get")) {
+      const items = (pods[namespace] ?? []).map((p) => (typeof p === "string" ? { metadata: { name: p } } : p));
+      return JSON.stringify({ items });
+    }
     const pod = args[args.indexOf("exec") + 1];
     const contents = files[`${namespace}/${pod}`];
     if (contents === undefined) throw new Error(`no fixture for ${namespace}/${pod}`);
@@ -140,4 +144,52 @@ test("the two exit codes are distinct and both non-zero", () => {
   // letting either become 0, is the defect this test exists to catch.
   assert.notEqual(EXIT_NONCONFORMING, EXIT_UNOBSERVABLE);
   assert.ok(EXIT_NONCONFORMING > 0 && EXIT_UNOBSERVABLE > 0);
+});
+
+// BLO-49205: run 40225736314 exec'd into a relay pod mid-replacement and got
+// `container not found ("trafficserver")` -> MasterGateRed for a rollout.
+const terminating = { metadata: { name: "relay-old", deletionTimestamp: "2026-10-25T19:23:00Z" } };
+
+test("a terminating pod is skipped and logged, never exec'd", () => {
+  const result = run(
+    OPTIONS,
+    fakeKubectl(
+      { "staging-x": [terminating, "relay-new"], "production-x": ["relay-2"] },
+      { "staging-x/relay-new": `${gatewayLine}\n`, "production-x/relay-2": `${gatewayLine}\n` },
+    ),
+  );
+  // fakeKubectl throws on an exec with no fixture, so reaching here proves relay-old was not exec'd.
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.checked, ["staging-x/relay-new", "production-x/relay-2"]);
+  assert.equal(result.skipped.length, 1);
+  assert.match(result.skipped[0], /^staging-x\/relay-old: terminating/);
+});
+
+test("a pod whose target container is not running is skipped", () => {
+  const starting = { metadata: { name: "relay-new" }, status: { containerStatuses: [{ name: "trafficserver", state: { waiting: {} } }] } };
+  const running = { metadata: { name: "relay-2" }, status: { containerStatuses: [{ name: "trafficserver", state: { running: {} } }] } };
+  const result = run(
+    { ...OPTIONS, container: "trafficserver" },
+    fakeKubectl({ "staging-x": [starting], "production-x": [running] }, { "production-x/relay-2": `${gatewayLine}\n` }),
+  );
+  assert.deepEqual(result.checked, ["production-x/relay-2"]);
+  assert.match(result.skipped[0], /container trafficserver not running/);
+  // Nothing eligible left in staging-x: fails closed as UNOBSERVABLE, not as a regression.
+  assert.equal(exitCodeFor(result), EXIT_UNOBSERVABLE);
+});
+
+test("a non-conforming live pod still fails beside a skipped terminating one", () => {
+  const result = run(
+    OPTIONS,
+    fakeKubectl(
+      { "staging-x": [terminating, "relay-new"], "production-x": ["relay-2"] },
+      {
+        "staging-x/relay-new": `${gatewayLine}\nssl_cert_name=/tmp/ds.crt ssl_key_name=/tmp/ds.key\n`,
+        "production-x/relay-2": `${gatewayLine}\n`,
+      },
+    ),
+  );
+  assert.equal(result.failures.length, 1);
+  assert.match(result.failures[0], /^staging-x\/relay-new/);
+  assert.equal(exitCodeFor(result), EXIT_NONCONFORMING);
 });
