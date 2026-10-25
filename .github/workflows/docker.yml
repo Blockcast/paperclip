@@ -31,6 +31,19 @@ on:
           digest, so the owner is what identifies which approval is retired.
         required: false
         type: string
+      # BLO-49140: deploy refuses while paperclip-0 is younger than 6h, since
+      # every rollout can strand mid-setup runs (BLO-12563).
+      min_interval_override:
+        description: >-
+          Bypass the 6h minimum interval between production rolls. Only for an
+          emergency fix or a rollback.
+        required: false
+        type: choice
+        default: none
+        options:
+          - none
+          - emergency
+          - rollback
   push:
     branches:
       - "master"
@@ -524,6 +537,16 @@ jobs:
           helm version --short
           kubectl auth whoami -o yaml
           kubectl -n "$NS" get statefulset paperclip -o jsonpath='{.spec.replicas}{"\n"}'
+
+      - name: Minimum interval since last roll (BLO-49140)
+        env:
+          NS: ${{ vars.PAPERCLIP_NAMESPACE || 'paperclip' }}
+          OVERRIDE: ${{ inputs.min_interval_override }}
+        run: |
+          set -euo pipefail
+          POD_CREATED="$(kubectl -n "$NS" get pod paperclip-0 --ignore-not-found -o jsonpath='{.metadata.creationTimestamp}')"
+          export POD_CREATED
+          .github/scripts/check-deploy-min-interval.sh
 
       - name: Login to Harbor (artifact check)
         uses: docker/login-action@v4

@@ -440,6 +440,12 @@ jobs:
         run: node --test ./scripts/check-docker-abandon-in-flight-inputs.test.js
         timeout-minutes: 1
 
+      # BLO-49140: deploy refuses while paperclip-0 is younger than 6h.
+      - name: Validate deploy minimum-interval guard (BLO-49140)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/check-deploy-min-interval.test.js
+        timeout-minutes: 1
+
       # BLO-31666: the automatic half of the above. The escape hatch pinned by
       # its neighbour is recovery and needs a human who knows it exists; this is
       # prevention — the deploy job retires the lock it took when `helm upgrade`
