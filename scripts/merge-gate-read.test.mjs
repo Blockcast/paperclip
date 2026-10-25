@@ -2273,3 +2273,60 @@ esac
     });
   }
 });
+
+// BLO-49045: the two remaining `--paginate` fetches. Each fixture is a head that
+// reads clean on a partial read: page 1 alone carries what clears it.
+describe("live mode: pulls and statuses-list partial reads fail closed (BLO-49045)", () => {
+  const sha = "a".repeat(40);
+  const base = "b".repeat(40);
+  const ok = `{"name":"ci","status":"completed","conclusion":"success","completed_at":"2026-10-24T00:00:00Z","details_url":"https://github.com/o/r/actions/runs/7/job/1"}`;
+  const legacy = `{"name":"build (legacy arm - refused, nothing ran)","status":"completed","conclusion":"failure","completed_at":"2026-10-24T00:00:00Z","details_url":"https://github.com/o/r/actions/runs/8/job/2"}`;
+  const witness = `{"id":5,"context":"ci/dispatched-lanes","state":"success","description":"(base master) no dispatched lane applies to this head","creator":{"id":41898282}}`;
+  const cases = {
+    // Page 1 names one base sha; a second PR's base sat on the failed page.
+    pulls: `
+  */dispatch-approved-pr-ci.yml) echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;
+  */check-runs*) printf '%s' '{"total_count":2,"check_runs":[${ok},${legacy}]}' ;;
+  */pulls*) echo ${base}; exit 1 ;;
+  */contents/.github/workflows\\?ref=*) echo .github/workflows/ci.yml ;;
+  */contents/*) printf 'jobs:\\n  test:\\n    runs-on: x\\n' ;;
+  */actions/runs*) printf '%s' '{"total_count":0,"workflow_runs":[]}' ;;
+  */status*) printf '%s' '{"state":"success","statuses":[]}' ;;`,
+    // Gated head; page 1 holds an Actions-written empty witness.
+    statuses: `
+  */dispatch-approved-pr-ci.yml) echo '{}' ;;
+  */check-runs*) printf '%s' '{"total_count":1,"check_runs":[${ok}]}' ;;
+  */actions/runs*) printf '%s' '{"total_count":0,"workflow_runs":[]}' ;;
+  */statuses*) printf '%s' '[${witness}]'; exit 1 ;;
+  */status*) printf '%s' '{"state":"success","statuses":[${witness}]}' ;;`,
+  };
+  for (const [surface, arms] of Object.entries(cases)) {
+    it(`STOPs with rc > 1 when ${surface} page 2 exits 1 with empty stdout`, () => {
+      const dir = mkdtempSync(join(tmpdir(), "mgr-gh-"));
+      writeFileSync(
+        join(dir, "gh"),
+        `#!/usr/bin/env bash
+case "$2" in${arms}
+  repos/o/r/commits/*) echo ${sha} ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac
+`,
+        { mode: 0o755 },
+      );
+      let rc = 0;
+      let out = "";
+      try {
+        out = execFileSync("bash", [READER, "o/r", sha], {
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+          env: { ...process.env, PATH: `${dir}:${process.env.PATH}` },
+        });
+      } catch (e) {
+        rc = e.status;
+        out = e.stdout;
+      }
+      assert.ok(rc > 1, `expected exit > 1, got ${rc}; out=${out}`);
+      assert.match(out, new RegExp(`^STOP\\t<${surface} fetch failed for ${sha} \\(rc 1\\); refusing on a partial read>\\tFETCH-FAILED\\trun=-$`, "m"));
+    });
+  }
+});
