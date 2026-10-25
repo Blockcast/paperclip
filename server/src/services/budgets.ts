@@ -1,4 +1,4 @@
-import { and, desc, eq, gte, inArray, isNotNull, lt, ne, sql } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNotNull, lt, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -204,7 +204,23 @@ async function computeObservedAmount(
   // Applied as well as -- never instead of -- the window bounds above, so a
   // forgiveness grant can only ever NARROW the sum. A grant that somehow
   // outlived its window still cannot widen enforcement past the window.
-  if (since) conditions.push(gte(costEvents.occurredAt, since));
+  //
+  // BOTH CLOCKS, OR'd: an event counts if it HAPPENED after the decision or if it
+  // LANDED after it. Flooring on `occurredAt` alone was fail-open in the one
+  // direction a cap must never fail -- spend the board could not have seen when it
+  // adjudicated (final usage from the runs cancelled at the pause, batched or
+  // back-billed ingestion) carries an `occurredAt` before the grant, and so escaped
+  // enforcement for the whole rest of the window while still showing up on every
+  // dashboard. What the board forgave is the overshoot visible at that instant; an
+  // event that was not yet in the table was not part of it.
+  //
+  // `createdAt` is insert time, defaulted by the database and never backdated, so
+  // the OR can only ever ADD rows to the enforced sum -- it cannot drop one that
+  // the `occurredAt` floor would have kept. Reporting is unaffected either way:
+  // every reporting caller omits `since` entirely and still sums the true window.
+  if (since) {
+    conditions.push(or(gte(costEvents.occurredAt, since), gte(costEvents.createdAt, since))!);
+  }
 
   const [row] = await db
     .select({
@@ -1719,22 +1735,34 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
             ),
           );
         // `resolutionAction` is what `hardStopForgivenSince` reads back later, so
-        // this write IS the forgiveness grant -- there is no other state. It rides
-        // the same `status = "open"` filter as the close itself, which means the
-        // grant can only ever land on a crossing this call actually closed.
+        // this write IS the forgiveness grant -- there is no other state. It is
+        // therefore stamped on the decided row ALONE, keyed on `id`, and the other
+        // rows this resume closes are closed in a second statement that never
+        // touches the column.
         //
-        // Consequence, deliberate and fail-closed: a `resume_without_raise` against
-        // an incident that was ALREADY closed (a stale client, or a card the window
-        // roll auto-cleared) stamps nothing, confers no grant, and the scope will
-        // re-latch on the next cost event as it does today. Rewriting a decided row
-        // to grant the suppression retroactively is precisely what every other
-        // `status = "open"` guard in this function exists to prevent, and a
-        // forgiveness grant is the last field that should be exempt from that rule.
+        // One statement keyed on `policyId AND status = "open"` is what this was,
+        // and it sprayed the action across every open row on the policy. That was
+        // wrong in exactly one reachable way, and the way is bad: a replayed
+        // `resume_without_raise` against an ALREADY-CLOSED incident A is not itself
+        // in the open set, so it stamped whatever else was -- a later, live hard
+        // incident B -- and minted a grant from B's `resolvedAt` that no board ever
+        // decided against B's numbers. `createIncidentIfNeeded` suppresses only on
+        // OPEN rows, so B is routinely creatable the moment A is resolved: grant,
+        // re-latch, replay is an ordinary stale-client sequence, not a contrived
+        // one. It survived a window roll too, since B carries the CURRENT
+        // `windowStart` and the grant is keyed on that.
         //
-        // A still-open *soft* row closed in the same sweep is stamped too. Harmless:
-        // `hardStopForgivenSince` filters on `thresholdType = "hard"`, so a soft row
-        // can never confer a grant, and the stamp remains a true record of which
-        // decision closed it.
+        // Keyed on `id`, a replay against a closed A now matches nothing, stamps
+        // nothing, and confers nothing -- B is still closed by the sweep below, but
+        // with `resolutionAction` left null, which `hardStopForgivenSince` cannot
+        // read as a grant. The invariant is structural rather than incidental: a
+        // grant can only ever come from the row the board actually named, and only
+        // if that row was still open when they named it.
+        //
+        // The sweep deliberately leaves `resolutionAction` null rather than
+        // stamping a second action. Those rows were closed as a side effect of a
+        // decision about a DIFFERENT crossing; null is the honest record of that,
+        // and it is what their withdrawal note already says.
         await db
           .update(budgetIncidents)
           .set({
@@ -1743,7 +1771,18 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
             resolutionAction: input.action,
             updatedAt: now,
           })
-          .where(and(eq(budgetIncidents.policyId, policy.id), eq(budgetIncidents.status, "open")));
+          .where(and(eq(budgetIncidents.id, incident.id), eq(budgetIncidents.status, "open")));
+
+        await db
+          .update(budgetIncidents)
+          .set({ status: "resolved", resolvedAt: now, updatedAt: now })
+          .where(
+            and(
+              eq(budgetIncidents.policyId, policy.id),
+              eq(budgetIncidents.status, "open"),
+              ne(budgetIncidents.id, incident.id),
+            ),
+          );
 
         await markApprovalStatus(db, incident.approvalId ?? null, "approved", input.decisionNote, actorUserId);
         // Resuming closes *every* open incident for the policy, but only the
