@@ -68,8 +68,8 @@ function isBoardUser(input: PluginApiRequestInput): boolean {
  * absolutely, and the two automatic drains both miss the case that matters:
  * the per-claim backstop in `beginAggregateFiring` runs only on a delivery,
  * and an aggregate whose alert has stopped firing sends none, while
- * `reconcileAbandonedAggregateFences` runs only from `setup()`, i.e. at a
- * restart. Between restarts a `finalizing` wedge was reachable by no path at
+ * `reconcileAbandonedAggregateFences` ran only from `setup()`, i.e. at a
+ * restart (it now also runs every `reconcile-active-alerts` pass, BLO-49195). Between restarts a `finalizing` wedge was reachable by no path at
  * all, operator included. Measured 2026-10-11: three rows wedged in
  * `finalizing`, the oldest since 2026-09-14 — 27 days, surviving every restart
  * in between.
