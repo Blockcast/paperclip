@@ -307,10 +307,12 @@ describeEmbeddedPostgres("opencode_k8s timer no-work suppression", () => {
     expect(after.enqueued - before.enqueued).toBe(0);
 
     // Pins the negative half of cause (3) in the documented cause list: the
-    // exclusion counter is silent here too, because this return is above all
-    // four of its call sites. Any comment or help text claiming global
-    // suppression is observable through that counter is wrong, and this is
-    // what says so mechanically.
+    // exclusion counter is silent here too, because this return is above the
+    // per-agent loop that holds every one of its call sites. PEN-4737 moved
+    // three of those call sites above `checked += 1` but left them inside that
+    // loop, so this assertion is unchanged by it -- and that is the point.
+    // Any comment or help text claiming global suppression is observable
+    // through that counter is wrong, and this is what says so mechanically.
     expect(await readSchedulerExclusionTotal()).toBe(exclusionsBefore);
   });
 
@@ -362,10 +364,15 @@ describeEmbeddedPostgres("opencode_k8s timer no-work suppression", () => {
     expect(after.checked - before.checked).toBe(0);
     expect(after.enqueued - before.enqueued).toBe(0);
 
-    // And the exclusion counter cannot explain the gap: every one of its
-    // increments happens after `checked += 1`, so it is silent here. This is
-    // why the help text must not send an operator there to corroborate a zero.
-    expect(await readSchedulerExclusionTotal()).toBe(exclusionsBefore);
+    // ...and since PEN-4737 the exclusion counter DOES explain the gap. This
+    // assertion was previously `toBe(exclusionsBefore)` -- it pinned the gap
+    // open, which is what PEN-2130 AC3 was left failing on. The pass still
+    // records `checked = 0`; what changed is that an operator reading a zero
+    // can now corroborate cause (2) from this counter instead of guessing.
+    expect(await readSchedulerExclusionTotal()).toBe(exclusionsBefore + 1);
+    expect((await renderMetrics()).body).toContain(
+      `${HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC}{reason="heartbeat.disabled"}`,
+    );
   });
 
   it("queues opencode_k8s timer ticks when the agent has assigned live work", async () => {
