@@ -168,6 +168,7 @@ describeEmbeddedPostgres("terminal-failed wake gauge (BLO-20255)", () => {
     agentId: string;
     status: string;
     createdAt: Date;
+    taskKey?: string;
   }) {
     await db.insert(heartbeatRuns).values({
       id: randomUUID(),
@@ -177,7 +178,7 @@ describeEmbeddedPostgres("terminal-failed wake gauge (BLO-20255)", () => {
       triggerDetail: "system",
       status: opts.status,
       createdAt: opts.createdAt,
-      contextSnapshot: { taskKey: PR_TASK_KEY },
+      contextSnapshot: { taskKey: opts.taskKey ?? PR_TASK_KEY },
     });
   }
 
@@ -186,6 +187,7 @@ describeEmbeddedPostgres("terminal-failed wake gauge (BLO-20255)", () => {
     companyId: string;
     agentId: string;
     finishedAt: Date;
+    requestedAt?: Date;
     taskKey?: string | null;
     errorCode?: string | null;
   }) {
@@ -215,6 +217,7 @@ describeEmbeddedPostgres("terminal-failed wake gauge (BLO-20255)", () => {
       reason: "github_pr_synchronized",
       status: "failed",
       finishedAt: opts.finishedAt,
+      ...(opts.requestedAt ? { requestedAt: opts.requestedAt } : {}),
       runId,
       ...(opts.taskKey ? { payload: { taskKey: opts.taskKey } } : {}),
     });
@@ -581,6 +584,123 @@ describeEmbeddedPostgres("terminal-failed wake gauge (BLO-20255)", () => {
       expect(await gaugeTotal({ scope: "pr_review" })).toBe(0);
     });
   }
+
+  // ---------------------------------------------------------------------------
+  // BLO-49060: two false positives seen live on 2026-10-25. Every case asserts
+  // BOTH the count (JS successor maps) and the oldest age (SQL aggregate),
+  // because the two paths implement the match independently and a fix to one
+  // alone must still fail here.
+  // ---------------------------------------------------------------------------
+
+  const MIXED_CASE_KEY = "pr_review:Blockcast/pim-multicast-gateway:4155";
+  const LOWER_CASE_KEY = "pr_review:blockcast/pim-multicast-gateway:4155";
+
+  it("drops the row when a successor WAKE's taskKey differs only in owner case", async () => {
+    const { agentId, companyId } = await seedCompanyAndAgent();
+    const now = new Date();
+    const failedAt = new Date(now.getTime() - 3_600_000);
+    await seedFailedWake({
+      companyId, agentId, finishedAt: failedAt, taskKey: MIXED_CASE_KEY,
+      errorCode: "k8s_pod_schedule_failed",
+    });
+    await seedSuccessorWake({
+      companyId, agentId, status: "completed",
+      requestedAt: new Date(failedAt.getTime() + 30_000), taskKey: LOWER_CASE_KEY,
+    });
+
+    await heartbeat.publishAgentWakeupTerminalFailedGauge(now);
+
+    expect(await gaugeTotal({ scope: "pr_review" })).toBe(0);
+    expect(await oldestAgeSeconds("pr_review")).toBe(0);
+  });
+
+  it("drops the row when a successor RUN's taskKey differs only in owner case", async () => {
+    const { agentId, companyId } = await seedCompanyAndAgent();
+    const now = new Date();
+    const failedAt = new Date(now.getTime() - 3_600_000);
+    await seedFailedWake({
+      companyId, agentId, finishedAt: failedAt, taskKey: MIXED_CASE_KEY,
+      errorCode: "k8s_pod_schedule_failed",
+    });
+    await seedSuccessorRun({
+      companyId, agentId, status: "succeeded",
+      createdAt: new Date(failedAt.getTime() + 120_000), taskKey: LOWER_CASE_KEY,
+    });
+
+    await heartbeat.publishAgentWakeupTerminalFailedGauge(now);
+
+    expect(await gaugeTotal({ scope: "pr_review" })).toBe(0);
+    expect(await oldestAgeSeconds("pr_review")).toBe(0);
+  });
+
+  // The onprem-k8s#6736 shape: the failed run sat PodInitializing for 30 min,
+  // and a re-request created during that window succeeded before it died.
+  async function seedOverlappingFailure() {
+    const { agentId, companyId } = await seedCompanyAndAgent();
+    const now = new Date();
+    const requestedAt = new Date(now.getTime() - 3_600_000);
+    const finishedAt = new Date(now.getTime() - 1_800_000);
+    await seedFailedWake({
+      companyId, agentId, requestedAt, finishedAt, taskKey: PR_TASK_KEY,
+      errorCode: "k8s_pod_schedule_failed",
+    });
+    return { agentId, companyId, now, requestedAt, finishedAt };
+  }
+
+  it("drops the row when a SUCCEEDED successor run was created before the failure finished", async () => {
+    const { agentId, companyId, now, requestedAt } = await seedOverlappingFailure();
+    await seedSuccessorRun({
+      companyId, agentId, status: "succeeded",
+      createdAt: new Date(requestedAt.getTime() + 600_000),
+    });
+
+    await heartbeat.publishAgentWakeupTerminalFailedGauge(now);
+
+    expect(await gaugeTotal({ scope: "pr_review" })).toBe(0);
+    expect(await oldestAgeSeconds("pr_review")).toBe(0);
+  });
+
+  it("keeps the row when the succeeded run predates the failed wake's REQUEST (a review of an older head)", async () => {
+    const { agentId, companyId, now, requestedAt } = await seedOverlappingFailure();
+    await seedSuccessorRun({
+      companyId, agentId, status: "succeeded",
+      createdAt: new Date(requestedAt.getTime() - 600_000),
+    });
+
+    await heartbeat.publishAgentWakeupTerminalFailedGauge(now);
+
+    expect(await gaugeTotal({ scope: "pr_review" })).toBe(1);
+    expect(await oldestAgeSeconds("pr_review")).toBeGreaterThanOrEqual(1_700);
+  });
+
+  for (const status of ["failed", "cancelled", "running", "queued"] as const) {
+    it(`keeps the row when an overlapping successor run is '${status}' (only 'succeeded' may overlap)`, async () => {
+      const { agentId, companyId, now, requestedAt } = await seedOverlappingFailure();
+      await seedSuccessorRun({
+        companyId, agentId, status,
+        createdAt: new Date(requestedAt.getTime() + 600_000),
+      });
+
+      await heartbeat.publishAgentWakeupTerminalFailedGauge(now);
+
+      expect(await gaugeTotal({ scope: "pr_review" })).toBe(1);
+      expect(await oldestAgeSeconds("pr_review")).toBeGreaterThanOrEqual(1_700);
+    });
+  }
+
+  it("labels k8s_pod_schedule_failed as its own error_code, not `other`", async () => {
+    const { agentId, companyId } = await seedCompanyAndAgent();
+    const now = new Date();
+    await seedFailedWake({
+      companyId, agentId, finishedAt: new Date(now.getTime() - 60_000),
+      taskKey: PR_TASK_KEY, errorCode: "k8s_pod_schedule_failed",
+    });
+
+    await heartbeat.publishAgentWakeupTerminalFailedGauge(now);
+
+    expect(await gaugeTotal({ errorCode: "k8s_pod_schedule_failed", scope: "pr_review" })).toBe(1);
+    expect(await gaugeTotal({ errorCode: "other" })).toBe(0);
+  });
 
   // ---------------------------------------------------------------------------
   // Per-row ageing (BLO-20255 review round 2).
