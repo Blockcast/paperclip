@@ -3115,7 +3115,6 @@ export const KNOWN_TERMINAL_FAILED_WAKE_ERROR_CODES = [
   // BLO-49060: the reviewer pod never started (e.g. stuck PodInitializing past
   // its budget on a node whose container runtime stalled). Infra fault below
   // the agent, same disposition as `adapter_failed` / `process_lost`.
-  "k8s_pod_schedule_failed",
 ] as const;
 
 export const UNKNOWN_TERMINAL_FAILED_WAKE_ERROR_CODE = "other";
