@@ -833,13 +833,22 @@ if [ "${1:-}" = "--gated" ]; then gated_lanes "${2:-}" "${3:-}" "${4:-}"; exit 0
 if [ "${1:-}" = "--empty-witness" ]; then empty_witness; exit 0; fi
 if [ "${1:-}" = "--sha-guard" ]; then require_sha "${2:-}"; exit $?; fi
 
+# BLO-49040. `gh api --paginate` exits non-zero when a LATER page fails. With
+# an error body the extractors choke and the reader already refuses; WITHOUT one
+# (reset, timeout) the variable holds page 1 only and every row past it is never
+# judged — magma heads carry 105-110 check-runs. Callers refuse on rc > 1.
+fetch_failed() { # $1 = surface, $2 = rc
+  printf 'STOP\t<%s fetch failed for %s (rc %s); refusing on a partial read>\tFETCH-FAILED\trun=-\n' "$1" "$H" "$2"
+  exit 3
+}
+
 R="$1"
 # MANDATORY full 40-hex: actions/runs?head_sha= returns zero rows for an
 # abbreviation, with no error, which silently empties DEAD (BLO-34114).
 H=$(gh api "repos/$R/commits/$2" --jq .sha 2>/dev/null)
 require_sha "$H" || exit 1
 
-RUNS=$(gh api "repos/$R/actions/runs?head_sha=$H&per_page=100" --paginate | run_extract)
+RUNS=$(gh api "repos/$R/actions/runs?head_sha=$H&per_page=100" --paginate | run_extract) || fetch_failed actions/runs $?
 # Both surfaces are fetched ONCE and fanned out. ZERO new API calls for
 # BLO-37887 (the pending set is a second pass over rows already in hand), and
 # the BLO-38577 witness pass reuses the same status body the verdict pass reads.
@@ -847,7 +856,7 @@ RUNS=$(gh api "repos/$R/actions/runs?head_sha=$H&per_page=100" --paginate | run_
 # routinely exhausted installation quota.
 # An empty RUNS arrives as one blank line: dead_runs() matches nothing on it, and
 # pending_runs()'s `$3 != ""` fence drops it.
-STATUSES=$(gh api "repos/$R/commits/$H/status?per_page=100" --paginate)
+STATUSES=$(gh api "repos/$R/commits/$H/status?per_page=100" --paginate) || fetch_failed status $?
 
 # BLO-38577 off-head witnesses. A candidate naming a run that IS at this head is
 # skipped: the sibling arm already rules on those, so resolving them would be a
@@ -895,7 +904,7 @@ PENDING=$(printf '%s\n' "$RUNS" | pending_runs)
 # status fetch silently drops the 31st context onward — and a dropped `failure`
 # prints no STOP. The ABSENT guard cannot catch it: `$4!="status"` excludes
 # status rows from the survivor count, so one surviving check-run keeps the guard quiet.
-CHECKS=$(gh api "repos/$R/commits/$H/check-runs?per_page=100" --paginate)
+CHECKS=$(gh api "repos/$R/commits/$H/check-runs?per_page=100" --paginate) || fetch_failed check-runs $?
 
 # BLO-48833: only when a legacy red has no twin, read the base workflows at the
 # head's PR base sha. Zero extra calls on every other head. Any failure (no PR,
