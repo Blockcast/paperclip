@@ -32,6 +32,11 @@ export const resolveBudgetIncidentSchema = z.object({
       path: ["amount"],
     });
   }
+  // `resume_without_raise` deliberately does NOT require an amount: its whole
+  // point is that the board need not restate a figure to get a scope running
+  // again, and omitting it keeps the cap exactly as it stands (PEN-4742). An
+  // amount IS accepted, and unlike the raise path it may sit at or below
+  // observed spend -- that is the ratchet this action exists to break.
 });
 
 export type ResolveBudgetIncident = z.infer<typeof resolveBudgetIncidentSchema>;

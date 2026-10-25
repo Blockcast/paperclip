@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import type { BudgetPolicySummary } from "@paperclipai/shared";
-import { AlertTriangle, PauseCircle, ShieldAlert, Wallet } from "lucide-react";
+import { AlertTriangle, PauseCircle, PlayCircle, ShieldAlert, Wallet } from "lucide-react";
 import { cn, formatCents } from "../lib/utils";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -165,6 +165,29 @@ export function BudgetPolicyCard({
     </div>
   ) : null;
 
+  /**
+   * A forgiven scope is over its cap and still running, by decision (PEN-4742).
+   *
+   * Utilization deliberately keeps reporting TRUE window spend, so without this
+   * line the card shows a red bar past 100% on a scope that is working normally
+   * and nothing anywhere says why. That reads as a broken gauge, and a broken
+   * gauge is how the board stops trusting the one number it checks -- the same
+   * failure mode as a paused scope rendering green, pointed the other way.
+   *
+   * Suppressed while `paused` is set: a re-latched scope is genuinely stopped,
+   * and `pausedPane` is the accurate statement then.
+   */
+  const forgivenPane = !summary.paused && summary.hardStopForgivenSince ? (
+    <div className="flex items-start gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-sm text-amber-900 dark:text-amber-100">
+      <PlayCircle className="mt-0.5 h-4 w-4 shrink-0" />
+      <div>
+        Resumed by the board on {new Date(summary.hardStopForgivenSince).toLocaleString()} without
+        raising the cap. Spend above is this window&rsquo;s true total; for the rest of the window
+        the hard stop is measured from that decision, and resets at the window roll.
+      </div>
+    </div>
+  ) : null;
+
   const saveSection = onSave ? (
     <div className={cn("flex flex-col gap-3 sm:flex-row sm:items-end", isPlain ? "" : "rounded-xl border border-border/70 bg-background/50 p-3")}>
       <div className="min-w-0 flex-1">
@@ -219,6 +242,7 @@ export function BudgetPolicyCard({
         {observedBudgetGrid}
         {progressSection}
         {pausedPane}
+        {forgivenPane}
         {saveSection}
         {parsedDraft === null ? (
           <p className="text-xs text-destructive">Enter a valid non-negative dollar amount.</p>
@@ -248,6 +272,7 @@ export function BudgetPolicyCard({
         {observedBudgetGrid}
         {progressSection}
         {pausedPane}
+        {forgivenPane}
         {saveSection}
         {parsedDraft === null ? (
           <p className="text-xs text-destructive">Enter a valid non-negative dollar amount.</p>

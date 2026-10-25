@@ -20,6 +20,23 @@ export const budgetIncidents = pgTable(
     amountLimit: integer("amount_limit").notNull(),
     amountObserved: integer("amount_observed").notNull(),
     status: text("status").notNull().default("open"),
+    /**
+     * Which board action closed this incident, or null (PEN-4742).
+     *
+     * `status` cannot answer this: `raise_budget_and_resume`,
+     * `resume_without_raise` and every *system* closure all land as `resolved`.
+     * `resume_without_raise` grants a window-scoped rebaseline of the hard stop,
+     * so the decision has to be readable from the row afterwards --
+     * `hardStopForgivenSince` reads exactly this column.
+     *
+     * Null means "not closed by a board decision": every row predating the
+     * column, plus system closures (`upsertPolicy` clearing a policy's
+     * incidents, `clearExpiredBudgetPause` at the window roll). Null never
+     * confers a grant, so both directions fail closed.
+     *
+     * Values come from `BUDGET_INCIDENT_RESOLUTION_ACTIONS`.
+     */
+    resolutionAction: text("resolution_action"),
     approvalId: uuid("approval_id").references(() => approvals.id),
     resolvedAt: timestamp("resolved_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),

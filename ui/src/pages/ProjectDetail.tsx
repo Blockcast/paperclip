@@ -652,6 +652,8 @@ export function ProjectDetail() {
       status: "ok",
       paused: Boolean(project?.pausedAt),
       pauseReason: project?.pauseReason ?? null,
+      // See AgentDetail: a synthesised fallback carries no grant.
+      hardStopForgivenSince: null,
       windowStart: new Date(),
       windowEnd: new Date(),
     } satisfies BudgetPolicySummary;
