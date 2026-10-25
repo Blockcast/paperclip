@@ -13329,8 +13329,7 @@ export function isFalseAdapterTimeoutResult(
     result.timedOut === true &&
     result.exitCode === 0 &&
     result.errorCode === "timeout" &&
-    typeof result.errorMessage === "string" &&
-    /^Timed out after [0-9]+s$/.test(result.errorMessage.trim()) &&
+    // Structural contradiction only; no errorMessage text match (BLO-23296).
     !hasStructuredAdapterFailureEvidence(result.resultJson)
   );
 }

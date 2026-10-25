@@ -1,3 +1,4 @@
+import { formatTimeoutMessage } from "@paperclipai/adapter-utils/server-utils";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -1565,6 +1566,7 @@ export function createAcpxLocalExecutor(deps: ExecuteDeps = {}) {
     let controller: AbortController | null = null;
     let timeout: NodeJS.Timeout | null = null;
     let timedOut = false;
+    const turnStartedAt = Date.now();
     const textParts: string[] = [];
     try {
       const timeoutMs = prepared.timeoutSec > 0 ? prepared.timeoutSec * 1000 : undefined;
@@ -1573,7 +1575,7 @@ export function createAcpxLocalExecutor(deps: ExecuteDeps = {}) {
         timeout = setTimeout(() => {
           timedOut = true;
           controller?.abort();
-          void cancelActiveTurn?.(`Timed out after ${prepared.timeoutSec}s`).catch(() => {});
+          void cancelActiveTurn?.(formatTimeoutMessage(prepared.timeoutSec, turnStartedAt)).catch(() => {});
         }, timeoutMs);
       }
       const turn = runtime.startTurn({
@@ -1653,7 +1655,7 @@ export function createAcpxLocalExecutor(deps: ExecuteDeps = {}) {
       }
 
       const errorMessage = timedOut
-        ? `Timed out after ${prepared.timeoutSec}s`
+        ? formatTimeoutMessage(prepared.timeoutSec, turnStartedAt)
         : resultErrorMessage(terminal);
       const terminalStopReason = terminal.status === "failed" ? terminal.error.message : terminal.stopReason;
       await emitAcpxLog(ctx, {
@@ -1689,7 +1691,7 @@ export function createAcpxLocalExecutor(deps: ExecuteDeps = {}) {
       };
     } catch (err) {
       if (timeout) clearTimeout(timeout);
-      const messageOverride = timedOut ? `Timed out after ${prepared.timeoutSec}s` : undefined;
+      const messageOverride = timedOut ? formatTimeoutMessage(prepared.timeoutSec, turnStartedAt) : undefined;
       const cancel = cancelActiveTurn as ((reason: string) => Promise<void>) | null;
       const preEmitMessage =
         messageOverride ?? (err instanceof Error ? err.message : String(err));

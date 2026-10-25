@@ -3420,3 +3420,20 @@ export async function runChildProcess(
       .catch(reject);
   });
 }
+
+/**
+ * Timeout error text for an adapter run (BLO-23296). Reports MEASURED elapsed
+ * time, never the configured `timeoutSec` as though it were a measurement: the
+ * old `Timed out after ${timeoutSec}s` read "3600s" on a run that exited 0 in
+ * 6m24s. With no start time it omits the duration and names only the limit.
+ */
+export function formatTimeoutMessage(
+  timeoutSec: number,
+  startedAt: string | number | null | undefined,
+  now: number = Date.now(),
+): string {
+  const startMs = typeof startedAt === "string" ? Date.parse(startedAt) : startedAt ?? NaN;
+  if (!Number.isFinite(startMs)) return `Timed out (limit ${timeoutSec}s)`;
+  const elapsedSec = Math.max(0, Math.round((now - startMs) / 1000));
+  return `Timed out after ${elapsedSec}s (limit ${timeoutSec}s)`;
+}
