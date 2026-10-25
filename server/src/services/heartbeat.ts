@@ -28253,6 +28253,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * latency (~30 s) for an agent whose queued run would have started inside the
    * sweep.
    *
+   * ⚠️ "Redundant" is exact about dispatch and not about two side effects that
+   * ride along with it. `startNextQueuedRunForAgent` also records head-rescan
+   * demand and, for an agent that is no longer invokable, calls
+   * `cancelActiveForAgentInternal` — both before it looks at the queue, so both
+   * used to fire for a reaped agent holding NO queued run. `resumeQueuedRuns`
+   * selects agents by `status = "queued"`, so it never visits that agent and
+   * does not re-trigger either effect. Assessed as harmless: the reaped run is
+   * already terminal by this point, and both start-lock entries have suppressed
+   * these same effects for as long as they have passed the flag. Named here so
+   * the redundancy claim is not read wider than it holds.
+   *
    * ponytail: this covers 2 of the 3 re-entry points. `releaseIssueExecutionAndPromote`
    * dispatches a *promoted* run without consulting the flag, by design
    * (BLO-35940), and that path is deliberately OUT OF SCOPE here: it fires only
