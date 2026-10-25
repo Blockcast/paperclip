@@ -133,6 +133,16 @@ const KNOWN_FLAG_MASK = GC_FLAG_BITS.reduce((mask, [bit]) => mask | bit, 0);
  * Deliberately only three. The `flags` label is a bitfield set, so the full
  * cross-product is 4 kinds x 64 combinations; pre-creating it would trade a
  * readability problem for a cardinality one.
+ *
+ * ⚠️ These are exact label combinations, not flag predicates, and the
+ * difference decides how a `0` here may be read. Because `flags` renders the
+ * whole set, a major carrying `schedule_idle|forced` is a *different* series
+ * from the pre-created `major|schedule_idle`. So a pre-created series still
+ * reading `0` means **that exact combination** never fired — not that the bit
+ * never appeared, which it may well have done alongside another one. A query
+ * asking whether a bit was ever set at all must match the set rather than
+ * equal it (`flags=~".*schedule_idle.*"`), or read the whole distribution with
+ * `sum by (kind, flags)`, which is what PEN-3314 should do in any case.
  */
 const PRE_INITIALISED_SERIES: ReadonlyArray<readonly [number, number]> = [
   [constants.NODE_PERFORMANCE_GC_MAJOR, 0],
