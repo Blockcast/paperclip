@@ -108,6 +108,30 @@ describe("heartbeat timeout outcome", () => {
     it("still finalizes a legacy-message false timeout as succeeded", () => {
       expect(finalize(falseTimeout("Timed out after 3600s"))).toBe("succeeded");
     });
+
+    // The vendored claude_k8s adapter (`buildTimeoutExecutionResult`) emits
+    // `errorCode: "timeout"` with non-legacy text and the pod's real exit code.
+    // Its exact output is pinned by `execute: timeout result construction` in
+    // vendor/paperclip-adapter-claude-k8s/src/server/execute.test.ts; this pins
+    // how the server finalizes it. Under the old regex an exit-0 run here
+    // finalized `failed`; it must now be `succeeded`.
+    const claudeK8sTimeout = (exitCode: number | null) => ({
+      exitCode,
+      signal: null,
+      timedOut: true,
+      errorCode: "timeout",
+      errorMessage: "Timed out after 7200s (Job activeDeadlineSeconds; adapter timeoutSec=0)",
+      resultJson: { observedTimeoutSec: 7200, observedTimeoutSource: "job_deadline", configuredTimeoutSec: 0 },
+    });
+
+    it("finalizes a claude_k8s exit-0 timeout as succeeded", () => {
+      expect(finalize(claudeK8sTimeout(0))).toBe("succeeded");
+    });
+
+    it("finalizes a claude_k8s non-zero or unknown-exit timeout as timed_out", () => {
+      expect(finalize(claudeK8sTimeout(137))).toBe("timed_out");
+      expect(finalize(claudeK8sTimeout(null))).toBe("timed_out");
+    });
   });
 
   describe("formatTimeoutMessage (BLO-23296)", () => {
