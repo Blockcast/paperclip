@@ -123,6 +123,42 @@ describe("gcKindLabel", () => {
 });
 
 describe("registerGcFlagsCollector", () => {
+  it("publishes the discriminator series at zero before any cycle is observed", async () => {
+    // The property that makes a negative result readable. Without it, "the
+    // memory-reducing GC never ran" and "this build predates the collector"
+    // are the same empty scrape — the confusion that cost PEN-3314 a source
+    // grep, a merge-base and a pod inspection on 2026-10-25.
+    const text = await renderAfter([]);
+    expect(text).toContain(
+      `${GC_CYCLES_METRIC}{kind="major",flags="all_available_garbage"} 0`,
+    );
+    expect(text).toContain(`${GC_CYCLES_METRIC}{kind="major",flags="none"} 0`);
+    expect(text).toContain(`${GC_CYCLES_METRIC}{kind="minor",flags="none"} 0`);
+  });
+
+  it("keeps the pre-created series bounded to three", async () => {
+    // Zero-init is a cardinality decision as much as a readability one: the
+    // flags label is a bitfield set, so pre-creating the cross-product would
+    // be 4 kinds x 64 combinations.
+    const text = await renderAfter([]);
+    const series = text
+      .split("\n")
+      .filter(line => line.startsWith(`${GC_CYCLES_METRIC}{`));
+    expect(series).toHaveLength(3);
+  });
+
+  it("counts from the pre-created zero rather than restarting at it", async () => {
+    // Guards the ordering bug this would have if the zero-init ran after the
+    // observer had already been fed: a reset to 0 would silently lose cycles.
+    const text = await renderAfter([
+      gcEntry(NODE_PERFORMANCE_GC_MAJOR, NODE_PERFORMANCE_GC_FLAGS_ALL_AVAILABLE_GARBAGE),
+      gcEntry(NODE_PERFORMANCE_GC_MAJOR, NODE_PERFORMANCE_GC_FLAGS_ALL_AVAILABLE_GARBAGE),
+    ]);
+    expect(text).toContain(
+      `${GC_CYCLES_METRIC}{kind="major",flags="all_available_garbage"} 2`,
+    );
+  });
+
   it("separates a memory-reducing major from an ordinary one", async () => {
     // The discriminator PEN-3314 needs: both are kind=major, and today both
     // land in the same `nodejs_gc_duration_seconds` series.

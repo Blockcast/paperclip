@@ -102,6 +102,38 @@ export const GC_FLAGS_NONE = "none";
 const KNOWN_FLAG_MASK = GC_FLAG_BITS.reduce((mask, [bit]) => mask | bit, 0);
 
 /**
+ * Series created at zero when the collector starts, as `(kind, flags)` pairs.
+ *
+ * A prom-client counter emits nothing until its first `inc()`, so a GC class
+ * that never runs is *absent* from the scrape rather than zero — and absent is
+ * exactly the reading this module cannot afford. PEN-3314's question is whether
+ * the memory-reducing full GC coincides with a page-pool release; if the answer
+ * is "that class never fires", the honest result and a process that never
+ * loaded this file render identically, and the row has already lost time to two
+ * traps of precisely that shape (`v8_heap_physical`, `bucket_bytes`) where an
+ * empty read was mistaken for "never shipped".
+ *
+ * Confirmed live on 2026-10-25: `paperclip_gc_cycles_total` read empty while
+ * the sibling `paperclip_process_mapping_*` series — same registry, same
+ * `/metrics` endpoint, same process — were populated. Distinguishing "not
+ * deployed" from "never fired" took a source grep, a `merge-base`, and a pod
+ * inspection. With these three series pre-created it is one query: absent means
+ * the build predates this module, `0` means the class genuinely never ran.
+ *
+ * Deliberately only three. The `flags` label is a bitfield set, so the full
+ * cross-product is 4 kinds x 64 combinations; pre-creating it would trade one
+ * cardinality problem for another. These are the series the PEN-3314 read
+ * needs — the discriminator, the ordinary major it must be told apart from, and
+ * the ambient scavenge that shows the observer is receiving entries at all.
+ * Every other combination still appears on first occurrence.
+ */
+const PRE_INITIALISED_SERIES: ReadonlyArray<readonly [number, number]> = [
+  [constants.NODE_PERFORMANCE_GC_MAJOR, 0],
+  [constants.NODE_PERFORMANCE_GC_MAJOR, constants.NODE_PERFORMANCE_GC_FLAGS_ALL_AVAILABLE_GARBAGE],
+  [constants.NODE_PERFORMANCE_GC_MINOR, 0],
+];
+
+/**
  * Map `entry.detail.kind` to a stable label.
  *
  * Unrecognised kinds collapse to {@link GC_KIND_UNKNOWN} rather than leaking the
@@ -205,6 +237,12 @@ export function registerGcFlagsCollector(
     labelNames: ["kind", "flags"],
     registers: [registry],
   });
+
+  // Zero-init the series PEN-3314 reads, so "this class never fired" is a 0
+  // rather than an absence. See PRE_INITIALISED_SERIES for why these three.
+  for (const [kind, flags] of PRE_INITIALISED_SERIES) {
+    cycles.inc({ kind: gcKindLabel(kind), flags: gcFlagsLabel(flags) }, 0);
+  }
 
   const onEntries = (entries: readonly PerformanceEntry[]): void => {
     for (const entry of entries) {
