@@ -72,7 +72,7 @@
 // limits are written down and tracked.
 
 import { spawn, spawnSync } from "node:child_process";
-import { accessSync, constants, realpathSync } from "node:fs";
+import { accessSync, constants, readdirSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -282,10 +282,14 @@ function publishVerbRefusal(publishVerb: GitPublishVerb): GitEgressRuntimeError 
  * match the gate asks for is therefore structural rather than something that can
  * drift.
  *
- * Injected for every repository, not just the two that gate on it. A trailer is
- * accurate wherever an agent commits, and a per-repo allowlist is a second thing
- * to keep correct that fails silently — toward the unsigned commit — when it is
- * not.
+ * Injected ONLY in a repository that ships its own DCO gate — a workflow under
+ * `.github/workflows/` whose file name contains `dco` (magma's `dco-check.yml`).
+ * Global injection (paperclip#2461) certified the DCO on code headed for
+ * third-party upstreams, which agents must not do: `Blockcast/moqtail`, a fork
+ * of `moqtail/moqtail`, received two sign-offs the agent never typed
+ * (BLO-40682). Reading the gate from the checkout rather than from a repo-name
+ * allowlist means a repo that adds a DCO workflow is covered with no change
+ * here, and the decision is made by the same file the gate runs from.
  *
  * Placement is AFTER the subcommand, unlike the `core.hooksPath` injection
  * below: `--signoff` is a `commit` option, not a global one. It goes first among
@@ -307,6 +311,15 @@ function publishVerbRefusal(publishVerb: GitPublishVerb): GitEgressRuntimeError 
  * the surface of a classifier whose four measured bypasses were all drift of
  * exactly that kind.
  */
+/** Does the checkout at `toplevel` carry a DCO gate workflow? See {@link withSignoff}. */
+export function repoGatesOnDco(toplevel: string): boolean {
+  try {
+    return readdirSync(path.join(toplevel, ".github", "workflows")).some((name) => /dco/i.test(name));
+  } catch {
+    return false;
+  }
+}
+
 function withSignoff(
   argv: readonly string[],
   classification: { subcommandIndex: number },
@@ -323,6 +336,8 @@ export function buildGitArgv(
     env?: NodeJS.ProcessEnv;
     /** Seam for the fs check; the default is the real one. */
     hookPresent?: (hooksDir: string) => boolean;
+    /** Does the target repository gate merges on DCO? Absent means no. */
+    requiresSignoff?: () => boolean;
   },
 ): string[] {
   const classification = classifyGitInvocation(argv, options.resolveAlias, options.env ?? {});
@@ -379,7 +394,9 @@ export function buildGitArgv(
     throw publishVerbRefusal(classification.publishVerb);
   }
 
-  if (classification.subcommand === "commit") return withSignoff(argv, classification);
+  if (classification.subcommand === "commit") {
+    return options.requiresSignoff?.() ? withSignoff(argv, classification) : [...argv];
+  }
 
   if (!classification.isPush) return [...argv];
 
@@ -580,11 +597,23 @@ export function runGitEgressRuntime(options: {
     return value.length > 0 ? value : null;
   };
 
+  // Same reasoning as the alias lookup: the caller's globals pick the repository.
+  const requiresSignoff = (): boolean => {
+    const result = spawnSync(options.target, [...globals, "rev-parse", "--show-toplevel"], {
+      encoding: "utf8",
+      env,
+      timeout: 10_000,
+    });
+    if (result.error || result.status !== 0) return false;
+    return repoGatesOnDco(result.stdout.trim());
+  };
+
   const argv = buildGitArgv(options.argv, {
     hooksDir: options.hooksDir,
     resolveAlias,
     env,
     hookPresent: options.hookPresent,
+    requiresSignoff,
   });
 
   return new Promise((resolve, reject) => {
