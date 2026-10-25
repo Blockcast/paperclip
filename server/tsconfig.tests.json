@@ -14,6 +14,7 @@
     "src/__tests__/app-plugin-takeover-resync.test.ts",
     "src/__tests__/budget-consumption-metric.test.ts",
     "src/__tests__/cold-in-review-issue-metrics.test.ts",
+    "src/__tests__/gc-flags-metrics.test.ts",
     "src/__tests__/github-api-refusal-metric.test.ts",
     "src/__tests__/github-webhook-dedicated-pool.test.ts",
     "src/__tests__/github-webhook-issue-lookup-filtered.test.ts",
