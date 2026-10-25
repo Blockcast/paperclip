@@ -122,8 +122,54 @@ import { readFileSync } from "node:fs";
 
 /** Anonymous memory charged to the cgroup. The sibling row (PEN-3314) owns this one. */
 export const CGROUP_ANON_COMPONENT = "anon";
-/** Page cache charged to the cgroup. Excluded as (B)'s driver by SIGN at node level. */
+/**
+ * Page cache charged to the cgroup.
+ *
+ * ⚠ **The node-level SIGN exclusion does not survive contact with this
+ * instrument, and that is why the breakdown below exists.** (B) excluded page
+ * cache as its driver because node `Cached` FELL 28.4 -> 19.2 GiB while the pod
+ * residual climbed +5.0. That argument is about the NODE; this gauge is about
+ * the one cgroup, and the two came apart the first time anyone could compare
+ * them. In the first within-life climb measured here -- `paperclip-1`,
+ * 2026-10-24T08:00Z -> 10-25T06:00Z, one pod life, +2.158 GiB of
+ * `memory.current` -- `file` contributed **+1175.6 MiB (53.2%)**, the single
+ * largest term, against `slab_reclaimable`'s +15.9 MiB (0.72%).
+ *
+ * ⛔ That is NOT a refutation of the 09-25..09-28 slab attribution and must not
+ * be cited as one: this was a 3.78 GiB level, roughly a third of the 10.74 GiB
+ * excursion, on a different pod. It is the reason the question is now worth
+ * decomposing rather than assuming.
+ */
 export const CGROUP_FILE_COMPONENT = "file";
+/**
+ * Page cache on the inactive list -- the half that is CHEAP to reclaim.
+ *
+ * `file` alone cannot answer the question its own size now raises: a cgroup
+ * sitting on gigabytes of cold, clean page cache is the kernel working as
+ * designed and gives the memory back under pressure, while the same number in
+ * dirty or mapped pages is headroom that is NOT available and is a different
+ * defect. Splitting the dominant growth term is what tells those apart.
+ */
+export const CGROUP_INACTIVE_FILE_COMPONENT = "inactive_file";
+/** Page cache on the active list. Reclaimed only after the inactive list is exhausted. */
+export const CGROUP_ACTIVE_FILE_COMPONENT = "active_file";
+/**
+ * File pages mapped into page tables.
+ *
+ * These cannot simply be dropped while a process maps them, so this is the part
+ * of `file` that behaves like a floor rather than like cache.
+ */
+export const CGROUP_FILE_MAPPED_COMPONENT = "file_mapped";
+/** Dirty page cache. Must be written back before it can be reclaimed. */
+export const CGROUP_FILE_DIRTY_COMPONENT = "file_dirty";
+/**
+ * Page cache under writeback right now.
+ *
+ * Named so that reclaim stalling on writeback is distinguishable from reclaim
+ * having nothing to reclaim -- the two produce the same `memory.current` and
+ * very different remedies.
+ */
+export const CGROUP_FILE_WRITEBACK_COMPONENT = "file_writeback";
 /** Kernel memory total, inclusive of slab. */
 export const CGROUP_KERNEL_COMPONENT = "kernel";
 /** Kernel stacks. Scales with thread count, not with cache. */
@@ -165,6 +211,11 @@ export const CGROUP_SLAB_COMPONENT = "slab";
 const STAT_COMPONENTS: readonly string[] = [
   CGROUP_ANON_COMPONENT,
   CGROUP_FILE_COMPONENT,
+  CGROUP_INACTIVE_FILE_COMPONENT,
+  CGROUP_ACTIVE_FILE_COMPONENT,
+  CGROUP_FILE_MAPPED_COMPONENT,
+  CGROUP_FILE_DIRTY_COMPONENT,
+  CGROUP_FILE_WRITEBACK_COMPONENT,
   CGROUP_KERNEL_COMPONENT,
   CGROUP_KERNEL_STACK_COMPONENT,
   CGROUP_PAGETABLES_COMPONENT,
