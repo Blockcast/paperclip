@@ -594,6 +594,17 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(agentRuntimeBake).toContain("type=gha,scope=agent-runtime-base");
   });
 
+  it("builds agent runtime images daemonless on the remote BuildKit (BLO-48930)", () => {
+    // arc-paperclip-buildkit has no Docker daemon, so the default
+    // docker-container buildx driver would fail there.
+    expect(agentRuntimeImagesWorkflow).toContain("runs-on: arc-paperclip-buildkit");
+    expect(agentRuntimeImagesWorkflow).not.toContain("runs-on: arc-dind");
+    expect(agentRuntimeImagesWorkflow).toContain("driver: remote");
+    expect(agentRuntimeImagesWorkflow).toContain(
+      "endpoint: ${{ steps.buildkit-endpoint.outputs.endpoint }}",
+    );
+  });
+
   it("keeps the designer Docker build context aligned with npm ci inputs", () => {
     expect(dockerDesignerWorkflow).toContain("context: packages/services/designer");
     expect(dockerDesignerWorkflow).toContain("file: packages/services/designer/Dockerfile");

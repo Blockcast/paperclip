@@ -55,7 +55,7 @@ concurrency:
 jobs:
   measure:
     name: Measure shard ${{ matrix.shard_index }}
-    runs-on: default
+    runs-on: arc-paperclip-general
     # 120, not 90: BLO-28956 widened the measured set from the 536 general-server
     # suites to all 666 server suites (the serialized route/authz lane now draws
     # its partition from this manifest too). A measure shard's slowest observed
@@ -115,7 +115,7 @@ jobs:
     # them. If all four shards fail there is nothing to download and this job
     # fails loudly, which is the right outcome for a total measurement loss.
     if: ${{ !cancelled() }}
-    runs-on: default
+    runs-on: arc-paperclip-light
     timeout-minutes: 10
     permissions:
       contents: write
