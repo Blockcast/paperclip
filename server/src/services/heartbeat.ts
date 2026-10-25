@@ -42458,8 +42458,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // (`blockcast/...`), and history already holds both. A case-sensitive `=`
       // missed a succeeded successor and kept an already-reviewed PR paging.
       // No index covers taskKey on either table, so `lower()` costs nothing.
-      const wakeTaskKeyLower = sql<string | null>`lower(${wakeTaskKey})`;
-      const runTaskKeyLower = sql<string | null>`lower(${heartbeatRuns.contextTaskKey})`;
+      const wakeTaskKeyLower = wakeTaskKey;
+      const runTaskKeyLower = heartbeatRuns.contextTaskKey;
 
       const selectCandidates = async (scope: "pr_review" | "other", limit: number) =>
         db
@@ -42546,7 +42546,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               sql`not exists (
                 select 1
                 from agent_wakeup_requests successor_wake
-                where lower(successor_wake.payload ->> 'taskKey') = lower(${wakeTaskKey})
+                where successor_wake.payload ->> 'taskKey' = ${wakeTaskKey}
                   and successor_wake.id <> ${agentWakeupRequests.id}
                   and successor_wake.requested_at > ${agentWakeupRequests.finishedAt}
                   and successor_wake.requested_at > ${cutoff.toISOString()}::timestamptz
@@ -42557,7 +42557,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               sql`not exists (
                 select 1
                 from heartbeat_runs successor_run
-                where lower(successor_run.context_task_key) = lower(${wakeTaskKey})
+                where successor_run.context_task_key = ${wakeTaskKey}
                   and successor_run.created_at > ${cutoff.toISOString()}::timestamptz
                   and (
                     (successor_run.created_at > ${agentWakeupRequests.finishedAt}
@@ -42616,7 +42616,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // the oldest candidate's finishedAt keeps them off a full-table scan.
       const taskKeys = [
         ...new Set(
-          rows.map((row) => row.taskKey?.toLowerCase()).filter((key): key is string => !!key),
+          rows.map((row) => row.taskKey).filter((key): key is string => !!key),
         ),
       ];
       const oldestFinishedAt = rows.reduce<Date>(
@@ -42727,7 +42727,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       for (const row of rows) {
         const finishedAt = row.finishedAt;
         if (row.taskKey && finishedAt) {
-          const key = row.taskKey.toLowerCase();
+          const key = row.taskKey;
           const successorAt = latestSuccessorByTaskKey.get(key);
           // Strictly-after: a successor stamped at the same instant as the
           // failure is the same event, not a re-drive.
