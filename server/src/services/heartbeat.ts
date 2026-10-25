@@ -1164,6 +1164,64 @@ export const UNCLAIMABLE_QUEUED_RUN_REAP_BATCH_SIZE = 200;
 export const UNCLAIMABLE_QUEUED_RUN_REAP_MAX_BATCHES = 25;
 
 /**
+ * The three `tickTimers` exclusions that fire BEFORE `checked += 1` (PEN-4737).
+ *
+ * Narrowed to a literal union so a call site cannot mint a label: every member
+ * is already in `KNOWN_HEARTBEAT_TIMER_SCHEDULER_EXCLUSIONS`, and is already the
+ * durable `agent_wakeup_requests.reason` that `enqueueWakeup` writes when the
+ * SAME condition declines an event-driven wake. The timer loop `continue`s
+ * before it ever calls `enqueueWakeup`, which is why these three were the only
+ * exclusions in the loop with no counter and no row (PEN-2130 AC3).
+ */
+export type TimerPreDispatchExclusionReason =
+  | "agent.not_invokable"
+  | "heartbeat.disabled"
+  | "heartbeat.worktree_execution_cutoff";
+
+/**
+ * `source` for the pre-dispatch timer exclusion ledger (PEN-4737).
+ *
+ * Deliberately NOT `"timer"`. Since BLO-34578 the latest `source: "timer"` row
+ * IS the agent's timer baseline (`lastTimerWakeAtByAgentId`), so filing these
+ * rows under that source would advance the baseline for an agent the loop never
+ * actually ticked. The agent would then have to wait a further full
+ * `intervalSec` after it became invokable / enabled / in-scope again before its
+ * first real tick — a recovery delay landing on exactly the starved-agent case
+ * PEN-2130 exists to fix, and unbounded for the `intervalSec <= 0` branch that
+ * has no interval at all. A distinct source keeps the baseline read untouched,
+ * so this change is observability-only and moves no scheduling decision.
+ *
+ * Safe as a new value: `agent_wakeup_requests.source` is free text with no
+ * enum, and both consumers that project the column are scoped away from these
+ * rows — the lockless-deferred-wake drain reads `status =
+ * 'deferred_issue_execution'`, and issue wake diagnostics joins on an issue id
+ * in the payload, which these rows deliberately do not carry.
+ */
+export const TIMER_PRE_DISPATCH_EXCLUSION_SOURCE = "timer_excluded";
+
+/**
+ * Cadence of the pre-dispatch exclusion ledger: at most one row, and one
+ * counter increment, per (agent, reason) per hour.
+ *
+ * These three branches sit above the dueness gate, so unlike the four
+ * exclusions below `checked += 1` they are NOT gated by the agent's own
+ * `intervalSec` — and for the `intervalSec <= 0` branch there is no interval to
+ * gate on even in principle. Left ungated they would write on every scheduler
+ * pass: `heartbeatSchedulerIntervalMs` defaults to 30s, so 2,880 rows per
+ * excluded agent per day, on the largest table in the schema and one with no
+ * pruning. That is the defect Ally caught on #1196 and `0d31bfcd` fixed for the
+ * circuit breakers.
+ *
+ * One hour, fixed, rather than derived from policy: it makes the write volume a
+ * function of the agent roster (agents x distinct reasons x 24 rows/day) rather
+ * than of scheduler frequency or of per-agent config, which is the property
+ * that actually has to hold. It is also the resolution PEN-2130's diagnostic
+ * query needs — "has this agent been excluded since T?" — without pretending to
+ * resolve the minute the exclusion began.
+ */
+export const TIMER_PRE_DISPATCH_EXCLUSION_INTERVAL_MS = 60 * 60 * 1000;
+
+/**
  * Choose the durable reason for a timer wake that did not dispatch.
  *
  * A dependency-blocked wake is a deferral, not a terminal skip: the retry park
@@ -44066,11 +44124,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         //
         // That is a real observability gap, and
         // paperclip_heartbeat_timer_scheduler_exclusion_total does NOT close
-        // it: every one of its call sites is below `checked += 1`, so none of
-        // them is reachable from this return. Its
-        // `heartbeat.scheduling_suppressed` label exists but is emitted from
-        // inside the per-agent loop, which this return skips -- so the label
-        // being present is not evidence the counter moves here. Global
+        // it: every one of its call sites is inside the per-agent loop, which
+        // this return skips entirely. (PEN-4737 added three call sites above
+        // `checked += 1`, so "below the counter" is no longer the reason they
+        // are unreachable from here -- "before the loop" is.) Its
+        // `heartbeat.scheduling_suppressed` label exists but is likewise
+        // emitted from inside that loop, so the label being present is not
+        // evidence the counter moves here. Global
         // suppression is observable from the scheduling-suppression record and
         // worker state instead; see the cause list on
         // HEARTBEAT_TIMER_CHECKED_METRIC in metrics.ts.
@@ -44256,11 +44316,113 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
       }
 
+      // PEN-4737: the pre-dispatch exclusion ledger's own cadence gate.
+      //
+      // Membership of this set means "already recorded for this (agent, reason)
+      // inside the current window", so the gate below is a plain lookup. The
+      // `requestedAt >= windowStart` bound is what makes that affordable
+      // without a new index. BLO-34578's baseline read needed the partial
+      // `agent_wakeup_requests_timer_baseline_idx` precisely because its
+      // `MAX(requested_at)` had no time bound, so `agentRequestedIdx` would
+      // have made each agent's whole history the scan bound. This read is
+      // bounded: it probes that same `(agent_id, requested_at)` index by agent,
+      // range-scans a one-hour tail, and leaves `source` as a recheck over the
+      // handful of rows inside it.
+      const exclusionWindowStart = new Date(
+        now.getTime() - TIMER_PRE_DISPATCH_EXCLUSION_INTERVAL_MS,
+      );
+      const preDispatchExclusionsInWindow = new Set<string>();
+      if (allAgents.length > 0) {
+        const recentExclusionRows = await db
+          .select({
+            agentId: agentWakeupRequests.agentId,
+            reason: agentWakeupRequests.reason,
+          })
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              inArray(agentWakeupRequests.agentId, allAgents.map((agent) => agent.id)),
+              eq(agentWakeupRequests.source, TIMER_PRE_DISPATCH_EXCLUSION_SOURCE),
+              gte(agentWakeupRequests.requestedAt, exclusionWindowStart),
+            ),
+          )
+          .groupBy(agentWakeupRequests.agentId, agentWakeupRequests.reason);
+        for (const row of recentExclusionRows) {
+          if (row.agentId && row.reason) preDispatchExclusionsInWindow.add(`${row.agentId}:${row.reason}`);
+        }
+      }
+
+      /**
+       * Record one of the three exclusions that fire before `checked += 1`.
+       *
+       * Row and counter move together, so the exclusion metric's standing
+       * promise — "each increment has durable evidence in
+       * agent_wakeup_requests" — survives the rate limit. The alternative,
+       * incrementing on every pass and writing hourly, would break that join
+       * for an operator reading a firing series back to its row.
+       *
+       * `checked` and `skipped` are deliberately untouched. These agents were
+       * filtered before the loop counted them, and incrementing `skipped`
+       * without `checked` would put the pass's ledger out of balance for
+       * BLO-22048's unexplained-gap rule. The counter and the row are the new
+       * signal; the tick ledger keeps the meaning BLO-32269 documented.
+       *
+       * `requestedAt` is stamped from the pass's own `now` rather than left to
+       * the column default, so the window arithmetic above is self-consistent
+       * with the clock the rest of the loop reads.
+       */
+      const recordPreDispatchExclusion = async (
+        agent: typeof agents.$inferSelect,
+        reason: TimerPreDispatchExclusionReason,
+        // Value-safe by construction: bounded enums, booleans and numbers only.
+        // No free text, no names, no issue content -- `invokability.message`
+        // and `invokability.details` (which carry ids and the whole org chain)
+        // are deliberately not propagated here.
+        evidence: Record<string, string | number | boolean | null>,
+      ) => {
+        const ledgerKey = `${agent.id}:${reason}`;
+        if (preDispatchExclusionsInWindow.has(ledgerKey)) return;
+        // Added before the await so a single pass cannot double-write, and so a
+        // later pass inside the window short-circuits without re-reading.
+        preDispatchExclusionsInWindow.add(ledgerKey);
+        await db.insert(agentWakeupRequests).values({
+          companyId: agent.companyId,
+          agentId: agent.id,
+          source: TIMER_PRE_DISPATCH_EXCLUSION_SOURCE,
+          triggerDetail: "system",
+          reason,
+          payload: { heartbeatSkip: { reason, ...evidence } },
+          status: "skipped",
+          requestedByActorType: "system",
+          requestedByActorId: "heartbeat_scheduler",
+          requestedAt: now,
+          finishedAt: now,
+        });
+        recordHeartbeatTimerSchedulerExclusion(reason);
+      };
+
       for (const agent of allAgents) {
         const invokability = evaluateAgentInvokability(toAgentOrgRow(agent), agentsByCompany.get(agent.companyId) ?? []);
-        if (!invokability.invokable) continue;
+        if (!invokability.invokable) {
+          await recordPreDispatchExclusion(agent, "agent.not_invokable", {
+            // `AgentInvokabilityBlockReason` is a closed 10-member union, so
+            // this is classed, not free text. It stays in the payload rather
+            // than becoming a metric label: PEN-4737 adds no new label.
+            blockReason: invokability.reason,
+            invalidOrgChain: invokability.invalidOrgChain,
+          });
+          continue;
+        }
         const policy = parseHeartbeatPolicy(agent);
-        if (!policy.enabled || policy.intervalSec <= 0) continue;
+        if (!policy.enabled || policy.intervalSec <= 0) {
+          await recordPreDispatchExclusion(agent, "heartbeat.disabled", {
+            // Both arms of the condition, so a reader can tell a disabled
+            // heartbeat from a zero/negative interval without re-deriving it.
+            enabled: policy.enabled,
+            intervalSec: policy.intervalSec,
+          });
+          continue;
+        }
 
         if (cutoff) {
           const eligibleIssue = await db
@@ -44274,7 +44436,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             ))
             .limit(1)
             .then((rows) => rows[0] ?? null);
-          if (!eligibleIssue) continue;
+          if (!eligibleIssue) {
+            await recordPreDispatchExclusion(agent, "heartbeat.worktree_execution_cutoff", {
+              eligibleIssueCount: 0,
+              // Global deployment config, and already recorded verbatim by the
+              // event-path writer for this same reason, so no new value class.
+              cutoff: cutoff.toISOString(),
+            });
+            continue;
+          }
         }
 
         checked += 1;

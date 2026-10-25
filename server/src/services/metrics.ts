@@ -941,7 +941,13 @@ export const HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC =
  * `tickTimers` (agent not invokable; heartbeat policy disabled or
  * `intervalSec <= 0`; a `getWorktreeExecutionCutoff()` cutoff with no eligible
  * issue behind it), so a fleet where every agent trips one of those yields a
- * completed pass with `checked = 0`. The full cause list is therefore:
+ * completed pass with `checked = 0`. Those three filters are unchanged, and so
+ * is what this counter counts — but since PEN-4737 they are no longer silent:
+ * each one now increments
+ * {@link HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC} under `agent.not_invokable`
+ * / `heartbeat.disabled` / `heartbeat.worktree_execution_cutoff` and writes a
+ * durable `agent_wakeup_requests` row, rate-limited to one per agent per reason
+ * per hour. The full cause list is therefore:
  *   1. the loop is wedged or the process is dead — the case worth paging on;
  *   2. every candidate was filtered out before the counter (above);
  *   3. global scheduling suppression — the caller does not enter `tickTimers`
@@ -956,12 +962,26 @@ export const HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC =
  * Only (1) warrants a restart, and note the trap: restarting for (4) re-enters
  * (4). Rule out 2–6 first.
  *
- * There is no counter that attributes a zero `checked` to which of 2–6 caused
- * it. {@link HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC} does NOT close that
- * gap and must not be read as doing so: every one of its increments happens
- * *after* `checked += 1`, so it is silent in all five of those cases.
- * Distinguish them from process state instead — worker uptime and the
- * scheduling-suppression record for (1)/(3), and the worker log for (4)/(5)/(6).
+ * {@link HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC} narrows a zero `checked`
+ * for the first time since PEN-4737, but does not resolve it alone. A zero
+ * `checked` carrying a non-zero `agent.not_invokable` / `heartbeat.disabled` /
+ * `heartbeat.worktree_execution_cutoff` increase over the same window says the
+ * per-agent loop RAN and excluded agents ahead of the counter, with a durable
+ * `agent_wakeup_requests` row per excluded agent naming which filter caught it.
+ * That is cause (2) — or cause (6), which lets those same increments through
+ * (they are recorded in the loop, not in the rejected tick) and then drops both
+ * halves of the pass. The `logger.warn` (6) emits is what separates the two.
+ *
+ * Read the absence carefully in the other direction: the ledger behind those
+ * three labels is rate-limited to one increment per agent per reason per hour,
+ * so a window shorter than an hour can legitimately show a zero increase while
+ * cause (2) is still in force. Widen the window before concluding it is not (2).
+ *
+ * It attributes none of 1, 3, 4 or 5, and must not be read as doing so: every
+ * one of its call sites is inside the per-agent loop, which (3)/(4)/(5) never
+ * enter and (1) never reaches. Distinguish those from process state instead —
+ * worker uptime and the scheduling-suppression record for (1)/(3), and the
+ * worker log for (4)/(5)/(6).
  *
  * `checked` is also a composite: agents examined, plus `issueMonitors.checked`,
  * plus `expiredIssueMonitors.checked`. A consumer cannot decompose it, so
@@ -970,10 +990,12 @@ export const HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC =
  * do not read it as "agents were considered".
  *
  * Deliberately unlabeled: the consumer is `sum(increase(...[15m])) == 0`, so
- * per-agent breakdown would add cardinality without adding signal. Per-agent
- * detail for *due ticks that were then excluded* lives in
- * {@link HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC} — which, per the paragraph
- * above, is a strictly narrower set than "candidates this loop skipped".
+ * per-agent breakdown would add cardinality without adding signal. Reason-level
+ * detail for timer-loop exclusions lives in
+ * {@link HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC}, which since PEN-4737
+ * spans both sides of this counter: four reasons for candidates excluded after
+ * `checked += 1`, and three for agents filtered before it. It is still not
+ * per-agent — that detail is in `agent_wakeup_requests`, not in a label.
  *
  * Both counters are emitted by the *worker* (`StatefulSet/paperclip`), which is
  * where the timer loop runs and which deploys independently of
@@ -4856,9 +4878,16 @@ function ensureRegistry(): {
     heartbeatTimerSchedulerExclusion = new Counter({
       name: HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC,
       help:
-        "Count of due heartbeat timer ticks excluded before dispatch, labeled by a bounded "
-        + "operational reason. Each increment has durable evidence in agent_wakeup_requests "
-        + "or a scheduled_retry heartbeat run.",
+        "Count of heartbeat timer-loop exclusions, labeled by a bounded operational reason. "
+        + "Each increment has durable evidence in agent_wakeup_requests or a scheduled_retry "
+        + "heartbeat run. Two populations, both in this counter (PEN-4737): due ticks "
+        + "excluded before dispatch, once per due tick; and agents filtered before the loop "
+        + "counts them in " + HEARTBEAT_TIMER_CHECKED_METRIC + " "
+        + "(agent.not_invokable, heartbeat.disabled, heartbeat.worktree_execution_cutoff), "
+        + "rate-limited to one increment per agent per reason per hour because those three "
+        + "run above the dueness gate and would otherwise fire on every 30s scheduler pass. "
+        + "So a non-zero rate on those three is evidence of exclusion, but a zero rate over "
+        + "a window shorter than an hour is not evidence of its absence.",
       labelNames: ["reason"],
       registers: [registry],
     });
@@ -4892,10 +4921,16 @@ function ensureRegistry(): {
         + "shutdown drain. A completed pass is also dropped outright, both halves, if "
         + "either input is not a non-negative finite number -- that is logged with the "
         + "offending field and should never happen. "
-        + HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC + " cannot "
-        + "disambiguate these: it is only incremented after this counter, so it is "
-        + "silent in all of them. Rule them out from worker uptime and logs before "
-        + "restarting. Emitted by the worker, where the timer loop runs (BLO-32269).",
+        + HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC + " narrows these since "
+        + "PEN-4737: a zero here alongside a non-zero agent.not_invokable, "
+        + "heartbeat.disabled or heartbeat.worktree_execution_cutoff increase means the "
+        + "per-agent loop ran and filtered every agent ahead of this counter, not that "
+        + "the loop is dead. Those three are rate-limited to one per agent per reason "
+        + "per hour, so read them over an hour or more, and a zero increase over a "
+        + "shorter window is not evidence against that case. It stays silent for "
+        + "suppression, startup recovery and the shutdown drain -- rule those out from "
+        + "worker uptime and logs before restarting. Emitted by the worker, where the "
+        + "timer loop runs (BLO-32269).",
       registers: [registry],
     });
     heartbeatTimerEnqueued = new Counter({
