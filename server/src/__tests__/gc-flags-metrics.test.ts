@@ -55,18 +55,39 @@ function gcEntry(kind: number | undefined, flags: number | undefined): Performan
   return { detail: { kind, flags } } as unknown as PerformanceEntry;
 }
 
-/** Drive the collector with a fixed set of entries and return the rendered text. */
-async function renderAfter(entries: readonly PerformanceEntry[]): Promise<string> {
+/**
+ * Drive the collector with a fixed set of entries and return the rendered text.
+ *
+ * `when` selects *where in registration* the entries arrive:
+ *
+ * - `"after-register"` (default) feeds them once `registerGcFlagsCollector` has
+ *   returned. Every statement in the function body has already run, so this
+ *   cannot distinguish their order.
+ * - `"during-observe"` feeds them synchronously from inside `observe()`, which
+ *   the collector calls as its last act. That places observed cycles *before*
+ *   anything a future edit might append after the observer is wired, which is
+ *   the only way an ordering claim about the zero-init loop can be tested
+ *   rather than merely asserted in a comment.
+ */
+async function renderAfter(
+  entries: readonly PerformanceEntry[],
+  when: "after-register" | "during-observe" = "after-register",
+): Promise<string> {
   const registry = new Registry();
   let emit: ((e: readonly PerformanceEntry[]) => void) | undefined;
   const handle = registerGcFlagsCollector({
     registry,
     createObserver: onEntries => {
       emit = onEntries;
-      return { observe: () => {}, disconnect: () => {} };
+      return {
+        observe: () => {
+          if (when === "during-observe") onEntries(entries);
+        },
+        disconnect: () => {},
+      };
     },
   });
-  emit?.(entries);
+  if (when === "after-register") emit?.(entries);
   const text = await registry.metrics();
   handle.stop();
   return text;
@@ -161,16 +182,43 @@ describe("registerGcFlagsCollector", () => {
     expect(series).toHaveLength(3);
   });
 
-  it("counts from the pre-created zero rather than restarting at it", async () => {
-    // Guards the ordering bug this would have if the zero-init ran after the
-    // observer had already been fed: a reset to 0 would silently lose cycles.
-    const text = await renderAfter([
-      gcEntry(NODE_PERFORMANCE_GC_MAJOR, NODE_PERFORMANCE_GC_FLAGS_SCHEDULE_IDLE),
-      gcEntry(NODE_PERFORMANCE_GC_MAJOR, NODE_PERFORMANCE_GC_FLAGS_SCHEDULE_IDLE),
-    ]);
+  it("renders one series, not two, when a pre-created class also fires", async () => {
+    // ⛔ This does NOT guard "the zero-init must not reset an already-counted
+    // series", which an earlier revision of this comment claimed. That bug
+    // cannot exist: prom-client's counter `inc(labels, value)` is additive on
+    // an existing child (`hashMap[hash].value += value`, counter.js:138-145),
+    // so `inc(labels, 0)` is a no-op at any point in the sequence and can
+    // never lose a count. Do not "fix" an ordering hazard that is not there.
+    //
+    // What IS worth guarding is label-rendering agreement between the two call
+    // sites. Zero-init goes through `gcKindLabel`/`gcFlagsLabel` and so does
+    // the observer; if those ever disagreed for the same cycle, the class
+    // would render as two series — a permanent 0 beside the real count — and
+    // the readable-negative-result property this PR adds would instead become
+    // a second way to misread the scrape. The count and the series *cardinality*
+    // together are the assertion; the count alone would pass with a stray
+    // zero-series sitting next to it.
+    //
+    // Fed from inside `observe()` so the cycles genuinely arrive during
+    // registration rather than after it.
+    const text = await renderAfter(
+      [
+        gcEntry(NODE_PERFORMANCE_GC_MAJOR, NODE_PERFORMANCE_GC_FLAGS_SCHEDULE_IDLE),
+        gcEntry(NODE_PERFORMANCE_GC_MAJOR, NODE_PERFORMANCE_GC_FLAGS_SCHEDULE_IDLE),
+      ],
+      "during-observe",
+    );
     expect(text).toContain(
       `${GC_CYCLES_METRIC}{kind="major",flags="schedule_idle"} 2`,
     );
+    // Counted over ALL series, not over lines matching this class: two series
+    // for one class necessarily carry *different* label values, so a filter
+    // keyed on the expected rendering can never see the stray one. The drift
+    // shows up as a fourth series, beside the three that were pre-created.
+    const series = text
+      .split("\n")
+      .filter(line => line.startsWith(`${GC_CYCLES_METRIC}{`));
+    expect(series).toHaveLength(3);
   });
 
   it("separates a memory-reducing major from an ordinary one", async () => {
