@@ -44368,19 +44368,43 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // Added before the await so a single pass cannot double-write, and so a
         // later pass inside the window short-circuits without re-reading.
         preDispatchExclusionsInWindow.add(ledgerKey);
-        await db.insert(agentWakeupRequests).values({
-          companyId: agent.companyId,
-          agentId: agent.id,
-          source: TIMER_PRE_DISPATCH_EXCLUSION_SOURCE,
-          triggerDetail: "system",
-          reason,
-          payload: { heartbeatSkip: { reason, ...evidence } },
-          status: "skipped",
-          requestedByActorType: "system",
-          requestedByActorId: "heartbeat_scheduler",
-          requestedAt: now,
-          finishedAt: now,
-        });
+        try {
+          await db.insert(agentWakeupRequests).values({
+            companyId: agent.companyId,
+            agentId: agent.id,
+            source: TIMER_PRE_DISPATCH_EXCLUSION_SOURCE,
+            triggerDetail: "system",
+            reason,
+            payload: { heartbeatSkip: { reason, ...evidence } },
+            status: "skipped",
+            requestedByActorType: "system",
+            requestedByActorId: "heartbeat_scheduler",
+            requestedAt: now,
+            finishedAt: now,
+          });
+        } catch (error) {
+          // Telemetry must not cost a dispatch. This is the only await in the
+          // per-agent loop that exists purely to observe it, so an unguarded
+          // throw here would abort the rest of the pass -- every agent after
+          // this one in `allAgents` goes unticked -- to record that THIS agent
+          // was already being skipped. That inverts PEN-2130: the instrument
+          // for starvation would itself starve the roster.
+          //
+          // The ledger key stays in the set, so a persistent failure is
+          // rate-limited exactly like a successful write: one failed insert and
+          // one warn per (agent, reason) per window, not one per 30s pass. The
+          // signal is not lost, only delayed -- these three conditions are
+          // standing states, so an agent still excluded in the next window is
+          // recorded then.
+          logger.warn(
+            { err: error, agentId: agent.id, companyId: agent.companyId, reason },
+            "failed to record a pre-dispatch heartbeat timer exclusion",
+          );
+          return;
+        }
+        // Only after the row lands, so the metric's standing promise -- each
+        // increment has durable evidence in agent_wakeup_requests -- survives
+        // the failure path too.
         recordHeartbeatTimerSchedulerExclusion(reason);
       };
 
