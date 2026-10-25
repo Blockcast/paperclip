@@ -20378,6 +20378,77 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   /**
+   * Run ids this process can positively prove it owns AND whose lifecycle is
+   * local (no external-lifecycle adapter, no unreleased runtime reservation).
+   * Shared by the crash marker and the graceful drain (BLO-49138): with
+   * replicas > 1 a `status = running` scan alone selects the peer replica's
+   * runs, and an external-lifecycle run may have a live Job that restart
+   * reattach must keep.
+   */
+  async function selectOwnedLocalRunIds(): Promise<string[]> {
+    // Union of both live-execution registries — the same pair `liveRunExecutions`
+    // consults, but enumerated rather than probed.
+    const runIds = Array.from(new Set([...runningProcesses.keys(), ...activeRunExecutions]));
+    if (runIds.length === 0) return [];
+
+    // Decide "is this run's lifecycle ours to end?" from the run, never from
+    // `external_run_id`. A null id does NOT mean local: `executeRun` adds a run
+    // to `activeRunExecutions` before it has even loaded the agent, while the
+    // backing Job name is stamped later and best-effort, only once a reap cycle
+    // observes the Job. A claude_k8s / opencode_k8s run therefore spends a real
+    // window owned-but-unstamped, and terminalizing it there would queue a
+    // replacement against a Job that is still healthy — duplicate execution of
+    // the same run, which is strictly worse than the orphaned row this guard
+    // exists to prevent.
+    //
+    // The agent's `adapterType` is likewise not sufficient on its own: it is
+    // mutable and read here long after dispatch, while `executeRun` made its
+    // lifecycle decision from the agent record it loaded at launch. Reconfigure
+    // a busy K8s agent to a local adapter and this query would classify its
+    // live, unstamped Job as local. So we also consult the run-scoped
+    // external-runtime reservation, which is immutable with respect to agent
+    // config and always exists before `executeRun` proceeds. A run is treated
+    // as ours to end only when *both* signals say local; either one saying
+    // external is enough to leave it alone.
+    //
+    // The inverse transition (local agent reconfigured to K8s while a local
+    // child is live) is left deliberately: it fails toward "leave it running",
+    // which is the pre-existing reaper's job to classify. Same fail-safe
+    // direction as a run whose agent row is missing, which drops out of this
+    // join entirely. We only terminalize work we can positively prove we own.
+    const ownedRuns = await db
+      .select({ runId: heartbeatRuns.id, adapterType: agents.adapterType })
+      .from(heartbeatRuns)
+      .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
+      .where(inArray(heartbeatRuns.id, runIds));
+    const localByAdapter = ownedRuns
+      .filter((row) => !hasExternalLifecycle(row.adapterType))
+      .map((row) => row.runId);
+    if (localByAdapter.length === 0) return [];
+
+    // One batched lookup, not one per run: this runs inside a dying process
+    // racing a fixed budget, and every round trip is time not spent recovering.
+    let reservedRunIds: Set<string>;
+    try {
+      const reserved = await db
+        .select({ runId: externalRuntimeReservations.runId })
+        .from(externalRuntimeReservations)
+        .where(and(
+          inArray(externalRuntimeReservations.runId, localByAdapter),
+          isNull(externalRuntimeReservations.releasedAt),
+        ));
+      reservedRunIds = new Set(reserved.map((row) => row.runId));
+    } catch (error) {
+      // Fail closed: without this signal we cannot prove any of these runs is
+      // local, so leave the whole batch for the reaper rather than risk
+      // terminalizing a live Job.
+      logger.warn({ err: error }, "failed to read external runtime reservations while selecting owned local runs");
+      return [];
+    }
+    return localByAdapter.filter((runId) => !reservedRunIds.has(runId));
+  }
+
+  /**
    * Crash-time counterpart to {@link drainRunningRunsForShutdown} (BLO-19722).
    *
    * A SIGTERM drain gets seconds and a healthy process; this runs from inside
@@ -20425,66 +20496,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // `finished_at`. The recovery that follows each mark is what needs a live
     // clock, and gets one.
     const now = input.now ?? new Date();
-    // Union of both live-execution registries — the same pair `liveRunExecutions`
-    // consults, but enumerated rather than probed.
-    const runIds = Array.from(new Set([...runningProcesses.keys(), ...activeRunExecutions]));
-    if (runIds.length === 0) return { markedRunIds: [] };
-
-    // Decide "is this run's lifecycle ours to end?" from the run, never from
-    // `external_run_id`. A null id does NOT mean local: `executeRun` adds a run
-    // to `activeRunExecutions` before it has even loaded the agent, while the
-    // backing Job name is stamped later and best-effort, only once a reap cycle
-    // observes the Job. A claude_k8s / opencode_k8s run therefore spends a real
-    // window owned-but-unstamped, and terminalizing it there would queue a
-    // replacement against a Job that is still healthy — duplicate execution of
-    // the same run, which is strictly worse than the orphaned row this guard
-    // exists to prevent.
-    //
-    // The agent's `adapterType` is likewise not sufficient on its own: it is
-    // mutable and read here long after dispatch, while `executeRun` made its
-    // lifecycle decision from the agent record it loaded at launch. Reconfigure
-    // a busy K8s agent to a local adapter and this query would classify its
-    // live, unstamped Job as local. So we also consult the run-scoped
-    // external-runtime reservation, which is immutable with respect to agent
-    // config and always exists before `executeRun` proceeds. A run is treated
-    // as ours to end only when *both* signals say local; either one saying
-    // external is enough to leave it alone.
-    //
-    // The inverse transition (local agent reconfigured to K8s while a local
-    // child is live) is left deliberately: it fails toward "leave it running",
-    // which is the pre-existing reaper's job to classify. Same fail-safe
-    // direction as a run whose agent row is missing, which drops out of this
-    // join entirely. We only terminalize work we can positively prove we own.
-    const ownedRuns = await db
-      .select({ runId: heartbeatRuns.id, adapterType: agents.adapterType })
-      .from(heartbeatRuns)
-      .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
-      .where(inArray(heartbeatRuns.id, runIds));
-    const localByAdapter = ownedRuns
-      .filter((row) => !hasExternalLifecycle(row.adapterType))
-      .map((row) => row.runId);
-    if (localByAdapter.length === 0) return { markedRunIds: [] };
-
-    // One batched lookup, not one per run: this runs inside a dying process
-    // racing a fixed budget, and every round trip is time not spent recovering.
-    let reservedRunIds: Set<string>;
-    try {
-      const reserved = await db
-        .select({ runId: externalRuntimeReservations.runId })
-        .from(externalRuntimeReservations)
-        .where(and(
-          inArray(externalRuntimeReservations.runId, localByAdapter),
-          isNull(externalRuntimeReservations.releasedAt),
-        ));
-      reservedRunIds = new Set(reserved.map((row) => row.runId));
-    } catch (error) {
-      // Fail closed: without this signal we cannot prove any of these runs is
-      // local, so leave the whole batch for the reaper rather than risk
-      // terminalizing a live Job.
-      logger.warn({ err: error }, "failed to read external runtime reservations during crash marking");
-      return { markedRunIds: [] };
-    }
-    const localRunIds = localByAdapter.filter((runId) => !reservedRunIds.has(runId));
+    const localRunIds = await selectOwnedLocalRunIds();
     if (localRunIds.length === 0) return { markedRunIds: [] };
 
     const message = `Interrupted by worker process crash (${input.reason})`;
@@ -21284,6 +21296,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function drainRunningRunsForShutdown(signal: "SIGINT" | "SIGTERM", now = new Date()) {
+    // BLO-49138: only runs this replica owns and whose lifecycle is local. A peer
+    // replica's runs, and our own launched k8s Jobs, are left for their owner /
+    // restart reattach — draining them killed 10 live Jobs on 2026-10-24.
+    const ownedLocalRunIds = await selectOwnedLocalRunIds();
+    if (ownedLocalRunIds.length === 0) return { interrupted: 0, interruptedRunIds: [], retryRunIds: [] };
     const activeRuns = await db
       .select({
         run: heartbeatRuns,
@@ -21291,7 +21308,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       })
       .from(heartbeatRuns)
       .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
-      .where(eq(heartbeatRuns.status, "running"));
+      .where(and(eq(heartbeatRuns.status, "running"), inArray(heartbeatRuns.id, ownedLocalRunIds)));
 
     const interruptedRunIds: string[] = [];
     const retryRunIds: string[] = [];
