@@ -297,3 +297,80 @@ describe("registerGcFlagsCollector", () => {
     }
   });
 });
+
+describe("gc cycles HELP text", () => {
+  /**
+   * Every flag name this module can render, derived through the module's own
+   * labeller rather than hardcoded, so a renamed label does not silently
+   * narrow the guard below to a vocabulary that no longer exists.
+   */
+  const ALL_FLAG_LABELS = [
+    constants.NODE_PERFORMANCE_GC_FLAGS_CONSTRUCT_RETAINED,
+    constants.NODE_PERFORMANCE_GC_FLAGS_FORCED,
+    constants.NODE_PERFORMANCE_GC_FLAGS_SYNCHRONOUS_PHANTOM_PROCESSING,
+    constants.NODE_PERFORMANCE_GC_FLAGS_ALL_AVAILABLE_GARBAGE,
+    constants.NODE_PERFORMANCE_GC_FLAGS_ALL_EXTERNAL_MEMORY,
+    constants.NODE_PERFORMANCE_GC_FLAGS_SCHEDULE_IDLE,
+  ].map(bit => gcFlagsLabel(bit));
+
+  /**
+   * The rendered `# HELP` line for the cycles counter.
+   *
+   * Rendered with no entries on purpose: HELP is emitted from registration, so
+   * this asserts what an operator reads off `/metrics` on a quiet process —
+   * which is exactly when someone reaches for this series and has only the
+   * HELP text to go on.
+   */
+  async function helpLine(): Promise<string> {
+    const text = await renderAfter([]);
+    const line = text
+      .split("\n")
+      .find(l => l.startsWith(`# HELP ${GC_CYCLES_METRIC} `));
+    expect(line, `no HELP line rendered for ${GC_CYCLES_METRIC}`).toBeDefined();
+    return line as string;
+  }
+
+  it("does not assert which flag value marks the unmapper's page-release path", async () => {
+    // The claim this file withdraws. An earlier revision read
+    // "'all_available_garbage' marks the cycle class that runs V8's unmapper
+    // page-release path and is the remaining candidate" — measured false
+    // before the series ever shipped: 0 firings in 13 natural major cycles.
+    //
+    // Guarded across every flag name rather than the one that happened to be
+    // wrong, because the risk is re-introducing the *shape* of the claim with
+    // whichever value the next reader finds attractive. `schedule_idle` is the
+    // obvious candidate, having taken 11 of the 13 — and an 11:2 split is a
+    // distribution, not an identification.
+    const line = await helpLine();
+    for (const label of ALL_FLAG_LABELS) {
+      expect(line).not.toMatch(new RegExp(`'${label}'\\s+(marks|is the marker)`, "i"));
+    }
+    // Pinned as the presence of the disclaimer rather than the absence of the
+    // phrase: the corrected text necessarily *contains* "marks the unmapper's
+    // page-release path", inside the sentence that denies it. A keyword ban
+    // broad enough to catch the claim also catches its retraction — which is
+    // how a guard like this ends up deleted as noise instead of narrowed.
+    expect(line).toMatch(/is NOT asserted here/);
+  });
+
+  it("carries the measurement that retired the claim, not just its deletion", async () => {
+    // A bare deletion loses why the guess was dropped, so the next reader
+    // re-derives the same hypothesis and re-spends the same measurement. The
+    // counter-evidence has to travel with the retraction.
+    const line = await helpLine();
+    expect(line).toContain("fire 0 times in 13 natural");
+    expect(line).toContain("11:2");
+  });
+
+  it("directs the reader to the distribution rather than a predicted filter", async () => {
+    // The failure this series is most likely to cause if read carelessly: a
+    // filter on a value V8 never emits returns empty, and empty is then read
+    // as "that cycle class was excluded" when it means "the label never
+    // existed". PEN-3314 has already lost time to two instances of exactly
+    // that confusion (`v8_heap_physical` read as a metric name when it is a
+    // label value; the mapping bucket label being `size_bucket`, not
+    // `bucket_bytes`).
+    const line = await helpLine();
+    expect(line).toContain("sum by (kind, flags)");
+  });
+});
