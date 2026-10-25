@@ -37,9 +37,27 @@
  *
  * What remains unmeasured is *which kind of major cycle ran*, and that is
  * exactly what `kind` collapses: a memory-reducing full GC and an ordinary
- * incremental-marking major are both `kind: "major"`. V8 runs the unmapper's
- * page-release path on the former. `NODE_PERFORMANCE_GC_FLAGS_ALL_AVAILABLE_GARBAGE`
- * marks it, and this module is the only place it becomes visible.
+ * incremental-marking major are both `kind: "major"`. Publishing `flags`
+ * alongside `kind` splits them, and this module is the only place that split
+ * becomes visible.
+ *
+ * ⛔ It deliberately does **not** name which flag value marks the unmapper's
+ * page-release path, and no query against this series should filter on a
+ * predicted one. An earlier revision of this docblock asserted
+ * `NODE_PERFORMANCE_GC_FLAGS_ALL_AVAILABLE_GARBAGE` was that marker. That was
+ * measured false before the series ever shipped: over 13 natural major cycles
+ * (Node v24, synthetic allocation workload) `all_available_garbage` fired
+ * **0 times**, while `kind: "major"` split **11:2** between `schedule_idle`
+ * and `none`. So the split this module exposes is real and the guess about
+ * which bit carries it was not. Read the distribution:
+ *
+ *     sum by (kind, flags) (increase(paperclip_gc_cycles_total[1m]))
+ *
+ * A filter on a value V8 never emits returns empty for a reason that has
+ * nothing to do with its hypothesis, and an empty result is then read as
+ * "the cycle class was excluded" when it means "the label never existed".
+ * That is the same trap PEN-3314 already records for `v8_heap_physical`,
+ * where a name grep read EMPTY as never-shipped.
  *
  * ## Cost
  *
@@ -52,9 +70,9 @@
  * ## What it is not
  *
  * ⛔ Not an alert source, not a fix, and not a claim that the memory-reducing
- * cycle *is* the discriminator. It is the instrument that can decide it. If
- * `all_available_garbage` turns out to fire on the non-releasing ceiling samples
- * too, that is a real answer and this series is how it gets read.
+ * cycle *is* the discriminator. It is the instrument that can decide it. If the
+ * same `{kind, flags}` combinations turn out to fire on the non-releasing
+ * ceiling samples too, that is a real answer and this series is how it gets read.
  *
  * ⛔ Does not replace `nodejs_gc_duration_seconds`. That histogram keeps its
  * duration distribution; this counts cycles by class.
@@ -197,8 +215,12 @@ export function registerGcFlagsCollector(
       + "NECESSARY for a page-pool release (4/4, one 30s sample ahead) but only "
       + "36% sufficient, and neither major-GC count, heap magnitude nor RSS level "
       + "separates the ceilings that release from the ones that do not. "
-      + "'all_available_garbage' marks the cycle class that runs V8's unmapper "
-      + "page-release path and is the remaining candidate. The 'flags' label is "
+      + "Which flag value marks the unmapper's page-release path is NOT "
+      + "asserted here and must not be guessed at query time: read the "
+      + "distribution with sum by (kind, flags). A predicted filter on "
+      + "'all_available_garbage' was measured to fire 0 times in 13 natural "
+      + "major cycles, where 'major' split 11:2 between 'schedule_idle' and "
+      + "'none'. The 'flags' label is "
       + "a set, joined by '|' in a fixed order, so one bit combination is one "
       + "series; unknown bits fold into 'other' and unknown kinds into "
       + "'unknown' rather than rendering raw integers, which bounds cardinality.",
