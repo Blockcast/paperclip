@@ -907,8 +907,9 @@ PENDING=$(printf '%s\n' "$RUNS" | pending_runs)
 CHECKS=$(gh api "repos/$R/commits/$H/check-runs?per_page=100" --paginate) || fetch_failed check-runs $?
 
 # BLO-48833: only when a legacy red has no twin, read the base workflows at the
-# head's PR base sha. Zero extra calls on every other head. Any failure (no PR,
-# several base shas, unreadable file) leaves BASE empty -> STOP.
+# head's PR base sha. Zero extra calls on every other head. A failed pulls fetch
+# exits 3 via fetch_failed; no PR, several base shas, or an unreadable file
+# leaves BASE empty -> STOP.
 # base.sha, not the base branch tip the trusted arm actually runs: base.sha can
 # lag until the PR is next synchronized. A job renamed on master since then only
 # ADDS text here (fails closed); a job ADDED to master since then can read as a
@@ -917,8 +918,11 @@ RENAMED=
 ORPHANS=$(printf '%s' "$CHECKS" | extract | legacy_orphans)
 if [ -n "$ORPHANS" ]; then
   BASE_FILE=$(mktemp); trap 'rm -f "$BASE_FILE"' EXIT
+  # BLO-49045: a partial read can under-count the base shas to exactly 1 and
+  # judge the rename against the wrong base, clearing the red.
   B=$(gh api "repos/$R/commits/$H/pulls?per_page=100" --paginate \
-        --jq ".[]|select(.head.sha==\"$H\")|.base.sha" 2>/dev/null | sort -u)
+        --jq ".[]|select(.head.sha==\"$H\")|.base.sha" 2>/dev/null | sort -u) \
+    || fetch_failed pulls $?
   if [ "$(printf '%s\n' "$B" | grep -c .)" = 1 ] && require_sha "$B" >/dev/null 2>&1 \
      && WF=$(gh api "repos/$R/contents/.github/workflows?ref=$B" \
                --jq '.[]|select(.type=="file")|.path' 2>/dev/null) && [ -n "$WF" ]; then
@@ -938,8 +942,11 @@ rc=$?
 # BLO-48830: the status LIST (it carries `creator`) costs a call, so only on a
 # gated head whose combined status names the context at all.
 SLIST='[]'
-[ -n "$GATED" ] && printf '%s' "$STATUSES" | grep -q '"ci/dispatched-lanes"' \
-  && SLIST=$(gh api "repos/$R/commits/$H/statuses?per_page=100" --paginate)
+# BLO-49045: guarded, not argued. A partial list can hold a stale success
+# witness whose withdrawing re-judge sat on the page that failed.
+if [ -n "$GATED" ] && printf '%s' "$STATUSES" | grep -q '"ci/dispatched-lanes"'; then
+  SLIST=$(gh api "repos/$R/commits/$H/statuses?per_page=100" --paginate) || fetch_failed statuses $?
+fi
 EMPTY=$(printf '%s\n%s\n' "$SLIST" "$CHECKS" | empty_witness)
 printf '%s\n' "$RUNS" | gated_lanes "$H" "$GATED" "$EMPTY"
 exit $rc
