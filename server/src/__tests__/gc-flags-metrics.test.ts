@@ -333,8 +333,8 @@ describe("gc cycles HELP text", () => {
   it("does not assert which flag value marks the unmapper's page-release path", async () => {
     // The claim this file withdraws. An earlier revision read
     // "'all_available_garbage' marks the cycle class that runs V8's unmapper
-    // page-release path and is the remaining candidate" — measured false
-    // before the series ever shipped: 0 firings in 13 natural major cycles.
+    // page-release path and is the remaining candidate" — a bit never
+    // observed to fire: 0 firings in 13 natural major cycles.
     //
     // Guarded across every flag name rather than the one that happened to be
     // wrong, because the risk is re-introducing the *shape* of the claim with
@@ -353,13 +353,23 @@ describe("gc cycles HELP text", () => {
     expect(line).toMatch(/is NOT asserted here/);
   });
 
-  it("carries the measurement that retired the claim, not just its deletion", async () => {
+  it("explains why a predicted filter misleads, in terms that cannot go stale", async () => {
     // A bare deletion loses why the guess was dropped, so the next reader
-    // re-derives the same hypothesis and re-spends the same measurement. The
-    // counter-evidence has to travel with the retraction.
+    // re-derives the same hypothesis. But the counter-evidence that travels
+    // in HELP must be the *durable* half: HELP is rendered on /metrics, where
+    // a dated, workload-specific count ("0 in 13 cycles", "11:2") reads as a
+    // standing fact long after it stops being one. Those numbers live in the
+    // module docblock; what HELP owes the operator is the misread itself —
+    // empty-because-never-emitted being indistinguishable from
+    // empty-because-excluded, the trap PEN-3314 has now hit three times
+    // (`v8_heap_physical` read as a metric name; `bucket_bytes` for
+    // `size_bucket`; a filter on a flag V8 never sets).
     const line = await helpLine();
-    expect(line).toContain("fire 0 times in 13 natural");
-    expect(line).toContain("11:2");
+    expect(line).toContain("the label never existed");
+    expect(line).toMatch(/docblock/);
+    // And the dated counts must not creep back into runtime output.
+    expect(line).not.toMatch(/\b11:2\b/);
+    expect(line).not.toMatch(/13 natural/);
   });
 
   it("directs the reader to the distribution rather than a predicted filter", async () => {
