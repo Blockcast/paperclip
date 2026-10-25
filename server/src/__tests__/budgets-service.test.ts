@@ -1984,7 +1984,7 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
   });
 
   it("does not read a previous window's grant as live (PEN-4742)", async () => {
-    const { companyId, service, policy } = await latchAgentOnBudget(100, 125);
+    const { companyId, agentId, service, policy } = await latchAgentOnBudget(100, 125);
     await resolveHardIncident(service, companyId, { action: "resume_without_raise" });
 
     // The grant surfaces on the policy summary, which is what makes the
@@ -2000,6 +2000,15 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
     const overview = await service.overview(companyId);
     const summary = overview.policies.find((entry) => entry.policyId === policy.id);
     expect(summary!.hardStopForgivenSince).toBeNull();
+
+    // And pinned on an enforcement surface too, not only the summary: with the
+    // grant out of window the cap is enforced against the full window total
+    // again, so the scope stops. The cost events have NOT moved -- this is the
+    // `windowStart` filter doing the work, not a roll.
+    expect(await service.getInvocationBlock(companyId, agentId)).toMatchObject({
+      scopeType: "agent",
+      reason: "Agent cannot start because its budget hard-stop is still exceeded.",
+    });
   });
 
   it("keeps reporting true window spend while a grant is live (PEN-4742)", async () => {
@@ -2199,6 +2208,97 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
       .select({ status: agents.status, pauseReason: agents.pauseReason })
       .from(agents);
     expect(pausedByTheFallback).toMatchObject({ status: "paused", pauseReason: "budget" });
+  });
+
+  it("does not mint a grant for a live crossing when a stale resume replays a closed one (PEN-4742)", async () => {
+    const { companyId, agentId, service, policy } = await latchAgentOnBudget(100, 125);
+
+    // Decision 1 -- a real board adjudication of a real crossing. Incident A
+    // closes carrying the grant, and the grant is measured from that instant.
+    await resolveHardIncident(service, companyId, { action: "resume_without_raise" });
+    const incidentA = await db
+      .select()
+      .from(budgetIncidents)
+      .where(eq(budgetIncidents.thresholdType, "hard"))
+      .then((rows) => rows[0]!);
+    expect(incidentA).toMatchObject({ status: "resolved", resolutionAction: "resume_without_raise" });
+
+    // The scope then burns a whole further cap's worth AFTER the grant and
+    // re-latches. That is the design working as specified: the grant bounds the
+    // tail, it does not remove the cap. `createIncidentIfNeeded` suppresses only
+    // on OPEN rows, so this files a *new* hard incident B.
+    const postGrant = await insertCostEvent({ companyId, agentId, costCents: 100 });
+    await service.evaluateCostEvent(postGrant);
+    const [relatched] = await db
+      .select({ status: agents.status, pauseReason: agents.pauseReason })
+      .from(agents);
+    expect(relatched).toMatchObject({ status: "paused", pauseReason: "budget" });
+
+    const incidentB = await db
+      .select()
+      .from(budgetIncidents)
+      .where(and(eq(budgetIncidents.thresholdType, "hard"), eq(budgetIncidents.status, "open")))
+      .then((rows) => rows[0]!);
+    expect(incidentB.id).not.toBe(incidentA.id);
+
+    // Now the stale client: it replays decision 1, naming incident A, which has
+    // been closed since. Nobody has looked at B's numbers -- B is a crossing of
+    // the same cap by a second, later cap's worth of spend.
+    await service.resolveIncident(
+      companyId,
+      incidentA.id,
+      { action: "resume_without_raise", decisionNote: "replayed decision 1" },
+      "board-user",
+    );
+
+    // B is still swept closed -- the resume has always closed every open row on
+    // the policy, and leaving one open against a withdrawn card is its own bug.
+    // But it is closed with NO resolution action, which is what stops it being
+    // read back as a grant. While the stamp was keyed on `policyId AND status =
+    // "open"`, the replay landed the action on B and minted a grant from B's
+    // `resolvedAt` that no board had ever decided.
+    const bAfter = await db
+      .select()
+      .from(budgetIncidents)
+      .where(eq(budgetIncidents.id, incidentB.id))
+      .then((rows) => rows[0]!);
+    expect(bAfter).toMatchObject({ status: "resolved", resolutionAction: null });
+
+    // So the live grant is still decision 1's, unmoved, and spend measured from
+    // it is a full cap's worth. The enforcement surface refuses the scope.
+    const overview = await service.overview(companyId);
+    const summary = overview.policies.find((entry) => entry.policyId === policy.id);
+    expect(summary!.hardStopForgivenSince).toEqual(incidentA.resolvedAt);
+    expect(await service.getInvocationBlock(companyId, agentId)).toMatchObject({
+      scopeType: "agent",
+      reason: "Agent cannot start because its budget hard-stop is still exceeded.",
+    });
+  });
+
+  it("counts spend that lands after the decision even when it is backdated before it (PEN-4742)", async () => {
+    const { companyId, agentId, service } = await latchAgentOnBudget(100, 125);
+    await resolveHardIncident(service, companyId, { action: "resume_without_raise" });
+    expect(await service.getInvocationBlock(companyId, agentId)).toBeNull();
+
+    // Final usage from the runs cancelled at the pause. It HAPPENED before the
+    // board adjudicated, so it carries a backdated `occurredAt`, but it LANDED
+    // after -- the board cannot have included it in what they forgave. While the
+    // enforcement floor was on `occurredAt` alone, a full cap's worth of real
+    // spend arriving this way escaped the grant's tail bound for the whole rest
+    // of the window, which is the one direction a cap must never fail.
+    const backdated = await insertCostEvent({
+      companyId,
+      agentId,
+      costCents: 100,
+      occurredAt: new Date(Date.now() - 60_000),
+    });
+    await service.evaluateCostEvent(backdated);
+
+    expect(await service.getInvocationBlock(companyId, agentId)).not.toBeNull();
+    const [repaused] = await db
+      .select({ status: agents.status, pauseReason: agents.pauseReason })
+      .from(agents);
+    expect(repaused).toMatchObject({ status: "paused", pauseReason: "budget" });
   });
 
 });
