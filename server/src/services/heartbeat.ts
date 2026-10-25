@@ -44390,12 +44390,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // was already being skipped. That inverts PEN-2130: the instrument
           // for starvation would itself starve the roster.
           //
-          // The ledger key stays in the set, so a persistent failure is
-          // rate-limited exactly like a successful write: one failed insert and
-          // one warn per (agent, reason) per window, not one per 30s pass. The
-          // signal is not lost, only delayed -- these three conditions are
-          // standing states, so an agent still excluded in the next window is
-          // recorded then.
+          // The in-memory add above still holds for the rest of THIS pass, so
+          // the same (agent, reason) cannot be retried twice inside one tick.
+          // It buys nothing across passes, though: `preDispatchExclusionsInWindow`
+          // is rebuilt every pass from rows actually present in the table, and
+          // a failed insert leaves none behind. So while the sink is down this
+          // retries -- and warns -- once per (agent, reason) per ~30s pass,
+          // not once per window.
+          //
+          // That is deliberate, not a gap. These three conditions are standing
+          // states, so retrying every pass records the exclusion as soon as the
+          // sink recovers instead of hiding it until the window rolls, and a
+          // per-pass warn is the only signal that the ledger itself is broken.
+          // Muting it across passes would silence the instrument exactly when
+          // the instrument has failed.
           logger.warn(
             { err: error, agentId: agent.id, companyId: agent.companyId, reason },
             "failed to record a pre-dispatch heartbeat timer exclusion",
