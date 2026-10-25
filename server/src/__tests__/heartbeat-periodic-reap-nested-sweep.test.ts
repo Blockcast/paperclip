@@ -50,7 +50,7 @@ vi.mock("../services/k8s-job-liveness.js", async (importOriginal) => {
   return { ...actual, listManagedAgentJobs: listManagedAgentJobsMock };
 });
 
-const { heartbeatService } = await import("../services/heartbeat.ts");
+const { heartbeatService } = await import("../services/heartbeat.js");
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -155,9 +155,10 @@ describeEmbeddedPostgres("periodic orphan reap nested fleet sweeps (PEN-4736)", 
    * here — a sweep that reaps nothing is cheap and useless.
    *
    * Both halves discriminate. Removing `suppressDispatchAfterReap: true` from
-   * `reapOrphanedRunsPeriodic` fails the sweep count (1 -> 4) AND the reap count
-   * (4 -> 1): the nested sweeps consume the orphan rows, so the outer pass
-   * finalizes one row and under-reports the rest.
+   * `reapOrphanedRunsPeriodic` fails the sweep count (1 -> 2..4 observed, since
+   * how many rows promote rather than dispatch varies) and also drops the reap
+   * count, because the nested sweeps consume orphan rows the outer pass would
+   * otherwise have finalized.
    */
   it("runs exactly one fleet sweep per periodic pass regardless of how many rows it reaps", async () => {
     const { agentIds } = await seedOrphanedFleet(4);
