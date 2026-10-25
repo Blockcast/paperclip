@@ -56,7 +56,7 @@ permissions:
 
 jobs:
   audit-merged:
-    runs-on: default
+    runs-on: arc-paperclip-light
     timeout-minutes: 15
     steps:
       - name: Checkout repository

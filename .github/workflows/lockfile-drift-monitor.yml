@@ -20,7 +20,7 @@ permissions:
 # while the drift persists, rather than relying on Actions notifications.
 jobs:
   check-master-lockfile-overrides:
-    runs-on: default
+    runs-on: arc-paperclip-light
     timeout-minutes: 5
     steps:
       - name: Checkout master

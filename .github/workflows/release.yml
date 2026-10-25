@@ -108,7 +108,7 @@ jobs:
   preview_stable:
     if: github.event_name == 'workflow_dispatch' && inputs.dry_run
     needs: verify_stable
-    runs-on: default
+    runs-on: arc-paperclip-general
     timeout-minutes: 45
     permissions:
       contents: read

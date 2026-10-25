@@ -53,7 +53,7 @@ jobs:
     # wedged for ~5h on 2026-09-04 (BLO-31818), and while it is wedged this
     # backstop does not run. That degrades to the status quo ante, not to
     # something worse.
-    runs-on: default
+    runs-on: arc-paperclip-light
     # Hang detector, not a performance budget. The job is a handful of API calls.
     timeout-minutes: 10
     steps:

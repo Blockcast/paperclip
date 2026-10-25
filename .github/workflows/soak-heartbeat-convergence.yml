@@ -58,7 +58,7 @@ concurrency:
 jobs:
   soak:
     name: Soak ${{ inputs.iterations }}x @ ${{ inputs.ref }}
-    runs-on: default
+    runs-on: arc-paperclip-general
     # 20 iterations at the observed 150-270s each is 50-90 minutes, and the
     # synthetic-load mode deliberately slows iterations down. Leave real margin
     # so runner contention is never reported as a soak failure.

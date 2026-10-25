@@ -231,7 +231,7 @@ permissions:
 jobs:
   sweep:
     name: Sweep stalled Ally reviews
-    runs-on: default
+    runs-on: arc-paperclip-light
     # WHAT THIS BOUND COVERS: a job that has STARTED and then hangs -- one
     # stalled socket cannot hold it to the Actions 6-hour ceiling. Matches the
     # sibling `ally-review-consistency.yml` (10m); slightly higher because this

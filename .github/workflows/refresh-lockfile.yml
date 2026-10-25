@@ -12,7 +12,7 @@ concurrency:
 
 jobs:
   refresh:
-    runs-on: default
+    runs-on: arc-paperclip-general
     timeout-minutes: 10
     permissions:
       contents: write
