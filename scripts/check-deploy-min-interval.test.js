@@ -37,11 +37,17 @@ test("absent pod allows; unparseable timestamp fails closed", () => {
 
 test("docker.yml wires the guard into deploy before any mutation", () => {
   const wf = readFileSync(new URL("../.github/workflows/docker.yml", import.meta.url), "utf8");
-  const guard = wf.indexOf("check-deploy-min-interval.sh");
+  const guard = wf.indexOf(".release-tooling/.github/scripts/check-deploy-min-interval.sh");
   assert.notEqual(guard, -1);
   assert.ok(guard > wf.indexOf("\n  deploy:\n"), "guard must be in the deploy job");
   assert.ok(guard < wf.indexOf("- name: Approve exact deploy plan"), "guard must precede approval");
   assert.ok(guard < wf.indexOf("- name: helm upgrade"));
   assert.match(wf, /min_interval_override:[\s\S]*?options:[\s\S]*?- none[\s\S]*?- emergency[\s\S]*?- rollback/);
   assert.match(wf, /OVERRIDE: \$\{\{ inputs\.min_interval_override \}\}/);
+  // A rollback targets an old commit whose checkout lacks this script, so it
+  // must run from the trusted .release-tooling checkout and be in its sparse list.
+  assert.match(wf, /\n\s+\.release-tooling\/\.github\/scripts\/check-deploy-min-interval\.sh\n/);
+  const tooling = wf.slice(wf.indexOf("- name: Checkout release tooling at trusted revision"));
+  assert.match(tooling.slice(0, tooling.indexOf("sparse-checkout-cone-mode:")), /\.github\/scripts\/check-deploy-min-interval\.sh/);
+  assert.ok(guard > wf.indexOf("- name: Verify release tooling revision"), "guard must follow the trusted checkout");
 });
