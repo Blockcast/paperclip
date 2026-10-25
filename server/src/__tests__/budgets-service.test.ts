@@ -1950,21 +1950,17 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
     expect(freshHard!.amountLimit).toBe(100);
   });
 
-  it("expires the grant at the window roll rather than carrying it forward (PEN-4742)", async () => {
+  it("binds at the human's cap again once the window has rolled (PEN-4742)", async () => {
     const { companyId, agentId, service, policy } = await latchAgentOnBudget(100, 125);
     await resolveHardIncident(service, companyId, { action: "resume_without_raise" });
     expect(await service.getInvocationBlock(companyId, agentId)).toBeNull();
 
-    // Roll: last window's spend AND last window's grant both fall out of scope.
-    // The grant is keyed on the incident's windowStart, so nothing has to delete
-    // it -- `resolveWindow` simply stops matching.
     await rollWindowBackwards(companyId);
-
     const freshWindowSpend = await insertCostEvent({ companyId, agentId, costCents: 100 });
     await service.evaluateCostEvent(freshWindowSpend);
 
-    // $1.00 of new-window spend against the $1.00 cap the human kept. If the
-    // grant had leaked across the roll this would still be running.
+    // $1.00 of new-window spend against the $1.00 cap the human kept: the cap
+    // is enforced normally again, with no residue from last window's decision.
     const [pausedAgain] = await db
       .select({ status: agents.status, pauseReason: agents.pauseReason })
       .from(agents);
@@ -1972,6 +1968,38 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
 
     const [capAfter] = await db.select().from(budgetPolicies).where(eq(budgetPolicies.id, policy.id));
     expect(capAfter!.amount).toBe(100);
+
+    // ⚠ Be precise about what this proves, because the obvious reading is wrong.
+    // `rollWindowBackwards` moves cost EVENTS, not incidents, so the grant row
+    // still names the current window at this point -- this case does NOT
+    // exercise the `windowStart` filter, and an assertion here that "the grant
+    // would have kept it running" would be false.
+    //
+    // The scope stops because expiry is STRUCTURAL: `computeObservedAmount`
+    // ANDs the `since` floor with the window bounds, and any grant from an
+    // earlier window has `resolvedAt` before the window start, so its floor is
+    // strictly weaker than the clamp and subtracts nothing. A stale grant is
+    // inert however it is read. The `windowStart` filter is belt-and-braces on
+    // top of that, and the next case pins it on its own.
+  });
+
+  it("does not read a previous window's grant as live (PEN-4742)", async () => {
+    const { companyId, service, policy } = await latchAgentOnBudget(100, 125);
+    await resolveHardIncident(service, companyId, { action: "resume_without_raise" });
+
+    // The grant surfaces on the policy summary, which is what makes the
+    // `windowStart` filter observable at all. Age the incident into the
+    // previous window -- the one thing `rollWindowBackwards` cannot simulate,
+    // because it moves cost events and leaves incidents where they are.
+    const now = new Date();
+    const lastWindowStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
+    await db
+      .update(budgetIncidents)
+      .set({ windowStart: lastWindowStart, resolvedAt: lastWindowStart });
+
+    const overview = await service.overview(companyId);
+    const summary = overview.policies.find((entry) => entry.policyId === policy.id);
+    expect(summary!.hardStopForgivenSince).toBeNull();
   });
 
   it("keeps reporting true window spend while a grant is live (PEN-4742)", async () => {
