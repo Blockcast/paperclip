@@ -5314,7 +5314,7 @@ function ensureRegistry(): {
         + "file_mapped, file_dirty and file_writeback are the part it cannot, and they "
         + "OVERLAP both each other and the active/inactive LRU counters -- a page can be "
         + "mapped AND dirty AND on the inactive list -- so they BOUND that part rather "
-        + "than sum to it. It CONFIRMS THE CLASS ONLY and cannot name the slab cache: cgroup v2 reports "
+        + "than sum to it. THIS GAUGE CONFIRMS THE CLASS ONLY and cannot name the slab cache: cgroup v2 reports "
         + "slab_reclaimable as one scalar with no per-cache breakdown, so dentry vs inode vs "
         + "buffer_head still needs host /proc/slabinfo. An absent component means this kernel "
         + "does not report that field; absence of the whole metric means memory.stat was "
