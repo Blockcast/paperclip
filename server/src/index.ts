@@ -2393,13 +2393,19 @@ export async function startServer(): Promise<StartedServer> {
           // instead of once per 30 s tick, reproducing the very symptom the
           // latch is deployed against ("runs sat in `running` 15-20 min before
           // their k8s Job was created").
+          //
+          // `reapOrphanedRunsPeriodic` (not `reapOrphanedRuns`) is deliberate:
+          // it suppresses the per-row post-reap dispatch, which on this chain is
+          // redundant with the `resumeQueuedRuns` two steps below and used to
+          // make every acted-on row await a fresh fleet-wide sweep (PEN-4736).
+          // Its docstring carries the measurement and the residual scope.
           trackHeartbeatSchedulerWork(heartbeat
             .resumeRunningExternalRuntimeRuns()
             .then(async () => {
               if (periodicOrphanReapInFlight) return;
               periodicOrphanReapInFlight = true;
               try {
-                await heartbeat.reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 });
+                await heartbeat.reapOrphanedRunsPeriodic({ staleThresholdMs: 5 * 60 * 1000 });
               } finally {
                 periodicOrphanReapInFlight = false;
               }
