@@ -13,6 +13,40 @@ import { logger } from "../middleware/logger.js";
 // pushes, producing a divergent sibling commit. This module claims the
 // branch itself as the contended resource, keyed by (companyId, branchKey),
 // independent of which issue a run is checked out on.
+//
+// ⚠️ PEN-4764 — KNOWN GAP, MEASURED: this module only protects a branch the
+// CONTROL PLANE knows about. Both `acquireBranchRunClaim` call sites in
+// `heartbeat.ts` are gated on an execution-workspace branch name
+// (`reusableExistingExecutionWorkspace.branchName` pre-realization, then
+// `branchNameForInitialPersistence` at the re-key step). A run whose issue has
+// no execution workspace at all — `executionWorkspaceId: null`, the repo-less
+// ephemeral-workspace shape that is every K8s run of a concurrency-enabled
+// agent on `project_primary` — has no branch to key on at dispatch and
+// therefore claims NOTHING. It then clones a repo ad hoc inside the agent
+// process and pushes a branch this table never sees.
+//
+// So the "keyed by (companyId, branchKey), independent of which issue" framing
+// above describes the KEY, not the coverage. The cross-issue hazard it was
+// built for is still live for any seat that works without a managed workspace.
+//
+// Measured 2026-10-25 (Penstock `Devops` seat, maxConcurrentRuns 6):
+//   * run `cc0893c3` — wake `issue_commented`, scoped to PEN-4555, holding
+//     PEN-4555's `executionRunId`, preparing a docs fix on branch
+//     `devops/pen-4555-prereqs-delivery-channel` of `Blockcast/magma`.
+//   * run `3cbf5b49` — wake `github_pr_closed`, scoped to a DIFFERENT issue
+//     (PEN-4707), which reacted to magma#2558 merging by pushing `92ded9ee` to
+//     that same PEN-4555 branch at 20:08:23Z.
+// Each held its own issue's lock and neither ever contended; the first signal
+// was `cc0893c3`'s `git push` being rejected as behind. One CI burn (~30 check
+// runs) was spent on the discarded head, one Ally review cycle was voided, and
+// a `git push --force` to unstick it would have destroyed `92ded9ee`.
+//
+// Note the same-ISSUE case is NOT this gap and is already closed: a second
+// dispatch for one issue is cancelled `duplicate_dispatch_suppressed`
+// (verified on run `aed334df`, the second PEN-4555 wake in the same window).
+// Fixing this one means claiming a branch the agent chooses AFTER dispatch,
+// which no dispatch-time hook can observe — it needs an agent-side claim call
+// or a push-time hook, and that design decision is open on PEN-4764.
 export type BranchRunClaim = typeof branchRunClaims.$inferSelect;
 
 const ACTIVE_BRANCH_CONSTRAINT = "branch_run_claims_active_branch_idx";

@@ -82,6 +82,14 @@ This bounds the strand remedy in Step 8 / `blocked` guidance: `todo` keeps a row
 
 **Do not use `activeRun` for this check (BLO-19749).** It is derived from `executionRunId` **only**, so an issue held solely via `checkoutRunId` reads `activeRun: null` while `POST /checkout` can still reject the claim. `activeRun: null` is therefore *not* evidence that nobody holds the issue — read the two lock IDs for the self-check, then let checkout decide ownership. (`activeRun` was additionally blind to `scheduled_retry` holders until BLO-19749; that half is fixed, but the single-column gap is intrinsic.)
 
+**Holding the issue lock does NOT mean you own the git branch (PEN-4764).** Checkout and `activeRun` are scoped to a Paperclip ROW. Under seat concurrency another live run of your own agent, legitimately checked out on a *different* issue, can resolve to the same repo and branch as you — neither run contends, both pass every ownership check, and the first signal is a rejected `git push`. Measured 2026-10-25: a run on PEN-4707 pushed to PEN-4555's branch while a run on PEN-4555 held that issue's lock and was preparing its own commit on the same file; one CI burn and one review cycle were wasted.
+
+So before you push, and regardless of what checkout told you:
+
+- `git fetch` and compare against the remote tip rather than trusting the tree you cloned. Work that appeared after your clone is normal, not corruption.
+- **Never `git push --force` to clear a "tip of your current branch is behind" rejection.** That rejection is the only collision signal this path has, and forcing past it silently destroys a colleague-run's commit. In the measured incident the discarded commit was the *better* fix. Rebase onto the remote tip, or diff the two and reconcile them.
+- If the remote already carries a fix for what you were about to fix, say so in a comment instead of re-landing your version. Two corrections to one file are worse than one.
+
 **The checkout result is the authoritative answer.** If checkout succeeds, you hold the issue. If it returns `409 Issue checkout conflict`, stop and cede without retrying. Report it as a checkout conflict; do not claim that another live run is executing the issue unless the response itself identifies a non-terminal holder. Some conflicts are status or assignee mismatches and may have both lock columns null.
 
 `inbox-lite` withholds these issues server-side, so in practice you should not see one. Keep the check anyway: it is two comparisons, it covers the fallback issue-list path and any stale-lock takeover, and a duplicate run that starts working is destructive rather than merely wasteful — under a shared worktree both runs edit the same tree, and a routine `rm -rf node_modules` in one destroys the other's state mid-task. Note that "no comments yet" is **not** evidence an issue is unworked: the holding run may be minutes into its first pass and not have commented yet.
