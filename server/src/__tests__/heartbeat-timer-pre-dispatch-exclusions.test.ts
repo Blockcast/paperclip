@@ -49,6 +49,43 @@ async function readExclusion(reason: string): Promise<number> {
   return match ? Number(match[1]) : 0;
 }
 
+/**
+ * `db` with the pre-dispatch ledger insert forced to fail for the reasons
+ * `shouldFail` selects, so the recorder's catch path can be exercised against
+ * a real database rather than a stub. Only the
+ * `insert(agentWakeupRequests).values(...)` shape the recorder uses is
+ * intercepted; every other call is delegated untouched, and a rejected promise
+ * is used rather than a synchronous throw so the failure arrives the way a
+ * real insert error would.
+ */
+function dbWithFailingLedgerInsert(
+  base: ReturnType<typeof createDb>,
+  shouldFail: (reason: unknown) => boolean,
+): ReturnType<typeof createDb> {
+  type InsertFn = (table: unknown) => { values: (values: Record<string, unknown>) => unknown };
+  const realInsert = (base as unknown as { insert: InsertFn }).insert.bind(base) as InsertFn;
+
+  return new Proxy(base as object, {
+    get(target, prop) {
+      if (prop === "insert") {
+        return (table: unknown) => {
+          if (table !== agentWakeupRequests) return realInsert(table);
+          return {
+            values: (values: Record<string, unknown>) =>
+              shouldFail(values.reason)
+                ? Promise.reject(new Error("simulated agent_wakeup_requests outage"))
+                : realInsert(agentWakeupRequests).values(values),
+          };
+        };
+      }
+      const value = Reflect.get(target, prop, target);
+      return typeof value === "function"
+        ? (value as (...args: unknown[]) => unknown).bind(target)
+        : value;
+    },
+  }) as ReturnType<typeof createDb>;
+}
+
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
@@ -406,5 +443,83 @@ describeEmbeddedPostgres("timer exclusions recorded before checked += 1", () => 
       "heartbeat.disabled",
     ]);
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId))).toHaveLength(0);
+  });
+
+  // The recorder's catch path. Review on PEN-4737 flagged that nothing pinned
+  // it, and that the comment beside it claimed a cross-pass rate limit the code
+  // does not implement. These two tests pin what it actually does, both halves:
+  // a telemetry failure must not abort the pass or move the counter, and the
+  // next pass must retry rather than wait out the window.
+  it("does not abort the pass when the ledger insert fails, and withholds the counter", async () => {
+    const companyId = randomUUID();
+    const notInvokableAgentId = randomUUID();
+    const disabledAgentId = randomUUID();
+    const now = new Date("2026-05-25T20:30:00.000Z");
+    await seedAgent({ companyId, agentId: notInvokableAgentId, status: "paused" });
+    const createdAt = new Date("2026-05-25T18:00:00.000Z");
+    await db.insert(agents).values({
+      id: disabledAgentId,
+      companyId,
+      name: "Reflection Coach",
+      role: "engineer",
+      status: "active",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { enabled: false, intervalSec: 60 } },
+      permissions: {},
+      lastHeartbeatAt: createdAt,
+      createdAt,
+      updatedAt: createdAt,
+    });
+
+    const beforeNotInvokable = await readExclusion("agent.not_invokable");
+    const beforeDisabled = await readExclusion("heartbeat.disabled");
+    const heartbeat = heartbeatService(
+      dbWithFailingLedgerInsert(db, (reason) => reason === "agent.not_invokable"),
+    );
+
+    // Resolving at all is the order-independent half of the invariant: an
+    // unguarded insert would reject out of `tickTimers` no matter which agent
+    // the loop reached first.
+    await expect(heartbeat.tickTimers(now)).resolves.toMatchObject({ checked: 0 });
+
+    // Nothing was recorded for the agent whose write failed -- in particular
+    // the counter did not move, so the metric's standing promise that every
+    // increment has a durable row behind it holds on the failure path.
+    expect(await readLedger(notInvokableAgentId)).toHaveLength(0);
+    expect(await readExclusion("agent.not_invokable")).toBe(beforeNotInvokable);
+
+    // And the rest of the roster was still processed. This is what the
+    // try/catch is for: the instrument for starvation must not itself starve
+    // every agent behind the one it failed on.
+    expect(await readLedger(disabledAgentId)).toHaveLength(1);
+    expect(await readExclusion("heartbeat.disabled")).toBe(beforeDisabled + 1);
+  });
+
+  it("retries a failed ledger insert on the next pass instead of waiting out the window", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const first = new Date("2026-05-25T20:30:00.000Z");
+    await seedAgent({ companyId, agentId, status: "paused" });
+
+    const before = await readExclusion("agent.not_invokable");
+    let sinkDown = true;
+    const heartbeat = heartbeatService(
+      dbWithFailingLedgerInsert(db, (reason) => sinkDown && reason === "agent.not_invokable"),
+    );
+
+    await heartbeat.tickTimers(first);
+    expect(await readLedger(agentId)).toHaveLength(0);
+    expect(await readExclusion("agent.not_invokable")).toBe(before);
+
+    // 30s later -- one scheduler pass, and far inside the one-hour window.
+    // `preDispatchExclusionsInWindow` is rebuilt each pass from rows actually
+    // in the table, and the failed insert left none, so the exclusion is
+    // recorded as soon as the sink recovers rather than being suppressed until
+    // the window rolls. The in-pass add dedupes within a tick only.
+    sinkDown = false;
+    await heartbeat.tickTimers(new Date(first.getTime() + 30_000));
+    expect(await readLedger(agentId)).toHaveLength(1);
+    expect(await readExclusion("agent.not_invokable")).toBe(before + 1);
   });
 });
