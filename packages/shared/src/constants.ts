@@ -1118,6 +1118,23 @@ export type BudgetIncidentStatus = (typeof BUDGET_INCIDENT_STATUSES)[number];
 export const BUDGET_INCIDENT_RESOLUTION_ACTIONS = [
   "keep_paused",
   "raise_budget_and_resume",
+  /**
+   * Resume the scope WITHOUT lifting the cap over what has already been spent
+   * (PEN-4742).
+   *
+   * `raise_budget_and_resume` refuses any amount at or below observed spend, so
+   * mid-window it forces the cap up to observed-plus-epsilon -- the cap stops
+   * being a chosen figure and becomes a function of one window's overshoot. A
+   * $1.63 breach is how a $20,011.63 cap got set.
+   *
+   * This action says instead: the crossing is adjudicated, the cap stays
+   * whatever the board chose, and for the REMAINDER OF THIS WINDOW the hard
+   * stop binds on spend incurred after the decision. It does not disable the
+   * cap -- the scope still hard-stops one cap's worth later -- and the grant
+   * expires on its own at the window roll. See `hardStopForgivenSince` in
+   * `server/src/services/budgets.ts`.
+   */
+  "resume_without_raise",
 ] as const;
 export type BudgetIncidentResolutionAction = (typeof BUDGET_INCIDENT_RESOLUTION_ACTIONS)[number];
 

@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import {
   agents,
   approvals,
@@ -27,7 +27,18 @@ type SelectResult = unknown[];
 
 function createDbStub(selectResults: SelectResult[]) {
   const pendingSelects = [...selectResults];
-  const selectWhere = vi.fn(async () => pendingSelects.shift() ?? []);
+  // Awaitable for `await db.select().from().where()`, and also `.orderBy()`-able
+  // for `.from().where().orderBy()` -- one query either way, so `.orderBy()`
+  // replays the rows this `.where()` already shifted rather than consuming a
+  // second queued result.
+  const selectWhere = vi.fn(() => {
+    const rows = pendingSelects.shift() ?? [];
+    const result = Promise.resolve(rows) as Promise<unknown[]> & {
+      orderBy: () => Promise<unknown[]>;
+    };
+    result.orderBy = async () => rows;
+    return result;
+  });
   const selectThen = vi.fn((resolve: (value: unknown[]) => unknown) => Promise.resolve(resolve(pendingSelects.shift() ?? [])));
   const selectOrderBy = vi.fn(async () => pendingSelects.shift() ?? []);
   const selectFrom = vi.fn(() => ({
@@ -167,6 +178,10 @@ describe("budgetService", () => {
 
     const dbStub = createDbStub([
       [policy],
+      // hardStopForgivenSince(): no board has resumed this scope without
+      // raising its cap in this window, so no grant and the hard stop is
+      // measured against the full window total (PEN-4742).
+      [],
       [{ total: 150 }],
       // resolveOpenSoftIncidents() reads the open soft rows so it can withdraw
       // any superseded soft card (BLO-28793); there are none here.
@@ -286,6 +301,10 @@ describe("budgetService", () => {
       }],
       [],
       [agentPolicy],
+      // hardStopForgivenSince(): no board has resumed this scope without
+      // raising its cap in this window, so no grant and the hard stop is
+      // measured against the full window total (PEN-4742).
+      [],
       [{ total: 120 }],
     ]);
 
@@ -328,6 +347,10 @@ describe("budgetService", () => {
         name: "Paperclip",
       }],
       [companyPolicy],
+      // hardStopForgivenSince(): no board has resumed this scope without
+      // raising its cap in this window, so no grant and the hard stop is
+      // measured against the full window total (PEN-4742).
+      [],
       // Still over cap in the current window, so the pause is still earned.
       [{ total: 120 }],
     ]);
@@ -386,6 +409,12 @@ describe("budgetService", () => {
         scopeId: "company-1",
         metric: "billed_cents",
         windowKind: "calendar_month_utc",
+        // NOT NULL DEFAULT true in the schema, so a row without it is not a
+        // state the database can produce. It became load-bearing here with
+        // PEN-4742: the guard is now skipped where it cannot bite, and a cap
+        // with no hard stop behind it is exactly such a case.
+        hardStopEnabled: true,
+        amount: 100,
       }],
       [{ total: 150 }],
     ]);
@@ -1800,4 +1829,348 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
       .filter((input: any) => input.action === "budget.pause_auto_cleared");
     expect(cleared).toHaveLength(1);
   });
+
+  // ---------------------------------------------------------------------------
+  // PEN-4742: resuming without ratcheting the cap up to observed-plus-epsilon.
+  //
+  // `raise_budget_and_resume` refuses any amount at or below observed spend, so
+  // mid-window it FORCES the cap above whatever has accrued. The cap stops being
+  // a chosen figure and becomes a function of one window's overshoot -- which is
+  // how a $1.63 breach produced a $20,011.63 cap, and how the warn band shipped
+  // in BLO-28793 got hollowed out, since a band on a cap nobody can reach warns
+  // on nothing.
+  //
+  // The fix is not to delete the guard: resuming under a cap you have already
+  // blown re-latches on the next cost event. It is to separate "what the cap is"
+  // from "may this scope run for the rest of this window".
+  // ---------------------------------------------------------------------------
+
+  async function resolveHardIncident(
+    service: ReturnType<typeof budgetService>,
+    companyId: string,
+    input: { action: "keep_paused" | "raise_budget_and_resume" | "resume_without_raise"; amount?: number },
+  ) {
+    const [hard] = await db
+      .select()
+      .from(budgetIncidents)
+      .where(eq(budgetIncidents.thresholdType, "hard"));
+    return service.resolveIncident(companyId, hard!.id, input, "board-user");
+  }
+
+  it("resumes a mid-window pause without lifting the cap over observed spend (PEN-4742)", async () => {
+    // $1.00 cap, $1.25 spent: the exact shape of the June breach.
+    const { companyId, agentId, service, policy } = await latchAgentOnBudget(100, 125);
+
+    // What the ratchet used to force. The board has no way to say "the cap is
+    // fine, I have looked at the overshoot, let it run".
+    await expect(
+      resolveHardIncident(service, companyId, { action: "raise_budget_and_resume", amount: 100 }),
+    ).rejects.toThrow(/must exceed current observed spend/);
+
+    await resolveHardIncident(service, companyId, { action: "resume_without_raise" });
+
+    // The cap is still exactly what a human chose. Not observed-plus-epsilon,
+    // not touched at all.
+    const [capAfter] = await db.select().from(budgetPolicies).where(eq(budgetPolicies.id, policy.id));
+    expect(capAfter!.amount).toBe(100);
+    expect(capAfter!.amountUpdatedAt).toEqual(policy.amountUpdatedAt);
+
+    const [resumed] = await db
+      .select({ status: agents.status, pauseReason: agents.pauseReason })
+      .from(agents);
+    expect(resumed).toMatchObject({ status: "idle", pauseReason: null });
+    expect(await service.getInvocationBlock(companyId, agentId)).toBeNull();
+
+    // The grant is the incident row, and nothing else. No new policy state, so
+    // nothing has to be cleaned up by hand.
+    const [hard] = await db
+      .select()
+      .from(budgetIncidents)
+      .where(eq(budgetIncidents.thresholdType, "hard"));
+    expect(hard).toMatchObject({ status: "resolved", resolutionAction: "resume_without_raise" });
+  });
+
+  it("does not re-latch on the next cost event after a keep-the-cap resume (PEN-4742)", async () => {
+    const { companyId, agentId, service } = await latchAgentOnBudget(100, 125);
+    await resolveHardIncident(service, companyId, { action: "resume_without_raise" });
+
+    // This is the event that used to put the scope straight back down: window
+    // spend is $1.26 against a $1.00 cap, so the old `observed >= amount` test
+    // fires on the first dollar of new work.
+    const next = await insertCostEvent({ companyId, agentId, costCents: 1 });
+    await service.evaluateCostEvent(next);
+
+    const [stillRunning] = await db
+      .select({ status: agents.status, pauseReason: agents.pauseReason })
+      .from(agents);
+    expect(stillRunning).toMatchObject({ status: "idle", pauseReason: null });
+    expect(await service.getInvocationBlock(companyId, agentId)).toBeNull();
+
+    // And no fresh card either. A warn card filed here would be the same churn
+    // the action exists to prevent, relabelled: total window spend is over the
+    // cap by construction, so it is over warnPercent of it too.
+    expect(
+      (await db.select().from(budgetIncidents)).filter((incident) => incident.status === "open"),
+    ).toHaveLength(0);
+  });
+
+  it("re-latches once post-decision spend reaches the cap, not before (PEN-4742)", async () => {
+    const { companyId, agentId, service } = await latchAgentOnBudget(100, 125);
+    await resolveHardIncident(service, companyId, { action: "resume_without_raise" });
+
+    // One cent short of the cap, measured from the decision. The grant bounds
+    // the tail at exactly one cap's worth -- it does not switch the hard stop
+    // off for the window, which would let a scope resumed at $1.26 burn
+    // arbitrarily and be worse in the tail than the ratchet it replaces.
+    const justUnder = await insertCostEvent({ companyId, agentId, costCents: 99 });
+    await service.evaluateCostEvent(justUnder);
+    expect(await service.getInvocationBlock(companyId, agentId)).toBeNull();
+
+    const overTheLine = await insertCostEvent({ companyId, agentId, costCents: 1 });
+    await service.evaluateCostEvent(overTheLine);
+
+    const [relatched] = await db
+      .select({ status: agents.status, pauseReason: agents.pauseReason })
+      .from(agents);
+    expect(relatched).toMatchObject({ status: "paused", pauseReason: "budget" });
+    expect(await service.getInvocationBlock(companyId, agentId)).toMatchObject({
+      scopeType: "agent",
+      reason: "Agent is paused because its budget hard-stop was reached.",
+    });
+
+    // The fresh card reports TRUE window spend ($2.25), not the rebaselined
+    // figure. The grant changes what the hard stop is measured against; it does
+    // not change what the scope actually spent, and a card claiming "$1.00
+    // against a limit of $1.00" would mislead the next board member to read it.
+    const [freshHard] = await db
+      .select()
+      .from(budgetIncidents)
+      .where(and(eq(budgetIncidents.thresholdType, "hard"), eq(budgetIncidents.status, "open")));
+    expect(freshHard!.amountObserved).toBe(225);
+    expect(freshHard!.amountLimit).toBe(100);
+  });
+
+  it("expires the grant at the window roll rather than carrying it forward (PEN-4742)", async () => {
+    const { companyId, agentId, service, policy } = await latchAgentOnBudget(100, 125);
+    await resolveHardIncident(service, companyId, { action: "resume_without_raise" });
+    expect(await service.getInvocationBlock(companyId, agentId)).toBeNull();
+
+    // Roll: last window's spend AND last window's grant both fall out of scope.
+    // The grant is keyed on the incident's windowStart, so nothing has to delete
+    // it -- `resolveWindow` simply stops matching.
+    await rollWindowBackwards(companyId);
+
+    const freshWindowSpend = await insertCostEvent({ companyId, agentId, costCents: 100 });
+    await service.evaluateCostEvent(freshWindowSpend);
+
+    // $1.00 of new-window spend against the $1.00 cap the human kept. If the
+    // grant had leaked across the roll this would still be running.
+    const [pausedAgain] = await db
+      .select({ status: agents.status, pauseReason: agents.pauseReason })
+      .from(agents);
+    expect(pausedAgain).toMatchObject({ status: "paused", pauseReason: "budget" });
+
+    const [capAfter] = await db.select().from(budgetPolicies).where(eq(budgetPolicies.id, policy.id));
+    expect(capAfter!.amount).toBe(100);
+  });
+
+  it("keeps reporting true window spend while a grant is live (PEN-4742)", async () => {
+    const { companyId, service, policy } = await latchAgentOnBudget(100, 125);
+    await resolveHardIncident(service, companyId, { action: "resume_without_raise" });
+
+    // Enforcement rebaselines; reporting must not. A forgiven scope that
+    // rendered as healthy would be PEN-1972 defect 3 in a new costume -- the
+    // gauge going quiet exactly when it has something to say.
+    const overview = await service.overview(companyId);
+    const summary = overview.policies.find((entry) => entry.policyId === policy.id);
+    expect(summary).toMatchObject({
+      observedAmount: 125,
+      utilizationPercent: 125,
+      status: "hard_stop",
+      paused: false,
+    });
+    // ...and the card is given the one fact that explains an over-cap scope that
+    // is nonetheless running, so it reads as a decision rather than a bug.
+    expect(summary!.hardStopForgivenSince).toBeInstanceOf(Date);
+  });
+
+  it("does not grant a window rebaseline when the board raises the cap instead (PEN-4742)", async () => {
+    const { companyId, agentId, service } = await latchAgentOnBudget(100, 125);
+
+    // The ordinary path, untouched: raise $1.00 -> $2.00, clear of observed.
+    await resolveHardIncident(service, companyId, { action: "raise_budget_and_resume", amount: 200 });
+    expect(await service.getInvocationBlock(companyId, agentId)).toBeNull();
+
+    // A raise must NOT confer forgiveness. Deriving the grant from "any resolved
+    // hard incident in this window" would do exactly that, and buy this scope
+    // immunity at $2.00 for the rest of the month -- an enforcement regression on
+    // the common path, introduced to fix the uncommon one. $0.75 more takes total
+    // spend to $2.00 and must stop it.
+    const toTheNewCap = await insertCostEvent({ companyId, agentId, costCents: 75 });
+    await service.evaluateCostEvent(toTheNewCap);
+
+    const [pausedAtNewCap] = await db
+      .select({ status: agents.status, pauseReason: agents.pauseReason })
+      .from(agents);
+    expect(pausedAtNewCap).toMatchObject({ status: "paused", pauseReason: "budget" });
+  });
+
+  it("cannot be handed a grant by lowering the cap after an ordinary raise (PEN-4742)", async () => {
+    const { companyId, agentId, service, policy } = await latchAgentOnBudget(100, 125);
+    await resolveHardIncident(service, companyId, { action: "raise_budget_and_resume", amount: 1000 });
+
+    // Deriving the grant from live state -- `policy.amount <= incident.amountObserved`
+    // -- is retroactively forgeable exactly here: lower the cap back under observed
+    // and the predicate flips to true, conferring a suppression no board decided.
+    // Lowering a cap must tighten enforcement, never loosen it.
+    await service.upsertPolicy(
+      companyId,
+      { scopeType: "agent", scopeId: agentId, amount: 110, metric: "billed_cents", windowKind: "calendar_month_utc" },
+      "board-user",
+    );
+
+    const [pausedByTheLowerCap] = await db
+      .select({ status: agents.status, pauseReason: agents.pauseReason })
+      .from(agents);
+    expect(pausedByTheLowerCap).toMatchObject({ status: "paused", pauseReason: "budget" });
+
+    const [reread] = await db.select().from(budgetPolicies).where(eq(budgetPolicies.id, policy.id));
+    expect(reread!.amount).toBe(110);
+  });
+
+  it("lets a resume keep the cap once the window has already rolled (PEN-4742, option 1)", async () => {
+    const { companyId, agentId, service, policy } = await latchAgentOnBudget(100, 125);
+    await rollWindowBackwards(companyId);
+
+    // Post-roll, observed has fallen below the cap, so keeping the cap already
+    // satisfies `nextAmount > currentObserved` and needs no grant at all. Pinned
+    // because it is the case the original guard was accused of blocking and does
+    // not: the bug is mid-window only.
+    await resolveHardIncident(service, companyId, { action: "raise_budget_and_resume", amount: 100 });
+
+    const [capAfter] = await db.select().from(budgetPolicies).where(eq(budgetPolicies.id, policy.id));
+    expect(capAfter!.amount).toBe(100);
+    expect(await service.getInvocationBlock(companyId, agentId)).toBeNull();
+
+    const [hard] = await db
+      .select()
+      .from(budgetIncidents)
+      .where(eq(budgetIncidents.thresholdType, "hard"));
+    // No grant: the window rolled, so there was nothing to forgive.
+    expect(hard).toMatchObject({ status: "resolved", resolutionAction: "raise_budget_and_resume" });
+  });
+
+  it("stops refusing a raise the cap could never enforce anyway (PEN-4742, option 1)", async () => {
+    const { companyId, service, policy } = await latchAgentOnBudget(100, 125);
+    await db
+      .update(budgetPolicies)
+      .set({ hardStopEnabled: false })
+      .where(eq(budgetPolicies.id, policy.id));
+
+    // With the hard stop off the cap pauses nothing, so there is no re-latch to
+    // protect against and the guard is pure friction. Same for amount 0, which
+    // means "no cap" everywhere else in this file and was unreachable purely
+    // because 0 is never greater than observed.
+    await resolveHardIncident(service, companyId, { action: "raise_budget_and_resume", amount: 50 });
+    const [lowered] = await db.select().from(budgetPolicies).where(eq(budgetPolicies.id, policy.id));
+    expect(lowered!.amount).toBe(50);
+
+    await db
+      .update(budgetPolicies)
+      .set({ hardStopEnabled: true })
+      .where(eq(budgetPolicies.id, policy.id));
+    const [hard] = await db
+      .select()
+      .from(budgetIncidents)
+      .where(eq(budgetIncidents.thresholdType, "hard"));
+    await service.resolveIncident(companyId, hard!.id, { action: "raise_budget_and_resume", amount: 0 }, "board-user");
+    const [uncapped] = await db.select().from(budgetPolicies).where(eq(budgetPolicies.id, policy.id));
+    expect(uncapped!.amount).toBe(0);
+  });
+
+  it("refuses a keep-the-cap resume on a lifetime budget, which never rolls (PEN-4742)", async () => {
+    const { companyId, service, policy } = await latchAgentOnBudget(100, 125);
+    await db
+      .update(budgetPolicies)
+      .set({ windowKind: "lifetime" })
+      .where(eq(budgetPolicies.id, policy.id));
+
+    // A lifetime window has no roll, so the grant would never expire -- permanent
+    // state, which is the one thing this design refuses. Raise it, disable the
+    // hard stop, or stay paused.
+    await expect(
+      resolveHardIncident(service, companyId, { action: "resume_without_raise" }),
+    ).rejects.toThrow(/lifetime-scoped/);
+  });
+
+  it("writes the cap a board types on a keep-the-cap resume, even below observed (PEN-4742)", async () => {
+    const { companyId, agentId, service, policy } = await latchAgentOnBudget(100, 125);
+
+    // The cap is whatever the human chose. Lowering it below observed is a
+    // legitimate decision -- "this window got away from us, next window is
+    // tighter" -- and is precisely what the old guard made unexpressible.
+    await resolveHardIncident(service, companyId, { action: "resume_without_raise", amount: 60 });
+
+    const [capAfter] = await db.select().from(budgetPolicies).where(eq(budgetPolicies.id, policy.id));
+    expect(capAfter!.amount).toBe(60);
+    expect(await service.getInvocationBlock(companyId, agentId)).toBeNull();
+
+    // And the grant is measured against that lower cap, not the old one.
+    const underTheLowerCap = await insertCostEvent({ companyId, agentId, costCents: 59 });
+    await service.evaluateCostEvent(underTheLowerCap);
+    expect(await service.getInvocationBlock(companyId, agentId)).toBeNull();
+
+    const overTheLowerCap = await insertCostEvent({ companyId, agentId, costCents: 1 });
+    await service.evaluateCostEvent(overTheLowerCap);
+    const [relatched] = await db
+      .select({ status: agents.status, pauseReason: agents.pauseReason })
+      .from(agents);
+    expect(relatched).toMatchObject({ status: "paused", pauseReason: "budget" });
+  });
+
+  it("does not let an unrelated policy edit re-pause a forgiven scope (PEN-4742)", async () => {
+    const { companyId, agentId, service } = await latchAgentOnBudget(100, 125);
+    await resolveHardIncident(service, companyId, { action: "resume_without_raise" });
+
+    // `upsertPolicy` is the third site that can pause a scope. Leaving it
+    // unaware of the grant would make a notification toggle silently undo a
+    // board decision.
+    await service.upsertPolicy(
+      companyId,
+      {
+        scopeType: "agent",
+        scopeId: agentId,
+        amount: 100,
+        metric: "billed_cents",
+        windowKind: "calendar_month_utc",
+        notifyEnabled: false,
+      },
+      "board-user",
+    );
+
+    const [stillRunning] = await db
+      .select({ status: agents.status, pauseReason: agents.pauseReason })
+      .from(agents);
+    expect(stillRunning).toMatchObject({ status: "idle", pauseReason: null });
+  });
+
+  it("never confers a grant from an incident resolved before the column existed (PEN-4742)", async () => {
+    const { companyId, agentId, service } = await latchAgentOnBudget(100, 125);
+    await resolveHardIncident(service, companyId, { action: "resume_without_raise" });
+
+    // Every row predating the migration reads `resolution_action = null`, and
+    // null must never confer a grant -- otherwise shipping this would
+    // retroactively un-cap every scope with a resolved incident in the current
+    // window. Simulate one by clearing the column.
+    await db.update(budgetIncidents).set({ resolutionAction: null });
+
+    const next = await insertCostEvent({ companyId, agentId, costCents: 1 });
+    await service.evaluateCostEvent(next);
+
+    const [pausedByTheFallback] = await db
+      .select({ status: agents.status, pauseReason: agents.pauseReason })
+      .from(agents);
+    expect(pausedByTheFallback).toMatchObject({ status: "paused", pauseReason: "budget" });
+  });
+
 });
