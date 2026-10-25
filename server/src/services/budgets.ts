@@ -339,8 +339,17 @@ export function buildApprovalPayload(input: {
     windowEnd: input.windowEnd.toISOString(),
     policyId: input.policy.id,
     summary: runway,
+    // "Keep the scope paused" is scoped to the condition, not forever: since
+    // PEN-1972 a budget pause lifts itself at the next invocation check once the
+    // hard stop stops binding, which for a windowed cap means the next window
+    // roll. That is the right behaviour -- a latch that outlives its condition
+    // is what took a primary implementer offline over $0.25 -- but the board is
+    // the party choosing it, so the card has to say so rather than let a
+    // "keep paused" click imply a durability it does not have.
     guidance: input.thresholdType === "hard"
-      ? "Raise the budget and resume the scope, or keep the scope paused."
+      ? "Raise the budget and resume the scope, or keep the scope paused -- a kept "
+        + "pause holds only while the cap still binds, and lifts on its own once "
+        + "observed spend in the window falls back under it."
       : "Raise the budget now to avoid a hard stop, or accept the pause when the cap is reached.",
   };
 }
@@ -443,11 +452,19 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
    * deleted, which is precisely the state in which nothing else would ever
    * clear it. Every update is guarded on `pauseReason = "budget"`, so this can
    * never lift a manual or operator pause.
+   *
+   * Returns whether a row actually changed. The guard makes this a no-op in two
+   * races -- a concurrent caller resumed first, or a human pause replaced the
+   * budget one between the caller's read and this write -- and a caller that
+   * attaches side effects to the resume needs to tell those apart from a resume
+   * it genuinely performed. See `clearExpiredBudgetPause`.
    */
-  async function resumeScopeFromBudget(policy: Pick<PolicyRow, "scopeType" | "scopeId">) {
+  async function resumeScopeFromBudget(
+    policy: Pick<PolicyRow, "scopeType" | "scopeId">,
+  ): Promise<boolean> {
     const now = new Date();
     if (policy.scopeType === "agent") {
-      await db
+      const changed = await db
         .update(agents)
         .set({
           status: "idle",
@@ -455,23 +472,25 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
           pausedAt: null,
           updatedAt: now,
         })
-        .where(and(eq(agents.id, policy.scopeId), eq(agents.pauseReason, "budget")));
-      return;
+        .where(and(eq(agents.id, policy.scopeId), eq(agents.pauseReason, "budget")))
+        .returning({ id: agents.id });
+      return changed.length > 0;
     }
 
     if (policy.scopeType === "project") {
-      await db
+      const changed = await db
         .update(projects)
         .set({
           pauseReason: null,
           pausedAt: null,
           updatedAt: now,
         })
-        .where(and(eq(projects.id, policy.scopeId), eq(projects.pauseReason, "budget")));
-      return;
+        .where(and(eq(projects.id, policy.scopeId), eq(projects.pauseReason, "budget")))
+        .returning({ id: projects.id });
+      return changed.length > 0;
     }
 
-    await db
+    const changed = await db
       .update(companies)
       .set({
         status: "active",
@@ -479,7 +498,9 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
         pausedAt: null,
         updatedAt: now,
       })
-      .where(and(eq(companies.id, policy.scopeId), eq(companies.pauseReason, "budget")));
+      .where(and(eq(companies.id, policy.scopeId), eq(companies.pauseReason, "budget")))
+      .returning({ id: companies.id });
+    return changed.length > 0;
   }
 
   async function loadActiveBudgetPolicy(
@@ -514,6 +535,26 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
   }
 
   /**
+   * Why the pause cleared, in the words that go into the audit trail and the
+   * board's withdrawal note.
+   *
+   * The clear fires whenever `hardStopStillBinds` stops holding, and that has
+   * four distinct causes -- a window roll is only one of them. Saying "the
+   * budget window rolled" for all four writes a false reason whenever the cause
+   * was really a deactivated policy, a cap set to zero, or a disabled hard
+   * stop; in that last case spend is typically still over cap, so the note
+   * would contradict the scope's own numbers. The order below mirrors
+   * `hardStopStillBinds`'s short-circuits, so the reason always names the test
+   * that actually failed first.
+   */
+  function describeClearedCause(policy: PolicyRow | null) {
+    if (!policy) return "no active hard-stop budget policy governs this scope";
+    if (!policy.hardStopEnabled) return "the hard stop is disabled on the governing policy";
+    if (policy.amount <= 0) return "the governing policy no longer sets a cap";
+    return "observed spend in the current window is below the cap";
+  }
+
+  /**
    * Clear a budget pause whose condition has stopped holding.
    *
    * The pause is a sticky flag on the scope row; the condition that set it is
@@ -526,10 +567,13 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
    * a $0.25 overshoot on a $3,000 cap could hold a scope down indefinitely
    * (Penstock PEN-1972).
    *
-   * Any still-open incident is closed and its pending card withdrawn: that card
-   * asks the board to choose between raising the budget and staying paused, and
-   * neither branch is meaningful once the scope is no longer paused. Leaving it
-   * pending would strand a decision against a condition that no longer exists.
+   * The still-open *hard* incident is closed and its pending card withdrawn:
+   * that card asks the board to choose between raising the budget and staying
+   * paused, and neither branch is meaningful once the scope is no longer
+   * paused. Leaving it pending would strand a decision against a condition that
+   * no longer exists. A still-open *soft* incident is deliberately left alone:
+   * it makes a different claim, one that can outlive the pause. See the
+   * filter below.
    */
   async function clearExpiredBudgetPause(
     companyId: string,
@@ -538,24 +582,45 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
     scopeName: string,
     policy: PolicyRow | null,
   ) {
-    await resumeScopeFromBudget({ scopeType, scopeId });
+    const resumed = await resumeScopeFromBudget({ scopeType, scopeId });
+    // Every update in `resumeScopeFromBudget` is guarded on
+    // `pauseReason = "budget"`, so "no row changed" means the scope was not ours
+    // to resume by the time the write landed: a concurrent caller got there
+    // first, or a human pause replaced the budget one between the read in
+    // `getInvocationBlock` and this write. This call resumed nothing, so it must
+    // not close the board's incident, withdraw its card, or write an
+    // `auto_cleared` row claiming a resume that did not happen here.
+    if (!resumed) return;
+
+    const cause = describeClearedCause(policy);
 
     if (policy) {
-      const openRows = await db
-        .select()
-        .from(budgetIncidents)
-        .where(and(eq(budgetIncidents.policyId, policy.id), eq(budgetIncidents.status, "open")));
+      // Hard only. The hard incident *is* the pause decision, so it dies with
+      // the pause. A soft incident is a different claim -- "spend has crossed
+      // the warn threshold" -- and that claim can still be true at the moment
+      // the pause lifts: clearing `hardStopEnabled` while over cap files a warn
+      // card and resumes the scope in the same breath (the coexistence case
+      // already documented in `resolveIncident`). Closing it there would delete
+      // a live warning and leave the board blind to an overspend it is still
+      // carrying.
+      const openHard = and(
+        eq(budgetIncidents.policyId, policy.id),
+        eq(budgetIncidents.status, "open"),
+        eq(budgetIncidents.thresholdType, "hard"),
+      );
+      const openRows = await db.select().from(budgetIncidents).where(openHard);
       if (openRows.length > 0) {
         const now = new Date();
         await db
           .update(budgetIncidents)
           .set({ status: "resolved", resolvedAt: now, updatedAt: now })
-          .where(and(eq(budgetIncidents.policyId, policy.id), eq(budgetIncidents.status, "open")));
+          .where(openHard);
         for (const row of openRows) {
           await withdrawPendingApproval(
             row.approvalId ?? null,
             row.companyId,
-            "Withdrawn automatically: the budget window rolled and this scope resumed on its own, so there is no longer a pause to decide about.",
+            `Withdrawn automatically: ${cause}, so this scope resumed on its own `
+              + "and there is no longer a pause to decide about.",
             "budget_pause_condition_cleared",
           );
         }
@@ -577,9 +642,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
         scopeId,
         scopeName,
         policyId: policy?.id ?? null,
-        reason: policy
-          ? "observed spend in the current window is below the cap"
-          : "no active hard-stop budget policy governs this scope",
+        reason: cause,
       },
     });
   }

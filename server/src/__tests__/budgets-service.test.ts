@@ -128,6 +128,26 @@ describe("budgetService", () => {
       expect(payload.title).toContain("$150.00");
       expect(payload.title).toContain("$100.00");
     });
+
+    it("tells the board that a kept pause lifts itself when the cap stops binding (PEN-1972)", () => {
+      // Since PEN-1972 a budget pause clears at the next invocation check once
+      // the hard stop stops binding, so "keep the scope paused" is a decision
+      // about the current condition, not an indefinite one. The board is the
+      // party choosing it, so the card has to disclose the difference rather
+      // than let the click imply a durability it does not have.
+      const hard = buildApprovalPayload({
+        policy: policy as any,
+        scopeName: "Budget Agent",
+        thresholdType: "hard",
+        amountObserved: 15000,
+        windowStart: new Date("2026-08-01T00:00:00Z"),
+        windowEnd: new Date("2026-09-01T00:00:00Z"),
+      });
+
+      expect(hard.guidance).toContain("keep the scope paused");
+      expect(hard.guidance).toContain("only while the cap still binds");
+      expect(hard.guidance).toContain("falls back under it");
+    });
   });
 
   it("creates a hard-stop incident and pauses an agent when spend exceeds a budget", async () => {
@@ -1679,5 +1699,105 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
       .select({ pauseReason: projects.pauseReason, pausedAt: projects.pausedAt })
       .from(projects);
     expect(resumedProject).toMatchObject({ pauseReason: null, pausedAt: null });
+  });
+
+  it("resumes on a disabled hard stop without destroying the live soft warning (PEN-1972, #3019 review)", async () => {
+    const { companyId, agentId, service, policy } = await latchAgentOnBudget();
+
+    // Turn the hard stop off while spend is still over cap. `upsertPolicy` takes
+    // its `observedAmount >= amount` branch: `hardStopWillFire` is false, so it
+    // files a *soft* warn card and leaves the scope paused.
+    await service.upsertPolicy(
+      companyId,
+      {
+        scopeType: "agent",
+        scopeId: agentId,
+        metric: "billed_cents",
+        windowKind: "calendar_month_utc",
+        amount: policy.amount,
+        warnPercent: 80,
+        hardStopEnabled: false,
+        notifyEnabled: true,
+      },
+      null,
+    );
+
+    const softBefore = (await db.select().from(budgetIncidents))
+      .filter((incident) => incident.thresholdType === "soft" && incident.status === "open");
+    expect(softBefore).toHaveLength(1);
+
+    // The hard stop no longer binds, so the resume is correct...
+    expect(await service.getInvocationBlock(companyId, agentId)).toBeNull();
+    const [resumed] = await db
+      .select({ status: agents.status, pauseReason: agents.pauseReason })
+      .from(agents);
+    expect(resumed).toMatchObject({ status: "idle", pauseReason: null });
+
+    // ...but it must not take the warn card with it. The window did not roll and
+    // spend is still over cap, so that warning is live: closing it would delete
+    // the board's only notice of an overspend the scope is still carrying.
+    const incidentsAfter = await db.select().from(budgetIncidents);
+    const [soft] = incidentsAfter.filter((incident) => incident.thresholdType === "soft");
+    expect(soft).toMatchObject({ status: "open" });
+    const [softCard] = await db
+      .select()
+      .from(approvals)
+      .where(eq(approvals.id, soft!.approvalId!));
+    expect(softCard).toMatchObject({ status: "pending" });
+
+    // The hard incident is the pause decision, so it still dies with the pause.
+    expect(
+      incidentsAfter.filter((incident) => incident.thresholdType === "hard" && incident.status === "open"),
+    ).toHaveLength(0);
+
+    // And the audit trail must name the cause that actually fired. "The budget
+    // window rolled" was false here on both counts, and it was written for a
+    // deactivated policy and a zeroed cap too.
+    const allCards = await db.select().from(approvals);
+    const withdrawn = allCards.filter((card) => card.status === "withdrawn");
+    expect(withdrawn).toHaveLength(1);
+    expect(withdrawn[0]!.decisionNote).toContain("the hard stop is disabled on the governing policy");
+    expect(withdrawn[0]!.decisionNote).not.toContain("window rolled");
+
+    expect(mockLogActivity.mock.calls.map(([, input]) => input)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          action: "budget.pause_auto_cleared",
+          details: expect.objectContaining({
+            reason: "the hard stop is disabled on the governing policy",
+          }),
+        }),
+      ]),
+    );
+  });
+
+  it("writes one auto-clear per resume when two callers race the same latch (PEN-1972, #3019 review)", async () => {
+    const { companyId, agentId, service } = await latchAgentOnBudget();
+    await rollWindowBackwards(companyId);
+    mockLogActivity.mockClear();
+
+    // Both calls start before either writes, so in the usual interleaving both
+    // read the row as paused and both reach the resume. That write is guarded on
+    // `pauseReason = "budget"`, so exactly one UPDATE returns a row and the
+    // loser's guard matches nothing. The loser resumed nothing, so it must not
+    // also claim an auto-clear in the ledger -- a resume is a fiscal event, and
+    // double-counting one is a false trace.
+    //
+    // The assertion holds under either interleaving: if the second call happens
+    // to read the row after the first already resumed it, it skips the clear
+    // entirely and still logs nothing. So this cannot fail spuriously, and in
+    // the racing interleaving -- the one it is here to cover -- it is the
+    // `.returning()` guard in `resumeScopeFromBudget` that keeps the count at 1.
+    const [first, second] = await Promise.all([
+      service.getInvocationBlock(companyId, agentId),
+      service.getInvocationBlock(companyId, agentId),
+    ]);
+    expect(first).toBeNull();
+    expect(second).toBeNull();
+
+    const cleared = mockLogActivity.mock.calls
+      .map(([, input]) => input)
+      .filter((input: any) => input.action === "budget.pause_auto_cleared");
+    expect(cleared).toHaveLength(1);
   });
 });
