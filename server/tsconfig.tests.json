@@ -21,6 +21,7 @@
     "src/__tests__/github-webhook-issue-lookup-filtered.test.ts",
     "src/__tests__/heartbeat-pending-image-bump-dispatch.test.ts",
     "src/__tests__/heartbeat-strict-git-probe-stderr.test.ts",
+    "src/__tests__/heartbeat-timer-pre-dispatch-exclusions.test.ts",
     "src/__tests__/issue-list-description-truncation-flag.test.ts",
     "src/__tests__/issue-park-expiry-sweep.test.ts",
     "src/__tests__/issue-tree-hold-metrics.test.ts",
