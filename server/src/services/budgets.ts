@@ -437,7 +437,14 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
     });
   }
 
-  async function resumeScopeFromBudget(policy: PolicyRow) {
+  /**
+   * Addressed by scope rather than by policy row: a budget latch has to be
+   * clearable even when the policy that set it has since been deactivated or
+   * deleted, which is precisely the state in which nothing else would ever
+   * clear it. Every update is guarded on `pauseReason = "budget"`, so this can
+   * never lift a manual or operator pause.
+   */
+  async function resumeScopeFromBudget(policy: Pick<PolicyRow, "scopeType" | "scopeId">) {
     const now = new Date();
     if (policy.scopeType === "agent") {
       await db
@@ -473,6 +480,108 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
         updatedAt: now,
       })
       .where(and(eq(companies.id, policy.scopeId), eq(companies.pauseReason, "budget")));
+  }
+
+  async function loadActiveBudgetPolicy(
+    companyId: string,
+    scopeType: BudgetScopeType,
+    scopeId: string,
+  ): Promise<PolicyRow | null> {
+    return db
+      .select()
+      .from(budgetPolicies)
+      .where(
+        and(
+          eq(budgetPolicies.companyId, companyId),
+          eq(budgetPolicies.scopeType, scopeType),
+          eq(budgetPolicies.scopeId, scopeId),
+          eq(budgetPolicies.isActive, true),
+          eq(budgetPolicies.metric, "billed_cents"),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+  }
+
+  /**
+   * Does the hard stop bind *right now*, against the current window? This is the
+   * question `getInvocationBlock` has always asked of a running scope, extracted
+   * so a paused one can be asked it too.
+   */
+  async function hardStopStillBinds(policy: PolicyRow | null) {
+    if (!policy || !policy.hardStopEnabled || policy.amount <= 0) return false;
+    const observed = await computeObservedAmount(db, policy);
+    return observed >= policy.amount;
+  }
+
+  /**
+   * Clear a budget pause whose condition has stopped holding.
+   *
+   * The pause is a sticky flag on the scope row; the condition that set it is
+   * window-scoped. `computeObservedAmount` only sums cost events inside the
+   * current window, so at the window roll the spend that justified the pause
+   * drops out of the sum and the condition evaporates -- but nothing clears the
+   * flag. `evaluateCostEvent` cannot do it either: it is driven by cost events,
+   * and a paused scope emits none, so a latched scope can never re-trigger its
+   * own evaluation. Before this, the only exit was an explicit human resume, and
+   * a $0.25 overshoot on a $3,000 cap could hold a scope down indefinitely
+   * (Penstock PEN-1972).
+   *
+   * Any still-open incident is closed and its pending card withdrawn: that card
+   * asks the board to choose between raising the budget and staying paused, and
+   * neither branch is meaningful once the scope is no longer paused. Leaving it
+   * pending would strand a decision against a condition that no longer exists.
+   */
+  async function clearExpiredBudgetPause(
+    companyId: string,
+    scopeType: BudgetScopeType,
+    scopeId: string,
+    scopeName: string,
+    policy: PolicyRow | null,
+  ) {
+    await resumeScopeFromBudget({ scopeType, scopeId });
+
+    if (policy) {
+      const openRows = await db
+        .select()
+        .from(budgetIncidents)
+        .where(and(eq(budgetIncidents.policyId, policy.id), eq(budgetIncidents.status, "open")));
+      if (openRows.length > 0) {
+        const now = new Date();
+        await db
+          .update(budgetIncidents)
+          .set({ status: "resolved", resolvedAt: now, updatedAt: now })
+          .where(and(eq(budgetIncidents.policyId, policy.id), eq(budgetIncidents.status, "open")));
+        for (const row of openRows) {
+          await withdrawPendingApproval(
+            row.approvalId ?? null,
+            row.companyId,
+            "Withdrawn automatically: the budget window rolled and this scope resumed on its own, so there is no longer a pause to decide about.",
+            "budget_pause_condition_cleared",
+          );
+        }
+      }
+    }
+
+    // A resume is a fiscal event and must leave a trace, the same way a pause
+    // does -- otherwise a scope that silently came back is indistinguishable
+    // from one that was never stopped.
+    await logActivity(db, {
+      companyId,
+      actorType: "system",
+      actorId: "budget_service",
+      action: "budget.pause_auto_cleared",
+      entityType: "budget_policy",
+      entityId: policy?.id ?? scopeId,
+      details: {
+        scopeType,
+        scopeId,
+        scopeName,
+        policyId: policy?.id ?? null,
+        reason: policy
+          ? "observed spend in the current window is below the cap"
+          : "no active hard-stop budget policy governs this scope",
+      },
+    });
   }
 
   async function getPolicyRow(policyId: string) {
@@ -1182,75 +1291,65 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
         .where(eq(companies.id, companyId))
         .then((rows) => rows[0] ?? null);
       if (!company) throw notFound("Company not found");
-      if (company.status === "paused") {
-        return {
-          scopeType: "company" as const,
-          scopeId: companyId,
-          scopeName: company.name,
-          reason:
-            company.pauseReason === "budget"
-              ? "Company is paused because its budget hard-stop was reached."
-              : "Company is paused and cannot start new work.",
-        };
-      }
 
-      const companyPolicy = await db
-        .select()
-        .from(budgetPolicies)
-        .where(
-          and(
-            eq(budgetPolicies.companyId, companyId),
-            eq(budgetPolicies.scopeType, "company"),
-            eq(budgetPolicies.scopeId, companyId),
-            eq(budgetPolicies.isActive, true),
-            eq(budgetPolicies.metric, "billed_cents"),
-          ),
-        )
-        .then((rows) => rows[0] ?? null);
-      if (companyPolicy && companyPolicy.hardStopEnabled && companyPolicy.amount > 0) {
-        const observed = await computeObservedAmount(db, companyPolicy);
-        if (observed >= companyPolicy.amount) {
+      // The governing policy is loaded *before* the pause check, not after it,
+      // so that a scope already carrying the flag can be asked the same live
+      // question as one that is still running. Observed spend is computed once
+      // and reused by both branches.
+      const companyPolicy = await loadActiveBudgetPolicy(companyId, "company", companyId);
+      const companyOverCap = await hardStopStillBinds(companyPolicy);
+
+      if (company.status === "paused") {
+        if (company.pauseReason !== "budget") {
           return {
             scopeType: "company" as const,
             scopeId: companyId,
             scopeName: company.name,
-            reason: "Company cannot start new work because its budget hard-stop is exceeded.",
+            reason: "Company is paused and cannot start new work.",
           };
         }
+        if (companyOverCap) {
+          return {
+            scopeType: "company" as const,
+            scopeId: companyId,
+            scopeName: company.name,
+            reason: "Company is paused because its budget hard-stop was reached.",
+          };
+        }
+        await clearExpiredBudgetPause(companyId, "company", companyId, company.name, companyPolicy);
       }
 
-      if (agent.status === "paused" && agent.pauseReason === "budget") {
+      if (companyOverCap) {
         return {
-          scopeType: "agent" as const,
-          scopeId: agentId,
-          scopeName: agent.name,
-          reason: "Agent is paused because its budget hard-stop was reached.",
+          scopeType: "company" as const,
+          scopeId: companyId,
+          scopeName: company.name,
+          reason: "Company cannot start new work because its budget hard-stop is exceeded.",
         };
       }
 
-      const agentPolicy = await db
-        .select()
-        .from(budgetPolicies)
-        .where(
-          and(
-            eq(budgetPolicies.companyId, companyId),
-            eq(budgetPolicies.scopeType, "agent"),
-            eq(budgetPolicies.scopeId, agentId),
-            eq(budgetPolicies.isActive, true),
-            eq(budgetPolicies.metric, "billed_cents"),
-          ),
-        )
-        .then((rows) => rows[0] ?? null);
-      if (agentPolicy && agentPolicy.hardStopEnabled && agentPolicy.amount > 0) {
-        const observed = await computeObservedAmount(db, agentPolicy);
-        if (observed >= agentPolicy.amount) {
+      const agentPolicy = await loadActiveBudgetPolicy(companyId, "agent", agentId);
+      const agentOverCap = await hardStopStillBinds(agentPolicy);
+
+      if (agent.status === "paused" && agent.pauseReason === "budget") {
+        if (agentOverCap) {
           return {
             scopeType: "agent" as const,
             scopeId: agentId,
             scopeName: agent.name,
-            reason: "Agent cannot start because its budget hard-stop is still exceeded.",
+            reason: "Agent is paused because its budget hard-stop was reached.",
           };
         }
+        await clearExpiredBudgetPause(companyId, "agent", agentId, agent.name, agentPolicy);
+      }
+
+      if (agentOverCap) {
+        return {
+          scopeType: "agent" as const,
+          scopeId: agentId,
+          scopeName: agent.name,
+          reason: "Agent cannot start because its budget hard-stop is still exceeded.",
+        };
       }
 
       const candidateProjectId = context?.projectId ?? null;
@@ -1269,38 +1368,21 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
         .then((rows) => rows[0] ?? null);
 
       if (!project || project.companyId !== companyId) return null;
-      const projectPolicy = await db
-        .select()
-        .from(budgetPolicies)
-        .where(
-          and(
-            eq(budgetPolicies.companyId, companyId),
-            eq(budgetPolicies.scopeType, "project"),
-            eq(budgetPolicies.scopeId, project.id),
-            eq(budgetPolicies.isActive, true),
-            eq(budgetPolicies.metric, "billed_cents"),
-          ),
-        )
-        .then((rows) => rows[0] ?? null);
-      if (projectPolicy && projectPolicy.hardStopEnabled && projectPolicy.amount > 0) {
-        const observed = await computeObservedAmount(db, projectPolicy);
-        if (observed >= projectPolicy.amount) {
-          return {
-            scopeType: "project" as const,
-            scopeId: project.id,
-            scopeName: project.name,
-            reason: "Project cannot start work because its budget hard-stop is still exceeded.",
-          };
-        }
+      const projectPolicy = await loadActiveBudgetPolicy(companyId, "project", project.id);
+      const projectOverCap = await hardStopStillBinds(projectPolicy);
+      if (projectOverCap) {
+        return {
+          scopeType: "project" as const,
+          scopeId: project.id,
+          scopeName: project.name,
+          reason: "Project cannot start work because its budget hard-stop is still exceeded.",
+        };
       }
 
       if (!project.pausedAt || project.pauseReason !== "budget") return null;
-      return {
-        scopeType: "project" as const,
-        scopeId: project.id,
-        scopeName: project.name,
-        reason: "Project is paused because its budget hard-stop was reached.",
-      };
+      // Over-cap was ruled out above, so the flag has outlived its condition.
+      await clearExpiredBudgetPause(companyId, "project", project.id, project.name, projectPolicy);
+      return null;
     },
 
     resolveIncident: async (

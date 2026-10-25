@@ -22,10 +22,40 @@ function windowLabel(windowKind: BudgetPolicySummary["windowKind"]) {
   return windowKind === "lifetime" ? "Lifetime budget" : "Monthly UTC budget";
 }
 
-function statusTone(status: BudgetPolicySummary["status"]) {
-  if (status === "hard_stop") return "text-red-700 dark:text-red-300 border-red-500/30 bg-red-500/10";
+/**
+ * What the card should *look* like, which is not the same question as what the
+ * policy's utilization is.
+ *
+ * `summary.status` is derived from observed spend alone, and observed spend is
+ * window-scoped: at the window roll a scope that is still paused drops to 0% and
+ * its status falls back to "ok". Keying the pill, icon and bar off `status` alone
+ * therefore turned a still-paused scope green at exactly the moment its pause
+ * became durable, and held it green for the rest of the window -- the single
+ * number a reviewer glances at to catch a failed resume was the number that
+ * stopped reporting it (Penstock PEN-1972, defect 3).
+ *
+ * Folding `paused` in here rather than at each render site is deliberate: the
+ * pill, the icon and the progress bar previously made this decision
+ * independently, and the label already said "Paused" while the colour said
+ * healthy.
+ */
+type BudgetDisplayStatus = BudgetPolicySummary["status"] | "paused";
+
+function displayStatus(summary: BudgetPolicySummary): BudgetDisplayStatus {
+  return summary.paused ? "paused" : summary.status;
+}
+
+function statusTone(status: BudgetDisplayStatus) {
+  if (status === "hard_stop" || status === "paused") return "text-red-700 dark:text-red-300 border-red-500/30 bg-red-500/10";
   if (status === "warning") return "text-amber-700 dark:text-amber-200 border-amber-500/30 bg-amber-500/10";
   return "text-emerald-700 dark:text-emerald-200 border-emerald-500/30 bg-emerald-500/10";
+}
+
+function statusLabel(status: BudgetDisplayStatus) {
+  if (status === "paused") return "Paused";
+  if (status === "hard_stop") return "Hard stop";
+  if (status === "warning") return "Warning";
+  return "Healthy";
 }
 
 export function BudgetPolicyCard({
@@ -50,7 +80,9 @@ export function BudgetPolicyCard({
   const parsedDraft = parseDollarInput(draftBudget);
   const canSave = typeof parsedDraft === "number" && parsedDraft !== summary.amount && Boolean(onSave);
   const progress = summary.amount > 0 ? Math.min(100, summary.utilizationPercent) : 0;
-  const StatusIcon = summary.status === "hard_stop" ? ShieldAlert : summary.status === "warning" ? AlertTriangle : Wallet;
+  const status = displayStatus(summary);
+  const StatusIcon =
+    status === "paused" ? PauseCircle : status === "hard_stop" ? ShieldAlert : status === "warning" ? AlertTriangle : Wallet;
   const isPlain = variant === "plain";
 
   const observedBudgetGrid = isPlain ? (
@@ -99,13 +131,20 @@ export function BudgetPolicyCard({
         <span>Remaining</span>
         <span>{summary.amount > 0 ? formatCents(summary.remainingAmount) : "Unlimited"}</span>
       </div>
-      <div className={cn("h-2 overflow-hidden rounded-full", isPlain ? "bg-border/70" : "bg-muted/70")}>
+      <div
+        className={cn(
+          "h-2 overflow-hidden rounded-full",
+          // A scope paused after a window roll reads 0%, so the fill is
+          // zero-width and cannot carry the signal on its own -- the track has to.
+          status === "paused" ? "bg-red-500/30" : isPlain ? "bg-border/70" : "bg-muted/70",
+        )}
+      >
         <div
           className={cn(
             "h-full rounded-full transition-(--tp-width-background-color) duration-200",
-            summary.status === "hard_stop"
+            status === "hard_stop" || status === "paused"
               ? "bg-(--status-task-blocked)"
-              : summary.status === "warning"
+              : status === "warning"
                 ? "bg-(--status-task-todo)"
                 : "bg-(--status-task-done)",
           )}
@@ -165,15 +204,15 @@ export function BudgetPolicyCard({
           <div
             className={cn(
               "inline-flex items-center gap-2 text-(length:--text-micro) uppercase tracking-(--tracking-caps)",
-              summary.status === "hard_stop"
+              status === "hard_stop" || status === "paused"
                 ? "text-red-700 dark:text-red-300"
-                : summary.status === "warning"
+                : status === "warning"
                   ? "text-amber-800 dark:text-amber-200"
                   : "text-muted-foreground",
             )}
           >
             <StatusIcon className="h-3.5 w-3.5" />
-            {summary.paused ? "Paused" : summary.status === "warning" ? "Warning" : summary.status === "hard_stop" ? "Hard stop" : "Healthy"}
+            {statusLabel(status)}
           </div>
         </div>
 
@@ -199,9 +238,9 @@ export function BudgetPolicyCard({
             <CardTitle className="mt-1 text-base">{summary.scopeName}</CardTitle>
             <CardDescription className="mt-1">{windowLabel(summary.windowKind)}</CardDescription>
           </div>
-          <div className={cn("inline-flex items-center gap-2 rounded-full border px-3 py-1 text-(length:--text-micro) uppercase tracking-(--tracking-caps)", statusTone(summary.status))}>
+          <div className={cn("inline-flex items-center gap-2 rounded-full border px-3 py-1 text-(length:--text-micro) uppercase tracking-(--tracking-caps)", statusTone(status))}>
             <StatusIcon className="h-3.5 w-3.5" />
-            {summary.paused ? "Paused" : summary.status === "warning" ? "Warning" : summary.status === "hard_stop" ? "Hard stop" : "Healthy"}
+            {statusLabel(status)}
           </div>
         </div>
       </CardHeader>
