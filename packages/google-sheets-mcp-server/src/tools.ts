@@ -26,7 +26,7 @@ const rangeSchema = z.string().trim().min(1).max(500).refine(
   "Range must be a single-line A1 notation range.",
 );
 const valuesSchema = z.array(z.array(z.union([z.string(), z.number(), z.boolean(), z.null()])));
-const valueInputOptionSchema = z.enum(["RAW", "USER_ENTERED"]).default("RAW");
+const valueInputOptionSchema = z.enum(["RAW", "USER_ENTERED"]).prefault("RAW");
 
 const spreadsheetToolSchema = z.object({
   spreadsheetId: spreadsheetIdSchema,
@@ -38,8 +38,8 @@ const readValuesSchema = spreadsheetToolSchema.extend({
 
 const searchRowsSchema = readValuesSchema.extend({
   query: z.string().min(1),
-  caseSensitive: z.boolean().optional().default(false),
-  maxResults: z.number().int().positive().max(500).optional().default(50),
+  caseSensitive: z.boolean().prefault(false),
+  maxResults: z.number().int().positive().max(500).prefault(50),
 });
 
 const appendRowsSchema = readValuesSchema.extend({

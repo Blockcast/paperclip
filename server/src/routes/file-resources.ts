@@ -125,7 +125,7 @@ function readQuery(query: unknown) {
     parsed = workspaceFileResourceQuerySchema.parse(query);
   } catch (error) {
     if (error instanceof ZodError) {
-      const refinement = error.errors.find((issue) => {
+      const refinement = error.issues.find((issue) => {
         const code = (issue as { params?: { code?: string } }).params?.code;
         return code === "invalid_path" || code === "invalid_target";
       });
@@ -148,7 +148,7 @@ function readListQuery(query: unknown) {
     parsed = workspaceFileListQuerySchema.parse(query);
   } catch (error) {
     if (error instanceof ZodError) {
-      const refinement = error.errors.find((issue) => {
+      const refinement = error.issues.find((issue) => {
         const code = (issue as { params?: { code?: string } }).params?.code;
         return code === "invalid_query" || code === "invalid_target" || code === "invalid_path";
       });

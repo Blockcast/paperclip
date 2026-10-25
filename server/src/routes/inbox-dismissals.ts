@@ -9,7 +9,7 @@ const ITEM_KEY_RE = /^(approval|join|run|attention):.+$/;
 
 const inboxDismissalSchema = z.object({
   itemKey: z.string().trim().min(1).regex(ITEM_KEY_RE, "Unsupported inbox item key"),
-  kind: z.enum(["dismiss", "snooze"]).default("dismiss"),
+  kind: z.enum(["dismiss", "snooze"]).prefault("dismiss"),
   snoozedUntil: z.string().trim().optional(),
 }).superRefine((value, ctx) => {
   if (value.kind === "dismiss") {

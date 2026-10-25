@@ -2309,3 +2309,4 @@ export {
   type EnvironmentCustomImageTerminalSessionToken,
 } from "./validators/environment-custom-images.js";
 export * from "./validators/skill-policy.js";
+export { optionalNoDefault, partialNoDefaults } from "./zod-compat.js";

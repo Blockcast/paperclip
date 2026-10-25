@@ -55,7 +55,7 @@ function jsonSchemaToZodShape(schema: unknown): z.ZodRawShape {
   const properties = (obj.properties ?? {}) as Record<string, unknown>;
   const required = new Set(Array.isArray(obj.required) ? (obj.required as string[]) : []);
 
-  const shape: z.ZodRawShape = {};
+  const shape: Record<string, z.ZodType> = {};
   for (const [key, raw] of Object.entries(properties)) {
     const propSchema = jsonSchemaPropToZod(raw);
     shape[key] = required.has(key) ? propSchema : propSchema.optional();

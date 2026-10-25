@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { partialNoDefaults } from "../zod-compat.js";
 import {
   ISSUE_PRIORITIES,
   ROUTINE_CATCH_UP_POLICIES,
@@ -20,10 +21,10 @@ const routineVariableValueSchema = z.union([z.string(), z.number().finite(), z.b
 export const routineVariableSchema = z.object({
   name: z.string().trim().regex(/^[A-Za-z][A-Za-z0-9_]*$/),
   label: z.string().trim().max(120).optional().nullable(),
-  type: z.enum(ROUTINE_VARIABLE_TYPES).optional().default("text"),
+  type: z.enum(ROUTINE_VARIABLE_TYPES).prefault("text"),
   defaultValue: routineVariableValueSchema.optional().nullable(),
-  required: z.boolean().optional().default(true),
-  options: z.array(z.string().trim().min(1).max(120)).max(50).optional().default([]),
+  required: z.boolean().prefault(true),
+  options: z.array(z.string().trim().min(1).max(120)).max(50).prefault([]),
 }).superRefine((value, ctx) => {
   if (value.type === "select" && value.options.length === 0) {
     ctx.addIssue({
@@ -60,49 +61,49 @@ export const routineVariableSchema = z.object({
 });
 
 export const createRoutineSchema = z.object({
-  projectId: z.string().uuid().optional().nullable(),
-  folderId: z.string().uuid().optional().nullable(),
-  goalId: z.string().uuid().optional().nullable(),
-  parentIssueId: z.string().uuid().optional().nullable(),
+  projectId: z.string().guid().optional().nullable(),
+  folderId: z.string().guid().optional().nullable(),
+  goalId: z.string().guid().optional().nullable(),
+  parentIssueId: z.string().guid().optional().nullable(),
   title: z.string().trim().min(1).max(200),
   description: z.string().optional().nullable(),
-  assigneeAgentId: z.string().uuid().optional().nullable(),
-  priority: z.enum(ISSUE_PRIORITIES).optional().default("medium"),
-  status: z.enum(ROUTINE_STATUSES).optional().default("active"),
-  concurrencyPolicy: z.enum(ROUTINE_CONCURRENCY_POLICIES).optional().default("coalesce_if_active"),
-  catchUpPolicy: z.enum(ROUTINE_CATCH_UP_POLICIES).optional().default("skip_missed"),
-  variables: z.array(routineVariableSchema).optional().default([]),
+  assigneeAgentId: z.string().guid().optional().nullable(),
+  priority: z.enum(ISSUE_PRIORITIES).prefault("medium"),
+  status: z.enum(ROUTINE_STATUSES).prefault("active"),
+  concurrencyPolicy: z.enum(ROUTINE_CONCURRENCY_POLICIES).prefault("coalesce_if_active"),
+  catchUpPolicy: z.enum(ROUTINE_CATCH_UP_POLICIES).prefault("skip_missed"),
+  variables: z.array(routineVariableSchema).prefault([]),
   env: envConfigSchema.optional().nullable(),
 });
 
 export type CreateRoutine = z.infer<typeof createRoutineSchema>;
 
-export const updateRoutineSchema = createRoutineSchema.partial().extend({
-  baseRevisionId: z.string().uuid().optional().nullable(),
+export const updateRoutineSchema = createRoutineSchema.apply(partialNoDefaults).extend({
+  baseRevisionId: z.string().guid().optional().nullable(),
 });
 export type UpdateRoutine = z.infer<typeof updateRoutineSchema>;
 
 export const routineRevisionSnapshotRoutineV1Schema = z.object({
-  id: z.string().uuid(),
-  companyId: z.string().uuid(),
-  projectId: z.string().uuid().nullable(),
-  folderId: z.string().uuid().nullable().optional(),
-  goalId: z.string().uuid().nullable(),
-  parentIssueId: z.string().uuid().nullable(),
+  id: z.string().guid(),
+  companyId: z.string().guid(),
+  projectId: z.string().guid().nullable(),
+  folderId: z.string().guid().nullable().optional(),
+  goalId: z.string().guid().nullable(),
+  parentIssueId: z.string().guid().nullable(),
   title: z.string().trim().min(1).max(200),
   description: z.string().nullable(),
-  assigneeAgentId: z.string().uuid().nullable(),
+  assigneeAgentId: z.string().guid().nullable(),
   priority: z.enum(ISSUE_PRIORITIES),
   status: z.enum(ROUTINE_STATUSES),
   concurrencyPolicy: z.enum(ROUTINE_CONCURRENCY_POLICIES),
   catchUpPolicy: z.enum(ROUTINE_CATCH_UP_POLICIES),
   variables: z.array(routineVariableSchema),
-  env: envConfigSchema.nullable().default(null),
-  responsibleUserId: z.string().nullable().default(null),
+  env: envConfigSchema.nullable().prefault(null),
+  responsibleUserId: z.string().nullable().prefault(null),
 }).strict();
 
 export const routineRevisionSnapshotTriggerV1Schema = z.object({
-  id: z.string().uuid(),
+  id: z.string().guid(),
   kind: z.enum(ROUTINE_TRIGGER_KINDS),
   label: z.string().nullable(),
   enabled: z.boolean(),
@@ -125,19 +126,19 @@ export type RoutineRevisionSnapshot = z.infer<typeof routineRevisionSnapshotSche
 
 const baseTriggerSchema = z.object({
   label: z.string().trim().max(120).optional().nullable(),
-  enabled: z.boolean().optional().default(true),
+  enabled: z.boolean().prefault(true),
 });
 
 export const createRoutineTriggerSchema = z.discriminatedUnion("kind", [
   baseTriggerSchema.extend({
     kind: z.literal("schedule"),
     cronExpression: z.string().trim().min(1),
-    timezone: z.string().trim().min(1).default("UTC"),
+    timezone: z.string().trim().min(1).prefault("UTC"),
   }),
   baseTriggerSchema.extend({
     kind: z.literal("webhook"),
-    signingMode: z.enum(ROUTINE_TRIGGER_SIGNING_MODES).optional().default("bearer"),
-    replayWindowSec: z.number().int().min(30).max(86_400).optional().default(300),
+    signingMode: z.enum(ROUTINE_TRIGGER_SIGNING_MODES).prefault("bearer"),
+    replayWindowSec: z.number().int().min(30).max(86_400).prefault(300),
   }),
   baseTriggerSchema.extend({
     kind: z.literal("api"),
@@ -158,15 +159,15 @@ export const updateRoutineTriggerSchema = z.object({
 export type UpdateRoutineTrigger = z.infer<typeof updateRoutineTriggerSchema>;
 
 export const runRoutineSchema = z.object({
-  triggerId: z.string().uuid().optional().nullable(),
+  triggerId: z.string().guid().optional().nullable(),
   payload: z.record(z.string(), z.unknown()).optional().nullable(),
   variables: z.record(z.string(), routineVariableValueSchema).optional().nullable(),
-  projectId: z.string().uuid().optional().nullable(),
-  projectWorkspaceId: z.string().uuid().optional().nullable(),
-  assigneeAgentId: z.string().uuid().optional().nullable(),
+  projectId: z.string().guid().optional().nullable(),
+  projectWorkspaceId: z.string().guid().optional().nullable(),
+  assigneeAgentId: z.string().guid().optional().nullable(),
   idempotencyKey: z.string().trim().max(255).optional().nullable(),
-  source: z.enum(["manual", "api"]).optional().default("manual"),
-  executionWorkspaceId: z.string().uuid().optional().nullable(),
+  source: z.enum(["manual", "api"]).prefault("manual"),
+  executionWorkspaceId: z.string().guid().optional().nullable(),
   executionWorkspacePreference: z.enum(ISSUE_EXECUTION_WORKSPACE_PREFERENCES).optional().nullable(),
   executionWorkspaceSettings: issueExecutionWorkspaceSettingsSchema.optional().nullable(),
 });

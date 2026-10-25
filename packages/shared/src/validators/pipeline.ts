@@ -10,7 +10,7 @@ export const pipelineStageKindSchema = z.enum(["working", "review", "done", "can
 export const legacyPipelineStageKindSchema = z.enum(["open", "working", "review", "done", "cancelled"]);
 
 export const pipelineStageApproverSchema = z.object({
-  kind: z.enum(["any_human", "user", "agent"]).optional().default("any_human"),
+  kind: z.enum(["any_human", "user", "agent"]).prefault("any_human"),
   id: z.string().trim().min(1).max(200).optional(),
 }).superRefine((value, ctx) => {
   if (value.kind !== "any_human" && (typeof value.id !== "string" || value.id.length === 0)) {
@@ -24,41 +24,41 @@ export const pipelineStageApproverSchema = z.object({
 
 export const pipelineStageOnEnterSchema = z.object({
   type: z.literal("run_routine"),
-  routineId: z.string().uuid(),
+  routineId: z.string().guid(),
   id: z.string().trim().min(1).max(200).optional(),
-  projectId: z.string().uuid().optional().nullable(),
-  projectWorkspaceId: z.string().uuid().optional().nullable(),
-  executionWorkspaceId: z.string().uuid().optional().nullable(),
+  projectId: z.string().guid().optional().nullable(),
+  projectWorkspaceId: z.string().guid().optional().nullable(),
+  executionWorkspaceId: z.string().guid().optional().nullable(),
   executionWorkspacePreference: z.enum(ISSUE_EXECUTION_WORKSPACE_PREFERENCES).optional().nullable(),
   executionWorkspaceSettings: issueExecutionWorkspaceSettingsSchema.optional().nullable(),
 }).passthrough();
 
 export const pipelineStageAutomationSchema = z.object({
-  routineId: z.string().uuid().optional().nullable(),
-  assigneeAgentId: z.string().uuid().optional().nullable(),
+  routineId: z.string().guid().optional().nullable(),
+  assigneeAgentId: z.string().guid().optional().nullable(),
   instructionsBody: z.string().optional().nullable(),
-  projectId: z.string().uuid().optional().nullable(),
-  projectWorkspaceId: z.string().uuid().optional().nullable(),
-  executionWorkspaceId: z.string().uuid().optional().nullable(),
+  projectId: z.string().guid().optional().nullable(),
+  projectWorkspaceId: z.string().guid().optional().nullable(),
+  executionWorkspaceId: z.string().guid().optional().nullable(),
   executionWorkspacePreference: z.enum(ISSUE_EXECUTION_WORKSPACE_PREFERENCES).optional().nullable(),
   executionWorkspaceSettings: issueExecutionWorkspaceSettingsSchema.optional().nullable(),
 }).passthrough();
 
 export const pipelineStageCarryOverPolicySchema = z.object({
-  version: z.literal(1).default(1),
-  mode: z.enum(["all_except", "only"]).default("all_except"),
-  includeFields: z.array(routineVariableLikeNameSchema).max(100).default([]),
-  excludeFields: z.array(routineVariableLikeNameSchema).max(100).default([]),
+  version: z.literal(1).prefault(1),
+  mode: z.enum(["all_except", "only"]).prefault("all_except"),
+  includeFields: z.array(routineVariableLikeNameSchema).max(100).prefault([]),
+  excludeFields: z.array(routineVariableLikeNameSchema).max(100).prefault([]),
 });
 
 export const pipelineStageBreakdownSchema = z.object({
-  targetPipelineId: z.string().uuid(),
+  targetPipelineId: z.string().guid(),
   targetStageKey: z.string().trim().min(1).max(120),
-  pieceNoun: z.string().trim().min(1).max(80).default("piece"),
+  pieceNoun: z.string().trim().min(1).max(80).prefault("piece"),
   carryOverPolicy: pipelineStageCarryOverPolicySchema.optional(),
-  inheritFields: z.array(routineVariableLikeNameSchema).max(100).default([]),
+  inheritFields: z.array(routineVariableLikeNameSchema).max(100).prefault([]),
   advanceTo: z.string().trim().min(1).max(120).optional(),
-  waitForPieces: z.boolean().optional().default(false),
+  waitForPieces: z.boolean().prefault(false),
   whenFinishedMoveTo: z.string().trim().min(1).max(120).optional(),
 }).superRefine((value, ctx) => {
   if (value.waitForPieces && !value.whenFinishedMoveTo) {
@@ -73,10 +73,10 @@ export const pipelineStageBreakdownSchema = z.object({
 export const pipelineStageVariableSchema = z.object({
   key: routineVariableLikeNameSchema,
   label: z.string().trim().max(120),
-  type: z.enum(["select", "text", "multiline"]).default("text"),
-  options: z.array(z.string().trim().min(1).max(120)).max(50).optional().default([]),
-  required: z.boolean().optional().default(false),
-  showInAddForm: z.boolean().optional().default(false),
+  type: z.enum(["select", "text", "multiline"]).prefault("text"),
+  options: z.array(z.string().trim().min(1).max(120)).max(50).prefault([]),
+  required: z.boolean().prefault(false),
+  showInAddForm: z.boolean().prefault(false),
 }).superRefine((value, ctx) => {
   if (value.type === "select" && value.options.length === 0) {
     ctx.addIssue({
@@ -95,7 +95,7 @@ export const pipelineStageVariableSchema = z.object({
 });
 
 export const pipelineStageConfigSchema = z.object({
-  variables: z.array(pipelineStageVariableSchema).default([]),
+  variables: z.array(pipelineStageVariableSchema).prefault([]),
   disabled: z.boolean().optional(),
   disabledReason: z.string().trim().max(1_000).nullable().optional(),
   requireApproval: z.boolean().optional(),
@@ -130,16 +130,16 @@ export const pipelineStageConfigSchema = z.object({
 export const pipelineAutomationRetryScopeSchema = z.enum(["current_stage", "previous_stage"]);
 
 export const pipelineAutomationRetryCleanupOptionsSchema = z.object({
-  retireDirectChildren: z.boolean().default(true),
-  retireDescendants: z.boolean().default(true),
-  cancelLinkedAutomationIssues: z.boolean().default(true),
+  retireDirectChildren: z.boolean().prefault(true),
+  retireDescendants: z.boolean().prefault(true),
+  cancelLinkedAutomationIssues: z.boolean().prefault(true),
 });
 
 export const pipelineAutomationRetryRequestSchema = z.object({
   scope: pipelineAutomationRetryScopeSchema,
-  targetStageId: z.string().uuid().nullable().optional(),
+  targetStageId: z.string().guid().nullable().optional(),
   expectedVersion: z.number().int().positive(),
-  cleanup: pipelineAutomationRetryCleanupOptionsSchema.default({
+  cleanup: pipelineAutomationRetryCleanupOptionsSchema.prefault({
     retireDirectChildren: true,
     retireDescendants: true,
     cancelLinkedAutomationIssues: true,

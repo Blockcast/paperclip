@@ -600,18 +600,18 @@ function coordinationBlockerPatchOnlyRemoves(
 // (create issue -> assign to a peer -> cancel their in-flight run).
 
 const refreshExternalObjectsSchema = z.object({
-  objectIds: z.array(z.string().uuid()).max(50).optional(),
+  objectIds: z.array(z.string().guid()).max(50).optional(),
 }).strict();
 const inboxArchiveBodySchema = z.object({
   userId: z.string().trim().min(1).optional(),
-}).strict().default({});
+}).strict().prefault({});
 const externalObjectSummariesSchema = z.object({
-  issueIds: z.array(z.string().uuid()).max(1000),
+  issueIds: z.array(z.string().guid()).max(1000),
 }).strict();
 
 const promoteLowTrustOutputSchema = z.object({
   sourceArtifactKind: z.enum(["comment", "document", "work_product", "issue"]),
-  sourceArtifactId: z.string().uuid(),
+  sourceArtifactId: z.string().guid(),
   title: z.string().trim().min(1).max(200),
   summary: z.string().trim().min(1).max(8_000),
 });
@@ -815,7 +815,7 @@ function requiresPaperclipAttachmentMetadata(input: {
 }
 
 const attachmentArtifactMetadataInputSchema = z.object({
-  attachmentId: z.string().uuid(),
+  attachmentId: z.string().guid(),
 }).passthrough();
 
 function buildCreateIssueActivityStatusDetails(
@@ -6161,8 +6161,8 @@ export function issueRoutes(
   //
   // Safe to read keys directly: `validate(updateIssueRouteSchema)` has already
   // replaced req.body with the parsed result, and updateIssueSchema is built
-  // with `.partial()`, which strips unknown keys AND suppresses field defaults
-  // (a bare `.default()` under `.optional()` does not fire on an absent key).
+  // with `partialNoDefaults()`, which strips unknown keys AND suppresses field
+  // defaults (zod 4's plain `.partial()` would fire them on an absent key).
   // So the key set here is exactly what the caller sent.
   function coordinationMetadataPatchFields(body: unknown): string[] | null {
     if (typeof body !== "object" || body === null || Array.isArray(body)) return null;
@@ -6701,7 +6701,7 @@ export function issueRoutes(
     //
     // Checked on the *normalized* policy rather than the request's key set:
     // `validate(updateIssueRouteSchema)` has already replaced req.body with the
-    // parsed result, and unlike the top-level `.partial()` object the nested
+    // parsed result, and unlike the top-level `partialNoDefaults()` object the nested
     // policy schema does fire its defaults — a monitor-only policy arrives here
     // as `{mode, commentRequired, stages, monitor}`. So key presence proves
     // nothing and only the values do. `mode`/`commentRequired` are not checked

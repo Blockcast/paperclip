@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { partialNoDefaults } from "../zod-compat.js";
 import {
   ISSUE_EXECUTION_DECISION_OUTCOMES,
   ISSUE_EXECUTION_MONITOR_CLEAR_REASONS,
@@ -64,12 +65,12 @@ export const issueBlockedInboxReasonSchema = z.enum([
 ]);
 
 export const issueBlockedInboxIssueRefSchema = z.object({
-  id: z.string().uuid(),
+  id: z.string().guid(),
   identifier: z.string().nullable(),
   title: z.string(),
   status: z.enum(ISSUE_STATUSES),
   priority: z.enum(ISSUE_PRIORITIES),
-  assigneeAgentId: z.string().uuid().nullable(),
+  assigneeAgentId: z.string().guid().nullable(),
   assigneeUserId: z.string().nullable(),
 }).strict();
 
@@ -81,7 +82,7 @@ export const issueBlockedInboxAttentionSchema = z.object({
   stoppedSinceAt: z.string().datetime().nullable(),
   owner: z.object({
     type: z.enum(["agent", "user", "board", "external", "unknown"]),
-    agentId: z.string().uuid().nullable(),
+    agentId: z.string().guid().nullable(),
     userId: z.string().nullable(),
     label: z.string().nullable(),
   }).strict(),
@@ -92,11 +93,11 @@ export const issueBlockedInboxAttentionSchema = z.object({
   sourceIssue: issueBlockedInboxIssueRefSchema.nullable(),
   leafIssue: issueBlockedInboxIssueRefSchema.nullable(),
   recoveryIssue: issueBlockedInboxIssueRefSchema.nullable(),
-  approvalId: z.string().uuid().nullable(),
-  interactionId: z.string().uuid().nullable(),
+  approvalId: z.string().guid().nullable(),
+  interactionId: z.string().guid().nullable(),
   // PEN-4193: this object is `.strict()`, so the key has to be admitted here or the whole
   // attention payload is REJECTED rather than merely stripped of the new field.
-  overdueInteractionId: z.string().uuid().nullable(),
+  overdueInteractionId: z.string().guid().nullable(),
   sampleIssueIdentifier: z.string().nullable(),
   redaction: z.object({
     externalDetailsRedacted: z.boolean(),
@@ -116,7 +117,7 @@ export const ISSUE_EXECUTION_WORKSPACE_PREFERENCES = [
 export const issueExecutionWorkspaceSettingsSchema = z
   .object({
     mode: z.enum(ISSUE_EXECUTION_WORKSPACE_PREFERENCES).optional(),
-    environmentId: z.string().uuid().optional().nullable(),
+    environmentId: z.string().guid().optional().nullable(),
     workspaceStrategy: executionWorkspaceStrategySchema.optional().nullable(),
     workspaceRuntime: z.record(z.string(), z.unknown()).optional().nullable(),
   })
@@ -132,7 +133,7 @@ export const issueAssigneeAdapterOverridesSchema = z
 
 const issueExecutionStagePrincipalBaseSchema = z.object({
   type: z.enum(["agent", "user"]),
-  agentId: z.string().uuid().optional().nullable(),
+  agentId: z.string().guid().optional().nullable(),
   userId: z.string().optional().nullable(),
 });
 
@@ -156,7 +157,7 @@ export const issueExecutionStagePrincipalSchema = issueExecutionStagePrincipalBa
   });
 
 export const issueExecutionStageParticipantSchema = issueExecutionStagePrincipalBaseSchema.extend({
-  id: z.string().uuid().optional(),
+  id: z.string().guid().optional(),
 }).superRefine((value, ctx) => {
   if (value.type === "agent") {
     if (!value.agentId) {
@@ -176,22 +177,22 @@ export const issueExecutionStageParticipantSchema = issueExecutionStagePrincipal
 });
 
 export const issueExecutionStageSchema = z.object({
-  id: z.string().uuid().optional(),
+  id: z.string().guid().optional(),
   type: z.enum(ISSUE_EXECUTION_STAGE_TYPES),
-  approvalsNeeded: z.literal(1).optional().default(1),
-  participants: z.array(issueExecutionStageParticipantSchema).default([]),
+  approvalsNeeded: z.literal(1).prefault(1),
+  participants: z.array(issueExecutionStageParticipantSchema).prefault([]),
 });
 
 export const issueExecutionMonitorPolicySchema = z.object({
   nextCheckAt: z.string().datetime(),
-  notes: z.string().max(500).optional().nullable().default(null),
-  scheduledBy: z.enum(ISSUE_MONITOR_SCHEDULED_BY).optional().default("assignee"),
+  notes: z.string().max(500).nullable().prefault(null),
+  scheduledBy: z.enum(ISSUE_MONITOR_SCHEDULED_BY).prefault("assignee"),
   gateSignals: z
     .array(z.string().trim().min(1).max(200))
     .max(20)
     .optional()
     .nullable()
-    .default(null)
+    .prefault(null)
     // Schema-size note (BLO-32419): this description is ~3.6 KB (~915 tokens) and ships in BOTH
     // the create-issue and update-issue MCP tool schemas, so every agent pays it roughly twice on
     // every tool-schema load. Kept inline rather than reduced to a pointer at `github-app-auth.ts`:
@@ -241,7 +242,7 @@ export const issueExecutionMonitorPolicySchema = z.object({
     .enum(ISSUE_EXECUTION_MONITOR_KINDS)
     .optional()
     .nullable()
-    .default(null)
+    .prefault(null)
     // PEN-3415: this field is the trigger for the #1195 external-wait slot yield, and until now it
     // was the only conjunct of that gate with nothing agent-facing describing it. The result was an
     // opt-in mechanism nobody opted into: measured 2026-09-21T22:2xZ across every `in_review` row
@@ -261,15 +262,15 @@ export const issueExecutionMonitorPolicySchema = z.object({
         "Every other conjunct is required too: you must be the issue's CURRENT execution run (setting `kind` later, from a different run, does nothing), `nextCheckAt` must be set and unlapsed, the row must end `in_progress` or `in_review`, and this PATCH must carry `executionPolicy` (or be the transition into `in_review`). " +
         "⚠️ ORDER OF OPERATIONS: your run is terminated at this PATCH. Commit, push, open the PR and post your comment FIRST — anything you had not finished is lost, and a comment you intended to add afterwards never lands. Leave `kind` null for an internal follow-up re-check you intend to keep working through. Use `serviceName`/`externalRef` to name what you are waiting on.",
     ),
-  serviceName: z.string().trim().min(1).max(120).optional().nullable().default(null),
-  externalRef: z.string().trim().min(1).max(500).optional().nullable().default(null),
-  timeoutAt: z.string().datetime().optional().nullable().default(null),
-  maxAttempts: z.number().int().positive().max(100).optional().nullable().default(null),
-  recoveryPolicy: z.enum(ISSUE_EXECUTION_MONITOR_RECOVERY_POLICIES).optional().nullable().default(null),
+  serviceName: z.string().trim().min(1).max(120).nullable().prefault(null),
+  externalRef: z.string().trim().min(1).max(500).nullable().prefault(null),
+  timeoutAt: z.string().datetime().nullable().prefault(null),
+  maxAttempts: z.number().int().positive().max(100).nullable().prefault(null),
+  recoveryPolicy: z.enum(ISSUE_EXECUTION_MONITOR_RECOVERY_POLICIES).nullable().prefault(null),
   productivityReviewDisabled: z
     .boolean()
-    .optional()
-    .default(false)
+    
+    .prefault(false)
     .describe(
       "⚠ THIS COPY DIES WITH THE MONITOR. It opts the issue out of automated productivity review only for as long as this monitor exists: every monitor clear — a convergence stall, a dispatch lapse, or an ordinary fire — drops it, and the opt-out is then silently gone while the issue still reads as opted out to whoever set it. " +
         "Prefer the top-level `executionPolicy.productivityReviewDisabled`, which is durable and is also the only reachable home on a row with no monitor (`nextCheckAt` is required here). Set it here only when you genuinely mean 'while this monitor is armed'.",
@@ -277,9 +278,9 @@ export const issueExecutionMonitorPolicySchema = z.object({
 });
 
 export const issueExecutionPolicySchema = z.object({
-  mode: z.enum(ISSUE_EXECUTION_POLICY_MODES).optional().default("normal"),
-  commentRequired: z.boolean().optional().default(true),
-  stages: z.array(issueExecutionStageSchema).default([]),
+  mode: z.enum(ISSUE_EXECUTION_POLICY_MODES).prefault("normal"),
+  commentRequired: z.boolean().prefault(true),
+  stages: z.array(issueExecutionStageSchema).prefault([]),
   monitor: issueExecutionMonitorPolicySchema
     .optional()
     .nullable()
@@ -311,21 +312,21 @@ export const issueExecutionMonitorStateSchema = z.object({
   status: z.enum(ISSUE_EXECUTION_MONITOR_STATE_STATUSES),
   nextCheckAt: z.string().datetime().nullable(),
   lastTriggeredAt: z.string().datetime().nullable(),
-  attemptCount: z.number().int().nonnegative().default(0),
+  attemptCount: z.number().int().nonnegative().prefault(0),
   notes: z.string().max(500).nullable(),
   scheduledBy: z.enum(ISSUE_MONITOR_SCHEDULED_BY).nullable(),
-  gateSignals: z.array(z.string().trim().min(1).max(200)).max(20).nullable().optional().default(null),
-  gateFingerprint: z.string().max(200).nullable().optional().default(null),
-  gateSource: z.enum(ISSUE_MONITOR_GATE_SOURCES).nullable().optional().default(null),
-  convergenceCount: z.number().int().nonnegative().optional().default(0),
-  convergenceStallCount: z.number().int().nonnegative().optional().default(0),
-  convergenceStalledAssigneeAgentId: z.string().uuid().nullable().optional().default(null),
-  kind: z.enum(ISSUE_EXECUTION_MONITOR_KINDS).nullable().optional().default(null),
-  serviceName: z.string().trim().min(1).max(120).nullable().optional().default(null),
-  externalRef: z.string().trim().min(1).max(500).nullable().optional().default(null),
-  timeoutAt: z.string().datetime().nullable().optional().default(null),
-  maxAttempts: z.number().int().positive().max(100).nullable().optional().default(null),
-  recoveryPolicy: z.enum(ISSUE_EXECUTION_MONITOR_RECOVERY_POLICIES).nullable().optional().default(null),
+  gateSignals: z.array(z.string().trim().min(1).max(200)).max(20).nullable().prefault(null),
+  gateFingerprint: z.string().max(200).nullable().prefault(null),
+  gateSource: z.enum(ISSUE_MONITOR_GATE_SOURCES).nullable().prefault(null),
+  convergenceCount: z.number().int().nonnegative().prefault(0),
+  convergenceStallCount: z.number().int().nonnegative().prefault(0),
+  convergenceStalledAssigneeAgentId: z.string().guid().nullable().prefault(null),
+  kind: z.enum(ISSUE_EXECUTION_MONITOR_KINDS).nullable().prefault(null),
+  serviceName: z.string().trim().min(1).max(120).nullable().prefault(null),
+  externalRef: z.string().trim().min(1).max(500).nullable().prefault(null),
+  timeoutAt: z.string().datetime().nullable().prefault(null),
+  maxAttempts: z.number().int().positive().max(100).nullable().prefault(null),
+  recoveryPolicy: z.enum(ISSUE_EXECUTION_MONITOR_RECOVERY_POLICIES).nullable().prefault(null),
   clearedAt: z.string().datetime().nullable(),
   clearReason: z.enum(ISSUE_EXECUTION_MONITOR_CLEAR_REASONS).nullable(),
 });
@@ -336,30 +337,30 @@ export const issueReviewRequestSchema = z.object({
 
 export const issueExecutionStateSchema = z.object({
   status: z.enum(ISSUE_EXECUTION_STATE_STATUSES),
-  currentStageId: z.string().uuid().nullable(),
+  currentStageId: z.string().guid().nullable(),
   currentStageIndex: z.number().int().nonnegative().nullable(),
   currentStageType: z.enum(ISSUE_EXECUTION_STAGE_TYPES).nullable(),
   currentParticipant: issueExecutionStagePrincipalSchema.nullable(),
   returnAssignee: issueExecutionStagePrincipalSchema.nullable(),
-  reviewRequest: issueReviewRequestSchema.nullable().optional().default(null),
-  completedStageIds: z.array(z.string().uuid()).default([]),
-  lastDecisionId: z.string().uuid().nullable(),
+  reviewRequest: issueReviewRequestSchema.nullable().prefault(null),
+  completedStageIds: z.array(z.string().guid()).prefault([]),
+  lastDecisionId: z.string().guid().nullable(),
   lastDecisionOutcome: z.enum(ISSUE_EXECUTION_DECISION_OUTCOMES).nullable(),
   monitor: issueExecutionMonitorStateSchema.optional().nullable(),
 });
 
 export const issueRecoveryActionReadModelSchema = z.object({
-  id: z.string().uuid(),
-  companyId: z.string().uuid(),
-  sourceIssueId: z.string().uuid(),
-  recoveryIssueId: z.string().uuid().nullable(),
+  id: z.string().guid(),
+  companyId: z.string().guid(),
+  sourceIssueId: z.string().guid(),
+  recoveryIssueId: z.string().guid().nullable(),
   kind: z.enum(ISSUE_RECOVERY_ACTION_KINDS),
   status: z.enum(ISSUE_RECOVERY_ACTION_STATUSES),
   ownerType: z.enum(ISSUE_RECOVERY_ACTION_OWNER_TYPES),
-  ownerAgentId: z.string().uuid().nullable(),
+  ownerAgentId: z.string().guid().nullable(),
   ownerUserId: z.string().nullable(),
-  previousOwnerAgentId: z.string().uuid().nullable(),
-  returnOwnerAgentId: z.string().uuid().nullable(),
+  previousOwnerAgentId: z.string().guid().nullable(),
+  returnOwnerAgentId: z.string().guid().nullable(),
   cause: z.string().min(1),
   fingerprint: z.string().min(1),
   evidence: z.record(z.string(), z.unknown()),
@@ -411,7 +412,7 @@ const RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES = [
  * entirely, so they must say where the row lands rather than leave it mid-flight.
  */
 export const resolveIssueRecoveryActionSchema = z.object({
-  actionId: z.string().uuid().optional(),
+  actionId: z.string().guid().optional(),
   outcome: z.enum(RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES),
   sourceIssueStatus: z.enum(["todo", "done", "in_review", "blocked"]).optional(),
   resolutionNote: multilineTextSchema.optional().nullable(),
@@ -594,7 +595,7 @@ export function misplacedIssueMonitorInputMessage(key: string) {
 
 function misplacedIssueMonitorInputSchema(key: (typeof MISPLACED_ISSUE_MONITOR_INPUT_KEYS)[number]) {
   return z
-    .undefined({ errorMap: () => ({ message: misplacedIssueMonitorInputMessage(key) }) })
+    .never({ error: () => misplacedIssueMonitorInputMessage(key) })
     .optional();
 }
 
@@ -627,7 +628,7 @@ export function misplacedIssueParkedInputMessage(key: string) {
 
 function misplacedIssueParkedInputSchema(key: (typeof MISPLACED_ISSUE_PARKED_INPUT_KEYS)[number]) {
   return z
-    .undefined({ errorMap: () => ({ message: misplacedIssueParkedInputMessage(key) }) })
+    .never({ error: () => misplacedIssueParkedInputMessage(key) })
     .optional();
 }
 
@@ -659,7 +660,7 @@ export function parkedDispositionCreateRejectionMessage() {
 
 const parkedDispositionCreateGuardShape = {
   parkedDisposition: z
-    .undefined({ errorMap: () => ({ message: parkedDispositionCreateRejectionMessage() }) })
+    .never({ error: () => parkedDispositionCreateRejectionMessage() })
     .optional(),
 };
 
@@ -713,43 +714,43 @@ const createIssueBaseSchema = z.object({
   ...misplacedIssueMonitorInputShape,
   ...misplacedIssueParkedInputShape,
   ...parkedDispositionCreateGuardShape,
-  projectId: z.string().uuid().optional().nullable(),
-  projectWorkspaceId: z.string().uuid().optional().nullable(),
-  goalId: z.string().uuid().optional().nullable(),
-  milestoneId: z.string().uuid().optional().nullable(),
+  projectId: z.string().guid().optional().nullable(),
+  projectWorkspaceId: z.string().guid().optional().nullable(),
+  goalId: z.string().guid().optional().nullable(),
+  milestoneId: z.string().guid().optional().nullable(),
   targetDate: z.string().optional().nullable(),
-  parentId: z.string().uuid().optional().nullable(),
+  parentId: z.string().guid().optional().nullable(),
   blockedByIssueIds: z
-    .array(z.string().uuid())
+    .array(z.string().guid())
     .optional()
     .describe(
       "Write-only set of blocker issue UUIDs. Pass the FULL desired set — it REPLACES the existing blockers (send [] to clear). IMPORTANT: this field is null on READ; persisted blockers come back in the hydrated `blockedBy` array (and the reverse side under `blocks`/`relatedWork`). Verify a blocker write succeeded via `blockedBy`, never by re-reading `blockedByIssueIds`.",
     ),
-  inheritExecutionWorkspaceFromIssueId: z.string().uuid().optional().nullable(),
+  inheritExecutionWorkspaceFromIssueId: z.string().guid().optional().nullable(),
   title: z.string().min(1),
   description: multilineTextSchema.optional().nullable(),
   status: z.enum(ISSUE_STATUSES),
-  workMode: z.enum(ISSUE_WORK_MODES).optional().default("standard"),
+  workMode: z.enum(ISSUE_WORK_MODES).prefault("standard"),
   harnessKind: z.enum(ISSUE_HARNESS_KINDS).optional().nullable(),
-  priority: z.enum(ISSUE_PRIORITIES).optional().default("medium"),
-  assigneeAgentId: z.string().uuid().optional().nullable(),
+  priority: z.enum(ISSUE_PRIORITIES).prefault("medium"),
+  assigneeAgentId: z.string().guid().optional().nullable(),
   assigneeUserId: z.string().optional().nullable(),
-  requestDepth: issueRequestDepthInputSchema.optional().default(0),
+  requestDepth: issueRequestDepthInputSchema.prefault(0),
   createdByUserId: z.string().optional().nullable(),
   responsibleUserId: z.string().optional().nullable(),
   billingCode: z.string().optional().nullable(),
   assigneeAdapterOverrides: issueAssigneeAdapterOverridesSchema.optional().nullable(),
   executionPolicy: issueExecutionPolicySchema.optional().nullable(),
-  executionWorkspaceId: z.string().uuid().optional().nullable(),
+  executionWorkspaceId: z.string().guid().optional().nullable(),
   executionWorkspacePreference: z.enum(ISSUE_EXECUTION_WORKSPACE_PREFERENCES).optional().nullable(),
   executionWorkspaceSettings: issueExecutionWorkspaceSettingsSchema.optional().nullable(),
-  labelIds: z.array(z.string().uuid()).optional(),
+  labelIds: z.array(z.string().guid()).optional(),
   watchdogDiscovery: z.object({
     kind: z.enum(ISSUE_WATCHDOG_DISCOVERY_KINDS),
     evidenceMarkdown: multilineTextSchema.optional().nullable(),
   }).strict().optional().nullable(),
   watchdog: z.object({
-    agentId: z.string().uuid(),
+    agentId: z.string().guid(),
     instructions: multilineTextSchema.optional().nullable(),
   }).strict().optional().nullable(),
   prReviewTarget: z.object({
@@ -762,8 +763,8 @@ const createIssueDuplicateGuardSchema = {
   idempotencyKey: z.string().trim().min(1).max(255).optional().nullable(),
   allowDuplicate: z.boolean()
     .describe("Bypasses recent-title duplicate detection; idempotency keys always replay their original issue")
-    .optional()
-    .default(false),
+    
+    .prefault(false),
 };
 
 export const createIssueInputSchema = createIssueBaseSchema.extend({
@@ -776,7 +777,7 @@ export const createIssueSchema = withCreateIssueStatusDefault(createIssueBaseSch
 export type CreateIssue = z.infer<typeof createIssueSchema>;
 
 export const upsertIssueWatchdogSchema = z.object({
-  agentId: z.string().uuid(),
+  agentId: z.string().guid(),
   instructions: multilineTextSchema.optional().nullable(),
 }).strict();
 
@@ -790,13 +791,13 @@ export const createChildIssueSchema = withCreateIssueStatusDefault(createIssueBa
   })
   .extend({
     acceptanceCriteria: z.array(z.string().trim().min(1).max(500)).max(20).optional(),
-    blockParentUntilDone: z.boolean().optional().default(false),
+    blockParentUntilDone: z.boolean().prefault(false),
   }));
 
 export type CreateChildIssue = z.infer<typeof createChildIssueSchema>;
 
 export const createAcceptedPlanDecompositionSchema = z.object({
-  acceptedPlanRevisionId: z.string().uuid(),
+  acceptedPlanRevisionId: z.string().guid(),
   children: z.array(createChildIssueSchema).min(1).max(25),
 });
 
@@ -814,7 +815,7 @@ export const updateIssueSchema = createIssueBaseSchema.omit({
   responsibleUserId: true,
   watchdog: true,
   prReviewTarget: true,
-}).partial().extend({
+}).apply(partialNoDefaults).extend({
   requestDepth: issueRequestDepthInputSchema.optional(),
   assigneeAgentId: z.string().trim().min(1).optional().nullable(),
   comment: multilineTextSchema.pipe(z.string().min(1)).optional(),
@@ -835,7 +836,7 @@ export type UpdateIssue = z.infer<typeof updateIssueSchema>;
 export type IssueExecutionWorkspaceSettings = z.infer<typeof issueExecutionWorkspaceSettingsSchema>;
 
 export const checkoutIssueSchema = z.object({
-  agentId: z.string().uuid(),
+  agentId: z.string().guid(),
   expectedStatuses: z.array(z.enum(ISSUE_STATUSES)).nonempty(),
 });
 
@@ -847,10 +848,10 @@ const commentMetadataTextSchema = z.string().trim().min(1).max(2000);
 export const issueCommentAuthorTypeSchema = z.enum(ISSUE_COMMENT_AUTHOR_TYPES);
 
 export const issueCommentPresentationSchema = z.object({
-  kind: z.enum(ISSUE_COMMENT_PRESENTATION_KINDS).default("message"),
-  tone: z.enum(ISSUE_COMMENT_PRESENTATION_TONES).default("neutral"),
+  kind: z.enum(ISSUE_COMMENT_PRESENTATION_KINDS).prefault("message"),
+  tone: z.enum(ISSUE_COMMENT_PRESENTATION_TONES).prefault("neutral"),
   title: z.string().trim().min(1).max(160).nullable().optional(),
-  detailsDefaultOpen: z.boolean().optional().default(false),
+  detailsDefaultOpen: z.boolean().prefault(false),
 }).strict();
 
 export type IssueCommentPresentation = z.infer<typeof issueCommentPresentationSchema>;
@@ -879,20 +880,20 @@ const issueCommentMetadataKeyValueRowSchema = issueCommentMetadataBaseRowSchema.
 
 const issueCommentMetadataIssueLinkRowSchema = issueCommentMetadataBaseRowSchema.extend({
   type: z.literal("issue_link"),
-  issueId: z.string().uuid().nullable().optional(),
+  issueId: z.string().guid().nullable().optional(),
   identifier: z.string().trim().min(1).max(80).nullable().optional(),
   title: z.string().trim().min(1).max(240).nullable().optional(),
 }).strict();
 
 const issueCommentMetadataAgentLinkRowSchema = issueCommentMetadataBaseRowSchema.extend({
   type: z.literal("agent_link"),
-  agentId: z.string().uuid(),
+  agentId: z.string().guid(),
   name: z.string().trim().min(1).max(160).nullable().optional(),
 }).strict();
 
 const issueCommentMetadataRunLinkRowSchema = issueCommentMetadataBaseRowSchema.extend({
   type: z.literal("run_link"),
-  runId: z.string().uuid(),
+  runId: z.string().guid(),
   title: z.string().trim().min(1).max(160).nullable().optional(),
 }).strict();
 
@@ -920,7 +921,7 @@ export const issueCommentMetadataSectionSchema = z.object({
 
 export const issueCommentMetadataSchema = z.object({
   version: z.literal(1),
-  sourceRunId: z.string().uuid().nullable().optional(),
+  sourceRunId: z.string().guid().nullable().optional(),
   sections: z.array(issueCommentMetadataSectionSchema).min(1).max(20),
 }).strict();
 
@@ -999,15 +1000,15 @@ export const INTERACTION_PAYLOAD_UNRECOGNIZED_KEYS_NOTE =
 export const suggestedTaskDraftSchema = z.object({
   clientKey: z.string().trim().min(1).max(120),
   parentClientKey: z.string().trim().min(1).max(120).nullable().optional(),
-  parentId: z.string().uuid().nullable().optional(),
+  parentId: z.string().guid().nullable().optional(),
   title: z.string().trim().min(1).max(240),
   description: multilineTextSchema.pipe(z.string().trim().max(20000)).nullable().optional(),
   priority: z.enum(ISSUE_PRIORITIES).nullable().optional(),
   workMode: z.enum(ISSUE_WORK_MODES).nullable().optional(),
-  assigneeAgentId: z.string().uuid().nullable().optional(),
+  assigneeAgentId: z.string().guid().nullable().optional(),
   assigneeUserId: z.string().trim().min(1).nullable().optional(),
-  projectId: z.string().uuid().nullable().optional(),
-  goalId: z.string().uuid().nullable().optional(),
+  projectId: z.string().guid().nullable().optional(),
+  goalId: z.string().guid().nullable().optional(),
   billingCode: z.string().trim().max(120).nullable().optional(),
   labels: z.array(z.string().trim().min(1).max(48)).max(20).optional(),
   hiddenInPreview: z.boolean().optional(),
@@ -1023,7 +1024,7 @@ export const suggestedTaskDraftSchema = z.object({
 
 export const suggestTasksPayloadSchema = z.object({
   version: z.literal(1),
-  defaultParentId: z.string().uuid().nullable().optional(),
+  defaultParentId: z.string().guid().nullable().optional(),
   tasks: z.array(suggestedTaskDraftSchema).min(1).max(50),
 }).superRefine((value, ctx) => {
   const seenClientKeys = new Set<string>();
@@ -1041,10 +1042,10 @@ export const suggestTasksPayloadSchema = z.object({
 }).describe(INTERACTION_PAYLOAD_UNRECOGNIZED_KEYS_NOTE);
 export const suggestTasksResultCreatedTaskSchema = z.object({
   clientKey: z.string().trim().min(1).max(120),
-  issueId: z.string().uuid(),
+  issueId: z.string().guid(),
   identifier: z.string().trim().min(1).nullable().optional(),
   title: z.string().trim().min(1).nullable().optional(),
-  parentIssueId: z.string().uuid().nullable().optional(),
+  parentIssueId: z.string().guid().nullable().optional(),
   parentIdentifier: z.string().trim().min(1).nullable().optional(),
 });
 
@@ -1128,7 +1129,7 @@ export const askUserQuestionsResultSchema = z.object({
   cancelled: z.literal(true).optional(),
   cancellationReason: z.string().trim().max(4000).nullable().optional(),
   expirationReason: z.literal("superseded_by_comment").optional(),
-  commentId: z.string().uuid().nullable().optional(),
+  commentId: z.string().guid().nullable().optional(),
   summaryMarkdown: z.string().max(20000).nullable().optional(),
 });
 
@@ -1145,10 +1146,10 @@ const requestConfirmationTargetBaseSchema = z.object({
 
 export const requestConfirmationIssueDocumentTargetSchema = requestConfirmationTargetBaseSchema.extend({
   type: z.literal("issue_document"),
-  issueId: z.string().uuid().nullable().optional(),
-  documentId: z.string().uuid().nullable().optional(),
+  issueId: z.string().guid().nullable().optional(),
+  documentId: z.string().guid().nullable().optional(),
   key: issueDocumentKeySchema,
-  revisionId: z.string().uuid(),
+  revisionId: z.string().guid(),
   revisionNumber: z.number().int().positive().nullable().optional(),
 });
 
@@ -1197,7 +1198,7 @@ export const interactionExpectedOutcomeGithubPrMergedSchema = z.object({
 export const interactionExpectedOutcomeIssueStatusSchema = z.object({
   kind: z.literal("issue_status"),
   ref: z.object({
-    issueId: z.string().uuid()
+    issueId: z.string().guid()
       .describe(
         "Issue UUID (not a `PEN-1234` identifier). Validated to resolve inside this "
         + "interaction's company when the ask is created, so a wrong id is refused here "
@@ -1232,12 +1233,12 @@ const EXPECTED_OUTCOME_DESCRIPTION =
 
 export const requestConfirmationToolActionPayloadSchema = z.object({
   version: z.literal(1),
-  actionRequestId: z.string().uuid(),
-  invocationId: z.string().uuid(),
+  actionRequestId: z.string().guid(),
+  invocationId: z.string().guid(),
   toolName: z.string().trim().min(1).max(500),
   toolDisplayName: z.string().trim().min(1).max(500),
-  connectionId: z.string().uuid().nullable(),
-  applicationId: z.string().uuid().nullable(),
+  connectionId: z.string().guid().nullable(),
+  applicationId: z.string().guid().nullable(),
   appDisplayName: z.string().trim().min(1).max(500).nullable(),
   risk: z.enum(["write", "destructive"]),
   previewMarkdown: z.string().trim().min(1).max(20000),
@@ -1253,7 +1254,7 @@ export const requestConfirmationPayloadSchema = z.object({
   rejectLabel: z.string().trim().min(1).max(80).nullable().optional(),
   rejectRequiresReason: z.boolean().optional(),
   rejectReasonLabel: z.string().trim().min(1).max(160).nullable().optional(),
-  allowDeclineReason: z.boolean().optional().default(true),
+  allowDeclineReason: z.boolean().prefault(true),
   declineReasonPlaceholder: z.string().trim().min(1).max(240).nullable().optional(),
   detailsMarkdown: z.string().max(20000).nullable().optional(),
   supersedeOnUserComment: z.boolean()
@@ -1287,15 +1288,15 @@ export const requestCheckboxConfirmationPayloadSchema = z.object({
     .max(REQUEST_CHECKBOX_CONFIRMATION_OPTION_LIMIT),
   defaultSelectedOptionIds: z.array(z.string().trim().min(1).max(120))
     .max(REQUEST_CHECKBOX_CONFIRMATION_OPTION_LIMIT)
-    .optional()
-    .default([]),
-  minSelected: z.number().int().min(0).optional().default(0),
+    
+    .prefault([]),
+  minSelected: z.number().int().min(0).prefault(0),
   maxSelected: z.number().int().min(0).nullable().optional(),
   acceptLabel: z.string().trim().min(1).max(80).nullable().optional(),
   rejectLabel: z.string().trim().min(1).max(80).nullable().optional(),
   rejectRequiresReason: z.boolean().optional(),
   rejectReasonLabel: z.string().trim().min(1).max(160).nullable().optional(),
-  allowDeclineReason: z.boolean().optional().default(true),
+  allowDeclineReason: z.boolean().prefault(true),
   declineReasonPlaceholder: z.string().trim().min(1).max(240).nullable().optional(),
   supersedeOnUserComment: z.boolean()
     .describe(
@@ -1388,9 +1389,9 @@ export const requestConfirmationResumeFailureSchema = z.object({
   errorCode: z.string().trim().min(1).max(120).nullable(),
   attempt: z.number().int().min(0).max(100),
   maxAttempts: z.number().int().min(0).max(100),
-  runId: z.string().uuid().nullable().optional(),
-  retryRunId: z.string().uuid().nullable().optional(),
-  recoveryActionId: z.string().uuid().nullable().optional(),
+  runId: z.string().guid().nullable().optional(),
+  retryRunId: z.string().guid().nullable().optional(),
+  recoveryActionId: z.string().guid().nullable().optional(),
   updatedAt: z.string().trim().min(1).nullable().optional(),
 });
 
@@ -1415,7 +1416,7 @@ export const requestConfirmationToolActionResultSchema = z.object({
 export const interactionOutcomeAcknowledgementSchema = z.object({
   acknowledgedAt: z.string().min(1),
   acknowledgedByUserId: z.string().nullable().optional(),
-  acknowledgedByAgentId: z.string().uuid().nullable().optional(),
+  acknowledgedByAgentId: z.string().guid().nullable().optional(),
   reason: z.string().trim().min(1).max(4000),
 });
 
@@ -1426,7 +1427,7 @@ export const requestConfirmationResultSchema = z.object({
   // same value, so the vocabulary stays consistent across kinds.
   outcome: z.enum(["accepted", "rejected", "superseded_by_comment", "stale_target", "cancelled"]),
   reason: z.string().trim().max(4000).nullable().optional(),
-  commentId: z.string().uuid().nullable().optional(),
+  commentId: z.string().guid().nullable().optional(),
   staleTarget: requestConfirmationTargetSchema.nullable().optional(),
   resumeFailure: requestConfirmationResumeFailureSchema.nullable().optional(),
   toolAction: requestConfirmationToolActionResultSchema.optional(),
@@ -1465,7 +1466,7 @@ export const requestItemVerdictsItemSchema = z.object({
   description: z.string().trim().max(500).nullable().optional(),
   previewMarkdown: z.string().max(20000).nullable().optional(),
   href: requestConfirmationHrefSchema.nullable().optional(),
-  attachmentId: z.string().uuid().nullable().optional(),
+  attachmentId: z.string().guid().nullable().optional(),
 });
 
 export const requestItemVerdictsPayloadSchema = z.object({
@@ -1478,14 +1479,14 @@ export const requestItemVerdictsPayloadSchema = z.object({
   verdicts: z.array(requestItemVerdictValueSchema)
     .min(2)
     .max(3)
-    .optional()
-    .default(["approve", "reject"]),
+    
+    .prefault(["approve", "reject"]),
   requireReasonOn: z.array(requestItemVerdictValueSchema)
     .max(3)
-    .optional()
-    .default(["reject"]),
+    
+    .prefault(["reject"]),
   reasonLabel: z.string().trim().min(1).max(160).nullable().optional(),
-  allowBulkApprove: z.boolean().optional().default(true),
+  allowBulkApprove: z.boolean().prefault(true),
   supersedeOnUserComment: z.boolean()
     .describe(
       "DEFAULTS TO TRUE when omitted. While true, ANY user comment on the issue expires this "
@@ -1556,7 +1557,7 @@ export const requestItemVerdictsResultItemSchema = z.object({
   reason: z.string().trim().max(4000).nullable().optional(),
   resolvedByUserId: z.string().trim().min(1).max(255),
   resolvedAt: z.union([z.string().datetime(), z.date()]),
-  commentId: z.string().uuid().nullable().optional(),
+  commentId: z.string().guid().nullable().optional(),
 });
 
 export const requestItemVerdictsResultSchema = z.object({
@@ -1565,7 +1566,7 @@ export const requestItemVerdictsResultSchema = z.object({
   complete: z.boolean(),
   items: z.array(requestItemVerdictsResultItemSchema)
     .max(REQUEST_ITEM_VERDICTS_ITEM_LIMIT),
-  commentId: z.string().uuid().nullable().optional(),
+  commentId: z.string().guid().nullable().optional(),
   staleTarget: requestConfirmationTargetSchema.nullable().optional(),
 }).superRefine((value, ctx) => {
   const itemIds = new Set<string>();
@@ -1585,51 +1586,51 @@ export const createIssueThreadInteractionSchema = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("suggest_tasks"),
     idempotencyKey: z.string().trim().max(255).nullable().optional(),
-    sourceCommentId: z.string().uuid().nullable().optional(),
-    sourceRunId: z.string().uuid().nullable().optional(),
+    sourceCommentId: z.string().guid().nullable().optional(),
+    sourceRunId: z.string().guid().nullable().optional(),
     title: z.string().trim().max(240).nullable().optional(),
     summary: z.string().trim().max(1000).nullable().optional(),
-    continuationPolicy: issueThreadInteractionContinuationPolicySchema.optional().default("wake_assignee"),
+    continuationPolicy: issueThreadInteractionContinuationPolicySchema.prefault("wake_assignee"),
     payload: suggestTasksPayloadSchema,
   }),
   z.object({
     kind: z.literal("ask_user_questions"),
     idempotencyKey: z.string().trim().max(255).nullable().optional(),
-    sourceCommentId: z.string().uuid().nullable().optional(),
-    sourceRunId: z.string().uuid().nullable().optional(),
+    sourceCommentId: z.string().guid().nullable().optional(),
+    sourceRunId: z.string().guid().nullable().optional(),
     title: z.string().trim().max(240).nullable().optional(),
     summary: z.string().trim().max(1000).nullable().optional(),
-    continuationPolicy: issueThreadInteractionContinuationPolicySchema.optional().default("wake_assignee"),
+    continuationPolicy: issueThreadInteractionContinuationPolicySchema.prefault("wake_assignee"),
     payload: askUserQuestionsPayloadSchema,
   }),
   z.object({
     kind: z.literal("request_confirmation"),
     idempotencyKey: z.string().trim().max(255).nullable().optional(),
-    sourceCommentId: z.string().uuid().nullable().optional(),
-    sourceRunId: z.string().uuid().nullable().optional(),
+    sourceCommentId: z.string().guid().nullable().optional(),
+    sourceRunId: z.string().guid().nullable().optional(),
     title: z.string().trim().max(240).nullable().optional(),
     summary: z.string().trim().max(1000).nullable().optional(),
-    continuationPolicy: issueThreadInteractionContinuationPolicySchema.optional().default("none"),
+    continuationPolicy: issueThreadInteractionContinuationPolicySchema.prefault("none"),
     payload: requestConfirmationPayloadSchema,
   }),
   z.object({
     kind: z.literal("request_checkbox_confirmation"),
     idempotencyKey: z.string().trim().max(255).nullable().optional(),
-    sourceCommentId: z.string().uuid().nullable().optional(),
-    sourceRunId: z.string().uuid().nullable().optional(),
+    sourceCommentId: z.string().guid().nullable().optional(),
+    sourceRunId: z.string().guid().nullable().optional(),
     title: z.string().trim().max(240).nullable().optional(),
     summary: z.string().trim().max(1000).nullable().optional(),
-    continuationPolicy: issueThreadInteractionContinuationPolicySchema.optional().default("wake_assignee"),
+    continuationPolicy: issueThreadInteractionContinuationPolicySchema.prefault("wake_assignee"),
     payload: requestCheckboxConfirmationPayloadSchema,
   }),
   z.object({
     kind: z.literal("request_item_verdicts"),
     idempotencyKey: z.string().trim().max(255).nullable().optional(),
-    sourceCommentId: z.string().uuid().nullable().optional(),
-    sourceRunId: z.string().uuid().nullable().optional(),
+    sourceCommentId: z.string().guid().nullable().optional(),
+    sourceRunId: z.string().guid().nullable().optional(),
     title: z.string().trim().max(240).nullable().optional(),
     summary: z.string().trim().max(1000).nullable().optional(),
-    continuationPolicy: issueThreadInteractionContinuationPolicySchema.optional().default("wake_assignee"),
+    continuationPolicy: issueThreadInteractionContinuationPolicySchema.prefault("wake_assignee"),
     payload: requestItemVerdictsPayloadSchema,
   }),
 ]);
@@ -1654,25 +1655,26 @@ export const MAX_REPORTED_UNRECOGNIZED_PAYLOAD_KEYS = 25;
  * Unwrap a payload schema down to the `ZodObject` whose shape defines the keys
  * the server actually understands.
  *
- * Four of the five payload schemas end in `.superRefine(...)`, which makes them
- * `ZodEffects` rather than `ZodObject`, so reading `.shape` off the exported
- * constant does not work uniformly. Dispatch on `_def.typeName` rather than
- * `instanceof`: a monorepo can resolve more than one copy of zod, and an
- * `instanceof` check against the wrong copy fails silently — which here would
- * report every key of a perfectly valid payload as dropped.
+ * Payload schemas may be wrapped (`.transform()` makes a `ZodPipe`; `.optional()`
+ * / `.default()` wrap an `innerType`), so reading `.shape` off the exported
+ * constant does not work uniformly. (In zod 4 `.superRefine()` no longer wraps —
+ * refinements are checks on the object itself.) Dispatch on `_zod.def.type`
+ * rather than `instanceof`: a monorepo can resolve more than one copy of zod,
+ * and an `instanceof` check against the wrong copy fails silently — which here
+ * would report every key of a perfectly valid payload as dropped.
  */
-function unwrapPayloadObjectSchema(schema: z.ZodTypeAny | undefined): z.ZodObject<z.ZodRawShape> | null {
-  let current: z.ZodTypeAny | undefined = schema;
+function unwrapPayloadObjectSchema(schema: z.core.$ZodType | undefined): z.ZodObject<z.ZodRawShape> | null {
+  let current: z.core.$ZodType | undefined = schema;
   // Bounded rather than `while (true)`: a malformed schema must not hang the
   // request path, and no real payload nests more than a couple of wrappers.
   for (let depth = 0; depth < 10 && current; depth += 1) {
-    const def = current._def as {
-      typeName?: string;
-      schema?: z.ZodTypeAny;
-      innerType?: z.ZodTypeAny;
+    const def = current._zod?.def as {
+      type?: string;
+      in?: z.core.$ZodType;
+      innerType?: z.core.$ZodType;
     } | undefined;
-    if (def?.typeName === "ZodObject") return current as z.ZodObject<z.ZodRawShape>;
-    current = def?.schema ?? def?.innerType;
+    if (def?.type === "object") return current as unknown as z.ZodObject<z.ZodRawShape>;
+    current = def?.innerType ?? def?.in;
   }
   return null;
 }
@@ -1695,10 +1697,11 @@ export const INTERACTION_PAYLOAD_KNOWN_KEYS: ReadonlyMap<string, ReadonlySet<str
   const table = new Map<string, ReadonlySet<string>>();
   for (const option of createIssueThreadInteractionSchema.options) {
     const shape = (option as z.ZodObject<z.ZodRawShape>).shape;
-    const kindDef = shape.kind?._def as { value?: unknown } | undefined;
+    const kindValues = (shape.kind?._zod.def as { values?: unknown[] } | undefined)?.values;
+    const kind = kindValues?.length === 1 ? kindValues[0] : undefined;
     const payloadObject = unwrapPayloadObjectSchema(shape.payload);
-    if (typeof kindDef?.value !== "string" || !payloadObject) continue;
-    table.set(kindDef.value, new Set(Object.keys(payloadObject.shape)));
+    if (typeof kind !== "string" || !payloadObject) continue;
+    table.set(kind, new Set(Object.keys(payloadObject.shape)));
   }
   return table;
 })();
@@ -1820,13 +1823,13 @@ export const submitIssueThreadInteractionVerdictsSchema = z.object({
 export type SubmitIssueThreadInteractionVerdicts = z.infer<typeof submitIssueThreadInteractionVerdictsSchema>;
 
 export const linkIssueApprovalSchema = z.object({
-  approvalId: z.string().uuid(),
+  approvalId: z.string().guid(),
 });
 
 export type LinkIssueApproval = z.infer<typeof linkIssueApprovalSchema>;
 
 export const createIssueAttachmentMetadataSchema = z.object({
-  issueCommentId: z.string().uuid().optional().nullable(),
+  issueCommentId: z.string().guid().optional().nullable(),
 });
 
 export type CreateIssueAttachmentMetadata = z.infer<typeof createIssueAttachmentMetadataSchema>;
@@ -1840,7 +1843,7 @@ export const upsertIssueDocumentSchema = z.object({
   format: issueDocumentFormatSchema,
   body: multilineTextSchema.pipe(z.string().max(524288)),
   changeSummary: z.string().trim().max(500).nullable().optional(),
-  baseRevisionId: z.string().uuid().nullable().optional(),
+  baseRevisionId: z.string().guid().nullable().optional(),
 });
 
 export const restoreIssueDocumentRevisionSchema = z.object({});

@@ -228,6 +228,7 @@
       "@lexical/selection": "0.46.0",
       "@lexical/utils": "0.46.0",
       "proxy-addr": ">=2.0.8 <3",
+      "zod": ">=4.6.6 <5",
       "body-parser": ">=2.4.0 <3"
     }
   }

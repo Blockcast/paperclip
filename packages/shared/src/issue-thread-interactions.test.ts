@@ -516,7 +516,7 @@ describe("unrecognized interaction payload keys (PEN-4445)", () => {
   // would hide a newly added kind losing coverage entirely, so pin the cover.
   it("derives known keys for every member of the create union", () => {
     const unionKinds = createIssueThreadInteractionSchema.options
-      .map((option) => (option.shape.kind as { _def: { value: string } })._def.value);
+      .map((option) => (option.shape.kind as unknown as { value: string }).value);
     expect(unionKinds.length).toBeGreaterThan(0);
     for (const kind of unionKinds) {
       const known = INTERACTION_PAYLOAD_KNOWN_KEYS.get(kind);
