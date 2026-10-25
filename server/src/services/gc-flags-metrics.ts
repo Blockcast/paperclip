@@ -106,30 +106,37 @@ const KNOWN_FLAG_MASK = GC_FLAG_BITS.reduce((mask, [bit]) => mask | bit, 0);
  *
  * A prom-client counter emits nothing until its first `inc()`, so a GC class
  * that never runs is *absent* from the scrape rather than zero — and absent is
- * exactly the reading this module cannot afford. PEN-3314's question is whether
- * the memory-reducing full GC coincides with a page-pool release; if the answer
- * is "that class never fires", the honest result and a process that never
- * loaded this file render identically, and the row has already lost time to two
- * traps of precisely that shape (`v8_heap_physical`, `bucket_bytes`) where an
- * empty read was mistaken for "never shipped".
+ * exactly the reading this module cannot afford. PEN-3314 has already lost
+ * time to two traps of that shape (`v8_heap_physical` read as a metric name
+ * when it is a label value; the mapping bucket label being `size_bucket`, not
+ * `bucket_bytes`), where an empty read was mistaken for "never shipped".
  *
  * Confirmed live on 2026-10-25: `paperclip_gc_cycles_total` read empty while
  * the sibling `paperclip_process_mapping_*` series — same registry, same
  * `/metrics` endpoint, same process — were populated. Distinguishing "not
- * deployed" from "never fired" took a source grep, a `merge-base`, and a pod
- * inspection. With these three series pre-created it is one query: absent means
- * the build predates this module, `0` means the class genuinely never ran.
+ * deployed" from "never fired" took a source grep, a `merge-base` and a pod
+ * inspection. It resolved to deploy lag, but nothing in the scrape could say
+ * so. With these series pre-created it is one query: absent means the build
+ * predates this module, `0` means the class genuinely never ran.
+ *
+ * ⛔ These are the combinations V8 was **measured** to emit — `major` split
+ * 11:2 between `schedule_idle` and `none` over 13 natural major cycles — plus
+ * the ambient scavenge that shows the observer is receiving entries at all.
+ * They are deliberately **not** a prediction about which flag marks the
+ * unmapper's page-release path, which this module does not assert and a query
+ * must not guess (see the ⛔ note in the module docblock, and #3010). Pinning
+ * the measured support is what makes the *distribution* readable from the
+ * first scrape; any other combination V8 emits still appears on its first
+ * occurrence, and once these read non-zero the collector is provably live, so
+ * a combination still absent at that point is genuinely one that never fired.
  *
  * Deliberately only three. The `flags` label is a bitfield set, so the full
- * cross-product is 4 kinds x 64 combinations; pre-creating it would trade one
- * cardinality problem for another. These are the series the PEN-3314 read
- * needs — the discriminator, the ordinary major it must be told apart from, and
- * the ambient scavenge that shows the observer is receiving entries at all.
- * Every other combination still appears on first occurrence.
+ * cross-product is 4 kinds x 64 combinations; pre-creating it would trade a
+ * readability problem for a cardinality one.
  */
 const PRE_INITIALISED_SERIES: ReadonlyArray<readonly [number, number]> = [
   [constants.NODE_PERFORMANCE_GC_MAJOR, 0],
-  [constants.NODE_PERFORMANCE_GC_MAJOR, constants.NODE_PERFORMANCE_GC_FLAGS_ALL_AVAILABLE_GARBAGE],
+  [constants.NODE_PERFORMANCE_GC_MAJOR, constants.NODE_PERFORMANCE_GC_FLAGS_SCHEDULE_IDLE],
   [constants.NODE_PERFORMANCE_GC_MINOR, 0],
 ];
 
@@ -238,8 +245,8 @@ export function registerGcFlagsCollector(
     registers: [registry],
   });
 
-  // Zero-init the series PEN-3314 reads, so "this class never fired" is a 0
-  // rather than an absence. See PRE_INITIALISED_SERIES for why these three.
+  // Zero-init the measured GC classes, so "this class never fired" reads as a
+  // 0 rather than an absence. See PRE_INITIALISED_SERIES for why these three.
   for (const [kind, flags] of PRE_INITIALISED_SERIES) {
     cycles.inc({ kind: gcKindLabel(kind), flags: gcFlagsLabel(flags) }, 0);
   }

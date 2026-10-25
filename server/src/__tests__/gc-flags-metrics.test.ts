@@ -123,17 +123,31 @@ describe("gcKindLabel", () => {
 });
 
 describe("registerGcFlagsCollector", () => {
-  it("publishes the discriminator series at zero before any cycle is observed", async () => {
-    // The property that makes a negative result readable. Without it, "the
-    // memory-reducing GC never ran" and "this build predates the collector"
-    // are the same empty scrape — the confusion that cost PEN-3314 a source
-    // grep, a merge-base and a pod inspection on 2026-10-25.
+  it("publishes the measured GC classes at zero before any cycle is observed", async () => {
+    // The property that makes a negative result readable. Without it, "this
+    // class never ran" and "this build predates the collector" are the same
+    // empty scrape — the confusion that cost PEN-3314 a source grep, a
+    // merge-base and a pod inspection on 2026-10-25.
     const text = await renderAfter([]);
-    expect(text).toContain(
-      `${GC_CYCLES_METRIC}{kind="major",flags="all_available_garbage"} 0`,
-    );
     expect(text).toContain(`${GC_CYCLES_METRIC}{kind="major",flags="none"} 0`);
+    expect(text).toContain(`${GC_CYCLES_METRIC}{kind="major",flags="schedule_idle"} 0`);
     expect(text).toContain(`${GC_CYCLES_METRIC}{kind="minor",flags="none"} 0`);
+  });
+
+  it("does not pre-create a flag value that was measured never to fire", async () => {
+    // Guards against re-introducing the refuted hypothesis: an earlier
+    // revision named `all_available_garbage` as the unmapper marker, and it
+    // fired 0 times in 13 natural major cycles. Pre-creating it would publish
+    // a permanently-zero series that reads as a standing claim.
+    //
+    // Scoped to sample lines on purpose: the HELP text is prose about the
+    // open question and is corrected separately (#3010), so asserting over
+    // the whole rendering would couple this test to that wording.
+    const text = await renderAfter([]);
+    const series = text
+      .split("\n")
+      .filter(line => line.startsWith(`${GC_CYCLES_METRIC}{`));
+    expect(series.join("\n")).not.toContain("all_available_garbage");
   });
 
   it("keeps the pre-created series bounded to three", async () => {
@@ -151,11 +165,11 @@ describe("registerGcFlagsCollector", () => {
     // Guards the ordering bug this would have if the zero-init ran after the
     // observer had already been fed: a reset to 0 would silently lose cycles.
     const text = await renderAfter([
-      gcEntry(NODE_PERFORMANCE_GC_MAJOR, NODE_PERFORMANCE_GC_FLAGS_ALL_AVAILABLE_GARBAGE),
-      gcEntry(NODE_PERFORMANCE_GC_MAJOR, NODE_PERFORMANCE_GC_FLAGS_ALL_AVAILABLE_GARBAGE),
+      gcEntry(NODE_PERFORMANCE_GC_MAJOR, NODE_PERFORMANCE_GC_FLAGS_SCHEDULE_IDLE),
+      gcEntry(NODE_PERFORMANCE_GC_MAJOR, NODE_PERFORMANCE_GC_FLAGS_SCHEDULE_IDLE),
     ]);
     expect(text).toContain(
-      `${GC_CYCLES_METRIC}{kind="major",flags="all_available_garbage"} 2`,
+      `${GC_CYCLES_METRIC}{kind="major",flags="schedule_idle"} 2`,
     );
   });
 
