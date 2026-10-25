@@ -4797,6 +4797,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       },
     });
     const heartbeat = createHeartbeat();
+    heartbeat.__test_unsafelyTrackActiveRunExecution(runId);
 
     const result = await heartbeat.drainRunningRunsForShutdown(
       "SIGTERM",
@@ -4855,6 +4856,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const { companyId, agentId, runId, issueId } = await seedRunFixture({ agentStatus: "running" });
     const { siblingIssueId, retryRunId } = await seedAdoptedRetryAndSiblingLock({ companyId, agentId, runId });
     const heartbeat = createHeartbeat();
+    heartbeat.__test_unsafelyTrackActiveRunExecution(runId);
 
     const result = await heartbeat.drainRunningRunsForShutdown("SIGTERM", new Date("2026-03-19T00:06:00.000Z"));
     expect(result.interruptedRunIds).toEqual([runId]);
@@ -4876,6 +4878,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         },
       })
       .where(eq(heartbeatRuns.id, runId));
+    heartbeat.__test_unsafelyTrackActiveRunExecution(runId);
 
     const result = await heartbeat.drainRunningRunsForShutdown(
       "SIGTERM",
@@ -4918,6 +4921,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       agentStatus: "running",
     });
     const heartbeat = createHeartbeat();
+    heartbeat.__test_unsafelyTrackActiveRunExecution(runId);
 
     await db
       .update(heartbeatRuns)
@@ -4961,6 +4965,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       agentStatus: "running",
     });
     const heartbeat = createHeartbeat();
+    heartbeat.__test_unsafelyTrackActiveRunExecution(runId);
 
     await heartbeat.drainRunningRunsForShutdown("SIGTERM", new Date("2026-03-19T00:06:00.000Z"));
     const firstRetry = await db
@@ -5002,6 +5007,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       agentStatus: "running",
     });
     const heartbeat = createHeartbeat();
+    heartbeat.__test_unsafelyTrackActiveRunExecution(runId);
 
     await heartbeat.drainRunningRunsForShutdown("SIGTERM", new Date("2026-03-19T00:06:00.000Z"));
     const firstRetry = await db
@@ -5023,6 +5029,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .update(issues)
       .set({ checkoutRunId: firstRetry!.id, executionRunId: firstRetry!.id, updatedAt: new Date("2026-03-19T00:07:00.000Z") })
       .where(eq(issues.id, issueId));
+    heartbeat.__test_unsafelyTrackActiveRunExecution(firstRetry!.id);
 
     const secondDrain = await heartbeat.drainRunningRunsForShutdown(
       "SIGTERM",
@@ -5053,6 +5060,32 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .then((rows) => rows[0] ?? null);
     expect(issue?.checkoutRunId).toBeNull();
     expect(issue?.executionRunId).toBeNull();
+  });
+
+  // BLO-49138: with replicas > 1, a `status = running` scan selected the peer
+  // replica's runs too; paperclip-1's drain killed 10 live k8s Jobs on 2026-10-24.
+  it("leaves a running run this worker does not own untouched on graceful shutdown (BLO-49138)", async () => {
+    const { runId } = await seedRunFixture({ agentStatus: "running" });
+    const heartbeat = createHeartbeat();
+
+    const result = await heartbeat.drainRunningRunsForShutdown("SIGTERM", new Date("2026-03-19T00:06:00.000Z"));
+
+    expect(result.interruptedRunIds).toEqual([]);
+    const run = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then((rows) => rows[0]);
+    expect(run?.status).toBe("running");
+    expect(run?.errorCode).toBeNull();
+  });
+
+  it("leaves this worker's own external-lifecycle run running so restart reattach keeps its Job (BLO-49138)", async () => {
+    const { runId } = await seedRunFixture({ agentStatus: "running", adapterType: "claude_k8s" });
+    const heartbeat = createHeartbeat();
+    heartbeat.__test_unsafelyTrackActiveRunExecution(runId);
+
+    const result = await heartbeat.drainRunningRunsForShutdown("SIGTERM", new Date("2026-03-19T00:06:00.000Z"));
+
+    expect(result.interruptedRunIds).toEqual([]);
+    const run = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then((rows) => rows[0]);
+    expect(run?.status).toBe("running");
   });
 
   it("releases active environment leases when an orphaned run is reaped", async () => {
