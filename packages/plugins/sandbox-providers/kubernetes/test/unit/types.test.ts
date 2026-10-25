@@ -11,6 +11,18 @@ describe("kubernetesProviderConfigSchema", () => {
     expect(parsed.jobTtlSecondsAfterFinished).toBe(900);
   });
 
+  it("parses serviceAccountAnnotations as a string->string record (zod 4 two-arg z.record)", () => {
+    expect(parseKubernetesProviderConfig({ inCluster: true }).serviceAccountAnnotations).toEqual({});
+    const parsed = parseKubernetesProviderConfig({
+      inCluster: true,
+      serviceAccountAnnotations: { "eks.amazonaws.com/role-arn": "arn:aws:iam::1:role/x" },
+    });
+    expect(parsed.serviceAccountAnnotations).toEqual({ "eks.amazonaws.com/role-arn": "arn:aws:iam::1:role/x" });
+    expect(() =>
+      parseKubernetesProviderConfig({ inCluster: true, serviceAccountAnnotations: { a: 1 } }),
+    ).toThrow();
+  });
+
   it("accepts inline kubeconfig", () => {
     const parsed = parseKubernetesProviderConfig({
       inCluster: false,
