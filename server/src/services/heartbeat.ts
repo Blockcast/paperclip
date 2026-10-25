@@ -42452,11 +42452,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // taskKey falling to `other`. `like` (not `ilike`) because the webhook
       // writes the prefix literally.
       const isPrReviewTaskKey = sql<boolean>`coalesce(${wakeTaskKey} like 'pr\\_review:%', false)`;
+      // BLO-49060: successor matching is CASE-INSENSITIVE on taskKey. The
+      // webhook writes the repo as GitHub spells it (`Blockcast/...`) while the
+      // `issue_pr_review_requested` assignment path writes it lowercased
+      // (`blockcast/...`), and history already holds both. A case-sensitive `=`
+      // missed a succeeded successor and kept an already-reviewed PR paging.
+      // No index covers taskKey on either table, so `lower()` costs nothing.
+      const wakeTaskKeyLower = sql<string | null>`lower(${wakeTaskKey})`;
+      const runTaskKeyLower = sql<string | null>`lower(${heartbeatRuns.contextTaskKey})`;
 
       const selectCandidates = async (scope: "pr_review" | "other", limit: number) =>
         db
           .select({
             id: agentWakeupRequests.id,
+            requestedAt: agentWakeupRequests.requestedAt,
             finishedAt: agentWakeupRequests.finishedAt,
             taskKey: wakeTaskKey,
             errorCode: heartbeatRuns.errorCode,
@@ -42500,7 +42509,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
        * a CONSTANT bound (`> ${cutoff}`) alongside its correlated one. The
        * constant bound is logically redundant — any successor must postdate a
        * candidate whose `finishedAt >= cutoff`, so it cannot change the result
-       * set — but a purely correlated predicate gives the planner nothing
+       * set (BLO-49060 caveat: a `succeeded` run is matched from the wake's
+       * `requestedAt`, which can precede `cutoff`; such a run is then missed and
+       * the row is counted — the safe direction) — but a purely correlated
+       * predicate gives the planner nothing
        * sargable and it probes all history. This matters more now that the
        * publisher runs on every replica's scheduler tick rather than on one
        * replica's reconcile pass. Same treatment the sibling JS-side successor
@@ -42534,7 +42546,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               sql`not exists (
                 select 1
                 from agent_wakeup_requests successor_wake
-                where successor_wake.payload ->> 'taskKey' = ${wakeTaskKey}
+                where lower(successor_wake.payload ->> 'taskKey') = lower(${wakeTaskKey})
                   and successor_wake.id <> ${agentWakeupRequests.id}
                   and successor_wake.requested_at > ${agentWakeupRequests.finishedAt}
                   and successor_wake.requested_at > ${cutoff.toISOString()}::timestamptz
@@ -42545,12 +42557,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               sql`not exists (
                 select 1
                 from heartbeat_runs successor_run
-                where successor_run.context_task_key = ${wakeTaskKey}
-                  and successor_run.created_at > ${agentWakeupRequests.finishedAt}
+                where lower(successor_run.context_task_key) = lower(${wakeTaskKey})
                   and successor_run.created_at > ${cutoff.toISOString()}::timestamptz
-                  and successor_run.status in (${successorStatusList(
-                    TERMINAL_FAILED_WAKE_SUCCESSOR_RUN_STATUSES,
-                  )})
+                  and (
+                    (successor_run.created_at > ${agentWakeupRequests.finishedAt}
+                      and successor_run.status in (${successorStatusList(
+                        TERMINAL_FAILED_WAKE_SUCCESSOR_RUN_STATUSES,
+                      )}))
+                    or (successor_run.status = 'succeeded'
+                      and successor_run.created_at > ${agentWakeupRequests.requestedAt})
+                  )
               )`,
             ),
           )
@@ -42599,14 +42615,34 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // successor must postdate the failure. Bounding both follow-up queries by
       // the oldest candidate's finishedAt keeps them off a full-table scan.
       const taskKeys = [
-        ...new Set(rows.map((row) => row.taskKey).filter((key): key is string => !!key)),
+        ...new Set(
+          rows.map((row) => row.taskKey?.toLowerCase()).filter((key): key is string => !!key),
+        ),
       ];
       const oldestFinishedAt = rows.reduce<Date>(
         (oldest, row) => (row.finishedAt && row.finishedAt < oldest ? row.finishedAt : oldest),
         rows[0]?.finishedAt ?? cutoff,
       );
+      // A `succeeded` run counts from the candidate's REQUEST, not its finish
+      // (see latestSucceededRunByTaskKey), so that query needs the older bound.
+      const oldestRequestedAt = rows.reduce<Date>(
+        (oldest, row) => (row.requestedAt && row.requestedAt < oldest ? row.requestedAt : oldest),
+        oldestFinishedAt,
+      );
 
+      // Both maps are keyed by the LOWERCASED taskKey (BLO-49060).
       const latestSuccessorByTaskKey = new Map<string, Date>();
+      /**
+       * BLO-49060: a successor run that ended `succeeded` resolves the failure
+       * even if it was created BEFORE the failed run finished. A slow failure
+       * (e.g. a pod stuck PodInitializing for 30 min) routinely overlaps a
+       * re-request that completes the review, and the strict-after rule kept
+       * that already-reviewed PR paging for the full 24h window. It must still
+       * postdate the failed wake's `requestedAt`, so a review of an OLDER head
+       * cannot vouch for a newer request. Non-terminal statuses keep the
+       * strict-after-`finishedAt` rule: an in-flight run proves nothing yet.
+       */
+      const latestSucceededRunByTaskKey = new Map<string, Date>();
       // The driver hands back a `max(timestamptz)` aggregate as a STRING, not a
       // Date, no matter what the `sql<Date | null>` annotation claims -- the
       // same reason `refreshExternalRuntimeReservationMetrics` re-wraps its
@@ -42616,12 +42652,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // disabled the successor exclusion entirely and paged on exactly the
       // retried rows this gauge promises never to page on. Parse at the
       // boundary and keep the map strictly Date-typed.
-      const noteSuccessor = (taskKey: string | null, at: unknown) => {
+      const noteSuccessor = (
+        taskKey: string | null,
+        at: unknown,
+        map: Map<string, Date> = latestSuccessorByTaskKey,
+      ) => {
         if (!taskKey || !at) return;
         const parsed = at instanceof Date ? at : new Date(at as string);
         if (Number.isNaN(parsed.getTime())) return;
-        const current = latestSuccessorByTaskKey.get(taskKey);
-        if (!current || parsed > current) latestSuccessorByTaskKey.set(taskKey, parsed);
+        const current = map.get(taskKey);
+        if (!current || parsed > current) map.set(taskKey, parsed);
       };
 
       if (taskKeys.length > 0) {
@@ -42645,13 +42685,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const candidateIds = rows.map((row) => row.id);
         const successorWakes = await db
           .select({
-            taskKey: wakeTaskKey,
+            taskKey: wakeTaskKeyLower,
             latest: sql<string | null>`max(${agentWakeupRequests.requestedAt})`,
           })
           .from(agentWakeupRequests)
           .where(
             and(
-              inArray(wakeTaskKey, taskKeys),
+              inArray(wakeTaskKeyLower, taskKeys),
               gt(agentWakeupRequests.requestedAt, oldestFinishedAt),
               notInArray(agentWakeupRequests.id, candidateIds),
               inArray(agentWakeupRequests.status, [
@@ -42659,34 +42699,41 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               ]),
             ),
           )
-          .groupBy(wakeTaskKey);
+          .groupBy(wakeTaskKeyLower);
         for (const row of successorWakes) noteSuccessor(row.taskKey, row.latest);
 
         const successorRuns = await db
           .select({
-            taskKey: heartbeatRuns.contextTaskKey,
+            taskKey: runTaskKeyLower,
             latest: sql<string | null>`max(${heartbeatRuns.createdAt})`,
+            latestSucceeded: sql<string | null>`max(${heartbeatRuns.createdAt}) filter (where ${heartbeatRuns.status} = 'succeeded')`,
           })
           .from(heartbeatRuns)
           .where(
             and(
-              inArray(heartbeatRuns.contextTaskKey, taskKeys),
-              gt(heartbeatRuns.createdAt, oldestFinishedAt),
+              inArray(runTaskKeyLower, taskKeys),
+              gt(heartbeatRuns.createdAt, oldestRequestedAt),
               inArray(heartbeatRuns.status, [...TERMINAL_FAILED_WAKE_SUCCESSOR_RUN_STATUSES]),
             ),
           )
-          .groupBy(heartbeatRuns.contextTaskKey);
-        for (const row of successorRuns) noteSuccessor(row.taskKey, row.latest);
+          .groupBy(runTaskKeyLower);
+        for (const row of successorRuns) {
+          noteSuccessor(row.taskKey, row.latest);
+          noteSuccessor(row.taskKey, row.latestSucceeded, latestSucceededRunByTaskKey);
+        }
       }
 
       const counts = new Map<string, { errorCode: string | null; scope: string; count: number }>();
       for (const row of rows) {
         const finishedAt = row.finishedAt;
         if (row.taskKey && finishedAt) {
-          const successorAt = latestSuccessorByTaskKey.get(row.taskKey);
+          const key = row.taskKey.toLowerCase();
+          const successorAt = latestSuccessorByTaskKey.get(key);
           // Strictly-after: a successor stamped at the same instant as the
           // failure is the same event, not a re-drive.
           if (successorAt && successorAt > finishedAt) continue;
+          const succeededAt = latestSucceededRunByTaskKey.get(key);
+          if (succeededAt && row.requestedAt && succeededAt > row.requestedAt) continue;
         }
         const errorCode = row.errorCode ?? null;
         const scope = terminalFailedWakeScopeForTaskKey(row.taskKey);
