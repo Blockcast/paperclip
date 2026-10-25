@@ -151,9 +151,10 @@ export const SHARED_CHECKOUT_WARNING_RUN_SAMPLE = 4;
  * is therefore the one contended resource with NO guard on this path.
  *
  * Measured 2026-10-25: two runs of one seat, on two different issues
- * (PEN-4555 and PEN-4707), both exempt here, raced a push to one protected
- * branch of `Blockcast/magma`; the loser learned of it from a rejected
- * `git push`. Do not read this exemption as "these runs cannot collide".
+ * (PEN-4555 and PEN-4707), both exempt here, raced a push to one ordinary
+ * feature branch of `Blockcast/magma`; the loser learned of it only when the
+ * remote rejected its push as behind. Do not read this exemption as "these
+ * runs cannot collide".
  */
 export function runLandsInSharedCheckout(input: {
   strategyType: string;
