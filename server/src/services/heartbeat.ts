@@ -28223,6 +28223,54 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return timedOut(await awaitStartLockSweepBounded(fresh, waitBoundMs)) ? "timed_out" : "ran";
   }
 
+  /**
+   * Entry point for the periodic orphan reaper (PEN-4736).
+   *
+   * Mirrors {@link reapOrphanedRunsForStartLock}: one named entry per calling
+   * context, so each context's dispatch policy lives next to the reason for it
+   * rather than in the bootstrap file.
+   *
+   * The periodic tick used to call `reapOrphanedRuns` with no
+   * `suppressDispatchAfterReap`, which made **every acted-on row await a fresh
+   * FLEET-WIDE sweep**: the per-row `startNextQueuedRunForAgent` reaches
+   * `withAgentStartLock` -> `reapOrphanedRunsForStartLock`, and the periodic
+   * sweep is never inside `agentStartLockSweepContext`, so that call misses the
+   * cheap `nested` branch and schedules a whole new sweep (the `skipped_fresh`
+   * short-circuit is unreachable too: `START_LOCK_REAP_TTL_DEFAULT_MS` is 0).
+   * Cost was therefore (rows acted on) x (fleet sweep), both terms growing with
+   * run population: measured at N^2.29 on PEN-4734 (6.74 runs -> 1.15 s/sweep;
+   * 24.18 runs -> 21.20 s/sweep), with
+   * `paperclip_agent_start_lock_reap_disposition_total{disposition="timed_out"}`
+   * 26 -> 405 and `PaperclipRecoveryChainHeadroomLow` firing 181 min/24 h.
+   *
+   * Suppressing that dispatch costs nothing, because it is redundant rather
+   * than load-bearing: the same promise chain in `index.ts` runs
+   * `promoteDueScheduledRetries` and then `resumeQueuedRuns` immediately after
+   * this call, and `resumeQueuedRuns` is what actually starts queued work. Both
+   * suppressed sites already say so in their own comments ("the next
+   * `resumeQueuedRuns` re-drives any agent still holding queued runs";
+   * "Dispatch is follow-on work with its own retry"). Worst case is one tick of
+   * latency (~30 s) for an agent whose queued run would have started inside the
+   * sweep.
+   *
+   * ponytail: this covers 2 of the 3 re-entry points. `releaseIssueExecutionAndPromote`
+   * dispatches a *promoted* run without consulting the flag, by design
+   * (BLO-35940), and that path is deliberately OUT OF SCOPE here: it fires only
+   * when a concrete queued continuation was just promoted for the issue, so
+   * suppressing it would defer a specific known wake rather than a speculative
+   * one. It is also mutually exclusive with the loop dispatch this does
+   * suppress — the `activeRuns` loop guards on `!promotedRunDispatched` — so a
+   * reaped row nests at most one sweep either way, and only promoting rows
+   * still do. Routing those into the `nested` branch would not help: that
+   * branch still runs a FULL sweep.
+   */
+  async function reapOrphanedRunsPeriodic(opts?: { staleThresholdMs?: number }) {
+    return await reapOrphanedRuns({
+      staleThresholdMs: opts?.staleThresholdMs,
+      suppressDispatchAfterReap: true,
+    });
+  }
+
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number; suppressDispatchAfterReap?: boolean }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
@@ -44125,6 +44173,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // Exposed so the dispatch-path coalescing (BLO-36922) is directly testable;
     // production callers reach it through `startNextQueuedRunForAgent`.
     reapOrphanedRunsForStartLock,
+    // The periodic tick's entry point (PEN-4736). Exposed for the same reason as
+    // the start-lock entry above: it carries the periodic path's dispatch
+    // policy, so the "one fleet sweep per periodic pass" invariant is testable
+    // without driving the server bootstrap.
+    reapOrphanedRunsPeriodic,
     reconcileOrphanedEnvironmentLeases,
     refreshOrphanedRuntimeResourceMetrics,
     resumeRunningExternalRuntimeRuns,
