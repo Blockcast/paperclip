@@ -42564,8 +42564,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                       and successor_run.status in (${successorStatusList(
                         TERMINAL_FAILED_WAKE_SUCCESSOR_RUN_STATUSES,
                       )}))
-                    or (successor_run.status = 'succeeded'
-                      and successor_run.created_at > ${agentWakeupRequests.requestedAt})
                   )
               )`,
             ),
@@ -42733,7 +42731,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // failure is the same event, not a re-drive.
           if (successorAt && successorAt > finishedAt) continue;
           const succeededAt = latestSucceededRunByTaskKey.get(key);
-          if (succeededAt && row.requestedAt && succeededAt > row.requestedAt) continue;
+          void succeededAt;
         }
         const errorCode = row.errorCode ?? null;
         const scope = terminalFailedWakeScopeForTaskKey(row.taskKey);
