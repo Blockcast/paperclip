@@ -586,7 +586,9 @@ describe("the budget watcher's own threshold cards are exempt by construction (B
       budgetAmount: 3800000,
       observedAmount: 3800096,
       thresholdType: "hard",
-      guidance: "Raise the budget and resume the scope, or keep the scope paused.",
+      guidance: "Raise the budget and resume the scope, or keep the scope paused -- a kept "
+        + "pause holds only while the cap still binds, and lifts on its own once "
+        + "observed spend in the window falls back under it.",
     };
 
     expect(extractEnforcementAssertions(watcherPayload)).toEqual([]);
