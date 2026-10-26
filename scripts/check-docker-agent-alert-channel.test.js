@@ -382,9 +382,10 @@ test("the shadowing control plants on an exec-capable tmpfs, or it can never go 
 
   assert.match(
     control,
-    /--tmpfs \/paperclip:rw,exec,nosuid,size=\d+m/,
-    "the PEN-4682 control must mount /paperclip with `exec`: Docker defaults --tmpfs to noexec, " +
-      "and a non-executable plant is skipped by `command -v`, so control (b) passes when it must " +
+    /--tmpfs \/paperclip:rw,exec,nosuid,size=\d+m,mode=1777 /,
+    "the PEN-4682 control must mount /paperclip with `exec` and `mode=1777`: Docker defaults --tmpfs to noexec " +
+      "and root-owned 0755. Without mode=1777 the uid-1000 mkdir is denied and the step reds before " +
+      "any control runs (BLO-33389); without exec the plant is skipped by `command -v`, so control (b) passes when it must " +
       "red and the step fails every master build (PEN-4682)",
   );
 });
@@ -425,7 +426,7 @@ test("dropping exec from the control's tmpfs falsifies the assertion", () => {
 
   assert.doesNotMatch(
     executableLines(getStepBlock(CONTROL_STEP, poisoned)),
-    /--tmpfs \/paperclip:rw,exec,nosuid,size=\d+m/,
+    /--tmpfs \/paperclip:rw,exec,nosuid,size=\d+m,mode=1777 /,
     "the guard must read the executed mount flag, not the comment above it that names noexec",
   );
 });
