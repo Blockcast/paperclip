@@ -663,9 +663,36 @@ under this decision.
 2. Drop `projectId == null`, then verdicts ≥3d stale vs `completedAt`.
 3. Drop `allDetected == null` **and** `allDetected == []` — both vacuous.
 4. **For every survivor, `GET /api/issues/{key}` and read `workProducts`.** A row
-   with a `type: "pull_request"` work product carrying `metadata.merged == true`
-   is **not** a phantom-done, whatever its verdict says. This step is mandatory;
-   on the measured population it rejects 100% of what step 3 hands it.
+   with a `type: "pull_request"` work product whose **`metadata.mergedAt` is
+   populated** is **not** a phantom-done, whatever its verdict says. This step is
+   mandatory; on the measured population it rejects 100% of what step 3 hands it.
+
+   ⛔ **Screen on `metadata.mergedAt`, NOT on `metadata.merged` or `status ==
+   "merged"`.** Until 2026-10-26 this step said `metadata.merged == true`, which
+   is the predicate *"Reading the artifact cheaply — and the one field that
+   currently lies"* below forbids with measurement: a mandatory-merge-queue merge
+   arrives as `dequeued`, not `closed`, so the event *carrying* the merge wrote
+   `merged: false` while populating `metadata.mergedAt` from the same payload
+   (PEN-4550; 3 of 6 directly-inspected rows lost that second-granular tie). Read
+   that section for the full mechanism and for the server's own canonical
+   predicate, `pullRequestHasMerged`. The old wording failed toward **escalating
+   a correctly-closed row**, which is the direction this whole screen exists to
+   prevent. (PEN-4813)
+
+   ⛔⛔ **`workProducts` is an ABSENT KEY on the list projection — this step only
+   works off the SINGLE surface named above.** The paging recipe earlier in this
+   document builds the candidate set from
+   `GET /api/companies/{id}/issues?status=done&limit=1000`, and that projection
+   does not carry `workProducts` at all: measured present on **0 / 600** `done`
+   rows (2026-10-24) and **0 / 862** (2026-10-26). It is *absent*, not `[]`, so
+   the natural `len(row.get("workProducts", []))` evaluates to **0 on every row
+   in the corpus** — the discriminator stops being a check and becomes a
+   constant that **confirms every candidate and escalates the lot**. Same
+   `.get()`-on-an-absent-key family already flagged for `descriptionTruncated`
+   and the retry-attendance fields, and it bites one level *after* you have done
+   the right thing by moving to `GET /api/issues/{key}`. Gate on key presence
+   (`has("workProducts")`) and treat its absence as *"wrong surface"*, never as
+   *"no work products"*. (PEN-4813)
 5. Only a survivor of step 4 is worth a human look — and it is still a
    *candidate*, because a planning/decision row legitimately has no PR.
 
