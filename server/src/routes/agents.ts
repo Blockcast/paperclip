@@ -2247,6 +2247,21 @@ export function agentRoutes(
     };
   }
 
+  /**
+   * The PEER projection: what an actor sees of an agent whose configuration it
+   * is not entitled to read. Callers must not apply it to the viewer's own row
+   * — `GET /agents/:id` exempts self and the company list now does too
+   * (PEN-4775).
+   *
+   * It DROPS both config objects rather than redacting them. That is a
+   * different mechanism from `redactAgentSecrets`, which keeps the shape and
+   * masks the values; a fix to one is not a fix to the other, which is how
+   * PEN-2839 (under-redaction) and PEN-4775 (over-strip) came to sit on the
+   * same two fields pointing opposite ways.
+   *
+   * Whether the peer rule should exist at all is an open policy question owned
+   * by PEN-3206, not settled here. See docs/security/agent-config-read-model.md.
+   */
   function redactForRestrictedAgentView(agent: Awaited<ReturnType<typeof svc.getById>>) {
     if (!agent) return null;
     return {
@@ -2666,7 +2681,35 @@ export function agentRoutes(
       res.json(result.map((agent) => redactAgentSecrets(agent)));
       return;
     }
-    res.json(result.map((agent) => redactForRestrictedAgentView(agent)));
+    // `redactForRestrictedAgentView` answers the PEER question — "may this
+    // actor see SOMEONE ELSE'S config?" — so applying it to every row swept up
+    // the viewer's own row as well (PEN-4775). `GET /agents/:id` exempts self
+    // one call earlier (`canReadSensitiveDetail = isSelf ? true : ...`), so the
+    // same viewer read its own `adapterConfig`/`runtimeConfig` from the detail
+    // route and `{}` for that same row from this one. That is a contradiction
+    // within a single (viewer, subject) pair, and no answer to the open peer-
+    // read policy question (PEN-3206) can make both sides right — which is why
+    // this is fixed here and the peer rule is left exactly as it was. The
+    // operational cost was concrete: a seat holding `tools:manage_runtime` can
+    // WRITE a peer's `runtimeConfig` but could not read back its own row from
+    // the roster to confirm the shape it had just written.
+    //
+    // Gated on the STANDARD trust preset so the exemption cannot widen the
+    // low-trust self view. `agent_config:read` is an unconditional
+    // `deny_low_trust_boundary` in `services/authorization.ts`, and the detail
+    // route answers a low-trust self with `buildLowTrustSelfView` — a shape
+    // that carries no config at all. A low-trust actor therefore keeps the
+    // restricted row here, which is both the fail-closed direction and the one
+    // that stays consistent with the detail route.
+    const selfAgentId = req.actor.type === "agent" ? req.actor.agentId ?? null : null;
+    const selfRow = selfAgentId
+      ? result.find((agent) => agent.id === selfAgentId) ?? null
+      : null;
+    const selfTrustPreset = selfRow ? await resolveAgentSelfTrustPreset(req, selfRow) : null;
+    const selfRowId = selfTrustPreset?.kind === "standard" ? selfAgentId : null;
+    res.json(result.map((agent) => (
+      agent.id === selfRowId ? redactAgentSecrets(agent) : redactForRestrictedAgentView(agent)
+    )));
   });
 
   router.get("/instance/scheduler-heartbeats", async (req, res) => {

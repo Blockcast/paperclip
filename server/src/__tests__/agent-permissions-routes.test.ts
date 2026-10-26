@@ -527,6 +527,145 @@ describe.sequential("agent permission routes", () => {
     ]);
   });
 
+  describe("company agent list keeps the viewer's own row (PEN-4775)", () => {
+    // The restricted projection answers the PEER question, so it must not
+    // swallow the viewer itself. `GET /agents/:id` already exempts self; before
+    // PEN-4775 this route did not, so one viewer read its own config from the
+    // detail route and `{}` for the same row from the list — a contradiction no
+    // answer to the open peer-read policy question (PEN-3206) could resolve.
+    //
+    // Both rows carry NON-EMPTY config on purpose. `baseAgent` ships
+    // `adapterConfig: {}` / `runtimeConfig: {}`, so an assertion of `{}` against
+    // an unmodified fixture passes whether the projection ran or not.
+    const peerAgentId = "55555555-5555-4555-8555-555555555555";
+    const selfAdapterConfig = {
+      command: "pnpm agent:run",
+      env: { PAPERCLIP_API_KEY: "self-secret-key" },
+    };
+    const selfRuntimeConfig = { heartbeat: { enabled: true, maxConcurrentRuns: 5 } };
+    const peerAdapterConfig = {
+      command: "pnpm peer:run",
+      env: { PAPERCLIP_API_KEY: "peer-secret-key" },
+    };
+    const peerRuntimeConfig = { heartbeat: { enabled: false, maxConcurrentRuns: 1 } };
+
+    function denyAgentConfigRead() {
+      mockAccessService.decide.mockImplementation(async (input: { action?: string }) => ({
+        allowed: input.action === "agent:read",
+        reason: input.action === "agent:read" ? "allow_test_read" : "deny_missing_grant",
+        explanation: input.action === "agent:read"
+          ? "Allowed by test read grant."
+          : "Missing permission: agents:configure.",
+      }));
+    }
+
+    function listSelfAndPeer(selfOverrides: Record<string, unknown> = {}) {
+      mockAgentService.list.mockResolvedValue([
+        {
+          ...baseAgent,
+          adapterConfig: selfAdapterConfig,
+          runtimeConfig: selfRuntimeConfig,
+          ...selfOverrides,
+        },
+        {
+          ...baseAgent,
+          id: peerAgentId,
+          name: "Peer",
+          urlKey: "peer",
+          adapterConfig: peerAdapterConfig,
+          runtimeConfig: peerRuntimeConfig,
+        },
+      ]);
+    }
+
+    it("returns the viewer's own config while still withholding a peer's", async () => {
+      denyAgentConfigRead();
+      listSelfAndPeer();
+
+      const app = await createApp({
+        type: "agent",
+        agentId,
+        companyId,
+        runId: "run-1",
+        source: "agent_key",
+      });
+
+      const res = await requestApp(app, (baseUrl) => request(baseUrl).get(`/api/companies/${companyId}/agents`));
+
+      expect(res.status).toBe(200);
+      const rows = res.body as Array<Record<string, any>>;
+      const self = rows.find((row) => row.id === agentId);
+      const peer = rows.find((row) => row.id === peerAgentId);
+
+      // Self: present, and redacted rather than dropped — the secret is masked
+      // in place, which is the distinction PEN-4775 §6 turns on.
+      expect(self?.adapterConfig).toMatchObject({
+        command: "pnpm agent:run",
+        env: { PAPERCLIP_API_KEY: "***" },
+      });
+      expect(self?.runtimeConfig).toEqual(selfRuntimeConfig);
+
+      // Peer: unchanged by this fix. The peer-read policy question stays open
+      // on PEN-3206; this test pins that the fix did not pre-empt it.
+      expect(peer?.adapterConfig).toEqual({});
+      expect(peer?.runtimeConfig).toEqual({});
+    }, 60_000);
+
+    it("keeps withholding the viewer's own config under the low-trust preset", async () => {
+      // Fail-closed direction. `agent_config:read` is an unconditional
+      // `deny_low_trust_boundary`, and `GET /agents/:id` answers a low-trust
+      // self with `buildLowTrustSelfView`, which carries no config — so the
+      // self-exemption must not fire here or it would widen that view.
+      denyAgentConfigRead();
+      listSelfAndPeer({
+        permissions: { ...baseAgent.permissions, trustPreset: LOW_TRUST_REVIEW_PRESET },
+      });
+
+      const app = await createApp({
+        type: "agent",
+        agentId,
+        companyId,
+        runId: "run-1",
+        source: "agent_key",
+      });
+
+      const res = await requestApp(app, (baseUrl) => request(baseUrl).get(`/api/companies/${companyId}/agents`));
+
+      expect(res.status).toBe(200);
+      const rows = res.body as Array<Record<string, any>>;
+      const self = rows.find((row) => row.id === agentId);
+
+      expect(self?.adapterConfig).toEqual({});
+      expect(self?.runtimeConfig).toEqual({});
+    }, 60_000);
+
+    it("still returns every row's config to a viewer that holds agent_config:read", async () => {
+      // Guards the other direction: the per-row branch must not narrow the
+      // existing allow path for a viewer that does hold the grant.
+      mockAccessService.decide.mockResolvedValue({
+        allowed: true,
+        reason: "allow_explicit_grant",
+        explanation: "Allowed by explicit grant agents:configure.",
+      });
+      listSelfAndPeer();
+
+      const app = await createApp({
+        type: "agent",
+        agentId,
+        companyId,
+        runId: "run-1",
+        source: "agent_key",
+      });
+
+      const res = await requestApp(app, (baseUrl) => request(baseUrl).get(`/api/companies/${companyId}/agents`));
+
+      expect(res.status).toBe(200);
+      const rows = res.body as Array<Record<string, any>>;
+      expect(rows.find((row) => row.id === agentId)?.runtimeConfig).toEqual(selfRuntimeConfig);
+      expect(rows.find((row) => row.id === peerAgentId)?.runtimeConfig).toEqual(peerRuntimeConfig);
+    }, 60_000);
+  });
+
   it("blocks agent updates for authenticated company members without agent admin permission", async () => {
     mockAccessService.canUser.mockResolvedValue(false);
 
