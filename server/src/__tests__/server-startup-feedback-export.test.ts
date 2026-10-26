@@ -885,6 +885,13 @@ describe("startServer feedback export wiring", () => {
       // `sweepExpiredRuntimeStatuses` is the first statement after that guard.
       expect(heartbeatServiceMock.sweepExpiredRuntimeStatuses).not.toHaveBeenCalled();
       expect(heartbeatServiceMock.reconcileFailedWakeDispatches).not.toHaveBeenCalled();
+      // BLO-49303: the timer enqueue must NOT wait for recovery. BLO-45212 runs
+      // this chain on every lease takeover, so a survivor that gated the enqueue
+      // behind it ran zero timer checks for the chain's whole duration (~75 s
+      // measured on the 2026-10-26 drill). Moving `tickTimers` back below the
+      // recovery gate must fail here.
+      await vi.waitFor(() => expect(heartbeatServiceMock.tickTimers).toHaveBeenCalledTimes(1));
+      expect(heartbeatServiceMock.sweepExpiredRuntimeStatuses).not.toHaveBeenCalled();
     } finally {
       releaseRecovery();
       // `beforeEach` uses `clearAllMocks`, which keeps implementations.
