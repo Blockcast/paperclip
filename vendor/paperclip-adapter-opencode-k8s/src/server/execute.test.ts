@@ -999,52 +999,14 @@ describe("execute — mutex serialization", () => {
   });
 });
 
-describe("execute — SIGTERM handler", () => {
-  it("registers a SIGTERM handler via process.once on first execute() call", async () => {
-    // Spy before execute() so we can verify the handler is installed.
-    const onceSpy = vi.spyOn(process, "once");
-    const ctx = makeCtx();
-    await execute(ctx);
-
-    // ensureSigtermHandler() should call process.once('SIGTERM', ...) at most once per process.
-    // Since we can't reset module state between tests, assert it was called at some point.
-    const sigtermCalls = onceSpy.mock.calls.filter(([event]) => event === "SIGTERM");
-    // Either this test triggered the registration, or an earlier test did.
-    // In either case, the handler must exist on process.
-    const listenerCount = process.listenerCount("SIGTERM");
-    expect(listenerCount).toBeGreaterThanOrEqual(1);
-    onceSpy.mockRestore();
-  });
-
-  it("SIGTERM handler deletes tracked jobs and calls process.exit(0)", async () => {
-    // Capture the SIGTERM handler by temporarily intercepting process.once.
-    let capturedHandler: (() => void) | null = null;
-    const onceSpy = vi.spyOn(process, "once").mockImplementation(
-      (event: string | symbol, handler: (...args: unknown[]) => void) => {
-        if (event === "SIGTERM") capturedHandler = handler as () => void;
-        return process;
-      },
-    );
-    const exitSpy = vi.spyOn(process, "exit").mockImplementation(() => { throw new Error("process.exit"); });
-
-    // Reset the SIGTERM flag by re-importing with resetModules (only works first-time per suite).
-    // Instead, we test the handler by intercepting the first registration that fires.
-    // If the handler was already installed, capturedHandler stays null and we skip.
-    const ctx = makeCtx();
-    await execute(ctx);
-
-    onceSpy.mockRestore();
-    exitSpy.mockRestore();
-
-    if (capturedHandler) {
-      const batchApi = vi.mocked(getBatchApi)();
-      // Fire the handler and verify it deletes the job that was just created.
-      try { (capturedHandler as () => void)(); } catch { /* swallow process.exit throw */ }
-      await new Promise((r) => setTimeout(r, 50)); // let async handler tick
-      expect(batchApi.deleteNamespacedJob).toHaveBeenCalled();
-    }
-    // If capturedHandler is null, sigtermHandlerInstalled was already true from
-    // a prior test — handler registration is idempotent, which is also correct.
+describe("execute — process signal handlers (BLO-49139)", () => {
+  it("registers no SIGTERM/SIGINT listener", async () => {
+    // The host server owns shutdown. An adapter listener that exits, or
+    // re-raises the signal, kills the host's drain mid-flight.
+    const before = { term: process.listenerCount("SIGTERM"), int: process.listenerCount("SIGINT") };
+    await execute(makeCtx());
+    expect(process.listenerCount("SIGTERM")).toBe(before.term);
+    expect(process.listenerCount("SIGINT")).toBe(before.int);
   });
 });
 
@@ -2692,89 +2654,6 @@ describe("execute — skill bundle source loading", () => {
     expect(buildArgs.skillsBundleContent).toContain("skill B flat content");
   });
 });
-
-describe("execute — SIGTERM handler body (FAR-86 coverage)", () => {
-  it("invoking the captured SIGTERM handler deletes tracked Jobs and Secrets", async () => {
-    // Force a fresh module so sigtermHandlerInstalled starts false again.
-    vi.resetModules();
-    vi.doMock("./k8s-client.js", () => ({
-      getSelfPodInfo: vi.fn().mockResolvedValue(MOCK_SELF_POD),
-      getBatchApi: vi.fn(),
-      getCoreApi: vi.fn(),
-      getPvc: vi.fn().mockResolvedValue({ metadata: { name: "opencode-db-x" } }),
-      createPvc: vi.fn().mockResolvedValue({}),
-    }));
-    vi.doMock("./job-manifest.js", () => ({
-      buildJobManifest: vi.fn().mockReturnValue({
-        job: MOCK_JOB,
-        jobName: "fresh-job",
-        namespace: NAMESPACE,
-        prompt: "p",
-        opencodeArgs: [],
-        promptMetrics: null,
-        podLogPath: `/paperclip/instances/default/data/run-logs/co-1/agent-id-test/run-test-123.pod.ndjson`,
-        envSecret: { name: "fresh-job-env", namespace: NAMESPACE, data: { OPENAI_API_KEY: "env-secret" } },
-        mcpConfigSecret: {
-          name: "fresh-job-mcp",
-          namespace: NAMESPACE,
-          data: { "opencode.json": '{"mcp":{"private":{"headers":{"Authorization":"Bearer secret"}}}}' },
-        },
-      }),
-      buildPodLogPath: vi.fn((companyId: string, agentId: string, runId: string) =>
-        `/paperclip/instances/default/data/run-logs/${companyId}/${agentId}/${runId}.pod.ndjson`
-      ),
-      readRunIsolationDescriptor: vi.fn(() => ({
-        mode: "shared",
-        key: null,
-        keyHash: null,
-        workspaceRoot: null,
-        homeRoot: null,
-        cacheRoot: null,
-        sessionScope: null,
-      })),
-      LARGE_PROMPT_THRESHOLD_BYTES: 256 * 1024,
-    }));
-
-    const fresh = await import("./execute.js");
-    const k8s = await import("./k8s-client.js");
-    const batchApi = makeBatchApi();
-    const coreApi = makeCoreApi();
-    vi.mocked(k8s.getBatchApi).mockReturnValue(batchApi as unknown as ReturnType<typeof k8s.getBatchApi>);
-    vi.mocked(k8s.getCoreApi).mockReturnValue(coreApi as unknown as ReturnType<typeof k8s.getCoreApi>);
-
-    let capturedHandler: (() => void) | null = null;
-    const onceSpy = vi.spyOn(process, "once").mockImplementation(
-      (event: string | symbol, handler: (...args: unknown[]) => void) => {
-        if (event === "SIGTERM") capturedHandler = handler as () => void;
-        return process;
-      },
-    );
-    const exitSpy = vi.spyOn(process, "exit").mockImplementation((() => {}) as never);
-
-    await fresh.execute(makeCtx());
-    onceSpy.mockRestore();
-
-    expect(capturedHandler).not.toBeNull();
-    (capturedHandler as unknown as () => void)();
-    // Wait long enough for the async handler body to settle
-    await new Promise((r) => setTimeout(r, 50));
-    expect(batchApi.deleteNamespacedJob).toHaveBeenCalled();
-    expect(coreApi.deleteNamespacedSecret).toHaveBeenCalledWith({
-      name: "fresh-job-env",
-      namespace: NAMESPACE,
-    });
-    expect(coreApi.deleteNamespacedSecret).toHaveBeenCalledWith({
-      name: "fresh-job-mcp",
-      namespace: NAMESPACE,
-    });
-    expect(exitSpy).toHaveBeenCalled();
-
-    exitSpy.mockRestore();
-    vi.doUnmock("./k8s-client.js");
-    vi.doUnmock("./job-manifest.js");
-  });
-});
-
 
 // tailPodLogFile tests deferred — requires file-system module isolation
 // not available in the shared test suite's vi.mock("node:fs/promises") setup

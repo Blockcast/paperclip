@@ -1352,7 +1352,7 @@ describe("startServer feedback export wiring", () => {
         if (delay === 30000) intervalCallback = callback;
         return 1 as unknown as ReturnType<typeof setInterval>;
       }) as typeof setInterval);
-    // `startServer` installs a `process.once("SIGTERM")` handler. Isolate this
+    // `startServer` installs a `process.on("SIGTERM")` handler. Isolate this
     // test's handler from any left by earlier tests in the file, and restore
     // the originals afterwards.
     const priorSigterm = process.listeners("SIGTERM");
@@ -1384,6 +1384,10 @@ describe("startServer feedback export wiring", () => {
       // invokes its callback, so the handler stops there — well after the
       // scheduler flag is set, the interval cleared and the idle barrier passed.
       process.emit("SIGTERM" as NodeJS.Signals);
+      // BLO-49139: the listener must survive its first call. With `once`, a
+      // library that re-raises SIGTERM finds no listener and the process dies
+      // mid-drain under the default action.
+      expect(process.listenerCount("SIGTERM")).toBe(1);
       await vi.waitFor(() => expect(fakeServer.close).toHaveBeenCalled());
 
       releaseSuppression?.();

@@ -303,7 +303,6 @@ const activeJobs = new Set<ActiveJobRef>();
 // concurrent execute() calls for the same agent both pass the list-then-create
 // guard and create K8s Jobs simultaneously on the shared PVC.
 const agentCreationMutex = new Map<string, Promise<void>>();
-let sigtermHandlerRegistered = false;
 
 function resolveIsolationMutexKey(
   ctx: Pick<AdapterExecutionContext, "runtime" | "agent">,
@@ -348,27 +347,6 @@ function resolvePromptCacheRoot(
   if (isolation.promptCacheRoot) return isolation.promptCacheRoot;
   const root = `${resolveDataMountPath(config)}/instances/default/data/k8s-isolation/${safePathComponent(ctx.agent.companyId)}/${safePathComponent(ctx.agent.id)}/${isolation.key}`;
   return `${root}/prompt-cache`;
-}
-
-function ensureSigtermHandler(): void {
-  if (sigtermHandlerRegistered) return;
-  sigtermHandlerRegistered = true;
-  process.once("SIGTERM", () => {
-    // Do NOT delete active K8s Jobs on SIGTERM (FAR-107).  Paperclip itself
-    // receives SIGTERM during rolling deploys, evictions, scale-down, etc.
-    // Deleting the Jobs we own there causes the in-flight heartbeat to surface
-    // a false-positive `k8s_job_deleted_externally` error and tears down work
-    // the user expected to keep running.
-    //
-    // The correct behaviour with `reattachOrphanedJobs=true` (default) is to
-    // leave the Jobs alive: the next paperclip process discovers them via the
-    // orphan-classification path and reattaches their log streams.  When
-    // `reattachOrphanedJobs=false` the operator explicitly opted into manual
-    // cleanup and should not have us auto-deleting either.  The owning Job's
-    // ownerReference (FAR-15) keeps the prompt Secret tied to the Job, so
-    // both survive together and TTL cleans them up after natural completion.
-    process.kill(process.pid, "SIGTERM");
-  });
 }
 
 async function listClaudeSessionJsonlFiles(root: string, sessionId: string): Promise<string[]> {
@@ -3097,7 +3075,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     kubeconfigPath,
   };
   activeJobs.add(activeJobRef);
-  ensureSigtermHandler();
 
   try {
     // Wait for pod to be ready for log streaming
