@@ -65,7 +65,7 @@ env:
 
 jobs:
   publish:
-    runs-on: arc-deploy
+    runs-on: arc-paperclip-deploy
     # ⚠ THIS IS NOT AN APPROVAL GATE. The environment exists but has NO protection
     # rules, so naming it here changes nothing about who may publish.
     #
