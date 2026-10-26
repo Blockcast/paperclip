@@ -367,10 +367,12 @@ jobs:
               chmod 0755 /paperclip/bin/google-chrome
               # The plant must be executable for this control to mean anything.
               # Docker mounts --tmpfs noexec unless `exec` is given, and bash
-              # `command -v` skips a PATH match it cannot execute -- so a noexec
-              # /paperclip would make the canary resolve the shim and this step
-              # would report CONTROL FAILED while the control itself was the
-              # broken thing. Fail at the plant instead, where the message is true.
+              # `command -v` skips a PATH match it cannot execute -- so on a
+              # noexec /paperclip the canary skips the plant and resolves the
+              # pinned $CHROME_BIN instead, passing in (b) where it must red.
+              # This step would then report CONTROL FAILED and blame the image,
+              # while the control itself was the broken thing. Fail at the plant
+              # instead, where the message is true.
               test -x /paperclip/bin/google-chrome
 
               # (a) The agent-shaped PATH. Both adapters force the image wrapper
