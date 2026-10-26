@@ -31,6 +31,21 @@ function executableLines(source) {
     .join("\n");
 }
 
+// Steps are at indent 6 under `steps:`. Same shape as getJobBlock: slice from
+// this step's `- name:` to the next one at the same indent.
+function getStepBlock(name, source = workflow) {
+  const marker = `      - name: ${name}\n`;
+  const start = source.indexOf(marker);
+  assert.notEqual(start, -1, `docker-agent.yml must define a step named ${name}`);
+  const remainder = source.slice(start + marker.length);
+  const nextStep = remainder.search(/^ {6}- name: /m);
+  return nextStep === -1 ? remainder : remainder.slice(0, nextStep);
+}
+
+const CONTROL_STEP =
+  "Prove a shadowing PVC browser cannot outrank the pinned one (PEN-4682 positive control)";
+const SMOKE_STEP = "Smoke test restricted headless screenshot";
+
 // BLO-33382: the defect this whole file exists to prevent recurring. The alert
 // job called `gh issue list` / `gh issue create` against a repository with
 // Issues DISABLED, so under `set -euo pipefail` it died before reporting
@@ -345,4 +360,82 @@ test("reintroducing cancel-in-progress: true falsifies the delivery assertion", 
     /^\s*cancel-in-progress: true$/m,
     "the guard must read the executed key, not the comment above it that quotes the old value",
   );
+});
+// PEN-4682: the control that shipped in #2988 could never go red, so every
+// master agent-image build failed at it -- inside build-and-push, upstream of
+// `Promote verified agent image` -- and the Alertmanager lane fired on each
+// one. Docker mounts `--tmpfs` noexec unless `exec` is given, so the planted
+// /paperclip/bin/google-chrome was never executable however it was chmodded;
+// bash `command -v` skips a PATH match it cannot execute, so the canary
+// skipped the plant, fell through to $CHROME_BIN (/usr/local/bin/google-chrome,
+// on the default PATH) and PASSED exactly where (b) requires it to fail. The
+// step then printed CONTROL FAILED and blamed the image.
+//
+// WHY STATIC, AND WHY HERE. docker-agent.yml runs only on `workflow_run` of
+// Docker on master and on workflow_dispatch, so no PR lane ever executes that
+// step -- #2988 went in with 25 green checks and the defect was invisible
+// until it reached trunk. This suite does run on PRs, so these assertions are
+// the only thing standing between a future edit of that mount and another
+// round of red master builds.
+test("the shadowing control plants on an exec-capable tmpfs, or it can never go red", () => {
+  const control = executableLines(getStepBlock(CONTROL_STEP));
+
+  assert.match(
+    control,
+    /--tmpfs \/paperclip:rw,exec,nosuid,size=\d+m/,
+    "the PEN-4682 control must mount /paperclip with `exec`: Docker defaults --tmpfs to noexec, " +
+      "and a non-executable plant is skipped by `command -v`, so control (b) passes when it must " +
+      "red and the step fails every master build (PEN-4682)",
+  );
+});
+
+test("the control proves the plant is executable before drawing a conclusion from it", () => {
+  const control = executableLines(getStepBlock(CONTROL_STEP));
+
+  assert.match(
+    control,
+    /^\s*test -x \/paperclip\/bin\/google-chrome$/m,
+    "the control must assert the plant is executable right after the chmod: under `sh -eu` that " +
+      "fails at the cause, instead of surfacing four lines later as a CONTROL FAILED that blames " +
+      "the image for the control's own broken mount (PEN-4682)",
+  );
+});
+
+// Scope check. `exec` is needed only where this step writes and runs its own
+// planted script; the plain smoke step plants nothing, so widening its mount
+// would be unearned.
+test("the plain smoke step keeps /paperclip noexec, because it plants nothing", () => {
+  const smoke = executableLines(getStepBlock(SMOKE_STEP));
+
+  assert.match(smoke, /--tmpfs \/paperclip:rw,nosuid,size=\d+m/);
+  assert.doesNotMatch(
+    smoke,
+    /--tmpfs \/paperclip:[^\s]*\bexec\b/,
+    "the smoke step must not gain `exec`: it plants no executable, so the mount stays as narrow " +
+      "as it has always been",
+  );
+});
+
+test("dropping exec from the control's tmpfs falsifies the assertion", () => {
+  const poisoned = workflow.replace(
+    "--tmpfs /paperclip:rw,exec,nosuid,size=16m",
+    "--tmpfs /paperclip:rw,nosuid,size=16m",
+  );
+  assert.notEqual(poisoned, workflow, "fixture check: the literal must be present to be swapped");
+
+  assert.doesNotMatch(
+    executableLines(getStepBlock(CONTROL_STEP, poisoned)),
+    /--tmpfs \/paperclip:rw,exec,nosuid,size=\d+m/,
+    "the guard must read the executed mount flag, not the comment above it that names noexec",
+  );
+});
+
+test("the step-block extractor cannot bleed into a later step", () => {
+  const control = getStepBlock(CONTROL_STEP);
+  assert.doesNotMatch(
+    control,
+    /Assert the agent image's git-config surface/,
+    "getStepBlock must stop at the next step, or an assertion could be satisfied by a neighbour",
+  );
+  assert.match(control, /control \(b\): wrapper directory absent/, "fixture check: it kept its own body");
 });
