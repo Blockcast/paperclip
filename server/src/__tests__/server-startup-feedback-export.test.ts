@@ -61,6 +61,11 @@ const {
     reconcileHotRestartAdoption: vi.fn(async () => ({ mode: "none" })),
     reconcileWorkerCrashedRuns: vi.fn(async () => ({ reconciledRunIds: [], retryRunIds: [], unresolvedRunIds: [] })),
     reapOrphanedRuns: vi.fn(async () => ({ reaped: 0, runIds: [] })),
+    // PEN-4736: the periodic tick calls this, NOT `reapOrphanedRuns` — it is the
+    // same sweep with per-row dispatch suppressed. Startup recovery still calls
+    // `reapOrphanedRuns`, so the two spies keep those call sites distinguishable;
+    // asserting the periodic latch on `reapOrphanedRuns` would silently pass.
+    reapOrphanedRunsPeriodic: vi.fn(async () => ({ reaped: 0, runIds: [] })),
     promoteDueScheduledRetries: vi.fn(async () => ({ promoted: 0, runIds: [] })),
     resumeQueuedRuns: vi.fn(async () => undefined),
     reconcileStrandedAssignedIssues: vi.fn(async () => ({
@@ -534,6 +539,7 @@ describe("startServer feedback export wiring", () => {
       await startServer();
 
       expect(heartbeatServiceMock.reapOrphanedRuns).not.toHaveBeenCalled();
+      expect(heartbeatServiceMock.reapOrphanedRunsPeriodic).not.toHaveBeenCalled();
       expect(heartbeatServiceMock.tickTimers).not.toHaveBeenCalled();
       expect(environmentCustomImagesServiceMock.cleanupExpiredSetupSessions).toHaveBeenCalledTimes(1);
       // The scheduler tick is the sole emission path (BLO-26727): startup
@@ -1606,10 +1612,12 @@ describe("startServer feedback export wiring", () => {
         return 1 as unknown as ReturnType<typeof setInterval>;
       }) as typeof setInterval);
     // Ticks inside the predicate, so the count only has a lower bound.
+    // PEN-4736: the periodic tick drives `reapOrphanedRunsPeriodic`; the
+    // single-flight latch under test is the same one, just a rung up.
     const tickUntilReapCallsExceed = async (n: number) =>
       vi.waitFor(() => {
         intervalCallback?.();
-        expect(heartbeatServiceMock.reapOrphanedRuns.mock.calls.length).toBeGreaterThan(n);
+        expect(heartbeatServiceMock.reapOrphanedRunsPeriodic.mock.calls.length).toBeGreaterThan(n);
       });
 
     let releaseReap: (() => void) | null = null;
@@ -1618,10 +1626,10 @@ describe("startServer feedback export wiring", () => {
       // Ticks return early until the startup recovery sequence finishes.
       await vi.waitFor(() =>
         expect(heartbeatServiceMock.reconcileStrandedAssignedIssues).toHaveBeenCalledTimes(1));
-      heartbeatServiceMock.reapOrphanedRuns.mockClear();
+      heartbeatServiceMock.reapOrphanedRunsPeriodic.mockClear();
       heartbeatServiceMock.resumeQueuedRuns.mockClear();
 
-      heartbeatServiceMock.reapOrphanedRuns.mockImplementationOnce(
+      heartbeatServiceMock.reapOrphanedRunsPeriodic.mockImplementationOnce(
         () => new Promise((resolve) => {
           releaseReap = () => resolve({ reaped: 0, runIds: [] });
         }),
@@ -1632,15 +1640,15 @@ describe("startServer feedback export wiring", () => {
       // Second tick with the reap parked: skips the reap, still dispatches.
       intervalCallback?.();
       await vi.waitFor(() => expect(heartbeatServiceMock.resumeQueuedRuns).toHaveBeenCalledTimes(1));
-      expect(heartbeatServiceMock.reapOrphanedRuns).toHaveBeenCalledTimes(1);
+      expect(heartbeatServiceMock.reapOrphanedRunsPeriodic).toHaveBeenCalledTimes(1);
 
       // Released on resolve...
       releaseReap?.();
       releaseReap = null;
       await tickUntilReapCallsExceed(1);
       // ...and on reject: the call after the rejected one must still happen.
-      heartbeatServiceMock.reapOrphanedRuns.mockRejectedValueOnce(new Error("reap blew up"));
-      const beforeReject = heartbeatServiceMock.reapOrphanedRuns.mock.calls.length;
+      heartbeatServiceMock.reapOrphanedRunsPeriodic.mockRejectedValueOnce(new Error("reap blew up"));
+      const beforeReject = heartbeatServiceMock.reapOrphanedRunsPeriodic.mock.calls.length;
       await tickUntilReapCallsExceed(beforeReject + 1);
     } finally {
       releaseReap?.();
