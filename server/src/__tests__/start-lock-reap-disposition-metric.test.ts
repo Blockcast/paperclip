@@ -190,4 +190,35 @@ describe("recordOrphanReapStage", () => {
       expect(await stageCount(stage)).toBe(1);
     }
   });
+
+  /**
+   * PEN-4781. Unlike the two splits above, this one is a PARTITION of `per_run`
+   * rather than a selection out of it, and `per_run_other` is what makes it
+   * one. The named four cover the awaits; the residual covers the glue, the
+   * iterations that `continue` before reaching any of them, and anything a
+   * later contributor adds without wiring it up.
+   *
+   * Asserted by name for the same reason the three above are -- the risk is
+   * deletion -- but with one addition specific to the residual: it is the
+   * bucket most likely to be read as an afterthought and dropped, and dropping
+   * it does not break the four. It makes them lie. Four small numbers with no
+   * residual read as "nothing is slow" while the time sits somewhere unnamed,
+   * which is a false negative where today's single `per_run` label is merely a
+   * dead end. The structural half of this guarantee -- that no awaited call in
+   * the loop escapes the four -- is enforced in
+   * `orphan-reap-per-run-sub-stage-audit.test.ts`.
+   */
+  it("keeps the per_run partition separable, residual included", async () => {
+    for (const stage of [
+      "per_run_liveness",
+      "per_run_finalize",
+      "per_run_dispatch",
+      "per_run_cleanup",
+      "per_run_other",
+    ] as const) {
+      expect(KNOWN_ORPHAN_REAP_STAGES).toContain(stage);
+      recordOrphanReapStage(stage, 0.25);
+      expect(await stageCount(stage)).toBe(1);
+    }
+  });
 });

@@ -1570,6 +1570,41 @@ export const KNOWN_ORPHAN_REAP_STAGES = [
   "refresh_resource_metrics",
   "pod_cleanup",
   "per_run",
+  // PEN-4781: the `per_run` lap decomposed into an EXHAUSTIVE partition. Like
+  // the two splits above these are ADDITIVE -- `per_run` still measures the
+  // identical span, so its history stays comparable -- but unlike them this set
+  // is a partition rather than a selection, and that is the point.
+  //
+  // `per_run` is one lap over ~28 awaits in nested branches across ~700 lines,
+  // so every sweep-slow episode resolved to `per_run` and stopped there. It has
+  // carried the top stage in episodes of MORE THAN ONE cause: on 2026-10-19
+  // phase A, `list_jobs` was flat at x1.04 while `per_run` went x1088 (kube
+  // ruled out); on 2026-10-25 `list_jobs` moved x96.6 in lockstep with `per_run`
+  // x90.8 while Postgres moved only x5.6 (a kube signature). Same label, two
+  // different faults, and no way to tell them apart from the metric.
+  //
+  // WHY EXHAUSTIVE, AND WHY THE RESIDUAL IS LOAD-BEARING. A 1-of-N split yields
+  // a boolean, not a localization: if the instrumented bucket reads flat and the
+  // time sits in an un-named remainder, the responder has learned only "not
+  // that" and is back to reading source. Worse, a NON-exhaustive partition makes
+  // the glue between the buckets invisible, so a responder reads four small
+  // numbers and concludes nothing is slow -- a false negative, strictly worse
+  // than the honest dead end it replaces. `per_run_other` is therefore not an
+  // afterthought bucket: it is what makes
+  //   sum(per_run_liveness + _finalize + _dispatch + _cleanup + _other) == per_run
+  // true by construction, and it is the bucket to read FIRST when the four named
+  // ones are all small.
+  //
+  // Compare these to `per_run` on the `_sum`, which is exact. The `_count`s also
+  // match, because the four are accumulated across the whole pass and emitted
+  // once per sweep (as `release_pending_job_reads` already is) rather than once
+  // per run -- that is what keeps a p99 comparison between a sub-stage and
+  // `per_run` an apples-to-apples one.
+  "per_run_liveness",
+  "per_run_finalize",
+  "per_run_dispatch",
+  "per_run_cleanup",
+  "per_run_other",
   "total",
 ] as const;
 export type OrphanReapStageLabel = (typeof KNOWN_ORPHAN_REAP_STAGES)[number];
