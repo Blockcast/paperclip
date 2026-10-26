@@ -1499,7 +1499,11 @@ export async function startServer(): Promise<StartedServer> {
           //
           // First, deliberately: a crash-marked run may still own an issue's
           // execution lock, and both the reattach and reap passes below make
-          // ownership decisions that should see the post-recovery state. It is
+          // ownership decisions that should see the post-recovery state. This
+          // orders passes WITHIN the chain only — it is not a guarantee that no
+          // reap precedes it: the timer enqueue runs ahead of this chain on a
+          // takeover (BLO-49303), so a dispatch-time start-lock reap can come
+          // first. Job liveness and the reservation shields cover that. It is
           // bounded by batch size, and each run is claimed with a durable,
           // expiring lease, so a slow or partly-failing backlog cannot stall
           // startup — whatever is left is picked up next start.
@@ -2102,12 +2106,14 @@ export async function startServer(): Promise<StartedServer> {
         // enqueue below it, a survivor that took the lease ran zero timer
         // checks until the chain drained: ~75 s on the 2026-10-26 drill, ~11
         // min on the 2026-10-24 failover, against a 60 s takeover budget.
-        // Safe beside recovery: `tickTimers` reaches the same `enqueueWakeup`
-        // that every API-driven wake (comment, assignment, webhook) already
-        // calls during recovery — those routes never consulted this gate — and
-        // the chain already runs beside this process's own live runs whenever
-        // it re-wins the lease (see the lease construction above). Everything
-        // left below still waits for recovery, unchanged.
+        // Safe beside recovery: worker-tier work already runs while this gate
+        // is held — the lease-supervised reconcilers further down and
+        // plugin-driven wakes never consult it — and in steady state
+        // `tickTimers` already runs concurrently with the periodic reap. The
+        // chain also runs beside this process's own live runs whenever it
+        // re-wins the lease (see the lease construction above). NOT a
+        // precedent: API-tier wakes, which return at the API-tier fence before
+        // any reap. Everything left below still waits for recovery, unchanged.
         if (heartbeatStartupRecoveryPending) return;
         const sweptRuntimeStatuses = heartbeat.sweepExpiredRuntimeStatuses();
         if (sweptRuntimeStatuses > 0) {
