@@ -15,7 +15,7 @@ through a personal account no agent seat can push to.
 | Package | `paperclip-adapter-opencode-k8s` |
 | Vendored at commit | `133f4c1a65085a6c141aab5aa8818afe51e2689c` |
 | Version at vendor time | `0.2.7` |
-| Current version | `0.2.8-blockcast.1` — see [Versioning](#versioning) |
+| Current version | `0.2.8-blockcast.2` — see [Versioning](#versioning) |
 | Declared license | MIT, in `package.json` only — see the caveat below |
 
 Before this change the image built this package by cloning that repository at a

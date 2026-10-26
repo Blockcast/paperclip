@@ -3639,12 +3639,22 @@ export async function startServer(): Promise<StartedServer> {
       process.exit(process.exitCode ?? 0);
     };
 
-    process.once("SIGINT", () => {
-      void shutdown("SIGINT");
-    });
-    process.once("SIGTERM", () => {
-      void shutdown("SIGTERM");
-    });
+    // `on`, not `once`, plus a guard (BLO-49139). With `once`, a library that
+    // re-raises the signal finds no listener left and the default action kills
+    // the process mid-drain. The vendored k8s adapters did exactly that, so the
+    // worker never got past the first await of this handler.
+    let shutdownStarted = false;
+    const onShutdownSignal = (signal: "SIGINT" | "SIGTERM") => {
+      if (shutdownStarted) {
+        writeShutdownBreadcrumb(`${signal} received again; shutdown already in progress`);
+        return;
+      }
+      shutdownStarted = true;
+      void shutdown(signal);
+    };
+    // SIGINT stays `once` so a second Ctrl-C in dev still force-quits.
+    process.once("SIGINT", () => onShutdownSignal("SIGINT"));
+    process.on("SIGTERM", () => onShutdownSignal("SIGTERM"));
   }
 
   return {
