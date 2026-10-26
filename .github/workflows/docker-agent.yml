@@ -357,7 +357,7 @@ jobs:
             --read-only \
             --security-opt no-new-privileges \
             --cap-drop ALL \
-            --tmpfs /paperclip:rw,exec,nosuid,size=16m \
+            --tmpfs /paperclip:rw,exec,nosuid,size=16m,mode=1777 \
             --tmpfs /tmp:rw,noexec,nosuid,size=64m \
             --env HOME=/tmp \
             "$AGENT_IMAGE" \
