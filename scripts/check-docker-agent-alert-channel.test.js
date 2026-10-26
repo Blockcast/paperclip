@@ -402,6 +402,38 @@ test("the control proves the plant is executable before drawing a conclusion fro
   );
 });
 
+// The image ENTRYPOINT runs ahead of the control's `sh -eu -c`. Once mode=1777
+// made /paperclip writable by uid 1000, install_browser_link's own `mkdir -p`
+// started succeeding too, so it now seeds /paperclip/bin/google-chrome as a
+// symlink to $CHROME_BIN before the plant is written. Shell `>` follows
+// symlinks, so the plant would write through to the real browser on the
+// --read-only rootfs (EROFS on CI; reproduced locally as EACCES, rc=2) -- and
+// had it landed, the plant would BE the pinned browser, so control (b) would
+// pass and the step would print CONTROL FAILED against a healthy image.
+test("the control unlinks the entrypoint-seeded symlink before planting", () => {
+  const control = executableLines(getStepBlock(CONTROL_STEP));
+
+  assert.match(
+    control,
+    /^\s*rm -f \/paperclip\/bin\/google-chrome$/m,
+    "the control must `rm -f /paperclip/bin/google-chrome` between the mkdir and the printf: the " +
+      "image entrypoint seeds that path as a symlink to $CHROME_BIN, and `>` follows symlinks, so " +
+      "without the unlink the plant writes through to the read-only rootfs and the step reds at " +
+      "the printf instead of proving anything (PEN-4682)",
+  );
+});
+
+test("dropping the unlink falsifies the plant assertion", () => {
+  const poisoned = workflow.replace("              rm -f /paperclip/bin/google-chrome\n", "");
+  assert.notEqual(poisoned, workflow, "fixture check: the literal must be present to be removed");
+
+  assert.doesNotMatch(
+    executableLines(getStepBlock(CONTROL_STEP, poisoned)),
+    /^\s*rm -f \/paperclip\/bin\/google-chrome$/m,
+    "the guard must read the executed unlink, not the comment above it that names the same path",
+  );
+});
+
 // Scope check. `exec` is needed only where this step writes and runs its own
 // planted script; the plain smoke step plants nothing, so widening its mount
 // would be unearned.

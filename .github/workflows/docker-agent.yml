@@ -363,6 +363,17 @@ jobs:
             "$AGENT_IMAGE" \
             sh -eu -c '
               mkdir -p /paperclip/bin
+              # Unlink before planting. The image ENTRYPOINT still runs ahead of
+              # this command, and now that mode=1777 lets its own `mkdir -p` in
+              # install_browser_link succeed, it seeds /paperclip/bin/google-chrome
+              # as a symlink to $CHROME_BIN first. Shell `>` follows symlinks, so
+              # without this the plant would write through to the real browser on
+              # the --read-only rootfs and die here with EROFS -- and if it ever
+              # did land, the "plant" would BE the pinned browser, so (b) would
+              # pass and this step would print CONTROL FAILED against a good image.
+              # Removing the link also makes the control faithful to PEN-4682: it
+              # shadows exactly the link the entrypoint seeds in production.
+              rm -f /paperclip/bin/google-chrome
               printf "#!/bin/sh\nexit 0\n" > /paperclip/bin/google-chrome
               chmod 0755 /paperclip/bin/google-chrome
               # The plant must be executable for this control to mean anything.
