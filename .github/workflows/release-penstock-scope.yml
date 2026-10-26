@@ -65,6 +65,9 @@ env:
 
 jobs:
   publish:
+    # arc-paperclip-deploy admits this workflow only @refs/heads/master; skip a
+    # branch dispatch explicitly rather than leave it queued for 24h.
+    if: ${{ github.ref == 'refs/heads/master' }}
     runs-on: arc-paperclip-deploy
     # ⚠ THIS IS NOT AN APPROVAL GATE. The environment exists but has NO protection
     # rules, so naming it here changes nothing about who may publish.
