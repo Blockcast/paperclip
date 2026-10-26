@@ -157,7 +157,7 @@ concurrency:
 jobs:
   dispatch:
     if: ${{ github.repository == 'Blockcast/paperclip' }}
-    runs-on: arc-deploy
+    runs-on: arc-paperclip-deploy
     steps:
       - name: Checkout
         id: checkout

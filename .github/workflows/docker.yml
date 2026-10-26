@@ -370,7 +370,7 @@ jobs:
   # authoritative re-check that closes that window.
   guard-pending-deploy:
     if: ${{ github.event_name == 'workflow_dispatch' && vars.PAPERCLIP_CI_DEPLOY == 'true' && github.ref == 'refs/heads/master' }}
-    runs-on: arc-deploy
+    runs-on: arc-paperclip-deploy
     timeout-minutes: 5
     permissions:
       # A job-level `permissions:` block REPLACES the workflow-level one
@@ -408,7 +408,7 @@ jobs:
   guard-pending-deploy-final:
     if: ${{ github.event_name == 'workflow_dispatch' && vars.PAPERCLIP_CI_DEPLOY == 'true' && github.ref == 'refs/heads/master' && needs.build-and-push.result == 'success' && needs.guard-pending-deploy.result == 'success' && needs.guard-pending-deploy.outputs.blocked != 'true' }}
     needs: [build-and-push, guard-pending-deploy]
-    runs-on: arc-deploy
+    runs-on: arc-paperclip-deploy
     timeout-minutes: 5
     permissions:
       # A job-level `permissions:` block REPLACES the workflow-level one
@@ -443,7 +443,7 @@ jobs:
     # that actually closes the eviction window; guard-pending-deploy alone
     # only short-circuits the common case fast.
     needs: [build-and-push, guard-pending-deploy, guard-pending-deploy-final]
-    runs-on: arc-deploy
+    runs-on: arc-paperclip-deploy
     if: ${{ github.event_name == 'workflow_dispatch' && vars.PAPERCLIP_CI_DEPLOY == 'true' && github.ref == 'refs/heads/master' && needs.build-and-push.result == 'success' && needs.guard-pending-deploy.result == 'success' && needs.guard-pending-deploy.outputs.blocked != 'true' && needs.guard-pending-deploy-final.result == 'success' && needs.guard-pending-deploy-final.outputs.blocked != 'true' }}
     environment:
       name: paperclip-production

@@ -342,7 +342,11 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(dockerWorkflow).toContain(
       "buildkit-amd64-${PREFERRED_ORDINAL}.buildkit-amd64-headless.ci.svc.cluster.local",
     );
-    expect(dockerWorkflow.match(/runs-on: arc-deploy/g)).toHaveLength(3);
+    expect(dockerWorkflow.match(/runs-on: arc-paperclip-deploy/g)).toHaveLength(3);
+    // BLO-48929: the deploy lane is the paperclip-only, workflow-restricted
+    // org group `arc-paperclip-deploy`; group-1 `arc-deploy` is unreachable
+    // from paperclip after the group-1 flip.
+    expect(dockerWorkflow).not.toContain("runs-on: arc-deploy");
     expect(dockerWorkflow).toContain(
       "if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}",
     );
