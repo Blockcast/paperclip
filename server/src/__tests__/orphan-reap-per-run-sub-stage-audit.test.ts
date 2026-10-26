@@ -38,7 +38,12 @@ const HEARTBEAT_SOURCE = join(
   fileURLToPath(new URL("../services/heartbeat.ts", import.meta.url)),
 );
 const LOOP_START = "for (const { run, adapterType, adapterConfig } of activeRuns) {";
-const LOOP_END = 'lapOrphanReap("per_run");';
+// Matched WITHOUT the closing paren so the marker survives an added argument
+// (PEN-4783 passes the lap's instant in, so the call now reads
+// `lapOrphanReap("per_run", perRunEndedAt)`). Still pins the call itself, so a
+// rename or deletion fails loudly below rather than matching nothing and making
+// every assertion here vacuously pass.
+const LOOP_END = 'lapOrphanReap("per_run"';
 
 /** Blank out comments so prose mentioning `await` is not read as a call. */
 function stripComments(source: string): string {

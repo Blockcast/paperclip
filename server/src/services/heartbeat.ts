@@ -28232,8 +28232,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // `total`; read the stage counts against `total` before trusting a mean.
     const orphanReapStartedAt = Date.now();
     let orphanReapLapAt = orphanReapStartedAt;
-    const lapOrphanReap = (stage: Parameters<typeof recordOrphanReapStage>[0]) => {
-      const at = Date.now();
+    // PEN-4783: `at` lets a caller close the lap from an instant it already
+    // read. The `per_run` lap needs it because its sub-stage partition is
+    // emitted just before the lap, and the residual is derived by SUBTRACTING
+    // the four buckets from the lap span. Reading the clock a second time here
+    // would put the five histogram observations between the two reads, so the
+    // lap would come back systematically LONGER than its own parts and the
+    // residual would silently under-report the difference -- measured at ~1 ms
+    // per sweep, which is small but makes `sum(sub_stages) == per_run` false
+    // where this split's whole contract is that it is true. Defaults to now,
+    // so every other call site is unchanged.
+    const lapOrphanReap = (stage: Parameters<typeof recordOrphanReapStage>[0], at = Date.now()) => {
       recordOrphanReapStage(stage, (at - orphanReapLapAt) / 1000);
       orphanReapLapAt = at;
     };
@@ -29528,7 +29537,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // numbers reading this bucket exists to prevent. It is deliberately NOT optional -- without
     // it, four small numbers would read as "nothing is slow" while the time sat
     // somewhere unnamed.
-    const perRunElapsedMs = Date.now() - orphanReapLapAt;
+    // ONE clock read, shared by the residual below and the lap at the end of
+    // this block -- see `lapOrphanReap`'s `at` parameter for why.
+    const perRunEndedAt = Date.now();
+    const perRunElapsedMs = perRunEndedAt - orphanReapLapAt;
     recordOrphanReapStage("per_run_liveness", perRunLivenessMs / 1000);
     recordOrphanReapStage("per_run_finalize", perRunFinalizeMs / 1000);
     recordOrphanReapStage("per_run_dispatch", perRunDispatchMs / 1000);
@@ -29540,7 +29552,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         perRunElapsedMs - perRunLivenessMs - perRunFinalizeMs - perRunDispatchMs - perRunCleanupMs,
       ) / 1000,
     );
-    lapOrphanReap("per_run");
+    lapOrphanReap("per_run", perRunEndedAt);
     recordOrphanReapStage("total", (Date.now() - orphanReapStartedAt) / 1000);
     if (reaped.length > 0) {
       logger.warn({ reapedCount: reaped.length, runIds: reaped }, "reaped orphaned heartbeat runs");
