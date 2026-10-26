@@ -160,7 +160,7 @@ import {
 } from "./stranded-attendance-prefetch.js";
 import {
   rotateStrandedCandidates,
-  STRANDED_SWEEP_BUDGET_MS,
+  runBudgetedStrandedLoop,
   type StrandedSweepKey,
 } from "./stranded-sweep-budget.js";
 import {
@@ -11521,21 +11521,9 @@ export function recoveryService(
       }
     };
 
-    const loopStartedAt = Date.now();
-    strandedSweepResumeAfter = null;
-    for (const issue of candidates) {
-      if (opts?.shouldStop?.()) {
-        scanned.stoppedForShutdown = true;
-        break;
-      }
-      // BLO-48950: bound the loop against DB latency. Checked before each candidate, so
-      // the one in flight always finishes; the rest are picked up by the next pass.
-      if (Date.now() - loopStartedAt > STRANDED_SWEEP_BUDGET_MS) {
-        result.budgetExhausted = true;
-        break;
-      }
-      strandedSweepResumeAfter = issue;
-      result.candidatesReached += 1;
+    // BLO-48950: bound the loop against DB latency; the candidates it does not reach are
+    // picked up by the next pass. See `runBudgetedStrandedLoop`.
+    const strandedLoop = await runBudgetedStrandedLoop(candidates, async (issue) => {
       try {
         await passTimer.candidate(issue.id, () => reconcileStrandedCandidate(issue));
       } catch (err) {
@@ -11564,8 +11552,11 @@ export function recoveryService(
           "stranded assigned issue reconciliation failed; continuing with remaining candidates",
         );
       }
-    }
-    if (!result.budgetExhausted) strandedSweepResumeAfter = null;
+    }, undefined, undefined, opts?.shouldStop);
+    if (strandedLoop.stopped) scanned.stoppedForShutdown = true;
+    result.candidatesReached = strandedLoop.reached;
+    result.budgetExhausted = strandedLoop.budgetExhausted;
+    strandedSweepResumeAfter = strandedLoop.resumeAfter;
 
     // PEN-3636: timed as its own phase because it is a SECOND sequential
     // per-candidate loop inside this same function, and its population is not
