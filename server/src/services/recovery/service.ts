@@ -159,6 +159,11 @@ import {
   type StrandedAttendanceWindow,
 } from "./stranded-attendance-prefetch.js";
 import {
+  rotateStrandedCandidates,
+  STRANDED_SWEEP_BUDGET_MS,
+  type StrandedSweepKey,
+} from "./stranded-sweep-budget.js";
+import {
   resolveStrandedEscalationStatus,
   shouldReuseStrandedRecoveryAction,
 } from "./stranded-escalation-status.js";
@@ -8322,6 +8327,9 @@ export function recoveryService(
   // the first grep above) and is not worth it for a diagnostic-accuracy gain until the
   // totals stop being merely indicative.
   let activePassTimer: PassTimer | null = null;
+  // BLO-48950: where the next stranded pass resumes after one that ran out of budget.
+  // Null after a pass that reached every candidate. See `stranded-sweep-budget.ts`.
+  let strandedSweepResumeAfter: StrandedSweepKey | null = null;
 
   /**
    * Time one per-candidate round-trip against whichever pass is in flight, if any.
@@ -9653,7 +9661,7 @@ export function recoveryService(
       dependencyWaitEscalationSuppressedDependencyReadyTotal;
     const dependencyWaitEscalationSuppressedUnclassifiedAtSweepStart =
       dependencyWaitEscalationSuppressedUnclassifiedTotal;
-    const candidates = await passTimer.time("candidateQuery", () => db
+    const orderedCandidates = await passTimer.time("candidateQuery", () => db
       .select()
       .from(issues)
       .where(
@@ -9674,6 +9682,9 @@ export function recoveryService(
         ),
       )
       .orderBy(asc(issues.companyId), asc(issues.assigneeAgentId), asc(issues.createdAt), asc(issues.id)));
+    // BLO-48950: start after the candidate the previous, budget-truncated pass reached
+    // last, so a run of slow passes still covers the whole set.
+    const candidates = rotateStrandedCandidates(orderedCandidates, strandedSweepResumeAfter);
     // PEN-3636: published to the wrapper immediately, so a pass that throws later
     // still reports the population it was working against. Read only by the
     // wrapper's `finally`; nothing branches on it.
@@ -9739,6 +9750,10 @@ export function recoveryService(
       // sweep that would previously have aborted at that issue and silently dropped
       // every candidate ordered after it.
       reconcileErrors: 0,
+      // BLO-48950: true when the candidate loop stopped at `STRANDED_SWEEP_BUDGET_MS`;
+      // `candidatesReached` is then less than `candidatesScanned`.
+      budgetExhausted: false,
+      candidatesReached: 0,
       skipped: 0,
       // PEN-3636 — the pass's own cost, which the funnel never reported.
       //
@@ -11506,11 +11521,21 @@ export function recoveryService(
       }
     };
 
+    const loopStartedAt = Date.now();
+    strandedSweepResumeAfter = null;
     for (const issue of candidates) {
       if (opts?.shouldStop?.()) {
         scanned.stoppedForShutdown = true;
         break;
       }
+      // BLO-48950: bound the loop against DB latency. Checked before each candidate, so
+      // the one in flight always finishes; the rest are picked up by the next pass.
+      if (Date.now() - loopStartedAt > STRANDED_SWEEP_BUDGET_MS) {
+        result.budgetExhausted = true;
+        break;
+      }
+      strandedSweepResumeAfter = issue;
+      result.candidatesReached += 1;
       try {
         await passTimer.candidate(issue.id, () => reconcileStrandedCandidate(issue));
       } catch (err) {
@@ -11540,6 +11565,7 @@ export function recoveryService(
         );
       }
     }
+    if (!result.budgetExhausted) strandedSweepResumeAfter = null;
 
     // PEN-3636: timed as its own phase because it is a SECOND sequential
     // per-candidate loop inside this same function, and its population is not
@@ -11629,6 +11655,8 @@ export function recoveryService(
     logger.info(
       {
         candidatesScanned: result.candidatesScanned,
+        candidatesReached: result.candidatesReached,
+        budgetExhausted: result.budgetExhausted,
         agentInvokabilityEvaluated: result.agentInvokabilityEvaluated,
         pauseHoldPrefilterLiveReads: result.pauseHoldPrefilterLiveReads,
         pauseHoldPrefilterMemoHits: result.pauseHoldPrefilterMemoHits,
