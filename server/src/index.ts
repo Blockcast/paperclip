@@ -1966,7 +1966,7 @@ export async function startServer(): Promise<StartedServer> {
         if (heartbeatSchedulerStopped) return;
 
         // All four gauge publishers are registered above BOTH gates — the
-        // startup-recovery gate immediately below and the scheduling-suppression
+        // startup-recovery gate further below and the scheduling-suppression
         // gate further down (BLO-31335, extended by BLO-21526).
         //
         // The startup-recovery gate matters as much as the suppression one, and
@@ -2057,7 +2057,6 @@ export async function startServer(): Promise<StartedServer> {
             logger.error({ err }, "periodic crash-recovery candidate-index gauge publication failed");
           }));
 
-        if (heartbeatStartupRecoveryPending) return;
         // BLO-43292: everything below this line enqueues runs or reconciles
         // shared rows, so exactly one process in the estate may reach it.
         //
@@ -2074,14 +2073,6 @@ export async function startServer(): Promise<StartedServer> {
         // access, so it cannot be starved by the pool exhaustion that stops a
         // tick reaching anything further down.
         if (schedulerLease && !schedulerLease.shouldRunLoop()) return;
-        const sweptRuntimeStatuses = heartbeat.sweepExpiredRuntimeStatuses();
-        if (sweptRuntimeStatuses > 0) {
-          logger.info(
-            { swept: sweptRuntimeStatuses },
-            "heartbeat runtime-status sweeper cleared expired entries",
-          );
-        }
-
         const timerSuppression = await heartbeat.resolveSchedulingSuppression();
         // Re-check AFTER the await, not just before it (BLO-20822). This
         // callback is handed to `setInterval` and is not itself registered with
@@ -2103,6 +2094,27 @@ export async function startServer(): Promise<StartedServer> {
             .catch((err) => {
               logger.error({ err }, "heartbeat timer tick failed");
             }));
+        }
+
+        // BLO-49303: the timer enqueue runs AHEAD of the recovery gate. That
+        // gate is held for the whole one-shot recovery chain, which BLO-45212
+        // runs on every lease ACQUISITION, not only at boot — so with the
+        // enqueue below it, a survivor that took the lease ran zero timer
+        // checks until the chain drained: ~75 s on the 2026-10-26 drill, ~11
+        // min on the 2026-10-24 failover, against a 60 s takeover budget.
+        // Safe beside recovery: `tickTimers` reaches the same `enqueueWakeup`
+        // that every API-driven wake (comment, assignment, webhook) already
+        // calls during recovery — those routes never consulted this gate — and
+        // the chain already runs beside this process's own live runs whenever
+        // it re-wins the lease (see the lease construction above). Everything
+        // left below still waits for recovery, unchanged.
+        if (heartbeatStartupRecoveryPending) return;
+        const sweptRuntimeStatuses = heartbeat.sweepExpiredRuntimeStatuses();
+        if (sweptRuntimeStatuses > 0) {
+          logger.info(
+            { swept: sweptRuntimeStatuses },
+            "heartbeat runtime-status sweeper cleared expired entries",
+          );
         }
 
         if (heartbeatSchedulerStopped) return;

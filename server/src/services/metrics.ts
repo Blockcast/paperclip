@@ -952,15 +952,17 @@ export const HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC =
  *   2. every candidate was filtered out before the counter (above);
  *   3. global scheduling suppression — the caller does not enter `tickTimers`
  *      at all (`server/src/index.ts`), so nothing is recorded;
- *   4. startup recovery is still pending (`heartbeatStartupRecoveryPending`);
+ *   4. this process is not the `heartbeat-timer` lease holder (a follower
+ *      returns before `tickTimers`, BLO-43292). Startup/takeover recovery
+ *      (`heartbeatStartupRecoveryPending`) is no longer a cause: since
+ *      BLO-49303 the timer enqueue runs ahead of that gate;
  *   5. the shutdown drain has begun (`heartbeatSchedulerStopped`);
  *   6. the pass completed but {@link recordHeartbeatTimerTick} rejected it as
  *      malformed and dropped **both** halves — see its own doc comment. This
  *      should never happen (both inputs are integer accumulators) and is the
  *      only cause of the six that emits a `logger.warn` naming the bad field,
  *      so the worker log settles it outright.
- * Only (1) warrants a restart, and note the trap: restarting for (4) re-enters
- * (4). Rule out 2–6 first.
+ * Only (1) warrants a restart. Rule out 2–6 first.
  *
  * {@link HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC} narrows a zero `checked`
  * for the first time since PEN-4737, but does not resolve it alone. A zero
