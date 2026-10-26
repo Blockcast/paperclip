@@ -6,6 +6,12 @@ commit that added this file, and the two live-seat readings in
 ["Measured confirmation"](#measured-confirmation) were taken against the
 Penstock instance on 2026-10-26. Nothing here is aspirational.
 
+Code is cited **by symbol name, never by line number**. The first draft of
+this file carried line anchors and five of them did not point at what they
+named, already at the commit that added the file — that same commit inserted
+the explanatory comments above those symbols and pushed them down. Grep for
+the symbol instead.
+
 This document exists because `adapterConfig` and `runtimeConfig` have now been
 the subject of four incidents in the `PEN-2370` door series — `PEN-2747`
 (door #8), `PEN-2839` (door #10, the same two fields returned **unredacted**),
@@ -24,7 +30,7 @@ here so the fifth reader does not have to.
 
 ## Why "never a stored grant" is the load-bearing part
 
-`permissionForAction` (`services/authorization.ts:175`) maps an action to the
+`permissionForAction` (`services/authorization.ts`) maps an action to the
 `permission_key` that the generic grant fallback at the bottom of `decideBase`
 will look up. For `agent_config:read` it returns `null`:
 
@@ -46,14 +52,14 @@ sent `PEN-4775` looking for an implication rule keyed on `role` or on org-root.
 
 | Order | Where | Condition | Result |
 | --- | --- | --- | --- |
-| 1 | `decideLowTrustAccess` (`:1181`, action list at `:1217`) | actor resolves to the low-trust review preset | **deny** `deny_low_trust_boundary`, unconditionally — preempts both paths below |
-| 2 | `decideBase` (`:2794`) | `resource.type === "agent"` **and** `resource.agentId === actorAgentId` | **allow** `allow_self` |
-| 3 | `decideWithAgentConfigReadGrant` (`:1957`) | actor holds `agents:configure`, else `agents:suggest-changes` | **allow** `allow_explicit_grant` |
+| 1 | `decideLowTrustAccess` | actor resolves to the low-trust review preset | **deny** `deny_low_trust_boundary`, unconditionally — preempts both paths below |
+| 2 | `decideBase`, its `if (input.action === "agent_config:read")` branch | `resource.type === "agent"` **and** `resource.agentId === actorAgentId` | **allow** `allow_self` |
+| 3 | `decideWithAgentConfigReadGrant`, called from that same branch | actor holds `agents:configure`, else `agents:suggest-changes` | **allow** `allow_explicit_grant` |
 
 A **board** (human) actor takes a different door entirely — company membership
-is sufficient, at `routes/agents.ts:1014`
-(`actorCanReadConfigurationsForCompany`) and its shared twin
-`routes/authz.ts:189` (`actorCanReadAgentConfig`).
+is sufficient, via `actorCanReadConfigurationsForCompany`
+(`routes/agents.ts`) and its shared twin `actorCanReadAgentConfig`
+(`routes/authz.ts`).
 
 Path 3 is a read projection keyed on two *write* permissions. That reads as a
 design smell and `PEN-4775` demoted it as a hypothesis for exactly that reason,
@@ -64,8 +70,8 @@ authority**, in both the direct and the suggest tier.
 
 ## What does NOT imply it
 
-`decideWithAgentConfigReadGrant` delegates to `decidePrincipalGrant`
-(`:902`), and that function consults exactly two things: an **active
+`decideWithAgentConfigReadGrant` delegates to `decidePrincipalGrant`,
+and that function consults exactly two things: an **active
 membership** row, and a stored **grant** row for the named `permission_key`
 (plus a scope check). It never loads `role`, `reportsTo`, or `permissions`.
 Therefore none of the following gates this action, and a difference in them
@@ -78,9 +84,9 @@ between two seats is a coincidence rather than a cause:
   consulted for `skill_config:update`, never for this action
 
 The one place in the file where `role === "ceo"` **does** confer authority
-without a grant is `canCreateAgentsLegacy` (`:210`), and its reach is three
+without a grant is `canCreateAgentsLegacy`, and its reach is three
 actions — `agents:create`, `tasks:manage_active_checkouts`,
-`tasks:override_execution_stage` (`:2863`). It sits *below* the
+`tasks:override_execution_stage`. It sits *below* the
 `agent_config:read` branch in `decideBase`, so that branch has already
 returned before control could reach it. A CEO seat that can read peer config
 does so because it holds `agents:configure`, not because it is the CEO.
@@ -113,14 +119,14 @@ hold the implication**, with the subject in the same company:
 
 The axis is **(viewer × subject × route)**, not any one of the three. The
 detail route asks the per-subject question (`canReadSensitiveDetail = isSelf ?
-true : ...`, `routes/agents.ts:3005`); the list route asked the company-wide
+true : ...` in `routes/agents.ts`); the list route asked the company-wide
 question once and applied the answer to every row, including the viewer's own.
 
 **Masked is not the same as dropped, and only one of them is at issue here.**
 On an allowed read the secrets are present-and-masked — `env` values as `***`,
 an MCP `Authorization` header as `***REDACTED***` — by `redactAgentSecrets`
-(`agent-redaction.ts:137`). The restricted projection
-(`redactForRestrictedAgentView`, `routes/agents.ts:2250`) does not redact; it
+(`agent-redaction.ts`). The restricted projection
+(`redactForRestrictedAgentView`, `routes/agents.ts`) does not redact; it
 replaces both objects wholesale. `PEN-2839` was a failure of the first
 mechanism, `PEN-4775` of the second, and a fix to either is not a fix to the
 other.
