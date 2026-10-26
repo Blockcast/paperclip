@@ -61,3 +61,33 @@ export function rotateStrandedCandidates<T extends StrandedSweepKey>(
   if (start <= 0) return [...candidates];
   return [...candidates.slice(start), ...candidates.slice(0, start)];
 }
+
+/**
+ * The budgeted candidate loop itself, so its two load-bearing lines -- the `break` and the
+ * cursor reset -- are under test rather than only inside `service.ts`. `visit` must not
+ * throw; the service wraps its per-candidate error boundary inside it.
+ *
+ * `resumeAfter` is the last candidate reached when the budget stopped the loop, and null
+ * when every candidate was reached, so a clean pass sends the next one back to the head.
+ */
+export async function runBudgetedStrandedLoop<T extends StrandedSweepKey>(
+  candidates: readonly T[],
+  visit: (candidate: T) => Promise<void>,
+  budgetMs: number = STRANDED_SWEEP_BUDGET_MS,
+  now: () => number = Date.now,
+  shouldStop?: () => boolean,
+): Promise<{ reached: number; budgetExhausted: boolean; stopped: boolean; resumeAfter: T | null }> {
+  const startedAt = now();
+  let reached = 0;
+  let last: T | null = null;
+  for (const candidate of candidates) {
+    // Shutdown wins over the budget; the cursor is in-memory, so there is nothing to keep.
+    if (shouldStop?.()) return { reached, budgetExhausted: false, stopped: true, resumeAfter: null };
+    // Checked before each candidate, so the one in flight always finishes.
+    if (now() - startedAt > budgetMs) return { reached, budgetExhausted: true, stopped: false, resumeAfter: last };
+    last = candidate;
+    reached += 1;
+    await visit(candidate);
+  }
+  return { reached, budgetExhausted: false, stopped: false, resumeAfter: null };
+}
