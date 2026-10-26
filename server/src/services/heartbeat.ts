@@ -28714,6 +28714,105 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     lapOrphanReap("pod_cleanup");
+
+    // PEN-4781: sub-stage attribution for the `per_run` lap below. Four named
+    // buckets plus a residual, forming an EXHAUSTIVE partition of the loop --
+    // see KNOWN_ORPHAN_REAP_STAGES for why a non-exhaustive split would be
+    // worse than no split at all.
+    //
+    // Accumulators, not laps. The buckets interleave in source order (a lease
+    // release sits between two finalize steps, for instance), so a moving lap
+    // cursor could not express this partition; and accumulating lets the five
+    // observations be emitted ONCE per sweep next to `lapOrphanReap("per_run")`,
+    // which is what keeps each sub-stage's `_count` equal to `per_run`'s and so
+    // keeps a p99 comparison between them meaningful. A sweep that throws emits
+    // none of them and no `per_run` either, exactly as it already emits no
+    // `total` -- the stage counts stay readable against `total` as before.
+    //
+    // This is a WRAPPING change only: no new awaits, no reordering, no change
+    // to what any call does. Each `timed*` alias below is the same function with
+    // the same arguments, timed into a bucket.
+    let perRunLivenessMs = 0;
+    let perRunFinalizeMs = 0;
+    let perRunDispatchMs = 0;
+    let perRunCleanupMs = 0;
+    type PerRunBucket = "liveness" | "finalize" | "dispatch" | "cleanup";
+    // Records from a `finally` for the same reason `timeOrphanReapCall` does:
+    // the call most worth attributing is the one that threw.
+    const timePerRun = async <T>(bucket: PerRunBucket, fn: () => Promise<T>): Promise<T> => {
+      const startedAt = Date.now();
+      try {
+        return await fn();
+      } finally {
+        const elapsedMs = Date.now() - startedAt;
+        if (bucket === "liveness") perRunLivenessMs += elapsedMs;
+        else if (bucket === "finalize") perRunFinalizeMs += elapsedMs;
+        else if (bucket === "dispatch") perRunDispatchMs += elapsedMs;
+        else perRunCleanupMs += elapsedMs;
+      }
+    };
+    const timedPerRunCall = <A extends readonly unknown[], R>(
+      bucket: PerRunBucket,
+      fn: (...args: A) => Promise<R>,
+    ) => (...args: A): Promise<R> => timePerRun(bucket, () => fn(...args));
+
+    // `liveness`: read-only probes that ask whether this run's Job/pod is still
+    // alive. Mixed kube and Postgres on purpose -- that mix is the bucket's
+    // value, because it is the one bucket that moves when kube is the fault.
+    const timedHasAdapterInvocationEvent = timedPerRunCall("liveness", hasAdapterInvocationEvent);
+    const timedResolveExternalLifecycleJobLiveness =
+      timedPerRunCall("liveness", resolveExternalLifecycleJobLiveness);
+    const timedShouldDeferHardStaleKillForBusyPod =
+      timedPerRunCall("liveness", shouldDeferHardStaleKillForBusyPod);
+    const timedReadAgentJobRunStatusByName = timedPerRunCall("liveness", readAgentJobRunStatusByName);
+    const timedIsTerminalExternalJobConsumedByOwner =
+      timedPerRunCall("liveness", isTerminalExternalJobConsumedByOwner);
+
+    // `finalize`: committing a terminal verdict for the run. The five
+    // `finalizeExternalLifecycleTerminalRun` call sites AND the hand-rolled
+    // process_lost mint below them, which is the same act written inline --
+    // splitting those two apart would put half of one decision in each of two
+    // buckets and make neither readable.
+    const timedFinalizeExternalLifecycleTerminalRun =
+      timedPerRunCall("finalize", finalizeExternalLifecycleTerminalRun);
+    const timedSetRunStatus = timedPerRunCall("finalize", setRunStatus);
+    const timedSetRunStatusIfRunning = timedPerRunCall("finalize", setRunStatusIfRunning);
+    const timedSetWakeupStatus = timedPerRunCall("finalize", setWakeupStatus);
+    const timedClassifyAndPersistRunLiveness =
+      timedPerRunCall("finalize", classifyAndPersistRunLiveness);
+    const timedFinalizeAgentStatus = timedPerRunCall("finalize", finalizeAgentStatus);
+    const timedTerminateHeartbeatRunProcess =
+      timedPerRunCall("finalize", terminateHeartbeatRunProcess);
+    const timedDismissStaleEvaluationOnRunTerminated = timedPerRunCall(
+      "finalize",
+      (input: Parameters<typeof recovery.dismissStaleEvaluationOnRunTerminated>[0]) =>
+        recovery.dismissStaleEvaluationOnRunTerminated(input),
+    );
+    const timedFinalizeRunEvent = timedPerRunCall("finalize", appendRunEvent);
+    const timedFinalizeNextRunEventSeq = timedPerRunCall("finalize", nextRunEventSeq);
+
+    // `dispatch`: handing the freed slot to the next run. Separated from
+    // `cleanup` because this is the only bucket that can re-enter the heartbeat.
+    const timedReleaseIssueExecutionAndPromote =
+      timedPerRunCall("dispatch", releaseIssueExecutionAndPromote);
+    const timedStartNextQueuedRunForAgent =
+      timedPerRunCall("dispatch", startNextQueuedRunForAgent);
+
+    // `cleanup`: releasing what the dead run held and scheduling its retry.
+    const timedReleaseEnvironmentLeasesForRun =
+      timedPerRunCall("cleanup", releaseEnvironmentLeasesForRun);
+    const timedReleaseLeasesForRun = timedPerRunCall(
+      "cleanup",
+      (runId: string, status: Parameters<typeof environmentsSvc.releaseLeasesForRun>[1]) =>
+        environmentsSvc.releaseLeasesForRun(runId, status),
+    );
+    const timedGetAgent = timedPerRunCall("cleanup", getAgent);
+    const timedEnqueueProcessLossRetry = timedPerRunCall("cleanup", enqueueProcessLossRetry);
+    const timedScheduleInteractionContinuationInfrastructureRetryIfEligible =
+      timedPerRunCall("cleanup", scheduleInteractionContinuationInfrastructureRetryIfEligible);
+    const timedCleanupRunEvent = timedPerRunCall("cleanup", appendRunEvent);
+    const timedCleanupNextRunEventSeq = timedPerRunCall("cleanup", nextRunEventSeq);
+
     for (const { run, adapterType, adapterConfig } of activeRuns) {
       if (runningProcesses.has(run.id)) continue;
       if (ambiguousExternalRunIds.has(run.id)) continue;
@@ -28736,7 +28835,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // the silence/Job-liveness check below decide for external lifecycle.
       if (activeRunExecutions.has(run.id) && !externalLifecycleRun) continue;
       const externalLifecycleStarted = externalLifecycleRun
-        ? await hasAdapterInvocationEvent(run.id)
+        ? await timedHasAdapterInvocationEvent(run.id)
         : false;
       const externalLifecyclePreAdapter = externalLifecycleRun && !externalLifecycleStarted;
       // BLO-16181: retain the pre-adapter Job liveness the loop resolves below so
@@ -28840,7 +28939,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // kube-unavailable degraded path still reap exactly as before. This
         // mirrors the 2026-05-23 guard that already protects live-but-quiet
         // STARTED runs below.
-        const preAdapterLiveness = await resolveExternalLifecycleJobLiveness(
+        const preAdapterLiveness = await timedResolveExternalLifecycleJobLiveness(
           run,
           jobRunStatuses,
           liveJobRunIds,
@@ -28860,8 +28959,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             // BLO-20251: a pre-adapter run is still doing real work during
             // workspace setup (repo clone, dependency install). Spare it while
             // its pod is demonstrably busy.
-            if (await shouldDeferHardStaleKillForBusyPod(run, now)) continue;
-            const finalized = await finalizeExternalLifecycleTerminalRun({
+            if (await timedShouldDeferHardStaleKillForBusyPod(run, now)) continue;
+            const finalized = await timedFinalizeExternalLifecycleTerminalRun({
               run,
               adapterType,
               adapterConfig,
@@ -28893,7 +28992,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           let jobStatus = jobRunStatuses.get(run.id) ?? null;
           const persistedJobName = run.externalRunId?.trim() || null;
           if (!jobStatus && persistedJobName) {
-            const exactJobStatus = await readAgentJobRunStatusByName(persistedJobName);
+            const exactJobStatus = await timedReadAgentJobRunStatusByName(persistedJobName);
             if (exactJobStatus?.phase === "missing") {
               confirmedMissingExternalJob = true;
             } else if (exactJobStatus) {
@@ -28921,7 +29020,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             // treating the terminal Job as authoritative.
             if (
               replacementPendingRunIds.has(run.id) ||
-              await isTerminalExternalJobConsumedByOwner(run.id, jobStatus, now)
+              await timedIsTerminalExternalJobConsumedByOwner(run.id, jobStatus, now)
             ) {
               logger.debug(
                 { runId: run.id, jobName: jobStatus.name ?? persistedJobName, jobPhase: jobStatus.phase },
@@ -28929,7 +29028,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               );
               continue;
             }
-            const finalized = await finalizeExternalLifecycleTerminalRun({
+            const finalized = await timedFinalizeExternalLifecycleTerminalRun({
               run,
               adapterType,
               adapterConfig,
@@ -28959,7 +29058,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 || !confirmedMissingExternalJob
               )
             ) continue;
-            const finalized = await finalizeExternalLifecycleTerminalRun({
+            const finalized = await timedFinalizeExternalLifecycleTerminalRun({
               run,
               adapterType,
               adapterConfig,
@@ -28983,8 +29082,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             // BLO-20251: silence here may just be a long Bash tool call
             // (dependency install, test suite, image build). Spare the run
             // while its pod is demonstrably burning CPU.
-            if (await shouldDeferHardStaleKillForBusyPod(run, now)) continue;
-            const finalized = await finalizeExternalLifecycleTerminalRun({
+            if (await timedShouldDeferHardStaleKillForBusyPod(run, now)) continue;
+            const finalized = await timedFinalizeExternalLifecycleTerminalRun({
               run,
               adapterType,
               adapterConfig,
@@ -29027,8 +29126,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               // BLO-20251: same deferral as the rich-status path above — the
               // snapshot says the Job is alive, so a busy pod means a live
               // subprocess rather than a wedge.
-              if (await shouldDeferHardStaleKillForBusyPod(run, now)) continue;
-              const finalized = await finalizeExternalLifecycleTerminalRun({
+              if (await timedShouldDeferHardStaleKillForBusyPod(run, now)) continue;
+              const finalized = await timedFinalizeExternalLifecycleTerminalRun({
                 run,
                 adapterType,
                 adapterConfig,
@@ -29078,12 +29177,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (processPidAlive) {
         if (run.errorCode !== DETACHED_PROCESS_ERROR_CODE) {
           const detachedMessage = `Lost in-memory process handle, but child pid ${run.processPid} is still alive`;
-          const detachedRun = await setRunStatus(run.id, "running", {
+          const detachedRun = await timedSetRunStatus(run.id, "running", {
             error: detachedMessage,
             errorCode: DETACHED_PROCESS_ERROR_CODE,
           });
           if (detachedRun) {
-            await appendRunEvent(detachedRun, await nextRunEventSeq(detachedRun.id), {
+            await timedFinalizeRunEvent(detachedRun, await timedFinalizeNextRunEventSeq(detachedRun.id), {
               eventType: "lifecycle",
               stream: "system",
               level: "warn",
@@ -29100,7 +29199,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       let descendantOnlyCleanup = false;
       if (processGroupAlive) {
         descendantOnlyCleanup = true;
-        await terminateHeartbeatRunProcess({
+        await timedTerminateHeartbeatRunProcess({
           pid: run.processPid,
           processGroupId: run.processGroupId,
         });
@@ -29227,7 +29326,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // once the mint is committed (so a failed/aborted setRunStatus never
       // over-counts). Split by adapter + error-string bucket + the durable
       // classification, all bounded.
-      const finalizedRunWrite = await setRunStatusIfRunning(run.id, "failed", {
+      const finalizedRunWrite = await timedSetRunStatusIfRunning(run.id, "failed", {
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
         errorCode: "process_lost",
         finishedAt: now,
@@ -29263,7 +29362,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       let finalizedRun = finalizedRunWrite.run;
       const terminalDecision = persistedRunTerminalDecision(finalizedRun, "failed");
       const terminalMessage = terminalDecision.error ?? baseMessage;
-      await setWakeupStatus(run.wakeupRequestId, terminalDecision.wakeupStatus, {
+      await timedSetWakeupStatus(run.wakeupRequestId, terminalDecision.wakeupStatus, {
         finishedAt: now,
         error: terminalDecision.error,
       });
@@ -29276,7 +29375,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           classification: processLossCapture.classification,
         });
       }
-      finalizedRun = await classifyAndPersistRunLiveness(finalizedRun, parseObject(finalizedRun.resultJson)) ?? finalizedRun;
+      finalizedRun = await timedClassifyAndPersistRunLiveness(finalizedRun, parseObject(finalizedRun.resultJson)) ?? finalizedRun;
       // PCL-2571: cancel any open stale_active_run_evaluation review for
       // this run now that the silence is explained by process_lost. The
       // detector and the reaper race on the suspicion threshold (~1h);
@@ -29284,7 +29383,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // inbox (11 stuck reviews in 5 days observed 2026-05-25).
       if (!terminalDecision.pipelineStageExited) {
         try {
-          await recovery.dismissStaleEvaluationOnRunTerminated({
+          await timedDismissStaleEvaluationOnRunTerminated({
             companyId: finalizedRun.companyId,
             runId: finalizedRun.id,
             agentId: finalizedRun.agentId,
@@ -29299,14 +29398,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           );
         }
       }
-      await releaseEnvironmentLeasesForRun({
+      await timedReleaseEnvironmentLeasesForRun({
         runId: finalizedRun.id,
         companyId: finalizedRun.companyId,
         agentId: finalizedRun.agentId,
         status: finalizedRun.status,
         failureReason: finalizedRun.error ?? undefined,
       });
-      await finalizeAgentStatus(run.agentId, terminalDecision.outcome, terminalMessage, {
+      await timedFinalizeAgentStatus(run.agentId, terminalDecision.outcome, terminalMessage, {
         errorCode: terminalDecision.errorCode,
         runId: run.id,
       });
@@ -29314,10 +29413,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       let retriedRun: typeof heartbeatRuns.$inferSelect | null = null;
       let retryContinuesContextIssue = false;
       let promotedRunDispatched = false;
-      const retryAgent = await getAgent(run.agentId);
+      const retryAgent = await timedGetAgent(run.agentId);
       if (!terminalDecision.pipelineStageExited && shouldRetry) {
         if (retryAgent) {
-          const retryResult = await enqueueProcessLossRetry(finalizedRun, retryAgent, now);
+          const retryResult = await timedEnqueueProcessLossRetry(finalizedRun, retryAgent, now);
           // `suppressed` keeps the pre-BLO-19722 behaviour of this call site:
           // no retry run, so the issue lock is released below exactly as it was
           // when this function returned null. The difference is only that the
@@ -29327,7 +29426,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             retryResult.kind === "suppressed" ? false : retryResult.retryContinuesContextIssue;
         }
       } else if (!terminalDecision.pipelineStageExited && retryAgent) {
-        const scheduled = await scheduleInteractionContinuationInfrastructureRetryIfEligible(finalizedRun, retryAgent);
+        const scheduled = await timedScheduleInteractionContinuationInfrastructureRetryIfEligible(finalizedRun, retryAgent);
         retriedRun = scheduled?.outcome === "scheduled" ? scheduled.run : null;
         retryContinuesContextIssue = Boolean(
           retriedRun && readNonEmptyString(parseObject(finalizedRun.contextSnapshot).issueId),
@@ -29345,7 +29444,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // `promotedRunDispatched` remains false, which is the same value this call
       // site saw before, so the `startNextQueuedRunForAgent` fallback below is
       // unchanged.
-      promotedRunDispatched = await releaseIssueExecutionAndPromote(finalizedRun, {
+      promotedRunDispatched = await timedReleaseIssueExecutionAndPromote(finalizedRun, {
         suppressPromotion: retryContinuesContextIssue,
       });
       if (!opts?.suppressDispatchAfterReap && !promotedRunDispatched) {
@@ -29366,7 +29465,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // and it would discard this pass's reap summary as well. Dispatch is
         // recoverable: the next `resumeQueuedRuns` re-drives any agent still
         // holding queued runs.
-        await startNextQueuedRunForAgent(run.agentId).catch((error: unknown) => {
+        await timedStartNextQueuedRunForAgent(run.agentId).catch((error: unknown) => {
           logger.warn(
             { error, runId: run.id, agentId: run.agentId },
             "reapOrphanedRuns: post-reap dispatch failed for one agent; continuing the pass",
@@ -29374,7 +29473,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
       }
 
-      await appendRunEvent(finalizedRun, await nextRunEventSeq(finalizedRun.id), {
+      await timedCleanupRunEvent(finalizedRun, await timedCleanupNextRunEventSeq(finalizedRun.id), {
         eventType: "lifecycle",
         stream: "system",
         level: terminalDecision.pipelineStageExited ? "warn" : "error",
@@ -29403,7 +29502,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // environment isn't permanently checked out (ported from upstream
       // v513). Marks lease as `failed` rather than `released` to preserve
       // forensic signal for stuck-lease audits.
-      await environmentsSvc.releaseLeasesForRun(
+      await timedReleaseLeasesForRun(
         run.id,
         terminalDecision.pipelineStageExited ? "released" : "failed",
       );
@@ -29411,6 +29510,36 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     }
 
+    // PEN-4781: emit the `per_run` partition. Read BEFORE `lapOrphanReap`,
+    // which advances the cursor, so this is the identical span that lap is
+    // about to record -- the split is additive and `per_run`'s own history
+    // stays comparable.
+    //
+    // `per_run_other` is the residual: the glue between the timed calls, every
+    // iteration that `continue`d before reaching one, and the loop's own
+    // synchronous work. Clamped at zero only against clock non-monotonicity;
+    // the four buckets are disjoint sub-spans of this lap, so arithmetically it
+    // cannot otherwise go negative. Disjoint because the `timed*` aliases are
+    // local to this sweep and used ONLY at the loop's own call sites -- none of
+    // the wrapped functions calls another through an alias, so no span nests
+    // inside another and nothing is counted twice. That matters more than it
+    // looks: double counting would push the four past the lap and `Math.max`
+    // would clamp the residual to zero, which is precisely the four-small-
+    // numbers reading this bucket exists to prevent. It is deliberately NOT optional -- without
+    // it, four small numbers would read as "nothing is slow" while the time sat
+    // somewhere unnamed.
+    const perRunElapsedMs = Date.now() - orphanReapLapAt;
+    recordOrphanReapStage("per_run_liveness", perRunLivenessMs / 1000);
+    recordOrphanReapStage("per_run_finalize", perRunFinalizeMs / 1000);
+    recordOrphanReapStage("per_run_dispatch", perRunDispatchMs / 1000);
+    recordOrphanReapStage("per_run_cleanup", perRunCleanupMs / 1000);
+    recordOrphanReapStage(
+      "per_run_other",
+      Math.max(
+        0,
+        perRunElapsedMs - perRunLivenessMs - perRunFinalizeMs - perRunDispatchMs - perRunCleanupMs,
+      ) / 1000,
+    );
     lapOrphanReap("per_run");
     recordOrphanReapStage("total", (Date.now() - orphanReapStartedAt) / 1000);
     if (reaped.length > 0) {
