@@ -410,6 +410,11 @@ test("the control proves the plant is executable before drawing a conclusion fro
 // --read-only rootfs (EROFS on CI; reproduced locally as EACCES, rc=2) -- and
 // had it landed, the plant would BE the pinned browser, so control (b) would
 // pass and the step would print CONTROL FAILED against a healthy image.
+// The two executed lines whose ORDER the control depends on, shared so the
+// assertion and its falsification partner cannot drift apart.
+const UNLINK_LINE = /^\s*rm -f \/paperclip\/bin\/google-chrome$/m;
+const PLANT_LINE = /^\s*printf "[^"]*" > \/paperclip\/bin\/google-chrome$/m;
+
 test("the control unlinks the entrypoint-seeded symlink before planting", () => {
   const control = executableLines(getStepBlock(CONTROL_STEP));
 
@@ -420,6 +425,38 @@ test("the control unlinks the entrypoint-seeded symlink before planting", () => 
       "image entrypoint seeds that path as a symlink to $CHROME_BIN, and `>` follows symlinks, so " +
       "without the unlink the plant writes through to the read-only rootfs and the step reds at " +
       "the printf instead of proving anything (PEN-4682)",
+  );
+
+  // Presence is not enough: an unlink that runs AFTER the printf removes the
+  // plant the control is about to rely on, and one that runs after the whole
+  // write-through has already failed removes nothing. Pin the order too.
+  const unlinkAt = control.search(UNLINK_LINE);
+  const plantAt = control.search(PLANT_LINE);
+  assert.ok(plantAt >= 0, "fixture check: the printf plant line must be present to order against");
+  assert.ok(
+    unlinkAt < plantAt,
+    "the unlink must precede the printf: after it, the `>` has already followed the " +
+      "entrypoint's symlink to $CHROME_BIN on the read-only rootfs, and the unlink would then " +
+      "delete the plant control (a) and (b) resolve through (PEN-4682)",
+  );
+});
+
+test("moving the unlink after the plant falsifies the ordering assertion", () => {
+  const poisoned = workflow
+    .replace("              rm -f /paperclip/bin/google-chrome\n", "")
+    .replace(
+      '              printf "#!/bin/sh\\nexit 0\\n" > /paperclip/bin/google-chrome\n',
+      '              printf "#!/bin/sh\\nexit 0\\n" > /paperclip/bin/google-chrome\n' +
+        "              rm -f /paperclip/bin/google-chrome\n",
+    );
+  assert.notEqual(poisoned, workflow, "fixture check: both literals must be present to be swapped");
+
+  const control = executableLines(getStepBlock(CONTROL_STEP, poisoned));
+  assert.match(control, UNLINK_LINE, "fixture check: the moved unlink is still present, just later");
+  assert.ok(
+    control.search(UNLINK_LINE) > control.search(PLANT_LINE),
+    "the guard must read position, not mere presence: a trailing unlink satisfies a " +
+      "presence-only assertion while deleting the plant",
   );
 });
 
