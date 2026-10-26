@@ -1499,7 +1499,21 @@ async function beginAggregateFinalization(
          updated_at = now()
      WHERE company_id = $1
        AND aggregate_key = $2
-       AND phase = 'active'
+       AND (
+         phase = 'active'
+         -- The abandonment backstop, same horizon as beginAggregateFiring's
+         -- (BLO-49264). Without it a held fence on an aggregate that has
+         -- stopped firing could only be reclaimed by a worker restart: the
+         -- firing claim's backstop never runs, because no firing delivery
+         -- arrives. Measured 2026-10-25: 'cancelling' held 2h, every
+         -- resolution retry refused until Alertmanager gave up. Safe by the
+         -- same generation argument: a resumed holder's token is gone, so it
+         -- cannot release, cancel, or finish.
+         OR (
+           phase IN ('firing', 'cancelling', 'finalizing')
+           AND updated_at < now() - ($7::bigint * interval '1 millisecond')
+         )
+       )
        AND NOT EXISTS (
          SELECT 1
          FROM ${members}
@@ -1515,6 +1529,7 @@ async function beginAggregateFinalization(
       token,
       WORKER_INSTANCE_ID,
       WORKER_SLOT,
+      AGGREGATE_FENCE_ABANDONED_BACKSTOP_MS,
     ],
   );
   if (result.rowCount > 0) return { ok: true, token };
@@ -1568,7 +1583,8 @@ async function beginAggregateFinalization(
  *     backstop, and then waits up to {@link AGGREGATE_FENCE_WAIT_BUDGET_MS}
  *     with a FIFO local handoff;
  *   - a finalization claim admitted `active` and nothing else, with no steal,
- *     no backstop, and no wait — one attempt, then throw.
+ *     no backstop, and no wait — one attempt, then throw. (The backstop was
+ *     added later, BLO-49264; see `beginAggregateFinalization`.)
  *
  * So a resolution delivery lost to *any* concurrent delivery on its own
  * aggregate, including the sub-second firing delivery the firing side absorbs

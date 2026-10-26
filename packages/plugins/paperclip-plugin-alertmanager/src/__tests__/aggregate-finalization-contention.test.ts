@@ -591,3 +591,54 @@ describe("PEN-4405 — a resolution refused by its own aggregate", () => {
     ).toBe(soloSleeps);
   });
 });
+
+describe("BLO-49264 — a resolution reclaims a fence held past the abandonment backstop", () => {
+  // 2026-10-25: `HeartbeatRunQueueAgentOldestQueuedHigh` sat in 'cancelling'
+  // for ~2h, 288 resolution retries refused, then Alertmanager gave up. The
+  // firing claim has had this backstop since BLO-32113, but a resolved alert
+  // sends no firing delivery, so only the resolution claim can reach it.
+  const holdFence = (phase: string, ageMinutes: number) =>
+    db.query(
+      `UPDATE ${FENCES}
+          SET phase = $3, resolution_token = 'leaked-resolution-token',
+              owner_instance_id = 'other-instance', owner_slot = 'other-slot',
+              updated_at = now() - ($4::int * interval '1 minute')
+        WHERE company_id = $1 AND aggregate_key = $2`,
+      [COMPANY_ID, AGGREGATE_KEY, phase, ageMinutes],
+    );
+
+  it.each(["cancelling", "finalizing", "firing"])(
+    "reclaims a foreign '%s' fence held past the backstop and finishes the resolution",
+    async (phase) => {
+      const store: SharedState = new Map();
+      await seedSingleMemberAggregate(store);
+      await holdFence(phase, 20);
+
+      const { ctx, logger } = mkCtx(store);
+      await expect(
+        deliver(ctx, payload("resolved"), "req-stale", fastPolicy({ budgetMs: 60 })),
+      ).resolves.toEqual({ accepted: 1 });
+      expect(logger.error).not.toHaveBeenCalled();
+
+      const rows = await db.query<{ phase: string; resolution_token: string | null }>(
+        `SELECT phase, resolution_token FROM ${FENCES} WHERE company_id = $1`,
+        [COMPANY_ID],
+      );
+      expect(rows.rows).toEqual([{ phase: "active", resolution_token: null }]);
+    },
+  );
+
+  it("still refuses the same fence one minute inside the backstop", async () => {
+    const store: SharedState = new Map();
+    await seedSingleMemberAggregate(store);
+    await holdFence("cancelling", 14);
+
+    const { ctx, logger } = mkCtx(store);
+    await expect(
+      deliver(ctx, payload("resolved"), "req-fresh", fastPolicy({ budgetMs: 60 })),
+    ).rejects.toThrow(/could not be processed/);
+    expect(logger.error.mock.calls.map((c) => String(c[0])).join("\n")).toContain(
+      "finalization is held in phase 'cancelling'",
+    );
+  });
+});
