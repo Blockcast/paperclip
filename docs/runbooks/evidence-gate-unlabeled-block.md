@@ -663,24 +663,36 @@ under this decision.
 2. Drop `projectId == null`, then verdicts ≥3d stale vs `completedAt`.
 3. Drop `allDetected == null` **and** `allDetected == []` — both vacuous.
 4. **For every survivor, `GET /api/issues/{key}` and read `workProducts`.** A row
-   with a `type: "pull_request"` work product whose **`metadata.mergedAt` is
-   populated** is **not** a phantom-done, whatever its verdict says. This step is
+   with a `type: "pull_request"` work product that satisfies the merge predicate
+   below is **not** a phantom-done, whatever its verdict says. This step is
    mandatory; on the measured population it rejects 100% of what step 3 hands it.
 
-   ⛔ **Screen on `metadata.mergedAt`, NOT on `metadata.merged` or `status ==
-   "merged"`.** Until 2026-10-26 this step said `metadata.merged == true`, which
-   is the predicate *"Reading the artifact cheaply — and the one field that
-   currently lies"* below forbids with measurement: a mandatory-merge-queue merge
-   arrives as `dequeued`, not `closed`, so the event *carrying* the merge wrote
-   `merged: false` while populating `metadata.mergedAt` from the same payload
-   (PEN-4550; 3 of 6 directly-inspected rows lost that second-granular tie). Read
-   that section for the full mechanism and for the server's own canonical
-   predicate, `pullRequestHasMerged`. The old wording failed toward **escalating
-   a correctly-closed row**, which is the direction this whole screen exists to
-   prevent. (PEN-4813)
+   ⛔ **Merged = `metadata.merged == true` OR `metadata.mergedAt` populated.
+   Never read `merged: false`, or `status != "merged"`, as evidence that a PR did
+   not merge.** Write it as that disjunction and nothing narrower: it is the
+   server's own canonical predicate, `pullRequestHasMerged` in
+   `server/src/services/pull-request-work-products.ts` (`prMerged === true ||
+   prMergedAt` non-empty). **Both arms are load-bearing, in opposite
+   directions** — drop either and you escalate a row whose PR genuinely merged:
 
-   ⛔⛔ **`workProducts` is an ABSENT KEY on the list projection — this step only
-   works off the SINGLE surface named above.** The paging recipe earlier in this
+   | row shape | arm that saves it | how it arises |
+   |---|---|---|
+   | `merged: false`, `mergedAt` set | `mergedAt` | a pre-PEN-4550 queue merge. GitHub delivers a mandatory-queue merge as `dequeued`, not `closed`, so the event *carrying* the merge wrote `merged: false` while populating `mergedAt` from the same payload; 3 of 6 directly-inspected rows lost that second-granular tie |
+   | `merged: true`, `mergedAt` null | `merged` | any writer that had no `merged_at` to pass — a hand-written `POST /api/issues/{key}/work-products` (`metadata` is `.passthrough()`, so the pair is caller-supplied and unvalidated) or a backfill |
+
+   This step has now been wrong in **both** directions: until 2026-10-26 it said
+   `metadata.merged == true` alone, dropping the first row shape, and the first
+   correction said `metadata.mergedAt` alone, dropping the second. Each
+   single-arm form fails toward **escalating a correctly-closed row**, which is
+   the direction this whole screen exists to prevent. For the mechanism and the
+   measurements, see *"Reading the artifact cheaply — and the one field that
+   currently lies"* below, which owns this rule. (PEN-4813)
+
+   ⛔⛔ **`workProducts` is an ABSENT KEY on the list projection — this step
+   only works off a PER-ISSUE surface.** Either `GET /api/issues/{key}` or the
+   narrower `GET /api/issues/{key}/work-products` returns these rows; the latter
+   is the cheaper call when the work products are all you need. What never
+   carries them is the *list* projection. The paging recipe earlier in this
    document builds the candidate set from
    `GET /api/companies/{id}/issues?status=done&limit=1000`, and that projection
    does not carry `workProducts` at all: measured present on **0 / 600** `done`
@@ -943,12 +955,23 @@ first and treat the verdict as a hint about *where* to look, not *whether* to.
 > block). Screen as though any queue merge could be wrong, because the row does
 > not record which side of that coin it landed on.
 >
-> **Screen on `metadata.mergedAt` being populated.** That is not a workaround;
-> it is the server's own canonical predicate, `pullRequestHasMerged` in
+> **Screen on `metadata.merged == true` OR `metadata.mergedAt` populated.** That
+> is not a workaround; it is verbatim the server's own canonical predicate,
+> `pullRequestHasMerged` in
 > `server/src/services/pull-request-work-products.ts` — `prMerged === true
-> || prMergedAt` non-empty — chosen because GitHub sets `merged_at` on a real
-> merge, never clears it, and a merged PR cannot be reopened. A genuine queue
-> **ejection** carries `merged_at: null` and is correctly excluded.
+> || prMergedAt` non-empty — and the `mergedAt` arm is there because GitHub sets
+> `merged_at` on a real merge, never clears it, and a merged PR cannot be
+> reopened. A genuine queue **ejection** carries `merged_at: null` and, absent a
+> true `merged`, is correctly excluded.
+>
+> ⚠️ **Keep the disjunction; do not collapse it to the `mergedAt` arm.** The
+> paragraph above forbids trusting `merged`/`status` *on their own* — that is
+> not licence to screen on `mergedAt` alone. `merged: true` with `mergedAt: null`
+> is representable (the webhook writes `mergedAt: input.prMergedAt ?? null`, and
+> a hand-written work product supplies `metadata` through a `.passthrough()`
+> schema), and dropping that arm false-FAILs it in exactly the direction this
+> blockquote exists to prevent. Each field is untrustworthy as a *negative*;
+> either one is sufficient as a *positive*. (PEN-4813)
 >
 > Measured the same day: PEN-4553's own #2955 read `status: ready_for_review`,
 > `merged: false`, `mergedAt: 2026-10-23T13:35:53Z` while GitHub reported
@@ -959,8 +982,11 @@ first and treat the verdict as a hint about *where* to look, not *whether* to.
 (PEN-4550, `8633c02`) and the backfill (PEN-4553, migration `0265`) are both on
 `master` as of 2026-10-23, so once a dispatched deploy carries them, `status`
 becomes trustworthy again and already-demoted rows are repaired in that same
-startup. Until then it is not — and `mergedAt` is the correct screen on both
-sides of that deploy, which is why it is the one to write down.
+startup. Until then it is not — and the disjunction above is the correct screen
+on both sides of that deploy, which is why it is the one to write down. Note the
+expiry retires the *trap*, not the `mergedAt` arm: after the deploy a queue merge
+sets both fields, so the arm costs nothing and still covers every row written
+before it.
 
 #### Two changes considered and rejected
 
