@@ -1,0 +1,157 @@
+/**
+ * @fileoverview Count the GC cycles that fired AROUND a release onset, in a
+ * window narrow enough to mean something, against an ambient baseline measured
+ * the same way (PEN-3314).
+ *
+ * ## The gap this closes, stated exactly
+ *
+ * PEN-3314 has two instruments that cannot be read against each other:
+ *
+ *   - {@link module:server/services/rss-release-tracker} dates a release ONSET
+ *     to +/-1 s, in-process.
+ *   - {@link module:server/services/gc-flags-metrics} counts GC cycles by
+ *     `{kind, flags}` into a prom-client COUNTER, readable only at the scrape.
+ *
+ * The scrape is 30 s on this fleet, and its buckets are aligned to scrape
+ * boundaries rather than to anything that happened. So joining them in PromQL
+ * takes a +/-1 s instant and asks a 30 s average about it: that selects WHICH
+ * bucket to look in — the +/-300 s stamp this row had before spanned ten of
+ * them — but every correlate inside it is still a 30 s mean. That is the whole
+ * content of the row's standing "Prometheus is exhausted on the trigger"
+ * finding, and it is a limit of the READOUT, not of the evidence.
+ *
+ * This module does the join in-process, where the entries still carry their own
+ * instants, and publishes the result. The window is the caller's, centred on the
+ * onset rather than on a scrape boundary.
+ *
+ * ## ⚠ Why a baseline window ships beside it, and why it is not optional
+ *
+ * PEN-3314's single most expensive repeated error is reading an ambient signal
+ * as a marker. Major GC at event magnitude holds in **93.4%** of all 30 s
+ * samples on the instances that released (3347/3582) — a 0.12% precision for
+ * "release" — and fired 2148 times on a worker that released zero times. So
+ * "4 major cycles fired within 5 s of the onset" is, on its own, worth nothing:
+ * it is the expected number.
+ *
+ * A reader given only the onset window will nonetheless read it as a finding.
+ * That is not a hypothetical; it is this row's history. So the baseline window
+ * is published from the same ring, at the SAME width, over a stretch of the same
+ * generation that contains no onset — making the only defensible comparison the
+ * cheap one. ⛔ Do not quote the onset counts without the baseline counts. A
+ * ratio near 1 is the standing refutation holding at a resolution that can
+ * finally test it; a ratio far from 1 is the first positive result this row has
+ * had on the trigger.
+ *
+ * ## Memoised per onset, deliberately
+ *
+ * The ring ages. Re-counting the same episode on every scrape would make the
+ * published counts decay toward zero as entries evicted — a series that silently
+ * rewrites a past measurement into a smaller one, which is worse than not
+ * publishing it. The counts are computed once per distinct onset instant and
+ * held, so they describe the episode rather than the ring's current contents.
+ *
+ * ## What it is not
+ *
+ * ⛔ Not a fix, not an alert source, and PEN-3314 does not close on it.
+ *
+ * ⛔ Not an attribution in the causal sense, despite the name: it reports
+ * coincidence in time, at a resolution where coincidence is finally
+ * informative. GC is the candidate this row has refuted twice at 30 s and once
+ * at +/-1 s against 30 s correlates; this is the measurement that can refute it
+ * at matched resolution, or stop refuting it.
+ *
+ * ⛔ Takes no view on which `{kind, flags}` classes matter, and publishes every
+ * class that fired. Filtering to a predicted one is the trap `gc-flags-metrics`
+ * already records.
+ *
+ * @module server/services/rss-release-gc-attribution
+ */
+
+import { readGcCyclesInWindow, type GcCycleWindow } from "./gc-flags-metrics.js";
+import type { RssReleaseReading } from "./rss-release-tracker.js";
+
+/**
+ * Half-width of the window centred on the onset, in ms.
+ *
+ * 5 s, giving a 10 s window. Chosen to be strictly finer than the 30 s scrape
+ * this module exists to beat while still spanning several cycles at the ambient
+ * 0.55/s — a window so narrow it usually contains nothing would publish noise
+ * rather than a rate.
+ *
+ * It is also wider than the onset stamp's own error. That stamp lands up to one
+ * plateau band into the fall (~4 s at the measured 3.6 MB/s drain), so a
+ * half-width below that could place the true onset OUTSIDE the window it is
+ * meant to centre.
+ */
+export const DEFAULT_ONSET_WINDOW_HALF_MS = 5_000;
+
+/**
+ * How far before the onset the baseline window is centred, in ms.
+ *
+ * 300 s back: far enough that the baseline cannot overlap the onset window or
+ * the descent leading into it, and recent enough to be the same process, the
+ * same generation and broadly the same load — which is what makes it a baseline
+ * rather than a different measurement.
+ *
+ * ⚠ It is ONE window, not a long-run average, so it carries the sampling noise
+ * of ~5 cycles. Read it as an order-of-magnitude control, and read
+ * {@link RssReleaseGcAttribution.baseline}'s `covered` before reading it at all.
+ */
+export const DEFAULT_BASELINE_OFFSET_MS = 300_000;
+
+export interface RssReleaseGcAttribution {
+  /** The onset this describes. Identifies the episode; the counts never move once set. */
+  readonly onsetAtMs: number;
+  /** Window centred on {@link onsetAtMs}. */
+  readonly onset: GcCycleWindow;
+  /** Same-width window {@link DEFAULT_BASELINE_OFFSET_MS} earlier, containing no onset. */
+  readonly baseline: GcCycleWindow;
+  /** Full width of both windows, in ms. Published so a count is readable as a rate. */
+  readonly windowMs: number;
+}
+
+export interface AttributeRssReleaseGcOptions {
+  readonly onsetWindowHalfMs?: number;
+  readonly baselineOffsetMs?: number;
+  /** Injected by the test so windows can be counted without a real GC stream. */
+  readonly readWindow?: (fromMs: number, toMs: number) => GcCycleWindow;
+}
+
+let memo: RssReleaseGcAttribution | null = null;
+
+/**
+ * Compute (or recall) the GC windows around the reading's most recent onset.
+ *
+ * Returns `null` while no episode has been observed — the same discipline the
+ * sibling series follow, where ABSENT and "measured zero" must not be the same
+ * reading. A reading with no onset is not an episode with no GC; it is no
+ * episode.
+ */
+export function attributeRssReleaseGc(
+  reading: RssReleaseReading | null,
+  options: AttributeRssReleaseGcOptions = {},
+): RssReleaseGcAttribution | null {
+  const onsetAtMs = reading?.lastOnsetAtMs ?? null;
+  if (onsetAtMs === null) return null;
+  // Same episode: hand back the counts taken when it was fresh. Re-counting
+  // would shrink them as the ring evicts. See the module docblock.
+  if (memo && memo.onsetAtMs === onsetAtMs) return memo;
+
+  const halfMs = options.onsetWindowHalfMs ?? DEFAULT_ONSET_WINDOW_HALF_MS;
+  const baselineOffsetMs = options.baselineOffsetMs ?? DEFAULT_BASELINE_OFFSET_MS;
+  const readWindow = options.readWindow ?? readGcCyclesInWindow;
+
+  const baselineCentreMs = onsetAtMs - baselineOffsetMs;
+  memo = {
+    onsetAtMs,
+    onset: readWindow(onsetAtMs - halfMs, onsetAtMs + halfMs),
+    baseline: readWindow(baselineCentreMs - halfMs, baselineCentreMs + halfMs),
+    windowMs: halfMs * 2,
+  };
+  return memo;
+}
+
+/** Reset module state between tests. Not for production use. */
+export function __resetRssReleaseGcAttributionForTest(): void {
+  memo = null;
+}

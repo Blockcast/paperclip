@@ -39,6 +39,7 @@ import {
   refreshScheduledRetryParkHorizonMetrics,
 } from "./queued-run-age-metrics.js";
 import { refreshRoutineFireGapMetrics } from "./routine-fire-gap-metrics.js";
+import { attributeRssReleaseGc } from "./rss-release-gc-attribution.js";
 import { readRssReleases } from "./rss-release-tracker.js";
 import {
   setAgentStartLockHeldMetrics,
@@ -52,6 +53,7 @@ import {
   setNativeMemoryMetrics,
   setProcessMappingMetrics,
   setRssReleaseMetrics,
+  setRssReleaseGcAttributionMetrics,
   setOverdueScheduledRetryAgeMetricsRefreshSuccess,
   setQueuedRunAgeMetricsRefreshSuccess,
   setRoutineFireGapMetricsRefreshSuccess,
@@ -343,7 +345,14 @@ export function refreshNativeMemoryMetrics(): void {
  * resolution limit this instrument exists to get under.
  */
 export function refreshRssReleaseMetrics(): void {
-  setRssReleaseMetrics(readRssReleases());
+  const reading = readRssReleases();
+  setRssReleaseMetrics(reading);
+  // Same reading, joined against the in-process GC ring. Done here rather than
+  // inside the tracker because `rss-release-tracker` deliberately records no
+  // candidate cause of its own -- it says WHEN, and folding a hypothesis into
+  // it would make the instrument agree with whichever one it was built around.
+  // The join belongs where both readings already meet, which is this collector.
+  setRssReleaseGcAttributionMetrics(attributeRssReleaseGc(reading));
 }
 
 /**
