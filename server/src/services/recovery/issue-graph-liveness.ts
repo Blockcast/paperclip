@@ -1,5 +1,6 @@
 import { getAgentWorkEligibility, isAgentInvokable } from "@paperclipai/shared";
 import { buildIssueGraphLivenessIncidentKey } from "./origins.js";
+import { isDeliberateParkActive } from "../issue-park-expiry.js";
 
 export type IssueLivenessSeverity = "warning" | "critical";
 
@@ -340,8 +341,9 @@ function hasScheduledMonitor(issue: IssueLivenessIssueInput, nowMs: number) {
  * same effect immediately.
  */
 function hasActiveParkedDisposition(issue: IssueLivenessIssueInput, nowMs: number) {
-  const parkedUntilMs = readDateMs(issue.parkedUntil);
-  return parkedUntilMs !== null && parkedUntilMs > nowMs;
+  // PEN-4871: delegates rather than restates. See `isDeliberateParkActive`'s docblock for
+  // why the hand-copied form was retired on this column specifically.
+  return isDeliberateParkActive(issue.parkedUntil, nowMs);
 }
 
 function readPrincipalAgentId(principal: unknown): string | null {

@@ -1,14 +1,20 @@
 /**
  * PEN-4420: the deliberate park's RELEASE edge.
  *
- * `parked_until` (BLO-27912 / migration 0222) is read on the wake path in at least two
- * places, and both of them read it to SUPPRESS:
+ * `parked_until` (BLO-27912 / migration 0222) is read on the wake path in three places,
+ * and all of them read it to SUPPRESS. Each defers to `isDeliberateParkActive` below;
+ * this list is the registry, so a fourth suppression site belongs here too:
  *
  *  - `hasLiveDeliberatePark` (`routes/github-webhook.ts`) — a live park suppresses
  *    `github_check_*` wakes (PEN-4114).
  *  - `hasActiveParkedDisposition` (`services/recovery/issue-graph-liveness.ts`) — a live
  *    park is the seventh explicit waiting path, so the strandedness invariants stop
  *    firing against the row.
+ *  - the strandedness DISPATCH sweep's candidate filter
+ *    (`runStrandedAssignedIssueSweep`, `services/recovery/service.ts`) — a live park
+ *    keeps the row out of the re-dispatch population (PEN-4871). This one was missing
+ *    until PEN-4871: the row above stopped being FLAGGED as stranded and went on being
+ *    WOKEN anyway, ~9 minutes after every park, at full agent-session cost.
  *
  * Nothing read it to RELEASE. `parked_until` passing produced no event on any status, so
  * a parked row whose only wake was the park itself sat inert indefinitely. The park had a
@@ -113,6 +119,38 @@ function readMs(value: Date | string | null | undefined): number | null {
 }
 
 /**
+ * Is a deliberate park in force on this row right now?
+ *
+ * PEN-4871: the single owner of the live-park reading. Every path that SUPPRESSES on a
+ * park defers to this function; none of them restates it.
+ *
+ * It did not start that way. The predicate was hand-copied into three places —
+ * `hasActiveParkedDisposition` (`services/recovery/issue-graph-liveness.ts`),
+ * `hasLiveDeliberatePark` (`routes/github-webhook.ts`) and, by its absence, the
+ * strandedness dispatch sweep — each with a comment asking the next author to keep them in
+ * step. That is the arrangement BLO-22660 already recorded failing on this exact column:
+ * *"That pair of producers had already drifted once on `parkedUntil` (BLO-27912) and the
+ * comment asking the next author to keep them in step did not prevent this one; a required
+ * key does."* The third site did not drift so much as never exist, which is the same defect
+ * with a cheaper disguise — nothing fails when a copy is simply missing.
+ *
+ * Keyed on the deadline alone and compared with `> nowMs`, so expiry is the default: a park
+ * nobody restates stops suppressing on its own, and un-parking (writing
+ * `parkedDisposition: null`, which clears the column) takes effect immediately. The
+ * mechanism cannot decay into permanent silence on a row that genuinely needs the wake.
+ *
+ * An unparseable or absent deadline reads as NOT parked — suppression must be something a
+ * row earns, never something it falls into.
+ */
+export function isDeliberateParkActive(
+  parkedUntil: Date | string | null | undefined,
+  nowMs: number,
+): boolean {
+  const parkedUntilMs = readMs(parkedUntil);
+  return parkedUntilMs !== null && parkedUntilMs > nowMs;
+}
+
+/**
  * Does this row's park owe a release wake right now?
  *
  * This is the authoritative statement of the sweep's predicate. `tickExpiredIssueParks`
@@ -143,8 +181,11 @@ export function issueParkOwesReleaseWake(
   if (!isIssueParkExpiryWakeStatus(issue.status)) return false;
   if (!issue.assigneeAgentId || issue.assigneeUserId) return false;
 
-  const parkedUntilMs = readMs(issue.parkedUntil);
-  if (parkedUntilMs === null || parkedUntilMs > nowMs) return false;
+  // The exact negation of `isDeliberateParkActive`, written through it rather than beside
+  // it so the "these two cannot both hold" claim above is enforced by construction. The
+  // `=== null` arm is the separate "no park at all" case, which is neither live nor lapsed.
+  if (readMs(issue.parkedUntil) === null) return false;
+  if (isDeliberateParkActive(issue.parkedUntil, nowMs)) return false;
 
   const firedAtMs = readMs(issue.parkedWakeFiredAt);
   if (firedAtMs === null) return true;
