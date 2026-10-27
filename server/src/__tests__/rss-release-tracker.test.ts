@@ -418,8 +418,11 @@ describe("Ally #3040 suggestions", () => {
     expect(cleared).toBe(1);
     // Both handles exist, but only the live one still folds samples in: driving
     // both must not double the count the help text reads as a ~1.0/s rate.
+    // Asserted as `1`, not `ticks.length`: `ticks.length` is also what a tick
+    // that ignored `stop()` would produce, so it could not tell the two apart.
+    expect(ticks).toHaveLength(2);
     for (const tick of ticks) tick();
-    expect(readRssReleases()!.sampleCount).toBe(ticks.length);
+    expect(readRssReleases()!.sampleCount).toBe(1);
   });
 
   it("publishes the bounds in force rather than the compiled-in defaults", async () => {
