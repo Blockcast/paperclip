@@ -18,6 +18,17 @@ const DEFAULT_ALERTMANAGER_URL = 'http://alertmanager.monitoring.svc.cluster.loc
 export const ALERT_TTL_MS = 2 * 60 * 60 * 1000;
 
 /**
+ * The detector renders an absent annotation as an angle-bracketed placeholder
+ * rather than as a blank -- `lock_owner         = <empty>` at
+ * check-stranded-approval-lock.sh:263. Those are prose, not values. Carrying one
+ * through verbatim is what put `abandon_in_flight_owner: <empty>` into the form
+ * this alert tells an operator to paste. Every real value on these three lines is
+ * a hex digest, a hex owner id or a single verdict word, so rejecting anything
+ * wholly wrapped in angle brackets cannot discard a legitimate reading.
+ */
+const PLACEHOLDER = /^<[\s\S]*>$/;
+
+/**
  * Lifts the pasteable retirement pair out of the detector's report so it lands
  * in the alert itself. Whoever reads this in Slack can act without opening the
  * run — and the pair is the whole remedy.
@@ -25,7 +36,9 @@ export const ALERT_TTL_MS = 2 * 60 * 60 * 1000;
 export function parseDetail(detail) {
   const field = (name) => {
     const match = new RegExp(`^${name}\\s*=\\s*(.+)$`, 'm').exec(detail ?? '');
-    return match ? match[1].trim() : null;
+    if (!match) return null;
+    const value = match[1].trim();
+    return PLACEHOLDER.test(value) ? null : value;
   };
   return {
     digest: field('lock_digest'),
@@ -38,6 +51,17 @@ export function buildAlert({ exitCode, detail, runUrl, repo, now }) {
   const stranded = exitCode === '1';
   const { digest, owner } = parseDetail(detail);
 
+  // A lock with no owner annotation cannot be retired through docker.yml's form
+  // at all -- the detector's own pasteable block says so in as many words
+  // (check-stranded-approval-lock.sh:322). Distinguish that from "we never got a
+  // report to read": if the digest parsed, the report rendered, so a null owner
+  // IS the ownerless lock rather than a parse failure.
+  const ownerLine =
+    owner ??
+    (digest
+      ? '<MISSING -- this lock has no owner annotation; retire it by hand>'
+      : '(see the run log)');
+
   const description = stranded
     ? [
         'An in-flight approval lock on ConfigMap/paperclip-api-approved-images can never be',
@@ -45,7 +69,7 @@ export function buildAlert({ exitCode, detail, runUrl, repo, now }) {
         '',
         'Retire it by re-dispatching docker.yml (workflow_dispatch) with:',
         `  abandon_in_flight:       ${digest ?? '(see the run log)'}`,
-        `  abandon_in_flight_owner: ${owner ?? '(see the run log)'}`,
+        `  abandon_in_flight_owner: ${ownerLine}`,
         '',
         'target_sha is also REQUIRED on that form — use master\'s current tip.',
         'Re-read the pair before dispatching; any successful deploy replaces it.',
@@ -56,10 +80,16 @@ export function buildAlert({ exitCode, detail, runUrl, repo, now }) {
         'one of its two objects is unreadable. It is NOT reporting that the lock is fine — it is',
         'reporting that nothing is currently watching for a stranded lock at all.',
         '',
-        'If this is the first run after PEN-4841 shipped, the likely cause is that',
-        'BLOCKCAST_KUBE_CONFIG_B64 lacks get on ConfigMap paperclip-release-approvals/',
-        'paperclip-api-approved-images or Deployment paperclip/paperclip-api. The workflow header',
-        'records the fallback.',
+        'Three distinct faults exit 2. The detector names which on stderr before it',
+        'exits, so read the step summary first rather than assuming:',
+        '',
+        '  1. kubeconfig was never configured — BLOCKCAST_KUBE_CONFIG_B64 absent or not',
+        '     base64-decodable. That step is continue-on-error precisely so this alert',
+        '     still fires; check whether it went red in the run.',
+        '  2. RBAC — the credential lacks get on ConfigMap paperclip-release-approvals/',
+        '     paperclip-api-approved-images or Deployment paperclip/paperclip-api. The',
+        '     workflow header records the fallback.',
+        '  3. A required tool (kubectl, jq, sha256sum) is missing from the runner image.',
       ].join('\n');
 
   return {

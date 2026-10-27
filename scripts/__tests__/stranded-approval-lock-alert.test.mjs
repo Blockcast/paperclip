@@ -34,6 +34,13 @@ This lock's rollout completed, but the live Deployment no longer canonicalizes t
 server plan the approval recorded, so the next approval still refuses to advance it.
 `;
 
+// The same report for a lock carrying no owner annotation. The detector pads and
+// renders the placeholder itself; this is its output, not a hand-made string.
+const OWNERLESS_REPORT = STRANDED_REPORT.replace(
+  /^lock_owner +=.*$/m,
+  "lock_owner         = <empty>",
+);
+
 describe("parseDetail", () => {
   it("lifts the retirement pair out of the column-padded report", () => {
     const { digest, owner, verdict } = parseDetail(STRANDED_REPORT);
@@ -48,6 +55,21 @@ describe("parseDetail", () => {
   it("returns null rather than a partial value when the report is missing", () => {
     assert.deepEqual(parseDetail(""), { digest: null, owner: null, verdict: null });
     assert.deepEqual(parseDetail(undefined), { digest: null, owner: null, verdict: null });
+  });
+
+  it("reads the detector's angle-bracketed placeholder as absent, not as a value", () => {
+    // check-stranded-approval-lock.sh:263 renders a lock with no owner
+    // annotation as `lock_owner         = <empty>`. Taken literally that became
+    // `abandon_in_flight_owner: <empty>` in the alert -- an instruction to paste
+    // the word "<empty>" into docker.yml's dispatch form.
+    const { digest, owner } = parseDetail(
+      OWNERLESS_REPORT,
+    );
+    assert.equal(
+      digest,
+      "sha256:c3c65a0480cd5e8c8fb0fed0438dc02fa2eb06f179432b64f37cebb29f2730f9",
+    );
+    assert.equal(owner, null);
   });
 });
 
@@ -94,6 +116,45 @@ describe("buildAlert", () => {
     assert.match(alert.annotations.description, /NOT reporting that the lock is fine/);
   });
 
+  it("never tells the operator to paste the placeholder for an ownerless lock", () => {
+    const alert = buildAlert({
+      exitCode: "1",
+      detail: OWNERLESS_REPORT,
+      runUrl: "https://example/run/4",
+      repo: "Blockcast/paperclip",
+      now,
+    });
+
+    // `<empty>` is not a value docker.yml's form accepts. The detector's own
+    // pasteable block (check-stranded-approval-lock.sh:322) says such a lock has
+    // to be retired by hand; the alert must carry that, not the placeholder.
+    assert.doesNotMatch(alert.annotations.description, /abandon_in_flight_owner: +<empty>/);
+    assert.match(alert.annotations.description, /abandon_in_flight_owner: +<MISSING/);
+    assert.match(alert.annotations.description, /retire it by hand/);
+
+    // The digest still rendered, so the half of the remedy that IS pasteable
+    // must not be degraded along with the half that is not.
+    assert.match(alert.annotations.description, /abandon_in_flight: +sha256:c3c65a04/);
+  });
+
+  it("names every cause of exit 2, not RBAC alone", () => {
+    const alert = buildAlert({
+      exitCode: "2",
+      detail: "",
+      runUrl: "https://example/run/5",
+      repo: "Blockcast/paperclip",
+      now,
+    });
+
+    // Exit 2 covers a missing tool and an unconfigured kubeconfig as well as
+    // RBAC -- and since the kubeconfig step is continue-on-error, the
+    // kubeconfig case is now the one most likely to land here. Naming only RBAC
+    // sends the reader to check permissions that were never the problem.
+    assert.match(alert.annotations.description, /BLOCKCAST_KUBE_CONFIG_B64/);
+    assert.match(alert.annotations.description, /lacks get on ConfigMap/);
+    assert.match(alert.annotations.description, /kubectl, jq, sha256sum/);
+  });
+
   it("degrades to a pointer rather than printing a bogus pair when the report is unparseable", () => {
     const alert = buildAlert({
       exitCode: "1",
@@ -130,6 +191,16 @@ describe("the workflow wiring", () => {
     // reaches a human — never fires. A red run alone notifies the last
     // committer, which is the failure mode this workflow exists to avoid.
     assert.match(workflowSource, /id: check\n\s+continue-on-error: true/);
+  });
+
+  it("keeps continue-on-error on the kubeconfig step, so a credential fault still alerts", () => {
+    // Easy to miss and silent when wrong: an explicit `if:` carrying no status
+    // function still implies `success()`. Without continue-on-error a failed
+    // kubeconfig step aborts the job, so BOTH `exit_code != '0'` steps skip and
+    // the run goes red having alerted nobody -- the "only the last committer
+    // hears" mode this workflow was written to remove. With it, the detector
+    // runs, cannot reach the cluster, and exits 2 into its own alertname.
+    assert.match(workflowSource, /- name: Configure kubeconfig\n\s+continue-on-error: true/);
   });
 
   it("declares no environment, so hourly runs cannot bury the production deploy record", () => {
