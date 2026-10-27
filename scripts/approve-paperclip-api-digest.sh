@@ -1,5 +1,42 @@
 #!/usr/bin/env bash
-# Vendored from Blockcast/onprem-k8s at cedac5c69fe6870e66250ce187c6d108bc0592ba.
+# FORK of Blockcast/onprem-k8s — do NOT re-vendor this file from upstream.
+#
+# Forked at cedac5c69fe6870e66250ce187c6d108bc0592ba (2026-08-03) and
+# intentionally divergent ever since. The header this replaces read "Vendored
+# from", which invited the one edit that breaks production: overwriting this
+# file from upstream — at the fork point or at its default branch — silently
+# deletes the restartedAt strip in CANONICAL_DEPLOYMENT_JQ below and re-opens
+# the deploy wedge that has already cost three outages (BLO-31598, PEN-4513,
+# PEN-4841). PEN-4846 chose to declare the fork rather than converge the copies.
+#
+# Measured when this note was written, 2026-10-27, against upstream's
+# default branch at c9f8b6e1 (line deltas are `git diff --no-index
+# --numstat` from that copy to this one):
+#
+#   this file                   1862 lines   97424 bytes
+#   upstream default branch      974 lines   47141 bytes   (+984 / -96 lines)
+#   upstream at the fork point   840 lines   39834 bytes
+#
+# Local-only, none of it upstream: the in-flight approval lock with its owner
+# handoff and retirement path (BLO-31598, BLO-31666, BLO-32001); last-healthy
+# and serving-ReplicaSet digest recovery (BLO-31842, BLO-32101); the running
+# digest pinned into the approval window (BLO-28483); jq aborts reported
+# instead of swallowed into a decline (BLO-32267, BLO-32396); and the
+# restartedAt strip (BLO-49531).
+#
+# Un-pulled from upstream: BLO-34817 rewrites this script's persistence check
+# off `printf | grep -q`, a shape `pipefail` can invert into a false "approval
+# did not persist". That shape survives in the verify_digests block below. It
+# cannot race here — the window is bounded to MAX_APPROVED_DIGESTS entries,
+# ~216 bytes against a 64 KiB pipe buffer — so this is shape, not a defect.
+# Carry it if you touch that block.
+#
+# To converge the copies, port THIS file's changes upstream and re-pin; never
+# overwrite in this direction. approve-paperclip-api-digest.test.js fails on
+# both reversion paths — verified on PEN-4846 by reverting the strip alone, and
+# by a whole-file re-vendor from upstream — so CI does stop a re-vendor, but
+# only after the work is done. That is what this note is for.
+#
 # Authorize one immutable Paperclip API image digest at admission time (BLO-19955).
 #
 # Rotates the bounded approval window in
