@@ -1222,6 +1222,14 @@ export async function startServer(): Promise<StartedServer> {
   let workerHeartbeat: ReturnType<typeof heartbeatService> | null = null;
   let heartbeatSchedulerStopped = false;
   let heartbeatStartupRecoveryPending = false;
+  /**
+   * BLO-49303. Holds the recovery gate closed from `onAcquire` until the
+   * plugin resync hands off to `runLeaderRecovery`, which only then sets
+   * `heartbeatStartupRecoveryPending`. Without it the takeover kick's tick
+   * passes the gate during resync. Separate flag: reusing the other one would
+   * trip `runLeaderRecovery`'s single-flight.
+   */
+  let takeoverRecoveryPending = false;
   let heartbeatSchedulerInterval: ReturnType<typeof setInterval> | null = null;
   /**
    * BLO-45212. Runs the one-shot recovery chain (crash reconciliation,
@@ -1934,15 +1942,20 @@ export async function startServer(): Promise<StartedServer> {
         // BLO-47803: bring the warm-standby plugin set up to date first, so
         // recovery drives external runs through current plugin code/config.
         onAcquire: () => {
-          // BLO-49303: first, and synchronously — the timer enqueue sits ahead
-          // of the recovery gate, so it need not wait for resync or recovery.
-          kickHeartbeatScheduler?.();
+          // BLO-49303: close the recovery gate BEFORE the kick, so the kicked
+          // tick cannot pass it while resync is still in flight; then kick —
+          // the timer enqueue sits ahead of that gate, so it need not wait.
           const resync = (app as { locals?: { resyncPluginsOnTakeover?: () => Promise<void> } })
             .locals?.resyncPluginsOnTakeover;
+          if (resync) takeoverRecoveryPending = true;
+          kickHeartbeatScheduler?.();
           if (!resync) return runLeaderRecovery?.();
           void resync()
             .catch((err) => logger.error({ err }, "plugin resync on lease takeover failed"))
-            .finally(() => runLeaderRecovery?.());
+            .finally(() => {
+              takeoverRecoveryPending = false;
+              runLeaderRecovery?.();
+            });
         },
       });
       // Awaited so the first tick already has a verdict rather than skipping
@@ -2124,8 +2137,12 @@ export async function startServer(): Promise<StartedServer> {
         // chain also runs beside this process's own live runs whenever it
         // re-wins the lease (see the lease construction above). NOT a
         // precedent: API-tier wakes, which return at the API-tier fence before
-        // any reap. Everything left below still waits for recovery, unchanged.
-        if (heartbeatStartupRecoveryPending) return;
+        // any reap. Everything left below still waits for recovery, unchanged —
+        // including the plugin resync that precedes it on a takeover.
+        // A re-acquire after lapsed renewals can overlap a tick still suspended
+        // above; that is the same overlap a slow `tickTimers` already has in
+        // steady state, and the passes below carry their own in-flight latches.
+        if (heartbeatStartupRecoveryPending || takeoverRecoveryPending) return;
         const sweptRuntimeStatuses = heartbeat.sweepExpiredRuntimeStatuses();
         if (sweptRuntimeStatuses > 0) {
           logger.info(

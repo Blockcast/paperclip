@@ -945,6 +945,39 @@ describe("startServer feedback export wiring", () => {
     }
   });
 
+  it("keeps the recovery gate closed while takeover plugin resync is in flight (BLO-49303)", async () => {
+    const schedulerIntervalMs = 30000;
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: schedulerIntervalMs,
+    }));
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation((() => 1 as unknown as ReturnType<typeof setInterval>) as typeof setInterval);
+    // Never resolves: recovery (and the flag it sets) never starts.
+    const resyncPluginsOnTakeover = vi.fn(() => new Promise<void>(() => {}));
+    createAppMock.mockResolvedValueOnce(
+      Object.assign(() => {}, { locals: { resyncPluginsOnTakeover } }) as never,
+    );
+    singletonLease.leader = false;
+    try {
+      await startServer();
+      const { schedulerLeaseHolder } = await import("../services/scheduler-lease.js");
+      const opts = vi.mocked(schedulerLeaseHolder).mock.calls.at(-1)?.[1] as { onAcquire?: () => void };
+      singletonLease.leader = true;
+      opts.onAcquire?.();
+
+      expect(resyncPluginsOnTakeover).toHaveBeenCalledTimes(1);
+      await vi.waitFor(() => expect(heartbeatServiceMock.tickTimers).toHaveBeenCalledTimes(1));
+      expect(heartbeatServiceMock.sweepExpiredRuntimeStatuses).not.toHaveBeenCalled();
+      expect(routineServiceMock.tickScheduledTriggers).not.toHaveBeenCalled();
+      expect(heartbeatServiceMock.reconcileWorkerCrashedRuns).not.toHaveBeenCalled();
+    } finally {
+      singletonLease.leader = true;
+      setIntervalSpy.mockRestore();
+    }
+  });
+
   it("does not replay hot-restart adoption when the orphan reaper retries", async () => {
     loadConfigMock.mockReturnValue(buildTestConfig({
       heartbeatSchedulerEnabled: true,
