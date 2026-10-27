@@ -477,8 +477,9 @@ import {
   setOrphanedRuntimeResourceMetricsRefreshSuccess,
   setCrashRecoveryCandidateIndexPresent,
   CAVEMAN_PROXY_NOT_READY_ERROR_CODE,
+  recordTransientRetryFloorDisposition,
 } from "./metrics.js";
-import type { DispatchDeclineReason } from "./metrics.js";
+import type { DispatchDeclineReason, TransientRetryFloorDisposition } from "./metrics.js";
 import { runQuotaExhaustedHook } from "./quota-exhausted-hook.js";
 import { runLifecycleHook } from "./lifecycle-hook.js";
 import { mapAdapterToCcrotateTarget, mapPenstockProviderToCcrotateTarget } from "./ccrotate-target.js";
@@ -492,6 +493,7 @@ import {
   resolveCcrotateCapacityRetry,
   clampTransientRetryHorizon,
   jitterTransientRetryFloor,
+  classifyRetryInstantAlignment,
   CCROTATE_CAPACITY_PARK_CLAMPED_FROM_KEY,
   isCapacityGovernedRetryFloor,
   applyCcrotateCapacityDecision,
@@ -22854,9 +22856,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // capacity provenance but never went through the resolver's jitter, so it
     // must not inherit the capacity exemption. Its `over_horizon` park is
     // `now + cap` at the reconciler pass, which runs refused in one pass share.
-    const floorAlreadyDispersed =
-      prReviewRefusalRetryNotBefore === null &&
-      (clampedTransientRetry?.clampedFromIso != null || isCapacityGovernedRetryFloor(run.resultJson));
+    //
+    // PEN-4145: the two exemption markers are resolved SEPARATELY rather than
+    // or-ed into one boolean, because which marker fired is the thing that
+    // silently broke. The 2026-08-29 fix exempted the wrong population and the
+    // exempt SHARE looked the same before and after it failed -- only the marker
+    // behind it changed. Order mirrors the original `||` exactly, so a floor
+    // that satisfies both still routes as it did before this split: the horizon
+    // clamp is tested first and wins.
+    const floorExemptionReason: TransientRetryFloorDisposition | null =
+      prReviewRefusalRetryNotBefore !== null
+        ? null
+        : clampedTransientRetry?.clampedFromIso != null
+          ? "exempt_horizon_clamped"
+          : isCapacityGovernedRetryFloor(run.resultJson)
+            ? "exempt_capacity_governed"
+            : null;
+    const floorAlreadyDispersed = floorExemptionReason !== null;
     const flooredDueAt =
       effectiveRetryNotBefore && effectiveRetryNotBefore.getTime() > baseSchedule.dueAt.getTime()
         ? floorAlreadyDispersed
@@ -22865,6 +22881,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               .dueAt
         : null;
     const preRoutineDueAt = flooredDueAt ?? baseSchedule.dueAt;
+    // PEN-4145: emit the decision. Until this call NEITHER branch above emitted
+    // a counter, gauge or log line, so the only durable trace that a dispersion
+    // decision had been made was the `scheduled_retry_at` value itself -- which
+    // is why the first PEN-2509 fix sat live, fleet-wide and wrong for six
+    // weeks and was found only by a hand census.
+    //
+    // Gated on a floor having EXISTED, not on one having won. A park with no
+    // floor takes the base backoff curve, which carries its own jitter and never
+    // herded; counting it would dilute the ratio with a population that is not
+    // at risk. A floor that existed and LOST to a later base backoff is counted
+    // as `superseded`, so the denominator reads "floor decisions" rather than
+    // "floor decisions that mattered" -- the honest denominator for a ratio
+    // about routing.
+    //
+    // The instant classified is this decision's own output (`preRoutineDueAt`),
+    // deliberately BEFORE the routine-window clamp below can move it. That
+    // isolates the mechanism under test; it also means this counter and a
+    // post-hoc census of the persisted `scheduled_retry_at` column can disagree
+    // on routine-scoped rows, and that is intended -- the column census stays
+    // the independent cross-check rather than a second copy of this reading.
+    if (effectiveRetryNotBefore) {
+      recordTransientRetryFloorDisposition({
+        disposition: flooredDueAt === null ? "superseded" : (floorExemptionReason ?? "dispersed"),
+        alignment: classifyRetryInstantAlignment(preRoutineDueAt),
+      });
+    }
 
     // Routine execution issues retain the routine run id as their origin. Read
     // the schedule through that stable relation rather than inferring routine
