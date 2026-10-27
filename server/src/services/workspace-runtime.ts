@@ -4063,23 +4063,35 @@ export async function relinkHuskGitWorktree(repoRoot: string, worktreePath: stri
   if (await fs.lstat(dotGit).then(() => true, () => false)) return false;
   const adminRoot = path.join(repoRoot, ".git", "worktrees");
   const wanted = await resolvePathForWorktreeComparison(dotGit);
-  for (const id of await fs.readdir(adminRoot).catch(() => [] as string[])) {
-    const adminDir = path.join(adminRoot, id);
-    const backRef = await fs.readFile(path.join(adminDir, "gitdir"), "utf8").catch(() => null);
-    if (!backRef || await resolvePathForWorktreeComparison(path.resolve(adminDir, backRef.trim())) !== wanted) continue;
-    if (!await fs.stat(path.join(adminDir, "HEAD")).then(() => true, () => false)) return false;
-    try {
-      await fs.writeFile(dotGit, `gitdir: ${adminDir}\n`, { flag: "wx" });
-    } catch {
-      return false;
+  // git names the admin dir after the worktree's basename in the common case,
+  // so probe that first. The scan is bounded like every other reclaim fs walk:
+  // a wedged CephFS getattr degrades to the BLO-47493 refusal, not a hung wake.
+  const findAdminDir = async () => {
+    const base = path.basename(worktreePath);
+    const ids = await fs.readdir(adminRoot).catch(() => [] as string[]);
+    for (const id of [base, ...ids.filter((id) => id !== base)]) {
+      const adminDir = path.join(adminRoot, id);
+      const backRef = await fs.readFile(path.join(adminDir, "gitdir"), "utf8").catch(() => null);
+      if (!backRef || await resolvePathForWorktreeComparison(path.resolve(adminDir, backRef.trim())) !== wanted) continue;
+      return await fs.stat(path.join(adminDir, "HEAD")).then(() => adminDir, () => null);
     }
+    return null;
+  };
+  const adminDir = await withReclaimFsDeadline(findAdminDir(), adminRoot).catch(() => null);
+  if (!adminDir) return false;
+  const resolvesToSelf = async () => {
     const topLevel = await runGit(["rev-parse", "--show-toplevel"], worktreePath).catch(() => null);
-    if (topLevel && await resolvePathForWorktreeComparison(topLevel) === await resolvePathForWorktreeComparison(worktreePath)) {
-      return true;
-    }
-    await fs.rm(dotGit, { force: true });
-    return false;
+    return !!topLevel
+      && await resolvePathForWorktreeComparison(topLevel) === await resolvePathForWorktreeComparison(worktreePath);
+  };
+  try {
+    await fs.writeFile(dotGit, `gitdir: ${adminDir}\n`, { flag: "wx" });
+  } catch {
+    // A concurrent run re-linked it first (EEXIST): healthy, not a refusal.
+    return resolvesToSelf();
   }
+  if (await resolvesToSelf()) return true;
+  await fs.rm(dotGit, { force: true });
   return false;
 }
 
