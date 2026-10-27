@@ -2087,6 +2087,22 @@ export const PROCESS_RSS_RELEASE_LAST_BYTES_METRIC = "paperclip_process_rss_rele
 export const PROCESS_RSS_RELEASE_SAMPLES_METRIC = "paperclip_process_rss_release_samples";
 
 /**
+ * The detector's own bounds, in bytes (PEN-3314).
+ *
+ * `bound="threshold"` is the drawdown depth that opens an episode — what is
+ * detectable at all. `bound="plateau_band"` is how far below the high-water
+ * mark still counts as "at the plateau" when stamping the onset — what bounds
+ * how LATE that stamp can be.
+ *
+ * Published rather than left to the help strings, for the reason this module
+ * publishes `sampleIntervalMs` beside every sampler: a reader who cannot see
+ * the bound cannot tell a real null from an undetectable one. It also keeps
+ * the figures quoted in the help text above from drifting away from the values
+ * actually in force, since both are injectable.
+ */
+export const PROCESS_RSS_RELEASE_BOUND_BYTES_METRIC = "paperclip_process_rss_release_bound_bytes";
+
+/**
  * `setting` label of the series carrying the pool's OWN idle-in-transaction
  * bound (PEN-3365), published beside the inherited reading so a loosening is a
  * one-series comparison. Named once here so the help text, the startup wiring
@@ -4458,6 +4474,7 @@ let processRssReleaseLastOnsetTimestamp: Gauge | null = null;
 let processRssReleaseLastDetectedTimestamp: Gauge | null = null;
 let processRssReleaseLastBytes: Gauge | null = null;
 let processRssReleaseSamples: Gauge | null = null;
+let processRssReleaseBoundBytes: Gauge<"bound"> | null = null;
 let cgroupMemoryComponentBytes: Gauge<"component"> | null = null;
 let cgroupMemoryCurrentBytes: Gauge | null = null;
 let cgroupMemoryMaxBytes: Gauge | null = null;
@@ -4647,6 +4664,7 @@ function ensureRegistry(): {
   processRssReleaseLastDetectedTimestampGauge: Gauge;
   processRssReleaseLastBytesGauge: Gauge;
   processRssReleaseSamplesGauge: Gauge;
+  processRssReleaseBoundBytesGauge: Gauge<"bound">;
   cgroupMemoryComponentBytesGauge: Gauge<"component">;
   cgroupMemoryCurrentBytesGauge: Gauge;
   cgroupMemoryMaxBytesGauge: Gauge;
@@ -4817,6 +4835,7 @@ function ensureRegistry(): {
     || !processRssReleaseLastDetectedTimestamp
     || !processRssReleaseLastBytes
     || !processRssReleaseSamples
+    || !processRssReleaseBoundBytes
     || !cgroupMemoryComponentBytes
     || !cgroupMemoryCurrentBytes
     || !cgroupMemoryMaxBytes
@@ -5551,6 +5570,26 @@ function ensureRegistry(): {
     // been observed yet" is ABSENT from the first scrape onward, and so that
     // property belongs to the metrics rather than to the order in which
     // `/metrics` happens to call its refreshers.
+    processRssReleaseBoundBytes = new Gauge({
+      name: PROCESS_RSS_RELEASE_BOUND_BYTES_METRIC,
+      help:
+        "The RSS release detector's own bounds, in bytes (PEN-3314). bound=threshold is the "
+        + "drawdown below the running high-water mark that opens an episode -- it bounds what is "
+        + "DETECTABLE: a shallower drawdown is not reported, and a release that completes and "
+        + "fully refills inside one 1s sample is invisible. bound=plateau_band is how far below "
+        + "the mark still counts as 'at the plateau' when stamping "
+        + PROCESS_RSS_RELEASE_LAST_ONSET_TIMESTAMP_METRIC
+        + " -- it bounds how LATE that stamp can be, because on a slow drain the onset lands at "
+        + "the last sample still inside the band (~4 s at the measured 3.6 MB/s). The band "
+        + "exists because the mark is an exact byte maximum and real RSS is noisy around a "
+        + "plateau: without it one high spike pins the onset to itself for the rest of the "
+        + "plateau, publishing an onset hours early. "
+        + "Published rather than left to these help strings because both values are injectable "
+        + "and a reader who cannot see the bound in force cannot tell a real null from an "
+        + "undetectable one. NOT an alert source.",
+      labelNames: ["bound"],
+      registers: [registry],
+    });
     processRssReleaseEvents.remove();
     processRssReleaseBytes.remove();
     processRssReleaseLastOnsetTimestamp.remove();
@@ -7355,6 +7394,7 @@ function ensureRegistry(): {
     processRssReleaseLastDetectedTimestampGauge: processRssReleaseLastDetectedTimestamp,
     processRssReleaseLastBytesGauge: processRssReleaseLastBytes,
     processRssReleaseSamplesGauge: processRssReleaseSamples,
+    processRssReleaseBoundBytesGauge: processRssReleaseBoundBytes,
     cgroupMemoryComponentBytesGauge: cgroupMemoryComponentBytes,
     cgroupMemoryCurrentBytesGauge: cgroupMemoryCurrentBytes,
     cgroupMemoryMaxBytesGauge: cgroupMemoryMaxBytes,
@@ -8517,6 +8557,7 @@ export function setRssReleaseMetrics(reading: RssReleaseReading | null): void {
   metrics.processRssReleaseLastDetectedTimestampGauge.remove();
   metrics.processRssReleaseLastBytesGauge.remove();
   metrics.processRssReleaseSamplesGauge.remove();
+  metrics.processRssReleaseBoundBytesGauge.reset();
   if (!reading) return;
 
   // Published even at 0, unlike the `last_*` series below: a live sampler that
@@ -8525,6 +8566,11 @@ export function setRssReleaseMetrics(reading: RssReleaseReading | null): void {
   metrics.processRssReleaseEventsGauge.set(reading.releaseCount);
   metrics.processRssReleaseBytesGauge.set(reading.releasedBytesTotal);
   metrics.processRssReleaseSamplesGauge.set(reading.sampleCount);
+  // The bounds in force, so every null above is readable as "below this" rather
+  // than as "nothing happened". Set from the reading, never from the constants,
+  // so an injected threshold cannot be contradicted by its own help text.
+  metrics.processRssReleaseBoundBytesGauge.set({ bound: "threshold" }, reading.thresholdBytes);
+  metrics.processRssReleaseBoundBytesGauge.set({ bound: "plateau_band" }, reading.plateauBandBytes);
 
   if (reading.lastOnsetAtMs !== null) {
     metrics.processRssReleaseLastOnsetTimestampGauge.set(reading.lastOnsetAtMs / 1000);
@@ -10362,6 +10408,7 @@ export function __resetMetricsForTest(): void {
   processRssReleaseLastDetectedTimestamp = null;
   processRssReleaseLastBytes = null;
   processRssReleaseSamples = null;
+  processRssReleaseBoundBytes = null;
   processLostTotal = null;
   externalLifecycleRunningRuns = null;
   externalLifecycleRunSilenceGap = null;
