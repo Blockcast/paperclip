@@ -5367,7 +5367,7 @@ export function agentRoutes(
           ...(strandedRecovery?.eligible
             ? {
                 strandedRunRecovery: true,
-                undispatchedForMs: strandedRecovery.queuedForMs,
+                undispatchedForMs: strandedRecovery.undispatchedForMs,
                 minAgeMs: STRANDED_RUN_RECOVERY_MIN_AGE_MS,
               }
             : {}),
