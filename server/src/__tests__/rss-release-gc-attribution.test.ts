@@ -12,19 +12,28 @@
  *    would reproduce the 30 s measurement this module exists to beat while
  *    looking like a 10 s one.
  *
- * 2. **Eviction is reported, not absorbed.** A window the ring can no longer
- *    cover must read `covered: false`. If it read as a smaller count instead,
- *    ring pressure would render as "GC did not fire near the onset" — the
- *    first positive-looking trigger result this row has ever had, and a false
- *    one. This is the single most dangerous failure mode in the module.
+ * 2. **An unobserved window is reported, not absorbed.** A window the ring can
+ *    no longer cover — evicted, or reaching back before the ring was watching
+ *    at all — must read `covered: false`. If it read as a smaller count
+ *    instead, ring pressure (or a release early in a generation) would render
+ *    as "GC did not fire near the onset" — the first positive-looking trigger
+ *    result this row has ever had, and a false one. This is the single most
+ *    dangerous failure mode in the module, and it has two halves: the ring's
+ *    oldest end and its START.
  *
- * 3. **Counts are frozen per episode.** Recomputing on every scrape would make
- *    a published measurement shrink over the following minutes as entries
- *    evicted, silently rewriting the past.
+ * 3. **Counts are frozen per episode — but only once the episode's window has
+ *    finished happening.** Recomputing on every scrape would make a published
+ *    measurement shrink over the following minutes as entries evicted, silently
+ *    rewriting the past; freezing a window whose tail is still in the future
+ *    would publish a truncated count as the exact one, which is the same error
+ *    pointing the other way.
  *
- * 4. **No episode publishes nothing.** "No release observed" and "a release was
- *    observed with no GC near it" are opposite findings, and the second is the
- *    result this row is waiting for.
+ * 4. **No episode publishes nothing, and neither does a contaminated control.**
+ *    "No release observed" and "a release was observed with no GC near it" are
+ *    opposite findings, and the second is the result this row is waiting for. A
+ *    baseline window holding the previous episode's onset is a second event
+ *    rather than an ambient stretch, so it is withheld rather than published as
+ *    a denominator.
  */
 
 import { describe, expect, it, beforeEach } from "vitest";
@@ -39,6 +48,7 @@ import {
   __resetRssReleaseGcAttributionForTest,
   attributeRssReleaseGc,
   DEFAULT_BASELINE_OFFSET_MS,
+  GC_ENTRY_DELIVERY_SLACK_MS,
 } from "../services/rss-release-gc-attribution.js";
 import type { RssReleaseReading } from "../services/rss-release-tracker.js";
 
@@ -100,6 +110,24 @@ describe("GC cycle ring", () => {
     expect(window.classes).toEqual([]);
   });
 
+  it("marks a window UNCOVERED when it reaches back before the ring was watching", () => {
+    // The ring begins observing at t=10_000; nothing before that was ever seen.
+    __resetGcCycleRingForTest(0, 10_000);
+    recordGcCycle(11_000, MAJOR, 0);
+
+    // Nothing was evicted, so the eviction test alone would call this exact --
+    // and publish an unobserved stretch as a measured zero, which on the
+    // baseline window reads as a large positive trigger result.
+    const beforeStart = readGcCyclesInWindow(5_000, 9_000);
+    expect(beforeStart.observedCycles).toBe(0);
+    expect(beforeStart.covered).toBe(false);
+
+    // Straddling the start is still only partly observed.
+    expect(readGcCyclesInWindow(9_999, 12_000).covered).toBe(false);
+    // From the start instant onward it is a real measurement.
+    expect(readGcCyclesInWindow(10_000, 12_000).covered).toBe(true);
+  });
+
   it("marks a window UNCOVERED once entries inside it have been evicted", () => {
     // Overflow the ring so the early entries are overwritten. Capacity is
     // 8192; writing 8193 evicts exactly the entry at t=1.
@@ -133,11 +161,11 @@ describe("release onset GC attribution", () => {
     // Same width, so the two counts are directly comparable — which is the
     // only way the onset count means anything at all.
     expect(attribution!.onset.toMs - attribution!.onset.fromMs).toBe(
-      attribution!.baseline.toMs - attribution!.baseline.fromMs,
+      attribution!.baseline!.toMs - attribution!.baseline!.fromMs,
     );
-    expect(attribution?.baseline.toMs).toBe(onset - DEFAULT_BASELINE_OFFSET_MS + 5_000);
+    expect(attribution?.baseline?.toMs).toBe(onset - DEFAULT_BASELINE_OFFSET_MS + 5_000);
     // And they must not overlap, or the baseline would include the event.
-    expect(attribution!.baseline.toMs).toBeLessThan(attribution!.onset.fromMs);
+    expect(attribution!.baseline!.toMs).toBeLessThan(attribution!.onset.fromMs);
   });
 
   it("separates an onset-clustered burst from the ambient baseline", () => {
@@ -155,12 +183,12 @@ describe("release onset GC attribution", () => {
 
     const attribution = attributeRssReleaseGc(readingWithOnset(onset));
 
-    expect(attribution?.baseline.observedCycles).toBe(11);
+    expect(attribution?.baseline?.observedCycles).toBe(11);
     expect(attribution?.onset.observedCycles).toBe(13);
     // The ambient class is flat across both windows; only the extra class
     // separates them. That contrast is the finding this series can carry, and
     // it is invisible to a 30 s counter, where both windows are one bucket.
-    expect(attribution?.baseline.classes).toEqual([
+    expect(attribution?.baseline?.classes).toEqual([
       { kind: "major", flags: "none", cycles: 11 },
     ]);
     expect(attribution?.onset.classes).toEqual([
@@ -186,5 +214,75 @@ describe("release onset GC attribution", () => {
     const third = attributeRssReleaseGc(readingWithOnset(onset + 60_000));
     expect(third).not.toBe(first);
     expect(third?.onset.observedCycles).toBe(0);
+  });
+
+  it("does NOT freeze an onset window that has not finished happening yet", () => {
+    const onset = 1_000_000;
+    recordGcCycle(onset - 1_000, MAJOR, 0);
+
+    // Detection can land ~1s after the onset, so a scrape can arrive while the
+    // window's tail is still in the future. Those cycles have not happened.
+    const open = attributeRssReleaseGc(readingWithOnset(onset), {
+      now: () => onset + 2_000,
+    });
+    expect(open?.onset.observedCycles).toBe(1);
+    // A count missing entries it should contain is a LOWER BOUND, not a result.
+    expect(open?.onset.covered).toBe(false);
+
+    // The rest of the window then happens.
+    recordGcCycle(onset + 3_000, MAJOR, 0);
+    recordGcCycle(onset + 4_500, MAJOR, IDLE);
+
+    const closed = attributeRssReleaseGc(readingWithOnset(onset), {
+      now: () => onset + 5_000 + GC_ENTRY_DELIVERY_SLACK_MS,
+    });
+    expect(closed).not.toBe(open);
+    expect(closed?.onset.observedCycles).toBe(3);
+    expect(closed?.onset.covered).toBe(true);
+
+    // And THAT is the reading that gets frozen for the episode.
+    __resetGcCycleRingForTest(0);
+    expect(attributeRssReleaseGc(readingWithOnset(onset), { now: () => onset + 600_000 }))
+      .toBe(closed);
+  });
+
+  it("withholds the baseline when the previous episode's onset falls inside it", () => {
+    const first = 1_000_000;
+    // The next episode lands exactly one baseline offset later, which puts the
+    // first onset in the centre of the second's control window.
+    const second = first + DEFAULT_BASELINE_OFFSET_MS;
+    const closed = (onsetAtMs: number) => ({ now: () => onsetAtMs + 600_000 });
+
+    expect(attributeRssReleaseGc(readingWithOnset(first), closed(first))?.baseline)
+      .not.toBeNull();
+
+    const contaminated = attributeRssReleaseGc(readingWithOnset(second), closed(second));
+    // Not a baseline of zero: a control containing the event is no control, and
+    // publishing it as a denominator is how an ambient signal becomes a finding.
+    expect(contaminated?.baseline).toBeNull();
+    expect(contaminated?.onset).not.toBeNull();
+
+    // A third episode, far enough out that the second's onset is clear of its
+    // control window, is measured normally again.
+    const third = second + DEFAULT_BASELINE_OFFSET_MS * 2;
+    expect(attributeRssReleaseGc(readingWithOnset(third), closed(third))?.baseline)
+      .not.toBeNull();
+  });
+
+  it("reads the baseline as UNCOVERED when it predates the ring", () => {
+    // Ring starts watching at t=900_000; an onset 100s later puts the baseline
+    // window (onset - 300s) 200s before anything was observed.
+    __resetGcCycleRingForTest(0, 900_000);
+    const onset = 1_000_000;
+
+    const attribution = attributeRssReleaseGc(readingWithOnset(onset), {
+      now: () => onset + 600_000,
+    });
+
+    expect(attribution?.baseline?.observedCycles).toBe(0);
+    // Without this the ratio onset/baseline is a division by an unmeasured 0 --
+    // a positive trigger result manufactured from a window nobody watched.
+    expect(attribution?.baseline?.covered).toBe(false);
+    expect(attribution?.onset.covered).toBe(true);
   });
 });

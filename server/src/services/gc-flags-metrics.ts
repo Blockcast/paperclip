@@ -318,6 +318,10 @@ export function registerGcFlagsCollector(
         };
       })();
 
+  // Observation begins HERE, not at module load: anchor the ring's coverage
+  // floor to it so a window reaching back before this instant reads as
+  // unobserved rather than as an exact zero. See `ringStartMs`.
+  ringStartMs = Date.now();
   observer.observe();
 
   let stopped = false;
@@ -373,6 +377,29 @@ let ringWritten = 0;
 let newestEvictedAtMs: number | null = null;
 
 /**
+ * Epoch instant from which this ring could have observed ANYTHING.
+ *
+ * Eviction is only half of coverage. A window that reaches back past the
+ * instant observation began was never observed either, and the ring cannot
+ * tell the two apart from its contents: both look like "no entry in range".
+ * Before the first eviction {@link newestEvictedAtMs} is `null`, so without
+ * this instant every such window read {@link GcCycleWindow.covered} as `true`
+ * — publishing an unobserved stretch as an exact zero.
+ *
+ * ⚠ That failure has a specific, likely shape on PEN-3314. A release in the
+ * first ~305 s of a generation (warm-up, then a drop) puts the BASELINE window
+ * of {@link module:server/services/rss-release-gc-attribution} — onset − 300 s
+ * — before this process was watching. An exact-looking baseline of 0 against a
+ * nonzero onset count is a large positive ratio, i.e. the first positive
+ * trigger result this row has ever had, manufactured out of a measurement that
+ * was never taken.
+ *
+ * Re-anchored when {@link registerGcFlagsCollector} installs the observer,
+ * because that — not module load — is when entries begin arriving.
+ */
+let ringStartMs = Date.now();
+
+/**
  * `performance.timeOrigin`, read once.
  *
  * `PerformanceEntry.startTime` is milliseconds since the time origin, not an
@@ -380,6 +407,15 @@ let newestEvictedAtMs: number | null = null;
  * `Date.now()`-derived timestamps from the RSS sampler. Converting at write
  * time keeps the two instruments on one clock, which is the entire point of
  * dating anything at 1 s.
+ *
+ * ⚠ Not the SAME clock, strictly: `timeOrigin + startTime` rides the monotonic
+ * clock while the sampler's stamps ride the wall clock, so NTP slew separates
+ * them by however much the wall clock was corrected since process start. That
+ * is a drift of well under a second at this fleet's uptimes — immaterial
+ * against a 10 s window and the onset stamp's own ~4 s lateness — but it is a
+ * drift, not a fixed offset, and it would matter to anyone narrowing the window
+ * toward the ±1 s the onset is dated at. Re-anchoring per entry would cost a
+ * `Date.now()` inside the GC callback and buy nothing at the current width.
  */
 let timeOriginMs = performance.timeOrigin;
 
@@ -479,18 +515,23 @@ export function readGcCyclesInWindow(fromMs: number, toMs: number): GcCycleWindo
     toMs,
     classes,
     observedCycles,
-    covered: newestEvictedAtMs === null || newestEvictedAtMs < fromMs,
+    covered:
+      fromMs >= ringStartMs && (newestEvictedAtMs === null || newestEvictedAtMs < fromMs),
   };
 }
 
 /** Reset ring state between tests. Not for production use. */
-export function __resetGcCycleRingForTest(originMs?: number): void {
+export function __resetGcCycleRingForTest(originMs?: number, startMs?: number): void {
   ringAtMs.fill(0);
   ringKind.fill(0);
   ringFlags.fill(0);
   ringWritten = 0;
   newestEvictedAtMs = null;
   timeOriginMs = originMs ?? performance.timeOrigin;
+  // Defaults to the injected origin, so a test that places synthetic entries on
+  // an origin-relative axis gets a ring that was "watching" from its own zero.
+  // Pass `startMs` explicitly to test the window-precedes-the-ring case.
+  ringStartMs = startMs ?? originMs ?? Date.now();
 }
 
 /** Epoch instant of a `gc` entry, which carries time-origin-relative `startTime`. */
