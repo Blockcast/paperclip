@@ -50,6 +50,16 @@
  * publishing it. The counts are computed once per distinct onset instant and
  * held, so they describe the episode rather than the ring's current contents.
  *
+ * ⚠ But only once the window has CLOSED. Detection can land ~1 s after the
+ * onset — a single sample can clear the whole threshold — so a scrape
+ * arriving inside `[onset, onset + 5 s]` would count a window whose tail is
+ * still in the future, and freezing THAT would publish a truncated count as
+ * the episode's exact one: the same error shape the ring's eviction test
+ * exists to prevent. Until the window closes (plus
+ * {@link GC_ENTRY_DELIVERY_SLACK_MS} for the observer's asynchronous entry
+ * delivery) the onset counts are published as a LOWER BOUND, `covered: false`,
+ * and recounted on the next scrape.
+ *
  * ## What it is not
  *
  * ⛔ Not a fix, not an alert source, and PEN-3314 does not close on it.
@@ -96,16 +106,45 @@ export const DEFAULT_ONSET_WINDOW_HALF_MS = 5_000;
  * ⚠ It is ONE window, not a long-run average, so it carries the sampling noise
  * of ~5 cycles. Read it as an order-of-magnitude control, and read
  * {@link RssReleaseGcAttribution.baseline}'s `covered` before reading it at all.
+ *
+ * ⚠ "Contains no onset" is enforced rather than assumed: the baseline is
+ * `null`, and nothing is published for it, when the PREVIOUS episode's onset
+ * falls inside it. See {@link RssReleaseGcAttribution.baseline}.
  */
 export const DEFAULT_BASELINE_OFFSET_MS = 300_000;
+
+/**
+ * How long after a window's end it is treated as CLOSED, in ms.
+ *
+ * `PerformanceObserver` delivers `gc` entries asynchronously — the callback
+ * runs after the cycle it describes, not during it — so a window counted at
+ * exactly `toMs` can still be short by the delivery lag. One second sits far
+ * above that lag (entries are queued and drained on the next turn) and far
+ * below the 30 s scrape that governs when the recount actually happens, so it
+ * costs nothing and removes the race.
+ */
+export const GC_ENTRY_DELIVERY_SLACK_MS = 1_000;
 
 export interface RssReleaseGcAttribution {
   /** The onset this describes. Identifies the episode; the counts never move once set. */
   readonly onsetAtMs: number;
   /** Window centred on {@link onsetAtMs}. */
   readonly onset: GcCycleWindow;
-  /** Same-width window {@link DEFAULT_BASELINE_OFFSET_MS} earlier, containing no onset. */
-  readonly baseline: GcCycleWindow;
+  /**
+   * Same-width window {@link DEFAULT_BASELINE_OFFSET_MS} earlier, containing no onset.
+   *
+   * `null` when the PREVIOUS episode's onset falls inside that window, which
+   * would make it a second event rather than the ambient control it is read as.
+   * ⛔ A `null` baseline is not a baseline of zero: with no control the
+   * onset count is uninterpretable, so nothing is published for either window's
+   * comparison and the reader is left with the absence rather than with a ratio
+   * computed against a contaminated denominator.
+   *
+   * Best-effort within one process: the prior onset is known only from an
+   * episode this module has already attributed, so the very first episode after
+   * a restart cannot be checked against one that predates it.
+   */
+  readonly baseline: GcCycleWindow | null;
   /** Full width of both windows, in ms. Published so a count is readable as a rate. */
   readonly windowMs: number;
 }
@@ -115,9 +154,21 @@ export interface AttributeRssReleaseGcOptions {
   readonly baselineOffsetMs?: number;
   /** Injected by the test so windows can be counted without a real GC stream. */
   readonly readWindow?: (fromMs: number, toMs: number) => GcCycleWindow;
+  /** Injected by the test so a scrape can be placed inside an open window. */
+  readonly now?: () => number;
 }
 
 let memo: RssReleaseGcAttribution | null = null;
+/** Newest onset this module has attributed, whether or not it was frozen. */
+let seenOnsetAtMs: number | null = null;
+/**
+ * The onset before {@link seenOnsetAtMs}.
+ *
+ * Kept only to answer "is the baseline window clean?" — see
+ * {@link RssReleaseGcAttribution.baseline}. The tracker publishes one onset at
+ * a time, so this is the only record of the previous one once it is superseded.
+ */
+let priorOnsetAtMs: number | null = null;
 
 /**
  * Compute (or recall) the GC windows around the reading's most recent onset.
@@ -141,17 +192,44 @@ export function attributeRssReleaseGc(
   const baselineOffsetMs = options.baselineOffsetMs ?? DEFAULT_BASELINE_OFFSET_MS;
   const readWindow = options.readWindow ?? readGcCyclesInWindow;
 
+  const nowMs = (options.now ?? Date.now)();
+  // A new onset supersedes the last one, which becomes the episode the control
+  // window must be checked against. Tracked here rather than off `memo`, which
+  // holds only FROZEN episodes and so would skip one whose window was still
+  // open when the next arrived.
+  if (seenOnsetAtMs !== null && seenOnsetAtMs !== onsetAtMs) priorOnsetAtMs = seenOnsetAtMs;
+  seenOnsetAtMs = onsetAtMs;
+
   const baselineCentreMs = onsetAtMs - baselineOffsetMs;
-  memo = {
+  const baselineFromMs = baselineCentreMs - halfMs;
+  const baselineToMs = baselineCentreMs + halfMs;
+  // A previous onset inside the control window makes it a second event, not an
+  // ambient stretch. Refuse the comparison rather than publish a denominator
+  // that quietly contains the thing being measured.
+  const baselineContainsPriorOnset =
+    priorOnsetAtMs !== null && priorOnsetAtMs >= baselineFromMs && priorOnsetAtMs <= baselineToMs;
+
+  const onset = readWindow(onsetAtMs - halfMs, onsetAtMs + halfMs);
+  // Has the onset window finished happening? If not, every entry still to come
+  // in it is missing from this count, which is exactly what `covered: false`
+  // means — a LOWER BOUND, not a measurement.
+  const windowClosed = nowMs >= onset.toMs + GC_ENTRY_DELIVERY_SLACK_MS;
+  const attribution: RssReleaseGcAttribution = {
     onsetAtMs,
-    onset: readWindow(onsetAtMs - halfMs, onsetAtMs + halfMs),
-    baseline: readWindow(baselineCentreMs - halfMs, baselineCentreMs + halfMs),
+    onset: windowClosed ? onset : { ...onset, covered: false },
+    baseline: baselineContainsPriorOnset ? null : readWindow(baselineFromMs, baselineToMs),
     windowMs: halfMs * 2,
   };
-  return memo;
+
+  // Freeze only a closed window. An open one is republished — and recounted --
+  // on the next scrape, by which time the ring has the whole window in it.
+  if (windowClosed) memo = attribution;
+  return attribution;
 }
 
 /** Reset module state between tests. Not for production use. */
 export function __resetRssReleaseGcAttributionForTest(): void {
   memo = null;
+  seenOnsetAtMs = null;
+  priorOnsetAtMs = null;
 }

@@ -5685,7 +5685,11 @@ function ensureRegistry(): {
         + "absence of measurement read as a measurement, which is the error shape this row has "
         + "already paid for twice (v8_heap_physical read as a metric name; size_bucket read as "
         + "bucket_bytes). A 0 is most likely on window=baseline early in a generation, where the "
-        + "ring simply does not reach back 300s yet. NOT an alert source.",
+        + "ring does not reach back 300s yet -- either because it has evicted that far or because "
+        + "the process was not yet watching, both of which read as 0 here. A window=baseline that "
+        + "is ABSENT rather than 0 is a third case: the previous release's onset fell inside the "
+        + "control window, so no control is published and the onset counts beside it are not "
+        + "readable as a ratio. NOT an alert source.",
       labelNames: ["window"],
       registers: [registry],
     });
@@ -8702,6 +8706,13 @@ export function setRssReleaseMetrics(reading: RssReleaseReading | null): void {
  * "a release was observed and no GC fired near it" are opposite findings on
  * this row, and the second one is the result it is waiting for — rendering the
  * first as a set of zeroes would hand it that result for free.
+ *
+ * A `null` BASELINE publishes nothing for `window="baseline"`, for the same
+ * reason at smaller scale: it means the control window was contaminated by the
+ * previous episode's onset, and an absent control must not render as a control
+ * of zero. The onset series is still published, and by the help text's own
+ * rule ("read both or neither") it is then not readable — which is the correct
+ * outcome rather than a missing-data accident.
  */
 export function setRssReleaseGcAttributionMetrics(
   attribution: RssReleaseGcAttribution | null,
@@ -8717,6 +8728,9 @@ export function setRssReleaseGcAttributionMetrics(
     ["onset", attribution.onset],
     ["baseline", attribution.baseline],
   ] as const) {
+    // A contaminated control is withheld entirely — see the docblock. Not even
+    // its coverage flag is published, since there is no window to qualify.
+    if (!counts) continue;
     // Coverage first, and published for BOTH windows even when the class list
     // below is empty: an empty distribution is only readable as "no GC fired"
     // when the ring is known to have held the window it was counted over.
