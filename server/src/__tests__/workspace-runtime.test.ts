@@ -29,6 +29,7 @@ import {
   buildWorkspaceTemplateData,
   cleanupExecutionWorkspaceArtifacts,
   ensureGitWorktreeBranchCoherent,
+  relinkHuskGitWorktree,
   ensurePersistedExecutionWorkspaceAvailable,
   ensureServerWorkspaceLinksCurrent,
   ensureRuntimeServicesForRun,
@@ -8170,6 +8171,22 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
       .toBe(await fs.realpath(worktreePath));
     expect((await readGit(worktreePath, ["symbolic-ref", "--short", "HEAD"])).trim()).toBe(expectedBranch);
     expect(await snapshot()).toEqual(before);
+  }, 20_000);
+
+  it("concurrent re-links of one husk both report a healthy worktree (BLO-49622)", async () => {
+    const { repoRoot, worktreePath } = await createDirtyMismatchRepo({
+      expectedBranch: "PAP-49622-a",
+      actualBranch: "PAP-49622-b",
+    });
+    await fs.rm(path.join(worktreePath, ".git"));
+
+    // The loser of the exclusive create must not report a healthy worktree as unrepairable.
+    expect(await Promise.all([
+      relinkHuskGitWorktree(repoRoot, worktreePath),
+      relinkHuskGitWorktree(repoRoot, worktreePath),
+    ])).toEqual([true, true]);
+    expect((await readGit(worktreePath, ["rev-parse", "--show-toplevel"])).trim())
+      .toBe(await fs.realpath(worktreePath));
   }, 20_000);
 
   it("refuses dirty quarantine repair while the execution workspace has an active runtime service", async () => {
