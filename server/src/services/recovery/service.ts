@@ -9568,11 +9568,12 @@ export function recoveryService(
     // the pass died before it had a population — which is itself the reading, and
     // is why this is not defaulted to 0: a pass that threw in `candidateQuery` and
     // a pass that genuinely found no candidates are different failures.
-    const scanned: { candidates: number | null } = { candidates: null };
+    const scanned: { candidates: number | null; stoppedForShutdown?: boolean } = { candidates: null };
     let completed = false;
     try {
       const swept = await runStrandedAssignedIssueSweep(opts, passTimer, scanned);
-      completed = true;
+      // BLO-49596: a shutdown-truncated pass is not complete.
+      completed = !scanned.stoppedForShutdown;
       return swept;
     } finally {
       activePassTimer = null;
@@ -9632,6 +9633,7 @@ export function recoveryService(
             // partial total reads exactly like a whole one, and every phase total
             // beside it would be silently understated.
             completed,
+            stoppedForShutdown: scanned.stoppedForShutdown ?? false,
           },
           "stranded assigned issue sweep phase timing",
         );
@@ -9644,7 +9646,7 @@ export function recoveryService(
   async function runStrandedAssignedIssueSweep(
     opts: { issueCreatedAtGte?: Date | null; shouldStop?: () => boolean } | undefined,
     passTimer: PassTimer,
-    scanned: { candidates: number | null },
+    scanned: { candidates: number | null; stoppedForShutdown?: boolean },
   ) {
     const dependencyWaitEscalationSuppressedAtSweepStart = dependencyWaitEscalationSuppressedTotal;
     const dependencyWaitEscalationSuppressedDependencyReadyAtSweepStart =
@@ -11505,7 +11507,10 @@ export function recoveryService(
     };
 
     for (const issue of candidates) {
-      if (opts?.shouldStop?.()) break;
+      if (opts?.shouldStop?.()) {
+        scanned.stoppedForShutdown = true;
+        break;
+      }
       try {
         await passTimer.candidate(issue.id, () => reconcileStrandedCandidate(issue));
       } catch (err) {
@@ -11542,7 +11547,8 @@ export function recoveryService(
     // the main loop, while `result.skipped` is shared between the two. So until this
     // phase had a number, an unknown share of pass 1 was unattributable by
     // construction.
-    const orphanBlockerRecovery = opts?.shouldStop?.()
+    if (opts?.shouldStop?.()) scanned.stoppedForShutdown = true;
+    const orphanBlockerRecovery = scanned.stoppedForShutdown
       ? { assigned: 0, skipped: 0, issueIds: [] as string[] }
       : await passTimer.time(
         "orphanBlockerSweep",

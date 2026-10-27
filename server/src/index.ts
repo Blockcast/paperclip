@@ -1560,6 +1560,10 @@ export async function startServer(): Promise<StartedServer> {
             logger.error({ err }, "startup hot-restart adoption wait failed");
           }
 
+          // BLO-49596 (Ally on #3048): this chain also runs on lease takeover, so a
+          // SIGTERM can land mid-chain. Stop between passes once shutdown starts, so
+          // the 20 s idle-wait backstop only ever covers the one in-flight step.
+          if (heartbeatSchedulerStopped) return;
           for (let attempt = 1; attempt <= 2; attempt++) {
             try {
               const result = await heartbeat.reapOrphanedRuns();
@@ -1582,6 +1586,7 @@ export async function startServer(): Promise<StartedServer> {
 
           // Lock cleanup must not be starved by failures in the broader recovery
           // sequence: stale checkout ownership can prevent every later run.
+          if (heartbeatSchedulerStopped) return;
           try {
             const swept = await heartbeat.sweepStaleIssueLocks();
             if (swept.cleared > 0) {
@@ -1594,6 +1599,7 @@ export async function startServer(): Promise<StartedServer> {
           // BLO-21621: terminalize queued runs whose issue lock has already
           // moved on or gone empty, so a detached run cannot sit invisible to
           // every other recovery sweep indefinitely.
+          if (heartbeatSchedulerStopped) return;
           try {
             const detached = await heartbeat.reconcileDetachedQueuedRuns();
             if (detached.terminalized > 0) {
@@ -1619,6 +1625,7 @@ export async function startServer(): Promise<StartedServer> {
           // in the periodic chain, so this leaves both chains' dispatch semantics
           // identical and only changes what happens AFTER the pair.
           let promotion: Awaited<ReturnType<typeof heartbeat.promoteDueScheduledRetries>> | null = null;
+          if (heartbeatSchedulerStopped) return;
           try {
             promotion = await heartbeat.promoteDueScheduledRetries();
             await heartbeat.resumeQueuedRuns();
@@ -1658,8 +1665,11 @@ export async function startServer(): Promise<StartedServer> {
           // re-runs every tick, so a transient fault there costs one interval.
           // This sequence runs exactly once: a rejection here means those passes
           // do not run again until the process restarts.
+          if (heartbeatSchedulerStopped) return;
           try {
-            const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
+            const reconciled = await heartbeat.reconcileStrandedAssignedIssues({
+              shouldStop: () => heartbeatSchedulerStopped,
+            });
             if (
               (promotion?.promoted ?? 0) > 0 ||
               reconciled.assignmentDispatched > 0 ||
@@ -1685,6 +1695,7 @@ export async function startServer(): Promise<StartedServer> {
             logger.error({ err }, "startup stranded-assigned-issue reconciliation failed");
           }
 
+          if (heartbeatSchedulerStopped) return;
           try {
             const issueGraphReconciled = await heartbeat.reconcileIssueGraphLiveness();
             if (
@@ -1701,6 +1712,7 @@ export async function startServer(): Promise<StartedServer> {
             logger.error({ err }, "startup issue-graph liveness reconciliation failed");
           }
 
+          if (heartbeatSchedulerStopped) return;
           try {
             const taskWatchdogsReconciled = await heartbeat.reconcileTaskWatchdogs();
             if (taskWatchdogsReconciled.triggered > 0) {
@@ -1713,6 +1725,7 @@ export async function startServer(): Promise<StartedServer> {
             logger.error({ err }, "startup task-watchdog reconciliation failed");
           }
 
+          if (heartbeatSchedulerStopped) return;
           try {
             const scanned = await heartbeat.scanSilentActiveRuns();
             if (scanned.created > 0 || scanned.escalated > 0) {
@@ -1722,6 +1735,7 @@ export async function startServer(): Promise<StartedServer> {
             logger.error({ err }, "startup active-run output watchdog failed");
           }
 
+          if (heartbeatSchedulerStopped) return;
           try {
             const reviewed = await heartbeat.reconcileProductivityReviews();
             // BLO-30303 AC4: log the funnel counters unconditionally. Gating this
@@ -1737,6 +1751,7 @@ export async function startServer(): Promise<StartedServer> {
             logger.error({ err }, "startup productivity reconciliation failed");
           }
 
+          if (heartbeatSchedulerStopped) return;
           try {
             const blockerDependentsSwept = await heartbeat.reconcileResolvedBlockerDependents();
             if (blockerDependentsSwept.woken > 0 || blockerDependentsSwept.failed > 0) {
@@ -1746,6 +1761,7 @@ export async function startServer(): Promise<StartedServer> {
             logger.error({ err }, "startup resolved-blocker-dependents sweep failed");
           }
 
+          if (heartbeatSchedulerStopped) return;
           try {
             // PEN-4385: drain any dependency-blocked `queued` rows this process
             // inherited before waiting a full tick. These age without bound, so
@@ -1761,6 +1777,7 @@ export async function startServer(): Promise<StartedServer> {
             logger.error({ err }, "startup unclaimable-queued-run reap failed");
           }
 
+          if (heartbeatSchedulerStopped) return;
           try {
             const deadMonitors = await heartbeat.reconcileUndeliverableIssueMonitors();
             if (deadMonitors.cleared > 0 || deadMonitors.failed > 0) {
@@ -1773,6 +1790,7 @@ export async function startServer(): Promise<StartedServer> {
             logger.error({ err }, "startup undeliverable-monitor reconciliation failed");
           }
 
+          if (heartbeatSchedulerStopped) return;
           try {
             const failedWakeDispatches = await heartbeat.reconcileFailedWakeDispatches();
             if (failedWakeDispatches.recovered > 0 || failedWakeDispatches.exhausted > 0) {
@@ -1796,6 +1814,7 @@ export async function startServer(): Promise<StartedServer> {
           // Tested, not assumed (BLO-45212): this chain also runs on a lease
           // takeover, and a process that held the lease earlier may still have a
           // periodic collector pass in flight.
+          if (heartbeatSchedulerStopped) return;
           if (!executionWorkspaceCollectorInFlight) {
             executionWorkspaceCollectorInFlight = true;
             executionWorkspaceCollectorStartedAt = Date.now();
