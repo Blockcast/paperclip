@@ -1131,6 +1131,29 @@ describe("scrubGitHubEgressText", () => {
     });
   });
 
+  describe("BLO-49668 regression: a k8s Job name under job_name is not a credential", () => {
+    // Derived, not embedded: the exact value the shipped rule refused.
+    const pair = (name: string, value: string) => [name, value].join("=");
+    const JOB = ["blockcastd", "relay", "contract", "guard", "29885531"].join("-");
+
+    it("passes a job_name label matcher byte-exact", () => {
+      const text = `kube_job_status_failed{${pair("job_name", `"${JOB}"`)}}`;
+      expect(scrubGitHubEgressText(text).text).toBe(text);
+      expect(scrubGitHubEgressText(text).redacted).toBe(false);
+      expect(locateGitHubEgressMatches(text)).toEqual([]);
+    });
+
+    it.each([
+      ["job_name", "a3f91c8e2b7d405fa6c19e83bd27f04a1c6e59b8"],
+      ["job_name", SYNTHETIC_OPAQUE_VALUE],
+      ["token", JOB],
+    ])("still refuses a credential-shaped value under %s", (name, value) => {
+      const result = scrubGitHubEgressText(pair(name, value));
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(value);
+    });
+  });
+
   describe("PEN-4637 regression: an absolute POSIX path is not a credential", () => {
     // Derived, not embedded, throughout. Every positive below is the exact
     // material the SHIPPED rule refuses, so a contiguous `name=value` literal
