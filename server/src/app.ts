@@ -78,9 +78,11 @@ import {
   refreshFdClassMetrics,
   refreshNativeMemoryMetrics,
   refreshProcessMappingMetrics,
+  refreshRssReleaseMetrics,
   startScrapeMetricsCollector,
 } from "./services/scrape-metrics-collector.js";
 import { startHeapPeakTracking } from "./services/heap-peak-tracker.js";
+import { startRssReleaseTracking } from "./services/rss-release-tracker.js";
 import { pluginUiStaticRoutes } from "./routes/plugin-ui-static.js";
 import { readBrandedStaticIndexHtml } from "./static-index-html.js";
 import { applyUiBranding } from "./ui-branding.js";
@@ -361,6 +363,7 @@ export async function createApp(
       refreshAgentStartLockMetrics();
       refreshFdClassMetrics();
       refreshNativeMemoryMetrics();
+      refreshRssReleaseMetrics();
       refreshCgroupMemoryMetrics();
       refreshProcessMappingMetrics();
       const { contentType, body } = await renderMetrics();
@@ -1188,6 +1191,12 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
   // Started beside the scrape collector and for the same reason: every tier is a
   // scrape target, and the api tier is where the 3 GB excursion was first caught.
   const stopHeapPeakTracking = startHeapPeakTracking();
+  // PEN-3314: date the RSS RELEASE, which the peak sampler above cannot see --
+  // a high-water mark never goes down. Started on the same 1 s grid as that
+  // sampler so the two readings do not have to be reconciled before they can be
+  // compared, and on every tier for the same reason: the release has been
+  // observed on both the worker and the api.
+  const stopRssReleaseTracking = startRssReleaseTracking();
   if (appConfig.paperclipNodeRole === "api") {
     logger.info(
       { role: appConfig.paperclipNodeRole },
@@ -1317,6 +1326,7 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
     stopScrapeMetricsCollector();
     stopProjectCheckoutOriginReconciler();
     stopHeapPeakTracking();
+    stopRssReleaseTracking();
     await stopIssueCommentEffectReconciler?.();
     disableFeedbackExportFlushes();
     devWatcher?.close();

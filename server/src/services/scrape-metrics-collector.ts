@@ -39,6 +39,7 @@ import {
   refreshScheduledRetryParkHorizonMetrics,
 } from "./queued-run-age-metrics.js";
 import { refreshRoutineFireGapMetrics } from "./routine-fire-gap-metrics.js";
+import { readRssReleases } from "./rss-release-tracker.js";
 import {
   setAgentStartLockHeldMetrics,
   setAcceptedInteractionOutcomeMetricsRefreshSuccess,
@@ -50,6 +51,7 @@ import {
   setCgroupMemoryMetrics,
   setNativeMemoryMetrics,
   setProcessMappingMetrics,
+  setRssReleaseMetrics,
   setOverdueScheduledRetryAgeMetricsRefreshSuccess,
   setQueuedRunAgeMetricsRefreshSuccess,
   setRoutineFireGapMetricsRefreshSuccess,
@@ -323,6 +325,25 @@ export function refreshFdClassMetrics(): void {
  */
 export function refreshNativeMemoryMetrics(): void {
   setNativeMemoryMetrics(collectNativeMemorySnapshot());
+}
+
+/**
+ * PEN-3314: publish the RSS release record on the scrape path.
+ *
+ * The cheapest refresher in this file by a wide margin, and deliberately so: it
+ * takes no reading of its own. The 1 s sampler has already folded every sample
+ * into a handful of scalars, so this republishes in-process state and performs
+ * no syscall at all.
+ *
+ * That asymmetry is the design. The measurement has to happen at 1 Hz to date a
+ * release to the second, and it cannot happen on the scrape path, which runs at
+ * 60 s — so the sampler owns the reading and the scrape owns only the publish.
+ * Contrast {@link refreshProcessMappingMetrics}, whose reading is floored at a
+ * 300 s cadence by its own O(resident pages) cost; that floor is precisely the
+ * resolution limit this instrument exists to get under.
+ */
+export function refreshRssReleaseMetrics(): void {
+  setRssReleaseMetrics(readRssReleases());
 }
 
 /**

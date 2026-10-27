@@ -53,6 +53,7 @@ import type { FdClassSnapshot } from "./fd-class-metrics.js";
 import type { CgroupMemorySnapshot } from "./cgroup-memory-metrics.js";
 import type { NativeMemorySnapshot } from "./native-memory-metrics.js";
 import type { ProcessMappingSnapshot } from "./process-mapping-metrics.js";
+import type { RssReleaseReading } from "./rss-release-tracker.js";
 import { registerGcFlagsCollector } from "./gc-flags-metrics.js";
 
 export const CONCURRENT_RUN_BLOCKED_METRIC = "claude_k8s_concurrent_run_blocked_total";
@@ -2009,6 +2010,81 @@ export const PROCESS_MAPPING_SCAN_TIMESTAMP_METRIC =
  * `..._bytes` gauge.
  */
 export const PROCESS_HEAP_PEAK_SAMPLES_METRIC = "paperclip_process_heap_peak_samples";
+
+/**
+ * Count of RSS RELEASE episodes this process has detected (PEN-3314).
+ *
+ * The counterpart to {@link PROCESS_HEAP_PEAK_SAMPLES_METRIC}'s maxima, and the
+ * series that exists because a maximum cannot go down. PEN-3314's open question
+ * is what triggers the wholesale return of ~800 MB of single-V8-page mappings,
+ * and as of 2026-10-26 NOTHING in Prometheus marks the instant: not GC, not
+ * in-flight runs, not dispatch, not node PSI. The finest timestamp available was
+ * +/-300 s, floored by the `/proc/self/smaps` scan's own cost.
+ *
+ * Monotonic within a process; on restart the series goes ABSENT and reappears
+ * from 0 rather than stepping down, so read it with `increase()`, never as a
+ * level. NOT an alert source.
+ */
+export const PROCESS_RSS_RELEASE_EVENTS_METRIC = "paperclip_process_rss_release_events";
+
+/**
+ * Cumulative peak-to-trough bytes returned across every episode (PEN-3314).
+ *
+ * Separates a generation that releases often and shallowly from one that
+ * releases once and deeply — two shapes with the same event count. Monotonic
+ * within a process; read with `increase()`.
+ */
+export const PROCESS_RSS_RELEASE_BYTES_METRIC = "paperclip_process_rss_release_bytes";
+
+/**
+ * Unix time of the START of the most recent drawdown (PEN-3314).
+ *
+ * ⭐ The headline series: the instant a trigger search aligns against. It is the
+ * LAST 1 s sample at which RSS stood at its pre-release high, not the first
+ * sample below it and not the first time that high was reached — a plateau can
+ * run for hours, and dating the onset from when the climb stopped would point a
+ * search at an arbitrary quiet instant.
+ *
+ * ABSENT until an episode is observed, deliberately. A 0 here is epoch 1970 and
+ * would make `time() - this` read as 56 years of staleness — the same hazard
+ * {@link PROCESS_MAPPING_SCAN_TIMESTAMP_METRIC} is dropped at construction for.
+ */
+export const PROCESS_RSS_RELEASE_LAST_ONSET_TIMESTAMP_METRIC =
+  "paperclip_process_rss_release_last_onset_timestamp_seconds";
+
+/**
+ * Unix time at which that drawdown first crossed the detection threshold
+ * (PEN-3314).
+ *
+ * Read WITH {@link PROCESS_RSS_RELEASE_LAST_ONSET_TIMESTAMP_METRIC}: the gap
+ * between them is the time taken to shed a FIXED number of bytes, so it is
+ * comparable across episodes and it is what separates the two shapes this row
+ * has measured. ~1 s apart is a step that completed inside one scrape; minutes
+ * apart is the ~15 minute, 3.3 GB drain. A reader holding only the detection
+ * instant cannot tell them apart and would align against the wrong end of a
+ * 15 minute window. ABSENT until an episode is observed.
+ */
+export const PROCESS_RSS_RELEASE_LAST_DETECTED_TIMESTAMP_METRIC =
+  "paperclip_process_rss_release_last_detected_timestamp_seconds";
+
+/**
+ * Peak-to-trough size of the most recent episode, in bytes (PEN-3314).
+ *
+ * Grows while a drain is still deepening, so it is the episode's running total
+ * rather than its value at detection. ABSENT until an episode is observed.
+ */
+export const PROCESS_RSS_RELEASE_LAST_BYTES_METRIC = "paperclip_process_rss_release_last_bytes";
+
+/**
+ * Liveness of the 1 s RSS sampler (PEN-3314).
+ *
+ * The qualifier WITHOUT WHICH the event count cannot be read at all: "sampled
+ * 40 000 times and saw no drawdown past 64 MiB" and "the sampler never ran" are
+ * both a zero event count and opposite conclusions. Same role, and same
+ * `rate()`-reads-the-stall property, as {@link PROCESS_HEAP_PEAK_SAMPLES_METRIC}.
+ * Never published at 0; absent means the sampler has not ticked.
+ */
+export const PROCESS_RSS_RELEASE_SAMPLES_METRIC = "paperclip_process_rss_release_samples";
 
 /**
  * `setting` label of the series carrying the pool's OWN idle-in-transaction
@@ -4376,6 +4452,12 @@ let processGlibcSecondaryArenaHeapCount: Gauge | null = null;
 let processMappingScanSeconds: Gauge | null = null;
 let processMappingScanTimestamp: Gauge | null = null;
 let processHeapPeakSamples: Gauge | null = null;
+let processRssReleaseEvents: Gauge | null = null;
+let processRssReleaseBytes: Gauge | null = null;
+let processRssReleaseLastOnsetTimestamp: Gauge | null = null;
+let processRssReleaseLastDetectedTimestamp: Gauge | null = null;
+let processRssReleaseLastBytes: Gauge | null = null;
+let processRssReleaseSamples: Gauge | null = null;
 let cgroupMemoryComponentBytes: Gauge<"component"> | null = null;
 let cgroupMemoryCurrentBytes: Gauge | null = null;
 let cgroupMemoryMaxBytes: Gauge | null = null;
@@ -4559,6 +4641,12 @@ function ensureRegistry(): {
   processMappingScanSecondsGauge: Gauge;
   processMappingScanTimestampGauge: Gauge;
   processHeapPeakSamplesGauge: Gauge;
+  processRssReleaseEventsGauge: Gauge;
+  processRssReleaseBytesGauge: Gauge;
+  processRssReleaseLastOnsetTimestampGauge: Gauge;
+  processRssReleaseLastDetectedTimestampGauge: Gauge;
+  processRssReleaseLastBytesGauge: Gauge;
+  processRssReleaseSamplesGauge: Gauge;
   cgroupMemoryComponentBytesGauge: Gauge<"component">;
   cgroupMemoryCurrentBytesGauge: Gauge;
   cgroupMemoryMaxBytesGauge: Gauge;
@@ -4723,6 +4811,12 @@ function ensureRegistry(): {
     || !processMappingScanSeconds
     || !processMappingScanTimestamp
     || !processHeapPeakSamples
+    || !processRssReleaseEvents
+    || !processRssReleaseBytes
+    || !processRssReleaseLastOnsetTimestamp
+    || !processRssReleaseLastDetectedTimestamp
+    || !processRssReleaseLastBytes
+    || !processRssReleaseSamples
     || !cgroupMemoryComponentBytes
     || !cgroupMemoryCurrentBytes
     || !cgroupMemoryMaxBytes
@@ -5365,6 +5459,104 @@ function ensureRegistry(): {
     // scrape onward, and so that property belongs to the metric rather than to
     // the order in which `/metrics` happens to call its refreshers.
     processHeapPeakSamples.remove();
+    processRssReleaseEvents = new Gauge({
+      name: PROCESS_RSS_RELEASE_EVENTS_METRIC,
+      help:
+        "RSS release episodes detected by the 1s sampler over this process's life (PEN-3314). "
+        + "An episode opens when resident memory falls 64 MiB below its running high-water "
+        + "mark and closes when it recovers 64 MiB above the trough. This is the counterpart "
+        + "to the *_peak components of "
+        + PROCESS_MEMORY_COMPONENT_BYTES_METRIC
+        + ", which are maxima and so cannot record a release at all. "
+        + "It is a DRAWDOWN detector, not a per-sample delta: the measured 3.3 GB release took "
+        + "~15 minutes (~3.6 MB/s), which no edgewise threshold above ordinary churn would ever "
+        + "catch, so one episode covers a whole drain rather than minting an event per sample. "
+        + "Monotonic within a process; on restart the series goes ABSENT and reappears from 0 "
+        + "rather than stepping down, so read it with increase() and never as a level. "
+        + "A ZERO IS NOT EVIDENCE THAT NO RELEASE OCCURRED -- read it against "
+        + PROCESS_RSS_RELEASE_SAMPLES_METRIC
+        + ", without which 'sampled 40000 times and saw nothing' and 'the sampler never ran' are "
+        + "the same number and opposite conclusions. NOT an alert source.",
+      registers: [registry],
+    });
+    processRssReleaseBytes = new Gauge({
+      name: PROCESS_RSS_RELEASE_BYTES_METRIC,
+      help:
+        "Cumulative peak-to-trough bytes returned across every detected episode (PEN-3314). "
+        + "Separates a generation that releases often and shallowly from one that releases once "
+        + "and deeply -- two shapes with the same episode count. Monotonic within a process; "
+        + "read with increase(), never as a level. NOT an alert source.",
+      registers: [registry],
+    });
+    processRssReleaseLastOnsetTimestamp = new Gauge({
+      name: PROCESS_RSS_RELEASE_LAST_ONSET_TIMESTAMP_METRIC,
+      help:
+        "Unix time of the START of the most recent RSS drawdown (PEN-3314). THE HEADLINE "
+        + "SERIES: the instant to align a trigger search against. As of 2026-10-26 nothing in "
+        + "Prometheus marked this instant -- not GC, in-flight runs, dispatch, container stall "
+        + "or node PSI -- and the finest timestamp available was +/-300 s, floored by the "
+        + "/proc/self/smaps scan's own O(resident pages) cost. This is +/-1 s. "
+        + "It is the LAST 1s sample at which RSS stood at its pre-release high: not the first "
+        + "sample below it, and not the first time that high was reached, because a plateau can "
+        + "run for hours and dating the onset from when the CLIMB stopped would point a search "
+        + "at an arbitrary quiet instant. "
+        + "ABSENT until an episode is observed, deliberately -- a 0 is epoch 1970 and makes "
+        + "time() - this read as 56 years of staleness. NOT an alert source.",
+      registers: [registry],
+    });
+    processRssReleaseLastDetectedTimestamp = new Gauge({
+      name: PROCESS_RSS_RELEASE_LAST_DETECTED_TIMESTAMP_METRIC,
+      help:
+        "Unix time at which the most recent drawdown first crossed the 64 MiB detection "
+        + "threshold (PEN-3314). READ IT WITH "
+        + PROCESS_RSS_RELEASE_LAST_ONSET_TIMESTAMP_METRIC
+        + ": the gap between them is the time taken to shed a FIXED number of bytes, so it is "
+        + "comparable across episodes, and it is what tells the two measured shapes apart. ~1 s "
+        + "apart is a step that completed inside one scrape; minutes apart is the ~15 minute, "
+        + "3.3 GB drain. A reader holding only the detection instant cannot distinguish them and "
+        + "would align evidence against the wrong end of a 15 minute window. "
+        + "ABSENT until an episode is observed. NOT an alert source.",
+      registers: [registry],
+    });
+    processRssReleaseLastBytes = new Gauge({
+      name: PROCESS_RSS_RELEASE_LAST_BYTES_METRIC,
+      help:
+        "Peak-to-trough size of the most recent RSS release episode, in bytes (PEN-3314). "
+        + "Grows while a drain is still deepening, so it is the episode's running total rather "
+        + "than its value at detection -- max_over_time() gives the largest release a process "
+        + "has seen. ABSENT until an episode is observed. NOT an alert source.",
+      registers: [registry],
+    });
+    processRssReleaseSamples = new Gauge({
+      name: PROCESS_RSS_RELEASE_SAMPLES_METRIC,
+      help:
+        "Samples the 1s RSS release sampler has folded in over this process's life (PEN-3314). "
+        + "The qualifier WITHOUT WHICH "
+        + PROCESS_RSS_RELEASE_EVENTS_METRIC
+        + " cannot be read: a zero event count means 'no release past 64 MiB happened' only if "
+        + "the sampler was running, and means nothing at all if it was not. "
+        + "The sampler runs on the event loop and the step it exists to date STALLS the event "
+        + "loop, so rate() over this series separates a quiet process from a stalled one and a "
+        + "dip IS the stall, measured rather than inferred. A healthy sampler rates at ~1.0/s. "
+        + "Monotonic within a process; read with rate()/increase(), never as a level. Never "
+        + "published at 0 -- absent means the sampler has not ticked yet. NOT an alert source.",
+      registers: [registry],
+    });
+    // Every one of these six is LABEL-LESS, and prom-client renders a label-less
+    // gauge as `name 0` from the moment it is registered -- before anything has
+    // measured anything. Each zero is a specific wrong answer: no releases ever,
+    // nothing returned, two epoch-1970 timestamps that read as 56 years of
+    // staleness, a zero-byte release, and a sampler that rate() reads as a
+    // permanently stalled event loop. Drop them at construction so "nothing has
+    // been observed yet" is ABSENT from the first scrape onward, and so that
+    // property belongs to the metrics rather than to the order in which
+    // `/metrics` happens to call its refreshers.
+    processRssReleaseEvents.remove();
+    processRssReleaseBytes.remove();
+    processRssReleaseLastOnsetTimestamp.remove();
+    processRssReleaseLastDetectedTimestamp.remove();
+    processRssReleaseLastBytes.remove();
+    processRssReleaseSamples.remove();
     cgroupMemoryComponentBytes = new Gauge({
       name: CGROUP_MEMORY_COMPONENT_BYTES_METRIC,
       help:
@@ -7157,6 +7349,12 @@ function ensureRegistry(): {
     processMappingScanSecondsGauge: processMappingScanSeconds,
     processMappingScanTimestampGauge: processMappingScanTimestamp,
     processHeapPeakSamplesGauge: processHeapPeakSamples,
+    processRssReleaseEventsGauge: processRssReleaseEvents,
+    processRssReleaseBytesGauge: processRssReleaseBytes,
+    processRssReleaseLastOnsetTimestampGauge: processRssReleaseLastOnsetTimestamp,
+    processRssReleaseLastDetectedTimestampGauge: processRssReleaseLastDetectedTimestamp,
+    processRssReleaseLastBytesGauge: processRssReleaseLastBytes,
+    processRssReleaseSamplesGauge: processRssReleaseSamples,
     cgroupMemoryComponentBytesGauge: cgroupMemoryComponentBytes,
     cgroupMemoryCurrentBytesGauge: cgroupMemoryCurrentBytes,
     cgroupMemoryMaxBytesGauge: cgroupMemoryMaxBytes,
@@ -8289,6 +8487,53 @@ export function setNativeMemoryMetrics(snapshot: NativeMemorySnapshot | null): v
   // sample), which is what keeps "absent" unambiguous.
   if (snapshot.heapPeakSampleCount !== null) {
     metrics.processHeapPeakSamplesGauge.set(snapshot.heapPeakSampleCount);
+  }
+}
+
+/**
+ * PEN-3314: publish the RSS release record.
+ *
+ * `remove()` on every series, NOT `reset()`, for the reason spelled out on
+ * {@link setNativeMemoryMetrics}: these are label-less gauges, `reset()` returns
+ * a label-less gauge to a *published* 0, and here each of those zeroes is a
+ * specific wrong answer rather than merely a vague one — no release ever
+ * happened, nothing was ever returned, the release began in 1970, and a sampler
+ * that `rate()` reads as a permanently stalled event loop.
+ *
+ * The three `last_*` series stay ABSENT until an episode has actually been
+ * observed, which is why they are published from a `null` check rather than
+ * defaulted. "This process has not released since it started" is a real and
+ * interesting reading, and it must not be rendered as a release of zero bytes at
+ * epoch 1970 — a reader computing `time() - onset` on that would get 56 years.
+ *
+ * A `null` reading publishes nothing at all: the sampler has never ticked, and
+ * on this row "cannot measure" and "measured zero" must never render identically.
+ */
+export function setRssReleaseMetrics(reading: RssReleaseReading | null): void {
+  const metrics = ensureRegistry();
+  metrics.processRssReleaseEventsGauge.remove();
+  metrics.processRssReleaseBytesGauge.remove();
+  metrics.processRssReleaseLastOnsetTimestampGauge.remove();
+  metrics.processRssReleaseLastDetectedTimestampGauge.remove();
+  metrics.processRssReleaseLastBytesGauge.remove();
+  metrics.processRssReleaseSamplesGauge.remove();
+  if (!reading) return;
+
+  // Published even at 0, unlike the `last_*` series below: a live sampler that
+  // has seen no release is exactly what this series is for, and it is readable
+  // as such only because the sample count beside it says the sampler is alive.
+  metrics.processRssReleaseEventsGauge.set(reading.releaseCount);
+  metrics.processRssReleaseBytesGauge.set(reading.releasedBytesTotal);
+  metrics.processRssReleaseSamplesGauge.set(reading.sampleCount);
+
+  if (reading.lastOnsetAtMs !== null) {
+    metrics.processRssReleaseLastOnsetTimestampGauge.set(reading.lastOnsetAtMs / 1000);
+  }
+  if (reading.lastDetectedAtMs !== null) {
+    metrics.processRssReleaseLastDetectedTimestampGauge.set(reading.lastDetectedAtMs / 1000);
+  }
+  if (reading.lastReleaseBytes !== null) {
+    metrics.processRssReleaseLastBytesGauge.set(reading.lastReleaseBytes);
   }
 }
 
@@ -10111,6 +10356,12 @@ export function __resetMetricsForTest(): void {
   processMappingScanSeconds = null;
   processMappingScanTimestamp = null;
   processHeapPeakSamples = null;
+  processRssReleaseEvents = null;
+  processRssReleaseBytes = null;
+  processRssReleaseLastOnsetTimestamp = null;
+  processRssReleaseLastDetectedTimestamp = null;
+  processRssReleaseLastBytes = null;
+  processRssReleaseSamples = null;
   processLostTotal = null;
   externalLifecycleRunningRuns = null;
   externalLifecycleRunSilenceGap = null;
