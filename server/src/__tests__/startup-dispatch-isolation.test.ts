@@ -72,14 +72,14 @@ describe("startup heartbeat dispatch cannot suppress stranded-issue reconciliati
     // taken from the wrong block.
     expect(serverSource.indexOf(START_ANCHOR)).toBe(serverSource.lastIndexOf(START_ANCHOR));
     expect(endIndex).toBeGreaterThan(startIndex);
-    expect(region).toContain("heartbeat.reconcileStrandedAssignedIssues()");
+    expect(region).toContain("heartbeat.reconcileStrandedAssignedIssues(");
   });
 
   it("wraps the dispatch pair and leaves stranded reconciliation outside the guard", () => {
     const promoteIndex = region.indexOf("heartbeat.promoteDueScheduledRetries()");
     const resumeIndex = region.indexOf("heartbeat.resumeQueuedRuns()");
     const catchIndex = region.indexOf('"startup heartbeat dispatch resumption failed"');
-    const reconcileIndex = region.indexOf("heartbeat.reconcileStrandedAssignedIssues()");
+    const reconcileIndex = region.indexOf("heartbeat.reconcileStrandedAssignedIssues(");
     // Nearest `try {` preceding the dispatch pair. The region begins after the
     // detached-queued-run sweeper's own `try {`, so there is no earlier one to
     // match by accident — if the guard is deleted this is -1.
@@ -103,7 +103,7 @@ describe("startup heartbeat dispatch cannot suppress stranded-issue reconciliati
     // Between the handler's message literal and the reconcile call there must be
     // exactly one brace — the one closing the handler — and no opening brace.
     const catchIndex = region.indexOf('"startup heartbeat dispatch resumption failed"');
-    const reconcileIndex = region.indexOf("heartbeat.reconcileStrandedAssignedIssues()");
+    const reconcileIndex = region.indexOf("heartbeat.reconcileStrandedAssignedIssues(");
     expect(catchIndex).toBeGreaterThan(-1);
     expect(reconcileIndex).toBeGreaterThan(catchIndex);
 
