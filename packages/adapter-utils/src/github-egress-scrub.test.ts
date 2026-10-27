@@ -1061,7 +1061,7 @@ describe("scrubGitHubEgressText", () => {
       ["password", POD],
       ["token", SERVICE],
       ["k8s_pod_name", POD],
-      ["job_name", LISTENER],
+      ["k8s_job_name", LISTENER],
     ])("refuses a Kubernetes-shaped value bound to %s instead", (name, value) => {
       const result = scrubGitHubEgressText(pair(name, value));
       expect(result.classes).toContain("high-entropy-assignment");
