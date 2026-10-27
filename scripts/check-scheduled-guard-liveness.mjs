@@ -324,6 +324,41 @@ export const WATCHED_GUARDS = [
     staleHours: 4,
     event: "schedule",
   },
+
+  // PEN-4841. Hourly (cron "53 * * * *") on `arc-paperclip-light`. Reports an
+  // in-flight approval lock that no rollout can ever satisfy, which blocks every
+  // production deploy at its approval step until a human retires it.
+  //
+  // The 2.75h bar is ADOPTED, not measured, and the adoption is tighter than the
+  // other two that say this. relay-ssl-multicert-guard.yml above is the same
+  // cadence (hourly) on the SAME lane (arc-paperclip-light) and already carries
+  // 2.75h, so this is not a cross-lane transfer of a number — it is the bar this
+  // lane's only other hourly guard already runs under. Re-derive from this
+  // guard's own completion gaps once it has a distribution; until then the
+  // precedent is the best available evidence, and leaving it unwatched to avoid
+  // adopting a number is how the detector itself stops silently.
+  //
+  // `event: "schedule"` though the enumeration test does not demand it here:
+  // this workflow's only non-schedule trigger is `workflow_dispatch`, which is
+  // deliberately outside that test's auto-trigger set. The exposure it names is
+  // still real — a manual dispatch bumps the newest-run timestamp and can mask a
+  // dead cron for one threshold window — and the stated reason for NOT filtering
+  // the seven pre-existing guards is that narrowing them would invalidate the gap
+  // distributions their thresholds were measured from. This guard has no measured
+  // distribution to invalidate, so the filter is free here and is taken.
+  //
+  // `graceUntil` because schedules fire only from the default branch: this
+  // workflow has zero completed schedule runs at merge BY CONSTRUCTION, and
+  // without grace its first liveness evaluation after merge is a guaranteed red
+  // — the born-red defect this file argues against throughout. The window is
+  // generous against this repo's review latency rather than against the cron
+  // (which fires within the hour); after it expires this reverts to a hard red.
+  {
+    workflow: "stranded-approval-lock-check.yml",
+    staleHours: 2.75,
+    event: "schedule",
+    graceUntil: "2026-11-10T00:00:00.000Z",
+  },
 ];
 
 /**

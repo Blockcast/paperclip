@@ -1650,7 +1650,7 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
     }
   });
 
-  it("carries the five surviving PEN-3281 guards, the security control the original list missed, the clock-rot guard, the consumer merge-control guard, and the deploy dispatcher", () => {
+  it("carries the five surviving PEN-3281 guards, the security control the original list missed, the clock-rot guard, the consumer merge-control guard, the deploy dispatcher, and the stranded-lock detector", () => {
     // PEN-3916 retired adapter-pin-drift-monitor.yml, so the PEN-3281 hourly
     // cohort is five here rather than six. It watched for `ARG
     // OPENCODE_K8S_REF` rotting from outside this repo; the opencode_k8s
@@ -1675,6 +1675,13 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
         // lane-scoped this workflow was structurally invisible to it. It went
         // dark for 54h06m with nothing recording it.
         "scheduled-production-deploy.yml",
+        // PEN-4841. Reports an in-flight approval lock that no rollout can
+        // satisfy, which refuses every production deploy at its approval step.
+        // The detector script shipped under BLO-41774 with NO caller, so all
+        // three occurrences were found by accident — the third 12.5h late, after
+        // a deploy slot had already burned on it. Watched rather than exempt:
+        // an unrun detector is the exact failure it exists to catch.
+        "stranded-approval-lock-check.yml",
       ],
     );
   });
