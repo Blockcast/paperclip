@@ -421,7 +421,19 @@ export function startRssReleaseTracking(options: StartRssReleaseTrackingOptions 
   state.thresholdBytes = options.thresholdBytes ?? DEFAULT_RELEASE_THRESHOLD_BYTES;
   state.plateauBandBytes = options.plateauBandBytes ?? state.thresholdBytes / PLATEAU_BAND_DIVISOR;
 
+  // Declared BEFORE the timer is scheduled, not beside `stop()` below: a
+  // caller-supplied scheduler may fire its callback synchronously (the bounds
+  // test does), and reading a `let` from inside the tick before its declaration
+  // executed is a temporal-dead-zone ReferenceError, not `false`.
+  let stopped = false;
+
   const timer = schedule(() => {
+    // A tick that outlives `stop()` must not keep folding samples into state
+    // this sampler no longer owns. `clearInterval` already covers production;
+    // this covers a fake or late-firing timer, and it is what lets the
+    // one-sampler test assert the claim it makes rather than only that
+    // `clearInterval` was called.
+    if (stopped) return;
     let rssBytes: number;
     try {
       rssBytes = readRss();
@@ -436,7 +448,6 @@ export function startRssReleaseTracking(options: StartRssReleaseTrackingOptions 
 
   // Idempotent, matching the sibling sampler: a second call must not clear a
   // handle this sampler no longer owns.
-  let stopped = false;
   const stop = () => {
     if (stopped) return;
     stopped = true;
