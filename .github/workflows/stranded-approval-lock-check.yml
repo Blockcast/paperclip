@@ -32,26 +32,55 @@
 #   ConfigMap/paperclip-api-approved-images  (ns paperclip-release-approvals)
 #   Deployment/paperclip-api                 (ns paperclip)
 # Both are inside secrets.KUBECONFIG_PAPERCLIP_CI_DEPLOY's existing grants, and
-# that is the least-privilege credential for the job. It is NOT used here,
-# because it is an ENVIRONMENT secret of `paperclip-production` (verified
+# that is the least-privilege credential for the job. It is what this workflow
+# now uses. Doing so is not free: it is an ENVIRONMENT secret of
+# `paperclip-production` (verified
 # 2026-10-27 via GET .../environments/paperclip-production/secrets), so reading
 # it requires declaring `environment: paperclip-production` — and a job that
 # declares an environment creates a GitHub *deployment record*. That environment
-# currently carries exactly one record per daily deploy, which is a legible
-# production-deploy audit trail; an hourly detector would add ~24/day and bury
-# it. Degrading an audit surface to read a ConfigMap is the wrong trade.
+# carries ~1 record per daily deploy, a legible production-deploy audit trail
+# that an hourly detector dilutes ~24x.
 #
-# So this uses secrets.BLOCKCAST_KUBE_CONFIG_B64, the repo-level credential
-# relay-ssl-multicert-guard.yml already uses from this same lane, hourly and
-# green. It grants this workflow NO authority that lane did not already have.
+# THAT COST IS NOW PAID, DELIBERATELY, because the cheaper credential was
+# measured and does not work. The first run of this workflow
+# (https://github.com/Blockcast/paperclip/actions/runs/40573380689,
+# 2026-10-27T19:55:41Z, workflow_dispatch on master) exited 2:
 #
-# ⚠️ ITS RBAC FOR THESE TWO OBJECTS IS UNVERIFIED — it could not be tested
-# without running this workflow. That uncertainty is SELF-REPORTING and cannot
-# produce a false all-clear: the detector exits 2 on an unreadable object, which
-# this job alerts on under its own alertname and reds on. If the first scheduled
-# run exits 2 with a forbidden/not-found message, the fallback is to declare
-# `environment: paperclip-production` and switch to KUBECONFIG_PAPERCLIP_CI_DEPLOY,
-# accepting the deployment-record cost above. Do not instead widen the kubeconfig.
+#   cannot read paperclip-release-approvals/paperclip-api-approved-images:
+#   Error from server (Forbidden): configmaps "paperclip-api-approved-images" is
+#   forbidden: User "system:serviceaccount:production-blockcastd:
+#   paperclip-relay-multicert-guard" cannot get resource "configmaps" in API
+#   group "" in the namespace "paperclip-release-approvals"
+#
+# So secrets.BLOCKCAST_KUBE_CONFIG_B64 — the repo-level credential
+# relay-ssl-multicert-guard.yml uses from this same lane — resolves to that
+# guard's own service account, which is scoped to its own job and holds no read
+# on the approval ConfigMap. It was never going to work, and the previous
+# revision said so: its RBAC was explicitly recorded as UNVERIFIED, with this
+# switch named as the fallback. This commit takes that pre-recorded fallback.
+#
+# The uncertainty behaved as designed and is worth keeping: the detector exits 2
+# on an unreadable object, so the gap self-reported as
+# StrandedApprovalLockCheckUnreadable rather than as a false all-clear.
+#
+# ⚠️ DO NOT "FIX" THIS BY WIDENING BLOCKCAST_KUBE_CONFIG_B64. Granting the
+# multicert guard's service account read on a release-approval object couples
+# two unrelated guards and widens a credential shared by another lane, to save a
+# deployment record. KUBECONFIG_PAPERCLIP_CI_DEPLOY is the least-privilege fit
+# already: it holds exact-name `get` on this ConfigMap so the
+# ValidatingAdmissionPolicy can resolve its paramRef, and it cannot mutate the
+# ring (approve-paperclip-api-digest.sh:45-48). It is strictly weaker than
+# KUBECONFIG_PAPERCLIP_RELEASE_APPROVER, which can write the ring — do not reach
+# for that one; a read-only detector must not hold the writer credential.
+#
+# ⓘ IF THE DILUTED AUDIT TRAIL LATER MATTERS MORE THAN IT DOES TODAY, the fix
+# that preserves both properties is a separate GitHub environment holding its
+# own copy of a read-only kubeconfig, so these hourly records land off
+# `paperclip-production`. That needs environment-admin plus secret-write and a
+# duplicate of a production credential under a new protection policy — out of
+# scope for this change, and a human decision rather than an agent's. Recorded
+# here so the option is not lost. Filtering by workflow on the deployments API
+# also recovers the real deploys in the meantime.
 #
 # ON THE CADENCE. Hourly, at :53 — ≥6 min from every other cron in this repo
 # (9, 17, 23, 41, 47), which the guard-liveness header asks for. The detector's
@@ -81,6 +110,13 @@ jobs:
   stranded-lock:
     runs-on: arc-paperclip-light
     timeout-minutes: 10
+    # Required to read KUBECONFIG_PAPERCLIP_CI_DEPLOY, which is an environment
+    # secret rather than a repo-level one. Mints a deployment record per run;
+    # see the header for why that cost is accepted. The environment's only
+    # protection rule is a protected-branch policy (no required reviewers), so
+    # this does not introduce a human gate into an hourly job — verified
+    # 2026-10-27 via GET /repos/Blockcast/paperclip/environments/paperclip-production.
+    environment: paperclip-production
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
@@ -109,10 +145,10 @@ jobs:
       - name: Configure kubeconfig
         continue-on-error: true
         env:
-          KUBE_CONFIG_B64: ${{ secrets.BLOCKCAST_KUBE_CONFIG_B64 }}
+          KUBE_CONFIG_B64: ${{ secrets.KUBECONFIG_PAPERCLIP_CI_DEPLOY }}
         run: |
           if [ -z "$KUBE_CONFIG_B64" ]; then
-            echo "::error::BLOCKCAST_KUBE_CONFIG_B64 is required for the stranded approval lock check."
+            echo "::error::KUBECONFIG_PAPERCLIP_CI_DEPLOY is required for the stranded approval lock check."
             exit 1
           fi
           mkdir -p "$HOME/.kube"

@@ -150,7 +150,7 @@ describe("buildAlert", () => {
     // RBAC -- and since the kubeconfig step is continue-on-error, the
     // kubeconfig case is now the one most likely to land here. Naming only RBAC
     // sends the reader to check permissions that were never the problem.
-    assert.match(alert.annotations.description, /BLOCKCAST_KUBE_CONFIG_B64/);
+    assert.match(alert.annotations.description, /KUBECONFIG_PAPERCLIP_CI_DEPLOY/);
     assert.match(alert.annotations.description, /lacks get on ConfigMap/);
     assert.match(alert.annotations.description, /kubectl, jq, sha256sum/);
   });
@@ -237,14 +237,34 @@ describe("the workflow wiring", () => {
     assert.doesNotMatch(workflowSource, /- name: Checkout repository\n\s+continue-on-error: true/);
   });
 
-  it("declares no environment, so hourly runs cannot bury the production deploy record", () => {
-    // Declaring `environment:` is the only way to read
-    // KUBECONFIG_PAPERCLIP_CI_DEPLOY, and it would also mint a GitHub deployment
-    // record on EVERY run. paperclip-production carries ~1 record per daily
-    // deploy today; ~24/day from a read-only detector would bury that audit
-    // trail. The workflow header records the fallback if the repo-level
-    // credential turns out to lack the two `get`s.
-    assert.doesNotMatch(workflowSource, /^\s*environment:/m);
+  it("declares paperclip-production, the only way to read the credential that works", () => {
+    // INVERTED DELIBERATELY. This test previously asserted the opposite, to
+    // keep hourly deployment records off paperclip-production (~1/day today,
+    // so a detector adds ~24x noise). That preference was conditional, and the
+    // condition was measured false: the repo-level BLOCKCAST_KUBE_CONFIG_B64
+    // resolves to serviceaccount production-blockcastd:
+    // paperclip-relay-multicert-guard, which is Forbidden on the approval
+    // ConfigMap (run 40573380689, 2026-10-27T19:55:41Z, exit 2). A detector
+    // that cannot read either object is worth less than a diluted audit list,
+    // so the header's pre-recorded fallback was taken.
+    //
+    // Flipping this back therefore re-breaks the detector. If the audit trail
+    // needs reclaiming, move these records to a separate environment holding
+    // its own read-only kubeconfig; do not simply drop the environment, and do
+    // not widen BLOCKCAST_KUBE_CONFIG_B64 instead.
+    assert.match(workflowSource, /^\s*environment: paperclip-production$/m);
+  });
+
+  it("uses the read-only deploy credential, never the ring writer", () => {
+    // KUBECONFIG_PAPERCLIP_CI_DEPLOY holds exact-name `get` on the approval
+    // ConfigMap so the ValidatingAdmissionPolicy can resolve its paramRef, and
+    // cannot mutate the ring (approve-paperclip-api-digest.sh:45-48).
+    // KUBECONFIG_PAPERCLIP_RELEASE_APPROVER *can* write it. Both live in the
+    // same environment, so reaching for the wrong one is a one-word edit that
+    // would hand a read-only hourly job the credential that rotates the
+    // approval window.
+    assert.match(workflowSource, /secrets\.KUBECONFIG_PAPERCLIP_CI_DEPLOY/);
+    assert.doesNotMatch(workflowSource, /secrets\.KUBECONFIG_PAPERCLIP_RELEASE_APPROVER/);
   });
 
   it("runs on a lane with proven cluster reach", () => {
