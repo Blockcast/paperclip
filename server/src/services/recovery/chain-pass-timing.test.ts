@@ -229,4 +229,14 @@ describe("createRecoveryChainTimer", () => {
     });
     expect(lines[0].fields).toMatchObject({ durationMs: 0 });
   });
+
+  it("skips passes reached after shouldSkip turns true (BLO-49596)", async () => {
+    let stopped = false;
+    const ran: string[] = [];
+    const timer = createRecoveryChainTimer({ log: () => undefined, chainId: "chain-1", shouldSkip: () => stopped });
+    await timer
+      .time(1, "one", async () => { ran.push("one"); stopped = true; })
+      .then(timer.pass(2, "two", async () => { ran.push("two"); }));
+    expect(ran).toEqual(["one"]);
+  });
 });

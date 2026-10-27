@@ -9542,6 +9542,11 @@ export function recoveryService(
     // by falling inside pass 1's window. Undefined for the startup pass and
     // for tests, which belong to no chain — pino omits the field entirely.
     recoveryChainId?: string;
+    // BLO-49596: polled before each candidate. True once the process is
+    // shutting down, so the pass stops instead of outliving the termination
+    // grace while its holder keeps renewing the scheduler lease. Candidates not
+    // reached show up as `candidatesScanned - candidates.count`.
+    shouldStop?: () => boolean;
   }) {
     // PEN-3636: published on the pass's own log line below, then cleared in the
     // `finally` so nothing outside a sweep is ever timed into it. Assigned rather
@@ -9637,7 +9642,7 @@ export function recoveryService(
   }
 
   async function runStrandedAssignedIssueSweep(
-    opts: { issueCreatedAtGte?: Date | null } | undefined,
+    opts: { issueCreatedAtGte?: Date | null; shouldStop?: () => boolean } | undefined,
     passTimer: PassTimer,
     scanned: { candidates: number | null },
   ) {
@@ -11500,6 +11505,7 @@ export function recoveryService(
     };
 
     for (const issue of candidates) {
+      if (opts?.shouldStop?.()) break;
       try {
         await passTimer.candidate(issue.id, () => reconcileStrandedCandidate(issue));
       } catch (err) {
@@ -11536,10 +11542,12 @@ export function recoveryService(
     // the main loop, while `result.skipped` is shared between the two. So until this
     // phase had a number, an unknown share of pass 1 was unattributable by
     // construction.
-    const orphanBlockerRecovery = await passTimer.time(
-      "orphanBlockerSweep",
-      () => reconcileUnassignedBlockingIssues(),
-    );
+    const orphanBlockerRecovery = opts?.shouldStop?.()
+      ? { assigned: 0, skipped: 0, issueIds: [] as string[] }
+      : await passTimer.time(
+        "orphanBlockerSweep",
+        () => reconcileUnassignedBlockingIssues(),
+      );
     // Snapshot BEFORE the merge below. `result.skipped` is about to absorb a different
     // sweep's tally, and `candidatesScanned` counts only this one's candidates — logging
     // the merged figure against it would invite a skip-rate that is not a rate of

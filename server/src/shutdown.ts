@@ -1,3 +1,15 @@
+/**
+ * BLO-49596. Upper bound on the graceful wait for in-flight scheduler work
+ * before the scheduler lease is released. Unbounded, a long recovery pass
+ * outlived the 120 s termination grace, the holder was SIGKILLed while still
+ * renewing, and the survivor waited out grace + TTL (~160 s measured). 20 s
+ * keeps preStop (5 s) + this + one follower poll well inside the 60 s
+ * failover budget. In-flight passes stop cooperatively at SIGTERM, so this is
+ * a backstop: when it fires, the lease is released with some work possibly
+ * still running — speed is chosen over exclusion for that residual.
+ */
+export const HEARTBEAT_SCHEDULER_IDLE_WAIT_TIMEOUT_MS = 20_000;
+
 type HotRestartShutdownPreparation = {
   skipDrain: boolean;
 };
@@ -8,10 +20,12 @@ export async function coordinateHeartbeatSchedulerShutdown<
   signal: "SIGINT" | "SIGTERM";
   prepareHotRestartShutdown: ((signal: "SIGINT" | "SIGTERM") => Promise<TPreparation>) | null;
   waitForHeartbeatSchedulerIdle: () => Promise<void>;
+  idleWaitTimeoutMs?: number;
 }): Promise<{
   hotRestart: TPreparation | null;
   preparationError: unknown;
   waitedForSchedulerIdle: boolean;
+  idleWaitTimedOut: boolean;
 }> {
   let hotRestart: TPreparation | null = null;
   let preparationError: unknown = null;
@@ -29,13 +43,21 @@ export async function coordinateHeartbeatSchedulerShutdown<
       hotRestart,
       preparationError,
       waitedForSchedulerIdle: false,
+      idleWaitTimedOut: false,
     };
   }
 
-  await input.waitForHeartbeatSchedulerIdle();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const idle = await Promise.race([
+    input.waitForHeartbeatSchedulerIdle().then(() => true),
+    ...(input.idleWaitTimeoutMs === undefined
+      ? []
+      : [new Promise<false>((resolve) => { timer = setTimeout(() => resolve(false), input.idleWaitTimeoutMs); })]),
+  ]).finally(() => clearTimeout(timer));
   return {
     hotRestart,
     preparationError,
-    waitedForSchedulerIdle: true,
+    waitedForSchedulerIdle: idle,
+    idleWaitTimedOut: !idle,
   };
 }

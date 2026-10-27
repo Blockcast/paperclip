@@ -102,6 +102,13 @@ export interface RecoveryChainTimerOptions {
   now?: () => number;
   /** Injectable for tests. Defaults to a fresh UUID per chain. */
   chainId?: string;
+  /**
+   * BLO-49596. Checked as each `pass()` link is reached; when true the pass is
+   * not run (and not recorded). Shutdown sets it so an in-flight chain stops
+   * at the next pass boundary instead of holding the scheduler lease through
+   * the rest of a ~135 s chain.
+   */
+  shouldSkip?: () => boolean;
 }
 
 export function createRecoveryChainTimer(opts: RecoveryChainTimerOptions): RecoveryChainTimer {
@@ -156,7 +163,7 @@ export function createRecoveryChainTimer(opts: RecoveryChainTimerOptions): Recov
     startedAtMs,
     time,
     pass<T>(passIndex: number, pass: string, run: () => Promise<T>): () => Promise<T> {
-      return () => time(passIndex, pass, run);
+      return () => (opts.shouldSkip?.() ? Promise.resolve(undefined as T) : time(passIndex, pass, run));
     },
     settle(chainDurationMs: number): void {
       try {
