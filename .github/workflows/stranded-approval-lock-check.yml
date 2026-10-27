@@ -88,7 +88,17 @@ jobs:
       - name: Install kubectl
         uses: azure/setup-kubectl@v4
 
+      # `continue-on-error` here for the same reason as on the check below, and
+      # the mechanism is easy to miss: an explicit `if:` without a status
+      # function still carries an implicit `success()`. So a red kubeconfig step
+      # aborts the job and BOTH `exit_code != '0'` steps are skipped -- the run
+      # goes red having pushed no alert, which notifies only the last committer.
+      # That is the exact failure this workflow exists to remove. Letting it
+      # through instead means the detector runs, cannot reach the cluster, exits
+      # 2, and routes to StrandedApprovalLockCheckUnreadable -- a named condition
+      # with its own remedy, rather than silence.
       - name: Configure kubeconfig
+        continue-on-error: true
         env:
           KUBE_CONFIG_B64: ${{ secrets.BLOCKCAST_KUBE_CONFIG_B64 }}
         run: |
