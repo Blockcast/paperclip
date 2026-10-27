@@ -85,7 +85,16 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v5
 
+      # Same implicit-`success()` trap as the kubeconfig step below, one step
+      # earlier: a failed install aborts the job and the alert never fires. Here
+      # the detector's own dependency check (check-stranded-approval-lock.sh:38)
+      # catches the missing binary and exits 2, so the run still reaches a human.
+      #
+      # Checkout deliberately does NOT get the same treatment: without the repo
+      # there is no post-stranded-approval-lock-alert.mjs to run either, so
+      # continuing past it buys nothing and only hides the real failure.
       - name: Install kubectl
+        continue-on-error: true
         uses: azure/setup-kubectl@v4
 
       # `continue-on-error` here for the same reason as on the check below, and

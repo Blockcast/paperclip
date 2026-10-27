@@ -155,6 +155,25 @@ describe("buildAlert", () => {
     assert.match(alert.annotations.description, /kubectl, jq, sha256sum/);
   });
 
+  it("does not claim its list of exit-2 causes is exhaustive", () => {
+    const alert = buildAlert({
+      exitCode: "2",
+      detail: "",
+      runUrl: "https://example/run/6",
+      repo: "Blockcast/paperclip",
+      now,
+    });
+
+    // The detector also exits 2 on a non-integer
+    // PAPERCLIP_STRANDED_LOCK_GRACE_MINUTES (check-stranded-approval-lock.sh:142)
+    // and on an undecidable jq predicate (:203, :242). An operator who has
+    // ruled out the three named causes must not conclude the alert is lying;
+    // the text has to send them to stderr instead.
+    assert.doesNotMatch(alert.annotations.description, /Three distinct faults/);
+    assert.match(alert.annotations.description, /NOT an exhaustive list/);
+    assert.match(alert.annotations.description, /stderr/);
+  });
+
   it("degrades to a pointer rather than printing a bogus pair when the report is unparseable", () => {
     const alert = buildAlert({
       exitCode: "1",
@@ -201,6 +220,21 @@ describe("the workflow wiring", () => {
     // hears" mode this workflow was written to remove. With it, the detector
     // runs, cannot reach the cluster, and exits 2 into its own alertname.
     assert.match(workflowSource, /- name: Configure kubeconfig\n\s+continue-on-error: true/);
+  });
+
+  it("keeps continue-on-error on Install kubectl, the same silent path one step earlier", () => {
+    // A failed install aborts the job before `check`, so both alert steps skip
+    // and the run goes red having alerted nobody. Allowed to fail, the
+    // detector's own dependency check (check-stranded-approval-lock.sh:38)
+    // reports the missing binary as exit 2 and a human hears about it.
+    assert.match(workflowSource, /- name: Install kubectl\n\s+continue-on-error: true/);
+  });
+
+  it("does NOT put continue-on-error on checkout, which would only hide the failure", () => {
+    // Deliberate asymmetry, recorded so it is not "fixed" for consistency:
+    // without the repo there is no post-stranded-approval-lock-alert.mjs to run
+    // either, so continuing past a failed checkout cannot produce an alert.
+    assert.doesNotMatch(workflowSource, /- name: Checkout repository\n\s+continue-on-error: true/);
   });
 
   it("declares no environment, so hourly runs cannot bury the production deploy record", () => {
