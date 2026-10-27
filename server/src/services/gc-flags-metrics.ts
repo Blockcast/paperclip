@@ -298,6 +298,11 @@ export function registerGcFlagsCollector(
     for (const entry of entries) {
       const { kind, flags } = readGcDetail(entry);
       cycles.inc({ kind: gcKindLabel(kind), flags: gcFlagsLabel(flags) });
+      // Same entry, second consumer: the counter answers "how many, by class,
+      // over a scrape interval"; the ring answers "which classes fired in THIS
+      // 10 s window", which is the question a +/-1 s release onset asks and a
+      // counter cannot be queried for. See `readGcCyclesInWindow`.
+      recordGcCycle(gcEntryInstantMs(entry), kind, flags);
     }
   };
 
@@ -323,4 +328,172 @@ export function registerGcFlagsCollector(
       observer.disconnect();
     },
   };
+}
+
+/**
+ * Capacity of {@link recentCycles}, in GC entries.
+ *
+ * Sized against what the join in
+ * {@link module:server/services/rss-release-gc-attribution} needs to retain: a
+ * release onset must still be inside the ring when the next `/metrics` scrape
+ * reads it. Worst case measured on this row is a 207 s drain (so the onset is
+ * already that old at detection) plus a 30 s scrape interval plus the window's
+ * own half-width — call it 5 minutes of GC history as the floor.
+ *
+ * 8192 entries covers ~4 h at the ambient 0.55 cycles/s this fleet runs at, and
+ * still covers the 5 minute floor at a sustained 27 cycles/s — ~50x the ambient
+ * rate. Beyond that the ring evicts, which is NOT silent: see
+ * {@link GcCycleWindow.covered}.
+ *
+ * ⚠ Fixed cost, paid once: three typed arrays, 128 KiB total, allocated at
+ * module load and never grown. That matters twice over on PEN-3314. The row is
+ * a memory investigation, so an instrument whose own footprint scales with
+ * anything would be self-defeating; and the writer runs INSIDE a
+ * `PerformanceObserver` GC callback, where allocating per entry would make the
+ * instrument a participant in the phenomenon it measures rather than an
+ * observer of it. Hence typed arrays and raw integers rather than an array of
+ * `{ atMs, kind, flags }` objects, which would allocate on every cycle.
+ */
+const GC_RING_CAPACITY = 8192;
+
+const ringAtMs = new Float64Array(GC_RING_CAPACITY);
+const ringKind = new Int32Array(GC_RING_CAPACITY);
+const ringFlags = new Int32Array(GC_RING_CAPACITY);
+/** Total entries ever recorded; the ring holds the last {@link GC_RING_CAPACITY} of them. */
+let ringWritten = 0;
+/**
+ * Instant of the NEWEST entry evicted by wraparound, or `null` if none has been.
+ *
+ * This is the whole basis of {@link GcCycleWindow.covered}: a window whose start
+ * is at or before this instant has lost entries it should have counted, so its
+ * counts are a LOWER BOUND. Tracking the newest rather than the oldest eviction
+ * is what makes that test sound — an older eviction says nothing about a
+ * recent window.
+ */
+let newestEvictedAtMs: number | null = null;
+
+/**
+ * `performance.timeOrigin`, read once.
+ *
+ * `PerformanceEntry.startTime` is milliseconds since the time origin, not an
+ * epoch instant, and every consumer of this ring compares it against
+ * `Date.now()`-derived timestamps from the RSS sampler. Converting at write
+ * time keeps the two instruments on one clock, which is the entire point of
+ * dating anything at 1 s.
+ */
+let timeOriginMs = performance.timeOrigin;
+
+/** One GC class and how many of its cycles fell inside a window. */
+export interface GcCycleClassCount {
+  readonly kind: string;
+  readonly flags: string;
+  readonly cycles: number;
+}
+
+/** The result of counting GC cycles over a closed time window. */
+export interface GcCycleWindow {
+  readonly fromMs: number;
+  readonly toMs: number;
+  /** Per-class counts, descending by `cycles`. Empty when no cycle fell inside. */
+  readonly classes: readonly GcCycleClassCount[];
+  /** Total cycles inside the window, i.e. the sum over {@link classes}. */
+  readonly observedCycles: number;
+  /**
+   * Whether the ring still held everything this window covers.
+   *
+   * `false` means entries inside the window were evicted and every count here
+   * is a LOWER BOUND. ⛔ A reader that ignores this field converts ring
+   * pressure into "GC did not fire", which is the exact shape of error PEN-3314
+   * has already paid for twice — an empty read taken as a measurement rather
+   * than as an absence of measurement.
+   */
+  readonly covered: boolean;
+}
+
+/**
+ * Record one GC cycle in the ring.
+ *
+ * Exported for the test, which must be able to place cycles at chosen instants:
+ * real GC is not schedulable, so driving this through actual collections would
+ * test the allocator rather than the ring.
+ */
+export function recordGcCycle(atMs: number, kind: number | undefined, flags: number | undefined): void {
+  const slot = ringWritten % GC_RING_CAPACITY;
+  if (ringWritten >= GC_RING_CAPACITY) {
+    // About to overwrite a live entry. Remember it, because a window reaching
+    // back past it can no longer be counted exactly.
+    const evictedAtMs = ringAtMs[slot];
+    if (newestEvictedAtMs === null || evictedAtMs > newestEvictedAtMs) {
+      newestEvictedAtMs = evictedAtMs;
+    }
+  }
+  ringAtMs[slot] = atMs;
+  ringKind[slot] = typeof kind === "number" && Number.isFinite(kind) ? kind : -1;
+  ringFlags[slot] = typeof flags === "number" && Number.isFinite(flags) ? flags : 0;
+  ringWritten += 1;
+}
+
+/**
+ * Count the GC cycles whose start instant falls in `[fromMs, toMs]`, by class.
+ *
+ * ## Why this exists rather than a PromQL range over `paperclip_gc_cycles_total`
+ *
+ * `paperclip_gc_cycles_total` is a counter, so the finest window a reader can
+ * put on it is one scrape interval — 30 s on this fleet — and that window is
+ * aligned to scrape boundaries rather than to anything that happened. PEN-3314
+ * now dates a release ONSET to +/-1 s, and its standing conclusion is that
+ * "Prometheus is exhausted on the trigger" precisely because a +/-1 s instant
+ * read against 30 s averages buys bucket SELECTION, not bucket RESOLUTION.
+ *
+ * This function is the other half: it counts cycles in a narrow window centred
+ * on an instant of the caller's choosing, in-process, at the resolution the
+ * entries themselves carry. That is a measurement the scrape cannot express at
+ * any query, and it is what makes the standing "GC does not mark the instant"
+ * result testable rather than merely re-assertable.
+ *
+ * ⛔ It takes no view on which classes matter. The caller names a window; this
+ * returns every class that fired in it. Filtering to a predicted `{kind, flags}`
+ * is the trap the module docblock already records — an empty result then reads
+ * as "that class was excluded" when it means "that label never existed".
+ */
+export function readGcCyclesInWindow(fromMs: number, toMs: number): GcCycleWindow {
+  const counts = new Map<string, { kind: string; flags: string; cycles: number }>();
+  const held = Math.min(ringWritten, GC_RING_CAPACITY);
+  let observedCycles = 0;
+  for (let index = 0; index < held; index += 1) {
+    const atMs = ringAtMs[index];
+    if (atMs < fromMs || atMs > toMs) continue;
+    const kind = gcKindLabel(ringKind[index] < 0 ? undefined : ringKind[index]);
+    const flags = gcFlagsLabel(ringFlags[index]);
+    const key = `${kind}\u0000${flags}`;
+    const existing = counts.get(key);
+    if (existing) existing.cycles += 1;
+    else counts.set(key, { kind, flags, cycles: 1 });
+    observedCycles += 1;
+  }
+  const classes = [...counts.values()].sort(
+    (left, right) => right.cycles - left.cycles || left.kind.localeCompare(right.kind),
+  );
+  return {
+    fromMs,
+    toMs,
+    classes,
+    observedCycles,
+    covered: newestEvictedAtMs === null || newestEvictedAtMs < fromMs,
+  };
+}
+
+/** Reset ring state between tests. Not for production use. */
+export function __resetGcCycleRingForTest(originMs?: number): void {
+  ringAtMs.fill(0);
+  ringKind.fill(0);
+  ringFlags.fill(0);
+  ringWritten = 0;
+  newestEvictedAtMs = null;
+  timeOriginMs = originMs ?? performance.timeOrigin;
+}
+
+/** Epoch instant of a `gc` entry, which carries time-origin-relative `startTime`. */
+export function gcEntryInstantMs(entry: PerformanceEntry): number {
+  return timeOriginMs + entry.startTime;
 }

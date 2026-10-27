@@ -53,6 +53,7 @@ import type { FdClassSnapshot } from "./fd-class-metrics.js";
 import type { CgroupMemorySnapshot } from "./cgroup-memory-metrics.js";
 import type { NativeMemorySnapshot } from "./native-memory-metrics.js";
 import type { ProcessMappingSnapshot } from "./process-mapping-metrics.js";
+import type { RssReleaseGcAttribution } from "./rss-release-gc-attribution.js";
 import type { RssReleaseReading } from "./rss-release-tracker.js";
 import { registerGcFlagsCollector } from "./gc-flags-metrics.js";
 
@@ -2101,6 +2102,49 @@ export const PROCESS_RSS_RELEASE_SAMPLES_METRIC = "paperclip_process_rss_release
  * actually in force, since both are injectable.
  */
 export const PROCESS_RSS_RELEASE_BOUND_BYTES_METRIC = "paperclip_process_rss_release_bound_bytes";
+
+/**
+ * GC cycles by class in a narrow window around a release ONSET, against an
+ * ambient baseline window of the same width (PEN-3314).
+ *
+ * ⭐ The join the row could not previously express. `paperclip_gc_cycles_total`
+ * is a counter, so its finest readable window is one 30 s scrape, aligned to
+ * scrape boundaries rather than to the event; the onset is dated to +/-1 s.
+ * Asking a 30 s mean about a 1 s instant is bucket SELECTION, not resolution,
+ * and that — not a shortage of evidence — is what "Prometheus is exhausted on
+ * the trigger" actually means. These counts are taken in-process from the
+ * entries' own instants.
+ *
+ * ⛔ READ BOTH `window` VALUES OR NEITHER. Major GC at event magnitude is the
+ * AMBIENT state of these processes: it holds in 93.4% of 30 s samples on
+ * instances that released, and fired 2148 times on a worker that released zero
+ * times. So `window="onset"` alone is uninterpretable — the expected count is
+ * not zero. `window="baseline"` is the same width, 300 s earlier, same
+ * generation. A ratio near 1 is the standing refutation holding at matched
+ * resolution; a ratio far from 1 is the first positive trigger result on this
+ * row. NOT an alert source.
+ */
+export const PROCESS_RSS_RELEASE_ONSET_GC_CYCLES_METRIC =
+  "paperclip_process_rss_release_onset_gc_cycles";
+
+/**
+ * Width of both windows of {@link PROCESS_RSS_RELEASE_ONSET_GC_CYCLES_METRIC},
+ * in seconds (PEN-3314). Published so a count is readable as a rate, and so the
+ * figure in force cannot drift from the help text when it is injected.
+ */
+export const PROCESS_RSS_RELEASE_ONSET_GC_WINDOW_SECONDS_METRIC =
+  "paperclip_process_rss_release_onset_gc_window_seconds";
+
+/**
+ * Whether the GC ring still held every cycle its window covers (PEN-3314).
+ *
+ * 1 = exact; 0 = entries inside the window were evicted and the counts beside
+ * it are a LOWER BOUND. ⛔ Without this, ring pressure renders as "GC did not
+ * fire" — an absence of measurement read as a measurement, which is the exact
+ * error shape this row has already paid for twice.
+ */
+export const PROCESS_RSS_RELEASE_ONSET_GC_WINDOW_COVERED_METRIC =
+  "paperclip_process_rss_release_onset_gc_window_covered";
 
 /**
  * `setting` label of the series carrying the pool's OWN idle-in-transaction
@@ -4475,6 +4519,9 @@ let processRssReleaseLastDetectedTimestamp: Gauge | null = null;
 let processRssReleaseLastBytes: Gauge | null = null;
 let processRssReleaseSamples: Gauge | null = null;
 let processRssReleaseBoundBytes: Gauge<"bound"> | null = null;
+let processRssReleaseOnsetGcCycles: Gauge<"window" | "kind" | "flags"> | null = null;
+let processRssReleaseOnsetGcWindowSeconds: Gauge | null = null;
+let processRssReleaseOnsetGcWindowCovered: Gauge<"window"> | null = null;
 let cgroupMemoryComponentBytes: Gauge<"component"> | null = null;
 let cgroupMemoryCurrentBytes: Gauge | null = null;
 let cgroupMemoryMaxBytes: Gauge | null = null;
@@ -4665,6 +4712,9 @@ function ensureRegistry(): {
   processRssReleaseLastBytesGauge: Gauge;
   processRssReleaseSamplesGauge: Gauge;
   processRssReleaseBoundBytesGauge: Gauge<"bound">;
+  processRssReleaseOnsetGcCyclesGauge: Gauge<"window" | "kind" | "flags">;
+  processRssReleaseOnsetGcWindowSecondsGauge: Gauge;
+  processRssReleaseOnsetGcWindowCoveredGauge: Gauge<"window">;
   cgroupMemoryComponentBytesGauge: Gauge<"component">;
   cgroupMemoryCurrentBytesGauge: Gauge;
   cgroupMemoryMaxBytesGauge: Gauge;
@@ -4836,6 +4886,9 @@ function ensureRegistry(): {
     || !processRssReleaseLastBytes
     || !processRssReleaseSamples
     || !processRssReleaseBoundBytes
+    || !processRssReleaseOnsetGcCycles
+    || !processRssReleaseOnsetGcWindowSeconds
+    || !processRssReleaseOnsetGcWindowCovered
     || !cgroupMemoryComponentBytes
     || !cgroupMemoryCurrentBytes
     || !cgroupMemoryMaxBytes
@@ -5590,7 +5643,54 @@ function ensureRegistry(): {
       labelNames: ["bound"],
       registers: [registry],
     });
+    processRssReleaseOnsetGcCycles = new Gauge({
+      name: PROCESS_RSS_RELEASE_ONSET_GC_CYCLES_METRIC,
+      help:
+        "GC cycles by {kind, flags} in a narrow window around an RSS release ONSET, beside an "
+        + "ambient baseline window of the same width 300s earlier in the same generation "
+        + "(PEN-3314). Counted IN-PROCESS from the perf_hooks entries' own instants, because "
+        + "paperclip_gc_cycles_total is a counter whose finest readable window is one 30s scrape "
+        + "aligned to scrape boundaries -- asking that about a +/-1s onset selects a bucket "
+        + "rather than resolving one, which is what 'Prometheus is exhausted on the trigger' "
+        + "means on this row. "
+        + "READ BOTH window VALUES OR NEITHER: major GC at event magnitude is the AMBIENT state "
+        + "of these processes (true in 93.4% of 30s samples on instances that released; 2148 "
+        + "cycles on a worker that released zero times), so window=onset alone is "
+        + "uninterpretable -- its expected count is not zero. Compare it against window=baseline. "
+        + "A ratio near 1 is the standing 'GC does not mark the instant' refutation holding at "
+        + "matched resolution; a ratio far from 1 is the first positive trigger result here. "
+        + "Counts are frozen per onset, so they describe the episode rather than the ring's "
+        + "current contents. Which {kind, flags} class marks the unmapper path is NOT asserted: "
+        + "read the distribution, do not filter on a predicted label. Qualify every reading with "
+        + PROCESS_RSS_RELEASE_ONSET_GC_WINDOW_COVERED_METRIC
+        + ". NOT an alert source.",
+      labelNames: ["window", "kind", "flags"],
+      registers: [registry],
+    });
+    processRssReleaseOnsetGcWindowSeconds = new Gauge({
+      name: PROCESS_RSS_RELEASE_ONSET_GC_WINDOW_SECONDS_METRIC,
+      help:
+        "Width in seconds of both windows of " + PROCESS_RSS_RELEASE_ONSET_GC_CYCLES_METRIC
+        + " (PEN-3314). Published so a count is readable as a rate and so the width actually in "
+        + "force cannot drift from the help text, since it is injectable. NOT an alert source.",
+      registers: [registry],
+    });
+    processRssReleaseOnsetGcWindowCovered = new Gauge({
+      name: PROCESS_RSS_RELEASE_ONSET_GC_WINDOW_COVERED_METRIC,
+      help:
+        "1 when the in-process GC ring still held every cycle the matching window of "
+        + PROCESS_RSS_RELEASE_ONSET_GC_CYCLES_METRIC
+        + " covers; 0 when entries inside it were evicted, making those counts a LOWER BOUND "
+        + "(PEN-3314). Without this series, ring pressure renders as 'GC did not fire' -- an "
+        + "absence of measurement read as a measurement, which is the error shape this row has "
+        + "already paid for twice (v8_heap_physical read as a metric name; size_bucket read as "
+        + "bucket_bytes). A 0 is most likely on window=baseline early in a generation, where the "
+        + "ring simply does not reach back 300s yet. NOT an alert source.",
+      labelNames: ["window"],
+      registers: [registry],
+    });
     processRssReleaseEvents.remove();
+    processRssReleaseOnsetGcWindowSeconds.remove();
     processRssReleaseBytes.remove();
     processRssReleaseLastOnsetTimestamp.remove();
     processRssReleaseLastDetectedTimestamp.remove();
@@ -7395,6 +7495,9 @@ function ensureRegistry(): {
     processRssReleaseLastBytesGauge: processRssReleaseLastBytes,
     processRssReleaseSamplesGauge: processRssReleaseSamples,
     processRssReleaseBoundBytesGauge: processRssReleaseBoundBytes,
+    processRssReleaseOnsetGcCyclesGauge: processRssReleaseOnsetGcCycles,
+    processRssReleaseOnsetGcWindowSecondsGauge: processRssReleaseOnsetGcWindowSeconds,
+    processRssReleaseOnsetGcWindowCoveredGauge: processRssReleaseOnsetGcWindowCovered,
     cgroupMemoryComponentBytesGauge: cgroupMemoryComponentBytes,
     cgroupMemoryCurrentBytesGauge: cgroupMemoryCurrentBytes,
     cgroupMemoryMaxBytesGauge: cgroupMemoryMaxBytes,
@@ -8580,6 +8683,47 @@ export function setRssReleaseMetrics(reading: RssReleaseReading | null): void {
   }
   if (reading.lastReleaseBytes !== null) {
     metrics.processRssReleaseLastBytesGauge.set(reading.lastReleaseBytes);
+  }
+}
+
+/**
+ * PEN-3314: publish the GC windows around the most recent release onset.
+ *
+ * `reset()` on the labelled series so a class that fired around the PREVIOUS
+ * onset stops being published once a new episode supersedes it, rather than
+ * freezing a stale class into the new episode's distribution — which would make
+ * the two episodes look alike for no reason other than publication order.
+ *
+ * `remove()` on the scalar width, matching the `last_*` discipline above: a
+ * published 0 would read as a zero-width window, i.e. a measurement taken over
+ * no time at all, rather than as "no episode yet".
+ *
+ * A `null` attribution publishes NOTHING. "No release has been observed" and
+ * "a release was observed and no GC fired near it" are opposite findings on
+ * this row, and the second one is the result it is waiting for — rendering the
+ * first as a set of zeroes would hand it that result for free.
+ */
+export function setRssReleaseGcAttributionMetrics(
+  attribution: RssReleaseGcAttribution | null,
+): void {
+  const metrics = ensureRegistry();
+  metrics.processRssReleaseOnsetGcCyclesGauge.reset();
+  metrics.processRssReleaseOnsetGcWindowCoveredGauge.reset();
+  metrics.processRssReleaseOnsetGcWindowSecondsGauge.remove();
+  if (!attribution) return;
+
+  metrics.processRssReleaseOnsetGcWindowSecondsGauge.set(attribution.windowMs / 1000);
+  for (const [window, counts] of [
+    ["onset", attribution.onset],
+    ["baseline", attribution.baseline],
+  ] as const) {
+    // Coverage first, and published for BOTH windows even when the class list
+    // below is empty: an empty distribution is only readable as "no GC fired"
+    // when the ring is known to have held the window it was counted over.
+    metrics.processRssReleaseOnsetGcWindowCoveredGauge.set({ window }, counts.covered ? 1 : 0);
+    for (const { kind, flags, cycles } of counts.classes) {
+      metrics.processRssReleaseOnsetGcCyclesGauge.set({ window, kind, flags }, cycles);
+    }
   }
 }
 
@@ -10409,6 +10553,9 @@ export function __resetMetricsForTest(): void {
   processRssReleaseLastBytes = null;
   processRssReleaseSamples = null;
   processRssReleaseBoundBytes = null;
+  processRssReleaseOnsetGcCycles = null;
+  processRssReleaseOnsetGcWindowSeconds = null;
+  processRssReleaseOnsetGcWindowCovered = null;
   processLostTotal = null;
   externalLifecycleRunningRuns = null;
   externalLifecycleRunSilenceGap = null;
