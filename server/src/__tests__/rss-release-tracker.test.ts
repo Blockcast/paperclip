@@ -34,6 +34,7 @@ import {
   PROCESS_RSS_RELEASE_LAST_BYTES_METRIC,
   PROCESS_RSS_RELEASE_LAST_DETECTED_TIMESTAMP_METRIC,
   PROCESS_RSS_RELEASE_LAST_ONSET_TIMESTAMP_METRIC,
+  PROCESS_RSS_RELEASE_BOUND_BYTES_METRIC,
   PROCESS_RSS_RELEASE_SAMPLES_METRIC,
   __resetMetricsForTest,
   renderMetrics,
@@ -43,6 +44,7 @@ import {
 import {
   DEFAULT_RELEASE_THRESHOLD_BYTES,
   DEFAULT_SAMPLE_INTERVAL_MS,
+  PLATEAU_BAND_DIVISOR,
   __resetRssReleaseTrackerForTest,
   readRssReleases,
   recordRssSample,
@@ -82,6 +84,16 @@ describe("recordRssSample", () => {
     recordRssSample(1760 * MIB, 2_000);
     recordRssSample(1790 * MIB, 3_000);
     expect(readRssReleases()!.releaseCount).toBe(0);
+  });
+
+  it("restamps the onset clock for in-band churn but not for out-of-band dips", () => {
+    recordRssSample(1800 * MIB, 1_000);
+    recordRssSample(1760 * MIB, 2_000); // 40 MiB down: descending, do not restamp
+    recordRssSample(1790 * MIB, 3_000); // 10 MiB down: inside the band, restamp
+    recordRssSample(1200 * MIB, 4_000);
+    // Onset is the last IN-BAND sample. Keying on the exact maximum would have
+    // pinned this at 1_000 -- the bug Ally caught on #3040.
+    expect(readRssReleases()!.lastOnsetAtMs).toBe(3_000);
   });
 
   /**
@@ -131,7 +143,13 @@ describe("recordRssSample", () => {
     // The magnitude is peak-to-trough and keeps deepening as the drain runs; it
     // is not frozen at the instant of detection.
     expect(reading.lastReleaseBytes).toBeCloseTo(startBytes - endBytes, -3);
-    expect(reading.lastOnsetAtMs).toBe(0);
+    // The onset is bounded-LATE by one plateau band, not hours-early: the first
+    // samples of a slow drain are still inside the band, so they restamp. At
+    // 1.2 MiB/sample a 16 MiB band is ~13 samples -- 1.4% of a 900 s drain, and
+    // the documented cost of not letting a lone noise spike pin the stamp.
+    const bandSamples = Math.floor(DEFAULT_RELEASE_THRESHOLD_BYTES / 4 / perSample);
+    expect(reading.lastOnsetAtMs).toBe(bandSamples * 1_000);
+    expect(reading.lastOnsetAtMs!).toBeLessThan(0.02 * samples * 1_000);
     // Detection lags the onset by the time taken to shed the threshold, which
     // is what makes a drain legible as a drain rather than as a step.
     expect(reading.lastDetectedAtMs).toBeGreaterThan(50_000);
@@ -353,5 +371,77 @@ describe("setRssReleaseMetrics (the publish path)", () => {
     // PUBLISHED 0, which rate() reads as a permanently stalled event loop.
     setRssReleaseMetrics(null);
     expect(await scalar(PROCESS_RSS_RELEASE_SAMPLES_METRIC)).toBeNull();
+  });
+});
+
+describe("REPRO: noisy plateau onset (Ally #3040 important finding)", () => {
+  it("dates the onset at the END of a noisy plateau, not at its highest spike", () => {
+    // Peak at t=1s, then hover a few MB under it for three hours, then release.
+    recordRssSample(1800 * MIB, 1_000);
+    let t = 2_000;
+    for (let i = 0; i < 10; i += 1) {
+      recordRssSample((1790 + (i % 7)) * MIB, t);
+      t += 1_000;
+    }
+    const plateauEndMs = t - 1_000;
+    recordRssSample(1212 * MIB, t);
+
+    const reading = readRssReleases()!;
+    expect(reading.releaseCount).toBe(1);
+    expect(reading.lastOnsetAtMs).toBe(plateauEndMs);
+  });
+});
+
+describe("Ally #3040 suggestions", () => {
+  afterEach(() => {
+    __resetMetricsForTest();
+  });
+
+  it("keeps exactly one sampler alive across repeated starts", () => {
+    const ticks: Array<() => void> = [];
+    let cleared = 0;
+    const handle = { unref() {} };
+    const opts = {
+      setInterval: ((fn: () => void) => {
+        ticks.push(fn);
+        return handle;
+      }) as unknown as typeof setInterval,
+      clearInterval: (() => {
+        cleared += 1;
+      }) as unknown as typeof clearInterval,
+      residentSetSize: () => 1_000,
+    };
+    // createApp starts this on every app construction, and a suite builds many.
+    startRssReleaseTracking(opts);
+    startRssReleaseTracking(opts);
+    // The first was stopped when the second started.
+    expect(cleared).toBe(1);
+    // Both handles exist, but only the live one still folds samples in: driving
+    // both must not double the count the help text reads as a ~1.0/s rate.
+    for (const tick of ticks) tick();
+    expect(readRssReleases()!.sampleCount).toBe(ticks.length);
+  });
+
+  it("publishes the bounds in force rather than the compiled-in defaults", async () => {
+    startRssReleaseTracking({
+      thresholdBytes: 8 * MIB,
+      setInterval: ((fn: () => void) => {
+        fn();
+        return { unref() {} };
+      }) as unknown as typeof setInterval,
+      clearInterval: (() => {}) as unknown as typeof clearInterval,
+      residentSetSize: () => 1_000,
+    });
+    setRssReleaseMetrics(readRssReleases());
+
+    const { body } = await renderMetrics();
+    const out: Record<string, number> = {};
+    for (const line of body.split("\n")) {
+      if (line.startsWith("#") || !line.startsWith(PROCESS_RSS_RELEASE_BOUND_BYTES_METRIC)) continue;
+      const matched = /\{bound="([^"]*)"\}\s+(\S+)$/.exec(line);
+      if (matched) out[matched[1]!] = Number(matched[2]);
+    }
+    expect(out.threshold).toBe(8 * MIB);
+    expect(out.plateau_band).toBe(8 * MIB / PLATEAU_BAND_DIVISOR);
   });
 });

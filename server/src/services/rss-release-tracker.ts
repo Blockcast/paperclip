@@ -146,18 +146,52 @@ export const DEFAULT_SAMPLE_INTERVAL_MS = 1_000;
  */
 export const DEFAULT_RELEASE_THRESHOLD_BYTES = 64 * 1024 * 1024;
 
+/**
+ * Divisor giving the PLATEAU BAND from the release threshold: how far below the
+ * high-water mark RSS may sit and still count as "still at the plateau" for the
+ * purpose of stamping the onset clock.
+ *
+ * The band exists because the mark is an exact byte maximum and real RSS is
+ * noisy around a plateau. Without it the onset stamp only refreshes when RSS
+ * re-touches its exact all-time maximum, so a process that spikes once and then
+ * hovers a few MB under that spike for hours before releasing would publish an
+ * onset from the spike — hours early, on the one series a trigger search aligns
+ * against, and reported as a multi-hour "drain" by the onset/detected gap.
+ *
+ * 4, not 8. The band has to clear the observed plateau noise, which runs to
+ * ~10 MB on this worker, and 8 would put the band at 8 MiB — inside the noise
+ * it is meant to absorb. At 4 the band is 16 MiB: above the noise, and still 4x
+ * below the threshold, so a sample inside it is unambiguously "at the plateau"
+ * rather than "descending".
+ *
+ * ⚠ It bounds the onset's accuracy in the other direction, and the docblock on
+ * {@link RssReleaseReading.lastOnsetAtMs} states that bound: on a slow drain the
+ * onset lands at the last sample still within the band, i.e. up to one band's
+ * worth of bytes into the fall. At the measured 3.6 MB/s drain that is ~4 s.
+ * Hours early traded for seconds late.
+ */
+export const PLATEAU_BAND_DIVISOR = 4;
+
 export interface RssReleaseReading {
   /** Episodes opened since process start. Monotonic within a process. */
   releaseCount: number;
   /** Sum of every episode's peak-to-trough drop, in bytes. Monotonic within a process. */
   releasedBytesTotal: number;
   /**
-   * Epoch ms of the LAST sample at which RSS stood at its pre-release high —
-   * the START of the most recent drawdown. `null` until one is observed.
+   * Epoch ms of the LAST sample at which RSS stood within
+   * {@link plateauBandBytes} of its pre-release high — the START of the most
+   * recent drawdown. `null` until one is observed.
    *
    * Last, not first: a plateau at the high can run for hours, and dating the
    * onset from when the climb stopped would point a trigger search at an
-   * arbitrary quiet instant. See {@link recordRssSample}.
+   * arbitrary quiet instant.
+   *
+   * ⚠ "Within the band", not "at the exact maximum", and the difference is not
+   * cosmetic — keying on the exact byte maximum means a single noise spike
+   * pins the stamp forever, which is the hours-early failure this field exists
+   * to avoid. The cost is a bounded lateness instead: on a slow drain this
+   * lands up to one band into the fall (~4 s at the measured 3.6 MB/s).
+   * See {@link recordRssSample} and {@link PLATEAU_BAND_DIVISOR}.
    */
   lastOnsetAtMs: number | null;
   /**
@@ -180,6 +214,11 @@ export interface RssReleaseReading {
   sampleIntervalMs: number;
   /** The drawdown depth required to open an episode, which bounds what is detectable at all. */
   thresholdBytes: number;
+  /**
+   * How far below the high-water mark still counts as "at the plateau" when
+   * stamping {@link lastOnsetAtMs}, which bounds how late that stamp can be.
+   */
+  plateauBandBytes: number;
 }
 
 interface TrackerState {
@@ -195,6 +234,7 @@ interface TrackerState {
   sampleCount: number;
   sampleIntervalMs: number;
   thresholdBytes: number;
+  plateauBandBytes: number;
 }
 
 function initialState(): TrackerState {
@@ -211,10 +251,23 @@ function initialState(): TrackerState {
     sampleCount: 0,
     sampleIntervalMs: DEFAULT_SAMPLE_INTERVAL_MS,
     thresholdBytes: DEFAULT_RELEASE_THRESHOLD_BYTES,
+    plateauBandBytes: DEFAULT_RELEASE_THRESHOLD_BYTES / PLATEAU_BAND_DIVISOR,
   };
 }
 
 const state: TrackerState = initialState();
+
+/**
+ * Stop function for the sampler currently running, if any.
+ *
+ * `createApp` starts this on every app construction, and a test suite builds
+ * many apps in one process. Two live timers folding into the one module state
+ * would double {@link RssReleaseReading.sampleCount}, which the metric's help
+ * text reads as a ~1.0/s rate and whose DIPS are meant to measure event-loop
+ * stalls — so a doubled count would not just be wrong, it would be wrong on the
+ * series that qualifies every other reading here.
+ */
+let activeStop: (() => void) | null = null;
 
 function finite(value: number | undefined): value is number {
   return typeof value === "number" && Number.isFinite(value);
@@ -284,7 +337,16 @@ export function recordRssSample(rssBytes: number | undefined, nowMs: number): vo
   }
 
   const drawdownBytes = state.peakBytes - rssBytes;
-  if (drawdownBytes < state.thresholdBytes) return;
+  if (drawdownBytes < state.thresholdBytes) {
+    // Below the mark but still inside the plateau band: RSS has not begun
+    // falling, it is merely noisy. Restamp the onset clock WITHOUT ratcheting
+    // the mark down, so a single high spike cannot pin the onset to itself for
+    // the rest of the plateau. Samples between the band and the threshold are
+    // deliberately NOT restamped -- those are already part of the descent, and
+    // leaving the stamp at the last in-band sample is what dates its start.
+    if (drawdownBytes <= state.plateauBandBytes) state.peakAtMs = nowMs;
+    return;
+  }
 
   state.episodeOpen = true;
   state.episodeTroughBytes = rssBytes;
@@ -315,12 +377,14 @@ export function readRssReleases(): RssReleaseReading | null {
     sampleCount: state.sampleCount,
     sampleIntervalMs: state.sampleIntervalMs,
     thresholdBytes: state.thresholdBytes,
+    plateauBandBytes: state.plateauBandBytes,
   };
 }
 
 export interface StartRssReleaseTrackingOptions {
   intervalMs?: number;
   thresholdBytes?: number;
+  plateauBandBytes?: number;
   setInterval?: typeof setInterval;
   clearInterval?: typeof clearInterval;
   residentSetSize?: () => number;
@@ -350,8 +414,12 @@ export function startRssReleaseTracking(options: StartRssReleaseTrackingOptions 
   // module docblock: reading only RSS is what keeps this O(1) in the footprint.
   const readRss = options.residentSetSize ?? (() => process.memoryUsage.rss());
 
+  // Exactly one sampler at a time; see `activeStop`.
+  activeStop?.();
+
   state.sampleIntervalMs = intervalMs;
   state.thresholdBytes = options.thresholdBytes ?? DEFAULT_RELEASE_THRESHOLD_BYTES;
+  state.plateauBandBytes = options.plateauBandBytes ?? state.thresholdBytes / PLATEAU_BAND_DIVISOR;
 
   const timer = schedule(() => {
     let rssBytes: number;
@@ -369,14 +437,18 @@ export function startRssReleaseTracking(options: StartRssReleaseTrackingOptions 
   // Idempotent, matching the sibling sampler: a second call must not clear a
   // handle this sampler no longer owns.
   let stopped = false;
-  return () => {
+  const stop = () => {
     if (stopped) return;
     stopped = true;
+    if (activeStop === stop) activeStop = null;
     cancel(timer as Parameters<typeof clearInterval>[0]);
   };
+  activeStop = stop;
+  return stop;
 }
 
 /** Reset module state between tests. Not for production use. */
 export function __resetRssReleaseTrackerForTest(): void {
   Object.assign(state, initialState());
+  activeStop = null;
 }
