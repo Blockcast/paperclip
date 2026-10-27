@@ -2900,6 +2900,53 @@ function expandLabelPlaceholders(lead, alertName) {
   });
 }
 
+test("PaperclipTransientRetryClampSignature fits the Slack relay's 400-char lead (PEN-4145)", () => {
+  // Same relay cut as the checkout-origin test below, asserted separately
+  // because this alert is not part of that family.
+  //
+  // SCOPE, stated so the next reader does not mistake this for a fleet-wide
+  // guarantee: measured 2026-10-27, 31 of this file's 45 alerts have leads over
+  // the cap (worst 2149 chars). That is a real pre-existing defect -- every one
+  // of those reaches Slack cut mid-word, silently, with the paragraph that says
+  // what to do pushed out -- but it is NOT PEN-4145's to fix, and sweeping it
+  // into this PR would bury a monitoring change under 31 prose rewrites. This
+  // test pins the one alert PEN-4145 adds, so the count does not grow to 32.
+  const DESC_LEAD_MAX = 400;
+  const rendered = renderChart([
+    "--show-only",
+    "templates/prometheusrule.yaml",
+    "--set",
+    "prometheusRule.enabled=true",
+  ]);
+
+  const raw = rendered.match(
+    /- alert: PaperclipTransientRetryClampSignature\n[\s\S]*?description: "([^\n]*?)"\n/,
+  )?.[1];
+  assert.ok(raw, "PaperclipTransientRetryClampSignature must render a description");
+
+  const description = raw.replace(/\\n/g, "\n");
+  const lead = description.trim().split("\n\n", 1)[0].split(/\s+/).join(" ");
+
+  // No `{{ $labels.x }}` in this description, so the rendered scalar IS what
+  // Slack receives -- nothing expands at fire time. Asserted rather than
+  // assumed, because a later edit adding a label placeholder would silently
+  // grow the lead past the cap only once the alert actually fires.
+  assert.doesNotMatch(
+    lead,
+    /\{\{/,
+    "lead must contain no fire-time template expansion, or its true length is unmeasurable here",
+  );
+  assert.ok(
+    lead.length <= DESC_LEAD_MAX,
+    `PaperclipTransientRetryClampSignature: Slack lead is ${lead.length} chars, over the ${DESC_LEAD_MAX} cap -- break the description at a sentence boundary with a blank line. Lead: ${lead}`,
+  );
+
+  // The lead must also be USEFUL on its own, not merely short: a responder who
+  // sees only this paragraph still needs the metric to break down by.
+  assert.match(lead, /PEN-4145/);
+  assert.match(lead, /disposition/);
+});
+
 test("the three checkout-origin descriptions fit the Slack relay's 400-char lead at FIRE TIME", () => {
   // The relay forwards only the first blank-line-delimited paragraph of a
   // description, whitespace-collapsed and truncated at 400 chars (onprem-k8s

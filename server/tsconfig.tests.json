@@ -42,6 +42,7 @@
     "src/__tests__/recovery-chain-pass-timing-wiring.test.ts",
     "src/__tests__/recovery-stranded-attendance-batch.test.ts",
     "src/__tests__/scrape-metrics-routine-fire-gap-work.test.ts",
+    "src/__tests__/transient-retry-floor-clamp-signature.test.ts",
     "src/__tests__/truncate-text.test.ts",
     "src/__tests__/unclaimable-queued-run-reap-postgres.test.ts",
     "src/__tests__/unclaimable-queued-run-reap.test.ts",

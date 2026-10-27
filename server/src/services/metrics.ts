@@ -30,6 +30,15 @@ import {
   APPROVAL_TYPES,
   RESTORED_EXECUTION_DISCHARGE_KINDS,
 } from "@paperclipai/shared";
+// Value import for the same reason as the shared allow-lists above: the PEN-4145
+// zero-init grid needs the actual member list, and a second copy here would be
+// free to drift from the classifier that decides which alignment a given retry
+// instant reports. `ccrotate-capacity-retry` has NO imports of its own -- it is
+// a deliberately pure leaf predicate module -- so this cannot form a cycle.
+import {
+  RETRY_INSTANT_ALIGNMENTS,
+  type RetryInstantAlignment,
+} from "./ccrotate-capacity-retry.js";
 import { logger } from "../middleware/logger.js";
 // Type-only, so it is erased at runtime and creates no import cycle with the
 // reaper (which imports the recorder below). Structurally restating the result
@@ -1671,6 +1680,92 @@ export const SCHEDULED_RETRY_PARK_HORIZON_REFRESH_SUCCESS_METRIC =
  * routine window cannot accept a useful retry" into the same series as "the
  * issue was reassigned", which is the distinction this metric exists to make.
  */
+/**
+ * The `transient_failure` retry-floor dispersion decision, by disposition and
+ * by the sub-second signature of the instant it produced (PEN-4145).
+ *
+ * ## Why this counter exists
+ *
+ * PEN-2509 routes a transient retry floor down one of two branches -- adopt the
+ * capacity arithmetic's own output verbatim, or disperse a raw provider instant
+ * with per-run jitter -- and until this counter NEITHER BRANCH EMITTED
+ * ANYTHING. No counter, no gauge, no log line above `debug`. The only durable
+ * trace that the scheduler had made a dispersion decision was the
+ * `scheduled_retry_at` value itself, on a run row.
+ *
+ * That is not an abstract gap. The first PEN-2509 fix shipped 2026-08-29 keyed
+ * its exemption on `providerCapacityResetProvenance`, which the finalize path
+ * writes for every recovered reset, so it exempted precisely the population
+ * that herds and the fix did nothing. It was live, fleet-wide and WRONG for six
+ * weeks, and was caught only when @Ceo re-measured by hand on 2026-10-12 and
+ * found the clamp signature still at 16.55% (160/967). Nothing in the system
+ * reported on the behaviour, so nothing could have surfaced it sooner. PR #2709
+ * fixed the predicate; this counter fixes the blindness that hid the first
+ * attempt.
+ *
+ * ## Read it as a SHARE, not a count
+ *
+ * The clamp arrives in bursts tied to upstream flapping -- measured 0 parks/day
+ * on 2026-10-13..15 against 132/day on 2026-10-05 -- so no count threshold can
+ * both catch a regression and stay quiet. The discriminating quantity is the
+ * aligned SHARE of floor decisions, which is scale-free:
+ *
+ *     sum(increase(paperclip_transient_retry_floor_total{alignment=~"whole_second|ten_minute_grid"}[24h]))
+ *     / sum(increase(paperclip_transient_retry_floor_total[24h]))
+ *
+ * ALWAYS carry the denominator. A zero numerator over a zero denominator is a
+ * quiet upstream, NOT a healthy scheduler, and conflating the two is the exact
+ * false clear that let PEN-2509 close in August with AC4 recorded as
+ * "unmeasurable, sample size 0". {@link PaperclipTransientRetryClampSignature}
+ * requires `>= 30` floor decisions in the rule itself for that reason; do not
+ * read the ratio below that without saying so.
+ *
+ * ## Zero-initialized across the full grid, deliberately
+ *
+ * Every `disposition` x `alignment` combination is seeded at 0 at registry
+ * construction. `increase()` takes last-first, so a label series BORN at 1 on
+ * its first increment evaluates to 0 forever and an alert reading it is
+ * permanently silent -- the failure mode that would otherwise reproduce this
+ * ticket's own blindness in the detector meant to remove it. A 0 here therefore
+ * means "this pod made no floor decision of this shape", which is a real
+ * reading, not a missing metric. Do NOT alert on `absent()`.
+ *
+ * ## What the denominator is, exactly
+ *
+ * One increment per retry schedule that had a transient retry FLOOR to decide
+ * about -- not per transient park. A park with no floor at all takes the base
+ * backoff curve, which carries its own jitter and never herded, so it is out of
+ * scope and absent here. `superseded` is in scope and counted: a floor that
+ * lost to a later base backoff was still a floor this code looked at, and
+ * keeping it in makes the total "floor decisions" rather than "floor decisions
+ * that mattered", which is the honest denominator for a routing ratio.
+ *
+ * Cardinality is fixed at 4 x 3 forever -- both label sets are compile-time
+ * allow-lists, neither grows with the fleet.
+ */
+export const TRANSIENT_RETRY_FLOOR_METRIC = "paperclip_transient_retry_floor_total";
+/**
+ * How the dispersion decision came out, most-specific first.
+ *
+ * The two `exempt_*` values are split rather than folded into one `exempt`
+ * because WHICH marker exempted a floor is the thing that silently broke. A
+ * predicate regression does not change the exempt share -- it changes which
+ * marker produces it -- so an undifferentiated `exempt` would have read
+ * identically before and after the 2026-08-29 fix failed. Select the pair with
+ * `disposition=~"exempt_.*"` where the distinction does not matter.
+ */
+export const TRANSIENT_RETRY_FLOOR_DISPOSITIONS = [
+  /** The floor came out of the capacity arithmetic, which jitters and bounds it itself. */
+  "exempt_capacity_governed",
+  /** The floor is `now + MAX_TRANSIENT_RETRY_HORIZON_MS`, so it is per-run by construction. */
+  "exempt_horizon_clamped",
+  /** A raw advertised instant, dispersed here by `jitterTransientRetryFloor`. */
+  "dispersed",
+  /** A floor existed but the base backoff landed later, so the floor was discarded. */
+  "superseded",
+] as const;
+
+export type TransientRetryFloorDisposition = (typeof TRANSIENT_RETRY_FLOOR_DISPOSITIONS)[number];
 export const RETRY_SCHEDULE_OUTCOME_METRIC = "paperclip_retry_schedule_outcome_total";
 /**
  * Retry-scheduling outcomes, as an allow-list so a future branch cannot mint a
@@ -4420,6 +4515,7 @@ type HeartbeatRunFailedLabel =
 let heartbeatRunFailed: Counter<HeartbeatRunFailedLabel> | null = null;
 let ccrotateCapacityDeferred: Counter<"adapter" | "provider"> | null = null;
 let retryScheduleOutcome: Counter<"outcome" | "retry_reason"> | null = null;
+let transientRetryFloor: Counter<"disposition" | "alignment"> | null = null;
 let startLockReapDisposition: Counter<"disposition"> | null = null;
 let orphanReapStageSeconds: Histogram<"stage"> | null = null;
 let penstockGateProbe: Counter<"path" | "outcome" | "provider" | "model"> | null = null;
@@ -4641,6 +4737,7 @@ function ensureRegistry(): {
   failedCounter: Counter<HeartbeatRunFailedLabel>;
   capacityDeferredCounter: Counter<"adapter" | "provider">;
   retryScheduleOutcomeCounter: Counter<"outcome" | "retry_reason">;
+  transientRetryFloorCounter: Counter<"disposition" | "alignment">;
   startLockReapDispositionCounter: Counter<"disposition">;
   orphanReapStageSecondsHistogram: Histogram<"stage">;
   penstockGateProbeCounter: Counter<"path" | "outcome" | "provider" | "model">;
@@ -5225,6 +5322,49 @@ function ensureRegistry(): {
     for (const outcome of KNOWN_RETRY_SCHEDULE_OUTCOMES) {
       for (const retry_reason of KNOWN_RETRY_SCHEDULE_REASONS) {
         retryScheduleOutcome.inc({ outcome, retry_reason }, 0);
+      }
+    }
+    transientRetryFloor = new Counter({
+      name: TRANSIENT_RETRY_FLOOR_METRIC,
+      help:
+        "Count of transient_failure retry-FLOOR dispersion decisions (PEN-4145), by disposition "
+        + "and by the sub-second signature of the instant the decision produced. Before this "
+        + "counter neither branch of the PEN-2509 dispersion fix emitted anything at all, so the "
+        + "only durable trace of a dispersion decision was the scheduled_retry_at value on a run "
+        + "row -- which is why the first fix was live, fleet-wide and WRONG for six weeks and was "
+        + "caught only by a hand census (16.55%, 160/967, on 2026-10-12). READ IT AS A SHARE, not "
+        + "a count: the clamp arrives in bursts tied to upstream flapping (0 parks/day on "
+        + "2026-10-13..15 vs 132/day on 2026-10-05), so no count threshold can both catch a "
+        + "regression and stay quiet. alignment='off_grid' is healthy and should be ~99.9% of "
+        + "every disposition -- jitter is drawn in milliseconds, so a dispersed instant lands on "
+        + "a whole second with p~1/1000 and on the :M9:59 grid with p~1/600000, while a verbatim "
+        + "provider instant lands on one with p~1. Recorded pre-fix baselines: 94.03% (126/134) "
+        + "aligned within the clamped population, 20.43% (153/749) unconditional. ALWAYS carry "
+        + "the denominator -- a zero numerator over a zero denominator is a quiet upstream, not a "
+        + "healthy scheduler, and that 0/0 is exactly the false clear that closed PEN-2509 in "
+        + "August with AC4 recorded as sample size 0. The denominator counts floor DECISIONS, not "
+        + "transient parks: a park with no floor takes the base backoff curve, carries its own "
+        + "jitter, never herded, and is absent here. The two exempt_* dispositions are split "
+        + "because WHICH marker exempted a floor is the thing that silently broke -- a predicate "
+        + "regression does not move the exempt share, it moves which marker produces it, so an "
+        + "undifferentiated exempt would have read identically before and after the 2026-08-29 "
+        + "fix failed; use disposition=~\"exempt_.*\" where that distinction does not matter. "
+        + "Every disposition x alignment series is zero-seeded at start, so increase() can see "
+        + "the first event after each restart -- a series born at 1 evaluates to 0 forever and "
+        + "would reproduce this ticket's own blindness inside its detector. A 0 is therefore a "
+        + "real reading ('this pod made no floor decision of this shape'), NOT a missing metric: "
+        + "do NOT alert on absent() here. Cardinality is fixed at 4 x 3 forever.",
+      labelNames: ["disposition", "alignment"],
+      registers: [registry],
+    });
+    // PEN-4145: zero-seed the full closed grid, for the reason spelled out in
+    // the help above and in TRANSIENT_RETRY_FLOOR_METRIC's own comment. This is
+    // the single most load-bearing line in this block: without it the alert
+    // that reads this counter is permanently silent, which is the failure this
+    // ticket exists to remove rather than to re-introduce one layer down.
+    for (const disposition of TRANSIENT_RETRY_FLOOR_DISPOSITIONS) {
+      for (const alignment of RETRY_INSTANT_ALIGNMENTS) {
+        transientRetryFloor.inc({ disposition, alignment }, 0);
       }
     }
     orphanReapStageSeconds = new Histogram({
@@ -7405,6 +7545,7 @@ function ensureRegistry(): {
     failedCounter: heartbeatRunFailed,
     capacityDeferredCounter: ccrotateCapacityDeferred,
     retryScheduleOutcomeCounter: retryScheduleOutcome,
+    transientRetryFloorCounter: transientRetryFloor,
     startLockReapDispositionCounter: startLockReapDisposition,
     orphanReapStageSecondsHistogram: orphanReapStageSeconds,
     penstockGateProbeCounter: penstockGateProbe,
@@ -7790,6 +7931,37 @@ export function recordRetryScheduleOutcome(
     retry_reason: coerceRetryScheduleReason(input.retryReason),
   };
   ensureRegistry().retryScheduleOutcomeCounter.inc(labels);
+  return labels;
+}
+
+/**
+ * Record one transient retry-floor dispersion decision (PEN-4145).
+ *
+ * Both labels are coerced to their compile-time allow-lists, so worst-case
+ * series count is fixed at
+ * `TRANSIENT_RETRY_FLOOR_DISPOSITIONS.length * RETRY_INSTANT_ALIGNMENTS.length`
+ * whatever a caller passes. Deliberately carries no `agent_id`: the regression
+ * this detects is fleet-wide routing, and the measured signature was a COHORT
+ * sharing one instant across agents -- per-agent series would split exactly the
+ * population whose concentration is the signal.
+ *
+ * Returns the resolved labels so the caller can put them in the run event
+ * alongside, and so a test can assert on the classification without reading the
+ * registry.
+ */
+export function recordTransientRetryFloorDisposition(input: {
+  disposition: TransientRetryFloorDisposition;
+  alignment: RetryInstantAlignment;
+}): { disposition: TransientRetryFloorDisposition; alignment: RetryInstantAlignment } {
+  const labels = {
+    disposition: (TRANSIENT_RETRY_FLOOR_DISPOSITIONS as readonly string[]).includes(input.disposition)
+      ? input.disposition
+      : ("superseded" as const),
+    alignment: (RETRY_INSTANT_ALIGNMENTS as readonly string[]).includes(input.alignment)
+      ? input.alignment
+      : ("off_grid" as const),
+  };
+  ensureRegistry().transientRetryFloorCounter.inc(labels);
   return labels;
 }
 
