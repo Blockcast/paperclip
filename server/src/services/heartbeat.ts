@@ -29684,10 +29684,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
   }
 
-  async function reconcileStrandedAssignedIssues(opts?: { recoveryChainId?: string }) {
+  async function reconcileStrandedAssignedIssues(opts?: { recoveryChainId?: string; shouldStop?: () => boolean }) {
     return recovery.reconcileStrandedAssignedIssues({
       issueCreatedAtGte: await getWorktreeExecutionCutoff(),
       recoveryChainId: opts?.recoveryChainId,
+      shouldStop: opts?.shouldStop,
     });
   }
 

@@ -21,6 +21,7 @@ describe("coordinateHeartbeatSchedulerShutdown", () => {
       hotRestart: { mode: "prepared", skipDrain: true },
       preparationError: null,
       waitedForSchedulerIdle: false,
+      idleWaitTimedOut: false,
     });
   });
 
@@ -52,6 +53,7 @@ describe("coordinateHeartbeatSchedulerShutdown", () => {
       hotRestart: { mode: "not_requested", skipDrain: false },
       preparationError: null,
       waitedForSchedulerIdle: true,
+      idleWaitTimedOut: false,
     });
   });
 
@@ -69,6 +71,7 @@ describe("coordinateHeartbeatSchedulerShutdown", () => {
       hotRestart: null,
       preparationError: null,
       waitedForSchedulerIdle: true,
+      idleWaitTimedOut: false,
     });
   });
 
@@ -89,6 +92,28 @@ describe("coordinateHeartbeatSchedulerShutdown", () => {
       hotRestart: null,
       preparationError,
       waitedForSchedulerIdle: true,
+      idleWaitTimedOut: false,
     });
+  });
+
+  it("stops waiting at idleWaitTimeoutMs so the lease is released inside the grace (BLO-49596)", async () => {
+    vi.useFakeTimers();
+    try {
+      const shutdown = coordinateHeartbeatSchedulerShutdown({
+        signal: "SIGTERM",
+        prepareHotRestartShutdown: null,
+        waitForHeartbeatSchedulerIdle: () => new Promise<void>(() => undefined),
+        idleWaitTimeoutMs: 20_000,
+      });
+      await vi.advanceTimersByTimeAsync(20_000);
+      await expect(shutdown).resolves.toEqual({
+        hotRestart: null,
+        preparationError: null,
+        waitedForSchedulerIdle: false,
+        idleWaitTimedOut: true,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

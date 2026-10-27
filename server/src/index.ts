@@ -134,7 +134,7 @@ import { initTelemetry, getTelemetryClient } from "./telemetry.js";
 import { conflict } from "./errors.js";
 import { githubReviewerAppSlug } from "./services/github-app-auth.js";
 import { reconcileContendedPrReviewerWakes } from "./routes/github-webhook.js";
-import { coordinateHeartbeatSchedulerShutdown } from "./shutdown.js";
+import { coordinateHeartbeatSchedulerShutdown, HEARTBEAT_SCHEDULER_IDLE_WAIT_TIMEOUT_MS } from "./shutdown.js";
 import type {
   InstanceDatabaseBackupRunResult,
   InstanceDatabaseBackupTrigger,
@@ -2495,6 +2495,8 @@ export async function startServer(): Promise<StartedServer> {
             // overlaps the next one. Diagnostic only — see the module docblock.
             const chainTimer = createRecoveryChainTimer({
               log: (fields, message) => logger.info(fields, message),
+              // BLO-49596: stop at the next pass boundary on shutdown.
+              shouldSkip: () => heartbeatSchedulerStopped,
             });
             trackHeartbeatSchedulerWork(chainTimer
               // Pass 1's span is the sweep call alone, so it stays directly
@@ -2502,6 +2504,7 @@ export async function startServer(): Promise<StartedServer> {
               // timing` line the sweep emits from inside itself.
               .time(1, "reconcileStrandedAssignedIssues", () => heartbeat.reconcileStrandedAssignedIssues({
                 recoveryChainId: chainTimer.chainId,
+                shouldStop: () => heartbeatSchedulerStopped,
               }))
               .then(async (reconciled) => {
                 if (
@@ -3557,7 +3560,14 @@ export async function startServer(): Promise<StartedServer> {
         signal,
         prepareHotRestartShutdown,
         waitForHeartbeatSchedulerIdle,
+        idleWaitTimeoutMs: HEARTBEAT_SCHEDULER_IDLE_WAIT_TIMEOUT_MS,
       });
+      if (heartbeatShutdown.idleWaitTimedOut) {
+        logger.warn(
+          { signal, timeoutMs: HEARTBEAT_SCHEDULER_IDLE_WAIT_TIMEOUT_MS },
+          "shutdown: heartbeat scheduler work still in flight at idle-wait deadline; releasing scheduler lease anyway (BLO-49596)",
+        );
+      }
       const skipHeartbeatDrain = heartbeatShutdown.hotRestart?.skipDrain === true;
 
       // BLO-43292. Released only AFTER the scheduler's in-flight work has
@@ -3574,10 +3584,18 @@ export async function startServer(): Promise<StartedServer> {
       // lease out. When the idle wait was skipped (hot restart), do NOT
       // release — let the TTL expire, trading handover speed for exclusion.
       // Best-effort either way: the holder logs and swallows a failed release.
+      //
+      // BLO-49596: the idle wait is bounded. Unbounded, a 145 s recovery pass
+      // outlived the 120 s grace, the pod was SIGKILLed before this line, and
+      // failover cost grace + TTL (~160 s). The chain now stops at SIGTERM, and
+      // on the backstop timeout the lease is released anyway (speed over
+      // exclusion for whatever single step is still running).
       // BLO-46694: stop the worker singletons before the lease can pass on.
       for (const stop of workerSingletonStops.splice(0)) stop();
       if (schedulerLease) {
-        await schedulerLease.stop({ release: heartbeatShutdown.waitedForSchedulerIdle });
+        await schedulerLease.stop({
+          release: heartbeatShutdown.waitedForSchedulerIdle || heartbeatShutdown.idleWaitTimedOut,
+        });
         schedulerLease = null;
       }
       if (skipHeartbeatDrain) {
