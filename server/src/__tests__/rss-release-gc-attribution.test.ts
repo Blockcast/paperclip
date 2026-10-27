@@ -31,9 +31,12 @@
  * 4. **No episode publishes nothing, and neither does a contaminated control.**
  *    "No release observed" and "a release was observed with no GC near it" are
  *    opposite findings, and the second is the result this row is waiting for. A
- *    baseline window holding the previous episode's onset is a second event
+ *    baseline window holding ANY earlier episode's onset is a second event
  *    rather than an ambient stretch, so it is withheld rather than published as
- *    a denominator.
+ *    a denominator. ⚠ "Any", not "the previous one": several onsets fit inside
+ *    one baseline offset — this fleet produced three in ~10 min — so a check
+ *    that remembers only the newest can have the contaminating onset erased out
+ *    from under it and publish the window as clean.
  */
 
 import { describe, expect, it, beforeEach } from "vitest";
@@ -267,6 +270,32 @@ describe("release onset GC attribution", () => {
     const third = second + DEFAULT_BASELINE_OFFSET_MS * 2;
     expect(attributeRssReleaseGc(readingWithOnset(third), closed(third))?.baseline)
       .not.toBeNull();
+  });
+
+  it("withholds the baseline when an onset older than the PREVIOUS one falls inside it", () => {
+    // Three onsets inside one baseline offset -- the shape measured on
+    // `paperclip-1` at 09:39 / 09:44 / 09:49. The newest's control window is
+    // centred on the FIRST, while the second sits well clear of it. So a check
+    // keeping only the immediately-prior onset is asking about the one episode
+    // that is NOT in the window, reads it as clean, and publishes a denominator
+    // with a release inside it -- an ambient control that contains the event.
+    const first = 1_000_000;
+    const second = first + 150_000;
+    const third = first + DEFAULT_BASELINE_OFFSET_MS;
+    const closed = (onsetAtMs: number) => ({ now: () => onsetAtMs + 600_000 });
+
+    expect(attributeRssReleaseGc(readingWithOnset(first), closed(first))?.baseline)
+      .not.toBeNull();
+    // The middle episode's own control window is genuinely clean and must stay
+    // published: widening the check must not withhold every baseline once more
+    // than one onset is on record.
+    expect(attributeRssReleaseGc(readingWithOnset(second), closed(second))?.baseline)
+      .not.toBeNull();
+
+    const contaminated = attributeRssReleaseGc(readingWithOnset(third), closed(third));
+    // `second` is 150 s clear of this window; `first` is dead centre in it.
+    expect(contaminated?.baseline).toBeNull();
+    expect(contaminated?.onset).not.toBeNull();
   });
 
   it("reads the baseline as UNCOVERED when it predates the ring", () => {

@@ -108,8 +108,9 @@ export const DEFAULT_ONSET_WINDOW_HALF_MS = 5_000;
  * {@link RssReleaseGcAttribution.baseline}'s `covered` before reading it at all.
  *
  * ⚠ "Contains no onset" is enforced rather than assumed: the baseline is
- * `null`, and nothing is published for it, when the PREVIOUS episode's onset
- * falls inside it. See {@link RssReleaseGcAttribution.baseline}.
+ * `null`, and nothing is published for it, when ANY earlier episode's onset
+ * falls inside it — not merely the immediately-prior one. See
+ * {@link RssReleaseGcAttribution.baseline}.
  */
 export const DEFAULT_BASELINE_OFFSET_MS = 300_000;
 
@@ -133,16 +134,27 @@ export interface RssReleaseGcAttribution {
   /**
    * Same-width window {@link DEFAULT_BASELINE_OFFSET_MS} earlier, containing no onset.
    *
-   * `null` when the PREVIOUS episode's onset falls inside that window, which
+   * `null` when ANY earlier episode's onset falls inside that window, which
    * would make it a second event rather than the ambient control it is read as.
    * ⛔ A `null` baseline is not a baseline of zero: with no control the
    * onset count is uninterpretable, so nothing is published for either window's
    * comparison and the reader is left with the absence rather than with a ratio
    * computed against a contaminated denominator.
    *
-   * Best-effort within one process: the prior onset is known only from an
-   * episode this module has already attributed, so the very first episode after
-   * a restart cannot be checked against one that predates it.
+   * ⚠ Checked against EVERY onset still within reach of a control window,
+   * not just the newest. Several onsets can fall inside one baseline offset —
+   * this fleet produced three in ~10 min — and a check holding only the
+   * immediately-prior one would let the newest overwrite the record of an older
+   * onset that is itself sitting in this window, publishing a contaminated
+   * denominator as clean.
+   *
+   * Best-effort within one process, in two ways: an onset is known only from an
+   * episode this module has already attributed, so the first episode after a
+   * restart cannot be checked against one that predates it — and the tracker
+   * publishes one onset at a time, so two onsets falling between consecutive
+   * scrapes leave the module never having seen the earlier one. ⛔ Neither gap
+   * is closable from here, so a non-null baseline means no OBSERVED onset
+   * contaminates it.
    */
   readonly baseline: GcCycleWindow | null;
   /** Full width of both windows, in ms. Published so a count is readable as a rate. */
@@ -159,16 +171,21 @@ export interface AttributeRssReleaseGcOptions {
 }
 
 let memo: RssReleaseGcAttribution | null = null;
-/** Newest onset this module has attributed, whether or not it was frozen. */
-let seenOnsetAtMs: number | null = null;
 /**
- * The onset before {@link seenOnsetAtMs}.
+ * Onsets this module has attributed, oldest first, frozen or not.
  *
  * Kept only to answer "is the baseline window clean?" — see
  * {@link RssReleaseGcAttribution.baseline}. The tracker publishes one onset at
- * a time, so this is the only record of the previous one once it is superseded.
+ * a time, so once an onset is superseded this array is the only record of it,
+ * and a single "previous" slot would lose every onset but the newest.
+ *
+ * Bounded by elapsed time rather than by episode count: onsets only move
+ * forward, so each call drops those already past the reach of any future
+ * control window, leaving one baseline offset of history — a handful of
+ * entries at this fleet's ~1 release per process-hour, and still bounded
+ * through a burst.
  */
-let priorOnsetAtMs: number | null = null;
+let recentOnsetsAtMs: number[] = [];
 
 /**
  * Compute (or recall) the GC windows around the reading's most recent onset.
@@ -193,21 +210,29 @@ export function attributeRssReleaseGc(
   const readWindow = options.readWindow ?? readGcCyclesInWindow;
 
   const nowMs = (options.now ?? Date.now)();
-  // A new onset supersedes the last one, which becomes the episode the control
-  // window must be checked against. Tracked here rather than off `memo`, which
-  // holds only FROZEN episodes and so would skip one whose window was still
-  // open when the next arrived.
-  if (seenOnsetAtMs !== null && seenOnsetAtMs !== onsetAtMs) priorOnsetAtMs = seenOnsetAtMs;
-  seenOnsetAtMs = onsetAtMs;
+  // EVERY onset seen so far is a candidate contaminant of this episode's
+  // control window, so they are kept as a set rather than in a single
+  // "previous" slot. Tracked here rather than off `memo`, which holds only
+  // FROZEN episodes and so would skip one whose window was still open when the
+  // next arrived.
+  if (recentOnsetsAtMs[recentOnsetsAtMs.length - 1] !== onsetAtMs) {
+    recentOnsetsAtMs.push(onsetAtMs);
+  }
+  // Onsets only move forward, so every later control window starts no earlier
+  // than this one's: an onset before this window's far edge can never fall
+  // inside this or any future one, and dropping it bounds the record.
+  const oldestReachableMs = onsetAtMs - baselineOffsetMs - halfMs;
+  recentOnsetsAtMs = recentOnsetsAtMs.filter((at) => at >= oldestReachableMs);
 
   const baselineCentreMs = onsetAtMs - baselineOffsetMs;
   const baselineFromMs = baselineCentreMs - halfMs;
   const baselineToMs = baselineCentreMs + halfMs;
-  // A previous onset inside the control window makes it a second event, not an
-  // ambient stretch. Refuse the comparison rather than publish a denominator
-  // that quietly contains the thing being measured.
-  const baselineContainsPriorOnset =
-    priorOnsetAtMs !== null && priorOnsetAtMs >= baselineFromMs && priorOnsetAtMs <= baselineToMs;
+  // Any OTHER episode's onset inside the control window makes it a second
+  // event, not an ambient stretch. Refuse the comparison rather than publish a
+  // denominator that quietly contains the thing being measured.
+  const baselineContainsOnset = recentOnsetsAtMs.some(
+    (at) => at !== onsetAtMs && at >= baselineFromMs && at <= baselineToMs,
+  );
 
   const onset = readWindow(onsetAtMs - halfMs, onsetAtMs + halfMs);
   // Has the onset window finished happening? If not, every entry still to come
@@ -217,7 +242,7 @@ export function attributeRssReleaseGc(
   const attribution: RssReleaseGcAttribution = {
     onsetAtMs,
     onset: windowClosed ? onset : { ...onset, covered: false },
-    baseline: baselineContainsPriorOnset ? null : readWindow(baselineFromMs, baselineToMs),
+    baseline: baselineContainsOnset ? null : readWindow(baselineFromMs, baselineToMs),
     windowMs: halfMs * 2,
   };
 
@@ -230,6 +255,5 @@ export function attributeRssReleaseGc(
 /** Reset module state between tests. Not for production use. */
 export function __resetRssReleaseGcAttributionForTest(): void {
   memo = null;
-  seenOnsetAtMs = null;
-  priorOnsetAtMs = null;
+  recentOnsetsAtMs = [];
 }
