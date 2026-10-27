@@ -364,8 +364,20 @@ const K8S_NAME_MAX_GENERATED_LENGTH = 10;
 /** Total opaque mass. This is the entropy budget the rule spends; see the
  *  residual note above for what it buys and what it costs. */
 const K8S_NAME_MAX_GENERATED_MASS = 16;
-/** PEN-4438 (D7): names whose values take the Kubernetes object-name shape. */
-const K8S_OBJECT_NAME_VALUE_NAMES = new Set(["cronjob", "instance", "name", "pod"]);
+/** PEN-4438 (D7): names whose values take the Kubernetes object-name shape.
+ *  BLO-49591 added `namespace` (a DNS-1123 label, e.g. a preview namespace
+ *  carrying an issue number) and `node` / `host_name` (a node name, as
+ *  kube-state-metrics and node-exporter label it). Same shape, same
+ *  conjuncts; a credential-shaped value under these names is still refused. */
+const K8S_OBJECT_NAME_VALUE_NAMES = new Set([
+  "cronjob",
+  "host_name",
+  "instance",
+  "name",
+  "namespace",
+  "node",
+  "pod",
+]);
 
 /** True when a value is a Kubernetes object name or in-cluster DNS name. */
 function isKubernetesObjectName(value: string): boolean {

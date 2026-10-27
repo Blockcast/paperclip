@@ -1100,6 +1100,37 @@ describe("scrubGitHubEgressText", () => {
     });
   });
 
+  describe("BLO-49591 regression: a namespace or node name is not a credential", () => {
+    // Derived, not embedded: these are the exact values the shipped rule
+    // refused in Blockcast/onprem-k8s promtool fixtures, so writing them
+    // contiguously would make this file unpushable until the fix deploys.
+    const pair = (name: string, value: string) => [name, value].join("=");
+    const NAMESPACE = ["staging", "depin", "preview", "blo", "35185", "ix", "umh", "probe", "input"].join("-");
+    const NODE = ["k8s", "paperclip", "calibration", "mean", "rate"].join("-");
+
+    it.each([
+      ["namespace", NAMESPACE, `      - series: 'kube_deployment_status_replicas{${pair("namespace", `"${NAMESPACE}"`)}}'`],
+      ["host_name", NODE, `description: "imagefs on {${pair("host_name", `'${NODE}'`)}} is low"`],
+      ["node", NODE, `kube_node_info{${pair("node", `"${NODE}"`)}}`],
+    ])("passes a %s label matcher byte-exact", (_name, _value, text) => {
+      expect(scrubGitHubEgressText(text).text).toBe(text);
+      expect(locateGitHubEgressMatches(text)).toEqual([]);
+    });
+
+    // Positive controls: the name anchor narrows, it does not licence.
+    it.each([
+      ["namespace", "a3f91c8e2b7d405fa6c19e83bd27f04a1c6e59b8"],
+      ["host_name", ["386c81e8", "e454", "4f2a", "9b31", "7c5d2e8a1f04"].join("-")],
+      ["node", SYNTHETIC_OPAQUE_VALUE],
+      ["password", NAMESPACE],
+      ["token", NODE],
+    ])("still refuses a credential-shaped value under %s", (name, value) => {
+      const result = scrubGitHubEgressText(pair(name, value));
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(value);
+    });
+  });
+
   describe("PEN-4637 regression: an absolute POSIX path is not a credential", () => {
     // Derived, not embedded, throughout. Every positive below is the exact
     // material the SHIPPED rule refuses, so a contiguous `name=value` literal
