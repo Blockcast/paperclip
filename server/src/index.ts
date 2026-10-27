@@ -1230,6 +1230,14 @@ export async function startServer(): Promise<StartedServer> {
    * that runs the gated loop — see the lease construction below for why.
    */
   let runLeaderRecovery: (() => void) | null = null;
+  /**
+   * BLO-49303. Runs one heartbeat scheduler tick now and restarts the interval
+   * from here, so a lease takeover enqueues at once instead of waiting out the
+   * remainder of a `heartbeatSchedulerIntervalMs` it spent as a follower.
+   * Null until the interval is armed (a boot-time acquisition keeps the
+   * startup ordering) and after shutdown disarms it.
+   */
+  let kickHeartbeatScheduler: (() => void) | null = null;
   // PEN-3314. Separate timer from `heartbeatSchedulerInterval` on purpose — see
   // the watchdog registration below for why the recovery-chain detector must
   // not ride the heartbeat tick.
@@ -1926,6 +1934,9 @@ export async function startServer(): Promise<StartedServer> {
         // BLO-47803: bring the warm-standby plugin set up to date first, so
         // recovery drives external runs through current plugin code/config.
         onAcquire: () => {
+          // BLO-49303: first, and synchronously — the timer enqueue sits ahead
+          // of the recovery gate, so it need not wait for resync or recovery.
+          kickHeartbeatScheduler?.();
           const resync = (app as { locals?: { resyncPluginsOnTakeover?: () => Promise<void> } })
             .locals?.resyncPluginsOnTakeover;
           if (!resync) return runLeaderRecovery?.();
@@ -1962,7 +1973,7 @@ export async function startServer(): Promise<StartedServer> {
       runLeaderRecovery?.();
     }
 
-    heartbeatSchedulerInterval = setInterval(() => {
+    const heartbeatSchedulerTick = () => {
       // Async so the suppression checks below can honor the override-aware
       // resolver (e.g. worktree run-execution opt-in). The gated work is still
       // wrapped in trackHeartbeatSchedulerWork with its own error handling.
@@ -2661,7 +2672,14 @@ export async function startServer(): Promise<StartedServer> {
           }
         }
       })();
-    }, config.heartbeatSchedulerIntervalMs);
+    };
+    heartbeatSchedulerInterval = setInterval(heartbeatSchedulerTick, config.heartbeatSchedulerIntervalMs);
+    kickHeartbeatScheduler = () => {
+      if (heartbeatSchedulerStopped || !heartbeatSchedulerInterval) return;
+      clearInterval(heartbeatSchedulerInterval);
+      heartbeatSchedulerInterval = setInterval(heartbeatSchedulerTick, config.heartbeatSchedulerIntervalMs);
+      heartbeatSchedulerTick();
+    };
   }
   
   // Database backup is a singleton scheduled task (writes one file per

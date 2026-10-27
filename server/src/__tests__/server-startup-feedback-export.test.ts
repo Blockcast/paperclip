@@ -908,6 +908,43 @@ describe("startServer feedback export wiring", () => {
     }
   });
 
+  it("ticks the timer enqueue at once when a running follower takes the lease (BLO-49303)", async () => {
+    const schedulerIntervalMs = 30000;
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: schedulerIntervalMs,
+    }));
+    let schedulerArms = 0;
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((_callback: () => void, delay?: number) => {
+        if (delay === schedulerIntervalMs) schedulerArms += 1;
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+    singletonLease.leader = false;
+    try {
+      await startServer();
+      expect(schedulerArms).toBe(1);
+      expect(heartbeatServiceMock.tickTimers).not.toHaveBeenCalled();
+
+      // Takeover: the holder flips to leader and fires onAcquire. No interval
+      // callback is invoked, so a tick here can only come from the kick —
+      // without it the first enqueue waited out up to a full interval
+      // (31 s measured on the 2026-10-27 rollout, against a 15 s AC).
+      const { schedulerLeaseHolder } = await import("../services/scheduler-lease.js");
+      const opts = vi.mocked(schedulerLeaseHolder).mock.calls.at(-1)?.[1] as { onAcquire?: () => void };
+      singletonLease.leader = true;
+      opts.onAcquire?.();
+
+      await vi.waitFor(() => expect(heartbeatServiceMock.tickTimers).toHaveBeenCalledTimes(1));
+      // Re-armed from the kick, so the next tick is a full interval away.
+      expect(schedulerArms).toBe(2);
+    } finally {
+      singletonLease.leader = true;
+      setIntervalSpy.mockRestore();
+    }
+  });
+
   it("does not replay hot-restart adoption when the orphan reaper retries", async () => {
     loadConfigMock.mockReturnValue(buildTestConfig({
       heartbeatSchedulerEnabled: true,
