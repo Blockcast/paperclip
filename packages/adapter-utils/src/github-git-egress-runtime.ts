@@ -390,6 +390,7 @@ function forcePushRefusal(forcePush: GitForcePush): GitEgressRuntimeError {
   const lease = [
     "    git fetch origin",
     "    git rev-parse origin/<branch>          # <expected-sha>",
+    // paperclip:allow-git-push: remediation text shown to the author, not an invocation
     "    git push --force-with-lease=refs/heads/<branch>:<expected-sha> origin <branch>",
   ].join("\n");
 

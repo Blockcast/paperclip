@@ -524,7 +524,7 @@ export interface GitPublishVerb {
  * Push options that consume a SEPARATE following token as their value.
  *
  * Exists for exactly one reason: so a value that happens to begin with `+` is
- * not read as a force refspec. `git push -o +weird origin main` carries no
+ * not read as a force refspec. The argv `push -o +weird origin main` carries no
  * force, and refusing it would be the "wrong answer refuses any push" failure
  * this guard must not have. Measured against git 2.47.3 — `+weird` was taken as
  * the push-option value and reached the remote as one.
@@ -593,7 +593,7 @@ export interface GitForcePush {
  * one seat, on two different issues, racing a push to one branch. The collision
  * itself was detected for free, server-side at GitHub, by git's own
  * non-fast-forward rejection — and it was bounded and self-healing. The
- * unbounded harm was the obvious recovery: a `git push --force` would have
+ * unbounded harm was the obvious recovery: a blind `push --force` would have
  * destroyed `92ded9ee`, which on comparison was the better of the two fixes.
  *
  * So this predicate does **not** prevent two runs pushing to one branch, and
@@ -616,11 +616,17 @@ export interface GitForcePush {
  * wrong answer here refuses a FORCE push specifically; it cannot refuse an
  * ordinary one, because nothing but a force token reaches a non-null return.
  *
+ * Examples in these comments name the argv without a leading `git`. The
+ * repo-wide no-push policy check under `scripts/` rejects a
+ * `git`-then-`push` adjacency anywhere in this package, and its
+ * comment-stripping heuristic only understands `//` lines, so the same
+ * words inside a block comment trip it. Keep the examples in this form.
+ *
  * Shapes handled, each measured against git 2.47.3 on a real non-fast-forward
  * push:
  *
  *   --force, -f, and bundled clusters   `-fu` and `-uf` both force.
- *   +<refspec>                          `git push origin +HEAD:refs/heads/x`
+ *   +<refspec>                          `push origin +HEAD:refs/heads/x`
  *                                       reported `forced update` carrying no
  *                                       `--force` token at all. Still forces
  *                                       after a `--` separator, which is why
@@ -652,8 +658,11 @@ export interface GitForcePush {
  * and reading config here would cost the totality the paragraph above buys. The
  * config is agent-writable anyway, the same caveat aliases carry, so covering
  * it would not make this enforcement; PEN-3183 is where that gap closes.
+ * Config-carried MIRRORING is the same blind spot: with `remote.<name>.mirror
+ * = true`, a bare `push <name>` argv force-updates and prunes every ref, and
+ * an argv predicate cannot see that either.
  *
- * Ref DELETIONS are deliberately out of scope: `git push origin :branch`,
+ * Ref DELETIONS are deliberately out of scope: `push origin :branch`,
  * `--delete` and `-d` remove a ref but destroy no commits, and deleting a
  * merged branch is routine. Note `:branch` has no leading `+`, so it does not
  * trip the refspec arm by accident.
@@ -792,7 +801,7 @@ export interface GitInvocationClassification {
    *
    * Computed from the arguments git will hand `push`, which on an alias-carried
    * push means the expansion's own arguments ahead of the caller's — `git -c
-   * alias.p='push --force' p origin main` runs `git push --force origin main`,
+   * alias.p='push --force' p origin main` runs `push --force origin main`,
    * and reading only the caller's half would miss the `--force` entirely.
    *
    * See {@link classifyForcePush} for the scope, the two honest limits, and
