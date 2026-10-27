@@ -2408,7 +2408,7 @@ release_in_flight_lock`;
     : [];
   // stdout as well as stderr: the two loops' MESSAGING asymmetry -- this one
   // silent on both success and exhaustion, retire-only mode chatty -- is the
-  // other half of what `:759-763` defends at length against a parity fix, and
+  // other half of what `:771-775` defends at length against a parity fix, and
   // until both harnesses captured stdout it was asserted by nothing. Every
   // direction of that fix is now a failure: adding an `echo` here on either
   // path, or deleting retire-only's.
@@ -2446,7 +2446,7 @@ test("a conflicting retirement write is still retried to exhaustion", () => {
   });
   assert.equal(r.writes, 3, "a conflict must consume every attempt, not bail on the first");
   assert.equal(r.status, 1, "exhausting the attempts still reports failure");
-  // FLAT, and asserted by argument rather than by count: `:751-760` spends ten
+  // FLAT, and asserted by argument rather than by count: `:763-772` spends ten
   // lines defending this flatness against the "helpful parity fix" that would
   // spell it `sleep "$attempt"` like retire-only mode's, and until the stub
   // recorded its argument that defence was enforced by nothing. ["1","1"] is
@@ -2462,7 +2462,7 @@ test("a conflicting retirement write is still retried to exhaustion", () => {
     /cannot retire the in-flight lock on/,
     "the non-retriable message must not fire on a retriable conflict",
   );
-  // The EXHAUSTION half of the silence `:761-762` requires, which the success
+  // The EXHAUSTION half of the silence `:773-774` requires, which the success
   // test's assertion cannot reach: that comment forbids a chatty success *or
   // exhaustion*, and exhaustion is where the temptation is stronger, because
   // the loop has just given up and so has something to report. It reports it on
@@ -2487,7 +2487,7 @@ test("a retirement write that succeeds returns at the first attempt, silently an
   // The SILENT half of the messaging asymmetry, and the more surprising one --
   // a parity fix reading retire-only mode's three chatty success lines would
   // "correct" this loop by ADDING output, which is the direction the retire-only
-  // assertion below cannot catch. `:759-763` argues this silence is required,
+  // assertion below cannot catch. `:771-775` argues this silence is required,
   // not merely tolerated: the caller (`cleanup_on_exit`) prints the operator
   // guidance itself, and this loop only ever runs after a deploy has already
   // failed, so a success line here would bury the failure the cleanup exists to
@@ -2648,7 +2648,7 @@ test("retire-only mode's conflicting write is still retried to exhaustion", () =
   // arguments rather than the attempt count is what makes the two loops'
   // pacing a tested difference instead of a commented one: with a discarding
   // stub, spelling this `sleep 1` -- or `sleep 0` -- left the suite green.
-  // 3s total, the number `:755-757` names as the cost retire-only mode can
+  // 3s total, the number `:767-769` names as the cost retire-only mode can
   // afford because it has an operator at a terminal and no grace-period clock.
   assert.deepEqual(
     r.sleeps,
@@ -2764,25 +2764,25 @@ const LINE_CITATIONS = [
     claim: "retire-only mode's three operator-facing success lines",
   },
   {
-    cite: "751-760",
+    cite: "763-772",
     startsWith: /^\s*# Flat, where retire-only mode backs off linearly/,
     contains: /only remaining asymmetry[\s\S]*unfinished parity fix[\s\S]*no such deadline/,
     claim: "the ten lines defending the release loop's flat backoff",
   },
   {
-    cite: "755-757",
+    cite: "767-769",
     startsWith: /^\s*# `trap 'exit 143' TERM`, so the runner's grace period/,
     contains: /2s of total sleep beats 3s/,
     claim: "the 3s figure retire-only mode can afford and the release loop cannot",
   },
   {
-    cite: "759-763",
+    cite: "771-775",
     startsWith: /^\s*# Their MESSAGING differences are deliberate too/,
     contains: /not a parity gap[\s\S]*`return` vs `exit` is structurally required/,
     claim: "the messaging-asymmetry defence against a parity fix",
   },
   {
-    cite: "761-762",
+    cite: "773-774",
     startsWith: /^\s*# guidance that retire-only mode prints itself, so a chatty success or/,
     contains: /exhaustion here would bury/,
     claim: "the clause forbidding a chatty success OR exhaustion",
@@ -2928,4 +2928,108 @@ test("omitting stderrText on a failing write is exactly an empty capture, never 
       `${mode} mode: omitting the argument object entirely must reach the same defaults as passing {}, not throw past them`,
     );
   }
+});
+
+// BLO-49531. live_deployment_completed_digest decides whether the next approval
+// may retire an in-flight lock, and it gates on the server-plan hash BEFORE the
+// completion predicate. `kubectl rollout restart` writes restartedAt into the
+// pod template; while CANONICAL_DEPLOYMENT_JQ hashed it, one routine restart after
+// a release made that lock unsatisfiable forever and refused every later deploy.
+// The shipping function and both shipping jq blocks run here against a stubbed
+// kubectl, so a revert of the strip fails the first case below.
+const completedDigestSource = extractShellFunction("live_deployment_completed_digest");
+const ROLLOUT_MARKER_ANNOTATION = shellAssign("ROLLOUT_MARKER_ANNOTATION");
+const RESTART_KEY = "kubectl.kubernetes.io/restartedAt";
+const LOCK_DIGEST = digest(0xc1);
+const LOCK_MARKER = "e3".repeat(32);
+
+function lockedPlan({ image = `${IMAGE_REPOSITORY}@${LOCK_DIGEST}`, annotations = {}, generation = 652 } = {}) {
+  return {
+    apiVersion: "apps/v1",
+    kind: "Deployment",
+    metadata: { name: "paperclip-api", namespace: "paperclip", uid: DEPLOYMENT_UID, generation },
+    spec: {
+      replicas: 2,
+      template: {
+        metadata: {
+          labels: { "app.kubernetes.io/name": "paperclip" },
+          annotations: { [ROLLOUT_MARKER_ANNOTATION]: LOCK_MARKER, ...annotations },
+        },
+        spec: { containers: [{ name: "paperclip", image }] },
+      },
+    },
+    status: {
+      observedGeneration: generation,
+      updatedReplicas: 2,
+      readyReplicas: 2,
+      availableReplicas: 2,
+    },
+  };
+}
+
+// The lock stores the hash of the approved plan; `live` is what the cluster
+// serves when the next approval asks. Returns the function's exit status.
+function completedDigestStatus(approved, live, { lockGeneration = "652" } = {}) {
+  const dir = mkdtempSync(path.join(tmpdir(), "completed-digest-"));
+  const approvedPath = path.join(dir, "approved.json");
+  const livePath = path.join(dir, "live.json");
+  writeFileSync(approvedPath, JSON.stringify(approved));
+  writeFileSync(livePath, JSON.stringify(live));
+  const harness = [
+    "set -euo pipefail",
+    `IMAGE_REPOSITORY=${JSON.stringify(IMAGE_REPOSITORY)}`,
+    'DEPLOY_NAMESPACE=paperclip DEPLOYMENT=paperclip-api',
+    `ROLLOUT_MARKER_ANNOTATION=${JSON.stringify(ROLLOUT_MARKER_ANNOTATION)}`,
+    'stub_kubectl() { cat "$LIVE"; }',
+    "deploy_kubectl=(stub_kubectl)",
+    completedDigestSource,
+    // The approval script's own hashing form: command substitution, no newline.
+    'server_plan="$(printf \'%s\' "$(jq -cS "$CANONICAL_DEPLOYMENT_JQ" "$APPROVED")" | sha256sum | awk \'{print $1}\')"',
+    'live_deployment_completed_digest "$DIGEST" "$UID_" "$GEN" "$MARKER" "$server_plan"',
+  ].join("\n");
+  const result = spawnSync("bash", ["-c", harness], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      CANONICAL_DEPLOYMENT_JQ: extractJqBlock("CANONICAL_DEPLOYMENT_JQ"),
+      ROLLOUT_COMPLETE_JQ: extractJqBlock("ROLLOUT_COMPLETE_JQ"),
+      APPROVED: approvedPath,
+      LIVE: livePath,
+      DIGEST: LOCK_DIGEST,
+      UID_: DEPLOYMENT_UID,
+      GEN: lockGeneration,
+      MARKER: LOCK_MARKER,
+    },
+  });
+  assert.ok(result.status === 0 || result.status === 1, `harness failed: ${result.stderr}`);
+  return result.status;
+}
+
+test("a lock auto-retires after its rollout landed and was then rolled-out-restarted", () => {
+  const restarted = lockedPlan({ generation: 656, annotations: { [RESTART_KEY]: "2026-10-26T19:06:15Z" } });
+  assert.equal(completedDigestStatus(lockedPlan(), restarted, { lockGeneration: "651" }), 0);
+});
+
+test("CONTROL: the same landed rollout without a restart retires too", () => {
+  assert.equal(completedDigestStatus(lockedPlan(), lockedPlan({ generation: 656 }), { lockGeneration: "651" }), 0);
+});
+
+test("CONTROL: a live plan changed by any other template annotation still refuses", () => {
+  const changed = lockedPlan({ generation: 656, annotations: { "sidecar.istio.io/inject": "true" } });
+  assert.equal(completedDigestStatus(lockedPlan(), changed, { lockGeneration: "651" }), 1);
+});
+
+test("CONTROL: a restarted Deployment on a different image still refuses", () => {
+  const other = lockedPlan({
+    generation: 656,
+    image: `${IMAGE_REPOSITORY}@${digest(0xd2)}`,
+    annotations: { [RESTART_KEY]: "2026-10-26T19:06:15Z" },
+  });
+  assert.equal(completedDigestStatus(other, other, { lockGeneration: "651" }), 1);
+});
+
+test("CONTROL: a restart alone is not evidence the locked plan ever rolled out", () => {
+  // Same generation as the lock nonce: the strip must not stand in for `advanced`.
+  const restarted = lockedPlan({ generation: 652, annotations: { [RESTART_KEY]: "2026-10-26T19:06:15Z" } });
+  assert.equal(completedDigestStatus(lockedPlan(), restarted, { lockGeneration: "652" }), 1);
 });

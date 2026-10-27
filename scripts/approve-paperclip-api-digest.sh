@@ -561,6 +561,17 @@ PLAN_SHA256="$(printf '%s' "$planned_json" | sha256sum | awk '{print $1}')"
 # and annotations alongside the complete Deployment spec so a copied marker
 # cannot retire a different pod plan.
 #
+# The one exception is kubectl.kubernetes.io/restartedAt, which `kubectl rollout
+# restart` writes into the template. A restart re-creates the SAME pod plan, so
+# it changes nothing that was approved -- but keeping it meant one routine
+# restart after a release left that release's lock permanently unsatisfiable,
+# refusing every later deploy until an operator ran abandon_in_flight
+# (BLO-49531). Helm's three-way merge also carries the live-only annotation
+# through later upgrades, so docker.yml's post-rollout plan check would fail the
+# same way. Identity stays pinned by the image, the rollout marker and the
+# `advanced` generation nonce in ROLLOUT_COMPLETE_JQ, and stripping it cannot
+# admit anything: the admission policy keys on the digest ring, not this hash.
+#
 # Extracted verbatim by the admission regression between the marker comments.
 read -r -d '' CANONICAL_DEPLOYMENT_JQ <<'CANONICAL_JQ' || true
 # BEGIN CANONICAL_DEPLOYMENT_JQ
@@ -570,7 +581,8 @@ read -r -d '' CANONICAL_DEPLOYMENT_JQ <<'CANONICAL_JQ' || true
 }
 | .spec.template.metadata = {
     labels: (.spec.template.metadata.labels // {}),
-    annotations: (.spec.template.metadata.annotations // {})
+    annotations: (.spec.template.metadata.annotations // {}
+      | del(.["kubectl.kubernetes.io/restartedAt"]))
   }
 | del(.status)
 # END CANONICAL_DEPLOYMENT_JQ
