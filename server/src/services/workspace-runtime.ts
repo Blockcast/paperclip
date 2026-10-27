@@ -2802,6 +2802,18 @@ export async function ensureGitWorktreeBranchCoherent(input: {
   const worktreeTopLevel = await runGit(["rev-parse", "--show-toplevel"], input.worktreePath).catch(() => null);
   const resolvedWorktreePath = await resolvePathForWorktreeComparison(input.worktreePath);
   if (worktreeTopLevel && path.resolve(worktreeTopLevel) !== resolvedWorktreePath) {
+    // BLO-49622: a husk whose registration survives is re-linked and re-checked
+    // rather than failing every wake until someone unbinds the workspace.
+    if (await relinkHuskGitWorktree(input.repoRoot, input.worktreePath)) {
+      const relinked = await ensureGitWorktreeBranchCoherent(input);
+      return {
+        ...relinked,
+        warnings: [
+          `Execution workspace git worktree at "${input.worktreePath}" had lost its .git link; it was re-linked to its surviving registration.`,
+          ...relinked.warnings,
+        ],
+      };
+    }
     throw new WorkspaceRuntimeValidationFailure(
       `Execution workspace git worktree at "${input.worktreePath}" resolves to repository root "${worktreeTopLevel}" (its .git link is missing), so branch repair was refused and no git writes were made.`,
       {
@@ -4037,6 +4049,40 @@ async function hasLinkedGitWorktreeRegistration(repoRoot: string, worktreePath: 
     (error as { code?: unknown } | null)?.code === "ETIMEDOUT" ? null : false);
 }
 
+/**
+ * BLO-49622: re-link a husk worktree — a dir whose `.git` link file is gone
+ * while its registration under `<repoRoot>/.git/worktrees/<id>` survives. The
+ * registration's `gitdir` names this exact `.git`, so writing the link back is
+ * the whole repair: the index, HEAD and lock all live in the admin dir and the
+ * files on disk are untouched. Only acts when `.git` is absent (never replaces
+ * a file that exists) and keeps the link only if git then resolves the path as
+ * its own top level. Returns whether the worktree is now linked.
+ */
+export async function relinkHuskGitWorktree(repoRoot: string, worktreePath: string): Promise<boolean> {
+  const dotGit = path.join(worktreePath, ".git");
+  if (await fs.lstat(dotGit).then(() => true, () => false)) return false;
+  const adminRoot = path.join(repoRoot, ".git", "worktrees");
+  const wanted = await resolvePathForWorktreeComparison(dotGit);
+  for (const id of await fs.readdir(adminRoot).catch(() => [] as string[])) {
+    const adminDir = path.join(adminRoot, id);
+    const backRef = await fs.readFile(path.join(adminDir, "gitdir"), "utf8").catch(() => null);
+    if (!backRef || await resolvePathForWorktreeComparison(path.resolve(adminDir, backRef.trim())) !== wanted) continue;
+    if (!await fs.stat(path.join(adminDir, "HEAD")).then(() => true, () => false)) return false;
+    try {
+      await fs.writeFile(dotGit, `gitdir: ${adminDir}\n`, { flag: "wx" });
+    } catch {
+      return false;
+    }
+    const topLevel = await runGit(["rev-parse", "--show-toplevel"], worktreePath).catch(() => null);
+    if (topLevel && await resolvePathForWorktreeComparison(topLevel) === await resolvePathForWorktreeComparison(worktreePath)) {
+      return true;
+    }
+    await fs.rm(dotGit, { force: true });
+    return false;
+  }
+  return false;
+}
+
 export async function inspectManagedGitWorktreeBranch(input: {
   worktreePath: string;
   expectedBranchName: string | null | undefined;
@@ -4847,11 +4893,17 @@ export async function realizeExecutionWorkspace(input: {
   }
 
   async function validateReusableWorktree(reusablePath: string) {
-    const validation = await validateLinkedGitWorktree({
+    const validate = () => validateLinkedGitWorktree({
       repoRoot,
       worktreePath: reusablePath,
       expectedBranchName: branchName,
     }).catch(() => null);
+    let validation = await validate();
+    // BLO-49622: re-link a husk whose registration survives, then re-validate.
+    if (validation && !validation.valid && validation.reasonCode === "wrong_repository_root"
+      && await relinkHuskGitWorktree(repoRoot, reusablePath)) {
+      validation = await validate();
+    }
     if (validation && !validation.valid && validation.reasonCode === "branch_mismatch") {
       const coherence = await ensureGitWorktreeBranchCoherent({
         db: input.db ?? null,
