@@ -125,6 +125,7 @@ import {
   parsePrePushInput,
   scanPrePushUpdates,
   type GitAliasBypass,
+  type GitForcePush,
   type GitPublishVerb,
   type GitReader,
 } from "./github-git-egress-shim.js";
@@ -366,6 +367,60 @@ function withSignoff(
   return [...argv.slice(0, at), "--signoff", ...argv.slice(at)];
 }
 
+/**
+ * The refusal for a blind force push (PEN-4869).
+ *
+ * Worded per shape because the remedies genuinely differ — `--mirror` has no
+ * lease form at all — and every wording carries the exact commands, including
+ * how to obtain the expected sha. An author who has just been refused mid-push
+ * should not have to go and read the lease syntax; that is the gap prose at
+ * `skills/paperclip/SKILL.md` already failed to close.
+ *
+ * Read `classifyForcePush` in github-git-egress-shim.ts before changing any
+ * of this. Two things there
+ * are easy to misread from here: this does NOT prevent two runs pushing to one
+ * branch (it prevents the destructive recovery, which was the unbounded half of
+ * PEN-4764), and it is an accident guard rather than enforcement, because it
+ * sits on the same agent-writable surface as the rest of this door — PEN-3183
+ * is the row that moves enforcement off the agent's machine.
+ */
+function forcePushRefusal(forcePush: GitForcePush): GitEgressRuntimeError {
+  const { reason, token } = forcePush;
+
+  const lease = [
+    "    git fetch origin",
+    "    git rev-parse origin/<branch>          # <expected-sha>",
+    "    git push --force-with-lease=refs/heads/<branch>:<expected-sha> origin <branch>",
+  ].join("\n");
+
+  // Not "the remote may have moved" — on the measured incident it HAD, and the
+  // commit the force would have destroyed was the better fix. The author needs
+  // to know the rejection is information, not an obstacle.
+  const contention =
+    "If that is refused, the remote moved under you: another run pushed to this branch. That is contention, not something to force past — `git fetch origin && git log origin/<branch>` names the commit that would have been destroyed. Compare it with yours before deciding which survives.";
+
+  if (reason === "mirror") {
+    return new GitEgressRuntimeError(
+      `paperclip-github-egress: refusing to publish — \`${token}\` mirrors the local refs onto the remote, which force-updates EVERY ref and deletes any the local repository does not have. There is no lease form of it, so there is nothing to narrow: push the refs you mean, one refspec at a time, with an explicit lease.\n\n${lease}\n\nA genuine whole-repository mirror — seeding a new remote from an old one, say — is an attended operator step, not agent work: run it with /usr/bin/git directly, the way an uninitialised submodule is repaired.\n\n${contention}`,
+    );
+  }
+
+  if (reason === "bare-lease") {
+    return new GitEgressRuntimeError(
+      `paperclip-github-egress: refusing to publish — \`${token}\` is a lease with no expected sha, which does not protect what it looks like it protects. The expectation is taken from the remote-tracking ref, and any \`git fetch\` in this run advances that ref to whatever another run just pushed; the lease then passes and overwrites the commit it was meant to guard. Name the sha you actually compared against.\n\n${lease}\n\n${contention}`,
+    );
+  }
+
+  const what =
+    reason === "plus-refspec"
+      ? `the refspec \`${token}\` is force-prefixed — a leading \`+\` force-updates the ref exactly as \`--force\` does, with no \`--force\` token in the command`
+      : `\`${token}\` is a blind force push`;
+
+  return new GitEgressRuntimeError(
+    `paperclip-github-egress: refusing to publish — ${what}, which overwrites the remote branch whatever is on it and can permanently destroy commits that are not in this checkout. PEN-4764 measured two runs of one seat racing a push to one branch; the force was the obvious unsticking move and would have destroyed the better of the two fixes, unrecoverably. Re-run with an explicit lease, which refuses instead of overwriting when the remote has moved:\n\n${lease}\n\n${contention}`,
+  );
+}
+
 export function buildGitArgv(
   argv: readonly string[],
   options: {
@@ -460,6 +515,19 @@ export function buildGitArgv(
   // Refusal is the only enforcement available here.
   if (classification.aliasBypass) {
     throw aliasBypassRefusal(classification.aliasBypass);
+  }
+
+  // After the bypass refusals, which are a different and more urgent family:
+  // those say "you are trying to evade the scan", this says "this push
+  // destroys work". Before the hook-presence check below, because this is a
+  // caller error and that one is a deployment fault.
+  //
+  // Set only on a push, by construction — `classifyGitInvocation` does not even
+  // ask otherwise. That is what keeps a wrong answer here to refusing a FORCE
+  // push rather than any push, which is the bound PEN-4869 put on this change
+  // after PEN-4518 took the whole fleet's egress down from this same door.
+  if (classification.forcePush) {
+    throw forcePushRefusal(classification.forcePush);
   }
 
   // Last, so the specific caller-error refusals above win the message. Placed

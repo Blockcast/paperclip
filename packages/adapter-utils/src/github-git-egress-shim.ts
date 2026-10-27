@@ -520,6 +520,229 @@ export interface GitPublishVerb {
   chain?: readonly string[];
 }
 
+/**
+ * Push options that consume a SEPARATE following token as their value.
+ *
+ * Exists for exactly one reason: so a value that happens to begin with `+` is
+ * not read as a force refspec. `git push -o +weird origin main` carries no
+ * force, and refusing it would be the "wrong answer refuses any push" failure
+ * this guard must not have. Measured against git 2.47.3 — `+weird` was taken as
+ * the push-option value and reached the remote as one.
+ *
+ * Matching is by PREFIX, because git accepts any unambiguous abbreviation of a
+ * long option and an abbreviation takes its value the same way (measured:
+ * `--force-with-l=<ref>:<sha>` parses as `--force-with-lease=`). Over-consuming
+ * on an ambiguous prefix such as `--r` costs nothing: git rejects the
+ * invocation outright, so there is no push to miss.
+ *
+ * The `--opt=value` spelling is self-contained and is handled separately, as it
+ * is for the global options.
+ */
+const PUSH_VALUE_TAKING_OPTIONS: readonly string[] = [
+  "--repo",
+  "--receive-pack",
+  "--exec",
+  "--recurse-submodules",
+  "--push-option",
+];
+
+/** The one short push option that takes a value, `-o <server-specific>`. */
+const SHORT_PUSH_OPTION_WITH_VALUE = "o";
+
+/** The short push option that forces, `-f`. */
+const SHORT_FORCE_OPTION = "f";
+
+/**
+ * True when `token` could be the long option `flag`, including abbreviations.
+ *
+ * The same "could this token be that flag?" test {@link isNoVerifyFlag} makes,
+ * and for the same reason: git's `parse-options` accepts any unambiguous long
+ * abbreviation, so enumerating spellings is the parser-disagrees-with-git
+ * failure this module exists to avoid. Measured against git 2.47.3, `--mir`,
+ * `--mi` and `--m` all reach `--mirror`, and `--force-with-l` reaches
+ * `--force-with-lease`.
+ *
+ * Matching prefixes git currently rejects as AMBIGUOUS (`--forc` could be
+ * `--force-with-lease` or `--force-if-includes`) is deliberate and costs
+ * nothing: git refuses those invocations itself, so no command git would run is
+ * being turned away, and a future git that disambiguated one would find this
+ * guard already covering it.
+ *
+ * The length floor keeps the bare `--` end-of-options separator out.
+ */
+function couldBeLongOption(token: string, flag: string): boolean {
+  return token.length > 2 && flag.startsWith(token);
+}
+
+/** What shape of force a push carries. See {@link GitForcePush}. */
+export type GitForcePushReason = "force-flag" | "plus-refspec" | "mirror" | "bare-lease";
+
+/** A push that would overwrite remote history without an explicit lease. */
+export interface GitForcePush {
+  /** Which shape of force was found; the refusal words each differently. */
+  reason: GitForcePushReason;
+  /** The token carrying it, as spelled, so the refusal can quote it. */
+  token: string;
+}
+
+/**
+ * Classify a `push`'s own arguments as a blind force, a leased force, or
+ * neither (PEN-4869).
+ *
+ * WHAT THIS IS FOR, and what it is NOT. PEN-4764 measured two heartbeat runs of
+ * one seat, on two different issues, racing a push to one branch. The collision
+ * itself was detected for free, server-side at GitHub, by git's own
+ * non-fast-forward rejection — and it was bounded and self-healing. The
+ * unbounded harm was the obvious recovery: a `git push --force` would have
+ * destroyed `92ded9ee`, which on comparison was the better of the two fixes.
+ *
+ * So this predicate does **not** prevent two runs pushing to one branch, and
+ * must not be mistaken for the branch-claim mechanism PEN-4868 considered and
+ * declined. It prevents the destructive recovery, and nothing else.
+ *
+ * It is also an ACCIDENT GUARD, NOT ENFORCEMENT. It sits on the same
+ * agent-writable surface as the rest of this door — the module header says the
+ * same of the credential scanner — so anything that means to force past it can.
+ * PEN-3183 tracks moving enforcement off the agent's own machine; that is where
+ * a real control lives, and no integrity check bolted on here would substitute
+ * for it (the header explains why such a check asserts a boundary that does not
+ * exist).
+ *
+ * The predicate is TOTAL and OFFLINE on purpose. No network, no credential, no
+ * run id, no environment read, no config read — nothing that can fail. That
+ * property is what made this seam the right home for the check (PEN-4868), and
+ * it bounds the rollout risk: this file is on every agent `git` invocation
+ * fleet-wide, and PEN-4518 was a full push outage originating at this door. A
+ * wrong answer here refuses a FORCE push specifically; it cannot refuse an
+ * ordinary one, because nothing but a force token reaches a non-null return.
+ *
+ * Shapes handled, each measured against git 2.47.3 on a real non-fast-forward
+ * push:
+ *
+ *   --force, -f, and bundled clusters   `-fu` and `-uf` both force.
+ *   +<refspec>                          `git push origin +HEAD:refs/heads/x`
+ *                                       reported `forced update` carrying no
+ *                                       `--force` token at all. Still forces
+ *                                       after a `--` separator, which is why
+ *                                       `--` switches this scan to positional
+ *                                       only rather than ending it.
+ *   --mirror                            forces every ref; no lease form exists.
+ *   --force-with-lease, bare            reported `forced update`. NOT safe: an
+ *                                       intervening `git fetch` advances the
+ *                                       remote-tracking ref the lease is taken
+ *                                       against, and the lease then passes over
+ *                                       the very commit it was meant to
+ *                                       protect — the PEN-4764 shape exactly.
+ *   --force-with-lease=<ref>            same hazard; the expectation still
+ *                                       comes from the remote-tracking ref.
+ *
+ * Accepted: `--force-with-lease=<ref>:<expect>` with both halves non-empty,
+ * the form `skills/paperclip/SKILL.md` already mandates.
+ *
+ * `--force-if-includes` is NOT accepted as an alternative, and is not itself a
+ * force: measured, a non-fast-forward push carrying only `--force-if-includes`
+ * was `rejected`. It is a safety add-on to `--force-with-lease` and a no-op
+ * without one, so admitting it would admit a flag that can silently mean
+ * nothing. It passes through untouched alongside an explicit lease, which is
+ * the combination that loses no legitimate use.
+ *
+ * NOT COVERED, stated rather than implied: a `+` carried by CONFIG instead of
+ * argv. Measured — with `remote.origin.push = +HEAD:refs/heads/ff`, a bare `git
+ * push origin` reported `forced update`. A pure argv predicate cannot see that,
+ * and reading config here would cost the totality the paragraph above buys. The
+ * config is agent-writable anyway, the same caveat aliases carry, so covering
+ * it would not make this enforcement; PEN-3183 is where that gap closes.
+ *
+ * Ref DELETIONS are deliberately out of scope: `git push origin :branch`,
+ * `--delete` and `-d` remove a ref but destroy no commits, and deleting a
+ * merged branch is routine. Note `:branch` has no leading `+`, so it does not
+ * trip the refspec arm by accident.
+ *
+ * Last-wins negation (`--force --no-force`) is NOT modelled: such an
+ * invocation refuses. Git would run it as a non-force, so this is a widening —
+ * a pathological one with no honest caller, kept because modelling negation
+ * would add state to a predicate whose value is that it has none.
+ */
+export function classifyForcePush(args: readonly string[]): GitForcePush | null {
+  let positionalOnly = false;
+
+  for (let index = 0; index < args.length; index += 1) {
+    const token = args[index]!;
+
+    // Everything after `--` is a refspec, including a token spelled like a
+    // flag: measured, `git push origin -- -f` failed with `src refspec -f does
+    // not match any`, i.e. git read it as a refspec. A `+` one still forces,
+    // so the scan narrows rather than stopping.
+    if (positionalOnly) {
+      if (token.startsWith("+")) return { reason: "plus-refspec", token };
+      continue;
+    }
+    if (token === "--") {
+      positionalOnly = true;
+      continue;
+    }
+
+    if (token.startsWith("--")) {
+      const separator = token.indexOf("=");
+      const name = separator < 0 ? token : token.slice(0, separator);
+
+      // Checked before the lease arms because `--force` and every abbreviation
+      // of it is also a prefix of `--force-with-lease`. Taking the force arm
+      // first leaves the lease arms seeing only genuine lease spellings.
+      if (couldBeLongOption(name, "--force")) return { reason: "force-flag", token };
+      if (couldBeLongOption(name, "--mirror")) return { reason: "mirror", token };
+
+      if (couldBeLongOption(name, "--force-with-lease")) {
+        // Bare, or an abbreviation of it: the expectation comes from the
+        // remote-tracking ref, which a `fetch` moves.
+        if (separator < 0) return { reason: "bare-lease", token };
+        const value = token.slice(separator + 1);
+        const colon = value.indexOf(":");
+        // `<ref>:<expect>` with both halves present is the accepted form. A
+        // bare `<ref>` is the remote-tracking-ref hazard again; an empty
+        // `<expect>` asserts the ref does not exist, which is a real git
+        // meaning but not one this guard needs to admit — the remedy in the
+        // refusal produces the full form either way.
+        if (colon <= 0 || colon === value.length - 1) return { reason: "bare-lease", token };
+        continue;
+      }
+
+      // A value-taking option in its separate-token spelling: skip its value so
+      // a `+`-leading one is not read as a refspec.
+      if (
+        separator < 0 &&
+        PUSH_VALUE_TAKING_OPTIONS.some((option) => couldBeLongOption(token, option))
+      ) {
+        index += 1;
+      }
+      continue;
+    }
+
+    if (token.startsWith("-") && token.length > 1) {
+      // A short cluster. Measured: `-fu`, `-uf`, `-fn` and `-nf` all force, so
+      // the whole cluster is scanned rather than only its first letter.
+      for (let at = 1; at < token.length; at += 1) {
+        const letter = token[at]!;
+        // `-o` takes a value, attached or separate, and that value is not a
+        // cluster. Measured: `-ofoo` sent `foo` as the push option — reading
+        // its `f` as `--force` would refuse a push carrying none.
+        if (letter === SHORT_PUSH_OPTION_WITH_VALUE) {
+          if (at === token.length - 1) index += 1;
+          break;
+        }
+        if (letter === SHORT_FORCE_OPTION) return { reason: "force-flag", token };
+      }
+      continue;
+    }
+
+    // A positional: the repository, then refspecs. A leading `+` on any of them
+    // is a force, and no remote is named `+something`.
+    if (token.startsWith("+")) return { reason: "plus-refspec", token };
+  }
+
+  return null;
+}
+
 export interface GitInvocationClassification {
   /** The resolved subcommand, or null when argv carries only global options. */
   subcommand: string | null;
@@ -562,6 +785,20 @@ export interface GitInvocationClassification {
    * them, which is the bug it exists to close.
    */
   publishVerb: GitPublishVerb | null;
+  /**
+   * A blind force push, when this invocation is one. Null on anything that is
+   * not a push, and on a push carrying an explicit
+   * `--force-with-lease=<ref>:<expect>`.
+   *
+   * Computed from the arguments git will hand `push`, which on an alias-carried
+   * push means the expansion's own arguments ahead of the caller's — `git -c
+   * alias.p='push --force' p origin main` runs `git push --force origin main`,
+   * and reading only the caller's half would miss the `--force` entirely.
+   *
+   * See {@link classifyForcePush} for the scope, the two honest limits, and
+   * what is deliberately not covered.
+   */
+  forcePush: GitForcePush | null;
 }
 
 export interface GitShellAlias {
@@ -622,6 +859,7 @@ export function classifyGitInvocation(
       aliasBypass: null,
       shellAlias: null,
       publishVerb: null,
+      forcePush: null,
     };
   }
 
@@ -732,6 +970,11 @@ export function classifyGitInvocation(
 
       if (expanded === "push") {
         isPush = true;
+        // Accumulated here as well as below, so an alias-carried push reports
+        // the arguments git will actually hand `push`. Without this the force
+        // scan would see only the caller's half and `alias.p='push --force'`
+        // would read as an ordinary push.
+        verbArgs = [...expandedRest, ...verbArgs];
         break;
       }
       verbArgs = [...expandedRest, ...verbArgs];
@@ -808,6 +1051,10 @@ export function classifyGitInvocation(
         : null,
     shellAlias,
     publishVerb,
+    // Only a push can force, so this is not even asked on anything else. That
+    // is the rollout property PEN-4869 required: a wrong answer in
+    // `classifyForcePush` refuses a force push, never an ordinary one.
+    forcePush: isPush ? classifyForcePush(verbArgs) : null,
   };
 }
 

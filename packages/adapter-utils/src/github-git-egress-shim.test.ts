@@ -7,6 +7,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   addedLinesFromPatch,
+  classifyForcePush,
   classifyGitInvocation,
   commitsForRefUpdate,
   formatRefusal,
@@ -1195,4 +1196,207 @@ describe("merge commits (BLO-46233)", () => {
       });
     }, 60_000);
   }
+});
+
+describe("classifyForcePush (PEN-4869)", () => {
+  // Every shape below was measured against git 2.47.3 on a real
+  // non-fast-forward push before it was encoded here; the expectation is what
+  // git did, not what the flag is assumed to mean.
+
+  for (const [label, args] of [
+    ["--force", ["--force", "origin", "main"]],
+    ["-f", ["-f", "origin", "main"]],
+    ["-fu, a bundled cluster", ["-fu", "origin", "main"]],
+    ["-uf, force last in the cluster", ["-uf", "origin", "main"]],
+    ["-nf, bundled behind --dry-run", ["-nf", "origin", "main"]],
+  ] as const) {
+    it(`reports ${label} as a force flag`, () => {
+      expect(classifyForcePush([...args])?.reason).toBe("force-flag");
+    });
+  }
+
+  // `--forc` and shorter are AMBIGUOUS to git (`could be --force-with-lease or
+  // --force-if-includes`) and rejected outright, so refusing them turns away no
+  // command git would run — the same direction `isNoVerifyFlag` takes.
+  for (const token of ["--f", "--fo", "--for", "--forc"]) {
+    it(`reports the ambiguous abbreviation ${token} as a force flag`, () => {
+      expect(classifyForcePush([token, "origin", "main"])?.reason).toBe("force-flag");
+    });
+  }
+
+  it("reports a +-prefixed refspec, which carries no --force token at all", () => {
+    // Measured: `git push origin +HEAD:refs/heads/ff` reported `forced update`.
+    // This is the shape a `--force`-only matcher misses.
+    expect(classifyForcePush(["origin", "+HEAD:refs/heads/ff"])).toEqual({
+      reason: "plus-refspec",
+      token: "+HEAD:refs/heads/ff",
+    });
+    expect(classifyForcePush(["origin", "+main"])?.reason).toBe("plus-refspec");
+  });
+
+  it("reports a +-prefixed refspec after the -- separator", () => {
+    // Measured twice over: after `--`, `+HEAD:refs/heads/ff` still reported
+    // `forced update`, and `-f` was read as a refspec (`src refspec -f does not
+    // match any`). So `--` narrows the scan to positionals rather than ending
+    // it, and a flag-spelled token after it is not a flag.
+    expect(classifyForcePush(["origin", "--", "+main"])?.reason).toBe("plus-refspec");
+    expect(classifyForcePush(["origin", "--", "-f"])).toBeNull();
+  });
+
+  it("reports --mirror and its abbreviations", () => {
+    // Measured: `--mirror`, `--mir`, `--mi` and `--m` all reach --mirror.
+    for (const token of ["--mirror", "--mirr", "--mir", "--mi", "--m"]) {
+      expect(classifyForcePush([token, "origin"])?.reason).toBe("mirror");
+    }
+  });
+
+  it("reports a bare --force-with-lease, which is NOT safe", () => {
+    // Measured: a bare lease on a non-fast-forward push reported `forced
+    // update`. The expectation is taken from the remote-tracking ref, which any
+    // intervening `git fetch` advances — the PEN-4764 shape exactly.
+    expect(classifyForcePush(["--force-with-lease", "origin", "main"])?.reason).toBe("bare-lease");
+    // Abbreviated, which git accepts (measured).
+    expect(classifyForcePush(["--force-with-l", "origin", "main"])?.reason).toBe("bare-lease");
+  });
+
+  it("reports --force-with-lease=<ref> with no expected sha", () => {
+    // Same hazard as bare: without `:<expect>` the expectation still comes from
+    // the remote-tracking ref.
+    expect(classifyForcePush(["--force-with-lease=refs/heads/main", "origin"])?.reason).toBe(
+      "bare-lease",
+    );
+    // A half-empty value is not the accepted form either.
+    expect(classifyForcePush(["--force-with-lease=refs/heads/main:", "origin"])?.reason).toBe(
+      "bare-lease",
+    );
+    expect(classifyForcePush(["--force-with-lease=:abc123", "origin"])?.reason).toBe("bare-lease");
+  });
+
+  it("admits an explicit --force-with-lease=<ref>:<sha>", () => {
+    expect(
+      classifyForcePush([
+        "--force-with-lease=refs/heads/main:0123456789abcdef0123456789abcdef01234567",
+        "origin",
+        "main",
+      ]),
+    ).toBeNull();
+    // Abbreviated, which git also accepts (measured:
+    // `--force-with-l=refs/heads/main:deadbeef` parsed and failed only on the
+    // object name).
+    expect(
+      classifyForcePush(["--force-with-l=refs/heads/main:abc1234", "origin", "main"]),
+    ).toBeNull();
+  });
+
+  it("does not treat --force-if-includes as a force, nor as a lease substitute", () => {
+    // Measured: a non-fast-forward push carrying ONLY --force-if-includes was
+    // `rejected`. It is a safety add-on to --force-with-lease and a no-op
+    // without one, so it neither forces nor licenses one.
+    expect(classifyForcePush(["--force-if-includes", "origin", "main"])).toBeNull();
+    expect(classifyForcePush(["--force-i", "origin", "main"])).toBeNull();
+    // Alongside a bare lease it is still refused: the lease is the unsafe part.
+    expect(
+      classifyForcePush(["--force-with-lease", "--force-if-includes", "origin", "main"])?.reason,
+    ).toBe("bare-lease");
+    // Alongside an explicit lease it passes through untouched.
+    expect(
+      classifyForcePush([
+        "--force-with-lease=refs/heads/main:abc1234",
+        "--force-if-includes",
+        "origin",
+        "main",
+      ]),
+    ).toBeNull();
+  });
+
+  it("leaves an ordinary push alone", () => {
+    for (const args of [
+      ["origin", "main"],
+      ["origin", "HEAD:refs/heads/topic"],
+      ["--set-upstream", "origin", "topic"],
+      ["-u", "origin", "topic"],
+      ["--tags", "origin"],
+      ["--dry-run", "origin", "main"],
+      ["--no-force", "origin", "main"],
+      ["--atomic", "--follow-tags", "origin", "main"],
+      [],
+    ]) {
+      expect(classifyForcePush(args)).toBeNull();
+    }
+  });
+
+  it("does not read a +-leading OPTION VALUE as a force refspec", () => {
+    // The rollout hazard this guard must not have: refusing a push that carries
+    // no force. Measured — `git push -o +weird origin main` sent `+weird` as
+    // the push option, and `-ofoo` sent `foo`, so neither the separate value
+    // nor the `f` inside the attached one is a force.
+    expect(classifyForcePush(["-o", "+weird", "origin", "main"])).toBeNull();
+    expect(classifyForcePush(["--push-option", "+weird", "origin", "main"])).toBeNull();
+    expect(classifyForcePush(["--push-option=+weird", "origin", "main"])).toBeNull();
+    expect(classifyForcePush(["-ofoo", "origin", "main"])).toBeNull();
+    expect(classifyForcePush(["--repo", "+odd", "origin", "main"])).toBeNull();
+    expect(classifyForcePush(["--receive-pack", "+odd", "origin", "main"])).toBeNull();
+  });
+
+  it("still sees a force that FOLLOWS a consumed option value", () => {
+    expect(classifyForcePush(["-o", "x", "--force", "origin", "main"])?.reason).toBe("force-flag");
+    expect(classifyForcePush(["-o", "x", "origin", "+main"])?.reason).toBe("plus-refspec");
+    // `-of` is `--push-option=f`, so the `f` is a value and not a force — but a
+    // real `-f` after it still is.
+    expect(classifyForcePush(["-of", "-f", "origin", "main"])?.reason).toBe("force-flag");
+  });
+
+  it("deletions are out of scope: they remove a ref but destroy no commits", () => {
+    expect(classifyForcePush(["origin", ":refs/heads/merged"])).toBeNull();
+    expect(classifyForcePush(["--delete", "origin", "merged"])).toBeNull();
+    expect(classifyForcePush(["-d", "origin", "merged"])).toBeNull();
+  });
+});
+
+describe("classifyGitInvocation force reporting (PEN-4869)", () => {
+  it("reports a force on a direct push", () => {
+    expect(classifyGitInvocation(["push", "--force", "origin", "main"]).forcePush?.reason).toBe(
+      "force-flag",
+    );
+  });
+
+  it("reads the arguments git will hand an ALIAS-carried push", () => {
+    // `git -c alias.p='push --force' p origin main` runs
+    // `git push --force origin main`: the expansion's own arguments come first,
+    // so a scan of only the caller's half sees no force at all.
+    const viaConfig = classifyGitInvocation(["p", "origin", "main"], (name) =>
+      name === "p" ? "push --force" : null,
+    );
+    expect(viaConfig.isPush).toBe(true);
+    expect(viaConfig.forcePush?.reason).toBe("force-flag");
+
+    // The command line defining its own alias, which no `git config --get`
+    // beside it can see.
+    expect(
+      classifyGitInvocation(["-c", "alias.p=push --force", "p", "origin", "main"]).forcePush
+        ?.reason,
+    ).toBe("force-flag");
+
+    // A `+` refspec supplied by the CALLER through a plain alias.
+    expect(
+      classifyGitInvocation(["p", "origin", "+main"], (name) => (name === "p" ? "push" : null))
+        .forcePush?.reason,
+    ).toBe("plus-refspec");
+
+    // Quoted the way git tokenises an alias, the case that defeated a
+    // whitespace split for `--no-verify`.
+    expect(
+      classifyGitInvocation(["q", "origin", "main"], (name) =>
+        name === "q" ? 'push "--force"' : null,
+      ).forcePush?.reason,
+    ).toBe("force-flag");
+  });
+
+  it("reports nothing on anything that is not a push", () => {
+    // The bound on the rollout risk: a wrong answer in the predicate can only
+    // refuse a force push, because it is not consulted anywhere else.
+    expect(classifyGitInvocation(["status", "--force"]).forcePush).toBeNull();
+    expect(classifyGitInvocation(["log", "origin", "+main"]).forcePush).toBeNull();
+    expect(classifyGitInvocation(["-c", "x=y"]).forcePush).toBeNull();
+  });
 });
