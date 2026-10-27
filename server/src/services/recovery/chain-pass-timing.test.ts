@@ -233,10 +233,17 @@ describe("createRecoveryChainTimer", () => {
   it("skips passes reached after shouldSkip turns true (BLO-49596)", async () => {
     let stopped = false;
     const ran: string[] = [];
-    const timer = createRecoveryChainTimer({ log: () => undefined, chainId: "chain-1", shouldSkip: () => stopped });
+    const logged: Array<Record<string, unknown>> = [];
+    const timer = createRecoveryChainTimer({
+      log: (fields) => logged.push(fields as Record<string, unknown>),
+      chainId: "chain-1",
+      shouldSkip: () => stopped,
+    });
     await timer
       .time(1, "one", async () => { ran.push("one"); stopped = true; })
       .then(timer.pass(2, "two", async () => { ran.push("two"); }));
     expect(ran).toEqual(["one"]);
+    timer.settle(0);
+    expect(logged[logged.length - 1]).toMatchObject({ passesRun: 1, passesSkipped: 1 });
   });
 });

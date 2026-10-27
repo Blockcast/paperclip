@@ -117,6 +117,7 @@ export function createRecoveryChainTimer(opts: RecoveryChainTimerOptions): Recov
   const startedAtMs = now();
   const startedAtIso = new Date(startedAtMs).toISOString();
   const passes: RecoveryChainPassRecord[] = [];
+  let passesSkipped = 0;
 
   // `Math.max(0, ...)` on every elapsed value: a backwards clock must not put a
   // negative duration on a field that only ever means "how long did this take".
@@ -163,7 +164,13 @@ export function createRecoveryChainTimer(opts: RecoveryChainTimerOptions): Recov
     startedAtMs,
     time,
     pass<T>(passIndex: number, pass: string, run: () => Promise<T>): () => Promise<T> {
-      return () => (opts.shouldSkip?.() ? Promise.resolve(undefined as T) : time(passIndex, pass, run));
+      return () => {
+        if (opts.shouldSkip?.()) {
+          passesSkipped += 1;
+          return Promise.resolve(undefined as T);
+        }
+        return time(passIndex, pass, run);
+      };
     },
     settle(chainDurationMs: number): void {
       try {
@@ -184,6 +191,9 @@ export function createRecoveryChainTimer(opts: RecoveryChainTimerOptions): Recov
             unaccountedMs: boundedChainDurationMs - passDurationMsTotal,
             passesRun: passes.length,
             passesFailed: passes.filter((p) => p.outcome === "failed").length,
+            // BLO-49596: passes not run because shutdown began. Non-zero marks a
+            // shutdown-cut chain, which `passesRun` alone cannot tell from a throw.
+            passesSkipped,
             passes,
           },
           RECOVERY_CHAIN_TIMING_MESSAGE,
