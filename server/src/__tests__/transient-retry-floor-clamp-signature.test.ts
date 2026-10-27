@@ -183,11 +183,25 @@ describe("recordTransientRetryFloorDisposition", () => {
 
     const { body, contentType } = await renderMetrics();
     expect(contentType).toContain("text/plain");
-    expect(body).toMatch(
-      new RegExp(
-        `${TRANSIENT_RETRY_FLOOR_METRIC}[^\\n]*alignment="off_grid"[^\\n]*disposition="dispersed"`,
-      ),
-    );
+
+    // Matched per-label rather than as one ordered regex. prom-client renders
+    // labels in `labelNames` declaration order (disposition, then alignment),
+    // so an ordered pattern silently encodes that choice: reordering labelNames
+    // -- a no-op for every consumer, including the alert -- would fail this test
+    // for a reason that has nothing to do with what it is checking.
+    const line = body
+      .split("\n")
+      .find(
+        (candidate) =>
+          candidate.startsWith(`${TRANSIENT_RETRY_FLOOR_METRIC}{`)
+          && candidate.includes('disposition="dispersed"')
+          && candidate.includes('alignment="off_grid"'),
+      );
+    expect(line, `no ${TRANSIENT_RETRY_FLOOR_METRIC} series for dispersed/off_grid in /metrics`).toBeDefined();
+    // The record call above is the first increment of this series in-process,
+    // but another test file in the same worker may have incremented it too, so
+    // assert it is non-zero rather than exactly 1.
+    expect(Number(line?.slice(line.lastIndexOf("}") + 1).trim())).toBeGreaterThan(0);
   });
 
   it("coerces an out-of-allow-list label rather than minting a series", () => {
