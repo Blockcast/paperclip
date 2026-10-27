@@ -50,6 +50,18 @@ const DCO = { requiresSignoff: () => true };
 const GIT = spawnSync("git", ["--version"], { encoding: "utf8" }).status === 0 ? "git" : null;
 
 /**
+ * Is the REAL git binary present, as opposed to whatever `git` is on PATH?
+ *
+ * Separate from {@link GIT} because on a deployed agent image `git` on PATH is
+ * this very wrapper, and the force-push tests must drive the binary the wrapper
+ * execs — spawning the wrapper with an argv this module already built makes the
+ * second pass refuse its own injected `core.hooksPath`.
+ */
+const REAL_GIT =
+  existsSync(DEFAULT_GIT_BINARY) &&
+  spawnSync(DEFAULT_GIT_BINARY, ["--version"], { encoding: "utf8" }).status === 0;
+
+/**
  * The spawned-entrypoint tests need git at DEFAULT_GIT_BINARY specifically, not
  * merely on PATH: the hook's own reader hardcodes that path, because the
  * `PAPERCLIP_GIT_EGRESS_GIT` override was removed as an escape hatch (see
@@ -226,9 +238,13 @@ describe("buildGitArgv", () => {
   });
 
   it("still guards a push reached through an alias", () => {
+    // The expansion carried `--force` until PEN-4869, incidentally — this
+    // asserts the hooks path is injected for an alias-reached push, not
+    // anything about the flag. `--force` is now refused in its own right, so
+    // the expansion uses a flag that still reaches the injection.
     const argv = buildGitArgv(["yolo"], {
       ...PRESENT,
-      resolveAlias: (name) => (name === "yolo" ? "push --force" : null),
+      resolveAlias: (name) => (name === "yolo" ? "push --tags" : null),
     });
     expect(argv).toEqual(["-c", `core.hooksPath=${HOOKS}`, "yolo"]);
   });
@@ -1322,5 +1338,264 @@ describe("PEN-3907: a force-push after a rebase reports only the author's own co
     // Builds a two-remote-ref repository and rebases it, so it runs well over a
     // dozen git invocations. On an agent seat `git` on PATH is a node wrapper,
     // which puts this comfortably past the 5s default.
+  }, 60_000);
+});
+
+describe("buildGitArgv force-push refusal (PEN-4869)", () => {
+  // Driven through `buildGitArgv`, the wrapper's own entry point, not through
+  // `classifyForcePush`. PEN-3156 records a bypass where the classifier
+  // correctly REPORTED a finding and the wrapper threw it away: the unit test
+  // on the classifier passed throughout, and only driving the wrapper end to
+  // end showed the refusal being discarded. The classifier has its own tests in
+  // github-git-egress-shim.test.ts; these assert the wrapper acts on them.
+
+  for (const [label, argv] of [
+    ["--force", ["push", "--force", "origin", "main"]],
+    ["-f", ["push", "-f", "origin", "main"]],
+    ["a bundled -fu", ["push", "-fu", "origin", "main"]],
+    ["an ambiguous --forc", ["push", "--forc", "origin", "main"]],
+  ] as const) {
+    it(`refuses ${label} and names the lease remedy`, () => {
+      expect(() => buildGitArgv([...argv], { ...PRESENT })).toThrow(/blind force push/);
+      // The remedy has to be complete enough to run, including how to obtain
+      // the sha — prose that only says "use a lease" is what SKILL.md already
+      // said, and it is the control that failed.
+      expect(() => buildGitArgv([...argv], { ...PRESENT })).toThrow(
+        /git rev-parse origin\/<branch>/,
+      );
+      expect(() => buildGitArgv([...argv], { ...PRESENT })).toThrow(
+        /--force-with-lease=refs\/heads\/<branch>:<expected-sha>/,
+      );
+    });
+  }
+
+  it("refuses a +-prefixed refspec, which carries no --force token", () => {
+    expect(() => buildGitArgv(["push", "origin", "+main"], { ...PRESENT })).toThrow(
+      /refspec `\+main` is force-prefixed/,
+    );
+    expect(() => buildGitArgv(["push", "origin", "--", "+main"], { ...PRESENT })).toThrow(
+      /force-prefixed/,
+    );
+  });
+
+  it("refuses --mirror, and does not offer a lease form it does not have", () => {
+    expect(() => buildGitArgv(["push", "--mirror", "origin"], { ...PRESENT })).toThrow(
+      /mirrors the local refs onto the remote/,
+    );
+  });
+
+  it("refuses a bare --force-with-lease, explaining why a fetch defeats it", () => {
+    expect(() => buildGitArgv(["push", "--force-with-lease", "origin", "main"], { ...PRESENT }))
+      .toThrow(/lease with no expected sha/);
+    expect(() =>
+      buildGitArgv(["push", "--force-with-lease=refs/heads/main", "origin"], { ...PRESENT }),
+    ).toThrow(/lease with no expected sha/);
+  });
+
+  it("lets an explicit --force-with-lease=<ref>:<sha> through, hooks path injected", () => {
+    const argv = [
+      "push",
+      "--force-with-lease=refs/heads/main:0123456789abcdef0123456789abcdef01234567",
+      "origin",
+      "main",
+    ];
+    expect(buildGitArgv(argv, { ...PRESENT })).toEqual([
+      "-c",
+      `core.hooksPath=${HOOKS}`,
+      ...argv,
+    ]);
+  });
+
+  it("leaves an ordinary push untouched", () => {
+    const argv = ["push", "-u", "origin", "HEAD:refs/heads/topic"];
+    expect(buildGitArgv(argv, { ...PRESENT })).toEqual(["-c", `core.hooksPath=${HOOKS}`, ...argv]);
+  });
+
+  it("refuses an ALIAS-carried force, where the flag is in the expansion", () => {
+    // The wrapper sees `git p origin main`; git will run `git push --force
+    // origin main`. Reading only the caller's half finds no force.
+    expect(() =>
+      buildGitArgv(["p", "origin", "main"], {
+        ...PRESENT,
+        resolveAlias: (name) => (name === "p" ? "push --force" : null),
+      }),
+    ).toThrow(/blind force push/);
+
+    // Defined by the command line itself, which no separate `git config --get`
+    // can see.
+    expect(() =>
+      buildGitArgv(["-c", "alias.p=push --force", "p", "origin", "main"], { ...PRESENT }),
+    ).toThrow(/blind force push/);
+
+    // Quoted the way git tokenises an alias — the shape that defeated a
+    // whitespace split for `--no-verify`.
+    expect(() =>
+      buildGitArgv(["q", "origin", "main"], {
+        ...PRESENT,
+        resolveAlias: (name) => (name === "q" ? 'push "--force"' : null),
+      }),
+    ).toThrow(/blind force push/);
+  });
+
+  it("refuses a + refspec the caller supplies to a plain push alias", () => {
+    expect(() =>
+      buildGitArgv(["p", "origin", "+main"], {
+        ...PRESENT,
+        resolveAlias: (name) => (name === "p" ? "push" : null),
+      }),
+    ).toThrow(/force-prefixed/);
+  });
+
+  it("does not refuse a push whose +-leading token is an option VALUE", () => {
+    // The rollout bound: a wrong answer must refuse a FORCE push, never an
+    // ordinary one. PEN-4518 was a full fleet push outage originating here.
+    const argv = ["push", "-o", "+weird", "origin", "main"];
+    expect(buildGitArgv(argv, { ...PRESENT })).toEqual(["-c", `core.hooksPath=${HOOKS}`, ...argv]);
+  });
+
+  it("does not touch a non-push, whatever tokens it carries", () => {
+    for (const argv of [
+      ["status", "--force"],
+      ["log", "origin", "+main"],
+      ["diff", "-f"],
+    ]) {
+      expect(buildGitArgv(argv, { ...PRESENT })).toEqual(argv);
+    }
+  });
+
+  it("lets the scanner-bypass refusals win the message on a force push", () => {
+    // `--no-verify` and a caller-supplied `core.hooksPath` are a different and
+    // more urgent family — "you are evading the scan" rather than "this
+    // destroys work" — so they are checked first and keep their wording even
+    // when the same invocation also forces.
+    expect(() => buildGitArgv(["push", "--force", "--no-verify"], { ...PRESENT })).toThrow(
+      /--no-verify is disabled/,
+    );
+    expect(() =>
+      buildGitArgv(["-c", "core.hooksPath=/tmp/empty", "push", "--force"], { ...PRESENT }),
+    ).toThrow(/sets core\.hooksPath itself/);
+  });
+
+  it("refuses before the hook-presence check, so the caller error is reported", () => {
+    expect(() =>
+      buildGitArgv(["push", "--force", "origin", "main"], {
+        hooksDir: HOOKS,
+        hookPresent: () => false,
+      }),
+    ).toThrow(/blind force push/);
+  });
+});
+
+describe.skipIf(!REAL_GIT)("force push against a real repository (PEN-4869)", () => {
+  // Drives REAL git, because the argv-shape tests cannot answer the question
+  // that decides whether this change is safe to ship fleet-wide: does the form
+  // the refusal STEERS TO still perform the rewrite the author needed? A guard
+  // that refuses the destructive command and also breaks the legitimate one is
+  // an outage, not a control.
+  //
+  // Every git call here goes to DEFAULT_GIT_BINARY rather than to `git` on
+  // PATH. On a deployed agent image `git` IS this wrapper, so spawning it with
+  // an argv this module already built double-wraps the invocation and the
+  // second pass refuses its own injected `core.hooksPath` — measured, exit 64
+  // with `sets core.hooksPath itself`. The wrapper execs the real binary, so
+  // that is what these tests push with.
+
+  function git(cwd: string, ...args: string[]): string {
+    return execFileSync(DEFAULT_GIT_BINARY, ["-C", cwd, ...args], { encoding: "utf8" });
+  }
+
+  /** A bare remote whose `main` holds two commits, and a clone sitting on it. */
+  function remoteAndClone(): { remote: string; work: string; head: string } {
+    const remote = path.join(tempDir("git-egress-"), "remote.git");
+    execFileSync(DEFAULT_GIT_BINARY, ["init", "-q", "--bare", "-b", "main", remote]);
+    const work = tempDir("git-egress-");
+    execFileSync(DEFAULT_GIT_BINARY, ["init", "-q", "-b", "main", work]);
+    git(work, "config", "user.email", "devops@paperclip.blockcast.net");
+    git(work, "config", "user.name", "DevOps");
+    writeFileSync(path.join(work, "a.txt"), "one\n");
+    git(work, "add", "a.txt");
+    git(work, "commit", "-qm", "one");
+    writeFileSync(path.join(work, "a.txt"), "two\n");
+    git(work, "commit", "-qam", "two");
+    git(work, "remote", "add", "origin", remote);
+    git(work, "push", "-q", "origin", "main");
+    return { remote, work, head: git(work, "rev-parse", "HEAD").trim() };
+  }
+
+  it("the accepted lease form still performs the rewrite", () => {
+    const { remote, work, head } = remoteAndClone();
+
+    // Diverge: drop the tip and write a different commit in its place, so the
+    // push genuinely is not a fast-forward and genuinely needs a force.
+    git(work, "reset", "-q", "--hard", "HEAD~1");
+    writeFileSync(path.join(work, "a.txt"), "two, rewritten\n");
+    git(work, "commit", "-qam", "two, rewritten");
+    const rewritten = git(work, "rev-parse", "HEAD").trim();
+    expect(rewritten).not.toBe(head);
+
+    // The hooks directory is empty, so git runs no pre-push hook — this test is
+    // about the force semantics surviving the guard, not about the scanner.
+    const hooksDir = tempDir("git-egress-hooks-");
+    const argv = buildGitArgv(
+      ["-C", work, "push", `--force-with-lease=refs/heads/main:${head}`, "origin", "main"],
+      { hooksDir, hookPresent: () => true },
+    );
+
+    const pushed = spawnSync(DEFAULT_GIT_BINARY, argv, { encoding: "utf8" });
+    expect(`${pushed.stdout}${pushed.stderr}`).toMatch(/forced update/);
+    expect(pushed.status).toBe(0);
+    expect(git(remote, "rev-parse", "refs/heads/main").trim()).toBe(rewritten);
+  }, 60_000);
+
+  it("a stale lease is refused by git, which is the protection being bought", () => {
+    // The whole point of naming the sha: when another run has already pushed,
+    // the lease fails instead of destroying what it pushed. This is the
+    // PEN-4764 moment, reproduced.
+    const { remote, work, head } = remoteAndClone();
+
+    // Another run lands a commit on the branch first.
+    const other = tempDir("git-egress-");
+    execFileSync(DEFAULT_GIT_BINARY, ["clone", "-q", "-b", "main", remote, other]);
+    git(other, "config", "user.email", "other@paperclip.blockcast.net");
+    git(other, "config", "user.name", "Other");
+    writeFileSync(path.join(other, "b.txt"), "theirs\n");
+    git(other, "add", "b.txt");
+    git(other, "commit", "-qm", "theirs");
+    git(other, "push", "-q", "origin", "main");
+    const winner = git(other, "rev-parse", "HEAD").trim();
+
+    // Our run rewrites the tip, still holding the sha it read before they won.
+    git(work, "reset", "-q", "--hard", "HEAD~1");
+    writeFileSync(path.join(work, "a.txt"), "mine\n");
+    git(work, "commit", "-qam", "mine");
+
+    const hooksDir = tempDir("git-egress-hooks-");
+    const argv = buildGitArgv(
+      ["-C", work, "push", `--force-with-lease=refs/heads/main:${head}`, "origin", "main"],
+      { hooksDir, hookPresent: () => true },
+    );
+    const pushed = spawnSync(DEFAULT_GIT_BINARY, argv, { encoding: "utf8" });
+
+    expect(pushed.status).not.toBe(0);
+    expect(`${pushed.stdout}${pushed.stderr}`).toMatch(/stale info/);
+    // The commit a blind --force would have destroyed is still on the remote.
+    expect(git(remote, "rev-parse", "refs/heads/main").trim()).toBe(winner);
+  }, 60_000);
+
+  it("refuses the blind force before any process is spawned", () => {
+    // Through `runGitEgressRuntime`, the real entrypoint. Thrown synchronously,
+    // before the promise is built, so nothing reaches the remote.
+    const { remote, work } = remoteAndClone();
+    const landed = git(remote, "rev-parse", "refs/heads/main").trim();
+
+    expect(() =>
+      runGitEgressRuntime({
+        target: DEFAULT_GIT_BINARY,
+        argv: ["-C", work, "push", "--force", "origin", "main"],
+        ...PRESENT,
+      }),
+    ).toThrow(/blind force push/);
+
+    expect(git(remote, "rev-parse", "refs/heads/main").trim()).toBe(landed);
   }, 60_000);
 });
