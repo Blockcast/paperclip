@@ -118,8 +118,11 @@ export function buildDexOAuthProviderConfigFromEnv(): GenericOAuthConfig | null 
 
   return {
     providerId,
-    issuer,
+    // better-auth >=1.7 takes the issuer from discovery and verifies ID tokens
+    // against it; refuse to register the provider if discovery cannot supply
+    // the issuer + jwks_uri that verification needs.
     discoveryUrl: `${issuer}/.well-known/openid-configuration`,
+    requireIdTokenVerification: true,
     clientId,
     clientSecret,
     scopes,
