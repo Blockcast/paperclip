@@ -49,6 +49,7 @@ import { loadConfig } from "../../config.js";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { runningProcesses } from "../../adapters/index.js";
 import { visibleIssueCondition } from "../issue-visibility.js";
+import { isDeliberateParkActive } from "../issue-park-expiry.js";
 import { HttpError, forbidden, notFound } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
 import { isPidAlive, isProcessGroupAlive, terminateLocalService } from "../local-service-supervisor.js";
@@ -9682,9 +9683,47 @@ export function recoveryService(
         ),
       )
       .orderBy(asc(issues.companyId), asc(issues.assigneeAgentId), asc(issues.createdAt), asc(issues.id)));
+    // PEN-4871: drop rows carrying a LIVE deliberate park before anything else looks at
+    // them. A park is a structured, attributed claim by a named actor that this row is
+    // not being worked until a stated deadline — which is an answer to BOTH limbs of what
+    // this sweep does to a candidate, so the exclusion is blanket rather than
+    // dispatch-only: re-driving the owner contradicts the claim, and escalating past them
+    // for "no progress" penalises a decision the platform asked them to make.
+    //
+    // Filtered HERE, in TypeScript, rather than as a `parked_until` term in the candidate
+    // query above. Three reasons, in order of how much they would cost to get wrong:
+    //
+    //  1. The decision stays in one place. `isDeliberateParkActive` is the single owner of
+    //     the live-park reading (see its docblock); a SQL copy would be a fourth hand-
+    //     written statement of a predicate this codebase has already watched drift once on
+    //     this exact column (BLO-22660 / BLO-27912). `issue-park-expiry.ts` makes the same
+    //     call for the same reason — its SQL "only narrows the scan", and the TS predicate
+    //     decides.
+    //  2. The suppressed rows stay countable. A SQL term makes them vanish from the
+    //     population, and "how many rows did we decline to wake?" is the only signal that
+    //     distinguishes this fix working from the sweep quietly matching nothing — which
+    //     is the precise failure mode the issue's own implementation notes warn about.
+    //  3. They must not consume the loop's wall-clock budget. BLO-48950 bounds the
+    //     candidate loop; a parked row that reaches it spends budget that would otherwise
+    //     reach a genuinely stranded candidate, so the exclusion has to land BEFORE
+    //     `rotateStrandedCandidates` and the budgeted loop, not inside the loop body.
+    //
+    // A LAPSED park (`parkedUntil <= now`) is deliberately NOT excluded: it must keep
+    // dispatching, or this fix becomes a second, silent strand. `isDeliberateParkActive`
+    // is the exact negation of the release edge's lapsed arm, so the two cannot both hold
+    // and cannot double-wake — and in practice the release edge's wake creates a live
+    // execution run, which the candidate query's `not exists (live execution run)` term
+    // then excludes. One wake at expiry, from whichever edge gets there first.
+    const parkSweepNowMs = Date.now();
+    const dispatchableCandidates: typeof orderedCandidates = [];
+    let parkSuppressedCount = 0;
+    for (const issue of orderedCandidates) {
+      if (isDeliberateParkActive(issue.parkedUntil, parkSweepNowMs)) parkSuppressedCount += 1;
+      else dispatchableCandidates.push(issue);
+    }
     // BLO-48950: start after the candidate the previous, budget-truncated pass reached
     // last, so a run of slow passes still covers the whole set.
-    const candidates = rotateStrandedCandidates(orderedCandidates, strandedSweepResumeAfter);
+    const candidates = rotateStrandedCandidates(dispatchableCandidates, strandedSweepResumeAfter);
     // PEN-3636: published to the wrapper immediately, so a pass that throws later
     // still reports the population it was working against. Read only by the
     // wrapper's `finally`; nothing branches on it.
@@ -9750,6 +9789,13 @@ export function recoveryService(
       // sweep that would previously have aborted at that issue and silently dropped
       // every candidate ordered after it.
       reconcileErrors: 0,
+      // PEN-4871: candidates dropped before the loop because a deliberate park is live on
+      // them. NOT folded into `skipped`: `skipped` counts rows the loop looked at and
+      // declined, and these never enter the loop at all — so adding them there would
+      // overstate the loop's population and understate this fix to invisibility. A
+      // non-zero value here is the sweep working; a permanent zero on a fleet that parks
+      // rows is the signal that it has stopped.
+      parkSuppressed: 0,
       // BLO-48950: true when the candidate loop stopped at `STRANDED_SWEEP_BUDGET_MS`;
       // `candidatesReached` is then less than `candidatesScanned`.
       budgetExhausted: false,
@@ -11633,6 +11679,7 @@ export function recoveryService(
     const pauseHoldPrefilterStats = activePauseHoldPrefilter.stats();
     const agentRosterMemoStats = agentRosterMemo.stats();
     result.candidatesScanned = candidates.length;
+    result.parkSuppressed = parkSuppressedCount;
     result.pauseHoldPrefilterLiveReads = pauseHoldPrefilterStats.liveReads;
     result.pauseHoldPrefilterMemoHits = pauseHoldPrefilterStats.memoHits;
     result.pauseHoldGateReadsAvoided = pauseHoldPrefilterStats.gateReadsAvoided;
@@ -11648,6 +11695,9 @@ export function recoveryService(
         candidatesScanned: result.candidatesScanned,
         candidatesReached: result.candidatesReached,
         budgetExhausted: result.budgetExhausted,
+        // PEN-4871. Reads next to `candidatesScanned` on purpose: scanned EXCLUDES these,
+        // so the two together are the sweep's real population.
+        parkSuppressed: result.parkSuppressed,
         agentInvokabilityEvaluated: result.agentInvokabilityEvaluated,
         pauseHoldPrefilterLiveReads: result.pauseHoldPrefilterLiveReads,
         pauseHoldPrefilterMemoHits: result.pauseHoldPrefilterMemoHits,

@@ -2167,7 +2167,8 @@ const INVALID_AGENT_IN_REVIEW_DISPOSITION_MESSAGE =
   "A live deliberate park (parkedDisposition / parkedUntil) is NOT on this list, and its absence is a decision rather than an oversight (BLO-33572): " +
   "a park records that nobody is acting on this row until a stated deadline, which is the opposite of what in_review asserts, and it expires on its own — " +
   "so admitting it here would reach in_review with no reviewer at all and merely defer this same refusal to the park's deadline. " +
-  "The strandedness sweep does count a live park, on any status, which is the point: park the row on the status that is actually true (todo/backlog) instead of moving it to review. " +
+  "Both strandedness sweeps count a live park, on any status — the liveness classifier stops flagging the row, and the dispatch sweep stops re-driving it (PEN-4871) — " +
+  "which is the point: park the row on the status that is actually true (todo/backlog) instead of moving it to review. " +
   "After creating one of those review paths, retry the status update.";
 
 function isPendingIssueThreadInteractionReviewPath(interaction: { kind: string; status: string }) {
@@ -4279,6 +4280,16 @@ export function issueRoutes(
    * - The caller already has the disposition they want, on a different status. The sweep
    *   honours a live park on `todo`/`backlog` too, so a parked row does not need `in_review`
    *   — using it as a parking lot is the mistake, and the message now says so.
+   *
+   * PEN-4871 — "sweep satisfier" above now means BOTH sweeps, and until PEN-4871 it did
+   * not. The liveness classifier honoured the park (`hasActiveParkedDisposition`), so the
+   * row stopped being FLAGGED as stranded; the dispatch sweep had no park predicate at
+   * all, so it went on WAKING the row roughly nine minutes after every park. The third
+   * bullet above — "the sweep honours a live park on `todo`/`backlog` too", the one that
+   * tells the caller where to put the row instead — was therefore the half that was not
+   * true, and it was the half the message routes people toward. The registry of
+   * suppression sites is the header of `services/issue-park-expiry.ts`; a future reader
+   * weighing this asymmetry should check there that both still hold.
    *
    * This is the PEN-2853 sentence one predicate over: the sweep's leniency exists to avoid
    * *seizing* a row nobody has had a chance to act on; it is not a licence to *assert* a
