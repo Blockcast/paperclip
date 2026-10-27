@@ -27,31 +27,29 @@
 # different remedy, and folding it in would degrade the one deploy signal that
 # currently works. It gets its own workflow and its own alertname.
 #
-# ON THE CREDENTIAL, and the trade-off taken (read before "fixing" this).
+# ON THE CREDENTIAL (BLO-49651 -- read before "fixing" this).
 # The detector issues two `get` calls:
 #   ConfigMap/paperclip-api-approved-images  (ns paperclip-release-approvals)
-#   Deployment/paperclip-api                 (ns paperclip)
-# Both are inside secrets.KUBECONFIG_PAPERCLIP_CI_DEPLOY's existing grants, and
-# that is the least-privilege credential for the job. It is NOT used here,
-# because it is an ENVIRONMENT secret of `paperclip-production` (verified
-# 2026-10-27 via GET .../environments/paperclip-production/secrets), so reading
-# it requires declaring `environment: paperclip-production` — and a job that
-# declares an environment creates a GitHub *deployment record*. That environment
-# currently carries exactly one record per daily deploy, which is a legible
-# production-deploy audit trail; an hourly detector would add ~24/day and bury
-# it. Degrading an audit surface to read a ConfigMap is the wrong trade.
+#   Deployment/paperclip/paperclip-api       (ns paperclip)
+# Both are inside secrets.KUBECONFIG_PAPERCLIP_CI_DEPLOY's existing grants
+# (SA paperclip/paperclip-ci-deploy; RoleBinding
+# paperclip-ci-deploy-approval-params-reader in onprem-k8s
+# paperclip/paperclip-release-approvals.yaml), the least-privilege credential
+# for this job. It is an ENVIRONMENT secret of `paperclip-production`, so the
+# job declares that environment -- with `deployment: false`, which grants the
+# environment's secrets WITHOUT minting a GitHub deployment record. That keeps
+# the environment's deployment history one-record-per-deploy, which
+# supersede-stale-deploy.mjs, guard-pending-deploy.sh and deploy-stall-record.mjs
+# all read. Do NOT drop `deployment: false`: ~24 records/day from a read-only
+# detector would land in exactly the history those scripts reason over.
+# `deployment: false` is refused if the environment ever gains a CUSTOM
+# deployment protection rule app; that failure is loud (the job errors), and the
+# environment today carries only a protected-branch policy (read 2026-10-27).
 #
-# So this uses secrets.BLOCKCAST_KUBE_CONFIG_B64, the repo-level credential
-# relay-ssl-multicert-guard.yml already uses from this same lane, hourly and
-# green. It grants this workflow NO authority that lane did not already have.
-#
-# ⚠️ ITS RBAC FOR THESE TWO OBJECTS IS UNVERIFIED — it could not be tested
-# without running this workflow. That uncertainty is SELF-REPORTING and cannot
-# produce a false all-clear: the detector exits 2 on an unreadable object, which
-# this job alerts on under its own alertname and reds on. If the first scheduled
-# run exits 2 with a forbidden/not-found message, the fallback is to declare
-# `environment: paperclip-production` and switch to KUBECONFIG_PAPERCLIP_CI_DEPLOY,
-# accepting the deployment-record cost above. Do not instead widen the kubeconfig.
+# The first version used the repo-level BLOCKCAST_KUBE_CONFIG_B64 secret
+# instead. Its identity (production-blockcastd SA for relay-ssl-multicert-guard)
+# is Forbidden on the ConfigMap -- the first two runs, 40573380689 and
+# 40573945545, both exited 2 on it. Do not instead widen that SA.
 #
 # ON THE CADENCE. Hourly, at :53 — ≥6 min from every other cron in this repo
 # (9, 17, 23, 41, 47), which the guard-liveness header asks for. The detector's
@@ -81,6 +79,9 @@ jobs:
   stranded-lock:
     runs-on: arc-paperclip-light
     timeout-minutes: 10
+    environment:
+      name: paperclip-production
+      deployment: false
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
@@ -109,14 +110,15 @@ jobs:
       - name: Configure kubeconfig
         continue-on-error: true
         env:
-          KUBE_CONFIG_B64: ${{ secrets.BLOCKCAST_KUBE_CONFIG_B64 }}
+          KUBECONFIG_DATA: ${{ secrets.KUBECONFIG_PAPERCLIP_CI_DEPLOY }}
         run: |
-          if [ -z "$KUBE_CONFIG_B64" ]; then
-            echo "::error::BLOCKCAST_KUBE_CONFIG_B64 is required for the stranded approval lock check."
+          if [ -z "$KUBECONFIG_DATA" ]; then
+            echo "::error::KUBECONFIG_PAPERCLIP_CI_DEPLOY is required for the stranded approval lock check."
             exit 1
           fi
           mkdir -p "$HOME/.kube"
-          printf '%s' "$KUBE_CONFIG_B64" | base64 -d > "$HOME/.kube/config"
+          # Raw kubeconfig, not base64 -- same as docker.yml's "Write kubeconfig".
+          printf '%s' "$KUBECONFIG_DATA" > "$HOME/.kube/config"
           chmod 600 "$HOME/.kube/config"
 
       # `continue-on-error` so exit 1 (stranded) and exit 2 (unreadable) both
