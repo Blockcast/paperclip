@@ -4892,6 +4892,7 @@ function ensureRegistry(): {
     || !heartbeatRunFailed
     || !ccrotateCapacityDeferred
     || !retryScheduleOutcome
+    || !transientRetryFloor
     || !startLockReapDisposition
     || !orphanReapStageSeconds
     || !penstockGateProbe
@@ -10685,6 +10686,12 @@ export function __resetMetricsForTest(): void {
   heartbeatRunFailed = null;
   ccrotateCapacityDeferred = null;
   retryScheduleOutcome = null;
+  // PEN-4145. Load-bearing: without this the counter survives a reset bound to a
+  // DISCARDED registry, so the zero-seed loop never re-runs and the 4x3 grid that
+  // makes `increase()` able to see a first event is silently missing for the rest
+  // of the process. That is the trap this metric exists to avoid, reintroduced
+  // through the test path.
+  transientRetryFloor = null;
   startLockReapDisposition = null;
   orphanReapStageSeconds = null;
   penstockGateProbe = null;
