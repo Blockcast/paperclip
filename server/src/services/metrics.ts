@@ -6939,7 +6939,7 @@ function ensureRegistry(): {
         + "`. The join needs no service selector, because only replicas publishing a "
         + "lease indicator survive it. ⛔ Note the OUTER parentheses are load-bearing: "
         + "PromQL binds `==` tighter than `and`, so dropping them parses the comparison "
-        + "against the lease gauge instead and yields an alert that can never fire. See "
+        + "against the lease gauge instead and yields an alert that can never fire. "
         + "⚠ And size `for:` off the CHAIN duration, never the tick interval: just after a "
         + "handoff the join correctly selects the new holder, whose flag is still at its "
         + "seeded 0 until its first chain completes, so a short `for:` pages on every "
