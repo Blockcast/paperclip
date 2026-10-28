@@ -572,3 +572,171 @@ test("the embedded-Postgres detector is not vacuous", () => {
       `branch), got: ${boots.join(", ") || "(none)"}`,
   );
 });
+
+// ---------------------------------------------------------------------------
+// PEN-4930: a test file may opt itself into a non-`node` Vitest environment
+// with a `// @vitest-environment <name>` docblock, or a package may set
+// `environment:` in its own vitest.config.ts. Either way Vitest then imports
+// the package that implements that environment -- `jsdom` for jsdom. That
+// import is satisfied by whatever is reachable from the package's
+// node_modules, which under pnpm includes anything hoisted into
+// node_modules/.pnpm/node_modules by some *other* importer.
+//
+// So a package can run its whole DOM suite green while declaring nothing. That
+// is what @paperclipai/plugin-llm-wiki and @paperclipai/ui were doing: 215
+// jsdom docblocks between them, and the only importer declaring `jsdom` was
+// `server`. Two costs, and the second is the one that justifies a guard here:
+//
+//   1. Fragility. `server` dropping jsdom, or a second version arriving and
+//      stopping the hoist, turns these lanes red with nothing in their own
+//      diff to explain it -- and the lane names a package the author never
+//      touched.
+//   2. Audit fidelity. Per-package CVE audit and SBOM generation enumerate
+//      DECLARED dependencies. A package that loads jsdom without declaring it
+//      does not carry jsdom in its dependency set, so a jsdom advisory does
+//      not attribute to it. jsdom is an HTML/CSS/URL parser with a non-trivial
+//      advisory history; this repo already pins `jsdom>undici` in the root
+//      package.json overrides, which is precisely the kind of remediation that
+//      has to be able to find every package it applies to.
+//
+// Neither cost is an exploitable vulnerability -- the package is pinned and
+// integrity-hashed in pnpm-lock.yaml, and the hoist introduces no substitution
+// vector. This is Low-severity hygiene, and the reason it is mechanical rather
+// than a one-time fix is that the one-time fix does not survive: the next
+// plugin to add a DOM spec reintroduces it silently, exactly as these two did.
+// The sweep is the whole point. Fixing the two packages without it would be
+// closing the instance and leaving the class open.
+
+const ENVIRONMENT_PROVIDERS = new Map([
+  ["jsdom", "jsdom"],
+  ["happy-dom", "happy-dom"],
+  ["edge-runtime", "@edge-runtime/vm"],
+]);
+
+const ENVIRONMENT_DOCBLOCK = /^\s*\/\/\s*@vitest-environment\s+([\w-]+)/m;
+const ENVIRONMENT_CONFIG = /\benvironment:\s*["']([\w-]+)["']/;
+
+// Attribute every test file to its nearest enclosing package.json, the same
+// way packagesOwningTests() does, but keep the files so each environment
+// request can be reported against the package that has to declare it.
+function environmentRequestsByPackage() {
+  const packageDirs = new Set();
+  const testFiles = [];
+  collectWorkspace(repoRoot, packageDirs, testFiles);
+
+  const requests = new Map();
+  const record = (dir, environment, source) => {
+    if (!dir || environment === "node") return;
+    if (!requests.has(dir)) requests.set(dir, new Map());
+    const perDir = requests.get(dir);
+    if (!perDir.has(environment)) perDir.set(environment, path.relative(repoRoot, source));
+  };
+  const ownerOf = (file) => {
+    let dir = path.dirname(file);
+    while (dir.startsWith(repoRoot)) {
+      if (packageDirs.has(dir)) return dir;
+      dir = path.dirname(dir);
+    }
+    return null;
+  };
+
+  for (const file of testFiles) {
+    const match = ENVIRONMENT_DOCBLOCK.exec(readFileSync(file, "utf8"));
+    if (match) record(ownerOf(file), match[1], file);
+  }
+
+  // The second opt-in door: a package-level default in its own vitest.config.
+  for (const dir of packageDirs) {
+    for (const name of ["vitest.config.ts", "vitest.config.mts", "vitest.config.js"]) {
+      const config = path.join(dir, name);
+      let source;
+      try {
+        source = readFileSync(config, "utf8");
+      } catch {
+        continue;
+      }
+      const match = ENVIRONMENT_CONFIG.exec(source);
+      if (match) record(dir, match[1], config);
+    }
+  }
+
+  return requests;
+}
+
+function declaredDependencies(dir) {
+  const manifest = JSON.parse(readFileSync(path.join(dir, "package.json"), "utf8"));
+  return new Set([
+    ...Object.keys(manifest.dependencies ?? {}),
+    ...Object.keys(manifest.devDependencies ?? {}),
+    ...Object.keys(manifest.peerDependencies ?? {}),
+    ...Object.keys(manifest.optionalDependencies ?? {}),
+  ]);
+}
+
+test("every package requesting a non-node Vitest environment declares the package providing it", () => {
+  const offenders = [];
+  const unknown = [];
+
+  for (const [dir, environments] of environmentRequestsByPackage()) {
+    const declared = declaredDependencies(dir);
+    for (const [environment, source] of environments) {
+      const provider = ENVIRONMENT_PROVIDERS.get(environment);
+      if (!provider) {
+        unknown.push({ environment, source });
+        continue;
+      }
+      if (!declared.has(provider)) {
+        offenders.push({ dir: path.relative(repoRoot, dir), environment, provider, source });
+      }
+    }
+  }
+
+  // Fail closed on an environment this map has never seen rather than waving
+  // it through. A new environment is a deliberate act by someone who is right
+  // here in this file's failure message; an unrecognised name silently scoring
+  // as "fine" is the exact fail-open shape the sweep exists to remove.
+  assert.deepEqual(
+    unknown,
+    [],
+    `Unrecognised Vitest environment(s). Add the package that implements each one to ` +
+      `ENVIRONMENT_PROVIDERS above so this sweep can check it is declared:\n` +
+      unknown.map(({ environment, source }) => `  - "${environment}" requested by ${source}`).join("\n"),
+  );
+
+  assert.deepEqual(
+    offenders,
+    [],
+    `These packages run tests in a non-node Vitest environment but do not declare the package ` +
+      `that provides it. Today it resolves only because pnpm hoists some other importer's copy ` +
+      `into node_modules/.pnpm/node_modules -- a phantom dependency, which breaks when that ` +
+      `other importer changes and which hides the package from per-package CVE audit and SBOM ` +
+      `output. Add it to the package's own devDependencies and regenerate pnpm-lock.yaml:\n` +
+      offenders
+        .map(
+          ({ dir, environment, provider, source }) =>
+            `  - ${dir} requests "${environment}" (${source}) but does not declare "${provider}"`,
+        )
+        .join("\n"),
+  );
+});
+
+test("the Vitest-environment detector is not vacuous", () => {
+  // Positive control, same reasoning as the embedded-Postgres one above. Both
+  // regexes are load-bearing and neither is exercised by the assertion when
+  // the repo is clean -- a passing sweep is equally consistent with "every
+  // package declares its environment" and "the docblock regex matches
+  // nothing". These two packages are the repo's only jsdom consumers, so
+  // naming them pins the docblock branch against a silent rename.
+  const requests = environmentRequestsByPackage();
+  const jsdomConsumers = [...requests]
+    .filter(([, environments]) => environments.has("jsdom"))
+    .map(([dir]) => path.relative(repoRoot, dir))
+    .sort();
+
+  assert.deepEqual(
+    jsdomConsumers,
+    ["packages/plugins/plugin-llm-wiki", "ui"],
+    `expected the sweep to find the two packages whose tests request jsdom; if a package ` +
+      `legitimately gained or lost jsdom specs, update this control -- do not delete it`,
+  );
+});
