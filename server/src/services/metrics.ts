@@ -1234,14 +1234,33 @@ export const DEFERRED_ISSUE_EXECUTION_WAKE_AGE_METRICS_REFRESH_SUCCESS_METRIC =
 // reset-on-lease-loss fix would need bespoke code to catch. Joining on it needs
 // no new series and no change to the publishing code.
 //
+// ⚠ SIZE `for:` OFF THE CHAIN DURATION, AND NOTHING SHORTER. This is the one
+// obligation the leader-scoped join ADDS, and it is not optional. Immediately
+// after any handoff the join correctly selects the NEW holder -- whose refresh
+// flag is still at its constructor-seeded 0, because
+// `setColdInReviewIssueMetricsRefreshSuccess` is its only writer and the new
+// leader has not completed a chain yet. So `== 0` is TRUE for the whole of the
+// new leader's first chain, and an alert with a short `for:` pages on every
+// handoff. Measured over the 7 d to 2026-10-28, the worst chain on the workers
+// tier ran 2985 s (~50 min); the figure this comment carried before, 645 s, was
+// a single 2026-10-24 sample and is NOT a safe bound. Set `for:` longer than
+// the worst chain duration you actually observe
+// (`max_over_time(paperclip_heartbeat_recovery_chain_duration_seconds[7d])`),
+// and re-check it when that number moves. An hour is a reasonable starting
+// floor today. This is a fail-CLOSED window -- noisy, not blind -- which is the
+// direction to err, but it is still a false page if you size `for:` wrong.
+//
 // Rejected alternatives, and why (PEN-4665 decision, 2026-10-28):
-//   * RESET THE GAUGES ON LEASE LOSS. Fixes the refresh flag but breaks the two
-//     gauge families in OPPOSITE directions during the handoff window: the
-//     refresh flag goes fail-CLOSED (the new leader is seeded 0 and a chain
-//     routinely outlives one interval -- 645 s measured 2026-10-24), while the
-//     AGE gauges go fail-OPEN (the old leader's ages drop to 0 before the new
-//     leader publishes, so `max` reads "nothing cold"). One change, two new
-//     traps, and it needs code in the demotion path.
+//   * RESET THE GAUGES ON LEASE LOSS. The honest discriminator here is the AGE
+//     gauges, not the refresh flag. Under reset the age gauges go fail-OPEN
+//     during the handoff window (the old leader's ages drop to 0 before the new
+//     leader publishes, so `max` reads "nothing cold") -- blindness, which is
+//     the direction this whole row exists to remove. The refresh flag's
+//     fail-CLOSED first-chain window, by contrast, is NOT a reason to prefer
+//     the join: the join has exactly the same window, for the same reason, as
+//     the `for:` note above says. Do not read the rejection as "reset is noisy
+//     and the join is not". It is "reset ALSO blinds the age gauges, and it
+//     needs bespoke code in the demotion path to do it".
 //   * KEY THE ALERT OFF A TIMESTAMP ADVANCING. Changes the alert's shape and
 //     still needs a per-refresh timestamp series these gauges do not publish.
 //
@@ -7054,6 +7073,11 @@ function ensureRegistry(): {
         + "lease indicator survive it. ⛔ Note the OUTER parentheses are load-bearing: "
         + "PromQL binds `==` tighter than `and`, so dropping them parses the comparison "
         + "against the lease gauge instead and yields an alert that can never fire. See "
+        + "⚠ And size `for:` off the CHAIN duration, never the tick interval: just after a "
+        + "handoff the join correctly selects the new holder, whose flag is still at its "
+        + "seeded 0 until its first chain completes, so a short `for:` pages on every "
+        + "handoff. Worst chain on the workers tier over the 7d to 2026-10-28 was 2985s "
+        + "(~50min); an hour is a reasonable starting floor. See "
         + "the declaration comment on "
         + COLD_IN_REVIEW_ISSUE_OLDEST_AGE_METRIC + " for the full derivation, the "
         + "rejected alternatives, and the deliberate handover-gap caveat; that comment "
