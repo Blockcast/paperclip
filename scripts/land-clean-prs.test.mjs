@@ -24,6 +24,10 @@ import {
   sweepRepos,
   targetRepos,
   unsatisfiedOwners,
+  codeownersPatternToRegExp,
+  impliedOwners,
+  ownersForFiles,
+  parseCodeowners,
 } from "./land-clean-prs.mjs";
 
 const HEAD = "958587ad1fe1eb52b06ca874c41734c9abdc2a10";
@@ -902,5 +906,151 @@ describe("markFailure", () => {
     ]);
     assert.match(receipt, /enqueue: 1/);
     assert.match(receipt, /enqueue-failed: 1/);
+  });
+});
+
+/**
+ * PEN-3474. `reviewRequests` alone is not the gate the hold claims to be: it
+ * holds on requests CODEOWNERS never implied, and on requests GitHub stopped
+ * implying when the owned file left the diff and then never withdrew.
+ */
+describe("CODEOWNERS scoping of the owner hold", () => {
+  /** The live `Blockcast/paperclip` rules, verbatim, so the cases are the real ones. */
+  const RULES = parseCodeowners(
+    [
+      "# Code owners.",
+      "",
+      ".github/** @kkroo",
+      "scripts/release*.sh @kkroo",
+      "doc/RELEASING.md @kkroo",
+      "skills/** @kkroo",
+      "package.json @kkroo   # matches at every depth",
+      "docs/ @org/docs-team",
+    ].join("\n"),
+  );
+
+  it("parses owners, skips comments and blank lines, and ignores a pattern with no owner", () => {
+    assert.equal(RULES.length, 6);
+    assert.deepEqual(RULES.at(-1).owners, ["team:docs-team"]);
+    assert.deepEqual(parseCodeowners("# only a comment\n\nlonely-pattern\n"), []);
+  });
+
+  it("anchors a pattern containing a slash and floats a bare name to any depth", () => {
+    // The checked-in CODEOWNERS relies on both, and says so in its own comment.
+    assert.ok(codeownersPatternToRegExp("package.json").test("packages/acpx-local/package.json"));
+    assert.ok(codeownersPatternToRegExp("package.json").test("package.json"));
+    assert.ok(!codeownersPatternToRegExp("scripts/release*.sh").test("scripts/nested/release.sh"));
+    assert.ok(codeownersPatternToRegExp("scripts/release*.sh").test("scripts/release-x.sh"));
+  });
+
+  it("spans whole segments for `**` and owns the contents of a directory pattern", () => {
+    assert.ok(codeownersPatternToRegExp("a/**/b.ts").test("a/b.ts"));
+    assert.ok(codeownersPatternToRegExp("a/**/b.ts").test("a/x/y/b.ts"));
+    assert.ok(!codeownersPatternToRegExp("a/**/b.ts").test("z/a/b.ts"));
+    assert.ok(codeownersPatternToRegExp("docs/").test("docs/x/y.md"));
+    assert.ok(!codeownersPatternToRegExp("docs/").test("docsy/x.md"));
+  });
+
+  it("treats a literal dot as a literal, not as a wildcard", () => {
+    // The chain-replace translator this replaced mangled `a.b*`: its lookbehind
+    // guard fired on the escaped dot and left the `*` as a regex quantifier.
+    assert.ok(codeownersPatternToRegExp("a.b*").test("a.bc"));
+    assert.ok(!codeownersPatternToRegExp("a.b*").test("axbc"));
+  });
+
+  it("applies LAST match wins per file, then unions across files", () => {
+    const rules = parseCodeowners(["src/** @first", "src/special.ts @second"].join("\n"));
+    assert.deepEqual([...ownersForFiles(["src/other.ts"], rules)], ["first"]);
+    assert.deepEqual([...ownersForFiles(["src/special.ts"], rules)], ["second"]);
+    assert.deepEqual([...ownersForFiles(["src/other.ts", "src/special.ts"], rules)].sort(), [
+      "first",
+      "second",
+    ]);
+  });
+
+  it("drops a request whose owned file left the diff (#3067)", () => {
+    // Opened touching `.github/workflows/pr.yml`, auto-requested @kkroo two
+    // seconds later, then force-pushed down to one unowned file. GitHub never
+    // withdraws the request, and GraphQL `asCodeOwner` still read `true`.
+    const row = classifyPr(
+      pr({
+        mergeStateStatus: "CLEAN",
+        reviewRequests: [{ login: "kkroo" }],
+        codeownerRules: RULES,
+        files: ["scripts/__tests__/vitest-project-coverage.test.mjs"],
+      }),
+      { now: NOW },
+    );
+    assert.equal(row.action, "enqueue");
+  });
+
+  it("keeps a request the current diff still owes (#3054, #3051)", () => {
+    for (const files of [[".github/workflows/stranded-approval-lock-check.yml"], ["skills/paperclip/SKILL.md"]]) {
+      const row = classifyPr(
+        pr({ reviewRequests: [{ login: "kkroo" }], codeownerRules: RULES, files }),
+        { now: NOW },
+      );
+      assert.equal(row.action, "codeowner-review-requested");
+      assert.equal(row.detail, "kkroo");
+    }
+  });
+
+  it("drops the `allyblockcast` User request CODEOWNERS never named", () => {
+    // The original PEN-3474 cohort: the requested User (id 296676656) is a
+    // different principal from the `allyblockcast[bot]` App that reviews, so
+    // no review can ever clear it. CODEOWNERS names only @kkroo.
+    assert.deepEqual(
+      unsatisfiedOwners({
+        headRefOid: HEAD,
+        reviewRequests: [{ login: "allyblockcast" }],
+        reviews: [review()],
+        codeownerRules: RULES,
+        files: [".github/workflows/pr.yml"],
+      }),
+      [],
+    );
+  });
+
+  it("keeps a team request the diff owes, which no login approval can satisfy", () => {
+    assert.deepEqual(
+      unsatisfiedOwners({
+        headRefOid: HEAD,
+        reviewRequests: [{ slug: "docs-team" }],
+        reviews: [{ state: "APPROVED", user: { login: "kkroo" }, commit_id: HEAD }],
+        codeownerRules: RULES,
+        files: ["docs/guide.md"],
+      }),
+      ["team:docs-team"],
+    );
+  });
+
+  it("falls back to holding when ownership cannot be determined", () => {
+    // This script's output is "merge it", so every unknown has to over-hold.
+    // `null` and `[]` must stay distinguishable: the empty set means nobody is
+    // owed, and reading an unreadable CODEOWNERS as empty would release every
+    // held PR at once.
+    const base = {
+      headRefOid: HEAD,
+      reviewRequests: [{ login: "kkroo" }],
+      reviews: [review()],
+      files: ["scripts/unowned.mjs"],
+    };
+    assert.deepEqual(unsatisfiedOwners(base), ["kkroo"], "no rules fetched");
+    assert.deepEqual(
+      unsatisfiedOwners({ ...base, codeownerRules: RULES, files: null }),
+      ["kkroo"],
+      "file listing failed",
+    );
+    assert.deepEqual(
+      unsatisfiedOwners({
+        ...base,
+        codeownerRules: RULES,
+        files: Array.from({ length: 3000 }, (_, i) => `f${i}.ts`),
+      }),
+      ["kkroo"],
+      "GitHub truncated the file listing",
+    );
+    assert.equal(impliedOwners({ codeownerRules: RULES, files: null }), null);
+    assert.deepEqual([...impliedOwners({ codeownerRules: RULES, files: ["unowned.ts"] })], []);
   });
 });
