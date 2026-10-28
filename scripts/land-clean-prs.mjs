@@ -662,6 +662,38 @@ function commentOnce(repo, number, marker, body, run = gh) {
 }
 
 /**
+ * The head SHA this PR carries RIGHT NOW, read at apply time.
+ *
+ * PEN-4887: `fetchOpenPrs` snapshots every open PR once per fire, and a head
+ * can move between that snapshot and the enqueue. The case that made this
+ * expensive is not a rare race — it is the deterministic consequence of
+ * landing a STACKED child PR: merging the child into the parent's branch
+ * replaces the parent's head with the merge commit, on which nothing has run
+ * yet. Measured on Blockcast/paperclip#3060 (2026-10-28): head moved at
+ * 07:46:13Z, enqueued at 07:46:17Z, ejected by the queue at 07:46:27Z, while
+ * `ci/ally-head-attested` did not succeed until 07:48:37Z — 2m10s after the
+ * removal, with `policy` gating the heavy matrix behind it for ~6 minutes more.
+ *
+ * Every gate in `classifyPr` — the settle floor, `checks:none`, the Ally
+ * verdict at head, the owner set — was evaluated against the OLD head and says
+ * nothing about the new one. Re-reading the SHA is what makes those verdicts
+ * mean what the receipt claims they mean.
+ *
+ * `--auto` is not a substitute. On a queue-enabled base GitHub enqueues
+ * immediately whenever it believes the requirements are met, and right after a
+ * head moves that belief is briefly stale: #3060 carries an
+ * `added_to_merge_queue` event with no `auto_merge_enabled` beside it.
+ */
+export function liveHeadSha(repo, number, run = gh) {
+  const raw = JSON.parse(
+    run(["pr", "view", String(number), "--repo", repo, "--json", "headRefOid"]),
+  )?.headRefOid;
+  return typeof raw === "string" && raw.length > 0 ? raw : null;
+}
+
+const short = (sha) => (typeof sha === "string" ? sha.slice(0, 7) : String(sha));
+
+/**
  * `--rebase` is mandatory, not cosmetic. `gh pr merge --auto` only infers a
  * merge method when the PR's BASE BRANCH has a merge queue — `isMergeQueueEnabled`
  * is a property of the base ref, not of this PR's mergeability. A PR stacked on
@@ -714,38 +746,6 @@ function commentOnce(repo, number, marker, body, run = gh) {
  * noise ever matters, skip rows whose base is unprotected — one
  * `gh api repos/{repo}/branches/{base}` per distinct base, not per PR.
  */
-/**
- * The head SHA this PR carries RIGHT NOW, read at apply time.
- *
- * PEN-4887: `fetchOpenPrs` snapshots every open PR once per fire, and a head
- * can move between that snapshot and the enqueue. The case that made this
- * expensive is not a rare race — it is the deterministic consequence of
- * landing a STACKED child PR: merging the child into the parent's branch
- * replaces the parent's head with the merge commit, on which nothing has run
- * yet. Measured on Blockcast/paperclip#3060 (2026-10-28): head moved at
- * 07:46:13Z, enqueued at 07:46:17Z, ejected by the queue at 07:46:27Z, while
- * `ci/ally-head-attested` did not succeed until 07:48:37Z — 2m10s after the
- * removal, with `policy` gating the heavy matrix behind it for ~6 minutes more.
- *
- * Every gate in `classifyPr` — the settle floor, `checks:none`, the Ally
- * verdict at head, the owner set — was evaluated against the OLD head and says
- * nothing about the new one. Re-reading the SHA is what makes those verdicts
- * mean what the receipt claims they mean.
- *
- * `--auto` is not a substitute. On a queue-enabled base GitHub enqueues
- * immediately whenever it believes the requirements are met, and right after a
- * head moves that belief is briefly stale: #3060 carries an
- * `added_to_merge_queue` event with no `auto_merge_enabled` beside it.
- */
-export function liveHeadSha(repo, number, run = gh) {
-  const raw = JSON.parse(
-    run(["pr", "view", String(number), "--repo", repo, "--json", "headRefOid"]),
-  )?.headRefOid;
-  return typeof raw === "string" && raw.length > 0 ? raw : null;
-}
-
-const short = (sha) => (typeof sha === "string" ? sha.slice(0, 7) : String(sha));
-
 export function applyRow(repo, row, run = gh) {
   if (row.action === "enqueue") {
     // PEN-4887: fail CLOSED on anything but a proven-unchanged head. An
@@ -761,7 +761,25 @@ export function applyRow(repo, row, run = gh) {
           "every check and review verdict in this row describes the previous head",
       );
     }
-    run(["pr", "merge", String(row.number), "--repo", repo, "--auto", "--rebase"]);
+    // Ally review, 2nd pass: the re-read above narrows the window but is still
+    // check-then-act — the head can move between `pr view` and `pr merge`.
+    // `--match-head-commit` closes it on GitHub's side: the request carries the
+    // SHA every gate in this row was evaluated against, and GitHub refuses the
+    // merge outright if the head no longer matches. The re-read is kept in
+    // front of it rather than replaced, because it is what produces the
+    // attributable `enqueue-failed` message naming both SHAs; this flag's
+    // refusal surfaces as a generic `gh` failure, which is the right backstop
+    // but the poorer receipt.
+    //
+    // Verified against the live API on #3063 (2026-10-28) with a deliberately
+    // non-matching SHA: GitHub answered `expected head oid does not match the
+    // current head oid (enablePullRequestAutoMerge)` and auto-merge was NOT
+    // armed. So the flag composes with `--auto` and is enforced server-side on
+    // the auto-merge path, not just on an immediate merge.
+    run([
+      "pr", "merge", String(row.number), "--repo", repo,
+      "--auto", "--rebase", "--match-head-commit", row.headSha,
+    ]);
     // Deliberately not "armed": this call queues, arms, or merges outright
     // depending on the base, and the receipt must not name the one it guessed.
     return "merge requested";

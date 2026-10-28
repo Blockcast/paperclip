@@ -680,20 +680,40 @@ const PEN4887_ENQUEUED_AT = "2026-10-28T07:46:17Z";
 const PEN4887_DEQUEUED_AT = "2026-10-28T07:46:27Z";
 
 /**
- * #3060's head as the check surfaces actually reported it. The four commit
- * STATUSES had already succeeded before the removal; every check run was
- * either unstarted at the removal or completed minutes after it. This mix is
- * the point -- see the "zero completed" test below.
+ * #3060's head as the check surfaces actually reported it, verbatim -- the
+ * full status HISTORY rather than a hand-deduped summary of it, because the
+ * history is what `ghHeadChecks` hands the classifier.
+ *
+ * `GET commits/{sha}/statuses` returns one row per POST, so the two contexts
+ * that had succeeded before the removal each appear FOUR times on `87a87dc0`:
+ * twice at 07:46, before the 07:46:27Z dequeue, and twice more when they were
+ * re-posted at 07:48, after it. Two of those contexts therefore STRADDLE the
+ * dequeue, which is the shape that made an earlier revision of this fixture
+ * (four rows, pre-deduped) score a bug as correct: counting rows reported both
+ * contexts as "not complete at removal" via their 07:48 re-posts.
+ *
+ * Every check run, by contrast, was either unstarted at the removal or
+ * completed minutes after it. That mix is the point -- see the "zero
+ * completed" test below.
  */
 const PEN4887_HEAD_CHECKS = [
-  { name: "gate/ally-comment-findings", conclusion: "success", completedAt: "2026-10-28T07:46:19Z" },
-  { name: "review/ally-comment", conclusion: "success", completedAt: "2026-10-28T07:46:21Z" },
-  { name: "gate/ally-comment-findings", conclusion: "success", completedAt: "2026-10-28T07:46:23Z" },
-  { name: "review/ally-comment", conclusion: "success", completedAt: "2026-10-28T07:46:24Z" },
-  { name: "ci/ally-head-attested", conclusion: "success", completedAt: "2026-10-28T07:48:37Z" },
-  { name: "policy", conclusion: null, completedAt: null },
-  { name: "Build", conclusion: null, completedAt: null },
-  { name: "Typecheck + Release Registry", conclusion: null, completedAt: null },
+  { name: "gate/ally-comment-findings", conclusion: "success", completedAt: "2026-10-28T07:46:19Z", surface: "status" },
+  { name: "review/ally-comment", conclusion: "success", completedAt: "2026-10-28T07:46:21Z", surface: "status" },
+  { name: "gate/ally-comment-findings", conclusion: "success", completedAt: "2026-10-28T07:46:23Z", surface: "status" },
+  { name: "review/ally-comment", conclusion: "success", completedAt: "2026-10-28T07:46:24Z", surface: "status" },
+  // --- the 07:46:27Z dequeue falls here ---
+  { name: "gate/ally-comment-findings", conclusion: "success", completedAt: "2026-10-28T07:48:30Z", surface: "status" },
+  { name: "review/ally-comment", conclusion: "success", completedAt: "2026-10-28T07:48:31Z", surface: "status" },
+  { name: "gate/ally-comment-findings", conclusion: "success", completedAt: "2026-10-28T07:48:35Z", surface: "status" },
+  { name: "review/ally-comment", conclusion: "success", completedAt: "2026-10-28T07:48:36Z", surface: "status" },
+  // `/check-runs` defaults to `filter=latest`, so these arrive one row per
+  // name. `ci/ally-head-attested` is a check RUN on this head, not a status --
+  // the status surface is exactly `gate/ally-comment-findings` and
+  // `review/ally-comment`, verified on `87a87dc0`.
+  { name: "ci/ally-head-attested", conclusion: "success", completedAt: "2026-10-28T07:48:37Z", surface: "check_run" },
+  { name: "policy", conclusion: null, completedAt: null, surface: "check_run" },
+  { name: "Build", conclusion: null, completedAt: null, surface: "check_run" },
+  { name: "Typecheck + Release Registry", conclusion: null, completedAt: null, surface: "check_run" },
 ];
 
 const admissionRejection = (overrides = {}) =>
@@ -767,17 +787,139 @@ test("PEN-4887 (the other side): a genuine un-stageable eviction still classifie
   );
 });
 
-test("PEN-4887: 'zero completed checks' alone is NOT the discriminator -- #3060 had four completions before removal", () => {
-  // Guards the measured correction that shaped this fix. Four commit statuses
+test("PEN-4887: 'zero completed checks' alone is NOT the discriminator -- #3060 had completions before removal", () => {
+  // Guards the measured correction that shaped this fix. Commit statuses
   // succeeded between the enqueue and the removal, so a predicate of the form
   // "nothing had completed" is FALSE on the very case it was meant to catch.
   const evidence = admissionRejection();
 
-  assert.equal(evidence.completedByDequeue, 4, "four statuses succeeded at or before 07:46:27Z");
+  assert.equal(
+    evidence.completedByDequeue,
+    2,
+    "two CONTEXTS succeeded at or before 07:46:27Z. The eight status rows on this head are those two posted " +
+      "four times each; counting rows would say four, which is what the first revision of this fix reported.",
+  );
   assert.ok(
     evidence.rejected,
     "the verdict must survive those completions -- it rests on the fresh-head window plus the existential " +
       "'something had not finished', never on a universal 'nothing completed'.",
+  );
+});
+
+test("PEN-4887 (Ally review, 2nd pass): a context posted twice, straddling the dequeue, counts ONCE and as complete", () => {
+  // `GET commits/{sha}/statuses` returns the full post history, not the latest
+  // state per context. Both contexts below succeeded BEFORE the 07:46:27Z
+  // removal and were re-posted at 07:48, after it. Classifying row by row put
+  // each of them in BOTH buckets -- and the notice then printed two finished
+  // checks under "Not complete at removal", which is the cause line naming the
+  // wrong cause.
+  const evidence = admissionRejection();
+
+  for (const name of ["gate/ally-comment-findings", "review/ally-comment"]) {
+    assert.ok(
+      !evidence.incompleteAtDequeue.includes(name),
+      `\`${name}\` succeeded at 07:46:2xZ, before the removal. Its 07:48 re-post must not resurrect it as ` +
+        "unfinished -- the notice prints this list verbatim.",
+    );
+  }
+
+  assert.equal(
+    evidence.incompleteAtDequeue.length,
+    new Set(evidence.incompleteAtDequeue).size,
+    "a context must never be named twice; duplicates are posts, not contexts",
+  );
+  assert.deepEqual(
+    evidence.incompleteAtDequeue,
+    ["ci/ally-head-attested", "policy", "Build", "Typecheck + Release Registry"],
+    "exactly the contexts with no terminal row at or before the dequeue",
+  );
+  assert.equal(
+    evidence.checkCount,
+    6,
+    "twelve rows, six distinct contexts -- `checkCount` is the denominator the notice prints, so it must " +
+      "count contexts and not posts",
+  );
+});
+
+test("PEN-4887 (Ally review, 2nd pass): the collapse is anchored to the dequeue, not to the latest row", () => {
+  // Why `GET commits/{sha}/status` (combined, latest-per-context) is NOT the
+  // fix: its "latest" is latest OVERALL. On #3060 that is the 07:48:35Z
+  // re-post, AFTER the removal, so both contexts would still read as
+  // incomplete -- the same wrong answer by a different route. The collapse has
+  // to pick the latest row at or before the dequeue, which only the history
+  // can supply.
+  const pendingThenGreen = [
+    { name: "policy", conclusion: "pending", completedAt: "2026-10-28T07:46:20Z", surface: "status" },
+    { name: "policy", conclusion: "success", completedAt: "2026-10-28T07:48:00Z", surface: "status" },
+  ];
+
+  const evidence = admissionRejection({ headChecks: pendingThenGreen });
+
+  assert.deepEqual(
+    evidence.incompleteAtDequeue,
+    ["policy"],
+    "`policy` was still pending when the queue ruled at 07:46:27Z; it went green 93s later. Taking the " +
+      "latest row overall would read it as complete and date the verdict to when the detector ran.",
+  );
+  assert.equal(evidence.completedByDequeue, 0);
+  assert.equal(evidence.checkCount, 1, "two posts, one context");
+  assert.equal(evidence.rejected, true);
+});
+
+test("PEN-4887 (Ally review, 2nd pass): a check run and a status sharing a name stay separate contexts", () => {
+  // Not hypothetical: measured on #3060's own head, `gate/ally-comment-findings`
+  // is BOTH a commit status that succeeded at 07:46:23Z -- before the
+  // 07:46:27Z removal -- and a check run that did not conclude until
+  // 07:48:35Z, after it. (`ci/ally-head-attested` is the same shape.)
+  //
+  // Collapsing the two surfaces by bare name would let the green status mask
+  // the unstarted check run, dropping a genuinely unmet context from the
+  // evidence. That is the fail-OPEN direction, the one this file refuses to
+  // move in, and it would have bitten on the very PR this fix was written for.
+  const evidence = admissionRejection({
+    headChecks: [
+      { name: "gate/ally-comment-findings", conclusion: "success", completedAt: "2026-10-28T07:46:23Z", surface: "status" },
+      { name: "gate/ally-comment-findings", conclusion: null, completedAt: "2026-10-28T07:48:35Z", surface: "check_run" },
+    ],
+  });
+
+  assert.equal(evidence.checkCount, 2, "same name, two surfaces, two contexts");
+  assert.equal(evidence.completedByDequeue, 1, "the status completed before the removal");
+  assert.deepEqual(
+    evidence.incompleteAtDequeue,
+    ["gate/ally-comment-findings (check run)"],
+    "the unfinished check run must survive the dedupe, and must say which surface it is -- the notice prints " +
+      "this list verbatim, and a bare name here sits beside an identically-named context that DID finish, " +
+      "which reads exactly like the defect the dedupe fixes",
+  );
+});
+
+test("PEN-4887 (Ally review, 2nd pass): an unambiguous name is never qualified with its surface", () => {
+  // The qualifier is for collisions only. Tagging every name would make the
+  // common notice noisier for no reader benefit.
+  const evidence = admissionRejection();
+
+  assert.ok(
+    evidence.incompleteAtDequeue.every((name) => !/\((check run|status)\)$/.test(name)),
+    `no name on this fixture collides across surfaces, so none may be qualified: ${evidence.incompleteAtDequeue}`,
+  );
+});
+
+test("PEN-4887 (Ally review, 2nd pass): on an identical timestamp the terminal row wins (fails toward the old verdict)", () => {
+  // Two rows for one context at the same second is reachable -- statuses carry
+  // whole-second precision and are posted in bursts. Counting the context as
+  // COMPLETE makes `rejected` less likely, which keeps the status-quo verdict;
+  // the opposite tie-break would manufacture incompleteness.
+  const sameSecond = [
+    { name: "gate/ally-comment-findings", conclusion: "pending", completedAt: "2026-10-28T07:46:19Z", surface: "status" },
+    { name: "gate/ally-comment-findings", conclusion: "success", completedAt: "2026-10-28T07:46:19Z", surface: "status" },
+  ];
+
+  assert.deepEqual(admissionRejection({ headChecks: sameSecond }).incompleteAtDequeue, []);
+  assert.deepEqual(
+    admissionRejection({ headChecks: [...sameSecond].reverse() }).incompleteAtDequeue,
+    [],
+    "and the tie-break must not depend on the order the API happened to return the rows in",
   );
 });
 
@@ -976,9 +1118,9 @@ test("PEN-4887: the head date is read from the COMMITTER date, not the author da
 test("PEN-4887: ghHeadChecks returns BOTH surfaces -- check runs and commit statuses", () => {
   // Reading only /check-runs would report "nothing completed" for a head whose
   // status contexts had reported, which is the fail-open direction for the
-  // incompleteness guard. #3060's four pre-removal completions were ALL
-  // statuses, so this union is the difference between the guard working and
-  // the guard being vacuous.
+  // incompleteness guard. BOTH of #3060's pre-removal completions were
+  // statuses and no check run had concluded by then, so this union is the
+  // difference between the guard working and the guard being vacuous.
   //
   // Asserted behaviourally, through the `exec` seam, rather than by grepping
   // the source for the two URLs: a fetch whose result is dropped on the floor
@@ -989,17 +1131,27 @@ test("PEN-4887: ghHeadChecks returns BOTH surfaces -- check runs and commit stat
     if (args.some((arg) => String(arg).includes("/check-runs"))) {
       return '{"name":"Build","conclusion":null,"completedAt":null}\n';
     }
-    return '{"name":"ci/ally-head-attested","conclusion":"success","completedAt":"2026-10-28T07:48:37Z"}\n';
+    return '{"name":"review/ally-comment","conclusion":"success","completedAt":"2026-10-28T07:46:24Z"}\n';
   };
 
   const checks = ghHeadChecks("Blockcast/paperclip", "87a87dc0", exec);
 
   assert.deepEqual(
     checks.map((check) => check.name).sort(),
-    ["Build", "ci/ally-head-attested"],
+    ["Build", "review/ally-comment"],
     `expected one entry from each surface; calls were:\n${calls.join("\n")}`,
   );
   assert.equal(calls.length, 2, "both surfaces must actually be read");
+
+  // Ally review, 2nd pass: each entry must say WHICH surface it came from, or
+  // `classifyAdmissionEvidence` collapses the two namespaces by bare name and
+  // a green status can mask an unstarted check run of the same name. Asserted
+  // here because that dedupe is the only consumer -- without this, dropping
+  // the tag from the jq leaves every test green.
+  assert.deepEqual(
+    Object.fromEntries(checks.map((check) => [check.name, check.surface])),
+    { Build: "check_run", "review/ally-comment": "status" },
+  );
 });
 
 test("PEN-4887: ghHeadChecks returns null -- not [] -- when a surface cannot be read", () => {

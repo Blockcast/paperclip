@@ -762,7 +762,34 @@ describe("applyRow", () => {
     // Not "armed": the same call queues, arms, or merges outright depending on
     // the base, and this defect was a receipt naming an action it had not taken.
     assert.equal(outcome, "merge requested");
-    assert.deepEqual(calls.at(-1), ["pr", "merge", "7", "--repo", "o/r", "--auto", "--rebase"]);
+    assert.deepEqual(calls.at(-1), [
+      "pr", "merge", "7", "--repo", "o/r", "--auto", "--rebase", "--match-head-commit", HEAD,
+    ]);
+  });
+
+  /**
+   * Ally review, 2nd pass. The re-read above is check-then-act: the head can
+   * still move between `pr view` and `pr merge`. `--match-head-commit` hands
+   * GitHub the SHA every gate in this row was evaluated against, so the server
+   * refuses the merge atomically if the head moved inside that window.
+   *
+   * What this pins down is that the flag is present and carries the row's own
+   * head rather than a constant or an unrelated SHA. It cannot distinguish
+   * `row.headSha` from the re-read value, because the guard above has already
+   * thrown unless the two are equal -- that equality is the point, not an
+   * untested branch.
+   */
+  it("pins the merge to the head the row was classified against, atomically", () => {
+    const calls = [];
+    applyRow("o/r", { number: 7, action: "enqueue", headSha: HEAD }, (args) => {
+      calls.push(args);
+      return JSON.stringify({ headRefOid: HEAD });
+    });
+
+    const merge = calls.at(-1);
+    const pinned = merge[merge.indexOf("--match-head-commit") + 1];
+    assert.equal(pinned, HEAD, "the pin must be the classified head");
+    assert.notEqual(pinned, OTHER);
   });
 
   /**

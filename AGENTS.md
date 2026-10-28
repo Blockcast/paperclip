@@ -563,10 +563,11 @@ then woke an agent to perform a no-op rebase. The classifier now reports that sh
 wasted — do not make it.
 
 The same rule holds for any other way a head moves: a push, a branch update, a `--admin` merge
-upstream. `scripts/land-clean-prs.mjs` enforces it mechanically (it re-reads the head SHA immediately
-before enqueuing and refuses when it moved), because its classification snapshot is taken once per
-fire. Manual enqueues have no such guard.
-
+upstream. `scripts/land-clean-prs.mjs` enforces it mechanically, because its classification snapshot
+is taken once per fire: it re-reads the head SHA immediately before enqueuing and refuses when it
+moved, then passes `--match-head-commit` so GitHub itself rejects the merge if the head moves inside
+the remaining window. Manual enqueues have neither guard — if you must enqueue by hand, pass
+`--match-head-commit <sha>` yourself.
 
 ## 12. Definition of Done
 
