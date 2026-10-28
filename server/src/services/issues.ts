@@ -11478,6 +11478,23 @@ export function issueService(db: Db) {
         // to describe. The sweep carries an independent `parkedWakeFiredAt < parkedAt`
         // backstop so a future writer that forgets this line degrades to a late wake
         // rather than to permanent silence.
+        //
+        // ⚠️ PEN-4894: THIS LINE is why `parkedWakeFiredAt` is not an audit record of park
+        // wakes. A park wake that works dispatches a run, and that run routinely re-parks
+        // the row -- which lands here and erases the stamp the sweep just wrote. So the
+        // field systematically deletes its own positive cases (measured: 7 of 7 fired,
+        // 0 of 7 still recorded 45 minutes later), and degrades as the release edge gets
+        // MORE reliable. That is correct for a fire-once claim marker, which is all this
+        // column is; it is wrong for anyone reading the issue row to ask "did park wakes
+        // fire?", and the three reader-facing surfaces (the Drizzle column, the shared
+        // `Issue` type, and `issue-park-expiry.ts`) now say so and point at
+        // `GET /api/issues/:id/diagnostics/wakes` instead.
+        //
+        // Preserving the stamp across a re-park was considered and declined: the `lt`
+        // backstop means it would not break fire-once, but the marker is also rolled back
+        // when `enqueueWakeup` throws, so the field would become durable-except-sometimes
+        // -- a field that is right most of the time invites exactly the confident wrong
+        // reading this comment exists to prevent. The per-event log is the audit surface.
         patch.parkedWakeFiredAt = null;
       }
 
