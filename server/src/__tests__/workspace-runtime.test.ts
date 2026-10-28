@@ -35,6 +35,9 @@ import {
   ensureRuntimeServicesForRun,
   executeProcessForTests,
   GIT_INDEX_LOCK_STALE_MS,
+  GitCommandTimeoutError,
+  createGitLinkExclusivelyForTests,
+  isInconclusiveGitFailureForTests,
   inspectManagedGitWorktreeBranch,
   isProcessGroupAliveForTests,
   listConfiguredRuntimeServiceEntries,
@@ -8188,6 +8191,137 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
     expect((await readGit(worktreePath, ["rev-parse", "--show-toplevel"])).trim())
       .toBe(await fs.realpath(worktreePath));
   }, 20_000);
+
+  // PEN-4877: the two ways `relinkHuskGitWorktree` called a healthy husk
+  // unrepairable. Both are concurrency/load sensitive, so they are asserted at
+  // the primitive rather than by winning the race -- the contended-pair probe
+  // above detects defect 1 at ~0.075% and is not a mutation check on its own.
+
+  it("publishes the .git link only once it is complete, so no observer sees a half-written one (PEN-4877)", async () => {
+    // The primitive is content-agnostic, so this drives it with a payload large
+    // enough that a create which is atomic in NAME but not in CONTENT leaves an
+    // observable window every time. That is the point: contention alone exposes
+    // the defect at ~0.075%, which is not a mutation check. At this size the
+    // pre-fix `writeFile(..., { flag: "wx" })` was measured red on 5 of 5 trials
+    // (4-9 short reads each) and the staged-then-`link` create green on 5 of 5.
+    const content = `gitdir: ${"x".repeat(8 * 1024 * 1024)}\n`;
+    const partials: number[] = [];
+
+    for (let round = 0; round < 3; round += 1) {
+      const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pen4877-atomic-"));
+      const target = path.join(dir, ".git");
+      let polling = true;
+      const observer = (async () => {
+        while (polling) {
+          const seen = await fs.readFile(target, "utf8").catch(() => null);
+          if (seen !== null && seen.length !== content.length) partials.push(seen.length);
+          await new Promise((resolve) => setImmediate(resolve));
+        }
+      })();
+
+      expect(await createGitLinkExclusivelyForTests(target, dir, content)).toBe("created");
+      polling = false;
+      await observer;
+
+      expect(await fs.readFile(target, "utf8")).toBe(content);
+      // And the staging file is gone, so a checkout never sees untracked noise.
+      expect((await fs.readdir(dir)).filter((name) => name !== ".git")).toEqual([]);
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+
+    expect(partials).toEqual([]);
+  }, 40_000);
+
+  it("reports the race lost without clobbering the winner's link (PEN-4877)", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pen4877-exists-"));
+    const target = path.join(dir, ".git");
+    await fs.writeFile(target, "gitdir: /winner\n", "utf8");
+
+    expect(await createGitLinkExclusivelyForTests(target, dir, "gitdir: /loser\n")).toBe("exists");
+    // Exclusivity is the property the winner/loser determination rests on: a
+    // create that overwrote here would destroy a link that is already correct.
+    expect(await fs.readFile(target, "utf8")).toBe("gitdir: /winner\n");
+    expect((await fs.readdir(dir)).filter((name) => name !== ".git")).toEqual([]);
+  }, 20_000);
+
+  it("reports a staging dir it cannot use as unsupported, so the caller degrades instead of refusing (PEN-4877)", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pen4877-unsupported-"));
+    const target = path.join(dir, ".git");
+
+    expect(await createGitLinkExclusivelyForTests(target, path.join(dir, "absent"), "gitdir: /x\n"))
+      .toBe("unsupported");
+    // "unsupported" must not have published a partial target: the caller takes
+    // that branch to retry with the plain exclusive write.
+    expect(existsSync(target)).toBe(false);
+  }, 20_000);
+
+  it("tells a stall and a spawn failure apart from a real non-zero exit (PEN-4877)", async () => {
+    // A real spawn failure, from the real process runner -- not a hand-built
+    // stand-in, because the whole discriminator rests on which fields node
+    // actually sets on this error.
+    const spawnFailure = await executeProcessForTests({
+      command: path.join(os.tmpdir(), `absent-git-${randomUUID()}`),
+      args: [],
+      cwd: os.tmpdir(),
+    }).then(() => null, (error: unknown) => error);
+    expect((spawnFailure as NodeJS.ErrnoException | null)?.code).toBe("ENOENT");
+    expect(isInconclusiveGitFailureForTests(spawnFailure)).toBe(true);
+
+    expect(isInconclusiveGitFailureForTests(
+      new GitCommandTimeoutError("git rev-parse --show-toplevel timed out after 1ms", { stdout: "" }),
+    )).toBe(true);
+
+    // The one shape that IS evidence about the checkout: `runGit` throws a
+    // plain Error built from stderr when git ran and exited non-zero.
+    expect(isInconclusiveGitFailureForTests(new Error("fatal: not a git repository"))).toBe(false);
+    expect(isInconclusiveGitFailureForTests(null)).toBe(false);
+  }, 20_000);
+
+  it("keeps a correct .git when git cannot be run, and removes it only on a real verdict (PEN-4877)", async () => {
+    const previous = process.env.PAPERCLIP_SERVER_GIT;
+    const restore = () => {
+      if (previous === undefined) delete process.env.PAPERCLIP_SERVER_GIT;
+      else process.env.PAPERCLIP_SERVER_GIT = previous;
+    };
+    try {
+      // Side A -- no verdict. Node cannot start git at all, which the old
+      // catch-all read as "this worktree does not resolve" and acted on by
+      // deleting the link it had just written correctly.
+      const inconclusive = await createDirtyMismatchRepo({
+        expectedBranch: "PAP-4877-a",
+        actualBranch: "PAP-4877-a-live",
+      });
+      const inconclusiveDotGit = path.join(inconclusive.worktreePath, ".git");
+      await fs.rm(inconclusiveDotGit);
+      process.env.PAPERCLIP_SERVER_GIT = path.join(inconclusive.repoRoot, "no-such-git");
+
+      expect(await relinkHuskGitWorktree(inconclusive.repoRoot, inconclusive.worktreePath)).toBe(false);
+      expect(existsSync(inconclusiveDotGit)).toBe(true);
+      restore();
+      // The link it kept is the correct one -- so the refusal was transient and
+      // the next wake succeeds, rather than the husk being recreated.
+      expect((await readGit(inconclusive.worktreePath, ["rev-parse", "--show-toplevel"])).trim())
+        .toBe(await fs.realpath(inconclusive.worktreePath));
+
+      // Side B -- a real verdict. git ran and answered, so the link must still
+      // be removed. Without this the fix would score identically to "never
+      // clean up", which is the wrong repair in the other direction.
+      const verdict = await createDirtyMismatchRepo({
+        expectedBranch: "PAP-4877-b",
+        actualBranch: "PAP-4877-b-live",
+      });
+      const verdictDotGit = path.join(verdict.worktreePath, ".git");
+      await fs.rm(verdictDotGit);
+      const failingGit = path.join(verdict.repoRoot, "failing-git.sh");
+      await fs.writeFile(failingGit, "#!/bin/sh\necho 'fatal: not a git repository' >&2\nexit 128\n", { mode: 0o755 });
+      process.env.PAPERCLIP_SERVER_GIT = failingGit;
+
+      expect(await relinkHuskGitWorktree(verdict.repoRoot, verdict.worktreePath)).toBe(false);
+      expect(existsSync(verdictDotGit)).toBe(false);
+    } finally {
+      restore();
+    }
+  }, 40_000);
 
   it("refuses dirty quarantine repair while the execution workspace has an active runtime service", async () => {
     const expectedBranch = "PAP-458-recorded";

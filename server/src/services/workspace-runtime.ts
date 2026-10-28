@@ -1181,7 +1181,7 @@ export function resolveServerGitInvocation(
  * deterministic failure (e.g. "not a git repository"). The message is unchanged
  * from the historical string so existing `gitErrorIncludes` matching still works.
  */
-class GitCommandTimeoutError extends Error {
+export class GitCommandTimeoutError extends Error {
   /**
    * Whatever the command had already written to stdout before it was killed,
    * raw and untrimmed.
@@ -4050,6 +4050,87 @@ async function hasLinkedGitWorktreeRegistration(repoRoot: string, worktreePath: 
 }
 
 /**
+ * Did `runGit` fail *without reaching a verdict* about the repository?
+ *
+ * `runGit` throws on three distinct conditions and only one of them is evidence
+ * about the checkout:
+ *
+ * - `GitCommandTimeoutError` -- the budget expired while git was still running.
+ * - a **spawn failure** -- node could not start git at all (ENOENT, EAGAIN or
+ *   EMFILE under threadpool/fd pressure). `executeProcess` surfaces these by
+ *   rejecting with the child's `error` event, so they arrive as system errors
+ *   carrying `syscall`; the non-zero-exit `Error` built from stderr never has
+ *   one, which is what makes this a sound discriminator rather than a guess.
+ * - a **non-zero exit** -- git ran and answered. That one IS a verdict.
+ *
+ * Callers must not act destructively on an inconclusive failure. Same
+ * distinction BLO-18784/BLO-47493/BLO-42089 draw elsewhere in this file: a
+ * stall is not a finding.
+ */
+function isInconclusiveGitFailure(error: unknown): boolean {
+  if (error instanceof GitCommandTimeoutError) return true;
+  return typeof (error as NodeJS.ErrnoException | null)?.syscall === "string";
+}
+
+/**
+ * Create `worktreePath/.git` exclusively *and atomically in content*.
+ *
+ * `fs.writeFile(..., { flag: "wx" })` is `open(O_CREAT|O_EXCL)` followed by a
+ * **separate** `write()`, with an await and a threadpool round-trip between
+ * them. A concurrent run gets `EEXIST` the moment the *name* appears, which can
+ * be before the `gitdir:` line is in it -- so the loser reads an empty `.git`
+ * and reports a perfectly healthy worktree unrepairable (PEN-4877; measured at
+ * 0.075% of contended pairs, and the rate rises with threadpool pressure, i.e.
+ * exactly under CI load).
+ *
+ * Staging the full content first and then `link()`ing it into place keeps the
+ * exclusive-create semantics -- `link` fails `EEXIST` if the target exists, so
+ * the winner/loser determination is unchanged -- while making the name atomic
+ * in content: `.git` is never observable without its `gitdir:` line.
+ *
+ * The staged file lives in the admin dir, not the worktree, so a hard kill
+ * between `link` and the cleanup cannot leave untracked noise inside a
+ * checkout. A mount that refuses hard links (or spans devices, `EXDEV`) is
+ * reported as `"unsupported"` so the caller degrades to the previous `wx`
+ * write rather than to a refusal.
+ */
+async function createGitLinkExclusively(
+  dotGit: string,
+  stagingDir: string,
+  content: string,
+): Promise<"created" | "exists" | "unsupported"> {
+  const staged = path.join(stagingDir, `.relink-${randomUUID()}.tmp`);
+  try {
+    await fs.writeFile(staged, content);
+  } catch {
+    return "unsupported";
+  }
+  try {
+    await fs.link(staged, dotGit);
+    return "created";
+  } catch (error) {
+    // Only EEXIST means "another run won the race". Everything else is this
+    // mount declining hard links, which must not read as a concurrent winner.
+    return (error as NodeJS.ErrnoException | null)?.code === "EEXIST" ? "exists" : "unsupported";
+  } finally {
+    await fs.rm(staged, { force: true }).catch(() => {});
+  }
+}
+
+/**
+ * Test seams for the two PEN-4877 primitives.
+ *
+ * Both are deliberately internal to the re-link path, and both failure modes
+ * they exist to fix are invisible from `relinkHuskGitWorktree`'s boolean
+ * result alone: the atomicity window is sub-millisecond and the
+ * verdict-vs-no-verdict split only shows up as *whether `.git` survives*. The
+ * exclusive-create contract and the error discriminator are therefore asserted
+ * directly, same rationale as `executeProcessForTests`.
+ */
+export const createGitLinkExclusivelyForTests = createGitLinkExclusively;
+export const isInconclusiveGitFailureForTests = isInconclusiveGitFailure;
+
+/**
  * BLO-49622: re-link a husk worktree — a dir whose `.git` link file is gone
  * while its registration under `<repoRoot>/.git/worktrees/<id>` survives. The
  * registration's `gitdir` names this exact `.git`, so writing the link back is
@@ -4079,18 +4160,48 @@ export async function relinkHuskGitWorktree(repoRoot: string, worktreePath: stri
   };
   const adminDir = await withReclaimFsDeadline(findAdminDir(), adminRoot).catch(() => null);
   if (!adminDir) return false;
-  const resolvesToSelf = async () => {
-    const topLevel = await runGit(["rev-parse", "--show-toplevel"], worktreePath).catch(() => null);
+  /**
+   * Tri-state on purpose (PEN-4877):
+   * - `true`  -- git resolved this path as its own top level.
+   * - `false` -- git ran and said otherwise. A real verdict about the worktree.
+   * - `null`  -- git could not be asked (stall or spawn failure). NOT a verdict.
+   *
+   * The old catch-all `.catch(() => null)` collapsed the last two, so a
+   * transient blip read identically to "this worktree does not resolve" -- and
+   * the caller then deleted a `.git` it had just written correctly.
+   */
+  const resolvesToSelf = async (): Promise<boolean | null> => {
+    let topLevel: string;
+    try {
+      topLevel = await runGit(["rev-parse", "--show-toplevel"], worktreePath);
+    } catch (error) {
+      return isInconclusiveGitFailure(error) ? null : false;
+    }
     return !!topLevel
       && await resolvePathForWorktreeComparison(topLevel) === await resolvePathForWorktreeComparison(worktreePath);
   };
-  try {
-    await fs.writeFile(dotGit, `gitdir: ${adminDir}\n`, { flag: "wx" });
-  } catch {
-    // A concurrent run re-linked it first (EEXIST): healthy, not a refusal.
-    return resolvesToSelf();
+  const content = `gitdir: ${adminDir}\n`;
+  let created = await createGitLinkExclusively(dotGit, adminDir, content);
+  if (created === "unsupported") {
+    // This mount refuses hard links. Degrade to the previous behaviour rather
+    // than to a refusal: no worse than before, and still exclusive by name.
+    created = await fs.writeFile(dotGit, content, { flag: "wx" }).then(
+      () => "created" as const,
+      () => "exists" as const,
+    );
   }
-  if (await resolvesToSelf()) return true;
+  if (created === "exists") {
+    // A concurrent run re-linked it first: healthy, not a refusal. An
+    // inconclusive probe is reported as not-yet-linked, which is a refusal this
+    // call does not act on -- never a reason to touch the winner's link.
+    return (await resolvesToSelf()) === true;
+  }
+  const verdict = await resolvesToSelf();
+  if (verdict === true) return true;
+  // Only a verdict earns the removal. Deleting the link on an inconclusive
+  // probe would re-husk a worktree we just repaired, turning a transient git
+  // failure into persistent damage -- strictly worse than refusing this wake.
+  if (verdict === null) return false;
   await fs.rm(dotGit, { force: true });
   return false;
 }
