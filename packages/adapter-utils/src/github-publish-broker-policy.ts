@@ -338,11 +338,17 @@ export function admitInvocation(tool: BrokeredTool, argv: readonly string[], env
  * Resolve the working directory a request asked for, or refuse it.
  *
  * The broker shares the agent's workspace volume — it has to, because it runs
- * git against the agent's repository. Confining `cwd` to that volume is what
- * stops a request naming a directory inside the broker's OWN filesystem: a
- * `cwd` of `/etc/paperclip/secrets/github-token` plus a `gh` invocation that
- * reads a file-backed body relative to it is a direct read of the credential
- * through a process that is allowed to read it.
+ * git against the agent's repository. Confining `cwd` to that volume stops a
+ * request naming a directory inside the broker's OWN filesystem, so that a
+ * tool resolving a RELATIVE path cannot be aimed at one.
+ *
+ * ⚠ That is all it does. It is not what stops a tool reading a broker-local
+ * file, because `gh` takes ABSOLUTE paths for its file-backed inputs
+ * (`--body-file`, `gh api --input`, `-F field=@file`) and an absolute path
+ * does not care what the working directory is. {@link admitCallerFilePaths} is
+ * the rule that covers those; this one covers the directory they would
+ * otherwise be resolved against. Both are needed and neither subsumes the
+ * other.
  *
  * Compared after resolution, so `..` cannot walk out, and with a trailing
  * separator so `/paperclip-evil` does not pass a `/paperclip` prefix test.
@@ -365,11 +371,115 @@ export function resolveBrokerCwd(
     throw new PublishBrokerRefusal(`refusing a working directory that does not resolve: \`${cwd}\``);
   }
   const root = realpath(workspaceRoot);
-  if (resolved !== root && !resolved.startsWith(root.endsWith(path.sep) ? root : `${root}${path.sep}`)) {
+  if (!isUnderRoot(resolved, root)) {
     throw new PublishBrokerRefusal(
       `refusing a working directory outside the shared workspace: \`${cwd}\` resolves to \`${resolved}\`, ` +
         `which is not under \`${root}\`.`,
     );
   }
   return resolved;
+}
+
+/** Is `candidate` the directory `root`, or something under it? */
+function isUnderRoot(candidate: string, root: string): boolean {
+  return candidate === root || candidate.startsWith(root.endsWith(path.sep) ? root : `${root}${path.sep}`);
+}
+
+/**
+ * Every spelling of a filesystem path a single argv token could be.
+ *
+ * Three forms, because `gh` accepts all three and the token is one string:
+ *
+ *  - `--body-file /tmp/b.md` — the path IS the token.
+ *  - `--body-file=/tmp/b.md` — the path follows an `=`.
+ *  - `-F body=@/tmp/b.md`    — the path follows an `@`, and `gh api` reads it.
+ *
+ * Returned as CANDIDATES rather than as "the path argument", because this
+ * module deliberately does not model which `gh` flags take files. A denylist
+ * of file-bearing flags would have to grow every time the CLI does, and a
+ * missing entry would fail OPEN — the shape {@link REFUSED_GH_SUBCOMMANDS}
+ * can accept because the config dir backs it up, and this one cannot, because
+ * there is nothing behind it. Treating every token as a possible path costs a
+ * `realpath` per token and cannot miss a flag that has not been invented yet.
+ */
+export function filePathCandidates(token: string): string[] {
+  const out = [token];
+  const eq = token.indexOf("=");
+  if (eq > 0) out.push(token.slice(eq + 1));
+  for (const form of [...out]) {
+    const at = form.indexOf("@");
+    // `@-` is gh's spelling for stdin, not a path.
+    if (at >= 0 && form.slice(at + 1) !== "-") out.push(form.slice(at + 1));
+  }
+  return out.filter((c) => c.length > 0 && c !== "-");
+}
+
+export interface FilePathConfinement {
+  /** Directories a request's file arguments may resolve into. */
+  allowedRoots: readonly string[];
+  /** Resolved working directory, for relative candidates. */
+  cwd: string;
+  realpath: (p: string) => string;
+}
+
+/**
+ * Refuse a request whose arguments name a file the AGENT cannot open but the
+ * BROKER can.
+ *
+ * The broker's filesystem is not the agent's: it holds the credential mount,
+ * and it is the only container that does. `gh` reads file-backed inputs by
+ * path — `--body-file`, `gh api --input`, `-F field=@file`, `gh ssh-key add
+ * <file>` — and none of those care about the working directory when given an
+ * absolute path. Without this rule the only thing standing between
+ * `gh issue comment --body-file /etc/paperclip/secrets/github-token/token` and
+ * a published credential is the content scrubber, and §8 of the decision
+ * document is explicit that the scrubber is a mistake guard, not a boundary.
+ *
+ * The rule is positional, not lexical: a candidate is refused when it RESOLVES
+ * to something that EXISTS outside every allowed root.
+ *
+ *  - Existing and outside → refused. That is the whole hazard class, and it
+ *    catches a symlink planted in the shared `/tmp` because the comparison is
+ *    made after `realpath`.
+ *  - Non-existent → admitted. There is nothing to read, and this is what keeps
+ *    `gh api /repos/o/r/pulls` working: an API path is absolute and is not a
+ *    file. Refusing on the nearest existing ANCESTOR instead would refuse
+ *    exactly that call, since its ancestor is `/`.
+ *  - Existing and inside → admitted. This is the `--body-file /tmp/x.md`
+ *    channel the shared `/tmp` exists for.
+ *
+ * Applied to the CALLER's argv, before the broker prepends its own config —
+ * the broker's `credential.helper` assignment names a real path in the image,
+ * outside every allowed root, and it is not caller input.
+ *
+ * ⚠ This is a read confinement. A write to a path outside the roots is not
+ * refused here; it is refused by the broker running non-root against an image
+ * it does not own. Recorded in §7.3 rather than claimed as closed.
+ */
+export function admitCallerFilePaths(argv: readonly string[], confinement: FilePathConfinement): void {
+  const roots = confinement.allowedRoots.map((root) => {
+    try {
+      return confinement.realpath(root);
+    } catch {
+      return root;
+    }
+  });
+  for (const token of argv) {
+    for (const candidate of filePathCandidates(token)) {
+      const absolute = path.isAbsolute(candidate) ? candidate : path.resolve(confinement.cwd, candidate);
+      let resolved: string;
+      try {
+        resolved = confinement.realpath(absolute);
+      } catch {
+        continue; // Names nothing on disk; there is no file here to read.
+      }
+      if (roots.some((root) => isUnderRoot(resolved, root))) continue;
+      throw new PublishBrokerRefusal(
+        `refusing an argument that names a file outside the shared workspace: \`${token}\` resolves to ` +
+          `\`${resolved}\`. The broker's filesystem holds the push credential, so a tool it runs may only ` +
+          `read files the agent could have read too — under ${roots.map((r) => `\`${r}\``).join(" or ")}. ` +
+          "Copy what you need into the shared /tmp and name it there.",
+      );
+    }
+  }
 }
