@@ -133,20 +133,23 @@ describe("PEN-1198 audit dependency remediation", () => {
     const overrides = rootPackageJson.pnpm.overrides;
 
     expect(overrides["@connectrpc/connect-node>undici"]).toBe(
-      ">=6.28.1 <7",
+      ">=6.29.1 <7",
     );
-    expect(overrides["jsdom>undici"]).toBe(">=7.29.1 <8");
+    expect(overrides["jsdom>undici"]).toBe(">=7.30.1 <8");
     expect(overrides["js-yaml"]).toBe(">=4.3.2 <5");
-    expect(overrides.multer).toBe(">=2.3.0 <3");
-    expect(serverPackageJson.dependencies.multer).toBe("^2.3.0");
+    expect(overrides.multer).toBe(">=2.5.0 <3");
+    expect(serverPackageJson.dependencies.multer).toBe("^2.5.0");
   });
 
   it("documents the advisories that the patched ranges address", () => {
     const remediations = rootPackageJson.securityAuditRemediations["PEN-1198"];
 
     expect(remediations["@connectrpc/connect-node>undici"]).toMatchObject({
-      patchedRange: ">=6.28.1 <7",
+      patchedRange: ">=6.29.1 <7",
       advisories: expect.arrayContaining([
+        // BLO-48925: GHSA-xjj6-f33q-929c (CVE-2026-109869) also has a 6.x
+        // arm (>=6.23.0 <6.29.1), raising the floor from 6.28.1 to 6.29.1.
+        "GHSA-xjj6-f33q-929c",
         // BLO-38291: GHSA-rfgv-xxqx-mfg5 (CVE-2026-19534) raised the floor
         // from 6.27.0 to 6.28.1. The advisories below are still addressed —
         // their patch versions are lower — so this stays one entry.
@@ -156,8 +159,11 @@ describe("PEN-1198 audit dependency remediation", () => {
       ]),
     });
     expect(remediations["jsdom>undici"]).toMatchObject({
-      patchedRange: ">=7.29.1 <8",
+      patchedRange: ">=7.30.1 <8",
       advisories: expect.arrayContaining([
+        // BLO-48926: GHSA-xjj6-f33q-929c (CVE-2026-109869) raised the floor
+        // from 7.29.1 to 7.30.1.
+        "GHSA-xjj6-f33q-929c",
         // BLO-38290: GHSA-w293-vg96-wgc3 (CVE-2026-84961) raised the floor
         // from 7.29.0 to 7.29.1. The advisories below are still addressed —
         // their patch versions are lower — so this stays one entry.
@@ -175,7 +181,7 @@ describe("PEN-1198 audit dependency remediation", () => {
       ]),
     });
     expect(remediations.multer).toMatchObject({
-      patchedRange: ">=2.3.0 <3",
+      patchedRange: ">=2.5.0 <3",
       advisories: expect.arrayContaining([
         "GHSA-72gw-mp4g-v24j",
         "GHSA-3p4h-7m6x-2hcm",
@@ -183,6 +189,10 @@ describe("PEN-1198 audit dependency remediation", () => {
         // from 2.2.0 to 2.3.0. The two advisories above are still addressed —
         // 2.3.0 is above their 2.2.0 patch — so this stays one entry.
         "GHSA-535w-7cp7-47q4",
+        // BLO-48924: GHSA-q7qp-rjg7-q26m (CVE-2026-113872) raised the floor
+        // from 2.3.0 to 2.5.0. Everything above patches lower, so this stays
+        // one entry.
+        "GHSA-q7qp-rjg7-q26m",
       ]),
     });
     expect(remediations["js-yaml"]).toMatchObject({

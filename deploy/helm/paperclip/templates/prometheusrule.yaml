@@ -161,6 +161,38 @@
       detector that already exists. The manual Argo sync gate (BLO-19095)
       still separates "in the ConfigMap" from "deployed".
 
+  STATUS of the PEN-4145 transient-retry clamp-signature alert, same
+  auditability rule:
+
+    - ADDED HERE 2026-10-27 as PaperclipTransientRetryClampSignature, in the
+      same change that adds the counter it reads
+      (paperclip_transient_retry_floor_total, server/src/services/metrics.ts).
+      NOT yet in onprem-k8s at the time of writing -- the companion PR is
+      opened against Blockcast/onprem-k8s alongside this one, because this
+      header's own rule is that a rule landing only here is dead code. Verify:
+        gh api repos/Blockcast/onprem-k8s/contents/monitoring/prometheus-rules-2-configmap.yaml \
+          -H 'Accept: application/vnd.github.raw' \
+          | grep -c PaperclipTransientRetryClampSignature
+      and remember shard membership is arbitrary -- grep all of
+      monitoring/prometheus-rules-{1..5}-configmap.yaml, not just shard 2.
+
+    - THIS ALERT HAS *THREE* GATES, not the usual two, and the third is the one
+      worth stating. (1) the onprem-k8s merge, (2) the manual `monitoring-rules`
+      Argo sync (BLO-19095), and (3) a paperclip release carrying the counter --
+      the rule reads a metric that ships in the SERVER IMAGE, so it is inert,
+      silently and in the healthy direction, until that image is deployed. A
+      green `/api/v1/rules` is therefore NOT sufficient evidence here; confirm
+      the series exists with
+      `count by (disposition, alignment) (paperclip_transient_retry_floor_total)`
+      returning 12 per pod before recording this as detecting anything.
+
+    - Why that matters more than usual for this one: the gap it closes IS a
+      detection-latency gap, and the failure it exists to catch already hid for
+      six weeks behind exactly this shape of "shipped but not actually
+      reporting". An alert recorded as live while one of the three gates is
+      unmet reproduces PEN-2509's own failure mode one layer up. See the
+      runbook section `transient-retry-clamp-signature-pen-4145`.
+
   ============================================================================
   PEN-4479 -- MEASURED DRIFT LEDGER, and the recorded decision on a guard
   ============================================================================
@@ -883,13 +915,45 @@ spec:
           # It must also be in `on()`: a one-to-one match with `on(...)` keeps
           # ONLY the listed labels on the result, so `on(routine_id)` alone
           # silently strips company_id back off the alert (promtool-verified).
-          expr: max by (routine_id, company_id) (paperclip_routine_last_done_fire_age_seconds and on(instance) (paperclip_routine_fire_gap_metrics_refresh_success == 1)) > on(routine_id, company_id) ({{ .Values.prometheusRule.routineFireGapIntervalMultiplier }} * min by (routine_id, company_id) (paperclip_routine_fire_interval_seconds and on(instance) (paperclip_routine_fire_gap_metrics_refresh_success == 1)))
+          #
+          # PEN-4647: the left-hand side is the MAX OF TWO AGES. It read
+          # paperclip_routine_last_done_fire_age_seconds alone, which measures
+          # time since a fire reached `done` -- NOT time since one STARTED.
+          # Those diverge in the dominant failure mode: an execution row
+          # wedged open eats the fires behind it (`skip_if_active` +
+          # `skip_missed`), and the moment that stale row finally completes
+          # the completion age resets to ~0 and the alert RESOLVES, with no
+          # fire having occurred. It failed OPEN, mid-outage.
+          #
+          # Measured on routine b3ba3b33 (`0 9 * * 1-5`): the gauge fell
+          # 278.34h -> 0.062h at 2026-10-19T10:00Z when an 11-day-old row
+          # completed, and 23.56h -> 0.441h at 2026-10-20T10:00Z when a
+          # 36-day-old one did. Neither was a firing; the next real execution
+          # row landed 2026-10-21T09:00Z, ~47h after the alert called it over.
+          #
+          # Taking the max keeps BOTH faults covered, which a straight
+          # replacement would not: firing age high means it has stopped
+          # dispatching (PEN-4647), completion age high means it dispatches
+          # and the work then dies before reaching `done` (the original
+          # BLO-32638 case, which firing age alone is blind to).
+          #
+          # `{__name__=~...}` rather than `or`: the set-operator
+          # signature ignores __name__, so with both series present `a or b`
+          # keeps a and DROPS b -- the legacy arm would win every time and the
+          # fix would be inert. Promtool-verified both ways.
+          #
+          # This expression also degrades cleanly: while the control plane has
+          # not yet shipped paperclip_routine_last_fire_start_age_seconds the
+          # regex matches one series and this reduces to the pre-PEN-4647
+          # rule, so the two repos need not land in the same minute to avoid a
+          # blind window.
+          expr: max by (routine_id, company_id) ({__name__=~"paperclip_routine_last_(done_fire|fire_start)_age_seconds"} and on(instance) (paperclip_routine_fire_gap_metrics_refresh_success == 1)) > on(routine_id, company_id) ({{ .Values.prometheusRule.routineFireGapIntervalMultiplier }} * min by (routine_id, company_id) (paperclip_routine_fire_interval_seconds and on(instance) (paperclip_routine_fire_gap_metrics_refresh_success == 1)))
           for: {{ .Values.prometheusRule.routineFireGapFor }}
           labels:
             severity: warning
           annotations:
-            summary: "Paperclip routine {{`{{ $labels.routine_id }}`}} has not completed a fire in {{ .Values.prometheusRule.routineFireGapIntervalMultiplier }}x its own cadence"
-            description: "Routine {{`{{ $labels.routine_id }}`}} last completed a fire {{`{{ $value }}`}}s ago, more than {{ .Values.prometheusRule.routineFireGapIntervalMultiplier }}x the longest gap its own cron schedules (BLO-32638). The age is only trusted while paperclip_routine_fire_gap_metrics_refresh_success is 1. The routine is still `active` with an enabled schedule trigger, so this is not a deliberate pause -- it is either not dispatching, or its fires are dispatching and then dying before the execution issue reaches `done`. Those are different faults with different evidence: check paperclip_routine_dispatch_total for the first, and the routine's recent `routine_runs` rows for the second. A never-fired routine reports its age from creation, so a large value on a young routine means it has never worked at all rather than that it stopped."
+            summary: "Paperclip routine {{`{{ $labels.routine_id }}`}} has not fired, or not completed a fire, in {{ .Values.prometheusRule.routineFireGapIntervalMultiplier }}x its own cadence"
+            description: "Routine {{`{{ $labels.routine_id }}`}} last fired, or last completed a fire, {{`{{ $value }}`}}s ago -- more than {{ .Values.prometheusRule.routineFireGapIntervalMultiplier }}x the longest gap its own cron schedules (BLO-32638, PEN-4647). That value is the WORSE of two ages; read both before triaging.\n\nThe two are paperclip_routine_last_fire_start_age_seconds and paperclip_routine_last_done_fire_age_seconds, both keyed on this routine_id. FIRING age high (both high) means it has STOPPED DISPATCHING -- check paperclip_routine_dispatch_total and the trigger's nextRunAt, and look for an open row with originKind=routine_execution and originId equal to this routine_id: under skip_if_active such a row eats the fires queued behind it, which is what drives BOTH ages up. FIRING age low but COMPLETION age high means it IS still dispatching and its runs are dying or wedging before the execution issue reaches `done` -- the original BLO-32638 condition: find that same open row, inspect it, and close it only if it is stale. It may be a legitimately long-running execution, so do not close live work. Either way do not re-create the routine -- the routine itself is fine. Both ages count any dispatched run whatever its source, so running the routine by hand resets them: do not hand-run it as a diagnostic while this alert is open (PEN-4651). The ages are only trusted while paperclip_routine_fire_gap_metrics_refresh_success is 1. The routine is still `active` with an enabled schedule trigger, so this is not a deliberate pause. A routine that has never fired reports its age from creation, so a large value on a young routine means it has never worked at all rather than that it stopped."
             runbook_url: {{ .Values.prometheusRule.routineFireGapRunbookUrl | quote }}
         - alert: PaperclipRoutineFireGapMetricsRefreshFailed
           # Separate from the gap alert for the same reason as the queued-run
@@ -1125,6 +1189,95 @@ spec:
             summary: "Paperclip scheduled-retry park-horizon metric refresh is failing"
             description: "The most recent /metrics scheduled-retry park-horizon database refresh failed (BLO-25036), so PaperclipScheduledRetryParkHorizonImplausible is gated off and its snapshot may be stale. Check Paperclip logs and database connectivity; do not interpret a stale zero as an empty scheduled_retry population."
             runbook_url: {{ .Values.prometheusRule.scheduledRetryParkHorizonRunbookUrl | quote }}
+    - name: paperclip-transient-retry-clamp-signature
+      rules:
+        - alert: PaperclipTransientRetryClampSignature
+          # PEN-4145. This alert exists because its subject was UNOBSERVABLE,
+          # not because it was unmonitored in the ordinary sense.
+          #
+          # PEN-2509 routes a `transient_failure` retry floor down one of two
+          # branches -- adopt the capacity arithmetic's own output verbatim, or
+          # disperse a raw provider instant with per-run jitter -- and until
+          # paperclip_transient_retry_floor_total neither branch emitted a
+          # counter, a gauge or a log line above `debug`. The only durable trace
+          # that a dispersion decision had been made was the
+          # `scheduled_retry_at` value itself, on a run row.
+          #
+          # The cost of that is measured, not hypothetical. The first PEN-2509
+          # fix shipped 2026-08-29 keyed its exemption on
+          # `providerCapacityResetProvenance`, which the finalize path writes for
+          # every recovered reset, so it exempted precisely the population that
+          # herds. It was live, fleet-wide and WRONG for six weeks and was caught
+          # only when @Ceo re-measured by hand on 2026-10-12 and found the clamp
+          # signature still at 16.55% (160/967, ~99x chance), with 4 agents
+          # sharing `scheduledRetryAt` to 0.000s. PR #2709 fixed the predicate.
+          # This rule fixes the blindness that hid the first attempt.
+          #
+          # WHY A SHARE AND NOT A COUNT. The clamp arrives in bursts tied to
+          # upstream flapping: 0 parks/day measured 2026-10-13..15 against
+          # 132/day on 2026-10-05. No count threshold can both catch a regression
+          # during a burst and stay quiet outside one. The aligned SHARE of floor
+          # decisions is scale-free and does not drift with upstream failure
+          # rate, exactly as PaperclipGithubWorkflowRunMassCancellation above
+          # reasons about cancellation share rather than cancellation count.
+          #
+          # WHY WHOLE-SECOND ALIGNMENT IS THE DISCRIMINATOR. `jitterTransient
+          # RetryFloor` adds `Math.floor(sample * windowMs)` MILLISECONDS, so a
+          # dispersed instant lands on a whole second with p~1/1000 and on the
+          # :M9:59 ten-minute grid with p~1/600,000, while a verbatim provider
+          # instant lands on one with p~1. That four-order-of-magnitude gap is
+          # what makes the test work on a population of tens rather than
+          # thousands -- spread needs a cohort, alignment needs one row.
+          #
+          # THE THRESHOLD, derived rather than picked. Measured in
+          # transient-retry-floor-clamp-signature.test.ts over 200k deterministic
+          # draws: a dispersed population reads 0.0995% aligned, a verbatim one
+          # reads 100%. Recorded pre-fix baselines are 20.43% (153/749)
+          # unconditional and 94.03% (126/134) within the clamped population. So
+          # 0.05 sits 50x above the healthy reading and 4x BELOW the weakest
+          # recorded regression -- it detects a repeat that is only a quarter as
+          # severe as the original. Both bounds are pinned in that test, so an
+          # edit crossing either fails CI rather than silently producing an alert
+          # that cannot fire or cannot stay quiet.
+          #
+          # THE SAMPLE FLOOR IS LOAD-BEARING, NOT BELT-AND-BRACES. A zero
+          # numerator over a zero denominator must not read as healthy: that 0/0
+          # is the exact false clear that closed PEN-2509 in August with AC4
+          # recorded as "unmeasurable-at-close, sample size 0". At n=30 it takes
+          # TWO aligned parks to cross 5% -- P(>=2 | n=30, p=0.001) ~ 4e-4 -- while
+          # ONE aligned park reads 3.3% and deliberately does not cross, so a
+          # single chance hit on an almost-idle fleet cannot page. Below 30 the
+          # ratio is not read at all, and that silence means "not measured", NOT
+          # "measured healthy".
+          #
+          # `for: 10m` IS REACHABLE, which is the fourth trap this rule is shaped
+          # against. A `for:` longer than a typical burst is unsatisfiable and the
+          # alert never fires. Here the WINDOW carries the smoothing, not `for:`:
+          # `increase(...[24h])` holds a burst inside the range for a full day, so
+          # a single 132-park burst keeps the ratio crossed for ~24h and 10m of
+          # debounce is close to none. The alert is correspondingly cheap to
+          # satisfy and expensive to flake -- the opposite trade from a short
+          # window with a long `for:`.
+          #
+          # DO NOT alert on absent() here. Every disposition x alignment series is
+          # zero-seeded at registry construction, deliberately, so that
+          # `increase()` can see a 0->1 transition at all; absence means the pod
+          # is not exporting, which the scrape-health alerts own.
+          expr: |
+            (
+              sum(increase(paperclip_transient_retry_floor_total{alignment=~"whole_second|ten_minute_grid"}[24h]))
+              /
+              clamp_min(sum(increase(paperclip_transient_retry_floor_total[24h])), 1)
+            ) >= {{ .Values.prometheusRule.transientRetryClampSignatureRatio }}
+            and
+            sum(increase(paperclip_transient_retry_floor_total[24h])) >= {{ .Values.prometheusRule.transientRetryClampSignatureMinSamples }}
+          for: {{ .Values.prometheusRule.transientRetryClampSignatureFor }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Paperclip transient_failure retry floors are landing on a shared grid again (aligned share of floor decisions over 24h >= {{ .Values.prometheusRule.transientRetryClampSignatureRatio }}, healthy is ~0.001)"
+            description: "The aligned share of transient_failure retry-FLOOR decisions over the last 24h has reached {{ .Values.prometheusRule.transientRetryClampSignatureRatio }} across at least {{ .Values.prometheusRule.transientRetryClampSignatureMinSamples }} decisions (PEN-4145); healthy is ~0.001. The PEN-2509 herd is re-forming -- a cohort is being parked onto a shared wake instant and will resume in lockstep. FIRST break down by disposition, which says which failure this is.\n\n`sum by (disposition, alignment) (increase(paperclip_transient_retry_floor_total[24h]))`. Alignment concentrated in disposition=~\"exempt_.*\" means the exemption predicate is routing a verbatim provider instant down the exempt branch -- the PEN-2509 signature exactly; read `isCapacityGovernedRetryFloor` in services/ccrotate-capacity-retry.ts. The two exempt values are split on purpose: a predicate regression does not move the exempt SHARE, it moves which marker produces it, so compare exempt_capacity_governed against exempt_horizon_clamped rather than the pair against dispersed.\n\nAlignment in disposition=\"dispersed\" instead means the jitter itself has stopped working (check TRANSIENT_RETRY_FLOOR_JITTER_MAX_MS and the `random` injection) -- a different and rarer defect. alignment=\"ten_minute_grid\" implicates an advertised `retry_after_seconds` reset adopted verbatim, since that horizon is computed off a 10-minute bucket edge.\n\nConfirm against the rows, looking for agents sharing an instant to 0.000s: `select id, agent_id, scheduled_retry_at, scheduled_retry_reason, scheduled_retry_attempt from heartbeat_runs where scheduled_retry_reason = 'transient_failure' and scheduled_retry_at is not null and updated_at > now() - interval '24 hours' order by scheduled_retry_at`.\n\nA reading below {{ .Values.prometheusRule.transientRetryClampSignatureMinSamples }} samples is NOT a healthy reading -- it is an unmeasured one, which is how this regression hid for six weeks. Measured baselines: a dispersed population reads 0.0995% aligned, a verbatim one 100%; pre-fix was 20.43% (153/749) unconditional and 94.03% (126/134) within the clamped population."
+            runbook_url: {{ .Values.prometheusRule.transientRetryClampSignatureRunbookUrl | quote }}
     - name: paperclip-plugin-lifecycle
       rules:
         - alert: PaperclipPluginCriticalErrored

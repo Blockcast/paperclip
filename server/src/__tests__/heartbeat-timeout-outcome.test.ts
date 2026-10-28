@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { formatTimeoutMessage } from "@paperclipai/adapter-utils/server-utils";
 import {
   isConfirmedAdapterTimeout,
   isFalseAdapterTimeoutResult,
@@ -35,16 +36,16 @@ describe("heartbeat timeout outcome", () => {
     })).toBe(false);
   });
 
-  it("does not suppress a non-timeout error that accompanies exit zero", () => {
-    const result = {
+  it("ignores errorMessage text; a non-timeout error code still blocks suppression", () => {
+    // BLO-23296: the decision is structural. A genuine non-timeout failure has
+    // to be carried by errorCode or by structured evidence in resultJson.
+    expect(isFalseAdapterTimeoutResult({
       timedOut: true,
       exitCode: 0,
       errorMessage: "Result publication failed",
-      errorCode: "timeout",
-      resultJson: { summary: "work completed" },
-    };
-    expect(isFalseAdapterTimeoutResult(result)).toBe(false);
-    expect(isSuccessfulAdapterResult(result)).toBe(false);
+      errorCode: "adapter_failed",
+      resultJson: null,
+    })).toBe(false);
   });
 
   it.each([
@@ -74,5 +75,76 @@ describe("heartbeat timeout outcome", () => {
     };
     expect(isFalseAdapterTimeoutResult(result)).toBe(true);
     expect(isSuccessfulAdapterResult(result)).toBe(true);
+  });
+
+  // Mirrors the finalize branch order in heartbeat.ts (timed_out, then success, else failed).
+  function finalize(result: Parameters<typeof isSuccessfulAdapterResult>[0]) {
+    if (isConfirmedAdapterTimeout(result)) return "timed_out";
+    return isSuccessfulAdapterResult(result) ? "succeeded" : "failed";
+  }
+
+  describe("structural false-timeout matcher (BLO-23296)", () => {
+    const falseTimeout = (errorMessage: string, resultJson: Record<string, unknown> | null = null) => ({
+      timedOut: true,
+      exitCode: 0,
+      errorMessage,
+      errorCode: "timeout",
+      resultJson,
+    });
+
+    it("finalizes a non-legacy-message false timeout as succeeded", () => {
+      expect(finalize(falseTimeout("Timed out after 384s (limit 3600s)"))).toBe("succeeded");
+    });
+
+    it("finalizes a genuine timeout (exitCode !== 0) as timed_out", () => {
+      expect(finalize({ ...falseTimeout("Timed out after 3600s (limit 3600s)"), exitCode: 137 })).toBe("timed_out");
+      expect(finalize({ ...falseTimeout("Timed out after 3600s (limit 3600s)"), exitCode: null })).toBe("timed_out");
+    });
+
+    it("finalizes a structured-failure result as failed", () => {
+      expect(finalize(falseTimeout("Timed out after 384s (limit 3600s)", { error: "Result publication failed" }))).toBe("failed");
+    });
+
+    it("still finalizes a legacy-message false timeout as succeeded", () => {
+      expect(finalize(falseTimeout("Timed out after 3600s"))).toBe("succeeded");
+    });
+
+    // The vendored claude_k8s adapter (`buildTimeoutExecutionResult`) emits
+    // `errorCode: "timeout"` with non-legacy text and the pod's real exit code.
+    // Its exact output is pinned by `execute: timeout result construction` in
+    // vendor/paperclip-adapter-claude-k8s/src/server/execute.test.ts; this pins
+    // how the server finalizes it. Under the old regex an exit-0 run here
+    // finalized `failed`; it must now be `succeeded`.
+    const claudeK8sTimeout = (exitCode: number | null) => ({
+      exitCode,
+      signal: null,
+      timedOut: true,
+      errorCode: "timeout",
+      errorMessage: "Timed out after 7200s (Job activeDeadlineSeconds; adapter timeoutSec=0)",
+      resultJson: { observedTimeoutSec: 7200, observedTimeoutSource: "job_deadline", configuredTimeoutSec: 0 },
+    });
+
+    it("finalizes a claude_k8s exit-0 timeout as succeeded", () => {
+      expect(finalize(claudeK8sTimeout(0))).toBe("succeeded");
+    });
+
+    it("finalizes a claude_k8s non-zero or unknown-exit timeout as timed_out", () => {
+      expect(finalize(claudeK8sTimeout(137))).toBe("timed_out");
+      expect(finalize(claudeK8sTimeout(null))).toBe("timed_out");
+    });
+  });
+
+  describe("formatTimeoutMessage (BLO-23296)", () => {
+    it("reports measured elapsed time, not the configured timeoutSec", () => {
+      const startedAt = "2026-08-08T00:00:00.000Z";
+      const now = Date.parse(startedAt) + 384_000; // 6m24s, as on run 90ac448e
+      const message = formatTimeoutMessage(3600, startedAt, now);
+      expect(message).not.toBe("Timed out after 3600s");
+      expect(message).toBe("Timed out after 384s (limit 3600s)");
+    });
+
+    it("omits the duration when no start time is known", () => {
+      expect(formatTimeoutMessage(3600, null)).toBe("Timed out (limit 3600s)");
+    });
   });
 });

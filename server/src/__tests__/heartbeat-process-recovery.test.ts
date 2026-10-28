@@ -2997,7 +2997,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     // Blockcast/multicast#778: the notice fired twice telling the assignee to
     // push a new head; the review it declared absent landed on that exact head
     // 72 minutes after the second notice, and a push would have voided it plus
-    // both pending markers plus 10/10 green required contexts.
+    // 10/10 green required contexts. (PEN-4663: the pending markers used to be
+    // counted here too. They are not a cost of a push -- see below.)
     // Regex, not substring: master's own replacement wording was "pushing a new
     // head voids any at-head attestation and is the last resort" — the same
     // destructive advice one inflection apart, which toContain("push a new
@@ -3009,10 +3010,24 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     // forever 4h11m. BLO-34410 invites re-measurement, and a re-measure should
     // not turn a correct notice into a red test.
     expect(notice[0]?.body).toMatch(/p50 of ~\d+h\d+m/);
-    // ...and the three things a push actually costs, named.
+    // ...and the two things a push actually costs, named.
     expect(notice[0]?.body).toContain("still in flight");
-    expect(notice[0]?.body).toContain("pending review-request marker at the old head");
     expect(notice[0]?.body).toContain("green required-check set");
+    // PEN-4663: it must NOT name a third cost that does not exist. A new head
+    // does not void a pending review-request marker: the marker request wakes
+    // under `github_pr_review_requested`, which buildPrReviewerWakeIdempotencyKey
+    // keys to the GitHub COMMENT ID, not the head -- only `github_pr_synchronized`
+    // is head-scoped (PEN-2865). Regex and not substring, and two of them, so the
+    // clause cannot come back by paraphrase: #2980 caught this exact wording
+    // propagating into a `gateSignals` doc-string, which is how PEN-4663 was found.
+    expect(notice[0]?.body).not.toMatch(/voids every pending review-request marker/i);
+    expect(notice[0]?.body).not.toMatch(/marker[^.]{0,60}at the old head/i);
+    // The support that replaced it must be the honest one: a push DOES wake the
+    // reviewer, so the warning argues from cost rather than from ineffectiveness.
+    // Asserted positively, because dropping the clause and leaving a bare
+    // prohibition would satisfy the negatives above while losing the reason.
+    expect(notice[0]?.body).toMatch(/argument from cost, not from ineffectiveness/i);
+    expect(notice[0]?.body).toMatch(/push DOES wake the reviewer/i);
     // The fix must not strip the notice's useful content: run id, head, PR URL.
     expect(notice[0]?.body).toContain(runId);
     expect(notice[0]?.body).toContain("https://github.com/Blockcast/libmmt/pull/444");
@@ -4782,6 +4797,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       },
     });
     const heartbeat = createHeartbeat();
+    heartbeat.__test_unsafelyTrackActiveRunExecution(runId);
 
     const result = await heartbeat.drainRunningRunsForShutdown(
       "SIGTERM",
@@ -4840,6 +4856,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     const { companyId, agentId, runId, issueId } = await seedRunFixture({ agentStatus: "running" });
     const { siblingIssueId, retryRunId } = await seedAdoptedRetryAndSiblingLock({ companyId, agentId, runId });
     const heartbeat = createHeartbeat();
+    heartbeat.__test_unsafelyTrackActiveRunExecution(runId);
 
     const result = await heartbeat.drainRunningRunsForShutdown("SIGTERM", new Date("2026-03-19T00:06:00.000Z"));
     expect(result.interruptedRunIds).toEqual([runId]);
@@ -4861,6 +4878,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         },
       })
       .where(eq(heartbeatRuns.id, runId));
+    heartbeat.__test_unsafelyTrackActiveRunExecution(runId);
 
     const result = await heartbeat.drainRunningRunsForShutdown(
       "SIGTERM",
@@ -4903,6 +4921,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       agentStatus: "running",
     });
     const heartbeat = createHeartbeat();
+    heartbeat.__test_unsafelyTrackActiveRunExecution(runId);
 
     await db
       .update(heartbeatRuns)
@@ -4946,6 +4965,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       agentStatus: "running",
     });
     const heartbeat = createHeartbeat();
+    heartbeat.__test_unsafelyTrackActiveRunExecution(runId);
 
     await heartbeat.drainRunningRunsForShutdown("SIGTERM", new Date("2026-03-19T00:06:00.000Z"));
     const firstRetry = await db
@@ -4987,6 +5007,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       agentStatus: "running",
     });
     const heartbeat = createHeartbeat();
+    heartbeat.__test_unsafelyTrackActiveRunExecution(runId);
 
     await heartbeat.drainRunningRunsForShutdown("SIGTERM", new Date("2026-03-19T00:06:00.000Z"));
     const firstRetry = await db
@@ -5008,6 +5029,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .update(issues)
       .set({ checkoutRunId: firstRetry!.id, executionRunId: firstRetry!.id, updatedAt: new Date("2026-03-19T00:07:00.000Z") })
       .where(eq(issues.id, issueId));
+    heartbeat.__test_unsafelyTrackActiveRunExecution(firstRetry!.id);
 
     const secondDrain = await heartbeat.drainRunningRunsForShutdown(
       "SIGTERM",
@@ -5038,6 +5060,32 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .then((rows) => rows[0] ?? null);
     expect(issue?.checkoutRunId).toBeNull();
     expect(issue?.executionRunId).toBeNull();
+  });
+
+  // BLO-49138: with replicas > 1, a `status = running` scan selected the peer
+  // replica's runs too; paperclip-1's drain killed 10 live k8s Jobs on 2026-10-24.
+  it("leaves a running run this worker does not own untouched on graceful shutdown (BLO-49138)", async () => {
+    const { runId } = await seedRunFixture({ agentStatus: "running" });
+    const heartbeat = createHeartbeat();
+
+    const result = await heartbeat.drainRunningRunsForShutdown("SIGTERM", new Date("2026-03-19T00:06:00.000Z"));
+
+    expect(result.interruptedRunIds).toEqual([]);
+    const run = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then((rows) => rows[0]);
+    expect(run?.status).toBe("running");
+    expect(run?.errorCode).toBeNull();
+  });
+
+  it("leaves this worker's own external-lifecycle run running so restart reattach keeps its Job (BLO-49138)", async () => {
+    const { runId } = await seedRunFixture({ agentStatus: "running", adapterType: "claude_k8s" });
+    const heartbeat = createHeartbeat();
+    heartbeat.__test_unsafelyTrackActiveRunExecution(runId);
+
+    const result = await heartbeat.drainRunningRunsForShutdown("SIGTERM", new Date("2026-03-19T00:06:00.000Z"));
+
+    expect(result.interruptedRunIds).toEqual([]);
+    const run = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then((rows) => rows[0]);
+    expect(run?.status).toBe("running");
   });
 
   it("releases active environment leases when an orphaned run is reaped", async () => {

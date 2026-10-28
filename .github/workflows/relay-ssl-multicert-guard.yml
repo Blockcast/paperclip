@@ -76,7 +76,7 @@ permissions:
 
 jobs:
   gateway-only-shape:
-    runs-on: default
+    runs-on: arc-paperclip-light
     timeout-minutes: 10
     steps:
       - name: Checkout repository

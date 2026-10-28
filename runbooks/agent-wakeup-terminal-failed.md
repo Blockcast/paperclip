@@ -135,6 +135,7 @@ wake table has no `error_code` column, only free-text `error`.
 | `caveman_proxy_not_ready` | the Caveman proxy missed its readiness budget before the agent process started | infra fault; re-request once proxy startup is healthy ([BLO-33279](https://paperclip.blockcast.net/BLO/issues/BLO-33279)) |
 | `adapter_failed` / `process_lost` | infrastructure fault below the agent | re-request once infra is healthy |
 | `skill_materialization_pending` | the agent's skill catalog source was unreachable, so the run was refused before any Job was created | transient infra fault; the run is bounded-retried, so check for a successor before re-requesting ([BLO-35668](https://paperclip.blockcast.net/BLO/issues/BLO-35668)) |
+| `k8s_pod_schedule_failed` | the reviewer pod never started (e.g. stuck `PodInitializing` until its budget expired, typically one node's container runtime stalling) | node/infra fault; find the node, and re-request only once pods schedule and start there again ([BLO-49060](https://paperclip.blockcast.net/BLO/issues/BLO-49060)) |
 | `agent_not_found` | the wake targeted an agent that no longer resolves | do **not** re-request; fix the routing |
 | `none` | no run row, or no code recorded (e.g. the "deferred wake could not be promoted" path) | inspect `w.error` prose |
 | `other` | a code missing from `KNOWN_TERMINAL_FAILED_WAKE_ERROR_CODES` | triage it into that list in `server/src/services/metrics.ts` |

@@ -1,0 +1,164 @@
+# PEN-4841. Run the read-only stranded-approval-lock detector hourly, so a lock
+# that no rollout can ever satisfy is DETECTED rather than discovered by the
+# next production deploy failing at its approval step.
+#
+# WHY THIS EXISTS. scripts/check-stranded-approval-lock.sh shipped under
+# BLO-41774 with no caller. Nothing ran it, so all three occurrences of the
+# condition were found by accident:
+#
+#   BLO-31598  lock taken, pre-helm failure
+#   BLO-41478 / PEN-4513  landed, then `helm upgrade --atomic` rolled back
+#   PEN-4841   landed cleanly, then a `kubectl rollout restart` mutated the pod
+#              template out from under the lock, so the server-plan hash the
+#              lock recorded can never match again
+#
+# On PEN-4841 the lock stranded at 2026-10-26T19:06:15Z and was found at
+# 2026-10-27T08:0xZ — 12.5 h later, by a human checking whether something else
+# had deployed, after the 07:23Z slot had already burned a run. With this
+# workflow the same lock is reported at 19:53Z, ~47 min after it stranded and
+# ~11.5 h before that deploy.
+#
+# ON THE SIGNAL BOUNDARY. A stranded lock is NOT the condition
+# scheduled-production-deploy.yml's conclusion means. PEN-2848 made that
+# workflow's red mean "a production approval is stuck past its threshold", and
+# its own source says the dispatcher's conclusion "must not start meaning
+# 'housekeeping failed'". Hosting this check inside that workflow was considered
+# and rejected for exactly that reason: it is a different condition with a
+# different remedy, and folding it in would degrade the one deploy signal that
+# currently works. It gets its own workflow and its own alertname.
+#
+# ON THE CREDENTIAL, and the trade-off taken (read before "fixing" this).
+# The detector issues two `get` calls:
+#   ConfigMap/paperclip-api-approved-images  (ns paperclip-release-approvals)
+#   Deployment/paperclip-api                 (ns paperclip)
+# Both are inside secrets.KUBECONFIG_PAPERCLIP_CI_DEPLOY's existing grants, and
+# that is the least-privilege credential for the job. It is NOT used here,
+# because it is an ENVIRONMENT secret of `paperclip-production` (verified
+# 2026-10-27 via GET .../environments/paperclip-production/secrets), so reading
+# it requires declaring `environment: paperclip-production` — and a job that
+# declares an environment creates a GitHub *deployment record*. That environment
+# currently carries exactly one record per daily deploy, which is a legible
+# production-deploy audit trail; an hourly detector would add ~24/day and bury
+# it. Degrading an audit surface to read a ConfigMap is the wrong trade.
+#
+# So this uses secrets.BLOCKCAST_KUBE_CONFIG_B64, the repo-level credential
+# relay-ssl-multicert-guard.yml already uses from this same lane, hourly and
+# green. It grants this workflow NO authority that lane did not already have.
+#
+# ⚠️ ITS RBAC FOR THESE TWO OBJECTS IS UNVERIFIED — it could not be tested
+# without running this workflow. That uncertainty is SELF-REPORTING and cannot
+# produce a false all-clear: the detector exits 2 on an unreadable object, which
+# this job alerts on under its own alertname and reds on. If the first scheduled
+# run exits 2 with a forbidden/not-found message, the fallback is to declare
+# `environment: paperclip-production` and switch to KUBECONFIG_PAPERCLIP_CI_DEPLOY,
+# accepting the deployment-record cost above. Do not instead widen the kubeconfig.
+#
+# ON THE CADENCE. Hourly, at :53 — ≥6 min from every other cron in this repo
+# (9, 17, 23, 41, 47), which the guard-liveness header asks for. The detector's
+# own PAPERCLIP_STRANDED_LOCK_GRACE_MINUTES (default 155) is what keeps an
+# in-progress deploy from reading as stranded, so the hourly cadence does not
+# need to dodge the 07:23Z slot.
+#
+# ON WHAT GOES RED. Both failure exits alert AND fail the run. The run failing
+# is the backstop, not the signal — a red scheduled run only notifies the last
+# committer, which is the failure mode production-environment-protection-guard.yml
+# documents at length. Alertmanager is the path that reaches a human.
+#
+# Liveness of THIS workflow is watched: scripts/check-scheduled-guard-liveness.mjs
+# carries it in WATCHED_GUARDS at the hourly 2.75h bar.
+
+name: Stranded Approval Lock Check
+
+on:
+  schedule:
+    - cron: "53 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  stranded-lock:
+    runs-on: arc-paperclip-light
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      # Same implicit-`success()` trap as the kubeconfig step below, one step
+      # earlier: a failed install aborts the job and the alert never fires. Here
+      # the detector's own dependency check (check-stranded-approval-lock.sh:38)
+      # catches the missing binary and exits 2, so the run still reaches a human.
+      #
+      # Checkout deliberately does NOT get the same treatment: without the repo
+      # there is no post-stranded-approval-lock-alert.mjs to run either, so
+      # continuing past it buys nothing and only hides the real failure.
+      - name: Install kubectl
+        continue-on-error: true
+        uses: azure/setup-kubectl@v4
+
+      # `continue-on-error` here for the same reason as on the check below, and
+      # the mechanism is easy to miss: an explicit `if:` without a status
+      # function still carries an implicit `success()`. So a red kubeconfig step
+      # aborts the job and BOTH `exit_code != '0'` steps are skipped -- the run
+      # goes red having pushed no alert, which notifies only the last committer.
+      # That is the exact failure this workflow exists to remove. Letting it
+      # through instead means the detector runs, cannot reach the cluster, exits
+      # 2, and routes to StrandedApprovalLockCheckUnreadable -- a named condition
+      # with its own remedy, rather than silence.
+      - name: Configure kubeconfig
+        continue-on-error: true
+        env:
+          KUBE_CONFIG_B64: ${{ secrets.BLOCKCAST_KUBE_CONFIG_B64 }}
+        run: |
+          if [ -z "$KUBE_CONFIG_B64" ]; then
+            echo "::error::BLOCKCAST_KUBE_CONFIG_B64 is required for the stranded approval lock check."
+            exit 1
+          fi
+          mkdir -p "$HOME/.kube"
+          printf '%s' "$KUBE_CONFIG_B64" | base64 -d > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+
+      # `continue-on-error` so exit 1 (stranded) and exit 2 (unreadable) both
+      # reach the alert step. Without it the job stops here and the alert — the
+      # only part that reaches a human — never fires.
+      - name: Check for a stranded in-flight approval lock
+        id: check
+        continue-on-error: true
+        run: |
+          set +e
+          scripts/check-stranded-approval-lock.sh 2>&1 | tee "$RUNNER_TEMP/stranded-lock.txt"
+          echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+        env:
+          PAPERCLIP_STRANDED_LOCK_GRACE_MINUTES: ${{ vars.PAPERCLIP_STRANDED_LOCK_GRACE_MINUTES || '' }}
+
+      - name: Summarise
+        if: always()
+        run: |
+          {
+            echo "### Stranded approval lock check"
+            echo
+            echo "Exit code: \`${{ steps.check.outputs.exit_code }}\` (0=clear, 1=stranded, 2=could not run)"
+            echo
+            echo '```'
+            cat "$RUNNER_TEMP/stranded-lock.txt" 2>/dev/null || echo "(no output captured)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Exit 2 (could not read) must never be reported as clear, so it alerts
+      # under its own alertname rather than being folded into the stranded one.
+      - name: Push alert to Alertmanager
+        if: steps.check.outputs.exit_code != '0'
+        env:
+          ALERTMANAGER_URL: ${{ vars.ALERTMANAGER_URL || 'http://alertmanager.monitoring.svc.cluster.local:9093' }}
+          EXIT_CODE: ${{ steps.check.outputs.exit_code }}
+          DETAIL_PATH: ${{ runner.temp }}/stranded-lock.txt
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          GH_REPO: ${{ github.repository }}
+        run: node .github/scripts/post-stranded-approval-lock-alert.mjs
+
+      - name: Fail the run when the lock is stranded or unreadable
+        if: steps.check.outputs.exit_code != '0'
+        run: |
+          echo "::error::stranded-approval-lock check exited ${{ steps.check.outputs.exit_code }} (1=stranded, 2=could not run). See the step summary and the Alertmanager alert."
+          exit 1

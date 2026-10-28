@@ -6,17 +6,29 @@ Re-reads the pull-request gates an issue monitor declared in
 `executionPolicy.monitor.gateSignals`, and — when every one of them is merged —
 posts a system comment on the issue naming the resolved gate.
 
-Two populations qualify (`listCandidateIssues`): a **terminated** monitor, which
-has stopped polling (`monitorNextCheckAt IS NULL`); and an **armed but never
+When nothing a re-check could change is outstanding and the monitor also
+declared a gate naming a **human** (`omar-go`, `hold:…`, `hold-lift`,
+`approval:…`), it posts a different comment instead, saying so: the remainder
+is a person who has not been told this row exists. That covers a pull request
+held **open** by a named person as well as a human gate standing after every
+pull request merged — see *The human-gate announcement (PEN-4545)* below, and
+in particular *the gate and the pull request it names are one statement*. That
+is a report, never a resolution.
+
+Three populations qualify (`listCandidateIssues`): a **terminated** monitor,
+which has stopped polling (`monitorNextCheckAt IS NULL`); an **armed but never
 evaluated** monitor (`monitorAttemptCount = 0 AND monitorLastTriggeredAt IS
 NULL`), which was armed on a gate that was already satisfied and would otherwise
-wait out its whole window before anything looked — BLO-36289. The comment copy
+wait out its whole window before anything looked — BLO-36289; and an
+**actively-polling** monitor that declares a human gate (PEN-4545), which the
+first two exclude by construction and which is the population that reads as
+attended while nothing can move it. The comment copy
 branches on whether the monitor can still wake the issue: the armed variant, which
 states the monitor is still armed and must not be treated as stranded, is used
 only when the first check is still in the future, AND the row is one the
 scheduler will fire (`issueAllowsMonitor`: agent-assigned, no user assignee,
 `in_progress`/`in_review`), AND the monitor has road left to run
-(`exhaustedMonitorClearReason`, evaluated at `attemptCount 0`). An overdue check,
+(`exhaustedMonitorClearReason`, evaluated at the row's real `monitorAttemptCount`). An overdue check,
 a `todo`/`blocked`/human-assigned row, or a monitor already past its own
 `timeoutAt` — nothing constrains `nextCheckAt <= timeoutAt`, so "check in 6h,
 give up after 2h" arms fine and is cleared rather than fired — gets the stranded
@@ -118,9 +130,13 @@ network call of its own — and owns none of the re-evaluation.
   response. It must not read as "done, go close the issue", and must not
   suppress oversight.
 - **Every declared signal must resolve.** One unparseable token
-  (`deploy:paperclip-api`, `approval:board`) means the issue is still waiting on
+  (`deploy:paperclip-api`, `mq:drained`) means the issue is still waiting on
   something the reconciler cannot see, so the issue is left alone. There is no
-  partial resolution.
+  partial resolution. The parse loop runs to completion *before* the read loop,
+  so an unparseable token costs zero GitHub calls.
+- **A human gate is reported, never resolved** (PEN-4545; see below). It is the
+  one unparseable class that gets a verdict of its own, and that verdict is
+  still not `satisfied`.
 - **Merge subsumes the sub-gates.** A merged PR satisfies `:checks` and
   `:review` as well as `:merged`, because merge is strictly stronger than any of
   them. Checks passing is *not* itself terminal — a green check can go red on
@@ -134,6 +150,217 @@ network call of its own — and owns none of the re-evaluation.
   not make either untrue. `no_comment_streak` is excluded too — unlike a
   dependency gate, which *causes* silence by cancelling queued runs before
   dispatch, a monitor gate does not stop the assignee from commenting.
+
+## The human-gate announcement (PEN-4545)
+
+### The gap
+
+The fail-closed rule above is correct as a *resolution* rule and was silent as a
+*reporting* rule. Any token the parser could not read sent the whole issue down
+one branch — `unresolvable_signal`, no comment, no log line, nothing — and the
+tokens agents write to say "a person must act" went down it with the rest.
+
+That made this sweep, the one board-side audit that reads `gateSignals` at all,
+structurally blind to the gate class that most needs a reader. Measured
+2026-10-23: six `in_review` rows across three agents, each with a PR that was
+`OPEN`, `MERGEABLE` and green, each carrying *"do not merge until Omar gives an
+explicit go"*, each declaring that go on its monitor. Every one had an armed
+`monitorNextCheckAt`, so:
+
+- not `blocked` → zero-blocker sweeps skipped them;
+- no `external owner:` lines → the declaration regex never saw them;
+- armed monitor → every dashboard read them as **actively attended**.
+
+The rows politely re-checked a gate nothing on the owner's side could ever
+answer. **Silence was indistinguishable from progress**, and the row looked
+better cared-for than a silent one. The complement is worse: when the go
+finally arrived — a blanket *"go for all"* at 12:16Z, thirteen PRs merged
+inside fifteen minutes — nothing connected that event to the rows parked
+against it. Two were parked to dates three and six days past the event they
+were waiting for.
+
+### What it does
+
+`parseTerminalGateSignal` now returns a third kind, `human_gate`, for tokens on
+an explicit allowlist — `HUMAN_GATE_TOKEN_PREFIXES` in the module, currently
+`omar-go`, `hold`, `hold-lift`, `hold-lifted`, `human-go`, `founder-go`,
+`approval`, `board-approval`, `card`, `signoff`, `sign-off`, `cto-ruling`,
+`ceo-ruling`, each with an optional `:suffix`. That array is the single source
+for both the JS matcher and the SQL candidate predicate; do not write either by
+hand. When **every** other declared gate is satisfied and only human gates
+remain, `resolveTerminalGate` returns `human_gate_only` and the sweep posts a
+distinct comment under the `terminal-gate-human-only:` idempotency prefix.
+
+A human gate written only as a plain `pr:` gate, with "needs one human
+approval" living in `monitorNotes`, stays invisible here — PEN-4410 is live in
+that shape. Those rows keep today's silence, which is the fail-safe direction;
+reaching them means reading the pull request's own review state, not a longer
+allowlist.
+
+### ⭐ The gate and the pull request it names are one statement, not two
+
+This is the half the first cut got backwards, and it inverted the notice end to
+end for exactly the shape the issue measured.
+
+A **hold-protocol** token usually *names a pull request*: `omar-go:#2686`,
+`hold:f35d6c:pr-2655:omar-go`. When that pull request is **also** a declared
+`pr:` gate on the same row, the two tokens say one thing — *a person must
+release this pull request*. Reading them independently produced the worst
+available ordering:
+
+| state of the named PR | what the row waits for | first cut | now |
+|---|---|---|---|
+| **open** | the person — this is the entire wait | `unresolved/pull_request_open`, **skipped in silence** | `human_gate_only` carrying `heldPullRequests`; announced, escalate the ask |
+| **merged** | nothing: under the hold protocol the merge cannot precede the go | `human_gate_only` — *"Escalate the ask"* for a go already given | `satisfied` carrying `dischargedHumanGates`; verify-and-close |
+
+#### Only the hold protocol, and that restriction is the whole safety argument
+
+Both cells of that table rest on one premise — *the person's decision is the
+thing standing between this pull request and its merge* — and that premise is
+a property of the **hold protocol** (`omar-go`, `hold`, `hold-lift`,
+`hold-lifted`, `human-go`, `founder-go`), not of human gates in general.
+
+`HOLD_PROTOCOL_TOKEN_PREFIXES` is therefore a strict subset of
+`HUMAN_GATE_TOKEN_PREFIXES`, and only it feeds the subject join. A standing
+gate — `approval:`, `board-approval:`, `card:`, `signoff:`/`sign-off:`,
+`cto-ruling:`, `ceo-ruling:` — can perfectly well name a decision due *after*
+the merge (`signoff:pr-2686:rollout`, `approval:prod-deploy:pr-2686`), so:
+
+| | hold-protocol gate | standing gate |
+|---|---|---|
+| named PR **open** | `human_gate_only`, PR listed under `heldPullRequests` | `unresolved/pull_request_open` — fail closed; "open because a person has not released it" is unestablished |
+| named PR **merged** | discharged; row becomes `satisfied` | **still stands**; row is `human_gate_only` and the gate is announced |
+
+Discharging a standing gate on merge would turn a decision nobody has made
+into `satisfied` and post *"there is nothing left to chase"* over it — the
+fail-open direction this module is built to refuse. `TGS` pins
+`signoff:pr-2686` + merged `#2686` -> `human_gate_only`, and its open-PR twin
+pins the fail-closed side.
+
+`parseHumanGateSubject` reads the pull request number out of the token, in both
+spellings the fleet writes (`#2686` on PEN-4475, `pr-2655` on PEN-2619). It
+fails closed: a token naming no number, or two, stays unjoined — and so does a
+bare `#N` that two different repositories both declare in the same gate set,
+because a bare number carries no repository and that join is ambiguous. An
+unjoined gate keeps precisely the behaviour it had before the join existed.
+
+Three invariants this must keep, each pinned by a test:
+
+- a pull request open **on its own account**, co-declared beside an unrelated
+  human gate, still returns `unresolved/pull_request_open`. Only the pull
+  request a gate *names* is held — otherwise the sweep would announce over the
+  whole polling fleet;
+- a **closed-unmerged** pull request is never reported as "held open by a
+  person". The work did not land, and that fail-closed rule outranks the new
+  branch;
+- discharge requires the merge of *that* pull request, so `satisfied` still
+  means every declared gate is met;
+- discharge requires a **hold-protocol** token. A standing human gate survives
+  the merge of a pull request it names.
+
+`listCandidateIssues` gained a **third arm** for this class, and it is the half
+that makes the feature meet its own description. The first two arms admit a
+monitor that is *not polling*; the reported population is the opposite — rows
+actively re-checking a human gate, with `monitorAttemptCount > 0` and a future
+`monitorNextCheckAt`, which is precisely what made them read as attended. The
+third arm admits a row whose stored `gateSignals` contain an allowlisted
+human-gate token regardless of attempt count. Without it the notice fires only
+before the first poll or after convergence-to-stall (~3 polls later) — only
+once the row is already stranded, never while it still looks healthy.
+
+The comment names the gate tokens, says the machine half is done, and says
+plainly that a re-check will return the same answer forever. It closes nothing,
+clears no monitor, dispatches no run, and files no card — picking between
+extending a pending card, recording a named owner on the row, and accepting the
+row as frozen is the owner's judgement, and guessing from here would reproduce
+the same defect one level out. On a gate set with no `pr:` token at all the
+headline drops the "every machine-checkable gate is satisfied" claim, which
+would be vacuously true and would read as a statement about landed work that
+nothing here checked.
+
+### Why an allowlist and not "anything unparseable"
+
+`deploy:landed`, `mq:drained`, `argo:synced`, `cron:nightly`, `heap:stable` and
+`insync:true` are unparseable here but *are* resolved by the assignee's own
+poll, and no human is expected to clear them. Announcing "waiting on a person"
+over one would be false. The split is drawn from the token census in
+`listCandidateIssues`, not guessed at.
+
+It fails in the safe direction: a human-gate token the list does not know keeps
+the old behaviour exactly — silent `unresolvable_signal` — so an omission costs
+the status quo, while a false positive would post a wrong-headed comment. Add
+prefixes on evidence.
+
+### Invariants a later change must not break
+
+- **`human_gate_only` is not `satisfied`.** It must never enter
+  `listResolvedTerminalGates`, which is the productivity-review suppression
+  path. A human-gated row is the case where oversight is *most* warranted: the
+  work is finished, unreachable, and nobody has been told. Two independent
+  guards hold this — the `kind === "pull_request"` filter and the separate
+  idempotency prefix — and both are deliberate. Note the first guard is
+  `every` over the *whole* signal set, so it also keeps a **discharged** row
+  out of the suppression map: the discharged hold token is still a
+  `human_gate` signal on that row, so the row is `satisfied` and gets the
+  verify-and-close notice but never suppresses a productivity review. That is
+  stricter than this module needs and is left as is — `TGP` pins it.
+- **The anti-join must test all three prefixes, and only two of them retire a
+  row for good.** `listCandidateIssues` excludes a row announced under any key
+  for its current signal set. Testing only the resolved prefix would re-admit
+  every announced human-gate row on every pass, where it can never clear — the
+  `SCAN_LIMIT` starvation vector the resolved-side anti-join exists to remove,
+  reached through a new door. `TGA` pins this on `scanned: 0`, which a JS-side
+  filter cannot fake.
+
+  The **held-open** finding is the exception, and the reason it has its own
+  prefix. It is *provisional*: it describes a pull request that is open right
+  now, and the event that ends it — the merge — writes nothing to the
+  database, so the gate signals, and therefore the digest, are identical
+  before and after. Retiring the row permanently on it meant the merged ->
+  `satisfied` verify-and-close transition in the table above could only fire
+  for a row whose pull request merged before any sweep saw it open; for the
+  population PEN-4545 measured (held open ~24h while actively polling) the
+  held notice always lands first, so that transition was dead for exactly the
+  rows it was written for. A held announcement therefore suppresses its row
+  only for `HELD_GATE_RECHECK_INTERVAL_MS` (6h), after which the sweep
+  re-reads the pull request. Still held: the insert conflicts on the held key
+  and nothing is posted — one read, no second comment — and the conflict
+  stamps `idempotency_processed_at`, which **restarts the window**. That stamp
+  is what makes 6h a cadence rather than a one-shot delay: the suppression
+  test reads `coalesce(idempotency_processed_at, created_at)`, and `created_at`
+  is fixed at the first announcement, so keyed on it alone a held row would
+  age out once and then be re-admitted on *every* pass until the merge — ~144
+  reads a day against the ~4 this interval promises, at the head of an
+  `updatedAt ASC` scan ahead of the stranded population. Merged: the verdict
+  and the key both change, and the resolved notice lands. `TGH` pins all
+  three — suppressed inside the window, re-read and re-suppressed once past
+  it, and the merge still seen on the next tick.
+- **The third arm must stay guarded by the allowlist.** Dropping
+  `humanGateSignalExistsSql` from it readmits the entire actively-polling
+  fleet, spending a PR read per row per pass on rows the scheduler is already
+  attending. `TGD` pins this.
+- **The JS and SQL matchers come from one array.** A prefix added to one and
+  not the other is the module's own failure mode in miniature: it would be
+  classified `human_gate`, never admitted by the sweep, and read as supported
+  while announcing nothing. `TGE` pins that the two agree on prefix boundaries
+  (`card` must not match `cardinality:ready`).
+- **`armedMonitorNextCheckAt` must use the row's real `monitorAttemptCount`.**
+  The hardcoded `0` was literally true while only the never-polled arm could
+  carry a non-null `monitorNextCheckAt`; with the third arm it under-reports
+  `max_attempts_exhausted` and promises a live wake path to a monitor that has
+  none. `TGF` pins this.
+- **Read cost.** A human-gated row with PR tokens now *does* spend PR reads
+  (previously it bailed at parse time), and the third arm means an
+  actively-polling one does so on every pass until its PRs merge or it is
+  announced. Bounded by `MAX_PULL_REQUEST_READS_PER_PASS`, deduped per pass by
+  `gateCache`, and confined to the human-gate class — a row whose unparseable
+  tokens are not human gates is unchanged and still costs zero. The held-open
+  branch adds one more effect worth knowing: because a held pull request no
+  longer short-circuits the loop, such a row reads *every* declared pull
+  request rather than stopping at the first open one. That is the price of
+  distinguishing "held by a person" from "open on its own account", it is
+  capped by the same budget, and a row with no human gate still short-circuits
+  exactly as before.
 
 ## Operational notes
 

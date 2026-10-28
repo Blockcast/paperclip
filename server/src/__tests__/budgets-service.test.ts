@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import {
   agents,
   approvals,
@@ -27,7 +27,18 @@ type SelectResult = unknown[];
 
 function createDbStub(selectResults: SelectResult[]) {
   const pendingSelects = [...selectResults];
-  const selectWhere = vi.fn(async () => pendingSelects.shift() ?? []);
+  // Awaitable for `await db.select().from().where()`, and also `.orderBy()`-able
+  // for `.from().where().orderBy()` -- one query either way, so `.orderBy()`
+  // replays the rows this `.where()` already shifted rather than consuming a
+  // second queued result.
+  const selectWhere = vi.fn(() => {
+    const rows = pendingSelects.shift() ?? [];
+    const result = Promise.resolve(rows) as Promise<unknown[]> & {
+      orderBy: () => Promise<unknown[]>;
+    };
+    result.orderBy = async () => rows;
+    return result;
+  });
   const selectThen = vi.fn((resolve: (value: unknown[]) => unknown) => Promise.resolve(resolve(pendingSelects.shift() ?? [])));
   const selectOrderBy = vi.fn(async () => pendingSelects.shift() ?? []);
   const selectFrom = vi.fn(() => ({
@@ -128,6 +139,26 @@ describe("budgetService", () => {
       expect(payload.title).toContain("$150.00");
       expect(payload.title).toContain("$100.00");
     });
+
+    it("tells the board that a kept pause lifts itself when the cap stops binding (PEN-1972)", () => {
+      // Since PEN-1972 a budget pause clears at the next invocation check once
+      // the hard stop stops binding, so "keep the scope paused" is a decision
+      // about the current condition, not an indefinite one. The board is the
+      // party choosing it, so the card has to disclose the difference rather
+      // than let the click imply a durability it does not have.
+      const hard = buildApprovalPayload({
+        policy: policy as any,
+        scopeName: "Budget Agent",
+        thresholdType: "hard",
+        amountObserved: 15000,
+        windowStart: new Date("2026-08-01T00:00:00Z"),
+        windowEnd: new Date("2026-09-01T00:00:00Z"),
+      });
+
+      expect(hard.guidance).toContain("keep the scope paused");
+      expect(hard.guidance).toContain("only while the cap still binds");
+      expect(hard.guidance).toContain("falls back under it");
+    });
   });
 
   it("creates a hard-stop incident and pauses an agent when spend exceeds a budget", async () => {
@@ -147,6 +178,10 @@ describe("budgetService", () => {
 
     const dbStub = createDbStub([
       [policy],
+      // hardStopForgivenSince(): no board has resumed this scope without
+      // raising its cap in this window, so no grant and the hard stop is
+      // measured against the full window total (PEN-4742).
+      [],
       [{ total: 150 }],
       // resolveOpenSoftIncidents() reads the open soft rows so it can withdraw
       // any superseded soft card (BLO-28793); there are none here.
@@ -266,6 +301,10 @@ describe("budgetService", () => {
       }],
       [],
       [agentPolicy],
+      // hardStopForgivenSince(): no board has resumed this scope without
+      // raising its cap in this window, so no grant and the hard stop is
+      // measured against the full window total (PEN-4742).
+      [],
       [{ total: 120 }],
     ]);
 
@@ -281,6 +320,20 @@ describe("budgetService", () => {
   });
 
   it("surfaces a budget-owned company pause distinctly from a manual pause", async () => {
+    const companyPolicy = {
+      id: "policy-company-1",
+      companyId: "company-1",
+      scopeType: "company",
+      scopeId: "company-1",
+      metric: "billed_cents",
+      windowKind: "calendar_month_utc",
+      amount: 100,
+      warnPercent: 80,
+      hardStopEnabled: true,
+      notifyEnabled: true,
+      isActive: true,
+    };
+
     const dbStub = createDbStub([
       [{
         status: "idle",
@@ -293,6 +346,13 @@ describe("budgetService", () => {
         pauseReason: "budget",
         name: "Paperclip",
       }],
+      [companyPolicy],
+      // hardStopForgivenSince(): no board has resumed this scope without
+      // raising its cap in this window, so no grant and the hard stop is
+      // measured against the full window total (PEN-4742).
+      [],
+      // Still over cap in the current window, so the pause is still earned.
+      [{ total: 120 }],
     ]);
 
     const service = budgetService(dbStub.db as any);
@@ -303,6 +363,33 @@ describe("budgetService", () => {
       scopeId: "company-1",
       scopeName: "Paperclip",
       reason: "Company is paused because its budget hard-stop was reached.",
+    });
+  });
+
+  it("keeps blocking a manually paused company without re-checking its budget", async () => {
+    // A manual pause is not the budget service's to lift, so it must never reach
+    // the re-evaluation path -- hence no policy or observed-spend rows stubbed.
+    const dbStub = createDbStub([
+      [{
+        status: "idle",
+        pauseReason: null,
+        companyId: "company-1",
+        name: "Budget Agent",
+      }],
+      [{
+        status: "paused",
+        pauseReason: "manual",
+        name: "Paperclip",
+      }],
+    ]);
+
+    const service = budgetService(dbStub.db as any);
+
+    expect(await service.getInvocationBlock("company-1", "agent-1")).toEqual({
+      scopeType: "company",
+      scopeId: "company-1",
+      scopeName: "Paperclip",
+      reason: "Company is paused and cannot start new work.",
     });
   });
 
@@ -322,6 +409,12 @@ describe("budgetService", () => {
         scopeId: "company-1",
         metric: "billed_cents",
         windowKind: "calendar_month_utc",
+        // NOT NULL DEFAULT true in the schema, so a row without it is not a
+        // state the database can produce. It became load-bearing here with
+        // PEN-4742: the guard is now skipped where it cannot bite, and a cap
+        // with no hard stop behind it is exactly such a case.
+        hardStopEnabled: true,
+        amount: 100,
       }],
       [{ total: 150 }],
     ]);
@@ -1451,4 +1544,761 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
     expect(cardsAfterStale.filter((card) => card.status === "pending")).toHaveLength(0);
     expect(cardsAfterStale.map((card) => card.status).sort()).toEqual(["rejected", "withdrawn"]);
   });
+
+  // --- PEN-1972: the budget pause is a latch, not a thermostat -------------
+  //
+  // Observed spend is window-scoped and the pause flag is not, so at the window
+  // roll the condition that set the flag evaporates while the flag survives. A
+  // paused scope emits no cost events, so evaluateCostEvent can never re-fire
+  // for it either -- before this, only an explicit human resume could clear it.
+
+  async function rollWindowBackwards(companyId: string) {
+    // Move every cost event into the previous calendar month. That is what a
+    // window roll looks like to computeObservedAmount, which filters on
+    // occurredAt, and it is the only part of the roll that matters here.
+    const now = new Date();
+    const previousWindow = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 15));
+    await db
+      .update(costEvents)
+      .set({ occurredAt: previousWindow })
+      .where(eq(costEvents.companyId, companyId));
+  }
+
+  async function latchAgentOnBudget(amount = 100, spend = 125) {
+    const fixture = await createBudgetFixture();
+    const cancelWorkForScope = vi.fn().mockResolvedValue(undefined);
+    const service = budgetService(db, { cancelWorkForScope });
+    const [policy] = await db
+      .insert(budgetPolicies)
+      .values({
+        companyId: fixture.companyId,
+        scopeType: "agent",
+        scopeId: fixture.agentId,
+        metric: "billed_cents",
+        windowKind: "calendar_month_utc",
+        amount,
+        warnPercent: 80,
+        hardStopEnabled: true,
+        notifyEnabled: true,
+        isActive: true,
+      })
+      .returning();
+
+    const event = await insertCostEvent({
+      companyId: fixture.companyId,
+      agentId: fixture.agentId,
+      costCents: spend,
+    });
+    await service.evaluateCostEvent(event);
+
+    const [agentRow] = await db
+      .select({ status: agents.status, pauseReason: agents.pauseReason })
+      .from(agents);
+    expect(agentRow).toMatchObject({ status: "paused", pauseReason: "budget" });
+
+    return { ...fixture, service, policy: policy! };
+  }
+
+  it("clears a budget pause whose window has rolled, on the next invocation check (PEN-1972)", async () => {
+    const { companyId, agentId, service } = await latchAgentOnBudget();
+
+    const blockedWhileOverCap = await service.getInvocationBlock(companyId, agentId);
+    expect(blockedWhileOverCap).toMatchObject({
+      scopeType: "agent",
+      reason: "Agent is paused because its budget hard-stop was reached.",
+    });
+
+    await rollWindowBackwards(companyId);
+    mockLogActivity.mockClear();
+
+    // The same call that used to report the latch forever is the one that lifts
+    // it: no scheduler, no human, just the next time anything asks whether this
+    // agent may run.
+    expect(await service.getInvocationBlock(companyId, agentId)).toBeNull();
+
+    const [resumed] = await db
+      .select({ status: agents.status, pauseReason: agents.pauseReason, pausedAt: agents.pausedAt })
+      .from(agents);
+    expect(resumed).toMatchObject({ status: "idle", pauseReason: null, pausedAt: null });
+
+    // The incident and its card asked the board to choose between raising the
+    // budget and staying paused. Neither branch means anything now, so the card
+    // must not be left pending against a condition that no longer exists.
+    const incidentRows = await db.select().from(budgetIncidents);
+    expect(incidentRows.filter((incident) => incident.status === "open")).toHaveLength(0);
+    const [card] = await db.select().from(approvals);
+    expect(card).toMatchObject({ status: "withdrawn" });
+
+    // A resume is a fiscal event and has to leave a trace, the same way the
+    // pause did -- otherwise a scope that came back on its own is
+    // indistinguishable from one that was never stopped.
+    expect(mockLogActivity.mock.calls.map(([, input]) => input)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          action: "budget.pause_auto_cleared",
+          details: expect.objectContaining({ scopeType: "agent", scopeId: agentId }),
+        }),
+      ]),
+    );
+  });
+
+  it("keeps a budget pause that is still earned in the current window (PEN-1972)", async () => {
+    const { companyId, agentId, service } = await latchAgentOnBudget();
+
+    // No window roll: the spend that caused the pause is still inside the
+    // window, so re-evaluating must reach the same verdict rather than treating
+    // every check as an excuse to resume.
+    expect(await service.getInvocationBlock(companyId, agentId)).toMatchObject({
+      scopeType: "agent",
+      scopeId: agentId,
+      reason: "Agent is paused because its budget hard-stop was reached.",
+    });
+
+    const [stillPaused] = await db
+      .select({ status: agents.status, pauseReason: agents.pauseReason })
+      .from(agents);
+    expect(stillPaused).toMatchObject({ status: "paused", pauseReason: "budget" });
+    expect(
+      (await db.select().from(budgetIncidents)).filter((incident) => incident.status === "open"),
+    ).toHaveLength(1);
+  });
+
+  it("clears a budget pause left behind by a policy that is no longer active (PEN-1972)", async () => {
+    const { companyId, agentId, service, policy } = await latchAgentOnBudget();
+
+    // Deactivating the policy removes the cap that justified the flag. Nothing
+    // else would ever clear it: the scope emits no cost events while paused, and
+    // the policy it was filed against no longer governs anything.
+    await db
+      .update(budgetPolicies)
+      .set({ isActive: false })
+      .where(eq(budgetPolicies.id, policy.id));
+
+    expect(await service.getInvocationBlock(companyId, agentId)).toBeNull();
+
+    const [resumed] = await db
+      .select({ status: agents.status, pauseReason: agents.pauseReason })
+      .from(agents);
+    expect(resumed).toMatchObject({ status: "idle", pauseReason: null });
+  });
+
+  it("never lifts a pause it does not own (PEN-1972)", async () => {
+    const { companyId, agentId, service } = await latchAgentOnBudget();
+    await db.update(agents).set({ pauseReason: "manual" }).where(eq(agents.id, agentId));
+
+    await rollWindowBackwards(companyId);
+    await service.getInvocationBlock(companyId, agentId);
+
+    // The window rolled and the budget condition is gone, but this pause was
+    // never the budget service's to lift.
+    const [stillPaused] = await db
+      .select({ status: agents.status, pauseReason: agents.pauseReason })
+      .from(agents);
+    expect(stillPaused).toMatchObject({ status: "paused", pauseReason: "manual" });
+  });
+
+  it("clears a rolled-over budget pause on a project scope too (PEN-1972)", async () => {
+    const { companyId, agentId, projectId } = await createBudgetFixture();
+    const cancelWorkForScope = vi.fn().mockResolvedValue(undefined);
+    const service = budgetService(db, { cancelWorkForScope });
+    await db.insert(budgetPolicies).values({
+      companyId,
+      scopeType: "project",
+      scopeId: projectId,
+      metric: "billed_cents",
+      windowKind: "calendar_month_utc",
+      amount: 100,
+      warnPercent: 80,
+      hardStopEnabled: true,
+      notifyEnabled: true,
+      isActive: true,
+    });
+
+    const event = await insertCostEvent({ companyId, agentId, projectId, costCents: 125 });
+    await service.evaluateCostEvent(event);
+    expect(await service.getInvocationBlock(companyId, agentId, { projectId })).toMatchObject({
+      scopeType: "project",
+      scopeId: projectId,
+    });
+
+    await rollWindowBackwards(companyId);
+
+    expect(await service.getInvocationBlock(companyId, agentId, { projectId })).toBeNull();
+    const [resumedProject] = await db
+      .select({ pauseReason: projects.pauseReason, pausedAt: projects.pausedAt })
+      .from(projects);
+    expect(resumedProject).toMatchObject({ pauseReason: null, pausedAt: null });
+  });
+
+  it("resumes on a disabled hard stop without destroying the live soft warning (PEN-1972, #3019 review)", async () => {
+    const { companyId, agentId, service, policy } = await latchAgentOnBudget();
+
+    // Turn the hard stop off while spend is still over cap. `upsertPolicy` takes
+    // its `observedAmount >= amount` branch: `hardStopWillFire` is false, so it
+    // files a *soft* warn card and leaves the scope paused.
+    await service.upsertPolicy(
+      companyId,
+      {
+        scopeType: "agent",
+        scopeId: agentId,
+        metric: "billed_cents",
+        windowKind: "calendar_month_utc",
+        amount: policy.amount,
+        warnPercent: 80,
+        hardStopEnabled: false,
+        notifyEnabled: true,
+      },
+      null,
+    );
+
+    const softBefore = (await db.select().from(budgetIncidents))
+      .filter((incident) => incident.thresholdType === "soft" && incident.status === "open");
+    expect(softBefore).toHaveLength(1);
+
+    // The hard stop no longer binds, so the resume is correct...
+    expect(await service.getInvocationBlock(companyId, agentId)).toBeNull();
+    const [resumed] = await db
+      .select({ status: agents.status, pauseReason: agents.pauseReason })
+      .from(agents);
+    expect(resumed).toMatchObject({ status: "idle", pauseReason: null });
+
+    // ...but it must not take the warn card with it. The window did not roll and
+    // spend is still over cap, so that warning is live: closing it would delete
+    // the board's only notice of an overspend the scope is still carrying.
+    const incidentsAfter = await db.select().from(budgetIncidents);
+    const [soft] = incidentsAfter.filter((incident) => incident.thresholdType === "soft");
+    expect(soft).toMatchObject({ status: "open" });
+    const [softCard] = await db
+      .select()
+      .from(approvals)
+      .where(eq(approvals.id, soft!.approvalId!));
+    expect(softCard).toMatchObject({ status: "pending" });
+
+    // The hard incident is the pause decision, so it still dies with the pause.
+    expect(
+      incidentsAfter.filter((incident) => incident.thresholdType === "hard" && incident.status === "open"),
+    ).toHaveLength(0);
+
+    // And the audit trail must name the cause that actually fired. "The budget
+    // window rolled" was false here on both counts, and it was written for a
+    // deactivated policy and a zeroed cap too.
+    const allCards = await db.select().from(approvals);
+    const withdrawn = allCards.filter((card) => card.status === "withdrawn");
+    expect(withdrawn).toHaveLength(1);
+    expect(withdrawn[0]!.decisionNote).toContain("the hard stop is disabled on the governing policy");
+    expect(withdrawn[0]!.decisionNote).not.toContain("window rolled");
+
+    expect(mockLogActivity.mock.calls.map(([, input]) => input)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          action: "budget.pause_auto_cleared",
+          details: expect.objectContaining({
+            reason: "the hard stop is disabled on the governing policy",
+          }),
+        }),
+      ]),
+    );
+  });
+
+  it("writes one auto-clear per resume when two callers race the same latch (PEN-1972, #3019 review)", async () => {
+    const { companyId, agentId, service } = await latchAgentOnBudget();
+    await rollWindowBackwards(companyId);
+    mockLogActivity.mockClear();
+
+    // Both calls start before either writes, so in the usual interleaving both
+    // read the row as paused and both reach the resume. That write is guarded on
+    // `pauseReason = "budget"`, so exactly one UPDATE returns a row and the
+    // loser's guard matches nothing. The loser resumed nothing, so it must not
+    // also claim an auto-clear in the ledger -- a resume is a fiscal event, and
+    // double-counting one is a false trace.
+    //
+    // The assertion holds under either interleaving: if the second call happens
+    // to read the row after the first already resumed it, it skips the clear
+    // entirely and still logs nothing. So this cannot fail spuriously, and in
+    // the racing interleaving -- the one it is here to cover -- it is the
+    // `.returning()` guard in `resumeScopeFromBudget` that keeps the count at 1.
+    const [first, second] = await Promise.all([
+      service.getInvocationBlock(companyId, agentId),
+      service.getInvocationBlock(companyId, agentId),
+    ]);
+    expect(first).toBeNull();
+    expect(second).toBeNull();
+
+    const cleared = mockLogActivity.mock.calls
+      .map(([, input]) => input)
+      .filter((input: any) => input.action === "budget.pause_auto_cleared");
+    expect(cleared).toHaveLength(1);
+  });
+
+  // ---------------------------------------------------------------------------
+  // PEN-4742: resuming without ratcheting the cap up to observed-plus-epsilon.
+  //
+  // `raise_budget_and_resume` refuses any amount at or below observed spend, so
+  // mid-window it FORCES the cap above whatever has accrued. The cap stops being
+  // a chosen figure and becomes a function of one window's overshoot -- which is
+  // how a $1.63 breach produced a $20,011.63 cap, and how the warn band shipped
+  // in BLO-28793 got hollowed out, since a band on a cap nobody can reach warns
+  // on nothing.
+  //
+  // The fix is not to delete the guard: resuming under a cap you have already
+  // blown re-latches on the next cost event. It is to separate "what the cap is"
+  // from "may this scope run for the rest of this window".
+  // ---------------------------------------------------------------------------
+
+  async function resolveHardIncident(
+    service: ReturnType<typeof budgetService>,
+    companyId: string,
+    input: { action: "keep_paused" | "raise_budget_and_resume" | "resume_without_raise"; amount?: number },
+  ) {
+    const [hard] = await db
+      .select()
+      .from(budgetIncidents)
+      .where(eq(budgetIncidents.thresholdType, "hard"));
+    return service.resolveIncident(companyId, hard!.id, input, "board-user");
+  }
+
+  it("resumes a mid-window pause without lifting the cap over observed spend (PEN-4742)", async () => {
+    // $1.00 cap, $1.25 spent: the exact shape of the June breach.
+    const { companyId, agentId, service, policy } = await latchAgentOnBudget(100, 125);
+
+    // What the ratchet used to force. The board has no way to say "the cap is
+    // fine, I have looked at the overshoot, let it run".
+    await expect(
+      resolveHardIncident(service, companyId, { action: "raise_budget_and_resume", amount: 100 }),
+    ).rejects.toThrow(/must exceed current observed spend/);
+
+    await resolveHardIncident(service, companyId, { action: "resume_without_raise" });
+
+    // The cap is still exactly what a human chose. Not observed-plus-epsilon,
+    // not touched at all.
+    const [capAfter] = await db.select().from(budgetPolicies).where(eq(budgetPolicies.id, policy.id));
+    expect(capAfter!.amount).toBe(100);
+    expect(capAfter!.amountUpdatedAt).toEqual(policy.amountUpdatedAt);
+
+    const [resumed] = await db
+      .select({ status: agents.status, pauseReason: agents.pauseReason })
+      .from(agents);
+    expect(resumed).toMatchObject({ status: "idle", pauseReason: null });
+    expect(await service.getInvocationBlock(companyId, agentId)).toBeNull();
+
+    // The grant is the incident row, and nothing else. No new policy state, so
+    // nothing has to be cleaned up by hand.
+    const [hard] = await db
+      .select()
+      .from(budgetIncidents)
+      .where(eq(budgetIncidents.thresholdType, "hard"));
+    expect(hard).toMatchObject({ status: "resolved", resolutionAction: "resume_without_raise" });
+  });
+
+  it("does not re-latch on the next cost event after a keep-the-cap resume (PEN-4742)", async () => {
+    const { companyId, agentId, service } = await latchAgentOnBudget(100, 125);
+    await resolveHardIncident(service, companyId, { action: "resume_without_raise" });
+
+    // This is the event that used to put the scope straight back down: window
+    // spend is $1.26 against a $1.00 cap, so the old `observed >= amount` test
+    // fires on the first dollar of new work.
+    const next = await insertCostEvent({ companyId, agentId, costCents: 1 });
+    await service.evaluateCostEvent(next);
+
+    const [stillRunning] = await db
+      .select({ status: agents.status, pauseReason: agents.pauseReason })
+      .from(agents);
+    expect(stillRunning).toMatchObject({ status: "idle", pauseReason: null });
+    expect(await service.getInvocationBlock(companyId, agentId)).toBeNull();
+
+    // And no fresh card either. A warn card filed here would be the same churn
+    // the action exists to prevent, relabelled: total window spend is over the
+    // cap by construction, so it is over warnPercent of it too.
+    expect(
+      (await db.select().from(budgetIncidents)).filter((incident) => incident.status === "open"),
+    ).toHaveLength(0);
+  });
+
+  it("re-latches once post-decision spend reaches the cap, not before (PEN-4742)", async () => {
+    const { companyId, agentId, service } = await latchAgentOnBudget(100, 125);
+    await resolveHardIncident(service, companyId, { action: "resume_without_raise" });
+
+    // One cent short of the cap, measured from the decision. The grant bounds
+    // the tail at exactly one cap's worth -- it does not switch the hard stop
+    // off for the window, which would let a scope resumed at $1.26 burn
+    // arbitrarily and be worse in the tail than the ratchet it replaces.
+    const justUnder = await insertCostEvent({ companyId, agentId, costCents: 99 });
+    await service.evaluateCostEvent(justUnder);
+    expect(await service.getInvocationBlock(companyId, agentId)).toBeNull();
+
+    const overTheLine = await insertCostEvent({ companyId, agentId, costCents: 1 });
+    await service.evaluateCostEvent(overTheLine);
+
+    const [relatched] = await db
+      .select({ status: agents.status, pauseReason: agents.pauseReason })
+      .from(agents);
+    expect(relatched).toMatchObject({ status: "paused", pauseReason: "budget" });
+    expect(await service.getInvocationBlock(companyId, agentId)).toMatchObject({
+      scopeType: "agent",
+      reason: "Agent is paused because its budget hard-stop was reached.",
+    });
+
+    // The fresh card reports TRUE window spend ($2.25), not the rebaselined
+    // figure. The grant changes what the hard stop is measured against; it does
+    // not change what the scope actually spent, and a card claiming "$1.00
+    // against a limit of $1.00" would mislead the next board member to read it.
+    const [freshHard] = await db
+      .select()
+      .from(budgetIncidents)
+      .where(and(eq(budgetIncidents.thresholdType, "hard"), eq(budgetIncidents.status, "open")));
+    expect(freshHard!.amountObserved).toBe(225);
+    expect(freshHard!.amountLimit).toBe(100);
+  });
+
+  it("binds at the human's cap again once the window has rolled (PEN-4742)", async () => {
+    const { companyId, agentId, service, policy } = await latchAgentOnBudget(100, 125);
+    await resolveHardIncident(service, companyId, { action: "resume_without_raise" });
+    expect(await service.getInvocationBlock(companyId, agentId)).toBeNull();
+
+    await rollWindowBackwards(companyId);
+    const freshWindowSpend = await insertCostEvent({ companyId, agentId, costCents: 100 });
+    await service.evaluateCostEvent(freshWindowSpend);
+
+    // $1.00 of new-window spend against the $1.00 cap the human kept: the cap
+    // is enforced normally again, with no residue from last window's decision.
+    const [pausedAgain] = await db
+      .select({ status: agents.status, pauseReason: agents.pauseReason })
+      .from(agents);
+    expect(pausedAgain).toMatchObject({ status: "paused", pauseReason: "budget" });
+
+    const [capAfter] = await db.select().from(budgetPolicies).where(eq(budgetPolicies.id, policy.id));
+    expect(capAfter!.amount).toBe(100);
+
+    // ⚠ Be precise about what this proves, because the obvious reading is wrong.
+    // `rollWindowBackwards` moves cost EVENTS, not incidents, so the grant row
+    // still names the current window at this point -- this case does NOT
+    // exercise the `windowStart` filter, and an assertion here that "the grant
+    // would have kept it running" would be false.
+    //
+    // The scope stops because expiry is STRUCTURAL: `computeObservedAmount`
+    // ANDs the `since` floor with the window bounds, and any grant from an
+    // earlier window has `resolvedAt` before the window start, so its floor is
+    // strictly weaker than the clamp and subtracts nothing. A stale grant is
+    // inert however it is read. The `windowStart` filter is belt-and-braces on
+    // top of that, and the next case pins it on its own.
+  });
+
+  it("does not read a previous window's grant as live (PEN-4742)", async () => {
+    const { companyId, agentId, service, policy } = await latchAgentOnBudget(100, 125);
+    await resolveHardIncident(service, companyId, { action: "resume_without_raise" });
+
+    // The grant surfaces on the policy summary, which is what makes the
+    // `windowStart` filter observable at all. Age the incident into the
+    // previous window -- the one thing `rollWindowBackwards` cannot simulate,
+    // because it moves cost events and leaves incidents where they are.
+    const now = new Date();
+    const lastWindowStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
+    await db
+      .update(budgetIncidents)
+      .set({ windowStart: lastWindowStart, resolvedAt: lastWindowStart });
+
+    const overview = await service.overview(companyId);
+    const summary = overview.policies.find((entry) => entry.policyId === policy.id);
+    expect(summary!.hardStopForgivenSince).toBeNull();
+
+    // And pinned on an enforcement surface too, not only the summary: with the
+    // grant out of window the cap is enforced against the full window total
+    // again, so the scope stops. The cost events have NOT moved -- this is the
+    // `windowStart` filter doing the work, not a roll.
+    expect(await service.getInvocationBlock(companyId, agentId)).toMatchObject({
+      scopeType: "agent",
+      reason: "Agent cannot start because its budget hard-stop is still exceeded.",
+    });
+  });
+
+  it("keeps reporting true window spend while a grant is live (PEN-4742)", async () => {
+    const { companyId, service, policy } = await latchAgentOnBudget(100, 125);
+    await resolveHardIncident(service, companyId, { action: "resume_without_raise" });
+
+    // Enforcement rebaselines; reporting must not. A forgiven scope that
+    // rendered as healthy would be PEN-1972 defect 3 in a new costume -- the
+    // gauge going quiet exactly when it has something to say.
+    const overview = await service.overview(companyId);
+    const summary = overview.policies.find((entry) => entry.policyId === policy.id);
+    expect(summary).toMatchObject({
+      observedAmount: 125,
+      utilizationPercent: 125,
+      status: "hard_stop",
+      paused: false,
+    });
+    // ...and the card is given the one fact that explains an over-cap scope that
+    // is nonetheless running, so it reads as a decision rather than a bug.
+    expect(summary!.hardStopForgivenSince).toBeInstanceOf(Date);
+  });
+
+  it("does not grant a window rebaseline when the board raises the cap instead (PEN-4742)", async () => {
+    const { companyId, agentId, service } = await latchAgentOnBudget(100, 125);
+
+    // The ordinary path, untouched: raise $1.00 -> $2.00, clear of observed.
+    await resolveHardIncident(service, companyId, { action: "raise_budget_and_resume", amount: 200 });
+    expect(await service.getInvocationBlock(companyId, agentId)).toBeNull();
+
+    // A raise must NOT confer forgiveness. Deriving the grant from "any resolved
+    // hard incident in this window" would do exactly that, and buy this scope
+    // immunity at $2.00 for the rest of the month -- an enforcement regression on
+    // the common path, introduced to fix the uncommon one. $0.75 more takes total
+    // spend to $2.00 and must stop it.
+    const toTheNewCap = await insertCostEvent({ companyId, agentId, costCents: 75 });
+    await service.evaluateCostEvent(toTheNewCap);
+
+    const [pausedAtNewCap] = await db
+      .select({ status: agents.status, pauseReason: agents.pauseReason })
+      .from(agents);
+    expect(pausedAtNewCap).toMatchObject({ status: "paused", pauseReason: "budget" });
+  });
+
+  it("cannot be handed a grant by lowering the cap after an ordinary raise (PEN-4742)", async () => {
+    const { companyId, agentId, service, policy } = await latchAgentOnBudget(100, 125);
+    await resolveHardIncident(service, companyId, { action: "raise_budget_and_resume", amount: 1000 });
+
+    // Deriving the grant from live state -- `policy.amount <= incident.amountObserved`
+    // -- is retroactively forgeable exactly here: lower the cap back under observed
+    // and the predicate flips to true, conferring a suppression no board decided.
+    // Lowering a cap must tighten enforcement, never loosen it.
+    await service.upsertPolicy(
+      companyId,
+      { scopeType: "agent", scopeId: agentId, amount: 110, metric: "billed_cents", windowKind: "calendar_month_utc" },
+      "board-user",
+    );
+
+    const [pausedByTheLowerCap] = await db
+      .select({ status: agents.status, pauseReason: agents.pauseReason })
+      .from(agents);
+    expect(pausedByTheLowerCap).toMatchObject({ status: "paused", pauseReason: "budget" });
+
+    const [reread] = await db.select().from(budgetPolicies).where(eq(budgetPolicies.id, policy.id));
+    expect(reread!.amount).toBe(110);
+  });
+
+  it("lets a resume keep the cap once the window has already rolled (PEN-4742, option 1)", async () => {
+    const { companyId, agentId, service, policy } = await latchAgentOnBudget(100, 125);
+    await rollWindowBackwards(companyId);
+
+    // Post-roll, observed has fallen below the cap, so keeping the cap already
+    // satisfies `nextAmount > currentObserved` and needs no grant at all. Pinned
+    // because it is the case the original guard was accused of blocking and does
+    // not: the bug is mid-window only.
+    await resolveHardIncident(service, companyId, { action: "raise_budget_and_resume", amount: 100 });
+
+    const [capAfter] = await db.select().from(budgetPolicies).where(eq(budgetPolicies.id, policy.id));
+    expect(capAfter!.amount).toBe(100);
+    expect(await service.getInvocationBlock(companyId, agentId)).toBeNull();
+
+    const [hard] = await db
+      .select()
+      .from(budgetIncidents)
+      .where(eq(budgetIncidents.thresholdType, "hard"));
+    // No grant: the window rolled, so there was nothing to forgive.
+    expect(hard).toMatchObject({ status: "resolved", resolutionAction: "raise_budget_and_resume" });
+  });
+
+  it("stops refusing a raise the cap could never enforce anyway (PEN-4742, option 1)", async () => {
+    const { companyId, service, policy } = await latchAgentOnBudget(100, 125);
+    await db
+      .update(budgetPolicies)
+      .set({ hardStopEnabled: false })
+      .where(eq(budgetPolicies.id, policy.id));
+
+    // With the hard stop off the cap pauses nothing, so there is no re-latch to
+    // protect against and the guard is pure friction. Same for amount 0, which
+    // means "no cap" everywhere else in this file and was unreachable purely
+    // because 0 is never greater than observed.
+    await resolveHardIncident(service, companyId, { action: "raise_budget_and_resume", amount: 50 });
+    const [lowered] = await db.select().from(budgetPolicies).where(eq(budgetPolicies.id, policy.id));
+    expect(lowered!.amount).toBe(50);
+
+    await db
+      .update(budgetPolicies)
+      .set({ hardStopEnabled: true })
+      .where(eq(budgetPolicies.id, policy.id));
+    const [hard] = await db
+      .select()
+      .from(budgetIncidents)
+      .where(eq(budgetIncidents.thresholdType, "hard"));
+    await service.resolveIncident(companyId, hard!.id, { action: "raise_budget_and_resume", amount: 0 }, "board-user");
+    const [uncapped] = await db.select().from(budgetPolicies).where(eq(budgetPolicies.id, policy.id));
+    expect(uncapped!.amount).toBe(0);
+  });
+
+  it("refuses a keep-the-cap resume on a lifetime budget, which never rolls (PEN-4742)", async () => {
+    const { companyId, service, policy } = await latchAgentOnBudget(100, 125);
+    await db
+      .update(budgetPolicies)
+      .set({ windowKind: "lifetime" })
+      .where(eq(budgetPolicies.id, policy.id));
+
+    // A lifetime window has no roll, so the grant would never expire -- permanent
+    // state, which is the one thing this design refuses. Raise it, disable the
+    // hard stop, or stay paused.
+    await expect(
+      resolveHardIncident(service, companyId, { action: "resume_without_raise" }),
+    ).rejects.toThrow(/lifetime-scoped/);
+  });
+
+  it("writes the cap a board types on a keep-the-cap resume, even below observed (PEN-4742)", async () => {
+    const { companyId, agentId, service, policy } = await latchAgentOnBudget(100, 125);
+
+    // The cap is whatever the human chose. Lowering it below observed is a
+    // legitimate decision -- "this window got away from us, next window is
+    // tighter" -- and is precisely what the old guard made unexpressible.
+    await resolveHardIncident(service, companyId, { action: "resume_without_raise", amount: 60 });
+
+    const [capAfter] = await db.select().from(budgetPolicies).where(eq(budgetPolicies.id, policy.id));
+    expect(capAfter!.amount).toBe(60);
+    expect(await service.getInvocationBlock(companyId, agentId)).toBeNull();
+
+    // And the grant is measured against that lower cap, not the old one.
+    const underTheLowerCap = await insertCostEvent({ companyId, agentId, costCents: 59 });
+    await service.evaluateCostEvent(underTheLowerCap);
+    expect(await service.getInvocationBlock(companyId, agentId)).toBeNull();
+
+    const overTheLowerCap = await insertCostEvent({ companyId, agentId, costCents: 1 });
+    await service.evaluateCostEvent(overTheLowerCap);
+    const [relatched] = await db
+      .select({ status: agents.status, pauseReason: agents.pauseReason })
+      .from(agents);
+    expect(relatched).toMatchObject({ status: "paused", pauseReason: "budget" });
+  });
+
+  it("does not let an unrelated policy edit re-pause a forgiven scope (PEN-4742)", async () => {
+    const { companyId, agentId, service } = await latchAgentOnBudget(100, 125);
+    await resolveHardIncident(service, companyId, { action: "resume_without_raise" });
+
+    // `upsertPolicy` is the third site that can pause a scope. Leaving it
+    // unaware of the grant would make a notification toggle silently undo a
+    // board decision.
+    await service.upsertPolicy(
+      companyId,
+      {
+        scopeType: "agent",
+        scopeId: agentId,
+        amount: 100,
+        metric: "billed_cents",
+        windowKind: "calendar_month_utc",
+        notifyEnabled: false,
+      },
+      "board-user",
+    );
+
+    const [stillRunning] = await db
+      .select({ status: agents.status, pauseReason: agents.pauseReason })
+      .from(agents);
+    expect(stillRunning).toMatchObject({ status: "idle", pauseReason: null });
+  });
+
+  it("never confers a grant from an incident resolved before the column existed (PEN-4742)", async () => {
+    const { companyId, agentId, service } = await latchAgentOnBudget(100, 125);
+    await resolveHardIncident(service, companyId, { action: "resume_without_raise" });
+
+    // Every row predating the migration reads `resolution_action = null`, and
+    // null must never confer a grant -- otherwise shipping this would
+    // retroactively un-cap every scope with a resolved incident in the current
+    // window. Simulate one by clearing the column.
+    await db.update(budgetIncidents).set({ resolutionAction: null });
+
+    const next = await insertCostEvent({ companyId, agentId, costCents: 1 });
+    await service.evaluateCostEvent(next);
+
+    const [pausedByTheFallback] = await db
+      .select({ status: agents.status, pauseReason: agents.pauseReason })
+      .from(agents);
+    expect(pausedByTheFallback).toMatchObject({ status: "paused", pauseReason: "budget" });
+  });
+
+  it("does not mint a grant for a live crossing when a stale resume replays a closed one (PEN-4742)", async () => {
+    const { companyId, agentId, service, policy } = await latchAgentOnBudget(100, 125);
+
+    // Decision 1 -- a real board adjudication of a real crossing. Incident A
+    // closes carrying the grant, and the grant is measured from that instant.
+    await resolveHardIncident(service, companyId, { action: "resume_without_raise" });
+    const incidentA = await db
+      .select()
+      .from(budgetIncidents)
+      .where(eq(budgetIncidents.thresholdType, "hard"))
+      .then((rows) => rows[0]!);
+    expect(incidentA).toMatchObject({ status: "resolved", resolutionAction: "resume_without_raise" });
+
+    // The scope then burns a whole further cap's worth AFTER the grant and
+    // re-latches. That is the design working as specified: the grant bounds the
+    // tail, it does not remove the cap. `createIncidentIfNeeded` suppresses only
+    // on OPEN rows, so this files a *new* hard incident B.
+    const postGrant = await insertCostEvent({ companyId, agentId, costCents: 100 });
+    await service.evaluateCostEvent(postGrant);
+    const [relatched] = await db
+      .select({ status: agents.status, pauseReason: agents.pauseReason })
+      .from(agents);
+    expect(relatched).toMatchObject({ status: "paused", pauseReason: "budget" });
+
+    const incidentB = await db
+      .select()
+      .from(budgetIncidents)
+      .where(and(eq(budgetIncidents.thresholdType, "hard"), eq(budgetIncidents.status, "open")))
+      .then((rows) => rows[0]!);
+    expect(incidentB.id).not.toBe(incidentA.id);
+
+    // Now the stale client: it replays decision 1, naming incident A, which has
+    // been closed since. Nobody has looked at B's numbers -- B is a crossing of
+    // the same cap by a second, later cap's worth of spend.
+    await service.resolveIncident(
+      companyId,
+      incidentA.id,
+      { action: "resume_without_raise", decisionNote: "replayed decision 1" },
+      "board-user",
+    );
+
+    // B is still swept closed -- the resume has always closed every open row on
+    // the policy, and leaving one open against a withdrawn card is its own bug.
+    // But it is closed with NO resolution action, which is what stops it being
+    // read back as a grant. While the stamp was keyed on `policyId AND status =
+    // "open"`, the replay landed the action on B and minted a grant from B's
+    // `resolvedAt` that no board had ever decided.
+    const bAfter = await db
+      .select()
+      .from(budgetIncidents)
+      .where(eq(budgetIncidents.id, incidentB.id))
+      .then((rows) => rows[0]!);
+    expect(bAfter).toMatchObject({ status: "resolved", resolutionAction: null });
+
+    // So the live grant is still decision 1's, unmoved, and spend measured from
+    // it is a full cap's worth. The enforcement surface refuses the scope.
+    const overview = await service.overview(companyId);
+    const summary = overview.policies.find((entry) => entry.policyId === policy.id);
+    expect(summary!.hardStopForgivenSince).toEqual(incidentA.resolvedAt);
+    expect(await service.getInvocationBlock(companyId, agentId)).toMatchObject({
+      scopeType: "agent",
+      reason: "Agent cannot start because its budget hard-stop is still exceeded.",
+    });
+  });
+
+  it("counts spend that lands after the decision even when it is backdated before it (PEN-4742)", async () => {
+    const { companyId, agentId, service } = await latchAgentOnBudget(100, 125);
+    await resolveHardIncident(service, companyId, { action: "resume_without_raise" });
+    expect(await service.getInvocationBlock(companyId, agentId)).toBeNull();
+
+    // Final usage from the runs cancelled at the pause. It HAPPENED before the
+    // board adjudicated, so it carries a backdated `occurredAt`, but it LANDED
+    // after -- the board cannot have included it in what they forgave. While the
+    // enforcement floor was on `occurredAt` alone, a full cap's worth of real
+    // spend arriving this way escaped the grant's tail bound for the whole rest
+    // of the window, which is the one direction a cap must never fail.
+    const backdated = await insertCostEvent({
+      companyId,
+      agentId,
+      costCents: 100,
+      occurredAt: new Date(Date.now() - 60_000),
+    });
+    await service.evaluateCostEvent(backdated);
+
+    expect(await service.getInvocationBlock(companyId, agentId)).not.toBeNull();
+    const [repaused] = await db
+      .select({ status: agents.status, pauseReason: agents.pauseReason })
+      .from(agents);
+    expect(repaused).toMatchObject({ status: "paused", pauseReason: "budget" });
+  });
+
 });

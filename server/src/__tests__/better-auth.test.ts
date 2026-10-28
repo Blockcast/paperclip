@@ -256,8 +256,8 @@ describe("Dex OAuth provider config", () => {
 
     expect(buildDexOAuthProviderConfigFromEnv()).toEqual({
       providerId: "dex",
-      issuer: "https://dex.sfo12.bcast.id",
       discoveryUrl: "https://dex.sfo12.bcast.id/.well-known/openid-configuration",
+      requireIdTokenVerification: true,
       clientId: "paperclip",
       clientSecret: "secret",
       scopes: ["openid", "email", "profile", "groups"],

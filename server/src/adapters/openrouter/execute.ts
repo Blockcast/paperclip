@@ -1,3 +1,4 @@
+import { formatTimeoutMessage } from "@paperclipai/adapter-utils/server-utils";
 import type {
   AdapterExecutionContext,
   AdapterExecutionResult,
@@ -729,7 +730,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   for (let turn = 0; turn < maxTurns; turn++) {
     if (Date.now() - startedAt > timeoutSec * 1000) {
-      return { exitCode: null, signal: null, timedOut: true, errorMessage: `Timed out after ${timeoutSec}s`, usage: { inputTokens: totalIn, outputTokens: totalOut }, provider: "openrouter", biller: "openrouter", model: resolvedModel, billingType: "api", costUsd: totalCost || null, summary: lastMessage || null };
+      return { exitCode: null, signal: null, timedOut: true, errorMessage: formatTimeoutMessage(timeoutSec, startedAt), usage: { inputTokens: totalIn, outputTokens: totalOut }, provider: "openrouter", biller: "openrouter", model: resolvedModel, billingType: "api", costUsd: totalCost || null, summary: lastMessage || null };
     }
 
     // On the last turn, force a text response (no tools) so the agent always summarizes

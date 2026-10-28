@@ -40,10 +40,16 @@
  *   a different response — it must not read as "done, go close the issue", and
  *   must not suppress oversight.
  * - Every declared signal must resolve. One unparseable token (`deploy:api`,
- *   `approval:board`) means the issue is still waiting on something this module
+ *   `mq:drained`) means the issue is still waiting on something this module
  *   cannot see, so the whole issue is left alone. Merge is strictly stronger
  *   than any PR sub-gate, so `:checks`/`:review` on a merged PR are moot and a
  *   merged PR satisfies whichever aspect was declared.
+ * - A token naming a *human* decision (`omar-go`, `approval:board`) is the one
+ *   exception, and it is an exception to the silence, not to the fail-closed
+ *   rule: such an issue is still never `satisfied`. When every other gate is
+ *   merged it gets its own verdict and its own comment, because a gate only a
+ *   person can clear is the one class where continuing to wait is not a
+ *   strategy. See PEN-4545 in `runbooks/terminal-gate-reconciler.md`.
  * - Unresolved `blockedBy` edges fold into the gate set (BLO-18294 folds them
  *   into the fingerprint), so an issue with a live blocker is not resolved.
  *
@@ -79,23 +85,308 @@ const MAX_PULL_REQUEST_READS_PER_PASS = 100;
 export const TERMINAL_GATE_RESOLVED_IDEMPOTENCY_PREFIX = "terminal-gate-resolved:";
 
 /**
+ * Separate prefix for the human-gate announcement (PEN-4545), so the two
+ * findings can never be mistaken for one another by the anti-join, by
+ * `listResolvedTerminalGates`, or by an agent reading the thread. A resolved
+ * gate says *go close this*; a human-only gate says *nothing on a timer will
+ * ever clear this*. Those warrant opposite actions.
+ */
+export const TERMINAL_GATE_HUMAN_ONLY_IDEMPOTENCY_PREFIX = "terminal-gate-human-only:";
+
+/**
+ * Third prefix, for the *held-open* shape of the human-gate finding: a
+ * declared pull request still open because a hold-protocol gate names it.
+ *
+ * It is separate from `TERMINAL_GATE_HUMAN_ONLY_IDEMPOTENCY_PREFIX` because
+ * the two findings have opposite lifetimes, and sharing a key made the
+ * documented post-merge transition unreachable (caught on #2974):
+ *
+ *   - the plain human-only finding is **terminal**. Every declared pull
+ *     request has merged and a person still has not acted; no later sweep can
+ *     read anything different, so it is announced once and the row is retired
+ *     from the window for good.
+ *   - the held finding is **provisional**. It is a statement about a pull
+ *     request that is open *right now*, and the event that ends it — the
+ *     merge — changes nothing in the database. Retiring the row on the same
+ *     key as the terminal finding meant the row was never selected again, so
+ *     the merged -> `satisfied`, verify-and-close transition the runbook
+ *     promises could only ever fire for a row whose pull request merged
+ *     before any sweep saw it open. For the population PEN-4545 measured
+ *     (held open ~24h while actively polling) the held notice always comes
+ *     first, so that transition was dead for exactly the rows it was for.
+ *
+ * A provisional finding is therefore re-examined on a cadence
+ * (`HELD_GATE_RECHECK_INTERVAL_MS`) rather than never, and the comment itself
+ * is still posted at most once by the idempotency index.
+ */
+export const TERMINAL_GATE_HELD_IDEMPOTENCY_PREFIX = "terminal-gate-human-only-held:";
+
+/**
+ * How long a held-open announcement keeps its row out of the scan window
+ * before the sweep re-reads the pull request to see whether the go arrived.
+ *
+ * The two costs this trades between are both real and both already named in
+ * this file. Never re-admitting the row loses the post-merge notice entirely.
+ * Re-admitting it every pass spends a `SCAN_LIMIT` slot and a pull-request
+ * read every 10 minutes, for a wait measured in days — the starvation vector
+ * the resolved-side anti-join exists to remove, reached through a new door,
+ * and the one the held row would camp on *ahead* of the stranded population
+ * (`updatedAt ASC`).
+ *
+ * Six hours is deliberately far from both: ~4 reads per day per held row
+ * against the ~144 a per-pass re-admission would cost, and the post-merge
+ * notice lands within six hours of the merge. Nothing downstream is
+ * time-critical — the notice says "verify the acceptance criteria and close",
+ * which is not an outage response.
+ *
+ * The ~4/day figure only holds because every still-held re-check *restarts*
+ * the window, by stamping `idempotency_processed_at` on the held comment when
+ * its key conflicts. Keyed on `created_at` instead this would be a one-shot
+ * delay, not an interval: that timestamp is fixed at the first announcement,
+ * so once it aged past the cutoff it would stay past it and the row would be
+ * re-admitted every pass — the ~144/day this constant exists to avoid, and
+ * the starvation vector reached through a new door. Both the SQL anti-join
+ * and the JS filter therefore compare against the affirmation time, and `TGH`
+ * pins a still-held re-check leaving the row out of the next pass.
+ */
+const HELD_GATE_RECHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
+
+/**
  * `normalizeGateToken` (issue-execution-policy.ts) lowercases every stored
  * signal, so this pattern is deliberately lowercase-only. GitHub repo paths are
  * case-insensitive, so the lowercased `owner/repo` still addresses the API.
  */
 const PULL_REQUEST_GATE_PATTERN = /^pr:([a-z0-9._-]+\/[a-z0-9._-]+)#(\d{1,9}):([a-z0-9_-]+)$/;
 
+/**
+ * Tokens that name a **human decision** rather than a machine-observable state
+ * (PEN-4545).
+ *
+ * These parse no better than `mq:` or `argo:` do — this module cannot read
+ * whether a person has decided something. The distinction it draws is about
+ * *who can ever clear the gate*, because that determines whether waiting is a
+ * strategy:
+ *
+ *   - `deploy:landed` is unresolvable *here* but resolvable *in principle* by
+ *     the assignee's next poll. Waiting is reasonable.
+ *   - `omar-go:#2686` is resolvable by exactly one party, who is not watching
+ *     this row and has nothing telling them it exists. Waiting is not a
+ *     strategy; it is the failure.
+ *
+ * The second class is the one PEN-4545 measured, and it was invisible precisely
+ * *because* it reached `unresolvable_signal` and was dropped in silence — the
+ * same branch an infra token takes. Six `in_review` rows across three agents
+ * sat ~24h behind a human go that no approval card named, each with an armed
+ * `monitorNextCheckAt` making it read as attended on every dashboard. When the
+ * go finally arrived (a blanket "go for all", 2026-10-23T12:16Z) nothing
+ * connected it to the rows parked against it; five were found by an unrelated
+ * errand, two were parked three and six days past the event they waited for.
+ *
+ * ## Why an allowlist rather than "anything unparseable"
+ *
+ * Treating every unparseable token as a human gate would announce over `mq:`,
+ * `heap:`, `argo:`, `cron:`, `insync:` and `deploy:` — all of which the
+ * assignee's own poll does resolve, and none of which a human is expected to
+ * clear. The fleet census in `listCandidateIssues` observed exactly those six
+ * machine prefixes alongside `approval:`, `cto-ruling:` and `hold:`, so the
+ * split is drawn from measured tokens rather than guessed at.
+ *
+ * ## What this list still cannot see, stated rather than implied
+ *
+ * A human gate is visible here only when it is written as its own token. A row
+ * declaring nothing but `pr:owner/repo#N:merged`, carrying "needs one human
+ * approval" in `monitorNotes`, is indistinguishable from a row waiting on CI —
+ * PEN-4410 is live in exactly that shape. Those rows keep today's silence,
+ * which is the fail-safe direction, and reaching them means reading the pull
+ * request's own review state rather than lengthening this list.
+ *
+ * Conservative in the safe direction: a human-gate token this list does not
+ * know keeps today's behaviour exactly (silent `unresolvable_signal`), so the
+ * worst case of an omission is the status quo, while a false *positive* would
+ * post a wrong-headed comment. New prefixes should be added on evidence.
+ *
+ * ## Two classes, and only one of them is discharged by a merge
+ *
+ * The allowlist splits in two. Everything above is true of both halves; what
+ * separates them is whether the token's content ties the person's decision to
+ * the merge of a pull request. See `HOLD_PROTOCOL_TOKEN_PREFIXES`, which is
+ * the half that does — the subject join reads that half and no other.
+ */
+
+/**
+ * The hold-protocol subset: tokens whose *content* is "do not merge pull
+ * request N until a person says go".
+ *
+ * This subset alone licenses the two inferences the join makes, and both of
+ * them run backwards for any other prefix:
+ *
+ *   - **held open**: the named pull request is open *because* the gate holds
+ *     it there, so the open state is the human wait rather than outstanding
+ *     machine work; and
+ *   - **discharged**: the merge could not have happened before the go, so the
+ *     merge is itself the record that the go arrived.
+ *
+ * A `signoff:`, `approval:`, `card:` or `*-ruling:` token naming a pull
+ * request says no such thing. It can perfectly well name a decision that
+ * comes *after* the merge — `signoff:pr-2686:rollout`, `approval:prod-deploy`
+ * — so discharging it on merge would convert a still-standing human gate into
+ * a `satisfied` verdict and post "there is nothing left to chase" over a
+ * decision nobody has made. That is the fail-open direction this module
+ * exists to refuse, so those prefixes keep standing after their pull request
+ * merges, and the row is announced as `human_gate_only` instead.
+ *
+ * The same asymmetry applies to the held-open branch: "this pull request is
+ * open because a person has not released it" is a claim about *why* it is
+ * open, and only the hold protocol establishes it. A non-hold gate beside an
+ * open pull request therefore keeps the fail-closed
+ * `unresolved/pull_request_open` it had before the join existed.
+ */
+const HOLD_PROTOCOL_TOKEN_PREFIXES = [
+  "omar-go",
+  // `hold:f35d6c:pr-2655:omar-go` — PEN-2619's live token, and the reason
+  // `parseHumanGateSubject` reads `pr-2655` as well as `#2655`.
+  "hold",
+  "hold-lift",
+  "hold-lifted",
+  "human-go",
+  "founder-go",
+] as const;
+
+/**
+ * Human gates that are *not* the hold protocol: a person must act, but nothing
+ * ties the timing of that act to the merge of any pull request the token
+ * happens to name. These are announced and never discharged.
+ */
+const STANDING_HUMAN_GATE_TOKEN_PREFIXES = [
+  "approval",
+  "board-approval",
+  "card",
+  "signoff",
+  "sign-off",
+  "cto-ruling",
+  "ceo-ruling",
+] as const;
+
+/** The whole allowlist: both halves, in one array, as the matchers below need it. */
+const HUMAN_GATE_TOKEN_PREFIXES = [
+  ...HOLD_PROTOCOL_TOKEN_PREFIXES,
+  ...STANDING_HUMAN_GATE_TOKEN_PREFIXES,
+] as const;
+
+/**
+ * Both the TS matcher and the SQL candidate predicate are generated from
+ * `HUMAN_GATE_TOKEN_PREFIXES` rather than written twice. The two run in
+ * different engines over the same contract, and a drift between them is
+ * exactly the silent failure this module exists to stop: a prefix added here
+ * but not there would be classified `human_gate` and never admitted to the
+ * sweep, so it would read as supported and announce nothing.
+ */
+const HUMAN_GATE_TOKEN_ALTERNATION = HUMAN_GATE_TOKEN_PREFIXES.join("|");
+const HUMAN_GATE_TOKEN_PATTERN = new RegExp(`^(${HUMAN_GATE_TOKEN_ALTERNATION})(:.*)?$`);
+
+/**
+ * Same shape, over the hold-protocol subset only. Deliberately a second
+ * pattern rather than a membership test on the matched prefix: `hold` and
+ * `hold-lift` are both in the list, so a longest-match question would have to
+ * be answered by hand, and the alternation already answers it.
+ */
+const HOLD_PROTOCOL_TOKEN_PATTERN = new RegExp(
+  `^(${HOLD_PROTOCOL_TOKEN_PREFIXES.join("|")})(:.*)?$`,
+);
+
+/**
+ * The pull request a human-gate token names, in the two spellings the fleet
+ * actually writes: `omar-go:#2686` (PEN-4475) and `hold:f35d6c:pr-2655:omar-go`
+ * (PEN-2619). Both say the same thing — *a person must release pull request N*
+ * — and which of the two a row uses is an accident of who armed the monitor.
+ *
+ * This is the join that was missing, and its absence is the whole of the
+ * mis-ordering PEN-4545's review caught: without it the module cannot tell
+ * `omar-go:#2686` sitting beside `pr:owner/repo#2686:merged` (the person gates
+ * *this* pull request, so the wait is live while it is open and over once it
+ * merges) from `omar-go:#2686` beside `pr:owner/repo#1281:merged` (unrelated
+ * artifacts, so the machine half is genuinely outstanding).
+ */
+const HUMAN_GATE_SUBJECT_PATTERN = /(?:^|[:_-])(?:#|pr-|pr#)(\d{1,9})(?=$|[:_-])/g;
+
+/**
+ * Fail closed on anything ambiguous. A token naming two different numbers, or
+ * none, yields `null` and every branch downstream then takes the behaviour it
+ * had before this join existed — silence — rather than guessing which pull
+ * request a person meant.
+ */
+export function parseHumanGateSubject(token: string): number | null {
+  const found = new Set<number>();
+  for (const match of token.matchAll(HUMAN_GATE_SUBJECT_PATTERN)) {
+    const parsed = Number.parseInt(match[1]!, 10);
+    if (Number.isSafeInteger(parsed) && parsed > 0) found.add(parsed);
+  }
+  return found.size === 1 ? [...found][0]! : null;
+}
+
 export type ParsedTerminalGateSignal =
   | { kind: "pull_request"; raw: string; repoFullName: string; prNumber: number; aspect: string }
+  | {
+      kind: "human_gate";
+      raw: string;
+      subjectPullRequestNumber: number | null;
+      /**
+       * True only for `HOLD_PROTOCOL_TOKEN_PREFIXES`. Gates the two inferences
+       * the subject join feeds — "held open by this gate" and "discharged by
+       * the merge" — neither of which holds for a standing human gate.
+       */
+      holdProtocol: boolean;
+    }
   | { kind: "unresolvable"; raw: string };
 
 export type TerminalGateVerdict =
-  | { kind: "satisfied"; signals: string[]; mergedPullRequests: string[] }
+  | {
+      kind: "satisfied";
+      signals: string[];
+      mergedPullRequests: string[];
+      /**
+       * *Hold-protocol* gates discharged by the merge of the very pull
+       * request they named — never a standing one, which can name a decision
+       * due after the merge and so is reported rather than discharged. The
+       * hold protocol these tokens encode is "do not merge until the go
+       * arrives", so the merge is itself the evidence the go arrived —
+       * and telling the owner to chase it would be asking for a decision
+       * already made. Named in the comment so the inference is auditable
+       * rather than silent.
+       */
+      dischargedHumanGates: string[];
+    }
+  /**
+   * Nothing a re-check could change is outstanding, and what remains is a
+   * person. That covers two shapes, and conflating them was the defect review
+   * caught on #2974:
+   *
+   *   - every declared pull request merged and a human gate still stands; and
+   *   - a declared pull request is *open because a human gate on this same
+   *     issue holds it there* (`heldPullRequests`), which is the live wait in
+   *     the hold-protocol shape and used to resolve to a silent
+   *     `unresolved/pull_request_open`.
+   *
+   * Deliberately NOT `satisfied` in either shape: the issue's gate is not met,
+   * so this must never suppress oversight or read as "go close this". It
+   * exists to be *announced* — the row's owner is the one party who can
+   * escalate the human gate, and before PEN-4545 nothing told them.
+   */
+  | {
+      kind: "human_gate_only";
+      signals: string[];
+      humanGates: string[];
+      /** Declared pull requests open because a listed human gate holds them. */
+      heldPullRequests: string[];
+      mergedPullRequests: string[];
+    }
   | { kind: "unresolved"; reason: string; detail?: string };
 
 export interface TerminalGateReconcileResult {
   scanned: number;
   resolved: number;
+  /** Rows announced as waiting on a human and nothing else (PEN-4545). */
+  humanGateOnly: number;
   pullRequestReads: number;
 }
 
@@ -117,7 +408,20 @@ export function parseTerminalGateSignal(raw: unknown): ParsedTerminalGateSignal 
   const token = raw.trim();
   if (!token) return null;
   const match = PULL_REQUEST_GATE_PATTERN.exec(token);
-  if (!match) return { kind: "unresolvable", raw: token };
+  if (!match) {
+    // Classify before giving up. A human-gate token is no more *readable* than
+    // any other unparseable one — the difference is that nobody on a timer can
+    // ever clear it, which is a different disposition, not a weaker one.
+    if (HUMAN_GATE_TOKEN_PATTERN.test(token)) {
+      return {
+        kind: "human_gate",
+        raw: token,
+        subjectPullRequestNumber: parseHumanGateSubject(token),
+        holdProtocol: HOLD_PROTOCOL_TOKEN_PATTERN.test(token),
+      };
+    }
+    return { kind: "unresolvable", raw: token };
+  }
   const prNumber = Number.parseInt(match[2]!, 10);
   if (!Number.isSafeInteger(prNumber) || prNumber <= 0) return { kind: "unresolvable", raw: token };
   return {
@@ -141,9 +445,33 @@ function pullRequestKey(repoFullName: string, prNumber: number) {
  * suppression that reads it.
  */
 export function terminalGateResolutionIdempotencyKey(signals: readonly string[]) {
+  return `${TERMINAL_GATE_RESOLVED_IDEMPOTENCY_PREFIX}${gateSignalDigest(signals)}`;
+}
+
+/** The digest every announcement key shares, so a re-arm invalidates all three at once. */
+function gateSignalDigest(signals: readonly string[]) {
   const material = [...signals].sort().join("\n");
-  const digest = createHash("sha256").update(material).digest("hex").slice(0, 32);
-  return `${TERMINAL_GATE_RESOLVED_IDEMPOTENCY_PREFIX}${digest}`;
+  return createHash("sha256").update(material).digest("hex").slice(0, 32);
+}
+
+/**
+ * Same digest over the same signal set, under the human-only prefix. Sharing
+ * the digest across all three keys is deliberate: every announcement must be
+ * invalidated by exactly the same event (a monitor re-armed on different
+ * gates), and the SQL anti-join computes that digest once for all of them.
+ */
+export function terminalGateHumanOnlyIdempotencyKey(signals: readonly string[]) {
+  return `${TERMINAL_GATE_HUMAN_ONLY_IDEMPOTENCY_PREFIX}${gateSignalDigest(signals)}`;
+}
+
+/**
+ * Same digest again, under the held-open prefix. See
+ * `TERMINAL_GATE_HELD_IDEMPOTENCY_PREFIX` for why this finding cannot share a
+ * key with the terminal one: it is provisional, and the event that ends it is
+ * invisible to the database.
+ */
+export function terminalGateHeldIdempotencyKey(signals: readonly string[]) {
+  return `${TERMINAL_GATE_HELD_IDEMPOTENCY_PREFIX}${gateSignalDigest(signals)}`;
 }
 
 /** The monitor's declared gate signals, normalized the same way the guard stores them. */
@@ -188,6 +516,12 @@ export function readIssueMonitorBounds(
  * satisfied. Fail-closed at every branch: any token this module cannot parse,
  * any PR it cannot read, and any PR that is not merged leaves the issue
  * unresolved. `readPullRequestGate` is called at most once per distinct PR.
+ *
+ * PEN-4545 adds one verdict between "satisfied" and "unresolved" —
+ * `human_gate_only`, for a gate set whose machine half is fully satisfied and
+ * whose remainder is a person. It does not weaken any fail-closed rule: such an
+ * issue is still *not* satisfied, and is reported under its own verdict rather
+ * than folded into the satisfied path.
  */
 export async function resolveTerminalGate(input: {
   gateSignals: readonly string[];
@@ -199,18 +533,64 @@ export async function resolveTerminalGate(input: {
   if (signals.length === 0) return { kind: "unresolved", reason: "no_gate_signals" };
 
   const parsed: Array<Extract<ParsedTerminalGateSignal, { kind: "pull_request" }>> = [];
+  const humanGates: Array<Extract<ParsedTerminalGateSignal, { kind: "human_gate" }>> = [];
   for (const signal of signals) {
     const gate = parseTerminalGateSignal(signal);
+    if (gate?.kind === "human_gate") {
+      humanGates.push(gate);
+      continue;
+    }
     if (!gate || gate.kind !== "pull_request") {
       // One signal we cannot interpret means the issue is still waiting on
-      // something outside this module's view. Never partially resolve.
+      // something outside this module's view. Never partially resolve. This
+      // runs to completion before any read, so an unresolvable token still
+      // costs zero network calls.
       return { kind: "unresolved", reason: "unresolvable_signal", detail: signal };
     }
     parsed.push(gate);
   }
 
+  // Join each human gate to the declared pull request it names. A bare
+  // `#2686` carries no repository, so a number two different repos both
+  // declare is ambiguous; such a gate is left unjoined and every branch below
+  // then behaves exactly as it did before this join existed.
+  const declaredKeysByNumber = new Map<number, Set<string>>();
+  for (const gate of parsed) {
+    const keys = declaredKeysByNumber.get(gate.prNumber) ?? new Set<string>();
+    keys.add(pullRequestKey(gate.repoFullName, gate.prNumber));
+    declaredKeysByNumber.set(gate.prNumber, keys);
+  }
+  /**
+   * Hold-protocol token -> the one declared pull request it unambiguously
+   * names. Restricted to the hold protocol because the join's only two
+   * consumers are inferences that subset alone licenses: a non-hold gate
+   * naming a pull request establishes neither that the pull request is open
+   * *because of it* nor that its merge discharges the gate. See
+   * `HOLD_PROTOCOL_TOKEN_PREFIXES`.
+   */
+  const subjectKeyByGate = new Map<string, string>();
+  /** The inverse: a declared pull request -> the hold-protocol gates holding it. */
+  const gatedPullRequestKeys = new Set<string>();
+  for (const gate of humanGates) {
+    if (!gate.holdProtocol) continue;
+    if (gate.subjectPullRequestNumber == null) continue;
+    const keys = declaredKeysByNumber.get(gate.subjectPullRequestNumber);
+    if (!keys || keys.size !== 1) continue;
+    const key = [...keys][0]!;
+    subjectKeyByGate.set(gate.raw, key);
+    gatedPullRequestKeys.add(key);
+  }
+
   const cache = input.gateCache ?? new Map<string, PullRequestGateResult>();
   const merged = new Set<string>();
+  /**
+   * Open, and open *because* a human gate on this issue holds it. Collecting
+   * these rather than returning at the first one is the only place this costs
+   * an extra read, and it is bounded to rows that declare a human gate naming
+   * a declared pull request — a row with no human gate still short-circuits on
+   * its first open pull request exactly as before.
+   */
+  const heldOpen = new Set<string>();
   for (const gate of parsed) {
     const key = pullRequestKey(gate.repoFullName, gate.prNumber);
     let result = cache.get(key);
@@ -233,6 +613,19 @@ export async function resolveTerminalGate(input: {
     // Merge is the only satisfied state. `closed` without merge is terminal but
     // the work did not land, so it must not read as "resolved, go close this".
     if (!result.merged) {
+      // An open pull request a declared human gate names is not an outstanding
+      // machine gate — it is the human wait itself, wearing a `pr:` token.
+      // Before this branch that row resolved to `unresolved/pull_request_open`
+      // and was skipped in silence for the entire time it was blocked on a
+      // person, and the notice arrived only after the merge, by which point it
+      // was telling the owner to chase a go that had necessarily already
+      // arrived. A *closed-unmerged* pull request is excluded deliberately:
+      // the work did not land, which is not a thing to announce as "a person
+      // is holding this open".
+      if (result.state !== "closed" && gatedPullRequestKeys.has(key)) {
+        heldOpen.add(key);
+        continue;
+      }
       return {
         kind: "unresolved",
         reason: result.state === "closed" ? "pull_request_closed_unmerged" : "pull_request_open",
@@ -242,12 +635,54 @@ export async function resolveTerminalGate(input: {
     merged.add(key);
   }
 
-  return { kind: "satisfied", signals, mergedPullRequests: [...merged].sort() };
+  // Reached when every declared pull request either merged or is held open by
+  // a hold-protocol gate on this issue. A *hold-protocol* gate whose named
+  // pull request merged is discharged — the merge cannot precede the go, so
+  // the merge is the evidence the go arrived. Nothing else is: a standing
+  // human gate (`signoff:`, `approval:`, `card:`, `*-ruling:`) can name a
+  // decision due *after* the merge, so `subjectKeyByGate` never holds one and
+  // it survives its pull request landing. Anything that still stands means
+  // the issue is not satisfied but is also not *waiting on anything a
+  // re-check could change*, which is the distinction worth announcing.
+  const standingHumanGates: string[] = [];
+  const dischargedHumanGates: string[] = [];
+  for (const gate of humanGates) {
+    const subjectKey = subjectKeyByGate.get(gate.raw);
+    if (subjectKey && merged.has(subjectKey)) dischargedHumanGates.push(gate.raw);
+    else standingHumanGates.push(gate.raw);
+  }
+
+  // Every held-open pull request is held by a hold-protocol gate naming it,
+  // and such a gate is discharged only by that pull request's *merge*, so it
+  // necessarily still stands here: a non-empty `heldOpen` always lands below.
+  if (standingHumanGates.length > 0) {
+    return {
+      kind: "human_gate_only",
+      signals,
+      humanGates: standingHumanGates.sort(),
+      heldPullRequests: [...heldOpen].sort(),
+      mergedPullRequests: [...merged].sort(),
+    };
+  }
+
+  return {
+    kind: "satisfied",
+    signals,
+    mergedPullRequests: [...merged].sort(),
+    dischargedHumanGates: dischargedHumanGates.sort(),
+  };
 }
 
 export function buildTerminalGateResolvedComment(input: {
   signals: readonly string[];
   mergedPullRequests: readonly string[];
+  /**
+   * Human gates discharged by the merge of the pull request they named. Spelt
+   * out in the comment because it is an *inference* — merge implies the go,
+   * under the hold protocol these tokens encode — and an inference a reader
+   * cannot see is one nobody can check.
+   */
+  dischargedHumanGates?: readonly string[];
   /**
    * The monitor's pending first check, for a row admitted by the never-polled
    * arm (BLO-36289). Non-null means the monitor is **armed** — it has a live
@@ -266,6 +701,7 @@ export function buildTerminalGateResolvedComment(input: {
   const armed = input.armedNextCheckAt != null;
   const prLines = input.mergedPullRequests.map((pr) => `- \`${pr}\` — **merged**`).join("\n");
   const signalLines = input.signals.map((signal) => `\`${signal}\``).join(", ");
+  const discharged = input.dischargedHumanGates ?? [];
   return [
     armed
       ? "**Terminal gate resolved — this issue's gate was already satisfied when its monitor was armed.**"
@@ -277,6 +713,16 @@ export function buildTerminalGateResolvedComment(input: {
     "",
     prLines,
     "",
+    ...(discharged.length > 0
+      ? [
+          "This issue also declared a human gate naming one of those pull requests. A hold of that shape cannot be merged through until the go arrives, so the merge is itself the record that it did — there is nothing left to chase:",
+          "",
+          ...discharged.map(
+            (gate) => `- \`${gate}\` — **discharged** by the merge of the pull request it names`,
+          ),
+          "",
+        ]
+      : []),
     `Declared gate signals: ${signalLines}`,
     "",
     armed
@@ -284,6 +730,95 @@ export function buildTerminalGateResolvedComment(input: {
       : "No run was dispatched to produce this — re-reading a pull request is one API call, and waking an agent to do it is not. Nothing here closes the issue: a merged gate proves the gate resolved, not that the acceptance criteria are met. Verify the acceptance criteria against the merged artifact and close, or re-arm the monitor on whatever is genuinely still outstanding.",
     "",
     "_Posted by the terminal-gate reconciler (BLO-27515)._",
+  ].join("\n");
+}
+
+/**
+ * The human-gate announcement (PEN-4545).
+ *
+ * Says one thing the row cannot say for itself: *the waiting is over as far as
+ * any machine is concerned, and the remainder is a person who does not know
+ * this row exists.* It names the gate tokens verbatim so the owner can escalate
+ * the specific ask, and it states plainly that a re-check will return the same
+ * answer forever — because an armed `monitorNextCheckAt` is exactly what made
+ * these rows read as attended while nothing could move them.
+ *
+ * It does not close, clear, dispatch, or file a card. Picking the escalation
+ * route is the owner's call: a card, a named owner on the row, or accepting the
+ * row as frozen are all correct answers depending on the ask, and guessing
+ * between them from here would be the "detector with nobody to tell" failure
+ * one level further out.
+ */
+export function buildTerminalGateHumanOnlyComment(input: {
+  signals: readonly string[];
+  humanGates: readonly string[];
+  /**
+   * Declared pull requests that are open *because* one of `humanGates` holds
+   * them there. This is the live wait in the hold-protocol shape, and the
+   * notice has to read differently for it: the go has not arrived, so chasing
+   * it is exactly right — whereas the same words after the merge were telling
+   * the owner to chase a decision already made.
+   */
+  heldPullRequests?: readonly string[];
+  mergedPullRequests: readonly string[];
+  /** See `buildTerminalGateResolvedComment` — same armed/stranded distinction, same reason. */
+  armedNextCheckAt?: Date | null;
+}) {
+  const armed = input.armedNextCheckAt != null;
+  const humanLines = input.humanGates.map((gate) => `- \`${gate}\` — **waiting on a person**`);
+  const prLines = input.mergedPullRequests.map((pr) => `- \`${pr}\` — merged`);
+  const held = input.heldPullRequests ?? [];
+  const heldLines = held.map((pr) => `- \`${pr}\` — **open, and held open by the gate below**`);
+  // With no PR gates declared, "every machine-checkable gate is satisfied" is
+  // vacuously true and reads as a claim about landed work that nothing here
+  // checked. Say what was actually established instead: the declared gate is
+  // a person, start to finish.
+  const anyMachineGate = prLines.length > 0;
+  const anyHeld = heldLines.length > 0;
+  return [
+    anyHeld
+      ? "**Human gate — a pull request this issue declares is open because a person has not released it. That wait is the whole of the gate.**"
+      : anyMachineGate
+        ? "**Human gate — every machine-checkable gate on this issue is satisfied; what is left is a person.**"
+        : "**Human gate — every gate this issue declares names a person. Nothing here is machine-checkable.**",
+    "",
+    ...(anyHeld
+      ? [
+          "A board-side re-read finds these declared pull requests still open — not because work or CI is outstanding, but because a human gate declared on this same issue names them:",
+          "",
+          ...heldLines,
+          "",
+        ]
+      : []),
+    ...(anyMachineGate
+      ? [
+          anyHeld
+            ? "The other declared pull-request gates are already satisfied:"
+            : "A board-side re-read finds the declared pull-request gates already satisfied:",
+          "",
+          ...prLines,
+          "",
+        ]
+      : []),
+    anyMachineGate || anyHeld
+      ? "The remaining declared gates name a human decision, which nothing on a timer can clear:"
+      : "The declared gates name a human decision, which nothing on a timer can clear:",
+    "",
+    ...humanLines,
+    "",
+    `Declared gate signals: ${input.signals.map((signal) => `\`${signal}\``).join(", ")}`,
+    "",
+    armed
+      ? `The monitor is armed and its next check is due \`${input.armedNextCheckAt!.toISOString()}\`. That check will return this same answer: polling cannot move a human gate, and three unchanged re-checks converge to a stall (BLO-18294). **The monitor still gives this issue a live wake path — do not treat it as stranded and do not repair it as one** — but the wake has no gate left to read.`
+      : "The monitor has stopped re-checking (converged to a stall, was cleared, or its run was killed). Nothing is scheduled to look at this issue again, and the gate it stopped on is one no re-check could ever have cleared.",
+    "",
+    anyHeld
+      ? "**This is not a resolution and nothing here closes the issue.** It is the notice that the pull request is waiting on a person and nothing else, which is the one thing an armed monitor makes invisible: the row reads as attended on every dashboard while no mechanism on the owner's side can answer. Escalate the ask — extend a pending approval card, record a named owner and the exact action on the row, or accept the row as frozen and stop re-checking — rather than re-arming against the same gate. Once the named pull request merges this gate is discharged: no further notice will ask you to chase it, and the sweep posts the verify-and-close notice instead."
+      : anyMachineGate
+      ? "**This is not a resolution and nothing here closes the issue.** It is the notice that the wait is now entirely on a named human, which is the one thing an armed monitor makes invisible: the row reads as attended on every dashboard while no mechanism on the owner's side can answer. Escalate the ask — extend a pending approval card, record a named owner and the exact action on the row, or accept the row as frozen and stop re-checking — rather than re-arming against the same gate."
+      : "**This is not a resolution, says nothing about whether the work is finished, and nothing here closes the issue.** No pull-request gate was declared, so this notice is only about the gate: it is one a person must clear, which is the thing an armed monitor makes invisible — the row reads as attended on every dashboard while no mechanism on the owner's side can answer. Escalate the ask — extend a pending approval card, record a named owner and the exact action on the row, or accept the row as frozen and stop re-checking — rather than re-arming against the same gate.",
+    "",
+    "_Posted by the terminal-gate reconciler (PEN-4545)._",
   ].join("\n");
 }
 
@@ -357,13 +892,56 @@ const gateSignalDigestSql = sql`substr(encode(sha256(convert_to((
   ) as t(signal)
 ), 'UTF8')), 'hex'), 1, 32)`;
 
+/**
+ * "Does this row declare at least one human-gate signal?", in SQL (PEN-4545).
+ *
+ * Generated from `HUMAN_GATE_TOKEN_PREFIXES`, the same array behind
+ * `HUMAN_GATE_TOKEN_PATTERN`, so the two matchers cannot drift. The prefixes
+ * are a fixed literal list of `[a-z-]` tokens, so the interpolated alternation
+ * carries no user input and nothing needs escaping; a prefix containing a
+ * regex metacharacter would break this, which is why the list is `as const`
+ * and not configuration.
+ *
+ * The POSIX `~` pattern mirrors the JS regex exactly, including the optional
+ * `:suffix`, so `cardinality` does not match `card` and `approvals` does not
+ * match `approval`.
+ *
+ * `btrim` because `parseTerminalGateSignal` classifies `raw.trim()`. Without
+ * it a signal stored with surrounding whitespace classifies as `human_gate` in
+ * TS and is never admitted here — fail-closed, but precisely the drift the
+ * shared array exists to prevent. `normalizeIssueMonitorGateSignals` trims on
+ * write, so this only covers a legacy or hand-edited row; that is the case
+ * worth covering, since it is the one nobody would think to check.
+ *
+ * Wrapped in the same `CASE` as the other JSONB predicates, for the same
+ * reason: PostgreSQL does not promise to evaluate a conjunct only after its
+ * neighbour, so `jsonb_array_elements_text` must never see a malformed
+ * object/scalar `gateSignals` — that raises and aborts the whole pass rather
+ * than skipping the one bad row.
+ */
+const humanGateSignalExistsSql = sql`case
+  when jsonb_typeof(${issues.executionState} -> 'monitor' -> 'gateSignals') = 'array'
+    then exists (
+      select 1
+      from jsonb_array_elements_text(${issues.executionState} -> 'monitor' -> 'gateSignals') as t(signal)
+      where btrim(t.signal) ~ ${`^(${HUMAN_GATE_TOKEN_ALTERNATION})(:.*)?$`}
+    )
+  else false end`;
+
 type CandidateRow = {
   id: string;
   companyId: string;
   identifier: string | null;
   executionState: unknown;
-  /** Non-null == admitted by the never-polled arm. Armed only if it can also fire; see the call site. */
+  /**
+   * Non-null means the monitor has a next check scheduled. Before PEN-4545
+   * that implied "admitted by the never-polled arm"; the human-gate arm also
+   * admits actively-polling rows, so it no longer does. Armed only if it can
+   * also fire — see `armedMonitorNextCheckAt`.
+   */
   monitorNextCheckAt: Date | null;
+  /** Real attempt count. The human-gate arm admits rows where this is > 0. */
+  monitorAttemptCount: number | null;
   /** The scheduler's eligibility tuple (`issueAllowsMonitor`); this query does not filter on it. */
   status: string;
   assigneeAgentId: string | null;
@@ -405,10 +983,29 @@ type CandidateRow = {
  * loop, so those cost zero network calls. Added GitHub reads per pass: **1**
  * (`blockcast/onprem-k8s#3823`, deduped per pass by `gateCache`).
  *
+ * ⚠ That census predates PEN-4545 and its bottom line has moved. Two of the
+ * eight prefixes it counts as free — `approval:` and `cto-ruling:` — are now
+ * classified `human_gate` rather than `unresolvable`, so a row declaring one
+ * no longer bails at parse time: it reads its PR tokens like any other
+ * candidate. The parse-before-read ordering is unchanged and still makes a
+ * genuinely unparseable token free, so the increase is confined to the
+ * human-gate class, bounded by `MAX_PULL_REQUEST_READS_PER_PASS` and deduped
+ * per pass by `gateCache`. The "**1** added read per pass" figure should be
+ * re-measured before it is cited again.
+ *
  * No network call is added to `PATCH /api/issues/{id}` — the evaluation stays
  * here, on the sweep, off the monitor-write transaction.
  */
-async function listCandidateIssues(db: Pick<Db, "select">, limit: number): Promise<CandidateRow[]> {
+async function listCandidateIssues(
+  db: Pick<Db, "select">,
+  limit: number,
+  /**
+   * A held-open announcement older than this stops suppressing its row, so
+   * the sweep re-reads the pull request and can post the post-merge notice.
+   * See `HELD_GATE_RECHECK_INTERVAL_MS`.
+   */
+  heldRecheckCutoff: Date,
+): Promise<CandidateRow[]> {
   return db
     .select({
       id: issues.id,
@@ -416,6 +1013,7 @@ async function listCandidateIssues(db: Pick<Db, "select">, limit: number): Promi
       identifier: issues.identifier,
       executionState: issues.executionState,
       monitorNextCheckAt: issues.monitorNextCheckAt,
+      monitorAttemptCount: issues.monitorAttemptCount,
       status: issues.status,
       assigneeAgentId: issues.assigneeAgentId,
       assigneeUserId: issues.assigneeUserId,
@@ -423,8 +1021,46 @@ async function listCandidateIssues(db: Pick<Db, "select">, limit: number): Promi
     .from(issues)
     .where(and(
       notInArray(issues.status, ["done", "cancelled"]),
+      // Three arms. The first two are "the monitor is not polling": terminated,
+      // or armed and not yet evaluated.
+      //
+      // The third (PEN-4545) is the opposite population and is the whole point
+      // of that fix: a monitor that IS actively re-checking, on a gate only a
+      // human can clear. Those rows have `monitorAttemptCount > 0` and a future
+      // `monitorNextCheckAt`, so the first two arms exclude them by
+      // construction — and they are precisely the six rows PEN-4545 measured,
+      // the ones that "politely re-check a gate on a timer while nothing on the
+      // owner's side can ever answer". Without this arm the notice would fire
+      // only before the first poll or after the monitor had already converged
+      // to a stall (~3 polls later, BLO-18294), i.e. only once the row was
+      // already stranded — never in the "reads as actively attended" state that
+      // is the reported defect.
+      //
+      // It is narrow by construction: it admits a row only when a stored gate
+      // signal matches the human-gate allowlist, so an actively-polling row
+      // with only `pr:`/`deploy:`/`mq:` gates is not readmitted and its polling
+      // cadence is untouched. Re-announcement is bounded by the anti-join
+      // below, once per signal set. The cost it does add is a PR read per pass
+      // for an actively-polling human-gate row whose PRs have not all merged
+      // (it reaches `resolveTerminalGate` and fails closed there); that is
+      // bounded by `MAX_PULL_REQUEST_READS_PER_PASS` and deduped by `gateCache`.
+      //
+      // ⚠ Known, accepted, and worth re-reading if the class grows: such a row
+      // is never announced, so the anti-join never retires it, and under
+      // `updatedAt ASC` the oldest of them sit at the head of both the
+      // `SCAN_LIMIT` window and the read budget — ahead of the stranded
+      // population this module was built for. A *held-open* row joins that
+      // head of the list too, but only once per `HELD_GATE_RECHECK_INTERVAL_MS`
+      // rather than on every pass, which is the whole reason that interval
+      // exists instead of a plain re-admission. That is the same starvation
+      // shape the anti-join's own comment describes, reached by a row that is
+      // legitimately unresolvable rather than by a bookkeeping bug. At the six
+      // rows PEN-4545 measured it is noise. If this class reaches a scale
+      // where it can crowd out the other two arms, give it its own share of
+      // the budget or order it last, rather than widening the caps.
       sql`(${issues.monitorNextCheckAt} is null
-            or (${issues.monitorAttemptCount} = 0 and ${issues.monitorLastTriggeredAt} is null))`,
+            or (${issues.monitorAttemptCount} = 0 and ${issues.monitorLastTriggeredAt} is null)
+            or ${humanGateSignalExistsSql})`,
       visibleIssueCondition(),
       // One CASE, not two ANDed predicates: PostgreSQL does not promise to
       // evaluate a WHERE conjunct only after its neighbour, so a separate
@@ -435,10 +1071,27 @@ async function listCandidateIssues(db: Pick<Db, "select">, limit: number): Promi
       sql`case when jsonb_typeof(${issues.executionState} -> 'monitor' -> 'gateSignals') = 'array'
             then jsonb_array_length(${issues.executionState} -> 'monitor' -> 'gateSignals')
             else 0 end > 0`,
+      // The two terminal findings retire a row for good; the provisional
+      // held-open one retires it only until `heldRecheckCutoff`. Expressing
+      // that as one `not exists` with an OR rather than two is deliberate:
+      // the row must stay out of the window while ANY suppressing
+      // announcement applies, and a second `not exists` would have to repeat
+      // the whole correlated subquery and its digest.
       sql`not exists (
         select 1 from issue_comments resolved_comment
         where resolved_comment.issue_id = ${issues.id}
-          and resolved_comment.idempotency_key = ${TERMINAL_GATE_RESOLVED_IDEMPOTENCY_PREFIX}::text || ${gateSignalDigestSql}
+          and (
+            resolved_comment.idempotency_key in (
+              ${TERMINAL_GATE_RESOLVED_IDEMPOTENCY_PREFIX}::text || ${gateSignalDigestSql},
+              ${TERMINAL_GATE_HUMAN_ONLY_IDEMPOTENCY_PREFIX}::text || ${gateSignalDigestSql}
+            )
+            or (
+              resolved_comment.idempotency_key
+                = ${TERMINAL_GATE_HELD_IDEMPOTENCY_PREFIX}::text || ${gateSignalDigestSql}
+              and coalesce(resolved_comment.idempotency_processed_at, resolved_comment.created_at)
+                    > ${heldRecheckCutoff.toISOString()}::timestamptz
+            )
+          )
           and resolved_comment.author_agent_id is null
           and resolved_comment.author_user_id is null
           and resolved_comment.deleted_at is null
@@ -448,14 +1101,37 @@ async function listCandidateIssues(db: Pick<Db, "select">, limit: number): Promi
     .limit(limit);
 }
 
-/** Idempotency keys already recorded for these issues, so a resolved gate is announced once. */
+/**
+ * Announcement keys already recorded for these issues, with the time each was
+ * last *affirmed*, so each finding is reported once per signal set. Callers
+ * pass every key an issue could be suppressed by — resolved, human-only and
+ * held-open — because any of them means this signal set has already been
+ * announced.
+ *
+ * "Last affirmed" is `idempotency_processed_at`, falling back to `created_at`.
+ * For the two terminal keys the two are the same instant and the distinction
+ * is irrelevant: nothing ever re-admits those rows. For the held key they
+ * diverge on purpose — a still-held re-check refreshes
+ * `idempotency_processed_at` without posting a second comment, so the window
+ * measures time since the last *look*, not since the first announcement. The
+ * `coalesce` is what keeps a row written before this column was set behaving
+ * as it did, rather than becoming permanently eligible.
+ *
+ * The timestamp is returned rather than folded into a boolean here because
+ * only one of the three keys is time-bounded, and the caller is the layer that
+ * knows which: see `HELD_GATE_RECHECK_INTERVAL_MS`.
+ */
 async function listExistingResolutionKeys(
   db: Pick<Db, "select">,
   candidates: Array<{ id: string; key: string }>,
-): Promise<Set<string>> {
-  if (candidates.length === 0) return new Set();
+): Promise<Map<string, Date>> {
+  if (candidates.length === 0) return new Map();
   const rows = await db
-    .select({ issueId: issueComments.issueId, idempotencyKey: issueComments.idempotencyKey })
+    .select({
+      issueId: issueComments.issueId,
+      idempotencyKey: issueComments.idempotencyKey,
+      affirmedAt: sql<Date>`coalesce(${issueComments.idempotencyProcessedAt}, ${issueComments.createdAt})`,
+    })
     .from(issueComments)
     .where(and(
       inArray(issueComments.issueId, candidates.map((c) => c.id)),
@@ -464,7 +1140,9 @@ async function listExistingResolutionKeys(
       isNull(issueComments.authorUserId),
       isNull(issueComments.deletedAt),
     ));
-  return new Set(rows.map((row) => `${row.issueId}\u0000${row.idempotencyKey ?? ""}`));
+  return new Map(
+    rows.map((row) => [`${row.issueId}\u0000${row.idempotencyKey ?? ""}`, new Date(row.affirmedAt)]),
+  );
 }
 
 /**
@@ -494,6 +1172,14 @@ export async function listResolvedTerminalGates(
   // trusted GitHub work product of this issue. The reconciler itself may still
   // announce an unbound gate, but the productivity detector must not let that
   // announcement retire accountability.
+  //
+  // The `kind === "pull_request"` test is also what keeps a `human_gate` token
+  // (PEN-4545) out of this map, and that is load-bearing rather than
+  // incidental. A human-only announcement states the issue is *not* resolved
+  // and is waiting on a person who has not been told — the case where
+  // oversight is most warranted, not least. It is also keyed under its own
+  // prefix, so the lookup below cannot match it even if this filter changed.
+  // Do not relax either guard to "every gate this module understands".
   const workProductRows = await db
     .select({ issueId: issueWorkProducts.issueId, externalId: issueWorkProducts.externalId })
     .from(issueWorkProducts)
@@ -545,6 +1231,52 @@ export async function listResolvedTerminalGates(
 }
 
 /**
+ * The monitor's next check when — and only when — that check is a wake that
+ * will actually happen. `null` means "treat this row as stranded".
+ *
+ * Only a check still in the FUTURE is a live wake path. A non-null
+ * `monitorNextCheckAt` here always means the row came in via the never-polled
+ * arm (the other arm requires it to be null), but an *overdue* first check is
+ * by definition a wake that did not happen — so claiming "live wake path, do
+ * not treat as stranded" over it would be the mirror of the false signal this
+ * branch exists to avoid. The stranded copy, including its re-arm advice, is
+ * the true one there.
+ *
+ * A future check is necessary but not sufficient, on two independent counts.
+ * First, the scheduler only ever selects rows `issueAllowsMonitor` admits, and
+ * `listCandidateIssues` admits every status but done/cancelled by design (the
+ * blocked -> todo restore population). Second, selection is not the same
+ * question as whether the monitor has any road left:
+ * `exhaustedMonitorClearReason` returns `timeout_exceeded` off `timeoutAt`
+ * alone, and nothing constrains `nextCheckAt <= timeoutAt` — "check in 6h, give
+ * up after 2h" arms fine, and the scheduler's next evaluation clears it rather
+ * than firing it. Either way a future check is a wake that will never happen,
+ * so it gets the stranded copy too.
+ *
+ * The row's REAL `monitorAttemptCount` is passed, not a literal `0`. Before
+ * PEN-4545 the two were the same thing — a non-null `monitorNextCheckAt` could
+ * only have come in via the never-polled arm, whose predicate *is*
+ * `monitorAttemptCount = 0` — but the human-gate arm admits actively-polling
+ * rows, where hardcoding `0` would under-report `max_attempts_exhausted` and
+ * promise a live wake path to a monitor that has none. `defaultMaxAttempts`
+ * stays omitted: an issue-level `maxAttempts` is a declared bound this module
+ * should honour, while the scheduler's fleet-wide ceiling is its own business.
+ */
+function armedMonitorNextCheckAt(candidate: CandidateRow, now: Date): Date | null {
+  if (candidate.monitorNextCheckAt === null) return null;
+  if (candidate.monitorNextCheckAt.getTime() <= now.getTime()) return null;
+  if (!issueAllowsMonitor(candidate.status, candidate.assigneeAgentId, candidate.assigneeUserId)) {
+    return null;
+  }
+  const exhausted = exhaustedMonitorClearReason({
+    monitor: readIssueMonitorBounds(candidate.executionState),
+    attemptCount: candidate.monitorAttemptCount ?? 0,
+    now,
+  });
+  return exhausted === null ? candidate.monitorNextCheckAt : null;
+}
+
+/**
  * One reconciler pass. Safe to run from every worker replica: the comment
  * insert is guarded by `issue_comments_issue_system_idempotency_idx` (unique on
  * `(issue_id, idempotency_key)` for system-authored rows) with
@@ -566,24 +1298,49 @@ export async function reconcileTerminalGates(
   const maxReads = Math.max(1, options.maxPullRequestReads ?? MAX_PULL_REQUEST_READS_PER_PASS);
   const now = options.now ?? new Date();
 
-  const candidates = await listCandidateIssues(db, Math.max(1, options.scanLimit ?? SCAN_LIMIT));
-  if (candidates.length === 0) return { scanned: 0, resolved: 0, pullRequestReads: 0 };
+  const heldRecheckCutoff = new Date(now.getTime() - HELD_GATE_RECHECK_INTERVAL_MS);
+  const candidates = await listCandidateIssues(
+    db,
+    Math.max(1, options.scanLimit ?? SCAN_LIMIT),
+    heldRecheckCutoff,
+  );
+  if (candidates.length === 0) {
+    return { scanned: 0, resolved: 0, humanGateOnly: 0, pullRequestReads: 0 };
+  }
 
   const withSignals = candidates
     .map((candidate) => ({ candidate, signals: readIssueMonitorGateSignals(candidate.executionState) }))
     .filter((entry) => entry.signals.length > 0)
-    .map((entry) => ({ ...entry, key: terminalGateResolutionIdempotencyKey(entry.signals) }));
+    .map((entry) => ({
+      ...entry,
+      key: terminalGateResolutionIdempotencyKey(entry.signals),
+      humanOnlyKey: terminalGateHumanOnlyIdempotencyKey(entry.signals),
+      heldKey: terminalGateHeldIdempotencyKey(entry.signals),
+    }));
 
-  // Drop anything already announced before spending a single API call.
+  // Drop anything already announced — under any of the three findings — before
+  // spending a single API call. This mirrors the SQL anti-join exactly,
+  // including the held key's cutoff: the SQL is the cheap filter and this is
+  // the authoritative one, and a disagreement between them would either
+  // re-announce or silently starve.
   const alreadyResolved = await listExistingResolutionKeys(
     db,
-    withSignals.map((entry) => ({ id: entry.candidate.id, key: entry.key })),
+    withSignals.flatMap((entry) => [
+      { id: entry.candidate.id, key: entry.key },
+      { id: entry.candidate.id, key: entry.humanOnlyKey },
+      { id: entry.candidate.id, key: entry.heldKey },
+    ]),
   );
-  const pending = withSignals.filter(
-    (entry) => !alreadyResolved.has(`${entry.candidate.id}\u0000${entry.key}`),
-  );
+  const pending = withSignals.filter((entry) => {
+    if (alreadyResolved.has(`${entry.candidate.id}\u0000${entry.key}`)) return false;
+    if (alreadyResolved.has(`${entry.candidate.id}\u0000${entry.humanOnlyKey}`)) return false;
+    // Provisional: a held-open announcement suppresses its row only until the
+    // cutoff, so the merge of the pull request it named can still be seen.
+    const heldAt = alreadyResolved.get(`${entry.candidate.id}\u0000${entry.heldKey}`);
+    return !(heldAt && heldAt.getTime() > heldRecheckCutoff.getTime());
+  });
   if (pending.length === 0) {
-    return { scanned: candidates.length, resolved: 0, pullRequestReads: 0 };
+    return { scanned: candidates.length, resolved: 0, humanGateOnly: 0, pullRequestReads: 0 };
   }
 
   // A live blocker edge is part of the gate set (BLO-18294 folds unresolved
@@ -605,6 +1362,7 @@ export async function reconcileTerminalGates(
 
   const gateCache = new Map<string, PullRequestGateResult>();
   let resolved = 0;
+  let humanGateOnly = 0;
   let readCapped = 0;
   for (const entry of pending) {
     if (!dependencyReady.has(entry.candidate.id)) continue;
@@ -615,10 +1373,20 @@ export async function reconcileTerminalGates(
       gateCache,
       maxPullRequestReads: maxReads,
     });
-    if (verdict.kind !== "satisfied") {
+    if (verdict.kind === "unresolved") {
       if (verdict.reason === "pull_request_read_cap") readCapped += 1;
       continue;
     }
+
+    const armedNextCheckAt = armedMonitorNextCheckAt(entry.candidate, now);
+    const isHumanOnly = verdict.kind === "human_gate_only";
+    // Three findings, three keys. A held-open row re-admitted past its cutoff
+    // and still held lands back here, conflicts on the held key, and inserts
+    // nothing — so the re-check costs a pull-request read and never a second
+    // comment. Once that pull request merges the verdict changes and so does
+    // the key, which is the whole point of separating them.
+    const isHeld = isHumanOnly && verdict.heldPullRequests.length > 0;
+    const idempotencyKey = isHeld ? entry.heldKey : isHumanOnly ? entry.humanOnlyKey : entry.key;
 
     const inserted = await db
       .insert(issueComments)
@@ -626,57 +1394,80 @@ export async function reconcileTerminalGates(
         companyId: entry.candidate.companyId,
         issueId: entry.candidate.id,
         authorType: "system",
-        idempotencyKey: entry.key,
+        idempotencyKey,
         idempotencyProcessedAt: now,
-        body: buildTerminalGateResolvedComment({
-          signals: verdict.signals,
-          mergedPullRequests: verdict.mergedPullRequests,
-          // Only a check still in the FUTURE is a live wake path. A non-null
-          // `monitorNextCheckAt` here always means the row came in via the
-          // never-polled arm (the other arm requires it to be null), but an
-          // *overdue* first check is by definition a wake that did not happen —
-          // so claiming "live wake path, do not treat as stranded" over it would
-          // be the mirror of the false signal this branch exists to avoid. The
-          // stranded copy, including its re-arm advice, is the true one there.
-          //
-          // A future check is necessary but not sufficient, on two independent
-          // counts. First, the scheduler only ever selects rows
-          // `issueAllowsMonitor` admits, and this query admits every status but
-          // done/cancelled by design (the blocked -> todo restore population).
-          // Second, selection is not the same question as whether the monitor
-          // has any road left: `exhaustedMonitorClearReason` returns
-          // `timeout_exceeded` off `timeoutAt` alone, and nothing constrains
-          // `nextCheckAt <= timeoutAt` — "check in 6h, give up after 2h" arms
-          // fine, and the scheduler's next evaluation clears it rather than
-          // firing it. Either way a future check is a wake that will never
-          // happen, so it gets the stranded copy too.
-          //
-          // `attemptCount: 0` is the literal truth here rather than a
-          // simplification: a non-null `monitorNextCheckAt` can only have come
-          // in via the never-polled arm, whose predicate *is*
-          // `monitorAttemptCount = 0`. `defaultMaxAttempts` is deliberately
-          // omitted — the scheduler's ceiling is about repeated polling, and
-          // nothing has polled yet.
-          armedNextCheckAt:
-            entry.candidate.monitorNextCheckAt !== null
-              && entry.candidate.monitorNextCheckAt.getTime() > now.getTime()
-              && issueAllowsMonitor(
-                entry.candidate.status,
-                entry.candidate.assigneeAgentId,
-                entry.candidate.assigneeUserId,
-              )
-              && exhaustedMonitorClearReason({
-                monitor: readIssueMonitorBounds(entry.candidate.executionState),
-                attemptCount: 0,
-                now,
-              }) === null
-              ? entry.candidate.monitorNextCheckAt
-              : null,
-        }),
+        body: isHumanOnly
+          ? buildTerminalGateHumanOnlyComment({
+              signals: verdict.signals,
+              humanGates: verdict.humanGates,
+              heldPullRequests: verdict.heldPullRequests,
+              mergedPullRequests: verdict.mergedPullRequests,
+              armedNextCheckAt,
+            })
+          : buildTerminalGateResolvedComment({
+              signals: verdict.signals,
+              mergedPullRequests: verdict.mergedPullRequests,
+              dischargedHumanGates: verdict.dischargedHumanGates,
+              armedNextCheckAt,
+            }),
       })
       .onConflictDoNothing()
       .returning({ id: issueComments.id });
-    if (inserted.length === 0) continue;
+    if (inserted.length === 0) {
+      // A still-held re-check: the comment already says what this pass would
+      // say, so nothing is posted — but the *window* has to restart here or
+      // the interval throttles only the first re-read. `created_at` is fixed
+      // at the first announcement, so once it ages past the cutoff it stays
+      // past it, and the row is re-admitted on every pass until the pull
+      // request merges — ~144 reads a day against the ~4 this interval and
+      // the runbook promise, camped at the head of an `updatedAt ASC` scan
+      // ahead of the stranded population. Stamping the affirmation time is
+      // what makes the cadence a real cadence rather than a one-shot delay.
+      //
+      // Only the held key is refreshed. The two terminal keys suppress
+      // unconditionally and must not acquire a cadence by accident.
+      //
+      // This write is deliberately invisible to everything that measures
+      // activity, and both halves of that are load-bearing. The
+      // `last_activity_at` bump on `issue_comments` is AFTER INSERT only, so
+      // re-checking a stranded row does not make it look freshly active to a
+      // staleness audit — the row is exactly as stuck after the look as
+      // before it, and should read that way. The digest touch-lock
+      // (`human_gated_digest_lock_updated_comment_issues`) is AFTER UPDATE but
+      // only locks issues touched by a *user*-authored comment; this one is
+      // system-authored with both author columns null, so it takes no lock. A
+      // change that widened either trigger, or that touched `updatedAt` here,
+      // would turn a cheap bookkeeping stamp into a visible edit.
+      if (isHeld) {
+        await db
+          .update(issueComments)
+          .set({ idempotencyProcessedAt: now })
+          .where(and(
+            eq(issueComments.issueId, entry.candidate.id),
+            eq(issueComments.idempotencyKey, idempotencyKey),
+            isNull(issueComments.authorAgentId),
+            isNull(issueComments.authorUserId),
+            isNull(issueComments.deletedAt),
+          ));
+      }
+      continue;
+    }
+
+    if (isHumanOnly) {
+      humanGateOnly += 1;
+      log.info(
+        {
+          issueId: entry.candidate.id,
+          identifier: entry.candidate.identifier,
+          assigneeAgentId: entry.candidate.assigneeAgentId,
+          humanGates: verdict.humanGates,
+          mergedPullRequests: verdict.mergedPullRequests,
+          gateSignals: verdict.signals,
+        },
+        "terminal-gate reconciler announced an issue whose only remaining gate is a human decision (PEN-4545)",
+      );
+      continue;
+    }
 
     resolved += 1;
     log.info(
@@ -702,7 +1493,7 @@ export async function reconcileTerminalGates(
     );
   }
 
-  return { scanned: candidates.length, resolved, pullRequestReads: gateCache.size };
+  return { scanned: candidates.length, resolved, humanGateOnly, pullRequestReads: gateCache.size };
 }
 
 /**

@@ -105,9 +105,9 @@ async function main() {
         `designer lockfile ${path} resolved fast-uri ${fastUri.version}, vulnerable per ${fastUriAdvisoriesFor(fastUri.version).join(", ")}`,
       );
     }
-    assertIncludes(lockfile, "undici@6.29.0:", "lockfile");
-    assertIncludes(lockfile, "undici@7.30.0:", "lockfile");
-    assertIncludes(lockfile, "multer@2.3.0:", "lockfile");
+    assertIncludes(lockfile, "undici@6.29.1:", "lockfile");
+    assertIncludes(lockfile, "undici@7.30.1:", "lockfile");
+    assertIncludes(lockfile, "multer@2.5.0:", "lockfile");
     assertIncludes(lockfile, "'@babel/core@7.29.7':", "lockfile");
     assertIncludes(lockfile, "esbuild@0.28.1:", "lockfile");
     assertIncludes(lockfile, "js-yaml@4.3.2:", "lockfile");
@@ -123,13 +123,13 @@ async function main() {
     assertIncludes(uiViteConfig, "optimizeDeps", "ui vite config");
     assert.match(
       lockfile,
-      /^  '@connectrpc\/connect-node@1\.7\.0(?:\([^\n]*\))?':\n(?: {4,}[^\n]*\n)*?      undici: 6\.29\.0$/m,
-      "@connectrpc/connect-node must resolve undici 6.29.0",
+      /^  '@connectrpc\/connect-node@1\.7\.0(?:\([^\n]*\))?':\n(?: {4,}[^\n]*\n)*?      undici: 6\.29\.1$/m,
+      "@connectrpc/connect-node must resolve undici 6.29.1",
     );
     assert.match(
       lockfile,
-      /^  jsdom@28\.1\.0(?:\([^\n]*\))?:\n(?: {4,}[^\n]*\n)*?      undici: 7\.30\.0$/m,
-      "jsdom must resolve undici 7.30.0",
+      /^  jsdom@28\.1\.0(?:\([^\n]*\))?:\n(?: {4,}[^\n]*\n)*?      undici: 7\.30\.1$/m,
+      "jsdom must resolve undici 7.30.1",
     );
 
     const audit = await runPnpm(

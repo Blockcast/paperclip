@@ -31,6 +31,21 @@ function executableLines(source) {
     .join("\n");
 }
 
+// Steps are at indent 6 under `steps:`. Same shape as getJobBlock: slice from
+// this step's `- name:` to the next one at the same indent.
+function getStepBlock(name, source = workflow) {
+  const marker = `      - name: ${name}\n`;
+  const start = source.indexOf(marker);
+  assert.notEqual(start, -1, `docker-agent.yml must define a step named ${name}`);
+  const remainder = source.slice(start + marker.length);
+  const nextStep = remainder.search(/^ {6}- name: /m);
+  return nextStep === -1 ? remainder : remainder.slice(0, nextStep);
+}
+
+const CONTROL_STEP =
+  "Prove a shadowing PVC browser cannot outrank the pinned one (PEN-4682 positive control)";
+const SMOKE_STEP = "Smoke test restricted headless screenshot";
+
 // BLO-33382: the defect this whole file exists to prevent recurring. The alert
 // job called `gh issue list` / `gh issue create` against a repository with
 // Issues DISABLED, so under `set -euo pipefail` it died before reporting
@@ -345,4 +360,152 @@ test("reintroducing cancel-in-progress: true falsifies the delivery assertion", 
     /^\s*cancel-in-progress: true$/m,
     "the guard must read the executed key, not the comment above it that quotes the old value",
   );
+});
+// PEN-4682: the control that shipped in #2988 could never go red, so every
+// master agent-image build failed at it -- inside build-and-push, upstream of
+// `Promote verified agent image` -- and the Alertmanager lane fired on each
+// one. Docker mounts `--tmpfs` noexec unless `exec` is given, so the planted
+// /paperclip/bin/google-chrome was never executable however it was chmodded;
+// bash `command -v` skips a PATH match it cannot execute, so the canary
+// skipped the plant, fell through to $CHROME_BIN (/usr/local/bin/google-chrome,
+// on the default PATH) and PASSED exactly where (b) requires it to fail. The
+// step then printed CONTROL FAILED and blamed the image.
+//
+// WHY STATIC, AND WHY HERE. docker-agent.yml runs only on `workflow_run` of
+// Docker on master and on workflow_dispatch, so no PR lane ever executes that
+// step -- #2988 went in with 25 green checks and the defect was invisible
+// until it reached trunk. This suite does run on PRs, so these assertions are
+// the only thing standing between a future edit of that mount and another
+// round of red master builds.
+test("the shadowing control plants on an exec-capable tmpfs, or it can never go red", () => {
+  const control = executableLines(getStepBlock(CONTROL_STEP));
+
+  assert.match(
+    control,
+    /--tmpfs \/paperclip:rw,exec,nosuid,size=\d+m,mode=1777 /,
+    "the PEN-4682 control must mount /paperclip with `exec` and `mode=1777`: Docker defaults --tmpfs to noexec " +
+      "and root-owned 0755. Without mode=1777 the uid-1000 mkdir is denied and the step reds before " +
+      "any control runs (BLO-33389); without exec the plant is skipped by `command -v`, so control (b) passes when it must " +
+      "red and the step fails every master build (PEN-4682)",
+  );
+});
+
+test("the control proves the plant is executable before drawing a conclusion from it", () => {
+  const control = executableLines(getStepBlock(CONTROL_STEP));
+
+  assert.match(
+    control,
+    /^\s*test -x \/paperclip\/bin\/google-chrome$/m,
+    "the control must assert the plant is executable right after the chmod: under `sh -eu` that " +
+      "fails at the cause, instead of surfacing four lines later as a CONTROL FAILED that blames " +
+      "the image for the control's own broken mount (PEN-4682)",
+  );
+});
+
+// The image ENTRYPOINT runs ahead of the control's `sh -eu -c`. Once mode=1777
+// made /paperclip writable by uid 1000, install_browser_link's own `mkdir -p`
+// started succeeding too, so it now seeds /paperclip/bin/google-chrome as a
+// symlink to $CHROME_BIN before the plant is written. Shell `>` follows
+// symlinks, so the plant would write through to the real browser on the
+// --read-only rootfs (EROFS on CI; reproduced locally as EACCES, rc=2) -- and
+// had it landed, the plant would BE the pinned browser, so control (b) would
+// pass and the step would print CONTROL FAILED against a healthy image.
+// The two executed lines whose ORDER the control depends on, shared so the
+// assertion and its falsification partner cannot drift apart.
+const UNLINK_LINE = /^\s*rm -f \/paperclip\/bin\/google-chrome$/m;
+const PLANT_LINE = /^\s*printf "[^"]*" > \/paperclip\/bin\/google-chrome$/m;
+
+test("the control unlinks the entrypoint-seeded symlink before planting", () => {
+  const control = executableLines(getStepBlock(CONTROL_STEP));
+
+  assert.match(
+    control,
+    /^\s*rm -f \/paperclip\/bin\/google-chrome$/m,
+    "the control must `rm -f /paperclip/bin/google-chrome` between the mkdir and the printf: the " +
+      "image entrypoint seeds that path as a symlink to $CHROME_BIN, and `>` follows symlinks, so " +
+      "without the unlink the plant writes through to the read-only rootfs and the step reds at " +
+      "the printf instead of proving anything (PEN-4682)",
+  );
+
+  // Presence is not enough: an unlink that runs AFTER the printf removes the
+  // plant the control is about to rely on, and one that runs after the whole
+  // write-through has already failed removes nothing. Pin the order too.
+  const unlinkAt = control.search(UNLINK_LINE);
+  const plantAt = control.search(PLANT_LINE);
+  assert.ok(plantAt >= 0, "fixture check: the printf plant line must be present to order against");
+  assert.ok(
+    unlinkAt < plantAt,
+    "the unlink must precede the printf: after it, the `>` has already followed the " +
+      "entrypoint's symlink to $CHROME_BIN on the read-only rootfs, and the unlink would then " +
+      "delete the plant control (a) and (b) resolve through (PEN-4682)",
+  );
+});
+
+test("moving the unlink after the plant falsifies the ordering assertion", () => {
+  const poisoned = workflow
+    .replace("              rm -f /paperclip/bin/google-chrome\n", "")
+    .replace(
+      '              printf "#!/bin/sh\\nexit 0\\n" > /paperclip/bin/google-chrome\n',
+      '              printf "#!/bin/sh\\nexit 0\\n" > /paperclip/bin/google-chrome\n' +
+        "              rm -f /paperclip/bin/google-chrome\n",
+    );
+  assert.notEqual(poisoned, workflow, "fixture check: both literals must be present to be swapped");
+
+  const control = executableLines(getStepBlock(CONTROL_STEP, poisoned));
+  assert.match(control, UNLINK_LINE, "fixture check: the moved unlink is still present, just later");
+  assert.ok(
+    control.search(UNLINK_LINE) > control.search(PLANT_LINE),
+    "the guard must read position, not mere presence: a trailing unlink satisfies a " +
+      "presence-only assertion while deleting the plant",
+  );
+});
+
+test("dropping the unlink falsifies the plant assertion", () => {
+  const poisoned = workflow.replace("              rm -f /paperclip/bin/google-chrome\n", "");
+  assert.notEqual(poisoned, workflow, "fixture check: the literal must be present to be removed");
+
+  assert.doesNotMatch(
+    executableLines(getStepBlock(CONTROL_STEP, poisoned)),
+    /^\s*rm -f \/paperclip\/bin\/google-chrome$/m,
+    "the guard must read the executed unlink, not the comment above it that names the same path",
+  );
+});
+
+// Scope check. `exec` is needed only where this step writes and runs its own
+// planted script; the plain smoke step plants nothing, so widening its mount
+// would be unearned.
+test("the plain smoke step keeps /paperclip noexec, because it plants nothing", () => {
+  const smoke = executableLines(getStepBlock(SMOKE_STEP));
+
+  assert.match(smoke, /--tmpfs \/paperclip:rw,nosuid,size=\d+m/);
+  assert.doesNotMatch(
+    smoke,
+    /--tmpfs \/paperclip:[^\s]*\bexec\b/,
+    "the smoke step must not gain `exec`: it plants no executable, so the mount stays as narrow " +
+      "as it has always been",
+  );
+});
+
+test("dropping exec from the control's tmpfs falsifies the assertion", () => {
+  const poisoned = workflow.replace(
+    "--tmpfs /paperclip:rw,exec,nosuid,size=16m",
+    "--tmpfs /paperclip:rw,nosuid,size=16m",
+  );
+  assert.notEqual(poisoned, workflow, "fixture check: the literal must be present to be swapped");
+
+  assert.doesNotMatch(
+    executableLines(getStepBlock(CONTROL_STEP, poisoned)),
+    /--tmpfs \/paperclip:rw,exec,nosuid,size=\d+m,mode=1777 /,
+    "the guard must read the executed mount flag, not the comment above it that names noexec",
+  );
+});
+
+test("the step-block extractor cannot bleed into a later step", () => {
+  const control = getStepBlock(CONTROL_STEP);
+  assert.doesNotMatch(
+    control,
+    /Assert the agent image's git-config surface/,
+    "getStepBlock must stop at the next step, or an assertion could be satisfied by a neighbour",
+  );
+  assert.match(control, /control \(b\): wrapper directory absent/, "fixture check: it kept its own body");
 });

@@ -1426,6 +1426,140 @@ paperclip. The paperclip-scoped series are `pg_paperclip_db_backends_backends`,
 Until an exporter exists, per-statement latency, lock waits, long transactions
 and table bloat on this database are not observable from Prometheus at all.
 
+## Transient retry clamp signature (PEN-4145)
+
+`PaperclipTransientRetryClampSignature` fires when the aligned **share** of
+`transient_failure` retry-FLOOR decisions over 24h reaches 0.05, across at least
+30 such decisions. It means the PEN-2509 herd is re-forming: a cohort of runs is
+being parked onto a shared wake instant and will resume in lockstep into the
+dependency whose degradation created the cohort.
+
+### Read this first: the alert exists because the subject was unobservable
+
+PEN-2509 routes a transient retry floor down one of two branches — adopt the
+capacity arithmetic's own output verbatim, or disperse a raw provider instant
+with per-run jitter. Until `paperclip_transient_retry_floor_total`, **neither
+branch emitted a counter, a gauge, or a log line above `debug`**. The only
+durable trace that a dispersion decision had been made was the
+`scheduled_retry_at` value itself, on a run row.
+
+That is not an abstract gap:
+
+| when | what |
+|---|---|
+| 2026-08-29 | PEN-2509 closed. AC4 recorded as *unmeasurable-at-close, sample size 0* — the upstream was quiet, so there was nothing to measure |
+| 08-29 → 10-12 | The shipped fix **did not work**. `isCapacityGovernedRetryFloor` keyed its exemption on `providerCapacityResetProvenance`, which the finalize path writes for every recovered reset, so it exempted exactly the population that herds |
+| 2026-10-12 | @Ceo re-measured **by hand** and found the clamp signature still at 16.55% (160/967, ~99× chance), with 4 agents sharing `scheduledRetryAt` to 0.000s. Filed PEN-4015 |
+
+Six weeks live, fleet-wide and wrong, found only because a person went looking.
+PR #2709 fixed the predicate; this alert fixes the blindness that hid the first
+attempt.
+
+### Triage — the disposition label tells you which failure this is
+
+Always start here, before touching a run row:
+
+```promql
+sum by (disposition, alignment) (increase(paperclip_transient_retry_floor_total[24h]))
+```
+
+- **Alignment concentrated in `disposition=~"exempt_.*"`** — the exemption
+  predicate is routing a verbatim provider instant down the exempt branch. This
+  is the PEN-2509 signature exactly. Read `isCapacityGovernedRetryFloor` in
+  `server/src/services/ccrotate-capacity-retry.ts`.
+
+  The two exempt values are split **on purpose**. A predicate regression does not
+  move the exempt *share* — it moves which marker produces it — so an
+  undifferentiated `exempt` would have read identically before and after the
+  2026-08-29 fix failed. Compare `exempt_capacity_governed` against
+  `exempt_horizon_clamped`, not the pair against `dispersed`.
+- **Alignment in `disposition="dispersed"`** — the jitter itself has stopped
+  working. Different and rarer defect; check
+  `TRANSIENT_RETRY_FLOOR_JITTER_MAX_MS` and the `random` injection in
+  `jitterTransientRetryFloor`.
+- **`alignment="ten_minute_grid"` specifically** — implicates an advertised
+  `retry_after_seconds` reset adopted verbatim, since that horizon is computed
+  off a 10-minute bucket edge. 76/76 of the whole-second parks measured on
+  2026-10-13 sat here.
+
+Then confirm against the rows, looking for agents sharing an instant to 0.000s:
+
+```sql
+select id, agent_id, scheduled_retry_at, scheduled_retry_reason, scheduled_retry_attempt
+from heartbeat_runs
+where scheduled_retry_reason = 'transient_failure'
+  and scheduled_retry_at is not null
+  and updated_at > now() - interval '24 hours'
+order by scheduled_retry_at;
+```
+
+### Why a share, and why these numbers
+
+The clamp arrives in **bursts** tied to upstream flapping — measured 0 parks/day
+on 2026-10-13..15 against 132/day on 2026-10-05 — so no count threshold can both
+catch a regression during a burst and stay quiet outside one. The aligned share
+is scale-free.
+
+Whole-second alignment is the discriminator because `jitterTransientRetryFloor`
+adds `Math.floor(sample * windowMs)` **milliseconds**: a dispersed instant lands
+on a whole second with p≈1/1000 and on the `:M9:59` grid with p≈1/600,000, while
+a verbatim provider instant lands on one with p≈1. Four orders of magnitude,
+which is what makes the test work on a population of tens rather than thousands —
+spread needs a cohort, alignment needs one row.
+
+Measured over 200k deterministic draws in
+`server/src/__tests__/transient-retry-floor-clamp-signature.test.ts`: a dispersed
+population reads **0.0995%** aligned, a verbatim one reads **100%**. Recorded
+pre-fix baselines are **20.43%** (153/749) unconditional and **94.03%**
+(126/134) within the clamped population. So 0.05 sits 50× above the healthy
+reading and 4× *below* the weakest recorded regression. Both bounds are pinned in
+that test — an edit crossing either fails CI.
+
+### ⚠️ A reading below 30 samples is NOT a healthy reading
+
+It is an **unmeasured** one. A zero numerator over a zero denominator must not
+read as healthy: that 0/0 is the exact false clear that closed PEN-2509 in August
+with AC4 recorded as *sample size 0*. The floor is in the rule expression for
+that reason. At n=30 it takes **two** aligned parks to cross 5% —
+P(≥2 | n=30, p=0.001) ≈ 4e-4 — while one aligned park reads 3.3% and
+deliberately does not cross, so a single chance hit on a near-idle fleet cannot
+page.
+
+Do not "confirm healthy" from a quiet period. Confirm healthy from a period with
+≥30 floor decisions in it.
+
+### Verifying the signal is live
+
+`paperclip_transient_retry_floor_total` is zero-seeded across the full 4×3
+`disposition` × `alignment` grid at registry construction, deliberately:
+`increase()` takes last-first, so a series **born at 1** on its first increment
+evaluates to 0 forever and the alert reading it would be permanently silent —
+reproducing this ticket's own blindness inside the detector built to remove it.
+
+So a `0` here is a real reading ("this pod made no floor decision of this
+shape"), **not** a missing metric. **Do not alert on `absent()`**; absence means
+the pod is not exporting, which the scrape-health alerts own.
+
+```promql
+# all 12 series should exist on every control-plane pod, most of them at 0
+count by (disposition, alignment) (paperclip_transient_retry_floor_total)
+```
+
+### ⚠️ Merging the chart does NOT make this alert live on Blockcast
+
+Same onprem-k8s lockstep caveat as every section above.
+`prometheusRule.enabled` is **false** in
+`deploy/helm/paperclip/values.blockcast.yaml`, so this chart's copy does not
+deploy there — shipping it in this repository alone leaves the regression exactly
+as undetected as it was. It must also land in the two lockstep
+`Blockcast/onprem-k8s` alert files, and the manual `monitoring-rules` Argo sync
+(BLO-19095) must run after that merge. Verify at `/api/v1/rules` before relying
+on it, and do not record "an alert exists" off this file.
+
+The counter itself has its own, separate gate: it ships in the server image, so
+it does not exist in Prometheus until a paperclip release carrying it is
+deployed. "Merged" is three steps short of "detecting".
+
 ## References
 
 - `runbooks/README.md` — index

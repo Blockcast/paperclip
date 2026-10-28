@@ -1074,3 +1074,70 @@ export function jitterTransientRetryFloor(input: {
   const jitterMs = Math.floor(sample * windowMs);
   return { dueAt: new Date(input.dueAt.getTime() + jitterMs), jitterMs };
 }
+
+/**
+ * The sub-second signature of a persisted retry instant (PEN-4145).
+ *
+ * Mutually exclusive by construction, ordered most-specific first, so the three
+ * partition every instant and a share is a plain sum over a label subset. Named
+ * rather than inlined because the exact grid definitions below ARE the
+ * measurement — a detector that disagrees with the census that found the
+ * regression is not the same detector.
+ *
+ *  - `ten_minute_grid` — a whole second that also lands on the `:M9:59` boundary
+ *    (`minute % 10 === 9 && second === 59`). This is the signature a provider
+ *    `retry_after_seconds` reset carries: the advertised horizon is computed off
+ *    a 10-minute bucket edge, so an instant adopted verbatim inherits it. 76/76
+ *    of the whole-second parks measured on 2026-10-13 sat here.
+ *  - `whole_second` — `ms === 000`, but off the 10-minute grid. Still a clamp
+ *    signature: jitter is drawn in milliseconds, so a jittered instant has no
+ *    reason to land on a second boundary.
+ *  - `off_grid` — carries a sub-second component. This is the healthy reading
+ *    and, for a dispersed floor, should be ~99.9% of the population.
+ *
+ * ## Why a whole second is the discriminator, and what "by chance" means here
+ *
+ * {@link jitterTransientRetryFloor} adds `Math.floor(sample * windowMs)`
+ * milliseconds, uniform over a window up to
+ * {@link TRANSIENT_RETRY_FLOOR_JITTER_MAX_MS}. A dispersed instant therefore
+ * lands on a whole second with probability ~1/1000, and on the 10-minute grid
+ * with probability ~1/600,000. A verbatim provider instant lands on one with
+ * probability ~1. That four-order-of-magnitude gap is what makes this a usable
+ * instrument on a population of tens rather than thousands, and it is why the
+ * test is alignment rather than, say, pairwise spread: spread needs a cohort,
+ * alignment needs one row.
+ *
+ * Recorded baselines, for anyone re-deriving the alert threshold: 94.03%
+ * (126/134) within the clamped population pre-fix, 20.43% (153/749)
+ * unconditional, against ~0.1% by chance. See PEN-2509 / PEN-4015.
+ */
+export const RETRY_INSTANT_ALIGNMENTS = ["ten_minute_grid", "whole_second", "off_grid"] as const;
+
+export type RetryInstantAlignment = (typeof RETRY_INSTANT_ALIGNMENTS)[number];
+
+/**
+ * Classify a persisted retry instant's sub-second signature.
+ *
+ * Deliberately reads UTC components, not local ones: `scheduled_retry_at` is
+ * stored `with time zone` and every recorded measurement of this signature was
+ * taken in UTC, so a pod in a non-UTC zone must not classify the same instant
+ * differently. `getUTCSeconds`/`getUTCMinutes` are the only safe readers here —
+ * note that a zone offset of `:30` or `:45` (India, Nepal, Chatham) would shift
+ * the minute component and silently move rows between the two aligned buckets.
+ *
+ * An invalid date classifies as `off_grid`, which is the fail-quiet direction: a
+ * NaN instant is a different defect with its own guard inside
+ * {@link jitterTransientRetryFloor}, and counting it as a clamp signature would
+ * page the wrong team.
+ */
+export function classifyRetryInstantAlignment(instant: Date): RetryInstantAlignment {
+  const epochMs = instant.getTime();
+  if (!Number.isFinite(epochMs)) return "off_grid";
+  // Modulo on the epoch rather than `getUTCMilliseconds()` so a negative epoch
+  // (pre-1970, reachable only from a corrupt value) cannot report a negative
+  // remainder as a non-zero millisecond component and read as healthy.
+  if (((epochMs % 1000) + 1000) % 1000 !== 0) return "off_grid";
+  return instant.getUTCSeconds() === 59 && instant.getUTCMinutes() % 10 === 9
+    ? "ten_minute_grid"
+    : "whole_second";
+}

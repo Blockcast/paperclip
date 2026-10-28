@@ -23,11 +23,20 @@
  *     gauge, rather than publishing a healthy-looking synthetic zero,
  *   - the pair is always published together, so `age > 2 * interval` can never
  *     compare one routine's age against another's cadence.
+ *
+ * PEN-4647 adds a SIXTH, and it is the one that failed in production: the
+ * FIRING age must not be reset by a fire that produced no new work. Completion
+ * age alone fails OPEN on the dominant failure mode -- a wedged long-open
+ * execution row eats the fires behind it, and the instant that row finally
+ * reaches `done` the completion age drops to ~0 and the alert resolves with no
+ * fire having occurred. Measured on routine b3ba3b33: 278.34h -> 0.06h on
+ * 2026-10-19 and 23.56h -> 0.44h on 2026-10-20, neither a firing, with the
+ * next real execution row ~47h after the alert called it over.
  */
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { sql } from "drizzle-orm";
-import { companies, createDb, routineRuns, routineTriggers, routines } from "@paperclipai/db";
+import { companies, createDb, issues, routineRuns, routineTriggers, routines } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -37,6 +46,7 @@ import {
   ROUTINE_FIRE_GAP_METRICS_REFRESH_SUCCESS_METRIC,
   ROUTINE_FIRE_INTERVAL_METRIC,
   ROUTINE_LAST_DONE_FIRE_AGE_METRIC,
+  ROUTINE_LAST_FIRE_START_AGE_METRIC,
   renderMetrics,
 } from "../services/metrics.js";
 import { refreshRoutineFireGapMetrics } from "../services/routine-fire-gap-metrics.js";
@@ -84,7 +94,7 @@ describeEmbeddedPostgres("refreshRoutineFireGapMetrics (BLO-32638)", () => {
   }, 120_000);
 
   afterEach(async () => {
-    await db.execute(sql`TRUNCATE TABLE routine_runs, routine_triggers, routines, companies CASCADE`);
+    await db.execute(sql`TRUNCATE TABLE routine_runs, routine_triggers, routines, issues, companies CASCADE`);
     __resetMetricsForTest();
     vi.restoreAllMocks();
   });
@@ -139,11 +149,31 @@ describeEmbeddedPostgres("refreshRoutineFireGapMetrics (BLO-32638)", () => {
     return routineId;
   }
 
+  /**
+   * PEN-4647: a run row bound to its own execution issue, which is what makes
+   * it a FIRING rather than a stood-down one. Returns the issue id so a test
+   * can point a second run at the same row -- which is exactly what
+   * `skip_if_active` does, and exactly what must NOT count.
+   */
+  async function insertExecutionIssue(companyId: string) {
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Routine execution",
+      status: "in_progress",
+      priority: "medium",
+    });
+    return issueId;
+  }
+
   async function insertRun(opts: {
     companyId: string;
     routineId: string;
     status: string;
     completedAt: Date | null;
+    triggeredAt?: Date;
+    linkedIssueId?: string | null;
   }) {
     await db.insert(routineRuns).values({
       id: randomUUID(),
@@ -151,8 +181,9 @@ describeEmbeddedPostgres("refreshRoutineFireGapMetrics (BLO-32638)", () => {
       routineId: opts.routineId,
       source: "schedule",
       status: opts.status,
-      triggeredAt: opts.completedAt ?? NOW,
+      triggeredAt: opts.triggeredAt ?? opts.completedAt ?? NOW,
       completedAt: opts.completedAt,
+      linkedIssueId: opts.linkedIssueId ?? null,
     });
   }
 
@@ -198,6 +229,184 @@ describeEmbeddedPostgres("refreshRoutineFireGapMetrics (BLO-32638)", () => {
     // over 2 * interval, so the rule the AC asks for fires. The 30.7h window
     // on a 1h-cadence watchdog is the same comparison 30x over.
     expect(5 * HOUR_S).toBeGreaterThan(2 * HOUR_S);
+  });
+
+  // ── PEN-4647 ────────────────────────────────────────────────────────────
+  it("does NOT reset the firing age when a wedged execution row finally completes", async () => {
+    // The production failure, reduced. One fire dispatched 12 days ago and
+    // created PEN-3866; that row sat open the whole time, eating the fires
+    // behind it, and then reached `done` four minutes ago. The COMPLETION age
+    // legitimately drops to ~0 -- a fire really did complete. The FIRING age
+    // must not move, because no fire has STARTED in 12 days.
+    const companyId = await insertCompany();
+    const routineId = await insertRoutine({ companyId });
+    const wedgedIssueId = await insertExecutionIssue(companyId);
+    await insertRun({
+      companyId,
+      routineId,
+      status: "completed",
+      triggeredAt: new Date(NOW.getTime() - 12 * 24 * HOUR_S * 1000),
+      completedAt: new Date(NOW.getTime() - 4 * 60 * 1000),
+      linkedIssueId: wedgedIssueId,
+    });
+
+    await refreshRoutineFireGapMetrics(db, NOW);
+
+    expect(await gaugeValue(ROUTINE_LAST_DONE_FIRE_AGE_METRIC, routineId)).toBe(String(4 * 60));
+    expect(await gaugeValue(ROUTINE_LAST_FIRE_START_AGE_METRIC, routineId))
+      .toBe(String(12 * 24 * HOUR_S));
+    // The alert takes the max of the two, so it stays above 2 * interval even
+    // though the arm it USED to read alone has gone green. This single
+    // comparison is the whole of PEN-4647.
+    const done = Number(await gaugeValue(ROUTINE_LAST_DONE_FIRE_AGE_METRIC, routineId));
+    const firing = Number(await gaugeValue(ROUTINE_LAST_FIRE_START_AGE_METRIC, routineId));
+    const interval = Number(await gaugeValue(ROUTINE_FIRE_INTERVAL_METRIC, routineId));
+    expect(done).toBeLessThanOrEqual(2 * interval);          // the old rule: green
+    expect(Math.max(done, firing)).toBeGreaterThan(2 * interval); // the new rule: firing
+  });
+
+  it("does NOT count a `skipped` fire as a firing, even though it carries a linked issue", async () => {
+    // THE TRAP, and the reason the predicate is not just `linked_issue_id is
+    // not null`. Under `skip_if_active` a suppressed fire is finalized with
+    // the HELD issue's id attached (coalesceOnto in routines.ts), so a null
+    // test alone would be reset by every eaten firing -- reproducing the
+    // PEN-4647 fail-open one layer down, in the exact case it exists to catch.
+    const companyId = await insertCompany();
+    const routineId = await insertRoutine({ companyId });
+    const heldIssueId = await insertExecutionIssue(companyId);
+    await insertRun({
+      companyId,
+      routineId,
+      status: "issue_created",
+      triggeredAt: new Date(NOW.getTime() - 30 * HOUR_S * 1000),
+      completedAt: null,
+      linkedIssueId: heldIssueId,
+    });
+    // Two fires eaten behind it, the most recent one minute ago.
+    for (const agoS of [HOUR_S, 60]) {
+      await insertRun({
+        companyId,
+        routineId,
+        status: "skipped",
+        triggeredAt: new Date(NOW.getTime() - agoS * 1000),
+        completedAt: new Date(NOW.getTime() - agoS * 1000),
+        linkedIssueId: heldIssueId,
+      });
+    }
+
+    await refreshRoutineFireGapMetrics(db, NOW);
+
+    // 30h -- the real dispatch -- not 60s.
+    expect(await gaugeValue(ROUTINE_LAST_FIRE_START_AGE_METRIC, routineId))
+      .toBe(String(30 * HOUR_S));
+  });
+
+  it("does NOT count a `coalesced` fire as a firing", async () => {
+    // Same reasoning as `skipped`, the other concurrency policy. A coalesced
+    // fire is folded onto an already-open row and takes no measurement of its
+    // own, so it produced no new work.
+    const companyId = await insertCompany();
+    const routineId = await insertRoutine({ companyId });
+    const heldIssueId = await insertExecutionIssue(companyId);
+    await insertRun({
+      companyId,
+      routineId,
+      status: "issue_created",
+      triggeredAt: new Date(NOW.getTime() - 20 * HOUR_S * 1000),
+      completedAt: null,
+      linkedIssueId: heldIssueId,
+    });
+    await insertRun({
+      companyId,
+      routineId,
+      status: "coalesced",
+      triggeredAt: new Date(NOW.getTime() - 60 * 1000),
+      completedAt: new Date(NOW.getTime() - 60 * 1000),
+      linkedIssueId: heldIssueId,
+    });
+
+    await refreshRoutineFireGapMetrics(db, NOW);
+
+    expect(await gaugeValue(ROUTINE_LAST_FIRE_START_AGE_METRIC, routineId))
+      .toBe(String(20 * HOUR_S));
+  });
+
+  it("does NOT count a dispatch that failed before creating its execution issue", async () => {
+    // BLO-40337: that path books `failed` with a NULL link and produced no
+    // work, so the null test still carries its own weight on top of the
+    // status exclusions.
+    const companyId = await insertCompany();
+    const routineId = await insertRoutine({ companyId });
+    const issueId = await insertExecutionIssue(companyId);
+    await insertRun({
+      companyId,
+      routineId,
+      status: "issue_created",
+      triggeredAt: new Date(NOW.getTime() - 8 * HOUR_S * 1000),
+      completedAt: null,
+      linkedIssueId: issueId,
+    });
+    await insertRun({
+      companyId,
+      routineId,
+      status: "failed",
+      triggeredAt: new Date(NOW.getTime() - 60 * 1000),
+      completedAt: new Date(NOW.getTime() - 60 * 1000),
+      linkedIssueId: null,
+    });
+
+    await refreshRoutineFireGapMetrics(db, NOW);
+
+    expect(await gaugeValue(ROUTINE_LAST_FIRE_START_AGE_METRIC, routineId))
+      .toBe(String(8 * HOUR_S));
+  });
+
+  it("DOES count a fire whose own execution issue later failed", async () => {
+    // The positive control for the three exclusions above. A `failed` run WITH
+    // a link dispatched real work that then went wrong -- the routine fired,
+    // so the firing age must move. Without this, "exclude everything" would
+    // pass the three tests above and freeze the gauge permanently.
+    const companyId = await insertCompany();
+    const routineId = await insertRoutine({ companyId });
+    const oldIssueId = await insertExecutionIssue(companyId);
+    const freshIssueId = await insertExecutionIssue(companyId);
+    await insertRun({
+      companyId,
+      routineId,
+      status: "completed",
+      triggeredAt: new Date(NOW.getTime() - 50 * HOUR_S * 1000),
+      completedAt: new Date(NOW.getTime() - 49 * HOUR_S * 1000),
+      linkedIssueId: oldIssueId,
+    });
+    await insertRun({
+      companyId,
+      routineId,
+      status: "failed",
+      triggeredAt: new Date(NOW.getTime() - 2 * HOUR_S * 1000),
+      completedAt: new Date(NOW.getTime() - 1 * HOUR_S * 1000),
+      linkedIssueId: freshIssueId,
+    });
+
+    await refreshRoutineFireGapMetrics(db, NOW);
+
+    expect(await gaugeValue(ROUTINE_LAST_FIRE_START_AGE_METRIC, routineId))
+      .toBe(String(2 * HOUR_S));
+  });
+
+  it("ages a never-dispatched routine from creation, with a value rather than an absent series", async () => {
+    // Same rule as the completion gauge, and load-bearing for the same
+    // reason: absent and "nothing is wrong" render identically. A routine that
+    // has never dispatched is the strictly worse case of one that has never
+    // completed, so it must not report a healthier number than its sibling.
+    const companyId = await insertCompany();
+    const routineId = await insertRoutine({
+      companyId,
+      createdAt: new Date(NOW.getTime() - 9 * HOUR_S * 1000),
+    });
+
+    await refreshRoutineFireGapMetrics(db, NOW);
+
+    expect(await gaugeValue(ROUTINE_LAST_FIRE_START_AGE_METRIC, routineId)).toBe(String(9 * HOUR_S));
   });
 
   it("stays below the alert threshold across a healthy interval (negative control)", async () => {

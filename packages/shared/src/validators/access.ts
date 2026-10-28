@@ -10,7 +10,7 @@ import {
 import { optionalAgentAdapterTypeSchema } from "../adapter-type.js";
 
 export const createCompanyInviteSchema = z.object({
-  allowedJoinTypes: z.enum(INVITE_JOIN_TYPES).default("both"),
+  allowedJoinTypes: z.enum(INVITE_JOIN_TYPES).prefault("both"),
   humanRole: z.enum(HUMAN_COMPANY_MEMBERSHIP_ROLES).optional().nullable(),
   defaultsPayload: z.record(z.string(), z.unknown()).optional().nullable(),
   agentMessage: z.string().max(4000).optional().nullable(),
@@ -51,8 +51,8 @@ export type ListJoinRequestsQuery = z.infer<typeof listJoinRequestsQuerySchema>;
 
 export const listCompanyInvitesQuerySchema = z.object({
   state: z.enum(["active", "revoked", "accepted", "expired"]).optional(),
-  limit: z.coerce.number().int().min(1).max(100).optional().default(20),
-  offset: z.coerce.number().int().min(0).optional().default(0),
+  limit: z.coerce.number().int().min(1).max(100).prefault(20),
+  offset: z.coerce.number().int().min(0).prefault(0),
 });
 
 export type ListCompanyInvitesQuery = z.infer<typeof listCompanyInvitesQuerySchema>;
@@ -73,8 +73,8 @@ export type BoardCliAuthAccessLevel = z.infer<typeof boardCliAuthAccessLevelSche
 export const createCliAuthChallengeSchema = z.object({
   command: z.string().min(1).max(240),
   clientName: z.string().max(120).optional().nullable(),
-  requestedAccess: boardCliAuthAccessLevelSchema.default("board"),
-  requestedCompanyId: z.string().uuid().optional().nullable(),
+  requestedAccess: boardCliAuthAccessLevelSchema.prefault("board"),
+  requestedCompanyId: z.string().guid().optional().nullable(),
 });
 
 export type CreateCliAuthChallenge = z.infer<typeof createCliAuthChallengeSchema>;
@@ -88,7 +88,7 @@ export type ResolveCliAuthChallenge = z.infer<typeof resolveCliAuthChallengeSche
 export const createServiceAccountBoardTokenSchema = z
   .object({
     name: z.string().min(1).max(120),
-    userId: z.string().uuid().optional().nullable(),
+    userId: z.string().guid().optional().nullable(),
     ttlDays: z.number().int().positive().max(3650).optional().nullable(),
     neverExpires: z.boolean().optional(),
   })
@@ -102,9 +102,9 @@ export type CreateServiceAccountBoardToken = z.infer<
 >;
 
 export const createBoardApiKeySchema = z.object({
-  name: z.string().trim().min(1).max(120).default("paperclipai cli"),
+  name: z.string().trim().min(1).max(120).prefault("paperclipai cli"),
   expiresAt: z.coerce.date().optional().nullable(),
-  requestedCompanyId: z.string().uuid().optional().nullable(),
+  requestedCompanyId: z.string().guid().optional().nullable(),
 });
 
 export type CreateBoardApiKey = z.infer<typeof createBoardApiKeySchema>;
@@ -120,6 +120,14 @@ export const updateMemberPermissionsSchema = z.object({
 
 export type UpdateMemberPermissions = z.infer<typeof updateMemberPermissionsSchema>;
 
+export const updateAgentGrantSchema = z.object({
+  operation: z.enum(["add", "remove"]),
+  permissionKey: z.enum(PERMISSION_KEYS),
+  scope: z.record(z.string(), z.unknown()).optional().nullable(),
+});
+
+export type UpdateAgentGrant = z.infer<typeof updateAgentGrantSchema>;
+
 const editableMembershipStatuses = ["pending", "active", "suspended"] as const;
 
 export const updateCompanyMemberSchema = z.object({
@@ -134,7 +142,7 @@ export type UpdateCompanyMember = z.infer<typeof updateCompanyMemberSchema>;
 export const updateCompanyMemberWithPermissionsSchema = z.object({
   membershipRole: z.enum(HUMAN_COMPANY_MEMBERSHIP_ROLES).optional().nullable(),
   status: z.enum(editableMembershipStatuses).optional(),
-  grants: updateMemberPermissionsSchema.shape.grants.default([]),
+  grants: updateMemberPermissionsSchema.shape.grants.prefault([]),
 }).refine((value) => value.membershipRole !== undefined || value.status !== undefined, {
   message: "membershipRole or status is required",
 });
@@ -144,8 +152,8 @@ export type UpdateCompanyMemberWithPermissions = z.infer<typeof updateCompanyMem
 export const archiveCompanyMemberSchema = z.object({
   reassignment: z
     .object({
-      assigneeAgentId: z.string().uuid().optional().nullable(),
-      assigneeUserId: z.string().uuid().optional().nullable(),
+      assigneeAgentId: z.string().guid().optional().nullable(),
+      assigneeUserId: z.string().guid().optional().nullable(),
     })
     .optional()
     .nullable(),
@@ -162,13 +170,13 @@ export const archiveCompanyMemberSchema = z.object({
 export type ArchiveCompanyMember = z.infer<typeof archiveCompanyMemberSchema>;
 
 export const updateUserCompanyAccessSchema = z.object({
-  companyIds: z.array(z.string().uuid()).default([]),
+  companyIds: z.array(z.string().guid()).prefault([]),
 });
 
 export type UpdateUserCompanyAccess = z.infer<typeof updateUserCompanyAccessSchema>;
 
 export const searchAdminUsersQuerySchema = z.object({
-  query: z.string().trim().max(120).optional().default(""),
+  query: z.string().trim().max(120).prefault(""),
 });
 
 export type SearchAdminUsersQuery = z.infer<typeof searchAdminUsersQuerySchema>;

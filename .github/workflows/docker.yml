@@ -31,6 +31,19 @@ on:
           digest, so the owner is what identifies which approval is retired.
         required: false
         type: string
+      # BLO-49140: deploy refuses while paperclip-0 is younger than 6h, since
+      # every rollout can strand mid-setup runs (BLO-12563).
+      min_interval_override:
+        description: >-
+          Bypass the 6h minimum interval between production rolls. Only for an
+          emergency fix or a rollback.
+        required: false
+        type: choice
+        default: none
+        options:
+          - none
+          - emergency
+          - rollback
   push:
     branches:
       - "master"
@@ -357,7 +370,7 @@ jobs:
   # authoritative re-check that closes that window.
   guard-pending-deploy:
     if: ${{ github.event_name == 'workflow_dispatch' && vars.PAPERCLIP_CI_DEPLOY == 'true' && github.ref == 'refs/heads/master' }}
-    runs-on: arc-deploy
+    runs-on: arc-paperclip-deploy
     timeout-minutes: 5
     permissions:
       # A job-level `permissions:` block REPLACES the workflow-level one
@@ -395,7 +408,7 @@ jobs:
   guard-pending-deploy-final:
     if: ${{ github.event_name == 'workflow_dispatch' && vars.PAPERCLIP_CI_DEPLOY == 'true' && github.ref == 'refs/heads/master' && needs.build-and-push.result == 'success' && needs.guard-pending-deploy.result == 'success' && needs.guard-pending-deploy.outputs.blocked != 'true' }}
     needs: [build-and-push, guard-pending-deploy]
-    runs-on: arc-deploy
+    runs-on: arc-paperclip-deploy
     timeout-minutes: 5
     permissions:
       # A job-level `permissions:` block REPLACES the workflow-level one
@@ -430,7 +443,7 @@ jobs:
     # that actually closes the eviction window; guard-pending-deploy alone
     # only short-circuits the common case fast.
     needs: [build-and-push, guard-pending-deploy, guard-pending-deploy-final]
-    runs-on: arc-deploy
+    runs-on: arc-paperclip-deploy
     if: ${{ github.event_name == 'workflow_dispatch' && vars.PAPERCLIP_CI_DEPLOY == 'true' && github.ref == 'refs/heads/master' && needs.build-and-push.result == 'success' && needs.guard-pending-deploy.result == 'success' && needs.guard-pending-deploy.outputs.blocked != 'true' && needs.guard-pending-deploy-final.result == 'success' && needs.guard-pending-deploy-final.outputs.blocked != 'true' }}
     environment:
       name: paperclip-production
@@ -625,6 +638,7 @@ jobs:
             scripts/stamp-paperclip-api-approval-plan.sh
             scripts/verify-review-gate-capture-promotion.mjs
             .github/scripts/precreate-online-indexes.sh
+            .github/scripts/check-deploy-min-interval.sh
           sparse-checkout-cone-mode: false
 
       - name: Verify release tooling revision
@@ -660,6 +674,18 @@ jobs:
           echo "stamp_script=${stamper}" >> "$GITHUB_OUTPUT"
           echo "promotion_verify_script=${promotion_verifier}" >> "$GITHUB_OUTPUT"
           echo "precreate_script=${precreate}" >> "$GITHUB_OUTPUT"
+
+      - name: Minimum interval since last roll (BLO-49140)
+        env:
+          NS: ${{ vars.PAPERCLIP_NAMESPACE || 'paperclip' }}
+          OVERRIDE: ${{ inputs.min_interval_override }}
+        run: |
+          set -euo pipefail
+          POD_CREATED="$(kubectl -n "$NS" get pod paperclip-0 --ignore-not-found -o jsonpath='{.metadata.creationTimestamp}')"
+          export POD_CREATED
+          # Trusted revision, not target_sha: the rollback override exists for
+          # old targets, and an old checkout has no copy of this script.
+          .release-tooling/.github/scripts/check-deploy-min-interval.sh
 
       - name: Render, stamp, and validate deploy plan
         id: plan

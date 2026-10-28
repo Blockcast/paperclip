@@ -1,0 +1,42 @@
+-- PEN-4647: back the routine fire-gap family's per-routine "most recent
+-- DISPATCHED fire" probe.
+--
+-- Sibling of 0254, which backs the same refresh's `max(completed_at)` probe.
+-- refreshRoutineFireGapMetrics now ALSO runs, on every scrape-metrics
+-- collector tick on every control-plane replica,
+--
+--   (select max(triggered_at) from routine_runs
+--     where routine_id = r.id
+--       and linked_issue_id is not null
+--       and status <> 'skipped' and status <> 'coalesced')
+--
+-- once per active scheduled routine. Without this index that probe walks every
+-- run the routine has ever had, because no existing routine_runs index carries
+-- `status` or `linked_issue_id` and 0254's partial index holds only
+-- `status = 'completed'` rows -- a strict subset of what this probe reads, so
+-- it cannot serve it.
+--
+-- WHY THIS PREDICATE AND NOT `status = 'issue_created'`. The question is "did
+-- this fire produce its OWN execution issue", and three statuses answer yes:
+-- `issue_created` at dispatch, then `completed` or `failed` once
+-- syncRunStatusForIssue retires the same row. Enumerating them positively
+-- means a new status silently falls out of the gauge; excluding the two that
+-- mean "no new work" (`skipped` behind a held row, `coalesced` onto one) fails
+-- the safe way round. `linked_issue_id is not null` is load-bearing ON TOP of
+-- that: a dispatch that fails BEFORE issue creation leaves `failed` with a
+-- null link and produced nothing, and must not reset the age.
+--
+-- ⚠ The exclusion is the whole point of the row. `skipped` and `coalesced`
+-- runs DO carry a linked_issue_id -- the held issue they stood down behind --
+-- so a `linked_issue_id is not null` predicate ALONE would reset the gauge on
+-- every eaten firing and reproduce PEN-4647's fail-open one layer down.
+--
+-- Two `<>` tests rather than `status not in (...)`: both are sargable here,
+-- and the planner proves predicate implication against the query's identical
+-- literal comparisons more reliably when the shapes match exactly.
+--
+-- Plain, not CONCURRENTLY, for 0254's reason: Drizzle migrations are
+-- transactional and routine_runs is in the small bucket
+-- (packages/db/src/table-size-estimates.ts), so the SHARE lock is held only
+-- for a build over a few thousand rows.
+CREATE INDEX IF NOT EXISTS "routine_runs_routine_dispatched_idx" ON "routine_runs" USING btree ("routine_id","triggered_at") WHERE "routine_runs"."linked_issue_id" is not null and "routine_runs"."status" <> 'skipped' and "routine_runs"."status" <> 'coalesced';

@@ -125,6 +125,23 @@ platform cannot resolve automatically. Each runbook should be:
   still finishing, just not inside the bound. The lever is sweep duration; do NOT
   raise the bound. ⚠️ The chart copy does not deploy on Blockcast
   (`prometheusRule.enabled: false`), so this alert needs the onprem-k8s port too.
+- [`queued-run-stranded.md#transient-retry-clamp-signature-pen-4145`](queued-run-stranded.md#transient-retry-clamp-signature-pen-4145) —
+  `PaperclipTransientRetryClampSignature`: `transient_failure` retry floors are
+  landing on a shared instant again, so a cohort of runs will resume in lockstep
+  into the dependency whose degradation created the cohort. Triage keys on the
+  `disposition` label, which says WHICH failure it is — alignment inside
+  `exempt_*` means the exemption predicate is mis-routing a verbatim provider
+  instant (the PEN-2509 signature), alignment inside `dispersed` means the jitter
+  itself stopped working. The alert exists because the dispersion decision used
+  to emit NOTHING: the first PEN-2509 fix was live, fleet-wide and wrong for six
+  weeks and was found only by a hand census (PEN-4015). ⚠️ A reading below 30
+  floor decisions is an UNMEASURED one, not a healthy one — that 0/0 is the false
+  clear that closed PEN-2509 in August. ⚠️ Three gates before this detects
+  anything: the chart copy does not deploy on Blockcast
+  (`prometheusRule.enabled: false`), the onprem-k8s `monitoring-rules` Argo app
+  syncs manually, and the counter ships in the SERVER IMAGE — so confirm
+  `count by (disposition, alignment) (paperclip_transient_retry_floor_total)`
+  returns 12 per pod before relying on it.
 - [`queued-run-stranded.md#overdue-scheduled-retry-blo-22094`](queued-run-stranded.md#overdue-scheduled-retry-blo-22094) —
   a `heartbeat_runs` row parked at `status='scheduled_retry'` past its own due
   time, never promoted: the retry-promotion sweep either wedged or is

@@ -58,7 +58,7 @@ permissions:
 
 jobs:
   one-verdict-per-head:
-    runs-on: default
+    runs-on: arc-paperclip-light
     timeout-minutes: 10
     steps:
       - name: Checkout repository

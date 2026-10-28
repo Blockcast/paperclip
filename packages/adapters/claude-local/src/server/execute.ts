@@ -1,3 +1,4 @@
+import { formatTimeoutMessage } from "@paperclipai/adapter-utils/server-utils";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -1286,7 +1287,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         exitCode: proc.exitCode,
         signal: proc.signal,
         timedOut: true,
-        errorMessage: `Timed out after ${timeoutSec}s`,
+        errorMessage: formatTimeoutMessage(timeoutSec, proc.startedAt),
         errorCode: "timeout",
         ...(timedOutBeforeOutput
           ? {

@@ -6,6 +6,7 @@ import {
   agentWakeupRequests,
   activityLog,
   budgetPolicies,
+  costEvents,
   companies,
   createDb,
   executionWorkspaces,
@@ -4017,15 +4018,34 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
 
   it("suppresses max-turn continuation scheduling when budget or dependencies block the issue", async () => {
     const budgetBlocked = await seedMaxTurnFixture({ now: new Date("2026-04-20T16:00:00.000Z") });
+    // A real cap with spend over it, rather than `amount: 0` plus the pause flag:
+    // since PEN-1972 the flag alone no longer blocks, because a flag whose window
+    // has rolled -- or which no policy backs -- is cleared on the next check
+    // rather than latched forever. `amount: 0` never bound in the first place
+    // (both the old and new hard-stop checks require `amount > 0`), so the
+    // suppression here was resting entirely on the stale flag.
     await db.insert(budgetPolicies).values({
       companyId: budgetBlocked.companyId,
       scopeType: "agent",
       scopeId: budgetBlocked.agentId,
-      windowKind: "monthly",
+      windowKind: "calendar_month_utc",
       metric: "billed_cents",
-      amount: 0,
+      amount: 100,
       hardStopEnabled: true,
       isActive: true,
+    });
+    await db.insert(costEvents).values({
+      companyId: budgetBlocked.companyId,
+      agentId: budgetBlocked.agentId,
+      provider: "openai",
+      biller: "openai",
+      billingType: "metered_api",
+      model: "gpt-5-retry-scheduling",
+      inputTokens: 100,
+      cachedInputTokens: 0,
+      outputTokens: 20,
+      costCents: 250,
+      occurredAt: new Date(),
     });
     await db
       .update(agents)

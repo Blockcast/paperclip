@@ -896,6 +896,9 @@ export function AgentDetail() {
       status: budgetMonthlyCents > 0 && spentMonthlyCents >= budgetMonthlyCents ? "hard_stop" : "ok",
       paused: agent?.status === "paused",
       pauseReason: agent?.pauseReason ?? null,
+      // Synthesised fallback for a scope with no policy row in the overview:
+      // there is no incident behind it, so there is no forgiveness grant.
+      hardStopForgivenSince: null,
       windowStart: new Date(),
       windowEnd: new Date(),
     } satisfies BudgetPolicySummary;

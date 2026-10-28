@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -12,13 +14,13 @@ const READER = fileURLToPath(new URL("./merge-gate-read.sh", import.meta.url));
  * exit is an expected outcome here and must not be read as a harness failure —
  * the VERDICT IS THE LINES. Use `read()` unless you are asserting on rc itself.
  */
-function readRc(rows, dead = "__none__", pend = "", wdead = "") {
+function readRc(rows, dead = "__none__", pend = "", wdead = "", renamed = "") {
   const stdin = rows.length ? rows.map((r) => r.join("\t")).join("\n") + "\n" : "";
   const opts = { input: stdin, encoding: "utf8" };
   let rc = 0;
   let out;
   try {
-    out = execFileSync("bash", [READER, "--rows", dead, pend, wdead], opts);
+    out = execFileSync("bash", [READER, "--rows", dead, pend, wdead, renamed], opts);
   } catch (e) {
     rc = e.status;
     out = e.stdout;
@@ -27,8 +29,8 @@ function readRc(rows, dead = "__none__", pend = "", wdead = "") {
 }
 
 /** Run the verdict pipeline and return only its lines. */
-function read(rows, dead = "__none__", pend = "", wdead = "") {
-  return readRc(rows, dead, pend, wdead).lines;
+function read(rows, dead = "__none__", pend = "", wdead = "", renamed = "") {
+  return readRc(rows, dead, pend, wdead, renamed).lines;
 }
 
 /** Render pend rows the way the live path hands them to verdicts(). */
@@ -93,13 +95,19 @@ function pending(runs) {
 }
 
 /** BLO-47984: the approval-gated-lanes check over run rows at `head`. */
-function gated(runs, head, isGated) {
+function gated(runs, head, isGated, witness = "") {
   const stdin = runs.map((r) => r.join("\t")).join("\n") + "\n";
-  const out = execFileSync("bash", [READER, "--gated", head, isGated ? "1" : ""], {
+  const out = execFileSync("bash", [READER, "--gated", head, isGated ? "1" : "", witness], {
     input: stdin,
     encoding: "utf8",
   });
   return out.split("\n").filter(Boolean);
+}
+
+/** BLO-48830: the empty-dispatch witness over status-list + check-runs pages. */
+function emptyWitness(pages) {
+  const stdin = pages.map((p) => JSON.stringify(p)).join("\n") + "\n";
+  return execFileSync("bash", [READER, "--empty-witness"], { input: stdin, encoding: "utf8" }).trim();
 }
 
 /** Validate a candidate head sha. Returns { rc, out }. */
@@ -235,6 +243,102 @@ describe("merge-gate reader", () => {
       "REFUSED-LEGACY\tci-preflight" + LEGACY + "\tfailure\trun=501",
       "STOP\tsecret-scan" + LEGACY + "\tfailure\trun=501",
     ]);
+  });
+
+  // BLO-48833: penstock#2720 renames `secret-scan` to `ci-secret-scan`. The
+  // trusted arm runs the BASE workflows, so the new twin cannot exist pre-merge.
+  describe("renamed job (BLO-48833)", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "mgr-"));
+    const baseFile = (text) => {
+      const f = join(tmp, String(Math.random()));
+      writeFileSync(f, text);
+      return f;
+    };
+    const renamed = (names, file) =>
+      execFileSync("bash", [READER, "--renamed", file], { input: names.join("\n") + "\n", encoding: "utf8" })
+        .split("\n")
+        .filter(Boolean);
+    const rows = [
+      ["secret-scan", "success", "t1", "500"],
+      ["ci-secret-scan" + LEGACY, "failure", "t1", "501"],
+    ];
+
+    it("labels a twin-less refusal RENAMED-LEGACY when base never declares the job", () => {
+      const r = renamed(["ci-secret-scan"], baseFile("jobs:\n  secret-scan:\n    name: secret-scan\n"));
+      assert.deepEqual(r, ["ci-secret-scan"]);
+      const lines = read(rows, "__none__", "", "", r.join("\n"));
+      assert.deepEqual(lines, ["RENAMED-LEGACY\tci-secret-scan" + LEGACY + "\tfailure\trun=501"]);
+      assert.equal(stops(lines).length, 0);
+    });
+
+    it("keeps STOP when base declares the job (a real missing twin)", () => {
+      const r = renamed(["ci-secret-scan"], baseFile("jobs:\n  ci-secret-scan:\n    name: ci-secret-scan${{ x }}\n"));
+      assert.deepEqual(r, []);
+      assert.deepEqual(read(rows, "__none__", "", "", r.join("\n")), [
+        "STOP\tci-secret-scan" + LEGACY + "\tfailure\trun=501",
+      ]);
+    });
+
+    it("keeps STOP for a matrix-shaped name whose templated job base declares", () => {
+      const base = baseFile("jobs:\n  pg:\n    name: postgres-tests (${{ matrix.shard }}/${{ strategy.job-total }})\n");
+      assert.deepEqual(renamed(["postgres-tests (1/4)", "ci-secret-scan"], base), ["ci-secret-scan"]);
+    });
+
+    for (const [what, file] of [
+      ["missing", join(tmp, "nope")],
+      ["empty", null],
+    ]) {
+      it(`keeps STOP when the base workflows are unreadable (${what} file)`, () => {
+        const r = renamed(["ci-secret-scan"], file ?? baseFile(""));
+        assert.deepEqual(r, []);
+        assert.deepEqual(stops(read(rows, "__none__", "", "", r.join("\n"))).length, 1);
+      });
+    }
+
+    // A templated name renders text found nowhere literally, and its stem
+    // (`shard-3`, `chromium e2e`) is not in the file either. Both RED with only
+    // the literal + stem guards.
+    for (const [name, decl] of [
+      ["shard-3", "shard-${{ matrix.n }}"],
+      ["chromium e2e", '"${{ matrix.browser }} e2e"'],
+    ]) {
+      it(`keeps STOP for ${name} when base declares the templated name ${decl}`, () => {
+        assert.deepEqual(renamed([name], baseFile(`jobs:\n  x:\n    name: ${decl}\n`)), []);
+      });
+    }
+
+    it("anchors the templated match: secret-scan${{ x }} does not cover ci-secret-scan", () => {
+      const base = baseFile("jobs:\n  s:\n    name: secret-scan${{ inputs.suffix }}\n  t:\n    - name: 'a.[b] (${{ m }})'\n");
+      assert.deepEqual(renamed(["ci-secret-scan", "aq[b] (1)", "a.[b] (1)"], base), ["ci-secret-scan", "aq[b] (1)"]);
+    });
+
+    // BLO-49040: esc() must quote regex metacharacters in the literal parts. A
+    // name that cannot match itself as a regex (`c++`, `lint[`) reads as a
+    // rename -> its STOP is dropped. Mutation: `esc(s) { return s }` turns this red.
+    for (const [name, decl] of [
+      ["c++ 17", "c++ ${{ matrix.std }}"],
+      ["lint[web]", "lint[${{ matrix.pkg }}]"],
+    ]) {
+      it(`keeps STOP for ${name}: esc() quotes metacharacters in ${decl}`, () => {
+        assert.deepEqual(renamed([name], baseFile(`jobs:\n  x:\n    name: ${decl}\n`)), []);
+      });
+    }
+
+    it("does not relabel a refusal whose twin survives", () => {
+      const lines = read(
+        [["ci-preflight", "success", "t1", "500"], ["ci-preflight" + LEGACY, "failure", "t1", "501"]],
+        "__none__", "", "", "ci-preflight",
+      );
+      assert.deepEqual(lines, ["REFUSED-LEGACY\tci-preflight" + LEGACY + "\tfailure\trun=501"]);
+    });
+
+    it("does not relabel a refusal that is not failure", () => {
+      const lines = read(
+        [["lint", "success", "t1", "500"], ["ci-secret-scan" + LEGACY, "cancelled", "t1", "501"]],
+        "__none__", "", "", "ci-secret-scan",
+      );
+      assert.deepEqual(lines, ["STOP\tci-secret-scan" + LEGACY + "\tcancelled\trun=501"]);
+    });
   });
 
   it("credits the refused legacy run as having spoken, so it is not NO-VERDICT", () => {
@@ -1793,7 +1897,7 @@ describe("merge-gate reader", () => {
         "WDEAD no longer computed from the witness arm alone",
       );
       assert.ok(
-        lines.some((l) => /^\} \| verdicts "\$DEAD" "\$PENDING" "\$WDEAD"$/.test(l)),
+        lines.some((l) => /^\} \| verdicts "\$DEAD" "\$PENDING" "\$WDEAD" "\$RENAMED"$/.test(l)),
         "live verdicts() call lost WDEAD",
       );
     });
@@ -1804,14 +1908,20 @@ describe("merge-gate reader", () => {
       // edit to this list and never a silent widening of the exemption. The
       // `/actions/runs/` entry must keep its trailing slash: `/actions/runs?`
       // is the LIST fetch and exempting it would un-paginate the run surface.
-      const SINGLE_OBJECT = ["/commits/$2", "/actions/runs/$rid", "/contents/"];
+      const SINGLE_OBJECT = [
+        "/commits/$2",
+        "/actions/runs/$rid",
+        "/contents/.github/workflows/dispatch",
+        "/contents/.github/workflows?ref", // a directory listing: one object, <=1000 entries
+        "/contents/$p?ref",
+      ];
       const isSingle = (l) => SINGLE_OBJECT.some((p) => l.includes(p));
       const singles = SOURCE.split("\n").filter((l) => l.includes('gh api "repos/') && isSingle(l));
       assert.equal(singles.length, SINGLE_OBJECT.length, `single-object lookup lost or doubled?`);
       const fetches = SOURCE.split("\n").filter(
         (l) => l.includes('gh api "repos/') && !isSingle(l),
       );
-      assert.equal(fetches.length, 3, `unguarded fetch added? got ${JSON.stringify(fetches)}`);
+      assert.equal(fetches.length, 5, `unguarded fetch added? got ${JSON.stringify(fetches)}`);
       // The collector matches `gh api "repos/` on ONE line, so a fetch written
       // `gh api "$url"` or split across a continuation is collected by NEITHER
       // line: the count above stays 3 and this test passes while that fetch goes
@@ -1968,7 +2078,76 @@ describe("merge-gate reader", () => {
     // require_sha check does: a deleted call would leave every fixture green.
     it("wires the probe and the guard into the live path", () => {
       assert.match(SOURCE, /contents\/\.github\/workflows\/dispatch-approved-pr-ci\.yml/);
-      assert.match(SOURCE, /^printf '%s\\n' "\$RUNS" \| gated_lanes "\$H" "\$GATED"$/m);
+      assert.match(SOURCE, /^printf '%s\\n' "\$RUNS" \| gated_lanes "\$H" "\$GATED" "\$EMPTY"$/m);
+      assert.match(SOURCE, /^EMPTY=\$\(printf .*\| empty_witness\)$/m);
+    });
+
+    // BLO-48830. Network-Operator-Portal#1450 @ 82913582 is docs-only: the
+    // dispatcher ran, logged `Scheduled: none`, and dispatched no CI PR run, so
+    // the title match alone STOPs forever. pr-ci-dispatch's own empty verdict
+    // is the positive witness, but only from the Actions app.
+    const EMPTY_DESC = "(base main) no dispatched lane applies to this head";
+    const ACTIONS = { login: "github-actions[bot]", id: 41898282, type: "Bot" };
+    const ALLY_APP = { login: "allyblockcast[bot]", id: 290875700, type: "Bot" };
+    const st = (id, state, description, creator = ACTIONS, context = "ci/dispatched-lanes") =>
+      ({ id, context, state, description, creator });
+    const cr = (id, conclusion, title, slug = "github-actions", status = "completed") =>
+      ({ check_runs: [{ id, name: "ci/dispatched-lanes", status, conclusion, output: { title }, app: { slug } }] });
+    const H1450 = "829135824992ab12fb60e6d0406fa9acb7236aec";
+    const nop = [
+      "3", "pull_request", "40048568051", "success", "2026-10-24T18:00:00Z", "completed",
+      "Migrations Append-Only Gate", "2026-10-24T18:01:00Z",
+      "docs(adr): accept ADR-0007 and record the commitment-row consumer",
+    ];
+
+    it("proceeds on a docs-only head the dispatcher witnessed as empty (NOP#1450)", () => {
+      const w = emptyWitness([[st(2, "success", EMPTY_DESC)], { check_runs: [] }]);
+      assert.equal(w, "1");
+      assert.deepEqual(gated([nop], H1450, true, w), []);
+    });
+
+    it("accepts the check-run form (onprem-k8s report: check-run)", () => {
+      assert.equal(emptyWitness([[], cr(5, "success", EMPTY_DESC)]), "1");
+    });
+
+    it("still stops at #6335: no witness, no dispatched run", () => {
+      const w = emptyWitness([[], { check_runs: [] }]);
+      assert.equal(w, "");
+      assert.equal(stops(gated([review(H6335, 6335)], H6335, true, w)).length, 1);
+    });
+
+    it("rejects a session-written status or check-run", () => {
+      const w = emptyWitness([[st(9, "success", EMPTY_DESC, ALLY_APP)], cr(9, "success", EMPTY_DESC, "allyblockcast")]);
+      assert.equal(w, "");
+      assert.equal(stops(gated([nop], H1450, true, w)).length, 1);
+    });
+
+    it("lets a newer Actions re-judge withdraw the witness", () => {
+      assert.equal(emptyWitness([[st(7, "pending", "waiting: ci=not dispatched"), st(2, "success", EMPTY_DESC)]]), "");
+      assert.equal(emptyWitness([[], { check_runs: [
+        { id: 8, name: "ci/dispatched-lanes", status: "in_progress", conclusion: null, output: { title: "waiting" }, app: { slug: "github-actions" } },
+        { id: 3, name: "ci/dispatched-lanes", status: "completed", conclusion: "success", output: { title: EMPTY_DESC }, app: { slug: "github-actions" } },
+      ] }]), "");
+    });
+
+    it("ignores a session entry newer than the Actions witness", () => {
+      assert.equal(emptyWitness([[st(9, "failure", "forged", ALLY_APP), st(2, "success", EMPTY_DESC)]]), "1");
+    });
+
+    it("counts only the empty wording, the right context, and success", () => {
+      assert.equal(emptyWitness([[st(2, "success", "(base main) 3 dispatched lane(s) passed at this head")]]), "");
+      assert.equal(emptyWitness([[st(2, "success", EMPTY_DESC, ACTIONS, "ci/web-lanes")]]), "");
+      assert.equal(emptyWitness([[st(2, "failure", EMPTY_DESC)]]), "");
+      assert.equal(emptyWitness([[], cr(5, "failure", EMPTY_DESC)]), "");
+      assert.equal(emptyWitness([[], cr(5, "success", "(base main) 3 dispatched lane(s) passed at this head")]), "");
+      const renamed = cr(5, "success", EMPTY_DESC);
+      renamed.check_runs[0].name = "ci/web-lanes";
+      assert.equal(emptyWitness([[], renamed]), "");
+    });
+
+    it("fails closed on an API error body or garbage", () => {
+      assert.equal(emptyWitness([{ message: "API rate limit exceeded", status: "403" }]), "");
+      assert.equal(execFileSync("bash", [READER, "--empty-witness"], { input: "not json\n", encoding: "utf8" }), "");
     });
   });
 });
@@ -2010,4 +2189,144 @@ describe("review/ally-ledger", () => {
     const lines = read([build, complete("success"), ledger("failure")]);
     assert.deepEqual(lines, ["STOP\treview/ally-ledger\tfailure\trun=status"]);
   });
+});
+
+// BLO-48833 review: a later check-run page that comes back as an error body must
+// not read as a clean head. `gh api --paginate` prints that body to STDOUT; the
+// reader must exit above 1 rather than print nothing and exit 0.
+describe("live mode: check-runs page error fails closed (BLO-48833)", () => {
+  it("exits above 1 when check-runs page 2 is a 403 body", () => {
+    const dir = mkdtempSync(join(tmpdir(), "mgr-gh-"));
+    const sha = "a".repeat(40);
+    writeFileSync(
+      join(dir, "gh"),
+      `#!/usr/bin/env bash
+case "$2" in
+  */check-runs*) printf '%s' '{"total_count":2,"check_runs":[{"name":"ci","status":"completed","conclusion":"success","completed_at":"2026-10-24T00:00:00Z","details_url":"https://github.com/o/r/actions/runs/7/job/1"}]}'
+                 printf '%s' '{"message":"API rate limit exceeded","status":"403"}'; exit 1 ;;
+  */dispatch-approved-pr-ci.yml) echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;
+  */actions/runs*) printf '%s' '{"total_count":0,"workflow_runs":[]}' ;;
+  */status*) printf '%s' '{"state":"success","statuses":[]}' ;;
+  repos/o/r/commits/*) echo ${sha} ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac
+`,
+      { mode: 0o755 },
+    );
+    let rc = 0;
+    try {
+      execFileSync("bash", [READER, "o/r", sha], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env, PATH: `${dir}:${process.env.PATH}` },
+      });
+    } catch (e) {
+      rc = e.status;
+    }
+    assert.ok(rc > 1, `expected exit > 1, got ${rc}`);
+  });
+});
+
+// BLO-49040: a later page that fails WITHOUT a body (reset, timeout) leaves only
+// page 1 on stdout. gh exits 1; the reader must print a STOP and exit above 1
+// rather than judge a partial read. Master before this fix: rc 0, no output.
+describe("live mode: a bodiless later-page failure fails closed (BLO-49040)", () => {
+  const sha = "a".repeat(40);
+  const page1 = {
+    "check-runs": `{"total_count":101,"check_runs":[{"name":"ci","status":"completed","conclusion":"success","completed_at":"2026-10-24T00:00:00Z","details_url":"https://github.com/o/r/actions/runs/7/job/1"}]}`,
+    status: `{"state":"success","statuses":[]}`,
+    "actions/runs": `{"total_count":101,"workflow_runs":[]}`,
+  };
+  for (const surface of Object.keys(page1)) {
+    it(`STOPs with rc > 1 when ${surface} page 2 exits 1 with empty stdout`, () => {
+      const dir = mkdtempSync(join(tmpdir(), "mgr-gh-"));
+      const arm = (pat, key) =>
+        `  ${pat}) printf '%s' '${page1[key]}'${key === surface ? "; exit 1" : ""} ;;`;
+      writeFileSync(
+        join(dir, "gh"),
+        `#!/usr/bin/env bash
+case "$2" in
+${arm("*/check-runs*", "check-runs")}
+  */dispatch-approved-pr-ci.yml) echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;
+${arm("*/actions/runs*", "actions/runs")}
+${arm("*/status*", "status")}
+  repos/o/r/commits/*) echo ${sha} ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac
+`,
+        { mode: 0o755 },
+      );
+      let rc = 0;
+      let out = "";
+      try {
+        out = execFileSync("bash", [READER, "o/r", sha], {
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+          env: { ...process.env, PATH: `${dir}:${process.env.PATH}` },
+        });
+      } catch (e) {
+        rc = e.status;
+        out = e.stdout;
+      }
+      assert.ok(rc > 1, `expected exit > 1, got ${rc}`);
+      assert.match(out, new RegExp(`^STOP\\t<${surface} fetch failed for ${sha} \\(rc 1\\); refusing on a partial read>\\tFETCH-FAILED\\trun=-$`, "m"));
+    });
+  }
+});
+
+// BLO-49045: the two remaining `--paginate` fetches. Each fixture is a head that
+// reads clean on a partial read: page 1 alone carries what clears it.
+describe("live mode: pulls and statuses-list partial reads fail closed (BLO-49045)", () => {
+  const sha = "a".repeat(40);
+  const base = "b".repeat(40);
+  const ok = `{"name":"ci","status":"completed","conclusion":"success","completed_at":"2026-10-24T00:00:00Z","details_url":"https://github.com/o/r/actions/runs/7/job/1"}`;
+  const legacy = `{"name":"build (legacy arm - refused, nothing ran)","status":"completed","conclusion":"failure","completed_at":"2026-10-24T00:00:00Z","details_url":"https://github.com/o/r/actions/runs/8/job/2"}`;
+  const witness = `{"id":5,"context":"ci/dispatched-lanes","state":"success","description":"(base master) no dispatched lane applies to this head","creator":{"id":41898282}}`;
+  const cases = {
+    // Page 1 names one base sha; a second PR's base sat on the failed page.
+    pulls: `
+  */dispatch-approved-pr-ci.yml) echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;
+  */check-runs*) printf '%s' '{"total_count":2,"check_runs":[${ok},${legacy}]}' ;;
+  */pulls*) echo ${base}; exit 1 ;;
+  */contents/.github/workflows\\?ref=*) echo .github/workflows/ci.yml ;;
+  */contents/*) printf 'jobs:\\n  test:\\n    runs-on: x\\n' ;;
+  */actions/runs*) printf '%s' '{"total_count":0,"workflow_runs":[]}' ;;
+  */status*) printf '%s' '{"state":"success","statuses":[]}' ;;`,
+    // Gated head; page 1 holds an Actions-written empty witness.
+    statuses: `
+  */dispatch-approved-pr-ci.yml) echo '{}' ;;
+  */check-runs*) printf '%s' '{"total_count":1,"check_runs":[${ok}]}' ;;
+  */actions/runs*) printf '%s' '{"total_count":0,"workflow_runs":[]}' ;;
+  */statuses*) printf '%s' '[${witness}]'; exit 1 ;;
+  */status*) printf '%s' '{"state":"success","statuses":[${witness}]}' ;;`,
+  };
+  for (const [surface, arms] of Object.entries(cases)) {
+    it(`STOPs with rc > 1 when ${surface} page 2 exits 1 with empty stdout`, () => {
+      const dir = mkdtempSync(join(tmpdir(), "mgr-gh-"));
+      writeFileSync(
+        join(dir, "gh"),
+        `#!/usr/bin/env bash
+case "$2" in${arms}
+  repos/o/r/commits/*) echo ${sha} ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac
+`,
+        { mode: 0o755 },
+      );
+      let rc = 0;
+      let out = "";
+      try {
+        out = execFileSync("bash", [READER, "o/r", sha], {
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+          env: { ...process.env, PATH: `${dir}:${process.env.PATH}` },
+        });
+      } catch (e) {
+        rc = e.status;
+        out = e.stdout;
+      }
+      assert.ok(rc > 1, `expected exit > 1, got ${rc}; out=${out}`);
+      assert.match(out, new RegExp(`^STOP\\t<${surface} fetch failed for ${sha} \\(rc 1\\); refusing on a partial read>\\tFETCH-FAILED\\trun=-$`, "m"));
+    });
+  }
 });

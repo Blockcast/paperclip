@@ -179,5 +179,18 @@ export const routineRuns = pgTable(
     routineCompletedIdx: index("routine_runs_routine_completed_idx")
       .on(table.routineId, table.completedAt)
       .where(sql`${table.status} = 'completed'`),
+    // PEN-4647 (migration 0266): backs the sibling "most recent DISPATCHED
+    // fire" probe. The index above cannot serve it -- it holds only
+    // `status = 'completed'`, a strict subset. The predicate EXCLUDES the two
+    // statuses that mean "this firing produced no new work": `skipped` (stood
+    // down behind a held row under skip_if_active) and `coalesced` (folded
+    // onto one). Both of those DO carry a linked_issue_id, so the null test
+    // alone would reset the age on every eaten firing -- which is PEN-4647's
+    // fail-open reproduced one layer down.
+    routineDispatchedIdx: index("routine_runs_routine_dispatched_idx")
+      .on(table.routineId, table.triggeredAt)
+      .where(
+        sql`${table.linkedIssueId} is not null and ${table.status} <> 'skipped' and ${table.status} <> 'coalesced'`,
+      ),
   }),
 );

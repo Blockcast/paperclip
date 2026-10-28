@@ -2,7 +2,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { type CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { describe, expect, it } from "vitest";
-import { createKvDemoMcpServer } from "./index.js";
+import { createKvDemoMcpServer, createToolDefinitions, KvStore } from "./index.js";
 
 function firstJson(result: CallToolResult): unknown {
   const block = result.content.find((entry) => entry.type === "text");
@@ -63,5 +63,15 @@ describe("kv demo MCP tools", () => {
     const { client } = await connectedClient();
     const result = (await client.callTool({ name: "kv_set", arguments: { key: "", value: "x" } })) as CallToolResult;
     expect(result.isError).toBe(true);
+  });
+
+  it("surfaces schema validation issues as tool errors without touching the store", async () => {
+    const store = new KvStore();
+    const kvSet = createToolDefinitions(store).find((tool) => tool.name === "kv_set")!;
+    const result = await kvSet.execute({ key: "", value: "x" });
+    expect(result.isError).toBe(true);
+    const block = result.content[0];
+    expect(block?.type === "text" ? block.text : "").not.toBe("");
+    expect(store.get("")).toBeUndefined();
   });
 });

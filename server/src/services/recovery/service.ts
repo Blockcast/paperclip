@@ -136,6 +136,7 @@ import {
   parseIssueGraphLivenessIncidentKey,
 } from "./origins.js";
 import { postRoutineSchedulerFailureHeartbeat } from "./routine-scheduler-heartbeat.js";
+import { coldInReviewGaugeEntries } from "./cold-in-review-gauge.js";
 import {
   PENDING_INTERACTION_MAX_AGE_MS,
   classifyIssueGraphLiveness,
@@ -158,6 +159,11 @@ import {
   type StrandedAttendanceWindow,
 } from "./stranded-attendance-prefetch.js";
 import {
+  rotateStrandedCandidates,
+  runBudgetedStrandedLoop,
+  type StrandedSweepKey,
+} from "./stranded-sweep-budget.js";
+import {
   resolveStrandedEscalationStatus,
   shouldReuseStrandedRecoveryAction,
 } from "./stranded-escalation-status.js";
@@ -167,6 +173,8 @@ import {
   recordRecoveryActionAutoDischarged,
   recordRecoveryHorizonExpired,
   setBackstopDeferredCandidates,
+  setColdInReviewIssueMetricsRefreshSuccess,
+  setColdInReviewIssueOldestAgeMetrics,
 } from "../metrics.js";
 import {
   isInfraFailureRun,
@@ -8319,6 +8327,9 @@ export function recoveryService(
   // the first grep above) and is not worth it for a diagnostic-accuracy gain until the
   // totals stop being merely indicative.
   let activePassTimer: PassTimer | null = null;
+  // BLO-48950: where the next stranded pass resumes after one that ran out of budget.
+  // Null after a pass that reached every candidate. See `stranded-sweep-budget.ts`.
+  let strandedSweepResumeAfter: StrandedSweepKey | null = null;
 
   /**
    * Time one per-candidate round-trip against whichever pass is in flight, if any.
@@ -9539,6 +9550,11 @@ export function recoveryService(
     // by falling inside pass 1's window. Undefined for the startup pass and
     // for tests, which belong to no chain — pino omits the field entirely.
     recoveryChainId?: string;
+    // BLO-49596: polled before each candidate. True once the process is
+    // shutting down, so the pass stops instead of outliving the termination
+    // grace while its holder keeps renewing the scheduler lease. Candidates not
+    // reached show up as `candidatesScanned - candidates.count`.
+    shouldStop?: () => boolean;
   }) {
     // PEN-3636: published on the pass's own log line below, then cleared in the
     // `finally` so nothing outside a sweep is ever timed into it. Assigned rather
@@ -9560,11 +9576,12 @@ export function recoveryService(
     // the pass died before it had a population — which is itself the reading, and
     // is why this is not defaulted to 0: a pass that threw in `candidateQuery` and
     // a pass that genuinely found no candidates are different failures.
-    const scanned: { candidates: number | null } = { candidates: null };
+    const scanned: { candidates: number | null; stoppedForShutdown?: boolean } = { candidates: null };
     let completed = false;
     try {
       const swept = await runStrandedAssignedIssueSweep(opts, passTimer, scanned);
-      completed = true;
+      // BLO-49596: a shutdown-truncated pass is not complete.
+      completed = !scanned.stoppedForShutdown;
       return swept;
     } finally {
       activePassTimer = null;
@@ -9624,6 +9641,7 @@ export function recoveryService(
             // partial total reads exactly like a whole one, and every phase total
             // beside it would be silently understated.
             completed,
+            stoppedForShutdown: scanned.stoppedForShutdown ?? false,
           },
           "stranded assigned issue sweep phase timing",
         );
@@ -9634,16 +9652,16 @@ export function recoveryService(
   }
 
   async function runStrandedAssignedIssueSweep(
-    opts: { issueCreatedAtGte?: Date | null } | undefined,
+    opts: { issueCreatedAtGte?: Date | null; shouldStop?: () => boolean } | undefined,
     passTimer: PassTimer,
-    scanned: { candidates: number | null },
+    scanned: { candidates: number | null; stoppedForShutdown?: boolean },
   ) {
     const dependencyWaitEscalationSuppressedAtSweepStart = dependencyWaitEscalationSuppressedTotal;
     const dependencyWaitEscalationSuppressedDependencyReadyAtSweepStart =
       dependencyWaitEscalationSuppressedDependencyReadyTotal;
     const dependencyWaitEscalationSuppressedUnclassifiedAtSweepStart =
       dependencyWaitEscalationSuppressedUnclassifiedTotal;
-    const candidates = await passTimer.time("candidateQuery", () => db
+    const orderedCandidates = await passTimer.time("candidateQuery", () => db
       .select()
       .from(issues)
       .where(
@@ -9664,6 +9682,9 @@ export function recoveryService(
         ),
       )
       .orderBy(asc(issues.companyId), asc(issues.assigneeAgentId), asc(issues.createdAt), asc(issues.id)));
+    // BLO-48950: start after the candidate the previous, budget-truncated pass reached
+    // last, so a run of slow passes still covers the whole set.
+    const candidates = rotateStrandedCandidates(orderedCandidates, strandedSweepResumeAfter);
     // PEN-3636: published to the wrapper immediately, so a pass that throws later
     // still reports the population it was working against. Read only by the
     // wrapper's `finally`; nothing branches on it.
@@ -9729,6 +9750,10 @@ export function recoveryService(
       // sweep that would previously have aborted at that issue and silently dropped
       // every candidate ordered after it.
       reconcileErrors: 0,
+      // BLO-48950: true when the candidate loop stopped at `STRANDED_SWEEP_BUDGET_MS`;
+      // `candidatesReached` is then less than `candidatesScanned`.
+      budgetExhausted: false,
+      candidatesReached: 0,
       skipped: 0,
       // PEN-3636 — the pass's own cost, which the funnel never reported.
       //
@@ -11496,7 +11521,9 @@ export function recoveryService(
       }
     };
 
-    for (const issue of candidates) {
+    // BLO-48950: bound the loop against DB latency; the candidates it does not reach are
+    // picked up by the next pass. See `runBudgetedStrandedLoop`.
+    const strandedLoop = await runBudgetedStrandedLoop(candidates, async (issue) => {
       try {
         await passTimer.candidate(issue.id, () => reconcileStrandedCandidate(issue));
       } catch (err) {
@@ -11525,7 +11552,11 @@ export function recoveryService(
           "stranded assigned issue reconciliation failed; continuing with remaining candidates",
         );
       }
-    }
+    }, undefined, undefined, opts?.shouldStop);
+    if (strandedLoop.stopped) scanned.stoppedForShutdown = true;
+    result.candidatesReached = strandedLoop.reached;
+    result.budgetExhausted = strandedLoop.budgetExhausted;
+    strandedSweepResumeAfter = strandedLoop.resumeAfter;
 
     // PEN-3636: timed as its own phase because it is a SECOND sequential
     // per-candidate loop inside this same function, and its population is not
@@ -11533,10 +11564,13 @@ export function recoveryService(
     // the main loop, while `result.skipped` is shared between the two. So until this
     // phase had a number, an unknown share of pass 1 was unattributable by
     // construction.
-    const orphanBlockerRecovery = await passTimer.time(
-      "orphanBlockerSweep",
-      () => reconcileUnassignedBlockingIssues(),
-    );
+    if (opts?.shouldStop?.()) scanned.stoppedForShutdown = true;
+    const orphanBlockerRecovery = scanned.stoppedForShutdown
+      ? { assigned: 0, skipped: 0, issueIds: [] as string[] }
+      : await passTimer.time(
+        "orphanBlockerSweep",
+        () => reconcileUnassignedBlockingIssues(),
+      );
     // Snapshot BEFORE the merge below. `result.skipped` is about to absorb a different
     // sweep's tally, and `candidatesScanned` counts only this one's candidates — logging
     // the merged figure against it would invite a skip-rate that is not a rate of
@@ -11612,6 +11646,8 @@ export function recoveryService(
     logger.info(
       {
         candidatesScanned: result.candidatesScanned,
+        candidatesReached: result.candidatesReached,
+        budgetExhausted: result.budgetExhausted,
         agentInvokabilityEvaluated: result.agentInvokabilityEvaluated,
         pauseHoldPrefilterLiveReads: result.pauseHoldPrefilterLiveReads,
         pauseHoldPrefilterMemoHits: result.pauseHoldPrefilterMemoHits,
@@ -11934,6 +11970,18 @@ export function recoveryService(
       .concat(recoveryActionRows);
 
     return {
+      // Carried out so `reconcileIssueGraphLiveness` can age a finding without
+      // re-reading `issues`: `IssueLivenessFinding` has no assignee and no
+      // timestamp, and both already sit in this snapshot (PEN-4652).
+      issues: issueRows,
+      agents: agentRows,
+      // The instant the classifier judged against. Returned so a caller aging a
+      // finding uses the SAME clock the verdict was reached on, rather than a
+      // second `new Date()` taken after the pass (PEN-4652). In production the
+      // gap is only collect latency -- minutes on a long pass, harmless against
+      // hour-to-week ages -- but it is unbounded in principle and, in a test
+      // injecting a fixed clock, verdicts and ages would run on different ones.
+      now: sharedInput.now,
       // The MINTING view. An open escalation contributes a waiting path for its own
       // subject and leaf, which is what stops the detector re-firing the same incident
       // every 30s tick while somebody is already on it (BLO-15200). Everything that
@@ -15400,7 +15448,50 @@ export function recoveryService(
     /** Idle bound after which an untouched recovery row is retired (BLO-28957). 0 disables. */
     abandonedRecoveryMs?: number;
   }) {
-    const collected = await collectIssueGraphLiveness();
+    const collected = await collectIssueGraphLiveness().catch((error: unknown) => {
+      // PEN-4652: the cold-`in_review` gauge is published from this snapshot, so
+      // a failed collect has to mark it stale. Without this the previous pass's
+      // ages keep being served and read as current — the freezing-at-last-value
+      // failure the freshness gauge exists to make visible.
+      setColdInReviewIssueMetricsRefreshSuccess(false);
+      throw error;
+    });
+
+    // PEN-4652: publish the cold-`in_review` gauge from the verdicts this pass
+    // has ALREADY computed, before anything narrows them.
+    //
+    // Unfiltered by `issueCreatedAtGte` on purpose, for the same reason the
+    // stale-escalation re-check below is: that knob narrows which findings may
+    // CREATE escalations, and the pre-cutoff backlog is precisely the
+    // population this gauge exists to make visible. Filtering here would hide
+    // the oldest rows — the ones whose invisibility is the defect.
+    //
+    // Reads the MINTING view (`findings`) rather than `escalationBlindFindings`:
+    // an open escalation is a real, owned action path, so a row somebody is
+    // already on is attended and should leave the gauge. That makes the series
+    // measure the UNATTENDED backlog, which is the number escalation policy
+    // should be set against. The escalation-blind view deliberately pretends
+    // those paths are absent and would double-count them.
+    //
+    // Emitted here rather than on the scrape-metrics collector tick, which is
+    // where this gauge first lived: the collector would have had to re-derive
+    // "cold" in SQL as a second copy of `hasExplicitWaitingPath`, and that copy
+    // was measurably wrong (see cold-in-review-gauge.ts). The cost is that the
+    // series exists on the workers tier only and refreshes once per recovery
+    // chain, NOT once per 30s tick — the chain routinely outlives one interval.
+    // That is the right cadence anyway: the state it measures moves in hours to
+    // weeks, and tying it to the classifier means it cannot report a verdict the
+    // classifier did not reach.
+    setColdInReviewIssueOldestAgeMetrics(
+      coldInReviewGaugeEntries(
+        collected.findings,
+        new Map(collected.issues.map((issue) => [issue.id, issue])),
+        collected.now,
+      ),
+      new Set(collected.agents.map((agent) => agent.id)),
+    );
+    setColdInReviewIssueMetricsRefreshSuccess(true);
+
     let findings = collected.findings;
     // BLO-29601: run the premise re-check FIRST, so a sweep that closes a dead
     // escalation does it before anything downstream reads the escalation as an owned

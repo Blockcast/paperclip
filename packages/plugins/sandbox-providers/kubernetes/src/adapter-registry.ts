@@ -14,12 +14,12 @@ import { z } from "zod";
 export const adapterRegistryEntrySchema = z
   .object({
     adapterType: z.string().min(1),
-    enabled: z.boolean().default(true),
+    enabled: z.boolean().prefault(true),
     runtimeImage: z.string().optional(),
     envKeys: z.array(z.string()).optional(),
     allowFqdns: z.array(z.string()).optional(),
     probeCommand: z.array(z.string()).optional(),
-    defaultEnv: z.record(z.string()).optional(),
+    defaultEnv: z.record(z.string(), z.string()).optional(),
   })
   .strict();
 

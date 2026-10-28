@@ -542,6 +542,77 @@ describe("issue validators", () => {
       expect(text).toMatch(/same latent fail-open and is NOT cleared by this block/i);
     });
 
+    // PEN-4660: this block taught an agent how to VERIFY a review and never how to CAUSE one, so
+    // an agent whose re-check read clean had exactly one move left — re-arm — against a gate with
+    // no producer it could reach. Measured on Blockcast/onprem-k8s#6262: a bare `@ally` comment at
+    // 2026-10-24T14:39:35Z posted fine, fired `review-gate ordered-v4`, and that run went GREEN,
+    // while the webhook dropped the request as `reviewer_bot_authored_request_missing_marker` —
+    // agent PR comments carry the reviewer App's own login, so the BLO-18865 self-wake guard ate
+    // it. The drop is a server-side `logger.warn`; nothing reaches the requesting agent, so every
+    // signal at the call site reads "working". The belief that the mention had worked came from a
+    // coincidence on the same PR four days earlier: a push landed 82s BEFORE the mention and the
+    // review landed on the pushed commit. Assert the invariants, not the prose.
+    it("tells the caller how to CAUSE a review, not only how to verify one", () => {
+      const text = issueExecutionMonitorPolicySchema.shape.gateSignals.description ?? "";
+
+      // Verifying and requesting must be named as different acts; conflating them is the defect.
+      expect(text).toMatch(/CAUSING a review is a DIFFERENT ACT from verifying one/i);
+      // The false belief, stated as false. A bare mention from an agent is not a summons.
+      expect(text).toMatch(/bare `@ally` mention does NOT summon a review/i);
+      // WHY it is dropped — the guard and the identity collision, so the rule is reconstructable
+      // rather than magic, and so a reader cannot conclude it applies only to some other caller.
+      expect(text).toMatch(/authored under the reviewer App's own login/i);
+      // The failure is silent at the call site. Without this an agent reads a green gate run as
+      // progress, which is precisely how the dead poll gets armed.
+      expect(text).toMatch(/logger\.warn/i);
+      expect(text).toMatch(/NOTHING at your call site/i);
+
+      // The working protocol, exactly as the webhook predicate matches it.
+      expect(text).toContain("<!-- paperclip:review-request -->");
+      expect(text).toMatch(/LITERAL FIRST BYTE/i);
+      // Both conjuncts are required and each is separately silent, so neither may be dropped from
+      // the instruction: marker-without-mention and mention-without-marker are distinct drops.
+      for (const ticket of ["BLO-33589", "BLO-18273", "BLO-21618", "BLO-18865"]) {
+        expect(text).toContain(ticket);
+      }
+      // The self-echo guard is the one drop a correct request can still trip, so the avoidance
+      // instruction has to survive a trim alongside the heading it keys on.
+      expect(text).toContain("## Ally — Consolidated PR Review");
+
+      // The tempting wrong fix. Forcing a new head voids in-flight reviews and re-burns CI, so
+      // this must not be reachable as "the way to get re-reviewed".
+      expect(text).toMatch(/Do NOT move the head to force a re-review/i);
+      // A green gate-workflow run is not evidence a review is coming — the producer is the
+      // control plane's webhook, not repo CI. This is the inference that cost the wasted wakes.
+      expect(text).toMatch(/authors NO review/i);
+
+      // Ally review of paperclip#2980, Important 1. An earlier draft of this clause told agents to
+      // "quote a prior review as an indented block" to dodge the BLO-21618 self-echo drop. That
+      // advice FAILS SILENTLY — the same defect class the clause exists to remove.
+      // ALLY_CONSOLIDATED_REVIEW_HEADING_PATTERN (`ally-review-detection.ts`) is
+      // `(?:^|\n)(?! *\t)(?! {4}) {0,3}(?:#{1,6}[ \t]+|\*\*[ \t]*)?Ally…`: it ALLOWS 0-3 spaces and
+      // makes the `#`/`**` prefix optional, so a two-space indent and a bare `Ally — Consolidated
+      // PR Review` line both match. Only a 4+-space/tab indent (NOT_INDENTED_CODE), a fenced block
+      // (stripped by emittedReviewText) and a `>` blockquote (absent from the pattern) escape.
+      expect(text).toMatch(/INDENTING DOES NOT AVOID IT/i);
+      expect(text).toMatch(/fenced block or behind `>`/i);
+      // The numeric boundary must survive a trim: "indent it" is wrong, "four spaces" is the line.
+      expect(text).toMatch(/four-space indent/i);
+      // ...and the clause must not reacquire the unqualified advice it replaced.
+      expect(text).not.toMatch(/quote[^.]{0,40}as an indented block/i);
+
+      // Ally review of paperclip#2980, suggestion 2. A push to a non-draft PR DOES wake the
+      // reviewer (`pull_request.synchronize` → `github_pr_synchronized`), so the case against
+      // moving the head is COST, not ineffectiveness. An earlier draft also claimed a new head
+      // "voids every pending review-request marker at the old head"; it does not — the marker wake
+      // is scoped to the COMMENT ID, and only `github_pr_synchronized` is head-scoped (PEN-2865).
+      // Stating a false mechanism here invites the next reader to disprove it and discard the
+      // (correct) conclusion with it.
+      expect(text).toMatch(/A push DOES wake the reviewer/i);
+      expect(text).toMatch(/argument from COST, not from ineffectiveness/i);
+      expect(text).not.toMatch(/voids every pending review-request marker/i);
+    });
+
     // PEN-3415: `monitor.kind` is the trigger for the #1195 external-wait slot yield. Measured
     // 2026-09-21 across every `in_review` row in one company (64 rows, untruncated): 7 armed
     // monitors, 7/7 with `kind: null` — an opt-in mechanism nobody opted into, because this was

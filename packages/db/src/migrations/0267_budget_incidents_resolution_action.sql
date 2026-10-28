@@ -1,0 +1,30 @@
+-- PEN-4742: record HOW a budget incident was resolved, not merely that it was.
+--
+-- `budget_incidents.status` collapses three different board decisions into one
+-- value. `raise_budget_and_resume` and the new `resume_without_raise` both land
+-- as `resolved`, and so does every system closure (`upsertPolicy` clearing the
+-- incidents for a policy, a pause clearing itself at the window roll). From the
+-- row alone you cannot tell which happened.
+--
+-- That is now load-bearing rather than merely untidy. `resume_without_raise`
+-- grants a window-scoped rebaseline -- the cap binds on spend incurred after the
+-- decision for the rest of the window -- and the grant has to be readable later,
+-- from the row, by `hardStopForgivenSince`. Deriving it instead from live state
+-- (`policy.amount <= incident.amount_observed`) was the first shape considered
+-- and is retroactively forgeable: raise a cap clear of observed, then lower it
+-- again through an ordinary policy edit, and the predicate flips to true and
+-- grants a suppression no board ever asked for. Lowering a cap would loosen
+-- enforcement. The decision has to be written down at the moment it is made.
+--
+-- NULLABLE WITH NO BACKFILL, DELIBERATELY. Every row that predates this column
+-- reads null, and `hardStopForgivenSince` requires an explicit
+-- `resume_without_raise` -- so the entire existing corpus grants no forgiveness
+-- and enforcement is unchanged for it. Null also stays the correct value going
+-- forward for system closures, which are not board decisions and must never
+-- confer a grant. Fails closed in both directions.
+--
+-- Unconstrained text, matching `status`, `threshold_type`, `scope_type` and
+-- `metric` on this same table: the enum lives in
+-- `BUDGET_INCIDENT_RESOLUTION_ACTIONS` (packages/shared/src/constants.ts) and is
+-- enforced by the zod schema at the route boundary.
+ALTER TABLE "budget_incidents" ADD COLUMN IF NOT EXISTS "resolution_action" text;

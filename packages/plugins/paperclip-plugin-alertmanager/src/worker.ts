@@ -80,6 +80,15 @@ export const plugin = definePlugin({
       }
     });
     ctx.jobs.register("reconcile-active-alerts", async (job: PluginJobContext) => {
+      // Re-run the fence sweep every pass, not only at boot (BLO-49195). Its age
+      // arm is the only automatic drain for a fence leaked by a LIVE process on
+      // an aggregate whose alert has stopped firing: the per-claim backstop only
+      // runs on a firing delivery, and the resolution claim admits `active`
+      // alone. Run only from setup(), such a fence waited for a worker restart
+      // while Alertmanager retried the resolution forever. Global and
+      // idempotent, so running it once per company dispatch is harmless; it
+      // never throws.
+      await reconcileAbandonedAggregateFences(ctx);
       // Same scope rules as the sweep: a run that silently does nothing would
       // report success while the backfill it exists for never happens.
       if (!job.companyId) {
@@ -97,10 +106,10 @@ export const plugin = definePlugin({
       // info, not debug: a disabled reconciler otherwise reads as "job completed
       // successfully" every 5 min, indistinguishable from a working one (BLO-44820).
       if (result.skipped) {
-        ctx.logger.info(`paperclip-plugin-alertmanager: alert reconcile skipped: ${result.skipped}`);
+        ctx.logger.info(`paperclip-plugin-alertmanager: alert reconcile company ${job.companyId} skipped: ${result.skipped}`);
       } else {
         ctx.logger.info(
-          `paperclip-plugin-alertmanager: alert reconcile routed=${result.routed} backfilled=${result.backfilled.length}`,
+          `paperclip-plugin-alertmanager: alert reconcile company ${job.companyId} routed=${result.routed} backfilled=${result.backfilled.length}`,
         );
       }
     });

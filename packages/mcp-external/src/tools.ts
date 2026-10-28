@@ -126,7 +126,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
   const getAgentSchema = z.object({
     agent_id: z
       .string()
-      .default("me")
+      .prefault("me")
       .describe('Agent UUID, or the literal "me" for the currently authenticated agent.'),
   });
 
@@ -159,15 +159,15 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       name: "list_issues",
       description: "List issues (tasks) in a company.",
       schema: z.object({
-        status: z.string().default("todo,in_progress").describe(
+        status: z.string().prefault("todo,in_progress").describe(
           "Comma-separated statuses: backlog, todo, in_progress, in_review, done, blocked, cancelled. Default: todo,in_progress",
         ),
-        assignee_agent_id: z.string().default("").describe("Filter by assignee agent UUID. Empty for all."),
-        project_id: z.string().default("").describe("Filter by project UUID. Empty for all."),
-        label: z.string().default("").describe("Filter by label name. Empty to skip."),
-        q: z.string().default("").describe("Full-text query. Empty to skip."),
-        limit: z.number().int().default(50).describe("Max results (1-200). Default: 50."),
-        company_id: z.string().default("").describe("Target company by context (UUID or prefix). Empty for default."),
+        assignee_agent_id: z.string().prefault("").describe("Filter by assignee agent UUID. Empty for all."),
+        project_id: z.string().prefault("").describe("Filter by project UUID. Empty for all."),
+        label: z.string().prefault("").describe("Filter by label name. Empty to skip."),
+        q: z.string().prefault("").describe("Full-text query. Empty to skip."),
+        limit: z.number().int().prefault(50).describe("Max results (1-200). Default: 50."),
+        company_id: z.string().prefault("").describe("Target company by context (UUID or prefix). Empty for default."),
       }),
       execute: async (args) => runTool(() => runListIssues(args)),
     },
@@ -177,14 +177,14 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
         "Search Paperclip issues by text. Compatibility alias for list_issues(q=...).",
       schema: z.object({
         query: z.string().describe("Full-text issue search query."),
-        status: z.string().default("todo,in_progress").describe(
+        status: z.string().prefault("todo,in_progress").describe(
           "Comma-separated statuses: backlog, todo, in_progress, in_review, done, blocked, cancelled. Default: todo,in_progress",
         ),
-        assignee_agent_id: z.string().default("").describe("Filter by assignee agent UUID. Empty for all."),
-        project_id: z.string().default("").describe("Filter by project UUID. Empty for all."),
-        label: z.string().default("").describe("Filter by label name. Empty to skip."),
-        limit: z.number().int().default(50).describe("Max results (1-200). Default: 50."),
-        company_id: z.string().default("").describe("Target company by context (UUID or prefix). Empty for default."),
+        assignee_agent_id: z.string().prefault("").describe("Filter by assignee agent UUID. Empty for all."),
+        project_id: z.string().prefault("").describe("Filter by project UUID. Empty for all."),
+        label: z.string().prefault("").describe("Filter by label name. Empty to skip."),
+        limit: z.number().int().prefault(50).describe("Max results (1-200). Default: 50."),
+        company_id: z.string().prefault("").describe("Target company by context (UUID or prefix). Empty for default."),
       }),
       execute: async (args) =>
         runTool(() => runListIssues({ ...args, q: args.query })),
@@ -206,12 +206,12 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       description: "Create a new Paperclip issue (task) and optionally assign it to an agent.",
       schema: z.object({
         title: z.string().describe("Short, imperative task title."),
-        description: z.string().default("").describe("Full instructions/context (Markdown)."),
-        assignee_agent_id: z.string().default("").describe("Assignee agent UUID. Empty to leave unassigned."),
-        project_id: z.string().default("").describe("Project UUID. Empty for none."),
-        parent_issue_id: z.string().default("").describe("Parent issue UUID for a subtask. Empty for top-level."),
-        priority: z.string().default("medium").describe("critical, high, medium, or low. Default: medium."),
-        company_id: z.string().default("").describe("Target company by context (UUID or prefix). Empty for default."),
+        description: z.string().prefault("").describe("Full instructions/context (Markdown)."),
+        assignee_agent_id: z.string().prefault("").describe("Assignee agent UUID. Empty to leave unassigned."),
+        project_id: z.string().prefault("").describe("Project UUID. Empty for none."),
+        parent_issue_id: z.string().prefault("").describe("Parent issue UUID for a subtask. Empty for top-level."),
+        priority: z.string().prefault("medium").describe("critical, high, medium, or low. Default: medium."),
+        company_id: z.string().prefault("").describe("Target company by context (UUID or prefix). Empty for default."),
         blocked_by_issue_ids: z
           .array(z.string())
           .nullable()
@@ -238,17 +238,17 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       description: "Update an existing issue. Only fields you provide are changed.",
       schema: z.object({
         issue_id: z.string().describe('Issue UUID or identifier (e.g. "CY-42").'),
-        title: z.string().default("").describe("New title. Empty to keep."),
-        description: z.string().default("").describe("New description (Markdown). Empty to keep."),
-        status: z.string().default("").describe("backlog, todo, in_progress, in_review, done, blocked, or cancelled. Empty to keep."),
-        assignee_agent_id: z.string().default("").describe("New assignee agent UUID. Empty to keep."),
-        priority: z.string().default("").describe("critical, high, medium, or low. Empty to keep."),
+        title: z.string().prefault("").describe("New title. Empty to keep."),
+        description: z.string().prefault("").describe("New description (Markdown). Empty to keep."),
+        status: z.string().prefault("").describe("backlog, todo, in_progress, in_review, done, blocked, or cancelled. Empty to keep."),
+        assignee_agent_id: z.string().prefault("").describe("New assignee agent UUID. Empty to keep."),
+        priority: z.string().prefault("").describe("critical, high, medium, or low. Empty to keep."),
         project_id: z
           .string()
           .nullable()
           .optional()
           .describe("New project UUID, or empty string to clear. Omit to keep."),
-        company_id: z.string().default("").describe("Target company by context (UUID or prefix). Empty to rely on issue-key routing."),
+        company_id: z.string().prefault("").describe("Target company by context (UUID or prefix). Empty to rely on issue-key routing."),
         blocked_by_issue_ids: z
           .array(z.string())
           .nullable()
@@ -349,7 +349,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       schema: z.object({
         issue_id: z.string().describe("Issue UUID or identifier."),
         body: z.string().describe("Comment text. Markdown supported."),
-        reopen: z.boolean().default(false).describe("Reopen the issue when posting (only if currently closed)."),
+        reopen: z.boolean().prefault(false).describe("Reopen the issue when posting (only if currently closed)."),
       }),
       execute: async (args) =>
         runTool(() => {
@@ -362,7 +362,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       name: "list_projects",
       description: "List projects in a company.",
       schema: z.object({
-        company_id: z.string().default("").describe("Target company by context (UUID or prefix). Empty for default."),
+        company_id: z.string().prefault("").describe("Target company by context (UUID or prefix). Empty for default."),
       }),
       execute: async (args) =>
         runTool(async () => {
@@ -375,7 +375,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       description: "Get a project by UUID or company-scoped short reference.",
       schema: z.object({
         project_id: z.string().describe("Project UUID or company-scoped project reference."),
-        company_id: z.string().default("").describe("Target company by context (UUID or prefix). Empty for default."),
+        company_id: z.string().prefault("").describe("Target company by context (UUID or prefix). Empty for default."),
       }),
       execute: async (args) =>
         runTool(async () => {
@@ -391,14 +391,14 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       description: "Create a project in a company.",
       schema: z.object({
         name: z.string().describe("Project name."),
-        description: z.string().default("").describe("Project description. Empty for none."),
-        status: z.string().default("backlog").describe("backlog, planned, in_progress, completed, cancelled. Default: backlog."),
-        goal_id: z.string().default("").describe("Deprecated default goal UUID. Prefer goal_ids."),
+        description: z.string().prefault("").describe("Project description. Empty for none."),
+        status: z.string().prefault("backlog").describe("backlog, planned, in_progress, completed, cancelled. Default: backlog."),
+        goal_id: z.string().prefault("").describe("Deprecated default goal UUID. Prefer goal_ids."),
         goal_ids: z.array(z.string()).nullable().optional().describe("Goal UUIDs to link."),
-        lead_agent_id: z.string().default("").describe("Lead agent UUID. Empty for none."),
-        target_date: z.string().default("").describe("Target date string. Empty for none."),
-        color: z.string().default("").describe("Project color. Empty for default."),
-        company_id: z.string().default("").describe("Target company by context (UUID or prefix). Empty for default."),
+        lead_agent_id: z.string().prefault("").describe("Lead agent UUID. Empty for none."),
+        target_date: z.string().prefault("").describe("Target date string. Empty for none."),
+        color: z.string().prefault("").describe("Project color. Empty for default."),
+        company_id: z.string().prefault("").describe("Target company by context (UUID or prefix). Empty for default."),
       }),
       execute: async (args) => {
         // Python parity (server.py create_project): empty status defaults to "backlog"
@@ -427,15 +427,15 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       description: "Update a project. Only fields you provide are changed.",
       schema: z.object({
         project_id: z.string().describe("Project UUID or company-scoped project reference."),
-        name: z.string().default("").describe("New name. Empty to keep."),
+        name: z.string().prefault("").describe("New name. Empty to keep."),
         description: z.string().nullable().optional().describe("New description, or empty string to clear. Omit to keep."),
-        status: z.string().default("").describe("backlog, planned, in_progress, completed, cancelled. Empty to keep."),
+        status: z.string().prefault("").describe("backlog, planned, in_progress, completed, cancelled. Empty to keep."),
         goal_id: z.string().nullable().optional().describe("Deprecated default goal UUID, or empty string to clear."),
         goal_ids: z.array(z.string()).nullable().optional().describe("Full set of linked goal UUIDs."),
         lead_agent_id: z.string().nullable().optional().describe("New lead agent UUID, or empty string to clear."),
         target_date: z.string().nullable().optional().describe("New target date, or empty string to clear."),
         color: z.string().nullable().optional().describe("New project color, or empty string to clear."),
-        company_id: z.string().default("").describe("Target company by context (UUID or prefix). Empty for default."),
+        company_id: z.string().prefault("").describe("Target company by context (UUID or prefix). Empty for default."),
       }),
       execute: async (args) => {
         const status = String((args.status as string | undefined) ?? "");
@@ -466,7 +466,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       name: "list_goals",
       description: "List all strategic goals for a company.",
       schema: z.object({
-        company_id: z.string().default("").describe("Target company by context (UUID or prefix). Empty for default."),
+        company_id: z.string().prefault("").describe("Target company by context (UUID or prefix). Empty for default."),
       }),
       execute: async (args) =>
         runTool(async () => {
@@ -479,8 +479,8 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       description: "Create a new strategic goal for a company.",
       schema: z.object({
         title: z.string().describe("Goal title."),
-        description: z.string().default("").describe("Extended context/success criteria (Markdown)."),
-        company_id: z.string().default("").describe("Target company by context (UUID or prefix). Empty for default."),
+        description: z.string().prefault("").describe("Extended context/success criteria (Markdown)."),
+        company_id: z.string().prefault("").describe("Target company by context (UUID or prefix). Empty for default."),
       }),
       execute: async (args) =>
         runTool(async () => {
@@ -495,8 +495,8 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       description: "Update an existing goal's title or description.",
       schema: z.object({
         goal_id: z.string().describe("Goal UUID."),
-        title: z.string().default("").describe("New title. Empty to keep."),
-        description: z.string().default("").describe("New description. Empty to keep."),
+        title: z.string().prefault("").describe("New title. Empty to keep."),
+        description: z.string().prefault("").describe("New description. Empty to keep."),
       }),
       execute: async (args) => {
         const body: Record<string, unknown> = {};
@@ -516,7 +516,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       name: "list_agents",
       description: "List all agents in a company with their name, role, status, and config.",
       schema: z.object({
-        company_id: z.string().default("").describe("Target company by context (UUID or prefix). Empty for default."),
+        company_id: z.string().prefault("").describe("Target company by context (UUID or prefix). Empty for default."),
       }),
       execute: async (args) =>
         runTool(async () => {
@@ -540,10 +540,10 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       name: "list_approvals",
       description: "List approval requests in a company.",
       schema: z.object({
-        status: z.string().default("pending").describe(
+        status: z.string().prefault("pending").describe(
           "pending, approved, rejected, or revision_requested. Default: pending.",
         ),
-        company_id: z.string().default("").describe("Target company by context (UUID or prefix). Empty for default."),
+        company_id: z.string().prefault("").describe("Target company by context (UUID or prefix). Empty for default."),
       }),
       execute: async (args) => {
         // Python parity (server.py list_approvals:750-752): validates `if status not in allowed`
@@ -564,7 +564,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       description: "Approve a pending approval request.",
       schema: z.object({
         approval_id: z.string().describe("Approval UUID."),
-        comment: z.string().default("").describe("Optional approval note to attach."),
+        comment: z.string().prefault("").describe("Optional approval note to attach."),
       }),
       execute: async (args) =>
         runTool(() => {
@@ -580,7 +580,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       description: "Reject a pending approval request.",
       schema: z.object({
         approval_id: z.string().describe("Approval UUID."),
-        comment: z.string().default("").describe("Reason for rejection — strongly recommended so the agent understands why."),
+        comment: z.string().prefault("").describe("Reason for rejection — strongly recommended so the agent understands why."),
       }),
       execute: async (args) =>
         runTool(() => {
@@ -623,11 +623,11 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
         "re-tailing. Each run's log starts with ~15-20KB of SessionStart/tool-list boilerplate; " +
         "pass a nonzero offset to skip past it instead of re-reading from 0.",
       schema: z.object({
-        runId: z.string().default("").describe("Heartbeat run UUID. Preferred stdio-compatible field."),
-        run_id: z.string().default("").describe("Heartbeat run UUID. Compatibility alias."),
-        offset: z.number().int().default(0).describe("Byte offset to resume from. Default: 0."),
-        limitBytes: z.number().int().default(16_384).describe("Max bytes to read (1-256000). Default: 16384 (matches the resource-subscription chunk size). For a low-context read, pass 2000-4000 explicitly plus a nonzero offset."),
-        limit_bytes: z.number().int().default(16_384).describe("Max bytes to read (1-256000). Compatibility alias."),
+        runId: z.string().prefault("").describe("Heartbeat run UUID. Preferred stdio-compatible field."),
+        run_id: z.string().prefault("").describe("Heartbeat run UUID. Compatibility alias."),
+        offset: z.number().int().prefault(0).describe("Byte offset to resume from. Default: 0."),
+        limitBytes: z.number().int().prefault(16_384).describe("Max bytes to read (1-256000). Default: 16384 (matches the resource-subscription chunk size). For a low-context read, pass 2000-4000 explicitly plus a nonzero offset."),
+        limit_bytes: z.number().int().prefault(16_384).describe("Max bytes to read (1-256000). Compatibility alias."),
       }),
       execute: async (args) =>
         runTool(async () => {
@@ -646,7 +646,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       description:
         "Get a high-level health summary for a company: agent count, open/in-progress/blocked issue counts, stale tasks, recent activity, current-period cost totals.",
       schema: z.object({
-        company_id: z.string().default("").describe("Target company by context (UUID or prefix). Empty for default."),
+        company_id: z.string().prefault("").describe("Target company by context (UUID or prefix). Empty for default."),
       }),
       execute: async (args) =>
         runTool(async () => {
@@ -659,7 +659,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       description:
         "Get aggregate token usage and spend for a company this billing period (total spend, remaining budget, per-agent breakdown).",
       schema: z.object({
-        company_id: z.string().default("").describe("Target company by context (UUID or prefix). Empty for default."),
+        company_id: z.string().prefault("").describe("Target company by context (UUID or prefix). Empty for default."),
       }),
       execute: async (args) =>
         runTool(async () => {
@@ -671,9 +671,9 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       name: "list_activity",
       description: "Retrieve the audit trail of recent actions in a company.",
       schema: z.object({
-        agent_id: z.string().default("").describe("Filter to a specific agent UUID. Empty for all."),
-        limit: z.number().int().default(20).describe("Max entries (1-100). Default: 20."),
-        company_id: z.string().default("").describe("Target company by context (UUID or prefix). Empty for default."),
+        agent_id: z.string().prefault("").describe("Filter to a specific agent UUID. Empty for all."),
+        limit: z.number().int().prefault(20).describe("Max entries (1-100). Default: 20."),
+        company_id: z.string().prefault("").describe("Target company by context (UUID or prefix). Empty for default."),
       }),
       execute: async (args) =>
         runTool(async () => {

@@ -504,9 +504,9 @@ async function scopeAllows(
     if (!matchesSubtree) return false;
   }
 
-  // Unknown metadata keys do not constrain the grant. Recognized constraints
-  // return false above when they fail to match the requested assignment scope.
-  return !constrained ? true : constrained;
+  // A non-empty scope must contain at least one recognized constraint. Unknown
+  // keys cannot silently turn a purportedly scoped grant into a broad grant.
+  return constrained;
 }
 
 function allow(input: Omit<AuthorizationDecision, "allowed">): AuthorizationDecision {
@@ -1954,6 +1954,15 @@ export function authorizationService(db: Db) {
       return broadDecision;
     }
 
+    // THE implication rule for `agent_config:read`, which is a virtual action
+    // with no `permission_key` of its own (`permissionForAction` returns null
+    // for it). Config READ authority is implied by config CHANGE authority, in
+    // both the direct and the suggest tier — and by nothing else: the
+    // delegate below reads only an active membership and a stored grant, never
+    // `role`, `reportsTo` or `permissions`. Searching a principal's grants for
+    // the string `agent_config:read` therefore always comes back empty, for an
+    // entitled principal exactly as much as for a denied one (PEN-4775).
+    // Keep in step with docs/security/agent-config-read-model.md.
     async function decideWithAgentConfigReadGrant(
       principalType: PrincipalType,
       principalId: string,

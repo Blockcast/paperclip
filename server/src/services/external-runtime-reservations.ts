@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, eq, isNotNull, isNull, ne, or, sql } from "drizzle-orm";
+import { and, asc, eq, isNotNull, isNull, lt, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { externalRuntimeReservations, heartbeatRuns } from "@paperclipai/db";
 import {
@@ -8,6 +8,10 @@ import {
 } from "./metrics.js";
 import { logger } from "../middleware/logger.js";
 import { canClaimPrReviewTask } from "./pr-review-dispatch-lock.js";
+import {
+  K8S_ISOLATION_RETRY_AT_CONTEXT_KEY,
+  K8S_ISOLATION_WAIT_KEY_CONTEXT_KEY,
+} from "./dispatch-readiness.js";
 
 const DEFAULT_EXTERNAL_RUNTIME_SLOT_ID = 0;
 
@@ -16,6 +20,21 @@ export type ExternalRuntimeIsolationMode = "shared" | "run" | "workspace";
 
 const ACTIVE_RUNTIME_SLOT_CONSTRAINT = "external_runtime_reservations_active_slot_idx";
 const ACTIVE_ISOLATION_WRITER_CONSTRAINT = "external_runtime_reservations_active_isolation_writer_idx";
+// BLO-48769: a queued waiter only holds its place while it is still retrying.
+// Deferral re-stamps the retry time at most 5 min apart, so a waiter whose stamp
+// is older than this has stopped contending (paused, budget-blocked, cancelled
+// upstream) and must not hold the key idle for younger runs.
+const ISOLATION_WAITER_LIVENESS_MS = 10 * 60_000;
+
+function liveIsolationWaiters(isolationKey: string, now: Date) {
+  return and(
+    eq(heartbeatRuns.status, "queued"),
+    sql`${heartbeatRuns.contextSnapshot} ->> ${K8S_ISOLATION_WAIT_KEY_CONTEXT_KEY} = ${isolationKey}`,
+    // Postgres does not order predicate evaluation, so the cast can see any
+    // queued row; guard it so one malformed stamp cannot fail every bind.
+    sql`(CASE WHEN (${heartbeatRuns.contextSnapshot} ->> ${K8S_ISOLATION_RETRY_AT_CONTEXT_KEY}) ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T' THEN (${heartbeatRuns.contextSnapshot} ->> ${K8S_ISOLATION_RETRY_AT_CONTEXT_KEY})::timestamptz END) > ${new Date(now.getTime() - ISOLATION_WAITER_LIVENESS_MS).toISOString()}::timestamptz`,
+  );
+}
 
 export class ExternalRuntimeIsolationConflictError extends Error {
   readonly code = "external_runtime_isolation_conflict";
@@ -393,6 +412,33 @@ export async function bindExternalRuntimeReservationIsolation(
             legacyWriter.runId,
           );
         }
+        // BLO-48769: the writer goes to the oldest live waiter on this key, not
+        // to whichever run reaches bind first after a release (usually the
+        // releasing agent's own next run, or a waiter on a shorter backoff).
+        // A younger run yields by taking the normal conflict/defer path.
+        const self = await tx
+          .select({ createdAt: heartbeatRuns.createdAt })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, input.runId))
+          .then((rows) => rows[0] ?? null);
+        if (self) {
+          const elder = await tx
+            .select({ id: heartbeatRuns.id })
+            .from(heartbeatRuns)
+            .where(and(
+              liveIsolationWaiters(input.isolationKey, now),
+              ne(heartbeatRuns.id, input.runId),
+              or(
+                lt(heartbeatRuns.createdAt, self.createdAt),
+                and(eq(heartbeatRuns.createdAt, self.createdAt), lt(heartbeatRuns.id, input.runId)),
+              ),
+            ))
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
+          if (elder) {
+            throw new ExternalRuntimeIsolationConflictError(input.runId, input.isolationKey, elder.id);
+          }
+        }
       }
 
       const reservation = await tx
@@ -578,8 +624,37 @@ export async function releaseExternalRuntimeReservation(
   if (reservation) {
     recordExternalRuntimeReservationEvent("released");
     refreshExternalRuntimeReservationMetricsBestEffort(db, now, "release");
+    if (
+      reservation.isolationKey
+      && (reservation.isolationMode === "workspace" || reservation.isolationMode === "shared")
+    ) {
+      await wakeOldestIsolationWaiter(db, reservation.isolationKey, now).catch((error) => {
+        logger.warn({ error, isolationKey: reservation.isolationKey }, "failed to wake oldest isolation waiter");
+      });
+    }
   }
   return reservation;
+}
+
+// BLO-48769: a released writer would otherwise sit idle until the oldest
+// waiter's backoff (up to 5 min) expires, since younger contenders now yield to
+// it. Pull that one waiter's retry stamp forward to now so the next dispatch
+// pass admits it.
+async function wakeOldestIsolationWaiter(db: Db, isolationKey: string, now: Date) {
+  const oldest = await db
+    .select({ id: heartbeatRuns.id })
+    .from(heartbeatRuns)
+    .where(liveIsolationWaiters(isolationKey, now))
+    .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
+    .limit(1)
+    .then((rows) => rows[0] ?? null);
+  if (!oldest) return;
+  await db
+    .update(heartbeatRuns)
+    .set({
+      contextSnapshot: sql`jsonb_set(${heartbeatRuns.contextSnapshot}, ${`{${K8S_ISOLATION_RETRY_AT_CONTEXT_KEY}}`}::text[], to_jsonb(${now.toISOString()}::text))`,
+    })
+    .where(and(eq(heartbeatRuns.id, oldest.id), eq(heartbeatRuns.status, "queued")));
 }
 
 export async function recordExpectedExternalRuntimeJobName(

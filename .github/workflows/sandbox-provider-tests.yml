@@ -91,8 +91,20 @@ jobs:
       # Needed only to build the SDK the providers import; the providers
       # themselves are installed standalone below. --frozen-lockfile keeps this
       # honest: if it ever mutates the root lockfile, the job fails here.
+      #
+      # Filtered, not the full workspace (BLO-48931). A full install with a
+      # cold `cache: pnpm` (any PR that changes pnpm-lock.yaml misses the
+      # cache key) writes the whole store and OOMKilled this 4Gi runner three
+      # runs in a row; master's lockfile fails the same way cold. The filter
+      # is the closure this lane uses: the SDK and its deps (shared), the
+      # root (typescript for ensure-plugin-build-deps, plus the vitest the
+      # orchestration smoke example resolves from the root), and
+      # @paperclipai/ui only because that root vitest's `vite` peer is
+      # satisfied by hoisting from ui. Measured cold: ~1.1 GB peak anon vs a
+      # failed full install. If a provider starts failing to resolve
+      # something from the root, widen this filter rather than dropping it.
       - name: Install root workspace
-        run: pnpm install --frozen-lockfile
+        run: pnpm install --frozen-lockfile --filter "@paperclipai/plugin-sdk..." --filter paperclip --filter @paperclipai/ui
 
       - name: Build @paperclipai/shared and @paperclipai/plugin-sdk
         run: node scripts/ensure-plugin-build-deps.mjs

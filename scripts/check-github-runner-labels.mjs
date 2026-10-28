@@ -18,6 +18,7 @@ export const ALLOWED_RUNNERS = new Set([
   "arc-paperclip-light",
   "arc-dind",
   "arc-deploy",
+  "arc-paperclip-deploy",
   "arc-paperclip-e2e",
   "arc-merge-queue",
   "arc-paperclip-buildkit",

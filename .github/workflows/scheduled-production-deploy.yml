@@ -156,8 +156,12 @@ concurrency:
 
 jobs:
   dispatch:
-    if: ${{ github.repository == 'Blockcast/paperclip' }}
-    runs-on: arc-deploy
+    # The ref check is load-bearing: group arc-paperclip-deploy admits this
+    # workflow only @refs/heads/master, so a branch dispatch would queue with no
+    # eligible runner for 24h while holding the concurrency group above. A
+    # skipped job needs no runner and releases the group immediately.
+    if: ${{ github.repository == 'Blockcast/paperclip' && github.ref == 'refs/heads/master' }}
+    runs-on: arc-paperclip-deploy
     steps:
       - name: Checkout
         id: checkout

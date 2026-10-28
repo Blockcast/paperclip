@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { optionalNoDefault, partialNoDefaults } from "../zod-compat.js";
 import {
   AGENT_ICON_NAMES,
   AGENT_ROLES,
@@ -12,8 +13,8 @@ import { trustAuthorizationPolicySchema, trustPresetSchema } from "./trust-polic
 import { agentDesiredSkillSelectionSchema } from "./adapter-skills.js";
 
 export const agentPermissionsSchema = z.object({
-  canCreateAgents: z.boolean().optional().default(false),
-  canCreateSkills: z.boolean().optional().default(true),
+  canCreateAgents: z.boolean().prefault(false),
+  canCreateSkills: z.boolean().prefault(true),
   trustPreset: trustPresetSchema.optional(),
   authorizationPolicy: trustAuthorizationPolicySchema.optional(),
 }).catchall(z.unknown());
@@ -135,7 +136,7 @@ export const updateAgentInstructionsBundleSchema = z.object({
   mode: agentInstructionsBundleModeSchema.optional(),
   rootPath: z.string().trim().min(1).nullable().optional(),
   entryFile: z.string().trim().min(1).optional(),
-  clearLegacyPromptTemplate: z.boolean().optional().default(false),
+  clearLegacyPromptTemplate: z.boolean().prefault(false),
 });
 
 export type UpdateAgentInstructionsBundle = z.infer<typeof updateAgentInstructionsBundleSchema>;
@@ -143,7 +144,7 @@ export type UpdateAgentInstructionsBundle = z.infer<typeof updateAgentInstructio
 export const upsertAgentInstructionsFileSchema = z.object({
   path: z.string().trim().min(1),
   content: z.string(),
-  clearLegacyPromptTemplate: z.boolean().optional().default(false),
+  clearLegacyPromptTemplate: z.boolean().prefault(false),
 });
 
 export type UpsertAgentInstructionsFile = z.infer<typeof upsertAgentInstructionsFileSchema>;
@@ -195,18 +196,18 @@ export const agentRuntimeConfigSchema = z.object({
 
 export const createAgentSchema = z.object({
   name: z.string().min(1),
-  role: z.enum(AGENT_ROLES).optional().default("general"),
+  role: z.enum(AGENT_ROLES).prefault("general"),
   title: z.string().optional().nullable(),
   icon: z.enum(AGENT_ICON_NAMES).optional().nullable(),
-  reportsTo: z.string().uuid().optional().nullable(),
+  reportsTo: z.string().guid().optional().nullable(),
   capabilities: z.string().optional().nullable(),
   desiredSkills: z.array(agentDesiredSkillSelectionSchema).optional(),
   adapterType: agentAdapterTypeSchema,
-  adapterConfig: adapterConfigSchema.optional().default({}),
+  adapterConfig: adapterConfigSchema.prefault({}),
   instructionsBundle: createAgentInstructionsBundleSchema.optional(),
-  defaultEnvironmentId: z.string().uuid().optional().nullable(),
-  runtimeConfig: agentRuntimeConfigSchema.optional().default({}),
-  budgetMonthlyCents: z.number().int().nonnegative().optional().default(0),
+  defaultEnvironmentId: z.string().guid().optional().nullable(),
+  runtimeConfig: agentRuntimeConfigSchema.prefault({}),
+  budgetMonthlyCents: z.number().int().nonnegative().prefault(0),
   permissions: agentPermissionsSchema.optional(),
   metadata: z.record(z.string(), z.unknown()).optional().nullable(),
 });
@@ -214,33 +215,33 @@ export const createAgentSchema = z.object({
 export type CreateAgent = z.infer<typeof createAgentSchema>;
 
 export const builtInAgentProvisionSchema = z.object({
-  adapterType: agentAdapterTypeSchema.optional(),
+  adapterType: optionalNoDefault(agentAdapterTypeSchema),
   adapterConfig: adapterConfigSchema.optional(),
   budgetMonthlyCents: z.number().int().nonnegative().optional(),
 }).strict();
 
 export type BuiltInAgentProvision = z.infer<typeof builtInAgentProvisionSchema>;
 
-export const builtInAgentEmptyMutationSchema = z.object({}).strict().default({});
+export const builtInAgentEmptyMutationSchema = z.object({}).strict().prefault({});
 
 export type BuiltInAgentEmptyMutation = z.infer<typeof builtInAgentEmptyMutationSchema>;
 
 export const builtInAgentResetSchema = z.object({
   resources: z.array(z.enum(["agent", "instructions", "skill", "routine"])).optional(),
-}).strict().default({});
+}).strict().prefault({});
 
 export type BuiltInAgentReset = z.infer<typeof builtInAgentResetSchema>;
 
 export const createAgentHireSchema = createAgentSchema.extend({
-  sourceIssueId: z.string().uuid().optional().nullable(),
-  sourceIssueIds: z.array(z.string().uuid()).max(APPROVAL_LINKED_ISSUE_IDS_MAX).optional(),
+  sourceIssueId: z.string().guid().optional().nullable(),
+  sourceIssueIds: z.array(z.string().guid()).max(APPROVAL_LINKED_ISSUE_IDS_MAX).optional(),
 });
 
 export type CreateAgentHire = z.infer<typeof createAgentHireSchema>;
 
 export const updateAgentSchema = createAgentSchema
   .omit({ permissions: true })
-  .partial()
+  .apply(partialNoDefaults)
   .extend({
     permissions: z.never().optional(),
     replaceAdapterConfig: z.boolean().optional(),
@@ -261,11 +262,11 @@ export type UpdateAgentInstructionsPath = z.infer<typeof updateAgentInstructions
 
 export const taskBridgeAgentKeyScopeSchema = z.object({
   kind: z.literal("task_bridge"),
-  projectId: z.string().uuid().optional().nullable(),
-  projectIds: z.array(z.string().uuid()).max(50).optional(),
-  parentIssueId: z.string().uuid().optional().nullable(),
-  parentIssueIds: z.array(z.string().uuid()).max(50).optional(),
-  allowedAssigneeAgentIds: z.array(z.string().uuid()).max(50).optional(),
+  projectId: z.string().guid().optional().nullable(),
+  projectIds: z.array(z.string().guid()).max(50).optional(),
+  parentIssueId: z.string().guid().optional().nullable(),
+  parentIssueIds: z.array(z.string().guid()).max(50).optional(),
+  allowedAssigneeAgentIds: z.array(z.string().guid()).max(50).optional(),
 }).strict().superRefine((value, ctx) => {
   const hasProjectBoundary = Boolean(value.projectId) || Boolean(value.projectIds?.length);
   const hasParentBoundary = Boolean(value.parentIssueId) || Boolean(value.parentIssueIds?.length);
@@ -284,7 +285,7 @@ export const standardAgentKeyScopeSchema = z.object({
 
 export const skillTestAgentKeyScopeSchema = z.object({
   kind: z.literal("skill_test"),
-  issueId: z.string().uuid(),
+  issueId: z.string().guid(),
 }).strict();
 
 export const agentApiKeyScopeSchema = z.union([
@@ -303,15 +304,15 @@ export function normalizeAgentApiKeyScope(value: unknown): AgentApiKeyScope {
 }
 
 export const createAgentKeySchema = z.object({
-  name: z.string().min(1).default("default"),
-  scope: agentApiKeyScopeSchema.optional().default({ kind: "standard" }),
+  name: z.string().min(1).prefault("default"),
+  scope: agentApiKeyScopeSchema.prefault({ kind: "standard" }),
 });
 
 export type CreateAgentKey = z.infer<typeof createAgentKeySchema>;
 
 export const agentMineInboxQuerySchema = z.object({
   userId: z.string().trim().min(1),
-  status: z.string().trim().min(1).optional().default(INBOX_MINE_ISSUE_STATUS_FILTER),
+  status: z.string().trim().min(1).prefault(INBOX_MINE_ISSUE_STATUS_FILTER),
 });
 
 export type AgentMineInboxQuery = z.infer<typeof agentMineInboxQuerySchema>;
@@ -323,26 +324,26 @@ export type AgentMineInboxQuery = z.infer<typeof agentMineInboxQuerySchema>;
  * cancelled rows are history and have to be asked for explicitly.
  */
 export const agentMeRecoveryActionsQuerySchema = z.object({
-  status: z.string().trim().min(1).optional().default("active,escalated"),
+  status: z.string().trim().min(1).prefault("active,escalated"),
   kind: z.string().trim().min(1).optional(),
-  limit: z.coerce.number().int().positive().max(500).optional().default(100),
+  limit: z.coerce.number().int().positive().max(500).prefault(100),
   // BLO-19124: `limit` alone cannot reach past row 500, so the oldest actions
   // were unreachable. `order: "asc"` + `offset` is the drift-free walk.
-  offset: z.coerce.number().int().min(0).optional().default(0),
-  order: z.enum(["asc", "desc"]).optional().default("desc"),
+  offset: z.coerce.number().int().min(0).prefault(0),
+  order: z.enum(["asc", "desc"]).prefault("desc"),
 });
 
 export type AgentMeRecoveryActionsQuery = z.infer<typeof agentMeRecoveryActionsQuerySchema>;
 
 export const wakeAgentSchema = z.object({
-  source: z.enum(["timer", "assignment", "on_demand", "automation"]).optional().default("on_demand"),
+  source: z.enum(["timer", "assignment", "on_demand", "automation"]).prefault("on_demand"),
   triggerDetail: z.enum(["manual", "ping", "callback", "system"]).optional(),
   reason: z.string().optional().nullable(),
   payload: z.record(z.string(), z.unknown()).optional().nullable(),
   idempotencyKey: z.string().optional().nullable(),
   forceFreshSession: z.preprocess(
     (value) => (value === null ? undefined : value),
-    z.boolean().optional().default(false),
+    z.boolean().prefault(false),
   ),
 });
 
@@ -355,7 +356,7 @@ export const resetAgentSessionSchema = z.object({
 export type ResetAgentSession = z.infer<typeof resetAgentSessionSchema>;
 
 export const testAdapterEnvironmentSchema = z.object({
-  adapterConfig: adapterConfigSchema.optional().default({}),
+  adapterConfig: adapterConfigSchema.prefault({}),
   /**
    * Optional environment to run the adapter test inside. When omitted, the
    * test runs against the local Paperclip host. When provided and the
@@ -364,7 +365,7 @@ export const testAdapterEnvironmentSchema = z.object({
    * (For the k8s-vendored deploy, the pod has no per-user codex/claude
    * credentials, so a non-null environmentId is effectively required.)
    */
-  environmentId: z.string().uuid().nullable().optional(),
+  environmentId: z.string().guid().nullable().optional(),
 });
 
 export type TestAdapterEnvironment = z.infer<typeof testAdapterEnvironmentSchema>;

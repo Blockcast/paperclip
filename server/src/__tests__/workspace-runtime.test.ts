@@ -29,6 +29,7 @@ import {
   buildWorkspaceTemplateData,
   cleanupExecutionWorkspaceArtifacts,
   ensureGitWorktreeBranchCoherent,
+  relinkHuskGitWorktree,
   ensurePersistedExecutionWorkspaceAvailable,
   ensureServerWorkspaceLinksCurrent,
   ensureRuntimeServicesForRun,
@@ -8100,8 +8101,11 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
       sourceIdentifier: "PAP-47493",
       claimant: "none",
     });
-    // Husk: registration survives, `.git` link does not; the main checkout is dirty.
+    // Husk with nothing to re-link to: the `.git` link is gone and the registration's
+    // back-pointer no longer names it (BLO-49622 re-links only a surviving one).
+    const adminDir = (await readGit(worktreePath, ["rev-parse", "--absolute-git-dir"])).trim();
     await fs.rm(path.join(worktreePath, ".git"));
+    await fs.writeFile(path.join(adminDir, "gitdir"), "/nonexistent/.git\n", "utf8");
     await fs.appendFile(path.join(repoRoot, "README.md"), "main checkout dirty\n", "utf8");
     const snapshot = async () => ({
       head: await readGit(repoRoot, ["symbolic-ref", "HEAD"]),
@@ -8126,6 +8130,63 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
     });
 
     expect(await snapshot()).toEqual(before);
+  }, 20_000);
+
+  it("re-links a husk worktree whose registration survives and repairs it in place (BLO-49622)", async () => {
+    const expectedBranch = "PAP-49622-recorded";
+    const actualBranch = "PAP-49622-live";
+    const { repoRoot, worktreePath } = await createDirtyMismatchRepo({ expectedBranch, actualBranch });
+    const ids = await seedDirtyQuarantineRecords({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      sourceIdentifier: "PAP-49622",
+      claimant: "none",
+    });
+    await fs.rm(path.join(worktreePath, ".git"));
+    await fs.appendFile(path.join(repoRoot, "README.md"), "main checkout dirty\n", "utf8");
+    const snapshot = async () => ({
+      head: await readGit(repoRoot, ["symbolic-ref", "HEAD"]),
+      // Tracked state only: the husk's files read as untracked to the main checkout until re-linked.
+      tracked: await readGit(repoRoot, ["diff", "HEAD"]),
+      mainRefs: await readGit(repoRoot, ["for-each-ref", "--format=%(refname) %(objectname)", "refs/heads/main"]),
+    });
+    const before = await snapshot();
+
+    const result = await ensureGitWorktreeBranchCoherent({
+      db,
+      repoRoot,
+      worktreePath,
+      expectedBranchName: expectedBranch,
+      sourceIssue: { id: ids.sourceIssueId, identifier: ids.sourceIdentifier, title: "Husk worktree" },
+      executionWorkspaceId: ids.sourceWorkspaceId,
+      heartbeatRunId: ids.runId,
+      enableWorkspaceDirtyQuarantineRepair: true,
+    });
+
+    expect(result.branchName).toBe(expectedBranch);
+    expect(result.warnings[0]).toContain("re-linked");
+    expect((await readGit(worktreePath, ["rev-parse", "--show-toplevel"])).trim())
+      .toBe(await fs.realpath(worktreePath));
+    expect((await readGit(worktreePath, ["symbolic-ref", "--short", "HEAD"])).trim()).toBe(expectedBranch);
+    expect(await snapshot()).toEqual(before);
+  }, 20_000);
+
+  it("concurrent re-links of one husk both report a healthy worktree (BLO-49622)", async () => {
+    const { repoRoot, worktreePath } = await createDirtyMismatchRepo({
+      expectedBranch: "PAP-49622-a",
+      actualBranch: "PAP-49622-b",
+    });
+    await fs.rm(path.join(worktreePath, ".git"));
+
+    // The loser of the exclusive create must not report a healthy worktree as unrepairable.
+    expect(await Promise.all([
+      relinkHuskGitWorktree(repoRoot, worktreePath),
+      relinkHuskGitWorktree(repoRoot, worktreePath),
+    ])).toEqual([true, true]);
+    expect((await readGit(worktreePath, ["rev-parse", "--show-toplevel"])).trim())
+      .toBe(await fs.realpath(worktreePath));
   }, 20_000);
 
   it("refuses dirty quarantine repair while the execution workspace has an active runtime service", async () => {

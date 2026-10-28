@@ -1093,7 +1093,6 @@ async function streamAndAwaitJob(
       clearInterval(keepaliveTimer);
       keepaliveTimer = null;
     }
-    activeJobs.delete(jobName);
     if (!retainJobs) {
       await cleanupJob(
         namespace,
@@ -1433,57 +1432,6 @@ async function streamAndAwaitJob(
 // Per-agent mutex: serializes guard-check + job-create to prevent TOCTOU races.
 const agentCreationMutex = new Map<string, Promise<void>>();
 
-// Active Jobs tracked for SIGTERM cleanup.
-const activeJobs = new Map<string, {
-  namespace: string;
-  kubeconfigPath?: string;
-  promptSecretName?: string;
-  envSecretName?: string;
-  mcpConfigSecretName?: string;
-}>();
-let sigtermHandlerInstalled = false;
-
-function ensureSigtermHandler(): void {
-  if (sigtermHandlerInstalled) return;
-  sigtermHandlerInstalled = true;
-  process.once("SIGTERM", () => {
-    void (async () => {
-      await Promise.allSettled(
-        Array.from(activeJobs.entries()).flatMap(([
-          jobName,
-          {
-            namespace,
-            kubeconfigPath,
-            promptSecretName,
-            envSecretName,
-            mcpConfigSecretName,
-          },
-        ]) => {
-          const ops: Promise<unknown>[] = [
-            getBatchApi(kubeconfigPath)
-              .deleteNamespacedJob({ name: jobName, namespace, body: { propagationPolicy: "Background" } })
-              .catch(() => {}),
-          ];
-          const secretNames = new Set(
-            [promptSecretName, envSecretName, mcpConfigSecretName].filter(
-              (name): name is string => Boolean(name),
-            ),
-          );
-          for (const secretName of secretNames) {
-            ops.push(
-              getCoreApi(kubeconfigPath)
-                .deleteNamespacedSecret({ name: secretName, namespace })
-                .catch(() => {}),
-            );
-          }
-          return ops;
-        }),
-      );
-      process.exit(0);
-    })();
-  });
-}
-
 export type AgentDbMode = "dedicated_pvc" | "ephemeral" | "workspace_subpath";
 
 /**
@@ -1651,7 +1599,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const runIsolation = readRunIsolationDescriptor(ctx, config);
   const selfPod = await getSelfPodInfo(kubeconfigPath);
   const guardNamespace = asString(config.namespace, "") || selfPod.namespace;
-  ensureSigtermHandler();
 
   // Serialize guard-check + job-create per shared-state slot to prevent TOCTOU
   // races. Shared/malformed isolation keeps the legacy per-agent mutex; isolated
@@ -1747,13 +1694,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             "stdout",
             `[paperclip] Reattaching to persisted K8s Job ${exactJobName} for the current run after adapter restart.\n`,
           );
-          activeJobs.set(exactJobName, {
-            namespace: guardNamespace,
-            kubeconfigPath,
-            promptSecretName,
-            envSecretName,
-            mcpConfigSecretName,
-          });
           return streamAndAwaitJob(
             ctx,
             exactJobName,
@@ -2121,15 +2061,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       );
     }
   }
-
-    // Register job for SIGTERM cleanup before releasing the mutex.
-    activeJobs.set(jobName, {
-      namespace,
-      kubeconfigPath,
-      promptSecretName,
-      envSecretName: envSecret?.name,
-      mcpConfigSecretName: mcpConfigSecret?.name,
-    });
 
     await onLog("stdout", `[paperclip] Created K8s Job: ${jobName} in namespace ${namespace} (deadline: ${timeoutSec > 0 ? `${timeoutSec}s` : "none"})\n`);
 

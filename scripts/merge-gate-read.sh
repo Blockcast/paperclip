@@ -29,6 +29,14 @@
 #                          no twin, or in any other conclusion, it STOPs: the
 #                          refusal is then the only signal that the trusted
 #                          arm never spoke for that job.
+#   RENAMED-LEGACY       — a twin-less REFUSED-LEGACY row whose `<job>` appears
+#                          in NO workflow file on the PR's base sha (BLO-48833).
+#                          The PR renames that job: the trusted
+#                          `pull_request_target` arm runs the BASE workflows, so
+#                          the new name's twin cannot exist until after merge.
+#                          NOT blocking. Base still declares `<job>`, or base
+#                          workflows unreadable, or no unique PR for the head:
+#                          STOP.
 #   ADVISORY             — `review/ally-ledger` reading `pending` while
 #                          `review/ally-complete` is `success` at the same head.
 #                          The review gate stores its finding ledger in that
@@ -61,7 +69,8 @@
 # one-way signal at best. Never write `merge-gate-read.sh … && merge`.
 #
 #   merge-gate-read.sh <owner/repo> <sha|pr-head>     # live
-#   merge-gate-read.sh --rows <DEAD> [PENDING] [WDEAD] # fixture mode, rows on stdin
+#   merge-gate-read.sh --rows <DEAD> [PENDING] [WDEAD] [RENAMED] # fixture mode, rows on stdin
+#   merge-gate-read.sh --renamed <base-text-file>     # fixture mode, bare job names on stdin
 #   merge-gate-read.sh --dead [witnesses] [w]         # fixture mode, runs on stdin;
 #                                                     # any 3rd arg: witness arm only
 #   merge-gate-read.sh --pending                      # fixture mode, runs on stdin
@@ -136,6 +145,53 @@ run_extract() { # stdin: actions/runs API body (one object per page) -> run rows
                            .status,.name,.updated_at,.display_title]|@tsv'
 }
 
+renamed_jobs() { # stdin: twin-less legacy bare names; $1 = file of base workflow text
+  # BLO-48833. Prints the names that appear NOWHERE in the base workflows. A
+  # missing or EMPTY file prints nothing, so an unreadable base fails CLOSED
+  # (STOP). Substring match on raw text: a mention anywhere (job id, name,
+  # comment) keeps the STOP, which is the safe direction.
+  # The stem before the first " (" is matched too: a matrix job named
+  # `postgres-tests (${{ matrix.shard }}/...)` renders `postgres-tests (1/4)`,
+  # which never appears literally, but its stem does -> STOP.
+  # A templated `name:` (`shard-${{ matrix.n }}`, `${{ matrix.browser }} e2e`)
+  # renders text that appears nowhere literally, and its stem may not either, so
+  # templated_name() matches the WHOLE name against each one with every
+  # `${{ ... }}` read as a wildcard. Anchored at both ends: penstock base declares
+  # `secret-scan${{ ... }}`, which must not match inside `ci-secret-scan`. A name
+  # that is ONLY an expression matches everything -> STOP (fails closed).
+  # ponytail: textual, not YAML-parsed: any line carrying `name:` counts (step,
+  # workflow), which only ever adds STOPs.
+  [ -s "${1:-}" ] || return 0
+  while IFS= read -r j; do
+    [ -n "$j" ] && ! grep -qF -- "$j" "$1" && ! grep -qF -- "${j%% (*}" "$1" \
+      && ! templated_name "$j" "$1" && printf '%s\n' "$j"
+  done
+  return 0
+}
+
+templated_name() { # $1 = rendered job name, $2 = base workflow text -> 0 if a templated name: matches whole
+  awk -v j="$1" '
+    function esc(s) { gsub(/[][\\.^$*+?(){}|\/]/, "\\\\&", s); return s }
+    /\$\{\{/ && match($0, /^[[:space:]]*(-[[:space:]]*)?name:[[:space:]]*/) {
+      v = substr($0, RLENGTH + 1); sub(/[[:space:]]+#.*$/, "", v); sub(/[[:space:]]+$/, "", v)
+      q = substr(v, 1, 1)
+      if ((q == "\"" || q == "\047") && substr(v, length(v)) == q) v = substr(v, 2, length(v) - 2)
+      re = ""
+      while ((s = index(v, "${{")) > 0) {
+        re = re esc(substr(v, 1, s - 1)) ".*"
+        v = substr(v, s + 3); e = index(v, "}}"); v = e ? substr(v, e + 2) : ""
+      }
+      if (j ~ ("^" re esc(v) "$")) { hit = 1; exit }
+    }
+    END { exit !hit }' "$2"
+}
+
+legacy_orphans() { # stdin: rows -> bare names of legacy reds with no same-name twin row
+  awk -F'\t' '{ twin[$1] = 1 }
+    $2 == "failure" && $1 ~ / \(legacy arm - refused, nothing ran\)$/ { l[substr($1, 1, length($1) - 36)] = 1 }
+    END { for (b in l) if (!(b in twin)) print b }'
+}
+
 gated_lanes() { # stdin: run rows; $1 = head sha, $2 non-empty = repo is gated
   # BLO-47984. On a repo whose default branch carries
   # dispatch-approved-pr-ci.yml, the CI lanes only run when the dispatcher fires
@@ -147,11 +203,37 @@ gated_lanes() { # stdin: run rows; $1 = head sha, $2 non-empty = repo is gated
   # 9 of 15 merged onprem-k8s PRs, including #6319 @ 5d11d645 with 14 green
   # dispatched runs. Existence only: those runs' own check-runs (and their
   # NO-VERDICT rows) already carry the verdict through verdicts().
-  # No exemption for "the dispatcher legitimately dispatched nothing": none has
-  # been measured. Fails closed — a false STOP costs a wait.
+  # BLO-48830: "the dispatcher legitimately dispatched nothing" is real
+  # (Network-Operator-Portal#1450 @ 82913582, docs-only: `Scheduled: none`), and
+  # absence of runs cannot tell it from "never fired". $3 is the POSITIVE
+  # witness from empty_witness(); without it this still fails closed.
   [ -n "${2:-}" ] || return 0
+  [ -z "${3:-}" ] || return 0
   awk -F'\t' -v h="$1" '$2 == "workflow_dispatch" && $9 ~ ("^CI PR #[0-9]+ @" h "$") { found = 1 }
     END { if (!found) printf "STOP\t<approval-gated CI lanes: no dispatched CI PR run at this head>\tABSENT\trun=-\n" }'
+}
+
+empty_witness() { # stdin: commit statuses LIST pages + check-runs pages -> "1" or nothing
+  # BLO-48830. pr-ci-dispatch (`post-status: "true"`) posts `ci/dispatched-lanes`
+  # = success "(base <ref>) no dispatched lane applies to this head" when it
+  # selects no lane. Accepted only when the ACTIONS app wrote it: a session
+  # writes as allyblockcast[bot] (290875700) or its User seat, never as
+  # github-actions[bot] (41898282) / app `github-actions` — the same identity
+  # fence as the shim's review/ally-* guard. Newest Actions-written entry per
+  # surface wins, so a later pending/failure re-judge withdraws the witness.
+  # Residual: any workflow in the repo holding statuses/checks write can still
+  # write as the Actions app.
+  # Only the EMPTY wording counts: "N lane(s) passed" means runs exist, and
+  # those are judged by the title match and by verdicts(), not by this.
+  # Status LIST endpoint, not the combined one: combined drops `creator`.
+  jq -rs --arg p "no dispatched lane applies to this head" '
+    ([.[]|arrays|.[]|select(type=="object" and .context=="ci/dispatched-lanes"
+                             and .creator.id==41898282)]|max_by(.id)) as $s
+    | ([.[]|objects|.check_runs[]?|select(.name=="ci/dispatched-lanes"
+                                          and .app.slug=="github-actions")]|max_by(.id)) as $c
+    | if ($s.state=="success" and (($s.description // "")|contains($p)))
+         or ($c.conclusion=="success" and (($c.output.title // "")|contains($p)))
+      then "1" else empty end' 2>/dev/null
 }
 
 pending_runs() { # stdin: run rows -> stdout: pend rows for runs owing a verdict
@@ -620,7 +702,7 @@ verdicts() { # $1 = DEAD alternation, $2 = PENDING rows, $3 = WDEAD (all may be 
       END { exit !k }' \
     | sort -t$'\t' -k1,1 -k4,4 -k3,3r \
     | awk -F'\t' '!seen[$1 FS $4]++' \
-    | PEND="${2:-}" awk -F'\t' -v dead="$dead" '
+    | PEND="${2:-}" RENAMED="${4:-}" awk -F'\t' -v dead="$dead" '
         # NO APOSTROPHES anywhere below: this awk program is single-quoted in the
         # surrounding shell, so one inside a comment ends the script mid-word and
         # bash reports a syntax error on an unrelated line further down.
@@ -644,7 +726,9 @@ verdicts() { # $1 = DEAD alternation, $2 = PENDING rows, $3 = WDEAD (all may be 
                  # and shifts the page boundary. Idempotent, so one line per run.
                  if (f[1] in pseen) continue
                  pseen[f[1]] = 1; k++
-                 prid[k] = f[1]; pstat[k] = f[2]; pname[k] = f[3] } }
+                 prid[k] = f[1]; pstat[k] = f[2]; pname[k] = f[3] }
+               nr = split(ENVIRON["RENAMED"], rl, "\n")
+               for (i = 1; i <= nr; i++) if (rl[i] != "") renamed[rl[i]] = 1 }
         NF==0{next}
         # Set on SURVIVING rows only — after DEAD, after dedup — so "contributed"
         # means "this run published a check-run that is still standing", which is
@@ -706,7 +790,8 @@ verdicts() { # $1 = DEAD alternation, $2 = PENDING rows, $3 = WDEAD (all may be 
         $2!="success"&&$2!="skipped"{print ($1~/\$\{\{/?"MALFORMED":($2=="neutral"?"NOT-EVALUATED":"STOP"))"\t"$1"\t"$2"\trun="$4}
         END{if(ledger) print (acs == "success" ? "ADVISORY" : "STOP") "\treview/ally-ledger\tpending\trun=status"
             for (i = 1; i <= lq; i++)
-              print ((substr(lname[i], 1, length(lname[i]) - 36) in twin) ? "REFUSED-LEGACY" : "STOP") "\t" lrow[i]
+              { b = substr(lname[i], 1, length(lname[i]) - 36)
+                print ((b in twin) ? "REFUSED-LEGACY" : (b in renamed) ? "RENAMED-LEGACY" : "STOP") "\t" lrow[i] }
             if(!n) print "STOP\t<" (dead!="__none__" \
               ? "every check-run at this head dropped as superseded-run" \
               : "no check-run verdict at this head") ">\tABSENT\trun=-"
@@ -736,15 +821,26 @@ verdicts() { # $1 = DEAD alternation, $2 = PENDING rows, $3 = WDEAD (all may be 
 # `--rows` propagates the pipeline status rather than swallowing it. Hardcoding
 # `exit 0` here made the exit contract unobservable by construction, so no
 # fixture could catch the header claiming an exactness it did not have.
-if [ "${1:-}" = "--rows" ]; then verdicts "${2:-}" "${3:-}" "${4:-}"; exit $?; fi
+if [ "${1:-}" = "--rows" ]; then verdicts "${2:-}" "${3:-}" "${4:-}" "${5:-}"; exit $?; fi
+if [ "${1:-}" = "--renamed" ]; then renamed_jobs "${2:-}"; exit 0; fi
 if [ "${1:-}" = "--dead" ]; then dead_runs "${2:-}" "${3:-}"; exit 0; fi
 if [ "${1:-}" = "--pending" ]; then pending_runs; exit 0; fi
 if [ "${1:-}" = "--extract" ]; then extract; exit 0; fi
 if [ "${1:-}" = "--status-extract" ]; then status_extract; exit 0; fi
 if [ "${1:-}" = "--witness-extract" ]; then witness_extract; exit 0; fi
 if [ "${1:-}" = "--runs-extract" ]; then run_extract; exit 0; fi
-if [ "${1:-}" = "--gated" ]; then gated_lanes "${2:-}" "${3:-}"; exit 0; fi
+if [ "${1:-}" = "--gated" ]; then gated_lanes "${2:-}" "${3:-}" "${4:-}"; exit 0; fi
+if [ "${1:-}" = "--empty-witness" ]; then empty_witness; exit 0; fi
 if [ "${1:-}" = "--sha-guard" ]; then require_sha "${2:-}"; exit $?; fi
+
+# BLO-49040. `gh api --paginate` exits non-zero when a LATER page fails. With
+# an error body the extractors choke and the reader already refuses; WITHOUT one
+# (reset, timeout) the variable holds page 1 only and every row past it is never
+# judged — magma heads carry 105-110 check-runs. Callers refuse on rc > 1.
+fetch_failed() { # $1 = surface, $2 = rc
+  printf 'STOP\t<%s fetch failed for %s (rc %s); refusing on a partial read>\tFETCH-FAILED\trun=-\n' "$1" "$H" "$2"
+  exit 3
+}
 
 R="$1"
 # MANDATORY full 40-hex: actions/runs?head_sha= returns zero rows for an
@@ -752,7 +848,7 @@ R="$1"
 H=$(gh api "repos/$R/commits/$2" --jq .sha 2>/dev/null)
 require_sha "$H" || exit 1
 
-RUNS=$(gh api "repos/$R/actions/runs?head_sha=$H&per_page=100" --paginate | run_extract)
+RUNS=$(gh api "repos/$R/actions/runs?head_sha=$H&per_page=100" --paginate | run_extract) || fetch_failed actions/runs $?
 # Both surfaces are fetched ONCE and fanned out. ZERO new API calls for
 # BLO-37887 (the pending set is a second pass over rows already in hand), and
 # the BLO-38577 witness pass reuses the same status body the verdict pass reads.
@@ -760,7 +856,7 @@ RUNS=$(gh api "repos/$R/actions/runs?head_sha=$H&per_page=100" --paginate | run_
 # routinely exhausted installation quota.
 # An empty RUNS arrives as one blank line: dead_runs() matches nothing on it, and
 # pending_runs()'s `$3 != ""` fence drops it.
-STATUSES=$(gh api "repos/$R/commits/$H/status?per_page=100" --paginate)
+STATUSES=$(gh api "repos/$R/commits/$H/status?per_page=100" --paginate) || fetch_failed status $?
 
 # BLO-38577 off-head witnesses. A candidate naming a run that IS at this head is
 # skipped: the sibling arm already rules on those, so resolving them would be a
@@ -808,9 +904,49 @@ PENDING=$(printf '%s\n' "$RUNS" | pending_runs)
 # status fetch silently drops the 31st context onward — and a dropped `failure`
 # prints no STOP. The ABSENT guard cannot catch it: `$4!="status"` excludes
 # status rows from the survivor count, so one surviving check-run keeps the guard quiet.
+CHECKS=$(gh api "repos/$R/commits/$H/check-runs?per_page=100" --paginate) || fetch_failed check-runs $?
+
+# BLO-48833: only when a legacy red has no twin, read the base workflows at the
+# head's PR base sha. Zero extra calls on every other head. A failed pulls fetch
+# exits 3 via fetch_failed; no PR, several base shas, or an unreadable file
+# leaves BASE empty -> STOP.
+# base.sha, not the base branch tip the trusted arm actually runs: base.sha can
+# lag until the PR is next synchronized. A job renamed on master since then only
+# ADDS text here (fails closed); a job ADDED to master since then can read as a
+# rename until the PR is rebased. Accepted: that legacy red clears on the rebase.
+RENAMED=
+ORPHANS=$(printf '%s' "$CHECKS" | extract | legacy_orphans)
+if [ -n "$ORPHANS" ]; then
+  BASE_FILE=$(mktemp); trap 'rm -f "$BASE_FILE"' EXIT
+  # BLO-49045: a partial read can under-count the base shas to exactly 1 and
+  # judge the rename against the wrong base, clearing the red.
+  B=$(gh api "repos/$R/commits/$H/pulls?per_page=100" --paginate \
+        --jq ".[]|select(.head.sha==\"$H\")|.base.sha" 2>/dev/null | sort -u) \
+    || fetch_failed pulls $?
+  if [ "$(printf '%s\n' "$B" | grep -c .)" = 1 ] && require_sha "$B" >/dev/null 2>&1 \
+     && WF=$(gh api "repos/$R/contents/.github/workflows?ref=$B" \
+               --jq '.[]|select(.type=="file")|.path' 2>/dev/null) && [ -n "$WF" ]; then
+    while IFS= read -r p; do
+      body=$(gh api "repos/$R/contents/$p?ref=$B" -H "Accept: application/vnd.github.raw" 2>/dev/null) \
+        || { : > "$BASE_FILE"; break; }
+      printf '%s\n' "$body" >> "$BASE_FILE"
+    done <<< "$WF"
+    RENAMED=$(printf '%s\n' "$ORPHANS" | renamed_jobs "$BASE_FILE")
+  fi
+fi
+
 { printf '%s' "$STATUSES" | status_extract
-  gh api "repos/$R/commits/$H/check-runs?per_page=100" --paginate | extract
-} | verdicts "$DEAD" "$PENDING" "$WDEAD"
+  printf '%s' "$CHECKS" | extract
+} | verdicts "$DEAD" "$PENDING" "$WDEAD" "$RENAMED"
 rc=$?
-printf '%s\n' "$RUNS" | gated_lanes "$H" "$GATED"
+# BLO-48830: the status LIST (it carries `creator`) costs a call, so only on a
+# gated head whose combined status names the context at all.
+SLIST='[]'
+# BLO-49045: guarded, not argued. A partial list can hold a stale success
+# witness whose withdrawing re-judge sat on the page that failed.
+if [ -n "$GATED" ] && printf '%s' "$STATUSES" | grep -q '"ci/dispatched-lanes"'; then
+  SLIST=$(gh api "repos/$R/commits/$H/statuses?per_page=100" --paginate) || fetch_failed statuses $?
+fi
+EMPTY=$(printf '%s\n%s\n' "$SLIST" "$CHECKS" | empty_witness)
+printf '%s\n' "$RUNS" | gated_lanes "$H" "$GATED" "$EMPTY"
 exit $rc

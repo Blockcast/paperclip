@@ -57,7 +57,8 @@ describeEmbeddedPostgres("heartbeat timeout outcome persistence", () => {
         exitCode: 0,
         signal: null,
         timedOut: true,
-        errorMessage: "Timed out after 300s",
+        // Non-legacy wording: the guard must not depend on message text (BLO-23296).
+        errorMessage: "Timed out after 38s (limit 300s)",
         errorCode: "timeout",
         resultJson: null,
       }),

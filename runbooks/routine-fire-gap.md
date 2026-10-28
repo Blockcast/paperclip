@@ -1,21 +1,72 @@
-# A routine has stopped completing fires (silently disabled, or its fires die)
+# A routine has stopped firing, or its fires stopped completing
 
 Source: `server/src/services/routine-fire-gap-metrics.ts`
 (`refreshRoutineFireGapMetrics`) and `server/src/services/metrics.ts`
-(`ROUTINE_LAST_DONE_FIRE_AGE_METRIC`, `ROUTINE_FIRE_INTERVAL_METRIC`,
+(`ROUTINE_LAST_DONE_FIRE_AGE_METRIC`, `ROUTINE_LAST_FIRE_START_AGE_METRIC`,
+`ROUTINE_FIRE_INTERVAL_METRIC`,
 `ROUTINE_FIRE_GAP_METRICS_REFRESH_SUCCESS_METRIC`).
 
 Triggers:
 
-- `PaperclipRoutineFireGap` — an active, schedule-triggered routine has not
-  completed a fire in more than `routineFireGapIntervalMultiplier` (2) times
-  the longest gap its own cron schedules, and the snapshot refreshed
-  successfully.
+- `PaperclipRoutineFireGap` — an active, schedule-triggered routine has
+  neither **fired** nor **completed a fire** within
+  `routineFireGapIntervalMultiplier` (2) times the longest gap its own cron
+  schedules, and the snapshot refreshed successfully.
 - `PaperclipRoutineFireGapMetricsRefreshFailed` — the most recent database
   refresh failed, so fire ages are stale and intentionally do not qualify the
   gap alert.
 
-Owner: Platform / SRE (BLO-32638)
+Owner: Platform / SRE (BLO-32638, PEN-4647)
+
+## Read BOTH ages first — they name different faults (PEN-4647)
+
+The alert's `$value` is the **worse** of two gauges. Which one is high decides
+what you do, and the alert cannot tell you from one number:
+
+```promql
+paperclip_routine_last_fire_start_age_seconds{routine_id="<routine_id>"}
+paperclip_routine_last_done_fire_age_seconds{routine_id="<routine_id>"}
+```
+
+| firing age | completion age | what it means | what to do |
+|---|---|---|---|
+| high | high | no fire is **producing work** | **Two causes, and §1 separates neither.** Either a scheduler/trigger fault (§2, **first** row — no `routine_runs` at all), **or** a live execution row eating the fires queued behind it under `skip_if_active` / `coalesce_if_active` (§2, **second** row — rows present but all `skipped` / `coalesced`). A stood-down fire is not counted, so the second cause drives the firing age up too. For that one: find the row holding the lock, inspect it, and **close it only if it is stale**. |
+| **low** | high | it **is** still dispatching and its runs **die or wedge** before reaching `done` — the original BLO-32638 condition | Read `routine_runs.failure_reason`, then the execution issue's own run history (§2, **third** row). If a row is still open it may be a legitimately long-running execution — inspect it and **close it only if it is stale**; do not close live work. Do **not** re-create the routine; the routine is fine. |
+| high | low | a **stale row just completed**. No fire has occurred. | This is the PEN-4647 case. The alert is correct to stay firing — treat it as "still not firing", not as recovery. |
+
+### Why there are two gauges at all
+
+`paperclip_routine_last_done_fire_age_seconds` ages a **completion**;
+`paperclip_routine_last_fire_start_age_seconds` ages a **firing**. They
+diverge precisely in the dominant failure mode. A wedged long-open execution
+row eats the fires behind it (`skip_if_active` + `skip_missed`), and the moment
+that row finally reaches `done` the completion age **resets to ~0** — so a rule
+reading completion age alone **resolves mid-outage with no fire having
+occurred**. It fails *open*.
+
+That is measured, not hypothetical. On routine
+`b3ba3b33-ec57-45dd-9e8c-829abf35e0bc` ("CI pipeline health check",
+`0 9 * * 1-5`):
+
+| when | completion gauge | event |
+|---|---|---|
+| 2026-10-19T09:30Z | 278.34h | climbing, alert firing |
+| 2026-10-19T10:00Z | **0.062h** | an 11-day-old row reached `done` |
+| 2026-10-20T10:00Z | **0.441h** | a 36-day-old row reached `done` |
+
+Neither reset was a firing. The next real execution row landed
+2026-10-21T09:00Z — about 47h after the alert said the problem was over — and
+the 10-19 and 10-20 firings were both lost. Independently: 25 of 105 expected
+weekday firings over 2026-06-01..10-23 produced no execution row (23.8%),
+longest run 9 consecutive weekdays ending 10-20.
+
+**So: if this alert RESOLVES, confirm a genuine new execution row landed.** Do
+not read a resolve as recovery on its own.
+
+Conversely the completion arm is not redundant and must not be "simplified"
+away: fires that dispatch on cadence and then die keep the firing age low, and
+a rule reading firing age alone would be silent on them. That is the original
+BLO-32638 condition. Taking the max covers both.
 
 ## Why this alert exists
 
@@ -71,7 +122,7 @@ select status, count(*), max(triggered_at) as last_triggered, max(completed_at) 
 | what you see | cause | next step |
 |---|---|---|
 | no rows at all in the window | **not dispatching.** The scheduler never created a fire. | Check `paperclip_routine_dispatch_total` for this routine's gating outcome, and `routine_triggers.next_run_at` — a `next_run_at` in the past that never advances is a claimed-and-dropped tick. |
-| rows, but all `skipped` / `coalesced` | **dispatching and gating off.** Each fire found a live execution issue and stood down. | Find the issue that is holding the lock. A fire whose predecessor never reached a terminal state suppresses every successor — that is [BLO-31996], and it costs two intervals per occurrence. |
+| rows, but all `skipped` / `coalesced` | **dispatching and gating off.** Each fire found a live execution issue and stood down. Note the firing age gauge does **not** count these (PEN-4647): a stood-down fire produced no work, so it stays high — which is the correct reading. | Find the issue that is holding the lock. A fire whose predecessor never reached a terminal state suppresses every successor — that is [BLO-31996], and it costs two intervals per occurrence. |
 | rows `failed`, or `received` with no terminal status | **dispatching and dying.** The fire created an execution issue whose run died before the issue reached `done`. | Read `routine_runs.failure_reason`, then the execution issue's own run history. |
 | rows `completed`, recently | the gauge disagrees with the table — **check the freshness gauge first**, then file a bug against the refresh. | |
 

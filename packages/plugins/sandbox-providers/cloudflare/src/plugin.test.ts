@@ -3,6 +3,13 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const fetchMock = vi.fn();
 let plugin: typeof import("./plugin.js").default;
 
+// Pay the cold transform of the plugin's module graph here, during collection,
+// rather than inside the first beforeEach: that hook is bounded by vitest's
+// hookTimeout and a cold-cache CI runner has measured 9-10s for this import.
+// vi.resetModules() below clears the registry, not the transform cache, so the
+// per-test re-import stays fresh and fast.
+await import("./plugin.js");
+
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,

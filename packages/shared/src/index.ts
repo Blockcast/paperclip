@@ -1994,6 +1994,7 @@ export {
   updateCompanyMemberWithPermissionsSchema,
   archiveCompanyMemberSchema,
   updateMemberPermissionsSchema,
+  updateAgentGrantSchema,
   searchAdminUsersQuerySchema,
   updateUserCompanyAccessSchema,
   type CreateCostEvent,
@@ -2018,6 +2019,7 @@ export {
   type UpdateCompanyMemberWithPermissions,
   type ArchiveCompanyMember,
   type UpdateMemberPermissions,
+  type UpdateAgentGrant,
   type SearchAdminUsersQuery,
   type UpdateUserCompanyAccess,
   companySkillSourceTypeSchema,
@@ -2307,3 +2309,4 @@ export {
   type EnvironmentCustomImageTerminalSessionToken,
 } from "./validators/environment-custom-images.js";
 export * from "./validators/skill-policy.js";
+export { optionalNoDefault, partialNoDefaults } from "./zod-compat.js";

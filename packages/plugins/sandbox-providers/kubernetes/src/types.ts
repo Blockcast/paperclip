@@ -6,19 +6,19 @@ const cidrRegex = /^(\d{1,3}\.){3}\d{1,3}\/\d{1,2}$/;
 
 export const kubernetesProviderConfigSchema = z
   .object({
-    inCluster: z.boolean().default(false),
+    inCluster: z.boolean().prefault(false),
     kubeconfig: z.string().optional(),
 
-    namespacePrefix: z.string().regex(/^[a-z0-9-]{1,32}$/).default("paperclip-"),
+    namespacePrefix: z.string().regex(/^[a-z0-9-]{1,32}$/).prefault("paperclip-"),
     companySlug: z.string().regex(/^[a-z0-9-]{1,32}$/).optional(),
 
     imageRegistry: z.string().url().optional(),
-    imageAllowList: z.array(z.string()).default([]),
-    imagePullSecrets: z.array(z.string()).default([]),
+    imageAllowList: z.array(z.string()).prefault([]),
+    imagePullSecrets: z.array(z.string()).prefault([]),
 
-    egressAllowFqdns: z.array(z.string()).default([]),
-    egressAllowCidrs: z.array(z.string().regex(cidrRegex, "Invalid CIDR")).default([]),
-    egressMode: z.enum(["cilium", "standard"]).default("standard"),
+    egressAllowFqdns: z.array(z.string()).prefault([]),
+    egressAllowCidrs: z.array(z.string().regex(cidrRegex, "Invalid CIDR")).prefault([]),
+    egressMode: z.enum(["cilium", "standard"]).prefault("standard"),
 
     defaultResources: z
       .object({
@@ -28,11 +28,11 @@ export const kubernetesProviderConfigSchema = z
       .optional(),
 
     runtimeClassName: z.string().optional(),
-    serviceAccountAnnotations: z.record(z.string()).default({}),
+    serviceAccountAnnotations: z.record(z.string(), z.string()).prefault({}),
 
-    jobTtlSecondsAfterFinished: z.number().int().nonnegative().default(900),
-    podActivityDeadlineSec: z.number().int().positive().default(7200),
-    jobBackoffLimit: z.number().int().nonnegative().default(0),
+    jobTtlSecondsAfterFinished: z.number().int().nonnegative().prefault(900),
+    podActivityDeadlineSec: z.number().int().positive().prefault(7200),
+    jobBackoffLimit: z.number().int().nonnegative().prefault(0),
 
     /**
      * The adapter type that Jobs in this environment will run.
@@ -42,7 +42,7 @@ export const kubernetesProviderConfigSchema = z
      */
     adapterType: z
       .string()
-      .default("claude_local")
+      .prefault("claude_local")
       .refine((v) => KNOWN_ADAPTER_TYPES.has(v), {
         message: "adapterType must be one of the known adapter types",
       }),
@@ -66,7 +66,7 @@ export const kubernetesProviderConfigSchema = z
      *   NOT support multi-command exec. Use this for clusters without agent-sandbox
      *   installed, or when you need stable (non-alpha) k8s APIs.
      */
-    backend: z.enum(["sandbox-cr", "job"]).default("sandbox-cr"),
+    backend: z.enum(["sandbox-cr", "job"]).prefault("sandbox-cr"),
   })
   .refine(
     (cfg) => cfg.inCluster || cfg.kubeconfig,

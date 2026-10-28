@@ -1,6 +1,6 @@
 import { useState } from "react";
 import type { BudgetIncident } from "@paperclipai/shared";
-import { AlertOctagon, ArrowUpRight, PauseCircle } from "lucide-react";
+import { AlertOctagon, ArrowUpRight, PauseCircle, PlayCircle } from "lucide-react";
 import { formatCents } from "../lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -28,19 +28,29 @@ function incidentStateLabel(incident: BudgetIncident) {
 export function BudgetIncidentCard({
   incident,
   onRaiseAndResume,
+  onResumeWithoutRaise,
   onKeepPaused,
   isMutating,
 }: {
   incident: BudgetIncident;
   onRaiseAndResume: (amountCents: number) => void;
+  onResumeWithoutRaise: () => void;
   onKeepPaused: () => void;
   isMutating?: boolean;
 }) {
-  const [draftAmount, setDraftAmount] = useState(
-    centsInputValue(Math.max(incident.amountObserved + 1000, incident.amountLimit)),
-  );
+  // Seed with the CURRENT cap, not `observed + $10` (PEN-4742). The old seed made
+  // the product recommend observed-plus-epsilon: a board that accepted the
+  // pre-filled figure ratcheted the cap up by one window's overshoot, every
+  // window, forever -- which is how a $1.63 breach produced a $20,011.63 cap. The
+  // box is for a cap a human chose; if they do not want to choose a new one, the
+  // resume button below that does not touch the cap is the right control.
+  const [draftAmount, setDraftAmount] = useState(centsInputValue(incident.amountLimit));
   const parsed = parseDollarInput(draftAmount);
   const stateLabel = incidentStateLabel(incident);
+  // `resume_without_raise` grants a window-scoped rebaseline that expires at the
+  // roll, and a lifetime window never rolls -- the server rejects it there, so do
+  // not offer it. Raising the cap or staying paused are the exits for those.
+  const canResumeWithoutRaise = incident.windowKind === "calendar_month_utc";
 
   return (
     <Card className="overflow-hidden border-red-500/20 bg-(image:--gradient-extract-4)">
@@ -99,12 +109,30 @@ export function BudgetIncidentCard({
           </div>
           {parsed !== null && parsed <= incident.amountObserved ? (
             <p className="mt-2 text-xs text-red-700 dark:text-red-200/80">
-              The new budget must exceed current observed spend.
+              A raise must exceed current observed spend. To resume on the cap you already
+              have, use &ldquo;Resume, keep cap&rdquo; below.
             </p>
           ) : null}
         </div>
 
-        <div className="flex justify-end">
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          {canResumeWithoutRaise ? (
+            <Button
+              variant="outline"
+              className="gap-2"
+              disabled={isMutating}
+              onClick={onResumeWithoutRaise}
+              title={
+                `Resume now and leave the cap at ${formatCents(incident.amountLimit)}. `
+                + "For the rest of this window the hard stop is measured from this decision, "
+                + "so the scope stops again after another full cap's worth of spend. "
+                + "The cap returns to normal at the window roll."
+              }
+            >
+              <PlayCircle className="h-4 w-4" />
+              Resume, keep cap
+            </Button>
+          ) : null}
           <Button variant="ghost" className="text-muted-foreground" disabled={isMutating} onClick={onKeepPaused}>
             Keep paused
           </Button>

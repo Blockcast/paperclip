@@ -26,7 +26,7 @@ permissions:
 
 jobs:
   zero-errors-on-master:
-    runs-on: default
+    runs-on: arc-paperclip-light
     timeout-minutes: 5
     steps:
       - name: Checkout repository

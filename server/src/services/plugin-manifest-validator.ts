@@ -128,8 +128,8 @@ export function pluginManifestValidator(): PluginManifestValidator {
         };
       }
 
-      const details = result.error.errors.map((issue) => ({
-        path: issue.path,
+      const details = result.error.issues.map((issue) => ({
+        path: issue.path as (string | number)[],
         message: issue.message,
       }));
 

@@ -1217,10 +1217,11 @@ async function claimAggregateFiringWaiting(
  * aggregates that do not fire again.
  *
  * The age arm does not weaken the exclusion above it. That exclusion protects a
- * live sibling delivery in *this* process, and this sweep runs only from
- * `setup()` (see `worker.ts`) — a fence this process owns cannot already be 15
- * minutes old when the process is seconds old, so the two arms do not overlap
- * in practice. Safety does not rest on that timing argument either way: as with
+ * live sibling delivery in *this* process. The sweep runs from `setup()` and
+ * from every `reconcile-active-alerts` pass (BLO-49195), so the age arm CAN
+ * release a fence this process still holds — deliberately: one held past the
+ * backstop is the live-process leak nothing else reaches. Safety never rested
+ * on a timing argument: as with
  * the per-claim backstop, a stolen holder is refused at every mutation site by
  * the `firing_token` generation, so an over-eager release costs one retry.
  *
@@ -1384,7 +1385,8 @@ async function finishAggregateFiring(
  * `beginAggregateCancellation` leaves it there, and for an aggregate whose
  * alert has stopped firing nothing automatic reaches it before the next worker
  * restart: the per-claim backstop only runs on a delivery, and
- * `reconcileAbandonedAggregateFences` only runs from `setup()`. Its release is
+ * `reconcileAbandonedAggregateFences` ran only from `setup()` (now also every
+ * `reconcile-active-alerts` pass, BLO-49195). Its release is
  * the same `-> active` transition `releaseAggregateFinalization` performs, so
  * this introduces no new state either, and the compare-and-set on
  * `resolution_token` is what keeps it from reopening a fence a newer resolver
@@ -1499,7 +1501,21 @@ async function beginAggregateFinalization(
          updated_at = now()
      WHERE company_id = $1
        AND aggregate_key = $2
-       AND phase = 'active'
+       AND (
+         phase = 'active'
+         -- The abandonment backstop, same horizon as beginAggregateFiring's
+         -- (BLO-49264). Without it a held fence on an aggregate that has
+         -- stopped firing could only be reclaimed by a worker restart: the
+         -- firing claim's backstop never runs, because no firing delivery
+         -- arrives. Measured 2026-10-25: 'cancelling' held 2h, every
+         -- resolution retry refused until Alertmanager gave up. Safe by the
+         -- same generation argument: a resumed holder's token is gone, so it
+         -- cannot release, cancel, or finish.
+         OR (
+           phase IN ('firing', 'cancelling', 'finalizing')
+           AND updated_at < now() - ($7::bigint * interval '1 millisecond')
+         )
+       )
        AND NOT EXISTS (
          SELECT 1
          FROM ${members}
@@ -1515,6 +1531,7 @@ async function beginAggregateFinalization(
       token,
       WORKER_INSTANCE_ID,
       WORKER_SLOT,
+      AGGREGATE_FENCE_ABANDONED_BACKSTOP_MS,
     ],
   );
   if (result.rowCount > 0) return { ok: true, token };
@@ -1568,7 +1585,8 @@ async function beginAggregateFinalization(
  *     backstop, and then waits up to {@link AGGREGATE_FENCE_WAIT_BUDGET_MS}
  *     with a FIFO local handoff;
  *   - a finalization claim admitted `active` and nothing else, with no steal,
- *     no backstop, and no wait — one attempt, then throw.
+ *     no backstop, and no wait — one attempt, then throw. (The backstop was
+ *     added later, BLO-49264; see `beginAggregateFinalization`.)
  *
  * So a resolution delivery lost to *any* concurrent delivery on its own
  * aggregate, including the sub-second firing delivery the firing side absorbs
@@ -3850,11 +3868,10 @@ export async function handleResolved(
               `retrying resolution delivery after a full ` +
               `${fenceWaitPolicy?.budgetMs ?? AGGREGATE_FENCE_WAIT_BUDGET_MS}ms wait. ` +
               `A fence abandoned by a dead process is released automatically by its slot's ` +
-              `next worker, and 'firing'/'cancelling' held past the abandonment backstop is ` +
-              `reclaimed by the next firing claim. 'finalizing' is NOT reclaimed by either ` +
-              `while the alert has stopped firing — if that is the phase here and it persists, ` +
-              `an operator can release it via the plugin's recover-aggregate-firing route ` +
-              `using its resolution token.`,
+              `next worker, and any phase held past the abandonment backstop is released by ` +
+              `the next firing claim or the periodic fence sweep (reconcile-active-alerts, ` +
+              `every 5 min). If it persists past that, an operator can release it via the ` +
+              `plugin's recover-aggregate-firing route using its resolution token.`,
         );
       }
       // Old per-fingerprint records have no aggregate key or member row, so
