@@ -64,6 +64,16 @@ async function runExecutor(
     executionTransport?: Record<string, unknown>;
   } = {},
 ) {
+  // A config without `cwd` falls through to `process.cwd()` in execute.ts
+  // (`effectiveWorkspaceCwd || configuredCwd || process.cwd()`), and for the
+  // `claude` agent that path writes a real `.claude/settings.local.json` into
+  // whatever directory the suite runs from -- a permissions file that
+  // allow-lists shell environment dumps and outbound curl without prompting.
+  // Under `pnpm test` that directory is the package source tree, and PEN-2506
+  // committed one such file by accident. Defaulting here rather than at each
+  // call site so a future test cannot reintroduce it. A workspace cwd in
+  // `context` still takes precedence.
+  const effectiveConfig = "cwd" in config ? config : { ...config, cwd: await makeTempRoot() };
   const runtimeOptions: Record<string, unknown>[] = [];
   const meta: Record<string, unknown>[] = [];
   const logs: Array<{ stream: string; text: string }> = [];
@@ -81,7 +91,7 @@ async function runExecutor(
       companyId: "company-1",
     },
       runtime: {},
-      config,
+      config: effectiveConfig,
       context: options.context ?? {},
       executionTransport: options.executionTransport,
       onLog: async (stream: "stdout" | "stderr", text: string) => {
