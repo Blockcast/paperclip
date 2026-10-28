@@ -44,6 +44,8 @@ function cutTailAtBoundary(trimmed: string, tailLength: number) {
  * Use `truncateSectionText` there, and pass an explicit `marker` anywhere the default bare
  * `...` could be mistaken for an author's own ellipsis.
  */
+// PEN-3107 CONTROL (probe branch only): a comment-only, type-clean touch under
+// server/**, so the paths filter fires and the lane runs on a healthy tree.
 export function truncateText(value: string, maxChars: number, marker = "...", separator = "") {
   const trimmed = value.trim();
   if (trimmed.length <= maxChars) return trimmed;
