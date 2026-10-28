@@ -5801,8 +5801,23 @@ function ensureRegistry(): {
         + "A ratio near 1 is the standing 'GC does not mark the instant' refutation holding at "
         + "matched resolution; a ratio far from 1 is the first positive trigger result here. "
         + "Counts are frozen per onset, so they describe the episode rather than the ring's "
-        + "current contents. Which {kind, flags} class marks the unmapper path is NOT asserted: "
-        + "read the distribution, do not filter on a predicted label. Qualify every reading with "
+        + "current contents. THEREFORE THIS SERIES CANNOT COUNT EPISODES, and summing it to "
+        + "look for one is a measured trap: a new onset whose multiset repeats renders as no "
+        + "change at all. On paperclip-0, 2026-10-28T00:34-01:08Z, FOUR consecutive distinct "
+        + "onsets carried a byte-identical vector (minor 4 / incremental 1 / major 1) and the "
+        + "summed series showed one flat line across all of them -- a 67% undercount against "
+        + "the clock. Take episode boundaries from "
+        + PROCESS_RSS_RELEASE_LAST_ONSET_TIMESTAMP_METRIC
+        + " and nothing else. "
+        + "flags is a PIPE-JOINED SET, not an enum -- the same flag appears bare and in "
+        + "composites (all_external_memory and "
+        + "synchronous_phantom_processing|all_external_memory are both live), so an equality "
+        + "match on one silently drops the other. Which {kind, flags} class marks the unmapper "
+        + "path is NOT asserted: read the distribution, do not filter on a predicted label. "
+        + "A class present in window=onset is not a discriminator until it is checked against "
+        + "window=baseline on the SAME instance -- major/all_external_memory was read as "
+        + "onset-only at n=3 and falsified at n=4 by a baseline carrying it at equal count. "
+        + "Qualify every reading with "
         + PROCESS_RSS_RELEASE_ONSET_GC_WINDOW_COVERED_METRIC
         + ". NOT an alert source.",
       labelNames: ["window", "kind", "flags"],
