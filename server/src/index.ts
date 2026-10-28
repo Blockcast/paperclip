@@ -3641,6 +3641,10 @@ export async function startServer(): Promise<StartedServer> {
         }
       }
 
+      // BLO-49139: step breadcrumbs (sync stderr, so they survive a SIGKILL at
+      // the grace deadline) — the 10-28 rollout went silent after the setup
+      // drain on paperclip-0 and nothing said which step hung.
+      writeShutdownBreadcrumb(`step: sse drain (signal=${signal})`);
       try {
         const { sseRegistry } = await import("./services/sse-registry.js");
         await sseRegistry.drain({ timeoutMs: 25_000, reason: `shutdown:${signal}` });
@@ -3649,8 +3653,18 @@ export async function startServer(): Promise<StartedServer> {
         logger.warn({ err }, "sseRegistry.drain failed");
       }
 
+      writeShutdownBreadcrumb(`step: server.close (signal=${signal})`);
       await new Promise<void>((resolveClose) => {
+        // BLO-49139: server.close waits for every open connection. Bound it so
+        // a long-lived request cannot starve the run drain below of the grace
+        // period; after the cap, force-close what is left.
+        const forceClose = setTimeout(() => {
+          writeShutdownBreadcrumb("server.close exceeded 10s; closing all connections");
+          server.closeAllConnections?.();
+        }, 10_000);
+        forceClose.unref();
         server.close((err) => {
+          clearTimeout(forceClose);
           if (err) logger.warn({ err }, "server.close error");
           resolveClose();
         });
@@ -3664,6 +3678,7 @@ export async function startServer(): Promise<StartedServer> {
       }
 
       if (!skipHeartbeatDrain && drainHeartbeatRunsForShutdown) {
+        writeShutdownBreadcrumb(`step: heartbeat run drain (signal=${signal})`);
         try {
           const drain = await drainHeartbeatRunsForShutdown(signal);
           logger.info({ signal, drain }, "graceful heartbeat run drain complete");
