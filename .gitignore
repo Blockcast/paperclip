@@ -43,7 +43,10 @@ diagnostics/
 # Editor / tool temp files
 *.tmp
 .vscode/
-.claude/settings.local.json
+# Interior slash => git anchors this to the repo root, so a nested copy such as
+# packages/adapters/acpx-local/.claude/settings.local.json was NOT ignored and got
+# committed (PEN-2506). Leading ** matches at any depth.
+**/.claude/settings.local.json
 .paperclip-local/
 .paperclip-runtime/
 /.idea/

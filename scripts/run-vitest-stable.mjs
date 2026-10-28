@@ -29,12 +29,14 @@ const nonServerProjects = [
   "@paperclipai/skills-catalog",
   "@paperclipai/db",
   "@paperclipai/adapter-utils",
+  "@paperclipai/adapter-acpx-local",
   "@paperclipai/adapter-claude-local",
   "@paperclipai/adapter-codex-local",
   "@paperclipai/adapter-cursor-cloud",
   "@paperclipai/adapter-cursor-local",
   "@paperclipai/adapter-gemini-local",
   "@paperclipai/adapter-grok-local",
+  "@paperclipai/adapter-openclaw-gateway",
   "@paperclipai/adapter-opencode-local",
   "@paperclipai/adapter-pi-local",
   "@paperclipai/plugin-sdk",
@@ -43,6 +45,18 @@ const nonServerProjects = [
   // package name, not the directory. Its 10 suites, including the BLO-32113
   // aggregate-fence reclaim regressions, ran in no CI lane before this.
   "paperclip-plugin-alertmanager",
+  // PEN-2506. Unscoped names (`paperclip-plugin-slack`) and @kkroo-scoped ones
+  // match each package.json `name` -- `--project` matches the package name,
+  // not the directory, which is why these do not all share one prefix.
+  "@paperclipai/plugin-fake-sandbox",
+  "@kkroo/paperclip-plugin-gbrain",
+  "@kkroo/paperclip-plugin-linear",
+  "paperclip-plugin-slack",
+  "@paperclipai/plugin-workspace-diff",
+  "@paperclipai/plugin-authoring-smoke-example",
+  "@paperclipai/google-sheets-mcp-server",
+  "@paperclipai/kv-demo-mcp-server",
+  "@paperclipai/teams-catalog",
   "@paperclipai/mcp-external",
   "@paperclipai/mcp-server",
   "@paperclipai/mcp-gateway",

@@ -220,31 +220,47 @@ const EXECUTED_BY_ANOTHER_LANE = new Map([
 // wiring the package up) but adding one is a deliberate, reviewable act and
 // needs a tracking issue.
 //
-// Every entry below is tracked by PEN-2506. All twelve are ordinary pnpm
-// workspace members, so the two-list fix (vitest.config.ts +
-// `nonServerProjects`) is the right remedy for each and nothing structural
-// blocks it.
+// PEN-2506 drained this list from twelve to one. The eleven that left were
+// ordinary pnpm workspace members, so the two-list fix (vitest.config.ts +
+// `nonServerProjects`) was available for each, and every one was run before
+// being claimed: 11 packages / 53 test files / 640 tests, all passing --
+// through the root `--project` path the CI driver uses, not standalone.
+//
+// The security-relevant ones among them were NOT the kubernetes set this row
+// was filed about. They were paperclip-plugin-slack --
+// signature-verification.test.ts (HMAC over the original bytes, stale
+// timestamps, length mismatch, fail-closed on an unreadable secret) and
+// interaction-tenant-scope.test.ts (BLO-21083: a delivery is never served
+// under another company's token or signing secret) -- plus
+// paperclip-plugin-gbrain's oauth-client-manager.test.ts. Those are
+// inbound-request authentication and cross-tenant isolation controls, and
+// nothing ran them.
 //
 // The nine workspace-EXCLUDED packages that used to sit here -- the sandbox
 // providers and plugin-orchestration-smoke-example, including the
-// @paperclipai/plugin-kubernetes set this row named as its highest-value
-// subset -- have moved to EXECUTED_BY_ANOTHER_LANE. They are not fixed debt;
-// they were never unexecuted debt after 2026-09-19, and this list said
-// otherwise for five weeks. See the note there.
+// @paperclipai/plugin-kubernetes set -- have moved to
+// EXECUTED_BY_ANOTHER_LANE. They were never unexecuted debt after 2026-09-19,
+// and this list said otherwise for five weeks. See the note there.
 const UNEXECUTED_WITH_TESTS = new Map(
   [
-    "@kkroo/paperclip-plugin-gbrain",
-    "@kkroo/paperclip-plugin-linear",
-    "@paperclipai/adapter-acpx-local",
-    "@paperclipai/adapter-openclaw-gateway",
-    "@paperclipai/google-sheets-mcp-server",
-    "@paperclipai/kv-demo-mcp-server",
-    "@paperclipai/plugin-authoring-smoke-example",
-    "@paperclipai/plugin-fake-sandbox",
+    // The only package PEN-2506 could not wire up, and it is a genuine
+    // failure rather than a structural blocker. Of its 3 spec files, 2 pass
+    // (85 tests); tests/wiki-route-sidebar-ui.spec.ts fails 16/16.
+    //
+    // That file renders React through `react-dom/client` createRoot and
+    // imports `act` from "react", but the package's own vitest.config.ts sets
+    // `environment: "node"` -- there is no DOM, and neither jsdom nor
+    // happy-dom is declared. `act` also resolves `undefined` off the
+    // react@19.2.7 build selected under that environment, which is the
+    // "TypeError: act is not a function" every one of the 16 reports.
+    //
+    // Wiring the package up as-is would turn 16 silent failures into a red
+    // lane on every PR. Fixing it means choosing a DOM environment and adding
+    // the dependency for it -- per-package remediation, not CI wiring, and
+    // exactly the BLO-20172 pattern this row's caveat predicted. Deliberately
+    // not bundled into a security change. The 85 passing tests are the prize
+    // waiting on it.
     "@paperclipai/plugin-llm-wiki",
-    "@paperclipai/plugin-workspace-diff",
-    "@paperclipai/teams-catalog",
-    "paperclip-plugin-slack",
   ].map((name) => [name, "PEN-2506"]),
 );
 
@@ -337,6 +353,25 @@ test("packages/mcp-gateway is wired into both lists", () => {
   );
 });
 
+// Everything from a top-level `jobs:` key up to the next top-level key, or
+// null when the file declares none. Bounded rather than "rest of file" so a
+// workflow that puts another top-level key after `jobs:` cannot smuggle a
+// match back in.
+function jobsSectionOf(source) {
+  const start = source.match(/^jobs:[ \t]*$/m);
+  if (!start) return null;
+  const rest = source.slice(start.index + start[0].length);
+  const next = rest.match(/^[A-Za-z_][A-Za-z0-9_-]*:/m);
+  return next ? rest.slice(0, next.index) : rest;
+}
+
+// A job key is interpolated into a RegExp below; YAML permits characters that
+// are regex metacharacters, and an unescaped one would silently change what
+// the guard accepts.
+function escapeForRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 test("every EXECUTED_BY_ANOTHER_LANE claim names a job that exists", () => {
   // EXECUTED_BY_ANOTHER_LANE is the one list in this file that asserts
   // coverage rather than its absence, and nothing checked it. That asymmetry
@@ -369,9 +404,22 @@ test("every EXECUTED_BY_ANOTHER_LANE claim names a job that exists", () => {
 
     // Strip any parenthetical detail, e.g. "policy (node --test steps)".
     const jobKey = job.replace(/\s*\(.*$/, "").trim();
+
+    // Scope the search to the `jobs:` block. Matching `^  <key>:$` against the
+    // whole file also accepts any OTHER two-space-indented mapping key -- most
+    // damagingly the trigger names under `on:`, so a claim of
+    // "pr.yml :: pull_request" or ":: merge_group" would pass and exempt a
+    // package from the sweep above on the strength of something that is not a
+    // job at all. Verified against pr.yml, where `pull_request:` sits at
+    // exactly two spaces (line 4).
+    const jobsBlock = jobsSectionOf(source);
+    assert.ok(
+      jobsBlock !== null,
+      `${name} cites ${file}, but that workflow has no top-level \`jobs:\` block.`,
+    );
     assert.match(
-      source,
-      new RegExp(`^  ${jobKey}:$`, "m"),
+      jobsBlock,
+      new RegExp(`^  ${escapeForRegExp(jobKey)}:$`, "m"),
       `${name} is exempted from the unexecuted-package sweep on the claim that ` +
         `\`${jobKey}\` in ${file} runs it, but that workflow declares no such job. ` +
         `Either the job was renamed or removed -- in which case this package's tests ` +
