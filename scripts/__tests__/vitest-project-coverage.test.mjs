@@ -251,13 +251,15 @@ const EXECUTED_BY_ANOTHER_LANE = new Map([
 // "there is no DOM, and neither jsdom nor happy-dom is declared". The second
 // half was TRUE and the conclusion drawn from it was not:
 // tests/wiki-route-sidebar-ui.spec.ts carries its own
-// `// @vitest-environment jsdom` docblock, and jsdom resolved anyway -- as a
+// `// @vitest-environment jsdom` docblock, and jsdom resolves anyway -- as a
 // phantom dependency, hoisted into node_modules/.pnpm/node_modules off
 // `server`'s declaration -- so `document` was defined the whole time. That is
-// PEN-4930, fixed separately: both packages that request a DOM declare jsdom
-// themselves now, and a sweep in this file holds that line for every package.
-// The 16 failures were
-// "TypeError: act is not a function" because React only exports `act` from
+// PEN-4930, tracked separately in #3072: that PR declares jsdom on the two
+// packages whose tests request it and adds a sweep to this file for any
+// package that requests a non-node environment without declaring what
+// provides it. Neither is in this tree yet -- on this branch jsdom is still
+// the phantom described above. The 16 failures were "TypeError: act is not a
+// function" because React only exports `act` from
 // cjs/react.development.js and react/index.js selects the production build
 // when process.env.NODE_ENV === "production" -- which is ambient in an agent
 // sandbox, but is NOT what CI does: runVitest in run-vitest-stable.mjs sets
