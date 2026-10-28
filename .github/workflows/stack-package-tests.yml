@@ -14,20 +14,18 @@ name: Stack package tests
 # 10 failures -- a plaintext token printing in the clear directly beneath its
 # own redaction marker.
 #
-# Scope, deliberately narrow. This closes the *review-time* half only, and it
-# is NOT sufficient on its own: as of this commit the merge gate is still open,
-# and it is #1472 rather than this file that closes it.
+# Scope, deliberately narrow: this file closes the *review-time* half only.
+# Whether the *merge-gate* half is also open is a per-entry question, and the
+# two entries below differ -- see each lane's own comment. Do not generalise
+# either answer to the other.
 #
-# The reason the merge gate is open is project selection, not a `paths:`
+# The reason a merge gate can be open is project selection, not a `paths:`
 # filter. pr.yml's `general_tests` runs `pnpm test:run:general`, i.e.
 # scripts/run-vitest-stable.mjs, which selects work with `--project <name>` off
-# its own `nonServerProjects` list. `@paperclipai/mcp-gateway` appears neither
-# in that list nor in `vitest.config.ts` `projects`, so `general_tests`
-# executes zero mcp-gateway tests -- on `pull_request` and on `merge_group`
-# alike. Absence of a paths filter is necessary but not sufficient; the
-# enumeration is the gate. Wiring the package into both lists is the sibling
-# fix (#1472), which must land first: until it does, a master-targeting change
-# to this package still reaches the merge queue with its suites unexecuted.
+# its own `nonServerProjects` list. A package in neither that list nor
+# `vitest.config.ts` `projects` has zero tests executed by `general_tests` --
+# on `pull_request` and on `merge_group` alike. Absence of a paths filter is
+# necessary but not sufficient; the enumeration is the gate.
 #
 # What this file adds is the signal during intermediate stack review, which is
 # exactly where the silent revert above survived.
@@ -35,38 +33,138 @@ name: Stack package tests
 # Why a separate workflow rather than dropping `branches:` from pr.yml:
 # `on.pull_request.branches` is workflow-level, not job-level, so relaxing it
 # there would put ~20 check runs on every intermediate PR in every stack and
-# lean on the arc-light saturation that file already documents. One
-# paths-filtered job, skipped outright on the base pr.yml owns, buys the
-# missing signal at a fraction of that cost. Base-unrestricted,
-# paths-filtered workflows are established practice here -- see
-# graphify-staleness.yml and the docker-*-bot workflows.
+# lean on the arc-light saturation that file already documents. Paths-filtered
+# lanes, skipped outright on the base pr.yml owns, buy the missing signal at a
+# fraction of that cost. Base-unrestricted, paths-filtered workflows are
+# established practice here -- see graphify-staleness.yml and the docker-*-bot
+# workflows.
 #
 # The paths list is a security-sensitive allowlist, not an attempt at coverage.
-# `packages/mcp-gateway/**` is on it because it holds the agent-facing k8s MCP
-# secret scrubber. Adding a package is one line.
+#
+# ADDING AN ENTRY IS NO LONGER ONE LINE, and the older header said it was.
+# `on.pull_request.paths` is workflow-level too, so a second entry made every
+# lane here eligible on every triggering diff -- a server-only stack PR would
+# have run mcp-gateway's full suite for nothing, which is the same arc
+# saturation the paragraph above declines to cause. The `select` job below
+# classifies the diff once, cheaply, and each lane gates on its own output.
+# So an entry costs three edits: a `paths:` line, a branch in `select`, and a
+# lane. That is the honest price; it was mis-stated before, not raised.
 
 on:
   pull_request:
     paths:
       - "packages/mcp-gateway/**"
+      - "server/**"
 
 permissions:
   contents: read
 
 jobs:
+  # One cheap classification for the whole file. Without it, `paths:` being
+  # workflow-level means any entry matching puts EVERY lane on the diff.
+  #
+  # Fails OPEN, deliberately, and in the same shape as pr.yml's
+  # `Select suites reachable from this diff`: the step is
+  # `continue-on-error`, and consumers below compare against the literal
+  # 'false'. Anything else -- 'true', empty, or an output that was never
+  # written because the step died -- means run the lane. A selector fault can
+  # therefore only over-run. The opposite default would let a `gh` rate limit
+  # silently reproduce the exact no-lane hole this file exists to close.
+  select:
+    name: Stack lane selection
+    # pr.yml owns master-targeting PRs and merge-queue candidates; this file
+    # exists for the stack-review path its `branches: [master]` gate excludes.
+    if: github.base_ref != 'master'
+    runs-on: arc-paperclip-light
+    # Hang detector, not a performance budget (BLO-35615). One API call with
+    # no checkout and no install; a healthy run is seconds.
+    timeout-minutes: 10
+    permissions:
+      # A job-level block REPLACES the workflow-level one rather than merging
+      # into it, so `contents: read` is restated deliberately -- see the same
+      # note on pr.yml's `policy` job.
+      contents: read
+      # `/pulls/{n}/files` -- the only call this job makes.
+      pull-requests: read
+    outputs:
+      mcp_gateway: ${{ steps.classify.outputs.mcp_gateway }}
+      server: ${{ steps.classify.outputs.server }}
+    steps:
+      - name: Classify the diff by lane
+        id: classify
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          # `--paginate` with `--jq` is fine; it is `--paginate` + `--jq` +
+          # `--arg` together that gh rejects.
+          files="$(gh api --paginate "repos/${REPO}/pulls/${PR_NUMBER}/files" --jq '.[].filename')"
+          # An empty list from a PR that matched `paths:` is incoherent -- the
+          # event would not have fired. Treat it as a failed classification and
+          # fail open rather than writing two 'false' values that would skip
+          # every lane.
+          if [ -z "$files" ]; then
+            echo "::warning::could not classify the diff; failing open (both lanes eligible)"
+            exit 1
+          fi
+          mcp_gateway=false
+          server=false
+          if printf '%s\n' "$files" | grep -q '^packages/mcp-gateway/'; then
+            mcp_gateway=true
+          fi
+          if printf '%s\n' "$files" | grep -q '^server/'; then
+            server=true
+          fi
+          echo "mcp_gateway=${mcp_gateway}" >> "$GITHUB_OUTPUT"
+          echo "server=${server}" >> "$GITHUB_OUTPUT"
+          echo "mcp-gateway lane: ${mcp_gateway}; server lane: ${server}"
+        timeout-minutes: 5
+
+      - name: Record what a green on this workflow does and does not attest
+        if: ${{ !cancelled() }}
+        run: |
+          {
+            echo "## Stack review signal -- read before trusting a green tick"
+            echo
+            echo "This PR targets \`${{ github.base_ref }}\`, not \`master\`, so"
+            echo "\`pr.yml\` -- which owns **every** vitest lane, Build and Typecheck in"
+            echo "this repo -- did not run and **will not run** on this head."
+            echo "\`review\` and \`security-review\` are App-provided and execute no code."
+            echo
+            echo "This workflow restores a *partial* signal. What it does **not** attest:"
+            echo
+            echo "- the full suite for any package (no lane here runs it)"
+            echo "- anything at all about packages outside the \`paths:\` allowlist"
+            echo "- that this tree would pass \`master\`'s merge gate"
+            echo
+            echo "Lanes selected for this diff: mcp-gateway=\`${{ steps.classify.outputs.mcp_gateway || 'fail-open' }}\`, server=\`${{ steps.classify.outputs.server || 'fail-open' }}\`."
+            echo
+            echo "PEN-2491 is the measured failure this exists for: a stack PR that added 126"
+            echo "lines of regression tests while silently reverting the 59-line fix they"
+            echo "covered, with every check green and \`mergeStateStatus\` CLEAN."
+          } >> "$GITHUB_STEP_SUMMARY"
+
   mcp_gateway:
     name: Stack tests (mcp-gateway)
-    # pr.yml owns master-targeting PRs and merge-queue candidates; this lane
-    # exists for the stack-review path its `branches: [master]` gate excludes.
-    # mcp-gateway joins pr.yml's `general_tests` selection via #1472, so once
-    # that lands, running the same suites here would duplicate an existing
-    # lane. Before it lands, a master-targeting mcp-gateway PR has no vitest
-    # lane at all -- that hole is #1472's to close, not this workflow's, which
-    # is why #1472 is a hard prerequisite rather than a sibling nicety.
-    if: github.base_ref != 'master'
+    needs: select
+    # `!= 'false'` and not `== 'true'`: see the fail-open note on `select`.
+    if: needs.select.outputs.mcp_gateway != 'false'
     runs-on: arc-paperclip-general
     timeout-minutes: 20
 
+    # MERGE GATE: closed. `@paperclipai/mcp-gateway` now appears in BOTH
+    # `nonServerProjects` (scripts/run-vitest-stable.mjs) and `vitest.config.ts`
+    # `projects`, i.e. #1472 -- this lane's hard prerequisite -- has landed. A
+    # master-targeting mcp-gateway PR therefore does get its suites executed by
+    # pr.yml's `general_tests`.
+    #
+    # ⛔ That is NOT a reason to delete this lane. #1472 closed the merge gate;
+    # `pr.yml` still never runs on a non-master base, so the review-time hole
+    # this lane fills is untouched by it. The `if: github.base_ref != 'master'`
+    # on `select` keeps the two disjoint -- they never both run on one head.
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -85,14 +183,125 @@ jobs:
 
       # Package-local invocation is deliberate: it does not depend on the
       # package being wired into the root `vitest.config.ts` `projects` array or
-      # into `nonServerProjects` in scripts/run-vitest-stable.mjs. Repairing
-      # those two lists is PEN-2491's sibling fix (#1472); this lane stays
-      # correct whether or not that has landed, and cannot be silently
-      # de-selected by a future edit to either list. That independence is about
-      # *this lane's* reliability only -- it does not substitute for #1472's
-      # merge-time coverage, which no `pull_request`-triggered job can provide.
+      # into `nonServerProjects` in scripts/run-vitest-stable.mjs. This lane
+      # stays correct whether or not those entries survive, and cannot be
+      # silently de-selected by a future edit to either list. That independence
+      # is about *this lane's* reliability only -- it does not substitute for
+      # the merge-time coverage those lists provide, which no
+      # `pull_request`-triggered job can provide.
       - name: Run mcp-gateway tests
         run: pnpm --filter @paperclipai/mcp-gateway exec vitest run
 
       - name: Typecheck mcp-gateway
         run: pnpm --filter @paperclipai/mcp-gateway exec tsc --noEmit
+
+  # PEN-3107. `server/**` is the same review-time hole one directory over, and
+  # it is the larger one: #1672 shipped a CI guard for a disclosure class
+  # carrying 37 tests across 4 suites, not one of which had ever executed in
+  # CI.
+  #
+  # MERGE GATE: already closed, unlike mcp-gateway's was. `server` is in
+  # `vitest.config.ts` `projects` and has its own dedicated shard group in
+  # run-vitest-stable.mjs (`general-server`), which pr.yml runs as 4 matrix
+  # shards on `pull_request` and `merge_group`. So server has no #1472-shaped
+  # prerequisite: the review-time half is the ONLY half open for it, and this
+  # lane closes it outright rather than partially.
+  #
+  # WHY COMPILE AND NOT THE SUITE. Those 4 server shards cost ~30-35 min each
+  # on pr.yml. Putting them on every intermediate PR in every stack is exactly
+  # the arc saturation this file's header declines to cause, and it would be
+  # redundant with pr.yml once the stack collapses onto master. A typecheck is
+  # a fraction of that and it catches the specific failure PEN-2491 measured:
+  # a silently reverted fix no longer satisfies the imports and call signatures
+  # of the regression tests shipped alongside it, so the compile goes red even
+  # though the suite was never run. `Guard the server-test typecheck allowlist`
+  # is what makes that true for a NEW test file -- without it the added test
+  # sits outside `tsconfig.tests.json` `include` and is typechecked by nothing.
+  #
+  # This is a deliberate, recorded trade, not an oversight: a stack PR whose
+  # server change breaks a test's *behaviour* without breaking its *types*
+  # still goes green here. The step summary says so on the PR.
+  server_stack:
+    name: Stack typecheck (server) -- compile only, suites not run
+    needs: select
+    if: needs.select.outputs.server != 'false'
+    runs-on: arc-paperclip-general
+    # Hang detector, not a performance budget (BLO-35615). PROVISIONAL: this
+    # job has no run history to derive `ceil(W95 / (F * 60))` from. 30 is the
+    # mcp-gateway lane's 20 plus margin for a materially larger `tsc` program.
+    # Re-derive it by the BLO-35615 rule once there are ~30 healthy runs; do
+    # NOT re-tune it from observed durations by eye.
+    timeout-minutes: 30
+
+    env:
+      # Consumed by scripts/check-test-typecheck-allowlist.mjs, whose
+      # added-file and ratchet arms are base-relative. It errors rather than
+      # passing when these are unset -- "a green check that could not see a new
+      # test file at all" -- so they are supplied explicitly here, exactly as
+      # pr.yml supplies them to the same script.
+      PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          # Not depth 1: the allowlist guard resolves $PR_BASE_SHA. pr.yml puts
+          # that guard in `policy` for this same reason.
+          fetch-depth: 0
+
+      - name: Setup pnpm
+        uses: ./.github/actions/setup-pnpm
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+
+      # Before `pnpm install`, because it is Node-builtins-only and this is the
+      # arm most likely to fire on the diff shape this lane exists to police:
+      # a stack PR that adds regression tests. An added test file outside
+      # `tsconfig.tests.json` `include` is typechecked by NOTHING (BLO-38582),
+      # so without this the typecheck below would pass vacuously on exactly the
+      # PEN-2491 tree.
+      - name: Guard the server-test typecheck allowlist (PEN-4186)
+        run: node ./scripts/check-test-typecheck-allowlist.mjs "$PR_BASE_SHA" "$PR_HEAD_SHA"
+        timeout-minutes: 1
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # server's own `typecheck` script: `ensure-build-deps && tsc --noEmit &&
+      # typecheck:tests`. One entry point covering source AND the allowlisted
+      # tests, so this lane cannot drift from what `pnpm -r typecheck` enforces
+      # at release (release-verify.yml). Note nothing on pr.yml's
+      # `pull_request` path runs this exact script -- `typecheck:build-gaps`
+      # filters server out because its build already contains `tsc`, and
+      # `typecheck_release_registry` runs only the `:tests` half (BLO-38582).
+      - name: Typecheck server source and allowlisted server tests
+        run: pnpm --filter @paperclipai/server run typecheck
+
+      - name: Record what this lane does and does not attest
+        if: ${{ !cancelled() }}
+        run: |
+          {
+            echo "## Stack typecheck (server) -- compile only"
+            echo
+            echo "**This green means the server tree COMPILES. It does not mean its tests pass.**"
+            echo
+            echo "Executed here:"
+            echo
+            echo "- \`tsc --noEmit\` over server source"
+            echo "- \`tsc --noEmit -p tsconfig.tests.json\` over the allowlisted server tests"
+            echo "- the PEN-4186 allowlist guard, so a test file added by this PR is inside that allowlist"
+            echo
+            echo "**Not** executed here -- and not executed anywhere on this PR:"
+            echo
+            echo "- the 4 \`general-server\` vitest shards (~30-35 min each; they run only on a \`master\` base)"
+            echo "- every server test outside \`server/tsconfig.tests.json\` \`include\`, even as a compile"
+            echo
+            echo "So a change that breaks a test's **behaviour** without breaking its **types**"
+            echo "passes this lane. Retarget to \`master\` to get the real suite; per PEN-4878 a"
+            echo "retarget alone does not start it -- push after retargeting."
+          } >> "$GITHUB_STEP_SUMMARY"
