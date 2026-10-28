@@ -128,8 +128,12 @@ jobs:
           # returns sorted paths, so both prefixes match early and the tail
           # fills the buffer -- i.e. it misfires precisely on a big
           # stack-collapse PR, where skipping the lane costs most. pr.yml's
-          # `Verify vendored version is recorded consistently` step carries a
-          # note on this same trap, reached there via `sed | head -1`.
+          # `Vendored claude_k8s adapter` job carries a note on this same trap
+          # in its `Verify vendored version is recorded consistently` step,
+          # which uses `sed -n '...{p;q}'` precisely to avoid it. Name the JOB:
+          # the `Vendored opencode_k8s adapter` job has a step of the same
+          # name, and that copy never got the fix -- it still reads
+          # `sed ... | head -1` (PEN-4935).
           if grep -q '^packages/mcp-gateway/' <<<"$files"; then
             mcp_gateway=true
           fi
