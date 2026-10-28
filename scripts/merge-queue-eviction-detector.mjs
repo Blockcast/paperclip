@@ -394,18 +394,20 @@ export function classifyAdmissionEvidence({
   // counts refer to, and the two can legitimately differ -- two `review` lanes
   // that both failed to finish are two contexts but one unmet requirement, and
   // branch protection requires by NAME. Printing the same name twice would
-  // read as the duplicate-row defect this collapse exists to fix, so the lists
-  // are de-duplicated for display while `checkCount` and `completedByDequeue`
-  // keep counting contexts.
+  // read as the duplicate-row defect this collapse exists to fix, so the name
+  // list is de-duplicated for display while `checkCount` and
+  // `completedByDequeue` keep counting contexts.
+  //
+  // Only the INCOMPLETE names are collected. The notice reports completions as
+  // a bare count ("2 of 28 ... had completed") and names only what was unmet,
+  // so a matching set of completed names would be built on every call and read
+  // by nobody.
   let completedContexts = 0;
   let incompleteContexts = 0;
-  const completed = new Set();
   const incomplete = new Set();
   for (const context of byContext.values()) {
-    if (context.terminal) {
-      completedContexts += 1;
-      completed.add(label(context));
-    } else {
+    if (context.terminal) completedContexts += 1;
+    else {
       incompleteContexts += 1;
       incomplete.add(label(context));
     }
