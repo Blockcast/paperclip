@@ -52,6 +52,7 @@ describe("git admission", () => {
     // The broker will not read alias config out of the repository it is being
     // asked to publish: that is attacker-chosen input consulted to decide
     // whether attacker-chosen input is admissible.
+    // paperclip:allow-git-push: prose about the verb the broker brokers (PEN-4933 / PEN-3183 D1); nothing here invokes git.
     expectRefusal(() => admitGitPush(["yolo"]), /spell it as `git push`/);
   });
 
@@ -90,6 +91,7 @@ describe("git admission", () => {
     expect(argv.filter((t) => t.startsWith("credential.")).length).toBe(2);
   });
 
+  // paperclip:allow-git-push: prose about the verb the broker brokers (PEN-4933 / PEN-3183 D1); nothing here invokes git.
   it("pins the transport, which is what closes `git push ext::sh -c ...`", () => {
     // An `ext::` URL asks git to run a LOCAL command as the transport — in
     // this process, that is arbitrary code beside the credential. Enforced by

@@ -100,6 +100,7 @@ export function gitConfigAssignments(argv: readonly string[]): GitConfigAssignme
  *
  * `protocol.allow=never` plus an explicit `https` allowance is the load-bearing
  * one, and it is git's own mechanism rather than a parser of ours. Without it
+ * paperclip:allow-git-push: prose about the verb the broker brokers (PEN-4933 / PEN-3183 D1); nothing here invokes git.
  * `git push ext::sh -c '…'` asks git to run a LOCAL command as the transport —
  * which, in this process, means running attacker-chosen code in the one
  * container that holds the credential. `file://` and `ssh://` are refused for
@@ -199,6 +200,7 @@ export function admitGitPush(argv: readonly string[], env: GitEgressEnv = {}): A
     throw new PublishBrokerRefusal(
       `the broker performs pushes, and this is \`git ${classification.subcommand ?? "(no subcommand)"}\`. ` +
         "Everything git does that is not a publish runs locally in your own container — call it there. " +
+        // paperclip:allow-git-push: prose about the verb the broker brokers (PEN-4933 / PEN-3183 D1); nothing here invokes git.
         "If this really is a push reached through an alias, spell it as `git push`: the broker will not " +
         "resolve an alias out of the repository it is being asked to publish.",
     );
