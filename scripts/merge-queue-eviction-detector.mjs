@@ -19,6 +19,13 @@ const WINDOW_BUFFER_MS = 5 * 60 * 1000;
 const DEQUEUE_REPLICATION_RETRIES = 3;
 const DEQUEUE_REPLICATION_RETRY_DELAY_MS = 5000;
 
+// PEN-4887: how soon after its head moved a PR must have been enqueued for the
+// eviction to read as an admission rejection rather than an un-stageable
+// rebase. 2 minutes is deliberately generous against the measured case (4s on
+// #3060) and still far below any legitimate enqueue: a PR enqueued because its
+// checks went green was necessarily waiting on them for minutes first.
+const ADMISSION_FRESH_HEAD_MS = 2 * 60 * 1000;
+
 // Mirrors server/src/services/paperclip-identifiers.ts's PAPERCLIP_IDENTIFIER_PATTERN,
 // but case-insensitive: this repo's branch-naming convention is lowercase
 // (e.g. `blo-23395-merge-queue-eviction-detector`), and this function's whole
@@ -206,6 +213,115 @@ export function isQueueInitiatedRemoval(dequeueActor) {
 }
 
 /**
+ * PEN-4887: the third cause of a zero-`merge_group`-run eviction, which the
+ * classifier below did not model and reported as an un-stageable rebase.
+ *
+ * The queue can ADMIT an entry and then eject it because the PR does not meet
+ * its merge requirements. That also stages no `merge_group` run, so run count
+ * alone cannot tell it apart from a branch the queue could not rebase -- and
+ * reporting it as the latter sends the reader to rebase a branch that is zero
+ * commits behind its base (measured on #3060: merge base IS `master`'s head).
+ *
+ * The shape is deterministic, not a marginal race. Landing a STACKED child PR
+ * moves the parent's head to the merge commit; enqueuing the parent seconds
+ * later enqueues a head on which nothing has run yet. On #3060 the head moved
+ * at 07:46:13Z, the enqueue landed at 07:46:17Z (+4s) and the queue ejected it
+ * at 07:46:27Z -- while `ci/ally-head-attested` did not succeed until
+ * 07:48:37Z, 2m10s after the removal.
+ *
+ * ## Why this is not the forbidden `mergeable` check
+ *
+ * It never asks whether the tree merges. It asks two questions about TIME,
+ * both answerable from timestamps this script already has or can read
+ * SHA-pinned:
+ *
+ *   1. how long before the enqueue did this PR's head commit appear, and
+ *   2. at the instant of removal, had the head's checks finished reporting?
+ *
+ * A `REBASE`-unstageable eviction reads `mergeable: CLEAN` (the trap at the
+ * docblock below) but it does NOT read "head four seconds old": a PR enqueued
+ * because its checks went green necessarily waited minutes for them first. So
+ * the trap stays closed -- see runbooks/merge-queue-stalled-head.md
+ * ("A fourth eviction cause...", BLO-19566/#920).
+ *
+ * ## Why "zero completed checks" is NOT the test on its own
+ *
+ * Measured on #3060's head at the 07:46:27Z removal instant: four commit
+ * STATUSES had already succeeded (`gate/ally-comment-findings` 07:46:19Z,
+ * `review/ally-comment` 07:46:21Z/07:46:24Z) while every CHECK RUN was still
+ * unstarted. A bare "nothing has completed" predicate is therefore false on
+ * the very case this exists to catch. The fresh-head window is the signal;
+ * incompleteness is the corroborating guard, and is phrased existentially
+ * ("something had not finished") rather than universally.
+ *
+ * Completion is judged AT THE DEQUEUE INSTANT, not at read time. This script
+ * runs minutes later, by which point the head's checks have usually finished;
+ * comparing `completedAt <= dequeuedAt` keeps the verdict anchored to what was
+ * knowable when the queue ruled.
+ *
+ * Fails toward the pre-PEN-4887 verdict, the same discipline PEN-3926 applied:
+ * returns `null` -- "no usable evidence" -- for a missing check list or any
+ * unparseable timestamp, and the caller then classifies exactly as before.
+ * This can never make a genuine eviction quieter.
+ *
+ * @param {{
+ *   headChecks?: Array<{ name?: string | null, conclusion?: string | null, completedAt?: string | null }> | null,
+ *   headCommittedAt?: string | null,
+ *   enqueuedAt?: string | null,
+ *   dequeuedAt?: string | null,
+ *   freshHeadMs?: number,
+ * }} input
+ * @returns {{
+ *   rejected: boolean,
+ *   headAgeAtEnqueueMs: number,
+ *   completedByDequeue: number,
+ *   incompleteAtDequeue: string[],
+ *   checkCount: number,
+ * } | null}
+ */
+export function classifyAdmissionEvidence({
+  headChecks = null,
+  headCommittedAt = null,
+  enqueuedAt = null,
+  dequeuedAt = null,
+  freshHeadMs = ADMISSION_FRESH_HEAD_MS,
+} = {}) {
+  if (!Array.isArray(headChecks)) return null;
+  const headMs = Date.parse(headCommittedAt ?? "");
+  const enqueuedMs = Date.parse(enqueuedAt ?? "");
+  const dequeuedMs = Date.parse(dequeuedAt ?? "");
+  if (!Number.isFinite(headMs) || !Number.isFinite(enqueuedMs) || !Number.isFinite(dequeuedMs)) return null;
+
+  const headAgeAtEnqueueMs = enqueuedMs - headMs;
+  // A head that post-dates the enqueue belongs to a LATER push than the attempt
+  // this window anchored to, so these checks describe a different head. Decline
+  // rather than reason about evidence that is not the queue's.
+  if (headAgeAtEnqueueMs < 0) return null;
+
+  const completed = [];
+  const incomplete = [];
+  for (const check of headChecks) {
+    const rawName = typeof check?.name === "string" ? check.name.trim() : "";
+    const name = rawName.length > 0 ? rawName : "<unnamed>";
+    const completedAt = Date.parse(check?.completedAt ?? "");
+    // A commit status is reported in one shot, so `pending` carries a
+    // timestamp like any other state. Without this it would count as a
+    // completion and weaken the guard in the fail-open direction.
+    const terminal = String(check?.conclusion ?? "").toLowerCase() !== "pending";
+    if (terminal && Number.isFinite(completedAt) && completedAt <= dequeuedMs) completed.push(name);
+    else incomplete.push(name);
+  }
+
+  return {
+    rejected: headAgeAtEnqueueMs <= freshHeadMs && incomplete.length > 0,
+    headAgeAtEnqueueMs,
+    completedByDequeue: completed.length,
+    incompleteAtDequeue: incomplete,
+    checkCount: headChecks.length,
+  };
+}
+
+/**
  * Deliberately takes no `mergeable`/`mergeStateStatus` input. On a `REBASE`
  * merge queue (this repo's configuration: `mergeMethod: REBASE`), a PR can
  * read `mergeable: CLEAN` throughout an eviction -- the final tree merges
@@ -225,19 +341,26 @@ export function isQueueInitiatedRemoval(dequeueActor) {
  * the only one that separates "the queue could not stage this" from "a
  * person took it out on purpose", both of which produce zero runs.
  *
+ * PEN-4887 adds `admissionEvidence`, which is NOT that forbidden check either:
+ * it reads how old the head was when the queue admitted it and whether that
+ * head's checks had finished reporting by the removal, never whether the tree
+ * merges. See `classifyAdmissionEvidence` above for why the trap stays closed.
+ *
  * @param {{
  *   merged: boolean,
  *   mergeGroupRuns: Array<{ conclusion: string | null }>,
  *   truncated?: boolean,
  *   dequeueActor?: string | null,
+ *   admissionEvidence?: ReturnType<typeof classifyAdmissionEvidence>,
  * }} input
- * @returns {"merged" | "conflict_unstageable" | "check_failure" | "manual" | "unknown"}
+ * @returns {"merged" | "conflict_unstageable" | "requirements_unmet" | "check_failure" | "manual" | "unknown"}
  */
 export function classifyMergeQueueEviction({
   merged,
   mergeGroupRuns,
   truncated = false,
   dequeueActor = null,
+  admissionEvidence = null,
 }) {
   if (merged) return "merged";
   // Ally review #1220: a `gh run list` sample that hit its cap is not proof
@@ -260,8 +383,18 @@ export function classifyMergeQueueEviction({
   // that read `mergeable: MERGEABLE`/`CLEAN` throughout, each within minutes
   // of its author announcing the hold on the thread. The removal actor is
   // the discriminator; absent one, this keeps the pre-PEN-3926 verdict.
+  //
+  // PEN-4887: and a THIRD cause the two above do not cover -- the queue
+  // admitted the entry and ejected it because the PR did not meet its merge
+  // requirements, which also stages no run. Deterministic after a stacked
+  // child lands into its parent's branch: the parent's head becomes the merge
+  // commit and is enqueued seconds later, before anything has run on it.
+  // `admissionEvidence.rejected` is only ever `true` on positive evidence, so
+  // an absent or unusable read falls through to the verdict above.
   if (!mergeGroupRuns || mergeGroupRuns.length === 0) {
-    return isQueueInitiatedRemoval(dequeueActor) ? "conflict_unstageable" : "manual";
+    if (!isQueueInitiatedRemoval(dequeueActor)) return "manual";
+    if (admissionEvidence?.rejected === true) return "requirements_unmet";
+    return "conflict_unstageable";
   }
   if (mergeGroupRuns.some((run) => run?.conclusion === "failure")) return "check_failure";
   // A merge_group run exists and did not fail, yet the PR was evicted
@@ -314,6 +447,69 @@ function ghTimeline(repo, prNumber) {
     .split("\n")
     .filter((line) => line.trim().length > 0)
     .map((line) => JSON.parse(line));
+}
+
+function parseNdjson(out) {
+  return out
+    .split("\n")
+    .filter((line) => line.trim().length > 0)
+    .map((line) => JSON.parse(line));
+}
+
+/**
+ * PEN-4887: both check surfaces for ONE commit, SHA-pinned.
+ *
+ * Reading only `/check-runs` would be wrong in the direction that matters.
+ * `ci/ally-head-attested`, `review/ally-complete` and the `review/*` mirrors
+ * are commit STATUSES, not check runs, and on #3060's head four of them had
+ * already succeeded before the removal while every check run was still
+ * unstarted. Omitting them would report "nothing completed" for heads where
+ * something had, which is the fail-open direction for the guard in
+ * `classifyAdmissionEvidence`.
+ *
+ * Returns `null` on any read failure rather than an empty array: an empty
+ * array is positive evidence ("this head carries no checks") and would let a
+ * transient API error classify, while `null` means "no evidence" and falls
+ * back to the pre-PEN-4887 verdict. Never throws -- a failure to gather
+ * optional corroboration must not cost the notice entirely.
+ */
+export function ghHeadChecks(repo, sha, exec = run) {
+  if (typeof sha !== "string" || sha.length === 0) return null;
+  try {
+    const checkRuns = parseNdjson(
+      exec([
+        "gh", "api", `repos/${repo}/commits/${sha}/check-runs?per_page=100`,
+        "--paginate", "--jq", ".check_runs[] | {name, conclusion, completedAt: .completed_at}",
+      ]),
+    );
+    const statuses = parseNdjson(
+      exec([
+        "gh", "api", `repos/${repo}/commits/${sha}/statuses?per_page=100`,
+        "--paginate", "--jq", ".[] | {name: .context, conclusion: .state, completedAt: .updated_at}",
+      ]),
+    );
+    return [...checkRuns, ...statuses];
+  } catch (error) {
+    console.error(`could not read head checks for ${repo}@${sha}: ${error?.message ?? error}`);
+    return null;
+  }
+}
+
+/**
+ * The committer date of the PR's head commit -- when this head came into
+ * existence, which is what makes "enqueued 4 seconds after the head moved"
+ * measurable. Committer, not author: a rebased or cherry-picked commit keeps
+ * its original AUTHOR date, which would read as hours old and silently defeat
+ * the fresh-head window. `null` on any failure (see `ghHeadChecks`).
+ */
+function ghHeadCommittedAt(repo, sha) {
+  if (typeof sha !== "string" || sha.length === 0) return null;
+  try {
+    return run(["gh", "api", `repos/${repo}/commits/${sha}`, "--jq", ".commit.committer.date"]).trim() || null;
+  } catch (error) {
+    console.error(`could not read head commit date for ${repo}@${sha}: ${error?.message ?? error}`);
+    return null;
+  }
 }
 
 function ghMergeGroupRuns(repo, createdRange) {
@@ -379,6 +575,7 @@ export function buildEvictionCommentBody({
   base,
   identifiers,
   dequeueActor = null,
+  admissionEvidence = null,
 }) {
   // PEN-3926: `manual` is now reachable with ZERO runs (a dequeue that beat
   // the queue to staging), so its cause line can no longer assert that a run
@@ -399,7 +596,35 @@ export function buildEvictionCommentBody({
     : "**manual / administrative dequeue** -- a `merge_group` run was created for this PR's head and did not " +
       "fail, so this was likely a deliberate dequeue (see `runbooks/merge-queue-stalled-head.md`'s stalled-head " +
       "procedure) rather than an automatic eviction.";
+  // PEN-4887: names what was actually unmet -- the head's age when the queue
+  // admitted it, and the checks that had not finished reporting by the removal
+  // -- instead of asserting a rebase problem. Falls back to the shape of the
+  // claim without the numbers if a caller supplies the classification with no
+  // evidence, so this can never print `undefined` at a reader.
+  const unmetNames = (admissionEvidence?.incompleteAtDequeue ?? []).slice(0, 8);
+  const unmetOverflow = (admissionEvidence?.incompleteAtDequeue ?? []).length - unmetNames.length;
+  const headAge = Number.isFinite(admissionEvidence?.headAgeAtEnqueueMs)
+    ? `${Math.max(0, Math.round(admissionEvidence.headAgeAtEnqueueMs / 1000))}s`
+    : "seconds";
+  const requirementsUnmetCause =
+    "**merge requirements not met at admission** -- the queue admitted this PR and ejected it without staging " +
+    `a \`merge_group\` run. This PR's head was **${headAge} old** when it was enqueued` +
+    (admissionEvidence
+      ? `, and at the instant of removal ${admissionEvidence.completedByDequeue} of ` +
+        `${admissionEvidence.checkCount} check(s) on it had completed`
+      : "") +
+    ". Branch protection could not have been satisfied on a head whose checks had not finished reporting, so the " +
+    "queue refused it at admission. This is **not** an un-stageable rebase and rebasing will not help -- the " +
+    "branch is typically zero commits behind its base." +
+    (unmetNames.length > 0
+      ? ` Not complete at removal: ${unmetNames.map((name) => `\`${name}\``).join(", ")}` +
+        `${unmetOverflow > 0 ? ` (+${unmetOverflow} more)` : ""}.`
+      : "") +
+    " Landing a stacked child PR into this branch is the usual cause: it moves this head, and enqueuing seconds " +
+    "later enqueues a head on which nothing has run. Arm auto-merge instead -- GitHub enqueues only once the " +
+    "requirements are actually met.";
   const causeLine = {
+    requirements_unmet: requirementsUnmetCause,
     conflict_unstageable:
       "**conflict / un-stageable rebase** -- the queue never created a `merge_group` run for this PR's head " +
       "during this queue attempt (0 runs found), so no check failure exists to explain it. The branch could " +
@@ -425,10 +650,17 @@ export function buildEvictionCommentBody({
     // base". That instruction is what made the false notices harmful -- it is
     // an action against a clean branch under a deliberate hold, and both a
     // human reader and an automated lander can act on it.
+    // PEN-4887: `requirements_unmet` joins `manual` in getting its own closing
+    // line. The generic one leads with "rebase onto the current base", which is
+    // precisely the no-op this class was being mislabelled into.
     classification === "manual"
       ? "Re-add this PR to the merge queue once whoever dequeued it confirms the hold is over."
-      : "Re-add this PR to the merge queue once the underlying issue is resolved (rebase onto the current base " +
-        "for an un-stageable eviction; fix the failing check; or confirm with whoever dequeued it manually).",
+      : classification === "requirements_unmet"
+        ? "Wait for this head's required checks to complete, then re-add -- or arm auto-merge (`gh pr merge " +
+          "--auto --rebase`) and let GitHub enqueue it when the requirements are met. Do not rebase on the " +
+          "strength of this notice."
+        : "Re-add this PR to the merge queue once the underlying issue is resolved (rebase onto the current base " +
+          "for an un-stageable eviction; fix the failing check; or confirm with whoever dequeued it manually).",
     // Ally review #1220 (4th pass): embedded so the webhook's issue_comment
     // handler (which has no branch name to fall back on) can still route the
     // wake for a PR linked to Paperclip only through its branch.
@@ -530,11 +762,24 @@ async function main() {
   const truncated = allRuns.length >= RUN_LIST_LIMIT;
 
   const mergeGroupRuns = filterMergeGroupRunsForPr(allRuns, { base: pr.baseRefName, prNumber });
+  // PEN-4887: only gathered when there is a zero-run eviction to explain. The
+  // other classifications are decided by run outcome and cannot be changed by
+  // this evidence, so paying three API calls for them would be waste.
+  const admissionEvidence =
+    !pr.merged && mergeGroupRuns.length === 0
+      ? classifyAdmissionEvidence({
+          headChecks: ghHeadChecks(repo, pr.headRefOid),
+          headCommittedAt: ghHeadCommittedAt(repo, pr.headRefOid),
+          enqueuedAt: attemptWindow.enqueuedAt,
+          dequeuedAt: attemptWindow.dequeuedAt,
+        })
+      : null;
   const classification = classifyMergeQueueEviction({
     merged: pr.merged,
     mergeGroupRuns,
     truncated,
     dequeueActor: attemptWindow.dequeuedBy,
+    admissionEvidence,
   });
 
   const result = {
@@ -548,6 +793,7 @@ async function main() {
     attemptWindow,
     mergeGroupRunCount: mergeGroupRuns.length,
     mergeGroupRuns,
+    admissionEvidence,
   };
   console.log(JSON.stringify(result, null, 2));
 
@@ -561,6 +807,7 @@ async function main() {
       base: pr.baseRefName,
       identifiers,
       dequeueActor: attemptWindow.dequeuedBy,
+      admissionEvidence,
     });
     run(["gh", "pr", "comment", String(prNumber), "--repo", repo, "--body", body]);
   }

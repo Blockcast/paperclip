@@ -540,6 +540,34 @@ When creating a pull request (via `gh pr create` or any other method), you **mus
 
 The review gate also publishes a `ci/ally-head-attested` check-run on every PR. It is a schedule signal for heavy CI (`success` when an Ally comment attests this exact head and nothing blocks it, even where `gate/ally-comment-findings` is deliberately `neutral`), not review evidence and not a finding when `neutral`. Never add it to required contexts.
 
+### Never enqueue a PR whose head has just moved (PEN-4887)
+
+Landing a **stacked child** PR replaces its parent's head with the merge commit. Every check on the
+parent then starts from zero, and `ci/ally-head-attested` is voided — the thing PEN-4877's own
+monitor note warned about, which landing the child does automatically.
+
+So after merging a stacked child, **do not run `gh pr merge <parent>` to enqueue the parent.** Arm
+auto-merge instead and let GitHub enqueue it when the requirements are actually met:
+
+```sh
+gh pr merge <parent> --repo Blockcast/paperclip --auto --rebase
+```
+
+A fixed delay is not a substitute: `policy` gates the heavy matrix, so the ready-time is minutes and
+variable. Measured on #3060 (2026-10-28) — head moved 07:46:13Z, enqueued 07:46:17Z (+4s), ejected by
+the queue 07:46:27Z (+10s), while `ci/ally-head-attested` did not succeed until 07:48:37Z and the
+matrix only spawned at ~07:49:40Z. The ejection costs a queue slot and emits an eviction notice that
+used to read *"conflict / un-stageable rebase"* against a branch **0 commits behind its base**, which
+then woke an agent to perform a no-op rebase. The classifier now reports that shape as
+`requirements_unmet` instead (`scripts/merge-queue-eviction-detector.mjs`), but the enqueue is still
+wasted — do not make it.
+
+The same rule holds for any other way a head moves: a push, a branch update, a `--admin` merge
+upstream. `scripts/land-clean-prs.mjs` enforces it mechanically (it re-reads the head SHA immediately
+before enqueuing and refuses when it moved), because its classification snapshot is taken once per
+fire. Manual enqueues have no such guard.
+
+
 ## 12. Definition of Done
 
 A change is done when all are true:

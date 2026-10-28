@@ -246,6 +246,20 @@ the eviction:
 - **zero `merge_group` runs found inside that attempt's window, and the
   removal is attributed to `github-merge-queue[bot]` → `conflict_unstageable`**
   (this shape),
+- **zero runs, queue-bot removal, but the head was admitted within 2 minutes of
+  appearing and its checks had not finished reporting → `requirements_unmet`**
+  (PEN-4887). The queue *admitted* the entry and ejected it because the PR did
+  not meet its merge requirements, which also stages no run. Deterministic after
+  a **stacked child PR lands into its parent's branch**: the parent's head
+  becomes the merge commit and gets enqueued seconds later, before anything has
+  run on it. Measured on #3060 (2026-10-28) — head moved 07:46:13Z, enqueued
+  07:46:17Z, ejected 07:46:27Z, `ci/ally-head-attested` not `success` until
+  07:48:37Z. This notice does **not** tell you to rebase, and you should not:
+  #3060's merge base *was* `master`'s head (0 commits behind) throughout. The
+  remedy is to wait for the head's checks and re-add, or arm auto-merge
+  (`gh pr merge --auto --rebase`) and let GitHub enqueue it when the
+  requirements are met. See `AGENTS.md` § *Never enqueue a PR whose head has
+  just moved*,
 - **zero runs, but the removal carries any other actor → `manual`** (PEN-3926).
   A human or App can remove a PR from the queue *before* the queue gets as far
   as staging a run, which produces zero runs for a reason that has nothing to
@@ -267,6 +281,35 @@ the eviction:
   (an incomplete sample isn't proof of zero — don't guess conflict on a
   truncated result; this is a deliberately conservative bailout, distinct
   from the three real causes above).
+
+#### Why `requirements_unmet` does not read `mergeable` (PEN-4887)
+
+It cannot: on a `REBASE` queue a genuinely un-stageable PR reads `CLEAN`
+throughout (see *"A fourth eviction cause"* below, BLO-19566/#920), so a
+`mergeable`-based split would be wrong in both directions. The discriminator is
+two questions about **time**, neither of which asks whether the tree merges:
+how long before the enqueue did this head commit appear, and had its checks
+finished reporting by the instant of removal. A PR enqueued because its checks
+went green necessarily waited minutes for them first, so the fresh-head window
+separates the two cleanly.
+
+Two measured details worth keeping if this is ever re-derived:
+
+- **"zero completed checks" is not the test.** On #3060's head, four commit
+  *statuses* (`gate/ally-comment-findings`, `review/ally-comment`) had already
+  succeeded before the 07:46:27Z removal while every *check run* was still
+  unstarted. A universal "nothing completed" predicate is false on the very
+  case it is meant to catch; the guard is existential ("something had not
+  finished") and the fresh-head window carries the verdict.
+- **Completion is judged at the dequeue instant, not at read time.** The
+  detector runs minutes later, by which point the head's checks have usually
+  finished. `completedAt <= dequeuedAt` keeps the verdict anchored to what was
+  knowable when the queue ruled.
+
+Both head-check surfaces are read SHA-pinned (`/check-runs` *and* `/statuses`);
+a failed read yields `null`, not `[]`, so a transient API error falls back to
+the pre-PEN-4887 `conflict_unstageable` verdict rather than classifying from
+absence.
 
 Bounding the lookup to the specific attempt's time window (rather than an
 unbounded newest-N sample across the whole repo's history) is what makes the

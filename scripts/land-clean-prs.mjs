@@ -714,8 +714,53 @@ function commentOnce(repo, number, marker, body, run = gh) {
  * noise ever matters, skip rows whose base is unprotected — one
  * `gh api repos/{repo}/branches/{base}` per distinct base, not per PR.
  */
+/**
+ * The head SHA this PR carries RIGHT NOW, read at apply time.
+ *
+ * PEN-4887: `fetchOpenPrs` snapshots every open PR once per fire, and a head
+ * can move between that snapshot and the enqueue. The case that made this
+ * expensive is not a rare race — it is the deterministic consequence of
+ * landing a STACKED child PR: merging the child into the parent's branch
+ * replaces the parent's head with the merge commit, on which nothing has run
+ * yet. Measured on Blockcast/paperclip#3060 (2026-10-28): head moved at
+ * 07:46:13Z, enqueued at 07:46:17Z, ejected by the queue at 07:46:27Z, while
+ * `ci/ally-head-attested` did not succeed until 07:48:37Z — 2m10s after the
+ * removal, with `policy` gating the heavy matrix behind it for ~6 minutes more.
+ *
+ * Every gate in `classifyPr` — the settle floor, `checks:none`, the Ally
+ * verdict at head, the owner set — was evaluated against the OLD head and says
+ * nothing about the new one. Re-reading the SHA is what makes those verdicts
+ * mean what the receipt claims they mean.
+ *
+ * `--auto` is not a substitute. On a queue-enabled base GitHub enqueues
+ * immediately whenever it believes the requirements are met, and right after a
+ * head moves that belief is briefly stale: #3060 carries an
+ * `added_to_merge_queue` event with no `auto_merge_enabled` beside it.
+ */
+export function liveHeadSha(repo, number, run = gh) {
+  const raw = JSON.parse(
+    run(["pr", "view", String(number), "--repo", repo, "--json", "headRefOid"]),
+  )?.headRefOid;
+  return typeof raw === "string" && raw.length > 0 ? raw : null;
+}
+
+const short = (sha) => (typeof sha === "string" ? sha.slice(0, 7) : String(sha));
+
 export function applyRow(repo, row, run = gh) {
   if (row.action === "enqueue") {
+    // PEN-4887: fail CLOSED on anything but a proven-unchanged head. An
+    // unreadable or absent SHA is not permission to enqueue — it means we
+    // cannot show the classification still applies, and the row simply
+    // re-classifies on the next fire. The throw is caught by `runRepo` and
+    // recorded as `enqueue-failed`, which is both visible in the receipt and
+    // correctly excluded from the per-fire cap: no queue slot was spent.
+    const live = liveHeadSha(repo, row.number, run);
+    if (!row.headSha || !live || live !== row.headSha) {
+      throw new Error(
+        `head moved since classification (${short(row.headSha)} -> ${short(live)}); not enqueued — ` +
+          "every check and review verdict in this row describes the previous head",
+      );
+    }
     run(["pr", "merge", String(row.number), "--repo", repo, "--auto", "--rebase"]);
     // Deliberately not "armed": this call queues, arms, or merges outright
     // depending on the base, and the receipt must not name the one it guessed.

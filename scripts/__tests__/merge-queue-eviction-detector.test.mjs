@@ -6,6 +6,8 @@ import {
   MERGE_QUEUE_EVICTION_MARKER,
   buildEvictionCommentBody,
   buildRunSearchWindow,
+  classifyAdmissionEvidence,
+  ghHeadChecks,
   classifyMergeQueueEviction,
   extractPaperclipIdentifiers,
   filterMergeGroupRunsForPr,
@@ -657,5 +659,397 @@ test("PEN-3926: main() threads the window's actor into both the classifier and t
       `\`buildEvictionCommentBody\` (which names the remover) -- found ${handoffs.length}. ` +
       "Dropping either one silently restores the pre-PEN-3926 rebase instruction, because the " +
       "classifier's missing-actor fail-open is indistinguishable from a genuine queue eviction.",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// PEN-4887: the queue ADMITTED the entry and ejected it for unmet merge
+// requirements -- a third cause of zero `merge_group` runs, previously
+// reported as `conflict_unstageable` ("rebase onto the current base") against
+// a branch that was zero commits behind its base.
+//
+// Every fixture below is the measured shape of Blockcast/paperclip#3060 on
+// 2026-10-28: stacked child #3061 merged into #3060's branch at 07:46:13Z,
+// making that merge commit #3060's new head; #3060 was enqueued at 07:46:17Z
+// (+4s) and ejected by `github-merge-queue[bot]` at 07:46:27Z (+10s), while
+// `ci/ally-head-attested` did not succeed until 07:48:37Z.
+// ---------------------------------------------------------------------------
+
+const PEN4887_HEAD_COMMITTED_AT = "2026-10-28T07:46:13Z";
+const PEN4887_ENQUEUED_AT = "2026-10-28T07:46:17Z";
+const PEN4887_DEQUEUED_AT = "2026-10-28T07:46:27Z";
+
+/**
+ * #3060's head as the check surfaces actually reported it. The four commit
+ * STATUSES had already succeeded before the removal; every check run was
+ * either unstarted at the removal or completed minutes after it. This mix is
+ * the point -- see the "zero completed" test below.
+ */
+const PEN4887_HEAD_CHECKS = [
+  { name: "gate/ally-comment-findings", conclusion: "success", completedAt: "2026-10-28T07:46:19Z" },
+  { name: "review/ally-comment", conclusion: "success", completedAt: "2026-10-28T07:46:21Z" },
+  { name: "gate/ally-comment-findings", conclusion: "success", completedAt: "2026-10-28T07:46:23Z" },
+  { name: "review/ally-comment", conclusion: "success", completedAt: "2026-10-28T07:46:24Z" },
+  { name: "ci/ally-head-attested", conclusion: "success", completedAt: "2026-10-28T07:48:37Z" },
+  { name: "policy", conclusion: null, completedAt: null },
+  { name: "Build", conclusion: null, completedAt: null },
+  { name: "Typecheck + Release Registry", conclusion: null, completedAt: null },
+];
+
+const admissionRejection = (overrides = {}) =>
+  classifyAdmissionEvidence({
+    headChecks: PEN4887_HEAD_CHECKS,
+    headCommittedAt: PEN4887_HEAD_COMMITTED_AT,
+    enqueuedAt: PEN4887_ENQUEUED_AT,
+    dequeuedAt: PEN4887_DEQUEUED_AT,
+    ...overrides,
+  });
+
+test("PEN-4887: the #3060 admission-rejection shape classifies requirements_unmet, not a rebase problem", () => {
+  const classification = classifyMergeQueueEviction({
+    merged: false,
+    mergeGroupRuns: [],
+    dequeueActor: "github-merge-queue[bot]",
+    admissionEvidence: admissionRejection(),
+  });
+
+  assert.equal(
+    classification,
+    "requirements_unmet",
+    "a PR enqueued 4s after its head moved, ejected 10s later with its checks still reporting, is not an " +
+      "un-stageable rebase -- #3060's merge base WAS `master`'s head throughout (0 commits behind).",
+  );
+});
+
+test("PEN-4887 (the other side): a genuine un-stageable eviction still classifies conflict_unstageable", () => {
+  // The BLO-23395 shape, which must not become quieter: a settled head whose
+  // checks all finished long before the enqueue, evicted by the queue with no
+  // `merge_group` run because it could not be replayed onto a moved base.
+  //
+  // The fixture deliberately CARRIES an incomplete check (`Canary Dry Run`
+  // never concluded), so the only thing separating it from the #3060 shape is
+  // the head's age at admission. A control whose checks had all completed
+  // would pass for the wrong reason, and would score a `rejected` that ignored
+  // the fresh-head window as correct.
+  const settledChecks = [
+    { name: "Build", conclusion: "success", completedAt: "2026-10-28T06:00:00Z" },
+    { name: "ci/ally-head-attested", conclusion: "success", completedAt: "2026-10-28T06:01:00Z" },
+    { name: "Canary Dry Run", conclusion: null, completedAt: null },
+  ];
+  const settled = classifyAdmissionEvidence({
+    headChecks: settledChecks,
+    headCommittedAt: "2026-10-28T05:40:00Z",
+    enqueuedAt: "2026-10-28T06:30:00Z",
+    dequeuedAt: "2026-10-28T06:30:12Z",
+  });
+
+  assert.ok(settled.incompleteAtDequeue.length > 0, "the control must carry an incomplete check, or it proves nothing");
+  assert.equal(settled.rejected, false, "a head enqueued 50 minutes after it appeared is not a fresh-head admission");
+
+  // Vary ONLY the head date: the same checks on a head that appeared 4s before
+  // the enqueue DO read as an admission rejection. That difference is the
+  // whole discriminator.
+  const fresh = classifyAdmissionEvidence({
+    headChecks: settledChecks,
+    headCommittedAt: "2026-10-28T06:29:56Z",
+    enqueuedAt: "2026-10-28T06:30:00Z",
+    dequeuedAt: "2026-10-28T06:30:12Z",
+  });
+  assert.equal(fresh.rejected, true, "head age at admission is the signal; nothing else changed between these two");
+  assert.equal(
+    classifyMergeQueueEviction({
+      merged: false,
+      mergeGroupRuns: [],
+      dequeueActor: "github-merge-queue[bot]",
+      admissionEvidence: settled,
+    }),
+    "conflict_unstageable",
+  );
+});
+
+test("PEN-4887: 'zero completed checks' alone is NOT the discriminator -- #3060 had four completions before removal", () => {
+  // Guards the measured correction that shaped this fix. Four commit statuses
+  // succeeded between the enqueue and the removal, so a predicate of the form
+  // "nothing had completed" is FALSE on the very case it was meant to catch.
+  const evidence = admissionRejection();
+
+  assert.equal(evidence.completedByDequeue, 4, "four statuses succeeded at or before 07:46:27Z");
+  assert.ok(
+    evidence.rejected,
+    "the verdict must survive those completions -- it rests on the fresh-head window plus the existential " +
+      "'something had not finished', never on a universal 'nothing completed'.",
+  );
+});
+
+test("PEN-4887: completion is judged at the dequeue instant, not at read time", () => {
+  // This script runs minutes after the eviction, by which point the head's
+  // checks have usually finished. A check that completed AFTER the removal was
+  // still incomplete when the queue ruled.
+  const evidence = admissionRejection();
+
+  assert.ok(
+    evidence.incompleteAtDequeue.includes("ci/ally-head-attested"),
+    "`ci/ally-head-attested` succeeded at 07:48:37Z, 2m10s AFTER the 07:46:27Z removal -- reading it as " +
+      "complete would date the verdict to when the detector happened to run.",
+  );
+});
+
+test("PEN-4887: a `pending` commit status does not count as a completion", () => {
+  // A commit status is reported in one shot, so `pending` carries an
+  // `updated_at` like any other state. Counting it would weaken the guard in
+  // the fail-open direction.
+  const evidence = classifyAdmissionEvidence({
+    headChecks: [{ name: "policy", conclusion: "pending", completedAt: "2026-10-28T07:46:20Z" }],
+    headCommittedAt: PEN4887_HEAD_COMMITTED_AT,
+    enqueuedAt: PEN4887_ENQUEUED_AT,
+    dequeuedAt: PEN4887_DEQUEUED_AT,
+  });
+
+  assert.equal(evidence.completedByDequeue, 0);
+  assert.deepEqual(evidence.incompleteAtDequeue, ["policy"]);
+});
+
+test("PEN-4887: unusable evidence falls back to the pre-PEN-4887 verdict, never to the new class", () => {
+  // Same fail-toward-status-quo discipline as PEN-3926: this may never make a
+  // genuine eviction quieter.
+  const unusable = [
+    { label: "no check list at all", input: { headChecks: null } },
+    { label: "non-array check list", input: { headChecks: "nope" } },
+    { label: "unparseable head commit date", input: { headCommittedAt: "not-a-date" } },
+    { label: "unparseable enqueue", input: { enqueuedAt: "not-a-date" } },
+    { label: "unparseable dequeue", input: { dequeuedAt: "not-a-date" } },
+    { label: "head newer than its own enqueue (a later push)", input: { headCommittedAt: "2026-10-28T07:50:00Z" } },
+  ];
+
+  for (const { label, input } of unusable) {
+    assert.equal(admissionRejection(input), null, `${label} must yield no evidence, not a guess`);
+    assert.equal(
+      classifyMergeQueueEviction({
+        merged: false,
+        mergeGroupRuns: [],
+        dequeueActor: "github-merge-queue[bot]",
+        admissionEvidence: admissionRejection(input),
+      }),
+      "conflict_unstageable",
+      `${label} must keep the pre-PEN-4887 verdict`,
+    );
+  }
+
+  // And the default -- a caller that does not thread the evidence at all.
+  assert.equal(
+    classifyMergeQueueEviction({ merged: false, mergeGroupRuns: [], dequeueActor: "github-merge-queue[bot]" }),
+    "conflict_unstageable",
+  );
+});
+
+test("PEN-4887: admission evidence never overrides a human dequeue, a failing check, or a merge", () => {
+  const evidence = admissionRejection();
+
+  assert.equal(
+    classifyMergeQueueEviction({ merged: false, mergeGroupRuns: [], dequeueActor: "kkroo", admissionEvidence: evidence }),
+    "manual",
+    "PEN-3926's manual split is decided first: a person took it out, whatever the head's age",
+  );
+  assert.equal(
+    classifyMergeQueueEviction({
+      merged: false,
+      mergeGroupRuns: [{ conclusion: "failure" }],
+      dequeueActor: "github-merge-queue[bot]",
+      admissionEvidence: evidence,
+    }),
+    "check_failure",
+    "a staged run that failed explains the eviction on its own",
+  );
+  assert.equal(
+    classifyMergeQueueEviction({ merged: true, mergeGroupRuns: [], admissionEvidence: evidence }),
+    "merged",
+  );
+  assert.equal(
+    classifyMergeQueueEviction({
+      merged: false,
+      mergeGroupRuns: [],
+      truncated: true,
+      dequeueActor: "github-merge-queue[bot]",
+      admissionEvidence: evidence,
+    }),
+    "unknown",
+    "an incomplete sample is still not proof of absence",
+  );
+});
+
+test("PEN-4887: the requirements_unmet notice never prescribes a rebase, and names what was unmet", () => {
+  const body = buildEvictionCommentBody({
+    repo: "Blockcast/paperclip",
+    prNumber: 3060,
+    classification: "requirements_unmet",
+    mergeGroupRunCount: 0,
+    base: "master",
+    identifiers: ["PEN-4877"],
+    dequeueActor: "github-merge-queue[bot]",
+    admissionEvidence: admissionRejection(),
+  });
+
+  assert.ok(
+    !/rebase onto the current base/i.test(body),
+    "this instruction is the whole harm: it sends the reader to rebase a branch that is 0 commits behind " +
+      `its base, and an automated lander can act on it too. Body was:\n${body}`,
+  );
+  assert.ok(!/un-stageable rebase\*\*/.test(body), "must not claim the un-stageable-rebase cause");
+  assert.match(body, /merge requirements not met at admission/);
+  assert.match(body, /4s old/, "names how old the head was when the queue admitted it");
+  assert.match(body, /`ci\/ally-head-attested`/, "names a check that had not completed at the removal");
+  assert.match(body, /auto-merge/, "points at the primitive that enqueues only once requirements are met");
+  assert.ok(body.startsWith(MERGE_QUEUE_EVICTION_MARKER), "still routable by the webhook");
+  assert.match(body, /PEN-4877/, "still carries the linked issue for the wake");
+});
+
+test("PEN-4887: the conflict_unstageable notice is unchanged and still says to rebase", () => {
+  // The other side of the notice change: the genuine cause must keep its
+  // remedy. A one-sided assertion ("never says rebase") would score a
+  // classifier that returned the new class unconditionally as correct.
+  const body = buildEvictionCommentBody({
+    repo: "Blockcast/paperclip",
+    prNumber: 1092,
+    classification: "conflict_unstageable",
+    mergeGroupRunCount: 0,
+    base: "master",
+    identifiers: [],
+    dequeueActor: "github-merge-queue[bot]",
+  });
+
+  assert.match(body, /conflict \/ un-stageable rebase/);
+  assert.match(body, /rebase onto the current base/);
+});
+
+test("PEN-4887: a requirements_unmet notice built with no evidence still reads as prose, never `undefined`", () => {
+  // `buildEvictionCommentBody` is exported independently of the classifier, so
+  // a caller can reach this branch without evidence. Printing `undefineds` at
+  // a reader is worse than printing the claim without its numbers.
+  const body = buildEvictionCommentBody({
+    repo: "Blockcast/paperclip",
+    prNumber: 3060,
+    classification: "requirements_unmet",
+    mergeGroupRunCount: 0,
+    base: "master",
+    identifiers: [],
+  });
+
+  assert.ok(!/undefined|NaN/.test(body), `body must not leak placeholders:\n${body}`);
+  assert.match(body, /merge requirements not met at admission/);
+  assert.ok(!/rebase onto the current base/i.test(body));
+});
+
+test("PEN-4887: main() threads the admission evidence into both the classifier and the notice", () => {
+  // Same guard shape as the PEN-3926 handoff test above: the rest of this
+  // suite passes the evidence to the classifier directly, so a main() that
+  // computed it and forgot to hand it over would leave every assertion green
+  // while every live notice kept saying "rebase onto the current base".
+  const source = readFileSync(DETECTOR_SOURCE_PATH, "utf8");
+  const handoffs = source.match(/^\s*admissionEvidence,$/gm) ?? [];
+
+  assert.equal(
+    handoffs.length,
+    3,
+    "expected `admissionEvidence` shorthand at exactly three sites -- `classifyMergeQueueEviction`, " +
+      `\`buildEvictionCommentBody\`, and the printed result -- found ${handoffs.length}.`,
+  );
+  assert.match(
+    source,
+    /headCommittedAt:\s*ghHeadCommittedAt\(repo,\s*pr\.headRefOid\)/,
+    "the head date must be read SHA-pinned from the PR's own head, not inferred",
+  );
+});
+
+test("PEN-4887: the head date is read from the COMMITTER date, not the author date", () => {
+  // A rebased or cherry-picked commit keeps its original author date, which
+  // would read as hours old and silently disable the fresh-head window --
+  // restoring the mislabelling with this whole suite green.
+  const source = readFileSync(DETECTOR_SOURCE_PATH, "utf8");
+
+  assert.match(source, /\.commit\.committer\.date/);
+  assert.ok(
+    !/\.commit\.author\.date/.test(source),
+    "the author date is attacker- and rebase-controlled relative to when this head actually appeared",
+  );
+});
+
+test("PEN-4887: ghHeadChecks returns BOTH surfaces -- check runs and commit statuses", () => {
+  // Reading only /check-runs would report "nothing completed" for a head whose
+  // status contexts had reported, which is the fail-open direction for the
+  // incompleteness guard. #3060's four pre-removal completions were ALL
+  // statuses, so this union is the difference between the guard working and
+  // the guard being vacuous.
+  //
+  // Asserted behaviourally, through the `exec` seam, rather than by grepping
+  // the source for the two URLs: a fetch whose result is dropped on the floor
+  // still matches a grep.
+  const calls = [];
+  const exec = (args) => {
+    calls.push(args.join(" "));
+    if (args.some((arg) => String(arg).includes("/check-runs"))) {
+      return '{"name":"Build","conclusion":null,"completedAt":null}\n';
+    }
+    return '{"name":"ci/ally-head-attested","conclusion":"success","completedAt":"2026-10-28T07:48:37Z"}\n';
+  };
+
+  const checks = ghHeadChecks("Blockcast/paperclip", "87a87dc0", exec);
+
+  assert.deepEqual(
+    checks.map((check) => check.name).sort(),
+    ["Build", "ci/ally-head-attested"],
+    `expected one entry from each surface; calls were:\n${calls.join("\n")}`,
+  );
+  assert.equal(calls.length, 2, "both surfaces must actually be read");
+});
+
+test("PEN-4887: ghHeadChecks returns null -- not [] -- when a surface cannot be read", () => {
+  // `[]` is positive evidence ("this head carries no checks") and would let a
+  // transient API error classify; `null` means "no evidence" and falls back to
+  // the pre-PEN-4887 verdict.
+  const thrower = () => {
+    throw new Error("gh: API rate limit exceeded");
+  };
+
+  assert.equal(ghHeadChecks("Blockcast/paperclip", "87a87dc0", thrower), null);
+  assert.equal(ghHeadChecks("Blockcast/paperclip", "", thrower), null, "an absent head SHA is not evidence either");
+  assert.equal(
+    classifyAdmissionEvidence({
+      headChecks: ghHeadChecks("Blockcast/paperclip", "87a87dc0", thrower),
+      headCommittedAt: PEN4887_HEAD_COMMITTED_AT,
+      enqueuedAt: PEN4887_ENQUEUED_AT,
+      dequeuedAt: PEN4887_DEQUEUED_AT,
+    }),
+    null,
+  );
+});
+
+test("PEN-4887: a fresh head whose checks HAD all completed is not reported as requirements-unmet", () => {
+  // The incompleteness guard, which the fresh-head window alone does not
+  // supply. The notice for this class asserts that nothing had finished
+  // attesting the head; if everything demonstrably had, that sentence is
+  // false and the eviction needs the other explanation. Contrived (a 4s-old
+  // head with a fully reported check suite does not occur in practice) and
+  // kept anyway, because the alternative is a verdict that cannot be wrong --
+  // which is a verdict that is not being checked.
+  const evidence = classifyAdmissionEvidence({
+    headChecks: [
+      { name: "Build", conclusion: "success", completedAt: "2026-10-28T07:46:20Z" },
+      { name: "ci/ally-head-attested", conclusion: "success", completedAt: "2026-10-28T07:46:21Z" },
+    ],
+    headCommittedAt: PEN4887_HEAD_COMMITTED_AT,
+    enqueuedAt: PEN4887_ENQUEUED_AT,
+    dequeuedAt: PEN4887_DEQUEUED_AT,
+  });
+
+  assert.deepEqual(evidence.incompleteAtDequeue, []);
+  assert.equal(evidence.rejected, false, "every check on this head had reported before the removal");
+  assert.equal(
+    classifyMergeQueueEviction({
+      merged: false,
+      mergeGroupRuns: [],
+      dequeueActor: "github-merge-queue[bot]",
+      admissionEvidence: evidence,
+    }),
+    "conflict_unstageable",
   );
 });
