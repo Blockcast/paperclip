@@ -72,6 +72,25 @@ These are independent of blast radius and justify removal on their own merits.
 | `bin/make` → `bin/busybox`, which is a 554-byte shell script printing `make shim supports only target: route` | Shadows real GNU `make` at `/usr/bin/make` on a PATH that puts `/paperclip/bin` first | *new here* |
 | `bin/swift`, `bin/swiftc` | 149-byte shims execing `/paperclip/.swift/swift-6.1.2/usr/bin/swift`, **which does not exist**. Dead since Jul 2026. | *new here* |
 
+### 3.4 Every Python entry-point shim in `.local/bin` is already dead
+
+`.local/bin` is mounted, but the `site-packages` tree those shims import from is **not** — only
+`.local/lib/paperclip-k8s-runtimes/...` is a mount, so `/paperclip/.local/lib` inside an agent pod
+contains that one directory and no `python3*` tree at all. Every shim therefore fails closed:
+
+```
+$ /paperclip/.local/bin/pytest --version     # rc=1
+  File "/paperclip/.local/bin/pytest", line 5, in <module>
+    from _pytest.config import _console_main
+ModuleNotFoundError: No module named '_pytest'
+```
+
+Reproduced identically (`rc=1`, `ModuleNotFoundError`) for `yamllint`, `jsonschema`, `cmake`,
+`scapy`, `pdfplumber`, `openapi-spec-validator`, `dotenv` and `pygmentize`. These have never worked
+through this mount. They are `DROP`, not `DECIDE` — baking them would be installing new tools under
+cover of a migration, which is a separate decision with a separate justification. `wasm-pack` is the
+only `.local/bin` entry that does run (0.13.1).
+
 PEN-4682 had to win the `google-chrome` name by PATH order precisely because *nothing inside a Job
 can repair the PVC copy* — `bin` is mounted read-only. Removing the mount removes the need for that
 workaround rather than adding another.
@@ -86,7 +105,8 @@ workaround rather than adding another.
 | `yq` (v4.44.3), `bun`/`bunx` (1.3.14) | **BAKE** | Done in this change |
 | `swift`, `swiftc`, `busybox`/`make`-shim | **DROP** | Broken or harmful (§3.2); nothing to bake |
 | `kyverno` (258 MB), `trivy` (168 MB), `promtool` (142 MB), `alertmanager` (37 MB), `amtool` (31 MB) | **DECIDE** | ~640 MB on every agent image. Needs an explicit size/usage call — see §5 |
-| `cmake`/`ccmake`/`cpack`/`ctest`, `wasm-pack`, `scapy`, `yamllint`, `pytest`/`py.test`, `pdfplumber`, `pdf2txt.py`, `dumppdf.py`, `pypdfium2`, `jsonschema`, `openapi-spec-validator`, `dotenv`, `idna`, `normalizer`, `pygmentize` | **DECIDE** | Mostly Python entry-point shims whose `site-packages` tree is *not* itself in `ROOT_TOOLCHAIN_SUBPATHS`; several are likely already broken in the same way `swift` is. Verify before baking — do not bake a shim whose target was never reachable |
+| `cmake`/`ccmake`/`cpack`/`ctest`, `scapy`, `yamllint`, `pytest`/`py.test`, `pdfplumber`, `pdf2txt.py`, `dumppdf.py`, `pypdfium2`, `jsonschema`, `openapi-spec-validator`, `dotenv`, `idna`, `normalizer`, `pygmentize` | **DROP** | Structurally dead — see §3.4. Do not bake; if any is genuinely wanted it is a fresh install decision, not a migration |
+| `wasm-pack` (0.13.1) | **DECIDE** | The one `.local/bin` entry that does run. 7 MB, so cheap to bake if wanted |
 | `.local/share/paperclip-git-hooks/pre-push` | **RELOCATE** | Server-written state, not tooling. Needs a non-PVC delivery (ConfigMap or image + `core.hooksPath`), not a bake |
 | `tools/kexec.py`, `tools/openapi-generator-cli.jar`, the three tarballs | **DROP** | Ad hoc; no caller identified |
 
@@ -120,8 +140,8 @@ not satisfy it.
 
 - **The ~640 MB set** (`kyverno`, `trivy`, `promtool`, `alertmanager`, `amtool`). Bake all, bake
   some, or move to on-demand install? Every agent image pays for whatever is baked.
-- **Python-shim rows.** Confirm whether any currently resolve; those that do not should be dropped
-  like `swift` rather than reconstructed.
+- **`wasm-pack`.** The one working `.local/bin` entry (7 MB). Bake, or drop with the rest?
+  (The Python shims no longer need a call — §3.4 settles them as `DROP`.)
 - **Company-scoped sharing.** `/work/<companyId>`, `/wt/<companyId>`, the pnpm store and
   `skills/<companyId>` are namespaced by path but *are* read by every agent of the same company.
   Per-agent volumes duplicate them. That is believed acceptable (and retires the BLO-19422 shared
