@@ -314,12 +314,44 @@ Three things a reader should not infer from that paragraph:
    - **Confining `cwd` does not confine file arguments.** `gh` takes absolute
      paths (`--body-file`, `gh api --input`, `-F field=@file`) and an absolute
      path does not care about the working directory. Admission now refuses any
-     argument that *resolves* to an existing path outside the workspace or the
-     shared `/tmp`, compared after `realpath` so a symlink planted in `/tmp`
-     is caught. Leaving this to the content scrubber would have been the §8
-     error: the scrubber is a mistake guard, not a boundary.
+     argument that *resolves* to an existing path outside the workspace or
+     the shared `/tmp`, compared after `realpath` so a symlink **already
+     planted** in `/tmp` when the request arrives is caught; one planted
+     after admission is the check-then-use residual below. Leaving this to
+     the content scrubber would have been the §8 error: the scrubber is a
+     mistake guard, not a boundary.
 
    Carried forward as residual, not claimed closed:
+
+   - That rule is **check-then-use**, and the window is real. Admission
+     resolves each candidate with `realpath`; `gh` re-resolves every path
+     when it OPENS it, and the agent owns the shared `/tmp` in between. Two
+     ways through: a candidate that names nothing at admission is admitted
+     and can be created as a symlink to the credential before the child
+     starts, and an admitted regular file can be swapped for one. Either way
+     the brokered tool reads the token inside the broker's mount namespace
+     and publishes it, which is the boundary this whole document is about.
+     The standard closure — snapshot each admitted file into
+     `BROKER_PRIVATE_DIR`, open it `O_NOFOLLOW`, `fstat` it, and rewrite the
+     argv token to the copy — is **not available here**, and the obstacle is
+     structural rather than effort: the candidate set is *every token*,
+     because `gh` is allowlist-by-exception (only `auth`, `alias`,
+     `extension` and `extensions` are refused) and its file-bearing flags
+     cannot be enumerated without a table that fails OPEN on the next `gh`
+     release. An over-broad candidate set is safe to REFUSE on and unsafe to
+     SUBSTITUTE on: rewriting every token that happens to name an existing
+     file would corrupt arguments that were never paths, `--title README.md`
+     being the cheap example. What would actually close it is giving the
+     child a different filesystem view from the broker — a mount namespace
+     per invocation, or a uid split between broker and child — and §8
+     reserves both to Security, because each needs a capability the broker
+     does not have today. **This is strictly narrower than §7.1 and strictly
+     weaker than a closed door**: it costs the attacker a race against a
+     process they cannot observe, where §7.1 simply handed them the token.
+     Two characterization tests in `github-publish-broker-policy.test.ts`
+     pin the gap, so that it stays visible to the next reader and so that
+     closing it reds a test rather than passing silently. Raised by review
+     on #3080, carried deliberately; review it on the same date.
 
    - That rule is a **read** confinement. An argument naming a path outside
      the roots that does not yet exist is admitted, because refusing on the

@@ -440,9 +440,10 @@ export interface FilePathConfinement {
  * The rule is positional, not lexical: a candidate is refused when it RESOLVES
  * to something that EXISTS outside every allowed root.
  *
- *  - Existing and outside → refused. That is the whole hazard class, and it
- *    catches a symlink planted in the shared `/tmp` because the comparison is
- *    made after `realpath`.
+ *  - Existing and outside → refused. That is the whole hazard class for a
+ *    symlink that is ALREADY planted in the shared `/tmp` when the request
+ *    arrives, because the comparison is made after `realpath`. For one planted
+ *    after it, see the check-then-use note below.
  *  - Non-existent → admitted. There is nothing to read, and this is what keeps
  *    `gh api /repos/o/r/pulls` working: an API path is absolute and is not a
  *    file. Refusing on the nearest existing ANCESTOR instead would refuse
@@ -457,6 +458,24 @@ export interface FilePathConfinement {
  * ⚠ This is a read confinement. A write to a path outside the roots is not
  * refused here; it is refused by the broker running non-root against an image
  * it does not own. Recorded in §7.3 rather than claimed as closed.
+ *
+ * ⚠ It is also a CHECK-THEN-USE rule, and the gap is not closable in this
+ * function. Admission resolves a candidate here; `gh` re-resolves every path
+ * when it opens it, and the agent owns the shared `/tmp` in between. So an
+ * admitted regular file can be swapped for a symlink to the credential after
+ * this returns, and a candidate that named nothing on disk can be created as
+ * one. The standard closure — snapshot each admitted file into the broker's
+ * private directory, open it `O_NOFOLLOW`, rewrite argv to the copy — is NOT
+ * available here, and the obstacle is structural rather than effort: the
+ * candidate set above is deliberately every token, because the `gh` surface is
+ * allowlist-by-exception and its file-bearing flags cannot be enumerated
+ * without a table that fails open on the next release. An over-broad candidate
+ * set is safe to REFUSE on and unsafe to SUBSTITUTE on — rewriting every token
+ * that happens to name an existing file would corrupt arguments that were never
+ * paths (`--title README.md`). Closing it needs the child to have a different
+ * filesystem view, which §8 of the decision document reserves to Security.
+ * Carried in §7.3 beside the write confinement, and pinned by two
+ * characterization tests so that closing it reds a test.
  */
 export function admitCallerFilePaths(argv: readonly string[], confinement: FilePathConfinement): void {
   const roots = confinement.allowedRoots.map((root) => {

@@ -290,6 +290,67 @@ describe("file-argument confinement", () => {
   });
 });
 
+describe("file-argument confinement is check-then-use (residual, decision doc §7.3)", () => {
+  // Admission resolves a candidate; `gh` resolves it AGAIN when it opens it,
+  // and the agent owns the shared `/tmp` in between. These two tests pin that
+  // gap as it stands. They are characterization tests of a RESIDUAL, not of a
+  // guarantee — read the ⚠ on `admitCallerFilePaths` for why the usual
+  // closure (snapshot the admitted file, rewrite argv to the copy) is not
+  // available against a candidate set that is deliberately every token.
+  //
+  // If a change ever closes the race, these fail. That failure is the signal
+  // to discharge the residual in the decision document, NOT to restore the
+  // behaviour pinned here.
+  const TOKEN = "/etc/paperclip/secrets/github-token/token";
+
+  // Same fake filesystem as above, but mutable: the agent writes to it
+  // between admission and open, which is the whole point.
+  const makeTree = (): Record<string, string> => ({
+    "/paperclip": "/paperclip",
+    "/paperclip/repo": "/paperclip/repo",
+    "/tmp": "/tmp",
+    "/tmp/body.md": "/tmp/body.md",
+    [TOKEN]: TOKEN,
+  });
+
+  const confinementOver = (tree: Record<string, string>) => ({
+    allowedRoots: ["/paperclip/repo", "/tmp"],
+    cwd: "/paperclip/repo",
+    realpath: (q: string) => {
+      const hit = tree[q.replace(/\/+$/, "") || "/"];
+      if (hit === undefined) throw new Error(`ENOENT: ${q}`);
+      return hit;
+    },
+  });
+
+  it("admits a candidate that names nothing, which the agent can then create as a symlink", () => {
+    const tree = makeTree();
+    const argv = ["pr", "comment", "--body-file", "/tmp/not-yet.md"];
+
+    // Admission: nothing is there, so there is nothing to read and it passes.
+    expect(() => admitCallerFilePaths(argv, confinementOver(tree))).not.toThrow();
+
+    // The agent plants the symlink in the window before the child starts.
+    tree["/tmp/not-yet.md"] = TOKEN;
+
+    // Re-resolving the SAME argv now refuses — which is exactly the point:
+    // the rule would have caught this, and it is not the thing that opens the
+    // file. `gh` is, and `gh` runs after the window.
+    expectRefusal(() => admitCallerFilePaths(argv, confinementOver(tree)), /outside the shared workspace/);
+  });
+
+  it("admits a regular file that the agent can then swap for a symlink", () => {
+    const tree = makeTree();
+    const argv = ["pr", "create", "--body-file", "/tmp/body.md"];
+
+    expect(() => admitCallerFilePaths(argv, confinementOver(tree))).not.toThrow();
+
+    tree["/tmp/body.md"] = TOKEN;
+
+    expectRefusal(() => admitCallerFilePaths(argv, confinementOver(tree)), /outside the shared workspace/);
+  });
+});
+
 describe("exec routes the broker relies on but does not itself close", () => {
   // Two keys in the agent's own `.git/config` would reach an exec inside the
   // container that holds the credential. Neither is in
