@@ -2214,6 +2214,28 @@ const GITHUB_BROKER_SOCKET_VOLUME = "github-broker-sock";
 const GITHUB_BROKER_TMP_VOLUME = "shared-tmp";
 const GITHUB_BROKER_TMP_MOUNT_PATH = "/tmp";
 
+/**
+ * Scratch mounted in the BROKER CONTAINER ONLY.
+ *
+ * The broker creates its per-invocation `GH_CONFIG_DIR` here. It must not use
+ * the shared `/tmp` above: `mkdtemp` makes a 0700 directory, but its parent is
+ * an `emptyDir` the agent can write and Kubernetes sets no sticky bit on one,
+ * so uid 1000 can rename that directory away and put its own in its place —
+ * and `gh` would then read an alias out of it and run shell beside the
+ * credential. Kept out of the agent's mount list for the same reason the
+ * credential is (`BROKER_PRIVATE_DIR` in adapter-utils; §7.3 of the decision
+ * doc on why the namespace, not the mode, is the mechanism).
+ *
+ * ⚠ `/var/lib`, not `/run`: `/var/run` is a symlink to `/run` on this image,
+ * and {@link GITHUB_BROKER_SOCKET_DIR} — which the AGENT mounts — is
+ * `/var/run/paperclip-github-broker`. A private dir at
+ * `/run/paperclip-github-broker` is the same directory, so it would be
+ * agent-writable. The shadowing backstop below compares literal mount paths
+ * and would admit the pair silently.
+ */
+const GITHUB_BROKER_PRIVATE_VOLUME = "github-broker-private";
+const GITHUB_BROKER_PRIVATE_DIR = "/var/lib/paperclip-github-broker";
+
 /** uid the broker runs as. Anything but 1000; see the uid note above. */
 const GITHUB_BROKER_UID = 1001;
 
@@ -2298,6 +2320,7 @@ function buildGitHubPublishBrokerSidecar(opts: {
     },
     volumeMounts: [
       { name: GITHUB_BROKER_TMP_VOLUME, mountPath: GITHUB_BROKER_TMP_MOUNT_PATH },
+      { name: GITHUB_BROKER_PRIVATE_VOLUME, mountPath: GITHUB_BROKER_PRIVATE_DIR },
       ...opts.dataMounts,
       ...opts.secretMounts,
       { name: GITHUB_BROKER_SOCKET_VOLUME, mountPath: GITHUB_BROKER_SOCKET_DIR },
@@ -3496,10 +3519,40 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // with nothing to broker and take away the agent's doors, so the condition is
   // "there is a credential AND we were asked to move it", never the flag alone.
   const brokerEnabled = enableGitHubPublishBroker && brokerSecretMounts.length > 0;
+  // Fail closed on a broad data mount rather than render a boundary that does
+  // not hold.
+  //
+  // The broker executes the PEN-3156 pre-push hook with the push credential in
+  // its environment. Under `narrowWritableSurface` that hook arrives as a
+  // read-only `subPath` bind (`ROOT_TOOLCHAIN_SUBPATHS` includes
+  // `GIT_HOOKS_SUBPATH`), so uid 1000 cannot rewrite the code the credential
+  // holder runs. Under the broad fallback the whole volume is mounted rw and
+  // it can — which turns the broker from a boundary into a longer path to the
+  // same token. The broker's `workspaceRoot` is `dataMountPath`, so the same
+  // leg also decides whether a request's `cwd` is confined to this run's
+  // workspace or to every agent's.
+  //
+  // Thrown, not skipped. Silently not rendering would leave the credential in
+  // the agent container with the operator believing it had moved, and §7.2
+  // already names `data-mount-scope: broad:*` as a trigger that ENDS the
+  // residual acceptance — so a broad-scope Job is the one case where shipping
+  // a degraded broker is worse than shipping none. The message names the leg
+  // that failed because all three are operator-fixable config.
+  if (enableGitHubPublishBroker && brokerSecretMounts.length > 0 && !narrowWritableSurface) {
+    throw new Error(
+      `claude_k8s: refusing to build Job manifest — enableGitHubPublishBroker is set, but the data volume ` +
+        `would be mounted broad read-write (reason: ${broadDataMountReason}). The broker runs the pre-push ` +
+        `hook with the push credential in its environment, and under a broad mount that hook lives in a ` +
+        `directory the agent can write, so the credential boundary would not hold. Fix the data mount ` +
+        `scope (see BLO-32734) or leave the broker disabled; do not ship it broad.`,
+    );
+  }
   if (brokerEnabled) {
     volumes.push(
       { name: GITHUB_BROKER_SOCKET_VOLUME, emptyDir: {} },
       { name: GITHUB_BROKER_TMP_VOLUME, emptyDir: {} },
+      // Broker-only: deliberately NOT pushed onto `volumeMounts`.
+      { name: GITHUB_BROKER_PRIVATE_VOLUME, emptyDir: {} },
     );
     // FRONT of the list, ahead of `/tmp/prompt`: see GITHUB_BROKER_TMP_VOLUME.
     volumeMounts.unshift({ name: GITHUB_BROKER_TMP_VOLUME, mountPath: GITHUB_BROKER_TMP_MOUNT_PATH });
@@ -3760,12 +3813,20 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
                     imagePullPolicy: asString(config.imagePullPolicy, "IfNotPresent"),
                     workspaceRoot: dataMountPath,
                     secretMounts: brokerSecretMounts,
-                    // The agent's own data and cache mounts, verbatim. Verbatim
-                    // because the broker runs git against the agent's working
-                    // tree: a different read-only/writable split here would be a
-                    // second opinion about which paths exist, and the one that
-                    // matters (the repository being published) must be the same
-                    // tree the agent committed in.
+                    // The agent's `data` and runtime-cache mounts, with the
+                    // same read-only/writable split the agent got — including
+                    // the read-only `subPath` bind over the pre-push hook the
+                    // broker executes. Copied rather than re-derived because a
+                    // different split here would be a second opinion about
+                    // which paths exist, and the one that matters (the
+                    // repository being published) must be the same tree the
+                    // agent committed in.
+                    //
+                    // NOT every mount the agent has: the two overlay emptyDirs
+                    // are dropped, so the broker sees the volume's own content
+                    // at those paths rather than the agent's scratch copy. That
+                    // is narrower, which is the safe direction, but it is not
+                    // parity and should not be read as parity.
                     dataMounts: volumeMounts.filter(
                       (m) => m.name === "data" || m.name === RUNTIME_CACHE_VOLUME_NAME,
                     ),

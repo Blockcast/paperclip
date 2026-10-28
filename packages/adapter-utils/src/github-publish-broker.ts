@@ -33,7 +33,6 @@
 import { spawn } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, unlinkSync } from "node:fs";
 import net from "node:net";
-import os from "node:os";
 import path from "node:path";
 
 import {
@@ -42,6 +41,7 @@ import {
   BROKER_SOCKET_ENV,
 } from "./github-publish-broker-client.js";
 import {
+  admitCallerFilePaths,
   admitInvocation,
   brokerGitConfigForCwd,
   PublishBrokerRefusal,
@@ -59,6 +59,47 @@ import {
 
 /** Where the image installs the wrappers the broker re-enters. */
 export const IMAGE_WRAPPER_DIR = "/usr/local/libexec/paperclip/bin";
+
+/**
+ * The shared `/tmp`, mounted in BOTH containers.
+ *
+ * It is the authored-text channel: `gh --body-file /tmp/x.md` is how an agent
+ * hands the broker text to publish, and the broker has to read that file
+ * rather than trust a verdict computed at uid 1000 (PEN-3183 §5). So it is the
+ * one directory outside the workspace whose contents a brokered tool may read.
+ */
+export const SHARED_TMP_DIR = "/tmp";
+
+/**
+ * A scratch directory mounted ONLY in the broker container.
+ *
+ * The `gh` config directory must live here and not under {@link
+ * SHARED_TMP_DIR}. An ephemeral `GH_CONFIG_DIR` is half of what makes the
+ * `gh` denylist acceptable (see `REFUSED_GH_SUBCOMMANDS`) — `alias` and
+ * `extension` are refused AND have nothing to execute from. That second half
+ * only holds if the agent cannot write the directory `gh` is about to read.
+ * `mkdtemp` under a shared `/tmp` does not give that: the directory it creates
+ * is 0700 and owned by the broker, but its PARENT is an `emptyDir` the agent
+ * can write, and a directory entry can be renamed away and replaced by anyone
+ * who can write the parent. Kubernetes does not set the sticky bit on an
+ * `emptyDir`, so nothing stops that — the agent substitutes its own config
+ * directory, `gh` reads an alias out of it, and the broker executes shell
+ * beside the credential.
+ *
+ * Container-scoped, like the credential mount itself: what makes this
+ * unreachable at uid 1000 is that it is not in the agent's mount namespace,
+ * not its mode (§7.3.2 makes the same point about the token).
+ *
+ * ⚠ Under `/var/lib`, deliberately NOT under `/run`. `/var/run` is a symlink
+ * to `/run` on the Debian-derived runtime image (verified on the image this
+ * ships in), and the shared socket directory — which the agent DOES mount —
+ * is `/var/run/paperclip-github-broker`. A private directory at
+ * `/run/paperclip-github-broker` would therefore resolve to that exact same
+ * directory and would be agent-writable, which is the one property this
+ * constant exists to deny. The Job builder's mount-shadowing backstop
+ * compares literal paths and would not catch it.
+ */
+export const BROKER_PRIVATE_DIR = "/var/lib/paperclip-github-broker";
 
 /**
  * Environment variables the broker's children keep from the broker's own
@@ -89,6 +130,14 @@ export interface PublishBrokerServerOptions {
   socketPath: string;
   /** Root the request `cwd` must resolve under; the shared workspace volume. */
   workspaceRoot: string;
+  /**
+   * Broker-private scratch. Overridden in tests ONLY — production takes
+   * {@link BROKER_PRIVATE_DIR}, and there is deliberately no environment
+   * variable for it: a misconfiguration that pointed this at the shared `/tmp`
+   * would silently undo the `gh` config-dir guarantee, and the one thing a
+   * boundary must not be is quietly configurable into being absent.
+   */
+  privateDir?: string;
   /** Overridden in tests. Production uses {@link IMAGE_WRAPPER_DIR}. */
   wrapperDir?: string;
   env?: NodeJS.ProcessEnv;
@@ -147,9 +196,21 @@ export function prepareBrokeredInvocation(options: {
   env: NodeJS.ProcessEnv;
   realpath?: (p: string) => string;
   makeTempDir?: () => string;
+  /** Overridden in tests. Production is the workspace plus the shared `/tmp`. */
+  allowedFileRoots?: readonly string[];
+  /** Overridden in tests. Production is {@link BROKER_PRIVATE_DIR}. */
+  privateDir?: string;
 }): PreparedInvocation {
   const realpath = options.realpath ?? realpathSync;
   const cwd = resolveBrokerCwd(options.request.cwd, options.workspaceRoot, realpath);
+  // Before admission and before injection, because this rule is about the
+  // CALLER's argv: the broker's own `credential.helper` assignment names a
+  // real path in the image, outside every allowed root, and is not input.
+  admitCallerFilePaths(options.request.argv, {
+    allowedRoots: options.allowedFileRoots ?? [options.workspaceRoot, SHARED_TMP_DIR],
+    cwd,
+    realpath,
+  });
   const admitted = admitInvocation(options.request.tool, options.request.argv);
 
   const extraEnv: Record<string, string> = {};
@@ -166,8 +227,19 @@ export function prepareBrokeredInvocation(options: {
     // per-invocation nothing a previous request wrote can persist into the
     // next. Paired with the `alias`/`extension` refusals in the admission
     // policy — neither is load-bearing alone.
+    //
+    // Created under {@link BROKER_PRIVATE_DIR}, NOT under `TMPDIR`/`os.tmpdir()`.
+    // Those both resolve to the shared `/tmp` in the deployed pod, whose parent
+    // the agent can write — and a 0700 directory inside a writable parent can
+    // be renamed away and replaced. See the constant for why that would undo
+    // the pairing above outright.
+    const privateDir = options.privateDir ?? BROKER_PRIVATE_DIR;
     const makeTempDir =
-      options.makeTempDir ?? (() => mkdtempSync(path.join(options.env.TMPDIR || os.tmpdir(), "paperclip-gh-broker-")));
+      options.makeTempDir ??
+      (() => {
+        mkdirSync(privateDir, { recursive: true, mode: 0o700 });
+        return mkdtempSync(path.join(privateDir, "gh-"));
+      });
     const configDir = makeTempDir();
     extraEnv.GH_CONFIG_DIR = configDir;
     cleanup = () => rmSync(configDir, { recursive: true, force: true });
@@ -198,8 +270,9 @@ export function createPublishBrokerServer(options: PublishBrokerServerOptions): 
   const spawnChild = options.spawnChild ?? spawn;
   const log = options.log ?? ((message: string) => process.stderr.write(`${message}\n`));
 
+  const privateDir = options.privateDir ?? BROKER_PRIVATE_DIR;
   const server = net.createServer((socket) => {
-    handleConnection({ socket, env, wrapperDir, spawnChild, workspaceRoot: options.workspaceRoot, log });
+    handleConnection({ socket, env, wrapperDir, spawnChild, workspaceRoot: options.workspaceRoot, privateDir, log });
   });
 
   return new Promise<PublishBrokerServer>((resolve, reject) => {
@@ -236,6 +309,7 @@ function handleConnection(ctx: {
   env: NodeJS.ProcessEnv;
   wrapperDir: string;
   workspaceRoot: string;
+  privateDir: string;
   spawnChild: typeof spawn;
   log: (message: string) => void;
 }): void {
@@ -318,6 +392,7 @@ function startChild(
     env: NodeJS.ProcessEnv;
     wrapperDir: string;
     workspaceRoot: string;
+    privateDir: string;
     spawnChild: typeof spawn;
     log: (message: string) => void;
   },
@@ -329,6 +404,7 @@ function startChild(
     request,
     workspaceRoot: ctx.workspaceRoot,
     wrapperDir: ctx.wrapperDir,
+    privateDir: ctx.privateDir,
     env: ctx.env,
   });
   ctx.log(`paperclip-github-broker: ${request.tool} in ${prepared.cwd}`);

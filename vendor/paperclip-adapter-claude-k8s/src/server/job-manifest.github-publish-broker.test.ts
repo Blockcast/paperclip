@@ -51,11 +51,23 @@ const baseSelfPod: SelfPodInfo = {
   inheritedEnvFrom: [],
 };
 
-function makeCtx(adapterConfig: Record<string, unknown>): AdapterExecutionContext {
+/**
+ * A run with per-run isolation, so `narrowWritableSurface` holds.
+ *
+ * Not incidental to the fixture — it is the configuration the broker is only
+ * ever rendered under. A `runtime.isolation` of `null` falls through to the
+ * broad whole-PVC rw mount, and the builder now refuses to render the broker
+ * there at all (see the broad-scope case at the bottom of this file). Every
+ * assertion in this file would otherwise be describing the shape of a
+ * boundary under the one data-mount scope where it does not hold.
+ */
+const NARROW_ISOLATION = { isolationMode: "shared", isolationKey: "agent-shared:agent-abc" };
+
+function makeCtx(adapterConfig: Record<string, unknown>, isolation: unknown = NARROW_ISOLATION): AdapterExecutionContext {
   return {
     runId: "run-abc12345",
     agent: { id: "agent-abc", companyId: "co1", name: "Test Agent", adapterType: "claude_k8s", adapterConfig },
-    runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+    runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null, isolation },
     config: { serviceAccountName: "test-sa", ...adapterConfig },
     context: {},
     onLog: async () => {},
@@ -140,6 +152,75 @@ describe("GitHub publish broker boundary (PEN-4933 / PEN-3183 D1)", () => {
     // then unreachable from inside the container (BLO-40401).
     expect(tmp).toBeLessThan(prompt);
     expect(mountPaths(brokerContainer(spec))).toContain("/tmp");
+  });
+
+  it("mounts the pre-push hook the broker executes read-only", () => {
+    // The broker runs the PEN-3156 hook with the push credential in its
+    // environment. If the agent can rewrite that file, the boundary buys
+    // nothing: uid 1000 chooses the code uid 1001 runs with the token. Pinned
+    // on the BROKER's mount list, because that is the one that decides it.
+    const broker = brokerContainer(render(true));
+    const hooks = (broker?.volumeMounts ?? []).find((m) =>
+      m.mountPath.endsWith(".local/share/paperclip-git-hooks"),
+    );
+    expect(hooks).toBeDefined();
+    expect(hooks?.readOnly).toBe(true);
+  });
+
+  it("keeps the broker's own scratch out of the agent's mount namespace", () => {
+    // `gh` reads aliases and extensions out of GH_CONFIG_DIR, and the broker
+    // makes one per invocation under here. It must NOT be the shared /tmp: a
+    // 0700 mkdtemp inside a parent the agent can write can be renamed away and
+    // replaced, and `gh` would then execute an alias of the agent's choosing
+    // beside the credential. An emptyDir has no sticky bit.
+    const spec = render(true);
+    const privateDir = "/var/lib/paperclip-github-broker";
+    expect(mountPaths(brokerContainer(spec))).toContain(privateDir);
+    for (const mounted of mountPaths(agentContainer(spec))) {
+      expect(privateDir === mounted || privateDir.startsWith(`${mounted}/`)).toBe(false);
+    }
+  });
+
+  it("keeps the broker's scratch clear of the shared socket dir even after /var/run resolves", () => {
+    // `/var/run` is a symlink to `/run` on the runtime image, so two mount
+    // paths that differ only by that prefix are ONE directory in the
+    // container — and the socket dir is mounted by the agent. The builder's
+    // shadowing backstop compares literal strings and would admit the pair.
+    // Normalise the way the kernel does, then require them to be disjoint.
+    const resolve = (p: string) => p.replace(/^\/var\/run\//, "/run/");
+    const broker = mountPaths(brokerContainer(render(true))).map(resolve);
+    const agent = mountPaths(agentContainer(render(true))).map(resolve);
+    const scratch = resolve("/var/lib/paperclip-github-broker");
+    expect(broker).toContain(scratch);
+    for (const mounted of agent) {
+      expect(scratch === mounted || scratch.startsWith(`${mounted}/`)).toBe(false);
+    }
+  });
+
+  it("REFUSES to render the broker when the data volume would be mounted broad rw", () => {
+    // The negative half of the read-only-hook case above. Under the broad
+    // fallback the whole PVC is mounted rw, so the hook the credential holder
+    // runs sits in a directory uid 1000 owns — and §7.2 already names
+    // `data-mount-scope: broad:*` as a trigger that ENDS the residual
+    // acceptance. Refusing to build is the only outcome that neither ships a
+    // boundary that does not hold nor silently leaves the token where it was.
+    expect(() =>
+      buildJobManifest({
+        ctx: makeCtx({ enableGitHubPublishBroker: true }, null),
+        selfPod: baseSelfPod,
+      }),
+    ).toThrow(/broad read-write \(reason: isolation_disabled\)/);
+  });
+
+  it("leaves a broad-scope run alone when the broker was not asked for", () => {
+    // The refusal above is scoped to the flag. A broad-scope Job with no
+    // broker is the status quo this change must not break, and without this
+    // case the refusal could widen to every broad run and still look correct.
+    const { job } = buildJobManifest({ ctx: makeCtx({}, null), selfPod: baseSelfPod });
+    const spec = job.spec!.template!.spec!;
+    expect(job.metadata?.annotations?.["paperclip.io/data-mount-scope"]).toBe("broad:isolation_disabled");
+    expect(brokerContainer(spec)).toBeUndefined();
+    expect(mountPaths(agentContainer(spec))).toEqual(expect.arrayContaining([TOKEN_MOUNT]));
   });
 
   it("POSITIVE CONTROL: with the broker off, the agent still holds the credential", () => {

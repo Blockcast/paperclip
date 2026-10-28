@@ -275,13 +275,74 @@ Three things a reader should not infer from that paragraph:
    are closed (`github-publish-broker-policy.ts`: pushes only, no caller config
    assignments, `protocol.allow` pinned, `core.askpass`/`core.fsmonitor`/
    `http.proxy`/`http.sslVerify` pinned, `gh auth`/`alias`/`extension` refused,
-   an ephemeral `GH_CONFIG_DIR`, `--hostname` refused, and the working
-   directory confined to the shared workspace). ⚠ That is a list of vectors
+   a broker-private ephemeral `GH_CONFIG_DIR`, `--hostname` refused, every
+   file-path argument confined to the workspace or the shared `/tmp`, and the
+   working directory confined to the same). ⚠ That is a list of vectors
    closed, **not a proof that no other git config key can reach an exec during
    a push**, and it must not be written up as one. It is strictly better than
    §7.1, where the agent simply holds the token, and it is strictly weaker than
    "the broker cannot be made to run attacker-chosen code". Review it on the
    same date.
+
+   Three things in that list are only true because of a container boundary, and
+   each was wrong in the first implementation before review (#3080) caught it.
+   They are recorded because the same mistake is easy to make again:
+
+   - **The broker is not rendered at all under a broad data mount.** It
+     executes the PEN-3156 pre-push hook with the credential in its
+     environment. That hook is read-only to uid 1000 only while
+     `narrowWritableSurface` holds; under the broad fallback the whole volume
+     is rw and the agent picks the code the credential holder runs. The Job
+     builder now **refuses to build** in that combination rather than
+     rendering a boundary that does not hold. This makes §7.2 trigger 2
+     structural for broker-enabled runs instead of purely an alerting target —
+     though the trigger still stands for every run that has the broker off.
+   - **`GH_CONFIG_DIR` is broker-private, not under the shared `/tmp`.** The
+     ephemeral config dir is half of what makes the `gh` denylist acceptable
+     (the two code-execution verbs are refused *and* have nothing to execute
+     from). `mkdtemp` creates it `0700`, but an `emptyDir` parent carries no
+     sticky bit and the agent can write it, so the directory entry could be
+     renamed away and replaced — and `gh` would then read an alias out of the
+     substitute. The mode was never the mechanism here either; the mount
+     namespace is. Same correction as (2) above, in a second place. It sits
+     under `/var/lib`, not `/run`: `/var/run` is a symlink to `/run` on this
+     image, so a private directory named `/run/paperclip-github-broker` would
+     have been the same directory as the shared socket mount at
+     `/var/run/paperclip-github-broker`, which the agent does mount. A
+     manifest test pins the two as disjoint after resolving that symlink,
+     because the builder's own mount-shadowing check compares literal paths.
+   - **Confining `cwd` does not confine file arguments.** `gh` takes absolute
+     paths (`--body-file`, `gh api --input`, `-F field=@file`) and an absolute
+     path does not care about the working directory. Admission now refuses any
+     argument that *resolves* to an existing path outside the workspace or the
+     shared `/tmp`, compared after `realpath` so a symlink planted in `/tmp`
+     is caught. Leaving this to the content scrubber would have been the §8
+     error: the scrubber is a mistake guard, not a boundary.
+
+   Carried forward as residual, not claimed closed:
+
+   - That rule is a **read** confinement. An argument naming a path outside
+     the roots that does not yet exist is admitted, because refusing on the
+     nearest existing ancestor would refuse `gh api /repos/o/r/pulls`. What
+     stops a brokered tool WRITING into the image — over the wrapper the
+     broker execs, say — is that the broker runs non-root against a
+     root-owned image, which is a different control and a weaker one than a
+     refusal.
+   - The repository's own `.git/config` is not cleared wholesale; the broker
+     pins a named set of keys. Two keys in that file that would otherwise
+     reach an exec inside the credential-holding container are closed
+     ELSEWHERE, which is worth knowing because neither is visible in the
+     broker's own list: `diff.<driver>.textconv` cannot run, because both
+     `git show` reads in `github-git-egress-shim.ts` pass `--no-textconv`
+     (a documented security flag with its own test); and a repository
+     `core.hooksPath` cannot redirect the hook, because the runtime injects
+     its own immediately before the subcommand, where git takes it last —
+     measured against 2.47.3 as beating repo config, `--config-env` and
+     `GIT_CONFIG_KEY_*`. Both are load-bearing for the broker and neither is
+     stated in `github-publish-broker-policy.ts`. **A change to either file
+     that drops them silently re-opens an exec route into the broker**, so
+     they belong on the review-date checklist even though they are closed
+     today.
 
 ## 8. Bounds on what may be built against this decision
 

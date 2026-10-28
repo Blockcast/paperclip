@@ -68,6 +68,9 @@ async function start(): Promise<string> {
     socketPath,
     workspaceRoot,
     wrapperDir,
+    // Production uses BROKER_PRIVATE_DIR, which is root-owned here. The point
+    // of the setting is only that it is NOT the shared /tmp; see the constant.
+    privateDir: path.join(workdir, "private"),
     env: { PATH: process.env.PATH, HOME: workdir, GH_TOKEN: TOKEN, GITHUB_TOKEN: TOKEN },
     log: () => {},
   });
