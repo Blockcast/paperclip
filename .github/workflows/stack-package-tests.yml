@@ -63,13 +63,18 @@ jobs:
   # One cheap classification for the whole file. Without it, `paths:` being
   # workflow-level means any entry matching puts EVERY lane on the diff.
   #
-  # Fails OPEN, deliberately, and in the same shape as pr.yml's
-  # `Select suites reachable from this diff`: the step is
+  # Fails OPEN at BOTH granularities, deliberately. The step shape is pr.yml's
+  # (`Select suites reachable from this diff`): the step is
   # `continue-on-error`, and consumers below compare against the literal
-  # 'false'. Anything else -- 'true', empty, or an output that was never
-  # written because the step died -- means run the lane. A selector fault can
-  # therefore only over-run. The opposite default would let a `gh` rate limit
-  # silently reproduce the exact no-lane hole this file exists to close.
+  # 'false', so 'true', empty, or an output never written all mean run the
+  # lane. That alone covers only a STEP failure -- if this JOB died (timeout,
+  # lost runner) the lanes would evaluate implicit `success()` and skip, so
+  # each lane adds `!cancelled()` and restates the base guard. Only a literal
+  # 'false' from a classification that actually ran can skip a lane.
+  #
+  # The opposite default would let a `gh` rate limit silently reproduce the
+  # exact no-lane hole this file exists to close -- and a fail-closed
+  # classifier already did, see the SIGPIPE note on the grep below.
   select:
     name: Stack lane selection
     # pr.yml owns master-targeting PRs and merge-queue candidates; this file
@@ -112,10 +117,22 @@ jobs:
           fi
           mcp_gateway=false
           server=false
-          if printf '%s\n' "$files" | grep -q '^packages/mcp-gateway/'; then
+          # Here-strings, NOT `printf ... | grep -q`. Under `set -o pipefail`
+          # that pipeline FAILS CLOSED on a large diff and inverts this file's
+          # whole invariant: `grep -q` exits on the first match, `printf` then
+          # takes SIGPIPE once the list outgrows the ~64 KiB pipe buffer, and
+          # the pipeline reports 141 -- so a diff that DOES touch server/ is
+          # recorded as `false` and the lane is skipped. Reproduced at 3001
+          # paths / 173 KB with `server/...` as the FIRST line: pipe form
+          # yields `false`, here-string yields `true`. `/pulls/{n}/files`
+          # returns sorted paths, so both prefixes match early and the tail
+          # fills the buffer -- i.e. it misfires precisely on a big
+          # stack-collapse PR, where skipping the lane costs most. pr.yml:2127
+          # carries a note on this same trap.
+          if grep -q '^packages/mcp-gateway/' <<<"$files"; then
             mcp_gateway=true
           fi
-          if printf '%s\n' "$files" | grep -q '^server/'; then
+          if grep -q '^server/' <<<"$files"; then
             server=true
           fi
           echo "mcp_gateway=${mcp_gateway}" >> "$GITHUB_OUTPUT"
@@ -124,6 +141,8 @@ jobs:
         timeout-minutes: 5
 
       - name: Record what a green on this workflow does and does not attest
+        # Cosmetic: it must never be the reason a lane does not run.
+        continue-on-error: true
         if: ${{ !cancelled() }}
         run: |
           {
@@ -151,7 +170,12 @@ jobs:
     name: Stack tests (mcp-gateway)
     needs: select
     # `!= 'false'` and not `== 'true'`: see the fail-open note on `select`.
-    if: needs.select.outputs.mcp_gateway != 'false'
+    # `!cancelled()` so a select JOB failure (timeout, lost runner) also fails
+    # OPEN -- without it the lane evaluates implicit `success()` and skips, which
+    # is the one hole `continue-on-error` on the step below cannot cover. That
+    # bypasses the `needs`-skip that used to carry the base guard, so the base
+    # guard is restated here rather than inherited transitively.
+    if: ${{ !cancelled() && github.base_ref != 'master' && needs.select.outputs.mcp_gateway != 'false' }}
     runs-on: arc-paperclip-general
     timeout-minutes: 20
 
@@ -224,7 +248,12 @@ jobs:
   server_stack:
     name: Stack typecheck (server) -- compile only, suites not run
     needs: select
-    if: needs.select.outputs.server != 'false'
+    # `!cancelled()` so a select JOB failure (timeout, lost runner) also fails
+    # OPEN -- without it the lane evaluates implicit `success()` and skips, which
+    # is the one hole `continue-on-error` on the step below cannot cover. That
+    # bypasses the `needs`-skip that used to carry the base guard, so the base
+    # guard is restated here rather than inherited transitively.
+    if: ${{ !cancelled() && github.base_ref != 'master' && needs.select.outputs.server != 'false' }}
     runs-on: arc-paperclip-general
     # Hang detector, not a performance budget (BLO-35615). PROVISIONAL: this
     # job has no run history to derive `ceil(W95 / (F * 60))` from. 30 is the
@@ -283,6 +312,7 @@ jobs:
         run: pnpm --filter @paperclipai/server run typecheck
 
       - name: Record what this lane does and does not attest
+        continue-on-error: true
         if: ${{ !cancelled() }}
         run: |
           {
