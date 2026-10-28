@@ -51,6 +51,7 @@ export default defineConfig({
       "packages/plugins/paperclip-plugin-linear",
       "packages/plugins/paperclip-plugin-slack",
       "packages/plugins/plugin-workspace-diff",
+      "packages/plugins/plugin-llm-wiki",
       "packages/plugins/examples/plugin-authoring-smoke-example",
       "packages/google-sheets-mcp-server",
       "packages/kv-demo-mcp-server",
