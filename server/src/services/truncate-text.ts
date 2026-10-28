@@ -45,6 +45,9 @@ function cutTailAtBoundary(trimmed: string, tailLength: number) {
  * `...` could be mistaken for an author's own ellipsis.
  */
 export function truncateText(value: string, maxChars: number, marker = "...", separator = "") {
+  // PEN-3107 CONTROL (probe branch only): deliberate type error, source program.
+  const probeSourceArm: number = "this is a string, not a number";
+  void probeSourceArm;
   const trimmed = value.trim();
   if (trimmed.length <= maxChars) return trimmed;
 
