@@ -23,11 +23,11 @@ built against this decision.
 
 | # | Question | Decision |
 |---|---|---|
-| D1 | Where does enforcement live? | **Credential-side.** The binding constraint is not who owns the guard files. It is that the push credential is readable by the very uid the guard scans. Move the credential out of that uid's reach and the surviving bypass stops being a publish path. |
+| D1 | Where does enforcement live? | **Credential-side.** The binding constraint is not who owns the guard files. It is that the push credential is reachable by the very uid the guard scans — both as a 0444 file it may read and, more cheaply, via the system credential helper in `/etc/gitconfig` that authenticates *any* git it runs (§4). Cut both routes and the surviving bypass stops being a publish path. |
 | D2 | Image-side (root-owned runtime)? | **Done, and that is as far as image-side reaches.** PEN-3713 / #2185 closed bypasses 2 and 4. It cannot close bypass 1, and no further image work can — see §3. Do not re-open this as an option. |
 | D3 | Destination-side `pre-receive` hook? | **DECLINED — unavailable.** Pre-receive hooks are a GitHub Enterprise Server feature; these repositories are on github.com. The row asked for this to be confirmed before costing. It is confirmed, and it is the end of that option. |
 | D4 | Egress NetworkPolicy + scanning proxy? | **DEFERRED, and note that it converges on D1.** Any proxy permitted to push to GitHub must itself hold the credential, so it *is* the credential-holder design, plus a TLS-terminating git-pack parser. Build the credential half first: it is most of the benefit at a fraction of the cost and risk. |
-| D5 | The residual between now and D1 | **ACCEPTED, dated.** Reviewed 2026-10-28; next review **2027-01-31**, or immediately on either trigger in §7.2. |
+| D5 | The residual between now and D1 | **ACCEPTED, dated — and conditional.** Reviewed 2026-10-28; next review **2027-01-31**, or immediately on any trigger in §7.2. Accepted on the stated, *unmeasured* assumption that nothing in the fleet invokes `git` by absolute path (§4.0); the §8 count settles it and a non-zero result ends the acceptance. |
 | D6 | *(correction of record)* | The row's evidence block, and the THREAT MODEL header in `github-git-egress-runtime.ts`, both describe a pod that no longer exists. Both are corrected by this change. |
 
 ⛔ The row's existing prohibition stands and is re-affirmed: **do not add integrity checks between
@@ -40,7 +40,7 @@ The row enumerated four bypasses measured 2026-09-11. Re-measured today in a liv
 
 | # | Bypass as filed | Status today | What changed it |
 |---|---|---|---|
-| 1 | Call `/usr/bin/git` directly; no file needs writing | **OPEN** | nothing |
+| 1 | Call `/usr/bin/git` directly; no file needs writing | **OPEN** — and easier than filed: `/etc/gitconfig` authenticates it unprompted (§4) | nothing |
 | 2 | Edit the scanner in `/opt/paperclip-bundled-adapters` | **CLOSED** | PEN-3713 / #2185, merged 2026-10-06 |
 | 3 | Replace the hook on the PVC | **CLOSED** | BLO-32734 phase 2b Job narrowing |
 | 4 | Replace the wrapper on the PVC | **CLOSED** | PEN-3713 / #2185 |
@@ -124,19 +124,54 @@ not 1 or 3. That assessment was correct and it has now been executed; 3 fell to 
 ## 4. The credential is the choke point, and it is the only one
 
 Bypass 1 is not dangerous because the agent can run `/usr/bin/git`. It is dangerous because that
-unguarded git **can authenticate**. Measured today:
+unguarded git **can authenticate** — and it does so *by itself*, with no credential handling by
+the caller at all. Measured today:
 
+- The agent image's **system** git scope carries a credential helper for github.com.
+  `Dockerfile.runtime:82-83` writes, as the only `git config --system` in the whole build chain:
+
+  ```
+  git config --system credential.https://github.com.helper '!/usr/bin/gh auth git-credential'
+  ```
+
+  That lands in `/etc/gitconfig`, which **every** git invocation in the pod loads — including
+  `/usr/bin/git` called by absolute path. `scripts/git-config-surface.mjs` states the same split in
+  the repo's own words: the system scope carries the **gh** helper, while the *paperclip* helper is
+  injected only as `-c` flags on the wrapper's exec line. Skipping the wrapper therefore drops the
+  paperclip helper and keeps the gh one.
+- That helper deliberately points at `/usr/bin/gh`, the wrapper — not `gh.real` — precisely
+  *because* the wrapper reads the token file (`Dockerfile.runtime:65-70`, BLO-25702). So the helper
+  resolves the credential on git's behalf.
 - The push credential is a Secret mounted at `/etc/paperclip/secrets/github-token/` with
   `defaultMode: 292` — octal **0444**, world-readable within the pod.
 - `test -r` on the token path from uid 1000: **readable**. (Verified by reachability only; the
   value was not read.)
 - It is not in the agent's environment — `paperclip-github-token-env` reads it from that file and
-  injects it only into the wrapped child. That design is sound and deliberate, and it is undone by
-  the file being readable anyway.
+  injects it only into the wrapped child. That design is sound and deliberate, and it is undone
+  twice over: by the file being readable, and by the system helper reading it for any caller.
 
-So the unguarded path is: call the real binary, supply the credential from a file you may read,
-publish. **No guard file is touched and no privilege is needed.** That is why bypass 1 is
+So the unguarded path is not "call the real binary *and* supply a credential". It is **just**: call
+the real binary. `/etc/gitconfig` supplies the credential. No guard file is touched, no privilege is
+needed, and **no knowledge of where the credential is mounted is needed** — a bare
+`/usr/bin/git push` from uid 1000 is authenticated and unscanned. That is why bypass 1 is
 architectural in the way the CEO's disposition said it was.
+
+This also enlarges the surface D1 must cut. The credential is reachable by two routes, and moving
+the mount is only the first: **`/etc/gitconfig`'s helper is the second**, and it must be shown to
+starve rather than assumed to. See §5.
+
+### 4.0 It is not only the deliberate case
+
+Because the helper needs no intent, **any** caller that execs git by absolute path — rather than
+resolving it on PATH — publishes unscanned *and* authenticated, with no intent at all. The guard is
+reached via PATH, which is exactly the thing such a caller does not consult. A tool, script, library
+or MCP server that hardcodes `/usr/bin/git` is therefore outside the accidental-disclosure control
+this guard exists to be, and nothing today reports that it happened.
+
+How much of that exists in the fleet is **unmeasured**. That measurement (§8) is consequently not a
+nice-to-have that could sharpen an urgency estimate: it is the one piece of evidence that bounds
+whether the *accidental* case — the case this control is actually for — is covered at all. It is
+load-bearing for §7.1 and it is named as an early trigger in §7.2.
 
 ### 4.1 One credential sits behind all three doors
 
@@ -183,6 +218,18 @@ The boundary must therefore hold the credential and **perform the publish itself
   the rule would break it.
 - The agent may still run `/usr/bin/git` for everything local. It simply cannot authenticate to
   GitHub, which turns bypass 1 from *publishes unscanned* into *fails to authenticate*.
+- **`/etc/gitconfig`'s system credential helper must be shown to starve** (§4). Removing the mount
+  from uid 1000 should do it — the helper runs `/usr/bin/gh`, which has no token to read — but
+  "should" is not the standard here, because the failure is silent in the permissive direction:
+  git ignores a credential helper's non-zero exit and carries on. Two fallbacks must be closed, not
+  assumed: `gh.real` resolving an ambient `GH_TOKEN`/`GITHUB_TOKEN`, and a stale
+  `~/.config/gh/hosts.yml` — the unmaintained state BLO-13241 wrapped `gh` to stop using in the
+  first place. Either one re-authenticates the unguarded binary with the mount already gone.
+  Prefer removing the helper from the image's system scope outright; if it stays (the wrapped
+  doors still need it), D1 must assert it yields no credential. Note `Dockerfile.runtime:82` is
+  guarded by two equality checks (`scripts/check-agent-image-git-config.mjs` and assertion (a) in
+  `agent-egress-path.test.mjs`) whose expectations live in `scripts/git-config-surface.mjs` —
+  changing that line means changing those in the same commit, by construction.
 
 Short-lived minted tokens are **not** a substitute. A GitHub App installation token handed to the
 agent is readable for its whole lifetime, so it narrows the window and leaves the boundary exactly
@@ -209,17 +256,27 @@ where it is now.
 ### 7.1 Statement
 
 Between 2026-10-28 and the delivery of D1, an agent that deliberately sets out to publish material
-`scrubGitHubEgressText` would remove **can do so**, by invoking the real binary and supplying the
-credential it is permitted to read. This is accepted, with eyes open, on these grounds:
+`scrubGitHubEgressText` would remove **can do so**, by invoking the real binary — which
+`/etc/gitconfig` then authenticates for it (§4). This is accepted, with eyes open, on these
+grounds:
 
-- The control's designed threat — **accidental** disclosure — is covered, and is better covered
-  than when the row was filed: the guard now sits on a root-owned path ahead of `/usr/bin` for
-  every ordinary invocation, where before it sat on a surface the agent could rewrite.
+- The control's designed threat — **accidental** disclosure — is covered **for every caller that
+  resolves `git` on PATH**, and is better covered than when the row was filed: the guard now sits
+  on a root-owned path ahead of `/usr/bin`, where before it sat on a surface the agent could
+  rewrite. That is the shape of essentially all agent and tool invocations.
 - Of the four enumerated bypasses, the three that required a deliberate write are closed. The
-  survivor requires deliberate intent and specific knowledge of where the credential is mounted.
-- No measurement has been taken of whether bypass 1 is exercised accidentally in the fleet. The CEO
-  asked for exactly that count on 2026-09-11 and it has not been collected. §8 keeps it open as the
-  one cheap piece of work that could change this decision's urgency.
+  survivor requires no write, no privilege, and — per §4 — **no knowledge of the credential
+  either**; it requires only that something invoke git by absolute path. For the *deliberate*
+  threat that is a low bar, but it is also the threat this control never claimed to cover and that
+  PEN-3183 exists to close; accepting it is accepting the status quo ante, not a new exposure.
+- The real uncertainty is therefore the **accidental** absolute-path caller (§4.0), and it is
+  **unmeasured**. The CEO asked for exactly that count on 2026-09-11 and it has not been collected.
+
+**This acceptance is explicitly conditional on that count.** It is accepted on the expectation that
+absolute-path `git` invocations are rare-to-absent in the fleet; a non-zero count falsifies the
+first ground above and ends the acceptance early (§7.2 trigger 4). The honest reading is that D5
+rests on an untested assumption, named here rather than buried, with the test that would settle it
+scheduled as the cheapest item in §8.
 
 ⚠ **Status, 2026-10-28 (PEN-4933):** D1 is **built** and merged behind a
 default-off rollout gate; see §7.3. The residual statement above still describes
@@ -232,7 +289,14 @@ is enabled.
 2. **Any agent Job rendering `paperclip.io/data-mount-scope: broad:*`** — that re-opens bypass 3
    and returns the guard to peers-not-layers. This is a cheap alerting target and should be one.
 3. **Any change that widens read access to the token Secret**, or mounts it into a new container.
-4. Otherwise: **2027-01-31.**
+   Read "the token Secret" as *any* route by which uid 1000 obtains a github.com credential — which
+   per §4 includes `/etc/gitconfig`'s system helper, not only the mount. A change broadening what
+   that helper will answer for is this trigger.
+4. **A non-zero absolute-path-`git` count** from the §8 measurement — i.e. any invocation reaching
+   `/usr/bin/git` that did not come through the wrapper. That means the *accidental* case is
+   uncovered too, which is the ground §7.1 accepts on; it ends the acceptance regardless of the
+   calendar date.
+5. Otherwise: **2027-01-31.**
 
 ### 7.3 Discharge status (PEN-4933)
 
@@ -384,8 +448,12 @@ Permitted without further security review:
   1000, and provided it calls the existing shim rather than re-deriving the refusal rule.
 - Alerting on the triggers in §7.2.
 - The absolute-path-`git` measurement the CEO asked for on 2026-09-11: count invocations reaching
-  `/usr/bin/git` that did not come through the wrapper. A non-zero count means the accidental case
-  is *also* uncovered and raises D1's urgency; a zero count leaves this decision unchanged.
+  `/usr/bin/git` that did not come through the wrapper. **Treat this as the highest-value item
+  here, not a nice-to-have.** Per §4.0, such an invocation is authenticated by `/etc/gitconfig`
+  with no intent and no credential handling, so a non-zero count means the *accidental* case — the
+  one this control exists for — is uncovered, falsifies the first ground of §7.1, and ends the
+  §7.2 acceptance early rather than merely "raising urgency". A zero count leaves this decision
+  unchanged and converts §7.1's stated assumption into a measured one.
 
 Not permitted without returning here first:
 

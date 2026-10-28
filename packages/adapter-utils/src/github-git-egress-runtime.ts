@@ -64,9 +64,21 @@
 //   - OPEN `/usr/bin/git` is mode 0755 and directly executable. Nothing routes
 //     it through this wrapper; the wrapper is reached via PATH, which the
 //     caller chooses. No file needs to be written to take that path — and the
-//     credential that authenticates the push is mounted 0444, so the real git
-//     can be driven with it. That is what makes this one a publish path rather
-//     than a nuisance.
+//     real git AUTHENTICATES ITSELF: `Dockerfile.runtime:82-83` writes a system
+//     credential helper into /etc/gitconfig
+//     (`credential.https://github.com.helper = !/usr/bin/gh auth git-credential`),
+//     which every git in the pod loads, and which resolves the token by way of
+//     the `gh` wrapper. The push credential is also mounted 0444 and readable
+//     here, but that is the harder of the two routes and not the one that
+//     matters: a bare `/usr/bin/git push` from uid 1000 publishes unscanned and
+//     authenticated with no credential handling by the caller at all. That is
+//     what makes this one a publish path rather than a nuisance.
+//
+//     Note the consequence for the ACCIDENTAL case above, which is this file's
+//     actual threat: because no intent is required, any caller that execs git
+//     by ABSOLUTE PATH rather than resolving it on PATH is outside this guard
+//     while still being authenticated. How much of that exists is unmeasured;
+//     it is the open measurement in §8 of the PEN-3183 decision record.
 //
 // The surviving bypass is not a file-ownership problem and cannot be closed by
 // one. The agent and this wrapper are the SAME principal: one container, uid
