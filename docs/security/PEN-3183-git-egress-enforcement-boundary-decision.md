@@ -221,6 +221,11 @@ credential it is permitted to read. This is accepted, with eyes open, on these g
   asked for exactly that count on 2026-09-11 and it has not been collected. §8 keeps it open as the
   one cheap piece of work that could change this decision's urgency.
 
+⚠ **Status, 2026-10-28 (PEN-4933):** D1 is **built** and merged behind a
+default-off rollout gate; see §7.3. The residual statement above still describes
+the deployed fleet, and remains accepted on the grounds listed, until that gate
+is enabled.
+
 ### 7.2 Review triggers — any one of these ends the acceptance early
 
 1. **A second disclosure event of the PEN-2526 class**, by any door.
@@ -228,6 +233,55 @@ credential it is permitted to read. This is accepted, with eyes open, on these g
    and returns the guard to peers-not-layers. This is a cheap alerting target and should be one.
 3. **Any change that widens read access to the token Secret**, or mounts it into a new container.
 4. Otherwise: **2027-01-31.**
+
+### 7.3 Discharge status (PEN-4933)
+
+The broker shape in §5 is implemented: `packages/adapter-utils/src/
+github-publish-broker*.ts` plus a `github-publish-broker` sidecar rendered by
+`vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts`. With it
+enabled, the GitHub credential Secret is mounted into that sidecar and **not**
+into the agent container, the agent reaches it over a unix socket asking for a
+publish, and the broker performs that publish by re-entering the SAME image
+wrapper — so the scan is the existing pre-push hook running the existing
+`scrubGitHubEgressText`, and door parity is preserved by construction rather
+than by a second implementation. `git`, `gh` and the GitHub MCP server are all
+routed, because §4.1 says routing one relocates the bypass to the other two.
+
+Three things a reader should not infer from that paragraph:
+
+1. **It is not yet enabled.** `enableGitHubPublishBroker` defaults to `false`,
+   so the deployed fleet is unchanged and §7.1 still holds. The gate is a
+   ROLLOUT gate, not the kill switch §6 refuses: with it off the fleet is
+   exactly where this document found it, and the reason it exists is the one §6
+   gives for deferring D4 — a change that can break every agent's ability to
+   publish should soak rather than flip. **Switching it back off after
+   enablement re-opens §7.1 and is a Security decision, not an incident one.**
+   The acceptance is discharged when the gate is on, not when this paragraph
+   was written.
+2. **The mode is not the mechanism.** §5 asks for `0400` owned by the broker's
+   uid. That is not reachable through a Kubernetes Secret volume — the kubelet
+   owns those files `root`, so `0400` denies the broker as readily as the
+   agent, and `fsGroup` is pod-scoped and would hand the agent container a
+   supplementary group instead. What makes the token unreadable at uid 1000 is
+   that the mount is **not in the agent's mount namespace at all**; the mode is
+   then doing no work. The uid split (broker at 1001) is kept as defence in
+   depth against a future `shareProcessNamespace`, not as the boundary.
+3. **A successor residual replaces the old one, and it is smaller but real.**
+   The broker runs `git` and `gh` against a repository owned by uid 1000, so
+   the agent still chooses some of the input the credential-holding process
+   reads — `.git/config` in particular, which is exactly what git's own
+   `safe.directory` check warns about and which the broker has to suppress in
+   order to work. The enumerated routes from that input back to the credential
+   are closed (`github-publish-broker-policy.ts`: pushes only, no caller config
+   assignments, `protocol.allow` pinned, `core.askpass`/`core.fsmonitor`/
+   `http.proxy`/`http.sslVerify` pinned, `gh auth`/`alias`/`extension` refused,
+   an ephemeral `GH_CONFIG_DIR`, `--hostname` refused, and the working
+   directory confined to the shared workspace). ⚠ That is a list of vectors
+   closed, **not a proof that no other git config key can reach an exec during
+   a push**, and it must not be written up as one. It is strictly better than
+   §7.1, where the agent simply holds the token, and it is strictly weaker than
+   "the broker cannot be made to run attacker-chosen code". Review it on the
+   same date.
 
 ## 8. Bounds on what may be built against this decision
 

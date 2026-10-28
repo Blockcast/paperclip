@@ -20,6 +20,7 @@ import {
   scrubGitHubCliInvocation,
 } from "./github-cli-egress-shim.js";
 import { GITHUB_EGRESS_REGION_CLASSES } from "./github-egress-scrub.js";
+import { brokerSocketPath, runPublishBrokerClient } from "./github-publish-broker-client.js";
 import {
   type CommitReachability,
   evaluateReviewSubmission,
@@ -210,6 +211,31 @@ export async function runGitHubCliEgressRuntime(
   );
   if (refusal) {
     throw new GitHubCliEgressRuntimeError(`${refusal.message} [${refusal.reason}]`, 65);
+  }
+
+  // PEN-4933: `gh` authenticates with the same credential as `git` and the MCP
+  // server (PEN-3183 §4.1), so in a brokered deployment this container holds
+  // none of it and every `gh` call is performed by the broker.
+  //
+  // Forwarded BEFORE `prepareGitHubCliInvocation`, not after. The scrub has to
+  // happen on the side that performs the call: a scrub run here and then
+  // trusted there would be a scrub the agent can skip, which is the "gate on
+  // issuance, not on use" error PEN-3183 §5 names. So this process does the
+  // review-attestation refusal above (a caller error, best answered locally)
+  // and then hands the ORIGINAL argv over; the broker re-enters this same
+  // runtime with the same shim, which is what keeps door parity true.
+  //
+  // Unlike the `git` door there is no local branch. Every `gh` invocation
+  // reaches GitHub, so there is nothing for a credential-less container to do
+  // with one.
+  const brokerSocket = brokerSocketPath();
+  if (brokerSocket) {
+    return runPublishBrokerClient({
+      socketPath: brokerSocket,
+      tool: "gh",
+      argv: [...options.argv],
+      cwd: process.cwd(),
+    });
   }
 
   const invocation = prepareGitHubCliInvocation(options);

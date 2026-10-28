@@ -102,6 +102,8 @@ import { fileURLToPath } from "node:url";
 
 import { DEFAULT_HOOKS_DIR } from "./github-git-hooks-path.js";
 
+import { brokerSocketPath, runPublishBrokerClient } from "./github-publish-broker-client.js";
+
 import {
   ALIAS_HOP_LIMIT,
   classifyGitInvocation,
@@ -631,6 +633,39 @@ export function runGitEgressRuntime(options: {
     if (result.error || result.status !== 0) return false;
     return repoGatesOnDco(result.stdout.trim());
   };
+
+  // PEN-4933: a push needs a credential, and in a brokered deployment this
+  // container does not have one. Hand the publish to the broker instead.
+  //
+  // `buildGitArgv` runs FIRST, for its refusals. Those are caller errors
+  // (`--no-verify`, a `core.hooksPath` of your own, a publishing verb that no
+  // hook can guard) and they are better answered here, with the caller's own
+  // repository and config in reach, than as a line relayed back over a socket.
+  // Its RESULT is discarded: the broker re-derives it from the original argv,
+  // because a guard that trusted the argv the agent handed it would be a guard
+  // the agent writes.
+  //
+  // Nothing about this branch is a control. An agent that deletes it reaches
+  // `/usr/bin/git` with no token — see `github-publish-broker-client.ts`.
+  const brokerSocket = brokerSocketPath(env);
+  if (brokerSocket) {
+    const classification = classifyGitInvocation(options.argv, resolveAlias, env);
+    if (classification.isPush) {
+      buildGitArgv(options.argv, {
+        hooksDir: options.hooksDir,
+        resolveAlias,
+        env,
+        hookPresent: options.hookPresent,
+        requiresSignoff,
+      });
+      return runPublishBrokerClient({
+        socketPath: brokerSocket,
+        tool: "git",
+        argv: [...options.argv],
+        cwd: process.cwd(),
+      });
+    }
+  }
 
   const argv = buildGitArgv(options.argv, {
     hooksDir: options.hooksDir,
