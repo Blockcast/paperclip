@@ -14,6 +14,7 @@ import {
   failingChecks,
   applyRow,
   isFatalGhError,
+  liveHeadSha,
   isMainModule,
   markFailure,
   latestCheckStates,
@@ -752,14 +753,87 @@ describe("applyRow", () => {
    */
   it("arms auto-merge with an explicit merge method", () => {
     const calls = [];
-    const outcome = applyRow("o/r", { number: 7, action: "enqueue" }, (args) => {
+    // PEN-4887: the row carries its classified head and the live read agrees,
+    // so the enqueue proceeds exactly as before.
+    const outcome = applyRow("o/r", { number: 7, action: "enqueue", headSha: HEAD }, (args) => {
       calls.push(args);
-      return "";
+      return JSON.stringify({ headRefOid: HEAD });
     });
     // Not "armed": the same call queues, arms, or merges outright depending on
     // the base, and this defect was a receipt naming an action it had not taken.
     assert.equal(outcome, "merge requested");
-    assert.deepEqual(calls, [["pr", "merge", "7", "--repo", "o/r", "--auto", "--rebase"]]);
+    assert.deepEqual(calls.at(-1), ["pr", "merge", "7", "--repo", "o/r", "--auto", "--rebase"]);
+  });
+
+  /**
+   * PEN-4887. `fetchOpenPrs` snapshots every PR once per fire; landing a
+   * stacked child into this PR's branch replaces its head with the merge
+   * commit, on which nothing has run. #3060 was enqueued 4s after that
+   * happened and ejected by the queue 10s later, 2m10s before
+   * `ci/ally-head-attested` even succeeded.
+   */
+  it("refuses to enqueue when the head moved since classification", () => {
+    const calls = [];
+    assert.throws(
+      () =>
+        applyRow("o/r", { number: 3060, action: "enqueue", headSha: HEAD }, (args) => {
+          calls.push(args);
+          return JSON.stringify({ headRefOid: OTHER });
+        }),
+      /head moved since classification/,
+    );
+    assert.ok(
+      !calls.some((args) => args[0] === "pr" && args[1] === "merge"),
+      `must not reach the merge call; calls were ${JSON.stringify(calls)}`,
+    );
+  });
+
+  it("fails closed when the live head cannot be read, or the row carries none", () => {
+    // An unreadable SHA is not permission to enqueue: it means the
+    // classification cannot be shown to still apply. The row re-classifies on
+    // the next fire, and `markFailure` keeps the refusal out of the cap.
+    for (const liveResponse of ["{}", JSON.stringify({ headRefOid: "" }), JSON.stringify({ headRefOid: null })]) {
+      assert.throws(
+        () => applyRow("o/r", { number: 11, action: "enqueue", headSha: HEAD }, () => liveResponse),
+        /head moved since classification/,
+        `unreadable live head (${liveResponse}) must not enqueue`,
+      );
+    }
+    assert.throws(
+      () => applyRow("o/r", { number: 12, action: "enqueue" }, () => JSON.stringify({ headRefOid: HEAD })),
+      /head moved since classification/,
+      "a row with no classified head cannot be compared against anything",
+    );
+  });
+
+  it("the refusal lands in the action column, so it never spends a queue slot", () => {
+    // End-to-end with `markFailure`/`sweepRepos`'s reading: only rows still
+    // reading `enqueue` count against MAX_ENQUEUES_PER_FIRE.
+    const row = { number: 3060, action: "enqueue", reason: "mergestate:CLEAN", detail: null, headSha: HEAD };
+    try {
+      applyRow("o/r", row, () => JSON.stringify({ headRefOid: OTHER }));
+      assert.fail("expected a refusal");
+    } catch (error) {
+      markFailure(row, error.message);
+    }
+    assert.equal(row.action, "enqueue-failed");
+    assert.match(row.detail, /head moved since classification/);
+    assert.equal([row].filter((r) => r.action === "enqueue").length, 0);
+    assert.equal(isFatalGhError(row.detail), false, "a moved head is a skip, never a reason to abort the fire");
+  });
+
+  it("liveHeadSha reads the PR's current head and normalises an unusable answer to null", () => {
+    const calls = [];
+    assert.equal(
+      liveHeadSha("o/r", 7, (args) => {
+        calls.push(args);
+        return JSON.stringify({ headRefOid: HEAD });
+      }),
+      HEAD,
+    );
+    assert.deepEqual(calls, [["pr", "view", "7", "--repo", "o/r", "--json", "headRefOid"]]);
+    assert.equal(liveHeadSha("o/r", 7, () => "{}"), null);
+    assert.equal(liveHeadSha("o/r", 7, () => JSON.stringify({ headRefOid: "" })), null);
   });
 
   it("disarms a stale enqueue without a merge method", () => {
