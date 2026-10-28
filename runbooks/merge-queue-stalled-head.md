@@ -293,7 +293,7 @@ finished reporting by the instant of removal. A PR enqueued because its checks
 went green necessarily waited minutes for them first, so the fresh-head window
 separates the two cleanly.
 
-Four measured details worth keeping if this is ever re-derived:
+Five measured details worth keeping if this is ever re-derived:
 
 - **"zero completed checks" is not the test.** On #3060's head, two commit
   *status* contexts (`gate/ally-comment-findings`, `review/ally-comment`) had
@@ -320,9 +320,27 @@ Four measured details worth keeping if this is ever re-derived:
   `gate/ally-comment-findings` is a status that succeeded at 07:46:23Z *and* a
   check run that did not conclude until 07:48:35Z. They are separate contexts;
   collapsing them by bare name lets the green status hide the unfinished check
-  run, which is the fail-open direction. The detector keys the collapse on
-  surface *and* name, and qualifies a name in the notice (`… (check run)`) only
+  run, which is the fail-open direction. The detector therefore keys on the
+  surface as well, and qualifies a name in the notice (`… (check run)`) only
   when it exists on both.
+- **Within `/check-runs`, a name is not an identity either — so only statuses
+  collapse.** `filter=latest` (the default) already returns the newest run per
+  check run, so two rows sharing a name are two genuinely distinct runs:
+  separate lanes, or `pull_request` and `pull_request_target` publishing the
+  same name. Measured on #3063's head `de82d2d`: `review` appears twice, runs
+  `122712076437` and `122711949261`, in different check suites. Collapsing
+  those by name lets a finished lane stand in for an in-flight sibling (which
+  has `completedAt: null` and is skipped), dropping it from the cause line. So
+  check runs are keyed on their run **id** and are not collapsed; only statuses
+  collapse, by context name. A status row's id is per *post* and must never be
+  used as a key, or the history collapse above is defeated.
+
+  One consequence: counts and names measure different things, deliberately.
+  `checkCount`/`completedByDequeue` count **contexts**; `incompleteAtDequeue`
+  lists the distinct **names** those contexts carry, because branch protection
+  requires by name — two unfinished `review` lanes are two contexts but one
+  unmet requirement, and printing the name twice would read as the
+  duplicate-row defect the collapse exists to fix.
 
 Both head-check surfaces are read SHA-pinned (`/check-runs` *and* `/statuses`);
 a failed read yields `null`, not `[]`, so a transient API error falls back to
