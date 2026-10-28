@@ -225,6 +225,35 @@ RUN curl -fsSL "https://github.com/int128/kubelogin/releases/download/${KUBELOGI
   && chmod +x /usr/local/bin/kubectl-oidc_login \
   && rm -f /tmp/kubelogin.zip /tmp/LICENSE
 
+# yq — PEN-4932. Image-owned, replacing the copy that currently reaches agents
+# only through the shared `paperclip-data` PVC at `/paperclip/bin/yq` (and a
+# second, same-version copy at `/paperclip/.local/bin/yq`). That row is one of
+# ROOT_TOOLCHAIN_SUBPATHS, so it is mounted into every agent pod off a single
+# CephFS volume handle: a tool nobody can reach without the shared mount is a
+# tool that keeps the mount, and the mount is what gives one hung
+# NodeUnstageVolume a whole node's blast radius. Version matches what the PVC
+# carried when it was inventoried (2026-10-28) so baking it changes no agent's
+# observed behaviour.
+ARG YQ_VERSION=v4.44.3
+RUN curl -fsSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" \
+       -o /usr/local/bin/yq \
+  && chmod +x /usr/local/bin/yq \
+  && yq --version | grep -Fq "${YQ_VERSION}"
+
+# Bun — PEN-4932, same reasoning as yq above. Reaches agents today only via the
+# `.bun/bin` entry of ROOT_TOOLCHAIN_SUBPATHS. `bunx` is a symlink to `bun` on
+# the PVC and is recreated here rather than copied, so both names resolve
+# without the shared mount.
+ARG BUN_VERSION=1.3.14
+RUN curl -fsSL "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-x64.zip" \
+       -o /tmp/bun.zip \
+  && unzip -q -d /tmp /tmp/bun.zip \
+  && mv /tmp/bun-linux-x64/bun /usr/local/bin/bun \
+  && chmod +x /usr/local/bin/bun \
+  && ln -sfn /usr/local/bin/bun /usr/local/bin/bunx \
+  && rm -rf /tmp/bun.zip /tmp/bun-linux-x64 \
+  && bun --version | grep -Fq "${BUN_VERSION}"
+
 # ---------------------------------------------------------------------------
 # Designer + browser automation CLIs (ccrotate-designer-lease)
 # ---------------------------------------------------------------------------
