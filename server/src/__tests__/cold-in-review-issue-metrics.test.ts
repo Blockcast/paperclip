@@ -393,6 +393,27 @@ describe("cold in_review issue gauge (PEN-4652)", () => {
       expect(expr.indexOf("max by (agent_id)")).toBeLessThan(expr.indexOf("and on (pod)"));
     });
 
+    // Ally's S1 on #3058. The leader-scoped join ADDS an obligation the retired
+    // tier-aggregate did not have: right after a handoff the join correctly
+    // selects the NEW holder, whose refresh flag is still at the 0 it was
+    // seeded with at registry construction, because the recovery chain is its
+    // only writer. So `== 0` is true for the whole of that leader's first
+    // chain. Without a `for:` longer than a chain, this alert pages on every
+    // handoff -- a false page shipped by the very guidance meant to make the
+    // instrument read honestly. "Do not size off the tick interval" said what
+    // NOT to do and left the reader to guess the rest.
+    it("tells the operator what to size `for:` off, not just what to avoid", async () => {
+      const help = await helpLine(COLD_IN_REVIEW_ISSUE_METRICS_REFRESH_SUCCESS_METRIC);
+      expect(help).toContain("for:");
+      // The floor must be stated in terms of the CHAIN, which is the thing that
+      // actually bounds the window -- not the tick interval.
+      expect(help.toLowerCase()).toContain("chain");
+      // And it must carry a concrete observed figure, so the reader is not left
+      // to invent one. 2985s is the worst workers-tier chain over the 7d to
+      // 2026-10-28; the previously-quoted 645s was a single sample.
+      expect(help).toContain("2985");
+    });
+
     it("names the lease that actually gates the chain, not an invented one", async () => {
       // The join is only correct if it keys off the lease the recovery chain is
       // gated on. `heartbeat-timer` is HEARTBEAT_TIMER_LEASE in
