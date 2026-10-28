@@ -1217,6 +1217,33 @@ export class GitCommandTimeoutError extends Error {
 }
 
 /**
+ * Raised when a git subprocess ran to completion and exited non-zero.
+ *
+ * This is the one `runGit` failure that is *evidence about the repository*: git
+ * was asked, and it answered. `isInconclusiveGitFailure` keys on this class to
+ * say so **positively**.
+ *
+ * That positive marker is the whole point of the class (PEN-4900). The
+ * classification used to rest on this throw being a bare `Error` carrying no
+ * `code` -- an invariant held 2,800 lines away from the predicate that depended
+ * on it, and silently breakable from here. Attaching a `code: "ERR_GIT_EXIT"`
+ * for diagnostics reads as purely additive at this call site; what it would
+ * actually have done is match the predicate's `ERR_` arm, reclassify *every*
+ * real verdict as inconclusive, and so disable the `fs.rm(dotGit)` cleanup in
+ * `relinkHuskGitWorktree` -- with nothing louder than a `warn` to show for it.
+ * Carrying the verdict in the type makes decorating this error additive again.
+ *
+ * The message is unchanged from the historical string so existing
+ * `gitErrorIncludes` matching still works.
+ */
+export class GitCommandFailedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "GitCommandFailedError";
+  }
+}
+
+/**
  * `git submodule status` line shape: a status character, the full object id,
  * then the path. Anchored deliberately -- it is the guard that makes salvaging a
  * *partial* stream safe, because neither a head-chopped fragment (which has lost
@@ -1269,7 +1296,17 @@ async function runGit(
     });
   }
   if (proc.code !== 0) {
-    throw new Error(proc.stderr.trim() || proc.stdout.trim() || `git ${args.join(" ")} failed`);
+    // git ran and answered: this is a VERDICT about the checkout, and the class
+    // is what says so. `isInconclusiveGitFailure` keys on it (see its docblock),
+    // so any field added here for diagnostics -- including a `code` -- stays
+    // purely additive.
+    //
+    // ⛔ Do NOT downgrade this back to a bare `new Error(...)`. The predicate
+    // would fall through to its deliberately broad `ERR_` arm, so a `code` such
+    // as `"ERR_GIT_EXIT"` would reclassify every real verdict as inconclusive,
+    // `relinkHuskGitWorktree` would stop running its `fs.rm(dotGit)` cleanup,
+    // and the only trace would be a `warn` (PEN-4900).
+    throw new GitCommandFailedError(proc.stderr.trim() || proc.stdout.trim() || `git ${args.join(" ")} failed`);
   }
   return proc.stdout.trim();
 }
@@ -4069,9 +4106,14 @@ async function hasLinkedGitWorktreeRegistration(repoRoot: string, worktreePath: 
  *   errors (`ERR_INVALID_ARG_TYPE` from a non-string command or a malformed
  *   options object, `ERR_INVALID_ARG_VALUE` from a bad `stdio`), and they
  *   carry **no `syscall`** -- measured on node 24: `TypeError`/`RangeError`
- *   with an `ERR_`-prefixed `code` and `syscall === undefined`. Matching them
- *   on that prefix is sound here because the one shape that IS a verdict is a
- *   plain `Error` built from stderr, which carries no `code` at all.
+ *   with an `ERR_`-prefixed `code` and `syscall === undefined`.
+ *
+ *   Matching them on that prefix is sound only because the shape that IS a
+ *   verdict is recognised **first and positively**, by its class
+ *   (`GitCommandFailedError`). It does not rest on that error happening to
+ *   carry no `code` -- an invariant that lived at the `runGit` throw 2,800
+ *   lines away and that a `code` added there for diagnostics would have broken
+ *   silently, turning every real verdict inconclusive (PEN-4900).
  *
  *   That prefix test is deliberately BROADER than synchronous spawn
  *   validation: it also catches any node-internal `ERR_*` rejection raised
@@ -4081,7 +4123,8 @@ async function hasLinkedGitWorktreeRegistration(repoRoot: string, worktreePath: 
  *   to *inconclusive*, and the worst an inconclusive outcome can do is skip a
  *   cleanup. It can never reach the `fs.rm`. A false NEGATIVE is the one that
  *   deletes a good `.git`, so when a shape is ambiguous, classify it here.
- * - a **non-zero exit** -- git ran and answered. That one IS a verdict.
+ * - a **non-zero exit** -- git ran and answered. That one IS a verdict, and
+ *   arrives as `GitCommandFailedError`.
  *
  * The synchronous arm is unreachable from today's only call site, which builds
  * its arguments through `resolveServerGitInvocation`, but it is classified
@@ -4095,6 +4138,9 @@ async function hasLinkedGitWorktreeRegistration(repoRoot: string, worktreePath: 
  * stall is not a finding.
  */
 function isInconclusiveGitFailure(error: unknown): boolean {
+  // Positive, and first: a non-zero exit is git's answer however the error is
+  // decorated, so no arm below can reclassify a verdict (PEN-4900).
+  if (error instanceof GitCommandFailedError) return false;
   if (error instanceof GitCommandTimeoutError) return true;
   const candidate = error as NodeJS.ErrnoException | null;
   if (typeof candidate?.syscall === "string") return true;
@@ -4158,6 +4204,17 @@ async function createGitLinkExclusively(
  */
 export const createGitLinkExclusivelyForTests = createGitLinkExclusively;
 export const isInconclusiveGitFailureForTests = isInconclusiveGitFailure;
+
+/**
+ * Test seam for `runGit` itself (PEN-4900).
+ *
+ * `isInconclusiveGitFailureForTests` can only assert how a *given* error is
+ * classified; it cannot assert that the production throw still has the shape
+ * the classification keys on. Those two halves compose into the real guarantee
+ * -- "a genuine non-zero exit is still a verdict, whatever it carries" -- only
+ * if both are pinned, so the throw site is reachable from a test too.
+ */
+export const runGitForTests = runGit;
 
 /**
  * BLO-49622: re-link a husk worktree — a dir whose `.git` link file is gone
