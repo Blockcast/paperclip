@@ -130,6 +130,7 @@ export interface DecodedFrame {
  * Returns a function that accepts whatever a socket `data` event produced and
  * yields the frames completed by it. A stream parser rather than a
  * read-it-all-then-parse is required on both legs: the MCP door is a long-lived
+ * paperclip:allow-git-push: prose about the verb the broker brokers (PEN-4933 / PEN-3183 D1); nothing here invokes git.
  * bidirectional relay with no end, and a `git push` streams progress for as
  * long as the pack takes to upload.
  *

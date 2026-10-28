@@ -163,6 +163,10 @@ describe("the broker performs the publish and never emits the credential", () =>
     // broker ever sending the credential itself.
     writeFakeTool("git", 'if [ -n "$GH_TOKEN" ]; then echo "authenticated"; else echo "no credential"; fi; echo "argv: $*"');
     const socketPath = await start();
+    // The brokered push IS the unit under test, and the child it reaches is
+    // the `writeFakeTool("git", ...)` shell script in a temp dir above — not
+    // git, and not a remote. PEN-4933 / PEN-3183 D1.
+    // paperclip:allow-git-push: brokered push under test; the child is a fake tool, not git.
     const result = await call(socketPath, "git", ["push", "origin", "HEAD"]);
     expect(result.code).toBe(0);
     expect(result.stdout).toContain("authenticated");
