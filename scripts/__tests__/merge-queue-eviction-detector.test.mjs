@@ -894,6 +894,106 @@ test("PEN-4887 (Ally review, 2nd pass): a check run and a status sharing a name 
   );
 });
 
+test("PEN-4887 (Ally review, 3rd pass): two check runs sharing a name are two contexts, not one", () => {
+  // `/check-runs?filter=latest` already yields the newest run per check run,
+  // so two rows sharing a name are two genuinely distinct runs -- separate
+  // lanes, or `pull_request` and `pull_request_target` publishing the same
+  // name. Measured on this script's own head `de82d2d`: `review` appears
+  // twice, runs 122712076437 and 122711949261, in different check suites.
+  //
+  // Collapsing them by name lets the FINISHED lane stand in for the in-flight
+  // one, which is skipped for having no timestamp -- so the context reads
+  // complete and the cause line silently drops a lane that had not finished.
+  // Safe for the verdict (it fails toward the old one) but wrong in the
+  // deliverable, which is the same class of defect as the status miscount.
+  const evidence = admissionRejection({
+    headChecks: [
+      { id: 122711949261, name: "review", conclusion: "success", completedAt: "2026-10-28T07:46:20Z", surface: "check_run" },
+      { id: 122712076437, name: "review", conclusion: null, completedAt: null, surface: "check_run" },
+    ],
+  });
+
+  assert.equal(evidence.checkCount, 2, "two distinct runs, two contexts -- the run id is the identity, not the name");
+  assert.equal(evidence.completedByDequeue, 1, "only the finished lane counts as complete");
+  assert.deepEqual(
+    evidence.incompleteAtDequeue,
+    ["review"],
+    "the in-flight lane must survive, so the cause line still names `review` as unmet",
+  );
+  assert.equal(evidence.rejected, true, "a fresh head with a lane still running is the admission-rejection shape");
+});
+
+test("PEN-4887 (Ally review, 3rd pass): one name is never printed twice, however many lanes carry it", () => {
+  // Counts are per context; the NAME list is what the notice prints, and
+  // branch protection requires by name. Two unfinished `review` lanes are two
+  // contexts but one unmet requirement -- printing `review` twice would read
+  // as exactly the duplicate-row defect this collapse exists to fix.
+  const evidence = admissionRejection({
+    headChecks: [
+      { id: 1, name: "review", conclusion: null, completedAt: null, surface: "check_run" },
+      { id: 2, name: "review", conclusion: null, completedAt: null, surface: "check_run" },
+    ],
+  });
+
+  assert.equal(evidence.checkCount, 2, "the count still sees both lanes");
+  assert.deepEqual(evidence.incompleteAtDequeue, ["review"], "but the reader sees the requirement once");
+});
+
+test("PEN-4887 (Ally review, 3rd pass): statuses still collapse by name, having no per-row identity", () => {
+  // The mirror of the test above. A status row's id is per POST, so keying
+  // statuses on an id would defeat the history collapse entirely and restore
+  // the original defect. Statuses are identified by their context name, and
+  // `ghHeadChecks` deliberately does not project an `id` for them.
+  const evidence = admissionRejection({
+    headChecks: [
+      { name: "review/ally-comment", conclusion: "success", completedAt: "2026-10-28T07:46:21Z", surface: "status" },
+      { name: "review/ally-comment", conclusion: "success", completedAt: "2026-10-28T07:46:24Z", surface: "status" },
+      { name: "review/ally-comment", conclusion: "success", completedAt: "2026-10-28T07:48:36Z", surface: "status" },
+    ],
+  });
+
+  assert.equal(evidence.checkCount, 1, "three posts of one context stay one context");
+  assert.equal(evidence.completedByDequeue, 1);
+  assert.deepEqual(evidence.incompleteAtDequeue, []);
+});
+
+test("PEN-4887 (Ally review, 3rd pass): the check-runs projection asks GitHub for the run id", () => {
+  // The `exec` seam CANNOT cover this one. Every other property of
+  // `ghHeadChecks` is asserted behaviourally through that seam, deliberately,
+  // because a fetch whose result is dropped on the floor still matches a grep
+  // -- but the stub returns canned NDJSON and never runs `jq`, so a projection
+  // that stopped requesting `id` would leave the seam test green while every
+  // check run on a real head arrived without an identity and collapsed by name
+  // again. Pin the projection itself; the seam test below covers the contract
+  // the id feeds.
+  const source = readFileSync(DETECTOR_SOURCE_PATH, "utf8");
+
+  assert.match(
+    source,
+    /\.check_runs\[\] \| \{id, name,/,
+    "the check-runs jq must project `id`, or the per-lane identity is lost at the read",
+  );
+  assert.ok(
+    !/\{name: \.context, conclusion: \.state, completedAt: \.updated_at, id/.test(source),
+    "and the statuses jq must NOT project one -- a status id is per post and would defeat the collapse",
+  );
+});
+
+test("PEN-4887 (Ally review, 3rd pass): ghHeadChecks carries a check-run id through, and no status id", () => {
+  // The contract the projection above feeds: without an id on the check run
+  // the classifier falls back to keying by name, which is the collapse this
+  // pass removed.
+  const exec = (args) =>
+    args.some((arg) => String(arg).includes("/check-runs"))
+      ? '{"id":122712076437,"name":"review","conclusion":null,"completedAt":null}\n'
+      : '{"name":"review/ally-comment","conclusion":"success","completedAt":"2026-10-28T07:46:24Z"}\n';
+
+  const [checkRun, status] = ghHeadChecks("Blockcast/paperclip", "de82d2d", exec);
+
+  assert.equal(checkRun.id, 122712076437, "a check run must carry its run id");
+  assert.equal(status.id, undefined, "a status must NOT, or the history collapse is defeated");
+});
+
 test("PEN-4887 (Ally review, 2nd pass): an unambiguous name is never qualified with its surface", () => {
   // The qualifier is for collisions only. Tagging every name would make the
   // common notice noisier for no reader benefit.
