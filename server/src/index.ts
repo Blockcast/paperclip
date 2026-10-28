@@ -134,7 +134,7 @@ import { initTelemetry, getTelemetryClient } from "./telemetry.js";
 import { conflict } from "./errors.js";
 import { githubReviewerAppSlug } from "./services/github-app-auth.js";
 import { reconcileContendedPrReviewerWakes } from "./routes/github-webhook.js";
-import { coordinateHeartbeatSchedulerShutdown, HEARTBEAT_SCHEDULER_IDLE_WAIT_TIMEOUT_MS } from "./shutdown.js";
+import { closeServerBounded, coordinateHeartbeatSchedulerShutdown, HEARTBEAT_SCHEDULER_IDLE_WAIT_TIMEOUT_MS } from "./shutdown.js";
 import type {
   InstanceDatabaseBackupRunResult,
   InstanceDatabaseBackupTrigger,
@@ -3654,25 +3654,15 @@ export async function startServer(): Promise<StartedServer> {
       }
 
       writeShutdownBreadcrumb(`step: server.close (signal=${signal})`);
-      await new Promise<void>((resolveClose) => {
-        // BLO-49139: server.close waits for every open connection. Bound it so
-        // a long-lived request cannot starve the run drain below of the grace
-        // period; after the cap, force-close what is left.
-        const forceClose = setTimeout(() => {
-          writeShutdownBreadcrumb("server.close exceeded 10s; closing all connections");
-          server.closeAllConnections?.();
-        }, 10_000);
-        forceClose.unref();
-        server.close((err) => {
-          clearTimeout(forceClose);
-          if (err) logger.warn({ err }, "server.close error");
-          resolveClose();
-        });
-        server.closeIdleConnections?.();
-      });
+      const closeErr = await closeServerBounded(server, 10_000, () =>
+        writeShutdownBreadcrumb("server.close exceeded 10s; closing all connections"),
+      );
+      if (closeErr) logger.warn({ err: closeErr }, "server.close error");
+      writeShutdownBreadcrumb(`step: server.close done (signal=${signal})`);
 
       const telemetryClient = getTelemetryClient();
       if (telemetryClient) {
+        writeShutdownBreadcrumb(`step: telemetry flush (signal=${signal})`);
         telemetryClient.stop();
         await telemetryClient.flush();
       }
