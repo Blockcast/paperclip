@@ -24,6 +24,7 @@ import {
   type Db,
 } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
+import { logger } from "../middleware/logger.js";
 import {
   buildWorkspaceRuntimeDesiredStatePatch,
   buildWorkspaceTemplateData,
@@ -8201,10 +8202,25 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
     // The primitive is content-agnostic, so this drives it with a payload large
     // enough that a create which is atomic in NAME but not in CONTENT leaves an
     // observable window every time. That is the point: contention alone exposes
-    // the defect at ~0.075%, which is not a mutation check. At this size the
-    // pre-fix `writeFile(..., { flag: "wx" })` was measured red on 5 of 5 trials
-    // (4-9 short reads each) and the staged-then-`link` create green on 5 of 5.
-    const content = `gitdir: ${"x".repeat(8 * 1024 * 1024)}\n`;
+    // the defect at ~0.075%, which is not a mutation check.
+    //
+    // 1 MB, down from the 8 MB first shipped (PEN-4878) -- and re-measured at
+    // the new size rather than inferred, because a quieter test that no longer
+    // reliably goes red on the unfixed code is strictly worse than an expensive
+    // one that does. Same protocol as this test, 20 trials x 3 rounds per size,
+    // node 24 on the CI runner's tmpdir:
+    //
+    //   size   pre-fix `wx`            post-fix staged+`link`
+    //   1 MB   red 20/20, 4-7 short    green 20/20
+    //   8 MB   red 20/20, 3-10 short   green 20/20
+    //
+    // So 1 MB detects the mutation on every trial with a *tighter* floor than
+    // 8 MB did (4 short reads vs 3), at an eighth of the I/O -- this shard
+    // writes ~3 MB instead of ~24 MB. A 5-trial sweep put the first thinning of
+    // the margin at 256 KB (red 5/5 but only 2-3 short reads), which is why
+    // this stops at 1 MB rather than going smaller. If you change the size
+    // again, re-run that mutation check and record the trial count here.
+    const content = `gitdir: ${"x".repeat(1024 * 1024)}\n`;
     const partials: number[] = [];
 
     for (let round = 0; round < 3; round += 1) {
@@ -8277,12 +8293,58 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
     expect(isInconclusiveGitFailureForTests(null)).toBe(false);
   }, 20_000);
 
+  it("tells a SYNCHRONOUS spawn failure apart from a real non-zero exit (PEN-4878)", async () => {
+    // The fourth shape, and the one the first cut of the discriminator read
+    // backwards. `spawn()` validates its arguments and throws *synchronously*
+    // for a malformed command or options object, so the throw escapes
+    // `executeProcess`'s Promise executor instead of arriving as the child's
+    // `error` event -- which means no `syscall`, and the pre-PEN-4878 check
+    // scored it a verdict. Direction of failure mattered: the caller acts on a
+    // verdict by `fs.rm`-ing a `.git` it had just written correctly.
+    //
+    // Driven through the real process runner rather than a hand-built
+    // stand-in, because the whole discriminator rests on which fields node
+    // actually sets -- the same rationale as the ENOENT case above.
+    const syncThrows = await Promise.all([
+      // ERR_INVALID_ARG_TYPE -- command is not a string.
+      { command: 7 as unknown as string, args: [], cwd: os.tmpdir() },
+      // ERR_INVALID_ARG_TYPE -- malformed options (cwd is not a path).
+      { command: "git", args: ["rev-parse"], cwd: 7 as unknown as string },
+    ].map((input) => executeProcessForTests(input).then(() => null, (error: unknown) => error)));
+
+    for (const thrown of syncThrows) {
+      // The shape itself, asserted rather than assumed: an ERR_-coded
+      // validation error with no `syscall` for the first arm to catch.
+      expect(thrown).toBeInstanceOf(Error);
+      expect((thrown as NodeJS.ErrnoException).syscall).toBeUndefined();
+      expect((thrown as NodeJS.ErrnoException).code).toMatch(/^ERR_/);
+      expect(isInconclusiveGitFailureForTests(thrown)).toBe(true);
+    }
+
+    // Two-sided, or this scores identically to "always inconclusive", which
+    // would stop a genuinely unresolvable worktree ever being cleaned up: an
+    // ERR_-ish *message* is not an ERR_ code, and a verdict carries no code.
+    expect(isInconclusiveGitFailureForTests(new Error("ERR_INVALID_ARG_TYPE"))).toBe(false);
+    expect(isInconclusiveGitFailureForTests(
+      Object.assign(new Error("fatal: not a git repository"), { code: 128 }),
+    )).toBe(false);
+  }, 20_000);
+
   it("keeps a correct .git when git cannot be run, and removes it only on a real verdict (PEN-4877)", async () => {
     const previous = process.env.PAPERCLIP_SERVER_GIT;
     const restore = () => {
       if (previous === undefined) delete process.env.PAPERCLIP_SERVER_GIT;
       else process.env.PAPERCLIP_SERVER_GIT = previous;
     };
+    // PEN-4878: the refusal this function returns on an inconclusive probe is
+    // outwardly identical to "this husk is not repairable", so the only thing
+    // separating a persistently broken git binary from an unrepairable husk is
+    // this warning. Asserted on both sides below -- a log that also fires on a
+    // real verdict would be noise an operator learns to ignore.
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => logger);
+    const warningsNaming = (worktreePath: string) => warn.mock.calls.filter(
+      ([fields]) => (fields as { worktreePath?: unknown } | undefined)?.worktreePath === worktreePath,
+    );
     try {
       // Side A -- no verdict. Node cannot start git at all, which the old
       // catch-all read as "this worktree does not resolve" and acted on by
@@ -8297,6 +8359,12 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
 
       expect(await relinkHuskGitWorktree(inconclusive.repoRoot, inconclusive.worktreePath)).toBe(false);
       expect(existsSync(inconclusiveDotGit)).toBe(true);
+      // ...and said so, naming the worktree and the error, rather than
+      // refusing silently on every wake.
+      const inconclusiveWarnings = warningsNaming(inconclusive.worktreePath);
+      expect(inconclusiveWarnings).toHaveLength(1);
+      expect(inconclusiveWarnings[0]?.[1]).toMatch(/inconclusive/i);
+      expect((inconclusiveWarnings[0]?.[0] as { err?: unknown })?.err).toBeInstanceOf(Error);
       restore();
       // The link it kept is the correct one -- so the refusal was transient and
       // the next wake succeeds, rather than the husk being recreated.
@@ -8318,8 +8386,12 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
 
       expect(await relinkHuskGitWorktree(verdict.repoRoot, verdict.worktreePath)).toBe(false);
       expect(existsSync(verdictDotGit)).toBe(false);
+      // The other side: git ran and answered, so this is a verdict and must NOT
+      // be reported as an inconclusive probe.
+      expect(warningsNaming(verdict.worktreePath)).toEqual([]);
     } finally {
       restore();
+      warn.mockRestore();
     }
   }, 40_000);
 
