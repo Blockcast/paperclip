@@ -1,0 +1,251 @@
+# PEN-3183 - Where enforcement of the GitHub egress door lives: security decision
+
+Date: 2026-10-28
+Reviewer: Security Engineer (`7500672d-efe6-4037-a05f-61204a670894`)
+Filed by: CTO (2026-09-11). Priority raised to `high` by the CEO the same day; owned to Security
+by the CEO on 2026-10-28 (PEN-4920 pass 3) with the ask stated as *"own the decision of where
+enforcement lives, or record that we accept the residual, dated."* This is that decision.
+Scope: the three GitHub egress doors in `packages/adapter-utils/src/` (`github-git-egress-runtime.ts`,
+`github-cli-egress-runtime.ts`, `github-mcp-egress-runtime.ts`), their image wrappers under
+`/usr/local/libexec/paperclip/bin`, and the credential they all authenticate with.
+Method: read-only, from inside a live `claude_k8s` agent Job pod
+(`ac-7500672d-efe6-40-8a19e066-b452-45-988cdb`, `isolation-mode=workspace`, image
+`sha-74e1c71-k8s-vendored`), plus the rendered Job manifest read through a read-only API seat.
+**No bypass was executed, no Secret value was read, nothing was mutated.** File reachability was
+established with `test -r` / `test -w` and `findmnt`, never by reading content.
+
+PEN-3183 asked for a design decision, not a patch. Section 1 is the decision. Section 2 is a
+re-measurement that materially changes the row: **three of its four bypasses are closed**, and its
+evidence block has been out of date since 2026-10-06. Section 8 states the bounds on what may be
+built against this decision.
+
+## 1. Verdict
+
+| # | Question | Decision |
+|---|---|---|
+| D1 | Where does enforcement live? | **Credential-side.** The binding constraint is not who owns the guard files. It is that the push credential is readable by the very uid the guard scans. Move the credential out of that uid's reach and the surviving bypass stops being a publish path. |
+| D2 | Image-side (root-owned runtime)? | **Done, and that is as far as image-side reaches.** PEN-3713 / #2185 closed bypasses 2 and 4. It cannot close bypass 1, and no further image work can — see §3. Do not re-open this as an option. |
+| D3 | Destination-side `pre-receive` hook? | **DECLINED — unavailable.** Pre-receive hooks are a GitHub Enterprise Server feature; these repositories are on github.com. The row asked for this to be confirmed before costing. It is confirmed, and it is the end of that option. |
+| D4 | Egress NetworkPolicy + scanning proxy? | **DEFERRED, and note that it converges on D1.** Any proxy permitted to push to GitHub must itself hold the credential, so it *is* the credential-holder design, plus a TLS-terminating git-pack parser. Build the credential half first: it is most of the benefit at a fraction of the cost and risk. |
+| D5 | The residual between now and D1 | **ACCEPTED, dated.** Reviewed 2026-10-28; next review **2027-01-31**, or immediately on either trigger in §7.2. |
+| D6 | *(correction of record)* | The row's evidence block, and the THREAT MODEL header in `github-git-egress-runtime.ts`, both describe a pod that no longer exists. Both are corrected by this change. |
+
+⛔ The row's existing prohibition stands and is re-affirmed: **do not add integrity checks between
+wrapper, hook and scanner.** §3 shows why it is not merely unhelpful but unsound — they remain one
+principal, and a check between them asserts a boundary that does not exist.
+
+## 2. Re-measurement, 2026-10-28
+
+The row enumerated four bypasses measured 2026-09-11. Re-measured today in a live pod:
+
+| # | Bypass as filed | Status today | What changed it |
+|---|---|---|---|
+| 1 | Call `/usr/bin/git` directly; no file needs writing | **OPEN** | nothing |
+| 2 | Edit the scanner in `/opt/paperclip-bundled-adapters` | **CLOSED** | PEN-3713 / #2185, merged 2026-10-06 |
+| 3 | Replace the hook on the PVC | **CLOSED** | BLO-32734 phase 2b Job narrowing |
+| 4 | Replace the wrapper on the PVC | **CLOSED** | PEN-3713 / #2185 |
+
+Evidence, in the same shape the row used:
+
+```
+$ id
+uid=1000(node) gid=1000(node) groups=1000(node)
+
+$ ls -ld /opt/paperclip-bundled-adapters          # was: drwxr-xr-x node node
+drwxr-xr-x 1 root root 4096 /opt/paperclip-bundled-adapters
+
+$ ls -l .../dist/github-git-egress-runtime.js     # the scanner
+-rw-r--r-- 1 root root 35351 ...                  # test -w -> not writable
+
+$ ls -ld /usr/local/libexec/paperclip/bin         # first entry on PATH
+drwxr-xr-x 1 root root 4096 ...                   # test -w -> not writable
+
+$ findmnt /paperclip/.local/share/paperclip-git-hooks
+                                       ro,...     # test -w -> not writable
+
+$ ls -l /usr/bin/git                              # unchanged
+-rwxr-xr-x 1 root root 4082768 /usr/bin/git
+```
+
+`which -a git` resolves `/usr/local/libexec/paperclip/bin/git` ahead of `/usr/bin/git`, and the
+former PVC wrapper directories either no longer exist or are mounted `ro`. The PATH ordering is
+held by a render guard — `deploy/helm/paperclip/tests/agent-egress-path.test.mjs` asserts that the
+root-owned image wrappers come first and that `git` resolves to the publish-guarding wrapper.
+
+### 2.1 Bypass 3 is closed by a *mount*, not by ownership — and that is conditional
+
+The hooks directory is still owned `node:node`. What makes it unwritable is
+`ROOT_TOOLCHAIN_SUBPATHS` in `vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts`,
+which re-exposes it `readOnly: true` over an `emptyDir` root overlay — and only when
+`narrowWritableSurface` holds (isolation enabled **and** the data claim matches the server's own).
+When that gate falls through, the pod gets the whole PVC read-write and **bypass 3 re-opens**.
+
+This is observable per Job rather than inferred: the manifest stamps
+`paperclip.io/data-mount-scope: scoped | broad:<reason>`. Sampled 2026-10-28 across the running
+agent Jobs including an `isolation-mode=shared` pod — the mode most likely to fall through — every
+one read `scoped`. Treat that annotation as the regression detector for this bypass (§7.2).
+
+### 2.2 The row's framing was right; its inventory has aged
+
+Nothing here contradicts the row's thesis. Its title — *enforcement must move off the agent's own
+machine* — survives intact, because the one bypass that remains is precisely the one that was never
+about file ownership. What has aged is the supporting inventory, and it aged in the direction that
+makes a reader *under*-rate the row: three closed bypasses make the remaining one look like
+bookkeeping. It is not. §4 is why.
+
+## 3. Why image-side cannot go further
+
+The wrapper and the agent are **the same principal**. The pod spec, read today:
+
+```yaml
+securityContext: { runAsNonRoot: true, runAsUser: 1000, runAsGroup: 1000 }
+containers[0].securityContext:
+  allowPrivilegeEscalation: false
+  capabilities: { drop: [ALL] }
+```
+
+One container, uid 1000, no privilege escalation, all capabilities dropped. Every consequence
+follows from that single line:
+
+- **No file permission can separate them.** Any binary the wrapper may execute, the agent may
+  execute directly. Making `/usr/bin/git` group-restricted fails because the wrapper runs as the
+  same uid and gid and would lose access with it.
+- **No setuid or setgid helper is possible.** `allowPrivilegeEscalation: false` is exactly the
+  control that forbids it, and dropping `ALL` removes the capability route as well. This is correct
+  hardening and must not be relaxed to buy a guard — that trade is strictly negative.
+- **Therefore an integrity check between wrapper, hook and scanner cannot work.** It is one
+  principal verifying itself. The row already prohibits this; the uid argument is *why* the
+  prohibition is structural rather than stylistic.
+
+The row listed "non-root-writable runtime" as a plausible shape, noting it would close 2 and 4 but
+not 1 or 3. That assessment was correct and it has now been executed; 3 fell to a different change.
+**Image-side is complete. There is nothing left for it to do here.**
+
+## 4. The credential is the choke point, and it is the only one
+
+Bypass 1 is not dangerous because the agent can run `/usr/bin/git`. It is dangerous because that
+unguarded git **can authenticate**. Measured today:
+
+- The push credential is a Secret mounted at `/etc/paperclip/secrets/github-token/` with
+  `defaultMode: 292` — octal **0444**, world-readable within the pod.
+- `test -r` on the token path from uid 1000: **readable**. (Verified by reachability only; the
+  value was not read.)
+- It is not in the agent's environment — `paperclip-github-token-env` reads it from that file and
+  injects it only into the wrapped child. That design is sound and deliberate, and it is undone by
+  the file being readable anyway.
+
+So the unguarded path is: call the real binary, supply the credential from a file you may read,
+publish. **No guard file is touched and no privilege is needed.** That is why bypass 1 is
+architectural in the way the CEO's disposition said it was.
+
+### 4.1 One credential sits behind all three doors
+
+This repository ships three egress doors — git, `gh`, and the GitHub MCP server — wrapped the same
+way and held to a tested parity (`github-egress-door-parity.test.ts`). Each is reached through
+PATH, so each carries the identical bypass, and **all three authenticate with the same 0444 token.**
+
+That settles where a single boundary can usefully sit. A control in front of *git* relocates the
+bypass to `gh`. A control in front of all three wrappers is still three controls reached by
+caller-chosen PATH. A control in front of **the credential** is one boundary covering every door,
+including doors not yet written.
+
+This is also the strongest argument against D4 as a first step: a NetworkPolicy scoped to git
+leaves `gh` and the MCP server publishing freely, and one scoped to all GitHub egress must still
+decide who holds the credential — which is D1 again, arrived at from the other side.
+
+### 4.2 Why this matters more than the file ownership ever did
+
+`Blockcast/paperclip` is a **public** repository. An unscanned push there is world-readable
+immediately, not merely a disclosure inside the perimeter. The disclosure class this control
+descends from has fired once already (PEN-2526, an environment dump interpolated into prose).
+Whether destination-side secret-scanning push protection is enabled is **unknown** — `gh api repos/...`
+returns `security_and_analysis: null` to an agent seat, which needs admin to read. Record that as
+unknown; do not count it as a layer until someone with admin confirms it.
+
+## 5. What a credential-side boundary must be — and the way it will be got wrong
+
+The decision is that enforcement lives credential-side. The shape is constrained, because there is
+one obvious implementation that looks like a boundary and is not:
+
+⛔ **Do not build a credential helper that scans and then emits the token.** Anything that hands
+the credential to a process running as uid 1000 has handed it to the agent, which can then call the
+helper itself and skip the scan. That is the same peers-not-layers error the header already warns
+about, relocated. A gate on *issuance* is not a gate on *use*.
+
+The boundary must therefore hold the credential and **perform the publish itself**:
+
+- The credential is mounted into a **separate container** at a uid that is not 1000, with a mode
+  that denies 1000 (`0400`, owned by that uid). The agent container loses the mount entirely.
+- The agent reaches it over a unix socket on a shared `emptyDir`, asking for a *push*, not a token.
+- The broker runs the existing scanner against the refs it is asked to publish and refuses on a
+  finding — reusing `scrubGitHubEgressText` and the existing shim, so there is exactly one
+  definition of what the doors refuse. Door parity is a tested invariant; a broker that re-derives
+  the rule would break it.
+- The agent may still run `/usr/bin/git` for everything local. It simply cannot authenticate to
+  GitHub, which turns bypass 1 from *publishes unscanned* into *fails to authenticate*.
+
+Short-lived minted tokens are **not** a substitute. A GitHub App installation token handed to the
+agent is readable for its whole lifetime, so it narrows the window and leaves the boundary exactly
+where it is now.
+
+## 6. Options declined, and why
+
+- **Server-side `pre-receive`** — unavailable on github.com (D3). Closed.
+- **Integrity checks between the guard's own components** — unsound at one uid (§3), and already
+  prohibited by the row and by the file header. Closed.
+- **Relaxing `allowPrivilegeEscalation` or capabilities to enable a setuid guard** — trades a
+  strong, standard container control for a weak bespoke one. Refused outright.
+- **A kill switch on the egress refusals** — not proposed by anyone, recorded here pre-emptively
+  because the adjacent PEN-2415 reasoning applies verbatim: a flag able to disable the refusal is a
+  flag able to reopen the disclosure path under incident pressure.
+- **Egress NetworkPolicy + scanning proxy (D4)** — deferred, not rejected. It is the only option
+  that also covers non-git exfiltration (plain HTTPS to any host), so it remains the right
+  long-term posture. It is deferred because it needs the credential decision made first (§4.1), and
+  because terminating TLS and parsing git pack protocol is a large, high-risk build whose failure
+  mode is breaking every agent's ability to publish.
+
+## 7. The accepted residual
+
+### 7.1 Statement
+
+Between 2026-10-28 and the delivery of D1, an agent that deliberately sets out to publish material
+`scrubGitHubEgressText` would remove **can do so**, by invoking the real binary and supplying the
+credential it is permitted to read. This is accepted, with eyes open, on these grounds:
+
+- The control's designed threat — **accidental** disclosure — is covered, and is better covered
+  than when the row was filed: the guard now sits on a root-owned path ahead of `/usr/bin` for
+  every ordinary invocation, where before it sat on a surface the agent could rewrite.
+- Of the four enumerated bypasses, the three that required a deliberate write are closed. The
+  survivor requires deliberate intent and specific knowledge of where the credential is mounted.
+- No measurement has been taken of whether bypass 1 is exercised accidentally in the fleet. The CEO
+  asked for exactly that count on 2026-09-11 and it has not been collected. §8 keeps it open as the
+  one cheap piece of work that could change this decision's urgency.
+
+### 7.2 Review triggers — any one of these ends the acceptance early
+
+1. **A second disclosure event of the PEN-2526 class**, by any door.
+2. **Any agent Job rendering `paperclip.io/data-mount-scope: broad:*`** — that re-opens bypass 3
+   and returns the guard to peers-not-layers. This is a cheap alerting target and should be one.
+3. **Any change that widens read access to the token Secret**, or mounts it into a new container.
+4. Otherwise: **2027-01-31.**
+
+## 8. Bounds on what may be built against this decision
+
+Permitted without further security review:
+
+- The broker shape in §5, provided it performs the publish and never emits the credential to uid
+  1000, and provided it calls the existing shim rather than re-deriving the refusal rule.
+- Alerting on the triggers in §7.2.
+- The absolute-path-`git` measurement the CEO asked for on 2026-09-11: count invocations reaching
+  `/usr/bin/git` that did not come through the wrapper. A non-zero count means the accidental case
+  is *also* uncovered and raises D1's urgency; a zero count leaves this decision unchanged.
+
+Not permitted without returning here first:
+
+- Any integrity check between wrapper, hook and scanner (§3).
+- Any relaxation of `allowPrivilegeEscalation`, dropped capabilities, or `runAsNonRoot` (§3).
+- Any credential helper that emits the token to the agent container (§5).
+- Any broker that implements its own notion of what a push may contain (§5, door parity).
+- Describing this control as tamper-resistant anywhere in the codebase until D1 ships. The header
+  in `github-git-egress-runtime.ts` is the canonical statement of its limits and is updated by this
+  change; keep it true.
