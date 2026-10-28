@@ -2256,13 +2256,17 @@ export const PROCESS_RSS_RELEASE_ONSET_GC_WINDOW_COVERED_METRIC =
  * ⚠ A CANDIDATE property, with the direction deliberately NOT asserted. V8's
  * unmapper can free chunks on a background task rather than inside the
  * collection, so a releasing cycle need not cost more pause. A null result is
- * therefore informative rather than a failure: pause moving implicates work
- * done inside the cycle, pause flat while the release still lands implicates
- * the background unmapper, and both narrow the mechanism.
+ * therefore informative rather than a failure: pause MOVING implicates work done
+ * inside the atomic pause, while pause FLAT with the release still landing rules
+ * that out and is consistent with work outside it — the background unmapper, the
+ * concurrent-marking threads, or work outside V8 entirely. ⛔ A flat reading
+ * closes the one branch; it does not pick among the rest.
  *
  * ⭐ And it is CONTINUOUS. The row's binary candidates need ~628 paired onsets
  * for 80% power at the effect sizes measured so far, which at ~6 onsets/hour is
- * weeks; a per-onset magnitude carries far more information per episode.
+ * ~4–5 days of UNINTERRUPTED onsets — a FLOOR rather than an estimate, since the
+ * ring is per-process and a restart resets the pairing rather than pausing it. A
+ * per-onset magnitude carries far more information per episode.
  *
  * ⛔ NOT `nodejs_gc_duration_seconds`. That histogram is observed at the scrape,
  * aligned to scrape boundaries and labelled by `kind` alone — the same 30 s
@@ -5903,13 +5907,16 @@ function ensureRegistry(): {
         + "IT IS A CANDIDATE AND THE DIRECTION IS NOT ASSERTED: V8's unmapper can free chunks "
         + "on a BACKGROUND task rather than inside the collection, so a releasing cycle need "
         + "not cost more pause at all. That makes a null here informative rather than a "
-        + "failure -- pause moving implicates work inside the cycle, pause flat while the "
-        + "release still lands implicates the background unmapper, and both narrow the "
-        + "mechanism. Do NOT read this series as a claim that the releasing cycle is the "
-        + "longer one. "
+        + "failure -- pause MOVING implicates work inside the atomic pause, and pause FLAT "
+        + "while the release still lands RULES THAT OUT and is consistent with work outside "
+        + "it: the background unmapper, the concurrent-marking threads, or work outside V8 "
+        + "entirely. A flat reading closes the one branch and does NOT pick among the rest. "
+        + "Do NOT read this series as a claim that the releasing cycle is the longer one. "
         + "It is also CONTINUOUS, which is the point -- the binary candidates on this row need "
-        + "~628 paired onsets for 80% power, which at ~6 onsets/hour is weeks, where a "
-        + "per-onset magnitude carries far more information per episode. "
+        + "~628 paired onsets for 80% power, which at ~6 onsets/hour is ~4-5 days of "
+        + "UNINTERRUPTED onsets, and that is a FLOOR rather than an estimate: the ring is "
+        + "per-process, so a restart resets the pairing rather than pausing it. A per-onset "
+        + "magnitude carries far more information per episode. "
         + "NOT nodejs_gc_duration_seconds: that histogram is observed at the scrape, aligned to "
         + "scrape boundaries and labelled by kind alone, which is the same 30s readout limit "
         + "that makes the cycles series necessary; this is pause summed over a window centred "

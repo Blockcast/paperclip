@@ -39,7 +39,7 @@
  *    from under it and publish the window as clean.
  */
 
-import { describe, expect, it, beforeEach } from "vitest";
+import { describe, expect, it, afterEach, beforeEach } from "vitest";
 import { constants } from "node:perf_hooks";
 
 import {
@@ -53,6 +53,18 @@ import {
   DEFAULT_BASELINE_OFFSET_MS,
   GC_ENTRY_DELIVERY_SLACK_MS,
 } from "../services/rss-release-gc-attribution.js";
+import type { GcCycleWindow } from "../services/gc-flags-metrics.js";
+import type { RssReleaseGcAttribution } from "../services/rss-release-gc-attribution.js";
+import {
+  PROCESS_RSS_RELEASE_ONSET_GC_CYCLES_METRIC,
+  PROCESS_RSS_RELEASE_ONSET_GC_PAUSE_SECONDS_METRIC,
+  PROCESS_RSS_RELEASE_ONSET_GC_PAUSE_UNKNOWN_CYCLES_METRIC,
+  PROCESS_RSS_RELEASE_ONSET_GC_WINDOW_COVERED_METRIC,
+  PROCESS_RSS_RELEASE_ONSET_GC_WINDOW_SECONDS_METRIC,
+  __resetMetricsForTest,
+  renderMetrics,
+  setRssReleaseGcAttributionMetrics,
+} from "../services/metrics.js";
 import type { RssReleaseReading } from "../services/rss-release-tracker.js";
 
 const MAJOR = constants.NODE_PERFORMANCE_GC_MAJOR;
@@ -376,5 +388,140 @@ describe("release onset GC attribution", () => {
     // a positive trigger result manufactured from a window nobody watched.
     expect(attribution?.baseline?.covered).toBe(false);
     expect(attribution?.onset.covered).toBe(true);
+  });
+});
+
+/**
+ * The PUBLISH path, which the compute tests above never reach.
+ *
+ * `attributeRssReleaseGc` is tested hard because its failures are subtle;
+ * `setRssReleaseGcAttributionMetrics` is tested here because its failures are
+ * SILENT AND UNIT-SHAPED, which on this row is worse. The series are read by
+ * hand against a Prometheus console by someone comparing an onset window to its
+ * control, so:
+ *
+ * 1. **ms -> s happens exactly once.** `pauseMs` is milliseconds and the metric
+ *    name ends `_seconds`. A dropped or doubled `/ 1000` still renders a
+ *    plausible small number next to a cycle count, and the reader has nothing
+ *    in the exposition to check it against -- they would simply take a 1000x
+ *    error as the measurement. This is the one assertion that cannot be made
+ *    from the compute layer, where everything is ms.
+ *
+ * 2. **`pause_unknown_cycles` is published AT ZERO, for BOTH windows.** Zero is
+ *    the expected reading and therefore the one a `set`-only-when-non-zero
+ *    publish would omit. An absent qualifier is not a qualifier: the pause sums
+ *    are only readable as totals rather than lower bounds when this is known to
+ *    be 0, so omitting it at 0 silently converts "exact" into "unknown".
+ *
+ * 3. **A `null` attribution clears the previous episode.** These gauges are
+ *    frozen per onset, so a stale set left standing after the tracker loses the
+ *    release does not look stale -- it looks like the current episode.
+ */
+describe("setRssReleaseGcAttributionMetrics", () => {
+  afterEach(() => {
+    __resetMetricsForTest();
+  });
+
+  async function render(): Promise<string> {
+    return (await renderMetrics()).body;
+  }
+
+  /**
+   * Value of one sample, found by metric name + labels rather than by matching a
+   * rendered line, so the assertions do not depend on prom-client's label order.
+   * `null` when the series is absent, which several tests below assert directly.
+   */
+  function sample(body: string, metric: string, labels: Record<string, string>): number | null {
+    for (const line of body.split("\n")) {
+      if (!line.startsWith(`${metric}{`) && !line.startsWith(`${metric} `)) continue;
+      if (!Object.entries(labels).every(([k, v]) => line.includes(`${k}="${v}"`))) continue;
+      const value = line.slice(line.lastIndexOf(" ") + 1);
+      return Number(value);
+    }
+    return null;
+  }
+
+  const window = (over: Partial<GcCycleWindow> = {}): GcCycleWindow => ({
+    fromMs: 1_000_000,
+    toMs: 1_010_000,
+    classes: [{ kind: "major", flags: "schedule_idle", cycles: 3, pauseMs: 1_234.5 }],
+    observedCycles: 3,
+    observedPauseMs: 1_234.5,
+    pauseUnknownCycles: 0,
+    covered: true,
+    ...over,
+  });
+
+  const attribution = (over: Partial<RssReleaseGcAttribution> = {}): RssReleaseGcAttribution => ({
+    onsetAtMs: 1_005_000,
+    onset: window(),
+    baseline: window({ classes: [{ kind: "major", flags: "schedule_idle", cycles: 1, pauseMs: 400 }] }),
+    windowMs: 10_000,
+    ...over,
+  });
+
+  it("publishes pause in SECONDS, converting from the ms the window carries", async () => {
+    setRssReleaseGcAttributionMetrics(attribution());
+    const body = await render();
+    const labels = { window: "onset", kind: "major", flags: "schedule_idle" };
+    // 1234.5 ms. Chosen so a missing `/ 1000` (1234.5), a doubled one
+    // (0.0012345) and the correct value are three visibly different numbers --
+    // a round input would let a wrong scale still look like a pause time.
+    expect(sample(body, PROCESS_RSS_RELEASE_ONSET_GC_PAUSE_SECONDS_METRIC, labels)).toBe(1.2345);
+    // The cycle count beside it is NOT scaled -- same loop, different unit.
+    expect(sample(body, PROCESS_RSS_RELEASE_ONSET_GC_CYCLES_METRIC, labels)).toBe(3);
+    // The window width is the module's other ms -> s conversion.
+    expect(sample(body, PROCESS_RSS_RELEASE_ONSET_GC_WINDOW_SECONDS_METRIC, {})).toBe(10);
+  });
+
+  it("publishes pause_unknown_cycles at a measured 0 for BOTH windows", async () => {
+    setRssReleaseGcAttributionMetrics(attribution());
+    const body = await render();
+    // `toBe(0)`, not `toBeFalsy()`: `null` here is the bug being excluded.
+    expect(sample(body, PROCESS_RSS_RELEASE_ONSET_GC_PAUSE_UNKNOWN_CYCLES_METRIC, { window: "onset" })).toBe(0);
+    expect(sample(body, PROCESS_RSS_RELEASE_ONSET_GC_PAUSE_UNKNOWN_CYCLES_METRIC, { window: "baseline" })).toBe(0);
+    expect(sample(body, PROCESS_RSS_RELEASE_ONSET_GC_WINDOW_COVERED_METRIC, { window: "onset" })).toBe(1);
+    expect(sample(body, PROCESS_RSS_RELEASE_ONSET_GC_WINDOW_COVERED_METRIC, { window: "baseline" })).toBe(1);
+  });
+
+  it("publishes a non-zero pause_unknown_cycles, which marks its window's pause a LOWER BOUND", async () => {
+    setRssReleaseGcAttributionMetrics(
+      attribution({ onset: window({ pauseUnknownCycles: 2, observedCycles: 5 }) }),
+    );
+    const body = await render();
+    expect(sample(body, PROCESS_RSS_RELEASE_ONSET_GC_PAUSE_UNKNOWN_CYCLES_METRIC, { window: "onset" })).toBe(2);
+    // Independent of coverage, which is a different failure: the ring held this
+    // window, and two of the entries in it carried no duration.
+    expect(sample(body, PROCESS_RSS_RELEASE_ONSET_GC_WINDOW_COVERED_METRIC, { window: "onset" })).toBe(1);
+  });
+
+  it("withholds a contaminated control ENTIRELY, including its qualifiers", async () => {
+    setRssReleaseGcAttributionMetrics(attribution({ baseline: null }));
+    const body = await render();
+    // The onset side proves the publish happened, so the absences below are
+    // real absences rather than a no-op test.
+    expect(sample(body, PROCESS_RSS_RELEASE_ONSET_GC_PAUSE_SECONDS_METRIC, { window: "onset" })).toBe(1.2345);
+    expect(sample(body, PROCESS_RSS_RELEASE_ONSET_GC_PAUSE_SECONDS_METRIC, { window: "baseline" })).toBeNull();
+    // Not even covered=0: there is no window to qualify, and a published 0
+    // would read as "the ring missed it" rather than "no control exists".
+    expect(sample(body, PROCESS_RSS_RELEASE_ONSET_GC_WINDOW_COVERED_METRIC, { window: "baseline" })).toBeNull();
+    expect(sample(body, PROCESS_RSS_RELEASE_ONSET_GC_PAUSE_UNKNOWN_CYCLES_METRIC, { window: "baseline" })).toBeNull();
+  });
+
+  it("clears every series on a null attribution rather than freezing the last episode", async () => {
+    setRssReleaseGcAttributionMetrics(attribution());
+    expect(sample(await render(), PROCESS_RSS_RELEASE_ONSET_GC_PAUSE_SECONDS_METRIC, { window: "onset" })).toBe(1.2345);
+
+    setRssReleaseGcAttributionMetrics(null);
+    const body = await render();
+    // Frozen-per-onset is the contract, so a stale set surviving here does not
+    // look stale -- it reads as the current episode's measurement.
+    expect(sample(body, PROCESS_RSS_RELEASE_ONSET_GC_PAUSE_SECONDS_METRIC, { window: "onset" })).toBeNull();
+    expect(sample(body, PROCESS_RSS_RELEASE_ONSET_GC_CYCLES_METRIC, { window: "onset" })).toBeNull();
+    expect(sample(body, PROCESS_RSS_RELEASE_ONSET_GC_PAUSE_UNKNOWN_CYCLES_METRIC, { window: "onset" })).toBeNull();
+    expect(sample(body, PROCESS_RSS_RELEASE_ONSET_GC_WINDOW_COVERED_METRIC, { window: "onset" })).toBeNull();
+    // `remove()` rather than `reset()` on the label-less width: a published 0
+    // would turn a per-second rate over this window into a division by zero.
+    expect(sample(body, PROCESS_RSS_RELEASE_ONSET_GC_WINDOW_SECONDS_METRIC, {})).toBeNull();
   });
 });

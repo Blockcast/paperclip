@@ -473,10 +473,12 @@ export interface GcCycleWindow {
    * deliberately not asserted. V8's unmapper can free chunks on a background
    * task rather than inside the collection, so a releasing cycle need not cost
    * more pause time at all. That makes a null result here INFORMATIVE rather
-   * than a failure: pause moving implicates work done inside the cycle, pause
-   * flat while the release still lands implicates the background unmapper, and
-   * both readings narrow the mechanism. ⛔ Do not read this field as an
-   * assertion that the releasing cycle is the longer one.
+   * than a failure: pause MOVING implicates work done inside the atomic pause,
+   * while pause FLAT with the release still landing rules that out and is
+   * consistent with work outside it — the background unmapper, the
+   * concurrent-marking threads, or work outside V8 entirely. ⛔ A flat reading
+   * closes the one branch and does not choose among the rest; this field is not
+   * an assertion that the releasing cycle is the longer one.
    *
    * ⭐ It is also CONTINUOUS, which is why it is worth a series rather than
    * another label. The row's binary candidates need ~628 paired onsets for 80%
