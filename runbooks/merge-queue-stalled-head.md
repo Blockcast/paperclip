@@ -293,18 +293,36 @@ finished reporting by the instant of removal. A PR enqueued because its checks
 went green necessarily waited minutes for them first, so the fresh-head window
 separates the two cleanly.
 
-Two measured details worth keeping if this is ever re-derived:
+Four measured details worth keeping if this is ever re-derived:
 
-- **"zero completed checks" is not the test.** On #3060's head, four commit
-  *statuses* (`gate/ally-comment-findings`, `review/ally-comment`) had already
-  succeeded before the 07:46:27Z removal while every *check run* was still
-  unstarted. A universal "nothing completed" predicate is false on the very
+- **"zero completed checks" is not the test.** On #3060's head, two commit
+  *status* contexts (`gate/ally-comment-findings`, `review/ally-comment`) had
+  already succeeded before the 07:46:27Z removal while every *check run* was
+  still unstarted — the earliest, `security-review`, did not conclude until
+  07:46:52Z. A universal "nothing completed" predicate is false on the very
   case it is meant to catch; the guard is existential ("something had not
   finished") and the fresh-head window carries the verdict.
 - **Completion is judged at the dequeue instant, not at read time.** The
   detector runs minutes later, by which point the head's checks have usually
   finished. `completedAt <= dequeuedAt` keeps the verdict anchored to what was
   knowable when the queue ruled.
+- **`GET commits/{sha}/statuses` returns the status HISTORY, one row per post
+  — not the latest state per context.** On `87a87dc0` those two contexts carry
+  **four rows each** (07:46:19Z/07:46:23Z, re-posted 07:48:30Z/07:48:35Z), so
+  classifying row by row counts posts rather than contexts and reports a
+  context that straddles the dequeue as both complete *and* incomplete. Collapse
+  to one row per context first, keeping the latest row **at or before**
+  `dequeuedAt`. The combined endpoint (`commits/{sha}/status`, `.statuses[]`)
+  is *not* a shortcut here: its "latest" is latest **overall**, which on #3060
+  is the post-removal 07:48:35Z re-post, so both contexts would still read as
+  incomplete. Only the history carries the time axis the collapse needs.
+- **A check run and a status can share a name, and on #3060 one does.**
+  `gate/ally-comment-findings` is a status that succeeded at 07:46:23Z *and* a
+  check run that did not conclude until 07:48:35Z. They are separate contexts;
+  collapsing them by bare name lets the green status hide the unfinished check
+  run, which is the fail-open direction. The detector keys the collapse on
+  surface *and* name, and qualifies a name in the notice (`… (check run)`) only
+  when it exists on both.
 
 Both head-check surfaces are read SHA-pinned (`/check-runs` *and* `/statuses`);
 a failed read yields `null`, not `[]`, so a transient API error falls back to

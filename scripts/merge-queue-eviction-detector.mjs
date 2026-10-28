@@ -246,13 +246,18 @@ export function isQueueInitiatedRemoval(dequeueActor) {
  *
  * ## Why "zero completed checks" is NOT the test on its own
  *
- * Measured on #3060's head at the 07:46:27Z removal instant: four commit
- * STATUSES had already succeeded (`gate/ally-comment-findings` 07:46:19Z,
- * `review/ally-comment` 07:46:21Z/07:46:24Z) while every CHECK RUN was still
- * unstarted. A bare "nothing has completed" predicate is therefore false on
- * the very case this exists to catch. The fresh-head window is the signal;
- * incompleteness is the corroborating guard, and is phrased existentially
- * ("something had not finished") rather than universally.
+ * Measured on #3060's head at the 07:46:27Z removal instant: two commit
+ * STATUS contexts had already succeeded -- `gate/ally-comment-findings`
+ * (07:46:19Z, re-posted 07:46:23Z) and `review/ally-comment` (07:46:21Z,
+ * re-posted 07:46:24Z) -- while every CHECK RUN was still unstarted. A bare
+ * "nothing has completed" predicate is therefore false on the very case this
+ * exists to catch. The fresh-head window is the signal; incompleteness is the
+ * corroborating guard, and is phrased existentially ("something had not
+ * finished") rather than universally.
+ *
+ * Counts below are per CONTEXT, not per status post -- see the dedupe comment
+ * in the body for why those differ and why it is the dequeue instant, not the
+ * read, that the collapse is anchored to.
  *
  * Completion is judged AT THE DEQUEUE INSTANT, not at read time. This script
  * runs minutes later, by which point the head's checks have usually finished;
@@ -265,7 +270,12 @@ export function isQueueInitiatedRemoval(dequeueActor) {
  * This can never make a genuine eviction quieter.
  *
  * @param {{
- *   headChecks?: Array<{ name?: string | null, conclusion?: string | null, completedAt?: string | null }> | null,
+ *   headChecks?: Array<{
+ *     name?: string | null,
+ *     conclusion?: string | null,
+ *     completedAt?: string | null,
+ *     surface?: string | null,
+ *   }> | null,
  *   headCommittedAt?: string | null,
  *   enqueuedAt?: string | null,
  *   dequeuedAt?: string | null,
@@ -277,7 +287,7 @@ export function isQueueInitiatedRemoval(dequeueActor) {
  *   completedByDequeue: number,
  *   incompleteAtDequeue: string[],
  *   checkCount: number,
- * } | null}
+ * } | null} counts and names are per distinct context, never per status post
  */
 export function classifyAdmissionEvidence({
   headChecks = null,
@@ -298,18 +308,76 @@ export function classifyAdmissionEvidence({
   // rather than reason about evidence that is not the queue's.
   if (headAgeAtEnqueueMs < 0) return null;
 
-  const completed = [];
-  const incomplete = [];
+  // PEN-4887 (Ally review, 2nd pass): `GET commits/{sha}/statuses` returns the
+  // full status HISTORY -- one row per post -- not the latest state per
+  // context. Measured on #3060's head `87a87dc0`: `gate/ally-comment-findings`
+  // and `review/ally-comment` each carry FOUR rows (07:46:19Z/07:46:23Z, then
+  // re-posted at 07:48:30Z/07:48:35Z). Classifying row by row counted posts
+  // rather than contexts, and listed both of those contexts under "not
+  // complete at removal" on the strength of their 07:48 re-posts -- though
+  // both had succeeded before the 07:46:27Z removal. The cause line is this
+  // notice's whole deliverable, so it must not name a finished check as
+  // unfinished.
+  //
+  // Collapse to one row per context first, keeping the latest row AT OR BEFORE
+  // `dequeuedAt`. That anchor is why the combined endpoint
+  // (`commits/{sha}/status`, `.statuses[]`) is not the fix: its "latest" is
+  // the latest OVERALL, which on #3060 is the 07:48:35Z re-post -- after the
+  // removal -- so both contexts would still read as incomplete. Only the
+  // history carries the time axis this needs.
+  /** @type {Map<string, {name: string, surface: string, at: number, terminal: boolean}>} */
+  const byContext = new Map();
   for (const check of headChecks) {
     const rawName = typeof check?.name === "string" ? check.name.trim() : "";
     const name = rawName.length > 0 ? rawName : "<unnamed>";
-    const completedAt = Date.parse(check?.completedAt ?? "");
+    // A check run and a commit status can carry the SAME name, and on #3060's
+    // own head two of them do: `gate/ally-comment-findings` is a status that
+    // succeeded at 07:46:23Z, before the removal, AND a check run that did not
+    // conclude until 07:48:35Z, after it (`ci/ally-head-attested` likewise).
+    // They are separate contexts, so they are never collapsed into each other
+    // -- doing so would let the green status hide the unfinished check run,
+    // which is the fail-OPEN direction. Entries with no surface (callers that
+    // predate it) group by name alone, exactly as before.
+    const surface = typeof check?.surface === "string" ? check.surface : "";
+    const key = `${surface}\u0000${name}`;
+    if (!byContext.has(key)) byContext.set(key, { name, surface, at: -Infinity, terminal: false });
+    const at = Date.parse(check?.completedAt ?? "");
+    // A row posted after the dequeue says nothing about what the queue could
+    // see. The context stays unreported unless an earlier row reported it.
+    if (!Number.isFinite(at) || at > dequeuedMs) continue;
     // A commit status is reported in one shot, so `pending` carries a
     // timestamp like any other state. Without this it would count as a
     // completion and weaken the guard in the fail-open direction.
     const terminal = String(check?.conclusion ?? "").toLowerCase() !== "pending";
-    if (terminal && Number.isFinite(completedAt) && completedAt <= dequeuedMs) completed.push(name);
-    else incomplete.push(name);
+    const best = byContext.get(key);
+    // Latest row wins. On an identical timestamp the TERMINAL row wins, which
+    // counts the context as completed and so makes `rejected` LESS likely --
+    // the same fail-toward-the-old-verdict direction as everything else here.
+    if (at > best.at || (at === best.at && terminal && !best.terminal)) {
+      best.at = at;
+      best.terminal = terminal;
+    }
+  }
+
+  // Where one name exists on both surfaces, say which is which. The notice
+  // prints these verbatim, and an unqualified name listed as unfinished beside
+  // an identically-named one that finished reads exactly like the defect this
+  // dedupe fixes. Unambiguous names stay bare.
+  const surfacesPerName = new Map();
+  for (const { name, surface } of byContext.values()) {
+    if (!surfacesPerName.has(name)) surfacesPerName.set(name, new Set());
+    surfacesPerName.get(name).add(surface);
+  }
+  const label = ({ name, surface }) =>
+    surface.length > 0 && surfacesPerName.get(name).size > 1
+      ? `${name} (${surface === "check_run" ? "check run" : surface})`
+      : name;
+
+  const completed = [];
+  const incomplete = [];
+  for (const context of byContext.values()) {
+    if (context.terminal) completed.push(label(context));
+    else incomplete.push(label(context));
   }
 
   return {
@@ -317,7 +385,7 @@ export function classifyAdmissionEvidence({
     headAgeAtEnqueueMs,
     completedByDequeue: completed.length,
     incompleteAtDequeue: incomplete,
-    checkCount: headChecks.length,
+    checkCount: byContext.size,
   };
 }
 
@@ -457,15 +525,32 @@ function parseNdjson(out) {
 }
 
 /**
+ * Tag every row with the check surface it came from. Applied here rather than
+ * in the `--jq` expression so the tag is a property of THIS function, visible
+ * through the `exec` seam and independent of what the API or jq returns.
+ */
+const taggedWith = (surface) => (rows) => rows.map((row) => ({ ...row, surface }));
+
+/**
  * PEN-4887: both check surfaces for ONE commit, SHA-pinned.
  *
  * Reading only `/check-runs` would be wrong in the direction that matters.
- * `ci/ally-head-attested`, `review/ally-complete` and the `review/*` mirrors
- * are commit STATUSES, not check runs, and on #3060's head four of them had
- * already succeeded before the removal while every check run was still
- * unstarted. Omitting them would report "nothing completed" for heads where
- * something had, which is the fail-open direction for the guard in
- * `classifyAdmissionEvidence`.
+ * `gate/ally-comment-findings` and `review/ally-comment` are commit STATUSES,
+ * not check runs (verified on #3060's head `87a87dc0` and on this script's
+ * own head: those two are the entire status surface). BOTH had succeeded
+ * before the 07:46:27Z removal, and NO check run had -- the earliest,
+ * `security-review`, concluded at 07:46:52Z. So every pre-removal completion
+ * on that head was invisible to `/check-runs`. Omitting the status surface
+ * would report "nothing completed" for heads where something had, which is
+ * the fail-open direction for the guard in `classifyAdmissionEvidence`.
+ *
+ * Each entry is tagged with the surface it came from. The two surfaces are
+ * separate namespaces in branch protection, so a check run and a status
+ * context that happen to share a name must not be collapsed into one when
+ * `classifyAdmissionEvidence` dedupes. This is also the surface that returns
+ * HISTORY rather than current state -- `/statuses` yields one row per post --
+ * which is deliberately left for that function to collapse, because only it
+ * knows the dequeue instant the collapse has to be anchored to.
  *
  * Returns `null` on any read failure rather than an empty array: an empty
  * array is positive evidence ("this head carries no checks") and would let a
@@ -476,17 +561,21 @@ function parseNdjson(out) {
 export function ghHeadChecks(repo, sha, exec = run) {
   if (typeof sha !== "string" || sha.length === 0) return null;
   try {
-    const checkRuns = parseNdjson(
-      exec([
-        "gh", "api", `repos/${repo}/commits/${sha}/check-runs?per_page=100`,
-        "--paginate", "--jq", ".check_runs[] | {name, conclusion, completedAt: .completed_at}",
-      ]),
+    const checkRuns = taggedWith("check_run")(
+      parseNdjson(
+        exec([
+          "gh", "api", `repos/${repo}/commits/${sha}/check-runs?per_page=100`,
+          "--paginate", "--jq", ".check_runs[] | {name, conclusion, completedAt: .completed_at}",
+        ]),
+      ),
     );
-    const statuses = parseNdjson(
-      exec([
-        "gh", "api", `repos/${repo}/commits/${sha}/statuses?per_page=100`,
-        "--paginate", "--jq", ".[] | {name: .context, conclusion: .state, completedAt: .updated_at}",
-      ]),
+    const statuses = taggedWith("status")(
+      parseNdjson(
+        exec([
+          "gh", "api", `repos/${repo}/commits/${sha}/statuses?per_page=100`,
+          "--paginate", "--jq", ".[] | {name: .context, conclusion: .state, completedAt: .updated_at}",
+        ]),
+      ),
     );
     return [...checkRuns, ...statuses];
   } catch (error) {
