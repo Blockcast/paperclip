@@ -4072,6 +4072,15 @@ async function hasLinkedGitWorktreeRegistration(repoRoot: string, worktreePath: 
  *   with an `ERR_`-prefixed `code` and `syscall === undefined`. Matching them
  *   on that prefix is sound here because the one shape that IS a verdict is a
  *   plain `Error` built from stderr, which carries no `code` at all.
+ *
+ *   That prefix test is deliberately BROADER than synchronous spawn
+ *   validation: it also catches any node-internal `ERR_*` rejection raised
+ *   after the child already exists -- a stream error on stdio, say. Do not
+ *   narrow it back to the spawn shapes. Breadth here is free because this
+ *   predicate is one-way: a false positive only moves an error from *verdict*
+ *   to *inconclusive*, and the worst an inconclusive outcome can do is skip a
+ *   cleanup. It can never reach the `fs.rm`. A false NEGATIVE is the one that
+ *   deletes a good `.git`, so when a shape is ambiguous, classify it here.
  * - a **non-zero exit** -- git ran and answered. That one IS a verdict.
  *
  * The synchronous arm is unreachable from today's only call site, which builds
@@ -4237,7 +4246,10 @@ export async function relinkHuskGitWorktree(repoRoot: string, worktreePath: stri
   //
   // The kept link is therefore deliberately UNVERIFIED, and verifying it is not
   // this function's job: the early `lstat` return above means the next wake
-  // takes the "already linked" path rather than re-probing, so the link is
+  // returns early WITHOUT re-probing, and that early return is `false` -- "not
+  // linked by this call", not "linked and healthy". Nothing in the return value
+  // distinguishes a kept-but-unverified link from a refusal, which is exactly
+  // why the inconclusive branch warns instead of staying silent. The link is
   // re-examined by the next health check that runs git against the worktree for
   // its own reasons (`inspectManagedGitWorktreeBranch` and the reuse probes),
   // not here. That is sound because the content is not a guess -- it is the
