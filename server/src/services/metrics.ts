@@ -2242,6 +2242,55 @@ export const PROCESS_RSS_RELEASE_ONSET_GC_WINDOW_COVERED_METRIC =
   "paperclip_process_rss_release_onset_gc_window_covered";
 
 /**
+ * GC pause time by class in the same two windows as
+ * {@link PROCESS_RSS_RELEASE_ONSET_GC_CYCLES_METRIC}, in seconds (PEN-3314).
+ *
+ * ⭐ Why a second series rather than another label. The cycles series answers
+ * "did GC fire?", and that question is now ANSWERED and is not the
+ * discriminator: a major marking cycle was in flight at 23/23 release onsets
+ * against a 65.2% ambient rate, so occurrence is necessary-looking and plainly
+ * not sufficient. Whatever separates a releasing cycle from an ordinary one is
+ * therefore a PROPERTY of the cycle, and pause time is the only such property
+ * V8 already hands over on the same entry.
+ *
+ * ⚠ A CANDIDATE property, with the direction deliberately NOT asserted. V8's
+ * unmapper can free chunks on a background task rather than inside the
+ * collection, so a releasing cycle need not cost more pause. A null result is
+ * therefore informative rather than a failure: pause moving implicates work
+ * done inside the cycle, pause flat while the release still lands implicates
+ * the background unmapper, and both narrow the mechanism.
+ *
+ * ⭐ And it is CONTINUOUS. The row's binary candidates need ~628 paired onsets
+ * for 80% power at the effect sizes measured so far, which at ~6 onsets/hour is
+ * weeks; a per-onset magnitude carries far more information per episode.
+ *
+ * ⛔ NOT `nodejs_gc_duration_seconds`. That histogram is observed at the scrape,
+ * aligned to scrape boundaries and labelled by `kind` alone — the same 30 s
+ * readout limit that makes the cycles series necessary. This is pause summed
+ * over a window centred on a ±1 s onset.
+ *
+ * ⛔ READ BOTH `window` VALUES OR NEITHER, exactly as for the cycle counts: GC
+ * pause is ambient too, so `window="onset"` alone has no expected value of
+ * zero to be read against. NOT an alert source.
+ */
+export const PROCESS_RSS_RELEASE_ONSET_GC_PAUSE_SECONDS_METRIC =
+  "paperclip_process_rss_release_onset_gc_pause_seconds";
+
+/**
+ * Cycles in a window that carried no usable pause duration (PEN-3314).
+ *
+ * `0` is the expected reading. Non-zero means
+ * {@link PROCESS_RSS_RELEASE_ONSET_GC_PAUSE_SECONDS_METRIC} is a LOWER BOUND
+ * for that window rather than a total. ⛔ Kept apart from
+ * {@link PROCESS_RSS_RELEASE_ONSET_GC_WINDOW_COVERED_METRIC}, which answers a
+ * different question — whether the ring still held the window — because folding
+ * two distinct failures into one flag makes them indistinguishable, which is
+ * the error shape this row has already paid for repeatedly.
+ */
+export const PROCESS_RSS_RELEASE_ONSET_GC_PAUSE_UNKNOWN_CYCLES_METRIC =
+  "paperclip_process_rss_release_onset_gc_pause_unknown_cycles";
+
+/**
  * `setting` label of the series carrying the pool's OWN idle-in-transaction
  * bound (PEN-3365), published beside the inherited reading so a loosening is a
  * one-series comparison. Named once here so the help text, the startup wiring
@@ -4618,6 +4667,8 @@ let processRssReleaseBoundBytes: Gauge<"bound"> | null = null;
 let processRssReleaseOnsetGcCycles: Gauge<"window" | "kind" | "flags"> | null = null;
 let processRssReleaseOnsetGcWindowSeconds: Gauge | null = null;
 let processRssReleaseOnsetGcWindowCovered: Gauge<"window"> | null = null;
+let processRssReleaseOnsetGcPauseSeconds: Gauge<"window" | "kind" | "flags"> | null = null;
+let processRssReleaseOnsetGcPauseUnknownCycles: Gauge<"window"> | null = null;
 let cgroupMemoryComponentBytes: Gauge<"component"> | null = null;
 let cgroupMemoryCurrentBytes: Gauge | null = null;
 let cgroupMemoryMaxBytes: Gauge | null = null;
@@ -4812,6 +4863,8 @@ function ensureRegistry(): {
   processRssReleaseOnsetGcCyclesGauge: Gauge<"window" | "kind" | "flags">;
   processRssReleaseOnsetGcWindowSecondsGauge: Gauge;
   processRssReleaseOnsetGcWindowCoveredGauge: Gauge<"window">;
+  processRssReleaseOnsetGcPauseSecondsGauge: Gauge<"window" | "kind" | "flags">;
+  processRssReleaseOnsetGcPauseUnknownCyclesGauge: Gauge<"window">;
   cgroupMemoryComponentBytesGauge: Gauge<"component">;
   cgroupMemoryCurrentBytesGauge: Gauge;
   cgroupMemoryMaxBytesGauge: Gauge;
@@ -4987,6 +5040,8 @@ function ensureRegistry(): {
     || !processRssReleaseOnsetGcCycles
     || !processRssReleaseOnsetGcWindowSeconds
     || !processRssReleaseOnsetGcWindowCovered
+    || !processRssReleaseOnsetGcPauseSeconds
+    || !processRssReleaseOnsetGcPauseUnknownCycles
     || !cgroupMemoryComponentBytes
     || !cgroupMemoryCurrentBytes
     || !cgroupMemoryMaxBytes
@@ -5831,6 +5886,61 @@ function ensureRegistry(): {
         + "is ABSENT rather than 0 is a third case: the previous release's onset fell inside the "
         + "control window, so no control is published and the onset counts beside it are not "
         + "readable as a ratio. NOT an alert source.",
+      labelNames: ["window"],
+      registers: [registry],
+    });
+    processRssReleaseOnsetGcPauseSeconds = new Gauge({
+      name: PROCESS_RSS_RELEASE_ONSET_GC_PAUSE_SECONDS_METRIC,
+      help:
+        "GC pause time in seconds by {kind, flags} in the same two windows as "
+        + PROCESS_RSS_RELEASE_ONSET_GC_CYCLES_METRIC
+        + " (PEN-3314). That series answers 'did GC fire?', and the answer is in: a major "
+        + "marking cycle was in flight at 23/23 release onsets against a 65.2% ambient rate "
+        + "(McNemar p=0.0078), so OCCURRENCE is necessary-looking and plainly NOT SUFFICIENT, "
+        + "and whatever separates a releasing cycle from an ordinary one is a PROPERTY of the "
+        + "cycle rather than its existence. Pause time is the only such property V8 hands over "
+        + "on the same perf_hooks entry. "
+        + "IT IS A CANDIDATE AND THE DIRECTION IS NOT ASSERTED: V8's unmapper can free chunks "
+        + "on a BACKGROUND task rather than inside the collection, so a releasing cycle need "
+        + "not cost more pause at all. That makes a null here informative rather than a "
+        + "failure -- pause moving implicates work inside the cycle, pause flat while the "
+        + "release still lands implicates the background unmapper, and both narrow the "
+        + "mechanism. Do NOT read this series as a claim that the releasing cycle is the "
+        + "longer one. "
+        + "It is also CONTINUOUS, which is the point -- the binary candidates on this row need "
+        + "~628 paired onsets for 80% power, which at ~6 onsets/hour is weeks, where a "
+        + "per-onset magnitude carries far more information per episode. "
+        + "NOT nodejs_gc_duration_seconds: that histogram is observed at the scrape, aligned to "
+        + "scrape boundaries and labelled by kind alone, which is the same 30s readout limit "
+        + "that makes the cycles series necessary; this is pause summed over a window centred "
+        + "on a +/-1s onset. "
+        + "READ BOTH window VALUES OR NEITHER -- GC pause is ambient too, so window=onset has "
+        + "no expected value of zero to be read against. Divide by the matching "
+        + PROCESS_RSS_RELEASE_ONSET_GC_CYCLES_METRIC
+        + " for a mean pause per cycle, which separates 'more cycles' from 'longer cycles' and "
+        + "is the comparison this series exists for. Qualify with "
+        + PROCESS_RSS_RELEASE_ONSET_GC_WINDOW_COVERED_METRIC
+        + " and with "
+        + PROCESS_RSS_RELEASE_ONSET_GC_PAUSE_UNKNOWN_CYCLES_METRIC
+        + ". Frozen per onset, so it describes the episode and not the ring's current "
+        + "contents, and therefore CANNOT COUNT EPISODES -- take boundaries from "
+        + PROCESS_RSS_RELEASE_LAST_ONSET_TIMESTAMP_METRIC
+        + " and nothing else. NOT an alert source.",
+      labelNames: ["window", "kind", "flags"],
+      registers: [registry],
+    });
+    processRssReleaseOnsetGcPauseUnknownCycles = new Gauge({
+      name: PROCESS_RSS_RELEASE_ONSET_GC_PAUSE_UNKNOWN_CYCLES_METRIC,
+      help:
+        "Cycles inside the matching window that carried no usable pause duration, making "
+        + PROCESS_RSS_RELEASE_ONSET_GC_PAUSE_SECONDS_METRIC
+        + " a LOWER BOUND rather than a total (PEN-3314). 0 is the expected reading -- Node's "
+        + "gc entries always carry a duration -- so any non-zero value is itself a finding "
+        + "about the instrument, not about the workload. Deliberately NOT folded into "
+        + PROCESS_RSS_RELEASE_ONSET_GC_WINDOW_COVERED_METRIC
+        + ", which answers the different question of whether the ring still held the window: "
+        + "one flag standing for two unrelated failures makes them indistinguishable, which is "
+        + "the error shape this row has already paid for repeatedly. NOT an alert source.",
       labelNames: ["window"],
       registers: [registry],
     });
@@ -7644,6 +7754,8 @@ function ensureRegistry(): {
     processRssReleaseOnsetGcCyclesGauge: processRssReleaseOnsetGcCycles,
     processRssReleaseOnsetGcWindowSecondsGauge: processRssReleaseOnsetGcWindowSeconds,
     processRssReleaseOnsetGcWindowCoveredGauge: processRssReleaseOnsetGcWindowCovered,
+    processRssReleaseOnsetGcPauseSecondsGauge: processRssReleaseOnsetGcPauseSeconds,
+    processRssReleaseOnsetGcPauseUnknownCyclesGauge: processRssReleaseOnsetGcPauseUnknownCycles,
     cgroupMemoryComponentBytesGauge: cgroupMemoryComponentBytes,
     cgroupMemoryCurrentBytesGauge: cgroupMemoryCurrentBytes,
     cgroupMemoryMaxBytesGauge: cgroupMemoryMaxBytes,
@@ -8892,6 +9004,8 @@ export function setRssReleaseGcAttributionMetrics(
 ): void {
   const metrics = ensureRegistry();
   metrics.processRssReleaseOnsetGcCyclesGauge.reset();
+  metrics.processRssReleaseOnsetGcPauseSecondsGauge.reset();
+  metrics.processRssReleaseOnsetGcPauseUnknownCyclesGauge.reset();
   metrics.processRssReleaseOnsetGcWindowCoveredGauge.reset();
   metrics.processRssReleaseOnsetGcWindowSecondsGauge.remove();
   if (!attribution) return;
@@ -8908,8 +9022,19 @@ export function setRssReleaseGcAttributionMetrics(
     // below is empty: an empty distribution is only readable as "no GC fired"
     // when the ring is known to have held the window it was counted over.
     metrics.processRssReleaseOnsetGcWindowCoveredGauge.set({ window }, counts.covered ? 1 : 0);
-    for (const { kind, flags, cycles } of counts.classes) {
+    // Published for both windows and even at 0, for the same reason: the pause
+    // sums beside it are only readable as totals when this is known to be 0,
+    // and an absent qualifier is not a qualifier.
+    metrics.processRssReleaseOnsetGcPauseUnknownCyclesGauge.set(
+      { window },
+      counts.pauseUnknownCycles,
+    );
+    for (const { kind, flags, cycles, pauseMs } of counts.classes) {
       metrics.processRssReleaseOnsetGcCyclesGauge.set({ window, kind, flags }, cycles);
+      metrics.processRssReleaseOnsetGcPauseSecondsGauge.set(
+        { window, kind, flags },
+        pauseMs / 1000,
+      );
     }
   }
 }
@@ -10749,6 +10874,8 @@ export function __resetMetricsForTest(): void {
   processRssReleaseOnsetGcCycles = null;
   processRssReleaseOnsetGcWindowSeconds = null;
   processRssReleaseOnsetGcWindowCovered = null;
+  processRssReleaseOnsetGcPauseSeconds = null;
+  processRssReleaseOnsetGcPauseUnknownCycles = null;
   processLostTotal = null;
   externalLifecycleRunningRuns = null;
   externalLifecycleRunSilenceGap = null;

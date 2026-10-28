@@ -82,8 +82,12 @@
  * same `{kind, flags}` combinations turn out to fire on the non-releasing
  * ceiling samples too, that is a real answer and this series is how it gets read.
  *
- * ⛔ Does not replace `nodejs_gc_duration_seconds`. That histogram keeps its
- * duration distribution; this counts cycles by class.
+ * ⛔ Does not replace `nodejs_gc_duration_seconds`, even though the ring now
+ * retains each cycle's pause as well as its class. That histogram keeps the
+ * duration DISTRIBUTION, observed at the scrape and labelled by `kind` alone.
+ * The ring's copy exists for one thing the histogram cannot do at any query:
+ * be summed over a ±5 s window a caller centres on a release onset. See
+ * {@link GcCycleWindow.observedPauseMs}.
  *
  * @module server/services/gc-flags-metrics
  */
@@ -302,7 +306,10 @@ export function registerGcFlagsCollector(
       // over a scrape interval"; the ring answers "which classes fired in THIS
       // 10 s window", which is the question a +/-1 s release onset asks and a
       // counter cannot be queried for. See `readGcCyclesInWindow`.
-      recordGcCycle(gcEntryInstantMs(entry), kind, flags);
+      // `entry.duration` rides along because it is the cycle's own pause length
+      // and the ring is the only place it can be joined to an onset -- see
+      // GcCycleWindow.observedPauseMs for why that join is the open question.
+      recordGcCycle(gcEntryInstantMs(entry), kind, flags, entry.duration);
     }
   };
 
@@ -349,20 +356,30 @@ export function registerGcFlagsCollector(
  * rate. Beyond that the ring evicts, which is NOT silent: see
  * {@link GcCycleWindow.covered}.
  *
- * ⚠ Fixed cost, paid once: three typed arrays, 128 KiB total, allocated at
+ * ⚠ Fixed cost, paid once: four typed arrays, 192 KiB total, allocated at
  * module load and never grown. That matters twice over on PEN-3314. The row is
  * a memory investigation, so an instrument whose own footprint scales with
  * anything would be self-defeating; and the writer runs INSIDE a
  * `PerformanceObserver` GC callback, where allocating per entry would make the
  * instrument a participant in the phenomenon it measures rather than an
- * observer of it. Hence typed arrays and raw integers rather than an array of
- * `{ atMs, kind, flags }` objects, which would allocate on every cycle.
+ * observer of it. Hence typed arrays and raw numbers rather than an array of
+ * `{ atMs, kind, flags, durationMs }` objects, which would allocate on every cycle.
  */
 const GC_RING_CAPACITY = 8192;
 
 const ringAtMs = new Float64Array(GC_RING_CAPACITY);
 const ringKind = new Int32Array(GC_RING_CAPACITY);
 const ringFlags = new Int32Array(GC_RING_CAPACITY);
+/**
+ * Pause duration of each cycle, in ms, or `NaN` where the entry did not carry one.
+ *
+ * `NaN` rather than `0` because this ring's consumers sum it: a zero would be
+ * indistinguishable from a cycle that really did take no measurable time, and
+ * would silently shrink a total that is read as a measurement. Unknown entries
+ * are counted separately — see {@link GcCycleWindow.pauseUnknownCycles} — so a
+ * sum is always qualifiable as exact or as a lower bound.
+ */
+const ringDurationMs = new Float64Array(GC_RING_CAPACITY);
 /** Total entries ever recorded; the ring holds the last {@link GC_RING_CAPACITY} of them. */
 let ringWritten = 0;
 /**
@@ -424,6 +441,13 @@ export interface GcCycleClassCount {
   readonly kind: string;
   readonly flags: string;
   readonly cycles: number;
+  /**
+   * Total pause time of this class's cycles inside the window, in ms.
+   *
+   * Sums only the cycles that carried a duration; see
+   * {@link GcCycleWindow.pauseUnknownCycles} before reading it as exact.
+   */
+  readonly pauseMs: number;
 }
 
 /** The result of counting GC cycles over a closed time window. */
@@ -434,6 +458,52 @@ export interface GcCycleWindow {
   readonly classes: readonly GcCycleClassCount[];
   /** Total cycles inside the window, i.e. the sum over {@link classes}. */
   readonly observedCycles: number;
+  /**
+   * Total GC pause time inside the window, in ms, i.e. the sum over {@link classes}.
+   *
+   * ⭐ The reason this exists. {@link observedCycles} answers "did GC fire?",
+   * which PEN-3314 has now measured as NECESSARY-LOOKING but plainly NOT
+   * SUFFICIENT: a major marking cycle was in flight at 23/23 release onsets
+   * against a 65.2% ambient rate, so occurrence cannot be the discriminator and
+   * the thing that separates a releasing cycle from an ordinary one must be a
+   * PROPERTY of the cycle. Pause time is the one property V8 already hands over
+   * on the same entry.
+   *
+   * ⚠ It is a CANDIDATE property, not a predicted one, and the direction is
+   * deliberately not asserted. V8's unmapper can free chunks on a background
+   * task rather than inside the collection, so a releasing cycle need not cost
+   * more pause time at all. That makes a null result here INFORMATIVE rather
+   * than a failure: pause moving implicates work done inside the cycle, pause
+   * flat while the release still lands implicates the background unmapper, and
+   * both readings narrow the mechanism. ⛔ Do not read this field as an
+   * assertion that the releasing cycle is the longer one.
+   *
+   * ⭐ It is also CONTINUOUS, which is why it is worth a series rather than
+   * another label. The row's binary candidates need ~628 paired onsets for 80%
+   * power at the effect sizes measured so far; a per-onset magnitude carries far
+   * more information per episode, and episodes accrue at ~6/hour.
+   *
+   * ⛔ Not the same measurement as `nodejs_gc_duration_seconds`. That histogram
+   * is observed at the scrape, aligned to scrape boundaries and labelled by
+   * `kind` alone — the exact 30 s readout limit this module exists to beat. This
+   * is pause time inside a window the CALLER centres on a ±1 s onset.
+   *
+   * ⛔ Read against the baseline window, never alone, for the same reason the
+   * counts are: GC pause is ambient too.
+   */
+  readonly observedPauseMs: number;
+  /**
+   * Cycles inside the window that carried NO usable duration.
+   *
+   * `0` is the expected reading — Node's `gc` entries always carry one — so a
+   * non-zero value means {@link observedPauseMs} and every {@link classes}
+   * `pauseMs` beside it are a LOWER BOUND rather than a total. ⛔ Published
+   * rather than folded into `covered`: that flag answers a different question
+   * (did the ring still hold the window), and overloading it would make two
+   * distinct failures indistinguishable — the error shape this row has already
+   * paid for repeatedly.
+   */
+  readonly pauseUnknownCycles: number;
   /**
    * Whether the ring still held everything this window covers.
    *
@@ -449,11 +519,21 @@ export interface GcCycleWindow {
 /**
  * Record one GC cycle in the ring.
  *
+ * `durationMs` is the entry's own pause length. It is optional so that the
+ * ring's existing callers and tests, which predate it, keep compiling; anything
+ * absent or non-finite is stored as UNKNOWN rather than as a zero, and surfaces
+ * in {@link GcCycleWindow.pauseUnknownCycles}.
+ *
  * Exported for the test, which must be able to place cycles at chosen instants:
  * real GC is not schedulable, so driving this through actual collections would
  * test the allocator rather than the ring.
  */
-export function recordGcCycle(atMs: number, kind: number | undefined, flags: number | undefined): void {
+export function recordGcCycle(
+  atMs: number,
+  kind: number | undefined,
+  flags: number | undefined,
+  durationMs?: number,
+): void {
   const slot = ringWritten % GC_RING_CAPACITY;
   if (ringWritten >= GC_RING_CAPACITY) {
     // About to overwrite a live entry. Remember it, because a window reaching
@@ -466,6 +546,10 @@ export function recordGcCycle(atMs: number, kind: number | undefined, flags: num
   ringAtMs[slot] = atMs;
   ringKind[slot] = typeof kind === "number" && Number.isFinite(kind) ? kind : -1;
   ringFlags[slot] = typeof flags === "number" && Number.isFinite(flags) ? flags : 0;
+  ringDurationMs[slot] =
+    typeof durationMs === "number" && Number.isFinite(durationMs) && durationMs >= 0
+      ? durationMs
+      : Number.NaN;
   ringWritten += 1;
 }
 
@@ -493,19 +577,32 @@ export function recordGcCycle(atMs: number, kind: number | undefined, flags: num
  * as "that class was excluded" when it means "that label never existed".
  */
 export function readGcCyclesInWindow(fromMs: number, toMs: number): GcCycleWindow {
-  const counts = new Map<string, { kind: string; flags: string; cycles: number }>();
+  const counts = new Map<string, { kind: string; flags: string; cycles: number; pauseMs: number }>();
   const held = Math.min(ringWritten, GC_RING_CAPACITY);
   let observedCycles = 0;
+  let observedPauseMs = 0;
+  let pauseUnknownCycles = 0;
   for (let index = 0; index < held; index += 1) {
     const atMs = ringAtMs[index];
     if (atMs < fromMs || atMs > toMs) continue;
     const kind = gcKindLabel(ringKind[index] < 0 ? undefined : ringKind[index]);
     const flags = gcFlagsLabel(ringFlags[index]);
+    // NaN marks a cycle whose duration never arrived. It is counted apart
+    // rather than added as 0, so the sum stays a sum and the shortfall stays
+    // visible. See GcCycleWindow.pauseUnknownCycles.
+    const durationMs = ringDurationMs[index];
+    const knownPauseMs = Number.isNaN(durationMs) ? 0 : durationMs;
+    if (Number.isNaN(durationMs)) pauseUnknownCycles += 1;
     const key = `${kind}\u0000${flags}`;
     const existing = counts.get(key);
-    if (existing) existing.cycles += 1;
-    else counts.set(key, { kind, flags, cycles: 1 });
+    if (existing) {
+      existing.cycles += 1;
+      existing.pauseMs += knownPauseMs;
+    } else {
+      counts.set(key, { kind, flags, cycles: 1, pauseMs: knownPauseMs });
+    }
     observedCycles += 1;
+    observedPauseMs += knownPauseMs;
   }
   const classes = [...counts.values()].sort(
     (left, right) => right.cycles - left.cycles || left.kind.localeCompare(right.kind),
@@ -515,6 +612,8 @@ export function readGcCyclesInWindow(fromMs: number, toMs: number): GcCycleWindo
     toMs,
     classes,
     observedCycles,
+    observedPauseMs,
+    pauseUnknownCycles,
     covered:
       fromMs >= ringStartMs && (newestEvictedAtMs === null || newestEvictedAtMs < fromMs),
   };
@@ -525,6 +624,7 @@ export function __resetGcCycleRingForTest(originMs?: number, startMs?: number): 
   ringAtMs.fill(0);
   ringKind.fill(0);
   ringFlags.fill(0);
+  ringDurationMs.fill(Number.NaN);
   ringWritten = 0;
   newestEvictedAtMs = null;
   timeOriginMs = originMs ?? performance.timeOrigin;
