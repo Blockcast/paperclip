@@ -116,12 +116,21 @@ emits no park-expiry wake at all — unlike `issue.monitor_triggered` /
 actions there. Verified on a feed covering 08:58–09:49Z in which a park fire at
 09:15:25.659Z produced no row.
 
-⚠️ **Before PEN-4894, `reason` read `"other"` on these rows.**
+⚠️ **Before PEN-4894, `reason` read `"other"` on these rows — but the fix is
+retroactive, so do not go looking for a split corpus.**
 `"issue_park_expired"` was absent from `ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS`
 (`server/src/routes/issues.ts`), so the route projected it to the generic
-bucket. Historical reads, and any deployment predating that change, will show
-`"other"` — attribute those by structure instead (park-fire latency band off a
-known `parkedUntil`, plus `source: "automation"`).
+bucket. That projection is a **read-time** filter over the raw `reason` column
+(`projectWakeDiagnosticReason(row.reason)`) — nothing was ever rewritten in
+`agent_wakeup_requests`, and the writer has always stored the specific reason.
+So on a server carrying this change, **every** stored park fire reads
+`issue_park_expired`, including rows written long before it, for as far back as
+the 14-day lookback reaches.
+
+Only two things still show `"other"`: output **captured** before the change
+(pasted into an issue or a comment, where the string is frozen), and a
+**deployment predating** it. Attribute those by structure instead — park-fire
+latency band off a known `parkedUntil`, plus `source: "automation"`.
 
 ## Design decisions, so they are not silently re-litigated
 
