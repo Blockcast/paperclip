@@ -350,9 +350,15 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(dockerWorkflow).toContain(
       "if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}",
     );
-    // BLO-33389: pinned to the prod group; the tools-cluster `arc-dind` twin
-    // cannot resolve the BuildKit pool.
-    expect(dockerAgentWorkflow).toContain("runs-on:\n      group: default\n      labels: arc-dind\n");
+    // BLO-33389: pinned to a prod-cluster group; the tools-cluster `arc-dind`
+    // twin cannot resolve the BuildKit pool. BLO-48930: that group is the
+    // paperclip-only, workflow-restricted `arc-paperclip-dind` (org group 28),
+    // because group-1 `default` is unreachable after the group-1 flip.
+    expect(dockerAgentWorkflow).toContain(
+      "runs-on:\n      group: arc-paperclip-dind\n      labels: arc-paperclip-dind\n",
+    );
+    expect(dockerAgentWorkflow).not.toContain("group: default");
+    expect(dockerAgentWorkflow).not.toMatch(/labels: arc-dind\b/);
     expect(dockerAgentWorkflow).not.toContain("runs-on: arc-dind");
     expect(dockerAgentWorkflow).toContain("driver: remote");
     expect(dockerAgentWorkflow).toContain('PREFERRED_ORDINAL: "1"');
