@@ -368,11 +368,14 @@ const K8S_NAME_MAX_GENERATED_MASS = 16;
  *  BLO-49591 added `namespace` (a DNS-1123 label, e.g. a preview namespace
  *  carrying an issue number) and `node` / `host_name` (a node name, as
  *  kube-state-metrics and node-exporter label it). Same shape, same
- *  conjuncts; a credential-shaped value under these names is still refused. */
+ *  conjuncts; a credential-shaped value under these names is still refused.
+ *  BLO-49668 added `job_name` (kube-state-metrics' Job object name, i.e.
+ *  `<cronjob>-<scheduled-time>`). */
 const K8S_OBJECT_NAME_VALUE_NAMES = new Set([
   "cronjob",
   "host_name",
   "instance",
+  "job_name",
   "name",
   "namespace",
   "node",
