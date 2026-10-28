@@ -183,6 +183,35 @@ const EXECUTED_BY_ANOTHER_LANE = new Map([
   // that enumeration is complete -- it only declines to claim the root package
   // is untested.
   ["paperclip", "pr.yml :: policy (node --test steps)"],
+  // PEN-2506. The nine packages below are the two pnpm-workspace.yaml `!`
+  // plugin exclusions -- `sandbox-providers/**` and
+  // plugin-orchestration-smoke-example. They are NOT workspace members, so
+  // root `pnpm install` never installs their deps and a root Vitest project
+  // pointed at them cannot resolve those imports: the two-list fix that closed
+  // BLO-20076 and PEN-2491 is structurally unavailable here, which is why they
+  // were parked as debt rather than wired up.
+  //
+  // They stopped being debt on 2026-09-19. BLO-34222 added
+  // .github/workflows/sandbox-provider-tests.yml, which discovers every
+  // package under both roots (not an enumerated list) and runs each one's
+  // `test` script after building the SDK they import. Verified executing, not
+  // assumed: run 40229751677 reports "Ran 9 package(s); 0 failed", with
+  // kubernetes at 18 test files and cloudflare/bridge-template at 4.
+  //
+  // They sat in UNEXECUTED_WITH_TESTS for the five weeks after that anyway,
+  // because nothing reconciles this list against workflows other than pr.yml.
+  // A false "no lane runs this" is not harmless: it is an open invitation to
+  // build the lane that already exists, which is exactly what it cost before
+  // this correction landed.
+  ["@paperclipai/plugin-kubernetes", "sandbox-provider-tests.yml :: tests"],
+  ["@paperclipai/plugin-cloudflare-sandbox", "sandbox-provider-tests.yml :: tests"],
+  ["paperclip-cloudflare-sandbox-bridge-template", "sandbox-provider-tests.yml :: tests"],
+  ["@paperclipai/plugin-daytona", "sandbox-provider-tests.yml :: tests"],
+  ["@paperclipai/plugin-e2b", "sandbox-provider-tests.yml :: tests"],
+  ["@paperclipai/plugin-exe-dev", "sandbox-provider-tests.yml :: tests"],
+  ["@paperclipai/plugin-modal", "sandbox-provider-tests.yml :: tests"],
+  ["@paperclipai/plugin-novita-sandbox", "sandbox-provider-tests.yml :: tests"],
+  ["@paperclipai/plugin-orchestration-smoke-example", "sandbox-provider-tests.yml :: tests"],
 ]);
 
 // Packages that own test files but that no CI lane executes. This list is a
@@ -191,10 +220,17 @@ const EXECUTED_BY_ANOTHER_LANE = new Map([
 // wiring the package up) but adding one is a deliberate, reviewable act and
 // needs a tracking issue.
 //
-// Every entry below is tracked by PEN-2506. The highest-value subset is
-// @paperclipai/plugin-kubernetes, whose unexecuted suites include
-// secret-manager, sensitive-env-guard, image-allowlist and network-policy --
-// controls whose whole job is containing agent workloads.
+// Every entry below is tracked by PEN-2506. All twelve are ordinary pnpm
+// workspace members, so the two-list fix (vitest.config.ts +
+// `nonServerProjects`) is the right remedy for each and nothing structural
+// blocks it.
+//
+// The nine workspace-EXCLUDED packages that used to sit here -- the sandbox
+// providers and plugin-orchestration-smoke-example, including the
+// @paperclipai/plugin-kubernetes set this row named as its highest-value
+// subset -- have moved to EXECUTED_BY_ANOTHER_LANE. They are not fixed debt;
+// they were never unexecuted debt after 2026-09-19, and this list said
+// otherwise for five weeks. See the note there.
 const UNEXECUTED_WITH_TESTS = new Map(
   [
     "@kkroo/paperclip-plugin-gbrain",
@@ -204,19 +240,10 @@ const UNEXECUTED_WITH_TESTS = new Map(
     "@paperclipai/google-sheets-mcp-server",
     "@paperclipai/kv-demo-mcp-server",
     "@paperclipai/plugin-authoring-smoke-example",
-    "@paperclipai/plugin-cloudflare-sandbox",
-    "@paperclipai/plugin-daytona",
-    "@paperclipai/plugin-e2b",
-    "@paperclipai/plugin-exe-dev",
     "@paperclipai/plugin-fake-sandbox",
-    "@paperclipai/plugin-kubernetes",
     "@paperclipai/plugin-llm-wiki",
-    "@paperclipai/plugin-modal",
-    "@paperclipai/plugin-novita-sandbox",
-    "@paperclipai/plugin-orchestration-smoke-example",
     "@paperclipai/plugin-workspace-diff",
     "@paperclipai/teams-catalog",
-    "paperclip-cloudflare-sandbox-bridge-template",
     "paperclip-plugin-slack",
   ].map((name) => [name, "PEN-2506"]),
 );
@@ -308,6 +335,49 @@ test("packages/mcp-gateway is wired into both lists", () => {
     !UNEXECUTED_WITH_TESTS.has("@paperclipai/mcp-gateway"),
     "@paperclipai/mcp-gateway must not be exempted in UNEXECUTED_WITH_TESTS",
   );
+});
+
+test("every EXECUTED_BY_ANOTHER_LANE claim names a job that exists", () => {
+  // EXECUTED_BY_ANOTHER_LANE is the one list in this file that asserts
+  // coverage rather than its absence, and nothing checked it. That asymmetry
+  // is not academic: for five weeks UNEXECUTED_WITH_TESTS claimed nine
+  // packages were run by no lane while sandbox-provider-tests.yml was running
+  // all nine, because no test reconciles either list against a workflow other
+  // than pr.yml. A wrong entry here is worse than a wrong entry there -- it
+  // exempts a package from the sweep above, so a renamed or deleted job
+  // silently stops running its tests and this file reports clean.
+  //
+  // This asserts the job KEY is declared in the workflow the entry names,
+  // which is what makes the claim falsifiable at review time. It cannot prove
+  // the job ran, or that it ran this package's tests -- only that the lane
+  // being cited exists.
+  const workflows = path.join(repoRoot, ".github", "workflows");
+
+  for (const [name, lane] of EXECUTED_BY_ANOTHER_LANE) {
+    const [file, job] = lane.split(" :: ");
+    assert.ok(file && job, `${name}: lane must read "<workflow>.yml :: <job key>", got "${lane}"`);
+
+    let source;
+    try {
+      source = readFileSync(path.join(workflows, file), "utf8");
+    } catch {
+      assert.fail(
+        `${name} is exempted from the unexecuted-package sweep on the claim that ` +
+          `${file} runs it, but .github/workflows/${file} does not exist.`,
+      );
+    }
+
+    // Strip any parenthetical detail, e.g. "policy (node --test steps)".
+    const jobKey = job.replace(/\s*\(.*$/, "").trim();
+    assert.match(
+      source,
+      new RegExp(`^  ${jobKey}:$`, "m"),
+      `${name} is exempted from the unexecuted-package sweep on the claim that ` +
+        `\`${jobKey}\` in ${file} runs it, but that workflow declares no such job. ` +
+        `Either the job was renamed or removed -- in which case this package's tests ` +
+        `are silently not running -- or the claim was never true.`,
+    );
+  }
 });
 
 test("UNEXECUTED_WITH_TESTS has no stale entries", () => {
