@@ -53,6 +53,7 @@ const nonServerProjects = [
   "@kkroo/paperclip-plugin-linear",
   "paperclip-plugin-slack",
   "@paperclipai/plugin-workspace-diff",
+  "@paperclipai/plugin-llm-wiki",
   "@paperclipai/plugin-authoring-smoke-example",
   "@paperclipai/google-sheets-mcp-server",
   "@paperclipai/kv-demo-mcp-server",

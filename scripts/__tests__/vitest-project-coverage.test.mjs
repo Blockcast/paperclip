@@ -220,13 +220,17 @@ const EXECUTED_BY_ANOTHER_LANE = new Map([
 // wiring the package up) but adding one is a deliberate, reviewable act and
 // needs a tracking issue.
 //
-// PEN-2506 drained this list from twelve to one. The eleven that left were
-// ordinary pnpm workspace members, so the two-list fix (vitest.config.ts +
+// PEN-2506 drained this list to EMPTY. The twelve that left were ordinary
+// pnpm workspace members, so the two-list fix (vitest.config.ts +
 // `nonServerProjects`) was available for each, and every one was run before
-// being claimed: 11 packages / 53 test files / 640 tests, all passing --
-// through the root `--project` path the CI driver uses, not standalone.
+// being claimed -- through the root `--project` path the CI driver uses, not
+// standalone. Eleven of them (53 test files / 640 tests) were confirmed in CI
+// run 40696778970, `General tests (workspaces-b)`, by reading the package
+// names out of the lane log. The twelfth, @paperclipai/plugin-llm-wiki
+// (3 files / 101 tests), was verified locally through that same `--project`
+// path; its first CI run is this change.
 //
-// The security-relevant ones among them were NOT the kubernetes set this row
+// The security-relevant ones among them were NOT the kubernetes set that row
 // was filed about. They were paperclip-plugin-slack --
 // signature-verification.test.ts (HMAC over the original bytes, stale
 // timestamps, length mismatch, fail-closed on an unreadable secret) and
@@ -241,28 +245,29 @@ const EXECUTED_BY_ANOTHER_LANE = new Map([
 // @paperclipai/plugin-kubernetes set -- have moved to
 // EXECUTED_BY_ANOTHER_LANE. They were never unexecuted debt after 2026-09-19,
 // and this list said otherwise for five weeks. See the note there.
-const UNEXECUTED_WITH_TESTS = new Map(
-  [
-    // The only package PEN-2506 could not wire up, and it is a genuine
-    // failure rather than a structural blocker. Of its 3 spec files, 2 pass
-    // (85 tests); tests/wiki-route-sidebar-ui.spec.ts fails 16/16.
-    //
-    // That file renders React through `react-dom/client` createRoot and
-    // imports `act` from "react", but the package's own vitest.config.ts sets
-    // `environment: "node"` -- there is no DOM, and neither jsdom nor
-    // happy-dom is declared. `act` also resolves `undefined` off the
-    // react@19.2.7 build selected under that environment, which is the
-    // "TypeError: act is not a function" every one of the 16 reports.
-    //
-    // Wiring the package up as-is would turn 16 silent failures into a red
-    // lane on every PR. Fixing it means choosing a DOM environment and adding
-    // the dependency for it -- per-package remediation, not CI wiring, and
-    // exactly the BLO-20172 pattern this row's caveat predicted. Deliberately
-    // not bundled into a security change. The 85 passing tests are the prize
-    // waiting on it.
-    "@paperclipai/plugin-llm-wiki",
-  ].map((name) => [name, "PEN-2506"]),
-);
+//
+// The last entry to leave was @paperclipai/plugin-llm-wiki, and the reason
+// recorded here for keeping it was WRONG in a way worth preserving. It read
+// "there is no DOM, and neither jsdom nor happy-dom is declared". Both halves
+// were false: tests/wiki-route-sidebar-ui.spec.ts carries its own
+// `// @vitest-environment jsdom` docblock, and jsdom resolves through the
+// workspace, so `document` was defined the whole time. The 16 failures were
+// "TypeError: act is not a function" because React only exports `act` from
+// cjs/react.development.js and react/index.js selects the production build
+// when process.env.NODE_ENV === "production" -- which is ambient in an agent
+// sandbox, but is NOT what CI does: runVitest in run-vitest-stable.mjs sets
+// NODE_ENV: "test" for every child. The suite passes 101/101 under NODE_ENV
+// of test, development, or unset. Pinned in the package's own vitest.config.ts
+// so a direct `pnpm test` cannot inherit production and reproduce the ghost.
+//
+// The lesson for this file: an entry here is a claim about CI, so verify it
+// the way CI runs it. A failure reproduced only in an agent shell is evidence
+// about the shell.
+//
+// Keep this empty. A new entry is a [packageName, trackingIssue] pair -- the
+// issue is not optional, and the sweep below prints it in the failure message:
+//   const UNEXECUTED_WITH_TESTS = new Map([["@scope/pkg", "ABC-123"]]);
+const UNEXECUTED_WITH_TESTS = new Map([]);
 
 function collectWorkspace(dir, packageDirs, testFiles) {
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
