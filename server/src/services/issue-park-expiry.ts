@@ -65,11 +65,24 @@
  * on PEN-4198 before a positive control caught it).
  *
  * ⇒ `null` means "no release wake is owed for this row's current park". To ask whether
- * park wakes FIRED, read `agent_wakeup_requests` — exposed as
- * `GET /api/issues/:id/diagnostics/wakes`, which is durable, per-event and paginable.
- * Note that a park-expiry wake is NOT emitted to `GET /api/companies/:id/activity` at all,
- * unlike `issue.monitor_triggered` / `_scheduled` / `_cleared`, so the activity feed is
- * not a substitute either.
+ * park wakes FIRED, read the `agent_wakeup_requests` TABLE, which is the durable
+ * per-event record. `GET /api/issues/:id/diagnostics/wakes` serves it, but as a BOUNDED
+ * view: the route passes no options, so both ceilings bind and a caller cannot raise
+ * them — at most `ISSUE_WAKE_DIAGNOSTICS_MAX_WAKE_REQUESTS` (50) requests, within
+ * `ISSUE_WAKE_DIAGNOSTICS_LOOKBACK_DAYS` (14) days, and there is no offset or cursor to
+ * page past either. Read `caps` and `truncatedSections.wakeRequests` off the response
+ * before reading an absence as a negative; on a busy row, or a park older than the
+ * lookback, empty means "outside the window", which is this module's own trap relocated
+ * to the replacement surface.
+ *
+ * Note also that a park-expiry wake is NOT emitted to `GET /api/companies/:id/activity`
+ * at all, unlike `issue.monitor_triggered` / `_scheduled` / `_cleared`, so the activity
+ * feed is not a substitute either.
+ *
+ * Operator-facing version of all of the above, including the three meanings of `null` and
+ * why preserving the stamp was declined: `runbooks/deliberate-park-release-edge.md`. That
+ * file is the single source of truth; the other code sites point at it rather than
+ * restating it, so the account cannot drift between five copies.
  */
 
 /**

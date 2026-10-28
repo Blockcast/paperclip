@@ -855,16 +855,17 @@ export interface Issue {
    * re-parks. The field therefore deletes its own positive cases, and deletes more of them
    * the better the release edge works.
    *
-   * Measured 2026-10-28 on a 7-row cohort parked to one shared instant: 7 of 7 fired
-   * (+30.5 s … +75.4 s, inside the historical park-fire band) and 7 of 7 read `null` here
-   * 45 minutes later, every one re-parked in between. Corpus-wide the discriminator was
-   * the re-park, not the wake outcome — fire then re-parked ⇒ `null` 7/7; fire, never
-   * re-parked ⇒ present 12/12.
+   * Measured 2026-10-28 on a 7-row cohort parked to one shared instant: 7 of 7 fired and
+   * 7 of 7 read `null` here 45 minutes later, every one re-parked in between.
    *
    * ⇒ `null` means "no release wake is owed for the park on this row right now". It does
    * NOT mean "this row's park never woke", and reading it that way is wrong in the
    * reassuring direction. To ask whether park wakes FIRED, use
-   * `GET /api/issues/:id/diagnostics/wakes`, which is the durable per-event record.
+   * `GET /api/issues/:id/diagnostics/wakes` — but note it is a BOUNDED view of
+   * `agent_wakeup_requests` (last 50 requests, 14-day lookback, no pagination), so check
+   * `caps` and `truncatedSections.wakeRequests` before reading an absence as a negative.
+   * Full account, and the two other ways this field reaches `null`:
+   * `runbooks/deliberate-park-release-edge.md`.
    *
    * Projected read-only alongside the four park columns for the same reason they are: the
    * audit that found PEN-4420 (PEN-4419) is a client-side query over list rows, and "is

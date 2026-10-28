@@ -389,10 +389,10 @@ describeEmbeddedPostgres("issue park expiry sweep", () => {
     // case is that a park wake dispatches a run which re-parks, landing here and erasing
     // the stamp (measured 7/7 fired, 0/7 still recorded 45 min later). That is CORRECT
     // for a fire-once claim marker and this assertion must stay. Do not "fix" it into a
-    // durable stamp to make the field auditable: the durable record is
-    // `agent_wakeup_requests` / `GET /api/issues/:id/diagnostics/wakes`, and the reader-
-    // facing comments on the column, the shared `Issue` type and `issue-park-expiry.ts`
-    // now say so.
+    // durable stamp to make the field auditable: the durable record is the
+    // `agent_wakeup_requests` table, served (bounded) by
+    // `GET /api/issues/:id/diagnostics/wakes`. See
+    // `runbooks/deliberate-park-release-edge.md`.
     const parked = await seedParkedIssue();
     const heartbeat = createHeartbeat();
     const svc = issueService(db);

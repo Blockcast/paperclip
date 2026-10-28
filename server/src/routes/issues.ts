@@ -1475,6 +1475,22 @@ export const ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS: ReadonlySet<string> = new Set(
   // have. The circuit-breaker pair reaches the column through a typed parameter rather
   // than a literal, so the writer-derived scan cannot see it -- the negative test in
   // `issue-wake-diagnostics-routes.test.ts` is what holds this exclusion.
+  // PEN-4894: the deliberate park's RELEASE wake (`tickExpiredIssueParks`). Neither
+  // writer-derived scan can reach it -- it is not a direct `insert(agentWakeupRequests)`
+  // at all, it is an `enqueueWakeup({ reason: ISSUE_PARK_EXPIRED_WAKE_REASON })` call,
+  // and the generic writer inside `enqueueWakeup` sets `reason: opts.reason ?? null`,
+  // which resolves to nothing statically. So this entry is held by the route test
+  // "names the park-expiry reason on a deliberate park's release wake" in
+  // `issue-wake-diagnostics-routes.test.ts`, the same way the two other
+  // const-identifier reasons above are.
+  //
+  // Admitting it is a reachability claim, and it holds: the park wake's payload and
+  // context snapshot both carry `issueId`, so `wakeRequestTargetsIssue` returns it on
+  // this route. It was measured on this route on 2026-10-28 -- reading "other", which
+  // is the defect. That projection is the whole reason PEN-4894's documentation had to
+  // tell readers to attribute park wakes by latency band instead of by name, and it is
+  // the same erasure the PEN-3727 block above describes.
+  "issue_park_expired",
   "issue_execution_deferred",
   "issue_execution_promoted",
   "issue_execution_same_name",
