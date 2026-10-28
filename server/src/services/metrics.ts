@@ -1289,7 +1289,7 @@ export const COLD_IN_REVIEW_ISSUE_METRICS_REFRESH_SUCCESS_METRIC =
  * remove, reintroduced one layer up. Hence the helper.
  */
 export const COLD_IN_REVIEW_LEADER_SCOPED_SELECTOR =
-  'and on (pod) (paperclip_scheduler_lease_held{lease="heartbeat-timer"} == 1)';
+  `and on (pod) (${SCHEDULER_LEASE_HELD_METRIC}{lease="heartbeat-timer"} == 1)`;
 
 /**
  * Compose a complete, correctly-parenthesised leader-scoped alert expression
