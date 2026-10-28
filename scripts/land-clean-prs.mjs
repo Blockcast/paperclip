@@ -340,12 +340,177 @@ export function allyVerdictAtHead(pr) {
 }
 
 /**
- * Requested reviewers with no APPROVED review at the current head.
+ * The GitHub-documented CODEOWNERS locations, in GitHub's own precedence
+ * order. The first file that exists is the only one that applies.
+ */
+export const CODEOWNERS_PATHS = [".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"];
+
+/** Files past this count mean GitHub truncated the diff listing, not that the PR is small. */
+export const MAX_PR_FILES = 3000;
+
+/**
+ * `@login` -> `login`, `@org/team` -> `team:team`, so an owner token compares
+ * directly against what `unsatisfiedOwners` builds from `reviewRequests`.
+ * An email owner normalises to itself and simply never matches a request,
+ * which is correct: an email in CODEOWNERS requests nobody.
+ */
+function normalizeOwner(owner) {
+  const raw = String(owner ?? "").replace(/^@/, "");
+  const slash = raw.indexOf("/");
+  return slash === -1 ? raw : `team:${raw.slice(slash + 1)}`;
+}
+
+/**
+ * Translates one CODEOWNERS pattern into an anchored RegExp.
+ *
+ * The syntax is gitignore's, and the two rules that matter here are the ones
+ * the repo's own CODEOWNERS relies on and a naive glob gets wrong:
+ *
+ * - A pattern with NO slash matches at **any depth**. `package.json` owns
+ *   `packages/adapters/acpx-local/package.json`, which is exactly why the
+ *   checked-in file carries a comment saying so.
+ * - A slash anywhere but the end anchors to the repo root. `scripts/release*.sh`
+ *   does not reach `scripts/nested/release-x.sh`, because `*` stops at `/`.
+ */
+export function codeownersPatternToRegExp(pattern) {
+  let body = String(pattern ?? "");
+  const dirOnly = body.endsWith("/");
+  if (dirOnly) body = body.slice(0, -1);
+  const rooted = body.startsWith("/");
+  if (rooted) body = body.slice(1);
+  // A slash anywhere but the end still anchors; only a bare name floats.
+  const anchored = rooted || body.includes("/");
+
+  // Scanned rather than chain-replaced. A `.replace` pass that rewrites `*`
+  // after having already emitted `.*` for `**` cannot tell its own output from
+  // the input, and any lookbehind guarding against that also fires on a
+  // legitimate `*` following an escaped literal dot.
+  let source = "";
+  for (let i = 0; i < body.length; i += 1) {
+    const char = body[i];
+    if (char === "*") {
+      if (body[i + 1] === "*") {
+        const atStart = i === 0;
+        const slashBefore = body[i - 1] === "/";
+        const slashAfter = body[i + 2] === "/";
+        const atEnd = i + 2 === body.length;
+        if (slashBefore && slashAfter) {
+          // `a/**/b` spans zero or more whole segments. The `/` is already emitted.
+          source += "(?:.+/)?";
+          i += 2;
+        } else if (slashBefore && atEnd) {
+          source += ".*"; // `a/**` owns everything beneath `a/`
+          i += 1;
+        } else if (atStart && slashAfter) {
+          source = "(?:.*/)?"; // `**/b` floats to any depth
+          i += 2;
+        } else {
+          source += ".*";
+          i += 1;
+        }
+        continue;
+      }
+      source += "[^/]*";
+      continue;
+    }
+    if (char === "?") {
+      source += "[^/]";
+      continue;
+    }
+    source += char.replace(/[.+^${}()|[\]\\]/, "\\$&");
+  }
+
+  const prefix = anchored ? "^" : "^(?:.*/)?";
+  // A directory pattern owns its contents; so does a bare name that turns out
+  // to be a directory, which is why the non-`dirOnly` tail is optional.
+  const suffix = dirOnly ? "/.*$" : "(?:/.*)?$";
+  return new RegExp(`${prefix}${source}${suffix}`);
+}
+
+/**
+ * Parses CODEOWNERS text into rules in file order. Callers must apply
+ * LAST-match-wins, which is GitHub's precedence and the opposite of what a
+ * `find`-style first-match loop does.
+ */
+export function parseCodeowners(text) {
+  return String(text ?? "")
+    .split("\n")
+    .map((line) => line.replace(/#.*$/, "").trim())
+    .filter((line) => line.length > 0)
+    .map((line) => line.split(/\s+/))
+    .filter((fields) => fields.length > 1)
+    .map(([pattern, ...owners]) => ({
+      pattern,
+      matcher: codeownersPatternToRegExp(pattern),
+      owners: owners.map(normalizeOwner).filter((owner) => owner.length > 0),
+    }));
+}
+
+/**
+ * The owner tokens CODEOWNERS assigns to `files`, lowercased.
+ *
+ * Last match wins PER FILE, then the per-file winners are unioned: a PR
+ * touching two differently-owned paths owes both owners.
+ */
+export function ownersForFiles(files, rules) {
+  const owners = new Set();
+  for (const file of files ?? []) {
+    const path = String(file ?? "");
+    let winner = null;
+    for (const rule of rules ?? []) if (rule.matcher.test(path)) winner = rule;
+    for (const owner of winner?.owners ?? []) owners.add(lower(owner));
+  }
+  return owners;
+}
+
+/**
+ * Owner tokens this PR's CURRENT diff actually owes, or `null` when that
+ * cannot be determined.
+ *
+ * `null` is load-bearing and must stay distinguishable from the empty set.
+ * This script's output is "merge it", so an unreadable CODEOWNERS or a
+ * truncated file list has to fall back to the old, over-holding behaviour —
+ * never to "nobody is owed", which would enqueue every held PR at once.
+ */
+export function impliedOwners(pr) {
+  const rules = pr?.codeownerRules;
+  const files = pr?.files;
+  if (!Array.isArray(rules) || !Array.isArray(files)) return null;
+  if (files.length >= MAX_PR_FILES) return null;
+  return ownersForFiles(files, rules);
+}
+
+/**
+ * Requested reviewers with no APPROVED review at the current head, scoped to
+ * the ones CODEOWNERS still names for this PR's current file list.
  *
  * D7: GitHub does not enforce CODEOWNERS on this repo, so an outstanding owner
  * request is a real gate that only this script observes. A team request can
  * never be satisfied by a login match and so always counts as outstanding,
  * which is correct — a team has not reviewed until one of its members has.
+ *
+ * PEN-3474: `reviewRequests` on its own is the WRONG set to hold on, in two
+ * measured ways, and both are permanent because nothing ever clears them.
+ *
+ * 1. **A request GitHub never withdraws.** GitHub auto-requests code owners
+ *    when a PR opens and does NOT withdraw the request when a force-push takes
+ *    the owned file back out of the diff. #3067 opened touching
+ *    `.github/workflows/pr.yml`, was auto-requested to `@kkroo` two seconds
+ *    later, then force-pushed down to one file that no rule matches — and this
+ *    function still reported `kkroo`, so a green PR held forever on an owner
+ *    who owns nothing in it. GraphQL's `asCodeOwner` does not see this either:
+ *    it read `true` on #3067 at the same instant, because GitHub stamps it at
+ *    request time and never recomputes it.
+ * 2. **A request no review can satisfy.** The `allyblockcast` *User* seat
+ *    (id 296676656) is a different principal from the `allyblockcast[bot]` App
+ *    (id 290875700) that submits every review, so the login never matches; at
+ *    the time of filing that pinned 70 of 124 open PRs. CODEOWNERS names only
+ *    `@kkroo`, so such a request is not code-owner-derived and is now dropped
+ *    by construction.
+ *
+ * This does NOT weaken a deliberate human hold, because a review request was
+ * never the instrument for one: `SKIP_LABELS` and draft state are, both
+ * machine-readable and both withdrawable by the human who set them.
  *
  * This matches on `commit_id` rather than a body attestation because a human
  * approval carries no attestation to read. That inherits GitHub's own
@@ -364,11 +529,15 @@ export function unsatisfiedOwners(pr) {
       )
       .map((review) => lower(review?.user?.login)),
   );
-  return (pr?.reviewRequests ?? [])
+  const outstanding = (pr?.reviewRequests ?? [])
     .map((request) =>
       request?.login ? String(request.login) : request?.slug ? `team:${request.slug}` : null,
     )
     .filter((who) => who !== null && !approved.has(lower(who)));
+
+  const implied = impliedOwners(pr);
+  if (implied === null) return outstanding;
+  return outstanding.filter((who) => implied.has(lower(who)));
 }
 
 /**
@@ -624,6 +793,40 @@ function gh(args) {
 }
 
 /**
+ * The repo's CODEOWNERS rules, or `null` when none could be read.
+ *
+ * `null` must stay distinguishable from `[]`: a repo with no CODEOWNERS owes
+ * nobody, while a repo whose CODEOWNERS could not be fetched is unknown, and
+ * `impliedOwners` falls back to over-holding on the second. Reading it from
+ * the DEFAULT branch rather than the PR head is deliberate — a PR must not be
+ * able to edit its own ownership rules into a weaker hold.
+ */
+export function fetchCodeownerRules(repo, run = gh) {
+  for (const path of CODEOWNERS_PATHS) {
+    try {
+      const encoded = JSON.parse(run(["api", `repos/${repo}/contents/${path}`]))?.content;
+      if (typeof encoded !== "string") continue;
+      return parseCodeowners(Buffer.from(encoded, "base64").toString("utf8"));
+    } catch {
+      // 404 on this location only means try the next one.
+    }
+  }
+  return null;
+}
+
+/** Changed paths for one PR, or `null` if the listing failed or GitHub truncated it. */
+export function fetchPrFiles(repo, number, run = gh) {
+  try {
+    const files = JSON.parse(
+      run(["api", `repos/${repo}/pulls/${number}/files`, "--paginate"]),
+    ).map((file) => file?.filename);
+    return files.length >= MAX_PR_FILES ? null : files;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Lists open PRs, then hydrates checks and reviews only for the ones the cheap
  * rules could not decide. `statusCheckRollup` is deliberately absent from the
  * list query — including it makes GitHub time out across this repo's open PR
@@ -638,11 +841,17 @@ function fetchOpenPrs(repo) {
     gh(["pr", "list", "--repo", repo, "--state", "open", "--limit", "500", "--json", PR_LIST_FIELDS]),
   );
   assertPrListComplete(rows, repo, 500);
+  // One fetch per repo, not per PR: the rules are a property of the base branch.
+  const codeownerRules = fetchCodeownerRules(repo);
   return rows.map((row) => {
     assertHeadSha(row, repo);
     if (classifyFromListing(row)) return row;
     return {
       ...row,
+      codeownerRules,
+      // Only PRs that actually carry a request can be scoped by ownership, so
+      // the extra call is spent only where it can change a verdict.
+      files: (row.reviewRequests ?? []).length > 0 ? fetchPrFiles(repo, row.number) : [],
       statusCheckRollup: JSON.parse(
         gh(["pr", "view", String(row.number), "--repo", repo, "--json", "statusCheckRollup"]),
       ).statusCheckRollup,
