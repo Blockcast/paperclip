@@ -49,6 +49,8 @@ import {
   __resetMetricsForTest,
   COLD_IN_REVIEW_ISSUE_METRICS_REFRESH_SUCCESS_METRIC,
   COLD_IN_REVIEW_ISSUE_OLDEST_AGE_METRIC,
+  COLD_IN_REVIEW_LEADER_SCOPED_SELECTOR,
+  coldInReviewLeaderScopedExpr,
   renderMetrics,
   setColdInReviewIssueMetricsRefreshSuccess,
   setColdInReviewIssueOldestAgeMetrics,
@@ -159,6 +161,18 @@ async function refreshSuccessValue(): Promise<string | undefined> {
   const { body } = await renderMetrics();
   const prefix = `${COLD_IN_REVIEW_ISSUE_METRICS_REFRESH_SUCCESS_METRIC} `;
   return body.split("\n").find((line) => line.startsWith(prefix))?.slice(prefix.length).trim();
+}
+
+/**
+ * The `# HELP` line a scraping operator actually reads. Asserted on because
+ * this is the surface that carries the alert rule to whoever writes the alert:
+ * PEN-4665's defect was that the shipped guidance was WRONG, not that the
+ * numbers were, so the guidance is the part that needs a regression test.
+ */
+async function helpLine(metric: string): Promise<string> {
+  const { body } = await renderMetrics();
+  const prefix = `# HELP ${metric} `;
+  return body.split("\n").find((line) => line.startsWith(prefix))?.slice(prefix.length) ?? "";
 }
 
 describe("cold in_review issue gauge (PEN-4652)", () => {
@@ -294,6 +308,100 @@ describe("cold in_review issue gauge (PEN-4652)", () => {
     expect(await refreshSuccessValue()).toBe("1");
     setColdInReviewIssueMetricsRefreshSuccess(false);
     expect(await refreshSuccessValue()).toBe("0");
+  });
+
+  // PEN-4665. The gauge values were never wrong; the ALERT RULE shipped in the
+  // help text was. `max by (service) (<series>{service="paperclip-workers"})`
+  // is correct only when leadership moves by restart, and reads a demoted but
+  // still-running leader's stale `1` as healthy when the lease moves in
+  // process — fail-open on an instrument whose whole job is to stop a silent
+  // state being silent. These lock the corrected guidance onto the surface an
+  // operator reads, and keep the retired form from creeping back.
+  describe("alert guidance (PEN-4665)", () => {
+    it("ships the leader-scoped join on BOTH gauges, from one shared constant", async () => {
+      // One constant, embedded twice — so the two help texts cannot drift from
+      // each other the way the two copies of the old rule did.
+      expect(COLD_IN_REVIEW_LEADER_SCOPED_SELECTOR)
+        .toBe('and on (pod) (paperclip_scheduler_lease_held{lease="heartbeat-timer"} == 1)');
+
+      for (const metric of [
+        COLD_IN_REVIEW_ISSUE_METRICS_REFRESH_SUCCESS_METRIC,
+        COLD_IN_REVIEW_ISSUE_OLDEST_AGE_METRIC,
+      ]) {
+        expect(await helpLine(metric), `${metric} must carry the leader-scoped selector`)
+          .toContain(COLD_IN_REVIEW_LEADER_SCOPED_SELECTOR);
+      }
+    });
+
+    it("does not prescribe the retired tier-aggregate predicate on either gauge", async () => {
+      // The retired form may still be NAMED as the rejected alternative — that
+      // is how a reader learns not to reintroduce it — so this asserts on the
+      // prescription, i.e. the full selector that used to be the recommendation.
+      const retired = 'max by (service) (<series>{service="paperclip-workers"}) == 0';
+      for (const metric of [
+        COLD_IN_REVIEW_ISSUE_METRICS_REFRESH_SUCCESS_METRIC,
+        COLD_IN_REVIEW_ISSUE_OLDEST_AGE_METRIC,
+      ]) {
+        expect(await helpLine(metric), `${metric} must not re-prescribe the fail-open form`)
+          .not.toContain(retired);
+      }
+    });
+
+    // PromQL binds comparison operators TIGHTER than `and`, so the composition a
+    // reader writes by hand --
+    //   <series> and on (pod) (<lease> == 1) == 0
+    // -- parses as `<series> and on (pod) ((<lease> == 1) == 0)`, whose right
+    // side is always empty, and is therefore an alert that can NEVER fire.
+    // Reduced to a self-contained control and measured against live Prometheus
+    // on 2026-10-28:
+    //   vector(0) and on() (vector(1) == 1) == 0    => []        (empty)
+    //   (vector(0) and on() (vector(1) == 1)) == 0  => {} 0
+    // That is the same silent-instrument failure PEN-4665 exists to remove,
+    // one layer up — hence the helper, and hence this test.
+    it("parenthesises the join so the comparison binds to it, not to the lease gauge", () => {
+      const expr = coldInReviewLeaderScopedExpr(
+        COLD_IN_REVIEW_ISSUE_METRICS_REFRESH_SUCCESS_METRIC,
+        "== 0",
+      );
+      expect(expr).toBe(
+        `(${COLD_IN_REVIEW_ISSUE_METRICS_REFRESH_SUCCESS_METRIC} `
+        + `${COLD_IN_REVIEW_LEADER_SCOPED_SELECTOR}) == 0`,
+      );
+      // The comparison must sit OUTSIDE the closing paren of the join.
+      expect(expr.indexOf("== 0")).toBeGreaterThan(expr.lastIndexOf(")") - 1);
+      expect(expr.startsWith("(")).toBe(true);
+    });
+
+    // The second way to write a silent alert, and it is NOT the same mistake.
+    // `and on (pod)` needs the `pod` label on both sides; `max by (agent_id)`
+    // has already dropped it. So the aggregation must WRAP the join. Measured
+    // against live Prometheus 2026-10-28 on a genuinely cold row (agent
+    // d6f327a4, 141,381 s):
+    //   max by (agent_id) (<age> and on (pod) (<lease> == 1)) > 86400  => fires
+    //   max by (agent_id) (<age>) and on (pod) (<lease> == 1) > 86400  => []
+    it("wraps the join in the aggregation, because `max by (agent_id)` drops `pod`", () => {
+      const expr = coldInReviewLeaderScopedExpr(
+        COLD_IN_REVIEW_ISSUE_OLDEST_AGE_METRIC,
+        "> 86400",
+        "max by (agent_id)",
+      );
+      expect(expr).toBe(
+        `max by (agent_id) (${COLD_IN_REVIEW_ISSUE_OLDEST_AGE_METRIC} `
+        + `${COLD_IN_REVIEW_LEADER_SCOPED_SELECTOR}) > 86400`,
+      );
+      // The aggregation opens before the join, so `pod` still exists at join time.
+      expect(expr.indexOf("max by (agent_id)")).toBeLessThan(expr.indexOf("and on (pod)"));
+    });
+
+    it("names the lease that actually gates the chain, not an invented one", async () => {
+      // The join is only correct if it keys off the lease the recovery chain is
+      // gated on. `heartbeat-timer` is HEARTBEAT_TIMER_LEASE in
+      // `scheduler-lease.ts`, which `index.ts` passes to `schedulerLeaseHolder`
+      // and whose `shouldRunLoop()` gates the timer loop that runs the chain.
+      // A typo here produces an empty join and an alert that can never fire.
+      expect(COLD_IN_REVIEW_LEADER_SCOPED_SELECTOR).toContain('lease="heartbeat-timer"');
+      expect(COLD_IN_REVIEW_LEADER_SCOPED_SELECTOR).toContain("paperclip_scheduler_lease_held");
+    });
   });
 
   it("ignores statuses other than in_review", () => {

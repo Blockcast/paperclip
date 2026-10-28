@@ -1197,15 +1197,130 @@ export const DEFERRED_ISSUE_EXECUTION_WAKE_AGE_METRICS_REFRESH_SUCCESS_METRIC =
 // file: it is published from `reconcileIssueGraphLiveness` where the classifier
 // verdicts already exist, so it lives on the WORKERS tier only, and refreshes
 // once per recovery CHAIN rather than once per 30s tick -- a chain routinely
-// outlives one interval. Scope any query to `service="paperclip-workers"` -- but
-// that selector is necessary, not sufficient: the chain is single-leader WITHIN
-// that tier, so every non-leader worker replica also sits at a permanent 0.
-// Aggregate across replicas (`max by (service) (...)`) rather than alerting
-// per-replica, and do not size a `for:` off the tick interval.
+// outlives one interval. Do not size a `for:` off the tick interval.
+//
+// THIS COMMENT OWNS THE ALERT RULE for both gauges below (PEN-4665). The help
+// text embeds {@link COLD_IN_REVIEW_LEADER_SCOPED_SELECTOR} rather than
+// restating it, so there is exactly one copy of the predicate and it cannot
+// drift from this reasoning.
+//
+// ⚠ `service="paperclip-workers"` is NOT a sufficient scope, and neither is
+// aggregating across that tier. The chain is SINGLE-LEADER within the workers
+// tier, so at any instant one worker replica refreshes these gauges and every
+// other worker sits at a permanent 0 while behaving correctly. The obvious
+// repair -- `max by (service) (<series>{service="paperclip-workers"}) == 0` --
+// is correct only when leadership moves BY RESTART, and is FAIL-OPEN when the
+// lease moves without one:
+//
+//   * `scheduler-lease.ts` demotes in process when renewals lapse past the TTL
+//     (the `wasLeader && !hold` branch, "scheduler lease lost to another
+//     holder"). Nothing in that path resets these gauges --
+//     `setColdInReviewIssueMetricsRefreshSuccess` is their only writer -- so a
+//     demoted-but-live replica keeps exporting its last `1`.
+//   * `max` then returns 1 from a replica that has stopped refreshing, while
+//     the NEW holder's chain is failing. The age gauges carry the same
+//     staleness: `max` across replicas keeps showing a repaired row's frozen
+//     age.
+//
+// That trades one fail-closed trap (per-replica `== 0` pages on the standby)
+// for a fail-open one, which is the worse direction for an instrument whose
+// whole job is to stop a silent state being silent.
+//
+// THE FIX IS TO ASK THE LEADER, NOT THE TIER. `paperclip_scheduler_lease_held`
+// already carries that answer: it is labelled by holder pod, it exists on every
+// worker replica, and `publish()` rewrites it at the END OF EVERY renew attempt
+// INCLUDING the in-process demotion branch. So a replica's leader indicator
+// flips to 0 on the very tick it stops refreshing these gauges -- the event a
+// reset-on-lease-loss fix would need bespoke code to catch. Joining on it needs
+// no new series and no change to the publishing code.
+//
+// Rejected alternatives, and why (PEN-4665 decision, 2026-10-28):
+//   * RESET THE GAUGES ON LEASE LOSS. Fixes the refresh flag but breaks the two
+//     gauge families in OPPOSITE directions during the handoff window: the
+//     refresh flag goes fail-CLOSED (the new leader is seeded 0 and a chain
+//     routinely outlives one interval -- 645 s measured 2026-10-24), while the
+//     AGE gauges go fail-OPEN (the old leader's ages drop to 0 before the new
+//     leader publishes, so `max` reads "nothing cold"). One change, two new
+//     traps, and it needs code in the demotion path.
+//   * KEY THE ALERT OFF A TIMESTAMP ADVANCING. Changes the alert's shape and
+//     still needs a per-refresh timestamp series these gauges do not publish.
+//
+// ⚠ KNOWN AND DELIBERATE GAP: during a genuine handover the lease legitimately
+// passes through zero holders, the join goes EMPTY, and an empty vector cannot
+// compare `== 0` -- so this alert is silent for that window. That is correct
+// separation, not an oversight: "nobody is running the loop" is already owned
+// by `sum by (lease) (paperclip_scheduler_lease_held) != 1` (see
+// {@link SCHEDULER_LEASE_HELD_METRIC}), which is bounded by the 45 s TTL. Pair
+// the two; do not try to make either one answer both questions.
 export const COLD_IN_REVIEW_ISSUE_OLDEST_AGE_METRIC =
   "paperclip_cold_in_review_issue_oldest_age_seconds";
 export const COLD_IN_REVIEW_ISSUE_METRICS_REFRESH_SUCCESS_METRIC =
   "paperclip_cold_in_review_issue_metrics_refresh_success";
+/**
+ * The ONLY correct way to scope either cold-`in_review` gauge in an alert
+ * (PEN-4665): keep the series from the replica that currently holds the
+ * heartbeat-timer lease, and drop every other replica -- the standby workers
+ * sitting at a permanent 0, the api replicas that never run the chain, and a
+ * demoted-but-live former leader still exporting a stale `1`.
+ *
+ * Exported as a constant and embedded in both gauges' help text so the rule has
+ * exactly one copy. Read the declaration comment above for why aggregating
+ * across the workers tier is fail-open, and for the handover-gap caveat.
+ *
+ * No `service` selector is needed alongside it: the join already restricts to
+ * replicas that publish a lease indicator, which the api tier does not.
+ *
+ * ⛔ DO NOT CONCATENATE A COMPARISON ONTO THIS FRAGMENT YOURSELF -- use
+ * {@link coldInReviewLeaderScopedExpr}, which parenthesises for you. PromQL
+ * binds `==` TIGHTER than `and`, so the obvious composition silently never
+ * fires:
+ *
+ *     <series> and on (pod) (<lease> == 1) == 0     ⛔ parses as
+ *     <series> and on (pod) ((<lease> == 1) == 0)   -- right side always empty
+ *
+ * Measured against live Prometheus 2026-10-28, reduced to a self-contained
+ * control so it can be re-run anywhere:
+ *
+ *     vector(0) and on() (vector(1) == 1) == 0      =>  [] (empty)
+ *     (vector(0) and on() (vector(1) == 1)) == 0    =>  {} 0
+ *
+ * The first form is the one a reader writes by hand, and it is an alert that
+ * can NEVER fire -- the same silent-instrument failure PEN-4665 exists to
+ * remove, reintroduced one layer up. Hence the helper.
+ */
+export const COLD_IN_REVIEW_LEADER_SCOPED_SELECTOR =
+  'and on (pod) (paperclip_scheduler_lease_held{lease="heartbeat-timer"} == 1)';
+
+/**
+ * Compose a complete, correctly-parenthesised leader-scoped alert expression
+ * for either cold-`in_review` gauge (PEN-4665).
+ *
+ * The parentheses are the point: see the ⛔ note on
+ * {@link COLD_IN_REVIEW_LEADER_SCOPED_SELECTOR} for why hand-concatenating the
+ * fragment with a comparison yields an expression that never fires.
+ *
+ * `aggregation` exists because the two gauges need the join at DIFFERENT
+ * depths, and getting that backwards is the second way to write a silent
+ * alert. The refresh flag is unlabelled, so the join is outermost. The age
+ * gauge is labelled by `agent_id`, and `and on (pod)` needs the `pod` label on
+ * BOTH sides -- so any aggregation must WRAP the join. `max by (agent_id) (age)
+ * and on (pod) (...)` has already dropped `pod` by the time it joins and
+ * matches nothing.
+ *
+ *   coldInReviewLeaderScopedExpr(COLD_IN_REVIEW_ISSUE_METRICS_REFRESH_SUCCESS_METRIC, "== 0")
+ *     -> (paperclip_cold_in_review_issue_metrics_refresh_success and on (pod) (...)) == 0
+ *
+ *   coldInReviewLeaderScopedExpr(COLD_IN_REVIEW_ISSUE_OLDEST_AGE_METRIC, "> 86400", "max by (agent_id)")
+ *     -> max by (agent_id) (paperclip_cold_in_review_issue_oldest_age_seconds and on (pod) (...)) > 86400
+ */
+export function coldInReviewLeaderScopedExpr(
+  metric: string,
+  comparison: string,
+  aggregation?: string,
+): string {
+  const joined = `(${metric} ${COLD_IN_REVIEW_LEADER_SCOPED_SELECTOR})`;
+  return `${aggregation ? `${aggregation} ${joined}` : joined} ${comparison}`;
+}
 // BLO-28865. Deliberately NOT a threshold over the pre-existing
 // EXTERNAL_RUNTIME_RESERVATION_OLDEST_AGE_METRIC: that gauge is unlabelled and
 // measures reservation age only, so it cannot separate a stranded row from a
@@ -6768,7 +6883,19 @@ function ensureRegistry(): {
         + "stuck\" render identically on a dashboard. Published from the heartbeat recovery "
         + "chain, so it exists on the workers tier only and refreshes per chain rather than "
         + "per tick; reset-then-set every refresh, so a repaired row drops the agent back "
-        + "to 0 instead of freezing at its last value.",
+        + "to 0 instead of freezing at its last value. ⚠ That reset is per-refresh, NOT "
+        + "per-leadership-change: a worker demoted in process by a lease handoff stops "
+        + "refreshing and keeps exporting the ages it last published, so aggregating "
+        + "across replicas re-serves a repaired row's frozen age indefinitely "
+        + "(PEN-4665). Scope any query to the current lease holder, exactly as for "
+        + COLD_IN_REVIEW_ISSUE_METRICS_REFRESH_SUCCESS_METRIC + ", e.g. `"
+        + coldInReviewLeaderScopedExpr(
+          COLD_IN_REVIEW_ISSUE_OLDEST_AGE_METRIC, "> 86400", "max by (agent_id)")
+        + "`. ⛔ Two things there are load-bearing. The aggregation must WRAP the "
+        + "join, because `and on (pod)` needs the pod label on both sides and `max by "
+        + "(agent_id)` has already dropped it. And the parentheses around the join must "
+        + "stay, because PromQL binds comparison tighter than `and`. Drop either and the "
+        + "alert can never fire. The declaration comment on this metric owns that rule.",
       labelNames: ["agent_id"],
       registers: [registry],
     });
@@ -6780,25 +6907,24 @@ function ensureRegistry(): {
         + "could not be read, so a stale cold-row age cannot be read as fresh (PEN-4652). "
         + "Note this tracks the heartbeat recovery chain, NOT the scrape-metrics collector "
         + "that carries the other refresh-success gauges in this file -- it can be 1 while "
-        + "every one of those is 0, and the reverse. ⚠ A service=\"paperclip-workers\" "
-        + "selector is NECESSARY BUT NOT SUFFICIENT on this series, and an alert that "
-        + "stops there still pages forever. Two things make a replica read a permanent "
-        + "0. First the tier: the registry is constructed everywhere and seeds this "
-        + "gauge to 0, but only the workers tier runs the recovery chain, so every api "
-        + "replica exports a 0 it will never refresh. Second, and the one the selector "
-        + "does NOT cover: the chain is a SINGLE-LEADER process within the workers tier "
-        + "too, so at any instant exactly one worker replica refreshes this gauge and "
-        + "every other worker replica is also sitting at a permanent 0 while behaving "
-        + "correctly. Measured 2026-10-24 against live Prometheus: "
-        + "paperclip_heartbeat_recovery_chain_duration_seconds read 645s on "
-        + "`paperclip-1` and 0 on `paperclip-0` -- both workers -- having been the "
-        + "other way round before leadership moved at ~07:30Z, while both "
-        + "`paperclip-api-*` replicas held 0 throughout. So the predicate must "
-        + "AGGREGATE ACROSS REPLICAS and ask whether NO worker refreshed, e.g. `max by "
-        + "(service) (<series>{service=\"paperclip-workers\"}) == 0`; any per-replica "
-        + "`== 0`, scoped or not, fires on the standby. Same shape as the pre-seeded "
-        + "backstop counters documented above, which were likewise measured on one "
-        + "worker replica alone.",
+        + "every one of those is 0, and the reverse. ⚠ DO NOT alert per-replica, and do "
+        + "NOT aggregate across the workers tier either. THREE classes of replica read a "
+        + "0 or a stale 1 while behaving correctly: every api replica (the registry is "
+        + "constructed everywhere and seeds this gauge to 0, but only workers run the "
+        + "chain); every non-leader worker (the chain is SINGLE-LEADER within the tier); "
+        + "and -- the one a `max by (service)` aggregate gets WRONG, fail-open -- a "
+        + "worker demoted in process by a lease handoff, which keeps exporting its last "
+        + "1 because nothing resets this gauge on lease loss (PEN-4665). Scope to the "
+        + "current lease holder instead: `"
+        + coldInReviewLeaderScopedExpr(COLD_IN_REVIEW_ISSUE_METRICS_REFRESH_SUCCESS_METRIC, "== 0")
+        + "`. The join needs no service selector, because only replicas publishing a "
+        + "lease indicator survive it. ⛔ Note the OUTER parentheses are load-bearing: "
+        + "PromQL binds `==` tighter than `and`, so dropping them parses the comparison "
+        + "against the lease gauge instead and yields an alert that can never fire. See "
+        + "the declaration comment on "
+        + COLD_IN_REVIEW_ISSUE_OLDEST_AGE_METRIC + " for the full derivation, the "
+        + "rejected alternatives, and the deliberate handover-gap caveat; that comment "
+        + "owns this rule and this help text defers to it.",
       registers: [registry],
     });
     coldInReviewIssueMetricsRefreshSuccess.set(0);
@@ -7368,7 +7494,7 @@ function ensureRegistry(): {
       help:
         "Execution-workspace tree removals attempted, labeled by trigger "
         + "(persist_rollback, collector, operator, unknown), method (worktree_remove, "
-        + "remove_local_fs), cleanup_reason and outcome (PEN-3692). \u26d4 READ "
+        + "remove_local_fs), cleanup_reason and outcome (PEN-3692). ⛔ READ "
         + "cleanup_reason, NOT trigger, to attribute work to runs: run end performs no "
         + "inline teardown, so run-attributable removal is inside trigger=\"collector\" "
         + "with cleanup_reason=\"run_ended\", and trigger=\"persist_rollback\" counts "
