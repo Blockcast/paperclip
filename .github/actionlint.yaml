@@ -17,3 +17,4 @@ self-hosted-runner:
     - arc-merge-queue
     - arc-paperclip-buildkit
     - arc-paperclip-general
+    - arc-paperclip-dind

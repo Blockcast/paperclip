@@ -23,6 +23,7 @@ export const ALLOWED_RUNNERS = new Set([
   "arc-merge-queue",
   "arc-paperclip-buildkit",
   "arc-paperclip-general",
+  "arc-paperclip-dind",
 ]);
 
 // BLO-22428: a handful of heavy jobs route merge_group traffic to the
