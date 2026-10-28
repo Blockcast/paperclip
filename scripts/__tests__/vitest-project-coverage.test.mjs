@@ -248,10 +248,15 @@ const EXECUTED_BY_ANOTHER_LANE = new Map([
 //
 // The last entry to leave was @paperclipai/plugin-llm-wiki, and the reason
 // recorded here for keeping it was WRONG in a way worth preserving. It read
-// "there is no DOM, and neither jsdom nor happy-dom is declared". Both halves
-// were false: tests/wiki-route-sidebar-ui.spec.ts carries its own
-// `// @vitest-environment jsdom` docblock, and jsdom resolves through the
-// workspace, so `document` was defined the whole time. The 16 failures were
+// "there is no DOM, and neither jsdom nor happy-dom is declared". The second
+// half was TRUE and the conclusion drawn from it was not:
+// tests/wiki-route-sidebar-ui.spec.ts carries its own
+// `// @vitest-environment jsdom` docblock, and jsdom resolved anyway -- as a
+// phantom dependency, hoisted into node_modules/.pnpm/node_modules off
+// `server`'s declaration -- so `document` was defined the whole time. That is
+// PEN-4930, fixed separately: both packages that request a DOM declare jsdom
+// themselves now, and a sweep in this file holds that line for every package.
+// The 16 failures were
 // "TypeError: act is not a function" because React only exports `act` from
 // cjs/react.development.js and react/index.js selects the production build
 // when process.env.NODE_ENV === "production" -- which is ambient in an agent
