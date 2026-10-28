@@ -93,10 +93,49 @@ describe("GC cycle ring", () => {
     expect(window.observedCycles).toBe(3);
     expect(window.covered).toBe(true);
     expect(window.classes).toEqual([
-      { kind: "major", flags: "schedule_idle", cycles: 1 },
-      { kind: "major", flags: "none", cycles: 1 },
-      { kind: "minor", flags: "none", cycles: 1 },
+      { kind: "major", flags: "schedule_idle", cycles: 1, pauseMs: 0 },
+      { kind: "major", flags: "none", cycles: 1, pauseMs: 0 },
+      { kind: "minor", flags: "none", cycles: 1, pauseMs: 0 },
     ]);
+    // These cycles were recorded without a duration, so the pause total is a
+    // lower bound and says so rather than reading as a measured zero.
+    expect(window.pauseUnknownCycles).toBe(3);
+    expect(window.observedPauseMs).toBe(0);
+  });
+
+  it("sums pause time per class, and reports it as exact when every cycle carried one", () => {
+    recordGcCycle(5_000, MAJOR, IDLE, 12.5);
+    recordGcCycle(5_100, MAJOR, IDLE, 7.5);
+    recordGcCycle(5_200, MINOR, 0, 1.25);
+    recordGcCycle(9_000, MAJOR, IDLE, 999); // outside
+
+    const window = readGcCyclesInWindow(4_000, 6_000);
+
+    expect(window.observedCycles).toBe(3);
+    expect(window.observedPauseMs).toBe(21.25);
+    expect(window.pauseUnknownCycles).toBe(0);
+    expect(window.classes).toEqual([
+      { kind: "major", flags: "schedule_idle", cycles: 2, pauseMs: 20 },
+      { kind: "minor", flags: "none", cycles: 1, pauseMs: 1.25 },
+    ]);
+  });
+
+  it("counts a missing duration apart instead of adding it as zero", () => {
+    // The distinction the pause series turns on: a cycle that took no
+    // measurable time and a cycle whose time never arrived are different
+    // readings, and summing both as 0 makes them the same one.
+    recordGcCycle(5_000, MAJOR, 0, 10);
+    recordGcCycle(5_100, MAJOR, 0); // no duration at all
+    recordGcCycle(5_200, MAJOR, 0, Number.NaN);
+    recordGcCycle(5_300, MAJOR, 0, -1); // not a real pause
+    recordGcCycle(5_400, MAJOR, 0, 0); // genuinely zero, and KNOWN
+
+    const window = readGcCyclesInWindow(4_000, 6_000);
+
+    expect(window.observedCycles).toBe(5);
+    expect(window.observedPauseMs).toBe(10);
+    // Three unusable, and the measured 0 is NOT among them.
+    expect(window.pauseUnknownCycles).toBe(3);
   });
 
   it("boundaries are inclusive, so a cycle exactly at the onset is counted", () => {
@@ -192,12 +231,36 @@ describe("release onset GC attribution", () => {
     // separates them. That contrast is the finding this series can carry, and
     // it is invisible to a 30 s counter, where both windows are one bucket.
     expect(attribution?.baseline?.classes).toEqual([
-      { kind: "major", flags: "none", cycles: 11 },
+      { kind: "major", flags: "none", cycles: 11, pauseMs: 0 },
     ]);
     expect(attribution?.onset.classes).toEqual([
-      { kind: "major", flags: "none", cycles: 11 },
-      { kind: "major", flags: "schedule_idle", cycles: 2 },
+      { kind: "major", flags: "none", cycles: 11, pauseMs: 0 },
+      { kind: "major", flags: "schedule_idle", cycles: 2, pauseMs: 0 },
     ]);
+  });
+
+  it("separates a LONGER cycle from a more frequent one across the two windows", () => {
+    // The case the cycle counts cannot express, and the reason the pause series
+    // exists: both windows run the same class at the same rate, so counting is
+    // blind here -- 23/23 onsets carried a major cycle against a 65.2% ambient
+    // rate, so occurrence cannot be the discriminator. Only the magnitude moves.
+    const onset = 1_000_000;
+    for (let offset = -5_000; offset <= 5_000; offset += 1_000) {
+      recordGcCycle(onset - DEFAULT_BASELINE_OFFSET_MS + offset, MAJOR, 0, 2);
+      recordGcCycle(onset + offset, MAJOR, 0, 10);
+    }
+
+    const attribution = attributeRssReleaseGc(readingWithOnset(onset));
+
+    // Identical counts: a reader with only the cycle series sees nothing.
+    expect(attribution?.baseline?.observedCycles).toBe(11);
+    expect(attribution?.onset.observedCycles).toBe(11);
+    // The pause series separates them 5:1.
+    expect(attribution?.baseline?.observedPauseMs).toBe(22);
+    expect(attribution?.onset.observedPauseMs).toBe(110);
+    // Both exact, so the ratio is a measurement rather than a lower bound.
+    expect(attribution?.baseline?.pauseUnknownCycles).toBe(0);
+    expect(attribution?.onset.pauseUnknownCycles).toBe(0);
   });
 
   it("freezes the counts for an episode instead of re-reading an ageing ring", () => {
