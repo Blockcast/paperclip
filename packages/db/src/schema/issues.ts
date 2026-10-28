@@ -91,6 +91,15 @@ export const issues = pgTable(
     // Deliberately NOT one of the four all-or-nothing park columns above: those describe
     // the park, this records what the platform has already done about it, and it must
     // survive being read on a row whose park has lapsed.
+    //
+    // ⚠️ PEN-4894: that reset is what makes this column NON-DURABLE, so it is not a
+    // park-wake audit log and must not be aggregated as one. It is scoped to the park
+    // CURRENTLY on the row, and a re-park erases the previous park's stamp -- which is the
+    // common case, because a park wake that works dispatches a run that re-parks. Measured
+    // 2026-10-28 on a shared-instant cohort: 7 of 7 fired, 0 of 7 still recorded here 45
+    // minutes later. The durable per-event record is `agent_wakeup_requests` (exposed as
+    // `GET /api/issues/:id/diagnostics/wakes`); a `NULL` here means only "no release wake
+    // is owed for this row's current park", never "this row's park never woke".
     parkedWakeFiredAt: timestamp("parked_wake_fired_at", { withTimezone: true }),
     executionWorkspaceId: uuid("execution_workspace_id")
       .references((): AnyPgColumn => executionWorkspaces.id, { onDelete: "set null" }),

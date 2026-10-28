@@ -383,6 +383,16 @@ describeEmbeddedPostgres("issue park expiry sweep", () => {
     // release edge per-PARK instead of per-row. Without it a row woken once would need
     // the `parkedWakeFiredAt < parkedAt` backstop to re-arm, and a backstop nothing
     // exercises is a backstop nobody knows is broken.
+    //
+    // ⚠️ PEN-4894: the `toBeNull()` assertion after the re-park below is the behaviour
+    // that makes `parkedWakeFiredAt` useless as a park-wake audit field -- the common
+    // case is that a park wake dispatches a run which re-parks, landing here and erasing
+    // the stamp (measured 7/7 fired, 0/7 still recorded 45 min later). That is CORRECT
+    // for a fire-once claim marker and this assertion must stay. Do not "fix" it into a
+    // durable stamp to make the field auditable: the durable record is
+    // `agent_wakeup_requests` / `GET /api/issues/:id/diagnostics/wakes`, and the reader-
+    // facing comments on the column, the shared `Issue` type and `issue-park-expiry.ts`
+    // now say so.
     const parked = await seedParkedIssue();
     const heartbeat = createHeartbeat();
     const svc = issueService(db);

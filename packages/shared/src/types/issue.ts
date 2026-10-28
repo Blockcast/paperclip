@@ -846,10 +846,30 @@ export interface Issue {
   parkedByAgentId?: string | null;
   parkedAt?: Date | null;
   /**
-   * PEN-4420: when the park's one-shot expiry wake fired, or `null` while it has not.
-   * Projected read-only alongside the four park columns for the same reason they are:
-   * the audit that found this defect (PEN-4419) is a client-side query over list rows,
-   * and "is this park's release edge still pending?" is the question it now has to ask.
+   * PEN-4420: when THIS park's one-shot expiry wake fired, or `null` while it has not.
+   *
+   * ⚠️ PEN-4894: NOT DURABLE, and NOT an audit record of park wakes. This is the sweep's
+   * fire-once CLAIM marker, scoped to the park currently on the row. The park writer
+   * resets it to `null` on every `parkedDisposition` write (`services/issues.ts`), so the
+   * next re-park erases it — and a park wake that WORKS dispatches a run which routinely
+   * re-parks. The field therefore deletes its own positive cases, and deletes more of them
+   * the better the release edge works.
+   *
+   * Measured 2026-10-28 on a 7-row cohort parked to one shared instant: 7 of 7 fired
+   * (+30.5 s … +75.4 s, inside the historical park-fire band) and 7 of 7 read `null` here
+   * 45 minutes later, every one re-parked in between. Corpus-wide the discriminator was
+   * the re-park, not the wake outcome — fire then re-parked ⇒ `null` 7/7; fire, never
+   * re-parked ⇒ present 12/12.
+   *
+   * ⇒ `null` means "no release wake is owed for the park on this row right now". It does
+   * NOT mean "this row's park never woke", and reading it that way is wrong in the
+   * reassuring direction. To ask whether park wakes FIRED, use
+   * `GET /api/issues/:id/diagnostics/wakes`, which is the durable per-event record.
+   *
+   * Projected read-only alongside the four park columns for the same reason they are: the
+   * audit that found PEN-4420 (PEN-4419) is a client-side query over list rows, and "is
+   * this park's release edge still pending?" — the question this field answers correctly —
+   * is the one it has to ask.
    */
   parkedWakeFiredAt?: Date | null;
   /**
