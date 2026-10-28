@@ -271,6 +271,7 @@ export function isQueueInitiatedRemoval(dequeueActor) {
  *
  * @param {{
  *   headChecks?: Array<{
+ *     id?: number | string | null,
  *     name?: string | null,
  *     conclusion?: string | null,
  *     completedAt?: string | null,
@@ -287,7 +288,9 @@ export function isQueueInitiatedRemoval(dequeueActor) {
  *   completedByDequeue: number,
  *   incompleteAtDequeue: string[],
  *   checkCount: number,
- * } | null} counts and names are per distinct context, never per status post
+ * } | null} `checkCount`/`completedByDequeue` count distinct contexts, never
+ *   status posts; `incompleteAtDequeue` lists the distinct NAMES those
+ *   contexts carry, which is what branch protection requires by
  */
 export function classifyAdmissionEvidence({
   headChecks = null,
@@ -330,16 +333,30 @@ export function classifyAdmissionEvidence({
   for (const check of headChecks) {
     const rawName = typeof check?.name === "string" ? check.name.trim() : "";
     const name = rawName.length > 0 ? rawName : "<unnamed>";
-    // A check run and a commit status can carry the SAME name, and on #3060's
-    // own head two of them do: `gate/ally-comment-findings` is a status that
+    // The two surfaces have DIFFERENT identity semantics, so each is keyed the
+    // way its own API reports it.
+    //
+    // A check run and a commit status can carry the same name, and on #3060's
+    // head two of them do: `gate/ally-comment-findings` is a status that
     // succeeded at 07:46:23Z, before the removal, AND a check run that did not
-    // conclude until 07:48:35Z, after it (`ci/ally-head-attested` likewise).
-    // They are separate contexts, so they are never collapsed into each other
-    // -- doing so would let the green status hide the unfinished check run,
-    // which is the fail-OPEN direction. Entries with no surface (callers that
-    // predate it) group by name alone, exactly as before.
+    // conclude until 07:48:35Z, after it. They are separate contexts, so they
+    // are never collapsed into each other -- doing so would let the green
+    // status hide the unfinished check run, the fail-OPEN direction.
+    //
+    // Within `/check-runs` a name is ALSO not an identity: `filter=latest`
+    // (the default) already yields the newest run per check run, so two rows
+    // sharing a name are two genuinely distinct runs -- separate lanes, or
+    // `pull_request` and `pull_request_target` publishing the same name.
+    // Measured on this script's own head `de82d2d`: `review` appears twice,
+    // check runs 122712076437 and 122711949261, in different check suites.
+    // Collapsing those by name would let a finished lane stand in for an
+    // in-flight sibling (`completedAt: null`, skipped below) and drop it from
+    // the cause line. So check runs key on their run `id` and nothing is
+    // collapsed; only STATUSES collapse by name, because only `/statuses`
+    // returns a history whose rows share one context.
     const surface = typeof check?.surface === "string" ? check.surface : "";
-    const key = `${surface}\u0000${name}`;
+    const identity = check?.id === undefined || check?.id === null ? name : String(check.id);
+    const key = `${surface}\u0000${identity}`;
     if (!byContext.has(key)) byContext.set(key, { name, surface, at: -Infinity, terminal: false });
     const at = Date.parse(check?.completedAt ?? "");
     // A row posted after the dequeue says nothing about what the queue could
@@ -373,18 +390,36 @@ export function classifyAdmissionEvidence({
       ? `${name} (${surface === "check_run" ? "check run" : surface})`
       : name;
 
-  const completed = [];
-  const incomplete = [];
+  // COUNTS are per context; NAMES are the distinct required contexts those
+  // counts refer to, and the two can legitimately differ -- two `review` lanes
+  // that both failed to finish are two contexts but one unmet requirement, and
+  // branch protection requires by NAME. Printing the same name twice would
+  // read as the duplicate-row defect this collapse exists to fix, so the lists
+  // are de-duplicated for display while `checkCount` and `completedByDequeue`
+  // keep counting contexts.
+  let completedContexts = 0;
+  let incompleteContexts = 0;
+  const completed = new Set();
+  const incomplete = new Set();
   for (const context of byContext.values()) {
-    if (context.terminal) completed.push(label(context));
-    else incomplete.push(label(context));
+    if (context.terminal) {
+      completedContexts += 1;
+      completed.add(label(context));
+    } else {
+      incompleteContexts += 1;
+      incomplete.add(label(context));
+    }
   }
 
   return {
-    rejected: headAgeAtEnqueueMs <= freshHeadMs && incomplete.length > 0,
+    // `incompleteContexts > 0` and `incomplete.size > 0` are equivalent here --
+    // a name is added exactly when a context is counted -- so the choice is
+    // about intent, not behaviour: the guard is "some CONTEXT had not finished
+    // reporting", and the de-duplicated name list is a display concern.
+    rejected: headAgeAtEnqueueMs <= freshHeadMs && incompleteContexts > 0,
     headAgeAtEnqueueMs,
-    completedByDequeue: completed.length,
-    incompleteAtDequeue: incomplete,
+    completedByDequeue: completedContexts,
+    incompleteAtDequeue: [...incomplete],
     checkCount: byContext.size,
   };
 }
@@ -565,7 +600,8 @@ export function ghHeadChecks(repo, sha, exec = run) {
       parseNdjson(
         exec([
           "gh", "api", `repos/${repo}/commits/${sha}/check-runs?per_page=100`,
-          "--paginate", "--jq", ".check_runs[] | {name, conclusion, completedAt: .completed_at}",
+          "--paginate", "--jq",
+          ".check_runs[] | {id, name, conclusion, completedAt: .completed_at}",
         ]),
       ),
     );
@@ -573,6 +609,9 @@ export function ghHeadChecks(repo, sha, exec = run) {
       parseNdjson(
         exec([
           "gh", "api", `repos/${repo}/commits/${sha}/statuses?per_page=100`,
+          // No `id`: a status row's id is per POST, so keying on it would
+          // defeat the history collapse that is the whole point. Statuses are
+          // identified by their context name.
           "--paginate", "--jq", ".[] | {name: .context, conclusion: .state, completedAt: .updated_at}",
         ]),
       ),
