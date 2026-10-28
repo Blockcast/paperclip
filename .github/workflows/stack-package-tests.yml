@@ -127,8 +127,9 @@ jobs:
           # yields `false`, here-string yields `true`. `/pulls/{n}/files`
           # returns sorted paths, so both prefixes match early and the tail
           # fills the buffer -- i.e. it misfires precisely on a big
-          # stack-collapse PR, where skipping the lane costs most. pr.yml:2127
-          # carries a note on this same trap.
+          # stack-collapse PR, where skipping the lane costs most. pr.yml's
+          # `Verify vendored version is recorded consistently` step carries a
+          # note on this same trap, reached there via `sed | head -1`.
           if grep -q '^packages/mcp-gateway/' <<<"$files"; then
             mcp_gateway=true
           fi
