@@ -2,6 +2,14 @@ import { describe, expect, it } from "vitest";
 import { truncateSectionText, truncateText } from "../services/truncate-text.js";
 
 describe("truncateText", () => {
+  // PEN-3107 CONTROL (probe branch only): deliberate type error, TESTS program only.
+  // Source compiles clean, so `tsc --noEmit` passes and the chain reaches
+  // `typecheck:tests` — which is the arm that catches a test no longer matching
+  // the source it covers (the PEN-2491 shape).
+  it("control: calls truncateText with the wrong argument type", () => {
+    expect(truncateText(42, 10)).toBe("");
+  });
+
   it("returns short values untouched apart from trimming", () => {
     expect(truncateText("  already short  ", 100)).toBe("already short");
   });
