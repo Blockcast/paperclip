@@ -22,6 +22,7 @@ import {
 import { and, desc, eq, inArray, isNull, ne, notInArray } from "drizzle-orm";
 import { asNumber, asString, parseObject, renderTemplate } from "../adapters/utils.js";
 import { resolveHomeAwarePath, resolveManagedProjectWorkspaceDir } from "../home-paths.js";
+import { logger } from "../middleware/logger.js";
 import { REPO_MANAGED_WORKTREES_SUBPATH } from "../worktree-config.js";
 import { formatGitProbeRefusal } from "./workspace-reuse-refusal-class.js";
 import { compareProjectCheckoutOrigin, normalizeRepoIdentity } from "./project-checkout-origin.js";
@@ -4052,16 +4053,33 @@ async function hasLinkedGitWorktreeRegistration(repoRoot: string, worktreePath: 
 /**
  * Did `runGit` fail *without reaching a verdict* about the repository?
  *
- * `runGit` throws on three distinct conditions and only one of them is evidence
+ * `runGit` throws on four distinct conditions and only one of them is evidence
  * about the checkout:
  *
  * - `GitCommandTimeoutError` -- the budget expired while git was still running.
- * - a **spawn failure** -- node could not start git at all (ENOENT, EAGAIN or
- *   EMFILE under threadpool/fd pressure). `executeProcess` surfaces these by
- *   rejecting with the child's `error` event, so they arrive as system errors
- *   carrying `syscall`; the non-zero-exit `Error` built from stderr never has
- *   one, which is what makes this a sound discriminator rather than a guess.
+ * - an **asynchronous spawn failure** -- node tried to start git and the OS
+ *   refused (ENOENT, EAGAIN or EMFILE under threadpool/fd pressure).
+ *   `executeProcess` surfaces these by rejecting with the child's `error`
+ *   event, so they arrive as system errors carrying `syscall`; the
+ *   non-zero-exit `Error` built from stderr never has one, which is what makes
+ *   this a sound discriminator rather than a guess.
+ * - a **synchronous spawn failure** -- node rejected the arguments before any
+ *   process existed, so `spawn()` threw out of `executeProcess`'s Promise
+ *   executor instead of emitting `error`. These are node's own validation
+ *   errors (`ERR_INVALID_ARG_TYPE` from a non-string command or a malformed
+ *   options object, `ERR_INVALID_ARG_VALUE` from a bad `stdio`), and they
+ *   carry **no `syscall`** -- measured on node 24: `TypeError`/`RangeError`
+ *   with an `ERR_`-prefixed `code` and `syscall === undefined`. Matching them
+ *   on that prefix is sound here because the one shape that IS a verdict is a
+ *   plain `Error` built from stderr, which carries no `code` at all.
  * - a **non-zero exit** -- git ran and answered. That one IS a verdict.
+ *
+ * The synchronous arm is unreachable from today's only call site, which builds
+ * its arguments through `resolveServerGitInvocation`, but it is classified
+ * rather than documented-around because reading it backwards fails in the
+ * destructive direction: `relinkHuskGitWorktree` would `fs.rm` a `.git` it had
+ * just written correctly, which is the exact path PEN-4877 exists to close
+ * (PEN-4878).
  *
  * Callers must not act destructively on an inconclusive failure. Same
  * distinction BLO-18784/BLO-47493/BLO-42089 draw elsewhere in this file: a
@@ -4069,7 +4087,9 @@ async function hasLinkedGitWorktreeRegistration(repoRoot: string, worktreePath: 
  */
 function isInconclusiveGitFailure(error: unknown): boolean {
   if (error instanceof GitCommandTimeoutError) return true;
-  return typeof (error as NodeJS.ErrnoException | null)?.syscall === "string";
+  const candidate = error as NodeJS.ErrnoException | null;
+  if (typeof candidate?.syscall === "string") return true;
+  return typeof candidate?.code === "string" && candidate.code.startsWith("ERR_");
 }
 
 /**
@@ -4175,7 +4195,20 @@ export async function relinkHuskGitWorktree(repoRoot: string, worktreePath: stri
     try {
       topLevel = await runGit(["rev-parse", "--show-toplevel"], worktreePath);
     } catch (error) {
-      return isInconclusiveGitFailure(error) ? null : false;
+      if (!isInconclusiveGitFailure(error)) return false;
+      // Logged at the point the inconclusive outcome is produced, because it is
+      // the only point that still holds *why* (a stall, an ENOENT or EACCES on
+      // PAPERCLIP_SERVER_GIT, an EMFILE under load). Both callers below collapse
+      // it into `false`, which is outwardly identical to "this husk is not
+      // repairable" -- so without this line a persistently broken git binary is
+      // a silent repeating refusal, indistinguishable in the logs from a husk
+      // that genuinely cannot be repaired (PEN-4878).
+      logger.warn(
+        { err: error, worktreePath, repoRoot },
+        "relinkHuskGitWorktree: could not ask git whether the worktree resolves to itself; "
+          + "treating as inconclusive (not a verdict) and leaving any .git link in place",
+      );
+      return null;
     }
     return !!topLevel
       && await resolvePathForWorktreeComparison(topLevel) === await resolvePathForWorktreeComparison(worktreePath);
@@ -4201,6 +4234,15 @@ export async function relinkHuskGitWorktree(repoRoot: string, worktreePath: stri
   // Only a verdict earns the removal. Deleting the link on an inconclusive
   // probe would re-husk a worktree we just repaired, turning a transient git
   // failure into persistent damage -- strictly worse than refusing this wake.
+  //
+  // The kept link is therefore deliberately UNVERIFIED, and verifying it is not
+  // this function's job: the early `lstat` return above means the next wake
+  // takes the "already linked" path rather than re-probing, so the link is
+  // re-examined by the next health check that runs git against the worktree for
+  // its own reasons (`inspectManagedGitWorktreeBranch` and the reuse probes),
+  // not here. That is sound because the content is not a guess -- it is the
+  // `gitdir` the admin dir's own back-ref already resolved to this exact path --
+  // so keeping it beats deleting it on no evidence (PEN-4878).
   if (verdict === null) return false;
   await fs.rm(dotGit, { force: true });
   return false;
