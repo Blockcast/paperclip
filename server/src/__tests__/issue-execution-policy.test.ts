@@ -1986,6 +1986,111 @@ describe("issue execution policy transitions", () => {
     });
 
     /**
+     * PEN-3803 review follow-up — the ceiling is an ARM-TIME bound, and must not
+     * leak onto the carry-forward path.
+     *
+     * The exhaustion predicate feeds two asymmetric consumers. An explicit arm
+     * throws 422: loud, at the caller, nothing persisted. A NON-explicit
+     * transition strips the monitor and records it cleared, with no activity row
+     * and no `recoveryPolicy` — and it runs on every generic
+     * `PATCH /api/issues/:id` that leaves `executionPolicy` alone, because
+     * `nextExecutionPolicy` falls back to the stored policy and carries the
+     * armed monitor in with `monitorExplicitlyUpdated` false.
+     *
+     * So supplying `defaultMaxAttempts` unconditionally would silently retire
+     * the very rows this fix exists for: a legacy `maxAttempts: null` row at
+     * `attemptCount >= 24` (what the old 200 path created, PEN-3328 included)
+     * would lose its monitor to an unrelated priority edit, instead of reaching
+     * the scheduler's `clearIssueMonitorAndRecover` — which retires it with
+     * `issue.monitor_exhausted` plus the configured `recoveryPolicy`.
+     *
+     * NEGATIVE CONTROL: drop the `input.monitorExplicitlyUpdated` guard on
+     * `defaultMaxAttempts` in `applyMonitorTransition` (issue-execution-policy.ts)
+     * and this test fails — `monitorNextCheckAt` comes back `null` and the state
+     * reads `cleared`/`max_attempts_exhausted`.
+     */
+    it("leaves an armed maxAttempts: null monitor at the ceiling untouched on a non-explicit transition", () => {
+      const armed = {
+        nextCheckAt: "2099-04-11T12:30:00.000Z",
+        scheduledBy: "assignee" as const,
+      };
+      const policy = normalizeIssueExecutionPolicy({ stages: [], monitor: armed })!;
+      expect(policy.monitor?.maxAttempts ?? null).toBeNull();
+
+      const result = applyIssueMonitorPolicyTransition({
+        issue: {
+          status: "in_review",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          // The row is ALREADY armed, and the generic PATCH carries that same
+          // policy straight back in as `nextExecutionPolicy`.
+          executionPolicy: policy,
+          executionState: null,
+          monitorAttemptCount: DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
+          monitorNextCheckAt: new Date(armed.nextCheckAt),
+          monitorLastTriggeredAt: null,
+          monitorNotes: null,
+          monitorScheduledBy: "assignee",
+        },
+        policy,
+        previousPolicy: policy,
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+        // The whole point: an edit that never touched the monitor.
+        monitorExplicitlyUpdated: false,
+      });
+
+      // Not stripped, and not recorded as cleared. The monitor stays on the row
+      // so the scheduler is still the thing that retires it — loudly.
+      expect(result.patch.monitorNextCheckAt ?? armed.nextCheckAt).not.toBeNull();
+      expect(result.patch.executionState).not.toMatchObject({
+        monitor: { status: "cleared", clearReason: "max_attempts_exhausted" },
+      });
+      expect(result.patch.executionPolicy).toBeUndefined();
+    });
+
+    /**
+     * The guard above withholds the DEFAULT on a non-explicit transition. It must
+     * not also withhold a bound the issue declared for itself: that strip predates
+     * PEN-3803 and is unrelated to the fleet ceiling, so it has to survive the fix.
+     */
+    it("still strips a non-explicit monitor whose own declared maxAttempts is spent", () => {
+      const policy = normalizeIssueExecutionPolicy({
+        stages: [],
+        monitor: {
+          nextCheckAt: "2099-04-11T12:30:00.000Z",
+          scheduledBy: "assignee",
+          maxAttempts: 3,
+        },
+      })!;
+
+      const result = applyIssueMonitorPolicyTransition({
+        issue: {
+          status: "in_review",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: null,
+          monitorAttemptCount: 3,
+          monitorNextCheckAt: new Date("2099-04-11T12:30:00.000Z"),
+          monitorLastTriggeredAt: null,
+          monitorNotes: null,
+          monitorScheduledBy: "assignee",
+        },
+        policy,
+        previousPolicy: policy,
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+        monitorExplicitlyUpdated: false,
+      });
+
+      expect(result.patch.monitorNextCheckAt).toBeNull();
+      expect(result.patch.executionState).toMatchObject({
+        monitor: { status: "cleared", clearReason: "max_attempts_exhausted" },
+      });
+    });
+
+    /**
      * PEN-3803 done-when #2: the arm-time path and the scheduler path must
      * reach the SAME verdict for the same row. Asserting the 422 alone cannot
      * show that — it only shows one path is strict. This table drives both

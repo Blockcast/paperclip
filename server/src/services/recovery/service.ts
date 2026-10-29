@@ -9495,14 +9495,33 @@ export function recoveryService(
         // it should be recorded and bounded rather than silently unbounded.
         // `null` (no representable renewal, i.e. 100+ attempts already made)
         // means this row has polled far past anything a quota backoff needs;
-        // leave it unarmed and let the caller record a skip.
+        // leave it unarmed, log why, and let the caller record a skip.
         // `issues.monitor_attempt_count` is `notNull().default(0)`, so this is
         // the row's real count with no fallback needed.
         maxAttempts: renewedIssueMonitorMaxAttempts(input.issue.monitorAttemptCount),
         recoveryPolicy: "wake_owner" as const,
       },
     };
-    if (policy.monitor.maxAttempts === null) return null;
+    if (policy.monitor.maxAttempts === null) {
+      // PEN-3803 review follow-up: this is the one `return null` on this path
+      // that is NOT a transient failure, and the caller books it as a bare
+      // `result.skipped += 1` alongside ~35 other exits. Without this line a row
+      // stuck in quota backoff past MAX_ISSUE_MONITOR_MAX_ATTEMPTS simply stops
+      // being re-armed and goes dark: no monitor, no activity row, and a skip
+      // counter that cannot say which guard produced it. A quota backoff is a
+      // wait on a provider reset time, so 100+ attempts means something other
+      // than the provider is wrong and a human needs to be able to find it.
+      logger.warn(
+        {
+          issueId: input.issue.id,
+          companyId: input.issue.companyId,
+          runId: input.latestRun.id,
+          attemptCount: input.issue.monitorAttemptCount,
+        },
+        "provider-quota recovery monitor not re-armed: monitor attempts exhausted beyond any representable renewal",
+      );
+      return null;
+    }
     const transition = applyIssueMonitorPolicyTransition({
       issue: input.issue,
       policy,
