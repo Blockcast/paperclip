@@ -2284,6 +2284,17 @@ const AGENT_GITHUB_CREDENTIAL_ENV_NAMES = [
  * Matched on NAME, and a `valueFrom` entry counts exactly as much as a literal
  * one: routing a value through a `secretKeyRef` changes where the Job stores
  * it, not whether the process can read it out of its own environment.
+ *
+ * SCOPE, stated because the defect this function exists to fix was caused by a
+ * check whose name claimed more than it tested. This reads the container's
+ * `env` LIST ONLY. It does not and cannot cover `envFrom`: a `secretRef` there
+ * injects every key of the referenced Secret, and those keys are not in the
+ * PodSpec -- they are in the Secret -- so no manifest-time check can enumerate
+ * them. `selfPod.inheritedEnvFrom` is filtered by `isAgentInheritableEnvFromRef`
+ * (k8s-client.ts) by NAME rather than by key, so a GitHub credential placed in
+ * an inheritable `envFrom` source would reach the agent container past this
+ * refusal. That is a real residual, recorded in section 7.3 of the decision
+ * doc; do not read a green render as "no credential in this container".
  */
 export function findAgentGitHubCredentialEnvNames(env: k8s.V1EnvVar[]): string[] {
   const present = new Set(env.map((e) => e.name));
