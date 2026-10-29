@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 
 import {
   CHECK_SETTLE_MINUTES,
+  EJECTIONS_BEFORE_HOLD,
   MAX_ENQUEUES_PER_FIRE,
   STALE_ENQUEUE_HOURS,
   STALE_HOLD_HOURS,
@@ -13,6 +14,8 @@ import {
   classifyFromListing,
   classifyPr,
   failingChecks,
+  ejectionsAtHead,
+  headMovedAt,
   applyRow,
   isFatalGhError,
   liveHeadSha,
@@ -1311,5 +1314,157 @@ describe(`stale-hold report (held >${STALE_HOLD_HOURS}h, PEN-5005)`, () => {
     assert.equal(newestCheckStamp([{ name: "verify", conclusion: "SUCCESS" }]), null);
     assert.equal(newestCheckStamp([]), null);
     assert.equal(judgeableAgeHours({ statusCheckRollup: [] }, { now: NOW }), null);
+  });
+});
+
+describe("ejected-at-current-head hold (PEN-5022)", () => {
+  // Real shapes. `removed_from_merge_queue` carries `commit_id: null` (verified
+  // on #3089's three events, 2026-10-29), which is why the rule dates against
+  // the head rather than matching a sha.
+  const committed = (at) => ({ event: "committed", committer: { date: at } });
+  const forcePushed = (at) => ({ event: "head_ref_force_pushed", created_at: at });
+  const added = (at) => ({ event: "added_to_merge_queue", created_at: at, commit_id: null });
+  const ejected = (at) => ({ event: "removed_from_merge_queue", created_at: at, commit_id: null });
+
+  describe("headMovedAt", () => {
+    it("reads an ordinary push off committer.date, not created_at", () => {
+      // `committed` is a raw git object and has no `created_at`. Reading only
+      // `created_at` would date the head off force-pushes alone and silently
+      // treat every ordinary push as "head never moved".
+      assert.equal(headMovedAt([committed("2026-09-13T08:00:00Z")]), Date.parse("2026-09-13T08:00:00Z"));
+    });
+
+    it("takes the newest of either kind", () => {
+      assert.equal(
+        headMovedAt([forcePushed("2026-09-13T09:00:00Z"), committed("2026-09-13T08:00:00Z")]),
+        Date.parse("2026-09-13T09:00:00Z"),
+      );
+    });
+
+    it("is null when nothing dates the head, and that is not 'infinitely old'", () => {
+      assert.equal(headMovedAt([added("2026-09-13T10:00:00Z")]), null);
+      assert.equal(headMovedAt([]), null);
+      assert.equal(headMovedAt(undefined), null);
+    });
+  });
+
+  describe("ejectionsAtHead", () => {
+    it("counts only ejections newer than the head — a push clears the history", () => {
+      const timeline = [
+        ejected("2026-09-13T06:00:00Z"),
+        ejected("2026-09-13T07:00:00Z"),
+        committed("2026-09-13T08:00:00Z"),
+        ejected("2026-09-13T09:00:00Z"),
+      ];
+      assert.equal(ejectionsAtHead(timeline).count, 1);
+    });
+
+    it("reports requeued when the newest event is the re-add", () => {
+      const timeline = [committed("2026-09-13T08:00:00Z"), ejected("2026-09-13T09:00:00Z"), added("2026-09-13T10:00:00Z")];
+      const result = ejectionsAtHead(timeline);
+      assert.equal(result.count, 1);
+      assert.equal(result.requeued, true);
+    });
+
+    it("is not requeued when the ejection is the newest event", () => {
+      const timeline = [committed("2026-09-13T08:00:00Z"), added("2026-09-13T09:00:00Z"), ejected("2026-09-13T10:00:00Z")];
+      assert.equal(ejectionsAtHead(timeline).requeued, false);
+    });
+
+    it("breaks a same-second add/removal tie toward the hold, not toward requeued", () => {
+      // One-second resolution makes the pair genuinely unordered. The
+      // directions are not symmetric: reading a tie as requeued suppresses the
+      // hold and re-enters the loop; reading it as held costs one deferred
+      // enqueue. This pins the asymmetry — it is the difference between `>`
+      // and `>=`, which no other assertion here can see.
+      const timeline = [
+        committed("2026-09-13T08:00:00Z"),
+        added("2026-09-13T09:00:00Z"),
+        ejected("2026-09-13T09:00:00Z"),
+      ];
+      assert.equal(ejectionsAtHead(timeline).requeued, false);
+    });
+
+    it("counts an undatable ejection rather than dropping it", () => {
+      // Fails toward a hold the next push clears, never toward the re-enqueue
+      // loop. Under-counting costs every entry in the queue a rebuild.
+      assert.equal(ejectionsAtHead([ejected("2026-09-13T09:00:00Z")]).count, 1);
+    });
+  });
+
+  describe("classifyPr", () => {
+    const withEjections = (n, extra = []) => [
+      committed("2026-09-13T08:00:00Z"),
+      ...Array.from({ length: n }, (_, i) => [added(`2026-09-13T09:0${i}:00Z`), ejected(`2026-09-13T09:0${i}:30Z`)]).flat(),
+      ...extra,
+    ];
+
+    it(`holds a PR GitHub has ejected ${EJECTIONS_BEFORE_HOLD}x at the current head`, () => {
+      const row = classify({ mergeStateStatus: "CLEAN", timeline: withEjections(EJECTIONS_BEFORE_HOLD) });
+      assert.equal(row.action, "skip");
+      assert.equal(row.reason, "ejected-at-current-head");
+    });
+
+    it("NEGATIVE CONTROL: enqueues after ONE ejection — an infra flake must not strand a healthy PR", () => {
+      // 3 of the 4 failing jobs on #3089's queue head were infrastructure (a
+      // runner shutdown and two cancellations) and all three were `success` on
+      // the rebuilt heads. If this test ever goes red the threshold has been
+      // lowered to 1 and healthy PRs are being held forever.
+      const row = classify({ mergeStateStatus: "CLEAN", timeline: withEjections(1) });
+      assert.equal(row.action, "enqueue");
+    });
+
+    it("clears the hold when the head moves, with no state to expire", () => {
+      const row = classify({
+        mergeStateStatus: "CLEAN",
+        timeline: [...withEjections(EJECTIONS_BEFORE_HOLD), forcePushed("2026-09-13T10:00:00Z")],
+      });
+      assert.equal(row.action, "enqueue");
+    });
+
+    it("does not re-enqueue a PR already back in the queue, however many times it was ejected", () => {
+      // §4yy: `classifyPr` is otherwise structurally blind to queue
+      // membership — `PR_LIST_FIELDS` carries no queue field, and auto-merge
+      // is a different GitHub mechanism.
+      const row = classify({
+        mergeStateStatus: "CLEAN",
+        timeline: withEjections(EJECTIONS_BEFORE_HOLD, [added("2026-09-13T11:00:00Z")]),
+      });
+      assert.notEqual(row.reason, "ejected-at-current-head");
+    });
+
+    it("runs LAST: a red check is still reported as the check, not as the ejection", () => {
+      // The ejection hold is the least actionable reason on the row — fixing
+      // the red check is what clears both.
+      const row = classify({
+        mergeStateStatus: "CLEAN",
+        statusCheckRollup: [{ name: "e2e", conclusion: "FAILURE", completedAt: "2026-09-13T05:00:00Z" }],
+        timeline: withEjections(EJECTIONS_BEFORE_HOLD),
+      });
+      assert.equal(row.reason, "checks:FAILURE");
+    });
+
+    it("is unchanged for a PR with no timeline at all", () => {
+      assert.equal(classify({ mergeStateStatus: "CLEAN" }).action, "enqueue");
+    });
+  });
+
+  it("is aged by the stale-hold report — it is a wedge, not a deliberate hold", () => {
+    // DELIBERATE_HOLD_REASON_RE must not grow to cover this. A PR ejected
+    // twice at an unchanged head is stuck and wants a human; aging it is the
+    // only thing that ever says how long it has been stuck.
+    const stuck = pr({
+      number: 3089,
+      mergeStateStatus: "CLEAN",
+      // The hold's age is measured off the newest CHECK stamp, not off the
+      // timeline — see judgeableAgeHours.
+      statusCheckRollup: [{ name: "verify", conclusion: "SUCCESS", completedAt: "2026-09-12T20:00:00Z" }],
+    });
+    const held = stalledHolds(
+      [stuck],
+      [{ number: 3089, action: "skip", reason: "ejected-at-current-head" }],
+      { now: NOW },
+    );
+    assert.deepEqual(held.map((row) => row.number), [3089]);
   });
 });
