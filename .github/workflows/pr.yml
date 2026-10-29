@@ -394,6 +394,22 @@ jobs:
           node --test ./scripts/prove-agent-image-git-config-controls.test.mjs
         timeout-minutes: 2
 
+      # PEN-4988. The standing detector for §7.2 trigger 2 of the PEN-3183
+      # git-egress boundary decision, plus the Alertmanager payload it pages
+      # with. Reviewed on every PR rather than only when the hourly cron next
+      # fires: this detector's whole failure mode is reporting CLEAR when it
+      # should report FIRED, and both halves of that -- the parse that must
+      # count an unreadable line as an occurrence, and the exit-code split that
+      # keeps "could not run" out of the clear bucket -- are pure logic a unit
+      # test can hold. A regression here goes unnoticed on the cron by
+      # construction, because its symptom is silence.
+      - name: Test git-egress residual trigger detector (PEN-4988)
+        if: ${{ !cancelled() }}
+        run: |
+          node --test ./scripts/check-git-egress-residual-triggers.test.mjs
+          node --test ./.github/scripts/tests/post-git-egress-residual-trigger-alert.test.mjs
+        timeout-minutes: 2
+
       - name: Validate Dockerfile deps stage
         if: ${{ !cancelled() }}
         run: |

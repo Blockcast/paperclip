@@ -313,6 +313,94 @@ is enabled.
    calendar date.
 5. Otherwise: **2027-01-31.**
 
+#### What watches each trigger (PEN-4988, 2026-10-29)
+
+Until PEN-4988 **nothing watched any of these**, and the acceptance above runs to 2027-01-31
+unless one fires. A trigger that fires and is not noticed is the same as a trigger that never
+fires — so the table below exists so a future reader can tell a *watched* condition from an
+*unwatched* one without re-deriving it. Keep it accurate or delete it; a stale coverage claim is
+worse than none.
+
+| # | Watched? | By what | Owner of the page |
+|---|---|---|---|
+| 1 | **No** | Nothing. Not a pollable condition — see below. | — |
+| 2 | **Yes** | `git-egress-residual-trigger-check.yml`, hourly | Security Engineer |
+| 3 | **Partly** | Two build/PR gates. They BLOCK; they do not ALERT. Mount half unasserted (PEN-4990). | — |
+| 4 | **No** | Accepted blind spot — no exec telemetry exists. Re-measurement: PEN-4989. | — |
+
+**Trigger 1 — not watched, and not watchable here.** A disclosure event is detected by whatever
+detects disclosures (the PEN-2526 response path), not by polling this repo. It is listed as a
+trigger because it ends the acceptance, not because this decision record can instrument it.
+
+**Trigger 2 — watched.** `.github/workflows/git-egress-residual-trigger-check.yml` runs hourly on
+`arc-paperclip-light` and pages Alertmanager as `GitEgressResidualTriggerFired`; a detector that
+cannot read its source pages separately as `GitEgressResidualTriggerCheckUnreadable`, because
+"nothing is watching" must never be reported as "clear". **The Security Engineer owns both pages**,
+as owner of this record. A fired trigger ends the acceptance *early regardless of the calendar
+date* and is raised to the CTO — it is not folded silently into the PEN-4933 rollout.
+
+It reads the render-time server warn `claude_k8s.data_mount_broad_rw` out of Loki, **not** the
+`paperclip.io/data-mount-scope` annotation §2.1 names. Both are written from the same
+`broadDataMountReason` variable a few lines apart in `buildJobManifest`, so they are two renderings
+of one computation rather than independent evidence, and the log is the one that is *observable*:
+agent Jobs carry `ttlSecondsAfterFinished: 300`, so polling live Jobs samples and silently misses a
+broad Job that starts and finishes between two polls; and the annotation is on the Job, not the Pod,
+so reading it needs a `batch/jobs: list` grant that the only least-privilege credential this repo's
+CI holds (`paperclip-ci-deploy`) does not have. The risk a log-based detector trades into — going
+silent if the producer stops, where silence reads as clear — is covered in-repo rather than
+trusted: the warn is pinned on all three gate legs by `job-manifest.test.ts` ("names the reason
+whenever the broad rw mount is emitted"), so dropping it reds CI before it can blind the check. Do
+not delete those tests as redundant with the annotation assertions beside them.
+
+**Trigger 3 — partly covered, and the gap is specific.** Its `/etc/gitconfig` half has two
+assertions: `deploy/helm/paperclip/tests/agent-egress-path.test.mjs` (assertion (a), the surface as
+declared in this repo, on every PR) and `scripts/check-agent-image-git-config.mjs` (assertion (b),
+the surface of the image as built, in `docker-agent.yml` before promotion). Three limits, none of
+which a green run covers:
+
+- **They block; they do not alert.** A red gate refuses the merge or the image promotion. Nobody is
+  paged, and nothing watches for the *absence* of a run.
+- **They are direction-blind**, and §7.2's direction rule above is precisely what they cannot
+  apply. Both assert **exact equality** to a declared set — deliberately, since "an added `-c` flag
+  is the attack, so a superset check cannot see it" — which means a change that *removes* a
+  credential route reds them exactly like one that adds a route. A red is "the declared surface
+  moved", not "a credential route widened". **A human must read the diff for direction**; the §7.4
+  refusal is the worked example of a red that is *not* this trigger.
+- Assertion (b) explicitly does not cover a retag or overwrite of an already-published image, or
+  drift of an already-running pod (see its own header).
+
+The **mount half** — "or mounts it into a new container" — has **no standing detector at all**.
+`deploy/helm/paperclip/tests/secret-mounts-outside-data-volume.test.mjs` asserts where secret
+volumes may sit (BLO-40279: nothing credential-bearing nested under the shared data volume), which
+is a different property from *which containers receive the github.com token*. Nothing asserts the
+latter, so adding the Secret to a new container is caught only by human review. Tracked as
+**PEN-4990**.
+
+**Trigger 4 — accepted blind spot, stated as such rather than left as an open gap.** It is the one
+trigger with no instrument, and that is structural: **no exec-level telemetry is deployed anywhere
+in this cluster** (no Tetragon, no Falco, no process-audit pipeline, and no Prometheus metric family
+carrying exec events — measured during PEN-4986). Nor can one be obtained from inside an agent pod:
+the container runs `runAsNonRoot` with `allowPrivilegeEscalation: false` and
+`capabilities: { drop: [ALL] }`, which is exactly the hardening that forbids attaching a tracer —
+and §8 forbids relaxing it. That hardening is correct; the blind spot is the price of it, and the
+price is worth paying.
+
+**The decision recorded here is that exec telemetry will not be deployed for this purpose.**
+Deploying a cluster-wide tracer is a platform change far outside the scope of this decision record;
+it is not refused on the merits, it is **not this record's to make** — the CTO owns that call, and
+this paragraph is what a future reader should point at when asking for it to be revisited.
+
+So trigger 4 fires **silently**: if an absolute-path `git` ran in another agent pod tomorrow,
+nothing would report it. What stands in its place is a *measurement*, not a detector —
+`scripts/measure-absolute-path-git.mjs`, committed with PEN-4986 and re-runnable. Read the
+difference plainly: a measurement observes the pods it is run in, over the window it is run for,
+and says nothing about the rest of the fleet or about the time between runs. PEN-4986 measured
+**one** pod and §7.1 records it as such. Widening that population is per-pod work — the script runs
+unprivileged inside an agent's own run, so it needs no new platform capability, only more agents
+running it — and re-taking it is required whenever the agent image or the PATH layout changes.
+That re-measurement is tracked as **PEN-4989** rather than as a sentence here, for the reason
+PEN-4988 exists at all: a condition recorded only in a document has no owner.
+
 #### Trigger 3's mount half — what asserts it (PEN-4990, 2026-10-29)
 
 Trigger 3 has two halves and until PEN-4990 only one was asserted anywhere.

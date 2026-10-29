@@ -359,6 +359,40 @@ export const WATCHED_GUARDS = [
     event: "schedule",
     graceUntil: "2026-11-10T00:00:00.000Z",
   },
+
+  // PEN-4988. Hourly (cron "59 * * * *") on `arc-paperclip-light`. Watches §7.2
+  // trigger 2 of the PEN-3183 git-egress boundary decision: an agent Job
+  // rendering a broad read-write data mount, which re-opens bypass 3 and ENDS
+  // that decision's residual acceptance early.
+  //
+  // Watching THIS one matters more than for most guards, and the reason is the
+  // row that filed it. The §7.2 triggers sat unwatched entirely while the
+  // acceptance ran toward 2027-01-31, on the reasoning that a trigger which
+  // fires and is not noticed is the same as one that never fires. A detector
+  // that silently stops reproduces exactly that condition one level up — with
+  // the added hazard that this one reads a LOG, so "producer stopped" and
+  // "nothing to report" are already indistinguishable at the Loki query. Its
+  // own liveness is the only thing that separates them.
+  //
+  // The 2.75h bar is ADOPTED from the same precedent stranded-approval-lock-check
+  // takes above: hourly cadence on the same `arc-paperclip-light` lane, which is
+  // what relay-ssl-multicert-guard and now two other guards run under. Re-derive
+  // from this guard's own completion gaps once it has a distribution.
+  //
+  // `event: "schedule"` for the same reason as the entry above: the only other
+  // trigger is `workflow_dispatch`, a manual dispatch would bump the newest-run
+  // timestamp and mask a dead cron for one threshold window, and this guard has
+  // no measured distribution that narrowing would invalidate.
+  //
+  // `graceUntil` because schedules fire only from the default branch, so this
+  // workflow has zero completed schedule runs at merge BY CONSTRUCTION and would
+  // otherwise be born red. After it expires this reverts to a hard red.
+  {
+    workflow: "git-egress-residual-trigger-check.yml",
+    staleHours: 2.75,
+    event: "schedule",
+    graceUntil: "2026-11-10T00:00:00.000Z",
+  },
 ];
 
 /**
