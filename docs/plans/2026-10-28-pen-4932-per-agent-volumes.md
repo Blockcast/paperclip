@@ -184,10 +184,40 @@ build fails, and there is no seed/visibility gap left for an overlay change to o
 
 ⛔ **But not in this change, and not casually.** This is the PEN-3156 publish guard — a security
 control — and the path is spelled by four consumers in three languages across two repositories
-(Helm seed, egress runtime, Job manifest, preflight in both vendored adapters). Getting it wrong
-either re-creates the 2h17m outage or, worse, leaves `core.hooksPath` pointing at a directory
-holding no hook, which fails *open*: pushes succeed, unscanned. It belongs in stage 3 with its own
-review, moving all four consumers together.
+(Helm seed, egress runtime, Job manifest, preflight in both vendored adapters). It belongs in
+stage 3 with its own review, moving all four consumers together.
+
+⚠️ **Corrected 2026-10-29: botching this fails CLOSED, not open — there is one failure mode here,
+not two.** This section previously said getting it wrong *"either re-creates the 2h17m outage or,
+worse, leaves `core.hooksPath` pointing at a directory holding no hook, which fails open: pushes
+succeed, unscanned"*, and ranked the second as the graver risk. The second outcome is unreachable
+in this system, so the ranking inverted the real one.
+
+Bare `git` *would* fail open — it treats a hooks directory with no `pre-push` in it as "no hook to
+run" and the push proceeds. That is precisely why no agent push path is bare `git`.
+`buildGitArgv` refuses **before** it injects `core.hooksPath`, because (in its own words) injecting
+a hooks path with no hook in it is indistinguishable from the outside from a push that was
+scanned:
+
+```
+packages/adapter-utils/src/github-git-egress-runtime.ts:469
+  if (!hookPresent(options.hooksDir)) throw new GitEgressRuntimeError(
+    "…refusing to publish — no executable pre-push hook at `<hooksDir>/pre-push`…")
+```
+
+`prePushHookPresent` is an `X_OK` access, so a present-but-not-executable hook refuses on the same
+branch (that is the preflight's `NOT-EXECUTABLE` verdict, explicitly *"not a silent
+unscanned-publish"*). Pinned by `github-git-egress-runtime.test.ts` — *"fails closed when the hook
+is not installed"* — and consistent with the runtime's own note that *"the push path already fails
+closed — that is how PEN-4518 was found"*.
+
+**So the two outcomes are one outcome.** An absent or unreachable hook reproduces the BLO-48361
+shape — every push in the fleet refused — which is what 2h17m of lost publishing *was*. That is the
+safe direction, and it sets the posture for stages 3b-ii/3b-iii: prepare for a **fleet-wide push
+outage**, i.e. keep a rollback ready and watch the preflight verdict across pods. Do **not** plan
+for a silent unscanned-publish window; there isn't one, and auditing for it after the fact would be
+looking for a hole the refusal closes. The one genuinely unscanned path is a publishing verb that
+never consults the hook at all (`send-pack`), which PEN-3156 closes by refusal rather than by hook.
 
 ### 3.7 Stage-3 preconditions, measured 2026-10-29
 
@@ -274,10 +304,36 @@ PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verificati
    `ROOT_TOOLCHAIN_SUBPATHS` now has a disposition backed by a measurement rather than a
    preference. `wasm-pack` is baked here, which completes the BAKE set **except** the `pre-push`
    hook, deliberately deferred to stage 3 (§3.6) because it is a security control with a
-   four-consumer join and a fail-*open* failure mode.
+   four-consumer join whose failure mode is a fleet-wide push **refusal** (§3.6, corrected
+   2026-10-29 — it fails closed, not open).
 3. **Remove `ROOT_TOOLCHAIN_SUBPATHS` from the Job spec**, and move the `pre-push` hook into the
    image in the same change. Only after 1–2; this is the step that actually retires the
    cross-agent mount, and the first step that can break a running agent.
+
+   ⚠️ **The gate is TWO-SIDED, and the two planes roll independently — measured 5h45m apart.**
+   This matters for the 3b split below and was not stated when the split was made. The
+   `ROOT_TOOLCHAIN_SUBPATHS` repoint is **server-side** (`paperclip-api` builds the Job manifest);
+   the hook file is **image-side** (the agent image). Measured 2026-10-29 from a live pod:
+
+   | plane | running version | vs #3104 (merged 13:13:08Z) |
+   |---|---|---|
+   | `paperclip-api` — builds the Job manifest | pods ~9 h old, started ~08:25Z | ~4h48m **before** it merged |
+   | agent image `paperclip-agent:sha-1dd8e90` | commit 13:08:04Z | **5 min before** it merged |
+
+   A server carrying the repoint can therefore roll while agent images still lag, and the result is
+   the §3.6 refusal on every push in the fleet — PEN-4518's shape, arrived at from the safe
+   direction, still an outage. So the gate is **both planes verified by property in a running pod**:
+   never a merge, and never one plane. Concretely, before 3b-ii: #3117 merged, **and** an agent
+   image built from a commit containing it, **and** `/usr/local/libexec/paperclip/hooks/pre-push`
+   present in a **freshly created** pod. Baseline recorded 2026-10-29: that path is **absent**,
+   while `/usr/local/libexec/paperclip/bin/` (the PEN-3840 wrapper precedent) exists `root:root
+   0755`, confirming the ownership model the `COPY` produces.
+
+   **`paperclip-api` ships once a day, at 07:23 UTC** — the hourly cron is sampling-only and cannot
+   ship. A change merged after that slot is not fleet-visible until the next one, so a server-plane
+   gate is routinely ~a day wide. Read it by **ancestry, not pod age**: compare the Deployment's
+   `paperclip.blockcast.net/deployed-commit` annotation against the merge commit
+   (`compare` → `behind_by`) — pod age is an inference that merely happens to agree.
 
    **Its precondition, and how to check it.** Stage 3 is safe only once agents actually *run* an
    image built from a commit at or after `992d21fc` (the `kubectl` pin, #3081). On an older image
@@ -413,7 +469,9 @@ call in the end — each turned out to have a measurable answer:
   drift from, and the only one where fetching at use time costs minutes rather than seconds.
 - **`pre-push`** → **bake, in stage 3** (§3.6). The "server-written state" reading was wrong; it is
   a 162-byte shim into the image. Deferred not because the decision is unclear but because the
-  change spans four consumers across two repositories and fails open if botched.
+  change spans four consumers across two repositories and, if botched, refuses every push in the
+  fleet (§3.6 — fails *closed*; an earlier draft of this line said "fails open", which is true of
+  bare `git` and false of this system).
 
 **Company-scoped sharing — resolved 2026-10-29, and it is a constraint rather than a trade-off.**
 `/work/<companyId>`, `/wt/<companyId>`, the pnpm store and `skills/<companyId>` are namespaced by
