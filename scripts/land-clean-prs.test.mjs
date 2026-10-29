@@ -5,6 +5,7 @@ import {
   CHECK_SETTLE_MINUTES,
   MAX_ENQUEUES_PER_FIRE,
   STALE_ENQUEUE_HOURS,
+  STALE_HOLD_HOURS,
   allyVerdictAtHead,
   approvalLanes,
   checkSettlement,
@@ -18,7 +19,11 @@ import {
   isMainModule,
   markFailure,
   latestCheckStates,
+  judgeableAgeHours,
+  newestCheckStamp,
   renderReceipt,
+  renderStalledHolds,
+  stalledHolds,
   repoRunner,
   settleMinutesFrom,
   sweepRepos,
@@ -1175,5 +1180,118 @@ describe("CODEOWNERS scoping of the owner hold", () => {
     );
     assert.equal(impliedOwners({ codeownerRules: RULES, files: null }), null);
     assert.deepEqual([...impliedOwners({ codeownerRules: RULES, files: ["unowned.ts"] })], []);
+  });
+});
+
+describe(`stale-hold report (held >${STALE_HOLD_HOURS}h, PEN-5005)`, () => {
+  // Every fixture is anchored on NOW so the clock under test is the only
+  // moving part.
+  const checkAt = (iso) => [{ name: "verify", conclusion: "SUCCESS", completedAt: iso }];
+  const pr = (number, iso) => ({ number, statusCheckRollup: iso === null ? [] : checkAt(iso) });
+  const row = (number, action, reason) => ({ number, action, reason });
+
+  const FRESH = "2026-09-13T11:00:00Z"; // 1h before NOW
+  const OLD = "2026-09-12T20:00:00Z"; // 16h before NOW
+
+  it("reports a hold whose head stopped moving longer ago than the window", () => {
+    const held = stalledHolds(
+      [pr(1, OLD)],
+      [row(1, "codeowner-review-requested", "owner-approval-pending")],
+      { now: NOW },
+    );
+    assert.deepEqual(held, [
+      { number: 1, reason: "owner-approval-pending", ageHours: 16 },
+    ]);
+  });
+
+  it("does not report a hold that is still inside the window", () => {
+    // The live case this detector was written against: #3089 and #3085 were
+    // 9.2h and 9.8h OLD on 2026-10-29 against a 2.2-6.8h create->merge
+    // spread, which reads as a strand — but both had pushed that morning and
+    // their CI had finished ~2.5h earlier, and both classified `enqueue` on
+    // the next read. A creation clock names them; this one must not.
+    assert.deepEqual(
+      stalledHolds([pr(1, FRESH)], [row(1, "skip", "checks:settling")], { now: NOW }),
+      [],
+    );
+  });
+
+  it("ages what a PR ended as, so an acted-on row is never reported", () => {
+    const prs = [pr(1, OLD), pr(2, OLD), pr(3, OLD), pr(4, OLD)];
+    const rows = [
+      row(1, "enqueue", "mergestate:CLEAN"),
+      row(2, "already-enqueued", "auto-merge armed 1.0h ago"),
+      // Both of these carry their own cohort or their own better clock, and
+      // reporting them here would name one PR twice under two mechanisms.
+      row(3, "approval-rotted", "mergestate:DIRTY"),
+      row(4, "stale-enqueue", "auto-merge armed 20.0h ago"),
+    ];
+    assert.deepEqual(stalledHolds(prs, rows, { now: NOW }), []);
+  });
+
+  it("never ages a deliberate hold", () => {
+    // Draft, an opt-out label and a human author are all states someone CHOSE.
+    // An alarm that fires on its own normal operation is one nobody reads.
+    const prs = [pr(1, OLD), pr(2, OLD), pr(3, OLD)];
+    const rows = [
+      row(1, "skip", "draft"),
+      row(2, "skip", "label:do-not-merge"),
+      row(3, "skip", "human-author"),
+    ];
+    assert.deepEqual(stalledHolds(prs, rows, { now: NOW }), []);
+  });
+
+  it("REPORTS an undatable hold rather than dropping it", () => {
+    // The fail-toward-clean shape: a held PR whose rollup carries no stamp is
+    // a PR nothing ever ran on, which is the case most worth hearing about.
+    // Silence here would be indistinguishable from a healthy repo.
+    assert.deepEqual(
+      stalledHolds([pr(1, null)], [row(1, "skip", "checks:none")], { now: NOW }),
+      [{ number: 1, reason: "checks:none", ageHours: null }],
+    );
+    assert.deepEqual(
+      stalledHolds([], [row(9, "skip", "checks:none")], { now: NOW }),
+      [{ number: 9, reason: "checks:none", ageHours: null }],
+      "a row whose PR is missing entirely is still reported",
+    );
+  });
+
+  it("reads the clock past an Ally verdict mirror posted after CI finished", () => {
+    // #1981's shape, arriving through this door: the mirror is the newest
+    // datable row, so an unfiltered read would restart the clock on a hold
+    // that has not moved since CI reported.
+    const prWithMirror = {
+      number: 1,
+      statusCheckRollup: [
+        { __typename: "CheckRun", name: "verify", conclusion: "SUCCESS", completedAt: OLD },
+        {
+          __typename: "StatusContext",
+          context: "gate/ally-comment-findings",
+          state: "SUCCESS",
+          createdAt: FRESH,
+        },
+      ],
+    };
+    assert.equal(judgeableAgeHours(prWithMirror, { now: NOW }), 16);
+  });
+
+  it("renders nothing when no hold is stale, and names each one when they are", () => {
+    assert.equal(renderStalledHolds("a/one", []), "");
+    const text = renderStalledHolds("a/one", [
+      { number: 7, reason: "owner-approval-pending", ageHours: 40.2 },
+      { number: 8, reason: "checks:none", ageHours: null },
+    ]);
+    assert.match(text, /stale-hold \(held >13h/);
+    assert.match(text, /a\/one#7 — `owner-approval-pending`, 40\.2h/);
+    assert.match(text, /a\/one#8 — `checks:none`, age unknown/);
+  });
+
+  it("shares one clock definition with the settle floor", () => {
+    // Two definitions of "when did this head last report" would drift, and the
+    // drift would be invisible: both answers look plausible in isolation.
+    assert.equal(newestCheckStamp(checkAt(OLD)), Date.parse(OLD));
+    assert.equal(newestCheckStamp([{ name: "verify", conclusion: "SUCCESS" }]), null);
+    assert.equal(newestCheckStamp([]), null);
+    assert.equal(judgeableAgeHours({ statusCheckRollup: [] }, { now: NOW }), null);
   });
 });

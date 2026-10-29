@@ -95,6 +95,28 @@ import {
  */
 export const STALE_ENQUEUE_HOURS = 13;
 
+/**
+ * How long a HOLD may stand before the receipt reports it as durable rather
+ * than in flight.
+ *
+ * The classifier already names a reason for every PR it does not enqueue, so
+ * nothing here is newly discovered — what is missing is DURATION. A row that
+ * has read `codeowner-review-requested` for three days and one that acquired
+ * the same reason four minutes ago are byte-identical in the receipt, and a
+ * fire only ever shows the instant it ran. The tail that results is invisible
+ * by construction: measured 2026-10-29 on Blockcast/paperclip, two of the four
+ * oldest unlanded PRs carried holds that could not clear on their own (#3051
+ * waiting on a code owner since 2026-10-27, #3032 red on the non-required
+ * `review` check since 2026-10-26), and nothing anywhere said how long.
+ *
+ * 13h, matching STALE_ENQUEUE_HOURS and for the same reason: it clears a
+ * normal overnight queue without waiting a second working day. It is also ~2x
+ * the create->merge spread measured over the 12 most recent merges on that
+ * repo the same day (2.2-6.8h), so a hold still standing at this age is past
+ * every landing that repo actually performs.
+ */
+export const STALE_HOLD_HOURS = 13;
+
 export const CODEOWNER_REQUEST_MARKER = "<!-- landing-routine:codeowner-request -->";
 export const STALE_ENQUEUE_MARKER = "<!-- landing-routine:stale-enqueue -->";
 
@@ -598,6 +620,24 @@ function approvalNote(pr) {
 }
 
 /**
+ * When the newest row in this rollup last reported, or `null` when nothing in
+ * it carries a parseable timestamp.
+ *
+ * Shared by the settle floor below and by `judgeableAgeHours`, because the two
+ * are the same clock read at opposite ends: the floor refuses a rollup that
+ * reported too RECENTLY to be believed, and the stale-hold report names one
+ * that has reported nothing SINCE, for long enough that the hold cannot still
+ * be in flight. Deriving them from one function is what keeps "the moment this
+ * head became judgeable" a single definition rather than two that drift.
+ */
+export function newestCheckStamp(rollup) {
+  const stamps = (rollup ?? [])
+    .map((c) => Date.parse(c?.completedAt || c?.startedAt || c?.createdAt || ""))
+    .filter((at) => Number.isFinite(at));
+  return stamps.length === 0 ? null : Math.max(...stamps);
+}
+
+/**
  * Whether an all-green rollup has been green long enough to believe.
  *
  * Two ways it has not. A rollup with zero rows is a stop, not a pass: the two
@@ -618,11 +658,9 @@ export function checkSettlement(
   { now = Date.now(), settleMinutes = CHECK_SETTLE_MINUTES } = {},
 ) {
   if ((rollup ?? []).length === 0) return { settled: false, reason: "none" };
-  const stamps = (rollup ?? [])
-    .map((c) => Date.parse(c?.completedAt || c?.startedAt || c?.createdAt || ""))
-    .filter((at) => Number.isFinite(at));
-  if (stamps.length === 0) return { settled: true };
-  const ageMinutes = (now - Math.max(...stamps)) / 60_000;
+  const newest = newestCheckStamp(rollup);
+  if (newest === null) return { settled: true };
+  const ageMinutes = (now - newest) / 60_000;
   if (ageMinutes < settleMinutes) {
     return {
       settled: false,
@@ -818,6 +856,104 @@ export function renderReceipt(rows) {
       "no open PRs",
   );
   return lines.join("\n");
+}
+
+/**
+ * Hold reasons that are a deliberate "not this one" rather than a strand.
+ *
+ * A draft PR open for a fortnight, a `do-not-merge` label and a human-authored
+ * PR are all states someone CHOSE, and the landing routine has no standing to
+ * age them. Reporting them would also swamp the cohort: those three rows are
+ * the common case on a busy repo, so a detector that counted them would be
+ * read once and then ignored, which is the failure mode of every alarm that
+ * fires on its own normal operation.
+ */
+const DELIBERATE_HOLD_REASON_RE = /^(?:human-author|draft|label:)/;
+
+/** Rows that are an action or a self-clearing wait, not a hold to be aged. */
+const NON_HOLD_ACTIONS = new Set([
+  "enqueue",
+  "already-enqueued",
+  // Has its own standing cohort (`reportRotted`) with its own semantics; aging
+  // it here would report the same PR twice under two different names.
+  "approval-rotted",
+  // A wedged auto-merge request is already reported AS a staleness finding by
+  // `classifyFromListing`, which has a better clock for it than this one: the
+  // request's own `enabledAt`.
+  "stale-enqueue",
+]);
+
+/**
+ * Hours since this PR's head last became judgeable, or `null` when nothing
+ * dates it.
+ *
+ * ## Why this clock and not the PR's age
+ *
+ * Creation time is the obvious choice and it is WRONG, in the direction that
+ * costs most: it manufactures findings. Measured 2026-10-29 on
+ * Blockcast/paperclip, #3089 and #3085 were 9.2h and 9.8h old against a
+ * 2.2-6.8h create->merge spread, which reads as a flagrant strand. Both had
+ * moved their heads that morning (08:05Z, 07:03Z) and their CI had finished
+ * minutes before the measurement (09:27Z, 09:01Z) — they had been judgeable
+ * for 2.3h and 2.7h, comfortably INSIDE the window, and both classified
+ * `enqueue` at the next read. A creation clock names them; this one does not.
+ *
+ * That is not a tuning difference. A PR's age is the age of its oldest
+ * abandoned attempt, and every push resets what the classifier is actually
+ * looking at: the rollup, the review attestation and the merge state are all
+ * properties of the CURRENT head. The honest question is "how long has this
+ * verdict been available and unchanged", and the newest check stamp is the
+ * only cheap answer to it — `checkSettlement` already computes it for the
+ * settle floor, so this costs no extra API call.
+ *
+ * Uses the mirror-filtered rollup for the same reason `failingChecks` does: an
+ * Ally verdict mirror posted after CI finished would otherwise reset this
+ * clock on a hold that has not moved (the #1981 shape).
+ */
+export function judgeableAgeHours(pr, { now = Date.now() } = {}) {
+  const newest = newestCheckStamp(withoutAllyVerdictMirrors(pr?.statusCheckRollup));
+  return newest === null ? null : (now - newest) / 3_600_000;
+}
+
+/**
+ * The held PRs whose hold has outlived the window in which this repo lands
+ * anything, as `{ number, reason, ageHours }`.
+ *
+ * `ageHours` is `null` when the PR could not be dated, and such a row is
+ * REPORTED rather than dropped. Dropping it is the §4l shape — an instrument
+ * that cannot see something reporting clean — and the undatable case is
+ * exactly the one worth hearing about, because a held PR whose rollup carries
+ * no timestamp at all is a PR on which nothing ever ran.
+ *
+ * Takes both arrays rather than a field on the row because the row shape is
+ * the receipt's contract and several callers deep-compare it; joining on
+ * `number` keeps the classifier pure and this report additive.
+ */
+export function stalledHolds(prs, rows, { now = Date.now(), staleHours = STALE_HOLD_HOURS } = {}) {
+  const byNumber = new Map((prs ?? []).map((pr) => [pr?.number, pr]));
+  const held = [];
+  for (const row of rows ?? []) {
+    if (NON_HOLD_ACTIONS.has(row?.action)) continue;
+    if (DELIBERATE_HOLD_REASON_RE.test(String(row?.reason ?? ""))) continue;
+    const ageHours = judgeableAgeHours(byNumber.get(row?.number), { now });
+    if (ageHours !== null && ageHours < staleHours) continue;
+    held.push({ number: row?.number, reason: row?.reason, ageHours });
+  }
+  return held;
+}
+
+/** The stale-hold block for one repo's receipt, or "" when there is none. */
+export function renderStalledHolds(repo, held, { staleHours = STALE_HOLD_HOURS } = {}) {
+  if ((held ?? []).length === 0) return "";
+  const line = ({ number, reason, ageHours }) =>
+    `  ${repo}#${number} — \`${reason}\`, ` +
+    (ageHours === null ? "age unknown (no dated check on this head)" : `${ageHours.toFixed(1)}h`);
+  return (
+    `stale-hold (held >${staleHours}h, nothing will clear these on its own) — ${held.length}:\n` +
+    held.map(line).join("\n") +
+    "\nEach already carries its reason above; what is new is that the reason has " +
+    "stopped being a wait. Act on it or say why it stands."
+  );
 }
 
 const PR_LIST_FIELDS =
@@ -1125,7 +1261,8 @@ export function markFailure(row, message) {
 }
 
 function runRepo(repo, apply, settleMinutes, spent, rotted) {
-  const rows = classifyAll(fetchOpenPrs(repo), { settleMinutes, spent });
+  const prs = fetchOpenPrs(repo);
+  const rows = classifyAll(prs, { settleMinutes, spent });
 
   for (const row of rows) {
     if (row.action === "approval-rotted") rotted.push(`${repo}#${row.number} (${row.detail})`);
@@ -1152,7 +1289,11 @@ function runRepo(repo, apply, settleMinutes, spent, rotted) {
     }
   }
 
-  console.log(`## ${repo}\n\n${renderReceipt(rows)}`);
+  // After the apply loop, so a row this fire just enqueued (or just renamed to
+  // `enqueue-failed`) is aged on what it ENDED as, not on the classification
+  // it entered with.
+  const stalled = renderStalledHolds(repo, stalledHolds(prs, rows));
+  console.log(`## ${repo}\n\n${renderReceipt(rows)}${stalled ? `\n\n${stalled}` : ""}`);
   return rows;
 }
 
