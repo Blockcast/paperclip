@@ -190,6 +190,15 @@ async function isOwnPlaceholder(targetPath: string, relativeDocPath: string): Pr
   }
 }
 
+/**
+ * Returns every referenced shared-doc path that is present in `cwd` once this resolves —
+ * whether it was just materialized, refreshed, or already there. PEN-3329 needs that list
+ * as data rather than as a side effect: a run-isolated pod bootstraps by `git clone
+ * --shared`-ing this workspace, which carries tracked objects only, so these untracked
+ * files have to be named explicitly for the pod bootstrap to carry them across. Paths are
+ * repo-relative POSIX (`docs/<name>.md`) and are already constrained to that shape by
+ * `extractReferencedSharedDocPaths` plus `resolveSafeRelativePath`.
+ */
 export async function ensureReferencedSharedDocsMaterialized(input: {
   cwd: string;
   instructionsRootPath: string;
@@ -200,7 +209,8 @@ export async function ensureReferencedSharedDocsMaterialized(input: {
    * against the instructions root only.
    */
   sharedDocSearchBoundaryPath?: string | null;
-}) {
+}): Promise<string[]> {
+  const materializedDocPaths: string[] = [];
   const referencedDocs = extractReferencedSharedDocPaths(input.instructionsContents);
   for (const relativeDocPath of referencedDocs) {
     const targetPath = resolveSafeRelativePath(input.cwd, relativeDocPath);
@@ -212,6 +222,9 @@ export async function ensureReferencedSharedDocsMaterialized(input: {
       input.sharedDocSearchBoundaryPath,
     );
     if (await pathExists(targetPath)) {
+      // Present either way, so it belongs in the returned set before any of the
+      // refresh short-circuits below can `continue` past it.
+      materializedDocPaths.push(relativeDocPath);
       // Refresh a stale placeholder only once a real source exists; otherwise leave the
       // workspace copy — placeholder or genuine doc — exactly as it is.
       const ownPlaceholder = await isOwnPlaceholder(targetPath, relativeDocPath);
@@ -243,7 +256,9 @@ export async function ensureReferencedSharedDocsMaterialized(input: {
     await fs.mkdir(path.dirname(targetPath), { recursive: true });
     await fs.writeFile(targetPath, content, "utf8");
     await excludeFromGitStatus(input.cwd, relativeDocPath, input.onLog);
+    materializedDocPaths.push(relativeDocPath);
   }
+  return materializedDocPaths;
 }
 
 /**

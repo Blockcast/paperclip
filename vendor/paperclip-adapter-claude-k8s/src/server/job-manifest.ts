@@ -18,6 +18,10 @@ import { buildClaudeCodeRuntimeShell, buildImageWrapperPreflightShell, buildPreP
 import { GIT_HOOKS_SUBPATH } from "./github-git-hooks-path.js";
 import { buildPodLogRedactorSetupShell, POD_LOG_FILTER_ARG_VAR, POD_LOG_FILTER_VAR } from "./pod-log-redactor.js";
 import { SERVER_ONLY_ENV_DENY } from "./inherit-allowlist.js";
+import {
+  buildSharedDocOverlayShell,
+  parseSharedDocOverlay,
+} from "./shared-doc-overlay.js";
 import { SELF_POD_DATA_MOUNT_PATH } from "./k8s-client.js";
 
 /**
@@ -3261,6 +3265,20 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
         `fi && cd ${quoteShellArg(isolation.workspaceRoot)}`,
       ].join(" ")
     : "";
+  // PEN-3329. Both branches of `workspaceSetup` above lose the shared docs the server
+  // materialized into the execution workspace: the clone carries tracked objects only,
+  // and the fallback branch hands the run an empty directory. This runs after either one
+  // and copies the declared set across. Gated on the same condition as `workspaceSetup`
+  // because every other isolation mode mounts that workspace directly and already has
+  // them. See `shared-doc-overlay.ts` for why the set is declared rather than discovered.
+  const sharedDocOverlay = workspaceSetup ? parseSharedDocOverlay(context.paperclipSharedDocs) : null;
+  const sharedDocOverlaySetup = sharedDocOverlay
+    ? buildSharedDocOverlayShell({
+        overlay: sharedDocOverlay,
+        workspaceRoot: isolation.workspaceRoot,
+        quote: quoteShellArg,
+      })
+    : "";
   // The mkdir, the redactor's fall-open sentinel and the tee all run INSIDE the
   // container, so they address the volume through the pod's mount path, never
   // the server's (BLO-32734).
@@ -3308,7 +3326,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // so a verdict after it would describe a pod that had already reached GitHub.
   // Advisory — the push path already fails closed; this buys time-to-diagnosis.
   const prePushHookPreflight = buildPrePushHookPreflightShell({ dataMountPath });
-  const claudeInvocation = `set -o pipefail; ${imageWrapperPreflight}; ${prePushHookPreflight}; ${workspaceSetup ? `${workspaceSetup} || exit $?; ` : ""}${buildEnvGuardSetupShell()}; ${claudeRuntime}${ccrotateRefresh ? `${ccrotateRefresh}; ` : ""}${preparePodLog}; ${buildPodLogRedactorSetupShell(containerLogPath)}; cat /tmp/prompt/prompt.txt | ${launcherCommand} ${claudeArgsEscaped} | "$${POD_LOG_FILTER_VAR}" \${${POD_LOG_FILTER_ARG_VAR}:+"$${POD_LOG_FILTER_ARG_VAR}"} | tee ${quoteShellArg(containerLogPath)} | ${failFastFilter} > /dev/null`;
+  const claudeInvocation = `set -o pipefail; ${imageWrapperPreflight}; ${prePushHookPreflight}; ${workspaceSetup ? `${workspaceSetup} || exit $?; ` : ""}${sharedDocOverlaySetup ? `${sharedDocOverlaySetup}; ` : ""}${buildEnvGuardSetupShell()}; ${claudeRuntime}${ccrotateRefresh ? `${ccrotateRefresh}; ` : ""}${preparePodLog}; ${buildPodLogRedactorSetupShell(containerLogPath)}; cat /tmp/prompt/prompt.txt | ${launcherCommand} ${claudeArgsEscaped} | "$${POD_LOG_FILTER_VAR}" \${${POD_LOG_FILTER_ARG_VAR}:+"$${POD_LOG_FILTER_ARG_VAR}"} | tee ${quoteShellArg(containerLogPath)} | ${failFastFilter} > /dev/null`;
   // When the DinD sidecar is wired in, prepend the wait-for-socket loop
   // so the agent never starts before dockerd is listening on the shared
   // unix socket. Mirrors the opencode_k8s adapter.
