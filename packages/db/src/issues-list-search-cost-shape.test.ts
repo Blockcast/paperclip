@@ -59,6 +59,16 @@
  * largest table in the schema. (A four-index variant including it measured
  * 57-72ms; it is not what ships, so it is not the headline.)
  *
+ * ⚠️ WHAT THIS SUITE DOES AND DOES NOT PROVE. `SHIPPED_SEARCH_WHERE` below is
+ * a hand-written copy of the predicate `issueSearchMatchCondition()` builds,
+ * not the predicate itself — this package cannot import the server service.
+ * So these tests prove the POSTGRES behaviour of the two shapes, and would
+ * stay green if `list()` reverted to `or(...)` tomorrow. The guard against
+ * that revert is in the server package:
+ * `server/src/__tests__/issues-service.test.ts`, "issues-list search predicate
+ * shape (PEN-3596)", which renders the real fragment and fails if the UNION
+ * collapses back to an OR over an EXISTS. Keep the two in step.
+ *
  * ── THREE REFUTED LEADS. Each was proposed on the row; none is the cause ────
  *
  *  1. "0098's activity_log index stopped being chosen."
@@ -163,7 +173,11 @@ const SUPERSEDED_SEARCH_WHERE = `(
   OR ${CORRELATED_COMMENT_MATCH}
 )`;
 
-/** The WHERE as `list()` builds it now: one id set per branch, unioned. */
+/**
+ * The WHERE as `list()` builds it now: one id set per branch, unioned.
+ * ⚠️ Hand-copied from `issueSearchMatchCondition()` — see the header note; the
+ * revert guard is the server-side shape suite, not this constant.
+ */
 const SHIPPED_SEARCH_WHERE = `i.id IN (
   SELECT s.id FROM issues s
   WHERE s.company_id = '${COMPANY}'::uuid AND s.title ILIKE '%${TERM}%' ESCAPE '\\'

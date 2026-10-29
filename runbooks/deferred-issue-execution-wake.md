@@ -96,8 +96,12 @@ curl -s "$PAPERCLIP_API/api/issues/<issueId>/diagnostics/wakes" | jq .
 
 Query the **issue**, never the recipient's seat — a deferred wake has no
 seat-side row, which is exactly what makes "nothing arrived" unfalsifiable from
-the recipient side. The route intermittently 503s with `transient_db_conflict`;
-retry once.
+the recipient side. The route intermittently 503s; retry once. ⚠ Two codes, and
+which one you get tells you what happened: `transient_db_conflict` is lock
+contention (sqlstates `40001`/`40P01`/`55P03`), while a query cancelled by the
+statement timeout now arrives as `503 statement_timeout` / sqlstate `57014`.
+(PEN-3596 split `57014` out of `transient_db_conflict`: a cancelled statement is
+not lock contention, and used to be reported as "Database contention".)
 
 Reading the result:
 

@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { asc, eq, inArray } from "drizzle-orm";
+import { PgDialect } from "drizzle-orm/pg-core";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { sql } from "drizzle-orm";
 import {
@@ -43,6 +44,7 @@ import {
   extractExecutiveHoldMarker,
   findActiveExecutiveHold,
   ISSUE_LIST_MAX_LIMIT,
+  issueSearchMatchCondition,
   issueService,
   parseExecutiveHoldMarkerTimestamp,
   recomputeBlockedIssuesStatusIfReady,
@@ -79,6 +81,58 @@ function deferred<T>() {
   });
   return { promise, resolve, reject };
 }
+
+describe("issues-list search predicate shape (PEN-3596)", () => {
+  // The cost-shape suite in packages/db measures Postgres' behaviour against a
+  // hand-written copy of this predicate, so by construction it stays green if
+  // `list()` reverts to `or(...)`. This renders the fragment `list()` actually
+  // pushes, so that revert fails here instead of shipping silently.
+  const COMPANY_ID = "6f1d2a3b-4c5d-6e7f-8a9b-0c1d2e3f4a5b";
+  const CONTAINS_PATTERN = "%statement%";
+
+  const rendered = () => new PgDialect().sqlToQuery(issueSearchMatchCondition(COMPANY_ID, CONTAINS_PATTERN));
+
+  it("unions one standalone id set per search branch rather than ORing them", () => {
+    const { sql: text } = rendered();
+    const normalized = text.replace(/\s+/g, " ").toLowerCase();
+
+    // Four branches => exactly three UNIONs, and the whole thing is an IN (...)
+    // over id sets rather than a disjunction of row predicates.
+    expect(normalized.match(/\bunion\b/g) ?? []).toHaveLength(3);
+    expect(normalized).toContain('"id" in (');
+    expect(normalized).not.toContain(" or ");
+  });
+
+  it("keeps the comment branch out of a semi-join, which is what blocked the BitmapOr", () => {
+    const { sql: text } = rendered();
+    // An EXISTS here is the exact regression: a semi-join cannot take part in a
+    // BitmapOr, so its presence forces a per-row filter over every issue in the
+    // company and makes the gin_trgm indexes unreachable.
+    expect(text.toLowerCase()).not.toContain("exists");
+    expect(text).toContain('"issue_comments"');
+  });
+
+  it("searches all four columns, each scoped to the company", () => {
+    const { sql: text, params } = rendered();
+    for (const column of ['"title"', '"identifier"', '"description"', '"body"']) {
+      expect(text).toContain(column);
+    }
+    // One company_id + one pattern per branch, nothing inlined into the text.
+    expect(params.filter((param) => param === COMPANY_ID)).toHaveLength(4);
+    expect(params.filter((param) => param === CONTAINS_PATTERN)).toHaveLength(4);
+    expect(text).not.toContain(COMPANY_ID);
+    expect(text).not.toContain(CONTAINS_PATTERN);
+  });
+
+  it("preserves the escape clause and the soft-delete filter on the comment branch", () => {
+    const { sql: text } = rendered();
+    // One ESCAPE per ILIKE branch, and the escape character is a single
+    // backslash -- `containsPattern` is built by `escapeLikePattern`, so losing
+    // this turns a user-supplied `%` into a wildcard.
+    expect(text.split("ESCAPE '\\'").length - 1).toBe(4);
+    expect(text.replace(/\s+/g, " ").toLowerCase()).toContain('"deleted_at" is null');
+  });
+});
 
 describe("issue list limit helpers", () => {
   it("clamps untrusted issue-list limits to the server maximum", () => {
