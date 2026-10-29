@@ -43,6 +43,18 @@ describe("getConfigSchema", () => {
     expect(field!.default).toBe(1000);
   });
 
+  // PEN-5017: the gate decides whether the GitHub push credential lands in the
+  // agent container or in a sidecar at another uid. Before this it was settable
+  // but invisible, so a reviewer could not tell a brokered agent from an
+  // unbrokered one without reading the database.
+  it("exposes enableGitHubPublishBroker, defaulting off", () => {
+    const schema = getConfigSchema();
+    const field = schema.fields.find((f: ConfigFieldSchema) => f.key === "enableGitHubPublishBroker");
+    expect(field).toBeDefined();
+    expect(field!.type).toBe("toggle");
+    expect(field!.default).toBe(false);
+  });
+
   it("does not expose dangerouslySkipPermissions in UI schema", () => {
     const schema = getConfigSchema();
     const field = schema.fields.find((f: ConfigFieldSchema) => f.key === "dangerouslySkipPermissions");

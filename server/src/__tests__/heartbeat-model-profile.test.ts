@@ -4,6 +4,7 @@ import {
   type AdapterModelProfileDefinition,
 } from "../adapters/index.js";
 import {
+  agentScopeOnlyConfigKeyOverrides,
   mergeModelProfileAdapterConfig,
   normalizeModelProfileWakeContext,
   resolveModelProfileApplication,
@@ -299,5 +300,141 @@ describe("mergeModelProfileAdapterConfig agent-scope-only env boundary", () => {
 
     expect(merged).toEqual({ model: "primary", env: { SHARED: "issue" } });
     expect(untouched).toEqual({ model: "issue-explicit", env: { SHARED: "agent" } });
+  });
+});
+
+// PEN-5017. The env boundary above is drawn one level too low to cover a
+// TOP-LEVEL adapterConfig key. `enableGitHubPublishBroker` decides whether the
+// GitHub push credential is mounted into the agent container or into a sidecar
+// at a different uid (PEN-4933 / PEN-3183 D1); buildJobManifest reads it off
+// this merged object. The issue overlay is spread last and accepts arbitrary
+// keys, and an agent can file an issue assigned to itself, so without
+// withAgentScopedConfigProvenance the principal the boundary constrains can
+// decline it per-run — and silently, because an agent that opted out still
+// publishes perfectly well.
+//
+// These assertions are the server half of "an issue-scope override cannot
+// change the rendered broker boundary". The adapter half — the broker is
+// rendered if and only if the config it is handed carries the flag — is
+// asserted in the adapter's own job-manifest.github-publish-broker.test.ts.
+// Together they cover the path; neither alone does.
+describe("mergeModelProfileAdapterConfig agent-scope-only top-level config boundary", () => {
+  const noProfile = {
+    requested: null,
+    requestedBy: null,
+    applied: null,
+    configSource: null,
+    fallbackReason: null,
+    adapterConfig: null,
+  } as const;
+
+  // The direction that matters once D1 stage 1 sets the gate true at agent
+  // scope: opting the run back out of the broker puts the credential back in
+  // the agent's own container.
+  it("does not let an issue adapter override disable an agent-scoped publish broker", () => {
+    const merged = mergeModelProfileAdapterConfig({
+      baseConfig: { enableGitHubPublishBroker: true },
+      modelProfile: { ...noProfile },
+      issueAdapterConfig: { enableGitHubPublishBroker: false },
+    });
+
+    expect(merged.enableGitHubPublishBroker).toBe(true);
+  });
+
+  // Deleting the key is the same exploit by another route: buildJobManifest
+  // reads it with `asBoolean(config.enableGitHubPublishBroker, false)`, so an
+  // absent key is an opted-out pod.
+  it("does not let an issue adapter override delete an agent-scoped publish broker gate", () => {
+    const merged = mergeModelProfileAdapterConfig({
+      baseConfig: { enableGitHubPublishBroker: true },
+      modelProfile: { ...noProfile },
+      issueAdapterConfig: { enableGitHubPublishBroker: undefined },
+    });
+
+    expect(merged.enableGitHubPublishBroker).toBe(true);
+  });
+
+  // Both directions, as for the env keys: an override must not be able to turn
+  // the broker ON for an agent that is not running it either. That renders a
+  // sidecar and takes away the agent's credential, which fails every publish
+  // on an issue anyone can file.
+  it("does not let an issue adapter override enable a broker the agent does not run", () => {
+    const merged = mergeModelProfileAdapterConfig({
+      baseConfig: { model: "primary" },
+      modelProfile: { ...noProfile },
+      issueAdapterConfig: { enableGitHubPublishBroker: true },
+    });
+
+    expect(merged).not.toHaveProperty("enableGitHubPublishBroker");
+  });
+
+  it("does not let a model profile overlay change the publish broker gate", () => {
+    const enabled = mergeModelProfileAdapterConfig({
+      baseConfig: { enableGitHubPublishBroker: true },
+      modelProfile: {
+        ...noProfile,
+        applied: "cheap",
+        configSource: "agent_runtime",
+        adapterConfig: { enableGitHubPublishBroker: false },
+      },
+      issueAdapterConfig: null,
+    });
+    const absent = mergeModelProfileAdapterConfig({
+      baseConfig: { model: "primary" },
+      modelProfile: {
+        ...noProfile,
+        applied: "cheap",
+        configSource: "agent_runtime",
+        adapterConfig: { enableGitHubPublishBroker: true },
+      },
+      issueAdapterConfig: null,
+    });
+
+    expect(enabled.enableGitHubPublishBroker).toBe(true);
+    expect(absent).not.toHaveProperty("enableGitHubPublishBroker");
+  });
+
+  // Scoped, not blanket. `assigneeAdapterOverrides.adapterConfig` is
+  // load-bearing for model selection and workspace strategy, and this row is
+  // not a refactor of that surface.
+  it("leaves every other top-level issue override honoured", () => {
+    const merged = mergeModelProfileAdapterConfig({
+      baseConfig: { model: "primary", enableDocker: false, enableGitHubPublishBroker: true },
+      modelProfile: { ...noProfile },
+      issueAdapterConfig: { model: "issue-explicit", enableDocker: true },
+    });
+
+    expect(merged).toEqual({
+      model: "issue-explicit",
+      enableDocker: true,
+      enableGitHubPublishBroker: true,
+    });
+  });
+
+  // The guard discards rather than throws, so the dispatch path logs the
+  // attempt instead. Without a reported attempt the refusal is invisible, and
+  // an operator cannot tell a boundary that held from one never reached.
+  it("reports which overlay keys were refused, so the discard is not silent", () => {
+    expect(agentScopeOnlyConfigKeyOverrides({ enableGitHubPublishBroker: false, model: "x" }))
+      .toEqual(["enableGitHubPublishBroker"]);
+    expect(agentScopeOnlyConfigKeyOverrides({ model: "x" })).toEqual([]);
+    expect(agentScopeOnlyConfigKeyOverrides(null)).toEqual([]);
+  });
+
+  // Membership pin. The guard is a list, so it is exactly as complete as its
+  // last edit — this makes adding or removing a key a deliberate act with a
+  // diff on it rather than something a refactor can do by accident.
+  it("pins the agent-scope-only top-level key set", () => {
+    const probe = {
+      enableGitHubPublishBroker: false,
+      enableDocker: true,
+      model: "x",
+      workspaceStrategy: { type: "git_worktree" },
+      serviceAccountName: "sa",
+      image: "img",
+      env: {},
+    };
+
+    expect(agentScopeOnlyConfigKeyOverrides(probe)).toEqual(["enableGitHubPublishBroker"]);
   });
 });
