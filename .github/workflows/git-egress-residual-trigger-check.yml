@@ -1,0 +1,134 @@
+# PEN-4988. Watch §7.2 trigger 2 of the PEN-3183 git-egress boundary decision,
+# so a trigger that FIRES is NOTICED.
+#
+# WHY THIS EXISTS
+#
+# `docs/security/PEN-3183-git-egress-enforcement-boundary-decision.md` accepts a
+# residual until 2027-01-31 "unless a trigger fires early". Until this workflow,
+# NOTHING watched for one — and a trigger that fires unnoticed is the same as a
+# trigger that never fires. §2.1 of that doc already named the signal and asked
+# for exactly this: the `paperclip.io/data-mount-scope` annotation "is a cheap
+# alerting target and should be one".
+#
+# This is explicitly permitted work. §8, "Permitted without further security
+# review", lists "Alerting on the triggers in §7.2". Nothing here relaxes
+# `allowPrivilegeEscalation`, dropped capabilities or `runAsNonRoot`, adds an
+# integrity check between wrapper and scanner, or touches the credential path —
+# the §8 "not permitted" list is respected. It observes; it changes nothing.
+#
+# WHAT IT READS, AND WHY NOT THE ANNOTATION
+#
+# It queries Loki for the render-time server warn `claude_k8s.data_mount_broad_rw`,
+# NOT the Job annotation. Both are written from the same `broadDataMountReason`
+# variable a few lines apart in `buildJobManifest`, so they are two renderings of
+# one computation rather than independent evidence — and the log is the one that
+# is observable:
+#
+#   * Agent Jobs carry `ttlSecondsAfterFinished: 300`. A poll of live Jobs SAMPLES,
+#     and a broad Job that starts and finishes between two polls is never seen,
+#     with nothing in the output to say so.
+#   * The annotation is on the Job, not the Pod, so reading it needs `batch/jobs:
+#     list`. The least-privilege credential this repo's CI holds —
+#     `paperclip-ci-deploy` — has `pods: get,list` and NO batch grant (Role read
+#     2026-10-29). An annotation arm needs an RBAC change in Blockcast/onprem-k8s,
+#     which cannot land from this repo.
+#
+# The risk a log-based detector trades into is going silent if the producer stops
+# emitting, since silence reads as clear. That is covered in-repo rather than
+# trusted: the warn is pinned on all three gate legs by
+# vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.test.ts
+# ("names the reason whenever the broad rw mount is emitted"), so dropping it reds
+# CI before it can blind this check. Do not delete those tests.
+#
+# ON THE WINDOW. 90 minutes against an hourly cadence, so consecutive runs OVERLAP.
+# A window equal to the cadence leaves a gap on every minute of scheduling jitter,
+# and GitHub's cron is routinely late. Overlap costs a duplicate page on a fired
+# trigger — which Alertmanager deduplicates on stable labels — and buys the
+# guarantee that no render falls between two runs.
+#
+# ON THE CADENCE. Hourly at :59 — >=6 min from every other cron in this repo
+# (3, 9, 13, 17, 23, 33, 41, 43, 47, 53), which the guard-liveness header asks for.
+#
+# ON WHAT GOES RED. Both failure exits alert AND fail the run. The run failing is
+# the backstop, not the signal: a red scheduled run only notifies the last
+# committer. Alertmanager is the path that reaches a human.
+#
+# ON THE OWNER OF THE PAGE. The Security Engineer owns both alertnames
+# (GitEgressResidualTriggerFired, GitEgressResidualTriggerCheckUnreadable), as the
+# owner of the PEN-3183 decision record. A fired trigger ENDS the residual
+# acceptance early regardless of the calendar date and is raised to the CTO; it is
+# not folded into the PEN-4933 broker rollout. This ownership is restated in §7.2
+# of the decision doc so it survives this file.
+#
+# NO CLUSTER CREDENTIAL IS NEEDED. Loki and Alertmanager are both reached in-cluster
+# by Service DNS from the ARC runner. Do not add a kubeconfig to "improve" this —
+# the annotation arm it would enable is the weaker of the two signals, and this job
+# holding no cluster credential is a property worth keeping.
+#
+# Liveness of THIS workflow is watched: scripts/check-scheduled-guard-liveness.mjs
+# carries it in WATCHED_GUARDS at the hourly 2.75h bar.
+
+name: Git Egress Residual Trigger Check
+
+on:
+  schedule:
+    - cron: "59 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  residual-trigger:
+    runs-on: arc-paperclip-light
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      # `continue-on-error` so exit 1 (fired) and exit 2 (unreadable) both reach
+      # the alert step. An explicit `if:` without a status function still carries
+      # an implicit `success()`, so without this the job stops here and the alert
+      # -- the only part that reaches a human -- never fires. That is the exact
+      # failure this workflow exists to remove.
+      - name: Check PEN-3183 §7.2 trigger 2 (broad agent data mount)
+        id: check
+        continue-on-error: true
+        env:
+          LOKI_URL: ${{ vars.LOKI_URL || '' }}
+          WINDOW_MINUTES: ${{ vars.GIT_EGRESS_TRIGGER_WINDOW_MINUTES || '' }}
+        run: |
+          set +e
+          node scripts/check-git-egress-residual-triggers.mjs 2>&1 | tee "$RUNNER_TEMP/residual-trigger.txt"
+          echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Summarise
+        if: always()
+        run: |
+          {
+            echo "### PEN-3183 §7.2 residual trigger check"
+            echo
+            echo "Exit code: \`${{ steps.check.outputs.exit_code }}\` (0=clear, 1=TRIGGER FIRED, 2=could not run)"
+            echo
+            echo '```'
+            cat "$RUNNER_TEMP/residual-trigger.txt" 2>/dev/null || echo "(no output captured)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Exit 2 (could not read) must never be reported as clear, so it alerts under
+      # its own alertname rather than being folded into the fired one.
+      - name: Push alert to Alertmanager
+        if: steps.check.outputs.exit_code != '0'
+        env:
+          ALERTMANAGER_URL: ${{ vars.ALERTMANAGER_URL || 'http://alertmanager.monitoring.svc.cluster.local:9093' }}
+          EXIT_CODE: ${{ steps.check.outputs.exit_code }}
+          DETAIL_PATH: ${{ runner.temp }}/residual-trigger.txt
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          GH_REPO: ${{ github.repository }}
+        run: node .github/scripts/post-git-egress-residual-trigger-alert.mjs
+
+      - name: Fail the run when a trigger fired or the check could not run
+        if: steps.check.outputs.exit_code != '0'
+        run: |
+          echo "::error::git-egress residual trigger check exited ${{ steps.check.outputs.exit_code }} (1=TRIGGER FIRED, 2=could not run). See the step summary and the Alertmanager alert."
+          exit 1

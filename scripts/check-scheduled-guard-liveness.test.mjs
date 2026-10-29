@@ -1650,7 +1650,7 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
     }
   });
 
-  it("carries the five surviving PEN-3281 guards, the security control the original list missed, the clock-rot guard, the consumer merge-control guard, the deploy dispatcher, and the stranded-lock detector", () => {
+  it("carries the five surviving PEN-3281 guards, the security control the original list missed, the clock-rot guard, the consumer merge-control guard, the deploy dispatcher, the stranded-lock detector, and the git-egress residual-trigger detector", () => {
     // PEN-3916 retired adapter-pin-drift-monitor.yml, so the PEN-3281 hourly
     // cohort is five here rather than six. It watched for `ARG
     // OPENCODE_K8S_REF` rotting from outside this repo; the opencode_k8s
@@ -1664,6 +1664,15 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
         "ally-review-consistency.yml",
         "codeowners-guard.yml",
         "commit-attribution-audit.yml",
+        // PEN-4988. Watches §7.2 trigger 2 of the PEN-3183 git-egress boundary
+        // decision — an agent Job rendering a broad read-write data mount, which
+        // re-opens bypass 3 and ends that decision's residual acceptance early.
+        // Watched rather than exempt for a reason specific to it: the §7.2
+        // triggers had NO standing detector at all, which is the condition
+        // PEN-4988 was filed to remove, and this detector reads a LOG — so
+        // "producer stopped emitting" and "nothing to report" are already
+        // indistinguishable at its own query. Its liveness is what separates them.
+        "git-egress-residual-trigger-check.yml",
         "lockfile-drift-monitor.yml",
         "master-health.yml",
         "production-environment-protection-guard.yml",
