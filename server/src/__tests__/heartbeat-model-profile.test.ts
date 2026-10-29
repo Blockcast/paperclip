@@ -397,28 +397,88 @@ describe("mergeModelProfileAdapterConfig agent-scope-only top-level config bound
   // Scoped, not blanket. `assigneeAdapterOverrides.adapterConfig` is
   // load-bearing for model selection and workspace strategy, and this row is
   // not a refactor of that surface.
-  it("leaves every other top-level issue override honoured", () => {
+  it("leaves every other top-level issue override honoured when the broker is off", () => {
     const merged = mergeModelProfileAdapterConfig({
-      baseConfig: { model: "primary", enableDocker: false, enableGitHubPublishBroker: true },
+      baseConfig: { model: "primary", enableDocker: false, image: "agent-img" },
       modelProfile: { ...noProfile },
-      issueAdapterConfig: { model: "issue-explicit", enableDocker: true },
+      issueAdapterConfig: { model: "issue-explicit", enableDocker: true, image: "issue-img" },
     });
 
     expect(merged).toEqual({
       model: "issue-explicit",
       enableDocker: true,
-      enableGitHubPublishBroker: true,
+      image: "issue-img",
     });
+  });
+
+  // Pinning the gate and the broker's image stops an override choosing the
+  // code INSIDE the boundary. This stops one standing a privileged container
+  // up BESIDE it: the DinD sidecar is `privileged: true, runAsUser: 0` in the
+  // same pod as the broker, so it defeats an in-pod uid boundary without
+  // needing the credential volume mounted at all.
+  it("does not let an issue adapter override add privileged docker when the broker is on", () => {
+    const merged = mergeModelProfileAdapterConfig({
+      baseConfig: { enableGitHubPublishBroker: true },
+      modelProfile: { ...noProfile },
+      issueAdapterConfig: { enableDocker: true, dockerImage: "attacker-dind" },
+    });
+
+    expect(merged).not.toHaveProperty("enableDocker");
+    expect(merged).not.toHaveProperty("dockerImage");
+  });
+
+  // A pinned `enableDocker` with an overridable image is a pin in name only.
+  it("does not let an issue adapter override retarget docker the agent did enable", () => {
+    const merged = mergeModelProfileAdapterConfig({
+      baseConfig: {
+        enableGitHubPublishBroker: true,
+        enableDocker: true,
+        dockerImage: "docker:28-dind",
+      },
+      modelProfile: { ...noProfile },
+      issueAdapterConfig: { dockerImage: "attacker-dind" },
+    });
+
+    expect(merged.dockerImage).toBe("docker:28-dind");
+  });
+
+  // The composition pin is conditional on the AGENT-scope gate, and the
+  // predicate mirrors the adapter's strict `asBoolean`. A non-boolean is not
+  // "on" there, so it must not be "on" here — if the two drift, the
+  // composition keys silently stop being pinned for a pod the adapter does
+  // broker, which is the permissive direction.
+  it("treats a non-boolean gate as off, exactly as the adapter's asBoolean does", () => {
+    const merged = mergeModelProfileAdapterConfig({
+      baseConfig: { enableGitHubPublishBroker: "true" as unknown as boolean },
+      modelProfile: { ...noProfile },
+      issueAdapterConfig: { enableDocker: true },
+    });
+
+    expect(merged.enableDocker).toBe(true);
   });
 
   // The guard discards rather than throws, so the dispatch path logs the
   // attempt instead. Without a reported attempt the refusal is invisible, and
   // an operator cannot tell a boundary that held from one never reached.
   it("reports which overlay keys were refused, so the discard is not silent", () => {
-    expect(agentScopeOnlyConfigKeyOverrides({ enableGitHubPublishBroker: false, model: "x" }))
-      .toEqual(["enableGitHubPublishBroker"]);
-    expect(agentScopeOnlyConfigKeyOverrides({ model: "x" })).toEqual([]);
-    expect(agentScopeOnlyConfigKeyOverrides(null)).toEqual([]);
+    expect(
+      agentScopeOnlyConfigKeyOverrides({ enableGitHubPublishBroker: false, model: "x" }, {}),
+    ).toEqual(["enableGitHubPublishBroker"]);
+    expect(agentScopeOnlyConfigKeyOverrides({ model: "x" }, {})).toEqual([]);
+    expect(agentScopeOnlyConfigKeyOverrides(null, {})).toEqual([]);
+  });
+
+  // Reporting is run-dependent too: a refused `enableDocker` must be reported
+  // on a brokered run and must NOT be reported on an unbrokered one, where it
+  // was honoured. A fixed list here would misreport one of the two.
+  it("reports the composition keys as refused only on a brokered run", () => {
+    const probe = { enableDocker: true, dockerImage: "d" };
+
+    expect(agentScopeOnlyConfigKeyOverrides(probe, { enableGitHubPublishBroker: true })).toEqual([
+      "enableDocker",
+      "dockerImage",
+    ]);
+    expect(agentScopeOnlyConfigKeyOverrides(probe, {})).toEqual([]);
   });
 
   // Membership pin. The guard is a list, so it is exactly as complete as its
@@ -435,10 +495,11 @@ describe("mergeModelProfileAdapterConfig agent-scope-only top-level config bound
   // holds no credential once brokered) and never the broker. See
   // job-manifest.github-publish-broker.test.ts "broker image provenance".
   // If that adapter-side pin is ever removed, `image` belongs in this set.
-  it("pins the agent-scope-only top-level key set", () => {
+  it("pins the agent-scope-only top-level key sets", () => {
     const probe = {
       enableGitHubPublishBroker: false,
       enableDocker: true,
+      dockerImage: "d",
       model: "x",
       workspaceStrategy: { type: "git_worktree" },
       serviceAccountName: "sa",
@@ -446,6 +507,11 @@ describe("mergeModelProfileAdapterConfig agent-scope-only top-level config bound
       env: {},
     };
 
-    expect(agentScopeOnlyConfigKeyOverrides(probe)).toEqual(["enableGitHubPublishBroker"]);
+    expect(agentScopeOnlyConfigKeyOverrides(probe, {})).toEqual(["enableGitHubPublishBroker"]);
+    expect(agentScopeOnlyConfigKeyOverrides(probe, { enableGitHubPublishBroker: true })).toEqual([
+      "enableGitHubPublishBroker",
+      "enableDocker",
+      "dockerImage",
+    ]);
   });
 });
