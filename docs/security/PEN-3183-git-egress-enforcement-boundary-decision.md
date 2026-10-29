@@ -350,6 +350,7 @@ Four things a reader should not infer from that paragraph:
    §7.1, where the agent simply holds the token, and it is strictly weaker than
    "the broker cannot be made to run attacker-chosen code". Review it on the
    same date.
+
    Three things in that list are only true because of a container boundary, and
    each was wrong in the first implementation before review (#3080) caught it.
    They are recorded because the same mistake is easy to make again:
