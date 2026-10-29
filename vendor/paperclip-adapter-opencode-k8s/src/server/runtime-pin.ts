@@ -20,7 +20,7 @@
  * image's bundled binary with a loud stderr line rather than failing outright.
  */
 
-import { DEFAULT_HOOKS_DIR, hooksDirForDataMount } from "./github-git-hooks-path.js";
+import { BAKED_HOOKS_DIR, hooksDirForDataMount } from "./github-git-hooks-path.js";
 
 /** npm package that ships the OpenCode CLI. */
 export const OPENCODE_PACKAGE = "opencode-ai";
@@ -375,13 +375,21 @@ export const PRE_PUSH_HOOK_PREFLIGHT_NOT_EXECUTABLE = `${PRE_PUSH_HOOK_PREFLIGHT
  *
  * Four verdicts, each naming a different fix:
  *   ok              — executable hook where the runtime will look. Nothing to do.
- *   MASKED          — nothing at either path. The PEN-4518 shape: the mount does
- *                     not reach this pod, or the seed never ran. Check
+ *   MASKED          — nothing at either path. Both planes are broken at once:
+ *                     the image carries no baked hook AND the seeded copy is
+ *                     not visible. Check the image first, then
  *                     `ROOT_TOOLCHAIN_SUBPATHS` and `/proc/mounts`.
- *   OFF-MOUNT       — the hook is on the data volume but NOT where the runtime
- *                     looks. `persistence.mountPath` has diverged from
- *                     `DEFAULT_DATA_MOUNT_PATH`; the runtime cannot read chart
- *                     values, so it will keep looking at the default.
+ *   OFF-MOUNT       — the SEEDED hook is on the data volume but the IMAGE
+ *                     carries none, and the runtime reads the image
+ *                     (`BAKED_HOOKS_DIR`, PEN-4932). This pod is running an
+ *                     agent image from before the bake, or one whose
+ *                     `COPY --from=server` produced an empty directory. The
+ *                     fix is to roll the image forward; the chart is not
+ *                     involved. Before PEN-4932 this verdict meant a
+ *                     `persistence.mountPath` divergence, which the repoint
+ *                     retired — the name was kept because the SHAPE it
+ *                     reports is unchanged: a hook exists, but not where the
+ *                     runtime looks.
  *   NOT-EXECUTABLE  — present but without +x. The runtime's presence check is
  *                     an `X_OK` access, so this refuses pushes exactly as
  *                     MASKED does — it is not a silent unscanned-publish. The
@@ -397,12 +405,15 @@ export const PRE_PUSH_HOOK_PREFLIGHT_NOT_EXECUTABLE = `${PRE_PUSH_HOOK_PREFLIGHT
  * widen the scanner, which is what bounds every real `git` call in the Job.
  *
  * It reports presence and executability, NOT that the file is the real scanner
- * — exactly the limit `prePushHookPresent` documents, for the same reason: the
- * seed runs as uid 1000 and cannot write a file the agent could not rewrite.
+ * — exactly the limit `prePushHookPresent` documents. Note the reason given
+ * there no longer applies to the path this reads: the seeded copy is written
+ * by a uid-1000 init container and so cannot be made agent-unwritable, but the
+ * baked copy is `root:root 0755` in the image. The limit survives anyway,
+ * because presence and executability are all an `[ -x ]` test can observe.
  * Named for what it observes.
  */
 export function buildPrePushHookPreflightShell(opts: { dataMountPath: string }): string {
-  const runtimeDir = shellSingleQuote(DEFAULT_HOOKS_DIR);
+  const runtimeDir = shellSingleQuote(BAKED_HOOKS_DIR);
   const mountDir = shellSingleQuote(hooksDirForDataMount(opts.dataMountPath));
   return [
     `__pchookrt=${runtimeDir}`,
@@ -412,9 +423,9 @@ export function buildPrePushHookPreflightShell(opts: { dataMountPath: string }):
     'elif [ -e "$__pchookrt/pre-push" ]; then ' +
       `echo "${PRE_PUSH_HOOK_PREFLIGHT_NOT_EXECUTABLE} dir=$__pchookrt - a pre-push file is there but is not executable, so the egress runtime will refuse every push from this pod; restore +x on the seeded hook — the mount is fine, unlike MASKED (PEN-3156, PEN-4518)" >&2; ` +
     'elif [ -e "$__pchookmnt/pre-push" ]; then ' +
-      `echo "${PRE_PUSH_HOOK_PREFLIGHT_OFF_MOUNT} runtime=$__pchookrt data=$__pchookmnt - the hook is on the data volume but not where the egress runtime looks, which it resolves from a constant and cannot learn from chart values; pushes from this pod will be refused (PEN-4518)" >&2; ` +
+      `echo "${PRE_PUSH_HOOK_PREFLIGHT_OFF_MOUNT} runtime=$__pchookrt data=$__pchookmnt - the seeded hook is on the data volume but the agent image carries none, and the egress runtime reads the image; pushes from this pod will be refused. This pod is running an image built before the hook was baked, or one whose copy of it is empty - roll it forward rather than touching the chart (PEN-4518, PEN-4932)" >&2; ` +
     "else " +
-      `echo "${PRE_PUSH_HOOK_PREFLIGHT_MASKED} runtime=$__pchookrt data=$__pchookmnt - no pre-push hook is visible at either path, so this pod cannot publish at all; the seed writes it to the PVC and a narrowed Job pod sees an overlay, so check ROOT_TOOLCHAIN_SUBPATHS against /proc/mounts rather than the seed log (PEN-4518, BLO-32734)" >&2; ` +
+      `echo "${PRE_PUSH_HOOK_PREFLIGHT_MASKED} runtime=$__pchookrt data=$__pchookmnt - no pre-push hook is visible at either path, so this pod cannot publish at all; check the agent image first - the runtime reads the baked copy - and only then the seeded one, where a narrowed Job pod sees an overlay over the PVC so ROOT_TOOLCHAIN_SUBPATHS against /proc/mounts is the check, not the seed log (PEN-4518, PEN-4932, BLO-32734)" >&2; ` +
     "fi",
     "unset __pchookrt __pchookmnt",
   ].join("; ");

@@ -112,7 +112,7 @@ import { accessSync, constants, readdirSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { DEFAULT_HOOKS_DIR } from "./github-git-hooks-path.js";
+import { BAKED_HOOKS_DIR, DEFAULT_HOOKS_DIR } from "./github-git-hooks-path.js";
 
 import { brokerSocketPath, runPublishBrokerClient } from "./github-publish-broker-client.js";
 
@@ -138,13 +138,21 @@ import {
  * is importable from the server (this one is not — see its header, and the
  * entry block at the bottom of this file).
  */
-export { DEFAULT_HOOKS_DIR };
+export { BAKED_HOOKS_DIR, DEFAULT_HOOKS_DIR };
 
 /** The real git, for the hook's own read-only queries. */
 export const DEFAULT_GIT_BINARY = "/usr/bin/git";
 
 /**
  * The hooks directory the deployed entrypoint uses.
+ *
+ * `BAKED_HOOKS_DIR`, not `DEFAULT_HOOKS_DIR`, as of PEN-4932: the image copy,
+ * not the seeded copy on the data volume. This module re-exports both, which
+ * makes them easy to confuse at a call site; they are different paths, and
+ * only this one travels with this file. Repointing here is atomic — the
+ * hook and this code are copied in the same Docker build — whereas the volume
+ * and the image roll on independent cadences, which is what made the old
+ * arrangement a join between two planes rather than a property of one artifact.
  *
  * Takes no arguments, and reads no environment, on purpose. These were once
  * `env`-backed overrides defaulting to the constants, which is an escape hatch
@@ -161,7 +169,7 @@ export const DEFAULT_GIT_BINARY = "/usr/bin/git";
  * parameters, so tests inject directly instead of through ambient state.
  */
 export function hooksDirectory(): string {
-  return DEFAULT_HOOKS_DIR;
+  return BAKED_HOOKS_DIR;
 }
 
 /** The git binary the deployed entrypoint reads with. See `hooksDirectory`. */
@@ -194,19 +202,35 @@ export class GitEgressRuntimeError extends Error {
  * one failure mode this whole door cannot tolerate, and it is silent: nothing
  * in the output distinguishes "scanned and clean" from "never scanned".
  *
- * It matters more now that the directory is a constant rather than an override.
- * `DEFAULT_HOOKS_DIR` hardcodes `/paperclip`, while the seed writes to
- * `{{ .Values.persistence.mountPath }}` — equal in every values file today, but
- * a deployment that changed the mount path would silently publish unscanned.
- * Checking turns that from a hole into a refusal that names the missing file.
+ * The hazard it covers changed shape in PEN-4932 and did not go away. It used
+ * to be a DIVERGENCE: the runtime hardcoded `/paperclip` while the seed wrote
+ * to `{{ .Values.persistence.mountPath }}`, equal in every values file today,
+ * so a deployment that relocated the PVC would publish unscanned. The runtime
+ * now reads `BAKED_HOOKS_DIR`, which is not on the data volume and not
+ * operator-configurable, so that particular divergence is gone. What replaces
+ * it is an ARTIFACT hazard: an agent image built before the hook was baked, or
+ * one whose `COPY --from=server` silently produced an empty directory, has a
+ * runtime pointed at a path with nothing in it. Checking turns either into a
+ * refusal that names the missing file.
  *
  * This is a DEPLOYMENT check, not a tamper check, and the distinction is worth
  * keeping straight: it establishes that a hook is present and executable, not
- * that the hook is this scanner. It cannot establish the latter, and neither
- * could a content or ownership check bolted on beside it — the seed runs
- * `runAsNonRoot: true, runAsUser: 1000`, so it has no way to write a file the
- * agent cannot rewrite, and the scanner's own code is on an agent-writable
- * path regardless. See the threat model at the top of this file.
+ * that the hook is this scanner. It cannot establish the latter, and a content
+ * or ownership check bolted on beside it would not either.
+ *
+ * What PEN-4932 did change is the premise that used to make that limit total.
+ * The SEEDED copy is written by a `runAsNonRoot: true, runAsUser: 1000` init
+ * container, so it is owned by the uid the agent runs as and the seed has no
+ * way to write a file the agent could not rewrite. The BAKED copy this now
+ * reads is `root:root 0755` in the image. Measured in a live agent pod on
+ * 2026-10-29, the rest of that chain is root-owned too: the wrapper at
+ * `/usr/local/libexec/paperclip/bin/git`, that directory sitting FIRST on
+ * PATH (PEN-4682), and this file under `/opt/paperclip-bundled-adapters`.
+ *
+ * That is a real improvement and it is still not a tamper check. It bounds
+ * one route — rewriting the file the guard runs — and says nothing about the
+ * others. Do not promote this function's verdict on the strength of it; see
+ * the threat model at the top of this file.
  */
 function prePushHookPresent(hooksDir: string): boolean {
   try {
@@ -537,7 +561,7 @@ export function buildGitArgv(
   const hookPresent = options.hookPresent ?? prePushHookPresent;
   if (!hookPresent(options.hooksDir)) {
     throw new GitEgressRuntimeError(
-      `paperclip-github-egress: refusing to publish — no executable pre-push hook at \`${path.join(options.hooksDir, "pre-push")}\`, so this push could not be checked for credential-shaped material. This is a deployment fault, not something to work around: the hook is written by the chart's agent-runtime seed. Report it rather than pushing past it.`,
+      `paperclip-github-egress: refusing to publish — no executable pre-push hook at \`${path.join(options.hooksDir, "pre-push")}\`, so this push could not be checked for credential-shaped material. This is a deployment fault, not something to work around: the hook is baked into the agent image, so this pod is running an image that predates the bake or one whose copy of it is empty. Report it rather than pushing past it.`,
     );
   }
 

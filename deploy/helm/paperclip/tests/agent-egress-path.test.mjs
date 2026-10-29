@@ -420,16 +420,20 @@ test("the seed installs a pre-push hook for the guard to run", () => {
   assert.match(rendered, /--pre-push-hook/, "the seeded hook does not invoke the guard");
 });
 
-test("the seeded hooks directory is the one the runtime actually looks in", () => {
+test("the seeded hooks directory is the one the constants call the seeded one", () => {
   // The assertions above match `--pre-push-hook` and `paperclip-git-hooks` as
   // strings, which catches deletion but not DIVERGENCE — and divergence is the
-  // failure this seam actually has. The runtime hardcodes DEFAULT_HOOKS_DIR
-  // (`/paperclip/...`) while the seed writes to `${BASE}/...` from
-  // persistence.mountPath. They are equal in every values file today, so a
-  // deployment that relocated the PVC would point core.hooksPath at a directory
-  // holding no hook. `prePushHookPresent` exists to turn that into a refusal
-  // rather than a silent unscanned push; this turns it into a failing test
-  // instead, which is cheaper than discovering it in production.
+  // failure this seam actually has.
+  //
+  // READ THE NAME: as of PEN-4932 this is NOT "where the runtime looks". The
+  // runtime reads BAKED_HOOKS_DIR, the image copy, pinned by the test below.
+  // What this one still owns is the join between the seed and
+  // `hooksDirForDataMount` — the path `ROOT_TOOLCHAIN_SUBPATHS` mounts and the
+  // preflight reports as `data=` when it cannot find the baked copy. A
+  // divergence here no longer takes pushes down; it makes the preflight's
+  // OFF-MOUNT verdict point an operator at a directory nothing writes, which
+  // is a slower version of the same PEN-4518 failure. This whole test goes
+  // away with the seed, in the step that drops `ROOT_TOOLCHAIN_SUBPATHS`.
   const rendered = render("templates/statefulset.yaml", {});
 
   const base = rendered.match(/^\s*BASE=(?:"([^"]*)"|'([^']*)'|(\S+))\s*$/m);
@@ -459,10 +463,9 @@ test("the seeded hooks directory is the one the runtime actually looks in", () =
   assert.equal(
     seeded,
     `${declaredBase[1]}/${declaredSub[1]}`,
-    "the seed writes the pre-push hook somewhere the runtime will not look",
+    "the seed writes the pre-push hook somewhere the Job manifest does not mount it and the preflight will not report it",
   );
 });
-
 // --- Fail closed on overrides that would take the scrubber off the path ----
 
 test("a PATH entry in env.extra is rejected rather than silently overriding the chart", () => {
@@ -1387,6 +1390,33 @@ test("the git-config surface predicates actually fire (PEN-4541 positive control
 // a test deriving it from one of them could not catch the other drifting.
 const IMAGE_HOOKS_DIR = "/usr/local/libexec/paperclip/hooks";
 const HOOK_SOURCE_PATH = "docker/github-hooks/pre-push";
+
+test("the directory the runtime reads is the directory the images write", () => {
+  // PEN-4932's join, and the one that can take the fleet down: `hooksDirectory()`
+  // returns BAKED_HOOKS_DIR, and nothing but this test says that string is the
+  // same one the two Dockerfiles COPY to. If they part, every pod refuses every
+  // push — the runtime fails closed on a missing hook (PEN-4518, BLO-48361), so
+  // the cost of the drift is a fleet-wide publishing outage, not a silent one.
+  //
+  // `IMAGE_HOOKS_DIR` is deliberately a literal restated near the Dockerfile
+  // assertions (see the comment on its declaration); this reads the TypeScript
+  // side out of source for the same reason the seed join does — a test holding
+  // both ends of an equality as literals cannot observe either end move.
+  const pathSource = fs.readFileSync(
+    path.join(repoRoot, "packages/adapter-utils/src/github-git-hooks-path.ts"),
+    "utf8",
+  );
+  const declaredBaked = pathSource.match(/BAKED_HOOKS_DIR\s*=\s*"([^"]+)"/);
+  assert.ok(
+    declaredBaked,
+    "could not read BAKED_HOOKS_DIR from github-git-hooks-path.ts — keep it a plain `= \"literal\"` a regex can read, as the header of that file asks",
+  );
+  assert.equal(
+    declaredBaked[1],
+    IMAGE_HOOKS_DIR,
+    "the egress runtime reads a hooks directory the agent image does not write — every push in the fleet would be refused",
+  );
+});
 
 /** The hook body the chart seed writes, dedented the way the YAML parser will.
  *
