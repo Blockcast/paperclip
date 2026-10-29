@@ -274,14 +274,33 @@ grounds:
   either**; it requires only that something invoke git by absolute path. For the *deliberate*
   threat that is a low bar, but it is also the threat this control never claimed to cover and that
   PEN-3183 exists to close; accepting it is accepting the status quo ante, not a new exposure.
-- The real uncertainty is therefore the **accidental** absolute-path caller (§4.0), and it is
-  **unmeasured**. The CEO asked for exactly that count on 2026-09-11 and it has not been collected.
+- The real uncertainty is therefore the **accidental** absolute-path caller (§4.0). The CEO asked
+  for exactly that count on 2026-09-11; it was collected on 2026-10-29 (PEN-4986) and it is
+  **zero**. See below — that bullet is no longer an assumption.
 
-**This acceptance is explicitly conditional on that count.** It is accepted on the expectation that
-absolute-path `git` invocations are rare-to-absent in the fleet; a non-zero count falsifies the
-first ground above and ends the acceptance early (§7.2 trigger 4). The honest reading is that D5
-rests on an untested assumption, named here rather than buried, with the test that would settle it
-scheduled as the cheapest item in §8.
+**This acceptance is explicitly conditional on that count, and the count has now been taken.**
+Measured 2026-10-29 (PEN-4986; method, controls and limits in
+[`PEN-4986-absolute-path-git-runtime-measurement.md`](./PEN-4986-absolute-path-git-runtime-measurement.md)):
+**zero** invocations reached `/usr/bin/git` without transiting the wrapper — 54 observations,
+all of them wrapped — across a 22.1-minute window of representative agent work in a live
+agent pod on image `sha-ed39009-k8s-vendored`. The instrument was proved able to see the opposite:
+a deliberate unwrapped invocation was classified correctly, and its catch rate on the
+shortest-lived invocation class measured 0.93. Separately, an image- and harness-wide census found
+**no** `/usr/bin/git` exec site outside the egress-control machinery itself.
+
+**§7.2 trigger 4 has not fired, and the acceptance stands unchanged.** What has changed is that the
+first ground above rests on a measurement rather than an expectation — with one qualification,
+which replaces the old one rather than removing it. The evidence splits in two: the
+**fleet-constant** half, what the image and harness themselves run, is zero *by census* and
+generalises across the fleet because the image is common to every agent pod; the **fleet-variable**
+half, what an agent composes into a shell at runtime, is zero *in the one pod measured*. So the
+assumption is tested, not yet a fleet census, and this is a point measurement — re-take it whenever
+the agent image or the PATH layout changes.
+
+One finding is worth more than the count itself: **no exec-level telemetry is deployed anywhere in
+the cluster**, so nothing would currently report trigger 4 firing in another pod. Standing alerting
+on the §7.2 triggers is already permitted by §8 without further security review, and is the cheapest
+remaining improvement here.
 
 ⚠ **Status, 2026-10-28 (PEN-4933):** D1 is **built** and merged behind a
 default-off rollout gate; see §7.3. The residual statement above still describes
@@ -578,6 +597,10 @@ Permitted without further security review:
   one this control exists for — is uncovered, falsifies the first ground of §7.1, and ends the
   §7.2 acceptance early rather than merely "raising urgency". A zero count leaves this decision
   unchanged and converts §7.1's stated assumption into a measured one.
+  ✅ **Taken 2026-10-29 (PEN-4986): zero.** See §7.1 and
+  [`PEN-4986-absolute-path-git-runtime-measurement.md`](./PEN-4986-absolute-path-git-runtime-measurement.md).
+  The tool is `scripts/measure-absolute-path-git.mjs`; re-take it on any agent-image or PATH
+  change, and note the result is one pod, so widening the population stays permitted here.
 
 Not permitted without returning here first:
 
