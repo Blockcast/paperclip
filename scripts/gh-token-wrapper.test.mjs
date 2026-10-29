@@ -103,7 +103,10 @@ function runWrapper(dir, { tokenFileContent, tokenValue, args = ["api", "user"] 
 // the compiled-in-default branch that must stay lenient for non-agent callers.
 // extraEnv is applied after sanitizing, for tests whose premise includes a
 // caller-supplied credential.
-function spawnWrapper(dir, { tokenFileContent, args = ["api", "user"], setTokenFileVar = true, extraEnv = {} } = {}) {
+function spawnWrapper(
+  dir,
+  { tokenFileContent, args = ["api", "user"], setTokenFileVar = true, extraEnv = {}, input } = {},
+) {
   const stubGhPath = path.join(dir, "gh.real");
   writeFileSync(stubGhPath, STUB_GH_SOURCE);
   chmodSync(stubGhPath, 0o755);
@@ -134,7 +137,11 @@ function spawnWrapper(dir, { tokenFileContent, args = ["api", "user"], setTokenF
     );
   }
 
-  return spawnSync("sh", [WRAPPER, ...args], { env, encoding: "utf8" });
+  // `input` is passed through only when a caller asks for it, so every existing
+  // caller keeps spawnSync's default (an inherited/empty stdin). It exists for
+  // the credential-helper tests below, which must feed the wrapper exactly what
+  // git feeds a helper rather than approximating it.
+  return spawnSync("sh", [WRAPPER, ...args], { env, encoding: "utf8", ...(input === undefined ? {} : { input }) });
 }
 
 test("exports GH_TOKEN/GITHUB_TOKEN from a fresh token file and execs through", () => {
@@ -567,6 +574,135 @@ test("Dockerfile.runtime points git's credential helper at the wrapper, not gh.r
   // through to prompting for a username.
   assert.equal(helper[1], "!/usr/bin/gh auth git-credential");
   assert.doesNotMatch(helper[1], /gh\.real/);
+});
+
+// ---------------------------------------------------------------------------
+// PEN-4933 / PEN-3183 §5 — THE STARVATION ASSERTION.
+//
+// §5 requires that /etc/gitconfig's system credential helper be *shown* to
+// starve once the push credential leaves the agent container, explicitly not
+// assumed: git treats a credential helper's non-zero exit as "no credential"
+// and carries on, so a broken boundary here fails SILENTLY IN THE PERMISSIVE
+// DIRECTION. There is no error anywhere — `git push` simply authenticates.
+//
+// The claim is about a bare `/usr/bin/git push` from uid 1000, i.e. PEN-3183's
+// surviving bypass 4: a caller-chosen PATH misses the egress wrappers entirely,
+// so NOTHING on the docker/github-wrappers/ path participates. The chain that
+// does run is four links, and the claim holds only if every one of them does:
+//
+//   A. /etc/gitconfig names `!/usr/bin/gh auth git-credential`
+//      -> pinned by the Dockerfile.runtime test directly above (BLO-18484).
+//   B. /usr/bin/gh IS this wrapper (a symlink to gh-token-wrapper.sh), not the
+//      upstream binary moved aside as gh.real
+//      -> pinned below. Link A alone does NOT give you this: the helper string
+//         stays byte-identical if /usr/bin/gh is reverted to the real binary.
+//   C. the wrapper refuses, rather than falling through to ambient auth, when
+//      PAPERCLIP_GITHUB_TOKEN_FILE is set and the file is absent
+//      -> that refusal is pinned by the BLO-37977 tests above; the composed
+//         form, with git's own stdin protocol, is pinned below.
+//   D. the brokered agent container still SETS PAPERCLIP_GITHUB_TOKEN_FILE
+//      while not mounting the Secret
+//      -> pinned in vendor/paperclip-adapter-claude-k8s/src/server/
+//         job-manifest.github-publish-broker.test.ts ("gives the agent a socket
+//         to ask over, and nothing that resembles a token").
+//
+// C and D are a PAIR and either half passes alone while the pair is broken.
+// Removing the mount and the variable together reads like tidying up — the
+// variable points at a path that no longer exists, so deleting it looks
+// correct — and it flips link C from refuse to fall-back-to-unwrapped-auth.
+// The positive control at the end of this block is what makes D load-bearing:
+// it pins that an unset variable really does re-authenticate, so D is not
+// decoration.
+//
+// ⚠ Correction of record: PEN-3183 §7.3's "expected mechanism" paragraph names
+// docker/github-wrappers/paperclip-github-token-env as the binary that starves.
+// It is not on this path. That file installs to /usr/local/libexec/paperclip/
+// bin/ (Dockerfile:674) and is reached through PATH — which is precisely what
+// bypass 4 sidesteps. The decisive conjunct is TOKEN_FILE_REQUIRED in this
+// wrapper (gh-token-wrapper.sh), reached via link B. An assertion written
+// against the documented mechanism would pin the wrong file and stay green
+// while the real chain broke.
+// ---------------------------------------------------------------------------
+
+test("link B: /usr/bin/gh is this wrapper, not the real binary (PEN-3183 §5)", () => {
+  const dockerfile = readFileSync(path.join(import.meta.dirname, "..", "Dockerfile.runtime"), "utf8");
+
+  // The upstream binary must be moved aside...
+  assert.match(
+    dockerfile,
+    /mv\s+\/usr\/bin\/gh\s+\/usr\/bin\/gh\.real/,
+    "Dockerfile.runtime must move the upstream gh aside as /usr/bin/gh.real",
+  );
+  // ...and /usr/bin/gh must be this wrapper. Without this, the helper string
+  // asserted above resolves to a binary that never reads the token file and
+  // never refuses, and the starvation claim is false with every other test in
+  // this file still green.
+  assert.match(
+    dockerfile,
+    /ln\s+-s\s+\/usr\/bin\/gh-token-wrapper\.sh\s+\/usr\/bin\/gh\b/,
+    "/usr/bin/gh must be a symlink to gh-token-wrapper.sh",
+  );
+});
+
+test("link C composed: the system credential helper returns no credential when the mount is gone (PEN-3183 §5)", () => {
+  // Exactly what git runs and exactly what git writes to it. git invokes the
+  // helper with the `get` operation and feeds a request on stdin, then reads
+  // `username=`/`password=` back off stdout. Approximating this with an
+  // arbitrary `gh` subcommand would assert a refusal git never performs.
+  withTempDir((dir) => {
+    const proc = spawnWrapper(dir, {
+      args: ["auth", "git-credential", "get"],
+      input: "protocol=https\nhost=github.com\n\n",
+    });
+
+    assert.equal(proc.status, 64, proc.stderr);
+    assert.match(proc.stderr, /is absent; refusing to run with ambient auth/);
+
+    // The assertion that IS the starvation claim: git consumes stdout, so what
+    // matters is that no credential appears there. Checked as the specific keys
+    // git parses as well as emptiness, because a future change that made the
+    // wrapper chatty on stdout would weaken the blanket check without anyone
+    // noticing it had.
+    assert.equal(proc.stdout, "");
+    assert.doesNotMatch(proc.stdout, /^password=/m);
+    assert.doesNotMatch(proc.stdout, /^username=/m);
+
+    // And it starved without reaching the real binary at all — which is also
+    // what closes the second fallback §7.3 names, a stale ~/.config/gh/
+    // hosts.yml: gh.real is the only thing that would read it, and gh.real did
+    // not run. (STUB_GH_SOURCE always prints, so empty stdout proves this.)
+  });
+});
+
+test("link D is load-bearing: unsetting PAPERCLIP_GITHUB_TOKEN_FILE re-authenticates the helper (PEN-3183 §5)", (t) => {
+  // The positive control for the C/D pair. This is the failure mode to guard:
+  // remove the Secret mount AND the variable together and the wrapper stops
+  // refusing. If this test ever goes red because the wrapper refuses with the
+  // variable unset, that is a BEHAVIOUR CHANGE in the wrapper's non-agent
+  // contract, not a security regression — read it against the
+  // "still falls back to the real binary ... (non-agent image use)" test above
+  // before changing anything here.
+  //
+  // Skipped inside an agent pod for the same reason that one is: with the
+  // variable unset the wrapper falls through to the compiled-in default, which
+  // holds the live bot token there, and the stub gh prints GH_TOKEN to stdout.
+  if (existsSync(COMPILED_IN_DEFAULT_TOKEN_FILE)) {
+    t.skip(`${COMPILED_IN_DEFAULT_TOKEN_FILE} exists; refusing to read a live credential`);
+    return;
+  }
+  withTempDir((dir) => {
+    const proc = spawnWrapper(dir, {
+      args: ["auth", "git-credential", "get"],
+      input: "protocol=https\nhost=github.com\n\n",
+      setTokenFileVar: false,
+    });
+
+    // Reached the real binary: no refusal, and the stub ran. That is the
+    // permissive branch link D exists to keep the fleet out of.
+    assert.equal(proc.status, 0, proc.stderr);
+    assert.match(proc.stdout, /ARGS=auth git-credential get/);
+    assert.doesNotMatch(proc.stderr, /refusing to run with ambient auth/);
+  });
 });
 
 // BLO-25702: `gh auth setup-git` resolves its OWN on-disk path (via
