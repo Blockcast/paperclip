@@ -310,24 +310,49 @@ PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verificati
    image in the same change. Only after 1–2; this is the step that actually retires the
    cross-agent mount, and the first step that can break a running agent.
 
-   ⚠️ **The gate is TWO-SIDED, and the two planes roll independently — measured 5h45m apart.**
-   This matters for the 3b split below and was not stated when the split was made. The
-   `ROOT_TOOLCHAIN_SUBPATHS` repoint is **server-side** (`paperclip-api` builds the Job manifest);
-   the hook file is **image-side** (the agent image). Measured 2026-10-29 from a live pod:
+   ⚠️ **Two planes roll independently — measured 5h45m apart — but they do NOT both bear on
+   3b-ii.** An earlier revision of this section said they did; that was wrong, and which stage
+   carries the skew hazard is the whole point of the 3b split, so it is corrected here rather than
+   silently reworded.
 
-   | plane | running version | vs #3104 (merged 13:13:08Z) |
+   | plane | ships | rolls |
    |---|---|---|
-   | `paperclip-api` — builds the Job manifest | pods ~9 h old, started ~08:25Z | ~4h48m **before** it merged |
-   | agent image `paperclip-agent:sha-1dd8e90` | commit 13:08:04Z | **5 min before** it merged |
+   | `paperclip-api` — builds the Job manifest (`job-manifest.ts`, `ROOT_TOOLCHAIN_SUBPATHS`) | server | daily, 07:23 UTC |
+   | agent image — baked hook file **and** the egress runtime that looks for it | agent image | per master commit, auto-bumped |
 
-   A server carrying the repoint can therefore roll while agent images still lag, and the result is
-   the §3.6 refusal on every push in the fleet — PEN-4518's shape, arrived at from the safe
-   direction, still an outage. So the gate is **both planes verified by property in a running pod**:
-   never a merge, and never one plane. Concretely, before 3b-ii: #3117 merged, **and** an agent
-   image built from a commit containing it, **and** `/usr/local/libexec/paperclip/hooks/pre-push`
-   present in a **freshly created** pod. Baseline recorded 2026-10-29: that path is **absent**,
-   while `/usr/local/libexec/paperclip/bin/` (the PEN-3840 wrapper precedent) exists `root:root
-   0755`, confirming the ownership model the `COPY` produces.
+   Measured 2026-10-29 from a live pod: `paperclip-api` pods ~9 h old (started ~08:25Z, i.e. ~4h48m
+   *before* #3104 merged at 13:13:08Z), while agent image `paperclip-agent:sha-1dd8e90` was built
+   from a commit 5 min before it. The skew is real. The error was attributing it to the wrong stage.
+
+   **3b-ii does not straddle the two planes.** Its repoint is `DEFAULT_HOOKS_DIR` /
+   `hooksDirectory()` in `packages/adapter-utils`, and that code does not run in `paperclip-api` on
+   the push path — the agent's `git` is a wrapper (`docker/github-wrappers/git`) that `exec`s
+   `/opt/paperclip-bundled-adapters/node_modules/@paperclipai/adapter-utils/dist/github-git-egress-runtime.js`
+   *inside the agent pod*. That bundle is compiled **from this working tree** during the image build
+   (`Dockerfile`: vendor stage `npx tsc` → `npm pack` → `/vendor/adapter-utils.tgz` → `npm install
+   --prefix /opt/paperclip-bundled-adapters`), and `Dockerfile.agent:27/:33` copy both it and
+   `/usr/local/libexec/paperclip/hooks` `--from=server`. **So the repoint and the file it points at
+   are the same artifact, built by the same Docker run.** A pod has both or neither; it cannot have
+   the repoint without the file. Verified 2026-10-29 in a running pod: that `dist/` carries the
+   current PVC constant `".local/share/paperclip-git-hooks"`, `root:root`.
+
+   3b-ii's gate is therefore a **verification** gate, not a plane-skew one, and it is weaker and
+   satisfiable the same day: prove the `COPY` actually produced an *executable* `pre-push` in a real
+   agent image before anything relies on it. A silently-empty bake (wrong path, `.dockerignore`,
+   `--exclude` semantics) would make §3.6's refusal fire on every push. Concretely: #3117 merged
+   (`968a684`, 2026-10-29 19:00:10Z), **and** an agent image built from a commit containing it,
+   **and** `/usr/local/libexec/paperclip/hooks/pre-push` present and `X_OK` in a **freshly created**
+   pod. Baseline recorded 2026-10-29: that path is **absent**, while
+   `/usr/local/libexec/paperclip/bin/` (the PEN-3840 wrapper precedent) exists `root:root 0755`,
+   confirming the ownership model the `COPY` produces.
+
+   **The skew hazard belongs to 3b-iii**, which removes the `ROOT_TOOLCHAIN_SUBPATHS` entry. That is
+   the server-side half, and it is the one that can race: a `paperclip-api` that has stopped
+   mounting the PVC hooks subPath, in front of agent images that still look there, strands pods with
+   no hook at the resolved path and refuses every push. That is exactly PEN-4518 — consumer 3 quietly
+   stopped making the file visible while consumer 2 kept looking for it (§ top of this file). So
+   3b-iii, not 3b-ii, is the step gated on **both** planes verified by property in a running pod, and
+   the PVC fallback 3b-ii installs is what spans the window between them.
 
    **`paperclip-api` ships once a day, at 07:23 UTC** — the hourly cron is sampling-only and cannot
    ship. A change merged after that slot is not fleet-visible until the next one, so a server-plane
