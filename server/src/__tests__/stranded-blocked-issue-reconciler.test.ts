@@ -749,6 +749,17 @@ describeEmbeddedPostgres("reconcileStrandedBlockedIssues", () => {
     expect(posted[0].body).toContain("external action:");
     expect(posted[0].body).toContain("description");
     expect(posted[0].body).toContain("stranded-blocked-issue reconciler");
+    // PEN-5065: the remedy is incomplete without the status. Every reader of the
+    // declaration is scoped to `blocked`, and this announcement fires as the row
+    // leaves it — so an assignee who adds the two lines and stops has written
+    // something inert. Pinned because the two halves regress independently: the
+    // assertions above pass just as happily on a body that teaches the lines and
+    // never mentions where the row has to be standing for them to count.
+    expect(posted[0].body).toContain("Set the status back to `blocked`");
+    expect(posted[0].body).toContain("read only on a `blocked` row");
+    // Name the escape hatch too, or the guidance reads as "always re-block",
+    // which is wrong for a row that still has agent work on it.
+    expect(posted[0].body).toContain("parkedUntil");
 
     // A sweep that flips nothing announces nothing.
     expect((await reconcileStrandedBlockedIssues(db)).reconciled).toBe(0);
