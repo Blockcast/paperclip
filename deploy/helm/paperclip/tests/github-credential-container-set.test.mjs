@@ -119,11 +119,18 @@ const CREDENTIAL_MOUNT_RE = /^\/etc\/paperclip\/secrets\/github-[a-z0-9-]*token$
 // the credential path defeats a name-only one.
 const CREDENTIAL_SECRET_RE = /^paperclip-github-[a-z0-9-]*token$/;
 
-// Env routes. `PAPERCLIP_GITHUB_TOKEN_FILE` is a POINTER, not a credential —
-// under the PEN-4933 broker the agent keeps it with no mount behind it, which
-// is intended. The remaining four carry a credential VALUE; §7.4 decided they
-// stay refused rather than routed. Both kinds are reported, separately, so a
-// red says which route moved.
+// Env routes BY NAME. `PAPERCLIP_GITHUB_TOKEN_FILE` is a POINTER, not a
+// credential — under the PEN-4933 broker the agent keeps it with no mount
+// behind it, which is intended. The remaining four carry a credential VALUE;
+// §7.4 decided they stay refused rather than routed.
+//
+// ⚠ Matching env routes by NAME alone is not enough, and a name list is the
+// wrong shape for the cheapest widening: a `secretKeyRef` to the credential
+// Secret works under ANY variable name, so a container could hold the token as
+// `MY_TOKEN` and be invisible to this list. The `secretRefs` bucket below
+// closes that by matching the referenced SECRET instead of the variable name.
+// Raised by review on #3103; the first draft of this file gave a green for all
+// three of the routes that bucket now covers.
 const CREDENTIAL_ENV_POINTERS = ["PAPERCLIP_GITHUB_TOKEN_FILE"];
 const CREDENTIAL_ENV_VALUES = [
   "GH_TOKEN",
@@ -141,22 +148,66 @@ function coversCredentialPath(mountPath, credentialPaths) {
 }
 
 /**
+ * Routes that name the credential SECRET rather than a path or a variable name.
+ *
+ * Three of them, and all three were green in the first draft of this file:
+ *
+ *   env[].valueFrom.secretKeyRef  — the token under any variable name at all,
+ *                                   which is why a name list cannot see it;
+ *   envFrom[].secretRef           — every key of the Secret, under names
+ *                                   nothing here ever observes;
+ *   (projected volumes are handled in `secretByVolume`, not here.)
+ *
+ * Reported as `NAME -> secret` / `envFrom -> secret` so a failure says which
+ * binding appeared rather than only that the count changed.
+ */
+function secretRefRoutes(container) {
+  const routes = [];
+  for (const entry of container.env ?? []) {
+    const secret = entry?.valueFrom?.secretKeyRef?.name;
+    if (typeof secret === "string" && CREDENTIAL_SECRET_RE.test(secret)) {
+      routes.push(`${entry.name} -> ${secret}`);
+    }
+  }
+  for (const source of container.envFrom ?? []) {
+    const secret = source?.secretRef?.name;
+    if (typeof secret === "string" && CREDENTIAL_SECRET_RE.test(secret)) {
+      routes.push(`envFrom -> ${secret}`);
+    }
+  }
+  return routes.sort();
+}
+
+/**
  * Container -> the github.com credential routes it receives, across the whole
  * rendered chart, keyed so a human can read the answer off a failure message.
  */
 function credentialRoutes(rendered) {
-  const docs = documents(rendered);
+  return routesFromDocuments(documents(rendered));
+}
+
+/** The walker proper, split out so it can be driven from a synthetic manifest. */
+function routesFromDocuments(docs) {
   const routes = {};
 
   for (const doc of docs) {
     const workload = `${doc.kind}/${doc.metadata?.name ?? "<unnamed>"}`;
     for (const podSpec of podSpecsIn(doc)) {
-      // volumeMount name -> Secret name, for the secretName half of the check.
-      const secretByVolume = new Map(
-        (podSpec.volumes ?? [])
-          .filter((volume) => volume?.secret?.secretName)
-          .map((volume) => [volume.name, volume.secret.secretName]),
-      );
+      // volumeMount name -> the Secret names it exposes, for the secretName
+      // half of the check. A `projected` volume is included: its sources carry
+      // the same Secret under a different key, so a projected credential
+      // mounted at a non-credential path would otherwise be invisible to both
+      // the path matcher and a `.secret.secretName`-only lookup.
+      const secretByVolume = new Map();
+      for (const volume of podSpec.volumes ?? []) {
+        const names = [
+          volume?.secret?.secretName,
+          ...(volume?.projected?.sources ?? []).map((source) => source?.secret?.name),
+        ].filter((name) => typeof name === "string");
+        if (names.length > 0) secretByVolume.set(volume.name, names);
+      }
+      const volumeExposesCredential = (name) =>
+        (secretByVolume.get(name) ?? []).some((secret) => CREDENTIAL_SECRET_RE.test(secret));
       // Every path in THIS pod at which a credential is mounted. Collected per
       // pod so the ancestor check below has something concrete to compare
       // against, rather than assuming the literal path is the one in use.
@@ -165,10 +216,7 @@ function credentialRoutes(rendered) {
         for (const container of podSpec[kind] ?? []) {
           for (const mount of container.volumeMounts ?? []) {
             const normalized = mount.mountPath.replace(/\/+$/, "") || "/";
-            if (
-              CREDENTIAL_MOUNT_RE.test(normalized) ||
-              CREDENTIAL_SECRET_RE.test(secretByVolume.get(mount.name) ?? "")
-            ) {
+            if (CREDENTIAL_MOUNT_RE.test(normalized) || volumeExposesCredential(mount.name)) {
               credentialPaths.push(normalized);
             }
           }
@@ -181,17 +229,25 @@ function credentialRoutes(rendered) {
             .filter(
               (mount) =>
                 coversCredentialPath(mount.mountPath, credentialPaths) ||
-                CREDENTIAL_SECRET_RE.test(secretByVolume.get(mount.name) ?? ""),
+                volumeExposesCredential(mount.name),
             )
             .map((mount) => mount.mountPath.replace(/\/+$/, "") || "/");
           const declared = (container.env ?? []).map((entry) => entry.name);
           const pointers = CREDENTIAL_ENV_POINTERS.filter((name) => declared.includes(name));
           const values = CREDENTIAL_ENV_VALUES.filter((name) => declared.includes(name));
-          if (mounts.length === 0 && pointers.length === 0 && values.length === 0) continue;
+          const secretRefs = secretRefRoutes(container);
+          if (
+            mounts.length === 0 &&
+            pointers.length === 0 &&
+            values.length === 0 &&
+            secretRefs.length === 0
+          )
+            continue;
           routes[`${workload} :: ${kind}/${container.name}`] = {
             mounts: [...new Set(mounts)].sort(),
             pointers: pointers.sort(),
             values: values.sort(),
+            secretRefs,
           };
         }
       }
@@ -218,16 +274,19 @@ const EXPECTED_BLOCKCAST_ROUTES = {
     mounts: [MERGE_TOKEN, TOKEN],
     pointers: ["PAPERCLIP_GITHUB_TOKEN_FILE"],
     values: [],
+    secretRefs: [],
   },
   "StatefulSet/paperclip :: initContainers/seed": {
     mounts: [MERGE_TOKEN, TOKEN],
     pointers: [],
     values: [],
+    secretRefs: [],
   },
   "StatefulSet/paperclip :: containers/paperclip": {
     mounts: [MERGE_TOKEN, TOKEN],
     pointers: ["PAPERCLIP_GITHUB_TOKEN_FILE"],
     values: [],
+    secretRefs: [],
   },
 };
 
@@ -294,4 +353,96 @@ test("podSpecsIn finds a pod template nested the way a CronJob nests one", () =>
     podSpecsIn(cronJob).map((spec) => spec.containers[0].name),
     ["c"],
   );
+});
+
+test("the walker sees the three Secret-named routes that do not name a credential path", () => {
+  // Raised by review on #3103. The first draft of this file matched mounts by
+  // path or by `volumes[].secret.secretName`, and env routes by VARIABLE NAME.
+  // All three shapes below were green under that draft, and each is a complete
+  // route to the token: the kubelet resolves a `secretKeyRef` into the
+  // container's environment regardless of what the variable is called, an
+  // `envFrom` injects every key of the Secret under names nothing observes, and
+  // a `projected` volume carries the same Secret to any path at all.
+  //
+  // Not hypothetical for agent Jobs: `k8s-client.ts` captures the Deployment's
+  // `valueFrom` entries and allowlisted `envFrom` sources — filtered only by
+  // env NAME — and `job-manifest.ts` emits them into the agent container.
+  //
+  // Driven from a synthetic manifest because this chart renders none of the
+  // three today. Asserting their absence from the real render would pass with
+  // the detector removed; this fails if the detector stops seeing them.
+  const synthetic = {
+    kind: "Deployment",
+    metadata: { name: "synthetic" },
+    spec: {
+      template: {
+        spec: {
+          volumes: [
+            {
+              name: "projected-cred",
+              projected: { sources: [{ secret: { name: "paperclip-github-mcp-token" } }] },
+            },
+          ],
+          containers: [
+            {
+              name: "by-secret-key-ref",
+              // Deliberately NOT one of CREDENTIAL_ENV_VALUES: the whole point
+              // is that the variable may be called anything.
+              env: [
+                {
+                  name: "MY_TOKEN",
+                  valueFrom: { secretKeyRef: { name: "paperclip-github-mcp-token", key: "token" } },
+                },
+              ],
+            },
+            {
+              name: "by-env-from",
+              envFrom: [{ secretRef: { name: "paperclip-github-merge-token" } }],
+            },
+            {
+              name: "by-projected-volume",
+              // Mounted far away from /etc/paperclip/secrets, so only the
+              // Secret-name half can see it.
+              volumeMounts: [{ name: "projected-cred", mountPath: "/tmp/anywhere" }],
+            },
+            {
+              // Negative control: a non-credential Secret by every route.
+              name: "unrelated",
+              env: [
+                {
+                  name: "OTHER",
+                  valueFrom: { secretKeyRef: { name: "gbrain-authbot-service-key", key: "k" } },
+                },
+              ],
+              envFrom: [{ secretRef: { name: "paperclip-github-app-creds" } }],
+            },
+          ],
+        },
+      },
+    },
+  };
+
+  assert.deepEqual(routesFromDocuments([synthetic]), {
+    "Deployment/synthetic :: containers/by-secret-key-ref": {
+      mounts: [],
+      pointers: [],
+      values: [],
+      secretRefs: ["MY_TOKEN -> paperclip-github-mcp-token"],
+    },
+    "Deployment/synthetic :: containers/by-env-from": {
+      mounts: [],
+      pointers: [],
+      values: [],
+      secretRefs: ["envFrom -> paperclip-github-merge-token"],
+    },
+    "Deployment/synthetic :: containers/by-projected-volume": {
+      mounts: ["/tmp/anywhere"],
+      pointers: [],
+      values: [],
+      secretRefs: [],
+    },
+    // `unrelated` is absent: the App creds are a control-plane credential kept
+    // out of scope here on purpose (see the header), and the authbot key is
+    // not a github.com credential at all.
+  });
 });
