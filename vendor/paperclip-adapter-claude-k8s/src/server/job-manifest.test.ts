@@ -5079,6 +5079,49 @@ describe("scoped writable mounts (BLO-32734)", () => {
     expect(seed?.securityContext?.runAsUser).toBe(0);
   });
 
+  // PEN-4932 stage 4a. The seeder makes a foreign claim START, which is the
+  // point — but it cannot POPULATE the two trees only the server materializes,
+  // and only ever into the server's own volume. Both then fail far from the
+  // cause: empty git-hooks fails every push closed (BLO-48361), empty
+  // `skills/<company>` dangles the prompt bundle's skill links silently.
+  it("names the unpopulated trees when the Job's claim is not the server's own", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const ctx = isolatedCtx();
+      ctx.config.workspaceVolumeClaim = "some-other-claim";
+      const { job } = buildJobManifest({ ctx, selfPod: makeSelfPod({ pvcClaimName: "paperclip-data" }) });
+      const entries = warn.mock.calls
+        .map(([line]) => (typeof line === "string" && line.startsWith("{") ? JSON.parse(line) : null))
+        .filter((entry) => entry?.event === "claude_k8s.data_claim_foreign");
+      expect(entries).toHaveLength(1);
+      expect(entries[0]).toMatchObject({
+        level: "warn",
+        dataClaimName: "some-other-claim",
+        selfPvcClaimName: "paperclip-data",
+        jobName: job.metadata?.name,
+      });
+      // Named explicitly rather than described in prose: these are the paths
+      // stage 4b has to materialize or relocate.
+      expect(entries[0]?.unpopulatedSubPaths).toContain(".local/share/paperclip-git-hooks");
+      expect(entries[0]?.unpopulatedSubPaths).toContain("instances/default/skills/co1");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("stays silent on the server's own claim, where both trees are already populated", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      buildJobManifest({ ctx: isolatedCtx(), selfPod: makeSelfPod() });
+      const foreign = warn.mock.calls
+        .map(([line]) => (typeof line === "string" && line.startsWith("{") ? JSON.parse(line) : null))
+        .filter((entry) => entry?.event === "claude_k8s.data_claim_foreign");
+      expect(foreign).toEqual([]);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   describe("seed-writable-dirs (PEN-4932)", () => {
     function seedOf(result: ReturnType<typeof buildJobManifest>) {
       return result.job.spec?.template?.spec?.initContainers?.find((c) => c.name === "seed-writable-dirs");
@@ -5132,11 +5175,11 @@ describe("scoped writable mounts (BLO-32734)", () => {
       expect(chownPart).not.toContain(`'/mnt/paperclip-data-seed/${hooks!.subPath}'`);
     });
 
-    it("is the only root container, and takes no more privilege than chown needs", () => {
+    it("is the only root container, and takes no more privilege than mkdir+chown need", () => {
       const spec = buildJobManifest({ ctx: isolatedCtx(), selfPod: makeSelfPod() }).job.spec?.template?.spec;
       const seed = spec?.initContainers?.find((c) => c.name === "seed-writable-dirs");
       expect(seed?.securityContext).toEqual({
-        capabilities: { drop: ["ALL"], add: ["CHOWN", "FOWNER"] },
+        capabilities: { drop: ["ALL"], add: ["CHOWN", "DAC_OVERRIDE"] },
         readOnlyRootFilesystem: true,
         runAsNonRoot: false,
         runAsUser: 0,
@@ -5148,6 +5191,34 @@ describe("scoped writable mounts (BLO-32734)", () => {
         (c) => c.name !== "seed-writable-dirs" && c.securityContext?.runAsUser === 0,
       );
       expect(otherRoot).toEqual([]);
+    });
+
+    it("keeps DAC_OVERRIDE, without which uid 0 cannot mkdir under a 1000-owned parent", () => {
+      // Pinned separately from the full-shape assertion above because this one
+      // capability is the difference between the seeder working and the Job
+      // never starting, and the reason is not visible from the manifest.
+      //
+      // uid 0 with CAP_DAC_OVERRIDE dropped is an ordinary DAC subject. Under a
+      // parent owned by uid 1000 it matches neither owner nor group and falls to
+      // the `other` bits, which are `r-x` for both modes in play (kubelet `0755`,
+      // server `2775`) — so `mkdir` of a not-yet-existing child EACCESes and
+      // `set -e` fails the init container. That case is unreachable on the self
+      // claim, where the server pre-created every target and `mkdir -p` no-ops
+      // on EEXIST, so the current fleet cannot surface a regression here. Assert
+      // it instead.
+      const caps = buildJobManifest({ ctx: isolatedCtx(), selfPod: makeSelfPod() })
+        .job.spec?.template?.spec?.initContainers?.find((c) => c.name === "seed-writable-dirs")
+        ?.securityContext?.capabilities;
+      expect(caps?.add).toContain("DAC_OVERRIDE");
+      expect(caps?.drop).toEqual(["ALL"]);
+      // Every added capability must still be in the PSS *baseline* allowed set,
+      // which is what lets this container run in a namespace the agent
+      // containers meet `restricted` in.
+      const PSS_BASELINE_CAPS = [
+        "AUDIT_WRITE", "CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID", "KILL", "MKNOD",
+        "NET_BIND_SERVICE", "SETFCAP", "SETGID", "SETPCAP", "SETUID", "SYS_CHROOT",
+      ];
+      for (const cap of caps?.add ?? []) expect(PSS_BASELINE_CAPS).toContain(cap);
     });
 
     it("is omitted entirely when the mount is not narrowed", () => {

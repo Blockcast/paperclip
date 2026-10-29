@@ -3009,6 +3009,46 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // `mkdir` a foreign Job's tree inside its OWN volume — creating junk the Job
   // never sees while leaving the real targets uncreated.
   const serverCanPreCreate = narrowWritableSurface && dataClaimName === selfPod.pvcClaimName;
+  // Reachable TODAY, not only in stage 4b: `dataClaimName` falls back to the
+  // server's claim but is overridden by `config.workspaceVolumeClaim`, so an
+  // operator can already point a Job at a foreign claim. Before this stage such
+  // a Job got the broad rw mount; it is now narrowed like any other.
+  //
+  // Warned about rather than blocked, because the Job is expected to START:
+  // `seed-writable-dirs` creates every target, so nothing EACCESes. What it
+  // CANNOT do is populate them.
+  //
+  // Two of those targets are materialized by the SERVER, and only ever into the
+  // server's own volume, so on a foreign claim they come up EMPTY. Both fail in
+  // the safe direction, and both fail a long way from the cause:
+  //
+  //   `.local/share/paperclip-git-hooks` — the PEN-3156 pre-push guard the
+  //       image `git` wrapper aims core.hooksPath at. Empty means the preflight
+  //       refuses and every push from the pod fails closed (BLO-48361). Correct,
+  //       but it surfaces as a puzzling push refusal mid-run.
+  //   `skills/<companyId>` — the company skill tree. Empty means the prompt
+  //       bundle's skill links dangle, which degrades silently.
+  //
+  // Stage 4b must either materialize both into the per-agent claim or move them
+  // into the image (§3.6 already proposes the latter for the hooks dir). Say so
+  // here so the FIRST per-agent run reports the reason rather than the symptom.
+  if (narrowWritableSurface && !serverCanPreCreate) {
+    console.warn(
+      JSON.stringify({
+        level: "warn",
+        event: "claude_k8s.data_claim_foreign",
+        msg: "Job volume is not the server's own claim; server-materialized trees will be empty (git hooks fail closed, company skills missing)",
+        unpopulatedSubPaths: [
+          GIT_HOOKS_SUBPATH,
+          path.posix.join(INSTANCE_ROOT_SUBPATH, "skills", sanitizeForK8sPath(agent.companyId)),
+        ],
+        runId,
+        jobName,
+        dataClaimName,
+        selfPvcClaimName: selfPod.pvcClaimName ?? "",
+      }),
+    );
+  }
   // Every one of those fallbacks used to be silent, so whether a production Job
   // actually got the narrowed mount depended on runtime config nobody could
   // read off the cluster. Name the reason the gate fell through — once as a
@@ -3902,10 +3942,35 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
           volumeMounts: [{ name: "data", mountPath: SEED_VOLUME_ROOT_MOUNT_PATH }],
           // The one container in this Pod that is root, and the narrowest root
           // the job allows: no privilege escalation, every capability dropped
-          // but the two `chown` on a foreign-owned path needs. Overrides
+          // but the two its `mkdir`/`chown` actually need. Overrides
           // `podSecurityContext`'s `runAsNonRoot`, which the agent keeps.
+          //
+          // DAC_OVERRIDE is load-bearing, not belt-and-braces. uid 0 with
+          // CAP_DAC_OVERRIDE dropped is an ORDINARY DAC subject: against a
+          // parent owned by uid 1000 it matches neither owner nor group, so it
+          // falls to the `other` bits. Both modes in play here deny it —
+          // kubelet-created `0755` and the server's `2775` alike grant `other`
+          // only `r-x`. `mkdir` of a new child under any 1000-owned parent
+          // would then EACCES, and under `set -e` that fails the init container
+          // and the Job never starts. It bites wherever a target's parent
+          // already exists 1000-owned and the target itself does not — a new
+          // `run-logs/<c>/<a>/isolated/<key>` under an existing agent log dir
+          // today, and in stage 4b any target nested under a tree a previous
+          // run left behind. It also covers directory SEARCH, so a `0700`
+          // component is traversable. DAC_OVERRIDE is in the PSS *baseline*
+          // allowed set (the default Docker capability set), so this stays
+          // baseline-clean; it is not in *restricted*, which the agent
+          // containers hold and this one deliberately does not.
+          //
+          // FOWNER is NOT here, and that is deliberate rather than an
+          // oversight: it bypasses the owner-match check on chmod/utimes, and
+          // neither syscall this container makes needs it. `chown` is covered
+          // by CAP_CHOWN. `mkdir -p` chmods only a directory it just created
+          // itself — and only when given `-m`, which it is not — so the one
+          // path FOWNER could matter on is one where the seeder is already the
+          // owner.
           securityContext: {
-            capabilities: { drop: ["ALL"], add: ["CHOWN", "FOWNER"] },
+            capabilities: { drop: ["ALL"], add: ["CHOWN", "DAC_OVERRIDE"] },
             readOnlyRootFilesystem: true,
             runAsNonRoot: false,
             runAsUser: 0,
