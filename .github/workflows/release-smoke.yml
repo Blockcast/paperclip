@@ -22,20 +22,6 @@ on:
         default: release-smoke
         type: string
 
-  workflow_call:
-    inputs:
-      paperclip_version:
-        required: true
-        type: string
-      host_port:
-        required: false
-        default: "3232"
-        type: string
-      artifact_name:
-        required: false
-        default: release-smoke
-        type: string
-
 env:
   SCCACHE_GHA_ENABLED: "true"
   RUSTC_WRAPPER: sccache
@@ -44,7 +30,16 @@ env:
 
 jobs:
   smoke:
-    runs-on: arc-dind
+    # BLO-48930: off org group 1 (arc-dind) onto arc-paperclip-dind (org group
+    # 28), whose restrictedToWorkflows pin admits this file only at
+    # refs/heads/master. The job needs a real Docker daemon (docker run/exec),
+    # so the daemonless buildkit lane cannot serve it. That pin is only safe
+    # because this workflow declares no workflow_call: a called workflow's
+    # job_workflow_ref is the callee's, so any PR could `uses:` the master copy
+    # and match the pin. Do not re-add workflow_call while this targets group 28.
+    runs-on:
+      group: arc-paperclip-dind
+      labels: arc-paperclip-dind
     timeout-minutes: 45
 
     steps:
