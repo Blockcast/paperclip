@@ -8370,14 +8370,49 @@ export function issueService(db: Db) {
         conditions.push(inArray(issues.id, labeledIssueIds.map((row) => row.issueId)));
       }
       if (hasSearch) {
-        conditions.push(
-          or(
-            titleContainsMatch,
-            identifierContainsMatch,
-            descriptionContainsMatch,
-            commentContainsMatch,
-          )!,
-        );
+        // PEN-3596: resolve each search branch into its own id set and union
+        // them, rather than ORing the four predicates together.
+        //
+        // The `or(...)` this replaces is what blew the 30s statement_timeout.
+        // `commentContainsMatch` is a semi-join, and a semi-join cannot take
+        // part in a BitmapOr, so its presence under the OR forced the entire
+        // disjunction to be evaluated as a per-row FILTER: every issue in the
+        // company was fetched and `description ILIKE '%term%'` run against all
+        // ~6KB of it. The three gin_trgm indexes on these columns existed the
+        // whole time and were simply unreachable.
+        //
+        // ⛔ This is NOT de-correlation, which was tried and refuted —
+        // PostgreSQL already flattens that EXISTS into a hashed SubPlan on its
+        // own, and hand-writing the flattening measured as noise. Nor is it an
+        // index gap: adding indexes without this restructure measured as
+        // nothing at all. See packages/db/src/issues-list-search-cost-shape.test.ts
+        // for the plan assertions and the measured table.
+        //
+        // Each arm below is a standalone indexable predicate, so each is served
+        // by its own company-scoped trigram index (migration 0268); the comment
+        // arm is served by issue_comments_body_search_idx BitmapAnd'ed with
+        // issue_comments_company_idx. Semantics are unchanged — this is the same
+        // disjunction, expressed so the planner can reach the indexes.
+        conditions.push(sql<boolean>`
+          ${issues.id} IN (
+            SELECT ${issues.id} FROM ${issues}
+            WHERE ${issues.companyId} = ${companyId}
+              AND ${issues.title} ILIKE ${containsPattern} ESCAPE '\\'
+            UNION
+            SELECT ${issues.id} FROM ${issues}
+            WHERE ${issues.companyId} = ${companyId}
+              AND ${issues.identifier} ILIKE ${containsPattern} ESCAPE '\\'
+            UNION
+            SELECT ${issues.id} FROM ${issues}
+            WHERE ${issues.companyId} = ${companyId}
+              AND ${issues.description} ILIKE ${containsPattern} ESCAPE '\\'
+            UNION
+            SELECT ${issueComments.issueId} FROM ${issueComments}
+            WHERE ${issueComments.companyId} = ${companyId}
+              AND ${issueComments.deletedAt} IS NULL
+              AND ${issueComments.body} ILIKE ${containsPattern} ESCAPE '\\'
+          )
+        `);
       }
       if (
         (filters?.excludeRoutineExecutions && !filters?.originKind && !filters?.originKindPrefix && !filters?.originId) ||
@@ -8391,6 +8426,15 @@ export function issueService(db: Db) {
         );
       }
       const priorityOrder = sql`CASE ${issues.priority} WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END`;
+      // PEN-3596: `commentContainsMatch` stays a correlated EXISTS *here*, on
+      // purpose. Once the WHERE above narrows the candidate set, the planner
+      // serves it as an index scan over just those rows (490 loops on the seed,
+      // ~0.01ms each); re-expressing it as the same `IN (SELECT ...)` the WHERE
+      // uses makes it a second full trigram scan of issue_comments, and measured
+      // WORSE on the production-shaped seed (76-82ms against 57-72ms, in the
+      // four-composite-index variant the comparison was run in). Likewise
+      // `descriptionContainsMatch` is cheap here now — it only ever runs on
+      // rows that already matched.
       const searchOrder = sql<number>`
         CASE
           WHEN ${titleStartsWithMatch} THEN 0
