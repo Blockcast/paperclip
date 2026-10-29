@@ -4829,6 +4829,60 @@ function issueRef(row: Pick<IssueRow, "id" | "identifier" | "title" | "status" |
   };
 }
 
+/**
+ * PEN-3596: the issues-list search predicate — one indexable id set per branch,
+ * unioned, rather than the four predicates ORed together.
+ *
+ * The `or(...)` this replaces is what blew the 30s statement_timeout.
+ * `commentContainsMatch` is a semi-join, and a semi-join cannot take part in a
+ * BitmapOr, so its presence under the OR forced the entire disjunction to be
+ * evaluated as a per-row FILTER: every issue in the company was fetched and
+ * `description ILIKE '%term%'` run against all ~6KB of it. The three gin_trgm
+ * indexes on these columns existed the whole time and were simply unreachable.
+ *
+ * ⛔ This is NOT de-correlation, which was tried and refuted — PostgreSQL
+ * already flattens that EXISTS into a hashed SubPlan on its own, and
+ * hand-writing the flattening measured as noise. Nor is it an index gap:
+ * adding indexes without this restructure measured as nothing at all. See
+ * `packages/db/src/issues-list-search-cost-shape.test.ts` for the plan
+ * assertions and the measured table.
+ *
+ * Each arm is a standalone indexable predicate, so each is served by its own
+ * company-scoped trigram index (migration 0268); the comment arm is served by
+ * `issue_comments_body_search_idx` BitmapAnd'ed with
+ * `issue_comments_company_idx`. Semantics are unchanged — this is the same
+ * disjunction, expressed so the planner can reach the indexes.
+ *
+ * ⚠️ Exported, and extracted from `list()` rather than written inline, so the
+ * shape itself is assertable: `issues-service.test.ts` renders this fragment
+ * and fails if the UNION collapses back to an `OR` over an `EXISTS`. The
+ * cost-shape suite in `packages/db` proves the *Postgres* behaviour against a
+ * hand-written copy of this predicate, which by construction cannot notice a
+ * revert here — this is the guard that can.
+ */
+export function issueSearchMatchCondition(companyId: string, containsPattern: string): SQL {
+  return sql<boolean>`
+    ${issues.id} IN (
+      SELECT ${issues.id} FROM ${issues}
+      WHERE ${issues.companyId} = ${companyId}
+        AND ${issues.title} ILIKE ${containsPattern} ESCAPE '\\'
+      UNION
+      SELECT ${issues.id} FROM ${issues}
+      WHERE ${issues.companyId} = ${companyId}
+        AND ${issues.identifier} ILIKE ${containsPattern} ESCAPE '\\'
+      UNION
+      SELECT ${issues.id} FROM ${issues}
+      WHERE ${issues.companyId} = ${companyId}
+        AND ${issues.description} ILIKE ${containsPattern} ESCAPE '\\'
+      UNION
+      SELECT ${issueComments.issueId} FROM ${issueComments}
+      WHERE ${issueComments.companyId} = ${companyId}
+        AND ${issueComments.deletedAt} IS NULL
+        AND ${issueComments.body} ILIKE ${containsPattern} ESCAPE '\\'
+    )
+  `;
+}
+
 function hasPlanDocumentCondition(companyId: string, hasPlanDocument: boolean): SQL {
   const existsPlanDocument = sql<boolean>`
     EXISTS (
@@ -8370,49 +8424,7 @@ export function issueService(db: Db) {
         conditions.push(inArray(issues.id, labeledIssueIds.map((row) => row.issueId)));
       }
       if (hasSearch) {
-        // PEN-3596: resolve each search branch into its own id set and union
-        // them, rather than ORing the four predicates together.
-        //
-        // The `or(...)` this replaces is what blew the 30s statement_timeout.
-        // `commentContainsMatch` is a semi-join, and a semi-join cannot take
-        // part in a BitmapOr, so its presence under the OR forced the entire
-        // disjunction to be evaluated as a per-row FILTER: every issue in the
-        // company was fetched and `description ILIKE '%term%'` run against all
-        // ~6KB of it. The three gin_trgm indexes on these columns existed the
-        // whole time and were simply unreachable.
-        //
-        // ⛔ This is NOT de-correlation, which was tried and refuted —
-        // PostgreSQL already flattens that EXISTS into a hashed SubPlan on its
-        // own, and hand-writing the flattening measured as noise. Nor is it an
-        // index gap: adding indexes without this restructure measured as
-        // nothing at all. See packages/db/src/issues-list-search-cost-shape.test.ts
-        // for the plan assertions and the measured table.
-        //
-        // Each arm below is a standalone indexable predicate, so each is served
-        // by its own company-scoped trigram index (migration 0268); the comment
-        // arm is served by issue_comments_body_search_idx BitmapAnd'ed with
-        // issue_comments_company_idx. Semantics are unchanged — this is the same
-        // disjunction, expressed so the planner can reach the indexes.
-        conditions.push(sql<boolean>`
-          ${issues.id} IN (
-            SELECT ${issues.id} FROM ${issues}
-            WHERE ${issues.companyId} = ${companyId}
-              AND ${issues.title} ILIKE ${containsPattern} ESCAPE '\\'
-            UNION
-            SELECT ${issues.id} FROM ${issues}
-            WHERE ${issues.companyId} = ${companyId}
-              AND ${issues.identifier} ILIKE ${containsPattern} ESCAPE '\\'
-            UNION
-            SELECT ${issues.id} FROM ${issues}
-            WHERE ${issues.companyId} = ${companyId}
-              AND ${issues.description} ILIKE ${containsPattern} ESCAPE '\\'
-            UNION
-            SELECT ${issueComments.issueId} FROM ${issueComments}
-            WHERE ${issueComments.companyId} = ${companyId}
-              AND ${issueComments.deletedAt} IS NULL
-              AND ${issueComments.body} ILIKE ${containsPattern} ESCAPE '\\'
-          )
-        `);
+        conditions.push(issueSearchMatchCondition(companyId, containsPattern));
       }
       if (
         (filters?.excludeRoutineExecutions && !filters?.originKind && !filters?.originKindPrefix && !filters?.originId) ||

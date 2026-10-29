@@ -32,6 +32,13 @@ platform cannot resolve automatically. Each runbook should be:
   Trigger: `paperclip_external_runtime_reservations_release_pending > 0`,
   `paperclip_environment_leases_orphaned_active > 0`, or a scheduler crash-loop
   on a database migration at startup.
+- [`issues-trigram-index-rollout.md`](issues-trigram-index-rollout.md) — the
+  migration 0268 trigram index build takes a SHARE lock on `issues` and, on the
+  role `lock_timeout` we believe is in force, makes retried issue writes return
+  `503 transient_db_conflict` rather than merely stalling. Covers the
+  `CONCURRENTLY` opt-out and the `btree_gin` privilege that does fail closed.
+  Trigger: approving the deploy that applies 0268, or a burst of
+  `transient_db_conflict` on issue writes lining up with a migration window.
 - [`clear-polluted-ssh-workspace.md`](clear-polluted-ssh-workspace.md) —
   recover a stranded SSH-driven run whose workspace import is failing on a
   sibling task's leftover scratch state. Trigger: blocked issue auto-comment
