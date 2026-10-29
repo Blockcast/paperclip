@@ -20,7 +20,10 @@ import type { SelfPodInfo } from "./k8s-client.js";
 import { buildEnvGuardPluginCleanupShell, buildEnvGuardPluginSetupShell } from "./env-guard-plugin.js";
 import {
   buildSharedDocOverlayShell,
+  buildSharedDocSecretProjection,
   parseSharedDocOverlay,
+  SHARED_DOC_SECRET_MOUNT_PATH,
+  SHARED_DOC_SECRET_VOLUME_NAME,
 } from "./shared-doc-overlay.js";
 import {
   isAgentInheritableEnvFromRef,
@@ -447,6 +450,8 @@ export interface JobBuildResult {
   envSecret: EnvSecret | null;
   /** MCP-bearing OpenCode config staged in a per-run Secret. */
   mcpConfigSecret: McpConfigSecret | null;
+  /** Shared-doc bodies staged as a Secret volume; same lifecycle as the others. */
+  sharedDocsSecret: SharedDocsSecret | null;
 }
 
 export interface EnvSecret {
@@ -461,6 +466,22 @@ export interface EnvSecret {
  * manifest and deliver it through a short-lived Secret-backed volume.
  */
 export interface McpConfigSecret {
+  name: string;
+  namespace: string;
+  data: Record<string, string>;
+}
+
+/** Non-null whenever the server carried shared-doc bodies for this run.
+ *  The documents an agent's AGENTS.md tells it to read cannot reach a
+ *  run-isolated pod as a path — the execution workspace is deliberately not
+ *  in that pod's mount set — so the bodies are staged as a Secret volume and
+ *  projected back to their repo-relative layout (PEN-3329). Not credential
+ *  material; a Secret is used for the same reason mcp.json is, namely that it
+ *  is the one delivery channel here that is bounded, cleaned up with the run,
+ *  and independent of which host paths the pod happens to mount. Same
+ *  lifecycle as promptSecret: the caller creates it before the Job and cleans
+ *  it up after. */
+export interface SharedDocsSecret {
   name: string;
   namespace: string;
   data: Record<string, string>;
@@ -1579,11 +1600,36 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // which is what keeps bridge-first safe: a declared doc that is absent even from the
   // company directory is reported, not `cp`-ed through the link into shared storage.
   const sharedDocOverlay = workspaceSetup ? parseSharedDocOverlay(context.paperclipSharedDocs) : null;
+  // The bodies travel with the Job. `sourceCwd` is the server's execution workspace and a
+  // run-isolated pod does not mount it, so a copy from there reports every doc absent —
+  // measured on a live pod, 2026-10-29. Staging a Secret makes delivery depend on the Job
+  // alone rather than on the pod's mount set. The path copy stays as the fallback for a
+  // server too old to send bodies; `buildSharedDocOverlayShell` picks whichever applies.
+  const sharedDocProjection = sharedDocOverlay ? buildSharedDocSecretProjection(sharedDocOverlay) : null;
+  let sharedDocsSecret: SharedDocsSecret | null = null;
+  if (sharedDocProjection) {
+    const sharedDocsSecretName = `${jobName}-shared-docs`;
+    sharedDocsSecret = { name: sharedDocsSecretName, namespace, data: sharedDocProjection.data };
+    volumes.push({
+      name: SHARED_DOC_SECRET_VOLUME_NAME,
+      // `items` restores `docs/<name>.md` from the positional keys, so the mount has the
+      // same shape the copy loop expects and the loop needs no per-path knowledge of the
+      // staging scheme. `optional: false` — a Secret that failed to create must surface
+      // as a pod that cannot start, not as a run that silently reads no documentation.
+      secret: { secretName: sharedDocsSecretName, optional: false, items: sharedDocProjection.items },
+    });
+    volumeMounts.push({
+      name: SHARED_DOC_SECRET_VOLUME_NAME,
+      mountPath: SHARED_DOC_SECRET_MOUNT_PATH,
+      readOnly: true,
+    });
+  }
   const sharedDocOverlaySetup = sharedDocOverlay
     ? `${buildSharedDocOverlayShell({
         overlay: sharedDocOverlay,
         workspaceRoot: isolation.workspaceRoot!,
         quote: shellQuote,
+        ...(sharedDocProjection ? { sourceDir: SHARED_DOC_SECRET_MOUNT_PATH } : {}),
       })}; `
     : "";
   // opencode-db schema-compat guard (root-caused 2026-06-21, BLO follow-up).
@@ -1791,6 +1837,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     opencodeVersion,
     envSecret,
     mcpConfigSecret,
+    sharedDocsSecret,
   };
 }
 

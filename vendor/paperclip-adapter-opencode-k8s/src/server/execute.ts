@@ -16,6 +16,7 @@ import { computeOpenAICompatibleCost } from "./pricing.js";
 import { getSelfPodInfo, getBatchApi, getCoreApi, getLogApi, getPvc, createPvc } from "./k8s-client.js";
 import { PassThrough } from "node:stream";
 import { buildJobManifest, LARGE_PROMPT_THRESHOLD_BYTES, buildPodLogPath, readRunIsolationDescriptor, sanitizeLabelValue } from "./job-manifest.js";
+import { SHARED_DOC_SECRET_VOLUME_NAME } from "./shared-doc-overlay.js";
 import type * as k8s from "@kubernetes/client-node";
 
 const POLL_INTERVAL_MS = 2000;
@@ -847,6 +848,7 @@ async function cleanupJob(
   envSecretName?: string,
   mcpConfigSecretName?: string,
   podLogPath?: string,
+  sharedDocsSecretName?: string,
 ): Promise<void> {
   try {
     const batchApi = getBatchApi(kubeconfigPath);
@@ -861,7 +863,7 @@ async function cleanupJob(
   }
   await cleanupSecrets(
     namespace,
-    [promptSecretName, envSecretName, mcpConfigSecretName],
+    [promptSecretName, envSecretName, mcpConfigSecretName, sharedDocsSecretName],
     kubeconfigPath,
   );
   if (podLogPath) {
@@ -931,6 +933,7 @@ async function streamAndAwaitJob(
   promptSecretName?: string,
   envSecretName?: string,
   mcpConfigSecretName?: string,
+  sharedDocsSecretName?: string,
 ): Promise<AdapterExecutionResult> {
   const { onLog } = ctx;
   const config = parseObject(ctx.config);
@@ -1103,13 +1106,14 @@ async function streamAndAwaitJob(
         envSecretName,
         mcpConfigSecretName,
         podLogPath,
+        sharedDocsSecretName,
       );
     } else {
       // Retaining a Job for debugging must never retain provider or control
       // plane credentials with it. The Job can remain; per-run Secrets cannot.
       await cleanupSecrets(
         namespace,
-        [promptSecretName, envSecretName, mcpConfigSecretName],
+        [promptSecretName, envSecretName, mcpConfigSecretName, sharedDocsSecretName],
         kubeconfigPath,
       );
       await onLog("stdout", `[paperclip] Retaining job ${jobName} for debugging (retainJobs=true)\n`);
@@ -1689,6 +1693,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           const mcpConfigSecretName = exactCurrentJob.spec?.template.spec?.volumes
             ?.find((volume) => volume.name === "mcp-config-secret")
             ?.secret?.secretName;
+          // Read off the live Job like its siblings above: on a reattach this function has
+          // no build result to consult, so a name not recovered here is a Secret nothing
+          // will ever delete.
+          const sharedDocsSecretName = exactCurrentJob.spec?.template.spec?.volumes
+            ?.find((volume) => volume.name === SHARED_DOC_SECRET_VOLUME_NAME)
+            ?.secret?.secretName;
           const podLogPath = buildPodLogPath(ctx.agent.companyId, agentId, ctx.runId);
           await onLog(
             "stdout",
@@ -1706,6 +1716,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             promptSecretName,
             envSecretName,
             mcpConfigSecretName,
+            sharedDocsSecretName,
           );
         }
       } catch (err) {
@@ -1843,12 +1854,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   let job = firstBuild.job;
   let envSecret = firstBuild.envSecret ?? null;
   let mcpConfigSecret = firstBuild.mcpConfigSecret ?? null;
+  let sharedDocsSecret = firstBuild.sharedDocsSecret ?? null;
   if (Buffer.byteLength(prompt, "utf-8") > LARGE_PROMPT_THRESHOLD_BYTES) {
     promptSecretName = `${jobName}-prompt`;
     const rebuilt = buildJobManifest({ ...buildArgs, promptSecretName });
     job = rebuilt.job;
     envSecret = rebuilt.envSecret ?? null;
     mcpConfigSecret = rebuilt.mcpConfigSecret ?? null;
+    sharedDocsSecret = rebuilt.sharedDocsSecret ?? null;
   }
 
   if (onMeta) {
@@ -1969,12 +1982,57 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
   }
 
+  // PEN-3329. The documents the agent's instructions tell it to read. A run-isolated pod
+  // cannot reach the execution workspace they were materialized into — that workspace is
+  // deliberately absent from its mount set — so the bodies are staged here and projected
+  // into the pod as a read-only volume.
+  //
+  // This fails the run when it fails, which is the opposite of how the pod-side copy
+  // behaves, and the asymmetry is deliberate. In the pod, a document must never be able
+  // to fail a bootstrap, so every error is reported and stepped over. Here, the Secret is
+  // referenced by the Job with `optional: false`: if it is missing the pod cannot start at
+  // all and would sit in `CreateContainerConfigError` until the run timed out. Failing
+  // now, with a named error, is strictly better than that.
+  if (sharedDocsSecret) {
+    const sharedDocsSecretResource: k8s.V1Secret = {
+      apiVersion: "v1",
+      kind: "Secret",
+      metadata: {
+        name: sharedDocsSecret.name,
+        namespace: sharedDocsSecret.namespace,
+        labels: job.metadata?.labels,
+      },
+      stringData: sharedDocsSecret.data,
+    };
+    try {
+      await coreApi.createNamespacedSecret({
+        namespace: sharedDocsSecret.namespace,
+        body: sharedDocsSecretResource,
+      });
+      preparedSecretNames.add(sharedDocsSecret.name);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      await cleanupPreparedSecrets([promptSecretName, envSecret?.name, mcpConfigSecret?.name, sharedDocsSecret.name]);
+      await onLog("stderr", `[paperclip] Failed to create shared-docs Secret: ${msg}\n`);
+      return {
+        exitCode: null,
+        signal: null,
+        timedOut: false,
+        errorMessage: `Failed to create shared-docs Secret: ${msg}`,
+        // Same code the claude tree uses for this failure, so triage does not depend on
+        // which adapter ran. The generic `k8s_job_create_failed` here was a copy from the
+        // Job-create arm below and pointed at the wrong step.
+        errorCode: "k8s_shared_docs_secret_create_failed",
+      };
+    }
+  }
+
   let createdJob: k8s.V1Job | undefined;
   try {
     createdJob = await batchApi.createNamespacedJob({ namespace, body: job });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    await cleanupPreparedSecrets([promptSecretName, envSecret?.name, mcpConfigSecret?.name]);
+    await cleanupPreparedSecrets([promptSecretName, envSecret?.name, mcpConfigSecret?.name, sharedDocsSecret?.name]);
     await onLog("stderr", `[paperclip] Failed to create K8s Job: ${msg}\n`);
     return {
       exitCode: null,
@@ -1995,6 +2053,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       envSecret?.name,
       mcpConfigSecret?.name,
       podLogPath,
+      sharedDocsSecret?.name,
     );
     return {
       exitCode: null,
@@ -2018,6 +2077,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       envSecret?.name,
       mcpConfigSecret?.name,
       podLogPath,
+      sharedDocsSecret?.name,
     );
     return {
       exitCode: null,
@@ -2030,7 +2090,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   // Owner references are the crash-only cleanup backstop. Explicit deletion
   // still runs on all ordinary completion and failure paths.
-  for (const secretName of [promptSecretName, envSecret?.name, mcpConfigSecret?.name].filter(
+  for (const secretName of [promptSecretName, envSecret?.name, mcpConfigSecret?.name, sharedDocsSecret?.name].filter(
     (name): name is string => Boolean(name),
   )) {
     try {
@@ -2076,6 +2136,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       promptSecretName,
       envSecret?.name,
       mcpConfigSecret?.name,
+      sharedDocsSecret?.name,
     );
   } finally {
     releaseLock();

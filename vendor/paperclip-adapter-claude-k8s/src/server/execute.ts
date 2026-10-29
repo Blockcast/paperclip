@@ -745,12 +745,27 @@ export async function createOrAdoptRunSecret(
         //
         // Merge semantics are also the closer fit for what adoption means here:
         // assert this run's keys and labels.  Unlike a PUT, a merge leaves
-        // pre-existing `data` keys in place.  That is only reachable for the
-        // env Secret — `prompt.txt` and `mcp.json` each carry a single fixed
-        // key, so they have no variable key set to strand — and the env Secret
-        // is consumed per-key via `secretKeyRef`, never as a whole-Secret
-        // envFrom, so a key left behind by an older adapter build is inert to
-        // the container.  The residual is hygiene only: such a key survives at
+        // pre-existing `data` keys in place.  Every key this call DOES send is
+        // overwritten with the current value, so an adopted Secret never serves
+        // a stale body — the residual is only a key the new set no longer has.
+        // Two of the four Secrets can strand one; `prompt.txt` and `mcp.json`
+        // each carry a single fixed key, so they have no variable key set.
+        //
+        // The env Secret is consumed per-key via `secretKeyRef`, never as a
+        // whole-Secret envFrom, so a key left behind by an older adapter build
+        // is inert to the container.
+        //
+        // The shared-docs Secret (PEN-3329) has a variable key set too —
+        // `doc-0`…`doc-N`, one per delivered document — so a retry whose doc
+        // set SHRANK leaves the surplus high-index keys behind.  Inert for the
+        // same reason, by a different mechanism: the Job projects the Secret
+        // through an explicit `secret.items` list built from the same build
+        // result as the data, so it names exactly the keys of the current set
+        // and a stranded `doc-N` is never mounted.  Keys are positional rather
+        // than path-derived, so a surplus key is also never confusable with a
+        // live one for a different document.
+        //
+        // The residual is hygiene only in every case: such a key survives at
         // rest until the finally-block delete or ownerReference GC.
         // `resourceVersion` is still carried, so a concurrent writer is still
         // surfaced as a 409 instead of being silently clobbered.
@@ -2401,6 +2416,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   let promptSecret: { name: string; namespace: string; data: Record<string, string> } | null = null;
   let envSecret: { name: string; namespace: string; data: Record<string, string> } | null = null;
   let mcpConfigSecret: { name: string; namespace: string; data: Record<string, string> } | null = null;
+  let sharedDocsSecret: { name: string; namespace: string; data: Record<string, string> } | null = null;
   // runtimeSessionParams and currentSessionIdRaw are also used after the
   // try block (in the result-parsing section) so hoist them here.
   const runtimeSessionParams = parseObject(runtime.sessionParams);
@@ -2730,6 +2746,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     promptSecret = built.promptSecret;
     envSecret = built.envSecret;
     mcpConfigSecret = built.mcpConfigSecret;
+    sharedDocsSecret = built.sharedDocsSecret;
     podLogPath = built.podLogPath;
     // Create the `subPath` targets before the Job exists (BLO-32734). Without
     // fsGroup, the kubelet creates a missing subPath dir as root:root 0755,
@@ -2857,6 +2874,46 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
     }
 
+    // PEN-3329. The documents the agent's instructions tell it to read. A run-isolated
+    // pod cannot reach the execution workspace they were materialized into — that
+    // workspace is deliberately absent from its mount set — so the bodies are staged
+    // here and projected into the pod as a read-only volume.
+    //
+    // This fails the run when it fails, which is the opposite of how the pod-side copy
+    // behaves, and the asymmetry is deliberate. In the pod, a document must never be able
+    // to fail a bootstrap, so every error is reported and stepped over. Here, the Secret
+    // is referenced by the Job with `optional: false`: if it is missing the pod cannot
+    // start at all and would sit in `CreateContainerConfigError` until the run timed out.
+    // Failing now, with a named error, is strictly better than that.
+    if (sharedDocsSecret) {
+      try {
+        const disposition = await createOrAdoptRunSecret(coreApi, {
+          name: sharedDocsSecret.name,
+          namespace: sharedDocsSecret.namespace,
+          runId,
+          data: sharedDocsSecret.data,
+        });
+        await onLog(
+          "stdout",
+          `[paperclip] ${SECRET_DISPOSITION_VERB[disposition]} shared-docs Secret: ${sharedDocsSecret.name} (${Object.keys(sharedDocsSecret.data).length} documents)\n`,
+        );
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        await onLog("stderr", `[paperclip] Failed to create shared-docs Secret: ${msg}\n`);
+        for (const staged of [promptSecret, envSecret, mcpConfigSecret]) {
+          if (!staged) continue;
+          await coreApi.deleteNamespacedSecret({ name: staged.name, namespace: staged.namespace }).catch(() => undefined);
+        }
+        return {
+          exitCode: null,
+          signal: null,
+          timedOut: false,
+          errorMessage: `Failed to create shared-docs Secret: ${msg}`,
+          errorCode: "k8s_shared_docs_secret_create_failed",
+        };
+      }
+    }
+
     // Create the Job
     let createdJobUid: string | undefined;
     // Set when the Job below already existed and is provably this run's own
@@ -2908,6 +2965,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             await coreApi.deleteNamespacedSecret({ name: mcpConfigSecret.name, namespace: mcpConfigSecret.namespace });
           } catch { /* best-effort */ }
         }
+        if (sharedDocsSecret) {
+          try {
+            await coreApi.deleteNamespacedSecret({ name: sharedDocsSecret.name, namespace: sharedDocsSecret.namespace });
+          } catch { /* best-effort */ }
+        }
         return {
           exitCode: null,
           signal: null,
@@ -2940,6 +3002,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ["prompt", promptSecret],
       ["env", envSecret],
       ["mcp-config", mcpConfigSecret],
+      ["shared-docs", sharedDocsSecret],
     ] as const) {
       if (!secret) continue;
       if (!createdJobUid) {
@@ -2985,7 +3048,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // adoption assigns createdJobUid, so an adopted run reaches the patch loop
       // above and can retain unowned Secrets just as a created one can.
       if (!adoptedExistingJob && (await cleanupJob(namespace, jobName, onLog, kubeconfigPath, podLogPath))) {
-        await deleteRunSecrets(coreApi, [promptSecret, envSecret, mcpConfigSecret]);
+        await deleteRunSecrets(coreApi, [promptSecret, envSecret, mcpConfigSecret, sharedDocsSecret]);
       } else {
         await warnUnownedSecrets();
       }
@@ -3011,7 +3074,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // live in-cluster object, not the most.  The adopted path still reaches
       // the warning, for the reason given at the first abort.
       if (!adoptedExistingJob && (await cleanupJob(namespace, jobName, onLog, kubeconfigPath, podLogPath))) {
-        await deleteRunSecrets(coreApi, [promptSecret, envSecret, mcpConfigSecret]);
+        await deleteRunSecrets(coreApi, [promptSecret, envSecret, mcpConfigSecret, sharedDocsSecret]);
       } else {
         await warnUnownedSecrets();
       }
@@ -3337,7 +3400,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // a pod outlived teardown, the Secrets stay too: the ownerReference-driven
     // Job GC collects them, and a retained Job's pod must keep its mounts.
     if (podsGone) {
-      await deleteRunSecrets(coreApi, [promptSecret, envSecret, mcpConfigSecret]);
+      await deleteRunSecrets(coreApi, [promptSecret, envSecret, mcpConfigSecret, sharedDocsSecret]);
     } else {
       // If any Secret's ownerReference patch did not land, that Secret carries
       // no ownerReference, so the Job GC that eventually collects the rest will

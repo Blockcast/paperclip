@@ -28,10 +28,39 @@
 
 /** What the server reports on `context.paperclipSharedDocs`. */
 export type SharedDocOverlay = {
-  /** Execution workspace the docs were materialized into; the pod copies from here. */
+  /**
+   * Execution workspace the docs were materialized into.
+   *
+   * Retained, but no longer the delivery mechanism for a run-isolated pod — see
+   * `contents` below. Still used by the fallback copy, which is correct for any pod that
+   * does mount this directory.
+   */
   sourceCwd: string;
   /** Repo-relative POSIX paths under `docs/`. */
   paths: string[];
+  /**
+   * Document bodies, keyed by the same repo-relative path.
+   *
+   * THE SOURCE PATH CANNOT CROSS INTO A RUN-ISOLATED POD, AND THAT IS BY DESIGN.
+   * Measured 2026-10-29 from a live `isolation-mode: run` pod carrying the first fix:
+   * every one of the 14 declared docs was reported absent, because `sourceCwd`
+   * (`/paperclip/instances/default/projects/...`) does not exist inside the pod at all.
+   * `/paperclip/instances/default` is an `emptyDir`, and only named PVC subPaths
+   * (`skills/`, `run-logs/`, `prompt-cache/`, `work/`, `wt/`) are re-mounted over it —
+   * the projects tree is not among them. Not mounting the server's workspace is the
+   * property `run` isolation exists to enforce, so the first fix was asking the pod for
+   * something it must not have.
+   *
+   * So the content travels instead of a path to it: the server reads each body and the
+   * adapter stages it as a per-Job Secret volume, the same way `mcp.json` is staged
+   * "regardless of size" (BLO-17980/BLO-17973). A value delivered this way is
+   * mount-shape-independent, which is exactly the dimension the path-based attempt was
+   * fragile on.
+   *
+   * Optional, so an older server paired with a newer adapter degrades to the path copy
+   * rather than failing: the two deploy on different cadences.
+   */
+  contents?: Record<string, string>;
 };
 
 /**
@@ -64,11 +93,72 @@ export function parseSharedDocOverlay(raw: unknown): SharedDocOverlay | null {
   // run workspace, so a relative source would resolve against the destination.
   if (!sourceCwd.startsWith("/")) return null;
   const rawPaths = Array.isArray(record.paths) ? record.paths : [];
-  const paths = [...new Set(rawPaths.filter(isSafeSharedDocPath))].sort((left, right) =>
-    left.localeCompare(right),
+  // Bodies are keyed by the same repo-relative path, and both the key and the value are
+  // re-checked here: the key against the same charset as `paths` (it becomes a Secret
+  // projection path), the value as a string (it becomes a file). A body that is not a
+  // string is dropped rather than coerced — "undefined" is not a document.
+  const rawContents =
+    record.contents && typeof record.contents === "object" && !Array.isArray(record.contents)
+      ? (record.contents as Record<string, unknown>)
+      : {};
+  const contents: Record<string, string> = {};
+  for (const [key, value] of Object.entries(rawContents)) {
+    if (!isSafeSharedDocPath(key)) continue;
+    if (typeof value !== "string") continue;
+    contents[key] = value;
+  }
+  // A doc the server sent a body for is deliverable even if it is absent from `paths`,
+  // and vice versa, so the declared set is the union. Sorted for a stable pod command:
+  // the command string feeds the prompt cache key, so an unstable order would miss.
+  const paths = [...new Set([...rawPaths.filter(isSafeSharedDocPath), ...Object.keys(contents)])].sort(
+    (left, right) => left.localeCompare(right),
   );
   if (paths.length === 0) return null;
-  return { sourceCwd, paths };
+  return { sourceCwd, paths, ...(Object.keys(contents).length > 0 ? { contents } : {}) };
+}
+
+/** Where the staged Secret is mounted in the pod. Not under any other mount path. */
+export const SHARED_DOC_SECRET_MOUNT_PATH = "/tmp/paperclip-shared-docs";
+
+/** The Secret volume name, shared by the volume and its mount. */
+export const SHARED_DOC_SECRET_VOLUME_NAME = "shared-docs-secret";
+
+export type SharedDocSecretProjection = {
+  /** `stringData` for the Secret: one entry per carried document. */
+  data: Record<string, string>;
+  /** `items` for the Secret volume, projecting each key back to its repo-relative path. */
+  items: Array<{ key: string; path: string }>;
+};
+
+/**
+ * Turns the carried bodies into a Secret plus the projection that restores their layout.
+ *
+ * Keys are positional (`doc-0`, `doc-1`, …) rather than derived from the path. A Secret
+ * key may only contain `[-._a-zA-Z0-9]`, so a path has to be transformed to be usable as
+ * one — and the obvious transform (`/` → `__`) is NOT injective over the charset
+ * `isSafeSharedDocPath` admits: `docs/a/b.md` and `docs/a__b.md` are both legal and would
+ * collide on one key, silently delivering one document's body under the other's name.
+ * A positional key cannot collide, and `items[].path` carries the real layout anyway, so
+ * nothing is lost by not encoding it twice.
+ *
+ * Returns null when nothing is carried, so callers stage no Secret at all.
+ */
+export function buildSharedDocSecretProjection(overlay: SharedDocOverlay): SharedDocSecretProjection | null {
+  const contents = overlay.contents;
+  if (!contents) return null;
+  const data: Record<string, string> = {};
+  const items: Array<{ key: string; path: string }> = [];
+  // Drive from `paths` (already sorted and safe) so key assignment is deterministic for a
+  // given overlay rather than dependent on object insertion order.
+  for (const docPath of overlay.paths) {
+    const body = contents[docPath];
+    if (typeof body !== "string") continue;
+    const key = `doc-${items.length}`;
+    data[key] = body;
+    items.push({ key, path: docPath });
+  }
+  if (items.length === 0) return null;
+  return { data, items };
 }
 
 /**
@@ -111,13 +201,24 @@ export function buildSharedDocOverlayShell(input: {
   overlay: SharedDocOverlay;
   workspaceRoot: string;
   quote: (value: string) => string;
+  /**
+   * Directory the documents are read from inside the POD.
+   *
+   * Pass the Secret mount when one is staged. Omitted, this falls back to
+   * `overlay.sourceCwd` — the server-side path — which is only readable from a pod that
+   * mounts the execution workspace. A run-isolated pod does not, which is the whole of
+   * PEN-3329's second round; see the `contents` field above.
+   */
+  sourceDir?: string;
 }): string {
   const { overlay, workspaceRoot, quote } = input;
   if (!workspaceRoot || overlay.paths.length === 0) return "";
+  const sourceDir = input.sourceDir?.trim() || overlay.sourceCwd;
+  if (!sourceDir.startsWith("/")) return "";
   const src = "$__pcdocs_src/$__pcdoc";
   const dst = "$__pcdocs_dst/$__pcdoc";
   return [
-    `__pcdocs_src=${quote(overlay.sourceCwd)};`,
+    `__pcdocs_src=${quote(sourceDir)};`,
     `__pcdocs_dst=${quote(workspaceRoot)};`,
     `for __pcdoc in ${overlay.paths.map(quote).join(" ")}; do`,
     // `-L` as well as `-e`: `-e` follows symlinks, so a dangling one reads as absent.
@@ -133,7 +234,7 @@ export function buildSharedDocOverlayShell(input: {
     `__pcdoc_dir="$(dirname "$__pcdoc_dir")";`,
     `done;`,
     `if [ "$__pcdoc_linked" = 1 ]; then echo "[paperclip] shared doc $__pcdoc is absent under a symlinked docs/ directory; not copying, because that would write into the shared directory the link points at" >&2; continue; fi;`,
-    `if [ ! -f "${src}" ]; then echo "[paperclip] shared doc $__pcdoc is absent from the execution workspace; the run workspace will not have it" >&2; continue; fi;`,
+    `if [ ! -f "${src}" ]; then echo "[paperclip] shared doc $__pcdoc was not delivered to this pod; the run workspace will not have it" >&2; continue; fi;`,
     `if mkdir -p "$(dirname "${dst}")" && cp -- "${src}" "${dst}"; then`,
     // info/exclude needs no glob escaping: `isSafeSharedDocPath` rejects every character
     // git would read as a pattern. A test pins that.

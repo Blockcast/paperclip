@@ -20,7 +20,10 @@ import { buildPodLogRedactorSetupShell, POD_LOG_FILTER_ARG_VAR, POD_LOG_FILTER_V
 import { SERVER_ONLY_ENV_DENY } from "./inherit-allowlist.js";
 import {
   buildSharedDocOverlayShell,
+  buildSharedDocSecretProjection,
   parseSharedDocOverlay,
+  SHARED_DOC_SECRET_MOUNT_PATH,
+  SHARED_DOC_SECRET_VOLUME_NAME,
 } from "./shared-doc-overlay.js";
 import { SELF_POD_DATA_MOUNT_PATH } from "./k8s-client.js";
 
@@ -1221,6 +1224,22 @@ export interface McpConfigSecret {
   data: Record<string, string>;
 }
 
+/** Non-null whenever the server carried shared-doc bodies for this run.
+ *  The documents an agent's AGENTS.md tells it to read cannot reach a
+ *  run-isolated pod as a path — the execution workspace is deliberately not
+ *  in that pod's mount set — so the bodies are staged as a Secret volume and
+ *  projected back to their repo-relative layout (PEN-3329). Not credential
+ *  material; a Secret is used for the same reason mcp.json is, namely that it
+ *  is the one delivery channel here that is bounded, cleaned up with the run,
+ *  and independent of which host paths the pod happens to mount. Same
+ *  lifecycle as promptSecret: the caller creates it before the Job and cleans
+ *  it up after. */
+export interface SharedDocsSecret {
+  name: string;
+  namespace: string;
+  data: Record<string, string>;
+}
+
 /**
  * Env var name patterns that must never carry a literal Job-pod value.
  * Matches anywhere in the name, case-insensitive. A false-positive match
@@ -1678,6 +1697,8 @@ export interface JobBuildResult {
   /** Non-null whenever a merged mcp.json is shipped to the pod — always
    *  Secret-backed, never a literal init-container env var (BLO-17980/BLO-17973). */
   mcpConfigSecret: McpConfigSecret | null;
+  /** Shared-doc bodies staged as a Secret volume; same lifecycle as the others. */
+  sharedDocsSecret: SharedDocsSecret | null;
   /** User-supplied extra labels that were dropped because they used a reserved prefix. */
   skippedLabels: string[];
   /** Path to the pod log file on the shared PVC. */
@@ -3478,11 +3499,36 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // because every other isolation mode mounts that workspace directly and already has
   // them. See `shared-doc-overlay.ts` for why the set is declared rather than discovered.
   const sharedDocOverlay = workspaceSetup ? parseSharedDocOverlay(context.paperclipSharedDocs) : null;
+  // The bodies travel with the Job. `sourceCwd` is the server's execution workspace and a
+  // run-isolated pod does not mount it, so a copy from there reports every doc absent —
+  // measured on a live pod, 2026-10-29. Staging a Secret makes delivery depend on the Job
+  // alone rather than on the pod's mount set. The path copy stays as the fallback for a
+  // server too old to send bodies; `buildSharedDocOverlayShell` picks whichever applies.
+  const sharedDocProjection = sharedDocOverlay ? buildSharedDocSecretProjection(sharedDocOverlay) : null;
+  let sharedDocsSecret: SharedDocsSecret | null = null;
+  if (sharedDocProjection) {
+    const sharedDocsSecretName = `${jobName}-shared-docs`;
+    sharedDocsSecret = { name: sharedDocsSecretName, namespace, data: sharedDocProjection.data };
+    volumes.push({
+      name: SHARED_DOC_SECRET_VOLUME_NAME,
+      // `items` restores `docs/<name>.md` from the positional keys, so the mount has the
+      // same shape the copy loop expects and the loop needs no per-path knowledge of the
+      // staging scheme. `optional: false` — a Secret that failed to create must surface
+      // as a pod that cannot start, not as a run that silently reads no documentation.
+      secret: { secretName: sharedDocsSecretName, optional: false, items: sharedDocProjection.items },
+    });
+    volumeMounts.push({
+      name: SHARED_DOC_SECRET_VOLUME_NAME,
+      mountPath: SHARED_DOC_SECRET_MOUNT_PATH,
+      readOnly: true,
+    });
+  }
   const sharedDocOverlaySetup = sharedDocOverlay
     ? buildSharedDocOverlayShell({
         overlay: sharedDocOverlay,
         workspaceRoot: isolation.workspaceRoot,
         quote: quoteShellArg,
+        ...(sharedDocProjection ? { sourceDir: SHARED_DOC_SECRET_MOUNT_PATH } : {}),
       })
     : "";
   // The mkdir, the redactor's fall-open sentinel and the tee all run INSIDE the
@@ -3926,5 +3972,5 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     );
   }
 
-  return { job, jobName, namespace, prompt, claudeArgs, promptMetrics, promptSecret, envSecret, mcpConfigSecret, skippedLabels, podLogPath, serviceAccountName, claudeCodeVersion, scopedWritableDirs };
+  return { job, jobName, namespace, prompt, claudeArgs, promptMetrics, promptSecret, envSecret, mcpConfigSecret, sharedDocsSecret, skippedLabels, podLogPath, serviceAccountName, claudeCodeVersion, scopedWritableDirs };
 }
