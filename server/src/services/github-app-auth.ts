@@ -479,6 +479,16 @@ export function parseOpenPullRequestsAtHeadPayload(body: unknown, sha: string): 
  * restore exactly the fail-open this exists to close, and would do it on the
  * quiet path where no status changes state. The caller must refuse to publish
  * and let the next webhook re-evaluate.
+ *
+ * ⚠ Two documented limits on completeness, neither reaching a current attack
+ * path, both worth knowing before treating this as an exhaustive enumeration:
+ *
+ * - The association index can LAG for a brand-new pull request. That lag does
+ *   not run in the bypass's direction — the victim is the long-open PR, indexed
+ *   long ago — and the caller skips its own row regardless.
+ * - Once the commit is on the DEFAULT BRANCH, GitHub documents this endpoint as
+ *   returning only the pull request that merged it. A victim head on the default
+ *   branch is already merged, so no gate decision rides on it.
  */
 export async function githubListOpenPullRequestsForHeadSha(input: {
   repoFullName: string;
