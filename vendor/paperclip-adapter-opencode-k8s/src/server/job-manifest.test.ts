@@ -1,5 +1,13 @@
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it, expect, vi } from "vitest";
@@ -458,8 +466,14 @@ describe("buildJobManifest", () => {
   // the two are not redundant: the bridge links a whole company `docs/` directory in and
   // does nothing at all when a `docs/` already exists — which is every project repo that
   // ships its own docs, i.e. exactly the case where the materialized company docs are
-  // missing and the tracked ones are not. They compose in one order only.
-  it("runs the shared-doc copy before the docs symlink bridge", () => {
+  // missing and the tracked ones are not. They compose in one order only: BRIDGE FIRST.
+  //
+  // The first revision of PEN-3329 had it backwards, and the test that was here could not
+  // see it, because it only compared string positions. The copy's `mkdir -p` creates a
+  // real `docs/`, the bridge's guard is `[ -e docs ] || ln -sfn …`, so on a repo with no
+  // `docs/` of its own the bridge never fired and the pod silently lost every company doc
+  // that is referenced only from inside another doc. So this runs the composed shell.
+  it("runs the docs symlink bridge before the shared-doc copy", () => {
     const ctx = withRuntimeIsolation({
       ...mockCtx,
       config: {
@@ -493,7 +507,98 @@ describe("buildJobManifest", () => {
     const bridgeAt = command.indexOf('__pcd="$(dirname');
     expect(copyAt).toBeGreaterThan(-1);
     expect(bridgeAt).toBeGreaterThan(-1);
-    expect(copyAt).toBeLessThan(bridgeAt);
+    expect(bridgeAt).toBeLessThan(copyAt);
+  });
+
+  // The behavioural half of the test above. Takes the bridge and the copy out of the
+  // command the manifest actually generated — in the order it generated them — and runs
+  // that slice against a repo with no `docs/` of its own, which is the case the bridge
+  // exists for and the case the wrong order broke.
+  it("gives a repo with no docs/ of its own the whole company docs directory", () => {
+    const root = mkdtempSync(join(tmpdir(), "pen3329-compose-"));
+    try {
+      // `AGENT_HOME` is the per-agent bundle root; the bridge derives the company docs
+      // directory as its grandparent + `/docs`, which is where Paperclip materializes.
+      const agentHome = join(root, "companies", "acme", "agents", "cto");
+      const companyDocs = join(root, "companies", "acme", "docs");
+      const runWorkspace = join(root, "run-workspace");
+      // The execution workspace the server materializes into, and the overlay copies
+      // from. It holds only the DECLARED path, which is the whole point.
+      const execWorkspace = join(root, "exec-workspace");
+      mkdirSync(agentHome, { recursive: true });
+      mkdirSync(companyDocs, { recursive: true });
+      mkdirSync(runWorkspace, { recursive: true });
+      mkdirSync(join(execWorkspace, "docs"), { recursive: true });
+      // Declared: the server reports this one on `paperclipSharedDocs`.
+      writeFileSync(join(companyDocs, "pr-conventions.md"), "# PR Conventions\n\nreal\n");
+      writeFileSync(join(execWorkspace, "docs", "pr-conventions.md"), "# PR Conventions\n\nreal\n");
+      // NOT declared — referenced only from inside another doc, so it never reaches the
+      // declared set. Only the bridge can serve it, which is why losing the bridge is a
+      // real regression and not a cosmetic ordering preference.
+      writeFileSync(join(companyDocs, "backlog-template.md"), "# Backlog Template\n\nreal\n");
+
+      const ctx = withRuntimeIsolation({
+        ...mockCtx,
+        config: {
+          instructionsBundleMode: "external",
+          instructionsRootPath: agentHome,
+        },
+        context: {
+          ...mockCtx.context,
+          paperclipWorkspace: { cwd: execWorkspace },
+          paperclipSharedDocs: { sourceCwd: execWorkspace, paths: ["docs/pr-conventions.md"] },
+        },
+      }, {
+        isolationMode: "run",
+        isolationKey: "run:run123456",
+        workspaceRoot: runWorkspace,
+        homeRoot: join(root, "home"),
+        sessionRoot: join(root, "session"),
+        cacheRoot: join(root, "cache"),
+        tmpRoot: join(root, "tmp"),
+        storage: runtimeStorage("ephemeral"),
+        sessionScope: { taskKey: "pr-review-42", isolationKey: "run:run123456" },
+      });
+
+      const command = buildJobManifest({ ctx, selfPod: mockSelfPod, agentDbClaimName: null })
+        .job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
+
+      // Both snippets are located independently and then replayed in whatever order the
+      // command put them, so this test reports the lost document rather than the index.
+      // Asserting the order here instead would make the mutation fail on an arithmetic
+      // precondition and never exercise the shell, which is how the string-position test
+      // this replaces missed the defect in the first place.
+      const bridgeAt = command.indexOf("( [ -e docs ]");
+      const copyAt = command.indexOf("__pcdocs_src=");
+      expect(bridgeAt).toBeGreaterThan(-1);
+      expect(copyAt).toBeGreaterThan(-1);
+      const bridgeEnd = command.indexOf("|| true;", bridgeAt) + "|| true;".length;
+      const copyEnd = command.indexOf("true;", copyAt) + "true;".length;
+      const composed = [
+        { at: bridgeAt, text: command.slice(bridgeAt, bridgeEnd) },
+        { at: copyAt, text: command.slice(copyAt, copyEnd) },
+      ]
+        .sort((left, right) => left.at - right.at)
+        .map((snippet) => snippet.text)
+        .join(" ");
+
+      const result = spawnSync("/bin/sh", ["-c", composed], {
+        cwd: runWorkspace,
+        encoding: "utf8",
+        env: { ...process.env, AGENT_HOME: agentHome },
+      });
+
+      expect(result.status).toBe(0);
+      // The bridge fired: `docs/` is the company directory, not a partial copy of it.
+      expect(lstatSync(join(runWorkspace, "docs")).isSymbolicLink()).toBe(true);
+      expect(readFileSync(join(runWorkspace, "docs", "pr-conventions.md"), "utf8")).toContain("real");
+      // The doc nothing declared — lost entirely under the wrong order.
+      expect(readFileSync(join(runWorkspace, "docs", "backlog-template.md"), "utf8")).toContain("real");
+      // And the copy wrote nothing through the link into the shared company directory.
+      expect(readdirSync(companyDocs).sort()).toEqual(["backlog-template.md", "pr-conventions.md"]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   // A `workspace`-isolated pod MOUNTS the execution workspace, so the docs are already

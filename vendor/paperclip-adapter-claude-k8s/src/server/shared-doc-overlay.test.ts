@@ -1,5 +1,14 @@
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -261,5 +270,71 @@ describe("shared docs survive the run-isolated pod bootstrap", () => {
     // either way the step exits 0 and the following doc still lands.
     expect(result.status).toBe(0);
     expect(existsSync(join(run, "docs", "definition-of-done.md"))).toBe(true);
+  });
+  // Ally's review of head `3d01f3e3` — `-e` follows symlinks, so a dangling one reads as
+  // absent and `cp` writes through it to wherever it points.
+  // Ally's review of head `3d01f3e3` raised a tracked *dangling* symlink at the
+  // destination: `-e` follows symlinks, so it reads as absent. GNU `cp` turns out to
+  // refuse the write itself ("not writing through dangling symlink"), so on this host the
+  // link is not actually followed — but it exits 1 to do it, which the step then reports
+  // as a copy failure that is not one. `-L` makes it the skip it should always have been,
+  // and keeps the behaviour the same under a `cp` that does follow the link.
+  it("treats a tracked dangling symlink as present, and reports no copy failure", () => {
+    symlinkSync("../outside.md", join(base, "docs", "dangling.md"));
+    git(base, "add", "docs/dangling.md");
+    git(base, "commit", "-q", "-m", "tracked dangling symlink");
+    bootstrapClone();
+    // The clone carries the symlink itself; the overlay's source is a real file.
+    rmSync(join(base, "docs", "dangling.md"), { force: true });
+    writeFileSync(join(base, "docs", "dangling.md"), "# real content\n");
+
+    const result = runOverlay(["docs/dangling.md"]);
+
+    expect(result.status).toBe(0);
+    expect(result.stderr).not.toContain("could not be copied");
+    // Nothing was written at the link's target, and the link is left as the repo has it.
+    expect(existsSync(join(run, "outside.md"))).toBe(false);
+    expect(lstatSync(join(run, "docs", "dangling.md")).isSymbolicLink()).toBe(true);
+  });
+
+  // The opencode tree's `sharedDocsBridge` (BLO-10315) symlinks the whole company `docs/`
+  // in when the repo has none of its own, and the bridge runs FIRST. A `cp` into that
+  // symlinked directory would land in the shared company directory, outside this run —
+  // and for a Paperclip placeholder it would overwrite the real document for every later
+  // run. The overlay has to refuse, which is what makes bridge-first safe.
+  it("refuses to copy into a symlinked docs/ directory rather than writing to shared storage", () => {
+    const company = join(root, "company-docs");
+    mkdirSync(company, { recursive: true });
+    writeFileSync(join(company, "pr-conventions.md"), "# PR Conventions\n\ncompany copy\n");
+    // A repo with no `docs/` of its own: the bridge links the company directory in.
+    rmSync(run, { recursive: true, force: true });
+    mkdirSync(run, { recursive: true });
+    symlinkSync(company, join(run, "docs"));
+
+    // `definition-of-done.md` is NOT in the company directory, so `[ -e ]` fails and the
+    // copy would otherwise proceed — straight through the link.
+    const result = runOverlay(["docs/definition-of-done.md", "docs/pr-conventions.md"]);
+
+    expect(result.status).toBe(0);
+    expect(existsSync(join(company, "definition-of-done.md"))).toBe(false);
+    expect(result.stderr).toContain("docs/definition-of-done.md is absent under a symlinked docs/ directory");
+    // The one the bridge does serve is left exactly as the company directory has it.
+    expect(readFileSync(join(company, "pr-conventions.md"), "utf8")).toContain("company copy");
+  });
+
+  // The same shape one level down: a symlinked ANCESTOR, not the file's own directory.
+  it("walks ancestors, so a symlinked docs/ also protects a nested declared path", () => {
+    const company = join(root, "company-docs");
+    mkdirSync(join(company, "nested"), { recursive: true });
+    rmSync(run, { recursive: true, force: true });
+    mkdirSync(run, { recursive: true });
+    symlinkSync(company, join(run, "docs"));
+    mkdirSync(join(base, "docs", "nested"), { recursive: true });
+    writeFileSync(join(base, "docs", "nested", "guide.md"), "# Guide\n");
+
+    const result = runOverlay(["docs/nested/guide.md"]);
+
+    expect(result.status).toBe(0);
+    expect(existsSync(join(company, "nested", "guide.md"))).toBe(false);
   });
 });

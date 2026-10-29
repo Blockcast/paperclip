@@ -1560,6 +1560,24 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // ones are not. This copies the declared files individually and skips only the
   // individual paths that are already present, so the two compose: the bridge keeps
   // covering repos with no `docs/` of their own, this covers the rest.
+  //
+  // THE BRIDGE MUST RUN FIRST, and `baseMainCommand` orders it that way. Both halves of
+  // that sentence are load-bearing and the opposite order silently loses documents:
+  //
+  //   * Bridge first, overlay second — on a repo with no `docs/`, the bridge links the
+  //     whole company directory in and the overlay then finds every declared path already
+  //     present and copies nothing. The bridge's coverage is strictly wider, because it
+  //     serves docs referenced only from inside another doc, which never appear in the
+  //     declared set.
+  //   * Overlay first, bridge second — the overlay's `mkdir -p "$(dirname …)"` creates a
+  //     real `docs/`, and the bridge's own guard is `[ -e docs ] || ln -sfn …`, so the
+  //     bridge then never fires. The repo ends up with only the declared subset, and the
+  //     transitively-referenced company docs are gone with nothing logged. That was the
+  //     shape this PR shipped at `3d01f3e3` and Ally caught it on review.
+  //
+  // The overlay refuses to write through a symlinked ancestor (see `shared-doc-overlay.ts`),
+  // which is what keeps bridge-first safe: a declared doc that is absent even from the
+  // company directory is reported, not `cp`-ed through the link into shared storage.
   const sharedDocOverlay = workspaceSetup ? parseSharedDocOverlay(context.paperclipSharedDocs) : null;
   const sharedDocOverlaySetup = sharedDocOverlay
     ? `${buildSharedDocOverlayShell({
@@ -1613,7 +1631,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // so a verdict after it would describe a pod that had already reached GitHub.
   // Advisory — the push path already fails closed; this buys time-to-diagnosis.
   const prePushHookPreflight = buildPrePushHookPreflightShell({ dataMountPath: workspaceMountPath });
-  const baseMainCommand = `set -o pipefail; ${imageWrapperPreflight}; ${prePushHookPreflight}; ${isolatedRuntimePrep}${opencodeRuntime}${workspaceSetup}${sharedDocOverlaySetup}${credentialSetup}${envGuardPluginSetup}${configSetup}${dbResetGuard}${compactPrefix}${sharedDocsBridge}mkdir -p $(dirname ${shellQuote(podLogPath)}) && : > ${shellQuote(podLogPath)} && cat /tmp/prompt/prompt.txt | ${launcherCommand} ${opencodeArgsEscaped} | tee -a ${shellQuote(podLogPath)}`;
+  const baseMainCommand = `set -o pipefail; ${imageWrapperPreflight}; ${prePushHookPreflight}; ${isolatedRuntimePrep}${opencodeRuntime}${workspaceSetup}${sharedDocsBridge}${sharedDocOverlaySetup}${credentialSetup}${envGuardPluginSetup}${configSetup}${dbResetGuard}${compactPrefix}mkdir -p $(dirname ${shellQuote(podLogPath)}) && : > ${shellQuote(podLogPath)} && cat /tmp/prompt/prompt.txt | ${launcherCommand} ${opencodeArgsEscaped} | tee -a ${shellQuote(podLogPath)}`;
   // Redirect Chrome's BrowserMetrics spool off the shared CephFS HOME to the
   // main container's per-pod runtime-cache emptyDir. The
   // agent-browser designer tool launches system Chrome with the default
