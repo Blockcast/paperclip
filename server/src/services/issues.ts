@@ -11470,14 +11470,34 @@ export function issueService(db: Db) {
           patch.parkedByAgentId = actorAgentId ?? null;
           patch.parkedAt = new Date();
         }
-        // PEN-4420: re-arm the park's release edge on BOTH arms. A park now fires exactly
-        // one expiry wake, marked by `parkedWakeFiredAt`, so a row re-parked after that
-        // wake fired would never fire again if the marker survived -- the park would be
-        // silently one-shot per row instead of per park. Cleared on the un-park arm too:
-        // the marker describes a park, and once there is no park there is nothing for it
-        // to describe. The sweep carries an independent `parkedWakeFiredAt < parkedAt`
-        // backstop so a future writer that forgets this line degrades to a late wake
-        // rather than to permanent silence.
+        // PEN-4420: re-arm the park's release edge on BOTH arms. A park fires exactly one
+        // expiry wake, marked by `parkedWakeFiredAt`; this reset is what scopes that
+        // marker to the CURRENT park rather than to the row. Cleared on the un-park arm
+        // too: the marker describes a park, and once there is no park there is nothing
+        // for it to describe. The sweep carries an independent
+        // `parkedWakeFiredAt < parkedAt` backstop so a future writer that forgets this
+        // line degrades to a late wake rather than to permanent silence.
+        //
+        // ⚠️ PEN-4894 corrected the rationale this comment used to give. It said a
+        // surviving marker would make the park "silently one-shot per row instead of per
+        // park". That is NOT true as written: the re-park arm above restamps `parkedAt`
+        // to now, so a surviving older marker satisfies the sweep's
+        // `parkedWakeFiredAt < parkedAt` arm and the edge stays armed. The two guards are
+        // redundant for THIS writer and independent only against a different writer's
+        // bug. The reset is still correct -- it is the primary guard, and the backstop is
+        // deliberately not load-bearing (migration 0262's header: it exists to survive "a
+        // future writer that forgets the reset"). Do not delete this line on the strength
+        // of the backstop; that would promote the thing meant to CATCH the bug into the
+        // thing that must not HAVE it.
+        //
+        // This line is also why `parkedWakeFiredAt` is not an audit record of park wakes:
+        // a park wake that works dispatches a run, and that run routinely re-parks the
+        // row, landing here and erasing the stamp the sweep just wrote. Correct for a
+        // claim marker, wrong for anyone asking the row "did park wakes fire?" -- which
+        // is a question for `agent_wakeup_requests`. Preserving the stamp across a
+        // re-park was considered and declined; the reasoning, the measurement and the
+        // reader-facing guidance all live in `runbooks/deliberate-park-release-edge.md`
+        // and the module doc of `services/issue-park-expiry.ts`, not restated here.
         patch.parkedWakeFiredAt = null;
       }
 

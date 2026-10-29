@@ -1,13 +1,17 @@
 // PEN-3156: process wrapper for the `git` egress door.
 //
 // SCOPE — this is an ACCIDENTAL-DISCLOSURE guard. It is not a tamper-resistant
-// boundary and must not be described as one. Every component of it — wrapper,
-// hook, and scanner alike — sits on a surface writable by the account it
-// guards, so it stops a mistake and does not stop a decision. Enforcement that
-// holds against a deliberate bypass does not exist yet; it is tracked as
-// PEN-3183 and that, not this file, is the control to cite when asking whether
-// an agent can publish a credential on purpose. The reasoning is under THREAT
-// MODEL below. Read it before extending, renaming, or relying on any of this.
+// boundary and must not be described as one. Wrapper, hook and scanner are now
+// root-owned or read-only to the agent (PEN-3713, BLO-32734), so the guard is
+// no longer trivially rewritable — but it still stops a mistake and does not
+// stop a decision, because the account it guards may run the real `git` and may
+// read the credential that authenticates the push. Enforcement that holds
+// against a deliberate bypass does not exist yet; it is tracked as PEN-3183 and
+// that, not this file, is the control to cite when asking whether an agent can
+// publish a credential on purpose. The decision on where that enforcement will
+// live is recorded in `docs/security/PEN-3183-git-egress-enforcement-boundary-decision.md`.
+// The reasoning is under THREAT MODEL below. Read it before extending,
+// renaming, or relying on any of this.
 //
 // Two modes, one module, because they must agree about what a push is:
 //
@@ -41,35 +45,55 @@
 // on the path the agent actually takes is effective, and every refusal above
 // earns its place.
 //
-// What it does NOT defend against is an agent that sets out to defeat it. In
-// the deployed pod, measured 2026-09-11:
+// What it does NOT defend against is an agent that sets out to defeat it.
+// PEN-3183 enumerated four bypasses measured 2026-09-11. Three have since been
+// closed; re-measured in a live agent pod 2026-10-28:
 //
-//   - `/usr/bin/git` is mode 0755 and directly executable. Nothing routes it
-//     through this wrapper; the wrapper is reached via PATH, which the caller
-//     chooses. No file needs to be written to take that path.
-//   - The agent runs as uid 1000 (`node`), and
-//     `/opt/paperclip-bundled-adapters` — which holds THIS FILE as compiled
-//     JavaScript — is `drwxr-xr-x node node`. The scanner is writable by the
-//     account it scans.
-//   - `${LOCAL_BIN}/git`, `${PATH_BIN}/git` and the hooks directory are all on
-//     the PVC, mounted `fsGroup: 1000`, so they are writable too.
+//   - CLOSED (PEN-3713) `/opt/paperclip-bundled-adapters`, which holds THIS
+//     FILE as compiled JavaScript, is now `root root` and the scanner is 0644
+//     root-owned. The scanner is no longer writable by the account it scans.
+//   - CLOSED (PEN-3713) The wrappers moved to `/usr/local/libexec/paperclip/bin`,
+//     root-owned and FIRST on PATH, ahead of both `/usr/bin` and the PVC
+//     directories. `deploy/helm/paperclip/tests/agent-egress-path.test.mjs`
+//     holds that ordering.
+//   - CLOSED, CONDITIONALLY (BLO-32734) The hooks directory is re-exposed
+//     `readOnly: true` over an emptyDir root overlay. It is still owned
+//     `node:node`: the MOUNT closes this, not the ownership, and only when
+//     `narrowWritableSurface` holds. A Job rendering
+//     `paperclip.io/data-mount-scope: broad:*` re-opens it.
+//   - OPEN `/usr/bin/git` is mode 0755 and directly executable. Nothing routes
+//     it through this wrapper; the wrapper is reached via PATH, which the
+//     caller chooses. No file needs to be written to take that path — and the
+//     credential that authenticates the push is mounted 0444, so the real git
+//     can be driven with it. That is what makes this one a publish path rather
+//     than a nuisance.
 //
-// So the hook, the wrapper and the scanner are peers, not layers: an agent able
-// to tamper with any one of them can tamper with all three, and does not need
-// to tamper with anything to call the real git directly. Do not add integrity
-// checks between these components — verifying the hook's content from the
-// wrapper, or vice versa, asserts a boundary that does not exist and reads to
-// the next person as though tamper-resistance had been established.
+// The surviving bypass is not a file-ownership problem and cannot be closed by
+// one. The agent and this wrapper are the SAME principal: one container, uid
+// 1000, `allowPrivilegeEscalation: false`, all capabilities dropped. Any binary
+// this wrapper may execute, the agent may execute directly. So do not add
+// integrity checks between wrapper, hook and scanner — that is one principal
+// verifying itself; it asserts a boundary that does not exist and reads to the
+// next person as though tamper-resistance had been established. Do not reach
+// for a setuid helper either: the controls that forbid it are correct, and
+// relaxing them to buy a guard is a strictly negative trade.
 //
 // Making this door hold against a deliberate bypass is a different change in a
-// different place: enforcement off the agent's own machine (a server-side
-// pre-receive hook, or egress network policy that forces pushes through a
-// proxy). That is PEN-3183 — filed, with the four bypasses enumerated and
-// measured, rather than approximated here. It is named rather than gestured at
-// on purpose: "filed separately" is a promise a reader cannot check, and an
-// uncheckable promise is how a documented limit quietly becomes a forgotten
-// one. A control that looks tamper-proof and is not is worse than one whose
-// limits are written down and tracked.
+// different place, and PEN-3183 has now decided where: enforcement moves
+// CREDENTIAL-SIDE. The credential is the one choke point common to all three
+// doors (git, `gh`, MCP), which are otherwise each reached through caller-chosen
+// PATH and each carry this same bypass. Held in a separate container at a uid
+// that is not 1000, performing the publish rather than emitting the token, it
+// turns this bypass from "publishes unscanned" into "fails to authenticate".
+// ⛔ A credential helper that scans and then hands the token to uid 1000 is NOT
+// that boundary — the agent can call the helper itself and skip the scan.
+// The decision, the declined alternatives, and the dated acceptance of the
+// residual until it ships are in
+// `docs/security/PEN-3183-git-egress-enforcement-boundary-decision.md`. It is
+// named rather than gestured at on purpose: "filed separately" is a promise a
+// reader cannot check, and an uncheckable promise is how a documented limit
+// quietly becomes a forgotten one. A control that looks tamper-proof and is not
+// is worse than one whose limits are written down and tracked.
 
 import { spawn, spawnSync } from "node:child_process";
 import { accessSync, constants, readdirSync, realpathSync } from "node:fs";
@@ -77,6 +101,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { DEFAULT_HOOKS_DIR } from "./github-git-hooks-path.js";
+
+import { brokerSocketPath, runPublishBrokerClient } from "./github-publish-broker-client.js";
 
 import {
   ALIAS_HOP_LIMIT,
@@ -607,6 +633,39 @@ export function runGitEgressRuntime(options: {
     if (result.error || result.status !== 0) return false;
     return repoGatesOnDco(result.stdout.trim());
   };
+
+  // PEN-4933: a push needs a credential, and in a brokered deployment this
+  // container does not have one. Hand the publish to the broker instead.
+  //
+  // `buildGitArgv` runs FIRST, for its refusals. Those are caller errors
+  // (`--no-verify`, a `core.hooksPath` of your own, a publishing verb that no
+  // hook can guard) and they are better answered here, with the caller's own
+  // repository and config in reach, than as a line relayed back over a socket.
+  // Its RESULT is discarded: the broker re-derives it from the original argv,
+  // because a guard that trusted the argv the agent handed it would be a guard
+  // the agent writes.
+  //
+  // Nothing about this branch is a control. An agent that deletes it reaches
+  // `/usr/bin/git` with no token — see `github-publish-broker-client.ts`.
+  const brokerSocket = brokerSocketPath(env);
+  if (brokerSocket) {
+    const classification = classifyGitInvocation(options.argv, resolveAlias, env);
+    if (classification.isPush) {
+      buildGitArgv(options.argv, {
+        hooksDir: options.hooksDir,
+        resolveAlias,
+        env,
+        hookPresent: options.hookPresent,
+        requiresSignoff,
+      });
+      return runPublishBrokerClient({
+        socketPath: brokerSocket,
+        tool: "git",
+        argv: [...options.argv],
+        cwd: process.cwd(),
+      });
+    }
+  }
 
   const argv = buildGitArgv(options.argv, {
     hooksDir: options.hooksDir,

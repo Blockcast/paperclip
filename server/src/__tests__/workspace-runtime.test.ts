@@ -36,6 +36,7 @@ import {
   ensureRuntimeServicesForRun,
   executeProcessForTests,
   GIT_INDEX_LOCK_STALE_MS,
+  GitCommandFailedError,
   GitCommandTimeoutError,
   createGitLinkExclusivelyForTests,
   isInconclusiveGitFailureForTests,
@@ -47,6 +48,7 @@ import {
   realizeExecutionWorkspace,
   releaseRuntimeServicesForRun,
   resetRuntimeServicesForTests,
+  runGitForTests,
   resolveWorkspaceRuntimeReadinessTimeoutSec,
   resolveShell,
   sanitizeRuntimeServiceBaseEnv,
@@ -8392,6 +8394,87 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
     } finally {
       restore();
       warn.mockRestore();
+    }
+  }, 40_000);
+
+  it("keeps a real non-zero exit a VERDICT even when the throw carries a string ERR_ code (PEN-4900)", async () => {
+    // The `ERR_` arm of `isInconclusiveGitFailure` is deliberately broad, and
+    // used to be safe only because of an invariant held at the `runGit` throw
+    // ~2,800 lines away: that it was a bare `Error` carrying no `code`. Nothing
+    // next to that throw said so. Attaching `code: "ERR_GIT_EXIT"` there for
+    // diagnostics reads as purely additive at the call site, and would in fact
+    // have reclassified EVERY real verdict as inconclusive -- which disables
+    // the `fs.rm(dotGit)` cleanup in `relinkHuskGitWorktree`, silently, since
+    // the inconclusive branch only warns.
+    //
+    // The guarantee is now carried by the error's TYPE, and it has two halves
+    // that only compose if both are pinned here:
+    //   A. the production throw really is a `GitCommandFailedError`, and
+    //   B. that type outranks anything later attached to the error.
+    // Asserting B alone would still pass if the throw were downgraded to a bare
+    // `new Error(...)`; asserting A alone would still pass if the predicate
+    // stopped consulting the type.
+    const previous = process.env.PAPERCLIP_SERVER_GIT;
+    const restore = () => {
+      if (previous === undefined) delete process.env.PAPERCLIP_SERVER_GIT;
+      else process.env.PAPERCLIP_SERVER_GIT = previous;
+    };
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), `pen-4900-${randomUUID()}-`));
+    try {
+      // Half A -- the real throw, from a git that genuinely ran and exited 128,
+      // not a hand-built stand-in. Same rationale as the PEN-4877/PEN-4878
+      // cases above: the discriminator rests on what the production path
+      // actually produces.
+      const failingGit = path.join(dir, "failing-git.sh");
+      await fs.writeFile(failingGit, "#!/bin/sh\necho 'fatal: not a git repository' >&2\nexit 128\n", { mode: 0o755 });
+      process.env.PAPERCLIP_SERVER_GIT = failingGit;
+      const thrown = await runGitForTests(["rev-parse", "--show-toplevel"], dir)
+        .then(() => null, (error: unknown) => error);
+      restore();
+
+      expect(thrown).toBeInstanceOf(GitCommandFailedError);
+      // The message is load-bearing elsewhere (`gitErrorIncludes` matches on
+      // it), so the subclass must not have changed it.
+      expect((thrown as Error).message).toBe("fatal: not a git repository");
+      expect(isInconclusiveGitFailureForTests(thrown)).toBe(false);
+
+      // Half B -- the predicted mutation, applied to that very object: a string
+      // `ERR_` code attached after the fact. Still a verdict.
+      expect(isInconclusiveGitFailureForTests(
+        Object.assign(thrown as Error, { code: "ERR_GIT_EXIT" }),
+      )).toBe(false);
+      // ...and still a verdict when decorated the way a spawn failure looks,
+      // which is the stronger statement: `syscall` no longer wins either.
+      expect(isInconclusiveGitFailureForTests(
+        Object.assign(thrown as Error, { code: "ERR_GIT_EXIT", syscall: "spawn" }),
+      )).toBe(false);
+
+      // Two-sided, or "always verdict" scores identically to a correct fix and
+      // a genuine stall would start deleting good `.git` links -- the exact
+      // regression PEN-4877 closed. An `ERR_`-coded error that is NOT a
+      // non-zero exit must still read inconclusive.
+      const syncThrow = await executeProcessForTests({
+        command: 7 as unknown as string,
+        args: [],
+        cwd: os.tmpdir(),
+      }).then(() => null, (error: unknown) => error);
+      expect((syncThrow as NodeJS.ErrnoException).code).toMatch(/^ERR_/);
+      expect(syncThrow).not.toBeInstanceOf(GitCommandFailedError);
+      expect(isInconclusiveGitFailureForTests(syncThrow)).toBe(true);
+
+      const spawnFailure = await executeProcessForTests({
+        command: path.join(os.tmpdir(), `absent-git-${randomUUID()}`),
+        args: [],
+        cwd: os.tmpdir(),
+      }).then(() => null, (error: unknown) => error);
+      expect(isInconclusiveGitFailureForTests(spawnFailure)).toBe(true);
+
+      expect(isInconclusiveGitFailureForTests(
+        new GitCommandTimeoutError("git rev-parse --show-toplevel timed out after 1ms", { stdout: "" }),
+      )).toBe(true);
+    } finally {
+      restore();
+      await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
     }
   }, 40_000);
 

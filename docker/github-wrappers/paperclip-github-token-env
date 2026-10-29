@@ -25,6 +25,24 @@ if [ "${GH_SEAT_TOKEN_VALUE+x}" = x ]; then
   exec "$@"
 fi
 TOKEN_FILE="${PAPERCLIP_GITHUB_TOKEN_FILE:-/etc/paperclip/secrets/github-token/token}"
+# PEN-4933: in a brokered deployment the credential is mounted into the broker
+# container and NOT into this one, so "no token file here" is the designed
+# state rather than a fault. Exec the child with no token: the egress runtime
+# it is about to start will hand the publish to the broker over
+# PAPERCLIP_GITHUB_BROKER_SOCKET.
+#
+# Deliberately conditioned on the broker socket being set AND the file being
+# absent, so a deployment that has a token file keeps every refusal below.
+# A missing file with no broker configured is still the loud failure PEN-3705
+# made it: an agent that starts blind is the failure mode that cost a review
+# that was never performed (BLO-37977).
+#
+# This is not a control and must not be read as one. The variable is in the
+# agent's own environment, so unsetting it here just means the child runs with
+# no token at all — which is the same outcome, reached sooner.
+if [ -n "${PAPERCLIP_GITHUB_BROKER_SOCKET:-}" ] && [ ! -r "${TOKEN_FILE}" ]; then
+  exec "$@"
+fi
 MOVED=""
 case "${TOKEN_FILE}" in
   /paperclip/.secrets/*)

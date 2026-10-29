@@ -134,7 +134,7 @@ import { initTelemetry, getTelemetryClient } from "./telemetry.js";
 import { conflict } from "./errors.js";
 import { githubReviewerAppSlug } from "./services/github-app-auth.js";
 import { reconcileContendedPrReviewerWakes } from "./routes/github-webhook.js";
-import { coordinateHeartbeatSchedulerShutdown, HEARTBEAT_SCHEDULER_IDLE_WAIT_TIMEOUT_MS } from "./shutdown.js";
+import { closeServerBounded, coordinateHeartbeatSchedulerShutdown, HEARTBEAT_SCHEDULER_IDLE_WAIT_TIMEOUT_MS } from "./shutdown.js";
 import type {
   InstanceDatabaseBackupRunResult,
   InstanceDatabaseBackupTrigger,
@@ -3641,6 +3641,10 @@ export async function startServer(): Promise<StartedServer> {
         }
       }
 
+      // BLO-49139: step breadcrumbs (sync stderr, so they survive a SIGKILL at
+      // the grace deadline) — the 10-28 rollout went silent after the setup
+      // drain on paperclip-0 and nothing said which step hung.
+      writeShutdownBreadcrumb(`step: sse drain (signal=${signal})`);
       try {
         const { sseRegistry } = await import("./services/sse-registry.js");
         await sseRegistry.drain({ timeoutMs: 25_000, reason: `shutdown:${signal}` });
@@ -3649,21 +3653,22 @@ export async function startServer(): Promise<StartedServer> {
         logger.warn({ err }, "sseRegistry.drain failed");
       }
 
-      await new Promise<void>((resolveClose) => {
-        server.close((err) => {
-          if (err) logger.warn({ err }, "server.close error");
-          resolveClose();
-        });
-        server.closeIdleConnections?.();
-      });
+      writeShutdownBreadcrumb(`step: server.close (signal=${signal})`);
+      const closeErr = await closeServerBounded(server, 10_000, () =>
+        writeShutdownBreadcrumb("server.close exceeded 10s; closing all connections"),
+      );
+      if (closeErr) logger.warn({ err: closeErr }, "server.close error");
+      writeShutdownBreadcrumb(`step: server.close done (signal=${signal})`);
 
       const telemetryClient = getTelemetryClient();
       if (telemetryClient) {
+        writeShutdownBreadcrumb(`step: telemetry flush (signal=${signal})`);
         telemetryClient.stop();
         await telemetryClient.flush();
       }
 
       if (!skipHeartbeatDrain && drainHeartbeatRunsForShutdown) {
+        writeShutdownBreadcrumb(`step: heartbeat run drain (signal=${signal})`);
         try {
           const drain = await drainHeartbeatRunsForShutdown(signal);
           logger.info({ signal, drain }, "graceful heartbeat run drain complete");

@@ -225,6 +225,65 @@ RUN curl -fsSL "https://github.com/int128/kubelogin/releases/download/${KUBELOGI
   && chmod +x /usr/local/bin/kubectl-oidc_login \
   && rm -f /tmp/kubelogin.zip /tmp/LICENSE
 
+# yq — PEN-4932. Image-owned, replacing the copy that currently reaches agents
+# only through the shared `paperclip-data` PVC at `/paperclip/bin/yq` (and a
+# second, same-version copy at `/paperclip/.local/bin/yq`). That row is one of
+# ROOT_TOOLCHAIN_SUBPATHS, so it is mounted into every agent pod off a single
+# CephFS volume handle: a tool nobody can reach without the shared mount is a
+# tool that keeps the mount, and the mount is what gives one hung
+# NodeUnstageVolume a whole node's blast radius. Version matches what the PVC
+# carried when it was inventoried (2026-10-28) so baking it changes no agent's
+# observed behaviour.
+ARG YQ_VERSION=v4.44.3
+RUN curl -fsSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" \
+       -o /usr/local/bin/yq \
+  && chmod +x /usr/local/bin/yq \
+  && yq --version | grep -Fq "${YQ_VERSION}"
+
+# Bun — PEN-4932, same reasoning as yq above. Reaches agents today only via the
+# `.bun/bin` entry of ROOT_TOOLCHAIN_SUBPATHS. `bunx` is a symlink to `bun` on
+# the PVC and is recreated here rather than copied, so both names resolve
+# without the shared mount.
+ARG BUN_VERSION=1.3.14
+RUN curl -fsSL "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-x64.zip" \
+       -o /tmp/bun.zip \
+  && unzip -q -d /tmp /tmp/bun.zip \
+  && mv /tmp/bun-linux-x64/bun /usr/local/bin/bun \
+  && chmod +x /usr/local/bin/bun \
+  && ln -sfn /usr/local/bin/bun /usr/local/bin/bunx \
+  && rm -rf /tmp/bun.zip /tmp/bun-linux-x64 \
+  && bun --version | grep -Fq "${BUN_VERSION}"
+
+# wasm-pack — PEN-4932. The ONE entry in the PVC's `.local/bin` row that both
+# runs today and has no image equivalent, so it is the only one of that row
+# that has to be baked rather than dropped (see
+# docs/plans/2026-10-28-pen-4932-per-agent-volumes.md Section 3.3). The rest of
+# that row is either structurally dead — every Python entry-point shim there
+# imports from a `site-packages` tree that is NOT mounted, so they all exit 1
+# with ModuleNotFoundError — or is an observability/scanner binary whose
+# correct version is defined by something else in the fleet and is therefore
+# fetched at use time, not frozen into this image.
+#
+# Unlike those, wasm-pack has no external version authority to drift from: it
+# is a build tool, pinned per project by the Rust toolchain that consumes it.
+# Building it from source via `cargo install` costs minutes per agent run; the
+# upstream musl tarball is 2.8 MB and static.
+#
+# Checksummed for the same reason the Chrome pin above is: this unpacks into
+# /usr/local/bin, so `curl --fail` alone is not enough — it rejects an HTTP
+# error, not a served-but-wrong artifact. Digest verified 2026-10-28 against
+# the artifact this URL serves.
+ARG WASM_PACK_VERSION=0.13.1
+ARG WASM_PACK_SHA256=c539d91ccab2591a7e975bcf82c82e1911b03335c80aa83d67ad25ed2ad06539
+RUN curl -fsSL "https://github.com/rustwasm/wasm-pack/releases/download/v${WASM_PACK_VERSION}/wasm-pack-v${WASM_PACK_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+       -o /tmp/wasm-pack.tgz \
+  && printf '%s  %s\n' "${WASM_PACK_SHA256}" /tmp/wasm-pack.tgz | sha256sum -c - \
+  && tar -xzf /tmp/wasm-pack.tgz -C /tmp \
+  && mv "/tmp/wasm-pack-v${WASM_PACK_VERSION}-x86_64-unknown-linux-musl/wasm-pack" /usr/local/bin/wasm-pack \
+  && chmod +x /usr/local/bin/wasm-pack \
+  && rm -rf /tmp/wasm-pack.tgz "/tmp/wasm-pack-v${WASM_PACK_VERSION}-x86_64-unknown-linux-musl" \
+  && wasm-pack --version | grep -Fq "${WASM_PACK_VERSION}"
+
 # ---------------------------------------------------------------------------
 # Designer + browser automation CLIs (ccrotate-designer-lease)
 # ---------------------------------------------------------------------------

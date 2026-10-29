@@ -150,7 +150,7 @@ describe("buildAlert", () => {
     // RBAC -- and since the kubeconfig step is continue-on-error, the
     // kubeconfig case is now the one most likely to land here. Naming only RBAC
     // sends the reader to check permissions that were never the problem.
-    assert.match(alert.annotations.description, /BLOCKCAST_KUBE_CONFIG_B64/);
+    assert.match(alert.annotations.description, /KUBECONFIG_PAPERCLIP_CI_DEPLOY/);
     assert.match(alert.annotations.description, /lacks get on ConfigMap/);
     assert.match(alert.annotations.description, /kubectl, jq, sha256sum/);
   });
@@ -237,14 +237,15 @@ describe("the workflow wiring", () => {
     assert.doesNotMatch(workflowSource, /- name: Checkout repository\n\s+continue-on-error: true/);
   });
 
-  it("declares no environment, so hourly runs cannot bury the production deploy record", () => {
-    // Declaring `environment:` is the only way to read
-    // KUBECONFIG_PAPERCLIP_CI_DEPLOY, and it would also mint a GitHub deployment
-    // record on EVERY run. paperclip-production carries ~1 record per daily
-    // deploy today; ~24/day from a read-only detector would bury that audit
-    // trail. The workflow header records the fallback if the repo-level
-    // credential turns out to lack the two `get`s.
-    assert.doesNotMatch(workflowSource, /^\s*environment:/m);
+  it("reads the CI-deploy credential without minting a deployment record", () => {
+    // BLO-49651: the repo-level BLOCKCAST_KUBE_CONFIG_B64 identity is Forbidden
+    // on the approval ConfigMap, so the job reads KUBECONFIG_PAPERCLIP_CI_DEPLOY,
+    // an environment secret of paperclip-production. `deployment: false` is
+    // what keeps an hourly read-only detector out of that environment's
+    // deployment history, which the deploy-supersede/stall scripts read.
+    assert.match(workflowSource, /environment:\n\s+name: paperclip-production\n\s+deployment: false\n/);
+    assert.match(workflowSource, /secrets\.KUBECONFIG_PAPERCLIP_CI_DEPLOY/);
+    assert.doesNotMatch(workflowSource, /secrets\.BLOCKCAST_KUBE_CONFIG_B64/);
   });
 
   it("runs on a lane with proven cluster reach", () => {

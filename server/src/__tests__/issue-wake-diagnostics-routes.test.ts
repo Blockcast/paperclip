@@ -23,6 +23,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes, ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS } from "../routes/issues.js";
+import { ISSUE_PARK_EXPIRED_WAKE_REASON } from "../services/issue-park-expiry.js";
 import {
   locklessDeferredWakeDisposition,
   locklessDeferredWakeTerminalError,
@@ -413,6 +414,66 @@ describeEmbeddedPostgres("issue wake diagnostics route", () => {
     const serialized = JSON.stringify(res.body);
     expect(serialized).not.toContain("\"payload\"");
     expect(serialized).not.toContain("remediation");
+  });
+
+  // PEN-4894. The deliberate park's release wake, and the one reason NEITHER
+  // writer-derived scan can reach: `tickExpiredIssueParks` does not insert into
+  // `agent_wakeup_requests` at all, it calls `enqueueWakeup({ reason:
+  // ISSUE_PARK_EXPIRED_WAKE_REASON })`, and the generic writer inside `enqueueWakeup`
+  // sets `reason: opts.reason ?? null` -- dynamic, so the direct-insert scan classifies
+  // it and never resolves the literal. This test is therefore the only guard on the
+  // allowlist entry, in the same position as the two const-identifier tests above.
+  //
+  // It is not hypothetical: measured on this route on 2026-10-28, six of seven park
+  // fires read `reason: "other"`, which forced attribution by latency band instead of
+  // by name. `parkedWakeFiredAt` cannot answer "did a park wake fire" (a re-park clears
+  // it), so this route is the surface PEN-4894's documentation sends readers to -- and
+  // it has to be able to NAME a park wake for that pointer to be worth following.
+  // See `runbooks/deliberate-park-release-edge.md`.
+  it("names the park-expiry reason on a deliberate park's release wake", async () => {
+    const company = await seedCompany(db);
+    const agent = await seedAgent(db, company.id);
+    const project = await seedProject(db, company.id, "Core");
+    const issue = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Row whose deliberate park has lapsed",
+      status: "in_review",
+      assigneeAgentId: agent.id,
+    });
+
+    await db.insert(agentWakeupRequests).values({
+      companyId: company.id,
+      agentId: agent.id,
+      source: "automation",
+      // The literal the allowlist admits. Asserted against its writer's constant below
+      // so a rename on either side fails here rather than silently reaching "other".
+      reason: "issue_park_expired",
+      status: "completed",
+      payload: {
+        issueId: issue.id,
+        parkedUntil: new Date(Date.now() - 60_000).toISOString(),
+        parkedReason: "waiting on an external gate",
+      },
+      runId: null,
+      requestedAt: new Date(Date.now() - 30_000),
+    });
+
+    const res = await request(createApp(db, boardActor(company)))
+      .get(`/api/issues/${issue.id}/diagnostics/wakes`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.events).toHaveLength(1);
+    expect(res.body.events[0]).toMatchObject({
+      kind: "wake_request",
+      source: "automation",
+      reason: "issue_park_expired",
+    });
+    // Binds the fixture above to the writer's own constant: the scans cannot prove this
+    // spelling for this reason, so if they disagree the fixture is testing a string the
+    // sweep no longer writes.
+    expect(ISSUE_PARK_EXPIRED_WAKE_REASON).toBe("issue_park_expired");
+    expect(ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS.has(ISSUE_PARK_EXPIRED_WAKE_REASON)).toBe(true);
   });
 
   it("returns null diagnosis for an unblocked issue with no wake history", async () => {

@@ -73,6 +73,34 @@ belongs in the same follow-up that deletes the seed install: that is already
 gated on the whole fleet carrying this directory, which is exactly the condition
 that makes the absolute path safe.
 
+## The publish broker (PEN-4933)
+
+When `enableGitHubPublishBroker` is set on the agent adapter, the GitHub
+credential Secret stops being mounted into the agent container and is mounted
+into a `github-publish-broker` sidecar instead. These scripts are unchanged in
+shape — they still lead PATH, still re-read the token file, still exec the same
+egress runtimes — but in the agent container that token file no longer exists,
+and each runtime hands the invocation to the broker over a unix socket.
+
+Two consequences worth knowing before editing anything here:
+
+- `paperclip-github-token-env` now execs its child WITHOUT a token when the
+  broker socket is set and the token file is absent. That is the designed state
+  in a brokered agent container, not a fault. Every other refusal is unchanged:
+  a missing token file with no broker configured is still the loud failure
+  PEN-3705 made it.
+- The broker runs these same scripts, in its own container, with
+  `PAPERCLIP_GITHUB_BROKER_ROLE=server` set — which is what makes the runtimes
+  do the work locally instead of forwarding again. So there is still exactly one
+  definition of each door, and the scan that decides what a push may contain is
+  still the pre-push hook running `scrubGitHubEgressText`. A change here changes
+  both sides at once, which is the point.
+
+None of this is a security control in itself. The boundary is that the
+credential is in a container the agent cannot read into; an agent that edits or
+ignores these scripts reaches `/usr/bin/git` with nothing to authenticate with.
+See `docs/security/PEN-3183-git-egress-enforcement-boundary-decision.md`.
+
 ## Editing one
 
 Edit the file here, and make the matching edit to the heredoc in

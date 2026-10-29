@@ -38,6 +38,7 @@ import {
   GitHubMcpEgressFrameError,
   scrubGitHubMcpClientFrame,
 } from "./github-mcp-egress-shim.js";
+import { brokerSocketPath, runPublishBrokerClient } from "./github-publish-broker-client.js";
 
 /**
  * Largest client frame this runtime will forward, in bytes.
@@ -205,6 +206,26 @@ export function runGitHubMcpEgressRuntime(
   const { target, argv } = options;
   if (!target) {
     return Promise.reject(new GitHubMcpEgressRuntimeError("missing GitHub MCP server target"));
+  }
+
+  // PEN-4933: the third door onto the same credential (PEN-3183 §4.1). In a
+  // brokered deployment the server runs in the broker container, and this
+  // process becomes a stdio relay for it.
+  //
+  // The relay preserves the property the header above calls a fact about the
+  // process topology rather than a claim about the code: responses still do
+  // not pass through any scrubber. They now pass through two more pipes — the
+  // broker's and this one's — which can copy bytes and cannot alter them.
+  // Scrubbing stays on the outbound leg, performed by this same runtime
+  // re-entered on the broker side.
+  const brokerSocket = brokerSocketPath();
+  if (brokerSocket) {
+    return runPublishBrokerClient({
+      socketPath: brokerSocket,
+      tool: "github-mcp-server",
+      argv: [...argv],
+      cwd: process.cwd(),
+    });
   }
 
   return new Promise((resolve, reject) => {

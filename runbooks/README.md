@@ -90,6 +90,15 @@ platform cannot resolve automatically. Each runbook should be:
   alert `PaperclipDeferredIssueExecutionWakeOverdue`,
   `PaperclipDeferredIssueExecutionWakeAgeMetricsRefreshFailed`, or the log line
   `deferred behind an issue execution lock`.
+- [`deliberate-park-release-edge.md`](deliberate-park-release-edge.md) —
+  answering "did this row's park wake fire?". The issue row's
+  `parkedWakeFiredAt` is a per-PARK claim marker, not a per-row audit field: a
+  re-park clears it, and a park wake that works dispatches a run that routinely
+  re-parks, so the column deletes its own positive cases (measured 7 of 7 fired,
+  0 of 7 still recorded 45 minutes later). Covers the three meanings of `null`,
+  the bounds of the wake-diagnostics endpoint that replaces it, and why the
+  activity feed carries no park wake at all. No alert: the symptom is a
+  reassuring `null` you are about to believe.
 - [`queued-run-stranded.md#agent-start-lock-wedged-pen-3305`](queued-run-stranded.md#agent-start-lock-wedged-pen-3305) —
   an agent has held its per-agent dispatch start lock past the point the code
   itself calls dispatch stopped. This is the *cause* side of the alert above:

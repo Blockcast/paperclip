@@ -2164,6 +2164,171 @@ function buildDindSidecar(opts: {
   return sidecar;
 }
 
+// ---------------------------------------------------------------------------
+// PEN-4933 / PEN-3183 D1: the GitHub publish broker sidecar.
+//
+// PEN-3183 measured that the surviving bypass of the egress guard is not a
+// writable guard file but a READABLE CREDENTIAL: the agent and the wrapper are
+// one principal (one container, uid 1000, no privilege escalation, all
+// capabilities dropped), so any binary the wrapper may exec the agent may exec
+// directly — and the push token was mounted `defaultMode: 292` (0444) where
+// that uid could read it. The decision (§1 D1) was to move enforcement
+// credential-side: hold the token in a container the agent cannot read into,
+// and have that container perform the publish.
+//
+// So: the inherited GitHub credential Secret volumes are mounted into THIS
+// sidecar and are REMOVED from the agent container, and the two containers
+// share only a unix socket on an `emptyDir`.
+//
+// ⚠ The boundary is the CONTAINER, not the file mode. A Kubernetes Secret
+// volume's files are owned by root, so `defaultMode: 0400` would deny the
+// broker's own uid as readily as the agent's, and the usual way round that —
+// `fsGroup` — is pod-scoped and would hand the agent a supplementary group
+// instead. What makes the agent unable to read the token is that the mount is
+// not in its mount namespace at all; the mode it is mounted with is then
+// irrelevant, and pretending otherwise would be the kind of overclaim
+// PEN-3183 §8 prohibits. The uid split below is defence in depth against a
+// future `shareProcessNamespace`, not the mechanism.
+// ---------------------------------------------------------------------------
+
+/** Directory holding the broker socket, shared with the agent container. */
+const GITHUB_BROKER_SOCKET_DIR = "/var/run/paperclip-github-broker";
+const GITHUB_BROKER_SOCKET_PATH = `${GITHUB_BROKER_SOCKET_DIR}/broker.sock`;
+const GITHUB_BROKER_SOCKET_VOLUME = "github-broker-sock";
+
+/**
+ * A shared `/tmp`.
+ *
+ * Needed because `gh --body-file /tmp/body.md` is the documented way to pass
+ * authored text through the egress scrubber (the stdin form is refused), and
+ * the broker has to READ that file to scrub it. Scrubbing agent-side and
+ * trusting the result on the broker side is precisely the "gate on issuance,
+ * not on use" error PEN-3183 §5 names, so the file has to cross, not the
+ * verdict.
+ *
+ * Pushed to the FRONT of the agent's mount list: `/tmp/prompt` is already
+ * mounted, and this builder's own shadowing backstop refuses a parent mounted
+ * after its child (Kubernetes admits such a Pod and the child is then
+ * unreachable — BLO-40401).
+ */
+const GITHUB_BROKER_TMP_VOLUME = "shared-tmp";
+const GITHUB_BROKER_TMP_MOUNT_PATH = "/tmp";
+
+/**
+ * Scratch mounted in the BROKER CONTAINER ONLY.
+ *
+ * The broker creates its per-invocation `GH_CONFIG_DIR` here. It must not use
+ * the shared `/tmp` above: `mkdtemp` makes a 0700 directory, but its parent is
+ * an `emptyDir` the agent can write and Kubernetes sets no sticky bit on one,
+ * so uid 1000 can rename that directory away and put its own in its place —
+ * and `gh` would then read an alias out of it and run shell beside the
+ * credential. Kept out of the agent's mount list for the same reason the
+ * credential is (`BROKER_PRIVATE_DIR` in adapter-utils; §7.3 of the decision
+ * doc on why the namespace, not the mode, is the mechanism).
+ *
+ * ⚠ `/var/lib`, not `/run`: `/var/run` is a symlink to `/run` on this image,
+ * and {@link GITHUB_BROKER_SOCKET_DIR} — which the AGENT mounts — is
+ * `/var/run/paperclip-github-broker`. A private dir at
+ * `/run/paperclip-github-broker` is the same directory, so it would be
+ * agent-writable. The shadowing backstop below compares literal mount paths
+ * and would admit the pair silently.
+ */
+const GITHUB_BROKER_PRIVATE_VOLUME = "github-broker-private";
+const GITHUB_BROKER_PRIVATE_DIR = "/var/lib/paperclip-github-broker";
+
+/** uid the broker runs as. Anything but 1000; see the uid note above. */
+const GITHUB_BROKER_UID = 1001;
+
+/** Where the image installs the egress wrappers and the broker runtime. */
+const GITHUB_BROKER_WRAPPER_DIR = "/usr/local/libexec/paperclip/bin";
+const GITHUB_BROKER_RUNTIME_JS =
+  "/opt/paperclip-bundled-adapters/node_modules/@paperclipai/adapter-utils/dist/github-publish-broker-runtime.js";
+
+/**
+ * Does this inherited Secret volume carry a GitHub credential?
+ *
+ * Matched on the MOUNT PATH rather than the Secret or volume name, because the
+ * mount path is what the consumers resolve: `PAPERCLIP_GITHUB_TOKEN_FILE` and
+ * the credential helper both name a file under `/etc/paperclip/secrets/
+ * github-*token/`, and that is the thing the agent container must stop being
+ * able to open. A Secret renamed in the chart keeps working; a Secret mounted
+ * somewhere else would not be found by its consumers either.
+ *
+ * Fails in the SAFE direction when it is wrong in one way and the unsafe
+ * direction in the other, so the manifest test asserts the outcome (no
+ * credential path reachable from the agent container) rather than this
+ * predicate's return value.
+ */
+export function isGitHubCredentialSecretVolume(mountPath: string): boolean {
+  // Trailing separators trimmed the same way the collision map below trims
+  // them, so `/etc/paperclip/secrets/github-token/` and the bare path are one
+  // value here. Not a shared helper with that map: this one is reached from
+  // module scope and that one closes over the builder's locals.
+  const normalized = mountPath.replace(/\/+$/, "") || "/";
+  return /^\/etc\/paperclip\/secrets\/github-[a-z0-9-]*token$/.test(normalized);
+}
+
+/**
+ * The broker sidecar.
+ *
+ * Deployed as a native sidecar (initContainer with `restartPolicy: "Always"`),
+ * the same shape as the DinD sidecar above: it starts before the agent
+ * container, lives for the Job, and terminates when the agent exits.
+ *
+ * Runs the SAME image as the agent, so the wrapper it re-enters and the
+ * scanner it runs are byte-identical to the ones the agent would have run.
+ * That is what keeps the tested door parity true: the broker has no notion of
+ * its own about what a push may contain (PEN-3183 §8).
+ *
+ * `umask 0002` because the repository belongs to uid 1000 and a push writes
+ * remote-tracking refs into it. The broker shares gid 1000 so those writes land
+ * group-writable rather than leaving files the agent cannot subsequently
+ * update.
+ */
+function buildGitHubPublishBrokerSidecar(opts: {
+  image: string;
+  imagePullPolicy: string;
+  workspaceRoot: string;
+  secretMounts: k8s.V1VolumeMount[];
+  dataMounts: k8s.V1VolumeMount[];
+  env: k8s.V1EnvVar[];
+}): k8s.V1Container {
+  const command =
+    `umask 0002; exec ${GITHUB_BROKER_WRAPPER_DIR}/paperclip-github-token-env ` +
+    `/usr/local/bin/node ${GITHUB_BROKER_RUNTIME_JS}`;
+  return {
+    name: "github-publish-broker",
+    image: opts.image,
+    imagePullPolicy: opts.imagePullPolicy,
+    command: ["sh", "-c", command],
+    env: [
+      ...opts.env,
+      { name: "PAPERCLIP_GITHUB_BROKER_SOCKET", value: GITHUB_BROKER_SOCKET_PATH },
+      { name: "PAPERCLIP_GITHUB_BROKER_WORKSPACE_ROOT", value: opts.workspaceRoot },
+    ],
+    securityContext: {
+      capabilities: { drop: ["ALL"] },
+      readOnlyRootFilesystem: false,
+      runAsNonRoot: true,
+      runAsUser: GITHUB_BROKER_UID,
+      runAsGroup: 1000,
+      allowPrivilegeEscalation: false,
+    },
+    resources: {
+      requests: { cpu: "50m", memory: "128Mi" },
+      limits: { cpu: "1", memory: "512Mi" },
+    },
+    volumeMounts: [
+      { name: GITHUB_BROKER_TMP_VOLUME, mountPath: GITHUB_BROKER_TMP_MOUNT_PATH },
+      { name: GITHUB_BROKER_PRIVATE_VOLUME, mountPath: GITHUB_BROKER_PRIVATE_DIR },
+      ...opts.dataMounts,
+      ...opts.secretMounts,
+      { name: GITHUB_BROKER_SOCKET_VOLUME, mountPath: GITHUB_BROKER_SOCKET_DIR },
+    ],
+    restartPolicy: "Always",
+  };
+}
+
 /**
  * Shell snippet the main container prepends to its command when the DinD
  * sidecar is enabled. Polls for the shared socket to appear (sidecar
@@ -2421,6 +2586,17 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // Throws on anything but an exact version or "image" — the value is shell-interpolated.
   const claudeCodeVersion = resolveClaudeCodeVersion(config.claudeCodeVersion);
   const enableDocker = asBoolean(config.enableDocker, false);
+  // PEN-4933 / PEN-3183 D1. Default OFF, and this is a ROLLOUT gate, not a kill
+  // switch on the egress refusals — §6 of the decision document records why one
+  // of those must never exist. With it off the pod is exactly what it was
+  // before: the credential mounted into the agent container, the accepted
+  // residual of §7 still running. With it on the credential moves to a sidecar
+  // and the agent cannot authenticate at all, which changes every agent's
+  // publish path fleet-wide. That is the one failure mode §6 cites as the
+  // reason D4 was deferred, so it gets a soak behind a flag rather than a flag
+  // day. Once enabled it must not be switched back off to clear an incident
+  // without re-opening the §7 acceptance with Security.
+  const enableGitHubPublishBroker = asBoolean(config.enableGitHubPublishBroker, false);
   const dockerImage = asString(config.dockerImage, "docker:28-dind");
   const dockerCpuLimit = asString(config.dockerCpuLimit, "4");
   const dockerMemoryLimit = asString(config.dockerMemoryLimit, "8Gi");
@@ -2802,6 +2978,9 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // SKIPPED rather than thrown on — except when it collides with the
   // operator-chosen workspace mount, which is a config mistake the operator can
   // actually fix and so is surfaced instead of silently dropping a secret.
+  // Credential mounts diverted to the broker sidecar (PEN-4933). Empty unless
+  // the broker is enabled, in which case the agent container loses them.
+  const brokerSecretMounts: k8s.V1VolumeMount[] = [];
   for (const sv of selfPod.secretVolumes) {
     const normalized = normalizeMountPath(sv.mountPath);
     if (normalized === normalizedDataMountPath) {
@@ -2873,11 +3052,17 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
         ...(sv.optional === undefined ? {} : { optional: sv.optional }),
       },
     });
-    volumeMounts.push({
-      name: sv.volumeName,
-      mountPath: sv.mountPath,
-      readOnly: true,
-    });
+    const mount: k8s.V1VolumeMount = { name: sv.volumeName, mountPath: sv.mountPath, readOnly: true };
+    // PEN-4933: the whole of the change, in three lines. A GitHub credential
+    // volume is still PROPAGATED (it is in `volumes` above, and the broker
+    // sidecar mounts it), but it is not mounted into the agent container, so
+    // uid 1000 has no path to open. Everything else about the credential —
+    // which Secret, which key, whether it is optional — is unchanged.
+    if (enableGitHubPublishBroker && isGitHubCredentialSecretVolume(sv.mountPath)) {
+      brokerSecretMounts.push(mount);
+      continue;
+    }
+    volumeMounts.push(mount);
   }
 
   // Security context matching the main Deployment
@@ -3327,6 +3512,54 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     envVars.push({ name: "DOCKER_HOST", value: `unix://${DIND_SOCKET_PATH}` });
   }
 
+  // PEN-4933: wire the publish broker.
+  //
+  // Gated on there being a credential to move as well as on the flag. Enabling
+  // the broker in a deployment that mounts no GitHub Secret would add a sidecar
+  // with nothing to broker and take away the agent's doors, so the condition is
+  // "there is a credential AND we were asked to move it", never the flag alone.
+  const brokerEnabled = enableGitHubPublishBroker && brokerSecretMounts.length > 0;
+  // Fail closed on a broad data mount rather than render a boundary that does
+  // not hold.
+  //
+  // The broker executes the PEN-3156 pre-push hook with the push credential in
+  // its environment. Under `narrowWritableSurface` that hook arrives as a
+  // read-only `subPath` bind (`ROOT_TOOLCHAIN_SUBPATHS` includes
+  // `GIT_HOOKS_SUBPATH`), so uid 1000 cannot rewrite the code the credential
+  // holder runs. Under the broad fallback the whole volume is mounted rw and
+  // it can — which turns the broker from a boundary into a longer path to the
+  // same token. The broker's `workspaceRoot` is `dataMountPath`, so the same
+  // leg also decides whether a request's `cwd` is confined to this run's
+  // workspace or to every agent's.
+  //
+  // Thrown, not skipped. Silently not rendering would leave the credential in
+  // the agent container with the operator believing it had moved, and §7.2
+  // already names `data-mount-scope: broad:*` as a trigger that ENDS the
+  // residual acceptance — so a broad-scope Job is the one case where shipping
+  // a degraded broker is worse than shipping none. The message names the leg
+  // that failed because all three are operator-fixable config.
+  if (enableGitHubPublishBroker && brokerSecretMounts.length > 0 && !narrowWritableSurface) {
+    throw new Error(
+      `claude_k8s: refusing to build Job manifest — enableGitHubPublishBroker is set, but the data volume ` +
+        `would be mounted broad read-write (reason: ${broadDataMountReason}). The broker runs the pre-push ` +
+        `hook with the push credential in its environment, and under a broad mount that hook lives in a ` +
+        `directory the agent can write, so the credential boundary would not hold. Fix the data mount ` +
+        `scope (see BLO-32734) or leave the broker disabled; do not ship it broad.`,
+    );
+  }
+  if (brokerEnabled) {
+    volumes.push(
+      { name: GITHUB_BROKER_SOCKET_VOLUME, emptyDir: {} },
+      { name: GITHUB_BROKER_TMP_VOLUME, emptyDir: {} },
+      // Broker-only: deliberately NOT pushed onto `volumeMounts`.
+      { name: GITHUB_BROKER_PRIVATE_VOLUME, emptyDir: {} },
+    );
+    // FRONT of the list, ahead of `/tmp/prompt`: see GITHUB_BROKER_TMP_VOLUME.
+    volumeMounts.unshift({ name: GITHUB_BROKER_TMP_VOLUME, mountPath: GITHUB_BROKER_TMP_MOUNT_PATH });
+    volumeMounts.push({ name: GITHUB_BROKER_SOCKET_VOLUME, mountPath: GITHUB_BROKER_SOCKET_DIR });
+    envVars.push({ name: "PAPERCLIP_GITHUB_BROKER_SOCKET", value: GITHUB_BROKER_SOCKET_PATH });
+  }
+
   // Decide prompt delivery strategy: env var (small) or Secret volume (large).
   const promptBytes = Buffer.byteLength(prompt, "utf-8");
   const useLargePromptPath = promptBytes > LARGE_PROMPT_THRESHOLD_BYTES;
@@ -3572,6 +3805,40 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
             initContainer,
             ...(enableDocker
               ? [buildDindSidecar({ image: dockerImage, cpuLimit: dockerCpuLimit, memoryLimit: dockerMemoryLimit })]
+              : []),
+            ...(brokerEnabled
+              ? [
+                  buildGitHubPublishBrokerSidecar({
+                    image,
+                    imagePullPolicy: asString(config.imagePullPolicy, "IfNotPresent"),
+                    workspaceRoot: dataMountPath,
+                    secretMounts: brokerSecretMounts,
+                    // The agent's `data` and runtime-cache mounts, with the
+                    // same read-only/writable split the agent got — including
+                    // the read-only `subPath` bind over the pre-push hook the
+                    // broker executes. Copied rather than re-derived because a
+                    // different split here would be a second opinion about
+                    // which paths exist, and the one that matters (the
+                    // repository being published) must be the same tree the
+                    // agent committed in.
+                    //
+                    // NOT every mount the agent has: the two overlay emptyDirs
+                    // are dropped, so the broker sees the volume's own content
+                    // at those paths rather than the agent's scratch copy. That
+                    // is narrower, which is the safe direction, but it is not
+                    // parity and should not be read as parity.
+                    dataMounts: volumeMounts.filter(
+                      (m) => m.name === "data" || m.name === RUNTIME_CACHE_VOLUME_NAME,
+                    ),
+                    // Only what the broker's own token wrapper and runtime read.
+                    // Deliberately NOT the agent's environment: a credential
+                    // holder that inherits the agent's env inherits the agent's
+                    // ability to redirect it (PEN-3183 §5).
+                    env: envVars.filter((v) =>
+                      ["PAPERCLIP_HOME", "PAPERCLIP_GITHUB_TOKEN_FILE"].includes(v.name),
+                    ),
+                  }),
+                ]
               : []),
           ],
           containers: [

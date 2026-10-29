@@ -61,3 +61,31 @@ export async function coordinateHeartbeatSchedulerShutdown<
     idleWaitTimedOut: !idle,
   };
 }
+
+/**
+ * BLO-49139. `server.close()` waits for every open connection, so one
+ * long-lived request could starve the heartbeat run drain of the grace period.
+ * After `timeoutMs`, force-close whatever is left and let close resolve.
+ */
+export function closeServerBounded(
+  server: {
+    close(cb: (err?: Error) => void): unknown;
+    closeIdleConnections?(): void;
+    closeAllConnections?(): void;
+  },
+  timeoutMs: number,
+  onForceClose: () => void,
+): Promise<Error | undefined> {
+  return new Promise((resolve) => {
+    const forceClose = setTimeout(() => {
+      onForceClose();
+      server.closeAllConnections?.();
+    }, timeoutMs);
+    forceClose.unref?.();
+    server.close((err) => {
+      clearTimeout(forceClose);
+      resolve(err);
+    });
+    server.closeIdleConnections?.();
+  });
+}
