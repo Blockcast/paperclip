@@ -77,8 +77,15 @@
 //     Note the consequence for the ACCIDENTAL case above, which is this file's
 //     actual threat: because no intent is required, any caller that execs git
 //     by ABSOLUTE PATH rather than resolving it on PATH is outside this guard
-//     while still being authenticated. How much of that exists is unmeasured;
-//     it is the open measurement in §8 of the PEN-3183 decision record.
+//     while still being authenticated. How much of that exists was measured on
+//     2026-10-29 (PEN-4986) and is ZERO: nothing reached /usr/bin/git outside
+//     this wrapper in an observed agent pod, and an image- and harness-wide
+//     census found no such exec site at all. That bounds the ACCIDENTAL case
+//     only. It does NOT narrow the bypass above, which stays OPEN for a
+//     deliberate caller, and it is a point measurement of one pod on one image
+//     rather than a standing detector -- nothing reports it if that changes, so
+//     re-take it on any image or PATH change. See §7.1 of the decision record
+//     and docs/security/PEN-4986-absolute-path-git-runtime-measurement.md.
 //
 // The surviving bypass is not a file-ownership problem and cannot be closed by
 // one. The agent and this wrapper are the SAME principal: one container, uid
