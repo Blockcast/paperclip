@@ -6,6 +6,10 @@ import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { AdapterRuntimeServiceReport } from "@paperclipai/adapter-utils";
+import {
+  gitGlobalOptions,
+  isKnownPublishingGitVerb,
+} from "@paperclipai/adapter-utils/github-git-egress-shim";
 import type { Db } from "@paperclipai/db";
 import { executionWorkspaces, issueComments, issues, projectWorkspaces, workspaceRuntimeServices } from "@paperclipai/db";
 import {
@@ -1091,6 +1095,60 @@ const SERVER_GIT_CREDENTIAL_HELPER_PATH =
 const SERVER_GIT_REAL_BINARY_PATH = "/usr/bin/git";
 
 /**
+ * Refuse to build an invocation that publishes, so the pin above cannot become
+ * an unguarded egress path (PEN-4979).
+ *
+ * The pin's whole justification is that server code does not publish. Every
+ * caller funnels through {@link resolveServerGitInvocation}, so this is the one
+ * chokepoint where that can be enforced rather than asserted, and it covers the
+ * two generic pass-throughs (`runGit`, `recordGitOperation`) a future call site
+ * would most likely arrive through.
+ *
+ * **Classification is reused, not re-derived.** `isKnownPublishingGitVerb` is
+ * the egress shim's own set. A second notion of "publishing" living in server
+ * code is exactly the divergence `github-egress-door-parity.test.ts` exists to
+ * prevent: both doors keep passing their own tests while one quietly stops
+ * covering a verb.
+ *
+ * **This door is deliberately weaker than the agent door, and that asymmetry is
+ * not an oversight.** The agent wrapper decides with the ALLOWLIST
+ * (`isNonPublishingGitVerb`), refusing anything unrecognised. This one uses the
+ * DENYLIST. It has to: `submodule` is deliberately absent from the allowlist —
+ * `foreach` and `update` run configured commands with git's exec-path ahead of
+ * PATH — and `submodule sync` / `submodule update --init` is precisely the
+ * repair this pin was created to perform (BLO-41987). Deciding here with the
+ * allowlist would refuse the one operation the pin exists for. So the honest
+ * statement of what this buys is narrow: a verb the shim KNOWS publishes is
+ * refused; an unrecognised verb still passes. Do not restate it as "server git
+ * cannot publish".
+ *
+ * Scope, equally narrow: this guards a first-party call site in this module
+ * written against this function. It is not an argv sanitiser for untrusted
+ * input, and it resolves no aliases — `recordGitOperation`'s `args` are built
+ * in-module and never from request data, so there is no caller for whom that
+ * would be the relevant threat. Were one ever added, the right tool is the
+ * shim's `classifyGitInvocation`, not a wider list here.
+ *
+ * The verb is located with the shim's `gitGlobalOptions` rather than read off
+ * `args[0]`, so `["-c", "x=y", "push"]` is caught too. Over-skipping is safe
+ * for the same reason it is safe in the shim (see `VALUE_TAKING_GLOBAL_OPTIONS`):
+ * an over-skipped invocation publishes nothing, and under-skipping is the only
+ * direction that opens a hole.
+ */
+function assertServerGitDoesNotPublish(args: readonly string[]): void {
+  const verb = args[gitGlobalOptions(args).length];
+  if (verb === undefined || !isKnownPublishingGitVerb(verb)) return;
+  throw new Error(
+    `resolveServerGitInvocation: refusing to build \`git ${verb}\` — this helper pins ` +
+      `${SERVER_GIT_REAL_BINARY_PATH} past the agent egress wrapper and the pre-push hook, and its ` +
+      `safety rests on server code not publishing (BLO-42838, PEN-4979). The system credential ` +
+      `helper would authenticate such a push unprompted, so it would be both unguarded and ` +
+      `unscanned. If the server must publish, route it through the reviewed publish path rather ` +
+      `than widening this one.`,
+  );
+}
+
+/**
  * Resolve the git the *server* runs, pinned past the agent egress wrapper
  * (BLO-42838).
  *
@@ -1110,8 +1168,17 @@ const SERVER_GIT_REAL_BINARY_PATH = "/usr/bin/git";
  * `submodule.<name>.update = !<cmd>`, both with git's exec-path ahead of PATH,
  * so a `push` inside either reaches the real binary and neither this wrapper
  * nor the pre-push hook. The guard's subject is the *agent*; this module is
- * server code that never publishes (it runs no `push`), so pinning the real
- * binary here removes nothing the guard is there to enforce.
+ * server code that does not publish, so pinning the real binary here removes
+ * nothing the guard is there to enforce.
+ *
+ * That last clause used to be asserted here in prose — "it runs no `push`" —
+ * and was true only by convention, because two of the three call sites are
+ * generic pass-throughs (`runGit`, `recordGitOperation`). A future caller
+ * passing `push` would have got an unguarded, unscanned publish path with
+ * nothing failing, and `/etc/gitconfig`'s system credential helper would have
+ * authenticated it unprompted (PEN-3183 §4). {@link
+ * assertServerGitDoesNotPublish} now enforces it instead, so the comment and
+ * the code agree and deleting the check fails CI (PEN-4979).
  *
  * The two `-c credential...` arguments are carried over verbatim from the
  * wrapper, and are load-bearing rather than cosmetic: the server does fetch
@@ -1146,6 +1213,9 @@ export function resolveServerGitInvocation(
   args: readonly string[],
   paths: { gitBinary?: string; credentialHelper?: string } = {},
 ): { command: string; args: string[] } {
+  // First, so the PAPERCLIP_SERVER_GIT test seam below is covered as well: the
+  // invariant is about what this module asks git to do, not which binary runs it.
+  assertServerGitDoesNotPublish(args);
   const gitBinary = paths.gitBinary ?? SERVER_GIT_REAL_BINARY_PATH;
   const credentialHelper = paths.credentialHelper ?? SERVER_GIT_CREDENTIAL_HELPER_PATH;
   const override = process.env.PAPERCLIP_SERVER_GIT?.trim();
