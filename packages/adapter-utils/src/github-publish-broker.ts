@@ -34,7 +34,7 @@ import { spawn } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, unlinkSync } from "node:fs";
 import net from "node:net";
 import path from "node:path";
-import { EGRESS_GUARD_BIN_DIR } from "@paperclipai/shared/egress-guard-path";
+import { EGRESS_GUARD_BIN_DIR } from "./egress-guard-path.js";
 
 import {
   BROKER_ROLE_ENV,
@@ -61,9 +61,9 @@ import {
 /**
  * Where the image installs the wrappers the broker re-enters.
  *
- * PEN-5030: re-exported from `@paperclipai/shared` rather than declared here,
- * so the same directory the broker re-enters is the one the PATH-guard helpers
- * refuse to drop. One literal, two readers.
+ * PEN-5030: re-exported from `./egress-guard-path.js` rather than declared
+ * here, so the same directory the broker re-enters is the one the PATH-guard
+ * helpers refuse to drop. One literal, two readers.
  */
 export const IMAGE_WRAPPER_DIR = EGRESS_GUARD_BIN_DIR;
 
