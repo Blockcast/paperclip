@@ -585,17 +585,27 @@ export function responsibleUserAuthzShadowMode() {
  *      `company-member-roles.ts` (`resolveHumanInviteRole`) and four sites in
  *      `routes/access.ts`. A cloud-tenant `support` row is SEEDED with
  *      `operator` grants here.
- *   3. raw `=== "viewer"`, fails open — `routes/authz.ts` (the
- *      `assertCompanyAccess` board write bar and the `onBehalfOf` write bar),
- *      `routes/tool-access.ts` and `routes/tool-gateway.ts`.
+ *   3. raw `=== "viewer"` — `routes/authz.ts` (the `assertCompanyAccess`
+ *      board write bar and the `onBehalfOf` write bar), `routes/tool-access.ts`
+ *      and `routes/tool-gateway.ts`. All four now deny `null` explicitly
+ *      (PEN-3954); all four still admit `support`.
  *
- * So a `support` principal is seeded operator-level by (2), admitted by (3),
- * and denied by (1). Converting (3) to this helper would NOT merely restore
- * agreement — it would put the HTTP write bars in conflict with the
- * provisioning path that deliberately seeds `support` as `operator`.
- * Reconciling them needs a decision about what `support` is entitled to, not
- * a mechanical substitution, so it is deliberately NOT done here. Tracked on
- * PEN-3954; do not widen this helper's claim until that lands.
+ * `null` no longer disagrees: (3) denies it at every bar, and (1) denies it
+ * here. It remains PRIVILEGED under (2), which is correct for that
+ * disposition's callers — seeding a role-less row with `operator` defaults is
+ * a provisioning decision, not an authorization bar.
+ *
+ * `support` still gets three different answers: seeded operator-level by (2),
+ * admitted by (3), denied by (1). Converting (3) for `support` would NOT
+ * merely restore agreement — it would put the HTTP write bars in conflict
+ * with the provisioning path that seeds it `operator`. Note that seed is a
+ * FALLBACK, not a decision anyone recorded about `support`: `normalizeHumanRole`
+ * has an explicit branch folding `member` to `operator` and no branch for
+ * `support` at all, so `support` reaches `operator` by falling through. Which
+ * is exactly why reconciling needs a decision about what `support` is
+ * entitled to, not a mechanical substitution — it is deliberately NOT done
+ * here. Tracked on PEN-3954; do not widen this helper's claim until that
+ * lands.
  */
 function membershipRoleIsNonViewer(value: unknown): boolean {
   return normalizeHumanRole(value, "viewer") !== "viewer";
