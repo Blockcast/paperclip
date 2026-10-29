@@ -309,6 +309,88 @@ is enabled.
    calendar date.
 5. Otherwise: **2027-01-31.**
 
+#### Trigger 3's mount half — what asserts it (PEN-4990, 2026-10-29)
+
+Trigger 3 has two halves and until PEN-4990 only one was asserted anywhere.
+
+| half | asserted by | kind |
+|---|---|---|
+| `/etc/gitconfig` system credential helper | `deploy/helm/paperclip/tests/agent-egress-path.test.mjs` (source, every PR) + `scripts/check-agent-image-git-config.mjs` (image, before promotion) | merge/promotion gate |
+| **which containers receive the token Secret** | `deploy/helm/paperclip/tests/github-credential-container-set.test.mjs` (chart) + `job-manifest.github-credential-container-set.test.ts` in **both** k8s adapters (agent Job) | merge gate |
+
+The second row is new. Before it, adding `paperclip-github-mcp-token` — or any
+equivalent route — to a new container was caught only by human review, which is
+precisely the change §7.2 names as ending the residual acceptance early.
+
+`deploy/helm/paperclip/tests/secret-mounts-outside-data-volume.test.mjs` looks
+like it covers this and does not. It asserts **where** a secret volume may sit
+(BLO-40279: nothing credential-bearing nested under the shared data volume,
+after a CephFS re-mount hid every secret mount for ~16h). Both of its assertions
+stay green while the token is mounted into a brand-new container, as long as the
+new mount is outside `/paperclip`. Do not read it as this row.
+
+What the new assertions pin, in both surfaces: a map from container to the
+github.com credential routes it receives, compared for **exact equality**. Four
+properties are deliberate.
+
+- **Two route kinds, reported separately.** The Secret volume mount, and the env
+  route. The env route is split again, because `PAPERCLIP_GITHUB_TOKEN_FILE` is a
+  POINTER rather than a credential — under the broker the agent keeps it with no
+  mount behind it, by design (§7.3) — while `GH_TOKEN` / `GITHUB_TOKEN` /
+  `GITHUB_PERSONAL_ACCESS_TOKEN` / `GH_SEAT_TOKEN_VALUE` carry a value and are
+  what §7.4 keeps refused. A red therefore says which route moved.
+- **The mount is matched two ways and includes ancestors.** By mount path
+  (`/etc/paperclip/secrets/github-*token`) *and* by Secret name
+  (`paperclip-github-*token`), because mounting the same Secret somewhere new
+  defeats a path-only check and mounting a renamed Secret at the credential path
+  defeats a name-only one; and a mount at any ancestor of a credential path
+  counts as reaching it, since mounting `/etc/paperclip/secrets` hands over both
+  tokens without naming either.
+- **Both broker arrangements are expected, not just today's.** §7.2 is explicit
+  that the broker receiving a credential **is** trigger 3 — a declared, reviewed
+  instance of it, not an exemption — so the agent-Job assertion carries a
+  separate expectation for broker-off and broker-on. An assertion written against
+  only the pre-broker shape would red the PEN-4933 rollout, which is the failure
+  mode worth naming here.
+- **The chart assertion renders the WHOLE chart**, not a list of templates, and
+  finds pod specs structurally. "Mounts it into a new container" includes a new
+  container in a new workload file, and a `--show-only` list covers only the
+  templates its author remembered.
+
+Three limits, none of which a green run covers.
+
+- **They block; they do not alert.** A red refuses the merge. Nobody is paged,
+  and nothing watches for the absence of a run. Same limit as the
+  `/etc/gitconfig` half.
+- **They are DIRECTION-BLIND**, and this is the trap §7.2's own direction rule
+  sets. Exact equality means a change that *removes* a credential route from
+  uid 1000 reds them exactly like one that adds a route — §7.4's refusal is the
+  worked example of a red that is **not** this trigger. A red means "the declared
+  credential-container map moved", never "a credential route widened"; **a human
+  must read the diff for direction.** Each of the three files states this in its
+  own header, so the next reader meets the warning at the failure rather than
+  here. This is the same limitation the `/etc/gitconfig` assertions carry and it
+  is accepted for the same reason: the gate's job is to stop a widening landing
+  unnoticed, not to classify it.
+- **The chart assertion sees the chart, not the cluster.** It renders
+  `values.blockcast.yaml`; a mount added to a live workload by any path that is
+  not this chart is outside it. Agent Jobs are covered by the adapter
+  assertions instead, which read the manifest the builder actually emits.
+
+Coverage is asserted in the **two** adapters that render agent Jobs —
+`claude_k8s` and `opencode_k8s`, both registered in
+`EXTERNAL_LIFECYCLE_ADAPTER_TYPES`. Asserting only the first would answer the
+question for one of the two builders; the second has no broker and applies its
+inheritance allowlist at build time rather than at capture time, so its
+expectation differs and is written out rather than assumed to match.
+
+The GitHub App private key (`paperclip-github-app-creds`) is **not** matched by
+any of this, deliberately. It is a github.com credential, but a control-plane
+one that never reaches an agent, and what keeps it there is a different control —
+the server-only inheritance allowlist, backstopped by
+`findServerOnlyEnvVarsInPodSpec`. Folding it in would merge two controls into one
+assertion and make a red ambiguous.
+
 ### 7.3 Discharge status (PEN-4933)
 
 The broker shape in §5 is implemented: `packages/adapter-utils/src/
