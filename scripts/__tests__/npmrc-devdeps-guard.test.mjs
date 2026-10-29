@@ -212,3 +212,78 @@ test("pr.yml guards the install against an ambient NODE_ENV=production", () => {
     "verify must exit non-zero for an infrastructure kill too — this changes the explanation, not the gate.",
   );
 });
+
+// PEN-5032. `worktree_install` is the one lane that must NOT enable
+// `actions/setup-node`'s pnpm cache, for two independent reasons:
+//
+//   1. The cache runs its save in a post-step with no timeout input, so it
+//      cannot be bounded in place. On merge-queue head c9021a88 (PR #3105,
+//      run 40897060922) `Post Setup Node.js` hung ten minutes and took the job
+//      past its `timeout-minutes: 20`. GitHub scores a timeout kill as
+//      `cancelled`, `verify` fails closed on a cancelled lane, and the merge
+//      queue ejected a PR whose every substantive step -- including the
+//      BLO-19064 assertion this lane exists for -- had already passed.
+//   2. This is the repo's only job pinning NODE_ENV=production at job scope,
+//      which pnpm reads as an implicit `--prod`. The store it saves is a
+//      devDependency-free subset, and setup-node keys the pnpm store on the
+//      lockfile hash with first-writer-wins, so this lane finishing first
+//      publishes a degraded store under the key other jobs restore from.
+//      Performance only -- the store is content-addressed, so a thin restore
+//      just re-fetches. Not a correctness claim.
+//
+// Asserting on the job body rather than the whole file is deliberate: every
+// other `cache: pnpm` in pr.yml is correct and must stay.
+test("worktree_install does not enable setup-node's pnpm cache", () => {
+  const prWorkflow = readRepoFile(".github/workflows/pr.yml");
+  const jobBody = workflowJobBody(prWorkflow, "worktree_install");
+
+  // Negative control: the anchor still exists, so this test cannot pass by
+  // matching an empty or mis-sliced job body.
+  assert.match(
+    jobBody,
+    /\n      - name: Setup Node\.js\n/,
+    "worktree_install must still set Node up; this test asserts how, not whether.",
+  );
+  assert.match(
+    jobBody,
+    /uses: actions\/setup-node@v6\n        with:\n          node-version: 24\n\n/,
+    "worktree_install's setup-node block must end at node-version — no cache input.",
+  );
+  assert.doesNotMatch(
+    jobBody,
+    /^\s*cache: pnpm\s*$/m,
+    "worktree_install must not enable the setup-node pnpm cache (PEN-5032): its post-step " +
+      "save is unbounded and killed the job via timeout-minutes, and its NODE_ENV=production " +
+      "store would poison the shared lockfile-keyed cache entry.",
+  );
+
+  // Positive control for the slicing AND for the scope of this rule: the other
+  // lanes still cache, so a change that stripped `cache: pnpm` repo-wide fails
+  // here rather than passing quietly.
+  const otherCachingLanes = prWorkflow.split("cache: pnpm").length - 1;
+  assert.ok(
+    otherCachingLanes >= 5,
+    `pr.yml should still enable the pnpm cache on the other lanes; found ${otherCachingLanes}.`,
+  );
+});
+
+// PEN-5032. The NODE_ENV pin is load-bearing for the reasoning above: if a
+// second lane ever adopts it, the "only job that would save a --prod store"
+// argument stops holding and the cache rule has to be re-derived for that lane
+// too. Fail here rather than let the comment quietly go stale.
+test("worktree_install is the only pr.yml job pinning NODE_ENV=production", () => {
+  const prWorkflow = readRepoFile(".github/workflows/pr.yml");
+  const pins = prWorkflow.match(/^\s*NODE_ENV: production\s*$/gm) ?? [];
+
+  assert.equal(
+    pins.length,
+    1,
+    "exactly one pr.yml job may pin NODE_ENV=production (worktree_install). A new one invalidates " +
+      "the PEN-5032 cache-save reasoning above — re-derive it for that lane before adding the pin.",
+  );
+  assert.match(
+    workflowJobBody(prWorkflow, "worktree_install"),
+    /^\s*NODE_ENV: production\s*$/m,
+    "the single NODE_ENV=production pin must be worktree_install's.",
+  );
+});
