@@ -2756,6 +2756,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // Best-effort per directory: an already-present dir is the common case, and
     // a failure here must surface as the pod's own error rather than pre-empting
     // the run with a less specific one.
+    //
+    // No longer the only mechanism, and no longer the one correctness rests on:
+    // since PEN-4932 the Job carries a `seed-writable-dirs` init container that
+    // does the same `mkdir` + `chown` from inside the pod, which is what lets a
+    // Job narrow onto a volume this process does not hold. `scopedWritableDirs`
+    // is empty in exactly that case, so this loop never addresses a claim it
+    // cannot reach; for the server's own PVC it stays as the cheaper path that
+    // has the directories already present when the pod starts.
     for (const dir of built.scopedWritableDirs) {
       try {
         await fs.mkdir(dir, { recursive: true });

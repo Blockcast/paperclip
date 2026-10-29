@@ -62,7 +62,7 @@ describe("pre-push hook on narrowed runs (BLO-48361)", () => {
     const { job } = buildJobManifest({ ctx, selfPod });
     const spec = job.spec?.template?.spec;
     expect(spec?.volumes?.find((v) => v.name === "root-overlay")?.emptyDir).toBeTruthy();
-    for (const container of [spec?.containers[0], spec?.initContainers?.[0]]) {
+    for (const container of [spec?.containers[0], spec?.initContainers?.find((c) => c.name === "write-prompt")]) {
       const mounts = container?.volumeMounts ?? [];
       const hook = deepestMount(mounts, "/paperclip/.local/share/paperclip-git-hooks/pre-push");
       expect(hook?.name).toBe("data");

@@ -635,6 +635,20 @@ const INSTANCE_OVERLAY_SIZE_LIMIT = "16Mi";
  * has ~440 entries and gains new `wt-*` dirs weekly.
  */
 const ROOT_OVERLAY_VOLUME_NAME = "root-overlay";
+/** Where `seed-writable-dirs` mounts the `data` volume.
+ *
+ *  Its own path, and deliberately NOT `dataMountPath`: the seeder's whole job is
+ *  to create the `subPath` targets, so it must mount the volume ROOT with no
+ *  `subPath` of its own. Mounting a `subPath` is what makes the kubelet create
+ *  that directory root:root — the very thing being prevented. Nothing else in
+ *  the Pod mounts here, so it cannot collide with `config.workspaceMountPath`
+ *  (which `assertSafeAbsolutePath` confines to the operator's own choice) or
+ *  shadow an inherited secret mount. */
+const SEED_VOLUME_ROOT_MOUNT_PATH = "/mnt/paperclip-data-seed";
+/** uid:gid the agent, the `write-prompt` init container and the broker all run
+ *  as (`podSecurityContext` below). The seeder runs as 0 precisely so it can
+ *  hand the targets to this owner. */
+const AGENT_UID_GID = "1000:1000";
 // PEN-4932 stage 3. This list used to re-expose the whole fleet-wide toolchain
 // off the shared `paperclip-data` volume: `bin`, `tools`, `jre`, `.local/bin`,
 // `.bun/bin` and `.cache/puppeteer-browsers`. All six are gone — every binary
@@ -656,6 +670,12 @@ const ROOT_OVERLAY_VOLUME_NAME = "root-overlay";
 // still bind `paperclip-data` after this change. Stage 3 is the precondition
 // that lets stage 4 swap `dataClaimName` for a per-agent claim, which is where
 // blast radius actually falls.
+//
+// Stage 4a (this change) is not that swap either, and also moves the number by
+// zero: it removes the reason the swap could not be made — the narrowing gate's
+// requirement that the Job's volume be the server's own — by moving `subPath`
+// pre-creation into the `seed-writable-dirs` init container. Stage 4b provisions
+// the per-agent claims and sets `dataClaimName` to them.
 //
 // `.local/share/paperclip-git-hooks` stays, and is now the only entry. It holds
 // the PEN-3156 pre-push publish guard the image `git` wrapper points
@@ -1710,11 +1730,21 @@ export interface JobBuildResult {
    *  when adapterConfig.claudeCodeVersion is "image" (use the bundled CLI). */
   claudeCodeVersion: string;
   /** Absolute paths, ON THE SERVER'S OWN FILESYSTEM, backing this Job's nested
-   *  rw `subPath` mounts. The caller must create them before the Job: without
-   *  fsGroup the kubelet creates a missing subPath dir as root:root 0755, which
-   *  the pod's uid 1000 cannot write (BLO-32734). Only ever populated when the
-   *  Job mounts the server's own PVC, so the server can reach them; empty when
-   *  the run keeps the broad rw mount. */
+   *  rw `subPath` mounts, for the caller to create before the Job starts.
+   *
+   *  No longer the mechanism that makes a narrowed Job startable — the Job's
+   *  own `seed-writable-dirs` init container creates and chowns these targets
+   *  from inside the pod (PEN-4932), which is what lets a Job narrow onto a
+   *  volume this process does not hold. What survives here is the fast path for
+   *  the one case where the server CAN reach the volume: creating a directory
+   *  through the server's 2775 setgid mount inherits ownership, and the paths
+   *  are then already present by the time the pod starts.
+   *
+   *  Populated ONLY when the Job's claim is the server's own PVC. These paths
+   *  are joined onto `SELF_POD_DATA_MOUNT_PATH`, so for any other claim they
+   *  would address the SERVER'S volume — making directories the Job never sees
+   *  while the real targets went uncreated. Empty for a foreign claim and for a
+   *  run that keeps the broad rw mount. */
   scopedWritableDirs: string[];
 }
 
@@ -3017,29 +3047,44 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // agent-scoped roots and narrows like any other; only a config-only run with
   // no descriptor and no `isolationMode` still reaches this fallback.
   //
-  // Also gated on the Job's `data` volume being THIS server's own PVC. The
-  // `subPath` targets are pre-created by the server through its own mount (see
-  // `scopedWritableDirs`), and that only lands in the Job's volume when both
-  // name the same claim. A per-Job `emptyDir` (no claim) is never shared, so
-  // there is nothing to scope and nothing the server could pre-create; a
-  // foreign `workspaceVolumeClaim` is a volume this process does not hold, so
-  // the kubelet would create the targets root:root and uid 1000 would EACCES at
-  // init. Both keep the broad rw mount rather than emit a Job that cannot start.
-  const narrowWritableSurface =
-    isolation.enabled && dataClaimName !== "" && dataClaimName === selfPod.pvcClaimName;
+  // Also gated on the Job's `data` volume being a PERSISTENT CLAIM. A per-Job
+  // `emptyDir` is never shared with anything, so there is nothing to scope and
+  // the narrowing would only cost a mount.
+  //
+  // PEN-4932 stage 4a re-based this gate. It used to additionally require
+  // `dataClaimName === selfPod.pvcClaimName` — the Job's volume being the
+  // SERVER'S OWN PVC — because the `subPath` targets were pre-created by the
+  // server through its own mount (see `scopedWritableDirs`), which only lands in
+  // the Job's volume when both name the same claim. For a foreign claim the
+  // kubelet would create the targets root:root and uid 1000 would EACCES at
+  // init, so the broad rw mount was the only Job that could start.
+  //
+  // `seed-writable-dirs` removes that dependency: it runs as uid 0 ahead of
+  // every other init container, mounts the data volume at its ROOT with no
+  // `subPath`, and does the `mkdir -p` + `chown` itself. Creation no longer
+  // needs a second process holding the same volume, so the gate no longer needs
+  // to ask whose volume it is — which is the precondition for stage 4b handing
+  // each agent a claim of its own. `foreign_claim` is consequently no longer a
+  // reachable broad-mount reason.
+  const narrowWritableSurface = isolation.enabled && dataClaimName !== "";
+  // Whether the SERVER can reach this Job's volume through its own mount. Still
+  // exactly the old gate, and deliberately kept apart from the one above: it is
+  // the condition on `scopedWritableDirs`, whose paths are addressed at
+  // `SELF_POD_DATA_MOUNT_PATH`. Folding the two together would make the server
+  // `mkdir` a foreign Job's tree inside its OWN volume — creating junk the Job
+  // never sees while leaving the real targets uncreated.
+  const serverCanPreCreate = narrowWritableSurface && dataClaimName === selfPod.pvcClaimName;
   // Every one of those fallbacks used to be silent, so whether a production Job
   // actually got the narrowed mount depended on runtime config nobody could
   // read off the cluster. Name the reason the gate fell through — once as a
   // structured server-side warn, once as a Job annotation (see `metadata`) so
   // it is observable per Job. Classification only: the decision above is the
   // gate, this merely says which leg of it did not hold.
-  const broadDataMountReason: "isolation_disabled" | "no_claim" | "foreign_claim" | null = narrowWritableSurface
+  const broadDataMountReason: "isolation_disabled" | "no_claim" | null = narrowWritableSurface
     ? null
     : !isolation.enabled
       ? "isolation_disabled"
-      : dataClaimName === ""
-        ? "no_claim"
-        : "foreign_claim";
+      : "no_claim";
   if (broadDataMountReason !== null) {
     console.warn(
       JSON.stringify({
@@ -3256,13 +3301,33 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
         return { name: "data", mountPath: path.posix.join(dataMountPath, subPath), subPath, readOnly: true };
       })()
     : null;
-  const scopedWritableDirs = [
+  //
+  // Relative to the VOLUME ROOT. `seed-writable-dirs` consumes this list as-is
+  // (it mounts the volume root); `scopedWritableDirs` re-addresses it onto the
+  // server's own mount for the caller.
+  const writableSubPaths = [
     ...scopedWritableMounts.map((m) => m.subPath),
     // Pre-created like the rw targets: a kubelet-created subPath dir is
     // root:root and would EACCES the server's own skill materializer later.
     ...(companySkillsMount?.subPath ? [companySkillsMount.subPath] : []),
-    ...rootMounts.flatMap((m) => (m.subPath ? [m.subPath] : [])),
-  ].map((subPath) => path.posix.join(SELF_POD_DATA_MOUNT_PATH, subPath));
+  ];
+  // The read-only toolchain binds. They need only to EXIST — the kubelet would
+  // otherwise create them root:root, which is harmless for a readOnly mount but
+  // leaves an un-owned directory on the volume. Not chowned: nothing writes
+  // them, and the one surviving entry is the PEN-3156 pre-push hook, whose
+  // whole point is that uid 1000 cannot rewrite it.
+  const readOnlySubPaths = rootMounts.flatMap((m) => (m.subPath ? [m.subPath] : []));
+  // Gated on `serverCanPreCreate`, NOT on `narrowWritableSurface`. Since the
+  // gate above was re-based, a narrowed Job may be running on a claim this
+  // process does not hold; joining those subPaths onto `SELF_POD_DATA_MOUNT_PATH`
+  // would mkdir them inside the SERVER'S volume, which is both junk the Job
+  // never sees and a silent no-op for the targets that actually needed
+  // creating. `seed-writable-dirs` covers that case from inside the pod.
+  const scopedWritableDirs = serverCanPreCreate
+    ? [...writableSubPaths, ...readOnlySubPaths].map((subPath) =>
+        path.posix.join(SELF_POD_DATA_MOUNT_PATH, subPath),
+      )
+    : [];
   // Deliberately NOT checked against `claimedMountPaths` here. A scoped mount
   // landing exactly on an already-claimed path (an inherited secret mount under
   // the data mount) is a real hazard, but it is already caught by the
@@ -3882,6 +3947,78 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
       readOnly: true,
     });
   }
+  // BLO-32734 / PEN-4932 — create this Job's `subPath` targets, as root, before
+  // anything that mounts them.
+  //
+  // Without fsGroup a missing `subPath` dir is created by the kubelet as
+  // root:root 0755 at the moment the container that mounts it starts, which is
+  // EACCES for uid 1000. Something must therefore create them FIRST, owned by
+  // 1000. That used to be the server (`scopedWritableDirs`), which forced the
+  // Job onto the server's own claim; doing it here instead is what lets stage 4b
+  // give each agent its own.
+  //
+  // Ordering is load-bearing: init containers run in declaration order and this
+  // one is FIRST, so `write-prompt` — which mounts every one of these as a
+  // `subPath` — finds them already present and correctly owned.
+  //
+  // fsGroup is NOT the answer here and was rejected with measurement, not
+  // instinct: `values.blockcast.yaml` records that on cephfs the kubelet's
+  // recursive chown does not reliably short-circuit under
+  // `fsGroupChangePolicy: OnRootMismatch`, so a whole-volume walk grinds for
+  // 30-45 min on every pod start. Measured 2026-10-29, one company's subtree is
+  // already ~232k inodes — minutes of chown per pod, for a Job that should start
+  // in seconds. This is O(skeleton): a fixed handful of `mkdir -p` calls,
+  // whatever the volume holds. It is also the pattern the chart itself names as
+  // the reason fsGroup is unnecessary ("the seed initContainer already does
+  // targeted chowns of the paths it writes").
+  //
+  // `mkdir -p` and `chown` (non-recursive) are both idempotent, so a re-run, a
+  // restarted pod and a second agent on the same volume all converge.
+  const seedSubPaths = [...writableSubPaths, ...readOnlySubPaths];
+  const seedInitContainer: k8s.V1Container | null =
+    narrowWritableSurface && seedSubPaths.length > 0
+      ? {
+          name: "seed-writable-dirs",
+          image: "busybox:1.36",
+          imagePullPolicy: "IfNotPresent",
+          command: [
+            "sh",
+            "-c",
+            [
+              "set -e",
+              // One `mkdir -p` for everything, then chown only the writable set.
+              `mkdir -p ${seedSubPaths
+                .map((sp) => quoteShellArg(path.posix.join(SEED_VOLUME_ROOT_MOUNT_PATH, sp)))
+                .join(" ")}`,
+              ...(writableSubPaths.length > 0
+                ? [
+                    `chown ${AGENT_UID_GID} ${writableSubPaths
+                      .map((sp) => quoteShellArg(path.posix.join(SEED_VOLUME_ROOT_MOUNT_PATH, sp)))
+                      .join(" ")}`,
+                  ]
+                : []),
+            ].join("; "),
+          ],
+          // The volume ROOT, no `subPath` — see SEED_VOLUME_ROOT_MOUNT_PATH.
+          volumeMounts: [{ name: "data", mountPath: SEED_VOLUME_ROOT_MOUNT_PATH }],
+          // The one container in this Pod that is root, and the narrowest root
+          // the job allows: no privilege escalation, every capability dropped
+          // but the two `chown` on a foreign-owned path needs. Overrides
+          // `podSecurityContext`'s `runAsNonRoot`, which the agent keeps.
+          securityContext: {
+            capabilities: { drop: ["ALL"], add: ["CHOWN", "FOWNER"] },
+            readOnlyRootFilesystem: true,
+            runAsNonRoot: false,
+            runAsUser: 0,
+            allowPrivilegeEscalation: false,
+          },
+          resources: {
+            requests: { cpu: "10m", memory: "16Mi" },
+            limits: { cpu: "100m", memory: "64Mi" },
+          },
+        }
+      : null;
+
   const initContainer: k8s.V1Container = {
     name: "write-prompt",
     image: "busybox:1.36",
@@ -3988,6 +4125,8 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
           ...(Object.keys(nodeSelector).length > 0 ? { nodeSelector } : {}),
           ...(tolerations.length > 0 ? { tolerations: tolerations as k8s.V1Toleration[] } : {}),
           initContainers: [
+            // FIRST: creates the `subPath` targets every later container mounts.
+            ...(seedInitContainer ? [seedInitContainer] : []),
             initContainer,
             ...(enableDocker
               ? [buildDindSidecar({ image: dockerImage, cpuLimit: dockerCpuLimit, memoryLimit: dockerMemoryLimit })]
