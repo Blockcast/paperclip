@@ -71,11 +71,17 @@ export function normalizeHumanRole(
  *
  * Add new call sites by calling THIS, never by re-spelling the comparison.
  * `server/src/__tests__/pen3954-membership-role-write-bars.test.ts` walks all
- * of `server/src` outside `__tests__` and fails CI on a raw `=== "viewer"`
- * reappearing anywhere in it.
+ * of `server/src` outside `__tests__` and fails CI on a raw comparison
+ * against the `viewer` literal reappearing anywhere in it.
+ *
+ * The one comparison that must exist is the one below, and it carries the
+ * `pen3954-census-allow` marker so the census can tell the definition from a
+ * re-spelling. The marker is not an escape hatch: the census requires
+ * EXACTLY ONE marked line in the whole tree and requires it to live in this
+ * file, so marking a second site fails just as loudly as not marking it.
  */
 export function membershipRoleIsNonViewer(value: unknown): boolean {
-  return normalizeHumanRole(value, "viewer") !== "viewer";
+  return normalizeHumanRole(value, "viewer") !== "viewer"; // pen3954-census-allow
 }
 
 export function grantsForHumanRole(

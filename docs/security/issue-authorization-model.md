@@ -119,7 +119,12 @@ load-bearing and should not be undone by a later cleanup:
   while the decider denied both and the provisioning seed granted `support`
   `operator`-level `tasks:assign`. New call sites must call the predicate;
   `server/src/__tests__/pen3954-membership-role-write-bars.test.ts` fails CI on a
-  raw comparison reappearing in server code.
+  raw comparison reappearing in server code — any spelling of it (`===`, `!==`,
+  `==`, either quote style), since the point is that the question not be
+  re-spelled. The predicate's own body is the single sanctioned comparison and
+  is marked `pen3954-census-allow`; the census requires exactly one such marked
+  line and requires it to be in `services/company-member-roles.ts`, so the
+  marker cannot be used to silence a second site.
 
 Stopping the provisioning seed does **not** revoke anything:
 `insertMissingPrincipalGrants` is insert-only (`onConflictDoNothing`, no delete,
