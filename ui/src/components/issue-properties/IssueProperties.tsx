@@ -4,6 +4,7 @@ import { issueStatusText } from "@/lib/status-colors";
 import { Link } from "@/lib/router";
 import {
   DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
+  MAX_ISSUE_MONITOR_MAX_ATTEMPTS,
   deriveOriginatingActor,
   renewedIssueMonitorMaxAttempts,
   type Issue,
@@ -1017,6 +1018,18 @@ export function IssueProperties({
    * Rather than let "Schedule" fail silently from the user's side, say so before
    * the click.
    *
+   * ⚠️ The copy must NOT repeat the server's remedy here. The 422 advises
+   * "set an explicit `maxAttempts` above the attempts already made", which is
+   * right at, say, 24 attempts — but this hint renders only at
+   * `>= MAX_ISSUE_MONITOR_MAX_ATTEMPTS` (100), and the schema caps `maxAttempts`
+   * at `.max(100)` while an arm needs it strictly ABOVE the count. No value
+   * satisfies both, and nothing in the codebase resets `monitorAttemptCount`
+   * (`clearArmedMonitorColumns` leaves it; the column is `notNull().default(0)`
+   * and only the scheduler increments it). So at this point the row is
+   * permanently unarmable, and saying anything else sends the user to a dead
+   * end. "Clear" remains offered on an armed row because retiring a dead
+   * monitor is still worth doing — it just does not restore armability.
+   *
    * ⚠️ Deliberately NOT conjoined with `monitorArmed`. Clearing a monitor does
    * not reset `monitorAttemptCount` — the count outlives the monitor, which is
    * the whole reason this issue exists — so a row whose monitor was already
@@ -1321,18 +1334,10 @@ export function IssueProperties({
       */}
       {monitorRenewalUnavailable ? (
         <p className="text-xs text-muted-foreground">
-          This issue has made {monitorAttemptCount} monitor attempts — past the maximum budget an arm
-          can grant, so scheduling would be rejected.{" "}
-          {monitorArmed ? (
-            <>
-              Clear it and stop polling, or raise <code>maxAttempts</code> through the API.
-            </>
-          ) : (
-            <>
-              The count survives clearing, so raise <code>maxAttempts</code> through the API to arm
-              again.
-            </>
-          )}
+          This issue has made {monitorAttemptCount} monitor attempts. The count never resets and{" "}
+          <code>maxAttempts</code> is capped at {MAX_ISSUE_MONITOR_MAX_ATTEMPTS}, so no further
+          monitor can be armed on this issue — from here or through the API.
+          {monitorArmed ? " Clearing retires the current one, but does not make it armable again." : ""}
         </p>
       ) : null}
       <div className="flex flex-col gap-2 md:flex-row">
@@ -1366,7 +1371,7 @@ export function IssueProperties({
             onClick={saveMonitor}
             title={
               monitorRenewalUnavailable
-                ? `This issue has made ${monitorAttemptCount} monitor attempts, past the maximum budget an arm can grant.`
+                ? `This issue has made ${monitorAttemptCount} monitor attempts. The count never resets and maxAttempts is capped at ${MAX_ISSUE_MONITOR_MAX_ATTEMPTS}, so no further monitor can be armed on this issue.`
                 : undefined
             }
           >
