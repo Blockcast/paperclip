@@ -96,7 +96,18 @@ export function assertCompanyAccess(req: Request, companyId: string) {
     }
     const method = typeof req.method === "string" ? req.method.toUpperCase() : "GET";
     const isSafeMethod = ["GET", "HEAD", "OPTIONS"].includes(method);
-    if (!isSafeMethod && membership.membershipRole === "viewer") {
+    // `null` is denied alongside `viewer` here, matching `routes/tool-access.ts`
+    // and `routes/tool-gateway.ts`, which already carry the `!membershipRole`
+    // half of this guard. `updateCompanyMemberSchema` accepts an explicit
+    // `null` and the member-update path writes it straight through, so a row
+    // with no role is reachable, and a bare `=== "viewer"` test counted it as
+    // non-viewer and admitted the write (PEN-3954).
+    //
+    // This deliberately does NOT change `support`, the other value that
+    // reaches this bar from outside `HUMAN_COMPANY_MEMBERSHIP_ROLES`. That
+    // one needs an entitlement decision, not a substitution — see the SCOPE
+    // note on `membershipRoleIsNonViewer` in `services/authorization.ts`.
+    if (!isSafeMethod && (!membership.membershipRole || membership.membershipRole === "viewer")) {
       throwOrShadowResponsibleUserCompanyAccessDeny(
         req,
         companyId,
@@ -117,7 +128,10 @@ export function assertCompanyAccess(req: Request, companyId: string) {
       if (!membership || membership.status !== "active") {
         throw forbidden("User does not have active company access");
       }
-      if (membership.membershipRole === "viewer") {
+      // Same `null` denial as the `onBehalfOf` bar above and the two tool
+      // bars; `support` is deliberately left admitted here pending the
+      // PEN-3954 entitlement decision.
+      if (!membership.membershipRole || membership.membershipRole === "viewer") {
         throw forbidden("Viewer access is read-only");
       }
     }
