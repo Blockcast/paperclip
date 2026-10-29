@@ -468,6 +468,16 @@ Four things a reader should not infer from that paragraph:
    a builder change. Until that decision is taken, enabling the broker for a
    seat-bound agent is a build failure, not a silent downgrade.
 
+   ⚠ That refusal reads the container's `env` LIST only, and is stated here
+   with its limit rather than as a clean close -- claiming more than was tested
+   is what produced this defect in the first place. It cannot cover `envFrom`:
+   a `secretRef` injects every key of the referenced Secret, and those keys
+   live in the Secret rather than the PodSpec, so no manifest-time check can
+   enumerate them. `isAgentInheritableEnvFromRef` filters those sources by
+   NAME, not by key, so a GitHub credential placed in an inheritable `envFrom`
+   source still reaches the agent container. **Carried forward as residual, not
+   claimed closed**, on the same review date as the rest of §7.3.
+
 2. **It is not yet enabled.** `enableGitHubPublishBroker` defaults to `false`,
    so the deployed fleet is unchanged and §7.1 still holds. The gate is a
    ROLLOUT gate, not the kill switch §6 refuses: with it off the fleet is
