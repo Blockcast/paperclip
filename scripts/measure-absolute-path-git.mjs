@@ -88,6 +88,16 @@
 //     the shortest-lived invocation class. A copy is used rather than
 //     /usr/bin/git itself so that calibrating cannot contaminate the count; the
 //     copy's inode is excluded from the target set explicitly.
+//
+//     ⚠ THE COPY OVER-STATES THE RATE FOR THE REAL BINARIES, so calibrate the
+//     watched paths DIRECTLY as well and quote those. Measured at n = 300 each:
+//     /usr/bin/git 0.710, /usr/lib/git-core/git 0.747, the copy 0.903. A copy
+//     outside /usr/bin and outside the git exec directory cannot locate
+//     git-core relative to its own argv[0], so it takes a slower startup path
+//     and lives ~24% longer (5126 us vs 4123 us per invocation over 200 runs),
+//     which makes it easier to land a sweep inside. Name the copy `git` and not
+//     `git-calib` while you are at it: git dispatches on argv[0], so a copy
+//     under another name runs a different, shorter path again.
 //   - It says nothing about what is INSTALLED, only about what RAN. Pair it
 //     with a source/image census for the other half.
 //   - It cannot see a binary that is not in the discovered sets — a git built

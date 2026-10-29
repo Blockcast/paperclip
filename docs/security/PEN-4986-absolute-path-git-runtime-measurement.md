@@ -10,7 +10,9 @@ calendar date.
 than the ones this measurement deliberately produced to prove the instrument can see them.
 **Trigger 4 has not fired.** The acceptance stands, and §7.1's assumption is now tested rather than
 merely stated — but read §4 before treating it as tested *fleet-wide*, because it is not, and the
-part that remains untested is named there rather than buried.
+part that remains untested is named there rather than buried. Read §2.2 before quoting a confidence
+with the zero: the sampler's measured catch rate on the shortest invocation class is **0.710**, so
+the zero supports *k = 0* at only ~71 % for that class, not the ~93 % earlier drafts claimed.
 
 ⚠ **This result replaces an earlier one that was taken against a target set too narrow to support
 it.** The first measurement watched the single path `/usr/bin/git`. Review (#3098) established that
@@ -78,55 +80,81 @@ observer.
 ### 2.1 Instrument validation
 
 A zero from an instrument that cannot see a positive is worthless, so the controls were run against
-the **shipped** script, inside the measurement window. The second negative control is the one the
-first version of this measurement could not have run at all.
+the **shipped** script. The second negative control is the one the first version of this measurement
+could not have run at all.
+
+**In-window controls** (run inside the counted window of §3, which is what validates the script *in
+situ*):
 
 - **Positive control** — 5 PATH-resolved `git` commands (`--version`, `status`, `rev-parse`, `log`,
-  `diff`) were issued inside the window. Every class-A observation in the window that was not a
-  deliberate control — **46** of them, the issued commands plus the harness's own unprompted
-  traffic — classified **wrapped**. No PATH-resolved invocation was ever classified unwrapped.
+  `diff`) were issued. Every class-A observation in the window that was not a deliberate control —
+  **36** of them, the issued commands plus the harness's own unprompted traffic — classified
+  **wrapped**. No PATH-resolved invocation was ever classified unwrapped.
 - **Negative control A — `/usr/bin/git`** — 11 issued as
-  `/usr/bin/git -c pen4986.detector.control=A --version`; **7 of the 11 caught** (the rest fell
-  between sweeps — see the catch rate below), **7/7 classified unwrapped**, with all three
-  wrapped-signatures absent.
+  `/usr/bin/git -c pen4986.detector.control=A --version`; **5 caught, 5/5 classified unwrapped**.
 - **Negative control B — `/usr/lib/git-core/git`** — 11 issued as
-  `/usr/lib/git-core/git -c pen4986.detector.control=B --version`; **10 of the 11 caught**,
-  **10/10 classified unwrapped**. ⚠ **This is the control that justifies the rewrite.** Against the previous single-path instrument every one of these 11 invocations would
-  have been invisible — not classified wrapped, but *never observed at all* — while being just as
-  authenticated by `/etc/gitconfig` as control A. It is the concrete form of the false zero the
-  widened target set exists to prevent.
-- **Catch rate** — 300 invocations of a **copy** of the git binary at a different path
-  (`cp /usr/bin/git /tmp/.../calib/git`; mean lifetime ≈ 4 ms, the shortest an invocation can be):
-  **274 caught, 0.913**. A copy is used so that calibrating cannot contaminate the count, and its
-  inode is excluded from the target set explicitly. Consistent with the 0.930 the first run
-  measured the same way.
+  `/usr/lib/git-core/git -c pen4986.detector.control=B --version`; **10 caught, 10/10 classified
+  unwrapped**. ⚠ **This is the control that justifies the rewrite.** Against the previous
+  single-path instrument every one of these 11 invocations would have been invisible — not
+  classified wrapped, but *never observed at all* — while being just as authenticated by
+  `/etc/gitconfig` as control A. It is the concrete form of the false zero the widened target set
+  exists to prevent.
 
-  ⚠ Name the copy `git`, not `git-calib`: git dispatches on `argv[0]`, so a copy under another
-  name takes a shorter failure path and measures a catch rate that is not the one you want. That
-  mistake was made and corrected while taking this measurement — it read 0.863 against the same
-  binary.
+Every control invocation is `--version`: it touches no credential, no network and no repository.
+All are excluded from the count as self-inflicted, identified by the `pen4986.detector.control` key
+in argv. **No control was ever misclassified as wrapped** — the direction that would hide a finding.
 
-- **Indeterminate samples.** A process caught inside `execve` reads back with an **empty**
-  `/proc/<pid>/cmdline`: the kernel has swapped the `mm` but not yet written the new argv. Such a
-  sample carries no evidence in either direction. The first version scored them **unwrapped**,
-  which manufactures findings out of ordinary traffic — and since a non-zero count *is* trigger 4,
-  an instrument that cries wolf is as useless as one that is blind. One immediate re-read clears
-  most of the race; what survives is emitted as `kind: "indeterminate"`, never classified, never
-  counted as a finding, and reported as its own number so the blind spot is visible rather than
-  absorbed. Three occurred in this window.
+### 2.2 ⚠ The catch rate, and why the earlier figure was too high
 
-All 17 caught unwrapped controls were classified correctly and **none** was misclassified
-as wrapped, which is the direction that would hide a finding. Every control invocation is
-`--version`: it touches no credential, no network and no repository, and all of them are excluded
-from the count as self-inflicted, identified by the `pen4986.detector.control` key in argv.
+The earlier draft quoted a catch rate of **0.913**, measured on a **copy** of the git binary at
+another path, and used it for the confidence statement. That figure is **wrong for the binaries
+actually being watched**, and the error is in the optimistic direction.
 
-**What the catch rate licenses, stated precisely.** 0.913 is a floor, not the operating rate:
-it is measured on `git --version`, and every real git operation is longer-lived and correspondingly
-easier to catch. Taking it at face value anyway, a single worst-case invocation is missed with
-probability 0.087, so for that shortest class an observed zero supports **k = 0 at ~91%
-confidence** — i.e. `P(observe 0 | k ≥ 1) ≤ 0.087`. The weaker claim **k ≤ 1** holds at
-**~99.2%**. (An earlier draft of this section wrote "bounds the true count at ≤ 1 with ~93%
-confidence", which attached the wrong claim to the wrong confidence.)
+A dedicated calibration run issued **300 invocations of each of the three paths** against the
+shipped script:
+
+| Path | Caught | Rate |
+|---|---|---|
+| `/usr/bin/git` (class A, watched) | 213 / 300 | **0.710** |
+| `/usr/lib/git-core/git` (class A, watched) | 224 / 300 | **0.747** |
+| `/tmp/.../calib/git` (a byte-identical **copy**) | 271 / 300 | 0.903 |
+
+The copy is caught ~20 points more often than the binaries it is standing in for. The cause is
+lifetime, measured directly over 200 invocations each: **4 123 µs** for `/usr/bin/git`, **4 403 µs**
+for `/usr/lib/git-core/git`, **5 126 µs** for the copy. A copy outside `/usr/bin` and outside the
+git exec directory cannot locate `git-core` relative to its own `argv[0]`, so it takes a slower
+startup path, lives ~24 % longer, and is correspondingly easier for a sampler to land inside.
+**Calibrating on a copy therefore over-states the catch rate for the real binaries.** Keep the copy
+— it is still the only way to calibrate without adding to the counted population — but calibrate
+the watched paths directly too, and quote *those*.
+
+**The confidence statement, corrected.** Take the worst watched path, **0.710**. A single
+worst-case invocation — `git --version`, the shortest an invocation can be — is missed with
+probability **0.290**. So an observed zero supports:
+
+- **k = 0 at ~71 % confidence** for that shortest class, i.e. `P(observe 0 | k ≥ 1) ≤ 0.29`;
+- **k ≤ 1 at ~92 %**.
+
+This is materially weaker than the **~91 % / ~99.2 %** the previous draft claimed, and weaker again
+than the "≤ 1 with ~93 % confidence" of the draft before that, which also attached the wrong claim
+to the wrong confidence. Every real git operation — `status`, `commit`, `push` — is far longer-lived
+than `--version` and is caught at a correspondingly higher rate, so this is a floor on the hardest
+class and not the operating rate. But it is the number that belongs next to the zero.
+
+**Catch rate is not classify rate, and both are now reported.** A calibration sample whose argv is
+unreadable still counts as *caught*, while a target in the same state used to be dropped as
+*indeterminate* and never classified — so a single figure silently conflated the two. The classifier
+now runs on every readable arm (`resolveSample`), and a sample is indeterminate only when the argv
+is unreadable **and** no arm fired. Measured: **0.963** of watched-binary samples in the §3
+window were classified (52 of 54), and under the burst load of the calibration run the indeterminate
+share was 31 of 472 (6.6 %). Indeterminate samples are reported as their own number, never counted
+as a finding and never silently absorbed.
+
+One consequence worth stating plainly, because it was raised in review: **the controls that went
+unobserved cannot be hiding in the indeterminate bucket.** In the §3 window 6 of the 11 control-A
+invocations were not observed while only **2** samples were indeterminate, so at most 2 of the 6
+could be accounted for that way. The shortfall is sweep-miss, which is exactly what §2.2's catch
+rate measures — and it is why that rate, not the copy's, is the one quoted above.
 
 ## 3. Window, population, result
 
@@ -135,41 +163,41 @@ because the difference between the two is the point.
 
 | | |
 |---|---|
-| **Window** | `2026-10-29T09:04:14Z` → `2026-10-29T09:06:42Z` UTC (`2.5` min, `62 033` sweeps) |
+| **Window** | `2026-10-29T09:12:52Z` → `2026-10-29T09:14:27Z` UTC (`1.6` min, `29 902` sweeps) |
 | **Population** | one agent pod: `ac-7500672d-efe6-40-958651fb-6540-4b-c299f9-q7jzw`, ns `paperclip`, Job `ac-7500672d-efe6-40-958651fb-6540-4b-c299f9`, agent **Security Engineer** (`7500672d-efe6-4037-a05f-61204a670894`), run `958651fb-6540-4b36-a852-2034e5292762`, task PEN-4986 |
 | **Image** | `harbor.blockcast.net/paperclip-agent/paperclip-agent:sha-992d21f-k8s-vendored` (digest `sha256:d65f18e1…`) — a **different image** from the first run's `sha-ed39009`, and the same two class-A inodes with the same `sha256 356db14e…` were found in it |
 | **Watched** | class A: **2** inodes / **147** reachable paths. class B: **21** inodes. Both discovered at startup and recorded in the run's `start` record |
 | **Workload in window** | a representative agent working session: status/diff/log/rev-parse, staging, commit, **and a push to the remote** — so the credentialed egress path itself is inside the window |
-| **class A observations** | `63` |
-| **— wrapped** | `46` |
-| **— unwrapped** | **`0`**, plus `17` deliberate negative controls |
+| **class A observations** | `51` |
+| **— wrapped** | `36` |
+| **— unwrapped** | **`0`**, plus `15` deliberate negative controls |
 | **class B observations** (git-core helpers) | `1` |
 | **— wrapped** | `1` |
 | **— unwrapped** | **`0`** |
 
 The window is short in wall-clock terms and dense in content: it covers a complete working cycle —
 status, diff, log, rev-parse, staging, a commit, and a push to the remote — rather than idle time.
-Class-A subcommands observed outside the controls: `config` 20, `core.fsmonitor` probes 8, `log` 3,
-`push` 2, `remote` 2, and one each of `diff`, `add`, `rev-parse`, `commit`, `rev-list`,
-`send-pack`, `pack-objects`, `symbolic-ref`, `core.askPass` probe. By exe: **43** reached
-`/usr/bin/git` and **3** reached `/usr/lib/git-core/git` — the second inode is not hypothetical
-traffic, it ran, and under the previous instrument those three would simply not have appeared.
-All 3 are hook- and alias-spawned children of a wrapped git (§4.1), classified wrapped on the
+Class-A subcommands observed outside the controls: `config` 17, `remote` 3, `push` 2,
+`core.askPass` probes 2, and one each of `add`, `commit`, `maintenance`, `remote-https`,
+`rev-list`, `log`, `send-pack`, `pack-objects`, `symbolic-ref`. By exe: **32** reached
+`/usr/bin/git` and **4** reached `/usr/lib/git-core/git` — the second inode is not hypothetical
+traffic, it ran, and under the previous instrument those four would simply not have appeared.
+All 4 are hook- and alias-spawned children of a wrapped git (§4.1), classified wrapped on the
 inherited `GIT_CONFIG_PARAMETERS`.
 
 The single class-B observation is **`git-remote-http`**, spawned by the push. That is the program
 that actually spends the credential, and it classified **wrapped** via its ancestor — which is the
 arm added in this revision. Under the previous instrument it was not watched at all.
 
-**`3` samples were indeterminate** — caught inside `execve` with an unreadable `/proc/<pid>/cmdline`.
-They are reported, not counted in either direction; see §2.1.
+**`2` samples were indeterminate** — argv unreadable *and* no classifier arm firing. They are
+reported, not counted in either direction; see §2.2.
 
 **Both halves are zero.** No invocation of either git binary, and no invocation of any other
 git-core program, reached the real binary outside the wrapper — including during a push, which is
 the one operation in the window that actually spends the credential.
 
-⚠ **Where this window is weaker than the first run's:** 2.5 minutes of wall-clock is much less
-exposure to *rare* events than 22.1 minutes, even though it carries more git traffic. A caller that
+⚠ **Where this window is weaker than the first run's:** 1.6 minutes of wall-clock is much less
+exposure to *rare* events than 22.1 minutes, even though it carries comparable git traffic. A caller that
 fires once an hour would be missed by both, but this one has the smaller chance of catching it. The
 right reading is that this run re-establishes the result against the **correct target set** and adds
 push traffic the first run never covered; it does not supersede the first run's longer exposure, and
@@ -221,22 +249,35 @@ from splitting the sources of a git invocation in an agent pod into two:
   `github-git-egress-shim.js` and **none** of them an exec site. So the census holds for both
   class-A paths, not just the one it was originally written against.
 
-  ⚠ **This half does not generalise structurally.** This bullet first said it did, "because the
-  image is identical across the fleet". That is false, and PEN-4989 measured it: **106** distinct
-  agent image digests ran in the 7 days to 2026-10-29, **17** in the last 24 h, and for **38.2 %**
-  of that week more than one image was live at the same instant. What carries the census is
-  *sampling* — PEN-4989 re-ran it on a second image and reproduced all 15 occurrences exactly, and
-  this run reproduced them on a **third** (`sha-992d21f`), so it stands at **3 of 106 images**.
-  Strong evidence the egress machinery is stable across rebuilds; not a fleet census, and it must
-  not be cited as one. See
-  [`PEN-4989-absolute-path-git-population-widening.md`](./PEN-4989-absolute-path-git-population-widening.md) §3.
+  ⚠ **This half does not generalise structurally, and the three samples are not independent.**
+  This bullet first said it did generalise, "because the image is identical across the fleet". That
+  is false, and PEN-4989 measured it: **106** distinct agent image digests ran in the 7 days to
+  2026-10-29, **17** in the last 24 h, and for **38.2 %** of that week more than one image was live
+  at the same instant.
+
+  The census has now been reproduced on three of those images — `sha-ed39009`, `sha-4db591b`
+  (PEN-4989) and `sha-992d21f` (this run) — all 15 occurrences, exactly, every time. **That is
+  reproducibility, not coverage, and "3 of 106" must not be read as a sample fraction of the
+  fleet's egress variation.** The three images share **one** egress surface, measured rather than
+  assumed: `ed39009…992d21f` is 9 commits with exactly one build-relevant file changed
+  (`Dockerfile.agent-toolchain`, a `KUBECTL_VERSION` pin), and `4db591b…992d21f` is 3 commits whose
+  only build-relevant change is the same file. Nothing in the wrapper, the egress runtime, the
+  credential helper or the git install differs between them. So the three samples tell you the
+  census is deterministic against that surface; they tell you nothing about an image built from a
+  surface that differs.
+
+  The fleet claim rests on the **fingerprint comparison in §5**, not on this count: a pod whose
+  egress-surface fingerprint matches may cite this census, and one whose fingerprint differs must
+  re-take it. See
+  [`PEN-4989-absolute-path-git-population-widening.md`](./PEN-4989-absolute-path-git-population-widening.md) §3
+  *(lands in #3102)*.
 - **Agent-composed shell — per-pod, and measured in one pod only.** An agent can compose an
   absolute path to either binary into a shell snippet at runtime. That is the half this measurement
   covers for one pod and cannot cover for the others.
 
-So the honest statement is: the image-resident half is zero by census in 3 of the 106 images that
-ran that week, and the per-pod half is zero in the pods observed — the first run, a second in
-PEN-4989, and this one, all of them the **same agent and workload**. §7.1's assumption is tested,
+So the honest statement is: the image-resident half is zero by census on three images that share a
+single egress surface, and the per-pod half is zero in the pods observed — the first run, a second
+in PEN-4989, and this one, all of them the **same agent and workload**. §7.1's assumption is tested,
 not assumed — but it is not a fleet census, and this document should not be cited as though it were.
 
 ### 4.1 ⚠ A finding about §7.1's wording, surfaced by the widened target set
@@ -288,9 +329,11 @@ cannot scope.
 
 This section first said "whenever the agent image or the PATH layout changes". At ≈15 image changes
 a day (PEN-4989 §3) that trigger is always firing and so gets ignored, which is the failure PEN-4988
-exists to prevent. `scripts/absolute-path-git-fingerprint.mjs` hashes the narrower surface, so
-staleness is a comparison: a run whose fingerprint matches may cite this measurement, one whose
-fingerprint differs must re-take it.
+exists to prevent. `scripts/absolute-path-git-fingerprint.mjs` *(lands in #3102)* hashes the narrower
+surface, so staleness is a comparison: a run whose fingerprint matches may cite this measurement,
+one whose fingerprint differs must re-take it. **This is also what the census count in §4 rests
+on**, since three images off one egress surface are a reproducibility check, not a sample of the
+fleet.
 
 ```sh
 mkdir -p /tmp/calib && cp /usr/bin/git /tmp/calib/git   # a copy, NOT /usr/bin/git itself.
@@ -305,16 +348,26 @@ node scripts/measure-absolute-path-git.mjs /tmp/obs.ndjson 2 /tmp/calib/git &
 git --version                                              # positive: must classify wrapped
 /usr/bin/git        -c pen4986.detector.control=A --version # negative, class-A inode 1
 /usr/lib/git-core/git -c pen4986.detector.control=B --version # negative, class-A inode 2
-for i in $(seq 1 300); do /tmp/calib/git --version >/dev/null; done   # catch rate
+# Catch rate: calibrate the WATCHED PATHS directly, not only the copy. The copy
+# cannot find git-core relative to its own argv[0], so it lives ~24% longer and
+# over-states the rate for the binaries that are actually counted (§2.2).
+for i in $(seq 1 300); do /tmp/calib/git --version >/dev/null; done
+for i in $(seq 1 300); do /usr/bin/git        -c pen4986.detector.control=A --version >/dev/null; done
+for i in $(seq 1 300); do /usr/lib/git-core/git -c pen4986.detector.control=B --version >/dev/null; done
 
 # ... then work normally across a representative window.
 kill -TERM %1                              # emits the {"kind":"stop"} summary + tally
 ```
 
 Read the result off the `stop` record's `tally`, not off a bare grep: `unwrapped` counts the
-findings, `indeterminate` counts samples caught inside `execve` whose argv could not be read, and
-the deliberate controls must be subtracted by their `pen4986.detector.control` marker. A grep for
-`"wrapped":false` alone will also pick up the controls.
+findings, `indeterminate` counts samples where the argv was unreadable and no classifier arm fired,
+and the deliberate controls must be subtracted by their `pen4986.detector.control` marker. A grep
+for `"wrapped":false` alone will also pick up the controls — in a run calibrated as above they are
+the overwhelming majority of them.
+
+Run the per-path calibration as its **own** run, not inside the counted window: 600 deliberate
+unwrapped invocations are exactly the population the window is trying to count, and mixing them in
+makes the headline unreadable even though the marker excludes them.
 
 Widening the population is the obvious improvement and needs no new permission: the same script run
 in more agent pods, by more agents, turns the one-pod result into a fleet census.
