@@ -25,10 +25,18 @@ import {
   ISSUE_CREATE_DUPLICATE_CANDIDATE_LATENCY_BUDGET_MS,
   ISSUE_CREATE_DUPLICATE_CANDIDATE_ROW_CAP,
   ISSUE_CREATE_DUPLICATE_CANDIDATE_SCAN_CAP,
+  classifyIssueDuplicateCandidateLookupOutcome,
   findCreateIssueDuplicateCandidates,
   issueRoutes,
   raceCreateIssueDuplicateCandidateLookup,
+  withReservedCreateIssueAdvisoryDb,
 } from "../routes/issues.js";
+import {
+  ISSUE_DUPLICATE_CANDIDATE_LOOKUP_METRIC,
+  ISSUE_DUPLICATE_CANDIDATE_LOOKUP_OUTCOMES,
+  ISSUE_DUPLICATE_CANDIDATE_LOOKUP_STAGES,
+  getMetricsRegistry,
+} from "../services/metrics.js";
 import {
   ISSUE_CREATE_IDEMPOTENCY_KEY_RETENTION_DAYS,
   issueService,
@@ -56,6 +64,94 @@ it("bounds a stalled duplicate candidate lookup so create can fail open", async 
   await expect(raceCreateIssueDuplicateCandidateLookup(new Promise<never>(() => {}), 10))
     .rejects.toThrow("issue duplicate candidate lookup timed out after 10ms");
   expect(performance.now() - startedAt).toBeLessThan(ISSUE_CREATE_DUPLICATE_CANDIDATE_LATENCY_BUDGET_MS);
+});
+
+describe("duplicate candidate lookup outcome classification (PEN-5019)", () => {
+  // Why this classifier exists at all: both duplicate-candidate database
+  // touches run after the issue is committed and swallow every failure, so the
+  // create answers 201 either way. The only trace of a blown budget was a log
+  // line -- and in the Postgres log that line is byte-identical to a 30 s
+  // role-level stall, which is how 19 of these came to be read as user-facing
+  // 503s. The counter these outcomes feed is what separates them.
+
+  it("reads the Postgres cancel sqlstate off the rejection", () => {
+    const err = Object.assign(new Error("canceling statement due to statement timeout"), {
+      code: "57014",
+    });
+    expect(classifyIssueDuplicateCandidateLookupOutcome(err)).toBe("statement_timeout");
+  });
+
+  it("finds the cancel sqlstate wrapped under cause", () => {
+    // The shape the embedded-Postgres coverage below actually observes: drizzle's
+    // transaction wrapper re-raises with the driver error as `cause`, so a
+    // top-level-only check would score a real timeout as a generic error.
+    const err = new Error("transaction failed", {
+      cause: Object.assign(new Error("canceling statement due to statement timeout"), {
+        code: "57014",
+      }),
+    });
+    expect(classifyIssueDuplicateCandidateLookupOutcome(err)).toBe("statement_timeout");
+  });
+
+  it("tags the in-process deadline distinctly from a server-side cancel", async () => {
+    // Produced by the real helper rather than hand-rolled, so the tag is proven
+    // across the throw site and not just asserted about itself.
+    const err = await raceCreateIssueDuplicateCandidateLookup(new Promise<never>(() => {}), 5)
+      .catch((caught: unknown) => caught);
+    expect(classifyIssueDuplicateCandidateLookupOutcome(err)).toBe("deadline_exceeded");
+  });
+
+  it("tags a reservation that never lands as connection_unavailable", async () => {
+    // A pool that can never hand out a connection: the scan never reaches
+    // Postgres, so this is not a database-slowness signal and must not read as
+    // one. No real database needed -- only $client.reserve is consulted.
+    const neverReserves = {
+      $client: { options: {}, reserve: () => new Promise<never>(() => {}) },
+    } as unknown as Parameters<typeof withReservedCreateIssueAdvisoryDb>[0];
+    const err = await withReservedCreateIssueAdvisoryDb(
+      neverReserves,
+      5,
+      "issue duplicate candidate lookup",
+      async () => "unreachable",
+    ).catch((caught: unknown) => caught);
+    expect(classifyIssueDuplicateCandidateLookupOutcome(err)).toBe("connection_unavailable");
+  });
+
+  it("falls back to error rather than ok for anything unrecognised", () => {
+    // Fails toward "something went wrong": an unclassified failure must never
+    // render as a successful scan on the degradation panel.
+    expect(classifyIssueDuplicateCandidateLookupOutcome(new Error("boom"))).toBe("error");
+    expect(classifyIssueDuplicateCandidateLookupOutcome(null)).toBe("error");
+    expect(classifyIssueDuplicateCandidateLookupOutcome("not an error")).toBe("error");
+    expect(classifyIssueDuplicateCandidateLookupOutcome(undefined)).toBe("error");
+  });
+
+  it("terminates on a cyclic cause chain", () => {
+    const outer: Error & { cause?: unknown } = new Error("outer");
+    const inner: Error & { cause?: unknown } = new Error("inner");
+    outer.cause = inner;
+    inner.cause = outer;
+    expect(classifyIssueDuplicateCandidateLookupOutcome(outer)).toBe("error");
+  });
+
+  it("exports every stage/outcome series at zero before anything fails", async () => {
+    // A labelled counter publishes nothing until its first inc(), so without
+    // seeding `increase()` would miss the first timeout on a pod and a healthy
+    // fleet would render "No data" instead of 0.
+    const metric = getMetricsRegistry().getSingleMetric(ISSUE_DUPLICATE_CANDIDATE_LOOKUP_METRIC);
+    expect(metric).toBeDefined();
+    const snapshot = (await metric!.get()) as {
+      values: Array<{ labels: Record<string, string | number> }>;
+    };
+    const seen = new Set(
+      snapshot.values.map((entry) => `${entry.labels.stage}/${entry.labels.outcome}`),
+    );
+    for (const stage of ISSUE_DUPLICATE_CANDIDATE_LOOKUP_STAGES) {
+      for (const outcome of ISSUE_DUPLICATE_CANDIDATE_LOOKUP_OUTCOMES) {
+        expect(seen).toContain(`${stage}/${outcome}`);
+      }
+    }
+  });
 });
 
 if (!embeddedPostgresSupport.supported) {

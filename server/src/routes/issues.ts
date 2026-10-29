@@ -108,7 +108,13 @@ import { trackAgentTaskCompleted } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import type { StorageService } from "../storage/types.js";
 import { validate } from "../middleware/validate.js";
-import { recordUnrecognizedInteractionPayloadKeys } from "../services/metrics.js";
+import {
+  ISSUE_DUPLICATE_CANDIDATE_LOOKUP_OUTCOMES,
+  recordIssueDuplicateCandidateLookup,
+  recordUnrecognizedInteractionPayloadKeys,
+  type IssueDuplicateCandidateLookupOutcome,
+} from "../services/metrics.js";
+import { STATEMENT_TIMEOUT_SQLSTATE } from "../lib/db-retry.js";
 import * as serviceIndex from "../services/index.js";
 import {
   accessService,
@@ -314,6 +320,56 @@ type CreateIssueDuplicateCandidatePage = {
   readable: CreateIssueDuplicateCandidateRow[];
 };
 
+/**
+ * Marks a rejection this module threw itself with the outcome it represents, so
+ * {@link classifyIssueDuplicateCandidateLookupOutcome} does not have to
+ * recognise it by message text. Both guards here fail with a plain `Error`
+ * whose only distinguishing feature would otherwise be its wording, and that
+ * wording is asserted by tests -- tagging keeps the classifier independent of
+ * it.
+ */
+const DUPLICATE_CANDIDATE_LOOKUP_OUTCOME_TAG = "__issueDuplicateCandidateLookupOutcome";
+
+function tagIssueDuplicateCandidateLookupOutcome<E extends Error>(
+  err: E,
+  outcome: IssueDuplicateCandidateLookupOutcome,
+): E {
+  return Object.assign(err, { [DUPLICATE_CANDIDATE_LOOKUP_OUTCOME_TAG]: outcome });
+}
+
+/**
+ * Which {@link ISSUE_DUPLICATE_CANDIDATE_LOOKUP_METRIC} outcome a caught
+ * duplicate-candidate failure represents.
+ *
+ * Walks the `cause` chain rather than inspecting only the top error: postgres.js
+ * puts the cancel sqlstate on the rejection it raises, but drizzle's transaction
+ * wrapper and {@link withReservedCreateIssueAdvisoryDb} can both re-wrap it, and
+ * the existing `57014` coverage in `issue-create-deduplication-routes.test.ts`
+ * finds it under `cause` for exactly that reason. Depth-bounded because a
+ * `cause` chain can be cyclic.
+ *
+ * Anything unrecognised is `error`, never silently `ok` -- an unclassified
+ * failure must not read as a successful scan on the degradation panel.
+ */
+export function classifyIssueDuplicateCandidateLookupOutcome(
+  err: unknown,
+): IssueDuplicateCandidateLookupOutcome {
+  let node: unknown = err;
+  for (let depth = 0; node !== null && typeof node === "object" && depth < 5; depth += 1) {
+    const candidate = node as Record<string, unknown>;
+    const tagged = candidate[DUPLICATE_CANDIDATE_LOOKUP_OUTCOME_TAG];
+    if (
+      typeof tagged === "string"
+      && (ISSUE_DUPLICATE_CANDIDATE_LOOKUP_OUTCOMES as readonly string[]).includes(tagged)
+    ) {
+      return tagged as IssueDuplicateCandidateLookupOutcome;
+    }
+    if (candidate.code === STATEMENT_TIMEOUT_SQLSTATE) return "statement_timeout";
+    node = candidate.cause;
+  }
+  return "error";
+}
+
 export function raceCreateIssueDuplicateCandidateLookup<T>(
   promise: Promise<T>,
   timeoutMs = ISSUE_CREATE_DUPLICATE_CANDIDATE_TIMEOUT_MS,
@@ -325,7 +381,10 @@ export function raceCreateIssueDuplicateCandidateLookup<T>(
     timer = setTimeout(
       () => {
         onTimeout?.();
-        reject(new Error(`${operation} timed out after ${timeoutMs}ms`));
+        reject(tagIssueDuplicateCandidateLookupOutcome(
+          new Error(`${operation} timed out after ${timeoutMs}ms`),
+          "deadline_exceeded",
+        ));
       },
       timeoutMs,
     );
@@ -437,7 +496,7 @@ function getReservablePostgresClient(db: Db): ReservablePostgresClient | null {
   return typeof client?.reserve === "function" ? client as ReservablePostgresClient : null;
 }
 
-async function withReservedCreateIssueAdvisoryDb<T>(
+export async function withReservedCreateIssueAdvisoryDb<T>(
   db: Db,
   timeoutMs: number,
   operation: string,
@@ -460,7 +519,10 @@ async function withReservedCreateIssueAdvisoryDb<T>(
       .catch((err) => {
         logger.warn({ err }, `${operation} database connection reservation failed after timeout`);
       });
-    throw new Error(`${operation} skipped because no database connection was available within ${timeoutMs}ms`);
+    throw tagIssueDuplicateCandidateLookupOutcome(
+      new Error(`${operation} skipped because no database connection was available within ${timeoutMs}ms`),
+      "connection_unavailable",
+    );
   }
 
   try {
@@ -529,12 +591,22 @@ function scheduleDuplicateCandidateShownActivity(input: {
       timeoutMs,
       undefined,
       "issue duplicate candidate consumption event",
-    ).catch((err) => {
-      logger.warn(
-        { err, companyId: input.companyId, issueId: input.issue.id, issueIdentifier: input.issue.identifier },
-        "issue duplicate candidate consumption event failed; continuing successful create",
-      );
-    });
+    ).then(
+      // Two-arg then, not .then().catch(): a .catch() chained after a success
+      // handler would also swallow -- and miscount as a lookup failure -- a
+      // throw from the recording call itself.
+      () => recordIssueDuplicateCandidateLookup("consumption_event", "ok"),
+      (err: unknown) => {
+        recordIssueDuplicateCandidateLookup(
+          "consumption_event",
+          classifyIssueDuplicateCandidateLookupOutcome(err),
+        );
+        logger.warn(
+          { err, companyId: input.companyId, issueId: input.issue.id, issueIdentifier: input.issue.identifier },
+          "issue duplicate candidate consumption event failed; continuing successful create",
+        );
+      },
+    );
   });
 }
 
@@ -11883,6 +11955,10 @@ export function issueRoutes(
     await opts.createIssueBeforeResponseHook?.();
 
     let duplicateCandidates: CreateIssueDuplicateCandidate[] = [];
+    // Recorded once below, after the try/catch, rather than on each branch: a
+    // record call inside the try would land its own throw in the catch and be
+    // counted a second time as a lookup failure.
+    let duplicateLookupOutcome: IssueDuplicateCandidateLookupOutcome = "ok";
     try {
       const lookupAbortController = new AbortController();
       const lookupTimeoutMs = opts.createIssueDuplicateCandidateTimeoutMs
@@ -11910,11 +11986,13 @@ export function issueRoutes(
         () => lookupAbortController.abort(),
       );
     } catch (err) {
+      duplicateLookupOutcome = classifyIssueDuplicateCandidateLookupOutcome(err);
       logger.warn(
         { err, companyId, issueId: issue.id, issueIdentifier: issue.identifier },
         "issue duplicate candidate lookup failed; continuing create without advisories",
       );
     }
+    recordIssueDuplicateCandidateLookup("corpus_scan", duplicateLookupOutcome);
 
     scheduleDuplicateCandidateShownActivity({
       db,
