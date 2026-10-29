@@ -1229,6 +1229,20 @@ describe(`stale-hold report (held >${STALE_HOLD_HOURS}h, PEN-5005)`, () => {
     assert.deepEqual(stalledHolds(prs, rows, { now: NOW }), []);
   });
 
+  it("never ages a row the cap deferred — the next fire takes it", () => {
+    // Ally on #3106: `classifyAll` rewrites an over-budget `enqueue` into
+    // `skip`/`cap:N-per-fire`, and the budget is spent on the PRs whose CI
+    // reported most recently — so the deferred rows carry the OLDEST stamps
+    // and age like strands. Reporting them would fire this block hardest
+    // exactly when the queue is deepest and the routine is working.
+    assert.deepEqual(
+      stalledHolds([pr(1, OLD)], [row(1, "skip", `cap:${MAX_ENQUEUES_PER_FIRE}-per-fire`)], {
+        now: NOW,
+      }),
+      [],
+    );
+  });
+
   it("never ages a deliberate hold", () => {
     // Draft, an opt-out label and a human author are all states someone CHOSE.
     // An alarm that fires on its own normal operation is one nobody reads.
@@ -1281,7 +1295,11 @@ describe(`stale-hold report (held >${STALE_HOLD_HOURS}h, PEN-5005)`, () => {
       { number: 7, reason: "owner-approval-pending", ageHours: 40.2 },
       { number: 8, reason: "checks:none", ageHours: null },
     ]);
-    assert.match(text, /stale-hold \(held >13h/);
+    // The header names the clock that was measured. "held >13h" would claim a
+    // duration this report does not have: a hold acquired this fire on CI
+    // that finished 14h ago is reported, and that is correct.
+    assert.match(text, /stale-hold \(judgeable >13h, still held\)/);
+    assert.match(text, /time since this head last reported, not time the hold has stood/);
     assert.match(text, /a\/one#7 — `owner-approval-pending`, 40\.2h/);
     assert.match(text, /a\/one#8 — `checks:none`, age unknown/);
   });

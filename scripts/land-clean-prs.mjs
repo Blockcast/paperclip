@@ -96,8 +96,14 @@ import {
 export const STALE_ENQUEUE_HOURS = 13;
 
 /**
- * How long a HOLD may stand before the receipt reports it as durable rather
- * than in flight.
+ * How long a head may go without reporting before a hold still standing on it
+ * is reported as durable rather than in flight.
+ *
+ * Note what that is NOT: it is not how long the hold has stood. Nothing cheap
+ * dates a hold's onset, and `judgeableAgeHours` explains why the head clock is
+ * the right proxy anyway. A row that acquired its hold this fire, on CI that
+ * finished yesterday, is reported — correctly, because the question is whether
+ * the verdict has been available and unacted-on, not who noticed when.
  *
  * The classifier already names a reason for every PR it does not enqueue, so
  * nothing here is newly discovered — what is missing is DURATION. A row that
@@ -867,8 +873,16 @@ export function renderReceipt(rows) {
  * the common case on a busy repo, so a detector that counted them would be
  * read once and then ignored, which is the failure mode of every alarm that
  * fires on its own normal operation.
+ *
+ * `cap:` is here for that last reason rather than the first. It is not a
+ * choice, it is `classifyAll` rewriting an over-budget `enqueue` into a skip —
+ * a PR the NEXT fire takes. It ages like a strand because the budget is spent
+ * on PRs whose CI finished more recently, so the deferred rows are precisely
+ * the ones with the oldest check stamps. Aging it would fire this report
+ * hardest exactly when the queue is deepest and the routine is working
+ * normally.
  */
-const DELIBERATE_HOLD_REASON_RE = /^(?:human-author|draft|label:)/;
+const DELIBERATE_HOLD_REASON_RE = /^(?:human-author|draft|label:|cap:)/;
 
 /** Rows that are an action or a self-clearing wait, not a hold to be aged. */
 const NON_HOLD_ACTIONS = new Set([
@@ -949,9 +963,11 @@ export function renderStalledHolds(repo, held, { staleHours = STALE_HOLD_HOURS }
     `  ${repo}#${number} — \`${reason}\`, ` +
     (ageHours === null ? "age unknown (no dated check on this head)" : `${ageHours.toFixed(1)}h`);
   return (
-    `stale-hold (held >${staleHours}h, nothing will clear these on its own) — ${held.length}:\n` +
+    `stale-hold (judgeable >${staleHours}h, still held) — ${held.length}:\n` +
     held.map(line).join("\n") +
-    "\nEach already carries its reason above; what is new is that the reason has " +
+    "\nThe age is time since this head last reported, not time the hold has " +
+    "stood — a hold acquired this fire on old CI still counts. Each row " +
+    "already carries its reason above; what is new is that the reason has " +
     "stopped being a wait. Act on it or say why it stands."
   );
 }
