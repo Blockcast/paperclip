@@ -8,6 +8,7 @@ import {
   createHttpLogger,
   shouldOmitRequestBodyFromLog,
   shouldSilenceHttpSuccessLog,
+  upgradePathForLog,
   urlForLog,
 } from "../middleware/http-log-policy.js";
 
@@ -133,6 +134,71 @@ describe("urlForLog", () => {
     // the worker-tier proxy has to avoid when building its target URL.
     const absolute = "http://worker:3000/api/plugins/slack/webhooks/slack-events?token=shh";
     expect(urlForLog(absolute)).toBe(absolute);
+  });
+});
+
+describe("upgradePathForLog", () => {
+  // The credential a browser WebSocket client has no other way to send: the
+  // `WebSocket` constructor cannot set an `Authorization` header, so the board
+  // authenticates the live-events socket with `?token=` (PEN-3549).
+  const WS_TOKEN_SENTINEL = "pcp_sentinel_agent_api_key_do_not_log";
+
+  it("drops the query string by default — the allowlist is empty until a caller names a key", () => {
+    const out = upgradePathForLog(`/api/companies/c1/live-events?token=${WS_TOKEN_SENTINEL}`);
+    expect(out).not.toContain(WS_TOKEN_SENTINEL);
+    expect(out).toBe("/api/companies/c1/live-events?redactedQueryKeys=1");
+  });
+
+  it("keeps the keys a caller names, and only those", () => {
+    const out = upgradePathForLog(
+      `/api/terminal?terminalSessionId=t1&cols=80&token=${WS_TOKEN_SENTINEL}`,
+      ["terminalSessionId", "cols"],
+    );
+    expect(out).not.toContain(WS_TOKEN_SENTINEL);
+    expect(out).toBe("/api/terminal?terminalSessionId=t1&cols=80&redactedQueryKeys=1");
+  });
+
+  // The whole point of the allowlist: a credential-bearing key nobody wrote
+  // down in advance is dropped, where a denylist of `token` would have kept it.
+  it("drops an unanticipated credential key an allowlist author never named", () => {
+    const out = upgradePathForLog(
+      `/api/terminal?terminalSessionId=t1&sessionSecret=${WS_TOKEN_SENTINEL}`,
+      ["terminalSessionId", "cols", "rows"],
+    );
+    expect(out).not.toContain(WS_TOKEN_SENTINEL);
+    expect(out).toBe("/api/terminal?terminalSessionId=t1&redactedQueryKeys=1");
+  });
+
+  it("reports how many keys it dropped, so an absent token reads differently from a scrubbed one", () => {
+    expect(upgradePathForLog("/api/companies/c1/live-events")).toBe("/api/companies/c1/live-events");
+    expect(upgradePathForLog("/api/companies/c1/live-events?token=x&trace=y"))
+      .toBe("/api/companies/c1/live-events?redactedQueryKeys=2");
+  });
+
+  it("does not leak a repeated key's later values", () => {
+    const out = upgradePathForLog(`/api/x?token=a&token=${WS_TOKEN_SENTINEL}`);
+    expect(out).not.toContain(WS_TOKEN_SENTINEL);
+    expect(out).toBe("/api/x?redactedQueryKeys=2");
+  });
+
+  it("passes undefined through so callers can log an absent URL as absent", () => {
+    expect(upgradePathForLog(undefined)).toBeUndefined();
+  });
+
+  it("drops everything from the first `?` when the URL will not parse", () => {
+    // Nothing in an unparseable URL can be shown to be non-credential, so the
+    // fallback keeps the path and discards the rest rather than passing it on.
+    const out = upgradePathForLog(`//%%/not a url?token=${WS_TOKEN_SENTINEL}`);
+    expect(out).not.toContain(WS_TOKEN_SENTINEL);
+    expect(out).not.toContain("?");
+  });
+
+  it("is a different rule from urlForLog, which is the identity function on these paths", () => {
+    // `urlForLog` is keyed on UNLOGGABLE_REQUEST_BODY_PATHS; no WS upgrade path
+    // is on that list, which is why this helper has to exist at all.
+    const raw = `/api/companies/c1/live-events?token=${WS_TOKEN_SENTINEL}`;
+    expect(urlForLog(raw)).toBe(raw);
+    expect(upgradePathForLog(raw)).not.toContain(WS_TOKEN_SENTINEL);
   });
 });
 

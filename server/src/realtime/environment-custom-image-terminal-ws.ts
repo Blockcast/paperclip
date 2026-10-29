@@ -4,6 +4,7 @@ import type { Duplex } from "node:stream";
 import type { Db } from "@paperclipai/db";
 import { conflict, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
+import { upgradePathForLog } from "../middleware/http-log-policy.js";
 import {
   readCustomImageSetupSessionCompanyId,
   requireFutureCustomImageSetupExpiry,
@@ -179,18 +180,12 @@ function clientSafeErrorMessage(err: unknown, fallback: string) {
   return fallback;
 }
 
-function safeUpgradePath(rawUrl: string | undefined): string | undefined {
-  if (!rawUrl) return undefined;
-  try {
-    const url = new URL(rawUrl, "http://localhost");
-    if (url.searchParams.has("token")) {
-      url.searchParams.set("token", "[redacted]");
-    }
-    return `${url.pathname}${url.search}`;
-  } catch {
-    return rawUrl.split("?")[0] || undefined;
-  }
-}
+// The non-credential query keys this socket reads, and the only ones its log
+// lines may carry. Named here rather than denied one-by-one at the log site:
+// this module used to redact exactly `token` and keep everything else, which
+// would have logged the next credential-bearing key in the clear. See
+// `upgradePathForLog` (PEN-3549).
+const TERMINAL_LOGGABLE_QUERY_KEYS = ["terminalSessionId", "cols", "rows"] as const;
 
 function terminalPayloadValidationError(
   failure: Extract<EnvironmentCustomImageTerminalPayloadValidationResult, { ok: false }>,
@@ -728,7 +723,7 @@ export function setupEnvironmentCustomImageTerminalWebSocketServer(
     if (!path) return;
 
     reqWithContext.paperclipWebSocketHandled = true;
-    const logPath = safeUpgradePath(req.url);
+    const logPath = upgradePathForLog(req.url, TERMINAL_LOGGABLE_QUERY_KEYS);
 
     const onRawSocketError = (err: Error) => {
       logger.warn({ errorName: safeErrorName(err), path: logPath }, "custom image terminal websocket upgrade socket error");
