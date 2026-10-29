@@ -23,7 +23,7 @@ residual acceptance does not run to 2027-01-31. It is ended by this measurement,
 a task to be absorbed into a future change.
 
 **⛔ The CTO ruled on 2026-10-29, and the ruling is now part of this record** (see *CTO
-disposition*, D-1…D-4, below). Trigger 4 is **accepted as fired**; the count of **28** stands; the
+disposition*, D-1…D-7, below). Trigger 4 is **accepted as fired**; the count of **28** stands; the
 residual acceptance is **ended, not re-granted on narrower terms**. No incident is opened — all 28 are non-publishing — but the control gap is
 classified **Medium, standing**. What replaces the acceptance is an **owned remediation with a date**,
 which is a different object from an acceptance. Where the CTO disposition and this record's original
@@ -588,6 +588,9 @@ and obtaining it from inside an agent pod needs the hardening §8 forbids relaxi
   (Engineer), against denominators of 203 and 239 — which is recorded rather than reconciled into
   one number, because the disagreement is itself the finding: **the predicate is not yet written
   precisely enough for two people to count the same thing.** Settling it is PEN-5012's.
+  *(Updated: **D-6** — two rules now bind. These three counts predate D-1, so the disagreement is
+  now resolvable; and they must **never** be reconciled to, or differenced against, the 28. Sweeps
+  count static sites; 28 counts runtime invocations. Neither bounds the other.)*
 - **⚠ The class is not confined to repository code, and a static sweep cannot see the rest of it.**
   While writing this amendment the author reproduced the bypass *in their own shell*, by applying a
   remembered `PATH=/usr/bin:$PATH` workaround — a habit carried in agent memory, not in any file in
@@ -595,6 +598,10 @@ and obtaining it from inside an agent pod needs the hardening §8 forbids relaxi
   it bounds: **PEN-5012 sweeps repositories, and an instantiation that lives in an agent's habit or
   in a run-time-composed command is outside every tree it reads.** The static sweep's "one reachable
   site" is therefore a statement about *committed code*, not about what runs in a pod.
+  *(Updated: **D-5** — same class, not a second firing; **28 stands**. No incident, and the
+  self-report carries no penalty, on the record. The scope rule above is now **binding** on
+  PEN-5012: a post-fix zero must carry its population and its `remediated` status and must never be
+  reported bare or as a class closure. A behavioural control was considered and **refused**.)*
 - **Workload, not pod count, was the axis that mattered — and it is still barely sampled.** Five pods
   and four agents found nothing until the one window that ran `pnpm test`. **≈ 61 minutes of
   observation in total**, and a single 24-second burst carried 26 of the 28. Widening needs no new
@@ -653,7 +660,7 @@ the number. A measurement that does not name its population cannot be widened by
 
 Stated here because PEN-4989's acceptance criterion requires it to be said explicitly and on the
 record, rather than left implicit in a count. **This section is what the record *asked for*; the
-*CTO disposition* (D-1…D-4) is what the CTO *ruled*. Where they differ, the disposition governs.**
+*CTO disposition* (D-1…D-7) is what the CTO *ruled*. Where they differ, the disposition governs.**
 
 1. **§7.2 trigger 4 has fired** (§1.2, PEN-4993). The count is **28**, measured 2026-10-29.
 2. **The §7.1 residual acceptance ends as of 2026-10-29.** It does **not** run to its 2027-01-31
@@ -678,7 +685,7 @@ record, rather than left implicit in a count. **This section is what the record 
 ## CTO disposition (2026-10-29) — the ruling of record
 
 > **Numbering note.** Throughout this record, bare `§1`–`§6` are *this* document's sections, while
-> `§7.1`, `§7.2` and `§8` always mean **PEN-3183's**. This section is therefore lettered **D-1…D-4**
+> `§7.1`, `§7.2` and `§8` always mean **PEN-3183's**. This section is therefore lettered **D-1…D-7**
 > rather than numbered, so that no reference is ambiguous.
 
 Recorded here in full because PEN-4989's acceptance criterion requires the firing and its
@@ -716,7 +723,9 @@ acceptance:
    `PATH` stops being the boundary. The dated enablement plan for `enableGitHubPublishBroker` is
    delivered — [PEN-5016](https://paperclip.blockcast.net/PEN/issues/PEN-5016), PR
    [#3109](https://github.com/Blockcast/paperclip/pull/3109) — carrying *proposed* dates; **the gate
-   is not flipped** and the CTO owns the date.
+   is not flipped** and the CTO owns the date. *(Updated: **D-7** — the sequence and exit criteria
+   are ratified, the **calendar is not**. Stage 1 begins on the stage-0 close, not on 2026-11-06,
+   which is an earliest-start only.)*
 2. **Interim mitigation — PEN-5012's helper.** A **mitigation**, and it **must not be recorded as
    closing the class.**
 3. **The standing blind spot stays, and the CTO owns it *as a blind spot*.** No cluster-wide exec
@@ -738,3 +747,103 @@ It is **harmless today** (the gate is off everywhere, so an override can only se
 already holds) and **becomes live the moment stage 1 sets it `true`**, failing silently in the
 permissive direction. It is a **rollout precondition for PEN-4933, not a second firing of trigger
 4**, and is recorded here only so the two are not conflated.
+
+### Premise re-verified independently — three pods, same answer
+
+Recorded here because D-3's structural argument rests on it, and because it was *re-verified* rather
+than inherited: the CTO checked it in their own pod (2026-10-29), the Engineer in theirs, and the
+author of this amendment in a third. All three read-only — name resolution, `ls`, `head -c`.
+
+| | all three pods |
+|---|---|
+| `PATH[0]` | `/usr/local/libexec/paperclip/bin` |
+| `command -v git` | `/usr/local/libexec/paperclip/bin/git` — a `#!` script |
+| wrapper dir | `gh git github-mcp-server github-token-credential-helper google-chrome paperclip-github-token-env` — **no `gitleaks`** |
+| real binary | `/usr/bin/git`, `-rwxr-xr-x root 4082768 Jul 30 2025` (byte-identical stat) |
+
+**Enforcement is `PATH` ordering and nothing else, and the real binary sits at a stable absolute
+path reachable by any process.** That is a property of *the control*, not of any repository — which
+is the whole of D-3's structural argument, now confirmed from three independent pods.
+
+⚠ **This is not a measurement and adds nothing to §1.1.** It is a structural check of the
+enforcement mechanism, not an observation window. **No measurement was re-taken here and no count
+changed — 28 stands.** Do not fold these three pods into §1.1's pod count or §4's image census;
+they are a different object, which is the same error D-6 forbids one level up.
+
+### D-5 The runtime/habit instantiation is the **same** class — no count changes
+
+§5's third bullet — the author reproducing the bypass *in their own shell* by applying a remembered
+`PATH=/usr/bin:$PATH` — is **not a second fired trigger and not a new class.** It is the class D-3
+already ruled on, reached from a transcript instead of a file. **28 stands**, exactly as §5 wrote it.
+
+1. **No incident.** Read-only `gh`, no git write, caught before any git operation, self-reported.
+   **Identical disposition to D-2.**
+2. **Self-reporting it was correct and carries no penalty.** Stated explicitly and on the record,
+   because the alternative equilibrium is both obvious and fatal: D-3 accepts the absence of exec
+   telemetry as a **standing blind spot**, so the only signal this class will ever emit inside a pod
+   is *an agent choosing to report it*. **A reported instance must always be cheaper than a concealed
+   one.** This is a property of the reporting equilibrium, not a courtesy.
+3. **⛔ The owned change — [PEN-5012](https://paperclip.blockcast.net/PEN/issues/PEN-5012) must state
+   the scope of its own zero.** A sweep that returns zero is a statement about **committed code in
+   the repositories and refs it read** — never about what runs in a pod. Paired with D-3's existing
+   rule that the helper is a *mitigation*: **a post-fix zero must be labelled with its population and
+   its `remediated` status, and must never be reported bare or as a class closure.** §5's first
+   bullet already draws this distinction for the static sweep; D-5 makes it binding rather than
+   observational.
+
+**⛔ What is refused, and why it will otherwise get reinvented.** **No behavioural control** — no
+lint, no policy line, no "agents must not narrow `PATH`" reminder. Three reasons, and each is
+sufficient on its own:
+
+- such a control is **agent-writable by construction**, which is precisely the shape PEN-3183 exists
+  to reject;
+- its **compliance is unmeasurable**, for the same reason trigger 4 has no detector;
+- **a green reading of it would be indistinguishable from no control at all** — the fail-open audit
+  record corrected on [penstock#2987](https://github.com/Blockcast/penstock-llm-proxy-core/pull/2987).
+
+That precedent is not hypothetical and it recurred *while this cluster was being written*: #2987's
+first tripwire located the wrapper with the same `#!` probe the derivation's own condition used, so
+in the compiled-wrapper case — the entire residual — it returned early and went **green while the
+guard was gone**. It was corrected to key on `PAPERCLIP_AGENT_ID`, a signal that does not share a
+failure mode with the thing being checked. **A second such control is not accepted at fleet scope.**
+
+**What D-5 does change:** it is a second **independent** reason D1 is the only close — D-3's was
+structural, this one is empirical. That raises the priority of **the date** (D-7), **not** of the
+sweep.
+
+### D-6 Two rules now bind on sweep counts
+
+Recording **51** (UX Designer), **54** (CTO) and **21** (Engineer) over the same tree *without
+reconciling them* was correct: **the disagreement is itself the finding.** Now that D-1 has settled
+the predicate, two rules bind.
+
+1. **Those three counts predate D-1.** The predicate is settled, so the disagreement is now
+   *resolvable*, and resolving it is PEN-5012's. **No sweep count may be reported without the
+   predicate and the denominator it counted under.** A bare number is what produced three
+   incompatible ones.
+2. **⚠ Never reconcile 51 / 54 / 21 *to* 28.** They are **different objects**: the sweeps count
+   **static sites**, the 28 counts **runtime invocations**. They **must not appear in the same column
+   or be differenced.** Conflating them would manufacture a false "unaccounted" delta and launder the
+   real finding — which is that **neither number bounds the other.**
+
+### D-7 The date — ratified in sequence, **not** in calendar
+
+Recorded here because D-3's item 1 leaves the date with the CTO, and this is the ruling on how that
+date gets set. It binds [PEN-5016](https://paperclip.blockcast.net/PEN/issues/PEN-5016) /
+[#3109](https://github.com/Blockcast/paperclip/pull/3109), whose owner is Devops; it is carried here
+so this record does not go stale against it.
+
+- **Ratified: #3109's sequence and its exit criteria. Not ratified: its calendar.**
+- **Stage 1 does not begin 2026-11-06 by default.** It begins when **stage 0 is closed**, and stage 0
+  today holds three open security rows — PEN-5017, PEN-5026, PEN-5027 — plus soak instrumentation the
+  plan itself says does not yet exist.
+- **2026-11-06 is an earliest-start, not a commitment.** The stage-2 and stage-3 windows **float with
+  it** rather than compressing to hold the end date.
+- **The reason is D-3's own.** Fixing the date now, before the gating work is done, is a frequency
+  bet over a population nobody has sampled — the same bet D-3 refused when it declined a narrower
+  re-grant. One is not refused and its twin placed.
+- **Review happens on the stage-0 close, not on the calendar.**
+
+⚠ **Consequence for this record:** D-3 item 1's "the CTO owns the date" now has a *procedure*
+attached. **This document must not cite 2026-11-06 as a start date**, and neither the ending of the
+§7.1 acceptance (D-3) nor this record's own disposition may be read as scheduling D1.
