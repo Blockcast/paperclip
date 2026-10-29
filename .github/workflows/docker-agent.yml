@@ -456,6 +456,125 @@ jobs:
           AGENT_IMAGE: harbor.blockcast.net/paperclip-agent/paperclip-agent@${{ steps.build.outputs.digest }}
         run: node scripts/prove-agent-image-git-config-controls.mjs "$AGENT_IMAGE"
 
+      # PEN-4932 stage 3b-i. The publish guard is baked into the SERVER image by
+      # a RUN in `Dockerfile` (which proves the bake) and carried here by a
+      # `COPY --from=server` whose text is pinned in
+      # deploy/helm/paperclip/tests/agent-egress-path.test.mjs. Neither proves
+      # DELIVERY: a `--from` stage that resolved to an older server image, a path
+      # that drifted on one side only, a later overlay layer shadowing the
+      # directory — each of those reaches the built agent image with every
+      # source-level assertion still green. This is the image agents actually
+      # run, so this is the copy whose absence costs something.
+      #
+      # WHY HERE AND NOT AS A RUN IN Dockerfile.agent, which is the obvious place:
+      #   - That file is asserted to be a pure COPY overlay carrying no RUN at all
+      #     (packages/adapter-utils/src/agent-dockerfile.test.ts), and a second
+      #     test's reasoning about the google-chrome shim rests on that invariant.
+      #     Adding one RUN is not a local edit; it weakens that argument.
+      #   - This lane is strictly stronger evidence anyway. A build-time RUN is
+      #     root, and for root `test -x` is true of a 0700 file that uid 1000 can
+      #     neither read nor run — the exact delivery defect worth catching. Here
+      #     the check runs AS uid 1000, the uid git spawns the hook as, so it asks
+      #     the question the agent asks rather than approximating it from root.
+      #
+      # The ENTRYPOINT is bypassed deliberately: it is a filesystem assertion
+      # about the image as built, and scripts/docker-entrypoint.sh touches
+      # neither /usr/local/libexec nor the hooks directory (verified), so running
+      # through it would add failure modes without adding coverage.
+      #
+      # Same bargain as the steps above, stated so a green run is not over-read:
+      # the immutable `sha-...` candidate tag is already pushed by the time this
+      # runs. What a red step prevents is promotion to `latest-k8s-vendored` and
+      # the rollout below, so no agent pod receives the image. It does not
+      # unpublish the candidate tag, and it says nothing about an already-running
+      # pod.
+      - name: Assert the publish guard reached the agent image (PEN-4932)
+        env:
+          AGENT_IMAGE: harbor.blockcast.net/paperclip-agent/paperclip-agent@${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker pull "$AGENT_IMAGE"
+          for mode in runtime ownership; do
+            # runtime -> uid 1000 (what the agent can do); ownership -> uid 0
+            # (what the agent must not be able to do). Neither uid can answer the
+            # other's question; see the script header.
+            user=1000:1000
+            [ "$mode" = ownership ] && user=0:0
+            docker run --rm -i \
+              --user "$user" \
+              --read-only \
+              --security-opt no-new-privileges \
+              --cap-drop ALL \
+              --network none \
+              --entrypoint sh \
+              "$AGENT_IMAGE" -s -- "$mode" \
+              < scripts/check-agent-image-publish-guard.sh
+          done
+
+      # The other half, in the shape PEN-4541 and PEN-4682 established above: each
+      # assertion gets an input that must RED it, so a green verdict on the real
+      # image means something. A control that comes back green is a FAILURE.
+      #
+      # Each mutation below is a delivery defect that has a plausible cause and
+      # that the paired arm is the only thing standing between and the fleet:
+      #   0700            a COPY that lost the mode, or a chmod in a later layer.
+      #                   Root-only arms cannot see this one at all, which is why
+      #                   the runtime arm runs as uid 1000.
+      #   removed         a mistyped --exclude glob, or a COPY of the wrong stage.
+      #                   Proves the existence check is not vacuous over an empty
+      #                   directory.
+      #   chown node      the PEN-3715 property inverted: the agent could rewrite
+      #                   the guard it is supposed to be subject to.
+      #   chmod o+w       the same, by mode rather than owner.
+      #
+      # `docker commit` rather than a one-layer `docker build`: the builder in
+      # this job may be a remote BuildKit endpoint (see "Select BuildKit
+      # endpoint"), and a control must not depend on `--load` round-tripping an
+      # image back from it. Nothing here is pushed; the tags are local and
+      # removed at the end.
+      - name: Prove the publish-guard assertion reds on a bad image (PEN-4932 positive controls)
+        env:
+          AGENT_IMAGE: harbor.blockcast.net/paperclip-agent/paperclip-agent@${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          hooks=/usr/local/libexec/paperclip/hooks
+          n=0
+          while IFS='|' read -r mutation mode; do
+            [ -n "$mutation" ] || continue
+            n=$((n + 1))
+            cname="pen4932-control-$n"
+            tag="pen4932-control:$n"
+
+            # Fail AT the mutation if it does not apply. A mutation that silently
+            # no-ops would commit an unmutated image, the arm would pass, and this
+            # step would print CONTROL FAILED against a good image -- blaming the
+            # image for a broken control. Same lesson as the PEN-4682 plant above.
+            docker rm -f "$cname" >/dev/null 2>&1 || true
+            docker run --user 0:0 --network none --name "$cname" \
+              --entrypoint sh "$AGENT_IMAGE" -ec "$mutation" ||
+              { echo "CONTROL BROKEN: mutation '$mutation' did not apply to the image; nothing below was measured." >&2; exit 1; }
+            docker commit "$cname" "$tag" >/dev/null
+            docker rm -f "$cname" >/dev/null
+
+            if docker run --rm -i --user 1000:1000 --read-only \
+                 --security-opt no-new-privileges --cap-drop ALL --network none \
+                 --entrypoint sh "$tag" -s -- "$mode" \
+                 < scripts/check-agent-image-publish-guard.sh >/dev/null 2>&1; then
+              echo "CONTROL FAILED: '$mutation' did not red the $mode arm, so that arm is vacuous and the assertion step above proves nothing about $hooks." >&2
+              docker rmi -f "$tag" >/dev/null 2>&1 || true
+              exit 1
+            fi
+            echo "control ok: '$mutation' reds the $mode arm"
+            docker rmi -f "$tag" >/dev/null 2>&1 || true
+          done <<EOF
+          chmod 0700 $hooks/pre-push|runtime
+          rm -f $hooks/pre-push|runtime
+          chown node:node $hooks/pre-push|ownership
+          chmod 0757 $hooks/pre-push|ownership
+          EOF
+          test "$n" -eq 4 ||
+            { echo "CONTROL BROKEN: expected 4 controls, ran $n." >&2; exit 1; }
+
       - name: Promote verified agent image
         env:
           CANDIDATE_IMAGE: harbor.blockcast.net/paperclip-agent/paperclip-agent@${{ steps.build.outputs.digest }}
