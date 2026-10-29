@@ -78,9 +78,26 @@
 //     actual threat: because no intent is required, any caller that execs git
 //     by ABSOLUTE PATH rather than resolving it on PATH is outside this guard
 //     while still being authenticated. How much of that exists was measured on
-//     2026-10-29 (PEN-4986) and is ZERO: nothing reached a real git binary
-//     outside this wrapper in an observed agent pod, and an image- and
-//     harness-wide census found no such exec site in the first-party image.
+//     2026-10-29 (PEN-4986), and it is NOT zero. The sixth window -- an
+//     Engineer pod running the repository's own test suite -- counted 28
+//     invocations that reached a real git binary without transiting this
+//     wrapper. ⛔ That is PEN-3183 §7.2 trigger 4, so the residual acceptance
+//     is ENDED as of 2026-10-29 rather than running to 2027-01-31. The five
+//     earlier windows returned zero; the sixth was the first to run a
+//     build/test workload, which is the axis that mattered.
+//
+//     The mechanism is a CLASS, not a site: first-party test code spawns a
+//     child with PATH narrowed to `${bin}:/usr/bin:/bin` so a stub binary is
+//     the only candidate, which leaves this wrapper's directory out BY
+//     CONSTRUCTION -- so every `git` that child runs reaches the real binary
+//     directly. Any test or tool that builds its own PATH gets an unwrapped
+//     git for free. The known site is cross-repo (penstock-llm-proxy-core),
+//     so a paperclip-only sweep reports it clean. Tracked as PEN-5012. The 28
+//     invocations were themselves harmless -- `rev-parse` and `maintenance`
+//     against remoteless scratch repos -- but trigger 4 is a count test, not a
+//     harm test, and the mechanism is the finding. An image- and harness-wide
+//     census separately found no such exec site in the first-party image,
+//     which is exactly why this class was invisible to the static half.
 //
 //     "A real git binary" is TWO of them. The image ships /usr/bin/git and
 //     /usr/lib/git-core/git as separate inodes holding byte-identical copies;
@@ -94,12 +111,13 @@
 //     credential. github-git-egress-shim.ts refuses `!`-shell aliases for
 //     exactly that reason.
 //
-//     That bounds the ACCIDENTAL case only. It does NOT narrow the bypass
-//     above, which stays OPEN for a deliberate caller, and it is a point
-//     measurement of three pods on three images rather than a standing detector
-//     -- nothing reports it if that changes, so re-take it when the
-//     egress-relevant surface changes. See §7.1 of the decision record and
-//     docs/security/PEN-4986-absolute-path-git-runtime-measurement.md.
+//     None of that narrows the bypass above, which stays OPEN for a deliberate
+//     caller. What the 28 establish is the ACCIDENTAL case: it is now measured
+//     as uncovered rather than assumed rare. The evidence is six windows across
+//     four agents, five pods and four image tags -- point measurements, not a
+//     standing detector; nothing reports it if the surface changes, so re-take
+//     it when the egress-relevant surface changes. See §7.1 of the decision
+//     record and docs/security/PEN-4986-absolute-path-git-runtime-measurement.md.
 //
 // The surviving bypass is not a file-ownership problem and cannot be closed by
 // one. The agent and this wrapper are the SAME principal: one container, uid

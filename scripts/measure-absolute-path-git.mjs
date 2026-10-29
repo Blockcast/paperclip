@@ -82,22 +82,35 @@
 //     beside the number rather than generalising from it.
 //   - It is NOT lossless. A process is only seen if a sweep lands inside its
 //     lifetime, so short-lived invocations can be missed. Pass `calibExe` — a
-//     COPY of the git binary at a DIFFERENT path, e.g.
-//     `cp /usr/bin/git /tmp/git-calib` — and invoke it N times during the run;
+//     COPY of the git binary at a DIFFERENT path, created with
+//     `mkdir -p /tmp/calib && cp /usr/bin/git /tmp/calib/git` — and invoke it N
+//     times during the run;
 //     `{"kind":"calib"}` records divided by N is the measured catch rate for
 //     the shortest-lived invocation class. A copy is used rather than
 //     /usr/bin/git itself so that calibrating cannot contaminate the count; the
 //     copy's inode is excluded from the target set explicitly.
 //
+//     ⛔ NAME THE COPY `git`. Git dispatches on argv[0], so a copy named
+//     `git-calib` does NOT merely take "a different, shorter path" — it does
+//     not run AT ALL: it exits 128 at builtin dispatch ("fatal: cannot handle
+//     calib as a builtin") without ever executing --version. Verified
+//     2026-10-29. Four rows calibrated under that name timed an ERROR PATH, not
+//     a git invocation, and their rates (0.930, 0.840, 0.933, 0.793) are VOID
+//     as catch rates rather than merely optimistic. Putting the copy in its own
+//     directory is what lets it keep the name: hence `/tmp/calib/git` above.
+//
 //     ⚠ THE COPY OVER-STATES THE RATE FOR THE REAL BINARIES, so calibrate the
-//     watched paths DIRECTLY as well and quote those. Measured at n = 300 each:
-//     /usr/bin/git 0.710, /usr/lib/git-core/git 0.747, the copy 0.903. A copy
-//     outside /usr/bin and outside the git exec directory cannot locate
-//     git-core relative to its own argv[0], so it takes a slower startup path
-//     and lives ~24% longer (5126 us vs 4123 us per invocation over 200 runs),
-//     which makes it easier to land a sweep inside. Name the copy `git` and not
-//     `git-calib` while you are at it: git dispatches on argv[0], so a copy
-//     under another name runs a different, shorter path again.
+//     watched paths DIRECTLY as well and quote those, never the copy's.
+//     Measured at n = 300 each: /usr/bin/git 0.710, /usr/lib/git-core/git
+//     0.747, a correctly-named copy 0.903. The over-statement DIRECTION
+//     reproduces; its magnitude and cause do not. This pod measured the copy
+//     living ~24% longer (5126 us vs 4123 us over 200 runs) and attributed that
+//     to a copy outside /usr/bin and outside the git exec directory not being
+//     able to locate git-core relative to its own argv[0] — but that figure is
+//     POD-LOCAL: re-measured 2026-10-29 in a different pod, a correctly-named
+//     copy and the real binary had comparable warm lifetimes (~4.2–4.8 ms vs
+//     ~3.9–4.5 ms, 3 × n = 300). Treat ~24% as one pod's observation, not as a
+//     fixed mechanism. See PEN-4986 §2.2 corrections 1–2.
 //   - It says nothing about what is INSTALLED, only about what RAN. Pair it
 //     with a source/image census for the other half.
 //   - It cannot see a binary that is not in the discovered sets — a git built
