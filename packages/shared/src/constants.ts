@@ -769,6 +769,68 @@ export type IssueMonitorGateSource = (typeof ISSUE_MONITOR_GATE_SOURCES)[number]
 export const DEFAULT_ISSUE_MONITOR_CONVERGENCE_THRESHOLD = 3;
 export const MAX_ISSUE_MONITOR_CONVERGENCE_THRESHOLD = 50;
 
+/**
+ * Ceiling applied to a monitor armed without an explicit `maxAttempts`
+ * (BLO-23061).
+ *
+ * `recoveryPolicy` and the whole `max_attempts_exhausted` -> owner-recovery path
+ * hang off `exhaustedMonitorClearReason`, which only fires when `maxAttempts` is
+ * non-null. Agents routinely arm monitors with a `recoveryPolicy` and no
+ * `maxAttempts`, which made that escalation unreachable: the monitor re-armed
+ * forever and no human was ever notified. Observed on BLO-22305 — 19 agent runs
+ * across 31 hours, every one reporting an unchanged signature and re-arming.
+ *
+ * 24 is deliberately generous: at the ~hourly cadence those live monitors used,
+ * it is roughly a day of self-service polling before a human is pulled in. An
+ * explicit `maxAttempts` on the policy still wins, so a caller that genuinely
+ * needs a longer leash can set one.
+ *
+ * PEN-3803: this lives in `@paperclipai/shared` because it is NOT the scheduler's
+ * private business. It was originally declared in the server's
+ * `issue-execution-policy.ts` and documented as "intentionally a scheduler
+ * default, not an API re-arm default: an explicit re-arm without `maxAttempts`
+ * remains unbounded". That sentence described an intent the system could not
+ * deliver, and the gap between the two was the defect: the arm-time validator
+ * omitted this default and so returned 200, while the scheduler applied it to
+ * EVERY monitor at dispatch and cleared the row as `max_attempts_exhausted`
+ * without firing. There is no unbounded monitor — only one that looks unbounded
+ * until the due instant. Every surface that decides whether a monitor can be
+ * delivered must therefore read the same ceiling, including the board UI, which
+ * is why it is shared rather than server-local.
+ */
+export const DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS = 24;
+
+/**
+ * Hard ceiling on an explicit `maxAttempts`, mirroring the `.max(100)` bound on
+ * `issueExecutionMonitorPolicySchema.maxAttempts`. Declared here so the renewal
+ * helper below cannot propose a value the validator would reject.
+ */
+export const MAX_ISSUE_MONITOR_MAX_ATTEMPTS = 100;
+
+/**
+ * PEN-3803: the budget an actor with authority to extend a spent monitor should
+ * grant, given the attempts the row has ALREADY made.
+ *
+ * Once `monitorAttemptCount` reaches the ceiling above, the row is undeliverable
+ * and an arm is refused. `attemptCount` is deliberately preserved across re-arm
+ * (that is what stops a poll loop resetting its own budget), and clearing the
+ * monitor does not reset it either — so the ONLY way to get a working monitor
+ * back onto such a row is an explicit `maxAttempts` strictly greater than the
+ * count. That is the right shape: a budget extension becomes a recorded,
+ * bounded, readable decision instead of the silent unbounded one that omitting
+ * `maxAttempts` used to buy.
+ *
+ * Returns `null` when no representable renewal exists (`attemptCount` at or
+ * above `MAX_ISSUE_MONITOR_MAX_ATTEMPTS`). A caller that gets `null` must stop
+ * polling and clear the monitor; at 100 attempts the convergence guard and the
+ * recovery escalation have both long since had their say.
+ */
+export function renewedIssueMonitorMaxAttempts(attemptCount: number): number | null {
+  const floor = Number.isFinite(attemptCount) ? Math.max(0, Math.trunc(attemptCount)) : 0;
+  if (floor >= MAX_ISSUE_MONITOR_MAX_ATTEMPTS) return null;
+  return Math.min(floor + DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS, MAX_ISSUE_MONITOR_MAX_ATTEMPTS);
+}
+
 export const ISSUE_EXECUTION_DECISION_OUTCOMES = ["approved", "changes_requested"] as const;
 export type IssueExecutionDecisionOutcome = (typeof ISSUE_EXECUTION_DECISION_OUTCOMES)[number];
 

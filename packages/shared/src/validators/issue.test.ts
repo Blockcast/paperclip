@@ -462,11 +462,43 @@ describe("issue validators", () => {
     });
 
     // attemptCount survives a re-arm and is compared against the *incoming* maxAttempts, so
-    // "re-arming resets a wedged monitor" is only true when maxAttempts is omitted.
+    // "re-arming resets a wedged monitor" needs the caveat spelled out.
     it("qualifies the re-arm-resets-a-wedged-monitor claim with the attemptCount caveat", () => {
       const text = issueExecutionPolicySchema.shape.monitor.description ?? "";
       expect(text).toContain("attemptCount");
       expect(text).toContain("maxAttempts");
+    });
+
+    // PEN-3803: this description USED to answer the caveat above with "omit
+    // `maxAttempts` when resetting a wedged monitor". That advice was exactly
+    // backwards and it was load-bearing in the wrong direction: omitting does
+    // not grant attempts, it only moves the failure past the arm, where the
+    // scheduler's own ceiling clears the monitor without firing after the row
+    // has advertised a live wake for the whole interval. The prose is free to
+    // change; these two invariants are not.
+    it("does not offer omitting maxAttempts as a way past an exhausted budget", () => {
+      const text = issueExecutionPolicySchema.shape.monitor.description ?? "";
+      // The phrase may appear, but only under a negation — the description has
+      // to be able to say "do NOT omit it", which is the whole correction. So
+      // assert on the MOOD, not the presence: every occurrence must be negated.
+      const occurrences = [...text.matchAll(/omit(?:ting)? `maxAttempts`/gi)];
+      expect(occurrences.length).toBeGreaterThan(0);
+      for (const match of occurrences) {
+        const lead = text.slice(Math.max(0, match.index - 24), match.index);
+        expect(lead, `un-negated "${match[0]}" at ${match.index}`).toMatch(/\b(?:do not|don't|never|not|NOT)\s*$/i);
+      }
+    });
+
+    it("names the two real exits from an exhausted monitor budget", () => {
+      const text = issueExecutionPolicySchema.shape.monitor.description ?? "";
+      // Exit 1: a recorded, bounded budget extension strictly above the count.
+      expect(text).toMatch(/explicit `maxAttempts` STRICTLY GREATER than/i);
+      expect(text).toContain("monitorAttemptCount");
+      // Exit 2: stop polling.
+      expect(text).toMatch(/clear the monitor and stop polling/i);
+      // And the reason omitting is not a third exit: the scheduler's ceiling
+      // applies to every monitor regardless.
+      expect(text).toMatch(/does not grant more attempts|DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS/);
     });
 
     // BLO-32419: the `pr:…:review` gate is re-checked by the agent by hand, so this description

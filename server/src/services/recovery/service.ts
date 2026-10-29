@@ -7,6 +7,7 @@ import {
   MIN_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
   PROVIDER_QUOTA_MONITOR_SERVICE_NAME,
   getAgentWorkEligibility,
+  renewedIssueMonitorMaxAttempts,
   type IssueGraphLivenessAutoRecoveryPreview,
   type IssueGraphLivenessAutoRecoveryPreviewItem,
   type IssueRecoveryAction,
@@ -9481,10 +9482,27 @@ export function recoveryService(
         serviceName: PROVIDER_QUOTA_MONITOR_SERVICE_NAME,
         externalRef: input.latestRun.id,
         timeoutAt: null,
-        maxAttempts: null,
+        // PEN-3803: this arm used to pass `maxAttempts: null` and rely on the
+        // arm-time validator never applying the scheduler's default ceiling.
+        // That escape is gone — an arm the scheduler would clear as
+        // `max_attempts_exhausted` is now refused 422 — and this call site has
+        // no try/catch, so on a row already at the ceiling the refusal would
+        // propagate out of the recovery sweep.
+        //
+        // Granting an explicit budget is also the honest shape here. This is a
+        // backoff against a provider reset time, not the self-perpetuating poll
+        // loop the ceiling exists to stop, so the extension is legitimate — but
+        // it should be recorded and bounded rather than silently unbounded.
+        // `null` (no representable renewal, i.e. 100+ attempts already made)
+        // means this row has polled far past anything a quota backoff needs;
+        // leave it unarmed and let the caller record a skip.
+        // `issues.monitor_attempt_count` is `notNull().default(0)`, so this is
+        // the row's real count with no fallback needed.
+        maxAttempts: renewedIssueMonitorMaxAttempts(input.issue.monitorAttemptCount),
         recoveryPolicy: "wake_owner" as const,
       },
     };
+    if (policy.monitor.maxAttempts === null) return null;
     const transition = applyIssueMonitorPolicyTransition({
       issue: input.issue,
       policy,
