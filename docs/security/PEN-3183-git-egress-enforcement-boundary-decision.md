@@ -597,7 +597,8 @@ agent/base value, and one the base lacks is absent. Three grounds.
    on. That is fail-closed — no confidentiality loss — but it is the same per-issue denial of
    service, reached by a different key, and **it becomes reachable at D1 stage 1**. It is named
    here rather than fixed: it is an availability fault behind a gate that is off everywhere, and
-   the stage-1 owner (PEN-5016) is the right place to decide whether it blocks enablement.
+   the stage-1 owner (PEN-5016) is the right place to decide whether it blocks enablement. Owned
+   as **PEN-5027**, so the decision has a holder rather than only this paragraph.
 
 2. **§7.4's "fail closed and loud at render, or do not change it" is not on point here, and was
    cited as if it were.** That sentence governs silently *stripping* a credential, so that publish
@@ -667,7 +668,10 @@ broker, and the uid-1001 boundary does not hold against it. That is an operator 
 their own agent rather than a principal declining a boundary, so it is recorded here rather than
 refused at render — but it means **"brokered" and "docker-enabled" together do not deliver D1's
 property**, and the stage-1 owner (PEN-5016) should either exclude such agents from the soak or
-accept it explicitly. It is not detectable from any current metric.
+accept it explicitly. It is not detectable from any current metric, so a soak containing such an
+agent would read green either way — the same silent-permissive failure this whole section exists
+to remove, one layer out. Owned as **PEN-5026**, where the choice between refusing the
+combination, dropping the privilege, and excluding-and-enforcing is made.
 
 ⚠ **Scope of the claim, stated so it is not read wider than it is.** What is now agent-scope-only
 is the **gate key**, the **broker's image**, and — while the gate is on — `enableDocker` /
