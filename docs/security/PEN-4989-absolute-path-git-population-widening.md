@@ -77,10 +77,10 @@ hashes the *contents* of every `git` in the PATH layout, so every v1 digest is n
 from its v2 counterpart. The value above is not a re-derivation from the old one — it was recomputed
 on the live surface, and the bridge is explicit: re-running the **v1** rule in the pod that produced
 this edit — image `…/paperclip-agent:sha-1e99f06-k8s-vendored`
-(`sha256:fd6337d3…10b2a31`), a **fourth** distinct image — reproduces `a23454c4…` exactly. (It is
-"uncensused" only in the §3 sense of not appearing in this record's own image census; §1.1's two
-workload rows were subsequently measured **on** it, which is why its digest now has three
-independent confirmations rather than one.) That
+(`sha256:fd6337d3…10b2a31`), the **fourth** distinct image this record names and the **third it was
+measured in** — reproduces `a23454c4…` exactly. (It is "uncensused" only in the §3 sense of not
+appearing in this record's own image census; §1.1's two workload rows were subsequently measured
+**on** it, which is why its digest now has three independent confirmations rather than one.) That
 establishes its egress surface as byte-identical to the measurement pod's, so its v2 digest is this
 surface's v2 digest. Rule version is folded into the digest (`FINGERPRINT_VERSION`), so a v1 value
 meeting a v2 value reads as a mismatch rather than as an unchanged surface.
@@ -164,7 +164,7 @@ was asked for. The analysis below is theirs; the disposition is this record's (*
 | | |
 |---|---|
 | Pod / agent | `ac-b4fe9f95-65ef-47-bab67a18-23d8-41-4e3297-c259s` (node `k8s-paperclip-3`) / **Engineer** |
-| Image | `sha-e74d17b-k8s-vendored` (`sha256:e690d3bf…077c9705`) — a **fifth** image |
+| Image | `sha-e74d17b-k8s-vendored` (`sha256:e690d3bf…077c9705`) — the **fifth** distinct image this record names, the **fourth it was measured in** (`sha-3ddaae3` appears only in the §3 census, never measured in). Against §1.1's counts it is the fourth of the four image tags, and the third of the three *fingerprinted* ones. |
 | Surface fingerprint | `d81423fe…` (**v2**), `wrapperAhead: true` — **byte-identical to §1's** |
 | Window | `2026-10-29T10:40:02.002Z` → `10:57:01.715Z` (17.0 min, 435,047 sweeps) |
 | Observations | 2,447 — 2,400 wrapped, **48 unwrapped** |
@@ -365,11 +365,16 @@ rc=0
 ```
 
 **So `0.930`, `0.840`, `0.933` and `0.793` are catch rates against a process that aborts immediately
-— an error path, not a `git` invocation.** They are a *lower* bound on lifetime and therefore, if
-anything, a conservative bound on catch; but they do not measure what they were reported as
-measuring, and **they must not be quoted as this instrument's catch rate.** The only calibration in
-the whole population taken against something that actually executes git is PEN-4993 B's (`0.837`
-copy named `git`, `0.810` real `/usr/bin/git`).
+— an error path, not a `git` invocation.** A lifetime argument would make them a floor. **The
+measurements go the other way, and this section's heading states the direction they actually
+support.** In every head-to-head pairing this record contains, the real binary was caught *less*
+often than the copy: `0.793` copy vs `0.710` real (PEN-4994), `0.837` copy named `git` vs `0.810`
+real (PEN-4993 B), and a pooled `≈ 0.86` predicted against `5 of 9 = 0.56` observed (table above).
+They therefore **over-state** catch against the real binary — §2's ceiling, not a floor — though on
+samples this small that is a measured direction, not a rigorous bound. They do not measure what they
+were reported as measuring, and **they must not be quoted as this instrument's catch rate.** The
+only calibration in the whole population taken against something that actually executes git is
+PEN-4993 B's (`0.837` copy named `git`, `0.810` real `/usr/bin/git`).
 
 The honest summary: **no pod's absolute rate should be reused as a fleet figure, and four of the six
 rows have no usable rate at all.**
