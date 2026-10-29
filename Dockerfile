@@ -693,6 +693,36 @@ COPY --chmod=0755 --exclude=*.md docker/github-wrappers/ /usr/local/libexec/pape
 # would refuse every push in the fleet rather than publish unscanned. See
 # docker/github-hooks/README.md for the ordering.
 COPY --chmod=0755 --exclude=*.md docker/github-hooks/ /usr/local/libexec/paperclip/hooks/
+# PEN-4932. The COPY above is pinned by text in the chart's test suite, but a
+# text assertion about a Dockerfile is not an assertion about the image it
+# produced. This is the same gap the `find` over /opt/paperclip-bundled-adapters
+# below closes for the adapter tree, and it matters more here because of how the
+# consumer fails: `runGitEgressRuntime` REFUSES a publish when it finds no
+# EXECUTABLE pre-push where it looks, so an image that ships this directory
+# empty — or ships the launcher unreadable to uid 1000 — does not degrade, it
+# stops every push in the fleet once stage 3b-ii repoints the runtime here.
+#
+# `-perm -0005`, not `test -x`: this RUN is root, and for root `test -x` is true
+# of a 0700 file that uid 1000 could neither read nor run. The agent executes
+# the hook as uid 1000 against a root:root file, so the bits that decide it are
+# OTHER's, and the launcher is a `#!/bin/sh` script — the kernel hands it to an
+# interpreter that must READ it, so o+r is as load-bearing as o+x. The same
+# find covers the directory's own inode, which needs o+x to be traversed at all.
+#
+# The existence test is separate because an empty directory satisfies every
+# arm of the find vacuously, and empty is precisely the shape a mistyped
+# `--exclude` glob would produce.
+#
+# `offender=` before `test`, and `|| { echo; false; }`: both for the reasons
+# spelled out at the bundled-adapter guard below — an assignment from a command
+# substitution adopts that command's status so a broken `find` fails the build
+# rather than yielding "" that `test -z` reads as success, and `echo` alone
+# would leave the RUN zero.
+RUN set -eu; \
+  hooks=/usr/local/libexec/paperclip/hooks; \
+  test -f "$hooks/pre-push" || { echo "PEN-4932: $hooks/pre-push is missing from the server image; the publish guard did not bake" >&2; false; }; \
+  offender="$(find "$hooks" \( ! -user root -o ! -perm -0005 -o -perm /022 \) -print -quit)"; \
+  { test -z "$offender" || { echo "PEN-4932: baked publish guard is not root-owned-and-world-runnable: $offender" >&2; false; }; }
 COPY --from=penstock-agent-runtime /opt/penstock/bin/penstock-agent-runtime.mjs /opt/penstock/bin/penstock-agent-runtime.mjs
 COPY --from=caveman-proxy /usr/local/bin/caveman-proxy /usr/local/bin/caveman-proxy
 COPY --from=ponytail-marketplace /opt/penstock/ponytail /opt/penstock/ponytail

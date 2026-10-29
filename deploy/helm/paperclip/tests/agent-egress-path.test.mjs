@@ -1513,3 +1513,38 @@ test("the pre-push hook ships root-owned and executable in both images (PEN-4932
     `Dockerfile.agent does not take ${IMAGE_HOOKS_DIR} from the server image. Re-copying it from the build context instead would let the two images carry different bodies of the same guard, which is the drift PEN-3713 removed for the wrappers.`,
   );
 });
+
+test("the image build asserts the baked guard, not only this test suite (PEN-4932)", () => {
+  // The two tests above pin the COPY lines by text. That catches a Dockerfile
+  // edited wrongly; it cannot catch an image built wrongly — a `--from` stage
+  // resolving to a stale server image, a layer shadowing the path, a cache
+  // artefact. The build-time guards are what close that, and they are worth
+  // pinning for the same reason the COPY lines are: deleting one is a one-line
+  // edit whose consequence is invisible until a push fails somewhere else.
+  //
+  // Both images carry their own guard on purpose — the server's proves the
+  // bake, the agent's proves the delivery — so this asserts both, keyed on the
+  // fragments that carry the meaning rather than on whole blocks, which a
+  // reflow of the line continuations would break without changing anything.
+  for (const [name, source] of [
+    ["Dockerfile", fs.readFileSync(path.join(repoRoot, "Dockerfile"), "utf8")],
+    ["Dockerfile.agent", fs.readFileSync(path.join(repoRoot, "Dockerfile.agent"), "utf8")],
+  ]) {
+    assert.ok(
+      source.includes(`hooks=${IMAGE_HOOKS_DIR};`),
+      `${name} no longer runs a build-time check over ${IMAGE_HOOKS_DIR}. Without it the only evidence that the publish guard reached the image is a one-off manual read of one pod.`,
+    );
+    assert.ok(
+      source.includes('test -f "$hooks/pre-push"'),
+      `${name}'s build-time check no longer asserts the launcher EXISTS. The find below it passes vacuously over an empty directory, which is exactly what a mistyped --exclude glob produces.`,
+    );
+    assert.ok(
+      source.includes("! -perm -0005"),
+      `${name}'s build-time check no longer asserts the launcher is readable and executable by OTHER. The build runs as root, for whom a 0700 file looks fine and uid 1000 can neither read nor run it; o+r matters as much as o+x because the kernel hands a #!/bin/sh script to an interpreter that must read it.`,
+    );
+    assert.ok(
+      source.includes("! -user root"),
+      `${name}'s build-time check no longer asserts the launcher is root-owned. Agent-writable is the PEN-3715 property the bake exists to buy over the PVC copy.`,
+    );
+  }
+});
