@@ -340,7 +340,30 @@ describe("PEN-3954: membership_role at the HTTP write bars", () => {
     // has none of those today, which is the moment to close them: the
     // invariant is about a question being re-spelled, and a census that only
     // knows one spelling is exactly the wrong shape for that.
-    const rawComparison = /[!=]==?\s*["']viewer["']|["']viewer["']\s*[!=]==?/;
+    //
+    // Ally's follow-up suggestion at `554f1571` named two more spellings:
+    // `["viewer"].includes(role)` and `case "viewer":`. The array-membership
+    // one is added below — it has no occurrence in the tree and no plausible
+    // benign form, so it is free.
+    //
+    // `case "viewer":` is deliberately NOT matched, and the reason is
+    // evidence rather than taste: adding it immediately flags
+    // `services/company-member-roles.ts`, the `grantsForHumanRole` switch.
+    // That arm takes a `HumanCompanyMembershipRole` — a value that has
+    // ALREADY been through `normalizeHumanRole` — so it is structurally
+    // incapable of being a write bar on a raw column value, which is the
+    // only thing this census is about. Admitting it would cost either the
+    // `toHaveLength(1)` marker pin (the property Ally singled out as what
+    // makes the whitelist sound) or a by-name file exemption (which Ally
+    // argued is strictly worse, because it would hide a second raw bar
+    // placed in that file). Neither price is worth a pattern whose first
+    // real-world match is a false positive.
+    //
+    // This stays an operator-level regex and can never be complete; a `Set`
+    // lookup or a `startsWith` would slip past. It is a tripwire for the
+    // re-spellings that actually happened, not a proof of absence.
+    const rawComparison =
+      /[!=]==?\s*["']viewer["']|["']viewer["']\s*[!=]==?|\[\s*["']viewer["']\s*\]\s*\.\s*includes/;
     // One comparison has to exist — the predicate's own body. It carries
     // this marker so the census can tell the definition from a re-spelling.
     // The marker alone is not enough to pass: `sanctioned` is asserted to be
@@ -358,7 +381,9 @@ describe("PEN-3954: membership_role at the HTTP write bars", () => {
           walk(full);
           continue;
         }
-        if (!entry.name.endsWith(".ts")) continue;
+        // `.mts`/`.tsx` do not exist under `server/src` today; including
+        // them means adding one later cannot quietly fall outside the walk.
+        if (!/\.(ts|mts|tsx)$/.test(entry.name)) continue;
         const source = readFileSync(full, "utf8");
         source.split("\n").forEach((line, index) => {
           const trimmed = line.trim();
