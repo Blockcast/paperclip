@@ -314,6 +314,32 @@ PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verificati
      `opencode-db-<agentId>` precedent (`paperclip.io/pvc-type=agent-db`). Note `paperclip-data`
      is an `existingClaim` managed out of onprem-k8s, so per-agent claims cannot be templated into
      the chart.
+
+     **Three invariants 4a hands to 4b.** All three are inert on the self claim and become live
+     the moment the claim is per-agent, so none of them can be caught by the fleet exercise 4a
+     relies on:
+
+     1. **Populate the server-materialized trees, or relocate them.**
+        `.local/share/paperclip-git-hooks` and `skills/<companyId>` are written by the SERVER into
+        the server's own volume. On a per-agent claim the seeder creates them and they stay
+        EMPTY — an empty hooks dir fails every push closed (BLO-48361), an empty skills tree
+        dangles the prompt bundle's skill links silently. 4a warns
+        `claude_k8s.data_claim_foreign` naming both; 4b must either materialize them into the
+        per-agent claim or finish the §3.6 relocation of the hooks dir into the image.
+     2. **Close the symlinked-PARENT hole in the seeder.** The seeder holds uid 0 +
+        `DAC_OVERRIDE` + `CHOWN` over the volume root, and both `mkdir -p` and `chown` follow
+        symlinks. 4a refuses a target whose FINAL component is already a symlink and uses
+        `chown -h`, which removes the direct chown-redirect; a symlinked *parent* component is
+        still followed. Unreachable on the self claim and on 4a's head —
+        `resolveScopedWritableMounts` drops nested targets, and a narrowed pod cannot reach
+        another agent's subtree — but a per-agent volume PERSISTS across runs whose target sets
+        differ, so one run's writable tree can become an ancestor of a later run's target. 4b
+        needs a per-component walk, tested against a real fresh volume.
+     3. **Decide the directory MODE.** The seeder `chown`s but sets no mode, so its dirs inherit
+        its umask rather than the `2775` setgid the server-side path got from its parent. Moot
+        while the dirs already exist (the `mkdir` no-ops); on a genuinely fresh volume 4a's dirs
+        come up without setgid, which is a real question for group-write across the publish-broker
+        sidecar. Answer it against a fresh volume rather than by assertion.
 5. **Demonstrate and re-measure.** PEN-4932's acceptance criterion.
 
 ### 4.1 The blocker stage 4 has to clear

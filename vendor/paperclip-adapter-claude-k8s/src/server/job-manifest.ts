@@ -4026,13 +4026,48 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
             "-c",
             [
               "set -e",
+              // Refuse a target that is ALREADY a symlink, before anything
+              // follows it. `mkdir -p` and `chown` both follow symlinks, and
+              // this container is the one process in the Pod holding uid 0 over
+              // the volume root — so a link planted at a target path by a uid
+              // 1000 writer would redirect a root `chown` onto its referent.
+              // The sharpest version: a link aimed at the git-hooks dir would
+              // hand uid 1000 ownership of the PEN-3156 pre-push guard, which
+              // is precisely the boundary the explicit no-chown below defends.
+              //
+              // Not reachable on this head — `resolveScopedWritableMounts`
+              // drops nested targets, so no agent-writable mount contains
+              // another target or its parents, and the narrowed mount gives a
+              // pod no path to another agent's subtree. It becomes reachable in
+              // 4b, where a per-agent volume PERSISTS across runs whose target
+              // sets differ, so one run's writable tree can be an ancestor of a
+              // later run's target. Fail closed rather than carry that into 4b
+              // as a thing to remember.
+              //
+              // SCOPE, stated rather than implied: this checks the FINAL
+              // component of each target. A symlinked PARENT component is not
+              // covered — `mkdir -p` would still create through it, onto a real
+              // directory reached by an unintended route. Closing that needs a
+              // per-component walk of every target, which belongs with 4b where
+              // it can be tested against a real fresh volume; §4 of
+              // `docs/plans/2026-10-28-pen-4932-per-agent-volumes.md` carries
+              // it as one of the three invariants 4a hands to 4b. Planting such a parent requires write access
+              // to ITS parent, which no narrowed pod has outside its own tree.
+              `for p in ${seedSubPaths
+                .map((sp) => quoteShellArg(path.posix.join(SEED_VOLUME_ROOT_MOUNT_PATH, sp)))
+                .join(" ")}; do if [ -L "$p" ]; then echo "seed-writable-dirs: $p is a symlink; refusing" >&2; exit 1; fi; done`,
               // One `mkdir -p` for everything, then chown only the writable set.
               `mkdir -p ${seedSubPaths
                 .map((sp) => quoteShellArg(path.posix.join(SEED_VOLUME_ROOT_MOUNT_PATH, sp)))
                 .join(" ")}`,
+              // `-h` so the chown can never traverse a symlink created between
+              // the guard above and here. Belt-and-braces on this head (init
+              // containers are sequential, so nothing else in the Pod is
+              // running) but free, and it removes the redirect primitive rather
+              // than narrowing the window for it.
               ...(writableSubPaths.length > 0
                 ? [
-                    `chown ${AGENT_UID_GID} ${writableSubPaths
+                    `chown -h ${AGENT_UID_GID} ${writableSubPaths
                       .map((sp) => quoteShellArg(path.posix.join(SEED_VOLUME_ROOT_MOUNT_PATH, sp)))
                       .join(" ")}`,
                   ]
