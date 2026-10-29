@@ -447,16 +447,37 @@ routed, because §4.1 says routing one relocates the bypass to the other two.
 
 Four things a reader should not infer from that paragraph:
 
-1. **It is not yet enabled.** `enableGitHubPublishBroker` defaults to `false`,
+1. **"the credential Secret" is not "the credential".** That paragraph is true
+   of the mounted Secret and says nothing about a credential delivered as an
+   **environment variable**, which is a separate, supported delivery route:
+   `GH_SEAT_TOKEN_VALUE` exists exactly so a token can be bound to one agent
+   without mounting it fleet-wide (BLO-18927), and
+   `translateGithubSeatTokenForExecutionTarget` expands it into
+   `GH_TOKEN`/`GITHUB_TOKEN` in the agent container's own environment. The
+   first implementation moved the mount and left that route untouched, so for
+   a seat-bound agent the boundary was **absent while every mount-based
+   assertion passed** — `/etc/gitconfig`'s system helper answers a bare
+   `/usr/bin/git push` out of those variables (§4.0), with no mount to read and
+   no intent required. The Job builder now **refuses to render the broker**
+   while any of `GH_TOKEN`, `GITHUB_TOKEN`, `GITHUB_PERSONAL_ACCESS_TOKEN` or
+   `GH_SEAT_TOKEN_VALUE` would land on the agent container, in the same
+   fail-closed shape as the broad-mount refusal. **So D1 covers the
+   mounted-Secret delivery path only.** Routing the seat-token path through the
+   broker would preserve the function, but it mounts a credential into a new
+   container — §7.2 trigger 3 — and is a Security decision under §8 rather than
+   a builder change. Until that decision is taken, enabling the broker for a
+   seat-bound agent is a build failure, not a silent downgrade.
+
+2. **It is not yet enabled.** `enableGitHubPublishBroker` defaults to `false`,
    so the deployed fleet is unchanged and §7.1 still holds. The gate is a
    ROLLOUT gate, not the kill switch §6 refuses: with it off the fleet is
    exactly where this document found it, and the reason it exists is the one §6
    gives for deferring D4 — a change that can break every agent's ability to
    publish should soak rather than flip. **Switching it back off after
    enablement re-opens §7.1 and is a Security decision, not an incident one.**
-   The acceptance is discharged when the gate is on **and item 4 below is
+   The acceptance is discharged when the gate is on **and item 5 below is
    satisfied**, not when this paragraph was written.
-2. **The mode is not the mechanism.** §5 asks for `0400` owned by the broker's
+3. **The mode is not the mechanism.** §5 asks for `0400` owned by the broker's
    uid. That is not reachable through a Kubernetes Secret volume — the kubelet
    owns those files `root`, so `0400` denies the broker as readily as the
    agent, and `fsGroup` is pod-scoped and would hand the agent container a
@@ -464,7 +485,7 @@ Four things a reader should not infer from that paragraph:
    that the mount is **not in the agent's mount namespace at all**; the mode is
    then doing no work. The uid split (broker at 1001) is kept as defence in
    depth against a future `shareProcessNamespace`, not as the boundary.
-3. **A successor residual replaces the old one, and it is smaller but real.**
+4. **A successor residual replaces the old one, and it is smaller but real.**
    The broker runs `git` and `gh` against a repository owned by uid 1000, so
    the agent still chooses some of the input the credential-holding process
    reads — `.git/config` in particular, which is exactly what git's own
@@ -574,7 +595,7 @@ Four things a reader should not infer from that paragraph:
      they belong on the review-date checklist even though they are closed
      today.
 
-4. **The §5 starvation assertion is still outstanding, and it gates discharge.**
+5. **The §5 starvation assertion is still outstanding, and it gates discharge.**
    §5 requires that `/etc/gitconfig`'s system credential helper be *shown* to
    starve once the token leaves the agent container — explicitly not assumed,
    because git treats a credential helper's non-zero exit as "no credential"
@@ -599,7 +620,7 @@ Four things a reader should not infer from that paragraph:
    `GH_TOKEN`/`GITHUB_TOKEN`, and a stale `~/.config/gh/hosts.yml` — the
    unmaintained state BLO-13241 wrapped `gh` to stop using.
 
-   So: **do not read item 1's "discharged when the gate is on" as satisfied by
+   So: **do not read item 2's "discharged when the gate is on" as satisfied by
    flipping the gate.** Until a test asserts that a bare `/usr/bin/git push`
    from uid 1000 in a brokered pod fails to authenticate, enabling the broker
    closes §7.1's *mount* route and leaves its *helper* route unproven, which is

@@ -2285,6 +2285,53 @@ const GITHUB_BROKER_PRIVATE_DIR = "/var/lib/paperclip-github-broker";
 /** uid the broker runs as. Anything but 1000; see the uid note above. */
 const GITHUB_BROKER_UID = 1001;
 
+/**
+ * Environment variable names that are THEMSELVES a GitHub push credential.
+ *
+ * The mount diversion below moves the credential *Secret volume* out of the
+ * agent container. It does nothing about a credential delivered as an
+ * environment variable, and that is a real second delivery route rather than a
+ * hypothetical one: `GH_SEAT_TOKEN_VALUE` exists precisely so a token can be
+ * given to one agent without mounting it fleet-wide (BLO-18927), and
+ * `translateGithubSeatTokenForExecutionTarget` (server/src/services/
+ * heartbeat.ts) expands it into `GH_TOKEN`/`GITHUB_TOKEN` in `adapterConfig.
+ * env` — layer 4 here, which lands in the agent container's env.
+ *
+ * With one of these present the boundary is simply absent, and it fails in the
+ * direction that looks fine: the mount is gone, every assertion about mount
+ * paths passes, and `/usr/bin/git push` still authenticates. The route is the
+ * system git scope — `Dockerfile.runtime` writes
+ * `credential.https://github.com.helper = !/usr/bin/gh auth git-credential`
+ * into `/etc/gitconfig`, which every git in the pod loads — and
+ * `scripts/gh-token-wrapper.sh` answers it from `GH_SEAT_TOKEN_VALUE` in its
+ * FIRST branch, before any broker consideration. So no intent and no knowledge
+ * of where the credential lives is required, which is PEN-3183 §4.0: the
+ * control's own threat, accidental disclosure, not the deliberate one.
+ *
+ * The same four names the broker hands to its own children as "the credential"
+ * ({@link INHERITED_ENV_NAMES} in `github-publish-broker.ts`). Kept in step
+ * deliberately: a name the broker treats as a credential is a name the agent
+ * container must not carry.
+ */
+const AGENT_GITHUB_CREDENTIAL_ENV_NAMES = [
+  "GH_TOKEN",
+  "GITHUB_TOKEN",
+  "GITHUB_PERSONAL_ACCESS_TOKEN",
+  "GH_SEAT_TOKEN_VALUE",
+] as const;
+
+/**
+ * Credential-shaped env names present on the agent container, in order.
+ *
+ * Matched on NAME, and a `valueFrom` entry counts exactly as much as a literal
+ * one: routing a value through a `secretKeyRef` changes where the Job stores
+ * it, not whether the process can read it out of its own environment.
+ */
+export function findAgentGitHubCredentialEnvNames(env: k8s.V1EnvVar[]): string[] {
+  const present = new Set(env.map((e) => e.name));
+  return AGENT_GITHUB_CREDENTIAL_ENV_NAMES.filter((n) => present.has(n));
+}
+
 /** Where the image installs the egress wrappers and the broker runtime. */
 const GITHUB_BROKER_WRAPPER_DIR = "/usr/local/libexec/paperclip/bin";
 const GITHUB_BROKER_RUNTIME_JS =
@@ -3631,6 +3678,42 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
         `directory the agent can write, so the credential boundary would not hold. Fix the data mount ` +
         `scope (see BLO-32734) or leave the broker disabled; do not ship it broad.`,
     );
+  }
+  // Fail closed on an env-delivered credential, for the same reason and in the
+  // same direction as the broad-mount check above.
+  //
+  // Moving the Secret VOLUME is the whole of the mount diversion, and it is not
+  // the whole of the credential surface: `GH_SEAT_TOKEN_VALUE` is a supported,
+  // volume-free delivery route (BLO-18927) that heartbeat expands into
+  // `GH_TOKEN`/`GITHUB_TOKEN` on this container. One of those present and the
+  // boundary buys nothing — `/etc/gitconfig`'s system helper answers a bare
+  // `/usr/bin/git push` out of the environment, with no mount to read and no
+  // intent required (PEN-3183 §4.0).
+  //
+  // Thrown rather than stripped, and the choice matters. Stripping would leave
+  // a seat-bound agent with no credential anywhere: the broker's env is
+  // filtered to the two variables its own token wrapper reads, so it would not
+  // inherit the seat token either, and every publish would fail at a boundary
+  // that reported success. Routing the seat token INTO the broker is the fix
+  // that preserves the function, but it mounts a credential into a new
+  // container, which is exactly §7.2 trigger 3 — a Security decision, not one
+  // this builder takes on its own (§8). So: refuse, name both ways out, and
+  // leave the fleet on the mounted-Secret path where the boundary does hold.
+  if (brokerEnabled) {
+    const credentialEnvNames = findAgentGitHubCredentialEnvNames(envVars);
+    if (credentialEnvNames.length > 0) {
+      throw new Error(
+        `claude_k8s: refusing to build Job manifest — enableGitHubPublishBroker is set, but the agent ` +
+          `container would still carry a GitHub push credential in its environment ` +
+          `(${credentialEnvNames.join(", ")}). The broker moves the credential SECRET VOLUME out of this ` +
+          `container; it cannot move a credential delivered as an environment variable, and ` +
+          `/etc/gitconfig routes a bare \`/usr/bin/git push\` to \`gh auth git-credential\`, which answers ` +
+          `from exactly these variables. Rendering this would report a boundary that is not there. Either ` +
+          `deliver the credential by mounted Secret (the path the broker brokers) and remove the agent- or ` +
+          `project-scope env binding, or leave the broker disabled. Routing the seat-token path through the ` +
+          `broker is PEN-3183 §7.2 trigger 3 and needs Security, not a change here.`,
+      );
+    }
   }
   if (brokerEnabled) {
     volumes.push(

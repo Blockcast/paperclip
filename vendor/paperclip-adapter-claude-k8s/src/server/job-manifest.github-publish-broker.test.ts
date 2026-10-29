@@ -74,9 +74,9 @@ function makeCtx(adapterConfig: Record<string, unknown>, isolation: unknown = NA
   } as unknown as AdapterExecutionContext;
 }
 
-function render(enabled: boolean): k8s.V1PodSpec {
+function render(enabled: boolean, extraConfig: Record<string, unknown> = {}): k8s.V1PodSpec {
   const { job } = buildJobManifest({
-    ctx: makeCtx(enabled ? { enableGitHubPublishBroker: true } : {}),
+    ctx: makeCtx(enabled ? { enableGitHubPublishBroker: true, ...extraConfig } : extraConfig),
     selfPod: baseSelfPod,
   });
   return job.spec!.template!.spec!;
@@ -119,7 +119,7 @@ describe("GitHub publish broker boundary (PEN-4933 / PEN-3183 D1)", () => {
     expect(broker?.restartPolicy).toBe("Always");
   });
 
-  it("gives the agent a socket to ask over, and nothing that resembles a token", () => {
+  it("gives the agent a socket to ask over, and no path to the token file", () => {
     const spec = render(true);
     const agent = agentContainer(spec);
     expect(mountPaths(agent)).toContain("/var/run/paperclip-github-broker");
@@ -140,6 +140,47 @@ describe("GitHub publish broker boundary (PEN-4933 / PEN-3183 D1)", () => {
     for (const path of mountPaths(agent)) {
       expect(tokenFile.startsWith(`${path}/`)).toBe(false);
     }
+    // MOUNTS ONLY. This case is named for the token FILE on purpose: it says
+    // nothing about a credential delivered as an environment variable, which
+    // is a separate delivery route with its own cases below. The previous name
+    // ("nothing that resembles a token") claimed the whole surface while
+    // checking one leg of it, and that gap is how the env route survived.
+    expect(agent.env?.some((e) => e.name === "GH_TOKEN")).toBe(false);
+  });
+
+  // PEN-4933 follow-up. The mount diversion is not the whole credential
+  // surface: `GH_SEAT_TOKEN_VALUE` is a supported volume-free delivery route
+  // (BLO-18927) that heartbeat expands into GH_TOKEN/GITHUB_TOKEN on the agent
+  // container. With one present the mount assertions above all still pass and
+  // `/usr/bin/git push` still authenticates via /etc/gitconfig's system helper,
+  // so the boundary fails in the direction that looks fine.
+  describe("an env-delivered credential is refused rather than rendered", () => {
+    for (const name of ["GH_TOKEN", "GITHUB_TOKEN", "GITHUB_PERSONAL_ACCESS_TOKEN", "GH_SEAT_TOKEN_VALUE"]) {
+      it(`refuses to render the broker while the agent container carries ${name}`, () => {
+        expect(() => render(true, { env: { [name]: "ghs_examplevalue" } })).toThrow(
+          /would still carry a GitHub push credential in its environment/,
+        );
+      });
+    }
+
+    it("names the offending variable, so the error is actionable", () => {
+      expect(() => render(true, { env: { GH_SEAT_TOKEN_VALUE: "ghs_examplevalue" } })).toThrow(
+        /GH_SEAT_TOKEN_VALUE/,
+      );
+    });
+
+    // The refusal is scoped to the credential names, not to "any env var".
+    it("renders normally for an unrelated env var", () => {
+      expect(() => render(true, { env: { SOME_FEATURE_FLAG: "1" } })).not.toThrow();
+    });
+
+    // POSITIVE CONTROL, and the one that pins WHY this refusal exists: with the
+    // broker off, the same seat token renders happily onto the agent container.
+    // That is today's fleet, and it is the state §7.1 describes.
+    it("POSITIVE CONTROL: with the broker off, the seat credential renders onto the agent", () => {
+      const spec = render(false, { env: { GH_TOKEN: "ghs_examplevalue" } });
+      expect(agentContainer(spec).env?.some((e) => e.name === "GH_TOKEN")).toBe(true);
+    });
   });
 
   it("shares /tmp with the broker, ahead of the nested prompt mount", () => {
