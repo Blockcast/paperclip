@@ -110,6 +110,27 @@ test("wrapperIsAhead follows a symlink that points at the wrapper", () => {
   assert.equal(wrapperIsAhead(["/usr/local/bin/git"], realpath), true);
 });
 
+test("wrapperIsAhead refuses a WRAPPER that itself resolves to the real binary", () => {
+  // The fail-open that resolving the WRAPPER side opens: if the guard has been replaced
+  // by a symlink to real git, then real-git-first resolves to the same file as the
+  // wrapper and the naive comparison answers "yes" -- suppressing the §4 escalation in
+  // exactly the case where the guard is gone.
+  const subvertedWrapper = (p) => (p === WRAPPER ? REAL_GIT : p);
+  assert.equal(wrapperIsAhead([REAL_GIT, WRAPPER], subvertedWrapper), false);
+  // Same shape via a third path: /bin/git and the subverted wrapper both resolve to the
+  // real binary, so they compare equal -- which must NOT be read as "reaches the wrapper".
+  const bothResolveToRealGit = (p) => (p === WRAPPER || p === "/bin/git" ? REAL_GIT : p);
+  assert.equal(wrapperIsAhead(["/bin/git"], bothResolveToRealGit), false);
+});
+
+test("wrapperIsAhead still reports the literal wrapper PATH entry when subverted", () => {
+  // Deliberate asymmetry: the flag answers WHICH FILE a bare `git` reaches. With the
+  // wrapper path first, a bare `git` does reach that entry. Whether the file behind it is
+  // still a guard is the WRAPPER content hash's question, and the two are read together.
+  const subvertedWrapper = (p) => (p === WRAPPER ? REAL_GIT : p);
+  assert.equal(wrapperIsAhead([WRAPPER, REAL_GIT], subvertedWrapper), true);
+});
+
 test("wrapperIsAhead fails CLOSED when a path cannot be resolved", () => {
   // The production resolver falls back to the path itself on error. An unresolvable
   // path then compares equal only to itself, so a resolution failure can never

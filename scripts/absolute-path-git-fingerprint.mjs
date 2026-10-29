@@ -128,12 +128,24 @@ const defaultRealpath = (p) => {
  * guard: a wrapper replaced in place by a copy of real git would pass here. That case is
  * covered by the content hash of `WRAPPER` in the fingerprint, not by this flag -- the
  * two are meant to be read together.
+ *
+ * Resolving the WRAPPER side reopens one narrow fail-open on its own, so it is closed
+ * explicitly: if `WRAPPER` is itself replaced by a symlink to the real binary, then a
+ * layout of `[REAL_GIT, WRAPPER]` -- real git genuinely first, the guard genuinely NOT
+ * ahead -- would resolve both sides to the same file and answer "yes". A wrapper that
+ * resolves to real git is refused outright below. The literal `first === WRAPPER` arm
+ * above is deliberately NOT subject to that refusal: there a bare `git` really does reach
+ * the wrapper PATH entry, which is what this flag reports; whether the file behind it is
+ * still a guard is the content hash's question, per the paragraph above.
  */
 export function wrapperIsAhead(layout, realpath = defaultRealpath) {
   const first = layout[0];
   if (first === undefined) return false;
   if (first === WRAPPER) return true;
-  return realpath(first) === realpath(WRAPPER);
+  const wrapperReal = realpath(WRAPPER);
+  // A wrapper that resolves to the real binary cannot make anything "the wrapper".
+  if (wrapperReal === realpath(REAL_GIT)) return false;
+  return realpath(first) === wrapperReal;
 }
 
 /**
