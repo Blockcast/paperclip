@@ -24,7 +24,10 @@ import type { Request, RequestHandler, Response as ExpressResponse, Router } fro
 import { logger } from "../middleware/logger.js";
 import { urlForLog } from "../middleware/http-log-policy.js";
 import { assertBoardOrgAccess } from "./authz.js";
-import { recordWorkerTierProxyFailure } from "../services/metrics.js";
+import {
+  initWorkerTierProxyRouteSeries,
+  recordWorkerTierProxyFailure,
+} from "../services/metrics.js";
 
 /**
  * Plugin routes whose handlers reach pluginWorkerManager.{startWorker,
@@ -249,9 +252,18 @@ function createWorkerProxyHandler(
   streaming: boolean,
   requestTimeoutMs: number,
   {
+    route,
     extraHeaders = {},
     serveLocallyIfUnreachable = false,
   }: {
+    /**
+     * The allowlist path pattern this handler was registered for, used as the
+     * `route` label on the failure counter and as log context. The PATTERN,
+     * never `req.path`: `:pluginId` and `:endpointKey` are caller-supplied, and
+     * interpolating them would turn a bounded label into unbounded cardinality
+     * from an unauthenticated webhook route (PEN-4100).
+     */
+    route: string;
     extraHeaders?: Record<string, string>;
     /**
      * BLO-47803: when the target cannot be connected to, hand the request to
@@ -260,7 +272,7 @@ function createWorkerProxyHandler(
      * the request timeout against a dead holder.
      */
     serveLocallyIfUnreachable?: boolean;
-  } = {},
+  },
 ): RequestHandler {
   return async (req, res, next) => {
     const workersInternalUrl = typeof target === "string" ? target : target(res);
@@ -391,7 +403,7 @@ function createWorkerProxyHandler(
       if (clientDisconnected) return;
       if (serveLocallyIfUnreachable && !timedOut && !res.headersSent && isConnectPhaseError(err)) {
         logger.warn(
-          { err, targetUrl: targetUrlForLog, method: req.method },
+          { err, targetUrl: targetUrlForLog, method: req.method, route },
           "plugin holder forward: lease holder unreachable; serving locally",
         );
         next("route");
@@ -410,12 +422,21 @@ function createWorkerProxyHandler(
         : res.headersSent
         ? "mid_stream"
         : "unreachable";
-      recordWorkerTierProxyFailure(failureReason);
+      recordWorkerTierProxyFailure(failureReason, route);
       logger.error(
         // `targetUrlForLog`, not `targetUrl`: the raw URL carries the
         // caller-supplied query string (PEN-2996). The failure split and the
-        // requestTimeoutMs context from BLO-31945 are kept as-is.
-        { err, targetUrl: targetUrlForLog, method: req.method, reason: failureReason, requestTimeoutMs },
+        // requestTimeoutMs context from BLO-31945 are kept as-is. `route` is
+        // the allowlist pattern, so the log and the counter agree on which
+        // proxied route failed without re-deriving it from the URL.
+        {
+          err,
+          targetUrl: targetUrlForLog,
+          method: req.method,
+          route,
+          reason: failureReason,
+          requestTimeoutMs,
+        },
         failureReason === "timeout"
           ? "worker-tier proxy: worker tier did not respond before the proxy timeout"
           : failureReason === "mid_stream"
@@ -464,12 +485,20 @@ export function registerWorkerTierProxyRoutes(
     if (route.preProxyAuth === "board-org") {
       handlers.push(boardOrgAccessProxyGuard);
     }
-    handlers.push(createWorkerProxyHandler(workersInternalUrl, route.streaming ?? false, timeoutMs));
+    handlers.push(createWorkerProxyHandler(
+      workersInternalUrl,
+      route.streaming ?? false,
+      timeoutMs,
+      { route: route.path },
+    ));
     router[route.method](
       route.path,
       ...handlers,
     );
   }
+  // Materialize {reason, route} at zero for every proxied route, so a quiet
+  // route reads as 0 rather than as an absent series (PEN-4100).
+  initWorkerTierProxyRouteSeries(WORKER_DEPENDENT_PLUGIN_ROUTES.map((r) => r.path));
   logger.info(
     {
       workersInternalUrl,
@@ -533,6 +562,7 @@ export function registerPluginHolderForwardRoutes(
       route.streaming ?? false,
       timeoutMs,
       {
+        route: route.path,
         extraHeaders: { [PLUGIN_HOLDER_FORWARDED_HEADER]: "1" },
         // A holder that crashed keeps its lease row until the TTL lapses
         // (~45 s); serve locally rather than fail every call in that window.
@@ -544,4 +574,5 @@ export function registerPluginHolderForwardRoutes(
     ));
     router[route.method](route.path, ...handlers);
   }
+  initWorkerTierProxyRouteSeries(WORKER_DEPENDENT_PLUGIN_ROUTES.map((r) => r.path));
 }

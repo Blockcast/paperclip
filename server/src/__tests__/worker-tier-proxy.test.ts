@@ -29,14 +29,36 @@ import {
  * in-memory assertion and fail the actual requirement.
  */
 async function proxyFailureSeries(): Promise<Record<string, number>> {
-  const { body } = await renderMetrics();
   const out: Record<string, number> = {};
-  for (const line of body.split("\n")) {
-    if (!line.startsWith(`${WORKER_TIER_PROXY_FAILURES_METRIC}{`)) continue;
-    const [, reason, rawValue] = /reason="([^"]*)"\}\s+(\S+)$/.exec(line) ?? [];
-    if (reason) out[reason] = Number(rawValue);
+  for (const { reason, value } of await proxyFailureRows()) {
+    out[reason] = (out[reason] ?? 0) + value;
   }
   return out;
+}
+
+/**
+ * Every `{reason, route}` child of the failure counter, as rendered.
+ *
+ * PEN-4100 added the `route` label, so the counter no longer has one series
+ * per reason — `proxyFailureSeries` sums across routes to keep the
+ * reason-level assertions reading as before, and this is what the
+ * attribution tests use when the route itself is the claim.
+ */
+async function proxyFailureRows(): Promise<
+  Array<{ reason: string; route: string; value: number }>
+> {
+  const { body } = await renderMetrics();
+  const rows: Array<{ reason: string; route: string; value: number }> = [];
+  for (const line of body.split("\n")) {
+    if (!line.startsWith(`${WORKER_TIER_PROXY_FAILURES_METRIC}{`)) continue;
+    const [, labels, rawValue] = /\{(.*)\}\s+(\S+)$/.exec(line) ?? [];
+    if (labels === undefined) continue;
+    const reason = /reason="([^"]*)"/.exec(labels)?.[1];
+    const route = /route="([^"]*)"/.exec(labels)?.[1];
+    if (reason === undefined || route === undefined) continue;
+    rows.push({ reason, route, value: Number(rawValue) });
+  }
+  return rows;
 }
 
 interface CapturedRequest {
@@ -392,6 +414,88 @@ describe("registerWorkerTierProxyRoutes", () => {
     // missing endpoint. Asserting both series also proves the zero-init holds,
     // so `rate()` over the quiet reason returns 0 rather than nothing.
     expect(await proxyFailureSeries()).toEqual({ timeout: 1, mid_stream: 0, unreachable: 0 });
+  });
+
+  // ---- PEN-4100: the 504 must be attributable to a route, serving-side -----
+
+  it("attributes a timeout to the alertmanager webhook route, not just a reason", async () => {
+    // PEN-4100. Alertmanager drops a whole batch on
+    // `504 Worker tier did not respond within 120000ms`, and the row was filed
+    // because the SENDER's log was the only witness. The serving side does
+    // record it — but `reason` alone pools all 17 proxied routes into one
+    // series, and in production the `unreachable` arm (api rollouts) outruns
+    // `timeout` by three orders of magnitude, so "was it the webhook?" was
+    // still only answerable from Alertmanager. The route label is what makes
+    // the serving side self-sufficient.
+    __resetMetricsForTest();
+    worker = await startWorkerStub(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      return { status: 200, body: JSON.stringify({ ok: true }) };
+    });
+    const app = buildAppWithProxyOptions(worker.url, { requestTimeoutMs: 50 });
+
+    const res = await request(app)
+      .post("/api/plugins/paperclip-plugin-alertmanager/webhooks/alertmanager")
+      .send({ alerts: [] });
+
+    expect(res.status).toBe(504);
+
+    const nonZero = (await proxyFailureRows()).filter((row) => row.value > 0);
+    expect(nonZero).toEqual([
+      {
+        reason: "timeout",
+        // The PATTERN, not the request path: `paperclip-plugin-alertmanager`
+        // and `alertmanager` are caller-supplied and must never become label
+        // values on an unauthenticated route.
+        route: "/plugins/:pluginId/webhooks/:endpointKey",
+        value: 1,
+      },
+    ]);
+  });
+
+  it("leaves the webhook route's timeout series at zero on a healthy delivery", async () => {
+    // The negative control PEN-4100 asks for: the observable must be ABSENT on
+    // a delivery that succeeds. Without this, a counter that incremented on
+    // every delivery would pass the test above and be useless as a signal.
+    __resetMetricsForTest();
+    worker = await startWorkerStub(() => ({
+      status: 200,
+      body: JSON.stringify({ status: "ok" }),
+    }));
+    const app = buildAppWithProxyOptions(worker.url, { requestTimeoutMs: 5_000 });
+
+    const res = await request(app)
+      .post("/api/plugins/paperclip-plugin-alertmanager/webhooks/alertmanager")
+      .send({ alerts: [] });
+
+    expect(res.status).toBe(200);
+    // Zero-init means the series must EXIST and read 0 — an absent series is
+    // indistinguishable from a healthy one once it reaches a dashboard.
+    expect(
+      (await proxyFailureRows()).find(
+        (row) =>
+          row.reason === "timeout"
+          && row.route === "/plugins/:pluginId/webhooks/:endpointKey",
+      ),
+    ).toEqual({ reason: "timeout", route: "/plugins/:pluginId/webhooks/:endpointKey", value: 0 });
+    expect((await proxyFailureRows()).every((row) => row.value === 0)).toBe(true);
+  });
+
+  it("keeps the alertmanager webhook on the generic 120s deadline, not the plugin-api profile", async () => {
+    // PEN-4100 guardrail. The row's named deadline is
+    // PROXY_REQUEST_TIMEOUT_MS = 120_000 (routes/worker-tier-proxy.ts), and the
+    // plugin mirrors it as WORKER_PROXY_DEADLINE_MS to derive its own 90s
+    // DELIVERY_BUDGET_MS. Moving the webhook onto the 150s `plugin-api` profile
+    // would silently desynchronize that pair — the plugin would keep yielding
+    // at 90s against a deadline that is no longer 120s — so the binding is
+    // asserted rather than left to a reviewer noticing a one-word diff.
+    const webhookRoute = WORKER_DEPENDENT_PLUGIN_ROUTES.find(
+      (route) => route.path === "/plugins/:pluginId/webhooks/:endpointKey",
+    );
+    expect(webhookRoute).toBeDefined();
+    expect(webhookRoute?.method).toBe("post");
+    expect(webhookRoute?.timeoutProfile).toBeUndefined();
+    expect(webhookRoute?.streaming).toBeFalsy();
   });
 
   it("counts a failure after headers were flushed as mid_stream, not unreachable", async () => {
