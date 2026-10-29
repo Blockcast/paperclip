@@ -277,7 +277,8 @@ grounds:
   `GIT_CONFIG_PARAMETERS` from its wrapped parent, so its **credential** path is still the paperclip
   helper and the accidental-disclosure case is not opened — what it escapes is the **guard**, not
   the credential. `github-git-egress-shim.ts` already refuses `!`-prefixed shell aliases for exactly
-  this reason; this bullet's wording is what had not kept up.
+  this reason, but that refusal does not cover hooks or external diff/merge tools. This bullet's
+  wording is what had not kept up; the uncovered shapes are tracked as **PEN-4998**.
 - Of the four enumerated bypasses, the three that required a deliberate write are closed. The
   survivor requires no write, no privilege, and — per §4 — **no knowledge of the credential
   either**; it requires only that something invoke git by absolute path. For the *deliberate*
