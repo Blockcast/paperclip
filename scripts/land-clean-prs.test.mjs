@@ -1323,8 +1323,16 @@ describe("ejected-at-current-head hold (PEN-5022)", () => {
   // Real shapes. `removed_from_merge_queue` carries `commit_id: null` (verified
   // on #3089's three events, 2026-10-29), which is why the rule dates against
   // the head rather than matching a sha.
-  const committed = (at) => ({ event: "committed", committer: { date: at } });
-  const forcePushed = (at) => ({ event: "head_ref_force_pushed", created_at: at });
+  // Real shapes again, and the two are disjoint: a `committed` event carries
+  // its sha under `sha`, a `head_ref_force_pushed` under `commit_id` (read
+  // live off #3089 and #3114, 2026-10-29). Both default to undefined so every
+  // pre-PEN-5028 call site below keeps meaning "a commit nobody identified".
+  const committed = (at, sha) => ({ event: "committed", sha, committer: { date: at } });
+  const forcePushed = (at, commitId) => ({
+    event: "head_ref_force_pushed",
+    created_at: at,
+    commit_id: commitId,
+  });
   const added = (at) => ({ event: "added_to_merge_queue", created_at: at, commit_id: null });
   const ejected = (at) => ({ event: "removed_from_merge_queue", created_at: at, commit_id: null });
 
@@ -1347,6 +1355,79 @@ describe("ejected-at-current-head hold (PEN-5022)", () => {
       assert.equal(headMovedAt([added("2026-09-13T10:00:00Z")]), null);
       assert.equal(headMovedAt([]), null);
       assert.equal(headMovedAt(undefined), null);
+    });
+
+    it("PEN-5028: ignores a commit that is no longer the head, however new it is", () => {
+      // The fail-OPEN direction, and the expensive one. #3089 carries six
+      // `committed` events of which exactly one is the head; an abandoned
+      // commit dated AFTER the head drags the stamp forward, and every
+      // ejection older than it is then silently dropped. Without the headSha
+      // narrowing this returns 10:00 and reports a head that never moved.
+      const timeline = [
+        committed("2026-09-13T08:00:00Z", HEAD),
+        committed("2026-09-13T10:00:00Z", OTHER),
+      ];
+      assert.equal(headMovedAt(timeline, HEAD), Date.parse("2026-09-13T08:00:00Z"));
+      // Unnarrowed is the pre-PEN-5028 answer, kept as the contrast.
+      assert.equal(headMovedAt(timeline), Date.parse("2026-09-13T10:00:00Z"));
+    });
+
+    it("PEN-5028: reads a force-push's sha off commit_id, not off sha", () => {
+      // `head_ref_force_pushed` carries `commit_id` and a null `sha`. Matching
+      // only on `sha` would make every force-pushed head unattested and send
+      // it down the fallback, which is the one path that cannot narrow.
+      // The trailing abandoned commit is what makes this discriminating: on a
+      // `sha`-only match the force-push attests nothing, the whole timeline
+      // falls back, and the stamp reads 10:00 instead of 09:00.
+      const timeline = [
+        committed("2026-09-13T08:00:00Z", OTHER),
+        forcePushed("2026-09-13T09:00:00Z", HEAD),
+        committed("2026-09-13T10:00:00Z", "c0ffee11c0ffee11c0ffee11c0ffee11c0ffee11"),
+      ];
+      assert.equal(headMovedAt(timeline, HEAD), Date.parse("2026-09-13T09:00:00Z"));
+    });
+
+    it("PEN-5028: falls back to the unnarrowed stamp when nothing attests the head", () => {
+      // Deliberate, and it is the anti-stranding guard. Returning null here
+      // would count every historical ejection and hold the PR, and no push
+      // could ever clear it — a permanent hold on exactly the PRs whose
+      // timeline is odd. The fallback is the pre-PEN-5028 behaviour, so the
+      // narrowing can only ever bite on positive evidence about the head.
+      const timeline = [committed("2026-09-13T08:00:00Z"), committed("2026-09-13T10:00:00Z")];
+      assert.equal(headMovedAt(timeline, HEAD), Date.parse("2026-09-13T10:00:00Z"));
+      assert.equal(headMovedAt(timeline, HEAD), headMovedAt(timeline));
+    });
+
+    it("PEN-5028 CEILING: dates the head by COMMIT time, so a commit-before-ejection, push-after keeps the ejection", () => {
+      // ⛔ This pins a KNOWN LIMITATION, not a desired behaviour. The REST
+      // timeline records no push time for a non-force push, so the only clock
+      // available is `committer.date`:
+      //
+      //   08:00 original commit · 10:00 ejection #1 · 10:30 fix COMMITTED
+      //   · 11:00 ejection #2 · 11:05 fix PUSHED, becoming the head
+      //
+      // The head is dated 10:30, so the 11:00 ejection survives onto a head
+      // that has never been in the queue. Narrowing to the head sha does NOT
+      // reach this — 10:30 is the head's own stamp — which is why the fix for
+      // PEN-5028 is a corrected doc plus this test, and not a filter. Closing
+      // it needs a push time from a source other than this timeline.
+      //
+      // If this ever goes red because the count dropped to 0, the ceiling has
+      // been closed: delete the ponytail notes on `headMovedAt` and
+      // `ejectionsAtHead` rather than relaxing the assertion.
+      const timeline = [
+        committed("2026-09-13T08:00:00Z", OTHER),
+        added("2026-09-13T09:50:00Z"),
+        ejected("2026-09-13T10:00:00Z"),
+        committed("2026-09-13T10:30:00Z", HEAD),
+        added("2026-09-13T10:50:00Z"),
+        ejected("2026-09-13T11:00:00Z"),
+      ];
+      assert.equal(headMovedAt(timeline, HEAD), Date.parse("2026-09-13T10:30:00Z"));
+      // One ejection carried onto a head that was never enqueued, so for this
+      // push ordering the effective threshold is EJECTIONS_BEFORE_HOLD - 1.
+      assert.equal(ejectionsAtHead(timeline, HEAD).count, 1);
+      assert.equal(EJECTIONS_BEFORE_HOLD - 1, 1);
     });
   });
 
@@ -1448,6 +1529,35 @@ describe("ejected-at-current-head hold (PEN-5022)", () => {
 
     it("is unchanged for a PR with no timeline at all", () => {
       assert.equal(classify({ mergeStateStatus: "CLEAN" }).action, "enqueue");
+    });
+
+    it("PEN-5028: an abandoned commit newer than the head no longer suppresses the hold", () => {
+      // End-to-end for the fail-open direction. Before the headSha narrowing
+      // the trailing OTHER commit dated the head at 10:00, both ejections fell
+      // away, and a head GitHub had ejected twice classified `enqueue`.
+      const row = classify({
+        mergeStateStatus: "CLEAN",
+        timeline: [
+          committed("2026-09-13T08:00:00Z", HEAD),
+          ...Array.from({ length: EJECTIONS_BEFORE_HOLD }, (_, i) => [
+            added(`2026-09-13T09:0${i}:00Z`),
+            ejected(`2026-09-13T09:0${i}:30Z`),
+          ]).flat(),
+          committed("2026-09-13T10:00:00Z", OTHER),
+        ],
+      });
+      assert.equal(row.action, "skip");
+      assert.equal(row.reason, "ejected-at-current-head");
+    });
+
+    it("PEN-5028: the detail names remedies that exist — not a deleted queue build", () => {
+      // An ejection DELETES the `gh-readonly-queue/...` branch, so "rerun the
+      // queue build" pointed a human at a dead ref. A push and a manual
+      // re-enqueue are the only two things that clear this row.
+      const row = classify({ mergeStateStatus: "CLEAN", timeline: withEjections(EJECTIONS_BEFORE_HOLD) });
+      assert.match(row.detail, /push a fix/);
+      assert.match(row.detail, /re-enqueue manually/);
+      assert.doesNotMatch(row.detail, /rerun the queue build/);
     });
   });
 
