@@ -34,6 +34,7 @@ import { spawn } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, unlinkSync } from "node:fs";
 import net from "node:net";
 import path from "node:path";
+import { EGRESS_GUARD_BIN_DIR } from "@paperclipai/shared/egress-guard-path";
 
 import {
   BROKER_ROLE_ENV,
@@ -57,8 +58,14 @@ import {
   type PublishBrokerRequest,
 } from "./github-publish-broker-protocol.js";
 
-/** Where the image installs the wrappers the broker re-enters. */
-export const IMAGE_WRAPPER_DIR = "/usr/local/libexec/paperclip/bin";
+/**
+ * Where the image installs the wrappers the broker re-enters.
+ *
+ * PEN-5030: re-exported from `@paperclipai/shared` rather than declared here,
+ * so the same directory the broker re-enters is the one the PATH-guard helpers
+ * refuse to drop. One literal, two readers.
+ */
+export const IMAGE_WRAPPER_DIR = EGRESS_GUARD_BIN_DIR;
 
 /**
  * The shared `/tmp`, mounted in BOTH containers.

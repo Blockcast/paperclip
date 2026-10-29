@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants, promises as fs, type Dirent } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { guardedChildEnv } from "@paperclipai/shared/egress-guard-path";
 import { sanitizeRemoteExecutionEnv } from "./remote-execution-env.js";
 import {
   buildLocalProcessSandboxSpawnTarget,
@@ -2282,9 +2283,28 @@ async function resolveSpawnTarget(
 }
 
 export function ensurePathInEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  if (typeof env.PATH === "string" && env.PATH.length > 0) return env;
-  if (typeof env.Path === "string" && env.Path.length > 0) return env;
-  return { ...env, PATH: defaultPathForPlatform() };
+  // `Path` is the Windows spelling, and no egress guard exists on Windows, so
+  // an environment carrying only that key is returned exactly as it was.
+  // Adding a `PATH` alongside it would change which value the child reads.
+  const hasPath = typeof env.PATH === "string" && env.PATH.length > 0;
+  if (!hasPath && typeof env.Path === "string" && env.Path.length > 0) return env;
+
+  // PEN-5030: both branches below keep the git egress guard.
+  //
+  // The substituted default from defaultPathForPlatform() is a hardcoded
+  // literal that *structurally* cannot contain the guard directory, which is
+  // the same defect as an unset PATH wearing better clothes — it reads as a
+  // deliberate, complete list rather than as an absence. Routing through
+  // guardedChildEnv() restores the guard in front of it, and restores it in
+  // front of a caller-supplied narrowed PATH too.
+  //
+  // This is `preserve, never add`: only directories already on the ambient
+  // PATH are carried in, so wherever no wrapper is installed — CI runners,
+  // developer laptops, Windows — every call here is an identity on the
+  // value this function produced before, and the substituted default is
+  // unchanged. On the agent image the guard already leads the ambient PATH,
+  // so the PATH-present branch is a no-op there as well.
+  return guardedChildEnv(env, { fallback: defaultPathForPlatform().split(path.delimiter) });
 }
 
 export async function ensureAbsoluteDirectory(

@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
-import path from "node:path";
+import path, { delimiter } from "node:path";
+import { guardedPath } from "@paperclipai/shared/egress-guard-path";
 import { spawn } from "node:child_process";
 import { definePlugin } from "@paperclipai/plugin-sdk";
 import type {
@@ -191,10 +192,30 @@ function buildCommandLine(command: string, args: string[] | undefined): string {
   return [command, ...(args ?? [])].join(" ");
 }
 
+/**
+ * The executed command's environment.
+ *
+ * The host environment is deliberately NOT inherited — see the "does not
+ * expose host-only environment variables to executed commands" test. Only
+ * `PATH` plus whatever the caller passed explicitly reaches the child.
+ *
+ * PEN-5030: `DEFAULT_FAKE_SANDBOX_PATH` is a hardcoded literal that
+ * structurally cannot contain the git egress guard directory, so a command run
+ * through this driver with no explicit `PATH` reached the real `git` directly,
+ * skipping the egress scanner. guardedPath() restores the guard in front.
+ *
+ * This does not weaken the isolation above. `preserve, never add` means only
+ * directories already on the ambient `PATH` are hoisted, and the guard
+ * directory holds wrappers, not secrets — no host *variable* is carried in,
+ * which is what that test is about. Where no wrapper is installed the call is
+ * an identity and the default stays exactly as it was, which is why the
+ * sibling "includes /usr/local/bin in the default PATH" test still holds.
+ */
 function buildCommandEnvironment(explicitEnv: Record<string, string> | undefined): Record<string, string> {
+  const requested = explicitEnv?.PATH ?? DEFAULT_FAKE_SANDBOX_PATH;
   return {
-    PATH: explicitEnv?.PATH ?? DEFAULT_FAKE_SANDBOX_PATH,
     ...(explicitEnv ?? {}),
+    PATH: guardedPath(requested.split(delimiter)),
   };
 }
 

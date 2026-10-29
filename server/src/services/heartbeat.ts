@@ -4383,6 +4383,22 @@ async function pathIsAbsent(cwd: string): Promise<boolean> {
 // Filtering the home prefix rather than hardcoding /usr/bin keeps these
 // working on dev machines and in CI, and excludes any future agent-home
 // shim for free.
+// PEN-5030, load-bearing and currently unasserted: this filter drops every
+// PATH entry under PAPERCLIP_HOME, and the git egress guard
+// (/usr/local/libexec/paperclip/bin) survives it ONLY because that directory
+// happens to sit outside PAPERCLIP_HOME — /paperclip in the agent pod, so the
+// guard is neither equal to it nor prefixed by it. That is a coincidence of
+// filesystem layout, not something this code states or checks.
+//
+// Relocate the guard under PAPERCLIP_HOME — a plausible tidy-up, since almost
+// everything else paperclip installs lives there — and this filter silently
+// strips it, handing `git rev-parse` below an unwrapped git with the system
+// credential helper still wired up in /etc/gitconfig. No test would fail.
+//
+// So: if the guard directory ever moves, re-exempt it here explicitly (the
+// shared constant is EGRESS_GUARD_BIN_DIR in @paperclipai/shared). Narrowing
+// PATH to dodge the credential shim and narrowing it past the egress guard
+// are one line apart, and only the first one is intended.
 function strictGitCheckoutProbeEnv(): NodeJS.ProcessEnv {
   const home = path.resolve(resolvePaperclipHomeDir());
   const entries = (process.env.PATH ?? "").split(path.delimiter).filter((entry) => {

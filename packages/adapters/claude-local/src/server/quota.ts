@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
+import { guardedChildEnv } from "@paperclipai/shared/egress-guard-path";
 import type { ProviderQuotaResult, QuotaWindow } from "@paperclipai/adapter-utils";
 
 const execFileAsync = promisify(execFile);
@@ -41,6 +42,24 @@ function hasNonEmptyProcessEnv(key: string): boolean {
   return typeof value === "string" && value.trim().length > 0;
 }
 
+/**
+ * The probe's environment: everything the host has except `ANTHROPIC_*`, so
+ * the Claude CLI reads its own stored credentials rather than this process's.
+ *
+ * PEN-5030 listed this as a site that hands `sh` an environment with no `PATH`
+ * key. Re-read at `06e87072a`: that is wrong, and the correction belongs here
+ * rather than only in the row. The loop below copies *every* string-valued
+ * entry of `process.env`, so `PATH` is carried through byte-identical — the
+ * finding was a static-analysis artifact of the env being rebuilt rather than
+ * spread, not an observed drop. Verified by running the loop: `PATH` present,
+ * `=== process.env.PATH`.
+ *
+ * It is still routed through guardedChildEnv(). The child is `sh -c`, which is
+ * the category that can reach `git`, and the cost is nil: with `PATH` present
+ * and the guard already leading the ambient `PATH` on the agent image, the
+ * call is an identity. What it buys is that the property stops depending on
+ * nobody ever adding a `PATH` filter to the loop above.
+ */
 function createClaudeQuotaEnv(): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [key, value] of Object.entries(process.env)) {
@@ -48,7 +67,7 @@ function createClaudeQuotaEnv(): Record<string, string> {
     if (key.startsWith("ANTHROPIC_")) continue;
     env[key] = value;
   }
-  return env;
+  return guardedChildEnv(env) as Record<string, string>;
 }
 
 function stripBackspaces(text: string): string {
