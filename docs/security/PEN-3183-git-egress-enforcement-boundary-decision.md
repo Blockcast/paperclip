@@ -29,7 +29,7 @@ built against this decision.
 | D4 | Egress NetworkPolicy + scanning proxy? | **DEFERRED, and note that it converges on D1.** Any proxy permitted to push to GitHub must itself hold the credential, so it *is* the credential-holder design, plus a TLS-terminating git-pack parser. Build the credential half first: it is most of the benefit at a fraction of the cost and risk. |
 | D5 | The residual between now and D1 | **ACCEPTED, dated — and conditional.** Reviewed 2026-10-28; next review **2027-01-31**, or immediately on any trigger in §7.2. Accepted on the stated, *unmeasured* assumption that nothing in the fleet invokes `git` by absolute path (§4.0); the §8 count settles it and a non-zero result ends the acceptance. |
 | D6 | *(correction of record)* | The row's evidence block, and the THREAT MODEL header in `github-git-egress-runtime.ts`, both describe a pod that no longer exists. Both are corrected by this change. |
-| D7 | Env-delivered credentials under the broker | **REFUSE to render, do not route** — decided 2026-10-29. A Job that would place a GitHub credential in the agent container's `env` fails to build rather than rendering a boundary that is not there. Routing that credential *into* the broker stays reserved; §7.4 gives the grounds and the three conditions that would release it. |
+| D7 | Env-delivered credentials under the broker | **REFUSE to render, do not route** — decided 2026-10-29. The ruling: a Job that would place a GitHub credential in the agent container's `env` must **fail to build** rather than render a boundary that is not there. ⚠ That refusal is **not on master** at this writing — it is #3089 (PEN-4933), open; D7 decides which way that PR goes and asserts no existing control. Routing that credential *into* the broker stays reserved; §7.4 gives the grounds and the three conditions that would release it. |
 
 ⛔ The row's existing prohibition stands and is re-affirmed: **do not add integrity checks between
 wrapper, hook and scanner.** §3 shows why it is not merely unhelpful but unsound — they remain one
@@ -232,8 +232,9 @@ The boundary must therefore hold the credential and **perform the publish itself
   `agent-egress-path.test.mjs`) whose expectations live in `scripts/git-config-surface.mjs` —
   changing that line means changing those in the same commit, by construction.
   **Status:** still outstanding as of 2026-10-29 — PEN-4933 shipped without it. It is tracked as
-  a precondition for discharging §7.1, not as a follow-up; see §7.3 item 4 for what is already
-  in place, what is merely probable, and what remains unasserted.
+  a precondition for discharging §7.1, not as a follow-up; see §7.3's *"The §5 starvation
+  assertion is still outstanding, and it gates discharge"* for what is already in place, what is
+  merely probable, and what remains unasserted.
 
 Short-lived minted tokens are **not** a substitute. A GitHub App installation token handed to the
 agent is readable for its whole lifetime, so it narrows the window and leaves the boundary exactly
@@ -484,11 +485,24 @@ Four things a reader should not infer from that paragraph:
 
 ### 7.4 Env-delivered credentials: the seat-token route stays refused, not routed (decided 2026-10-29)
 
-**The question, raised from PEN-4933 on 2026-10-29.** #3089 makes `buildJobManifest` refuse to
-render the broker while `GH_TOKEN`, `GITHUB_TOKEN`, `GITHUB_PERSONAL_ACCESS_TOKEN` or
-`GH_SEAT_TOKEN_VALUE` would land on the agent container (§7.3). Routing the seat-token path
-*through* the broker instead would preserve function for a seat-bound agent. CTO declined to pick
-unilaterally, correctly, because §8 reserves it here.
+⚠ **Status, so this section is not misread as a description of master.** What follows decides a
+change that is **not merged**. The refusal lives in #3089 (PEN-4933), open at this writing;
+neither `buildJobManifest` nor §7.3 refuses anything on master today. Every "the refusal" below
+means *the refusal #3089 proposes, which this section rules should stay* — nothing here asserts a
+control that exists. Asserting a boundary that is not there is the failure D7 exists to prevent,
+and it would be a poor way to record D7.
+
+> **Citation convention.** §7.3's items are cited below by their **bold titles**, never by number.
+> #3089 inserts a new first item and renumbers the rest, so a numeric reference would silently
+> point at the wrong item in one of the two merge orders — and these references are the
+> load-bearing part of the release conditions.
+
+**The question, raised from PEN-4933 on 2026-10-29.** #3089 would make `buildJobManifest` refuse
+to render the broker while `GH_TOKEN`, `GITHUB_TOKEN`, `GITHUB_PERSONAL_ACCESS_TOKEN` or
+`GH_SEAT_TOKEN_VALUE` would land on the agent container, and would record that refusal as a new
+first item in §7.3. Routing the seat-token path *through* the broker instead would preserve
+function for a seat-bound agent. CTO declined to pick unilaterally, correctly, because §8 reserves
+it here.
 
 **Decision: keep the refusal. Do not route.** Four grounds, in the order that decided it.
 
@@ -510,8 +524,9 @@ unilaterally, correctly, because §8 reserves it here.
    required` for the Security seat. Treat it as "no agent-scope binding found", not "no binding
    exists" — which is also why condition (c) below is a measurement and not an assumption.
 
-3. **Routing would amplify the one residual §7.3 item 3 leaves open, onto a broader credential.**
-   That item carries a live check-then-use gap: admission resolves a path, `gh` re-resolves it when
+3. **Routing would amplify the one residual §7.3 leaves open, onto a broader credential.** That
+   is §7.3's *"A successor residual replaces the old one, and it is smaller but real"*, which
+   carries a live check-then-use gap: admission resolves a path, `gh` re-resolves it when
    it opens it, and the agent owns the shared `/tmp` in between. Whatever credential the broker
    holds is what that race leaks. Today that is the App installation token. `GH_SEAT_TOKEN_VALUE`'s
    documented instance is the `allyblockcast` **user** PAT, which `AGENTS.md` records as *broader
@@ -520,18 +535,21 @@ unilaterally, correctly, because §8 reserves it here.
    would widen the blast radius of a gap this document already declines to claim closed. That is
    backwards for a change whose entire purpose is to narrow credential reach.
 
-4. **§5's bar is not yet met for the credential already in the broker.** §7.3 item 4 records that
-   the `/etc/gitconfig` starvation assertion is outstanding and is a **precondition for discharge**.
+4. **§5's bar is not yet met for the credential already in the broker.** §7.3's *"The §5
+   starvation assertion is still outstanding, and it gates discharge"* records that the
+   `/etc/gitconfig` assertion is unmet and is a **precondition for discharge**.
    Adding a second, broader credential before the first one's starvation is *shown* rather than
    assumed is the §5 error at one remove.
 
 **What would release this.** All three, together — any one alone is not enough:
 
-- **(a)** §7.3 item 4 satisfied: a test asserts that a bare `/usr/bin/git push` from uid 1000 in a
-  brokered pod fails to authenticate.
-- **(b)** *Either* the §7.3 item 3 check-then-use residual closed — per-invocation mount namespace,
-  or a uid split between broker and child, both already reserved to Security by §8 — *or* the
-  credential proposed for routing shown to be no broader than the App installation it would join.
+- **(a)** §7.3's *"The §5 starvation assertion is still outstanding, and it gates discharge"*
+  satisfied: a test asserts that a bare `/usr/bin/git push` from uid 1000 in a brokered pod fails
+  to authenticate.
+- **(b)** *Either* the check-then-use residual of §7.3's *"A successor residual replaces the old
+  one, and it is smaller but real"* closed — per-invocation mount namespace, or a uid split between
+  broker and child, both already reserved to Security by §8 — *or* the credential proposed for
+  routing shown to be no broader than the App installation it would join.
 - **(c)** A non-zero count of seat-bound agents across **all** binding scopes, i.e. evidence that a
   real agent is actually blocked by the refusal. Build it when something needs it, not before.
 
