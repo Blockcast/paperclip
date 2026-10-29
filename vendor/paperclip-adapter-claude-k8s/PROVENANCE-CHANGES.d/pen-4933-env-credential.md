@@ -24,10 +24,16 @@ A `valueFrom` entry counts exactly as much as a literal one. Routing a value
 through a `secretKeyRef` changes where the Job stores it, not whether the
 process can read it out of its own environment.
 
-The four names are kept deliberately in step with `INHERITED_ENV_NAMES` in
-`github-publish-broker.ts` — the same set the broker hands to its own children
-as "the credential". A name the broker treats as a credential is a name the
-agent container must not carry.
+These four are a **superset** of the credential names the broker hands to its
+own children (`INHERITED_ENV_NAMES` in `github-publish-broker.ts` carries three:
+`GH_TOKEN`, `GITHUB_TOKEN`, `GITHUB_PERSONAL_ACCESS_TOKEN`). The extra one is
+`GH_SEAT_TOKEN_VALUE`, and the asymmetry is right in both directions: the broker
+has no reason to forward the seat token, while this check must refuse it —
+`gh-token-wrapper.sh` answers the system credential helper from it directly, so
+it is the exact delivery route this refusal exists for.
+
+They are kept in step in the one direction that matters: a name the broker
+treats as a credential is a name the agent container must not carry.
 
 ## Why
 

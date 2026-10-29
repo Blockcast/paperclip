@@ -2266,10 +2266,17 @@ const GITHUB_BROKER_UID = 1001;
  * of where the credential lives is required, which is PEN-3183 §4.0: the
  * control's own threat, accidental disclosure, not the deliberate one.
  *
- * The same four names the broker hands to its own children as "the credential"
- * ({@link INHERITED_ENV_NAMES} in `github-publish-broker.ts`). Kept in step
- * deliberately: a name the broker treats as a credential is a name the agent
- * container must not carry.
+ * A SUPERSET of the credential names the broker hands to its own children
+ * ({@link INHERITED_ENV_NAMES} in `github-publish-broker.ts`), which carries
+ * three: `GH_TOKEN`, `GITHUB_TOKEN`, `GITHUB_PERSONAL_ACCESS_TOKEN`. The extra
+ * one here is `GH_SEAT_TOKEN_VALUE`, and the asymmetry is correct in both
+ * directions: the broker has no reason to forward the seat token (its own
+ * token wrapper does not read it), while this check must refuse it, because
+ * `gh-token-wrapper.sh` answers the system credential helper from it directly
+ * — it is the delivery route this whole refusal exists for.
+ *
+ * Kept in step deliberately in the one direction that matters: a name the
+ * broker treats as a credential is a name the agent container must not carry.
  */
 const AGENT_GITHUB_CREDENTIAL_ENV_NAMES = [
   "GH_TOKEN",
