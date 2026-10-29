@@ -1270,6 +1270,75 @@ export const DEFERRED_ISSUE_EXECUTION_WAKE_OLDEST_AGE_METRIC =
   "paperclip_deferred_issue_execution_wake_oldest_age_seconds";
 export const DEFERRED_ISSUE_EXECUTION_WAKE_AGE_METRICS_REFRESH_SUCCESS_METRIC =
   "paperclip_deferred_issue_execution_wake_age_metrics_refresh_success";
+/**
+ * How each issue-create duplicate-candidate database touch resolved (PEN-5019).
+ *
+ * Duplicate detection runs *after* the issue row is committed, on a reserved
+ * connection under its own short `statement_timeout` -- 500 ms for the corpus
+ * scan, 1 s for the consumption event -- and EVERY failure is caught and logged
+ * at `warn`, so the create still answers `201` with an empty
+ * `duplicateCandidates`. The degradation is deliberate; being unable to see it
+ * was not. A blown budget and a scan that genuinely found no near-duplicate
+ * produce the same response body, and the only trace was a log line.
+ *
+ * The reason that gap matters beyond the feature itself: a blown budget also
+ * writes `canceling statement due to statement timeout` into the Postgres log,
+ * and THAT LINE CARRIES NO TIMEOUT VALUE -- it is byte-identical whether the
+ * 500 ms guard here fired or a statement ran into the 30 s role-level bound. 19
+ * of those lines over a 19 h window were read as 30 s stalls serving
+ * user-facing `503`s (PEN-5019 as filed); they are the guard working, on a
+ * request that answered `201`. `statement_timeout` on this counter accounts for
+ * the log line at its source, so the two no longer have to be told apart by
+ * reading SQL text out of a log tail.
+ *
+ * `stage` separates the two touches: they carry different budgets and
+ * different consequences. A lost `corpus_scan` costs the caller its duplicate
+ * advisory; a lost `consumption_event` costs only the `activity_log` row
+ * recording that advisories were shown.
+ *
+ * ⚠️ THE TWO STAGES DO NOT SHARE A DENOMINATOR, so do not read a shortfall
+ * between their totals as lost events. `corpus_scan` counts once per issue
+ * create. `consumption_event` is skipped entirely unless the scan actually
+ * found candidates AND the response was 2xx, so it is normally the far smaller
+ * number -- and on a fleet where most creates are not near-duplicates it is
+ * near zero for reasons that have nothing to do with health. Compare each stage
+ * against ITSELF over time, never against the other.
+ *
+ * Not alertable on raw non-zero: some `statement_timeout` volume is the
+ * intended cost of a tight advisory budget. The reading that matters is the
+ * RATIO of non-`ok` to total per `stage`, which answers "is duplicate detection
+ * actually running?" -- a question nothing could answer before this.
+ */
+export const ISSUE_DUPLICATE_CANDIDATE_LOOKUP_METRIC =
+  "paperclip_issue_duplicate_candidate_lookup_total";
+/** The two database touches {@link ISSUE_DUPLICATE_CANDIDATE_LOOKUP_METRIC} separates. */
+export const ISSUE_DUPLICATE_CANDIDATE_LOOKUP_STAGES = [
+  "corpus_scan",
+  "consumption_event",
+] as const;
+export type IssueDuplicateCandidateLookupStage =
+  (typeof ISSUE_DUPLICATE_CANDIDATE_LOOKUP_STAGES)[number];
+/**
+ * Closed outcome set for {@link ISSUE_DUPLICATE_CANDIDATE_LOOKUP_METRIC}.
+ *
+ * `statement_timeout` (Postgres cancelled the statement, `57014`) and
+ * `deadline_exceeded` (the in-process race rejected first) both mean "too
+ * slow", and are still kept apart on purpose: the first says the database was
+ * given the work and could not finish it inside the budget, the second says the
+ * budget elapsed in this process -- which also covers the statement never
+ * reaching Postgres at all. `connection_unavailable` is a third, earlier
+ * failure: no pooled connection could even be reserved, so the scan never ran
+ * and the database was never the constraint.
+ */
+export const ISSUE_DUPLICATE_CANDIDATE_LOOKUP_OUTCOMES = [
+  "ok",
+  "statement_timeout",
+  "deadline_exceeded",
+  "connection_unavailable",
+  "error",
+] as const;
+export type IssueDuplicateCandidateLookupOutcome =
+  (typeof ISSUE_DUPLICATE_CANDIDATE_LOOKUP_OUTCOMES)[number];
 // PEN-4652. An `in_review` issue with NO waiting path at all. The classifier
 // for this already exists and is correct -- `in_review_without_action_path` in
 // recovery/issue-graph-liveness.ts -- but its only consumer is the
@@ -5019,6 +5088,7 @@ let agentStartLockHeldSeconds: Gauge<"agent_id"> | null = null;
 let agentStartLockPhaseSeconds: Gauge<"agent_id" | "phase"> | null = null;
 let agentStartLockAbortedTotal: Counter<"agent_id"> | null = null;
 let duplicateDispatchSuppressedTotal: Counter | null = null;
+let issueDuplicateCandidateLookupTotal: Counter<"stage" | "outcome"> | null = null;
 let processLostTotal: Counter<"adapter" | "error_bucket" | "classification"> | null = null;
 let externalLifecycleRunningRuns: Gauge<"adapter"> | null = null;
 let externalLifecycleRunSilenceGap: Histogram<"adapter" | "status"> | null = null;
@@ -5300,6 +5370,7 @@ function ensureRegistry(): {
   agentStartLockPhaseSecondsGauge: Gauge<"agent_id" | "phase">;
   agentStartLockAbortedTotalCounter: Counter<"agent_id">;
   duplicateDispatchSuppressedCounter: Counter;
+  issueDuplicateCandidateLookupCounter: Counter<"stage" | "outcome">;
   prReviewQueueWaitHistogram: Histogram;
   runDispatchWaitHistogram: Histogram;
   authRequestCounter: Counter<"operation" | "outcome">;
@@ -5390,6 +5461,7 @@ function ensureRegistry(): {
     || !agentStartLockPhaseSeconds
     || !agentStartLockAbortedTotal
     || !duplicateDispatchSuppressedTotal
+    || !issueDuplicateCandidateLookupTotal
     || !processLostTotal
     || !externalLifecycleRunningRuns
     || !externalLifecycleRunSilenceGap
@@ -6494,6 +6566,35 @@ function ensureRegistry(): {
       labelNames: ["agent_id"],
       registers: [registry],
     });
+    issueDuplicateCandidateLookupTotal = new Counter({
+      name: ISSUE_DUPLICATE_CANDIDATE_LOOKUP_METRIC,
+      help:
+        "How each issue-create duplicate-candidate database touch resolved, by stage "
+        + "(corpus_scan, consumption_event) and outcome (PEN-5019). Both touches run after the "
+        + "issue is already committed, under their own short statement_timeout, and every failure "
+        + "is swallowed so the create still answers 201 with no advisories -- so a blown budget "
+        + "and a genuinely empty result were indistinguishable. statement_timeout here is the same "
+        + "event as a 'canceling statement due to statement timeout' line in the Postgres log, "
+        + "which carries NO timeout value and so cannot by itself be told apart from a 30 s "
+        + "role-level stall; that ambiguity is what made 19 of these read as user-facing 503s. Do "
+        + "NOT alert on raw non-zero -- some timeout volume is the intended cost of a tight "
+        + "advisory budget. Alert on the non-ok/total ratio per stage -- per stage, because "
+        + "the two do NOT share a denominator: corpus_scan counts once per issue create, while "
+        + "consumption_event is skipped unless that scan found candidates and the response was "
+        + "2xx, so consumption_event is normally far smaller and a shortfall between the two "
+        + "totals is not lost events.",
+      labelNames: ["stage", "outcome"],
+      registers: [registry],
+    });
+    // Same absent-vs-zero reasoning as the review-completion set: a labelled
+    // counter exports nothing until its first inc(), so `increase()` would miss
+    // the first timeout on a pod and a healthy fleet would render "No data"
+    // rather than 0 on the degradation panel. 10 constant-zero series.
+    for (const stage of ISSUE_DUPLICATE_CANDIDATE_LOOKUP_STAGES) {
+      for (const outcome of ISSUE_DUPLICATE_CANDIDATE_LOOKUP_OUTCOMES) {
+        issueDuplicateCandidateLookupTotal.inc({ stage, outcome }, 0);
+      }
+    }
     duplicateDispatchSuppressedTotal = new Counter({
       name: HEARTBEAT_DUPLICATE_DISPATCH_SUPPRESSED_METRIC,
       help:
@@ -8171,6 +8272,7 @@ function ensureRegistry(): {
     agentStartLockPhaseSecondsGauge: agentStartLockPhaseSeconds,
     agentStartLockAbortedTotalCounter: agentStartLockAbortedTotal,
     duplicateDispatchSuppressedCounter: duplicateDispatchSuppressedTotal,
+    issueDuplicateCandidateLookupCounter: issueDuplicateCandidateLookupTotal,
     processLostTotalCounter: processLostTotal,
     externalLifecycleRunningRunsGauge: externalLifecycleRunningRuns,
     externalLifecycleRunSilenceGapHistogram: externalLifecycleRunSilenceGap,
@@ -9240,6 +9342,20 @@ export function setDbInheritedTimeouts(settings: readonly DbInheritedTimeoutSett
  */
 export function recordAgentStartLockAborted(agentId: string): void {
   ensureRegistry().agentStartLockAbortedTotalCounter.inc({ agent_id: agentId });
+}
+
+/**
+ * Increment {@link ISSUE_DUPLICATE_CANDIDATE_LOOKUP_METRIC}.
+ *
+ * Call exactly once per duplicate-candidate database touch, on every path
+ * including success -- the denominator is what makes the timeout counts
+ * readable as a rate rather than raw volume that tracks issue-create traffic.
+ */
+export function recordIssueDuplicateCandidateLookup(
+  stage: IssueDuplicateCandidateLookupStage,
+  outcome: IssueDuplicateCandidateLookupOutcome,
+): void {
+  ensureRegistry().issueDuplicateCandidateLookupCounter.inc({ stage, outcome });
 }
 
 /** Increment {@link HEARTBEAT_DUPLICATE_DISPATCH_SUPPRESSED_METRIC}. Call once per landed cancel. */
@@ -11373,6 +11489,7 @@ export function __resetMetricsForTest(): void {
   agentStartLockPhaseSeconds = null;
   agentStartLockAbortedTotal = null;
   duplicateDispatchSuppressedTotal = null;
+  issueDuplicateCandidateLookupTotal = null;
   processOpenFdsByClass = null;
   processMemoryComponentBytes = null;
   processV8ContextCount = null;
