@@ -2833,8 +2833,69 @@ const AGENT_SCOPE_ONLY_CONFIG_KEYS = new Set([
   "enableGitHubPublishBroker",
 ]);
 
-function isAgentScopeOnlyConfigKey(key: string) {
-  return AGENT_SCOPE_ONLY_CONFIG_KEYS.has(key);
+// PEN-5017, added in review. Keys pinned to agent scope ONLY WHEN the broker
+// is on at agent scope, because that is exactly when they stop expressing a
+// preference and start deciding whether the broker's uid boundary means
+// anything.
+//
+// `enableDocker` renders the DinD sidecar, and that sidecar is
+// `privileged: true, runAsUser: 0` in the SAME POD as the broker. A privileged
+// root container defeats an in-pod uid boundary generally — it does not need
+// the credential volume mounted to reach uid 1001's filesystem — and the agent
+// container is handed the resulting docker socket, so it can start further
+// privileged containers with arbitrary host mounts. Pinning the broker's image
+// (see `brokerImage` in job-manifest.ts) stops an override choosing the code
+// *inside* the boundary; this stops one standing a privileged container up
+// *beside* it. `dockerImage` rides along because a pinned `enableDocker` with
+// an overridable image is a pin in name only.
+//
+// ⚠ This closes the LOWER-SCOPE route only. An operator who sets both
+// `enableDocker` and `enableGitHubPublishBroker` at agent scope still gets a
+// privileged root container beside the broker; that is an operator decision
+// about their own agent, and it is recorded as a residual in §7.5 of the
+// PEN-3183 decision record rather than refused here.
+//
+// The membership rule, so this stays a rule and not a list of incidents: WHEN
+// THE CREDENTIAL IS BROKERED, WHAT CODE RUNS IN THE POD AND AT WHAT PRIVILEGE
+// IS AGENT SCOPE'S TO DECIDE. `image` is deliberately NOT here — it is pinned
+// adapter-side for the broker container alone, which is strictly stronger and
+// leaves the agent container's image freely overridable. Add a key here when
+// it answers the question above and cannot be pinned at the point of use.
+//
+// ⚠ The cost, stated: an issue override cannot request docker on a
+// broker-enabled agent. That is a real capability loss. It is accepted because
+// it is narrow — `enableDocker` stays freely overridable for every agent not
+// running the broker, which is the whole fleet today — and because an agent
+// that needs docker for brokered work can have it set at agent scope, where an
+// operator sees it and accepts the residual above.
+const BROKERED_POD_COMPOSITION_CONFIG_KEYS = new Set([
+  "enableDocker",
+  "dockerImage",
+]);
+
+/**
+ * Is the publish broker on at AGENT scope?
+ *
+ * ⚠ Mirrors the adapter's own read exactly: `buildJobManifest` uses
+ * `asBoolean(config.enableGitHubPublishBroker, false)`, and `asBoolean` is
+ * strict — `typeof value === "boolean" ? value : fallback` — so a string
+ * `"true"` is `false` there and must be `false` here. If the two drift, this
+ * returns `false` for a pod the adapter does broker and the composition keys
+ * silently stop being pinned, which is the permissive direction.
+ *
+ * Read off `baseConfig`, not the merged config: the answer must not depend on
+ * an overlay. `enableGitHubPublishBroker` is itself pinned, so the two agree
+ * by construction — reading the base makes that independent of the order the
+ * keys happen to be visited in.
+ */
+function brokerEnabledAtAgentScope(baseConfig: Record<string, unknown>): boolean {
+  return baseConfig.enableGitHubPublishBroker === true;
+}
+
+/** The pinned key set for this run: the unconditional keys, plus the brokered-pod composition keys when the broker is on. */
+function agentScopeOnlyConfigKeysFor(baseConfig: Record<string, unknown>): ReadonlySet<string> {
+  if (!brokerEnabledAtAgentScope(baseConfig)) return AGENT_SCOPE_ONLY_CONFIG_KEYS;
+  return new Set([...AGENT_SCOPE_ONLY_CONFIG_KEYS, ...BROKERED_POD_COMPOSITION_CONFIG_KEYS]);
 }
 
 /**
@@ -2842,17 +2903,24 @@ function isAgentScopeOnlyConfigKey(key: string) {
  * dispatch path can log the attempt: the guard below is silent by design, and
  * a security boundary that quietly discards input is one an operator cannot
  * tell from one that was never tested.
+ *
+ * Takes `baseConfig` because the pinned set is run-dependent (see
+ * BROKERED_POD_COMPOSITION_CONFIG_KEYS) — the caller must report what was
+ * actually refused for THIS run, not what would be refused for some run.
  */
 export function agentScopeOnlyConfigKeyOverrides(
   overlayConfig: Record<string, unknown> | null | undefined,
+  baseConfig: Record<string, unknown>,
 ): string[] {
   if (!overlayConfig) return [];
-  return Object.keys(overlayConfig).filter(isAgentScopeOnlyConfigKey);
+  const pinned = agentScopeOnlyConfigKeysFor(baseConfig);
+  return Object.keys(overlayConfig).filter((key) => pinned.has(key));
 }
 
-// Post-condition: every AGENT_SCOPE_ONLY_CONFIG_KEY present in the merged
-// config holds exactly the baseConfig value, and any the baseConfig lacks is
-// absent. Both directions matter — introducing the key is how an agent would
+// Post-condition: every key pinned for THIS run — see
+// agentScopeOnlyConfigKeysFor, whose membership depends on whether the broker
+// is on at agent scope — holds exactly the baseConfig value in the merged
+// config, and any the baseConfig lacks is absent. Both directions matter — introducing the key is how an agent would
 // opt out of a boundary that is on, and deleting it is how one would opt out
 // of a default that is on because `asBoolean(config.x, false)` reads an absent
 // key as `false`.
@@ -2866,7 +2934,7 @@ function withAgentScopedConfigProvenance(
   baseConfig: Record<string, unknown>,
 ): Record<string, unknown> {
   let next: Record<string, unknown> | null = null;
-  for (const key of AGENT_SCOPE_ONLY_CONFIG_KEYS) {
+  for (const key of agentScopeOnlyConfigKeysFor(baseConfig)) {
     const baseHasKey = Object.prototype.hasOwnProperty.call(baseConfig, key);
     const mergedHasKey = Object.prototype.hasOwnProperty.call(merged, key);
     if (baseHasKey) {
@@ -34261,12 +34329,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // a boundary that held from one that was never reached. Warn, not error:
     // the run is correct, it is the input that was refused.
     const refusedAgentScopeOnlyConfigKeys = [
-      ...agentScopeOnlyConfigKeyOverrides(issueAssigneeOverrides?.adapterConfig ?? null).map(
-        (key) => ({ key, source: "issue_assignee_adapter_overrides" as const }),
-      ),
-      ...agentScopeOnlyConfigKeyOverrides(modelProfileApplication.adapterConfig).map(
-        (key) => ({ key, source: "model_profile" as const }),
-      ),
+      ...agentScopeOnlyConfigKeyOverrides(
+        issueAssigneeOverrides?.adapterConfig ?? null,
+        workspaceManagedConfig,
+      ).map((key) => ({ key, source: "issue_assignee_adapter_overrides" as const })),
+      ...agentScopeOnlyConfigKeyOverrides(
+        modelProfileApplication.adapterConfig,
+        workspaceManagedConfig,
+      ).map((key) => ({ key, source: "model_profile" as const })),
     ];
     if (refusedAgentScopeOnlyConfigKeys.length > 0) {
       logger.warn(

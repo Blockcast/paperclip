@@ -823,11 +823,42 @@ of service this section declines above. Pinned by three cases in
 `job-manifest.github-publish-broker.test.ts`, including a positive control that the broker still
 *tracks* the agent image rather than being frozen to a constant.
 
+**A third route, closed the same day: a privileged container standing *beside* the broker.**
+Pinning the gate and the broker's image both answer "what code runs inside the boundary". Neither
+answers "what else is in the pod". `enableDocker` renders the DinD sidecar as
+`privileged: true, runAsUser: 0` in the **same pod** as the broker, and the agent container is
+handed the resulting docker socket — so it can start further privileged containers with arbitrary
+host mounts. A privileged root container defeats an in-pod uid boundary generally; it never needs
+the credential volume mounted to read uid 1001's filesystem. Read off the merged config,
+`enableDocker` was issue-settable, so the boundary was declinable by a third sibling key.
+
+`enableDocker` and `dockerImage` are therefore pinned to agent scope **while the gate is on**, by
+the same merge guard (`BROKERED_POD_COMPOSITION_CONFIG_KEYS`). `dockerImage` rides along because a
+pinned `enableDocker` with an overridable image is a pin in name only. The pin is conditional for
+the same reason the rest of this section is narrow: `enableDocker` stays freely overridable for
+every agent not running the broker, which is the whole fleet today, so no current run changes. The
+cost is stated and real — an issue override cannot request docker on a broker-enabled agent.
+
+The membership rule is written at the list so this stays a rule rather than a list of remembered
+incidents: **when the credential is brokered, what code runs in the pod and at what privilege is
+agent scope's to decide.** `image` is deliberately not in that set — it is pinned at the point of
+use instead, which is stronger and leaves the agent container's image alone.
+
+⚠ **Residual, not closed: agent-scope docker.** An operator who sets *both* `enableDocker` and
+`enableGitHubPublishBroker` on the same agent still gets a privileged root container beside the
+broker, and the uid-1001 boundary does not hold against it. That is an operator decision about
+their own agent rather than a principal declining a boundary, so it is recorded here rather than
+refused at render — but it means **"brokered" and "docker-enabled" together do not deliver D1's
+property**, and the stage-1 owner (PEN-5016) should either exclude such agents from the soak or
+accept it explicitly. It is not detectable from any current metric.
+
 ⚠ **Scope of the claim, stated so it is not read wider than it is.** What is now agent-scope-only
-is the **gate key** and the **broker's image**. The rendered broker boundary *as a whole* is not,
+is the **gate key**, the **broker's image**, and — while the gate is on — `enableDocker` /
+`dockerImage`. The rendered broker boundary *as a whole* is not,
 and this document should not be cited as saying so: `AGENT_SCOPE_ONLY_CONFIG_KEYS` is a list, the
-`image` route above was found by review rather than by the list, and the `workspaceVolumeClaim`
-route in ground 1 is open. Two keys are closed; the class is not.
+`image` and `enableDocker` routes above were both found by review rather than by the list, and
+the `workspaceVolumeClaim` route in ground 1 is open. Four keys are closed; the class is not, and
+the agent-scope docker residual below is open by decision.
 
 **The audit half.** `enableGitHubPublishBroker` is now in the adapter's `getConfigSchema()`, so the
 state of a credential boundary is legible to a reviewer looking at the agent rather than only to
