@@ -4548,13 +4548,22 @@ describe("scoped writable mounts (BLO-32734)", () => {
   });
 
   // Phase 2b: the PVC root is the server's home. Credential dirs and foreign
-  // worktrees there must resolve to the per-pod root overlay; only the
-  // toolchain allowlist reaches the shared volume, read-only.
-  it("hides the PVC root behind the root overlay except the read-only toolchain", () => {
+  // worktrees there must resolve to the per-pod root overlay.
+  //
+  // PEN-4932 stage 3: the fleet-wide toolchain joined them. `bin`, `tools`,
+  // `jre`, `.local/bin`, `.bun/bin` and `.cache/puppeteer-browsers` used to be
+  // re-exposed read-only off the shared volume and are now behind the overlay
+  // like everything else, so the binaries they shadowed resolve to the image.
+  // They are listed as their two coupled removal units rather than as six
+  // independent paths, because `bin` holds symlinks INTO `tools`, `jre` and
+  // `.cache/puppeteer-browsers`, and `.local/bin/bunx` into `.bun/bin` — a
+  // regression that re-added one target without its `bin` entry would leave a
+  // dangling symlink, and this test should fail on the unit, not on one path.
+  it("hides the PVC root behind the root overlay except the read-only git hooks", () => {
     const { job } = buildJobManifest({ ctx: isolatedCtx(), selfPod: makeSelfPod() });
     const spec = job.spec?.template?.spec;
     expect(spec?.volumes?.find((v) => v.name === "root-overlay")?.emptyDir).toBeTruthy();
-    const unreachable = [
+    const credentialsAndForeignWork = [
       "/paperclip/.ssh/id_ed25519",
       "/paperclip/.kube/config",
       "/paperclip/.secrets/x",
@@ -4564,17 +4573,27 @@ describe("scoped writable mounts (BLO-32734)", () => {
       "/paperclip/wt-pen1234/README.md",
       "/paperclip/.mcp.json",
     ];
-    const toolchain = ["/paperclip/bin/go", "/paperclip/tools/go1.25.6/bin/go", "/paperclip/.local/bin/trivy"];
+    // Unit 1: `bin` plus every directory `bin` symlinks into.
+    const droppedBinUnit = [
+      "/paperclip/bin/go",
+      "/paperclip/tools/go1.25.6/bin/go",
+      "/paperclip/jre/bin/java",
+      "/paperclip/.cache/puppeteer-browsers/chrome/linux-149.0.7827.54/chrome",
+    ];
+    // Unit 2: `.local/bin` plus the directory `.local/bin/bunx` symlinks into.
+    const droppedLocalBinUnit = ["/paperclip/.local/bin/trivy", "/paperclip/.bun/bin/bun"];
     for (const container of [spec?.containers[0], spec?.initContainers?.[0]]) {
       const mounts = container?.volumeMounts ?? [];
-      for (const target of unreachable) {
+      for (const target of [...credentialsAndForeignWork, ...droppedBinUnit, ...droppedLocalBinUnit]) {
         expect(deepestMount(mounts, target)?.name, target).toBe("root-overlay");
       }
-      for (const target of toolchain) {
-        const seen = deepestMount(mounts, target);
-        expect(seen?.name, target).toBe("data");
-        expect(seen?.readOnly, target).toBe(true);
-      }
+      // The PEN-3156 publish guard is the one survivor, and must stay a
+      // read-only bind off the shared volume until it is baked into the image
+      // (§3.6). A rw bind would let uid 1000 rewrite the hook the credential
+      // holder executes; no bind at all fails OPEN, pushing unscanned.
+      const hook = deepestMount(mounts, "/paperclip/.local/share/paperclip-git-hooks/pre-push");
+      expect(hook?.name).toBe("data");
+      expect(hook?.readOnly).toBe(true);
     }
   });
 
