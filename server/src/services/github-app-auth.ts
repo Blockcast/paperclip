@@ -409,6 +409,117 @@ export async function githubListOpenPullRequestsByBase(input: {
   return parseOpenPullRequestsOnBasePayload(await res.json().catch(() => null));
 }
 
+export type OpenPullRequestAtHead = { number: number; url: string | null };
+
+export type OpenPullRequestsAtHeadResult = { pullRequests: OpenPullRequestAtHead[] } | { error: string };
+
+const OPEN_PRS_AT_HEAD_PAGE_SIZE = 100;
+const OPEN_PRS_AT_HEAD_HARD_LIMIT_PAGES = 10;
+
+/**
+ * Pure payload parse, split from the fetch for the same injection-seam reason
+ * as `parseOpenPullRequestsOnBasePayload`.
+ *
+ * Filters on BOTH `state === "open"` and `head.sha === sha`, and neither
+ * predicate is redundant:
+ *
+ * - `GET /commits/{sha}/pulls` returns every pull request this commit is
+ *   *associated* with, which includes closed and merged ones. A verdict is only
+ *   a property of the heads that can still merge, and a closed PR's stale red
+ *   would pin an open sibling red forever with no lever to clear it.
+ * - It also returns a PR that merely *contains* the commit somewhere in its
+ *   branch, not only one whose head it is. A status is written at one SHA and
+ *   read as that tree's verdict, so a review of a LATER head says nothing about
+ *   this one; crediting it would let a descendant's finding redden an ancestor
+ *   that nobody has reviewed, and a descendant's clean review hide a finding
+ *   raised here.
+ *
+ * A malformed body is an error, never an empty page — the same refusal as
+ * `parseOpenPullRequestsOnBasePayload`, and load-bearing here: the one caller
+ * reads "no peers" as licence to publish its own verdict unchanged.
+ */
+export function parseOpenPullRequestsAtHeadPayload(body: unknown, sha: string): OpenPullRequestsAtHeadResult {
+  if (!Array.isArray(body)) return { error: "open_pull_requests_at_head_malformed" };
+
+  const pullRequests: OpenPullRequestAtHead[] = [];
+  for (const entry of body as Array<Record<string, unknown>>) {
+    const number = entry?.number;
+    if (!Number.isInteger(number)) continue;
+    if (entry?.state !== "open") continue;
+    const head = entry?.head as Record<string, unknown> | undefined;
+    if (typeof head?.sha !== "string" || head.sha.toLowerCase() !== sha.toLowerCase()) continue;
+    pullRequests.push({
+      number: number as number,
+      url: typeof entry?.html_url === "string" ? entry.html_url : null,
+    });
+  }
+  return { pullRequests };
+}
+
+/**
+ * Every OPEN pull request whose head is exactly `sha` (PEN-3818).
+ *
+ * A commit status is keyed by SHA; a review verdict is computed from one pull
+ * request's review history. Those two scopes are not the same, and nothing
+ * reconciled them: opening any pull request at another PR's head SHA published
+ * that new PR's verdict — legitimately fail-open, since nothing has reviewed
+ * it — over the victim's red findings gate. Reproduced against production on
+ * 2026-10-05 with one `gh pr create`, and it does not self-heal: closing the
+ * probe PR and deleting its branch left the false green standing.
+ *
+ * This enumeration is what lets the publisher ask the SHA-scoped question
+ * instead of the PR-scoped one. It is NOT the ordering fix that row proposed
+ * first: evaluations of one head are already serialized cross-process by
+ * `withGithubStatusDeliveryLock`, which is keyed `repo#headSha`. Ordering was
+ * never the defect — with perfect serialization the wrong PR still wins, it
+ * just wins last.
+ *
+ * Fails closed, and the distinction carries real weight here. An unreadable
+ * enumeration is NOT an empty one: coercing a failed read to "no peers" would
+ * restore exactly the fail-open this exists to close, and would do it on the
+ * quiet path where no status changes state. The caller must refuse to publish
+ * and let the next webhook re-evaluate.
+ */
+export async function githubListOpenPullRequestsForHeadSha(input: {
+  repoFullName: string;
+  sha: string;
+  signal?: AbortSignal;
+}): Promise<OpenPullRequestsAtHeadResult> {
+  const token = await getInstallationToken(Date.now(), { signal: input.signal });
+  if (!token) return { error: "open_pull_requests_at_head_no_token" };
+  const headers = { ...GITHUB_API_HEADERS, authorization: `Bearer ${token}` };
+  const apiBase = gitHubApiBase(GITHUB_HOST);
+  const pullRequests: OpenPullRequestAtHead[] = [];
+
+  try {
+    for (let page = 1; page <= OPEN_PRS_AT_HEAD_HARD_LIMIT_PAGES; page += 1) {
+      const url =
+        `${apiBase}/repos/${input.repoFullName}/commits/${encodeURIComponent(input.sha)}/pulls` +
+        `?per_page=${OPEN_PRS_AT_HEAD_PAGE_SIZE}&page=${page}`;
+      const res = await ghFetch(url, { headers, signal: input.signal });
+      if (!res.ok) {
+        const classified = await classifyGithubHttpFailure("pull_request", res);
+        return { error: classified.reason };
+      }
+      const body = (await res.json().catch(() => null)) as unknown;
+      const parsed = parseOpenPullRequestsAtHeadPayload(body, input.sha);
+      if ("error" in parsed) return parsed;
+      pullRequests.push(...parsed.pullRequests);
+      // Paginate on the RAW page length, not on the filtered count: the filters
+      // above drop closed and non-head rows, so a full page can contribute zero
+      // open peers and still be followed by a page that contributes several.
+      if (!Array.isArray(body) || body.length < OPEN_PRS_AT_HEAD_PAGE_SIZE) return { pullRequests };
+    }
+    // Ran out of pages rather than running out of results. A truncated
+    // enumeration cannot support "no other PR at this head is red", so it is an
+    // error, not a prefix — same reason the comment pagination hard limit
+    // returns null rather than what it had.
+    return { error: "open_pull_requests_at_head_truncated" };
+  } catch {
+    return { error: "open_pull_requests_at_head_fetch_failed" };
+  }
+}
+
 export type BranchState = "exists" | "deleted" | "unknown";
 
 /**

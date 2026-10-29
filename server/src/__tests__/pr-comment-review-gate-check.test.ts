@@ -23,6 +23,7 @@ const mockFetchPrAuthor = vi.hoisted(() => vi.fn());
 const mockFetchCommitAuthorEmail = vi.hoisted(() => vi.fn());
 const mockPostStatus = vi.hoisted(() => vi.fn());
 const mockPostCheckRun = vi.hoisted(() => vi.fn());
+const mockListOpenPrsAtHead = vi.hoisted(() => vi.fn());
 const mockStatusDeliveryLock = vi.hoisted(() => vi.fn());
 
 // Only the network calls are mocked. The identity predicates are imported for
@@ -38,6 +39,7 @@ vi.mock("../services/github-app-auth.js", async (importOriginal) => ({
   githubListPrReviewsWithTimestamps: mockListReviews,
   githubPostCommitStatusDetailed: mockPostStatus,
   githubPostCheckRun: mockPostCheckRun,
+  githubListOpenPullRequestsForHeadSha: mockListOpenPrsAtHead,
 }));
 
 vi.mock("../services/github-status-delivery-outbox.js", () => ({
@@ -97,6 +99,7 @@ beforeEach(() => {
   mockFetchCommitAuthorEmail.mockReset();
   mockPostStatus.mockReset();
   mockPostCheckRun.mockReset();
+  mockListOpenPrsAtHead.mockReset();
   mockStatusDeliveryLock.mockReset();
   mockStatusDeliveryLock.mockImplementation(async (_db, _key, operation) => operation());
   // Default both surfaces to empty; each test overrides the one it exercises.
@@ -116,6 +119,14 @@ beforeEach(() => {
     throw new Error("githubFetchCommitAuthorEmail: this case declares a reviewer lane and did not stub the fetch");
   });
   mockPostCheckRun.mockResolvedValue({ ok: true, statusCode: 201 });
+  // The ordinary shape: this PR is the only open one at its head, so the
+  // SHA-scoped sweep (PEN-3818) finds no peer and leaves the verdict alone.
+  // Stubbed as a DEFAULT rather than per-case because the sweep runs on every
+  // `success`, and an unstubbed enumeration would fail closed and silently turn
+  // each of this suite's green cases into `fetch_failed`.
+  mockListOpenPrsAtHead.mockResolvedValue({
+    pullRequests: [{ number: TARGET.prNumber, url: TARGET.prUrl }],
+  });
 });
 
 afterEach(() => {
@@ -581,6 +592,166 @@ describe("runPrCommentReviewGateCheck", () => {
     });
     expect(mockPostStatus).not.toHaveBeenCalled();
   }, 10_000);
+
+  // ── PEN-3818: the verdict is a property of the SHA, not of one pull request ──
+  //
+  // A commit status is keyed by SHA; the verdict was computed from one PR's
+  // review history. Opening any PR at a victim's head SHA therefore published
+  // that new PR's legitimately fail-open green over the victim's red findings
+  // gate. Reproduced against production on 2026-10-05 with one `gh pr create`,
+  // and it did not self-heal — closing the probe PR left the false green
+  // standing.
+  describe("SHA-scoped verdict (PEN-3818)", () => {
+    const PROBE_PR = { number: 2247, url: "https://github.com/Blockcast/paperclip/pull/2247" };
+    const VICTIM_PR = { number: 2202, url: "https://github.com/Blockcast/paperclip/pull/2202" };
+
+    it("refuses to clear a peer PR's red findings gate from a probe PR at the same head", async () => {
+      // The exact reproduction. The probe is #2247: brand new, no review of any
+      // kind, so its own history reaches "No Ally consolidated-review comment
+      // attests to reviewing this head" — a true statement about #2247 and a
+      // `success`. #2202 shares the head and carries an unresolved finding.
+      mockListOpenPrsAtHead.mockResolvedValue({ pullRequests: [PROBE_PR, VICTIM_PR] });
+      mockListComments.mockImplementation(async ({ prNumber }: { prNumber: number }) =>
+        prNumber === VICTIM_PR.number ? [blockingCommentFor(TARGET.headSha)] : [],
+      );
+      mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
+
+      const result = await runPrCommentReviewGateCheck({
+        ...TARGET,
+        prNumber: PROBE_PR.number,
+        prUrl: PROBE_PR.url,
+      });
+
+      expect(result).toMatchObject({ posted: true, verdict: { state: "failure" } });
+      expect(mockPostStatus).toHaveBeenCalledWith(
+        expect.objectContaining({
+          sha: TARGET.headSha,
+          context: "review/ally-comment-gate",
+          state: "failure",
+          // Retargeted at the PR whose review justifies the red, so a reader
+          // following the status lands on #2202 and not on the throwaway that
+          // happened to evaluate last.
+          targetUrl: VICTIM_PR.url,
+        }),
+      );
+    });
+
+    it("retargets every artifact at this head, not only the commit status", async () => {
+      h.cfg.prCommentReviewGateRetiredStatusContexts = ["review/ally-comment"];
+      mockListOpenPrsAtHead.mockResolvedValue({ pullRequests: [PROBE_PR, VICTIM_PR] });
+      mockListComments.mockImplementation(async ({ prNumber }: { prNumber: number }) =>
+        prNumber === VICTIM_PR.number ? [blockingCommentFor(TARGET.headSha)] : [],
+      );
+      mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
+
+      await runPrCommentReviewGateCheck({ ...TARGET, prNumber: PROBE_PR.number, prUrl: PROBE_PR.url });
+
+      // The retired context is mirrored from the same verdict, so it must carry
+      // the adopted red too: it may still be the required check somewhere
+      // (BLO-26602), and leaving it green there would reopen the bypass through
+      // the legacy context.
+      expect(mockPostStatus).toHaveBeenCalledWith(
+        expect.objectContaining({ context: "review/ally-comment", state: "failure", targetUrl: VICTIM_PR.url }),
+      );
+      for (const call of mockPostCheckRun.mock.calls) {
+        expect(call[0]).toMatchObject({ sha: TARGET.headSha, detailsUrl: VICTIM_PR.url });
+      }
+    });
+
+    it("leaves a lone PR's green exactly as it was", async () => {
+      // The overwhelmingly common case, and the regression guard: with no peer
+      // at this head the sweep must be invisible.
+      mockListOpenPrsAtHead.mockResolvedValue({ pullRequests: [{ number: TARGET.prNumber, url: TARGET.prUrl }] });
+      mockListComments.mockResolvedValue([cleanCommentFor(TARGET.headSha)]);
+      mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
+
+      await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({
+        posted: true,
+        verdict: { state: "success" },
+      });
+      expect(mockPostStatus).toHaveBeenCalledWith(
+        expect.objectContaining({ state: "success", targetUrl: TARGET.prUrl }),
+      );
+      // Only this PR's own two surfaces were read.
+      expect(mockListComments).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not sweep when its own verdict is already red", async () => {
+      // A `failure` is the strictest outcome this gate has, so no peer could
+      // change it. Skipping the sweep keeps the red path at its current cost and
+      // its current failure surface — a red going silent is the one outcome this
+      // module must never produce.
+      mockListComments.mockResolvedValue([blockingCommentFor(TARGET.headSha)]);
+      mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
+
+      await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toMatchObject({
+        posted: true,
+        verdict: { state: "failure" },
+      });
+      expect(mockListOpenPrsAtHead).not.toHaveBeenCalled();
+    });
+
+    it("withholds the green when the peer enumeration cannot be read", async () => {
+      // Fails CLOSED, and the direction matters: coercing an unreadable
+      // enumeration to "no peers" restores the whole bypass on the quiet path
+      // where no status changes state. Not publishing leaves the prior verdict
+      // standing and the next webhook re-evaluates.
+      mockListOpenPrsAtHead.mockResolvedValue({ error: "pull_request_http_403" });
+      mockListComments.mockResolvedValue([]);
+      mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
+
+      await expect(runPrCommentReviewGateCheck(TARGET)).resolves.toEqual({
+        posted: false,
+        reason: "fetch_failed",
+      });
+      expect(mockPostStatus).not.toHaveBeenCalled();
+    }, 10_000);
+
+    it("withholds the green when a peer's own review history cannot be read", async () => {
+      // An unreadable peer is not a clean one. Same refusal, same reason.
+      mockListOpenPrsAtHead.mockResolvedValue({ pullRequests: [PROBE_PR, VICTIM_PR] });
+      mockListComments.mockImplementation(async ({ prNumber }: { prNumber: number }) =>
+        prNumber === VICTIM_PR.number ? null : [],
+      );
+      mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
+
+      await expect(
+        runPrCommentReviewGateCheck({ ...TARGET, prNumber: PROBE_PR.number, prUrl: PROBE_PR.url }),
+      ).resolves.toEqual({ posted: false, reason: "fetch_failed" });
+      expect(mockPostStatus).not.toHaveBeenCalled();
+    }, 10_000);
+
+    it("keeps a green when the only peer at this head is green too", async () => {
+      // Strictest-wins, not peer-exists-wins: a sibling PR at the same head
+      // whose review is clean must not redden anything.
+      mockListOpenPrsAtHead.mockResolvedValue({ pullRequests: [PROBE_PR, VICTIM_PR] });
+      mockListComments.mockResolvedValue([cleanCommentFor(TARGET.headSha)]);
+      mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
+
+      await expect(
+        runPrCommentReviewGateCheck({ ...TARGET, prNumber: PROBE_PR.number, prUrl: PROBE_PR.url }),
+      ).resolves.toMatchObject({ posted: true, verdict: { state: "success" } });
+      expect(mockPostStatus).toHaveBeenCalledWith(
+        expect.objectContaining({ state: "success", targetUrl: PROBE_PR.url }),
+      );
+    });
+
+    it("ignores a peer whose head is a different commit", async () => {
+      // The enumeration endpoint returns every PR the commit is associated
+      // with, including ones that merely contain it. A review of a LATER head
+      // says nothing about this tree, so only exact-head peers may contribute —
+      // the filter lives in `parseOpenPullRequestsAtHeadPayload`, and this
+      // pins that the gate does not re-admit what the parser dropped.
+      mockListOpenPrsAtHead.mockResolvedValue({ pullRequests: [PROBE_PR] });
+      mockListComments.mockResolvedValue([]);
+      mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
+
+      await expect(
+        runPrCommentReviewGateCheck({ ...TARGET, prNumber: PROBE_PR.number, prUrl: PROBE_PR.url }),
+      ).resolves.toMatchObject({ posted: true, verdict: { state: "success" } });
+      expect(mockListComments).toHaveBeenCalledTimes(1);
+    });
+  });
 });
 
 // BLO-29711 AC#1. The gate moved off `review/ally-comment` to

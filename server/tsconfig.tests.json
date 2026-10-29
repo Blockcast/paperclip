@@ -7,6 +7,7 @@
     "noEmit": true
   },
   "include": [
+    "src/__tests__/open-pull-requests-at-head.test.ts",
     "src/__tests__/rss-release-tracker.test.ts",
     "src/__tests__/rss-release-gc-attribution.test.ts",
     "src/types/express.d.ts",
