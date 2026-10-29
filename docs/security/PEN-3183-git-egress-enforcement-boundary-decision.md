@@ -774,6 +774,13 @@ agent/base value, and one the base lacks is absent. Three grounds.
    one.** Any actor able to assign an issue could park the key on an issue assigned to *another*
    agent and fail every dispatch of it at manifest build. Discarding the overlay renders the pod
    exactly as agent scope specifies and strands nobody.
+   ⚠ **That argument is about *this key*, and does not generalise to the merged config.** A sibling
+   key already reaches a refusal: `workspaceVolumeClaim` feeds `narrowWritableSurface`, and a
+   foreign claim makes `buildJobManifest` throw on the broad-data-mount check once the broker is
+   on. That is fail-closed — no confidentiality loss — but it is the same per-issue denial of
+   service, reached by a different key, and **it becomes reachable at D1 stage 1**. It is named
+   here rather than fixed: it is an availability fault behind a gate that is off everywhere, and
+   the stage-1 owner (PEN-5016) is the right place to decide whether it blocks enablement.
 
 2. **§7.4's "fail closed and loud at render, or do not change it" is not on point here, and was
    cited as if it were.** That sentence governs silently *stripping* a credential, so that publish
@@ -787,14 +794,40 @@ agent/base value, and one the base lacks is absent. Three grounds.
    agent, issue and refused keys, for both the issue and model-profile routes. That is the "loud"
    half, without the denial of service.
 
-**Stated weakness: this is a list, and a list is as complete as its last edit.** It is mitigated,
-not removed — the membership is pinned by a test so adding or removing a key is a deliberate act
+**Stated weakness: this is a list, and a list is as complete as its last edit.** The `image`
+finding above is that weakness firing on the first try — review caught a key the list did not, in
+the same change that introduced the list. It is mitigated, not removed — the membership is pinned by a test so adding or removing a key is a deliberate act
 with a diff on it, and the maintenance rule is written at the list ("a key belongs here when it
 decides where a credential lands, what uid runs it, or whether a refusal fires"). An allowlist of
 issue-settable keys would be structurally stronger and was considered; it was not taken because the
 live set of keys issue overrides legitimately carry has not been measured, and guessing it would
 break `modelProfile` and workspace selection, which this change deliberately leaves alone. Build
 the allowlist when that measurement exists.
+
+**A sibling key defeated the same boundary, and is closed here too (found by Ally reviewing the
+fix, 2026-10-29).** Pinning the gate is not sufficient on its own. `image` is read off the *same*
+merged config, and `buildJobManifest` hands it to the broker sidecar — which execs
+`paperclip-github-token-env` and the broker runtime JS **out of that image** with the push
+credential in its environment. So an issue override could leave `enableGitHubPublishBroker` pinned
+exactly as intended and still choose the code that runs at uid 1001 holding the token. The gate
+would have held and the boundary would not.
+
+It is closed adapter-side rather than by a second list entry: the broker now renders from
+`ctx.agent.adapterConfig` — the agent row *before* any merge, which is the one image value in that
+function with agent provenance — while the agent container keeps the merged value. That asymmetry
+is deliberate and is the point of D1: a brokered agent container holds no credential, so what it
+runs is its own business; only the credential-holding container must run operator-chosen code.
+Divergence between the two is allowed rather than refused, because a socket-protocol mismatch
+fails loudly at publish time with no credential in it, whereas throwing would re-create the denial
+of service this section declines above. Pinned by three cases in
+`job-manifest.github-publish-broker.test.ts`, including a positive control that the broker still
+*tracks* the agent image rather than being frozen to a constant.
+
+⚠ **Scope of the claim, stated so it is not read wider than it is.** What is now agent-scope-only
+is the **gate key** and the **broker's image**. The rendered broker boundary *as a whole* is not,
+and this document should not be cited as saying so: `AGENT_SCOPE_ONLY_CONFIG_KEYS` is a list, the
+`image` route above was found by review rather than by the list, and the `workspaceVolumeClaim`
+route in ground 1 is open. Two keys are closed; the class is not.
 
 **The audit half.** `enableGitHubPublishBroker` is now in the adapter's `getConfigSchema()`, so the
 state of a credential boundary is legible to a reviewer looking at the agent rather than only to
