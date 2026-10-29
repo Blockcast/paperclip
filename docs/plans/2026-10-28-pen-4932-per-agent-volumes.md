@@ -211,9 +211,11 @@ alone breaks the symlink. On unshadow, `java` resolves to `/usr/bin/java` →
 entirely image-resident: `readlink -f` leaves `/paperclip` altogether. (The PVC `jre` is 21.0.11,
 so this is the upgrade §3.3 predicted, now confirmed end-to-end rather than by version string.)
 
-**3. `.cache/puppeteer-browsers` is already unreachable.** `PUPPETEER_CACHE_DIR` and
-`PUPPETEER_CONFIG_DIR` are both `/opt/puppeteer` — an image path, not this mount — so nothing
-resolves a browser through the PVC. The mount holds Chrome `linux-149.0.7827.54`: the same stale
+**3. `.cache/puppeteer-browsers` is not reached through `PUPPETEER_*` — only via the shadowed `bin/google-chrome` symlink (item 4).** `PUPPETEER_CACHE_DIR` and
+`PUPPETEER_CONFIG_DIR` are both `/opt/puppeteer` — an image path, not this mount — so no
+*browser-launcher* lookup reaches the PVC, and bare `google-chrome` resolves to the
+`/usr/local/libexec/paperclip/bin` shim at `PATH` position 1 rather than here. The directory is
+still a symlink *target* of `bin/google-chrome`, which is why item 4 groups it with `bin`. The mount holds Chrome `linux-149.0.7827.54`: the same stale
 149 §3.2 identifies as the PEN-4682 hazard. Dropping it removes a copy nothing reads.
 ⚠️ Noted in passing and explicitly **not** this issue's to fix: `/opt/puppeteer` does not exist in
 the image either, so both variables point at nothing. That is pre-existing and orthogonal to the
@@ -294,7 +296,7 @@ PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verificati
    BLO-33382, where a ~30 s `paperclip-api` restart returned 503 and permanently dropped the bump
    for three consecutive commits — has since been **fixed in the step itself**: it now retries
    connection failures and 5xx up to 5× with backoff and then `exit 1`s
-   (`.github/workflows/docker-agent.yml`, the `bump_company` helper). Do not cite it as a live
+   (`.github/workflows/docker-agent.yml`, the `post_bump()` helper — `:550` at `fbf3ca8d`). Do not cite it as a live
    defect. Two reasons to verify survive that fix, both still present today:
 
    - with no `PAPERCLIP_AGENT_BUMP_TOKEN` the step emits `::warning` and `exit 0` — a **green build
