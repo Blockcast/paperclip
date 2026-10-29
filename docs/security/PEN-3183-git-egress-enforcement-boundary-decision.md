@@ -1066,13 +1066,33 @@ agent/base value, and one the base lacks is absent. Three grounds.
    agent and fail every dispatch of it at manifest build. Discarding the overlay renders the pod
    exactly as agent scope specifies and strands nobody.
    ⚠ **That argument is about *this key*, and does not generalise to the merged config.** A sibling
-   key already reaches a refusal: `workspaceVolumeClaim` feeds `narrowWritableSurface`, and a
+   key already reached a refusal: `workspaceVolumeClaim` feeds `narrowWritableSurface`, and a
    foreign claim makes `buildJobManifest` throw on the broad-data-mount check once the broker is
    on. That is fail-closed — no confidentiality loss — but it is the same per-issue denial of
-   service, reached by a different key, and **it becomes reachable at D1 stage 1**. It is named
-   here rather than fixed: it is an availability fault behind a gate that is off everywhere, and
-   the stage-1 owner (PEN-5016) is the right place to decide whether it blocks enablement. Owned
-   as **PEN-5027**, so the decision has a holder rather than only this paragraph.
+   service, reached by a different key, and it would have become reachable at D1 stage 1. So what
+   this ground buys is **not adding a new denial of service**, not the absence of one. Owned as
+   **PEN-5027** and now closed there, before stage 1 rather than during it: the key is pinned to
+   agent provenance by the same conditional guard as the composition keys below
+   (`BROKERED_POD_COMPOSITION_CONFIG_KEYS`), so a lower-scope claim is discarded and logged
+   instead of reaching the throw. The CTO disposition refused acceptance on cost asymmetry rather
+   than severity — a Job that never renders presents as *"dispatch broke when we enabled the
+   broker"*, the misattribution most likely to force the §7.3 rollback, and stage 1 exists to
+   produce a readable signal from one agent.
+
+   ⚠ **An environment-supplied claim still wins, and that is a property of the site, not of the
+   list.** The environment's `K8sRemoteSpec` is the only legitimate writer of this key, and the
+   environment overlay is applied *downstream* of this merge — `mergeEnvironmentConfig` in the
+   claude-k8s adapter's `execute.ts` runs over the config `mergeModelProfileAdapterConfig`
+   returns, and lets non-null environment fields win. Pinned by a test that composes the two real
+   functions in that order, because a refactor moving the guard below the overlay would break
+   every deployment whose data claim comes from its environment while the unit tests on either
+   function alone still passed.
+
+   ⚠ **Not closed, and deliberately: `resolveJobIsolation`'s descriptor-absent fallback to
+   `SHARED_JOB_ISOLATION` reaches the same throw by a route no provenance pin touches.** That is
+   not an override at all, so no merge guard can see it; it stays with PEN-5016's stage-0
+   broad-data-mount pre-flight. This paragraph closes the *override* route and should not be read
+   as having closed the refusal.
 
 2. **§7.4's "fail closed and loud at render, or do not change it" is not on point here, and was
    cited as if it were.** That sentence governs silently *stripping* a credential, so that publish
@@ -1147,13 +1167,24 @@ and at agent scope there is no third party. Read §7.6 before citing this paragr
 the boundary moved.
 
 ⚠ **Scope of the claim, stated so it is not read wider than it is.** What is now agent-scope-only
-is the **gate key**, the **broker's image**, and — while the gate is on — `enableDocker` /
-`dockerImage`. The rendered broker boundary *as a whole* is not,
-and this document should not be cited as saying so: `AGENT_SCOPE_ONLY_CONFIG_KEYS` is a list, the
-`image` and `enableDocker` routes above were both found by review rather than by the list, and
-the `workspaceVolumeClaim` route in ground 1 is open. Four keys are closed; the class is not.
-§7.6 closes the *privilege* class structurally rather than by a fifth key — which is the
-answer to this paragraph's complaint, for that one class only.
+is the **gate key**, the **broker's image**, and — while the gate is on — `enableDocker`,
+`dockerImage` and `workspaceVolumeClaim`. The rendered broker boundary *as a whole* is not,
+and this document should not be cited as saying so: `AGENT_SCOPE_ONLY_CONFIG_KEYS` is a list, and
+every route closed after the first — `image`, then `enableDocker`, then `workspaceVolumeClaim` —
+was found by review of the previous fix rather than by the list itself. Five keys are closed; the
+class is not.
+
+§7.6 is the answer to that complaint, for one class only: it closes the *privilege* class
+**structurally**, by reading the assembled pod spec rather than by naming another key, so a
+privileged container added later is covered without anyone remembering to list it.
+`workspaceVolumeClaim` is a fifth list entry and **not** a second such property — it inherits the
+weakness this paragraph states, and is pinned by the list because the volume the broker's hook
+writes into is chosen by one named key, where privilege is not.
+
+One route remains open by decision rather than by oversight: the `resolveJobIsolation`
+descriptor-absent fallback named in ground 1, which is not an override and so is unreachable by any
+merge guard. (The agent-scope docker residual this paragraph used to list beside it is closed —
+§7.6, above.)
 
 **The audit half.** `enableGitHubPublishBroker` is now in the adapter's `getConfigSchema()`, so the
 state of a credential boundary is legible to a reviewer looking at the agent rather than only to

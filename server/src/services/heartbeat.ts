@@ -2849,28 +2849,69 @@ const AGENT_SCOPE_ONLY_CONFIG_KEYS = new Set([
 // *beside* it. `dockerImage` rides along because a pinned `enableDocker` with
 // an overridable image is a pin in name only.
 //
-// ⚠ This closes the LOWER-SCOPE route only. An operator who sets both
-// `enableDocker` and `enableGitHubPublishBroker` at agent scope still gets a
-// privileged root container beside the broker; that is an operator decision
-// about their own agent, and it is recorded as a residual in §7.5 of the
-// PEN-3183 decision record rather than refused here.
+// ⚠ This closes the LOWER-SCOPE route only — an operator who sets both
+// `enableDocker` and `enableGitHubPublishBroker` at agent scope is not reached
+// by a provenance pin at all. That residual is no longer open: §7.6 of the
+// PEN-3183 decision record (PEN-5026) REFUSES the combination at render, in
+// the adapter, by reading the assembled pod spec
+// (`findPrivilegedContainersBesideBroker`) rather than by naming a key here.
+// So the two halves are: this list stops a lower scope turning it on, and the
+// builder refuses it whatever scope turned it on.
 //
 // The membership rule, so this stays a rule and not a list of incidents: WHEN
-// THE CREDENTIAL IS BROKERED, WHAT CODE RUNS IN THE POD AND AT WHAT PRIVILEGE
-// IS AGENT SCOPE'S TO DECIDE. `image` is deliberately NOT here — it is pinned
-// adapter-side for the broker container alone, which is strictly stronger and
-// leaves the agent container's image freely overridable. Add a key here when
-// it answers the question above and cannot be pinned at the point of use.
+// THE CREDENTIAL IS BROKERED, WHAT CODE RUNS IN THE POD, AT WHAT PRIVILEGE,
+// AND OFF WHICH VOLUME IS AGENT SCOPE'S TO DECIDE. `image` is deliberately NOT
+// here — it is pinned adapter-side for the broker container alone, which is
+// strictly stronger and leaves the agent container's image freely overridable.
+// Add a key here when it answers the question above and cannot be pinned at
+// the point of use.
 //
-// ⚠ The cost, stated: an issue override cannot request docker on a
-// broker-enabled agent. That is a real capability loss. It is accepted because
-// it is narrow — `enableDocker` stays freely overridable for every agent not
-// running the broker, which is the whole fleet today — and because an agent
-// that needs docker for brokered work can have it set at agent scope, where an
-// operator sees it and accepts the residual above.
+// PEN-5027 adds the third clause and `workspaceVolumeClaim` under it.
+// `buildJobManifest` narrows the shared data volume to read-only and re-mounts
+// a few trees rw by `subPath` only when the Job's claim IS this server's own
+// (`narrowWritableSurface`: `dataClaimName === selfPod.pvcClaimName`). The
+// broker's pre-push hook lives on that volume, so under the broad fallback
+// uid 1000 could rewrite the code the credential holder runs — which is why
+// the adapter REFUSES to render a brokered pod on a broad mount
+// (job-manifest.ts, the `enableGitHubPublishBroker && !narrowWritableSurface`
+// throw). An issue-scope `workspaceVolumeClaim` naming any other claim is
+// therefore not a preference: on a brokered agent it fails that agent's
+// dispatch at manifest build, and anyone able to assign it an issue can do it.
+// That is the same per-issue denial of service AGENT_SCOPE_ONLY_CONFIG_KEYS
+// declines to create above, reached by a different key — discarding the
+// overlay closes it the same way, and for the same reason.
+//
+// ⚠ An ENVIRONMENT-supplied claim must still win, and does: the environment
+// overlay is applied DOWNSTREAM of this merge, by `mergeEnvironmentConfig` in
+// the adapter's own execute.ts, over the config this function returns. That
+// ordering is what makes the discard safe here and is a property of the SITE,
+// not of this list — moving this guard adapter-side would have to re-establish
+// it explicitly (PEN-5027 constraint 1).
+//
+// ⚠ Not pinned when the broker is OFF, where a foreign claim merely forgoes
+// the subPath narrowing with a `claude_k8s.data_mount_broad_rw` warn and no
+// throw. Whether an issue should be able to choose the data volume at all is a
+// wider question about the override surface; it is deliberately not answered
+// here.
+//
+// ⚠ The cost, stated: an issue override cannot request docker, or choose the
+// data volume, on a broker-enabled agent. That is a real capability loss. It
+// is accepted because it is narrow — both stay freely overridable for every
+// agent not running the broker, which is the whole fleet today.
+//
+// The two keys differ in what agent scope buys back, and §7.6 is why. For
+// `workspaceVolumeClaim` the loss is close to nominal: an agent that needs a
+// particular data volume for brokered work can have it set at agent scope, and
+// in any case the only value that renders a brokered pod at all is the
+// server's own claim — which is what the agent already resolves to without the
+// override. For `enableDocker` agent scope buys back NOTHING: §7.6 refuses the
+// brokered + privileged combination at render regardless of which scope asked
+// for it. Discarding the overlay there turns a refusal into a working pod
+// without docker, which is the kinder failure, not a way to obtain docker.
 const BROKERED_POD_COMPOSITION_CONFIG_KEYS = new Set([
   "enableDocker",
   "dockerImage",
+  "workspaceVolumeClaim",
 ]);
 
 /**
