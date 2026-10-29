@@ -8,6 +8,7 @@ import { agentApiKeys, companyMemberships, instanceUserRoles } from "@paperclipa
 import { normalizeAgentApiKeyScope, type AgentApiKeyScope, type DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "../middleware/logger.js";
+import { upgradePathForLog } from "../middleware/http-log-policy.js";
 import { subscribeCompanyLiveEvents } from "../services/live-events.js";
 import { createLiveEventTranscriptGate } from "./live-event-transcript-gate.js";
 
@@ -432,8 +433,13 @@ export function setupLiveEventsWebSocketServer(
       return;
     }
 
+    // No allowlist: this socket reads exactly one query key and it is the
+    // credential (`authorizeUpgrade`, `?token=`), so there is no non-credential
+    // query diagnostic here to keep. See `upgradePathForLog` (PEN-3549).
+    const logPath = upgradePathForLog(req.url);
+
     const onRawSocketError = (err: Error) => {
-      logger.warn({ err, path: req.url }, "live websocket upgrade socket error");
+      logger.warn({ err, path: logPath }, "live websocket upgrade socket error");
     };
     const cleanupRawSocketListeners = () => {
       socket.off("error", onRawSocketError);
@@ -479,7 +485,7 @@ export function setupLiveEventsWebSocketServer(
         });
       })
       .catch((err) => {
-        logger.error({ err, path: req.url }, "failed websocket upgrade authorization");
+        logger.error({ err, path: logPath }, "failed websocket upgrade authorization");
         rejectUpgrade(socket, "500 Internal Server Error", "upgrade failed");
       });
   });
