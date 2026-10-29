@@ -199,6 +199,7 @@ import {
   parseUnsupportedTimeFilterParams,
   resolveIssueListTruncation,
 } from "../lib/issue-list-query.js";
+import { STATEMENT_TIMEOUT_SQLSTATE } from "../lib/db-retry.js";
 import { readAcceptedPlanConfirmationTarget } from "../services/issues.js";
 import { issueEfficiencyService } from "../services/issue-efficiency.js";
 import {
@@ -283,6 +284,57 @@ export const ISSUE_CREATE_DUPLICATE_CANDIDATE_SCAN_CAP = 1_000;
 export const ISSUE_CREATE_DUPLICATE_CANDIDATE_TIMEOUT_MS = 500;
 export const ISSUE_CREATE_DUPLICATE_CANDIDATE_ACTIVITY_TIMEOUT_MS = 1_000;
 export const ISSUE_CREATE_DUPLICATE_CANDIDATE_LATENCY_BUDGET_MS = 1_000;
+
+/**
+ * Why the create-time duplicate-candidate lookup did not return advisories.
+ *
+ * PEN-3596: the lookup degrades gracefully in every one of these cases — the
+ * create still succeeds and simply carries `duplicateCandidates: []` — but
+ * they are NOT equally interesting, and one `logger.warn` saying "failed" for
+ * all of them is the same misattribution defect this row already fixed at the
+ * API boundary (`57014` reported as "Database contention").
+ *
+ * - `statement_timeout`: the deliberate transaction-local budget
+ *   ({@link ISSUE_CREATE_DUPLICATE_CANDIDATE_TIMEOUT_MS}, set by
+ *   `set_config('statement_timeout', …, true)`) fired. **Working as designed.**
+ * - `lookup_timeout`: {@link raceCreateIssueDuplicateCandidateLookup} won the
+ *   race — the wall-clock budget expired outside the statement.
+ * - `connection_unavailable`: no pool connection was free within the budget,
+ *   so no statement was ever sent. **Pool pressure — the real signal here.**
+ * - `error`: anything else, i.e. an actual defect.
+ */
+export type CreateIssueDuplicateCandidateLookupFailure =
+  | "statement_timeout"
+  | "lookup_timeout"
+  | "connection_unavailable"
+  | "error";
+
+/**
+ * Classify a duplicate-candidate lookup failure so an operator can tell the
+ * designed budget apart from pool pressure without reading SQL text.
+ *
+ * ⚠️ PEN-3596 trap, measured on `paperclip-pg-0` 2026-10-29 11:55:57Z–12:38:16Z:
+ * THREE `canceling statement due to statement timeout` lines appeared in that
+ * 42-minute window and only ONE was the issues-list defect. The other two were
+ * this path hitting its own 500 ms budget — by design, never a 503. The
+ * cluster's `log_line_prefix` is `%m [%p]`, carrying no `application_name`, so
+ * the pg log cannot separate them; the only discriminators are the statement
+ * text and this classification. Any check of the "no statement timeouts over a
+ * representative window" criterion that greps the ERROR line alone WILL read
+ * these as regressions.
+ */
+export function classifyCreateIssueDuplicateCandidateLookupFailure(
+  err: unknown,
+): CreateIssueDuplicateCandidateLookupFailure {
+  const code = (err as { code?: unknown } | null | undefined)?.code;
+  if (typeof code === "string" && code === STATEMENT_TIMEOUT_SQLSTATE) return "statement_timeout";
+  const message = err instanceof Error ? err.message : typeof err === "string" ? err : "";
+  if (message.includes("because no database connection was available within")) {
+    return "connection_unavailable";
+  }
+  if (/\btimed out after \d+ms$/.test(message)) return "lookup_timeout";
+  return "error";
+}
 
 type CreateIssueDuplicateCandidate = {
   identifier: string;
@@ -11910,9 +11962,12 @@ export function issueRoutes(
         () => lookupAbortController.abort(),
       );
     } catch (err) {
+      const reason = classifyCreateIssueDuplicateCandidateLookupFailure(err);
       logger.warn(
-        { err, companyId, issueId: issue.id, issueIdentifier: issue.identifier },
-        "issue duplicate candidate lookup failed; continuing create without advisories",
+        { err, reason, companyId, issueId: issue.id, issueIdentifier: issue.identifier },
+        reason === "statement_timeout" || reason === "lookup_timeout"
+          ? "issue duplicate candidate lookup exceeded its budget; continuing create without advisories"
+          : "issue duplicate candidate lookup failed; continuing create without advisories",
       );
     }
 
