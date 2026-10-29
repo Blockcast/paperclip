@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 
 import {
+  BAKED_HOOKS_DIR,
   buildGitArgv,
   DEFAULT_GIT_BINARY,
   DEFAULT_HOOKS_DIR,
@@ -441,8 +442,13 @@ describe("entrypoint configuration", () => {
     }
   });
 
-  it("uses the path the Helm seed writes", () => {
-    expect(hooksDirectory()).toBe(DEFAULT_HOOKS_DIR);
+  it("uses the path the agent image bakes, not the one the Helm seed writes", () => {
+    // PEN-4932. Both constants are re-exported from this module, so the two
+    // are one keystroke apart at a call site — and picking the seeded one
+    // would quietly put the guard back on a volume that rolls independently
+    // of this file. Pinned against BOTH values, not just the right one.
+    expect(hooksDirectory()).toBe(BAKED_HOOKS_DIR);
+    expect(hooksDirectory()).not.toBe(DEFAULT_HOOKS_DIR);
     expect(gitBinary()).toBe(DEFAULT_GIT_BINARY);
   });
 
@@ -450,7 +456,7 @@ describe("entrypoint configuration", () => {
     process.env.PAPERCLIP_GIT_EGRESS_HOOKS_DIR = "/tmp/empty";
     process.env.PAPERCLIP_GIT_EGRESS_GIT = "/tmp/fake-git";
 
-    expect(hooksDirectory()).toBe(DEFAULT_HOOKS_DIR);
+    expect(hooksDirectory()).toBe(BAKED_HOOKS_DIR);
     expect(gitBinary()).toBe(DEFAULT_GIT_BINARY);
   });
 });

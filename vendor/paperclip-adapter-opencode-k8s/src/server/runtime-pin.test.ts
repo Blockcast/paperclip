@@ -24,7 +24,7 @@ import {
   PRE_PUSH_HOOK_PREFLIGHT_OFF_MOUNT,
   PRE_PUSH_HOOK_PREFLIGHT_NOT_EXECUTABLE,
 } from "./runtime-pin.js";
-import { DEFAULT_HOOKS_DIR, hooksDirForDataMount } from "./github-git-hooks-path.js";
+import { BAKED_HOOKS_DIR, hooksDirForDataMount } from "./github-git-hooks-path.js";
 
 // PEN-3916 (Blockcast-local, not upstream). The runtime root is ASSEMBLED here
 // rather than written as one literal. Paperclip's GitHub egress guard refuses
@@ -426,7 +426,7 @@ describe("buildPrePushHookPreflightShell (PEN-4518)", () => {
    * shipped string.
    */
   const against = (runtimeDir: string, mountDir: string) => {
-    let swapped = snippet.replace(`__pchookrt='${DEFAULT_HOOKS_DIR}'`, `__pchookrt='${runtimeDir}'`);
+    let swapped = snippet.replace(`__pchookrt='${BAKED_HOOKS_DIR}'`, `__pchookrt='${runtimeDir}'`);
     expect(swapped).not.toBe(snippet);
     const before = swapped;
     swapped = swapped.replace(
@@ -553,7 +553,7 @@ describe("buildPrePushHookPreflightShell (PEN-4518)", () => {
   });
 
   it("ships the real deployed paths, not the fixtures the arms were exercised with", () => {
-    expect(snippet).toContain(`__pchookrt='${DEFAULT_HOOKS_DIR}'`);
+    expect(snippet).toContain(`__pchookrt='${BAKED_HOOKS_DIR}'`);
     expect(snippet).toContain(`__pchookmnt='${hooksDirForDataMount(DATA_MOUNT)}'`);
   });
 
@@ -562,7 +562,7 @@ describe("buildPrePushHookPreflightShell (PEN-4518)", () => {
     // values, so relocating the PVC must NOT move the runtime side — that
     // divergence is precisely what the OFF-MOUNT verdict exists to name.
     const custom = buildPrePushHookPreflightShell({ dataMountPath: "/mnt/agent-data" });
-    expect(custom).toContain(`__pchookrt='${DEFAULT_HOOKS_DIR}'`);
+    expect(custom).toContain(`__pchookrt='${BAKED_HOOKS_DIR}'`);
     expect(custom).toContain(`__pchookmnt='${hooksDirForDataMount("/mnt/agent-data")}'`);
   });
 

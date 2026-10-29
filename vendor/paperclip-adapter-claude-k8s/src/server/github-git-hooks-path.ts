@@ -47,6 +47,29 @@ export const DEFAULT_DATA_MOUNT_PATH = "/paperclip";
 export const DEFAULT_HOOKS_DIR = `${DEFAULT_DATA_MOUNT_PATH}/${GIT_HOOKS_SUBPATH}`;
 
 /**
+ * Where the AGENT IMAGE carries the hook, independent of any volume.
+ *
+ * `COPY --chmod=0755 --exclude=*.md docker/github-hooks/` in the server image,
+ * re-copied `--from=server` into the agent image, so the hook and the runtime
+ * that looks for it are ONE artifact from one Docker build. A pod has both or
+ * neither; it cannot have a runtime pointed here and no file here, which is
+ * what makes repointing the runtime at this path atomic in a way the PVC path
+ * never was (the volume and the image roll on independent cadences).
+ *
+ * It is also the stronger of the two paths for the property the guard exists
+ * to have. The seeded copy is written by a `runAsUser: 1000` init container
+ * and is therefore owned by the uid the agent runs as; it is read-only in an
+ * agent pod only for as long as the volumeMount says `readOnly`. This copy is
+ * `root:root 0755` inside the image, so no uid-1000 process can rewrite it in
+ * any pod, under any mount topology. PEN-3715.
+ *
+ * NOT derived from `DEFAULT_DATA_MOUNT_PATH` on purpose: the point of this
+ * path is that it does not live on the data volume, so an operator who
+ * relocates `persistence.mountPath` must not move it.
+ */
+export const BAKED_HOOKS_DIR = "/usr/local/libexec/paperclip/hooks";
+
+/**
  * The hooks directory for a given data mount point.
  *
  * Trailing slashes are stripped so `/paperclip/` and `/paperclip` agree; an

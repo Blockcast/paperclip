@@ -9,6 +9,15 @@
  *   3. the Job manifest that MOUNTS it      (`job-manifest.ts`, `ROOT_TOOLCHAIN_SUBPATHS`)
  *   4. the preflight that ASSERTS it        (`runtime-pin.ts`, both adapters)
  *
+ * There are now TWO paths here, and which consumer reads which is the whole
+ * point of keeping them in one file. 1 and 3 are the SEEDED copy on the data
+ * volume (`DEFAULT_HOOKS_DIR` / `hooksDirForDataMount`). 2 and 4 are the BAKED
+ * copy in the agent image (`BAKED_HOOKS_DIR`), as of PEN-4932: the runtime
+ * reads the image, not the volume. The seeded copy is still written and still
+ * mounted — it is what the preflight reports as a diagnostic when the image
+ * copy is missing, and it is deleted in the step that drops
+ * `ROOT_TOOLCHAIN_SUBPATHS`, not in this one.
+ *
  * PEN-4518 is what a disagreement between them costs. BLO-32734 phase 2b gave
  * narrowed Job pods an emptyDir over the PVC root and re-exposed an allowlist
  * of toolchain subpaths; this path was not on it. Consumer 1 kept writing the
@@ -60,6 +69,29 @@ export const DEFAULT_DATA_MOUNT_PATH = "/paperclip";
 
 /** Where the Helm seed writes the pre-push hook, in the default layout. */
 export const DEFAULT_HOOKS_DIR = `${DEFAULT_DATA_MOUNT_PATH}/${GIT_HOOKS_SUBPATH}`;
+
+/**
+ * Where the AGENT IMAGE carries the hook, independent of any volume.
+ *
+ * `COPY --chmod=0755 --exclude=*.md docker/github-hooks/` in the server image,
+ * re-copied `--from=server` into the agent image, so the hook and the runtime
+ * that looks for it are ONE artifact from one Docker build. A pod has both or
+ * neither; it cannot have a runtime pointed here and no file here, which is
+ * what makes repointing the runtime at this path atomic in a way the PVC path
+ * never was (the volume and the image roll on independent cadences).
+ *
+ * It is also the stronger of the two paths for the property the guard exists
+ * to have. The seeded copy is written by a `runAsUser: 1000` init container
+ * and is therefore owned by the uid the agent runs as; it is read-only in an
+ * agent pod only for as long as the volumeMount says `readOnly`. This copy is
+ * `root:root 0755` inside the image, so no uid-1000 process can rewrite it in
+ * any pod, under any mount topology. PEN-3715.
+ *
+ * NOT derived from `DEFAULT_DATA_MOUNT_PATH` on purpose: the point of this
+ * path is that it does not live on the data volume, so an operator who
+ * relocates `persistence.mountPath` must not move it.
+ */
+export const BAKED_HOOKS_DIR = "/usr/local/libexec/paperclip/hooks";
 
 /**
  * The hooks directory for a given data mount point.
