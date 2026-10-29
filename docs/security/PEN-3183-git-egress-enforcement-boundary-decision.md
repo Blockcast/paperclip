@@ -346,7 +346,13 @@ properties are deliberate.
   defeats a name-only one; and a mount at any ancestor of a credential path
   counts as reaching it, since mounting `/etc/paperclip/secrets` hands over both
   tokens without naming either. A `projected` volume's sources count as the
-  Secret they carry.
+  Secret they carry. The Secret-name match **fails closed**: the whole
+  `paperclip-github-*` family counts as credential-bearing and the exceptions
+  are enumerated, so a credential renamed out of the `*token` spelling is still
+  seen. That matters most for the route below, which has no path to fall back
+  on. The enumerated exceptions — `app-creds`, `app-key`, `webhook-secret` —
+  are part of the declared surface; adding to that set is a decision, not a
+  cleanup.
 - **A third route kind matches the referenced SECRET, not a name or a path**,
   and it is the one the first draft of these tests got wrong. A
   `env[].valueFrom.secretKeyRef` binds the token under **any** variable name, so
@@ -356,7 +362,9 @@ properties are deliberate.
   sources — filtered by env NAME only, never by which Secret they reference —
   and `job-manifest.ts` emits them into the agent container. Caught by review on
   #3103; recorded here because "we match the mount and the variable names" reads
-  complete and is not.
+  complete and is not. This route is also why the Secret-name match above has to
+  fail closed: a `secretKeyRef` names no path, so the Secret name is the only
+  signal there is.
 - **Both broker arrangements are expected, not just today's.** §7.2 is explicit
   that the broker receiving a credential **is** trigger 3 — a declared, reviewed
   instance of it, not an exemption — so the agent-Job assertion carries a

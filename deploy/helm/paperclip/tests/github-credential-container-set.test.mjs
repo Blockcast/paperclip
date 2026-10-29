@@ -117,7 +117,31 @@ const CREDENTIAL_MOUNT_RE = /^\/etc\/paperclip\/secrets\/github-[a-z0-9-]*token$
 // because the two failure modes are different: mounting the same Secret
 // somewhere new defeats a path-only check, and mounting a renamed Secret at
 // the credential path defeats a name-only one.
-const CREDENTIAL_SECRET_RE = /^paperclip-github-[a-z0-9-]*token$/;
+//
+// FAILS CLOSED, and that is the whole design. An earlier draft anchored this
+// on a `token` SUFFIX, which meant a credential Secret renamed to
+// `paperclip-github-pat` was invisible to both the Secret-name half and the
+// `secretRefs` bucket — and `secretRefs` has no path to fall back on, because
+// a `secretKeyRef` names no path at all. So the family is credential-bearing
+// BY DEFAULT and the exceptions are enumerated: a new `paperclip-github-*`
+// Secret is treated as a credential until someone says otherwise. A false
+// positive is a red a human reads; a false negative is silence, which is the
+// failure this whole file exists to prevent. Raised by review on #3103.
+//
+// The exclusions are control-plane credentials that never reach an agent and
+// are covered by a DIFFERENT control — the server-only inheritance allowlist,
+// backstopped by `findServerOnlyEnvVarsInPodSpec`. Folding them in here would
+// merge two controls into one assertion and make a red ambiguous. This set is
+// part of the declared surface: adding to it is a decision, not a cleanup.
+const NON_CREDENTIAL_GITHUB_SECRETS = new Set([
+  "paperclip-github-app-creds",
+  "paperclip-github-app-key",
+  "paperclip-github-webhook-secret",
+]);
+
+function isCredentialSecretName(name) {
+  return /^paperclip-github-[a-z0-9-]+$/.test(name) && !NON_CREDENTIAL_GITHUB_SECRETS.has(name);
+}
 
 // Env routes BY NAME. `PAPERCLIP_GITHUB_TOKEN_FILE` is a POINTER, not a
 // credential — under the PEN-4933 broker the agent keeps it with no mount
@@ -169,13 +193,13 @@ function secretRefRoutes(container) {
   const routes = [];
   for (const entry of container.env ?? []) {
     const secret = entry?.valueFrom?.secretKeyRef?.name;
-    if (typeof secret === "string" && CREDENTIAL_SECRET_RE.test(secret)) {
+    if (typeof secret === "string" && isCredentialSecretName(secret)) {
       routes.push(`${entry.name} -> ${secret}`);
     }
   }
   for (const source of container.envFrom ?? []) {
     const secret = source?.secretRef?.name;
-    if (typeof secret === "string" && CREDENTIAL_SECRET_RE.test(secret)) {
+    if (typeof secret === "string" && isCredentialSecretName(secret)) {
       routes.push(`envFrom -> ${secret}`);
     }
   }
@@ -211,7 +235,7 @@ function routesFromDocuments(docs) {
         if (names.length > 0) secretByVolume.set(volume.name, names);
       }
       const volumeExposesCredential = (name) =>
-        (secretByVolume.get(name) ?? []).some((secret) => CREDENTIAL_SECRET_RE.test(secret));
+        (secretByVolume.get(name) ?? []).some((secret) => isCredentialSecretName(secret));
       // Every path in THIS pod at which a credential is mounted. Collected per
       // pod so the ancestor check below has something concrete to compare
       // against, rather than assuming the literal path is the one in use.
@@ -329,15 +353,28 @@ test("the matchers would fire on the shapes this test exists to reject", () => {
   // A green assertion proves nothing unless it goes red on the bad input.
   assert.ok(CREDENTIAL_MOUNT_RE.test(TOKEN));
   assert.ok(CREDENTIAL_MOUNT_RE.test(MERGE_TOKEN));
-  assert.ok(CREDENTIAL_SECRET_RE.test("paperclip-github-mcp-token"));
-  assert.ok(CREDENTIAL_SECRET_RE.test("paperclip-github-merge-token"));
+  assert.ok(isCredentialSecretName("paperclip-github-mcp-token"));
+  assert.ok(isCredentialSecretName("paperclip-github-merge-token"));
+  // Fails CLOSED on a rename: the family counts by default, so a credential
+  // Secret that stops being spelled "...token" is still seen. This is the case
+  // the suffix-anchored first draft missed, and the one with no path to fall
+  // back on when the binding is a `secretKeyRef`.
+  assert.ok(isCredentialSecretName("paperclip-github-pat"));
+  assert.ok(isCredentialSecretName("paperclip-github-something-new"));
 
   // The broker's socket and private dirs carry "github" in the name and are
   // NOT credentials. Matching them would make every brokered pod look like a
   // widening and train the next reader to ignore this test.
   assert.ok(!CREDENTIAL_MOUNT_RE.test("/var/run/paperclip-github-broker"));
   assert.ok(!CREDENTIAL_MOUNT_RE.test("/var/lib/paperclip-github-broker"));
-  assert.ok(!CREDENTIAL_SECRET_RE.test("paperclip-github-app-creds"));
+  // The enumerated exceptions: control-plane credentials covered by a
+  // different control (see the header). Out of scope here, deliberately.
+  assert.ok(!isCredentialSecretName("paperclip-github-app-creds"));
+  assert.ok(!isCredentialSecretName("paperclip-github-app-key"));
+  assert.ok(!isCredentialSecretName("paperclip-github-webhook-secret"));
+  // Not in the family at all.
+  assert.ok(!isCredentialSecretName("gbrain-authbot-service-key"));
+  assert.ok(!isCredentialSecretName("paperclip-githubbed-token"));
 
   // A parent mount reaches the credential underneath it; that is a widening
   // the exact-path check alone would miss.
