@@ -16,6 +16,14 @@ census generalises fleet-wide "because the image is identical across the fleet".
 run one image. That does not change either measurement's number; it changes what may be inferred
 from them, and it changes the shape of the re-measurement trigger.
 
+> ⚠ **Merge order: PR [#3098](https://github.com/Blockcast/paperclip/pull/3098) lands first.**
+> Two things this document relies on exist only there and 404 on `master` until it lands:
+> `PEN-4986-absolute-path-git-runtime-measurement.md` (linked above — this record's primary
+> reference) and `scripts/measure-absolute-path-git.mjs` (the measurement itself, invoked by the
+> §6 re-run procedure). Landing this record first would publish a security record whose primary
+> link is dead and whose re-measurement procedure cannot be executed — which is the specific
+> failure §4 is about: a staleness rule nobody can run is a rule nobody acts on.
+
 ## 1. Window, population, result
 
 | | |
@@ -23,7 +31,7 @@ from them, and it changes the shape of the re-measurement trigger.
 | **Window** | `2026-10-29T08:35:16.715Z` → `2026-10-29T08:43:11.876Z` UTC (`7.9` min, `220483` sweeps) |
 | **Population** | one agent pod: `ac-7500672d-efe6-40-872601a6-55e4-43-40d491-bfzww`, ns `paperclip`, agent **Security Engineer** (`7500672d-efe6-4037-a05f-61204a670894`), run `872601a6-55e4-430c-8726-76d4c8f976ff`, task PEN-4989 |
 | **Image** | `…/paperclip-agent:sha-4db591b-k8s-vendored` (`sha256:2ebb2948…30538a7`) — **a different image from PEN-4986's** `sha-ed39009-k8s-vendored` |
-| **Surface fingerprint** | `a23454c47df4da615771bb9e5a5c958975587cb403884354812741ea70a144ee` (§4) |
+| **Surface fingerprint** | `d81423fe12c348c3e7ef7a004614385439f3d1998506850e47fcad640cf55568` (rule **v2**, §4) |
 | **`/usr/bin/git` observations** | `233` |
 | **— wrapped** | `231` |
 | **— unwrapped** | **`0`**, plus 2 deliberate negative controls |
@@ -36,6 +44,17 @@ weaker than PEN-4986's on exactly that axis.** 194 of the 233 are `--version`, b
 invoked 210 of them as controls. The organic remainder is ~21 invocations over 7.9 minutes against
 PEN-4986's 54 over 22.1. What this run adds is a **second image**, a **census reproduction** (§3), and
 a **false-positive bound** (§2) — not a richer sample of agent behaviour. Both windows are short.
+
+ℹ **The fingerprint above is a rule-v2 digest, and the measurement was taken under rule v1.**
+The run recorded `a23454c47df4da615771bb9e5a5c958975587cb403884354812741ea70a144ee`; v2 additionally
+hashes the *contents* of every `git` in the PATH layout, so every v1 digest is numerically different
+from its v2 counterpart. The value above is not a re-derivation from the old one — it was recomputed
+on the live surface, and the bridge is explicit: re-running the **v1** rule in the pod that produced
+this edit — image `…/paperclip-agent:sha-1e99f06-k8s-vendored`
+(`sha256:fd6337d3…10b2a31`), a **fourth** distinct image — reproduces `a23454c4…` exactly. That
+establishes its egress surface as byte-identical to the measurement pod's, so its v2 digest is this
+surface's v2 digest. Rule version is folded into the digest (`FINGERPRINT_VERSION`), so a v1 value
+meeting a v2 value reads as a mismatch rather than as an unchanged surface.
 
 ### Wrapped by which signature
 
@@ -143,6 +162,9 @@ Rules:
 
 - A later run whose fingerprint **equals** the one in §1 may cite this measurement.
 - A later run whose fingerprint **differs** must re-take it; a prior result says nothing about it.
+- Compare **like rule for like rule.** The digest carries its rule version (`version` in `--json`,
+  `rule vN` in the human output). A digest produced by a different rule is a mismatch by
+  construction and means "re-derive under the current rule", not "the surface changed".
 - A run reporting `wrapperAhead: false` must not be treated as a stale-measurement question at all —
   the guard is not ahead of `/usr/bin`, which is a live control failure and goes to Security.
 
@@ -159,14 +181,23 @@ and obtaining it from inside an agent pod needs the hardening §8 forbids relaxi
 - **§7.1 still carries a one-pod figure.** It is updated to a two-pod, two-image figure only when
   PEN-4986's PR has landed; until then this document is the wider record.
 - **The sample is 2 of 106 images.** The census's stability across rebuilds is evidence, not a
-  theorem.
+  theorem — and counting images overstates it, because a different image is not automatically a
+  different egress surface. That is measured, not assumed: `sha-1e99f06` (`sha256:fd6337d3…`), a
+  **fourth** image that was **not** censused, reproduces this record's v1 surface digest **exactly**
+  despite differing from the `sha-4db591b` the measurement ran on. One datum, not a survey — but it
+  is a direct counter-example to treating image identity and surface identity as the same thing, and
+  it is the direction that makes "2 of 106" read as more coverage than it is. A fleet claim therefore
+  rests on the §4 fingerprint comparison rather than on the image count, which is the point of §4 and
+  the reason the trigger is phrased against the surface rather than the image tag. **What remains
+  uncovered is an image whose fingerprint DIFFERS: none has been observed — and none has been
+  searched for, which is why this is an open item and not a result.**
 
 ## 6. Re-running
 
 ```sh
 node scripts/absolute-path-git-fingerprint.mjs --json > fingerprint.json   # record FIRST
 cp /usr/bin/git /tmp/git-calib                    # calibration copy; NOT /usr/bin/git itself
-node scripts/measure-absolute-path-git.mjs /tmp/obs.ndjson 2 /tmp/git-calib &
+node scripts/measure-absolute-path-git.mjs /tmp/obs.ndjson 2 /tmp/git-calib &  # lands in #3098
 # positive, negative and calibration controls, then work normally across the window
 kill -TERM %1                                      # emits the {"kind":"stop"} summary
 grep -c '"wrapped":false' /tmp/obs.ndjson          # minus any deliberate negative control
