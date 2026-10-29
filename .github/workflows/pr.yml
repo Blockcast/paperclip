@@ -1573,34 +1573,30 @@ jobs:
           path: .
 
       # PEN-5032: deliberately NO `cache: pnpm` on this lane, unlike every other
-      # `Setup Node.js` in this workflow. Two independent reasons, either of
-      # which is sufficient on its own.
+      # `Setup Node.js` in this workflow. The cache POST-step is what kills this
+      # job. `actions/setup-node` saves the pnpm store in a post-step and
+      # exposes no timeout on it, so there is nothing to bound in place.
       #
-      # 1. The cache POST-step is what kills this job. `actions/setup-node`
-      #    saves the pnpm store in a post-step and exposes no timeout on it, so
-      #    there is nothing to bound in place. Measured on merge-queue head
-      #    c9021a88 (PR #3105, run 40897060922, job 123533129683): every
-      #    substantive step passed -- including `Assert the install is
-      #    complete`, the BLO-19064 guard this lane exists for -- and then
-      #    `Post Setup Node.js` hung 15:17:35Z -> 15:27:37Z until the job hit
-      #    its `timeout-minutes: 20` at 20m08s. GitHub reports a timeout kill
-      #    as `conclusion: cancelled`, `verify` fails closed on a cancelled
-      #    lane (correctly -- see scripts/__tests__/pr-verify-lane-outcome
-      #    .test.mjs), and the merge queue ejected a PR whose diff was fine.
-      #    The restore was no loss to give up: it took 27s and MISSED, and the
-      #    install it guards measured 6m51s cold -- well inside the ceiling.
+      # Measured on merge-queue head c9021a88 (PR #3105, run 40897060922, job
+      # 123533129683): every substantive step passed -- including `Assert the
+      # install is complete`, the BLO-19064 guard this lane exists for -- and
+      # then `Post Setup Node.js` hung 15:17:35Z -> 15:27:37Z until the job hit
+      # its `timeout-minutes: 20` at 20m08s. GitHub reports a timeout kill as
+      # `conclusion: cancelled`, `verify` fails closed on a cancelled lane
+      # (correctly -- see scripts/__tests__/pr-verify-lane-outcome.test.mjs),
+      # and the merge queue ejected a PR whose diff was fine.
       #
-      # 2. This lane must never win the cache SAVE race. It is the only job in
-      #    this repo pinning `NODE_ENV: production` at job scope (see the `env:`
-      #    block above), and pnpm reads that as an implicit `--prod`. The store
-      #    it would save is therefore a devDependency-free subset, while
-      #    `actions/setup-node` keys the pnpm store on the lockfile hash and
-      #    cache entries are first-writer-wins. Whenever this short lane
-      #    finished first it published that degraded store under the key the
-      #    other six `cache: pnpm` jobs restore from. This is a PERFORMANCE
-      #    argument only -- the pnpm store is content-addressed, so a restore
-      #    missing dev packages just re-fetches them. Do not restate it as a
-      #    correctness claim.
+      # Giving the restore up costs this lane nothing: it took 27s and MISSED,
+      # and the install it guards measured 6m51s cold -- well inside the
+      # ceiling.
+      #
+      # The `NODE_ENV: production` pin in the `env:` block above is NOT part of
+      # this reasoning, and the store this lane would save is NOT a thin
+      # `--prod` one: `.npmrc` sets `production=false`, which overrides
+      # NODE_ENV, and `Assert the install is complete` below fails the job if
+      # that ever stops holding. This lane's store is the same dev-inclusive
+      # set as every other lane's, so there is no shared-cache-key hazard here
+      # to re-derive.
       #
       # Asserted by scripts/__tests__/npmrc-devdeps-guard.test.mjs so the line
       # cannot come back silently.
