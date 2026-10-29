@@ -230,6 +230,9 @@ The boundary must therefore hold the credential and **perform the publish itself
   guarded by two equality checks (`scripts/check-agent-image-git-config.mjs` and assertion (a) in
   `agent-egress-path.test.mjs`) whose expectations live in `scripts/git-config-surface.mjs` —
   changing that line means changing those in the same commit, by construction.
+  **Status:** still outstanding as of 2026-10-29 — PEN-4933 shipped without it. It is tracked as
+  a precondition for discharging §7.1, not as a follow-up; see §7.3 item 4 for what is already
+  in place, what is merely probable, and what remains unasserted.
 
 Short-lived minted tokens are **not** a substitute. A GitHub App installation token handed to the
 agent is readable for its whole lifetime, so it narrows the window and leaves the boundary exactly
@@ -311,7 +314,7 @@ wrapper — so the scan is the existing pre-push hook running the existing
 than by a second implementation. `git`, `gh` and the GitHub MCP server are all
 routed, because §4.1 says routing one relocates the bypass to the other two.
 
-Three things a reader should not infer from that paragraph:
+Four things a reader should not infer from that paragraph:
 
 1. **It is not yet enabled.** `enableGitHubPublishBroker` defaults to `false`,
    so the deployed fleet is unchanged and §7.1 still holds. The gate is a
@@ -320,8 +323,8 @@ Three things a reader should not infer from that paragraph:
    gives for deferring D4 — a change that can break every agent's ability to
    publish should soak rather than flip. **Switching it back off after
    enablement re-opens §7.1 and is a Security decision, not an incident one.**
-   The acceptance is discharged when the gate is on, not when this paragraph
-   was written.
+   The acceptance is discharged when the gate is on **and item 4 below is
+   satisfied**, not when this paragraph was written.
 2. **The mode is not the mechanism.** §5 asks for `0400` owned by the broker's
    uid. That is not reachable through a Kubernetes Secret volume — the kubelet
    owns those files `root`, so `0400` denies the broker as readily as the
@@ -347,7 +350,6 @@ Three things a reader should not infer from that paragraph:
    §7.1, where the agent simply holds the token, and it is strictly weaker than
    "the broker cannot be made to run attacker-chosen code". Review it on the
    same date.
-
    Three things in that list are only true because of a container boundary, and
    each was wrong in the first implementation before review (#3080) caught it.
    They are recorded because the same mistake is easy to make again:
@@ -439,6 +441,38 @@ Three things a reader should not infer from that paragraph:
      that drops them silently re-opens an exec route into the broker**, so
      they belong on the review-date checklist even though they are closed
      today.
+
+4. **The §5 starvation assertion is still outstanding, and it gates discharge.**
+   §5 requires that `/etc/gitconfig`'s system credential helper be *shown* to
+   starve once the token leaves the agent container — explicitly not assumed,
+   because git treats a credential helper's non-zero exit as "no credential"
+   and carries on, so this fails silently in the permissive direction. **No
+   test asserts it today.** Checked at this head:
+   `github-publish-broker.test.ts`, `github-publish-broker-policy.test.ts` and
+   `job-manifest.github-publish-broker.test.ts` contain no starvation check,
+   and `agent-egress-path.test.mjs` asserts only that the git wrapper installs
+   the *paperclip* helper on its own command line and that nothing else writes
+   `/etc/gitconfig` — a different claim.
+
+   The expected mechanism is plausible and worth stating so the assertion knows
+   what it is confirming: the helper runs `/usr/bin/gh auth git-credential`;
+   `paperclip-github-token-env` execs the child with **no** token when
+   `PAPERCLIP_GITHUB_BROKER_SOCKET` is set and the token file is absent
+   (`docker/github-wrappers/paperclip-github-token-env:34-45`), which is the
+   brokered agent container; and the broker refuses the whole `auth` verb
+   (`github-publish-broker-policy.ts`), so the helper has nothing to return.
+   ⚠ That is why it **probably** starves, which is the standard §5 rejects.
+   Two fallbacks remain unasserted and either one re-authenticates the
+   unguarded binary with the mount already gone: `gh.real` resolving an ambient
+   `GH_TOKEN`/`GITHUB_TOKEN`, and a stale `~/.config/gh/hosts.yml` — the
+   unmaintained state BLO-13241 wrapped `gh` to stop using.
+
+   So: **do not read item 1's "discharged when the gate is on" as satisfied by
+   flipping the gate.** Until a test asserts that a bare `/usr/bin/git push`
+   from uid 1000 in a brokered pod fails to authenticate, enabling the broker
+   closes §7.1's *mount* route and leaves its *helper* route unproven, which is
+   the narrower of the two but the one §4 found to be cheaper for an attacker.
+   This is a rollout precondition for PEN-4933, not a follow-up.
 
 ## 8. Bounds on what may be built against this decision
 
