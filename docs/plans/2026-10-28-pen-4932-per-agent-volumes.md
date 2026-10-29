@@ -302,23 +302,77 @@ PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verificati
    - with no `PAPERCLIP_AGENT_BUMP_TOKEN` the step emits `::warning` and `exit 0` — a **green build
      that bumps nothing**;
    - `if: github.event_name != 'workflow_dispatch'` skips the bump entirely on a manual re-run.
-4. **Per-agent claim.** Swap `dataClaimName` (`job-manifest.ts`, the `const dataClaimName =` binding — `:2846` at `cfc80829`) to a per-agent PVC, following
-   the existing `opencode-db-<agentId>` precedent (`paperclip.io/pvc-type=agent-db`).
+4. **Per-agent claim.** Split in two once §4.1 was read properly — the swap is not the hard part,
+   and doing it alone stops the fleet creating agent Jobs (§4.1).
+
+   - **4a. Make a non-self claim narrowable.** *Done.* Re-base the `narrowWritableSurface` gate off
+     "is this the server's own claim" and move `subPath` pre-creation into a root
+     `seed-writable-dirs` init container. No per-agent claim yet, so lock exposure is unchanged;
+     this is purely the step that makes 4b possible.
+   - **4b. Swap `dataClaimName`** (`job-manifest.ts`, the `const dataClaimName =` binding) to a
+     per-agent PVC, provisioned dynamically by the server following the existing
+     `opencode-db-<agentId>` precedent (`paperclip.io/pvc-type=agent-db`). Note `paperclip-data`
+     is an `existingClaim` managed out of onprem-k8s, so per-agent claims cannot be templated into
+     the chart.
 5. **Demonstrate and re-measure.** PEN-4932's acceptance criterion.
 
 ### 4.1 The blocker stage 4 has to clear
 
 `dataClaimName = envWorkspaceClaim || selfPod.pvcClaimName || ""` — every agent Job inherits the
-*server's own* claim. The `narrowWritableSurface` gate then requires
-`dataClaimName === selfPod.pvcClaimName`, because the `subPath` targets are pre-created by the
+*server's own* claim. The `narrowWritableSurface` gate then required
+`dataClaimName === selfPod.pvcClaimName`, because the `subPath` targets were pre-created by the
 server through its own mount. A per-agent claim is by definition a volume the server does not
-hold, so it takes the `foreign_claim` branch and falls back to a broad rw mount.
+hold, so it took the `foreign_claim` branch and fell back to a broad rw mount.
 
-That is not merely a gate to satisfy — note it **inverts**: the BLO-32734 narrowing exists because
-one volume is shared by every company and agent, and the mount is the only thing that can scope it.
-A per-agent volume is scoped by construction, so the ~14 `subPath` binds have nothing left to
-narrow and collapse to a single mount. Stage 4 should delete that machinery for per-agent claims,
-not satisfy it.
+**Corrected 2026-10-29.** This section previously concluded that the narrowing machinery should be
+*deleted* for per-agent claims rather than satisfied — "a per-agent volume is scoped by
+construction, so the ~14 `subPath` binds have nothing left to narrow". That is wrong, and acting on
+it would have stopped the fleet creating agent Jobs. Three things fall out of the gate at once, and
+only the first is about cross-agent scoping:
+
+1. `rootMounts` collapses to a single broad rw mount — losing the **root overlay**, which is not
+   about other agents at all. The PVC root is the server's `node` home: `.ssh`, `.kube`,
+   `.secrets`, `.claude/.credentials.json`, mkcert's CA key. A per-agent volume does not make those
+   safe to expose; it is a different volume, not an empty one.
+2. `scopedWritableDirs` empties, and nothing pre-creates the tree — the server **structurally
+   cannot**, since it does not mount a per-agent volume. A fresh CephFS volume's root is
+   `root:root` and the init container runs as uid 1000.
+3. `buildJobManifest` **throws** for every broker-enabled Job: *"refusing to build Job manifest —
+   enableGitHubPublishBroker is set, but the data volume would be mounted broad read-write"*. That
+   is the code failing closed as designed, and it is why the naive swap fails loudly rather than
+   degrading quietly.
+
+So stage 4 **satisfies** the gate. Stage 4a re-bases it onto the question that actually matters —
+*can this Job's `subPath` targets be given correct ownership?* — and answers it with a root
+`seed-writable-dirs` init container that does targeted `mkdir -p` + `chown` on the skeleton from
+inside the pod, ahead of every container that mounts a target. `foreign_claim` becomes unreachable.
+
+**`fsGroup` is the obvious alternative and is contraindicated by measurement already in this tree.**
+`values.blockcast.yaml:520-530` (onprem-k8s #225) records that on cephfs
+`fsGroupChangePolicy: OnRootMismatch` does **not** reliably short-circuit, so the kubelet runs a
+recursive chown over the whole volume on every pod mount and each rollout grinds 30-45 min against
+the ~2M-inode shared tree. Per-agent shrinks the tree, so the honest question is whether it shrinks
+it *enough*. Measured 2026-10-29 on the Penstock company subtree — the trees a per-agent volume
+duplicates:
+
+| tree | inodes |
+|---|---|
+| `wt/` (12 worktrees, 4.9 G) | 115,450 |
+| `k8s-isolation/pnpm/<co>` | 66,217 |
+| `projects/<co>/<proj>/penstock-llm-proxy-core` | 50,225 |
+| **total** | **231,892** |
+
+That is **11.6%** of the ~2M behind the 30-45 min figure — so roughly **3.5-5 min of kubelet chown
+on every pod start**, assuming linear scaling, for a Job expected to start in seconds. Two honest
+limits, both pushing the same way: it is one company, and worktree count grows, so 231,892 is a
+floor rather than a ceiling. The seeder is O(skeleton) instead, and is the pattern the chart itself
+names as the reason `fsGroup` is unnecessary.
+
+**One trap inside the fix.** The gate re-base must *not* be applied to `scopedWritableDirs`. Those
+paths are joined onto `SELF_POD_DATA_MOUNT_PATH` — the server's own mount — so handing them out for
+a foreign claim would `mkdir` the Job's tree inside the **server's** volume: junk the Job never
+sees, while the targets that needed creating stayed uncreated. The old condition therefore survives
+under its own name (`serverCanPreCreate`), governing that list alone.
 
 ## 5. Decisions taken, and what is still genuinely open
 
@@ -335,13 +389,33 @@ call in the end — each turned out to have a measurable answer:
   a 162-byte shim into the image. Deferred not because the decision is unclear but because the
   change spans four consumers across two repositories and fails open if botched.
 
-Still genuinely open, and the one item that does need an owner:
+**Company-scoped sharing — resolved 2026-10-29, and it is a constraint rather than a trade-off.**
+`/work/<companyId>`, `/wt/<companyId>`, the pnpm store and `skills/<companyId>` are namespaced by
+path but *are* read by every agent of the same company, so per-agent volumes duplicate them.
+Measured on the Penstock subtree: project checkout 4.8 G, `wt/<co>` 4.9 G, pnpm store 3.0 G,
+`work/<co>` 304 M, k8s-runtimes 240 M, skills 133 K — **≈13.2 G per company**. Penstock runs 9
+pod-backed agents, so per-agent takes it to ≈119 G, **+106 G**, against a volume that is 3.0 T with
+1.1 T free. Affordable, and worth saying *affordable* rather than *free*: it scales linearly with
+agent count on a volume already two-thirds full.
 
-- **Company-scoped sharing.** `/work/<companyId>`, `/wt/<companyId>`, the pnpm store and
-  `skills/<companyId>` are namespaced by path but *are* read by every agent of the same company.
-  Per-agent volumes duplicate them. That is believed acceptable (and retires the BLO-19422 shared
-  checkout hazard) but it is a behaviour change, not a pure re-plumbing, and should be acknowledged
-  before stage 4.
+The reason this is not a design choice: **stage 4 reduces blast radius only if the agent pod stops
+mounting `paperclip-data` altogether.** The ceph-csi lock keys on the volume handle and exposure is
+pods × volume, so *one* surviving `subPath` to the shared handle preserves the whole node-wide
+wedge — and mounting it read-only does not help either, since `NodeUnstageVolume` is per handle
+regardless of `ro`/`rw`. The compromise anyone reaches for first ("keep the company-scoped trees on
+the shared PVC, put only agent/workspace data on the per-agent claim") therefore pays the full
+provisioning cost and buys **exactly zero** blast-radius reduction. The duplication is the price of
+the fix, not an option inside it.
+
+It is not purely a cost: per-agent project checkouts structurally retire the BLO-19422 shared
+checkout, and two agents can hold different branches of the same repo at once. Behaviour changes to
+accept, named rather than glossed: a first-run cold `pnpm` install per agent, and worktrees created
+by one agent no longer visible to another of the same company.
+
+Caveats on the numbers: Blockcast's subtree is not mounted here, so the fleet figure is
+extrapolation; `du` counts allocated blocks and pnpm's hardlink sharing does **not** survive a copy
+to a separate volume, so the duplicated copies are genuinely additive; and worktree count grows
+over time.
 
 ## 6. Not in scope
 

@@ -472,7 +472,7 @@ describe("buildJobManifest", () => {
   describe("init containers", () => {
     it("has write-prompt init container with busybox image", () => {
       const { job } = buildJobManifest({ ctx, selfPod });
-      const init = job.spec?.template?.spec?.initContainers?.[0];
+      const init = job.spec?.template?.spec?.initContainers?.find((c) => c.name === "write-prompt");
       expect(init?.name).toBe("write-prompt");
       expect(init?.image).toBe("busybox:1.36");
       expect(init?.imagePullPolicy).toBe("IfNotPresent");
@@ -480,7 +480,7 @@ describe("buildJobManifest", () => {
 
     it("write-prompt writes PROMPT_CONTENT to /tmp/prompt/prompt.txt", () => {
       const { job } = buildJobManifest({ ctx, selfPod });
-      const init = job.spec?.template?.spec?.initContainers?.[0];
+      const init = job.spec?.template?.spec?.initContainers?.find((c) => c.name === "write-prompt");
       expect(init?.command?.[0]).toBe("sh");
       expect(init?.command?.[1]).toBe("-c");
       expect(init?.command?.[2]).toContain("printf '%s' \"$PROMPT_CONTENT\" > /tmp/prompt/prompt.txt");
@@ -493,7 +493,7 @@ describe("buildJobManifest", () => {
       // with EDQUOT. Only BrowserMetrics is redirected (profile auth stays
       // persistent), idempotently, to a per-pod path that dies with the pod.
       const { job } = buildJobManifest({ ctx, selfPod });
-      const init = job.spec?.template?.spec?.initContainers?.[0];
+      const init = job.spec?.template?.spec?.initContainers?.find((c) => c.name === "write-prompt");
       const cmd = init?.command?.[2] ?? "";
       // Paths are shell-quoted because they are operator-configurable
       // (`config.workspaceMountPath` / `config.homeRoot`) and land in the init
@@ -516,7 +516,7 @@ describe("buildJobManifest", () => {
       // A legitimate custom absolute path still builds, and is quoted.
       ctx.config.workspaceMountPath = "/srv/agent-data";
       const { job } = buildJobManifest({ ctx, selfPod });
-      const initCmd = job.spec?.template?.spec?.initContainers?.[0]?.command?.[2] ?? "";
+      const initCmd = job.spec?.template?.spec?.initContainers?.find((c) => c.name === "write-prompt")?.command?.[2] ?? "";
       expect(initCmd).toContain("'/srv/agent-data/.config/google-chrome'");
     });
 
@@ -700,13 +700,13 @@ describe("buildJobManifest", () => {
 
     it("write-prompt mounts the runtime-cache emptyDir so the BrowserMetrics symlink target resolves", () => {
       const { job } = buildJobManifest({ ctx, selfPod });
-      const init = job.spec?.template?.spec?.initContainers?.[0];
+      const init = job.spec?.template?.spec?.initContainers?.find((c) => c.name === "write-prompt");
       expect(init?.volumeMounts).toContainEqual({ name: "runtime-cache", mountPath: "/runtime-cache" });
     });
 
     it("write-prompt mounts prompt volume", () => {
       const { job } = buildJobManifest({ ctx, selfPod });
-      const init = job.spec?.template?.spec?.initContainers?.[0];
+      const init = job.spec?.template?.spec?.initContainers?.find((c) => c.name === "write-prompt");
       expect(init?.volumeMounts).toContainEqual({ name: "prompt", mountPath: "/tmp/prompt" });
     });
 
@@ -716,13 +716,13 @@ describe("buildJobManifest", () => {
       // root filesystem. The data volume is the shared RWX PVC where run logs and
       // session state live.
       const { job } = buildJobManifest({ ctx, selfPod });
-      const init = job.spec?.template?.spec?.initContainers?.[0];
+      const init = job.spec?.template?.spec?.initContainers?.find((c) => c.name === "write-prompt");
       expect(init?.volumeMounts).toContainEqual({ name: "data", mountPath: "/paperclip" });
     });
 
     it("prompt env var contains rendered prompt text", () => {
       const { job, prompt } = buildJobManifest({ ctx, selfPod });
-      const init = job.spec?.template?.spec?.initContainers?.[0];
+      const init = job.spec?.template?.spec?.initContainers?.find((c) => c.name === "write-prompt");
       const promptEnv = init?.env?.find((e: { name: string }) => e.name === "PROMPT_CONTENT");
       expect(promptEnv?.value).toBe(prompt);
     });
@@ -821,7 +821,7 @@ describe("buildJobManifest", () => {
         name: "data",
         mountPath: "/paperclip",
       });
-      expect(job.spec?.template?.spec?.initContainers?.[0]?.volumeMounts).toContainEqual({
+      expect(job.spec?.template?.spec?.initContainers?.find((c) => c.name === "write-prompt")?.volumeMounts).toContainEqual({
         name: "data",
         mountPath: "/paperclip",
       });
@@ -2549,7 +2549,7 @@ describe("buildJobManifest", () => {
       expect(promptSecret).not.toBeNull();
       expect(promptSecret!.data["prompt.txt"]).toBe(largePrompt);
       // Init container should copy from secret volume, not use PROMPT_CONTENT env
-      const init = job.spec?.template?.spec?.initContainers?.[0];
+      const init = job.spec?.template?.spec?.initContainers?.find((c) => c.name === "write-prompt");
       expect(init?.command).toContainEqual(expect.stringContaining("cp"));
       expect(init?.env).toBeUndefined();
       // Should have prompt-secret volume
@@ -2559,7 +2559,7 @@ describe("buildJobManifest", () => {
 
     it("uses env var init container for small prompts", () => {
       const { job } = buildJobManifest({ ctx, selfPod });
-      const init = job.spec?.template?.spec?.initContainers?.[0];
+      const init = job.spec?.template?.spec?.initContainers?.find((c) => c.name === "write-prompt");
       expect(init?.env?.[0]?.name).toBe("PROMPT_CONTENT");
     });
 
@@ -2581,7 +2581,7 @@ describe("buildJobManifest", () => {
     ])("never emits an unexecable PROMPT_CONTENT env: %s (%i B)", (_label, size) => {
       ctx.config = { promptTemplate: "x".repeat(size) };
       const { job } = buildJobManifest({ ctx, selfPod });
-      const init = job.spec?.template?.spec?.initContainers?.[0];
+      const init = job.spec?.template?.spec?.initContainers?.find((c) => c.name === "write-prompt");
       const promptEnv = init?.env?.find((e: { name: string }) => e.name === "PROMPT_CONTENT");
       if (!promptEnv) return; // took the Secret path — safe by construction
       const envStringBytes = Buffer.byteLength(`PROMPT_CONTENT=${promptEnv.value ?? ""}`, "utf-8") + 1;
@@ -2598,7 +2598,7 @@ describe("buildJobManifest", () => {
       ctx.config = { promptTemplate: "x".repeat(firstUnexecableSize) };
       const { promptSecret, job } = buildJobManifest({ ctx, selfPod });
       expect(promptSecret).not.toBeNull();
-      const init = job.spec?.template?.spec?.initContainers?.[0];
+      const init = job.spec?.template?.spec?.initContainers?.find((c) => c.name === "write-prompt");
       expect(init?.env?.find((e: { name: string }) => e.name === "PROMPT_CONTENT")).toBeUndefined();
     });
 
@@ -2609,7 +2609,7 @@ describe("buildJobManifest", () => {
       ctx.config = { promptTemplate: "x".repeat(largestExecable) };
       const { promptSecret, job } = buildJobManifest({ ctx, selfPod });
       expect(promptSecret).toBeNull();
-      const init = job.spec?.template?.spec?.initContainers?.[0];
+      const init = job.spec?.template?.spec?.initContainers?.find((c) => c.name === "write-prompt");
       const promptEnv = init?.env?.find((e: { name: string }) => e.name === "PROMPT_CONTENT");
       expect(Buffer.byteLength(`PROMPT_CONTENT=${promptEnv?.value ?? ""}`, "utf-8") + 1).toBe(MAX_ARG_STRLEN);
     });
@@ -2625,7 +2625,7 @@ describe("buildJobManifest", () => {
       let sawEnvPath = false;
       for (const kib of [1, 64, 119, 120, 121, 128, 130, 160, 200, 300]) {
         ctx.config = { promptTemplate: "x".repeat(kib * 1024) };
-        const value = buildJobManifest({ ctx, selfPod }).job.spec?.template?.spec?.initContainers?.[0]?.env?.find(
+        const value = buildJobManifest({ ctx, selfPod }).job.spec?.template?.spec?.initContainers?.find((c) => c.name === "write-prompt")?.env?.find(
           (e) => e.name === "PROMPT_CONTENT",
         )?.value;
         if (value === undefined) continue; // took the Secret path — not exec'd as a string
@@ -3432,7 +3432,7 @@ describe("per-agent mcp.json layering", () => {
     const { claudeArgs, job, mcpConfigSecret } = buildJobManifest({ ctx, selfPod });
     expect(claudeArgs).not.toContain("--mcp-config");
     expect(claudeArgs).not.toContain("--strict-mcp-config");
-    const init = job.spec!.template.spec!.initContainers![0];
+    const init = job.spec!.template.spec!.initContainers!.find((c) => c.name === "write-prompt")!;
     const initEnvNames = (init.env ?? []).map((e) => e.name);
     expect(initEnvNames).not.toContain("MCP_CONFIG");
     expect(mcpConfigSecret).toBeNull();
@@ -3460,7 +3460,7 @@ describe("per-agent mcp.json layering", () => {
       expect(claudeArgs).toContain("/tmp/prompt/mcp.json");
       expect(claudeArgs).toContain("--strict-mcp-config");
 
-      const init = job.spec!.template.spec!.initContainers![0];
+      const init = job.spec!.template.spec!.initContainers!.find((c) => c.name === "write-prompt")!;
       const initEnvNames = (init.env ?? []).map((e) => e.name);
       expect(initEnvNames).not.toContain("MCP_CONFIG");
 
@@ -3507,7 +3507,7 @@ describe("per-agent mcp.json layering", () => {
     expect(claudeArgs).toContain("/tmp/prompt/mcp.json");
     expect(claudeArgs).toContain("--strict-mcp-config");
 
-    const init = job.spec!.template.spec!.initContainers![0];
+    const init = job.spec!.template.spec!.initContainers!.find((c) => c.name === "write-prompt")!;
     const initEnvNames = (init.env ?? []).map((e) => e.name);
     expect(initEnvNames).not.toContain("MCP_CONFIG");
 
@@ -4192,7 +4192,7 @@ describe("tool-child memory cap (BLO-34477)", () => {
 
   const initCommand = (): string => {
     const { job } = buildJobManifest({ ctx, selfPod });
-    return job.spec?.template?.spec?.initContainers?.[0]?.command?.[2] ?? "";
+    return job.spec?.template?.spec?.initContainers?.find((c) => c.name === "write-prompt")?.command?.[2] ?? "";
   };
   const claudeEnv = (): Map<string, string | undefined> => {
     const { job } = buildJobManifest({ ctx, selfPod });
@@ -4370,7 +4370,7 @@ describe("tool-child memory cap (BLO-34477)", () => {
     it("both containers mount the runtime-cache volume the cap lives on, and the init command parses", () => {
       const { job } = buildJobManifest({ ctx, selfPod });
       const spec = job.spec?.template?.spec;
-      const init = spec?.initContainers?.[0];
+      const init = spec?.initContainers?.find((c) => c.name === "write-prompt");
       const claude = spec?.containers?.find((c) => c.name === "claude");
       const mountedAt = (c: k8s.V1Container | undefined) => (c?.volumeMounts ?? []).find((m) => m.mountPath === "/runtime-cache")?.name;
       expect(mountedAt(init)).toBe("runtime-cache");
@@ -4554,7 +4554,7 @@ describe("scoped writable mounts (BLO-32734)", () => {
     const spec = job.spec?.template?.spec;
     return {
       main: spec?.containers[0]?.volumeMounts ?? [],
-      init: spec?.initContainers?.[0]?.volumeMounts ?? [],
+      init: spec?.initContainers?.find((c) => c.name === "write-prompt")?.volumeMounts ?? [],
     };
   }
 
@@ -4650,7 +4650,7 @@ describe("scoped writable mounts (BLO-32734)", () => {
       ["/paperclip/instances/default/companies/co1/agents/agent-abc/memory/x.md", true],
       ["/paperclip/instances/default/skills/co1/__runtime__/x/SKILL.md", false],
     ];
-    for (const container of [spec?.containers[0], spec?.initContainers?.[0]]) {
+    for (const container of [spec?.containers[0], spec?.initContainers?.find((c) => c.name === "write-prompt")]) {
       const mounts = container?.volumeMounts ?? [];
       for (const target of unreachable) {
         expect(deepestMount(mounts, target)?.name, target).toBe("instance-overlay");
@@ -4706,7 +4706,7 @@ describe("scoped writable mounts (BLO-32734)", () => {
     ];
     // Unit 2: `.local/bin` plus the directory `.local/bin/bunx` symlinks into.
     const droppedLocalBinUnit = ["/paperclip/.local/bin/trivy", "/paperclip/.bun/bin/bun"];
-    for (const container of [spec?.containers[0], spec?.initContainers?.[0]]) {
+    for (const container of [spec?.containers[0], spec?.initContainers?.find((c) => c.name === "write-prompt")]) {
       const mounts = container?.volumeMounts ?? [];
       for (const target of [...credentialsAndForeignWork, ...droppedBinUnit, ...droppedLocalBinUnit]) {
         expect(deepestMount(mounts, target)?.name, target).toBe("root-overlay");
@@ -4764,7 +4764,7 @@ describe("scoped writable mounts (BLO-32734)", () => {
       ctx.config = { ...(ctx.config ?? {}), workspaceMountPath: mountPath };
       setRuntimeIsolation(ctx, { ...WORKSPACE_DESCRIPTOR, storage: isolatedStorage("persistent") });
       const { job, scopedWritableDirs } = buildJobManifest({ ctx, selfPod: makeSelfPod() });
-      const containers = [job.spec?.template?.spec?.containers[0], job.spec?.template?.spec?.initContainers?.[0]];
+      const containers = [job.spec?.template?.spec?.containers[0], job.spec?.template?.spec?.initContainers?.find((c) => c.name === "write-prompt")];
 
       const pnpmHome = new Map(
         containers[0]?.env?.map((e) => [e.name, e.value]),
@@ -4797,7 +4797,7 @@ describe("scoped writable mounts (BLO-32734)", () => {
       ctx.config = { ...(ctx.config ?? {}), workspaceMountPath: mountPath };
       setRuntimeIsolation(ctx, { ...WORKSPACE_DESCRIPTOR, storage: isolatedStorage("persistent") });
       const { job, scopedWritableDirs } = buildJobManifest({ ctx, selfPod: makeSelfPod() });
-      const containers = [job.spec?.template?.spec?.containers[0], job.spec?.template?.spec?.initContainers?.[0]];
+      const containers = [job.spec?.template?.spec?.containers[0], job.spec?.template?.spec?.initContainers?.find((c) => c.name === "write-prompt")];
       const command = containers[0]?.command?.[2] ?? "";
 
       const root = /__pcroot='([^']+)'/.exec(command)?.[1];
@@ -4857,7 +4857,7 @@ describe("scoped writable mounts (BLO-32734)", () => {
     const ctx = makeCtx();
     ctx.config = { isolationMode: "isolated", isolationKey: "cm-1", workspaceMountPath: "/srv/agent-data" };
     const { job, scopedWritableDirs } = buildJobManifest({ ctx, selfPod: makeSelfPod() });
-    const containers = [job.spec?.template?.spec?.containers[0], job.spec?.template?.spec?.initContainers?.[0]];
+    const containers = [job.spec?.template?.spec?.containers[0], job.spec?.template?.spec?.initContainers?.find((c) => c.name === "write-prompt")];
     const root = "/srv/agent-data/instances/default/data/k8s-isolation/co1/agent-abc/cm-1";
 
     // The roots the pod addresses follow the mount the pod actually has. Pinned
@@ -5022,13 +5022,15 @@ describe("scoped writable mounts (BLO-32734)", () => {
     expect(() => buildJobManifest({ ctx, selfPod: makeSelfPod() })).toThrow(/must not be the data mount root/);
   });
 
-  // The server pre-creates the subPath targets through its own /paperclip mount,
-  // so narrowing is only sound when the Job's `data` volume IS that PVC. For any
-  // other backing the kubelet would create the targets root:root and uid 1000
-  // would EACCES at init — so those keep the broad rw mount instead.
+  // Narrowing needs something to narrow, so it is gated on the `data` volume
+  // being a PERSISTENT CLAIM. A per-Job `emptyDir` is shared with nothing.
+  //
+  // It is NOT gated on that claim being the server's own any more (PEN-4932):
+  // `seed-writable-dirs` creates the `subPath` targets from inside the pod, so
+  // narrowing no longer depends on a second process holding the same volume.
   function broadRwOnly(result: ReturnType<typeof buildJobManifest>) {
     const spec = result.job.spec?.template?.spec;
-    for (const mounts of [spec?.containers[0]?.volumeMounts, spec?.initContainers?.[0]?.volumeMounts]) {
+    for (const mounts of [spec?.containers[0]?.volumeMounts, spec?.initContainers?.find((c) => c.name === "write-prompt")?.volumeMounts]) {
       const data = (mounts ?? []).filter((m) => m.name === "data");
       expect(data).toHaveLength(1);
       expect(data[0]?.readOnly).toBeFalsy();
@@ -5048,16 +5050,112 @@ describe("scoped writable mounts (BLO-32734)", () => {
     broadRwOnly(result);
   });
 
-  it("keeps the broad rw mount when the Job's claim is not the server's own PVC", () => {
+  // PEN-4932 stage 4a. This case used to assert the OPPOSITE — `broadRwOnly` —
+  // because the subPath targets could only be created by the server, through
+  // its own mount. `seed-writable-dirs` creates them from inside the pod, so a
+  // claim the server does not hold now narrows like any other. That is the
+  // whole point: stage 4b hands each agent a claim of its own, and this is the
+  // gate that would otherwise send every one of those Jobs to a broad rw mount.
+  it("narrows a claim that is NOT the server's own, and seeds it from inside the pod", () => {
     const ctx = isolatedCtx();
     ctx.config.workspaceVolumeClaim = "some-other-claim";
     const result = buildJobManifest({ ctx, selfPod: makeSelfPod({ pvcClaimName: "paperclip-data" }) });
-    expect(result.job.spec?.template?.spec?.volumes?.find((v) => v.name === "data")?.persistentVolumeClaim).toEqual({
+    const spec = result.job.spec?.template?.spec;
+    expect(spec?.volumes?.find((v) => v.name === "data")?.persistentVolumeClaim).toEqual({
       claimName: "some-other-claim",
     });
-    // The server does not hold that volume, so a server-side mkdir could not
-    // land in it; emitting subPath mounts anyway would be a Job that cannot start.
-    broadRwOnly(result);
+    // Narrowed: the root is the overlay, not a broad rw `data` mount.
+    expect(result.job.metadata?.annotations?.["paperclip.io/data-mount-scope"]).toBe("scoped");
+    const dataMounts = (spec?.containers[0]?.volumeMounts ?? []).filter((m) => m.name === "data");
+    expect(dataMounts.length).toBeGreaterThan(1);
+    expect(dataMounts.every((m) => typeof m.subPath === "string" && m.subPath.length > 0)).toBe(true);
+    // The server CANNOT reach this volume, so it must not be asked to: these
+    // paths are joined onto the server's own mount, and creating them there
+    // would make junk in the wrong volume while the real targets stayed
+    // uncreated. The seeder covers it instead.
+    expect(result.scopedWritableDirs).toEqual([]);
+    const seed = spec?.initContainers?.find((c) => c.name === "seed-writable-dirs");
+    expect(seed).toBeDefined();
+    expect(seed?.securityContext?.runAsUser).toBe(0);
+  });
+
+  describe("seed-writable-dirs (PEN-4932)", () => {
+    function seedOf(result: ReturnType<typeof buildJobManifest>) {
+      return result.job.spec?.template?.spec?.initContainers?.find((c) => c.name === "seed-writable-dirs");
+    }
+
+    it("runs FIRST, ahead of every container that mounts a subPath target", () => {
+      const names = buildJobManifest({ ctx: isolatedCtx(), selfPod: makeSelfPod() })
+        .job.spec?.template?.spec?.initContainers?.map((c) => c.name);
+      // Load-bearing, not cosmetic: the kubelet creates a missing subPath dir
+      // root:root at the moment the container mounting it starts. If
+      // `write-prompt` ran first every target would be created un-writable and
+      // uid 1000 would EACCES — which is the exact failure the seeder exists
+      // to prevent, so position is part of the contract.
+      expect(names?.[0]).toBe("seed-writable-dirs");
+      expect(names).toContain("write-prompt");
+      expect(names!.indexOf("seed-writable-dirs")).toBeLessThan(names!.indexOf("write-prompt"));
+    });
+
+    it("mounts the volume ROOT with no subPath of its own", () => {
+      const seed = seedOf(buildJobManifest({ ctx: isolatedCtx(), selfPod: makeSelfPod() }));
+      // Mounting a `subPath` is precisely what makes the kubelet create that
+      // directory root:root, so a seeder that used one would cause the problem
+      // it is meant to solve.
+      expect(seed?.volumeMounts).toEqual([{ name: "data", mountPath: "/mnt/paperclip-data-seed" }]);
+    });
+
+    it("mkdirs every target and chowns exactly the writable ones", () => {
+      const result = buildJobManifest({ ctx: isolatedCtx(), selfPod: makeSelfPod() });
+      const script = seedOf(result)?.command?.[2] ?? "";
+      expect(script).toMatch(/^set -e; mkdir -p /);
+      expect(script).toContain("chown 1000:1000 ");
+      // Every scoped rw mount is created AND handed to uid 1000.
+      const spec = result.job.spec?.template?.spec;
+      const writable = (spec?.containers[0]?.volumeMounts ?? []).filter(
+        (m) => m.name === "data" && m.subPath && !m.readOnly,
+      );
+      expect(writable.length).toBeGreaterThan(0);
+      const [mkdirPart, chownPart] = [script.split("; chown ")[0] ?? "", script.split("; chown ")[1] ?? ""];
+      for (const m of writable) {
+        expect(mkdirPart).toContain(`'/mnt/paperclip-data-seed/${m.subPath}'`);
+        expect(chownPart).toContain(`'/mnt/paperclip-data-seed/${m.subPath}'`);
+      }
+      // The read-only git-hooks bind is created but NOT chowned: nothing writes
+      // it, and uid 1000 being unable to rewrite the pre-push hook is the
+      // PEN-3156 boundary the broker depends on.
+      const hooks = (spec?.containers[0]?.volumeMounts ?? []).find(
+        (m) => m.name === "data" && m.readOnly && m.subPath?.includes("paperclip-git-hooks"),
+      );
+      expect(hooks).toBeDefined();
+      expect(mkdirPart).toContain(`'/mnt/paperclip-data-seed/${hooks!.subPath}'`);
+      expect(chownPart).not.toContain(`'/mnt/paperclip-data-seed/${hooks!.subPath}'`);
+    });
+
+    it("is the only root container, and takes no more privilege than chown needs", () => {
+      const spec = buildJobManifest({ ctx: isolatedCtx(), selfPod: makeSelfPod() }).job.spec?.template?.spec;
+      const seed = spec?.initContainers?.find((c) => c.name === "seed-writable-dirs");
+      expect(seed?.securityContext).toEqual({
+        capabilities: { drop: ["ALL"], add: ["CHOWN", "FOWNER"] },
+        readOnlyRootFilesystem: true,
+        runAsNonRoot: false,
+        runAsUser: 0,
+        allowPrivilegeEscalation: false,
+      });
+      // The pod default stays non-root, and nothing else inherited uid 0.
+      expect(spec?.securityContext?.runAsNonRoot).toBe(true);
+      const otherRoot = [...(spec?.initContainers ?? []), ...(spec?.containers ?? [])].filter(
+        (c) => c.name !== "seed-writable-dirs" && c.securityContext?.runAsUser === 0,
+      );
+      expect(otherRoot).toEqual([]);
+    });
+
+    it("is omitted entirely when the mount is not narrowed", () => {
+      // No claim -> broad rw -> no subPath targets -> nothing to seed. Emitting
+      // a root container with no work to do would be privilege for free.
+      expect(seedOf(buildJobManifest({ ctx: isolatedCtx(), selfPod: makeSelfPod({ pvcClaimName: null }) }))).toBeUndefined();
+      expect(seedOf(buildJobManifest({ ctx: makeCtx(), selfPod: makeSelfPod() }))).toBeUndefined();
+    });
   });
 
   it("addresses the pre-create targets through the server's own mount under a custom workspaceMountPath", () => {
@@ -5217,18 +5315,19 @@ describe("scoped writable mounts (BLO-32734)", () => {
       expect(entries[0]).toMatchObject({ reason: "no_claim", dataClaimName: "", selfPvcClaimName: "" });
     });
 
-    it("foreign_claim — names the Job's claim and the server's own", () => {
+    // `foreign_claim` was the third reason and is now UNREACHABLE (PEN-4932):
+    // a claim the server does not hold is seeded from inside the pod and
+    // narrows like any other, so it never reaches this classifier. Asserted as
+    // an absence rather than deleted, because leaving it unasserted is how a
+    // reason silently comes back — and coming back would mean every per-agent
+    // Job logging "narrowing skipped" forever on the change that makes the
+    // narrowing work.
+    it("foreign_claim — no longer reachable; a non-self claim is scoped, not broad", () => {
       const ctx = isolatedCtx();
       ctx.config.workspaceVolumeClaim = "some-other-claim";
       const { job } = buildJobManifest({ ctx, selfPod: makeSelfPod({ pvcClaimName: "paperclip-data" }) });
-      expect(job.metadata?.annotations?.[SCOPE_ANNOTATION]).toBe("broad:foreign_claim");
-      const entries = broadRwWarnings();
-      expect(entries).toHaveLength(1);
-      expect(entries[0]).toMatchObject({
-        reason: "foreign_claim",
-        dataClaimName: "some-other-claim",
-        selfPvcClaimName: "paperclip-data",
-      });
+      expect(job.metadata?.annotations?.[SCOPE_ANNOTATION]).toBe("scoped");
+      expect(broadRwWarnings()).toEqual([]);
     });
 
     it("scoped — stamps `scoped` and warns nothing", () => {
