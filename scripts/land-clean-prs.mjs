@@ -405,7 +405,10 @@ export function codeownersPatternToRegExp(pattern) {
           source = "(?:.*/)?"; // `**/b` floats to any depth
           i += 2;
         } else {
-          source += ".*";
+          // gitignore: "other consecutive asterisks are considered regular
+          // asterisks". `a**b` is therefore confined to one segment, where
+          // `.*` would have crossed `/` and owned paths gitignore does not.
+          source += "[^/]*";
           i += 1;
         }
         continue;
@@ -428,6 +431,27 @@ export function codeownersPatternToRegExp(pattern) {
 }
 
 /**
+ * Drops the trailing comment from one CODEOWNERS line.
+ *
+ * A `#` escaped as `\#` is a literal `#` belonging to the pattern, not the
+ * start of a comment, so a blanket `/#.*$/` strip truncates such a pattern
+ * into a different -- and silently wider or narrower -- one.
+ */
+export function stripCodeownersComment(line) {
+  let out = "";
+  for (let i = 0; i < line.length; i += 1) {
+    if (line[i] === "\\" && line[i + 1] === "#") {
+      out += "#"; // escaped, so it is part of the pattern
+      i += 1;
+      continue;
+    }
+    if (line[i] === "#") break;
+    out += line[i];
+  }
+  return out.trim();
+}
+
+/**
  * Parses CODEOWNERS text into rules in file order. Callers must apply
  * LAST-match-wins, which is GitHub's precedence and the opposite of what a
  * `find`-style first-match loop does.
@@ -435,7 +459,7 @@ export function codeownersPatternToRegExp(pattern) {
 export function parseCodeowners(text) {
   return String(text ?? "")
     .split("\n")
-    .map((line) => line.replace(/#.*$/, "").trim())
+    .map((line) => stripCodeownersComment(line))
     .filter((line) => line.length > 0)
     .map((line) => line.split(/\s+/))
     .filter((fields) => fields.length > 1)
@@ -767,6 +791,17 @@ export function isFatalGhError(message) {
   );
 }
 
+/**
+ * A `gh` failure that is specifically "this path does not exist".
+ *
+ * Deliberately narrow: `gh api` always spells the status as `(HTTP 404)`, and
+ * a caller that falls through on anything looser would treat an outage as an
+ * absence. Everything it cannot positively identify reads as unknown.
+ */
+export function isNotFoundGhError(message) {
+  return /HTTP 404/i.test(String(message ?? ""));
+}
+
 export function renderReceipt(rows) {
   const lines = [
     "| PR | action | reason | detail |",
@@ -803,13 +838,29 @@ function gh(args) {
  */
 export function fetchCodeownerRules(repo, run = gh) {
   for (const path of CODEOWNERS_PATHS) {
+    let response;
     try {
-      const encoded = JSON.parse(run(["api", `repos/${repo}/contents/${path}`]))?.content;
-      if (typeof encoded !== "string") continue;
-      return parseCodeowners(Buffer.from(encoded, "base64").toString("utf8"));
-    } catch {
-      // 404 on this location only means try the next one.
+      response = JSON.parse(run(["api", `repos/${repo}/contents/${path}`]));
+    } catch (error) {
+      // ONLY "this location has no CODEOWNERS" may try the next one. A 5xx, a
+      // 403 or a transport failure on a HIGHER-precedence path must not fall
+      // through and silently adopt a lower-precedence file's rules, so
+      // anything not positively identified as a 404 is unreadable => `null`.
+      if (isNotFoundGhError(error?.stderr?.toString() || error?.message || String(error))) {
+        continue;
+      }
+      return null;
     }
+    const { content, encoding } = response ?? {};
+    // A directory at this path answers with an array and no `content`; that is
+    // not a CODEOWNERS file, so the next location still applies.
+    if (typeof content !== "string") continue;
+    // Blobs over 1 MB are not inlined: the API answers `content: ""` with
+    // `encoding: "none"`. That decodes to `""` and parses to `[]` -- the
+    // "measured, nobody is owed" value -- which would drop every outstanding
+    // request and release every held PR at once. It is unread, not empty.
+    if (encoding !== "base64") return null;
+    return parseCodeowners(Buffer.from(content, "base64").toString("utf8"));
   }
   return null;
 }
