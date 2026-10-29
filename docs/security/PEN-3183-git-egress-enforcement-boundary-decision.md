@@ -747,6 +747,64 @@ rejected on the build side and is rejected here too: it leaves a seat-bound agen
 anywhere, so every publish fails at a boundary that reports success. Fail closed and loud at render,
 or do not change it.
 
+### 7.5 Issue-scope overrides of the D1 gate: pinned to agent provenance, not refused (decided 2026-10-29)
+
+**The finding, raised by Devops as PEN-5017 while writing the D1 enablement plan.**
+`enableGitHubPublishBroker` is read by `buildJobManifest` off the **merged** run config.
+`mergeModelProfileAdapterConfig` overlays `issue.assigneeAdapterOverrides.adapterConfig` **last**
+as a shallow spread, and `parseIssueAssigneeAdapterOverrides` accepts arbitrary keys. The only
+provenance guard in that merge, `withAgentScopedEnvProvenance`, re-asserts three keys *inside*
+`env` (BLO-18927); nothing re-asserted top-level keys. The overlay applies only to an issue
+assigned to the agent, which is not a mitigation — an agent can file an issue against itself. So
+the principal the boundary constrains could decline it per-run, and §6's "a flag able to disable a
+refusal is a flag able to reopen the disclosure path" would have had a second, per-issue copy that
+needs no operator at all.
+
+**Not exploitable at this writing, and this section does not claim it was.** The gate is `false`
+everywhere, so an override could only set it to the value it already held. This is **not** a §7.2
+trigger-3 firing: no change put a credential anywhere new. It acquires teeth the moment D1 stage 1
+sets the gate `true` at agent scope.
+
+**Decision: pin the key to agent provenance, discard a lower-scope override, and log the attempt.
+Do not refuse to render.** `AGENT_SCOPE_ONLY_CONFIG_KEYS` in `server/src/services/heartbeat.ts` is
+the top-level sibling of the env-key guard: every listed key in the merged config holds exactly the
+agent/base value, and one the base lacks is absent. Three grounds.
+
+1. **Refusing to render would trade a latent confidentiality finding for a reachable availability
+   one.** Any actor able to assign an issue could park the key on an issue assigned to *another*
+   agent and fail every dispatch of it at manifest build. Discarding the overlay renders the pod
+   exactly as agent scope specifies and strands nobody.
+
+2. **§7.4's "fail closed and loud at render, or do not change it" is not on point here, and was
+   cited as if it were.** That sentence governs silently *stripping* a credential, so that publish
+   fails at a boundary reporting success. Ignoring an issue override is the opposite direction:
+   nothing is removed, nothing reports success falsely, and the pod is what the agent's own config
+   asked for. The sentence is about a change that lies; this one declines an input.
+
+3. **The silence was the real cost of discarding, and it is paid separately.** An agent that opted
+   out would still publish perfectly well, and no metric distinguishes "brokered" from "opted out".
+   The dispatch path therefore logs `agent_scope_only_config_key_override_refused` with the run,
+   agent, issue and refused keys, for both the issue and model-profile routes. That is the "loud"
+   half, without the denial of service.
+
+**Stated weakness: this is a list, and a list is as complete as its last edit.** It is mitigated,
+not removed — the membership is pinned by a test so adding or removing a key is a deliberate act
+with a diff on it, and the maintenance rule is written at the list ("a key belongs here when it
+decides where a credential lands, what uid runs it, or whether a refusal fires"). An allowlist of
+issue-settable keys would be structurally stronger and was considered; it was not taken because the
+live set of keys issue overrides legitimately carry has not been measured, and guessing it would
+break `modelProfile` and workspace selection, which this change deliberately leaves alone. Build
+the allowlist when that measurement exists.
+
+**The audit half.** `enableGitHubPublishBroker` is now in the adapter's `getConfigSchema()`, so the
+state of a credential boundary is legible to a reviewer looking at the agent rather than only to
+whoever reads the database. That field is a **view** — the pin above is the enforcement, and both
+the field's hint and its provenance entry say so, because describing a UI toggle as the boundary
+would be the §8 overclaim.
+
+**Scope.** Nothing here changes the gate's default, the broker, the wrapper, the hook, the scanner
+or the credential path, and nothing here approaches §8's forbidden list.
+
 ## 8. Bounds on what may be built against this decision
 
 Permitted without further security review:

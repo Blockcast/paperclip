@@ -2795,6 +2795,97 @@ function withAgentScopedEnvProvenance(
   return { ...merged, env };
 }
 
+// PEN-5017. The same hazard withAgentScopedEnvProvenance closes for `env`
+// keys, one level up: TOP-LEVEL adapterConfig keys that gate a security
+// boundary of the rendered pod rather than express a preference.
+//
+// `enableGitHubPublishBroker` is the first key where it has teeth. It decides
+// whether the GitHub push credential is mounted into the agent container or
+// into a sidecar at a different uid (PEN-4933 / PEN-3183 D1). It is read off
+// the MERGED run config in buildJobManifest, and the merge below overlays
+// `issue.assigneeAdapterOverrides.adapterConfig` last with no key allowlist —
+// so without this filter, an issue assigned to the agent could carry
+// `enableGitHubPublishBroker: false` and render the credential back into the
+// agent's own container. An agent can file such an issue against itself, so
+// the `assigneeAgentId === agent.id` gate on the overlay is not a mitigation.
+//
+// A boundary the constrained principal can decline per-run is not a boundary,
+// it is a default — and this one would fail silently in the permissive
+// direction, because an agent that opted out still publishes perfectly well
+// and no metric distinguishes "brokered" from "opted out".
+//
+// ⚠ MAINTENANCE OBLIGATION. This is a list, so it is exactly as complete as
+// its last edit. Add a key here when a top-level adapterConfig key starts
+// deciding where a credential lands, what uid runs it, or whether a refusal
+// fires — not when it merely changes cost, model or placement. The membership
+// is pinned by a test, so adding or removing one is a deliberate act.
+//
+// Deliberately NOT a throw. Refusing to render would convert a finding that is
+// not currently exploitable into a reachable denial of service: any actor able
+// to assign an issue could park a guarded key on an issue assigned to another
+// agent and brick every dispatch of it. §7.4's "fail closed and loud at
+// render, or do not change it" is about silently STRIPPING a credential so
+// that publishing fails at a boundary reporting success — the opposite
+// direction. Ignoring the overlay renders the pod exactly as agent scope
+// specifies and claims nothing false. The "loud" half is kept by logging the
+// attempt at the call site (see agentScopeOnlyConfigKeyOverrides).
+const AGENT_SCOPE_ONLY_CONFIG_KEYS = new Set([
+  "enableGitHubPublishBroker",
+]);
+
+function isAgentScopeOnlyConfigKey(key: string) {
+  return AGENT_SCOPE_ONLY_CONFIG_KEYS.has(key);
+}
+
+/**
+ * Keys an overlay supplied that the merge will NOT honour. Exported so the
+ * dispatch path can log the attempt: the guard below is silent by design, and
+ * a security boundary that quietly discards input is one an operator cannot
+ * tell from one that was never tested.
+ */
+export function agentScopeOnlyConfigKeyOverrides(
+  overlayConfig: Record<string, unknown> | null | undefined,
+): string[] {
+  if (!overlayConfig) return [];
+  return Object.keys(overlayConfig).filter(isAgentScopeOnlyConfigKey);
+}
+
+// Post-condition: every AGENT_SCOPE_ONLY_CONFIG_KEY present in the merged
+// config holds exactly the baseConfig value, and any the baseConfig lacks is
+// absent. Both directions matter — introducing the key is how an agent would
+// opt out of a boundary that is on, and deleting it is how one would opt out
+// of a default that is on because `asBoolean(config.x, false)` reads an absent
+// key as `false`.
+//
+// Restores from baseConfig, so a value arriving via modelProfile.adapterConfig
+// is ignored too. Same reason withAgentScopedEnvProvenance gives: the key
+// resolves from the agent's primary config and nowhere else, so there is one
+// place to audit rather than one per profile.
+function withAgentScopedConfigProvenance(
+  merged: Record<string, unknown>,
+  baseConfig: Record<string, unknown>,
+): Record<string, unknown> {
+  let next: Record<string, unknown> | null = null;
+  for (const key of AGENT_SCOPE_ONLY_CONFIG_KEYS) {
+    const baseHasKey = Object.prototype.hasOwnProperty.call(baseConfig, key);
+    const mergedHasKey = Object.prototype.hasOwnProperty.call(merged, key);
+    if (baseHasKey) {
+      if (mergedHasKey && merged[key] === baseConfig[key]) continue;
+      next ??= { ...merged };
+      next[key] = baseConfig[key];
+      continue;
+    }
+    if (!mergedHasKey) continue;
+    // Delete rather than assign `undefined`: an explicitly-undefined property
+    // survives a spread and is still `Object.hasOwn`-visible, and this file
+    // already treats key presence as meaningful (see
+    // withPolicyResolvedWorkspaceStrategy, which deletes for the same reason).
+    next ??= { ...merged };
+    delete next[key];
+  }
+  return next ?? merged;
+}
+
 function assertLowTrustEnvConfigAllowed(envValue: unknown, source: string) {
   const record = stripPaperclipRuntimeEnvBindings(envValue);
   if (!record) return;
@@ -6840,10 +6931,13 @@ export function mergeModelProfileAdapterConfig(input: {
     ...(input.modelProfile.adapterConfig ?? {}),
     ...(input.issueAdapterConfig ?? {}),
   };
-  return withPolicyResolvedWorkspaceStrategy(
-    withAgentScopedEnvProvenance(merged, input.baseConfig),
+  return withAgentScopedConfigProvenance(
+    withPolicyResolvedWorkspaceStrategy(
+      withAgentScopedEnvProvenance(merged, input.baseConfig),
+      input.baseConfig,
+      input.issueAdapterConfig,
+    ),
     input.baseConfig,
-    input.issueAdapterConfig,
   );
 }
 
@@ -34160,6 +34254,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       modelProfile: modelProfileApplication,
       issueAdapterConfig: issueAssigneeOverrides?.adapterConfig ?? null,
     });
+    // PEN-5017: the guard inside the merge is silent by design (see
+    // AGENT_SCOPE_ONLY_CONFIG_KEYS for why it discards rather than throws).
+    // This is its loud half — without it, an attempt to opt out of a rendered
+    // security boundary leaves no trace anywhere, and an operator cannot tell
+    // a boundary that held from one that was never reached. Warn, not error:
+    // the run is correct, it is the input that was refused.
+    const refusedAgentScopeOnlyConfigKeys = [
+      ...agentScopeOnlyConfigKeyOverrides(issueAssigneeOverrides?.adapterConfig ?? null).map(
+        (key) => ({ key, source: "issue_assignee_adapter_overrides" as const }),
+      ),
+      ...agentScopeOnlyConfigKeyOverrides(modelProfileApplication.adapterConfig).map(
+        (key) => ({ key, source: "model_profile" as const }),
+      ),
+    ];
+    if (refusedAgentScopeOnlyConfigKeys.length > 0) {
+      logger.warn(
+        {
+          event: "agent_scope_only_config_key_override_refused",
+          runId: run.id,
+          agentId: agent.id,
+          issueId,
+          refused: refusedAgentScopeOnlyConfigKeys,
+        },
+        "Refused a lower-scope override of an agent-scope-only adapter config key; the agent-scope value was used",
+      );
+    }
     const configSnapshot = buildExecutionWorkspaceConfigSnapshot(mergedConfig, selectedEnvironmentId);
     const executionRunConfig = stripWorkspaceRuntimeFromExecutionRunConfig(mergedConfig);
     const selectedEnvironmentForConfig = selectedEnvironmentId === localEnvironment.id

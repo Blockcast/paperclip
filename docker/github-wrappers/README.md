@@ -77,7 +77,11 @@ that makes the absolute path safe.
 
 When `enableGitHubPublishBroker` is set on the agent adapter, the GitHub
 credential Secret stops being mounted into the agent container and is mounted
-into a `github-publish-broker` sidecar instead. These scripts are unchanged in
+into a `github-publish-broker` sidecar instead. *On the agent adapter* is the
+whole of it: PEN-5017 pins the key to agent provenance, so a per-issue
+`assigneeAdapterOverrides.adapterConfig` carrying it is discarded and logged,
+never honoured — otherwise an agent could file an issue against itself and
+render the credential back into its own container. These scripts are unchanged in
 shape — they still lead PATH, still re-read the token file, still exec the same
 egress runtimes — but in the agent container that token file no longer exists,
 and each runtime hands the invocation to the broker over a unix socket.
