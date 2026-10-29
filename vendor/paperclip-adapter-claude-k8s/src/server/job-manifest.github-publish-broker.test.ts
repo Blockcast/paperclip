@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import type * as k8s from "@kubernetes/client-node";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
-import { buildJobManifest } from "./job-manifest.js";
+import { buildJobManifest, findPrivilegedContainersBesideBroker } from "./job-manifest.js";
 import type { SelfPodInfo } from "./k8s-client.js";
 
 // PEN-4933 / PEN-3183 D1: the boundary test.
@@ -324,6 +324,143 @@ describe("GitHub publish broker boundary (PEN-4933 / PEN-3183 D1)", () => {
 
       expect(brokerContainer(spec)?.image).toBe("registry.example/operator-agent:pinned");
       expect(brokerContainer(spec)?.image).toBe(agentContainer(spec).image);
+    });
+  });
+
+
+  // PEN-5026 / PEN-3183 §7.6. The cases above all ask "what is inside the
+  // boundary". These ask the question that defeats it from outside: what ELSE
+  // is in the pod. A privileged container never needs the credential volume
+  // mounted — privileged is `setns` into another container's mount namespace,
+  // and it is mounting the node filesystem where the kubelet already wrote the
+  // Secret. So the boundary is a property of the POD, and these pin it there.
+  describe("nothing privileged beside the broker (PEN-5026)", () => {
+    const dockerAndBroker = { enableGitHubPublishBroker: true, enableDocker: true };
+
+    it("REFUSES to render a brokered pod that also carries the privileged DinD sidecar", () => {
+      // The whole finding, as one assertion. Before this, the combination
+      // rendered silently: publishing worked either way, so nothing — no
+      // metric, no log line, no failed dispatch — distinguished "brokered and
+      // isolated" from "brokered with privileged root beside it". That is what
+      // made a D1 soak containing such an agent evidence of nothing.
+      expect(() => buildJobManifest({ ctx: makeCtx(dockerAndBroker), selfPod: baseSelfPod })).toThrow(
+        /also carry privilege outside the broker \(dind: privileged: true/,
+      );
+    });
+
+    it("names the remedy and the release condition in the refusal", () => {
+      // A refusal with no exit is how a capability gets quietly deleted. The
+      // operator is told which switch to turn off; §7.6's release condition —
+      // an unprivileged container runtime — is named so that the next person
+      // who needs docker beside a broker builds that rather than deleting this.
+      let message = "";
+      try {
+        buildJobManifest({ ctx: makeCtx(dockerAndBroker), selfPod: baseSelfPod });
+      } catch (err) {
+        message = (err as Error).message;
+      }
+      expect(message).toMatch(/turn off `enableDocker` on this agent, or leave the broker disabled/);
+      expect(message).toMatch(/unprivileged container runtime/);
+      // The socket matters as much as the sidecar: the agent is handed it and
+      // can start further privileged containers with arbitrary host mounts.
+      expect(message).toMatch(/docker socket/);
+    });
+
+    it("leaves a docker-enabled run alone when the broker was not asked for", () => {
+      // Scoping control, the same shape as the broad-mount one above. Without
+      // it the refusal could widen to every docker-enabled pod — which is the
+      // whole fleet's toolchain — and still look correct here.
+      const { job } = buildJobManifest({ ctx: makeCtx({ enableDocker: true }), selfPod: baseSelfPod });
+      const spec = job.spec!.template!.spec!;
+      expect(brokerContainer(spec)).toBeUndefined();
+      expect(spec.initContainers?.find((c) => c.name === "dind")?.securityContext?.privileged).toBe(true);
+    });
+
+    it("POSITIVE CONTROL: an ordinary brokered pod is clean, so the check can pass", () => {
+      // Without this, a check that refused unconditionally — or one wired to a
+      // predicate that always matched — would pass every case above while
+      // making the broker unrenderable in every configuration. The assertion
+      // is on the helper, not just on "it didn't throw", so a future change
+      // that stops CALLING the helper still leaves this reading the real thing.
+      const spec = render(true);
+      expect(brokerContainer(spec)).toBeDefined();
+      expect(findPrivilegedContainersBesideBroker(spec)).toEqual([]);
+    });
+
+    it("exempts the broker itself, and nothing else, by name", () => {
+      // The broker is skipped because it IS the boundary. Pinned against the
+      // constant drifting away from the container's rendered name, which would
+      // either exempt the wrong container or exempt none and refuse every
+      // brokered pod.
+      const spec = render(true);
+      const broker = brokerContainer(spec)!;
+      expect(findPrivilegedContainersBesideBroker({ containers: [broker] })).toEqual([]);
+      expect(findPrivilegedContainersBesideBroker({ containers: [{ ...broker, name: "not-the-broker" }] })).toEqual([]);
+    });
+
+    it("trips on a container that merely omits allowPrivilegeEscalation", () => {
+      // Fail-closed on UNSET, because Kubernetes defaults the field to true.
+      // Reading absent as false would make this backstop silently inert on
+      // exactly the container nobody thought about — the only kind it exists
+      // to catch.
+      expect(findPrivilegedContainersBesideBroker({ containers: [{ name: "careless", image: "x" }] })).toEqual([
+        "careless: allowPrivilegeEscalation is unset (Kubernetes defaults it to true)",
+      ]);
+    });
+
+    it("trips on an escape-capable capability, not on the seed container's DAC_OVERRIDE", () => {
+      // The capability list is about crossing OUT of a container. SYS_ADMIN is
+      // `mount` and `setns`. DAC_OVERRIDE bypasses file permissions inside the
+      // holder's own mount namespace and reaches nothing else — and it is
+      // load-bearing for the seed init container, so a list that included it
+      // would make the broker unrenderable wherever the narrow mount needs
+      // seeding, which is everywhere the broker is legal.
+      const base = { image: "x", securityContext: { allowPrivilegeEscalation: false } } as const;
+      expect(
+        findPrivilegedContainersBesideBroker({
+          containers: [{ ...base, name: "mounter", securityContext: { allowPrivilegeEscalation: false, capabilities: { add: ["SYS_ADMIN"] } } }],
+        }),
+      ).toEqual(["mounter: capabilities.add includes SYS_ADMIN"]);
+      expect(
+        findPrivilegedContainersBesideBroker({
+          containers: [{ ...base, name: "seeder", securityContext: { allowPrivilegeEscalation: false, capabilities: { drop: ["ALL"], add: ["CHOWN", "DAC_OVERRIDE"] } } }],
+        }),
+      ).toEqual([]);
+    });
+
+    it("does not refuse a brokered pod merely because a container runs as uid 0", () => {
+      // THE DISCRIMINATOR IS PRIVILEGE, NOT UID — pinned so that "tightening"
+      // this to `runAsUser === 0` fails here rather than bricking the broker in
+      // production. The container below is PEN-4932's `seed-writable-dirs`,
+      // reproduced literally: it is uid 0 by necessity, because it creates the
+      // subPath targets a narrow mount needs, and the narrow mount is itself a
+      // precondition of the broker (see the broad-mount refusal). It is
+      // unprivileged, every capability dropped but the two it uses, and it has
+      // exited before the broker process exists.
+      //
+      // Written as a fixture rather than rendered, deliberately: this branch
+      // stacks on #3112, whose base predates the seeder, so there is no
+      // `seed-writable-dirs` in a manifest built HERE. The fixture is copied
+      // from the real one on master and the combination is verified against
+      // master by test-merge (see the PR body). When this lands the seeder is
+      // in the pod for real, and this case is what stops the two meeting for
+      // the first time in production.
+      expect(
+        findPrivilegedContainersBesideBroker({
+          containers: [
+            {
+              name: "seed-writable-dirs",
+              image: "busybox:1.36",
+              securityContext: {
+                capabilities: { drop: ["ALL"], add: ["CHOWN", "DAC_OVERRIDE"] },
+                runAsNonRoot: false,
+                runAsUser: 0,
+                allowPrivilegeEscalation: false,
+              },
+            },
+          ],
+        }),
+      ).toEqual([]);
     });
   });
 
