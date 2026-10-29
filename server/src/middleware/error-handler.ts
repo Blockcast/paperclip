@@ -2,7 +2,7 @@ import type { Request, Response, NextFunction } from "express";
 import type { Db } from "@paperclipai/db";
 import { ZodError } from "zod";
 import { HttpError } from "../errors.js";
-import { findPgError, TRANSIENT_DB_SQLSTATES } from "../lib/db-retry.js";
+import { findPgError, STATEMENT_TIMEOUT_SQLSTATE, TRANSIENT_DB_SQLSTATES } from "../lib/db-retry.js";
 import { trackErrorHandlerCrash } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import { COMPANY_IMPORT_API_PATH } from "../routes/company-import-paths.js";
@@ -184,13 +184,32 @@ export function errorHandler(
   // and `idempotencyKey` is optional on that route — so a caller told the write
   // "did not apply" would post a duplicate comment on replay. Report the
   // classification, which is provable; leave replay safety to the caller.
+  //
+  // PEN-3596: `57014` is NOT contention and must not be reported as such. It is
+  // `query_canceled` — the statement ran longer than the role's
+  // `statement_timeout` (30s, applied 2026-05-13) and the server cancelled it.
+  // Nothing was waiting on a lock. Reported as "Database contention" it sends
+  // the reader hunting a lock that does not exist, and it hides the only
+  // actionable fact: the query is too expensive for the bound. The three
+  // genuine contention states (40P01 deadlock, 40001 serialization failure,
+  // 55P03 lock_timeout) keep the original wording and code.
+  //
+  // Retry classification is deliberately untouched — `TRANSIENT_DB_SQLSTATES`
+  // still carries 57014 for db-retry.ts, because a statement cancelled under a
+  // transient load spike can succeed on replay. This splits only what the
+  // caller is *told*.
   const pgError = findPgError(err);
   if (pgError && TRANSIENT_DB_SQLSTATES.has(pgError.code)) {
+    const isStatementTimeout = pgError.code === STATEMENT_TIMEOUT_SQLSTATE;
     res.status(503).json({
-      error:
-        "Database contention: the failing statement was rolled back. " +
-        "Earlier statements in this request may have applied — replay only if it is idempotent.",
-      code: "transient_db_conflict",
+      error: isStatementTimeout
+        ? "Database statement timeout: the statement exceeded the server statement_timeout, "
+          + "was cancelled, and was rolled back. This is query cost, not lock contention — "
+          + "nothing was waiting on a lock. "
+          + "Earlier statements in this request may have applied — replay only if it is idempotent."
+        : "Database contention: the failing statement was rolled back. "
+          + "Earlier statements in this request may have applied — replay only if it is idempotent.",
+      code: isStatementTimeout ? "statement_timeout" : "transient_db_conflict",
       details: { sqlstate: pgError.code },
     });
     return;

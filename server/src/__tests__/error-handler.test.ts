@@ -1,7 +1,7 @@
 import type { NextFunction, Request, Response } from "express";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { HttpError } from "../errors.js";
-import { TRANSIENT_DB_SQLSTATES } from "../lib/db-retry.js";
+import { STATEMENT_TIMEOUT_SQLSTATE, TRANSIENT_DB_SQLSTATES } from "../lib/db-retry.js";
 import { errorHandler } from "../middleware/error-handler.js";
 
 const recordResponsibleUserDenialOnActiveRunMock = vi.hoisted(() => vi.fn());
@@ -134,8 +134,11 @@ describe("errorHandler", () => {
       code: "transient_db_conflict",
     };
 
-    it("reports every transient SQLSTATE as a typed 503", () => {
+    it("reports every contention SQLSTATE as a typed 503", () => {
+      // PEN-3596: 57014 is excluded here — it is a statement timeout, not
+      // contention, and has its own body asserted below.
       for (const code of TRANSIENT_DB_SQLSTATES) {
+        if (code === STATEMENT_TIMEOUT_SQLSTATE) continue;
         const res = makeRes() as any;
         errorHandler(
           Object.assign(new Error(`pg error ${code}`), { code }),
@@ -150,6 +153,39 @@ describe("errorHandler", () => {
           details: { sqlstate: code },
         });
       }
+    });
+
+    // PEN-3596: a cancelled statement was reported as "Database contention",
+    // which sends the reader hunting a lock that is not there. The issues-list
+    // query reached 25.7-28.9s against the 30s role statement_timeout on the
+    // live PEN company, so this is the body callers actually received.
+    it("reports a statement timeout as a timeout, not as contention", () => {
+      const res = makeRes() as any;
+      errorHandler(
+        Object.assign(new Error("canceling statement due to statement timeout"), {
+          code: STATEMENT_TIMEOUT_SQLSTATE,
+        }),
+        makeReq(),
+        res,
+        vi.fn() as unknown as NextFunction,
+      );
+
+      expect(res.status).toHaveBeenCalledWith(503);
+      const body = res.json.mock.calls[0][0];
+      expect(body.code).toBe("statement_timeout");
+      expect(body.details).toEqual({ sqlstate: "57014" });
+      // Asserts the replacement claim, not merely the absence of a keyword:
+      // the new wording still contains the word "contention" (in "not lock
+      // contention"), so a bare keyword ban would both pass vacuously here and
+      // fail on the disclaimer.
+      expect(body.error).toContain("statement timeout");
+      expect(body.error).toContain("not lock contention");
+      expect(body.error).toContain("replay only if it is idempotent");
+      expect(body.error).not.toContain("Database contention");
+    });
+
+    it("keeps 57014 retryable — this split changes the report, not the retry set", () => {
+      expect(TRANSIENT_DB_SQLSTATES.has(STATEMENT_TIMEOUT_SQLSTATE)).toBe(true);
     });
 
     it("unwraps the drizzle wrapper the lock timeout actually arrives in", () => {

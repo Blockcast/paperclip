@@ -28,6 +28,16 @@
  */
 
 /**
+ * `query_canceled`. PEN-3596: this is the one member of
+ * {@link TRANSIENT_DB_SQLSTATES} that is NOT contention — the statement
+ * outran the role's `statement_timeout` and nothing was waiting on a lock.
+ * It stays in the retry set (a cancellation under a transient load spike can
+ * succeed on replay), but the API boundary reports it separately so a reader
+ * is not sent looking for a lock that does not exist.
+ */
+export const STATEMENT_TIMEOUT_SQLSTATE = "57014";
+
+/**
  * Transient PostgreSQL SQLSTATEs worth replaying. Deadlock, serialization
  * failure, lock-not-available (lock_timeout), and query-canceled
  * (statement_timeout). Non-transient errors (unique violation 23505, etc.)
@@ -37,7 +47,7 @@ export const TRANSIENT_DB_SQLSTATES = new Set([
   "40P01", // deadlock_detected
   "40001", // serialization_failure
   "55P03", // lock_not_available (lock_timeout)
-  "57014", // query_canceled (statement_timeout)
+  STATEMENT_TIMEOUT_SQLSTATE, // query_canceled (statement_timeout) — not contention
 ]);
 
 /** True when `error` carries a transient PostgreSQL SQLSTATE `code`. */
