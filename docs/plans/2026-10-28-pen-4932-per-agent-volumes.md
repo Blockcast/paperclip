@@ -152,8 +152,10 @@ promtool/amtool derivation both run unchanged. What they lose is a stale copy th
 
 ⚠️ This is the one row where "drop" is a behaviour change rather than removing something already
 broken: unlike the Python shims (§3.4), these five binaries do run. The mitigation is stated above
-and should be verified in stage 3 rather than assumed — specifically, that an agent can still run
+and should be verified rather than assumed — specifically, that an agent can still run
 `scripts/kyverno-test-strict.sh`, which invokes bare `kyverno` off `PATH`.
+**Done: §3.7 item 1** measured the fetch from a live agent pod, checksum-matched against the
+digest the CI action pins. This row is no longer an open risk.
 
 ### 3.6 The `pre-push` hook is not server state, and baking it retires an outage class
 
@@ -187,6 +189,50 @@ either re-creates the 2h17m outage or, worse, leaves `core.hooksPath` pointing a
 holding no hook, which fails *open*: pushes succeed, unscanned. It belongs in stage 3 with its own
 review, moving all four consumers together.
 
+### 3.7 Stage-3 preconditions, measured 2026-10-29
+
+Four things stage 3 rests on that were previously asserted rather than measured. Each was read
+from a live agent pod on 2026-10-29, after #3079 and #3081 merged.
+
+**1. The `kyverno` drop is safe — the fetch path works from an agent pod.** §3.5 flagged this as
+the one row where "drop" is a behaviour change rather than removing something already broken, and
+said it *"should be verified in stage 3 rather than assumed"*. Now verified: an agent pod fetched
+`kyverno-cli_v1.18.0_linux_x86_64.tar.gz` (51,849,993 bytes) from the GitHub release and its
+SHA256 matched `3aa7b7aa…718904` — byte-identical to the digest pinned in
+`onprem-k8s/.github/actions/install-kyverno-cli`. Egress, version and checksum all hold, so
+`scripts/kyverno-test-strict.sh` can provision exactly the binary CI provisions. The PVC copy is
+also v1.18.0, so dropping changes the *provisioning path*, not the version.
+
+**2. `jre` is reachable only as the target of `bin/java`, and the image's `java` is independent of
+the PVC.** `/paperclip/bin/java` is a symlink to `/paperclip/jre/bin/java`, so those two subPaths
+are one unit and must be removed **together** — dropping `bin` alone orphans `jre`, dropping `jre`
+alone breaks the symlink. On unshadow, `java` resolves to `/usr/bin/java` →
+`/etc/alternatives/java` → `/usr/lib/jvm/java-21-openjdk-amd64/bin/java`, **openjdk 21.0.12.1**,
+entirely image-resident: `readlink -f` leaves `/paperclip` altogether. (The PVC `jre` is 21.0.11,
+so this is the upgrade §3.3 predicted, now confirmed end-to-end rather than by version string.)
+
+**3. `.cache/puppeteer-browsers` is already unreachable.** `PUPPETEER_CACHE_DIR` and
+`PUPPETEER_CONFIG_DIR` are both `/opt/puppeteer` — an image path, not this mount — so nothing
+resolves a browser through the PVC. The mount holds Chrome `linux-149.0.7827.54`: the same stale
+149 §3.2 identifies as the PEN-4682 hazard. Dropping it removes a copy nothing reads.
+⚠️ Noted in passing and explicitly **not** this issue's to fix: `/opt/puppeteer` does not exist in
+the image either, so both variables point at nothing. That is pre-existing and orthogonal to the
+mount; it is recorded here only so the next reader does not mistake it for stage-3 fallout.
+
+**4. Only `bin` and the hooks dir are reachable at all.** Re-confirmed against the live `PATH`: of
+the seven `ROOT_TOOLCHAIN_SUBPATHS` entries, only `/paperclip/bin` is on `PATH` (position 7, ahead
+of `/usr/local/bin` at 9). `.local/bin` and `.bun/bin` are mounted but absent from `PATH`; `tools`
+and `jre` are data directories; `.local/share/paperclip-git-hooks` is reached through
+`core.hooksPath`, not `PATH`. So the entire behavioural surface of stage 3 is `bin` (unshadowing,
+§3.3) plus the hook (relocation, §3.6).
+
+> ⚠️ **This does not make a partial stage 3 worth doing.** Five of the seven subPaths are
+> unreachable, which makes "remove just those five" look like a safe down-payment. It buys
+> **nothing**: every subPath binds the *same* volume handle (`csi-vol-3bdd0e68-…`), and ceph-csi's
+> `IDLocker` keys on the handle, not the bind. Blast radius falls only when the last bind to that
+> handle goes — so a partial removal reduces mount count while leaving lock exposure exactly where
+> it was. Stage 3 is whole or it is nothing.
+
 ## 4. Staging
 
 1. **Bake the unambiguous gaps.** `yq`, `bun`/`bunx`. *Done.* Zero fleet risk: adding a
@@ -199,6 +245,25 @@ review, moving all four consumers together.
 3. **Remove `ROOT_TOOLCHAIN_SUBPATHS` from the Job spec**, and move the `pre-push` hook into the
    image in the same change. Only after 1–2; this is the step that actually retires the
    cross-agent mount, and the first step that can break a running agent.
+
+   **Its precondition, and how to check it.** Stage 3 is safe only once agents actually *run* an
+   image built from a commit at or after `992d21fc` (the `kubectl` pin, #3081). On an older image
+   the mount removal is a silent four-minor `kubectl` downgrade — the regression #3081 exists to
+   prevent (§3.3). The rollout is automatic, but it is **not** the image build: the final step of
+   `.github/workflows/docker-agent.yml`, *Bump agent image refs in cluster*, PATCHes each agent's
+   `adapter_config.image` to `sha-<short>-k8s-vendored` through `/admin/agents/bump-agent-image`.
+
+   Check the **property**, never a tag. A toolchain tag hashes live registry digests resolved at
+   build time, so it cannot be computed from the repo — two separate attempts to predict it were
+   wrong, for two different reasons. Either read a fresh agent pod's `image:` and confirm its
+   commit contains the pin, or run `/usr/local/bin/kubectl version --client` inside one and
+   require `v1.35.3`.
+
+   ⚠️ That bump step has a known **silent** failure mode, and it is the last link in the chain so
+   nothing downstream recovers it. BLO-33382 records a ~30 s `paperclip-api` restart returning 503
+   and permanently dropping the bump for three consecutive commits: images built, smoke-tested and
+   promoted to Harbor, cluster refs never advancing, `pending_image_bump` left null so nothing
+   retried. **Verify the deployed ref; do not infer it from a green build.**
 4. **Per-agent claim.** Swap `dataClaimName` (`job-manifest.ts:2666`) to a per-agent PVC, following
    the existing `opencode-db-<agentId>` precedent (`paperclip.io/pvc-type=agent-db`).
 5. **Demonstrate and re-measure.** PEN-4932's acceptance criterion.
