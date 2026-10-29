@@ -19,6 +19,10 @@ import {
 import type { SelfPodInfo } from "./k8s-client.js";
 import { buildEnvGuardPluginCleanupShell, buildEnvGuardPluginSetupShell } from "./env-guard-plugin.js";
 import {
+  buildSharedDocOverlayShell,
+  parseSharedDocOverlay,
+} from "./shared-doc-overlay.js";
+import {
   isAgentInheritableEnvFromRef,
   isAgentInheritableEnvName,
   isAgentInheritableSecretVolume,
@@ -1542,6 +1546,28 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
         `fi && cd ${shellQuote(isolation.workspaceRoot!)}`,
       ].join(" ")}; } || { echo "[paperclip] failed to prepare isolated workspace" >&2; exit 1; }; `
     : "";
+  // PEN-3329. Both branches of `workspaceSetup` above lose the shared docs the server
+  // materialized into the execution workspace: the clone carries tracked objects only,
+  // and the fallback branch hands the run an empty directory. This runs after either one
+  // and copies the declared set across. Gated on the same condition as `workspaceSetup`
+  // because every other isolation mode mounts that workspace directly and already has
+  // them.
+  //
+  // This does NOT replace `sharedDocsBridge` above, and the two are not redundant. That
+  // one symlinks a whole company `docs/` directory in, and does nothing at all when a
+  // `docs/` already exists — which is every project repo that ships its own docs, i.e.
+  // exactly the case where the materialized company docs are missing and the tracked
+  // ones are not. This copies the declared files individually and skips only the
+  // individual paths that are already present, so the two compose: the bridge keeps
+  // covering repos with no `docs/` of their own, this covers the rest.
+  const sharedDocOverlay = workspaceSetup ? parseSharedDocOverlay(context.paperclipSharedDocs) : null;
+  const sharedDocOverlaySetup = sharedDocOverlay
+    ? `${buildSharedDocOverlayShell({
+        overlay: sharedDocOverlay,
+        workspaceRoot: isolation.workspaceRoot!,
+        quote: shellQuote,
+      })}; `
+    : "";
   // opencode-db schema-compat guard (root-caused 2026-06-21, BLO follow-up).
   // The persistent opencode.db is keyed per (company, agent, taskKey) and reused
   // across runs (workspace_subpath mode). When the vendored opencode binary is
@@ -1587,7 +1613,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // so a verdict after it would describe a pod that had already reached GitHub.
   // Advisory — the push path already fails closed; this buys time-to-diagnosis.
   const prePushHookPreflight = buildPrePushHookPreflightShell({ dataMountPath: workspaceMountPath });
-  const baseMainCommand = `set -o pipefail; ${imageWrapperPreflight}; ${prePushHookPreflight}; ${isolatedRuntimePrep}${opencodeRuntime}${workspaceSetup}${credentialSetup}${envGuardPluginSetup}${configSetup}${dbResetGuard}${compactPrefix}${sharedDocsBridge}mkdir -p $(dirname ${shellQuote(podLogPath)}) && : > ${shellQuote(podLogPath)} && cat /tmp/prompt/prompt.txt | ${launcherCommand} ${opencodeArgsEscaped} | tee -a ${shellQuote(podLogPath)}`;
+  const baseMainCommand = `set -o pipefail; ${imageWrapperPreflight}; ${prePushHookPreflight}; ${isolatedRuntimePrep}${opencodeRuntime}${workspaceSetup}${sharedDocOverlaySetup}${credentialSetup}${envGuardPluginSetup}${configSetup}${dbResetGuard}${compactPrefix}${sharedDocsBridge}mkdir -p $(dirname ${shellQuote(podLogPath)}) && : > ${shellQuote(podLogPath)} && cat /tmp/prompt/prompt.txt | ${launcherCommand} ${opencodeArgsEscaped} | tee -a ${shellQuote(podLogPath)}`;
   // Redirect Chrome's BrowserMetrics spool off the shared CephFS HOME to the
   // main container's per-pod runtime-cache emptyDir. The
   // agent-browser designer tool launches system Chrome with the default

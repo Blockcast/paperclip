@@ -110,6 +110,61 @@ describe("referenced shared docs materialization", () => {
     }
   });
 
+  // PEN-3329. The returned list is the only way the run-isolated pod bootstrap learns
+  // which untracked files to carry across its `git clone --shared`, so it has to name
+  // every doc that is present afterwards — including ones it did not write this run,
+  // because the workspace is long-lived and a doc materialized by an earlier run is just
+  // as absent from a fresh clone.
+  it("reports every referenced shared doc present in the workspace, not just the ones it wrote", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-docs-report-"));
+    const cwd = path.join(root, "workspace");
+    const instructionsRootPath = path.join(root, "instructions");
+    await fs.mkdir(path.join(cwd, "docs"), { recursive: true });
+    await fs.mkdir(path.join(instructionsRootPath, "docs"), { recursive: true });
+    await fs.writeFile(path.join(instructionsRootPath, "docs", "architecture-template.md"), "# Architecture\n", "utf8");
+    // Already in the workspace from an earlier run; nothing is written for it this time.
+    await fs.writeFile(path.join(cwd, "docs", "definition-of-done.md"), "# Existing\n", "utf8");
+
+    try {
+      const materialized = await ensureReferencedSharedDocsMaterialized({
+        cwd,
+        instructionsRootPath,
+        instructionsContents: [
+          "Read: docs/architecture-template.md",
+          "Read: docs/definition-of-done.md",
+          // Unresolvable: a placeholder is written, and it is still reported — the pod
+          // must carry it, because the placeholder's own text is what explains the
+          // absence to the agent. An absent file explains nothing.
+          "Read: docs/backlog-process.md",
+        ].join("\n"),
+        onLog: async () => {},
+      });
+
+      expect(materialized).toEqual([
+        "docs/architecture-template.md",
+        "docs/backlog-process.md",
+        "docs/definition-of-done.md",
+      ]);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("reports nothing when the instructions reference no shared docs", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-docs-none-"));
+    try {
+      await fs.mkdir(path.join(root, "workspace"), { recursive: true });
+      await expect(ensureReferencedSharedDocsMaterialized({
+        cwd: path.join(root, "workspace"),
+        instructionsRootPath: path.join(root, "instructions"),
+        instructionsContents: "No shared documentation here.",
+        onLog: async () => {},
+      })).resolves.toEqual([]);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("creates a non-fatal placeholder for missing referenced shared docs", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-opencode-docs-missing-"));
     const cwd = path.join(root, "workspace");

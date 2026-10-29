@@ -6233,13 +6233,29 @@ function readNonEmptyString(value: unknown): string | null {
 // agent reading whatever `docs/<name>.md` happened to be in the project repo.
 const SHARED_DOC_MATERIALIZING_ADAPTER_TYPES = new Set(["claude_k8s", "opencode_k8s"]);
 
+/**
+ * What the pod bootstrap needs in order to carry the materialized shared docs across
+ * (PEN-3329). Delivered on the adapter context as `paperclipSharedDocs`.
+ *
+ * The docs are written into the execution workspace as *untracked* files, and a
+ * run-isolated pod bootstraps with `git clone --shared` from that workspace — which
+ * carries tracked objects only. Nothing untracked crosses, so the set has to be declared
+ * rather than discovered: the pod copies exactly these paths and nothing else.
+ */
+export type PaperclipSharedDocOverlay = {
+  /** Execution workspace the docs were materialized into; the pod reads them from here. */
+  sourceCwd: string;
+  /** Repo-relative POSIX paths (`docs/<name>.md`), sorted, never absolute and never `..`. */
+  paths: string[];
+};
+
 async function materializeExternalK8sSharedDocs(input: {
   adapterType: string;
   config: Record<string, unknown>;
   cwd: string;
   onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
-}) {
-  if (!SHARED_DOC_MATERIALIZING_ADAPTER_TYPES.has(input.adapterType)) return;
+}): Promise<PaperclipSharedDocOverlay | null> {
+  if (!SHARED_DOC_MATERIALIZING_ADAPTER_TYPES.has(input.adapterType)) return null;
   const instructionsRootPath = readNonEmptyString(input.config.instructionsRootPath);
   const instructionsFilePath = readNonEmptyString(input.config.instructionsFilePath);
   if (!instructionsRootPath && !instructionsFilePath) {
@@ -6247,7 +6263,7 @@ async function materializeExternalK8sSharedDocs(input: {
       "stdout",
       "[paperclip] Skipped external k8s shared docs materialization: no instructions bundle configured.\n",
     );
-    return;
+    return null;
   }
 
   const sourceRootPath = instructionsRootPath
@@ -6258,7 +6274,7 @@ async function materializeExternalK8sSharedDocs(input: {
     readNonEmptyString(input.config.instructionsEntryFile) ??
       (instructionsFilePath ? path.basename(instructionsFilePath) : "AGENTS.md"),
   );
-  if (!entryFile) return;
+  if (!entryFile) return null;
   // External instruction bundles are optional; if the resolved entry is absent, skip doc materialization.
   const instructionsEntryPath = path.resolve(sourceRootPath, entryFile);
   let instructionsContents = "";
@@ -6271,16 +6287,16 @@ async function materializeExternalK8sSharedDocs(input: {
         "stdout",
         "[paperclip] Skipped external k8s shared docs materialization: external instructions entry absent.\n",
       );
-      return;
+      return null;
     } else {
       await input.onLog(
         "stderr",
         `[paperclip] Skipped external k8s shared docs materialization: failed to read instructions entry (${code ?? "unknown"}).\n`,
       );
-      return;
+      return null;
     }
   }
-  if (!instructionsContents) return;
+  if (!instructionsContents) return null;
 
   const sharedDocSearchBoundaryPath = resolveSharedDocSearchBoundaryPath();
   if (!sharedDocSourceRoots(sourceRootPath, sharedDocSearchBoundaryPath).some((root) => root !== sourceRootPath)) {
@@ -6292,14 +6308,20 @@ async function materializeExternalK8sSharedDocs(input: {
       `[paperclip] Shared-doc ancestor lookup disabled: instructions root ${sourceRootPath} is outside ${sharedDocSearchBoundaryPath}.\n`,
     );
   }
-  await ensureReferencedSharedDocsMaterialized({
-    // These adapters mount (or clone) this local execution workspace into the pod, so writes here are visible remotely.
+  const paths = await ensureReferencedSharedDocsMaterialized({
+    // A `workspace`-isolated pod MOUNTS this local execution workspace, so writes here are
+    // visible remotely with nothing further to do. A `run`-isolated pod CLONES it instead,
+    // and `git clone --shared` carries tracked objects only — so for that half the write
+    // here is necessary but not sufficient, and the returned paths are handed to the pod
+    // bootstrap so it can copy them in after the clone (PEN-3329).
     cwd: input.cwd,
     instructionsRootPath: sourceRootPath,
     sharedDocSearchBoundaryPath,
     instructionsContents,
     onLog: input.onLog,
   });
+  if (paths.length === 0) return null;
+  return { sourceCwd: input.cwd, paths };
 }
 
 type ManagedMcpGatewayRunConfig = {
@@ -35453,12 +35475,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             : null,
         cwd: executionWorkspace.cwd,
       });
-      await materializeExternalK8sSharedDocs({
+      const sharedDocOverlay = await materializeExternalK8sSharedDocs({
         adapterType: agent.adapterType,
         config: runtimeConfig,
         cwd: executionWorkspace.cwd,
         onLog,
       });
+      // Set unconditionally-when-present rather than only for `run` isolation: the
+      // isolation mode is resolved inside the adapter from its own config, and
+      // duplicating that resolution here would be a second place to get it wrong. The
+      // adapters ignore the key in every other mode, where the mount already delivers
+      // the docs (PEN-3329).
+      if (sharedDocOverlay) context.paperclipSharedDocs = sharedDocOverlay;
       const adapterEnv = Object.fromEntries(
         Object.entries(parseObject(resolvedConfig.env)).filter(
           (entry): entry is [string, string] => typeof entry[0] === "string" && typeof entry[1] === "string",

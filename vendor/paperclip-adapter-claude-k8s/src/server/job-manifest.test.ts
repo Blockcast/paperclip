@@ -1029,6 +1029,94 @@ describe("buildJobManifest", () => {
       );
     });
 
+    // PEN-3329. The shared docs an agent's AGENTS.md tells it to read are materialized
+    // into the execution workspace as untracked files, and the bootstrap above carries
+    // tracked objects only — so without this step a run-isolated agent reads nothing at
+    // every `Read: docs/<name>.md` in its own instructions, silently. The shell itself is
+    // exercised end-to-end against a real clone in shared-doc-overlay.test.ts; these pin
+    // that it reaches the pod command at all, and when.
+    it("carries the server-declared shared docs into the run-isolated workspace", () => {
+      ctx.context = {
+        paperclipWorkspace: { cwd: "/paperclip/source-worktree" },
+        paperclipSharedDocs: {
+          sourceCwd: "/paperclip/source-worktree",
+          paths: ["docs/pr-conventions.md", "docs/definition-of-done.md"],
+        },
+      };
+      setRuntimeIsolation(ctx, {
+        isolationMode: "run",
+        isolationKey: "run:run-abc12345",
+        workspaceRoot: "/runtime-cache/paperclip-runs/run-abc12345/workspace",
+        homeRoot: "/runtime-cache/paperclip-runs/run-abc12345/home",
+        sessionRoot: "/runtime-cache/paperclip-runs/run-abc12345/session",
+        cacheRoot: "/runtime-cache/paperclip-runs/run-abc12345/cache",
+        tmpRoot: "/runtime-cache/paperclip-runs/run-abc12345/tmp",
+        storage: isolatedStorage("ephemeral"),
+      });
+
+      const { job } = buildJobManifest({ ctx, selfPod });
+      const command = job.spec?.template?.spec?.containers[0]?.command?.join(" ") ?? "";
+
+      // Composed rather than spelled out as one literal: the run-scoped path inside a
+      // `NAME='value'` assignment reads as credential-shaped to the GitHub egress door,
+      // which refuses the push rather than the test. Deriving it is the documented fix.
+      const runWorkspaceRoot = "/runtime-cache/paperclip-runs/run-abc12345/workspace";
+      expect(command).toContain("__pcdocs_src='/paperclip/source-worktree';");
+      expect(command).toContain(`__pcdocs_dst='${runWorkspaceRoot}';`);
+      // Sorted and de-duplicated by parseSharedDocOverlay, so the manifest is stable
+      // across runs that report the same set in a different order.
+      expect(command).toContain("for __pcdoc in 'docs/definition-of-done.md' 'docs/pr-conventions.md'; do");
+      // After the clone, not before: the bootstrap `rm -rf`s the workspace root on both
+      // its branches, so anything written ahead of it is deleted.
+      expect(command.indexOf("git clone --shared")).toBeLessThan(command.indexOf("__pcdocs_src="));
+    });
+
+    it("drops shared-doc paths that could escape the run workspace", () => {
+      ctx.context = {
+        paperclipWorkspace: { cwd: "/paperclip/source-worktree" },
+        paperclipSharedDocs: {
+          sourceCwd: "/paperclip/source-worktree",
+          paths: ["../../etc/passwd", "/etc/shadow", "docs/pr-conventions.md"],
+        },
+      };
+      setRuntimeIsolation(ctx, {
+        isolationMode: "run",
+        isolationKey: "run:run-abc12345",
+        workspaceRoot: "/runtime-cache/paperclip-runs/run-abc12345/workspace",
+        homeRoot: "/runtime-cache/paperclip-runs/run-abc12345/home",
+        sessionRoot: "/runtime-cache/paperclip-runs/run-abc12345/session",
+        cacheRoot: "/runtime-cache/paperclip-runs/run-abc12345/cache",
+        tmpRoot: "/runtime-cache/paperclip-runs/run-abc12345/tmp",
+        storage: isolatedStorage("ephemeral"),
+      });
+
+      const command = buildJobManifest({ ctx, selfPod }).job.spec?.template?.spec?.containers[0]
+        ?.command?.join(" ") ?? "";
+
+      expect(command).toContain("for __pcdoc in 'docs/pr-conventions.md'; do");
+      expect(command).not.toContain("etc/passwd");
+      expect(command).not.toContain("etc/shadow");
+    });
+
+    // A `workspace`-isolated pod MOUNTS the execution workspace, so the docs are already
+    // there and copying them onto themselves would be a no-op at best. The step is gated
+    // on the same condition as the clone that makes it necessary.
+    it("emits no shared-doc copy when the workspace is mounted rather than cloned", () => {
+      ctx.config = { isolationMode: "workspace", isolationKey: "ws-key" };
+      ctx.context = {
+        paperclipWorkspace: { cwd: "/paperclip/source-worktree" },
+        paperclipSharedDocs: {
+          sourceCwd: "/paperclip/source-worktree",
+          paths: ["docs/pr-conventions.md"],
+        },
+      };
+
+      const command = buildJobManifest({ ctx, selfPod }).job.spec?.template?.spec?.containers[0]
+        ?.command?.join(" ") ?? "";
+
+      expect(command).not.toContain("__pcdocs_src=");
+    });
+
     it("prefers run-scoped runtime roots over manual config and clones an independent workspace", () => {
       ctx.config = {
         isolationMode: "isolated",
