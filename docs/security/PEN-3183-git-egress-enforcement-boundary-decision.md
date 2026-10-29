@@ -897,24 +897,24 @@ incidents: **when the credential is brokered, what code runs in the pod and at w
 agent scope's to decide.** `image` is deliberately not in that set — it is pinned at the point of
 use instead, which is stronger and leaves the agent container's image alone.
 
-⚠ **Residual, not closed: agent-scope docker.** An operator who sets *both* `enableDocker` and
+✅ **The residual this section recorded is now closed, in the other direction: see §7.6
+(decided 2026-10-29).** What stood here was "an operator who sets *both* `enableDocker` and
 `enableGitHubPublishBroker` on the same agent still gets a privileged root container beside the
-broker, and the uid-1001 boundary does not hold against it. That is an operator decision about
-their own agent rather than a principal declining a boundary, so it is recorded here rather than
-refused at render — but it means **"brokered" and "docker-enabled" together do not deliver D1's
-property**, and the stage-1 owner (PEN-5016) should either exclude such agents from the soak or
-accept it explicitly. It is not detectable from any current metric, so a soak containing such an
-agent would read green either way — the same silent-permissive failure this whole section exists
-to remove, one layer out. Owned as **PEN-5026**, where the choice between refusing the
-combination, dropping the privilege, and excluding-and-enforcing is made.
+broker, and the uid-1001 boundary does not hold against it — recorded rather than refused, because
+it is an operator decision about their own agent." §7.6 re-examined that with the question properly
+scoped and **refuses the combination at render**. The reason the two sections differ is the reason
+this one gave for not refusing: ground 1 above is an availability argument about a *third party*,
+and at agent scope there is no third party. Read §7.6 before citing this paragraph; the shape of
+the boundary moved.
 
 ⚠ **Scope of the claim, stated so it is not read wider than it is.** What is now agent-scope-only
 is the **gate key**, the **broker's image**, and — while the gate is on — `enableDocker` /
 `dockerImage`. The rendered broker boundary *as a whole* is not,
 and this document should not be cited as saying so: `AGENT_SCOPE_ONLY_CONFIG_KEYS` is a list, the
 `image` and `enableDocker` routes above were both found by review rather than by the list, and
-the `workspaceVolumeClaim` route in ground 1 is open. Four keys are closed; the class is not, and
-the agent-scope docker residual below is open by decision.
+the `workspaceVolumeClaim` route in ground 1 is open. Four keys are closed; the class is not.
+§7.6 closes the *privilege* class structurally rather than by a fifth key — which is the
+answer to this paragraph's complaint, for that one class only.
 
 **The audit half.** `enableGitHubPublishBroker` is now in the adapter's `getConfigSchema()`, so the
 state of a credential boundary is legible to a reviewer looking at the agent rather than only to
@@ -924,6 +924,100 @@ would be the §8 overclaim.
 
 **Scope.** Nothing here changes the gate's default, the broker, the wrapper, the hook, the scanner
 or the credential path, and nothing here approaches §8's forbidden list.
+
+### 7.6 A privileged container beside the broker: refused at render (decided 2026-10-29)
+
+**Owner: Security (§8 reserves the shape of this boundary). Raised as PEN-5026, out of §7.5.**
+
+**The finding.** D1's property is that the push credential lives in a container at uid 1001 that
+the agent cannot read into. That property is about the **pod**, not about the broker container.
+`buildDindSidecar` renders the DinD sidecar `privileged: true, runAsUser: 0, runAsNonRoot: false`
+in the same pod as the broker. It mounts no credential volume and does not need one: privileged
+means `setns` into another container's mount namespace, and it means mounting the node's own
+filesystem, where the kubelet has already written the Secret. The agent is then handed that
+sidecar's docker socket (`--group=1000`, mode 0660 root:1000), so it can start further privileged
+containers with arbitrary host mounts. §7.5 pinned `enableDocker`/`dockerImage` to agent scope,
+which closes the route where a *lower* scope turns this on; it does not reach an operator who sets
+both keys on the same agent.
+
+**Why this was worth re-opening rather than leaving as §7.5's residual.** Not because it was live
+— `enableGitHubPublishBroker` is `false` everywhere, so no pod has a broker for a sidecar to sit
+beside. Because of what it does to the **measurement**. PEN-5016 stage 1 soaks D1 to find out
+whether the boundary holds. For a docker-enabled agent it does not hold, and the soak would read
+green regardless, because publishing works identically either way. Nothing — no metric, no log
+line, no failed dispatch — distinguished "brokered and isolated" from "brokered with privileged
+root beside it". A soak containing such an agent is evidence of nothing, and nobody reading its
+result could tell.
+
+**Decision: refuse the combination at render.** With the broker on, `buildJobManifest` throws if
+any container other than the broker holds privilege. Four grounds.
+
+1. **§7.5's reason for not refusing is scope-dependent, and does not survive the move to agent
+   scope.** Ground 1 there is an availability argument about a **third party**: anyone able to
+   assign an issue could park the key on an issue assigned to *another* agent and fail every
+   dispatch of it, denying service to a principal who did nothing. At agent scope there is no
+   third party. The only principal who can set `enableDocker` on a brokered agent is the operator
+   who also set `enableGitHubPublishBroker`, and the failure is immediate, attributed, and fixed
+   by the same hand that caused it. §7.5's own ground 1 therefore argues *for* refusal here.
+
+2. **It is the third member of a set this builder already has.** A broad data mount throws. An
+   env-delivered credential throws. Both say the same thing: the pod would REPORT a boundary that
+   is not there, the config is operator-fixable, so refuse and name the leg that failed. A
+   privileged container beside the broker was the one member of that set still rendered silently.
+   Note the env-credential refusal is itself **agent-scope-only** — the seat-token binding is
+   pinned by `withAgentScopedEnvProvenance` — so "this builder does not refuse an operator's own
+   decision" is not a rule it follows. It refuses exactly this kind of decision, twice already.
+
+3. **Refusing makes the state unrepresentable, which is strictly better than detecting it.** The
+   row asked for the outcome to be *detectable*. An accept-and-exclude answer (option (c)) needs a
+   check that enumerates docker-enabled agents at soak time and keeps being run, and it leaves the
+   broken combination legal between runs of that check. Refusing at render puts the enforcement in
+   the one place that sees every pod, at the only moment anyone can still act, and leaves nothing
+   to detect: every brokered pod that exists holds the boundary, so a green soak means something.
+
+4. **Dropping the sidecar instead of refusing would be §7.4's error.** Silently removing docker
+   would leave the agent's toolchain failing at a boundary that reported success. The operator
+   asked for two things that cannot both be true; say so.
+
+**The check is a property, not a key.** §7.5 states its own weakness — "this is a list, and a list
+is as complete as its last edit" — and records it firing twice, `image` and then `enableDocker`,
+both found by review rather than by the list. A third list entry would inherit it. So
+`findPrivilegedContainersBesideBroker` reads the **assembled** pod spec and asks whether anything
+beside the broker is privileged, escalation-capable, or holds a capability that crosses a
+container. A sidecar added later is covered without anyone remembering to add it.
+
+⚠ **The discriminator is privilege, not uid, and tightening it to `runAsUser === 0` would brick the
+broker.** PEN-4932's `seed-writable-dirs` init container is uid 0 by necessity — it creates the
+`subPath` targets a narrow mount needs, and `narrowWritableSurface` is itself a precondition of the
+broker — so uid 0 and the broker *co-occur*, in exactly the configurations the broker is legal in.
+It is also not a risk: unprivileged, `allowPrivilegeEscalation: false`, every capability dropped
+but CHOWN and DAC_OVERRIDE (neither crosses a container), and, being a classic init container ahead
+of both sidecars, exited before the broker process exists. Pinned by a test for that reason.
+`allowPrivilegeEscalation` is tripped when **unset** as well as when true, because Kubernetes
+defaults it to true — reading absent as false would make the backstop inert on exactly the
+container nobody thought about.
+
+**The release condition, named so this does not quietly delete a capability.** Option (b) —
+rootless DinD, or a non-Docker builder — would make the combination renderable with the boundary
+intact, and is strictly better if it works. It is not taken today because it is **unmeasured**, and
+because making it work in this pod needs precisely what §8 reserves: `allowPrivilegeEscalation`,
+dropped capabilities, or an unconfined seccomp/AppArmor profile. So: refuse now, and treat an
+unprivileged container runtime as the thing that releases the refusal. The error message says so,
+in the same shape §7.4 uses for the seat token. **Do not weaken the refusal instead.**
+
+**The cost, measured rather than asserted.** Zero agents today. All 11 agents in the one company
+readable from this seat carry neither `enableDocker` nor `enableGitHubPublishBroker` in their
+`adapterConfig`. That measurement is *complete* rather than a sample, and §7.5's pin is what makes
+it so: `withAgentScopedConfigProvenance` restores both keys from `baseConfig`, so when the broker is
+on, agent `adapterConfig` is the only place either key can come from — no project scope, no model
+profile, no issue override. The standing cost is narrower than it looks: `enableDocker` is
+unaffected for every agent not running the broker, which is the whole fleet.
+
+**What this does NOT claim.** It does not make the pod unprivileged — a docker-enabled agent with
+no broker still gets the privileged sidecar, unchanged, and that is the status quo this decision
+deliberately leaves alone. It does not address `hostPID`, `hostIPC` or `shareProcessNamespace`,
+none of which this builder sets. And it is scoped to the `claude_k8s` adapter: `opencode_k8s`
+renders the same privileged sidecar but has no broker, so there is no uid boundary there to defeat.
 
 ## 8. Bounds on what may be built against this decision
 
@@ -950,6 +1044,11 @@ Not permitted without returning here first:
   `GITHUB_TOKEN` / `GITHUB_PERSONAL_ACCESS_TOKEN` it expands into) through the broker rather
   than refusing to render the Job — decided 2026-10-29 in §7.4, which lists the three
   conditions that would release it.
+- Weakening, narrowing or removing §7.6's refusal of a privileged container beside the broker —
+  including narrowing it from a property check back to a key check, or reading an unset
+  `allowPrivilegeEscalation` as `false`. The way to make `enableDocker` and the broker coexist is
+  an unprivileged container runtime, which is §7.6's named release condition and lands squarely in
+  the `allowPrivilegeEscalation` / dropped-capabilities bullet above.
 - Describing this control as tamper-resistant anywhere in the codebase until D1 ships. The header
   in `github-git-egress-runtime.ts` is the canonical statement of its limits and is updated by this
   change; keep it true.
