@@ -39,6 +39,12 @@ import {
   RETRY_INSTANT_ALIGNMENTS,
   type RetryInstantAlignment,
 } from "./ccrotate-capacity-retry.js";
+// Value import for the same reason again: the transient-db subset counter's
+// `sqlstate` allow-list must BE the retry classifier's set, not a copy of it.
+// A second list here would let a sqlstate be added to the retry path and
+// silently land in the `other` bucket forever. `lib/db-retry` has NO imports of
+// its own -- it is a pure leaf predicate module -- so this cannot form a cycle.
+import { TRANSIENT_DB_SQLSTATES } from "../lib/db-retry.js";
 import { logger } from "../middleware/logger.js";
 // Type-only, so it is erased at runtime and creates no import cycle with the
 // reaper (which imports the recorder below). Structurally restating the result
@@ -130,6 +136,46 @@ export const HTTP_REQUESTS_METRIC = "paperclip_http_requests_total";
  * the distinction has to be recorded live.
  */
 export const HTTP_EMPTY_LIST_RESPONSES_METRIC = "paperclip_http_empty_list_responses_total";
+/**
+ * Transient-database 503s, as a strict subset of {@link HTTP_REQUESTS_METRIC}
+ * labelled by the SQLSTATE that caused them (PEN-3596).
+ *
+ * ## Why a separate counter rather than a `sqlstate` label
+ *
+ * {@link HTTP_REQUESTS_METRIC} has no SQLSTATE dimension, and should not gain
+ * one: the label is meaningless on the ~99.8% of responses that are not a
+ * transient-database refusal, so adding it there would multiply every existing
+ * series by a label that is empty on nearly all of them. The precedent is
+ * {@link HTTP_EMPTY_LIST_RESPONSES_METRIC} — a strict subset counter, labelled
+ * identically plus the one discriminating dimension, so `subset / total` is a
+ * rate and the subset carries detail the parent cannot afford.
+ *
+ * ## What it closes
+ *
+ * Measured on 2026-10-29, `/api/companies/:companyId/issues` served 79 `503`s
+ * in 24h (0.19% of calls on that route). That number was the only available
+ * evidence for PEN-3596's "no statement timeouts over a representative window"
+ * condition, and it could not discharge it: a `503` on that route is a *proxy*
+ * for `57014`, since `40P01`, `40001` and `55P03` land in the same status
+ * bucket. The honest reading was an upper bound, which makes the condition
+ * inferable rather than verifiable.
+ *
+ * With this counter, `sqlstate="57014"` answers it directly, and the other
+ * three sqlstates stay separable rather than being folded into the same
+ * number — a timeout burst and a lock-contention burst are different
+ * incidents with different fixes, and they were previously indistinguishable
+ * after the fact.
+ *
+ * ## Cardinality
+ *
+ * `route` is bounded by {@link HTTP_ROUTE_LABEL_CAP} exactly as the parent
+ * counter is. `code` is the two API-boundary classifications
+ * (`statement_timeout` / `transient_db_conflict`) and `sqlstate` is bounded to
+ * {@link TRANSIENT_DB_SQLSTATES} plus an `other` bucket, so the subset adds at
+ * most a handful of series per route that actually refuses — and none at all
+ * for a route that never does, because nothing is zero-initialized here.
+ */
+export const HTTP_TRANSIENT_DB_RESPONSES_METRIC = "paperclip_http_transient_db_responses_total";
 /**
  * Project primary-workspace fallback counter (BLO-26184). Incremented once
  * per resolution of a project that has >=1 workspace but no row flagged
@@ -3950,6 +3996,47 @@ export function normalizeHttpStatus(status: number | null | undefined): string {
     : "0";
 }
 
+/** Label value for a SQLSTATE outside {@link TRANSIENT_DB_SQLSTATES}. Reaching
+ * this means the API boundary classified something as a transient-database
+ * refusal that the retry classifier does not know about — the two have drifted,
+ * and a non-zero value here is the signal that they did. */
+export const HTTP_TRANSIENT_DB_SQLSTATE_OTHER = "other";
+
+/**
+ * The API-boundary classifications a transient-database refusal can carry
+ * (PEN-3596). These are the `code` values `error-handler.ts` puts in the 503
+ * envelope, and the split is the point: `57014` is query cost and the other
+ * three sqlstates are lock contention, so they must not share a label value.
+ */
+export const KNOWN_HTTP_TRANSIENT_DB_CODES = [
+  "statement_timeout",
+  "transient_db_conflict",
+] as const;
+export type KnownHttpTransientDbCode = (typeof KNOWN_HTTP_TRANSIENT_DB_CODES)[number];
+
+const knownHttpTransientDbCodeSet: ReadonlySet<string> = new Set(KNOWN_HTTP_TRANSIENT_DB_CODES);
+
+/** Normalize the API-boundary classification. An unrecognized value lands on
+ * `transient_db_conflict` rather than minting a series, because that is the
+ * error handler's own default branch for a transient sqlstate. */
+export function normalizeHttpTransientDbCode(code: string | null | undefined): string {
+  return typeof code === "string" && knownHttpTransientDbCodeSet.has(code)
+    ? code
+    : "transient_db_conflict";
+}
+
+/**
+ * Normalize a SQLSTATE to a bounded label, using the retry classifier's own
+ * set as the allow-list. Anything outside it collapses to
+ * {@link HTTP_TRANSIENT_DB_SQLSTATE_OTHER}, so a malformed or unexpected
+ * `code` on a driver error cannot mint an unbounded series.
+ */
+export function normalizeHttpTransientDbSqlstate(sqlstate: string | null | undefined): string {
+  return typeof sqlstate === "string" && TRANSIENT_DB_SQLSTATES.has(sqlstate)
+    ? sqlstate
+    : HTTP_TRANSIENT_DB_SQLSTATE_OTHER;
+}
+
 /**
  * Normalize a route label, enforcing the cardinality cap.
  *
@@ -4952,6 +5039,7 @@ let runDispatchWait: Histogram | null = null;
 let authRequest: Counter<"operation" | "outcome"> | null = null;
 let httpRequests: Counter<"route" | "method" | "status"> | null = null;
 let httpEmptyListResponses: Counter<"route" | "method" | "status"> | null = null;
+let httpTransientDbResponses: Counter<"route" | "method" | "code" | "sqlstate"> | null = null;
 let gbrainRecallTotal: Counter<"status"> | null = null;
 let agentHeartbeatAge: Gauge<"agent_id"> | null = null;
 let agentHeartbeatInterval: Gauge<"agent_id"> | null = null;
@@ -5111,6 +5199,7 @@ function ensureRegistry(): {
   authRequestCounter: Counter<"operation" | "outcome">;
   httpRequestsCounter: Counter<"route" | "method" | "status">;
   httpEmptyListResponsesCounter: Counter<"route" | "method" | "status">;
+  httpTransientDbResponsesCounter: Counter<"route" | "method" | "code" | "sqlstate">;
   gbrainRecallCounter: Counter<"status">;
   agentHeartbeatAgeGauge: Gauge<"agent_id">;
   agentHeartbeatIntervalGauge: Gauge<"agent_id">;
@@ -5266,6 +5355,7 @@ function ensureRegistry(): {
     || !authRequest
     || !httpRequests
     || !httpEmptyListResponses
+    || !httpTransientDbResponses
     || !gbrainRecallTotal
     || !agentHeartbeatAge
     || !agentHeartbeatInterval
@@ -7354,6 +7444,25 @@ function ensureRegistry(): {
       labelNames: ["route", "method", "status"],
       registers: [registry],
     });
+    httpTransientDbResponses = new Counter({
+      name: HTTP_TRANSIENT_DB_RESPONSES_METRIC,
+      help:
+        "Count of 503 responses caused by a transient PostgreSQL SQLSTATE, labeled by route "
+        + "and method as in "
+        + `${HTTP_REQUESTS_METRIC}, plus the API-boundary classification (code) and the `
+        + "SQLSTATE itself (PEN-3596). A strict subset of that counter's 503s, so "
+        + "subset/total is a route's transient-database refusal rate. This is what makes a "
+        + "statement timeout verifiable rather than inferable: 57014 is query cost and "
+        + "40P01/40001/55P03 are lock contention, and before this they shared the 503 "
+        + "bucket with no way to tell them apart after the fact. Nothing is "
+        + "zero-initialized -- a route that never refuses mints no series -- so an absent "
+        + "series means no refusal was ever recorded, not that the counter is missing. "
+        + `A sqlstate of "${HTTP_TRANSIENT_DB_SQLSTATE_OTHER}" means the API boundary and `
+        + "the retry classifier have drifted. No user, company, agent, query string, or "
+        + "statement text is exposed.",
+      labelNames: ["route", "method", "code", "sqlstate"],
+      registers: [registry],
+    });
     gbrainRecallTotal = new Counter({
       name: GBRAIN_RECALL_METRIC,
       help:
@@ -8014,6 +8123,7 @@ function ensureRegistry(): {
     authRequestCounter: authRequest,
     httpRequestsCounter: httpRequests,
     httpEmptyListResponsesCounter: httpEmptyListResponses,
+    httpTransientDbResponsesCounter: httpTransientDbResponses,
     gbrainRecallCounter: gbrainRecallTotal,
     agentHeartbeatAgeGauge: agentHeartbeatAge,
     agentHeartbeatIntervalGauge: agentHeartbeatInterval,
@@ -10509,7 +10619,24 @@ export function recordHttpRequest(input: {
   method: string | null | undefined;
   status: number | null | undefined;
   emptyList: boolean;
-}): { route: string; method: string; status: string } {
+  /**
+   * Set when the response was a transient-database refusal (PEN-3596), which
+   * only `error-handler.ts` knows. It is threaded through this one recorder
+   * rather than incremented at the error handler on purpose: the route label
+   * must be the SAME value the parent counter used, and at error-handler time
+   * it is not available correctly. Express restores `req.baseUrl` as an error
+   * unwinds, so a thrown route reports `/companies/:companyId/issues` there
+   * while the same route reports `/api/companies/:companyId/issues` on
+   * success — see the block comment in `middleware/http-metrics.ts`. Recording
+   * here reuses the captured label and keeps the subset relation exact.
+   */
+  transientDb?: { code: string | null | undefined; sqlstate: string | null | undefined } | null;
+}): {
+  route: string;
+  method: string;
+  status: string;
+  transientDb: { code: string; sqlstate: string } | null;
+} {
   const labels = {
     route: normalizeHttpRoute(input.route),
     method: normalizeHttpMethod(input.method),
@@ -10520,7 +10647,19 @@ export function recordHttpRequest(input: {
   if (input.emptyList) {
     registered.httpEmptyListResponsesCounter.inc(labels);
   }
-  return labels;
+  let transientDb: { code: string; sqlstate: string } | null = null;
+  if (input.transientDb) {
+    transientDb = {
+      code: normalizeHttpTransientDbCode(input.transientDb.code),
+      sqlstate: normalizeHttpTransientDbSqlstate(input.transientDb.sqlstate),
+    };
+    registered.httpTransientDbResponsesCounter.inc({
+      route: labels.route,
+      method: labels.method,
+      ...transientDb,
+    });
+  }
+  return { ...labels, transientDb };
 }
 
 /**
@@ -11165,6 +11304,7 @@ export function __resetMetricsForTest(): void {
   authRequest = null;
   httpRequests = null;
   httpEmptyListResponses = null;
+  httpTransientDbResponses = null;
   seenHttpRouteLabels.clear();
   agentHeartbeatAge = null;
   agentHeartbeatInterval = null;
