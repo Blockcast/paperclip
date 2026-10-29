@@ -123,6 +123,36 @@ export const STALE_ENQUEUE_HOURS = 13;
  */
 export const STALE_HOLD_HOURS = 13;
 
+/**
+ * How many times GitHub may eject the SAME head before the enqueuer stops
+ * putting it back.
+ *
+ * Two, deliberately, and the second one is the whole discriminator.
+ *
+ * An ejection has three causes and they need opposite responses: an infra
+ * flake (retry at the same head), a reproducible assertion (the head must
+ * move), and collateral from an entry ahead in the queue (nothing to do). A
+ * single ejection cannot tell them apart. Measured on #3089, 2026-10-29: of
+ * the four failing jobs on queue head `15e7dcef`, THREE were infrastructure —
+ * `mirror` died mid-checkout with `The runner has received a shutdown signal`
+ * and took both vendored-adapter jobs with it as `The operation was
+ * canceled` — and all three were `success` on the rebuilt heads. Holding on
+ * the first ejection would have stranded a healthy PR indefinitely.
+ *
+ * Re-running IS the retest, so the second ejection at an unchanged head is
+ * evidence the first was not a flake. That makes the threshold the cheap
+ * substitute for classifying the failure: it needs no log scraping, no job
+ * name allowlist and no guess about which runner died, and it degrades in the
+ * recoverable direction — one wasted re-enqueue, never a permanent hold.
+ *
+ * ⛔ Do NOT lower this to 1. That reintroduces exactly the hold this comment
+ * rules out, and the cost is paid by the PRs behind it: with
+ * `mergingStrategy: ALLGREEN` + `mergeMethod: REBASE` an ejection rebuilds
+ * every entry behind it from zero (#3089's 13:48:05Z ejection cost #3085 and
+ * #3032 ~43 min each, for a failure in neither).
+ */
+export const EJECTIONS_BEFORE_HOLD = 2;
+
 export const CODEOWNER_REQUEST_MARKER = "<!-- landing-routine:codeowner-request -->";
 export const STALE_ENQUEUE_MARKER = "<!-- landing-routine:stale-enqueue -->";
 
@@ -731,6 +761,83 @@ export function classifyFromListing(pr, { now = Date.now() } = {}) {
 }
 
 /**
+ * Timeline events that mean "the head moved", newest wins.
+ *
+ * `removed_from_merge_queue` carries `commit_id: null` (verified on #3089's
+ * three merge-queue events, 2026-10-29), so an ejection cannot be attributed
+ * to a sha directly. It has to be dated against the head instead, and these
+ * are the events that date a head: `committed` for an ordinary push,
+ * `head_ref_force_pushed` for a rebase or amend. Anything older than the
+ * newest of them happened to a head that no longer exists.
+ *
+ * Returns `null` when the timeline carries neither — which is the unreadable
+ * case, not the "head is infinitely old" case, and `ejectionsAtHead` treats it
+ * as such.
+ */
+export function headMovedAt(timeline) {
+  const stamps = (Array.isArray(timeline) ? timeline : [])
+    .filter((event) => event?.event === "committed" || event?.event === "head_ref_force_pushed")
+    // `committed` is a raw git object: it carries `committer.date`, not the
+    // `created_at` every issue-event has. Reading only `created_at` would drop
+    // every ordinary push and leave force-pushes as the sole clock.
+    .map((event) => Date.parse(event?.created_at ?? event?.committer?.date ?? ""))
+    .filter((ms) => Number.isFinite(ms));
+  return stamps.length ? Math.max(...stamps) : null;
+}
+
+/**
+ * How many times GitHub ejected this PR at its CURRENT head, and whether it is
+ * sitting out of the queue right now.
+ *
+ * Counts only ejections newer than `headMovedAt`, which is what makes the hold
+ * self-clearing: a push resets the count to zero with no state to store and
+ * nothing to expire.
+ *
+ * ⚠ An ejection with NO datable head is counted. The alternative — ignore what
+ * you cannot date — fails open into the re-enqueue loop this exists to stop,
+ * on precisely the PRs whose timeline is odd. Over-counting costs a hold the
+ * next push clears; under-counting costs every entry in the queue a rebuild.
+ *
+ * `requeued` is read separately from the count because the two answer
+ * different questions: the count asks whether this head keeps failing, and
+ * `requeued` asks whether acting now would double-enqueue. `classifyPr` needs
+ * both — a PR already back in the queue is not a candidate whatever its count.
+ */
+export function ejectionsAtHead(timeline) {
+  const events = (Array.isArray(timeline) ? timeline : []).filter(
+    (event) =>
+      event?.event === "removed_from_merge_queue" || event?.event === "added_to_merge_queue",
+  );
+  const movedAt = headMovedAt(timeline);
+  const atHead = events.filter((event) => {
+    if (movedAt === null) return true;
+    const at = Date.parse(event?.created_at ?? "");
+    return !Number.isFinite(at) || at >= movedAt;
+  });
+  const removals = atHead.filter((event) => event.event === "removed_from_merge_queue");
+  const newest = (list) =>
+    list.reduce((max, event) => {
+      const at = Date.parse(event?.created_at ?? "");
+      return Number.isFinite(at) && at > max ? at : max;
+    }, -Infinity);
+  const lastRemoved = newest(removals);
+  const lastAdded = newest(atHead.filter((event) => event.event === "added_to_merge_queue"));
+  return {
+    count: removals.length,
+    // Strictly greater, and the tie is broken toward the HOLD on purpose.
+    // Timeline stamps have one-second resolution, so an add and a removal in
+    // the same second are genuinely unordered — nothing here can tell which
+    // happened first, and I have not measured which GitHub emits first. The
+    // two directions are not symmetric: calling a tie `requeued` suppresses
+    // the hold and re-enters the loop this rule exists to stop, while calling
+    // it held costs one deferred enqueue that the next fire takes. Pinned by
+    // the `same second` test; do not relax to `>=`.
+    requeued: lastAdded > lastRemoved,
+    lastRemovedAt: Number.isFinite(lastRemoved) ? lastRemoved : null,
+  };
+}
+
+/**
  * One row per PR. Rules are ordered so that the reason reported is the one a
  * human would act on first: an explicit opt-out beats a red check, and a red
  * check beats a missing review, because fixing the review would not help.
@@ -797,6 +904,36 @@ export function classifyPr(pr, { now = Date.now(), settleMinutes = CHECK_SETTLE_
 
   if (UNLANDABLE_MERGE_STATES.has(mergeState)) return row("skip", `mergestate:${mergeState}`);
 
+  // LAST, and that position is the point. Every rule above reads the PR HEAD;
+  // GitHub does not merge the PR head. On a REBASE/ALLGREEN queue it builds a
+  // rebased queue head — a different commit — and that is the one whose
+  // required `verify` decides. The two disagree systematically, and the PR
+  // side is the one that looks green: when GitHub ejects, it deletes the
+  // `gh-readonly-queue/...` branch, so the failing check runs stay attached to
+  // a commit no PR-level query reaches and `mergeStateStatus` reverts to
+  // CLEAN. After an ejection the PR reads not merely green but FRESHLY green.
+  //
+  // So this cannot be folded into the check rules above — there is nothing in
+  // the rollup for them to see. Measured on #3089, 2026-10-29: `verify` was
+  // `success` on PR head `d4f8aa38` and `failure` on queue head `15e7dcef` at
+  // the same instant, and `classifyPr` returned `skip — checks:settling,
+  // failing=[]` on a PR GitHub had ejected 20 minutes earlier. It re-enqueued
+  // the unchanged head at 14:08:50Z, 21 minutes after a receipt on the PR had
+  // named the failing jobs.
+  //
+  // ⚠ The repo already DETECTS this twice — `report-merge-queue-ejection.yml`
+  // posted the failing job names at 13:48:01Z and
+  // `merge-queue-eviction-detector.yml` posted "Cause: failing required check"
+  // at 13:52:22Z, both correct and both on time. Neither was an input to the
+  // enqueue decision. This rule is the wiring, not a new detector.
+  const ejections = ejectionsAtHead(pr?.timeline);
+  if (!ejections.requeued && ejections.count >= EJECTIONS_BEFORE_HOLD) {
+    return row(
+      "skip",
+      "ejected-at-current-head",
+      `GitHub ejected this head ${ejections.count}x; push a fix or rerun the queue build`,
+    );
+  }
 
   return row("enqueue", `mergestate:${mergeState}`);
 }
@@ -1059,6 +1196,19 @@ function fetchOpenPrs(repo) {
         gh(["pr", "view", String(row.number), "--repo", repo, "--json", "statusCheckRollup"]),
       ).statusCheckRollup,
       reviews: JSON.parse(gh(["api", `repos/${repo}/pulls/${row.number}/reviews`, "--paginate"])),
+      // The merge-queue ejection history, for the `ejected-at-current-head`
+      // rule. Spent only on PRs that already survived `classifyFromListing`,
+      // i.e. the ones that could still enqueue — on this repo a handful of the
+      // open set, each already paying three calls.
+      //
+      // ⛔ `--paginate` is load-bearing. GitHub's default page size is 30 and
+      // the events this reads are the NEWEST on the timeline, so a single-page
+      // fetch drops exactly them on any PR with a normal amount of discussion
+      // and reports `count: 0` — a confident all-clear, in the fail-open
+      // direction.
+      timeline: JSON.parse(
+        gh(["api", `repos/${repo}/issues/${row.number}/timeline`, "--paginate"]),
+      ),
     };
   });
 }

@@ -6,10 +6,34 @@ on:
     # here. Measured over 1000 merge-group runs -- PR 272/79/19 (success/failure/
     # cancelled), commitperclip PR Review 370/2, Comment-review gate (merge queue)
     # 255/2. `PR` alone is 98 of the 102 non-success runs, so this covers ~96% of
-    # ejections. The other two are left out until their failures are shown to
-    # actually eject; subscribing to a non-required check would comment on PRs
-    # that were never ejected.
-    workflows: [PR]
+    # ejections.
+    #
+    # `Comment-review gate (merge queue)` was added 2026-10-29 (PEN-5022). The
+    # bar this list set for itself was "left out until their failures are shown
+    # to actually eject", and that bar is now met, in writing, inside the job
+    # itself: comment-review-gate-merge-group.yml's `mirror` records run
+    # 34228985576 on queue ref pr-1719-1efd24d1 being refused at runner
+    # admission -- "and under ALLGREEN that ejected the entry 2m40s after it was
+    # staged".
+    #
+    # The premise behind the exclusion -- "subscribing to a non-required check
+    # would comment on PRs that were never ejected" -- does not hold under this
+    # repo's queue configuration. `mergingStrategy: ALLGREEN` (read live
+    # 2026-10-29) ejects on a failure in ANY merge-group check, required or not,
+    # so `required` is the wrong test for "can this eject"; on an ALLGREEN queue
+    # every merge_group workflow can. The `cancelled` half keeps its separate
+    # guard regardless (shouldReportCancelledRun).
+    #
+    # `commitperclip PR Review` stays OUT, deliberately. The same mechanism
+    # argument reaches it, but no ejection has been MEASURED on it, and this
+    # list's standard is a measurement rather than a mechanism. Add it when one
+    # is observed -- do not add it on the strength of the paragraph above.
+    #
+    # Missing `mirror` had a cost: on #3089 (2026-10-29) the 13:48:01Z comment
+    # named three failing lanes and omitted `mirror`, which had died at
+    # `The runner has received a shutdown signal` and taken two vendored-adapter
+    # jobs with it as collateral.
+    workflows: ["PR", "Comment-review gate (merge queue)"]
     types: [completed]
 
 permissions:
