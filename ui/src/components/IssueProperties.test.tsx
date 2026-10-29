@@ -16,6 +16,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Issue } from "@paperclipai/shared";
 import {
   DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
+  MAX_ISSUE_MONITOR_MAX_ATTEMPTS,
   renewedIssueMonitorMaxAttempts,
 } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -2108,12 +2109,17 @@ describe("IssueProperties", () => {
       container: HTMLDivElement,
       onUpdate: ComponentProps<typeof IssueProperties>["onUpdate"],
       policyOverrides: Partial<IssueExecutionPolicy>,
+      // PEN-3803 review follow-up: some monitor-dialog behaviour keys off issue
+      // columns rather than the policy (`monitorAttemptCount`), so let a caller
+      // set those too. Defaulted, so every existing caller is unchanged.
+      issueOverrides: Partial<Issue> = {},
     ) {
       const root = renderProperties(container, {
         issue: createIssue({
           status: "in_progress",
           assigneeAgentId: "agent-1",
           executionPolicy: createExecutionPolicy(policyOverrides),
+          ...issueOverrides,
         }),
         childIssues: [],
         onUpdate,
@@ -2424,6 +2430,61 @@ describe("IssueProperties", () => {
       ).toBeNull();
 
       act(() => youngRoot.unmount());
+    });
+
+    /**
+     * PEN-3803 review follow-up. Past `MAX_ISSUE_MONITOR_MAX_ATTEMPTS` the
+     * renewal is not representable, so the two tests above have nothing to
+     * grant: the dialog would send `maxAttempts: null` and the server would
+     * answer 422 naming a remedy this dialog cannot apply — it renders no
+     * `maxAttempts` control, and `onUpdate` gives the popover no error surface
+     * to show the refusal in. So the click would simply appear to do nothing.
+     *
+     * Refuse before the click instead, and name the control that does work.
+     */
+    it("disables Schedule and explains the remedy once no renewal is representable", async () => {
+      const onUpdate = vi.fn();
+      const root = await openMonitorEditor(container, onUpdate, {
+        monitor: { nextCheckAt: "2026-04-11T12:30:00.000Z", notes: null, scheduledBy: "assignee" },
+      }, { monitorAttemptCount: MAX_ISSUE_MONITOR_MAX_ATTEMPTS });
+
+      expect(renewedIssueMonitorMaxAttempts(MAX_ISSUE_MONITOR_MAX_ATTEMPTS)).toBeNull();
+
+      const schedule = Array.from(container.querySelectorAll("button"))
+        .find((candidate) => candidate.textContent?.trim() === "Schedule");
+      expect(schedule).toBeTruthy();
+      expect((schedule as HTMLButtonElement).disabled).toBe(true);
+
+      // The remedy has to be readable, not just implied by a greyed button.
+      expect(container.textContent).toContain(String(MAX_ISSUE_MONITOR_MAX_ATTEMPTS));
+      expect(container.textContent).toMatch(/Clear it and stop polling/);
+
+      // "Clear" stays live — it is the move the hint names.
+      const clear = Array.from(container.querySelectorAll("button"))
+        .find((candidate) => candidate.textContent?.trim() === "Clear");
+      expect(clear).toBeTruthy();
+      expect((clear as HTMLButtonElement).disabled).toBe(false);
+
+      act(() => root.unmount());
+    });
+
+    /**
+     * Negative control for the gate above: a row with road left must keep an
+     * enabled Schedule and show no hint, or the gate is an unconditional
+     * disable rather than a spent-budget rule.
+     */
+    it("leaves Schedule enabled while a renewal is still representable", async () => {
+      const onUpdate = vi.fn();
+      const root = await openMonitorEditor(container, onUpdate, {
+        monitor: { nextCheckAt: "2026-04-11T12:30:00.000Z", notes: null, scheduledBy: "assignee" },
+      }, { monitorAttemptCount: DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS });
+
+      const schedule = Array.from(container.querySelectorAll("button"))
+        .find((candidate) => candidate.textContent?.trim() === "Schedule");
+      expect((schedule as HTMLButtonElement).disabled).toBe(false);
+      expect(container.textContent).not.toMatch(/Clear it and stop polling/);
+
+      act(() => root.unmount());
     });
 
     it("clears externalRef only when a service name that was set gets cleared", async () => {

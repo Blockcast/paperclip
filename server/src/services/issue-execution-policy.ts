@@ -1422,11 +1422,41 @@ function applyMonitorTransition(
       // `lastTriggeredAt` predating the arm). An explicit `maxAttempts` still
       // wins over the default, which is what keeps a deliberate budget
       // extension possible — see `renewedIssueMonitorMaxAttempts`.
+      //
+      // ⚠️ ONLY on an explicit arm. This predicate has two consumers just below
+      // and they are not symmetric. An explicit arm THROWS 422 — loud, at the
+      // caller, before anything is persisted. A non-explicit transition instead
+      // STRIPS the monitor and records it cleared: silent, no activity row, no
+      // `recoveryPolicy`, because `buildClearedMonitorState` is a pure state
+      // builder. That branch runs on every generic `PATCH /api/issues/:id` that
+      // leaves `executionPolicy` alone, since `nextExecutionPolicy` falls back
+      // to the stored policy and carries its armed monitor in with
+      // `monitorExplicitlyUpdated` false (routes/issues.ts).
+      //
+      // Applying the fleet ceiling there would silently destroy the exact
+      // population this fix exists for. A legacy row at `attemptCount >= 24`
+      // with `maxAttempts: null` — what the old 200 path created, PEN-3328
+      // included — survives any unrelated PATCH today and reaches the
+      // scheduler, which retires it LOUDLY through `clearIssueMonitorAndRecover`
+      // (`issue.monitor_exhausted` plus the configured `recoveryPolicy`,
+      // heartbeat.ts). Stripping it here would trade that escalation for a
+      // silent clear triggered by an unrelated edit — a priority change, a
+      // comment, a status move.
+      //
+      // Deliverability is the ARM's question. Carrying an already-armed monitor
+      // forward is not an arm, so the scheduler stays the one place that retires
+      // a spent monitor, and it does so with the escalation attached.
       const exhaustedReason = exhaustedMonitorClearReason({
         monitor: input.policy.monitor,
         attemptCount: currentMonitorState?.attemptCount ?? 0,
         now: new Date(),
-        defaultMaxAttempts: DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
+        // Non-explicit transitions keep the pre-PEN-3803 resolution — the
+        // issue-declared bound only. An explicit `maxAttempts` the row has
+        // already reached still strips exactly as it always did; only the
+        // default is withheld, and only here.
+        ...(input.monitorExplicitlyUpdated
+          ? { defaultMaxAttempts: DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS }
+          : {}),
       });
       if (exhaustedReason) {
         if (input.monitorExplicitlyUpdated) {

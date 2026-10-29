@@ -1003,6 +1003,22 @@ export function IssueProperties({
       },
     });
   };
+  const monitorAttemptCount = issue.monitorAttemptCount ?? issue.executionState?.monitor?.attemptCount ?? 0;
+  /**
+   * PEN-3803 review follow-up: past `MAX_ISSUE_MONITOR_MAX_ATTEMPTS` there is no
+   * representable renewal, so `renewedIssueMonitorMaxAttempts` returns `null`,
+   * the dialog would send `maxAttempts: null`, and the server would answer 422
+   * naming the remedy — "set an explicit `maxAttempts` above the attempts
+   * already made". This dialog renders no `maxAttempts` control, so the board
+   * user cannot apply that remedy here, and the 422 is raised through `onUpdate`
+   * where this popover has no error surface to show it in.
+   *
+   * Rather than let "Schedule" fail silently from the user's side, say so before
+   * the click and point at the one control that does work — "Clear", which is
+   * rendered immediately beside it.
+   */
+  const monitorRenewalUnavailable =
+    Boolean(issue.executionPolicy?.monitor) && renewedIssueMonitorMaxAttempts(monitorAttemptCount) === null;
   const saveMonitor = () => {
     if (!monitorAtInput) return;
     const nextCheckAt = new Date(monitorAtInput);
@@ -1033,7 +1049,7 @@ export function IssueProperties({
     //
     // `timeoutAt` keeps the `null` treatment: nothing supplies a default for
     // it, so omitting really does remove the bound.
-    const attemptCount = issue.monitorAttemptCount ?? issue.executionState?.monitor?.attemptCount ?? 0;
+    const attemptCount = monitorAttemptCount;
     const timeoutAt = carried?.timeoutAt ?? null;
     const maxAttempts = carried?.maxAttempts ?? null;
     updateMonitor({
@@ -1290,6 +1306,19 @@ export function IssueProperties({
   ) : null;
   const monitorContent = (
     <div className="flex w-full flex-col gap-2">
+      {/*
+        PEN-3803 review follow-up: the server refuses this arm with a 422 that
+        names a remedy the dialog cannot apply (it renders no `maxAttempts`
+        control), and `onUpdate` surfaces no error here. State the refusal up
+        front instead, and name the control that does work.
+      */}
+      {monitorRenewalUnavailable ? (
+        <p className="text-xs text-muted-foreground">
+          This monitor has made {monitorAttemptCount} attempts — past the maximum budget a re-arm can
+          grant, so re-scheduling would be rejected. Clear it and stop polling, or raise{" "}
+          <code>maxAttempts</code> through the API.
+        </p>
+      ) : null}
       <div className="flex flex-col gap-2 md:flex-row">
         <input
           type="datetime-local"
@@ -1317,8 +1346,13 @@ export function IssueProperties({
           <button
             type="button"
             className="inline-flex items-center rounded-full border border-border px-2 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground disabled:opacity-50"
-            disabled={!monitorAtInput}
+            disabled={!monitorAtInput || monitorRenewalUnavailable}
             onClick={saveMonitor}
+            title={
+              monitorRenewalUnavailable
+                ? `This monitor has made ${monitorAttemptCount} attempts, past the maximum budget a re-arm can grant. Clear it instead.`
+                : undefined
+            }
           >
             Schedule
           </button>
