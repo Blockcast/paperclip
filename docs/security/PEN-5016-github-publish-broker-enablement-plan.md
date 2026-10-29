@@ -9,6 +9,14 @@ Method: read-only. No cluster write, no deployment, no gate change, no credentia
 bypass exercised. Measurements are Loki queries, `kubectl version`, a live-Job list, the sanctioned
 `safe-env-inspect.mjs` in this run's own pod, and reading `origin/master` at `5de67c25e`.
 
+**Revision 2 — 2026-10-29, same day.** Three §3 preconditions moved while this PR was open and one
+new one appeared, so the first revision's §3 is already wrong in the permissive direction: it reads
+as though more is outstanding than is. #3097 and #3089 **merged**; Security chose §3.2's remedy and
+pushed it (§3.2 below); and two fail-closed refusals that did not exist when revision 1 was written
+now gate the stage population (**§3.5**). Everything in revision 2 is re-read at `origin/master`
+`06e87072a` or at the named PR head, not carried over. Measurements dated 2026-10-29T13:33Z and
+earlier are revision 1's and are not re-taken — §10 still bounds them.
+
 ## 0. Why this document exists
 
 On 2026-10-29 §7.2 **trigger 4** of `PEN-3183-git-egress-enforcement-boundary-decision.md` fired at a
@@ -24,10 +32,25 @@ should be read as one until a stage actually lands.
 
 ## 1. Verdict in one line
 
-**The gate is not ready to be flipped, and the blockers are not the soak.** Three of them are
-unmerged PRs already named as preconditions, one is a missing operator surface, and one is a
-**defect found while writing this plan**: the gate can be turned off per-issue by the principal it
-constrains (§3.2). Stage 1 should not start until §3 is closed.
+**The gate is not ready to be flipped, and the blockers are not the soak.** Stage 1 should not start
+until §3 is closed.
+
+Revision 2 state, 2026-10-29T19:30Z — four of the seven §3 items have moved, all in the closing
+direction, and none of them is landed except the first two:
+
+| §3 item | Revision 1 | Now |
+|---|---|---|
+| #3097, the §5 starvation assertion | open | **merged** |
+| #3089, the env-credential refusal | open | **merged** |
+| #3098, the §8 measurement | open | open, `BEHIND` |
+| §3.2, the gate is declinable per-issue | *found while writing this plan*, remedy undecided | remedy **chosen** (§7.5) and pushed as **#3112**, open |
+| §3.3, no operator surface | absent from the schema | **added in #3112**, open |
+| §3.5a, privilege beside the broker | **did not exist** | refusal pushed as **#3123**, open |
+| §3.5b, per-issue `workspaceVolumeClaim` | **did not exist** | pin pushed as **#3121**, open |
+
+⚠ **Four open PRs is the honest count, and "chosen" is not "landed".** Three of them exist because
+this plan's own §3.2 produced findings that produced more findings. The gate's readiness has not
+changed in the fleet since revision 1 — only the ownership of what is still outstanding.
 
 ## 2. What the gate actually does
 
@@ -52,17 +75,29 @@ Two properties make staging possible, and both were verified in the source rathe
 
 ## 3. Preconditions — all of these gate stage 1
 
-### 3.1 The three PRs that §7.3 already names (state read 2026-10-29)
+### 3.1 The PRs §7.3 names, plus the three this plan's own findings produced (state read 2026-10-29T19:30Z)
 
 | PR | What it is | State | Why it gates |
 |---|---|---|---|
-| [#3097](https://github.com/Blockcast/paperclip/pull/3097) `27459d1e4` | the §5 starvation assertion | **OPEN**, `CLEAN` | §7.3 *"The §5 starvation assertion is still outstanding, and it gates discharge"* calls it **"a rollout precondition for PEN-4933, not a follow-up"**. Until a test asserts that a bare `/usr/bin/git push` from uid 1000 in a brokered pod fails to authenticate, enabling the broker closes §7.1's *mount* route and leaves its *helper* route unproven — the narrower of the two, but the one §4 found cheaper for an attacker. |
-| [#3089](https://github.com/Blockcast/paperclip/pull/3089) `d4f8aa383` | refuse to render the broker when an env-delivered credential would land on the agent | **OPEN** | §7.4 decided this refusal **stays**. It is not on `master`: enabling the gate at this head would render the broker *and* leave an env credential in the agent container for any seat-bound agent — the boundary would silently not hold, reporting success. |
+| [#3097](https://github.com/Blockcast/paperclip/pull/3097) `27459d1e4` | the §5 starvation assertion | **MERGED** 16:55:15Z (`c0d8b83eb`, on `master`) | §7.3 *"The §5 starvation assertion is still outstanding, and it gates discharge"* calls it **"a rollout precondition for PEN-4933, not a follow-up"**. Until a test asserts that a bare `/usr/bin/git push` from uid 1000 in a brokered pod fails to authenticate, enabling the broker closes §7.1's *mount* route and leaves its *helper* route unproven — the narrower of the two, but the one §4 found cheaper for an attacker. |
+| [#3089](https://github.com/Blockcast/paperclip/pull/3089) `d4f8aa383` | refuse to render the broker when an env-delivered credential would land on the agent | **MERGED** 17:26:01Z (`99905d39b`, on `master`) | §7.4 decided this refusal **stays**. It is not on `master`: enabling the gate at this head would render the broker *and* leave an env credential in the agent container for any seat-bound agent — the boundary would silently not hold, reporting success. |
 | [#3098](https://github.com/Blockcast/paperclip/pull/3098) `d2158387c` | the §8 measurement, trigger-4 firing, count 28 | **OPEN**, `BEHIND` | Not a technical blocker for the broker, but it is the change that puts the fired count into §7.1. Until it lands, §7.1 must not be cited (PEN-4989's own framing). |
+| [#3112](https://github.com/Blockcast/paperclip/pull/3112) `1fa76e155` | §3.2's remedy: `AGENT_SCOPE_ONLY_CONFIG_KEYS`, the `brokerImage` provenance fix, the conditional `enableDocker`/`dockerImage` pin, and §3.3's schema field | **OPEN**, `CLEAN` | §3.2 is the only §3 item that is a *defect in the gate itself*. Until this merges, setting the gate `true` at agent scope ships a boundary the constrained principal can decline per-issue. |
+| [#3121](https://github.com/Blockcast/paperclip/pull/3121) `16db213ad` | pins `workspaceVolumeClaim` to agent scope while the gate is on (PEN-5027) | **OPEN**, `CLEAN`, **based on #3112's branch** | Availability, not confidentiality: without it a per-issue claim makes `buildJobManifest` throw once the gate is on (§3.5b). Stacked — it must not merge ahead of #3112. |
+| [#3123](https://github.com/Blockcast/paperclip/pull/3123) `44069aa2f` | refuses a brokered pod carrying privilege outside the broker (PEN-5026, §7.6) | **OPEN**, `BEHIND` | Closes the agent-scope half of the composition problem that #3112 closes only at issue scope (§3.5a). Based on `master` and **carries #3112's three commits**, so #3112 and #3123 must not both merge without a rebase in between. |
 
-**Ordering consequence, stated because it is easy to get backwards:** #3089 must land *before* the
-first flip, not alongside it. A brokered pod that also holds `GH_TOKEN` is strictly worse than an
-unbrokered one — it carries the cost of the boundary and none of the benefit, and it looks enabled.
+⚠ **These states are a snapshot and will go stale — re-read them live before acting on this table,
+the same way §4 asks for its query to be re-read before each stage widens.** Two of the six moved
+between revision 1 and revision 2 of this document, four hours apart. A stage-0 exit check that
+quotes this table rather than re-reading it is quoting a photograph.
+
+**Ordering consequences, stated because they are easy to get backwards:**
+
+1. #3089 had to land *before* the first flip, not alongside it — a brokered pod that also holds
+   `GH_TOKEN` is strictly worse than an unbrokered one, because it carries the cost of the boundary
+   and none of the benefit while looking enabled. **It has landed.**
+2. #3121 is based on #3112's branch and #3123 carries #3112's commits on top of `master`. Any merge
+   order works; merging two of them without a rebase in between does not.
 
 ### 3.2 ⛔ The gate is flippable per-issue by the principal it constrains
 
@@ -103,11 +138,41 @@ covered.
 per-run is not a boundary; it is a default. It would also be invisible in exactly the way that costs
 time: the soak would read green, because the agent that opted out still publishes fine.
 
-**Required before stage 1 — Security to choose, not Devops.** Either pin the gate to agent
-provenance the way the env keys are pinned (an `AGENT_SCOPE_ONLY_CONFIG_KEYS` sibling re-asserting
-the base value post-merge), or refuse to render when an issue override supplies the key at all. This
-plan does not implement either: §8 of the decision record reserves the shape of the boundary to
-Security, and this is the boundary.
+**Disposition — Security chose, on 2026-10-29, and it is pushed but not landed.** Recorded as
+PEN-3183 **§7.5**; implemented in [#3112](https://github.com/Blockcast/paperclip/pull/3112). The
+choice was *pin to agent provenance* — an `AGENT_SCOPE_ONLY_CONFIG_KEYS` set re-asserting the base
+value after the merge — plus the loud half of the refusal option: the discarded overlay is logged
+rather than dropped silently. Refusing to render was declined because it would convert a latent
+confidentiality finding into a reachable availability one, any actor able to assign an issue being
+able to park the key on *another* agent's issue and fail every dispatch of it. §3.3's schema field
+is in the same PR.
+
+**Review then found that pinning the gate does not pin the boundary, and that is the part worth
+carrying forward.** Two sibling keys could decline the same boundary while leaving the gate pinned
+exactly as intended, and both were found by review rather than by the list:
+
+- **`image`** is what the broker *itself* runs — `buildGitHubPublishBrokerSidecar` execs
+  `paperclip-github-token-env` and the broker runtime out of it, at uid 1001, with the credential in
+  its environment. Closed adapter-side rather than with a second list entry: the broker now renders
+  from `ctx.agent.adapterConfig` (the agent row before any merge) while the **agent** container
+  deliberately keeps the merged value, since a brokered agent container holds no credential and what
+  it runs is its own business.
+- **`enableDocker` / `dockerImage`** render a `privileged: true, runAsUser: 0` sidecar in the same
+  pod. Pinned to agent scope **conditionally** — only while the gate is on
+  (`BROKERED_POD_COMPOSITION_CONFIG_KEYS`), so docker stays freely overridable for every agent that
+  is not brokered.
+
+The membership rule is written at the list rather than left as a list of remembered incidents: *when
+the credential is brokered, what code runs in the pod and at what privilege is agent scope's to
+decide.*
+
+⚠ **The class is not closed, and this plan should not be read as saying it is.** A list is as
+complete as its last edit, and that weakness has now fired twice on its first outing. What is closed
+is the *issue-scope* route for four named keys. §3.5a is the one class member closed structurally
+rather than by name.
+
+**Stage-0 exit is "#3112 merged", not "Security chose".** The choice is made; the fleet is unchanged
+until it lands.
 
 ### 3.3 The gate has no operator surface
 
@@ -119,7 +184,10 @@ which means every stage below is an `adapterConfig` patch rather than a toggle, 
 cannot see the gate's state in the agent form.
 
 Not a blocker on its own; it **is** a blocker for the rollback requirement in §6, which needs the
-state to be legible to whoever is deciding at 3am. Add the schema field in the same PR as §3.2.
+state to be legible to whoever is deciding at 3am. **Done in #3112**, as a `toggle`. ⚠ The schema
+field is a *view*: `asBoolean` still reads the merged config, and the enforcement point is
+`AGENT_SCOPE_ONLY_CONFIG_KEYS` (§3.2), not the schema. A reviewer reading the agent form now sees
+the gate's state; they do not thereby see that it held.
 
 ### 3.4 The env-credential pre-flight cannot be completed from an agent seat
 
@@ -143,6 +211,60 @@ Two readings, reproduced in this run's own pod (`safe-env-inspect.mjs`, image
 confirming no GitHub credential name is bound at any scope. Until #3089 lands this is the only thing
 standing between "broker enabled" and "broker enabled while the agent still holds a token", and no
 agent can perform it.
+
+### 3.5 Two fail-closed refusals that did not exist when this plan was written
+
+Both are new since revision 1, both are **correct**, and both change the stage *population* rather
+than the design. Neither is reachable today: each is conditional on the gate being on.
+
+#### (a) A brokered pod may not carry privilege outside the broker — PEN-5026, PEN-3183 §7.6, [#3123](https://github.com/Blockcast/paperclip/pull/3123)
+
+Read at `44069aa2f` in `vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts`.
+
+⚠ **It is not a check on `enableDocker`, and describing it as one understates it.** It is a property
+check on the **assembled pod spec**: while `brokerEnabled`, `findPrivilegedContainersBesideBroker`
+walks `initContainers` + `containers` + `ephemeralContainers`, exempts the broker by name, and
+`buildJobManifest` throws if any remaining container is `privileged: true`, has
+`allowPrivilegeEscalation` set to anything other than `false` (**unset counts** — Kubernetes defaults
+it to true), or adds one of five escape capabilities (`SYS_ADMIN`, `SYS_PTRACE`, `SYS_MODULE`,
+`SYS_RAWIO`, `SYS_BOOT`). The throw names the offending container and the leg that failed.
+
+Two consequences for the stage plan that a key check would not have had:
+
+- **It covers containers nobody has written yet.** A sidecar added later that omits
+  `allowPrivilegeEscalation: false` makes every brokered pod in the stage unrenderable. So this is a
+  pre-flight at **every widening**, not a one-time census of who has docker on.
+- **The discriminator is privilege, not uid, and that is deliberate.** PEN-4932's
+  `seed-writable-dirs` init container runs at uid 0 by necessity — it creates the `subPath` targets a
+  narrow mount needs, and `narrowWritableSurface` is itself a precondition of the broker — and is
+  exempt by construction: unprivileged, `allowPrivilegeEscalation: false`, every capability dropped
+  but `CHOWN` and `DAC_OVERRIDE`, and exited before the broker process exists. **Do not report a
+  uid-0 container in a brokered pod as a violation of this**, and do not propose tightening it to
+  uid.
+
+**Measured cost to the stage population: zero, today.** Read 2026-10-29T19:20Z over all **11** agents
+in `b1d3f3d3` (Penstock) through the company agent list: **0 set `enableDocker` at agent scope.**
+Nine are `claude_k8s` and carry no `enableDocker` key at all (eight have an empty `adapterConfig`,
+one — Devops — has a populated one with no such key); two (`Reflection Coach`, `Summarizer`) are
+`claude_local` and never render a Job at all. That agrees with revision 1's independent cluster-side
+reading (23 of 23 live agent Jobs single-container, §5.1) and with BLO-40401's finding that the only
+in-repo `enableDocker: true` is a test fixture.
+
+So §7.6 costs stage 1 and stage 2 nothing — and the docker exclusion Security asked to be *enforced
+rather than written down* is enforced, in the stronger form: on the rendered pod rather than on the
+key. Bounds in §10.
+
+#### (b) A per-issue `workspaceVolumeClaim` throws once the gate is on — PEN-5027, [#3121](https://github.com/Blockcast/paperclip/pull/3121)
+
+`workspaceVolumeClaim` is read off the merged config and feeds `narrowWritableSurface`; a foreign
+claim reaches the broad-data-mount refusal of §4 and `buildJobManifest` throws. Fail-closed, so no
+confidentiality loss — but it is the *same* per-issue denial of service §3.2's ground 1 declines to
+create, reached by a different key, and it becomes reachable at stage 1. #3121 pins the key to agent
+scope while the gate is on, the same conditional shape as `enableDocker`.
+
+**What (a) and (b) together do to §6:** the set of "the agent cannot run, and that is a control
+working correctly" grows from two members to three. §6's rollback evidence item 3 is updated to
+match, because all three present identically to whoever is woken up.
 
 ## 4. The broad-data-mount interaction — measured, not assumed
 
@@ -211,6 +333,10 @@ stage, re-read immediately before each stage widens. Not "clear once".
   since 1.29. The risk is not the feature, it is that nothing here has run on it: a sidecar that
   fails to terminate turns every agent Job into one that never completes.
   **Stage 1 must check Job *completion*, not just agent success.**
+  Since revision 1 this is also **enforced rather than merely observed**: §3.5a refuses to render a
+  brokered pod carrying privilege outside the broker, so the DinD shape and the broker shape can no
+  longer co-exist by accident. The 23/23 figure is now the measurement that says the refusal costs
+  nothing, not the only thing standing between the two.
 
 ### 5.2 What breaks if the broker is wrong, by door
 
@@ -275,10 +401,12 @@ than on the volume of the complaint:
    is as likely to be that agent's workspace as the broker.
 2. A statement of which door failed (`git` / `gh` / MCP) — §5.2's asymmetry means "publishing is
    broken" is not yet a diagnosis.
-3. Confirmation that the failure is not the two refusals that are **working as designed**: the broad
-   data-mount refusal (§4) and, once #3089 lands, the env-credential refusal (§3.1). Both present as
-   "the agent cannot run", and neither is a broker defect. **Rolling back on either would be rolling
-   back a control that correctly refused.**
+3. Confirmation that the failure is not one of the **three refusals that are working as designed**:
+   the broad data-mount refusal (§4), the env-credential refusal (§3.1, merged as #3089), and the
+   privilege-beside-the-broker refusal (§3.5a, #3123). All three present identically as "the agent
+   cannot run", and none is a broker defect. **Rolling back on any of them would be rolling back a
+   control that correctly refused.** Each names its own leg in the thrown message — read the message
+   before reading the gate as the cause.
 4. Whether narrowing the stage (row 1 above) already restored service — if it did, that is the
    remedy, and the gate stays on for the stages that are healthy.
 
@@ -293,23 +421,38 @@ duration, not at a single instant. Day counts assume stage 0 completes; every st
 re-read of §4's trigger-2 query, not a one-time clearance.
 
 **Stage 0 — preconditions (not a soak).** Proposed target **2026-11-05**.
-Exit: #3097 merged; #3089 merged; §3.2 closed by Security's chosen remedy; schema field added (§3.3);
-board-level env-scope read returned clean (§3.4); the §5.3 broker log queries saved. **No gate is set
-in stage 0.**
+Exit: ~~#3097 merged~~ **done 16:55Z**; ~~#3089 merged~~ **done 17:26Z**; **#3112 merged** (§3.2's
+remedy *and* §3.3's schema field — chosen is not landed); **#3121 and #3123 merged, in an order that
+rebases between them** (§3.1 ordering note 2); board-level env-scope read returned clean (§3.4); the
+§5.3 broker log queries saved. **No gate is set in stage 0.**
 
 **Stage 1 — one agent, one company.** Proposed **2026-11-06 → 2026-11-10** (≥ 3 working days).
 Population: a single `claude_k8s` agent that publishes often enough to exercise all three doors
 within the window. **Devops (`11b9c48f`) volunteers as stage 1**: this seat opens PRs daily, uses
 `gh` and the GitHub MCP server in the same runs, and its failure is visible to its own owner rather
 than to a tenant.
+Pre-flight (new, §3.5a): confirm the population renders no privileged container beside the broker.
+For stage 1 that is one agent and it is already clean — Devops carries no `enableDocker`. **Re-run it
+at every widening rather than citing this sentence**, because the check is on the assembled pod and a
+container added later is in scope.
 Observe: (a) **Job completion**, not just run success — the native-sidecar risk of §5.1; (b) a real
 `git push` reaching GitHub; (c) a real `gh` call *other than* push; (d) a GitHub MCP tool call; (e)
 zero unexplained broker-container errors; (f) trigger-2 still zero.
 Exit: all six, across ≥ 3 days and ≥ 10 runs.
 
+⚠ **Stage 1 is only evidence if the agent in it actually has D1's property.** A brokered agent that
+also ran privileged root would publish perfectly well and read green without the boundary holding,
+and no metric in §5.3 distinguishes the two. Before §3.5a that was a measurement-validity hole in
+this plan; §3.5a closes it structurally, which is why it is a stage-0 merge and not a follow-up.
+
 **Stage 2 — one company, all agents.** Proposed **2026-11-11 → 2026-11-18** (≥ 5 working days).
-Population: all `claude_k8s` agents in `b1d3f3d3` (Penstock) — 8 of the agents in §4's broad-render
-history sit here, so it is the population whose isolation legs are actually known.
+Population: all `claude_k8s` agents in `b1d3f3d3` (Penstock) — **9 of the 11 agents in the company**
+(§3.5a), the other two being `claude_local` and never rendering a Job. §4's broad-render history
+counts 8 *distinct agents* fleet-wide and this plan has **not** mapped those 8 to companies, so do
+not read them as the same 8; the reason to start here is that it is this plan author's own company
+and the §3.5a pre-flight is clean across it, not a company attribution §4 does not make.
+Pre-flight (§3.5a): re-run the privilege check across all 9 — clean at 2026-10-29T19:20Z, and stale
+by stage 2.
 Observe: stage 1's list, plus node capacity against the `+50m/+128Mi` per pod of §5.1, plus any agent
 whose runs stopped completing.
 Exit: as stage 1, plus no scheduling regression attributable to the sidecar.
@@ -356,7 +499,10 @@ retires. Enabling the broker does not close it; it makes it matter less.
 ## 9. What this plan does not do
 
 - **It does not flip the gate.** PEN-5016 produces the plan; the CTO sets the date against it.
-- **It does not implement §3.2's fix.** The shape of that boundary is reserved to Security by §8.
+- **It does not implement §3.2's fix, or §3.5's two refusals.** The shape of those boundaries is
+  reserved to Security by §8; Security chose and implemented them (#3112, #3123), and #3121 — the
+  availability half of §3.5b, which §8 does not reserve — is the only one of the three this plan's
+  author wrote. This document records the dispositions; it does not make them.
 - **It does not touch §8's forbidden list**, and nothing in it approaches that list: no relaxation of
   `allowPrivilegeEscalation`, dropped capabilities or `runAsNonRoot`; no integrity check between
   wrapper, hook and scanner; no change to the credential path; no env-delivered credential routed
@@ -381,3 +527,10 @@ Stated so a later reader does not inherit them as stronger than they are:
 - The env-credential reading covers **one pod of one agent** at agent scope, and agrees with §7.4's
   reading in a different agent's pod. Project and environment scope are unreadable from any agent
   seat (§3.4) — which is why §3.4 is a gate item and not a conclusion.
+- §3.5a's "0 of 11 set `enableDocker`" is **agent scope, one company, one instant**
+  (2026-10-29T19:20Z). It is a sound negative at that scope — the agent list returns `adapterConfig`
+  with keys visible and only values redacted, so an absent key is absent and not hidden. It says
+  nothing about project or environment scope (unreadable, §3.4), nothing about the second company
+  (not readable from this seat), and nothing about ten minutes later. It is also **not the thing
+  §3.5a checks**: the refusal is on the assembled pod, so a clean `enableDocker` census is evidence
+  that the refusal costs nothing today, not evidence that it will not fire.
