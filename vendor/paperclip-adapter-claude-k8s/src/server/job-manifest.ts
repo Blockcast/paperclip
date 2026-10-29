@@ -1700,6 +1700,100 @@ export function findServerOnlyEnvVarsInPodSpec(podSpec: k8s.V1PodSpec): string[]
   );
 }
 
+// ---------------------------------------------------------------------------
+// PEN-5026 / PEN-3183 §7.6: nothing privileged may stand BESIDE the broker.
+//
+// D1's property is that the push credential lives in a container the agent
+// cannot read into. That property is about the POD, not about the broker
+// container alone — a privileged container anywhere in the pod defeats it
+// without ever mounting the credential volume, because privileged means
+// `setns` into another container's mount namespace, and it means mounting the
+// node's own filesystem where the kubelet already wrote the Secret.
+//
+// So this does not ask "did someone set enableDocker". It asks the question
+// that actually matters — "is anything in this pod privileged" — on the
+// ASSEMBLED spec, for the reason the two backstops below give: a container
+// added later is covered automatically rather than silently bypassing it.
+// §7.5's stated weakness is that AGENT_SCOPE_ONLY_CONFIG_KEYS is a list and a
+// list is as complete as its last edit; that weakness has already fired twice
+// (`image`, then `enableDocker`, both found by review rather than by the
+// list). A third list entry would inherit it. A property check does not.
+//
+// ⚠ THE DISCRIMINATOR IS PRIVILEGE, NOT UID, and that is deliberate rather
+// than an oversight — do not "tighten" it to `runAsUser === 0` later. The
+// PEN-4932 `seed-writable-dirs` init container runs at uid 0 by necessity: it
+// creates the `subPath` targets a narrow mount needs, and
+// `narrowWritableSurface` is itself a precondition of the broker (see the
+// broad-data-mount refusal), so uid 0 and the broker are not alternatives —
+// they co-occur in exactly the configurations the broker is legal in and
+// whose targets need seeding. Refusing on uid 0 would make the broker
+// unrenderable there. It is also not a boundary risk: it is unprivileged,
+// `allowPrivilegeEscalation: false`, every capability dropped but CHOWN and
+// DAC_OVERRIDE — neither of which crosses a container — and, being a classic
+// init container ahead of both sidecars, it has exited before the broker
+// process exists.
+//
+// `allowPrivilegeEscalation` is tripped when UNSET as well as when true,
+// because Kubernetes defaults it to true for a container that does not say
+// otherwise. Reading "absent" as "false" here would make the backstop silently
+// inert on exactly the container nobody thought about, which is the only kind
+// it exists to catch.
+// ---------------------------------------------------------------------------
+
+/**
+ * Capabilities that reach OUT of the container holding them. `SYS_ADMIN` is
+ * `mount` and `setns`; `SYS_PTRACE` attaches to another container's processes
+ * under a shared PID namespace; the rest own the kernel outright.
+ *
+ * Deliberately NOT here: `DAC_OVERRIDE` and `DAC_READ_SEARCH`. They bypass
+ * file-permission checks *within the holder's own mount namespace*, which is
+ * not a path to another container's mounts — and `DAC_OVERRIDE` is load-bearing
+ * for the seed init container above.
+ */
+const CONTAINER_ESCAPE_CAPABILITIES = new Set([
+  "SYS_ADMIN",
+  "SYS_PTRACE",
+  "SYS_MODULE",
+  "SYS_RAWIO",
+  "SYS_BOOT",
+]);
+
+/**
+ * Every container in `podSpec`, other than the broker itself, that holds
+ * privilege capable of crossing into the broker's container. Returns
+ * `"<container>: <reason>"` strings, empty when the pod is clean.
+ *
+ * Exported for the tests that pin this; the enforcement is the throw in
+ * `buildJobManifest`.
+ */
+export function findPrivilegedContainersBesideBroker(podSpec: k8s.V1PodSpec): string[] {
+  const containers: k8s.V1Container[] = [
+    ...(podSpec.initContainers ?? []),
+    ...(podSpec.containers ?? []),
+    ...((podSpec.ephemeralContainers ?? []) as unknown as k8s.V1Container[]),
+  ];
+  const findings: string[] = [];
+  for (const container of containers) {
+    const name = container.name || "<unnamed>";
+    if (name === GITHUB_BROKER_CONTAINER_NAME) continue;
+    const sc = container.securityContext;
+    if (sc?.privileged === true) {
+      findings.push(`${name}: privileged: true`);
+    }
+    if (sc?.allowPrivilegeEscalation !== false) {
+      findings.push(
+        `${name}: allowPrivilegeEscalation is ${sc?.allowPrivilegeEscalation === undefined ? "unset (Kubernetes defaults it to true)" : String(sc.allowPrivilegeEscalation)}`,
+      );
+    }
+    for (const cap of sc?.capabilities?.add ?? []) {
+      if (CONTAINER_ESCAPE_CAPABILITIES.has(cap)) {
+        findings.push(`${name}: capabilities.add includes ${cap}`);
+      }
+    }
+  }
+  return findings;
+}
+
 export interface JobBuildResult {
   job: k8s.V1Job;
   jobName: string;
@@ -2267,6 +2361,16 @@ function buildDindSidecar(opts: {
 // future `shareProcessNamespace`, not the mechanism.
 // ---------------------------------------------------------------------------
 
+/**
+ * The broker container's name.
+ *
+ * A constant rather than a literal because `findPrivilegedContainersBesideBroker`
+ * identifies the broker by name to exempt it, and a drift between the two would
+ * silently exempt the wrong container — or, worse, exempt nothing and make the
+ * backstop refuse every brokered pod.
+ */
+const GITHUB_BROKER_CONTAINER_NAME = "github-publish-broker";
+
 /** Directory holding the broker socket, shared with the agent container. */
 const GITHUB_BROKER_SOCKET_DIR = "/var/run/paperclip-github-broker";
 const GITHUB_BROKER_SOCKET_PATH = `${GITHUB_BROKER_SOCKET_DIR}/broker.sock`;
@@ -2438,7 +2542,7 @@ function buildGitHubPublishBrokerSidecar(opts: {
     `umask 0002; exec ${GITHUB_BROKER_WRAPPER_DIR}/paperclip-github-token-env ` +
     `/usr/local/bin/node ${GITHUB_BROKER_RUNTIME_JS}`;
   return {
-    name: "github-publish-broker",
+    name: GITHUB_BROKER_CONTAINER_NAME,
     image: opts.image,
     imagePullPolicy: opts.imagePullPolicy,
     command: ["sh", "-c", command],
@@ -4338,6 +4442,61 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     throw new Error(
       `claude_k8s: refusing to build Job manifest — server-only credential env var(s) would be propagated to the agent pod: ${serverOnlyNames.join(", ")}`,
     );
+  }
+
+  // PEN-5026 / PEN-3183 §7.6: refuse a brokered pod that also carries
+  // privilege, rather than render a credential boundary that does not hold.
+  //
+  // This is the third member of a set this builder already has, not a new kind
+  // of refusal: a broad data mount throws, an env-delivered credential throws,
+  // and both say the same thing — the pod would REPORT a boundary that is not
+  // there, the config is operator-fixable, so refuse and name the leg that
+  // failed. A privileged root container beside the broker was the one member
+  // of that set still rendered silently.
+  //
+  // §7.5 declined to throw on the issue-scope version of this, and that ground
+  // does not carry here. It was an availability argument about a THIRD PARTY:
+  // anyone able to assign an issue could park the key on another agent's issue
+  // and fail every dispatch of it. At agent scope there is no third party —
+  // the only principal who can set `enableDocker` on a brokered agent is the
+  // operator who also set `enableGitHubPublishBroker`, and the failure is
+  // immediate, attributed, and fixed by the same hand that caused it. The
+  // env-credential refusal below is itself agent-scope-only (the seat-token
+  // binding is pinned by `withAgentScopedEnvProvenance`), so "this builder
+  // does not throw on an operator's own decision" is not a rule it follows.
+  //
+  // Thrown rather than dropping the sidecar, for §7.4's reason: silently
+  // removing docker would leave the agent's toolchain failing at a boundary
+  // that reported success. The operator asked for two things that cannot both
+  // be true; say so.
+  //
+  // THE WAY OUT IS NAMED IN THE MESSAGE, because a refusal with no exit is how
+  // a capability gets quietly deleted. An unprivileged container runtime
+  // (rootless dockerd, or a non-Docker builder) would make this combination
+  // renderable with the boundary intact, and that is the release condition for
+  // this refusal — not a reason to weaken it. Taking it needs §8's sign-off,
+  // since it touches `allowPrivilegeEscalation` / dropped capabilities.
+  if (brokerEnabled) {
+    const privilegedBesideBroker = findPrivilegedContainersBesideBroker(job.spec!.template.spec!);
+    if (privilegedBesideBroker.length > 0) {
+      throw new Error(
+        `claude_k8s: refusing to build Job manifest — enableGitHubPublishBroker is set, but this pod would ` +
+          `also carry privilege outside the broker (${privilegedBesideBroker.join("; ")}). The broker holds ` +
+          `the GitHub push credential at uid ${GITHUB_BROKER_UID} and the boundary is that the agent cannot ` +
+          `read into that container; a privileged container anywhere in the pod defeats it without mounting ` +
+          `the credential at all — privileged means \`setns\` into another container's mount namespace, and ` +
+          `it means mounting the node filesystem where the kubelet already wrote the Secret. Rendering this ` +
+          `would report a boundary that is not there.` +
+          (enableDocker
+            ? ` The container here is the DinD sidecar: turn off \`enableDocker\` on this agent, or leave the ` +
+              `broker disabled. Note the agent container is handed that sidecar's docker socket, so it can ` +
+              `start further privileged containers with arbitrary host mounts — this is not only about the ` +
+              `sidecar itself.`
+            : ``) +
+          ` An unprivileged container runtime would make the combination renderable with the boundary intact; ` +
+          `that is PEN-3183 §7.6's release condition and needs Security (§8), not a change here.`,
+      );
+    }
   }
 
   return { job, jobName, namespace, prompt, claudeArgs, promptMetrics, promptSecret, envSecret, mcpConfigSecret, sharedDocsSecret, skippedLabels, podLogPath, serviceAccountName, claudeCodeVersion, scopedWritableDirs };

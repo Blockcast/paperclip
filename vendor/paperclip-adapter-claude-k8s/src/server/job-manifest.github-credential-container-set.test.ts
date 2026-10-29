@@ -350,20 +350,31 @@ describe("which agent-Job containers receive a github.com credential (PEN-4990 /
         "containers/claude": { mounts: [], pointers: ["PAPERCLIP_GITHUB_TOKEN_FILE"], values: [], secretRefs: [] },
       },
     ],
-    [
-      "broker ON + DinD — the sidecar changes nothing",
-      { enableGitHubPublishBroker: true, enableDocker: true },
-      {
-        "initContainers/github-publish-broker": {
-          mounts: BOTH_MOUNTS,
-          pointers: ["PAPERCLIP_GITHUB_TOKEN_FILE"],
-          values: [],
-          secretRefs: [],
-        },
-        "containers/claude": { mounts: [], pointers: ["PAPERCLIP_GITHUB_TOKEN_FILE"], values: [], secretRefs: [] },
-      },
-    ],
   ];
+
+  // PEN-5026 supersedes the case that used to sit here, and the correction is
+  // worth recording rather than quietly deleting.
+  //
+  // That case was "broker ON + DinD — the sidecar changes nothing", and it
+  // asserted the credential-route map was identical with and without the DinD
+  // sidecar. The assertion was TRUE and the title's conclusion was FALSE. This
+  // file measures where the credential is ROUTED, and the sidecar is routed
+  // none — but it renders `privileged: true, runAsUser: 0` in the same pod,
+  // and a privileged container does not need a route: privileged is `setns`
+  // into the broker's mount namespace, and it is mounting the node filesystem
+  // where the kubelet already wrote the Secret. So a green route map was being
+  // read as "the boundary holds", which is exactly the silent-permissive
+  // reading PEN-5026 exists to remove.
+  //
+  // The combination is now refused at render, so there is no map to assert.
+  // What replaces it is the refusal itself — and keeping it HERE, in the file
+  // that enumerates credential containers, is the point: the next person to
+  // extend that CASES table with a new pod arrangement meets this first.
+  it("broker ON + DinD — refused at render, because a route map cannot see privilege", () => {
+    expect(() => credentialRoutes({ enableGitHubPublishBroker: true, enableDocker: true })).toThrow(
+      /also carry privilege outside the broker/,
+    );
+  });
 
   for (const [name, adapterConfig, expected] of CASES) {
     it(name, () => {

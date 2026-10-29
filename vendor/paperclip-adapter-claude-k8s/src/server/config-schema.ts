@@ -221,8 +221,9 @@ export function getConfigSchema(): AdapterConfigSchema {
         + "With it off the credential is mounted into the agent container (the accepted PEN-3183 \u00a77 residual). "
         + "With it on the agent cannot authenticate to github.com directly at all, which changes every publish path "
         + "for this agent. Agent scope only \u2014 a per-issue override of this key is ignored. "
-        + "While it is on, `enableDocker` and `dockerImage` are pinned to agent scope too, because a privileged "
-        + "DinD sidecar sits beside the broker in the same pod. "
+        + "While it is on, `enableDocker` and `dockerImage` are pinned to agent scope too, and the two cannot "
+        + "both be on: a privileged DinD sidecar in the same pod defeats the broker's uid boundary, so the Job "
+        + "REFUSES TO RENDER rather than report a boundary that is not there (PEN-3183 \u00a77.6). "
         + "This is a rollout gate, not a kill switch: switching it back off after enablement re-opens the \u00a77 "
         + "acceptance and needs Security.",
     },
