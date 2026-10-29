@@ -103,7 +103,46 @@ const ctx = {
   onLog: async () => {},
 } as unknown as JobBuildInput["ctx"];
 
-type Routes = Record<string, { mounts: string[]; pointers: string[]; values: string[] }>;
+type Routes = Record<
+  string,
+  { mounts: string[]; pointers: string[]; values: string[]; secretRefs: string[] }
+>;
+
+/**
+ * Routes that name the credential SECRET rather than a path or a variable name.
+ *
+ * Two of them here, and both were green in the first draft of this file:
+ *
+ *   env[].valueFrom.secretKeyRef  — the token under ANY variable name, which is
+ *                                   why a name list cannot see it;
+ *   envFrom[].secretRef           — every key of the Secret, under names nothing
+ *                                   here ever observes.
+ *
+ * (Projected volumes are handled in the volume->Secret map, not here.)
+ *
+ * This is a LIVE path for agent Jobs, not a hypothetical: `k8s-client.ts`
+ * captures the Deployment container's `valueFrom` entries and its allowlisted
+ * `envFrom` sources — filtered by env NAME only, never by referenced Secret —
+ * and `job-manifest.ts` emits both into the agent container. Raised by review
+ * on #3103.
+ */
+function secretRefRoutes(container: k8s.V1Container): string[] {
+  const routes: string[] = [];
+  for (const entry of container.env ?? []) {
+    const secret = entry.valueFrom?.secretKeyRef?.name;
+    if (typeof secret === "string" && CREDENTIAL_SECRET_RE.test(secret)) {
+      routes.push(`${entry.name} -> ${secret}`);
+    }
+  }
+  for (const source of container.envFrom ?? []) {
+    const secret = source.secretRef?.name;
+    if (typeof secret === "string" && CREDENTIAL_SECRET_RE.test(secret)) {
+      routes.push(`envFrom -> ${secret}`);
+    }
+  }
+  return routes.sort();
+}
+
 
 function coversCredentialPath(mountPath: string, credentialPaths: string[]): boolean {
   const normalized = mountPath.replace(/\/+$/, "") || "/";
@@ -118,17 +157,29 @@ function coversCredentialPath(mountPath: string, credentialPaths: string[]): boo
  * Read off the ASSEMBLED pod spec over every container list, so a container
  * added later is covered automatically rather than silently bypassing this.
  */
-function credentialRoutes(): Routes {
-  const spec = buildJobManifest({ ctx, selfPod }).job.spec!.template!.spec! as k8s.V1PodSpec;
+function credentialRoutes(selfPodOverride: JobBuildInput["selfPod"] = selfPod): Routes {
+  const spec = buildJobManifest({ ctx, selfPod: selfPodOverride }).job.spec!.template!.spec! as k8s.V1PodSpec;
 
-  const secretByVolume = new Map(
-    (spec.volumes ?? [])
-      .filter((volume) => volume.secret?.secretName)
-      .map((volume) => [volume.name, volume.secret!.secretName!]),
-  );
+  // volumeMount name -> the Secret names it exposes. A `projected` volume is
+  // included: its sources carry the same Secret under a different key, so a
+  // projected credential mounted at a non-credential path would be invisible
+  // to both the path matcher and a `.secret.secretName`-only lookup.
+  const secretByVolume = new Map<string, string[]>();
+  for (const volume of spec.volumes ?? []) {
+    const names = [
+      volume.secret?.secretName,
+      ...(volume.projected?.sources ?? []).map((source) => source.secret?.name),
+    ].filter((name): name is string => typeof name === "string");
+    if (names.length > 0) secretByVolume.set(volume.name, names);
+  }
+  const volumeExposesCredential = (name: string): boolean =>
+    (secretByVolume.get(name) ?? []).some((secret) => CREDENTIAL_SECRET_RE.test(secret));
   const lists: ReadonlyArray<readonly [string, k8s.V1Container[]]> = [
     ["initContainers", spec.initContainers ?? []],
     ["containers", spec.containers ?? []],
+    // Not rendered by this builder today. Listed so the three copies of this
+    // walker (chart + both adapters) keep the same shape rather than drifting.
+    ["ephemeralContainers", (spec.ephemeralContainers ?? []) as unknown as k8s.V1Container[]],
   ];
 
   const credentialPaths: string[] = [];
@@ -136,10 +187,7 @@ function credentialRoutes(): Routes {
     for (const container of containers) {
       for (const mount of container.volumeMounts ?? []) {
         const normalized = mount.mountPath.replace(/\/+$/, "") || "/";
-        if (
-          CREDENTIAL_MOUNT_RE.test(normalized) ||
-          CREDENTIAL_SECRET_RE.test(secretByVolume.get(mount.name) ?? "")
-        ) {
+        if (CREDENTIAL_MOUNT_RE.test(normalized) || volumeExposesCredential(mount.name)) {
           credentialPaths.push(normalized);
         }
       }
@@ -153,17 +201,25 @@ function credentialRoutes(): Routes {
         .filter(
           (mount) =>
             coversCredentialPath(mount.mountPath, credentialPaths) ||
-            CREDENTIAL_SECRET_RE.test(secretByVolume.get(mount.name) ?? ""),
+            volumeExposesCredential(mount.name),
         )
         .map((mount) => mount.mountPath.replace(/\/+$/, "") || "/");
       const declared = (container.env ?? []).map((entry) => entry.name);
       const pointers = CREDENTIAL_ENV_POINTERS.filter((name) => declared.includes(name));
       const values = CREDENTIAL_ENV_VALUES.filter((name) => declared.includes(name));
-      if (mounts.length === 0 && pointers.length === 0 && values.length === 0) continue;
+      const secretRefs = secretRefRoutes(container);
+      if (
+        mounts.length === 0 &&
+        pointers.length === 0 &&
+        values.length === 0 &&
+        secretRefs.length === 0
+      )
+        continue;
       routes[`${kind}/${container.name}`] = {
         mounts: [...new Set(mounts)].sort(),
         pointers: pointers.sort(),
         values: values.sort(),
+        secretRefs,
       };
     }
   }
@@ -184,12 +240,62 @@ describe("which opencode agent-Job containers receive a github.com credential (P
         mounts: [TOKEN_MOUNT],
         pointers: ["PAPERCLIP_GITHUB_TOKEN_FILE"],
         values: [],
+        secretRefs: [],
       },
     });
   });
 
   it("the prompt init container never receives the credential", () => {
     expect(Object.keys(credentialRoutes())).not.toContain("initContainers/write-prompt");
+  });
+
+  it("sees a credential bound by secretKeyRef under an allowlisted env name", () => {
+    // Raised by review on #3103, and the reason the `secretRefs` bucket exists.
+    // The first draft left `inheritedEnvValueFrom` / `inheritedEnvFrom` empty in
+    // the fixture, so this path was never exercised and a credential arriving
+    // by `secretKeyRef` scored as no route at all.
+    //
+    // Both halves are asserted, because this adapter differs from the
+    // claude_k8s one in a way worth pinning: it RE-APPLIES
+    // `isAgentInheritableEnvName` at BUILD time (job-manifest.ts, the
+    // `inheritedEnvValueFrom` loop), where claude_k8s trusts the capture-time
+    // filter and emits what it is given.
+    //
+    //   `MY_TOKEN`      — not allowlisted, dropped here. Recorded as current
+    //                     behaviour, NOT relied on as the boundary: it is an
+    //                     env-NAME filter and says nothing about which Secret
+    //                     is referenced.
+    //   `ANTHROPIC_GH`  — matches the `ANTHROPIC_` allowed prefix, so it passes
+    //                     the name filter while referencing the credential
+    //                     Secret. This is the route that actually reaches the
+    //                     agent container, and the one the bucket must see.
+    //
+    // Asserting only the dropped half would be vacuous — it would pass with the
+    // detector deleted.
+    const routes = credentialRoutes({
+      ...selfPod,
+      inheritedEnvValueFrom: [
+        {
+          name: "MY_TOKEN",
+          valueFrom: { secretKeyRef: { name: "paperclip-github-mcp-token", key: "token" } },
+        },
+        {
+          name: "ANTHROPIC_GH",
+          valueFrom: { secretKeyRef: { name: "paperclip-github-mcp-token", key: "token" } },
+        },
+        // Negative control: a non-GitHub Secret by the same route, under an
+        // allowlisted prefix, must not register — or "any secretKeyRef" would
+        // be passing for "the credential".
+        {
+          name: "ANTHROPIC_AUTHBOT",
+          valueFrom: { secretKeyRef: { name: "authbot-mcp-consumer-service-keys", key: "k" } },
+        },
+      ],
+    } as unknown as JobBuildInput["selfPod"]);
+
+    expect(routes["containers/opencode"]?.secretRefs).toEqual([
+      "ANTHROPIC_GH -> paperclip-github-mcp-token",
+    ]);
   });
 
   it("the matchers would fire on the shapes this test exists to reject", () => {

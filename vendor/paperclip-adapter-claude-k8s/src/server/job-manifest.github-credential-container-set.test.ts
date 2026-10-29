@@ -56,7 +56,12 @@ const CREDENTIAL_SECRET_RE = /^paperclip-github-[a-z0-9-]*token$/;
 
 // A POINTER, not a credential: under the broker the agent keeps it with no
 // mount behind it, deliberately (PEN-4933). Reported separately from the
-// mounts so a red says which of the two routes moved.
+// mounts so a red says which route moved.
+//
+// ⚠ Matching env routes by NAME is not sufficient on its own, and a name list
+// is the wrong shape for the cheapest widening: a `secretKeyRef` binds the
+// credential Secret under ANY variable name. `secretRefs` below matches the
+// referenced SECRET instead, which is what closes that.
 const CREDENTIAL_ENV_POINTERS = ["PAPERCLIP_GITHUB_TOKEN_FILE"];
 // Credential VALUES. §7.4 decided these stay refused rather than routed through
 // the broker; none is bound in this fixture, so they appear in no expectation
@@ -130,7 +135,46 @@ function makeCtx(adapterConfig: Record<string, unknown>): AdapterExecutionContex
   } as unknown as AdapterExecutionContext;
 }
 
-type Routes = Record<string, { mounts: string[]; pointers: string[]; values: string[] }>;
+type Routes = Record<
+  string,
+  { mounts: string[]; pointers: string[]; values: string[]; secretRefs: string[] }
+>;
+
+/**
+ * Routes that name the credential SECRET rather than a path or a variable name.
+ *
+ * Two of them here, and both were green in the first draft of this file:
+ *
+ *   env[].valueFrom.secretKeyRef  — the token under ANY variable name, which is
+ *                                   why a name list cannot see it;
+ *   envFrom[].secretRef           — every key of the Secret, under names nothing
+ *                                   here ever observes.
+ *
+ * (Projected volumes are handled in the volume->Secret map, not here.)
+ *
+ * This is a LIVE path for agent Jobs, not a hypothetical: `k8s-client.ts`
+ * captures the Deployment container's `valueFrom` entries and its allowlisted
+ * `envFrom` sources — filtered by env NAME only, never by referenced Secret —
+ * and `job-manifest.ts` emits both into the agent container. Raised by review
+ * on #3103.
+ */
+function secretRefRoutes(container: k8s.V1Container): string[] {
+  const routes: string[] = [];
+  for (const entry of container.env ?? []) {
+    const secret = entry.valueFrom?.secretKeyRef?.name;
+    if (typeof secret === "string" && CREDENTIAL_SECRET_RE.test(secret)) {
+      routes.push(`${entry.name} -> ${secret}`);
+    }
+  }
+  for (const source of container.envFrom ?? []) {
+    const secret = source.secretRef?.name;
+    if (typeof secret === "string" && CREDENTIAL_SECRET_RE.test(secret)) {
+      routes.push(`envFrom -> ${secret}`);
+    }
+  }
+  return routes.sort();
+}
+
 
 /** Does `mountPath` sit at, or above, a path the credential is mounted at? */
 function coversCredentialPath(mountPath: string, credentialPaths: string[]): boolean {
@@ -148,18 +192,33 @@ function coversCredentialPath(mountPath: string, credentialPaths: string[]): boo
  * backstops in job-manifest.ts read the spec back: a container added later is
  * then covered automatically instead of silently bypassing this.
  */
-function credentialRoutes(adapterConfig: Record<string, unknown>): Routes {
-  const { job } = buildJobManifest({ ctx: makeCtx(adapterConfig), selfPod: baseSelfPod });
+function credentialRoutes(
+  adapterConfig: Record<string, unknown>,
+  selfPod: SelfPodInfo = baseSelfPod,
+): Routes {
+  const { job } = buildJobManifest({ ctx: makeCtx(adapterConfig), selfPod });
   const spec = job.spec!.template!.spec! as k8s.V1PodSpec;
 
-  const secretByVolume = new Map(
-    (spec.volumes ?? [])
-      .filter((volume) => volume.secret?.secretName)
-      .map((volume) => [volume.name, volume.secret!.secretName!]),
-  );
+  // volumeMount name -> the Secret names it exposes. A `projected` volume is
+  // included: its sources carry the same Secret under a different key, so a
+  // projected credential mounted at a non-credential path would be invisible
+  // to both the path matcher and a `.secret.secretName`-only lookup.
+  const secretByVolume = new Map<string, string[]>();
+  for (const volume of spec.volumes ?? []) {
+    const names = [
+      volume.secret?.secretName,
+      ...(volume.projected?.sources ?? []).map((source) => source.secret?.name),
+    ].filter((name): name is string => typeof name === "string");
+    if (names.length > 0) secretByVolume.set(volume.name, names);
+  }
+  const volumeExposesCredential = (name: string): boolean =>
+    (secretByVolume.get(name) ?? []).some((secret) => CREDENTIAL_SECRET_RE.test(secret));
   const lists: ReadonlyArray<readonly [string, k8s.V1Container[]]> = [
     ["initContainers", spec.initContainers ?? []],
     ["containers", spec.containers ?? []],
+    // Not rendered by this builder today. Listed so the three copies of this
+    // walker (chart + both adapters) keep the same shape rather than drifting.
+    ["ephemeralContainers", (spec.ephemeralContainers ?? []) as unknown as k8s.V1Container[]],
   ];
 
   const credentialPaths: string[] = [];
@@ -167,10 +226,7 @@ function credentialRoutes(adapterConfig: Record<string, unknown>): Routes {
     for (const container of containers) {
       for (const mount of container.volumeMounts ?? []) {
         const normalized = mount.mountPath.replace(/\/+$/, "") || "/";
-        if (
-          CREDENTIAL_MOUNT_RE.test(normalized) ||
-          CREDENTIAL_SECRET_RE.test(secretByVolume.get(mount.name) ?? "")
-        ) {
+        if (CREDENTIAL_MOUNT_RE.test(normalized) || volumeExposesCredential(mount.name)) {
           credentialPaths.push(normalized);
         }
       }
@@ -184,17 +240,25 @@ function credentialRoutes(adapterConfig: Record<string, unknown>): Routes {
         .filter(
           (mount) =>
             coversCredentialPath(mount.mountPath, credentialPaths) ||
-            CREDENTIAL_SECRET_RE.test(secretByVolume.get(mount.name) ?? ""),
+            volumeExposesCredential(mount.name),
         )
         .map((mount) => mount.mountPath.replace(/\/+$/, "") || "/");
       const declared = (container.env ?? []).map((entry) => entry.name);
       const pointers = CREDENTIAL_ENV_POINTERS.filter((name) => declared.includes(name));
       const values = CREDENTIAL_ENV_VALUES.filter((name) => declared.includes(name));
-      if (mounts.length === 0 && pointers.length === 0 && values.length === 0) continue;
+      const secretRefs = secretRefRoutes(container);
+      if (
+        mounts.length === 0 &&
+        pointers.length === 0 &&
+        values.length === 0 &&
+        secretRefs.length === 0
+      )
+        continue;
       routes[`${kind}/${container.name}`] = {
         mounts: [...new Set(mounts)].sort(),
         pointers: pointers.sort(),
         values: values.sort(),
+        secretRefs,
       };
     }
   }
@@ -218,6 +282,7 @@ describe("which agent-Job containers receive a github.com credential (PEN-4990 /
           mounts: BOTH_MOUNTS,
           pointers: ["PAPERCLIP_GITHUB_TOKEN_FILE"],
           values: [],
+          secretRefs: [],
         },
       },
     ],
@@ -229,6 +294,7 @@ describe("which agent-Job containers receive a github.com credential (PEN-4990 /
           mounts: BOTH_MOUNTS,
           pointers: ["PAPERCLIP_GITHUB_TOKEN_FILE"],
           values: [],
+          secretRefs: [],
         },
       },
     ],
@@ -240,12 +306,13 @@ describe("which agent-Job containers receive a github.com credential (PEN-4990 /
           mounts: BOTH_MOUNTS,
           pointers: ["PAPERCLIP_GITHUB_TOKEN_FILE"],
           values: [],
+          secretRefs: [],
         },
         // No `mounts`. The dangling pointer is deliberate (PEN-4933): the
         // wrappers read it, find no file, and fall through to the broker
         // socket. Pinned so that quietly restoring a mount behind it — the
         // exact widening §7.2 names — reds here.
-        "containers/claude": { mounts: [], pointers: ["PAPERCLIP_GITHUB_TOKEN_FILE"], values: [] },
+        "containers/claude": { mounts: [], pointers: ["PAPERCLIP_GITHUB_TOKEN_FILE"], values: [], secretRefs: [] },
       },
     ],
     [
@@ -256,8 +323,9 @@ describe("which agent-Job containers receive a github.com credential (PEN-4990 /
           mounts: BOTH_MOUNTS,
           pointers: ["PAPERCLIP_GITHUB_TOKEN_FILE"],
           values: [],
+          secretRefs: [],
         },
-        "containers/claude": { mounts: [], pointers: ["PAPERCLIP_GITHUB_TOKEN_FILE"], values: [] },
+        "containers/claude": { mounts: [], pointers: ["PAPERCLIP_GITHUB_TOKEN_FILE"], values: [], secretRefs: [] },
       },
     ],
   ];
@@ -279,6 +347,47 @@ describe("which agent-Job containers receive a github.com credential (PEN-4990 /
     for (const config of [{}, { enableGitHubPublishBroker: true }]) {
       expect(Object.keys(credentialRoutes(config))).not.toContain("initContainers/write-prompt");
     }
+  });
+
+  it("sees a credential bound by secretKeyRef / envFrom, under a name no list contains", () => {
+    // Raised by review on #3103, and the reason the `secretRefs` bucket exists.
+    //
+    // This is the LIVE capture path, not a synthetic shape: `k8s-client.ts`
+    // keeps the Deployment container's `valueFrom` entries and its allowlisted
+    // `envFrom` sources — filtered by env NAME only, never by which Secret they
+    // reference — and this builder emits both into the agent container. The
+    // first draft of this file set both to `[]` in the fixture, so the path was
+    // never exercised and a credential arriving this way scored as no route at
+    // all.
+    //
+    // `MY_TOKEN` is deliberately a name that appears in NO list in this file.
+    // That is the whole point: a `secretKeyRef` binds the Secret whatever the
+    // variable is called, so only matching the referenced Secret can see it.
+    const routes = credentialRoutes(
+      {},
+      {
+        ...baseSelfPod,
+        inheritedEnvValueFrom: [
+          {
+            name: "MY_TOKEN",
+            valueFrom: { secretKeyRef: { name: "paperclip-github-mcp-token", key: "token" } },
+          },
+          // Negative control: a non-GitHub Secret by the same route must not
+          // register, or "any secretKeyRef" would be passing for "the
+          // credential".
+          {
+            name: "AUTHBOT_KEY",
+            valueFrom: { secretKeyRef: { name: "gbrain-authbot-service-key", key: "k" } },
+          },
+        ],
+        inheritedEnvFrom: [{ secretRef: { name: "paperclip-github-second-token" } }],
+      },
+    );
+
+    expect(routes["containers/claude"]?.secretRefs).toEqual([
+      "MY_TOKEN -> paperclip-github-mcp-token",
+      "envFrom -> paperclip-github-second-token",
+    ]);
   });
 
   it("the matchers would fire on the shapes this test exists to reject", () => {

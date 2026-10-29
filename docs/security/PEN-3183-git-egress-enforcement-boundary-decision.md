@@ -345,7 +345,18 @@ properties are deliberate.
   defeats a path-only check and mounting a renamed Secret at the credential path
   defeats a name-only one; and a mount at any ancestor of a credential path
   counts as reaching it, since mounting `/etc/paperclip/secrets` hands over both
-  tokens without naming either.
+  tokens without naming either. A `projected` volume's sources count as the
+  Secret they carry.
+- **A third route kind matches the referenced SECRET, not a name or a path**,
+  and it is the one the first draft of these tests got wrong. A
+  `env[].valueFrom.secretKeyRef` binds the token under **any** variable name, so
+  a name list cannot see it; an `envFrom[].secretRef` injects every key of the
+  Secret under names nothing observes. Both are live: `k8s-client.ts` captures
+  the Deployment container's `valueFrom` entries and its allowlisted `envFrom`
+  sources — filtered by env NAME only, never by which Secret they reference —
+  and `job-manifest.ts` emits them into the agent container. Caught by review on
+  #3103; recorded here because "we match the mount and the variable names" reads
+  complete and is not.
 - **Both broker arrangements are expected, not just today's.** §7.2 is explicit
   that the broker receiving a credential **is** trigger 3 — a declared, reviewed
   instance of it, not an exemption — so the agent-Job assertion carries a
@@ -376,6 +387,16 @@ Three limits, none of which a green run covers.
   `values.blockcast.yaml`; a mount added to a live workload by any path that is
   not this chart is outside it. Agent Jobs are covered by the adapter
   assertions instead, which read the manifest the builder actually emits.
+
+One asymmetry between the two agent-Job builders is worth knowing, and is now
+pinned by a test on each side rather than left to be rediscovered: `claude_k8s`
+does **not** re-apply the env-name allowlist at build time, trusting the
+capture-time filter in `k8s-client.ts`, while `opencode_k8s` re-applies it in
+its `inheritedEnvValueFrom` loop and its `envFrom` filter. Neither is wrong —
+capture is the control, and the build-time pass is defence in depth — but note
+what that second pass is and is not: it filters env **names**, so a credential
+bound under an allowed prefix (`ANTHROPIC_*`) passes it while still referencing
+the token Secret. It is not a credential boundary and must not be cited as one.
 
 Coverage is asserted in the **two** adapters that render agent Jobs —
 `claude_k8s` and `opencode_k8s`, both registered in
