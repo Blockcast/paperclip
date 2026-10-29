@@ -77,11 +77,17 @@ that makes the absolute path safe.
 
 When `enableGitHubPublishBroker` is set on the agent adapter, the GitHub
 credential Secret stops being mounted into the agent container and is mounted
-into a `github-publish-broker` sidecar instead. *On the agent adapter* is the
-whole of it: PEN-5017 pins the key to agent provenance, so a per-issue
-`assigneeAdapterOverrides.adapterConfig` carrying it is discarded and logged,
-never honoured — otherwise an agent could file an issue against itself and
-render the credential back into its own container. These scripts are unchanged in
+into a `github-publish-broker` sidecar instead. PEN-5017 pins *that key* to agent
+provenance, so a per-issue `assigneeAdapterOverrides.adapterConfig` carrying it
+is discarded and logged, never honoured — otherwise an agent could file an
+issue against itself and render the credential back into its own container. The
+broker's `image` is pinned the same way, for the same reason: the broker execs
+these scripts out of it with the credential in its environment.
+
+⚠ That is two keys, not the whole boundary. The merged run config is still
+overlaid from issue scope for every other key, and PEN-3183 §7.5 names one
+route (`workspaceVolumeClaim`) that is still open. Do not read "agent scope
+only" as a property of the rendered broker. These scripts are unchanged in
 shape — they still lead PATH, still re-read the token file, still exec the same
 egress runtimes — but in the agent container that token file no longer exists,
 and each runtime hands the invocation to the broker over a unix socket.

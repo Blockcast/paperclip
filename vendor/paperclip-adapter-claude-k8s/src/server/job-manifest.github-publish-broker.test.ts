@@ -264,6 +264,69 @@ describe("GitHub publish broker boundary (PEN-4933 / PEN-3183 D1)", () => {
     expect(mountPaths(agentContainer(spec))).toEqual(expect.arrayContaining([TOKEN_MOUNT]));
   });
 
+  // PEN-5017, found by Ally reviewing #3112. The server-side pin keeps an issue
+  // override from flipping `enableGitHubPublishBroker` off — but `image` is read
+  // off the SAME merged config, and the broker execs
+  // `paperclip-github-token-env` and the runtime JS out of that image with the
+  // push credential in its environment. So an override of a sibling key chose
+  // the code that runs at uid 1001 holding the token, with the gate still
+  // pinned exactly as intended. The broker now renders from
+  // `ctx.agent.adapterConfig` — the agent row before any merge.
+  describe("broker image provenance", () => {
+    const divergentCtx = (agentScope: Record<string, unknown>, merged: Record<string, unknown>) =>
+      ({
+        runId: "run-abc12345",
+        agent: {
+          id: "agent-abc",
+          companyId: "co1",
+          name: "Test Agent",
+          adapterType: "claude_k8s",
+          adapterConfig: { enableGitHubPublishBroker: true, ...agentScope },
+        },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null, isolation: NARROW_ISOLATION },
+        config: { serviceAccountName: "test-sa", enableGitHubPublishBroker: true, ...merged },
+        context: {},
+        onLog: async () => {},
+      }) as unknown as AdapterExecutionContext;
+
+    const renderDivergent = (agentScope: Record<string, unknown>, merged: Record<string, unknown>) =>
+      buildJobManifest({ ctx: divergentCtx(agentScope, merged), selfPod: baseSelfPod })
+        .job.spec!.template!.spec!;
+
+    it("runs the broker on the agent-scope image, not an overridden one", () => {
+      const spec = renderDivergent(
+        { image: "registry.example/operator-agent:pinned" },
+        { image: "registry.example/attacker:evil" },
+      );
+
+      expect(brokerContainer(spec)?.image).toBe("registry.example/operator-agent:pinned");
+      // The agent container may still take the override — once brokered it
+      // holds no credential, so what it runs is its own business. Asserted so
+      // that a future fix cannot quietly pin BOTH and call this case green.
+      expect(agentContainer(spec).image).toBe("registry.example/attacker:evil");
+    });
+
+    it("falls back to the self-pod image when agent scope names none, never to the override", () => {
+      const spec = renderDivergent({}, { image: "registry.example/attacker:evil" });
+
+      expect(brokerContainer(spec)?.image).toBe(baseSelfPod.image);
+      expect(brokerContainer(spec)?.image).not.toBe("registry.example/attacker:evil");
+    });
+
+    it("POSITIVE CONTROL: with no override the broker still tracks the agent image", () => {
+      // Without this, pinning the broker to a constant would pass both cases
+      // above while silently breaking every real deployment — the broker must
+      // run the agent's image, it just must learn it from agent scope.
+      const spec = renderDivergent(
+        { image: "registry.example/operator-agent:pinned" },
+        { image: "registry.example/operator-agent:pinned" },
+      );
+
+      expect(brokerContainer(spec)?.image).toBe("registry.example/operator-agent:pinned");
+      expect(brokerContainer(spec)?.image).toBe(agentContainer(spec).image);
+    });
+  });
+
   it("POSITIVE CONTROL: with the broker off, the agent still holds the credential", () => {
     const spec = render(false);
     expect(brokerContainer(spec)).toBeUndefined();

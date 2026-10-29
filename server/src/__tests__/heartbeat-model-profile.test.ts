@@ -424,6 +424,17 @@ describe("mergeModelProfileAdapterConfig agent-scope-only top-level config bound
   // Membership pin. The guard is a list, so it is exactly as complete as its
   // last edit — this makes adding or removing a key a deliberate act with a
   // diff on it rather than something a refactor can do by accident.
+  //
+  // ⚠ `image` is deliberately NOT in this set, and that is a decision rather
+  // than an omission. It reaches the broker sidecar — which runs the credential
+  // — but it also selects the AGENT container's image, which has legitimate
+  // lower-scope uses and an unmeasured live set. Pinning it here would have
+  // been a silent behaviour change for every issue-scope image override.
+  // PEN-5017 closes that route adapter-side instead: the broker renders from
+  // `ctx.agent.adapterConfig`, so an override moves the agent container (which
+  // holds no credential once brokered) and never the broker. See
+  // job-manifest.github-publish-broker.test.ts "broker image provenance".
+  // If that adapter-side pin is ever removed, `image` belongs in this set.
   it("pins the agent-scope-only top-level key set", () => {
     const probe = {
       enableGitHubPublishBroker: false,
