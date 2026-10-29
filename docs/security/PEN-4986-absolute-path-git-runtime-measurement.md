@@ -6,11 +6,19 @@ calls its **highest-value item**, and the one §7.1's residual acceptance is exp
 on. §7.2 trigger 4 fires on a **non-zero** count and ends that acceptance early regardless of the
 calendar date.
 
-**Result: zero.** No invocation reaching a real git binary outside the wrapper was observed, other
-than the ones this measurement deliberately produced to prove the instrument can see them.
-**Trigger 4 has not fired.** The acceptance stands, and §7.1's assumption is now tested rather than
-merely stated — but read §4 before treating it as tested *fleet-wide*, because it is not, and the
-part that remains untested is named there rather than buried. Read §2.2 before quoting a confidence
+**Result in this pod: zero.** No invocation reaching a real git binary outside the wrapper was
+observed, other than the ones this measurement deliberately produced to prove the instrument can
+see them.
+
+⛔ **DO NOT CITE THAT ZERO AS THE ANSWER. §7.2 trigger 4 has since FIRED.** This document records
+the **first** window only. The measurement was widened the same day (2026-10-29) along the axis §4
+names as untested — **workload** — and the sixth window, an Engineer pod running a full
+build/test suite, returned **28**. The residual acceptance is **ended**, not standing. The
+authoritative record of the firing, its mechanism and its severity argument is
+[`PEN-4989-absolute-path-git-population-widening.md`](./PEN-4989-absolute-path-git-population-widening.md)
+*(lands in #3102)* and §7.1 of the decision record; this document is the method and the first data
+point. §4 below is right that this result does not generalise — what it could not know is that the
+first counter-example was already one window away. Read §2.2 before quoting a confidence
 with the zero: the sampler's measured catch rate on the shortest invocation class is **0.710**, so
 the zero supports *k = 0* at only ~71 % for that class, not the ~93 % earlier drafts claimed.
 
@@ -127,6 +135,25 @@ startup path, lives ~24 % longer, and is correspondingly easier for a sampler to
 **Calibrating on a copy therefore over-states the catch rate for the real binaries.** Keep the copy
 — it is still the only way to calibrate without adding to the counted population — but calibrate
 the watched paths directly too, and quote *those*.
+
+⛔ **Two corrections to this subsection, both dated 2026-10-29 and both in the direction of
+trusting it less.**
+
+1. **The copy must be named `git`, and in four of the six rows it was not.** Git dispatches on
+   `argv[0]`: a copy named **`git-calib`** exits `128` at builtin dispatch
+   (`fatal: cannot handle calib as a builtin`) and **never executes `--version` at all**. The
+   table above is sound — its copy sat at `/tmp/.../calib/git` — but PEN-4986's headline `0.930`,
+   PEN-4989 §1's `0.840`, PEN-4992's `0.933` and PEN-4994's `0.793` were all taken under the
+   `git-calib` name and so timed an **error path rather than a git invocation**. Treat those four
+   as **void**, not as over-statements. It also explains PEN-4992's reported contradiction — a
+   `0.933` rate beside 1-of-3 real controls caught, `P[≤1] ≈ 1.3 %` — which is not a contradiction
+   once the two targets are recognised as different programs.
+2. **The lifetime mechanism above is pod-local.** The `5 126 µs` vs `4 123 µs` figures are a real
+   measurement in *this* pod, but re-measured in another pod on 2026-10-29 a correctly-named copy
+   and the real binary had **comparable** warm lifetimes (~4.2–4.8 ms vs ~3.9–4.5 ms, 3 × n = 300;
+   the copy is markedly longer only cold, at 10.0 ms vs 4.3 ms). The *direction* — copy
+   over-states — reproduces across pods. The *magnitude* and the *cause* do not. Do not carry
+   "~24 %" into another row as though it were a constant.
 
 **The confidence statement, corrected.** Take the worst watched path, **0.710**. A single
 worst-case invocation — `git --version`, the shortest an invocation can be — is missed with
@@ -342,10 +369,15 @@ fleet.
 
 ```sh
 mkdir -p /tmp/calib && cp /usr/bin/git /tmp/calib/git   # a copy, NOT /usr/bin/git itself.
-                                                        # Name it `git`: git dispatches on argv[0],
-                                                        # so a copy named `git-calib` runs a
-                                                        # different, shorter path and mismeasures
-                                                        # the catch rate.
+                                                        # Name it `git`. Git dispatches on argv[0],
+                                                        # so a copy named `git-calib` does not take
+                                                        # a "shorter path" -- it does not run AT
+                                                        # ALL: it exits 128 at builtin dispatch
+                                                        # ("fatal: cannot handle calib as a
+                                                        # builtin") without executing --version.
+                                                        # Verified 2026-10-29. Four rows calibrated
+                                                        # under that name timed an error path, not
+                                                        # git; their rates are VOID. See §2.2.
 node scripts/measure-absolute-path-git.mjs /tmp/obs.ndjson 2 /tmp/calib/git &
 
 # Controls -- run all four, inside the window. `--version` touches no credential,
@@ -353,9 +385,11 @@ node scripts/measure-absolute-path-git.mjs /tmp/obs.ndjson 2 /tmp/calib/git &
 git --version                                              # positive: must classify wrapped
 /usr/bin/git        -c pen4986.detector.control=A --version # negative, class-A inode 1
 /usr/lib/git-core/git -c pen4986.detector.control=B --version # negative, class-A inode 2
-# Catch rate: calibrate the WATCHED PATHS directly, not only the copy. The copy
-# cannot find git-core relative to its own argv[0], so it lives ~24% longer and
-# over-states the rate for the binaries that are actually counted (§2.2).
+# Catch rate: calibrate the WATCHED PATHS directly, not only the copy. A correctly
+# named copy over-states the rate for the binaries actually counted (§2.2). The
+# "~24% longer" mechanism measured there is pod-local -- re-measured 2026-10-29 in
+# another pod, copy and real binary had comparable warm lifetimes. Direction holds,
+# magnitude does not. Quote the watched-path rate, never the copy's.
 for i in $(seq 1 300); do /tmp/calib/git --version >/dev/null; done
 for i in $(seq 1 300); do /usr/bin/git        -c pen4986.detector.control=A --version >/dev/null; done
 for i in $(seq 1 300); do /usr/lib/git-core/git -c pen4986.detector.control=B --version >/dev/null; done

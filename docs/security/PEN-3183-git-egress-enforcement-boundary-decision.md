@@ -285,8 +285,10 @@ grounds:
   threat that is a low bar, but it is also the threat this control never claimed to cover and that
   PEN-3183 exists to close; accepting it is accepting the status quo ante, not a new exposure.
 - The real uncertainty is therefore the **accidental** absolute-path caller (§4.0). The CEO asked
-  for exactly that count on 2026-09-11; it was collected on 2026-10-29 (PEN-4986) and it is
-  **zero**. See below — that bullet is no longer an assumption.
+  for exactly that count on 2026-09-11. It was collected on 2026-10-29 (PEN-4986) and was
+  **zero** in that pod; widening it the same day to a build/test workload returned **28**
+  (PEN-4989, PEN-4993). ⛔ **This ground does not survive.** See below: the bullet is no longer
+  an assumption, and it is no longer true as written.
 
 **This acceptance is explicitly conditional on that count, and the count has now been taken.**
 Measured 2026-10-29 (PEN-4986; method, controls and limits in
@@ -312,16 +314,69 @@ measured **directly on each watched path** at n = 300 rather than on a copy — 
 `/usr/bin/git` and **0.747** for `/usr/lib/git-core/git`. On that floor an observed zero supports
 **k = 0 at ~71 %** and **k ≤ 1 at ~92 %** for that shortest class, and much tighter for any real
 git operation, all of which are longer-lived. ⚠ Earlier drafts quoted ~0.93 here; that figure came
-from a byte-identical *copy* of the binary, which cannot find `git-core` relative to its own
-`argv[0]`, lives ~24 % longer and is correspondingly easier to catch — so it over-stated the rate
-for the binaries actually watched. See §2.2 of the measurement doc. Separately, an image- and harness-wide census found **no** exec site for either path
+from a byte-identical *copy* of the binary, which over-stated the rate for the binaries actually
+watched.
+
+⛔ **The name of that copy decides whether the figure means anything, and four of the six rows got
+it wrong.** Git dispatches on `argv[0]`, so a copy named **`git-calib`** — the name this
+document's own earlier recipe gave, and the one PEN-4986, PEN-4989 §1, PEN-4992 and PEN-4994 all
+used — **never runs at all**: it exits `128` at builtin dispatch (`fatal: cannot handle calib as a
+builtin`) without ever executing `--version`. Verified 2026-10-29 on this image. Those four rows'
+rates (`0.930`, `0.840`, `0.933`, `0.793`) therefore timed an **error path, not a git invocation**,
+and are **void as catch rates** rather than merely optimistic. This also resolves an anomaly
+PEN-4992 reported and could not explain: a `0.933` calibration alongside catching only 1 of 3 real
+negative controls (`P[≤1] ≈ 1.3 %`). The two numbers never described the same thing.
+
+Rows that named the copy `git` are unaffected and remain the usable ones: this document's §2.2
+(`0.903` copy vs `0.710`/`0.747` watched) and PEN-4993 (`0.837` copy vs `0.810` watched). ⚠ §2.2's
+*mechanism* for the residual gap — "lives ~24 % longer" — is a real measurement (5 126 µs vs
+4 123 µs) but is **pod-local**: re-measured 2026-10-29 in a different pod, a correctly-named copy
+and the real binary have comparable warm lifetimes (~4.2–4.8 ms vs ~3.9–4.5 ms, 3 × n = 300). The
+over-statement direction reproduces; its magnitude and cause do not. Quote the **watched-path**
+rate, never the copy's. Separately, an image- and harness-wide census found **no** exec site for either path
 outside the egress-control machinery itself.
 
-**§7.2 trigger 4 has not fired, and the acceptance stands unchanged.** What has changed is that the
-first ground above rests on a measurement rather than an expectation — with one qualification,
-which replaces the old one rather than removing it. The evidence splits in two: the
-**image-resident** half, what the image and harness themselves run, is zero *by census*; the
-**per-pod** half, what an agent composes into a shell at runtime, is zero *in the pods measured*.
+⛔ **§7.2 trigger 4 has FIRED, and this acceptance is ENDED as of 2026-10-29. It does not run to
+2027-01-31.** The count is **28**, from a sixth measurement window in an **Engineer** pod running
+the repository's own test suite (PEN-4993, folded into PEN-4989 and its record). The five earlier
+windows, across four agents and four image tags, all returned zero; the sixth was the first to run
+`pnpm test`. Widening along the *pod* axis alone would have returned zero indefinitely — §3 of the
+PEN-4989 record named **workload** as the uncovered axis before it was sampled.
+
+⚠ **The firing does not depend on the predicate question** raised on PEN-4989 and PEN-4993. Those
+asked whether "absolute-path `git`" means a literal `argv[0] == "/usr/bin/git"` or the instrument's
+"reached a real git without transiting the wrapper", and warned that the literal reading would
+score this finding **zero**. Read against trigger 4's own words — *"any invocation **reaching**
+`/usr/bin/git` that did not come through the wrapper"* — that ambiguity is **not load-bearing
+here**: 26 of the 28 resolve a bare `git` through a narrowed `PATH` to `/usr/bin/git` itself, with
+no wrapper anywhere in their ancestry. They reached `/usr/bin/git` and did not come through the
+wrapper, so **trigger 4 fires on its own literal text**. (The remaining 2 reach
+`/usr/lib/git-core/git` and are PEN-4998's separately-triaged class.) §7.1 should still be made to
+say which predicate it means — but that is a clarification, not a precondition for acting on this.
+
+**Mechanism — a class, not a site.** The 26 come from first-party test code that spawns a child
+with `PATH` narrowed to `` `${bin}:/usr/bin:/bin` `` so that a stub binary is genuinely the only
+candidate. The wrapper's directory is absent from that `PATH` **by construction**, so every `git`
+the child runs reaches the real binary directly. The intent is reasonable and commented in place;
+the wrapper bypass is an unremarked side effect of it. **Any test or tool that builds its own
+`PATH` gets an unwrapped `git` for free.** ⚠ The known site is in
+**`Blockcast/penstock-llm-proxy-core`** (`test/secret-scan-budget.test.ts`), **not** in this
+repository — the class is cross-repo, and a paperclip-only sweep will report it clean. Tracked as
+**PEN-5012**.
+
+**Severity, stated both ways.** The 28 invocations are themselves harmless: `rev-parse` and
+`maintenance` against throwaway scratch repos with no remote, so nothing was published and no
+credential was used, and the 26 are one reviewed, commented design choice rather than
+agent-composed shell. The **mechanism** is the finding. §4.0 was verified live in that pod —
+`/etc/gitconfig` supplies `credential.https://github.com.helper` unconditionally — so an unwrapped
+`git` reaching github.com *is* authenticated with no intent and no credential handling by the
+caller, which is exactly the **accidental** case this control exists for; and the bypass is reached
+by **every run of that test suite**. Trigger 4 is written as a count test, not a harm test.
+
+What survives of the original measurement is narrower than it was written to be. The evidence
+splits in two: the **image-resident** half, what the image and harness themselves run, is zero *by
+census*; the **per-pod** half, what runs inside an agent's own workload, is zero in five windows
+and **28 in the sixth**.
 
 ⚠ That first half does **not** generalise for the reason this paragraph originally gave. It claimed
 the census carries fleet-wide "because the image is common to every agent pod", and the fleet does
@@ -336,7 +391,8 @@ changed between them (a `KUBECTL_VERSION` pin), so they share a single egress su
 is a count, not a sample fraction of the fleet's variation. The fleet claim rests on the
 egress-surface fingerprint comparison below, not on that count.
 
-So the assumption is tested in three pods on three images, and is not a fleet census. Re-take it when
+So the assumption is tested in six windows across four agents, five pods and four image tags, and
+is not a fleet census — and it **failed** in the one window that ran a build/test workload. Re-take it when
 the **egress-relevant surface** changes — the wrapper, the runtime it `exec`s, the credential helper,
 **the set of real git binaries**, and the PATH ordering. "Whenever the agent image changes" is not an operable
 trigger at ≈15 changes a day; `scripts/absolute-path-git-fingerprint.mjs` *(lands in #3102)* computes the narrower
@@ -347,10 +403,12 @@ the cluster**, so nothing would currently report trigger 4 firing in another pod
 on the §7.2 triggers is already permitted by §8 without further security review, and is the cheapest
 remaining improvement here.
 
-⚠ **Status, 2026-10-28 (PEN-4933):** D1 is **built** and merged behind a
-default-off rollout gate; see §7.3. The residual statement above still describes
-the deployed fleet, and remains accepted on the grounds listed, until that gate
-is enabled.
+⚠ **Status, 2026-10-29 (PEN-4933):** D1 is **built** and merged behind a default-off rollout gate;
+see §7.3. The residual statement above still describes the deployed fleet — but it is **no longer
+accepted on the grounds listed**, because trigger 4 has fired (above). ⛔ The firing is deliberately
+**not** folded into D1's rollout: a broker retiring the residual *in future* is a different event
+from the acceptance *failing now*, and merging the two would quietly convert a fired trigger into a
+scheduled task. Disposition is the CTO's and is tracked on PEN-4989.
 
 ### 7.2 Review triggers — any one of these ends the acceptance early
 
@@ -371,7 +429,12 @@ is enabled.
    `/usr/bin/git` that did not come through the wrapper. That means the *accidental* case is
    uncovered too, which is the ground §7.1 accepts on; it ends the acceptance regardless of the
    calendar date.
-5. Otherwise: **2027-01-31.**
+
+   ⛔ **FIRED 2026-10-29. Count = 28** (PEN-4993 → PEN-4989). This trigger is **spent**, not
+   pending: §7.1 records the firing, the mechanism and the severity argument, and the acceptance is
+   ended. Read item 5 below as superseded.
+5. Otherwise: **2027-01-31.** ⛔ **Superseded** — trigger 4 fired on 2026-10-29, which ends the
+   acceptance regardless of this date.
 
 ### 7.3 Discharge status (PEN-4933)
 
