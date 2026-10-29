@@ -697,15 +697,31 @@ export const RECOVERY_ACTION_AUTO_DISCHARGED_METRIC = "paperclip_recovery_action
  * was therefore unevaluable in either direction against that surface. The
  * counter has normal retention, so the same question is a range query.
  *
- * Cardinality is three series by construction —
- * {@link KNOWN_WORKER_TIER_PROXY_FAILURE_REASONS} is a closed set, not caller
- * input. `timeout` means the connection succeeded and the worker was still
+ * `reason` is a closed set by construction —
+ * {@link KNOWN_WORKER_TIER_PROXY_FAILURE_REASONS}, not caller input. `timeout`
+ * means the connection succeeded and the worker was still
  * silent when the proxy's own deadline fired; `mid_stream` means the worker
  * answered and the response then broke after headers were already flushed;
  * `unreachable` means the request never got that far. They are separated
  * because they route differently: `timeout` is worker latency, `mid_stream` is
  * a worker that died or was restarted mid-response, and only `unreachable`
  * points at a missing Service endpoint.
+ *
+ * `route` names WHICH proxied route failed, as the Express path pattern from
+ * the `WORKER_DEPENDENT_PLUGIN_ROUTES` allowlist — also a closed set, and
+ * already parameterized (`:pluginId`, `:endpointKey`), so no caller-supplied
+ * id reaches a label. Added by PEN-4100: `reason` alone pools every proxied
+ * route into one series, and the routes fail for unrelated causes at wildly
+ * different rates. Measured over 2026-10-22 → 10-29 the `unreachable` arm took
+ * 2,550 increments (api rollouts) against 2 for `timeout`, so "did an
+ * alertmanager webhook delivery time out at the proxy" was answerable only by
+ * reading the SENDER's log — which is the exact dependency PEN-4100 exists to
+ * remove. With `route` the webhook arm is isolable:
+ * `increase(paperclip_worker_tier_proxy_failures_total{reason="timeout",
+ * route="/plugins/:pluginId/webhooks/:endpointKey"}[7d])`.
+ *
+ * Cardinality stays bounded at |routes| × |reasons| — 17 × 3 = 51 series
+ * today — because both label sets are allowlists fixed at build time.
  */
 export const WORKER_TIER_PROXY_FAILURES_METRIC = "paperclip_worker_tier_proxy_failures_total";
 export const KNOWN_WORKER_TIER_PROXY_FAILURE_REASONS = [
@@ -715,6 +731,62 @@ export const KNOWN_WORKER_TIER_PROXY_FAILURE_REASONS = [
 ] as const;
 export type WorkerTierProxyFailureReason =
   (typeof KNOWN_WORKER_TIER_PROXY_FAILURE_REASONS)[number];
+
+/**
+ * Route patterns the worker-tier proxy serves, as registered by
+ * `registerWorkerTierProxyRoutes` / `registerPluginHolderForwardRoutes`
+ * (routes/worker-tier-proxy.ts).
+ *
+ * Declared here rather than imported from the route module because the
+ * dependency runs the other way — that module imports
+ * {@link recordWorkerTierProxyFailure} — and closing the loop would make
+ * module-init order load-bearing. The route module pushes its allowlist in at
+ * registration via {@link initWorkerTierProxyRouteSeries} instead, so the
+ * label set stays derived from the one table that defines it and cannot drift
+ * into a second hand-maintained copy.
+ *
+ * Deliberately NOT cleared by {@link __resetMetricsForTest}: which routes this
+ * binary proxies is a property of the build, not of a test's state. Keeping it
+ * makes zero-init order-independent — a reset that rebuilds the registry
+ * re-seeds from this set, and a registration that lands before the registry
+ * exists is picked up when it is built.
+ */
+const workerTierProxyRoutes = new Set<string>();
+
+/**
+ * Seed the zero-valued `{reason, route}` series for every proxied route.
+ *
+ * Same rationale as every other zero-init here: an un-incremented counter is
+ * absent from the scrape, and `rate()`/`increase()` over an absent series
+ * returns nothing rather than 0 — indistinguishable from healthy on a
+ * dashboard, and unusable as an alert denominator. With a `route` label the
+ * quiet case is the common one (most proxied routes never fail), so the seed
+ * matters more here than it did on `reason` alone.
+ *
+ * Idempotent, and safe to call before the registry is built.
+ */
+export function initWorkerTierProxyRouteSeries(routes: readonly string[]): void {
+  let added = false;
+  for (const route of routes) {
+    if (!workerTierProxyRoutes.has(route)) {
+      workerTierProxyRoutes.add(route);
+      added = true;
+    }
+  }
+  if (!added || !workerTierProxyFailures) return;
+  zeroInitWorkerTierProxyFailureSeries(workerTierProxyFailures);
+}
+
+/**
+ * Zero every `{reason, route}` pair currently known. Called at counter
+ * construction and again whenever a new route registers afterwards.
+ */
+function zeroInitWorkerTierProxyFailureSeries(counter: Counter<"reason" | "route">): void {
+  for (const reason of KNOWN_WORKER_TIER_PROXY_FAILURE_REASONS) {
+    for (const route of workerTierProxyRoutes) counter.inc({ reason, route }, 0);
+  }
+}
+
 export const HEARTBEAT_RUN_FAILED_METRIC = "paperclip_heartbeat_run_failed_total";
 /**
  * `error_code` booked when a `job_failed` run is proven to be the Caveman-proxy
@@ -4902,7 +4974,7 @@ let pluginWebhookDeliveryRejected:
   | null = null;
 let recoveryHorizonExpired: Counter<"delivery"> | null = null;
 let recoveryActionAutoDischarged: Counter<"kind"> | null = null;
-let workerTierProxyFailures: Counter<"reason"> | null = null;
+let workerTierProxyFailures: Counter<"reason" | "route"> | null = null;
 let isolationReaperScanned: Counter<"dry_run"> | null = null;
 let isolationReaperDeleted: Counter<"dry_run"> | null = null;
 let isolationReaperSkippedLayout: Counter<"dry_run"> | null = null;
@@ -5059,7 +5131,7 @@ function ensureRegistry(): {
   pluginWebhookDeliveryRejectedCounter: Counter<"plugin_key" | "response_class" | "plugin_status">;
   recoveryHorizonExpiredCounter: Counter<"delivery">;
   recoveryActionAutoDischargedCounter: Counter<"kind">;
-  workerTierProxyFailuresCounter: Counter<"reason">;
+  workerTierProxyFailuresCounter: Counter<"reason" | "route">;
   isolationReaperScannedCounter: Counter<"dry_run">;
   isolationReaperDeletedCounter: Counter<"dry_run">;
   isolationReaperSkippedLayoutCounter: Counter<"dry_run">;
@@ -7800,18 +7872,17 @@ function ensureRegistry(): {
         "Count of worker-tier proxy relay failures, labeled by reason: 'timeout' "
         + "(connection succeeded, the worker was still silent at the proxy deadline), "
         + "'mid_stream' (the worker answered and the response broke after headers "
-        + "were flushed) or 'unreachable' (the request never reached a worker). "
+        + "were flushed) or 'unreachable' (the request never reached a worker), and "
+        + "by route (the proxied Express path pattern that failed). "
         + "Replaces a log grep that could not answer a 24h question, because the api "
         + "pod's log does not survive its own recreation (BLO-31945).",
-      labelNames: ["reason"],
+      labelNames: ["reason", "route"],
       registers: [registry],
     });
     // Zero-init every series. An un-incremented counter is absent from the
     // scrape, and an absent series is indistinguishable from a healthy one on
     // every dashboard — rate() over it returns nothing rather than 0.
-    for (const reason of KNOWN_WORKER_TIER_PROXY_FAILURE_REASONS) {
-      workerTierProxyFailures.inc({ reason }, 0);
-    }
+    zeroInitWorkerTierProxyFailureSeries(workerTierProxyFailures);
     // Process/runtime metrics make the scrape target carry meaningful data even
     // before any refusal is reported (manual-verification check #3 on BLO-8328).
     collectDefaultMetrics({ register: registry });
@@ -10868,11 +10939,17 @@ export function recordExecutionWorkspaceCollectorPass(
  * failing, and a metrics fault has no business turning a considered 502/504
  * into a 500.
  */
-export function recordWorkerTierProxyFailure(reason: WorkerTierProxyFailureReason): void {
+export function recordWorkerTierProxyFailure(
+  reason: WorkerTierProxyFailureReason,
+  route: string,
+): void {
   try {
-    ensureRegistry().workerTierProxyFailuresCounter.inc({ reason });
+    ensureRegistry().workerTierProxyFailuresCounter.inc({ reason, route });
   } catch (error) {
-    logger.error({ err: error, reason }, "failed to record worker-tier proxy failure metric");
+    logger.error(
+      { err: error, reason, route },
+      "failed to record worker-tier proxy failure metric",
+    );
   }
 }
 
