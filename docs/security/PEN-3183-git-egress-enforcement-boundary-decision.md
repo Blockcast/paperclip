@@ -350,9 +350,21 @@ properties are deliberate.
   `paperclip-github-*` family counts as credential-bearing and the exceptions
   are enumerated, so a credential renamed out of the `*token` spelling is still
   seen. That matters most for the route below, which has no path to fall back
-  on. The enumerated exceptions — `app-creds`, `app-key`, `webhook-secret` —
-  are part of the declared surface; adding to that set is a decision, not a
-  cleanup.
+  on. The enumerated exceptions are exactly two — `paperclip-github-app-creds`
+  and `paperclip-github-webhook-secret` — and both earn it twice over: each is
+  a live `secretKeyRef` target in the StatefulSet, and each is held out of
+  agent reach by a different control (below). That set is part of the declared
+  surface; adding to it is a decision, not a cleanup. The rule an entry must
+  pass is recorded in all three test headers: it must name a Secret that
+  **actually exists**, and the reason must be that different control — not
+  that the name looks administrative. A third entry, `paperclip-github-app-key`,
+  was dropped on #3103 for failing exactly that test: no Secret by that name
+  exists anywhere, so it excluded nothing today and pre-approved a hole
+  tomorrow, and a mutation confirmed the detector went silent on a Secret of
+  that name mounted into a container at a non-credential path. The one place
+  the name does appear is `inherit-allowlist.test.ts`, as the example of a
+  server-only Secret that must NOT reach an agent — the opposite of the reading
+  the exclusion gave it.
 - **A third route kind matches the referenced SECRET, not a name or a path**,
   and it is the one the first draft of these tests got wrong. A
   `env[].valueFrom.secretKeyRef` binds the token under **any** variable name, so
