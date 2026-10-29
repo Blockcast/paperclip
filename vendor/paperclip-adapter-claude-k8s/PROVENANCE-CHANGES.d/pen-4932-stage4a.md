@@ -69,6 +69,21 @@ grows, so that is a floor. The seeder is O(skeleton) — a fixed handful of
 as the reason `fsGroup` is unnecessary ("the seed initContainer already does
 targeted chowns of the paths it writes").
 
+## A foreign claim is narrowed now, and warned about
+
+`config.workspaceVolumeClaim` already lets an operator point a Job at a claim
+that is not the server's. Before this stage such a Job fell back to the broad rw
+mount; it is now narrowed and seeded like any other. The seeder creates every
+`subPath` target, so the Job starts — but two of those targets are materialized
+by the SERVER, and only ever into the server's own volume, so on a foreign claim
+they come up EMPTY: `.local/share/paperclip-git-hooks` (every push then fails
+closed, BLO-48361) and `skills/<companyId>` (the prompt bundle's skill links
+dangle). Both fail in the safe direction and both fail a long way from the
+cause, so `buildJobManifest` now logs `claude_k8s.data_claim_foreign` naming the
+unpopulated subPaths. Stage 4b must either materialize them into the per-agent
+claim or move them into the image (§3.6 already proposes the latter for the
+hooks dir).
+
 ## `foreign_claim` is now unreachable
 
 `broadDataMountReason` drops to `isolation_disabled | no_claim`. Left asserted
@@ -80,10 +95,30 @@ change that makes the narrowing work.
 ## Privilege
 
 The seeder is the only root container in the Pod and takes the narrowest root
-the job allows: `drop: ["ALL"]`, `add: ["CHOWN", "FOWNER"]`,
+the job allows: `drop: ["ALL"]`, `add: ["CHOWN", "DAC_OVERRIDE"]`,
 `readOnlyRootFilesystem: true`, `allowPrivilegeEscalation: false`. It is
 strictly less privileged than the `dind` sidecar this Pod already admits
-(`privileged: true`), so it needs no new PSA allowance. `podSecurityContext`
+(`privileged: true`), so it needs no new PSA allowance.
+
+`DAC_OVERRIDE` is required, not defensive. uid 0 with `CAP_DAC_OVERRIDE`
+dropped is an ordinary DAC subject: under a parent owned by uid 1000 it matches
+neither owner nor group and falls to the `other` bits, which are `r-x` for both
+modes in play (kubelet-created `0755`, server-created `2775`). `mkdir` of a
+not-yet-existing child under such a parent would `EACCES`, and `set -e` would
+fail the init container, so the Job would never start. That is reachable on an
+existing config path — `config.workspaceVolumeClaim` already lets an operator
+point a Job at a foreign claim, which this stage newly narrows — and it is the
+normal case in 4b, where a per-agent volume accumulates 1000-owned trees and
+any later target nested under one hits it. It is NOT reachable on the self
+claim, where the server pre-created every target and `mkdir -p` no-ops on
+`EEXIST`, so the fleet exercise above cannot surface it; a test pins the
+capability instead. `DAC_OVERRIDE` is inside the PSS *baseline* allowed set, so
+the baseline-clean claim is unchanged.
+
+`FOWNER` was dropped in the same change. It bypasses the owner-match check on
+`chmod`/`utimes`, and neither syscall this container makes needs it: `chown` is
+covered by `CAP_CHOWN`, and `mkdir -p` chmods only a directory it just created
+itself, and only when given `-m`, which it is not. `podSecurityContext`
 stays `runAsNonRoot`, and a test asserts no other container runs as uid 0. The
 read-only git-hooks bind is `mkdir`ed but deliberately **not** chowned: uid 1000
 being unable to rewrite the PEN-3156 pre-push hook is the boundary the publish
