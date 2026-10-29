@@ -78,14 +78,28 @@
 //     actual threat: because no intent is required, any caller that execs git
 //     by ABSOLUTE PATH rather than resolving it on PATH is outside this guard
 //     while still being authenticated. How much of that exists was measured on
-//     2026-10-29 (PEN-4986) and is ZERO: nothing reached /usr/bin/git outside
-//     this wrapper in an observed agent pod, and an image- and harness-wide
-//     census found no such exec site at all. That bounds the ACCIDENTAL case
-//     only. It does NOT narrow the bypass above, which stays OPEN for a
-//     deliberate caller, and it is a point measurement of one pod on one image
-//     rather than a standing detector -- nothing reports it if that changes, so
-//     re-take it on any image or PATH change. See §7.1 of the decision record
-//     and docs/security/PEN-4986-absolute-path-git-runtime-measurement.md.
+//     2026-10-29 (PEN-4986) and is ZERO: nothing reached a real git binary
+//     outside this wrapper in an observed agent pod, and an image- and
+//     harness-wide census found no such exec site in the first-party image.
+//
+//     "A real git binary" is TWO of them. The image ships /usr/bin/git and
+//     /usr/lib/git-core/git as separate inodes holding byte-identical copies;
+//     neither is a symlink to the other, so an exec of either skips this
+//     wrapper and is authenticated the same way. The measurement watches both,
+//     by content identity rather than by path. Note that git PREPENDS its
+//     exec-path (/usr/lib/git-core) to PATH for every process it spawns, so
+//     inside a hook or an alias expansion a bare `git` resolves to the second
+//     copy, not to this wrapper -- such a child still inherits the helper via
+//     GIT_CONFIG_PARAMETERS, so it escapes the GUARD rather than the
+//     credential. github-git-egress-shim.ts refuses `!`-shell aliases for
+//     exactly that reason.
+//
+//     That bounds the ACCIDENTAL case only. It does NOT narrow the bypass
+//     above, which stays OPEN for a deliberate caller, and it is a point
+//     measurement of three pods on three images rather than a standing detector
+//     -- nothing reports it if that changes, so re-take it when the
+//     egress-relevant surface changes. See §7.1 of the decision record and
+//     docs/security/PEN-4986-absolute-path-git-runtime-measurement.md.
 //
 // The surviving bypass is not a file-ownership problem and cannot be closed by
 // one. The agent and this wrapper are the SAME principal: one container, uid
