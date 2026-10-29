@@ -2042,7 +2042,14 @@ describe("issue execution policy transitions", () => {
 
       // Not stripped, and not recorded as cleared. The monitor stays on the row
       // so the scheduler is still the thing that retires it — loudly.
-      expect(result.patch.monitorNextCheckAt ?? armed.nextCheckAt).not.toBeNull();
+      //
+      // Assert the armed instant itself rather than `not.toBeNull()`: the strip
+      // path runs `clearArmedMonitorColumns`, which writes an explicit `null`
+      // here, so the date IS the discriminator. (An earlier revision wrote
+      // `result.patch.monitorNextCheckAt ?? armed.nextCheckAt`, which can never
+      // fail — `null ?? x` is `x` — so it did not carry the negative control
+      // the docblock above credits it with.)
+      expect(result.patch.monitorNextCheckAt).toEqual(new Date(armed.nextCheckAt));
       expect(result.patch.executionState).not.toMatchObject({
         monitor: { status: "cleared", clearReason: "max_attempts_exhausted" },
       });
