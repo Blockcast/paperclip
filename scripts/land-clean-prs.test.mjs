@@ -39,6 +39,8 @@ import {
   ownersForFiles,
   parseCodeowners,
   stripCodeownersComment,
+  resolveMergeState,
+  UNLANDABLE_MERGE_STATES,
 } from "./land-clean-prs.mjs";
 
 const HEAD = "958587ad1fe1eb52b06ca874c41734c9abdc2a10";
@@ -1466,5 +1468,107 @@ describe("ejected-at-current-head hold (PEN-5022)", () => {
       { now: NOW },
     );
     assert.deepEqual(held.map((row) => row.number), [3089]);
+  });
+});
+
+describe("resolveMergeState (PEN-5057)", () => {
+  // A run stub that returns each queued state in turn and records every call,
+  // so "how many reads did this cost" is asserted rather than assumed.
+  const stub = (states) => {
+    const calls = [];
+    return {
+      calls,
+      run: (args) => {
+        calls.push(args);
+        return JSON.stringify({ mergeStateStatus: states[calls.length - 1] });
+      },
+    };
+  };
+  const sleeps = () => {
+    const slept = [];
+    return { slept, sleep: (ms) => slept.push(ms) };
+  };
+
+  it("spends nothing on a PR whose state GitHub already computed", () => {
+    const { calls, run } = stub([]);
+    const { slept, sleep } = sleeps();
+    assert.equal(resolveMergeState("o/r", 1, "CLEAN", { run, sleep }), "CLEAN");
+    assert.deepEqual(calls, []);
+    assert.deepEqual(slept, []);
+  });
+
+  it("resolves UNKNOWN -> CLEAN, which is the enqueue this bug suppressed", () => {
+    const { calls, run } = stub(["CLEAN"]);
+    const { slept, sleep } = sleeps();
+    assert.equal(resolveMergeState("o/r", 3123, "UNKNOWN", { run, sleep }), "CLEAN");
+    assert.equal(calls.length, 1);
+    // Sleeps BEFORE the first re-read: the read that reported UNKNOWN is what
+    // scheduled the recomputation.
+    assert.deepEqual(slept, [2000]);
+  });
+
+  it("stops at the first computed value instead of spending every retry", () => {
+    const { calls, run } = stub(["UNKNOWN", "CLEAN", "CLEAN"]);
+    const { sleep } = sleeps();
+    assert.equal(resolveMergeState("o/r", 1, "UNKNOWN", { run, sleep }), "CLEAN");
+    assert.equal(calls.length, 2);
+  });
+
+  it("holds a PR that is STILL UNKNOWN when the retries are spent", () => {
+    const { calls, run } = stub(["UNKNOWN", "UNKNOWN", "UNKNOWN"]);
+    const { sleep } = sleeps();
+    assert.equal(resolveMergeState("o/r", 1, "UNKNOWN", { run, sleep }), "UNKNOWN");
+    assert.equal(calls.length, 3);
+    assert.ok(UNLANDABLE_MERGE_STATES.has("UNKNOWN"));
+  });
+
+  it("resolves UNKNOWN -> DIRTY and HOLDS — it is not a retry-until-it-looks-good", () => {
+    const { run } = stub(["DIRTY"]);
+    const { sleep } = sleeps();
+    const resolved = resolveMergeState("o/r", 1, "UNKNOWN", { run, sleep });
+    assert.equal(resolved, "DIRTY");
+    assert.ok(UNLANDABLE_MERGE_STATES.has(resolved));
+  });
+
+  it("treats a throwing read as still-unknown rather than killing the fire", () => {
+    let calls = 0;
+    const run = () => {
+      calls += 1;
+      if (calls === 1) throw new Error("gh: 502 Bad Gateway");
+      return JSON.stringify({ mergeStateStatus: "CLEAN" });
+    };
+    const { sleep } = sleeps();
+    assert.equal(resolveMergeState("o/r", 1, "UNKNOWN", { run, sleep }), "CLEAN");
+    assert.equal(calls, 2);
+  });
+
+  it("returns UNKNOWN when every read throws", () => {
+    const run = () => {
+      throw new Error("gh: network unreachable");
+    };
+    const { sleep } = sleeps();
+    assert.equal(resolveMergeState("o/r", 1, "UNKNOWN", { run, sleep }), "UNKNOWN");
+  });
+
+  it("asks for mergeStateStatus on the named PR and repo", () => {
+    const { calls, run } = stub(["CLEAN"]);
+    const { sleep } = sleeps();
+    resolveMergeState("Blockcast/paperclip", 3098, "UNKNOWN", { run, sleep });
+    assert.deepEqual(calls[0], [
+      "pr",
+      "view",
+      "3098",
+      "--repo",
+      "Blockcast/paperclip",
+      "--json",
+      "mergeStateStatus",
+    ]);
+  });
+
+  it("treats a missing/absent state as UNKNOWN rather than as computed", () => {
+    const { calls, run } = stub(["CLEAN"]);
+    const { sleep } = sleeps();
+    assert.equal(resolveMergeState("o/r", 1, undefined, { run, sleep }), "CLEAN");
+    assert.equal(calls.length, 1);
   });
 });

@@ -239,8 +239,39 @@ const ALLY_VERDICT_STATUS_RE = /^(?:review|gate)\/ally-/i;
  * UNSTABLE is a non-passing status the check rule can miss, because that rule
  * ignores Ally verdict statuses by design, so dropping it here turns a hold
  * into an immediate merge past a red status. A test pins it.
+ *
+ * UNKNOWN is in this set for a DIFFERENT reason than the other two, and the
+ * difference decides how it must be read. DIRTY and UNSTABLE are states —
+ * GitHub computed them and they say the PR cannot land. UNKNOWN is not a
+ * state: it is GitHub saying it has not computed mergeability yet. Holding on
+ * it is correct (never enqueue on an uncomputed state), but the hold must not
+ * be TERMINAL — see `resolveMergeState`.
  */
-const UNLANDABLE_MERGE_STATES = new Set(["DIRTY", "UNSTABLE", "UNKNOWN"]);
+export const UNLANDABLE_MERGE_STATES = new Set(["DIRTY", "UNSTABLE", "UNKNOWN"]);
+
+/**
+ * How many extra reads to spend resolving an UNKNOWN `mergeStateStatus`, and
+ * how long to wait between them.
+ *
+ * GitHub computes `mergeable`/`mergeStateStatus` lazily. A query against a
+ * value some other merge invalidated returns UNKNOWN *and schedules* the
+ * background recomputation, so the documented client behaviour is to ask
+ * again. The listing read in `fetchOpenPrs` is therefore both the report and
+ * the trigger, and the next read is the one that can answer.
+ *
+ * Measured 2026-10-29 (PEN-5057): three PRs merged between 22:00Z and 22:24Z;
+ * the next fire classified #3123/#3112/#3109/#3098 `skip — mergestate:UNKNOWN`
+ * while a direct read of each returned CLEAN, and a second fire minutes later
+ * — no push, no head move, no base change — classified all four `enqueue`.
+ * That is 4 of 4 of the fire's genuine candidates, suppressed. A back-to-back
+ * control returned byte-identical verdicts across all 15 open PRs, so the
+ * flip was one real UNKNOWN -> CLEAN transition, not read-to-read noise.
+ *
+ * Three attempts at 2s covers the observed recompute with a worst case of ~6s
+ * per affected PR, on a handful of PRs per fire.
+ */
+const MERGE_STATE_RETRIES = 3;
+const MERGE_STATE_RETRY_DELAY_MS = 2000;
 
 /**
  * How long after the newest check reports before an all-green rollup is
@@ -1188,6 +1219,10 @@ function fetchOpenPrs(repo) {
     if (classifyFromListing(row)) return row;
     return {
       ...row,
+      // Only PRs that survived `classifyFromListing` can still enqueue, so an
+      // unresolved UNKNOWN can only change a verdict here — the same rule that
+      // scopes `files`, `reviews` and `timeline` below.
+      mergeStateStatus: resolveMergeState(repo, row.number, row.mergeStateStatus),
       codeownerRules,
       // Only PRs that actually carry a request can be scoped by ownership, so
       // the extra call is spent only where it can change a verdict.
@@ -1211,6 +1246,56 @@ function fetchOpenPrs(repo) {
       ),
     };
   });
+}
+
+/**
+ * Blocks the calling thread for `ms`. This script is synchronous end to end
+ * (`execFileSync` throughout), so the retry delay has to be too.
+ */
+function sleepSync(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/**
+ * The PR's `mergeStateStatus`, re-read while GitHub reports UNKNOWN.
+ *
+ * Returns the first computed value, or UNKNOWN if every attempt is spent —
+ * in which case the `UNLANDABLE_MERGE_STATES` hold stands exactly as before.
+ * ⛔ That fail-closed end is the contract, not a fallback: this function
+ * resolves an *unread* state, it does not retry until the answer looks good.
+ * A PR that resolves UNKNOWN -> DIRTY is held on DIRTY, and a test pins it.
+ *
+ * A read that throws is treated as "still unknown" rather than fatal. The
+ * caller already holds a usable classification; losing the whole fire over an
+ * optional refinement would be a worse failure than the one this fixes.
+ */
+export function resolveMergeState(repo, number, current, options = {}) {
+  const {
+    run = gh,
+    sleep = sleepSync,
+    retries = MERGE_STATE_RETRIES,
+    delayMs = MERGE_STATE_RETRY_DELAY_MS,
+  } = options;
+  // Spend nothing on a PR whose state GitHub already computed. This is the
+  // overwhelmingly common case and it must stay free.
+  if (String(current ?? "UNKNOWN").toUpperCase() !== "UNKNOWN") return current;
+
+  for (let attempt = 0; attempt < retries; attempt += 1) {
+    // Sleep FIRST. The read that reported UNKNOWN is what scheduled the
+    // recomputation, so an immediate re-read asks before there is an answer
+    // and burns an attempt.
+    sleep(delayMs);
+    let next;
+    try {
+      next = JSON.parse(
+        run(["pr", "view", String(number), "--repo", repo, "--json", "mergeStateStatus"]),
+      )?.mergeStateStatus;
+    } catch {
+      continue;
+    }
+    if (String(next ?? "UNKNOWN").toUpperCase() !== "UNKNOWN") return next;
+  }
+  return current;
 }
 
 /** Posts `body` unless a comment carrying `marker` is already on the PR. */
