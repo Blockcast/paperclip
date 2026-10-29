@@ -182,6 +182,10 @@ jobs:
           # makes the output mandatory before this step can run.
           GH_TOKEN: ${{ steps.bot-token.outputs.value }}
           REPO_OWNER: ${{ github.repository_owner }}
+          # Linked from the PR body so a reviewer can reach the measurement
+          # that produced the diff. Passed as env rather than interpolated
+          # into the body heredoc, which is deliberately quoted.
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           if git diff --quiet -- scripts/general-server-shard-durations.json; then
             echo "Manifest unchanged, nothing to do."
@@ -205,6 +209,66 @@ jobs:
           # point of GH_TOKEN above.
           git push --force "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" "$BRANCH"
 
+          # The body must satisfy the repo's own PR template gate, and this is
+          # the failure this workflow spent three months not having (PEN-5005).
+          # commitperclip fails the `review` check on any PR missing the
+          # template sections, and `review` is not a required context -- so the
+          # stall alarm below reads "CI running normally", every required check
+          # goes green, and the PR then sits unmergeable on paperwork with no
+          # signal anywhere. #3032 sat that way for 77h with the one-line body
+          # this replaces, red on exactly the five headings below; its
+          # predecessors did the same, every week, for the same reason.
+          #
+          # Quoted heredoc so backticks and $ in the markdown stay literal. The
+          # run link is substituted afterwards rather than interpolated, for
+          # the same reason.
+          cat > /tmp/refresh-pr-body.md <<'BODY'
+          ## Thinking Path
+
+          > - Paperclip is the open source app people use to manage AI agents for work
+          > - `scripts/general-server-shard-durations.json` steers the server test shard matrix, and goes stale silently as suites are added and change weight (BLO-24241)
+          > - Nothing measured that drift before this workflow existed, so refresh depended on a human noticing
+          > - This PR is that measurement: a 4-way general-server shard matrix on real runners, merged into one manifest update
+          > - It is opened as a PR rather than pushed because a duration manifest is worth a diff someone can skim for a suite that moved by an order of magnitude
+
+          ## Linked Issues or Issue Description
+
+          Refs BLO-24241. Generated unattended by `.github/workflows/refresh-shard-manifest.yml`; measurement run: __RUN_URL__
+
+          ## What Changed
+
+          - `scripts/general-server-shard-durations.json` only. Each measured suite's recorded duration is replaced by this week's value.
+          - Suites absent from the measurement keep their previous values, and the prune is keyed on the on-disk suite set rather than the measured set, so a partial measurement cannot silently shrink the manifest.
+          - No source, test or workflow file is touched. The diff is data.
+
+          ## Verification
+
+          - Four `measure` shards ran `scripts/measure-general-server-shard-durations.mjs --all` over the full server suite set on `arc-paperclip-general` runners.
+          - `scripts/merge-shard-duration-manifest.mjs` merged the four artifacts into the manifest.
+          - This PR's own required checks run on it as on any other PR; see the checks below.
+
+          ## Risks
+
+          - **Routine drift is expected; an order-of-magnitude move is not.** Skim the diff for any suite whose duration changed by roughly 10x before merging. That is either a real regression or a measurement artifact, and it is the one thing this PR cannot judge for itself.
+          - A wrong manifest mis-balances the shard matrix -- slower CI, or a shard that times out. It does not change what is tested.
+          - **Rollback:** revert the commit. The previous manifest is restored and the next weekly run re-measures.
+
+          ## Model Used
+
+          None. This PR is generated unattended by a workflow from a measurement run; no model authored the change.
+
+          ## Checklist
+
+          - [x] I have searched GitHub for duplicate or related PRs and linked them above (this workflow reuses one branch, `chore/refresh-shard-manifest`, so at most one such PR is ever open)
+          - [x] I have specified the model used (none -- machine-generated)
+          - [x] I have either linked existing issues or described the issue in-PR (BLO-24241)
+          - [x] I have run tests locally and they pass (the measurement matrix above is this change's test; its four shards are the run that produced the diff)
+          BODY
+          # The heredoc is indented to match this block; strip that indent back
+          # off so the markdown is not read as a code block.
+          sed -i 's/^          //' /tmp/refresh-pr-body.md
+          sed -i "s#__RUN_URL__#$RUN_URL#" /tmp/refresh-pr-body.md
+
           pr_url="$(
             gh pr list --state open --head "$BRANCH" --json url,headRepositoryOwner \
               --jq ".[] | select(.headRepositoryOwner.login == \"$REPO_OWNER\") | .url" |
@@ -214,10 +278,17 @@ jobs:
             pr_url="$(gh pr create \
               --head "$BRANCH" \
               --title "ci: refresh general-server shard durations" \
-              --body "Auto-generated weekly refresh of scripts/general-server-shard-durations.json from a live 4-way general-server measurement run (BLO-24241). Review for any suite whose duration moved by an order of magnitude before merging -- everything else is routine drift.")"
+              --body-file /tmp/refresh-pr-body.md)"
             echo "Created new PR: $pr_url"
           else
-            echo "PR already exists: $pr_url"
+            # Rewrite the body on the reuse path too. The branch is
+            # force-pushed with new measurements while the PR object persists,
+            # so a body written once is a body that never gets corrected --
+            # which is why #3032 kept its failing description across every
+            # refresh that touched it. Editing the description re-triggers the
+            # checks without creating a commit.
+            gh pr edit "$pr_url" --body-file /tmp/refresh-pr-body.md
+            echo "PR already exists, body refreshed: $pr_url"
           fi
           echo "pr_url=$pr_url" >> "$GITHUB_OUTPUT"
 
