@@ -629,19 +629,37 @@ const INSTANCE_OVERLAY_SIZE_LIMIT = "16Mi";
  * entries and gains new `wt-*` dirs weekly.
  */
 const ROOT_OVERLAY_VOLUME_NAME = "root-overlay";
-// `.local/share/paperclip-git-hooks` holds the PEN-3156 pre-push publish guard
-// the image `git` wrapper points core.hooksPath at; without it every push from
-// a narrowed pod fails closed (BLO-48361). Only that dir, never `.local/share`,
-// which also holds mkcert's CA key.
-const ROOT_TOOLCHAIN_SUBPATHS = [
-  "bin",
-  "tools",
-  "jre",
-  ".local/bin",
-  GIT_HOOKS_SUBPATH,
-  ".bun/bin",
-  ".cache/puppeteer-browsers",
-];
+// PEN-4932 stage 3. This list used to re-expose the whole fleet-wide toolchain
+// off the shared `paperclip-data` volume: `bin`, `tools`, `jre`, `.local/bin`,
+// `.bun/bin` and `.cache/puppeteer-browsers`. All six are gone — every binary
+// they carried is now image-resident (#3079, #3081), dead, or deliberately
+// fetched at use time, each entry triaged by measurement in
+// `docs/plans/2026-10-28-pen-4932-per-agent-volumes.md` §3.3-§3.5.
+//
+// They were removed as the two units §3.7 item 4 measured, never entry by
+// entry, because `bin` is a hub of symlinks pointing OUT of itself: `go`,
+// `gofmt` and `tinygo` into `tools`, `java` into `jre`, `google-chrome` into
+// `.cache/puppeteer-browsers`; and `.local/bin/bunx` into `.bun/bin`. Dropping
+// a target without its `bin` entry leaves a dangling symlink; dropping `bin`
+// without its targets orphans them. If any of these is ever re-added, re-add
+// its whole unit.
+//
+// What this does NOT do is reduce ceph-csi lock exposure — that is stage 4's
+// job, and nothing before it moves the number. Exposure scales with pods ×
+// volume, and the ~14 company-, project-, agent- and workspace-scoped subPaths
+// still bind `paperclip-data` after this change. Stage 3 is the precondition
+// that lets stage 4 swap `dataClaimName` for a per-agent claim, which is where
+// blast radius actually falls.
+//
+// `.local/share/paperclip-git-hooks` stays, and is now the only entry. It holds
+// the PEN-3156 pre-push publish guard the image `git` wrapper points
+// core.hooksPath at; without it every push from a narrowed pod fails closed
+// (BLO-48361). Only that dir, never `.local/share`, which also holds mkcert's
+// CA key. It is a security control with a four-consumer join across two
+// repositories and a fail-OPEN failure mode — core.hooksPath aimed at an empty
+// directory means pushes succeed unscanned — so it is relocated into the image
+// under its own review (§3.6), not here.
+const ROOT_TOOLCHAIN_SUBPATHS = [GIT_HOOKS_SUBPATH];
 
 function sharedPnpmStorePath(rawCompanyId: string, dataMountPath: string): string {
   const companyId = sanitizeForK8sPath(rawCompanyId);
