@@ -270,9 +270,18 @@ Between 2026-10-28 and the delivery of D1, an agent that deliberately sets out t
 grounds:
 
 - The control's designed threat — **accidental** disclosure — is covered **for every caller that
-  resolves `git` on PATH**, and is better covered than when the row was filed: the guard now sits
-  on a root-owned path ahead of `/usr/bin`, where before it sat on a surface the agent could
-  rewrite. That is the shape of essentially all agent and tool invocations.
+  resolves `git` on the agent's own PATH**, and is better covered than when the row was filed: the
+  guard now sits on a root-owned path ahead of `/usr/bin`, where before it sat on a surface the
+  agent could rewrite. That is the shape of essentially all agent and tool invocations.
+  ⚠ "On PATH" is narrower than it reads, and PEN-4986 §4.1 measured where: **git prepends its own
+  exec-path `/usr/lib/git-core` to `PATH` for every process it spawns**, ahead of the wrapper's
+  directory, and that directory holds a second complete copy of the git binary. So inside a hook,
+  an alias expansion or an external diff/merge tool, a bare `git` resolves to
+  `/usr/lib/git-core/git` and the wrapper is not reached. Such a child still inherits
+  `GIT_CONFIG_PARAMETERS` from its wrapped parent, so its **credential** path is still the paperclip
+  helper and the accidental-disclosure case is not opened — what it escapes is the **guard**, not
+  the credential. `github-git-egress-shim.ts` already refuses `!`-prefixed shell aliases for exactly
+  this reason; this bullet's wording is what had not kept up.
 - Of the four enumerated bypasses, the three that required a deliberate write are closed. The
   survivor requires no write, no privilege, and — per §4 — **no knowledge of the credential
   either**; it requires only that something invoke git by absolute path. For the *deliberate*
@@ -285,12 +294,25 @@ grounds:
 **This acceptance is explicitly conditional on that count, and the count has now been taken.**
 Measured 2026-10-29 (PEN-4986; method, controls and limits in
 [`PEN-4986-absolute-path-git-runtime-measurement.md`](./PEN-4986-absolute-path-git-runtime-measurement.md)):
-**zero** invocations reached `/usr/bin/git` without transiting the wrapper — 54 observations,
-all of them wrapped — across a 22.1-minute window of representative agent work in a live
-agent pod on image `sha-ed39009-k8s-vendored`. The instrument was proved able to see the opposite:
-a deliberate unwrapped invocation was classified correctly, and its catch rate on the
-shortest-lived invocation class measured 0.93. Separately, an image- and harness-wide census found
-**no** `/usr/bin/git` exec site outside the egress-control machinery itself.
+**zero** invocations reached a real git binary without transiting the wrapper — `63` class-A
+observations, of which `46` wrapped and **0** unwrapped, plus `17` deliberate
+unwrapped negative controls and `1` observation of another git-core program (`git-remote-http`,
+spawned by the push), which was also wrapped — across a `2.5`-minute window of representative agent
+work (including a push) in a live agent pod on image `sha-992d21f-k8s-vendored`. The first run's
+longer 22.1-minute window, against the narrower target set, is kept in §3.1 of that document:
+neither window is long enough to speak to a rare periodic caller, which is what the standing
+telemetry gap below is for.
+
+"A real git binary" is two of them, not one, and that is a correction to the first version of this
+paragraph. The image ships `/usr/bin/git` **and** `/usr/lib/git-core/git` as **separate inodes
+holding byte-identical copies** of the same binary; the first measurement watched only the former,
+so its zero was narrower than it was written to be. The instrument now discovers its targets by
+content identity and watched both — 2 inodes reachable by 147 paths, plus 21 further git-core
+programs that read `/etc/gitconfig` on their own account. The instrument was proved able to see the
+opposite **on each of the two inodes separately**: deliberate unwrapped invocations of both were
+classified correctly, and its catch rate on the shortest-lived invocation class measured
+`0.913`. Separately, an image- and harness-wide census found **no** exec site for either path
+outside the egress-control machinery itself.
 
 **§7.2 trigger 4 has not fired, and the acceptance stands unchanged.** What has changed is that the
 first ground above rests on a measurement rather than an expectation — with one qualification,
@@ -304,12 +326,13 @@ not run one image: measured 2026-10-29 from `kube_pod_container_info` (PEN-4989)
 agent image digests ran in the preceding 7 days, **17** in the last 24 h, and for **38.2 %** of that
 week more than one image was live simultaneously — three at the moment of measurement. What supports
 the census half is therefore *sampling*, not identity: it was re-run on a second image
-(`sha-4db591b`) and reproduced exactly — 15 occurrences, all inside the egress machinery, zero exec
-sites outside the wrapper — making it **2 of 106 images**. Cite that sample size, not a fleet census.
+(`sha-4db591b`) and on a third (`sha-992d21f`) and reproduced exactly each time — 15 occurrences,
+all inside the egress machinery, zero exec sites outside the wrapper — making it **3 of 106
+images**. Cite that sample size, not a fleet census.
 
-So the assumption is tested in two pods on two images, and is not a fleet census. Re-take it when
+So the assumption is tested in three pods on three images, and is not a fleet census. Re-take it when
 the **egress-relevant surface** changes — the wrapper, the runtime it `exec`s, the credential helper,
-the real binary, and the PATH ordering. "Whenever the agent image changes" is not an operable
+**the set of real git binaries**, and the PATH ordering. "Whenever the agent image changes" is not an operable
 trigger at ≈15 changes a day; `scripts/absolute-path-git-fingerprint.mjs` computes the narrower
 surface hash so staleness is a comparison rather than a judgement.
 
