@@ -25,6 +25,12 @@ COPY --from=server /usr/local/bin/github-mcp-server /usr/local/bin/github-mcp-se
 # the repo, one install, one rule. Root-owned by default (no --chown), which
 # is the whole point — uid 1000 must not be able to rewrite these.
 COPY --from=server /usr/local/libexec/paperclip/bin /usr/local/libexec/paperclip/bin
+# PEN-4932 stage 3b-i. Same provenance rule as the wrapper dir above: taken from
+# the server image, never re-copied from the build context, so the two images
+# cannot carry different bodies of the PEN-3156 pre-push guard. Root-owned by
+# default (no `--chown`), which is the point. Inert until the runtime is
+# repointed — see docker/github-hooks/README.md.
+COPY --from=server /usr/local/libexec/paperclip/hooks /usr/local/libexec/paperclip/hooks
 COPY --from=server /opt/penstock/bin/penstock-agent-runtime.mjs /opt/penstock/bin/penstock-agent-runtime.mjs
 COPY --from=server /usr/local/bin/caveman-proxy /usr/local/bin/caveman-proxy
 COPY --from=server /opt/penstock/ponytail /opt/penstock/ponytail

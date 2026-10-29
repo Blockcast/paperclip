@@ -1368,3 +1368,118 @@ test("the git-config surface predicates actually fire (PEN-4541 positive control
     "the widened Dockerfile reader reports an ordinary git command as a config write",
   );
 });
+
+// ---------------------------------------------------------------------------
+// PEN-4932 stage 3b-i: the pre-push publish guard now ships in the image too.
+//
+// `docker/github-hooks/pre-push` and the chart seed's heredoc are the SAME
+// launcher written twice, and they will coexist for the whole of the staged
+// rollout (ship the file -> measure images -> repoint the runtime -> drop the
+// seed). Two copies of a security control with nothing comparing them is
+// exactly the shape PEN-4518 was: four consumers all individually correct,
+// nothing owning the join, 2h17m of fleet-wide push failure.
+//
+// So the join is a test. While both exist they must be byte-identical.
+// ---------------------------------------------------------------------------
+
+// Restated here for the same reason as IMAGE_WRAPPER_BIN above: this value must
+// agree with the Dockerfile COPY target and Dockerfile.agent's COPY --from, and
+// a test deriving it from one of them could not catch the other drifting.
+const IMAGE_HOOKS_DIR = "/usr/local/libexec/paperclip/hooks";
+const HOOK_SOURCE_PATH = "docker/github-hooks/pre-push";
+
+/** The hook body the chart seed writes, dedented the way the YAML parser will.
+ *
+ *  The rendered template still carries the block scalar's indentation as TEXT;
+ *  it is the parse that strips it. Stripping exactly the `cat >` line's own
+ *  indent reproduces that, and is why the shebang reaches the shell at column
+ *  0 rather than as ` #!/bin/sh`, which would not be a shebang at all. */
+function seededPrePushBody(rendered) {
+  const lines = rendered.split("\n");
+  const start = lines.findIndex((line) =>
+    /^\s*cat > "\$\{GIT_HOOKS_DIR\}\/pre-push" <<'EOF'$/.test(line),
+  );
+  assert.notEqual(
+    start,
+    -1,
+    "the chart no longer seeds a pre-push hook by heredoc. If the seed was removed deliberately (stage 3b-iii), remove this test with it; if it was merely reworded, this join is now blind and must be re-pointed.",
+  );
+  const indent = /^(\s*)/.exec(lines[start])[1];
+  const body = [];
+  for (let i = start + 1; i < lines.length; i += 1) {
+    if (lines[i] === `${indent}EOF`) {
+      return `${body.join("\n")}\n`;
+    }
+    assert.ok(
+      lines[i].startsWith(indent),
+      `heredoc line ${i + 1} is indented less than its opener, so the block scalar does not dedent the way this test assumes: ${JSON.stringify(lines[i])}`,
+    );
+    body.push(lines[i].slice(indent.length));
+  }
+  assert.fail("the pre-push heredoc is never terminated by EOF in the rendered chart");
+}
+
+test("the image hook and the chart seed carry the same publish guard (PEN-4932)", () => {
+  const rendered = render("templates/statefulset.yaml");
+  const seeded = seededPrePushBody(rendered);
+  const baked = fs.readFileSync(path.join(repoRoot, HOOK_SOURCE_PATH), "utf8");
+
+  assert.equal(
+    baked,
+    seeded,
+    `${HOOK_SOURCE_PATH} and the chart seed's heredoc have drifted. These are the same PEN-3156 launcher written twice and both are live during the stage 3b rollout, so a difference means some agents scrub through one body and some through the other.`,
+  );
+
+  // The property that makes it a hook at all, asserted on the shared value so
+  // it cannot pass by both copies being equally broken.
+  assert.ok(
+    seeded.startsWith("#!/bin/sh\n"),
+    "the publish guard launcher lost its shebang, so git would execute it under whatever interpreter it guessed",
+  );
+  assert.match(
+    seeded,
+    /--pre-push-hook "\$@"\n$/,
+    "the launcher no longer forwards git's hook arguments to the egress runtime, which reads the ref updates it is meant to scan from them",
+  );
+});
+
+test("the pre-push hook ships root-owned and executable in both images (PEN-4932)", () => {
+  // Mode, from git rather than the worktree: a checkout can lose +x to umask,
+  // but what ships is what git records. `COPY --chmod=0755` would mask a
+  // non-executable source here, so this guards the source of truth staying
+  // runnable for anyone who uses it outside the image.
+  const mode = execFileSync("git", ["ls-files", "-s", "--", HOOK_SOURCE_PATH], {
+    cwd: repoRoot,
+    encoding: "utf8",
+  }).trim();
+  assert.match(
+    mode,
+    /^100755 /,
+    `${HOOK_SOURCE_PATH} is not tracked executable (got: ${mode || "untracked"})`,
+  );
+
+  const dockerfile = fs.readFileSync(path.join(repoRoot, "Dockerfile"), "utf8");
+  const agentDockerfile = fs.readFileSync(path.join(repoRoot, "Dockerfile.agent"), "utf8");
+
+  // No `--chown`: that is the security property, not an omission. On the PVC
+  // this launcher is agent-writable and the chart cannot help it (its seed runs
+  // as uid 1000 against an fsGroup-1000 volume). Root-owned in the image is the
+  // whole reason baking it is an improvement and not just a relocation, so a
+  // `--chown=node:node` added here later would quietly undo it.
+  assert.ok(
+    dockerfile.includes(
+      `COPY --chmod=0755 --exclude=*.md docker/github-hooks/ ${IMAGE_HOOKS_DIR}/`,
+    ),
+    `the server image no longer installs docker/github-hooks/ to ${IMAGE_HOOKS_DIR} with --chmod=0755 and --exclude=*.md. The exclude is load-bearing: everything in that directory installs 0755, so a README added later would ship executable.`,
+  );
+  assert.ok(
+    !/COPY\s+--chown=\S+\s+--chmod=0755\s+--exclude=\*\.md\s+docker\/github-hooks\//.test(
+      dockerfile,
+    ),
+    "the hook directory is installed with --chown, which hands uid 1000 the ability to rewrite the launcher of the guard that constrains it (PEN-3715)",
+  );
+  assert.ok(
+    agentDockerfile.includes(`COPY --from=server ${IMAGE_HOOKS_DIR} ${IMAGE_HOOKS_DIR}`),
+    `Dockerfile.agent does not take ${IMAGE_HOOKS_DIR} from the server image. Re-copying it from the build context instead would let the two images carry different bodies of the same guard, which is the drift PEN-3713 removed for the wrappers.`,
+  );
+});

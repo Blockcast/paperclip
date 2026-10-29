@@ -672,6 +672,27 @@ COPY --from=github-mcp /server/github-mcp-server /usr/local/bin/github-mcp-serve
 # The exclude is a glob rather than README.md: everything in this directory is
 # installed executable at 0755, so a doc file added later would ship as one.
 COPY --chmod=0755 --exclude=*.md docker/github-wrappers/ /usr/local/libexec/paperclip/bin/
+# PEN-4932 stage 3b-i. The PEN-3156 pre-push publish guard's launcher, which
+# until now existed only as a heredoc in the Helm chart that wrote it onto the
+# shared PVC at deploy time. Same install rule as the wrappers above and for the
+# same two reasons: root-owned (no `--chown`), so uid 1000 cannot rewrite the
+# launcher of the guard that constrains it — on the PVC it is agent-writable and
+# the chart says so itself, because its seed runs as uid 1000 against an
+# fsGroup-1000 volume; and `--exclude=*.md`, because everything installed from
+# that directory lands 0755 and a doc file would ship executable.
+#
+# `hooks/` rather than `bin/`: this is chain-loaded by git through
+# `core.hooksPath`, not by name off PATH, and putting a file called `pre-push`
+# on PATH would be an accident waiting to be typed.
+#
+# NOTHING READS THIS YET, deliberately. The runtime still resolves the hook on
+# the PVC (`DEFAULT_HOOKS_DIR`), so this layer is inert and an agent on an older
+# image is unaffected. Repointing is a separate step because the failure mode is
+# asymmetric: `runGitEgressRuntime` REFUSES a publish when it finds no executable
+# `pre-push` where it looks, so a repoint landing before images carry this file
+# would refuse every push in the fleet rather than publish unscanned. See
+# docker/github-hooks/README.md for the ordering.
+COPY --chmod=0755 --exclude=*.md docker/github-hooks/ /usr/local/libexec/paperclip/hooks/
 COPY --from=penstock-agent-runtime /opt/penstock/bin/penstock-agent-runtime.mjs /opt/penstock/bin/penstock-agent-runtime.mjs
 COPY --from=caveman-proxy /usr/local/bin/caveman-proxy /usr/local/bin/caveman-proxy
 COPY --from=ponytail-marketplace /opt/penstock/ponytail /opt/penstock/ponytail
