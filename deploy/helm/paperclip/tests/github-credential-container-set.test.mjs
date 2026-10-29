@@ -150,13 +150,17 @@ function coversCredentialPath(mountPath, credentialPaths) {
 /**
  * Routes that name the credential SECRET rather than a path or a variable name.
  *
- * Three of them, and all three were green in the first draft of this file:
+ * Two of them live here:
  *
  *   env[].valueFrom.secretKeyRef  — the token under any variable name at all,
  *                                   which is why a name list cannot see it;
  *   envFrom[].secretRef           — every key of the Secret, under names
- *                                   nothing here ever observes;
- *   (projected volumes are handled in `secretByVolume`, not here.)
+ *                                   nothing here ever observes.
+ *
+ * The third of the same family, a `projected` volume carrying the Secret to any
+ * path, is handled in `secretByVolume` instead, because it reaches a container
+ * through a mount rather than through the environment. All three were green in
+ * the first draft of this file.
  *
  * Reported as `NAME -> secret` / `envFrom -> secret` so a failure says which
  * binding appeared rather than only that the count changed.
