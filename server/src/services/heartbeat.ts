@@ -29149,10 +29149,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             // scheduler-lease leader -- so `activeRunExecutions` cannot see it.
             // Measured 2026-10-29: 334 refused owner writes in ~4.7h on the
             // non-leader worker, ~46% of succeeded runs left with no usage and
-            // no cost_events row. Give the owner the same stale window the
-            // missing-Job branch below gives it; a dead owner still converges
-            // here once the run goes silent.
-            if (jobStatus.phase === "succeeded" && !isSilent) continue;
+            // no cost_events row. A live owner finalizes within seconds of Job
+            // success, so a short grace from the last signal is enough. Keep it
+            // well under the Job TTL (900s): a dead owner's Job GC'd before this
+            // branch sees it again would be finalized `job_missing` (failed, not
+            // retried) instead of `job_complete`.
+            if (
+              jobStatus.phase === "succeeded"
+              && lastSignalRef
+              && now.getTime() - lastSignalRef < EXTERNAL_LIFECYCLE_RECENT_RUN_GRACE_MS
+            ) continue;
             const finalized = await timedFinalizeExternalLifecycleTerminalRun({
               run,
               adapterType,

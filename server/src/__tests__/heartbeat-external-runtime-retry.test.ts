@@ -1952,10 +1952,19 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
     expect(run?.status).toBe("running");
   }, 120_000);
 
-  it("still finalizes a succeeded Job as job_complete once the owner is silent (BLO-49987)", async () => {
+  // The two tests below are the control for the one above: they differ only in
+  // lastActivityAt, and the grace guard is the only time-gated `continue`
+  // between the identity stamp and finalize. Change the seeds together.
+  // 8 min: past the 5-min grace but inside the 15-min stale window, so the
+  // deferral cannot outlive the Job's 900s TTL and turn job_complete into
+  // job_missing.
+  it.each([
+    { label: "past the grace, inside the stale window", silentMin: 8 },
+    { label: "silent", silentMin: 20 },
+  ])("finalizes a succeeded Job as job_complete once the owner is $label (BLO-49987)", async ({ silentMin }) => {
     const { runId } = await seedSucceededJobWithLaunchedReservation(
-      "SucceededJobOwnerSilentCo",
-      new Date(Date.now() - 20 * 60 * 1000),
+      `SucceededJobOwnerSilent${silentMin}Co`,
+      new Date(Date.now() - silentMin * 60 * 1000),
     );
 
     await heartbeat.reapOrphanedRuns();
