@@ -3,7 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import { guardedChildEnv } from "@paperclipai/shared/egress-guard-path";
+import { guardedChildEnv } from "@paperclipai/adapter-utils/egress-guard-path";
 import type { ProviderQuotaResult, QuotaWindow } from "@paperclipai/adapter-utils";
 
 const execFileAsync = promisify(execFile);

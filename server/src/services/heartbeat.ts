@@ -4396,7 +4396,8 @@ async function pathIsAbsent(cwd: string): Promise<boolean> {
 // credential helper still wired up in /etc/gitconfig. No test would fail.
 //
 // So: if the guard directory ever moves, re-exempt it here explicitly (the
-// shared constant is EGRESS_GUARD_BIN_DIR in @paperclipai/shared). Narrowing
+// shared constant is EGRESS_GUARD_BIN_DIR in
+// @paperclipai/adapter-utils/egress-guard-path). Narrowing
 // PATH to dodge the credential shim and narrowing it past the egress guard
 // are one line apart, and only the first one is intended.
 function strictGitCheckoutProbeEnv(): NodeJS.ProcessEnv {

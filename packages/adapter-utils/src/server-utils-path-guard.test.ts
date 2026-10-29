@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { EGRESS_GUARD_BIN_DIR } from "@paperclipai/shared/egress-guard-path";
+import { EGRESS_GUARD_BIN_DIR } from "./egress-guard-path.js";
 import { defaultPathForPlatform, ensurePathInEnv } from "./server-utils.js";
 
 /**

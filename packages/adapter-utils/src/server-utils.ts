@@ -3,7 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { constants as fsConstants, promises as fs, type Dirent } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { guardedChildEnv } from "@paperclipai/shared/egress-guard-path";
+import { guardedChildEnv } from "./egress-guard-path.js";
 import { sanitizeRemoteExecutionEnv } from "./remote-execution-env.js";
 import {
   buildLocalProcessSandboxSpawnTarget,

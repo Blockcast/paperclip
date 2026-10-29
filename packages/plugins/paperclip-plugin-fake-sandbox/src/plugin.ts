@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path, { delimiter } from "node:path";
-import { guardedPath } from "@paperclipai/shared/egress-guard-path";
+import { guardedPath } from "@paperclipai/adapter-utils/egress-guard-path";
 import { spawn } from "node:child_process";
 import { definePlugin } from "@paperclipai/plugin-sdk";
 import type {

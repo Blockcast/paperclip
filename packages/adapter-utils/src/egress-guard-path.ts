@@ -31,10 +31,41 @@
  * durable close is PEN-4933's broker, where the credential is not in the
  * agent's mount namespace at all and `PATH` stops being the boundary.
  *
- * Lives in `@paperclipai/shared` rather than in `adapter-utils` because it is
- * the lowest leaf all three PEN-5030 call sites can reach: `adapter-utils`
- * itself, `packages/adapters/*`, and `packages/plugins/*` (which depend on
- * `plugin-sdk`, not on `adapter-utils`). See PEN-5030 for the decision.
+ * PEN-5030 decision -- where this lives, and why it is NOT in
+ * `@paperclipai/shared`.
+ *
+ * `shared` is the obvious home: it is the lowest leaf the call sites can
+ * reach, and `plugin-sdk` already depends on it, so `packages/plugins/*` get
+ * it for free. That was the first shape of this change and it is wrong, for a
+ * reason that is invisible from the workspace:
+ *
+ *   **`adapter-utils` may not depend on any workspace package.** The agent
+ *   image builds it ALONE -- `COPY packages/adapter-utils /vendor/adapter-utils-src`,
+ *   then `npm install --no-save typescript @types/node`, `tsc`, `npm pack`
+ *   (Dockerfile, `vendor` stage) -- and installs the tarball into both
+ *   vendored k8s adapters. Outside the workspace there is no pnpm to resolve
+ *   `workspace:*`, so adding `"@paperclipai/shared": "workspace:*"` here fails
+ *   the install outright with `EUNSUPPORTEDPROTOCOL: Unsupported URL Type
+ *   "workspace:"`, before `tsc` is ever reached. Measured, not reasoned:
+ *   reproducing that stage on the first draft of this change exited 1, and the
+ *   same reproduction against `origin/master` exited 0. A plain semver range
+ *   instead of `workspace:*` is worse, not better -- npm would install the
+ *   PUBLISHED `@paperclipai/shared`, which does not carry this module, and the
+ *   failure would move from the image build to a runtime
+ *   `ERR_MODULE_NOT_FOUND` inside every agent pod.
+ *
+ * `standalone-deps.test.ts`, beside this file, holds that constraint down so
+ * the next person does not rediscover it from a red image build.
+ *
+ * So the module lives here, in the package that already owned the literal
+ * (`IMAGE_WRAPPER_DIR`, re-exported from `github-publish-broker.ts`) and that
+ * hosts the egress runtime. The cost is one new edge:
+ * `@paperclipai/plugin-fake-sandbox` depends on `adapter-utils` rather than on
+ * `shared`. That edge is novel -- no other plugin has one -- and it is
+ * accepted deliberately over the alternative, which was a second copy of the
+ * guard logic and a second copy of the directory literal. A duplicated
+ * security constant that can drift is worse than an unusual dependency in a
+ * private, workspace-only package.
  */
 import { delimiter } from "node:path";
 
