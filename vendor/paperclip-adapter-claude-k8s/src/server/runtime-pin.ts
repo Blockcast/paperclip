@@ -444,8 +444,8 @@ export const PRE_PUSH_HOOK_PREFLIGHT_NOT_EXECUTABLE = `${PRE_PUSH_HOOK_PREFLIGHT
  *                     not visible. Check the image first, then
  *                     `ROOT_TOOLCHAIN_SUBPATHS` and `/proc/mounts`.
  *   OFF-MOUNT       — the SEEDED hook is on the data volume but the IMAGE
- *                     carries none, and the runtime reads the image
- *                     (`BAKED_HOOKS_DIR`, PEN-4932). This pod is running an
+ *                     carries none, and a PEN-4932-or-later runtime reads the
+ *                     image (`BAKED_HOOKS_DIR`). This pod is running an
  *                     agent image from before the bake, or one whose
  *                     `COPY --from=server` produced an empty directory. The
  *                     fix is to roll the image forward; the chart is not
@@ -454,6 +454,22 @@ export const PRE_PUSH_HOOK_PREFLIGHT_NOT_EXECUTABLE = `${PRE_PUSH_HOOK_PREFLIGHT
  *                     retired — the name was kept because the SHAPE it
  *                     reports is unchanged: a hook exists, but not where the
  *                     runtime looks.
+ *
+ *                     ⚠️ This is the one verdict whose CONSEQUENCE does not
+ *                     follow from the file layout alone, so its text does not
+ *                     assert one. This shell is built SERVER-side, but the
+ *                     Job's image is `asString(config.image, "") ||
+ *                     selfPod.image` (`job-manifest.ts`) — an agent can pin an
+ *                     image OLDER than the server that wrote this check. A new
+ *                     server in front of a pre-bake pinned image emits
+ *                     OFF-MOUNT for a pod that publishes perfectly well:
+ *                     that image's runtime still reads the SEEDED path, and
+ *                     the seed is still written and still mounted. Claiming a
+ *                     refusal here would send an operator to debug a working
+ *                     pod, so the text names both branches and the one remedy
+ *                     they share. The other three verdicts are safe to state
+ *                     flatly because each is decided by what the pod's own
+ *                     runtime will find, not by which runtime it is.
  *   NOT-EXECUTABLE  — present but without +x. The runtime's presence check is
  *                     an `X_OK` access, so this refuses pushes exactly as
  *                     MASKED does — it is not a silent unscanned-publish. The
@@ -487,7 +503,7 @@ export function buildPrePushHookPreflightShell(opts: { dataMountPath: string }):
     'elif [ -e "$__pchookrt/pre-push" ]; then ' +
       `echo "${PRE_PUSH_HOOK_PREFLIGHT_NOT_EXECUTABLE} dir=$__pchookrt - a pre-push file is there but is not executable, so the egress runtime will refuse every push from this pod; restore +x on the seeded hook — the mount is fine, unlike MASKED (PEN-3156, PEN-4518)" >&2; ` +
     'elif [ -e "$__pchookmnt/pre-push" ]; then ' +
-      `echo "${PRE_PUSH_HOOK_PREFLIGHT_OFF_MOUNT} runtime=$__pchookrt data=$__pchookmnt - the seeded hook is on the data volume but the agent image carries none, and the egress runtime reads the image; pushes from this pod will be refused. This pod is running an image built before the hook was baked, or one whose copy of it is empty - roll it forward rather than touching the chart (PEN-4518, PEN-4932)" >&2; ` +
+      `echo "${PRE_PUSH_HOOK_PREFLIGHT_OFF_MOUNT} runtime=$__pchookrt data=$__pchookmnt - the seeded hook is on the data volume but the agent image carries none. Whether this pod can publish depends on which egress runtime that image carries: one from PEN-4932 or later reads the image copy and will refuse every push from this pod, while an older one reads the seeded copy, which is still mounted, and publishes normally. Do not read this line on its own as an outage - this preflight is built by the server, and an agent can pin an image older than the server that wrote it. The remedy is the same either way: roll the image forward rather than touching the chart (PEN-4518, PEN-4932)" >&2; ` +
     "else " +
       `echo "${PRE_PUSH_HOOK_PREFLIGHT_MASKED} runtime=$__pchookrt data=$__pchookmnt - no pre-push hook is visible at either path, so this pod cannot publish at all; check the agent image first - the runtime reads the baked copy - and only then the seeded one, where a narrowed Job pod sees an overlay over the PVC so ROOT_TOOLCHAIN_SUBPATHS against /proc/mounts is the check, not the seed log (PEN-4518, PEN-4932, BLO-32734)" >&2; ` +
     "fi",

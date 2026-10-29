@@ -33,3 +33,18 @@ byte-identical with the canonical copy, as it does for the others.
 Nothing here deletes the seeded hook or its mount; that is the step that drops
 `ROOT_TOOLCHAIN_SUBPATHS`, and until it lands both copies exist and the chart
 test pins them to the same body.
+
+`OFF-MOUNT` is the one verdict that does NOT assert a consequence, and that is
+deliberate. This shell is built SERVER-side, but the Job's image is
+`asString(config.image, "") || selfPod.image` (`job-manifest.ts`), so an agent
+can pin an image OLDER than the server that wrote the check. A new server in
+front of a pre-bake pinned image therefore emits `OFF-MOUNT` for a pod that
+publishes perfectly well: that image carries the pre-repoint runtime, which
+still reads the SEEDED path, and the seed is still written and still mounted.
+An unconditional "pushes will be refused" would send an operator to debug a
+healthy pod — the mirror image of the `ok`-on-a-broken-pod failure above, and
+the same kind of mistake. The text names both branches and the single remedy
+they share (roll the image forward), and a test pins both so the claim cannot
+drift back to an unconditional one. The other three verdicts stay flat because
+each is decided by what the pod's own runtime will find, not by which runtime
+it is.
