@@ -29010,6 +29010,60 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const timedIsTerminalExternalJobConsumedByOwner =
       timedPerRunCall("liveness", isTerminalExternalJobConsumedByOwner);
 
+    // PEN-5006: the one liveness probe every external-lifecycle run pays, hoisted
+    // out of the loop. `hasAdapterInvocationEvent` was a single-row SELECT issued
+    // once per run per sweep -- the only UNCONDITIONAL per-run round trip in this
+    // bucket, so it scaled 1:1 with run population while the other four liveness
+    // calls below only fire once a run is already past its grace window. At the
+    // measured ~1,090 sweeps/h that is N x 1,090 queries/h from this call site
+    // alone (~27k/h at N=25).
+    //
+    // WHY THIS STAGE, AND WHY THE SHARE RATHER THAN THE SECONDS. Over seven
+    // same-clock-hour windows (10-22..10-29, 20 m buckets, window fixed effects,
+    // common band N in [6,28]) `per_run_liveness` is the only sub-stage whose
+    // SHARE of the sweep rises significantly with run population --
+    // d log(share)/d log(N) = +0.208 +- 0.045 -- and the sign is stable across
+    // window sets. `identity_stamp` holds 34.8% of the sweep's seconds and is
+    // flat (+0.005 +- 0.036): it grows with the sweep, it does not outgrow it, so
+    // it is not a convexity carrier. `release_pending_act` reads +0.581 +- 0.186
+    // over all seven windows but -0.088 +- 0.228 over the three newest -- an
+    // episodic excursion, not a standing slope. Per run, liveness costs 11.6 ms
+    // at N in [6,12] and 17.2 ms at N in [18,28]; the +48% is the superlinear
+    // part, and a per-run round trip whose latency grows with concurrency is
+    // exactly the shape that produces it.
+    //
+    // SAFETY -- the `||` below is load-bearing and is NOT a fallback for errors.
+    // `heartbeat_run_events` is append-only, so a run that HAS an `adapter.invoke`
+    // event can never stop having one: a positive batch answer cannot go stale in
+    // the direction that matters. A negative one can -- a run may invoke while
+    // this sweep is still walking the loop -- so a miss is re-checked with the
+    // original single-row read before the pre-adapter branch is taken. That keeps
+    // the decision byte-identical to the pre-batch behaviour while costing a query
+    // only for the minority of runs that genuinely have not invoked yet. Do not
+    // "simplify" this to the Set alone.
+    const externalLifecycleRunIds = activeRuns
+      .filter((row) => hasExternalLifecycle(row.adapterType))
+      .map(({ run }) => run.id);
+    const runsWithAdapterInvocation = new Set<string>();
+    if (externalLifecycleRunIds.length > 0) {
+      await timePerRun("liveness", async () => {
+        // Chunked because the predicate is bounded by concurrently-running runs,
+        // not by anything this code controls; a fleet-wide incident can make that
+        // list long enough to matter to the planner.
+        for (let i = 0; i < externalLifecycleRunIds.length; i += 500) {
+          const chunk = externalLifecycleRunIds.slice(i, i + 500);
+          const rows = await db
+            .select({ runId: heartbeatRunEvents.runId })
+            .from(heartbeatRunEvents)
+            .where(and(
+              inArray(heartbeatRunEvents.runId, chunk),
+              eq(heartbeatRunEvents.eventType, "adapter.invoke"),
+            ));
+          for (const row of rows) runsWithAdapterInvocation.add(row.runId);
+        }
+      });
+    }
+
     // `finalize`: committing a terminal verdict for the run. The five
     // `finalizeExternalLifecycleTerminalRun` call sites AND the hand-rolled
     // process_lost mint below them, which is the same act written inline --
@@ -29077,7 +29131,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // the silence/Job-liveness check below decide for external lifecycle.
       if (activeRunExecutions.has(run.id) && !externalLifecycleRun) continue;
       const externalLifecycleStarted = externalLifecycleRun
-        ? await timedHasAdapterInvocationEvent(run.id)
+        ? (runsWithAdapterInvocation.has(run.id) || await timedHasAdapterInvocationEvent(run.id))
         : false;
       const externalLifecyclePreAdapter = externalLifecycleRun && !externalLifecycleStarted;
       // BLO-16181: retain the pre-adapter Job liveness the loop resolves below so
