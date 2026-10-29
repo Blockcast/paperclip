@@ -294,10 +294,10 @@ grounds:
 **This acceptance is explicitly conditional on that count, and the count has now been taken.**
 Measured 2026-10-29 (PEN-4986; method, controls and limits in
 [`PEN-4986-absolute-path-git-runtime-measurement.md`](./PEN-4986-absolute-path-git-runtime-measurement.md)):
-**zero** invocations reached a real git binary without transiting the wrapper — `63` class-A
-observations, of which `46` wrapped and **0** unwrapped, plus `17` deliberate
+**zero** invocations reached a real git binary without transiting the wrapper — `51` class-A
+observations, of which `36` wrapped and **0** unwrapped, plus `15` deliberate
 unwrapped negative controls and `1` observation of another git-core program (`git-remote-http`,
-spawned by the push), which was also wrapped — across a `2.5`-minute window of representative agent
+spawned by the push), which was also wrapped — across a `1.6`-minute window of representative agent
 work (including a push) in a live agent pod on image `sha-992d21f-k8s-vendored`. The first run's
 longer 22.1-minute window, against the narrower target set, is kept in §3.1 of that document:
 neither window is long enough to speak to a rare periodic caller, which is what the standing
@@ -310,8 +310,14 @@ so its zero was narrower than it was written to be. The instrument now discovers
 content identity and watched both — 2 inodes reachable by 147 paths, plus 21 further git-core
 programs that read `/etc/gitconfig` on their own account. The instrument was proved able to see the
 opposite **on each of the two inodes separately**: deliberate unwrapped invocations of both were
-classified correctly, and its catch rate on the shortest-lived invocation class measured
-`0.913`. Separately, an image- and harness-wide census found **no** exec site for either path
+classified correctly. Its catch rate on the shortest-lived invocation class — `git --version`,
+measured **directly on each watched path** at n = 300 rather than on a copy — is **0.710** for
+`/usr/bin/git` and **0.747** for `/usr/lib/git-core/git`. On that floor an observed zero supports
+**k = 0 at ~71 %** and **k ≤ 1 at ~92 %** for that shortest class, and much tighter for any real
+git operation, all of which are longer-lived. ⚠ Earlier drafts quoted ~0.93 here; that figure came
+from a byte-identical *copy* of the binary, which cannot find `git-core` relative to its own
+`argv[0]`, lives ~24 % longer and is correspondingly easier to catch — so it over-stated the rate
+for the binaries actually watched. See §2.2 of the measurement doc. Separately, an image- and harness-wide census found **no** exec site for either path
 outside the egress-control machinery itself.
 
 **§7.2 trigger 4 has not fired, and the acceptance stands unchanged.** What has changed is that the
@@ -325,15 +331,18 @@ the census carries fleet-wide "because the image is common to every agent pod", 
 not run one image: measured 2026-10-29 from `kube_pod_container_info` (PEN-4989), **106** distinct
 agent image digests ran in the preceding 7 days, **17** in the last 24 h, and for **38.2 %** of that
 week more than one image was live simultaneously — three at the moment of measurement. What supports
-the census half is therefore *sampling*, not identity: it was re-run on a second image
+the census half is therefore *reproducibility*, not identity: it was re-run on a second image
 (`sha-4db591b`) and on a third (`sha-992d21f`) and reproduced exactly each time — 15 occurrences,
-all inside the egress machinery, zero exec sites outside the wrapper — making it **3 of 106
-images**. Cite that sample size, not a fleet census.
+all inside the egress machinery, zero exec sites outside the wrapper. ⚠ Those three images are
+**not three independent samples**: measured, they span 9 commits with one build-relevant file
+changed between them (a `KUBECTL_VERSION` pin), so they share a single egress surface. "3 of 106"
+is a count, not a sample fraction of the fleet's variation. The fleet claim rests on the
+egress-surface fingerprint comparison below, not on that count.
 
 So the assumption is tested in three pods on three images, and is not a fleet census. Re-take it when
 the **egress-relevant surface** changes — the wrapper, the runtime it `exec`s, the credential helper,
 **the set of real git binaries**, and the PATH ordering. "Whenever the agent image changes" is not an operable
-trigger at ≈15 changes a day; `scripts/absolute-path-git-fingerprint.mjs` computes the narrower
+trigger at ≈15 changes a day; `scripts/absolute-path-git-fingerprint.mjs` *(lands in #3102)* computes the narrower
 surface hash so staleness is a comparison rather than a judgement.
 
 One finding is worth more than the count itself: **no exec-level telemetry is deployed anywhere in
