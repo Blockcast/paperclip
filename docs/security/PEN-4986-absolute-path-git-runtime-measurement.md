@@ -303,11 +303,16 @@ its *credential* path is still the paperclip helper and it is correctly classifi
 §4.0 accidental-disclosure case is not opened by it. What it bypasses is the **guard** — the egress
 runtime's inspection of the command — not the credential.
 
-This is **already known to first-party code and is already defended against** for the one shape that
-escapes: `github-git-egress-shim.js` refuses `!`-prefixed shell aliases, and its comment states the
-mechanism in the same terms measured here. What has not kept up is §7.1's prose. The wording is
-narrowed in this PR; it is recorded here because "every caller that resolves `git` on PATH" is the
-load-bearing phrase of the first ground of the acceptance, and it was broader than the truth.
+This is **already known to first-party code and is already defended against for one shape**:
+`github-git-egress-shim.js` refuses `!`-prefixed shell aliases, and its comment states the mechanism
+in the same terms measured here. That refusal does **not** cover repository hooks, external
+diff/merge tools, `GIT_EXTERNAL_DIFF` or clean/smudge filters, each of which git spawns with the
+same rewritten `PATH`.
+
+§7.1's prose is narrowed in this PR, but narrowing prose is not a remediation, so the gap is
+tracked as its own row: **PEN-4998**. It is recorded here because "every caller that resolves `git`
+on PATH" is the load-bearing phrase of the first ground of the acceptance, and it was broader than
+the truth.
 
 **A second gap, worth more than the first.** Because no exec-level telemetry is deployed, **the
 fleet cannot currently detect trigger 4 firing in production.** If an absolute-path `git` ran in
