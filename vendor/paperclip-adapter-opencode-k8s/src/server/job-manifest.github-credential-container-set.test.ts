@@ -41,7 +41,35 @@ const UNLISTED_TOKEN_MOUNT = "/etc/paperclip/secrets/github-second-token";
 // stops matching fails OPEN, and a test sharing it would go green in exactly
 // that case.
 const CREDENTIAL_MOUNT_RE = /^\/etc\/paperclip\/secrets\/github-[a-z0-9-]*token$/;
-const CREDENTIAL_SECRET_RE = /^paperclip-github-[a-z0-9-]*token$/;
+// The Secret names behind those mounts. Checked IN ADDITION to the path,
+// because the two failure modes are different: mounting the same Secret
+// somewhere new defeats a path-only check, and mounting a renamed Secret at
+// the credential path defeats a name-only one.
+//
+// FAILS CLOSED, and that is the whole design. An earlier draft anchored this
+// on a `token` SUFFIX, which meant a credential Secret renamed to
+// `paperclip-github-pat` was invisible to both the Secret-name half and the
+// `secretRefs` bucket — and `secretRefs` has no path to fall back on, because
+// a `secretKeyRef` names no path at all. So the family is credential-bearing
+// BY DEFAULT and the exceptions are enumerated: a new `paperclip-github-*`
+// Secret is treated as a credential until someone says otherwise. A false
+// positive is a red a human reads; a false negative is silence, which is the
+// failure this whole file exists to prevent. Raised by review on #3103.
+//
+// The exclusions are control-plane credentials that never reach an agent and
+// are covered by a DIFFERENT control — the server-only inheritance allowlist,
+// backstopped by `findServerOnlyEnvVarsInPodSpec`. Folding them in here would
+// merge two controls into one assertion and make a red ambiguous. This set is
+// part of the declared surface: adding to it is a decision, not a cleanup.
+const NON_CREDENTIAL_GITHUB_SECRETS = new Set([
+  "paperclip-github-app-creds",
+  "paperclip-github-app-key",
+  "paperclip-github-webhook-secret",
+]);
+
+function isCredentialSecretName(name: string): boolean {
+  return /^paperclip-github-[a-z0-9-]+$/.test(name) && !NON_CREDENTIAL_GITHUB_SECRETS.has(name);
+}
 
 const CREDENTIAL_ENV_POINTERS = ["PAPERCLIP_GITHUB_TOKEN_FILE"];
 const CREDENTIAL_ENV_VALUES = [
@@ -130,13 +158,13 @@ function secretRefRoutes(container: k8s.V1Container): string[] {
   const routes: string[] = [];
   for (const entry of container.env ?? []) {
     const secret = entry.valueFrom?.secretKeyRef?.name;
-    if (typeof secret === "string" && CREDENTIAL_SECRET_RE.test(secret)) {
+    if (typeof secret === "string" && isCredentialSecretName(secret)) {
       routes.push(`${entry.name} -> ${secret}`);
     }
   }
   for (const source of container.envFrom ?? []) {
     const secret = source.secretRef?.name;
-    if (typeof secret === "string" && CREDENTIAL_SECRET_RE.test(secret)) {
+    if (typeof secret === "string" && isCredentialSecretName(secret)) {
       routes.push(`envFrom -> ${secret}`);
     }
   }
@@ -173,7 +201,7 @@ function credentialRoutes(selfPodOverride: JobBuildInput["selfPod"] = selfPod): 
     if (names.length > 0) secretByVolume.set(volume.name, names);
   }
   const volumeExposesCredential = (name: string): boolean =>
-    (secretByVolume.get(name) ?? []).some((secret) => CREDENTIAL_SECRET_RE.test(secret));
+    (secretByVolume.get(name) ?? []).some((secret) => isCredentialSecretName(secret));
   const lists: ReadonlyArray<readonly [string, k8s.V1Container[]]> = [
     ["initContainers", spec.initContainers ?? []],
     ["containers", spec.containers ?? []],
@@ -300,7 +328,17 @@ describe("which opencode agent-Job containers receive a github.com credential (P
 
   it("the matchers would fire on the shapes this test exists to reject", () => {
     expect(CREDENTIAL_MOUNT_RE.test(TOKEN_MOUNT)).toBe(true);
-    expect(CREDENTIAL_SECRET_RE.test("paperclip-github-mcp-token")).toBe(true);
+    expect(isCredentialSecretName("paperclip-github-mcp-token")).toBe(true);
+    // Fails CLOSED on a rename: the family counts by default, so a credential
+    // Secret that stops being spelled "...token" is still seen. The
+    // suffix-anchored first draft missed this, and `secretRefs` has no path to
+    // fall back on. Raised by review on #3103.
+    expect(isCredentialSecretName("paperclip-github-pat")).toBe(true);
+    // The enumerated exceptions: control-plane credentials covered by a
+    // different control (see the header).
+    expect(isCredentialSecretName("paperclip-github-app-creds")).toBe(false);
+    expect(isCredentialSecretName("paperclip-github-webhook-secret")).toBe(false);
+    expect(isCredentialSecretName("gbrain-authbot-service-key")).toBe(false);
     expect(CREDENTIAL_MOUNT_RE.test("/var/run/paperclip-github-broker")).toBe(false);
     expect(coversCredentialPath("/etc/paperclip/secrets", [TOKEN_MOUNT])).toBe(true);
     expect(coversCredentialPath("/var/run/authbot", [TOKEN_MOUNT])).toBe(false);
