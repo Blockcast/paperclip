@@ -2469,6 +2469,73 @@ describe("IssueProperties", () => {
     });
 
     /**
+     * PEN-3803 review follow-up #2. `monitorAttemptCount` SURVIVES a clear — that
+     * outliving is the whole subject of this issue — so a row whose monitor was
+     * already cleared at the cap still cannot be armed: the arm resolves the same
+     * spent count and 422s. An earlier revision of the gate conjoined
+     * `executionPolicy?.monitor`, which left Schedule enabled on exactly that row
+     * and sent it to the same unsurfaceable refusal.
+     *
+     * NEGATIVE CONTROL: restore the `Boolean(issue.executionPolicy?.monitor) &&`
+     * conjunct on `monitorRenewalUnavailable` and this test fails.
+     */
+    it("disables Schedule at the cap even when the monitor was already cleared", async () => {
+      const onUpdate = vi.fn();
+      const root = renderProperties(container, {
+        issue: createIssue({
+          status: "in_progress",
+          assigneeAgentId: "agent-1",
+          // The count outlives the monitor that spent it.
+          monitorAttemptCount: MAX_ISSUE_MONITOR_MAX_ATTEMPTS,
+          executionPolicy: createExecutionPolicy({}),
+          executionState: {
+            status: "pending",
+            currentStageId: null,
+            currentStageIndex: null,
+            currentStageType: null,
+            currentParticipant: null,
+            returnAssignee: null,
+            reviewRequest: null,
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+            monitor: {
+              status: "cleared",
+              nextCheckAt: null,
+              lastTriggeredAt: null,
+              attemptCount: MAX_ISSUE_MONITOR_MAX_ATTEMPTS,
+              notes: null,
+              scheduledBy: "assignee",
+              clearedAt: "2026-04-10T12:00:00.000Z",
+              clearReason: "max_attempts_exhausted",
+            },
+          } satisfies IssueExecutionState,
+        }),
+        childIssues: [],
+        onUpdate,
+        inline: true,
+      });
+      await flushReact();
+      await act(async () => {
+        Array.from(container.querySelectorAll("button"))
+          .find((button) => button.textContent?.trim() === "Cleared")!
+          .dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flushReact();
+
+      const schedule = Array.from(container.querySelectorAll("button"))
+        .find((candidate) => candidate.textContent?.trim() === "Schedule");
+      expect(schedule).toBeTruthy();
+      expect((schedule as HTMLButtonElement).disabled).toBe(true);
+
+      // With nothing to clear, the hint must not tell the user to clear it.
+      expect(container.textContent).not.toMatch(/Clear it and stop polling/);
+      expect(container.textContent).toMatch(/count survives clearing/);
+
+      act(() => root.unmount());
+    });
+
+    /**
      * Negative control for the gate above: a row with road left must keep an
      * enabled Schedule and show no hint, or the gate is an unconditional
      * disable rather than a spent-budget rule.

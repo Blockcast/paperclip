@@ -1004,6 +1004,7 @@ export function IssueProperties({
     });
   };
   const monitorAttemptCount = issue.monitorAttemptCount ?? issue.executionState?.monitor?.attemptCount ?? 0;
+  const monitorArmed = Boolean(issue.executionPolicy?.monitor);
   /**
    * PEN-3803 review follow-up: past `MAX_ISSUE_MONITOR_MAX_ATTEMPTS` there is no
    * representable renewal, so `renewedIssueMonitorMaxAttempts` returns `null`,
@@ -1014,11 +1015,17 @@ export function IssueProperties({
    * where this popover has no error surface to show it in.
    *
    * Rather than let "Schedule" fail silently from the user's side, say so before
-   * the click and point at the one control that does work — "Clear", which is
-   * rendered immediately beside it.
+   * the click.
+   *
+   * ⚠️ Deliberately NOT conjoined with `monitorArmed`. Clearing a monitor does
+   * not reset `monitorAttemptCount` — the count outlives the monitor, which is
+   * the whole reason this issue exists — so a row whose monitor was already
+   * cleared at the cap still cannot be armed. Gating on "a monitor is present"
+   * would leave Schedule enabled on exactly that row and send it to the same
+   * unsurfaceable 422. `monitorArmed` only chooses the WORDING below, because
+   * "clear it" is advice you can act on only when there is something to clear.
    */
-  const monitorRenewalUnavailable =
-    Boolean(issue.executionPolicy?.monitor) && renewedIssueMonitorMaxAttempts(monitorAttemptCount) === null;
+  const monitorRenewalUnavailable = renewedIssueMonitorMaxAttempts(monitorAttemptCount) === null;
   const saveMonitor = () => {
     if (!monitorAtInput) return;
     const nextCheckAt = new Date(monitorAtInput);
@@ -1314,9 +1321,18 @@ export function IssueProperties({
       */}
       {monitorRenewalUnavailable ? (
         <p className="text-xs text-muted-foreground">
-          This monitor has made {monitorAttemptCount} attempts — past the maximum budget a re-arm can
-          grant, so re-scheduling would be rejected. Clear it and stop polling, or raise{" "}
-          <code>maxAttempts</code> through the API.
+          This issue has made {monitorAttemptCount} monitor attempts — past the maximum budget an arm
+          can grant, so scheduling would be rejected.{" "}
+          {monitorArmed ? (
+            <>
+              Clear it and stop polling, or raise <code>maxAttempts</code> through the API.
+            </>
+          ) : (
+            <>
+              The count survives clearing, so raise <code>maxAttempts</code> through the API to arm
+              again.
+            </>
+          )}
         </p>
       ) : null}
       <div className="flex flex-col gap-2 md:flex-row">
@@ -1350,7 +1366,7 @@ export function IssueProperties({
             onClick={saveMonitor}
             title={
               monitorRenewalUnavailable
-                ? `This monitor has made ${monitorAttemptCount} attempts, past the maximum budget a re-arm can grant. Clear it instead.`
+                ? `This issue has made ${monitorAttemptCount} monitor attempts, past the maximum budget an arm can grant.`
                 : undefined
             }
           >
