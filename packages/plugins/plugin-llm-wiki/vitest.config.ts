@@ -13,13 +13,15 @@ export default defineConfig({
     // fail with "TypeError: act is not a function", while the other two spec
     // files (85 tests) pass. The DOM is not the problem: document is defined in
     // that file either way -- though not for the reason the PEN-2506 ratchet
-    // note used to give. jsdom does not resolve "through the workspace": this
-    // package does not declare it, and it reaches these tests only because pnpm
-    // hoists `server`'s copy -- `server` is the sole importer declaring jsdom --
-    // into node_modules/.pnpm/node_modules. Until PEN-4930 (#3072) lands it is
-    // a phantom dependency; that PR declares jsdom on this package and adds a
-    // sweep for the next package to request a non-node environment without
-    // declaring what provides it. The corrected ratchet note is in
+    // note used to give. jsdom has never resolved "through the workspace": the
+    // repo root declares it nowhere. It reached these tests as a phantom
+    // dependency -- pnpm hoisting `server`'s copy, long the sole importer
+    // declaring jsdom, into node_modules/.pnpm/node_modules. PEN-4930 (#3072)
+    // closes that by declaring jsdom on this package and adding a sweep for the
+    // next package to request a non-node environment without declaring what
+    // provides it. Whether that has landed is deliberately not asserted here:
+    // this package's own package.json is the authority, and a comment that
+    // restates it only rots. The corrected ratchet note is in
     // scripts/__tests__/vitest-project-coverage.test.mjs.
     //
     // Vitest already defaults NODE_ENV to "test" when it is unset, so this only

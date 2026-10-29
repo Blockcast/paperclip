@@ -257,8 +257,11 @@ const EXECUTED_BY_ANOTHER_LANE = new Map([
 // PEN-4930, tracked separately in #3072: that PR declares jsdom on the two
 // packages whose tests request it and adds a sweep to this file for any
 // package that requests a non-node environment without declaring what
-// provides it. Neither is in this tree yet -- on this branch jsdom is still
-// the phantom described above. The 16 failures were "TypeError: act is not a
+// provides it. Whether that has landed here is answered by those packages'
+// package.json files and by whether that sweep is present below -- not by
+// this note, which deliberately does not assert it, because the merge order
+// of this branch and #3072 is not fixed and a note tracking it would be
+// wrong half the time. The 16 failures were "TypeError: act is not a
 // function" because React only exports `act` from
 // cjs/react.development.js and react/index.js selects the production build
 // when process.env.NODE_ENV === "production" -- which is ambient in an agent
