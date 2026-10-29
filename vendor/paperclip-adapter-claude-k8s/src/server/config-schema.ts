@@ -202,6 +202,28 @@ export function getConfigSchema(): AdapterConfigSchema {
       label: "DinD Memory Limit",
       hint: "Memory limit for the DinD sidecar (default '8Gi'). e.g. '4Gi', '8Gi'.",
     },
+    // PEN-3183 D1 rollout gate (PEN-4933). Surfaced here so the state of a
+    // credential boundary is legible to a reviewer looking at the agent,
+    // rather than only to whoever reads the database (PEN-5017).
+    //
+    // ⚠ This field is a VIEW, not the enforcement point. The key is pinned to
+    // agent provenance by AGENT_SCOPE_ONLY_CONFIG_KEYS in the Paperclip
+    // server's heartbeat merge; a per-issue `assigneeAdapterOverrides`
+    // carrying it is discarded and logged, not honoured. Do not read the
+    // presence of this toggle as the thing that makes that true.
+    {
+      type: "toggle",
+      key: "enableGitHubPublishBroker",
+      label: "GitHub publish broker (PEN-3183 D1)",
+      default: false,
+      hint:
+        "Move the GitHub push credential out of the agent container into a sidecar at a different uid. "
+        + "With it off the credential is mounted into the agent container (the accepted PEN-3183 \u00a77 residual). "
+        + "With it on the agent cannot authenticate to github.com directly at all, which changes every publish path "
+        + "for this agent. Agent scope only \u2014 a per-issue override of this key is ignored. "
+        + "This is a rollout gate, not a kill switch: switching it back off after enablement re-opens the \u00a77 "
+        + "acceptance and needs Security.",
+    },
   ];
 
   return { fields };
