@@ -66,13 +66,60 @@ needed in migration 0051 and is expected to hold — but if it does not, that
 statement RAISES and fails the rollout rather than degrading. The hand-run
 opt-out has the same first line and the same requirement.
 
+## 3. Verify the rollout actually landed
+
+⚠️ **A green deploy run is not evidence the fix is live.** On 2026-10-29 a
+dispatch fired at 07:27Z, master took the query fix at 07:35Z, and the pods
+rolled at ~07:40Z — *after* the merge — carrying an image built from the
+pre-merge commit. Every signal short of the running code said "deployed".
+
+One request settles it, with no pg-log access and no psql seat. Issue the call
+this fix is about and read the **`code`** field of the response:
+
+```
+GET /api/companies/{companyId}/issues?q=statement&limit=15
+```
+
+| Response | Meaning |
+|---|---|
+| **200**, promptly | Query fix is live and working. |
+| **503** `code: "statement_timeout"` (`57014`) | Relabelling is live, so the code **is** post-PEN-3596 — but the query is still over the bound. This is the informative failure: the shape change did not deliver at production row counts. Escalate on PEN-3596 rather than re-deploying. |
+| **503** `code: "transient_db_conflict"` (`57014`) | **Not deployed.** The node is running pre-PEN-3596 code. Nothing about the fix has been tested yet. |
+
+The discriminator is `error-handler.ts` (`isStatementTimeout`), which branches
+`57014` away from the contention wording. That branch (`f3bacbe`) is the
+**direct parent** of the query fix (`4db591b3`) — adjacent commits from the same
+PR (#3084), so they enter `master` as one unit and no deployable head carries
+one without the other. That adjacency is what lets the `code` field double as a
+deploy detector; re-check it with `git merge-base --is-ancestor` if either is
+ever back-ported or reverted separately.
+
+Pick a search term with broad matches; the cost is term-dependent, so repeated
+sampling with one narrow term reads green either way (`q=timeout` measured 2.9s
+where `q=statement` measured 25.7s on the same database).
+
+**Expect timeouts to continue regardless.** 45 of 69 production statement
+timeouts measured over 19h are *not* this query shape — they are
+[PEN-5019](/PEN/issues/PEN-5019), and they will not collapse when this rolls. A
+`canceling statement due to statement timeout` grep is the wrong instrument for
+judging this fix; the call above is the right one.
+
 ## If writes are already failing
 
-1. Confirm the window matches a migration, not ordinary contention: a statement
-   cancelled by `statement_timeout` is sqlstate `57014` and now surfaces as
-   `503 statement_timeout`, *not* `transient_db_conflict` (PEN-3596). A burst of
-   `transient_db_conflict` carrying `55P03` is lock contention and is consistent
-   with this build.
+1. Confirm the window matches a migration, not ordinary contention. **Read the
+   `code` field, then the `sqlstate`, and mind which build you are on** — the
+   relabelling and this migration ship in the *same* deploy, so during the
+   rollout window the pair is genuinely ambiguous unless you check both:
+
+   | `code` | `sqlstate` | Reading |
+   |---|---|---|
+   | `transient_db_conflict` | `55P03` | Lock contention — **consistent with this build.** |
+   | `statement_timeout` | `57014` | Query cost, not a lock. Not this build. |
+   | `transient_db_conflict` | `57014` | A statement timeout on a node still running **pre-PEN-3596 code** — the relabelling has not rolled here. Not this build either; see §3. |
+
+   The last row is not hypothetical: it is what production returned on
+   2026-10-29T17:12Z, hours after the fix merged to `master`. Do not read an
+   absent `statement_timeout` code as "no statement timeouts happened".
 2. Do not cancel the migration mid-build unless you have decided to take the
    opt-out — a cancelled transactional `CREATE INDEX` rolls back, and the next
    deploy preflight runs it again from zero.
