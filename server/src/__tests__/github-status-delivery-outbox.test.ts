@@ -214,11 +214,22 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
     // live write succeeding while a retired-context supersede does not. 422 is
     // classified non-retryable, which keeps the bounded retry from sleeping.
     failPostContexts?: string[];
+    // `GET /commits/{sha}/pulls` — every open pull request at this head. The
+    // gate sweeps it before publishing a `success` so a green means no PR at
+    // this head is red (PEN-3818). It MUST be routed even when a test has no
+    // peers to describe: left unstubbed the fetch throws, the enumeration fails
+    // closed, and the publish is withheld as `fetch_failed`, so every clean
+    // verdict here would collapse for a reason the test never asked about.
+    // The default `[]` is equivalent to the realistic self-only page, because
+    // the sweep skips its own row; a test that wants the self-skip or a peer
+    // verdict exercised passes the rows explicitly.
+    openPullRequestsAtHead?: unknown[];
   }) {
     const fetchMock = vi.fn(async (url: string | URL, init?: RequestInit) => {
       const u = String(url);
       if (u.includes("/access_tokens")) return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
       if (/\/commits\/[^/]+\/statuses(?:\?|$)/.test(u)) return jsonResponse(options.latestStatuses ?? []);
+      if (/\/commits\/[^/]+\/pulls(?:\?|$)/.test(u)) return jsonResponse(options.openPullRequestsAtHead ?? []);
       if (u.includes("/pulls/") && u.includes("/reviews")) {
         if (options.reviewsStatus && options.reviewsStatus >= 400) {
           return jsonResponse(
@@ -1085,6 +1096,20 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
       };
     }
 
+    // The realistic `GET /commits/{sha}/pulls` page for these rows: the only
+    // open pull request at this head is the one being re-evaluated. The sweep
+    // skips its own row, so this is the self-skip branch rather than a peer.
+    function selfOnlyPullsPage() {
+      return [
+        {
+          number: 105,
+          state: "open",
+          head: { sha: HEAD_SHA },
+          html_url: "https://github.com/Blockcast/frr/pull/105",
+        },
+      ];
+    }
+
     async function seedReevaluation(options: { queuedAt?: Date } = {}) {
       h.cfg.prCommentReviewGateStatusContext = GATE_CONTEXT;
       const delivery = await enqueueGithubCommitStatusDelivery(db, {
@@ -1130,6 +1155,7 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
         latestStatuses: [{ context: GATE_CONTEXT, state: "failure", created_at: "2026-09-26T16:32:20Z" }],
         reviews: [cleanAllyReview(HEAD_SHA)],
         comments: [],
+        openPullRequestsAtHead: selfOnlyPullsPage(),
       });
 
       await expect(pollGitHubCommitStatusDeliveriesOnce(db)).resolves.toBe(1);
@@ -1201,6 +1227,7 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
         reviews: [cleanAllyReview(HEAD_SHA)],
         comments: [],
         failPostContexts: ["review/ally-comment"],
+        openPullRequestsAtHead: selfOnlyPullsPage(),
       });
 
       await expect(pollGitHubCommitStatusDeliveriesOnce(db)).resolves.toBe(1);
