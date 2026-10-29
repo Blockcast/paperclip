@@ -76,8 +76,24 @@ export function parseSharedDocOverlay(raw: unknown): SharedDocOverlay | null {
  *
  * Every property below is load-bearing:
  *
- *   * **Never overwrites.** `[ -e ]` short-circuits, so a doc the clone already carries as
- *     a tracked file keeps the cloned revision's content. This step fills absences only.
+ *   * **Never overwrites.** `[ -e ] || [ -L ]` short-circuits, so a doc the clone already
+ *     carries as a tracked file keeps the cloned revision's content. This step fills
+ *     absences only. `-L` is tested as well as `-e` because `-e` follows symlinks, so a
+ *     tracked *dangling* symlink at `docs/<name>.md` reads as absent. GNU `cp` refuses
+ *     that write on its own ("not writing through dangling symlink"), so the `-L` test is
+ *     not what stops the escape there — it stops `cp` exiting 1 and the step reporting a
+ *     copy failure that is really a file already being present. It does close the escape
+ *     under a `cp` that follows the link, which POSIX permits and busybox does.
+ *   * **Never writes through a symlinked directory.** Where some earlier bootstrap step
+ *     has already symlinked `docs/` at a shared source — the opencode tree's
+ *     `sharedDocsBridge` (BLO-10315) links the whole company `docs/` in when the repo has
+ *     none of its own — a `cp` into it would land in that shared directory, outside this
+ *     run, and a placeholder would overwrite the real company document for every later
+ *     run. So each destination's ancestors are checked and a symlinked one is reported and
+ *     stepped over. This is also what makes the bridge and this step compose: the bridge
+ *     runs first and serves the whole directory, and this step then fills nothing, which
+ *     is correct — the bridge covers transitively-referenced docs that are not in the
+ *     declared set, and this step cannot.
  *   * **Never fails the run.** A missing source, an unwritable destination and a
  *     read-only `.git` are each reported on stderr and stepped over. The whole step ends
  *     `true`, so a caller can splice it into a `&&`/`|| exit` chain without the pod's
@@ -104,7 +120,19 @@ export function buildSharedDocOverlayShell(input: {
     `__pcdocs_src=${quote(overlay.sourceCwd)};`,
     `__pcdocs_dst=${quote(workspaceRoot)};`,
     `for __pcdoc in ${overlay.paths.map(quote).join(" ")}; do`,
-    `if [ -e "${dst}" ]; then continue; fi;`,
+    // `-L` as well as `-e`: `-e` follows symlinks, so a dangling one reads as absent.
+    // Either shape means "something is already here" and must not be touched.
+    `if [ -e "${dst}" ] || [ -L "${dst}" ]; then continue; fi;`,
+    // Walk the destination's ancestors under the workspace root and refuse to write when
+    // any of them is a symlink: the copy would land outside this run, in whatever shared
+    // directory the link points at. Reached when a doc is absent from a symlinked `docs/`,
+    // which is exactly the case the opencode tree's `sharedDocsBridge` creates.
+    `__pcdoc_dir="$(dirname "$__pcdoc")"; __pcdoc_linked=0;`,
+    `while [ "$__pcdoc_dir" != "." ] && [ "$__pcdoc_dir" != "/" ]; do`,
+    `if [ -L "$__pcdocs_dst/$__pcdoc_dir" ]; then __pcdoc_linked=1; break; fi;`,
+    `__pcdoc_dir="$(dirname "$__pcdoc_dir")";`,
+    `done;`,
+    `if [ "$__pcdoc_linked" = 1 ]; then echo "[paperclip] shared doc $__pcdoc is absent under a symlinked docs/ directory; not copying, because that would write into the shared directory the link points at" >&2; continue; fi;`,
     `if [ ! -f "${src}" ]; then echo "[paperclip] shared doc $__pcdoc is absent from the execution workspace; the run workspace will not have it" >&2; continue; fi;`,
     `if mkdir -p "$(dirname "${dst}")" && cp -- "${src}" "${dst}"; then`,
     // info/exclude needs no glob escaping: `isSafeSharedDocPath` rejects every character
