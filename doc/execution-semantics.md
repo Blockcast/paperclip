@@ -290,6 +290,20 @@ Both lines are required; either one alone does not count. Matching is case-insen
 
 Use this to park an issue on a gate the issue graph cannot represent: an approval, a credential grant, another team's sign-off. Per the monitor contract, do **not** arm a monitor on a human-only gate — polling does not move it. Declare the external wait instead.
 
+**The declaration is read only on a `blocked` issue. On any other status it is inert — it suppresses nothing, surfaces nothing, and is read by nothing.** All three consumers are scoped the same way, so there is no partial effect to rely on: the stranded-blocked reconciler only ever evaluates `blocked` candidates, the blocked-inbox `external_wait` attention state is gated on `status === "blocked"`, and `isDeadEndBlocked` tests `status === "blocked"` before it consults the declaration at all. Writing the two lines onto a `todo`, `in_progress`, `in_review` or `backlog` row is silent and buys nothing, which is the dangerous shape: the moment you write the declaration is the moment you have correctly diagnosed a human gate, and getting no feedback reads as success.
+
+That scoping is deliberate and is not a gap to be widened — a non-`blocked` row is asserting that it *is* actionable, and every past widening of the suppression predicate has ended with rows that could never be drained (BLO-27553 measured 19 of 23 estate-wide strands sitting behind a suppression that had quietly become unconditional). So **set the status first, then declare**, and pick the hold from the gate:
+
+| row status | what is holding it | the instrument that works |
+|---|---|---|
+| `blocked` | a person | **the declaration** — the only hold that names *who* and *what* |
+| `blocked` | another issue | a `blockedBy` edge |
+| `in_review` / `in_progress` | a person | a **park** (`parkedUntil`) — nothing sweeps those statuses, and a park is what reads as attended |
+| `in_review` / `in_progress` | CI, a queue, a machine | a **monitor** — polling can actually move it |
+| `todo` | you, right now | none; it is work, not a wait |
+
+A row that is genuinely waiting on a person and also carries agent-actionable work is the one case where a non-`blocked` status plus a declaration is reasonable — but then the *park or monitor* is what is holding it, and the declaration is documentation for the reader rather than a control-plane signal. Do not count it as the hold.
+
 A declaration is also read positively, not just as a suppression: a `blocked` issue with a declared wait and no live monitor is surfaced in the blocked inbox as `external_wait` rather than as a stalled row. The two declaration lines are stripped from the description shown there, and the parsed owner and action values are then struck out of whatever prose remains.
 
 **A declared external wait is exempt from auto-resume.** The stranded-blocked-issue reconciler flips any `blocked` issue with zero unresolved blockers to `todo`; a declared wait suppresses that flip (`external_wait`, alongside pending interactions, approvals, executive holds, monitor gates, and the rest). So the declaration is sufficient on its own to hold the park — you do not additionally need a blocker edge or an interaction card. **A `blocked` issue with zero blockers and no declaration is still drained to `todo`, deliberately**, so an undeclared park does not survive either: park on a human gate by declaring it, never by leaving the row `blocked` and silent. The reconciler posts a system comment on the issue each time it performs that flip, naming the change and these two lines, so the drain is visible to the assignee on the thread rather than only in the activity log (PEN-3974). An issue can be flipped more than once if it is re-blocked without a declaration, and each flip is announced.

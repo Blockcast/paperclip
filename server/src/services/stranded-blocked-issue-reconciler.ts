@@ -217,6 +217,16 @@ async function listLockedLivePathIssueIds(
  * made. The remedy belongs in the announcement because that is the moment the
  * mistake becomes visible.
  *
+ * PEN-5065: the announcement must also say WHAT STATUS, for the same reason. All
+ * three readers of the declaration are scoped to `blocked` — this sweep's own
+ * suppression, the blocked-inbox `external_wait` attention state, and
+ * `isDeadEndBlocked` — so an assignee who follows the remedy above and leaves the
+ * row on the `todo` this sweep just set has written two inert lines and been told
+ * nothing. That is the worst response available to a correct diagnosis, and this
+ * announcement is the one surface guaranteed to be read at exactly that moment,
+ * because it fires as the row leaves `blocked`. Measured 2026-10-29 over 756 open
+ * rows: 12 carried a well-formed declaration and 6 of them were not `blocked`.
+ *
  * Deliberately NOT a widening of `listBlockedIssueAutoResumeSuppressions` to
  * scan comments. Every past widening of that predicate has ended up making rows
  * permanently undrainable — BLO-27553 measured 19 of 23 estate-wide strands
@@ -256,6 +266,13 @@ function announcementBody(): string {
     "blocker-resolved wake, and the row is surfaced in the blocked inbox as `external_wait` with",
     "the declared owner and action instead of as a stalled row. Delete the two lines when the gate",
     "clears — a stale declaration parks the row just as effectively as a live one.",
+    "",
+    "**Set the status back to `blocked` as well — the declaration is read only on a `blocked` row.**",
+    "This sweep has just moved this issue to `todo`, so adding the two lines and stopping there",
+    "leaves them inert: on `todo`, `in_progress`, `in_review` or `backlog` nothing reads them, and",
+    "the row stays dispatchable. If the row is not `blocked` because real agent work remains, hold",
+    "it with the instrument that works on its status instead — a `parkedUntil` for a human gate, a",
+    "monitor for CI or a queue.",
     "",
     "See `doc/execution-semantics.md#declaring-an-external-wait`.",
   ].join("\n");
