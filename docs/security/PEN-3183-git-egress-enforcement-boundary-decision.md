@@ -291,11 +291,23 @@ shortest-lived invocation class measured 0.93. Separately, an image- and harness
 **§7.2 trigger 4 has not fired, and the acceptance stands unchanged.** What has changed is that the
 first ground above rests on a measurement rather than an expectation — with one qualification,
 which replaces the old one rather than removing it. The evidence splits in two: the
-**fleet-constant** half, what the image and harness themselves run, is zero *by census* and
-generalises across the fleet because the image is common to every agent pod; the **fleet-variable**
-half, what an agent composes into a shell at runtime, is zero *in the one pod measured*. So the
-assumption is tested, not yet a fleet census, and this is a point measurement — re-take it whenever
-the agent image or the PATH layout changes.
+**image-resident** half, what the image and harness themselves run, is zero *by census*; the
+**per-pod** half, what an agent composes into a shell at runtime, is zero *in the pods measured*.
+
+⚠ That first half does **not** generalise for the reason this paragraph originally gave. It claimed
+the census carries fleet-wide "because the image is common to every agent pod", and the fleet does
+not run one image: measured 2026-10-29 from `kube_pod_container_info` (PEN-4989), **106** distinct
+agent image digests ran in the preceding 7 days, **17** in the last 24 h, and for **38.2 %** of that
+week more than one image was live simultaneously — three at the moment of measurement. What supports
+the census half is therefore *sampling*, not identity: it was re-run on a second image
+(`sha-4db591b`) and reproduced exactly — 15 occurrences, all inside the egress machinery, zero exec
+sites outside the wrapper — making it **2 of 106 images**. Cite that sample size, not a fleet census.
+
+So the assumption is tested in two pods on two images, and is not a fleet census. Re-take it when
+the **egress-relevant surface** changes — the wrapper, the runtime it `exec`s, the credential helper,
+the real binary, and the PATH ordering. "Whenever the agent image changes" is not an operable
+trigger at ≈15 changes a day; `scripts/absolute-path-git-fingerprint.mjs` computes the narrower
+surface hash so staleness is a comparison rather than a judgement.
 
 One finding is worth more than the count itself: **no exec-level telemetry is deployed anywhere in
 the cluster**, so nothing would currently report trigger 4 firing in another pod. Standing alerting
