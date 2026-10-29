@@ -315,9 +315,9 @@ is enabled.
 
 #### What watches each trigger (PEN-4988, 2026-10-29)
 
-Until PEN-4988 **nothing watched any of these**, and the acceptance above runs to 2027-01-31
-unless one fires. A trigger that fires and is not noticed is the same as a trigger that never
-fires — so the table below exists so a future reader can tell a *watched* condition from an
+Until PEN-4988 **nothing watched any of these**, and the acceptance above was to run to
+2027-01-31 unless one fired. **One since has** — trigger 4, below. A trigger that fires and is not
+noticed is the same as a trigger that never fires — so the table below exists so a future reader can tell a *watched* condition from an
 *unwatched* one without re-deriving it. Keep it accurate or delete it; a stale coverage claim is
 worse than none.
 
@@ -325,8 +325,8 @@ worse than none.
 |---|---|---|---|
 | 1 | **No** | Nothing. Not a pollable condition — see below. | — |
 | 2 | **Yes** | `git-egress-residual-trigger-check.yml`, hourly | Security Engineer |
-| 3 | **Partly** | Two build/PR gates. They BLOCK; they do not ALERT. Mount half unasserted (PEN-4990). | — |
-| 4 | **No** | Accepted blind spot — no exec telemetry exists. Re-measurement: PEN-4989. | — |
+| 3 | **Partly** | Build/PR gates on *both* halves since PEN-4990. They BLOCK; they do not ALERT, and they are direction-blind. | — |
+| 4 | **No** — and it has **FIRED** | Accepted blind spot: no exec telemetry exists. Found by measurement, not reported by a detector (PEN-4989). | — |
 
 **Trigger 1 — not watched, and not watchable here.** A disclosure event is detected by whatever
 detects disclosures (the PEN-2526 response path), not by polling this repo. It is listed as a
@@ -369,12 +369,33 @@ which a green run covers:
 - Assertion (b) explicitly does not cover a retag or overwrite of an already-published image, or
   drift of an already-running pod (see its own header).
 
-The **mount half** — "or mounts it into a new container" — has **no standing detector at all**.
-`deploy/helm/paperclip/tests/secret-mounts-outside-data-volume.test.mjs` asserts where secret
-volumes may sit (BLO-40279: nothing credential-bearing nested under the shared data volume), which
-is a different property from *which containers receive the github.com token*. Nothing asserts the
-latter, so adding the Secret to a new container is caught only by human review. Tracked as
-**PEN-4990**.
+The **mount half** — "or mounts it into a new container" — **is asserted as of PEN-4990**
+(merged 2026-10-29), which closed the gap this paragraph previously recorded as open:
+`deploy/helm/paperclip/tests/github-credential-container-set.test.mjs` for the chart, and
+`job-manifest.github-credential-container-set.test.ts` in **both** k8s adapters for the agent Job,
+pin a map from container to the github.com credential routes it receives and compare it for exact
+equality. The subsection below states what those assertions do and do not reach. They are merge
+gates, so the first two limits above apply to them unchanged — they block rather than alert, and
+exact equality makes them direction-blind.
+
+Do **not** read `deploy/helm/paperclip/tests/secret-mounts-outside-data-volume.test.mjs` as this
+assertion. It asserts *where* a secret volume may sit (BLO-40279: nothing credential-bearing nested
+under the shared data volume) and stays green while the token is mounted into a brand-new container,
+as long as that mount is outside `/paperclip` — a different property from *which* containers receive
+the token.
+
+⚠ **Trigger 4 has since FIRED, and this record is not the row that disposes of it.** On
+2026-10-29 the measurement returned a non-zero count — **28** unwrapped absolute-path invocations in
+an Engineer pod, 26 of them from a single test in another repository that narrows `PATH` and so
+drops the guard directory by construction (measured on PEN-4993, widened on PEN-4989; the mechanism
+is PEN-5012). Per the trigger list above that **ends the residual acceptance early, regardless of
+the 2027-01-31 date**. The count and the disposition of the acceptance are owned by PEN-4989 and
+raised to the CTO — recorded here so a reader of this table is not left to infer from "no detector"
+that the condition has not occurred.
+
+Everything below describes the **instrumentation**, which the firing does not change: there is still
+no detector, which is precisely why the firing had to be found by a measurement rather than reported
+by one.
 
 **Trigger 4 — accepted blind spot, stated as such rather than left as an open gap.** It is the one
 trigger with no instrument, and that is structural: **no exec-level telemetry is deployed anywhere
