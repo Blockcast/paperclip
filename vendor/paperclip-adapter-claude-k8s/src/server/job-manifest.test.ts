@@ -5151,8 +5151,9 @@ describe("scoped writable mounts (BLO-32734)", () => {
     it("mkdirs every target and chowns exactly the writable ones", () => {
       const result = buildJobManifest({ ctx: isolatedCtx(), selfPod: makeSelfPod() });
       const script = seedOf(result)?.command?.[2] ?? "";
-      expect(script).toMatch(/^set -e; mkdir -p /);
-      expect(script).toContain("chown 1000:1000 ");
+      expect(script).toMatch(/^set -e; for p in /);
+      expect(script).toContain("; mkdir -p ");
+      expect(script).toContain("chown -h 1000:1000 ");
       // Every scoped rw mount is created AND handed to uid 1000.
       const spec = result.job.spec?.template?.spec;
       const writable = (spec?.containers[0]?.volumeMounts ?? []).filter(
@@ -5173,6 +5174,29 @@ describe("scoped writable mounts (BLO-32734)", () => {
       expect(hooks).toBeDefined();
       expect(mkdirPart).toContain(`'/mnt/paperclip-data-seed/${hooks!.subPath}'`);
       expect(chownPart).not.toContain(`'/mnt/paperclip-data-seed/${hooks!.subPath}'`);
+    });
+
+    it("refuses a target that is already a symlink, before anything follows it", () => {
+      const result = buildJobManifest({ ctx: isolatedCtx(), selfPod: makeSelfPod() });
+      const script = seedOf(result)?.command?.[2] ?? "";
+      // Both `mkdir -p` and a bare `chown` follow symlinks, and this is the one
+      // process in the Pod holding uid 0 over the volume root — so a link
+      // planted at a target path by a uid 1000 writer would redirect the chown
+      // onto its referent. The guard runs BEFORE the mkdir, so nothing is
+      // created through a planted link either.
+      const [guard, rest] = [script.split("; mkdir -p ")[0] ?? "", script.split("; mkdir -p ")[1] ?? ""];
+      expect(guard).toContain('if [ -L "$p" ]');
+      expect(guard).toContain("exit 1");
+      expect(rest).not.toContain('[ -L "$p" ]');
+      // Every target is guarded, read-only ones included: a symlinked
+      // read-only target redirects the kubelet's bind just as surely.
+      const spec = result.job.spec?.template?.spec;
+      const targets = (spec?.containers[0]?.volumeMounts ?? []).filter((m) => m.name === "data" && m.subPath);
+      expect(targets.length).toBeGreaterThan(0);
+      for (const m of targets) expect(guard).toContain(`'/mnt/paperclip-data-seed/${m.subPath}'`);
+      // `-h` so the chown itself cannot traverse a link created after the
+      // guard ran. Redundant while init containers are sequential; free.
+      expect(script).toContain("chown -h ");
     });
 
     it("is the only root container, and takes no more privilege than mkdir+chown need", () => {

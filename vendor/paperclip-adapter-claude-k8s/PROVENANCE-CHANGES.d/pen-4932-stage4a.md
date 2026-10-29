@@ -115,6 +115,19 @@ claim, where the server pre-created every target and `mkdir -p` no-ops on
 capability instead. `DAC_OVERRIDE` is inside the PSS *baseline* allowed set, so
 the baseline-clean claim is unchanged.
 
+The seeder also refuses a target whose final component is already a symlink, and uses
+`chown -h`. Both `mkdir -p` and a bare `chown` follow symlinks, and this is the one
+process in the Pod holding uid 0 over the volume root — so a link planted at a target
+path by a uid 1000 writer would redirect a root `chown` onto its referent, the sharpest
+case being a link aimed at the git-hooks dir, which would hand uid 1000 the PEN-3156
+pre-push guard the explicit no-chown below exists to protect. Not reachable on this head
+(`resolveScopedWritableMounts` drops nested targets, and a narrowed pod has no path to
+another agent's subtree) and not reachable on the self claim; it becomes reachable in 4b,
+where a per-agent volume persists across runs whose target sets differ. A symlinked
+**parent** component is NOT covered — closing that needs a per-component walk, recorded as
+a 4b invariant in `docs/plans/2026-10-28-pen-4932-per-agent-volumes.md` §4 rather than
+guessed at here.
+
 `FOWNER` was dropped in the same change. It bypasses the owner-match check on
 `chmod`/`utimes`, and neither syscall this container makes needs it: `chown` is
 covered by `CAP_CHOWN`, and `mkdir -p` chmods only a directory it just created
