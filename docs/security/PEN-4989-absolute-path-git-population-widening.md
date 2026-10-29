@@ -436,12 +436,13 @@ and obtaining it from inside an agent pod needs the hardening §8 forbids relaxi
 
 ## 5. What is still open
 
-- **⛔ The acceptance is ended, and the remediation is not yet scoped.** §1.2 fired trigger 4. What
+- **⛔ The acceptance is ended; the remediation is owned but not done.** §1.2 fired trigger 4. What
   this record does NOT do is fix the mechanism: `test/secret-scan-budget.test.ts:611` still narrows
   `PATH`, and **any other test or tool that constructs its own `PATH` still gets an unwrapped `git`**.
-  Nobody has swept for the others. That sweep, and the decision on whether narrowing `PATH` should be
-  made to preserve the wrapper directory, belong to the CTO's disposition — they are deliberately not
-  decided here.
+  Nobody has swept for the others. **That sweep is [PEN-5012](https://paperclip.blockcast.net/PEN/issues/PEN-5012)**,
+  filed so the class has an owner rather than a sentence — which is the failure PEN-4988 exists to
+  prevent and would have been repeated by recording it only here. The *acceptance* disposition
+  remains the CTO's and is not decided by that row.
 - **Workload, not pod count, was the axis that mattered — and it is still barely sampled.** Five pods
   and four agents found nothing until the one window that ran `pnpm test`. **≈ 61 minutes of
   observation in total**, and a single 24-second burst carried 26 of the 28. Widening needs no new
@@ -504,10 +505,13 @@ record, rather than left implicit in a count.
    broker rollout. The broker retiring the residual *in future* is not the same event as the
    acceptance *failing now*, and merging the two would silently convert a fired trigger into a
    scheduled task.
-4. **Open and unscoped, named so they are not mistaken for handled:** the `PATH`-narrowing class has
-   not been swept for other sites; the predicate ambiguity in §7.1 ("absolute-path" vs "did not
-   transit the wrapper") is unresolved and currently admits reporting this very finding as a zero;
-   and §2.1's calibration question is answered on sign but not on a fleet magnitude.
+4. **Open, named so they are not mistaken for handled:** the `PATH`-narrowing class has not been
+   swept for other sites — owned by [PEN-5012](https://paperclip.blockcast.net/PEN/issues/PEN-5012),
+   filed, not yet done. The predicate ambiguity in §7.1 ("absolute-path" vs "did not transit the
+   wrapper") is unresolved and currently admits reporting this very finding as a zero; that one is
+   **unowned**, because it is a question about what §7.1 means to claim and only the CTO's
+   disposition can settle it. §2.1's calibration question is answered on sign but not on a fleet
+   magnitude.
 5. **Not in scope here, and not done:** no guard, wrapper, credential path or pod security context
    was touched. §8's "not permitted without returning here first" list binds this record as it binds
    every other measurement row.
