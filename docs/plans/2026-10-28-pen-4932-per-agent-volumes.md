@@ -50,7 +50,7 @@ overlay.
 
 Fourteen of those mounts are already namespaced by company / project / agent / workspace path and
 become per-agent claims mechanically. The remaining seven are `ROOT_TOOLCHAIN_SUBPATHS`
-(`job-manifest.ts:632`) — `bin`, `tools`, `jre`, `.local/bin`, `.local/share/paperclip-git-hooks`,
+(`job-manifest.ts`, `const ROOT_TOOLCHAIN_SUBPATHS` — `:636` at `cfc80829`) — `bin`, `tools`, `jre`, `.local/bin`, `.local/share/paperclip-git-hooks`,
 `.bun/bin`, `.cache/puppeteer-browsers` — mounted read-only into every agent pod. **That row is
 the only genuinely cross-agent one, and it is what keeps the shared handle alive.**
 
@@ -219,19 +219,50 @@ resolves a browser through the PVC. The mount holds Chrome `linux-149.0.7827.54`
 the image either, so both variables point at nothing. That is pre-existing and orthogonal to the
 mount; it is recorded here only so the next reader does not mistake it for stage-3 fallout.
 
-**4. Only `bin` and the hooks dir are reachable at all.** Re-confirmed against the live `PATH`: of
-the seven `ROOT_TOOLCHAIN_SUBPATHS` entries, only `/paperclip/bin` is on `PATH` (position 7, ahead
-of `/usr/local/bin` at 9). `.local/bin` and `.bun/bin` are mounted but absent from `PATH`; `tools`
-and `jre` are data directories; `.local/share/paperclip-git-hooks` is reached through
-`core.hooksPath`, not `PATH`. So the entire behavioural surface of stage 3 is `bin` (unshadowing,
-§3.3) plus the hook (relocation, §3.6).
+**4. Every subPath is reachable — `bin` is a hub of symlinks, not a flat directory.** Only
+`/paperclip/bin` is on `PATH` directly (position 7, ahead of `/usr/local/bin` at 9), which makes it
+tempting to call the other six inert. They are not: `bin` holds symlinks *out of itself* into three
+of them, so they are reachable transitively, and item 2's “remove together” rule generalises to all
+of them.
 
-> ⚠️ **This does not make a partial stage 3 worth doing.** Five of the seven subPaths are
-> unreachable, which makes "remove just those five" look like a safe down-payment. It buys
-> **nothing**: every subPath binds the *same* volume handle (`csi-vol-3bdd0e68-…`), and ceph-csi's
-> `IDLocker` keys on the handle, not the bind. Blast radius falls only when the last bind to that
-> handle goes — so a partial removal reduces mount count while leaving lock exposure exactly where
-> it was. Stage 3 is whole or it is nothing.
+| `bin` entry | resolves to | couples |
+|---|---|---|
+| `go`, `gofmt` | `tools/go1.25.6/bin/…` | **`tools`** |
+| `tinygo` | `tools/tinygo0.39.0/bin/tinygo` | **`tools`** |
+| `java` | `jre/bin/java` | **`jre`** |
+| `google-chrome` | `.cache/puppeteer-browsers/chrome/linux-149.0.7827.54/…` | **`.cache/puppeteer-browsers`** |
+
+So the removal units are **`bin` + `tools` + `jre` + `.cache/puppeteer-browsers`** as one group, and
+`.local/bin` + `.bun/bin` as another (`.local/bin/bunx` → `.bun/bin/bun`). The hooks dir is reached
+through `core.hooksPath`, not `PATH`, and is handled in §3.6.
+
+⚠️ **`.local/bin` reachability is deployment-dependent, and both readings are wrong as universals.**
+Chart default puts `<base>/.local/bin` on `PATH` — `paperclip.toolingBinDirs`
+(`deploy/helm/paperclip/templates/_helpers.tpl:309`) emits `<base>/.local/bin,<base>/bin`, and the
+render guard *fails* if `env.path` omits it, because the PVC shell dotfiles then prepend
+`$HOME/.local/bin` ahead of the root-owned wrappers (PEN-3840). Measured 2026-10-29 in a Penstock
+`claude_k8s` agent pod, `/paperclip/.local/bin` is **absent** from `PATH` and `promtool`, `trivy`
+and `cmake` are not found; measured the same day in a Blockcast pod, it is **present** and those
+same binaries resolve to it. Both measurements are real. Stage 3 must therefore treat the
+`.local/bin` drop set as live for at least some pods rather than relying on one pod's `PATH`.
+
+**One version change this hides, and it is not `kubectl`.** On unshadow `tinygo` moves from the
+PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verification list beside
+`kubectl`, along with whatever `.local/bin` stops shadowing wherever it is on `PATH`.
+
+> ⚠️ **A partial stage 3 is still not worth doing — but the reason is not the lock key.** An
+> earlier draft of this section argued that every subPath binds the same handle and ceph-csi's
+> `IDLocker` keys on the handle. That reaches the right answer by the wrong route: subPaths are
+> *kubelet* bind mounts beneath a single per-pod `NodePublishVolume`, so ceph-csi never sees how
+> many subPaths a pod has at all. Exposure scales with **pods × volume**, not with binds.
+>
+> The sharper statement is stronger: **stage 3 reduces lock exposure by exactly zero.** By §3's own
+> inventory the ~14 company-, project-, agent- and workspace-scoped subPaths still bind
+> `paperclip-data` after a *whole* stage 3. Blast radius falls at **stage 4**, when `dataClaimName`
+> is swapped for a per-agent claim — and nowhere else. Stage 3's entire value is being the
+> precondition that makes stage 4 possible, so the test for a proposed partial stage 3 is not "does
+> it reduce exposure" (nothing here does) but "does it satisfy stage 4's precondition". A partial
+> one does not.
 
 ## 4. Staging
 
@@ -259,12 +290,17 @@ and `jre` are data directories; `.local/share/paperclip-git-hooks` is reached th
    commit contains the pin, or run `/usr/local/bin/kubectl version --client` inside one and
    require `v1.35.3`.
 
-   ⚠️ That bump step has a known **silent** failure mode, and it is the last link in the chain so
-   nothing downstream recovers it. BLO-33382 records a ~30 s `paperclip-api` restart returning 503
-   and permanently dropping the bump for three consecutive commits: images built, smoke-tested and
-   promoted to Harbor, cluster refs never advancing, `pending_image_bump` left null so nothing
-   retried. **Verify the deployed ref; do not infer it from a green build.**
-4. **Per-agent claim.** Swap `dataClaimName` (`job-manifest.ts:2666`) to a per-agent PVC, following
+   ⚠️ **Verify the deployed ref; do not infer it from a green build.** The original reason —
+   BLO-33382, where a ~30 s `paperclip-api` restart returned 503 and permanently dropped the bump
+   for three consecutive commits — has since been **fixed in the step itself**: it now retries
+   connection failures and 5xx up to 5× with backoff and then `exit 1`s
+   (`.github/workflows/docker-agent.yml`, the `bump_company` helper). Do not cite it as a live
+   defect. Two reasons to verify survive that fix, both still present today:
+
+   - with no `PAPERCLIP_AGENT_BUMP_TOKEN` the step emits `::warning` and `exit 0` — a **green build
+     that bumps nothing**;
+   - `if: github.event_name != 'workflow_dispatch'` skips the bump entirely on a manual re-run.
+4. **Per-agent claim.** Swap `dataClaimName` (`job-manifest.ts`, the `const dataClaimName =` binding — `:2846` at `cfc80829`) to a per-agent PVC, following
    the existing `opencode-db-<agentId>` precedent (`paperclip.io/pvc-type=agent-db`).
 5. **Demonstrate and re-measure.** PEN-4932's acceptance criterion.
 
