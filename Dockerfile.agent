@@ -34,22 +34,4 @@ COPY --from=server /usr/local/libexec/paperclip/hooks /usr/local/libexec/papercl
 COPY --from=server /opt/penstock/bin/penstock-agent-runtime.mjs /opt/penstock/bin/penstock-agent-runtime.mjs
 COPY --from=server /usr/local/bin/caveman-proxy /usr/local/bin/caveman-proxy
 COPY --from=server /opt/penstock/ponytail /opt/penstock/ponytail
-# PEN-4932. The server image asserts the same property, and this repeats it
-# deliberately: that one proves the bake, this one proves the DELIVERY. These
-# are different images from different bases, and every failure between them —
-# a `--from` stage that resolved to an older server image, a path that drifted
-# on one side only, a later layer shadowing the directory — lands here and is
-# invisible there. This is the image agents actually run, so this is the copy
-# whose absence would stop every push in the fleet at stage 3b-ii.
-#
-# Placed last rather than beside its COPY so it reads the image as shipped,
-# after every other overlay layer has had its chance to clobber the path.
-#
-# See the server Dockerfile for why the test is `-perm -0005` rather than
-# `test -x`, and why the existence check is separate from the find.
-RUN set -eu; \
-  hooks=/usr/local/libexec/paperclip/hooks; \
-  test -f "$hooks/pre-push" || { echo "PEN-4932: $hooks/pre-push did not reach the agent image; the publish guard would refuse every push once the runtime is repointed" >&2; false; }; \
-  offender="$(find "$hooks" \( ! -user root -o ! -perm -0005 -o -perm /022 \) -print -quit)"; \
-  { test -z "$offender" || { echo "PEN-4932: delivered publish guard is not root-owned-and-world-runnable: $offender" >&2; false; }; }
 USER node

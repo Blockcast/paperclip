@@ -1516,35 +1516,99 @@ test("the pre-push hook ships root-owned and executable in both images (PEN-4932
 
 test("the image build asserts the baked guard, not only this test suite (PEN-4932)", () => {
   // The two tests above pin the COPY lines by text. That catches a Dockerfile
-  // edited wrongly; it cannot catch an image built wrongly — a `--from` stage
-  // resolving to a stale server image, a layer shadowing the path, a cache
-  // artefact. The build-time guards are what close that, and they are worth
-  // pinning for the same reason the COPY lines are: deleting one is a one-line
-  // edit whose consequence is invisible until a push fails somewhere else.
-  //
-  // Both images carry their own guard on purpose — the server's proves the
-  // bake, the agent's proves the delivery — so this asserts both, keyed on the
-  // fragments that carry the meaning rather than on whole blocks, which a
-  // reflow of the line continuations would break without changing anything.
-  for (const [name, source] of [
-    ["Dockerfile", fs.readFileSync(path.join(repoRoot, "Dockerfile"), "utf8")],
-    ["Dockerfile.agent", fs.readFileSync(path.join(repoRoot, "Dockerfile.agent"), "utf8")],
-  ]) {
-    assert.ok(
-      source.includes(`hooks=${IMAGE_HOOKS_DIR};`),
-      `${name} no longer runs a build-time check over ${IMAGE_HOOKS_DIR}. Without it the only evidence that the publish guard reached the image is a one-off manual read of one pod.`,
-    );
-    assert.ok(
-      source.includes('test -f "$hooks/pre-push"'),
-      `${name}'s build-time check no longer asserts the launcher EXISTS. The find below it passes vacuously over an empty directory, which is exactly what a mistyped --exclude glob produces.`,
-    );
-    assert.ok(
-      source.includes("! -perm -0005"),
-      `${name}'s build-time check no longer asserts the launcher is readable and executable by OTHER. The build runs as root, for whom a 0700 file looks fine and uid 1000 can neither read nor run it; o+r matters as much as o+x because the kernel hands a #!/bin/sh script to an interpreter that must read it.`,
-    );
-    assert.ok(
-      source.includes("! -user root"),
-      `${name}'s build-time check no longer asserts the launcher is root-owned. Agent-writable is the PEN-3715 property the bake exists to buy over the PVC copy.`,
-    );
-  }
+  // edited wrongly; it cannot catch an image built WRONGLY — a `--from` stage
+  // resolving to a stale server image, a later layer shadowing the path, a
+  // cache artefact. Two different checks close that on the two different
+  // images, and both are worth pinning for the same reason the COPY lines are:
+  // deleting either is a one-line edit whose consequence is invisible until a
+  // push fails somewhere else. What the consumer does on a bad image is the
+  // reason that matters — `runGitEgressRuntime` REFUSES a publish when it
+  // finds no executable pre-push where it looks, so a wrong image does not
+  // degrade, it stops every push in the fleet once stage 3b-ii repoints the
+  // runtime here.
+  const serverDockerfile = fs.readFileSync(path.join(repoRoot, "Dockerfile"), "utf8");
+  const agentDockerfile = fs.readFileSync(path.join(repoRoot, "Dockerfile.agent"), "utf8");
+
+  // (1) The SERVER image proves the BAKE, at build time, where it is cheapest.
+  assert.ok(
+    serverDockerfile.includes(`hooks=${IMAGE_HOOKS_DIR};`),
+    `Dockerfile no longer runs a build-time check over ${IMAGE_HOOKS_DIR}. Without it the only evidence that the publish guard baked is a one-off manual read of one pod.`,
+  );
+  assert.ok(
+    serverDockerfile.includes('test -f "$hooks/pre-push"'),
+    "Dockerfile's build-time check no longer asserts the launcher EXISTS. The find below it passes vacuously over an empty directory, which is exactly what a mistyped --exclude glob produces.",
+  );
+  assert.ok(
+    serverDockerfile.includes("! -perm -0005"),
+    "Dockerfile's build-time check no longer asserts the launcher is readable and executable by OTHER. That RUN is root, for whom a 0700 file looks fine while uid 1000 can neither read nor run it; o+r matters as much as o+x because the kernel hands a #!/bin/sh script to an interpreter that must read it.",
+  );
+  assert.ok(
+    serverDockerfile.includes("! -user root"),
+    "Dockerfile's build-time check no longer asserts the launcher is root-owned. Agent-writable is the PEN-3715 property the bake exists to buy over the PVC copy.",
+  );
+  assert.ok(
+    serverDockerfile.includes("-perm /022"),
+    "Dockerfile's build-time check no longer rejects a group/other-writable launcher. Ownership alone is not the PEN-3715 property: a root-owned 0757 file is still rewritable by the agent.",
+  );
+
+  // (2) The AGENT image proves the DELIVERY — and deliberately NOT with a RUN
+  // of its own. Dockerfile.agent is asserted to be a pure COPY overlay with no
+  // RUN at all (packages/adapter-utils/src/agent-dockerfile.test.ts), and the
+  // google-chrome shim test's reasoning about COPY merge semantics rests on
+  // that invariant, so adding one RUN here is not a local edit. The post-build
+  // lane in docker-agent.yml is the stronger evidence anyway: a build RUN is
+  // root, while the agent spawns the hook as uid 1000, and that lane can run
+  // the check AS uid 1000 against the real pushed image.
+  assert.ok(
+    !agentDockerfile.includes("RUN "),
+    "Dockerfile.agent has grown a RUN. It is asserted to be a pure COPY overlay elsewhere, and the delivery check belongs in docker-agent.yml where it can run as uid 1000 on the built image.",
+  );
+
+  const checkScriptPath = "scripts/check-agent-image-publish-guard.sh";
+  const checkScript = fs.readFileSync(path.join(repoRoot, checkScriptPath), "utf8");
+  assert.ok(
+    checkScript.includes(`hooks=${IMAGE_HOOKS_DIR}`),
+    `${checkScriptPath} no longer reads ${IMAGE_HOOKS_DIR}, so the delivery check measures a different path from the one the COPY above writes.`,
+  );
+  assert.ok(
+    checkScript.includes('test -f "$hooks/pre-push"'),
+    `${checkScriptPath} no longer asserts the launcher EXISTS. Every per-file assertion in it is vacuous over an empty directory.`,
+  );
+  assert.ok(
+    checkScript.includes("test -r") && checkScript.includes("test -x"),
+    `${checkScriptPath} no longer asserts the launcher is both readable AND executable by the running uid. The launcher is a #!/bin/sh script, so the interpreter must read it; -x alone would ship an unrunnable guard.`,
+  );
+  assert.ok(
+    checkScript.includes("! -user root") && checkScript.includes("-perm /022"),
+    `${checkScriptPath} no longer asserts the delivered guard is root-owned and not group/other-writable. That is the PEN-3715 property; without it uid 1000 can rewrite the guard it is subject to.`,
+  );
+
+  const agentWorkflow = fs.readFileSync(
+    path.join(repoRoot, ".github/workflows/docker-agent.yml"),
+    "utf8",
+  );
+  assert.ok(
+    agentWorkflow.includes(checkScriptPath),
+    `.github/workflows/docker-agent.yml no longer runs ${checkScriptPath}. The agent image is then covered only by the text assertions above, which cannot see what the build actually produced.`,
+  );
+  assert.ok(
+    agentWorkflow.includes("for mode in runtime ownership"),
+    ".github/workflows/docker-agent.yml no longer runs BOTH arms of the delivery check. They run as different uids and neither can answer the other's question: runtime asks what uid 1000 can do, ownership asks what it must not be able to do.",
+  );
+  assert.ok(
+    agentWorkflow.includes("PEN-4932 positive controls"),
+    ".github/workflows/docker-agent.yml no longer proves the delivery check reds on a bad image. An assertion with no control that must fail it is indistinguishable from one that cannot fail at all.",
+  );
+
+  // Ordering is the whole value of the lane: the candidate tag is already
+  // pushed by then, so what a red step buys is that the image is never
+  // promoted to `latest-k8s-vendored` and never rolled out to an agent pod.
+  // Below the promotion it would buy nothing.
+  const assertIndex = agentWorkflow.indexOf("Assert the publish guard reached the agent image");
+  const promoteIndex = agentWorkflow.indexOf("Promote verified agent image");
+  assert.ok(assertIndex > -1 && promoteIndex > -1, "docker-agent.yml lost the delivery check or the promotion step.");
+  assert.ok(
+    assertIndex < promoteIndex,
+    "The delivery check now runs after the image is promoted to latest-k8s-vendored. A red verdict then arrives too late to keep the image off agent pods, which is the only thing this lane can buy.",
+  );
 });
