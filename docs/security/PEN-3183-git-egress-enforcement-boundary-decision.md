@@ -617,14 +617,39 @@ Four things a reader should not infer from that paragraph:
    the *paperclip* helper on its own command line and that nothing else writes
    `/etc/gitconfig` — a different claim.
 
-   The expected mechanism is plausible and worth stating so the assertion knows
-   what it is confirming: the helper runs `/usr/bin/gh auth git-credential`;
-   `paperclip-github-token-env` execs the child with **no** token when
-   `PAPERCLIP_GITHUB_BROKER_SOCKET` is set and the token file is absent
-   (`docker/github-wrappers/paperclip-github-token-env:34-45`), which is the
-   brokered agent container; and the broker refuses the whole `auth` verb
-   (`github-publish-broker-policy.ts`), so the helper has nothing to return.
+   ⚠ **Correction (2026-10-29, PEN-4933).** This paragraph previously named
+   `paperclip-github-token-env` as the binary that starves, and routed the
+   answer through the broker's refusal of the `auth` verb. **Neither is on
+   this path.** That wrapper installs to `/usr/local/libexec/paperclip/bin/`
+   (`Dockerfile:674`) and is reached through `PATH` — which is precisely what
+   bypass 4 sidesteps. The system helper is `!/usr/bin/gh auth git-credential`
+   (`Dockerfile.runtime:83`), an **absolute** path, so `PATH` is not consulted
+   and no egress wrapper is involved; and the broker is never asked, because
+   nothing on this path speaks to it. Pointing an assertion at the documented
+   mechanism would have pinned a file the chain does not execute, and stayed
+   green while the real chain broke. Security traced this independently on
+   master `8055be2a6`.
+
+   The real mechanism, which is what the assertion confirms: `/usr/bin/gh` is
+   a symlink to `scripts/gh-token-wrapper.sh` (`Dockerfile.runtime:53-55`), and
+   the decisive conjunct is its `TOKEN_FILE_REQUIRED`, set to `yes` **iff
+   `PAPERCLIP_GITHUB_TOKEN_FILE` is present in the environment** (`:404-406`,
+   tested with `${VAR+x}`, so set-empty counts). `auth git-credential` is not
+   in the exempt list that follows (`:412`), so with the variable set and the
+   file absent the wrapper reaches `reject_token_file "is absent"` (`:525`) and
+   exits non-zero. With the variable **unset** it falls through to
+   `exec_real_gh` (`:528`) under whatever ambient auth exists.
    ⚠ That is why it **probably** starves, which is the standard §5 rejects.
+
+   **The failure mode to guard is quiet and looks like tidying up.** Both of
+   the fallbacks below resolve on that same single conjunct, so removing the
+   mount *and* the now-dangling `PAPERCLIP_GITHUB_TOKEN_FILE` together — the
+   variable points at a path that no longer exists, so deleting it reads as
+   correct — silently flips the wrapper from *refuse* to *fall back to
+   unwrapped auth*, with no error anywhere. The assertion must therefore pin
+   the rendered brokered manifest (variable **present**) **and** the wrapper's
+   non-zero exit for an absent file: either half alone passes while the pair
+   is broken.
    Two fallbacks remain unasserted and either one re-authenticates the
    unguarded binary with the mount already gone: `gh.real` resolving an ambient
    `GH_TOKEN`/`GITHUB_TOKEN`, and a stale `~/.config/gh/hosts.yml` — the
