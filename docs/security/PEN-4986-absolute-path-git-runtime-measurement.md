@@ -98,22 +98,31 @@ the wrapper. The instrument was proved able to see the opposite and did not see 
 is not a fleet census and must not be quoted as one. The generalisation that *is* available comes
 from splitting the sources of a git invocation in an agent pod into two:
 
-- **Image- and harness-resident callers — common to every agent pod, and censused.** A literal and
+- **Image- and harness-resident callers — censused.** A literal and
   dynamic-construction census of `/opt/paperclip-bundled-adapters`, `/usr/local/lib/node_modules`,
   `/usr/local/libexec/paperclip`, `/usr/lib/git-core`, `/etc/profile.d` and the Claude Code runtime
   found **15** occurrences of the string `/usr/bin/git`, **all of them inside the egress-control
   machinery itself** — comments, type declarations, the wrapper's own `exec` line, and
   `DEFAULT_GIT_BINARY`. **Zero** exec sites outside the wrapper. The Claude Code harness contains
   none at all; the only other `/usr/bin` references found belong to the Gemini CLI's sandbox-profile
-  allowlists and are not git call sites. Because the image is identical across the fleet, this half
-  *does* generalise.
+  allowlists and are not git call sites.
+
+  ⚠ **This half does not generalise structurally.** This bullet first said it did, "because the
+  image is identical across the fleet". That is false, and PEN-4989 measured it: **106** distinct
+  agent image digests ran in the 7 days to 2026-10-29, **17** in the last 24 h, and for **38.2 %**
+  of that week more than one image was live at the same instant. What carries the census is
+  *sampling* — PEN-4989 re-ran it on a second image and reproduced all 15 occurrences exactly, so
+  it stands at **2 of 106 images**. Strong evidence the egress machinery is stable across rebuilds;
+  not a fleet census, and it must not be cited as one. See
+  [`PEN-4989-absolute-path-git-population-widening.md`](./PEN-4989-absolute-path-git-population-widening.md) §3.
 - **Agent-composed shell — per-pod, and measured in one pod only.** An agent can compose
   `/usr/bin/git` into a shell snippet at runtime. That is the half this measurement covers for one
   pod and cannot cover for the others.
 
-So the honest statement is: the fleet-constant half is zero by census, and the fleet-variable half
-is zero in the one pod observed. §7.1's assumption is tested, not assumed — but it is not yet a
-fleet census, and this document should not be cited as though it were.
+So the honest statement is: the image-resident half is zero by census in 2 of the 106 images that
+ran that week, and the per-pod half is zero in the pods observed — one here, a second in PEN-4989,
+both of them the **same agent and workload**. §7.1's assumption is tested, not assumed — but it is
+not a fleet census, and this document should not be cited as though it were.
 
 **A second gap, worth more than the first.** Because no exec-level telemetry is deployed, **the
 fleet cannot currently detect trigger 4 firing in production.** If an absolute-path `git` ran in
@@ -123,8 +132,15 @@ substitute for it, not a replacement.
 
 ## 5. Re-running
 
-Re-take this whenever the agent image or the PATH layout changes — a result is only ever a statement
-about the image and pod it ran in.
+Re-take this when the **egress-relevant surface** changes — the wrapper, the runtime it `exec`s, the
+credential helper, the real binary, and the PATH ordering that decides which a bare `git` reaches.
+A result is only ever a statement about the image and pod it ran in.
+
+This section first said "whenever the agent image or the PATH layout changes". At ≈15 image changes
+a day (PEN-4989 §3) that trigger is always firing and so gets ignored, which is the failure PEN-4988
+exists to prevent. `scripts/absolute-path-git-fingerprint.mjs` hashes the narrower surface, so
+staleness is a comparison: a run whose fingerprint matches may cite this measurement, one whose
+fingerprint differs must re-take it.
 
 ```sh
 cp /usr/bin/git /tmp/git-calib            # calibration copy; NOT /usr/bin/git itself
