@@ -639,12 +639,16 @@ Four things a reader should not infer from that paragraph:
 
 ### 7.4 Env-delivered credentials: the seat-token route stays refused, not routed (decided 2026-10-29)
 
-⚠ **Status, so this section is not misread as a description of master.** What follows decides a
-change that is **not merged**. The refusal lives in #3089 (PEN-4933), open at this writing;
-neither `buildJobManifest` nor §7.3 refuses anything on master today. Every "the refusal" below
-means *the refusal #3089 proposes, which this section rules should stay* — nothing here asserts a
-control that exists. Asserting a boundary that is not there is the failure D7 exists to prevent,
-and it would be a poor way to record D7.
+⚠ **Status.** This section was written while the change it decides was still open, and said so.
+It has since landed: #3089 (PEN-4933) merged, so `buildJobManifest` **does** now refuse to render
+the broker when an agent-env GitHub credential would land on the agent container, and §7.3's
+opening item, *the credential Secret is not the credential*, records it. Every "the refusal" below means
+that refusal, which this section rules should stay. The decision itself is unchanged by the merge
+— only this status note is. Note what the refusal is **not**: it is a manifest-render refusal, so
+it binds the `env:`/`secretKeyRef` names a PodSpec carries, and **not** `envFrom.secretRef`, whose
+keys live in the Secret rather than the manifest (§7.3's successor-residual item). Asserting a
+boundary that is not there is the failure D7 exists to prevent, and it would be a poor way to
+record D7.
 
 > **Citation convention.** §7.3's items are cited below by their **bold titles**, never by number.
 > #3089 inserts a new first item and renumbers the rest, so a numeric reference would silently
