@@ -2,7 +2,7 @@ import type { Request, Response } from "express";
 import type { HumanCompanyMembershipRole } from "@paperclipai/shared";
 import { forbidden, HttpError, unauthorized } from "../errors.js";
 import { logger } from "../middleware/logger.js";
-import { normalizeHumanRole } from "../services/company-member-roles.js";
+import { membershipRoleIsNonViewer, normalizeHumanRole } from "../services/company-member-roles.js";
 import { responsibleUserAuthzShadowMode, type AuthorizationDecision } from "../services/authorization.js";
 
 function throwOrShadowResponsibleUserCompanyAccessDeny(
@@ -96,7 +96,15 @@ export function assertCompanyAccess(req: Request, companyId: string) {
     }
     const method = typeof req.method === "string" ? req.method.toUpperCase() : "GET";
     const isSafeMethod = ["GET", "HEAD", "OPTIONS"].includes(method);
-    if (!isSafeMethod && membership.membershipRole === "viewer") {
+    // PEN-3954. One shared predicate rather than a raw role comparison: this
+    // bar, the board bar below, `routes/tool-access.ts` and
+    // `routes/tool-gateway.ts` all ask the same question and must give the
+    // same answer. A bare `role === "viewer"` test counted BOTH `null` and
+    // `support` as non-viewer and ADMITTED the write; both are now denied —
+    // `null` because `updateCompanyMemberSchema` accepts it and the
+    // member-update path writes it straight through, `support` because
+    // PEN-4964 ruled a cloud-tenant support principal read-only.
+    if (!isSafeMethod && !membershipRoleIsNonViewer(membership.membershipRole)) {
       throwOrShadowResponsibleUserCompanyAccessDeny(
         req,
         companyId,
@@ -117,7 +125,9 @@ export function assertCompanyAccess(req: Request, companyId: string) {
       if (!membership || membership.status !== "active") {
         throw forbidden("User does not have active company access");
       }
-      if (membership.membershipRole === "viewer") {
+      // Same predicate as the `onBehalfOf` bar above and the two tool bars
+      // (PEN-3954). `null` and `support` both land as `viewer` and are denied.
+      if (!membershipRoleIsNonViewer(membership.membershipRole)) {
         throw forbidden("Viewer access is read-only");
       }
     }

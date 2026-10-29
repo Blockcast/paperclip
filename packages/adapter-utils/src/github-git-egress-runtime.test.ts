@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -14,6 +14,7 @@ import {
   hooksDirectory,
   makeGitReader,
   readStdin,
+  repoGatesOnDco,
   type HookStdin,
   runGitEgressRuntime,
   runPrePushHook,
@@ -43,6 +44,7 @@ const HOOKS = "/hooks";
  * that are not about that case assert the precondition holds.
  */
 const PRESENT = { hooksDir: HOOKS, hookPresent: () => true };
+const DCO = { requiresSignoff: () => true };
 
 /** Real git, or null when this environment has none to drive. */
 const GIT = spawnSync("git", ["--version"], { encoding: "utf8" }).status === 0 ? "git" : null;
@@ -92,12 +94,21 @@ describe("buildGitArgv", () => {
     // branch is force-pushed. `--signoff` takes the committer identity, which
     // the run's GIT_COMMITTER_* overlay already pins to the same values git
     // stamps on the commit, so the match the gate wants is structural.
-    expect(buildGitArgv(["commit", "-m", "x"], { ...PRESENT })).toEqual([
+    expect(buildGitArgv(["commit", "-m", "x"], { ...PRESENT, ...DCO })).toEqual([
       "commit",
       "--signoff",
       "-m",
       "x",
     ]);
+  });
+
+  it("leaves a commit unsigned in a repository with no DCO gate", () => {
+    // BLO-40682: global injection certified the DCO on a fork of a third-party
+    // upstream. Absent or false `requiresSignoff` must leave argv untouched.
+    expect(buildGitArgv(["commit", "-m", "x"], { ...PRESENT })).toEqual(["commit", "-m", "x"]);
+    expect(
+      buildGitArgv(["commit", "-m", "x"], { ...PRESENT, requiresSignoff: () => false }),
+    ).toEqual(["commit", "-m", "x"]);
   });
 
   it("puts --signoff AFTER the subcommand and ahead of the caller's own arguments", () => {
@@ -108,6 +119,7 @@ describe("buildGitArgv", () => {
     // pathspec.
     const argv = buildGitArgv(["-C", "/repo", "commit", "--amend", "--", "file"], {
       ...PRESENT,
+      ...DCO,
     });
     expect(argv).toEqual(["-C", "/repo", "commit", "--signoff", "--amend", "--", "file"]);
     expect(argv.indexOf("--signoff")).toBeGreaterThan(argv.indexOf("commit"));
@@ -128,6 +140,7 @@ describe("buildGitArgv", () => {
     expect(
       buildGitArgv(["ci", "-m", "x"], {
         ...PRESENT,
+        ...DCO,
         resolveAlias: (name) => (name === "ci" ? "commit" : null),
       }),
     ).toEqual(["ci", "-m", "x"]);
@@ -318,9 +331,16 @@ describe.skipIf(!GIT)("--signoff against a real repository", () => {
   const NAME = "BackendEngineerGo";
   const EMAIL = "backendengineergo@paperclip.blockcast.net";
 
-  function commitWith(argv: readonly string[]): { message: string; ident: string } {
+  function commitWith(
+    argv: readonly string[],
+    dcoGate = true,
+  ): { message: string; ident: string } {
     const repo = tempDir("git-egress-signoff-");
     execFileSync("git", ["init", "-q", repo]);
+    if (dcoGate) {
+      mkdirSync(path.join(repo, ".github", "workflows"), { recursive: true });
+      writeFileSync(path.join(repo, ".github", "workflows", "dco-check.yml"), "name: DCO\n");
+    }
     const env = {
       ...process.env,
       GIT_AUTHOR_NAME: NAME,
@@ -328,7 +348,11 @@ describe.skipIf(!GIT)("--signoff against a real repository", () => {
       GIT_COMMITTER_NAME: NAME,
       GIT_COMMITTER_EMAIL: EMAIL,
     };
-    execFileSync("git", buildGitArgv(argv, { ...PRESENT }), { cwd: repo, env });
+    const requiresSignoff = () => repoGatesOnDco(repo);
+    // The real binary, not PATH's `git`: inside an agent pod PATH resolves to the
+    // deployed egress wrapper, which would apply its own sign-off policy on top.
+    const realGit = existsSync(DEFAULT_GIT_BINARY) ? DEFAULT_GIT_BINARY : "git";
+    execFileSync(realGit, buildGitArgv(argv, { ...PRESENT, requiresSignoff }), { cwd: repo, env });
     const read = (format: string) =>
       execFileSync("git", ["-C", repo, "log", "-1", `--format=${format}`], {
         encoding: "utf8",
@@ -366,6 +390,14 @@ describe.skipIf(!GIT)("--signoff against a real repository", () => {
     ]);
     expect(dcoPasses(message, ident)).toBe(true);
     expect(message.match(/^Signed-off-by:/gim)).toHaveLength(1);
+  });
+
+  it("adds no sign-off in a repository without a DCO workflow", () => {
+    // BLO-40682: a fork of a third-party upstream must not get a certification
+    // the agent never made.
+    const { message, ident } = commitWith(["commit", "--allow-empty", "-m", "subject"], false);
+    expect(dcoPasses(message, ident)).toBe(false);
+    expect(message).not.toMatch(/^Signed-off-by:/im);
   });
 
   it("lets an explicit --no-signoff win", () => {
@@ -517,7 +549,7 @@ describe("publishing verbs other than `push` (PEN-3156)", () => {
     // `commit` belongs to the same control — it must not be refused — but it is
     // the one allowlisted verb this wrapper rewrites, so it is asserted apart
     // from the identity loop rather than dropped from the coverage.
-    expect(buildGitArgv(["commit", "-m", "x"], { ...PRESENT })).toEqual([
+    expect(buildGitArgv(["commit", "-m", "x"], { ...PRESENT, ...DCO })).toEqual([
       "commit",
       "--signoff",
       "-m",

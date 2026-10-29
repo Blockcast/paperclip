@@ -129,7 +129,7 @@ describe("recovery chain per-pass timing wiring (PEN-4381)", () => {
     expect(indexSrc).toContain("recoveryChainId: chainTimer.chainId,");
     // ...the wrapper forwards it to the recovery service...
     expect(heartbeatSrc).toMatch(
-      /async function reconcileStrandedAssignedIssues\(opts\?: \{ recoveryChainId\?: string \}\)/,
+      /async function reconcileStrandedAssignedIssues\(opts\?: \{ recoveryChainId\?: string; shouldStop\?: \(\) => boolean \}\)/,
     );
     expect(heartbeatSrc).toContain("recoveryChainId: opts?.recoveryChainId,");
     // ...and the service puts it on the line that the join actually needs.

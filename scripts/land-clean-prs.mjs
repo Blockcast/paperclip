@@ -95,6 +95,34 @@ import {
  */
 export const STALE_ENQUEUE_HOURS = 13;
 
+/**
+ * How long a head may go without reporting before a hold still standing on it
+ * is reported as durable rather than in flight.
+ *
+ * Note what that is NOT: it is not how long the hold has stood. Nothing cheap
+ * dates a hold's onset, and `judgeableAgeHours` explains why the head clock is
+ * the right proxy anyway. A row that acquired its hold this fire, on CI that
+ * finished yesterday, is reported — correctly, because the question is whether
+ * the verdict has been available and unacted-on, not who noticed when.
+ *
+ * The classifier already names a reason for every PR it does not enqueue, so
+ * nothing here is newly discovered — what is missing is DURATION. A row that
+ * has read `codeowner-review-requested` for three days and one that acquired
+ * the same reason four minutes ago are byte-identical in the receipt, and a
+ * fire only ever shows the instant it ran. The tail that results is invisible
+ * by construction: measured 2026-10-29 on Blockcast/paperclip, two of the four
+ * oldest unlanded PRs carried holds that could not clear on their own (#3051
+ * waiting on a code owner since 2026-10-27, #3032 red on the non-required
+ * `review` check since 2026-10-26), and nothing anywhere said how long.
+ *
+ * 13h, matching STALE_ENQUEUE_HOURS and for the same reason: it clears a
+ * normal overnight queue without waiting a second working day. It is also ~2x
+ * the create->merge spread measured over the 12 most recent merges on that
+ * repo the same day (2.2-6.8h), so a hold still standing at this age is past
+ * every landing that repo actually performs.
+ */
+export const STALE_HOLD_HOURS = 13;
+
 export const CODEOWNER_REQUEST_MARKER = "<!-- landing-routine:codeowner-request -->";
 export const STALE_ENQUEUE_MARKER = "<!-- landing-routine:stale-enqueue -->";
 
@@ -340,12 +368,201 @@ export function allyVerdictAtHead(pr) {
 }
 
 /**
- * Requested reviewers with no APPROVED review at the current head.
+ * The GitHub-documented CODEOWNERS locations, in GitHub's own precedence
+ * order. The first file that exists is the only one that applies.
+ */
+export const CODEOWNERS_PATHS = [".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"];
+
+/** Files past this count mean GitHub truncated the diff listing, not that the PR is small. */
+export const MAX_PR_FILES = 3000;
+
+/**
+ * `@login` -> `login`, `@org/team` -> `team:team`, so an owner token compares
+ * directly against what `unsatisfiedOwners` builds from `reviewRequests`.
+ * An email owner normalises to itself and simply never matches a request,
+ * which is correct: an email in CODEOWNERS requests nobody.
+ */
+function normalizeOwner(owner) {
+  const raw = String(owner ?? "").replace(/^@/, "");
+  const slash = raw.indexOf("/");
+  return slash === -1 ? raw : `team:${raw.slice(slash + 1)}`;
+}
+
+/**
+ * Translates one CODEOWNERS pattern into an anchored RegExp.
+ *
+ * The syntax is gitignore's, and the two rules that matter here are the ones
+ * the repo's own CODEOWNERS relies on and a naive glob gets wrong:
+ *
+ * - A pattern with NO slash matches at **any depth**. `package.json` owns
+ *   `packages/adapters/acpx-local/package.json`, which is exactly why the
+ *   checked-in file carries a comment saying so.
+ * - A slash anywhere but the end anchors to the repo root. `scripts/release*.sh`
+ *   does not reach `scripts/nested/release-x.sh`, because `*` stops at `/`.
+ */
+export function codeownersPatternToRegExp(pattern) {
+  let body = String(pattern ?? "");
+  const dirOnly = body.endsWith("/");
+  if (dirOnly) body = body.slice(0, -1);
+  const rooted = body.startsWith("/");
+  if (rooted) body = body.slice(1);
+  // A slash anywhere but the end still anchors; only a bare name floats.
+  const anchored = rooted || body.includes("/");
+
+  // Scanned rather than chain-replaced. A `.replace` pass that rewrites `*`
+  // after having already emitted `.*` for `**` cannot tell its own output from
+  // the input, and any lookbehind guarding against that also fires on a
+  // legitimate `*` following an escaped literal dot.
+  let source = "";
+  for (let i = 0; i < body.length; i += 1) {
+    const char = body[i];
+    if (char === "*") {
+      if (body[i + 1] === "*") {
+        const atStart = i === 0;
+        const slashBefore = body[i - 1] === "/";
+        const slashAfter = body[i + 2] === "/";
+        const atEnd = i + 2 === body.length;
+        if (slashBefore && slashAfter) {
+          // `a/**/b` spans zero or more whole segments. The `/` is already emitted.
+          source += "(?:.+/)?";
+          i += 2;
+        } else if (slashBefore && atEnd) {
+          source += ".*"; // `a/**` owns everything beneath `a/`
+          i += 1;
+        } else if (atStart && slashAfter) {
+          source = "(?:.*/)?"; // `**/b` floats to any depth
+          i += 2;
+        } else {
+          // gitignore: "other consecutive asterisks are considered regular
+          // asterisks". `a**b` is therefore confined to one segment, where
+          // `.*` would have crossed `/` and owned paths gitignore does not.
+          source += "[^/]*";
+          i += 1;
+        }
+        continue;
+      }
+      source += "[^/]*";
+      continue;
+    }
+    if (char === "?") {
+      source += "[^/]";
+      continue;
+    }
+    source += char.replace(/[.+^${}()|[\]\\]/, "\\$&");
+  }
+
+  const prefix = anchored ? "^" : "^(?:.*/)?";
+  // A directory pattern owns its contents; so does a bare name that turns out
+  // to be a directory, which is why the non-`dirOnly` tail is optional.
+  const suffix = dirOnly ? "/.*$" : "(?:/.*)?$";
+  return new RegExp(`${prefix}${source}${suffix}`);
+}
+
+/**
+ * Drops the trailing comment from one CODEOWNERS line.
+ *
+ * A `#` escaped as `\#` is a literal `#` belonging to the pattern, not the
+ * start of a comment, so a blanket `/#.*$/` strip truncates such a pattern
+ * into a different -- and silently wider or narrower -- one.
+ */
+export function stripCodeownersComment(line) {
+  let out = "";
+  for (let i = 0; i < line.length; i += 1) {
+    if (line[i] === "\\" && line[i + 1] === "#") {
+      out += "#"; // escaped, so it is part of the pattern
+      i += 1;
+      continue;
+    }
+    if (line[i] === "#") break;
+    out += line[i];
+  }
+  return out.trim();
+}
+
+/**
+ * Parses CODEOWNERS text into rules in file order. Callers must apply
+ * LAST-match-wins, which is GitHub's precedence and the opposite of what a
+ * `find`-style first-match loop does.
+ */
+export function parseCodeowners(text) {
+  return String(text ?? "")
+    .split("\n")
+    .map((line) => stripCodeownersComment(line))
+    .filter((line) => line.length > 0)
+    .map((line) => line.split(/\s+/))
+    .filter((fields) => fields.length > 1)
+    .map(([pattern, ...owners]) => ({
+      pattern,
+      matcher: codeownersPatternToRegExp(pattern),
+      owners: owners.map(normalizeOwner).filter((owner) => owner.length > 0),
+    }));
+}
+
+/**
+ * The owner tokens CODEOWNERS assigns to `files`, lowercased.
+ *
+ * Last match wins PER FILE, then the per-file winners are unioned: a PR
+ * touching two differently-owned paths owes both owners.
+ */
+export function ownersForFiles(files, rules) {
+  const owners = new Set();
+  for (const file of files ?? []) {
+    const path = String(file ?? "");
+    let winner = null;
+    for (const rule of rules ?? []) if (rule.matcher.test(path)) winner = rule;
+    for (const owner of winner?.owners ?? []) owners.add(lower(owner));
+  }
+  return owners;
+}
+
+/**
+ * Owner tokens this PR's CURRENT diff actually owes, or `null` when that
+ * cannot be determined.
+ *
+ * `null` is load-bearing and must stay distinguishable from the empty set.
+ * This script's output is "merge it", so an unreadable CODEOWNERS or a
+ * truncated file list has to fall back to the old, over-holding behaviour —
+ * never to "nobody is owed", which would enqueue every held PR at once.
+ */
+export function impliedOwners(pr) {
+  const rules = pr?.codeownerRules;
+  const files = pr?.files;
+  if (!Array.isArray(rules) || !Array.isArray(files)) return null;
+  if (files.length >= MAX_PR_FILES) return null;
+  return ownersForFiles(files, rules);
+}
+
+/**
+ * Requested reviewers with no APPROVED review at the current head, scoped to
+ * the ones CODEOWNERS still names for this PR's current file list.
  *
  * D7: GitHub does not enforce CODEOWNERS on this repo, so an outstanding owner
  * request is a real gate that only this script observes. A team request can
  * never be satisfied by a login match and so always counts as outstanding,
  * which is correct — a team has not reviewed until one of its members has.
+ *
+ * PEN-3474: `reviewRequests` on its own is the WRONG set to hold on, in two
+ * measured ways, and both are permanent because nothing ever clears them.
+ *
+ * 1. **A request GitHub never withdraws.** GitHub auto-requests code owners
+ *    when a PR opens and does NOT withdraw the request when a force-push takes
+ *    the owned file back out of the diff. #3067 opened touching
+ *    `.github/workflows/pr.yml`, was auto-requested to `@kkroo` two seconds
+ *    later, then force-pushed down to one file that no rule matches — and this
+ *    function still reported `kkroo`, so a green PR held forever on an owner
+ *    who owns nothing in it. GraphQL's `asCodeOwner` does not see this either:
+ *    it read `true` on #3067 at the same instant, because GitHub stamps it at
+ *    request time and never recomputes it.
+ * 2. **A request no review can satisfy.** The `allyblockcast` *User* seat
+ *    (id 296676656) is a different principal from the `allyblockcast[bot]` App
+ *    (id 290875700) that submits every review, so the login never matches; at
+ *    the time of filing that pinned 70 of 124 open PRs. CODEOWNERS names only
+ *    `@kkroo`, so such a request is not code-owner-derived and is now dropped
+ *    by construction.
+ *
+ * This does NOT weaken a deliberate human hold, because a review request was
+ * never the instrument for one: `SKIP_LABELS` and draft state are, both
+ * machine-readable and both withdrawable by the human who set them.
  *
  * This matches on `commit_id` rather than a body attestation because a human
  * approval carries no attestation to read. That inherits GitHub's own
@@ -364,11 +581,15 @@ export function unsatisfiedOwners(pr) {
       )
       .map((review) => lower(review?.user?.login)),
   );
-  return (pr?.reviewRequests ?? [])
+  const outstanding = (pr?.reviewRequests ?? [])
     .map((request) =>
       request?.login ? String(request.login) : request?.slug ? `team:${request.slug}` : null,
     )
     .filter((who) => who !== null && !approved.has(lower(who)));
+
+  const implied = impliedOwners(pr);
+  if (implied === null) return outstanding;
+  return outstanding.filter((who) => implied.has(lower(who)));
 }
 
 /**
@@ -405,6 +626,24 @@ function approvalNote(pr) {
 }
 
 /**
+ * When the newest row in this rollup last reported, or `null` when nothing in
+ * it carries a parseable timestamp.
+ *
+ * Shared by the settle floor below and by `judgeableAgeHours`, because the two
+ * are the same clock read at opposite ends: the floor refuses a rollup that
+ * reported too RECENTLY to be believed, and the stale-hold report names one
+ * that has reported nothing SINCE, for long enough that the hold cannot still
+ * be in flight. Deriving them from one function is what keeps "the moment this
+ * head became judgeable" a single definition rather than two that drift.
+ */
+export function newestCheckStamp(rollup) {
+  const stamps = (rollup ?? [])
+    .map((c) => Date.parse(c?.completedAt || c?.startedAt || c?.createdAt || ""))
+    .filter((at) => Number.isFinite(at));
+  return stamps.length === 0 ? null : Math.max(...stamps);
+}
+
+/**
  * Whether an all-green rollup has been green long enough to believe.
  *
  * Two ways it has not. A rollup with zero rows is a stop, not a pass: the two
@@ -425,11 +664,9 @@ export function checkSettlement(
   { now = Date.now(), settleMinutes = CHECK_SETTLE_MINUTES } = {},
 ) {
   if ((rollup ?? []).length === 0) return { settled: false, reason: "none" };
-  const stamps = (rollup ?? [])
-    .map((c) => Date.parse(c?.completedAt || c?.startedAt || c?.createdAt || ""))
-    .filter((at) => Number.isFinite(at));
-  if (stamps.length === 0) return { settled: true };
-  const ageMinutes = (now - Math.max(...stamps)) / 60_000;
+  const newest = newestCheckStamp(rollup);
+  if (newest === null) return { settled: true };
+  const ageMinutes = (now - newest) / 60_000;
   if (ageMinutes < settleMinutes) {
     return {
       settled: false,
@@ -598,6 +835,17 @@ export function isFatalGhError(message) {
   );
 }
 
+/**
+ * A `gh` failure that is specifically "this path does not exist".
+ *
+ * Deliberately narrow: `gh api` always spells the status as `(HTTP 404)`, and
+ * a caller that falls through on anything looser would treat an outage as an
+ * absence. Everything it cannot positively identify reads as unknown.
+ */
+export function isNotFoundGhError(message) {
+  return /HTTP 404/i.test(String(message ?? ""));
+}
+
 export function renderReceipt(rows) {
   const lines = [
     "| PR | action | reason | detail |",
@@ -616,11 +864,169 @@ export function renderReceipt(rows) {
   return lines.join("\n");
 }
 
+/**
+ * Hold reasons that are a deliberate "not this one" rather than a strand.
+ *
+ * A draft PR open for a fortnight, a `do-not-merge` label and a human-authored
+ * PR are all states someone CHOSE, and the landing routine has no standing to
+ * age them. Reporting them would also swamp the cohort: those three rows are
+ * the common case on a busy repo, so a detector that counted them would be
+ * read once and then ignored, which is the failure mode of every alarm that
+ * fires on its own normal operation.
+ *
+ * `cap:` is here for that last reason rather than the first. It is not a
+ * choice, it is `classifyAll` rewriting an over-budget `enqueue` into a skip —
+ * a PR the NEXT fire takes. It ages like a strand because the budget is spent
+ * on PRs whose CI finished more recently, so the deferred rows are precisely
+ * the ones with the oldest check stamps. Aging it would fire this report
+ * hardest exactly when the queue is deepest and the routine is working
+ * normally.
+ */
+const DELIBERATE_HOLD_REASON_RE = /^(?:human-author|draft|label:|cap:)/;
+
+/** Rows that are an action or a self-clearing wait, not a hold to be aged. */
+const NON_HOLD_ACTIONS = new Set([
+  "enqueue",
+  "already-enqueued",
+  // Has its own standing cohort (`reportRotted`) with its own semantics; aging
+  // it here would report the same PR twice under two different names.
+  "approval-rotted",
+  // A wedged auto-merge request is already reported AS a staleness finding by
+  // `classifyFromListing`, which has a better clock for it than this one: the
+  // request's own `enabledAt`.
+  "stale-enqueue",
+]);
+
+/**
+ * Hours since this PR's head last became judgeable, or `null` when nothing
+ * dates it.
+ *
+ * ## Why this clock and not the PR's age
+ *
+ * Creation time is the obvious choice and it is WRONG, in the direction that
+ * costs most: it manufactures findings. Measured 2026-10-29 on
+ * Blockcast/paperclip, #3089 and #3085 were 9.2h and 9.8h old against a
+ * 2.2-6.8h create->merge spread, which reads as a flagrant strand. Both had
+ * moved their heads that morning (08:05Z, 07:03Z) and their CI had finished
+ * minutes before the measurement (09:27Z, 09:01Z) — they had been judgeable
+ * for 2.3h and 2.7h, comfortably INSIDE the window, and both classified
+ * `enqueue` at the next read. A creation clock names them; this one does not.
+ *
+ * That is not a tuning difference. A PR's age is the age of its oldest
+ * abandoned attempt, and every push resets what the classifier is actually
+ * looking at: the rollup, the review attestation and the merge state are all
+ * properties of the CURRENT head. The honest question is "how long has this
+ * verdict been available and unchanged", and the newest check stamp is the
+ * only cheap answer to it — `checkSettlement` already computes it for the
+ * settle floor, so this costs no extra API call.
+ *
+ * Uses the mirror-filtered rollup for the same reason `failingChecks` does: an
+ * Ally verdict mirror posted after CI finished would otherwise reset this
+ * clock on a hold that has not moved (the #1981 shape).
+ */
+export function judgeableAgeHours(pr, { now = Date.now() } = {}) {
+  const newest = newestCheckStamp(withoutAllyVerdictMirrors(pr?.statusCheckRollup));
+  return newest === null ? null : (now - newest) / 3_600_000;
+}
+
+/**
+ * The held PRs whose hold has outlived the window in which this repo lands
+ * anything, as `{ number, reason, ageHours }`.
+ *
+ * `ageHours` is `null` when the PR could not be dated, and such a row is
+ * REPORTED rather than dropped. Dropping it is the §4l shape — an instrument
+ * that cannot see something reporting clean — and the undatable case is
+ * exactly the one worth hearing about, because a held PR whose rollup carries
+ * no timestamp at all is a PR on which nothing ever ran.
+ *
+ * Takes both arrays rather than a field on the row because the row shape is
+ * the receipt's contract and several callers deep-compare it; joining on
+ * `number` keeps the classifier pure and this report additive.
+ */
+export function stalledHolds(prs, rows, { now = Date.now(), staleHours = STALE_HOLD_HOURS } = {}) {
+  const byNumber = new Map((prs ?? []).map((pr) => [pr?.number, pr]));
+  const held = [];
+  for (const row of rows ?? []) {
+    if (NON_HOLD_ACTIONS.has(row?.action)) continue;
+    if (DELIBERATE_HOLD_REASON_RE.test(String(row?.reason ?? ""))) continue;
+    const ageHours = judgeableAgeHours(byNumber.get(row?.number), { now });
+    if (ageHours !== null && ageHours < staleHours) continue;
+    held.push({ number: row?.number, reason: row?.reason, ageHours });
+  }
+  return held;
+}
+
+/** The stale-hold block for one repo's receipt, or "" when there is none. */
+export function renderStalledHolds(repo, held, { staleHours = STALE_HOLD_HOURS } = {}) {
+  if ((held ?? []).length === 0) return "";
+  const line = ({ number, reason, ageHours }) =>
+    `  ${repo}#${number} — \`${reason}\`, ` +
+    (ageHours === null ? "age unknown (no dated check on this head)" : `${ageHours.toFixed(1)}h`);
+  return (
+    `stale-hold (judgeable >${staleHours}h, still held) — ${held.length}:\n` +
+    held.map(line).join("\n") +
+    "\nThe age is time since this head last reported, not time the hold has " +
+    "stood — a hold acquired this fire on old CI still counts. Each row " +
+    "already carries its reason above; what is new is that the reason has " +
+    "stopped being a wait. Act on it or say why it stands."
+  );
+}
+
 const PR_LIST_FIELDS =
   "number,headRefOid,author,labels,isDraft,autoMergeRequest,mergeStateStatus,reviewRequests";
 
 function gh(args) {
   return execFileSync("gh", args, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+}
+
+/**
+ * The repo's CODEOWNERS rules, or `null` when none could be read.
+ *
+ * `null` must stay distinguishable from `[]`: a repo with no CODEOWNERS owes
+ * nobody, while a repo whose CODEOWNERS could not be fetched is unknown, and
+ * `impliedOwners` falls back to over-holding on the second. Reading it from
+ * the DEFAULT branch rather than the PR head is deliberate — a PR must not be
+ * able to edit its own ownership rules into a weaker hold.
+ */
+export function fetchCodeownerRules(repo, run = gh) {
+  for (const path of CODEOWNERS_PATHS) {
+    let response;
+    try {
+      response = JSON.parse(run(["api", `repos/${repo}/contents/${path}`]));
+    } catch (error) {
+      // ONLY "this location has no CODEOWNERS" may try the next one. A 5xx, a
+      // 403 or a transport failure on a HIGHER-precedence path must not fall
+      // through and silently adopt a lower-precedence file's rules, so
+      // anything not positively identified as a 404 is unreadable => `null`.
+      if (isNotFoundGhError(error?.stderr?.toString() || error?.message || String(error))) {
+        continue;
+      }
+      return null;
+    }
+    const { content, encoding } = response ?? {};
+    // A directory at this path answers with an array and no `content`; that is
+    // not a CODEOWNERS file, so the next location still applies.
+    if (typeof content !== "string") continue;
+    // Blobs over 1 MB are not inlined: the API answers `content: ""` with
+    // `encoding: "none"`. That decodes to `""` and parses to `[]` -- the
+    // "measured, nobody is owed" value -- which would drop every outstanding
+    // request and release every held PR at once. It is unread, not empty.
+    if (encoding !== "base64") return null;
+    return parseCodeowners(Buffer.from(content, "base64").toString("utf8"));
+  }
+  return null;
+}
+
+/** Changed paths for one PR, or `null` if the listing failed or GitHub truncated it. */
+export function fetchPrFiles(repo, number, run = gh) {
+  try {
+    const files = JSON.parse(
+      run(["api", `repos/${repo}/pulls/${number}/files`, "--paginate"]),
+    ).map((file) => file?.filename);
+    return files.length >= MAX_PR_FILES ? null : files;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -638,11 +1044,17 @@ function fetchOpenPrs(repo) {
     gh(["pr", "list", "--repo", repo, "--state", "open", "--limit", "500", "--json", PR_LIST_FIELDS]),
   );
   assertPrListComplete(rows, repo, 500);
+  // One fetch per repo, not per PR: the rules are a property of the base branch.
+  const codeownerRules = fetchCodeownerRules(repo);
   return rows.map((row) => {
     assertHeadSha(row, repo);
     if (classifyFromListing(row)) return row;
     return {
       ...row,
+      codeownerRules,
+      // Only PRs that actually carry a request can be scoped by ownership, so
+      // the extra call is spent only where it can change a verdict.
+      files: (row.reviewRequests ?? []).length > 0 ? fetchPrFiles(repo, row.number) : [],
       statusCheckRollup: JSON.parse(
         gh(["pr", "view", String(row.number), "--repo", repo, "--json", "statusCheckRollup"]),
       ).statusCheckRollup,
@@ -660,6 +1072,38 @@ function commentOnce(repo, number, marker, body, run = gh) {
   run(["pr", "comment", String(number), "--repo", repo, "--body", `${marker}\n${body}`]);
   return "posted";
 }
+
+/**
+ * The head SHA this PR carries RIGHT NOW, read at apply time.
+ *
+ * PEN-4887: `fetchOpenPrs` snapshots every open PR once per fire, and a head
+ * can move between that snapshot and the enqueue. The case that made this
+ * expensive is not a rare race — it is the deterministic consequence of
+ * landing a STACKED child PR: merging the child into the parent's branch
+ * replaces the parent's head with the merge commit, on which nothing has run
+ * yet. Measured on Blockcast/paperclip#3060 (2026-10-28): head moved at
+ * 07:46:13Z, enqueued at 07:46:17Z, ejected by the queue at 07:46:27Z, while
+ * `ci/ally-head-attested` did not succeed until 07:48:37Z — 2m10s after the
+ * removal, with `policy` gating the heavy matrix behind it for ~6 minutes more.
+ *
+ * Every gate in `classifyPr` — the settle floor, `checks:none`, the Ally
+ * verdict at head, the owner set — was evaluated against the OLD head and says
+ * nothing about the new one. Re-reading the SHA is what makes those verdicts
+ * mean what the receipt claims they mean.
+ *
+ * `--auto` is not a substitute. On a queue-enabled base GitHub enqueues
+ * immediately whenever it believes the requirements are met, and right after a
+ * head moves that belief is briefly stale: #3060 carries an
+ * `added_to_merge_queue` event with no `auto_merge_enabled` beside it.
+ */
+export function liveHeadSha(repo, number, run = gh) {
+  const raw = JSON.parse(
+    run(["pr", "view", String(number), "--repo", repo, "--json", "headRefOid"]),
+  )?.headRefOid;
+  return typeof raw === "string" && raw.length > 0 ? raw : null;
+}
+
+const short = (sha) => (typeof sha === "string" ? sha.slice(0, 7) : String(sha));
 
 /**
  * `--rebase` is mandatory, not cosmetic. `gh pr merge --auto` only infers a
@@ -716,7 +1160,38 @@ function commentOnce(repo, number, marker, body, run = gh) {
  */
 export function applyRow(repo, row, run = gh) {
   if (row.action === "enqueue") {
-    run(["pr", "merge", String(row.number), "--repo", repo, "--auto", "--rebase"]);
+    // PEN-4887: fail CLOSED on anything but a proven-unchanged head. An
+    // unreadable or absent SHA is not permission to enqueue — it means we
+    // cannot show the classification still applies, and the row simply
+    // re-classifies on the next fire. The throw is caught by `runRepo` and
+    // recorded as `enqueue-failed`, which is both visible in the receipt and
+    // correctly excluded from the per-fire cap: no queue slot was spent.
+    const live = liveHeadSha(repo, row.number, run);
+    if (!row.headSha || !live || live !== row.headSha) {
+      throw new Error(
+        `head moved since classification (${short(row.headSha)} -> ${short(live)}); not enqueued — ` +
+          "every check and review verdict in this row describes the previous head",
+      );
+    }
+    // Ally review, 2nd pass: the re-read above narrows the window but is still
+    // check-then-act — the head can move between `pr view` and `pr merge`.
+    // `--match-head-commit` closes it on GitHub's side: the request carries the
+    // SHA every gate in this row was evaluated against, and GitHub refuses the
+    // merge outright if the head no longer matches. The re-read is kept in
+    // front of it rather than replaced, because it is what produces the
+    // attributable `enqueue-failed` message naming both SHAs; this flag's
+    // refusal surfaces as a generic `gh` failure, which is the right backstop
+    // but the poorer receipt.
+    //
+    // Verified against the live API on #3063 (2026-10-28) with a deliberately
+    // non-matching SHA: GitHub answered `expected head oid does not match the
+    // current head oid (enablePullRequestAutoMerge)` and auto-merge was NOT
+    // armed. So the flag composes with `--auto` and is enforced server-side on
+    // the auto-merge path, not just on an immediate merge.
+    run([
+      "pr", "merge", String(row.number), "--repo", repo,
+      "--auto", "--rebase", "--match-head-commit", row.headSha,
+    ]);
     // Deliberately not "armed": this call queues, arms, or merges outright
     // depending on the base, and the receipt must not name the one it guessed.
     return "merge requested";
@@ -802,7 +1277,8 @@ export function markFailure(row, message) {
 }
 
 function runRepo(repo, apply, settleMinutes, spent, rotted) {
-  const rows = classifyAll(fetchOpenPrs(repo), { settleMinutes, spent });
+  const prs = fetchOpenPrs(repo);
+  const rows = classifyAll(prs, { settleMinutes, spent });
 
   for (const row of rows) {
     if (row.action === "approval-rotted") rotted.push(`${repo}#${row.number} (${row.detail})`);
@@ -829,7 +1305,11 @@ function runRepo(repo, apply, settleMinutes, spent, rotted) {
     }
   }
 
-  console.log(`## ${repo}\n\n${renderReceipt(rows)}`);
+  // After the apply loop, so a row this fire just enqueued (or just renamed to
+  // `enqueue-failed`) is aged on what it ENDED as, not on the classification
+  // it entered with.
+  const stalled = renderStalledHolds(repo, stalledHolds(prs, rows));
+  console.log(`## ${repo}\n\n${renderReceipt(rows)}${stalled ? `\n\n${stalled}` : ""}`);
   return rows;
 }
 

@@ -10,13 +10,13 @@ import { sanitizeRecord } from "../redaction.js";
 import { LIVE_EVENT_TRANSCRIPT_AUDIT_ACTION } from "../realtime/live-event-transcript-gate.js";
 
 const createActivitySchema = z.object({
-  actorType: z.enum(["agent", "user", "system", "plugin"]).optional().default("system"),
+  actorType: z.enum(["agent", "user", "system", "plugin"]).prefault("system"),
   actorId: z.string().min(1),
   action: z.string().min(1),
   entityType: z.string().min(1),
   entityId: z.string().min(1),
-  agentId: z.string().uuid().optional().nullable(),
-  details: z.record(z.unknown()).optional().nullable(),
+  agentId: z.string().guid().optional().nullable(),
+  details: z.record(z.string(), z.unknown()).optional().nullable(),
 });
 
 const COMPANY_ACTIVITY_QUERY_PARAMS = new Set(["agentId", "entityType", "entityId", "action", "limit"]);
@@ -31,7 +31,7 @@ const companyActivityQuerySchema = z.object({
   limit: z.string().optional(),
 });
 
-const uuidQueryParamSchema = z.string().uuid();
+const uuidQueryParamSchema = z.string().guid();
 
 // Audit records that are not feed items, left off the unnarrowed page only — one that sets none of
 // `action`, `agentId`, `entityType`, `entityId` (`limit` does not narrow it). `heartbeat.run_events_streamed`

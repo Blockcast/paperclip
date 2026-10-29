@@ -19,6 +19,13 @@ import {
 import type { SelfPodInfo } from "./k8s-client.js";
 import { buildEnvGuardPluginCleanupShell, buildEnvGuardPluginSetupShell } from "./env-guard-plugin.js";
 import {
+  buildSharedDocOverlayShell,
+  buildSharedDocSecretProjection,
+  parseSharedDocOverlay,
+  SHARED_DOC_SECRET_MOUNT_PATH,
+  SHARED_DOC_SECRET_VOLUME_NAME,
+} from "./shared-doc-overlay.js";
+import {
   isAgentInheritableEnvFromRef,
   isAgentInheritableEnvName,
   isAgentInheritableSecretVolume,
@@ -443,6 +450,8 @@ export interface JobBuildResult {
   envSecret: EnvSecret | null;
   /** MCP-bearing OpenCode config staged in a per-run Secret. */
   mcpConfigSecret: McpConfigSecret | null;
+  /** Shared-doc bodies staged as a Secret volume; same lifecycle as the others. */
+  sharedDocsSecret: SharedDocsSecret | null;
 }
 
 export interface EnvSecret {
@@ -457,6 +466,22 @@ export interface EnvSecret {
  * manifest and deliver it through a short-lived Secret-backed volume.
  */
 export interface McpConfigSecret {
+  name: string;
+  namespace: string;
+  data: Record<string, string>;
+}
+
+/** Non-null whenever the server carried shared-doc bodies for this run.
+ *  The documents an agent's AGENTS.md tells it to read cannot reach a
+ *  run-isolated pod as a path — the execution workspace is deliberately not
+ *  in that pod's mount set — so the bodies are staged as a Secret volume and
+ *  projected back to their repo-relative layout (PEN-3329). Not credential
+ *  material; a Secret is used for the same reason mcp.json is, namely that it
+ *  is the one delivery channel here that is bounded, cleaned up with the run,
+ *  and independent of which host paths the pod happens to mount. Same
+ *  lifecycle as promptSecret: the caller creates it before the Job and cleans
+ *  it up after. */
+export interface SharedDocsSecret {
   name: string;
   namespace: string;
   data: Record<string, string>;
@@ -1542,6 +1567,71 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
         `fi && cd ${shellQuote(isolation.workspaceRoot!)}`,
       ].join(" ")}; } || { echo "[paperclip] failed to prepare isolated workspace" >&2; exit 1; }; `
     : "";
+  // PEN-3329. Both branches of `workspaceSetup` above lose the shared docs the server
+  // materialized into the execution workspace: the clone carries tracked objects only,
+  // and the fallback branch hands the run an empty directory. This runs after either one
+  // and copies the declared set across. Gated on the same condition as `workspaceSetup`
+  // because every other isolation mode mounts that workspace directly and already has
+  // them.
+  //
+  // This does NOT replace `sharedDocsBridge` above, and the two are not redundant. That
+  // one symlinks a whole company `docs/` directory in, and does nothing at all when a
+  // `docs/` already exists — which is every project repo that ships its own docs, i.e.
+  // exactly the case where the materialized company docs are missing and the tracked
+  // ones are not. This copies the declared files individually and skips only the
+  // individual paths that are already present, so the two compose: the bridge keeps
+  // covering repos with no `docs/` of their own, this covers the rest.
+  //
+  // THE BRIDGE MUST RUN FIRST, and `baseMainCommand` orders it that way. Both halves of
+  // that sentence are load-bearing and the opposite order silently loses documents:
+  //
+  //   * Bridge first, overlay second — on a repo with no `docs/`, the bridge links the
+  //     whole company directory in and the overlay then finds every declared path already
+  //     present and copies nothing. The bridge's coverage is strictly wider, because it
+  //     serves docs referenced only from inside another doc, which never appear in the
+  //     declared set.
+  //   * Overlay first, bridge second — the overlay's `mkdir -p "$(dirname …)"` creates a
+  //     real `docs/`, and the bridge's own guard is `[ -e docs ] || ln -sfn …`, so the
+  //     bridge then never fires. The repo ends up with only the declared subset, and the
+  //     transitively-referenced company docs are gone with nothing logged. That was the
+  //     shape this PR shipped at `3d01f3e3` and Ally caught it on review.
+  //
+  // The overlay refuses to write through a symlinked ancestor (see `shared-doc-overlay.ts`),
+  // which is what keeps bridge-first safe: a declared doc that is absent even from the
+  // company directory is reported, not `cp`-ed through the link into shared storage.
+  const sharedDocOverlay = workspaceSetup ? parseSharedDocOverlay(context.paperclipSharedDocs) : null;
+  // The bodies travel with the Job. `sourceCwd` is the server's execution workspace and a
+  // run-isolated pod does not mount it, so a copy from there reports every doc absent —
+  // measured on a live pod, 2026-10-29. Staging a Secret makes delivery depend on the Job
+  // alone rather than on the pod's mount set. The path copy stays as the fallback for a
+  // server too old to send bodies; `buildSharedDocOverlayShell` picks whichever applies.
+  const sharedDocProjection = sharedDocOverlay ? buildSharedDocSecretProjection(sharedDocOverlay) : null;
+  let sharedDocsSecret: SharedDocsSecret | null = null;
+  if (sharedDocProjection) {
+    const sharedDocsSecretName = `${jobName}-shared-docs`;
+    sharedDocsSecret = { name: sharedDocsSecretName, namespace, data: sharedDocProjection.data };
+    volumes.push({
+      name: SHARED_DOC_SECRET_VOLUME_NAME,
+      // `items` restores `docs/<name>.md` from the positional keys, so the mount has the
+      // same shape the copy loop expects and the loop needs no per-path knowledge of the
+      // staging scheme. `optional: false` — a Secret that failed to create must surface
+      // as a pod that cannot start, not as a run that silently reads no documentation.
+      secret: { secretName: sharedDocsSecretName, optional: false, items: sharedDocProjection.items },
+    });
+    volumeMounts.push({
+      name: SHARED_DOC_SECRET_VOLUME_NAME,
+      mountPath: SHARED_DOC_SECRET_MOUNT_PATH,
+      readOnly: true,
+    });
+  }
+  const sharedDocOverlaySetup = sharedDocOverlay
+    ? `${buildSharedDocOverlayShell({
+        overlay: sharedDocOverlay,
+        workspaceRoot: isolation.workspaceRoot!,
+        quote: shellQuote,
+        ...(sharedDocProjection ? { sourceDir: SHARED_DOC_SECRET_MOUNT_PATH } : {}),
+      })}; `
+    : "";
   // opencode-db schema-compat guard (root-caused 2026-06-21, BLO follow-up).
   // The persistent opencode.db is keyed per (company, agent, taskKey) and reused
   // across runs (workspace_subpath mode). When the vendored opencode binary is
@@ -1587,7 +1677,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // so a verdict after it would describe a pod that had already reached GitHub.
   // Advisory — the push path already fails closed; this buys time-to-diagnosis.
   const prePushHookPreflight = buildPrePushHookPreflightShell({ dataMountPath: workspaceMountPath });
-  const baseMainCommand = `set -o pipefail; ${imageWrapperPreflight}; ${prePushHookPreflight}; ${isolatedRuntimePrep}${opencodeRuntime}${workspaceSetup}${credentialSetup}${envGuardPluginSetup}${configSetup}${dbResetGuard}${compactPrefix}${sharedDocsBridge}mkdir -p $(dirname ${shellQuote(podLogPath)}) && : > ${shellQuote(podLogPath)} && cat /tmp/prompt/prompt.txt | ${launcherCommand} ${opencodeArgsEscaped} | tee -a ${shellQuote(podLogPath)}`;
+  const baseMainCommand = `set -o pipefail; ${imageWrapperPreflight}; ${prePushHookPreflight}; ${isolatedRuntimePrep}${opencodeRuntime}${workspaceSetup}${sharedDocsBridge}${sharedDocOverlaySetup}${credentialSetup}${envGuardPluginSetup}${configSetup}${dbResetGuard}${compactPrefix}mkdir -p $(dirname ${shellQuote(podLogPath)}) && : > ${shellQuote(podLogPath)} && cat /tmp/prompt/prompt.txt | ${launcherCommand} ${opencodeArgsEscaped} | tee -a ${shellQuote(podLogPath)}`;
   // Redirect Chrome's BrowserMetrics spool off the shared CephFS HOME to the
   // main container's per-pod runtime-cache emptyDir. The
   // agent-browser designer tool launches system Chrome with the default
@@ -1747,6 +1837,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     opencodeVersion,
     envSecret,
     mcpConfigSecret,
+    sharedDocsSecret,
   };
 }
 

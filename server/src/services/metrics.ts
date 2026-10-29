@@ -30,6 +30,15 @@ import {
   APPROVAL_TYPES,
   RESTORED_EXECUTION_DISCHARGE_KINDS,
 } from "@paperclipai/shared";
+// Value import for the same reason as the shared allow-lists above: the PEN-4145
+// zero-init grid needs the actual member list, and a second copy here would be
+// free to drift from the classifier that decides which alignment a given retry
+// instant reports. `ccrotate-capacity-retry` has NO imports of its own -- it is
+// a deliberately pure leaf predicate module -- so this cannot form a cycle.
+import {
+  RETRY_INSTANT_ALIGNMENTS,
+  type RetryInstantAlignment,
+} from "./ccrotate-capacity-retry.js";
 import { logger } from "../middleware/logger.js";
 // Type-only, so it is erased at runtime and creates no import cycle with the
 // reaper (which imports the recorder below). Structurally restating the result
@@ -53,6 +62,9 @@ import type { FdClassSnapshot } from "./fd-class-metrics.js";
 import type { CgroupMemorySnapshot } from "./cgroup-memory-metrics.js";
 import type { NativeMemorySnapshot } from "./native-memory-metrics.js";
 import type { ProcessMappingSnapshot } from "./process-mapping-metrics.js";
+import type { RssReleaseGcAttribution } from "./rss-release-gc-attribution.js";
+import type { RssReleaseReading } from "./rss-release-tracker.js";
+import { registerGcFlagsCollector } from "./gc-flags-metrics.js";
 
 export const CONCURRENT_RUN_BLOCKED_METRIC = "claude_k8s_concurrent_run_blocked_total";
 /**
@@ -685,15 +697,31 @@ export const RECOVERY_ACTION_AUTO_DISCHARGED_METRIC = "paperclip_recovery_action
  * was therefore unevaluable in either direction against that surface. The
  * counter has normal retention, so the same question is a range query.
  *
- * Cardinality is three series by construction —
- * {@link KNOWN_WORKER_TIER_PROXY_FAILURE_REASONS} is a closed set, not caller
- * input. `timeout` means the connection succeeded and the worker was still
+ * `reason` is a closed set by construction —
+ * {@link KNOWN_WORKER_TIER_PROXY_FAILURE_REASONS}, not caller input. `timeout`
+ * means the connection succeeded and the worker was still
  * silent when the proxy's own deadline fired; `mid_stream` means the worker
  * answered and the response then broke after headers were already flushed;
  * `unreachable` means the request never got that far. They are separated
  * because they route differently: `timeout` is worker latency, `mid_stream` is
  * a worker that died or was restarted mid-response, and only `unreachable`
  * points at a missing Service endpoint.
+ *
+ * `route` names WHICH proxied route failed, as the Express path pattern from
+ * the `WORKER_DEPENDENT_PLUGIN_ROUTES` allowlist — also a closed set, and
+ * already parameterized (`:pluginId`, `:endpointKey`), so no caller-supplied
+ * id reaches a label. Added by PEN-4100: `reason` alone pools every proxied
+ * route into one series, and the routes fail for unrelated causes at wildly
+ * different rates. Measured over 2026-10-22 → 10-29 the `unreachable` arm took
+ * 2,550 increments (api rollouts) against 2 for `timeout`, so "did an
+ * alertmanager webhook delivery time out at the proxy" was answerable only by
+ * reading the SENDER's log — which is the exact dependency PEN-4100 exists to
+ * remove. With `route` the webhook arm is isolable:
+ * `increase(paperclip_worker_tier_proxy_failures_total{reason="timeout",
+ * route="/plugins/:pluginId/webhooks/:endpointKey"}[7d])`.
+ *
+ * Cardinality stays bounded at |routes| × |reasons| — 17 × 3 = 51 series
+ * today — because both label sets are allowlists fixed at build time.
  */
 export const WORKER_TIER_PROXY_FAILURES_METRIC = "paperclip_worker_tier_proxy_failures_total";
 export const KNOWN_WORKER_TIER_PROXY_FAILURE_REASONS = [
@@ -703,6 +731,62 @@ export const KNOWN_WORKER_TIER_PROXY_FAILURE_REASONS = [
 ] as const;
 export type WorkerTierProxyFailureReason =
   (typeof KNOWN_WORKER_TIER_PROXY_FAILURE_REASONS)[number];
+
+/**
+ * Route patterns the worker-tier proxy serves, as registered by
+ * `registerWorkerTierProxyRoutes` / `registerPluginHolderForwardRoutes`
+ * (routes/worker-tier-proxy.ts).
+ *
+ * Declared here rather than imported from the route module because the
+ * dependency runs the other way — that module imports
+ * {@link recordWorkerTierProxyFailure} — and closing the loop would make
+ * module-init order load-bearing. The route module pushes its allowlist in at
+ * registration via {@link initWorkerTierProxyRouteSeries} instead, so the
+ * label set stays derived from the one table that defines it and cannot drift
+ * into a second hand-maintained copy.
+ *
+ * Deliberately NOT cleared by {@link __resetMetricsForTest}: which routes this
+ * binary proxies is a property of the build, not of a test's state. Keeping it
+ * makes zero-init order-independent — a reset that rebuilds the registry
+ * re-seeds from this set, and a registration that lands before the registry
+ * exists is picked up when it is built.
+ */
+const workerTierProxyRoutes = new Set<string>();
+
+/**
+ * Seed the zero-valued `{reason, route}` series for every proxied route.
+ *
+ * Same rationale as every other zero-init here: an un-incremented counter is
+ * absent from the scrape, and `rate()`/`increase()` over an absent series
+ * returns nothing rather than 0 — indistinguishable from healthy on a
+ * dashboard, and unusable as an alert denominator. With a `route` label the
+ * quiet case is the common one (most proxied routes never fail), so the seed
+ * matters more here than it did on `reason` alone.
+ *
+ * Idempotent, and safe to call before the registry is built.
+ */
+export function initWorkerTierProxyRouteSeries(routes: readonly string[]): void {
+  let added = false;
+  for (const route of routes) {
+    if (!workerTierProxyRoutes.has(route)) {
+      workerTierProxyRoutes.add(route);
+      added = true;
+    }
+  }
+  if (!added || !workerTierProxyFailures) return;
+  zeroInitWorkerTierProxyFailureSeries(workerTierProxyFailures);
+}
+
+/**
+ * Zero every `{reason, route}` pair currently known. Called at counter
+ * construction and again whenever a new route registers afterwards.
+ */
+function zeroInitWorkerTierProxyFailureSeries(counter: Counter<"reason" | "route">): void {
+  for (const reason of KNOWN_WORKER_TIER_PROXY_FAILURE_REASONS) {
+    for (const route of workerTierProxyRoutes) counter.inc({ reason, route }, 0);
+  }
+}
+
 export const HEARTBEAT_RUN_FAILED_METRIC = "paperclip_heartbeat_run_failed_total";
 /**
  * `error_code` booked when a `job_failed` run is proven to be the Caveman-proxy
@@ -940,27 +1024,49 @@ export const HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC =
  * `tickTimers` (agent not invokable; heartbeat policy disabled or
  * `intervalSec <= 0`; a `getWorktreeExecutionCutoff()` cutoff with no eligible
  * issue behind it), so a fleet where every agent trips one of those yields a
- * completed pass with `checked = 0`. The full cause list is therefore:
+ * completed pass with `checked = 0`. Those three filters are unchanged, and so
+ * is what this counter counts — but since PEN-4737 they are no longer silent:
+ * each one now increments
+ * {@link HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC} under `agent.not_invokable`
+ * / `heartbeat.disabled` / `heartbeat.worktree_execution_cutoff` and writes a
+ * durable `agent_wakeup_requests` row, rate-limited to one per agent per reason
+ * per hour. The full cause list is therefore:
  *   1. the loop is wedged or the process is dead — the case worth paging on;
  *   2. every candidate was filtered out before the counter (above);
  *   3. global scheduling suppression — the caller does not enter `tickTimers`
  *      at all (`server/src/index.ts`), so nothing is recorded;
- *   4. startup recovery is still pending (`heartbeatStartupRecoveryPending`);
+ *   4. this process is not the `heartbeat-timer` lease holder (a follower
+ *      returns before `tickTimers`, BLO-43292). Startup/takeover recovery
+ *      (`heartbeatStartupRecoveryPending`) is no longer a cause: since
+ *      BLO-49303 the timer enqueue runs ahead of that gate;
  *   5. the shutdown drain has begun (`heartbeatSchedulerStopped`);
  *   6. the pass completed but {@link recordHeartbeatTimerTick} rejected it as
  *      malformed and dropped **both** halves — see its own doc comment. This
  *      should never happen (both inputs are integer accumulators) and is the
  *      only cause of the six that emits a `logger.warn` naming the bad field,
  *      so the worker log settles it outright.
- * Only (1) warrants a restart, and note the trap: restarting for (4) re-enters
- * (4). Rule out 2–6 first.
+ * Only (1) warrants a restart. Rule out 2–6 first.
  *
- * There is no counter that attributes a zero `checked` to which of 2–6 caused
- * it. {@link HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC} does NOT close that
- * gap and must not be read as doing so: every one of its increments happens
- * *after* `checked += 1`, so it is silent in all five of those cases.
- * Distinguish them from process state instead — worker uptime and the
- * scheduling-suppression record for (1)/(3), and the worker log for (4)/(5)/(6).
+ * {@link HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC} narrows a zero `checked`
+ * for the first time since PEN-4737, but does not resolve it alone. A zero
+ * `checked` carrying a non-zero `agent.not_invokable` / `heartbeat.disabled` /
+ * `heartbeat.worktree_execution_cutoff` increase over the same window says the
+ * per-agent loop RAN and excluded agents ahead of the counter, with a durable
+ * `agent_wakeup_requests` row per excluded agent naming which filter caught it.
+ * That is cause (2) — or cause (6), which lets those same increments through
+ * (they are recorded in the loop, not in the rejected tick) and then drops both
+ * halves of the pass. The `logger.warn` (6) emits is what separates the two.
+ *
+ * Read the absence carefully in the other direction: the ledger behind those
+ * three labels is rate-limited to one increment per agent per reason per hour,
+ * so a window shorter than an hour can legitimately show a zero increase while
+ * cause (2) is still in force. Widen the window before concluding it is not (2).
+ *
+ * It attributes none of 1, 3, 4 or 5, and must not be read as doing so: every
+ * one of its call sites is inside the per-agent loop, which (3)/(4)/(5) never
+ * enter and (1) never reaches. Distinguish those from process state instead —
+ * worker uptime and the scheduling-suppression record for (1)/(3), and the
+ * worker log for (4)/(5)/(6).
  *
  * `checked` is also a composite: agents examined, plus `issueMonitors.checked`,
  * plus `expiredIssueMonitors.checked`. A consumer cannot decompose it, so
@@ -969,10 +1075,12 @@ export const HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC =
  * do not read it as "agents were considered".
  *
  * Deliberately unlabeled: the consumer is `sum(increase(...[15m])) == 0`, so
- * per-agent breakdown would add cardinality without adding signal. Per-agent
- * detail for *due ticks that were then excluded* lives in
- * {@link HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC} — which, per the paragraph
- * above, is a strictly narrower set than "candidates this loop skipped".
+ * per-agent breakdown would add cardinality without adding signal. Reason-level
+ * detail for timer-loop exclusions lives in
+ * {@link HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC}, which since PEN-4737
+ * spans both sides of this counter: four reasons for candidates excluded after
+ * `checked += 1`, and three for agents filtered before it. It is still not
+ * per-agent — that detail is in `agent_wakeup_requests`, not in a label.
  *
  * Both counters are emitted by the *worker* (`StatefulSet/paperclip`), which is
  * where the timer loop runs and which deploys independently of
@@ -1161,15 +1269,149 @@ export const DEFERRED_ISSUE_EXECUTION_WAKE_AGE_METRICS_REFRESH_SUCCESS_METRIC =
 // file: it is published from `reconcileIssueGraphLiveness` where the classifier
 // verdicts already exist, so it lives on the WORKERS tier only, and refreshes
 // once per recovery CHAIN rather than once per 30s tick -- a chain routinely
-// outlives one interval. Scope any query to `service="paperclip-workers"` -- but
-// that selector is necessary, not sufficient: the chain is single-leader WITHIN
-// that tier, so every non-leader worker replica also sits at a permanent 0.
-// Aggregate across replicas (`max by (service) (...)`) rather than alerting
-// per-replica, and do not size a `for:` off the tick interval.
+// outlives one interval. Do not size a `for:` off the tick interval.
+//
+// THIS COMMENT OWNS THE ALERT RULE for both gauges below (PEN-4665). The help
+// text embeds {@link COLD_IN_REVIEW_LEADER_SCOPED_SELECTOR} rather than
+// restating it, so there is exactly one copy of the predicate and it cannot
+// drift from this reasoning.
+//
+// ⚠ `service="paperclip-workers"` is NOT a sufficient scope, and neither is
+// aggregating across that tier. The chain is SINGLE-LEADER within the workers
+// tier, so at any instant one worker replica refreshes these gauges and every
+// other worker sits at a permanent 0 while behaving correctly. The obvious
+// repair -- `max by (service) (<series>{service="paperclip-workers"}) == 0` --
+// is correct only when leadership moves BY RESTART, and is FAIL-OPEN when the
+// lease moves without one:
+//
+//   * `scheduler-lease.ts` demotes in process when renewals lapse past the TTL
+//     (the `wasLeader && !hold` branch, "scheduler lease lost to another
+//     holder"). Nothing in that path resets these gauges --
+//     `setColdInReviewIssueMetricsRefreshSuccess` is their only writer -- so a
+//     demoted-but-live replica keeps exporting its last `1`.
+//   * `max` then returns 1 from a replica that has stopped refreshing, while
+//     the NEW holder's chain is failing. The age gauges carry the same
+//     staleness: `max` across replicas keeps showing a repaired row's frozen
+//     age.
+//
+// That trades one fail-closed trap (per-replica `== 0` pages on the standby)
+// for a fail-open one, which is the worse direction for an instrument whose
+// whole job is to stop a silent state being silent.
+//
+// THE FIX IS TO ASK THE LEADER, NOT THE TIER. `paperclip_scheduler_lease_held`
+// already carries that answer: it is labelled by holder pod, it exists on every
+// worker replica, and `publish()` rewrites it at the END OF EVERY renew attempt
+// INCLUDING the in-process demotion branch. So a replica's leader indicator
+// flips to 0 on the very tick it stops refreshing these gauges -- the event a
+// reset-on-lease-loss fix would need bespoke code to catch. Joining on it needs
+// no new series and no change to the publishing code.
+//
+// ⚠ SIZE `for:` OFF THE CHAIN DURATION, AND NOTHING SHORTER. This is the one
+// obligation the leader-scoped join ADDS, and it is not optional. Immediately
+// after any handoff the join correctly selects the NEW holder -- whose refresh
+// flag is still at its constructor-seeded 0, because
+// `setColdInReviewIssueMetricsRefreshSuccess` is its only writer and the new
+// leader has not completed a chain yet. So `== 0` is TRUE for the whole of the
+// new leader's first chain, and an alert with a short `for:` pages on every
+// handoff. Measured over the 7 d to 2026-10-28, the worst chain on the workers
+// tier ran 2985 s (~50 min); the figure this comment carried before, 645 s, was
+// a single 2026-10-24 sample and is NOT a safe bound. Set `for:` longer than
+// the worst chain duration you actually observe
+// (`max_over_time(paperclip_heartbeat_recovery_chain_duration_seconds[7d])`),
+// and re-check it when that number moves. An hour is a reasonable starting
+// floor today. This is a fail-CLOSED window -- noisy, not blind -- which is the
+// direction to err, but it is still a false page if you size `for:` wrong.
+//
+// Rejected alternatives, and why (PEN-4665 decision, 2026-10-28):
+//   * RESET THE GAUGES ON LEASE LOSS. The honest discriminator here is the AGE
+//     gauges, not the refresh flag. Under reset the age gauges go fail-OPEN
+//     during the handoff window (the old leader's ages drop to 0 before the new
+//     leader publishes, so `max` reads "nothing cold") -- blindness, which is
+//     the direction this whole row exists to remove. The refresh flag's
+//     fail-CLOSED first-chain window, by contrast, is NOT a reason to prefer
+//     the join: the join has exactly the same window, for the same reason, as
+//     the `for:` note above says. Do not read the rejection as "reset is noisy
+//     and the join is not". It is "reset ALSO blinds the age gauges, and it
+//     needs bespoke code in the demotion path to do it".
+//   * KEY THE ALERT OFF A TIMESTAMP ADVANCING. Changes the alert's shape and
+//     still needs a per-refresh timestamp series these gauges do not publish.
+//
+// ⚠ KNOWN AND DELIBERATE GAP: during a genuine handover the lease legitimately
+// passes through zero holders, the join goes EMPTY, and an empty vector cannot
+// compare `== 0` -- so this alert is silent for that window. That is correct
+// separation, not an oversight: "nobody is running the loop" is already owned
+// by `sum by (lease) (paperclip_scheduler_lease_held) != 1` (see
+// {@link SCHEDULER_LEASE_HELD_METRIC}), which is bounded by the 45 s TTL. Pair
+// the two; do not try to make either one answer both questions.
 export const COLD_IN_REVIEW_ISSUE_OLDEST_AGE_METRIC =
   "paperclip_cold_in_review_issue_oldest_age_seconds";
 export const COLD_IN_REVIEW_ISSUE_METRICS_REFRESH_SUCCESS_METRIC =
   "paperclip_cold_in_review_issue_metrics_refresh_success";
+/**
+ * The ONLY correct way to scope either cold-`in_review` gauge in an alert
+ * (PEN-4665): keep the series from the replica that currently holds the
+ * heartbeat-timer lease, and drop every other replica -- the standby workers
+ * sitting at a permanent 0, the api replicas that never run the chain, and a
+ * demoted-but-live former leader still exporting a stale `1`.
+ *
+ * Exported as a constant and embedded in both gauges' help text so the rule has
+ * exactly one copy. Read the declaration comment above for why aggregating
+ * across the workers tier is fail-open, and for the handover-gap caveat.
+ *
+ * No `service` selector is needed alongside it: the join already restricts to
+ * replicas that publish a lease indicator, which the api tier does not.
+ *
+ * ⛔ DO NOT CONCATENATE A COMPARISON ONTO THIS FRAGMENT YOURSELF -- use
+ * {@link coldInReviewLeaderScopedExpr}, which parenthesises for you. PromQL
+ * binds `==` TIGHTER than `and`, so the obvious composition silently never
+ * fires:
+ *
+ *     <series> and on (pod) (<lease> == 1) == 0     ⛔ parses as
+ *     <series> and on (pod) ((<lease> == 1) == 0)   -- right side always empty
+ *
+ * Measured against live Prometheus 2026-10-28, reduced to a self-contained
+ * control so it can be re-run anywhere:
+ *
+ *     vector(0) and on() (vector(1) == 1) == 0      =>  [] (empty)
+ *     (vector(0) and on() (vector(1) == 1)) == 0    =>  {} 0
+ *
+ * The first form is the one a reader writes by hand, and it is an alert that
+ * can NEVER fire -- the same silent-instrument failure PEN-4665 exists to
+ * remove, reintroduced one layer up. Hence the helper.
+ */
+export const COLD_IN_REVIEW_LEADER_SCOPED_SELECTOR =
+  `and on (pod) (${SCHEDULER_LEASE_HELD_METRIC}{lease="heartbeat-timer"} == 1)`;
+
+/**
+ * Compose a complete, correctly-parenthesised leader-scoped alert expression
+ * for either cold-`in_review` gauge (PEN-4665).
+ *
+ * The parentheses are the point: see the ⛔ note on
+ * {@link COLD_IN_REVIEW_LEADER_SCOPED_SELECTOR} for why hand-concatenating the
+ * fragment with a comparison yields an expression that never fires.
+ *
+ * `aggregation` exists because the two gauges need the join at DIFFERENT
+ * depths, and getting that backwards is the second way to write a silent
+ * alert. The refresh flag is unlabelled, so the join is outermost. The age
+ * gauge is labelled by `agent_id`, and `and on (pod)` needs the `pod` label on
+ * BOTH sides -- so any aggregation must WRAP the join. `max by (agent_id) (age)
+ * and on (pod) (...)` has already dropped `pod` by the time it joins and
+ * matches nothing.
+ *
+ *   coldInReviewLeaderScopedExpr(COLD_IN_REVIEW_ISSUE_METRICS_REFRESH_SUCCESS_METRIC, "== 0")
+ *     -> (paperclip_cold_in_review_issue_metrics_refresh_success and on (pod) (...)) == 0
+ *
+ *   coldInReviewLeaderScopedExpr(COLD_IN_REVIEW_ISSUE_OLDEST_AGE_METRIC, "> 86400", "max by (agent_id)")
+ *     -> max by (agent_id) (paperclip_cold_in_review_issue_oldest_age_seconds and on (pod) (...)) > 86400
+ */
+export function coldInReviewLeaderScopedExpr(
+  metric: string,
+  comparison: string,
+  aggregation?: string,
+): string {
+  const joined = `(${metric} ${COLD_IN_REVIEW_LEADER_SCOPED_SELECTOR})`;
+  return `${aggregation ? `${aggregation} ${joined}` : joined} ${comparison}`;
+}
 // BLO-28865. Deliberately NOT a threshold over the pre-existing
 // EXTERNAL_RUNTIME_RESERVATION_OLDEST_AGE_METRIC: that gauge is unlabelled and
 // measures reservation age only, so it cannot separate a stranded row from a
@@ -1547,6 +1789,41 @@ export const KNOWN_ORPHAN_REAP_STAGES = [
   "refresh_resource_metrics",
   "pod_cleanup",
   "per_run",
+  // PEN-4781: the `per_run` lap decomposed into an EXHAUSTIVE partition. Like
+  // the two splits above these are ADDITIVE -- `per_run` still measures the
+  // identical span, so its history stays comparable -- but unlike them this set
+  // is a partition rather than a selection, and that is the point.
+  //
+  // `per_run` is one lap over ~28 awaits in nested branches across ~700 lines,
+  // so every sweep-slow episode resolved to `per_run` and stopped there. It has
+  // carried the top stage in episodes of MORE THAN ONE cause: on 2026-10-19
+  // phase A, `list_jobs` was flat at x1.04 while `per_run` went x1088 (kube
+  // ruled out); on 2026-10-25 `list_jobs` moved x96.6 in lockstep with `per_run`
+  // x90.8 while Postgres moved only x5.6 (a kube signature). Same label, two
+  // different faults, and no way to tell them apart from the metric.
+  //
+  // WHY EXHAUSTIVE, AND WHY THE RESIDUAL IS LOAD-BEARING. A 1-of-N split yields
+  // a boolean, not a localization: if the instrumented bucket reads flat and the
+  // time sits in an un-named remainder, the responder has learned only "not
+  // that" and is back to reading source. Worse, a NON-exhaustive partition makes
+  // the glue between the buckets invisible, so a responder reads four small
+  // numbers and concludes nothing is slow -- a false negative, strictly worse
+  // than the honest dead end it replaces. `per_run_other` is therefore not an
+  // afterthought bucket: it is what makes
+  //   sum(per_run_liveness + _finalize + _dispatch + _cleanup + _other) == per_run
+  // true by construction, and it is the bucket to read FIRST when the four named
+  // ones are all small.
+  //
+  // Compare these to `per_run` on the `_sum`, which is exact. The `_count`s also
+  // match, because the four are accumulated across the whole pass and emitted
+  // once per sweep (as `release_pending_job_reads` already is) rather than once
+  // per run -- that is what keeps a p99 comparison between a sub-stage and
+  // `per_run` an apples-to-apples one.
+  "per_run_liveness",
+  "per_run_finalize",
+  "per_run_dispatch",
+  "per_run_cleanup",
+  "per_run_other",
   "total",
 ] as const;
 export type OrphanReapStageLabel = (typeof KNOWN_ORPHAN_REAP_STAGES)[number];
@@ -1609,6 +1886,92 @@ export const SCHEDULED_RETRY_PARK_HORIZON_REFRESH_SUCCESS_METRIC =
  * routine window cannot accept a useful retry" into the same series as "the
  * issue was reassigned", which is the distinction this metric exists to make.
  */
+/**
+ * The `transient_failure` retry-floor dispersion decision, by disposition and
+ * by the sub-second signature of the instant it produced (PEN-4145).
+ *
+ * ## Why this counter exists
+ *
+ * PEN-2509 routes a transient retry floor down one of two branches -- adopt the
+ * capacity arithmetic's own output verbatim, or disperse a raw provider instant
+ * with per-run jitter -- and until this counter NEITHER BRANCH EMITTED
+ * ANYTHING. No counter, no gauge, no log line above `debug`. The only durable
+ * trace that the scheduler had made a dispersion decision was the
+ * `scheduled_retry_at` value itself, on a run row.
+ *
+ * That is not an abstract gap. The first PEN-2509 fix shipped 2026-08-29 keyed
+ * its exemption on `providerCapacityResetProvenance`, which the finalize path
+ * writes for every recovered reset, so it exempted precisely the population
+ * that herds and the fix did nothing. It was live, fleet-wide and WRONG for six
+ * weeks, and was caught only when @Ceo re-measured by hand on 2026-10-12 and
+ * found the clamp signature still at 16.55% (160/967). Nothing in the system
+ * reported on the behaviour, so nothing could have surfaced it sooner. PR #2709
+ * fixed the predicate; this counter fixes the blindness that hid the first
+ * attempt.
+ *
+ * ## Read it as a SHARE, not a count
+ *
+ * The clamp arrives in bursts tied to upstream flapping -- measured 0 parks/day
+ * on 2026-10-13..15 against 132/day on 2026-10-05 -- so no count threshold can
+ * both catch a regression and stay quiet. The discriminating quantity is the
+ * aligned SHARE of floor decisions, which is scale-free:
+ *
+ *     sum(increase(paperclip_transient_retry_floor_total{alignment=~"whole_second|ten_minute_grid"}[24h]))
+ *     / sum(increase(paperclip_transient_retry_floor_total[24h]))
+ *
+ * ALWAYS carry the denominator. A zero numerator over a zero denominator is a
+ * quiet upstream, NOT a healthy scheduler, and conflating the two is the exact
+ * false clear that let PEN-2509 close in August with AC4 recorded as
+ * "unmeasurable, sample size 0". {@link PaperclipTransientRetryClampSignature}
+ * requires `>= 30` floor decisions in the rule itself for that reason; do not
+ * read the ratio below that without saying so.
+ *
+ * ## Zero-initialized across the full grid, deliberately
+ *
+ * Every `disposition` x `alignment` combination is seeded at 0 at registry
+ * construction. `increase()` takes last-first, so a label series BORN at 1 on
+ * its first increment evaluates to 0 forever and an alert reading it is
+ * permanently silent -- the failure mode that would otherwise reproduce this
+ * ticket's own blindness in the detector meant to remove it. A 0 here therefore
+ * means "this pod made no floor decision of this shape", which is a real
+ * reading, not a missing metric. Do NOT alert on `absent()`.
+ *
+ * ## What the denominator is, exactly
+ *
+ * One increment per retry schedule that had a transient retry FLOOR to decide
+ * about -- not per transient park. A park with no floor at all takes the base
+ * backoff curve, which carries its own jitter and never herded, so it is out of
+ * scope and absent here. `superseded` is in scope and counted: a floor that
+ * lost to a later base backoff was still a floor this code looked at, and
+ * keeping it in makes the total "floor decisions" rather than "floor decisions
+ * that mattered", which is the honest denominator for a routing ratio.
+ *
+ * Cardinality is fixed at 4 x 3 forever -- both label sets are compile-time
+ * allow-lists, neither grows with the fleet.
+ */
+export const TRANSIENT_RETRY_FLOOR_METRIC = "paperclip_transient_retry_floor_total";
+/**
+ * How the dispersion decision came out, most-specific first.
+ *
+ * The two `exempt_*` values are split rather than folded into one `exempt`
+ * because WHICH marker exempted a floor is the thing that silently broke. A
+ * predicate regression does not change the exempt share -- it changes which
+ * marker produces it -- so an undifferentiated `exempt` would have read
+ * identically before and after the 2026-08-29 fix failed. Select the pair with
+ * `disposition=~"exempt_.*"` where the distinction does not matter.
+ */
+export const TRANSIENT_RETRY_FLOOR_DISPOSITIONS = [
+  /** The floor came out of the capacity arithmetic, which jitters and bounds it itself. */
+  "exempt_capacity_governed",
+  /** The floor is `now + MAX_TRANSIENT_RETRY_HORIZON_MS`, so it is per-run by construction. */
+  "exempt_horizon_clamped",
+  /** A raw advertised instant, dispersed here by `jitterTransientRetryFloor`. */
+  "dispersed",
+  /** A floor existed but the base backoff landed later, so the floor was discarded. */
+  "superseded",
+] as const;
+
+export type TransientRetryFloorDisposition = (typeof TRANSIENT_RETRY_FLOOR_DISPOSITIONS)[number];
 export const RETRY_SCHEDULE_OUTCOME_METRIC = "paperclip_retry_schedule_outcome_total";
 /**
  * Retry-scheduling outcomes, as an allow-list so a future branch cannot mint a
@@ -1949,6 +2312,193 @@ export const PROCESS_MAPPING_SCAN_TIMESTAMP_METRIC =
  * `..._bytes` gauge.
  */
 export const PROCESS_HEAP_PEAK_SAMPLES_METRIC = "paperclip_process_heap_peak_samples";
+
+/**
+ * Count of RSS RELEASE episodes this process has detected (PEN-3314).
+ *
+ * The counterpart to {@link PROCESS_HEAP_PEAK_SAMPLES_METRIC}'s maxima, and the
+ * series that exists because a maximum cannot go down. PEN-3314's open question
+ * is what triggers the wholesale return of ~800 MB of single-V8-page mappings,
+ * and as of 2026-10-26 NOTHING in Prometheus marks the instant: not GC, not
+ * in-flight runs, not dispatch, not node PSI. The finest timestamp available was
+ * +/-300 s, floored by the `/proc/self/smaps` scan's own cost.
+ *
+ * Monotonic within a process; on restart the series goes ABSENT and reappears
+ * from 0 rather than stepping down, so read it with `increase()`, never as a
+ * level. NOT an alert source.
+ */
+export const PROCESS_RSS_RELEASE_EVENTS_METRIC = "paperclip_process_rss_release_events";
+
+/**
+ * Cumulative peak-to-trough bytes returned across every episode (PEN-3314).
+ *
+ * Separates a generation that releases often and shallowly from one that
+ * releases once and deeply — two shapes with the same event count. Monotonic
+ * within a process; read with `increase()`.
+ */
+export const PROCESS_RSS_RELEASE_BYTES_METRIC = "paperclip_process_rss_release_bytes";
+
+/**
+ * Unix time of the START of the most recent drawdown (PEN-3314).
+ *
+ * ⭐ The headline series: the instant a trigger search aligns against. It is the
+ * LAST 1 s sample at which RSS stood at its pre-release high, not the first
+ * sample below it and not the first time that high was reached — a plateau can
+ * run for hours, and dating the onset from when the climb stopped would point a
+ * search at an arbitrary quiet instant.
+ *
+ * ABSENT until an episode is observed, deliberately. A 0 here is epoch 1970 and
+ * would make `time() - this` read as 56 years of staleness — the same hazard
+ * {@link PROCESS_MAPPING_SCAN_TIMESTAMP_METRIC} is dropped at construction for.
+ */
+export const PROCESS_RSS_RELEASE_LAST_ONSET_TIMESTAMP_METRIC =
+  "paperclip_process_rss_release_last_onset_timestamp_seconds";
+
+/**
+ * Unix time at which that drawdown first crossed the detection threshold
+ * (PEN-3314).
+ *
+ * Read WITH {@link PROCESS_RSS_RELEASE_LAST_ONSET_TIMESTAMP_METRIC}: the gap
+ * between them is the time taken to shed a FIXED number of bytes, so it is
+ * comparable across episodes and it is what separates the two shapes this row
+ * has measured. ~1 s apart is a step that completed inside one scrape; minutes
+ * apart is the ~15 minute, 3.3 GB drain. A reader holding only the detection
+ * instant cannot tell them apart and would align against the wrong end of a
+ * 15 minute window. ABSENT until an episode is observed.
+ */
+export const PROCESS_RSS_RELEASE_LAST_DETECTED_TIMESTAMP_METRIC =
+  "paperclip_process_rss_release_last_detected_timestamp_seconds";
+
+/**
+ * Peak-to-trough size of the most recent episode, in bytes (PEN-3314).
+ *
+ * Grows while a drain is still deepening, so it is the episode's running total
+ * rather than its value at detection. ABSENT until an episode is observed.
+ */
+export const PROCESS_RSS_RELEASE_LAST_BYTES_METRIC = "paperclip_process_rss_release_last_bytes";
+
+/**
+ * Liveness of the 1 s RSS sampler (PEN-3314).
+ *
+ * The qualifier WITHOUT WHICH the event count cannot be read at all: "sampled
+ * 40 000 times and saw no drawdown past 64 MiB" and "the sampler never ran" are
+ * both a zero event count and opposite conclusions. Same role, and same
+ * `rate()`-reads-the-stall property, as {@link PROCESS_HEAP_PEAK_SAMPLES_METRIC}.
+ * Never published at 0; absent means the sampler has not ticked.
+ */
+export const PROCESS_RSS_RELEASE_SAMPLES_METRIC = "paperclip_process_rss_release_samples";
+
+/**
+ * The detector's own bounds, in bytes (PEN-3314).
+ *
+ * `bound="threshold"` is the drawdown depth that opens an episode — what is
+ * detectable at all. `bound="plateau_band"` is how far below the high-water
+ * mark still counts as "at the plateau" when stamping the onset — what bounds
+ * how LATE that stamp can be.
+ *
+ * Published rather than left to the help strings, for the reason this module
+ * publishes `sampleIntervalMs` beside every sampler: a reader who cannot see
+ * the bound cannot tell a real null from an undetectable one. It also keeps
+ * the figures quoted in the help text above from drifting away from the values
+ * actually in force, since both are injectable.
+ */
+export const PROCESS_RSS_RELEASE_BOUND_BYTES_METRIC = "paperclip_process_rss_release_bound_bytes";
+
+/**
+ * GC cycles by class in a narrow window around a release ONSET, against an
+ * ambient baseline window of the same width (PEN-3314).
+ *
+ * ⭐ The join the row could not previously express. `paperclip_gc_cycles_total`
+ * is a counter, so its finest readable window is one 30 s scrape, aligned to
+ * scrape boundaries rather than to the event; the onset is dated to +/-1 s.
+ * Asking a 30 s mean about a 1 s instant is bucket SELECTION, not resolution,
+ * and that — not a shortage of evidence — is what "Prometheus is exhausted on
+ * the trigger" actually means. These counts are taken in-process from the
+ * entries' own instants.
+ *
+ * ⛔ READ BOTH `window` VALUES OR NEITHER. Major GC at event magnitude is the
+ * AMBIENT state of these processes: it holds in 93.4% of 30 s samples on
+ * instances that released, and fired 2148 times on a worker that released zero
+ * times. So `window="onset"` alone is uninterpretable — the expected count is
+ * not zero. `window="baseline"` is the same width, 300 s earlier, same
+ * generation. A ratio near 1 is the standing refutation holding at matched
+ * resolution; a ratio far from 1 is the first positive trigger result on this
+ * row. NOT an alert source.
+ */
+export const PROCESS_RSS_RELEASE_ONSET_GC_CYCLES_METRIC =
+  "paperclip_process_rss_release_onset_gc_cycles";
+
+/**
+ * Width of both windows of {@link PROCESS_RSS_RELEASE_ONSET_GC_CYCLES_METRIC},
+ * in seconds (PEN-3314). Published so a count is readable as a rate, and so the
+ * figure in force cannot drift from the help text when it is injected.
+ */
+export const PROCESS_RSS_RELEASE_ONSET_GC_WINDOW_SECONDS_METRIC =
+  "paperclip_process_rss_release_onset_gc_window_seconds";
+
+/**
+ * Whether the GC ring still held every cycle its window covers (PEN-3314).
+ *
+ * 1 = exact; 0 = entries inside the window were evicted and the counts beside
+ * it are a LOWER BOUND. ⛔ Without this, ring pressure renders as "GC did not
+ * fire" — an absence of measurement read as a measurement, which is the exact
+ * error shape this row has already paid for twice.
+ */
+export const PROCESS_RSS_RELEASE_ONSET_GC_WINDOW_COVERED_METRIC =
+  "paperclip_process_rss_release_onset_gc_window_covered";
+
+/**
+ * GC pause time by class in the same two windows as
+ * {@link PROCESS_RSS_RELEASE_ONSET_GC_CYCLES_METRIC}, in seconds (PEN-3314).
+ *
+ * ⭐ Why a second series rather than another label. The cycles series answers
+ * "did GC fire?", and that question is now ANSWERED and is not the
+ * discriminator: a major marking cycle was in flight at 23/23 release onsets
+ * against a 65.2% ambient rate, so occurrence is necessary-looking and plainly
+ * not sufficient. Whatever separates a releasing cycle from an ordinary one is
+ * therefore a PROPERTY of the cycle, and pause time is the only such property
+ * V8 already hands over on the same entry.
+ *
+ * ⚠ A CANDIDATE property, with the direction deliberately NOT asserted. V8's
+ * unmapper can free chunks on a background task rather than inside the
+ * collection, so a releasing cycle need not cost more pause. A null result is
+ * therefore informative rather than a failure: pause MOVING implicates work done
+ * inside the atomic pause, while pause FLAT with the release still landing rules
+ * that out and is consistent with work outside it — the background unmapper, the
+ * concurrent-marking threads, or work outside V8 entirely. ⛔ A flat reading
+ * closes the one branch; it does not pick among the rest.
+ *
+ * ⭐ And it is CONTINUOUS. The row's binary candidates need ~628 paired onsets
+ * for 80% power at the effect sizes measured so far, which at ~6 onsets/hour is
+ * ~4–5 days of UNINTERRUPTED onsets — a FLOOR rather than an estimate, since the
+ * ring is per-process and a restart resets the pairing rather than pausing it. A
+ * per-onset magnitude carries far more information per episode.
+ *
+ * ⛔ NOT `nodejs_gc_duration_seconds`. That histogram is observed at the scrape,
+ * aligned to scrape boundaries and labelled by `kind` alone — the same 30 s
+ * readout limit that makes the cycles series necessary. This is pause summed
+ * over a window centred on a ±1 s onset.
+ *
+ * ⛔ READ BOTH `window` VALUES OR NEITHER, exactly as for the cycle counts: GC
+ * pause is ambient too, so `window="onset"` alone has no expected value of
+ * zero to be read against. NOT an alert source.
+ */
+export const PROCESS_RSS_RELEASE_ONSET_GC_PAUSE_SECONDS_METRIC =
+  "paperclip_process_rss_release_onset_gc_pause_seconds";
+
+/**
+ * Cycles in a window that carried no usable pause duration (PEN-3314).
+ *
+ * `0` is the expected reading. Non-zero means
+ * {@link PROCESS_RSS_RELEASE_ONSET_GC_PAUSE_SECONDS_METRIC} is a LOWER BOUND
+ * for that window rather than a total. ⛔ Kept apart from
+ * {@link PROCESS_RSS_RELEASE_ONSET_GC_WINDOW_COVERED_METRIC}, which answers a
+ * different question — whether the ring still held the window — because folding
+ * two distinct failures into one flag makes them indistinguishable, which is
+ * the error shape this row has already paid for repeatedly.
+ */
+export const PROCESS_RSS_RELEASE_ONSET_GC_PAUSE_UNKNOWN_CYCLES_METRIC =
+  "paperclip_process_rss_release_onset_gc_pause_unknown_cycles";
 
 /**
  * `setting` label of the series carrying the pool's OWN idle-in-transaction
@@ -3112,6 +3662,10 @@ export const KNOWN_TERMINAL_FAILED_WAKE_ERROR_CODES = [
   "skill_materialization_pending",
   "process_lost",
   "agent_not_found",
+  // BLO-49060: the reviewer pod never started (e.g. stuck PodInitializing past
+  // its budget on a node whose container runtime stalled). Infra fault below
+  // the agent, same disposition as `adapter_failed` / `process_lost`.
+  "k8s_pod_schedule_failed",
 ] as const;
 
 export const UNKNOWN_TERMINAL_FAILED_WAKE_ERROR_CODE = "other";
@@ -4220,6 +4774,7 @@ type HeartbeatRunFailedLabel =
 let heartbeatRunFailed: Counter<HeartbeatRunFailedLabel> | null = null;
 let ccrotateCapacityDeferred: Counter<"adapter" | "provider"> | null = null;
 let retryScheduleOutcome: Counter<"outcome" | "retry_reason"> | null = null;
+let transientRetryFloor: Counter<"disposition" | "alignment"> | null = null;
 let startLockReapDisposition: Counter<"disposition"> | null = null;
 let orphanReapStageSeconds: Histogram<"stage"> | null = null;
 let penstockGateProbe: Counter<"path" | "outcome" | "provider" | "model"> | null = null;
@@ -4312,6 +4867,18 @@ let processGlibcSecondaryArenaHeapCount: Gauge | null = null;
 let processMappingScanSeconds: Gauge | null = null;
 let processMappingScanTimestamp: Gauge | null = null;
 let processHeapPeakSamples: Gauge | null = null;
+let processRssReleaseEvents: Gauge | null = null;
+let processRssReleaseBytes: Gauge | null = null;
+let processRssReleaseLastOnsetTimestamp: Gauge | null = null;
+let processRssReleaseLastDetectedTimestamp: Gauge | null = null;
+let processRssReleaseLastBytes: Gauge | null = null;
+let processRssReleaseSamples: Gauge | null = null;
+let processRssReleaseBoundBytes: Gauge<"bound"> | null = null;
+let processRssReleaseOnsetGcCycles: Gauge<"window" | "kind" | "flags"> | null = null;
+let processRssReleaseOnsetGcWindowSeconds: Gauge | null = null;
+let processRssReleaseOnsetGcWindowCovered: Gauge<"window"> | null = null;
+let processRssReleaseOnsetGcPauseSeconds: Gauge<"window" | "kind" | "flags"> | null = null;
+let processRssReleaseOnsetGcPauseUnknownCycles: Gauge<"window"> | null = null;
 let cgroupMemoryComponentBytes: Gauge<"component"> | null = null;
 let cgroupMemoryCurrentBytes: Gauge | null = null;
 let cgroupMemoryMaxBytes: Gauge | null = null;
@@ -4407,7 +4974,7 @@ let pluginWebhookDeliveryRejected:
   | null = null;
 let recoveryHorizonExpired: Counter<"delivery"> | null = null;
 let recoveryActionAutoDischarged: Counter<"kind"> | null = null;
-let workerTierProxyFailures: Counter<"reason"> | null = null;
+let workerTierProxyFailures: Counter<"reason" | "route"> | null = null;
 let isolationReaperScanned: Counter<"dry_run"> | null = null;
 let isolationReaperDeleted: Counter<"dry_run"> | null = null;
 let isolationReaperSkippedLayout: Counter<"dry_run"> | null = null;
@@ -4431,6 +4998,7 @@ function ensureRegistry(): {
   failedCounter: Counter<HeartbeatRunFailedLabel>;
   capacityDeferredCounter: Counter<"adapter" | "provider">;
   retryScheduleOutcomeCounter: Counter<"outcome" | "retry_reason">;
+  transientRetryFloorCounter: Counter<"disposition" | "alignment">;
   startLockReapDispositionCounter: Counter<"disposition">;
   orphanReapStageSecondsHistogram: Histogram<"stage">;
   penstockGateProbeCounter: Counter<"path" | "outcome" | "provider" | "model">;
@@ -4495,6 +5063,18 @@ function ensureRegistry(): {
   processMappingScanSecondsGauge: Gauge;
   processMappingScanTimestampGauge: Gauge;
   processHeapPeakSamplesGauge: Gauge;
+  processRssReleaseEventsGauge: Gauge;
+  processRssReleaseBytesGauge: Gauge;
+  processRssReleaseLastOnsetTimestampGauge: Gauge;
+  processRssReleaseLastDetectedTimestampGauge: Gauge;
+  processRssReleaseLastBytesGauge: Gauge;
+  processRssReleaseSamplesGauge: Gauge;
+  processRssReleaseBoundBytesGauge: Gauge<"bound">;
+  processRssReleaseOnsetGcCyclesGauge: Gauge<"window" | "kind" | "flags">;
+  processRssReleaseOnsetGcWindowSecondsGauge: Gauge;
+  processRssReleaseOnsetGcWindowCoveredGauge: Gauge<"window">;
+  processRssReleaseOnsetGcPauseSecondsGauge: Gauge<"window" | "kind" | "flags">;
+  processRssReleaseOnsetGcPauseUnknownCyclesGauge: Gauge<"window">;
   cgroupMemoryComponentBytesGauge: Gauge<"component">;
   cgroupMemoryCurrentBytesGauge: Gauge;
   cgroupMemoryMaxBytesGauge: Gauge;
@@ -4551,7 +5131,7 @@ function ensureRegistry(): {
   pluginWebhookDeliveryRejectedCounter: Counter<"plugin_key" | "response_class" | "plugin_status">;
   recoveryHorizonExpiredCounter: Counter<"delivery">;
   recoveryActionAutoDischargedCounter: Counter<"kind">;
-  workerTierProxyFailuresCounter: Counter<"reason">;
+  workerTierProxyFailuresCounter: Counter<"reason" | "route">;
   isolationReaperScannedCounter: Counter<"dry_run">;
   isolationReaperDeletedCounter: Counter<"dry_run">;
   isolationReaperSkippedLayoutCounter: Counter<"dry_run">;
@@ -4575,6 +5155,7 @@ function ensureRegistry(): {
     || !heartbeatRunFailed
     || !ccrotateCapacityDeferred
     || !retryScheduleOutcome
+    || !transientRetryFloor
     || !startLockReapDisposition
     || !orphanReapStageSeconds
     || !penstockGateProbe
@@ -4659,6 +5240,18 @@ function ensureRegistry(): {
     || !processMappingScanSeconds
     || !processMappingScanTimestamp
     || !processHeapPeakSamples
+    || !processRssReleaseEvents
+    || !processRssReleaseBytes
+    || !processRssReleaseLastOnsetTimestamp
+    || !processRssReleaseLastDetectedTimestamp
+    || !processRssReleaseLastBytes
+    || !processRssReleaseSamples
+    || !processRssReleaseBoundBytes
+    || !processRssReleaseOnsetGcCycles
+    || !processRssReleaseOnsetGcWindowSeconds
+    || !processRssReleaseOnsetGcWindowCovered
+    || !processRssReleaseOnsetGcPauseSeconds
+    || !processRssReleaseOnsetGcPauseUnknownCycles
     || !cgroupMemoryComponentBytes
     || !cgroupMemoryCurrentBytes
     || !cgroupMemoryMaxBytes
@@ -4851,9 +5444,16 @@ function ensureRegistry(): {
     heartbeatTimerSchedulerExclusion = new Counter({
       name: HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC,
       help:
-        "Count of due heartbeat timer ticks excluded before dispatch, labeled by a bounded "
-        + "operational reason. Each increment has durable evidence in agent_wakeup_requests "
-        + "or a scheduled_retry heartbeat run.",
+        "Count of heartbeat timer-loop exclusions, labeled by a bounded operational reason. "
+        + "Each increment has durable evidence in agent_wakeup_requests or a scheduled_retry "
+        + "heartbeat run. Two populations, both in this counter (PEN-4737): due ticks "
+        + "excluded before dispatch, once per due tick; and agents filtered before the loop "
+        + "counts them in " + HEARTBEAT_TIMER_CHECKED_METRIC + " "
+        + "(agent.not_invokable, heartbeat.disabled, heartbeat.worktree_execution_cutoff), "
+        + "rate-limited to one increment per agent per reason per hour because those three "
+        + "run above the dueness gate and would otherwise fire on every 30s scheduler pass. "
+        + "So a non-zero rate on those three is evidence of exclusion, but a zero rate over "
+        + "a window shorter than an hour is not evidence of its absence.",
       labelNames: ["reason"],
       registers: [registry],
     });
@@ -4887,10 +5487,16 @@ function ensureRegistry(): {
         + "shutdown drain. A completed pass is also dropped outright, both halves, if "
         + "either input is not a non-negative finite number -- that is logged with the "
         + "offending field and should never happen. "
-        + HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC + " cannot "
-        + "disambiguate these: it is only incremented after this counter, so it is "
-        + "silent in all of them. Rule them out from worker uptime and logs before "
-        + "restarting. Emitted by the worker, where the timer loop runs (BLO-32269).",
+        + HEARTBEAT_TIMER_SCHEDULER_EXCLUSION_METRIC + " narrows these since "
+        + "PEN-4737: a zero here alongside a non-zero agent.not_invokable, "
+        + "heartbeat.disabled or heartbeat.worktree_execution_cutoff increase means the "
+        + "per-agent loop ran and filtered every agent ahead of this counter, not that "
+        + "the loop is dead. Those three are rate-limited to one per agent per reason "
+        + "per hour, so read them over an hour or more, and a zero increase over a "
+        + "shorter window is not evidence against that case. It stays silent for "
+        + "suppression, startup recovery and the shutdown drain -- rule those out from "
+        + "worker uptime and logs before restarting. Emitted by the worker, where the "
+        + "timer loop runs (BLO-32269).",
       registers: [registry],
     });
     heartbeatTimerEnqueued = new Counter({
@@ -4982,6 +5588,49 @@ function ensureRegistry(): {
     for (const outcome of KNOWN_RETRY_SCHEDULE_OUTCOMES) {
       for (const retry_reason of KNOWN_RETRY_SCHEDULE_REASONS) {
         retryScheduleOutcome.inc({ outcome, retry_reason }, 0);
+      }
+    }
+    transientRetryFloor = new Counter({
+      name: TRANSIENT_RETRY_FLOOR_METRIC,
+      help:
+        "Count of transient_failure retry-FLOOR dispersion decisions (PEN-4145), by disposition "
+        + "and by the sub-second signature of the instant the decision produced. Before this "
+        + "counter neither branch of the PEN-2509 dispersion fix emitted anything at all, so the "
+        + "only durable trace of a dispersion decision was the scheduled_retry_at value on a run "
+        + "row -- which is why the first fix was live, fleet-wide and WRONG for six weeks and was "
+        + "caught only by a hand census (16.55%, 160/967, on 2026-10-12). READ IT AS A SHARE, not "
+        + "a count: the clamp arrives in bursts tied to upstream flapping (0 parks/day on "
+        + "2026-10-13..15 vs 132/day on 2026-10-05), so no count threshold can both catch a "
+        + "regression and stay quiet. alignment='off_grid' is healthy and should be ~99.9% of "
+        + "every disposition -- jitter is drawn in milliseconds, so a dispersed instant lands on "
+        + "a whole second with p~1/1000 and on the :M9:59 grid with p~1/600000, while a verbatim "
+        + "provider instant lands on one with p~1. Recorded pre-fix baselines: 94.03% (126/134) "
+        + "aligned within the clamped population, 20.43% (153/749) unconditional. ALWAYS carry "
+        + "the denominator -- a zero numerator over a zero denominator is a quiet upstream, not a "
+        + "healthy scheduler, and that 0/0 is exactly the false clear that closed PEN-2509 in "
+        + "August with AC4 recorded as sample size 0. The denominator counts floor DECISIONS, not "
+        + "transient parks: a park with no floor takes the base backoff curve, carries its own "
+        + "jitter, never herded, and is absent here. The two exempt_* dispositions are split "
+        + "because WHICH marker exempted a floor is the thing that silently broke -- a predicate "
+        + "regression does not move the exempt share, it moves which marker produces it, so an "
+        + "undifferentiated exempt would have read identically before and after the 2026-08-29 "
+        + "fix failed; use disposition=~\"exempt_.*\" where that distinction does not matter. "
+        + "Every disposition x alignment series is zero-seeded at start, so increase() can see "
+        + "the first event after each restart -- a series born at 1 evaluates to 0 forever and "
+        + "would reproduce this ticket's own blindness inside its detector. A 0 is therefore a "
+        + "real reading ('this pod made no floor decision of this shape'), NOT a missing metric: "
+        + "do NOT alert on absent() here. Cardinality is fixed at 4 x 3 forever.",
+      labelNames: ["disposition", "alignment"],
+      registers: [registry],
+    });
+    // PEN-4145: zero-seed the full closed grid, for the reason spelled out in
+    // the help above and in TRANSIENT_RETRY_FLOOR_METRIC's own comment. This is
+    // the single most load-bearing line in this block: without it the alert
+    // that reads this counter is permanently silent, which is the failure this
+    // ticket exists to remove rather than to re-introduce one layer down.
+    for (const disposition of TRANSIENT_RETRY_FLOOR_DISPOSITIONS) {
+      for (const alignment of RETRY_INSTANT_ALIGNMENTS) {
+        transientRetryFloor.inc({ disposition, alignment }, 0);
       }
     }
     orphanReapStageSeconds = new Histogram({
@@ -5288,6 +5937,249 @@ function ensureRegistry(): {
     // scrape onward, and so that property belongs to the metric rather than to
     // the order in which `/metrics` happens to call its refreshers.
     processHeapPeakSamples.remove();
+    processRssReleaseEvents = new Gauge({
+      name: PROCESS_RSS_RELEASE_EVENTS_METRIC,
+      help:
+        "RSS release episodes detected by the 1s sampler over this process's life (PEN-3314). "
+        + "An episode opens when resident memory falls 64 MiB below its running high-water "
+        + "mark and closes when it recovers 64 MiB above the trough. This is the counterpart "
+        + "to the *_peak components of "
+        + PROCESS_MEMORY_COMPONENT_BYTES_METRIC
+        + ", which are maxima and so cannot record a release at all. "
+        + "It is a DRAWDOWN detector, not a per-sample delta: the measured 3.3 GB release took "
+        + "~15 minutes (~3.6 MB/s), which no edgewise threshold above ordinary churn would ever "
+        + "catch, so one episode covers a whole drain rather than minting an event per sample. "
+        + "Monotonic within a process; on restart the series goes ABSENT and reappears from 0 "
+        + "rather than stepping down, so read it with increase() and never as a level. "
+        + "A ZERO IS NOT EVIDENCE THAT NO RELEASE OCCURRED -- read it against "
+        + PROCESS_RSS_RELEASE_SAMPLES_METRIC
+        + ", without which 'sampled 40000 times and saw nothing' and 'the sampler never ran' are "
+        + "the same number and opposite conclusions. NOT an alert source.",
+      registers: [registry],
+    });
+    processRssReleaseBytes = new Gauge({
+      name: PROCESS_RSS_RELEASE_BYTES_METRIC,
+      help:
+        "Cumulative peak-to-trough bytes returned across every detected episode (PEN-3314). "
+        + "Separates a generation that releases often and shallowly from one that releases once "
+        + "and deeply -- two shapes with the same episode count. Monotonic within a process; "
+        + "read with increase(), never as a level. NOT an alert source.",
+      registers: [registry],
+    });
+    processRssReleaseLastOnsetTimestamp = new Gauge({
+      name: PROCESS_RSS_RELEASE_LAST_ONSET_TIMESTAMP_METRIC,
+      help:
+        "Unix time of the START of the most recent RSS drawdown (PEN-3314). THE HEADLINE "
+        + "SERIES: the instant to align a trigger search against. As of 2026-10-26 nothing in "
+        + "Prometheus marked this instant -- not GC, in-flight runs, dispatch, container stall "
+        + "or node PSI -- and the finest timestamp available was +/-300 s, floored by the "
+        + "/proc/self/smaps scan's own O(resident pages) cost. This is +/-1 s. "
+        + "It is the LAST 1s sample at which RSS stood at its pre-release high: not the first "
+        + "sample below it, and not the first time that high was reached, because a plateau can "
+        + "run for hours and dating the onset from when the CLIMB stopped would point a search "
+        + "at an arbitrary quiet instant. "
+        + "ABSENT until an episode is observed, deliberately -- a 0 is epoch 1970 and makes "
+        + "time() - this read as 56 years of staleness. NOT an alert source.",
+      registers: [registry],
+    });
+    processRssReleaseLastDetectedTimestamp = new Gauge({
+      name: PROCESS_RSS_RELEASE_LAST_DETECTED_TIMESTAMP_METRIC,
+      help:
+        "Unix time at which the most recent drawdown first crossed the 64 MiB detection "
+        + "threshold (PEN-3314). READ IT WITH "
+        + PROCESS_RSS_RELEASE_LAST_ONSET_TIMESTAMP_METRIC
+        + ": the gap between them is the time taken to shed a FIXED number of bytes, so it is "
+        + "comparable across episodes, and it is what tells the two measured shapes apart. ~1 s "
+        + "apart is a step that completed inside one scrape; minutes apart is the ~15 minute, "
+        + "3.3 GB drain. A reader holding only the detection instant cannot distinguish them and "
+        + "would align evidence against the wrong end of a 15 minute window. "
+        + "ABSENT until an episode is observed. NOT an alert source.",
+      registers: [registry],
+    });
+    processRssReleaseLastBytes = new Gauge({
+      name: PROCESS_RSS_RELEASE_LAST_BYTES_METRIC,
+      help:
+        "Peak-to-trough size of the most recent RSS release episode, in bytes (PEN-3314). "
+        + "Grows while a drain is still deepening, so it is the episode's running total rather "
+        + "than its value at detection -- max_over_time() gives the largest release a process "
+        + "has seen. ABSENT until an episode is observed. NOT an alert source.",
+      registers: [registry],
+    });
+    processRssReleaseSamples = new Gauge({
+      name: PROCESS_RSS_RELEASE_SAMPLES_METRIC,
+      help:
+        "Samples the 1s RSS release sampler has folded in over this process's life (PEN-3314). "
+        + "The qualifier WITHOUT WHICH "
+        + PROCESS_RSS_RELEASE_EVENTS_METRIC
+        + " cannot be read: a zero event count means 'no release past 64 MiB happened' only if "
+        + "the sampler was running, and means nothing at all if it was not. "
+        + "The sampler runs on the event loop and the step it exists to date STALLS the event "
+        + "loop, so rate() over this series separates a quiet process from a stalled one and a "
+        + "dip IS the stall, measured rather than inferred. A healthy sampler rates at ~1.0/s. "
+        + "Monotonic within a process; read with rate()/increase(), never as a level. Never "
+        + "published at 0 -- absent means the sampler has not ticked yet. NOT an alert source.",
+      registers: [registry],
+    });
+    // Every one of these six is LABEL-LESS, and prom-client renders a label-less
+    // gauge as `name 0` from the moment it is registered -- before anything has
+    // measured anything. Each zero is a specific wrong answer: no releases ever,
+    // nothing returned, two epoch-1970 timestamps that read as 56 years of
+    // staleness, a zero-byte release, and a sampler that rate() reads as a
+    // permanently stalled event loop. Drop them at construction so "nothing has
+    // been observed yet" is ABSENT from the first scrape onward, and so that
+    // property belongs to the metrics rather than to the order in which
+    // `/metrics` happens to call its refreshers.
+    processRssReleaseBoundBytes = new Gauge({
+      name: PROCESS_RSS_RELEASE_BOUND_BYTES_METRIC,
+      help:
+        "The RSS release detector's own bounds, in bytes (PEN-3314). bound=threshold is the "
+        + "drawdown below the running high-water mark that opens an episode -- it bounds what is "
+        + "DETECTABLE: a shallower drawdown is not reported, and a release that completes and "
+        + "fully refills inside one 1s sample is invisible. bound=plateau_band is how far below "
+        + "the mark still counts as 'at the plateau' when stamping "
+        + PROCESS_RSS_RELEASE_LAST_ONSET_TIMESTAMP_METRIC
+        + " -- it bounds how LATE that stamp can be, because on a slow drain the onset lands at "
+        + "the last sample still inside the band (~4 s at the measured 3.6 MB/s). The band "
+        + "exists because the mark is an exact byte maximum and real RSS is noisy around a "
+        + "plateau: without it one high spike pins the onset to itself for the rest of the "
+        + "plateau, publishing an onset hours early. "
+        + "Published rather than left to these help strings because both values are injectable "
+        + "and a reader who cannot see the bound in force cannot tell a real null from an "
+        + "undetectable one. NOT an alert source.",
+      labelNames: ["bound"],
+      registers: [registry],
+    });
+    processRssReleaseOnsetGcCycles = new Gauge({
+      name: PROCESS_RSS_RELEASE_ONSET_GC_CYCLES_METRIC,
+      help:
+        "GC cycles by {kind, flags} in a narrow window around an RSS release ONSET, beside an "
+        + "ambient baseline window of the same width 300s earlier in the same generation "
+        + "(PEN-3314). Counted IN-PROCESS from the perf_hooks entries' own instants, because "
+        + "paperclip_gc_cycles_total is a counter whose finest readable window is one 30s scrape "
+        + "aligned to scrape boundaries -- asking that about a +/-1s onset selects a bucket "
+        + "rather than resolving one, which is what 'Prometheus is exhausted on the trigger' "
+        + "means on this row. "
+        + "READ BOTH window VALUES OR NEITHER: major GC at event magnitude is the AMBIENT state "
+        + "of these processes (true in 93.4% of 30s samples on instances that released; 2148 "
+        + "cycles on a worker that released zero times), so window=onset alone is "
+        + "uninterpretable -- its expected count is not zero. Compare it against window=baseline. "
+        + "A ratio near 1 is the standing 'GC does not mark the instant' refutation holding at "
+        + "matched resolution; a ratio far from 1 is the first positive trigger result here. "
+        + "Counts are frozen per onset, so they describe the episode rather than the ring's "
+        + "current contents. THEREFORE THIS SERIES CANNOT COUNT EPISODES, and summing it to "
+        + "look for one is a measured trap: a new onset whose multiset repeats renders as no "
+        + "change at all. Measured on paperclip-0, 2026-10-28: the onsets at 00:14:48Z, "
+        + "00:28:31Z, 00:34:14Z and 01:08:27Z were four distinct consecutive episodes that "
+        + "all carried the byte-identical vector minor 4 / incremental 1 / major 1, and this "
+        + "series registered ONE change across them -- it saw the first and missed the other "
+        + "three. Take episode boundaries from "
+        + PROCESS_RSS_RELEASE_LAST_ONSET_TIMESTAMP_METRIC
+        + " and nothing else. "
+        + "flags is a PIPE-JOINED SET, not an enum -- the same flag appears bare and in "
+        + "composites (all_external_memory and "
+        + "synchronous_phantom_processing|all_external_memory are both live), so an equality "
+        + "match on one silently drops the other. Which {kind, flags} class marks the unmapper "
+        + "path is NOT asserted: read the distribution, do not filter on a predicted label. "
+        + "A class present in window=onset is not a discriminator until it is checked against "
+        + "window=baseline on the SAME instance -- major/all_external_memory was read as "
+        + "onset-only at n=3 and falsified at n=4 by a baseline carrying it at equal count. "
+        + "Qualify every reading with "
+        + PROCESS_RSS_RELEASE_ONSET_GC_WINDOW_COVERED_METRIC
+        + ". NOT an alert source.",
+      labelNames: ["window", "kind", "flags"],
+      registers: [registry],
+    });
+    processRssReleaseOnsetGcWindowSeconds = new Gauge({
+      name: PROCESS_RSS_RELEASE_ONSET_GC_WINDOW_SECONDS_METRIC,
+      help:
+        "Width in seconds of both windows of " + PROCESS_RSS_RELEASE_ONSET_GC_CYCLES_METRIC
+        + " (PEN-3314). Published so a count is readable as a rate and so the width actually in "
+        + "force cannot drift from the help text, since it is injectable. NOT an alert source.",
+      registers: [registry],
+    });
+    processRssReleaseOnsetGcWindowCovered = new Gauge({
+      name: PROCESS_RSS_RELEASE_ONSET_GC_WINDOW_COVERED_METRIC,
+      help:
+        "1 when the in-process GC ring still held every cycle the matching window of "
+        + PROCESS_RSS_RELEASE_ONSET_GC_CYCLES_METRIC
+        + " covers; 0 when entries inside it were evicted, making those counts a LOWER BOUND "
+        + "(PEN-3314). Without this series, ring pressure renders as 'GC did not fire' -- an "
+        + "absence of measurement read as a measurement, which is the error shape this row has "
+        + "already paid for twice (v8_heap_physical read as a metric name; size_bucket read as "
+        + "bucket_bytes). A 0 is most likely on window=baseline early in a generation, where the "
+        + "ring does not reach back 300s yet -- either because it has evicted that far or because "
+        + "the process was not yet watching, both of which read as 0 here. A window=baseline that "
+        + "is ABSENT rather than 0 is a third case: the previous release's onset fell inside the "
+        + "control window, so no control is published and the onset counts beside it are not "
+        + "readable as a ratio. NOT an alert source.",
+      labelNames: ["window"],
+      registers: [registry],
+    });
+    processRssReleaseOnsetGcPauseSeconds = new Gauge({
+      name: PROCESS_RSS_RELEASE_ONSET_GC_PAUSE_SECONDS_METRIC,
+      help:
+        "GC pause time in seconds by {kind, flags} in the same two windows as "
+        + PROCESS_RSS_RELEASE_ONSET_GC_CYCLES_METRIC
+        + " (PEN-3314). That series answers 'did GC fire?', and the answer is in: a major "
+        + "marking cycle was in flight at 23/23 release onsets against a 65.2% ambient rate "
+        + "(McNemar p=0.0078), so OCCURRENCE is necessary-looking and plainly NOT SUFFICIENT, "
+        + "and whatever separates a releasing cycle from an ordinary one is a PROPERTY of the "
+        + "cycle rather than its existence. Pause time is the only such property V8 hands over "
+        + "on the same perf_hooks entry. "
+        + "IT IS A CANDIDATE AND THE DIRECTION IS NOT ASSERTED: V8's unmapper can free chunks "
+        + "on a BACKGROUND task rather than inside the collection, so a releasing cycle need "
+        + "not cost more pause at all. That makes a null here informative rather than a "
+        + "failure -- pause MOVING implicates work inside the atomic pause, and pause FLAT "
+        + "while the release still lands RULES THAT OUT and is consistent with work outside "
+        + "it: the background unmapper, the concurrent-marking threads, or work outside V8 "
+        + "entirely. A flat reading closes the one branch and does NOT pick among the rest. "
+        + "Do NOT read this series as a claim that the releasing cycle is the longer one. "
+        + "It is also CONTINUOUS, which is the point -- the binary candidates on this row need "
+        + "~628 paired onsets for 80% power, which at ~6 onsets/hour is ~4-5 days of "
+        + "UNINTERRUPTED onsets, and that is a FLOOR rather than an estimate: the ring is "
+        + "per-process, so a restart resets the pairing rather than pausing it. A per-onset "
+        + "magnitude carries far more information per episode. "
+        + "NOT nodejs_gc_duration_seconds: that histogram is observed at the scrape, aligned to "
+        + "scrape boundaries and labelled by kind alone, which is the same 30s readout limit "
+        + "that makes the cycles series necessary; this is pause summed over a window centred "
+        + "on a +/-1s onset. "
+        + "READ BOTH window VALUES OR NEITHER -- GC pause is ambient too, so window=onset has "
+        + "no expected value of zero to be read against. Divide by the matching "
+        + PROCESS_RSS_RELEASE_ONSET_GC_CYCLES_METRIC
+        + " for a mean pause per cycle, which separates 'more cycles' from 'longer cycles' and "
+        + "is the comparison this series exists for. Qualify with "
+        + PROCESS_RSS_RELEASE_ONSET_GC_WINDOW_COVERED_METRIC
+        + " and with "
+        + PROCESS_RSS_RELEASE_ONSET_GC_PAUSE_UNKNOWN_CYCLES_METRIC
+        + ". Frozen per onset, so it describes the episode and not the ring's current "
+        + "contents, and therefore CANNOT COUNT EPISODES -- take boundaries from "
+        + PROCESS_RSS_RELEASE_LAST_ONSET_TIMESTAMP_METRIC
+        + " and nothing else. NOT an alert source.",
+      labelNames: ["window", "kind", "flags"],
+      registers: [registry],
+    });
+    processRssReleaseOnsetGcPauseUnknownCycles = new Gauge({
+      name: PROCESS_RSS_RELEASE_ONSET_GC_PAUSE_UNKNOWN_CYCLES_METRIC,
+      help:
+        "Cycles inside the matching window that carried no usable pause duration, making "
+        + PROCESS_RSS_RELEASE_ONSET_GC_PAUSE_SECONDS_METRIC
+        + " a LOWER BOUND rather than a total (PEN-3314). 0 is the expected reading -- Node's "
+        + "gc entries always carry a duration -- so any non-zero value is itself a finding "
+        + "about the instrument, not about the workload. Deliberately NOT folded into "
+        + PROCESS_RSS_RELEASE_ONSET_GC_WINDOW_COVERED_METRIC
+        + ", which answers the different question of whether the ring still held the window: "
+        + "one flag standing for two unrelated failures makes them indistinguishable, which is "
+        + "the error shape this row has already paid for repeatedly. NOT an alert source.",
+      labelNames: ["window"],
+      registers: [registry],
+    });
+    processRssReleaseEvents.remove();
+    processRssReleaseOnsetGcWindowSeconds.remove();
+    processRssReleaseBytes.remove();
+    processRssReleaseLastOnsetTimestamp.remove();
+    processRssReleaseLastDetectedTimestamp.remove();
+    processRssReleaseLastBytes.remove();
+    processRssReleaseSamples.remove();
     cgroupMemoryComponentBytes = new Gauge({
       name: CGROUP_MEMORY_COMPONENT_BYTES_METRIC,
       help:
@@ -5302,10 +6194,19 @@ function ensureRegistry(): {
         + "component=shmem keeps an exclusion checkable: the pod's emptyDirs set no "
         + "medium: Memory, so a non-zero reading REFUTES that and is itself a finding. "
         + "NOT A PARTITION -- slab is the kernel's own total of slab_reclaimable + "
-        + "slab_unreclaimable, published beside its parts rather than derived, so do not sum "
-        + "these and expect "
+        + "slab_unreclaimable, and inactive_file/active_file/file_mapped/file_dirty/"
+        + "file_writeback are all subsets of file, every one published beside its parts "
+        + "rather than derived, so do not sum these and expect "
         + CGROUP_MEMORY_CURRENT_BYTES_METRIC
-        + ". It CONFIRMS THE CLASS ONLY and cannot name the slab cache: cgroup v2 reports "
+        + ". The file breakdown exists because page cache, not slab, led the first climb "
+        + "this gauge measured; the figures and their caveats live on PEN-3692 and on "
+        + "CGROUP_FILE_COMPONENT in services/cgroup-memory-metrics.ts, not in this help "
+        + "string, which would go stale the next time the series is measured. Read "
+        + "inactive_file for the cache the kernel gives back FIRST under pressure; "
+        + "file_mapped, file_dirty and file_writeback are the part it cannot, and they "
+        + "OVERLAP both each other and the active/inactive LRU counters -- a page can be "
+        + "mapped AND dirty AND on the inactive list -- so they BOUND that part rather "
+        + "than sum to it. THIS GAUGE CONFIRMS THE CLASS ONLY and cannot name the slab cache: cgroup v2 reports "
         + "slab_reclaimable as one scalar with no per-cache breakdown, so dentry vs inode vs "
         + "buffer_head still needs host /proc/slabinfo. An absent component means this kernel "
         + "does not report that field; absence of the whole metric means memory.stat was "
@@ -6206,7 +7107,19 @@ function ensureRegistry(): {
         + "stuck\" render identically on a dashboard. Published from the heartbeat recovery "
         + "chain, so it exists on the workers tier only and refreshes per chain rather than "
         + "per tick; reset-then-set every refresh, so a repaired row drops the agent back "
-        + "to 0 instead of freezing at its last value.",
+        + "to 0 instead of freezing at its last value. ⚠ That reset is per-refresh, NOT "
+        + "per-leadership-change: a worker demoted in process by a lease handoff stops "
+        + "refreshing and keeps exporting the ages it last published, so aggregating "
+        + "across replicas re-serves a repaired row's frozen age indefinitely "
+        + "(PEN-4665). Scope any query to the current lease holder, exactly as for "
+        + COLD_IN_REVIEW_ISSUE_METRICS_REFRESH_SUCCESS_METRIC + ", e.g. `"
+        + coldInReviewLeaderScopedExpr(
+          COLD_IN_REVIEW_ISSUE_OLDEST_AGE_METRIC, "> 86400", "max by (agent_id)")
+        + "`. ⛔ Two things there are load-bearing. The aggregation must WRAP the "
+        + "join, because `and on (pod)` needs the pod label on both sides and `max by "
+        + "(agent_id)` has already dropped it. And the parentheses around the join must "
+        + "stay, because PromQL binds comparison tighter than `and`. Drop either and the "
+        + "alert can never fire. The declaration comment on this metric owns that rule.",
       labelNames: ["agent_id"],
       registers: [registry],
     });
@@ -6218,25 +7131,29 @@ function ensureRegistry(): {
         + "could not be read, so a stale cold-row age cannot be read as fresh (PEN-4652). "
         + "Note this tracks the heartbeat recovery chain, NOT the scrape-metrics collector "
         + "that carries the other refresh-success gauges in this file -- it can be 1 while "
-        + "every one of those is 0, and the reverse. ⚠ A service=\"paperclip-workers\" "
-        + "selector is NECESSARY BUT NOT SUFFICIENT on this series, and an alert that "
-        + "stops there still pages forever. Two things make a replica read a permanent "
-        + "0. First the tier: the registry is constructed everywhere and seeds this "
-        + "gauge to 0, but only the workers tier runs the recovery chain, so every api "
-        + "replica exports a 0 it will never refresh. Second, and the one the selector "
-        + "does NOT cover: the chain is a SINGLE-LEADER process within the workers tier "
-        + "too, so at any instant exactly one worker replica refreshes this gauge and "
-        + "every other worker replica is also sitting at a permanent 0 while behaving "
-        + "correctly. Measured 2026-10-24 against live Prometheus: "
-        + "paperclip_heartbeat_recovery_chain_duration_seconds read 645s on "
-        + "`paperclip-1` and 0 on `paperclip-0` -- both workers -- having been the "
-        + "other way round before leadership moved at ~07:30Z, while both "
-        + "`paperclip-api-*` replicas held 0 throughout. So the predicate must "
-        + "AGGREGATE ACROSS REPLICAS and ask whether NO worker refreshed, e.g. `max by "
-        + "(service) (<series>{service=\"paperclip-workers\"}) == 0`; any per-replica "
-        + "`== 0`, scoped or not, fires on the standby. Same shape as the pre-seeded "
-        + "backstop counters documented above, which were likewise measured on one "
-        + "worker replica alone.",
+        + "every one of those is 0, and the reverse. ⚠ DO NOT alert per-replica, and do "
+        + "NOT aggregate across the workers tier either. THREE classes of replica read a "
+        + "0 or a stale 1 while behaving correctly: every api replica (the registry is "
+        + "constructed everywhere and seeds this gauge to 0, but only workers run the "
+        + "chain); every non-leader worker (the chain is SINGLE-LEADER within the tier); "
+        + "and -- the one a `max by (service)` aggregate gets WRONG, fail-open -- a "
+        + "worker demoted in process by a lease handoff, which keeps exporting its last "
+        + "1 because nothing resets this gauge on lease loss (PEN-4665). Scope to the "
+        + "current lease holder instead: `"
+        + coldInReviewLeaderScopedExpr(COLD_IN_REVIEW_ISSUE_METRICS_REFRESH_SUCCESS_METRIC, "== 0")
+        + "`. The join needs no service selector, because only replicas publishing a "
+        + "lease indicator survive it. ⛔ Note the OUTER parentheses are load-bearing: "
+        + "PromQL binds `==` tighter than `and`, so dropping them parses the comparison "
+        + "against the lease gauge instead and yields an alert that can never fire. "
+        + "⚠ And size `for:` off the CHAIN duration, never the tick interval: just after a "
+        + "handoff the join correctly selects the new holder, whose flag is still at its "
+        + "seeded 0 until its first chain completes, so a short `for:` pages on every "
+        + "handoff. Worst chain on the workers tier over the 7d to 2026-10-28 was 2985s "
+        + "(~50min); an hour is a reasonable starting floor. See "
+        + "the declaration comment on "
+        + COLD_IN_REVIEW_ISSUE_OLDEST_AGE_METRIC + " for the full derivation, the "
+        + "rejected alternatives, and the deliberate handover-gap caveat; that comment "
+        + "owns this rule and this help text defers to it.",
       registers: [registry],
     });
     coldInReviewIssueMetricsRefreshSuccess.set(0);
@@ -6806,7 +7723,7 @@ function ensureRegistry(): {
       help:
         "Execution-workspace tree removals attempted, labeled by trigger "
         + "(persist_rollback, collector, operator, unknown), method (worktree_remove, "
-        + "remove_local_fs), cleanup_reason and outcome (PEN-3692). \u26d4 READ "
+        + "remove_local_fs), cleanup_reason and outcome (PEN-3692). ⛔ READ "
         + "cleanup_reason, NOT trigger, to attribute work to runs: run end performs no "
         + "inline teardown, so run-attributable removal is inside trigger=\"collector\" "
         + "with cleanup_reason=\"run_ended\", and trigger=\"persist_rollback\" counts "
@@ -6955,21 +7872,25 @@ function ensureRegistry(): {
         "Count of worker-tier proxy relay failures, labeled by reason: 'timeout' "
         + "(connection succeeded, the worker was still silent at the proxy deadline), "
         + "'mid_stream' (the worker answered and the response broke after headers "
-        + "were flushed) or 'unreachable' (the request never reached a worker). "
+        + "were flushed) or 'unreachable' (the request never reached a worker), and "
+        + "by route (the proxied Express path pattern that failed). "
         + "Replaces a log grep that could not answer a 24h question, because the api "
         + "pod's log does not survive its own recreation (BLO-31945).",
-      labelNames: ["reason"],
+      labelNames: ["reason", "route"],
       registers: [registry],
     });
     // Zero-init every series. An un-incremented counter is absent from the
     // scrape, and an absent series is indistinguishable from a healthy one on
     // every dashboard — rate() over it returns nothing rather than 0.
-    for (const reason of KNOWN_WORKER_TIER_PROXY_FAILURE_REASONS) {
-      workerTierProxyFailures.inc({ reason }, 0);
-    }
+    zeroInitWorkerTierProxyFailureSeries(workerTierProxyFailures);
     // Process/runtime metrics make the scrape target carry meaningful data even
     // before any refusal is reported (manual-verification check #3 on BLO-8328).
     collectDefaultMetrics({ register: registry });
+    // That default set labels GC by `kind` alone and discards V8's `flags`
+    // bitfield, which is the dimension PEN-3314 needs to tell a memory-reducing
+    // full GC from an ordinary major. Observes the same event stream; no extra
+    // syscall and no cadence change. See `services/gc-flags-metrics.ts`.
+    registerGcFlagsCollector({ registry });
   }
   return {
     registry,
@@ -6979,6 +7900,7 @@ function ensureRegistry(): {
     failedCounter: heartbeatRunFailed,
     capacityDeferredCounter: ccrotateCapacityDeferred,
     retryScheduleOutcomeCounter: retryScheduleOutcome,
+    transientRetryFloorCounter: transientRetryFloor,
     startLockReapDispositionCounter: startLockReapDisposition,
     orphanReapStageSecondsHistogram: orphanReapStageSeconds,
     penstockGateProbeCounter: penstockGateProbe,
@@ -7066,6 +7988,18 @@ function ensureRegistry(): {
     processMappingScanSecondsGauge: processMappingScanSeconds,
     processMappingScanTimestampGauge: processMappingScanTimestamp,
     processHeapPeakSamplesGauge: processHeapPeakSamples,
+    processRssReleaseEventsGauge: processRssReleaseEvents,
+    processRssReleaseBytesGauge: processRssReleaseBytes,
+    processRssReleaseLastOnsetTimestampGauge: processRssReleaseLastOnsetTimestamp,
+    processRssReleaseLastDetectedTimestampGauge: processRssReleaseLastDetectedTimestamp,
+    processRssReleaseLastBytesGauge: processRssReleaseLastBytes,
+    processRssReleaseSamplesGauge: processRssReleaseSamples,
+    processRssReleaseBoundBytesGauge: processRssReleaseBoundBytes,
+    processRssReleaseOnsetGcCyclesGauge: processRssReleaseOnsetGcCycles,
+    processRssReleaseOnsetGcWindowSecondsGauge: processRssReleaseOnsetGcWindowSeconds,
+    processRssReleaseOnsetGcWindowCoveredGauge: processRssReleaseOnsetGcWindowCovered,
+    processRssReleaseOnsetGcPauseSecondsGauge: processRssReleaseOnsetGcPauseSeconds,
+    processRssReleaseOnsetGcPauseUnknownCyclesGauge: processRssReleaseOnsetGcPauseUnknownCycles,
     cgroupMemoryComponentBytesGauge: cgroupMemoryComponentBytes,
     cgroupMemoryCurrentBytesGauge: cgroupMemoryCurrentBytes,
     cgroupMemoryMaxBytesGauge: cgroupMemoryMaxBytes,
@@ -7354,6 +8288,37 @@ export function recordRetryScheduleOutcome(
     retry_reason: coerceRetryScheduleReason(input.retryReason),
   };
   ensureRegistry().retryScheduleOutcomeCounter.inc(labels);
+  return labels;
+}
+
+/**
+ * Record one transient retry-floor dispersion decision (PEN-4145).
+ *
+ * Both labels are coerced to their compile-time allow-lists, so worst-case
+ * series count is fixed at
+ * `TRANSIENT_RETRY_FLOOR_DISPOSITIONS.length * RETRY_INSTANT_ALIGNMENTS.length`
+ * whatever a caller passes. Deliberately carries no `agent_id`: the regression
+ * this detects is fleet-wide routing, and the measured signature was a COHORT
+ * sharing one instant across agents -- per-agent series would split exactly the
+ * population whose concentration is the signal.
+ *
+ * Returns the resolved labels so the caller can put them in the run event
+ * alongside, and so a test can assert on the classification without reading the
+ * registry.
+ */
+export function recordTransientRetryFloorDisposition(input: {
+  disposition: TransientRetryFloorDisposition;
+  alignment: RetryInstantAlignment;
+}): { disposition: TransientRetryFloorDisposition; alignment: RetryInstantAlignment } {
+  const labels = {
+    disposition: (TRANSIENT_RETRY_FLOOR_DISPOSITIONS as readonly string[]).includes(input.disposition)
+      ? input.disposition
+      : ("superseded" as const),
+    alignment: (RETRY_INSTANT_ALIGNMENTS as readonly string[]).includes(input.alignment)
+      ? input.alignment
+      : ("off_grid" as const),
+  };
+  ensureRegistry().transientRetryFloorCounter.inc(labels);
   return labels;
 }
 
@@ -8198,6 +9163,123 @@ export function setNativeMemoryMetrics(snapshot: NativeMemorySnapshot | null): v
   // sample), which is what keeps "absent" unambiguous.
   if (snapshot.heapPeakSampleCount !== null) {
     metrics.processHeapPeakSamplesGauge.set(snapshot.heapPeakSampleCount);
+  }
+}
+
+/**
+ * PEN-3314: publish the RSS release record.
+ *
+ * `remove()` on every series, NOT `reset()`, for the reason spelled out on
+ * {@link setNativeMemoryMetrics}: these are label-less gauges, `reset()` returns
+ * a label-less gauge to a *published* 0, and here each of those zeroes is a
+ * specific wrong answer rather than merely a vague one — no release ever
+ * happened, nothing was ever returned, the release began in 1970, and a sampler
+ * that `rate()` reads as a permanently stalled event loop.
+ *
+ * The three `last_*` series stay ABSENT until an episode has actually been
+ * observed, which is why they are published from a `null` check rather than
+ * defaulted. "This process has not released since it started" is a real and
+ * interesting reading, and it must not be rendered as a release of zero bytes at
+ * epoch 1970 — a reader computing `time() - onset` on that would get 56 years.
+ *
+ * A `null` reading publishes nothing at all: the sampler has never ticked, and
+ * on this row "cannot measure" and "measured zero" must never render identically.
+ */
+export function setRssReleaseMetrics(reading: RssReleaseReading | null): void {
+  const metrics = ensureRegistry();
+  metrics.processRssReleaseEventsGauge.remove();
+  metrics.processRssReleaseBytesGauge.remove();
+  metrics.processRssReleaseLastOnsetTimestampGauge.remove();
+  metrics.processRssReleaseLastDetectedTimestampGauge.remove();
+  metrics.processRssReleaseLastBytesGauge.remove();
+  metrics.processRssReleaseSamplesGauge.remove();
+  metrics.processRssReleaseBoundBytesGauge.reset();
+  if (!reading) return;
+
+  // Published even at 0, unlike the `last_*` series below: a live sampler that
+  // has seen no release is exactly what this series is for, and it is readable
+  // as such only because the sample count beside it says the sampler is alive.
+  metrics.processRssReleaseEventsGauge.set(reading.releaseCount);
+  metrics.processRssReleaseBytesGauge.set(reading.releasedBytesTotal);
+  metrics.processRssReleaseSamplesGauge.set(reading.sampleCount);
+  // The bounds in force, so every null above is readable as "below this" rather
+  // than as "nothing happened". Set from the reading, never from the constants,
+  // so an injected threshold cannot be contradicted by its own help text.
+  metrics.processRssReleaseBoundBytesGauge.set({ bound: "threshold" }, reading.thresholdBytes);
+  metrics.processRssReleaseBoundBytesGauge.set({ bound: "plateau_band" }, reading.plateauBandBytes);
+
+  if (reading.lastOnsetAtMs !== null) {
+    metrics.processRssReleaseLastOnsetTimestampGauge.set(reading.lastOnsetAtMs / 1000);
+  }
+  if (reading.lastDetectedAtMs !== null) {
+    metrics.processRssReleaseLastDetectedTimestampGauge.set(reading.lastDetectedAtMs / 1000);
+  }
+  if (reading.lastReleaseBytes !== null) {
+    metrics.processRssReleaseLastBytesGauge.set(reading.lastReleaseBytes);
+  }
+}
+
+/**
+ * PEN-3314: publish the GC windows around the most recent release onset.
+ *
+ * `reset()` on the labelled series so a class that fired around the PREVIOUS
+ * onset stops being published once a new episode supersedes it, rather than
+ * freezing a stale class into the new episode's distribution — which would make
+ * the two episodes look alike for no reason other than publication order.
+ *
+ * `remove()` on the scalar width, matching the `last_*` discipline above: a
+ * published 0 would read as a zero-width window, i.e. a measurement taken over
+ * no time at all, rather than as "no episode yet".
+ *
+ * A `null` attribution publishes NOTHING. "No release has been observed" and
+ * "a release was observed and no GC fired near it" are opposite findings on
+ * this row, and the second one is the result it is waiting for — rendering the
+ * first as a set of zeroes would hand it that result for free.
+ *
+ * A `null` BASELINE publishes nothing for `window="baseline"`, for the same
+ * reason at smaller scale: it means the control window was contaminated by the
+ * previous episode's onset, and an absent control must not render as a control
+ * of zero. The onset series is still published, and by the help text's own
+ * rule ("read both or neither") it is then not readable — which is the correct
+ * outcome rather than a missing-data accident.
+ */
+export function setRssReleaseGcAttributionMetrics(
+  attribution: RssReleaseGcAttribution | null,
+): void {
+  const metrics = ensureRegistry();
+  metrics.processRssReleaseOnsetGcCyclesGauge.reset();
+  metrics.processRssReleaseOnsetGcPauseSecondsGauge.reset();
+  metrics.processRssReleaseOnsetGcPauseUnknownCyclesGauge.reset();
+  metrics.processRssReleaseOnsetGcWindowCoveredGauge.reset();
+  metrics.processRssReleaseOnsetGcWindowSecondsGauge.remove();
+  if (!attribution) return;
+
+  metrics.processRssReleaseOnsetGcWindowSecondsGauge.set(attribution.windowMs / 1000);
+  for (const [window, counts] of [
+    ["onset", attribution.onset],
+    ["baseline", attribution.baseline],
+  ] as const) {
+    // A contaminated control is withheld entirely — see the docblock. Not even
+    // its coverage flag is published, since there is no window to qualify.
+    if (!counts) continue;
+    // Coverage first, and published for BOTH windows even when the class list
+    // below is empty: an empty distribution is only readable as "no GC fired"
+    // when the ring is known to have held the window it was counted over.
+    metrics.processRssReleaseOnsetGcWindowCoveredGauge.set({ window }, counts.covered ? 1 : 0);
+    // Published for both windows and even at 0, for the same reason: the pause
+    // sums beside it are only readable as totals when this is known to be 0,
+    // and an absent qualifier is not a qualifier.
+    metrics.processRssReleaseOnsetGcPauseUnknownCyclesGauge.set(
+      { window },
+      counts.pauseUnknownCycles,
+    );
+    for (const { kind, flags, cycles, pauseMs } of counts.classes) {
+      metrics.processRssReleaseOnsetGcCyclesGauge.set({ window, kind, flags }, cycles);
+      metrics.processRssReleaseOnsetGcPauseSecondsGauge.set(
+        { window, kind, flags },
+        pauseMs / 1000,
+      );
+    }
   }
 }
 
@@ -9857,11 +10939,17 @@ export function recordExecutionWorkspaceCollectorPass(
  * failing, and a metrics fault has no business turning a considered 502/504
  * into a 500.
  */
-export function recordWorkerTierProxyFailure(reason: WorkerTierProxyFailureReason): void {
+export function recordWorkerTierProxyFailure(
+  reason: WorkerTierProxyFailureReason,
+  route: string,
+): void {
   try {
-    ensureRegistry().workerTierProxyFailuresCounter.inc({ reason });
+    ensureRegistry().workerTierProxyFailuresCounter.inc({ reason, route });
   } catch (error) {
-    logger.error({ err: error, reason }, "failed to record worker-tier proxy failure metric");
+    logger.error(
+      { err: error, reason, route },
+      "failed to record worker-tier proxy failure metric",
+    );
   }
 }
 
@@ -9973,6 +11061,12 @@ export function __resetMetricsForTest(): void {
   heartbeatRunFailed = null;
   ccrotateCapacityDeferred = null;
   retryScheduleOutcome = null;
+  // PEN-4145. Load-bearing: without this the counter survives a reset bound to a
+  // DISCARDED registry, so the zero-seed loop never re-runs and the 4x3 grid that
+  // makes `increase()` able to see a first event is silently missing for the rest
+  // of the process. That is the trap this metric exists to avoid, reintroduced
+  // through the test path.
+  transientRetryFloor = null;
   startLockReapDisposition = null;
   orphanReapStageSeconds = null;
   penstockGateProbe = null;
@@ -10020,6 +11114,18 @@ export function __resetMetricsForTest(): void {
   processMappingScanSeconds = null;
   processMappingScanTimestamp = null;
   processHeapPeakSamples = null;
+  processRssReleaseEvents = null;
+  processRssReleaseBytes = null;
+  processRssReleaseLastOnsetTimestamp = null;
+  processRssReleaseLastDetectedTimestamp = null;
+  processRssReleaseLastBytes = null;
+  processRssReleaseSamples = null;
+  processRssReleaseBoundBytes = null;
+  processRssReleaseOnsetGcCycles = null;
+  processRssReleaseOnsetGcWindowSeconds = null;
+  processRssReleaseOnsetGcWindowCovered = null;
+  processRssReleaseOnsetGcPauseSeconds = null;
+  processRssReleaseOnsetGcPauseUnknownCycles = null;
   processLostTotal = null;
   externalLifecycleRunningRuns = null;
   externalLifecycleRunSilenceGap = null;

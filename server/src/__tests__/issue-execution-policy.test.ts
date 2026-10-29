@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest";
+import { renewedIssueMonitorMaxAttempts } from "@paperclipai/shared";
 import {
   DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
   applyIssueExecutionPolicyTransition,
   applyIssueMonitorPolicyTransition,
   buildIssueMonitorClearedPatch,
   buildIssueMonitorEligibilityPatch,
+  exhaustedMonitorClearReason,
   isMonitorNextCheckAtLive,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
@@ -1833,12 +1835,123 @@ describe("issue execution policy transitions", () => {
       ).toThrow("Monitor bounds are already exhausted");
     });
 
-    it("allows an explicit re-arm without maxAttempts after the scheduler default ceiling", () => {
+    /**
+     * PEN-3803 — THE DISCRIMINATING CASE.
+     *
+     * This test replaces one that asserted the opposite ("allows an explicit
+     * re-arm without maxAttempts after the scheduler default ceiling"). That
+     * test was not wrong about the behaviour; it was wrong about the behaviour
+     * being correct. The arm returned 200 and the row then advertised a live
+     * `monitorNextCheckAt` right up to the due second, when the scheduler —
+     * which DOES apply `DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS` — cleared it as
+     * `max_attempts_exhausted` without firing. Measured on PEN-3328: armed
+     * 2026-10-03T23:50Z for 2026-10-04T23:30Z, cleared at the due instant with
+     * `lastTriggeredAt` predating the arm, ~24h of phantom liveness.
+     *
+     * Asserting the 422 on an explicit `maxAttempts` at/below `attemptCount`
+     * (the test above) is NOT sufficient coverage: that path was always correct.
+     * The discriminating case is `maxAttempts: null`, which is the shape the
+     * tool description used to recommend.
+     *
+     * NEGATIVE CONTROL: drop `defaultMaxAttempts` from the
+     * `exhaustedMonitorClearReason` call in `applyMonitorTransition`
+     * (issue-execution-policy.ts) and this test fails — the transition returns
+     * a `scheduled` monitor instead of throwing.
+     */
+    it("refuses an explicit re-arm with maxAttempts: null once the scheduler default ceiling is reached", () => {
       const policy = normalizeIssueExecutionPolicy({
         stages: [],
         monitor: {
           nextCheckAt: "2099-04-11T12:30:00.000Z",
           scheduledBy: "assignee",
+        },
+      })!;
+
+      expect(policy.monitor?.maxAttempts ?? null).toBeNull();
+
+      expect(() =>
+        applyIssueMonitorPolicyTransition({
+          issue: {
+            status: "in_review",
+            assigneeAgentId: coderAgentId,
+            assigneeUserId: null,
+            executionPolicy: null,
+            executionState: null,
+            monitorAttemptCount: DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
+            monitorNextCheckAt: null,
+            monitorLastTriggeredAt: null,
+            monitorNotes: null,
+            monitorScheduledBy: "assignee",
+          },
+          policy,
+          previousPolicy: null,
+          requestedAssigneePatch: {},
+          actor: { agentId: coderAgentId },
+          monitorExplicitlyUpdated: true,
+        }),
+      ).toThrow("Monitor bounds are already exhausted");
+    });
+
+    it("carries the numbers and the remedy on the exhaustion refusal", () => {
+      const policy = normalizeIssueExecutionPolicy({
+        stages: [],
+        monitor: { nextCheckAt: "2099-04-11T12:30:00.000Z", scheduledBy: "assignee" },
+      })!;
+
+      let thrown: unknown;
+      try {
+        applyIssueMonitorPolicyTransition({
+          issue: {
+            status: "in_review",
+            assigneeAgentId: coderAgentId,
+            assigneeUserId: null,
+            executionPolicy: null,
+            executionState: null,
+            monitorAttemptCount: DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
+            monitorNextCheckAt: null,
+            monitorLastTriggeredAt: null,
+            monitorNotes: null,
+            monitorScheduledBy: "assignee",
+          },
+          policy,
+          previousPolicy: null,
+          requestedAssigneePatch: {},
+          actor: { agentId: coderAgentId },
+          monitorExplicitlyUpdated: true,
+        });
+      } catch (err) {
+        thrown = err;
+      }
+
+      const error = thrown as { status?: number; message?: string; details?: Record<string, unknown> };
+      expect(error.status).toBe(422);
+      // `maxAttemptsSource: "default"` is the load-bearing field: it tells a
+      // caller the bound it just tripped is one it never set and cannot see on
+      // the policy, which is why the old 200 was so hard to diagnose.
+      expect(error.details).toMatchObject({
+        clearReason: "max_attempts_exhausted",
+        attemptCount: DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
+        maxAttempts: DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
+        maxAttemptsSource: "default",
+        suggestedMaxAttempts: renewedIssueMonitorMaxAttempts(DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS),
+      });
+      // The remedy must be in the message, not only in the details: omitting is
+      // what the circulating advice recommended, and it is the one move that
+      // reproduces the defect.
+      expect(error.message).toContain("maxAttempts");
+      expect(error.message).toMatch(/Omitting `maxAttempts` does NOT grant more attempts/);
+    });
+
+    it("admits the same re-arm when an explicit maxAttempts exceeds the attempts already made", () => {
+      const renewal = renewedIssueMonitorMaxAttempts(DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS);
+      expect(renewal).toBe(DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS * 2);
+
+      const policy = normalizeIssueExecutionPolicy({
+        stages: [],
+        monitor: {
+          nextCheckAt: "2099-04-11T12:30:00.000Z",
+          scheduledBy: "assignee",
+          maxAttempts: renewal,
         },
       })!;
 
@@ -1862,13 +1975,188 @@ describe("issue execution policy transitions", () => {
         monitorExplicitlyUpdated: true,
       });
 
+      // An explicit bound still wins over the fleet ceiling — that is what keeps
+      // a deliberate, recorded budget extension possible, and it is the only
+      // exit left now that omitting is refused and clearing does not reset the
+      // counter.
       expect(result.patch.monitorNextCheckAt).toEqual(new Date("2099-04-11T12:30:00.000Z"));
       expect(result.patch.executionState).toMatchObject({
-        monitor: {
-          status: "scheduled",
-          attemptCount: DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
-        },
+        monitor: { status: "scheduled", attemptCount: DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS },
       });
+    });
+
+    /**
+     * PEN-3803 review follow-up — the ceiling is an ARM-TIME bound, and must not
+     * leak onto the carry-forward path.
+     *
+     * The exhaustion predicate feeds two asymmetric consumers. An explicit arm
+     * throws 422: loud, at the caller, nothing persisted. A NON-explicit
+     * transition strips the monitor and records it cleared, with no activity row
+     * and no `recoveryPolicy` — and it runs on every generic
+     * `PATCH /api/issues/:id` that leaves `executionPolicy` alone, because
+     * `nextExecutionPolicy` falls back to the stored policy and carries the
+     * armed monitor in with `monitorExplicitlyUpdated` false.
+     *
+     * So supplying `defaultMaxAttempts` unconditionally would silently retire
+     * the very rows this fix exists for: a legacy `maxAttempts: null` row at
+     * `attemptCount >= 24` (what the old 200 path created, PEN-3328 included)
+     * would lose its monitor to an unrelated priority edit, instead of reaching
+     * the scheduler's `clearIssueMonitorAndRecover` — which retires it with
+     * `issue.monitor_exhausted` plus the configured `recoveryPolicy`.
+     *
+     * NEGATIVE CONTROL: drop the `input.monitorExplicitlyUpdated` guard on
+     * `defaultMaxAttempts` in `applyMonitorTransition` (issue-execution-policy.ts)
+     * and this test fails — `monitorNextCheckAt` comes back `null` and the state
+     * reads `cleared`/`max_attempts_exhausted`.
+     */
+    it("leaves an armed maxAttempts: null monitor at the ceiling untouched on a non-explicit transition", () => {
+      const armed = {
+        nextCheckAt: "2099-04-11T12:30:00.000Z",
+        scheduledBy: "assignee" as const,
+      };
+      const policy = normalizeIssueExecutionPolicy({ stages: [], monitor: armed })!;
+      expect(policy.monitor?.maxAttempts ?? null).toBeNull();
+
+      const result = applyIssueMonitorPolicyTransition({
+        issue: {
+          status: "in_review",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          // The row is ALREADY armed, and the generic PATCH carries that same
+          // policy straight back in as `nextExecutionPolicy`.
+          executionPolicy: policy,
+          executionState: null,
+          monitorAttemptCount: DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
+          monitorNextCheckAt: new Date(armed.nextCheckAt),
+          monitorLastTriggeredAt: null,
+          monitorNotes: null,
+          monitorScheduledBy: "assignee",
+        },
+        policy,
+        previousPolicy: policy,
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+        // The whole point: an edit that never touched the monitor.
+        monitorExplicitlyUpdated: false,
+      });
+
+      // Not stripped, and not recorded as cleared. The monitor stays on the row
+      // so the scheduler is still the thing that retires it — loudly.
+      //
+      // Assert the armed instant itself rather than `not.toBeNull()`: the strip
+      // path runs `clearArmedMonitorColumns`, which writes an explicit `null`
+      // here, so the date IS the discriminator. (An earlier revision wrote
+      // `result.patch.monitorNextCheckAt ?? armed.nextCheckAt`, which can never
+      // fail — `null ?? x` is `x` — so it did not carry the negative control
+      // the docblock above credits it with.)
+      expect(result.patch.monitorNextCheckAt).toEqual(new Date(armed.nextCheckAt));
+      expect(result.patch.executionState).not.toMatchObject({
+        monitor: { status: "cleared", clearReason: "max_attempts_exhausted" },
+      });
+      expect(result.patch.executionPolicy).toBeUndefined();
+    });
+
+    /**
+     * The guard above withholds the DEFAULT on a non-explicit transition. It must
+     * not also withhold a bound the issue declared for itself: that strip predates
+     * PEN-3803 and is unrelated to the fleet ceiling, so it has to survive the fix.
+     */
+    it("still strips a non-explicit monitor whose own declared maxAttempts is spent", () => {
+      const policy = normalizeIssueExecutionPolicy({
+        stages: [],
+        monitor: {
+          nextCheckAt: "2099-04-11T12:30:00.000Z",
+          scheduledBy: "assignee",
+          maxAttempts: 3,
+        },
+      })!;
+
+      const result = applyIssueMonitorPolicyTransition({
+        issue: {
+          status: "in_review",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: null,
+          monitorAttemptCount: 3,
+          monitorNextCheckAt: new Date("2099-04-11T12:30:00.000Z"),
+          monitorLastTriggeredAt: null,
+          monitorNotes: null,
+          monitorScheduledBy: "assignee",
+        },
+        policy,
+        previousPolicy: policy,
+        requestedAssigneePatch: {},
+        actor: { agentId: coderAgentId },
+        monitorExplicitlyUpdated: false,
+      });
+
+      expect(result.patch.monitorNextCheckAt).toBeNull();
+      expect(result.patch.executionState).toMatchObject({
+        monitor: { status: "cleared", clearReason: "max_attempts_exhausted" },
+      });
+    });
+
+    /**
+     * PEN-3803 done-when #2: the arm-time path and the scheduler path must
+     * reach the SAME verdict for the same row. Asserting the 422 alone cannot
+     * show that — it only shows one path is strict. This table drives both
+     * predicates over the boundary and asserts they agree at every point,
+     * including the `maxAttempts: null` cases where they used to diverge.
+     */
+    it.each([
+      { label: "null bound, one below the ceiling", maxAttempts: null, attemptCount: DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS - 1 },
+      { label: "null bound, exactly at the ceiling", maxAttempts: null, attemptCount: DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS },
+      { label: "null bound, past the ceiling", maxAttempts: null, attemptCount: DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS + 7 },
+      { label: "explicit bound, below it", maxAttempts: 3, attemptCount: 2 },
+      { label: "explicit bound, reached", maxAttempts: 3, attemptCount: 3 },
+      { label: "explicit bound above a spent default", maxAttempts: 60, attemptCount: DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS + 7 },
+    ])("arm-time and scheduler agree: $label", ({ maxAttempts, attemptCount }) => {
+      const policy = normalizeIssueExecutionPolicy({
+        stages: [],
+        monitor: {
+          nextCheckAt: "2099-04-11T12:30:00.000Z",
+          scheduledBy: "assignee",
+          ...(maxAttempts === null ? {} : { maxAttempts }),
+        },
+      })!;
+
+      // The scheduler's question, verbatim: `heartbeat.ts` passes the row's real
+      // attempt count and the fleet ceiling, then clears the monitor without
+      // firing when this returns non-null.
+      const schedulerWouldClear = exhaustedMonitorClearReason({
+        monitor: policy.monitor!,
+        attemptCount,
+        now: new Date("2026-10-29T00:00:00.000Z"),
+        defaultMaxAttempts: DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
+      }) !== null;
+
+      const arm = () =>
+        applyIssueMonitorPolicyTransition({
+          issue: {
+            status: "in_review",
+            assigneeAgentId: coderAgentId,
+            assigneeUserId: null,
+            executionPolicy: null,
+            executionState: null,
+            monitorAttemptCount: attemptCount,
+            monitorNextCheckAt: null,
+            monitorLastTriggeredAt: null,
+            monitorNotes: null,
+            monitorScheduledBy: "assignee",
+          },
+          policy,
+          previousPolicy: null,
+          requestedAssigneePatch: {},
+          actor: { agentId: coderAgentId },
+          monitorExplicitlyUpdated: true,
+        });
+
+      if (schedulerWouldClear) {
+        expect(arm).toThrow("Monitor bounds are already exhausted");
+      } else {
+        expect(arm().patch.monitorNextCheckAt).toEqual(new Date("2099-04-11T12:30:00.000Z"));
+      }
     });
   });
 

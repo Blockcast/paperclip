@@ -85,7 +85,9 @@ reads, no log access, no database access:
    Newest first; `details.interactionId` and `entityId` (the issue) are the
    two fields you want. ⚠ Keep `limit` at or below ~30 — this filter is not
    indexed, and larger pages reliably hit the statement timeout and return
-   `503 transient_db_conflict` / sqlstate `57014`.
+   `503 statement_timeout` / sqlstate `57014`. (PEN-3596 split that code out
+   of `transient_db_conflict`: `57014` is a cancelled statement, not lock
+   contention, and used to be reported as "Database contention".)
 
 3. **Read the card** with `GET /api/issues/:issueId/interactions` and confirm
    it: `status: "accepted"`, a `resolvedAt` matching step 1, and a

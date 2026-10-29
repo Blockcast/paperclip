@@ -26,8 +26,13 @@
 import { describe, expect, it, afterEach } from "vitest";
 
 import {
+  CGROUP_ACTIVE_FILE_COMPONENT,
   CGROUP_ANON_COMPONENT,
   CGROUP_FILE_COMPONENT,
+  CGROUP_FILE_DIRTY_COMPONENT,
+  CGROUP_FILE_MAPPED_COMPONENT,
+  CGROUP_FILE_WRITEBACK_COMPONENT,
+  CGROUP_INACTIVE_FILE_COMPONENT,
   CGROUP_KERNEL_COMPONENT,
   CGROUP_SHMEM_COMPONENT,
   CGROUP_SLAB_COMPONENT,
@@ -62,6 +67,10 @@ const V2_STAT = [
   "vmalloc 0",
   "shmem 0",
   "file_mapped 258048",
+  "file_dirty 94208",
+  "file_writeback 0",
+  "inactive_file 180258048",
+  "active_file 37198592",
   "slab_reclaimable 16910600",
   "slab_unreclaimable 2945192",
   "slab 19855792",
@@ -127,8 +136,53 @@ describe("collectCgroupMemorySnapshot", () => {
   });
 
   it("ignores memory.stat keys it does not publish", () => {
-    expect(collect()!.components.has("file_mapped")).toBe(false);
     expect(collect()!.components.has("percpu")).toBe(false);
+    expect(collect()!.components.has("vmalloc")).toBe(false);
+    expect(collect()!.components.has("sec_pagetables")).toBe(false);
+  });
+
+  it("breaks `file` down, because page cache -- not slab -- led the first climb measured", () => {
+    // PEN-3692 excluded page cache as (B)'s driver by SIGN at NODE level. The
+    // first within-life climb this gauge could see (paperclip-1, 2026-10-24T08:00Z
+    // -> 10-25T06:00Z, +2.158 GiB) was 53.2% `file` against 0.72%
+    // `slab_reclaimable`, so the dominant term is the one that was assumed away.
+    // Splitting it is what separates cache the kernel gives back under pressure
+    // from headroom it cannot.
+    const components = collect()!.components;
+    expect(components.get(CGROUP_INACTIVE_FILE_COMPONENT)).toBe(180_258_048);
+    expect(components.get(CGROUP_ACTIVE_FILE_COMPONENT)).toBe(37_198_592);
+    expect(components.get(CGROUP_FILE_MAPPED_COMPONENT)).toBe(258_048);
+    expect(components.get(CGROUP_FILE_DIRTY_COMPONENT)).toBe(94_208);
+    // Published at a measured 0 rather than omitted: "nothing is in writeback"
+    // and "this kernel does not report writeback" are different findings, and
+    // only the first is a zero.
+    expect(components.get(CGROUP_FILE_WRITEBACK_COMPONENT)).toBe(0);
+  });
+
+  it("OMITS a file-breakdown key this kernel does not report, rather than publishing 0", () => {
+    // Same invariant the whole module is built on, pinned for the new keys: a
+    // zeroed `inactive_file` would read as "no reclaimable cache", which is the
+    // exact wrong conclusion on a cgroup whose growth is page cache.
+    const withoutInactive = V2_STAT.split("\n")
+      .filter((line) => !line.startsWith("inactive_file "))
+      .join("\n");
+    const components = collect({ "/cg/memory.stat": withoutInactive })!.components;
+    expect(components.has(CGROUP_INACTIVE_FILE_COMPONENT)).toBe(false);
+    // The rest of the breakdown is unaffected -- one absent key is not fatal.
+    expect(components.get(CGROUP_ACTIVE_FILE_COMPONENT)).toBe(37_198_592);
+  });
+
+  it("does not require the file breakdown to accept the file as cgroup v2", () => {
+    // The v2 shape check keys on anon/file/slab_reclaimable. A kernel reporting
+    // none of the breakdown must still publish everything else rather than
+    // refusing the whole snapshot.
+    const stripped = V2_STAT.split("\n")
+      .filter((line) => !/^(inactive_file|active_file|file_mapped|file_dirty|file_writeback) /.test(line))
+      .join("\n");
+    const snapshot = collect({ "/cg/memory.stat": stripped });
+    expect(snapshot).not.toBeNull();
+    expect(snapshot!.components.get(CGROUP_FILE_COMPONENT)).toBe(217_456_640);
+    expect(snapshot!.components.has(CGROUP_FILE_MAPPED_COMPONENT)).toBe(false);
   });
 
   it("REFUSES a cgroup v1 memory.stat rather than parsing it as an empty v2 one", () => {

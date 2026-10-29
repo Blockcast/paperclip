@@ -97,6 +97,13 @@ const MAX_SUMMARIZED_KEYS = 40;
 // Key names on these routes are sender-authored too, so each one is bounded
 // as well as the count; otherwise `{"<64 KiB string>": 1}` lands verbatim.
 const MAX_SUMMARIZED_KEY_LENGTH = 64;
+
+// An allowlisted upgrade query value is non-credential by the call site's
+// judgement, but it is still caller-authored: the client chooses the bytes.
+// Bounded for the same reason `summarizeKeys` bounds a key — an unbounded
+// caller-controlled string in a log line is a volume and line-injection
+// vector independent of whether it is secret.
+const MAX_UPGRADE_QUERY_VALUE_LENGTH = 64;
 const OMITTED_QUERY = "[OMITTED: untrusted webhook query]";
 
 function summarizeKeys(field: string, value: Record<string, unknown>): Record<string, unknown> {
@@ -222,6 +229,75 @@ export function buildHttpLogProps(req: LoggedRequest, res: LoggedResponse): Reco
 // part and concatenate the origin afterwards.
 export function urlForLog(url: string | undefined): string | undefined {
   return url !== undefined && shouldOmitRequestBodyFromLog(url) ? normalizePath(url) : url;
+}
+
+// Bound a kept query value. See MAX_UPGRADE_QUERY_VALUE_LENGTH.
+function truncateQueryValue(value: string): string {
+  return value.length > MAX_UPGRADE_QUERY_VALUE_LENGTH
+    ? `${value.slice(0, MAX_UPGRADE_QUERY_VALUE_LENGTH)}…`
+    : value;
+}
+
+// A WebSocket upgrade URL as it may appear in a log line: pathname, plus only
+// the query keys the call site named. Everything else is dropped.
+//
+// This is a DIFFERENT rule from `urlForLog`, and both are needed (PEN-3549).
+// `urlForLog` is keyed on `UNLOGGABLE_REQUEST_BODY_PATHS` — a route list — and
+// is the identity function on any route not on it, which every WS upgrade path
+// is. The reason upgrade URLs need their own rule is that they carry the
+// credential in the query string by protocol necessity: a browser `WebSocket`
+// constructor cannot set an `Authorization` header, so `?token=` is the only
+// way a board client can authenticate. The global pino `redact` in logger.ts
+// names `req.headers.authorization` — the header, precisely not this form.
+//
+// Allowlist, not denylist, and that is the decision this helper records.
+// The previous in-repo mitigation lived module-locally in
+// environment-custom-image-terminal-ws.ts and redacted exactly the key
+// `token` — a denylist of one. A denylist here has to guess the name of the
+// next credential-bearing query key before anybody writes it, which is the
+// same shape PEN-2996 found does not converge (`SENSITIVE_KEYS` named six
+// qualified `*_token` variants and still missed bare `token`). Dropping the
+// query by default inverts that: a new query key is non-loggable until an
+// author looks at it and says otherwise, so the failure mode of forgetting is
+// a missing diagnostic rather than a leaked credential.
+//
+// The default costs little in practice. live-events-ws reads exactly one
+// query key and it is the credential, so pathname-only loses nothing there;
+// the terminal socket names its three non-credential keys and keeps them.
+//
+// `redactedQueryKeys` reports how many keys were dropped, so an operator can
+// still tell "the client sent no token at all" from "the token was present and
+// scrubbed". It is a count on purpose: query *key names* are caller-authored
+// on an upgrade URL, and echoing them back into a log line would reopen a
+// smaller version of the same hole (cf. `summarizeKeys`, which bounds both the
+// count and the length of each key for that reason).
+//
+// Kept VALUES are length-bounded for the same reason, which is a separate
+// concern from secrecy: an allowlisted key is non-credential by the call
+// site's judgement, but the client still authors its bytes, so an unbounded
+// one is a log-volume and line-injection vector on its own.
+export function upgradePathForLog(
+  rawUrl: string | undefined,
+  allowQueryKeys: readonly string[] = [],
+): string | undefined {
+  if (!rawUrl) return undefined;
+  try {
+    const url = new URL(rawUrl, "http://localhost");
+    const allowed = new Set(allowQueryKeys);
+    const kept = new URLSearchParams();
+    let dropped = 0;
+    for (const [key, value] of url.searchParams) {
+      if (allowed.has(key)) kept.append(key, truncateQueryValue(value));
+      else dropped += 1;
+    }
+    if (dropped > 0) kept.append("redactedQueryKeys", String(dropped));
+    const search = kept.toString();
+    return search.length > 0 ? `${url.pathname}?${search}` : url.pathname;
+  } catch {
+    // A URL this malformed cannot be parsed into parts, so nothing can be
+    // shown to be non-credential. Drop everything from the first `?` on.
+    return normalizePath(rawUrl);
+  }
 }
 
 // Lives here rather than in logger.ts so a test can drive the real pino-http

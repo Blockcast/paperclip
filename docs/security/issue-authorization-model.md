@@ -61,6 +61,7 @@ chain, at any depth.
 | Local implicit board | A | A | A |
 | Cloud-tenant user with active non-`viewer` membership | A | **A** | A (via `issue:mutate`) |
 | Cloud-tenant user with `viewer` membership | — | — | — |
+| Cloud-tenant user with `support` membership | — | — | — |
 | Agent — **assignee** of the issue | A | **A** | A (via `issue:mutate`) |
 | Agent — issue has **no** assignee | A | A | A (via `issue:mutate`) |
 | Agent — **creator**, someone else assigned | A | — | — |
@@ -77,6 +78,60 @@ chain, at any depth.
 
 The two bold `—` cells in the manager rows are the finding `BLO-30034` was filed
 about. They are intentional; the next section says why.
+
+### `support` is a membership role that is not in any role enum
+
+The `support` row is the one principal here whose membership role the UI cannot
+produce and the type system does not know about. It is worth stating explicitly,
+because this file being silent about it is what let three layers disagree about it
+for a month (`PEN-3954`).
+
+`company_memberships.membership_role` is a plain nullable `text` column with **no
+DB constraint** (`packages/db/src/schema/company_memberships.ts`). The cloud-tenant
+provisioning path writes the stack role into it verbatim —
+`stackMembershipRole` (`server/src/middleware/auth.ts`) accepts
+`owner | admin | member | support` and only `owner`/`admin` collapse to `owner`, so
+a `support` stack role is persisted as the literal string `support`. That string is
+outside `HUMAN_COMPANY_MEMBERSHIP_ROLES` **and** outside the wider storable
+`COMPANY_MEMBERSHIP_ROLES` (`packages/shared/src/constants.ts`); the insert
+succeeds only because the column is unconstrained.
+
+**Decided 2026-10-29, owner CTO (`PEN-4964`): a cloud-tenant `support` principal
+gets read, not write.** It is therefore identical to the `viewer` row above, and
+`PEN-3954` made every layer say so. Three properties of that decision are
+load-bearing and should not be undone by a later cleanup:
+
+- **It is read-side normalization, not an ingress rewrite.** The raw `support`
+  string is still what gets stored; `normalizeHumanRole`
+  (`server/src/services/company-member-roles.ts`) has an explicit
+  `support -> viewer` branch beside the existing `member -> operator` one. Folding
+  at the boundary instead would leave every row written before the change
+  unconverted.
+- **`support` stays out of `HUMAN_COMPANY_MEMBERSHIP_ROLES`.** Adding it was
+  considered and rejected: that set is the selectable role list in every tenant's
+  UI and in the public plugin SDK, and widening it across all deployments to fix
+  an authorization bug in one deployment mode is the wrong trade.
+- **One predicate, not five comparisons.** `membershipRoleIsNonViewer`
+  (same file) is the only membership-role write bar. Before `PEN-3954` the same
+  question was spelled as a raw `role === "viewer"` test at four HTTP bars
+  (`routes/authz.ts` ×2, `routes/tool-access.ts`, `routes/tool-gateway.ts`), each
+  of which counted `support` **and** `null` as non-viewer and admitted the write,
+  while the decider denied both and the provisioning seed granted `support`
+  `operator`-level `tasks:assign`. New call sites must call the predicate;
+  `server/src/__tests__/pen3954-membership-role-write-bars.test.ts` fails CI on a
+  raw comparison reappearing in server code — any spelling of it (`===`, `!==`,
+  `==`, either quote style), since the point is that the question not be
+  re-spelled. The predicate's own body is the single sanctioned comparison and
+  is marked `pen3954-census-allow`; the census requires exactly one such marked
+  line and requires it to be in `services/company-member-roles.ts`, so the
+  marker cannot be used to silence a second site.
+
+Stopping the provisioning seed does **not** revoke anything:
+`insertMissingPrincipalGrants` is insert-only (`onConflictDoNothing`, no delete,
+early return on an empty grant list), so a support seat that already holds a
+`tasks:assign` row keeps it. The HTTP write bars are the half with retroactive
+reach. A seat that turns out to need write is restored with an explicit
+`principal_permission_grants` row.
 
 ## Allow-paths, enumerated from source
 
@@ -218,6 +273,10 @@ without re-deciding the model itself:
 
 - A peer agent with no relation to an issue: denied on all three actions.
 - A cloud-tenant user with `viewer` membership: denied on all three actions.
+- A cloud-tenant user with `support` membership: denied on all three actions
+  (`PEN-4964`). This one is denied through `normalizeHumanRole`'s
+  `support -> viewer` branch rather than through a role the enums contain, so a
+  "tidy up the unreachable branch" change re-opens it silently.
 - A manager of the assignee: denied `issue:mutate`, **even holding `tasks:assign`**.
 - A `tasks:assign` holder who does **not** manage the assignee: denied
   `issue:coordination_metadata` (`deny_scope`).
@@ -240,7 +299,7 @@ without re-deciding the model itself:
 `server/src/__tests__/authorization-service.test.ts`, describe block
 **"issue authorization matrix (BLO-30034)"**. It is table-driven over
 (principal relation × action): one relation per row of the principal × field grid —
-the four board principals included, and the parent-or-sibling row split into two —
+the five board principals included, and the parent-or-sibling row split into two —
 asserting every action verdict in the allow-path table, including the denials. The
 four historical incidents are rows in that table rather than separate cases, which
 is the specific thing that was missing when each of them shipped.

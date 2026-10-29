@@ -134,7 +134,7 @@ import { initTelemetry, getTelemetryClient } from "./telemetry.js";
 import { conflict } from "./errors.js";
 import { githubReviewerAppSlug } from "./services/github-app-auth.js";
 import { reconcileContendedPrReviewerWakes } from "./routes/github-webhook.js";
-import { coordinateHeartbeatSchedulerShutdown } from "./shutdown.js";
+import { closeServerBounded, coordinateHeartbeatSchedulerShutdown, HEARTBEAT_SCHEDULER_IDLE_WAIT_TIMEOUT_MS } from "./shutdown.js";
 import type {
   InstanceDatabaseBackupRunResult,
   InstanceDatabaseBackupTrigger,
@@ -1222,6 +1222,14 @@ export async function startServer(): Promise<StartedServer> {
   let workerHeartbeat: ReturnType<typeof heartbeatService> | null = null;
   let heartbeatSchedulerStopped = false;
   let heartbeatStartupRecoveryPending = false;
+  /**
+   * BLO-49303. Holds the recovery gate closed from `onAcquire` until the
+   * plugin resync hands off to `runLeaderRecovery`, which only then sets
+   * `heartbeatStartupRecoveryPending`. Without it the takeover kick's tick
+   * passes the gate during resync. Separate flag: reusing the other one would
+   * trip `runLeaderRecovery`'s single-flight.
+   */
+  let takeoverRecoveryPending = false;
   let heartbeatSchedulerInterval: ReturnType<typeof setInterval> | null = null;
   /**
    * BLO-45212. Runs the one-shot recovery chain (crash reconciliation,
@@ -1230,6 +1238,14 @@ export async function startServer(): Promise<StartedServer> {
    * that runs the gated loop — see the lease construction below for why.
    */
   let runLeaderRecovery: (() => void) | null = null;
+  /**
+   * BLO-49303. Runs one heartbeat scheduler tick now and restarts the interval
+   * from here, so a lease takeover enqueues at once instead of waiting out the
+   * remainder of a `heartbeatSchedulerIntervalMs` it spent as a follower.
+   * Null until the interval is armed (a boot-time acquisition keeps the
+   * startup ordering) and after shutdown disarms it.
+   */
+  let kickHeartbeatScheduler: (() => void) | null = null;
   // PEN-3314. Separate timer from `heartbeatSchedulerInterval` on purpose — see
   // the watchdog registration below for why the recovery-chain detector must
   // not ride the heartbeat tick.
@@ -1499,7 +1515,11 @@ export async function startServer(): Promise<StartedServer> {
           //
           // First, deliberately: a crash-marked run may still own an issue's
           // execution lock, and both the reattach and reap passes below make
-          // ownership decisions that should see the post-recovery state. It is
+          // ownership decisions that should see the post-recovery state. This
+          // orders passes WITHIN the chain only — it is not a guarantee that no
+          // reap precedes it: the timer enqueue runs ahead of this chain on a
+          // takeover (BLO-49303), so a dispatch-time start-lock reap can come
+          // first. Job liveness and the reservation shields cover that. It is
           // bounded by batch size, and each run is claimed with a durable,
           // expiring lease, so a slow or partly-failing backlog cannot stall
           // startup — whatever is left is picked up next start.
@@ -1540,6 +1560,10 @@ export async function startServer(): Promise<StartedServer> {
             logger.error({ err }, "startup hot-restart adoption wait failed");
           }
 
+          // BLO-49596 (Ally on #3048): this chain also runs on lease takeover, so a
+          // SIGTERM can land mid-chain. Stop between passes once shutdown starts, so
+          // the 20 s idle-wait backstop only ever covers the one in-flight step.
+          if (heartbeatSchedulerStopped) return;
           for (let attempt = 1; attempt <= 2; attempt++) {
             try {
               const result = await heartbeat.reapOrphanedRuns();
@@ -1562,6 +1586,7 @@ export async function startServer(): Promise<StartedServer> {
 
           // Lock cleanup must not be starved by failures in the broader recovery
           // sequence: stale checkout ownership can prevent every later run.
+          if (heartbeatSchedulerStopped) return;
           try {
             const swept = await heartbeat.sweepStaleIssueLocks();
             if (swept.cleared > 0) {
@@ -1574,6 +1599,7 @@ export async function startServer(): Promise<StartedServer> {
           // BLO-21621: terminalize queued runs whose issue lock has already
           // moved on or gone empty, so a detached run cannot sit invisible to
           // every other recovery sweep indefinitely.
+          if (heartbeatSchedulerStopped) return;
           try {
             const detached = await heartbeat.reconcileDetachedQueuedRuns();
             if (detached.terminalized > 0) {
@@ -1599,6 +1625,7 @@ export async function startServer(): Promise<StartedServer> {
           // in the periodic chain, so this leaves both chains' dispatch semantics
           // identical and only changes what happens AFTER the pair.
           let promotion: Awaited<ReturnType<typeof heartbeat.promoteDueScheduledRetries>> | null = null;
+          if (heartbeatSchedulerStopped) return;
           try {
             promotion = await heartbeat.promoteDueScheduledRetries();
             await heartbeat.resumeQueuedRuns();
@@ -1638,8 +1665,11 @@ export async function startServer(): Promise<StartedServer> {
           // re-runs every tick, so a transient fault there costs one interval.
           // This sequence runs exactly once: a rejection here means those passes
           // do not run again until the process restarts.
+          if (heartbeatSchedulerStopped) return;
           try {
-            const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
+            const reconciled = await heartbeat.reconcileStrandedAssignedIssues({
+              shouldStop: () => heartbeatSchedulerStopped,
+            });
             if (
               (promotion?.promoted ?? 0) > 0 ||
               reconciled.assignmentDispatched > 0 ||
@@ -1665,6 +1695,7 @@ export async function startServer(): Promise<StartedServer> {
             logger.error({ err }, "startup stranded-assigned-issue reconciliation failed");
           }
 
+          if (heartbeatSchedulerStopped) return;
           try {
             const issueGraphReconciled = await heartbeat.reconcileIssueGraphLiveness();
             if (
@@ -1681,6 +1712,7 @@ export async function startServer(): Promise<StartedServer> {
             logger.error({ err }, "startup issue-graph liveness reconciliation failed");
           }
 
+          if (heartbeatSchedulerStopped) return;
           try {
             const taskWatchdogsReconciled = await heartbeat.reconcileTaskWatchdogs();
             if (taskWatchdogsReconciled.triggered > 0) {
@@ -1693,6 +1725,7 @@ export async function startServer(): Promise<StartedServer> {
             logger.error({ err }, "startup task-watchdog reconciliation failed");
           }
 
+          if (heartbeatSchedulerStopped) return;
           try {
             const scanned = await heartbeat.scanSilentActiveRuns();
             if (scanned.created > 0 || scanned.escalated > 0) {
@@ -1702,6 +1735,7 @@ export async function startServer(): Promise<StartedServer> {
             logger.error({ err }, "startup active-run output watchdog failed");
           }
 
+          if (heartbeatSchedulerStopped) return;
           try {
             const reviewed = await heartbeat.reconcileProductivityReviews();
             // BLO-30303 AC4: log the funnel counters unconditionally. Gating this
@@ -1717,6 +1751,7 @@ export async function startServer(): Promise<StartedServer> {
             logger.error({ err }, "startup productivity reconciliation failed");
           }
 
+          if (heartbeatSchedulerStopped) return;
           try {
             const blockerDependentsSwept = await heartbeat.reconcileResolvedBlockerDependents();
             if (blockerDependentsSwept.woken > 0 || blockerDependentsSwept.failed > 0) {
@@ -1726,6 +1761,7 @@ export async function startServer(): Promise<StartedServer> {
             logger.error({ err }, "startup resolved-blocker-dependents sweep failed");
           }
 
+          if (heartbeatSchedulerStopped) return;
           try {
             // PEN-4385: drain any dependency-blocked `queued` rows this process
             // inherited before waiting a full tick. These age without bound, so
@@ -1741,6 +1777,7 @@ export async function startServer(): Promise<StartedServer> {
             logger.error({ err }, "startup unclaimable-queued-run reap failed");
           }
 
+          if (heartbeatSchedulerStopped) return;
           try {
             const deadMonitors = await heartbeat.reconcileUndeliverableIssueMonitors();
             if (deadMonitors.cleared > 0 || deadMonitors.failed > 0) {
@@ -1753,6 +1790,7 @@ export async function startServer(): Promise<StartedServer> {
             logger.error({ err }, "startup undeliverable-monitor reconciliation failed");
           }
 
+          if (heartbeatSchedulerStopped) return;
           try {
             const failedWakeDispatches = await heartbeat.reconcileFailedWakeDispatches();
             if (failedWakeDispatches.recovered > 0 || failedWakeDispatches.exhausted > 0) {
@@ -1776,6 +1814,7 @@ export async function startServer(): Promise<StartedServer> {
           // Tested, not assumed (BLO-45212): this chain also runs on a lease
           // takeover, and a process that held the lease earlier may still have a
           // periodic collector pass in flight.
+          if (heartbeatSchedulerStopped) return;
           if (!executionWorkspaceCollectorInFlight) {
             executionWorkspaceCollectorInFlight = true;
             executionWorkspaceCollectorStartedAt = Date.now();
@@ -1922,12 +1961,20 @@ export async function startServer(): Promise<StartedServer> {
         // BLO-47803: bring the warm-standby plugin set up to date first, so
         // recovery drives external runs through current plugin code/config.
         onAcquire: () => {
+          // BLO-49303: close the recovery gate BEFORE the kick, so the kicked
+          // tick cannot pass it while resync is still in flight; then kick —
+          // the timer enqueue sits ahead of that gate, so it need not wait.
           const resync = (app as { locals?: { resyncPluginsOnTakeover?: () => Promise<void> } })
             .locals?.resyncPluginsOnTakeover;
+          if (resync) takeoverRecoveryPending = true;
+          kickHeartbeatScheduler?.();
           if (!resync) return runLeaderRecovery?.();
           void resync()
             .catch((err) => logger.error({ err }, "plugin resync on lease takeover failed"))
-            .finally(() => runLeaderRecovery?.());
+            .finally(() => {
+              takeoverRecoveryPending = false;
+              runLeaderRecovery?.();
+            });
         },
       });
       // Awaited so the first tick already has a verdict rather than skipping
@@ -1958,7 +2005,7 @@ export async function startServer(): Promise<StartedServer> {
       runLeaderRecovery?.();
     }
 
-    heartbeatSchedulerInterval = setInterval(() => {
+    const heartbeatSchedulerTick = () => {
       // Async so the suppression checks below can honor the override-aware
       // resolver (e.g. worktree run-execution opt-in). The gated work is still
       // wrapped in trackHeartbeatSchedulerWork with its own error handling.
@@ -1966,7 +2013,7 @@ export async function startServer(): Promise<StartedServer> {
         if (heartbeatSchedulerStopped) return;
 
         // All four gauge publishers are registered above BOTH gates — the
-        // startup-recovery gate immediately below and the scheduling-suppression
+        // startup-recovery gate further below and the scheduling-suppression
         // gate further down (BLO-31335, extended by BLO-21526).
         //
         // The startup-recovery gate matters as much as the suppression one, and
@@ -2057,7 +2104,6 @@ export async function startServer(): Promise<StartedServer> {
             logger.error({ err }, "periodic crash-recovery candidate-index gauge publication failed");
           }));
 
-        if (heartbeatStartupRecoveryPending) return;
         // BLO-43292: everything below this line enqueues runs or reconciles
         // shared rows, so exactly one process in the estate may reach it.
         //
@@ -2074,14 +2120,6 @@ export async function startServer(): Promise<StartedServer> {
         // access, so it cannot be starved by the pool exhaustion that stops a
         // tick reaching anything further down.
         if (schedulerLease && !schedulerLease.shouldRunLoop()) return;
-        const sweptRuntimeStatuses = heartbeat.sweepExpiredRuntimeStatuses();
-        if (sweptRuntimeStatuses > 0) {
-          logger.info(
-            { swept: sweptRuntimeStatuses },
-            "heartbeat runtime-status sweeper cleared expired entries",
-          );
-        }
-
         const timerSuppression = await heartbeat.resolveSchedulingSuppression();
         // Re-check AFTER the await, not just before it (BLO-20822). This
         // callback is handed to `setInterval` and is not itself registered with
@@ -2103,6 +2141,33 @@ export async function startServer(): Promise<StartedServer> {
             .catch((err) => {
               logger.error({ err }, "heartbeat timer tick failed");
             }));
+        }
+
+        // BLO-49303: the timer enqueue runs AHEAD of the recovery gate. That
+        // gate is held for the whole one-shot recovery chain, which BLO-45212
+        // runs on every lease ACQUISITION, not only at boot — so with the
+        // enqueue below it, a survivor that took the lease ran zero timer
+        // checks until the chain drained: ~75 s on the 2026-10-26 drill, ~11
+        // min on the 2026-10-24 failover, against a 60 s takeover budget.
+        // Safe beside recovery: worker-tier work already runs while this gate
+        // is held — the lease-supervised reconcilers further down and
+        // plugin-driven wakes never consult it — and in steady state
+        // `tickTimers` already runs concurrently with the periodic reap. The
+        // chain also runs beside this process's own live runs whenever it
+        // re-wins the lease (see the lease construction above). NOT a
+        // precedent: API-tier wakes, which return at the API-tier fence before
+        // any reap. Everything left below still waits for recovery, unchanged —
+        // including the plugin resync that precedes it on a takeover.
+        // A re-acquire after lapsed renewals can overlap a tick still suspended
+        // above; that is the same overlap a slow `tickTimers` already has in
+        // steady state, and the passes below carry their own in-flight latches.
+        if (heartbeatStartupRecoveryPending || takeoverRecoveryPending) return;
+        const sweptRuntimeStatuses = heartbeat.sweepExpiredRuntimeStatuses();
+        if (sweptRuntimeStatuses > 0) {
+          logger.info(
+            { swept: sweptRuntimeStatuses },
+            "heartbeat runtime-status sweeper cleared expired entries",
+          );
         }
 
         if (heartbeatSchedulerStopped) return;
@@ -2393,13 +2458,19 @@ export async function startServer(): Promise<StartedServer> {
           // instead of once per 30 s tick, reproducing the very symptom the
           // latch is deployed against ("runs sat in `running` 15-20 min before
           // their k8s Job was created").
+          //
+          // `reapOrphanedRunsPeriodic` (not `reapOrphanedRuns`) is deliberate:
+          // it suppresses the per-row post-reap dispatch, which on this chain is
+          // redundant with the `resumeQueuedRuns` two steps below and used to
+          // make every acted-on row await a fresh fleet-wide sweep (PEN-4736).
+          // Its docstring carries the measurement and the residual scope.
           trackHeartbeatSchedulerWork(heartbeat
             .resumeRunningExternalRuntimeRuns()
             .then(async () => {
               if (periodicOrphanReapInFlight) return;
               periodicOrphanReapInFlight = true;
               try {
-                await heartbeat.reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 });
+                await heartbeat.reapOrphanedRunsPeriodic({ staleThresholdMs: 5 * 60 * 1000 });
               } finally {
                 periodicOrphanReapInFlight = false;
               }
@@ -2443,6 +2514,8 @@ export async function startServer(): Promise<StartedServer> {
             // overlaps the next one. Diagnostic only — see the module docblock.
             const chainTimer = createRecoveryChainTimer({
               log: (fields, message) => logger.info(fields, message),
+              // BLO-49596: stop at the next pass boundary on shutdown.
+              shouldSkip: () => heartbeatSchedulerStopped,
             });
             trackHeartbeatSchedulerWork(chainTimer
               // Pass 1's span is the sweep call alone, so it stays directly
@@ -2450,6 +2523,7 @@ export async function startServer(): Promise<StartedServer> {
               // timing` line the sweep emits from inside itself.
               .time(1, "reconcileStrandedAssignedIssues", () => heartbeat.reconcileStrandedAssignedIssues({
                 recoveryChainId: chainTimer.chainId,
+                shouldStop: () => heartbeatSchedulerStopped,
               }))
               .then(async (reconciled) => {
                 if (
@@ -2637,7 +2711,14 @@ export async function startServer(): Promise<StartedServer> {
           }
         }
       })();
-    }, config.heartbeatSchedulerIntervalMs);
+    };
+    heartbeatSchedulerInterval = setInterval(heartbeatSchedulerTick, config.heartbeatSchedulerIntervalMs);
+    kickHeartbeatScheduler = () => {
+      if (heartbeatSchedulerStopped || !heartbeatSchedulerInterval) return;
+      clearInterval(heartbeatSchedulerInterval);
+      heartbeatSchedulerInterval = setInterval(heartbeatSchedulerTick, config.heartbeatSchedulerIntervalMs);
+      heartbeatSchedulerTick();
+    };
   }
   
   // Database backup is a singleton scheduled task (writes one file per
@@ -3498,7 +3579,14 @@ export async function startServer(): Promise<StartedServer> {
         signal,
         prepareHotRestartShutdown,
         waitForHeartbeatSchedulerIdle,
+        idleWaitTimeoutMs: HEARTBEAT_SCHEDULER_IDLE_WAIT_TIMEOUT_MS,
       });
+      if (heartbeatShutdown.idleWaitTimedOut) {
+        logger.warn(
+          { signal, timeoutMs: HEARTBEAT_SCHEDULER_IDLE_WAIT_TIMEOUT_MS },
+          "shutdown: heartbeat scheduler work still in flight at idle-wait deadline; releasing scheduler lease anyway (BLO-49596)",
+        );
+      }
       const skipHeartbeatDrain = heartbeatShutdown.hotRestart?.skipDrain === true;
 
       // BLO-43292. Released only AFTER the scheduler's in-flight work has
@@ -3515,10 +3603,18 @@ export async function startServer(): Promise<StartedServer> {
       // lease out. When the idle wait was skipped (hot restart), do NOT
       // release — let the TTL expire, trading handover speed for exclusion.
       // Best-effort either way: the holder logs and swallows a failed release.
+      //
+      // BLO-49596: the idle wait is bounded. Unbounded, a 145 s recovery pass
+      // outlived the 120 s grace, the pod was SIGKILLed before this line, and
+      // failover cost grace + TTL (~160 s). The chain now stops at SIGTERM, and
+      // on the backstop timeout the lease is released anyway (speed over
+      // exclusion for whatever single step is still running).
       // BLO-46694: stop the worker singletons before the lease can pass on.
       for (const stop of workerSingletonStops.splice(0)) stop();
       if (schedulerLease) {
-        await schedulerLease.stop({ release: heartbeatShutdown.waitedForSchedulerIdle });
+        await schedulerLease.stop({
+          release: heartbeatShutdown.waitedForSchedulerIdle || heartbeatShutdown.idleWaitTimedOut,
+        });
         schedulerLease = null;
       }
       if (skipHeartbeatDrain) {
@@ -3545,6 +3641,10 @@ export async function startServer(): Promise<StartedServer> {
         }
       }
 
+      // BLO-49139: step breadcrumbs (sync stderr, so they survive a SIGKILL at
+      // the grace deadline) — the 10-28 rollout went silent after the setup
+      // drain on paperclip-0 and nothing said which step hung.
+      writeShutdownBreadcrumb(`step: sse drain (signal=${signal})`);
       try {
         const { sseRegistry } = await import("./services/sse-registry.js");
         await sseRegistry.drain({ timeoutMs: 25_000, reason: `shutdown:${signal}` });
@@ -3553,21 +3653,22 @@ export async function startServer(): Promise<StartedServer> {
         logger.warn({ err }, "sseRegistry.drain failed");
       }
 
-      await new Promise<void>((resolveClose) => {
-        server.close((err) => {
-          if (err) logger.warn({ err }, "server.close error");
-          resolveClose();
-        });
-        server.closeIdleConnections?.();
-      });
+      writeShutdownBreadcrumb(`step: server.close (signal=${signal})`);
+      const closeErr = await closeServerBounded(server, 10_000, () =>
+        writeShutdownBreadcrumb("server.close exceeded 10s; closing all connections"),
+      );
+      if (closeErr) logger.warn({ err: closeErr }, "server.close error");
+      writeShutdownBreadcrumb(`step: server.close done (signal=${signal})`);
 
       const telemetryClient = getTelemetryClient();
       if (telemetryClient) {
+        writeShutdownBreadcrumb(`step: telemetry flush (signal=${signal})`);
         telemetryClient.stop();
         await telemetryClient.flush();
       }
 
       if (!skipHeartbeatDrain && drainHeartbeatRunsForShutdown) {
+        writeShutdownBreadcrumb(`step: heartbeat run drain (signal=${signal})`);
         try {
           const drain = await drainHeartbeatRunsForShutdown(signal);
           logger.info({ signal, drain }, "graceful heartbeat run drain complete");
@@ -3639,12 +3740,22 @@ export async function startServer(): Promise<StartedServer> {
       process.exit(process.exitCode ?? 0);
     };
 
-    process.once("SIGINT", () => {
-      void shutdown("SIGINT");
-    });
-    process.once("SIGTERM", () => {
-      void shutdown("SIGTERM");
-    });
+    // `on`, not `once`, plus a guard (BLO-49139). With `once`, a library that
+    // re-raises the signal finds no listener left and the default action kills
+    // the process mid-drain. The vendored k8s adapters did exactly that, so the
+    // worker never got past the first await of this handler.
+    let shutdownStarted = false;
+    const onShutdownSignal = (signal: "SIGINT" | "SIGTERM") => {
+      if (shutdownStarted) {
+        writeShutdownBreadcrumb(`${signal} received again; shutdown already in progress`);
+        return;
+      }
+      shutdownStarted = true;
+      void shutdown(signal);
+    };
+    // SIGINT stays `once` so a second Ctrl-C in dev still force-quits.
+    process.once("SIGINT", () => onShutdownSignal("SIGINT"));
+    process.on("SIGTERM", () => onShutdownSignal("SIGTERM"));
   }
 
   return {

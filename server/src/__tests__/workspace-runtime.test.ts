@@ -24,16 +24,22 @@ import {
   type Db,
 } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
+import { logger } from "../middleware/logger.js";
 import {
   buildWorkspaceRuntimeDesiredStatePatch,
   buildWorkspaceTemplateData,
   cleanupExecutionWorkspaceArtifacts,
   ensureGitWorktreeBranchCoherent,
+  relinkHuskGitWorktree,
   ensurePersistedExecutionWorkspaceAvailable,
   ensureServerWorkspaceLinksCurrent,
   ensureRuntimeServicesForRun,
   executeProcessForTests,
   GIT_INDEX_LOCK_STALE_MS,
+  GitCommandFailedError,
+  GitCommandTimeoutError,
+  createGitLinkExclusivelyForTests,
+  isInconclusiveGitFailureForTests,
   inspectManagedGitWorktreeBranch,
   isProcessGroupAliveForTests,
   listConfiguredRuntimeServiceEntries,
@@ -42,6 +48,7 @@ import {
   realizeExecutionWorkspace,
   releaseRuntimeServicesForRun,
   resetRuntimeServicesForTests,
+  runGitForTests,
   resolveWorkspaceRuntimeReadinessTimeoutSec,
   resolveShell,
   sanitizeRuntimeServiceBaseEnv,
@@ -8100,8 +8107,11 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
       sourceIdentifier: "PAP-47493",
       claimant: "none",
     });
-    // Husk: registration survives, `.git` link does not; the main checkout is dirty.
+    // Husk with nothing to re-link to: the `.git` link is gone and the registration's
+    // back-pointer no longer names it (BLO-49622 re-links only a surviving one).
+    const adminDir = (await readGit(worktreePath, ["rev-parse", "--absolute-git-dir"])).trim();
     await fs.rm(path.join(worktreePath, ".git"));
+    await fs.writeFile(path.join(adminDir, "gitdir"), "/nonexistent/.git\n", "utf8");
     await fs.appendFile(path.join(repoRoot, "README.md"), "main checkout dirty\n", "utf8");
     const snapshot = async () => ({
       head: await readGit(repoRoot, ["symbolic-ref", "HEAD"]),
@@ -8127,6 +8137,346 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
 
     expect(await snapshot()).toEqual(before);
   }, 20_000);
+
+  it("re-links a husk worktree whose registration survives and repairs it in place (BLO-49622)", async () => {
+    const expectedBranch = "PAP-49622-recorded";
+    const actualBranch = "PAP-49622-live";
+    const { repoRoot, worktreePath } = await createDirtyMismatchRepo({ expectedBranch, actualBranch });
+    const ids = await seedDirtyQuarantineRecords({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      sourceIdentifier: "PAP-49622",
+      claimant: "none",
+    });
+    await fs.rm(path.join(worktreePath, ".git"));
+    await fs.appendFile(path.join(repoRoot, "README.md"), "main checkout dirty\n", "utf8");
+    const snapshot = async () => ({
+      head: await readGit(repoRoot, ["symbolic-ref", "HEAD"]),
+      // Tracked state only: the husk's files read as untracked to the main checkout until re-linked.
+      tracked: await readGit(repoRoot, ["diff", "HEAD"]),
+      mainRefs: await readGit(repoRoot, ["for-each-ref", "--format=%(refname) %(objectname)", "refs/heads/main"]),
+    });
+    const before = await snapshot();
+
+    const result = await ensureGitWorktreeBranchCoherent({
+      db,
+      repoRoot,
+      worktreePath,
+      expectedBranchName: expectedBranch,
+      sourceIssue: { id: ids.sourceIssueId, identifier: ids.sourceIdentifier, title: "Husk worktree" },
+      executionWorkspaceId: ids.sourceWorkspaceId,
+      heartbeatRunId: ids.runId,
+      enableWorkspaceDirtyQuarantineRepair: true,
+    });
+
+    expect(result.branchName).toBe(expectedBranch);
+    expect(result.warnings[0]).toContain("re-linked");
+    expect((await readGit(worktreePath, ["rev-parse", "--show-toplevel"])).trim())
+      .toBe(await fs.realpath(worktreePath));
+    expect((await readGit(worktreePath, ["symbolic-ref", "--short", "HEAD"])).trim()).toBe(expectedBranch);
+    expect(await snapshot()).toEqual(before);
+  }, 20_000);
+
+  it("concurrent re-links of one husk both report a healthy worktree (BLO-49622)", async () => {
+    const { repoRoot, worktreePath } = await createDirtyMismatchRepo({
+      expectedBranch: "PAP-49622-a",
+      actualBranch: "PAP-49622-b",
+    });
+    await fs.rm(path.join(worktreePath, ".git"));
+
+    // The loser of the exclusive create must not report a healthy worktree as unrepairable.
+    expect(await Promise.all([
+      relinkHuskGitWorktree(repoRoot, worktreePath),
+      relinkHuskGitWorktree(repoRoot, worktreePath),
+    ])).toEqual([true, true]);
+    expect((await readGit(worktreePath, ["rev-parse", "--show-toplevel"])).trim())
+      .toBe(await fs.realpath(worktreePath));
+  }, 20_000);
+
+  // PEN-4877: the two ways `relinkHuskGitWorktree` called a healthy husk
+  // unrepairable. Both are concurrency/load sensitive, so they are asserted at
+  // the primitive rather than by winning the race -- the contended-pair probe
+  // above detects defect 1 at ~0.075% and is not a mutation check on its own.
+
+  it("publishes the .git link only once it is complete, so no observer sees a half-written one (PEN-4877)", async () => {
+    // The primitive is content-agnostic, so this drives it with a payload large
+    // enough that a create which is atomic in NAME but not in CONTENT leaves an
+    // observable window every time. That is the point: contention alone exposes
+    // the defect at ~0.075%, which is not a mutation check.
+    //
+    // 1 MB, down from the 8 MB first shipped (PEN-4878) -- and re-measured at
+    // the new size rather than inferred, because a quieter test that no longer
+    // reliably goes red on the unfixed code is strictly worse than an expensive
+    // one that does. Same protocol as this test, 20 trials x 3 rounds per size,
+    // node 24 on the CI runner's tmpdir:
+    //
+    //   size   pre-fix `wx`            post-fix staged+`link`
+    //   1 MB   red 20/20, 4-7 short    green 20/20
+    //   8 MB   red 20/20, 3-10 short   green 20/20
+    //
+    // So 1 MB detects the mutation on every trial with a *tighter* floor than
+    // 8 MB did (4 short reads vs 3), at an eighth of the I/O -- this shard
+    // writes ~3 MB instead of ~24 MB. A 5-trial sweep put the first thinning of
+    // the margin at 256 KB (red 5/5 but only 2-3 short reads), which is why
+    // this stops at 1 MB rather than going smaller. If you change the size
+    // again, re-run that mutation check and record the trial count here.
+    const content = `gitdir: ${"x".repeat(1024 * 1024)}\n`;
+    const partials: number[] = [];
+
+    for (let round = 0; round < 3; round += 1) {
+      const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pen4877-atomic-"));
+      const target = path.join(dir, ".git");
+      let polling = true;
+      const observer = (async () => {
+        while (polling) {
+          const seen = await fs.readFile(target, "utf8").catch(() => null);
+          if (seen !== null && seen.length !== content.length) partials.push(seen.length);
+          await new Promise((resolve) => setImmediate(resolve));
+        }
+      })();
+
+      expect(await createGitLinkExclusivelyForTests(target, dir, content)).toBe("created");
+      polling = false;
+      await observer;
+
+      expect(await fs.readFile(target, "utf8")).toBe(content);
+      // And the staging file is gone, so a checkout never sees untracked noise.
+      expect((await fs.readdir(dir)).filter((name) => name !== ".git")).toEqual([]);
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+
+    expect(partials).toEqual([]);
+  }, 40_000);
+
+  it("reports the race lost without clobbering the winner's link (PEN-4877)", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pen4877-exists-"));
+    const target = path.join(dir, ".git");
+    await fs.writeFile(target, "gitdir: /winner\n", "utf8");
+
+    expect(await createGitLinkExclusivelyForTests(target, dir, "gitdir: /loser\n")).toBe("exists");
+    // Exclusivity is the property the winner/loser determination rests on: a
+    // create that overwrote here would destroy a link that is already correct.
+    expect(await fs.readFile(target, "utf8")).toBe("gitdir: /winner\n");
+    expect((await fs.readdir(dir)).filter((name) => name !== ".git")).toEqual([]);
+  }, 20_000);
+
+  it("reports a staging dir it cannot use as unsupported, so the caller degrades instead of refusing (PEN-4877)", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pen4877-unsupported-"));
+    const target = path.join(dir, ".git");
+
+    expect(await createGitLinkExclusivelyForTests(target, path.join(dir, "absent"), "gitdir: /x\n"))
+      .toBe("unsupported");
+    // "unsupported" must not have published a partial target: the caller takes
+    // that branch to retry with the plain exclusive write.
+    expect(existsSync(target)).toBe(false);
+  }, 20_000);
+
+  it("tells a stall and a spawn failure apart from a real non-zero exit (PEN-4877)", async () => {
+    // A real spawn failure, from the real process runner -- not a hand-built
+    // stand-in, because the whole discriminator rests on which fields node
+    // actually sets on this error.
+    const spawnFailure = await executeProcessForTests({
+      command: path.join(os.tmpdir(), `absent-git-${randomUUID()}`),
+      args: [],
+      cwd: os.tmpdir(),
+    }).then(() => null, (error: unknown) => error);
+    expect((spawnFailure as NodeJS.ErrnoException | null)?.code).toBe("ENOENT");
+    expect(isInconclusiveGitFailureForTests(spawnFailure)).toBe(true);
+
+    expect(isInconclusiveGitFailureForTests(
+      new GitCommandTimeoutError("git rev-parse --show-toplevel timed out after 1ms", { stdout: "" }),
+    )).toBe(true);
+
+    // The one shape that IS evidence about the checkout: `runGit` throws a
+    // plain Error built from stderr when git ran and exited non-zero.
+    expect(isInconclusiveGitFailureForTests(new Error("fatal: not a git repository"))).toBe(false);
+    expect(isInconclusiveGitFailureForTests(null)).toBe(false);
+  }, 20_000);
+
+  it("tells a SYNCHRONOUS spawn failure apart from a real non-zero exit (PEN-4878)", async () => {
+    // The fourth shape, and the one the first cut of the discriminator read
+    // backwards. `spawn()` validates its arguments and throws *synchronously*
+    // for a malformed command or options object, so the throw escapes
+    // `executeProcess`'s Promise executor instead of arriving as the child's
+    // `error` event -- which means no `syscall`, and the pre-PEN-4878 check
+    // scored it a verdict. Direction of failure mattered: the caller acts on a
+    // verdict by `fs.rm`-ing a `.git` it had just written correctly.
+    //
+    // Driven through the real process runner rather than a hand-built
+    // stand-in, because the whole discriminator rests on which fields node
+    // actually sets -- the same rationale as the ENOENT case above.
+    const syncThrows = await Promise.all([
+      // ERR_INVALID_ARG_TYPE -- command is not a string.
+      { command: 7 as unknown as string, args: [], cwd: os.tmpdir() },
+      // ERR_INVALID_ARG_TYPE -- malformed options (cwd is not a path).
+      { command: "git", args: ["rev-parse"], cwd: 7 as unknown as string },
+    ].map((input) => executeProcessForTests(input).then(() => null, (error: unknown) => error)));
+
+    for (const thrown of syncThrows) {
+      // The shape itself, asserted rather than assumed: an ERR_-coded
+      // validation error with no `syscall` for the first arm to catch.
+      expect(thrown).toBeInstanceOf(Error);
+      expect((thrown as NodeJS.ErrnoException).syscall).toBeUndefined();
+      expect((thrown as NodeJS.ErrnoException).code).toMatch(/^ERR_/);
+      expect(isInconclusiveGitFailureForTests(thrown)).toBe(true);
+    }
+
+    // Two-sided, or this scores identically to "always inconclusive", which
+    // would stop a genuinely unresolvable worktree ever being cleaned up: an
+    // ERR_-ish *message* is not an ERR_ code, and a verdict carries no code.
+    expect(isInconclusiveGitFailureForTests(new Error("ERR_INVALID_ARG_TYPE"))).toBe(false);
+    expect(isInconclusiveGitFailureForTests(
+      Object.assign(new Error("fatal: not a git repository"), { code: 128 }),
+    )).toBe(false);
+  }, 20_000);
+
+  it("keeps a correct .git when git cannot be run, and removes it only on a real verdict (PEN-4877)", async () => {
+    const previous = process.env.PAPERCLIP_SERVER_GIT;
+    const restore = () => {
+      if (previous === undefined) delete process.env.PAPERCLIP_SERVER_GIT;
+      else process.env.PAPERCLIP_SERVER_GIT = previous;
+    };
+    // PEN-4878: the refusal this function returns on an inconclusive probe is
+    // outwardly identical to "this husk is not repairable", so the only thing
+    // separating a persistently broken git binary from an unrepairable husk is
+    // this warning. Asserted on both sides below -- a log that also fires on a
+    // real verdict would be noise an operator learns to ignore.
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => logger);
+    const warningsNaming = (worktreePath: string) => warn.mock.calls.filter(
+      ([fields]) => (fields as { worktreePath?: unknown } | undefined)?.worktreePath === worktreePath,
+    );
+    try {
+      // Side A -- no verdict. Node cannot start git at all, which the old
+      // catch-all read as "this worktree does not resolve" and acted on by
+      // deleting the link it had just written correctly.
+      const inconclusive = await createDirtyMismatchRepo({
+        expectedBranch: "PAP-4877-a",
+        actualBranch: "PAP-4877-a-live",
+      });
+      const inconclusiveDotGit = path.join(inconclusive.worktreePath, ".git");
+      await fs.rm(inconclusiveDotGit);
+      process.env.PAPERCLIP_SERVER_GIT = path.join(inconclusive.repoRoot, "no-such-git");
+
+      expect(await relinkHuskGitWorktree(inconclusive.repoRoot, inconclusive.worktreePath)).toBe(false);
+      expect(existsSync(inconclusiveDotGit)).toBe(true);
+      // ...and said so, naming the worktree and the error, rather than
+      // refusing silently on every wake.
+      const inconclusiveWarnings = warningsNaming(inconclusive.worktreePath);
+      expect(inconclusiveWarnings).toHaveLength(1);
+      expect(inconclusiveWarnings[0]?.[1]).toMatch(/inconclusive/i);
+      expect((inconclusiveWarnings[0]?.[0] as { err?: unknown })?.err).toBeInstanceOf(Error);
+      restore();
+      // The link it kept is the correct one -- so the refusal was transient and
+      // the next wake succeeds, rather than the husk being recreated.
+      expect((await readGit(inconclusive.worktreePath, ["rev-parse", "--show-toplevel"])).trim())
+        .toBe(await fs.realpath(inconclusive.worktreePath));
+
+      // Side B -- a real verdict. git ran and answered, so the link must still
+      // be removed. Without this the fix would score identically to "never
+      // clean up", which is the wrong repair in the other direction.
+      const verdict = await createDirtyMismatchRepo({
+        expectedBranch: "PAP-4877-b",
+        actualBranch: "PAP-4877-b-live",
+      });
+      const verdictDotGit = path.join(verdict.worktreePath, ".git");
+      await fs.rm(verdictDotGit);
+      const failingGit = path.join(verdict.repoRoot, "failing-git.sh");
+      await fs.writeFile(failingGit, "#!/bin/sh\necho 'fatal: not a git repository' >&2\nexit 128\n", { mode: 0o755 });
+      process.env.PAPERCLIP_SERVER_GIT = failingGit;
+
+      expect(await relinkHuskGitWorktree(verdict.repoRoot, verdict.worktreePath)).toBe(false);
+      expect(existsSync(verdictDotGit)).toBe(false);
+      // The other side: git ran and answered, so this is a verdict and must NOT
+      // be reported as an inconclusive probe.
+      expect(warningsNaming(verdict.worktreePath)).toEqual([]);
+    } finally {
+      restore();
+      warn.mockRestore();
+    }
+  }, 40_000);
+
+  it("keeps a real non-zero exit a VERDICT even when the throw carries a string ERR_ code (PEN-4900)", async () => {
+    // The `ERR_` arm of `isInconclusiveGitFailure` is deliberately broad, and
+    // used to be safe only because of an invariant held at the `runGit` throw
+    // ~2,800 lines away: that it was a bare `Error` carrying no `code`. Nothing
+    // next to that throw said so. Attaching `code: "ERR_GIT_EXIT"` there for
+    // diagnostics reads as purely additive at the call site, and would in fact
+    // have reclassified EVERY real verdict as inconclusive -- which disables
+    // the `fs.rm(dotGit)` cleanup in `relinkHuskGitWorktree`, silently, since
+    // the inconclusive branch only warns.
+    //
+    // The guarantee is now carried by the error's TYPE, and it has two halves
+    // that only compose if both are pinned here:
+    //   A. the production throw really is a `GitCommandFailedError`, and
+    //   B. that type outranks anything later attached to the error.
+    // Asserting B alone would still pass if the throw were downgraded to a bare
+    // `new Error(...)`; asserting A alone would still pass if the predicate
+    // stopped consulting the type.
+    const previous = process.env.PAPERCLIP_SERVER_GIT;
+    const restore = () => {
+      if (previous === undefined) delete process.env.PAPERCLIP_SERVER_GIT;
+      else process.env.PAPERCLIP_SERVER_GIT = previous;
+    };
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), `pen-4900-${randomUUID()}-`));
+    try {
+      // Half A -- the real throw, from a git that genuinely ran and exited 128,
+      // not a hand-built stand-in. Same rationale as the PEN-4877/PEN-4878
+      // cases above: the discriminator rests on what the production path
+      // actually produces.
+      const failingGit = path.join(dir, "failing-git.sh");
+      await fs.writeFile(failingGit, "#!/bin/sh\necho 'fatal: not a git repository' >&2\nexit 128\n", { mode: 0o755 });
+      process.env.PAPERCLIP_SERVER_GIT = failingGit;
+      const thrown = await runGitForTests(["rev-parse", "--show-toplevel"], dir)
+        .then(() => null, (error: unknown) => error);
+      restore();
+
+      expect(thrown).toBeInstanceOf(GitCommandFailedError);
+      // The message is load-bearing elsewhere (`gitErrorIncludes` matches on
+      // it), so the subclass must not have changed it.
+      expect((thrown as Error).message).toBe("fatal: not a git repository");
+      expect(isInconclusiveGitFailureForTests(thrown)).toBe(false);
+
+      // Half B -- the predicted mutation, applied to that very object: a string
+      // `ERR_` code attached after the fact. Still a verdict.
+      expect(isInconclusiveGitFailureForTests(
+        Object.assign(thrown as Error, { code: "ERR_GIT_EXIT" }),
+      )).toBe(false);
+      // ...and still a verdict when decorated the way a spawn failure looks,
+      // which is the stronger statement: `syscall` no longer wins either.
+      expect(isInconclusiveGitFailureForTests(
+        Object.assign(thrown as Error, { code: "ERR_GIT_EXIT", syscall: "spawn" }),
+      )).toBe(false);
+
+      // Two-sided, or "always verdict" scores identically to a correct fix and
+      // a genuine stall would start deleting good `.git` links -- the exact
+      // regression PEN-4877 closed. An `ERR_`-coded error that is NOT a
+      // non-zero exit must still read inconclusive.
+      const syncThrow = await executeProcessForTests({
+        command: 7 as unknown as string,
+        args: [],
+        cwd: os.tmpdir(),
+      }).then(() => null, (error: unknown) => error);
+      expect((syncThrow as NodeJS.ErrnoException).code).toMatch(/^ERR_/);
+      expect(syncThrow).not.toBeInstanceOf(GitCommandFailedError);
+      expect(isInconclusiveGitFailureForTests(syncThrow)).toBe(true);
+
+      const spawnFailure = await executeProcessForTests({
+        command: path.join(os.tmpdir(), `absent-git-${randomUUID()}`),
+        args: [],
+        cwd: os.tmpdir(),
+      }).then(() => null, (error: unknown) => error);
+      expect(isInconclusiveGitFailureForTests(spawnFailure)).toBe(true);
+
+      expect(isInconclusiveGitFailureForTests(
+        new GitCommandTimeoutError("git rev-parse --show-toplevel timed out after 1ms", { stdout: "" }),
+      )).toBe(true);
+    } finally {
+      restore();
+      await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+    }
+  }, 40_000);
 
   it("refuses dirty quarantine repair while the execution workspace has an active runtime service", async () => {
     const expectedBranch = "PAP-458-recorded";

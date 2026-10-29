@@ -342,13 +342,23 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(dockerWorkflow).toContain(
       "buildkit-amd64-${PREFERRED_ORDINAL}.buildkit-amd64-headless.ci.svc.cluster.local",
     );
-    expect(dockerWorkflow.match(/runs-on: arc-deploy/g)).toHaveLength(3);
+    expect(dockerWorkflow.match(/runs-on: arc-paperclip-deploy/g)).toHaveLength(3);
+    // BLO-48929: the deploy lane is the paperclip-only, workflow-restricted
+    // org group `arc-paperclip-deploy`; group-1 `arc-deploy` is unreachable
+    // from paperclip after the group-1 flip.
+    expect(dockerWorkflow).not.toContain("runs-on: arc-deploy");
     expect(dockerWorkflow).toContain(
       "if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}",
     );
-    // BLO-33389: pinned to the prod group; the tools-cluster `arc-dind` twin
-    // cannot resolve the BuildKit pool.
-    expect(dockerAgentWorkflow).toContain("runs-on:\n      group: default\n      labels: arc-dind\n");
+    // BLO-33389: pinned to a prod-cluster group; the tools-cluster `arc-dind`
+    // twin cannot resolve the BuildKit pool. BLO-48930: that group is the
+    // paperclip-only, workflow-restricted `arc-paperclip-dind` (org group 28),
+    // because group-1 `default` is unreachable after the group-1 flip.
+    expect(dockerAgentWorkflow).toContain(
+      "runs-on:\n      group: arc-paperclip-dind\n      labels: arc-paperclip-dind\n",
+    );
+    expect(dockerAgentWorkflow).not.toContain("group: default");
+    expect(dockerAgentWorkflow).not.toMatch(/labels: arc-dind\b/);
     expect(dockerAgentWorkflow).not.toContain("runs-on: arc-dind");
     expect(dockerAgentWorkflow).toContain("driver: remote");
     expect(dockerAgentWorkflow).toContain('PREFERRED_ORDINAL: "1"');
@@ -592,6 +602,17 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
       "type=registry,ref=${REGISTRY}/agent-runtime-base:buildcache-v1",
     );
     expect(agentRuntimeBake).toContain("type=gha,scope=agent-runtime-base");
+  });
+
+  it("builds agent runtime images daemonless on the remote BuildKit (BLO-48930)", () => {
+    // arc-paperclip-buildkit has no Docker daemon, so the default
+    // docker-container buildx driver would fail there.
+    expect(agentRuntimeImagesWorkflow).toContain("runs-on: arc-paperclip-buildkit");
+    expect(agentRuntimeImagesWorkflow).not.toContain("runs-on: arc-dind");
+    expect(agentRuntimeImagesWorkflow).toContain("driver: remote");
+    expect(agentRuntimeImagesWorkflow).toContain(
+      "endpoint: ${{ steps.buildkit-endpoint.outputs.endpoint }}",
+    );
   });
 
   it("keeps the designer Docker build context aligned with npm ci inputs", () => {

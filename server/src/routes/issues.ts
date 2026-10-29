@@ -600,18 +600,18 @@ function coordinationBlockerPatchOnlyRemoves(
 // (create issue -> assign to a peer -> cancel their in-flight run).
 
 const refreshExternalObjectsSchema = z.object({
-  objectIds: z.array(z.string().uuid()).max(50).optional(),
+  objectIds: z.array(z.string().guid()).max(50).optional(),
 }).strict();
 const inboxArchiveBodySchema = z.object({
   userId: z.string().trim().min(1).optional(),
-}).strict().default({});
+}).strict().prefault({});
 const externalObjectSummariesSchema = z.object({
-  issueIds: z.array(z.string().uuid()).max(1000),
+  issueIds: z.array(z.string().guid()).max(1000),
 }).strict();
 
 const promoteLowTrustOutputSchema = z.object({
   sourceArtifactKind: z.enum(["comment", "document", "work_product", "issue"]),
-  sourceArtifactId: z.string().uuid(),
+  sourceArtifactId: z.string().guid(),
   title: z.string().trim().min(1).max(200),
   summary: z.string().trim().min(1).max(8_000),
 });
@@ -815,7 +815,7 @@ function requiresPaperclipAttachmentMetadata(input: {
 }
 
 const attachmentArtifactMetadataInputSchema = z.object({
-  attachmentId: z.string().uuid(),
+  attachmentId: z.string().guid(),
 }).passthrough();
 
 function buildCreateIssueActivityStatusDetails(
@@ -1475,6 +1475,22 @@ export const ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS: ReadonlySet<string> = new Set(
   // have. The circuit-breaker pair reaches the column through a typed parameter rather
   // than a literal, so the writer-derived scan cannot see it -- the negative test in
   // `issue-wake-diagnostics-routes.test.ts` is what holds this exclusion.
+  // PEN-4894: the deliberate park's RELEASE wake (`tickExpiredIssueParks`). Neither
+  // writer-derived scan can reach it -- it is not a direct `insert(agentWakeupRequests)`
+  // at all, it is an `enqueueWakeup({ reason: ISSUE_PARK_EXPIRED_WAKE_REASON })` call,
+  // and the generic writer inside `enqueueWakeup` sets `reason: opts.reason ?? null`,
+  // which resolves to nothing statically. So this entry is held by the route test
+  // "names the park-expiry reason on a deliberate park's release wake" in
+  // `issue-wake-diagnostics-routes.test.ts`, the same way the two other
+  // const-identifier reasons above are.
+  //
+  // Admitting it is a reachability claim, and it holds: the park wake's payload and
+  // context snapshot both carry `issueId`, so `wakeRequestTargetsIssue` returns it on
+  // this route. It was measured on this route on 2026-10-28 -- reading "other", which
+  // is the defect. That projection is the whole reason PEN-4894's documentation had to
+  // tell readers to attribute park wakes by latency band instead of by name, and it is
+  // the same erasure the PEN-3727 block above describes.
+  "issue_park_expired",
   "issue_execution_deferred",
   "issue_execution_promoted",
   "issue_execution_same_name",
@@ -2167,7 +2183,8 @@ const INVALID_AGENT_IN_REVIEW_DISPOSITION_MESSAGE =
   "A live deliberate park (parkedDisposition / parkedUntil) is NOT on this list, and its absence is a decision rather than an oversight (BLO-33572): " +
   "a park records that nobody is acting on this row until a stated deadline, which is the opposite of what in_review asserts, and it expires on its own — " +
   "so admitting it here would reach in_review with no reviewer at all and merely defer this same refusal to the park's deadline. " +
-  "The strandedness sweep does count a live park, on any status, which is the point: park the row on the status that is actually true (todo/backlog) instead of moving it to review. " +
+  "Both strandedness sweeps count a live park, on any status — the liveness classifier stops flagging the row, and the dispatch sweep stops re-driving it (PEN-4871) — " +
+  "which is the point: park the row on the status that is actually true (todo/backlog) instead of moving it to review. " +
   "After creating one of those review paths, retry the status update.";
 
 function isPendingIssueThreadInteractionReviewPath(interaction: { kind: string; status: string }) {
@@ -4280,6 +4297,16 @@ export function issueRoutes(
    *   honours a live park on `todo`/`backlog` too, so a parked row does not need `in_review`
    *   — using it as a parking lot is the mistake, and the message now says so.
    *
+   * PEN-4871 — "sweep satisfier" above now means BOTH sweeps, and until PEN-4871 it did
+   * not. The liveness classifier honoured the park (`hasActiveParkedDisposition`), so the
+   * row stopped being FLAGGED as stranded; the dispatch sweep had no park predicate at
+   * all, so it went on WAKING the row roughly nine minutes after every park. The third
+   * bullet above — "the sweep honours a live park on `todo`/`backlog` too", the one that
+   * tells the caller where to put the row instead — was therefore the half that was not
+   * true, and it was the half the message routes people toward. The registry of
+   * suppression sites is the header of `services/issue-park-expiry.ts`; a future reader
+   * weighing this asymmetry should check there that both still hold.
+   *
    * This is the PEN-2853 sentence one predicate over: the sweep's leniency exists to avoid
    * *seizing* a row nobody has had a chance to act on; it is not a licence to *assert* a
    * review path.
@@ -6161,8 +6188,8 @@ export function issueRoutes(
   //
   // Safe to read keys directly: `validate(updateIssueRouteSchema)` has already
   // replaced req.body with the parsed result, and updateIssueSchema is built
-  // with `.partial()`, which strips unknown keys AND suppresses field defaults
-  // (a bare `.default()` under `.optional()` does not fire on an absent key).
+  // with `partialNoDefaults()`, which strips unknown keys AND suppresses field
+  // defaults (zod 4's plain `.partial()` would fire them on an absent key).
   // So the key set here is exactly what the caller sent.
   function coordinationMetadataPatchFields(body: unknown): string[] | null {
     if (typeof body !== "object" || body === null || Array.isArray(body)) return null;
@@ -6701,7 +6728,7 @@ export function issueRoutes(
     //
     // Checked on the *normalized* policy rather than the request's key set:
     // `validate(updateIssueRouteSchema)` has already replaced req.body with the
-    // parsed result, and unlike the top-level `.partial()` object the nested
+    // parsed result, and unlike the top-level `partialNoDefaults()` object the nested
     // policy schema does fire its defaults — a monitor-only policy arrives here
     // as `{mode, commentRequired, stages, monitor}`. So key presence proves
     // nothing and only the values do. `mode`/`commentRequired` are not checked

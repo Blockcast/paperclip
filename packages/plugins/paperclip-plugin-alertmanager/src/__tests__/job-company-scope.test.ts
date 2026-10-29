@@ -52,6 +52,12 @@ vi.mock("../reconcile.js", async (importOriginal) => {
   };
 });
 
+const reconcileAbandonedAggregateFences = vi.fn(async () => ({ byIdentity: 0, byAge: 0 }));
+vi.mock("../webhook-handler.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../webhook-handler.js")>();
+  return { ...actual, reconcileAbandonedAggregateFences: () => reconcileAbandonedAggregateFences() };
+});
+
 const { plugin } = await import("../worker.js");
 
 type JobHandler = (job: PluginJobContext) => Promise<void>;
@@ -175,5 +181,23 @@ describe("alertmanager reconcile-active-alerts outcome is visible at info (BLO-4
   it("logs routed/backfilled counts at info on a real pass", async () => {
     const lines = await runReconcile({ routed: 3, backfilled: ["fp1"] });
     expect(lines).toContain("paperclip-plugin-alertmanager: alert reconcile company company-a routed=3 backfilled=1");
+  });
+});
+
+// BLO-49195: a fence leaked by a live process on an aggregate whose alert had
+// stopped firing waited for a worker restart, because the sweep with the age
+// arm ran only from setup(). It must also run on every reconcile pass.
+describe("alertmanager reconcile-active-alerts re-runs the fence sweep (BLO-49195)", () => {
+  it("runs reconcileAbandonedAggregateFences on each pass, not only at setup", async () => {
+    resolveEscalationSweepConfig.mockResolvedValue({ defaultCompanyId: "company-a" });
+    reconcileActiveAlerts.mockResolvedValue({ routed: 0, backfilled: [] });
+    const { ctx, registered } = mkCtx();
+    await plugin.definition.setup!(ctx);
+    reconcileAbandonedAggregateFences.mockClear();
+    const handler = registered.get("reconcile-active-alerts");
+    if (!handler) throw new Error("reconcile-active-alerts was never registered");
+    await handler({ companyId: "company-a" } as unknown as PluginJobContext);
+    await handler({ companyId: "company-a" } as unknown as PluginJobContext);
+    expect(reconcileAbandonedAggregateFences).toHaveBeenCalledTimes(2);
   });
 });

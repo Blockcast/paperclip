@@ -1,14 +1,20 @@
 /**
  * PEN-4420: the deliberate park's RELEASE edge.
  *
- * `parked_until` (BLO-27912 / migration 0222) is read on the wake path in at least two
- * places, and both of them read it to SUPPRESS:
+ * `parked_until` (BLO-27912 / migration 0222) is read on the wake path in three places,
+ * and all of them read it to SUPPRESS. Each defers to `isDeliberateParkActive` below;
+ * this list is the registry, so a fourth suppression site belongs here too:
  *
  *  - `hasLiveDeliberatePark` (`routes/github-webhook.ts`) — a live park suppresses
  *    `github_check_*` wakes (PEN-4114).
  *  - `hasActiveParkedDisposition` (`services/recovery/issue-graph-liveness.ts`) — a live
  *    park is the seventh explicit waiting path, so the strandedness invariants stop
  *    firing against the row.
+ *  - the strandedness DISPATCH sweep's candidate filter
+ *    (`runStrandedAssignedIssueSweep`, `services/recovery/service.ts`) — a live park
+ *    keeps the row out of the re-dispatch population (PEN-4871). This one was missing
+ *    until PEN-4871: the row above stopped being FLAGGED as stranded and went on being
+ *    WOKEN anyway, ~9 minutes after every park, at full agent-session cost.
  *
  * Nothing read it to RELEASE. `parked_until` passing produced no event on any status, so
  * a parked row whose only wake was the park itself sat inert indefinitely. The park had a
@@ -36,6 +42,47 @@
  * intent of BLO-33572's refusal, which says admitting a live park as a review path would
  * "merely defer this same refusal to the park's deadline". This module is what makes that
  * deferral actually occur. The two compose; neither is weakened.
+ *
+ * ## `parkedWakeFiredAt` is a CLAIM, not an audit record (PEN-4894)
+ *
+ * The column exists to make the release edge fire exactly once per park. It is not, and
+ * cannot be read as, a record of which parks woke:
+ *
+ *  - the park writer resets it to `null` on every `parkedDisposition` write, so a re-park
+ *    erases it — and a park wake that WORKS dispatches a run which routinely re-parks the
+ *    row, so the field systematically deletes its own positive cases;
+ *  - the sweep rolls it back to `null` when `enqueueWakeup` throws, so even a stamp that
+ *    survives re-parking is not a complete record of fires.
+ *
+ * Measured 2026-10-28 on seven rows parked to one shared instant: 7 of 7 fired, between
+ * +30.5 s and +75.4 s after the deadline (inside the historical park-fire band), and 7 of
+ * 7 read `parkedWakeFiredAt = null` 45 minutes later, every one re-parked in between.
+ * Across a 4,361-row census the discriminator was the re-park and not the wake outcome:
+ * fired then re-parked ⇒ `null` 7/7, fired and never re-parked ⇒ present 12/12.
+ *
+ * ⚠️ The failure is in the REASSURING direction and gets worse as this module gets more
+ * reliable, which is what made it expensive to find (three days and four monitor attempts
+ * on PEN-4198 before a positive control caught it).
+ *
+ * ⇒ `null` means "no release wake is owed for this row's current park". To ask whether
+ * park wakes FIRED, read the `agent_wakeup_requests` TABLE, which is the durable
+ * per-event record. `GET /api/issues/:id/diagnostics/wakes` serves it, but as a BOUNDED
+ * view: the route passes no options, so both ceilings bind and a caller cannot raise
+ * them — at most `ISSUE_WAKE_DIAGNOSTICS_MAX_WAKE_REQUESTS` (50) requests, within
+ * `ISSUE_WAKE_DIAGNOSTICS_LOOKBACK_DAYS` (14) days, and there is no offset or cursor to
+ * page past either. Read `caps` and `truncatedSections.wakeRequests` off the response
+ * before reading an absence as a negative; on a busy row, or a park older than the
+ * lookback, empty means "outside the window", which is this module's own trap relocated
+ * to the replacement surface.
+ *
+ * Note also that a park-expiry wake is NOT emitted to `GET /api/companies/:id/activity`
+ * at all, unlike `issue.monitor_triggered` / `_scheduled` / `_cleared`, so the activity
+ * feed is not a substitute either.
+ *
+ * Operator-facing version of all of the above, including the three meanings of `null` and
+ * why preserving the stamp was declined: `runbooks/deliberate-park-release-edge.md`. That
+ * file is the single source of truth; the other code sites point at it rather than
+ * restating it, so the account cannot drift between five copies.
  */
 
 /**
@@ -113,6 +160,38 @@ function readMs(value: Date | string | null | undefined): number | null {
 }
 
 /**
+ * Is a deliberate park in force on this row right now?
+ *
+ * PEN-4871: the single owner of the live-park reading. Every path that SUPPRESSES on a
+ * park defers to this function; none of them restates it.
+ *
+ * It did not start that way. The predicate was hand-copied into three places —
+ * `hasActiveParkedDisposition` (`services/recovery/issue-graph-liveness.ts`),
+ * `hasLiveDeliberatePark` (`routes/github-webhook.ts`) and, by its absence, the
+ * strandedness dispatch sweep — each with a comment asking the next author to keep them in
+ * step. That is the arrangement BLO-22660 already recorded failing on this exact column:
+ * *"That pair of producers had already drifted once on `parkedUntil` (BLO-27912) and the
+ * comment asking the next author to keep them in step did not prevent this one; a required
+ * key does."* The third site did not drift so much as never exist, which is the same defect
+ * with a cheaper disguise — nothing fails when a copy is simply missing.
+ *
+ * Keyed on the deadline alone and compared with `> nowMs`, so expiry is the default: a park
+ * nobody restates stops suppressing on its own, and un-parking (writing
+ * `parkedDisposition: null`, which clears the column) takes effect immediately. The
+ * mechanism cannot decay into permanent silence on a row that genuinely needs the wake.
+ *
+ * An unparseable or absent deadline reads as NOT parked — suppression must be something a
+ * row earns, never something it falls into.
+ */
+export function isDeliberateParkActive(
+  parkedUntil: Date | string | null | undefined,
+  nowMs: number,
+): boolean {
+  const parkedUntilMs = readMs(parkedUntil);
+  return parkedUntilMs !== null && parkedUntilMs > nowMs;
+}
+
+/**
  * Does this row's park owe a release wake right now?
  *
  * This is the authoritative statement of the sweep's predicate. `tickExpiredIssueParks`
@@ -131,6 +210,8 @@ function readMs(value: Date | string | null | undefined): number | null {
  *    fire-once marker. `parkedWakeFiredAt < parkedAt` is an independent backstop against a
  *    writer that forgets to reset the marker on a re-park: it degrades that bug to a late
  *    wake instead of to permanent silence, which is the direction this whole row is about.
+ *    Per-PARK, never per-row — see "`parkedWakeFiredAt` is a CLAIM" above before reading
+ *    this column as a history of park wakes.
  *  - **the status still wants a wake.** See `ISSUE_PARK_EXPIRY_WAKE_STATUSES`.
  *  - **there is an agent to wake.** A human-assigned row has no agent target; `enqueueWakeup`
  *    takes an agent id, and a park on a `assigneeUserId` row is a note to a person, not a
@@ -143,8 +224,11 @@ export function issueParkOwesReleaseWake(
   if (!isIssueParkExpiryWakeStatus(issue.status)) return false;
   if (!issue.assigneeAgentId || issue.assigneeUserId) return false;
 
-  const parkedUntilMs = readMs(issue.parkedUntil);
-  if (parkedUntilMs === null || parkedUntilMs > nowMs) return false;
+  // The exact negation of `isDeliberateParkActive`, written through it rather than beside
+  // it so the "these two cannot both hold" claim above is enforced by construction. The
+  // `=== null` arm is the separate "no park at all" case, which is neither live nor lapsed.
+  if (readMs(issue.parkedUntil) === null) return false;
+  if (isDeliberateParkActive(issue.parkedUntil, nowMs)) return false;
 
   const firedAtMs = readMs(issue.parkedWakeFiredAt);
   if (firedAtMs === null) return true;

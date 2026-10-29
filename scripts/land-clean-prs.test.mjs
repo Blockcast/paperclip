@@ -5,6 +5,7 @@ import {
   CHECK_SETTLE_MINUTES,
   MAX_ENQUEUES_PER_FIRE,
   STALE_ENQUEUE_HOURS,
+  STALE_HOLD_HOURS,
   allyVerdictAtHead,
   approvalLanes,
   checkSettlement,
@@ -14,15 +15,27 @@ import {
   failingChecks,
   applyRow,
   isFatalGhError,
+  liveHeadSha,
   isMainModule,
   markFailure,
   latestCheckStates,
+  judgeableAgeHours,
+  newestCheckStamp,
   renderReceipt,
+  renderStalledHolds,
+  stalledHolds,
   repoRunner,
   settleMinutesFrom,
   sweepRepos,
   targetRepos,
   unsatisfiedOwners,
+  codeownersPatternToRegExp,
+  fetchCodeownerRules,
+  impliedOwners,
+  isNotFoundGhError,
+  ownersForFiles,
+  parseCodeowners,
+  stripCodeownersComment,
 } from "./land-clean-prs.mjs";
 
 const HEAD = "958587ad1fe1eb52b06ca874c41734c9abdc2a10";
@@ -752,14 +765,114 @@ describe("applyRow", () => {
    */
   it("arms auto-merge with an explicit merge method", () => {
     const calls = [];
-    const outcome = applyRow("o/r", { number: 7, action: "enqueue" }, (args) => {
+    // PEN-4887: the row carries its classified head and the live read agrees,
+    // so the enqueue proceeds exactly as before.
+    const outcome = applyRow("o/r", { number: 7, action: "enqueue", headSha: HEAD }, (args) => {
       calls.push(args);
-      return "";
+      return JSON.stringify({ headRefOid: HEAD });
     });
     // Not "armed": the same call queues, arms, or merges outright depending on
     // the base, and this defect was a receipt naming an action it had not taken.
     assert.equal(outcome, "merge requested");
-    assert.deepEqual(calls, [["pr", "merge", "7", "--repo", "o/r", "--auto", "--rebase"]]);
+    assert.deepEqual(calls.at(-1), [
+      "pr", "merge", "7", "--repo", "o/r", "--auto", "--rebase", "--match-head-commit", HEAD,
+    ]);
+  });
+
+  /**
+   * Ally review, 2nd pass. The re-read above is check-then-act: the head can
+   * still move between `pr view` and `pr merge`. `--match-head-commit` hands
+   * GitHub the SHA every gate in this row was evaluated against, so the server
+   * refuses the merge atomically if the head moved inside that window.
+   *
+   * What this pins down is that the flag is present and carries the row's own
+   * head rather than a constant or an unrelated SHA. It cannot distinguish
+   * `row.headSha` from the re-read value, because the guard above has already
+   * thrown unless the two are equal -- that equality is the point, not an
+   * untested branch.
+   */
+  it("pins the merge to the head the row was classified against, atomically", () => {
+    const calls = [];
+    applyRow("o/r", { number: 7, action: "enqueue", headSha: HEAD }, (args) => {
+      calls.push(args);
+      return JSON.stringify({ headRefOid: HEAD });
+    });
+
+    const merge = calls.at(-1);
+    const pinned = merge[merge.indexOf("--match-head-commit") + 1];
+    assert.equal(pinned, HEAD, "the pin must be the classified head");
+    assert.notEqual(pinned, OTHER);
+  });
+
+  /**
+   * PEN-4887. `fetchOpenPrs` snapshots every PR once per fire; landing a
+   * stacked child into this PR's branch replaces its head with the merge
+   * commit, on which nothing has run. #3060 was enqueued 4s after that
+   * happened and ejected by the queue 10s later, 2m10s before
+   * `ci/ally-head-attested` even succeeded.
+   */
+  it("refuses to enqueue when the head moved since classification", () => {
+    const calls = [];
+    assert.throws(
+      () =>
+        applyRow("o/r", { number: 3060, action: "enqueue", headSha: HEAD }, (args) => {
+          calls.push(args);
+          return JSON.stringify({ headRefOid: OTHER });
+        }),
+      /head moved since classification/,
+    );
+    assert.ok(
+      !calls.some((args) => args[0] === "pr" && args[1] === "merge"),
+      `must not reach the merge call; calls were ${JSON.stringify(calls)}`,
+    );
+  });
+
+  it("fails closed when the live head cannot be read, or the row carries none", () => {
+    // An unreadable SHA is not permission to enqueue: it means the
+    // classification cannot be shown to still apply. The row re-classifies on
+    // the next fire, and `markFailure` keeps the refusal out of the cap.
+    for (const liveResponse of ["{}", JSON.stringify({ headRefOid: "" }), JSON.stringify({ headRefOid: null })]) {
+      assert.throws(
+        () => applyRow("o/r", { number: 11, action: "enqueue", headSha: HEAD }, () => liveResponse),
+        /head moved since classification/,
+        `unreadable live head (${liveResponse}) must not enqueue`,
+      );
+    }
+    assert.throws(
+      () => applyRow("o/r", { number: 12, action: "enqueue" }, () => JSON.stringify({ headRefOid: HEAD })),
+      /head moved since classification/,
+      "a row with no classified head cannot be compared against anything",
+    );
+  });
+
+  it("the refusal lands in the action column, so it never spends a queue slot", () => {
+    // End-to-end with `markFailure`/`sweepRepos`'s reading: only rows still
+    // reading `enqueue` count against MAX_ENQUEUES_PER_FIRE.
+    const row = { number: 3060, action: "enqueue", reason: "mergestate:CLEAN", detail: null, headSha: HEAD };
+    try {
+      applyRow("o/r", row, () => JSON.stringify({ headRefOid: OTHER }));
+      assert.fail("expected a refusal");
+    } catch (error) {
+      markFailure(row, error.message);
+    }
+    assert.equal(row.action, "enqueue-failed");
+    assert.match(row.detail, /head moved since classification/);
+    assert.equal([row].filter((r) => r.action === "enqueue").length, 0);
+    assert.equal(isFatalGhError(row.detail), false, "a moved head is a skip, never a reason to abort the fire");
+  });
+
+  it("liveHeadSha reads the PR's current head and normalises an unusable answer to null", () => {
+    const calls = [];
+    assert.equal(
+      liveHeadSha("o/r", 7, (args) => {
+        calls.push(args);
+        return JSON.stringify({ headRefOid: HEAD });
+      }),
+      HEAD,
+    );
+    assert.deepEqual(calls, [["pr", "view", "7", "--repo", "o/r", "--json", "headRefOid"]]);
+    assert.equal(liveHeadSha("o/r", 7, () => "{}"), null);
+    assert.equal(liveHeadSha("o/r", 7, () => JSON.stringify({ headRefOid: "" })), null);
   });
 
   it("disarms a stale enqueue without a merge method", () => {
@@ -801,5 +914,402 @@ describe("markFailure", () => {
     ]);
     assert.match(receipt, /enqueue: 1/);
     assert.match(receipt, /enqueue-failed: 1/);
+  });
+});
+
+/**
+ * PEN-4919. `fetchCodeownerRules` is the fail-CLOSED half of the owner hold:
+ * `null` ("unreadable, keep holding") must stay distinguishable from `[]`
+ * ("measured, nobody is owed"). Two paths used to cross that line silently.
+ */
+describe("fetchCodeownerRules fails closed on anything it did not read", () => {
+  const CODEOWNERS = "docs/ @org/docs-team\n";
+
+  /** `execFileSync` surfaces gh's diagnostics on `stderr` as a Buffer. */
+  function ghError(stderr) {
+    return Object.assign(new Error("Command failed"), { stderr: Buffer.from(stderr) });
+  }
+
+  const notFound = () => ghError("gh: Not Found (HTTP 404)\n");
+  const blob = (text, encoding = "base64") =>
+    JSON.stringify({ encoding, content: Buffer.from(text).toString("base64") });
+
+  /** Answers by path, so precedence order is observable rather than assumed. */
+  function runner(byPath, calls = []) {
+    return (args) => {
+      const path = String(args.at(-1)).replace(/^repos\/[^/]+\/[^/]+\/contents\//, "");
+      calls.push(path);
+      const answer = byPath[path] ?? notFound;
+      if (typeof answer === "function") throw answer();
+      return answer;
+    };
+  }
+
+  it("falls through a 404 to the next location, in precedence order", () => {
+    const calls = [];
+    const rules = fetchCodeownerRules(
+      "Blockcast/paperclip",
+      runner({ CODEOWNERS: blob(CODEOWNERS) }, calls),
+    );
+    assert.deepEqual(calls, [".github/CODEOWNERS", "CODEOWNERS"]);
+    assert.equal(rules.length, 1);
+    assert.deepEqual(rules[0].owners, ["team:docs-team"]);
+  });
+
+  it("does NOT fall through a 5xx to a lower-precedence CODEOWNERS", () => {
+    // The whole point: a transient outage on `.github/CODEOWNERS` must not
+    // silently adopt `docs/CODEOWNERS`'s rules. Unreadable is not absent.
+    const calls = [];
+    const rules = fetchCodeownerRules(
+      "Blockcast/paperclip",
+      runner(
+        {
+          ".github/CODEOWNERS": () => ghError("gh: Internal Server Error (HTTP 500)\n"),
+          "docs/CODEOWNERS": blob("* @someone-else\n"),
+        },
+        calls,
+      ),
+    );
+    assert.equal(rules, null);
+    assert.deepEqual(calls, [".github/CODEOWNERS"]);
+  });
+
+  it("does NOT fall through a 403, and stops on a transport failure", () => {
+    for (const stderr of ["gh: Forbidden (HTTP 403)\n", "spawnSync gh ENOENT"]) {
+      assert.equal(
+        fetchCodeownerRules("r/r", runner({ ".github/CODEOWNERS": () => ghError(stderr) })),
+        null,
+      );
+    }
+  });
+
+  it("reads a >1 MB CODEOWNERS as unread, not as empty", () => {
+    // Blobs over 1 MB are not inlined: `content: ""` with `encoding: "none"`.
+    // That used to decode to "" and parse to [] -- "nobody is owed" -- which
+    // drops every outstanding request and releases every held PR at once.
+    const calls = [];
+    const rules = fetchCodeownerRules(
+      "Blockcast/paperclip",
+      runner({ ".github/CODEOWNERS": JSON.stringify({ encoding: "none", content: "" }) }, calls),
+    );
+    assert.equal(rules, null);
+    assert.notDeepEqual(rules, []);
+    assert.deepEqual(calls, [".github/CODEOWNERS"], "must not try a lower-precedence file either");
+  });
+
+  it("skips a directory at the path but still reads the next location", () => {
+    const rules = fetchCodeownerRules(
+      "r/r",
+      runner({
+        ".github/CODEOWNERS": JSON.stringify([{ name: "OWNERS" }]),
+        CODEOWNERS: blob(CODEOWNERS),
+      }),
+    );
+    assert.equal(rules.length, 1);
+  });
+
+  it("returns null when every location 404s, and when the body is not JSON", () => {
+    assert.equal(fetchCodeownerRules("r/r", runner({})), null);
+    assert.equal(fetchCodeownerRules("r/r", runner({ ".github/CODEOWNERS": "<html>" })), null);
+  });
+
+  it("identifies a 404 and nothing looser", () => {
+    assert.ok(isNotFoundGhError("gh: Not Found (HTTP 404)"));
+    assert.ok(!isNotFoundGhError("gh: Internal Server Error (HTTP 500)"));
+    // A 404 named only in prose is not a status; the caller must fail closed.
+    assert.ok(!isNotFoundGhError("Not Found"));
+    assert.ok(!isNotFoundGhError(undefined));
+  });
+});
+
+/**
+ * PEN-3474. `reviewRequests` alone is not the gate the hold claims to be: it
+ * holds on requests CODEOWNERS never implied, and on requests GitHub stopped
+ * implying when the owned file left the diff and then never withdrew.
+ */
+describe("CODEOWNERS scoping of the owner hold", () => {
+  /** The live `Blockcast/paperclip` rules, verbatim, so the cases are the real ones. */
+  const RULES = parseCodeowners(
+    [
+      "# Code owners.",
+      "",
+      ".github/** @kkroo",
+      "scripts/release*.sh @kkroo",
+      "doc/RELEASING.md @kkroo",
+      "skills/** @kkroo",
+      "package.json @kkroo   # matches at every depth",
+      "docs/ @org/docs-team",
+    ].join("\n"),
+  );
+
+  it("parses owners, skips comments and blank lines, and ignores a pattern with no owner", () => {
+    assert.equal(RULES.length, 6);
+    assert.deepEqual(RULES.at(-1).owners, ["team:docs-team"]);
+    assert.deepEqual(parseCodeowners("# only a comment\n\nlonely-pattern\n"), []);
+  });
+
+  it("anchors a pattern containing a slash and floats a bare name to any depth", () => {
+    // The checked-in CODEOWNERS relies on both, and says so in its own comment.
+    assert.ok(codeownersPatternToRegExp("package.json").test("packages/acpx-local/package.json"));
+    assert.ok(codeownersPatternToRegExp("package.json").test("package.json"));
+    assert.ok(!codeownersPatternToRegExp("scripts/release*.sh").test("scripts/nested/release.sh"));
+    assert.ok(codeownersPatternToRegExp("scripts/release*.sh").test("scripts/release-x.sh"));
+  });
+
+  it("spans whole segments for `**` and owns the contents of a directory pattern", () => {
+    assert.ok(codeownersPatternToRegExp("a/**/b.ts").test("a/b.ts"));
+    assert.ok(codeownersPatternToRegExp("a/**/b.ts").test("a/x/y/b.ts"));
+    assert.ok(!codeownersPatternToRegExp("a/**/b.ts").test("z/a/b.ts"));
+    assert.ok(codeownersPatternToRegExp("docs/").test("docs/x/y.md"));
+    assert.ok(!codeownersPatternToRegExp("docs/").test("docsy/x.md"));
+  });
+
+  it("treats a literal dot as a literal, not as a wildcard", () => {
+    // The chain-replace translator this replaced mangled `a.b*`: its lookbehind
+    // guard fired on the escaped dot and left the `*` as a regex quantifier.
+    assert.ok(codeownersPatternToRegExp("a.b*").test("a.bc"));
+    assert.ok(!codeownersPatternToRegExp("a.b*").test("axbc"));
+  });
+
+  it("confines an interior `**` to one segment and keeps an escaped `#` literal", () => {
+    // PEN-4919 (c). gitignore: "other consecutive asterisks are considered
+    // regular asterisks", so `a**b` must not cross `/` the way `.*` did.
+    assert.ok(codeownersPatternToRegExp("a**b").test("axxb"));
+    assert.ok(!codeownersPatternToRegExp("a**b").test("a/x/b"));
+    // The forms that ARE bounded by slashes keep spanning whole segments.
+    assert.ok(codeownersPatternToRegExp("a/**/b").test("a/x/y/b"));
+    assert.ok(codeownersPatternToRegExp("a/**").test("a/x/y"));
+
+    assert.equal(stripCodeownersComment("src/a\\#b @o   # trailing"), "src/a#b @o");
+    const [rule] = parseCodeowners("weird\\#name @kkroo\n");
+    assert.equal(rule.pattern, "weird#name");
+    assert.ok(rule.matcher.test("weird#name"));
+  });
+
+  it("applies LAST match wins per file, then unions across files", () => {
+    const rules = parseCodeowners(["src/** @first", "src/special.ts @second"].join("\n"));
+    assert.deepEqual([...ownersForFiles(["src/other.ts"], rules)], ["first"]);
+    assert.deepEqual([...ownersForFiles(["src/special.ts"], rules)], ["second"]);
+    assert.deepEqual([...ownersForFiles(["src/other.ts", "src/special.ts"], rules)].sort(), [
+      "first",
+      "second",
+    ]);
+  });
+
+  it("drops a request whose owned file left the diff (#3067)", () => {
+    // Opened touching `.github/workflows/pr.yml`, auto-requested @kkroo two
+    // seconds later, then force-pushed down to one unowned file. GitHub never
+    // withdraws the request, and GraphQL `asCodeOwner` still read `true`.
+    const row = classifyPr(
+      pr({
+        mergeStateStatus: "CLEAN",
+        reviewRequests: [{ login: "kkroo" }],
+        codeownerRules: RULES,
+        files: ["scripts/__tests__/vitest-project-coverage.test.mjs"],
+      }),
+      { now: NOW },
+    );
+    assert.equal(row.action, "enqueue");
+  });
+
+  it("keeps a request the current diff still owes (#3054, #3051)", () => {
+    for (const files of [[".github/workflows/stranded-approval-lock-check.yml"], ["skills/paperclip/SKILL.md"]]) {
+      const row = classifyPr(
+        pr({ reviewRequests: [{ login: "kkroo" }], codeownerRules: RULES, files }),
+        { now: NOW },
+      );
+      assert.equal(row.action, "codeowner-review-requested");
+      assert.equal(row.detail, "kkroo");
+    }
+  });
+
+  it("drops the `allyblockcast` User request CODEOWNERS never named", () => {
+    // The original PEN-3474 cohort: the requested User (id 296676656) is a
+    // different principal from the `allyblockcast[bot]` App that reviews, so
+    // no review can ever clear it. CODEOWNERS names only @kkroo.
+    assert.deepEqual(
+      unsatisfiedOwners({
+        headRefOid: HEAD,
+        reviewRequests: [{ login: "allyblockcast" }],
+        reviews: [review()],
+        codeownerRules: RULES,
+        files: [".github/workflows/pr.yml"],
+      }),
+      [],
+    );
+  });
+
+  it("keeps a team request the diff owes, which no login approval can satisfy", () => {
+    assert.deepEqual(
+      unsatisfiedOwners({
+        headRefOid: HEAD,
+        reviewRequests: [{ slug: "docs-team" }],
+        reviews: [{ state: "APPROVED", user: { login: "kkroo" }, commit_id: HEAD }],
+        codeownerRules: RULES,
+        files: ["docs/guide.md"],
+      }),
+      ["team:docs-team"],
+    );
+  });
+
+  it("falls back to holding when ownership cannot be determined", () => {
+    // This script's output is "merge it", so every unknown has to over-hold.
+    // `null` and `[]` must stay distinguishable: the empty set means nobody is
+    // owed, and reading an unreadable CODEOWNERS as empty would release every
+    // held PR at once.
+    const base = {
+      headRefOid: HEAD,
+      reviewRequests: [{ login: "kkroo" }],
+      reviews: [review()],
+      files: ["scripts/unowned.mjs"],
+    };
+    assert.deepEqual(unsatisfiedOwners(base), ["kkroo"], "no rules fetched");
+    assert.deepEqual(
+      unsatisfiedOwners({ ...base, codeownerRules: RULES, files: null }),
+      ["kkroo"],
+      "file listing failed",
+    );
+    assert.deepEqual(
+      unsatisfiedOwners({
+        ...base,
+        codeownerRules: RULES,
+        files: Array.from({ length: 3000 }, (_, i) => `f${i}.ts`),
+      }),
+      ["kkroo"],
+      "GitHub truncated the file listing",
+    );
+    assert.equal(impliedOwners({ codeownerRules: RULES, files: null }), null);
+    assert.deepEqual([...impliedOwners({ codeownerRules: RULES, files: ["unowned.ts"] })], []);
+  });
+});
+
+describe(`stale-hold report (held >${STALE_HOLD_HOURS}h, PEN-5005)`, () => {
+  // Every fixture is anchored on NOW so the clock under test is the only
+  // moving part.
+  const checkAt = (iso) => [{ name: "verify", conclusion: "SUCCESS", completedAt: iso }];
+  const pr = (number, iso) => ({ number, statusCheckRollup: iso === null ? [] : checkAt(iso) });
+  const row = (number, action, reason) => ({ number, action, reason });
+
+  const FRESH = "2026-09-13T11:00:00Z"; // 1h before NOW
+  const OLD = "2026-09-12T20:00:00Z"; // 16h before NOW
+
+  it("reports a hold whose head stopped moving longer ago than the window", () => {
+    const held = stalledHolds(
+      [pr(1, OLD)],
+      [row(1, "codeowner-review-requested", "owner-approval-pending")],
+      { now: NOW },
+    );
+    assert.deepEqual(held, [
+      { number: 1, reason: "owner-approval-pending", ageHours: 16 },
+    ]);
+  });
+
+  it("does not report a hold that is still inside the window", () => {
+    // The live case this detector was written against: #3089 and #3085 were
+    // 9.2h and 9.8h OLD on 2026-10-29 against a 2.2-6.8h create->merge
+    // spread, which reads as a strand — but both had pushed that morning and
+    // their CI had finished ~2.5h earlier, and both classified `enqueue` on
+    // the next read. A creation clock names them; this one must not.
+    assert.deepEqual(
+      stalledHolds([pr(1, FRESH)], [row(1, "skip", "checks:settling")], { now: NOW }),
+      [],
+    );
+  });
+
+  it("ages what a PR ended as, so an acted-on row is never reported", () => {
+    const prs = [pr(1, OLD), pr(2, OLD), pr(3, OLD), pr(4, OLD)];
+    const rows = [
+      row(1, "enqueue", "mergestate:CLEAN"),
+      row(2, "already-enqueued", "auto-merge armed 1.0h ago"),
+      // Both of these carry their own cohort or their own better clock, and
+      // reporting them here would name one PR twice under two mechanisms.
+      row(3, "approval-rotted", "mergestate:DIRTY"),
+      row(4, "stale-enqueue", "auto-merge armed 20.0h ago"),
+    ];
+    assert.deepEqual(stalledHolds(prs, rows, { now: NOW }), []);
+  });
+
+  it("never ages a row the cap deferred — the next fire takes it", () => {
+    // Ally on #3106: `classifyAll` rewrites an over-budget `enqueue` into
+    // `skip`/`cap:N-per-fire`, and the budget is spent on the PRs whose CI
+    // reported most recently — so the deferred rows carry the OLDEST stamps
+    // and age like strands. Reporting them would fire this block hardest
+    // exactly when the queue is deepest and the routine is working.
+    assert.deepEqual(
+      stalledHolds([pr(1, OLD)], [row(1, "skip", `cap:${MAX_ENQUEUES_PER_FIRE}-per-fire`)], {
+        now: NOW,
+      }),
+      [],
+    );
+  });
+
+  it("never ages a deliberate hold", () => {
+    // Draft, an opt-out label and a human author are all states someone CHOSE.
+    // An alarm that fires on its own normal operation is one nobody reads.
+    const prs = [pr(1, OLD), pr(2, OLD), pr(3, OLD)];
+    const rows = [
+      row(1, "skip", "draft"),
+      row(2, "skip", "label:do-not-merge"),
+      row(3, "skip", "human-author"),
+    ];
+    assert.deepEqual(stalledHolds(prs, rows, { now: NOW }), []);
+  });
+
+  it("REPORTS an undatable hold rather than dropping it", () => {
+    // The fail-toward-clean shape: a held PR whose rollup carries no stamp is
+    // a PR nothing ever ran on, which is the case most worth hearing about.
+    // Silence here would be indistinguishable from a healthy repo.
+    assert.deepEqual(
+      stalledHolds([pr(1, null)], [row(1, "skip", "checks:none")], { now: NOW }),
+      [{ number: 1, reason: "checks:none", ageHours: null }],
+    );
+    assert.deepEqual(
+      stalledHolds([], [row(9, "skip", "checks:none")], { now: NOW }),
+      [{ number: 9, reason: "checks:none", ageHours: null }],
+      "a row whose PR is missing entirely is still reported",
+    );
+  });
+
+  it("reads the clock past an Ally verdict mirror posted after CI finished", () => {
+    // #1981's shape, arriving through this door: the mirror is the newest
+    // datable row, so an unfiltered read would restart the clock on a hold
+    // that has not moved since CI reported.
+    const prWithMirror = {
+      number: 1,
+      statusCheckRollup: [
+        { __typename: "CheckRun", name: "verify", conclusion: "SUCCESS", completedAt: OLD },
+        {
+          __typename: "StatusContext",
+          context: "gate/ally-comment-findings",
+          state: "SUCCESS",
+          createdAt: FRESH,
+        },
+      ],
+    };
+    assert.equal(judgeableAgeHours(prWithMirror, { now: NOW }), 16);
+  });
+
+  it("renders nothing when no hold is stale, and names each one when they are", () => {
+    assert.equal(renderStalledHolds("a/one", []), "");
+    const text = renderStalledHolds("a/one", [
+      { number: 7, reason: "owner-approval-pending", ageHours: 40.2 },
+      { number: 8, reason: "checks:none", ageHours: null },
+    ]);
+    // The header names the clock that was measured. "held >13h" would claim a
+    // duration this report does not have: a hold acquired this fire on CI
+    // that finished 14h ago is reported, and that is correct.
+    assert.match(text, /stale-hold \(judgeable >13h, still held\)/);
+    assert.match(text, /time since this head last reported, not time the hold has stood/);
+    assert.match(text, /a\/one#7 — `owner-approval-pending`, 40\.2h/);
+    assert.match(text, /a\/one#8 — `checks:none`, age unknown/);
+  });
+
+  it("shares one clock definition with the settle floor", () => {
+    // Two definitions of "when did this head last report" would drift, and the
+    // drift would be invisible: both answers look plausible in isolation.
+    assert.equal(newestCheckStamp(checkAt(OLD)), Date.parse(OLD));
+    assert.equal(newestCheckStamp([{ name: "verify", conclusion: "SUCCESS" }]), null);
+    assert.equal(newestCheckStamp([]), null);
+    assert.equal(judgeableAgeHours({ statusCheckRollup: [] }, { now: NOW }), null);
   });
 });

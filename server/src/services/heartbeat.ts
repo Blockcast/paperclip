@@ -477,8 +477,9 @@ import {
   setOrphanedRuntimeResourceMetricsRefreshSuccess,
   setCrashRecoveryCandidateIndexPresent,
   CAVEMAN_PROXY_NOT_READY_ERROR_CODE,
+  recordTransientRetryFloorDisposition,
 } from "./metrics.js";
-import type { DispatchDeclineReason } from "./metrics.js";
+import type { DispatchDeclineReason, TransientRetryFloorDisposition } from "./metrics.js";
 import { runQuotaExhaustedHook } from "./quota-exhausted-hook.js";
 import { runLifecycleHook } from "./lifecycle-hook.js";
 import { mapAdapterToCcrotateTarget, mapPenstockProviderToCcrotateTarget } from "./ccrotate-target.js";
@@ -492,6 +493,7 @@ import {
   resolveCcrotateCapacityRetry,
   clampTransientRetryHorizon,
   jitterTransientRetryFloor,
+  classifyRetryInstantAlignment,
   CCROTATE_CAPACITY_PARK_CLAMPED_FROM_KEY,
   isCapacityGovernedRetryFloor,
   applyCcrotateCapacityDecision,
@@ -1162,6 +1164,64 @@ export const UNCLAIMABLE_QUEUED_RUN_REAP_MIN_AGE_MS = 10 * 60 * 1000;
  */
 export const UNCLAIMABLE_QUEUED_RUN_REAP_BATCH_SIZE = 200;
 export const UNCLAIMABLE_QUEUED_RUN_REAP_MAX_BATCHES = 25;
+
+/**
+ * The three `tickTimers` exclusions that fire BEFORE `checked += 1` (PEN-4737).
+ *
+ * Narrowed to a literal union so a call site cannot mint a label: every member
+ * is already in `KNOWN_HEARTBEAT_TIMER_SCHEDULER_EXCLUSIONS`, and is already the
+ * durable `agent_wakeup_requests.reason` that `enqueueWakeup` writes when the
+ * SAME condition declines an event-driven wake. The timer loop `continue`s
+ * before it ever calls `enqueueWakeup`, which is why these three were the only
+ * exclusions in the loop with no counter and no row (PEN-2130 AC3).
+ */
+export type TimerPreDispatchExclusionReason =
+  | "agent.not_invokable"
+  | "heartbeat.disabled"
+  | "heartbeat.worktree_execution_cutoff";
+
+/**
+ * `source` for the pre-dispatch timer exclusion ledger (PEN-4737).
+ *
+ * Deliberately NOT `"timer"`. Since BLO-34578 the latest `source: "timer"` row
+ * IS the agent's timer baseline (`lastTimerWakeAtByAgentId`), so filing these
+ * rows under that source would advance the baseline for an agent the loop never
+ * actually ticked. The agent would then have to wait a further full
+ * `intervalSec` after it became invokable / enabled / in-scope again before its
+ * first real tick — a recovery delay landing on exactly the starved-agent case
+ * PEN-2130 exists to fix, and unbounded for the `intervalSec <= 0` branch that
+ * has no interval at all. A distinct source keeps the baseline read untouched,
+ * so this change is observability-only and moves no scheduling decision.
+ *
+ * Safe as a new value: `agent_wakeup_requests.source` is free text with no
+ * enum, and both consumers that project the column are scoped away from these
+ * rows — the lockless-deferred-wake drain reads `status =
+ * 'deferred_issue_execution'`, and issue wake diagnostics joins on an issue id
+ * in the payload, which these rows deliberately do not carry.
+ */
+export const TIMER_PRE_DISPATCH_EXCLUSION_SOURCE = "timer_excluded";
+
+/**
+ * Cadence of the pre-dispatch exclusion ledger: at most one row, and one
+ * counter increment, per (agent, reason) per hour.
+ *
+ * These three branches sit above the dueness gate, so unlike the four
+ * exclusions below `checked += 1` they are NOT gated by the agent's own
+ * `intervalSec` — and for the `intervalSec <= 0` branch there is no interval to
+ * gate on even in principle. Left ungated they would write on every scheduler
+ * pass: `heartbeatSchedulerIntervalMs` defaults to 30s, so 2,880 rows per
+ * excluded agent per day, on the largest table in the schema and one with no
+ * pruning. That is the defect Ally caught on #1196 and `0d31bfcd` fixed for the
+ * circuit breakers.
+ *
+ * One hour, fixed, rather than derived from policy: it makes the write volume a
+ * function of the agent roster (agents x distinct reasons x 24 rows/day) rather
+ * than of scheduler frequency or of per-agent config, which is the property
+ * that actually has to hold. It is also the resolution PEN-2130's diagnostic
+ * query needs — "has this agent been excluded since T?" — without pretending to
+ * resolve the minute the exclusion began.
+ */
+export const TIMER_PRE_DISPATCH_EXCLUSION_INTERVAL_MS = 60 * 60 * 1000;
 
 /**
  * Choose the durable reason for a timer wake that did not dispatch.
@@ -6173,13 +6233,131 @@ function readNonEmptyString(value: unknown): string | null {
 // agent reading whatever `docs/<name>.md` happened to be in the project repo.
 const SHARED_DOC_MATERIALIZING_ADAPTER_TYPES = new Set(["claude_k8s", "opencode_k8s"]);
 
+/**
+ * What the pod bootstrap needs in order to carry the materialized shared docs across
+ * (PEN-3329). Delivered on the adapter context as `paperclipSharedDocs`.
+ *
+ * The docs are written into the execution workspace as *untracked* files, and a
+ * run-isolated pod bootstraps with `git clone --shared` from that workspace — which
+ * carries tracked objects only. Nothing untracked crosses, so the set has to be declared
+ * rather than discovered: the pod copies exactly these paths and nothing else.
+ */
+export type PaperclipSharedDocOverlay = {
+  /**
+   * Execution workspace the docs were materialized into.
+   *
+   * Only readable from a pod that MOUNTS this directory. A run-isolated pod does not —
+   * see `contents`.
+   */
+  sourceCwd: string;
+  /** Repo-relative POSIX paths (`docs/<name>.md`), sorted, never absolute and never `..`. */
+  paths: string[];
+  /**
+   * Document bodies, keyed by the same repo-relative path, for the pod to write directly.
+   *
+   * The first round of PEN-3329 shipped `sourceCwd` + `paths` and had the pod copy from
+   * that directory. Measured from a live `isolation-mode: run` pod on 2026-10-29: all 14
+   * docs reported absent, because `/paperclip/instances/default/projects/...` does not
+   * exist inside the pod. `/paperclip/instances/default` is an `emptyDir` with only named
+   * PVC subPaths re-mounted over it, and the projects tree is not one of them. That is
+   * not an oversight to correct in the mount list — not mounting the server's workspace
+   * is what `run` isolation IS.
+   *
+   * So the bodies travel with the Job instead, staged by the adapter as a Secret volume.
+   * Budgeted, because a Secret is capped at 1 MiB and a document must never be able to
+   * fail a pod: a doc over budget is simply left out, and the pod's existing per-path
+   * verdict line reports it undelivered.
+   */
+  contents?: Record<string, string>;
+};
+
+/**
+ * The same overlay with the bodies dropped -- the shape that is safe to persist.
+ *
+ * `context` is written verbatim into `heartbeat_runs.context_snapshot` at many call
+ * sites, and `contents` is transport to the adapter only: nothing reads the bodies back
+ * out of a snapshot. Without this the column would gain a per-run copy of every company
+ * doc. Returns a new object rather than deleting in place -- the caller hands the
+ * untouched original to the adapter, so mutating it here would strip the bodies from the
+ * one consumer that needs them (PEN-3329).
+ */
+export function omitSharedDocContents(
+  overlay: PaperclipSharedDocOverlay,
+): PaperclipSharedDocOverlay {
+  // Destructure-and-discard, so a field added to the type later is carried by `rest`
+  // automatically and only `contents` is ever dropped.
+  const { contents: _contents, ...rest } = overlay;
+  return rest;
+}
+
+/**
+ * Byte budgets for the carried bodies.
+ *
+ * A Kubernetes Secret is capped at 1 MiB *encoded*, and `stringData` is base64-encoded by
+ * the API server (4/3 expansion), so the raw ceiling is nearer 768 KiB before keys and
+ * metadata. Both numbers below sit under that with room to spare: the company docs this
+ * carries measure in single-digit KiB, so a doc near the per-file cap is already an
+ * anomaly rather than a document, and the total cap bounds the blast radius of a
+ * misconfigured bundle regardless.
+ */
+const SHARED_DOC_MAX_BYTES_PER_DOC = 128 * 1024;
+const SHARED_DOC_MAX_BYTES_TOTAL = 512 * 1024;
+
+/**
+ * Reads the materialized bodies so they can travel with the Job rather than be fetched
+ * from a path the pod may not have.
+ *
+ * Never throws and never rejects the overlay: an unreadable or over-budget document is
+ * dropped from `contents` while staying in `paths`, so the pod still names it as
+ * undelivered instead of silently shipping a short set.
+ */
+async function readSharedDocContents(input: {
+  cwd: string;
+  paths: string[];
+  onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+}): Promise<Record<string, string>> {
+  const contents: Record<string, string> = {};
+  let total = 0;
+  for (const docPath of input.paths) {
+    let body: string;
+    try {
+      body = await fs.readFile(path.resolve(input.cwd, docPath), "utf8");
+    } catch (error) {
+      const code = error instanceof Error ? (error as NodeJS.ErrnoException).code : undefined;
+      await input.onLog(
+        "stderr",
+        `[paperclip] Shared doc ${docPath} could not be read back for delivery (${code ?? "unknown"}); the pod will report it undelivered.\n`,
+      );
+      continue;
+    }
+    const size = Buffer.byteLength(body, "utf8");
+    if (size > SHARED_DOC_MAX_BYTES_PER_DOC) {
+      await input.onLog(
+        "stderr",
+        `[paperclip] Shared doc ${docPath} is ${size} bytes, over the ${SHARED_DOC_MAX_BYTES_PER_DOC}-byte per-document budget; not delivering it.\n`,
+      );
+      continue;
+    }
+    if (total + size > SHARED_DOC_MAX_BYTES_TOTAL) {
+      await input.onLog(
+        "stderr",
+        `[paperclip] Shared docs exceed the ${SHARED_DOC_MAX_BYTES_TOTAL}-byte total budget at ${docPath}; delivering the ${Object.keys(contents).length} read so far.\n`,
+      );
+      break;
+    }
+    contents[docPath] = body;
+    total += size;
+  }
+  return contents;
+}
+
 async function materializeExternalK8sSharedDocs(input: {
   adapterType: string;
   config: Record<string, unknown>;
   cwd: string;
   onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
-}) {
-  if (!SHARED_DOC_MATERIALIZING_ADAPTER_TYPES.has(input.adapterType)) return;
+}): Promise<PaperclipSharedDocOverlay | null> {
+  if (!SHARED_DOC_MATERIALIZING_ADAPTER_TYPES.has(input.adapterType)) return null;
   const instructionsRootPath = readNonEmptyString(input.config.instructionsRootPath);
   const instructionsFilePath = readNonEmptyString(input.config.instructionsFilePath);
   if (!instructionsRootPath && !instructionsFilePath) {
@@ -6187,7 +6365,7 @@ async function materializeExternalK8sSharedDocs(input: {
       "stdout",
       "[paperclip] Skipped external k8s shared docs materialization: no instructions bundle configured.\n",
     );
-    return;
+    return null;
   }
 
   const sourceRootPath = instructionsRootPath
@@ -6198,7 +6376,7 @@ async function materializeExternalK8sSharedDocs(input: {
     readNonEmptyString(input.config.instructionsEntryFile) ??
       (instructionsFilePath ? path.basename(instructionsFilePath) : "AGENTS.md"),
   );
-  if (!entryFile) return;
+  if (!entryFile) return null;
   // External instruction bundles are optional; if the resolved entry is absent, skip doc materialization.
   const instructionsEntryPath = path.resolve(sourceRootPath, entryFile);
   let instructionsContents = "";
@@ -6211,16 +6389,16 @@ async function materializeExternalK8sSharedDocs(input: {
         "stdout",
         "[paperclip] Skipped external k8s shared docs materialization: external instructions entry absent.\n",
       );
-      return;
+      return null;
     } else {
       await input.onLog(
         "stderr",
         `[paperclip] Skipped external k8s shared docs materialization: failed to read instructions entry (${code ?? "unknown"}).\n`,
       );
-      return;
+      return null;
     }
   }
-  if (!instructionsContents) return;
+  if (!instructionsContents) return null;
 
   const sharedDocSearchBoundaryPath = resolveSharedDocSearchBoundaryPath();
   if (!sharedDocSourceRoots(sourceRootPath, sharedDocSearchBoundaryPath).some((root) => root !== sourceRootPath)) {
@@ -6232,14 +6410,25 @@ async function materializeExternalK8sSharedDocs(input: {
       `[paperclip] Shared-doc ancestor lookup disabled: instructions root ${sourceRootPath} is outside ${sharedDocSearchBoundaryPath}.\n`,
     );
   }
-  await ensureReferencedSharedDocsMaterialized({
-    // These adapters mount (or clone) this local execution workspace into the pod, so writes here are visible remotely.
+  const paths = await ensureReferencedSharedDocsMaterialized({
+    // A `workspace`-isolated pod MOUNTS this local execution workspace, so writes here are
+    // visible remotely with nothing further to do. A `run`-isolated pod neither mounts nor
+    // can reach it: it bootstraps with `git clone --shared`, which carries tracked objects
+    // only, and the workspace is not in its mount set at all. For that half this write is
+    // necessary but not sufficient — the returned paths AND their bodies are handed to the
+    // pod bootstrap, which writes them in after the clone (PEN-3329).
     cwd: input.cwd,
     instructionsRootPath: sourceRootPath,
     sharedDocSearchBoundaryPath,
     instructionsContents,
     onLog: input.onLog,
   });
+  if (paths.length === 0) return null;
+  // Read the bodies here, on the server, where the files demonstrably are. The pod gets
+  // the content itself rather than a path to it, because `sourceCwd` is unreachable from
+  // a run-isolated pod by design (PEN-3329, second round).
+  const contents = await readSharedDocContents({ cwd: input.cwd, paths, onLog: input.onLog });
+  return { sourceCwd: input.cwd, paths, ...(Object.keys(contents).length > 0 ? { contents } : {}) };
 }
 
 type ManagedMcpGatewayRunConfig = {
@@ -7202,6 +7391,9 @@ export async function listRecentTerminalRunsForZeroTokenStreak(db: Db, agentId: 
       // they are not adapter attempts and cannot provide a token-usage signal.
       // claimQueuedRun sets startedAt only after the pre-claim gates pass.
       isNotNull(heartbeatRuns.startedAt),
+      // BLO-49987: same reason, after the claim -- a lock-gate cancel stamps
+      // startedAt but never reaches the adapter, so it cannot carry usage.
+      sql`${heartbeatRuns.errorCode} IS DISTINCT FROM 'issue_execution_lock_not_acquired'`,
       // Keep this filter aligned with countConsecutiveZeroTokenCompletedRuns:
       // non-terminal rows would reset the streak, but this production query
       // intentionally measures only completed, started terminal attempts.
@@ -13329,8 +13521,7 @@ export function isFalseAdapterTimeoutResult(
     result.timedOut === true &&
     result.exitCode === 0 &&
     result.errorCode === "timeout" &&
-    typeof result.errorMessage === "string" &&
-    /^Timed out after [0-9]+s$/.test(result.errorMessage.trim()) &&
+    // Structural contradiction only; no errorMessage text match (BLO-23296).
     !hasStructuredAdapterFailureEvidence(result.resultJson)
   );
 }
@@ -20379,6 +20570,77 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   /**
+   * Run ids this process can positively prove it owns AND whose lifecycle is
+   * local (no external-lifecycle adapter, no unreleased runtime reservation).
+   * Shared by the crash marker and the graceful drain (BLO-49138): with
+   * replicas > 1 a `status = running` scan alone selects the peer replica's
+   * runs, and an external-lifecycle run may have a live Job that restart
+   * reattach must keep.
+   */
+  async function selectOwnedLocalRunIds(): Promise<string[]> {
+    // Union of both live-execution registries — the same pair `liveRunExecutions`
+    // consults, but enumerated rather than probed.
+    const runIds = Array.from(new Set([...runningProcesses.keys(), ...activeRunExecutions]));
+    if (runIds.length === 0) return [];
+
+    // Decide "is this run's lifecycle ours to end?" from the run, never from
+    // `external_run_id`. A null id does NOT mean local: `executeRun` adds a run
+    // to `activeRunExecutions` before it has even loaded the agent, while the
+    // backing Job name is stamped later and best-effort, only once a reap cycle
+    // observes the Job. A claude_k8s / opencode_k8s run therefore spends a real
+    // window owned-but-unstamped, and terminalizing it there would queue a
+    // replacement against a Job that is still healthy — duplicate execution of
+    // the same run, which is strictly worse than the orphaned row this guard
+    // exists to prevent.
+    //
+    // The agent's `adapterType` is likewise not sufficient on its own: it is
+    // mutable and read here long after dispatch, while `executeRun` made its
+    // lifecycle decision from the agent record it loaded at launch. Reconfigure
+    // a busy K8s agent to a local adapter and this query would classify its
+    // live, unstamped Job as local. So we also consult the run-scoped
+    // external-runtime reservation, which is immutable with respect to agent
+    // config and always exists before `executeRun` proceeds. A run is treated
+    // as ours to end only when *both* signals say local; either one saying
+    // external is enough to leave it alone.
+    //
+    // The inverse transition (local agent reconfigured to K8s while a local
+    // child is live) is left deliberately: it fails toward "leave it running",
+    // which is the pre-existing reaper's job to classify. Same fail-safe
+    // direction as a run whose agent row is missing, which drops out of this
+    // join entirely. We only terminalize work we can positively prove we own.
+    const ownedRuns = await db
+      .select({ runId: heartbeatRuns.id, adapterType: agents.adapterType })
+      .from(heartbeatRuns)
+      .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
+      .where(inArray(heartbeatRuns.id, runIds));
+    const localByAdapter = ownedRuns
+      .filter((row) => !hasExternalLifecycle(row.adapterType))
+      .map((row) => row.runId);
+    if (localByAdapter.length === 0) return [];
+
+    // One batched lookup, not one per run: this runs inside a dying process
+    // racing a fixed budget, and every round trip is time not spent recovering.
+    let reservedRunIds: Set<string>;
+    try {
+      const reserved = await db
+        .select({ runId: externalRuntimeReservations.runId })
+        .from(externalRuntimeReservations)
+        .where(and(
+          inArray(externalRuntimeReservations.runId, localByAdapter),
+          isNull(externalRuntimeReservations.releasedAt),
+        ));
+      reservedRunIds = new Set(reserved.map((row) => row.runId));
+    } catch (error) {
+      // Fail closed: without this signal we cannot prove any of these runs is
+      // local, so leave the whole batch for the reaper rather than risk
+      // terminalizing a live Job.
+      logger.warn({ err: error }, "failed to read external runtime reservations while selecting owned local runs");
+      return [];
+    }
+    return localByAdapter.filter((runId) => !reservedRunIds.has(runId));
+  }
+
+  /**
    * Crash-time counterpart to {@link drainRunningRunsForShutdown} (BLO-19722).
    *
    * A SIGTERM drain gets seconds and a healthy process; this runs from inside
@@ -20426,66 +20688,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // `finished_at`. The recovery that follows each mark is what needs a live
     // clock, and gets one.
     const now = input.now ?? new Date();
-    // Union of both live-execution registries — the same pair `liveRunExecutions`
-    // consults, but enumerated rather than probed.
-    const runIds = Array.from(new Set([...runningProcesses.keys(), ...activeRunExecutions]));
-    if (runIds.length === 0) return { markedRunIds: [] };
-
-    // Decide "is this run's lifecycle ours to end?" from the run, never from
-    // `external_run_id`. A null id does NOT mean local: `executeRun` adds a run
-    // to `activeRunExecutions` before it has even loaded the agent, while the
-    // backing Job name is stamped later and best-effort, only once a reap cycle
-    // observes the Job. A claude_k8s / opencode_k8s run therefore spends a real
-    // window owned-but-unstamped, and terminalizing it there would queue a
-    // replacement against a Job that is still healthy — duplicate execution of
-    // the same run, which is strictly worse than the orphaned row this guard
-    // exists to prevent.
-    //
-    // The agent's `adapterType` is likewise not sufficient on its own: it is
-    // mutable and read here long after dispatch, while `executeRun` made its
-    // lifecycle decision from the agent record it loaded at launch. Reconfigure
-    // a busy K8s agent to a local adapter and this query would classify its
-    // live, unstamped Job as local. So we also consult the run-scoped
-    // external-runtime reservation, which is immutable with respect to agent
-    // config and always exists before `executeRun` proceeds. A run is treated
-    // as ours to end only when *both* signals say local; either one saying
-    // external is enough to leave it alone.
-    //
-    // The inverse transition (local agent reconfigured to K8s while a local
-    // child is live) is left deliberately: it fails toward "leave it running",
-    // which is the pre-existing reaper's job to classify. Same fail-safe
-    // direction as a run whose agent row is missing, which drops out of this
-    // join entirely. We only terminalize work we can positively prove we own.
-    const ownedRuns = await db
-      .select({ runId: heartbeatRuns.id, adapterType: agents.adapterType })
-      .from(heartbeatRuns)
-      .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
-      .where(inArray(heartbeatRuns.id, runIds));
-    const localByAdapter = ownedRuns
-      .filter((row) => !hasExternalLifecycle(row.adapterType))
-      .map((row) => row.runId);
-    if (localByAdapter.length === 0) return { markedRunIds: [] };
-
-    // One batched lookup, not one per run: this runs inside a dying process
-    // racing a fixed budget, and every round trip is time not spent recovering.
-    let reservedRunIds: Set<string>;
-    try {
-      const reserved = await db
-        .select({ runId: externalRuntimeReservations.runId })
-        .from(externalRuntimeReservations)
-        .where(and(
-          inArray(externalRuntimeReservations.runId, localByAdapter),
-          isNull(externalRuntimeReservations.releasedAt),
-        ));
-      reservedRunIds = new Set(reserved.map((row) => row.runId));
-    } catch (error) {
-      // Fail closed: without this signal we cannot prove any of these runs is
-      // local, so leave the whole batch for the reaper rather than risk
-      // terminalizing a live Job.
-      logger.warn({ err: error }, "failed to read external runtime reservations during crash marking");
-      return { markedRunIds: [] };
-    }
-    const localRunIds = localByAdapter.filter((runId) => !reservedRunIds.has(runId));
+    const localRunIds = await selectOwnedLocalRunIds();
     if (localRunIds.length === 0) return { markedRunIds: [] };
 
     const message = `Interrupted by worker process crash (${input.reason})`;
@@ -21285,6 +21488,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   async function drainRunningRunsForShutdown(signal: "SIGINT" | "SIGTERM", now = new Date()) {
+    // BLO-49138: only runs this replica owns and whose lifecycle is local. A peer
+    // replica's runs, and our own launched k8s Jobs, are left for their owner /
+    // restart reattach — draining them killed 10 live Jobs on 2026-10-24.
+    const ownedLocalRunIds = await selectOwnedLocalRunIds();
+    if (ownedLocalRunIds.length === 0) return { interrupted: 0, interruptedRunIds: [], retryRunIds: [] };
     const activeRuns = await db
       .select({
         run: heartbeatRuns,
@@ -21292,7 +21500,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       })
       .from(heartbeatRuns)
       .innerJoin(agents, eq(heartbeatRuns.agentId, agents.id))
-      .where(eq(heartbeatRuns.status, "running"));
+      .where(and(eq(heartbeatRuns.status, "running"), inArray(heartbeatRuns.id, ownedLocalRunIds)));
 
     const interruptedRunIds: string[] = [];
     const retryRunIds: string[] = [];
@@ -22780,9 +22988,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // capacity provenance but never went through the resolver's jitter, so it
     // must not inherit the capacity exemption. Its `over_horizon` park is
     // `now + cap` at the reconciler pass, which runs refused in one pass share.
-    const floorAlreadyDispersed =
-      prReviewRefusalRetryNotBefore === null &&
-      (clampedTransientRetry?.clampedFromIso != null || isCapacityGovernedRetryFloor(run.resultJson));
+    //
+    // PEN-4145: the two exemption markers are resolved SEPARATELY rather than
+    // or-ed into one boolean, because which marker fired is the thing that
+    // silently broke. The 2026-08-29 fix exempted the wrong population and the
+    // exempt SHARE looked the same before and after it failed -- only the marker
+    // behind it changed. Order mirrors the original `||` exactly, so a floor
+    // that satisfies both still routes as it did before this split: the horizon
+    // clamp is tested first and wins.
+    const floorExemptionReason: TransientRetryFloorDisposition | null =
+      prReviewRefusalRetryNotBefore !== null
+        ? null
+        : clampedTransientRetry?.clampedFromIso != null
+          ? "exempt_horizon_clamped"
+          : isCapacityGovernedRetryFloor(run.resultJson)
+            ? "exempt_capacity_governed"
+            : null;
+    const floorAlreadyDispersed = floorExemptionReason !== null;
     const flooredDueAt =
       effectiveRetryNotBefore && effectiveRetryNotBefore.getTime() > baseSchedule.dueAt.getTime()
         ? floorAlreadyDispersed
@@ -22791,6 +23013,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               .dueAt
         : null;
     const preRoutineDueAt = flooredDueAt ?? baseSchedule.dueAt;
+    // PEN-4145: emit the decision. Until this call NEITHER branch above emitted
+    // a counter, gauge or log line, so the only durable trace that a dispersion
+    // decision had been made was the `scheduled_retry_at` value itself -- which
+    // is why the first PEN-2509 fix sat live, fleet-wide and wrong for six
+    // weeks and was found only by a hand census.
+    //
+    // Gated on a floor having EXISTED, not on one having won. A park with no
+    // floor takes the base backoff curve, which carries its own jitter and never
+    // herded; counting it would dilute the ratio with a population that is not
+    // at risk. A floor that existed and LOST to a later base backoff is counted
+    // as `superseded`, so the denominator reads "floor decisions" rather than
+    // "floor decisions that mattered" -- the honest denominator for a ratio
+    // about routing.
+    //
+    // The instant classified is this decision's own output (`preRoutineDueAt`),
+    // deliberately BEFORE the routine-window clamp below can move it. That
+    // isolates the mechanism under test; it also means this counter and a
+    // post-hoc census of the persisted `scheduled_retry_at` column can disagree
+    // on routine-scoped rows, and that is intended -- the column census stays
+    // the independent cross-check rather than a second copy of this reading.
+    if (effectiveRetryNotBefore) {
+      recordTransientRetryFloorDisposition({
+        disposition: flooredDueAt === null ? "superseded" : (floorExemptionReason ?? "dispersed"),
+        alignment: classifyRetryInstantAlignment(preRoutineDueAt),
+      });
+    }
 
     // Routine execution issues retain the routine run id as their origin. Read
     // the schedule through that stable relation rather than inferring routine
@@ -28149,6 +28397,65 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return timedOut(await awaitStartLockSweepBounded(fresh, waitBoundMs)) ? "timed_out" : "ran";
   }
 
+  /**
+   * Entry point for the periodic orphan reaper (PEN-4736).
+   *
+   * Mirrors {@link reapOrphanedRunsForStartLock}: one named entry per calling
+   * context, so each context's dispatch policy lives next to the reason for it
+   * rather than in the bootstrap file.
+   *
+   * The periodic tick used to call `reapOrphanedRuns` with no
+   * `suppressDispatchAfterReap`, which made **every acted-on row await a fresh
+   * FLEET-WIDE sweep**: the per-row `startNextQueuedRunForAgent` reaches
+   * `withAgentStartLock` -> `reapOrphanedRunsForStartLock`, and the periodic
+   * sweep is never inside `agentStartLockSweepContext`, so that call misses the
+   * cheap `nested` branch and schedules a whole new sweep (the `skipped_fresh`
+   * short-circuit is unreachable too: `START_LOCK_REAP_TTL_DEFAULT_MS` is 0).
+   * Cost was therefore (rows acted on) x (fleet sweep), both terms growing with
+   * run population: measured at N^2.29 on PEN-4734 (6.74 runs -> 1.15 s/sweep;
+   * 24.18 runs -> 21.20 s/sweep), with
+   * `paperclip_agent_start_lock_reap_disposition_total{disposition="timed_out"}`
+   * 26 -> 405 and `PaperclipRecoveryChainHeadroomLow` firing 181 min/24 h.
+   *
+   * Suppressing that dispatch costs nothing, because it is redundant rather
+   * than load-bearing: the same promise chain in `index.ts` runs
+   * `promoteDueScheduledRetries` and then `resumeQueuedRuns` immediately after
+   * this call, and `resumeQueuedRuns` is what actually starts queued work. Both
+   * suppressed sites already say so in their own comments ("the next
+   * `resumeQueuedRuns` re-drives any agent still holding queued runs";
+   * "Dispatch is follow-on work with its own retry"). Worst case is one tick of
+   * latency (~30 s) for an agent whose queued run would have started inside the
+   * sweep.
+   *
+   * ⚠️ "Redundant" is exact about dispatch and not about two side effects that
+   * ride along with it. `startNextQueuedRunForAgent` also records head-rescan
+   * demand and, for an agent that is no longer invokable, calls
+   * `cancelActiveForAgentInternal` — both before it looks at the queue, so both
+   * used to fire for a reaped agent holding NO queued run. `resumeQueuedRuns`
+   * selects agents by `status = "queued"`, so it never visits that agent and
+   * does not re-trigger either effect. Assessed as harmless: the reaped run is
+   * already terminal by this point, and both start-lock entries have suppressed
+   * these same effects for as long as they have passed the flag. Named here so
+   * the redundancy claim is not read wider than it holds.
+   *
+   * ponytail: this covers 2 of the 3 re-entry points. `releaseIssueExecutionAndPromote`
+   * dispatches a *promoted* run without consulting the flag, by design
+   * (BLO-35940), and that path is deliberately OUT OF SCOPE here: it fires only
+   * when a concrete queued continuation was just promoted for the issue, so
+   * suppressing it would defer a specific known wake rather than a speculative
+   * one. It is also mutually exclusive with the loop dispatch this does
+   * suppress — the `activeRuns` loop guards on `!promotedRunDispatched` — so a
+   * reaped row nests at most one sweep either way, and only promoting rows
+   * still do. Routing those into the `nested` branch would not help: that
+   * branch still runs a FULL sweep.
+   */
+  async function reapOrphanedRunsPeriodic(opts?: { staleThresholdMs?: number }) {
+    return await reapOrphanedRuns({
+      staleThresholdMs: opts?.staleThresholdMs,
+      suppressDispatchAfterReap: true,
+    });
+  }
+
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number; suppressDispatchAfterReap?: boolean }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
@@ -28158,8 +28465,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // `total`; read the stage counts against `total` before trusting a mean.
     const orphanReapStartedAt = Date.now();
     let orphanReapLapAt = orphanReapStartedAt;
-    const lapOrphanReap = (stage: Parameters<typeof recordOrphanReapStage>[0]) => {
-      const at = Date.now();
+    // PEN-4783: `at` lets a caller close the lap from an instant it already
+    // read. The `per_run` lap needs it because its sub-stage partition is
+    // emitted just before the lap, and the residual is derived by SUBTRACTING
+    // the four buckets from the lap span. Reading the clock a second time here
+    // would put the five histogram observations between the two reads, so the
+    // lap would come back systematically LONGER than its own parts and the
+    // residual would silently under-report the difference -- measured at ~1 ms
+    // per sweep, which is small but makes `sum(sub_stages) == per_run` false
+    // where this split's whole contract is that it is true. Defaults to now,
+    // so every other call site is unchanged.
+    const lapOrphanReap = (stage: Parameters<typeof recordOrphanReapStage>[0], at = Date.now()) => {
       recordOrphanReapStage(stage, (at - orphanReapLapAt) / 1000);
       orphanReapLapAt = at;
     };
@@ -28640,6 +28956,105 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     lapOrphanReap("pod_cleanup");
+
+    // PEN-4781: sub-stage attribution for the `per_run` lap below. Four named
+    // buckets plus a residual, forming an EXHAUSTIVE partition of the loop --
+    // see KNOWN_ORPHAN_REAP_STAGES for why a non-exhaustive split would be
+    // worse than no split at all.
+    //
+    // Accumulators, not laps. The buckets interleave in source order (a lease
+    // release sits between two finalize steps, for instance), so a moving lap
+    // cursor could not express this partition; and accumulating lets the five
+    // observations be emitted ONCE per sweep next to `lapOrphanReap("per_run")`,
+    // which is what keeps each sub-stage's `_count` equal to `per_run`'s and so
+    // keeps a p99 comparison between them meaningful. A sweep that throws emits
+    // none of them and no `per_run` either, exactly as it already emits no
+    // `total` -- the stage counts stay readable against `total` as before.
+    //
+    // This is a WRAPPING change only: no new awaits, no reordering, no change
+    // to what any call does. Each `timed*` alias below is the same function with
+    // the same arguments, timed into a bucket.
+    let perRunLivenessMs = 0;
+    let perRunFinalizeMs = 0;
+    let perRunDispatchMs = 0;
+    let perRunCleanupMs = 0;
+    type PerRunBucket = "liveness" | "finalize" | "dispatch" | "cleanup";
+    // Records from a `finally` for the same reason `timeOrphanReapCall` does:
+    // the call most worth attributing is the one that threw.
+    const timePerRun = async <T>(bucket: PerRunBucket, fn: () => Promise<T>): Promise<T> => {
+      const startedAt = Date.now();
+      try {
+        return await fn();
+      } finally {
+        const elapsedMs = Date.now() - startedAt;
+        if (bucket === "liveness") perRunLivenessMs += elapsedMs;
+        else if (bucket === "finalize") perRunFinalizeMs += elapsedMs;
+        else if (bucket === "dispatch") perRunDispatchMs += elapsedMs;
+        else perRunCleanupMs += elapsedMs;
+      }
+    };
+    const timedPerRunCall = <A extends readonly unknown[], R>(
+      bucket: PerRunBucket,
+      fn: (...args: A) => Promise<R>,
+    ) => (...args: A): Promise<R> => timePerRun(bucket, () => fn(...args));
+
+    // `liveness`: read-only probes that ask whether this run's Job/pod is still
+    // alive. Mixed kube and Postgres on purpose -- that mix is the bucket's
+    // value, because it is the one bucket that moves when kube is the fault.
+    const timedHasAdapterInvocationEvent = timedPerRunCall("liveness", hasAdapterInvocationEvent);
+    const timedResolveExternalLifecycleJobLiveness =
+      timedPerRunCall("liveness", resolveExternalLifecycleJobLiveness);
+    const timedShouldDeferHardStaleKillForBusyPod =
+      timedPerRunCall("liveness", shouldDeferHardStaleKillForBusyPod);
+    const timedReadAgentJobRunStatusByName = timedPerRunCall("liveness", readAgentJobRunStatusByName);
+    const timedIsTerminalExternalJobConsumedByOwner =
+      timedPerRunCall("liveness", isTerminalExternalJobConsumedByOwner);
+
+    // `finalize`: committing a terminal verdict for the run. The five
+    // `finalizeExternalLifecycleTerminalRun` call sites AND the hand-rolled
+    // process_lost mint below them, which is the same act written inline --
+    // splitting those two apart would put half of one decision in each of two
+    // buckets and make neither readable.
+    const timedFinalizeExternalLifecycleTerminalRun =
+      timedPerRunCall("finalize", finalizeExternalLifecycleTerminalRun);
+    const timedSetRunStatus = timedPerRunCall("finalize", setRunStatus);
+    const timedSetRunStatusIfRunning = timedPerRunCall("finalize", setRunStatusIfRunning);
+    const timedSetWakeupStatus = timedPerRunCall("finalize", setWakeupStatus);
+    const timedClassifyAndPersistRunLiveness =
+      timedPerRunCall("finalize", classifyAndPersistRunLiveness);
+    const timedFinalizeAgentStatus = timedPerRunCall("finalize", finalizeAgentStatus);
+    const timedTerminateHeartbeatRunProcess =
+      timedPerRunCall("finalize", terminateHeartbeatRunProcess);
+    const timedDismissStaleEvaluationOnRunTerminated = timedPerRunCall(
+      "finalize",
+      (input: Parameters<typeof recovery.dismissStaleEvaluationOnRunTerminated>[0]) =>
+        recovery.dismissStaleEvaluationOnRunTerminated(input),
+    );
+    const timedFinalizeRunEvent = timedPerRunCall("finalize", appendRunEvent);
+    const timedFinalizeNextRunEventSeq = timedPerRunCall("finalize", nextRunEventSeq);
+
+    // `dispatch`: handing the freed slot to the next run. Separated from
+    // `cleanup` because this is the only bucket that can re-enter the heartbeat.
+    const timedReleaseIssueExecutionAndPromote =
+      timedPerRunCall("dispatch", releaseIssueExecutionAndPromote);
+    const timedStartNextQueuedRunForAgent =
+      timedPerRunCall("dispatch", startNextQueuedRunForAgent);
+
+    // `cleanup`: releasing what the dead run held and scheduling its retry.
+    const timedReleaseEnvironmentLeasesForRun =
+      timedPerRunCall("cleanup", releaseEnvironmentLeasesForRun);
+    const timedReleaseLeasesForRun = timedPerRunCall(
+      "cleanup",
+      (runId: string, status: Parameters<typeof environmentsSvc.releaseLeasesForRun>[1]) =>
+        environmentsSvc.releaseLeasesForRun(runId, status),
+    );
+    const timedGetAgent = timedPerRunCall("cleanup", getAgent);
+    const timedEnqueueProcessLossRetry = timedPerRunCall("cleanup", enqueueProcessLossRetry);
+    const timedScheduleInteractionContinuationInfrastructureRetryIfEligible =
+      timedPerRunCall("cleanup", scheduleInteractionContinuationInfrastructureRetryIfEligible);
+    const timedCleanupRunEvent = timedPerRunCall("cleanup", appendRunEvent);
+    const timedCleanupNextRunEventSeq = timedPerRunCall("cleanup", nextRunEventSeq);
+
     for (const { run, adapterType, adapterConfig } of activeRuns) {
       if (runningProcesses.has(run.id)) continue;
       if (ambiguousExternalRunIds.has(run.id)) continue;
@@ -28662,7 +29077,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // the silence/Job-liveness check below decide for external lifecycle.
       if (activeRunExecutions.has(run.id) && !externalLifecycleRun) continue;
       const externalLifecycleStarted = externalLifecycleRun
-        ? await hasAdapterInvocationEvent(run.id)
+        ? await timedHasAdapterInvocationEvent(run.id)
         : false;
       const externalLifecyclePreAdapter = externalLifecycleRun && !externalLifecycleStarted;
       // BLO-16181: retain the pre-adapter Job liveness the loop resolves below so
@@ -28766,7 +29181,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // kube-unavailable degraded path still reap exactly as before. This
         // mirrors the 2026-05-23 guard that already protects live-but-quiet
         // STARTED runs below.
-        const preAdapterLiveness = await resolveExternalLifecycleJobLiveness(
+        const preAdapterLiveness = await timedResolveExternalLifecycleJobLiveness(
           run,
           jobRunStatuses,
           liveJobRunIds,
@@ -28786,8 +29201,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             // BLO-20251: a pre-adapter run is still doing real work during
             // workspace setup (repo clone, dependency install). Spare it while
             // its pod is demonstrably busy.
-            if (await shouldDeferHardStaleKillForBusyPod(run, now)) continue;
-            const finalized = await finalizeExternalLifecycleTerminalRun({
+            if (await timedShouldDeferHardStaleKillForBusyPod(run, now)) continue;
+            const finalized = await timedFinalizeExternalLifecycleTerminalRun({
               run,
               adapterType,
               adapterConfig,
@@ -28819,7 +29234,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           let jobStatus = jobRunStatuses.get(run.id) ?? null;
           const persistedJobName = run.externalRunId?.trim() || null;
           if (!jobStatus && persistedJobName) {
-            const exactJobStatus = await readAgentJobRunStatusByName(persistedJobName);
+            const exactJobStatus = await timedReadAgentJobRunStatusByName(persistedJobName);
             if (exactJobStatus?.phase === "missing") {
               confirmedMissingExternalJob = true;
             } else if (exactJobStatus) {
@@ -28847,7 +29262,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             // treating the terminal Job as authoritative.
             if (
               replacementPendingRunIds.has(run.id) ||
-              await isTerminalExternalJobConsumedByOwner(run.id, jobStatus, now)
+              await timedIsTerminalExternalJobConsumedByOwner(run.id, jobStatus, now)
             ) {
               logger.debug(
                 { runId: run.id, jobName: jobStatus.name ?? persistedJobName, jobPhase: jobStatus.phase },
@@ -28855,7 +29270,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               );
               continue;
             }
-            const finalized = await finalizeExternalLifecycleTerminalRun({
+            // BLO-49987: a SUCCEEDED Job is not evidence the owner is gone, and
+            // only the owner can record the run's usage, session and cost: this
+            // path writes none of them, and once it claims the row the owner's
+            // terminal write is refused ("skipping late run finalization"). The
+            // owner is often in ANOTHER process -- this sweep runs only on the
+            // scheduler-lease leader -- so `activeRunExecutions` cannot see it.
+            // Measured 2026-10-29: 334 refused owner writes in ~4.7h on the
+            // non-leader worker, ~46% of succeeded runs left with no usage and
+            // no cost_events row. A live owner finalizes within seconds of Job
+            // success, so a short grace from the last signal is enough. Keep it
+            // well under the Job TTL (900s): a dead owner's Job GC'd before this
+            // branch sees it again would be finalized `job_missing` (failed, not
+            // retried) instead of `job_complete`.
+            if (
+              jobStatus.phase === "succeeded"
+              && lastSignalRef
+              && now.getTime() - lastSignalRef < EXTERNAL_LIFECYCLE_RECENT_RUN_GRACE_MS
+            ) continue;
+            const finalized = await timedFinalizeExternalLifecycleTerminalRun({
               run,
               adapterType,
               adapterConfig,
@@ -28885,7 +29318,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 || !confirmedMissingExternalJob
               )
             ) continue;
-            const finalized = await finalizeExternalLifecycleTerminalRun({
+            const finalized = await timedFinalizeExternalLifecycleTerminalRun({
               run,
               adapterType,
               adapterConfig,
@@ -28909,8 +29342,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             // BLO-20251: silence here may just be a long Bash tool call
             // (dependency install, test suite, image build). Spare the run
             // while its pod is demonstrably burning CPU.
-            if (await shouldDeferHardStaleKillForBusyPod(run, now)) continue;
-            const finalized = await finalizeExternalLifecycleTerminalRun({
+            if (await timedShouldDeferHardStaleKillForBusyPod(run, now)) continue;
+            const finalized = await timedFinalizeExternalLifecycleTerminalRun({
               run,
               adapterType,
               adapterConfig,
@@ -28953,8 +29386,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               // BLO-20251: same deferral as the rich-status path above — the
               // snapshot says the Job is alive, so a busy pod means a live
               // subprocess rather than a wedge.
-              if (await shouldDeferHardStaleKillForBusyPod(run, now)) continue;
-              const finalized = await finalizeExternalLifecycleTerminalRun({
+              if (await timedShouldDeferHardStaleKillForBusyPod(run, now)) continue;
+              const finalized = await timedFinalizeExternalLifecycleTerminalRun({
                 run,
                 adapterType,
                 adapterConfig,
@@ -29004,12 +29437,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (processPidAlive) {
         if (run.errorCode !== DETACHED_PROCESS_ERROR_CODE) {
           const detachedMessage = `Lost in-memory process handle, but child pid ${run.processPid} is still alive`;
-          const detachedRun = await setRunStatus(run.id, "running", {
+          const detachedRun = await timedSetRunStatus(run.id, "running", {
             error: detachedMessage,
             errorCode: DETACHED_PROCESS_ERROR_CODE,
           });
           if (detachedRun) {
-            await appendRunEvent(detachedRun, await nextRunEventSeq(detachedRun.id), {
+            await timedFinalizeRunEvent(detachedRun, await timedFinalizeNextRunEventSeq(detachedRun.id), {
               eventType: "lifecycle",
               stream: "system",
               level: "warn",
@@ -29026,7 +29459,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       let descendantOnlyCleanup = false;
       if (processGroupAlive) {
         descendantOnlyCleanup = true;
-        await terminateHeartbeatRunProcess({
+        await timedTerminateHeartbeatRunProcess({
           pid: run.processPid,
           processGroupId: run.processGroupId,
         });
@@ -29153,7 +29586,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // once the mint is committed (so a failed/aborted setRunStatus never
       // over-counts). Split by adapter + error-string bucket + the durable
       // classification, all bounded.
-      const finalizedRunWrite = await setRunStatusIfRunning(run.id, "failed", {
+      const finalizedRunWrite = await timedSetRunStatusIfRunning(run.id, "failed", {
         error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
         errorCode: "process_lost",
         finishedAt: now,
@@ -29189,7 +29622,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       let finalizedRun = finalizedRunWrite.run;
       const terminalDecision = persistedRunTerminalDecision(finalizedRun, "failed");
       const terminalMessage = terminalDecision.error ?? baseMessage;
-      await setWakeupStatus(run.wakeupRequestId, terminalDecision.wakeupStatus, {
+      await timedSetWakeupStatus(run.wakeupRequestId, terminalDecision.wakeupStatus, {
         finishedAt: now,
         error: terminalDecision.error,
       });
@@ -29202,7 +29635,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           classification: processLossCapture.classification,
         });
       }
-      finalizedRun = await classifyAndPersistRunLiveness(finalizedRun, parseObject(finalizedRun.resultJson)) ?? finalizedRun;
+      finalizedRun = await timedClassifyAndPersistRunLiveness(finalizedRun, parseObject(finalizedRun.resultJson)) ?? finalizedRun;
       // PCL-2571: cancel any open stale_active_run_evaluation review for
       // this run now that the silence is explained by process_lost. The
       // detector and the reaper race on the suspicion threshold (~1h);
@@ -29210,7 +29643,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // inbox (11 stuck reviews in 5 days observed 2026-05-25).
       if (!terminalDecision.pipelineStageExited) {
         try {
-          await recovery.dismissStaleEvaluationOnRunTerminated({
+          await timedDismissStaleEvaluationOnRunTerminated({
             companyId: finalizedRun.companyId,
             runId: finalizedRun.id,
             agentId: finalizedRun.agentId,
@@ -29225,14 +29658,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           );
         }
       }
-      await releaseEnvironmentLeasesForRun({
+      await timedReleaseEnvironmentLeasesForRun({
         runId: finalizedRun.id,
         companyId: finalizedRun.companyId,
         agentId: finalizedRun.agentId,
         status: finalizedRun.status,
         failureReason: finalizedRun.error ?? undefined,
       });
-      await finalizeAgentStatus(run.agentId, terminalDecision.outcome, terminalMessage, {
+      await timedFinalizeAgentStatus(run.agentId, terminalDecision.outcome, terminalMessage, {
         errorCode: terminalDecision.errorCode,
         runId: run.id,
       });
@@ -29240,10 +29673,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       let retriedRun: typeof heartbeatRuns.$inferSelect | null = null;
       let retryContinuesContextIssue = false;
       let promotedRunDispatched = false;
-      const retryAgent = await getAgent(run.agentId);
+      const retryAgent = await timedGetAgent(run.agentId);
       if (!terminalDecision.pipelineStageExited && shouldRetry) {
         if (retryAgent) {
-          const retryResult = await enqueueProcessLossRetry(finalizedRun, retryAgent, now);
+          const retryResult = await timedEnqueueProcessLossRetry(finalizedRun, retryAgent, now);
           // `suppressed` keeps the pre-BLO-19722 behaviour of this call site:
           // no retry run, so the issue lock is released below exactly as it was
           // when this function returned null. The difference is only that the
@@ -29253,7 +29686,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             retryResult.kind === "suppressed" ? false : retryResult.retryContinuesContextIssue;
         }
       } else if (!terminalDecision.pipelineStageExited && retryAgent) {
-        const scheduled = await scheduleInteractionContinuationInfrastructureRetryIfEligible(finalizedRun, retryAgent);
+        const scheduled = await timedScheduleInteractionContinuationInfrastructureRetryIfEligible(finalizedRun, retryAgent);
         retriedRun = scheduled?.outcome === "scheduled" ? scheduled.run : null;
         retryContinuesContextIssue = Boolean(
           retriedRun && readNonEmptyString(parseObject(finalizedRun.contextSnapshot).issueId),
@@ -29271,7 +29704,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // `promotedRunDispatched` remains false, which is the same value this call
       // site saw before, so the `startNextQueuedRunForAgent` fallback below is
       // unchanged.
-      promotedRunDispatched = await releaseIssueExecutionAndPromote(finalizedRun, {
+      promotedRunDispatched = await timedReleaseIssueExecutionAndPromote(finalizedRun, {
         suppressPromotion: retryContinuesContextIssue,
       });
       if (!opts?.suppressDispatchAfterReap && !promotedRunDispatched) {
@@ -29292,7 +29725,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // and it would discard this pass's reap summary as well. Dispatch is
         // recoverable: the next `resumeQueuedRuns` re-drives any agent still
         // holding queued runs.
-        await startNextQueuedRunForAgent(run.agentId).catch((error: unknown) => {
+        await timedStartNextQueuedRunForAgent(run.agentId).catch((error: unknown) => {
           logger.warn(
             { error, runId: run.id, agentId: run.agentId },
             "reapOrphanedRuns: post-reap dispatch failed for one agent; continuing the pass",
@@ -29300,7 +29733,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
       }
 
-      await appendRunEvent(finalizedRun, await nextRunEventSeq(finalizedRun.id), {
+      await timedCleanupRunEvent(finalizedRun, await timedCleanupNextRunEventSeq(finalizedRun.id), {
         eventType: "lifecycle",
         stream: "system",
         level: terminalDecision.pipelineStageExited ? "warn" : "error",
@@ -29329,7 +29762,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // environment isn't permanently checked out (ported from upstream
       // v513). Marks lease as `failed` rather than `released` to preserve
       // forensic signal for stuck-lease audits.
-      await environmentsSvc.releaseLeasesForRun(
+      await timedReleaseLeasesForRun(
         run.id,
         terminalDecision.pipelineStageExited ? "released" : "failed",
       );
@@ -29337,7 +29770,40 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     }
 
-    lapOrphanReap("per_run");
+    // PEN-4781: emit the `per_run` partition. Read BEFORE `lapOrphanReap`,
+    // which advances the cursor, so this is the identical span that lap is
+    // about to record -- the split is additive and `per_run`'s own history
+    // stays comparable.
+    //
+    // `per_run_other` is the residual: the glue between the timed calls, every
+    // iteration that `continue`d before reaching one, and the loop's own
+    // synchronous work. Clamped at zero only against clock non-monotonicity;
+    // the four buckets are disjoint sub-spans of this lap, so arithmetically it
+    // cannot otherwise go negative. Disjoint because the `timed*` aliases are
+    // local to this sweep and used ONLY at the loop's own call sites -- none of
+    // the wrapped functions calls another through an alias, so no span nests
+    // inside another and nothing is counted twice. That matters more than it
+    // looks: double counting would push the four past the lap and `Math.max`
+    // would clamp the residual to zero, which is precisely the four-small-
+    // numbers reading this bucket exists to prevent. It is deliberately NOT optional -- without
+    // it, four small numbers would read as "nothing is slow" while the time sat
+    // somewhere unnamed.
+    // ONE clock read, shared by the residual below and the lap at the end of
+    // this block -- see `lapOrphanReap`'s `at` parameter for why.
+    const perRunEndedAt = Date.now();
+    const perRunElapsedMs = perRunEndedAt - orphanReapLapAt;
+    recordOrphanReapStage("per_run_liveness", perRunLivenessMs / 1000);
+    recordOrphanReapStage("per_run_finalize", perRunFinalizeMs / 1000);
+    recordOrphanReapStage("per_run_dispatch", perRunDispatchMs / 1000);
+    recordOrphanReapStage("per_run_cleanup", perRunCleanupMs / 1000);
+    recordOrphanReapStage(
+      "per_run_other",
+      Math.max(
+        0,
+        perRunElapsedMs - perRunLivenessMs - perRunFinalizeMs - perRunDispatchMs - perRunCleanupMs,
+      ) / 1000,
+    );
+    lapOrphanReap("per_run", perRunEndedAt);
     recordOrphanReapStage("total", (Date.now() - orphanReapStartedAt) / 1000);
     if (reaped.length > 0) {
       logger.warn({ reapedCount: reaped.length, runIds: reaped }, "reaped orphaned heartbeat runs");
@@ -29410,10 +29876,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
   }
 
-  async function reconcileStrandedAssignedIssues(opts?: { recoveryChainId?: string }) {
+  async function reconcileStrandedAssignedIssues(opts?: { recoveryChainId?: string; shouldStop?: () => boolean }) {
     return recovery.reconcileStrandedAssignedIssues({
       issueCreatedAtGte: await getWorktreeExecutionCutoff(),
       recoveryChainId: opts?.recoveryChainId,
+      shouldStop: opts?.shouldStop,
     });
   }
 
@@ -35136,12 +35603,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             : null,
         cwd: executionWorkspace.cwd,
       });
-      await materializeExternalK8sSharedDocs({
+      const sharedDocOverlay = await materializeExternalK8sSharedDocs({
         adapterType: agent.adapterType,
         config: runtimeConfig,
         cwd: executionWorkspace.cwd,
         onLog,
       });
+      // Set unconditionally-when-present rather than only for `run` isolation: the
+      // isolation mode is resolved inside the adapter from its own config, and
+      // duplicating that resolution here would be a second place to get it wrong. The
+      // adapters ignore the key in every other mode, where the mount already delivers
+      // the docs (PEN-3329).
+      //
+      // `contents` is deliberately NOT on this object. `context` is persisted verbatim to
+      // `heartbeat_runs.context_snapshot` at ~15 call sites (`contextSnapshot: context`),
+      // and the bodies are transport to the adapter only -- nothing ever reads them back
+      // out of the snapshot. Carrying them here would turn a few-hundred-byte path list
+      // into a per-run copy of every company doc (up to SHARED_DOC_MAX_BYTES_TOTAL) in the
+      // JSONB column migrations 0079/0080 already worked to keep small enough not to
+      // detoast. Stripping at each write site would be a list to keep in sync with every
+      // future write; keeping the field off `context` entirely cannot drift. The bodies
+      // are re-attached to `adapterContext` below -- the same not-persisted seam
+      // `paperclipManagedMcp` already uses.
+      if (sharedDocOverlay) {
+        context.paperclipSharedDocs = omitSharedDocContents(sharedDocOverlay);
+      }
       const adapterEnv = Object.fromEntries(
         Object.entries(parseObject(resolvedConfig.env)).filter(
           (entry): entry is [string, string] => typeof entry[0] === "string" && typeof entry[1] === "string",
@@ -35655,6 +36141,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       let adapterResult: Awaited<ReturnType<typeof adapter.execute>>;
       try {
         const adapterContext = { ...context };
+        // Re-attach the document bodies for the adapter only. `context` carries
+        // `sourceCwd` + `paths` so the persisted snapshot stays small (see the
+        // `omitSharedDocContents` call above); the adapter needs `contents` to stage the
+        // Secret, and `adapterContext` is never written to `heartbeat_runs`. Same seam as
+        // `paperclipManagedMcp` just below (PEN-3329).
+        if (sharedDocOverlay) {
+          adapterContext.paperclipSharedDocs = sharedDocOverlay;
+        }
         const runtimeMcpServers = await buildPaperclipRuntimeMcpServers({
           db,
           agent,
@@ -42452,11 +42946,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // taskKey falling to `other`. `like` (not `ilike`) because the webhook
       // writes the prefix literally.
       const isPrReviewTaskKey = sql<boolean>`coalesce(${wakeTaskKey} like 'pr\\_review:%', false)`;
+      // BLO-49060: successor matching is CASE-INSENSITIVE on taskKey. The
+      // webhook writes the repo as GitHub spells it (`Blockcast/...`) while the
+      // `issue_pr_review_requested` assignment path writes it lowercased
+      // (`blockcast/...`), and history already holds both. A case-sensitive `=`
+      // missed a succeeded successor and kept an already-reviewed PR paging.
+      // No index covers taskKey on either table, so `lower()` costs nothing.
+      const wakeTaskKeyLower = sql<string | null>`lower(${wakeTaskKey})`;
+      const runTaskKeyLower = sql<string | null>`lower(${heartbeatRuns.contextTaskKey})`;
 
       const selectCandidates = async (scope: "pr_review" | "other", limit: number) =>
         db
           .select({
             id: agentWakeupRequests.id,
+            requestedAt: agentWakeupRequests.requestedAt,
             finishedAt: agentWakeupRequests.finishedAt,
             taskKey: wakeTaskKey,
             errorCode: heartbeatRuns.errorCode,
@@ -42500,7 +43003,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
        * a CONSTANT bound (`> ${cutoff}`) alongside its correlated one. The
        * constant bound is logically redundant — any successor must postdate a
        * candidate whose `finishedAt >= cutoff`, so it cannot change the result
-       * set — but a purely correlated predicate gives the planner nothing
+       * set (BLO-49060 caveat: a `succeeded` run is matched from the wake's
+       * `requestedAt`, which can precede `cutoff`; such a run is then missed and
+       * the row is counted — the safe direction) — but a purely correlated
+       * predicate gives the planner nothing
        * sargable and it probes all history. This matters more now that the
        * publisher runs on every replica's scheduler tick rather than on one
        * replica's reconcile pass. Same treatment the sibling JS-side successor
@@ -42534,7 +43040,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               sql`not exists (
                 select 1
                 from agent_wakeup_requests successor_wake
-                where successor_wake.payload ->> 'taskKey' = ${wakeTaskKey}
+                where lower(successor_wake.payload ->> 'taskKey') = lower(${wakeTaskKey})
                   and successor_wake.id <> ${agentWakeupRequests.id}
                   and successor_wake.requested_at > ${agentWakeupRequests.finishedAt}
                   and successor_wake.requested_at > ${cutoff.toISOString()}::timestamptz
@@ -42545,12 +43051,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               sql`not exists (
                 select 1
                 from heartbeat_runs successor_run
-                where successor_run.context_task_key = ${wakeTaskKey}
-                  and successor_run.created_at > ${agentWakeupRequests.finishedAt}
+                where lower(successor_run.context_task_key) = lower(${wakeTaskKey})
                   and successor_run.created_at > ${cutoff.toISOString()}::timestamptz
-                  and successor_run.status in (${successorStatusList(
-                    TERMINAL_FAILED_WAKE_SUCCESSOR_RUN_STATUSES,
-                  )})
+                  and (
+                    (successor_run.created_at > ${agentWakeupRequests.finishedAt}
+                      and successor_run.status in (${successorStatusList(
+                        TERMINAL_FAILED_WAKE_SUCCESSOR_RUN_STATUSES,
+                      )}))
+                    or (successor_run.status = 'succeeded'
+                      and successor_run.created_at > ${agentWakeupRequests.requestedAt})
+                  )
               )`,
             ),
           )
@@ -42599,14 +43109,34 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // successor must postdate the failure. Bounding both follow-up queries by
       // the oldest candidate's finishedAt keeps them off a full-table scan.
       const taskKeys = [
-        ...new Set(rows.map((row) => row.taskKey).filter((key): key is string => !!key)),
+        ...new Set(
+          rows.map((row) => row.taskKey?.toLowerCase()).filter((key): key is string => !!key),
+        ),
       ];
       const oldestFinishedAt = rows.reduce<Date>(
         (oldest, row) => (row.finishedAt && row.finishedAt < oldest ? row.finishedAt : oldest),
         rows[0]?.finishedAt ?? cutoff,
       );
+      // A `succeeded` run counts from the candidate's REQUEST, not its finish
+      // (see latestSucceededRunByTaskKey), so that query needs the older bound.
+      const oldestRequestedAt = rows.reduce<Date>(
+        (oldest, row) => (row.requestedAt && row.requestedAt < oldest ? row.requestedAt : oldest),
+        oldestFinishedAt,
+      );
 
+      // Both maps are keyed by the LOWERCASED taskKey (BLO-49060).
       const latestSuccessorByTaskKey = new Map<string, Date>();
+      /**
+       * BLO-49060: a successor run that ended `succeeded` resolves the failure
+       * even if it was created BEFORE the failed run finished. A slow failure
+       * (e.g. a pod stuck PodInitializing for 30 min) routinely overlaps a
+       * re-request that completes the review, and the strict-after rule kept
+       * that already-reviewed PR paging for the full 24h window. It must still
+       * postdate the failed wake's `requestedAt`, so a review of an OLDER head
+       * cannot vouch for a newer request. Non-terminal statuses keep the
+       * strict-after-`finishedAt` rule: an in-flight run proves nothing yet.
+       */
+      const latestSucceededRunByTaskKey = new Map<string, Date>();
       // The driver hands back a `max(timestamptz)` aggregate as a STRING, not a
       // Date, no matter what the `sql<Date | null>` annotation claims -- the
       // same reason `refreshExternalRuntimeReservationMetrics` re-wraps its
@@ -42616,12 +43146,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // disabled the successor exclusion entirely and paged on exactly the
       // retried rows this gauge promises never to page on. Parse at the
       // boundary and keep the map strictly Date-typed.
-      const noteSuccessor = (taskKey: string | null, at: unknown) => {
+      const noteSuccessor = (
+        taskKey: string | null,
+        at: unknown,
+        map: Map<string, Date> = latestSuccessorByTaskKey,
+      ) => {
         if (!taskKey || !at) return;
         const parsed = at instanceof Date ? at : new Date(at as string);
         if (Number.isNaN(parsed.getTime())) return;
-        const current = latestSuccessorByTaskKey.get(taskKey);
-        if (!current || parsed > current) latestSuccessorByTaskKey.set(taskKey, parsed);
+        const current = map.get(taskKey);
+        if (!current || parsed > current) map.set(taskKey, parsed);
       };
 
       if (taskKeys.length > 0) {
@@ -42645,13 +43179,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const candidateIds = rows.map((row) => row.id);
         const successorWakes = await db
           .select({
-            taskKey: wakeTaskKey,
+            taskKey: wakeTaskKeyLower,
             latest: sql<string | null>`max(${agentWakeupRequests.requestedAt})`,
           })
           .from(agentWakeupRequests)
           .where(
             and(
-              inArray(wakeTaskKey, taskKeys),
+              inArray(wakeTaskKeyLower, taskKeys),
               gt(agentWakeupRequests.requestedAt, oldestFinishedAt),
               notInArray(agentWakeupRequests.id, candidateIds),
               inArray(agentWakeupRequests.status, [
@@ -42659,34 +43193,41 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               ]),
             ),
           )
-          .groupBy(wakeTaskKey);
+          .groupBy(wakeTaskKeyLower);
         for (const row of successorWakes) noteSuccessor(row.taskKey, row.latest);
 
         const successorRuns = await db
           .select({
-            taskKey: heartbeatRuns.contextTaskKey,
+            taskKey: runTaskKeyLower,
             latest: sql<string | null>`max(${heartbeatRuns.createdAt})`,
+            latestSucceeded: sql<string | null>`max(${heartbeatRuns.createdAt}) filter (where ${heartbeatRuns.status} = 'succeeded')`,
           })
           .from(heartbeatRuns)
           .where(
             and(
-              inArray(heartbeatRuns.contextTaskKey, taskKeys),
-              gt(heartbeatRuns.createdAt, oldestFinishedAt),
+              inArray(runTaskKeyLower, taskKeys),
+              gt(heartbeatRuns.createdAt, oldestRequestedAt),
               inArray(heartbeatRuns.status, [...TERMINAL_FAILED_WAKE_SUCCESSOR_RUN_STATUSES]),
             ),
           )
-          .groupBy(heartbeatRuns.contextTaskKey);
-        for (const row of successorRuns) noteSuccessor(row.taskKey, row.latest);
+          .groupBy(runTaskKeyLower);
+        for (const row of successorRuns) {
+          noteSuccessor(row.taskKey, row.latest);
+          noteSuccessor(row.taskKey, row.latestSucceeded, latestSucceededRunByTaskKey);
+        }
       }
 
       const counts = new Map<string, { errorCode: string | null; scope: string; count: number }>();
       for (const row of rows) {
         const finishedAt = row.finishedAt;
         if (row.taskKey && finishedAt) {
-          const successorAt = latestSuccessorByTaskKey.get(row.taskKey);
+          const key = row.taskKey.toLowerCase();
+          const successorAt = latestSuccessorByTaskKey.get(key);
           // Strictly-after: a successor stamped at the same instant as the
           // failure is the same event, not a re-drive.
           if (successorAt && successorAt > finishedAt) continue;
+          const succeededAt = latestSucceededRunByTaskKey.get(key);
+          if (succeededAt && row.requestedAt && succeededAt > row.requestedAt) continue;
         }
         const errorCode = row.errorCode ?? null;
         const scope = terminalFailedWakeScopeForTaskKey(row.taskKey);
@@ -43863,6 +44404,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // Exposed so the dispatch-path coalescing (BLO-36922) is directly testable;
     // production callers reach it through `startNextQueuedRunForAgent`.
     reapOrphanedRunsForStartLock,
+    // The periodic tick's entry point (PEN-4736). Exposed for the same reason as
+    // the start-lock entry above: it carries the periodic path's dispatch
+    // policy, so the "one fleet sweep per periodic pass" invariant is testable
+    // without driving the server bootstrap.
+    reapOrphanedRunsPeriodic,
     reconcileOrphanedEnvironmentLeases,
     refreshOrphanedRuntimeResourceMetrics,
     resumeRunningExternalRuntimeRuns,
@@ -44003,11 +44549,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         //
         // That is a real observability gap, and
         // paperclip_heartbeat_timer_scheduler_exclusion_total does NOT close
-        // it: every one of its call sites is below `checked += 1`, so none of
-        // them is reachable from this return. Its
-        // `heartbeat.scheduling_suppressed` label exists but is emitted from
-        // inside the per-agent loop, which this return skips -- so the label
-        // being present is not evidence the counter moves here. Global
+        // it: every one of its call sites is inside the per-agent loop, which
+        // this return skips entirely. (PEN-4737 added three call sites above
+        // `checked += 1`, so "below the counter" is no longer the reason they
+        // are unreachable from here -- "before the loop" is.) Its
+        // `heartbeat.scheduling_suppressed` label exists but is likewise
+        // emitted from inside that loop, so the label being present is not
+        // evidence the counter moves here. Global
         // suppression is observable from the scheduling-suppression record and
         // worker state instead; see the cause list on
         // HEARTBEAT_TIMER_CHECKED_METRIC in metrics.ts.
@@ -44193,11 +44741,145 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
       }
 
+      // PEN-4737: the pre-dispatch exclusion ledger's own cadence gate.
+      //
+      // Membership of this set means "already recorded for this (agent, reason)
+      // inside the current window", so the gate below is a plain lookup. The
+      // `requestedAt >= windowStart` bound is what makes that affordable
+      // without a new index. BLO-34578's baseline read needed the partial
+      // `agent_wakeup_requests_timer_baseline_idx` precisely because its
+      // `MAX(requested_at)` had no time bound, so `agentRequestedIdx` would
+      // have made each agent's whole history the scan bound. This read is
+      // bounded: it probes that same `(agent_id, requested_at)` index by agent,
+      // range-scans a one-hour tail, and leaves `source` as a recheck over the
+      // handful of rows inside it.
+      const exclusionWindowStart = new Date(
+        now.getTime() - TIMER_PRE_DISPATCH_EXCLUSION_INTERVAL_MS,
+      );
+      const preDispatchExclusionsInWindow = new Set<string>();
+      if (allAgents.length > 0) {
+        const recentExclusionRows = await db
+          .select({
+            agentId: agentWakeupRequests.agentId,
+            reason: agentWakeupRequests.reason,
+          })
+          .from(agentWakeupRequests)
+          .where(
+            and(
+              inArray(agentWakeupRequests.agentId, allAgents.map((agent) => agent.id)),
+              eq(agentWakeupRequests.source, TIMER_PRE_DISPATCH_EXCLUSION_SOURCE),
+              gte(agentWakeupRequests.requestedAt, exclusionWindowStart),
+            ),
+          )
+          .groupBy(agentWakeupRequests.agentId, agentWakeupRequests.reason);
+        for (const row of recentExclusionRows) {
+          if (row.agentId && row.reason) preDispatchExclusionsInWindow.add(`${row.agentId}:${row.reason}`);
+        }
+      }
+
+      /**
+       * Record one of the three exclusions that fire before `checked += 1`.
+       *
+       * Row and counter move together, so the exclusion metric's standing
+       * promise — "each increment has durable evidence in
+       * agent_wakeup_requests" — survives the rate limit. The alternative,
+       * incrementing on every pass and writing hourly, would break that join
+       * for an operator reading a firing series back to its row.
+       *
+       * `checked` and `skipped` are deliberately untouched. These agents were
+       * filtered before the loop counted them, and incrementing `skipped`
+       * without `checked` would put the pass's ledger out of balance for
+       * BLO-22048's unexplained-gap rule. The counter and the row are the new
+       * signal; the tick ledger keeps the meaning BLO-32269 documented.
+       *
+       * `requestedAt` is stamped from the pass's own `now` rather than left to
+       * the column default, so the window arithmetic above is self-consistent
+       * with the clock the rest of the loop reads.
+       */
+      const recordPreDispatchExclusion = async (
+        agent: typeof agents.$inferSelect,
+        reason: TimerPreDispatchExclusionReason,
+        // Value-safe by construction: bounded enums, booleans and numbers only.
+        // No free text, no names, no issue content -- `invokability.message`
+        // and `invokability.details` (which carry ids and the whole org chain)
+        // are deliberately not propagated here.
+        evidence: Record<string, string | number | boolean | null>,
+      ) => {
+        const ledgerKey = `${agent.id}:${reason}`;
+        if (preDispatchExclusionsInWindow.has(ledgerKey)) return;
+        // Added before the await so a single pass cannot double-write, and so a
+        // later pass inside the window short-circuits without re-reading.
+        preDispatchExclusionsInWindow.add(ledgerKey);
+        try {
+          await db.insert(agentWakeupRequests).values({
+            companyId: agent.companyId,
+            agentId: agent.id,
+            source: TIMER_PRE_DISPATCH_EXCLUSION_SOURCE,
+            triggerDetail: "system",
+            reason,
+            payload: { heartbeatSkip: { reason, ...evidence } },
+            status: "skipped",
+            requestedByActorType: "system",
+            requestedByActorId: "heartbeat_scheduler",
+            requestedAt: now,
+            finishedAt: now,
+          });
+        } catch (error) {
+          // Telemetry must not cost a dispatch. This is the only await in the
+          // per-agent loop that exists purely to observe it, so an unguarded
+          // throw here would abort the rest of the pass -- every agent after
+          // this one in `allAgents` goes unticked -- to record that THIS agent
+          // was already being skipped. That inverts PEN-2130: the instrument
+          // for starvation would itself starve the roster.
+          //
+          // The in-memory add above still holds for the rest of THIS pass, so
+          // the same (agent, reason) cannot be retried twice inside one tick.
+          // It buys nothing across passes, though: `preDispatchExclusionsInWindow`
+          // is rebuilt every pass from rows actually present in the table, and
+          // a failed insert leaves none behind. So while the sink is down this
+          // retries -- and warns -- once per (agent, reason) per ~30s pass,
+          // not once per window.
+          //
+          // That is deliberate, not a gap. These three conditions are standing
+          // states, so retrying every pass records the exclusion as soon as the
+          // sink recovers instead of hiding it until the window rolls, and a
+          // per-pass warn is the only signal that the ledger itself is broken.
+          // Muting it across passes would silence the instrument exactly when
+          // the instrument has failed.
+          logger.warn(
+            { err: error, agentId: agent.id, companyId: agent.companyId, reason },
+            "failed to record a pre-dispatch heartbeat timer exclusion",
+          );
+          return;
+        }
+        // Only after the row lands, so the metric's standing promise -- each
+        // increment has durable evidence in agent_wakeup_requests -- survives
+        // the failure path too.
+        recordHeartbeatTimerSchedulerExclusion(reason);
+      };
+
       for (const agent of allAgents) {
         const invokability = evaluateAgentInvokability(toAgentOrgRow(agent), agentsByCompany.get(agent.companyId) ?? []);
-        if (!invokability.invokable) continue;
+        if (!invokability.invokable) {
+          await recordPreDispatchExclusion(agent, "agent.not_invokable", {
+            // `AgentInvokabilityBlockReason` is a closed 10-member union, so
+            // this is classed, not free text. It stays in the payload rather
+            // than becoming a metric label: PEN-4737 adds no new label.
+            blockReason: invokability.reason,
+            invalidOrgChain: invokability.invalidOrgChain,
+          });
+          continue;
+        }
         const policy = parseHeartbeatPolicy(agent);
-        if (!policy.enabled || policy.intervalSec <= 0) continue;
+        if (!policy.enabled || policy.intervalSec <= 0) {
+          await recordPreDispatchExclusion(agent, "heartbeat.disabled", {
+            // Both arms of the condition, so a reader can tell a disabled
+            // heartbeat from a zero/negative interval without re-deriving it.
+            enabled: policy.enabled,
+            intervalSec: policy.intervalSec,
+          });
+          continue;
+        }
 
         if (cutoff) {
           const eligibleIssue = await db
@@ -44211,7 +44893,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             ))
             .limit(1)
             .then((rows) => rows[0] ?? null);
-          if (!eligibleIssue) continue;
+          if (!eligibleIssue) {
+            await recordPreDispatchExclusion(agent, "heartbeat.worktree_execution_cutoff", {
+              eligibleIssueCount: 0,
+              // Global deployment config, and already recorded verbatim by the
+              // event-path writer for this same reason, so no new value class.
+              cutoff: cutoff.toISOString(),
+            });
+            continue;
+          }
         }
 
         checked += 1;

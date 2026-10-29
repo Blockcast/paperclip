@@ -128,6 +128,7 @@ import {
   enqueueGithubReviewGateDelivery,
   type GithubReviewGateAuthorityConfig,
 } from "../services/github-review-gate-authority.js";
+import { isDeliberateParkActive } from "../services/issue-park-expiry.js";
 
 type PrReviewerSelectionDb = Pick<Db | DbTransaction, "select">;
 
@@ -3034,10 +3035,10 @@ function hasLiveDeliberatePark(
   issue: { parkedUntil?: Date | string | null },
   nowMs: number,
 ): boolean {
-  const raw = issue.parkedUntil;
-  if (!raw) return false;
-  const parkedUntilMs = raw instanceof Date ? raw.getTime() : new Date(raw).getTime();
-  return Number.isFinite(parkedUntilMs) && parkedUntilMs > nowMs;
+  // PEN-4871: delegates rather than restates. The comment above used to be the only thing
+  // holding this copy in step with the others, which is the arrangement BLO-22660 recorded
+  // failing on this exact column.
+  return isDeliberateParkActive(issue.parkedUntil, nowMs);
 }
 
 function prReviewerWakeIdempotencyScope(

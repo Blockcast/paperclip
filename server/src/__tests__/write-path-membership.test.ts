@@ -228,20 +228,29 @@ describe.sequential("write-path membership checks (viewer / inactive)", () => {
     });
   });
 
-  describe("active editor (sanity check)", () => {
-    const editorActor = {
+  // PEN-3954 replaced the raw `role !== "viewer"` comparison behind this bar
+  // with `membershipRoleIsNonViewer`, which normalizes with a `viewer`
+  // fallback. This block used to be a single `membershipRole: "editor"`
+  // sanity check that passed only because the raw comparison admitted every
+  // string except the literal `"viewer"` — i.e. it asserted the fail-open
+  // behaviour that ticket removed. `editor` is not storable: the member-update
+  // API validates against `HUMAN_COMPANY_MEMBERSHIP_ROLES`
+  // (`packages/shared/src/validators/access.ts`), and the only writers of an
+  // out-of-enum value are the cloud-tenant path (`support`, `member`) and
+  // legacy rows. So the sanity check now runs on the roles that really do
+  // write, and the unrecognized string is kept as a deny case.
+  describe("active writer roles (sanity check)", () => {
+    const writerActor = (membershipRole: string) => ({
       type: "board" as const,
-      userId: "editor-user",
+      userId: `${membershipRole}-user`,
       companyIds: [companyId],
       source: "session" as const,
       isInstanceAdmin: false,
-      memberships: [
-        { companyId, status: "active", membershipRole: "editor" },
-      ],
-    };
+      memberships: [{ companyId, status: "active", membershipRole }],
+    });
 
-    it("allows PATCH on a goal", async () => {
-      const app = await createApp(editorActor);
+    it("allows PATCH on a goal for an operator", async () => {
+      const app = await createApp(writerActor("operator"));
       const res = await requestApp(app, (baseUrl) =>
         request(baseUrl).patch(`/api/goals/${goalId}`).send({ title: "New title" }),
       );
@@ -249,5 +258,65 @@ describe.sequential("write-path membership checks (viewer / inactive)", () => {
       expect(res.status).toBe(200);
       expect(mockGoalService.update).toHaveBeenCalledWith(goalId, { title: "New title" });
     });
+
+    it("allows PATCH on a goal for the legacy `member` role", async () => {
+      const app = await createApp(writerActor("member"));
+      const res = await requestApp(app, (baseUrl) =>
+        request(baseUrl).patch(`/api/goals/${goalId}`).send({ title: "New title" }),
+      );
+
+      expect(res.status).toBe(200);
+      expect(mockGoalService.update).toHaveBeenCalledWith(goalId, { title: "New title" });
+    });
+
+    it("allows PATCH on a goal for an owner", async () => {
+      const app = await createApp(writerActor("owner"));
+      const res = await requestApp(app, (baseUrl) =>
+        request(baseUrl).patch(`/api/goals/${goalId}`).send({ title: "New title" }),
+      );
+
+      expect(res.status).toBe(200);
+      expect(mockGoalService.update).toHaveBeenCalledWith(goalId, { title: "New title" });
+    });
+  });
+
+  // The other half of the same change: anything the human-role union does not
+  // recognize lands where a viewer lands, rather than being admitted because
+  // it merely is not the string "viewer". `support` is the one such value the
+  // product actually provisions (PEN-4964: read-only, owner CTO, 2026-10-29);
+  // `editor` stands in for the general unrecognized case, and is the exact
+  // fixture this block previously asserted a 200 for.
+  describe("roles outside the human union are read-only", () => {
+    const unknownActor = (membershipRole: string | null) => ({
+      type: "board" as const,
+      userId: "unknown-role-user",
+      companyIds: [companyId],
+      source: "session" as const,
+      isInstanceAdmin: false,
+      memberships: [{ companyId, status: "active", membershipRole }],
+    });
+
+    for (const role of ["support", "editor", null] as const) {
+      it(`rejects PATCH on a goal for membershipRole=${JSON.stringify(role)}`, async () => {
+        const app = await createApp(unknownActor(role));
+        const res = await requestApp(app, (baseUrl) =>
+          request(baseUrl).patch(`/api/goals/${goalId}`).send({ title: "New title" }),
+        );
+
+        expect(res.status).toBe(403);
+        expect(res.body.error).toBe("Viewer access is read-only");
+        expect(mockGoalService.update).not.toHaveBeenCalled();
+      });
+
+      it(`allows GET on a goal for membershipRole=${JSON.stringify(role)}`, async () => {
+        const app = await createApp(unknownActor(role));
+        const res = await requestApp(app, (baseUrl) =>
+          request(baseUrl).get(`/api/goals/${goalId}`),
+        );
+
+        expect(res.status).toBe(200);
+        expect(res.body.id).toBe(goalId);
+      });
+    }
   });
 });

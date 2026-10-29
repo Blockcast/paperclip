@@ -33,7 +33,7 @@ import {
 } from "./trust-preset-resolver.js";
 import { ACTIVE_RECOVERY_ACTION_STATUSES, RECOVERY_HANDOFF_COMMENT_GRANT_TTL_MS, recoveryHandoffGrantIsWithinTtl } from "./issue-recovery-actions.js";
 import { RECOVERY_ORIGIN_KINDS } from "./recovery/origins.js";
-import { normalizeHumanRole } from "./company-member-roles.js";
+import { membershipRoleIsNonViewer } from "./company-member-roles.js";
 import { logger } from "../middleware/logger.js";
 
 export type AuthorizationActor =
@@ -504,9 +504,9 @@ async function scopeAllows(
     if (!matchesSubtree) return false;
   }
 
-  // Unknown metadata keys do not constrain the grant. Recognized constraints
-  // return false above when they fail to match the requested assignment scope.
-  return !constrained ? true : constrained;
+  // A non-empty scope must contain at least one recognized constraint. Unknown
+  // keys cannot silently turn a purportedly scoped grant into a broad grant.
+  return constrained;
 }
 
 function allow(input: Omit<AuthorizationDecision, "allowed">): AuthorizationDecision {
@@ -546,60 +546,54 @@ export function responsibleUserAuthzShadowMode() {
   return mode === "shadow" || shadow === "1" || shadow === "true" || shadow === "yes";
 }
 
-/**
- * PEN-3913. Whether a stored membership row clears a non-viewer bar, failing
- * CLOSED on anything outside the normalized human role union.
+// PEN-3913 / PEN-3954 — why `membershipRoleIsNonViewer` is imported rather
+// than defined here.
+/*
+ * `membershipRoleIsNonViewer` now lives in
+ * `services/company-member-roles.ts` beside `normalizeHumanRole`, and is THE
+ * membership-role write bar for the whole server. It used to be a private
+ * copy here while four other sites spelled the same test as a raw
+ * `role === "viewer"` comparison; the move is Ally's Suggestion 1 on
+ * paperclip#2444.
  *
  * `company_memberships.membership_role` is a plain nullable `text` column with
  * no DB constraint (`packages/db/src/schema/company_memberships.ts`), and two
- * writers put values outside `HUMAN_COMPANY_MEMBERSHIP_ROLES` into it:
- * the cloud-tenant path persists `support` verbatim (`middleware/auth.ts`,
+ * writers put values outside `HUMAN_COMPANY_MEMBERSHIP_ROLES` into it: the
+ * cloud-tenant path persists `support` verbatim (`middleware/auth.ts`,
  * `stackMembershipRole`), and `updateCompanyMemberSchema`
  * (`packages/shared/src/validators/access.ts`) accepts an explicit `null`,
  * which the member-update path writes straight through. A raw
  * `role !== "viewer"` test counts BOTH as non-viewer and fails OPEN.
  *
- * `boardActorIsTranscriptOperator` (`routes/authz.ts`) already reads the same
- * column through `normalizeHumanRole(value, "viewer")` and fails closed on
- * exactly these values. This keeps THOSE TWO gates in step — the decider's
- * non-viewer bars and the transcript gate: a role string this codebase does
- * not recognize lands where a viewer lands, needing an explicit grant, on
- * both sides rather than being privileged by one and refused by the other.
- * `member` still folds to `operator`, which is the agreement with
- * `normalizeHumanRole` that both call sites exist to hold.
+ * RESOLVED — the three dispositions now agree. The column was read three ways
+ * and a `support` row got a different answer from each: denied by the
+ * fail-closed bars, SEEDED `operator` grants by the provisioning path, and
+ * ADMITTED by the four raw bars. PEN-4964 decided it (2026-10-29, owner CTO):
+ * a cloud-tenant `support` principal gets READ, NOT WRITE. PEN-3954
+ * implemented that as one explicit `support -> viewer` branch in
+ * `normalizeHumanRole`, which closes all three at once:
  *
- * Note the fallback is `viewer`, NOT `normalizeHumanRole`'s own `operator`
- * default. That default is right for its other callers (grant seeding, label
- * rendering) and wrong for an authorization bar, for the reason spelled out at
- * `normalizedTranscriptRole`: it would turn every unknown or legacy role
- * string into a privileged member.
+ *   1. fail-closed reads (here, `routes/authz.ts` `normalizedTranscriptRole`)
+ *      — unchanged; `support` and `null` were already denied.
+ *   2. `operator` fallback (`ensureHumanRoleDefaultGrants`,
+ *      `resolveHumanInviteRole`, four sites in `routes/access.ts`) —
+ *      `support` now resolves `viewer`, so `grantsForHumanRole` returns `[]`
+ *      and the seed stops. `insertMissingPrincipalGrants` is insert-only
+ *      (`onConflictDoNothing`, early return on an empty list), so this grants
+ *      nothing new and REVOKES NOTHING: a support seat that already holds a
+ *      `tasks:assign` row keeps it until someone deletes it.
+ *   3. the four raw `=== "viewer"` bars — converted to call
+ *      `membershipRoleIsNonViewer`, so there is now ONE spelling. This is the
+ *      half with retroactive reach: an existing support seat loses HTTP write
+ *      on deploy. An explicit `principal_permission_grants` row restores any
+ *      seat that turns out to need it.
  *
- * SCOPE — the column is NOT uniformly normalized, and this helper does not
- * make it so. Do not read the paragraph above as a whole-codebase claim.
- * `membership_role` is read through three dispositions:
- *
- *   1. `viewer` fallback, fails closed — here and `routes/authz.ts`
- *      (`normalizedTranscriptRole`). `support`/`null` are denied.
- *   2. `operator` fallback, privileged — `principal-access-compatibility.ts`
- *      (`ensureHumanRoleDefaultGrants`, the provisioning path),
- *      `company-member-roles.ts` (`resolveHumanInviteRole`) and four sites in
- *      `routes/access.ts`. A cloud-tenant `support` row is SEEDED with
- *      `operator` grants here.
- *   3. raw `=== "viewer"`, fails open — `routes/authz.ts` (the
- *      `assertCompanyAccess` board write bar and the `onBehalfOf` write bar),
- *      `routes/tool-access.ts` and `routes/tool-gateway.ts`.
- *
- * So a `support` principal is seeded operator-level by (2), admitted by (3),
- * and denied by (1). Converting (3) to this helper would NOT merely restore
- * agreement — it would put the HTTP write bars in conflict with the
- * provisioning path that deliberately seeds `support` as `operator`.
- * Reconciling them needs a decision about what `support` is entitled to, not
- * a mechanical substitution, so it is deliberately NOT done here. Tracked on
- * PEN-3954; do not widen this helper's claim until that lands.
+ * `support` stays OUT of `HUMAN_COMPANY_MEMBERSHIP_ROLES` on purpose — adding
+ * it would make it a selectable UI role in every tenant and in the public
+ * plugin SDK to fix an authz bug in one deployment mode. The raw string is
+ * still what gets stored; normalization happens on READ, which is also what
+ * covers rows written before this landed.
  */
-function membershipRoleIsNonViewer(value: unknown): boolean {
-  return normalizeHumanRole(value, "viewer") !== "viewer";
-}
 
 function activeActorMembership(
   memberships: Array<{ companyId: string; membershipRole?: string | null; status?: string }> | null | undefined,
@@ -1954,6 +1948,15 @@ export function authorizationService(db: Db) {
       return broadDecision;
     }
 
+    // THE implication rule for `agent_config:read`, which is a virtual action
+    // with no `permission_key` of its own (`permissionForAction` returns null
+    // for it). Config READ authority is implied by config CHANGE authority, in
+    // both the direct and the suggest tier — and by nothing else: the
+    // delegate below reads only an active membership and a stored grant, never
+    // `role`, `reportsTo` or `permissions`. Searching a principal's grants for
+    // the string `agent_config:read` therefore always comes back empty, for an
+    // entitled principal exactly as much as for a denied one (PEN-4775).
+    // Keep in step with docs/security/agent-config-read-model.md.
     async function decideWithAgentConfigReadGrant(
       principalType: PrincipalType,
       principalId: string,

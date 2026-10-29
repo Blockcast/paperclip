@@ -32,6 +32,13 @@ platform cannot resolve automatically. Each runbook should be:
   Trigger: `paperclip_external_runtime_reservations_release_pending > 0`,
   `paperclip_environment_leases_orphaned_active > 0`, or a scheduler crash-loop
   on a database migration at startup.
+- [`issues-trigram-index-rollout.md`](issues-trigram-index-rollout.md) — the
+  migration 0268 trigram index build takes a SHARE lock on `issues` and, on the
+  role `lock_timeout` we believe is in force, makes retried issue writes return
+  `503 transient_db_conflict` rather than merely stalling. Covers the
+  `CONCURRENTLY` opt-out and the `btree_gin` privilege that does fail closed.
+  Trigger: approving the deploy that applies 0268, or a burst of
+  `transient_db_conflict` on issue writes lining up with a migration window.
 - [`clear-polluted-ssh-workspace.md`](clear-polluted-ssh-workspace.md) —
   recover a stranded SSH-driven run whose workspace import is failing on a
   sibling task's leftover scratch state. Trigger: blocked issue auto-comment
@@ -90,6 +97,15 @@ platform cannot resolve automatically. Each runbook should be:
   alert `PaperclipDeferredIssueExecutionWakeOverdue`,
   `PaperclipDeferredIssueExecutionWakeAgeMetricsRefreshFailed`, or the log line
   `deferred behind an issue execution lock`.
+- [`deliberate-park-release-edge.md`](deliberate-park-release-edge.md) —
+  answering "did this row's park wake fire?". The issue row's
+  `parkedWakeFiredAt` is a per-PARK claim marker, not a per-row audit field: a
+  re-park clears it, and a park wake that works dispatches a run that routinely
+  re-parks, so the column deletes its own positive cases (measured 7 of 7 fired,
+  0 of 7 still recorded 45 minutes later). Covers the three meanings of `null`,
+  the bounds of the wake-diagnostics endpoint that replaces it, and why the
+  activity feed carries no park wake at all. No alert: the symptom is a
+  reassuring `null` you are about to believe.
 - [`queued-run-stranded.md#agent-start-lock-wedged-pen-3305`](queued-run-stranded.md#agent-start-lock-wedged-pen-3305) —
   an agent has held its per-agent dispatch start lock past the point the code
   itself calls dispatch stopped. This is the *cause* side of the alert above:
@@ -125,6 +141,23 @@ platform cannot resolve automatically. Each runbook should be:
   still finishing, just not inside the bound. The lever is sweep duration; do NOT
   raise the bound. ⚠️ The chart copy does not deploy on Blockcast
   (`prometheusRule.enabled: false`), so this alert needs the onprem-k8s port too.
+- [`queued-run-stranded.md#transient-retry-clamp-signature-pen-4145`](queued-run-stranded.md#transient-retry-clamp-signature-pen-4145) —
+  `PaperclipTransientRetryClampSignature`: `transient_failure` retry floors are
+  landing on a shared instant again, so a cohort of runs will resume in lockstep
+  into the dependency whose degradation created the cohort. Triage keys on the
+  `disposition` label, which says WHICH failure it is — alignment inside
+  `exempt_*` means the exemption predicate is mis-routing a verbatim provider
+  instant (the PEN-2509 signature), alignment inside `dispersed` means the jitter
+  itself stopped working. The alert exists because the dispersion decision used
+  to emit NOTHING: the first PEN-2509 fix was live, fleet-wide and wrong for six
+  weeks and was found only by a hand census (PEN-4015). ⚠️ A reading below 30
+  floor decisions is an UNMEASURED one, not a healthy one — that 0/0 is the false
+  clear that closed PEN-2509 in August. ⚠️ Three gates before this detects
+  anything: the chart copy does not deploy on Blockcast
+  (`prometheusRule.enabled: false`), the onprem-k8s `monitoring-rules` Argo app
+  syncs manually, and the counter ships in the SERVER IMAGE — so confirm
+  `count by (disposition, alignment) (paperclip_transient_retry_floor_total)`
+  returns 12 per pod before relying on it.
 - [`queued-run-stranded.md#overdue-scheduled-retry-blo-22094`](queued-run-stranded.md#overdue-scheduled-retry-blo-22094) —
   a `heartbeat_runs` row parked at `status='scheduled_retry'` past its own due
   time, never promoted: the retry-promotion sweep either wedged or is

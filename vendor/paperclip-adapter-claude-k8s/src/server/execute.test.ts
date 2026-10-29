@@ -716,6 +716,16 @@ describe("execute: stdout accumulator regression", () => {
   });
 });
 
+describe("execute: process signal handlers (BLO-49139)", () => {
+  it("registers no process signal listener", async () => {
+    // The host server owns shutdown. This adapter used to re-raise SIGTERM
+    // from a `once` listener, which killed the host's drain mid-flight.
+    const source = await readFile(new URL("./execute.ts", import.meta.url), "utf-8");
+    expect(source).not.toMatch(/process\.(on|once|addListener|prependListener|prependOnceListener)\(\s*["'`]SIG/);
+    expect(source).not.toMatch(/process\.kill\(\s*process\.pid/);
+  });
+});
+
 // ─── execute: concurrency guard paths ────────────────────────────────────────
 
 describe("execute: concurrency guard", () => {

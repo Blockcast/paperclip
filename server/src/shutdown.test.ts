@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { coordinateHeartbeatSchedulerShutdown } from "./shutdown.js";
+import { closeServerBounded, coordinateHeartbeatSchedulerShutdown } from "./shutdown.js";
 
 describe("coordinateHeartbeatSchedulerShutdown", () => {
   it("captures a hot-restart snapshot without waiting for active scheduler work", async () => {
@@ -21,6 +21,7 @@ describe("coordinateHeartbeatSchedulerShutdown", () => {
       hotRestart: { mode: "prepared", skipDrain: true },
       preparationError: null,
       waitedForSchedulerIdle: false,
+      idleWaitTimedOut: false,
     });
   });
 
@@ -52,6 +53,7 @@ describe("coordinateHeartbeatSchedulerShutdown", () => {
       hotRestart: { mode: "not_requested", skipDrain: false },
       preparationError: null,
       waitedForSchedulerIdle: true,
+      idleWaitTimedOut: false,
     });
   });
 
@@ -69,6 +71,7 @@ describe("coordinateHeartbeatSchedulerShutdown", () => {
       hotRestart: null,
       preparationError: null,
       waitedForSchedulerIdle: true,
+      idleWaitTimedOut: false,
     });
   });
 
@@ -89,6 +92,74 @@ describe("coordinateHeartbeatSchedulerShutdown", () => {
       hotRestart: null,
       preparationError,
       waitedForSchedulerIdle: true,
+      idleWaitTimedOut: false,
     });
+  });
+
+  it("stops waiting at idleWaitTimeoutMs so the lease is released inside the grace (BLO-49596)", async () => {
+    vi.useFakeTimers();
+    try {
+      const shutdown = coordinateHeartbeatSchedulerShutdown({
+        signal: "SIGTERM",
+        prepareHotRestartShutdown: null,
+        waitForHeartbeatSchedulerIdle: () => new Promise<void>(() => undefined),
+        idleWaitTimeoutMs: 20_000,
+      });
+      await vi.advanceTimersByTimeAsync(20_000);
+      await expect(shutdown).resolves.toEqual({
+        hotRestart: null,
+        preparationError: null,
+        waitedForSchedulerIdle: false,
+        idleWaitTimedOut: true,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("closeServerBounded (BLO-49139)", () => {
+  function fakeServer() {
+    let closeCb: ((err?: Error) => void) | undefined;
+    const server = {
+      close: vi.fn((cb: (err?: Error) => void) => { closeCb = cb; }),
+      closeIdleConnections: vi.fn(),
+      closeAllConnections: vi.fn(() => closeCb?.()),
+    };
+    return { server, finishClose: (err?: Error) => closeCb?.(err) };
+  }
+
+  it("force-closes all connections when close outlives the cap", async () => {
+    vi.useFakeTimers();
+    try {
+      const { server } = fakeServer();
+      const onForceClose = vi.fn();
+      const done = closeServerBounded(server, 10_000, onForceClose);
+      expect(server.closeIdleConnections).toHaveBeenCalled();
+      expect(server.closeAllConnections).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(onForceClose).toHaveBeenCalledTimes(1);
+      expect(server.closeAllConnections).toHaveBeenCalledTimes(1);
+      await expect(done).resolves.toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not force-close when close finishes in time, and returns its error", async () => {
+    vi.useFakeTimers();
+    try {
+      const { server, finishClose } = fakeServer();
+      const onForceClose = vi.fn();
+      const done = closeServerBounded(server, 10_000, onForceClose);
+      const err = new Error("not listening");
+      finishClose(err);
+      await expect(done).resolves.toBe(err);
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(onForceClose).not.toHaveBeenCalled();
+      expect(server.closeAllConnections).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

@@ -96,12 +96,40 @@ function kubectl(args, options) {
   return execFileSync(options.kubectl, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
 }
 
+// A pod being replaced still reports status.phase=Running until it is gone,
+// so the field selector alone lets the walk exec into a container that has
+// already stopped: `container not found` -> a thrown kubectl error -> exit 1,
+// i.e. a rollout read as a config regression (BLO-49205). Skip pods that are
+// terminating, or whose target container is not running; they are logged,
+// never exec'd. A namespace left with no eligible pod is UNOBSERVABLE.
+export function eligiblePods(items, container) {
+  const pods = [];
+  const skipped = [];
+  for (const item of items) {
+    const name = item.metadata?.name;
+    if (!name) continue;
+    if (item.metadata.deletionTimestamp) {
+      skipped.push(`${name}: terminating (deletionTimestamp=${item.metadata.deletionTimestamp})`);
+      continue;
+    }
+    if (container) {
+      const status = (item.status?.containerStatuses ?? []).find((c) => c.name === container);
+      if (!status?.state?.running) {
+        skipped.push(`${name}: container ${container} not running`);
+        continue;
+      }
+    }
+    pods.push(name);
+  }
+  return { pods, skipped };
+}
+
 function listPods(namespace, options, exec) {
   const output = exec(
-    ["-n", namespace, "get", "pods", "-l", options.selector, "--field-selector", "status.phase=Running", "-o", "jsonpath={range .items[*]}{.metadata.name}{'\\n'}{end}"],
+    ["-n", namespace, "get", "pods", "-l", options.selector, "--field-selector", "status.phase=Running", "-o", "json"],
     options,
   );
-  return output.split("\n").map((pod) => pod.trim()).filter(Boolean);
+  return eligiblePods(JSON.parse(output).items ?? [], options.container);
 }
 
 function readPodFile(namespace, pod, options, exec) {
@@ -142,9 +170,12 @@ export function run(options, exec = kubectl) {
   const failures = [];
   const unobservable = [];
   const checked = [];
+  const skipped = [];
 
   for (const namespace of options.namespaces) {
-    const pods = listPods(namespace, options, exec);
+    const listed = listPods(namespace, options, exec);
+    const pods = listed.pods;
+    for (const reason of listed.skipped) skipped.push(`${namespace}/${reason}`);
     if (pods.length === 0) {
       unobservable.push(`${namespace}: no running relay pods matched selector ${options.selector}`);
       continue;
@@ -160,13 +191,14 @@ export function run(options, exec = kubectl) {
     }
   }
 
-  return { ok: failures.length === 0 && unobservable.length === 0, checked, failures, unobservable };
+  return { ok: failures.length === 0 && unobservable.length === 0, checked, skipped, failures, unobservable };
 }
 
 function main() {
   const options = parseArgs(process.argv.slice(2));
   const result = run(options);
 
+  for (const pod of result.skipped) console.log(`SKIP ${pod}`);
   for (const pod of result.checked) console.log(`PASS ${pod}`);
   if (!result.ok) {
     for (const failure of result.failures) console.error(`FAIL ${failure}`);
@@ -189,7 +221,9 @@ if (import.meta.url === `file://${process.argv[1]}`) {
     // Splitting them needs a second try block and buys nothing today: the
     // workflow treats any non-zero as red either way, and the message on
     // stderr already names the cause. Revisit if a transport failure is ever
-    // mistaken for a regression.
+    // mistaken for a regression. (It was, BLO-49205: a pod mid-replacement;
+    // eligiblePods now skips those. A pod that starts terminating between the
+    // list and the exec can still land here — a narrower window, same exit.)
     process.exitCode = EXIT_NONCONFORMING;
   }
 }

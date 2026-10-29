@@ -10,6 +10,11 @@ import {
   releaseSchedulerLease,
   schedulerLeaseHolder,
 } from "../services/scheduler-lease.js";
+import {
+  __resetMetricsForTest,
+  renderMetrics,
+  SCHEDULER_LEASE_HELD_METRIC,
+} from "../services/metrics.js";
 
 vi.hoisted(() => {
   process.env.PAPERCLIP_HOME = "/tmp/paperclip-test-home";
@@ -24,6 +29,17 @@ const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : 
 type Db = ReturnType<typeof createDb>;
 
 const LEASE = "heartbeat-timer-test";
+
+/**
+ * Read one holder's published value of {@link SCHEDULER_LEASE_HELD_METRIC}
+ * straight off the exposition surface, because that -- not the in-memory
+ * `isLeader()` verdict -- is what an alert actually joins against (PEN-4665).
+ */
+async function publishedLeaseHeld(holderPod: string): Promise<string | undefined> {
+  const { body } = await renderMetrics();
+  const prefix = `${SCHEDULER_LEASE_HELD_METRIC}{lease="${LEASE}",holder="${holderPod}"} `;
+  return body.split("\n").find((line) => line.startsWith(prefix))?.slice(prefix.length).trim();
+}
 
 /**
  * BLO-43292. Run against a REAL postgres rather than a fake, deliberately: the
@@ -161,6 +177,72 @@ describeEmbeddedPostgres("scheduler lease (BLO-43292)", () => {
     expect(holder.isLeader()).toBe(true);
     clock += 2_000;
     expect(holder.isLeader()).toBe(false);
+  });
+
+  // PEN-4665. The test above proves the DEMOTION happens in process; this one
+  // proves the demotion is PUBLISHED. The distinction is the whole of PEN-4665:
+  // the cold-`in_review` alert joins on this gauge to decide which replica's
+  // refresh flag to believe, so if a demoted-but-live process kept exporting
+  // `holder=1` the join would keep selecting a replica that has stopped
+  // refreshing, and the alert would read a stale `1` as healthy.
+  //
+  // This is also the scenario PEN-4665 could not observe in the wild: every
+  // `heartbeat-timer` handoff measured in production so far coincided with a
+  // pod replacement, so the in-process path was argued through rather than
+  // exercised. It is exercised here -- one process, no restart, lease moves.
+  it("publishes held=0 when it is demoted IN PROCESS, with no restart (PEN-4665)", async () => {
+    __resetMetricsForTest();
+    let clock = 1_000_000;
+    const common = { name: LEASE, ttlMs: 45_000, renewIntervalMs: 60_000 };
+
+    const formerLeader = schedulerLeaseHolder(db, {
+      ...common,
+      identity: { pod: "pod-old", holderId: "pod-old#fixed" },
+      now: () => clock,
+    });
+
+    expect(await formerLeader.tick()).toBe(true);
+    expect(await publishedLeaseHeld("pod-old")).toBe("1");
+
+    // Expire the row on the DATABASE clock -- which is the only clock
+    // `acquireSchedulerLease` consults (`expires_at <= now()`), so advancing
+    // the injected `now` would not move it. Done directly rather than by
+    // sleeping out a short TTL, to keep the test deterministic.
+    //
+    // The injected clock is deliberately NOT advanced: `formerLeader` must
+    // still believe it leads when it next ticks, because `wasLeader && !hold`
+    // is the branch under test. That combination -- a process still convinced
+    // it is the leader, whose lease has actually moved -- IS the fail-open
+    // state PEN-4665 is about.
+    await db
+      .update(schedulerLeases)
+      .set({ expiresAt: new Date(Date.now() - 60_000) });
+
+    const successor = schedulerLeaseHolder(db, {
+      ...common,
+      identity: { pod: "pod-new", holderId: "pod-new#fixed" },
+      now: () => clock,
+    });
+    expect(await successor.tick()).toBe(true);
+
+    // The former leader's next renew attempt finds the lease gone. This is the
+    // `wasLeader && !hold` branch -- and `publish()` sits after it, outside the
+    // try/catch, so it runs on this path too.
+    expect(await formerLeader.tick()).toBe(false);
+
+    expect(await publishedLeaseHeld("pod-old")).toBe("0");
+    expect(await publishedLeaseHeld("pod-new")).toBe("1");
+
+    // And the property an alert actually depends on: across the whole fleet
+    // exactly one replica advertises leadership, so a join `on (pod)` against
+    // this gauge selects precisely one series.
+    const { body } = await renderMetrics();
+    const advertising = body
+      .split("\n")
+      .filter((line) => line.startsWith(`${SCHEDULER_LEASE_HELD_METRIC}{lease="${LEASE}"`))
+      .filter((line) => line.trim().endsWith(" 1"));
+    expect(advertising).toHaveLength(1);
+    expect(advertising[0]).toContain('holder="pod-new"');
   });
 
   it("keeps the lease across a failed renewal until the cached deadline passes", async () => {

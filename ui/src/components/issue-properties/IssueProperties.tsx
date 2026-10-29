@@ -2,7 +2,14 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ComponentType }
 import { pickTextColorForPillBg } from "@/lib/color-contrast";
 import { issueStatusText } from "@/lib/status-colors";
 import { Link } from "@/lib/router";
-import { deriveOriginatingActor, type Issue, type IssueLabel } from "@paperclipai/shared";
+import {
+  DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
+  MAX_ISSUE_MONITOR_MAX_ATTEMPTS,
+  deriveOriginatingActor,
+  renewedIssueMonitorMaxAttempts,
+  type Issue,
+  type IssueLabel,
+} from "@paperclipai/shared";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { accessApi } from "../../api/access";
 import { agentsApi } from "../../api/agents";
@@ -997,26 +1004,72 @@ export function IssueProperties({
       },
     });
   };
+  const monitorAttemptCount = issue.monitorAttemptCount ?? issue.executionState?.monitor?.attemptCount ?? 0;
+  const monitorArmed = Boolean(issue.executionPolicy?.monitor);
+  /**
+   * PEN-3803 review follow-up: past `MAX_ISSUE_MONITOR_MAX_ATTEMPTS` there is no
+   * representable renewal, so `renewedIssueMonitorMaxAttempts` returns `null`,
+   * the dialog would send `maxAttempts: null`, and the server would answer 422
+   * naming the remedy — "set an explicit `maxAttempts` above the attempts
+   * already made". This dialog renders no `maxAttempts` control, so the board
+   * user cannot apply that remedy here, and the 422 is raised through `onUpdate`
+   * where this popover has no error surface to show it in.
+   *
+   * Rather than let "Schedule" fail silently from the user's side, say so before
+   * the click.
+   *
+   * ⚠️ The copy must NOT repeat the server's remedy here. The 422 advises
+   * "set an explicit `maxAttempts` above the attempts already made", which is
+   * right at, say, 24 attempts — but this hint renders only at
+   * `>= MAX_ISSUE_MONITOR_MAX_ATTEMPTS` (100), and the schema caps `maxAttempts`
+   * at `.max(100)` while an arm needs it strictly ABOVE the count. No value
+   * satisfies both, and nothing in the codebase resets `monitorAttemptCount`
+   * (`clearArmedMonitorColumns` leaves it; the column is `notNull().default(0)`
+   * and only the scheduler increments it). So at this point the row is
+   * permanently unarmable, and saying anything else sends the user to a dead
+   * end. "Clear" remains offered on an armed row because retiring a dead
+   * monitor is still worth doing — it just does not restore armability.
+   *
+   * ⚠️ Deliberately NOT conjoined with `monitorArmed`. Clearing a monitor does
+   * not reset `monitorAttemptCount` — the count outlives the monitor, which is
+   * the whole reason this issue exists — so a row whose monitor was already
+   * cleared at the cap still cannot be armed. Gating on "a monitor is present"
+   * would leave Schedule enabled on exactly that row and send it to the same
+   * unsurfaceable 422. `monitorArmed` only chooses the WORDING below, because
+   * "clear it" is advice you can act on only when there is something to clear.
+   */
+  const monitorRenewalUnavailable = renewedIssueMonitorMaxAttempts(monitorAttemptCount) === null;
   const saveMonitor = () => {
     if (!monitorAtInput) return;
     const nextCheckAt = new Date(monitorAtInput);
     if (Number.isNaN(nextCheckAt.getTime())) return;
     const serviceName = monitorServiceInput.trim() || null;
     const carried = issue.executionPolicy?.monitor;
-    // BLO-40082: carry the two bounds forward, but drop one that is already
-    // spent. A board "Schedule" always sets `monitorExplicitlyUpdated`
+    // BLO-40082: carry the two bounds forward, but neutralise one that is
+    // already spent. A board "Schedule" always sets `monitorExplicitlyUpdated`
     // server-side (routes/issues.ts), and on that path
     // `applyIssueExecutionPolicyTransition` *throws* 422 "Monitor bounds are
     // already exhausted" rather than stripping them
     // (services/issue-execution-policy.ts). The dialog renders no control for
     // either field, so re-sending a lapsed `timeoutAt` or a `maxAttempts` the
     // monitor has already reached would leave the board unable to reset exactly
-    // the wedged monitors it exists to reset — the "omit `maxAttempts` when
-    // resetting a wedged monitor" path the monitor contract documents, and the
-    // BLO-18294 convergence-stall reset that requires a non-assignee actor.
-    // `null` is how you omit here: the server replaces the monitor wholesale and
-    // `exhaustedMonitorClearReason` reads both through `?? null`.
-    const attemptCount = issue.monitorAttemptCount ?? issue.executionState?.monitor?.attemptCount ?? 0;
+    // the wedged monitors it exists to reset.
+    //
+    // PEN-3803: for `maxAttempts` the remedy used to be `null` — "omit it" —
+    // and that is no longer a remedy, because it never was one. Omitting only
+    // silenced the ARM: the scheduler applies `DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS`
+    // to every monitor at dispatch, so a board reset past the ceiling returned
+    // 200, rendered a live next-check, and was cleared without firing. The arm
+    // now refuses that, so the dialog has to say what it means: grant an
+    // explicit budget above the attempts already made. Two consequences worth
+    // keeping in view — the spent test must read the EFFECTIVE bound (a `null`
+    // `maxAttempts` still means 24, not "no limit"), and the grant is capped at
+    // the schema's `.max(100)`, so a row past that gets a loud 422 naming the
+    // remedy rather than a silent dead monitor.
+    //
+    // `timeoutAt` keeps the `null` treatment: nothing supplies a default for
+    // it, so omitting really does remove the bound.
+    const attemptCount = monitorAttemptCount;
     const timeoutAt = carried?.timeoutAt ?? null;
     const maxAttempts = carried?.maxAttempts ?? null;
     updateMonitor({
@@ -1059,7 +1112,9 @@ export function IssueProperties({
       ...(timeoutAt && new Date(timeoutAt).getTime() <= Date.now() - MONITOR_BOUND_SKEW_MARGIN_MS
         ? { timeoutAt: null }
         : {}),
-      ...(maxAttempts !== null && maxAttempts <= attemptCount ? { maxAttempts: null } : {}),
+      ...((maxAttempts ?? DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS) <= attemptCount
+        ? { maxAttempts: renewedIssueMonitorMaxAttempts(attemptCount) }
+        : {}),
     });
     setMonitorOpen(false);
   };
@@ -1271,6 +1326,21 @@ export function IssueProperties({
   ) : null;
   const monitorContent = (
     <div className="flex w-full flex-col gap-2">
+      {/*
+        PEN-3803 review follow-up: the server refuses this arm with a 422 the
+        popover cannot surface (`onUpdate` exposes no error here), so without
+        this the click is a silent no-op. State the refusal up front instead.
+        See `monitorRenewalUnavailable` for why the copy offers no remedy: at
+        this count there is none, and the 422's own advice cannot be followed.
+      */}
+      {monitorRenewalUnavailable ? (
+        <p className="text-xs text-muted-foreground">
+          This issue has made {monitorAttemptCount} monitor attempts. The count never resets and{" "}
+          <code>maxAttempts</code> is capped at {MAX_ISSUE_MONITOR_MAX_ATTEMPTS}, so no further
+          monitor can be armed on this issue — from here or through the API.
+          {monitorArmed ? " Clearing retires the current one, but does not make it armable again." : ""}
+        </p>
+      ) : null}
       <div className="flex flex-col gap-2 md:flex-row">
         <input
           type="datetime-local"
@@ -1298,8 +1368,13 @@ export function IssueProperties({
           <button
             type="button"
             className="inline-flex items-center rounded-full border border-border px-2 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-accent/50 hover:text-foreground disabled:opacity-50"
-            disabled={!monitorAtInput}
+            disabled={!monitorAtInput || monitorRenewalUnavailable}
             onClick={saveMonitor}
+            title={
+              monitorRenewalUnavailable
+                ? `This issue has made ${monitorAttemptCount} monitor attempts. The count never resets and maxAttempts is capped at ${MAX_ISSUE_MONITOR_MAX_ATTEMPTS}, so no further monitor can be armed on this issue.`
+                : undefined
+            }
           >
             Schedule
           </button>

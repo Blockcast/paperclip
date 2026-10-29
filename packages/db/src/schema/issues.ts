@@ -90,7 +90,19 @@ export const issues = pgTable(
     // writer resets it to NULL on every `parkedDisposition` write so a re-park re-arms.
     // Deliberately NOT one of the four all-or-nothing park columns above: those describe
     // the park, this records what the platform has already done about it, and it must
-    // survive being read on a row whose park has lapsed.
+    // survive the park LAPSING -- expiry does not clear it, which is what makes the
+    // fire-once claim hold across the window between the deadline and the re-park.
+    //
+    // ⚠️ PEN-4894: "survives a lapse" is the whole of it, and it was read as durability.
+    // It does NOT survive a RE-PARK: the reset above clears it, so this column is scoped
+    // to the park CURRENTLY on the row and is not a park-wake audit log -- do not
+    // aggregate it as one. Erasure is the common case, not an edge: a park wake that
+    // works dispatches a run that re-parks. Measured 2026-10-28 on a shared-instant
+    // cohort: 7 of 7 fired, 0 of 7 still recorded here 45 minutes later. A `NULL` here
+    // means only "no release wake is owed for this row's current park", never "this row's
+    // park never woke". Ask that question of `agent_wakeup_requests` instead -- see
+    // `runbooks/deliberate-park-release-edge.md`, which also covers the bounds of the
+    // endpoint that serves it.
     parkedWakeFiredAt: timestamp("parked_wake_fired_at", { withTimezone: true }),
     executionWorkspaceId: uuid("execution_workspace_id")
       .references((): AnyPgColumn => executionWorkspaces.id, { onDelete: "set null" }),
@@ -184,6 +196,19 @@ export const issues = pgTable(
     titleSearchIdx: index("issues_title_search_idx").using("gin", table.title.op("gin_trgm_ops")),
     identifierSearchIdx: index("issues_identifier_search_idx").using("gin", table.identifier.op("gin_trgm_ops")),
     descriptionSearchIdx: index("issues_description_search_idx").using("gin", table.description.op("gin_trgm_ops")),
+    // PEN-3596: company-scoped twins of the three single-column trigram indexes
+    // above. The issues-list search path always filters by company, and the
+    // un-scoped indexes make it pay for every other company's matches on the
+    // heap (2,700 index hits to keep 245 rows on a production-shaped seed).
+    // btree_gin lets company_id lead the GIN index so the index cond answers
+    // both halves. The single-column indexes stay: company-search also searches
+    // these columns with `ILIKE ANY(array)` forms these do not serve.
+    companyTitleSearchIdx: index("issues_company_title_search_idx")
+      .using("gin", table.companyId, table.title.op("gin_trgm_ops")),
+    companyIdentifierSearchIdx: index("issues_company_identifier_search_idx")
+      .using("gin", table.companyId, table.identifier.op("gin_trgm_ops")),
+    companyDescriptionSearchIdx: index("issues_company_description_search_idx")
+      .using("gin", table.companyId, table.description.op("gin_trgm_ops")),
     openRoutineExecutionIdx: uniqueIndex("issues_open_routine_execution_uq")
       .on(table.companyId, table.originKind, table.originId, table.originFingerprint)
       .where(

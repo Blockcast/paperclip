@@ -7,7 +7,9 @@ import {
   activityLog,
   agents,
   agentWakeupRequests,
+  budgetPolicies,
   companies,
+  costEvents,
   createDb,
   heartbeatRunEvents,
   heartbeatRuns,
@@ -57,6 +59,10 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
+    // Budget rows reference agents and companies, so they have to go first or
+    // the deletes below fail the FK check and strand the next test's fixture.
+    await db.delete(costEvents);
+    await db.delete(budgetPolicies);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -673,6 +679,35 @@ describeEmbeddedPostgres("issue scheduled retry routes", () => {
 
   it("suppresses retry-now when the issue is under a budget hard-stop", async () => {
     const { companyId, agentId, issueId, retryRunId } = await seedIssueWithRetry();
+    // The policy and the cost event are load-bearing, not scenery: since
+    // PEN-1972 the `pauseReason: "budget"` flag alone no longer suppresses work,
+    // because a flag whose window has rolled is cleared on the next check rather
+    // than latched forever. A real hard stop needs spend over cap in the window.
+    await db.insert(budgetPolicies).values({
+      companyId,
+      scopeType: "agent",
+      scopeId: agentId,
+      metric: "billed_cents",
+      windowKind: "calendar_month_utc",
+      amount: 100,
+      warnPercent: 80,
+      hardStopEnabled: true,
+      notifyEnabled: true,
+      isActive: true,
+    });
+    await db.insert(costEvents).values({
+      companyId,
+      agentId,
+      provider: "openai",
+      biller: "openai",
+      billingType: "metered_api",
+      model: "gpt-5-scheduled-retry-routes",
+      inputTokens: 100,
+      cachedInputTokens: 0,
+      outputTokens: 20,
+      costCents: 250,
+      occurredAt: new Date(),
+    });
     await db
       .update(agents)
       .set({ status: "paused", pauseReason: "budget" })

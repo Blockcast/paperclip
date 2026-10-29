@@ -61,10 +61,7 @@ export function parseApprovalGate(payload: unknown): ApprovalGate | null {
 }
 
 const approvalPayloadSchema = z.object({
-  title: z.string({
-    required_error: approvalTitleMessage,
-    invalid_type_error: approvalTitleMessage,
-  }).refine((title) => title.trim().length > 0, approvalTitleMessage),
+  title: z.string({ error: approvalTitleMessage }).refine((title) => title.trim().length > 0, approvalTitleMessage),
   gate: approvalGateSchema.optional(),
 }).catchall(z.unknown()).describe(
   // This ships in every agent's tool list on every run, so it carries the rule,
@@ -98,9 +95,9 @@ const approvalPayloadSchema = z.object({
 
 export const createApprovalSchema = z.object({
   type: z.enum(APPROVAL_TYPES),
-  requestedByAgentId: z.string().uuid().optional().nullable(),
+  requestedByAgentId: z.string().guid().optional().nullable(),
   payload: approvalPayloadSchema,
-  issueIds: z.array(z.string().uuid()).max(APPROVAL_LINKED_ISSUE_IDS_MAX).optional(),
+  issueIds: z.array(z.string().guid()).max(APPROVAL_LINKED_ISSUE_IDS_MAX).optional(),
   idempotencyKey: z
     .string()
     .trim()
@@ -122,10 +119,10 @@ export type CreateApproval = z.infer<typeof createApprovalSchema>;
 export const listApprovalsQuerySchema = z.object({
   status: z.enum(APPROVAL_STATUSES).optional(),
   type: z.enum(APPROVAL_TYPES).optional(),
-  issueId: z.string().uuid().optional(),
-  requestedByAgentId: z.string().uuid().optional(),
+  issueId: z.string().guid().optional(),
+  requestedByAgentId: z.string().guid().optional(),
   idempotencyKey: z.string().trim().min(1).max(255).optional(),
-  view: z.enum(["full", "summary", "count"]).optional().default("full"),
+  view: z.enum(["full", "summary", "count"]).prefault("full"),
 });
 
 export type ListApprovalsQuery = z.infer<typeof listApprovalsQuerySchema>;

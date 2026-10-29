@@ -6,6 +6,10 @@ import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { AdapterRuntimeServiceReport } from "@paperclipai/adapter-utils";
+import {
+  gitGlobalOptions,
+  isKnownPublishingGitVerb,
+} from "@paperclipai/adapter-utils/github-git-egress-shim";
 import type { Db } from "@paperclipai/db";
 import { executionWorkspaces, issueComments, issues, projectWorkspaces, workspaceRuntimeServices } from "@paperclipai/db";
 import {
@@ -22,6 +26,7 @@ import {
 import { and, desc, eq, inArray, isNull, ne, notInArray } from "drizzle-orm";
 import { asNumber, asString, parseObject, renderTemplate } from "../adapters/utils.js";
 import { resolveHomeAwarePath, resolveManagedProjectWorkspaceDir } from "../home-paths.js";
+import { logger } from "../middleware/logger.js";
 import { REPO_MANAGED_WORKTREES_SUBPATH } from "../worktree-config.js";
 import { formatGitProbeRefusal } from "./workspace-reuse-refusal-class.js";
 import { compareProjectCheckoutOrigin, normalizeRepoIdentity } from "./project-checkout-origin.js";
@@ -1090,6 +1095,60 @@ const SERVER_GIT_CREDENTIAL_HELPER_PATH =
 const SERVER_GIT_REAL_BINARY_PATH = "/usr/bin/git";
 
 /**
+ * Refuse to build an invocation that publishes, so the pin above cannot become
+ * an unguarded egress path (PEN-4979).
+ *
+ * The pin's whole justification is that server code does not publish. Every
+ * caller funnels through {@link resolveServerGitInvocation}, so this is the one
+ * chokepoint where that can be enforced rather than asserted, and it covers the
+ * two generic pass-throughs (`runGit`, `recordGitOperation`) a future call site
+ * would most likely arrive through.
+ *
+ * **Classification is reused, not re-derived.** `isKnownPublishingGitVerb` is
+ * the egress shim's own set. A second notion of "publishing" living in server
+ * code is exactly the divergence `github-egress-door-parity.test.ts` exists to
+ * prevent: both doors keep passing their own tests while one quietly stops
+ * covering a verb.
+ *
+ * **This door is deliberately weaker than the agent door, and that asymmetry is
+ * not an oversight.** The agent wrapper decides with the ALLOWLIST
+ * (`isNonPublishingGitVerb`), refusing anything unrecognised. This one uses the
+ * DENYLIST. It has to: `submodule` is deliberately absent from the allowlist —
+ * `foreach` and `update` run configured commands with git's exec-path ahead of
+ * PATH — and `submodule sync` / `submodule update --init` is precisely the
+ * repair this pin was created to perform (BLO-41987). Deciding here with the
+ * allowlist would refuse the one operation the pin exists for. So the honest
+ * statement of what this buys is narrow: a verb the shim KNOWS publishes is
+ * refused; an unrecognised verb still passes. Do not restate it as "server git
+ * cannot publish".
+ *
+ * Scope, equally narrow: this guards a first-party call site in this module
+ * written against this function. It is not an argv sanitiser for untrusted
+ * input, and it resolves no aliases — `recordGitOperation`'s `args` are built
+ * in-module and never from request data, so there is no caller for whom that
+ * would be the relevant threat. Were one ever added, the right tool is the
+ * shim's `classifyGitInvocation`, not a wider list here.
+ *
+ * The verb is located with the shim's `gitGlobalOptions` rather than read off
+ * `args[0]`, so `["-c", "x=y", "push"]` is caught too. Over-skipping is safe
+ * for the same reason it is safe in the shim (see `VALUE_TAKING_GLOBAL_OPTIONS`):
+ * an over-skipped invocation publishes nothing, and under-skipping is the only
+ * direction that opens a hole.
+ */
+function assertServerGitDoesNotPublish(args: readonly string[]): void {
+  const verb = args[gitGlobalOptions(args).length];
+  if (verb === undefined || !isKnownPublishingGitVerb(verb)) return;
+  throw new Error(
+    `resolveServerGitInvocation: refusing to build \`git ${verb}\` — this helper pins ` +
+      `${SERVER_GIT_REAL_BINARY_PATH} past the agent egress wrapper and the pre-push hook, and its ` +
+      `safety rests on server code not publishing (BLO-42838, PEN-4979). The system credential ` +
+      `helper would authenticate such a push unprompted, so it would be both unguarded and ` +
+      `unscanned. If the server must publish, route it through the reviewed publish path rather ` +
+      `than widening this one.`,
+  );
+}
+
+/**
  * Resolve the git the *server* runs, pinned past the agent egress wrapper
  * (BLO-42838).
  *
@@ -1109,8 +1168,17 @@ const SERVER_GIT_REAL_BINARY_PATH = "/usr/bin/git";
  * `submodule.<name>.update = !<cmd>`, both with git's exec-path ahead of PATH,
  * so a `push` inside either reaches the real binary and neither this wrapper
  * nor the pre-push hook. The guard's subject is the *agent*; this module is
- * server code that never publishes (it runs no `push`), so pinning the real
- * binary here removes nothing the guard is there to enforce.
+ * server code that does not publish, so pinning the real binary here removes
+ * nothing the guard is there to enforce.
+ *
+ * That last clause used to be asserted here in prose — "it runs no `push`" —
+ * and was true only by convention, because two of the three call sites are
+ * generic pass-throughs (`runGit`, `recordGitOperation`). A future caller
+ * passing `push` would have got an unguarded, unscanned publish path with
+ * nothing failing, and `/etc/gitconfig`'s system credential helper would have
+ * authenticated it unprompted (PEN-3183 §4). {@link
+ * assertServerGitDoesNotPublish} now enforces it instead, so the comment and
+ * the code agree and deleting the check fails CI (PEN-4979).
  *
  * The two `-c credential...` arguments are carried over verbatim from the
  * wrapper, and are load-bearing rather than cosmetic: the server does fetch
@@ -1145,6 +1213,9 @@ export function resolveServerGitInvocation(
   args: readonly string[],
   paths: { gitBinary?: string; credentialHelper?: string } = {},
 ): { command: string; args: string[] } {
+  // First, so the PAPERCLIP_SERVER_GIT test seam below is covered as well: the
+  // invariant is about what this module asks git to do, not which binary runs it.
+  assertServerGitDoesNotPublish(args);
   const gitBinary = paths.gitBinary ?? SERVER_GIT_REAL_BINARY_PATH;
   const credentialHelper = paths.credentialHelper ?? SERVER_GIT_CREDENTIAL_HELPER_PATH;
   const override = process.env.PAPERCLIP_SERVER_GIT?.trim();
@@ -1181,7 +1252,7 @@ export function resolveServerGitInvocation(
  * deterministic failure (e.g. "not a git repository"). The message is unchanged
  * from the historical string so existing `gitErrorIncludes` matching still works.
  */
-class GitCommandTimeoutError extends Error {
+export class GitCommandTimeoutError extends Error {
   /**
    * Whatever the command had already written to stdout before it was killed,
    * raw and untrimmed.
@@ -1212,6 +1283,33 @@ class GitCommandTimeoutError extends Error {
     this.stdout = partial?.stdout ?? "";
     this.stdoutEndsWithNewline = this.stdout.endsWith("\n");
     this.processGroupAliveAfterTimeout = partial?.processGroupAliveAfterTimeout ?? false;
+  }
+}
+
+/**
+ * Raised when a git subprocess ran to completion and exited non-zero.
+ *
+ * This is the one `runGit` failure that is *evidence about the repository*: git
+ * was asked, and it answered. `isInconclusiveGitFailure` keys on this class to
+ * say so **positively**.
+ *
+ * That positive marker is the whole point of the class (PEN-4900). The
+ * classification used to rest on this throw being a bare `Error` carrying no
+ * `code` -- an invariant held 2,800 lines away from the predicate that depended
+ * on it, and silently breakable from here. Attaching a `code: "ERR_GIT_EXIT"`
+ * for diagnostics reads as purely additive at this call site; what it would
+ * actually have done is match the predicate's `ERR_` arm, reclassify *every*
+ * real verdict as inconclusive, and so disable the `fs.rm(dotGit)` cleanup in
+ * `relinkHuskGitWorktree` -- with nothing louder than a `warn` to show for it.
+ * Carrying the verdict in the type makes decorating this error additive again.
+ *
+ * The message is unchanged from the historical string so existing
+ * `gitErrorIncludes` matching still works.
+ */
+export class GitCommandFailedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "GitCommandFailedError";
   }
 }
 
@@ -1268,7 +1366,17 @@ async function runGit(
     });
   }
   if (proc.code !== 0) {
-    throw new Error(proc.stderr.trim() || proc.stdout.trim() || `git ${args.join(" ")} failed`);
+    // git ran and answered: this is a VERDICT about the checkout, and the class
+    // is what says so. `isInconclusiveGitFailure` keys on it (see its docblock),
+    // so any field added here for diagnostics -- including a `code` -- stays
+    // purely additive.
+    //
+    // ⛔ Do NOT downgrade this back to a bare `new Error(...)`. The predicate
+    // would fall through to its deliberately broad `ERR_` arm, so a `code` such
+    // as `"ERR_GIT_EXIT"` would reclassify every real verdict as inconclusive,
+    // `relinkHuskGitWorktree` would stop running its `fs.rm(dotGit)` cleanup,
+    // and the only trace would be a `warn` (PEN-4900).
+    throw new GitCommandFailedError(proc.stderr.trim() || proc.stdout.trim() || `git ${args.join(" ")} failed`);
   }
   return proc.stdout.trim();
 }
@@ -2802,6 +2910,18 @@ export async function ensureGitWorktreeBranchCoherent(input: {
   const worktreeTopLevel = await runGit(["rev-parse", "--show-toplevel"], input.worktreePath).catch(() => null);
   const resolvedWorktreePath = await resolvePathForWorktreeComparison(input.worktreePath);
   if (worktreeTopLevel && path.resolve(worktreeTopLevel) !== resolvedWorktreePath) {
+    // BLO-49622: a husk whose registration survives is re-linked and re-checked
+    // rather than failing every wake until someone unbinds the workspace.
+    if (await relinkHuskGitWorktree(input.repoRoot, input.worktreePath)) {
+      const relinked = await ensureGitWorktreeBranchCoherent(input);
+      return {
+        ...relinked,
+        warnings: [
+          `Execution workspace git worktree at "${input.worktreePath}" had lost its .git link; it was re-linked to its surviving registration.`,
+          ...relinked.warnings,
+        ],
+      };
+    }
     throw new WorkspaceRuntimeValidationFailure(
       `Execution workspace git worktree at "${input.worktreePath}" resolves to repository root "${worktreeTopLevel}" (its .git link is missing), so branch repair was refused and no git writes were made.`,
       {
@@ -4037,6 +4157,236 @@ async function hasLinkedGitWorktreeRegistration(repoRoot: string, worktreePath: 
     (error as { code?: unknown } | null)?.code === "ETIMEDOUT" ? null : false);
 }
 
+/**
+ * Did `runGit` fail *without reaching a verdict* about the repository?
+ *
+ * `runGit` throws on four distinct conditions and only one of them is evidence
+ * about the checkout:
+ *
+ * - `GitCommandTimeoutError` -- the budget expired while git was still running.
+ * - an **asynchronous spawn failure** -- node tried to start git and the OS
+ *   refused (ENOENT, EAGAIN or EMFILE under threadpool/fd pressure).
+ *   `executeProcess` surfaces these by rejecting with the child's `error`
+ *   event, so they arrive as system errors carrying `syscall`; the
+ *   non-zero-exit `Error` built from stderr never has one, which is what makes
+ *   this a sound discriminator rather than a guess.
+ * - a **synchronous spawn failure** -- node rejected the arguments before any
+ *   process existed, so `spawn()` threw out of `executeProcess`'s Promise
+ *   executor instead of emitting `error`. These are node's own validation
+ *   errors (`ERR_INVALID_ARG_TYPE` from a non-string command or a malformed
+ *   options object, `ERR_INVALID_ARG_VALUE` from a bad `stdio`), and they
+ *   carry **no `syscall`** -- measured on node 24: `TypeError`/`RangeError`
+ *   with an `ERR_`-prefixed `code` and `syscall === undefined`.
+ *
+ *   Matching them on that prefix is sound only because the shape that IS a
+ *   verdict is recognised **first and positively**, by its class
+ *   (`GitCommandFailedError`). It does not rest on that error happening to
+ *   carry no `code` -- an invariant that lived at the `runGit` throw 2,800
+ *   lines away and that a `code` added there for diagnostics would have broken
+ *   silently, turning every real verdict inconclusive (PEN-4900).
+ *
+ *   That prefix test is deliberately BROADER than synchronous spawn
+ *   validation: it also catches any node-internal `ERR_*` rejection raised
+ *   after the child already exists -- a stream error on stdio, say. Do not
+ *   narrow it back to the spawn shapes. Breadth here is free because this
+ *   predicate is one-way: a false positive only moves an error from *verdict*
+ *   to *inconclusive*, and the worst an inconclusive outcome can do is skip a
+ *   cleanup. It can never reach the `fs.rm`. A false NEGATIVE is the one that
+ *   deletes a good `.git`, so when a shape is ambiguous, classify it here.
+ * - a **non-zero exit** -- git ran and answered. That one IS a verdict, and
+ *   arrives as `GitCommandFailedError`.
+ *
+ * The synchronous arm is unreachable from today's only call site, which builds
+ * its arguments through `resolveServerGitInvocation`, but it is classified
+ * rather than documented-around because reading it backwards fails in the
+ * destructive direction: `relinkHuskGitWorktree` would `fs.rm` a `.git` it had
+ * just written correctly, which is the exact path PEN-4877 exists to close
+ * (PEN-4878).
+ *
+ * Callers must not act destructively on an inconclusive failure. Same
+ * distinction BLO-18784/BLO-47493/BLO-42089 draw elsewhere in this file: a
+ * stall is not a finding.
+ */
+function isInconclusiveGitFailure(error: unknown): boolean {
+  // Positive, and first: a non-zero exit is git's answer however the error is
+  // decorated, so no arm below can reclassify a verdict (PEN-4900).
+  if (error instanceof GitCommandFailedError) return false;
+  if (error instanceof GitCommandTimeoutError) return true;
+  const candidate = error as NodeJS.ErrnoException | null;
+  if (typeof candidate?.syscall === "string") return true;
+  return typeof candidate?.code === "string" && candidate.code.startsWith("ERR_");
+}
+
+/**
+ * Create `worktreePath/.git` exclusively *and atomically in content*.
+ *
+ * `fs.writeFile(..., { flag: "wx" })` is `open(O_CREAT|O_EXCL)` followed by a
+ * **separate** `write()`, with an await and a threadpool round-trip between
+ * them. A concurrent run gets `EEXIST` the moment the *name* appears, which can
+ * be before the `gitdir:` line is in it -- so the loser reads an empty `.git`
+ * and reports a perfectly healthy worktree unrepairable (PEN-4877; measured at
+ * 0.075% of contended pairs, and the rate rises with threadpool pressure, i.e.
+ * exactly under CI load).
+ *
+ * Staging the full content first and then `link()`ing it into place keeps the
+ * exclusive-create semantics -- `link` fails `EEXIST` if the target exists, so
+ * the winner/loser determination is unchanged -- while making the name atomic
+ * in content: `.git` is never observable without its `gitdir:` line.
+ *
+ * The staged file lives in the admin dir, not the worktree, so a hard kill
+ * between `link` and the cleanup cannot leave untracked noise inside a
+ * checkout. A mount that refuses hard links (or spans devices, `EXDEV`) is
+ * reported as `"unsupported"` so the caller degrades to the previous `wx`
+ * write rather than to a refusal.
+ */
+async function createGitLinkExclusively(
+  dotGit: string,
+  stagingDir: string,
+  content: string,
+): Promise<"created" | "exists" | "unsupported"> {
+  const staged = path.join(stagingDir, `.relink-${randomUUID()}.tmp`);
+  try {
+    await fs.writeFile(staged, content);
+  } catch {
+    return "unsupported";
+  }
+  try {
+    await fs.link(staged, dotGit);
+    return "created";
+  } catch (error) {
+    // Only EEXIST means "another run won the race". Everything else is this
+    // mount declining hard links, which must not read as a concurrent winner.
+    return (error as NodeJS.ErrnoException | null)?.code === "EEXIST" ? "exists" : "unsupported";
+  } finally {
+    await fs.rm(staged, { force: true }).catch(() => {});
+  }
+}
+
+/**
+ * Test seams for the two PEN-4877 primitives.
+ *
+ * Both are deliberately internal to the re-link path, and both failure modes
+ * they exist to fix are invisible from `relinkHuskGitWorktree`'s boolean
+ * result alone: the atomicity window is sub-millisecond and the
+ * verdict-vs-no-verdict split only shows up as *whether `.git` survives*. The
+ * exclusive-create contract and the error discriminator are therefore asserted
+ * directly, same rationale as `executeProcessForTests`.
+ */
+export const createGitLinkExclusivelyForTests = createGitLinkExclusively;
+export const isInconclusiveGitFailureForTests = isInconclusiveGitFailure;
+
+/**
+ * Test seam for `runGit` itself (PEN-4900).
+ *
+ * `isInconclusiveGitFailureForTests` can only assert how a *given* error is
+ * classified; it cannot assert that the production throw still has the shape
+ * the classification keys on. Those two halves compose into the real guarantee
+ * -- "a genuine non-zero exit is still a verdict, whatever it carries" -- only
+ * if both are pinned, so the throw site is reachable from a test too.
+ */
+export const runGitForTests = runGit;
+
+/**
+ * BLO-49622: re-link a husk worktree — a dir whose `.git` link file is gone
+ * while its registration under `<repoRoot>/.git/worktrees/<id>` survives. The
+ * registration's `gitdir` names this exact `.git`, so writing the link back is
+ * the whole repair: the index, HEAD and lock all live in the admin dir and the
+ * files on disk are untouched. Only acts when `.git` is absent (never replaces
+ * a file that exists) and keeps the link only if git then resolves the path as
+ * its own top level. Returns whether the worktree is now linked.
+ */
+export async function relinkHuskGitWorktree(repoRoot: string, worktreePath: string): Promise<boolean> {
+  const dotGit = path.join(worktreePath, ".git");
+  if (await fs.lstat(dotGit).then(() => true, () => false)) return false;
+  const adminRoot = path.join(repoRoot, ".git", "worktrees");
+  const wanted = await resolvePathForWorktreeComparison(dotGit);
+  // git names the admin dir after the worktree's basename in the common case,
+  // so probe that first. The scan is bounded like every other reclaim fs walk:
+  // a wedged CephFS getattr degrades to the BLO-47493 refusal, not a hung wake.
+  const findAdminDir = async () => {
+    const base = path.basename(worktreePath);
+    const ids = await fs.readdir(adminRoot).catch(() => [] as string[]);
+    for (const id of [base, ...ids.filter((id) => id !== base)]) {
+      const adminDir = path.join(adminRoot, id);
+      const backRef = await fs.readFile(path.join(adminDir, "gitdir"), "utf8").catch(() => null);
+      if (!backRef || await resolvePathForWorktreeComparison(path.resolve(adminDir, backRef.trim())) !== wanted) continue;
+      return await fs.stat(path.join(adminDir, "HEAD")).then(() => adminDir, () => null);
+    }
+    return null;
+  };
+  const adminDir = await withReclaimFsDeadline(findAdminDir(), adminRoot).catch(() => null);
+  if (!adminDir) return false;
+  /**
+   * Tri-state on purpose (PEN-4877):
+   * - `true`  -- git resolved this path as its own top level.
+   * - `false` -- git ran and said otherwise. A real verdict about the worktree.
+   * - `null`  -- git could not be asked (stall or spawn failure). NOT a verdict.
+   *
+   * The old catch-all `.catch(() => null)` collapsed the last two, so a
+   * transient blip read identically to "this worktree does not resolve" -- and
+   * the caller then deleted a `.git` it had just written correctly.
+   */
+  const resolvesToSelf = async (): Promise<boolean | null> => {
+    let topLevel: string;
+    try {
+      topLevel = await runGit(["rev-parse", "--show-toplevel"], worktreePath);
+    } catch (error) {
+      if (!isInconclusiveGitFailure(error)) return false;
+      // Logged at the point the inconclusive outcome is produced, because it is
+      // the only point that still holds *why* (a stall, an ENOENT or EACCES on
+      // PAPERCLIP_SERVER_GIT, an EMFILE under load). Both callers below collapse
+      // it into `false`, which is outwardly identical to "this husk is not
+      // repairable" -- so without this line a persistently broken git binary is
+      // a silent repeating refusal, indistinguishable in the logs from a husk
+      // that genuinely cannot be repaired (PEN-4878).
+      logger.warn(
+        { err: error, worktreePath, repoRoot },
+        "relinkHuskGitWorktree: could not ask git whether the worktree resolves to itself; "
+          + "treating as inconclusive (not a verdict) and leaving any .git link in place",
+      );
+      return null;
+    }
+    return !!topLevel
+      && await resolvePathForWorktreeComparison(topLevel) === await resolvePathForWorktreeComparison(worktreePath);
+  };
+  const content = `gitdir: ${adminDir}\n`;
+  let created = await createGitLinkExclusively(dotGit, adminDir, content);
+  if (created === "unsupported") {
+    // This mount refuses hard links. Degrade to the previous behaviour rather
+    // than to a refusal: no worse than before, and still exclusive by name.
+    created = await fs.writeFile(dotGit, content, { flag: "wx" }).then(
+      () => "created" as const,
+      () => "exists" as const,
+    );
+  }
+  if (created === "exists") {
+    // A concurrent run re-linked it first: healthy, not a refusal. An
+    // inconclusive probe is reported as not-yet-linked, which is a refusal this
+    // call does not act on -- never a reason to touch the winner's link.
+    return (await resolvesToSelf()) === true;
+  }
+  const verdict = await resolvesToSelf();
+  if (verdict === true) return true;
+  // Only a verdict earns the removal. Deleting the link on an inconclusive
+  // probe would re-husk a worktree we just repaired, turning a transient git
+  // failure into persistent damage -- strictly worse than refusing this wake.
+  //
+  // The kept link is therefore deliberately UNVERIFIED, and verifying it is not
+  // this function's job: the early `lstat` return above means the next wake
+  // returns early WITHOUT re-probing, and that early return is `false` -- "not
+  // linked by this call", not "linked and healthy". Nothing in the return value
+  // distinguishes a kept-but-unverified link from a refusal, which is exactly
+  // why the inconclusive branch warns instead of staying silent. The link is
+  // re-examined by the next health check that runs git against the worktree for
+  // its own reasons (`inspectManagedGitWorktreeBranch` and the reuse probes),
+  // not here. That is sound because the content is not a guess -- it is the
+  // `gitdir` the admin dir's own back-ref already resolved to this exact path --
+  // so keeping it beats deleting it on no evidence (PEN-4878).
+  if (verdict === null) return false;
+  await fs.rm(dotGit, { force: true });
+  return false;
+}
+
 export async function inspectManagedGitWorktreeBranch(input: {
   worktreePath: string;
   expectedBranchName: string | null | undefined;
@@ -4847,11 +5197,17 @@ export async function realizeExecutionWorkspace(input: {
   }
 
   async function validateReusableWorktree(reusablePath: string) {
-    const validation = await validateLinkedGitWorktree({
+    const validate = () => validateLinkedGitWorktree({
       repoRoot,
       worktreePath: reusablePath,
       expectedBranchName: branchName,
     }).catch(() => null);
+    let validation = await validate();
+    // BLO-49622: re-link a husk whose registration survives, then re-validate.
+    if (validation && !validation.valid && validation.reasonCode === "wrong_repository_root"
+      && await relinkHuskGitWorktree(repoRoot, reusablePath)) {
+      validation = await validate();
+    }
     if (validation && !validation.valid && validation.reasonCode === "branch_mismatch") {
       const coherence = await ensureGitWorktreeBranchCoherent({
         db: input.db ?? null,

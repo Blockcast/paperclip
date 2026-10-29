@@ -137,6 +137,24 @@ export const SHARED_CHECKOUT_WARNING_RUN_SAMPLE = 4;
  * Absent isolation (non-K8s adapters) means no relocation, so we still warn:
  * forgetting to pass it costs noise, never a missed real collision. The same
  * holds for a missing or malformed `agentId`: unprovable means warn.
+ *
+ * ⚠️ PEN-4764 — THE EXEMPTION IS ABOUT THE DIRECTORY, AND ONLY THE DIRECTORY.
+ * An exempted run is genuinely alone in its per-run ephemeral workspace, so
+ * suppressing the shared-TREE warning for it is right and should stay. But such
+ * a run still `git clone`s a repo and pushes a REMOTE BRANCH, and filesystem
+ * isolation says nothing whatever about that: two exempted runs of one agent
+ * can target the same branch of the same repo with no shared directory between
+ * them at any point. Nothing in this module measures that, and nothing else
+ * catches it either — `branch-run-claims.ts` never arms for these runs, because
+ * it keys on an execution-workspace branch name and an exempted run has no
+ * execution workspace (see the PEN-4764 block in that file). The remote branch
+ * is therefore the one contended resource with NO guard on this path.
+ *
+ * Measured 2026-10-25: two runs of one seat, on two different issues
+ * (PEN-4555 and PEN-4707), both exempt here, raced a push to one ordinary
+ * feature branch of `Blockcast/magma`; the loser learned of it only when the
+ * remote rejected its push as behind. Do not read this exemption as "these
+ * runs cannot collide".
  */
 export function runLandsInSharedCheckout(input: {
   strategyType: string;

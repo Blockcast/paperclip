@@ -33,6 +33,7 @@ import {
   githubFetchPrAuthorLogin,
   githubFetchPrHeadSha,
   githubListIssueCommentsWithTimestamps,
+  githubListOpenPullRequestsForHeadSha,
   githubListPrReviewsWithTimestamps,
   githubPostCheckRun,
   githubPostCommitStatusDetailed,
@@ -1870,6 +1871,18 @@ async function withBoundedRetry<T>(attempt: () => Promise<T>, shouldRetry: (resu
 // authoritative. Serialize evaluations for the same PR/context and fetch
 // fresh state inside each turn, so a delayed older snapshot cannot overwrite a
 // verdict computed by a newer webhook delivery.
+//
+// ⚠ This is the IN-PROCESS chain and it is keyed per PULL REQUEST, which is a
+// different key from the cross-process lock `executeCommentReviewGateCheck`
+// takes (`repo#headSha`). Both statements are accurate about their own lock,
+// and reading them as one claim is a documented trap: PEN-3818 took the `db`
+// handle's "serializing evaluations of one head" for a contradiction of this
+// line and filed the missing `headSha` HERE as the root cause of a merge-gate
+// bypass. It is not. The SHA lock already orders every evaluation of a head,
+// across pull requests; this key cannot be SHA-scoped anyway, since the head is
+// not resolved until inside the executor. What the bypass actually needed was
+// for the VERDICT to be SHA-scoped rather than PR-scoped — see the sweep in
+// `publish`, which is where that fix lives.
 const gateEvaluationChains = new Map<string, Promise<unknown>>();
 
 function serializeGateEvaluation<T>(key: string, run: () => Promise<T>): Promise<T> {
@@ -1915,6 +1928,35 @@ export async function runPrCommentReviewGateCheck(
   return serializeGateEvaluation(key, () => executeCommentReviewGateCheck(input, context, config));
 }
 
+/**
+ * One warning per repo when the SHA-scoped peer enumeration cannot be read.
+ *
+ * Separate set from the check-run writers' for the reason theirs are separate
+ * from each other: the failures are independent and each names a different
+ * consequence. This one is the only warning in this module that fires on a
+ * path where NOTHING was published — a silent "still evaluating" is otherwise
+ * indistinguishable from a healthy quiet head, and the most likely cause is a
+ * missing grant rather than a transient, so it needs to be diagnosable.
+ */
+const peerEnumerationWarnings = new Set<string>();
+
+function warnOnceOnPeerEnumerationFailure(
+  repoFullName: string,
+  headSha: string,
+  reason: string,
+  context: string,
+): void {
+  if (peerEnumerationWarnings.has(repoFullName)) return;
+  peerEnumerationWarnings.add(repoFullName);
+  console.warn(
+    `[pr-comment-review-gate] Could not enumerate the open pull requests at ` +
+      `${repoFullName}@${headSha.slice(0, 7)}: ${reason}. Withholding a "${context}" green rather ` +
+      "than publishing one that cannot be shown to hold for every PR at this head (PEN-3818); the " +
+      "next webhook for this head re-evaluates. A 403 here means the installation is missing " +
+      "`pull_requests: read`.",
+  );
+}
+
 const misreadableContextWarnings = new Set<string>();
 
 function warnOnceIfMisreadableContext(verdict: CommentReviewGateVerdict, context: string): void {
@@ -1942,28 +1984,36 @@ async function executeCommentReviewGateCheck(
     ));
   if (!headSha) return { posted: false, reason: "fetch_failed" };
 
-  const publish = async (): Promise<PrCommentReviewGateCheckResult> => {
-    // Both surfaces, because Ally uses whichever is available to it: a
-    // `COMMENTED` pull_request_review on `/pulls/{n}/reviews`, or a plain issue
-    // comment. Read and evaluate them inside the shared lock. Otherwise two
-    // API pods can compute against different snapshots and publish an older
-    // verdict after a newer one (BLO-29711).
+  // Both surfaces, because Ally uses whichever is available to it: a
+  // `COMMENTED` pull_request_review on `/pulls/{n}/reviews`, or a plain issue
+  // comment. Called inside the shared lock. Otherwise two API pods can compute
+  // against different snapshots and publish an older verdict after a newer one
+  // (BLO-29711).
+  //
+  // Takes a PR number rather than closing over `input.prNumber`, because the
+  // SHA-scoped sweep below reads the review history of the OTHER pull requests
+  // at this head too (PEN-3818).
+  //
+  // `null` is "unreadable", never "no comments". Every caller must leave the
+  // prior status untouched on `null` rather than publish a verdict computed
+  // from partial history.
+  const loadComments = async (prNumber: number): Promise<CommentReviewGateComment[] | null> => {
     const [issueComments, prReviews] = await Promise.all([
       withBoundedRetry(
-        () => githubListIssueCommentsWithTimestamps({ repoFullName: input.repoFullName, prNumber: input.prNumber }),
+        () => githubListIssueCommentsWithTimestamps({ repoFullName: input.repoFullName, prNumber }),
         (result) => result == null,
       ),
       withBoundedRetry(
-        () => githubListPrReviewsWithTimestamps({ repoFullName: input.repoFullName, prNumber: input.prNumber }),
+        () => githubListPrReviewsWithTimestamps({ repoFullName: input.repoFullName, prNumber }),
         (result) => result == null,
       ),
     ]);
-    if (issueComments == null || prReviews == null) return { posted: false, reason: "fetch_failed" };
+    if (issueComments == null || prReviews == null) return null;
 
     // Tagged at the only place that knows, which is here: downstream both
     // arrays are the same shape and the distinction is unrecoverable once they
     // are concatenated (PEN-4431). Tag before the concat, never after.
-    const comments: CommentReviewGateComment[] = [
+    return [
       ...issueComments.map((comment) => ({
         authorLogin: comment.login,
         body: comment.body,
@@ -1977,6 +2027,28 @@ async function executeCommentReviewGateCheck(
         surface: "pull_request_review" as const,
       })),
     ];
+  };
+
+  // The git author email on THIS commit, memoized. It is a property of the
+  // head, not of the pull request, so every PR at this SHA shares one answer
+  // and one fetch — which is what keeps the sweep below from re-reading it per
+  // peer. `null` means unknown, and unknown CREDITS a retirement, matching the
+  // contract `githubFetchCommitAuthorEmail` documents.
+  let authorLaneResolved = false;
+  let authorLaneValue: string | null = null;
+  const resolveAuthorLane = async (): Promise<string | null> => {
+    if (authorLaneResolved) return authorLaneValue;
+    authorLaneResolved = true;
+    authorLaneValue = await withBoundedRetry(
+      () => githubFetchCommitAuthorEmail({ repoFullName: input.repoFullName, sha: headSha }),
+      (email) => email == null,
+    );
+    return authorLaneValue;
+  };
+
+  const publish = async (): Promise<PrCommentReviewGateCheckResult> => {
+    const comments = await loadComments(input.prNumber);
+    if (comments == null) return { posted: false, reason: "fetch_failed" };
 
     // Evaluate author-blind FIRST. Only `clean` reads the author, and both red
     // outcomes stand on the comment surfaces alone — so fetching the author up
@@ -2042,10 +2114,7 @@ async function executeCommentReviewGateCheck(
     // description this gate publishes may imply otherwise.
     let prAuthorLane: string | null = null;
     if (comments.some((comment) => allyVerdictReviewerLane(comment.body) !== null)) {
-      prAuthorLane = await withBoundedRetry(
-        () => githubFetchCommitAuthorEmail({ repoFullName: input.repoFullName, sha: headSha }),
-        (email) => email == null,
-      );
+      prAuthorLane = await resolveAuthorLane();
       if (prAuthorLane) {
         verdict = evaluateCommentReviewGate({
           comments,
@@ -2093,7 +2162,163 @@ async function executeCommentReviewGateCheck(
       // silent there is the direction this module must not get wrong.
     }
 
+    // ── The verdict is a property of the SHA, not of this pull request ──
+    //
+    // Everything above computed `verdict` from ONE pull request's review
+    // history. Every artifact below publishes it at `headSha`, which GitHub
+    // shares with every other pull request whose head is this commit. Those two
+    // scopes were never reconciled, and the gap is directly exploitable
+    // (PEN-3818): open any pull request at a victim PR's head SHA and it
+    // evaluates on its own empty review history, legitimately reaches the
+    // fail-open "no Ally consolidated-review comment attests to reviewing this
+    // head", and publishes `success` over the victim's red findings gate.
+    // Reproduced against production on 2026-10-05 with one `gh pr create` —
+    // no force-push, no review, no elevated permission, no interaction with the
+    // victim at all. It does not self-heal: closing the probe PR and deleting
+    // its branch left the false green standing, pointing at a closed PR.
+    //
+    // ⚠ This is NOT the serialization fix that row proposed first, and that one
+    // would not have closed it. Evaluations of one head are ALREADY serialized
+    // cross-process by `withGithubStatusDeliveryLock`, keyed `repo#headSha`
+    // below. (The row read the `db` handle's comment — "serializing evaluations
+    // of one head" — against `gateEvaluationChains`' — "the same PR/context" —
+    // and took them for a contradiction. They describe two different locks, and
+    // each is accurate about its own.) Ordering was never the defect: with
+    // perfect serialization the wrong PR still wins, it just wins last.
+    //
+    // So: ask the SHA-scoped question. Enumerate every OPEN pull request at this
+    // head and take the STRICTEST verdict — a green must mean no PR at this head
+    // is red, which is the claim a SHA-keyed status actually makes.
+    //
+    // Only on `success`. A `failure` is already the strictest outcome this gate
+    // has, so a peer could not change it, and skipping the sweep there keeps the
+    // red path at exactly its current cost — the direction this module must not
+    // get slower or more failure-prone, since a red going silent is the one
+    // outcome it must never produce.
+    //
+    // Known residual, deliberately not papered over: `GET /commits/{sha}/pulls`
+    // is index-backed and the association of a BRAND-NEW pull request can lag.
+    // That lag does not run in the attack's direction — the victim is the
+    // long-open PR, whose association indexed long ago, and the probe's own row
+    // is skipped here regardless — so it does not reopen the demonstrated hole.
+    // The row's option 3 (refuse to overwrite an existing `failure` written for
+    // another PR) was considered as a lag-free second layer and NOT taken: the
+    // existing red names its PR only by `target_url`, and honouring it blindly
+    // wedges the legitimate case where that PR has since been closed, trading a
+    // narrow residual for a merge-blocking one with no lever.
+    let targetUrl = input.prUrl ?? null;
+    if (verdict.state === "success") {
+      const peers = await withBoundedRetry(
+        () => githubListOpenPullRequestsForHeadSha({ repoFullName: input.repoFullName, sha: headSha }),
+        (result) => "error" in result,
+      );
+      if ("error" in peers) {
+        // Fail closed, and note WHICH way that points: we are about to publish a
+        // green, and an unreadable enumeration cannot support it. Coercing the
+        // failed read to "no peers" would restore the exact bypass this exists to
+        // close, on the quiet path where no status changes state. Not publishing
+        // leaves the prior verdict standing and the next webhook re-evaluates —
+        // the same recoverable direction the author-login read takes directly
+        // above.
+        warnOnceOnPeerEnumerationFailure(input.repoFullName, headSha, peers.error, context);
+        return { posted: false, reason: "fetch_failed" };
+      }
+
+      for (const peer of peers.pullRequests) {
+        if (peer.number === input.prNumber) continue;
+        const peerComments = await loadComments(peer.number);
+        // Same refusal, same reason: an unreadable peer is not a clean one.
+        if (peerComments == null) return { posted: false, reason: "fetch_failed" };
+
+        // Author-blind FIRST, mirroring the main path's ordering and for the
+        // same reason. It is NOT sufficient on its own, and the cheap-looking
+        // claim that it is — "every red stands on the comment surfaces alone" —
+        // is false for exactly one outcome: `carried_finding` can come back
+        // with `authorUnknown`, and a DISTINCT author's at-head attestation
+        // clears that carry outright (`evaluateCommentReviewGate` says so where
+        // it sets the flag). Adopting such a red would publish, onto a shared
+        // head, a verdict the peer's own evaluation would never publish — the
+        // mirror image of the bypass this sweep exists to close, and reachable
+        // the same cheap way. So the author is read on precisely that route,
+        // below, and nowhere else.
+        let peerLane: string | null = null;
+        let peerVerdict = evaluateCommentReviewGate({
+          comments: peerComments,
+          headSha,
+          reviewerBotLogin,
+          prAuthorLogin: null,
+          prAuthorLane: null,
+        });
+        // The lane read can only ever make a verdict REDDER (it adds carried
+        // findings; a null lane credits the retirement), so it is worth taking
+        // on a peer that came back green and declares a lane, and worth skipping
+        // on one already red. Memoized: the lane is the commit author at this
+        // SHA, identical for every PR here, so the whole sweep costs at most one
+        // extra fetch however many peers there are.
+        if (
+          peerVerdict.state === "success" &&
+          peerComments.some((comment) => allyVerdictReviewerLane(comment.body) !== null)
+        ) {
+          peerLane = await resolveAuthorLane();
+          if (peerLane) {
+            peerVerdict = evaluateCommentReviewGate({
+              comments: peerComments,
+              headSha,
+              reviewerBotLogin,
+              prAuthorLogin: null,
+              prAuthorLane: peerLane,
+            });
+          }
+        }
+
+        // The one route where a peer's red is not yet supported by the
+        // evidence. `authorUnknown` marks a verdict the author could still
+        // change, and on a `failure` that means `carried_finding` whose carry a
+        // distinct author's at-head attestation would clear. Resolve it before
+        // adopting, with the lane the pass above actually used.
+        if (peerVerdict.state === "failure" && "authorUnknown" in peerVerdict && peerVerdict.authorUnknown) {
+          const peerAuthorLogin = await withBoundedRetry(
+            () => githubFetchPrAuthorLogin({ repoFullName: input.repoFullName, prNumber: peer.number }),
+            (login) => login == null,
+          );
+          // Refuse rather than adopt, and note this is the OPPOSITE call from
+          // the main path's on the same flag. There, an unresolved author
+          // leaves a PR's own red standing, because the author can only soften
+          // it and a red going silent is the worse outcome. Here the red is not
+          // ours: adopting it on an unread author paints THIS pull request —
+          // and the shared head — red on evidence we could not confirm, with
+          // the peer's own evaluation free to disagree on its next webhook. The
+          // peer still publishes its own red if it genuinely has one, so
+          // withholding loses no signal and the next webhook re-evaluates.
+          if (!peerAuthorLogin) return { posted: false, reason: "fetch_failed" };
+          peerVerdict = evaluateCommentReviewGate({
+            comments: peerComments,
+            headSha,
+            reviewerBotLogin,
+            prAuthorLogin: peerAuthorLogin,
+            prAuthorLane: peerLane,
+          });
+        }
+
+        if (peerVerdict.state === "failure") {
+          verdict = peerVerdict;
+          // Retarget at the peer. `verdict.reason` is left exactly as computed —
+          // it is a true statement about this HEAD, which is what a SHA-keyed
+          // status describes — and the target URL is what carries the provenance,
+          // so a reader following the red lands on the pull request whose review
+          // justifies it rather than on the one that happened to evaluate last.
+          targetUrl = peer.url ?? targetUrl;
+          break;
+        }
+      }
+    }
+
     warnOnceIfMisreadableContext(verdict, context);
+    // Every downstream write takes the retargeted input, so the four artifacts
+    // at this SHA agree on both the verdict and the pull request that justifies
+    // it. Identical to `input` whenever the sweep adopted nothing, which is the
+    // overwhelmingly common case.
+    const publishInput = targetUrl === (input.prUrl ?? null) ? input : { ...input, prUrl: targetUrl };
     const posted = await withBoundedRetry<GitHubCommitStatusPostResult>(
       () =>
         githubPostCommitStatusDetailed({
@@ -2102,13 +2327,13 @@ async function executeCommentReviewGateCheck(
           context,
           state: verdict.state,
           description: verdict.reason,
-          targetUrl: input.prUrl ?? null,
+          targetUrl,
         }),
       (result) => !result.ok && result.retryable,
     );
     if (!posted.ok) return { posted: false, reason: "post_failed", postFailure: posted.reason };
 
-    await publishCheckRunMirror(input, headSha, context, verdict);
+    await publishCheckRunMirror(publishInput, headSha, context, verdict);
 
     // The retirement write is merge-facing and the signal is not, so retirement
     // goes first and the signal is written LAST, after every write that decides
@@ -2133,9 +2358,9 @@ async function executeCommentReviewGateCheck(
     // retirement's. Pinned by test.
     let retirementFailures: Awaited<ReturnType<typeof supersedeRetiredContexts>>;
     try {
-      retirementFailures = await supersedeRetiredContexts(input, headSha, context, config, verdict);
+      retirementFailures = await supersedeRetiredContexts(publishInput, headSha, context, config, verdict);
     } finally {
-      await publishAllyHeadAttestedCheckRun(input, headSha, context, verdict);
+      await publishAllyHeadAttestedCheckRun(publishInput, headSha, context, verdict);
     }
     if (retirementFailures.length > 0) {
       // NOT "post_failed": the live status published successfully at line 643
@@ -2153,7 +2378,7 @@ async function executeCommentReviewGateCheck(
           context: failure.context,
           state: failure.state,
           description: failure.description,
-          targetUrl: input.prUrl ?? null,
+          targetUrl,
         })),
       };
     }

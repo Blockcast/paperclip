@@ -7,8 +7,9 @@ import {
   principalPermissionGrants,
 } from "@paperclipai/db";
 import type { PermissionKey, PrincipalType } from "@paperclipai/shared";
-import { conflict } from "../errors.js";
+import { conflict, notFound } from "../errors.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
+import { logActivity, type LogActivityInput } from "./activity-log.js";
 import { authorizationService, type AuthorizationActor, type AuthorizationResource } from "./authorization.js";
 import { ensureHumanRoleDefaultGrants } from "./principal-access-compatibility.js";
 import { buildIssueMonitorEligibilityPatch } from "./issue-execution-policy.js";
@@ -688,6 +689,92 @@ export function accessService(db: Db) {
       .orderBy(principalPermissionGrants.permissionKey);
   }
 
+  async function updatePrincipalGrant(
+    companyId: string,
+    principalType: PrincipalType,
+    principalId: string,
+    input: GrantInput & { operation: "add" | "remove" },
+    grantedByUserId: string | null,
+    activity: LogActivityInput,
+  ) {
+    return db.transaction(async (tx) => {
+      if (input.operation === "add" && principalType === "agent") {
+        const activeMembership = await tx
+          .select({ id: companyMemberships.id })
+          .from(companyMemberships)
+          .where(
+            and(
+              eq(companyMemberships.companyId, companyId),
+              eq(companyMemberships.principalType, "agent"),
+              eq(companyMemberships.principalId, principalId),
+              eq(companyMemberships.status, "active"),
+            ),
+          )
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!activeMembership) throw notFound("Active agent membership not found");
+      }
+
+      let changed = false;
+      if (input.operation === "remove") {
+        const removed = await tx
+          .delete(principalPermissionGrants)
+          .where(
+            and(
+              eq(principalPermissionGrants.companyId, companyId),
+              eq(principalPermissionGrants.principalType, principalType),
+              eq(principalPermissionGrants.principalId, principalId),
+              eq(principalPermissionGrants.permissionKey, input.permissionKey),
+            ),
+          )
+          .returning({ id: principalPermissionGrants.id });
+        changed = removed.length > 0;
+      } else {
+        const added = await tx
+          .insert(principalPermissionGrants)
+          .values({
+            companyId,
+            principalType,
+            principalId,
+            permissionKey: input.permissionKey,
+            scope: input.scope ?? null,
+            grantedByUserId,
+          })
+          .onConflictDoNothing({
+            target: [
+              principalPermissionGrants.companyId,
+              principalPermissionGrants.principalType,
+              principalPermissionGrants.principalId,
+              principalPermissionGrants.permissionKey,
+            ],
+          })
+          .returning({ id: principalPermissionGrants.id });
+        changed = added.length > 0;
+      }
+
+      await logActivity(tx as unknown as Db, {
+        ...activity,
+        details: {
+          ...activity.details,
+          changed,
+        },
+      });
+
+      const grants = await tx
+        .select()
+        .from(principalPermissionGrants)
+        .where(
+          and(
+            eq(principalPermissionGrants.companyId, companyId),
+            eq(principalPermissionGrants.principalType, principalType),
+            eq(principalPermissionGrants.principalId, principalId),
+          ),
+        )
+        .orderBy(principalPermissionGrants.permissionKey);
+      return { changed, grants };
+    });
+  }
+
   async function setPrincipalPermission(
     companyId: string,
     principalType: PrincipalType,
@@ -837,6 +924,7 @@ export function accessService(db: Db) {
     setUserCompanyAccess,
     setPrincipalGrants,
     listPrincipalGrants,
+    updatePrincipalGrant,
     setPrincipalPermission,
     updateMember,
   };

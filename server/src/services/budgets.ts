@@ -1,4 +1,4 @@
-import { and, desc, eq, gte, inArray, lt, ne, sql } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNotNull, lt, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -177,6 +177,16 @@ async function resolveScopeRecord(db: Db, scopeType: BudgetScopeType, scopeId: s
 async function computeObservedAmount(
   db: Db,
   policy: Pick<PolicyRow, "companyId" | "scopeType" | "scopeId" | "windowKind" | "metric">,
+  /**
+   * Floor the sum at this instant, on top of the window bounds (PEN-4742).
+   *
+   * Only `hardStopForgivenSince` passes it, to ask the ENFORCEMENT question
+   * "how much has this scope spent since the board adjudicated the crossing?".
+   * Every reporting caller omits it and keeps getting the true window total:
+   * rebaselining what the dashboard shows would hide the overshoot the board
+   * just forgave, which is PEN-1972 defect 3 wearing a different hat.
+   */
+  since?: Date,
 ) {
   // NB: the `billed_cents` metric NAME is unchanged and still means consumption -- renaming
   // the BUDGET_METRICS enum needs a budget_policies data migration plus an API/UI contract
@@ -190,6 +200,26 @@ async function computeObservedAmount(
   if (policy.windowKind === "calendar_month_utc") {
     conditions.push(gte(costEvents.occurredAt, start));
     conditions.push(lt(costEvents.occurredAt, end));
+  }
+  // Applied as well as -- never instead of -- the window bounds above, so a
+  // forgiveness grant can only ever NARROW the sum. A grant that somehow
+  // outlived its window still cannot widen enforcement past the window.
+  //
+  // BOTH CLOCKS, OR'd: an event counts if it HAPPENED after the decision or if it
+  // LANDED after it. Flooring on `occurredAt` alone was fail-open in the one
+  // direction a cap must never fail -- spend the board could not have seen when it
+  // adjudicated (final usage from the runs cancelled at the pause, batched or
+  // back-billed ingestion) carries an `occurredAt` before the grant, and so escaped
+  // enforcement for the whole rest of the window while still showing up on every
+  // dashboard. What the board forgave is the overshoot visible at that instant; an
+  // event that was not yet in the table was not part of it.
+  //
+  // `createdAt` is insert time, defaulted by the database and never backdated, so
+  // the OR can only ever ADD rows to the enforced sum -- it cannot drop one that
+  // the `occurredAt` floor would have kept. Reporting is unaffected either way:
+  // every reporting caller omits `since` entirely and still sums the true window.
+  if (since) {
+    conditions.push(or(gte(costEvents.occurredAt, since), gte(costEvents.createdAt, since))!);
   }
 
   const [row] = await db
@@ -339,8 +369,17 @@ export function buildApprovalPayload(input: {
     windowEnd: input.windowEnd.toISOString(),
     policyId: input.policy.id,
     summary: runway,
+    // "Keep the scope paused" is scoped to the condition, not forever: since
+    // PEN-1972 a budget pause lifts itself at the next invocation check once the
+    // hard stop stops binding, which for a windowed cap means the next window
+    // roll. That is the right behaviour -- a latch that outlives its condition
+    // is what took a primary implementer offline over $0.25 -- but the board is
+    // the party choosing it, so the card has to say so rather than let a
+    // "keep paused" click imply a durability it does not have.
     guidance: input.thresholdType === "hard"
-      ? "Raise the budget and resume the scope, or keep the scope paused."
+      ? "Raise the budget and resume the scope, or keep the scope paused -- a kept "
+        + "pause holds only while the cap still binds, and lifts on its own once "
+        + "observed spend in the window falls back under it."
       : "Raise the budget now to avoid a hard stop, or accept the pause when the cap is reached.",
   };
 }
@@ -437,10 +476,25 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
     });
   }
 
-  async function resumeScopeFromBudget(policy: PolicyRow) {
+  /**
+   * Addressed by scope rather than by policy row: a budget latch has to be
+   * clearable even when the policy that set it has since been deactivated or
+   * deleted, which is precisely the state in which nothing else would ever
+   * clear it. Every update is guarded on `pauseReason = "budget"`, so this can
+   * never lift a manual or operator pause.
+   *
+   * Returns whether a row actually changed. The guard makes this a no-op in two
+   * races -- a concurrent caller resumed first, or a human pause replaced the
+   * budget one between the caller's read and this write -- and a caller that
+   * attaches side effects to the resume needs to tell those apart from a resume
+   * it genuinely performed. See `clearExpiredBudgetPause`.
+   */
+  async function resumeScopeFromBudget(
+    policy: Pick<PolicyRow, "scopeType" | "scopeId">,
+  ): Promise<boolean> {
     const now = new Date();
     if (policy.scopeType === "agent") {
-      await db
+      const changed = await db
         .update(agents)
         .set({
           status: "idle",
@@ -448,23 +502,25 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
           pausedAt: null,
           updatedAt: now,
         })
-        .where(and(eq(agents.id, policy.scopeId), eq(agents.pauseReason, "budget")));
-      return;
+        .where(and(eq(agents.id, policy.scopeId), eq(agents.pauseReason, "budget")))
+        .returning({ id: agents.id });
+      return changed.length > 0;
     }
 
     if (policy.scopeType === "project") {
-      await db
+      const changed = await db
         .update(projects)
         .set({
           pauseReason: null,
           pausedAt: null,
           updatedAt: now,
         })
-        .where(and(eq(projects.id, policy.scopeId), eq(projects.pauseReason, "budget")));
-      return;
+        .where(and(eq(projects.id, policy.scopeId), eq(projects.pauseReason, "budget")))
+        .returning({ id: projects.id });
+      return changed.length > 0;
     }
 
-    await db
+    const changed = await db
       .update(companies)
       .set({
         status: "active",
@@ -472,7 +528,247 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
         pausedAt: null,
         updatedAt: now,
       })
-      .where(and(eq(companies.id, policy.scopeId), eq(companies.pauseReason, "budget")));
+      .where(and(eq(companies.id, policy.scopeId), eq(companies.pauseReason, "budget")))
+      .returning({ id: companies.id });
+    return changed.length > 0;
+  }
+
+  async function loadActiveBudgetPolicy(
+    companyId: string,
+    scopeType: BudgetScopeType,
+    scopeId: string,
+  ): Promise<PolicyRow | null> {
+    return db
+      .select()
+      .from(budgetPolicies)
+      .where(
+        and(
+          eq(budgetPolicies.companyId, companyId),
+          eq(budgetPolicies.scopeType, scopeType),
+          eq(budgetPolicies.scopeId, scopeId),
+          eq(budgetPolicies.isActive, true),
+          eq(budgetPolicies.metric, "billed_cents"),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+  }
+
+  /**
+   * When, in THIS window, did the board adjudicate a hard crossing and resume
+   * the scope without lifting the cap clear of observed spend? Null if never
+   * (PEN-4742).
+   *
+   * This is the whole of the forgiveness mechanism's state, and it is derived,
+   * not stored: a `budget_incidents` row that is `resolved`, `hard`, carries
+   * `resolution_action = "resume_without_raise"`, and whose `window_start` is
+   * the window we are enforcing right now. Nothing has to be cleaned up by hand
+   * -- at the roll, `resolveWindow` returns the next window's start, the
+   * `windowStart` equality stops matching, and the grant is simply gone.
+   *
+   * WHY A COLUMN RATHER THAN DERIVING IT FROM LIVE STATE. The cheap-looking
+   * alternative is "any resolved hard incident in this window", but
+   * `raise_budget_and_resume` resolves one too -- so an ordinary raise from
+   * $3,000 to $4,000 would also buy a scope immunity at $4,000 for the rest of
+   * the month. The next refinement, `policy.amount <= incident.amountObserved`,
+   * is retroactively forgeable: raise the cap clear of observed, then let any
+   * later `upsertPolicy` lower it again, and the predicate flips to true and
+   * confers a grant nobody decided. Lowering a cap would loosen enforcement.
+   * The decision has to be written down when it is made.
+   *
+   * `isNotNull(resolvedAt)` is load-bearing twice over, not defensive noise.
+   * The column is nullable; this function's contract is to return the instant
+   * the grant starts from, and a null would make `computeObservedAmount` drop
+   * its floor silently. It also removes a NULLS-FIRST hazard: Postgres sorts
+   * nulls FIRST under `ORDER BY ... DESC`, so without the filter a single
+   * malformed row (action stamped, `resolvedAt` absent) would sort ahead of a
+   * real grant and hide it. Both writes set the two fields together, so this is
+   * about what a hand-edit or an older server could leave behind.
+   *
+   * `desc(resolvedAt)` because repeated adjudications in one window are
+   * legitimate -- each re-latch can be forgiven again -- and only the most
+   * recent one bounds the allowance.
+   */
+  async function hardStopForgivenSince(policy: PolicyRow): Promise<Date | null> {
+    // `lifetime` windows never roll, so a grant on one would never expire --
+    // permanent state, which is exactly what this design refuses. `resolveIncident`
+    // rejects the action for them up front; this is the matching read-side guard,
+    // so a row written by an older server or by hand still cannot confer one.
+    if (policy.windowKind !== "calendar_month_utc") return null;
+    const { start } = resolveWindow(policy.windowKind as BudgetWindowKind);
+    const row = await db
+      .select({ resolvedAt: budgetIncidents.resolvedAt })
+      .from(budgetIncidents)
+      .where(
+        and(
+          eq(budgetIncidents.policyId, policy.id),
+          eq(budgetIncidents.thresholdType, "hard"),
+          eq(budgetIncidents.status, "resolved"),
+          eq(budgetIncidents.resolutionAction, "resume_without_raise"),
+          eq(budgetIncidents.windowStart, start),
+          isNotNull(budgetIncidents.resolvedAt),
+        ),
+      )
+      .orderBy(desc(budgetIncidents.resolvedAt))
+      .then((rows) => rows[0] ?? null);
+    return row?.resolvedAt ?? null;
+  }
+
+  /**
+   * The spend figure the hard stop is enforced against, and the grant (if any)
+   * that moved it.
+   *
+   * Without a grant this is the plain window total and nothing has changed.
+   * With one, the cap is measured from the instant the board adjudicated the
+   * crossing -- "the cap you chose, applied forward from the moment you forgave
+   * the overshoot" -- so the scope gets one cap's worth of runway and then hard
+   * stops again. The grant bounds the tail; it does not remove the cap. That
+   * distinction is the point: blanket suppression would let a scope resumed at
+   * $3,001 against a $3,000 cap burn arbitrarily for the rest of the window,
+   * which is worse in the tail than the ratchet it replaces.
+   *
+   * Every enforcement site reads this. Every reporting site reads
+   * `computeObservedAmount` directly and keeps showing true window spend.
+   */
+  async function enforcedObservedAmount(policy: PolicyRow) {
+    const forgivenSince = await hardStopForgivenSince(policy);
+    const observed = await computeObservedAmount(db, policy, forgivenSince ?? undefined);
+    return { observed, forgivenSince };
+  }
+
+  /**
+   * Does the hard stop bind *right now*, against the current window? This is the
+   * question `getInvocationBlock` has always asked of a running scope, extracted
+   * so a paused one can be asked it too.
+   */
+  async function hardStopStillBinds(policy: PolicyRow | null) {
+    if (!policy || !policy.hardStopEnabled || policy.amount <= 0) return false;
+    const { observed } = await enforcedObservedAmount(policy);
+    return observed >= policy.amount;
+  }
+
+  /**
+   * Why the pause cleared, in the words that go into the audit trail and the
+   * board's withdrawal note.
+   *
+   * The clear fires whenever `hardStopStillBinds` stops holding, and that has
+   * five distinct causes -- a window roll is only one of them. Saying "the
+   * budget window rolled" for all five writes a false reason whenever the cause
+   * was really a deactivated policy, a cap set to zero, or a disabled hard
+   * stop; in that last case spend is typically still over cap, so the note
+   * would contradict the scope's own numbers. The order below mirrors
+   * `hardStopStillBinds`'s short-circuits, so the reason always names the test
+   * that actually failed first.
+   *
+   * The fifth cause is a live forgiveness grant (PEN-4742): spend SINCE the
+   * board adjudicated this window's crossing is below the cap, while total
+   * window spend may well still be above it. That is reachable -- a forgiven
+   * scope can re-latch on post-grant spend and then be released again by a cap
+   * raise -- and reporting it as "observed spend in the current window is below
+   * the cap" would state the opposite of what the scope's own dashboard shows.
+   */
+  async function describeClearedCause(policy: PolicyRow | null) {
+    if (!policy) return "no active hard-stop budget policy governs this scope";
+    if (!policy.hardStopEnabled) return "the hard stop is disabled on the governing policy";
+    if (policy.amount <= 0) return "the governing policy no longer sets a cap";
+    const forgivenSince = await hardStopForgivenSince(policy);
+    if (forgivenSince) {
+      return "spend since the board resumed this scope on "
+        + `${forgivenSince.toISOString()} is below the cap`;
+    }
+    return "observed spend in the current window is below the cap";
+  }
+
+  /**
+   * Clear a budget pause whose condition has stopped holding.
+   *
+   * The pause is a sticky flag on the scope row; the condition that set it is
+   * window-scoped. `computeObservedAmount` only sums cost events inside the
+   * current window, so at the window roll the spend that justified the pause
+   * drops out of the sum and the condition evaporates -- but nothing clears the
+   * flag. `evaluateCostEvent` cannot do it either: it is driven by cost events,
+   * and a paused scope emits none, so a latched scope can never re-trigger its
+   * own evaluation. Before this, the only exit was an explicit human resume, and
+   * a $0.25 overshoot on a $3,000 cap could hold a scope down indefinitely
+   * (Penstock PEN-1972).
+   *
+   * The still-open *hard* incident is closed and its pending card withdrawn:
+   * that card asks the board to choose between raising the budget and staying
+   * paused, and neither branch is meaningful once the scope is no longer
+   * paused. Leaving it pending would strand a decision against a condition that
+   * no longer exists. A still-open *soft* incident is deliberately left alone:
+   * it makes a different claim, one that can outlive the pause. See the
+   * filter below.
+   */
+  async function clearExpiredBudgetPause(
+    companyId: string,
+    scopeType: BudgetScopeType,
+    scopeId: string,
+    scopeName: string,
+    policy: PolicyRow | null,
+  ) {
+    const resumed = await resumeScopeFromBudget({ scopeType, scopeId });
+    // Every update in `resumeScopeFromBudget` is guarded on
+    // `pauseReason = "budget"`, so "no row changed" means the scope was not ours
+    // to resume by the time the write landed: a concurrent caller got there
+    // first, or a human pause replaced the budget one between the read in
+    // `getInvocationBlock` and this write. This call resumed nothing, so it must
+    // not close the board's incident, withdraw its card, or write an
+    // `auto_cleared` row claiming a resume that did not happen here.
+    if (!resumed) return;
+
+    const cause = await describeClearedCause(policy);
+
+    if (policy) {
+      // Hard only. The hard incident *is* the pause decision, so it dies with
+      // the pause. A soft incident is a different claim -- "spend has crossed
+      // the warn threshold" -- and that claim can still be true at the moment
+      // the pause lifts: clearing `hardStopEnabled` while over cap files a warn
+      // card and resumes the scope in the same breath (the coexistence case
+      // already documented in `resolveIncident`). Closing it there would delete
+      // a live warning and leave the board blind to an overspend it is still
+      // carrying.
+      const openHard = and(
+        eq(budgetIncidents.policyId, policy.id),
+        eq(budgetIncidents.status, "open"),
+        eq(budgetIncidents.thresholdType, "hard"),
+      );
+      const openRows = await db.select().from(budgetIncidents).where(openHard);
+      if (openRows.length > 0) {
+        const now = new Date();
+        await db
+          .update(budgetIncidents)
+          .set({ status: "resolved", resolvedAt: now, updatedAt: now })
+          .where(openHard);
+        for (const row of openRows) {
+          await withdrawPendingApproval(
+            row.approvalId ?? null,
+            row.companyId,
+            `Withdrawn automatically: ${cause}, so this scope resumed on its own `
+              + "and there is no longer a pause to decide about.",
+            "budget_pause_condition_cleared",
+          );
+        }
+      }
+    }
+
+    // A resume is a fiscal event and must leave a trace, the same way a pause
+    // does -- otherwise a scope that silently came back is indistinguishable
+    // from one that was never stopped.
+    await logActivity(db, {
+      companyId,
+      actorType: "system",
+      actorId: "budget_service",
+      action: "budget.pause_auto_cleared",
+      entityType: "budget_policy",
+      entityId: policy?.id ?? scopeId,
+      details: {
+        scopeType,
+        scopeId,
+        scopeName,
+        policyId: policy?.id ?? null,
+        reason: cause,
+      },
+    });
   }
 
   async function getPolicyRow(policyId: string) {
@@ -495,7 +791,14 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
 
   async function buildPolicySummary(policy: PolicyRow): Promise<BudgetPolicySummary> {
     const scope = await resolveScopeRecord(db, policy.scopeType as BudgetScopeType, policy.scopeId);
+    // TRUE window spend, deliberately not the enforcement figure. A forgiven
+    // scope keeps reporting the overshoot the board accepted; rebaselining here
+    // would drop it to a healthy-looking number and reproduce PEN-1972 defect 3
+    // -- the gauge going quiet at precisely the moment it has something to say.
+    // `hardStopForgivenSince` below is what explains an over-cap scope that is
+    // nonetheless running, so the card can say so instead of looking broken.
     const observedAmount = await computeObservedAmount(db, policy);
+    const forgivenSince = await hardStopForgivenSince(policy);
     const { start, end } = resolveWindow(policy.windowKind as BudgetWindowKind);
     const amount = policy.isActive ? policy.amount : 0;
     const utilizationPercent =
@@ -521,6 +824,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
         : "ok",
       paused: scope.paused,
       pauseReason: scope.pauseReason,
+      hardStopForgivenSince: policy.isActive ? forgivenSince : null,
       windowStart: start,
       windowEnd: end,
     };
@@ -845,6 +1149,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
           amountLimit: row.amountLimit,
           amountObserved: row.amountObserved,
           status: row.status as BudgetIncident["status"],
+          resolutionAction: (row.resolutionAction as BudgetIncident["resolutionAction"]) ?? null,
           approvalId: row.approvalId ?? null,
           approvalStatus: row.approvalId ? approvalStatusById.get(row.approvalId) ?? null : null,
           resolvedAt: row.resolvedAt ?? null,
@@ -1016,16 +1321,33 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
       }
 
       if (amount > 0) {
-        const observedAmount = await computeObservedAmount(db, row);
-        if (observedAmount < amount) {
+        // Enforcement figure, exactly as in `evaluateCostEvent`: a policy write
+        // is the third site that can pause a scope, and leaving it unaware of a
+        // forgiveness grant would make an unrelated edit -- toggling
+        // notifications, nudging warnPercent -- silently re-pause a scope the
+        // board had just released (PEN-4742).
+        //
+        // That also means an ordinary policy edit does NOT revoke a grant. The
+        // alternative, "a cap change mid-window cancels forgiveness", is a
+        // hidden rule that fires on edits nobody connects to it. The explicit
+        // way to stop a forgiven scope is the operator pause: it sets a
+        // `pauseReason` other than `budget`, and every budget resume path is
+        // guarded on `pauseReason = "budget"`, so no budget logic will lift it.
+        const { observed: enforcedObserved, forgivenSince } = await enforcedObservedAmount(row);
+        // Cards and incidents carry true window spend; only the decision uses
+        // the rebaselined figure. See the same split in `evaluateCostEvent`.
+        const observedAmount = forgivenSince
+          ? await computeObservedAmount(db, row)
+          : enforcedObserved;
+        if (enforcedObserved < amount) {
           await resumeScopeFromBudget(row);
           await resolveOpenIncidentsForPolicy(row.id, actorUserId ? "approved" : null, actorUserId);
         } else {
           const softThreshold = Math.ceil((row.amount * row.warnPercent) / 100);
-          const hardStopWillFire = row.hardStopEnabled && observedAmount >= row.amount;
+          const hardStopWillFire = row.hardStopEnabled && enforcedObserved >= row.amount;
           // Same gate as evaluateCostEvent: do not file a warn card the hard
           // branch below is about to withdraw in the same call.
-          if (row.notifyEnabled && observedAmount >= softThreshold && !hardStopWillFire) {
+          if (row.notifyEnabled && enforcedObserved >= softThreshold && !hardStopWillFire) {
             await createIncidentIfNeeded(row, "soft", observedAmount);
           }
           if (hardStopWillFire) {
@@ -1097,9 +1419,33 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
 
       for (const policy of relevantPolicies) {
         if (policy.metric !== "billed_cents" || policy.amount <= 0) continue;
-        const observedAmount = await computeObservedAmount(db, policy);
+        // Enforcement figure, not the reporting one: where the board has
+        // adjudicated this window's crossing and resumed without raising the
+        // cap, both thresholds are measured from that decision for the rest of
+        // the window (PEN-4742).
+        //
+        // The WARN branch has to honour the grant as well as the hard one, and
+        // that is not incidental tidiness. Total window spend is by definition
+        // still over the cap right after a grant, hence over warnPercent of it
+        // too -- so a hard-only fix would file a fresh warn card on the very
+        // next cost event, against a crossing the board had just finished
+        // deciding. That is the same churn the action exists to prevent, merely
+        // relabelled from "re-paused" to "re-carded". Measured from the
+        // decision instead, the warn card regains its meaning: it fires when
+        // the scope is burning through the allowance the board just granted.
+        const { observed: enforcedObserved, forgivenSince } = await enforcedObservedAmount(policy);
+        // The card and the activity row get TRUE window spend, never the
+        // rebaselined figure. The grant changes what the hard stop is measured
+        // against; it does not change what the scope actually spent, and an
+        // incident claiming "$3,000 against a limit of $3,000" on a scope that
+        // has really burned $6,001 this window would mislead the next board
+        // member to read it. The two numbers are only ever different when a
+        // grant is live, so the extra read costs nothing on the normal path.
+        const observedAmount = forgivenSince
+          ? await computeObservedAmount(db, policy)
+          : enforcedObserved;
         const softThreshold = Math.ceil((policy.amount * policy.warnPercent) / 100);
-        const hardStopWillFire = policy.hardStopEnabled && observedAmount >= policy.amount;
+        const hardStopWillFire = policy.hardStopEnabled && enforcedObserved >= policy.amount;
 
         // Skip the warn card only when the hard branch below is about to run in
         // this same evaluation and immediately withdraw it -- a single cost event
@@ -1109,7 +1455,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
         // is "the hard path will fire", not "observed >= amount": with
         // `hardStopEnabled: false` nothing else would ever notify, and the warn
         // card is the only signal that scope has blown its cap.
-        if (policy.notifyEnabled && observedAmount >= softThreshold && !hardStopWillFire) {
+        if (policy.notifyEnabled && enforcedObserved >= softThreshold && !hardStopWillFire) {
           const softIncident = await createIncidentIfNeeded(policy, "soft", observedAmount);
           if (softIncident?.created) {
             await logActivity(db, {
@@ -1123,6 +1469,8 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
                 scopeType: policy.scopeType,
                 scopeId: policy.scopeId,
                 amountObserved: observedAmount,
+                amountObservedSinceForgiveness: forgivenSince ? enforcedObserved : null,
+                hardStopForgivenSince: forgivenSince?.toISOString() ?? null,
                 amountLimit: policy.amount,
                 approvalId: softIncident.incident.approvalId ?? null,
               },
@@ -1130,7 +1478,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
           }
         }
 
-        if (policy.hardStopEnabled && observedAmount >= policy.amount) {
+        if (policy.hardStopEnabled && enforcedObserved >= policy.amount) {
           await resolveOpenSoftIncidents(policy.id);
           const hardIncident = await createIncidentIfNeeded(policy, "hard", observedAmount);
           await pauseAndCancelScopeForBudget(policy);
@@ -1146,6 +1494,8 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
                 scopeType: policy.scopeType,
                 scopeId: policy.scopeId,
                 amountObserved: observedAmount,
+                amountObservedSinceForgiveness: forgivenSince ? enforcedObserved : null,
+                hardStopForgivenSince: forgivenSince?.toISOString() ?? null,
                 amountLimit: policy.amount,
                 approvalId: hardIncident.incident.approvalId ?? null,
               },
@@ -1182,75 +1532,65 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
         .where(eq(companies.id, companyId))
         .then((rows) => rows[0] ?? null);
       if (!company) throw notFound("Company not found");
-      if (company.status === "paused") {
-        return {
-          scopeType: "company" as const,
-          scopeId: companyId,
-          scopeName: company.name,
-          reason:
-            company.pauseReason === "budget"
-              ? "Company is paused because its budget hard-stop was reached."
-              : "Company is paused and cannot start new work.",
-        };
-      }
 
-      const companyPolicy = await db
-        .select()
-        .from(budgetPolicies)
-        .where(
-          and(
-            eq(budgetPolicies.companyId, companyId),
-            eq(budgetPolicies.scopeType, "company"),
-            eq(budgetPolicies.scopeId, companyId),
-            eq(budgetPolicies.isActive, true),
-            eq(budgetPolicies.metric, "billed_cents"),
-          ),
-        )
-        .then((rows) => rows[0] ?? null);
-      if (companyPolicy && companyPolicy.hardStopEnabled && companyPolicy.amount > 0) {
-        const observed = await computeObservedAmount(db, companyPolicy);
-        if (observed >= companyPolicy.amount) {
+      // The governing policy is loaded *before* the pause check, not after it,
+      // so that a scope already carrying the flag can be asked the same live
+      // question as one that is still running. Observed spend is computed once
+      // and reused by both branches.
+      const companyPolicy = await loadActiveBudgetPolicy(companyId, "company", companyId);
+      const companyOverCap = await hardStopStillBinds(companyPolicy);
+
+      if (company.status === "paused") {
+        if (company.pauseReason !== "budget") {
           return {
             scopeType: "company" as const,
             scopeId: companyId,
             scopeName: company.name,
-            reason: "Company cannot start new work because its budget hard-stop is exceeded.",
+            reason: "Company is paused and cannot start new work.",
           };
         }
+        if (companyOverCap) {
+          return {
+            scopeType: "company" as const,
+            scopeId: companyId,
+            scopeName: company.name,
+            reason: "Company is paused because its budget hard-stop was reached.",
+          };
+        }
+        await clearExpiredBudgetPause(companyId, "company", companyId, company.name, companyPolicy);
       }
 
-      if (agent.status === "paused" && agent.pauseReason === "budget") {
+      if (companyOverCap) {
         return {
-          scopeType: "agent" as const,
-          scopeId: agentId,
-          scopeName: agent.name,
-          reason: "Agent is paused because its budget hard-stop was reached.",
+          scopeType: "company" as const,
+          scopeId: companyId,
+          scopeName: company.name,
+          reason: "Company cannot start new work because its budget hard-stop is exceeded.",
         };
       }
 
-      const agentPolicy = await db
-        .select()
-        .from(budgetPolicies)
-        .where(
-          and(
-            eq(budgetPolicies.companyId, companyId),
-            eq(budgetPolicies.scopeType, "agent"),
-            eq(budgetPolicies.scopeId, agentId),
-            eq(budgetPolicies.isActive, true),
-            eq(budgetPolicies.metric, "billed_cents"),
-          ),
-        )
-        .then((rows) => rows[0] ?? null);
-      if (agentPolicy && agentPolicy.hardStopEnabled && agentPolicy.amount > 0) {
-        const observed = await computeObservedAmount(db, agentPolicy);
-        if (observed >= agentPolicy.amount) {
+      const agentPolicy = await loadActiveBudgetPolicy(companyId, "agent", agentId);
+      const agentOverCap = await hardStopStillBinds(agentPolicy);
+
+      if (agent.status === "paused" && agent.pauseReason === "budget") {
+        if (agentOverCap) {
           return {
             scopeType: "agent" as const,
             scopeId: agentId,
             scopeName: agent.name,
-            reason: "Agent cannot start because its budget hard-stop is still exceeded.",
+            reason: "Agent is paused because its budget hard-stop was reached.",
           };
         }
+        await clearExpiredBudgetPause(companyId, "agent", agentId, agent.name, agentPolicy);
+      }
+
+      if (agentOverCap) {
+        return {
+          scopeType: "agent" as const,
+          scopeId: agentId,
+          scopeName: agent.name,
+          reason: "Agent cannot start because its budget hard-stop is still exceeded.",
+        };
       }
 
       const candidateProjectId = context?.projectId ?? null;
@@ -1269,38 +1609,21 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
         .then((rows) => rows[0] ?? null);
 
       if (!project || project.companyId !== companyId) return null;
-      const projectPolicy = await db
-        .select()
-        .from(budgetPolicies)
-        .where(
-          and(
-            eq(budgetPolicies.companyId, companyId),
-            eq(budgetPolicies.scopeType, "project"),
-            eq(budgetPolicies.scopeId, project.id),
-            eq(budgetPolicies.isActive, true),
-            eq(budgetPolicies.metric, "billed_cents"),
-          ),
-        )
-        .then((rows) => rows[0] ?? null);
-      if (projectPolicy && projectPolicy.hardStopEnabled && projectPolicy.amount > 0) {
-        const observed = await computeObservedAmount(db, projectPolicy);
-        if (observed >= projectPolicy.amount) {
-          return {
-            scopeType: "project" as const,
-            scopeId: project.id,
-            scopeName: project.name,
-            reason: "Project cannot start work because its budget hard-stop is still exceeded.",
-          };
-        }
+      const projectPolicy = await loadActiveBudgetPolicy(companyId, "project", project.id);
+      const projectOverCap = await hardStopStillBinds(projectPolicy);
+      if (projectOverCap) {
+        return {
+          scopeType: "project" as const,
+          scopeId: project.id,
+          scopeName: project.name,
+          reason: "Project cannot start work because its budget hard-stop is still exceeded.",
+        };
       }
 
       if (!project.pausedAt || project.pauseReason !== "budget") return null;
-      return {
-        scopeType: "project" as const,
-        scopeId: project.id,
-        scopeName: project.name,
-        reason: "Project is paused because its budget hard-stop was reached.",
-      };
+      // Over-cap was ruled out above, so the flag has outlived its condition.
+      await clearExpiredBudgetPause(companyId, "project", project.id, project.name, projectPolicy);
+      return null;
     },
 
     resolveIncident: async (
@@ -1318,33 +1641,82 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
       if (incident.companyId !== companyId) throw notFound("Budget incident not found");
 
       const policy = await getPolicyRow(incident.policyId);
-      if (input.action === "raise_budget_and_resume") {
-        const nextAmount = Math.max(0, Math.floor(input.amount ?? 0));
-        const currentObserved = await computeObservedAmount(db, policy);
-        if (nextAmount <= currentObserved) {
-          throw unprocessable("New budget must exceed current observed spend");
+      const isResume = input.action === "raise_budget_and_resume"
+        || input.action === "resume_without_raise";
+      let resolvedPolicyAmount = policy.amount;
+      if (isResume) {
+        const raising = input.action === "raise_budget_and_resume";
+        // `raise_budget_and_resume` has always required an amount (the zod schema
+        // enforces it). `resume_without_raise` does not: omitting it means "keep
+        // the cap exactly as it stands", which is the common case and the whole
+        // reason the action exists (PEN-4742).
+        const writesCap = raising || typeof input.amount === "number";
+        const nextAmount = writesCap ? Math.max(0, Math.floor(input.amount ?? 0)) : policy.amount;
+        resolvedPolicyAmount = nextAmount;
+
+        if (!raising && policy.windowKind !== "calendar_month_utc") {
+          // A `lifetime` window never rolls, so a forgiveness grant on one would
+          // never expire -- permanent state, which is what this design refuses.
+          // The coherent exits for a blown lifetime cap are raising it, turning
+          // the hard stop off, or staying paused.
+          throw unprocessable(
+            "Resuming without a raise needs a window that rolls; this policy's budget is lifetime-scoped",
+          );
+        }
+
+        if (raising) {
+          const currentObserved = await computeObservedAmount(db, policy);
+          // NARROWED, not deleted (PEN-4742). The guard's intent is sound -- resuming
+          // under a cap you have already blown re-latches on the next cost event, so
+          // churn, a fresh incident, a fresh card. But it only has that effect where
+          // the cap can actually bind, and applying it unconditionally is what turned
+          // the cap into a function of accrued spend: mid-window it forces
+          // observed-plus-epsilon, which ratchets the figure upward permanently for
+          // every future window because of one window's overshoot. A $1.63 breach is
+          // how a $20,011.63 cap got set.
+          //
+          // Two cases where it cannot bite and so must not block:
+          //   - `hardStopEnabled: false` -- the cap pauses nothing, so there is
+          //     nothing to re-latch.
+          //   - `nextAmount <= 0` -- zero means "no cap" everywhere else in this file
+          //     (`budgetStatusFromObserved`, `hardStopStillBinds`, `getInvocationBlock`
+          //     all short-circuit on it), so this rejected the one input that removes
+          //     the cap outright, purely because 0 is never greater than observed.
+          //
+          // The post-roll case needs no code: once observed falls below the cap,
+          // keeping the cap already satisfies `nextAmount > currentObserved`.
+          //
+          // The mid-window case -- the one that actually bites -- is not handled by
+          // narrowing at all. It is handled by `resume_without_raise`, which separates
+          // "what the cap is" from "may this scope run for the rest of this window".
+          const guardCanBite = policy.hardStopEnabled && nextAmount > 0;
+          if (guardCanBite && nextAmount <= currentObserved) {
+            throw unprocessable("New budget must exceed current observed spend");
+          }
         }
 
         const now = new Date();
-        await db
-          .update(budgetPolicies)
-          .set({
-            amount: nextAmount,
-            isActive: true,
-            updatedByUserId: actorUserId,
-            updatedAt: now,
-            ...(nextAmount === policy.amount ? {} : { amountUpdatedAt: now }),
-          })
-          .where(eq(budgetPolicies.id, policy.id));
+        if (writesCap) {
+          await db
+            .update(budgetPolicies)
+            .set({
+              amount: nextAmount,
+              isActive: true,
+              updatedByUserId: actorUserId,
+              updatedAt: now,
+              ...(nextAmount === policy.amount ? {} : { amountUpdatedAt: now }),
+            })
+            .where(eq(budgetPolicies.id, policy.id));
+        }
 
-        if (policy.scopeType === "company" && policy.windowKind === "calendar_month_utc") {
+        if (writesCap && policy.scopeType === "company" && policy.windowKind === "calendar_month_utc") {
           await db
             .update(companies)
             .set({ budgetMonthlyCents: nextAmount, updatedAt: now })
             .where(eq(companies.id, policy.scopeId));
         }
 
-        if (policy.scopeType === "agent" && policy.windowKind === "calendar_month_utc") {
+        if (writesCap && policy.scopeType === "agent" && policy.windowKind === "calendar_month_utc") {
           await db
             .update(agents)
             .set({ budgetMonthlyCents: nextAmount, updatedAt: now })
@@ -1362,17 +1734,58 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
               ne(budgetIncidents.id, incident.id),
             ),
           );
+        // `resolutionAction` is what `hardStopForgivenSince` reads back later, so
+        // this write IS the forgiveness grant -- there is no other state. It is
+        // therefore stamped on the decided row ALONE, keyed on `id`, and the other
+        // rows this resume closes are closed in a second statement that never
+        // touches the column.
+        //
+        // One statement keyed on `policyId AND status = "open"` is what this was,
+        // and it sprayed the action across every open row on the policy. That was
+        // wrong in exactly one reachable way, and the way is bad: a replayed
+        // `resume_without_raise` against an ALREADY-CLOSED incident A is not itself
+        // in the open set, so it stamped whatever else was -- a later, live hard
+        // incident B -- and minted a grant from B's `resolvedAt` that no board ever
+        // decided against B's numbers. `createIncidentIfNeeded` suppresses only on
+        // OPEN rows, so B is routinely creatable the moment A is resolved: grant,
+        // re-latch, replay is an ordinary stale-client sequence, not a contrived
+        // one. It survived a window roll too, since B carries the CURRENT
+        // `windowStart` and the grant is keyed on that.
+        //
+        // Keyed on `id`, a replay against a closed A now matches nothing, stamps
+        // nothing, and confers nothing -- B is still closed by the sweep below, but
+        // with `resolutionAction` left null, which `hardStopForgivenSince` cannot
+        // read as a grant. The invariant is structural rather than incidental: a
+        // grant can only ever come from the row the board actually named, and only
+        // if that row was still open when they named it.
+        //
+        // The sweep deliberately leaves `resolutionAction` null rather than
+        // stamping a second action. Those rows were closed as a side effect of a
+        // decision about a DIFFERENT crossing; null is the honest record of that,
+        // and it is what their withdrawal note already says.
         await db
           .update(budgetIncidents)
           .set({
             status: "resolved",
             resolvedAt: now,
+            resolutionAction: input.action,
             updatedAt: now,
           })
-          .where(and(eq(budgetIncidents.policyId, policy.id), eq(budgetIncidents.status, "open")));
+          .where(and(eq(budgetIncidents.id, incident.id), eq(budgetIncidents.status, "open")));
+
+        await db
+          .update(budgetIncidents)
+          .set({ status: "resolved", resolvedAt: now, updatedAt: now })
+          .where(
+            and(
+              eq(budgetIncidents.policyId, policy.id),
+              eq(budgetIncidents.status, "open"),
+              ne(budgetIncidents.id, incident.id),
+            ),
+          );
 
         await markApprovalStatus(db, incident.approvalId ?? null, "approved", input.decisionNote, actorUserId);
-        // Raising the cap closes *every* open incident for the policy, but only the
+        // Resuming closes *every* open incident for the policy, but only the
         // one the board acted on gets a decision, so the rest must have their cards
         // withdrawn rather than left pending against a resolved incident.
         //
@@ -1388,7 +1801,9 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
           await withdrawPendingApproval(
             row.approvalId ?? null,
             row.companyId,
-            "Withdrawn automatically: the budget was raised in response to another incident on this policy.",
+            raising
+              ? "Withdrawn automatically: the budget was raised in response to another incident on this policy."
+              : "Withdrawn automatically: the scope was resumed in response to another incident on this policy.",
             "incident_closed_without_decision",
           );
         }
@@ -1398,6 +1813,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
           .set({
             status: "dismissed",
             resolvedAt: new Date(),
+            resolutionAction: input.action,
             updatedAt: new Date(),
           })
           // Same `status = "open"` filter the raise branch uses above. Without it a
@@ -1420,7 +1836,12 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
         entityId: incident.id,
         details: {
           action: input.action,
+          // What the board sent, and separately what the cap actually is now.
+          // They differ on `resume_without_raise` with no amount -- the case the
+          // whole action exists for -- and a log that only carried `null` there
+          // could not answer "what was this scope capped at when it resumed?".
           amount: input.amount ?? null,
+          effectiveAmount: resolvedPolicyAmount,
           scopeType: incident.scopeType,
           scopeId: incident.scopeId,
         },

@@ -10,6 +10,7 @@ import {
   createDb,
   executionWorkspaces,
   externalRuntimeReservations,
+  heartbeatRunEvents,
   heartbeatRuns,
   issues,
   projects,
@@ -1906,6 +1907,71 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
     expect((overdue[0][0] as { silentForMs: number }).silentForMs).toBeGreaterThanOrEqual(20 * 60 * 1000);
     // No row, no release clock.
     expect(overdue[0][0]).toMatchObject({ releasePendingForMs: null });
+  }, 120_000);
+
+  // BLO-49987: the reaper runs only on the scheduler-lease leader, while the
+  // run's owner (the only writer of usage/session/cost) may be on the other
+  // worker. A succeeded Job seen while the reservation still reads `launched`
+  // used to be claimed as `job_complete` at once, so the owner's write was
+  // refused and ~46% of succeeded runs kept no usage and no cost_events row.
+  async function seedSucceededJobWithLaunchedReservation(name: string, lastActivityAt?: Date) {
+    const placeholder = randomUUID();
+    const seeded = await seedRunningRunWithObservedJob({
+      name,
+      slotId: 0,
+      reservation: {
+        kind: "launched",
+        expectedJobName: `ac-${placeholder}`,
+        jobName: `ac-${placeholder}`,
+        jobUid: `uid-${placeholder}`,
+      },
+      lastActivityAt,
+    });
+    const job = terminalJobFor(seeded);
+    await db
+      .update(externalRuntimeReservations)
+      .set({ expectedJobName: job.name, jobName: job.name, jobUid: job.uid })
+      .where(eq(externalRuntimeReservations.id, seeded.reservationId));
+    await db.insert(heartbeatRunEvents).values({
+      companyId: seeded.companyId,
+      runId: seeded.runId,
+      agentId: seeded.agentId,
+      seq: 1,
+      eventType: "adapter.invoke",
+    });
+    mockListManagedAgentJobs.mockResolvedValue([job]);
+    return seeded;
+  }
+
+  it("leaves a succeeded Job to its owner inside the stale window (BLO-49987)", async () => {
+    const { runId } = await seedSucceededJobWithLaunchedReservation("SucceededJobOwnerGraceCo");
+
+    await heartbeat.reapOrphanedRuns();
+
+    const run = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then((r) => r[0]);
+    expect(run?.status).toBe("running");
+  }, 120_000);
+
+  // The two tests below are the control for the one above: they differ only in
+  // lastActivityAt, and the grace guard is the only time-gated `continue`
+  // between the identity stamp and finalize. Change the seeds together.
+  // 8 min: past the 5-min grace but inside the 15-min stale window, so the
+  // deferral cannot outlive the Job's 900s TTL and turn job_complete into
+  // job_missing.
+  it.each([
+    { label: "past the grace, inside the stale window", silentMin: 8 },
+    { label: "silent", silentMin: 20 },
+  ])("finalizes a succeeded Job as job_complete once the owner is $label (BLO-49987)", async ({ silentMin }) => {
+    const { runId } = await seedSucceededJobWithLaunchedReservation(
+      `SucceededJobOwnerSilent${silentMin}Co`,
+      new Date(Date.now() - silentMin * 60 * 1000),
+    );
+
+    await heartbeat.reapOrphanedRuns();
+
+    const run = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then((r) => r[0]);
+    expect(run?.status).toBe("succeeded");
+    expect((run?.resultJson as Record<string, any> | null)?.externalLifecycleRecovery?.reason).toBe("job_complete");
   }, 120_000);
 
   it.each([

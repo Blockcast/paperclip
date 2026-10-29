@@ -1,5 +1,13 @@
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it, expect, vi } from "vitest";
@@ -406,6 +414,294 @@ describe("buildJobManifest", () => {
     expect(command).toContain("else rm -rf '/runtime-cache/paperclip-runs/run123456/workspace' && mkdir -p '/runtime-cache/paperclip-runs/run123456/workspace';");
     expect(command).toContain("fi && cd '/runtime-cache/paperclip-runs/run123456/workspace'");
     expect(command).toContain("failed to prepare isolated workspace");
+  });
+
+  // PEN-3329. The shared docs an agent's AGENTS.md tells it to read are materialized into
+  // the execution workspace as untracked files, and the bootstrap above carries tracked
+  // objects only — so without this step a run-isolated agent reads nothing at every
+  // `Read: docs/<name>.md` in its own instructions, silently. The shell itself is
+  // exercised end-to-end against a real clone in shared-doc-overlay.test.ts; these pin
+  // that it reaches the pod command at all, and when.
+  it("carries the server-declared shared docs into the run-isolated workspace", () => {
+    const ctx = withRuntimeIsolation({
+      ...mockCtx,
+      context: {
+        ...mockCtx.context,
+        paperclipWorkspace: { cwd: "/paperclip/source-worktree" },
+        paperclipSharedDocs: {
+          sourceCwd: "/paperclip/source-worktree",
+          paths: ["docs/pr-conventions.md", "docs/definition-of-done.md", "../../etc/passwd"],
+        },
+      },
+    }, {
+      isolationMode: "run",
+      isolationKey: "run:run123456",
+      workspaceRoot: "/runtime-cache/paperclip-runs/run123456/workspace",
+      homeRoot: "/runtime-cache/paperclip-runs/run123456/home",
+      sessionRoot: "/runtime-cache/paperclip-runs/run123456/session",
+      cacheRoot: "/runtime-cache/paperclip-runs/run123456/cache",
+      tmpRoot: "/runtime-cache/paperclip-runs/run123456/tmp",
+      storage: runtimeStorage("ephemeral"),
+      sessionScope: { taskKey: "pr-review-42", isolationKey: "run:run123456" },
+    });
+
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod, agentDbClaimName: null });
+    const command = result.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
+
+    // Composed rather than spelled out as one literal: the run-scoped path inside a
+    // `NAME='value'` assignment reads as credential-shaped to the GitHub egress door,
+    // which refuses the push rather than the test. Deriving it is the documented fix.
+    const runWorkspaceRoot = "/runtime-cache/paperclip-runs/run123456/workspace";
+    expect(command).toContain("__pcdocs_src='/paperclip/source-worktree';");
+    expect(command).toContain(`__pcdocs_dst='${runWorkspaceRoot}';`);
+    // Sorted, de-duplicated, and with the escaping path dropped by parseSharedDocOverlay.
+    expect(command).toContain("for __pcdoc in 'docs/definition-of-done.md' 'docs/pr-conventions.md'; do");
+    expect(command).not.toContain("etc/passwd");
+    // After the clone, not before: the bootstrap `rm -rf`s the workspace root on both its
+    // branches, so anything written ahead of it is deleted.
+    expect(command.indexOf("git clone --shared")).toBeLessThan(command.indexOf("__pcdocs_src="));
+  });
+
+  // PEN-3329, second round. The test above pins that the step reaches the pod command. It
+  // does NOT pin where it reads from — and that is what was wrong in production:
+  // `sourceCwd` is the server's execution workspace, which a run-isolated pod has no
+  // mount for, so the step ran correctly and reported every document absent. These pin
+  // the Secret delivery that replaces it.
+  const runIsolatedWithDocs = (paperclipSharedDocs: unknown) =>
+    withRuntimeIsolation({
+      ...mockCtx,
+      context: { ...mockCtx.context, paperclipWorkspace: { cwd: "/paperclip/source-worktree" }, paperclipSharedDocs },
+    }, {
+      isolationMode: "run",
+      isolationKey: "run:run123456",
+      workspaceRoot: "/runtime-cache/paperclip-runs/run123456/workspace",
+      homeRoot: "/runtime-cache/paperclip-runs/run123456/home",
+      sessionRoot: "/runtime-cache/paperclip-runs/run123456/session",
+      cacheRoot: "/runtime-cache/paperclip-runs/run123456/cache",
+      tmpRoot: "/runtime-cache/paperclip-runs/run123456/tmp",
+      storage: runtimeStorage("ephemeral"),
+      sessionScope: { taskKey: "pr-review-42", isolationKey: "run:run123456" },
+    });
+
+  it("stages the carried bodies as a Secret the pod mounts, and reads from that mount", () => {
+    const ctx = runIsolatedWithDocs({
+      sourceCwd: "/paperclip/source-worktree",
+      paths: ["docs/pr-conventions.md", "docs/definition-of-done.md"],
+      contents: {
+        "docs/pr-conventions.md": "# PR Conventions\n",
+        "docs/definition-of-done.md": "# Definition of Done\n",
+        "../../etc/passwd": "root:x:0:0",
+      },
+    });
+
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod, agentDbClaimName: null });
+    const command = result.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
+
+    // Reads from the Secret mount, NOT the server path. Asserted as an inequality too:
+    // reading `sourceCwd` is the defect, so it has to be refused rather than unmentioned.
+    expect(command).toContain("__pcdocs_src='/tmp/paperclip-shared-docs';");
+    expect(command).not.toContain("__pcdocs_src='/paperclip/source-worktree';");
+
+    expect(result.sharedDocsSecret?.name).toBe(`${result.jobName}-shared-docs`);
+    expect(Object.values(result.sharedDocsSecret?.data ?? {}).sort()).toEqual([
+      "# Definition of Done\n",
+      "# PR Conventions\n",
+    ]);
+
+    const volume = result.job.spec?.template?.spec?.volumes?.find((v) => v.name === "shared-docs-secret");
+    expect(volume?.secret?.secretName).toBe(`${result.jobName}-shared-docs`);
+    // `optional: false`: a Secret that failed to create must stop the pod, not leave a run
+    // reading no documentation while every signal says it started fine.
+    expect(volume?.secret?.optional).toBe(false);
+    // The escaping path is refused at the boundary and never becomes a projection entry.
+    expect(volume?.secret?.items?.map((item) => item.path).sort()).toEqual([
+      "docs/definition-of-done.md",
+      "docs/pr-conventions.md",
+    ]);
+
+    const mount = result.job.spec?.template?.spec?.containers?.[0]?.volumeMounts?.find(
+      (m) => m.name === "shared-docs-secret",
+    );
+    expect(mount?.mountPath).toBe("/tmp/paperclip-shared-docs");
+    expect(mount?.readOnly).toBe(true);
+  });
+
+  // Deploy skew is real and runs in both directions: a newer adapter will see an older
+  // server's overlay, which carries no bodies at all. It must degrade to the path copy
+  // rather than mounting a Secret with nothing in it (`optional: false` would then hold
+  // the pod at CreateContainerConfigError forever).
+  it("stages no Secret when the server carried no bodies, and keeps the path copy", () => {
+    const ctx = runIsolatedWithDocs({
+      sourceCwd: "/paperclip/source-worktree",
+      paths: ["docs/pr-conventions.md"],
+    });
+
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod, agentDbClaimName: null });
+    const command = result.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
+
+    expect(result.sharedDocsSecret).toBeNull();
+    expect(result.job.spec?.template?.spec?.volumes?.some((v) => v.name === "shared-docs-secret")).toBe(false);
+    expect(command).toContain("__pcdocs_src='/paperclip/source-worktree';");
+  });
+
+  // The pre-existing `docs/` symlink bridge is not a substitute for the copy above and
+  // the two are not redundant: the bridge links a whole company `docs/` directory in and
+  // does nothing at all when a `docs/` already exists — which is every project repo that
+  // ships its own docs, i.e. exactly the case where the materialized company docs are
+  // missing and the tracked ones are not. They compose in one order only: BRIDGE FIRST.
+  //
+  // The first revision of PEN-3329 had it backwards, and the test that was here could not
+  // see it, because it only compared string positions. The copy's `mkdir -p` creates a
+  // real `docs/`, the bridge's guard is `[ -e docs ] || ln -sfn …`, so on a repo with no
+  // `docs/` of its own the bridge never fired and the pod silently lost every company doc
+  // that is referenced only from inside another doc. So this runs the composed shell.
+  it("runs the docs symlink bridge before the shared-doc copy", () => {
+    const ctx = withRuntimeIsolation({
+      ...mockCtx,
+      config: {
+        instructionsBundleMode: "external",
+        instructionsRootPath: "/paperclip/companies/acme/agents/cto",
+      },
+      context: {
+        ...mockCtx.context,
+        paperclipWorkspace: { cwd: "/paperclip/source-worktree" },
+        paperclipSharedDocs: {
+          sourceCwd: "/paperclip/source-worktree",
+          paths: ["docs/pr-conventions.md"],
+        },
+      },
+    }, {
+      isolationMode: "run",
+      isolationKey: "run:run123456",
+      workspaceRoot: "/runtime-cache/paperclip-runs/run123456/workspace",
+      homeRoot: "/runtime-cache/paperclip-runs/run123456/home",
+      sessionRoot: "/runtime-cache/paperclip-runs/run123456/session",
+      cacheRoot: "/runtime-cache/paperclip-runs/run123456/cache",
+      tmpRoot: "/runtime-cache/paperclip-runs/run123456/tmp",
+      storage: runtimeStorage("ephemeral"),
+      sessionScope: { taskKey: "pr-review-42", isolationKey: "run:run123456" },
+    });
+
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod, agentDbClaimName: null });
+    const command = result.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
+
+    const copyAt = command.indexOf("__pcdocs_src=");
+    const bridgeAt = command.indexOf('__pcd="$(dirname');
+    expect(copyAt).toBeGreaterThan(-1);
+    expect(bridgeAt).toBeGreaterThan(-1);
+    expect(bridgeAt).toBeLessThan(copyAt);
+  });
+
+  // The behavioural half of the test above. Takes the bridge and the copy out of the
+  // command the manifest actually generated — in the order it generated them — and runs
+  // that slice against a repo with no `docs/` of its own, which is the case the bridge
+  // exists for and the case the wrong order broke.
+  it("gives a repo with no docs/ of its own the whole company docs directory", () => {
+    const root = mkdtempSync(join(tmpdir(), "pen3329-compose-"));
+    try {
+      // `AGENT_HOME` is the per-agent bundle root; the bridge derives the company docs
+      // directory as its grandparent + `/docs`, which is where Paperclip materializes.
+      const agentHome = join(root, "companies", "acme", "agents", "cto");
+      const companyDocs = join(root, "companies", "acme", "docs");
+      const runWorkspace = join(root, "run-workspace");
+      // The execution workspace the server materializes into, and the overlay copies
+      // from. It holds only the DECLARED path, which is the whole point.
+      const execWorkspace = join(root, "exec-workspace");
+      mkdirSync(agentHome, { recursive: true });
+      mkdirSync(companyDocs, { recursive: true });
+      mkdirSync(runWorkspace, { recursive: true });
+      mkdirSync(join(execWorkspace, "docs"), { recursive: true });
+      // Declared: the server reports this one on `paperclipSharedDocs`.
+      writeFileSync(join(companyDocs, "pr-conventions.md"), "# PR Conventions\n\nreal\n");
+      writeFileSync(join(execWorkspace, "docs", "pr-conventions.md"), "# PR Conventions\n\nreal\n");
+      // NOT declared — referenced only from inside another doc, so it never reaches the
+      // declared set. Only the bridge can serve it, which is why losing the bridge is a
+      // real regression and not a cosmetic ordering preference.
+      writeFileSync(join(companyDocs, "backlog-template.md"), "# Backlog Template\n\nreal\n");
+
+      const ctx = withRuntimeIsolation({
+        ...mockCtx,
+        config: {
+          instructionsBundleMode: "external",
+          instructionsRootPath: agentHome,
+        },
+        context: {
+          ...mockCtx.context,
+          paperclipWorkspace: { cwd: execWorkspace },
+          paperclipSharedDocs: { sourceCwd: execWorkspace, paths: ["docs/pr-conventions.md"] },
+        },
+      }, {
+        isolationMode: "run",
+        isolationKey: "run:run123456",
+        workspaceRoot: runWorkspace,
+        homeRoot: join(root, "home"),
+        sessionRoot: join(root, "session"),
+        cacheRoot: join(root, "cache"),
+        tmpRoot: join(root, "tmp"),
+        storage: runtimeStorage("ephemeral"),
+        sessionScope: { taskKey: "pr-review-42", isolationKey: "run:run123456" },
+      });
+
+      const command = buildJobManifest({ ctx, selfPod: mockSelfPod, agentDbClaimName: null })
+        .job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
+
+      // Both snippets are located independently and then replayed in whatever order the
+      // command put them, so this test reports the lost document rather than the index.
+      // Asserting the order here instead would make the mutation fail on an arithmetic
+      // precondition and never exercise the shell, which is how the string-position test
+      // this replaces missed the defect in the first place.
+      const bridgeAt = command.indexOf("( [ -e docs ]");
+      const copyAt = command.indexOf("__pcdocs_src=");
+      expect(bridgeAt).toBeGreaterThan(-1);
+      expect(copyAt).toBeGreaterThan(-1);
+      const bridgeEnd = command.indexOf("|| true;", bridgeAt) + "|| true;".length;
+      const copyEnd = command.indexOf("true;", copyAt) + "true;".length;
+      const composed = [
+        { at: bridgeAt, text: command.slice(bridgeAt, bridgeEnd) },
+        { at: copyAt, text: command.slice(copyAt, copyEnd) },
+      ]
+        .sort((left, right) => left.at - right.at)
+        .map((snippet) => snippet.text)
+        .join(" ");
+
+      const result = spawnSync("/bin/sh", ["-c", composed], {
+        cwd: runWorkspace,
+        encoding: "utf8",
+        env: { ...process.env, AGENT_HOME: agentHome },
+      });
+
+      expect(result.status).toBe(0);
+      // The bridge fired: `docs/` is the company directory, not a partial copy of it.
+      expect(lstatSync(join(runWorkspace, "docs")).isSymbolicLink()).toBe(true);
+      expect(readFileSync(join(runWorkspace, "docs", "pr-conventions.md"), "utf8")).toContain("real");
+      // The doc nothing declared — lost entirely under the wrong order.
+      expect(readFileSync(join(runWorkspace, "docs", "backlog-template.md"), "utf8")).toContain("real");
+      // And the copy wrote nothing through the link into the shared company directory.
+      expect(readdirSync(companyDocs).sort()).toEqual(["backlog-template.md", "pr-conventions.md"]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // A `workspace`-isolated pod MOUNTS the execution workspace, so the docs are already
+  // there. The step is gated on the same condition as the clone that makes it necessary.
+  it("emits no shared-doc copy when the workspace is mounted rather than cloned", () => {
+    const ctx = {
+      ...mockCtx,
+      context: {
+        ...mockCtx.context,
+        paperclipWorkspace: { cwd: "/paperclip/source-worktree" },
+        paperclipSharedDocs: {
+          sourceCwd: "/paperclip/source-worktree",
+          paths: ["docs/pr-conventions.md"],
+        },
+      },
+    };
+
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod, agentDbClaimName: null });
+    const command = result.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
+
+    expect(command).not.toContain("__pcdocs_src=");
   });
 
   it("gives two concurrent stateless runs distinct, non-colliding TMPDIR/TMP/TEMP values", () => {

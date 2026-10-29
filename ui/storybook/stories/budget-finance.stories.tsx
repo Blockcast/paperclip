@@ -93,6 +93,7 @@ const budgetIncidents: BudgetIncident[] = [
     amountLimit: 40_000,
     amountObserved: 42_450,
     status: "resolved",
+    resolutionAction: "raise_budget_and_resume",
     approvalId: "approval-budget-resolved",
     approvalStatus: "approved",
     resolvedAt: at(42),
@@ -114,6 +115,7 @@ const budgetIncidents: BudgetIncident[] = [
     amountLimit: 120_000,
     amountObserved: 131_400,
     status: "open",
+    resolutionAction: null,
     approvalId: "approval-budget-pending",
     approvalStatus: "pending",
     resolvedAt: null,
@@ -135,6 +137,7 @@ const budgetIncidents: BudgetIncident[] = [
     amountLimit: 250_000,
     amountObserved: 287_300,
     status: "open",
+    resolutionAction: null,
     approvalId: "approval-budget-escalated",
     approvalStatus: "revision_requested",
     resolvedAt: null,
@@ -598,6 +601,7 @@ function BudgetFinanceMatrix() {
                 incident={budgetIncidents[0]!}
                 onKeepPaused={() => undefined}
                 onRaiseAndResume={() => undefined}
+                onResumeWithoutRaise={() => undefined}
               />
             </CaseFrame>
             <CaseFrame title="Pending board decision" detail="Project execution is paused while a budget approval waits for review." tone="warning">
@@ -605,6 +609,7 @@ function BudgetFinanceMatrix() {
                 incident={budgetIncidents[1]!}
                 onKeepPaused={() => undefined}
                 onRaiseAndResume={() => undefined}
+                onResumeWithoutRaise={() => undefined}
               />
             </CaseFrame>
             <CaseFrame title="Escalated hard stop" detail="Company spend exceeded the cap and the first approval needs revision." tone="critical">
@@ -612,6 +617,7 @@ function BudgetFinanceMatrix() {
                 incident={budgetIncidents[2]!}
                 onKeepPaused={() => undefined}
                 onRaiseAndResume={() => undefined}
+                onResumeWithoutRaise={() => undefined}
               />
             </CaseFrame>
           </div>

@@ -18,6 +18,13 @@ import { buildClaudeCodeRuntimeShell, buildImageWrapperPreflightShell, buildPreP
 import { GIT_HOOKS_SUBPATH } from "./github-git-hooks-path.js";
 import { buildPodLogRedactorSetupShell, POD_LOG_FILTER_ARG_VAR, POD_LOG_FILTER_VAR } from "./pod-log-redactor.js";
 import { SERVER_ONLY_ENV_DENY } from "./inherit-allowlist.js";
+import {
+  buildSharedDocOverlayShell,
+  buildSharedDocSecretProjection,
+  parseSharedDocOverlay,
+  SHARED_DOC_SECRET_MOUNT_PATH,
+  SHARED_DOC_SECRET_VOLUME_NAME,
+} from "./shared-doc-overlay.js";
 import { SELF_POD_DATA_MOUNT_PATH } from "./k8s-client.js";
 
 /**
@@ -605,9 +612,10 @@ const SHARED_PNPM_STORE_SUBPATH = "instances/default/data/k8s-isolation/pnpm";
  * tree — every foreign company's `companies/`, `run-logs/`, `projects/` and
  * `k8s-isolation/`, plus `secrets/master.key`, `data/backups/` (DB dumps),
  * `.env`, `config.json` and `db/` — and the run's own subPath binds are
- * re-applied on top of it. Root-level toolchain dirs are re-exposed by the root
- * overlay below. The overlay is rw only so the runtime can create mountpoint
- * dirs inside it for those binds; nothing persists past the pod.
+ * re-applied on top of it. The root overlay below re-exposes only the git-hooks
+ * dir: PEN-4932 stage 3 dropped the six fleet-wide toolchain dirs it used to
+ * re-expose alongside it. The overlay is rw only so the runtime can create
+ * mountpoint dirs inside it for those binds; nothing persists past the pod.
  */
 const INSTANCE_ROOT_SUBPATH = "instances/default";
 const INSTANCE_OVERLAY_VOLUME_NAME = "instance-overlay";
@@ -618,26 +626,46 @@ const INSTANCE_OVERLAY_SIZE_LIMIT = "16Mi";
  * `.secrets`, `.claude/.credentials.json`, mkcert's CA key under `.local/share`,
  * and every tenant's `wt-*` worktrees. A read-only parent still let every
  * narrowed pod READ all of it, so the root gets an emptyDir as well, and only
- * the toolchain a narrowed run resolves is re-exposed read-only. Measured
- * 2026-10-21 from a narrowed pod: HOME, XDG_* and CLAUDE_CONFIG_DIR are per-run,
- * and the only root references are PATH (`.local/bin`, `bin`) plus the symlink
- * targets inside those two dirs. Allowlist, not denylist: the root has ~440
- * entries and gains new `wt-*` dirs weekly.
+ * `ROOT_TOOLCHAIN_SUBPATHS` is re-exposed read-only. Measured 2026-10-21 from a
+ * narrowed pod: HOME, XDG_* and CLAUDE_CONFIG_DIR are per-run, and the only root
+ * references were PATH (`.local/bin`, `bin`) plus the symlink targets inside
+ * those two dirs. PEN-4932 stage 3 dropped all of those, so that list is now the
+ * git-hooks dir alone, and those PATH entries resolve into the rw overlay rather
+ * than a read-only bind — see the note below. Allowlist, not denylist: the root
+ * has ~440 entries and gains new `wt-*` dirs weekly.
  */
 const ROOT_OVERLAY_VOLUME_NAME = "root-overlay";
-// `.local/share/paperclip-git-hooks` holds the PEN-3156 pre-push publish guard
-// the image `git` wrapper points core.hooksPath at; without it every push from
-// a narrowed pod fails closed (BLO-48361). Only that dir, never `.local/share`,
-// which also holds mkcert's CA key.
-const ROOT_TOOLCHAIN_SUBPATHS = [
-  "bin",
-  "tools",
-  "jre",
-  ".local/bin",
-  GIT_HOOKS_SUBPATH,
-  ".bun/bin",
-  ".cache/puppeteer-browsers",
-];
+// PEN-4932 stage 3. This list used to re-expose the whole fleet-wide toolchain
+// off the shared `paperclip-data` volume: `bin`, `tools`, `jre`, `.local/bin`,
+// `.bun/bin` and `.cache/puppeteer-browsers`. All six are gone — every binary
+// they carried is now image-resident (#3079, #3081), dead, or deliberately
+// fetched at use time, each entry triaged by measurement in
+// `docs/plans/2026-10-28-pen-4932-per-agent-volumes.md` §3.3-§3.5.
+//
+// They were removed as the two units §3.7 item 4 measured, never entry by
+// entry, because `bin` is a hub of symlinks pointing OUT of itself: `go`,
+// `gofmt` and `tinygo` into `tools`, `java` into `jre`, `google-chrome` into
+// `.cache/puppeteer-browsers`; and `.local/bin/bunx` into `.bun/bin`. Dropping
+// a target without its `bin` entry leaves a dangling symlink; dropping `bin`
+// without its targets orphans them. If any of these is ever re-added, re-add
+// its whole unit.
+//
+// What this does NOT do is reduce ceph-csi lock exposure — that is stage 4's
+// job, and nothing before it moves the number. Exposure scales with pods ×
+// volume, and the ~14 company-, project-, agent- and workspace-scoped subPaths
+// still bind `paperclip-data` after this change. Stage 3 is the precondition
+// that lets stage 4 swap `dataClaimName` for a per-agent claim, which is where
+// blast radius actually falls.
+//
+// `.local/share/paperclip-git-hooks` stays, and is now the only entry. It holds
+// the PEN-3156 pre-push publish guard the image `git` wrapper points
+// core.hooksPath at; without it every push from a narrowed pod fails closed
+// (BLO-48361). Only that dir, never `.local/share`, which also holds mkcert's
+// CA key. It is a security control with a four-consumer join across two
+// repositories and a fail-OPEN failure mode — core.hooksPath aimed at an empty
+// directory means pushes succeed unscanned — so it is relocated into the image
+// under its own review (§3.6), not here.
+const ROOT_TOOLCHAIN_SUBPATHS = [GIT_HOOKS_SUBPATH];
 
 function sharedPnpmStorePath(rawCompanyId: string, dataMountPath: string): string {
   const companyId = sanitizeForK8sPath(rawCompanyId);
@@ -1196,6 +1224,22 @@ export interface McpConfigSecret {
   data: Record<string, string>;
 }
 
+/** Non-null whenever the server carried shared-doc bodies for this run.
+ *  The documents an agent's AGENTS.md tells it to read cannot reach a
+ *  run-isolated pod as a path — the execution workspace is deliberately not
+ *  in that pod's mount set — so the bodies are staged as a Secret volume and
+ *  projected back to their repo-relative layout (PEN-3329). Not credential
+ *  material; a Secret is used for the same reason mcp.json is, namely that it
+ *  is the one delivery channel here that is bounded, cleaned up with the run,
+ *  and independent of which host paths the pod happens to mount. Same
+ *  lifecycle as promptSecret: the caller creates it before the Job and cleans
+ *  it up after. */
+export interface SharedDocsSecret {
+  name: string;
+  namespace: string;
+  data: Record<string, string>;
+}
+
 /**
  * Env var name patterns that must never carry a literal Job-pod value.
  * Matches anywhere in the name, case-insensitive. A false-positive match
@@ -1653,6 +1697,8 @@ export interface JobBuildResult {
   /** Non-null whenever a merged mcp.json is shipped to the pod — always
    *  Secret-backed, never a literal init-container env var (BLO-17980/BLO-17973). */
   mcpConfigSecret: McpConfigSecret | null;
+  /** Shared-doc bodies staged as a Secret volume; same lifecycle as the others. */
+  sharedDocsSecret: SharedDocsSecret | null;
   /** User-supplied extra labels that were dropped because they used a reserved prefix. */
   skippedLabels: string[];
   /** Path to the pod log file on the shared PVC. */
@@ -2164,6 +2210,236 @@ function buildDindSidecar(opts: {
   return sidecar;
 }
 
+// ---------------------------------------------------------------------------
+// PEN-4933 / PEN-3183 D1: the GitHub publish broker sidecar.
+//
+// PEN-3183 measured that the surviving bypass of the egress guard is not a
+// writable guard file but a READABLE CREDENTIAL: the agent and the wrapper are
+// one principal (one container, uid 1000, no privilege escalation, all
+// capabilities dropped), so any binary the wrapper may exec the agent may exec
+// directly — and the push token was mounted `defaultMode: 292` (0444) where
+// that uid could read it. The decision (§1 D1) was to move enforcement
+// credential-side: hold the token in a container the agent cannot read into,
+// and have that container perform the publish.
+//
+// So: the inherited GitHub credential Secret volumes are mounted into THIS
+// sidecar and are REMOVED from the agent container, and the two containers
+// share only a unix socket on an `emptyDir`.
+//
+// ⚠ The boundary is the CONTAINER, not the file mode. A Kubernetes Secret
+// volume's files are owned by root, so `defaultMode: 0400` would deny the
+// broker's own uid as readily as the agent's, and the usual way round that —
+// `fsGroup` — is pod-scoped and would hand the agent a supplementary group
+// instead. What makes the agent unable to read the token is that the mount is
+// not in its mount namespace at all; the mode it is mounted with is then
+// irrelevant, and pretending otherwise would be the kind of overclaim
+// PEN-3183 §8 prohibits. The uid split below is defence in depth against a
+// future `shareProcessNamespace`, not the mechanism.
+// ---------------------------------------------------------------------------
+
+/** Directory holding the broker socket, shared with the agent container. */
+const GITHUB_BROKER_SOCKET_DIR = "/var/run/paperclip-github-broker";
+const GITHUB_BROKER_SOCKET_PATH = `${GITHUB_BROKER_SOCKET_DIR}/broker.sock`;
+const GITHUB_BROKER_SOCKET_VOLUME = "github-broker-sock";
+
+/**
+ * A shared `/tmp`.
+ *
+ * Needed because `gh --body-file /tmp/body.md` is the documented way to pass
+ * authored text through the egress scrubber (the stdin form is refused), and
+ * the broker has to READ that file to scrub it. Scrubbing agent-side and
+ * trusting the result on the broker side is precisely the "gate on issuance,
+ * not on use" error PEN-3183 §5 names, so the file has to cross, not the
+ * verdict.
+ *
+ * Pushed to the FRONT of the agent's mount list: `/tmp/prompt` is already
+ * mounted, and this builder's own shadowing backstop refuses a parent mounted
+ * after its child (Kubernetes admits such a Pod and the child is then
+ * unreachable — BLO-40401).
+ */
+const GITHUB_BROKER_TMP_VOLUME = "shared-tmp";
+const GITHUB_BROKER_TMP_MOUNT_PATH = "/tmp";
+
+/**
+ * Scratch mounted in the BROKER CONTAINER ONLY.
+ *
+ * The broker creates its per-invocation `GH_CONFIG_DIR` here. It must not use
+ * the shared `/tmp` above: `mkdtemp` makes a 0700 directory, but its parent is
+ * an `emptyDir` the agent can write and Kubernetes sets no sticky bit on one,
+ * so uid 1000 can rename that directory away and put its own in its place —
+ * and `gh` would then read an alias out of it and run shell beside the
+ * credential. Kept out of the agent's mount list for the same reason the
+ * credential is (`BROKER_PRIVATE_DIR` in adapter-utils; §7.3 of the decision
+ * doc on why the namespace, not the mode, is the mechanism).
+ *
+ * ⚠ `/var/lib`, not `/run`: `/var/run` is a symlink to `/run` on this image,
+ * and {@link GITHUB_BROKER_SOCKET_DIR} — which the AGENT mounts — is
+ * `/var/run/paperclip-github-broker`. A private dir at
+ * `/run/paperclip-github-broker` is the same directory, so it would be
+ * agent-writable. The shadowing backstop below compares literal mount paths
+ * and would admit the pair silently.
+ */
+const GITHUB_BROKER_PRIVATE_VOLUME = "github-broker-private";
+const GITHUB_BROKER_PRIVATE_DIR = "/var/lib/paperclip-github-broker";
+
+/** uid the broker runs as. Anything but 1000; see the uid note above. */
+const GITHUB_BROKER_UID = 1001;
+
+/**
+ * Environment variable names that are THEMSELVES a GitHub push credential.
+ *
+ * The mount diversion below moves the credential *Secret volume* out of the
+ * agent container. It does nothing about a credential delivered as an
+ * environment variable, and that is a real second delivery route rather than a
+ * hypothetical one: `GH_SEAT_TOKEN_VALUE` exists precisely so a token can be
+ * given to one agent without mounting it fleet-wide (BLO-18927), and
+ * `translateGithubSeatTokenForExecutionTarget` (server/src/services/
+ * heartbeat.ts) expands it into `GH_TOKEN`/`GITHUB_TOKEN` in `adapterConfig.
+ * env` — layer 4 here, which lands in the agent container's env.
+ *
+ * With one of these present the boundary is simply absent, and it fails in the
+ * direction that looks fine: the mount is gone, every assertion about mount
+ * paths passes, and `/usr/bin/git push` still authenticates. The route is the
+ * system git scope — `Dockerfile.runtime` writes
+ * `credential.https://github.com.helper = !/usr/bin/gh auth git-credential`
+ * into `/etc/gitconfig`, which every git in the pod loads — and
+ * `scripts/gh-token-wrapper.sh` answers it from `GH_SEAT_TOKEN_VALUE` in its
+ * FIRST branch, before any broker consideration. So no intent and no knowledge
+ * of where the credential lives is required, which is PEN-3183 §4.0: the
+ * control's own threat, accidental disclosure, not the deliberate one.
+ *
+ * A SUPERSET of the credential names the broker hands to its own children
+ * ({@link INHERITED_ENV_NAMES} in `github-publish-broker.ts`), which carries
+ * three: `GH_TOKEN`, `GITHUB_TOKEN`, `GITHUB_PERSONAL_ACCESS_TOKEN`. The extra
+ * one here is `GH_SEAT_TOKEN_VALUE`, and the asymmetry is correct in both
+ * directions: the broker has no reason to forward the seat token (its own
+ * token wrapper does not read it), while this check must refuse it, because
+ * `gh-token-wrapper.sh` answers the system credential helper from it directly
+ * — it is the delivery route this whole refusal exists for.
+ *
+ * Kept in step deliberately in the one direction that matters: a name the
+ * broker treats as a credential is a name the agent container must not carry.
+ */
+const AGENT_GITHUB_CREDENTIAL_ENV_NAMES = [
+  "GH_TOKEN",
+  "GITHUB_TOKEN",
+  "GITHUB_PERSONAL_ACCESS_TOKEN",
+  "GH_SEAT_TOKEN_VALUE",
+] as const;
+
+/**
+ * Credential-shaped env names present on the agent container, in order.
+ *
+ * Matched on NAME, and a `valueFrom` entry counts exactly as much as a literal
+ * one: routing a value through a `secretKeyRef` changes where the Job stores
+ * it, not whether the process can read it out of its own environment.
+ *
+ * SCOPE, stated because the defect this function exists to fix was caused by a
+ * check whose name claimed more than it tested. This reads the container's
+ * `env` LIST ONLY. It does not and cannot cover `envFrom`: a `secretRef` there
+ * injects every key of the referenced Secret, and those keys are not in the
+ * PodSpec -- they are in the Secret -- so no manifest-time check can enumerate
+ * them. `selfPod.inheritedEnvFrom` is filtered by `isAgentInheritableEnvFromRef`
+ * (k8s-client.ts) by NAME rather than by key, so a GitHub credential placed in
+ * an inheritable `envFrom` source would reach the agent container past this
+ * refusal. That is a real residual, recorded in section 7.3 of the decision
+ * doc; do not read a green render as "no credential in this container".
+ */
+export function findAgentGitHubCredentialEnvNames(env: k8s.V1EnvVar[]): string[] {
+  const present = new Set(env.map((e) => e.name));
+  return AGENT_GITHUB_CREDENTIAL_ENV_NAMES.filter((n) => present.has(n));
+}
+
+/** Where the image installs the egress wrappers and the broker runtime. */
+const GITHUB_BROKER_WRAPPER_DIR = "/usr/local/libexec/paperclip/bin";
+const GITHUB_BROKER_RUNTIME_JS =
+  "/opt/paperclip-bundled-adapters/node_modules/@paperclipai/adapter-utils/dist/github-publish-broker-runtime.js";
+
+/**
+ * Does this inherited Secret volume carry a GitHub credential?
+ *
+ * Matched on the MOUNT PATH rather than the Secret or volume name, because the
+ * mount path is what the consumers resolve: `PAPERCLIP_GITHUB_TOKEN_FILE` and
+ * the credential helper both name a file under `/etc/paperclip/secrets/
+ * github-*token/`, and that is the thing the agent container must stop being
+ * able to open. A Secret renamed in the chart keeps working; a Secret mounted
+ * somewhere else would not be found by its consumers either.
+ *
+ * Fails in the SAFE direction when it is wrong in one way and the unsafe
+ * direction in the other, so the manifest test asserts the outcome (no
+ * credential path reachable from the agent container) rather than this
+ * predicate's return value.
+ */
+export function isGitHubCredentialSecretVolume(mountPath: string): boolean {
+  // Trailing separators trimmed the same way the collision map below trims
+  // them, so `/etc/paperclip/secrets/github-token/` and the bare path are one
+  // value here. Not a shared helper with that map: this one is reached from
+  // module scope and that one closes over the builder's locals.
+  const normalized = mountPath.replace(/\/+$/, "") || "/";
+  return /^\/etc\/paperclip\/secrets\/github-[a-z0-9-]*token$/.test(normalized);
+}
+
+/**
+ * The broker sidecar.
+ *
+ * Deployed as a native sidecar (initContainer with `restartPolicy: "Always"`),
+ * the same shape as the DinD sidecar above: it starts before the agent
+ * container, lives for the Job, and terminates when the agent exits.
+ *
+ * Runs the SAME image as the agent, so the wrapper it re-enters and the
+ * scanner it runs are byte-identical to the ones the agent would have run.
+ * That is what keeps the tested door parity true: the broker has no notion of
+ * its own about what a push may contain (PEN-3183 §8).
+ *
+ * `umask 0002` because the repository belongs to uid 1000 and a push writes
+ * remote-tracking refs into it. The broker shares gid 1000 so those writes land
+ * group-writable rather than leaving files the agent cannot subsequently
+ * update.
+ */
+function buildGitHubPublishBrokerSidecar(opts: {
+  image: string;
+  imagePullPolicy: string;
+  workspaceRoot: string;
+  secretMounts: k8s.V1VolumeMount[];
+  dataMounts: k8s.V1VolumeMount[];
+  env: k8s.V1EnvVar[];
+}): k8s.V1Container {
+  const command =
+    `umask 0002; exec ${GITHUB_BROKER_WRAPPER_DIR}/paperclip-github-token-env ` +
+    `/usr/local/bin/node ${GITHUB_BROKER_RUNTIME_JS}`;
+  return {
+    name: "github-publish-broker",
+    image: opts.image,
+    imagePullPolicy: opts.imagePullPolicy,
+    command: ["sh", "-c", command],
+    env: [
+      ...opts.env,
+      { name: "PAPERCLIP_GITHUB_BROKER_SOCKET", value: GITHUB_BROKER_SOCKET_PATH },
+      { name: "PAPERCLIP_GITHUB_BROKER_WORKSPACE_ROOT", value: opts.workspaceRoot },
+    ],
+    securityContext: {
+      capabilities: { drop: ["ALL"] },
+      readOnlyRootFilesystem: false,
+      runAsNonRoot: true,
+      runAsUser: GITHUB_BROKER_UID,
+      runAsGroup: 1000,
+      allowPrivilegeEscalation: false,
+    },
+    resources: {
+      requests: { cpu: "50m", memory: "128Mi" },
+      limits: { cpu: "1", memory: "512Mi" },
+    },
+    volumeMounts: [
+      { name: GITHUB_BROKER_TMP_VOLUME, mountPath: GITHUB_BROKER_TMP_MOUNT_PATH },
+      { name: GITHUB_BROKER_PRIVATE_VOLUME, mountPath: GITHUB_BROKER_PRIVATE_DIR },
+      ...opts.dataMounts,
+      ...opts.secretMounts,
+      { name: GITHUB_BROKER_SOCKET_VOLUME, mountPath: GITHUB_BROKER_SOCKET_DIR },
+    ],
+    restartPolicy: "Always",
+  };
+}
+
 /**
  * Shell snippet the main container prepends to its command when the DinD
  * sidecar is enabled. Polls for the shared socket to appear (sidecar
@@ -2421,6 +2697,17 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // Throws on anything but an exact version or "image" — the value is shell-interpolated.
   const claudeCodeVersion = resolveClaudeCodeVersion(config.claudeCodeVersion);
   const enableDocker = asBoolean(config.enableDocker, false);
+  // PEN-4933 / PEN-3183 D1. Default OFF, and this is a ROLLOUT gate, not a kill
+  // switch on the egress refusals — §6 of the decision document records why one
+  // of those must never exist. With it off the pod is exactly what it was
+  // before: the credential mounted into the agent container, the accepted
+  // residual of §7 still running. With it on the credential moves to a sidecar
+  // and the agent cannot authenticate at all, which changes every agent's
+  // publish path fleet-wide. That is the one failure mode §6 cites as the
+  // reason D4 was deferred, so it gets a soak behind a flag rather than a flag
+  // day. Once enabled it must not be switched back off to clear an incident
+  // without re-opening the §7 acceptance with Security.
+  const enableGitHubPublishBroker = asBoolean(config.enableGitHubPublishBroker, false);
   const dockerImage = asString(config.dockerImage, "docker:28-dind");
   const dockerCpuLimit = asString(config.dockerCpuLimit, "4");
   const dockerMemoryLimit = asString(config.dockerMemoryLimit, "8Gi");
@@ -2802,6 +3089,9 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // SKIPPED rather than thrown on — except when it collides with the
   // operator-chosen workspace mount, which is a config mistake the operator can
   // actually fix and so is surfaced instead of silently dropping a secret.
+  // Credential mounts diverted to the broker sidecar (PEN-4933). Empty unless
+  // the broker is enabled, in which case the agent container loses them.
+  const brokerSecretMounts: k8s.V1VolumeMount[] = [];
   for (const sv of selfPod.secretVolumes) {
     const normalized = normalizeMountPath(sv.mountPath);
     if (normalized === normalizedDataMountPath) {
@@ -2873,11 +3163,17 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
         ...(sv.optional === undefined ? {} : { optional: sv.optional }),
       },
     });
-    volumeMounts.push({
-      name: sv.volumeName,
-      mountPath: sv.mountPath,
-      readOnly: true,
-    });
+    const mount: k8s.V1VolumeMount = { name: sv.volumeName, mountPath: sv.mountPath, readOnly: true };
+    // PEN-4933: the whole of the change, in three lines. A GitHub credential
+    // volume is still PROPAGATED (it is in `volumes` above, and the broker
+    // sidecar mounts it), but it is not mounted into the agent container, so
+    // uid 1000 has no path to open. Everything else about the credential —
+    // which Secret, which key, whether it is optional — is unchanged.
+    if (enableGitHubPublishBroker && isGitHubCredentialSecretVolume(sv.mountPath)) {
+      brokerSecretMounts.push(mount);
+      continue;
+    }
+    volumeMounts.push(mount);
   }
 
   // Security context matching the main Deployment
@@ -3261,6 +3557,45 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
         `fi && cd ${quoteShellArg(isolation.workspaceRoot)}`,
       ].join(" ")
     : "";
+  // PEN-3329. Both branches of `workspaceSetup` above lose the shared docs the server
+  // materialized into the execution workspace: the clone carries tracked objects only,
+  // and the fallback branch hands the run an empty directory. This runs after either one
+  // and copies the declared set across. Gated on the same condition as `workspaceSetup`
+  // because every other isolation mode mounts that workspace directly and already has
+  // them. See `shared-doc-overlay.ts` for why the set is declared rather than discovered.
+  const sharedDocOverlay = workspaceSetup ? parseSharedDocOverlay(context.paperclipSharedDocs) : null;
+  // The bodies travel with the Job. `sourceCwd` is the server's execution workspace and a
+  // run-isolated pod does not mount it, so a copy from there reports every doc absent —
+  // measured on a live pod, 2026-10-29. Staging a Secret makes delivery depend on the Job
+  // alone rather than on the pod's mount set. The path copy stays as the fallback for a
+  // server too old to send bodies; `buildSharedDocOverlayShell` picks whichever applies.
+  const sharedDocProjection = sharedDocOverlay ? buildSharedDocSecretProjection(sharedDocOverlay) : null;
+  let sharedDocsSecret: SharedDocsSecret | null = null;
+  if (sharedDocProjection) {
+    const sharedDocsSecretName = `${jobName}-shared-docs`;
+    sharedDocsSecret = { name: sharedDocsSecretName, namespace, data: sharedDocProjection.data };
+    volumes.push({
+      name: SHARED_DOC_SECRET_VOLUME_NAME,
+      // `items` restores `docs/<name>.md` from the positional keys, so the mount has the
+      // same shape the copy loop expects and the loop needs no per-path knowledge of the
+      // staging scheme. `optional: false` — a Secret that failed to create must surface
+      // as a pod that cannot start, not as a run that silently reads no documentation.
+      secret: { secretName: sharedDocsSecretName, optional: false, items: sharedDocProjection.items },
+    });
+    volumeMounts.push({
+      name: SHARED_DOC_SECRET_VOLUME_NAME,
+      mountPath: SHARED_DOC_SECRET_MOUNT_PATH,
+      readOnly: true,
+    });
+  }
+  const sharedDocOverlaySetup = sharedDocOverlay
+    ? buildSharedDocOverlayShell({
+        overlay: sharedDocOverlay,
+        workspaceRoot: isolation.workspaceRoot,
+        quote: quoteShellArg,
+        ...(sharedDocProjection ? { sourceDir: SHARED_DOC_SECRET_MOUNT_PATH } : {}),
+      })
+    : "";
   // The mkdir, the redactor's fall-open sentinel and the tee all run INSIDE the
   // container, so they address the volume through the pod's mount path, never
   // the server's (BLO-32734).
@@ -3308,7 +3643,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // so a verdict after it would describe a pod that had already reached GitHub.
   // Advisory — the push path already fails closed; this buys time-to-diagnosis.
   const prePushHookPreflight = buildPrePushHookPreflightShell({ dataMountPath });
-  const claudeInvocation = `set -o pipefail; ${imageWrapperPreflight}; ${prePushHookPreflight}; ${workspaceSetup ? `${workspaceSetup} || exit $?; ` : ""}${buildEnvGuardSetupShell()}; ${claudeRuntime}${ccrotateRefresh ? `${ccrotateRefresh}; ` : ""}${preparePodLog}; ${buildPodLogRedactorSetupShell(containerLogPath)}; cat /tmp/prompt/prompt.txt | ${launcherCommand} ${claudeArgsEscaped} | "$${POD_LOG_FILTER_VAR}" \${${POD_LOG_FILTER_ARG_VAR}:+"$${POD_LOG_FILTER_ARG_VAR}"} | tee ${quoteShellArg(containerLogPath)} | ${failFastFilter} > /dev/null`;
+  const claudeInvocation = `set -o pipefail; ${imageWrapperPreflight}; ${prePushHookPreflight}; ${workspaceSetup ? `${workspaceSetup} || exit $?; ` : ""}${sharedDocOverlaySetup ? `${sharedDocOverlaySetup}; ` : ""}${buildEnvGuardSetupShell()}; ${claudeRuntime}${ccrotateRefresh ? `${ccrotateRefresh}; ` : ""}${preparePodLog}; ${buildPodLogRedactorSetupShell(containerLogPath)}; cat /tmp/prompt/prompt.txt | ${launcherCommand} ${claudeArgsEscaped} | "$${POD_LOG_FILTER_VAR}" \${${POD_LOG_FILTER_ARG_VAR}:+"$${POD_LOG_FILTER_ARG_VAR}"} | tee ${quoteShellArg(containerLogPath)} | ${failFastFilter} > /dev/null`;
   // When the DinD sidecar is wired in, prepend the wait-for-socket loop
   // so the agent never starts before dockerd is listening on the shared
   // unix socket. Mirrors the opencode_k8s adapter.
@@ -3325,6 +3660,90 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     );
     volumeMounts.push({ name: "docker-sock", mountPath: DIND_SOCKET_DIR });
     envVars.push({ name: "DOCKER_HOST", value: `unix://${DIND_SOCKET_PATH}` });
+  }
+
+  // PEN-4933: wire the publish broker.
+  //
+  // Gated on there being a credential to move as well as on the flag. Enabling
+  // the broker in a deployment that mounts no GitHub Secret would add a sidecar
+  // with nothing to broker and take away the agent's doors, so the condition is
+  // "there is a credential AND we were asked to move it", never the flag alone.
+  const brokerEnabled = enableGitHubPublishBroker && brokerSecretMounts.length > 0;
+  // Fail closed on a broad data mount rather than render a boundary that does
+  // not hold.
+  //
+  // The broker executes the PEN-3156 pre-push hook with the push credential in
+  // its environment. Under `narrowWritableSurface` that hook arrives as a
+  // read-only `subPath` bind (`ROOT_TOOLCHAIN_SUBPATHS` includes
+  // `GIT_HOOKS_SUBPATH`), so uid 1000 cannot rewrite the code the credential
+  // holder runs. Under the broad fallback the whole volume is mounted rw and
+  // it can — which turns the broker from a boundary into a longer path to the
+  // same token. The broker's `workspaceRoot` is `dataMountPath`, so the same
+  // leg also decides whether a request's `cwd` is confined to this run's
+  // workspace or to every agent's.
+  //
+  // Thrown, not skipped. Silently not rendering would leave the credential in
+  // the agent container with the operator believing it had moved, and §7.2
+  // already names `data-mount-scope: broad:*` as a trigger that ENDS the
+  // residual acceptance — so a broad-scope Job is the one case where shipping
+  // a degraded broker is worse than shipping none. The message names the leg
+  // that failed because all three are operator-fixable config.
+  if (enableGitHubPublishBroker && brokerSecretMounts.length > 0 && !narrowWritableSurface) {
+    throw new Error(
+      `claude_k8s: refusing to build Job manifest — enableGitHubPublishBroker is set, but the data volume ` +
+        `would be mounted broad read-write (reason: ${broadDataMountReason}). The broker runs the pre-push ` +
+        `hook with the push credential in its environment, and under a broad mount that hook lives in a ` +
+        `directory the agent can write, so the credential boundary would not hold. Fix the data mount ` +
+        `scope (see BLO-32734) or leave the broker disabled; do not ship it broad.`,
+    );
+  }
+  // Fail closed on an env-delivered credential, for the same reason and in the
+  // same direction as the broad-mount check above.
+  //
+  // Moving the Secret VOLUME is the whole of the mount diversion, and it is not
+  // the whole of the credential surface: `GH_SEAT_TOKEN_VALUE` is a supported,
+  // volume-free delivery route (BLO-18927) that heartbeat expands into
+  // `GH_TOKEN`/`GITHUB_TOKEN` on this container. One of those present and the
+  // boundary buys nothing — `/etc/gitconfig`'s system helper answers a bare
+  // `/usr/bin/git push` out of the environment, with no mount to read and no
+  // intent required (PEN-3183 §4.0).
+  //
+  // Thrown rather than stripped, and the choice matters. Stripping would leave
+  // a seat-bound agent with no credential anywhere: the broker's env is
+  // filtered to the two variables its own token wrapper reads, so it would not
+  // inherit the seat token either, and every publish would fail at a boundary
+  // that reported success. Routing the seat token INTO the broker is the fix
+  // that preserves the function, but it mounts a credential into a new
+  // container, which is exactly §7.2 trigger 3 — a Security decision, not one
+  // this builder takes on its own (§8). So: refuse, name both ways out, and
+  // leave the fleet on the mounted-Secret path where the boundary does hold.
+  if (brokerEnabled) {
+    const credentialEnvNames = findAgentGitHubCredentialEnvNames(envVars);
+    if (credentialEnvNames.length > 0) {
+      throw new Error(
+        `claude_k8s: refusing to build Job manifest — enableGitHubPublishBroker is set, but the agent ` +
+          `container would still carry a GitHub push credential in its environment ` +
+          `(${credentialEnvNames.join(", ")}). The broker moves the credential SECRET VOLUME out of this ` +
+          `container; it cannot move a credential delivered as an environment variable, and ` +
+          `/etc/gitconfig routes a bare \`/usr/bin/git push\` to \`gh auth git-credential\`, which answers ` +
+          `from exactly these variables. Rendering this would report a boundary that is not there. Either ` +
+          `deliver the credential by mounted Secret (the path the broker brokers) and remove the agent- or ` +
+          `project-scope env binding, or leave the broker disabled. Routing the seat-token path through the ` +
+          `broker is PEN-3183 §7.2 trigger 3 and needs Security, not a change here.`,
+      );
+    }
+  }
+  if (brokerEnabled) {
+    volumes.push(
+      { name: GITHUB_BROKER_SOCKET_VOLUME, emptyDir: {} },
+      { name: GITHUB_BROKER_TMP_VOLUME, emptyDir: {} },
+      // Broker-only: deliberately NOT pushed onto `volumeMounts`.
+      { name: GITHUB_BROKER_PRIVATE_VOLUME, emptyDir: {} },
+    );
+    // FRONT of the list, ahead of `/tmp/prompt`: see GITHUB_BROKER_TMP_VOLUME.
+    volumeMounts.unshift({ name: GITHUB_BROKER_TMP_VOLUME, mountPath: GITHUB_BROKER_TMP_MOUNT_PATH });
+    volumeMounts.push({ name: GITHUB_BROKER_SOCKET_VOLUME, mountPath: GITHUB_BROKER_SOCKET_DIR });
+    envVars.push({ name: "PAPERCLIP_GITHUB_BROKER_SOCKET", value: GITHUB_BROKER_SOCKET_PATH });
   }
 
   // Decide prompt delivery strategy: env var (small) or Secret volume (large).
@@ -3573,6 +3992,40 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
             ...(enableDocker
               ? [buildDindSidecar({ image: dockerImage, cpuLimit: dockerCpuLimit, memoryLimit: dockerMemoryLimit })]
               : []),
+            ...(brokerEnabled
+              ? [
+                  buildGitHubPublishBrokerSidecar({
+                    image,
+                    imagePullPolicy: asString(config.imagePullPolicy, "IfNotPresent"),
+                    workspaceRoot: dataMountPath,
+                    secretMounts: brokerSecretMounts,
+                    // The agent's `data` and runtime-cache mounts, with the
+                    // same read-only/writable split the agent got — including
+                    // the read-only `subPath` bind over the pre-push hook the
+                    // broker executes. Copied rather than re-derived because a
+                    // different split here would be a second opinion about
+                    // which paths exist, and the one that matters (the
+                    // repository being published) must be the same tree the
+                    // agent committed in.
+                    //
+                    // NOT every mount the agent has: the two overlay emptyDirs
+                    // are dropped, so the broker sees the volume's own content
+                    // at those paths rather than the agent's scratch copy. That
+                    // is narrower, which is the safe direction, but it is not
+                    // parity and should not be read as parity.
+                    dataMounts: volumeMounts.filter(
+                      (m) => m.name === "data" || m.name === RUNTIME_CACHE_VOLUME_NAME,
+                    ),
+                    // Only what the broker's own token wrapper and runtime read.
+                    // Deliberately NOT the agent's environment: a credential
+                    // holder that inherits the agent's env inherits the agent's
+                    // ability to redirect it (PEN-3183 §5).
+                    env: envVars.filter((v) =>
+                      ["PAPERCLIP_HOME", "PAPERCLIP_GITHUB_TOKEN_FILE"].includes(v.name),
+                    ),
+                  }),
+                ]
+              : []),
           ],
           containers: [
             {
@@ -3620,5 +4073,5 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     );
   }
 
-  return { job, jobName, namespace, prompt, claudeArgs, promptMetrics, promptSecret, envSecret, mcpConfigSecret, skippedLabels, podLogPath, serviceAccountName, claudeCodeVersion, scopedWritableDirs };
+  return { job, jobName, namespace, prompt, claudeArgs, promptMetrics, promptSecret, envSecret, mcpConfigSecret, sharedDocsSecret, skippedLabels, podLogPath, serviceAccountName, claudeCodeVersion, scopedWritableDirs };
 }

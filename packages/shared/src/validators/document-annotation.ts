@@ -12,8 +12,8 @@ export const documentAnnotationAnchorConfidenceSchema = z.enum(DOCUMENT_ANNOTATI
 
 export const documentAnnotationTextQuoteSelectorSchema = z.object({
   exact: z.string().min(1).max(10_000),
-  prefix: z.string().max(1_000).default(""),
-  suffix: z.string().max(1_000).default(""),
+  prefix: z.string().max(1_000).prefault(""),
+  suffix: z.string().max(1_000).prefault(""),
 }).strict();
 
 export const documentAnnotationTextPositionSelectorSchema = z.object({
@@ -44,16 +44,16 @@ export const documentAnnotationAnchorSelectorSchema = z.object({
 }).strict();
 
 export const createDocumentAnnotationThreadSchema = z.object({
-  baseRevisionId: z.string().uuid(),
+  baseRevisionId: z.string().guid(),
   baseRevisionNumber: z.number().int().positive(),
   selector: documentAnnotationAnchorSelectorSchema,
   body: multilineTextSchema.pipe(z.string().min(1).max(20_000)),
-  issueCommentId: z.string().uuid().nullable().optional(),
+  issueCommentId: z.string().guid().nullable().optional(),
 }).strict();
 
 export const createDocumentAnnotationCommentSchema = z.object({
   body: multilineTextSchema.pipe(z.string().min(1).max(20_000)),
-  issueCommentId: z.string().uuid().nullable().optional(),
+  issueCommentId: z.string().guid().nullable().optional(),
 }).strict();
 
 export const updateDocumentAnnotationThreadSchema = z.object({

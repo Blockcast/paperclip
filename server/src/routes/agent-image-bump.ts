@@ -16,13 +16,13 @@ import { assertCompanyAccess } from "./authz.js";
 import { bumpAgentImagesForCompany } from "../services/agent-image-bump.js";
 
 const bumpAgentImageSchema = z.object({
-  companyId: z.string().uuid(),
+  companyId: z.string().guid(),
   image: z
     .string()
     .min(1)
     .max(500)
     .regex(/^[\w./@:-]+$/, "image must be a valid container reference"),
-  source: z.string().min(1).max(120).optional().default("admin:manual"),
+  source: z.string().min(1).max(120).prefault("admin:manual"),
   buildSha: z.string().min(1).max(40).optional(),
 });
 

@@ -24,7 +24,7 @@ import { formatErrorResponse, formatTextResponse } from "./format.js";
 export interface ToolDefinition {
   name: string;
   description: string;
-  schema: z.AnyZodObject;
+  schema: z.ZodObject;
   execute: (input: Record<string, unknown>) => Promise<{
     content: Array<{ type: "text"; text: string }>;
     // Set by formatErrorResponse. Keeping it in the declared return type makes
@@ -72,11 +72,11 @@ function parseOptionalJson(raw: string | undefined | null): unknown {
 // Accept either a company UUID or a human issue-prefix (e.g. "PEN", "BLO").
 // Prefixes are resolved against the auth token's company memberships server-side.
 const companyIdOptional = z.string().trim().min(1).optional().nullable();
-const agentIdOptional = z.string().uuid().optional().nullable();
+const agentIdOptional = z.string().guid().optional().nullable();
 const issueIdSchema = z.string().min(1);
 const projectIdSchema = z.string().min(1);
-const goalIdSchema = z.string().uuid();
-const approvalIdSchema = z.string().uuid();
+const goalIdSchema = z.string().guid();
+const approvalIdSchema = z.string().guid();
 const documentKeySchema = z.string().trim().min(1).max(64);
 
 // BLO-27561: `q` is a literal contiguous ILIKE '%…%' over four columns — it is NOT
@@ -147,29 +147,29 @@ const listIssuesSchema = z.object({
   status: z.string().optional(),
   // Not real filters. See `unsupportedTimeFilter` above.
   ...unsupportedTimeFilterShape,
-  projectId: z.string().uuid().optional(),
-  assigneeAgentId: z.string().uuid().optional(),
-  participantAgentId: z.string().uuid().optional(),
+  projectId: z.string().guid().optional(),
+  assigneeAgentId: z.string().guid().optional(),
+  participantAgentId: z.string().guid().optional(),
   assigneeUserId: z.string().optional(),
   touchedByUserId: z.string().optional(),
   inboxArchivedByUserId: z.string().optional(),
   unreadForUserId: z.string().optional(),
-  labelId: z.string().uuid().optional(),
-  executionWorkspaceId: z.string().uuid().optional(),
+  labelId: z.string().guid().optional(),
+  executionWorkspaceId: z.string().guid().optional(),
   originKind: z.string().optional(),
   originId: z.string().optional(),
   includeRoutineExecutions: z.boolean().optional(),
   includeLiveDescendantSummary: z.boolean().optional(),
   parentId: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe(
       "Return the DIRECT children of this issue. There is no `children` field on any issue read — this filter is the only way to enumerate sub-issues. An epic that looks childless because you did not pass this has NOT been shown to be childless.",
     ),
   descendantOf: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe("Return the whole subtree under this issue (all descendants, not just direct children)."),
   includeBlockedBy: z
@@ -215,7 +215,7 @@ const listCommentsSchema = z.object({
   issueId: issueIdSchema,
   after: z
     .string()
-    .uuid()
+    .guid()
     .optional()
     .describe(
       "Keyset cursor: return only comments STRICTLY AFTER this comment id, in the direction `order` selects. The cursor comment itself is never included, so `0 rows` means 'no replies since that comment' and nothing else. PEN-4458: before 2026-10-21 this was INCLUSIVE in `order: asc` and exclusive in `order: desc`, so the cursor comment came back at the head of every ascending page and `replies = rows - 1` was the only correct reading; if you carry logic that subtracts the self row, drop it. An `after` that names no comment on this issue is now refused 400 `code: after_cursor_not_found` rather than answered with an empty array -- an empty array previously meant 'your cursor is wrong' and was byte-identical to the all-clear, so a stale or truncated cursor reported a permanent, confident 'nobody has replied'. A non-UUID value is refused 400 `code: after_cursor_malformed` (it used to 500). A DELETED comment's id remains a valid cursor: the row survives deletion and is only redacted, so polling does not break when the comment you anchored on is removed.",
@@ -231,10 +231,10 @@ const upsertDocumentToolSchema = z.object({
   issueId: issueIdSchema,
   key: documentKeySchema,
   title: z.string().trim().max(200).nullable().optional(),
-  format: z.enum(["markdown"]).default("markdown"),
+  format: z.enum(["markdown"]).prefault("markdown"),
   body: z.string().max(524288),
   changeSummary: z.string().trim().max(500).nullable().optional(),
-  baseRevisionId: z.string().uuid().nullable().optional(),
+  baseRevisionId: z.string().guid().nullable().optional(),
 });
 
 const createIssueToolSchema = z.object({
@@ -262,61 +262,59 @@ const setIssueMonitorToolSchema = z.object({
 const addCommentToolSchema = z.object({
   issueId: issueIdSchema,
   summary: z
-    .undefined({
-      errorMap: () => ({
-        message: "`summary` is not a paperclipAddComment parameter: put the comment text in `body` (markdown).",
-      }),
+    .never({
+      error: () => "`summary` is not a paperclipAddComment parameter: put the comment text in `body` (markdown).",
     })
     .optional(),
-}).merge(addIssueCommentSchema.innerType());
+}).merge(addIssueCommentSchema);
 
 const createSuggestTasksToolSchema = z.object({
   issueId: issueIdSchema,
   idempotencyKey: z.string().trim().max(255).nullable().optional(),
-  sourceCommentId: z.string().uuid().nullable().optional(),
-  sourceRunId: z.string().uuid().nullable().optional(),
+  sourceCommentId: z.string().guid().nullable().optional(),
+  sourceRunId: z.string().guid().nullable().optional(),
   title: z.string().trim().max(240).nullable().optional(),
   summary: z.string().trim().max(1000).nullable().optional(),
-  continuationPolicy: issueThreadInteractionContinuationPolicySchema.optional().default("wake_assignee"),
+  continuationPolicy: issueThreadInteractionContinuationPolicySchema.prefault("wake_assignee"),
   payload: suggestTasksPayloadSchema,
 });
 
 const withdrawInteractionToolSchema = z.object({
   issueId: issueIdSchema,
-  interactionId: z.string().uuid(),
+  interactionId: z.string().guid(),
   reason: z.string().trim().max(4000).optional(),
 });
 
 const createAskUserQuestionsToolSchema = z.object({
   issueId: issueIdSchema,
   idempotencyKey: z.string().trim().max(255).nullable().optional(),
-  sourceCommentId: z.string().uuid().nullable().optional(),
-  sourceRunId: z.string().uuid().nullable().optional(),
+  sourceCommentId: z.string().guid().nullable().optional(),
+  sourceRunId: z.string().guid().nullable().optional(),
   title: z.string().trim().max(240).nullable().optional(),
   summary: z.string().trim().max(1000).nullable().optional(),
-  continuationPolicy: issueThreadInteractionContinuationPolicySchema.optional().default("wake_assignee"),
+  continuationPolicy: issueThreadInteractionContinuationPolicySchema.prefault("wake_assignee"),
   payload: askUserQuestionsPayloadSchema,
 });
 
 const createRequestConfirmationToolSchema = z.object({
   issueId: issueIdSchema,
   idempotencyKey: z.string().trim().max(255).nullable().optional(),
-  sourceCommentId: z.string().uuid().nullable().optional(),
-  sourceRunId: z.string().uuid().nullable().optional(),
+  sourceCommentId: z.string().guid().nullable().optional(),
+  sourceRunId: z.string().guid().nullable().optional(),
   title: z.string().trim().max(240).nullable().optional(),
   summary: z.string().trim().max(1000).nullable().optional(),
-  continuationPolicy: issueThreadInteractionContinuationPolicySchema.optional().default("none"),
+  continuationPolicy: issueThreadInteractionContinuationPolicySchema.prefault("none"),
   payload: requestConfirmationPayloadSchema,
 });
 
 const createRequestCheckboxConfirmationToolSchema = z.object({
   issueId: issueIdSchema,
   idempotencyKey: z.string().trim().max(255).nullable().optional(),
-  sourceCommentId: z.string().uuid().nullable().optional(),
-  sourceRunId: z.string().uuid().nullable().optional(),
+  sourceCommentId: z.string().guid().nullable().optional(),
+  sourceRunId: z.string().guid().nullable().optional(),
   title: z.string().trim().max(240).nullable().optional(),
   summary: z.string().trim().max(1000).nullable().optional(),
-  continuationPolicy: issueThreadInteractionContinuationPolicySchema.optional().default("wake_assignee"),
+  continuationPolicy: issueThreadInteractionContinuationPolicySchema.prefault("wake_assignee"),
   payload: requestCheckboxConfirmationPayloadSchema,
 });
 
@@ -338,7 +336,7 @@ const createApprovalToolSchema = z.object({
   companyId: companyIdOptional,
 }).merge(createApprovalSchema);
 
-const milestoneIdSchema = z.string().uuid();
+const milestoneIdSchema = z.string().guid();
 
 const createMilestoneToolSchema = z.object({
   companyId: companyIdOptional,
@@ -346,7 +344,7 @@ const createMilestoneToolSchema = z.object({
 
 const listMilestonesToolSchema = z.object({
   companyId: companyIdOptional,
-  projectId: z.string().uuid().optional(),
+  projectId: z.string().guid().optional(),
 });
 
 const updateMilestoneToolSchema = z.object({
@@ -361,7 +359,7 @@ const apiRequestSchema = z.object({
 
 const workspaceRuntimeControlTargetSchema = z.object({
   workspaceCommandId: z.string().min(1).optional().nullable(),
-  runtimeServiceId: z.string().uuid().optional().nullable(),
+  runtimeServiceId: z.string().guid().optional().nullable(),
   serviceIndex: z.number().int().nonnegative().optional().nullable(),
 });
 
@@ -372,15 +370,15 @@ const issueWorkspaceRuntimeControlSchema = z.object({
 
 const waitForIssueWorkspaceServiceSchema = z.object({
   issueId: issueIdSchema,
-  runtimeServiceId: z.string().uuid().optional().nullable(),
+  runtimeServiceId: z.string().guid().optional().nullable(),
   serviceName: z.string().min(1).optional().nullable(),
   timeoutSeconds: z.number().int().positive().max(300).optional(),
 });
 
 const tailHeartbeatRunLogSchema = z.object({
   runId: z.string().min(1),
-  offset: z.number().int().nonnegative().optional().default(0),
-  limitBytes: z.number().int().positive().max(256_000).optional().default(16_384),
+  offset: z.number().int().nonnegative().prefault(0),
+  limitBytes: z.number().int().positive().max(256_000).prefault(16_384),
 });
 
 function sleep(ms: number) {
@@ -561,7 +559,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     makeTool(
       "paperclipGetHeartbeatContext",
       "Get compact heartbeat context for an issue",
-      z.object({ issueId: issueIdSchema, wakeCommentId: z.string().uuid().optional() }),
+      z.object({ issueId: issueIdSchema, wakeCommentId: z.string().guid().optional() }),
       async ({ issueId, wakeCommentId }) => {
         const qs = wakeCommentId ? `?wakeCommentId=${encodeURIComponent(wakeCommentId)}` : "";
         return client.requestJson("GET", `/issues/${encodeURIComponent(issueId)}/heartbeat-context${qs}`);
@@ -583,7 +581,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     makeTool(
       "paperclipGetComment",
       "Get a specific issue comment by id",
-      z.object({ issueId: issueIdSchema, commentId: z.string().uuid() }),
+      z.object({ issueId: issueIdSchema, commentId: z.string().guid() }),
       async ({ issueId, commentId }) =>
         client.requestJson("GET", `/issues/${encodeURIComponent(issueId)}/comments/${encodeURIComponent(commentId)}`),
     ),
@@ -728,8 +726,8 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
         companyId: companyIdOptional,
         status: z.string().optional(),
         type: z.string().optional(),
-        issueId: z.string().uuid().optional().describe("Only approvals linked to this issue"),
-        requestedByAgentId: z.string().uuid().optional(),
+        issueId: z.string().guid().optional().describe("Only approvals linked to this issue"),
+        requestedByAgentId: z.string().guid().optional(),
         idempotencyKey: z
           .string()
           .optional()
@@ -811,7 +809,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipSetIssueMonitor",
-      "Arm or re-arm an issue monitor (wake) and NOTHING ELSE. Prefer this over `paperclipUpdateIssue`'s `executionPolicy.monitor`: that path REPLACES the whole `executionPolicy`, so arming through it means read-modify-write — re-send the complete current policy or you silently delete another agent's `stages`, `reviewPreset` and `authorizationPolicy`, and you race whoever else is writing the row. This call touches the monitor only, so there is nothing to read first and nothing to lose. Same authorization as the legacy path (assignee agent, the agent holding the current execution run, or a board user). Re-arming supersedes a `triggered` monitor, but `attemptCount` survives, so re-sending a `maxAttempts` at or below that count (or a past `timeoutAt`) is still rejected 422 as exhausted — use paperclipClearIssueMonitor for a wedged one. Monitors only hold on an `in_progress`/`in_review` issue assigned to an agent, and an unresolved `blockedBy` edge suppresses the wake, so ALWAYS re-read `monitorNextCheckAt` and treat `null` as failure rather than reporting success off a 200. The BLO-18294 convergence guard applies unchanged: an assignee-scheduled monitor that re-checks the same gate set 3 times running is refused on the 4th and the issue moves to `blocked`.",
+      "Arm or re-arm an issue monitor (wake) and NOTHING ELSE. Prefer this over `paperclipUpdateIssue`'s `executionPolicy.monitor`: that path REPLACES the whole `executionPolicy`, so arming through it means read-modify-write — re-send the complete current policy or you silently delete another agent's `stages`, `reviewPreset` and `authorizationPolicy`, and you race whoever else is writing the row. This call touches the monitor only, so there is nothing to read first and nothing to lose. Same authorization as the legacy path (assignee agent, the agent holding the current execution run, or a board user). Re-arming supersedes a `triggered` monitor, but `attemptCount` survives — clearing does not reset it either — so re-sending a `maxAttempts` at or below that count, or a past `timeoutAt`, is rejected 422 as exhausted. ⚠ PEN-3803: omitting `maxAttempts` is NOT a way past that. The scheduler applies its own ceiling (24) to every monitor at dispatch, so an omitted bound on a row at or past 24 used to return 200 and then be cleared `max_attempts_exhausted` without ever firing, after advertising a live `monitorNextCheckAt` for the whole interval; the arm now reaches the same verdict the scheduler would. Two ways forward: pass an explicit `maxAttempts` strictly greater than the issue's `monitorAttemptCount` (capped at 100) for a recorded, bounded budget extension, or call paperclipClearIssueMonitor and stop polling — usually the right answer, since an exhausted budget is evidence the polling was not working. Monitors only hold on an `in_progress`/`in_review` issue assigned to an agent, and an unresolved `blockedBy` edge suppresses the wake, so ALWAYS re-read `monitorNextCheckAt` and treat `null` as failure rather than reporting success off a 200. The BLO-18294 convergence guard applies unchanged: an assignee-scheduled monitor that re-checks the same gate set 3 times running is refused on the 4th and the issue moves to `blocked`.",
       setIssueMonitorToolSchema,
       async ({ issueId, ...monitor }) =>
         client.requestJson("PATCH", `/issues/${encodeURIComponent(issueId)}/monitor`, { body: monitor }),
@@ -912,7 +910,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       z.object({
         issueId: issueIdSchema,
         key: documentKeySchema,
-        revisionId: z.string().uuid(),
+        revisionId: z.string().guid(),
       }),
       async ({ issueId, key, revisionId }) =>
         client.requestJson(

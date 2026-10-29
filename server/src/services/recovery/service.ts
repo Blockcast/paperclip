@@ -7,6 +7,7 @@ import {
   MIN_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS,
   PROVIDER_QUOTA_MONITOR_SERVICE_NAME,
   getAgentWorkEligibility,
+  renewedIssueMonitorMaxAttempts,
   type IssueGraphLivenessAutoRecoveryPreview,
   type IssueGraphLivenessAutoRecoveryPreviewItem,
   type IssueRecoveryAction,
@@ -49,6 +50,7 @@ import { loadConfig } from "../../config.js";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { runningProcesses } from "../../adapters/index.js";
 import { visibleIssueCondition } from "../issue-visibility.js";
+import { isDeliberateParkActive } from "../issue-park-expiry.js";
 import { HttpError, forbidden, notFound } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
 import { isPidAlive, isProcessGroupAlive, terminateLocalService } from "../local-service-supervisor.js";
@@ -158,6 +160,11 @@ import {
   type IssueAttendanceEvidence,
   type StrandedAttendanceWindow,
 } from "./stranded-attendance-prefetch.js";
+import {
+  rotateStrandedCandidates,
+  runBudgetedStrandedLoop,
+  type StrandedSweepKey,
+} from "./stranded-sweep-budget.js";
 import {
   resolveStrandedEscalationStatus,
   shouldReuseStrandedRecoveryAction,
@@ -8322,6 +8329,9 @@ export function recoveryService(
   // the first grep above) and is not worth it for a diagnostic-accuracy gain until the
   // totals stop being merely indicative.
   let activePassTimer: PassTimer | null = null;
+  // BLO-48950: where the next stranded pass resumes after one that ran out of budget.
+  // Null after a pass that reached every candidate. See `stranded-sweep-budget.ts`.
+  let strandedSweepResumeAfter: StrandedSweepKey | null = null;
 
   /**
    * Time one per-candidate round-trip against whichever pass is in flight, if any.
@@ -9472,10 +9482,46 @@ export function recoveryService(
         serviceName: PROVIDER_QUOTA_MONITOR_SERVICE_NAME,
         externalRef: input.latestRun.id,
         timeoutAt: null,
-        maxAttempts: null,
+        // PEN-3803: this arm used to pass `maxAttempts: null` and rely on the
+        // arm-time validator never applying the scheduler's default ceiling.
+        // That escape is gone — an arm the scheduler would clear as
+        // `max_attempts_exhausted` is now refused 422 — and this call site has
+        // no try/catch, so on a row already at the ceiling the refusal would
+        // propagate out of the recovery sweep.
+        //
+        // Granting an explicit budget is also the honest shape here. This is a
+        // backoff against a provider reset time, not the self-perpetuating poll
+        // loop the ceiling exists to stop, so the extension is legitimate — but
+        // it should be recorded and bounded rather than silently unbounded.
+        // `null` (no representable renewal, i.e. 100+ attempts already made)
+        // means this row has polled far past anything a quota backoff needs;
+        // leave it unarmed, log why, and let the caller record a skip.
+        // `issues.monitor_attempt_count` is `notNull().default(0)`, so this is
+        // the row's real count with no fallback needed.
+        maxAttempts: renewedIssueMonitorMaxAttempts(input.issue.monitorAttemptCount),
         recoveryPolicy: "wake_owner" as const,
       },
     };
+    if (policy.monitor.maxAttempts === null) {
+      // PEN-3803 review follow-up: this is the one `return null` on this path
+      // that is NOT a transient failure, and the caller books it as a bare
+      // `result.skipped += 1` alongside ~35 other exits. Without this line a row
+      // stuck in quota backoff past MAX_ISSUE_MONITOR_MAX_ATTEMPTS simply stops
+      // being re-armed and goes dark: no monitor, no activity row, and a skip
+      // counter that cannot say which guard produced it. A quota backoff is a
+      // wait on a provider reset time, so 100+ attempts means something other
+      // than the provider is wrong and a human needs to be able to find it.
+      logger.warn(
+        {
+          issueId: input.issue.id,
+          companyId: input.issue.companyId,
+          runId: input.latestRun.id,
+          attemptCount: input.issue.monitorAttemptCount,
+        },
+        "provider-quota recovery monitor not re-armed: monitor attempts exhausted beyond any representable renewal",
+      );
+      return null;
+    }
     const transition = applyIssueMonitorPolicyTransition({
       issue: input.issue,
       policy,
@@ -9542,6 +9588,11 @@ export function recoveryService(
     // by falling inside pass 1's window. Undefined for the startup pass and
     // for tests, which belong to no chain — pino omits the field entirely.
     recoveryChainId?: string;
+    // BLO-49596: polled before each candidate. True once the process is
+    // shutting down, so the pass stops instead of outliving the termination
+    // grace while its holder keeps renewing the scheduler lease. Candidates not
+    // reached show up as `candidatesScanned - candidates.count`.
+    shouldStop?: () => boolean;
   }) {
     // PEN-3636: published on the pass's own log line below, then cleared in the
     // `finally` so nothing outside a sweep is ever timed into it. Assigned rather
@@ -9563,11 +9614,12 @@ export function recoveryService(
     // the pass died before it had a population — which is itself the reading, and
     // is why this is not defaulted to 0: a pass that threw in `candidateQuery` and
     // a pass that genuinely found no candidates are different failures.
-    const scanned: { candidates: number | null } = { candidates: null };
+    const scanned: { candidates: number | null; stoppedForShutdown?: boolean } = { candidates: null };
     let completed = false;
     try {
       const swept = await runStrandedAssignedIssueSweep(opts, passTimer, scanned);
-      completed = true;
+      // BLO-49596: a shutdown-truncated pass is not complete.
+      completed = !scanned.stoppedForShutdown;
       return swept;
     } finally {
       activePassTimer = null;
@@ -9627,6 +9679,7 @@ export function recoveryService(
             // partial total reads exactly like a whole one, and every phase total
             // beside it would be silently understated.
             completed,
+            stoppedForShutdown: scanned.stoppedForShutdown ?? false,
           },
           "stranded assigned issue sweep phase timing",
         );
@@ -9637,16 +9690,16 @@ export function recoveryService(
   }
 
   async function runStrandedAssignedIssueSweep(
-    opts: { issueCreatedAtGte?: Date | null } | undefined,
+    opts: { issueCreatedAtGte?: Date | null; shouldStop?: () => boolean } | undefined,
     passTimer: PassTimer,
-    scanned: { candidates: number | null },
+    scanned: { candidates: number | null; stoppedForShutdown?: boolean },
   ) {
     const dependencyWaitEscalationSuppressedAtSweepStart = dependencyWaitEscalationSuppressedTotal;
     const dependencyWaitEscalationSuppressedDependencyReadyAtSweepStart =
       dependencyWaitEscalationSuppressedDependencyReadyTotal;
     const dependencyWaitEscalationSuppressedUnclassifiedAtSweepStart =
       dependencyWaitEscalationSuppressedUnclassifiedTotal;
-    const candidates = await passTimer.time("candidateQuery", () => db
+    const orderedCandidates = await passTimer.time("candidateQuery", () => db
       .select()
       .from(issues)
       .where(
@@ -9667,6 +9720,47 @@ export function recoveryService(
         ),
       )
       .orderBy(asc(issues.companyId), asc(issues.assigneeAgentId), asc(issues.createdAt), asc(issues.id)));
+    // PEN-4871: drop rows carrying a LIVE deliberate park before anything else looks at
+    // them. A park is a structured, attributed claim by a named actor that this row is
+    // not being worked until a stated deadline — which is an answer to BOTH limbs of what
+    // this sweep does to a candidate, so the exclusion is blanket rather than
+    // dispatch-only: re-driving the owner contradicts the claim, and escalating past them
+    // for "no progress" penalises a decision the platform asked them to make.
+    //
+    // Filtered HERE, in TypeScript, rather than as a `parked_until` term in the candidate
+    // query above. Three reasons, in order of how much they would cost to get wrong:
+    //
+    //  1. The decision stays in one place. `isDeliberateParkActive` is the single owner of
+    //     the live-park reading (see its docblock); a SQL copy would be a fourth hand-
+    //     written statement of a predicate this codebase has already watched drift once on
+    //     this exact column (BLO-22660 / BLO-27912). `issue-park-expiry.ts` makes the same
+    //     call for the same reason — its SQL "only narrows the scan", and the TS predicate
+    //     decides.
+    //  2. The suppressed rows stay countable. A SQL term makes them vanish from the
+    //     population, and "how many rows did we decline to wake?" is the only signal that
+    //     distinguishes this fix working from the sweep quietly matching nothing — which
+    //     is the precise failure mode the issue's own implementation notes warn about.
+    //  3. They must not consume the loop's wall-clock budget. BLO-48950 bounds the
+    //     candidate loop; a parked row that reaches it spends budget that would otherwise
+    //     reach a genuinely stranded candidate, so the exclusion has to land BEFORE
+    //     `rotateStrandedCandidates` and the budgeted loop, not inside the loop body.
+    //
+    // A LAPSED park (`parkedUntil <= now`) is deliberately NOT excluded: it must keep
+    // dispatching, or this fix becomes a second, silent strand. `isDeliberateParkActive`
+    // is the exact negation of the release edge's lapsed arm, so the two cannot both hold
+    // and cannot double-wake — and in practice the release edge's wake creates a live
+    // execution run, which the candidate query's `not exists (live execution run)` term
+    // then excludes. One wake at expiry, from whichever edge gets there first.
+    const parkSweepNowMs = Date.now();
+    const dispatchableCandidates: typeof orderedCandidates = [];
+    let parkSuppressedCount = 0;
+    for (const issue of orderedCandidates) {
+      if (isDeliberateParkActive(issue.parkedUntil, parkSweepNowMs)) parkSuppressedCount += 1;
+      else dispatchableCandidates.push(issue);
+    }
+    // BLO-48950: start after the candidate the previous, budget-truncated pass reached
+    // last, so a run of slow passes still covers the whole set.
+    const candidates = rotateStrandedCandidates(dispatchableCandidates, strandedSweepResumeAfter);
     // PEN-3636: published to the wrapper immediately, so a pass that throws later
     // still reports the population it was working against. Read only by the
     // wrapper's `finally`; nothing branches on it.
@@ -9732,6 +9826,17 @@ export function recoveryService(
       // sweep that would previously have aborted at that issue and silently dropped
       // every candidate ordered after it.
       reconcileErrors: 0,
+      // PEN-4871: candidates dropped before the loop because a deliberate park is live on
+      // them. NOT folded into `skipped`: `skipped` counts rows the loop looked at and
+      // declined, and these never enter the loop at all — so adding them there would
+      // overstate the loop's population and understate this fix to invisibility. A
+      // non-zero value here is the sweep working; a permanent zero on a fleet that parks
+      // rows is the signal that it has stopped.
+      parkSuppressed: 0,
+      // BLO-48950: true when the candidate loop stopped at `STRANDED_SWEEP_BUDGET_MS`;
+      // `candidatesReached` is then less than `candidatesScanned`.
+      budgetExhausted: false,
+      candidatesReached: 0,
       skipped: 0,
       // PEN-3636 — the pass's own cost, which the funnel never reported.
       //
@@ -11499,7 +11604,9 @@ export function recoveryService(
       }
     };
 
-    for (const issue of candidates) {
+    // BLO-48950: bound the loop against DB latency; the candidates it does not reach are
+    // picked up by the next pass. See `runBudgetedStrandedLoop`.
+    const strandedLoop = await runBudgetedStrandedLoop(candidates, async (issue) => {
       try {
         await passTimer.candidate(issue.id, () => reconcileStrandedCandidate(issue));
       } catch (err) {
@@ -11528,7 +11635,11 @@ export function recoveryService(
           "stranded assigned issue reconciliation failed; continuing with remaining candidates",
         );
       }
-    }
+    }, undefined, undefined, opts?.shouldStop);
+    if (strandedLoop.stopped) scanned.stoppedForShutdown = true;
+    result.candidatesReached = strandedLoop.reached;
+    result.budgetExhausted = strandedLoop.budgetExhausted;
+    strandedSweepResumeAfter = strandedLoop.resumeAfter;
 
     // PEN-3636: timed as its own phase because it is a SECOND sequential
     // per-candidate loop inside this same function, and its population is not
@@ -11536,10 +11647,13 @@ export function recoveryService(
     // the main loop, while `result.skipped` is shared between the two. So until this
     // phase had a number, an unknown share of pass 1 was unattributable by
     // construction.
-    const orphanBlockerRecovery = await passTimer.time(
-      "orphanBlockerSweep",
-      () => reconcileUnassignedBlockingIssues(),
-    );
+    if (opts?.shouldStop?.()) scanned.stoppedForShutdown = true;
+    const orphanBlockerRecovery = scanned.stoppedForShutdown
+      ? { assigned: 0, skipped: 0, issueIds: [] as string[] }
+      : await passTimer.time(
+        "orphanBlockerSweep",
+        () => reconcileUnassignedBlockingIssues(),
+      );
     // Snapshot BEFORE the merge below. `result.skipped` is about to absorb a different
     // sweep's tally, and `candidatesScanned` counts only this one's candidates — logging
     // the merged figure against it would invite a skip-rate that is not a rate of
@@ -11602,6 +11716,7 @@ export function recoveryService(
     const pauseHoldPrefilterStats = activePauseHoldPrefilter.stats();
     const agentRosterMemoStats = agentRosterMemo.stats();
     result.candidatesScanned = candidates.length;
+    result.parkSuppressed = parkSuppressedCount;
     result.pauseHoldPrefilterLiveReads = pauseHoldPrefilterStats.liveReads;
     result.pauseHoldPrefilterMemoHits = pauseHoldPrefilterStats.memoHits;
     result.pauseHoldGateReadsAvoided = pauseHoldPrefilterStats.gateReadsAvoided;
@@ -11615,6 +11730,11 @@ export function recoveryService(
     logger.info(
       {
         candidatesScanned: result.candidatesScanned,
+        candidatesReached: result.candidatesReached,
+        budgetExhausted: result.budgetExhausted,
+        // PEN-4871. Reads next to `candidatesScanned` on purpose: scanned EXCLUDES these,
+        // so the two together are the sweep's real population.
+        parkSuppressed: result.parkSuppressed,
         agentInvokabilityEvaluated: result.agentInvokabilityEvaluated,
         pauseHoldPrefilterLiveReads: result.pauseHoldPrefilterLiveReads,
         pauseHoldPrefilterMemoHits: result.pauseHoldPrefilterMemoHits,

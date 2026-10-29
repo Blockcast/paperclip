@@ -1777,10 +1777,20 @@ describe("agent metadata containment on the spread-based redactors", () => {
     mockCompanySkillService.listRuntimeSkillEntries.mockResolvedValue([]);
   });
 
-  function withMetadata(metadata: unknown) {
+  // The id the list row carries in the restricted-arm tests below. It must NOT
+  // be `agentId`: since PEN-4775 the company list exempts the VIEWER'S OWN row
+  // from `redactForRestrictedAgentView` (the detail route always did), so a
+  // list whose only row is the caller itself now takes the secrets arm and
+  // never reaches the projection these tests are about. The describe's own
+  // comment already says "a peer agent" — this makes the fixture match it.
+  const peerAgentId = "66666666-6666-4666-8666-666666666666";
+
+  function withMetadata(metadata: unknown, options?: { asPeer?: boolean }) {
     const agent = { ...baseAgent, metadata } as typeof baseAgent;
     mockAgentService.getById.mockResolvedValue(agent);
-    mockAgentService.list.mockResolvedValue([agent]);
+    mockAgentService.list.mockResolvedValue([
+      options?.asPeer ? { ...agent, id: peerAgentId, name: "Peer", urlKey: "peer" } : agent,
+    ]);
     return agent;
   }
 
@@ -1853,7 +1863,7 @@ describe("agent metadata containment on the spread-based redactors", () => {
 
   describe("redactForRestrictedAgentView", () => {
     it("masks a plain binding planted in metadata", async () => {
-      withMetadata({ leaked: { type: "plain", value: METADATA_SECRET } });
+      withMetadata({ leaked: { type: "plain", value: METADATA_SECRET } }, { asPeer: true });
       denyConfigReadOnly();
       const app = createApp(agentActor);
       const res = await request(app).get(`/api/companies/${companyId}/agents`);
@@ -1871,7 +1881,7 @@ describe("agent metadata containment on the spread-based redactors", () => {
     // a hole — but the pair is only self-checking when both halves are present
     // on both arms, which is what the comment on the secrets arm asks for.
     it("keeps an ARRAY-valued metadata as an element-wise-masked array", async () => {
-      withMetadata([{ type: "plain", value: METADATA_SECRET }]);
+      withMetadata([{ type: "plain", value: METADATA_SECRET }], { asPeer: true });
       denyConfigReadOnly();
       const app = createApp(agentActor);
       const res = await request(app).get(`/api/companies/${companyId}/agents`);
@@ -1886,7 +1896,7 @@ describe("agent metadata containment on the spread-based redactors", () => {
     it("withholds a metadata whose prototype is not Object.prototype", async () => {
       withMetadata(Object.assign(Object.create({ inherited: true }), {
         leaked: { type: "plain", value: METADATA_SECRET },
-      }));
+      }), { asPeer: true });
       denyConfigReadOnly();
       const app = createApp(agentActor);
       const res = await request(app).get(`/api/companies/${companyId}/agents`);

@@ -34,3 +34,18 @@ it("leaves no scheduler task that reads window pending after an unmount", async 
   for (let i = 0; i < 3; i++) await new Promise((resolve) => setImmediate(resolve));
   expect(reads).toBe(afterDrain);
 });
+
+it("runs a 0ms timer that a scheduler task posts during the drain", async () => {
+  // Shape of Radix FocusScope's unmount cleanup: a task on the immediate queue
+  // that posts setTimeout(fn, 0). It must have fired by the time the drain
+  // returns, or it fires after jsdom teardown (BLO-46894).
+  let fired = false;
+  setImmediate(() => {
+    setTimeout(() => {
+      fired = true;
+    }, 0);
+  });
+
+  await drainReactScheduler();
+  expect(fired).toBe(true);
+});

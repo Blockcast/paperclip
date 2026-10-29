@@ -21,13 +21,17 @@ permissions:
 jobs:
   build-and-push:
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
-    # BLO-33389: pinned to org group `default` (prod cluster). The `arc-dind`
-    # label is also served by the tools-cluster twin in `default-tools`
-    # (onprem-k8s#6299), where `buildkit-amd64*.ci.svc.cluster.local` does not
-    # resolve; run 39420733721 failed there in "Select BuildKit endpoint".
+    # BLO-48930: the paperclip-only `arc-paperclip-dind` lane (onprem-k8s#6708,
+    # org group 28), a prod-cluster copy of arc-dind. Its group is
+    # restrictedToWorkflows and pins exactly this file at refs/heads/master, so
+    # renaming or moving this file makes the job wait until the pin follows.
+    # Leaving org group `default` is what lets the group-1 flip (BLO-40782)
+    # proceed. The group is still named here (BLO-33389): a bare label could
+    # land on a tools-cluster twin, where `buildkit-amd64*.ci.svc.cluster.local`
+    # does not resolve (run 39420733721, "Select BuildKit endpoint").
     runs-on:
-      group: default
-      labels: arc-dind
+      group: arc-paperclip-dind
+      labels: arc-paperclip-dind
     # BLO-47194. Derived from the slowest run that still made progress, not
     # from a cold toolchain: over 2026-10-15T12Z..10-17T11Z every toolchain
     # rebuild (4, each triggered by a new ffmpeg-publisher:stable digest) took
@@ -332,6 +336,78 @@ jobs:
             --env HOME=/tmp \
             "$AGENT_IMAGE" \
             paperclip-browser-smoke
+
+      # The other half, in the shape PEN-4541 established for the git-config
+      # checks: the assertion above gets an input that must RED it, so a green
+      # verdict means something. A control that comes back green is a FAILURE.
+      #
+      # This reproduces PEN-4682 exactly. `/paperclip` is a PVC in a real agent
+      # Job and `/paperclip/bin` precedes the image's own directories on the
+      # agent PATH, so a browser left there outranks the pinned headless shell
+      # by name. That is not hypothetical: a June-2026 symlink to an ad hoc
+      # puppeteer Chrome 149 did exactly this on the live fleet, and that build
+      # hangs under --user-data-dir rather than failing, so nothing noticed.
+      #
+      # The smoke step above cannot see it. It runs on the image's own PATH,
+      # where no /paperclip/bin exists — which is the whole reason this control
+      # plants one.
+      - name: Prove a shadowing PVC browser cannot outrank the pinned one (PEN-4682 positive control)
+        env:
+          AGENT_IMAGE: harbor.blockcast.net/paperclip-agent/paperclip-agent@${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --user 1000:1000 \
+            --read-only \
+            --security-opt no-new-privileges \
+            --cap-drop ALL \
+            --tmpfs /paperclip:rw,exec,nosuid,size=16m,mode=1777 \
+            --tmpfs /tmp:rw,noexec,nosuid,size=64m \
+            --env HOME=/tmp \
+            "$AGENT_IMAGE" \
+            sh -eu -c '
+              mkdir -p /paperclip/bin
+              # Unlink before planting. The image ENTRYPOINT still runs ahead of
+              # this command, and now that mode=1777 lets its own `mkdir -p` in
+              # install_browser_link succeed, it seeds /paperclip/bin/google-chrome
+              # as a symlink to $CHROME_BIN first. Shell `>` follows symlinks, so
+              # without this the plant would write through to the real browser on
+              # the --read-only rootfs and die here with EROFS -- and if it ever
+              # did land, the "plant" would BE the pinned browser, so (b) would
+              # pass and this step would print CONTROL FAILED against a good image.
+              # Removing the link also makes the control faithful to PEN-4682: it
+              # shadows exactly the link the entrypoint seeds in production.
+              rm -f /paperclip/bin/google-chrome
+              printf "#!/bin/sh\nexit 0\n" > /paperclip/bin/google-chrome
+              chmod 0755 /paperclip/bin/google-chrome
+              # The plant must be executable for this control to mean anything.
+              # Docker mounts --tmpfs noexec unless `exec` is given, and bash
+              # `command -v` skips a PATH match it cannot execute -- so on a
+              # noexec /paperclip the canary skips the plant and resolves the
+              # pinned $CHROME_BIN instead, passing in (b) where it must red.
+              # This step would then report CONTROL FAILED and blame the image,
+              # while the control itself was the broken thing. Fail at the plant
+              # instead, where the message is true.
+              test -x /paperclip/bin/google-chrome
+
+              # (a) The agent-shaped PATH. Both adapters force the image wrapper
+              # directory to PATH[0] off one IMAGE_WRAPPER_BIN_DIR constant, so
+              # this ordering is the one claude_k8s and opencode_k8s both build.
+              # The shim there must win over the planted browser.
+              echo "control (a): image wrapper directory leads PATH -> shim must win"
+              PATH=/usr/local/libexec/paperclip/bin:/paperclip/bin:$PATH \
+                paperclip-browser-smoke
+
+              # (b) Drop the wrapper directory and the planted browser is first.
+              # The canary MUST red here. If it passes, it is not actually
+              # resolving through PATH and (a) proved nothing.
+              echo "control (b): wrapper directory absent -> canary must red"
+              if PATH=/paperclip/bin:$PATH paperclip-browser-smoke >/dev/null 2>&1; then
+                echo "CONTROL FAILED: the canary passed while a planted /paperclip/bin/google-chrome led PATH. It is not resolving by name, so the assertion in (a) is vacuous and PEN-4682 would recur unseen." >&2
+                exit 1
+              fi
+              echo "control (b): reds as required"
+            '
 
       # PEN-4541 assertion (b): the agent image's git-config surface, measured
       # on the artifact rather than on the sources, before it is promoted or

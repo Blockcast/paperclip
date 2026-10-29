@@ -253,6 +253,9 @@ export {
   ISSUE_MONITOR_GATE_SOURCES,
   DEFAULT_ISSUE_MONITOR_CONVERGENCE_THRESHOLD,
   MAX_ISSUE_MONITOR_CONVERGENCE_THRESHOLD,
+  DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
+  MAX_ISSUE_MONITOR_MAX_ATTEMPTS,
+  renewedIssueMonitorMaxAttempts,
   ISSUE_EXECUTION_DECISION_OUTCOMES,
   GOAL_LEVELS,
   GOAL_STATUSES,
@@ -1994,6 +1997,7 @@ export {
   updateCompanyMemberWithPermissionsSchema,
   archiveCompanyMemberSchema,
   updateMemberPermissionsSchema,
+  updateAgentGrantSchema,
   searchAdminUsersQuerySchema,
   updateUserCompanyAccessSchema,
   type CreateCostEvent,
@@ -2018,6 +2022,7 @@ export {
   type UpdateCompanyMemberWithPermissions,
   type ArchiveCompanyMember,
   type UpdateMemberPermissions,
+  type UpdateAgentGrant,
   type SearchAdminUsersQuery,
   type UpdateUserCompanyAccess,
   companySkillSourceTypeSchema,
@@ -2307,3 +2312,4 @@ export {
   type EnvironmentCustomImageTerminalSessionToken,
 } from "./validators/environment-custom-images.js";
 export * from "./validators/skill-policy.js";
+export { optionalNoDefault, partialNoDefaults } from "./zod-compat.js";

@@ -14,6 +14,11 @@ import type {
 } from "@paperclipai/shared";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Issue } from "@paperclipai/shared";
+import {
+  DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
+  MAX_ISSUE_MONITOR_MAX_ATTEMPTS,
+  renewedIssueMonitorMaxAttempts,
+} from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { IssueProperties } from "./IssueProperties";
 import { queryKeys } from "../lib/queryKeys";
@@ -2104,12 +2109,17 @@ describe("IssueProperties", () => {
       container: HTMLDivElement,
       onUpdate: ComponentProps<typeof IssueProperties>["onUpdate"],
       policyOverrides: Partial<IssueExecutionPolicy>,
+      // PEN-3803 review follow-up: some monitor-dialog behaviour keys off issue
+      // columns rather than the policy (`monitorAttemptCount`), so let a caller
+      // set those too. Defaulted, so every existing caller is unchanged.
+      issueOverrides: Partial<Issue> = {},
     ) {
       const root = renderProperties(container, {
         issue: createIssue({
           status: "in_progress",
           assigneeAgentId: "agent-1",
           executionPolicy: createExecutionPolicy(policyOverrides),
+          ...issueOverrides,
         }),
         childIssues: [],
         onUpdate,
@@ -2292,7 +2302,16 @@ describe("IssueProperties", () => {
       act(() => root.unmount());
     });
 
-    it("drops a maxAttempts the monitor has already reached, and keeps one it has not", async () => {
+    /**
+     * PEN-3803: this used to assert `maxAttempts` was sent as `null`, on the
+     * theory that omitting it removed the bound. It did not — the scheduler
+     * applies `DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS` to every monitor at
+     * dispatch, so `null` only hid the refusal until the due instant, and the
+     * board's reset produced a monitor that read live and then died silently.
+     * The arm now refuses that, so the dialog grants an explicit budget above
+     * the attempts already made instead.
+     */
+    it("renews a maxAttempts the monitor has already reached, and keeps one it has not", async () => {
       const onUpdate = vi.fn();
       const root = renderProperties(container, {
         issue: createIssue({
@@ -2316,14 +2335,17 @@ describe("IssueProperties", () => {
       await flushReact();
 
       clickMonitorButton(container, "Schedule");
-      expect(
-        (onUpdate.mock.calls.at(-1)?.[0]?.executionPolicy as IssueExecutionPolicy).monitor?.maxAttempts,
-      ).toBeNull();
+      const renewed = (onUpdate.mock.calls.at(-1)?.[0]?.executionPolicy as IssueExecutionPolicy)
+        .monitor?.maxAttempts;
+      expect(renewed).toBe(renewedIssueMonitorMaxAttempts(5));
+      // The property that matters is not the magnitude but that the server
+      // will accept it: strictly above the attempts already made.
+      expect(renewed!).toBeGreaterThan(5);
 
       act(() => root.unmount());
 
       // Negative control: a budget with road left is not touched, so this is a
-      // spent-bound rule and not an unconditional strip.
+      // spent-bound rule and not an unconditional rewrite.
       const liveOnUpdate = vi.fn();
       const liveRoot = await openMonitorEditor(container, liveOnUpdate, {
         monitor: { nextCheckAt: "2026-04-11T12:30:00.000Z", notes: null, scheduledBy: "assignee", maxAttempts: 5 },
@@ -2334,6 +2356,210 @@ describe("IssueProperties", () => {
       ).toBe(5);
 
       act(() => liveRoot.unmount());
+    });
+
+    /**
+     * PEN-3803, the case the old rule could not see at all. With no declared
+     * `maxAttempts` there was no bound to "drop", so the dialog sent nothing
+     * and the server resolved the fleet ceiling — which the row had already
+     * spent. This is the shape that produced the measured 24h phantom wake on
+     * PEN-3328, and the board hitting Schedule on it is exactly the attempted
+     * rescue that used to fail silently.
+     */
+    it("renews an unset maxAttempts once the row has spent the default ceiling", async () => {
+      const onUpdate = vi.fn();
+      const root = renderProperties(container, {
+        issue: createIssue({
+          status: "in_progress",
+          assigneeAgentId: "agent-1",
+          monitorAttemptCount: DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
+          executionPolicy: createExecutionPolicy({
+            monitor: { nextCheckAt: "2026-04-11T12:30:00.000Z", notes: null, scheduledBy: "assignee" },
+          }),
+        }),
+        childIssues: [],
+        onUpdate,
+        inline: true,
+      });
+      await flushReact();
+      await act(async () => {
+        Array.from(container.querySelectorAll("button"))
+          .find((button) => button.textContent?.includes("Next check"))!
+          .dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flushReact();
+
+      clickMonitorButton(container, "Schedule");
+      const written = (onUpdate.mock.calls.at(-1)?.[0]?.executionPolicy as IssueExecutionPolicy).monitor;
+      expect(written?.maxAttempts).toBe(
+        renewedIssueMonitorMaxAttempts(DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS),
+      );
+      expect(written?.maxAttempts!).toBeGreaterThan(DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS);
+
+      act(() => root.unmount());
+
+      // Negative control for the same branch: below the ceiling, an unset
+      // bound stays unset. Sending a renewal there would convert the fleet
+      // default into a per-row declared bound for free.
+      const youngOnUpdate = vi.fn();
+      const youngRoot = renderProperties(container, {
+        issue: createIssue({
+          status: "in_progress",
+          assigneeAgentId: "agent-1",
+          monitorAttemptCount: DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS - 1,
+          executionPolicy: createExecutionPolicy({
+            monitor: { nextCheckAt: "2026-04-11T12:30:00.000Z", notes: null, scheduledBy: "assignee" },
+          }),
+        }),
+        childIssues: [],
+        onUpdate: youngOnUpdate,
+        inline: true,
+      });
+      await flushReact();
+      await act(async () => {
+        Array.from(container.querySelectorAll("button"))
+          .find((button) => button.textContent?.includes("Next check"))!
+          .dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flushReact();
+
+      clickMonitorButton(container, "Schedule");
+      expect(
+        (youngOnUpdate.mock.calls.at(-1)?.[0]?.executionPolicy as IssueExecutionPolicy).monitor?.maxAttempts
+          ?? null,
+      ).toBeNull();
+
+      act(() => youngRoot.unmount());
+    });
+
+    /**
+     * PEN-3803 review follow-up. Past `MAX_ISSUE_MONITOR_MAX_ATTEMPTS` the
+     * renewal is not representable, so the two tests above have nothing to
+     * grant: the dialog would send `maxAttempts: null` and the server would
+     * answer 422 naming a remedy this dialog cannot apply — it renders no
+     * `maxAttempts` control, and `onUpdate` gives the popover no error surface
+     * to show the refusal in. So the click would simply appear to do nothing.
+     *
+     * Refuse before the click instead, and name the control that does work.
+     */
+    it("disables Schedule and explains the remedy once no renewal is representable", async () => {
+      const onUpdate = vi.fn();
+      const root = await openMonitorEditor(container, onUpdate, {
+        monitor: { nextCheckAt: "2026-04-11T12:30:00.000Z", notes: null, scheduledBy: "assignee" },
+      }, { monitorAttemptCount: MAX_ISSUE_MONITOR_MAX_ATTEMPTS });
+
+      expect(renewedIssueMonitorMaxAttempts(MAX_ISSUE_MONITOR_MAX_ATTEMPTS)).toBeNull();
+
+      const schedule = Array.from(container.querySelectorAll("button"))
+        .find((candidate) => candidate.textContent?.trim() === "Schedule");
+      expect(schedule).toBeTruthy();
+      expect((schedule as HTMLButtonElement).disabled).toBe(true);
+
+      // The refusal has to be readable, not just implied by a greyed button —
+      // and it must not promise a remedy that cannot be applied.
+      expect(container.textContent).toContain(String(MAX_ISSUE_MONITOR_MAX_ATTEMPTS));
+      expect(container.textContent).toMatch(/no further\s+monitor can be armed on this issue/);
+      // Clearing is still offered on an armed row, but only as retirement.
+      expect(container.textContent).toMatch(/Clearing retires the current one/);
+      expect(container.textContent).not.toMatch(/raise .*maxAttempts.* through the API/);
+
+      // "Clear" stays live — it is the move the hint names.
+      const clear = Array.from(container.querySelectorAll("button"))
+        .find((candidate) => candidate.textContent?.trim() === "Clear");
+      expect(clear).toBeTruthy();
+      expect((clear as HTMLButtonElement).disabled).toBe(false);
+
+      act(() => root.unmount());
+    });
+
+    /**
+     * PEN-3803 review follow-up #2. `monitorAttemptCount` SURVIVES a clear — that
+     * outliving is the whole subject of this issue — so a row whose monitor was
+     * already cleared at the cap still cannot be armed: the arm resolves the same
+     * spent count and 422s. An earlier revision of the gate conjoined
+     * `executionPolicy?.monitor`, which left Schedule enabled on exactly that row
+     * and sent it to the same unsurfaceable refusal.
+     *
+     * NEGATIVE CONTROL: restore the `Boolean(issue.executionPolicy?.monitor) &&`
+     * conjunct on `monitorRenewalUnavailable` and this test fails.
+     */
+    it("disables Schedule at the cap even when the monitor was already cleared", async () => {
+      const onUpdate = vi.fn();
+      const root = renderProperties(container, {
+        issue: createIssue({
+          status: "in_progress",
+          assigneeAgentId: "agent-1",
+          // The count outlives the monitor that spent it.
+          monitorAttemptCount: MAX_ISSUE_MONITOR_MAX_ATTEMPTS,
+          executionPolicy: createExecutionPolicy({}),
+          executionState: {
+            status: "pending",
+            currentStageId: null,
+            currentStageIndex: null,
+            currentStageType: null,
+            currentParticipant: null,
+            returnAssignee: null,
+            reviewRequest: null,
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+            monitor: {
+              status: "cleared",
+              nextCheckAt: null,
+              lastTriggeredAt: null,
+              attemptCount: MAX_ISSUE_MONITOR_MAX_ATTEMPTS,
+              notes: null,
+              scheduledBy: "assignee",
+              clearedAt: "2026-04-10T12:00:00.000Z",
+              clearReason: "max_attempts_exhausted",
+            },
+          } satisfies IssueExecutionState,
+        }),
+        childIssues: [],
+        onUpdate,
+        inline: true,
+      });
+      await flushReact();
+      await act(async () => {
+        Array.from(container.querySelectorAll("button"))
+          .find((button) => button.textContent?.trim() === "Cleared")!
+          .dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      await flushReact();
+
+      const schedule = Array.from(container.querySelectorAll("button"))
+        .find((candidate) => candidate.textContent?.trim() === "Schedule");
+      expect(schedule).toBeTruthy();
+      expect((schedule as HTMLButtonElement).disabled).toBe(true);
+
+      // The hint must state the dead end, and must not offer a remedy. At this
+      // count no `maxAttempts` can satisfy the arm (schema caps it at 100, the
+      // arm needs strictly more) and nothing resets the counter.
+      expect(container.textContent).toMatch(/no further\s+monitor can be armed on this issue/);
+      expect(container.textContent).not.toMatch(/Clearing retires the current one/);
+      // Never point at the API as a way out — there isn't one from here.
+      expect(container.textContent).not.toMatch(/raise .*maxAttempts.* through the API/);
+
+      act(() => root.unmount());
+    });
+
+    /**
+     * Negative control for the gate above: a row with road left must keep an
+     * enabled Schedule and show no hint, or the gate is an unconditional
+     * disable rather than a spent-budget rule.
+     */
+    it("leaves Schedule enabled while a renewal is still representable", async () => {
+      const onUpdate = vi.fn();
+      const root = await openMonitorEditor(container, onUpdate, {
+        monitor: { nextCheckAt: "2026-04-11T12:30:00.000Z", notes: null, scheduledBy: "assignee" },
+      }, { monitorAttemptCount: DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS });
+
+      const schedule = Array.from(container.querySelectorAll("button"))
+        .find((candidate) => candidate.textContent?.trim() === "Schedule");
+      expect((schedule as HTMLButtonElement).disabled).toBe(false);
+      expect(container.textContent).not.toMatch(/Clear it and stop polling/);
+
+      act(() => root.unmount());
     });
 
     it("clears externalRef only when a service name that was set gets cleared", async () => {

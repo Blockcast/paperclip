@@ -13,9 +13,11 @@ import type {
 } from "@paperclipai/shared";
 import {
   DEFAULT_ISSUE_MONITOR_CONVERGENCE_THRESHOLD,
+  DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
   MAX_ISSUE_MONITOR_CONVERGENCE_THRESHOLD,
   issueExecutionPolicySchema,
   issueExecutionStateSchema,
+  renewedIssueMonitorMaxAttempts,
 } from "@paperclipai/shared";
 import { unprocessable } from "../errors.js";
 
@@ -93,7 +95,44 @@ const COMPLETED_STATUS: IssueExecutionState["status"] = "completed";
 const PENDING_STATUS: IssueExecutionState["status"] = "pending";
 const CHANGES_REQUESTED_STATUS: IssueExecutionState["status"] = "changes_requested";
 const MONITOR_INVALID_MESSAGE = "Monitor can only be scheduled on issues assigned to an agent in in_progress or in_review";
-const MONITOR_BOUNDS_EXHAUSTED_MESSAGE = "Monitor bounds are already exhausted";
+/**
+ * PEN-3803: the remedy is part of the message because this 422 now fires on a
+ * population it previously waved through — a monitor at or past the default
+ * ceiling with `maxAttempts: null` — and the advice in circulation for that
+ * case was exactly backwards ("omit `maxAttempts`", which is what produced the
+ * silent 200). Clearing does not reset `monitorAttemptCount` either, so a
+ * reader who is told only "exhausted" has no way to infer the one move that
+ * works.
+ */
+const MONITOR_BOUNDS_EXHAUSTED_MESSAGE =
+  "Monitor bounds are already exhausted — this arm would be cleared at dispatch without firing. " +
+  "Either set an explicit `maxAttempts` greater than the issue's `monitorAttemptCount` " +
+  "(a recorded, bounded budget extension), or clear the monitor and stop polling. " +
+  "Omitting `maxAttempts` does NOT grant more attempts: the scheduler applies its own ceiling " +
+  "to every monitor at dispatch.";
+
+/**
+ * PEN-3803: the numbers behind the refusal, so a caller can compute the remedy
+ * the message names without a second read. `maxAttemptsSource` distinguishes a
+ * bound the issue declared from the fleet-wide ceiling, which is the difference
+ * between "you set this" and "you never saw this".
+ */
+function monitorBoundsExhaustedDetails(input: {
+  clearReason: IssueExecutionMonitorClearReason;
+  monitor: Pick<IssueExecutionMonitorPolicy, "timeoutAt" | "maxAttempts"> | null;
+  attemptCount: number;
+}) {
+  const declared = input.monitor?.maxAttempts ?? null;
+  const effective = declared ?? DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS;
+  return {
+    clearReason: input.clearReason,
+    attemptCount: input.attemptCount,
+    maxAttempts: effective,
+    maxAttemptsSource: declared === null ? ("default" as const) : ("policy" as const),
+    timeoutAt: input.monitor?.timeoutAt ?? null,
+    suggestedMaxAttempts: renewedIssueMonitorMaxAttempts(input.attemptCount),
+  };
+}
 const MONITOR_CONVERGENCE_RESET_REQUIRES_NON_ASSIGNEE_MESSAGE =
   "A monitor cleared for convergence_stalled must be re-armed by a non-assignee actor";
 export const REDACTED_ISSUE_MONITOR_EXTERNAL_REF = "[redacted]";
@@ -494,25 +533,19 @@ function parseMonitorDate(value: string | null | undefined) {
 }
 
 /**
- * Ceiling used by scheduler dispatch for a monitor armed without an explicit
- * `maxAttempts` (BLO-23061).
+ * PEN-3803: the ceiling now lives in `@paperclipai/shared` and is re-exported
+ * here so existing server importers keep their import path.
  *
- * `recoveryPolicy` and the whole `max_attempts_exhausted` → owner-recovery path
- * are already implemented and tested, but they hang off `exhaustedMonitorClearReason`,
- * which only fires when `maxAttempts` is non-null. Agents routinely arm monitors
- * with a `recoveryPolicy` and no `maxAttempts`, which made that escalation
- * unreachable: the monitor re-armed forever and no human was ever notified.
- * Observed on BLO-22305 — 19 agent runs across 31 hours, every one reporting an
- * unchanged signature and re-arming.
- *
- * 24 is deliberately generous: at the ~hourly cadence those live monitors used,
- * it is roughly a day of self-service polling before a human is pulled in. An
- * explicit `maxAttempts` on the policy still wins, so callers that genuinely
- * need a longer leash can set one. This is intentionally a scheduler default,
- * not an API re-arm default: an explicit re-arm without `maxAttempts` remains
- * unbounded as it was before this ceiling existed.
+ * It moved because the sentence that used to sit on this declaration — "this is
+ * intentionally a scheduler default, not an API re-arm default: an explicit
+ * re-arm without `maxAttempts` remains unbounded" — was not true of the system,
+ * and believing it was what produced the defect. The scheduler applies this
+ * ceiling to EVERY monitor at dispatch, whether or not the arm declared a
+ * `maxAttempts`. "Unbounded at the API" therefore only ever meant "the arm is
+ * not refused"; it never meant the monitor got more than 24 attempts. See the
+ * declaration in `shared/constants.ts` for the full reasoning.
  */
-export const DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS = 24;
+export { DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS };
 
 /**
  * Single source of truth for "has this monitor run out of road?" — shared by the
@@ -523,9 +556,19 @@ export const DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS = 24;
  * `nextAttemptCount > maxAttempts`, where `nextAttemptCount = attemptCount + 1`;
  * that is algebraically identical to `attemptCount >= maxAttempts`, so collapsing
  * the two is behaviour-preserving. Keep this parameterization — passing the
- * post-increment count here would move the ceiling by one. Only the scheduler
- * supplies `defaultMaxAttempts`; explicit policy transitions omit it so a
- * monitor with no configured limit remains unbounded.
+ * post-increment count here would move the ceiling by one.
+ *
+ * PEN-3803: `defaultMaxAttempts` used to be supplied by the scheduler alone, on
+ * the theory that an explicit policy transition should leave a monitor with no
+ * configured limit unbounded. The effect was not an unbounded monitor but an
+ * undetectable one — the arm returned 200 and the scheduler cleared the row as
+ * `max_attempts_exhausted` at the due instant without ever firing, after the
+ * row had advertised a live `monitorNextCheckAt` for the whole interval. Every
+ * caller that decides whether a monitor CAN BE DELIVERED now supplies the
+ * ceiling, so the arm-time verdict and the dispatch verdict are the same
+ * verdict. A caller asking a different question may still omit it; the one
+ * in-tree example is `armedMonitorNextCheckAt` in terminal-gate-reconciler.ts,
+ * which deliberately honours only an issue-declared bound and documents why.
  */
 export function exhaustedMonitorClearReason(input: {
   monitor: Pick<IssueExecutionMonitorPolicy, "timeoutAt" | "maxAttempts"> | null;
@@ -1369,14 +1412,62 @@ function applyMonitorTransition(
         clearedAt: new Date(),
       });
     } else {
+      // PEN-3803: supply the scheduler's ceiling so this validator asks the
+      // question the scheduler will ask. Omitting it made the two disagree
+      // about the same bound: at `attemptCount >= DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS`
+      // with `maxAttempts: null`, the arm resolved the bound to `null`, returned
+      // 200, and the row read as a live wake until dispatch cleared it as
+      // `max_attempts_exhausted` without firing (measured on PEN-3328: armed
+      // 2026-10-03T23:50Z for 2026-10-04T23:30Z, cleared at the due second,
+      // `lastTriggeredAt` predating the arm). An explicit `maxAttempts` still
+      // wins over the default, which is what keeps a deliberate budget
+      // extension possible — see `renewedIssueMonitorMaxAttempts`.
+      //
+      // ⚠️ ONLY on an explicit arm. This predicate has two consumers just below
+      // and they are not symmetric. An explicit arm THROWS 422 — loud, at the
+      // caller, before anything is persisted. A non-explicit transition instead
+      // STRIPS the monitor and records it cleared: silent, no activity row, no
+      // `recoveryPolicy`, because `buildClearedMonitorState` is a pure state
+      // builder. That branch runs on every generic `PATCH /api/issues/:id` that
+      // leaves `executionPolicy` alone, since `nextExecutionPolicy` falls back
+      // to the stored policy and carries its armed monitor in with
+      // `monitorExplicitlyUpdated` false (routes/issues.ts).
+      //
+      // Applying the fleet ceiling there would silently destroy the exact
+      // population this fix exists for. A legacy row at `attemptCount >= 24`
+      // with `maxAttempts: null` — what the old 200 path created, PEN-3328
+      // included — survives any unrelated PATCH today and reaches the
+      // scheduler, which retires it LOUDLY through `clearIssueMonitorAndRecover`
+      // (`issue.monitor_exhausted` plus the configured `recoveryPolicy`,
+      // heartbeat.ts). Stripping it here would trade that escalation for a
+      // silent clear triggered by an unrelated edit — a priority change, a
+      // comment, a status move.
+      //
+      // Deliverability is the ARM's question. Carrying an already-armed monitor
+      // forward is not an arm, so the scheduler stays the one place that retires
+      // a spent monitor, and it does so with the escalation attached.
       const exhaustedReason = exhaustedMonitorClearReason({
         monitor: input.policy.monitor,
         attemptCount: currentMonitorState?.attemptCount ?? 0,
         now: new Date(),
+        // Non-explicit transitions keep the pre-PEN-3803 resolution — the
+        // issue-declared bound only. An explicit `maxAttempts` the row has
+        // already reached still strips exactly as it always did; only the
+        // default is withheld, and only here.
+        ...(input.monitorExplicitlyUpdated
+          ? { defaultMaxAttempts: DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS }
+          : {}),
       });
       if (exhaustedReason) {
         if (input.monitorExplicitlyUpdated) {
-          throw unprocessable(MONITOR_BOUNDS_EXHAUSTED_MESSAGE, { clearReason: exhaustedReason });
+          throw unprocessable(
+            MONITOR_BOUNDS_EXHAUSTED_MESSAGE,
+            monitorBoundsExhaustedDetails({
+              clearReason: exhaustedReason,
+              monitor: input.policy.monitor,
+              attemptCount: currentMonitorState?.attemptCount ?? 0,
+            }),
+          );
         }
         patch.executionPolicy = stripMonitorFromExecutionPolicy(input.policy);
         clearArmedMonitorColumns(patch);
@@ -1479,13 +1570,25 @@ export function buildInitialIssueMonitorFields(input: {
   if (!issueAllowsMonitor(input.status, input.assigneeAgentId ?? null, input.assigneeUserId ?? null)) {
     throw unprocessable(MONITOR_INVALID_MESSAGE);
   }
+  // PEN-3803: `defaultMaxAttempts` is correctly omitted here, unlike at the
+  // re-arm site above. This is the create path, where the row has made no
+  // attempts by construction, so the ceiling cannot bite and supplying it would
+  // be inert. The literal `0` is the row's real attempt count here, not the
+  // hardcoded stand-in the re-arm path used to pass.
   const exhaustedReason = exhaustedMonitorClearReason({
     monitor: input.policy.monitor,
     attemptCount: 0,
     now: new Date(),
   });
   if (exhaustedReason) {
-    throw unprocessable(MONITOR_BOUNDS_EXHAUSTED_MESSAGE, { clearReason: exhaustedReason });
+    throw unprocessable(
+      MONITOR_BOUNDS_EXHAUSTED_MESSAGE,
+      monitorBoundsExhaustedDetails({
+        clearReason: exhaustedReason,
+        monitor: input.policy.monitor,
+        attemptCount: 0,
+      }),
+    );
   }
 
   const monitorState = buildScheduledMonitorState(null, input.policy.monitor);

@@ -225,7 +225,11 @@ export function Costs() {
   });
 
   const incidentMutation = useMutation({
-    mutationFn: (input: { incidentId: string; action: "keep_paused" | "raise_budget_and_resume"; amount?: number }) =>
+    mutationFn: (input: {
+      incidentId: string;
+      action: "keep_paused" | "raise_budget_and_resume" | "resume_without_raise";
+      amount?: number;
+    }) =>
       budgetsApi.resolveIncident(companyId, input.incidentId, input),
     onSuccess: invalidateBudgetViews,
   });
@@ -644,6 +648,8 @@ export function Costs() {
                       key={incident.id}
                       incident={incident}
                       isMutating={incidentMutation.isPending}
+                      onResumeWithoutRaise={() =>
+                        incidentMutation.mutate({ incidentId: incident.id, action: "resume_without_raise" })}
                       onKeepPaused={() => incidentMutation.mutate({ incidentId: incident.id, action: "keep_paused" })}
                       onRaiseAndResume={(amount) =>
                         incidentMutation.mutate({
@@ -889,7 +895,9 @@ export function Costs() {
                         key={incident.id}
                         incident={incident}
                         isMutating={incidentMutation.isPending}
-                        onKeepPaused={() => incidentMutation.mutate({ incidentId: incident.id, action: "keep_paused" })}
+                        onResumeWithoutRaise={() =>
+                        incidentMutation.mutate({ incidentId: incident.id, action: "resume_without_raise" })}
+                      onKeepPaused={() => incidentMutation.mutate({ incidentId: incident.id, action: "keep_paused" })}
                         onRaiseAndResume={(amount) =>
                           incidentMutation.mutate({
                             incidentId: incident.id,

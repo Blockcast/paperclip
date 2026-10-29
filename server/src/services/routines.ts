@@ -306,11 +306,20 @@ const ROUTINE_FIRE_AGE_HORIZON_SAMPLE_TICKS = 6;
  * If each caller sampled the cron itself they would silently drift apart on
  * the next edit to either.
  *
- * ponytail: a longest gap that recurs less often than once per
- * ROUTINE_FIRE_AGE_HORIZON_SAMPLE_TICKS gaps (e.g. a daily cron that skips one
- * month a year) is under-sampled and can page once at that gap. Upgrade path
- * if such a cron appears: publish a deadline (the second scheduled tick after
- * the last completed fire) instead of a cadence.
+ * PEN-4711: the tick-bounded walk under-samples `maxMs` whenever the longest
+ * gap recurs less often than once per ROUTINE_FIRE_AGE_HORIZON_SAMPLE_TICKS
+ * gaps. That was NOT the exotic case the original note guessed at -- it is any
+ * day-of-week cron firing more than ~6 times a week, e.g. the twice-daily
+ * `0 9,14 * * 1-5`, which paged every weekend on a healthy routine.
+ * {@link deriveDaySkipGapMs} now supplies that gap arithmetically, so every
+ * weekly pattern is covered at zero extra search cost.
+ *
+ * ponytail: a cron whose longest gap is neither weekly nor within a day --
+ * a daily cron restricted to some months, say -- is still under-sampled and
+ * can page once at that gap, since the arithmetic path deliberately declines
+ * any cron with a restricted day-of-month or month field. No such trigger
+ * exists today. Upgrade path if one appears: publish a deadline (the second
+ * scheduled tick after the last completed fire) instead of a cadence.
  *
  * Returns null rather than a fallback because the two callers want opposite
  * things from "no cadence": dispatch keeps gating on a flat horizon, while the
@@ -374,6 +383,65 @@ export function resetRoutineFireGapsMemoForTests() {
   routineFireGapsMemo.clear();
 }
 
+/**
+ * PEN-4711: the longest gap this cron's DAY pattern imposes, in milliseconds,
+ * or null when it imposes none (every day is scheduled) or when the pattern is
+ * not weekly.
+ *
+ * A cron's tick times within a day are identical on every scheduled day -- the
+ * minute and hour fields do not vary by date -- so the longest gap across a
+ * skipped run of days is fully determined by the parsed fields:
+ *
+ *   strideDays * 24h - (last tick-of-day offset - first tick-of-day offset)
+ *
+ * For `0 9,14 * * 1-5` the stride is Fri -> Mon = 3 days and the offsets are
+ * 09:00 and 14:00, giving 72h - 5h = 67h: the exact Fri 14:00 -> Mon 09:00
+ * gap, derived with no tick search at all.
+ *
+ * Why arithmetic rather than simply walking further: {@link
+ * sampleRoutineFireGapsMs} spends a TICK budget, not a TIME budget, and
+ * BLO-32638 caps this whole derivation at seven next-tick searches precisely
+ * because its `Intl` cost took helm revision 798 down. Spanning a week costs 11
+ * searches on a twice-daily cron and 169 on an hourly one, so lengthening the
+ * walk trades this bug for that outage. This costs zero additional searches.
+ *
+ * Restricted to crons whose day-of-month and month fields are both
+ * unrestricted; otherwise the day pattern is not weekly (`0 9 15 5 *` fires
+ * yearly) and a stride over days-of-week would be meaningless. Those are left
+ * to the walk, which already characterises them correctly because each of its
+ * gaps spans a whole period.
+ *
+ * DST: the stride is counted in calendar days and converted at 24h each, so a
+ * gap spanning a transition is off by an hour in one direction or the other.
+ * That is immaterial against the alert's `2 *` multiplier -- 67h becoming 66h
+ * moves the threshold by 2h in 134h -- and is why the result is folded in as a
+ * `max` against the measured walk rather than replacing it.
+ */
+function deriveDaySkipGapMs(cronExpression: string): number | null {
+  const cron = parseCron(cronExpression);
+  // 31 and 12 are the full sets `parseField` produces for `*`. Both must be
+  // unrestricted for the day pattern to repeat weekly.
+  if (cron.daysOfMonth.length !== 31 || cron.months.length !== 12) return null;
+  const days = cron.daysOfWeek;
+  // Every day scheduled (or none) skips nothing, so the walk already sees every
+  // gap this cron has.
+  if (days.length === 0 || days.length === 7) return null;
+  let strideDays = 0;
+  for (let i = 0; i < days.length; i += 1) {
+    // The last scheduled day of the week wraps to the first of the next one.
+    const next = i + 1 < days.length ? days[i + 1]! : days[0]! + 7;
+    const stride = next - days[i]!;
+    if (stride > strideDays) strideDays = stride;
+  }
+  if (strideDays <= 1) return null;
+  // `hours` and `minutes` are sorted and non-empty (`parseField` throws rather
+  // than returning an empty field), so these are the day's first and last tick.
+  const firstOffsetMin = cron.hours[0]! * 60 + cron.minutes[0]!;
+  const lastOffsetMin =
+    cron.hours[cron.hours.length - 1]! * 60 + cron.minutes[cron.minutes.length - 1]!;
+  return (strideDays * 24 * 60 - (lastOffsetMin - firstOffsetMin)) * 60_000;
+}
+
 function sampleRoutineFireGapsMs(
   cronExpression: string,
   timeZone: string,
@@ -395,6 +463,20 @@ function sampleRoutineFireGapsMs(
         if (gapMs < gaps.minMs) gaps.minMs = gapMs;
         if (gapMs > gaps.maxMs) gaps.maxMs = gapMs;
       }
+    }
+    // PEN-4711: the walk above is bounded in TICKS, so on a cron that fires
+    // more often than ROUTINE_FIRE_AGE_HORIZON_SAMPLE_TICKS times a week it
+    // never reaches the day-skip gap -- `0 9,14 * * 1-5` spans only Mon -> Thu.
+    // `maxMs` then came back as the 19h overnight gap against a legitimate 67h
+    // Fri -> Mon idle, and PaperclipRoutineFireGap false-paged for ~28h every
+    // weekend on a healthy routine. Derive that gap arithmetically instead.
+    //
+    // ONLY `maxMs` is widened. `minMs` is the dispatch-lock horizon's input
+    // (BLO-31996) and a day-skip gap is by construction never the shortest gap,
+    // so that caller is untouched by this.
+    const daySkipGapMs = deriveDaySkipGapMs(cronExpression);
+    if (gaps !== null && daySkipGapMs !== null && daySkipGapMs > gaps.maxMs) {
+      gaps.maxMs = daySkipGapMs;
     }
     // No usable gap at all (a cron that fires once and never again) means
     // there is no cadence.

@@ -312,6 +312,18 @@ describe("merge-gate reader", () => {
       assert.deepEqual(renamed(["ci-secret-scan", "aq[b] (1)", "a.[b] (1)"], base), ["ci-secret-scan", "aq[b] (1)"]);
     });
 
+    // BLO-49040: esc() must quote regex metacharacters in the literal parts. A
+    // name that cannot match itself as a regex (`c++`, `lint[`) reads as a
+    // rename -> its STOP is dropped. Mutation: `esc(s) { return s }` turns this red.
+    for (const [name, decl] of [
+      ["c++ 17", "c++ ${{ matrix.std }}"],
+      ["lint[web]", "lint[${{ matrix.pkg }}]"],
+    ]) {
+      it(`keeps STOP for ${name}: esc() quotes metacharacters in ${decl}`, () => {
+        assert.deepEqual(renamed([name], baseFile(`jobs:\n  x:\n    name: ${decl}\n`)), []);
+      });
+    }
+
     it("does not relabel a refusal whose twin survives", () => {
       const lines = read(
         [["ci-preflight", "success", "t1", "500"], ["ci-preflight" + LEGACY, "failure", "t1", "501"]],
@@ -2213,4 +2225,108 @@ esac
     }
     assert.ok(rc > 1, `expected exit > 1, got ${rc}`);
   });
+});
+
+// BLO-49040: a later page that fails WITHOUT a body (reset, timeout) leaves only
+// page 1 on stdout. gh exits 1; the reader must print a STOP and exit above 1
+// rather than judge a partial read. Master before this fix: rc 0, no output.
+describe("live mode: a bodiless later-page failure fails closed (BLO-49040)", () => {
+  const sha = "a".repeat(40);
+  const page1 = {
+    "check-runs": `{"total_count":101,"check_runs":[{"name":"ci","status":"completed","conclusion":"success","completed_at":"2026-10-24T00:00:00Z","details_url":"https://github.com/o/r/actions/runs/7/job/1"}]}`,
+    status: `{"state":"success","statuses":[]}`,
+    "actions/runs": `{"total_count":101,"workflow_runs":[]}`,
+  };
+  for (const surface of Object.keys(page1)) {
+    it(`STOPs with rc > 1 when ${surface} page 2 exits 1 with empty stdout`, () => {
+      const dir = mkdtempSync(join(tmpdir(), "mgr-gh-"));
+      const arm = (pat, key) =>
+        `  ${pat}) printf '%s' '${page1[key]}'${key === surface ? "; exit 1" : ""} ;;`;
+      writeFileSync(
+        join(dir, "gh"),
+        `#!/usr/bin/env bash
+case "$2" in
+${arm("*/check-runs*", "check-runs")}
+  */dispatch-approved-pr-ci.yml) echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;
+${arm("*/actions/runs*", "actions/runs")}
+${arm("*/status*", "status")}
+  repos/o/r/commits/*) echo ${sha} ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac
+`,
+        { mode: 0o755 },
+      );
+      let rc = 0;
+      let out = "";
+      try {
+        out = execFileSync("bash", [READER, "o/r", sha], {
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+          env: { ...process.env, PATH: `${dir}:${process.env.PATH}` },
+        });
+      } catch (e) {
+        rc = e.status;
+        out = e.stdout;
+      }
+      assert.ok(rc > 1, `expected exit > 1, got ${rc}`);
+      assert.match(out, new RegExp(`^STOP\\t<${surface} fetch failed for ${sha} \\(rc 1\\); refusing on a partial read>\\tFETCH-FAILED\\trun=-$`, "m"));
+    });
+  }
+});
+
+// BLO-49045: the two remaining `--paginate` fetches. Each fixture is a head that
+// reads clean on a partial read: page 1 alone carries what clears it.
+describe("live mode: pulls and statuses-list partial reads fail closed (BLO-49045)", () => {
+  const sha = "a".repeat(40);
+  const base = "b".repeat(40);
+  const ok = `{"name":"ci","status":"completed","conclusion":"success","completed_at":"2026-10-24T00:00:00Z","details_url":"https://github.com/o/r/actions/runs/7/job/1"}`;
+  const legacy = `{"name":"build (legacy arm - refused, nothing ran)","status":"completed","conclusion":"failure","completed_at":"2026-10-24T00:00:00Z","details_url":"https://github.com/o/r/actions/runs/8/job/2"}`;
+  const witness = `{"id":5,"context":"ci/dispatched-lanes","state":"success","description":"(base master) no dispatched lane applies to this head","creator":{"id":41898282}}`;
+  const cases = {
+    // Page 1 names one base sha; a second PR's base sat on the failed page.
+    pulls: `
+  */dispatch-approved-pr-ci.yml) echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;
+  */check-runs*) printf '%s' '{"total_count":2,"check_runs":[${ok},${legacy}]}' ;;
+  */pulls*) echo ${base}; exit 1 ;;
+  */contents/.github/workflows\\?ref=*) echo .github/workflows/ci.yml ;;
+  */contents/*) printf 'jobs:\\n  test:\\n    runs-on: x\\n' ;;
+  */actions/runs*) printf '%s' '{"total_count":0,"workflow_runs":[]}' ;;
+  */status*) printf '%s' '{"state":"success","statuses":[]}' ;;`,
+    // Gated head; page 1 holds an Actions-written empty witness.
+    statuses: `
+  */dispatch-approved-pr-ci.yml) echo '{}' ;;
+  */check-runs*) printf '%s' '{"total_count":1,"check_runs":[${ok}]}' ;;
+  */actions/runs*) printf '%s' '{"total_count":0,"workflow_runs":[]}' ;;
+  */statuses*) printf '%s' '[${witness}]'; exit 1 ;;
+  */status*) printf '%s' '{"state":"success","statuses":[${witness}]}' ;;`,
+  };
+  for (const [surface, arms] of Object.entries(cases)) {
+    it(`STOPs with rc > 1 when ${surface} page 2 exits 1 with empty stdout`, () => {
+      const dir = mkdtempSync(join(tmpdir(), "mgr-gh-"));
+      writeFileSync(
+        join(dir, "gh"),
+        `#!/usr/bin/env bash
+case "$2" in${arms}
+  repos/o/r/commits/*) echo ${sha} ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac
+`,
+        { mode: 0o755 },
+      );
+      let rc = 0;
+      let out = "";
+      try {
+        out = execFileSync("bash", [READER, "o/r", sha], {
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+          env: { ...process.env, PATH: `${dir}:${process.env.PATH}` },
+        });
+      } catch (e) {
+        rc = e.status;
+        out = e.stdout;
+      }
+      assert.ok(rc > 1, `expected exit > 1, got ${rc}; out=${out}`);
+      assert.match(out, new RegExp(`^STOP\\t<${surface} fetch failed for ${sha} \\(rc 1\\); refusing on a partial read>\\tFETCH-FAILED\\trun=-$`, "m"));
+    });
+  }
 });

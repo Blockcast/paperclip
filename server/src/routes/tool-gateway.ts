@@ -12,6 +12,7 @@ import { assertBoard, assertBoardOrAgent, assertCompanyAccess, getActorInfo } fr
 import { ToolGatewayHttpError, type ToolGatewayService } from "../services/tool-gateway.js";
 import { forbidden, HttpError } from "../errors.js";
 import { accessService } from "../services/index.js";
+import { membershipRoleIsNonViewer } from "../services/company-member-roles.js";
 
 const TOOL_GATEWAY_ACTIONS = [
   "tool_gateway.session_created",
@@ -276,7 +277,9 @@ export function toolGatewayRoutes(db: Db, toolGateway: ToolGatewayService) {
     if (!membership || membership.status !== "active") {
       throw forbidden("User does not have active company access");
     }
-    if (!membership.membershipRole || membership.membershipRole === "viewer") {
+    // PEN-3954 — the shared write bar, not a raw role comparison. Denies
+    // `viewer`, `null`, and `support` (ruled read-only on PEN-4964).
+    if (!membershipRoleIsNonViewer(membership.membershipRole)) {
       throw forbidden("Viewer access is read-only");
     }
   }

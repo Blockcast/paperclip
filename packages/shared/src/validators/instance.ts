@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { partialNoDefaults } from "../zod-compat.js";
 import { DEFAULT_FEEDBACK_DATA_SHARING_PREFERENCE } from "../types/feedback.js";
 import {
   DAILY_RETENTION_PRESETS,
@@ -19,65 +20,65 @@ function presetSchema<T extends readonly number[]>(presets: T, label: string) {
 }
 
 export const backupRetentionPolicySchema = z.object({
-  dailyDays: presetSchema(DAILY_RETENTION_PRESETS, "dailyDays").default(DEFAULT_BACKUP_RETENTION.dailyDays),
-  weeklyWeeks: presetSchema(WEEKLY_RETENTION_PRESETS, "weeklyWeeks").default(DEFAULT_BACKUP_RETENTION.weeklyWeeks),
-  monthlyMonths: presetSchema(MONTHLY_RETENTION_PRESETS, "monthlyMonths").default(DEFAULT_BACKUP_RETENTION.monthlyMonths),
+  dailyDays: presetSchema(DAILY_RETENTION_PRESETS, "dailyDays").prefault(DEFAULT_BACKUP_RETENTION.dailyDays),
+  weeklyWeeks: presetSchema(WEEKLY_RETENTION_PRESETS, "weeklyWeeks").prefault(DEFAULT_BACKUP_RETENTION.weeklyWeeks),
+  monthlyMonths: presetSchema(MONTHLY_RETENTION_PRESETS, "monthlyMonths").prefault(DEFAULT_BACKUP_RETENTION.monthlyMonths),
 });
 
 export const instanceGeneralSettingsSchema = z.object({
-  censorUsernameInLogs: z.boolean().default(false),
-  keyboardShortcuts: z.boolean().default(false),
-  feedbackDataSharingPreference: feedbackDataSharingPreferenceSchema.default(
+  censorUsernameInLogs: z.boolean().prefault(false),
+  keyboardShortcuts: z.boolean().prefault(false),
+  feedbackDataSharingPreference: feedbackDataSharingPreferenceSchema.prefault(
     DEFAULT_FEEDBACK_DATA_SHARING_PREFERENCE,
   ),
-  backupRetention: backupRetentionPolicySchema.default(DEFAULT_BACKUP_RETENTION),
+  backupRetention: backupRetentionPolicySchema.prefault(DEFAULT_BACKUP_RETENTION),
   // Bounded because these are the only settings strings a request turns into
   // filesystem syscalls: the hook-command audit stats every script-like token,
   // so an unbounded string is unbounded synchronous work on the API event loop
   // (BLO-28872 review). 4 KiB is ~40x the longest real hook command.
-  quotaExhaustedCmd: z.string().max(4096).nullable().default(null),
-  preRunCmd: z.string().max(4096).nullable().default(null),
-  postRunCmd: z.string().max(4096).nullable().default(null),
+  quotaExhaustedCmd: z.string().max(4096).nullable().prefault(null),
+  preRunCmd: z.string().max(4096).nullable().prefault(null),
+  postRunCmd: z.string().max(4096).nullable().prefault(null),
   // Execution policy. Absent/"any" = unrestricted; "kubernetes" forces the
   // Kubernetes sandbox provider and denies local/ssh execution (cloud_tenant).
   executionMode: z.enum(["kubernetes", "any"]).optional(),
 }).strict();
 
-export const patchInstanceGeneralSettingsSchema = instanceGeneralSettingsSchema.partial();
+export const patchInstanceGeneralSettingsSchema = instanceGeneralSettingsSchema.apply(partialNoDefaults);
 
 export const instanceExperimentalSettingsSchema = z.object({
-  enableEnvironments: z.boolean().default(false),
-  enableIsolatedWorkspaces: z.boolean().default(false),
-  enableStreamlinedLeftNavigation: z.boolean().default(true),
-  enableApps: z.boolean().default(false),
-  enablePipelines: z.boolean().default(false),
-  enableCases: z.boolean().default(false),
-  enableConferenceRoomChat: z.boolean().default(false),
-  enableTaskWatchdogs: z.boolean().default(false),
-  enableIssuePlanDecompositions: z.boolean().default(false),
-  enableExperimentalFileViewer: z.boolean().default(false),
-  enableCloudSync: z.boolean().default(false),
-  enableDoneExecutionGate: z.boolean().default(false),
-  enableExternalObjects: z.boolean().default(false),
-  enableSmokeLab: z.boolean().default(false),
-  enableBuiltInAgents: z.boolean().default(false),
-  enableSummaries: z.boolean().default(false),
-  enableDecisions: z.boolean().default(false),
-  enableGoalsSidebarLink: z.boolean().default(false),
-  enableServerInfoDebugView: z.boolean().default(false),
-  autoRestartDevServerWhenIdle: z.boolean().default(false),
-  enableIssueGraphLivenessAutoRecovery: z.boolean().default(false),
-  enableWorkspaceBranchReconcileForward: z.boolean().default(true),
-  enableWorkspaceDirtyQuarantineRepair: z.boolean().default(true),
-  enableWorktreeRunExecution: z.boolean().default(false),
-  worktreeRunExecutionActivatedAt: z.string().datetime().nullable().default(null),
-  worktreeRunExecutionActivationInstanceId: z.string().min(1).nullable().default(null),
+  enableEnvironments: z.boolean().prefault(false),
+  enableIsolatedWorkspaces: z.boolean().prefault(false),
+  enableStreamlinedLeftNavigation: z.boolean().prefault(true),
+  enableApps: z.boolean().prefault(false),
+  enablePipelines: z.boolean().prefault(false),
+  enableCases: z.boolean().prefault(false),
+  enableConferenceRoomChat: z.boolean().prefault(false),
+  enableTaskWatchdogs: z.boolean().prefault(false),
+  enableIssuePlanDecompositions: z.boolean().prefault(false),
+  enableExperimentalFileViewer: z.boolean().prefault(false),
+  enableCloudSync: z.boolean().prefault(false),
+  enableDoneExecutionGate: z.boolean().prefault(false),
+  enableExternalObjects: z.boolean().prefault(false),
+  enableSmokeLab: z.boolean().prefault(false),
+  enableBuiltInAgents: z.boolean().prefault(false),
+  enableSummaries: z.boolean().prefault(false),
+  enableDecisions: z.boolean().prefault(false),
+  enableGoalsSidebarLink: z.boolean().prefault(false),
+  enableServerInfoDebugView: z.boolean().prefault(false),
+  autoRestartDevServerWhenIdle: z.boolean().prefault(false),
+  enableIssueGraphLivenessAutoRecovery: z.boolean().prefault(false),
+  enableWorkspaceBranchReconcileForward: z.boolean().prefault(true),
+  enableWorkspaceDirtyQuarantineRepair: z.boolean().prefault(true),
+  enableWorktreeRunExecution: z.boolean().prefault(false),
+  worktreeRunExecutionActivatedAt: z.string().datetime().nullable().prefault(null),
+  worktreeRunExecutionActivationInstanceId: z.string().min(1).nullable().prefault(null),
   issueGraphLivenessAutoRecoveryLookbackHours: z
     .number()
     .int()
     .min(MIN_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS)
     .max(MAX_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS)
-    .default(DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS),
+    .prefault(DEFAULT_ISSUE_GRAPH_LIVENESS_AUTO_RECOVERY_LOOKBACK_HOURS),
 }).strict();
 
 export const patchInstanceExperimentalSettingsSchema = instanceExperimentalSettingsSchema
@@ -85,11 +86,11 @@ export const patchInstanceExperimentalSettingsSchema = instanceExperimentalSetti
     worktreeRunExecutionActivatedAt: true,
     worktreeRunExecutionActivationInstanceId: true,
   })
-  .partial()
+  .apply(partialNoDefaults)
   .strip();
 
 export const patchInstanceSettingsSchema = z.object({
-  defaultEnvironmentId: z.string().uuid().nullable().optional(),
+  defaultEnvironmentId: z.string().guid().nullable().optional(),
 }).strict();
 
 export const issueGraphLivenessAutoRecoveryRequestSchema = z.object({
@@ -111,8 +112,8 @@ export type IssueGraphLivenessAutoRecoveryRequest = z.infer<
 >;
 
 export const instanceSettingsSchema = z.object({
-  id: z.string().uuid(),
-  defaultEnvironmentId: z.string().uuid().nullable(),
+  id: z.string().guid(),
+  defaultEnvironmentId: z.string().guid().nullable(),
   general: instanceGeneralSettingsSchema,
   experimental: instanceExperimentalSettingsSchema,
   createdAt: z.union([z.date(), z.string().datetime()]),

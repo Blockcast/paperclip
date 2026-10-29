@@ -1,3 +1,4 @@
+import { formatTimeoutMessage } from "@paperclipai/adapter-utils/server-utils";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -684,6 +685,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         timedOut: boolean;
         stdout: string;
         stderr: string;
+        startedAt?: string | null;
       };
       parsed: ReturnType<typeof parseCursorJsonl>;
     },
@@ -694,7 +696,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         exitCode: attempt.proc.exitCode,
         signal: attempt.proc.signal,
         timedOut: true,
-        errorMessage: `Timed out after ${timeoutSec}s`,
+        errorMessage: formatTimeoutMessage(timeoutSec, attempt.proc.startedAt),
         clearSession: clearSessionOnMissingSession,
       };
     }

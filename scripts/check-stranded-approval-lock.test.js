@@ -229,6 +229,22 @@ test("a lock whose rollout completed reports clean", () => {
   assert.match(run.stdout, /verdict=clean/);
 });
 
+// BLO-49531: `kubectl rollout restart` after the release lands writes restartedAt
+// into the pod template. That is the same pod plan, so the lock is still
+// retirable and this must not cry stranded.
+test("a completed rollout that was then restarted reports clean", () => {
+  const approved = deployment();
+  const dir = mkdtempSync(path.join(tmpdir(), "stranded-hash-"));
+  const p = path.join(dir, "d.json");
+  writeFileSync(p, JSON.stringify(approved, null, 2));
+  const restarted = deployment({ generation: 596, observedGeneration: 596 });
+  restarted.spec.template.metadata.annotations["kubectl.kubernetes.io/restartedAt"] = "2026-10-26T19:06:15Z";
+  const run = runChecker({ cm: configmap({ generation: 590, serverPlan: canonicalHash(p) }), deploy: restarted });
+  assert.equal(run.status, 0, run.stderr + run.stdout);
+  assert.equal(field(run.stdout, "server_plan_match"), "true");
+  assert.match(run.stdout, /verdict=clean/);
+});
+
 test("a rollout still in flight reports landing, not stranded", () => {
   const run = runChecker({
     cm: configmap({ generation: 590, writtenAt: minutesAgo(600) }),

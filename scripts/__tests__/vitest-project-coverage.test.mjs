@@ -183,6 +183,35 @@ const EXECUTED_BY_ANOTHER_LANE = new Map([
   // that enumeration is complete -- it only declines to claim the root package
   // is untested.
   ["paperclip", "pr.yml :: policy (node --test steps)"],
+  // PEN-2506. The nine packages below are the two pnpm-workspace.yaml `!`
+  // plugin exclusions -- `sandbox-providers/**` and
+  // plugin-orchestration-smoke-example. They are NOT workspace members, so
+  // root `pnpm install` never installs their deps and a root Vitest project
+  // pointed at them cannot resolve those imports: the two-list fix that closed
+  // BLO-20076 and PEN-2491 is structurally unavailable here, which is why they
+  // were parked as debt rather than wired up.
+  //
+  // They stopped being debt on 2026-09-19. BLO-34222 added
+  // .github/workflows/sandbox-provider-tests.yml, which discovers every
+  // package under both roots (not an enumerated list) and runs each one's
+  // `test` script after building the SDK they import. Verified executing, not
+  // assumed: run 40229751677 reports "Ran 9 package(s); 0 failed", with
+  // kubernetes at 18 test files and cloudflare/bridge-template at 4.
+  //
+  // They sat in UNEXECUTED_WITH_TESTS for the five weeks after that anyway,
+  // because nothing reconciles this list against workflows other than pr.yml.
+  // A false "no lane runs this" is not harmless: it is an open invitation to
+  // build the lane that already exists, which is exactly what it cost before
+  // this correction landed.
+  ["@paperclipai/plugin-kubernetes", "sandbox-provider-tests.yml :: tests"],
+  ["@paperclipai/plugin-cloudflare-sandbox", "sandbox-provider-tests.yml :: tests"],
+  ["paperclip-cloudflare-sandbox-bridge-template", "sandbox-provider-tests.yml :: tests"],
+  ["@paperclipai/plugin-daytona", "sandbox-provider-tests.yml :: tests"],
+  ["@paperclipai/plugin-e2b", "sandbox-provider-tests.yml :: tests"],
+  ["@paperclipai/plugin-exe-dev", "sandbox-provider-tests.yml :: tests"],
+  ["@paperclipai/plugin-modal", "sandbox-provider-tests.yml :: tests"],
+  ["@paperclipai/plugin-novita-sandbox", "sandbox-provider-tests.yml :: tests"],
+  ["@paperclipai/plugin-orchestration-smoke-example", "sandbox-provider-tests.yml :: tests"],
 ]);
 
 // Packages that own test files but that no CI lane executes. This list is a
@@ -191,35 +220,64 @@ const EXECUTED_BY_ANOTHER_LANE = new Map([
 // wiring the package up) but adding one is a deliberate, reviewable act and
 // needs a tracking issue.
 //
-// Every entry below is tracked by PEN-2506. The highest-value subset is
-// @paperclipai/plugin-kubernetes, whose unexecuted suites include
-// secret-manager, sensitive-env-guard, image-allowlist and network-policy --
-// controls whose whole job is containing agent workloads.
-const UNEXECUTED_WITH_TESTS = new Map(
-  [
-    "@kkroo/paperclip-plugin-gbrain",
-    "@kkroo/paperclip-plugin-linear",
-    "@paperclipai/adapter-acpx-local",
-    "@paperclipai/adapter-openclaw-gateway",
-    "@paperclipai/google-sheets-mcp-server",
-    "@paperclipai/kv-demo-mcp-server",
-    "@paperclipai/plugin-authoring-smoke-example",
-    "@paperclipai/plugin-cloudflare-sandbox",
-    "@paperclipai/plugin-daytona",
-    "@paperclipai/plugin-e2b",
-    "@paperclipai/plugin-exe-dev",
-    "@paperclipai/plugin-fake-sandbox",
-    "@paperclipai/plugin-kubernetes",
-    "@paperclipai/plugin-llm-wiki",
-    "@paperclipai/plugin-modal",
-    "@paperclipai/plugin-novita-sandbox",
-    "@paperclipai/plugin-orchestration-smoke-example",
-    "@paperclipai/plugin-workspace-diff",
-    "@paperclipai/teams-catalog",
-    "paperclip-cloudflare-sandbox-bridge-template",
-    "paperclip-plugin-slack",
-  ].map((name) => [name, "PEN-2506"]),
-);
+// PEN-2506 drained this list to EMPTY. The twelve that left were ordinary
+// pnpm workspace members, so the two-list fix (vitest.config.ts +
+// `nonServerProjects`) was available for each, and every one was run before
+// being claimed -- through the root `--project` path the CI driver uses, not
+// standalone. Eleven of them (53 test files / 640 tests) were confirmed in CI
+// run 40696778970, `General tests (workspaces-b)`, by reading the package
+// names out of the lane log. The twelfth, @paperclipai/plugin-llm-wiki
+// (3 files / 101 tests), was verified locally through that same `--project`
+// path; its first CI run is this change.
+//
+// The security-relevant ones among them were NOT the kubernetes set that row
+// was filed about. They were paperclip-plugin-slack --
+// signature-verification.test.ts (HMAC over the original bytes, stale
+// timestamps, length mismatch, fail-closed on an unreadable secret) and
+// interaction-tenant-scope.test.ts (BLO-21083: a delivery is never served
+// under another company's token or signing secret) -- plus
+// paperclip-plugin-gbrain's oauth-client-manager.test.ts. Those are
+// inbound-request authentication and cross-tenant isolation controls, and
+// nothing ran them.
+//
+// The nine workspace-EXCLUDED packages that used to sit here -- the sandbox
+// providers and plugin-orchestration-smoke-example, including the
+// @paperclipai/plugin-kubernetes set -- have moved to
+// EXECUTED_BY_ANOTHER_LANE. They were never unexecuted debt after 2026-09-19,
+// and this list said otherwise for five weeks. See the note there.
+//
+// The last entry to leave was @paperclipai/plugin-llm-wiki, and the reason
+// recorded here for keeping it was WRONG in a way worth preserving. It read
+// "there is no DOM, and neither jsdom nor happy-dom is declared". The second
+// half was TRUE and the conclusion drawn from it was not:
+// tests/wiki-route-sidebar-ui.spec.ts carries its own
+// `// @vitest-environment jsdom` docblock, and jsdom resolves anyway -- as a
+// phantom dependency, hoisted into node_modules/.pnpm/node_modules off
+// `server`'s declaration -- so `document` was defined the whole time. That is
+// PEN-4930, tracked separately in #3072: that PR declares jsdom on the two
+// packages whose tests request it and adds a sweep to this file for any
+// package that requests a non-node environment without declaring what
+// provides it. Whether that has landed here is answered by those packages'
+// package.json files and by whether that sweep is present below -- not by
+// this note, which deliberately does not assert it, because the merge order
+// of this branch and #3072 is not fixed and a note tracking it would be
+// wrong half the time. The 16 failures were "TypeError: act is not a
+// function" because React only exports `act` from
+// cjs/react.development.js and react/index.js selects the production build
+// when process.env.NODE_ENV === "production" -- which is ambient in an agent
+// sandbox, but is NOT what CI does: runVitest in run-vitest-stable.mjs sets
+// NODE_ENV: "test" for every child. The suite passes 101/101 under NODE_ENV
+// of test, development, or unset. Pinned in the package's own vitest.config.ts
+// so a direct `pnpm test` cannot inherit production and reproduce the ghost.
+//
+// The lesson for this file: an entry here is a claim about CI, so verify it
+// the way CI runs it. A failure reproduced only in an agent shell is evidence
+// about the shell.
+//
+// Keep this empty. A new entry is a [packageName, trackingIssue] pair -- the
+// issue is not optional, and the sweep below prints it in the failure message:
+//   const UNEXECUTED_WITH_TESTS = new Map([["@scope/pkg", "ABC-123"]]);
+const UNEXECUTED_WITH_TESTS = new Map([]);
 
 function collectWorkspace(dir, packageDirs, testFiles) {
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
@@ -308,6 +366,81 @@ test("packages/mcp-gateway is wired into both lists", () => {
     !UNEXECUTED_WITH_TESTS.has("@paperclipai/mcp-gateway"),
     "@paperclipai/mcp-gateway must not be exempted in UNEXECUTED_WITH_TESTS",
   );
+});
+
+// Everything from a top-level `jobs:` key up to the next top-level key, or
+// null when the file declares none. Bounded rather than "rest of file" so a
+// workflow that puts another top-level key after `jobs:` cannot smuggle a
+// match back in.
+function jobsSectionOf(source) {
+  const start = source.match(/^jobs:[ \t]*$/m);
+  if (!start) return null;
+  const rest = source.slice(start.index + start[0].length);
+  const next = rest.match(/^[A-Za-z_][A-Za-z0-9_-]*:/m);
+  return next ? rest.slice(0, next.index) : rest;
+}
+
+// A job key is interpolated into a RegExp below; YAML permits characters that
+// are regex metacharacters, and an unescaped one would silently change what
+// the guard accepts.
+function escapeForRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+test("every EXECUTED_BY_ANOTHER_LANE claim names a job that exists", () => {
+  // EXECUTED_BY_ANOTHER_LANE is the one list in this file that asserts
+  // coverage rather than its absence, and nothing checked it. That asymmetry
+  // is not academic: for five weeks UNEXECUTED_WITH_TESTS claimed nine
+  // packages were run by no lane while sandbox-provider-tests.yml was running
+  // all nine, because no test reconciles either list against a workflow other
+  // than pr.yml. A wrong entry here is worse than a wrong entry there -- it
+  // exempts a package from the sweep above, so a renamed or deleted job
+  // silently stops running its tests and this file reports clean.
+  //
+  // This asserts the job KEY is declared in the workflow the entry names,
+  // which is what makes the claim falsifiable at review time. It cannot prove
+  // the job ran, or that it ran this package's tests -- only that the lane
+  // being cited exists.
+  const workflows = path.join(repoRoot, ".github", "workflows");
+
+  for (const [name, lane] of EXECUTED_BY_ANOTHER_LANE) {
+    const [file, job] = lane.split(" :: ");
+    assert.ok(file && job, `${name}: lane must read "<workflow>.yml :: <job key>", got "${lane}"`);
+
+    let source;
+    try {
+      source = readFileSync(path.join(workflows, file), "utf8");
+    } catch {
+      assert.fail(
+        `${name} is exempted from the unexecuted-package sweep on the claim that ` +
+          `${file} runs it, but .github/workflows/${file} does not exist.`,
+      );
+    }
+
+    // Strip any parenthetical detail, e.g. "policy (node --test steps)".
+    const jobKey = job.replace(/\s*\(.*$/, "").trim();
+
+    // Scope the search to the `jobs:` block. Matching `^  <key>:$` against the
+    // whole file also accepts any OTHER two-space-indented mapping key -- most
+    // damagingly the trigger names under `on:`, so a claim of
+    // "pr.yml :: pull_request" or ":: merge_group" would pass and exempt a
+    // package from the sweep above on the strength of something that is not a
+    // job at all. Verified against pr.yml, where `pull_request:` sits at
+    // exactly two spaces (line 4).
+    const jobsBlock = jobsSectionOf(source);
+    assert.ok(
+      jobsBlock !== null,
+      `${name} cites ${file}, but that workflow has no top-level \`jobs:\` block.`,
+    );
+    assert.match(
+      jobsBlock,
+      new RegExp(`^  ${escapeForRegExp(jobKey)}:$`, "m"),
+      `${name} is exempted from the unexecuted-package sweep on the claim that ` +
+        `\`${jobKey}\` in ${file} runs it, but that workflow declares no such job. ` +
+        `Either the job was renamed or removed -- in which case this package's tests ` +
+        `are silently not running -- or the claim was never true.`,
+    );
+  }
 });
 
 test("UNEXECUTED_WITH_TESTS has no stale entries", () => {
@@ -437,5 +570,173 @@ test("the embedded-Postgres detector is not vacuous", () => {
     `expected the detector to find server, packages/db and ` +
       `packages/plugins/paperclip-plugin-alertmanager (the latter pins the PGlite ` +
       `branch), got: ${boots.join(", ") || "(none)"}`,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// PEN-4930: a test file may opt itself into a non-`node` Vitest environment
+// with a `// @vitest-environment <name>` docblock, or a package may set
+// `environment:` in its own vitest.config.ts. Either way Vitest then imports
+// the package that implements that environment -- `jsdom` for jsdom. That
+// import is satisfied by whatever is reachable from the package's
+// node_modules, which under pnpm includes anything hoisted into
+// node_modules/.pnpm/node_modules by some *other* importer.
+//
+// So a package can run its whole DOM suite green while declaring nothing. That
+// is what @paperclipai/plugin-llm-wiki and @paperclipai/ui were doing: 215
+// jsdom docblocks between them, and the only importer declaring `jsdom` was
+// `server`. Two costs, and the second is the one that justifies a guard here:
+//
+//   1. Fragility. `server` dropping jsdom, or a second version arriving and
+//      stopping the hoist, turns these lanes red with nothing in their own
+//      diff to explain it -- and the lane names a package the author never
+//      touched.
+//   2. Audit fidelity. Per-package CVE audit and SBOM generation enumerate
+//      DECLARED dependencies. A package that loads jsdom without declaring it
+//      does not carry jsdom in its dependency set, so a jsdom advisory does
+//      not attribute to it. jsdom is an HTML/CSS/URL parser with a non-trivial
+//      advisory history; this repo already pins `jsdom>undici` in the root
+//      package.json overrides, which is precisely the kind of remediation that
+//      has to be able to find every package it applies to.
+//
+// Neither cost is an exploitable vulnerability -- the package is pinned and
+// integrity-hashed in pnpm-lock.yaml, and the hoist introduces no substitution
+// vector. This is Low-severity hygiene, and the reason it is mechanical rather
+// than a one-time fix is that the one-time fix does not survive: the next
+// plugin to add a DOM spec reintroduces it silently, exactly as these two did.
+// The sweep is the whole point. Fixing the two packages without it would be
+// closing the instance and leaving the class open.
+
+const ENVIRONMENT_PROVIDERS = new Map([
+  ["jsdom", "jsdom"],
+  ["happy-dom", "happy-dom"],
+  ["edge-runtime", "@edge-runtime/vm"],
+]);
+
+const ENVIRONMENT_DOCBLOCK = /^\s*\/\/\s*@vitest-environment\s+([\w-]+)/m;
+const ENVIRONMENT_CONFIG = /\benvironment:\s*["']([\w-]+)["']/;
+
+// Attribute every test file to its nearest enclosing package.json, the same
+// way packagesOwningTests() does, but keep the files so each environment
+// request can be reported against the package that has to declare it.
+function environmentRequestsByPackage() {
+  const packageDirs = new Set();
+  const testFiles = [];
+  collectWorkspace(repoRoot, packageDirs, testFiles);
+
+  const requests = new Map();
+  const record = (dir, environment, source) => {
+    if (!dir || environment === "node") return;
+    if (!requests.has(dir)) requests.set(dir, new Map());
+    const perDir = requests.get(dir);
+    if (!perDir.has(environment)) perDir.set(environment, path.relative(repoRoot, source));
+  };
+  const ownerOf = (file) => {
+    let dir = path.dirname(file);
+    while (dir.startsWith(repoRoot)) {
+      if (packageDirs.has(dir)) return dir;
+      dir = path.dirname(dir);
+    }
+    return null;
+  };
+
+  for (const file of testFiles) {
+    const match = ENVIRONMENT_DOCBLOCK.exec(readFileSync(file, "utf8"));
+    if (match) record(ownerOf(file), match[1], file);
+  }
+
+  // The second opt-in door: a package-level default in its own vitest.config.
+  for (const dir of packageDirs) {
+    for (const name of ["vitest.config.ts", "vitest.config.mts", "vitest.config.js"]) {
+      const config = path.join(dir, name);
+      let source;
+      try {
+        source = readFileSync(config, "utf8");
+      } catch {
+        continue;
+      }
+      const match = ENVIRONMENT_CONFIG.exec(source);
+      if (match) record(dir, match[1], config);
+    }
+  }
+
+  return requests;
+}
+
+function declaredDependencies(dir) {
+  const manifest = JSON.parse(readFileSync(path.join(dir, "package.json"), "utf8"));
+  return new Set([
+    ...Object.keys(manifest.dependencies ?? {}),
+    ...Object.keys(manifest.devDependencies ?? {}),
+    ...Object.keys(manifest.peerDependencies ?? {}),
+    ...Object.keys(manifest.optionalDependencies ?? {}),
+  ]);
+}
+
+test("every package requesting a non-node Vitest environment declares the package providing it", () => {
+  const offenders = [];
+  const unknown = [];
+
+  for (const [dir, environments] of environmentRequestsByPackage()) {
+    const declared = declaredDependencies(dir);
+    for (const [environment, source] of environments) {
+      const provider = ENVIRONMENT_PROVIDERS.get(environment);
+      if (!provider) {
+        unknown.push({ environment, source });
+        continue;
+      }
+      if (!declared.has(provider)) {
+        offenders.push({ dir: path.relative(repoRoot, dir), environment, provider, source });
+      }
+    }
+  }
+
+  // Fail closed on an environment this map has never seen rather than waving
+  // it through. A new environment is a deliberate act by someone who is right
+  // here in this file's failure message; an unrecognised name silently scoring
+  // as "fine" is the exact fail-open shape the sweep exists to remove.
+  assert.deepEqual(
+    unknown,
+    [],
+    `Unrecognised Vitest environment(s). Add the package that implements each one to ` +
+      `ENVIRONMENT_PROVIDERS above so this sweep can check it is declared:\n` +
+      unknown.map(({ environment, source }) => `  - "${environment}" requested by ${source}`).join("\n"),
+  );
+
+  assert.deepEqual(
+    offenders,
+    [],
+    `These packages run tests in a non-node Vitest environment but do not declare the package ` +
+      `that provides it. Today it resolves only because pnpm hoists some other importer's copy ` +
+      `into node_modules/.pnpm/node_modules -- a phantom dependency, which breaks when that ` +
+      `other importer changes and which hides the package from per-package CVE audit and SBOM ` +
+      `output. Add it to the package's own devDependencies and regenerate pnpm-lock.yaml:\n` +
+      offenders
+        .map(
+          ({ dir, environment, provider, source }) =>
+            `  - ${dir} requests "${environment}" (${source}) but does not declare "${provider}"`,
+        )
+        .join("\n"),
+  );
+});
+
+test("the Vitest-environment detector is not vacuous", () => {
+  // Positive control, same reasoning as the embedded-Postgres one above. Both
+  // regexes are load-bearing and neither is exercised by the assertion when
+  // the repo is clean -- a passing sweep is equally consistent with "every
+  // package declares its environment" and "the docblock regex matches
+  // nothing". These two packages are the repo's only jsdom consumers, so
+  // naming them pins the docblock branch against a silent rename.
+  const requests = environmentRequestsByPackage();
+  const jsdomConsumers = [...requests]
+    .filter(([, environments]) => environments.has("jsdom"))
+    .map(([dir]) => path.relative(repoRoot, dir))
+    .sort();
+
+  assert.deepEqual(
+    jsdomConsumers,
+    ["packages/plugins/plugin-llm-wiki", "ui"],
+    `expected the sweep to find the two packages whose tests request jsdom; if a package ` +
+      `legitimately gained or lost jsdom specs, update this control -- do not delete it`,
   );
 });

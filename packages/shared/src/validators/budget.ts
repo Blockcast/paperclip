@@ -8,14 +8,14 @@ import {
 
 export const upsertBudgetPolicySchema = z.object({
   scopeType: z.enum(BUDGET_SCOPE_TYPES),
-  scopeId: z.string().uuid(),
-  metric: z.enum(BUDGET_METRICS).optional().default("billed_cents"),
-  windowKind: z.enum(BUDGET_WINDOW_KINDS).optional().default("calendar_month_utc"),
+  scopeId: z.string().guid(),
+  metric: z.enum(BUDGET_METRICS).prefault("billed_cents"),
+  windowKind: z.enum(BUDGET_WINDOW_KINDS).prefault("calendar_month_utc"),
   amount: z.number().int().nonnegative(),
-  warnPercent: z.number().int().min(1).max(99).optional().default(80),
-  hardStopEnabled: z.boolean().optional().default(true),
-  notifyEnabled: z.boolean().optional().default(true),
-  isActive: z.boolean().optional().default(true),
+  warnPercent: z.number().int().min(1).max(99).prefault(80),
+  hardStopEnabled: z.boolean().prefault(true),
+  notifyEnabled: z.boolean().prefault(true),
+  isActive: z.boolean().prefault(true),
 });
 
 export type UpsertBudgetPolicy = z.infer<typeof upsertBudgetPolicySchema>;
@@ -32,6 +32,11 @@ export const resolveBudgetIncidentSchema = z.object({
       path: ["amount"],
     });
   }
+  // `resume_without_raise` deliberately does NOT require an amount: its whole
+  // point is that the board need not restate a figure to get a scope running
+  // again, and omitting it keeps the cap exactly as it stands (PEN-4742). An
+  // amount IS accepted, and unlike the raise path it may sit at or below
+  // observed spend -- that is the ratchet this action exists to break.
 });
 
 export type ResolveBudgetIncident = z.infer<typeof resolveBudgetIncidentSchema>;
