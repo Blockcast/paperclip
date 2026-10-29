@@ -592,6 +592,87 @@ test("findLocalRangeOffenses reads real paths, so the graphify exemption holds i
 });
 
 
+test("findLocalRangeOffenses clears an exempt commit without ever buffering its patch (PEN-5025)", () => {
+  // The weekly graphify commit outgrew `GIT_MAX_BUFFER`: 35,125,928 B of patch
+  // against a 33,554,432 B cap. `patchIdForCommit` was called for every
+  // App-attributed commit BEFORE the exemption was consulted, so the gate died
+  // with a bare `spawnSync git ENOBUFS` on a commit its own rule passes, and
+  // Blockcast/paperclip#3005 sat red for 104h with the next weekly refresh
+  // guaranteed to reproduce it.
+  //
+  // Rather than build a >32 MiB fixture (slow, and it would pin today's cap
+  // rather than the ordering), this intercepts the one call that overflows and
+  // makes it throw. An exempt commit must never reach it; a non-exempt one
+  // still must, or the test would pass on a build that simply stopped
+  // computing patch ids at all.
+  const repoRoot = mkdtempSync(path.join(os.tmpdir(), "attribution-test-enobufs-"));
+  try {
+    const git = (args, overrides) =>
+      execFileSync("git", args, {
+        cwd: repoRoot,
+        encoding: "utf8",
+        env: { ...process.env, ...asAuthor("base@example.com"), ...overrides },
+      });
+    const commitFile = (relPath, body, overrides) => {
+      mkdirSync(path.join(repoRoot, path.dirname(relPath)), { recursive: true });
+      writeFileSync(path.join(repoRoot, relPath), body);
+      git(["add", relPath]);
+      git(["-c", "commit.gpgsign=false", "commit", "-m", `touch ${relPath}`, "-q"], overrides);
+      return git(["rev-parse", "HEAD"]).trim();
+    };
+
+    git(["init", "-q", "-b", "main"]);
+    git(["-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "base", "-q"], asAuthor("base@example.com"));
+    const base = git(["rev-parse", "HEAD"]).trim();
+
+    // Only the patch-producing `git show` overflows; `--name-only` emits
+    // metadata and is left alone, so `paths` — and therefore the exemption —
+    // is still read from real git.
+    let patchReads = 0;
+    const overflowingExecFile = (file, args, options) => {
+      if (file === "git" && args.includes("show") && !args.includes("--name-only")) {
+        patchReads += 1;
+        const error = new Error("spawnSync git ENOBUFS");
+        error.code = "ENOBUFS";
+        throw error;
+      }
+      return execFileSync(file, args, options);
+    };
+
+    const bot = asAuthor("allyblockcast[bot]@users.noreply.github.com", "graphify-reindex (allyblockcast)");
+
+    // Exempt: cleared on paths alone, so the overflowing call is never made.
+    const inScope = commitFile("server/src/graphify-out/graph.json", '{"nodes":[]}\n', bot);
+    assert.deepEqual(
+      findLocalRangeOffenses({ repoRoot, base, head: inScope, execFile: overflowingExecFile }),
+      [],
+    );
+    assert.equal(patchReads, 0, "an exempt commit must not have its patch buffered");
+
+    // Not exempt: the grandfather allowlist is keyed on patch id, so this one
+    // genuinely needs the patch and the throw must surface rather than be
+    // swallowed into a silent pass.
+    const outOfScope = commitFile("server/src/services/issues.ts", "export const x = 1;\n", bot);
+    assert.throws(
+      () => findLocalRangeOffenses({ repoRoot, base: inScope, head: outOfScope, execFile: overflowingExecFile }),
+      // Re-thrown with the sha and the cap: a bare ENOBUFS named neither, and
+      // that is what made this take a local repro to localise.
+      (error) => error.message.includes(outOfScope) && /\d{8}-byte buffer/.test(error.message),
+    );
+    assert.equal(patchReads, 1, "a non-exempt commit must still reach the patch read");
+
+    // Control: with a working git, that same non-exempt commit is reported
+    // normally — the ordering change did not quietly stop flagging anything.
+    const offenses = findLocalRangeOffenses({ repoRoot, base: inScope, head: outOfScope });
+    assert.equal(offenses.length, 1);
+    assert.equal(offenses[0].sha, outOfScope);
+    assert.notEqual(offenses[0].patchId, undefined);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+
 test("auditRepoCommitAttribution flags App-attributed commits across the injected PR's own commit list", async () => {
   const commitsPage = JSON.stringify([
     {

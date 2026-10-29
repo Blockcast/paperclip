@@ -290,6 +290,16 @@ export const APP_NOREPLY_EMAIL_PATTERN =
  * the real commit/branch that justifies it and the narrowest path scope that
  * covers its output; never widen `APP_NOREPLY_EMAIL_PATTERN` to exclude one.
  */
+/**
+ * Cap on the output every `git` call in this module will buffer.
+ *
+ * Shared so the three call sites cannot drift, and named so an overflow can
+ * report the number it hit (PEN-5025). Only `patchIdForCommit` can realistically
+ * reach it: `git log --format` and `git show --name-only` produce metadata,
+ * while a patch is as large as the diff.
+ */
+const GIT_MAX_BUFFER = 32 * 1024 * 1024;
+
 export const NON_AGENT_PROCESS_EXEMPTIONS = new Map([
   // origin/bot/graphify-reindex — scheduled knowledge-graph refresh.
   // Both graphify-authored commits in this repo's history (514aefa72,
@@ -590,11 +600,31 @@ function parseLocalGitLog(rawOutput) {
 }
 
 function patchIdForCommit(repoRoot, sha, execFile = execFileSync) {
-  const patch = execFile("git", ["show", "--format=", "--no-ext-diff", "--no-renames", sha], {
-    cwd: repoRoot,
-    encoding: "utf8",
-    maxBuffer: 32 * 1024 * 1024,
-  });
+  let patch;
+  try {
+    patch = execFile("git", ["show", "--format=", "--no-ext-diff", "--no-renames", sha], {
+      cwd: repoRoot,
+      encoding: "utf8",
+      maxBuffer: GIT_MAX_BUFFER,
+    });
+  } catch (error) {
+    // Node reports an overflow as a bare `spawnSync git ENOBUFS` naming neither
+    // the commit nor the limit — which is the entire diagnosis (PEN-5025: this
+    // surfaced as a weekly PR red on `policy` for 104h, and localising that one
+    // string took a local repro). Re-throw with both, and with the fact that
+    // reaching here means the exemption already declined the commit, so the
+    // next question is whether the scope is wrong or the commit is genuinely
+    // too large to patch-id.
+    if (error?.code === "ENOBUFS") {
+      throw new Error(
+        `git show ${sha} exceeded the ${GIT_MAX_BUFFER}-byte buffer. Only a commit NOT cleared by ` +
+          "NON_AGENT_PROCESS_EXEMPTIONS reaches this call: either that scope needs to cover it, " +
+          "or it is genuinely too large to patch-id.",
+        { cause: error },
+      );
+    }
+    throw error;
+  }
   return execFile("git", ["patch-id", "--stable"], {
     cwd: repoRoot,
     input: patch,
@@ -608,7 +638,7 @@ function pathsForCommit(repoRoot, sha, execFile = execFileSync) {
   const raw = execFile("git", ["-c", "core.quotePath=false", "show", "--format=", "--name-only", "--no-renames", sha], {
     cwd: repoRoot,
     encoding: "utf8",
-    maxBuffer: 32 * 1024 * 1024,
+    maxBuffer: GIT_MAX_BUFFER,
   });
   return raw.split("\n").map((line) => line.trim()).filter(Boolean);
 }
@@ -626,6 +656,10 @@ function pathsForCommit(repoRoot, sha, execFile = execFileSync) {
  * to decide grandfathering and the non-agent-process exemption, and neither
  * question arises otherwise. On an ordinary PR that is zero extra git
  * invocations rather than two per commit.
+ *
+ * Within that set the two are ordered, not paired: `paths` decides the
+ * exemption, and an exempt commit never pays for `patchId` — see the comment
+ * in the body for why that ordering is load-bearing rather than thrifty.
  */
 export function findLocalRangeOffenses({
   repoRoot,
@@ -638,17 +672,27 @@ export function findLocalRangeOffenses({
   const rawOutput = execFile(
     "git",
     ["log", "--no-merges", `--format=${format}`, `${base}..${head}`],
-    { cwd: repoRoot, encoding: "utf8", maxBuffer: 32 * 1024 * 1024 },
+    { cwd: repoRoot, encoding: "utf8", maxBuffer: GIT_MAX_BUFFER },
   );
-  const commits = parseLocalGitLog(rawOutput).map((commit) =>
-    APP_NOREPLY_EMAIL_PATTERN.test(String(commit.authorEmail ?? ""))
-      ? {
-          ...commit,
-          patchId: patchIdForCommit(repoRoot, commit.sha, execFile),
-          paths: pathsForCommit(repoRoot, commit.sha, execFile),
-        }
-      : commit,
-  );
+  const commits = parseLocalGitLog(rawOutput).map((commit) => {
+    if (!APP_NOREPLY_EMAIL_PATTERN.test(String(commit.authorEmail ?? ""))) return commit;
+    // `paths` first, then `patchId` ONLY if the exemption has not already
+    // cleared the commit. `findAttributionOffenses` returns at the exemption
+    // strictly before the one line that reads `patchId`, so for an exempt
+    // commit the patch id was always computed and discarded.
+    //
+    // That ordering is not a micro-optimisation (PEN-5025): `patchIdForCommit`
+    // buffers the entire `git show` output, and the single process this
+    // exemption exists for emits generated graph data that outgrew the cap —
+    // 35,125,928 B against GIT_MAX_BUFFER's 33,554,432 B, with graph.json
+    // growing every week. The old order therefore killed the gate with
+    // ENOBUFS on a commit the gate's own rule passes, and would have again at
+    // every weekly refresh. Deciding the exemption first makes the verdict
+    // independent of how large an exempt commit's diff is.
+    const withPaths = { ...commit, paths: pathsForCommit(repoRoot, commit.sha, execFile) };
+    if (isExemptNonAgentProcessCommit(withPaths)) return withPaths;
+    return { ...withPaths, patchId: patchIdForCommit(repoRoot, commit.sha, execFile) };
+  });
   return findAttributionOffenses(commits, { allowlist });
 }
 
