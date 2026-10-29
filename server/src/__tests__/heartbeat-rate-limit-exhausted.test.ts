@@ -663,6 +663,21 @@ describeEmbeddedPostgres("listRecentTerminalRunsForZeroTokenStreak", () => {
       createdAt: new Date("2026-07-08T12:02:00Z"),
     });
 
+    // BLO-49987: claimed (startedAt set) but cancelled at the issue-lock gate,
+    // before any adapter attempt. Newest row, so including it would lead the
+    // streak with a run that could never have carried usage.
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId,
+      status: "cancelled",
+      usageJson: null,
+      errorCode: "issue_execution_lock_not_acquired",
+      startedAt: new Date("2026-07-08T12:05:00Z"),
+      finishedAt: new Date("2026-07-08T12:05:01Z"),
+      createdAt: new Date("2026-07-08T12:05:00Z"),
+    });
+
     const rows = await listRecentTerminalRunsForZeroTokenStreak(db, agentId);
 
     expect(rows.map((row) => row.status)).toEqual(["cancelled", "failed", "succeeded"]);

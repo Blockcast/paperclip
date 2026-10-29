@@ -7262,6 +7262,9 @@ export async function listRecentTerminalRunsForZeroTokenStreak(db: Db, agentId: 
       // they are not adapter attempts and cannot provide a token-usage signal.
       // claimQueuedRun sets startedAt only after the pre-claim gates pass.
       isNotNull(heartbeatRuns.startedAt),
+      // BLO-49987: same reason, after the claim -- a lock-gate cancel stamps
+      // startedAt but never reaches the adapter, so it cannot carry usage.
+      sql`${heartbeatRuns.errorCode} IS DISTINCT FROM 'issue_execution_lock_not_acquired'`,
       // Keep this filter aligned with countConsecutiveZeroTokenCompletedRuns:
       // non-terminal rows would reset the streak, but this production query
       // intentionally measures only completed, started terminal attempts.
@@ -29138,6 +29141,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               );
               continue;
             }
+            // BLO-49987: a SUCCEEDED Job is not evidence the owner is gone, and
+            // only the owner can record the run's usage, session and cost: this
+            // path writes none of them, and once it claims the row the owner's
+            // terminal write is refused ("skipping late run finalization"). The
+            // owner is often in ANOTHER process -- this sweep runs only on the
+            // scheduler-lease leader -- so `activeRunExecutions` cannot see it.
+            // Measured 2026-10-29: 334 refused owner writes in ~4.7h on the
+            // non-leader worker, ~46% of succeeded runs left with no usage and
+            // no cost_events row. Give the owner the same stale window the
+            // missing-Job branch below gives it; a dead owner still converges
+            // here once the run goes silent.
+            if (jobStatus.phase === "succeeded" && !isSilent) continue;
             const finalized = await timedFinalizeExternalLifecycleTerminalRun({
               run,
               adapterType,
