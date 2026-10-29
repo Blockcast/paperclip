@@ -2629,6 +2629,33 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const namespace = asString(config.namespace, "") || selfPod.namespace;
   const serviceAccountName = resolveServiceAccountName(config);
   const image = asString(config.image, "") || selfPod.image;
+  // PEN-5017 (Ally review of #3112). `config` is the MERGED run config, and an
+  // issue-scope `assigneeAdapterOverrides.adapterConfig` is overlaid into it
+  // last — so `image` above is settable by anyone who can create or patch an
+  // issue assigned to this agent, which includes the agent itself.
+  //
+  // That is fine for the agent container: once the broker is rendered, the
+  // agent container holds no GitHub credential at all, so what it runs is its
+  // own business. It is NOT fine for the broker, which execs
+  // `paperclip-github-token-env` and the broker runtime JS *out of this image*
+  // with the push credential in its environment. Rendering the broker from the
+  // overridable value would let an agent keep `enableGitHubPublishBroker`
+  // pinned exactly as the server guard intends and still choose the code that
+  // runs at uid 1001 holding the token — the boundary declined by a sibling
+  // key rather than by the gate.
+  //
+  // `ctx.agent.adapterConfig` is the agent row verbatim, before any merge, so
+  // it is the one image value in this function with agent provenance. Same
+  // resolution rule as above, against that object.
+  //
+  // Divergence is allowed rather than refused. If a lower scope points the
+  // agent container at a different image, the broker still runs the operator's
+  // image, and any resulting socket-protocol mismatch fails loudly at publish
+  // time — a self-inflicted availability fault with no credential in it.
+  // Throwing instead would hand every actor able to assign an issue a way to
+  // fail this agent's dispatches outright, which is the trade PEN-3183 §7.5
+  // declines for the gate key itself.
+  const brokerImage = asString(parseObject(agent?.adapterConfig).image, "") || selfPod.image;
   // Throws on anything but an exact version or "image" — the value is shell-interpolated.
   const claudeCodeVersion = resolveClaudeCodeVersion(config.claudeCodeVersion);
   const enableDocker = asBoolean(config.enableDocker, false);
@@ -3894,7 +3921,8 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
             ...(brokerEnabled
               ? [
                   buildGitHubPublishBrokerSidecar({
-                    image,
+                    // Agent scope, NOT the merged `image` — see brokerImage.
+                    image: brokerImage,
                     imagePullPolicy: asString(config.imagePullPolicy, "IfNotPresent"),
                     workspaceRoot: dataMountPath,
                     secretMounts: brokerSecretMounts,
