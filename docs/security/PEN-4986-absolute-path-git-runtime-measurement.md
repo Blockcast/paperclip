@@ -13,10 +13,26 @@ see them.
 ⛔ **DO NOT CITE THAT ZERO AS THE ANSWER. §7.2 trigger 4 has since FIRED.** This document records
 the **first** window only. The measurement was widened the same day (2026-10-29) along the axis §4
 names as untested — **workload** — and the sixth window, an Engineer pod running a full
-build/test suite, returned **28**. The residual acceptance is **ended**, not standing. The
-authoritative record of the firing, its mechanism and its severity argument is
-[`PEN-4989-absolute-path-git-population-widening.md`](./PEN-4989-absolute-path-git-population-widening.md)
-*(lands in #3102)* and §7.1 of the decision record; this document is the method and the first data
+build/test suite, returned **28**. The residual acceptance is **ended**, not standing.
+
+**The mechanism, inline so this headline does not depend on another file:** it is a **class, not a
+site**. 26 of the 28 are first-party test code that spawns a child with `PATH` narrowed to
+`` `${bin}:/usr/bin:/bin` `` so that a stub binary is genuinely the only candidate; the wrapper's
+directory is absent from that `PATH` **by construction**, so every `git` the child runs reaches
+`/usr/bin/git` directly, with no wrapper anywhere in its ancestry. **Any test or tool that builds
+its own `PATH` gets an unwrapped `git` for free.** The known site is cross-repo — in
+`Blockcast/penstock-llm-proxy-core` (`test/secret-scan-budget.test.ts`), **not** in this repository,
+so a paperclip-only sweep reports it clean. Tracked as **PEN-5012**. (The remaining 2 reach
+`/usr/lib/git-core/git` and are PEN-4998's separately-triaged class.) The 28 invocations are
+themselves harmless — `rev-parse` and `maintenance` against remoteless scratch repos — but trigger 4
+is written as a **count test, not a harm test**, and the mechanism is the finding.
+
+§7.1 of
+[`PEN-3183-git-egress-enforcement-boundary-decision.md`](./PEN-3183-git-egress-enforcement-boundary-decision.md)
+carries the same summary and is **in this tree**. The fuller record of the widening — all six
+windows, the severity argument and the predicate discussion — is
+`PEN-4989-absolute-path-git-population-widening.md` *(lands in #3102; not present in this tree, so
+do not follow it from here until that merges)*. This document is the method and the first data
 point. §4 below is right that this result does not generalise — what it could not know is that the
 first counter-example was already one window away. Read §2.2 before quoting a confidence
 with the zero: the sampler's measured catch rate on the shortest invocation class is **0.710**, so
@@ -296,8 +312,8 @@ from splitting the sources of a git invocation in an agent pod into two:
   The fleet claim rests on the **fingerprint comparison in §5**, not on this count: a pod whose
   egress-surface fingerprint matches may cite this census, and one whose fingerprint differs must
   re-take it. See
-  [`PEN-4989-absolute-path-git-population-widening.md`](./PEN-4989-absolute-path-git-population-widening.md) §3
-  *(lands in #3102)*.
+  `PEN-4989-absolute-path-git-population-widening.md` §3 *(lands in #3102; not present in this
+  tree)*.
 - **Agent-composed shell — per-pod, and measured in one pod only.** An agent can compose an
   absolute path to either binary into a shell snippet at runtime. That is the half this measurement
   covers for one pod and cannot cover for the others.
