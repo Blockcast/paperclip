@@ -6243,11 +6243,113 @@ const SHARED_DOC_MATERIALIZING_ADAPTER_TYPES = new Set(["claude_k8s", "opencode_
  * rather than discovered: the pod copies exactly these paths and nothing else.
  */
 export type PaperclipSharedDocOverlay = {
-  /** Execution workspace the docs were materialized into; the pod reads them from here. */
+  /**
+   * Execution workspace the docs were materialized into.
+   *
+   * Only readable from a pod that MOUNTS this directory. A run-isolated pod does not —
+   * see `contents`.
+   */
   sourceCwd: string;
   /** Repo-relative POSIX paths (`docs/<name>.md`), sorted, never absolute and never `..`. */
   paths: string[];
+  /**
+   * Document bodies, keyed by the same repo-relative path, for the pod to write directly.
+   *
+   * The first round of PEN-3329 shipped `sourceCwd` + `paths` and had the pod copy from
+   * that directory. Measured from a live `isolation-mode: run` pod on 2026-10-29: all 14
+   * docs reported absent, because `/paperclip/instances/default/projects/...` does not
+   * exist inside the pod. `/paperclip/instances/default` is an `emptyDir` with only named
+   * PVC subPaths re-mounted over it, and the projects tree is not one of them. That is
+   * not an oversight to correct in the mount list — not mounting the server's workspace
+   * is what `run` isolation IS.
+   *
+   * So the bodies travel with the Job instead, staged by the adapter as a Secret volume.
+   * Budgeted, because a Secret is capped at 1 MiB and a document must never be able to
+   * fail a pod: a doc over budget is simply left out, and the pod's existing per-path
+   * verdict line reports it undelivered.
+   */
+  contents?: Record<string, string>;
 };
+
+/**
+ * The same overlay with the bodies dropped -- the shape that is safe to persist.
+ *
+ * `context` is written verbatim into `heartbeat_runs.context_snapshot` at many call
+ * sites, and `contents` is transport to the adapter only: nothing reads the bodies back
+ * out of a snapshot. Without this the column would gain a per-run copy of every company
+ * doc. Returns a new object rather than deleting in place -- the caller hands the
+ * untouched original to the adapter, so mutating it here would strip the bodies from the
+ * one consumer that needs them (PEN-3329).
+ */
+export function omitSharedDocContents(
+  overlay: PaperclipSharedDocOverlay,
+): PaperclipSharedDocOverlay {
+  // Destructure-and-discard, so a field added to the type later is carried by `rest`
+  // automatically and only `contents` is ever dropped.
+  const { contents: _contents, ...rest } = overlay;
+  return rest;
+}
+
+/**
+ * Byte budgets for the carried bodies.
+ *
+ * A Kubernetes Secret is capped at 1 MiB *encoded*, and `stringData` is base64-encoded by
+ * the API server (4/3 expansion), so the raw ceiling is nearer 768 KiB before keys and
+ * metadata. Both numbers below sit under that with room to spare: the company docs this
+ * carries measure in single-digit KiB, so a doc near the per-file cap is already an
+ * anomaly rather than a document, and the total cap bounds the blast radius of a
+ * misconfigured bundle regardless.
+ */
+const SHARED_DOC_MAX_BYTES_PER_DOC = 128 * 1024;
+const SHARED_DOC_MAX_BYTES_TOTAL = 512 * 1024;
+
+/**
+ * Reads the materialized bodies so they can travel with the Job rather than be fetched
+ * from a path the pod may not have.
+ *
+ * Never throws and never rejects the overlay: an unreadable or over-budget document is
+ * dropped from `contents` while staying in `paths`, so the pod still names it as
+ * undelivered instead of silently shipping a short set.
+ */
+async function readSharedDocContents(input: {
+  cwd: string;
+  paths: string[];
+  onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
+}): Promise<Record<string, string>> {
+  const contents: Record<string, string> = {};
+  let total = 0;
+  for (const docPath of input.paths) {
+    let body: string;
+    try {
+      body = await fs.readFile(path.resolve(input.cwd, docPath), "utf8");
+    } catch (error) {
+      const code = error instanceof Error ? (error as NodeJS.ErrnoException).code : undefined;
+      await input.onLog(
+        "stderr",
+        `[paperclip] Shared doc ${docPath} could not be read back for delivery (${code ?? "unknown"}); the pod will report it undelivered.\n`,
+      );
+      continue;
+    }
+    const size = Buffer.byteLength(body, "utf8");
+    if (size > SHARED_DOC_MAX_BYTES_PER_DOC) {
+      await input.onLog(
+        "stderr",
+        `[paperclip] Shared doc ${docPath} is ${size} bytes, over the ${SHARED_DOC_MAX_BYTES_PER_DOC}-byte per-document budget; not delivering it.\n`,
+      );
+      continue;
+    }
+    if (total + size > SHARED_DOC_MAX_BYTES_TOTAL) {
+      await input.onLog(
+        "stderr",
+        `[paperclip] Shared docs exceed the ${SHARED_DOC_MAX_BYTES_TOTAL}-byte total budget at ${docPath}; delivering the ${Object.keys(contents).length} read so far.\n`,
+      );
+      break;
+    }
+    contents[docPath] = body;
+    total += size;
+  }
+  return contents;
+}
 
 async function materializeExternalK8sSharedDocs(input: {
   adapterType: string;
@@ -6310,10 +6412,11 @@ async function materializeExternalK8sSharedDocs(input: {
   }
   const paths = await ensureReferencedSharedDocsMaterialized({
     // A `workspace`-isolated pod MOUNTS this local execution workspace, so writes here are
-    // visible remotely with nothing further to do. A `run`-isolated pod CLONES it instead,
-    // and `git clone --shared` carries tracked objects only — so for that half the write
-    // here is necessary but not sufficient, and the returned paths are handed to the pod
-    // bootstrap so it can copy them in after the clone (PEN-3329).
+    // visible remotely with nothing further to do. A `run`-isolated pod neither mounts nor
+    // can reach it: it bootstraps with `git clone --shared`, which carries tracked objects
+    // only, and the workspace is not in its mount set at all. For that half this write is
+    // necessary but not sufficient — the returned paths AND their bodies are handed to the
+    // pod bootstrap, which writes them in after the clone (PEN-3329).
     cwd: input.cwd,
     instructionsRootPath: sourceRootPath,
     sharedDocSearchBoundaryPath,
@@ -6321,7 +6424,11 @@ async function materializeExternalK8sSharedDocs(input: {
     onLog: input.onLog,
   });
   if (paths.length === 0) return null;
-  return { sourceCwd: input.cwd, paths };
+  // Read the bodies here, on the server, where the files demonstrably are. The pod gets
+  // the content itself rather than a path to it, because `sourceCwd` is unreachable from
+  // a run-isolated pod by design (PEN-3329, second round).
+  const contents = await readSharedDocContents({ cwd: input.cwd, paths, onLog: input.onLog });
+  return { sourceCwd: input.cwd, paths, ...(Object.keys(contents).length > 0 ? { contents } : {}) };
 }
 
 type ManagedMcpGatewayRunConfig = {
@@ -35507,7 +35614,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // duplicating that resolution here would be a second place to get it wrong. The
       // adapters ignore the key in every other mode, where the mount already delivers
       // the docs (PEN-3329).
-      if (sharedDocOverlay) context.paperclipSharedDocs = sharedDocOverlay;
+      //
+      // `contents` is deliberately NOT on this object. `context` is persisted verbatim to
+      // `heartbeat_runs.context_snapshot` at ~15 call sites (`contextSnapshot: context`),
+      // and the bodies are transport to the adapter only -- nothing ever reads them back
+      // out of the snapshot. Carrying them here would turn a few-hundred-byte path list
+      // into a per-run copy of every company doc (up to SHARED_DOC_MAX_BYTES_TOTAL) in the
+      // JSONB column migrations 0079/0080 already worked to keep small enough not to
+      // detoast. Stripping at each write site would be a list to keep in sync with every
+      // future write; keeping the field off `context` entirely cannot drift. The bodies
+      // are re-attached to `adapterContext` below -- the same not-persisted seam
+      // `paperclipManagedMcp` already uses.
+      if (sharedDocOverlay) {
+        context.paperclipSharedDocs = omitSharedDocContents(sharedDocOverlay);
+      }
       const adapterEnv = Object.fromEntries(
         Object.entries(parseObject(resolvedConfig.env)).filter(
           (entry): entry is [string, string] => typeof entry[0] === "string" && typeof entry[1] === "string",
@@ -36021,6 +36141,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       let adapterResult: Awaited<ReturnType<typeof adapter.execute>>;
       try {
         const adapterContext = { ...context };
+        // Re-attach the document bodies for the adapter only. `context` carries
+        // `sourceCwd` + `paths` so the persisted snapshot stays small (see the
+        // `omitSharedDocContents` call above); the adapter needs `contents` to stage the
+        // Secret, and `adapterContext` is never written to `heartbeat_runs`. Same seam as
+        // `paperclipManagedMcp` just below (PEN-3329).
+        if (sharedDocOverlay) {
+          adapterContext.paperclipSharedDocs = sharedDocOverlay;
+        }
         const runtimeMcpServers = await buildPaperclipRuntimeMcpServers({
           db,
           agent,

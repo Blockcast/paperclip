@@ -462,6 +462,88 @@ describe("buildJobManifest", () => {
     expect(command.indexOf("git clone --shared")).toBeLessThan(command.indexOf("__pcdocs_src="));
   });
 
+  // PEN-3329, second round. The test above pins that the step reaches the pod command. It
+  // does NOT pin where it reads from — and that is what was wrong in production:
+  // `sourceCwd` is the server's execution workspace, which a run-isolated pod has no
+  // mount for, so the step ran correctly and reported every document absent. These pin
+  // the Secret delivery that replaces it.
+  const runIsolatedWithDocs = (paperclipSharedDocs: unknown) =>
+    withRuntimeIsolation({
+      ...mockCtx,
+      context: { ...mockCtx.context, paperclipWorkspace: { cwd: "/paperclip/source-worktree" }, paperclipSharedDocs },
+    }, {
+      isolationMode: "run",
+      isolationKey: "run:run123456",
+      workspaceRoot: "/runtime-cache/paperclip-runs/run123456/workspace",
+      homeRoot: "/runtime-cache/paperclip-runs/run123456/home",
+      sessionRoot: "/runtime-cache/paperclip-runs/run123456/session",
+      cacheRoot: "/runtime-cache/paperclip-runs/run123456/cache",
+      tmpRoot: "/runtime-cache/paperclip-runs/run123456/tmp",
+      storage: runtimeStorage("ephemeral"),
+      sessionScope: { taskKey: "pr-review-42", isolationKey: "run:run123456" },
+    });
+
+  it("stages the carried bodies as a Secret the pod mounts, and reads from that mount", () => {
+    const ctx = runIsolatedWithDocs({
+      sourceCwd: "/paperclip/source-worktree",
+      paths: ["docs/pr-conventions.md", "docs/definition-of-done.md"],
+      contents: {
+        "docs/pr-conventions.md": "# PR Conventions\n",
+        "docs/definition-of-done.md": "# Definition of Done\n",
+        "../../etc/passwd": "root:x:0:0",
+      },
+    });
+
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod, agentDbClaimName: null });
+    const command = result.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
+
+    // Reads from the Secret mount, NOT the server path. Asserted as an inequality too:
+    // reading `sourceCwd` is the defect, so it has to be refused rather than unmentioned.
+    expect(command).toContain("__pcdocs_src='/tmp/paperclip-shared-docs';");
+    expect(command).not.toContain("__pcdocs_src='/paperclip/source-worktree';");
+
+    expect(result.sharedDocsSecret?.name).toBe(`${result.jobName}-shared-docs`);
+    expect(Object.values(result.sharedDocsSecret?.data ?? {}).sort()).toEqual([
+      "# Definition of Done\n",
+      "# PR Conventions\n",
+    ]);
+
+    const volume = result.job.spec?.template?.spec?.volumes?.find((v) => v.name === "shared-docs-secret");
+    expect(volume?.secret?.secretName).toBe(`${result.jobName}-shared-docs`);
+    // `optional: false`: a Secret that failed to create must stop the pod, not leave a run
+    // reading no documentation while every signal says it started fine.
+    expect(volume?.secret?.optional).toBe(false);
+    // The escaping path is refused at the boundary and never becomes a projection entry.
+    expect(volume?.secret?.items?.map((item) => item.path).sort()).toEqual([
+      "docs/definition-of-done.md",
+      "docs/pr-conventions.md",
+    ]);
+
+    const mount = result.job.spec?.template?.spec?.containers?.[0]?.volumeMounts?.find(
+      (m) => m.name === "shared-docs-secret",
+    );
+    expect(mount?.mountPath).toBe("/tmp/paperclip-shared-docs");
+    expect(mount?.readOnly).toBe(true);
+  });
+
+  // Deploy skew is real and runs in both directions: a newer adapter will see an older
+  // server's overlay, which carries no bodies at all. It must degrade to the path copy
+  // rather than mounting a Secret with nothing in it (`optional: false` would then hold
+  // the pod at CreateContainerConfigError forever).
+  it("stages no Secret when the server carried no bodies, and keeps the path copy", () => {
+    const ctx = runIsolatedWithDocs({
+      sourceCwd: "/paperclip/source-worktree",
+      paths: ["docs/pr-conventions.md"],
+    });
+
+    const result = buildJobManifest({ ctx, selfPod: mockSelfPod, agentDbClaimName: null });
+    const command = result.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
+
+    expect(result.sharedDocsSecret).toBeNull();
+    expect(result.job.spec?.template?.spec?.volumes?.some((v) => v.name === "shared-docs-secret")).toBe(false);
+    expect(command).toContain("__pcdocs_src='/paperclip/source-worktree';");
+  });
+
   // The pre-existing `docs/` symlink bridge is not a substitute for the copy above and
   // the two are not redundant: the bridge links a whole company `docs/` directory in and
   // does nothing at all when a `docs/` already exists — which is every project repo that

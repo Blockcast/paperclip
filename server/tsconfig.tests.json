@@ -24,6 +24,7 @@
     "src/__tests__/heartbeat-pending-image-bump-dispatch.test.ts",
     "src/__tests__/heartbeat-per-run-sub-stage-split.test.ts",
     "src/__tests__/heartbeat-periodic-reap-nested-sweep.test.ts",
+    "src/__tests__/heartbeat-shared-doc-contents-not-persisted.test.ts",
     "src/__tests__/heartbeat-strict-git-probe-stderr.test.ts",
     "src/__tests__/heartbeat-timer-pre-dispatch-exclusions.test.ts",
     "src/__tests__/issue-list-description-truncation-flag.test.ts",

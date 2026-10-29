@@ -1098,6 +1098,130 @@ describe("buildJobManifest", () => {
       expect(command).not.toContain("etc/shadow");
     });
 
+    // PEN-3329, second round. The tests above pin that the step reaches the pod command.
+    // They do NOT pin where it reads from — and that is what was wrong in production:
+    // `sourceCwd` is the server's execution workspace, which a run-isolated pod has no
+    // mount for, so the step ran correctly and reported every document absent. These pin
+    // the Secret delivery that replaces it.
+    it("stages the carried bodies as a Secret the pod mounts, and reads from that mount", () => {
+      ctx.context = {
+        paperclipWorkspace: { cwd: "/paperclip/source-worktree" },
+        paperclipSharedDocs: {
+          sourceCwd: "/paperclip/source-worktree",
+          paths: ["docs/pr-conventions.md", "docs/definition-of-done.md"],
+          contents: {
+            "docs/pr-conventions.md": "# PR Conventions\n",
+            "docs/definition-of-done.md": "# Definition of Done\n",
+          },
+        },
+      };
+      setRuntimeIsolation(ctx, {
+        isolationMode: "run",
+        isolationKey: "run:run-abc12345",
+        workspaceRoot: "/runtime-cache/paperclip-runs/run-abc12345/workspace",
+        homeRoot: "/runtime-cache/paperclip-runs/run-abc12345/home",
+        sessionRoot: "/runtime-cache/paperclip-runs/run-abc12345/session",
+        cacheRoot: "/runtime-cache/paperclip-runs/run-abc12345/cache",
+        tmpRoot: "/runtime-cache/paperclip-runs/run-abc12345/tmp",
+        storage: isolatedStorage("ephemeral"),
+      });
+
+      const { job, jobName, sharedDocsSecret } = buildJobManifest({ ctx, selfPod });
+      const command = job.spec?.template?.spec?.containers[0]?.command?.join(" ") ?? "";
+
+      // The copy reads from the Secret mount, NOT from the server path. Asserted as an
+      // inequality too: reading `sourceCwd` is the defect, so it has to be refused rather
+      // than merely not mentioned.
+      expect(command).toContain("__pcdocs_src='/tmp/paperclip-shared-docs';");
+      expect(command).not.toContain("__pcdocs_src='/paperclip/source-worktree';");
+
+      // The bodies travel with the Job.
+      expect(sharedDocsSecret?.name).toBe(`${jobName}-shared-docs`);
+      expect(Object.values(sharedDocsSecret?.data ?? {}).sort()).toEqual([
+        "# Definition of Done\n",
+        "# PR Conventions\n",
+      ]);
+
+      // ...and the volume projects them back to the layout the copy loop expects.
+      const volume = job.spec?.template?.spec?.volumes?.find((v) => v.name === "shared-docs-secret");
+      expect(volume?.secret?.secretName).toBe(`${jobName}-shared-docs`);
+      // `optional: false`: a Secret that failed to create must stop the pod, not leave a
+      // run reading no documentation while every signal says it started fine.
+      expect(volume?.secret?.optional).toBe(false);
+      expect(volume?.secret?.items?.map((item) => item.path).sort()).toEqual([
+        "docs/definition-of-done.md",
+        "docs/pr-conventions.md",
+      ]);
+
+      const mount = job.spec?.template?.spec?.containers[0]?.volumeMounts?.find(
+        (m) => m.name === "shared-docs-secret",
+      );
+      expect(mount?.mountPath).toBe("/tmp/paperclip-shared-docs");
+      expect(mount?.readOnly).toBe(true);
+    });
+
+    it("never stages a body for a path the boundary refuses", () => {
+      ctx.context = {
+        paperclipWorkspace: { cwd: "/paperclip/source-worktree" },
+        paperclipSharedDocs: {
+          sourceCwd: "/paperclip/source-worktree",
+          paths: ["docs/pr-conventions.md"],
+          contents: {
+            "docs/pr-conventions.md": "# PR Conventions\n",
+            "../../etc/passwd": "root:x:0:0",
+            "/etc/shadow": "root:!:0",
+          },
+        },
+      };
+      setRuntimeIsolation(ctx, {
+        isolationMode: "run",
+        isolationKey: "run:run-abc12345",
+        workspaceRoot: "/runtime-cache/paperclip-runs/run-abc12345/workspace",
+        homeRoot: "/runtime-cache/paperclip-runs/run-abc12345/home",
+        sessionRoot: "/runtime-cache/paperclip-runs/run-abc12345/session",
+        cacheRoot: "/runtime-cache/paperclip-runs/run-abc12345/cache",
+        tmpRoot: "/runtime-cache/paperclip-runs/run-abc12345/tmp",
+        storage: isolatedStorage("ephemeral"),
+      });
+
+      const { job, sharedDocsSecret } = buildJobManifest({ ctx, selfPod });
+      const volume = job.spec?.template?.spec?.volumes?.find((v) => v.name === "shared-docs-secret");
+
+      expect(volume?.secret?.items?.map((item) => item.path)).toEqual(["docs/pr-conventions.md"]);
+      expect(Object.values(sharedDocsSecret?.data ?? {})).toEqual(["# PR Conventions\n"]);
+    });
+
+    // Deploy skew is real and runs in both directions: a newer adapter will see an older
+    // server's overlay, which carries no bodies at all. It must degrade to the path copy
+    // rather than mounting a Secret with nothing in it (`optional: false` would then hold
+    // the pod at CreateContainerConfigError forever).
+    it("stages no Secret when the server carried no bodies, and keeps the path copy", () => {
+      ctx.context = {
+        paperclipWorkspace: { cwd: "/paperclip/source-worktree" },
+        paperclipSharedDocs: {
+          sourceCwd: "/paperclip/source-worktree",
+          paths: ["docs/pr-conventions.md"],
+        },
+      };
+      setRuntimeIsolation(ctx, {
+        isolationMode: "run",
+        isolationKey: "run:run-abc12345",
+        workspaceRoot: "/runtime-cache/paperclip-runs/run-abc12345/workspace",
+        homeRoot: "/runtime-cache/paperclip-runs/run-abc12345/home",
+        sessionRoot: "/runtime-cache/paperclip-runs/run-abc12345/session",
+        cacheRoot: "/runtime-cache/paperclip-runs/run-abc12345/cache",
+        tmpRoot: "/runtime-cache/paperclip-runs/run-abc12345/tmp",
+        storage: isolatedStorage("ephemeral"),
+      });
+
+      const { job, sharedDocsSecret } = buildJobManifest({ ctx, selfPod });
+      const command = job.spec?.template?.spec?.containers[0]?.command?.join(" ") ?? "";
+
+      expect(sharedDocsSecret).toBeNull();
+      expect(job.spec?.template?.spec?.volumes?.some((v) => v.name === "shared-docs-secret")).toBe(false);
+      expect(command).toContain("__pcdocs_src='/paperclip/source-worktree';");
+    });
+
     // A `workspace`-isolated pod MOUNTS the execution workspace, so the docs are already
     // there and copying them onto themselves would be a no-op at best. The step is gated
     // on the same condition as the clone that makes it necessary.
