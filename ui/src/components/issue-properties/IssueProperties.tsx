@@ -1327,10 +1327,11 @@ export function IssueProperties({
   const monitorContent = (
     <div className="flex w-full flex-col gap-2">
       {/*
-        PEN-3803 review follow-up: the server refuses this arm with a 422 that
-        names a remedy the dialog cannot apply (it renders no `maxAttempts`
-        control), and `onUpdate` surfaces no error here. State the refusal up
-        front instead, and name the control that does work.
+        PEN-3803 review follow-up: the server refuses this arm with a 422 the
+        popover cannot surface (`onUpdate` exposes no error here), so without
+        this the click is a silent no-op. State the refusal up front instead.
+        See `monitorRenewalUnavailable` for why the copy offers no remedy: at
+        this count there is none, and the 422's own advice cannot be followed.
       */}
       {monitorRenewalUnavailable ? (
         <p className="text-xs text-muted-foreground">
