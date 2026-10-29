@@ -185,6 +185,35 @@ describe("upgradePathForLog", () => {
     expect(upgradePathForLog(undefined)).toBeUndefined();
   });
 
+  // An allowlisted value is non-credential by the call site's judgement, but
+  // the client still chooses its bytes. Bounded for the same reason
+  // `summarizeKeys` bounds a key: an unbounded caller-controlled string in a
+  // log line is a volume and line-injection vector regardless of secrecy.
+  it("bounds an allowlisted value a caller padded, and marks the truncation", () => {
+    const long = "t".repeat(500);
+    const out = upgradePathForLog(`/api/terminal?terminalSessionId=${long}`, [
+      "terminalSessionId",
+    ]);
+    expect(out).toBeDefined();
+    // URLSearchParams percent-encodes the ellipsis, so assert on the decoded form.
+    const kept = new URLSearchParams(out!.split("?")[1]).get("terminalSessionId")!;
+    expect(kept).toHaveLength(65); // 64 kept + the truncation marker
+    expect(kept.endsWith("\u2026")).toBe(true);
+    expect(out!.length).toBeLessThan(200);
+  });
+
+  it("leaves an allowlisted value inside the bound exactly as sent", () => {
+    const out = upgradePathForLog("/api/terminal?cols=80&rows=24", ["cols", "rows"]);
+    expect(out).toBe("/api/terminal?cols=80&rows=24");
+  });
+
+  // A newline in a log line is the injection shape the bound is partly for;
+  // assert the encoded form never reaches the sink as a literal break.
+  it("does not emit a literal newline from a caller-authored allowlisted value", () => {
+    const out = upgradePathForLog("/api/terminal?cols=8%0Afake%20log%20line", ["cols"]);
+    expect(out).not.toContain("\n");
+  });
+
   it("drops everything from the first `?` when the URL will not parse", () => {
     // Nothing in an unparseable URL can be shown to be non-credential, so the
     // fallback keeps the path and discards the rest rather than passing it on.
