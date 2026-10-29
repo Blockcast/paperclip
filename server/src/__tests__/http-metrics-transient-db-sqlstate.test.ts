@@ -1,10 +1,13 @@
+import http from "node:http";
+import type { AddressInfo } from "node:net";
+
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it } from "vitest";
 
 import { STATEMENT_TIMEOUT_SQLSTATE, TRANSIENT_DB_SQLSTATES } from "../lib/db-retry.js";
 import { errorHandler } from "../middleware/error-handler.js";
-import { httpMetricsMiddleware } from "../middleware/http-metrics.js";
+import { httpMetricsMiddleware, noteTransientDbResponse } from "../middleware/http-metrics.js";
 import {
   HTTP_REQUESTS_METRIC,
   HTTP_TRANSIENT_DB_RESPONSES_METRIC,
@@ -75,6 +78,14 @@ function buildApp() {
   app.use("/api", api);
   app.use(errorHandler);
   return app;
+}
+
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
 }
 
 async function call(app: express.Express, path: string, expectedStatus: number) {
@@ -148,6 +159,55 @@ describe("transient-database 503 sqlstate instrumentation (PEN-3596)", () => {
     expect(await requests({ route, status: "503" })).toBe(0);
     expect(await refusals({ route, status: "0" })).toBe(1);
     expect(await refusals({ route, status: "503" })).toBe(0);
+  });
+
+  it("carries the tag through the middleware on the close path, not only on finish", async () => {
+    // Companion to the test above, and the one that covers the MIDDLEWARE. That
+    // one calls `recordHttpRequest` directly, which is the right shape for the
+    // label question but bypasses the seam this PR invented: the error handler
+    // tags the response, and `record()` reads the tag at finish-OR-close.
+    //
+    // Verified by mutation: gating the read on `res.writableFinished` (so an
+    // abandoned refusal silently loses its tag) leaves the direct-call test
+    // green and turns only this one red. Without this, a regression that drops
+    // abandoned refusals entirely would ship unnoticed -- and those are exactly
+    // the 57014s worth seeing, since a statement that ran past the timeout is
+    // the one whose client is most likely to have given up.
+    const arrived = deferred();
+    const closed = deferred();
+    const hangApp = express();
+    hangApp.use(httpMetricsMiddleware());
+    hangApp.get("/refuses-then-hangs", (_req, res) => {
+      noteTransientDbResponse(res, {
+        code: "statement_timeout",
+        sqlstate: STATEMENT_TIMEOUT_SQLSTATE,
+      });
+      // Registered after the middleware's listeners, so it fires after them.
+      res.once("close", closed.resolve);
+      arrived.resolve();
+      // Never responds: the refusal whose client went away before the flush.
+    });
+
+    const server = http.createServer(hangApp);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const { port } = server.address() as AddressInfo;
+      const clientReq = http.get({ host: "127.0.0.1", port, path: "/refuses-then-hangs" });
+      clientReq.on("error", () => {
+        // The destroy below surfaces client-side as a socket hang up.
+      });
+      await arrived.promise;
+      clientReq.destroy();
+      await closed.promise;
+    } finally {
+      server.closeAllConnections();
+      await new Promise((resolve) => server.close(resolve));
+    }
+
+    const route = "/refuses-then-hangs";
+    expect(await refusals({ route, status: "0" })).toBe(1);
+    expect(await refusals({ route, status: "503" })).toBe(0);
+    expect(await requests({ route, status: "0" })).toBe(1);
   });
 
   it("is a strict subset: it counts no response that was not a transient-db refusal", async () => {
