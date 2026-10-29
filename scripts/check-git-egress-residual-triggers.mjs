@@ -68,9 +68,19 @@ const DEFAULT_WINDOW_MINUTES = 90;
  * load-bearing: ns `paperclip` also carries every agent pod's own `claude`
  * container, and an unscoped query would let agent output match this needle and
  * report a render that never happened.
+ *
+ * The needle is the STRUCTURED KEY, `"event":"<name>"`, not the bare event name.
+ * `summariseEntries` deliberately counts an unparseable match as FIRED, so a
+ * bare-substring needle would turn any line that merely QUOTES the event name —
+ * an error echoing issue or comment text, a logged request body — into a
+ * `critical` page. Matching the key keeps the fail-toward-FIRED property while
+ * removing that class of false page: the producer is a single
+ * `JSON.stringify({ level, event, ... })` (`job-manifest.ts`), so it always
+ * emits the key form with no interior spaces. Backticks are a LogQL raw string,
+ * which is what lets the double quotes sit inline unescaped.
  */
 export const LOKI_QUERY =
-  '{namespace="paperclip",container="paperclip"} |= "claude_k8s.data_mount_broad_rw"';
+  '{namespace="paperclip",container="paperclip"} |= `"event":"claude_k8s.data_mount_broad_rw"`';
 
 /** Exit codes, named so callers and tests cannot drift from the workflow. */
 export const CLEAR = 0;

@@ -388,12 +388,15 @@ this paragraph is what a future reader should point at when asking for it to be 
 
 So trigger 4 fires **silently**: if an absolute-path `git` ran in another agent pod tomorrow,
 nothing would report it. What stands in its place is a *measurement*, not a detector —
-`scripts/measure-absolute-path-git.mjs`, committed with PEN-4986 and re-runnable. Read the
-difference plainly: a measurement observes the pods it is run in, over the window it is run for,
-and says nothing about the rest of the fleet or about the time between runs. PEN-4986 measured
-**one** pod and §7.1 records it as such. Widening that population is per-pod work — the script runs
-unprivileged inside an agent's own run, so it needs no new platform capability, only more agents
-running it — and re-taking it is required whenever the agent image or the PATH layout changes.
+`scripts/measure-absolute-path-git.mjs`, re-runnable, from PEN-4986. ⚠ That script is **not on
+master** at this writing — it is #3098 (PEN-4986), open — and neither is the §7.1 text this
+paragraph cites. Both land in that PR or not at all; until they do, this paragraph states an
+intent, not a control that exists. Read the difference plainly: a measurement observes the pods
+it is run in, over the window it is run for, and says nothing about the rest of the fleet or
+about the time between runs. PEN-4986 measured **three** pods on three images that share one
+egress surface, and §7.1 records it as such — explicitly *not* as a fleet census. Widening that
+population is per-pod work — the script runs unprivileged inside an agent's own run, so it needs
+no new platform capability, only more agents running it — and re-taking it is required whenever the agent image or the PATH layout changes.
 That re-measurement is tracked as **PEN-4989** rather than as a sentence here, for the reason
 PEN-4988 exists at all: a condition recorded only in a document has no owner.
 

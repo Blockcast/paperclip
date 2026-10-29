@@ -109,6 +109,28 @@ test("the Loki query is scoped to the server container, not the namespace", () =
   assert.match(LOKI_QUERY, /claude_k8s\.data_mount_broad_rw/);
 });
 
+test("the Loki needle matches the structured key, not the bare event name", () => {
+  // `summariseEntries` counts an unparseable match as FIRED, so a bare-substring
+  // needle makes any line that merely QUOTES the event name — an error echoing
+  // issue text, a logged request body — a `critical` page. The producer is a
+  // single `JSON.stringify({ level, event, ... })`, so the key form is what it
+  // actually emits, with no interior spaces.
+  assert.match(LOKI_QUERY, /`"event":"claude_k8s\.data_mount_broad_rw"`/);
+
+  // The shape the producer emits must satisfy the needle...
+  const needle = LOKI_QUERY.slice(LOKI_QUERY.indexOf("|=") + 2).trim().replaceAll("`", "");
+  const emitted = JSON.stringify({
+    level: "warn",
+    event: "claude_k8s.data_mount_broad_rw",
+    reason: "no_claim",
+  });
+  assert.ok(emitted.includes(needle), `${emitted} does not contain ${needle}`);
+
+  // ...and prose that merely names the event must not.
+  const prose = 'error: issue body mentions claude_k8s.data_mount_broad_rw here';
+  assert.ok(!prose.includes(needle));
+});
+
 test("exit codes are distinct and UNREADABLE is not CLEAR", () => {
   // The workflow branches on these and the alert gives exit 1 and exit 2
   // different alertnames: one means "bypass 3 re-opened", the other means

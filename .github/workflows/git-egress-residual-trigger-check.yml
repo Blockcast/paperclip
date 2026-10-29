@@ -46,8 +46,15 @@
 # trigger — which Alertmanager deduplicates on stable labels — and buys the
 # guarantee that no render falls between two runs.
 #
-# ON THE CADENCE. Hourly at :59 — >=6 min from every other cron in this repo
-# (3, 9, 13, 17, 23, 33, 41, 43, 47, 53), which the guard-liveness header asks for.
+# ON THE CADENCE. Hourly at :58. The guard-liveness header asks for >=6 min from
+# every other cron in this repo; that is NOT achievable here, and saying it was
+# is how the first draft of this comment got it wrong. Enumerated 2026-10-29, the
+# minutes already taken are 3, 9, 13, 17, 23, 29, 33, 37, 41, 43, 47 and 53 — note
+# 29 and 37 (daily), which the first draft omitted, and that `3-59/10`
+# (merge-queue-orphan-sweeper) owns 3/13/23/33/43/53. The widest gap left is the
+# 53->3 wrap, 10 minutes, so the best minimum separation any slot can reach is 5
+# and :58 is the ONLY slot that reaches it. The earlier :59 sat 4 min from the
+# sweeper's :03. Re-derive with the set above before moving this.
 #
 # ON WHAT GOES RED. Both failure exits alert AND fail the run. The run failing is
 # the backstop, not the signal: a red scheduled run only notifies the last
@@ -72,7 +79,7 @@ name: Git Egress Residual Trigger Check
 
 on:
   schedule:
-    - cron: "59 * * * *"
+    - cron: "58 * * * *"
   workflow_dispatch:
 
 permissions:
