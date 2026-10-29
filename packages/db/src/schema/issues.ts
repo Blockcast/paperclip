@@ -196,6 +196,19 @@ export const issues = pgTable(
     titleSearchIdx: index("issues_title_search_idx").using("gin", table.title.op("gin_trgm_ops")),
     identifierSearchIdx: index("issues_identifier_search_idx").using("gin", table.identifier.op("gin_trgm_ops")),
     descriptionSearchIdx: index("issues_description_search_idx").using("gin", table.description.op("gin_trgm_ops")),
+    // PEN-3596: company-scoped twins of the three single-column trigram indexes
+    // above. The issues-list search path always filters by company, and the
+    // un-scoped indexes make it pay for every other company's matches on the
+    // heap (2,700 index hits to keep 245 rows on a production-shaped seed).
+    // btree_gin lets company_id lead the GIN index so the index cond answers
+    // both halves. The single-column indexes stay: company-search also searches
+    // these columns with `ILIKE ANY(array)` forms these do not serve.
+    companyTitleSearchIdx: index("issues_company_title_search_idx")
+      .using("gin", table.companyId, table.title.op("gin_trgm_ops")),
+    companyIdentifierSearchIdx: index("issues_company_identifier_search_idx")
+      .using("gin", table.companyId, table.identifier.op("gin_trgm_ops")),
+    companyDescriptionSearchIdx: index("issues_company_description_search_idx")
+      .using("gin", table.companyId, table.description.op("gin_trgm_ops")),
     openRoutineExecutionIdx: uniqueIndex("issues_open_routine_execution_uq")
       .on(table.companyId, table.originKind, table.originId, table.originFingerprint)
       .where(

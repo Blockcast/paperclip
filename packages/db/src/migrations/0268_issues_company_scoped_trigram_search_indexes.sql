@@ -1,0 +1,81 @@
+-- PEN-3596: make the issues-list search path reachable by a trigram index.
+--
+-- The list query ORs four search predicates together -- title, identifier and
+-- description ILIKE '%term%' on `issues`, plus an EXISTS over issue_comments.
+-- A semi-join cannot take part in a BitmapOr, so the EXISTS forced the whole
+-- disjunction to be evaluated as a per-row FILTER: every issue in the company
+-- was fetched and `description ILIKE '%term%'` was run against all ~6KB of it,
+-- once in the WHERE and again in the ORDER BY relevance key. That is what blew
+-- the 30s role statement_timeout and 503'd callers with 57014.
+--
+-- The query side of the fix (server/src/services/issues.ts) resolves each
+-- search branch into its own id set and unions them, so each branch is now a
+-- standalone indexable predicate. These indexes are the other half: WITHOUT
+-- them the restructure alone is only ~1.6x, and without the restructure the
+-- indexes are worth nothing at all because the OR keeps them unreachable.
+-- Measured together on a production-shaped embedded-Postgres seed (54,000
+-- issues / 216,000 comments / 6.4KB descriptions, the live 54,209-row shape):
+--
+--   BEFORE: OR + per-row filter ............................ 426-453ms
+--   AFTER:  union restructure + these indexes ...............  98-114ms
+--
+-- and, isolating which half does the work:
+--
+--   these indexes alone, query unchanged .................... 471-508ms  (nothing)
+--   union restructure alone, single-column indexes .......... 307-339ms
+--
+-- WHY COMPANY-SCOPED AND NOT THE EXISTING SINGLE-COLUMN GIN INDEXES.
+-- issues_description_search_idx already exists (migration 0051) and the
+-- planner does pick it once the branch stands alone -- but it is not scoped to
+-- a company, so it returns every matching row in the table and the company_id
+-- test is then a post-filter on the heap. On the seed that is 2,700 index hits
+-- to keep 245 rows, and the description recheck runs on all 2,700: 245ms.
+-- Prefixing company_id (btree_gin lets a scalar lead a GIN index) makes the
+-- index cond answer both halves, so only the 245 rows are touched: 21ms.
+--
+-- The single-column indexes are deliberately KEPT, not replaced: company-search
+-- (server/src/services/company-search.ts) also searches these columns and uses
+-- `ILIKE ANY(array)` token forms that these composites do not serve.
+--
+-- WHY issue_comments.body GETS NO COMPOSITE. It was measured and rejected: it
+-- is worth ~11ms of the above, because issue_comments_body_search_idx
+-- BitmapAnd'ed with issue_comments_company_idx already serves that branch. It
+-- would have cost an 18MB index and a 13.6s build on the largest table in the
+-- schema. Not worth the write amplification.
+--
+-- ⚠️ DEPLOY NOTE -- READ BEFORE APPROVING. Plain, not CONCURRENTLY: Drizzle
+-- migrations are transactional. This takes a SHARE lock on `issues` for the
+-- duration of the build, which BLOCKS WRITES to `issues` for that window.
+-- Measured on the 54k-row seed: ~41s for the description index, ~0.5s for
+-- title and identifier together. Expect roughly 30-90s against production,
+-- comfortably inside MIGRATION_STATEMENT_TIMEOUT_MS (10 min), so it will not
+-- time out -- it will stall issue writes. Migration 0051 already built three
+-- GIN trigram indexes on this same table the same way.
+--
+-- NOT registered in PENDING_CONCURRENT_INDEXES, deliberately, even though
+-- `issues` is hot enough to deserve it. That machinery precreates indexes
+-- CONCURRENTLY from a standalone CLI run BEFORE `helm upgrade`, and these
+-- indexes cannot be built until btree_gin exists -- which only happens when
+-- this file runs. `skipUnavailable` covers a missing table or column, not a
+-- missing extension, so registering them would make the pre-deploy CLI throw
+-- `data type uuid has no default operator class for access method gin`.
+--
+-- If that write-stall is not acceptable for this deploy, the opt-out is an
+-- operator running these by hand first, after which this file is a no-op
+-- (every statement is IF NOT EXISTS):
+--
+--   CREATE EXTENSION IF NOT EXISTS btree_gin;
+--   CREATE INDEX CONCURRENTLY IF NOT EXISTS issues_company_title_search_idx
+--     ON issues USING gin (company_id, title gin_trgm_ops);
+--   CREATE INDEX CONCURRENTLY IF NOT EXISTS issues_company_identifier_search_idx
+--     ON issues USING gin (company_id, identifier gin_trgm_ops);
+--   CREATE INDEX CONCURRENTLY IF NOT EXISTS issues_company_description_search_idx
+--     ON issues USING gin (company_id, description gin_trgm_ops);
+--
+-- The query change is independently correct and ships either way: without
+-- these indexes it is still ~1.6x, with them ~4.3x. Nothing fails closed if
+-- they are absent.
+CREATE EXTENSION IF NOT EXISTS btree_gin;--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "issues_company_title_search_idx" ON "issues" USING gin ("company_id","title" gin_trgm_ops);--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "issues_company_identifier_search_idx" ON "issues" USING gin ("company_id","identifier" gin_trgm_ops);--> statement-breakpoint
+CREATE INDEX IF NOT EXISTS "issues_company_description_search_idx" ON "issues" USING gin ("company_id","description" gin_trgm_ops);

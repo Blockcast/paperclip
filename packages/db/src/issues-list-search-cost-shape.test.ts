@@ -1,6 +1,7 @@
 /**
- * PEN-3596: where the issues-list search query actually spends its time, pinned
- * so the next person does not re-chase the leads that have already been refuted.
+ * PEN-3596: where the issues-list search query spends its time, and the shape
+ * change that fixed it — pinned so the next person does not re-chase the leads
+ * that have already been refuted.
  *
  * The row reported `GET /api/companies/:id/issues` blowing the 30s role
  * `statement_timeout` and 503ing callers with `57014`, and attributed it to
@@ -17,7 +18,48 @@
  * `GREATEST(...)` ORDER BY subqueries at ~1s over ALL 4.9k issues — they are
  * not the cliff.
  *
- * THREE REFUTED LEADS. Each was proposed on the row; none is the cause:
+ * ── THE CAUSE ──────────────────────────────────────────────────────────────
+ *
+ * The search WHERE ORed four predicates: `title`/`identifier`/`description`
+ * ILIKE '%term%' on `issues`, plus an EXISTS over `issue_comments`. A
+ * semi-join cannot take part in a BitmapOr, so the EXISTS forced the WHOLE
+ * disjunction to be evaluated as a per-row FILTER on a scan of every issue in
+ * the company — and `description ILIKE '%term%'` then ran against all ~6KB of
+ * every description, in the WHERE and again in the `searchOrder` sort key.
+ * The gin_trgm indexes on those columns (migration 0051) existed the whole
+ * time and were simply unreachable.
+ *
+ * ── THE FIX, AND WHY IT IS BOTH HALVES ─────────────────────────────────────
+ *
+ * Query side (server/src/services/issues.ts): resolve each search branch into
+ * its own id set and UNION them, so every branch is a standalone indexable
+ * predicate. Index side (migration 0268): company-scoped `(company_id, col
+ * gin_trgm_ops)` twins of the three single-column trigram indexes, because the
+ * un-scoped ones make the scan pay for every OTHER company's matches on the
+ * heap (2,700 index hits to keep 245 rows on the seed below: 245ms → 21ms).
+ *
+ * Measured on a production-shaped embedded-Postgres seed — 54,000 issues /
+ * 216,000 comments / 6.4KB descriptions, matching the live 54,209-row table
+ * with ~4.9k of them in the searched company:
+ *
+ *   BEFORE: four predicates under one OR ................... 426-453ms
+ *   AFTER:  shipped union shape + migration 0268 ............  98-114ms
+ *
+ * and, isolating which half does the work:
+ *
+ *   composite indexes alone, query unchanged ................ 471-508ms  ← nothing
+ *   union restructure alone, single-column indexes .......... 307-339ms
+ *
+ * NEITHER HALF WORKS ALONE. The indexes are worth literally nothing without
+ * the restructure (the OR keeps them unreachable), and the restructure alone
+ * is only ~1.6x; together they are ~4.3x. Attribution within the composite
+ * set, same seed: description −212ms, title+identifier −27ms,
+ * issue_comments.body −11ms — which is why `issue_comments` gets NO composite
+ * index: that 11ms would have cost an 18MB index and a 13.6s build on the
+ * largest table in the schema. (A four-index variant including it measured
+ * 57-72ms; it is not what ships, so it is not the headline.)
+ *
+ * ── THREE REFUTED LEADS. Each was proposed on the row; none is the cause ────
  *
  *  1. "0098's activity_log index stopped being chosen."
  *     `idx_activity_log_entity_id_created` is present and the ORDER BY
@@ -29,40 +71,33 @@
  *     row; de-correlate it to `id IN (SELECT ...)`."
  *     ⛔ PostgreSQL ALREADY DOES THIS. It pulls the correlated EXISTS up into
  *     an uncorrelated `hashed SubPlan` — the first test below asserts that
- *     directly. Rewriting the predicate by hand was measured at no
+ *     directly. Rewriting that ONE predicate by hand was measured at no
  *     improvement (147-152ms before, 140-163ms after, i.e. noise) and was
- *     reverted. Do not re-attempt it.
+ *     reverted. The fix is not de-correlation; it is removing the semi-join
+ *     from the disjunction so the OTHER three branches become indexable.
  *
- * WHAT IT ACTUALLY IS: `descriptionContainsMatch`. Production descriptions
- * average ~6KB, and `description ILIKE '%term%'` must read and scan all of it
- * for every candidate row — once in the WHERE's `or(...)` and again in the
- * `searchOrder` sort key. Measured here on a production-shaped seed (1500
- * issues, 6KB descriptions, 6 comments each), same WHERE/ORDER BY shape:
+ * Note the per-row cost is CPU, not I/O, and that was measured rather than
+ * assumed: a 6KB description of repetitive prose is pglz-compressed to well
+ * under the 2KB out-of-line threshold, so it is stored INLINE and the TOAST
+ * relation is never touched (an earlier version of this test asserted TOAST
+ * block reads and measured exactly zero). "Move it out of TOAST" is not the
+ * fix either.
  *
- *   current (correlated comment + description everywhere) .. 147-152ms
- *   de-correlated comment, description unchanged ........... 140-163ms  (noise)
- *   description dropped from the SORT KEY only ............. 156-198ms  (no help:
- *                                                             the WHERE still
- *                                                             detoasts)
- *   no description predicate at all ......................... 45-53ms   (~3x)
+ * ⚠️ THESE TESTS ASSERT STRUCTURE, NOT PLAN CHOICE OR WALL-CLOCK. The timings
+ * above are evidence recorded in prose, deliberately not assertions. BLO-31354
+ * recorded that pinning plan *choice* here sits inside PostgreSQL's 1% cost
+ * fuzz and ejected unrelated PRs from the merge queue. Plan choice is also
+ * genuinely scale-dependent for this query: measured, the planner picks
+ * `issues_company_description_search_idx` at the 54k-row production shape and
+ * does NOT at 400/1500/4000 rows, where a seq scan of a small table really is
+ * cheaper. A CI-affordable seed therefore cannot assert "the index is used"
+ * without being a lie at that size. What it CAN assert, and what actually
+ * distinguishes the two shapes at every size, is whether the description
+ * predicate is welded to the scan that produces candidate rows.
  *
- * i.e. ~2/3 of the time is the description scan, and removing it from only one
- * of its two sites buys nothing.
- *
- * Note the cost is CPU, not I/O, and that was measured rather than assumed: a
- * 6KB description of repetitive prose is pglz-compressed to well under the 2KB
- * out-of-line threshold, so it is stored INLINE and the TOAST relation is never
- * touched (an earlier version of this test asserted TOAST block reads and
- * measured exactly zero). The per-row work is decompress-and-scan. So "move it
- * out of TOAST" is not the fix either; the fix has to stop evaluating the
- * predicate per row. A trigram index alone will not do that while the four
- * search predicates sit under one `OR`, which forces the seq scan asserted
- * below.
- *
- * These tests assert STRUCTURE, not wall-clock: the timings above are evidence
- * recorded in prose, deliberately not assertions. BLO-31354 recorded that
- * pinning plan *choice* here sits inside PostgreSQL's 1% cost fuzz and ejected
- * unrelated PRs from the merge queue; a timing assertion would be worse still.
+ * ⚠️ The SQL below mirrors `list()` in server/src/services/issues.ts by hand
+ * (this package cannot import the server). If that query's search shape
+ * changes, change these with it.
  */
 import { afterEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
@@ -88,7 +123,7 @@ async function startDatabase(prefix: string) {
   return { sql };
 }
 
-/** Production-shaped: ~6KB descriptions, so they TOAST exactly as production's do. */
+/** Production-shaped: ~6KB descriptions, so the per-row cost is production's. */
 async function populate(sql: postgres.Sql) {
   await sql.unsafe(`
     SET session_replication_role = replica;
@@ -96,12 +131,14 @@ async function populate(sql: postgres.Sql) {
     INSERT INTO issues (id, company_id, title, description, status, priority, created_at, updated_at, last_activity_at)
     SELECT ('00000000-0000-4000-8000-' || lpad(g::text, 12, '0'))::uuid, '${COMPANY}'::uuid,
            'seeded issue ' || g,
-           repeat('lorem ipsum dolor sit amet consectetur adipiscing elit ', 110) || ' tail ' || g,
+           repeat('lorem ipsum dolor sit amet consectetur adipiscing elit ', 110)
+             || CASE WHEN g % 20 = 0 THEN ' mentions ${TERM} timeout ' ELSE '' END || ' tail ' || g,
            'in_progress', 'medium', now(), now(), now()
     FROM generate_series(1, ${TOTAL_ISSUES}) AS g;
     INSERT INTO issue_comments (company_id, issue_id, body, created_at, updated_at)
     SELECT '${COMPANY}'::uuid, ('00000000-0000-4000-8000-' || lpad(g::text, 12, '0'))::uuid,
-           'canceling ${TERM} due to ${TERM} timeout, comment ' || g || '/' || c, now(), now()
+           CASE WHEN g % 10 = 0 THEN 'canceling ${TERM} due to ${TERM} timeout, ' ELSE 'ordinary chatter ' END
+             || 'comment ' || g || '/' || c, now(), now()
     FROM generate_series(1, ${TOTAL_ISSUES}) AS g, generate_series(1, ${COMMENTS_PER_ISSUE}) AS c;
     SET session_replication_role = origin;
     ANALYZE issues;
@@ -118,6 +155,30 @@ const CORRELATED_COMMENT_MATCH = `
       AND c.body ILIKE '%${TERM}%' ESCAPE '\\'
   )`;
 
+/** The WHERE as it stood before this fix: four predicates under one OR. */
+const SUPERSEDED_SEARCH_WHERE = `(
+  i.title ILIKE '%${TERM}%' ESCAPE '\\'
+  OR i.identifier ILIKE '%${TERM}%' ESCAPE '\\'
+  OR i.description ILIKE '%${TERM}%' ESCAPE '\\'
+  OR ${CORRELATED_COMMENT_MATCH}
+)`;
+
+/** The WHERE as `list()` builds it now: one id set per branch, unioned. */
+const SHIPPED_SEARCH_WHERE = `i.id IN (
+  SELECT s.id FROM issues s
+  WHERE s.company_id = '${COMPANY}'::uuid AND s.title ILIKE '%${TERM}%' ESCAPE '\\'
+  UNION
+  SELECT s.id FROM issues s
+  WHERE s.company_id = '${COMPANY}'::uuid AND s.identifier ILIKE '%${TERM}%' ESCAPE '\\'
+  UNION
+  SELECT s.id FROM issues s
+  WHERE s.company_id = '${COMPANY}'::uuid AND s.description ILIKE '%${TERM}%' ESCAPE '\\'
+  UNION
+  SELECT c.issue_id FROM issue_comments c
+  WHERE c.company_id = '${COMPANY}'::uuid AND c.deleted_at IS NULL
+    AND c.body ILIKE '%${TERM}%' ESCAPE '\\'
+)`;
+
 /** Mirrors production: the predicate sits in the SORT KEY, so LIMIT cannot skip it. */
 function listQuery(predicate: string) {
   return `
@@ -125,6 +186,13 @@ function listQuery(predicate: string) {
     WHERE i.company_id = '${COMPANY}'::uuid AND i.hidden_at IS NULL
     ORDER BY (CASE WHEN ${predicate} THEN 4 ELSE 6 END), i.updated_at DESC, i.id DESC
     LIMIT 15`;
+}
+
+function searchQuery(where: string) {
+  return `
+    SELECT i.id FROM issues i
+    WHERE i.company_id = '${COMPANY}'::uuid AND i.hidden_at IS NULL AND ${where}
+    ORDER BY i.updated_at DESC, i.id DESC`;
 }
 
 /**
@@ -138,6 +206,18 @@ function commentScanLoops(node: any): number {
   const self = node["Relation Name"] === "issue_comments" ? Number(node["Actual Loops"] ?? 0) : 0;
   const children: any[] = Array.isArray(node.Plans) ? node.Plans : [];
   return children.reduce((sum, child) => sum + commentScanLoops(child), self);
+}
+
+/** The scan node that produces candidate `issues` rows for the outer query. */
+function outermostIssuesScan(node: any): any {
+  if (!node || typeof node !== "object") return undefined;
+  if (node["Relation Name"] === "issues") return node;
+  const children: any[] = Array.isArray(node.Plans) ? node.Plans : [];
+  for (const child of children) {
+    const found = outermostIssuesScan(child);
+    if (found) return found;
+  }
+  return undefined;
 }
 
 afterEach(async () => {
@@ -165,13 +245,12 @@ describeEmbeddedPostgres("issues-list search cost shape (PEN-3596)", () => {
     expect(JSON.stringify(root.Plan)).toContain("hashed SubPlan");
   }, 180_000);
 
-  // The actual cost driver, pinned structurally. Not a timing assertion: the
-  // point is that the description predicate is applied as a per-row FILTER on a
-  // full scan of issues, so no index can serve it while it sits under the `OR`
-  // with the other three search predicates. That is why it costs what it costs,
-  // and it is what any real fix has to change.
-  it("applies the description predicate as a per-row filter on a full scan", async () => {
-    const { sql } = await startDatabase("paperclip-pen3596-descr-");
+  // The cause, pinned on the shape this replaced. Keeping it executable is the
+  // point: it is the control the shipped shape is measured against, and if a
+  // future change reintroduces an OR over the semi-join, this is what that
+  // regression looks like.
+  it("the superseded OR shape welds the description predicate to a full scan", async () => {
+    const { sql } = await startDatabase("paperclip-pen3596-superseded-");
     await populate(sql);
 
     // Descriptions are production-sized, which is the premise for the cost.
@@ -180,25 +259,77 @@ describeEmbeddedPostgres("issues-list search cost shape (PEN-3596)", () => {
     ))[0].a);
     expect(avgBytes).toBeGreaterThan(2_000);
 
-    // The WHERE as the search path builds it: four predicates under one OR.
-    const rows = await sql.unsafe(`
-      EXPLAIN (ANALYZE, FORMAT JSON)
-      SELECT i.id FROM issues i
-      WHERE i.company_id = '${COMPANY}'::uuid AND i.hidden_at IS NULL
-        AND (
-          i.title ILIKE '%${TERM}%' ESCAPE '\\'
-          OR i.identifier ILIKE '%${TERM}%' ESCAPE '\\'
-          OR i.description ILIKE '%${TERM}%' ESCAPE '\\'
-          OR ${CORRELATED_COMMENT_MATCH}
-        )`);
-    const plan = (rows as any)[0]["QUERY PLAN"][0].Plan;
+    const rows = await sql.unsafe(
+      `EXPLAIN (ANALYZE, FORMAT JSON) ${searchQuery(SUPERSEDED_SEARCH_WHERE)}`,
+    );
+    const scan = outermostIssuesScan((rows as any)[0]["QUERY PLAN"][0].Plan);
 
-    // A full scan of issues, with the description ILIKE evaluated per row.
-    expect(plan["Node Type"] ?? "").toContain("Seq Scan");
-    expect(plan["Relation Name"]).toBe("issues");
-    expect(String(plan.Filter)).toContain("description");
-    // Every row in the company is inspected; LIMIT cannot reduce this, and the
-    // sort key then pays for the surviving rows a second time.
-    expect(Number(plan["Actual Rows"] ?? 0)).toBe(TOTAL_ISSUES);
+    // One scan of every issue in the company, with the 6KB description ILIKE
+    // applied per row as a filter. No index can serve it from here.
+    expect(String(scan["Node Type"] ?? "")).toContain("Seq Scan");
+    expect(String(scan.Filter)).toContain("description");
+    // Rows INSPECTED, not rows returned: `Actual Rows` is the post-filter
+    // output, and it is the inspected count that the description predicate is
+    // charged against.
+    const inspected = Number(scan["Actual Rows"] ?? 0) + Number(scan["Rows Removed by Filter"] ?? 0);
+    expect(inspected).toBe(TOTAL_ISSUES);
+  }, 180_000);
+
+  // The fix, asserted as the structural difference rather than as plan choice
+  // (see the ⚠️ note in the file header on why plan choice is not assertable
+  // at a CI-affordable seed size).
+  it("the shipped union shape detaches the description predicate from the candidate scan", async () => {
+    const { sql } = await startDatabase("paperclip-pen3596-shipped-");
+    await populate(sql);
+
+    const rows = await sql.unsafe(
+      `EXPLAIN (ANALYZE, FORMAT JSON) ${searchQuery(SHIPPED_SEARCH_WHERE)}`,
+    );
+    const root = (rows as any)[0]["QUERY PLAN"][0].Plan;
+    const scan = outermostIssuesScan(root);
+
+    // The scan that produces candidate rows no longer evaluates the 6KB
+    // description predicate, so what it costs no longer scales with
+    // description size. That is the whole change.
+    expect(String(scan.Filter ?? "")).not.toContain("description");
+
+    // The description predicate still exists — in its own branch, as the sole
+    // qual of a scan, which is the form an index can serve. At the production
+    // row count the planner does serve it from
+    // issues_company_description_search_idx; at this seed size it correctly
+    // prefers a seq scan of a small table, so only the FORM is asserted.
+    expect(JSON.stringify(root)).toContain("description");
+  }, 180_000);
+
+  // Semantics. The restructure must be a pure shape change.
+  it("returns exactly the same issues as the shape it replaced", async () => {
+    const { sql } = await startDatabase("paperclip-pen3596-equivalence-");
+    await populate(sql);
+
+    const before = (await sql.unsafe(searchQuery(SUPERSEDED_SEARCH_WHERE))) as any[];
+    const after = (await sql.unsafe(searchQuery(SHIPPED_SEARCH_WHERE))) as any[];
+
+    expect(after.length).toBeGreaterThan(0);
+    expect(after.map((row) => row.id)).toEqual(before.map((row) => row.id));
+  }, 180_000);
+
+  // Migration 0268. The restructure is worth ~1.6x without these and ~8x with
+  // them, so a silently-missing migration is a silent ~2.7x regression on top of the restructure.
+  it("ships the company-scoped trigram indexes the restructure depends on", async () => {
+    const { sql } = await startDatabase("paperclip-pen3596-indexes-");
+
+    const present = (await sql.unsafe(`
+      SELECT indexname FROM pg_indexes
+      WHERE tablename = 'issues' AND indexname IN (
+        'issues_company_title_search_idx',
+        'issues_company_identifier_search_idx',
+        'issues_company_description_search_idx'
+      ) ORDER BY indexname`)) as any[];
+
+    expect(present.map((row) => row.indexname)).toEqual([
+      "issues_company_description_search_idx",
+      "issues_company_identifier_search_idx",
+      "issues_company_title_search_idx",
+    ]);
   }, 180_000);
 });
