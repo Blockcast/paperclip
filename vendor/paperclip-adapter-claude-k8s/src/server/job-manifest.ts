@@ -609,9 +609,10 @@ const SHARED_PNPM_STORE_SUBPATH = "instances/default/data/k8s-isolation/pnpm";
  * tree — every foreign company's `companies/`, `run-logs/`, `projects/` and
  * `k8s-isolation/`, plus `secrets/master.key`, `data/backups/` (DB dumps),
  * `.env`, `config.json` and `db/` — and the run's own subPath binds are
- * re-applied on top of it. Root-level toolchain dirs are re-exposed by the root
- * overlay below. The overlay is rw only so the runtime can create mountpoint
- * dirs inside it for those binds; nothing persists past the pod.
+ * re-applied on top of it. The root overlay below re-exposes only the git-hooks
+ * dir: PEN-4932 stage 3 dropped the six fleet-wide toolchain dirs it used to
+ * re-expose alongside it. The overlay is rw only so the runtime can create
+ * mountpoint dirs inside it for those binds; nothing persists past the pod.
  */
 const INSTANCE_ROOT_SUBPATH = "instances/default";
 const INSTANCE_OVERLAY_VOLUME_NAME = "instance-overlay";
@@ -622,11 +623,13 @@ const INSTANCE_OVERLAY_SIZE_LIMIT = "16Mi";
  * `.secrets`, `.claude/.credentials.json`, mkcert's CA key under `.local/share`,
  * and every tenant's `wt-*` worktrees. A read-only parent still let every
  * narrowed pod READ all of it, so the root gets an emptyDir as well, and only
- * the toolchain a narrowed run resolves is re-exposed read-only. Measured
- * 2026-10-21 from a narrowed pod: HOME, XDG_* and CLAUDE_CONFIG_DIR are per-run,
- * and the only root references are PATH (`.local/bin`, `bin`) plus the symlink
- * targets inside those two dirs. Allowlist, not denylist: the root has ~440
- * entries and gains new `wt-*` dirs weekly.
+ * `ROOT_TOOLCHAIN_SUBPATHS` is re-exposed read-only. Measured 2026-10-21 from a
+ * narrowed pod: HOME, XDG_* and CLAUDE_CONFIG_DIR are per-run, and the only root
+ * references were PATH (`.local/bin`, `bin`) plus the symlink targets inside
+ * those two dirs. PEN-4932 stage 3 dropped all of those, so that list is now the
+ * git-hooks dir alone, and those PATH entries resolve into the rw overlay rather
+ * than a read-only bind — see the note below. Allowlist, not denylist: the root
+ * has ~440 entries and gains new `wt-*` dirs weekly.
  */
 const ROOT_OVERLAY_VOLUME_NAME = "root-overlay";
 // PEN-4932 stage 3. This list used to re-expose the whole fleet-wide toolchain
