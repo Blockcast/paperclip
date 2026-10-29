@@ -360,7 +360,7 @@ export const WATCHED_GUARDS = [
     graceUntil: "2026-11-10T00:00:00.000Z",
   },
 
-  // PEN-4988. Hourly (cron "59 * * * *") on `arc-paperclip-light`. Watches §7.2
+  // PEN-4988. Hourly (cron "58 * * * *") on `arc-paperclip-light`. Watches §7.2
   // trigger 2 of the PEN-3183 git-egress boundary decision: an agent Job
   // rendering a broad read-write data mount, which re-opens bypass 3 and ENDS
   // that decision's residual acceptance early.
