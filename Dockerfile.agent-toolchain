@@ -196,10 +196,30 @@ RUN install -m 0755 -d /etc/apt/keyrings \
        docker-ce-cli docker-buildx-plugin docker-compose-plugin \
   && rm -rf /var/lib/apt/lists/*
 
-ARG KUBECTL_VERSION=v1.31.4
+# kubectl — PEN-4932. Pinned to the version the cluster actually runs (control
+# plane v1.35.3, measured 2026-10-29). That is also the version CI pins by hand
+# in penstock-llm-proxy-core (admission-policy-drift.yml,
+# authorization-execution-drift.yml, both `KUBECTL_VERSION: v1.35.3`) and the
+# version an agent resolves today.
+#
+# An agent does NOT currently reach this copy. The shared `paperclip-data` PVC
+# mounts /paperclip/bin at PATH position 7, ahead of /usr/local/bin at 9, so a
+# bare `kubectl` resolves to the PVC's v1.35.3 and this image's copy is
+# shadowed. The bump is therefore observationally inert today, and is a
+# prerequisite for the stage-3 removal of that mount: dropping the mount while
+# this said v1.31.4 would silently move every agent four minor versions back —
+# outside Kubernetes' supported +/-1 kubectl-to-API-server skew, against a
+# v1.35.3 server, across ~698 kubectl call sites in penstock-llm-proxy-core
+# alone. Matching the PVC exactly is what makes removing the mount a no-op
+# rather than a fleet-wide downgrade.
+#
+# Asserted rather than assumed: this pin exists to guarantee a specific version
+# match, so a served-but-wrong artifact must fail the build, not ship quietly.
+ARG KUBECTL_VERSION=v1.35.3
 RUN curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
        -o /usr/local/bin/kubectl \
-  && chmod +x /usr/local/bin/kubectl
+  && chmod +x /usr/local/bin/kubectl \
+  && kubectl version --client=true -o json | grep -Fq "${KUBECTL_VERSION}"
 
 ARG HELM_VERSION=v3.20.0
 RUN curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" \
