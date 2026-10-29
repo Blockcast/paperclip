@@ -91,7 +91,41 @@ function isApiPath(path: string): boolean {
  * double-count. */
 const INSTRUMENTED = Symbol.for("paperclip.httpMetricsInstrumented");
 
-type InstrumentableResponse = Response & { [INSTRUMENTED]?: boolean };
+/**
+ * Carries the SQLSTATE of a transient-database refusal from the error handler
+ * to this middleware's finish-time record (PEN-3596).
+ *
+ * The error handler is the only place that knows a 503 came from `57014`
+ * rather than from lock contention, but it is the wrong place to increment a
+ * route-labelled counter: Express has already restored `req.baseUrl` by the
+ * time an error unwinds there, so the route label it could build differs from
+ * the one the parent counter used for the same route on success. Tagging the
+ * response and recording here keeps both counters on one label value, which is
+ * what makes the subset relation exact rather than approximate.
+ */
+const TRANSIENT_DB = Symbol.for("paperclip.httpMetricsTransientDb");
+
+export interface TransientDbResponseTag {
+  code: string;
+  sqlstate: string;
+}
+
+type InstrumentableResponse = Response & {
+  [INSTRUMENTED]?: boolean;
+  [TRANSIENT_DB]?: TransientDbResponseTag;
+};
+
+/**
+ * Record that this response is a transient-database refusal. Called by
+ * `error-handler.ts` at the moment it serves the 503, before the body is sent.
+ *
+ * Deliberately a no-op beyond the tag: nothing is incremented until the
+ * response actually finishes, so a refusal the client never received is
+ * counted on the `"0"` status exactly like any other abandoned response.
+ */
+export function noteTransientDbResponse(res: Response, tag: TransientDbResponseTag): void {
+  (res as InstrumentableResponse)[TRANSIENT_DB] = tag;
+}
 
 /** Compose the mounted route template from the prefix and the declared path.
  * `path` is only usable when it is a string -- a route declared with a RegExp
@@ -190,6 +224,7 @@ export function httpMetricsMiddleware(): RequestHandler {
           // the "0" sentinel instead of as a success it never was.
           status: res.writableFinished ? res.statusCode : null,
           emptyList,
+          transientDb: instrumentable[TRANSIENT_DB] ?? null,
         });
       } catch {
         // A metrics failure must never surface as a request failure. The

@@ -7,6 +7,7 @@ import { trackErrorHandlerCrash } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import { COMPANY_IMPORT_API_PATH } from "../routes/company-import-paths.js";
 import { logger } from "./logger.js";
+import { noteTransientDbResponse } from "./http-metrics.js";
 import {
   recordResponsibleUserDenialOnActiveRun,
 } from "../services/responsible-user-denial-run-outcomes.js";
@@ -201,6 +202,16 @@ export function errorHandler(
   const pgError = findPgError(err);
   if (pgError && TRANSIENT_DB_SQLSTATES.has(pgError.code)) {
     const isStatementTimeout = pgError.code === STATEMENT_TIMEOUT_SQLSTATE;
+    const transientDbCode = isStatementTimeout ? "statement_timeout" : "transient_db_conflict";
+    // PEN-3596: the `details.sqlstate` below tells a single caller what
+    // happened to its own request; this makes the same fact aggregatable.
+    // `paperclip_http_requests_total` carries no sqlstate dimension, so a 503
+    // on a route is only a PROXY for 57014 -- the three contention states land
+    // in the same bucket. Measured 2026-10-29, that left this row's "no
+    // statement timeouts over a representative window" condition readable only
+    // as an upper bound (79/24h on the issues-list route). Tag rather than
+    // increment: see `noteTransientDbResponse`.
+    noteTransientDbResponse(res, { code: transientDbCode, sqlstate: pgError.code });
     res.status(503).json({
       error: isStatementTimeout
         ? "Database statement timeout: the statement exceeded the server statement_timeout, "
@@ -209,7 +220,7 @@ export function errorHandler(
           + "Earlier statements in this request may have applied — replay only if it is idempotent."
         : "Database contention: the failing statement was rolled back. "
           + "Earlier statements in this request may have applied — replay only if it is idempotent.",
-      code: isStatementTimeout ? "statement_timeout" : "transient_db_conflict",
+      code: transientDbCode,
       details: { sqlstate: pgError.code },
     });
     return;
