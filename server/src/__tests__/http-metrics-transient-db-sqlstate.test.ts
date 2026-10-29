@@ -13,6 +13,7 @@ import {
   getMetricsRegistry,
   normalizeHttpTransientDbCode,
   normalizeHttpTransientDbSqlstate,
+  recordHttpRequest,
 } from "../services/metrics.js";
 
 /**
@@ -23,9 +24,9 @@ import {
  * only as an upper bound (measured 2026-10-29: 79 `503`s/24h on the
  * issues-list route, with no way to say how many were `57014`).
  *
- * These tests pin the three properties that make it a measurement:
- * `57014` is separable from contention, the subset carries the SAME route
- * label as its parent counter, and the labels stay bounded.
+ * These tests pin the properties that make it a measurement: `57014` is
+ * separable from contention, the subset carries the SAME route AND status
+ * labels as its parent counter, and the labels stay bounded.
  */
 
 type Series = { value: number; labels: Record<string, string | number> };
@@ -119,9 +120,34 @@ describe("transient-database 503 sqlstate instrumentation (PEN-3596)", () => {
     await call(app, `/api/companies/c1/fail-${STATEMENT_TIMEOUT_SQLSTATE}`, 503);
 
     expect(await requests({ route, status: "503" })).toBe(1);
-    expect(await refusals({ route, sqlstate: STATEMENT_TIMEOUT_SQLSTATE })).toBe(1);
+    // Same route AND same status, so the ratio is taken between two series
+    // that describe the same population.
+    expect(await refusals({ route, status: "503", sqlstate: STATEMENT_TIMEOUT_SQLSTATE })).toBe(1);
     // No series under the prefix-stripped label on either counter.
     expect(await refusals({ route: `/companies/:companyId/fail-${STATEMENT_TIMEOUT_SQLSTATE}` })).toBe(0);
+  });
+
+  it("puts an abandoned refusal on the same \"0\" status as the parent, not on 503", async () => {
+    // The response whose socket closes before the body flushes. `recordHttpRequest`
+    // is called directly because the middleware's only input here is
+    // `res.writableFinished === false`, which is exactly the `status: null` below.
+    //
+    // Without the shared `status` label the subset would increment while the
+    // parent recorded "0", and `subset / parent{status="503"}` could exceed 1 --
+    // a rate above 100%, on the one counter PEN-3596 Done-when #2 is read from.
+    const route = "/api/companies/:companyId/issues";
+    recordHttpRequest({
+      route,
+      method: "GET",
+      status: null,
+      emptyList: false,
+      transientDb: { code: "statement_timeout", sqlstate: STATEMENT_TIMEOUT_SQLSTATE },
+    });
+
+    expect(await requests({ route, status: "0" })).toBe(1);
+    expect(await requests({ route, status: "503" })).toBe(0);
+    expect(await refusals({ route, status: "0" })).toBe(1);
+    expect(await refusals({ route, status: "503" })).toBe(0);
   });
 
   it("is a strict subset: it counts no response that was not a transient-db refusal", async () => {
@@ -137,6 +163,12 @@ describe("transient-database 503 sqlstate instrumentation (PEN-3596)", () => {
   it("bounds the sqlstate label to the retry classifier's own set", () => {
     // The allow-list IS `TRANSIENT_DB_SQLSTATES`, not a copy, so a sqlstate
     // added to the retry path cannot silently land in `other`.
+    //
+    // Note what this does NOT show: `other` is unreachable through the real
+    // path, because `error-handler.ts` only tags a response when that same set
+    // already matched. These calls reach the normalizer directly. The bucket is
+    // a cardinality guard against a malformed driver `code`, not a drift
+    // detector -- its absence in production is evidence of nothing.
     for (const code of TRANSIENT_DB_SQLSTATES) {
       expect(normalizeHttpTransientDbSqlstate(code)).toBe(code);
     }

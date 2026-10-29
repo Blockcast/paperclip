@@ -28,6 +28,7 @@
     "src/__tests__/heartbeat-shared-doc-contents-not-persisted.test.ts",
     "src/__tests__/heartbeat-strict-git-probe-stderr.test.ts",
     "src/__tests__/heartbeat-timer-pre-dispatch-exclusions.test.ts",
+    "src/__tests__/http-metrics-transient-db-sqlstate.test.ts",
     "src/__tests__/issue-list-description-truncation-flag.test.ts",
     "src/__tests__/issue-park-expiry-sweep.test.ts",
     "src/__tests__/stranded-sweep-park-suppression.test.ts",

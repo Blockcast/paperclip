@@ -147,8 +147,10 @@ export const HTTP_EMPTY_LIST_RESPONSES_METRIC = "paperclip_http_empty_list_respo
  * transient-database refusal, so adding it there would multiply every existing
  * series by a label that is empty on nearly all of them. The precedent is
  * {@link HTTP_EMPTY_LIST_RESPONSES_METRIC} — a strict subset counter, labelled
- * identically plus the one discriminating dimension, so `subset / total` is a
- * rate and the subset carries detail the parent cannot afford.
+ * identically -- including `status`, which is what makes it a subset per status
+ * and not merely in aggregate -- plus the discriminating dimensions, so
+ * `subset / total` at a given status is a rate and the subset carries detail
+ * the parent cannot afford.
  *
  * ## What it closes
  *
@@ -168,8 +170,10 @@ export const HTTP_EMPTY_LIST_RESPONSES_METRIC = "paperclip_http_empty_list_respo
  *
  * ## Cardinality
  *
- * `route` is bounded by {@link HTTP_ROUTE_LABEL_CAP} exactly as the parent
- * counter is. `code` is the two API-boundary classifications
+ * `route` and `status` are bounded exactly as the parent counter's are
+ * ({@link HTTP_ROUTE_LABEL_CAP}, and in practice `status` only ever takes
+ * `"503"` or the `"0"` abandoned sentinel here). `code` is the two
+ * API-boundary classifications
  * (`statement_timeout` / `transient_db_conflict`) and `sqlstate` is bounded to
  * {@link TRANSIENT_DB_SQLSTATES} plus an `other` bucket, so the subset adds at
  * most a handful of series per route that actually refuses — and none at all
@@ -3996,10 +4000,15 @@ export function normalizeHttpStatus(status: number | null | undefined): string {
     : "0";
 }
 
-/** Label value for a SQLSTATE outside {@link TRANSIENT_DB_SQLSTATES}. Reaching
- * this means the API boundary classified something as a transient-database
- * refusal that the retry classifier does not know about — the two have drifted,
- * and a non-zero value here is the signal that they did. */
+/** Label value for a SQLSTATE outside {@link TRANSIENT_DB_SQLSTATES}.
+ *
+ * A pure cardinality guard, and unreachable in practice: the only caller of
+ * `noteTransientDbResponse` is gated on `TRANSIENT_DB_SQLSTATES.has(...)`
+ * (`error-handler.ts`), and {@link normalizeHttpTransientDbSqlstate} bounds the
+ * label to that same set, so no live path can emit this value. Do NOT read its
+ * absence as evidence that the API boundary and the retry classifier agree --
+ * it is what stops a malformed `code` on a driver error from minting an
+ * unbounded series, nothing more. */
 export const HTTP_TRANSIENT_DB_SQLSTATE_OTHER = "other";
 
 /**
@@ -5039,7 +5048,7 @@ let runDispatchWait: Histogram | null = null;
 let authRequest: Counter<"operation" | "outcome"> | null = null;
 let httpRequests: Counter<"route" | "method" | "status"> | null = null;
 let httpEmptyListResponses: Counter<"route" | "method" | "status"> | null = null;
-let httpTransientDbResponses: Counter<"route" | "method" | "code" | "sqlstate"> | null = null;
+let httpTransientDbResponses: Counter<"route" | "method" | "status" | "code" | "sqlstate"> | null = null;
 let gbrainRecallTotal: Counter<"status"> | null = null;
 let agentHeartbeatAge: Gauge<"agent_id"> | null = null;
 let agentHeartbeatInterval: Gauge<"agent_id"> | null = null;
@@ -5199,7 +5208,7 @@ function ensureRegistry(): {
   authRequestCounter: Counter<"operation" | "outcome">;
   httpRequestsCounter: Counter<"route" | "method" | "status">;
   httpEmptyListResponsesCounter: Counter<"route" | "method" | "status">;
-  httpTransientDbResponsesCounter: Counter<"route" | "method" | "code" | "sqlstate">;
+  httpTransientDbResponsesCounter: Counter<"route" | "method" | "status" | "code" | "sqlstate">;
   gbrainRecallCounter: Counter<"status">;
   agentHeartbeatAgeGauge: Gauge<"agent_id">;
   agentHeartbeatIntervalGauge: Gauge<"agent_id">;
@@ -7447,20 +7456,24 @@ function ensureRegistry(): {
     httpTransientDbResponses = new Counter({
       name: HTTP_TRANSIENT_DB_RESPONSES_METRIC,
       help:
-        "Count of 503 responses caused by a transient PostgreSQL SQLSTATE, labeled by route "
-        + "and method as in "
-        + `${HTTP_REQUESTS_METRIC}, plus the API-boundary classification (code) and the `
-        + "SQLSTATE itself (PEN-3596). A strict subset of that counter's 503s, so "
-        + "subset/total is a route's transient-database refusal rate. This is what makes a "
-        + "statement timeout verifiable rather than inferable: 57014 is query cost and "
+        "Count of responses the API refused with a transient PostgreSQL SQLSTATE, labeled "
+        + `by route, method and status as in ${HTTP_REQUESTS_METRIC}, plus the `
+        + "API-boundary classification (code) and the SQLSTATE itself (PEN-3596). A strict "
+        + "subset of that counter at the SAME status, so divide by the matching status: "
+        + "subset{status=\"503\"}/total{status=\"503\"} is a route's transient-database "
+        + "refusal rate. Status is carried for the same reason the parent carries it -- a "
+        + "refusal whose socket closed before the body flushed records \"0\" on BOTH "
+        + "counters, so neither over-counts the other. This is what makes a statement "
+        + "timeout verifiable rather than inferable: 57014 is query cost and "
         + "40P01/40001/55P03 are lock contention, and before this they shared the 503 "
         + "bucket with no way to tell them apart after the fact. Nothing is "
         + "zero-initialized -- a route that never refuses mints no series -- so an absent "
         + "series means no refusal was ever recorded, not that the counter is missing. "
-        + `A sqlstate of "${HTTP_TRANSIENT_DB_SQLSTATE_OTHER}" means the API boundary and `
-        + "the retry classifier have drifted. No user, company, agent, query string, or "
-        + "statement text is exposed.",
-      labelNames: ["route", "method", "code", "sqlstate"],
+        + `The "${HTTP_TRANSIENT_DB_SQLSTATE_OTHER}" sqlstate is a cardinality guard, NOT `
+        + "a drift detector: the only caller is gated on the same set the label is bounded "
+        + "to, so no live path can emit it and its absence is evidence of nothing. No "
+        + "user, company, agent, query string, or statement text is exposed.",
+      labelNames: ["route", "method", "status", "code", "sqlstate"],
       registers: [registry],
     });
     gbrainRecallTotal = new Counter({
@@ -10653,11 +10666,10 @@ export function recordHttpRequest(input: {
       code: normalizeHttpTransientDbCode(input.transientDb.code),
       sqlstate: normalizeHttpTransientDbSqlstate(input.transientDb.sqlstate),
     };
-    registered.httpTransientDbResponsesCounter.inc({
-      route: labels.route,
-      method: labels.method,
-      ...transientDb,
-    });
+    // `labels.status`, not a literal "503": an abandoned refusal records "0"
+    // on the parent, and reusing the same value is what keeps this a strict
+    // subset per status rather than only in aggregate.
+    registered.httpTransientDbResponsesCounter.inc({ ...labels, ...transientDb });
   }
   return { ...labels, transientDb };
 }
