@@ -231,10 +231,14 @@ The boundary must therefore hold the credential and **perform the publish itself
   guarded by two equality checks (`scripts/check-agent-image-git-config.mjs` and assertion (a) in
   `agent-egress-path.test.mjs`) whose expectations live in `scripts/git-config-surface.mjs` —
   changing that line means changing those in the same commit, by construction.
-  **Status:** still outstanding as of 2026-10-29 — PEN-4933 shipped without it. It is tracked as
-  a precondition for discharging §7.1, not as a follow-up; see §7.3's *"The §5 starvation
-  assertion is still outstanding, and it gates discharge"* for what is already in place, what is
-  merely probable, and what remains unasserted.
+  **Status: satisfied 2026-10-29** (#3097), having been outstanding when PEN-4933 first shipped.
+  `scripts/gh-token-wrapper.test.mjs` now asserts that the helper yields no credential once the
+  mount is gone, as a composed chain of four links each verified by mutation. Both fallbacks named
+  just above are closed by it: each requires `gh.real` to **run**, and the assertion pins that it
+  does not. This was a precondition for discharging §7.1 rather than a follow-up, and it is the
+  second of that discharge's two conjuncts — the first, the rollout gate, is still off. See §7.3's
+  *"The §5 starvation assertion is satisfied; the rollout gate still is not"* for the per-link
+  breakdown and for the limit: these are composed unit assertions, not an in-pod end-to-end run.
 
 Short-lived minted tokens are **not** a substitute. A GitHub App installation token handed to the
 agent is readable for its whole lifetime, so it narrows the window and leaves the boundary exactly
@@ -605,17 +609,29 @@ Four things a reader should not infer from that paragraph:
      they belong on the review-date checklist even though they are closed
      today.
 
-5. **The §5 starvation assertion is still outstanding, and it gates discharge.**
+5. **The §5 starvation assertion is satisfied; the rollout gate still is not.**
    §5 requires that `/etc/gitconfig`'s system credential helper be *shown* to
    starve once the token leaves the agent container — explicitly not assumed,
    because git treats a credential helper's non-zero exit as "no credential"
-   and carries on, so this fails silently in the permissive direction. **No
-   test asserts it today.** Checked at this head:
-   `github-publish-broker.test.ts`, `github-publish-broker-policy.test.ts` and
-   `job-manifest.github-publish-broker.test.ts` contain no starvation check,
-   and `agent-egress-path.test.mjs` asserts only that the git wrapper installs
-   the *paperclip* helper on its own command line and that nothing else writes
-   `/etc/gitconfig` — a different claim.
+   and carries on, so this fails silently in the permissive direction.
+
+   ⚠ **Status (2026-10-29, #3097).** This item previously read *"is still
+   outstanding, and it gates discharge"* and recorded that **no test asserted
+   it**. Both statements are now false, and the survey behind the second was
+   incomplete when written: it checked `github-publish-broker.test.ts`,
+   `github-publish-broker-policy.test.ts`,
+   `job-manifest.github-publish-broker.test.ts` and `agent-egress-path.test.mjs`,
+   and missed `scripts/gh-token-wrapper.test.mjs`, which already pinned two of
+   the four links. That suite now asserts the claim as a composed chain, every
+   link verified **by mutation** — each was made to fail before being accepted
+   as passing.
+
+   | link | the claim | asserted by |
+   |---|---|---|
+   | A | `/etc/gitconfig` names `!/usr/bin/gh auth git-credential` | `gh-token-wrapper.test.mjs`, pre-existing (BLO-18484) |
+   | B | `/usr/bin/gh` **is** this wrapper, not the upstream binary moved aside as `gh.real` | #3097 — **this was the hole.** Link A's helper string stays byte-identical if `/usr/bin/gh` is reverted to the real binary, which never reads the token file and never refuses |
+   | C | the wrapper refuses, rather than falling through to ambient auth, when `PAPERCLIP_GITHUB_TOKEN_FILE` is set and the named file is absent | refusal pre-existing (BLO-37977); the **composed** form — driven with git's own `get` stdin request, asserting exit 64, empty stdout and specifically no `password=`/`username=` — is #3097 |
+   | D | the brokered agent container still **sets** that variable while not mounting the Secret | `job-manifest.github-publish-broker.test.ts`; made load-bearing by a positive control in #3097 that pins that *unsetting* it really does re-authenticate |
 
    ⚠ **Correction (2026-10-29, PEN-4933).** This paragraph previously named
    `paperclip-github-token-env` as the binary that starves, and routed the
@@ -639,28 +655,51 @@ Four things a reader should not infer from that paragraph:
    file absent the wrapper reaches `reject_token_file "is absent"` (`:525`) and
    exits non-zero. With the variable **unset** it falls through to
    `exec_real_gh` (`:528`) under whatever ambient auth exists.
-   ⚠ That is why it **probably** starves, which is the standard §5 rejects.
+   ⚠ That mechanism is now **asserted**, not merely probable — which was the
+   whole of §5's objection to the paragraph above.
 
-   **The failure mode to guard is quiet and looks like tidying up.** Both of
-   the fallbacks below resolve on that same single conjunct, so removing the
-   mount *and* the now-dangling `PAPERCLIP_GITHUB_TOKEN_FILE` together — the
-   variable points at a path that no longer exists, so deleting it reads as
-   correct — silently flips the wrapper from *refuse* to *fall back to
-   unwrapped auth*, with no error anywhere. The assertion must therefore pin
-   the rendered brokered manifest (variable **present**) **and** the wrapper's
-   non-zero exit for an absent file: either half alone passes while the pair
-   is broken.
-   Two fallbacks remain unasserted and either one re-authenticates the
-   unguarded binary with the mount already gone: `gh.real` resolving an ambient
-   `GH_TOKEN`/`GITHUB_TOKEN`, and a stale `~/.config/gh/hosts.yml` — the
-   unmaintained state BLO-13241 wrapped `gh` to stop using.
+   **The failure mode to guard is quiet and looks like tidying up.** Links C
+   and D resolve on that same single conjunct, so removing the mount *and* the
+   now-dangling `PAPERCLIP_GITHUB_TOKEN_FILE` together — the variable points at
+   a path that no longer exists, so deleting it reads as correct — silently
+   flips the wrapper from *refuse* to *fall back to unwrapped auth*, with no
+   error anywhere. C and D are therefore pinned as a **pair**, in two different
+   suites: either half alone stays green while the pair is broken.
 
-   So: **do not read item 2's "discharged when the gate is on" as satisfied by
-   flipping the gate.** Until a test asserts that a bare `/usr/bin/git push`
-   from uid 1000 in a brokered pod fails to authenticate, enabling the broker
-   closes §7.1's *mount* route and leaves its *helper* route unproven, which is
-   the narrower of the two but the one §4 found to be cheaper for an attacker.
-   This is a rollout precondition for PEN-4933, not a follow-up.
+   **Both fallbacks are closed, and by the same assertion.** §5 named two that
+   would each re-authenticate the unguarded binary with the mount already gone:
+   `gh.real` resolving an ambient `GH_TOKEN`/`GITHUB_TOKEN`, and a stale
+   `~/.config/gh/hosts.yml` (the unmaintained state BLO-13241 wrapped `gh` to
+   stop using). Both require `gh.real` to **run**, and link C pins that it does
+   not: the stub always writes to stdout, so the assertion that stdout is empty
+   is what proves the real binary was never reached. The env-delivered half is
+   additionally held off the agent container at render time by the refusal in
+   *"the credential Secret is not the credential"* above — defence in depth, not
+   the primary assertion.
+
+   **What this discharges, and what it does not.** Item 2 has two conjuncts and
+   this is the second of them. The first — `enableGitHubPublishBroker` on — is
+   **unchanged and still false**, so on its own this discharges **nothing**.
+   What has changed is that enabling the gate no longer closes §7.1's *mount*
+   route while leaving its *helper* route unproven, which was the specific trap
+   this item existed to prevent. The rollout precondition is met; the rollout
+   has not happened.
+
+   ⚠ Do **not** read this item as a statement about §7.1's overall standing.
+   It speaks only to the assertion conjunct. Whether the acceptance is still
+   in force — in particular whether a §7.2 trigger has since fired — is settled
+   in §7.1 and §7.2 and nowhere else; the §8 absolute-path-`git` measurement
+   that trigger 4 turns on was being taken and widened on this same date
+   (PEN-4986 / PEN-4989), so a reader arriving here later should check those
+   sections rather than infer their result from this one.
+
+   ⚠ **State the limit rather than rounding up.** This is a *composed* assertion
+   over four links, each pinned in a unit suite and each mutation-verified. It
+   is **not** an end-to-end run of `/usr/bin/git push` from uid 1000 inside a
+   live brokered pod. The composition is argued in the test file's header
+   comment, not executed. Whether that meets the bar §7.4's release condition
+   (a) sets is **Security's call, not this document's** — see the status note
+   there; nothing is released either way, because (b) and (c) remain unmet.
 
 ### 7.4 Env-delivered credentials: the seat-token route stays refused, not routed (decided 2026-10-29)
 
@@ -718,17 +757,30 @@ it here.
    would widen the blast radius of a gap this document already declines to claim closed. That is
    backwards for a change whose entire purpose is to narrow credential reach.
 
-4. **§5's bar is not yet met for the credential already in the broker.** §7.3's *"The §5
-   starvation assertion is still outstanding, and it gates discharge"* records that the
-   `/etc/gitconfig` assertion is unmet and is a **precondition for discharge**.
+4. **§5's bar — unmet for the credential already in the broker when this was decided; met
+   later the same day.** As written this ground read *"is not yet met"*, and cited §7.3's
+   item on the starvation assertion as recording the `/etc/gitconfig` assertion unmet and a
+   **precondition for discharge**. #3097 satisfied that assertion; the item is retitled
+   *"The §5 starvation assertion is satisfied; the rollout gate still is not"*.
    Adding a second, broader credential before the first one's starvation is *shown* rather than
-   assumed is the §5 error at one remove.
+   assumed would have been the §5 error at one remove — and that is no longer the objection.
+
+   ⚠ **The decision is unchanged, and this ground is recorded rather than deleted.** Grounds 1–3
+   are untouched by #3097 and each stands on its own; ground 1 in particular is the one that put
+   this choice in Security's hands at all. A ground that has since been met is evidence about
+   what the decision still rests on, which is exactly what a reader re-opening §7.4 needs and
+   what deleting it would destroy. Re-deciding §7.4 on the strength of this is Security's call
+   under §8, not a consequence of the merge.
 
 **What would release this.** All three, together — any one alone is not enough:
 
-- **(a)** §7.3's *"The §5 starvation assertion is still outstanding, and it gates discharge"*
-  satisfied: a test asserts that a bare `/usr/bin/git push` from uid 1000 in a brokered pod fails
-  to authenticate.
+- **(a)** §7.3's *"The §5 starvation assertion is satisfied; the rollout gate still is not"* —
+  **partially met, and the remaining gap is Security's to judge.** That item is satisfied in its
+  *composed* form (#3097): links A–D each pinned and each mutation-verified. It is **not** the
+  literal thing this line asks for, which is a test that runs a bare `/usr/bin/git push` from uid
+  1000 **inside a brokered pod**. Whether the composed assertion clears this bar is left open
+  here deliberately, rather than marked met by the engineer who wrote those tests. Moot today
+  either way: the three conditions are conjunctive and (b) and (c) are both unmet.
 - **(b)** *Either* the check-then-use residual of §7.3's *"A successor residual replaces the old
   one, and it is smaller but real"* closed — per-invocation mount namespace, or a uid split between
   broker and child, both already reserved to Security by §8 — *or* the credential proposed for
