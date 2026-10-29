@@ -134,6 +134,33 @@ export function classifyGitInvocation({ argv = [], gitConfigParameters = null, a
   return { wrapped: viaArgv || viaEnv || viaAncestor, evidence: { viaArgv, viaEnv, viaAncestor } };
 }
 
+/**
+ * Decide what one sample IS, given what could be read of it. Pure, and separate
+ * from `classifyGitInvocation` because the two rules fail in different
+ * directions and each needs pinning on its own.
+ *
+ * A process caught inside `execve` reads back with an EMPTY
+ * `/proc/<pid>/cmdline`: the kernel has swapped the `mm` but not yet written
+ * the new argv. Scoring such a sample `unwrapped` manufactures findings out of
+ * ordinary traffic, and since a non-zero count is §7.2 trigger 4, an instrument
+ * that cries wolf is as useless as one that is blind.
+ *
+ * But an unreadable argv does not make a sample evidence-free: argv is one of
+ * three arms, and the other two read `/proc/<pid>/environ` and the ancestry
+ * chain, which are usually still readable. So the classifier runs regardless,
+ * and a sample is INDETERMINATE only when the argv is unreadable AND no arm
+ * fired. The asymmetry is one-directional by construction: missing evidence can
+ * leave a sample unclassified or promote it to `wrapped`, never to a finding.
+ */
+export function resolveSample({ argv = [], gitConfigParameters = null, ancestry = [], klass }) {
+  if (klass === "calib") return { klass, wrapped: null, evidence: null };
+  const cls = classifyGitInvocation({ argv, gitConfigParameters, ancestry });
+  if (argv.length === 0 && cls.wrapped === false) {
+    return { klass: "indeterminate", wrapped: null, evidence: cls.evidence };
+  }
+  return { klass, wrapped: cls.wrapped, evidence: cls.evidence };
+}
+
 const read = (p) => { try { return readFileSync(p, "utf8"); } catch { return null; } };
 const argvOf = (pid) => (read(`/proc/${pid}/cmdline`) ?? "").split("\0").filter(Boolean);
 const exeOf = (pid) => { try { return readlinkSync(`/proc/${pid}/exe`); } catch { return null; } };
@@ -279,26 +306,17 @@ export function main(argvIn = process.argv.slice(2)) {
       const key = `${e}:${st.starttime}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      // A process caught inside execve reads back with an EMPTY /proc/<pid>/cmdline:
-      // the kernel has swapped the mm but not yet written the new argv. Such a
-      // sample carries no evidence either way, and scoring it `unwrapped` --
-      // which the first version did -- manufactures findings out of ordinary
-      // traffic. Since a non-zero count is §7.2 trigger 4, an instrument that
-      // cries wolf is as useless as one that is blind. One immediate re-read
-      // clears most of the race; what survives is reported as INDETERMINATE,
-      // never as wrapped and never as a finding.
+      // See `resolveSample` for the indeterminate rule and why it is one-directional.
       let argv = argvOf(e);
-      if (argv.length === 0) argv = argvOf(e);
+      if (argv.length === 0) argv = argvOf(e);   // one re-read clears most of the execve race
       const gcp = gitConfigParametersOf(e);
       const ancestry = ancestryOf(st.ppid);
-      const indeterminate = argv.length === 0;
-      if (indeterminate) klass = klass === "calib" ? "calib" : "indeterminate";
-      const cls = (klass === "calib" || indeterminate)
-        ? { wrapped: null, evidence: null }
-        : classifyGitInvocation({ argv, gitConfigParameters: gcp.value, ancestry });
+      const cls = resolveSample({ argv, gitConfigParameters: gcp.value, ancestry, klass });
+      const indeterminate = cls.klass === "indeterminate";
+      klass = cls.klass;
       emit({
         kind: klass,
-        ...(indeterminate ? { reason: "argv-unreadable: process caught inside execve" } : {}),
+        ...(indeterminate ? { reason: "argv-unreadable and no other arm fired: process caught inside execve" } : {}),
         ts: new Date().toISOString(),
         pid: e, starttime: st.starttime, exe, exeId: id,
         argv: argv.join(" ").slice(0, 600),
