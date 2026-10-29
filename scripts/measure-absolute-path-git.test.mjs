@@ -24,7 +24,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, linkSync, chmodSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  classifyGitInvocation, discoverGitBinaries,
+  classifyGitInvocation, discoverGitBinaries, resolveSample,
   PAPERCLIP_HELPER, WRAPPER, RUNTIME_JS,
 } from "./measure-absolute-path-git.mjs";
 
@@ -167,4 +167,49 @@ test("a NON-paperclip credential helper does not count as having transited the w
 
 test("missing fields default to unwrapped rather than throwing", () => {
   assert.equal(classifyGitInvocation({}).wrapped, false);
+});
+
+// ------------------------------------------------- the indeterminate rule
+
+test("an unreadable argv with no other evidence is INDETERMINATE, never a finding", () => {
+  const r = resolveSample({ argv: [], gitConfigParameters: null, ancestry: [], klass: "observation" });
+  assert.equal(r.klass, "indeterminate");
+  assert.equal(r.wrapped, null, "null, not false -- an unreadable sample is not a trigger-4 fire");
+});
+
+test("an unreadable argv still classifies WRAPPED when another arm fires", () => {
+  // argv is one of three arms. /proc/<pid>/environ and the ancestry chain are
+  // usually still readable mid-execve, and evidence from them is just as good.
+  // Scoring these indeterminate would understate the wrapped count and inflate
+  // the apparent blind spot.
+  const viaEnv = resolveSample({
+    argv: [], gitConfigParameters: `'credential.https://github.com.helper=${PAPERCLIP_HELPER}'`,
+    ancestry: [], klass: "observation",
+  });
+  assert.equal(viaEnv.klass, "observation");
+  assert.equal(viaEnv.wrapped, true);
+
+  const viaAncestor = resolveSample({
+    argv: [], gitConfigParameters: null,
+    ancestry: [{ pid: "9", comm: "sh", exe: "/bin/sh", argv: `/bin/sh ${WRAPPER} fetch` }],
+    klass: "observation",
+  });
+  assert.equal(viaAncestor.klass, "observation");
+  assert.equal(viaAncestor.wrapped, true);
+});
+
+test("the indeterminate rule is one-directional: it can never produce a finding", () => {
+  // A readable argv with no wrapped evidence IS the finding, and must stay one.
+  const r = resolveSample({
+    argv: ["/usr/lib/git-core/git", "push"], gitConfigParameters: null, ancestry: [],
+    klass: "observation",
+  });
+  assert.equal(r.klass, "observation");
+  assert.equal(r.wrapped, false);
+});
+
+test("calibration samples are never classified or re-labelled", () => {
+  const r = resolveSample({ argv: [], gitConfigParameters: null, ancestry: [], klass: "calib" });
+  assert.equal(r.klass, "calib");
+  assert.equal(r.wrapped, null);
 });
