@@ -770,18 +770,63 @@ export function classifyFromListing(pr, { now = Date.now() } = {}) {
  * `head_ref_force_pushed` for a rebase or amend. Anything older than the
  * newest of them happened to a head that no longer exists.
  *
- * Returns `null` when the timeline carries neither — which is the unreadable
- * case, not the "head is infinitely old" case, and `ejectionsAtHead` treats it
- * as such.
+ * The two shapes are disjoint, both read live on 2026-10-29: `committed`
+ * carries `sha` and `committer.date` with a null `created_at`, while
+ * `head_ref_force_pushed` carries `commit_id` and `created_at` with a null
+ * `sha`. So the sha of the commit an event attests lives under a different
+ * key per kind, and both have to be read.
+ *
+ * `headSha` narrows the stamps to events attesting THAT commit. Without it
+ * the newest commit anywhere on the timeline dates the head even when it is
+ * not the head: #3089 carries six `committed` events of which exactly one is
+ * `d4f8aa38`, and an abandoned commit dated after the head drags the stamp
+ * forward and silently drops real ejections. That is the fail-OPEN direction,
+ * and under-counting is the expensive one — it costs every entry in the queue
+ * a rebuild, where over-counting costs one deferred enqueue.
+ *
+ * ⚠ When `headSha` is given but NOTHING on the timeline attests it, this
+ * falls back to the unnarrowed newest stamp rather than reporting null.
+ * Null would count every historical ejection and hold the PR, and no push
+ * could clear it, because a push that produces no attesting event never will
+ * — a PERMANENT hold on exactly the PRs whose timeline is odd, which is the
+ * stranding `EJECTIONS_BEFORE_HOLD` exists to rule out. The fallback is this
+ * function's pre-PEN-5028 behaviour byte for byte, so narrowing can only ever
+ * happen on positive evidence about the head.
+ *
+ * ponytail: every stamp here is a COMMIT time, never a push time, and the
+ * REST timeline records no push time for a non-force push. A commit created
+ * BEFORE an ejection but pushed AFTER it therefore dates the new head earlier
+ * than that ejection, and `ejectionsAtHead` counts it against a head that was
+ * never in the queue. Narrowing to `headSha` does not reach this ordering —
+ * the head's own `committer.date` is the stamp — so it is a ceiling, not a
+ * bug to be found later. Closing it needs a push time from a source other
+ * than this timeline. Pinned by the `commit-before-ejection, push-after`
+ * test, and the residual leans toward a hold the next push clears.
+ *
+ * Returns `null` when the timeline carries neither kind — which is the
+ * unreadable case, not the "head is infinitely old" case, and
+ * `ejectionsAtHead` treats it as such.
  */
-export function headMovedAt(timeline) {
-  const stamps = (Array.isArray(timeline) ? timeline : [])
-    .filter((event) => event?.event === "committed" || event?.event === "head_ref_force_pushed")
-    // `committed` is a raw git object: it carries `committer.date`, not the
-    // `created_at` every issue-event has. Reading only `created_at` would drop
-    // every ordinary push and leave force-pushes as the sole clock.
-    .map((event) => Date.parse(event?.created_at ?? event?.committer?.date ?? ""))
-    .filter((ms) => Number.isFinite(ms));
+export function headMovedAt(timeline, headSha = null) {
+  const events = (Array.isArray(timeline) ? timeline : []).filter(
+    (event) => event?.event === "committed" || event?.event === "head_ref_force_pushed",
+  );
+  // `committed` is a raw git object: it carries `committer.date`, not the
+  // `created_at` every issue-event has. Reading only `created_at` would drop
+  // every ordinary push and leave force-pushes as the sole clock.
+  const stampsOf = (list) =>
+    list
+      .map((event) => Date.parse(event?.created_at ?? event?.committer?.date ?? ""))
+      .filter((ms) => Number.isFinite(ms));
+  const head = lower(headSha);
+  const attesting =
+    head === ""
+      ? []
+      : events.filter((event) => lower(event?.sha) === head || lower(event?.commit_id) === head);
+  // Unparseable stamps on the attesting events fall back too: an attesting
+  // event nobody can date is no more informative than no attesting event.
+  const narrowed = stampsOf(attesting);
+  const stamps = narrowed.length ? narrowed : stampsOf(events);
   return stamps.length ? Math.max(...stamps) : null;
 }
 
@@ -790,8 +835,20 @@ export function headMovedAt(timeline) {
  * sitting out of the queue right now.
  *
  * Counts only ejections newer than `headMovedAt`, which is what makes the hold
- * self-clearing: a push resets the count to zero with no state to store and
- * nothing to expire.
+ * self-clearing with no state to store and nothing to expire: a push whose
+ * commit was CREATED after the ejections resets the count to zero.
+ *
+ * ⚠ That reset is NOT unconditional, and the exception is not reachable from
+ * this timeline. `headMovedAt` dates a head by commit time, so a commit
+ * created BEFORE an ejection but pushed AFTER it dates the new head earlier
+ * than that ejection and carries it onto a head that has never been in the
+ * queue. For that one push ordering the effective threshold is
+ * `EJECTIONS_BEFORE_HOLD - 1`. This sentence used to read "a push resets the
+ * count to zero" flatly, which is the sentence a future reader would trust;
+ * it was wrong for this ordering (PEN-5028). See the ponytail note on
+ * `headMovedAt` for why no narrowing fixes it. The residual leans toward a
+ * hold, which the NEXT push — or a manual re-enqueue, which sets `requeued`
+ * and bypasses the rule outright — clears.
  *
  * ⚠ An ejection with NO datable head is counted. The alternative — ignore what
  * you cannot date — fails open into the re-enqueue loop this exists to stop,
@@ -803,12 +860,12 @@ export function headMovedAt(timeline) {
  * `requeued` asks whether acting now would double-enqueue. `classifyPr` needs
  * both — a PR already back in the queue is not a candidate whatever its count.
  */
-export function ejectionsAtHead(timeline) {
+export function ejectionsAtHead(timeline, headSha = null) {
   const events = (Array.isArray(timeline) ? timeline : []).filter(
     (event) =>
       event?.event === "removed_from_merge_queue" || event?.event === "added_to_merge_queue",
   );
-  const movedAt = headMovedAt(timeline);
+  const movedAt = headMovedAt(timeline, headSha);
   const atHead = events.filter((event) => {
     if (movedAt === null) return true;
     const at = Date.parse(event?.created_at ?? "");
@@ -926,12 +983,17 @@ export function classifyPr(pr, { now = Date.now(), settleMinutes = CHECK_SETTLE_
   // `merge-queue-eviction-detector.yml` posted "Cause: failing required check"
   // at 13:52:22Z, both correct and both on time. Neither was an input to the
   // enqueue decision. This rule is the wiring, not a new detector.
-  const ejections = ejectionsAtHead(pr?.timeline);
+  const ejections = ejectionsAtHead(pr?.timeline, pr?.headRefOid);
   if (!ejections.requeued && ejections.count >= EJECTIONS_BEFORE_HOLD) {
     return row(
       "skip",
       "ejected-at-current-head",
-      `GitHub ejected this head ${ejections.count}x; push a fix or rerun the queue build`,
+      // Not "rerun the queue build": an ejection DELETES the
+      // `gh-readonly-queue/...` branch — this rule's own premise — so there is
+      // no queue build left to rerun and naming one sends a human to a dead
+      // ref. The two things that actually clear this row are a push, and a
+      // manual re-enqueue (which sets `requeued`, bypassing the rule).
+      `GitHub ejected this head ${ejections.count}x; push a fix, or re-enqueue manually if the failure was infra`,
     );
   }
 
