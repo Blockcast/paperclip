@@ -2455,9 +2455,13 @@ describe("IssueProperties", () => {
       expect(schedule).toBeTruthy();
       expect((schedule as HTMLButtonElement).disabled).toBe(true);
 
-      // The remedy has to be readable, not just implied by a greyed button.
+      // The refusal has to be readable, not just implied by a greyed button —
+      // and it must not promise a remedy that cannot be applied.
       expect(container.textContent).toContain(String(MAX_ISSUE_MONITOR_MAX_ATTEMPTS));
-      expect(container.textContent).toMatch(/Clear it and stop polling/);
+      expect(container.textContent).toMatch(/no further\s+monitor can be armed on this issue/);
+      // Clearing is still offered on an armed row, but only as retirement.
+      expect(container.textContent).toMatch(/Clearing retires the current one/);
+      expect(container.textContent).not.toMatch(/raise .*maxAttempts.* through the API/);
 
       // "Clear" stays live — it is the move the hint names.
       const clear = Array.from(container.querySelectorAll("button"))
@@ -2528,9 +2532,13 @@ describe("IssueProperties", () => {
       expect(schedule).toBeTruthy();
       expect((schedule as HTMLButtonElement).disabled).toBe(true);
 
-      // With nothing to clear, the hint must not tell the user to clear it.
-      expect(container.textContent).not.toMatch(/Clear it and stop polling/);
-      expect(container.textContent).toMatch(/count survives clearing/);
+      // The hint must state the dead end, and must not offer a remedy. At this
+      // count no `maxAttempts` can satisfy the arm (schema caps it at 100, the
+      // arm needs strictly more) and nothing resets the counter.
+      expect(container.textContent).toMatch(/no further\s+monitor can be armed on this issue/);
+      expect(container.textContent).not.toMatch(/Clearing retires the current one/);
+      // Never point at the API as a way out — there isn't one from here.
+      expect(container.textContent).not.toMatch(/raise .*maxAttempts.* through the API/);
 
       act(() => root.unmount());
     });
