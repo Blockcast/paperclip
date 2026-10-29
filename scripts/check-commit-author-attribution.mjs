@@ -280,6 +280,16 @@ export const APP_NOREPLY_EMAIL_PATTERN =
   /^(?:\d+\+)?allyblockcast\[bot\](?:\+[^@]*)?@users\.noreply\.github\.com$/i;
 
 /**
+ * Cap on the output every `git` call in this module will buffer.
+ *
+ * Shared so the three call sites cannot drift, and named so an overflow can
+ * report the number it hit (PEN-5025). Only `patchIdForCommit` can realistically
+ * reach it: `git log --format` and `git show --name-only` produce metadata,
+ * while a patch is as large as the diff.
+ */
+const GIT_MAX_BUFFER = 32 * 1024 * 1024;
+
+/**
  * Non-agent automated processes that share the App's bare noreply email and
  * so cannot be told apart from a genuine agent commit by email alone.
  *
@@ -290,16 +300,6 @@ export const APP_NOREPLY_EMAIL_PATTERN =
  * the real commit/branch that justifies it and the narrowest path scope that
  * covers its output; never widen `APP_NOREPLY_EMAIL_PATTERN` to exclude one.
  */
-/**
- * Cap on the output every `git` call in this module will buffer.
- *
- * Shared so the three call sites cannot drift, and named so an overflow can
- * report the number it hit (PEN-5025). Only `patchIdForCommit` can realistically
- * reach it: `git log --format` and `git show --name-only` produce metadata,
- * while a patch is as large as the diff.
- */
-const GIT_MAX_BUFFER = 32 * 1024 * 1024;
-
 export const NON_AGENT_PROCESS_EXEMPTIONS = new Map([
   // origin/bot/graphify-reindex — scheduled knowledge-graph refresh.
   // Both graphify-authored commits in this repo's history (514aefa72,
