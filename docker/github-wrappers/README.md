@@ -84,10 +84,16 @@ issue against itself and render the credential back into its own container. The
 broker's `image` is pinned the same way, for the same reason: the broker execs
 these scripts out of it with the credential in its environment.
 
-⚠ That is two keys, not the whole boundary. The merged run config is still
-overlaid from issue scope for every other key, and PEN-3183 §7.5 names one
-route (`workspaceVolumeClaim`) that is still open. Do not read "agent scope
-only" as a property of the rendered broker. These scripts are unchanged in
+While the gate is on, `enableDocker` and `dockerImage` are pinned too — the
+DinD sidecar is privileged root in the same pod, which defeats the uid split
+without touching the credential at all.
+
+⚠ That is four keys, not the whole boundary. The merged run config is still
+overlaid from issue scope for every other key; PEN-3183 §7.5 names one route
+(`workspaceVolumeClaim`) that is still open, and records that an operator who
+enables docker *at agent scope* on a brokered agent keeps a privileged
+container beside the broker by decision. Do not read "agent scope only" as a
+property of the rendered broker. These scripts are unchanged in
 shape — they still lead PATH, still re-read the token file, still exec the same
 egress runtimes — but in the agent container that token file no longer exists,
 and each runtime hands the invocation to the broker over a unix socket.
