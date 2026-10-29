@@ -97,6 +97,13 @@ const MAX_SUMMARIZED_KEYS = 40;
 // Key names on these routes are sender-authored too, so each one is bounded
 // as well as the count; otherwise `{"<64 KiB string>": 1}` lands verbatim.
 const MAX_SUMMARIZED_KEY_LENGTH = 64;
+
+// An allowlisted upgrade query value is non-credential by the call site's
+// judgement, but it is still caller-authored: the client chooses the bytes.
+// Bounded for the same reason `summarizeKeys` bounds a key — an unbounded
+// caller-controlled string in a log line is a volume and line-injection
+// vector independent of whether it is secret.
+const MAX_UPGRADE_QUERY_VALUE_LENGTH = 64;
 const OMITTED_QUERY = "[OMITTED: untrusted webhook query]";
 
 function summarizeKeys(field: string, value: Record<string, unknown>): Record<string, unknown> {
@@ -224,6 +231,13 @@ export function urlForLog(url: string | undefined): string | undefined {
   return url !== undefined && shouldOmitRequestBodyFromLog(url) ? normalizePath(url) : url;
 }
 
+// Bound a kept query value. See MAX_UPGRADE_QUERY_VALUE_LENGTH.
+function truncateQueryValue(value: string): string {
+  return value.length > MAX_UPGRADE_QUERY_VALUE_LENGTH
+    ? `${value.slice(0, MAX_UPGRADE_QUERY_VALUE_LENGTH)}…`
+    : value;
+}
+
 // A WebSocket upgrade URL as it may appear in a log line: pathname, plus only
 // the query keys the call site named. Everything else is dropped.
 //
@@ -257,6 +271,11 @@ export function urlForLog(url: string | undefined): string | undefined {
 // on an upgrade URL, and echoing them back into a log line would reopen a
 // smaller version of the same hole (cf. `summarizeKeys`, which bounds both the
 // count and the length of each key for that reason).
+//
+// Kept VALUES are length-bounded for the same reason, which is a separate
+// concern from secrecy: an allowlisted key is non-credential by the call
+// site's judgement, but the client still authors its bytes, so an unbounded
+// one is a log-volume and line-injection vector on its own.
 export function upgradePathForLog(
   rawUrl: string | undefined,
   allowQueryKeys: readonly string[] = [],
@@ -268,7 +287,7 @@ export function upgradePathForLog(
     const kept = new URLSearchParams();
     let dropped = 0;
     for (const [key, value] of url.searchParams) {
-      if (allowed.has(key)) kept.append(key, value);
+      if (allowed.has(key)) kept.append(key, truncateQueryValue(value));
       else dropped += 1;
     }
     if (dropped > 0) kept.append("redactedQueryKeys", String(dropped));
