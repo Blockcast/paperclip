@@ -498,6 +498,17 @@ describe("buildPrePushHookPreflightShell (PEN-4518)", () => {
       const res = run(against(f.runtime, f.mount));
       expect(res.stderr).toContain(PRE_PUSH_HOOK_PREFLIGHT_OFF_MOUNT);
       expect(res.stderr).not.toContain(PRE_PUSH_HOOK_PREFLIGHT_MASKED);
+      // Same rule the NOT-EXECUTABLE arm is pinned against: the consequence has
+      // to match what the runtime does. The difference is that here it is NOT
+      // decidable from the layout this arm observed. The shell is built
+      // server-side, and `config.image` lets an agent pin an image older than
+      // the server (`job-manifest.ts`); that image reads the SEEDED copy, which
+      // is still mounted, and publishes normally. So this verdict must name
+      // both branches rather than announce an outage at a pod that works — a
+      // false alarm here costs an operator a debugging session on a healthy pod.
+      expect(res.stderr).toContain("will refuse every push from this pod");
+      expect(res.stderr).toContain("publishes normally");
+      expect(res.stderr).not.toContain("pushes from this pod will be refused");
     } finally {
       f.cleanup();
     }
