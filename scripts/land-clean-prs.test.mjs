@@ -25,9 +25,12 @@ import {
   targetRepos,
   unsatisfiedOwners,
   codeownersPatternToRegExp,
+  fetchCodeownerRules,
   impliedOwners,
+  isNotFoundGhError,
   ownersForFiles,
   parseCodeowners,
+  stripCodeownersComment,
 } from "./land-clean-prs.mjs";
 
 const HEAD = "958587ad1fe1eb52b06ca874c41734c9abdc2a10";
@@ -910,6 +913,111 @@ describe("markFailure", () => {
 });
 
 /**
+ * PEN-4919. `fetchCodeownerRules` is the fail-CLOSED half of the owner hold:
+ * `null` ("unreadable, keep holding") must stay distinguishable from `[]`
+ * ("measured, nobody is owed"). Two paths used to cross that line silently.
+ */
+describe("fetchCodeownerRules fails closed on anything it did not read", () => {
+  const CODEOWNERS = "docs/ @org/docs-team\n";
+
+  /** `execFileSync` surfaces gh's diagnostics on `stderr` as a Buffer. */
+  function ghError(stderr) {
+    return Object.assign(new Error("Command failed"), { stderr: Buffer.from(stderr) });
+  }
+
+  const notFound = () => ghError("gh: Not Found (HTTP 404)\n");
+  const blob = (text, encoding = "base64") =>
+    JSON.stringify({ encoding, content: Buffer.from(text).toString("base64") });
+
+  /** Answers by path, so precedence order is observable rather than assumed. */
+  function runner(byPath, calls = []) {
+    return (args) => {
+      const path = String(args.at(-1)).replace(/^repos\/[^/]+\/[^/]+\/contents\//, "");
+      calls.push(path);
+      const answer = byPath[path] ?? notFound;
+      if (typeof answer === "function") throw answer();
+      return answer;
+    };
+  }
+
+  it("falls through a 404 to the next location, in precedence order", () => {
+    const calls = [];
+    const rules = fetchCodeownerRules(
+      "Blockcast/paperclip",
+      runner({ CODEOWNERS: blob(CODEOWNERS) }, calls),
+    );
+    assert.deepEqual(calls, [".github/CODEOWNERS", "CODEOWNERS"]);
+    assert.equal(rules.length, 1);
+    assert.deepEqual(rules[0].owners, ["team:docs-team"]);
+  });
+
+  it("does NOT fall through a 5xx to a lower-precedence CODEOWNERS", () => {
+    // The whole point: a transient outage on `.github/CODEOWNERS` must not
+    // silently adopt `docs/CODEOWNERS`'s rules. Unreadable is not absent.
+    const calls = [];
+    const rules = fetchCodeownerRules(
+      "Blockcast/paperclip",
+      runner(
+        {
+          ".github/CODEOWNERS": () => ghError("gh: Internal Server Error (HTTP 500)\n"),
+          "docs/CODEOWNERS": blob("* @someone-else\n"),
+        },
+        calls,
+      ),
+    );
+    assert.equal(rules, null);
+    assert.deepEqual(calls, [".github/CODEOWNERS"]);
+  });
+
+  it("does NOT fall through a 403, and stops on a transport failure", () => {
+    for (const stderr of ["gh: Forbidden (HTTP 403)\n", "spawnSync gh ENOENT"]) {
+      assert.equal(
+        fetchCodeownerRules("r/r", runner({ ".github/CODEOWNERS": () => ghError(stderr) })),
+        null,
+      );
+    }
+  });
+
+  it("reads a >1 MB CODEOWNERS as unread, not as empty", () => {
+    // Blobs over 1 MB are not inlined: `content: ""` with `encoding: "none"`.
+    // That used to decode to "" and parse to [] -- "nobody is owed" -- which
+    // drops every outstanding request and releases every held PR at once.
+    const calls = [];
+    const rules = fetchCodeownerRules(
+      "Blockcast/paperclip",
+      runner({ ".github/CODEOWNERS": JSON.stringify({ encoding: "none", content: "" }) }, calls),
+    );
+    assert.equal(rules, null);
+    assert.notDeepEqual(rules, []);
+    assert.deepEqual(calls, [".github/CODEOWNERS"], "must not try a lower-precedence file either");
+  });
+
+  it("skips a directory at the path but still reads the next location", () => {
+    const rules = fetchCodeownerRules(
+      "r/r",
+      runner({
+        ".github/CODEOWNERS": JSON.stringify([{ name: "OWNERS" }]),
+        CODEOWNERS: blob(CODEOWNERS),
+      }),
+    );
+    assert.equal(rules.length, 1);
+  });
+
+  it("returns null when every location 404s, and when the body is not JSON", () => {
+    assert.equal(fetchCodeownerRules("r/r", runner({})), null);
+    assert.equal(fetchCodeownerRules("r/r", runner({ ".github/CODEOWNERS": "<html>" })), null);
+  });
+
+  it("identifies a 404 and nothing looser", () => {
+    assert.ok(isNotFoundGhError("gh: Not Found (HTTP 404)"));
+    assert.ok(!isNotFoundGhError("gh: Internal Server Error (HTTP 500)"));
+    // A 404 named only in prose is not a status; the caller must fail closed.
+    assert.ok(!isNotFoundGhError("Not Found"));
+    assert.ok(!isNotFoundGhError(undefined));
+  });
+});
+
+/**
  * PEN-3474. `reviewRequests` alone is not the gate the hold claims to be: it
  * holds on requests CODEOWNERS never implied, and on requests GitHub stopped
  * implying when the owned file left the diff and then never withdrew.
@@ -956,6 +1064,21 @@ describe("CODEOWNERS scoping of the owner hold", () => {
     // guard fired on the escaped dot and left the `*` as a regex quantifier.
     assert.ok(codeownersPatternToRegExp("a.b*").test("a.bc"));
     assert.ok(!codeownersPatternToRegExp("a.b*").test("axbc"));
+  });
+
+  it("confines an interior `**` to one segment and keeps an escaped `#` literal", () => {
+    // PEN-4919 (c). gitignore: "other consecutive asterisks are considered
+    // regular asterisks", so `a**b` must not cross `/` the way `.*` did.
+    assert.ok(codeownersPatternToRegExp("a**b").test("axxb"));
+    assert.ok(!codeownersPatternToRegExp("a**b").test("a/x/b"));
+    // The forms that ARE bounded by slashes keep spanning whole segments.
+    assert.ok(codeownersPatternToRegExp("a/**/b").test("a/x/y/b"));
+    assert.ok(codeownersPatternToRegExp("a/**").test("a/x/y"));
+
+    assert.equal(stripCodeownersComment("src/a\\#b @o   # trailing"), "src/a#b @o");
+    const [rule] = parseCodeowners("weird\\#name @kkroo\n");
+    assert.equal(rule.pattern, "weird#name");
+    assert.ok(rule.matcher.test("weird#name"));
   });
 
   it("applies LAST match wins per file, then unions across files", () => {
