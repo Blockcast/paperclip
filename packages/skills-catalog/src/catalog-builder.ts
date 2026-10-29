@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -211,7 +211,26 @@ export async function writeCatalogManifest(packageDir: string) {
 
   const generatedDir = path.join(packageDir, "generated");
   await fs.mkdir(generatedDir, { recursive: true });
-  await fs.writeFile(path.join(generatedDir, "catalog.json"), formatCatalogManifest(result.manifest), "utf8");
+
+  // Write to a sibling temp file and rename, rather than writing the destination in
+  // place. `fs.writeFile` truncates before it writes, so a concurrent reader can
+  // observe an empty or partial manifest and fail on `JSON.parse`. That is not
+  // hypothetical: `packaged-artifacts.test.ts` shells out to `build` (which runs
+  // this) whenever `dist/` is absent -- always true in CI -- while sibling tests in
+  // the same vitest project read `generated/catalog.json`. The torn read surfaces as
+  // `generated/catalog.json is missing or invalid: Unexpected end of JSON input`,
+  // plus a spurious "is stale" because `validateCatalog` then diffs the partial text.
+  // It ejected PR #3089 from the merge queue. `rename` within one directory is
+  // atomic, so a reader sees either the old manifest or the new one, never a torn one.
+  const manifestPath = path.join(generatedDir, "catalog.json");
+  const tempPath = path.join(generatedDir, `.catalog.json.${process.pid}.${randomUUID()}.tmp`);
+  try {
+    await fs.writeFile(tempPath, formatCatalogManifest(result.manifest), "utf8");
+    await fs.rename(tempPath, manifestPath);
+  } catch (error) {
+    await fs.rm(tempPath, { force: true });
+    throw error;
+  }
   return result;
 }
 
