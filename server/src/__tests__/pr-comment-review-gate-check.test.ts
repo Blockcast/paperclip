@@ -736,6 +736,97 @@ describe("runPrCommentReviewGateCheck", () => {
       );
     });
 
+    it("does not adopt a peer's carried red that a distinct author's attestation clears", async () => {
+      // Ally's review of #3091. The author-blind pass is NOT sufficient for a
+      // peer: `carried_finding` comes back with `authorUnknown` when an at-head
+      // attestation exists but the author is unread, and a DISTINCT author
+      // clears that carry outright. Adopting it would publish, onto a shared
+      // head, a red the peer's own evaluation would never publish — and the
+      // peer's next webhook would flip it back, so the gate would oscillate
+      // with webhook order. The mirror image of the bypass, reachable the same
+      // cheap way.
+      mockListOpenPrsAtHead.mockResolvedValue({ pullRequests: [PROBE_PR, VICTIM_PR] });
+      mockFetchPrAuthor.mockResolvedValue("some-contributor");
+      mockListReviews.mockImplementation(async ({ prNumber }: { prNumber: number }) =>
+        prNumber === VICTIM_PR.number
+          ? [blockingCommentFor("0".repeat(40)), cleanCommentFor(TARGET.headSha)]
+          : [],
+      );
+      mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
+
+      await expect(
+        runPrCommentReviewGateCheck({ ...TARGET, prNumber: PROBE_PR.number, prUrl: PROBE_PR.url }),
+      ).resolves.toMatchObject({ posted: true, verdict: { state: "success" } });
+      expect(mockFetchPrAuthor).toHaveBeenCalledWith({
+        repoFullName: TARGET.repoFullName,
+        prNumber: VICTIM_PR.number,
+      });
+      expect(mockPostStatus).toHaveBeenCalledWith(
+        expect.objectContaining({ state: "success", targetUrl: PROBE_PR.url }),
+      );
+    });
+
+    it("still adopts a peer's carried red once the author is known not to clear it", async () => {
+      // The other half: same fixture, author IS the reviewer identity, so the
+      // attestation is self-attested and the carry stands. Without this the
+      // test above could be satisfied by never adopting a carried red at all.
+      mockListOpenPrsAtHead.mockResolvedValue({ pullRequests: [PROBE_PR, VICTIM_PR] });
+      mockFetchPrAuthor.mockResolvedValue("allyblockcast[bot]");
+      mockListReviews.mockImplementation(async ({ prNumber }: { prNumber: number }) =>
+        prNumber === VICTIM_PR.number
+          ? [blockingCommentFor("0".repeat(40)), cleanCommentFor(TARGET.headSha)]
+          : [],
+      );
+      mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
+
+      await expect(
+        runPrCommentReviewGateCheck({ ...TARGET, prNumber: PROBE_PR.number, prUrl: PROBE_PR.url }),
+      ).resolves.toMatchObject({
+        posted: true,
+        verdict: { state: "failure", outcome: "carried_finding" },
+      });
+      expect(mockPostStatus).toHaveBeenCalledWith(
+        expect.objectContaining({ state: "failure", targetUrl: VICTIM_PR.url }),
+      );
+    });
+
+    it("withholds rather than adopting when a peer's author cannot be read", async () => {
+      // The OPPOSITE call from the main path's on the same flag, deliberately.
+      // There an unresolved author leaves a PR's own red standing, because the
+      // author can only soften it. Here the red is not ours, so adopting it on
+      // an unread author paints this PR and the shared head red on evidence we
+      // could not confirm. The peer still publishes its own red if it has one.
+      mockListOpenPrsAtHead.mockResolvedValue({ pullRequests: [PROBE_PR, VICTIM_PR] });
+      mockFetchPrAuthor.mockResolvedValue(null);
+      mockListReviews.mockImplementation(async ({ prNumber }: { prNumber: number }) =>
+        prNumber === VICTIM_PR.number
+          ? [blockingCommentFor("0".repeat(40)), cleanCommentFor(TARGET.headSha)]
+          : [],
+      );
+      mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
+
+      await expect(
+        runPrCommentReviewGateCheck({ ...TARGET, prNumber: PROBE_PR.number, prUrl: PROBE_PR.url }),
+      ).resolves.toEqual({ posted: false, reason: "fetch_failed" });
+      expect(mockPostStatus).not.toHaveBeenCalled();
+    }, 10_000);
+
+    it("spends no author fetch on a peer whose red the author cannot change", async () => {
+      // A plain at-head `blocking_finding` carries no `authorUnknown`, so the
+      // sweep must adopt it without a `GET /pulls/{n}` — the cost guard for the
+      // route the fix above added.
+      mockListOpenPrsAtHead.mockResolvedValue({ pullRequests: [PROBE_PR, VICTIM_PR] });
+      mockListComments.mockImplementation(async ({ prNumber }: { prNumber: number }) =>
+        prNumber === VICTIM_PR.number ? [blockingCommentFor(TARGET.headSha)] : [],
+      );
+      mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
+
+      await expect(
+        runPrCommentReviewGateCheck({ ...TARGET, prNumber: PROBE_PR.number, prUrl: PROBE_PR.url }),
+      ).resolves.toMatchObject({ posted: true, verdict: { state: "failure" } });
+      expect(mockFetchPrAuthor).not.toHaveBeenCalled();
+    });
+
     it("ignores a peer whose head is a different commit", async () => {
       // The enumeration endpoint returns every PR the commit is associated
       // with, including ones that merely contain it. A review of a LATER head

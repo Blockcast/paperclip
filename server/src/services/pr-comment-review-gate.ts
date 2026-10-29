@@ -2230,12 +2230,18 @@ async function executeCommentReviewGateCheck(
         // Same refusal, same reason: an unreadable peer is not a clean one.
         if (peerComments == null) return { posted: false, reason: "fetch_failed" };
 
-        // Author-blind, and that is sufficient HERE where only a `failure` can
-        // change the outcome: this module's own ordering note above records that
-        // every red outcome stands on the comment surfaces alone, and the author
-        // login separates `clean` from `not_evaluated` — two outcomes that are
-        // both `success` and both lose to our own `success` anyway. So the peer
-        // sweep never spends a `GET /pulls/{n}` on an author it cannot use.
+        // Author-blind FIRST, mirroring the main path's ordering and for the
+        // same reason. It is NOT sufficient on its own, and the cheap-looking
+        // claim that it is — "every red stands on the comment surfaces alone" —
+        // is false for exactly one outcome: `carried_finding` can come back
+        // with `authorUnknown`, and a DISTINCT author's at-head attestation
+        // clears that carry outright (`evaluateCommentReviewGate` says so where
+        // it sets the flag). Adopting such a red would publish, onto a shared
+        // head, a verdict the peer's own evaluation would never publish — the
+        // mirror image of the bypass this sweep exists to close, and reachable
+        // the same cheap way. So the author is read on precisely that route,
+        // below, and nowhere else.
+        let peerLane: string | null = null;
         let peerVerdict = evaluateCommentReviewGate({
           comments: peerComments,
           headSha,
@@ -2253,7 +2259,7 @@ async function executeCommentReviewGateCheck(
           peerVerdict.state === "success" &&
           peerComments.some((comment) => allyVerdictReviewerLane(comment.body) !== null)
         ) {
-          const peerLane = await resolveAuthorLane();
+          peerLane = await resolveAuthorLane();
           if (peerLane) {
             peerVerdict = evaluateCommentReviewGate({
               comments: peerComments,
@@ -2263,6 +2269,35 @@ async function executeCommentReviewGateCheck(
               prAuthorLane: peerLane,
             });
           }
+        }
+
+        // The one route where a peer's red is not yet supported by the
+        // evidence. `authorUnknown` marks a verdict the author could still
+        // change, and on a `failure` that means `carried_finding` whose carry a
+        // distinct author's at-head attestation would clear. Resolve it before
+        // adopting, with the lane the pass above actually used.
+        if (peerVerdict.state === "failure" && "authorUnknown" in peerVerdict && peerVerdict.authorUnknown) {
+          const peerAuthorLogin = await withBoundedRetry(
+            () => githubFetchPrAuthorLogin({ repoFullName: input.repoFullName, prNumber: peer.number }),
+            (login) => login == null,
+          );
+          // Refuse rather than adopt, and note this is the OPPOSITE call from
+          // the main path's on the same flag. There, an unresolved author
+          // leaves a PR's own red standing, because the author can only soften
+          // it and a red going silent is the worse outcome. Here the red is not
+          // ours: adopting it on an unread author paints THIS pull request —
+          // and the shared head — red on evidence we could not confirm, with
+          // the peer's own evaluation free to disagree on its next webhook. The
+          // peer still publishes its own red if it genuinely has one, so
+          // withholding loses no signal and the next webhook re-evaluates.
+          if (!peerAuthorLogin) return { posted: false, reason: "fetch_failed" };
+          peerVerdict = evaluateCommentReviewGate({
+            comments: peerComments,
+            headSha,
+            reviewerBotLogin,
+            prAuthorLogin: peerAuthorLogin,
+            prAuthorLane: peerLane,
+          });
         }
 
         if (peerVerdict.state === "failure") {
