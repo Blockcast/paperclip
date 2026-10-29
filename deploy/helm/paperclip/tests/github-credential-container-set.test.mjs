@@ -133,9 +133,16 @@ const CREDENTIAL_MOUNT_RE = /^\/etc\/paperclip\/secrets\/github-[a-z0-9-]*token$
 // backstopped by `findServerOnlyEnvVarsInPodSpec`. Folding them in here would
 // merge two controls into one assertion and make a red ambiguous. This set is
 // part of the declared surface: adding to it is a decision, not a cleanup.
+//
+// An entry must name a Secret that ACTUALLY EXISTS, and the reason it is out
+// of scope must be the different control above — not merely that it looks
+// administrative. An exclusion for a name nothing uses excludes nothing today
+// and pre-approves a hole tomorrow: whoever later creates a Secret under that
+// exact name gets silence from this file instead of a red. Both entries here
+// are live `secretKeyRef` targets in the StatefulSet; a third was dropped on
+// #3103 for failing exactly this test.
 const NON_CREDENTIAL_GITHUB_SECRETS = new Set([
   "paperclip-github-app-creds",
-  "paperclip-github-app-key",
   "paperclip-github-webhook-secret",
 ]);
 
@@ -369,9 +376,21 @@ test("the matchers would fire on the shapes this test exists to reject", () => {
   assert.ok(!CREDENTIAL_MOUNT_RE.test("/var/lib/paperclip-github-broker"));
   // The enumerated exceptions: control-plane credentials covered by a
   // different control (see the header). Out of scope here, deliberately.
+  // Both are live `secretKeyRef` targets in the StatefulSet, so without the
+  // exception the exact-equality expectations below would red on them.
   assert.ok(!isCredentialSecretName("paperclip-github-app-creds"));
-  assert.ok(!isCredentialSecretName("paperclip-github-app-key"));
   assert.ok(!isCredentialSecretName("paperclip-github-webhook-secret"));
+  // `paperclip-github-app-key` WAS a third exception and is deliberately no
+  // longer one: no Secret by that name exists anywhere in the chart, the
+  // server, or either adapter, so the entry excluded nothing and pre-approved
+  // a hole — a Secret later created under that exact name would have been
+  // silently out of scope. It is a credential by default now, like any other
+  // unrecognised member of the family. The one place the name does appear
+  // outside this file is `inherit-allowlist.test.ts`, which uses it as the
+  // example of a server-only Secret that must NOT reach an agent — so
+  // excluding it here pointed the opposite way to the only stated intent for
+  // it. Raised by review on #3103.
+  assert.ok(isCredentialSecretName("paperclip-github-app-key"));
   // Not in the family at all.
   assert.ok(!isCredentialSecretName("gbrain-authbot-service-key"));
   assert.ok(!isCredentialSecretName("paperclip-githubbed-token"));

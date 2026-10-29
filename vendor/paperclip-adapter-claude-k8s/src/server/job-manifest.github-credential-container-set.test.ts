@@ -72,9 +72,16 @@ const CREDENTIAL_MOUNT_RE = /^\/etc\/paperclip\/secrets\/github-[a-z0-9-]*token$
 // backstopped by `findServerOnlyEnvVarsInPodSpec`. Folding them in here would
 // merge two controls into one assertion and make a red ambiguous. This set is
 // part of the declared surface: adding to it is a decision, not a cleanup.
+//
+// An entry must name a Secret that ACTUALLY EXISTS, and the reason it is out
+// of scope must be the different control above — not merely that it looks
+// administrative. An exclusion for a name nothing uses excludes nothing today
+// and pre-approves a hole tomorrow: whoever later creates a Secret under that
+// exact name gets silence from this file instead of a red. Both entries here
+// are live `secretKeyRef` targets in the StatefulSet; a third was dropped on
+// #3103 for failing exactly this test.
 const NON_CREDENTIAL_GITHUB_SECRETS = new Set([
   "paperclip-github-app-creds",
-  "paperclip-github-app-key",
   "paperclip-github-webhook-secret",
 ]);
 
@@ -427,9 +434,19 @@ describe("which agent-Job containers receive a github.com credential (PEN-4990 /
     // fall back on. Raised by review on #3103.
     expect(isCredentialSecretName("paperclip-github-pat")).toBe(true);
     // The enumerated exceptions: control-plane credentials covered by a
-    // different control (see the header).
+    // different control (see the header). Both are live `secretKeyRef`
+    // targets in the StatefulSet, so without the exception the exact-equality
+    // expectations would red on them.
     expect(isCredentialSecretName("paperclip-github-app-creds")).toBe(false);
     expect(isCredentialSecretName("paperclip-github-webhook-secret")).toBe(false);
+    // `paperclip-github-app-key` WAS a third exception and is deliberately no
+    // longer one: no Secret by that name exists in the chart, the server, or
+    // either adapter, so it excluded nothing and pre-approved a hole. The one
+    // place the name appears outside these files is `inherit-allowlist.test.ts`,
+    // which uses it as the example of a server-only Secret that must NOT reach
+    // an agent — the opposite of the only stated intent for it. It is a
+    // credential by default now. Raised by review on #3103.
+    expect(isCredentialSecretName("paperclip-github-app-key")).toBe(true);
     expect(isCredentialSecretName("gbrain-authbot-service-key")).toBe(false);
     // The broker's socket and private scratch carry "github" and are not
     // credentials; matching them would flag every brokered pod as a widening.
