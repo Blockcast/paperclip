@@ -168,3 +168,76 @@ describe("resolveServerGitInvocation", () => {
     expect(resolved.command).toBe("git");
   });
 });
+
+// PEN-4979. The pin above is justified by server code not publishing. That was
+// held in a code comment and by convention only: two of the three call sites
+// (`runGit`, `recordGitOperation`) take arbitrary args, so a future caller
+// passing `push` would have got a path that is past both the agent egress
+// wrapper and the pre-push hook, authenticated unprompted by the system
+// credential helper, with nothing failing. These assertions are the reason that
+// comment may now point at code; deleting the check must fail CI.
+describe("resolveServerGitInvocation refuses to build a publishing invocation", () => {
+  const paths = () => ({ gitBinary: fakeGit, credentialHelper: fakeHelper });
+
+  it.each(["push", "send-pack", "http-push"])("refuses `git %s`", (verb) => {
+    expect(() => resolveServerGitInvocation([verb, "origin", "HEAD"], paths())).toThrow(/refusing to build/);
+  });
+
+  it("refuses a publishing verb hidden behind global options, not just args[0]", () => {
+    // Located with the shim's own `gitGlobalOptions`, so `-c` pairs are skipped
+    // the way git skips them. Reading `args[0]` would pass this straight through.
+    expect(() => resolveServerGitInvocation(["-c", "http.sslVerify=false", "push"], paths())).toThrow(
+      /refusing to build/,
+    );
+    expect(() => resolveServerGitInvocation(["-C", "/srv/repo", "push"], paths())).toThrow(/refusing to build/);
+  });
+
+  it("refuses under the PAPERCLIP_SERVER_GIT override too", () => {
+    // The invariant is about what this module asks git to DO, not which binary
+    // runs it, so the test seam must not become a way around the check.
+    process.env.PAPERCLIP_SERVER_GIT = fakeGit;
+    expect(() => resolveServerGitInvocation(["push"], paths())).toThrow(/refusing to build/);
+  });
+
+  it("names the pin and the remedy, so the refusal is not read as a tooling gap", () => {
+    // A bare "not allowed" invites the wrong fix (widen the list). The message
+    // has to say why the path is unguarded and where a real publish belongs.
+    expect(() => resolveServerGitInvocation(["push"], paths())).toThrow(/pre-push hook/);
+    expect(() => resolveServerGitInvocation(["push"], paths())).toThrow(/credential helper/);
+  });
+
+  it("still admits every verb the server actually runs, submodule repair included", () => {
+    // The point of the pin (BLO-41987). `submodule` is deliberately absent from
+    // the agent door's allowlist, which is why this door decides with the
+    // DENYLIST instead -- deciding here with `isNonPublishingGitVerb` would
+    // refuse the one operation the pin exists to perform. This case is what
+    // fails if someone "tightens" it to the allowlist for symmetry.
+    const serverVerbs = [
+      ["submodule", "sync", "--recursive"],
+      ["submodule", "update", "--init"],
+      ["fetch", "--prune", "origin"],
+      ["worktree", "add", "-b", "b", "/tmp/w", "HEAD"],
+      ["checkout", "-B", "b", "HEAD"],
+      ["merge-base", "--is-ancestor", "a", "b"],
+      ["rev-parse", "HEAD"],
+      ["reset", "--hard", "HEAD"],
+      ["branch", "-d", "b"],
+      ["commit", "-m", "m"],
+      ["add", "-A"],
+      ["status"],
+      ["config", "user.name"],
+      ["remote", "-v"],
+      ["rev-list", "--count", "HEAD"],
+      ["show-ref", "--verify", "refs/heads/b"],
+      ["symbolic-ref", "HEAD"],
+    ];
+    for (const args of serverVerbs) {
+      expect(() => resolveServerGitInvocation(args, paths()), args.join(" ")).not.toThrow();
+    }
+  });
+
+  it("leaves an argv with no subcommand to git rather than inventing a verdict", () => {
+    expect(() => resolveServerGitInvocation([], paths())).not.toThrow();
+    expect(() => resolveServerGitInvocation(["--version"], paths())).not.toThrow();
+  });
+});
