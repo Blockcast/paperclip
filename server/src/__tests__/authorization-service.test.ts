@@ -4685,6 +4685,7 @@ describeEmbeddedPostgres("authorization service", () => {
       | "instance_admin"
       | "cloud_tenant_member"
       | "cloud_tenant_viewer"
+      | "cloud_tenant_support"
       | "assignee"
       | "unassigned"
       | "creator"
@@ -4715,7 +4716,7 @@ describeEmbeddedPostgres("authorization service", () => {
       let parentIssueId: string | null = null;
 
       switch (relation) {
-        // The four principal rows of the doc's grid. Their actor is a board
+        // The five principal rows of the doc's grid. Their actor is a board
         // user, not an agent; the target issue is the same assigned issue.
         case "local_board": {
           boardActor = { type: "board", userId: "local-board", source: "local_implicit" };
@@ -4729,14 +4730,25 @@ describeEmbeddedPostgres("authorization service", () => {
           break;
         }
         case "cloud_tenant_member":
-        case "cloud_tenant_viewer": {
+        case "cloud_tenant_viewer":
+        case "cloud_tenant_support": {
           const userId = `user-${randomUUID()}`;
+          // `support` is written verbatim into this column by the
+          // cloud-tenant provisioning path (`middleware/auth.ts`,
+          // `stackMembershipRole`) and is outside BOTH role enums — it is
+          // storable only because the column is unconstrained `text`, so it
+          // is inserted here as the raw string the provisioner writes.
+          const membershipRole = relation === "cloud_tenant_viewer"
+            ? "viewer"
+            : relation === "cloud_tenant_support"
+              ? "support"
+              : "member";
           await db.insert(companyMemberships).values({
             companyId: company.id,
             principalType: "user",
             principalId: userId,
             status: "active",
-            membershipRole: relation === "cloud_tenant_viewer" ? "viewer" : "member",
+            membershipRole,
           });
           boardActor = { type: "board", userId, companyIds: [company.id], source: "cloud_tenant" };
           break;
@@ -4948,6 +4960,24 @@ describeEmbeddedPostgres("authorization service", () => {
         ],
       },
       {
+        // PEN-3954 / PEN-4964, decided 2026-10-29 (owner: CTO). A cloud-tenant
+        // `support` principal gets READ, NOT WRITE — so this row must stay
+        // byte-identical to `cloud_tenant_viewer` above. It reached this
+        // decision through `normalizeHumanRole`'s `support -> viewer` branch,
+        // not through a membership row the UI can produce: `support` is
+        // absent from both role enums and is written only by the cloud-tenant
+        // provisioning path. Before that branch, the same principal was
+        // denied here, ADMITTED at the four HTTP write bars, and SEEDED
+        // `operator` grants by provisioning.
+        relation: "cloud_tenant_support",
+        note: "PEN-4964 — a cloud-tenant support principal is read-only, exactly like a viewer",
+        cells: [
+          { action: "issue:comment", allowed: false, reason: "deny_unsupported_action" },
+          { action: "issue:mutate", allowed: false, reason: "deny_unsupported_action" },
+          { action: "issue:coordination_metadata", allowed: false, reason: "deny_unsupported_action" },
+        ],
+      },
+      {
         relation: "assignee",
         note: "holds the issue, so it may rewrite every field — the escape hatch the model points managers at",
         cells: [
@@ -5105,9 +5135,9 @@ describeEmbeddedPostgres("authorization service", () => {
     it("covers every relation the model documents, in both directions", () => {
       // Guards against a row being deleted to make a failure go away, and
       // against a cell being dropped rather than fixed.
-      // 19 = the 17 rows of the doc's grid, with its parent-or-sibling and
+      // 20 = the 18 rows of the doc's grid, with its parent-or-sibling and
       // dependency-edge rows each modelled as two relations.
-      expect(MATRIX).toHaveLength(19);
+      expect(MATRIX).toHaveLength(20);
       for (const row of MATRIX) {
         expect(row.cells.map((cell) => cell.action), row.relation).toEqual([
           "issue:comment",

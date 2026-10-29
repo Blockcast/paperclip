@@ -1,32 +1,44 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
+import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Request } from "express";
 import { describe, expect, it } from "vitest";
 import { assertCompanyAccess } from "../routes/authz.js";
-import { normalizeHumanRole } from "../services/company-member-roles.js";
+import {
+  grantsForHumanRole,
+  membershipRoleIsNonViewer,
+  normalizeHumanRole,
+} from "../services/company-member-roles.js";
+import { ensureHumanRoleDefaultGrants } from "../services/principal-access-compatibility.js";
 
 /**
  * PEN-3954 — `company_memberships.membership_role` is a plain nullable `text`
- * column with no DB constraint, and the codebase reads it through THREE
- * dispositions that disagree with each other:
+ * column with no DB constraint, and the codebase used to read it through
+ * THREE dispositions that disagreed with each other:
  *
  *   1. `normalizeHumanRole(v, "viewer")` — fails CLOSED. `services/authorization.ts`
  *      (`membershipRoleIsNonViewer`) and `routes/authz.ts` (`normalizedTranscriptRole`).
  *   2. `normalizeHumanRole(v, "operator")` — PRIVILEGED. The provisioning path
  *      (`services/principal-access-compatibility.ts`), `resolveHumanInviteRole`
  *      and four sites in `routes/access.ts`.
- *   3. raw `=== "viewer"` — fails OPEN. The two write bars in `routes/authz.ts`
+ *   3. raw `=== "viewer"` — failed OPEN. The two write bars in `routes/authz.ts`
  *      and the two in `routes/tool-access.ts` / `routes/tool-gateway.ts`.
  *
  * Two values reach those bars from outside `HUMAN_COMPANY_MEMBERSHIP_ROLES`:
  * `null` (accepted explicitly by `updateCompanyMemberSchema` and written
  * straight through by the member-update path) and `support` (written verbatim
  * by the cloud-tenant path in `middleware/auth.ts` — only `owner`/`admin`
- * collapse to `owner`).
+ * collapse to `owner`). `support` is absent from the wider storable
+ * `COMPANY_MEMBERSHIP_ROLES` too; the write only succeeds because the column
+ * is unconstrained `text`.
  *
- * This suite closes the `null` half and PINS the `support` half as the open
- * question it still is. The two halves are deliberately separated: `null` has
- * no entitlement question behind it, `support` does.
+ * BOTH halves are now closed. The `null` half had no entitlement question
+ * behind it. The `support` half did, and PEN-4964 ruled it on 2026-10-29
+ * (owner: CTO): a cloud-tenant `support` principal gets READ, NOT WRITE.
+ *
+ * This suite pins all three dispositions AGREEING, which is the property the
+ * ticket was actually about — any one of them drifting back is a regression,
+ * and a regression in a different one each time is how this got to three.
  */
 
 function boardRequest(
@@ -75,26 +87,19 @@ describe("PEN-3954: membership_role at the HTTP write bars", () => {
       }
     });
 
-    it("denies a null role the same way the two tool bars already did", () => {
-      // `routes/tool-access.ts` and `routes/tool-gateway.ts` have carried
-      // `!membership.membershipRole ||` since before PEN-3954. The point of
-      // this change is that all four bars now spell the guard identically.
-      const toolAccess = readFileSync(
-        fileURLToPath(new URL("../routes/tool-access.ts", import.meta.url)),
-        "utf8",
-      );
-      const toolGateway = readFileSync(
-        fileURLToPath(new URL("../routes/tool-gateway.ts", import.meta.url)),
-        "utf8",
-      );
-      const authz = readFileSync(
-        fileURLToPath(new URL("../routes/authz.ts", import.meta.url)),
-        "utf8",
-      );
-      const guard = '!membership.membershipRole || membership.membershipRole === "viewer"';
-      expect(toolAccess).toContain(guard);
-      expect(toolGateway).toContain(guard);
-      expect(authz).toContain(guard);
+    it("routes the deny through the shared predicate, not a role literal", () => {
+      // `membershipRoleIsNonViewer` is THE write bar (Ally's Suggestion 1 on
+      // #2444). Asserting it directly means the four call sites are pinned by
+      // one property instead of four copies of a string comparison.
+      expect(membershipRoleIsNonViewer(null)).toBe(false);
+      expect(membershipRoleIsNonViewer(undefined)).toBe(false);
+      expect(membershipRoleIsNonViewer("viewer")).toBe(false);
+      expect(membershipRoleIsNonViewer("")).toBe(false);
+      // Controls: the predicate is not simply false for everything.
+      expect(membershipRoleIsNonViewer("operator")).toBe(true);
+      expect(membershipRoleIsNonViewer("member")).toBe(true);
+      expect(membershipRoleIsNonViewer("owner")).toBe(true);
+      expect(membershipRoleIsNonViewer("admin")).toBe(true);
     });
 
     it("keeps `member` and `viewer` behaving exactly as before", () => {
@@ -107,77 +112,140 @@ describe("PEN-3954: membership_role at the HTTP write bars", () => {
   });
 
   /**
-   * CHARACTERIZATION — these assert what the code does TODAY, not what it
-   * should do. `support` is the unresolved half of PEN-3954: the entitlement
-   * question ("what is a cloud-tenant support principal allowed to do?") is
-   * routed to the CTO and is NOT settled by this suite.
+   * PEN-4964, decided 2026-10-29, owner CTO: a cloud-tenant `support`
+   * principal gets READ, NOT WRITE.
    *
-   * When that decision lands, these two assertions are the diff. If `support`
-   * becomes read-only, the first flips to `.toThrow()` and the second's
-   * fallback changes. Do not "fix" them in passing — flipping them without
-   * the provisioning seed in `ensureHumanRoleDefaultGrants` just relocates the
-   * disagreement onto the provisioning path, which is the whole reason this
-   * was split out of #2444.
+   * Two of these were CHARACTERIZATION tests until that ruling — they
+   * recorded three layers giving three different answers. They are now the
+   * ruling itself. The implementation is ONE branch (`support -> viewer` in
+   * `normalizeHumanRole`) plus the four converted bars, so the layers move
+   * together; asserting each layer separately is what makes a partial revert
+   * visible rather than silently half-applied.
    */
-  describe("support membership_role: the three dispositions still disagree (OPEN)", () => {
-    it("is ADMITTED at the HTTP write bar (disposition 3, fails open)", () => {
+  describe("support membership_role is read-only (PEN-4964)", () => {
+    it("is DENIED at the HTTP write bar, with a control allow and a control read", () => {
       expect(() => assertCompanyAccess(boardRequest("POST", "support"), "company-1"))
+        .toThrow(/read-only/i);
+
+      // Control: the bar is not refusing every cloud-tenant write.
+      expect(() => assertCompanyAccess(boardRequest("POST", "operator"), "company-1"))
         .not.toThrow();
+      // Control: support keeps its READ. "Read, not write" is the ruling —
+      // if this starts throwing, the change went further than was decided.
+      for (const method of ["GET", "HEAD", "OPTIONS"]) {
+        expect(() => assertCompanyAccess(boardRequest(method, "support"), "company-1"))
+          .not.toThrow();
+      }
     });
 
-    it("is DENIED by the decider and SEEDED operator by provisioning (dispositions 1 and 2)", () => {
-      // Disposition 1 — `membershipRoleIsNonViewer` in services/authorization.ts.
+    it("normalizes to viewer under EVERY fallback, which is what makes the layers agree", () => {
+      // Disposition 1 — the fail-closed bars. Unchanged by the ruling.
       expect(normalizeHumanRole("support", "viewer")).toBe("viewer");
-      // Disposition 2 — `ensureHumanRoleDefaultGrants` seeds grantsForHumanRole(this).
-      expect(normalizeHumanRole("support", "operator")).toBe("operator");
-      // The disagreement, stated as one assertion so it cannot be read past:
+      // Disposition 2 — the provisioning seed. This is the one that moved:
+      // it used to fall through to the `operator` fallback.
+      expect(normalizeHumanRole("support", "operator")).toBe("viewer");
+      // Stated as one assertion so a partial revert cannot be read past: the
+      // two dispositions that disagreed now return the same value.
       expect(normalizeHumanRole("support", "viewer"))
-        .not.toBe(normalizeHumanRole("support", "operator"));
+        .toBe(normalizeHumanRole("support", "operator"));
+      // Control: the fallback still works for a value with no branch, so the
+      // agreement above is `support`'s explicit branch and not a dead
+      // parameter.
+      expect(normalizeHumanRole("nonsense-role", "viewer")).toBe("viewer");
+      expect(normalizeHumanRole("nonsense-role", "operator")).toBe("operator");
+      // Control: `member` still folds UP to operator. The ruling narrowed
+      // `support` only.
+      expect(normalizeHumanRole("member", "viewer")).toBe("operator");
+    });
+
+    it("seeds a support row NO grants — and writes nothing at all, so it revokes nothing", async () => {
+      // `grantsForHumanRole("viewer")` is empty, so
+      // `insertMissingPrincipalGrants` returns before touching the database.
+      // That is load-bearing: the seed is insert-only
+      // (`onConflictDoNothing`, no delete), so stopping it cannot take
+      // `tasks:assign` away from a support seat that already holds one.
+      // Existing seats lose write at the HTTP bar above, not here.
+      expect(grantsForHumanRole(normalizeHumanRole("support", "operator"))).toEqual([]);
+
+      const exploding = new Proxy({}, {
+        get(_target, property) {
+          throw new Error(`ensureHumanRoleDefaultGrants touched db.${String(property)} for a support row`);
+        },
+      });
+      await expect(ensureHumanRoleDefaultGrants(exploding as never, {
+        companyId: "company-1",
+        principalId: "user-1",
+        membershipRole: "support",
+        grantedByUserId: null,
+      })).resolves.toBe(0);
+
+      // Control: an operator row DOES reach the database, so the assertion
+      // above is about `support` and not about the proxy never being called.
+      await expect(ensureHumanRoleDefaultGrants(exploding as never, {
+        companyId: "company-1",
+        principalId: "user-1",
+        membershipRole: "operator",
+        grantedByUserId: null,
+      })).rejects.toThrow(/touched db\./);
+    });
+
+    it("stays OUT of the role enums — the decision was read-side normalization, not a new role", async () => {
+      // Adding `support` to `HUMAN_COMPANY_MEMBERSHIP_ROLES` was considered
+      // and REJECTED on PEN-4964: it would make it a selectable UI role in
+      // every tenant and in the public plugin SDK to fix an authz bug in one
+      // deployment mode. It is absent from the wider storable set too, which
+      // is why `middleware/auth.ts` can only write it into an unconstrained
+      // `text` column.
+      const shared = await import("@paperclipai/shared");
+      expect(shared.HUMAN_COMPANY_MEMBERSHIP_ROLES).not.toContain("support");
+      expect(shared.COMPANY_MEMBERSHIP_ROLES).not.toContain("support");
     });
   });
 
   /**
-   * Ally's Suggestion 1 on #2444, in the form that is executable TODAY.
+   * Ally's Suggestion 1 on #2444, now in the form it was originally asked
+   * for. While the four bars had to stay raw this could only pin a CENSUS —
+   * the exact per-file count — because a lint forbidding the pattern
+   * outright could not pass. With all four converted the invariant is the
+   * strong one: the comparison does not appear in server code at all.
    *
-   * A lint that forbids raw `=== "viewer"` outright cannot pass while the
-   * four bars are still raw, and they must stay raw until the `support`
-   * decision lands. So instead this pins the CENSUS: the exact set of files
-   * carrying a raw bar, and how many each has. A FIFTH disposition cannot
-   * appear without failing here, which is the invariant the suggestion was
-   * actually after.
-   *
-   * When `support` is decided and the bars are converted, delete the entries
-   * rather than bumping the numbers.
+   * A new call site must go through `membershipRoleIsNonViewer`. Re-spelling
+   * the comparison is what produced three disagreeing dispositions out of one
+   * question, and the disagreement was invisible precisely because each site
+   * read correct on its own.
    */
-  it("pins the census of raw `=== \"viewer\"` comparisons so a new one fails CI", () => {
-    const expected: Record<string, number> = {
-      // The `onBehalfOf` write bar and the `assertCompanyAccess` board write
-      // bar. Both now also deny `null`; both still admit `support`.
-      "routes/authz.ts": 2,
-      "routes/tool-access.ts": 1,
-      "routes/tool-gateway.ts": 1,
-    };
+  it("admits no raw `=== \"viewer\"` comparison anywhere in server code", () => {
+    const root = fileURLToPath(new URL("..", import.meta.url));
+    const offenders: string[] = [];
 
-    const actual: Record<string, number> = {};
-    for (const relative of Object.keys(expected)) {
-      const source = readFileSync(
-        fileURLToPath(new URL(`../${relative}`, import.meta.url)),
-        "utf8",
-      );
-      // Count CODE lines only. The comments beside these bars quote the
-      // pattern they are documenting, and a prose mention must not read as a
-      // new bar. Dropping comments can only ever undercount a mention, never
-      // hide a real comparison — a live bar is not a comment line.
-      actual[relative] = source
-        .split("\n")
-        .filter((line) => {
+    const walk = (dir: string) => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const full = join(dir, entry.name);
+        if (entry.isDirectory()) {
+          // `__tests__` is excluded on purpose: a test asserting on the old
+          // behaviour must still be able to name the pattern it is about.
+          if (entry.name === "__tests__" || entry.name === "node_modules") continue;
+          walk(full);
+          continue;
+        }
+        if (!entry.name.endsWith(".ts")) continue;
+        const source = readFileSync(full, "utf8");
+        source.split("\n").forEach((line, index) => {
           const trimmed = line.trim();
-          return !trimmed.startsWith("//") && !trimmed.startsWith("*");
-        })
-        .filter((line) => line.includes('=== "viewer"'))
-        .length;
-    }
+          // Count CODE lines only. The comments beside the converted bars
+          // quote the pattern they are documenting, and prose must not read
+          // as a live bar. Dropping comment lines can only undercount a
+          // mention, never hide a real comparison — a live bar is not a
+          // comment line.
+          if (trimmed.startsWith("//") || trimmed.startsWith("*") || trimmed.startsWith("/*")) return;
+          if (line.includes('=== "viewer"')) {
+            offenders.push(`${relative(root, full)}:${index + 1}`);
+          }
+        });
+      }
+    };
+    walk(root);
 
-    expect(actual).toEqual(expected);
+    expect(offenders).toEqual([]);
   });
 });

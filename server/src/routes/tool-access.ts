@@ -2,6 +2,7 @@ import { Router, type Request } from "express";
 import type { Db } from "@paperclipai/db";
 import { agents, companies } from "@paperclipai/db";
 import { eq } from "drizzle-orm";
+import { membershipRoleIsNonViewer } from "../services/company-member-roles.js";
 import {
   TOOL_APP_GALLERY,
   TOOL_ACTION_REQUEST_STATUSES,
@@ -207,7 +208,9 @@ export function toolAccessRoutes(
     if (!membership || membership.status !== "active") {
       throw forbidden("User does not have active company access");
     }
-    if (!membership.membershipRole || membership.membershipRole === "viewer") {
+    // PEN-3954 — the shared write bar, not a raw role comparison. Denies
+    // `viewer`, `null`, and `support` (ruled read-only on PEN-4964).
+    if (!membershipRoleIsNonViewer(membership.membershipRole)) {
       throw forbidden("Viewer access is read-only");
     }
   }
