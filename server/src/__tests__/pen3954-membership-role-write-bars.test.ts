@@ -3,6 +3,7 @@ import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Request } from "express";
 import { describe, expect, it } from "vitest";
+import { HttpError } from "../errors.js";
 import { assertCompanyAccess } from "../routes/authz.js";
 import {
   grantsForHumanRole,
@@ -57,6 +58,65 @@ function boardRequest(
       memberships: [{ companyId: "company-1", membershipRole, status }],
     },
   } as unknown as Request;
+}
+
+/**
+ * The OTHER bar in `routes/authz.ts`. `assertCompanyAccess` holds two
+ * independent membership tests — this one for an agent acting on behalf of a
+ * responsible user, and the board one above — and before PEN-3954 each
+ * spelled the role question with its own raw comparison. They now call the
+ * same predicate, but "same predicate" is a structural claim; this helper is
+ * what lets the suite make the BEHAVIOURAL one at the second bar too.
+ */
+function onBehalfOfRequest(
+  method: string,
+  membershipRole: string | null,
+  status = "active",
+): Request {
+  return {
+    method,
+    actor: {
+      type: "agent",
+      source: "agent_jwt",
+      agentId: "agent-1",
+      companyId: "company-1",
+      onBehalfOfUserId: "user-1",
+      onBehalfOfMemberships: [{ companyId: "company-1", membershipRole, status }],
+    },
+  } as unknown as Request;
+}
+
+/**
+ * The `onBehalfOf` bar degrades to log-only when shadow mode is on, so a
+ * deny assertion is meaningless unless the mode is pinned off. Reading the
+ * ambient environment would make the test pass vacuously wherever the var
+ * happens to be set.
+ */
+function withResponsibleUserEnforcement<T>(run: () => T): T {
+  const previousShadow = process.env.PAPERCLIP_RESPONSIBLE_USER_AUTHZ_SHADOW;
+  const previousMode = process.env.PAPERCLIP_RESPONSIBLE_USER_AUTHZ_MODE;
+  delete process.env.PAPERCLIP_RESPONSIBLE_USER_AUTHZ_SHADOW;
+  delete process.env.PAPERCLIP_RESPONSIBLE_USER_AUTHZ_MODE;
+  try {
+    return run();
+  } finally {
+    if (previousShadow === undefined) delete process.env.PAPERCLIP_RESPONSIBLE_USER_AUTHZ_SHADOW;
+    else process.env.PAPERCLIP_RESPONSIBLE_USER_AUTHZ_SHADOW = previousShadow;
+    if (previousMode === undefined) delete process.env.PAPERCLIP_RESPONSIBLE_USER_AUTHZ_MODE;
+    else process.env.PAPERCLIP_RESPONSIBLE_USER_AUTHZ_MODE = previousMode;
+  }
+}
+
+function expectResponsibleUserWriteDenied(req: Request) {
+  try {
+    assertCompanyAccess(req, "company-1");
+  } catch (err) {
+    expect(err).toBeInstanceOf(HttpError);
+    expect((err as HttpError).status).toBe(403);
+    expect((err as HttpError).details).toMatchObject({ code: "RESPONSIBLE_USER_UNAUTHORIZED" });
+    return;
+  }
+  throw new Error("Expected a responsible-user company access denial");
 }
 
 describe("PEN-3954: membership_role at the HTTP write bars", () => {
@@ -203,6 +263,59 @@ describe("PEN-3954: membership_role at the HTTP write bars", () => {
   });
 
   /**
+   * Ally's Suggestion 2 on head `8deb1a75`: until now the behavioural cases
+   * all used `board` actors, so the `onBehalfOf` bar (`routes/authz.ts:107`)
+   * was covered only STRUCTURALLY — by the predicate assertions above. Both
+   * bars calling one predicate lowers that risk but does not close it: the
+   * two bars differ in how they deny (`throw` vs the shadow-mode log-only
+   * path) and in which membership list they read, and either of those could
+   * be rewired without the predicate changing at all.
+   */
+  describe("the onBehalfOf bar denies the same two values, behaviourally", () => {
+    it("denies a support responsible user on write, with an operator control", () => {
+      withResponsibleUserEnforcement(() => {
+        expectResponsibleUserWriteDenied(onBehalfOfRequest("PATCH", "support"));
+
+        // Control: the bar is not refusing every on-behalf-of write.
+        expect(() => assertCompanyAccess(onBehalfOfRequest("PATCH", "operator"), "company-1"))
+          .not.toThrow();
+      });
+    });
+
+    it("denies a null responsible-user role on write", () => {
+      withResponsibleUserEnforcement(() => {
+        expectResponsibleUserWriteDenied(onBehalfOfRequest("POST", null));
+      });
+    });
+
+    it("leaves reads alone at this bar too — read-only, not no-access", () => {
+      withResponsibleUserEnforcement(() => {
+        for (const role of ["support", null]) {
+          for (const method of ["GET", "HEAD", "OPTIONS"]) {
+            expect(() => assertCompanyAccess(onBehalfOfRequest(method, role), "company-1"))
+              .not.toThrow();
+          }
+        }
+      });
+    });
+
+    it("still degrades to log-only under shadow mode", () => {
+      // The deny above is real only because enforcement is on. Pinning the
+      // shadow path keeps the three tests above honest: if shadow mode ever
+      // became a no-op, they would pass for the wrong reason.
+      const previous = process.env.PAPERCLIP_RESPONSIBLE_USER_AUTHZ_SHADOW;
+      process.env.PAPERCLIP_RESPONSIBLE_USER_AUTHZ_SHADOW = "true";
+      try {
+        expect(() => assertCompanyAccess(onBehalfOfRequest("PATCH", "support"), "company-1"))
+          .not.toThrow();
+      } finally {
+        if (previous === undefined) delete process.env.PAPERCLIP_RESPONSIBLE_USER_AUTHZ_SHADOW;
+        else process.env.PAPERCLIP_RESPONSIBLE_USER_AUTHZ_SHADOW = previous;
+      }
+    });
+  });
+
+  /**
    * Ally's Suggestion 1 on #2444, now in the form it was originally asked
    * for. While the four bars had to stay raw this could only pin a CENSUS —
    * the exact per-file count — because a lint forbidding the pattern
@@ -214,9 +327,26 @@ describe("PEN-3954: membership_role at the HTTP write bars", () => {
    * question, and the disagreement was invisible precisely because each site
    * read correct on its own.
    */
-  it("admits no raw `=== \"viewer\"` comparison anywhere in server code", () => {
+  it("admits no raw comparison against the `viewer` literal anywhere in server code", () => {
     const root = fileURLToPath(new URL("..", import.meta.url));
     const offenders: string[] = [];
+    const sanctioned: string[] = [];
+
+    // Every spelling of the comparison, not just the one the four bars
+    // happened to use. Matching only `=== "viewer"` left `!== "viewer"` —
+    // the EXACT shape `membershipRoleIsNonViewer` itself is written in, and
+    // the one the `authorization.ts` docblock describes as the fail-open
+    // form — plus `== "viewer"` and `'viewer'` free to reappear. The source
+    // has none of those today, which is the moment to close them: the
+    // invariant is about a question being re-spelled, and a census that only
+    // knows one spelling is exactly the wrong shape for that.
+    const rawComparison = /[!=]==?\s*["']viewer["']|["']viewer["']\s*[!=]==?/;
+    // One comparison has to exist — the predicate's own body. It carries
+    // this marker so the census can tell the definition from a re-spelling.
+    // The marker alone is not enough to pass: `sanctioned` is asserted to be
+    // exactly one line, in `services/company-member-roles.ts`, below. Pasting
+    // it onto a second site fails just as loudly as leaving it off.
+    const allowMarker = "pen3954-census-allow";
 
     const walk = (dir: string) => {
       for (const entry of readdirSync(dir, { withFileTypes: true })) {
@@ -238,14 +368,20 @@ describe("PEN-3954: membership_role at the HTTP write bars", () => {
           // mention, never hide a real comparison — a live bar is not a
           // comment line.
           if (trimmed.startsWith("//") || trimmed.startsWith("*") || trimmed.startsWith("/*")) return;
-          if (line.includes('=== "viewer"')) {
-            offenders.push(`${relative(root, full)}:${index + 1}`);
-          }
+          if (!rawComparison.test(line)) return;
+          const where = `${relative(root, full)}:${index + 1}`;
+          if (line.includes(allowMarker)) sanctioned.push(where);
+          else offenders.push(where);
         });
       }
     };
     walk(root);
 
     expect(offenders).toEqual([]);
+    // The marker is a whitelist of exactly one, pinned to the file that
+    // defines the predicate. Asserting the count rather than merely ignoring
+    // marked lines is what keeps the marker from becoming an escape hatch.
+    expect(sanctioned).toHaveLength(1);
+    expect(sanctioned[0]).toMatch(/^services\/company-member-roles\.ts:\d+$/);
   });
 });
