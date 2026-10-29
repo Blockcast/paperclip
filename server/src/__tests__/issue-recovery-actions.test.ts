@@ -25,6 +25,7 @@ import {
   ISSUE_STATUSES,
   RESTORED_EXECUTION_EVIDENCE_LAG_MS,
   RESTORED_EXECUTION_WATERMARK_MIN_ADVANCE_MS,
+  renewedIssueMonitorMaxAttempts,
   type IssueStatus,
 } from "@paperclipai/shared";
 import {
@@ -3275,11 +3276,18 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       monitorNotes: "Provider usage quota reached; retry the original assignee at the provider reset time.",
     });
     expect(updatedIssue?.monitorNextCheckAt).toBeInstanceOf(Date);
+    // PEN-3803: this arm used to pass `maxAttempts: null`, relying on the
+    // arm-time validator never applying the scheduler's default ceiling. That
+    // escape is gone (an arm the scheduler would clear is now refused 422), and
+    // this call site has no error boundary, so the arm declares an explicit
+    // budget above the attempts already made instead. On a never-polled row
+    // that is exactly the fleet ceiling — same effective leash as before, now
+    // recorded on the policy where a reader can see it.
     expect(updatedIssue?.executionPolicy).toMatchObject({
       monitor: {
         serviceName: "AI provider quota",
         externalRef: runId,
-        maxAttempts: null,
+        maxAttempts: renewedIssueMonitorMaxAttempts(0),
         recoveryPolicy: "wake_owner",
       },
     });
@@ -3357,9 +3365,12 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
     expect(updatedIssue?.status).toBe("in_progress");
     expect(updatedIssue?.monitorNextCheckAt).toBeInstanceOf(Date);
+    // PEN-3803: the renewal is computed from the attempts this row has ALREADY
+    // made (seeded at 1 above), not from zero — that is what keeps the grant
+    // strictly above the count and therefore acceptable to the arm.
     expect(updatedIssue?.executionPolicy).toMatchObject({
       monitor: {
-        maxAttempts: null,
+        maxAttempts: renewedIssueMonitorMaxAttempts(1),
         externalRef: runId,
       },
     });

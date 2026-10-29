@@ -2,7 +2,13 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ComponentType }
 import { pickTextColorForPillBg } from "@/lib/color-contrast";
 import { issueStatusText } from "@/lib/status-colors";
 import { Link } from "@/lib/router";
-import { deriveOriginatingActor, type Issue, type IssueLabel } from "@paperclipai/shared";
+import {
+  DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
+  deriveOriginatingActor,
+  renewedIssueMonitorMaxAttempts,
+  type Issue,
+  type IssueLabel,
+} from "@paperclipai/shared";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { accessApi } from "../../api/access";
 import { agentsApi } from "../../api/agents";
@@ -1003,19 +1009,30 @@ export function IssueProperties({
     if (Number.isNaN(nextCheckAt.getTime())) return;
     const serviceName = monitorServiceInput.trim() || null;
     const carried = issue.executionPolicy?.monitor;
-    // BLO-40082: carry the two bounds forward, but drop one that is already
-    // spent. A board "Schedule" always sets `monitorExplicitlyUpdated`
+    // BLO-40082: carry the two bounds forward, but neutralise one that is
+    // already spent. A board "Schedule" always sets `monitorExplicitlyUpdated`
     // server-side (routes/issues.ts), and on that path
     // `applyIssueExecutionPolicyTransition` *throws* 422 "Monitor bounds are
     // already exhausted" rather than stripping them
     // (services/issue-execution-policy.ts). The dialog renders no control for
     // either field, so re-sending a lapsed `timeoutAt` or a `maxAttempts` the
     // monitor has already reached would leave the board unable to reset exactly
-    // the wedged monitors it exists to reset — the "omit `maxAttempts` when
-    // resetting a wedged monitor" path the monitor contract documents, and the
-    // BLO-18294 convergence-stall reset that requires a non-assignee actor.
-    // `null` is how you omit here: the server replaces the monitor wholesale and
-    // `exhaustedMonitorClearReason` reads both through `?? null`.
+    // the wedged monitors it exists to reset.
+    //
+    // PEN-3803: for `maxAttempts` the remedy used to be `null` — "omit it" —
+    // and that is no longer a remedy, because it never was one. Omitting only
+    // silenced the ARM: the scheduler applies `DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS`
+    // to every monitor at dispatch, so a board reset past the ceiling returned
+    // 200, rendered a live next-check, and was cleared without firing. The arm
+    // now refuses that, so the dialog has to say what it means: grant an
+    // explicit budget above the attempts already made. Two consequences worth
+    // keeping in view — the spent test must read the EFFECTIVE bound (a `null`
+    // `maxAttempts` still means 24, not "no limit"), and the grant is capped at
+    // the schema's `.max(100)`, so a row past that gets a loud 422 naming the
+    // remedy rather than a silent dead monitor.
+    //
+    // `timeoutAt` keeps the `null` treatment: nothing supplies a default for
+    // it, so omitting really does remove the bound.
     const attemptCount = issue.monitorAttemptCount ?? issue.executionState?.monitor?.attemptCount ?? 0;
     const timeoutAt = carried?.timeoutAt ?? null;
     const maxAttempts = carried?.maxAttempts ?? null;
@@ -1059,7 +1076,9 @@ export function IssueProperties({
       ...(timeoutAt && new Date(timeoutAt).getTime() <= Date.now() - MONITOR_BOUND_SKEW_MARGIN_MS
         ? { timeoutAt: null }
         : {}),
-      ...(maxAttempts !== null && maxAttempts <= attemptCount ? { maxAttempts: null } : {}),
+      ...((maxAttempts ?? DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS) <= attemptCount
+        ? { maxAttempts: renewedIssueMonitorMaxAttempts(attemptCount) }
+        : {}),
     });
     setMonitorOpen(false);
   };
