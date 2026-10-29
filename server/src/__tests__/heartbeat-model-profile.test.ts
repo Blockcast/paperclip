@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { mergeEnvironmentConfig } from "@paperclipai/adapter-utils";
 import {
   listAdapterModelProfiles,
   type AdapterModelProfileDefinition,
@@ -442,6 +443,105 @@ describe("mergeModelProfileAdapterConfig agent-scope-only top-level config bound
     expect(merged.dockerImage).toBe("docker:28-dind");
   });
 
+  // PEN-5027. The third composition key, and the one that reaches a REFUSAL
+  // rather than a weaker pod. `buildJobManifest` narrows the shared data
+  // volume by `subPath` only when the Job's claim is this server's own, and it
+  // throws outright rather than render a brokered pod on the broad fallback —
+  // so a foreign issue-scope claim fails every dispatch of a brokered agent at
+  // manifest build. That is the per-issue denial of service the gate key's own
+  // pin declines to create, reached by a different key.
+  it("does not let an issue adapter override supply a foreign data claim when the broker is on", () => {
+    const merged = mergeModelProfileAdapterConfig({
+      baseConfig: { enableGitHubPublishBroker: true },
+      modelProfile: { ...noProfile },
+      issueAdapterConfig: { workspaceVolumeClaim: "attacker-claim" },
+    });
+
+    expect(merged).not.toHaveProperty("workspaceVolumeClaim");
+  });
+
+  // Both directions, as everywhere else in this set. Replacing an agent-scoped
+  // claim is the denial of service; deleting one is a per-issue redirection of
+  // where the run's data lives, which is equally not an issue's to make.
+  it("does not let an issue adapter override replace or delete an agent-scoped data claim", () => {
+    const base = { enableGitHubPublishBroker: true, workspaceVolumeClaim: "paperclip-data" };
+    const replaced = mergeModelProfileAdapterConfig({
+      baseConfig: { ...base },
+      modelProfile: { ...noProfile },
+      issueAdapterConfig: { workspaceVolumeClaim: "attacker-claim" },
+    });
+    const deleted = mergeModelProfileAdapterConfig({
+      baseConfig: { ...base },
+      modelProfile: { ...noProfile },
+      issueAdapterConfig: { workspaceVolumeClaim: undefined },
+    });
+
+    expect(replaced.workspaceVolumeClaim).toBe("paperclip-data");
+    expect(deleted.workspaceVolumeClaim).toBe("paperclip-data");
+  });
+
+  it("does not let a model profile overlay change the data claim when the broker is on", () => {
+    const merged = mergeModelProfileAdapterConfig({
+      baseConfig: { enableGitHubPublishBroker: true, workspaceVolumeClaim: "paperclip-data" },
+      modelProfile: {
+        ...noProfile,
+        applied: "cheap",
+        configSource: "agent_runtime",
+        adapterConfig: { workspaceVolumeClaim: "profile-claim" },
+      },
+      issueAdapterConfig: null,
+    });
+
+    expect(merged.workspaceVolumeClaim).toBe("paperclip-data");
+  });
+
+  // PEN-5027 constraint 1, pinned as a property of the SITE rather than left
+  // as prose. The pin above discards an ISSUE-scope claim; an ENVIRONMENT-scope
+  // one must still win, because the environment's K8sRemoteSpec is the only
+  // legitimate writer of this key (see ui/src/lib/environment-form.ts and
+  // packages/shared/src/validators/environment.ts).
+  //
+  // It wins because of WHERE the guard sits: the environment overlay is applied
+  // DOWNSTREAM, by `mergeEnvironmentConfig` in the claude-k8s adapter's
+  // execute.ts, over the config this merge returns. Composing the two real
+  // functions in that order is what makes this a regression test — a future
+  // refactor that moves the pin below the environment overlay would silently
+  // break deployments whose data claim comes from their environment, and the
+  // unit tests on either function alone would both still pass.
+  it("still lets an environment-scope data claim win over the agent-scope pin", () => {
+    const merged = mergeModelProfileAdapterConfig({
+      baseConfig: { enableGitHubPublishBroker: true, workspaceVolumeClaim: "agent-claim" },
+      modelProfile: { ...noProfile },
+      issueAdapterConfig: { workspaceVolumeClaim: "attacker-claim" },
+    });
+    // execute.ts: mergeEnvironmentConfig(agentConfig, executionTarget.config).
+    const effective = mergeEnvironmentConfig(merged, { workspaceVolumeClaim: "paperclip-data" });
+    // A partially-populated K8sRemoteSpec must not clobber the agent value.
+    const partial = mergeEnvironmentConfig(merged, { workspaceVolumeClaim: null });
+
+    expect(merged.workspaceVolumeClaim).toBe("agent-claim");
+    expect(effective.workspaceVolumeClaim).toBe("paperclip-data");
+    expect(partial.workspaceVolumeClaim).toBe("agent-claim");
+  });
+
+  // The no-op proof for today's fleet, as an assertion rather than a claim:
+  // the gate is `false` on every agent, so every current render takes this
+  // branch and the overlay is honoured exactly as it was before PEN-5027.
+  //
+  // Scoped deliberately. With the broker off a foreign claim merely forgoes
+  // the subPath narrowing (a `claude_k8s.data_mount_broad_rw` warn, no throw),
+  // so there is no refusal to prevent — and whether an issue should be able to
+  // choose the data volume at all is a wider question this row does not answer.
+  it("leaves a data-claim override honoured when the broker is off", () => {
+    const merged = mergeModelProfileAdapterConfig({
+      baseConfig: { workspaceVolumeClaim: "paperclip-data" },
+      modelProfile: { ...noProfile },
+      issueAdapterConfig: { workspaceVolumeClaim: "issue-claim" },
+    });
+
+    expect(merged.workspaceVolumeClaim).toBe("issue-claim");
+  });
+
   // The composition pin is conditional on the AGENT-scope gate, and the
   // predicate mirrors the adapter's strict `asBoolean`. A non-boolean is not
   // "on" there, so it must not be "on" here — if the two drift, the
@@ -500,6 +600,7 @@ describe("mergeModelProfileAdapterConfig agent-scope-only top-level config bound
       enableGitHubPublishBroker: false,
       enableDocker: true,
       dockerImage: "d",
+      workspaceVolumeClaim: "c",
       model: "x",
       workspaceStrategy: { type: "git_worktree" },
       serviceAccountName: "sa",
@@ -512,6 +613,7 @@ describe("mergeModelProfileAdapterConfig agent-scope-only top-level config bound
       "enableGitHubPublishBroker",
       "enableDocker",
       "dockerImage",
+      "workspaceVolumeClaim",
     ]);
   });
 });
