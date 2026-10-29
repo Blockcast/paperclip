@@ -120,8 +120,12 @@ type InstrumentableResponse = Response & {
  * `error-handler.ts` at the moment it serves the 503, before the body is sent.
  *
  * Deliberately a no-op beyond the tag: nothing is incremented until the
- * response actually finishes, so a refusal the client never received is
- * counted on the `"0"` status exactly like any other abandoned response.
+ * response is done, and the increment then carries the SAME `status` label the
+ * parent counter computed -- `"0"` for a refusal the client never received,
+ * `"503"` for one it did. The shared label is what keeps the subset relation
+ * exact: without it an abandoned refusal would land in the subset while the
+ * parent recorded it on `"0"`, and `subset / parent{status="503"}` could
+ * exceed 1.
  */
 export function noteTransientDbResponse(res: Response, tag: TransientDbResponseTag): void {
   (res as InstrumentableResponse)[TRANSIENT_DB] = tag;
