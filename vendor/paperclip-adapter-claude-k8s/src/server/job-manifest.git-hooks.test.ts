@@ -5,9 +5,22 @@ import { buildJobManifest } from "./job-manifest.js";
 import type { SelfPodInfo } from "./k8s-client.js";
 
 // BLO-48361: the root overlay on narrowed runs hid the chart-seeded pre-push
-// hook, so the egress guard refused every push. The hook dir must reach the
-// pod read-only from `data`, while its `.local/share` siblings (the mkcert CA
-// key) stay behind the overlay.
+// hook, so the egress guard refused every push. The fix was to re-expose the
+// hook dir read-only from `data` while its `.local/share` siblings (the mkcert
+// CA key) stayed behind the overlay.
+//
+// PEN-4932 stage 3b-iii retires that fix by removing what it repaired: the hook
+// is baked into the agent image (`BAKED_HOOKS_DIR`) and `hooksDirectory()`
+// resolves there unconditionally, so the overlay hiding the PVC copy is no
+// longer an outage — it is the intended end state, and `ROOT_TOOLCHAIN_SUBPATHS`
+// is empty.
+//
+// This file is kept, inverted, rather than deleted. BLO-48361 cost 2h17m of
+// fleet-wide publishing and the seed's own success log stayed true throughout,
+// because the seed writes to the PVC and the Job pod sees an overlay. The
+// standing lesson is that this join is only ever visible from the MANIFEST, so
+// the manifest keeps a test — now asserting that neither path is reachable off
+// the shared volume, which is the state the push path actually depends on.
 
 const ctx: AdapterExecutionContext = {
   runId: "run-abc12345",
@@ -57,17 +70,21 @@ function deepestMount(mounts: k8s.V1VolumeMount[], target: string): k8s.V1Volume
   return best;
 }
 
-describe("pre-push hook on narrowed runs (BLO-48361)", () => {
-  it("exposes the hook dir read-only from data and keeps mkcert behind the overlay", () => {
+describe("pre-push hook on narrowed runs (BLO-48361, PEN-4932 stage 3b-iii)", () => {
+  it("binds nothing under .local/share off data — hook and mkcert both sit behind the overlay", () => {
     const { job } = buildJobManifest({ ctx, selfPod });
     const spec = job.spec?.template?.spec;
     expect(spec?.volumes?.find((v) => v.name === "root-overlay")?.emptyDir).toBeTruthy();
     for (const container of [spec?.containers[0], spec?.initContainers?.find((c) => c.name === "write-prompt")]) {
       const mounts = container?.volumeMounts ?? [];
-      const hook = deepestMount(mounts, "/paperclip/.local/share/paperclip-git-hooks/pre-push");
-      expect(hook?.name).toBe("data");
-      expect(hook?.readOnly).toBe(true);
+      expect(deepestMount(mounts, "/paperclip/.local/share/paperclip-git-hooks/pre-push")?.name).toBe(
+        "root-overlay",
+      );
       expect(deepestMount(mounts, "/paperclip/.local/share/mkcert/rootCA-key.pem")?.name).toBe("root-overlay");
+      // Stated on the subPath as well, not only through `deepestMount`: a bind
+      // re-added at a different mountPath would still put the hook back on the
+      // shared handle, and the resolution check above would not see it.
+      expect(mounts.some((m) => m.subPath === ".local/share/paperclip-git-hooks")).toBe(false);
     }
   });
 });

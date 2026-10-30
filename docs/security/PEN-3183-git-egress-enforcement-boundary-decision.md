@@ -27,7 +27,7 @@ built against this decision.
 | D2 | Image-side (root-owned runtime)? | **Done, and that is as far as image-side reaches.** PEN-3713 / #2185 closed bypasses 2 and 4. It cannot close bypass 1, and no further image work can — see §3. Do not re-open this as an option. |
 | D3 | Destination-side `pre-receive` hook? | **DECLINED — unavailable.** Pre-receive hooks are a GitHub Enterprise Server feature; these repositories are on github.com. The row asked for this to be confirmed before costing. It is confirmed, and it is the end of that option. |
 | D4 | Egress NetworkPolicy + scanning proxy? | **DEFERRED, and note that it converges on D1.** Any proxy permitted to push to GitHub must itself hold the credential, so it *is* the credential-holder design, plus a TLS-terminating git-pack parser. Build the credential half first: it is most of the benefit at a fraction of the cost and risk. |
-| D5 | The residual between now and D1 | **ACCEPTED, dated — and conditional.** Reviewed 2026-10-28; next review **2027-01-31**, or immediately on any trigger in §7.2. Accepted on the stated, *unmeasured* assumption that nothing in the fleet invokes `git` by absolute path (§4.0); the §8 count settles it and a non-zero result ends the acceptance. |
+| D5 | The residual between now and D1 | ⛔ **ACCEPTANCE ENDED 2026-10-29 — it does NOT run to 2027-01-31.** It was accepted on 2026-10-28, dated and conditional, on the stated *unmeasured* assumption that nothing in the fleet invokes `git` by absolute path (§4.0), with the §8 count to settle it and a non-zero result to end it. **The count was taken on 2026-10-29 and is 28** (PEN-4986 → PEN-4989), so **§7.2 trigger 4 has fired** and the condition the acceptance was granted under has failed. The residual itself is unchanged and still describes the deployed fleet — what ended is the *acceptance of it*. Read §7.1 and §7.2 before relying on this row; disposition is the CTO's, tracked on PEN-4989. |
 | D6 | *(correction of record)* | The row's evidence block, and the THREAT MODEL header in `github-git-egress-runtime.ts`, both describe a pod that no longer exists. Both are corrected by this change. |
 | D7 | Env-delivered credentials under the broker | **REFUSE to render, do not route** — decided 2026-10-29. The ruling: a Job that would place a GitHub credential in the agent container's `env` must **fail to build** rather than render a boundary that is not there. ⚠ That refusal is **not on master** at this writing — it is #3089 (PEN-4933), open; D7 decides which way that PR goes and asserts no existing control. Routing that credential *into* the broker stays reserved; §7.4 gives the grounds and the three conditions that would release it. |
 
@@ -169,10 +169,13 @@ reached via PATH, which is exactly the thing such a caller does not consult. A t
 or MCP server that hardcodes `/usr/bin/git` is therefore outside the accidental-disclosure control
 this guard exists to be, and nothing today reports that it happened.
 
-How much of that exists in the fleet is **unmeasured**. That measurement (§8) is consequently not a
-nice-to-have that could sharpen an urgency estimate: it is the one piece of evidence that bounds
-whether the *accidental* case — the case this control is actually for — is covered at all. It is
-load-bearing for §7.1 and it is named as an early trigger in §7.2.
+How much of that exists in the fleet was **unmeasured** when this decision was written. ⛔ **It has
+since been measured: 28, on 2026-10-29** (§7.1) — so the *accidental* case is **not** covered. That
+measurement (§8) was never a nice-to-have that could sharpen an urgency estimate: it is the one
+piece of evidence that bounds whether the *accidental* case — the case this control is actually
+for — is covered at all. It was load-bearing for §7.1 and named as an early trigger in §7.2, and
+that trigger has **fired**: the §7.1 acceptance is **ended as of 2026-10-29**, not running to
+2027-01-31.
 
 ### 4.1 One credential sits behind all three doors
 
@@ -1303,10 +1306,21 @@ Permitted without further security review:
   one this control exists for — is uncovered, falsifies the first ground of §7.1, and ends the
   §7.2 acceptance early rather than merely "raising urgency". A zero count leaves this decision
   unchanged and converts §7.1's stated assumption into a measured one.
-  ✅ **Taken 2026-10-29 (PEN-4986): zero.** See §7.1 and
-  [`PEN-4986-absolute-path-git-runtime-measurement.md`](./PEN-4986-absolute-path-git-runtime-measurement.md).
-  The tool is `scripts/measure-absolute-path-git.mjs`; re-take it on any agent-image or PATH
-  change, and note the result is one pod, so widening the population stays permitted here.
+  ⛔ **Taken 2026-10-29 (PEN-4986, widened PEN-4993 → PEN-4989): the count is 28, NOT zero — so
+  the non-zero branch above is the one that applies.** §7.2 trigger 4 has **fired** and the §7.1
+  acceptance is **ended as of 2026-10-29**. The first five windows returned zero; the sixth, an
+  Engineer pod running the repository's own test suite, returned 28. Widening along the *pod*
+  axis alone would have returned zero indefinitely — **workload** was the uncovered axis. The
+  mechanism is a **class, not a site**: any test or tool that builds its own narrowed `PATH` gets
+  an unwrapped `git` for free, and the known site is cross-repo
+  (`Blockcast/penstock-llm-proxy-core`), so a paperclip-only sweep reports it clean. Tracked as
+  **PEN-5012**. See §7.1 and
+  [`PEN-4986-absolute-path-git-runtime-measurement.md`](./PEN-4986-absolute-path-git-runtime-measurement.md),
+  whose own headline records the *first* window and says so — do not cite that document's "zero"
+  as the answer. The tool is `scripts/measure-absolute-path-git.mjs`; re-take it on any agent-image
+  or PATH change. ⚠ Re-taking it is still permitted here and is still only an observation — but
+  note that the measurement has already discharged its purpose, so a further re-take neither
+  revives the acceptance nor is required to end it.
 
 Not permitted without returning here first:
 

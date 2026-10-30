@@ -15,7 +15,6 @@ import path from "node:path";
 import type { ClaudePromptBundle } from "./prompt-cache.js";
 import { buildEnvGuardSetupShell } from "./env-guard.js";
 import { buildClaudeCodeRuntimeShell, buildImageWrapperPreflightShell, buildPrePushHookPreflightShell, claudeCodeRuntimeRoot, IMAGE_WRAPPER_BIN_DIR, resolveClaudeCodeVersion } from "./runtime-pin.js";
-import { GIT_HOOKS_SUBPATH } from "./github-git-hooks-path.js";
 import { buildPodLogRedactorSetupShell, POD_LOG_FILTER_ARG_VAR, POD_LOG_FILTER_VAR } from "./pod-log-redactor.js";
 import { SERVER_ONLY_ENV_DENY } from "./inherit-allowlist.js";
 import {
@@ -612,10 +611,11 @@ const SHARED_PNPM_STORE_SUBPATH = "instances/default/data/k8s-isolation/pnpm";
  * tree — every foreign company's `companies/`, `run-logs/`, `projects/` and
  * `k8s-isolation/`, plus `secrets/master.key`, `data/backups/` (DB dumps),
  * `.env`, `config.json` and `db/` — and the run's own subPath binds are
- * re-applied on top of it. The root overlay below re-exposes only the git-hooks
- * dir: PEN-4932 stage 3 dropped the six fleet-wide toolchain dirs it used to
- * re-expose alongside it. The overlay is rw only so the runtime can create
- * mountpoint dirs inside it for those binds; nothing persists past the pod.
+ * re-applied on top of it. The root overlay below now re-exposes NOTHING:
+ * PEN-4932 stage 3 dropped the six fleet-wide toolchain dirs, and 3b-iii dropped
+ * the git-hooks dir that outlived them. The overlay is rw only so the runtime
+ * can create mountpoint dirs inside it for the scoped binds; nothing persists
+ * past the pod.
  */
 const INSTANCE_ROOT_SUBPATH = "instances/default";
 const INSTANCE_OVERLAY_VOLUME_NAME = "instance-overlay";
@@ -629,10 +629,13 @@ const INSTANCE_OVERLAY_SIZE_LIMIT = "16Mi";
  * `ROOT_TOOLCHAIN_SUBPATHS` is re-exposed read-only. Measured 2026-10-21 from a
  * narrowed pod: HOME, XDG_* and CLAUDE_CONFIG_DIR are per-run, and the only root
  * references were PATH (`.local/bin`, `bin`) plus the symlink targets inside
- * those two dirs. PEN-4932 stage 3 dropped all of those, so that list is now the
- * git-hooks dir alone, and those PATH entries resolve into the rw overlay rather
- * than a read-only bind — see the note below. Allowlist, not denylist: the root
- * has ~440 entries and gains new `wt-*` dirs weekly.
+ * those two dirs. PEN-4932 stage 3 dropped all of those and 3b-iii dropped the
+ * git-hooks dir, so `ROOT_TOOLCHAIN_SUBPATHS` is now EMPTY and the root overlay
+ * hides the PVC root outright. Those PATH entries resolve into the rw overlay,
+ * and the binaries behind them are image-resident. Kept as an allowlist rather
+ * than collapsed to a bare overlay: the root has ~440 entries and gains new
+ * `wt-*` dirs weekly, so a re-add must be an explicit entry, never a denylist
+ * exception.
  */
 const ROOT_OVERLAY_VOLUME_NAME = "root-overlay";
 /** Where `seed-writable-dirs` mounts the `data` volume.
@@ -677,15 +680,42 @@ const AGENT_UID_GID = "1000:1000";
 // pre-creation into the `seed-writable-dirs` init container. Stage 4b provisions
 // the per-agent claims and sets `dataClaimName` to them.
 //
-// `.local/share/paperclip-git-hooks` stays, and is now the only entry. It holds
-// the PEN-3156 pre-push publish guard the image `git` wrapper points
-// core.hooksPath at; without it every push from a narrowed pod fails closed
-// (BLO-48361). Only that dir, never `.local/share`, which also holds mkcert's
-// CA key. It is a security control with a four-consumer join across two
-// repositories and a fail-OPEN failure mode — core.hooksPath aimed at an empty
-// directory means pushes succeed unscanned — so it is relocated into the image
-// under its own review (§3.6), not here.
-const ROOT_TOOLCHAIN_SUBPATHS = [GIT_HOOKS_SUBPATH];
+// Stage 3b-iii empties the list: `.local/share/paperclip-git-hooks`, the last
+// entry, is gone too, because §3.6's relocation of the PEN-3156 pre-push guard
+// INTO the image has landed and been verified in a running pod. Nothing on the
+// push path reads the PVC copy any more:
+//
+//   - `hooksDirectory()` returns `BAKED_HOOKS_DIR` unconditionally (#3126), and
+//     the agent `git` is a wrapper that execs the egress runtime, so there is no
+//     bare-`git` leg that could still consult the old path;
+//   - `PAPERCLIP_GIT_EGRESS_HOOKS_DIR` is a test-only override and is set by
+//     nothing in this repo or in the Job manifest.
+//
+// Measured 2026-10-30 inside a live agent pod on the fleet image (master tip,
+// bumped fleet-wide by `docker-agent.yml`): the installed
+// `@paperclipai/adapter-utils` returns `BAKED_HOOKS_DIR`, and
+// `/usr/local/libexec/paperclip/hooks/pre-push` is present, `root:root 0755`,
+// X_OK. That is the property the gate is on — not a tag and not a merge.
+//
+// The uid-1000 boundary the read-only bind used to provide is NOT dropped, it
+// moves to file ownership: the baked dir is `root:root 0755` in the image, so
+// the agent uid still cannot rewrite the code the publish broker's credential
+// holder executes. Ownership is the stronger form — it holds in the broad-mount
+// fallback too, where the read-only bind did not exist at all.
+//
+// Failure direction, per §3.6 (corrected): an absent or unreachable hook fails
+// CLOSED. `buildGitArgv` refuses before injecting `core.hooksPath` when no
+// executable `pre-push` is at the resolved dir, so the risk this change carries
+// is a fleet-wide push REFUSAL, never a silent unscanned publish. Watch the
+// preflight verdict across pods after the server rolls; revert this commit to
+// restore the bind. The Helm seed that writes the PVC copy is deliberately left
+// in place as that revert path — it is unmounted, not deleted, and removing it
+// is a separate change once this has soaked.
+//
+// Kept as an empty list rather than deleted: `rootMounts` below still needs the
+// root overlay, and a future re-add has a home with its own invariants (if any
+// entry comes back, re-add its whole symlink unit — see above).
+const ROOT_TOOLCHAIN_SUBPATHS: readonly string[] = [];
 
 function sharedPnpmStorePath(rawCompanyId: string, dataMountPath: string): string {
   const companyId = sanitizeForK8sPath(rawCompanyId);
@@ -3214,30 +3244,30 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // `seed-writable-dirs` creates every target, so nothing EACCESes. What it
   // CANNOT do is populate them.
   //
-  // Two of those targets are materialized by the SERVER, and only ever into the
-  // server's own volume, so on a foreign claim they come up EMPTY. Both fail in
-  // the safe direction, and both fail a long way from the cause:
+  // ONE target is materialized by the SERVER, and only ever into the server's
+  // own volume, so on a foreign claim it comes up EMPTY:
   //
-  //   `.local/share/paperclip-git-hooks` — the PEN-3156 pre-push guard the
-  //       image `git` wrapper aims core.hooksPath at. Empty means the preflight
-  //       refuses and every push from the pod fails closed (BLO-48361). Correct,
-  //       but it surfaces as a puzzling push refusal mid-run.
   //   `skills/<companyId>` — the company skill tree. Empty means the prompt
-  //       bundle's skill links dangle, which degrades silently.
+  //       bundle's skill links dangle, which degrades SILENTLY. That is the
+  //       dangerous direction, and it is now the only one left here.
   //
-  // Stage 4b must either materialize both into the per-agent claim or move them
-  // into the image (§3.6 already proposes the latter for the hooks dir). Say so
-  // here so the FIRST per-agent run reports the reason rather than the symptom.
+  // `.local/share/paperclip-git-hooks` used to be listed beside it and is not
+  // any more: stage 3b-iii emptied `ROOT_TOOLCHAIN_SUBPATHS`, so the Job does
+  // not mount it on ANY claim and there is nothing left for a per-agent claim to
+  // fail to populate. §3.6's relocation into the image closed it for good rather
+  // than moving it onto 4b's plate — which is what makes this list shorter by
+  // one real blocker rather than by an omission.
+  //
+  // Stage 4b must therefore materialize the skills tree into the per-agent claim
+  // or relocate it. Say so here so the FIRST per-agent run reports the reason
+  // rather than the symptom.
   if (narrowWritableSurface && !serverCanPreCreate) {
     console.warn(
       JSON.stringify({
         level: "warn",
         event: "claude_k8s.data_claim_foreign",
-        msg: "Job volume is not the server's own claim; server-materialized trees will be empty (git hooks fail closed, company skills missing)",
-        unpopulatedSubPaths: [
-          GIT_HOOKS_SUBPATH,
-          path.posix.join(INSTANCE_ROOT_SUBPATH, "skills", sanitizeForK8sPath(agent.companyId)),
-        ],
+        msg: "Job volume is not the server's own claim; server-materialized trees will be empty (company skills missing)",
+        unpopulatedSubPaths: [path.posix.join(INSTANCE_ROOT_SUBPATH, "skills", sanitizeForK8sPath(agent.companyId))],
         runId,
         jobName,
         dataClaimName,
@@ -3482,11 +3512,12 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     // root:root and would EACCES the server's own skill materializer later.
     ...(companySkillsMount?.subPath ? [companySkillsMount.subPath] : []),
   ];
-  // The read-only toolchain binds. They need only to EXIST — the kubelet would
-  // otherwise create them root:root, which is harmless for a readOnly mount but
-  // leaves an un-owned directory on the volume. Not chowned: nothing writes
-  // them, and the one surviving entry is the PEN-3156 pre-push hook, whose
-  // whole point is that uid 1000 cannot rewrite it.
+  // The read-only toolchain binds. Empty since stage 3b-iii, so this contributes
+  // nothing today — kept because the derivation, not the list, is the invariant:
+  // any entry re-added to `ROOT_TOOLCHAIN_SUBPATHS` must be pre-created so the
+  // kubelet does not leave an un-owned root:root directory on the volume, and
+  // must NOT be chowned, since a read-only bind the agent uid can rewrite is not
+  // a boundary.
   const readOnlySubPaths = rootMounts.flatMap((m) => (m.subPath ? [m.subPath] : []));
   // Gated on `serverCanPreCreate`, NOT on `narrowWritableSurface`. Since the
   // gate above was re-based, a narrowed Job may be running on a claim this
@@ -3909,14 +3940,18 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // not hold.
   //
   // The broker executes the PEN-3156 pre-push hook with the push credential in
-  // its environment. Under `narrowWritableSurface` that hook arrives as a
-  // read-only `subPath` bind (`ROOT_TOOLCHAIN_SUBPATHS` includes
-  // `GIT_HOOKS_SUBPATH`), so uid 1000 cannot rewrite the code the credential
-  // holder runs. Under the broad fallback the whole volume is mounted rw and
-  // it can — which turns the broker from a boundary into a longer path to the
-  // same token. The broker's `workspaceRoot` is `dataMountPath`, so the same
-  // leg also decides whether a request's `cwd` is confined to this run's
-  // workspace or to every agent's.
+  // its environment. That hook is now image-resident (`BAKED_HOOKS_DIR`,
+  // `root:root 0755`) rather than a read-only `subPath` bind, so the "uid 1000
+  // cannot rewrite the code the credential holder runs" leg holds on ownership
+  // and no longer depends on this gate at all — stage 3b-iii emptied
+  // `ROOT_TOOLCHAIN_SUBPATHS`.
+  //
+  // The throw stays, on its OTHER leg, which was always independent: the
+  // broker's `workspaceRoot` is `dataMountPath`, so this condition decides
+  // whether a request's `cwd` is confined to this run's workspace or to every
+  // agent's. Under the broad fallback the whole volume is mounted rw, which
+  // turns the broker from a boundary into a longer path to the same token. Do
+  // not relax this because the hook argument moved.
   //
   // Thrown, not skipped. Silently not rendering would leave the credential in
   // the agent container with the operator believing it had moved, and §7.2
