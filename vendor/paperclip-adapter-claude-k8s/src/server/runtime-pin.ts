@@ -474,13 +474,15 @@ export const PRE_PUSH_HOOK_PREFLIGHT_NOT_EXECUTABLE = `${PRE_PUSH_HOOK_PREFLIGHT
  *                     an `X_OK` access, so this refuses pushes exactly as
  *                     MASKED does — it is not a silent unscanned-publish. It
  *                     stays a separate verdict for what it sends the reader to
- *                     look at, not for a separate remedy: the bake delivered a
- *                     file and dropped its mode, which points at the image
- *                     build rather than at the mount. Since PEN-4932 the
- *                     remedy is MASKED's — this arm reads the image copy,
- *                     `root:root 0755` from `COPY --chmod=0755`, so no chmod
- *                     available to a uid-1000 pod can repair it and the image
- *                     has to roll forward. Before the repoint this path was
+ *                     look at, not for a separate remedy: the image carries the
+ *                     file without an executable mode, which points at the
+ *                     image build rather than at the mount. Since PEN-4932 the
+ *                     remedy is OFF-MOUNT's, roll the image forward — this arm
+ *                     reads the image copy, `root:root 0755` from
+ *                     `COPY --chmod=0755`, so no chmod available to a uid-1000
+ *                     pod can repair it. `MASKED` names a place to look rather
+ *                     than a remedy, so the cross-reference is to `OFF-MOUNT`
+ *                     alone. Before the repoint this path was
  *                     the agent-owned seeded copy and restoring the mode was
  *                     the right instruction; it now names a file the reader
  *                     cannot touch.
@@ -510,7 +512,7 @@ export function buildPrePushHookPreflightShell(opts: { dataMountPath: string }):
     'if [ -x "$__pchookrt/pre-push" ]; then ' +
       `echo "${PRE_PUSH_HOOK_PREFLIGHT_OK} dir=$__pchookrt" >&2; ` +
     'elif [ -e "$__pchookrt/pre-push" ]; then ' +
-      `echo "${PRE_PUSH_HOOK_PREFLIGHT_NOT_EXECUTABLE} dir=$__pchookrt - a pre-push file is there but is not executable, so the egress runtime will refuse every push from this pod; this path is the copy baked into the agent image, root-owned and not writable by the uid the agent runs as, so no chmod inside the pod can repair it - the bake delivered the file and dropped its mode, and the remedy is to roll the image forward, the same one OFF-MOUNT and MASKED name (PEN-3156, PEN-4518, PEN-4932)" >&2; ` +
+      `echo "${PRE_PUSH_HOOK_PREFLIGHT_NOT_EXECUTABLE} dir=$__pchookrt - a pre-push file is there but is not executable, so the egress runtime will refuse every push from this pod; this path is the copy baked into the agent image, root-owned and not writable by the uid the agent runs as, so no chmod inside the pod can repair it - the image carries this file without an executable mode, so the fault is in the image build, and the remedy is to roll the image forward, the same one OFF-MOUNT names (PEN-3156, PEN-4518, PEN-4932)" >&2; ` +
     'elif [ -e "$__pchookmnt/pre-push" ]; then ' +
       `echo "${PRE_PUSH_HOOK_PREFLIGHT_OFF_MOUNT} runtime=$__pchookrt data=$__pchookmnt - the seeded hook is on the data volume but the agent image carries none. Whether this pod can publish depends on which egress runtime that image carries: one from PEN-4932 or later reads the image copy and will refuse every push from this pod, while an older one reads the seeded copy, which is still mounted, and publishes normally. Do not read this line on its own as an outage - this preflight is built by the server, and an agent can pin an image older than the server that wrote it. The remedy is the same either way: roll the image forward rather than touching the chart (PEN-4518, PEN-4932)" >&2; ` +
     "else " +

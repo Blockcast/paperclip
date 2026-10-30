@@ -24,13 +24,22 @@ time-to-diagnosis, sending the reader to a file they cannot change spends an
 incident and returns nothing — the failure is quieter than a wrong verdict
 name, which is why it survived the repoint.
 
-The text now states the cause (the bake delivered the file and dropped its
-mode) and the remedy that follows from it (roll the image forward), which is
-the same remedy `OFF-MOUNT` and `MASKED` already name. The verdict stays
-separate from `MASKED` despite now sharing its remedy, because the two send the
-reader to different places to look: `MASKED` means nothing is at either path,
-while this means the bake produced a file and lost its mode, which points at
+The text now states what the pod can observe (the image carries the file
+without an executable mode) and the remedy that follows from it (roll the image
+forward), which is the remedy `OFF-MOUNT` already names. It cross-references
+`OFF-MOUNT` alone, because `MASKED` names a diagnostic order rather than a
+remedy — "the same one `MASKED` names" would have sent the reader to a line
+where no remedy is written, which is a smaller instance of the defect this
+change exists to remove. The verdict stays separate from `MASKED` because the
+two send the reader to different places to look: `MASKED` means nothing is at
+either path, while this means a file is there without its mode, which points at
 the image build specifically.
+
+The wording also stops short of naming the bake as the cause. `Dockerfile:695`
+lays the hook down with `COPY --chmod=0755`, so a file arriving without `+x` is
+more likely a bake from a different stage, or a non-executable mount, than a
+mode lost in this one. The remedy is the same under either, so the verdict
+states the observation and leaves the reader to tell them apart.
 
 The verdict NAME is unchanged, as in the repoint and for the same reason: fleet
 greps are written against the shapes, not the prose.
