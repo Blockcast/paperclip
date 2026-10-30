@@ -297,6 +297,33 @@ export function promptBundleSizingKey(input: {
 const PROMPT_BUNDLE_SIZING_CACHE_MAX_ENTRIES = 256;
 const PROMPT_BUNDLE_SIZING_CACHE = new Map<string, PromptBundleSizing>();
 
+/**
+ * Refusal KINDS whose verdict the sizing key cannot reproduce — see
+ * `UNCACHEABLE_PROJECTION_REFUSAL_NAMES` for the two collisions that make it so.
+ *
+ * Keyed on the outcome's `detail.kind` rather than on the error, so the decision is a
+ * pure function of the thing being cached rather than a boolean threaded out of a
+ * `catch`. That is what makes it directly testable: deleting the guard changes this
+ * function's observable behaviour, instead of silently changing a call site.
+ */
+const UNCACHEABLE_PROJECTION_REFUSAL_KINDS = new Set(["symlink_escapes_tree", "symlink_cycle", "too_many_dirs"]);
+
+/**
+ * Remember this sizing for later runs, UNLESS it is a refusal the key cannot tell from
+ * its own fix. Reporting is unaffected — an uncached refusal is recomputed and re-warned
+ * on the next run, so the "refusals stay visible on every run" property is preserved;
+ * only the re-walk is paid.
+ */
+export function rememberProjectionSizingUnlessUncacheable(key: string, sizing: PromptBundleSizing): void {
+  if (sizing.outcome === "refused" && UNCACHEABLE_PROJECTION_REFUSAL_KINDS.has(sizing.detail.kind)) return;
+  rememberPromptBundleSizing(key, sizing);
+}
+
+/** Test seam: what the sizing cache currently holds for a key, if anything. */
+export function peekProjectionSizing(key: string): PromptBundleSizing | undefined {
+  return PROMPT_BUNDLE_SIZING_CACHE.get(key);
+}
+
 function rememberPromptBundleSizing(key: string, sizing: PromptBundleSizing): void {
   PROMPT_BUNDLE_SIZING_CACHE.set(key, sizing);
   while (PROMPT_BUNDLE_SIZING_CACHE.size > PROMPT_BUNDLE_SIZING_CACHE_MAX_ENTRIES) {
@@ -3030,7 +3057,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     });
     const cached = PROMPT_BUNDLE_SIZING_CACHE.get(sizingKey);
     let sized: PromptBundleSizing;
-    let uncacheableRefusal = false;
     if (cached) {
       sized = cached;
     } else {
@@ -3058,8 +3084,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         // sizing key cannot tell their fixed trees from their broken ones — see
         // `UNCACHEABLE_PROJECTION_REFUSAL_NAMES` — so caching one would keep refusing a
         // tree the operator has already repaired exactly as the error told them to.
-        uncacheableRefusal = isUncacheableProjectionRefusal(err);
-        if (!uncacheableRefusal && !isDeterministicProjectionRefusal(err)) throw err;
+        if (!isUncacheableProjectionRefusal(err) && !isDeterministicProjectionRefusal(err)) throw err;
         sized = describeProjectionRefusal(
           err as
             | PromptBundleOverBudgetError
@@ -3069,9 +3094,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             | PromptBundleTooManyDirsError,
         );
       }
-      // Skipped, not omitted by accident: the refusal is still reported below on THIS
-      // run, it is only not remembered for later ones.
-      if (!uncacheableRefusal) rememberPromptBundleSizing(sizingKey, sized);
+      // Skips the uncacheable refusals: still reported below on THIS run, just not
+      // remembered for later ones.
+      rememberProjectionSizingUnlessUncacheable(sizingKey, sized);
     }
     if (sized.outcome === "refused") {
       // Same warn the catch below emits, reached without rebuilding the projection.
@@ -3123,11 +3148,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       );
     }
   } catch (err) {
-    // The TRANSIENT faults only — an ENOENT mid-walk, an EIO off CephFS. The two
-    // deliberate refusals are handled above as a `refused` outcome, because they are
-    // deterministic and worth caching; anything reaching here is this run's own fresh
-    // fault, so `error` is its message and no cached string can be stale. A consumer
-    // tells the two apart by `errorName`, and by `refusal` versus `error`.
+    // The TRANSIENT faults only — an ENOENT mid-walk, an EIO off CephFS. All FIVE
+    // deliberate refusals are handled above as a `refused` outcome; two of them are
+    // cached and three are deliberately not (see
+    // `UNCACHEABLE_PROJECTION_REFUSAL_NAMES` — do NOT "fix" those back into the cache,
+    // the sizing key cannot tell a fixed tree from a broken one). Anything reaching
+    // HERE is this run's own fresh fault, so `error` is its message and no cached
+    // string can be stale. A consumer tells the two apart by `errorName`, and by
+    // `refusal` versus `error`.
     console.warn(
       JSON.stringify({
         level: "warn",

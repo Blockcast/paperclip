@@ -137,6 +137,8 @@ const {
   execute,
   promptBundleSizingKey,
   describeProjectionRefusal,
+  rememberProjectionSizingUnlessUncacheable,
+  peekProjectionSizing,
 } = await import("./execute.js");
 
 // Real class, not a stub: the prompt-cache mock above is a partial that passes
@@ -4556,6 +4558,63 @@ describe("describeProjectionRefusal (PEN-4932 stage 4b)", () => {
       resolvedTarget: "/elsewhere/secret.md",
       treeRoot: "/skills/linky",
     });
+  });
+
+  // The guard that implements the prior Important finding's fix. Without these, the
+  // `if` could be deleted or a name moved back into the cached set and the suite would
+  // stay green — a guard with no failing mutation, which is how the false caching claim
+  // survived in the first place.
+  it("does NOT remember a refusal whose verdict the sizing key cannot reproduce", async () => {
+    const { PromptBundleSymlinkEscapesTreeError, PromptBundleSymlinkCycleError, PromptBundleTooManyDirsError } =
+      await import("./prompt-bundle-projection.js");
+    const cases = [
+      new PromptBundleSymlinkEscapesTreeError({
+        skillKey: "linky",
+        linkPath: "a.md",
+        resolvedTarget: "/elsewhere/a.md",
+        treeRoot: "/skills/linky",
+      }),
+      new PromptBundleSymlinkCycleError({ skillKey: "loopy", linkPath: "self", resolvedTarget: "/skills/loopy" }),
+      new PromptBundleTooManyDirsError("expando", 2000),
+    ];
+    for (const err of cases) {
+      const key = `uncacheable-${err.name}`;
+      rememberProjectionSizingUnlessUncacheable(key, describeProjectionRefusal(err));
+      expect(peekProjectionSizing(key), `${err.name} must not be cached`).toBeUndefined();
+    }
+  });
+
+  it("DOES remember the two refusals the sizing key can reproduce", async () => {
+    // Positive control: without this, a guard that cached nothing at all would also
+    // pass the test above, and the over-budget bundles this measurement exists to find
+    // would silently go back to re-walking the skill farm on every run.
+    const { PromptBundleOverBudgetError, PromptBundleTooManyFilesError } = await import(
+      "./prompt-bundle-projection.js"
+    );
+    const overBudget = describeProjectionRefusal(
+      new PromptBundleOverBudgetError({
+        companyId: "co",
+        runLabel: "run",
+        totalValueBytes: 99,
+        maxBytes: 10,
+        fileCount: 1,
+        bytesBySkillKey: { fat: 99 },
+      }),
+    );
+    rememberProjectionSizingUnlessUncacheable("cacheable-over-budget", overBudget);
+    expect(peekProjectionSizing("cacheable-over-budget")).toEqual(overBudget);
+
+    const tooMany = describeProjectionRefusal(new PromptBundleTooManyFilesError("many", 5));
+    rememberProjectionSizingUnlessUncacheable("cacheable-too-many-files", tooMany);
+    expect(peekProjectionSizing("cacheable-too-many-files")).toEqual(tooMany);
+  });
+
+  it("remembers an ordinary sized outcome", async () => {
+    const sized = { outcome: "sized" as const, totalValueBytes: 10, fileCount: 1, binaryFileCount: 0,
+      resolvedSymlinkCount: 0, danglingSymlinkCount: 0, skippedNonRegularCount: 0, bytesBySkillKey: {},
+      escalationThresholdCrossed: false };
+    rememberProjectionSizingUnlessUncacheable("cacheable-sized", sized);
+    expect(peekProjectionSizing("cacheable-sized")).toEqual(sized);
   });
 
   it("carries the too-many-dirs refusal structurally", async () => {

@@ -82,6 +82,12 @@ fixed in place.
   blip for the life of the process.
 - `fs.stat`/`fs.readFile` take the **resolved** path rather than the link, so the bytes
   read are the bytes whose location was containment-checked.
+- `rememberProjectionSizingUnlessUncacheable` — the cache decision is keyed on the
+  outcome's `detail.kind` and exported, rather than being a boolean threaded out of a
+  `catch`. That is what makes it testable: a second review round noted the guard had no
+  failing mutation, which is exactly the shape that let the false caching claim survive
+  the first time. Three mutations now kill it, including an over-fire control so that
+  "cache nothing" cannot pass as "cache the right things".
 - `src/server/prompt-bundle-projection.test.ts` — the two step-over tests are replaced
   by eleven covering each of the four outcomes plus the three ways to get the
   containment and cycle tests wrong. Every one was mutation-verified to fail against
@@ -104,12 +110,15 @@ cover it, and none passing silently:
 | links stepped over entirely (the pre-change behaviour) | 10 |
 | blanket `realpath` catch (review fix reverted) | 1 |
 | directory-visit cap removed (review fix reverted) | 1 |
+| cache guard deleted (always cache) | 1 |
+| escape kind removed from the uncacheable set | 1 |
+| cache guard over-fires (cache nothing) | 1 |
 
 The `stat`/`readFile`-the-resolved-path change is **not** separately covered, and
 deliberately not claimed to be: absent an actual race the two paths are identical, so a
 test would exercise the interposition rather than the code. It is TOCTOU hardening.
 
-Full adapter suite 1804 passed / 28 files (1789 before; +15 is exactly this change's
+Full adapter suite 1807 passed / 28 files (1789 before; +18 is exactly this change's
 additions). `tsc --noEmit` clean, verified non-vacuous by injecting a type error and
 confirming it was reported.
 
