@@ -9,6 +9,7 @@ import {
 } from "@paperclipai/adapter-utils/server-utils";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import {
   ClaudeSkillSourceUnavailableError,
   prepareClaudePromptBundle,
@@ -18,6 +19,7 @@ import {
   PROMPT_BUNDLE_SECRET_MAX_BYTES,
   buildPromptBundleSecretProjection,
 } from "./prompt-bundle-projection.js";
+import type { PromptBundleSecretProjection } from "./prompt-bundle-projection.js";
 import {
   parseClaudeStreamJson,
   describeClaudeFailure,
@@ -29,6 +31,98 @@ import {
   extractClaudeRetryNotBefore,
 } from "./parse.js";
 import { getSelfPodInfo, getBatchApi, getCoreApi, SELF_POD_DATA_MOUNT_PATH } from "./k8s-client.js";
+
+/**
+ * PEN-4932 stage 4b sizing cache — the MEASUREMENT only, never the payload.
+ *
+ * `buildPromptBundleSecretProjection` returns the projected file bytes, and this is a
+ * module-level map on a long-lived server process: retaining those would be a megabyte
+ * per distinct bundle held forever. Only the handful of numbers the log line prints is
+ * kept, so a full cache costs kilobytes regardless of how large the trees are.
+ */
+type PromptBundleSizing = Pick<
+  PromptBundleSecretProjection,
+  | "totalValueBytes"
+  | "fileCount"
+  | "binaryFileCount"
+  | "skippedSymlinkCount"
+  | "skippedNonRegularCount"
+  | "bytesBySkillKey"
+  | "escalationThresholdCrossed"
+>;
+
+const EMPTY_PROMPT_BUNDLE_SIZING: PromptBundleSizing = {
+  totalValueBytes: 0,
+  fileCount: 0,
+  binaryFileCount: 0,
+  skippedSymlinkCount: 0,
+  skippedNonRegularCount: 0,
+  bytesBySkillKey: {},
+  escalationThresholdCrossed: false,
+};
+
+function summarizePromptBundleProjection(projection: PromptBundleSecretProjection | null): PromptBundleSizing {
+  if (!projection) return EMPTY_PROMPT_BUNDLE_SIZING;
+  return {
+    totalValueBytes: projection.totalValueBytes,
+    fileCount: projection.fileCount,
+    binaryFileCount: projection.binaryFileCount,
+    skippedSymlinkCount: projection.skippedSymlinkCount,
+    skippedNonRegularCount: projection.skippedNonRegularCount,
+    bytesBySkillKey: projection.bytesBySkillKey,
+    escalationThresholdCrossed: projection.escalationThresholdCrossed,
+  };
+}
+
+/**
+ * Everything the projection's SIZE depends on, hashed.
+ *
+ * `bundleKey` already covers the instructions and every skill's key, runtimeName and
+ * tree contents. What it does not cover is the filter: `skillSourceNeedsProjection`
+ * reads each `source` path, the server mount and the catalog-backed set, and two runs
+ * could share a bundle key while disagreeing on which entries travel. Folding those in
+ * makes an equal key a sufficient condition for an equal measurement, which is what
+ * lets the cached value be reported as this run's own rather than as an approximation.
+ *
+ * All metadata, so building this reads no files — the point of the cache.
+ */
+function promptBundleSizingKey(input: {
+  bundleKey: string;
+  serverDataMountPath: string;
+  skills: Array<{ key: string; runtimeName: string; source: string }>;
+  catalogBackedSkillKeys: ReadonlySet<string>;
+}): string {
+  const hash = createHash("sha256");
+  hash.update("paperclip-prompt-bundle-sizing:v1\n");
+  hash.update(`${input.bundleKey}\n`);
+  hash.update(`mount:${input.serverDataMountPath}\n`);
+  for (const entry of [...input.skills].sort((a, b) => a.key.localeCompare(b.key))) {
+    hash.update(
+      `skill:${entry.key}\u0000${entry.runtimeName}\u0000${entry.source}\u0000` +
+        `${input.catalogBackedSkillKeys.has(entry.key) ? "1" : "0"}\n`,
+    );
+  }
+  return hash.digest("hex");
+}
+
+/**
+ * Bound on the sizing cache. A server sees one entry per distinct (bundle, skill-set)
+ * pair across every company it runs; this caps the map rather than letting it track
+ * that unboundedly. Oldest-first eviction via `Map`'s insertion order — not an LRU,
+ * because the access pattern here is "the same few bundles, repeatedly" and the cost
+ * of a miss is one re-read, not a fault.
+ */
+const PROMPT_BUNDLE_SIZING_CACHE_MAX_ENTRIES = 256;
+const PROMPT_BUNDLE_SIZING_CACHE = new Map<string, PromptBundleSizing>();
+
+function rememberPromptBundleSizing(key: string, sizing: PromptBundleSizing): void {
+  PROMPT_BUNDLE_SIZING_CACHE.set(key, sizing);
+  while (PROMPT_BUNDLE_SIZING_CACHE.size > PROMPT_BUNDLE_SIZING_CACHE_MAX_ENTRIES) {
+    const oldest = PROMPT_BUNDLE_SIZING_CACHE.keys().next();
+    if (oldest.done) break;
+    PROMPT_BUNDLE_SIZING_CACHE.delete(oldest.value);
+  }
+}
 import {
   ADAPTER_TYPE_LABEL,
   ADAPTER_TYPE as ADAPTER_TYPE_VALUE,
@@ -2734,13 +2828,41 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // change that makes the pod read from the Secret; until then every outcome here is
   // reported and stepped over.
   try {
-    const projection = await buildPromptBundleSecretProjection({
-      companyId: ctx.agent.companyId,
-      runLabel: ctx.runId,
-      skills: desiredSkills,
-      instructionsContents,
+    // Sized at most once per distinct bundle, not once per run. `buildPromptBundleSecretProjection`
+    // re-reads every desired skill file, and `prepareClaudePromptBundle` has already
+    // hashed those same trees a few lines above — so without this, every run pays a
+    // second full content read of the skill farm on the Job-creation critical path, on
+    // the CephFS mount whose stalls are this issue's entire subject, purely to produce
+    // a log line.
+    //
+    // `bundleKey` is a sha256 over the instructions plus every skill's key, runtimeName
+    // and full tree contents, so an equal key means the projected BYTES are equal. It
+    // does not cover what the filter in `skillSourceNeedsProjection` reads — the source
+    // paths, the server mount and the catalog set — so those are folded in here; two
+    // runs agreeing on all of it cannot disagree about the measurement.
+    const sizingKey = promptBundleSizingKey({
+      bundleKey: promptBundle.bundleKey,
       serverDataMountPath: SELF_POD_DATA_MOUNT_PATH,
+      skills: desiredSkills,
+      catalogBackedSkillKeys,
     });
+    const cached = PROMPT_BUNDLE_SIZING_CACHE.get(sizingKey);
+    const sized =
+      cached ??
+      summarizePromptBundleProjection(
+        await buildPromptBundleSecretProjection({
+          companyId: ctx.agent.companyId,
+          runLabel: ctx.runId,
+          skills: desiredSkills,
+          instructionsContents,
+          serverDataMountPath: SELF_POD_DATA_MOUNT_PATH,
+          // The discriminator `prompt-cache.ts` keys on. Without it the prefix test
+          // alone would call every catalog skill an image path and drop it from the
+          // projection wherever PAPERCLIP_HOME is not under the server mount.
+          catalogBackedSkillKeys,
+        }),
+      );
+    if (!cached) rememberPromptBundleSizing(sizingKey, sized);
     console.info(
       JSON.stringify({
         level: "info",
@@ -2748,13 +2870,24 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         msg: "measured the projected per-run prompt-bundle Secret size (PEN-4932 stage 4b; not yet the delivery path)",
         companyId: ctx.agent.companyId,
         runId: ctx.runId,
-        // Decoded UTF-8 bytes — the quantity `ValidateSecret` checks. See the
-        // module header: §4.2's sample figure was base64-inflated.
-        totalValueBytes: projection?.totalValueBytes ?? 0,
-        fileCount: projection?.fileCount ?? 0,
+        // Raw value bytes — the quantity `ValidateSecret` checks, across `stringData`
+        // and base64 `data` alike. See the module header: §4.2's sample figure was
+        // base64-inflated.
+        totalValueBytes: sized.totalValueBytes,
+        fileCount: sized.fileCount,
+        // Non-UTF-8 files, which have to travel base64. Zero today is the expected
+        // reading; a non-zero one says some skill tree ships an asset, which is worth
+        // knowing before the Secret becomes the delivery path.
+        binaryFileCount: sized.binaryFileCount,
+        // Files the walk stepped over and the pod will therefore not get. Emitted so
+        // that "visible rather than silent" is a property of this channel rather than
+        // a claim about it, and so the byte total is read with its own omissions.
+        skippedSymlinkCount: sized.skippedSymlinkCount,
+        skippedNonRegularCount: sized.skippedNonRegularCount,
         maxBytes: PROMPT_BUNDLE_SECRET_MAX_BYTES,
-        escalationThresholdCrossed: projection?.escalationThresholdCrossed ?? false,
-        bytesBySkillKey: projection?.bytesBySkillKey ?? {},
+        escalationThresholdCrossed: sized.escalationThresholdCrossed,
+        bytesBySkillKey: sized.bytesBySkillKey,
+        sizingCacheHit: cached !== undefined,
       }),
     );
   } catch (err) {

@@ -723,8 +723,36 @@ property 1 is instrumentation as much as it is a guard.
 `vendor/paperclip-adapter-claude-k8s/src/server/prompt-bundle-projection.ts` implements property 1:
 it walks the run's resolved entries, projects them to positional Secret keys with `items[].path`
 restoring the bundle layout, and **refuses** — `PromptBundleOverBudgetError`, naming company, run
-and measured bytes — rather than truncating. Image-path entries are excluded by the same
-discriminator `prompt-cache.ts` already applies.
+and measured bytes — rather than truncating.
+
+Three properties of that walk were corrected in review (2026-10-30) and are worth recording,
+because each was a way for the channel to under-deliver *silently* — the failure mode this whole
+invariant exists to rule out:
+
+* **Image-path exclusion is not a path-prefix test.** An earlier draft excluded any entry whose
+  source was not under `SELF_POD_DATA_MOUNT_PATH`, and described that as "the same discriminator
+  `prompt-cache.ts` already applies". It is not. `prompt-cache.ts:509-519` records that the prefix
+  test is correct *for an image path only*: a catalog-backed source is a `PAPERCLIP_HOME` path, and
+  `PAPERCLIP_HOME` (an env var defaulting to `~/.paperclip`) and the server mount (a hardcoded
+  `/paperclip`) are two variables that coincide in today's deployment rather than one. Where they
+  diverge, the prefix test calls **every catalog skill** an image path and drops it with no signal.
+  The projection now keys on `catalogBackedSkillKeys` — what `prompt-cache.ts` actually uses —
+  OR'd with the mount prefix, and only the remainder is an image path.
+* **Files travel as bytes, not as decoded strings.** Reading every file as UTF-8 substitutes
+  U+FFFD for each invalid byte, so a PNG, a font or a Latin-1 file in a skill tree would be
+  delivered corrupted *and* measured at 3 bytes per invalid byte. Valid-UTF-8 files now travel in
+  `stringData` and the rest base64 in `data`; both count their decoded length against
+  `MaxSecretSize`, so the budget arithmetic above is unchanged and `binaryFileCount` reports how
+  many took the second channel.
+* **Skipped symlinks are counted.** The walk steps over links rather than following them, so one
+  cannot escape the tree. That trade is only "visible rather than silent" if the skip is reported,
+  so `skippedSymlinkCount` and `skippedNonRegularCount` are emitted alongside the byte total and
+  the total is read with its own omissions attached.
+
+One further caveat on reading the cap as the ceiling: the Secret is one object among the Job's, and
+etcd's request limit (~1.5 MiB by default) applies to the whole serialized object — keys, base64
+expansion and metadata included. The usable headroom therefore sits slightly under the validation
+cap rather than at it, which is a further reason the trigger is set at half.
 
 It is wired into `execute.ts` as **measurement only**, and that restraint is deliberate rather than
 unfinished. Nothing reads the projection yet; the pod still gets the bundle off the shared volume
@@ -732,6 +760,12 @@ and will until `dataClaimName` is swapped. Enforcing the refusal now would abort
 budget that buys that run nothing — a pure regression — so the call site logs
 `claude_k8s.prompt_bundle_projection_sized` and steps over every outcome, including the refusals.
 The refusal becomes load-bearing in the same change that makes the pod read from the Secret.
+
+The sizing is cached on the bundle key `prepareClaudePromptBundle` already computes (plus the
+source paths, server mount and catalog set the projection filter reads, which the bundle key does
+not cover). Without that, every run would pay a second full content read of the skill farm on the
+Job-creation critical path — on the very CephFS mount whose stalls are this issue's subject —
+purely to produce a log line. Only the measurement is retained, never the projected bytes.
 
 What that buys ahead of the swap is the one thing Finding 3 could not get: this sizing is from a
 single company because an agent seat cannot enumerate them, so **the fleet distribution against the
