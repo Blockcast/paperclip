@@ -140,11 +140,22 @@ Every path that can return `allowed: true` for `issue:comment` / `issue:mutate` 
 `98839e63` and will drift. The reason string is authoritative: when a line number
 and a reason disagree, trust the reason. It is also what the tests assert on.
 
+⚠ **Most of this table's numbers are stale and are not yet machine-checked.** PEN-5091
+added `scripts/check-doc-line-anchors.mjs`, which re-resolves every anchor under
+`docs/security/**` on every pull request — but each reason string here occurs at several
+sites in a 3000-line file, so choosing which one a row means is a judgement about which
+branch it describes, not a line refresh. Those 23 anchors are listed in
+`scripts/doc-line-anchors.unverified.json` and are reported rather than enforced until
+someone establishes a distinctive construct for each. Do not read an unannotated number
+here as current; the reason string still is.
+
+<!-- anchor-file: server/src/services/authorization.ts -->
+
 | Reason | `authorization.ts` | comment | mutate | coordination metadata | Condition |
 | --- | --- | :---: | :---: | :---: | --- |
 | `allow_local_board` | `:1872` | A | A | A | `actor.source === "local_implicit"` |
 | `allow_instance_admin` | `:1886` | A | A | A | instance-admin row, never for `cloud_tenant` |
-| `allow_company_member` | `:1916` | A | A | — | cloud-tenant board user (`actor.type === "board"`, `:1867`; `actor.source === "cloud_tenant" && actor.userId`, `:1895`) with active membership, `membershipRole !== "viewer"` |
+| `allow_company_member` | `:1916` | A | A | — | cloud-tenant board user (`actor.type === "board"`, `:2078`; `actor.source === "cloud_tenant" && actor.userId`, `:1895`) with active membership, `membershipRole !== "viewer"` |
 | `allow_self` | `:2420` | A | A | — | `resource.assigneeAgentId === actor` |
 | `allow_company_agent` | `:2438` | A | A | — | issue has no assignee, and is not a review/escalation shell |
 | `allow_issue_creator` | `:2449` | A | — | — | `resource.createdByAgentId === actor` |

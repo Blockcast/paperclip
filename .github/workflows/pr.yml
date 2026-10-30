@@ -700,6 +700,20 @@ jobs:
         run: node --test ./scripts/ally-agent-idempotency-contract.test.mjs ./scripts/check-ally-bundle-anchors.test.mjs
         timeout-minutes: 1
 
+      # Deliberately unfiltered by path. The failure this catches is a source change
+      # falsifying a security decision record the PR never opened -- `3e5ac86e0` moved
+      # `job-manifest.ts` and invalidated nine citations across three sections. A
+      # `paths:` filter on docs/security/** cannot see that (PEN-5091).
+      - name: Re-resolve docs/security source anchors (PEN-5091)
+        if: ${{ !cancelled() }}
+        run: node ./scripts/check-doc-line-anchors.mjs
+        timeout-minutes: 1
+
+      - name: Test doc line-anchor checker
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/check-doc-line-anchors.test.mjs
+        timeout-minutes: 1
+
       - name: Test scheduled-guard liveness detector (PEN-3281)
         if: ${{ !cancelled() }}
         run: node --test ./scripts/check-scheduled-guard-liveness.test.mjs

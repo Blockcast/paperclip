@@ -96,18 +96,51 @@ closed, even if every one of its PEN-5017 commits has already reached `master` b
 **Three PRs are open, not four**, and one of them (#3112) now carries two preconditions rather than
 one. The gate's readiness in the fleet is unchanged since revision 1: no gate is set anywhere.
 
+## 1a. How to write a source anchor (and why the numbers are now checked)
+
+Every `file.ts:NNN` in this document is re-resolved on every pull request by
+`scripts/check-doc-line-anchors.mjs`, which runs in the `policy` job whether or not the
+PR touches this file. **The named construct is the citation; the line number is a cache.**
+
+This exists because the cache kept going stale faster than review. Between 2026-10-29 and
+2026-10-30 these anchors were corrected four times (PEN-5069, PEN-5071, PEN-5080 twice),
+and three of those corrections were falsified before they merged — `job-manifest.ts` moved
+three times in six hours, and `3e5ac86e0` silently invalidated nine citations across three
+sections of a record whose stated method is *"verified in the source."* The falsifying PR
+never opened this document, which is why a `paths:` filter on it would not have helped.
+
+Write an anchor so the checker can assert it:
+
+- Name the construct in backticks beside the anchor — `` `mergeModelProfileAdapterConfig` (`:7050`) ``.
+  The checker takes the nearest code span on the same line, looking left first.
+- To say it outright, put it in parentheses straight after:
+  `` `job-manifest.ts:2901` (`asBoolean(config.enableGitHubPublishBroker, false)`) ``.
+- A bare `` `:NNN` `` needs a declared file, set by a comment that is invisible when rendered
+  and holds until the next one: `<!-- anchor-file: server/src/services/heartbeat.ts -->`.
+- Anchors into another repository: `<!-- anchor-external: penstock-vault-node -->`. They are
+  reported and skipped, never silently passed.
+
+Prefer a construct that occurs **once** in its file. A distinctive one makes the assertion
+sharp and lets `--fix` relocate the number for you; `null` is technically present at the
+cited line and asserts almost nothing.
+
+When a number drifts, run `node scripts/check-doc-line-anchors.mjs --fix` — it rewrites any
+anchor whose construct it can place unambiguously, and reports the rest rather than guessing.
+
 ## 2. What the gate actually does
 
-Read at `vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts` **`:2901`**,
-`asBoolean(config.enableGitHubPublishBroker, false)`. Every anchor below is a line in that
+<!-- anchor-file: vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts -->
+
+Read at `vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts` **`:2901`**
+(`asBoolean(config.enableGitHubPublishBroker, false)`). Every anchor below is a line in that
 same vendored file — not the `opencode-k8s` adapter's same-named `job-manifest.ts` — and each
 was re-verified at source on `master` `56710069f` (2026-10-30T09:5xZ):
 
 | | Gate off (today) | Gate on |
 |---|---|---|
-| GitHub Secret | mounted into the agent container | mounted into the `github-publish-broker` sidecar only (**`:3418`**, `enableGitHubPublishBroker && isGitHubCredentialSecretVolume(...)`, drops it from the agent) |
+| GitHub Secret | mounted into the agent container | mounted into the `github-publish-broker` sidecar only (**`:3418`** (`isGitHubCredentialSecretVolume(sv.mountPath)`), drops it from the agent) |
 | Agent publish path | `git`/`gh`/MCP authenticate locally | agent asks the broker over a unix socket; `PAPERCLIP_GITHUB_BROKER_SOCKET` is set |
-| Broad data mount | renders, annotated `broad:<reason>` | **`buildJobManifest` throws** (**`:3962-3964`**) — fail closed, not degrade |
+| Broad data mount | renders, annotated `broad:<reason>` | **`buildJobManifest` throws** (**`:3962-3964`** (`!narrowWritableSurface`)) — fail closed, not degrade |
 | Pod shape | one container | `+1` native sidecar (initContainer, `restartPolicy: Always`), uid 1001, gid 1000, same image |
 
 Two properties make staging possible, and both were verified in the source rather than assumed:
@@ -170,12 +203,15 @@ value it already has. **It becomes live the moment stage 1 sets the gate `true` 
 
 The chain, read at `5de67c25e`:
 
-1. `parseIssueAssigneeAdapterOverrides` (`server/src/services/heartbeat.ts:7959`) parses
+<!-- anchor-file: server/src/services/heartbeat.ts -->
+
+1. `parseIssueAssigneeAdapterOverrides` (`server/src/services/heartbeat.ts:8286`) parses
    `issue.assigneeAdapterOverrides.adapterConfig` with `parseObject` and **no key allowlist** —
    arbitrary keys pass.
-2. `mergeModelProfileAdapterConfig` (`:6726`) is a **shallow spread** with `issueAdapterConfig`
+2. `mergeModelProfileAdapterConfig` (`:7050`) is a **shallow spread** with `issueAdapterConfig`
    **last**, so an issue override beats agent config for any top-level key.
-3. The merged object becomes `executionRunConfig` (`:34003`) and reaches the adapter as `ctx.config`
+3. The merged object becomes `executionRunConfig` at `:34412`
+   (`stripWorkspaceRuntimeFromExecutionRunConfig(mergedConfig)`) and reaches the adapter as `ctx.config`
    — the same object `buildJobManifest` reads the gate from.
 4. The only provenance guard, `withAgentScopedEnvProvenance` (`:2783`), re-asserts agent values for
    `AGENT_SCOPE_ONLY_ENV_KEYS` — three keys, **inside `env`**. It does nothing for top-level
@@ -183,11 +219,12 @@ The chain, read at `5de67c25e`:
 
 So `assigneeAdapterOverrides.adapterConfig.enableGitHubPublishBroker = false` on an issue assigned to
 the agent yields a pod with the credential back in the agent container. The overlay applies only when
-`issueContext.assigneeAgentId === agent.id` (`:33467`) — which is not a mitigation, since an agent can
+`issueContext.assigneeAgentId === agent.id` (`:33848`) — which is not a mitigation, since an agent can
 file an issue assigned to itself, and `paperclipCreateIssue` exposes `assigneeAdapterOverrides`
 directly.
 
-The code already knows this class of problem. The comment at `:2766` says it in as many words:
+The code already knows this class of problem. The comment at `:2766`
+(`issueAdapterConfig`) says it in as many words:
 
 > `issueAdapterConfig` is `issue.assigneeAdapterOverrides.adapterConfig`.
 > `parseIssueAssigneeAdapterOverrides` accepts arbitrary keys, and any actor able to create or patch
@@ -362,10 +399,13 @@ renders are certainly still happening — 23 agent Jobs were live during the que
 this run executes in. So the zero is "the warn site was evaluated and did not fire", not "nobody
 looked".
 
+<!-- anchor-file: vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts -->
+
 **What changed on 2026-10-20 is named in the source, not inferred.** `BLO-47526` gave a `shared`
 runtime descriptor agent-scoped persistent roots so that `narrowWritableSurface` holds — the
 `mode === "shared"` branch and its rationale comment in
-`vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts` at **`:811-820`**, with
+`vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts` at **`:811-820`**
+(`narrowWritableSurface`), with
 `narrowWritableSurface` itself defined at **`:3230`**; before it, a shared run returned
 `enabled:false` and kept the whole PVC mounted rw. `isolation_disabled` being the *only* leg that
 ever fired, and its stopping dead at that change, is consistent with that and with nothing else.
@@ -373,8 +413,9 @@ ever fired, and its stopping dead at that change, is consistent with that and wi
 ⚠ **The surviving broad path, which the zero does not cover.** `resolveJobIsolation` falls through to
 `SHARED_JOB_ISOLATION` (`enabled: false`) when a run arrives with **no runtime isolation descriptor**
 and `config.isolationMode` is not `isolated`/`isolate` — in
-`vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts`, the constant declared at **`:762`**
-and returned at **`:885-887`**. The comment at **`:3207-3209`** names it: *"only a config-only run
+`vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts`, the constant declared at **`:762`** (`SHARED_JOB_ISOLATION`)
+and returned at **`:885-887`** (`return SHARED_JOB_ISOLATION`). The comment at
+**`:3207-3209`** (`only a config-only run`) names it: *"only a config-only run
 with no descriptor and no `isolationMode` still reaches this fallback."* The measured zero is
 therefore a property of **the server supplying a descriptor on every render**, not of configuration.
 A run path that stops supplying one renders broad — and once the gate is on, that stops being a
@@ -607,6 +648,8 @@ on PEN-5016 at 2026-10-29T20:23Z). It is written here so that it survives the th
 > `docs/security/PEN-3183-git-egress-enforcement-boundary-decision.md` says both `gh.real` fallbacks
 > *"are closed by it"* with **no qualifier**. That holds only while **link D** holds — i.e. while the
 > brokered agent container still *sets* `PAPERCLIP_GITHUB_TOKEN_FILE`.
+
+<!-- anchor-file: scripts/gh-token-wrapper.sh -->
 
 **Independently verified against `master` for this revision**, rather than carried on the CTO's word:
 `scripts/gh-token-wrapper.sh:405` guards the token-file path on `${PAPERCLIP_GITHUB_TOKEN_FILE+x}`
@@ -1000,7 +1043,8 @@ complete the configuration half of this pre-flight.**
 
 **(c) …and the render-time observation covers what the config read cannot. This is why (b) does not
 block.** The §4 warn is emitted from `resolveJobIsolation`, which reads `config.isolationMode` off
-the **merged** config (`vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts:885`) — after
+the **merged** config (`vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts:885`
+(`asString(config.isolationMode, "shared")`)) — after
 every scope has been applied. So a broad render caused by an *environment*-scope setting fires
 exactly the same warn as an agent-scope one. The
 render observation is **scope-agnostic and strictly stronger than a config read**: it observes the
@@ -1028,12 +1072,14 @@ from agents that *never* rendered broad, a clean reading would have been consist
 was never affected". It is not: Devops **was** affected, and stopped when `BLO-47526` landed. The
 zero is evidence about the mechanism, not about the sample.
 
+<!-- anchor-file: vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts -->
+
 ⚠ **Bounds, stated so a later reader does not inherit this as stronger than it is.** This is a 10-day
 negative over Loki's retained window, liveness-controlled — it is **not** a configuration proof, and
 §4's surviving broad path is untouched by it: a run arriving with no runtime isolation descriptor and
 no `isolationMode` still reaches the `SHARED_JOB_ISOLATION` fallback — in
-`vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts`, the constant declared at **`:762`**
-and returned at **`:885-887`**. The zero is a property of the server supplying a descriptor on every
+`vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts`, the constant declared at **`:762`** (`SHARED_JOB_ISOLATION`)
+and returned at **`:885-887`** (`return SHARED_JOB_ISOLATION`). The zero is a property of the server supplying a descriptor on every
 render. A run path that stops supplying one renders broad — and once the gate is on, that is a
 hard build failure, not a quiet annotation.
 ⇒ **Check 3 of §11.6 re-runs this at every widening. It is not cleared once.**

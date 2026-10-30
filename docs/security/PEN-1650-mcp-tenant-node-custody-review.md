@@ -44,6 +44,8 @@ Trust boundaries are client-to-gateway, control-plane registry-to-gateway, gatew
 
 ### High - Caller secrets cross the gateway-to-node boundary without tenant binding
 
+<!-- anchor-file: packages/mcp-gateway/src/upstreams.ts -->
+
 - Location: `packages/mcp-gateway/src/server.ts:395-458`, `packages/mcp-gateway/src/upstreams.ts:156-180` and `:233-245`.
 - Evidence: correctly labeled `tenant_node` routes suppress central environment and custody injection, but use the generic forwarding path. That path copies inbound headers except a small hop-by-hop/framing denylist. Caller `Authorization`, `Cookie`, `x-api-key`, proxy authorization, forwarding metadata, and client-supplied tenant headers can reach the registry-selected URL.
 - Evidence: `UpstreamConfig` has no authenticated tenant, node, route, or audience fields. The gateway sends ordinary HTTP requests rather than a server-owned PEN-629 frame and cannot validate a relay response audience.
@@ -61,6 +63,8 @@ Trust boundaries are client-to-gateway, control-plane registry-to-gateway, gatew
 - Required remediation: resolve a server-owned PEN-629 route identifier instead of accepting arbitrary URLs, enforce redirect- and resolution-safe target policy where URLs remain, and bind route/session caches to authenticated identity and registry version.
 
 ### High - Registry key names can select unrelated vault-node process secrets
+
+<!-- anchor-external: penstock-vault-node -->
 
 - Location: node `src/mcp_worker.rs:78-88`, `:262-280`, and `:333-338`.
 - Evidence: `EnvironmentCredentialCustody` calls `std::env::var` for any uppercase/digit/underscore name. Registry metadata can name reverse-channel tokens/private keys, helper signing/sealing keys, enrollment credentials, or any other single-line process secret and inject it into an outbound header.
