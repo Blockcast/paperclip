@@ -1154,6 +1154,34 @@ describe("scrubGitHubEgressText", () => {
     });
   });
 
+  describe("BLO-50225 regression: an orc8r network id under networkID is not a credential", () => {
+    // Derived, not embedded, so this file stays pushable before the fix deploys.
+    const pair = (name: string, value: string) => [name, value].join("=");
+    const NETWORK_ID = ["5c7e1a2b", "9d34", "4f6a", "8b21", "0e3d7c9f1a64"].join("-");
+
+    it("passes a networkID label matcher and its YAML exp_labels form byte-exact", () => {
+      for (const text of [
+        `gateway_checkin_status{${pair("networkID", `"${NETWORK_ID}"`)}}`,
+        `networkID: ${NETWORK_ID}`,
+      ]) {
+        expect(scrubGitHubEgressText(text).text).toBe(text);
+        expect(scrubGitHubEgressText(text).redacted).toBe(false);
+        expect(locateGitHubEgressMatches(text)).toEqual([]);
+      }
+    });
+
+    it.each([
+      ["networkID", SYNTHETIC_OPAQUE_VALUE],
+      ["networkID", "s7Kq2Vt9-Lm4X-b8Nd-3Wp6-Zc1Yr5Hj0Tg9"],
+      ["networkID", NETWORK_ID.toUpperCase()],
+      ["token", NETWORK_ID],
+    ])("still refuses a credential-shaped value under %s", (name, value) => {
+      const result = scrubGitHubEgressText(pair(name, value));
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(value);
+    });
+  });
+
   describe("PEN-4637 regression: an absolute POSIX path is not a credential", () => {
     // Derived, not embedded, throughout. Every positive below is the exact
     // material the SHIPPED rule refuses, so a contiguous `name=value` literal
