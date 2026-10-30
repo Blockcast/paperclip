@@ -135,6 +135,35 @@ describe("buildPromptBundleMaterializationShell", () => {
     expect(readFileSync(join(foreign, "SKILL.md"), "utf8")).toBe("must not be touched\n");
   });
 
+  it("drops a live farm link WITHOUT reaching through it into the shared source", () => {
+    // The ancestor walk must run shallowest-first. Bottom-up, the deepest
+    // ancestor is tested while the farm link above it is still live, so `-L`
+    // and `rm -f` resolve THROUGH it and delete a symlink inside the shared
+    // skill source — outside the bundle root, and for every agent sharing that
+    // source. That is the exact outcome the walk exists to prevent.
+    stage(".claude/skills/dataviz/references/palette.md", "fresh\n");
+    const shared = join(root, "shared-skill-source/dataviz");
+    const realRefs = join(root, "shared-skill-source/real-references");
+    mkdirSync(realRefs, { recursive: true });
+    writeFileSync(join(realRefs, "palette.md"), "must not be touched\n");
+    mkdirSync(shared, { recursive: true });
+    // A symlinked subdirectory INSIDE the source — the within-tree shape #3157
+    // now resolves, so it is a shape the projection genuinely produces.
+    symlinkSync(realRefs, join(shared, "references"));
+    mkdirSync(join(bundleRoot, ".claude/skills"), { recursive: true });
+    symlinkSync(shared, join(bundleRoot, ".claude/skills/dataviz"));
+
+    const { result } = run([".claude/skills/dataviz/references/palette.md"]);
+
+    expect(result.status).toBe(0);
+    // The shared source keeps its own link, and the file behind it.
+    expect(lstatSync(join(shared, "references")).isSymbolicLink()).toBe(true);
+    expect(readFileSync(join(realRefs, "palette.md"), "utf8")).toBe("must not be touched\n");
+    // ...and the bundle got real directories and the fresh bytes.
+    expect(lstatSync(join(bundleRoot, ".claude/skills/dataviz")).isDirectory()).toBe(true);
+    expect(readFileSync(join(bundleRoot, ".claude/skills/dataviz/references/palette.md"), "utf8")).toBe("fresh\n");
+  });
+
   it("drops a DANGLING ancestor link, which is the shape the swap actually produces", () => {
     stage(".claude/skills/dataviz/SKILL.md", "fresh\n");
     mkdirSync(join(bundleRoot, ".claude/skills"), { recursive: true });
@@ -144,6 +173,53 @@ describe("buildPromptBundleMaterializationShell", () => {
 
     expect(result.status).toBe(0);
     expect(readFileSync(join(bundleRoot, ".claude/skills/dataviz/SKILL.md"), "utf8")).toBe("fresh\n");
+  });
+
+  it("handles a dash-led FIRST segment, which isSafeBundlePath admits", () => {
+    // `isSafeBundlePath` rejects empty, absolute, control-char, `.` and `..`
+    // segments, but says nothing about a leading `-`. The previous walk ran
+    // `dirname "$p"` with no `--`; with a dash-led FIRST segment the whole
+    // argument is dash-led, so `dirname` errors, returns empty, and the walk is
+    // skipped — a guard that silently stops guarding. Only the first segment
+    // can do this: under `.claude/...` the argument always begins with `.`.
+    //
+    // The projection cannot emit such a path today (it emits only
+    // `agent-instructions.md` and `.claude/skills/<runtime>/<rel>`), so this
+    // pins the BUILDER's contract rather than a reachable run — which is the
+    // right level, since the builder is what admits the path.
+    stage("-dataviz/SKILL.md", "fresh\n");
+    const foreign = join(root, "foreign-skill-source");
+    mkdirSync(foreign, { recursive: true });
+    writeFileSync(join(foreign, "SKILL.md"), "must not be touched\n");
+    mkdirSync(bundleRoot, { recursive: true });
+    symlinkSync(foreign, join(bundleRoot, "-dataviz"));
+
+    const { result } = run(["-dataviz/SKILL.md"]);
+
+    expect(result.status).toBe(0);
+    expect(result.stderr).not.toContain("dirname");
+    // The stale link was dropped and replaced by a real directory...
+    expect(lstatSync(join(bundleRoot, "-dataviz")).isDirectory()).toBe(true);
+    expect(readFileSync(join(bundleRoot, "-dataviz/SKILL.md"), "utf8")).toBe("fresh\n");
+    // ...rather than written through into the shared source.
+    expect(readFileSync(join(foreign, "SKILL.md"), "utf8")).toBe("must not be touched\n");
+  });
+
+  it("swaps each file in atomically and leaves no partial behind", () => {
+    // `cp` truncates its destination in place, so a reader during the copy sees
+    // a half-written file and two runs sharing a `bundleKey` root interleave.
+    // Copy-to-sibling then `mv` within the same directory is atomic. The
+    // residue assertion is the half that would otherwise rot: a `.pcpb-part`
+    // left in the bundle would be read by `--add-dir` as content.
+    stage(".claude/skills/dataviz/SKILL.md", "fresh\n");
+    stage("agent-instructions.md", "instructions\n");
+
+    const { script, result } = run([".claude/skills/dataviz/SKILL.md", "agent-instructions.md"]);
+
+    expect(script).toContain('mv -f -- "$__pcpb_dst/$__pcpb.pcpb-part" "$__pcpb_dst/$__pcpb"');
+    expect(result.status).toBe(0);
+    expect(readdirSync(bundleRoot).sort()).toEqual([".claude", "agent-instructions.md"]);
+    expect(readdirSync(join(bundleRoot, ".claude/skills/dataviz"))).toEqual(["SKILL.md"]);
   });
 
   it("drops a symlink parked at the leaf destination", () => {
