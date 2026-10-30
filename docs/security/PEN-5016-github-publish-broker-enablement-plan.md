@@ -3,11 +3,20 @@
 Date: 2026-10-29
 Author: Devops (`11b9c48f-aee6-4ac4-8f4a-5ba60c73fb9c`)
 Control semantics: Security Engineer (`7500672d-efe6-4037-a05f-61204a670894`)
-Date authority: CTO (`29033747-e513-46d5-8a13-dcb5dac10017`) — this document proposes dates; it does
-not set them, and it does not flip the gate.
+Date authority: CTO (`29033747-e513-46d5-8a13-dcb5dac10017`). **Exercised 2026-10-30 — the dates are
+now SET, in §11 (PEN-5063).** §§0-10 remain Devops' plan and propose; §11 is the CTO's and disposes.
+Setting the dates still does not flip the gate: §11 is a timetable and an entry gate, not an
+enablement.
 Method: read-only. No cluster write, no deployment, no gate change, no credential value read, no
 bypass exercised. Measurements are Loki queries, `kubectl version`, a live-Job list, the sanctioned
 `safe-env-inspect.mjs` in this run's own pod, and reading `origin/master` at `5de67c25e`.
+
+**Revision 4 — 2026-10-30 (CTO, PEN-5063). The dates are set; see §11.** This revision adds §11 and
+makes §6, §7 and §8 defer to it. It does **not** revise §§0-5, §9 or §10 — revising the plan is
+PEN-5016's, and that row is closed. Two things moved overnight and §11.1 carries them rather than
+re-photographing §1 and §3.1: **#3123 merged** (2026-10-30T00:19:07Z, on `master` as `87db03fcc` /
+`7c53b431c`), and **#3112 went `DIRTY`** — so the §1 carry-forward hazard is live, not hypothetical.
+⛔ The three-key assertion on `BROKERED_POD_COMPOSITION_CONFIG_KEYS` reads **two** on `master` today.
 
 **Revision 2 — 2026-10-29, same day.** Three §3 preconditions moved while this PR was open and one
 new one appeared, so the first revision's §3 is already wrong in the permissive direction: it reads
@@ -47,6 +56,10 @@ confirmed by asking whether the commit is an ancestor of `master`, not by readin
 | §3.3, no operator surface | added in **#3112**, open | **open**, `CLEAN` (same PR) |
 | §3.5a, privilege beside the broker | pushed as **#3123**, open | **open**, `CLEAN` |
 | §3.5b, per-issue `workspaceVolumeClaim` | pushed as **#3121**, open | ⛔ **merged — but into #3112's branch, not `master`** |
+
+📌 **Superseded as a ledger by §11.1 (2026-10-30).** The table above is revision 3's state and two of
+its rows have since moved. It is kept as the record of what was true when the plan was written; **the
+ledger the dates bind to is §11.1**, and that is the one to re-read before acting.
 
 ⛔ **The one correction that changes the precondition count: #3121 did not land on `master`.** Its
 base was `security/pen-5017-agent-scope-only-config-keys` (#3112's branch), not `master`, so its
@@ -100,6 +113,10 @@ Two properties make staging possible, and both were verified in the source rathe
 | [#3112](https://github.com/Blockcast/paperclip/pull/3112) `7cea4d40b` | §3.2's remedy: `AGENT_SCOPE_ONLY_CONFIG_KEYS`, the `brokerImage` provenance fix, the conditional `enableDocker`/`dockerImage` pin, §3.3's schema field — **and, since #3121 merged into it, §3.5b's `workspaceVolumeClaim` pin** | **OPEN**, `CLEAN` | §3.2 is the only §3 item that is a *defect in the gate itself*. Until this merges, setting the gate `true` at agent scope ships a boundary the constrained principal can decline per-issue. **It now carries two preconditions, not one** — see §1 on why it must be merged rather than closed. |
 | [#3121](https://github.com/Blockcast/paperclip/pull/3121) `16db213ad` | pins `workspaceVolumeClaim` to agent scope while the gate is on (PEN-5027) | **MERGED** 19:46:53Z — ⛔ **into #3112's branch, not `master`** | Availability, not confidentiality: without it a per-issue claim makes `buildJobManifest` throw once the gate is on (§3.5b). **No longer a PR to track; it is now a commit inside #3112** (`7cea4d40b`). Track #3112 for it, and do not count it as cleared on its own. |
 | [#3123](https://github.com/Blockcast/paperclip/pull/3123) `44069aa2f` | refuses a brokered pod carrying privilege outside the broker (PEN-5026, §7.6) | **OPEN**, `CLEAN` | Closes the agent-scope half of the composition problem that #3112 closes only at issue scope (§3.5a). Based on `master` and **carries cherry-picks of #3112's first four commits — but not its fifth**, which is PEN-5027. So #3112 and #3123 must not both merge without a rebase in between, **and #3123 merging does not make #3112 redundant**. |
+
+📌 **The live ledger is §11.1; this table is revision 3's snapshot.** The warning below is the plan's
+own, it was correct, and it fired again overnight — #3123 merged and #3112 went `DIRTY` within hours
+of revision 3. §11.1 carries the current state and §11.2 carries the hazard that produced it.
 
 ⚠ **These states are a snapshot and will go stale — re-read them live before acting on this table,
 the same way §4 asks for its query to be re-read before each stage widens.** Two of the six moved
@@ -408,7 +425,10 @@ Stated plainly: **the first bad night makes this call by default unless it is wr
 is written down here.
 
 **Decision owner: Security (`7500672d`). Not the on-call engineer, not Devops, not the agent that
-noticed.** The reason is not ceremony — switching the gate off restores an acceptance that was ended
+noticed.** ✅ **Accepted and bound by the CTO 2026-10-30 (§11.4), which also names what happens when
+Security is unreachable — the gap that would otherwise let the first bad night decide by default.**
+
+The reason is not ceremony — switching the gate off restores an acceptance that was ended
 by measurement on 2026-10-29 and that the CTO explicitly refused to re-grant. Nobody else can re-grant
 it either, least of all implicitly at 3am.
 
@@ -443,7 +463,10 @@ needs draining; nothing is reconfigured underneath a running agent.
 
 ## 7. Soak shape
 
-Dates are **proposed**; the CTO owns them. Each stage's exit criteria must hold for its whole
+⚠ **§11 owns the dates. The per-stage dates below are the proposals §11 accepted; where §11 differs
+it wins, and it differs on stages 2 and 3.** Read this section for stage *shape* — population,
+pre-flight, observations, exit criteria — and §11 for *when*. (One owner per rule; this cross-reference
+exists so the two copies cannot drift.) Each stage's exit criteria must hold for its whole
 duration, not at a single instant. Day counts assume stage 0 completes; every stage boundary is a
 re-read of §4's trigger-2 query, not a one-time clearance.
 
@@ -459,7 +482,8 @@ silent broker and a broker nobody asked to publish are the same observation (§5
 
 **Stage 1 — one agent, one company.** **Does not start on a date. It starts when every precondition
 below is on `master`**, target **2026-11-06**, which is an earliest-start and not a commitment (CTO,
-2026-10-29). Duration ≥ 3 working days.
+2026-10-29). Duration ≥ 3 working days. ✅ **Set in §11.3, with the mechanical entry gate in §11.6 —
+two of whose four checks fail as of 2026-10-30.**
 
 **Stage 1's precondition set — all must be on `master`, ancestor-confirmed, not label-read:**
 
@@ -520,6 +544,8 @@ this plan; §3.5a closes it structurally, which is why #3123 is a **stage-1 prec
 follow-up.
 
 **Stage 2 — one company, all agents.** Proposed **2026-11-11 → 2026-11-18** (≥ 5 working days).
+⚠ **§11.3 re-set this as `stage-1 exit + 1 working day`, with these dates as the earliest case** —
+a fixed calendar date downstream of a conditional start compresses the soak when the start slips.
 Population: all `claude_k8s` agents in `b1d3f3d3` (Penstock) — **9 of the 11 agents in the company**
 (§3.5a), the other two being `claude_local` and never rendering a Job. §4's broad-render history
 counts 8 *distinct agents* fleet-wide and this plan has **not** mapped those 8 to companies, so do
@@ -532,6 +558,7 @@ whose runs stopped completing.
 Exit: as stage 1, plus no scheduling regression attributable to the sidecar.
 
 **Stage 3 — fleet.** Proposed **2026-11-19 → 2026-11-26**.
+⚠ **§11.3 re-set this as `stage-2 exit + 1 working day`, these dates being the earliest case.**
 Population: the second company (2 observed) and anything added since. A node-capacity check is a
 precondition here, not an observation.
 Exit: as stage 2, held for a full week.
@@ -583,6 +610,11 @@ Carried forward, unchanged in substance, with the review date §7.3 assigns it:
 | Read-confinement only — an argument naming a not-yet-existing path outside the roots is admitted | **2027-01-31** |
 | `diff.<driver>.textconv` and repository `core.hooksPath` are closed **elsewhere** (`--no-textconv` in the shim; the runtime's injected `core.hooksPath`) and are **not** stated in the broker's own policy list — a change to either file silently re-opens an exec route | **2027-01-31**, and on any change to those two files |
 
+✅ **The 2027-01-31 review date is bound by the CTO 2026-10-30 (§11.5), and §11.5 requires it to be
+given a carrier row before stage 3 exits.** A review date recorded only in this table has the same
+defect PEN-4988 exists to encode: a date with no owner is not a review, and the acceptance it
+succeeds is the thing that would quietly take it down.
+
 ⚠ **This successor residual is strictly smaller than §7.1's and must not be described as equivalent.**
 Under §7.1 the agent simply holds the token. Under D1 it must win a race or find an unenumerated
 config key. That is a real improvement and it is still not "the broker cannot be made to run
@@ -632,3 +664,224 @@ Stated so a later reader does not inherit them as stronger than they are:
   (not readable from this seat), and nothing about ten minutes later. It is also **not the thing
   §3.5a checks**: the refusal is on the assembled pod, so a clean `enableDocker` census is evidence
   that the refusal costs nothing today, not evidence that it will not fire.
+
+## 11. Date authority exercised — the dates, SET (CTO, 2026-10-30, PEN-5063)
+
+§9 reserves this to the CTO: *"PEN-5016 produces the plan; the CTO sets the date against it."* This
+section is that act. It is deliberately a separate section rather than an edit to §7, so that what
+Devops proposed and what the CTO set stay distinguishable in the history of this file.
+
+**Why this section exists at all, and not as a comment.** The date has been owed since 2026-10-29 and
+lived in two comment threads (my disposition `03d7f7d4` on PEN-4989, my *"I still owe the date"* on
+PEN-5016). PEN-4988 exists to encode the failure that a directive recorded only in a comment has no
+owner — and I cited it at Devops while leaving my own deliverable in exactly that shape. The dates
+are therefore set **here**, in the merged document, where they outlive the thread.
+
+### 11.1 The stage-1 precondition ledger, discharged (state re-read 2026-10-30T01:0xZ)
+
+⚠ Read this table, not §1's or §3.1's — those are revision-3 photographs and §3.1 says so itself.
+Every row was decided by **asking whether the content is on `master`**, never by reading a `MERGED`
+label. ⛔ And not by asking whether the PR's *head SHA* is an ancestor either: the merge queue
+**rebases**, so a merged PR's head SHA is generally **not** an ancestor of `master` even though its
+content is. #3123 is the worked example — `44069aa2f` is not an ancestor, and its content is on
+`master` as `87db03fcc` / `7c53b431c`. A ledger that tests head-SHA ancestry reports a landed
+precondition as outstanding, which is the *conservative* direction but still wrong.
+
+| # | What it is | State 2026-10-30 | Discharged? |
+|---|---|---|---|
+| [#3097](https://github.com/Blockcast/paperclip/pull/3097) | §5 starvation assertion | on `master` (`c0d8b83eb`) | ✅ |
+| [#3089](https://github.com/Blockcast/paperclip/pull/3089) | env-credential refusal | on `master` (`99905d39b`) | ✅ |
+| [#3120](https://github.com/Blockcast/paperclip/pull/3120) | §5 assertion recorded as satisfied | on `master` (`978ba0f6d`) | ✅ |
+| [#3123](https://github.com/Blockcast/paperclip/pull/3123) | PEN-5026 privilege-beside-broker refusal | **merged 2026-10-30T00:19:07Z**, content on `master` (`87db03fcc`, `7c53b431c`) | ✅ **new since revision 3** |
+| [#3098](https://github.com/Blockcast/paperclip/pull/3098) | §8 measurement, trigger-4 count 28 | **OPEN** — but now `CLEAN`, no longer `BEHIND`/red | ❌ |
+| [#3112](https://github.com/Blockcast/paperclip/pull/3112) | PEN-5017 provenance gate **+ the sole copy of the PEN-5027 `workspaceVolumeClaim` pin** (`7cea4d40b`) | **OPEN and `DIRTY`** — see §11.2 | ❌ |
+
+**Four of six discharged; two outstanding.** The two are not equivalent: #3098 needs a job re-run and
+an owner's attention, and #3112 needs a **conflict resolution pushed by Security** and is the one
+carrying an unrecoverable hazard.
+
+### 11.2 ⛔ The carry-forward hazard is now LIVE — #3112 is `DIRTY` and is the only carrier of the pin
+
+The hazard §1 warned about has fired. #3123 merged, carrying cherry-picks of #3112's **first four**
+commits but not its fifth. Measured on `master` this morning:
+
+```
+BROKERED_POD_COMPOSITION_CONFIG_KEYS  (server/src/services/heartbeat.ts:2871)
+  on master      → { enableDocker, dockerImage }                         ← TWO
+  on #3112 head  → { enableDocker, dockerImage, workspaceVolumeClaim }   ← THREE
+```
+
+**Two keys on `master` is the predicted signature of the pin having been dropped.** It has *not* been
+dropped — it is alive on `7cea4d40b` — but it now exists on exactly one branch, and that branch is
+`DIRTY`. **#3112 must be merged, never closed.** Four of its five commits are already on `master`,
+which is precisely what will make it look redundant to the next person who reads it.
+
+**The rebase is still safe, re-measured 2026-10-30 against the current `master` (not carried over
+from the 2026-10-29 measurement, which predates #3123 landing):** the four shared commits come back
+`skipped previously applied`, `server/src/services/heartbeat.ts` **auto-merges with all three keys
+intact**, and exactly **one** prose hunk conflicts, in
+`docs/security/PEN-3183-git-egress-enforcement-boundary-decision.md`.
+
+⚠ **That one conflict changed character when #3123 landed, and this is the part worth reading before
+resolving it.** It is no longer a side-pick. On 2026-10-29 the branch side was simply newer. Now
+**each side carries something the other lacks**:
+
+- `master` (HEAD) gained a sentence from #3123: *"§7.6 closes the privilege class structurally rather
+  than by a fifth key"* — which the branch predates and does not contain.
+- the branch (`7cea4d40b`) carries the corrected count — **five** keys closed, naming
+  `workspaceVolumeClaim` — which `master` still records as open.
+
+⇒ **Resolve it as a union, not by taking a side.** Taking `master` silently reverts the pin's own
+documentation while the pin lands; taking the branch silently deletes #3123's §7.6 sentence. Both
+failures are quiet and both land in a security decision record.
+
+**Owner: Security (`7500672d`), as the author of #3112.** This is a push, not a re-run — a `DIRTY`
+PR never merges on its own and the queue will not rebase it for you.
+
+### 11.3 The dates
+
+**Stage 0 — preparation. `2026-11-05`. SET, firm and unconditional.** Unchanged from the proposal and
+re-affirmed here. Stage 0 carries **no PR merges**, sets no gate, and does **not** wait on #3098 or
+#3112; it can complete with both still open. Its exit is the §7 list — saved §5.3 broker queries, §4
+re-read, §3.5a pre-flight, the §3.4 board-level env read, the §5.1 node baseline.
+
+**Stage 1 — one agent, one company. No calendar start date, by design. Earliest start `2026-11-06`.
+SET as a conditional start.** A date that fires before its preconditions is not a date, it is an
+instruction to skip them. Stage 1 starts on the first working day after **both** of these hold:
+
+1. **§11.1 reads six of six discharged**, each confirmed as content on `master`.
+2. **The entry gate in §11.6 passes.**
+
+Duration unchanged: ≥ 3 working days and ≥ 10 runs, exit on all six observations of §7.
+
+**`2026-11-12` — escalation date. SET.** If §11.1 is not six-of-six by end of day 2026-11-12, that is
+an escalation to the CTO and **not a silent slip**. To be concrete about what escalation means here,
+because "escalate" has been doing too much work: the CTO re-reads §11.2, decides whether #3112 is
+still recoverable, and if it is not, files the pin as a new carrier row before anything else. The
+open PRs are the live risk in this plan, not the soak.
+
+**Stage 2 — one company, all agents. `stage-1 exit + 1 working day`, ≥ 5 working days. Earliest
+`2026-11-11 → 2026-11-18`.**
+**Stage 3 — fleet. `stage-2 exit + 1 working day`, held a full week. Earliest `2026-11-19 → 2026-11-26`.**
+
+⚠ **This is a deliberate change from §7's proposal, which gave stages 2 and 3 fixed calendar dates.**
+Fixed dates downstream of a conditional start are not a schedule — they silently compress or skip the
+stage when the start slips, and the compression lands on the soak, which is the only part of this
+plan that produces evidence. The calendar dates are retained as the **earliest case**, i.e. what
+happens if stage 1 starts on 2026-11-06 and every exit is met on its first opportunity. They are not
+commitments and a slip upstream moves them.
+
+### 11.4 Rollback owner — bound, and the unreachable-Security gap closed
+
+§6's decision owner is **accepted as written: Security (`7500672d`)**, with §6's evidence list (two
+agents, named door, the three working-as-designed refusals ruled out, narrowing already tried)
+binding as the standard of proof.
+
+PEN-5063 required the owner to be *named*, because otherwise the first bad night makes the call by
+default. §6 names one. **What §6 does not say is what happens when that owner is unreachable**, and an
+owner who cannot be reached at 3am is operationally the same gap. Closing it:
+
+- On-call may always use the four non-§7.1 levers in §6's table — **narrow the stage, pause the
+  agent, restart a Job**. These restore service without re-opening §7.1 and need nobody's permission.
+  ⚠ Narrowing is very often the whole remedy (§6 row 4): if it restores service, the gate **stays on**
+  for the healthy stages and there is no rollback decision to make.
+- Setting the gate `false` for an already-enabled population stays **Security's alone**.
+- **If Security is unreachable, it escalates to the CTO (`29033747`) — not to on-call, and not by
+  default.** The CTO may make the call on §6's evidence standard and must record it on PEN-3183 §7.1
+  as a re-grant with a date, because that is what it is.
+- ⛔ **Silence is not authorisation.** An unanswered page does not promote the decision to whoever is
+  awake. The escalation path above is the only route, and until it completes the gate stays on and
+  the levers above are the response.
+
+### 11.5 The successor residual — review date bound, and it needs a carrier
+
+§8's four residuals and their **2027-01-31** review date are **bound**. PEN-5063 asked specifically
+that this not be silently dropped when the §7.1 acceptance ended, because an acceptance that ends can
+quietly take its successor with it.
+
+A date in a table is not yet a review. **Before stage 3 exits, the 2027-01-31 review must be given a
+carrier row**, owned by Security, referencing §8 and this section. Discharging §7.1 without that
+carrier is the failure mode, not the discharge.
+
+⚠ Two of the four do **not** wait for 2027-01-31: the `diff.<driver>.textconv` / `core.hooksPath` row
+is explicitly *"and on any change to those two files"*, and that trigger is live today. The carrier
+row owns that watch too.
+
+**The standing blind spot stays the CTO's**, unchanged and not re-granted: no cluster-wide exec
+telemetry, trigger 4 has a measurement and not a detector (PEN-4989). D1 does not close it; it makes
+it matter less. Recorded here so that discharging §7.1 is not read as closing it.
+
+### 11.6 Stage-1 entry gate — four checks, all mechanical
+
+Run these in order immediately before starting stage 1. Each is a command, not a judgement, and each
+has a stated failing value, so "I checked" is falsifiable.
+
+| # | Check | Pass | Measured 2026-10-30 |
+|---|---|---|---|
+| 1 | `BROKERED_POD_COMPOSITION_CONFIG_KEYS` on `master` | **three** keys incl. `workspaceVolumeClaim` | ⛔ **two — FAILS** (§11.2) |
+| 2 | §11.1 ledger | six of six on `master` | ⛔ **four of six — FAILS** |
+| 3 | §4 trigger-2 query, re-read over a window overlapping stage 0 | zero broad renders, with the liveness control | ✅ **pass** (§11.7) |
+| 4 | §3.5a privilege pre-flight across the stage-1 population | no privileged container beside the broker | ✅ **pass** (§11.7) |
+
+⛔ **Two of the four fail today. Stage 1 cannot start today, and that is the point of setting the
+date as a condition rather than as 2026-11-06.** Checks 3 and 4 are the perishable ones — re-run them
+at every widening, never cite this row.
+
+### 11.7 The §4 pre-flight, actually run (2026-10-30T01:0xZ)
+
+PEN-5063 asked for this to be *run*, not assumed — *"a refusal to build discovered at rollout is a
+much worse discovery than a query now"* — and for the **environment** scope as well as the agent
+config. Both were attempted. One succeeded, one is refused from every agent seat, and the refusal
+turns out not to matter. That last part is the finding.
+
+**(a) Agent config, stage-1 population (Devops `11b9c48f`) — clean.** `adapterConfig` reads `{}`:
+no `enableDocker`, no `dockerImage`, no `workspaceVolumeClaim`, no `isolationMode`. The §3.5a
+pre-flight is clean for the stage-1 population at agent scope, and so is the §3.5b key.
+
+**(b) Environment scope — NOT readable, and this is now measured rather than asserted.**
+`GET /api/environments/{id}` and the company-scoped list both return **`403 Board access required`**
+from the CTO seat; `GET /api/environments` is `404`. §3.4 recorded this for the env *credential*
+read from a Devops seat. It holds for the env *config* read, and it holds at CTO seat level too — so
+this is a property of the API's board boundary, not of which agent asks. **No agent seat can
+complete the configuration half of this pre-flight.**
+
+**(c) …and the render-time observation covers what the config read cannot. This is why (b) does not
+block.** The §4 warn is emitted from `resolveJobIsolation`, which reads `config.isolationMode` off
+the **merged** config (`job-manifest.ts:855`) — after every scope has been applied. So a broad render
+caused by an *environment*-scope setting fires exactly the same warn as an agent-scope one. The
+render observation is **scope-agnostic and strictly stronger than a config read**: it observes the
+assembled outcome rather than one layer of the input.
+
+Re-run over the 14 days to 2026-10-30T01:0xZ:
+
+| | |
+|---|---|
+| total broad renders | **1634** |
+| first / last | 2026-10-16T01:06:52Z / **2026-10-20T01:47:28Z** |
+| reason legs | `isolation_disabled` **1634**, `no_claim` 0, `foreign_claim` 0 |
+| distinct agents | **8** |
+| renders since 2026-10-20T01:47:28Z | **0** — ≈ 239 h clear |
+| **of which, by the stage-1 agent (`11b9c48f`)** | **234 historically, 0 since the cutoff** |
+
+**Liveness control, because silence is byte-identical to clear:** the `container="paperclip"` stream's
+newest entry at query time was 2026-10-30T01:01:02Z, seconds old. The zero is *"the warn site was
+evaluated and did not fire"*, not *"nobody looked"*.
+
+⭐ **The stage-1 agent is one of the 8 that historically rendered broad** — 234 times, all before the
+cutoff. §4 counted 8 distinct agents and did not attribute them; this attributes them, and the
+attribution strengthens the result rather than weakening it. Had the stage-1 population been chosen
+from agents that *never* rendered broad, a clean reading would have been consistent with "this agent
+was never affected". It is not: Devops **was** affected, and stopped when `BLO-47526` landed. The
+zero is evidence about the mechanism, not about the sample.
+
+⚠ **Bounds, stated so a later reader does not inherit this as stronger than it is.** This is a 10-day
+negative over Loki's retained window, liveness-controlled — it is **not** a configuration proof, and
+§4's surviving broad path is untouched by it: a run arriving with no runtime isolation descriptor and
+no `isolationMode` still reaches the `SHARED_JOB_ISOLATION` fallback (`:709`, `:832-834`). The zero is
+a property of the server supplying a descriptor on every render. A run path that stops supplying one
+renders broad — and once the gate is on, that is a hard build failure, not a quiet annotation.
+⇒ **Check 3 of §11.6 re-runs this at every widening. It is not cleared once.**
+
+**What remains owed to §3.4, and it is not this section's to close:** the board-level environment and
+project-scope read is still a stage-0 exit item with a **board/operator** owner, because no agent seat
+can perform it. (a)-(c) discharge PEN-5063's pre-flight requirement; they do not discharge §3.4.
