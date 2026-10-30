@@ -116,6 +116,7 @@ import {
 } from "./execution-workspace-policy.js";
 import { mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { buildInitialIssueMonitorFields, buildIssueMonitorEligibilityPatch, normalizeIssueExecutionPolicy, parseIssueExecutionState } from "./issue-execution-policy.js";
+import { isDeliberateParkActive, isIssueParkExpiryWakeStatus } from "./issue-park-expiry.js";
 import {
   ISSUE_EXECUTION_LOCK_REAPABLE_NEVER_STARTED_RUN_STATUSES,
   TERMINAL_HEARTBEAT_RUN_STATUS_VALUES,
@@ -2933,6 +2934,7 @@ type IssueBlockerAttentionNode = {
   executionRunId?: string | null;
   assigneeAgentId: string | null;
   assigneeUserId: string | null;
+  parkedUntil?: Date | string | null;
   monitorNextCheckAt?: Date | null;
   monitorAttemptCount?: number | null;
   executionPolicy?: unknown;
@@ -2942,7 +2944,7 @@ type IssueBlockerAttentionInputNode =
     IssueBlockerAttentionNode,
     "id" | "companyId" | "parentId" | "identifier" | "title" | "status" | "assigneeAgentId" | "assigneeUserId"
   >
-  & { executionRunId?: string | null };
+  & { executionRunId?: string | null; parkedUntil?: Date | string | null };
 
 type IssueBlockerAttentionEdge = {
   issueId: string;
@@ -3496,6 +3498,45 @@ async function listIssueProductivityReviewMap(
   return map;
 }
 
+/**
+ * Does a deliberate park on this blocker amount to an ATTENDED wait?
+ *
+ * PEN-5021. `blockerAttention` read a blocker's `status` and its monitor, but never its
+ * park — so a blocker that had been deliberately stood down, with a release wake already
+ * owed to it, was classified `stalled` exactly like one nobody had touched. Measured twice
+ * in one sweep (PEN-4969 via PEN-4874, PEN-4931 via PEN-4656) and five times across three
+ * sweeps, always with the same missing term. Each false `stalled` mints a `severity: "high"`
+ * attention item asking a human to pick an owner for work that is already owned.
+ *
+ * The conjuncts are exactly the ones that make the park produce a wake, because "attended"
+ * here means "something will come back to it", not "someone wrote a date on it":
+ *
+ *  - `isDeliberateParkActive` — the deadline is in the future. This is NOT restated here;
+ *    `services/issue-park-expiry.ts` is the documented single owner of the live-park
+ *    reading and names the three sites that once hand-copied it and drifted (BLO-27912,
+ *    BLO-22660). This is the fourth caller, not a fourth copy. A lapsed or unparseable
+ *    deadline reads as not-parked, so suppression expires on its own.
+ *  - `isIssueParkExpiryWakeStatus` — the sweep wakes `backlog`/`todo`/`in_progress`/
+ *    `in_review` only. `blocked` is deliberately excluded there, so a parked `blocked`
+ *    blocker keeps classifying as before.
+ *  - an agent to wake, and no human assignee — `issueParkOwesReleaseWake` requires both,
+ *    because `enqueueWakeup` takes an agent id and a park on a human-assigned row is a note
+ *    to a person rather than a schedulable wake. Covering a park that owes no wake would
+ *    open a quiet hole of exactly the kind PEN-5021's second half is about; human-assigned
+ *    blockers already reach `covered` by their own arm below.
+ *
+ * Consequently this can only move a blocker from `stalled` to `covered` — never from
+ * `needs_attention`, and never in the direction of more feed volume.
+ */
+function hasLiveDeliberateParkWakePath(
+  node: Pick<IssueBlockerAttentionNode, "status" | "assigneeAgentId" | "assigneeUserId" | "parkedUntil">,
+  nowMs: number,
+): boolean {
+  if (!isIssueParkExpiryWakeStatus(node.status)) return false;
+  if (!node.assigneeAgentId || node.assigneeUserId) return false;
+  return isDeliberateParkActive(node.parkedUntil, nowMs);
+}
+
 function hasValidBlockerMonitor(node: Pick<IssueBlockerAttentionNode, "monitorNextCheckAt" | "monitorAttemptCount" | "executionPolicy">): boolean {
   const nextCheckAt = node.monitorNextCheckAt;
   if (!nextCheckAt) return false;
@@ -3577,6 +3618,7 @@ async function listIssueBlockerAttentionMap(
           executionRunId: issues.executionRunId,
           assigneeAgentId: issues.assigneeAgentId,
           assigneeUserId: issues.assigneeUserId,
+          parkedUntil: issues.parkedUntil,
           monitorNextCheckAt: issues.monitorNextCheckAt,
           monitorAttemptCount: issues.monitorAttemptCount,
           executionPolicy: issues.executionPolicy,
@@ -3605,6 +3647,7 @@ async function listIssueBlockerAttentionMap(
           executionRunId: issues.executionRunId,
           assigneeAgentId: issues.assigneeAgentId,
           assigneeUserId: issues.assigneeUserId,
+          parkedUntil: issues.parkedUntil,
           monitorNextCheckAt: issues.monitorNextCheckAt,
           monitorAttemptCount: issues.monitorAttemptCount,
           executionPolicy: issues.executionPolicy,
@@ -3644,6 +3687,7 @@ async function listIssueBlockerAttentionMap(
           executionRunId: row.executionRunId,
           assigneeAgentId: row.assigneeAgentId,
           assigneeUserId: row.assigneeUserId,
+          parkedUntil: row.parkedUntil,
           monitorNextCheckAt: row.monitorNextCheckAt,
           monitorAttemptCount: row.monitorAttemptCount,
           executionPolicy: row.executionPolicy,
@@ -3690,6 +3734,9 @@ async function listIssueBlockerAttentionMap(
   for (const rootId of frontierByRoot.keys()) truncatedRootIds.add(rootId);
 
   const nodeIds = [...nodesById.keys()];
+  // One clock for the whole evaluation: a park that lapses mid-traversal must not classify
+  // one root differently from another in the same page.
+  const blockerAttentionNowMs = Date.now();
   const activeIssueIds = new Set<string>();
   const agentIds = new Set<string>();
   const issueIdByExecutionRunId = new Map<string, string>();
@@ -3842,6 +3889,13 @@ async function listIssueBlockerAttentionMap(
       return { covered: true, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
     }
     if (explicitWaitingIssueIds.has(node.id)) {
+      return { covered: true, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
+    }
+    // PEN-5021. Status-agnostic on purpose, and placed beside the other attendance reads
+    // rather than inside the `in_review` arm below: `in_review` is where the false `stalled`
+    // was measured, but a park is the same statement about attendance on every status the
+    // park-expiry sweep wakes, and one site cannot drift from itself.
+    if (hasLiveDeliberateParkWakePath(node, blockerAttentionNowMs)) {
       return { covered: true, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
     }
     if (node.assigneeUserId && node.status !== "cancelled") {
