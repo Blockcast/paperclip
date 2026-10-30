@@ -22,6 +22,7 @@
     "src/__tests__/github-api-refusal-metric.test.ts",
     "src/__tests__/github-webhook-dedicated-pool.test.ts",
     "src/__tests__/github-webhook-issue-lookup-filtered.test.ts",
+    "src/__tests__/heartbeat-owner-silence-gap-metric.test.ts",
     "src/__tests__/heartbeat-pending-image-bump-dispatch.test.ts",
     "src/__tests__/heartbeat-per-run-sub-stage-split.test.ts",
     "src/__tests__/heartbeat-periodic-reap-nested-sweep.test.ts",
