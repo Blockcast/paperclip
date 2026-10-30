@@ -20,17 +20,22 @@ import { externalWaitFromDescription } from "../services/issues.js";
 
 const docPath = fileURLToPath(new URL("../../../doc/execution-semantics.md", import.meta.url));
 
-function documentedSnippet(): string {
+const HEADING = "#### Declaring an external wait";
+
+function documentedSection(): string {
   const doc = readFileSync(docPath, "utf8");
-  const heading = "#### Declaring an external wait";
-  const headingIndex = doc.indexOf(heading);
-  expect(headingIndex, `"${heading}" is missing from doc/execution-semantics.md`).toBeGreaterThan(-1);
+  const headingIndex = doc.indexOf(HEADING);
+  expect(headingIndex, `"${HEADING}" is missing from doc/execution-semantics.md`).toBeGreaterThan(-1);
 
   // Bound the search to this section: stop at the next heading of any level, so a fence
   // added further down the document can never be picked up by mistake.
-  const rest = doc.slice(headingIndex + heading.length);
+  const rest = doc.slice(headingIndex + HEADING.length);
   const nextHeading = rest.search(/\n#{1,6} /);
-  const section = nextHeading === -1 ? rest : rest.slice(0, nextHeading);
+  return nextHeading === -1 ? rest : rest.slice(0, nextHeading);
+}
+
+function documentedSnippet(): string {
+  const section = documentedSection();
 
   // Take the fenced block that actually declares an external wait, rather than whichever
   // fence happens to come first — an unrelated example added above it must not retarget
@@ -39,7 +44,7 @@ function documentedSnippet(): string {
   const snippet = fences.find((body) => /^\s*external owner\s*:/im.test(body));
   expect(
     snippet,
-    `no fenced example declaring "external owner:" under "${heading}"`,
+    `no fenced example declaring "external owner:" under "${HEADING}"`,
   ).toBeTruthy();
   return snippet!;
 }
@@ -100,6 +105,57 @@ describe("external-wait declaration: doc and matcher agree", () => {
     expect(
       externalWaitFromDescription("\t External Owner :  CTO\n  EXTERNAL ACTION:\tApprove it"),
     ).toEqual({ owner: "CTO", action: "Approve it" });
+  });
+
+  it("states that the declaration is read only on a `blocked` row", () => {
+    // PEN-5065: every mechanical sentence in this section already happened to be scoped
+    // to `blocked` — all three consumers are (`isDeadEndBlocked`, the blocked-inbox
+    // `external_wait` attention, and the auto-resume suppression) — but the scope was
+    // never stated as a rule, so a reader writing the two lines onto a `todo` row had no
+    // way to learn they bought nothing. Measured 2026-10-29 across 756 open rows: 12
+    // carried a well-formed declaration, 6 of them on a non-`blocked` status.
+    //
+    // This is a prose assertion rather than a parser one on purpose, and it is the same
+    // drift this file exists to catch — just in the one direction a parser test cannot
+    // reach. There is no code path to exercise, because the defect IS the absence of
+    // feedback: the matcher never sees `status` and never will, so this section is the
+    // only thing that can tell an author about the scope. The announcement half is
+    // pinned separately in `stranded-blocked-issue-reconciler.test.ts`; the two regress
+    // independently, so both are asserted.
+    const section = documentedSection();
+    expect(section).toMatch(/read only on a `blocked` (issue|row)/i);
+    expect(section).toMatch(/\binert\b/i);
+  });
+
+  it("names a working instrument for each status the declaration does not cover", () => {
+    // Stating the restriction without naming the alternative would convert a silent
+    // no-op into a dead end: an agent that has correctly diagnosed a human gate on a
+    // `todo` row still needs somewhere to put it. A deliberate park is the general
+    // answer, because both strandedness sweeps count one on any status.
+    const section = documentedSection();
+    for (const status of ["todo", "in_progress", "in_review", "backlog"]) {
+      expect(section, `the section does not mention \`${status}\``).toContain(status);
+    }
+    expect(section).toContain("parkedDisposition");
+  });
+
+  it("does not offer a park as the `in_review` review path", () => {
+    // The one recommendation in that table that fails on the WRITE path rather than
+    // silently, and therefore the one most worth pinning. `assertAgentInReviewReviewPath`
+    // (server/src/routes/issues.ts) excludes a live park from the accepted `in_review`
+    // review paths deliberately (BLO-33572) — a park asserts nobody is acting on the row,
+    // which is the opposite of what `in_review` claims — and its remedy is to park on
+    // `todo`/`backlog` instead of moving to review. A park DOES hold an `in_review` row
+    // against both strandedness sweeps, which is exactly why the wrong advice looks
+    // right; the doc has to name the write-side refusal or a reader will reach for it.
+    const section = documentedSection();
+    const inReviewRow = section
+      .split("\n")
+      .find((line) => line.startsWith("| `in_review`"));
+    expect(inReviewRow, "no `in_review` row in the per-status instrument table").toBeTruthy();
+    expect(inReviewRow!).toMatch(/not a park/i);
+    // ...and at least one path the write-side gate actually accepts.
+    expect(inReviewRow!).toMatch(/interaction|approval|assigneeUserId|currentParticipant/);
   });
 
   it("truncates at the caps the doc documents", () => {
