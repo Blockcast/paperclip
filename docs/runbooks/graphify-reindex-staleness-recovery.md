@@ -25,7 +25,8 @@ graphify update server/src --force                      # ~5-7 min, no LLM key n
 git checkout --no-track -B graphify-regen origin/master # local name, deliberately NOT the PR branch
 git commit -am "chore: refresh knowledge graphs @ $(git rev-parse --short origin/master)"
 
-EXPECTED=$(git rev-parse origin/bot/graphify-reindex)   # the head you are replacing
+# the head you are replacing — ls-remote, because only `master` was fetched above
+EXPECTED=$(git ls-remote origin refs/heads/bot/graphify-reindex | cut -f1)
 git push --force-with-lease=refs/heads/bot/graphify-reindex:"$EXPECTED" \
          origin graphify-regen:bot/graphify-reindex
 ```
@@ -43,6 +44,10 @@ Two details in there are load-bearing, not style:
 - **A lease with an explicit sha.** A bare `--force-with-lease` takes its expectation
   from the remote-tracking ref, which any `fetch` in the same run can advance, so it
   protects nothing; the fleet's egress wrapper refuses it outright for that reason.
+  Read the sha with `git ls-remote` rather than `git rev-parse origin/<branch>`: the
+  sequence only fetches `master`, so the tracking ref for the PR branch is stale, or
+  absent in a fresh clone and `rev-parse` then errors. A stale sha fails the lease
+  closed rather than open, so this is a legibility fix, not a safety one.
 
 Measured cost: **5m04s** and **6m40s** on two runs (1350 files, 64 workers; the
 second had a competing build on the same box). No LLM key and no CronJob are

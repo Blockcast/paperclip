@@ -96,7 +96,7 @@ jobs:
             graphify update <scope> --force
             git checkout --no-track -B graphify-regen origin/${BASE_REF}
             git commit -am "chore: refresh knowledge graphs @ \$(git rev-parse --short origin/${BASE_REF})"
-            git rev-parse origin/<pr-branch>   # the sha you are replacing: <expected>
+            git ls-remote origin refs/heads/<pr-branch>   # the sha you are replacing: <expected>
             git push --force-with-lease=refs/heads/<pr-branch>:<expected> origin graphify-regen:<pr-branch>
 
           A neutral local name and an explicit refspec are both load-bearing.
@@ -106,6 +106,9 @@ jobs:
           ${BASE_REF}; and the name collides with the primary checkout if the PR
           branch is checked out there. A bare \`--force-with-lease\` takes its
           expectation from the tracking ref, so it protects nothing; name the sha.
+          \`ls-remote\` rather than \`rev-parse origin/<pr-branch>\` because only
+          ${BASE_REF} was fetched above: the tracking ref is stale or, in a fresh
+          clone, absent. A stale sha fails the lease closed, but confusingly.
 
           Do NOT merge or rebase ${BASE_REF} into the branch instead. Neither moves
           \`built_at_commit\` — it is a field inside graph.json, not a git relationship —
