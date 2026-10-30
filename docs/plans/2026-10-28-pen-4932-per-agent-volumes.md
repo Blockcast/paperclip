@@ -690,13 +690,76 @@ PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verificati
         possible, would have been the widest act of the three for exactly that reason — a second
         count against it.
 
-        **What is left.** Real closure needs either an fd-relative walk —
-        `openat(…, O_NOFOLLOW|O_DIRECTORY)` per component, then `fchown`/`fchmod` on the final fd
-        — which `sh` cannot express and so means moving the seeder out of shell, or serialising
-        same-agent runs on the claim, which costs exactly the concurrency PEN-4902 is preserving.
-        The fd-relative walk does not fight concurrency and should be costed first; note it
-        subsumes invariant 3's act as well, since `fchmod` on the fd `openat` already returned
-        needs no second resolution.
+        **Costed 2026-10-30, and the answer is neither of the two this plan last named.** The
+        two it named were an fd-relative walk — `openat(…, O_NOFOLLOW|O_DIRECTORY)` per
+        component, then `fchown`/`fchmod` on the final fd, which `sh` cannot express and so means
+        moving the seeder to a different image and a different language, carrying path-resolution
+        logic we would then own — and serialising same-agent runs on the claim, which costs
+        exactly the concurrency PEN-4902 is retiring concurrency-1 to preserve. Both harden or
+        avoid the race *across* the privilege boundary. There is a third option that **removes
+        the boundary**, and it costs about two lines of manifest.
+
+        **Recommendation: chown the volume ROOT once as uid 0, then do everything else as uid
+        1000.** Split the seeder in two:
+
+        | phase | uid | capabilities | does |
+        |---|---|---|---|
+        | A | 0 | `drop: ALL`, `add: [CHOWN]` | `chown 1000:1000 /mnt/paperclip-data-seed` — one inode, nothing else |
+        | B | 1000 (`runAsNonRoot`) | `drop: ALL`, none added | the component guard + `mkdir -m 2775 -p`; **no `chown` at all** |
+
+        **Phase A has no TOCTOU to speak of, and that is structural rather than lucky.** Its one
+        argument is the mount point itself — kubelet's own mount of the volume root. There are no
+        path components *inside* the volume between the process and the inode, so there is
+        nothing for a concurrent writer to swap; and the mount root cannot be replaced from
+        inside the volume (no pod can `rmdir` a mount root, and the parent directory is the
+        container's own rootfs, which no other pod shares). `DAC_OVERRIDE` is not needed —
+        phase A writes nothing — so the uid-0 surface shrinks from two capabilities over a whole
+        skeleton to one capability over one inode.
+
+        **Phase B dissolves the invariant rather than mitigating it.** Once the root is
+        `1000:1000`, every directory the seeder creates it creates *as* 1000, so no `chown` is
+        needed and `mkdir -m 2775` works because the creator is the owner (invariant 3 falls out
+        for free). The concurrent writer this invariant is about is a uid-1000 agent container —
+        now exactly as privileged as the seeder. A symlink planted inside the window redirects
+        phase B into doing something the planter could already do directly, so it stops being a
+        privilege boundary and therefore stops being a vulnerability. ⚠️ The component guard
+        should be **kept and re-labelled**: it remains worth having against accidents and against
+        a future re-privileged phase, but the comment must stop describing it as a security
+        control, or the next reader will take the boundary to still exist.
+
+        **Why this is available now and was not when the seeder was written.** The seeder needs
+        uid 0 only to create directories the agent must *not* own — the read-only toolchain
+        binds, of which the PEN-3156 pre-push hook dir was the sharp case. Stage 3b-iii emptied
+        `ROOT_TOOLCHAIN_SUBPATHS` (`job-manifest.ts:718`, now `[]`) and moved the hooks into the
+        image, and `readOnlySubPaths` derives to `[]` on **both** branches where the seeder can
+        exist: with `narrowWritableSurface` true the sole `rootMounts` entry carries no `subPath`
+        (`:3389-3398`), and with it false the seeder is `null` outright. So
+        `seedSubPaths === writableSubPaths` — **every path the seeder touches is one that ends
+        up 1000-owned anyway.** The uid-0 phase has nothing left to protect except the single
+        `chown` that makes 1000-ownership possible in the first place. This is read from source,
+        not executed; the nearest standing test asserts the hooks path's *absence* from the
+        seeder script (`job-manifest.test.ts:5246-5257`) rather than pinning the set's emptiness,
+        and an implementing PR should add that converse assertion.
+
+        **It also ends strictly tighter than today.** Phase B is PSS-**restricted** compliant
+        (non-root, all capabilities dropped); the current seeder is the one container in the Pod
+        that is merely baseline, and `job-manifest.test.ts:5399-5402` pins it as the only uid-0
+        container in the Job. After the split, the uid-0 container does one `chown` and nothing
+        else.
+
+        ⚠️ **This is 4b-only, and shipping it early would be a widening.** Chowning the volume
+        root to `1000:1000` is right for a per-agent volume and **wrong for the shared one** —
+        there it would let any agent pod create and delete entries at the root of the volume
+        every agent shares. Phase A must therefore be gated on the claim being per-agent, and
+        that gate does not exist yet: it arrives with the `dataClaimName` swap. Sequence it
+        *with* the swap, never ahead of it.
+
+        **Not measured.** Whether a freshly provisioned CephFS subvolume root accepts the chown
+        from inside the pod mount (it should — the mount *is* the subvolume root, so this is an
+        ordinary `setattr` — but it is the same unmeasured surface invariant 3 records, and this
+        seat has no `create` on `pvc`/`job`/`pod` to settle it). If it does not, the fd-relative
+        walk is still there as the fallback, and `fchmod` belongs beside `fchown` in it since it
+        subsumes invariant 3's act too — no second path resolution.
 5. **Demonstrate and re-measure.** PEN-4932's acceptance criterion.
 
 ### 4.1 The blocker stage 4 has to clear
@@ -1139,8 +1202,8 @@ would defeat this issue's own acceptance criterion.
 |---|---|
 | 1 — populate/relocate the server-materialized trees (incl. the prompt bundle) | **closed** — #3153 / #3157 / #3158, last merged 20:19:43Z. Inert until the swap, by design. |
 | 2 — symlinked-PARENT hole in the seeder | **closed** — #3161, merged 19:51:15Z |
-| 3 — directory MODE | **decided, not implemented** — `mkdir -m 2775 -p` (a separate `chmod` is unexecutable: the seeder has no `CAP_FOWNER`); converges only targets the seeder creates; the CephFS fresh-subvolume question is explicitly unmeasured |
-| 4 — guard is check-then-act under concurrent same-agent runs | **open** — remedy space narrowed to one candidate; `fsGroup` and "re-check between `mkdir` and `chown`" both ruled out |
+| 3 — directory MODE | **decided, not implemented** — `mkdir -m 2775 -p` (a separate `chmod` is unexecutable: the seeder has no `CAP_FOWNER`); converges only targets the seeder creates; the CephFS fresh-subvolume question is explicitly unmeasured. Subsumed if invariant 4's recommended split lands: as uid 1000 the seeder owns what it creates, so the mode needs no privilege at all |
+| 4 — guard is check-then-act under concurrent same-agent runs | **open, remedy recommended** — split the seeder: uid 0 chowns the volume ROOT only (one inode, no TOCTOU), everything else runs as uid 1000, which removes the privilege boundary instead of hardening the race across it. Available only because stage 3b-iii left `readOnlySubPaths` empty. Must ship WITH the `dataClaimName` swap, never before it. `fsGroup`, the post-`mkdir` re-check, and run serialisation all ruled out |
 
 ⚠️ **The acceptance criterion is UNMET and none of the above moves it.** Done-when 1 — *two agent
 pods on one node reporting distinct volume IDs* — is the `dataClaimName` swap itself, which is
