@@ -4295,18 +4295,35 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
               // later run's target. Fail closed rather than carry that into 4b
               // as a thing to remember.
               //
-              // SCOPE, stated rather than implied: this checks the FINAL
-              // component of each target. A symlinked PARENT component is not
-              // covered — `mkdir -p` would still create through it, onto a real
-              // directory reached by an unintended route. Closing that needs a
-              // per-component walk of every target, which belongs with 4b where
-              // it can be tested against a real fresh volume; §4 of
-              // `docs/plans/2026-10-28-pen-4932-per-agent-volumes.md` carries
-              // it as one of the three invariants 4a hands to 4b. Planting such a parent requires write access
-              // to ITS parent, which no narrowed pod has outside its own tree.
+              // SCOPE: every COMPONENT of every target, not just its final
+              // one. `mkdir -p` creates THROUGH a symlinked parent onto a real
+              // directory reached by an unintended route, so checking only the
+              // leaf leaves the redirect primitive intact one level up. The
+              // walk below strips one component at a time back to the volume
+              // root and refuses at the first link it meets, which is the
+              // invariant §4 of
+              // `docs/plans/2026-10-28-pen-4932-per-agent-volumes.md` hands
+              // from 4a to 4b.
+              //
+              // Still unreachable on THIS head, and that is why it is asserted
+              // rather than exercised: `resolveScopedWritableMounts` drops
+              // nested targets, and a narrowed pod has no path to another
+              // agent's subtree, so planting such a parent needs write access
+              // to ITS parent that no pod has. It becomes reachable the moment
+              // the claim is per-agent, because a per-agent volume PERSISTS
+              // across runs whose target sets differ — one run's writable tree
+              // can be an ancestor of a later run's target.
+              //
+              // `${d%/*}` rather than `dirname`: no subprocess per component,
+              // and no argument for a leading-dash path to be read as a flag.
+              // The `case` re-asserts containment on every step, so the walk
+              // also refuses a target that resolves outside the volume root at
+              // all, and it is what bounds the loop — `d` strictly shortens
+              // each pass, so it either reaches the root, meets a link, or
+              // leaves the root, and every one of those exits.
               `for p in ${seedSubPaths
                 .map((sp) => quoteShellArg(path.posix.join(SEED_VOLUME_ROOT_MOUNT_PATH, sp)))
-                .join(" ")}; do if [ -L "$p" ]; then echo "seed-writable-dirs: $p is a symlink; refusing" >&2; exit 1; fi; done`,
+                .join(" ")}; do d="$p"; while [ "$d" != '${SEED_VOLUME_ROOT_MOUNT_PATH}' ]; do case "$d" in '${SEED_VOLUME_ROOT_MOUNT_PATH}/'*) ;; *) echo "seed-writable-dirs: $p is not under the volume root; refusing" >&2; exit 1 ;; esac; if [ -L "$d" ]; then echo "seed-writable-dirs: $d is a symlink; refusing" >&2; exit 1; fi; d=\${d%/*}; done; done`,
               // One `mkdir -p` for everything, then chown only the writable set.
               `mkdir -p ${seedSubPaths
                 .map((sp) => quoteShellArg(path.posix.join(SEED_VOLUME_ROOT_MOUNT_PATH, sp)))

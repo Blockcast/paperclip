@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
@@ -5256,18 +5256,30 @@ describe("scoped writable mounts (BLO-32734)", () => {
       expect(script).not.toContain("paperclip-git-hooks");
     });
 
-    it("refuses a target that is already a symlink, before anything follows it", () => {
+    it("refuses a symlink at ANY component of a target, not just its final one", () => {
       const result = buildJobManifest({ ctx: isolatedCtx(), selfPod: makeSelfPod() });
       const script = seedOf(result)?.command?.[2] ?? "";
       // Both `mkdir -p` and a bare `chown` follow symlinks, and this is the one
-      // process in the Pod holding uid 0 over the volume root — so a link
-      // planted at a target path by a uid 1000 writer would redirect the chown
-      // onto its referent. The guard runs BEFORE the mkdir, so nothing is
-      // created through a planted link either.
+      // process in the Pod holding uid 0 over the volume root — so a link on
+      // the path to a target redirects a root `chown`, or has `mkdir -p` build
+      // through it onto a real directory reached by an unintended route. The
+      // guard runs BEFORE the mkdir, so nothing is created through a link
+      // either.
       const [guard, rest] = [script.split("; mkdir -p ")[0] ?? "", script.split("; mkdir -p ")[1] ?? ""];
-      expect(guard).toContain('if [ -L "$p" ]');
+      // A WALK, not a leaf test: `$d` starts at the target and is stripped one
+      // component at a time back to the volume root. A leaf-only check
+      // (`[ -L "$p" ]` and nothing else) leaves the redirect intact one level
+      // up, which is the hole 4a knowingly left for 4b.
+      expect(guard).toContain('d="$p"');
+      expect(guard).toContain('while [ "$d" != \'/mnt/paperclip-data-seed\' ]');
+      expect(guard).toContain('if [ -L "$d" ]');
+      expect(guard).toContain("d=${d%/*}");
       expect(guard).toContain("exit 1");
-      expect(rest).not.toContain('[ -L "$p" ]');
+      // Containment is re-asserted on every step, so a target that resolves
+      // outside the volume root is refused rather than walked past — and that
+      // is also what bounds the loop.
+      expect(guard).toContain("case \"$d\" in '/mnt/paperclip-data-seed/'*)");
+      expect(rest).not.toContain('[ -L "$d" ]');
       // Every target is guarded, read-only ones included: a symlinked
       // read-only target redirects the kubelet's bind just as surely.
       const spec = result.job.spec?.template?.spec;
@@ -5277,6 +5289,99 @@ describe("scoped writable mounts (BLO-32734)", () => {
       // `-h` so the chown itself cannot traverse a link created after the
       // guard ran. Redundant while init containers are sequential; free.
       expect(script).toContain("chown -h ");
+    });
+
+    // The assertions above pin the SHAPE of the guard. These RUN it, because
+    // the shape is a string and the property that matters is what `sh` does
+    // with it — a quoting slip or a non-terminating walk reads as fine above.
+    //
+    // The only edit made before execution is substituting the volume-root
+    // constant for a temp dir, applied uniformly to the whole script, so the
+    // logic under test is the shipped logic. This is the "tested against a real
+    // fresh volume" §4 asks for, at the one layer a unit test can reach: a real
+    // directory tree with real symlinks in it.
+    describe("the guard, executed against a real tree", () => {
+      const roots: string[] = [];
+      afterEach(() => {
+        for (const r of roots.splice(0)) rmSync(r, { recursive: true, force: true });
+      });
+
+      function runGuard(plant?: (root: string, firstTarget: string) => void) {
+        const result = buildJobManifest({ ctx: isolatedCtx(), selfPod: makeSelfPod() });
+        const script = seedOf(result)?.command?.[2] ?? "";
+        const guard = script.split("; mkdir -p ")[0] ?? "";
+        const root = mkdtempSync(join(tmpdir(), "seedwalk-"));
+        roots.push(root);
+        const firstTarget =
+          (result.job.spec?.template?.spec?.containers[0]?.volumeMounts ?? []).find(
+            (m) => m.name === "data" && m.subPath,
+          )?.subPath ?? "";
+        expect(firstTarget).not.toBe("");
+        plant?.(root, firstTarget);
+        // `set -e` is part of the guard's contract: it is the first element of
+        // the joined script, so carry it rather than re-deriving it.
+        return spawnSync("sh", ["-c", guard.replaceAll("/mnt/paperclip-data-seed", root)], {
+          encoding: "utf8",
+        });
+      }
+
+      it("passes on a fresh volume, where no target exists yet", () => {
+        // The ordinary case, and the one a regression would break loudly: the
+        // guard must not refuse merely because a target is absent.
+        const r = runGuard();
+        expect(r.stderr).toBe("");
+        expect(r.status).toBe(0);
+      });
+
+      it("passes when the targets already exist as real directories", () => {
+        const r = runGuard((root, firstTarget) => {
+          mkdirSync(join(root, firstTarget), { recursive: true });
+        });
+        expect(r.stderr).toBe("");
+        expect(r.status).toBe(0);
+      });
+
+      it("refuses when a target's FINAL component is a symlink", () => {
+        const r = runGuard((root, firstTarget) => {
+          mkdirSync(join(root, "elsewhere"), { recursive: true });
+          mkdirSync(join(root, firstTarget, ".."), { recursive: true });
+          symlinkSync(join(root, "elsewhere"), join(root, firstTarget));
+        });
+        expect(r.status).toBe(1);
+        expect(r.stderr).toContain("is a symlink; refusing");
+      });
+
+      it("refuses when a target's PARENT component is a symlink", () => {
+        // The hole this change closes. `mkdir -p` would have created the leaf
+        // happily THROUGH this link, onto a real directory reached by an
+        // unintended route, and the subsequent `chown -h` would then have
+        // handed uid 1000 a tree it was never scoped to.
+        const r = runGuard((root, firstTarget) => {
+          const parent = join(root, firstTarget, "..");
+          mkdirSync(join(root, "elsewhere"), { recursive: true });
+          mkdirSync(join(parent, ".."), { recursive: true });
+          symlinkSync(join(root, "elsewhere"), parent);
+        });
+        expect(r.status).toBe(1);
+        expect(r.stderr).toContain("is a symlink; refusing");
+      });
+
+      it("terminates — the walk cannot spin on a path it never recognises", () => {
+        // `d` strictly shortens each pass, and containment is re-checked on
+        // every step, so the loop always reaches an exit. Asserted by timeout
+        // rather than by reading the code: a non-terminating guard would hang
+        // the init container and the Job would never start, which is the one
+        // failure mode that looks like an infrastructure problem.
+        const result = buildJobManifest({ ctx: isolatedCtx(), selfPod: makeSelfPod() });
+        const guard = (seedOf(result)?.command?.[2] ?? "").split("; mkdir -p ")[0] ?? "";
+        const r = spawnSync("sh", ["-c", guard.replaceAll("'/mnt/paperclip-data-seed/", "'/nowhere/")], {
+          encoding: "utf8",
+          timeout: 15_000,
+        });
+        expect(r.signal).toBeNull();
+        expect(r.status).toBe(1);
+        expect(r.stderr).toContain("is not under the volume root; refusing");
+      });
     });
 
     it("is the only root container, and takes no more privilege than mkdir+chown need", () => {

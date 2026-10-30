@@ -482,15 +482,31 @@ PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verificati
 
         **This, not the skills tree alone, was the open design question on 4b's critical
         path. §4.2 closes it.**
-     2. **Close the symlinked-PARENT hole in the seeder.** The seeder holds uid 0 +
-        `DAC_OVERRIDE` + `CHOWN` over the volume root, and both `mkdir -p` and `chown` follow
-        symlinks. 4a refuses a target whose FINAL component is already a symlink and uses
-        `chown -h`, which removes the direct chown-redirect; a symlinked *parent* component is
-        still followed. Unreachable on the self claim and on 4a's head —
-        `resolveScopedWritableMounts` drops nested targets, and a narrowed pod cannot reach
-        another agent's subtree — but a per-agent volume PERSISTS across runs whose target sets
-        differ, so one run's writable tree can become an ancestor of a later run's target. 4b
-        needs a per-component walk, tested against a real fresh volume.
+     2. **Close the symlinked-PARENT hole in the seeder.** **CLOSED 2026-10-30.** The seeder
+        holds uid 0 + `DAC_OVERRIDE` + `CHOWN` over the volume root, and both `mkdir -p` and
+        `chown` follow symlinks. 4a refused a target whose FINAL component is already a symlink
+        and used `chown -h`, which removes the direct chown-redirect; a symlinked *parent*
+        component was still followed, and that is the worse of the two — the leaf case is caught
+        the moment `-L` looks at it, while the parent case has `mkdir -p` build the leaf
+        *through* the link onto a real directory reached by an unintended route, after which
+        `chown -h` hands uid 1000 a tree it was never scoped to, with nothing erroring.
+
+        The guard is now a per-component walk back to the volume root
+        (`d=${d%/*}`, no `dirname` subprocess and no leading-dash argument), with a `case` that
+        re-asserts containment on every step — which also refuses a target resolving outside the
+        root, and is what BOUNDS the loop. A guard that can spin is worse than no guard: it hangs
+        the init container and the Job never starts, which reads as an infrastructure fault
+        rather than a refusal.
+
+        Tested by EXECUTION against a real tree, not by shape alone — fresh volume, pre-existing
+        real dirs, symlinked leaf, symlinked parent, and an outside-the-root path under a
+        timeout — and mutation-checked: reverting to the 4a leaf-only guard fails three of them,
+        including the parent case, which exits 0 under the old guard. This was always
+        unreachable on the self claim (`resolveScopedWritableMounts` drops nested targets, and a
+        narrowed pod cannot reach another agent's subtree), which is why it is closed *ahead* of
+        the swap rather than when it bites: a per-agent volume PERSISTS across runs whose target
+        sets differ, so one run's writable tree can become an ancestor of a later run's target,
+        and the fleet exercise 4a relied on cannot surface it.
      3. **Decide the directory MODE.** The seeder `chown`s but sets no mode, so its dirs inherit
         its umask rather than the `2775` setgid the server-side path got from its parent. Moot
         while the dirs already exist (the `mkdir` no-ops); on a genuinely fresh volume 4a's dirs
