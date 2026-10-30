@@ -349,6 +349,7 @@ describe("collectPreflightBlockers", () => {
   const issuesSpecs = PRECREATE_REQUIRED_INDEXES.filter((spec) => spec.table === "issues");
   const wakeupRequestSpecs = PRECREATE_REQUIRED_INDEXES.filter((spec) => spec.table === "agent_wakeup_requests");
   const costEventsSpecs = PRECREATE_REQUIRED_INDEXES.filter((spec) => spec.table === "cost_events");
+  const issueCommentsSpecs = PRECREATE_REQUIRED_INDEXES.filter((spec) => spec.table === "issue_comments");
 
   // Both probes are reads with no effects, so their *verdict* is covered by
   // `decidePreflightBlocker` above and what is left to pin is how many times
@@ -409,18 +410,21 @@ describe("collectPreflightBlockers", () => {
 
     await collectPreflightBlockers(PRECREATE_REQUIRED_INDEXES, probes);
 
-    // Eight heartbeat_runs entries, two issues entries and one
-    // agent_wakeup_requests entry and one cost_events entry collapse to four probes. Asserted as a
+    // Eight heartbeat_runs entries, two issues entries, one
+    // agent_wakeup_requests entry, one cost_events entry and one
+    // issue_comments entry collapse to five probes. Asserted as a
     // set-with-count so adding a registry entry on an existing table does not
     // move this number.
     expect(populationCalls.sort()).toEqual([
       "agent_wakeup_requests",
       "cost_events",
       "heartbeat_runs",
+      "issue_comments",
       "issues",
     ]);
     expect(
-      heartbeatSpecs.length + issuesSpecs.length + wakeupRequestSpecs.length + costEventsSpecs.length,
+      heartbeatSpecs.length + issuesSpecs.length + wakeupRequestSpecs.length + costEventsSpecs.length
+      + issueCommentsSpecs.length,
     ).toBe(
       PRECREATE_REQUIRED_INDEXES.length,
     );

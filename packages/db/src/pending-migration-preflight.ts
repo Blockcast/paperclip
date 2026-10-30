@@ -221,6 +221,27 @@ export const PRECREATE_REQUIRED_INDEXES: readonly PrecreateRequiredIndex[] = [
       "CREATE INDEX CONCURRENTLY IF NOT EXISTS cost_events_company_issue_idx " +
       "ON cost_events USING btree (company_id, issue_id)",
   },
+  {
+    // PEN-3596 / 0269. Needs btree_gin, which migration 0268 creates -- so on
+    // a database where 0268 has not run yet this command must be preceded by
+    // `CREATE EXTENSION IF NOT EXISTS btree_gin;`. Every deployed database has
+    // it already; the remediation below is what an operator pastes, and it is
+    // spelled out here rather than left implicit because the failure without
+    // it reads `data type uuid has no default operator class for access
+    // method gin`, which does not name the extension.
+    migration: "0269_issue_comments_company_scoped_trigram_search_index.sql",
+    name: "issue_comments_company_body_search_idx",
+    table: "issue_comments",
+    createStatement:
+      "CREATE EXTENSION IF NOT EXISTS btree_gin; " +
+      "CREATE INDEX CONCURRENTLY IF NOT EXISTS issue_comments_company_body_search_idx " +
+      "ON issue_comments USING gin (company_id, body gin_trgm_ops)",
+    // ^ the extension is part of the remediation, not decoration: this is the
+    // only registry entry whose index cannot be built by its CREATE INDEX
+    // alone, and the error without it names an operator class rather than the
+    // extension. The migration's HINT carries the same two statements, which
+    // the "identical to the migration's own HINT" test pins.
+  },
 ];
 
 export type PreflightBlocker = {

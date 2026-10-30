@@ -4848,10 +4848,19 @@ function issueRef(row: Pick<IssueRow, "id" | "identifier" | "title" | "status" |
  * assertions and the measured table.
  *
  * Each arm is a standalone indexable predicate, so each is served by its own
- * company-scoped trigram index (migration 0268); the comment arm is served by
- * `issue_comments_body_search_idx` BitmapAnd'ed with
- * `issue_comments_company_idx`. Semantics are unchanged — this is the same
- * disjunction, expressed so the planner can reach the indexes.
+ * company-scoped trigram index: the three `issues` arms by migration 0268, the
+ * comment arm by `issue_comments_company_body_search_idx` (migration 0269).
+ * Semantics are unchanged — this is the same disjunction, expressed so the
+ * planner can reach the indexes.
+ *
+ * ⚠️ The comment arm was NOT company-scoped between 0268 and 0269, and that
+ * was the residual: `issue_comments_body_search_idx` BitmapAnd'ed with
+ * `issue_comments_company_idx` built the term's trigram bitmap across every
+ * company before intersecting it, so a common term still cost 16–22s in
+ * production against the 30s bound while a no-match term cost 0.251s. 0269
+ * company-scopes it (~6x on this arm) and drops the un-scoped index, which had
+ * no remaining caller. Do not reintroduce an un-scoped trigram index on
+ * `issue_comments.body`.
  *
  * ⚠️ Exported, and extracted from `list()` rather than written inline, so the
  * shape itself is assertable: `issues-service.test.ts` renders this fragment
