@@ -769,7 +769,9 @@ PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verificati
         alongside it as equally sufficient, and that was itself an overstatement — it is narrower
         than the withdrawn paragraph needed, and is kept below, demoted, because getting it wrong
         the second time is part of the record.** (They are listed here in the opposite order to
-        PR #3167's description, which presented the narrow one first.)
+        PR #3167's description *as originally written*, which presented the narrow one first and
+        repeated the "either sufficient" claim; that description was corrected in the same review
+        cycle, so the two now agree.)
 
         1. **The widening it feared is not reachable — and this reason carries the withdrawal by
            itself.** Under `narrowWritableSurface` — which is a *precondition of the seeder
