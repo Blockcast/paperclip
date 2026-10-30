@@ -135,6 +135,7 @@ const {
   describeFiredTimeoutBound,
   buildTimeoutExecutionResult,
   execute,
+  promptBundleSizingKey,
 } = await import("./execute.js");
 
 // Real class, not a stub: the prompt-cache mock above is a partial that passes
@@ -4424,5 +4425,71 @@ describe("execute: timeout result construction (PEN-4023)", () => {
     // And the defective formatting is gone from the file entirely, not merely
     // bypassed at this one call site.
     expect(source).not.toMatch(/Timed out after \$\{timeoutSec\}s/);
+  });
+});
+
+describe("promptBundleSizingKey (PEN-4932 stage 4b)", () => {
+  // This key is the whole correctness argument for reporting a CACHED sizing as this
+  // run's own measurement. `bundleKey` covers the instructions and every skill's
+  // content, but NOT the three inputs `skillSourceNeedsProjection` reads — so if any
+  // of them stopped changing the key, two runs that project different entry sets would
+  // share a cache slot and one would be reported with the other's bytes.
+  const base = {
+    bundleKey: "bundle-key-aaa",
+    serverDataMountPath: "/paperclip",
+    skills: [
+      { key: "alpha", runtimeName: "alpha", source: "/paperclip/skills/co/alpha" },
+      { key: "beta", runtimeName: "beta", source: "/app/skills/beta" },
+    ],
+    catalogBackedSkillKeys: new Set(["alpha"]),
+  };
+
+  it("is stable for identical inputs", () => {
+    expect(promptBundleSizingKey(base)).toBe(promptBundleSizingKey({ ...base }));
+  });
+
+  it("is stable across skill input order", () => {
+    // The cache must hit when only the caller's array order differs, or it degrades to
+    // no cache at all on a set the server legitimately reorders.
+    expect(promptBundleSizingKey({ ...base, skills: [...base.skills].reverse() })).toBe(
+      promptBundleSizingKey(base),
+    );
+  });
+
+  it("changes when the bundle key changes", () => {
+    expect(promptBundleSizingKey({ ...base, bundleKey: "bundle-key-bbb" })).not.toBe(
+      promptBundleSizingKey(base),
+    );
+  });
+
+  it("changes when a skill source path moves", () => {
+    const moved = [{ ...base.skills[0]!, source: "/srv/elsewhere/alpha" }, base.skills[1]!];
+    expect(promptBundleSizingKey({ ...base, skills: moved })).not.toBe(promptBundleSizingKey(base));
+  });
+
+  it("changes when the server data mount changes", () => {
+    expect(promptBundleSizingKey({ ...base, serverDataMountPath: "/mnt/data" })).not.toBe(
+      promptBundleSizingKey(base),
+    );
+  });
+
+  it("changes when the catalog-backed set changes", () => {
+    // The input that decides whether an off-mount entry is projected or treated as an
+    // image path, so a sizing computed under one set must not be served under another.
+    expect(promptBundleSizingKey({ ...base, catalogBackedSkillKeys: new Set(["alpha", "beta"]) })).not.toBe(
+      promptBundleSizingKey(base),
+    );
+  });
+
+  it("changes when a skill's runtimeName changes", () => {
+    const renamed = [{ ...base.skills[0]!, runtimeName: "alpha-v2" }, base.skills[1]!];
+    expect(promptBundleSizingKey({ ...base, skills: renamed })).not.toBe(promptBundleSizingKey(base));
+  });
+
+  it("does not collide when a delimiter-looking string appears inside a field", () => {
+    // Fields are NUL-separated precisely so a source containing the separator text
+    // cannot forge a different entry's encoding.
+    const sneaky = [{ key: "alpha", runtimeName: "alpha", source: "/paperclip/skills/co/alpha\u0000x" }, base.skills[1]!];
+    expect(promptBundleSizingKey({ ...base, skills: sneaky })).not.toBe(promptBundleSizingKey(base));
   });
 });

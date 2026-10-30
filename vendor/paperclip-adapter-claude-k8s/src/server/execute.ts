@@ -17,6 +17,8 @@ import {
 } from "./prompt-cache.js";
 import {
   PROMPT_BUNDLE_SECRET_MAX_BYTES,
+  PromptBundleOverBudgetError,
+  PromptBundleTooManyFilesError,
   buildPromptBundleSecretProjection,
 } from "./prompt-bundle-projection.js";
 import type { PromptBundleSecretProjection } from "./prompt-bundle-projection.js";
@@ -40,7 +42,7 @@ import { getSelfPodInfo, getBatchApi, getCoreApi, SELF_POD_DATA_MOUNT_PATH } fro
  * per distinct bundle held forever. Only the handful of numbers the log line prints is
  * kept, so a full cache costs kilobytes regardless of how large the trees are.
  */
-type PromptBundleSizing = Pick<
+type PromptBundleSizedOutcome = { outcome: "sized" } & Pick<
   PromptBundleSecretProjection,
   | "totalValueBytes"
   | "fileCount"
@@ -51,7 +53,27 @@ type PromptBundleSizing = Pick<
   | "escalationThresholdCrossed"
 >;
 
-const EMPTY_PROMPT_BUNDLE_SIZING: PromptBundleSizing = {
+/**
+ * A refusal is cached too, and that is the whole point rather than a detail.
+ *
+ * `buildPromptBundleSecretProjection` throws on an over-budget or over-file-count
+ * bundle, so caching only the success path would leave exactly the LARGEST bundles —
+ * the ones this measurement exists to find — re-reading the whole skill farm on every
+ * run forever. Sound to cache because both refusals are deterministic for a given
+ * cache key: the key covers the content hash, the sources, the mount and the catalog
+ * set, and the thresholds are constants, so the same key cannot refuse once and
+ * succeed the next time.
+ *
+ * ⚠️ ONLY those two. An I/O fault (ENOENT mid-walk, EIO off CephFS) is transient, and
+ * caching one would suppress the measurement for the life of the process on the
+ * strength of a blip — so those are reported and NOT remembered.
+ */
+type PromptBundleRefusedOutcome = { outcome: "refused"; errorName: string; error: string };
+
+type PromptBundleSizing = PromptBundleSizedOutcome | PromptBundleRefusedOutcome;
+
+const EMPTY_PROMPT_BUNDLE_SIZING: PromptBundleSizedOutcome = {
+  outcome: "sized",
   totalValueBytes: 0,
   fileCount: 0,
   binaryFileCount: 0,
@@ -61,9 +83,12 @@ const EMPTY_PROMPT_BUNDLE_SIZING: PromptBundleSizing = {
   escalationThresholdCrossed: false,
 };
 
-function summarizePromptBundleProjection(projection: PromptBundleSecretProjection | null): PromptBundleSizing {
+function summarizePromptBundleProjection(
+  projection: PromptBundleSecretProjection | null,
+): PromptBundleSizedOutcome {
   if (!projection) return EMPTY_PROMPT_BUNDLE_SIZING;
   return {
+    outcome: "sized",
     totalValueBytes: projection.totalValueBytes,
     fileCount: projection.fileCount,
     binaryFileCount: projection.binaryFileCount,
@@ -72,6 +97,11 @@ function summarizePromptBundleProjection(projection: PromptBundleSecretProjectio
     bytesBySkillKey: projection.bytesBySkillKey,
     escalationThresholdCrossed: projection.escalationThresholdCrossed,
   };
+}
+
+/** The two deterministic refusals, as opposed to a transient I/O fault. */
+function isDeterministicProjectionRefusal(err: unknown): boolean {
+  return err instanceof PromptBundleOverBudgetError || err instanceof PromptBundleTooManyFilesError;
 }
 
 /**
@@ -86,7 +116,7 @@ function summarizePromptBundleProjection(projection: PromptBundleSecretProjectio
  *
  * All metadata, so building this reads no files — the point of the cache.
  */
-function promptBundleSizingKey(input: {
+export function promptBundleSizingKey(input: {
   bundleKey: string;
   serverDataMountPath: string;
   skills: Array<{ key: string; runtimeName: string; source: string }>;
@@ -2847,49 +2877,84 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       catalogBackedSkillKeys,
     });
     const cached = PROMPT_BUNDLE_SIZING_CACHE.get(sizingKey);
-    const sized =
-      cached ??
-      summarizePromptBundleProjection(
-        await buildPromptBundleSecretProjection({
+    let sized: PromptBundleSizing;
+    if (cached) {
+      sized = cached;
+    } else {
+      try {
+        sized = summarizePromptBundleProjection(
+          await buildPromptBundleSecretProjection({
+            companyId: ctx.agent.companyId,
+            runLabel: ctx.runId,
+            skills: desiredSkills,
+            instructionsContents,
+            serverDataMountPath: SELF_POD_DATA_MOUNT_PATH,
+            // The discriminator `prompt-cache.ts` keys on. Without it the prefix test
+            // alone would call every catalog skill an image path and drop it from the
+            // projection wherever PAPERCLIP_HOME is not under the server mount.
+            catalogBackedSkillKeys,
+          }),
+        );
+      } catch (err) {
+        // A deterministic refusal is remembered under the same key, so the bundles
+        // that cannot fit the channel stop re-reading the whole skill farm every run.
+        // Anything else is rethrown unremembered: a transient I/O fault must not
+        // suppress the measurement for the life of the process.
+        if (!isDeterministicProjectionRefusal(err)) throw err;
+        sized = {
+          outcome: "refused",
+          errorName: err instanceof Error ? err.name : "unknown",
+          error: err instanceof Error ? err.message : String(err),
+        };
+      }
+      rememberPromptBundleSizing(sizingKey, sized);
+    }
+    if (sized.outcome === "refused") {
+      // Same warn the catch below emits, reached without rebuilding the projection.
+      // The refusals ARE the signal this measurement exists to find, so a company
+      // that would not fit the channel stays visible on every run rather than only
+      // on the first one that happened to compute it.
+      console.warn(
+        JSON.stringify({
+          level: "warn",
+          event: "claude_k8s.prompt_bundle_projection_failed",
+          msg: "could not size the projected prompt-bundle Secret; run is unaffected (measurement only)",
           companyId: ctx.agent.companyId,
-          runLabel: ctx.runId,
-          skills: desiredSkills,
-          instructionsContents,
-          serverDataMountPath: SELF_POD_DATA_MOUNT_PATH,
-          // The discriminator `prompt-cache.ts` keys on. Without it the prefix test
-          // alone would call every catalog skill an image path and drop it from the
-          // projection wherever PAPERCLIP_HOME is not under the server mount.
-          catalogBackedSkillKeys,
+          runId: ctx.runId,
+          errorName: sized.errorName,
+          error: sized.error,
+          sizingCacheHit: cached !== undefined,
         }),
       );
-    if (!cached) rememberPromptBundleSizing(sizingKey, sized);
-    console.info(
-      JSON.stringify({
-        level: "info",
-        event: "claude_k8s.prompt_bundle_projection_sized",
-        msg: "measured the projected per-run prompt-bundle Secret size (PEN-4932 stage 4b; not yet the delivery path)",
-        companyId: ctx.agent.companyId,
-        runId: ctx.runId,
-        // Raw value bytes — the quantity `ValidateSecret` checks, across `stringData`
-        // and base64 `data` alike. See the module header: §4.2's sample figure was
-        // base64-inflated.
-        totalValueBytes: sized.totalValueBytes,
-        fileCount: sized.fileCount,
-        // Non-UTF-8 files, which have to travel base64. Zero today is the expected
-        // reading; a non-zero one says some skill tree ships an asset, which is worth
-        // knowing before the Secret becomes the delivery path.
-        binaryFileCount: sized.binaryFileCount,
-        // Files the walk stepped over and the pod will therefore not get. Emitted so
-        // that "visible rather than silent" is a property of this channel rather than
-        // a claim about it, and so the byte total is read with its own omissions.
-        skippedSymlinkCount: sized.skippedSymlinkCount,
-        skippedNonRegularCount: sized.skippedNonRegularCount,
-        maxBytes: PROMPT_BUNDLE_SECRET_MAX_BYTES,
-        escalationThresholdCrossed: sized.escalationThresholdCrossed,
-        bytesBySkillKey: sized.bytesBySkillKey,
-        sizingCacheHit: cached !== undefined,
-      }),
-    );
+    } else {
+      console.info(
+        JSON.stringify({
+          level: "info",
+          event: "claude_k8s.prompt_bundle_projection_sized",
+          msg: "measured the projected per-run prompt-bundle Secret size (PEN-4932 stage 4b; not yet the delivery path)",
+          companyId: ctx.agent.companyId,
+          runId: ctx.runId,
+          // Raw value bytes — the quantity `ValidateSecret` checks, across `stringData`
+          // and base64 `data` alike. See the module header: §4.2's sample figure was
+          // base64-inflated.
+          totalValueBytes: sized.totalValueBytes,
+          fileCount: sized.fileCount,
+          // Non-UTF-8 files, which have to travel base64. Zero today is the expected
+          // reading; a non-zero one says some skill tree ships an asset, which is worth
+          // knowing before the Secret becomes the delivery path.
+          binaryFileCount: sized.binaryFileCount,
+          // Files the walk stepped over and the pod will therefore not get. Emitted so
+          // that "visible rather than silent" is a property of this channel rather than
+          // a claim about it, and so the byte total is read with its own omissions.
+          skippedSymlinkCount: sized.skippedSymlinkCount,
+          skippedNonRegularCount: sized.skippedNonRegularCount,
+          maxBytes: PROMPT_BUNDLE_SECRET_MAX_BYTES,
+          escalationThresholdCrossed: sized.escalationThresholdCrossed,
+          bytesBySkillKey: sized.bytesBySkillKey,
+          sizingCacheHit: cached !== undefined,
+        }),
+      );
+    }
   } catch (err) {
     // Includes the deliberate over-budget and too-many-files refusals, which are the
     // signal this measurement exists to find. Logged at warn with the error's own
