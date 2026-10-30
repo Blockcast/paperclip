@@ -429,20 +429,56 @@ PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verificati
      the moment the claim is per-agent, so none of them can be caught by the fleet exercise 4a
      relies on:
 
-     1. **Populate the server-materialized tree, or relocate it.** ⬇ **Halved by 3b-iii.**
-        `.local/share/paperclip-git-hooks` and `skills/<companyId>` were both written by the
-        SERVER into the server's own volume, and on a per-agent claim the seeder creates them and
-        they stay EMPTY. The hooks half is **closed**: 3b-iii emptied `ROOT_TOOLCHAIN_SUBPATHS`,
-        so the Job does not mount that dir on any claim and there is nothing left to populate —
-        §3.6's relocation finished it rather than deferring it here.
+     1. **Populate the server-materialized trees, or relocate them.** One closed by 3b-iii,
+        one newly found. `.local/share/paperclip-git-hooks` and `skills/<companyId>` were both
+        written by the SERVER into the server's own volume, and on a per-agent claim the seeder
+        creates them and they stay EMPTY. The hooks half is **closed**: 3b-iii emptied
+        `ROOT_TOOLCHAIN_SUBPATHS`, so the Job does not mount that dir on any claim and there is
+        nothing left to populate — §3.6's relocation finished it rather than deferring it here.
 
-        `skills/<companyId>` remains, and it is the worse of the two: an empty skills tree dangles
-        the prompt bundle's skill links **silently**, where the hooks dir failed closed and loudly.
-        The `claude_k8s.data_claim_foreign` warn now names it alone. It is also harder than the
+        `skills/<companyId>` remains: an empty skills tree dangles the prompt bundle's skill links
+        **silently**, where the hooks dir failed closed and loudly. It is also harder than the
         hooks dir was — skills are per-company and agents create them at runtime, so "bake it into
         the image" is not available. Either the server's materializer has to reach the per-agent
-        claim, or the seeding moves inside the pod the way `mkdir`/`chown` already did in 4a. **This
-        is the open design question on 4b's critical path.**
+        claim, or the seeding moves inside the pod the way `mkdir`/`chown` already did in 4a.
+
+        **⚠️ And it is not alone. Corrected 2026-10-30: the PROMPT BUNDLE ITSELF is a third
+        server-materialized tree, and it dominates both.** This invariant previously counted two
+        trees and then one; the count was wrong each time because it was read off the `subPath`
+        mount list, and the bundle is not a mount — it is a directory the server *writes into* one
+        of the mounts.
+
+        `execute.ts` prepares it with `prepareClaudePromptBundle`, under a comment that states the
+        assumption exactly: *"One volume, TWO mount points: this process writes at
+        `SELF_POD_DATA_MOUNT_PATH` and the K8s Job pod reaches the same bytes at
+        `resolveDataMountPath(config)`."* That is true today and **false the moment the claim is
+        per-agent** — same relative path, different volume. The server writes a complete bundle
+        into its own volume; the pod gets the seeded, empty directory. `--add-dir` then names an
+        empty tree and `--append-system-prompt-file` names a file that does not exist.
+
+        So the failure is not a degraded skill set, it is **the agent losing its instructions** —
+        and it is silent in the same way, since nothing on the write side errors. Measured on a
+        live pod 2026-10-30: the bundle exists at
+        `instances/default/data/k8s-isolation/<companyId>/<agentId>/<key>/prompt-cache/<bundleKey>`,
+        owned `node:node`, carrying `agent-instructions.md` (3,491 bytes) and `.claude/skills/`.
+
+        It also does not share the skills tree's REMEDY, which is why it changes the shape of 4b
+        rather than lengthening its list. Skills can be fixed by getting the right bytes onto the
+        claim. The bundle cannot: it is written per-run, at Job-creation time, to a path the server
+        chooses, so there is no tree to pre-populate. **The write target has to move onto a channel
+        that does not assume a shared volume** — the same kind of channel the prompt text already
+        rides (`prompt-secret`, a per-run Secret the `write-prompt` init container copies into an
+        emptyDir). A Secret caps at 1 MiB; the one live company skills tree measures 133 KB over 44
+        files (2026-10-30), which fits, but that is one company and not a ceiling — size it before
+        committing to that channel.
+
+        ⛔ Do **not** reach for the other obvious option, a read-only mount of the server's claim
+        beside the per-agent one. §2 already refuses it for the tooling row and the reasoning is
+        unchanged here: a shared read-only claim is still one volume ID mounted by every agent pod
+        on the node, taking the same ceph-csi lock through the same `NodeUnstageVolume` path.
+        It would also defeat this issue's own acceptance criterion.
+
+        **This, not the skills tree alone, is the open design question on 4b's critical path.**
      2. **Close the symlinked-PARENT hole in the seeder.** The seeder holds uid 0 +
         `DAC_OVERRIDE` + `CHOWN` over the volume root, and both `mkdir -p` and `chown` follow
         symlinks. 4a refuses a target whose FINAL component is already a symlink and uses

@@ -717,6 +717,41 @@ const AGENT_UID_GID = "1000:1000";
 // entry comes back, re-add its whole symlink unit — see above).
 const ROOT_TOOLCHAIN_SUBPATHS: readonly string[] = [];
 
+/**
+ * POD address of the prompt-cache root — where `execute.ts` writes the prompt
+ * bundle and where the agent container reads it back — or null to let the
+ * bundle fall back to its managed server-side default.
+ *
+ * Every branch returns a path the CONTAINER must be able to resolve, which is
+ * why the last one is rooted at `resolveDataMountPath` and not at a literal
+ * `/paperclip` — the same correction BLO-32734 applied to the other five
+ * isolation roots. That branch is the runtime-descriptor case: config-source
+ * isolation always populates `isolation.promptCacheRoot`, but a runtime
+ * descriptor may leave it "".
+ *
+ * PEN-4932 moved this here from `execute.ts`, where it was private. It is not
+ * tidying: the `data_claim_foreign` warning below must name the directory that
+ * will actually be read, and a second copy of this precedence would be free to
+ * drift from the first. The descriptor branch is exactly where a re-derivation
+ * goes wrong — `isolation.root` is `dirname(homeRoot)` there, which for a
+ * workspace descriptor is `…/k8s-isolation/workspaces/<wsId>`, while the bundle
+ * lands under `…/k8s-isolation/<companyId>/<agentId>/<key>`. Those are different
+ * trees, and the obvious derivation picks the wrong one.
+ */
+export function resolvePromptCacheRoot(
+  config: Record<string, unknown>,
+  ctx: AdapterExecutionContext,
+  isolation: JobIsolation,
+): string | null {
+  const configured = asString(config.promptCacheRoot, "").trim();
+  if (configured) return configured;
+  if (!isolation.enabled) return null;
+  if (isolation.promptCacheRoot) return isolation.promptCacheRoot;
+  const safe = (value: string) => sanitizeForK8sPath(value) || "unknown";
+  const root = `${resolveDataMountPath(config)}/instances/default/data/k8s-isolation/${safe(ctx.agent.companyId)}/${safe(ctx.agent.id)}/${isolation.key}`;
+  return `${root}/prompt-cache`;
+}
+
 function sharedPnpmStorePath(rawCompanyId: string, dataMountPath: string): string {
   const companyId = sanitizeForK8sPath(rawCompanyId);
   assertSafePathComponent("companyId", companyId);
@@ -3244,30 +3279,68 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // `seed-writable-dirs` creates every target, so nothing EACCESes. What it
   // CANNOT do is populate them.
   //
-  // ONE target is materialized by the SERVER, and only ever into the server's
-  // own volume, so on a foreign claim it comes up EMPTY:
+  // TWO of those targets are materialized by the SERVER, and only ever into the
+  // server's own volume, so on a foreign claim they come up EMPTY. Neither
+  // fails loudly, and the second is the severe one:
   //
   //   `skills/<companyId>` — the company skill tree. Empty means the prompt
-  //       bundle's skill links dangle, which degrades SILENTLY. That is the
-  //       dangerous direction, and it is now the only one left here.
+  //       bundle's skill links dangle, which degrades SILENTLY.
+  //   `<promptCacheRoot>` — the prompt bundle ITSELF. `execute.ts` prepares it
+  //       with `prepareClaudePromptBundle`, which writes at
+  //       `SELF_POD_DATA_MOUNT_PATH` while the pod reads the same relative path
+  //       at `dataMountPath` — "one volume, TWO mount points" (execute.ts).
+  //       That identity holds only while the two mounts are the same VOLUME. On
+  //       a per-agent claim the server writes a complete bundle into its OWN
+  //       volume and the pod gets the seeded, empty directory: `--add-dir` names
+  //       an empty tree and `--append-system-prompt-file` names a file that does
+  //       not exist. That is the agent's INSTRUCTIONS going missing, not a
+  //       degraded skill set — and it was absent from this list until PEN-4932
+  //       re-read the write path, which is why it is spelled out rather than
+  //       appended.
   //
-  // `.local/share/paperclip-git-hooks` used to be listed beside it and is not
-  // any more: stage 3b-iii emptied `ROOT_TOOLCHAIN_SUBPATHS`, so the Job does
-  // not mount it on ANY claim and there is nothing left for a per-agent claim to
+  // The two do not share a REMEDY. The skills tree can be fixed by getting the
+  // right bytes onto the claim. The bundle cannot: it is written per-run by the
+  // server at Job-creation time, to a path the server chooses, so there is no
+  // tree to pre-populate — the write TARGET has to move onto a channel that does
+  // not assume a shared volume, the same kind of channel the prompt text already
+  // rides (`prompt-secret`).
+  //
+  // `.local/share/paperclip-git-hooks` used to be listed here and is not any
+  // more: stage 3b-iii emptied `ROOT_TOOLCHAIN_SUBPATHS`, so the Job does not
+  // mount it on ANY claim and there is nothing left for a per-agent claim to
   // fail to populate. §3.6's relocation into the image closed it for good rather
-  // than moving it onto 4b's plate — which is what makes this list shorter by
-  // one real blocker rather than by an omission.
+  // than moving it onto 4b's plate.
   //
-  // Stage 4b must therefore materialize the skills tree into the per-agent claim
-  // or relocate it. Say so here so the FIRST per-agent run reports the reason
+  // Stage 4b must materialize both of the remaining two into the per-agent claim
+  // or relocate them. Say so here so the FIRST per-agent run reports the reason
   // rather than the symptom.
   if (narrowWritableSurface && !serverCanPreCreate) {
+    // Pod address -> volume-relative subPath, for the bundle root only. The
+    // other two entries are volume-relative constants; this one is derived
+    // per-run, through the SAME function `execute.ts` uses to choose the write
+    // target, so the warning cannot name a directory no run reads.
+    //
+    // Emitted only when it is under `dataMountPath`. An operator-set
+    // `promptCacheRoot` can point off-volume (at the `/runtime-cache` emptyDir,
+    // say), and such a path has no volume-relative address at all: slicing a
+    // prefix that does not match would put a confident wrong path into the one
+    // field stage 4b reads. Omission is the honest answer — and an off-volume
+    // bundle is a different fault, already reported as
+    // `claude_k8s.prompt_bundle_off_volume` by `prepareClaudePromptBundle`.
+    const promptCacheRoot = resolvePromptCacheRoot(config, ctx, isolation);
+    const dataPrefix = dataMountPath.endsWith("/") ? dataMountPath : `${dataMountPath}/`;
+    const promptCacheSubPath = promptCacheRoot?.startsWith(dataPrefix)
+      ? promptCacheRoot.slice(dataPrefix.length)
+      : null;
     console.warn(
       JSON.stringify({
         level: "warn",
         event: "claude_k8s.data_claim_foreign",
-        msg: "Job volume is not the server's own claim; server-materialized trees will be empty (company skills missing)",
-        unpopulatedSubPaths: [path.posix.join(INSTANCE_ROOT_SUBPATH, "skills", sanitizeForK8sPath(agent.companyId))],
+        msg: "Job volume is not the server's own claim; server-materialized trees will be empty (company skills missing, prompt bundle absent so the agent loses its instructions)",
+        unpopulatedSubPaths: [
+          path.posix.join(INSTANCE_ROOT_SUBPATH, "skills", sanitizeForK8sPath(agent.companyId)),
+          ...(promptCacheSubPath ? [promptCacheSubPath] : []),
+        ],
         runId,
         jobName,
         dataClaimName,

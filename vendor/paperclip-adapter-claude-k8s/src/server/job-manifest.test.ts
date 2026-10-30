@@ -5103,17 +5103,61 @@ describe("scoped writable mounts (BLO-32734)", () => {
         selfPvcClaimName: "paperclip-data",
         jobName: job.metadata?.name,
       });
-      // Named explicitly rather than described in prose: this is the path stage
-      // 4b has to materialize or relocate. Asserted as the EXACT list, not with
-      // `toContain`: the git-hooks entry leaving is the point of stage 3b-iii,
-      // and a containment check would not notice it coming back.
-      expect(entries[0]?.unpopulatedSubPaths).toEqual(["instances/default/skills/co1"]);
+      // Named explicitly rather than described in prose: these are the paths
+      // stage 4b has to materialize or relocate. Asserted as the EXACT list,
+      // not with `toContain`: the git-hooks entry leaving is the point of stage
+      // 3b-iii, and a containment check would not notice it coming back.
+      //
+      // The second entry is the prompt bundle. `execute.ts` writes it at
+      // SELF_POD_DATA_MOUNT_PATH and the pod reads the same relative path at
+      // `dataMountPath`, so a foreign claim leaves the pod with the seeded,
+      // EMPTY directory: no `--add-dir` tree and no
+      // `--append-system-prompt-file`. Pinned by its literal volume-relative
+      // path, because the whole defect is that the path is right and the
+      // VOLUME is not.
+      //
+      // That path is NOT `dirname(homeRoot)/prompt-cache`. For a workspace
+      // descriptor the home tree is `…/k8s-isolation/workspaces/<wsId>` while
+      // the bundle lands under `…/k8s-isolation/<companyId>/<agentId>/<key>` —
+      // two different trees, and the obvious re-derivation picks the wrong one.
+      // The exact-list assertion pins that too.
+      expect(entries[0]?.unpopulatedSubPaths).toEqual([
+        "instances/default/skills/co1",
+        "instances/default/data/k8s-isolation/co1/agent-abc/workspacews-1/prompt-cache",
+      ]);
     } finally {
       warn.mockRestore();
     }
   });
 
-  it("stays silent on the server's own claim, where both trees are already populated", () => {
+  // The bundle root is the one derived entry, so it is the one that can be
+  // derived WRONG. An operator-set `promptCacheRoot` off the data volume has no
+  // volume-relative address at all; emitting a slice of a non-matching prefix
+  // would put a confident wrong path in the one field stage 4b reads. Omission
+  // is the honest answer, and the other two entries must survive it.
+  it("omits the bundle root from the foreign-claim warning when it is off-volume", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const ctx = isolatedCtx();
+      ctx.config.workspaceVolumeClaim = "some-other-claim";
+      ctx.config.promptCacheRoot = "/runtime-cache/prompt-cache";
+      buildJobManifest({ ctx, selfPod: makeSelfPod({ pvcClaimName: "paperclip-data" }) });
+      const entries = warn.mock.calls
+        .map(([line]) => (typeof line === "string" && line.startsWith("{") ? JSON.parse(line) : null))
+        .filter((entry) => entry?.event === "claude_k8s.data_claim_foreign");
+      expect(entries).toHaveLength(1);
+      const subPaths: string[] = entries[0]?.unpopulatedSubPaths ?? [];
+      // The skills entry must SURVIVE the omission — dropping the bundle root
+      // must not drop the list.
+      expect(subPaths).toEqual(["instances/default/skills/co1"]);
+      // Specifically not the off-volume path with its leading slash eaten.
+      expect(subPaths).not.toContain("runtime-cache/prompt-cache");
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("stays silent on the server's own claim, where all three trees are already populated", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
       buildJobManifest({ ctx: isolatedCtx(), selfPod: makeSelfPod() });
