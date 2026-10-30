@@ -310,6 +310,35 @@ PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verificati
    image in the same change. Only after 1–2; this is the step that actually retires the
    cross-agent mount, and the first step that can break a running agent.
 
+   **Status 2026-10-30: 3b-ii's verification gate is SATISFIED and 3b-iii is this change.** Both
+   were read as properties inside a live agent pod running the fleet image, never from a tag or a
+   merge:
+
+   | gate | required | measured 2026-10-30 |
+   |---|---|---|
+   | baked hook exists and is executable (3b-ii) | `/usr/local/libexec/paperclip/hooks/pre-push`, `X_OK` | present, `root:root 0755`, `X_OK` ✅ — the 2026-10-29 baseline recorded it **absent** |
+   | runtime resolves the baked copy (3b-iii precondition) | installed `@paperclipai/adapter-utils` `hooksDirectory()` → `BAKED_HOOKS_DIR` | `BAKED_HOOKS_DIR` ✅ (`DEFAULT_HOOKS_DIR` occurs 0 times in the built module) |
+   | no env override aims it back at the PVC | `PAPERCLIP_GIT_EGRESS_HOOKS_DIR` unset | unset in-pod, and set by nothing in this repo ✅ |
+   | `kubectl` pin (#3081) survives unshadowing | `/usr/local/bin/kubectl` is `v1.35.3` | `v1.35.3` ✅ (`PATH` still resolves `kubectl` to the PVC copy, which is what this stage retires) |
+
+   **The agent plane is ahead of the server plane here, which is the safe order.** Measured the
+   same day: the agent image is at master tip, while a pod created at 05:25:48Z still carried all
+   **seven** toolchain `subPath`s — so `paperclip-api` had not yet picked up #3104 (merged
+   2026-10-29T13:13:08Z, ≥16 h earlier), and `paperclip_api_deploy_drift_stale` reads `0`
+   throughout, so that exporter does not measure this. Read the server plane from the mounts a
+   fresh pod actually has; do not read it from that metric.
+
+   That ordering is what makes 3b-iii safe rather than merely green: the hazard §4 names is a
+   server that has stopped mounting the PVC copy *in front of* images that still look there. The
+   images stopped looking first, and they roll per-commit while the server rolls daily — so the
+   window cannot open in the dangerous direction.
+
+   **What is deliberately NOT in 3b-iii:** the Helm seed in
+   `deploy/helm/paperclip/templates/statefulset.yaml` still writes the PVC copy. It is now
+   unmounted rather than deleted, which keeps a revert path that does not need a chart release.
+   Remove it in a separate change once this has soaked, per §3.6's posture of keeping a rollback
+   ready for a fleet-wide push refusal.
+
    ⚠️ **Two planes roll independently — measured 5h45m apart — but they do NOT both bear on
    3b-ii.** An earlier revision of this section said they did; that was wrong, and which stage
    carries the skew hazard is the whole point of the 3b split, so it is corrected here rather than
@@ -400,13 +429,20 @@ PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verificati
      the moment the claim is per-agent, so none of them can be caught by the fleet exercise 4a
      relies on:
 
-     1. **Populate the server-materialized trees, or relocate them.**
-        `.local/share/paperclip-git-hooks` and `skills/<companyId>` are written by the SERVER into
-        the server's own volume. On a per-agent claim the seeder creates them and they stay
-        EMPTY — an empty hooks dir fails every push closed (BLO-48361), an empty skills tree
-        dangles the prompt bundle's skill links silently. 4a warns
-        `claude_k8s.data_claim_foreign` naming both; 4b must either materialize them into the
-        per-agent claim or finish the §3.6 relocation of the hooks dir into the image.
+     1. **Populate the server-materialized tree, or relocate it.** ⬇ **Halved by 3b-iii.**
+        `.local/share/paperclip-git-hooks` and `skills/<companyId>` were both written by the
+        SERVER into the server's own volume, and on a per-agent claim the seeder creates them and
+        they stay EMPTY. The hooks half is **closed**: 3b-iii emptied `ROOT_TOOLCHAIN_SUBPATHS`,
+        so the Job does not mount that dir on any claim and there is nothing left to populate —
+        §3.6's relocation finished it rather than deferring it here.
+
+        `skills/<companyId>` remains, and it is the worse of the two: an empty skills tree dangles
+        the prompt bundle's skill links **silently**, where the hooks dir failed closed and loudly.
+        The `claude_k8s.data_claim_foreign` warn now names it alone. It is also harder than the
+        hooks dir was — skills are per-company and agents create them at runtime, so "bake it into
+        the image" is not available. Either the server's materializer has to reach the per-agent
+        claim, or the seeding moves inside the pod the way `mkdir`/`chown` already did in 4a. **This
+        is the open design question on 4b's critical path.**
      2. **Close the symlinked-PARENT hole in the seeder.** The seeder holds uid 0 +
         `DAC_OVERRIDE` + `CHOWN` over the volume root, and both `mkdir -p` and `chown` follow
         symlinks. 4a refuses a target whose FINAL component is already a symlink and uses
