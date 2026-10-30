@@ -4534,4 +4534,45 @@ describe("describeProjectionRefusal (PEN-4932 stage 4b)", () => {
     expect(refusal.errorName).toBe("PromptBundleTooManyFilesError");
     expect(refusal.detail).toEqual({ kind: "too_many_files", skillKey: "many", limit: 5 });
   });
+
+  // The two symlink refusals route through the same `name`-keyed branch chain. Getting
+  // one wrong does not throw — it reports the wrong `kind` with undefined fields — so
+  // each gets its own assertion rather than relying on the chain's shape.
+  it("carries the escaping-symlink refusal structurally", async () => {
+    const { PromptBundleSymlinkEscapesTreeError } = await import("./prompt-bundle-projection.js");
+    const refusal = describeProjectionRefusal(
+      new PromptBundleSymlinkEscapesTreeError({
+        skillKey: "linky",
+        linkPath: "docs/alias.md",
+        resolvedTarget: "/elsewhere/secret.md",
+        treeRoot: "/skills/linky",
+      }),
+    );
+    expect(refusal.errorName).toBe("PromptBundleSymlinkEscapesTreeError");
+    expect(refusal.detail).toEqual({
+      kind: "symlink_escapes_tree",
+      skillKey: "linky",
+      linkPath: "docs/alias.md",
+      resolvedTarget: "/elsewhere/secret.md",
+      treeRoot: "/skills/linky",
+    });
+  });
+
+  it("carries the symlink-cycle refusal structurally", async () => {
+    const { PromptBundleSymlinkCycleError } = await import("./prompt-bundle-projection.js");
+    const refusal = describeProjectionRefusal(
+      new PromptBundleSymlinkCycleError({
+        skillKey: "loopy",
+        linkPath: "self",
+        resolvedTarget: "/skills/loopy",
+      }),
+    );
+    expect(refusal.errorName).toBe("PromptBundleSymlinkCycleError");
+    expect(refusal.detail).toEqual({
+      kind: "symlink_cycle",
+      skillKey: "loopy",
+      linkPath: "self",
+      resolvedTarget: "/skills/loopy",
+    });
+  });
 });

@@ -179,16 +179,25 @@ export type PromptBundleSecretProjection = {
   /** How many of `fileCount` had to travel base64 because they are not valid UTF-8. */
   binaryFileCount: number;
   /**
-   * Symlinks stepped over by the walk, summed across every projected tree.
+   * Symlinks RESOLVED within the tree and projected, summed across every tree.
    *
-   * Reported rather than merely skipped: a skipped link is a file the pod will not get,
-   * and leaving it out of both the log and `bytesBySkillKey` would under-count the
-   * measurement in silence — which is the same class of fault as a dropped skill, just
-   * smaller. The PR's claim that stepping over links is "visible rather than silent" is
-   * only true because this is counted.
+   * Non-zero is now a normal, fully-delivered outcome rather than the blocker it was
+   * while links were stepped over: each one contributed its target's bytes under the
+   * link's own path, which is what the pod reads today. Anything that could NOT be
+   * resolved that way is a refusal, not a number — see `PromptBundleSymlinkEscapesTreeError`
+   * and `PromptBundleSymlinkCycleError`.
    */
-  skippedSymlinkCount: number;
-  /** Non-regular, non-directory, non-symlink entries stepped over (fifo, socket, …). */
+  resolvedSymlinkCount: number;
+  /**
+   * Symlinks that resolve nowhere, stepped over.
+   *
+   * The one link outcome that is counted rather than refused, because it is the one
+   * that cannot be a delivery regression: a dangling link gives the pod nothing today
+   * either. Still reported, because a skill shipping one is probably broken in a way
+   * its author wants to know about.
+   */
+  danglingSymlinkCount: number;
+  /** Non-regular, non-directory entries stepped over (fifo, socket, …), link-resolved. */
   skippedNonRegularCount: number;
   /** Per-skill byte totals, so an over-budget verdict can name the contributor. */
   bytesBySkillKey: Record<string, number>;
@@ -247,6 +256,75 @@ export class PromptBundleOverBudgetError extends Error {
     this.maxBytes = input.maxBytes;
     this.fileCount = input.fileCount;
     this.bytesBySkillKey = input.bytesBySkillKey;
+  }
+}
+
+/**
+ * Raised when a symlink inside a skill tree resolves to a target OUTSIDE that tree.
+ *
+ * Refusing is the only safe answer, and the reason is two separate faults meeting at
+ * one link. **Delivery:** the pod reads the bundle by traversing the real tree today,
+ * so it follows the link and gets the target's bytes — but the target is reachable
+ * only because the pod shares the server's volume, which is exactly what a per-agent
+ * claim takes away. Projecting the link and not its target would make it dangle on the
+ * swap; stepping over it would drop a file the pod gets today. **Containment:** copying
+ * an arbitrary out-of-tree target into this run's Secret would carry whatever the link
+ * names — another company's tree, a host path — into a value this run's pod can read.
+ * There is no projection that is both faithful and contained, so the projection refuses
+ * and the operator re-points the link or vendors the file into the tree.
+ */
+export class PromptBundleSymlinkEscapesTreeError extends Error {
+  /** A literal discriminant, for the reason given on `PromptBundleOverBudgetError`. */
+  declare readonly name: "PromptBundleSymlinkEscapesTreeError";
+  readonly skillKey: string;
+  readonly linkPath: string;
+  readonly resolvedTarget: string;
+  readonly treeRoot: string;
+
+  constructor(input: { skillKey: string; linkPath: string; resolvedTarget: string; treeRoot: string }) {
+    super(
+      `skill "${input.skillKey}" contains a symlink at "${input.linkPath}" resolving to ` +
+        `"${input.resolvedTarget}", which is outside the skill tree "${input.treeRoot}". ` +
+        `Refusing rather than projecting: the pod reads the target through the shared volume ` +
+        `today and would lose it on a per-agent claim, and copying an out-of-tree target into ` +
+        `the run's Secret would carry bytes the tree does not own. Re-point the link inside the ` +
+        `tree or vendor the file into it.`,
+    );
+    this.name = "PromptBundleSymlinkEscapesTreeError";
+    this.skillKey = input.skillKey;
+    this.linkPath = input.linkPath;
+    this.resolvedTarget = input.resolvedTarget;
+    this.treeRoot = input.treeRoot;
+  }
+}
+
+/**
+ * Raised when a directory symlink resolves onto one of its own ancestors.
+ *
+ * Such a link expands without bound — the pod sees `a/self/self/…` for as long as
+ * anything keeps opening it — so there is no finite projection of it. The walk refuses
+ * instead of stopping at an arbitrary depth, because stopping would silently decide
+ * which of those paths the pod gets. Note this is a true CYCLE check, not a
+ * seen-directory check: two sibling links onto the same real directory are not a cycle,
+ * the pod really does see that content under both names, and both are projected.
+ */
+export class PromptBundleSymlinkCycleError extends Error {
+  /** A literal discriminant, for the reason given on `PromptBundleOverBudgetError`. */
+  declare readonly name: "PromptBundleSymlinkCycleError";
+  readonly skillKey: string;
+  readonly linkPath: string;
+  readonly resolvedTarget: string;
+
+  constructor(input: { skillKey: string; linkPath: string; resolvedTarget: string }) {
+    super(
+      `skill "${input.skillKey}" contains a directory symlink at "${input.linkPath}" resolving ` +
+        `to its own ancestor "${input.resolvedTarget}", which expands without bound. ` +
+        `Refusing rather than truncating at an arbitrary depth.`,
+    );
+    this.name = "PromptBundleSymlinkCycleError";
+    this.skillKey = input.skillKey;
+    this.linkPath = input.linkPath;
+    this.resolvedTarget = input.resolvedTarget;
   }
 }
 
@@ -337,40 +415,134 @@ type CollectedSkillFile = {
 
 type CollectedSkillTree = {
   files: CollectedSkillFile[];
-  skippedSymlinkCount: number;
+  resolvedSymlinkCount: number;
+  danglingSymlinkCount: number;
   skippedNonRegularCount: number;
 };
 
-/** Depth-first walk of a skill source directory, yielding regular files only. */
+/** One directory still to walk, carrying the realpath chain that proves it is not a cycle. */
+type PendingDir = {
+  /** Path relative to the skill root, as the pod will see it. */
+  relDir: string;
+  /** Fully-resolved path of `relDir`, so a child's realpath needs no extra syscall. */
+  realDir: string;
+  /** Realpaths of this directory and every ancestor, for the cycle test. */
+  ancestors: ReadonlySet<string>;
+};
+
+/**
+ * Whether `candidate` is `root` or sits beneath it, compared on path BOUNDARIES.
+ *
+ * A bare `startsWith` would accept `/skills/foo-evil` as inside `/skills/foo`, which is
+ * the containment check failing open on exactly the input it exists to reject. Both
+ * arguments must already be realpaths — a containment test run on unresolved paths
+ * proves nothing, since any component could be a link.
+ */
+function isWithinTree(root: string, candidate: string): boolean {
+  return candidate === root || candidate.startsWith(root.endsWith(path.sep) ? root : `${root}${path.sep}`);
+}
+
+/**
+ * Depth-first walk of a skill source directory, yielding regular files.
+ *
+ * ⛔ SYMLINKS ARE RESOLVED-WITHIN-TREE OR REFUSED — never stepped over. The earlier
+ * draft counted and skipped them, which was safe only while this projection was
+ * measurement-only. `hashPathContents` (`prompt-cache.ts:190-205`) *resolves* a link
+ * with `realpath` and hashes the target, and the pod reads the bundle by traversing the
+ * real tree, so a link inside a skill delivers its target's bytes TODAY. A projection
+ * that steps over it therefore becomes, on the run that swaps `dataClaimName`, a file
+ * the pod used to get and silently stops getting — the precise dangling-skill failure
+ * this channel exists to prevent, reintroduced by the change meant to close it.
+ *
+ * So every link takes exactly one of four outcomes, and none of them is silent:
+ *
+ *   * resolves to a regular file inside the tree  => projected under the LINK's path,
+ *     carrying the TARGET's bytes, matching what the pod reads today;
+ *   * resolves to a directory inside the tree     => descended into, so its files
+ *     project under the link's path as the pod sees them;
+ *   * resolves outside the tree                   => `PromptBundleSymlinkEscapesTreeError`;
+ *   * resolves nowhere (dangling)                 => counted, not refused — a dangling
+ *     link delivers nothing to the pod today either, so stepping over it is the one
+ *     case that cannot be a delivery regression. Refusing here would instead abort runs
+ *     that work today, which is a regression in the other direction.
+ *
+ * Still iterative rather than recursive: a skill tree is operator-supplied, and a link
+ * cycle must not be a stack overflow at Job-creation time. Cycles are refused outright
+ * (see `PromptBundleSymlinkCycleError`) rather than cut off at a depth, because cutting
+ * off silently picks which of the expanded paths the pod gets.
+ */
 async function collectSkillFiles(input: {
   entry: PaperclipSkillEntry;
   maxFiles: number;
 }): Promise<CollectedSkillTree> {
   const { entry, maxFiles } = input;
   const out: CollectedSkillFile[] = [];
-  let skippedSymlinkCount = 0;
+  let resolvedSymlinkCount = 0;
+  let danglingSymlinkCount = 0;
   let skippedNonRegularCount = 0;
-  // Iterative rather than recursive: a skill tree is operator-supplied and a symlink
-  // cycle would otherwise be a stack overflow at Job-creation time. `withFileTypes`
-  // reports the link itself, and `isFile()` is false for one, so links are stepped
-  // over rather than followed — a skill that relies on an internal symlink projects
-  // without it, where following one could escape the tree. Counted, not merely
-  // skipped: the caller surfaces the total, so "projects without it" is an observable
-  // fact rather than a claim.
-  const stack: string[] = [""];
+  // The root is resolved once and every containment test is made against THIS, not
+  // against `entry.source`: the source may itself be reached through a symlinked
+  // component (it routinely is — the managed skill root lives under a mount), and a
+  // within-tree link would then resolve to a path that does not share the unresolved
+  // prefix and would be refused as an escape.
+  const realRoot = await fs.realpath(entry.source);
+  const stack: PendingDir[] = [{ relDir: "", realDir: realRoot, ancestors: new Set([realRoot]) }];
+
   while (stack.length > 0) {
-    const relDir = stack.pop() as string;
+    const { relDir, realDir, ancestors } = stack.pop() as PendingDir;
     const absDir = relDir ? path.join(entry.source, relDir) : entry.source;
     const dirents = await fs.readdir(absDir, { withFileTypes: true });
     for (const dirent of dirents) {
       const relPath = relDir ? path.posix.join(relDir, dirent.name) : dirent.name;
       if (dirent.isDirectory()) {
-        stack.push(relPath);
+        // No link involved, so the child's realpath is the parent's plus the name —
+        // which is why `realDir` is carried rather than re-resolved per directory.
+        const childReal = path.join(realDir, dirent.name);
+        stack.push({ relDir: relPath, realDir: childReal, ancestors: new Set([...ancestors, childReal]) });
+        continue;
+      }
+      if (dirent.isSymbolicLink()) {
+        const linkAbs = path.join(entry.source, relPath);
+        const resolvedTarget = await fs.realpath(linkAbs).catch(() => null);
+        if (resolvedTarget === null) {
+          danglingSymlinkCount += 1;
+          continue;
+        }
+        if (!isWithinTree(realRoot, resolvedTarget)) {
+          throw new PromptBundleSymlinkEscapesTreeError({
+            skillKey: entry.key,
+            linkPath: relPath,
+            resolvedTarget,
+            treeRoot: realRoot,
+          });
+        }
+        // `stat` follows the link, so this is the TARGET's type — which is the thing
+        // that decides what the pod reads, not the link's own.
+        const targetStat = await fs.stat(linkAbs);
+        if (targetStat.isDirectory()) {
+          if (ancestors.has(resolvedTarget)) {
+            throw new PromptBundleSymlinkCycleError({ skillKey: entry.key, linkPath: relPath, resolvedTarget });
+          }
+          resolvedSymlinkCount += 1;
+          stack.push({
+            relDir: relPath,
+            realDir: resolvedTarget,
+            ancestors: new Set([...ancestors, resolvedTarget]),
+          });
+          continue;
+        }
+        if (!targetStat.isFile()) {
+          skippedNonRegularCount += 1;
+          continue;
+        }
+        resolvedSymlinkCount += 1;
+        if (out.length >= maxFiles) throw new PromptBundleTooManyFilesError(entry.key, maxFiles);
+        const contents = await fs.readFile(linkAbs);
+        out.push({ relPath, contents, byteLength: contents.length, utf8: decodeUtf8Strict(contents) });
         continue;
       }
       if (!dirent.isFile()) {
-        if (dirent.isSymbolicLink()) skippedSymlinkCount += 1;
-        else skippedNonRegularCount += 1;
+        skippedNonRegularCount += 1;
         continue;
       }
       if (out.length >= maxFiles) throw new PromptBundleTooManyFilesError(entry.key, maxFiles);
@@ -388,7 +560,7 @@ async function collectSkillFiles(input: {
   // on readdir order, which is filesystem-defined. The Job command feeds the prompt
   // cache key, so an unstable order would miss the cache on every run.
   out.sort((left, right) => left.relPath.localeCompare(right.relPath));
-  return { files: out, skippedSymlinkCount, skippedNonRegularCount };
+  return { files: out, resolvedSymlinkCount, danglingSymlinkCount, skippedNonRegularCount };
 }
 
 /**
@@ -443,7 +615,8 @@ export async function buildPromptBundleSecretProjection(input: {
   }
 
   const bytesBySkillKey: Record<string, number> = {};
-  let skippedSymlinkCount = 0;
+  let resolvedSymlinkCount = 0;
+  let danglingSymlinkCount = 0;
   let skippedNonRegularCount = 0;
   // Sorted by runtimeName so the projection is stable across runs with the same skill
   // set, for the same prompt-cache reason the per-tree sort above has.
@@ -454,7 +627,8 @@ export async function buildPromptBundleSecretProjection(input: {
 
   for (const entry of projected) {
     const tree = await collectSkillFiles({ entry, maxFiles });
-    skippedSymlinkCount += tree.skippedSymlinkCount;
+    resolvedSymlinkCount += tree.resolvedSymlinkCount;
+    danglingSymlinkCount += tree.danglingSymlinkCount;
     skippedNonRegularCount += tree.skippedNonRegularCount;
     let entryBytes = 0;
     for (const file of tree.files) {
@@ -513,7 +687,8 @@ export async function buildPromptBundleSecretProjection(input: {
     totalValueBytes,
     fileCount: files.length,
     binaryFileCount,
-    skippedSymlinkCount,
+    resolvedSymlinkCount,
+    danglingSymlinkCount,
     skippedNonRegularCount,
     bytesBySkillKey,
     escalationThresholdCrossed: totalValueBytes >= maxBytes * PROMPT_BUNDLE_ESCALATION_RATIO,

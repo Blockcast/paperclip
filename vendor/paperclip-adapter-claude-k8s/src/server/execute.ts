@@ -21,7 +21,11 @@ import {
   PromptBundleTooManyFilesError,
   buildPromptBundleSecretProjection,
 } from "./prompt-bundle-projection.js";
-import type { PromptBundleSecretProjection } from "./prompt-bundle-projection.js";
+import type {
+  PromptBundleSecretProjection,
+  PromptBundleSymlinkCycleError,
+  PromptBundleSymlinkEscapesTreeError,
+} from "./prompt-bundle-projection.js";
 import {
   parseClaudeStreamJson,
   describeClaudeFailure,
@@ -47,7 +51,8 @@ type PromptBundleSizedOutcome = { outcome: "sized" } & Pick<
   | "totalValueBytes"
   | "fileCount"
   | "binaryFileCount"
-  | "skippedSymlinkCount"
+  | "resolvedSymlinkCount"
+  | "danglingSymlinkCount"
   | "skippedNonRegularCount"
   | "bytesBySkillKey"
   | "escalationThresholdCrossed"
@@ -88,11 +93,19 @@ type PromptBundleRefusedOutcome = {
         fileCount: number;
         bytesBySkillKey: Record<string, number>;
       }
-    | { kind: "too_many_files"; skillKey: string; limit: number };
+    | { kind: "too_many_files"; skillKey: string; limit: number }
+    | { kind: "symlink_escapes_tree"; skillKey: string; linkPath: string; resolvedTarget: string; treeRoot: string }
+    | { kind: "symlink_cycle"; skillKey: string; linkPath: string; resolvedTarget: string };
 };
 
 /** The cached refusal's run-independent fields, as a refusal this run can report. */
-export function describeProjectionRefusal(err: PromptBundleOverBudgetError | PromptBundleTooManyFilesError): PromptBundleRefusedOutcome {
+export function describeProjectionRefusal(
+  err:
+    | PromptBundleOverBudgetError
+    | PromptBundleTooManyFilesError
+    | PromptBundleSymlinkEscapesTreeError
+    | PromptBundleSymlinkCycleError,
+): PromptBundleRefusedOutcome {
   // `name`, not `instanceof` — see `isDeterministicProjectionRefusal`. Getting this
   // wrong does not throw: it silently reports a too-many-files refusal as an
   // over-budget one with undefined byte fields.
@@ -101,6 +114,31 @@ export function describeProjectionRefusal(err: PromptBundleOverBudgetError | Pro
       outcome: "refused",
       errorName: err.name,
       detail: { kind: "too_many_files", skillKey: err.skillKey, limit: err.limit },
+    };
+  }
+  if (err.name === "PromptBundleSymlinkEscapesTreeError") {
+    return {
+      outcome: "refused",
+      errorName: err.name,
+      detail: {
+        kind: "symlink_escapes_tree",
+        skillKey: err.skillKey,
+        linkPath: err.linkPath,
+        resolvedTarget: err.resolvedTarget,
+        treeRoot: err.treeRoot,
+      },
+    };
+  }
+  if (err.name === "PromptBundleSymlinkCycleError") {
+    return {
+      outcome: "refused",
+      errorName: err.name,
+      detail: {
+        kind: "symlink_cycle",
+        skillKey: err.skillKey,
+        linkPath: err.linkPath,
+        resolvedTarget: err.resolvedTarget,
+      },
     };
   }
   return {
@@ -123,7 +161,8 @@ const EMPTY_PROMPT_BUNDLE_SIZING: PromptBundleSizedOutcome = {
   totalValueBytes: 0,
   fileCount: 0,
   binaryFileCount: 0,
-  skippedSymlinkCount: 0,
+  resolvedSymlinkCount: 0,
+  danglingSymlinkCount: 0,
   skippedNonRegularCount: 0,
   bytesBySkillKey: {},
   escalationThresholdCrossed: false,
@@ -138,7 +177,8 @@ function summarizePromptBundleProjection(
     totalValueBytes: projection.totalValueBytes,
     fileCount: projection.fileCount,
     binaryFileCount: projection.binaryFileCount,
-    skippedSymlinkCount: projection.skippedSymlinkCount,
+    resolvedSymlinkCount: projection.resolvedSymlinkCount,
+    danglingSymlinkCount: projection.danglingSymlinkCount,
     skippedNonRegularCount: projection.skippedNonRegularCount,
     bytesBySkillKey: projection.bytesBySkillKey,
     escalationThresholdCrossed: projection.escalationThresholdCrossed,
@@ -159,6 +199,11 @@ function summarizePromptBundleProjection(
 const DETERMINISTIC_PROJECTION_REFUSAL_NAMES = new Set([
   "PromptBundleOverBudgetError",
   "PromptBundleTooManyFilesError",
+  // Both symlink refusals are deterministic in the same sense: the sizing key covers
+  // the tree contents and the sources, and `hashPathContents` hashes a link's target,
+  // so a tree that refuses under one key cannot resolve cleanly under the same one.
+  "PromptBundleSymlinkEscapesTreeError",
+  "PromptBundleSymlinkCycleError",
 ]);
 
 function isDeterministicProjectionRefusal(err: unknown): boolean {
@@ -2962,7 +3007,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         // Anything else is rethrown unremembered: a transient I/O fault must not
         // suppress the measurement for the life of the process.
         if (!isDeterministicProjectionRefusal(err)) throw err;
-        sized = describeProjectionRefusal(err as PromptBundleOverBudgetError | PromptBundleTooManyFilesError);
+        sized = describeProjectionRefusal(
+          err as
+            | PromptBundleOverBudgetError
+            | PromptBundleTooManyFilesError
+            | PromptBundleSymlinkEscapesTreeError
+            | PromptBundleSymlinkCycleError,
+        );
       }
       rememberPromptBundleSizing(sizingKey, sized);
     }
@@ -3005,7 +3056,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           // Files the walk stepped over and the pod will therefore not get. Emitted so
           // that "visible rather than silent" is a property of this channel rather than
           // a claim about it, and so the byte total is read with its own omissions.
-          skippedSymlinkCount: sized.skippedSymlinkCount,
+          resolvedSymlinkCount: sized.resolvedSymlinkCount,
+          danglingSymlinkCount: sized.danglingSymlinkCount,
           skippedNonRegularCount: sized.skippedNonRegularCount,
           maxBytes: PROMPT_BUNDLE_SECRET_MAX_BYTES,
           escalationThresholdCrossed: sized.escalationThresholdCrossed,

@@ -744,21 +744,58 @@ invariant exists to rule out:
   `stringData` and the rest base64 in `data`; both count their decoded length against
   `MaxSecretSize`, so the budget arithmetic above is unchanged and `binaryFileCount` reports how
   many took the second channel.
-* **Skipped symlinks are counted.** The walk steps over links rather than following them, so one
-  cannot escape the tree. That trade is only "visible rather than silent" if the skip is reported,
-  so `skippedSymlinkCount` and `skippedNonRegularCount` are emitted alongside the byte total and
-  the total is read with its own omissions attached.
+* **Skipped symlinks were counted — and are now RESOLVED-WITHIN-TREE OR REFUSED.** The first
+  draft of the walk stepped over links so that one could not escape the tree, and counted the
+  skips so the trade was visible rather than silent. That was sound only while the projection was
+  measurement-only, and it carried the ⛔ constraint below. **Discharged 2026-10-30** — the walk no
+  longer steps over a link at all.
 
-  ⛔ **Carried constraint for the swap PR: a non-zero `skippedSymlinkCount` is a blocker, not a
-  number.** `hashPathContents` (`prompt-cache.ts:196-205`) *resolves* a symlink with `realpath` and
-  hashes the target, and the bundle the pod reads today delivers that target's content. The
-  projection steps over the link. The two therefore disagree, and today that disagreement is
-  harmless because the Secret is not the delivery path — but on the run that swaps `dataClaimName`
-  it becomes a file the pod used to get and silently stops getting, which is the precise failure
-  this channel exists to prevent, reintroduced by the change meant to close it. The swap must
-  either resolve links whose target is inside the skill tree, or refuse. Counting it now is what
-  makes that decision answerable from data rather than from a guess about whether any real skill
-  tree uses one.
+  The reason it could not stay a number: `hashPathContents` (`prompt-cache.ts:190-205`) *resolves*
+  a link with `realpath` and hashes the target, and the pod reads the bundle by traversing the real
+  tree, so a link inside a skill delivers its target's bytes **today**. A projection that stepped
+  over it would become, on the run that swaps `dataClaimName`, a file the pod used to get and
+  silently stops getting — the precise dangling-skill failure this channel exists to prevent,
+  reintroduced by the change meant to close it.
+
+  Every link now takes exactly one of four outcomes, none of them silent:
+
+  | link resolves to | outcome |
+  |---|---|
+  | a regular file inside the tree | projected under the **link's** path carrying the **target's** bytes, matching what the pod reads today; `resolvedSymlinkCount` |
+  | a directory inside the tree | descended into, so its files project under the link's path as the pod sees them |
+  | anything outside the tree | **refused** — `PromptBundleSymlinkEscapesTreeError` |
+  | nothing (dangling) | counted as `danglingSymlinkCount`, **not** refused |
+
+  Three details are load-bearing and were each a way to get this wrong:
+
+  * **Containment is tested against the tree root's `realpath`, not against `entry.source`.** The
+    managed skill root routinely sits under a symlinked mount component, so a genuinely within-tree
+    link resolves to a path that does not share the unresolved prefix — testing against the raw
+    source would refuse every run on such a deployment.
+  * **The prefix test compares on a path boundary.** A bare `startsWith` accepts `<root>-evil` as
+    inside `<root>`, i.e. the containment check failing open on exactly its adversarial input.
+  * **The cycle test is a true ANCESTOR test, not a seen-directory test.** Two sibling links onto
+    one real directory are not a cycle — the pod really does see that content under both names, and
+    both are projected. Deduplicating on "already visited" would drop one of them, which is the same
+    silent loss this change exists to remove. Only a link onto its own ancestor expands without
+    bound, and that is refused (`PromptBundleSymlinkCycleError`) rather than truncated at a depth,
+    because truncating silently picks which of the expanded paths the pod gets.
+
+  **Why an out-of-tree target is refused rather than copied.** Two faults meet at one link.
+  *Delivery*: the target is reachable only because the pod shares the server's volume, which is
+  exactly what a per-agent claim takes away, so projecting the link without its target dangles on
+  the swap. *Containment*: copying an arbitrary out-of-tree target into this run's Secret would
+  carry whatever the link names — another company's tree, a host path — into a value this run's pod
+  can read. There is no projection that is both faithful and contained, so the operator re-points
+  the link or vendors the file into the tree.
+
+  A dangling link is the one case counted rather than refused, and deliberately: it delivers
+  nothing to the pod today either, so stepping over it cannot be a delivery regression, while
+  refusing would abort runs that currently work — a regression in the other direction.
+
+  Both symlink refusals join the over-budget and too-many-files refusals in the **cached**
+  deterministic set: the sizing key covers the tree contents and the sources, so a tree that
+  refuses under one key cannot resolve cleanly under the same one.
 
 One further caveat on reading the cap as the ceiling: the Secret is one object among the Job's, and
 etcd's request limit (~1.5 MiB by default) applies to the whole serialized object — keys, base64
@@ -785,8 +822,8 @@ matter:
 
 | event | fields |
 |---|---|
-| `claude_k8s.prompt_bundle_projection_sized` | `totalValueBytes`, `fileCount`, `binaryFileCount`, `skippedSymlinkCount`, `skippedNonRegularCount`, `maxBytes`, `escalationThresholdCrossed`, `bytesBySkillKey`, `sizingCacheHit` |
-| `claude_k8s.prompt_bundle_projection_failed`, **refusal** | `errorName`, `refusal` (`{kind: "over_budget", totalValueBytes, maxBytes, fileCount, bytesBySkillKey}` or `{kind: "too_many_files", skillKey, limit}`), `sizingCacheHit` |
+| `claude_k8s.prompt_bundle_projection_sized` | `totalValueBytes`, `fileCount`, `binaryFileCount`, `resolvedSymlinkCount`, `danglingSymlinkCount`, `skippedNonRegularCount`, `maxBytes`, `escalationThresholdCrossed`, `bytesBySkillKey`, `sizingCacheHit` |
+| `claude_k8s.prompt_bundle_projection_failed`, **refusal** | `errorName`, `refusal` (`{kind: "over_budget", totalValueBytes, maxBytes, fileCount, bytesBySkillKey}`, `{kind: "too_many_files", skillKey, limit}`, `{kind: "symlink_escapes_tree", skillKey, linkPath, resolvedTarget, treeRoot}` or `{kind: "symlink_cycle", skillKey, linkPath, resolvedTarget}`), `sizingCacheHit` |
 | `claude_k8s.prompt_bundle_projection_failed`, **transient fault** | `errorName`, `error` (message string), `sizingCacheHit: false` |
 
 Both `failed` shapes carry `companyId` and `runId` for the run **emitting** the line. The refusal
