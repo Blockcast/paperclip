@@ -103,11 +103,24 @@
  * ── THREE REFUTED LEADS. Each was proposed on the row; none is the cause ────
  *
  *  1. "0098's activity_log index stopped being chosen."
- *     `idx_activity_log_entity_id_created` is present and the ORDER BY
- *     subqueries cost ~1s total (see the no-search row above).
+ *     Still refuted, but ⚠️ CORRECTED 2026-10-30 — the reason given here was
+ *     wrong, and it names the wrong index. At the production shape the
+ *     planner does not use 0098's `idx_activity_log_entity_id_created` for
+ *     this query AT ALL; it uses the partial
+ *     `idx_activity_log_issue_company_entity_action_created` on
+ *     `(company_id, entity_id, action, created_at DESC, id DESC) WHERE
+ *     entity_type = 'issue'`, which carries the `action` column the ORDER BY
+ *     subquery's NOT IN needs and is therefore fully index-only (0 heap
+ *     fetches). So 0098 is not the cause — not because its index is "still
+ *     chosen", but because it is not the index in play. Measured in
+ *     `issues-list-production-scale-plan-shape.bench.ts`, which is also the
+ *     first seed in this repo to put ANY rows in activity_log: the ~1s figure
+ *     cited above came from a live timing, and every SEEDED measurement
+ *     behind this file ran that ORDER BY arm against an EMPTY TABLE.
  *  2. "The issue_comments correlated subquery needs a covering index."
  *     `issue_comments_company_issue_created_at_idx` on
- *     `(company_id, issue_id, created_at)` already exists.
+ *     `(company_id, issue_id, created_at)` already exists — and is confirmed
+ *     chosen, as an Index Only Scan Backward, by the bench above.
  *  3. "`commentContainsMatch` is a correlated EXISTS, so it re-executes per
  *     row; de-correlate it to `id IN (SELECT ...)`."
  *     ⛔ PostgreSQL ALREADY DOES THIS. It pulls the correlated EXISTS up into
@@ -139,6 +152,18 @@
  * ⚠️ The SQL below mirrors `list()` in server/src/services/issues.ts by hand
  * (this package cannot import the server). If that query's search shape
  * changes, change these with it.
+ *
+ * ── SEE ALSO: the production-SCALE companion ───────────────────────────────
+ *
+ * `issues-list-production-scale-plan-shape.bench.ts` runs the same four
+ * shapes at 54,600 issues / 1,255,800 comments / 982,800 activity_log rows.
+ * It is NOT a test (`.bench.ts` is outside the vitest glob) because it takes
+ * ~1 hour and several GB; it exists because the two questions are different.
+ * THIS file asserts structure at a CI-affordable size and deliberately
+ * asserts neither plan choice nor wall-clock (see the warning above). That
+ * one measures which access path the planner actually picks once the tables
+ * are production-sized — the question this one cannot answer, and the one
+ * PEN-3596's done-when 1 asks. Its header carries the measured plans.
  */
 import { afterEach, describe, expect, it } from "vitest";
 import postgres from "postgres";

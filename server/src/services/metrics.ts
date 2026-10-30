@@ -178,6 +178,39 @@ export const HTTP_EMPTY_LIST_RESPONSES_METRIC = "paperclip_http_empty_list_respo
  * {@link TRANSIENT_DB_SQLSTATES} plus an `other` bucket, so the subset adds at
  * most a handful of series per route that actually refuses — and none at all
  * for a route that never does, because nothing is zero-initialized here.
+ *
+ * ## ⛔ How to read it: `increase()` and `rate()` CANNOT see a series' first event
+ *
+ * This follows from "nothing is zero-initialized here" above, and it bites in
+ * the direction that reads as good news, so it is spelled out rather than left
+ * as a corollary.
+ *
+ * `increase()` and `rate()` measure the rise between the first and last sample
+ * *inside* their window. A series that is BORN at 1 and does not move again
+ * rises by 0. So a quiet-window check built on `increase()` reports "quiet"
+ * **while the very event it watches for is inside the window**.
+ *
+ * Because no series is zero-initialized, every series here is born on its own
+ * first event — so this is the NORMAL case for this counter, not an edge case.
+ * A route that has never refused has no series at all; the first refusal
+ * creates one at 1; `increase(...[6h])` over that window still returns 0.
+ *
+ * Measured 2026-10-30 (PEN-3596). The counter shipped with the 08:17Z deploy.
+ * Two 503s landed at 12:21:14Z, one per API pod, matching two
+ * `canceling statement due to statement timeout` events in `paperclip-pg-0`:
+ *
+ *   sum by (sqlstate, route) (increase(paperclip_http_transient_db_responses_total[6h]))
+ *     → /api/companies/:companyId/issues   0      ← WRONG, and silently so
+ *   paperclip_http_transient_db_responses_total   → 1 on each of the two pods
+ *
+ * Read presence-and-value instead — `max_over_time(...[6h]) > 0`, or the raw
+ * counter value, or a comparison against a known-zero baseline. Reserve
+ * `increase()`/`rate()` for a series already known to exist and to have moved
+ * before the window opened.
+ *
+ * ⚠️ A corollary for any "clean for N hours" gate: the window must start no
+ * earlier than the deploy that created the series. A clean window shorter than
+ * the series' own age measures the instrument's youth, not the system's health.
  */
 export const HTTP_TRANSIENT_DB_RESPONSES_METRIC = "paperclip_http_transient_db_responses_total";
 /**
