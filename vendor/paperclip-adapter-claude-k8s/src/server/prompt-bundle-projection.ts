@@ -31,8 +31,18 @@
  *
  * Adapter-bundled IMAGE paths are the one exclusion: they survive in the image at the
  * same absolute path in both namespaces, so projecting them would copy bytes the pod
- * already has. That is the same discriminator `prompt-cache.ts` already applies when
- * it decides whether to report `prompt_bundle_skill_off_volume`.
+ * already has.
+ *
+ * ⚠️ IDENTIFYING ONE IS NOT A PATH-PREFIX TEST. `prompt-cache.ts:509-519` states the
+ * reason: a catalog-backed source is a `PAPERCLIP_HOME` path, while the server mount is
+ * `SELF_POD_DATA_MOUNT_PATH` — a hardcoded `/paperclip` against an env var defaulting to
+ * `~/.paperclip`. Two variables that COINCIDE TODAY, not one. Where they diverge, a
+ * prefix test alone calls every catalog skill an image path and drops it from the
+ * projection with no signal: the exact silent dangling-skill outcome this channel exists
+ * to prevent, and an under-count of `totalValueBytes` that biases §4.2's escalation
+ * measurement low. So the discriminator is the one `prompt-cache.ts` actually keys on —
+ * `catalogBackedSkillKeys` — OR'd with the mount prefix, and only the remainder is an
+ * image path. See `skillSourceNeedsProjection`.
  */
 
 import { promises as fs } from "node:fs";
@@ -65,6 +75,12 @@ import type { PaperclipSkillEntry } from "@paperclipai/adapter-utils/server-util
  * base64 bytes fires at an effective 37.5 % of real capacity, which would move the
  * design to the init-container fetch a third of the way early. Both are computed on
  * `totalValueBytes` below so they cannot disagree about what is being measured.
+ *
+ * One caveat on treating the cap as the practical ceiling: this Secret is one object
+ * among the Job's, and etcd's own request limit (~1.5 MiB by default) applies to the
+ * whole serialized object — keys, base64 expansion of `data`, metadata and all. So the
+ * usable headroom sits slightly under the validation cap rather than at it, which is a
+ * further reason the §4.2 escalation trigger is set at half rather than near the limit.
  */
 export const PROMPT_BUNDLE_SECRET_MAX_BYTES = 1024 * 1024;
 
@@ -107,26 +123,73 @@ export const PROMPT_BUNDLE_MAX_FILES = 2000;
 export type PromptBundleFile = {
   /** Bundle-relative POSIX path, e.g. `.claude/skills/dataviz/SKILL.md`. */
   bundlePath: string;
-  /** UTF-8 contents. */
-  contents: string;
-  /** `Buffer.byteLength(contents)` — the quantity the API server budgets. */
+  /** The file's bytes, verbatim. Never a decoded string — see `collectSkillFiles`. */
+  contents: Buffer;
+  /**
+   * `contents.length`, i.e. RAW bytes. This is what `ValidateSecret` sums, for a value
+   * arriving through `stringData` (folded in as `[]byte(v)`) and through `data`
+   * (base64-decoded) alike, so one quantity budgets both channels.
+   */
   byteLength: number;
+  /**
+   * Strict UTF-8 decode of `contents`, or null when the bytes are not valid UTF-8 and
+   * must travel base64. Computed once, at read time, and carried rather than recomputed.
+   */
+  utf8: string | null;
   /** Skill key this file came from, or null for the instructions file. */
   skillKey: string | null;
 };
 
 export type PromptBundleSecretProjection = {
-  /** `stringData` for the Secret: one entry per projected file. */
-  data: Record<string, string>;
+  /**
+   * `stringData` for the Secret: the projected files whose bytes are valid UTF-8.
+   *
+   * Split from `base64Data` because `stringData` cannot carry arbitrary bytes. A skill
+   * tree may hold a PNG, a font or a stray Latin-1 file, and routing one through a
+   * string would substitute U+FFFD for every invalid byte — delivering corrupted bytes
+   * and, worse for a measurement-only change, inflating the measured length to 3 bytes
+   * per invalid byte. Neither the budget guard nor any log would notice.
+   */
+  stringData: Record<string, string>;
+  /**
+   * `data` for the Secret: base64 of the projected files whose bytes are NOT valid
+   * UTF-8. Kubernetes base64-decodes these before `ValidateSecret` sums them, so they
+   * count the same decoded length against `MaxSecretSize` as a `stringData` entry does
+   * and the budget arithmetic above is unchanged.
+   *
+   * ⚠️ WHOEVER WIRES THIS UP MUST CARRY BOTH MAPS. `createOrAdoptRunSecret` takes a
+   * single `data` record and writes it to `stringData` — correct for the shared-doc
+   * Secret it was built for, which carries only text. Reaching for that signature by
+   * analogy here would drop every entry in this map, i.e. exactly the silent missing
+   * file this channel exists to prevent, and `items[]` would then project a key the
+   * Secret does not have. The projection is deliberately two maps so that omission is
+   * a type error rather than a quiet one.
+   */
+  base64Data: Record<string, string>;
   /** `items` for the Secret volume, projecting each key back to its bundle-relative path. */
   items: Array<{ key: string; path: string }>;
   /**
-   * Sum of UTF-8 value bytes — exactly `ValidateSecret`'s `totalSize`. This is the
-   * number the budget refuses on and the number the escalation trigger reads.
+   * Sum of raw value bytes — exactly `ValidateSecret`'s `totalSize`, across both
+   * channels. This is the number the budget refuses on and the number the escalation
+   * trigger reads.
    */
   totalValueBytes: number;
   /** Number of projected files. */
   fileCount: number;
+  /** How many of `fileCount` had to travel base64 because they are not valid UTF-8. */
+  binaryFileCount: number;
+  /**
+   * Symlinks stepped over by the walk, summed across every projected tree.
+   *
+   * Reported rather than merely skipped: a skipped link is a file the pod will not get,
+   * and leaving it out of both the log and `bytesBySkillKey` would under-count the
+   * measurement in silence — which is the same class of fault as a dropped skill, just
+   * smaller. The PR's claim that stepping over links is "visible rather than silent" is
+   * only true because this is counted.
+   */
+  skippedSymlinkCount: number;
+  /** Non-regular, non-directory, non-symlink entries stepped over (fifo, socket, …). */
+  skippedNonRegularCount: number;
   /** Per-skill byte totals, so an over-budget verdict can name the contributor. */
   bytesBySkillKey: Record<string, number>;
   /** True once `totalValueBytes` crosses `PROMPT_BUNDLE_ESCALATION_RATIO` of the cap. */
@@ -201,33 +264,88 @@ function mountPrefix(mount: string): string {
 /**
  * Whether this entry's bytes have to travel.
  *
- * An entry whose source is NOT under the server's data mount is an image path — the
- * adapter's own bundled skills, present at the same absolute path in the pod because
- * both come from the same image layer. Those are left alone: projecting them would
- * copy bytes the pod already has, and `prompt-cache.ts` already treats the same
- * distinction as the reason not to warn about them.
+ * Only ONE class may be left alone: an adapter-bundled IMAGE path, present at the same
+ * absolute path in the pod because both come from the same image layer. Projecting one
+ * would copy bytes the pod already has.
  *
- * With `serverDataMountPath` unknown nothing is derivable, so every entry is projected.
- * That is the direction to fail in — an unnecessary copy costs budget, a missing one
- * costs the agent its skill.
+ * Identifying that class is the whole difficulty, and a path prefix on the server mount
+ * does not do it. `prompt-cache.ts:509-519` records why: a catalog-backed source is a
+ * `PAPERCLIP_HOME` path and the server mount is `SELF_POD_DATA_MOUNT_PATH`, two
+ * variables that coincide in today's deployment but are not one. Under a
+ * `PAPERCLIP_HOME` outside `/paperclip` the prefix test calls every catalog skill an
+ * image path and silently drops it. So this mirrors the test `prompt-cache.ts` actually
+ * applies — the catalog discriminator — and takes the union with the mount prefix:
+ *
+ *   * catalog-backed  => must travel (a `PAPERCLIP_HOME` path, wherever that resolves);
+ *   * under the mount => must travel (it lives on the volume the pod stops sharing);
+ *   * neither         => image path, left alone.
+ *
+ * BOTH unknowns fail toward projecting, deliberately and in the same direction as
+ * `prompt-cache.ts`'s own `?? true`: with `serverDataMountPath` absent nothing is
+ * derivable, and with `catalogBackedSkillKeys` absent no caller has distinguished the
+ * image set. An unnecessary copy costs budget; a missing one costs the agent its skill.
  */
-export function skillSourceNeedsProjection(entry: PaperclipSkillEntry, serverDataMountPath?: string): boolean {
+export function skillSourceNeedsProjection(
+  entry: PaperclipSkillEntry,
+  serverDataMountPath?: string,
+  catalogBackedSkillKeys?: ReadonlySet<string>,
+): boolean {
   if (!serverDataMountPath) return true;
+  if (catalogBackedSkillKeys?.has(entry.key) ?? true) return true;
   return entry.source.startsWith(mountPrefix(serverDataMountPath));
 }
+
+/**
+ * Strict UTF-8 decode, or null when the bytes are not valid UTF-8.
+ *
+ * `fatal: true` is what makes this a *test* rather than a lossy conversion:
+ * `buf.toString("utf8")` and a non-fatal decoder both substitute U+FFFD for every
+ * invalid byte and report success. `ignoreBOM: true` is equally load-bearing in the
+ * other direction — the default STRIPS a leading U+FEFF, which would silently drop
+ * three bytes from a BOM-prefixed file and break the round-trip this relies on. With
+ * both set, a non-null result re-encodes to exactly the input bytes.
+ */
+const UTF8_STRICT_DECODER = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+
+function decodeUtf8Strict(buf: Buffer): string | null {
+  try {
+    return UTF8_STRICT_DECODER.decode(buf);
+  } catch {
+    return null;
+  }
+}
+
+/** One file the walk collected: its bytes verbatim, plus how they must be carried. */
+type CollectedSkillFile = {
+  relPath: string;
+  contents: Buffer;
+  byteLength: number;
+  /** Strict decode, or null when the bytes are not valid UTF-8 and must go base64. */
+  utf8: string | null;
+};
+
+type CollectedSkillTree = {
+  files: CollectedSkillFile[];
+  skippedSymlinkCount: number;
+  skippedNonRegularCount: number;
+};
 
 /** Depth-first walk of a skill source directory, yielding regular files only. */
 async function collectSkillFiles(input: {
   entry: PaperclipSkillEntry;
   maxFiles: number;
-}): Promise<Array<{ relPath: string; contents: string; byteLength: number }>> {
+}): Promise<CollectedSkillTree> {
   const { entry, maxFiles } = input;
-  const out: Array<{ relPath: string; contents: string; byteLength: number }> = [];
+  const out: CollectedSkillFile[] = [];
+  let skippedSymlinkCount = 0;
+  let skippedNonRegularCount = 0;
   // Iterative rather than recursive: a skill tree is operator-supplied and a symlink
   // cycle would otherwise be a stack overflow at Job-creation time. `withFileTypes`
   // reports the link itself, and `isFile()` is false for one, so links are stepped
   // over rather than followed — a skill that relies on an internal symlink projects
-  // without it, which is visible, where following one could escape the tree.
+  // without it, where following one could escape the tree. Counted, not merely
+  // skipped: the caller surfaces the total, so "projects without it" is an observable
+  // fact rather than a claim.
   const stack: string[] = [""];
   while (stack.length > 0) {
     const relDir = stack.pop() as string;
@@ -239,17 +357,27 @@ async function collectSkillFiles(input: {
         stack.push(relPath);
         continue;
       }
-      if (!dirent.isFile()) continue;
+      if (!dirent.isFile()) {
+        if (dirent.isSymbolicLink()) skippedSymlinkCount += 1;
+        else skippedNonRegularCount += 1;
+        continue;
+      }
       if (out.length >= maxFiles) throw new PromptBundleTooManyFilesError(entry.key, maxFiles);
-      const contents = await fs.readFile(path.join(entry.source, relPath), "utf-8");
-      out.push({ relPath, contents, byteLength: Buffer.byteLength(contents, "utf8") });
+      // Read as bytes, never as a string. A skill tree may legitimately hold a PNG, a
+      // font, or a file in some other encoding; decoding one as UTF-8 would corrupt
+      // the bytes delivered AND inflate the measured length (3 bytes per substituted
+      // U+FFFD), which is wrong for exactly the trees this measurement most needs to
+      // size correctly. `byteLength` is therefore the raw buffer length, which is the
+      // quantity `ValidateSecret` sums whichever channel the value travels on.
+      const contents = await fs.readFile(path.join(entry.source, relPath));
+      out.push({ relPath, contents, byteLength: contents.length, utf8: decodeUtf8Strict(contents) });
     }
   }
   // Sorted so key assignment is deterministic for a given tree rather than dependent
   // on readdir order, which is filesystem-defined. The Job command feeds the prompt
   // cache key, so an unstable order would miss the cache on every run.
   out.sort((left, right) => left.relPath.localeCompare(right.relPath));
-  return out;
+  return { files: out, skippedSymlinkCount, skippedNonRegularCount };
 }
 
 /**
@@ -273,6 +401,12 @@ export async function buildPromptBundleSecretProjection(input: {
   instructionsContents: string | null;
   /** Where THIS process reaches the data volume (`SELF_POD_DATA_MOUNT_PATH`). */
   serverDataMountPath?: string;
+  /**
+   * Skill keys the caller resolved from the company-skill catalog, i.e. the same
+   * discriminator `prepareClaudePromptBundle` takes. Omitting it projects every entry;
+   * see `skillSourceNeedsProjection` for why that is the direction to fail in.
+   */
+  catalogBackedSkillKeys?: ReadonlySet<string>;
   maxBytes?: number;
   maxFilesPerSkill?: number;
 }): Promise<PromptBundleSecretProjection | null> {
@@ -281,30 +415,43 @@ export async function buildPromptBundleSecretProjection(input: {
   const files: PromptBundleFile[] = [];
 
   if (input.instructionsContents) {
+    // Already a string in the caller's hands, so this one has no encoding question:
+    // `Buffer.from(…, "utf8")` is the exact wire form, and it rejoins the byte-shaped
+    // path every other file takes.
+    const instructions = Buffer.from(input.instructionsContents, "utf8");
     files.push({
       bundlePath: PROMPT_BUNDLE_INSTRUCTIONS_PATH,
-      contents: input.instructionsContents,
-      byteLength: Buffer.byteLength(input.instructionsContents, "utf8"),
+      contents: instructions,
+      byteLength: instructions.length,
+      // Decoded from the buffer rather than reusing the input string, so the value
+      // carried is provably what the bytes counted above say — the same identity every
+      // other file gets, with no special case to go stale.
+      utf8: decodeUtf8Strict(instructions),
       skillKey: null,
     });
   }
 
   const bytesBySkillKey: Record<string, number> = {};
+  let skippedSymlinkCount = 0;
+  let skippedNonRegularCount = 0;
   // Sorted by runtimeName so the projection is stable across runs with the same skill
   // set, for the same prompt-cache reason the per-tree sort above has.
   const projected = input.skills
-    .filter((entry) => skillSourceNeedsProjection(entry, input.serverDataMountPath))
+    .filter((entry) => skillSourceNeedsProjection(entry, input.serverDataMountPath, input.catalogBackedSkillKeys))
     .slice()
     .sort((left, right) => left.runtimeName.localeCompare(right.runtimeName));
 
   for (const entry of projected) {
-    const skillFiles = await collectSkillFiles({ entry, maxFiles });
+    const tree = await collectSkillFiles({ entry, maxFiles });
+    skippedSymlinkCount += tree.skippedSymlinkCount;
+    skippedNonRegularCount += tree.skippedNonRegularCount;
     let entryBytes = 0;
-    for (const file of skillFiles) {
+    for (const file of tree.files) {
       files.push({
         bundlePath: path.posix.join(PROMPT_BUNDLE_SKILLS_DIR, entry.runtimeName, file.relPath),
         contents: file.contents,
         byteLength: file.byteLength,
+        utf8: file.utf8,
         skillKey: entry.key,
       });
       entryBytes += file.byteLength;
@@ -314,12 +461,25 @@ export async function buildPromptBundleSecretProjection(input: {
 
   if (files.length === 0) return null;
 
-  const data: Record<string, string> = {};
+  const stringData: Record<string, string> = {};
+  const base64Data: Record<string, string> = {};
   const items: Array<{ key: string; path: string }> = [];
   let totalValueBytes = 0;
+  let binaryFileCount = 0;
   for (const file of files) {
     const key = `bundle-${items.length}`;
-    data[key] = file.contents;
+    // Valid UTF-8 travels as `stringData` — readable in a `kubectl get -o yaml` and
+    // byte-identical, because the strict decoder above ruled out any substitution.
+    // Anything else travels base64 through `data`, which is the only Secret channel
+    // that can carry arbitrary bytes. Each key appears in exactly one map, and
+    // Kubernetes merges both into `Data` before validating, so `items[].path` projects
+    // them identically and the budget below sees one total.
+    if (file.utf8 === null) {
+      base64Data[key] = file.contents.toString("base64");
+      binaryFileCount += 1;
+    } else {
+      stringData[key] = file.utf8;
+    }
     items.push({ key, path: file.bundlePath });
     totalValueBytes += file.byteLength;
   }
@@ -336,10 +496,14 @@ export async function buildPromptBundleSecretProjection(input: {
   }
 
   return {
-    data,
+    stringData,
+    base64Data,
     items,
     totalValueBytes,
     fileCount: files.length,
+    binaryFileCount,
+    skippedSymlinkCount,
+    skippedNonRegularCount,
     bytesBySkillKey,
     escalationThresholdCrossed: totalValueBytes >= maxBytes * PROMPT_BUNDLE_ESCALATION_RATIO,
   };
