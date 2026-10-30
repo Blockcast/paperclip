@@ -4328,27 +4328,55 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
               `mkdir -p ${seedSubPaths
                 .map((sp) => quoteShellArg(path.posix.join(SEED_VOLUME_ROOT_MOUNT_PATH, sp)))
                 .join(" ")}`,
-              // `-h` so the chown can never traverse a symlink created between
-              // the guard above and here. Belt-and-braces on this head (init
-              // containers are sequential, so nothing else in the Pod is
-              // running) but free, and it removes the redirect primitive rather
-              // than narrowing the window for it.
+              // `-h` so a target whose FINAL component is a symlink is chowned
+              // as the link rather than as whatever it points at. That is the
+              // whole of what `-h` buys, and it pairs with the guard's leaf
+              // check above. Free, so keep it — but see below for what it does
+              // NOT buy.
               //
-              // ⚠ 4b RESIDUE — and the open window is guard → `mkdir -p`, NOT
-              // this `chown`. `-h` is symlink-safe by construction: it acts on
-              // the link itself and never traverses, so a link planted after
-              // the guard changes nothing HERE. `mkdir -p` has no such
-              // protection — it creates THROUGH a symlinked component onto a
-              // real directory reached by an unintended route, which is the
-              // exact redirect primitive the walk above removes, re-opened in
-              // the window between the two. So "re-check between mkdir and
-              // chown" does NOT close this: by then `mkdir -p` has already
-              // written through the link.
+              // ⚠ 4b RESIDUE — the open window is guard → `chown`, with the
+              // `mkdir -p` in the middle, and BOTH halves are exposed.
               //
-              // The "nothing else in the Pod is running" argument above is
-              // POD-scoped, and pod scope is precisely what a per-agent claim
-              // dissolves: the concurrent writer is a uid-1000 agent container
-              // in a DIFFERENT pod, on a different node, sharing the claim.
+              // `-h` is NOT symlink-safe as a path operation. It maps to
+              // `lchown(2)`, which declines to follow only the LAST component;
+              // every intermediate component is resolved the ordinary way,
+              // symlinks included. Measured on a runner rather than reasoned
+              // from the man page: with `elsewhere/leaf` real and `link ->
+              // elsewhere`, `chown -h link/leaf` exits 0 and lands on
+              // `elsewhere/leaf`; `chown -h link/nosuchthing` exits 1; and
+              // through a DANGLING intermediate (`deadlink -> /nonexistent`)
+              // `chown -h deadlink/leaf` returns ENOENT — which it could only
+              // do by having resolved that intermediate.
+              //
+              // So a uid-1000 writer that swaps a parent component for a
+              // symlink inside the window gets, from uid 0:
+              //   - `mkdir -p` to create root-owned directories at a route it
+              //     chose, and
+              //   - `chown` to hand uid 1000 ownership of a directory it chose.
+              // The second is the worse half: it is an ownership transfer, not
+              // just a misplaced mkdir. This corrects an earlier comment here
+              // (and PEN-4932's 19:49Z note) that called the chown step safe
+              // and put the window at guard → `mkdir -p`.
+              //
+              // A re-check between `mkdir` and `chown` does NOT close it, for a
+              // more basic reason than the one previously recorded: the
+              // re-check is itself check-then-act, so it closes neither half —
+              // it only shortens the race it is trying to win. Closing this
+              // needs one of:
+              //   - an fd-relative walk — `openat(…, O_NOFOLLOW|O_DIRECTORY)`
+              //     per component, then `fchown` on the final fd — which `sh`
+              //     cannot express, so it means moving the seeder out of shell;
+              //   - or removing the privilege boundary, so the race is
+              //     uid-1000-on-uid-1000 and not a boundary at all. See the
+              //     `fsGroup` note below, which is cost-blocked, not
+              //     unavailable.
+              //
+              // Nothing can take that window on THIS head: init containers
+              // are sequential, so while this one runs nothing else in the Pod
+              // is. But that argument is POD-scoped, and pod scope is
+              // precisely what a per-agent claim dissolves: the concurrent
+              // writer is a uid-1000 agent container in a DIFFERENT pod, on a
+              // different node, sharing the claim.
               // That is the normal case, not an edge one — read live
               // 2026-10-30, two agents each held 2 concurrent run pods and one
               // of them spanned two nodes, which is also why a per-agent claim
