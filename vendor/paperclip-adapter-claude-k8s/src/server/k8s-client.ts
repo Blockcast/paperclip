@@ -318,3 +318,50 @@ export function resetCache(): void {
   kcCache.clear();
   selfPodCache.clear();
 }
+
+/**
+ * Kubernetes 404 (`NotFound`).
+ *
+ * Local to this module rather than reusing `execute.ts`'s `isK8s404`, for two
+ * reasons. Importing it would pull the whole run path into a module the Core
+ * API clients live in. And it would inherit a known gap: that predicate checks
+ * `response.statusCode`, `response.status` and `statusCode`, but NOT `code` —
+ * which is the one field @kubernetes/client-node actually sets. `ApiException`
+ * is constructed as `super("HTTP-Code: " + code + ...)` and then assigns only
+ * `this.code`, leaving `statusCode` and `response` undefined, so `isK8s404`
+ * works today purely on its message regex. `isK8s409` documents exactly this
+ * asymmetry in its own header. For `getPvc` the gap is not cosmetic: a missed
+ * 404 turns "the claim does not exist yet" into a thrown error, which fails
+ * the run instead of provisioning the volume it was about to mount.
+ */
+function isPvcNotFound(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const e = err as unknown as Record<string, unknown>;
+  const resp = e.response as Record<string, unknown> | undefined;
+  if (resp?.statusCode === 404 || resp?.status === 404) return true;
+  if (e.statusCode === 404 || e.code === 404) return true;
+  return /HTTP-Code:\s*404\b/.test(err.message);
+}
+
+/** Returns the PVC if it exists, or null if it does not. Throws on any other error. */
+export async function getPvc(
+  namespace: string,
+  name: string,
+  kubeconfigPath?: string,
+): Promise<k8s.V1PersistentVolumeClaim | null> {
+  try {
+    return await getCoreApi(kubeconfigPath).readNamespacedPersistentVolumeClaim({ name, namespace });
+  } catch (err) {
+    if (isPvcNotFound(err)) return null;
+    throw err;
+  }
+}
+
+/** Creates a PVC. Callers handle 409 (`AlreadyExists`) themselves. */
+export async function createPvc(
+  namespace: string,
+  spec: k8s.V1PersistentVolumeClaim,
+  kubeconfigPath?: string,
+): Promise<k8s.V1PersistentVolumeClaim> {
+  return getCoreApi(kubeconfigPath).createNamespacedPersistentVolumeClaim({ namespace, body: spec });
+}
