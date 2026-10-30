@@ -211,6 +211,10 @@ test("a failing verdict prints the regenerate-from-the-tip recovery", (t) => {
   assert.match(r.out, /git push --force-with-lease=refs\/heads\/<pr-branch>:<expected> origin graphify-regen:<pr-branch>/);
   assert.doesNotMatch(r.out, /git push --force-with-lease\s*$/m);
   assert.doesNotMatch(r.out, /git checkout -B <branch>/);
+  // Only the base ref is fetched above, so the lease sha has to come from the
+  // remote, not from a tracking ref that is stale or absent.
+  assert.match(r.out, /git ls-remote origin refs\/heads\/<pr-branch>/);
+  assert.doesNotMatch(r.out, /git rev-parse origin\/<pr-branch>/);
 });
 
 test("regenerating the branch at the base tip clears the gate", (t) => {
