@@ -765,32 +765,86 @@ PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verificati
         Phase A must therefore be gated on the claim being per-agent, and that gate does not exist
         yet: it arrives with the `dataClaimName` swap. Sequence it with the swap, never ahead of
         it."* Recorded as a hard sequencing constraint, it was never checked against
-        `rootMounts`. Two independent reasons it does not hold, either of which is sufficient:
+        `rootMounts`. **One reason carries the withdrawal on its own. A second was recorded
+        alongside it as equally sufficient, and that was itself an overstatement — it is narrower
+        than the withdrawn paragraph needed, and is kept below, demoted, because getting it wrong
+        the second time is part of the record.** (They are listed here in the opposite order to
+        PR #3167's description, which presented the narrow one first.)
 
-        1. **The gate already exists.** `serverCanPreCreate`
-           (`dataClaimName === selfPod.pvcClaimName`) is exactly the "is this claim the server's
-           own" test, and it predates this work. The shape is selected *per claim*, so the
-           server's own claim is never chowned at all and Phase A is unreachable on it. The
-           missing gate was not missing.
-        2. **The widening it feared is not reachable even without the gate.** Under
-           `narrowWritableSurface` — which is a *precondition of the seeder existing at all* —
-           the agent containers mount the `root-overlay` `emptyDir` at `dataMountPath`, not the
-           `data` volume, and `write-prompt` reuses that same list. The only container in the Pod
-           that mounts `data` at its root is the seeder itself. So "any agent pod could create
+        1. **The widening it feared is not reachable — and this reason carries the withdrawal by
+           itself.** Under `narrowWritableSurface` — which is a *precondition of the seeder
+           existing at all* — the agent containers mount the `root-overlay` `emptyDir` at
+           `dataMountPath`, not the `data` volume (`job-manifest.ts:3389-3399`), and
+           `write-prompt` reuses that same list (`:4215`). Every other mount of `data` is a
+           `subPath` bind (`:3587`, `:3626`, `:4221`); the only container in the Pod that mounts
+           `data` at its root is the seeder itself (`:4410`). Read back off a live Pod spec
+           2026-10-30 (`ac-386c81e8-…-gdwld`, company `aaced805`, node `k8s-paperclip-3`):
+           `claude` and `write-prompt` both take `root-overlay` at `/paperclip`, every one of
+           their `data` entries carries a `subPath`, and `seed-writable-dirs` is the sole
+           root-of-volume mount, at `/mnt/paperclip-data-seed`. So "any agent pod could create
            and delete entries at the shared root" describes a reachability the manifest does not
-           grant.
+           grant: chowning that root widens nothing an agent container can address.
+        2. **A gate exists — but a narrower one than the withdrawn paragraph asked for, so this
+           reason does NOT stand alone.** `serverCanPreCreate` (`job-manifest.ts:3272`,
+           `narrowWritableSurface && dataClaimName === selfPod.pvcClaimName`) tests whether a
+           claim is *the server's own*. The withdrawn paragraph wanted a different test — whether
+           a claim belongs to **one agent** — and the two come apart: a claim can be foreign and
+           still be shared by several agents. Such a claim passes `!serverCanPreCreate`, is given
+           the split shape, and has its root chowned. That is safe, but it is safe because of
+           reason 1, not because of this gate. What this gate does settle is the narrower case
+           the withdrawn paragraph was actually written about: today's one shared claim *is* the
+           server's own, and the shape is selected *per claim*, so that claim is never chowned at
+           all. Right about today's volume; not the general argument it was recorded as.
 
-        **What this cost, and the lesson worth keeping.** The two facts above were both readable
-        from the same function the recommendation was written against. Recording a *blocker* from
-        reasoning about a mount layout, without reading the layout, held a self-contained change
-        hostage to a much larger one. Where this plan says "must ship with", that claim needs a
-        citation of the same kind it demands for a measurement.
+        **What this cost, and the lesson worth keeping.** Reason 1 was readable from the same
+        function the recommendation was written against. Recording a *blocker* from reasoning
+        about a mount layout, without reading the layout, held a self-contained change hostage to
+        a much larger one. Where this plan says "must ship with", that claim needs a citation of
+        the same kind it demands for a measurement — and §5's row 4 points here rather than
+        restating it.
+
+        **The lesson has a second half, learned the same way.** The withdrawal as first written
+        offered reason 2 as independently sufficient. It is not, and nothing had checked that
+        either: `serverCanPreCreate` was read for what it gates, not for what it *tests*, and a
+        reader who took it as "this claim is one agent's" would have carried the same class of
+        unverified premise forward under the banner of correcting one. A retraction is not exempt
+        from the standard it imposes. Both halves are left standing above rather than tidied into
+        a single clean reason, because the shape of the error is the useful part of the record.
 
         **What shipped instead:** #3165, on its own and ahead of the swap. Two shapes selected by
         `serverCanPreCreate`; every Job on the fleet today keeps the byte-identical single uid-0
-        container, asserted by a negative-control test. The split shape is **inert in production**
-        — no per-agent claim exists, so it is unreachable — which is the point: the swap becomes a
-        claim change rather than a claim change plus a privilege-model change.
+        container, asserted by a negative-control test. The split shape is unreachable **unless an
+        execution target sets `workspaceVolumeClaim` to a non-server claim**. Whether a per-agent
+        claim exists is *not* what decides that, and the source says so where the recommendation
+        could have read it: `job-manifest.ts:3273-3276` — *"Reachable TODAY, not only in stage
+        4b … an operator can already point a Job at a foreign claim."*
+
+        **So it was measured — this paragraph's own lesson applied to this paragraph.** Over
+        Prometheus's full retention window, **22,949** distinct agent-Job pods in namespace
+        `paperclip` declared a PVC-backed volume, and every one of them named the same claim:
+
+        ```promql
+        count by (persistentvolumeclaim) (
+          max_over_time(kube_pod_spec_volumes_persistentvolumeclaims_info{namespace="paperclip", pod=~"ac-.*"}[7d])
+        )
+        → {persistentvolumeclaim="paperclip-data"}  22949      # one series, 2026-10-30
+        ```
+
+        The server's own pods — `paperclip-0`, `paperclip-1`, and both `paperclip-api-*` — name
+        that same `paperclip-data`, so `dataClaimName === selfPod.pvcClaimName` holds for every
+        one of those 22,949 Jobs and `serverCanPreCreate` is true fleet-wide. The split shape is
+        inert **in fact**, measured, rather than inert by a construction that does not hold. That
+        is still the point: the swap becomes a claim change rather than a claim change plus a
+        privilege-model change.
+
+        ⚠️ **Two limits on that measurement, stated rather than glossed** — the same two §4.1
+        already attaches to the wedge baseline. First, Prometheus retains ~7 days, so this is
+        "no foreign claim in the last week", not "never". Second, it observes *rendered
+        manifests*, not the environment config rows that render them: that table is board-scoped
+        and this seat is refused (`GET /api/companies/:id/environments` → 403). An environment
+        could set `workspaceVolumeClaim` explicitly to `paperclip-data` — indistinguishable here,
+        and harmless, since it resolves to the server's own claim either way. What the
+        measurement does rule out is any target that currently renders a *different* one.
 
         ⚠️ **A real constraint does survive, in the opposite direction, and it is sticky.** The
         server's own claim must *keep* the uid-0 shape — not as caution but because that volume
@@ -800,6 +854,18 @@ PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verificati
         **rollback hazard**: seeding a per-agent claim with the uid-0 shape even once leaves
         root-owned intermediates the split shape can never create inside afterwards. Reverting
         #3165 after the swap has begun is therefore not a clean revert.
+
+        ⚠️ **That hazard is not rollback-only — it reaches the forward path too, and on master
+        already.** The seeder's gate is `narrowWritableSurface`, **not** `serverCanPreCreate`
+        (`job-manifest.ts:4270`). So the uid-0 seeder today runs against a *foreign* claim just as
+        readily as against the server's own, and any claim ever seeded that way may already carry
+        root-owned intermediates — inside which, per the paragraph above, a uid-1000 `mkdir` of a
+        new sibling EACCESes under `set -e`. The measurement above says no such claim is in use
+        on the fleet today, which is why this is recorded as a precondition to check before the
+        swap rather than as a live defect. Stated as the rule it implies: **a claim that has ever
+        been seeded under the uid-0 shape cannot be adopted as a per-agent claim without first
+        reconciling its ownership** — in either direction of travel, and regardless of whether a
+        gate selects the shape correctly.
 
         **Not measured.** Whether a freshly provisioned CephFS subvolume root accepts the chown
         from inside the pod mount (it should — the mount *is* the subvolume root, so this is an
@@ -1252,7 +1318,7 @@ four are inert until the `dataClaimName` swap:
 | 1 — populate/relocate the server-materialized trees (incl. the prompt bundle) | **closed** — #3153 / #3157 / #3158, last merged 20:19:43Z. Inert until the swap, by design. |
 | 2 — symlinked-PARENT hole in the seeder | **closed** — #3161, merged 19:51:15Z |
 | 3 — directory MODE | **implemented, in review** — #3165. `mkdir -m 2775 -p`, as recommended; a separate `chmod` stays unexecutable (no `CAP_FOWNER`), and busybox's `make_directory.c` `goto ret0`s on `EEXIST` at the final component *before* its `chmod`, so an existing 1000-owned target is never chmodded. Subsumed by invariant 4's split exactly as predicted: as uid 1000 the seeder owns what it creates, so the mode needs no privilege. ⚠️ Still converges only targets the seeder creates, and the CephFS fresh-subvolume question remains **unmeasured** — no per-agent claim exists to measure against |
-| 4 — guard is check-then-act under concurrent same-agent runs | **implemented, in review** — #3165, the recommended split: uid 0 chowns the volume ROOT only (one inode, no in-volume path components, so no TOCTOU), everything else runs as uid 1000, which *removes* the privilege boundary rather than hardening the race across it. Available only because stage 3b-iii left `readOnlySubPaths` empty — now enforced as a build-time throw, not a comment. `fsGroup`, the post-`mkdir` re-check and run serialisation remain ruled out. ⚠️ **"Must ship WITH the swap, never before it" is WITHDRAWN** — the premise was unchecked and false, twice over; see §4. It shipped ahead of the swap and inert. ⚠️ The root `chown` on a real CephFS subvolume is still **unexecuted**; fd-relative `openat` walk remains the fallback |
+| 4 — guard is check-then-act under concurrent same-agent runs | **implemented, in review** — #3165, the recommended split: uid 0 chowns the volume ROOT only (one inode, no in-volume path components, so no TOCTOU), everything else runs as uid 1000, which *removes* the privilege boundary rather than hardening the race across it. Available only because stage 3b-iii left `readOnlySubPaths` empty — now enforced as a build-time throw, not a comment. `fsGroup`, the post-`mkdir` re-check and run serialisation remain ruled out. ⚠️ **"Must ship WITH the swap, never before it" is WITHDRAWN** — the premise was unchecked and false; the reachability argument in §4 carries that on its own, and the second reason first recorded beside it does not (it tests "is this the server's claim", not "is this claim one agent's"). See §4. It shipped ahead of the swap, and is inert on the fleet by measurement (every agent Job over 7d names the server's own claim), not by construction. ⚠️ The root `chown` on a real CephFS subvolume is still **unexecuted**; fd-relative `openat` walk remains the fallback |
 
 **PEN-4932's four done-when items, measured from inside a live agent pod 2026-10-30T21:4xZ**
 (`findmnt`, this run's own pod on `k8s-paperclip-3`):
