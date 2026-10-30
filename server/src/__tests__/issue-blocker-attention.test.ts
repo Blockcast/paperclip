@@ -116,6 +116,7 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     monitorNextCheckAt?: Date | null;
     monitorAttemptCount?: number | null;
     executionPolicy?: unknown;
+    parkedUntil?: Date | null;
   }) {
     const id = input.id ?? randomUUID();
     await db.insert(issues).values({
@@ -134,6 +135,7 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       executionState: input.executionState ?? null,
       executionWorkspaceId: input.executionWorkspaceId ?? null,
       description: input.description ?? null,
+      ...(input.parkedUntil != null ? { parkedUntil: input.parkedUntil } : {}),
       ...(input.monitorNextCheckAt != null ? { monitorNextCheckAt: input.monitorNextCheckAt } : {}),
       ...(input.monitorAttemptCount != null ? { monitorAttemptCount: input.monitorAttemptCount } : {}),
       ...(input.executionPolicy != null ? { executionPolicy: input.executionPolicy as Record<string, unknown> } : {}),
@@ -1461,6 +1463,114 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       state: "stalled",
       reason: "stalled_review",
       stalledBlockerCount: 1,
+    });
+  });
+
+
+  // PEN-5021: `blockerAttention` read status and monitor but never the park, so a blocker
+  // deliberately stood down with a release wake owed to it classified `stalled` exactly like
+  // one nobody had touched. Measured live twice in one sweep (PEN-4969 via PEN-4874,
+  // PEN-4931 via PEN-4656); five times across three sweeps with the same missing term.
+  it("covers an in_review blocker parked on a live deliberate park (PEN-5021)", async () => {
+    const { companyId, agentId } = await createCompany("PPK");
+    const parentId = await insertIssue({ companyId, identifier: "PPK-1", title: "Parent", status: "blocked" });
+    const blockerId = await insertIssue({
+      companyId,
+      identifier: "PPK-2",
+      title: "Parked review blocker",
+      status: "in_review",
+      assigneeAgentId: agentId,
+      parkedUntil: new Date(Date.now() + 6 * 60 * 60 * 1000),
+    });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: parentId });
+
+    const parent = ((await svc.list(companyId, { status: "blocked" })) as IssueListItem[]).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({
+      state: "covered",
+      unresolvedBlockerCount: 1,
+      coveredBlockerCount: 1,
+      stalledBlockerCount: 0,
+      attentionBlockerCount: 0,
+    });
+  });
+
+  // The negation, and the reason suppression cannot decay into permanent silence: expiry is
+  // the default, so a park nobody restates stops covering on its own.
+  it("stalls an in_review blocker whose deliberate park has lapsed (PEN-5021)", async () => {
+    const { companyId, agentId } = await createCompany("PPL");
+    const parentId = await insertIssue({ companyId, identifier: "PPL-1", title: "Parent", status: "blocked" });
+    const blockerId = await insertIssue({
+      companyId,
+      identifier: "PPL-2",
+      title: "Lapsed park review blocker",
+      status: "in_review",
+      assigneeAgentId: agentId,
+      parkedUntil: new Date(Date.now() - 60 * 60 * 1000),
+    });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: parentId });
+
+    const parent = ((await svc.list(companyId, { status: "blocked" })) as IssueListItem[]).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({
+      state: "stalled",
+      reason: "stalled_review",
+      stalledBlockerCount: 1,
+      sampleStalledBlockerIdentifier: "PPL-2",
+    });
+  });
+
+  // A park only covers when it owes a release wake. `issueParkOwesReleaseWake` needs an agent
+  // to wake, so an unassigned parked blocker must NOT be covered -- covering it would open a
+  // quiet hole of exactly the kind PEN-5021's second half is about. It keeps the `stalled`
+  // verdict the `in_review` arm already gave it, which is the correct reading: nothing is
+  // going to wake it. The assertion that matters here is `coveredBlockerCount: 0`.
+  it("does not cover an unassigned parked blocker, which is owed no release wake (PEN-5021)", async () => {
+    const { companyId } = await createCompany("PPM");
+    const parentId = await insertIssue({ companyId, identifier: "PPM-1", title: "Parent", status: "blocked" });
+    const blockerId = await insertIssue({
+      companyId,
+      identifier: "PPM-2",
+      title: "Unassigned parked blocker",
+      status: "in_review",
+      parkedUntil: new Date(Date.now() + 6 * 60 * 60 * 1000),
+    });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: parentId });
+
+    const parent = ((await svc.list(companyId, { status: "blocked" })) as IssueListItem[]).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({
+      state: "stalled",
+      reason: "stalled_review",
+      coveredBlockerCount: 0,
+      stalledBlockerCount: 1,
+      sampleStalledBlockerIdentifier: "PPM-2",
+    });
+  });
+
+  // `blocked` is deliberately absent from ISSUE_PARK_EXPIRY_WAKE_STATUSES, so the park sweep
+  // never wakes a blocked row and a park on one must not cover. Pins the status conjunct
+  // independently of the agent conjunct above.
+  it("does not cover a parked blocker whose status the park sweep never wakes (PEN-5021)", async () => {
+    const { companyId, agentId } = await createCompany("PPN");
+    const parentId = await insertIssue({ companyId, identifier: "PPN-1", title: "Parent", status: "blocked" });
+    const blockerId = await insertIssue({
+      companyId,
+      identifier: "PPN-2",
+      title: "Parked blocked blocker",
+      status: "blocked",
+      assigneeAgentId: agentId,
+      parkedUntil: new Date(Date.now() + 6 * 60 * 60 * 1000),
+    });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: parentId });
+
+    const parent = ((await svc.list(companyId, { status: "blocked" })) as IssueListItem[]).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({
+      state: "needs_attention",
+      reason: "attention_required",
+      coveredBlockerCount: 0,
+      attentionBlockerCount: 1,
     });
   });
 
