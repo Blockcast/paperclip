@@ -722,7 +722,8 @@ Two properties the implementation must carry, both forced by Finding 3:
    measured is the **projected per-run Secret size** — the sum over the run's resolved entries, not
    the company tree — because that is what actually ships (Finding 1).
 2. **Symlinks do not survive a Secret projection**, so the bundle's `.claude/skills/<runtimeName>`
-   farm must be built **in-pod** from the projected tree. That is the concrete form of invariant
+   farm must be built **in-pod** from the projected tree. *(Landed 2026-10-30; see the end of this
+   section.)* That is the concrete form of invariant
    1's *"the write target has to move"*, and it is a small init-container step, not a redesign:
    the link set is already derivable from the entries the server sends.
 
@@ -890,7 +891,55 @@ What that buys ahead of the swap is the one thing Finding 3 could not get: this 
 single company because an agent seat cannot enumerate them, so **the fleet distribution against the
 50 % trigger is unmeasured**. Emitting the projected per-run size on real traffic measures it,
 which is what the decision means by choosing a trigger that fires "against a measurement rather
-than under an outage". Property 2 — the in-pod link farm — is not in this change.
+than under an outage".
+
+**Landed 2026-10-30 — property 2, the in-pod rebuild.**
+`vendor/paperclip-adapter-claude-k8s/src/server/prompt-bundle-materialization.ts`
+(`buildPromptBundleMaterializationShell`) emits the step that turns the projected Secret back into
+the bundle tree inside the pod: for each path the projection declared, drop any symlinked ancestor,
+then `cp -L` it out of the Secret mount into the bundle root.
+
+Like the projection before it, **nothing calls it yet** — the Job does not mount the prompt-bundle
+Secret and the pod still reads the bundle off the shared volume, as it will until `dataClaimName`
+is swapped. Staging a Secret per run that nothing reads is a cost that buys that run nothing, which
+is the same restraint, for the same reason, that kept the projection measurement-only.
+
+Three of its properties are the **opposite** of `buildSharedDocOverlayShell`, which solves the same
+shape of problem and is the model for the Secret staging. Each inversion is forced by what the
+failure costs, and each is pinned by a test that fails when the property is removed:
+
+| | shared docs (PEN-3329) | this step |
+|---|---|---|
+| a declared file is not delivered | reported on stderr, step ends `true` | **exits non-zero** — the pod fails to start |
+| a destination already exists | kept; the step fills absences only | **overwritten** |
+| an ancestor is a symlink | stepped over | **removed** and reported |
+
+The first inversion is the one that matters. A shared doc that does not arrive costs the run some
+documentation; a skill file that does not arrive is invisible from inside the run — the agent simply
+does not have the skill — which is this channel's whole failure mode. The decision above already
+states the preference ("a `Pending` pod with an event, not a partially-populated tree"); this is
+where it is spent. The second follows from the bundle root being content-addressed by `bundleKey`:
+anything already at a destination is either byte-identical or the residue of a half-finished
+attempt, so overwriting makes the tree a function of the Secret alone, which is the invariant the
+swap needs. The third follows from ownership — the pod owns the bundle root, and a symlink at
+`.claude/skills/<runtimeName>` is precisely the pre-swap farm entry the swap exists to retire, so
+stepping over it would preserve the dangling link. `-L` is tested rather than `-e`, so a *dangling*
+ancestor, the shape the swap actually produces, is caught as well as a live one.
+
+`cp -L` rather than a plain copy, because a Secret volume is an atomic-writer layout: every
+projected path is a symlink into `..data/<key>`, itself a link to a timestamped directory. A copy
+preserving links would leave the bundle root correct only while that mount exists — the same class
+of fault as the server-written farm. And the step copies exactly the declared paths, never walking
+the mount root, so the Secret's own `..data` bookkeeping cannot reach the bundle.
+
+Path safety is decided in TypeScript (`isSafeBundlePath`), not defended against in shell: every path
+reaching the step comes from the projection's own `items[].path`, so an unsafe one is a bug in this
+channel rather than hostile input, and the builder throws rather than emitting a step that silently
+drops it. A shell guard would also have to be correct under every `sh` the image might ship.
+
+**What is left before the swap** is now the swap itself: mount the Secret on the Job, point the
+bundle root at the in-pod tree, stop the server writing the farm, and move `dataClaimName` to a
+per-agent claim. Done-when 1 is unmet until that lands.
 
 ⛔ Unchanged and still refused: a shared read-only claim (§2). It is one volume ID on every agent
 pod on the node, taking the same ceph-csi lock through the same `NodeUnstageVolume` path, and it
