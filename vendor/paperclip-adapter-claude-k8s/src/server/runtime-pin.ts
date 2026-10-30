@@ -440,13 +440,15 @@ export const PRE_PUSH_HOOK_PREFLIGHT_NOT_EXECUTABLE = `${PRE_PUSH_HOOK_PREFLIGHT
  * Four verdicts, each naming a different fix:
  *   ok              — executable hook where the runtime will look. Nothing to do.
  *   MASKED          — nothing at either path, so this pod refuses every push.
- *                     Check the image first, then `ROOT_TOOLCHAIN_SUBPATHS`
- *                     and `/proc/mounts`. Since PEN-4932 this no longer
- *                     implies two independent faults: on a narrowed pod the
- *                     seeded copy is unreachable BY DESIGN, so a single
- *                     fault — a pre-bake image — is sufficient, and is now
- *                     the likeliest cause. An absent bind is the intended
- *                     state, not the defect; roll the image forward.
+ *                     Check the image build. Since PEN-4932 this no longer
+ *                     implies two independent faults: a narrowed pod carries
+ *                     no git-hooks bind at all, so the seeded copy is
+ *                     unreachable BY DESIGN and a single fault — a pre-bake
+ *                     image — is sufficient, and is now the likeliest cause.
+ *                     An absent bind is the intended state, not the defect, so
+ *                     `/proc/mounts` is no longer where this is decided and
+ *                     hunting the bind there leads nowhere; roll the image
+ *                     forward.
  *   OFF-MOUNT       — the SEEDED hook is on the data volume but the IMAGE
  *                     carries none, and a PEN-4932-or-later runtime reads the
  *                     image (`BAKED_HOOKS_DIR`). This pod is running an
@@ -533,7 +535,7 @@ export function buildPrePushHookPreflightShell(opts: { dataMountPath: string }):
     'elif [ -e "$__pchookmnt/pre-push" ]; then ' +
       `echo "${PRE_PUSH_HOOK_PREFLIGHT_OFF_MOUNT} runtime=$__pchookrt data=$__pchookmnt - the seeded hook is on the data volume but the agent image carries none. Since PEN-4932 emptied ROOT_TOOLCHAIN_SUBPATHS this verdict is reachable only on the broad data mount, the one place that copy is still visible; a narrowed pod in the same state reports MASKED instead, and there the pod really cannot publish. On the broad mount it depends on which egress runtime the image carries: one from PEN-4932 or later reads the image copy and will refuse every push from this pod, while an older one reads the seeded copy, which is still mounted there, and publishes normally. Do not read this line on its own as an outage - this preflight is built by the server, and an agent can pin an image older than the server that wrote it. The remedy is the same either way: roll the image forward rather than touching the chart (PEN-4518, PEN-4932)" >&2; ` +
     "else " +
-      `echo "${PRE_PUSH_HOOK_PREFLIGHT_MASKED} runtime=$__pchookrt data=$__pchookmnt - no pre-push hook is visible at either path, so this pod cannot publish at all; check the agent image first - the runtime reads the baked copy - and only then the seeded one, where a narrowed Job pod sees an overlay over the PVC so ROOT_TOOLCHAIN_SUBPATHS against /proc/mounts is the check, not the seed log (PEN-4518, PEN-4932, BLO-32734)" >&2; ` +
+      `echo "${PRE_PUSH_HOOK_PREFLIGHT_MASKED} runtime=$__pchookrt data=$__pchookmnt - no pre-push hook is visible at either path, so this pod cannot publish at all; the runtime reads the copy baked into the agent image, so check the image build first. A narrowed pod carries no hooks bind at all - since PEN-4932 none is created, and the seeded copy is unreachable BY DESIGN - so an absent bind is the intended state rather than the defect, and hunting it in /proc/mounts leads nowhere. That leaves one fault sufficient to produce this line, an image from before the bake, which is now the likeliest cause; the remedy is to roll the image forward, the same one OFF-MOUNT and NOT-EXECUTABLE name (PEN-4518, PEN-4932, BLO-32734)" >&2; ` +
     "fi",
     "unset __pchookrt __pchookmnt",
   ].join("; ");

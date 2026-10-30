@@ -99,3 +99,54 @@ pod`, `publishes normally`) both survive deliberately.
 
 **Re-verified after this edit:** `tsc --noEmit` clean; vendored claude suite **1751/1751** on the
 pinned `vitest ^4.1.4` (`runtime-pin.test.ts` 44/44); provenance log ok against `origin/master`.
+
+## Follow-up on review: the MASKED *runtime string* had the same defect as its doc block
+
+Ally's review of `ad2cdc6d` took the doc-block correction above and pointed at what it had left
+behind: the doc block was fixed, the **emitted** string was not. `runtime-pin.ts` still told the
+operator that
+
+> a narrowed Job pod sees an overlay over the PVC so `ROOT_TOOLCHAIN_SUBPATHS` against
+> `/proc/mounts` is the check, not the seed log
+
+After this PR a narrowed pod has no hooks bind at all, so that sentence sends the reader to inspect
+a mount whose absence is the **intended** state. The failure mode is specific and worse than vague
+prose: the reader follows the instruction, confirms the bind is missing, and concludes they have
+found the fault — when they have found the design. That is the same defect class as the
+`NOT-EXECUTABLE` text corrected in #3134 and the `OFF-MOUNT` text corrected in #3126: *a verdict
+naming a remedy the reader cannot act on*. This is the third instance, and the last one the
+`ROOT_TOOLCHAIN_SUBPATHS` change created.
+
+The string now names the image build as the place to look, states that the seeded copy is
+unreachable by design, says in so many words that hunting the bind in `/proc/mounts` leads nowhere,
+and gives the same remedy `OFF-MOUNT` and `NOT-EXECUTABLE` already give — roll the image forward.
+The doc block's residual *"Check the image first, then `ROOT_TOOLCHAIN_SUBPATHS` and
+`/proc/mounts`"* is dropped for the same reason; it survived the first correction and contradicted
+the paragraph directly beneath it.
+
+**Both adapters, deliberately.** The `MASKED` and `NOT-EXECUTABLE` emitted strings are byte-identical
+across `claude_k8s` and `opencode_k8s` (verified by hash before and after this edit), and both
+adapters' preflights read the same `BAKED_HOOKS_DIR`. Fixing only this one would have *created* a
+divergence rather than left a pre-existing one. The opencode copy was stale for a slightly different
+reason and the wording accounts for it: that adapter's `job-manifest.ts` has no
+`ROOT_TOOLCHAIN_SUBPATHS` and never bound the dir, so its seeded copy was already unreachable. The
+replacement text therefore says "since PEN-4932 none is created" rather than attributing the absence
+to the emptying, which is true in the claude case and false in the opencode one.
+
+**Pinned, with a stated positive control.** The MASKED test asserted `toContain("ROOT_TOOLCHAIN_SUBPATHS")`
+under a comment reading "it must send the reader at the mount" — an assertion that actively defended
+the defect. It now pins the three load-bearing phrases (`check the image build`,
+`unreachable BY DESIGN`, `roll the image forward`) and asserts the old directive is **absent**.
+Positive control: restoring the previous emitted string turns exactly that test red
+(`expected … to contain 'check the image build'`, 1 failed / 43 passed) and nothing else.
+
+**One wording constraint, imposed by an existing guard rather than by taste.** The first draft read
+"no git-hooks bind at all", which tripped `job-manifest.test.ts`'s unclassified-`git`-call scanner —
+it matches `(?<![-.`\w])git\b` across the whole container command and fails closed on anything it
+cannot classify. The token was prose inside an `echo`, not a call, but the guard's own comment says
+the fix is to classify the call rather than narrow the match, and neither applies to prose that does
+not need to be there. Reworded to "no hooks bind at all"; the guard is untouched. The string also
+remains free of `"`, `` ` `` and `$`, as the double-quoted `echo` requires.
+
+**Re-verified after this edit:** `tsc --noEmit` clean in both adapters; vendored claude suite
+**1751/1751**, vendored opencode suite **750/750**.

@@ -471,9 +471,19 @@ describe("buildPrePushHookPreflightShell (PEN-4518)", () => {
       const res = run(against(f.runtime, f.mount));
       expect(res.stderr).toContain(PRE_PUSH_HOOK_PREFLIGHT_MASKED);
       expect(res.stderr).not.toContain(PRE_PUSH_HOOK_PREFLIGHT_OK);
-      // It must send the reader at the mount, not at the seed log, because the
-      // seed log said "installed" throughout the outage and was not lying.
-      expect(res.stderr).toContain("ROOT_TOOLCHAIN_SUBPATHS");
+      // It must send the reader at the IMAGE, and must not send them hunting a
+      // bind that PEN-4932 deliberately stopped creating. Before this change
+      // the line named `ROOT_TOOLCHAIN_SUBPATHS` and `/proc/mounts` as "the
+      // check", which outlived the bind it described: an operator following it
+      // confirms the bind is absent and concludes they have found the fault,
+      // when absence is the intended state. The seed log is still not the
+      // place to look -- it said "installed" throughout the PEN-4518 outage
+      // and was not lying -- but the reason is now that the seeded copy is
+      // unreachable by design, not that the mount hides it.
+      expect(res.stderr).toContain("check the image build");
+      expect(res.stderr).toContain("unreachable BY DESIGN");
+      expect(res.stderr).toContain("roll the image forward");
+      expect(res.stderr).not.toContain("ROOT_TOOLCHAIN_SUBPATHS against /proc/mounts is the check");
     } finally {
       f.cleanup();
     }
