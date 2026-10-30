@@ -37508,6 +37508,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       outcome = persistedDecision.outcome;
 
       let persistedRun = persistedRunWrite.run;
+      if (persistedRun && hasExternalLifecycle(agent.adapterType)) {
+        // BLO-49987 / BLO-50192: the owner write is the other half of the
+        // finalization race (see finalizeExternalLifecycleTerminalRun). Since
+        // #3092 it wins every succeeded Job inside the stale window, so without
+        // this the histogram's `succeeded` population is starved. The write
+        // above is conditional on `running`, so exactly one path observes a
+        // run. Observed before classifyAndPersistRunLiveness, like the others.
+        recordExternalLifecycleRunSilenceGap({
+          adapter: agent.adapterType,
+          status: outcome,
+          run: persistedRun,
+          finalizedAt: persistedRun.finishedAt ?? new Date(),
+        });
+      }
       if (persistedRun) {
         persistedRun = await classifyAndPersistRunLiveness(
           persistedRun,
