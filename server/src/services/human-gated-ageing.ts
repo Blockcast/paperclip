@@ -98,6 +98,63 @@ const PRIORITY_RANK = new Map<string, number>(
  * its own right rather than a tuning pass, and it is tracked on **PEN-4500**
  * rather than folded in here. Until then, read a past-threshold count from this
  * digest as "open and older than two weeks", not as a triage verdict.
+ *
+ * ## A candidate selector that does discriminate — measured 2026-10-30 (PEN-4500)
+ *
+ * The paragraph above says what the threshold has stopped doing. This says what
+ * could replace it, with the measurement that priced it. **Nothing here changes
+ * behaviour** — PEN-4500 still owns the decision, and this is the evidence it was
+ * missing, recorded where the next reader of the constant will find it.
+ *
+ * Re-measured on the Penstock queue 2026-10-30, same method as the 2026-10-22 pass
+ * (all five open statuses, `assigneeUserId IS NOT NULL`, complete pages). The queue
+ * has shrunk from 74 rows to **48**; the non-discrimination has not moved with it.
+ *
+ * | tier     | pool | past threshold | is the sole remaining gate for >=1 open row |
+ * |----------|------|----------------|---------------------------------------------|
+ * | critical |   14 |         **14** |                                           9 |
+ * | high     |   24 |             21 |                                           7 |
+ * | medium   |    5 |              4 |                                       **0** |
+ * | low      |    5 |              4 |                                       **0** |
+ * | **all**  | **48** |   **43 (90%)** |                               **16 (33%)** |
+ *
+ * The candidate is **transitive payoff**: walk `blockedBy` from every open row to
+ * its root frontier, and score a human-gated row by how many open rows it is the
+ * *sole* remaining root of — i.e. rows where this one console action is the whole
+ * remaining gate. It is a filter, not a ranking, which is the property age has lost:
+ *
+ * - **30 of 48 (62%) cannot free anything today.** 28 are the root of no open
+ *   chain at all; the other 2 (`PEN-1095`, `PEN-193`) do block work but are
+ *   themselves blocked, so acting on them alone frees nothing either. Age admits
+ *   all 30; payoff excludes them on merit.
+ * - It removes `medium` and `low` wholesale — 0 of 10 are a sole gate — which is
+ *   the job the 30d/45d weighting exists to do, done by measurement instead of by
+ *   tier. On this queue the weighting is not what is keeping `low` out.
+ * - The remaining 16 rows are the sole gate for **43 open rows**, and the **top 7
+ *   cover 29 of those 43**. That is a cut that lands inside the population, which
+ *   per {@link DEFAULT_MAX_ESCALATED} no cap on an age-ordered list can do.
+ *
+ * **The two orderings disagree almost completely, and that is the finding.** The 7
+ * oldest human-gated rows — what the digest escalates today — are the sole gate for
+ * **2 open rows between them**; six of the seven free nothing. The 7 highest-payoff
+ * rows free 29. The clearest single case is `PEN-4079`: **16 days old**, so age
+ * ranks it near the bottom and it would not escalate for another fortnight, while
+ * it sits above **27 open rows, 23 of them `critical`/`high`** — the largest reach
+ * in the graph. Age and payoff are not two views of one priority here; on this
+ * queue they are close to orthogonal.
+ *
+ * Validation, because a selector derived from a bad graph is worse than no selector:
+ * all 77 blockers referenced from outside the open set are `done` (so zero phantom
+ * roots), the blocker graph has **zero cycles** (so the frontier walk is exact and
+ * its cycle guard never fired), and `PEN-4079`'s reach of 27 was reproduced by an
+ * independent forward BFS over inbound edges rather than read off the same walk.
+ *
+ * ⚠ Two limits this measurement does not clear. It is **one company's queue** —
+ * the same mistake the table above is charged with, so payoff must be re-measured
+ * per queue before it is believed anywhere else. And payoff scores *what a row
+ * unblocks*, which is not the same as *what it is worth*: a row gating nothing can
+ * still be urgent on its own merits (a security exposure, a legal deadline), so
+ * payoff is a candidate for the escalation **filter**, never for dropping a row.
  */
 export const DEFAULT_ESCALATE_AFTER_DAYS_BY_PRIORITY: Readonly<Record<string, number>> =
   Object.freeze({
