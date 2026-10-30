@@ -749,6 +749,17 @@ invariant exists to rule out:
   so `skippedSymlinkCount` and `skippedNonRegularCount` are emitted alongside the byte total and
   the total is read with its own omissions attached.
 
+  ⛔ **Carried constraint for the swap PR: a non-zero `skippedSymlinkCount` is a blocker, not a
+  number.** `hashPathContents` (`prompt-cache.ts:196-205`) *resolves* a symlink with `realpath` and
+  hashes the target, and the bundle the pod reads today delivers that target's content. The
+  projection steps over the link. The two therefore disagree, and today that disagreement is
+  harmless because the Secret is not the delivery path — but on the run that swaps `dataClaimName`
+  it becomes a file the pod used to get and silently stops getting, which is the precise failure
+  this channel exists to prevent, reintroduced by the change meant to close it. The swap must
+  either resolve links whose target is inside the skill tree, or refuse. Counting it now is what
+  makes that decision answerable from data rather than from a guess about whether any real skill
+  tree uses one.
+
 One further caveat on reading the cap as the ceiling: the Secret is one object among the Job's, and
 etcd's request limit (~1.5 MiB by default) applies to the whole serialized object — keys, base64
 expansion and metadata included. The usable headroom therefore sits slightly under the validation
@@ -766,6 +777,13 @@ source paths, server mount and catalog set the projection filter reads, which th
 not cover). Without that, every run would pay a second full content read of the skill farm on the
 Job-creation critical path — on the very CephFS mount whose stalls are this issue's subject —
 purely to produce a log line. Only the measurement is retained, never the projected bytes.
+
+The over-budget and too-many-files **refusals are cached under the same key** as a success. They
+are deterministic for a given key (which covers the content hash, the sources, the mount and the
+catalog set, against constant thresholds), and caching only successes would leave exactly the
+largest bundles — the ones this measurement exists to find — re-reading the whole skill farm on
+every run forever. A transient I/O fault is deliberately *not* cached: remembering one would
+suppress the measurement for the life of the process on the strength of a blip.
 
 What that buys ahead of the swap is the one thing Finding 3 could not get: this sizing is from a
 single company because an agent seat cannot enumerate them, so **the fleet distribution against the
