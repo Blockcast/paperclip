@@ -43,6 +43,10 @@ import {
   resolveDataMountPath,
   resolveJobIsolation,
   sanitizeLabelValue,
+  // PEN-4932: lives in job-manifest.ts because `buildJobManifest`'s
+  // `data_claim_foreign` warning has to name the very directory this resolves.
+  // Two copies would drift, and the warning would then name a path no run reads.
+  resolvePromptCacheRoot,
   type JobIsolation,
 } from "./job-manifest.js";
 import type * as k8s from "@kubernetes/client-node";
@@ -315,38 +319,6 @@ function resolveIsolationMutexKey(
     isolationKey: isolation.key,
     isolation,
   };
-}
-
-function sanitizePathComponent(value: string): string {
-  return value.replace(/[^a-zA-Z0-9-]/g, "");
-}
-
-function safePathComponent(value: string): string {
-  return sanitizePathComponent(value) || "unknown";
-}
-
-/**
- * POD address of the prompt-cache root, or null to let the bundle fall back to
- * its managed server-side default.
- *
- * Every branch returns a path the CONTAINER must be able to resolve, which is
- * why the last one is rooted at `resolveDataMountPath` and not at a literal
- * `/paperclip` — the same correction BLO-32734 applied to the other five
- * isolation roots. That branch is the runtime-descriptor case: config-source
- * isolation always populates `isolation.promptCacheRoot`, but a runtime
- * descriptor may leave it "".
- */
-function resolvePromptCacheRoot(
-  config: Record<string, unknown>,
-  ctx: AdapterExecutionContext,
-  isolation: JobIsolation,
-): string | null {
-  const configured = asString(config.promptCacheRoot, "").trim();
-  if (configured) return configured;
-  if (!isolation.enabled) return null;
-  if (isolation.promptCacheRoot) return isolation.promptCacheRoot;
-  const root = `${resolveDataMountPath(config)}/instances/default/data/k8s-isolation/${safePathComponent(ctx.agent.companyId)}/${safePathComponent(ctx.agent.id)}/${isolation.key}`;
-  return `${root}/prompt-cache`;
 }
 
 async function listClaudeSessionJsonlFiles(root: string, sessionId: string): Promise<string[]> {
