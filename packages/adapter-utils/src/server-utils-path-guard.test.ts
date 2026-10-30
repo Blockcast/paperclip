@@ -67,5 +67,53 @@ describe("ensurePathInEnv keeps the git egress guard (PEN-5030)", () => {
     it("still substitutes exactly the default it always did", () => {
       expect(ensurePathInEnv({ FOO: "bar" }).PATH).toBe(defaultPathForPlatform());
     });
+
+    it("drops empty segments — the one way the round trip is not a literal identity", () => {
+      // PEN-5066. guardedChildEnv() splits and rejoins, so an empty segment
+      // does not survive. Pinned rather than merely documented, because the
+      // comment on ensurePathInEnv() now claims exactly this much and no more.
+      // The direction is toward safety: an empty POSIX segment means the
+      // current working directory, so this removes an implicit cwd-on-PATH.
+      //
+      // Mutation-testing this found the drop is enforced TWICE — split() in
+      // egress-guard-path.ts filters empty entries, and guardedPath() filters
+      // them again when it builds `rest`. Removing either one alone leaves
+      // this case green; only removing both turns the round trip back into a
+      // literal identity. So neither filter is independently load-bearing
+      // here, and a future tidy-up that deletes "the redundant one" is a
+      // behaviour change this case will not catch on its own.
+      expect(ensurePathInEnv({ PATH: "/tmp/stub::/usr/bin" }).PATH).toBe("/tmp/stub:/usr/bin");
+      expect(ensurePathInEnv({ PATH: "/tmp/stub: :/usr/bin" }).PATH).toBe("/tmp/stub:/usr/bin");
+    });
+  });
+
+  describe("the Windows `Path` spelling", () => {
+    // PEN-5066. The early return is keyed on the environment map, not on
+    // process.platform, so it fires here on Linux too. Each case below is
+    // tied to one conjunct of that guard and fails if the conjunct is removed.
+    beforeEach(() => {
+      process.env.PATH = `${GUARD}:/usr/local/bin:/usr/bin:/bin`;
+    });
+
+    it("returns an environment carrying only `Path` exactly as it was", () => {
+      // Drop the early return entirely and this fails: with no `PATH` key,
+      // guardedChildEnv() substitutes the guarded default and adds it.
+      expect(ensurePathInEnv({ Path: "C:\\Windows\\System32", FOO: "bar" })).toEqual({
+        Path: "C:\\Windows\\System32",
+        FOO: "bar",
+      });
+    });
+
+    it("still guards when both spellings are present — `PATH` is what the child reads", () => {
+      // Drop the `!hasPath` conjunct and this fails: the environment returns
+      // untouched and the narrowed PATH keeps no guard.
+      expect(ensurePathInEnv({ PATH: "/tmp/stub", Path: "C:\\x" }).PATH).toBe(`${GUARD}:/tmp/stub`);
+    });
+
+    it("treats an empty `Path` as absent, exactly as it treats an empty `PATH`", () => {
+      // Drop the `Path.length > 0` conjunct and this fails: the early return
+      // fires on the empty string and no PATH is supplied at all.
+      expect(ensurePathInEnv({ Path: "" }).PATH?.split(":")[0]).toBe(GUARD);
+    });
   });
 });
