@@ -52,12 +52,52 @@ describe("agentWorkspaceClaimName", () => {
 
 describe("ensureAgentWorkspacePvc", () => {
   it("returns the existing claim without creating anything", async () => {
-    vi.mocked(getPvc).mockResolvedValue({ metadata: { name: "x" } });
+    vi.mocked(getPvc).mockResolvedValue({
+      metadata: { name: "x" },
+      spec: { accessModes: ["ReadWriteMany"] },
+    });
 
     const name = await ensureAgentWorkspacePvc({ agentId: AGENT_ID, namespace: NAMESPACE });
 
     expect(name).toBe(`agent-workspace-${AGENT_ID}`);
     expect(createPvc).not.toHaveBeenCalled();
+  });
+
+  // The adopt path is where a wrong claim actually arrives: the create path is
+  // pinned RWX by a test, but a claim made by an earlier revision or by hand
+  // (following the RWO `opencode-db` precedent) is otherwise adopted forever
+  // with nothing re-checking it.
+  it("refuses to adopt a pre-existing claim that is not RWX", async () => {
+    vi.mocked(getPvc).mockResolvedValue({
+      metadata: { name: "x" },
+      spec: { accessModes: ["ReadWriteOnce"] },
+    });
+
+    await expect(
+      ensureAgentWorkspacePvc({ agentId: AGENT_ID, namespace: NAMESPACE }),
+    ).rejects.toThrow(/not ReadWriteMany[\s\S]*immutable/);
+    expect(createPvc).not.toHaveBeenCalled();
+  });
+
+  it("adopts a claim that lists RWX among several modes", async () => {
+    vi.mocked(getPvc).mockResolvedValue({
+      metadata: { name: "x" },
+      spec: { accessModes: ["ReadWriteOnce", "ReadWriteMany"] },
+    });
+
+    await expect(
+      ensureAgentWorkspacePvc({ agentId: AGENT_ID, namespace: NAMESPACE }),
+    ).resolves.toBe(`agent-workspace-${AGENT_ID}`);
+  });
+
+  // Missing spec means the read told us nothing, not that the claim is wrong.
+  // Refusing here would fail runs over a reporting gap.
+  it("adopts when the read reports no access modes to judge", async () => {
+    vi.mocked(getPvc).mockResolvedValue({ metadata: { name: "x" } });
+
+    await expect(
+      ensureAgentWorkspacePvc({ agentId: AGENT_ID, namespace: NAMESPACE }),
+    ).resolves.toBe(`agent-workspace-${AGENT_ID}`);
   });
 
   it("creates an RWX claim with the agent-workspace labels and defaults", async () => {

@@ -22,4 +22,16 @@ The 409/404 tests use a fixture shaped like a real `ApiException` (both `code` a
 
 **What this does NOT do, and must not be read as doing:** it does not change `dataClaimName`, so every agent pod still mounts `paperclip-data` and the measured blast radius is unchanged. The claim cannot be adopted until the prompt bundle reaches the pod over a channel that does not assume a shared volume (invariant 1) — on a per-agent claim the server writes a complete bundle into its own volume and the pod gets the seeded, empty directory, so `--append-system-prompt-file` names a file that does not exist and the agent silently loses its instructions. Adoption also requires #3165's split seeder shape on `master` first: `resolveSeedShape` picks `split` for a non-self claim, and seeding a per-agent claim with the `self-claim` shape even once leaves root-owned intermediates that `split` can never create inside afterwards.
 
-Suite: 31 files / 1861 tests green, `tsc --noEmit` clean.
+## 2. Refuse to adopt a non-RWX claim
+
+**Files:** `src/server/workspace-pvc.ts`, `src/server/workspace-pvc.test.ts`
+
+The create path pins RWX and a test holds it there, but the ADOPT path returned any claim under the expected name without re-checking its shape — and adoption is where a wrong claim actually arrives. A claim created by an earlier or mistaken revision, or by hand following the RWO `opencode-db-<agentId>` precedent this module explicitly departs from, would be adopted on every later run forever. The consequence is not cosmetic: RWO on a claim several concurrent pods mount is `Multi-Attach`, which wedges every concurrent run of that agent and presents as scheduling failure rather than as a mis-shaped volume.
+
+`ensureAgentWorkspacePvc` now refuses such a claim. `accessModes` is immutable on a bound PVC, so the message says the claim must be deleted and reprovisioned rather than implying a repair — and it does not do that itself, because deleting a data-bearing volume under a run is an operator's call.
+
+Scope is deliberately only the access mode. StorageClass and capacity are legitimately operator-tunable (capacity is expandable on `cephfs`), so refusing a claim for differing from today's defaults would reject deliberate configuration; the access mode is the one property that is a correctness invariant rather than a preference. An ABSENT `accessModes` is not treated as a violation either — it means the read gave no spec to judge, and inventing a refusal from missing data would fail runs over a reporting gap.
+
+Three tests: the refusal, a claim listing RWX among several modes (adopted), and a read with no modes to judge (adopted). Mutation-checked — removing the guard call turns exactly the refusal test red.
+
+Suite: 31 files / 1853 tests green, `tsc --noEmit` clean.
