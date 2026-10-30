@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
@@ -5076,9 +5076,14 @@ describe("scoped writable mounts (BLO-32734)", () => {
     // would make junk in the wrong volume while the real targets stayed
     // uncreated. The seeder covers it instead.
     expect(result.scopedWritableDirs).toEqual([]);
+    // Two init containers, not one, and the seeder itself is NOT root — see
+    // the `own-volume-root` describe block below for why the split is the fix
+    // rather than a tidy-up.
+    const names = spec?.initContainers?.map((c) => c.name) ?? [];
+    expect(names.slice(0, 2)).toEqual(["own-volume-root", "seed-writable-dirs"]);
     const seed = spec?.initContainers?.find((c) => c.name === "seed-writable-dirs");
     expect(seed).toBeDefined();
-    expect(seed?.securityContext?.runAsUser).toBe(0);
+    expect(seed?.securityContext?.runAsUser).toBe(1000);
   });
 
   // PEN-4932 stage 4a. The seeder makes a foreign claim START, which is the
@@ -5495,6 +5500,194 @@ describe("scoped writable mounts (BLO-32734)", () => {
       // a root container with no work to do would be privilege for free.
       expect(seedOf(buildJobManifest({ ctx: isolatedCtx(), selfPod: makeSelfPod({ pvcClaimName: null }) }))).toBeUndefined();
       expect(seedOf(buildJobManifest({ ctx: makeCtx(), selfPod: makeSelfPod() }))).toBeUndefined();
+    });
+
+    // PEN-4932 stage 4b, invariants 3 and 4. A claim the server does not hold
+    // gets a DIFFERENT seeding shape, and the difference is the fix rather
+    // than a tidy-up: the shape above has a guard -> `mkdir` -> `chown` window
+    // whose only defence is that nothing else in the Pod runs while an init
+    // container does. That argument is POD-scoped, and a per-agent claim is
+    // shared by other pods of the same agent — measured live 2026-10-30, two
+    // concurrent run pods, one pair spanning two nodes. The window is closed by
+    // removing the privilege boundary: the only uid 0 left touches one inode
+    // with no in-volume path components, and the container that walks paths
+    // runs as the same uid as the writers it races.
+    describe("a claim the server does not hold (stage 4b)", () => {
+      function foreign() {
+        const ctx = isolatedCtx();
+        ctx.config.workspaceVolumeClaim = "agent-abc-data";
+        return buildJobManifest({ ctx, selfPod: makeSelfPod({ pvcClaimName: "paperclip-data" }) }).job.spec
+          ?.template?.spec;
+      }
+
+      it("splits the seeder in two, both ahead of every container that mounts a target", () => {
+        const names = foreign()?.initContainers?.map((c) => c.name) ?? [];
+        expect(names.slice(0, 2)).toEqual(["own-volume-root", "seed-writable-dirs"]);
+        expect(names.indexOf("seed-writable-dirs")).toBeLessThan(names.indexOf("write-prompt"));
+      });
+
+      it("gives `own-volume-root` exactly one inode and no in-volume path components", () => {
+        // This is the whole reason the split closes the race rather than
+        // shortening it. Its argument is the MOUNT POINT: there is no component
+        // inside the volume for a concurrent writer to swap for a symlink, and
+        // a mount root cannot be replaced from inside the volume. So the one
+        // remaining root operation has no TOCTOU to lose.
+        const own = foreign()?.initContainers?.find((c) => c.name === "own-volume-root");
+        expect(own?.command).toEqual(["sh", "-c", "set -e; chown 1000:1000 '/mnt/paperclip-data-seed'"]);
+        expect(own?.volumeMounts).toEqual([{ name: "data", mountPath: "/mnt/paperclip-data-seed" }]);
+        // No `-R`: a recursive chown here would be the fsGroup walk this whole
+        // design rejects, re-paid on every pod start.
+        expect(own?.command?.[2]).not.toContain("-R");
+      });
+
+      it("drops DAC_OVERRIDE from the root container, which now needs only CHOWN", () => {
+        const own = foreign()?.initContainers?.find((c) => c.name === "own-volume-root");
+        expect(own?.securityContext).toEqual({
+          capabilities: { drop: ["ALL"], add: ["CHOWN"] },
+          readOnlyRootFilesystem: true,
+          runAsNonRoot: false,
+          runAsUser: 0,
+          allowPrivilegeEscalation: false,
+        });
+        // uid 0 chowning a `root:root` fresh-volume root matches the owner, so
+        // DAC_OVERRIDE buys nothing — and FOWNER was never here.
+        expect(own?.securityContext?.capabilities?.add).not.toContain("DAC_OVERRIDE");
+        expect(own?.securityContext?.capabilities?.add).not.toContain("FOWNER");
+      });
+
+      it("runs the path-walking container as uid 1000 with no capabilities and no chown", () => {
+        const seed = foreign()?.initContainers?.find((c) => c.name === "seed-writable-dirs");
+        expect(seed?.securityContext).toEqual({
+          capabilities: { drop: ["ALL"] },
+          readOnlyRootFilesystem: true,
+          runAsNonRoot: true,
+          runAsUser: 1000,
+          runAsGroup: 1000,
+          allowPrivilegeEscalation: false,
+        });
+        // No chown AT ALL, not a narrower one: every directory it creates is
+        // 1000-owned because its creator is uid 1000. A chown reappearing here
+        // would mean the privilege boundary came back.
+        expect(seed?.command?.[2]).not.toContain("chown");
+        // PSS *restricted*, which the shape above cannot reach.
+        expect(seed?.securityContext?.capabilities?.add).toBeUndefined();
+      });
+
+      it("creates targets `2775` via `mkdir -m`, never via a chmod it could not execute", () => {
+        // setgid + `g+w` is what the `github-publish-broker` sidecar needs: it
+        // runs as a different uid with `runAsGroup: 1000`, so it reaches these
+        // trees by group, and setgid keeps gid 1000 on what is created inside
+        // them. The self-claim shape sets no mode at all and inherits its
+        // umask — moot there because the server pre-created the targets with
+        // `2775`, and a real regression on a fresh volume.
+        //
+        // `chmod` is the thing that must NOT appear. Its owner-match check is
+        // gated on CAP_FOWNER, which CAP_DAC_OVERRIDE does not cover and which
+        // nothing in this Pod holds; on a PERSISTENT per-agent volume the
+        // targets already exist 1000-owned from a previous run, so a chmod
+        // issued by any uid-0 container would be a non-owner chmod -> EPERM ->
+        // `set -e` -> the Job never starts.
+        const seed = foreign()?.initContainers?.find((c) => c.name === "seed-writable-dirs");
+        const script = seed?.command?.[2] ?? "";
+        expect(script).toContain("; mkdir -m 2775 -p ");
+        expect(script).not.toContain("chmod");
+      });
+
+      it("keeps the containment walk, and still refuses a symlinked parent", () => {
+        // Kept even though the race it defends is no longer a privilege
+        // boundary: it is free, and its containment arm refuses a target that
+        // escapes the volume root, which is not about symlinks at all.
+        const ctx = isolatedCtx();
+        ctx.config.workspaceVolumeClaim = "agent-abc-data";
+        const result = buildJobManifest({ ctx, selfPod: makeSelfPod({ pvcClaimName: "paperclip-data" }) });
+        const script =
+          result.job.spec?.template?.spec?.initContainers?.find((c) => c.name === "seed-writable-dirs")
+            ?.command?.[2] ?? "";
+        const guard = script.split("; mkdir ")[0] ?? "";
+        const root = mkdtempSync(join(tmpdir(), "seedwalk4b-"));
+        try {
+          const firstTarget =
+            (result.job.spec?.template?.spec?.containers[0]?.volumeMounts ?? []).find(
+              (m) => m.name === "data" && m.subPath,
+            )?.subPath ?? "";
+          expect(firstTarget).not.toBe("");
+          const parent = join(root, firstTarget, "..");
+          mkdirSync(join(root, "elsewhere"), { recursive: true });
+          mkdirSync(join(parent, ".."), { recursive: true });
+          symlinkSync(join(root, "elsewhere"), parent);
+          const r = spawnSync("sh", ["-c", guard.replaceAll("/mnt/paperclip-data-seed", root)], {
+            encoding: "utf8",
+            timeout: 15_000,
+          });
+          expect(r.signal).toBeNull();
+          expect(r.status).toBe(1);
+          expect(r.stderr).toContain("is a symlink; refusing");
+        } finally {
+          rmSync(root, { recursive: true, force: true });
+        }
+      });
+
+      it("re-runs over an existing target without attempting a chmod", () => {
+        // The EPERM case above, executed. A persistent per-agent volume means
+        // the second run's targets already exist, so `mkdir -m` must no-op
+        // rather than try to set the mode — and the observable proof is that a
+        // deliberately WRONG mode survives the re-run untouched.
+        //
+        // ⚠ CORROBORATION, NOT PROOF. The runner's `mkdir` is coreutils; the
+        // guarantee relied on is busybox's, because `busybox:1.36` is the image.
+        // busybox `libbb/make_directory.c` `goto ret0`s on EEXIST at the final
+        // component, BEFORE the `chmod(path, mode)` call. coreutils agreeing is
+        // what makes this test possible, not what makes it sound.
+        const seed = foreign()?.initContainers?.find((c) => c.name === "seed-writable-dirs");
+        const script = seed?.command?.[2] ?? "";
+        const mkdirPart = "mkdir " + (script.split("; mkdir ")[1] ?? "");
+        expect(mkdirPart).toContain("-m 2775 -p ");
+        const root = mkdtempSync(join(tmpdir(), "seedmode-"));
+        try {
+          const rewritten = mkdirPart.replaceAll("/mnt/paperclip-data-seed", root);
+          const first = spawnSync("sh", ["-c", `set -e; ${rewritten}`], { encoding: "utf8", timeout: 15_000 });
+          expect(first.stderr).toBe("");
+          expect(first.status).toBe(0);
+          const target = (rewritten.match(new RegExp(`'${root}[^']*'`)) ?? [])[0]?.slice(1, -1) ?? "";
+          expect(target).not.toBe("");
+          // Created fresh -> `-m` applied. Mask to the permission bits; the
+          // process umask cannot clear a mode passed to `mkdir -m`.
+          expect(statSync(target).mode & 0o7777).toBe(0o2775);
+          chmodSync(target, 0o700);
+          const second = spawnSync("sh", ["-c", `set -e; ${rewritten}`], { encoding: "utf8", timeout: 15_000 });
+          expect(second.stderr).toBe("");
+          expect(second.status).toBe(0);
+          // Untouched: proof the re-run issued no chmod, which is what keeps it
+          // executable without CAP_FOWNER.
+          expect(statSync(target).mode & 0o7777).toBe(0o700);
+        } finally {
+          rmSync(root, { recursive: true, force: true });
+        }
+      });
+
+      it("leaves the server's own claim on the unchanged single-container shape", () => {
+        // The fleet runs this path today, so the split must be invisible to it.
+        // It is NOT merely a preference: the shared volume carries root-owned
+        // intermediate directories from every past uid-0 run (`mkdir -p a/b/c`
+        // chowns only `c`), and a uid-1000 `mkdir` of a new sibling inside one
+        // of them EACCESes under `set -e` — the Job would never start.
+        const spec = buildJobManifest({ ctx: isolatedCtx(), selfPod: makeSelfPod() }).job.spec?.template?.spec;
+        expect(spec?.initContainers?.some((c) => c.name === "own-volume-root")).toBe(false);
+        const seed = spec?.initContainers?.find((c) => c.name === "seed-writable-dirs");
+        expect(seed?.securityContext?.runAsUser).toBe(0);
+        expect(seed?.command?.[2]).toContain("chown -h 1000:1000 ");
+        expect(seed?.command?.[2]).toContain("; mkdir -p ");
+        expect(seed?.command?.[2]).not.toContain("-m 2775");
+      });
+
+      it("keeps `own-volume-root` the ONLY root container on a per-agent claim", () => {
+        const spec = foreign();
+        const root = [...(spec?.initContainers ?? []), ...(spec?.containers ?? [])].filter(
+          (c) => c.securityContext?.runAsUser === 0,
+        );
+        expect(root.map((c) => c.name)).toEqual(["own-volume-root"]);
+        expect(spec?.securityContext?.runAsNonRoot).toBe(true);
+      });
     });
   });
 
