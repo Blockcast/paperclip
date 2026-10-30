@@ -169,10 +169,13 @@ reached via PATH, which is exactly the thing such a caller does not consult. A t
 or MCP server that hardcodes `/usr/bin/git` is therefore outside the accidental-disclosure control
 this guard exists to be, and nothing today reports that it happened.
 
-How much of that exists in the fleet is **unmeasured**. That measurement (§8) is consequently not a
-nice-to-have that could sharpen an urgency estimate: it is the one piece of evidence that bounds
-whether the *accidental* case — the case this control is actually for — is covered at all. It is
-load-bearing for §7.1 and it is named as an early trigger in §7.2.
+How much of that exists in the fleet was **unmeasured** when this decision was written. ⛔ **It has
+since been measured: 28, on 2026-10-29** (§7.1) — so the *accidental* case is **not** covered. That
+measurement (§8) was never a nice-to-have that could sharpen an urgency estimate: it is the one
+piece of evidence that bounds whether the *accidental* case — the case this control is actually
+for — is covered at all. It was load-bearing for §7.1 and named as an early trigger in §7.2, and
+that trigger has **fired**: the §7.1 acceptance is **ended as of 2026-10-29**, not running to
+2027-01-31.
 
 ### 4.1 One credential sits behind all three doors
 
@@ -1303,14 +1306,15 @@ Permitted without further security review:
   one this control exists for — is uncovered, falsifies the first ground of §7.1, and ends the
   §7.2 acceptance early rather than merely "raising urgency". A zero count leaves this decision
   unchanged and converts §7.1's stated assumption into a measured one.
-  ⛔ **Taken 2026-10-29 (PEN-4986): the count is 28, NOT zero — so the second branch above is the
-  one that applies.** §7.2 trigger 4 has **fired** and the §7.1 acceptance is **ended as of
-  2026-10-29**. The first five windows returned zero; the sixth, an Engineer pod running the
-  repository's own test suite, returned 28. Widening along the *pod* axis alone would have returned
-  zero indefinitely — **workload** was the uncovered axis. The mechanism is a **class, not a site**:
-  any test or tool that builds its own narrowed `PATH` gets an unwrapped `git` for free, and the
-  known site is cross-repo (`Blockcast/penstock-llm-proxy-core`), so a paperclip-only sweep reports
-  it clean. Tracked as **PEN-5012**. See §7.1 and
+  ⛔ **Taken 2026-10-29 (PEN-4986, widened PEN-4993 → PEN-4989): the count is 28, NOT zero — so
+  the non-zero branch above is the one that applies.** §7.2 trigger 4 has **fired** and the §7.1
+  acceptance is **ended as of 2026-10-29**. The first five windows returned zero; the sixth, an
+  Engineer pod running the repository's own test suite, returned 28. Widening along the *pod*
+  axis alone would have returned zero indefinitely — **workload** was the uncovered axis. The
+  mechanism is a **class, not a site**: any test or tool that builds its own narrowed `PATH` gets
+  an unwrapped `git` for free, and the known site is cross-repo
+  (`Blockcast/penstock-llm-proxy-core`), so a paperclip-only sweep reports it clean. Tracked as
+  **PEN-5012**. See §7.1 and
   [`PEN-4986-absolute-path-git-runtime-measurement.md`](./PEN-4986-absolute-path-git-runtime-measurement.md),
   whose own headline records the *first* window and says so — do not cite that document's "zero"
   as the answer. The tool is `scripts/measure-absolute-path-git.mjs`; re-take it on any agent-image
