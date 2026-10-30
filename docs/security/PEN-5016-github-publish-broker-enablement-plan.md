@@ -196,8 +196,9 @@ complete as its last edit, and that weakness has now fired twice on its first ou
 is the *issue-scope* route for four named keys. §3.5a is the one class member closed structurally
 rather than by name.
 
-**Stage-0 exit is "#3112 merged", not "Security chose".** The choice is made; the fleet is unchanged
-until it lands.
+**Stage 1's gate is "#3112 merged", not "Security chose".** The choice is made; the fleet is
+unchanged until it lands. Stage 0 carries **no PR merges** and does not wait on this (§7);
+#3112 sits in stage 1's precondition set.
 
 ### 3.3 The gate has no operator surface
 
