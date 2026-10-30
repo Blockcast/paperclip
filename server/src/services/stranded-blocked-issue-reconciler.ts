@@ -271,8 +271,9 @@ function announcementBody(): string {
     "This sweep has just moved this issue to `todo`, so adding the two lines and stopping there",
     "leaves them inert: on `todo`, `in_progress`, `in_review` or `backlog` nothing reads them, and",
     "the row stays dispatchable. If the row is not `blocked` because real agent work remains, hold",
-    "it with the instrument that works on its status instead — a `parkedUntil` for a human gate, a",
-    "monitor for CI or a queue.",
+    "it with the instrument that works on its status instead — a park for a human gate, a monitor",
+    "for CI or a queue. A park is written as `parkedDisposition: {reason, until}` and read back as",
+    "`parkedUntil`/`parkedReason`; `parkedUntil` is not itself a writable field.",
     "",
     "See `doc/execution-semantics.md#declaring-an-external-wait`.",
   ].join("\n");
