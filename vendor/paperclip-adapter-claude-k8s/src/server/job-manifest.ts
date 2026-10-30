@@ -4333,6 +4333,42 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
               // containers are sequential, so nothing else in the Pod is
               // running) but free, and it removes the redirect primitive rather
               // than narrowing the window for it.
+              //
+              // ⚠ 4b RESIDUE — and the open window is guard → `mkdir -p`, NOT
+              // this `chown`. `-h` is symlink-safe by construction: it acts on
+              // the link itself and never traverses, so a link planted after
+              // the guard changes nothing HERE. `mkdir -p` has no such
+              // protection — it creates THROUGH a symlinked component onto a
+              // real directory reached by an unintended route, which is the
+              // exact redirect primitive the walk above removes, re-opened in
+              // the window between the two. So "re-check between mkdir and
+              // chown" does NOT close this: by then `mkdir -p` has already
+              // written through the link.
+              //
+              // The "nothing else in the Pod is running" argument above is
+              // POD-scoped, and pod scope is precisely what a per-agent claim
+              // dissolves: the concurrent writer is a uid-1000 agent container
+              // in a DIFFERENT pod, on a different node, sharing the claim.
+              // That is the normal case, not an edge one — read live
+              // 2026-10-30, two agents each held 2 concurrent run pods and one
+              // of them spanned two nodes, which is also why a per-agent claim
+              // has to stay ReadWriteMany.
+              //
+              // ⛔ `fsGroup` is the obvious-looking escape — own the tree as
+              // 1000, the seeder stops needing uid 0, and the race becomes
+              // uid-1000-on-uid-1000, i.e. no longer a privilege boundary at
+              // all. AVAILABILITY is not what blocks it: `cephfs.csi.ceph.com`
+              // reports `fsGroupPolicy: File` on this cluster, so kubelet
+              // would honour it. COST is. See the rationale in
+              // `deploy/helm/paperclip/values.blockcast.yaml`, which clears the
+              // chart default `fsGroup: 1000` because cephfs does not reliably
+              // short-circuit `fsGroupChangePolicy: OnRootMismatch` — kubelet
+              // re-walks the volume on EVERY mount, giving 30-45 min rollouts
+              // (onprem-k8s #225). A per-agent volume starts empty, but grows
+              // to that agent’s own checkout, so the walk is re-paid per pod
+              // start and scales with the volume rather than being one-off.
+              // Do not re-propose it without re-measuring that short-circuit
+              // against a real per-agent claim.
               ...(writableSubPaths.length > 0
                 ? [
                     `chown -h ${AGENT_UID_GID} ${writableSubPaths

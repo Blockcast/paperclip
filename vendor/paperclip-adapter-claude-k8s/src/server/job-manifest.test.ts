@@ -5366,15 +5366,56 @@ describe("scoped writable mounts (BLO-32734)", () => {
         expect(r.stderr).toContain("is a symlink; refusing");
       });
 
+      // The two cases below both end at the guard's containment `exit 1`, but
+      // by DIFFERENT routes — and conflating them is how one of the two stops
+      // being tested. The `for p in …` list, the `case` pattern and the `while`
+      // sentinel ALL carry the volume root, so a `replaceAll` over the whole
+      // script moves the root along WITH the targets. That still proves the
+      // loop is bounded, but it cannot prove a target escaping a root that
+      // stayed put, because under that rewrite no target ever escapes. Each
+      // test therefore rewrites exactly the span its own property needs.
+      function guardOf() {
+        const result = buildJobManifest({ ctx: isolatedCtx(), selfPod: makeSelfPod() });
+        return (seedOf(result)?.command?.[2] ?? "").split("; mkdir -p ")[0] ?? "";
+      }
+      // Exact end of the `for p in …` list: the first thing the loop body does
+      // is re-bind `$p`. Splitting here moves the targets and nothing else.
+      const FOR_LIST_END = '; do d="$p";';
+
+      it("refuses a target that resolves outside the volume root, on the first step", () => {
+        // Root stays where the guard put it; only the targets escape — the
+        // shape a mis-joined `subPath` would actually take. Containment must
+        // refuse on the FIRST pass, before the walk shortens `$d` at all,
+        // which is what makes this distinct from the termination case below.
+        const guard = guardOf();
+        const cut = guard.indexOf(FOR_LIST_END);
+        expect(cut).toBeGreaterThan(0);
+        const movedTargets = guard.slice(0, cut).replaceAll("'/mnt/paperclip-data-seed/", "'/nowhere/");
+        const rest = guard.slice(cut);
+        // Pin the asymmetry this test depends on, so a future edit to the
+        // guard's shape fails here rather than silently re-conflating the two.
+        expect(movedTargets).not.toContain("/mnt/paperclip-data-seed");
+        expect(rest).toContain("'/mnt/paperclip-data-seed/'*");
+        const r = spawnSync("sh", ["-c", movedTargets + rest], { encoding: "utf8", timeout: 15_000 });
+        expect(r.signal).toBeNull();
+        expect(r.status).toBe(1);
+        expect(r.stderr).toContain("is not under the volume root; refusing");
+      });
+
       it("terminates — the walk cannot spin on a path it never recognises", () => {
         // `d` strictly shortens each pass, and containment is re-checked on
         // every step, so the loop always reaches an exit. Asserted by timeout
         // rather than by reading the code: a non-terminating guard would hang
         // the init container and the Job would never start, which is the one
         // failure mode that looks like an infrastructure problem.
-        const result = buildJobManifest({ ctx: isolatedCtx(), selfPod: makeSelfPod() });
-        const guard = (seedOf(result)?.command?.[2] ?? "").split("; mkdir -p ")[0] ?? "";
-        const r = spawnSync("sh", ["-c", guard.replaceAll("'/mnt/paperclip-data-seed/", "'/nowhere/")], {
+        //
+        // The rewrite here is deliberately whole-script: targets and `case`
+        // pattern both move to `/nowhere`, while the `while` sentinel carries
+        // no trailing slash and so does not match the rewritten prefix — it
+        // keeps naming the original root. The walk can therefore never meet
+        // its sentinel and must be stopped by `case` failing on the final
+        // `/nowhere`. That is the LOOP BOUND, not the escape above.
+        const r = spawnSync("sh", ["-c", guardOf().replaceAll("'/mnt/paperclip-data-seed/", "'/nowhere/")], {
           encoding: "utf8",
           timeout: 15_000,
         });
