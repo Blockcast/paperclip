@@ -110,13 +110,30 @@ export function buildPromptBundleMaterializationShell(input: {
     // Walk the destination's ancestors under the bundle root and drop any that is a
     // symlink. `-L` tests the link itself, so a dangling one — the shape a pre-swap farm
     // entry takes on a volume this pod does not mount — is caught as well as a live one.
-    `__pcpb_dir="$(dirname "$__pcpb")";`,
-    `while [ "$__pcpb_dir" != "." ] && [ "$__pcpb_dir" != "/" ]; do`,
-    `if [ -L "$__pcpb_dst/$__pcpb_dir" ]; then`,
-    `echo "[paperclip] prompt bundle: dropping stale symlink at $__pcpb_dir; its target is not on this pod's volume" >&2;`,
-    `rm -f "$__pcpb_dst/$__pcpb_dir" || exit $?;`,
+    //
+    // SHALLOWEST FIRST, and that direction is the whole correctness argument. Walking
+    // bottom-up tests the deepest ancestor while the farm link ABOVE it is still live, so
+    // `-L` and `rm -f` resolve THROUGH that link: given a farm entry
+    // `.claude/skills/x -> shared/x` and a symlinked subdirectory `shared/x/refs` inside
+    // the source — the within-tree shape the projection now resolves rather than skips —
+    // the step deletes `shared/x/refs` in the SHARED source, outside the bundle root and
+    // for every agent sharing it. Top-down removes each link before anything beneath it
+    // is tested, so nothing is ever reached through one.
+    //
+    // Segment-split rather than `dirname`: no subprocess per component, and no argument
+    // for a leading-dash segment — which `isSafeBundlePath` admits — to be read as an
+    // option. `$__pcpb_pre` also carries the parent path out of the loop, which is what
+    // the `mkdir` below uses instead of a second `dirname`.
+    `__pcpb_pre=""; __pcpb_rest="$__pcpb";`,
+    // Loop while a `/` remains: `\${x#*/}` equals `$x` exactly when there is none, so the
+    // last segment (the file itself) is never treated as an ancestor.
+    `while [ "$__pcpb_rest" != "\${__pcpb_rest#*/}" ]; do`,
+    `__pcpb_pre="\${__pcpb_pre:+$__pcpb_pre/}\${__pcpb_rest%%/*}";`,
+    `__pcpb_rest="\${__pcpb_rest#*/}";`,
+    `if [ -L "$__pcpb_dst/$__pcpb_pre" ]; then`,
+    `echo "[paperclip] prompt bundle: dropping stale symlink at $__pcpb_pre; its target is not on this pod's volume" >&2;`,
+    `rm -f "$__pcpb_dst/$__pcpb_pre" || exit $?;`,
     `fi;`,
-    `__pcpb_dir="$(dirname "$__pcpb_dir")";`,
     `done;`,
     // The destination itself gets the same treatment: `cp` would otherwise follow a
     // symlink parked at the leaf and write through it.
@@ -125,10 +142,15 @@ export function buildPromptBundleMaterializationShell(input: {
     // which is a bug in this channel rather than a condition to tolerate. Exit, so the
     // pod reports it instead of the run quietly missing a skill.
     `if [ ! -f "${src}" ]; then echo "[paperclip] prompt bundle: $__pcpb was declared but not delivered to this pod" >&2; exit 1; fi;`,
-    `mkdir -p "$(dirname "${dst}")" || exit $?;`,
+    `mkdir -p "$__pcpb_dst/$__pcpb_pre" || exit $?;`,
     // `-L` dereferences the Secret's internal links; `--` keeps a leading-dash path from
     // being read as an option even though `isSafeBundlePath` already admits one.
-    `cp -L -- "${src}" "${dst}" || exit $?;`,
+    //
+    // Copy to a sibling and rename, rather than `cp` onto the destination: `cp` truncates
+    // in place, so a reader during the copy sees a half-written file, and two runs sharing
+    // a `bundleKey` root would interleave. `mv` within one directory is atomic.
+    `cp -L -- "${src}" "${dst}.pcpb-part" || exit $?;`,
+    `mv -f -- "${dst}.pcpb-part" "${dst}" || exit $?;`,
     `done;`,
     `true`,
   ].join(" ");

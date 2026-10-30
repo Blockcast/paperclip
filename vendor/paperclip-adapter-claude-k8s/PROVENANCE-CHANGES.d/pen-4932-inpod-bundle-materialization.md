@@ -61,6 +61,22 @@ each failure costs:
   through it would land outside the run. So it is removed and reported. `-L` is tested
   rather than `-e`, so a *dangling* ancestor — the shape the swap actually produces — is
   caught as well as a live one.
+- **The ancestor walk goes SHALLOWEST FIRST, and that direction is the correctness
+  argument rather than a style choice.** Bottom-up, the deepest ancestor is tested while
+  the farm link above it is still live, so `-L` and `rm -f` resolve *through* it: with a
+  farm entry `.claude/skills/x -> shared/x` and a symlinked subdirectory `shared/x/refs`
+  inside the source — the within-tree shape #3157 resolves rather than skips — the step
+  deletes `shared/x/refs` in the SHARED source, outside the bundle root and for every
+  agent sharing it. That is the exact outcome this step exists to prevent, arrived at by
+  the step itself. Top-down removes each link before anything beneath it is tested.
+  (Found by Ally on the rebased head and reproduced under `sh` before the fix.)
+- **The walk splits segments rather than calling `dirname`.** No subprocess per component,
+  and no argument for a dash-led FIRST segment — which `isSafeBundlePath` admits — to be
+  read as an option. With `dirname` and no `--` such a path makes `dirname` error and
+  return empty, so the walk is skipped entirely: a guard that silently stops guarding.
+  Only the first segment can do it; under `.claude/...` the argument always starts with
+  `.`. The accumulated prefix also carries the parent path out of the loop, which replaces
+  the second `dirname` the `mkdir` used.
 
 ## Two further details
 
@@ -69,6 +85,11 @@ each failure costs:
   directory. A copy preserving links would leave the bundle root correct only while that
   mount exists — the same class of fault as the server-written farm. `-L` dereferences, so
   the bundle root holds real bytes.
+- **…copied to a sibling and `mv`d into place, not written onto the destination.** `cp`
+  truncates in place, so a reader during the copy sees a half-written file and two runs
+  sharing a `bundleKey` root interleave. `mv` within one directory is atomic. The test
+  also asserts no `.pcpb-part` residue survives: one left in the bundle would be read by
+  `--add-dir` as content.
 - **The `..data` layout is never walked.** The step copies exactly the paths the
   projection declared, so the Secret's own bookkeeping entries cannot reach the bundle
   root, which a `cp -R` of the mount root would deliver.
@@ -85,7 +106,14 @@ buys the run nothing is a regression.
 
 `src/server/prompt-bundle-materialization.test.ts` executes the emitted script with `sh`
 against a real temporary tree, as the shared-doc tests do, rather than asserting on the
-string. Each of the three inverted properties above has a test that fails when the
-property is removed — verified by mutation: deleting the ancestor `rm -f` fails 2 tests,
-`cp -L` → `cp -P` fails the dereference test, and turning the undelivered-path `exit 1`
-into a `continue` fails the pod-fails test.
+string. Each of the inverted properties above has a test that fails when the property is
+removed — verified by mutation: deleting the ancestor `rm -f` fails 2 tests, `cp -L` →
+`cp -P` fails the dereference test, and turning the undelivered-path `exit 1` into a
+`continue` fails the pod-fails test.
+
+Reverting the walk to the bottom-up `dirname` form fails exactly two more — the
+reach-through case and the dash-led-first-segment case — and both were written as
+reproductions that failed before the fix rather than after it. The reach-through fixture
+is the one the earlier tests could not catch: they put the link at the leaf skill
+directory with nothing linked beneath it, so there was nothing for the walk to reach
+through.
