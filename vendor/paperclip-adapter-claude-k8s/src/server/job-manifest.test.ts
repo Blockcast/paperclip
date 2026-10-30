@@ -5387,10 +5387,27 @@ describe("scoped writable mounts (BLO-32734)", () => {
         // shape a mis-joined `subPath` would actually take. Containment must
         // refuse on the FIRST pass, before the walk shortens `$d` at all,
         // which is what makes this distinct from the termination case below.
+        //
+        // The escaped targets are pointed through a PLANTED SYMLINK rather
+        // than at a path that simply does not exist, and that plant is the
+        // whole reason this test discriminates. The correct guard never
+        // touches the filesystem here — it refuses lexically on step 1 — so
+        // the plant is invisible to it. It exists to give a WRONG guard
+        // somewhere else to go. Weaken containment to `case "$d" in /*)` (i.e.
+        // "is absolute", root no longer checked) and, with a plain
+        // `/nowhere/a/b` target, the walk still shortens to `""` and still
+        // exits with `is not under the volume root` — the mutant passes, and
+        // the test proves nothing about the root. With `<tmp>/link/…` where
+        // `link -> .`, that same mutant instead walks down to the link and
+        // dies with `is a symlink`. Hence the second assertion: the message
+        // alone is not enough, it has to be the message for the right reason.
         const guard = guardOf();
         const cut = guard.indexOf(FOR_LIST_END);
         expect(cut).toBeGreaterThan(0);
-        const movedTargets = guard.slice(0, cut).replaceAll("'/mnt/paperclip-data-seed/", "'/nowhere/");
+        const plant = mkdtempSync(join(tmpdir(), "seedwalk-escape-"));
+        roots.push(plant);
+        symlinkSync(".", join(plant, "link"));
+        const movedTargets = guard.slice(0, cut).replaceAll("'/mnt/paperclip-data-seed/", `'${plant}/link/`);
         const rest = guard.slice(cut);
         // Pin the asymmetry this test depends on, so a future edit to the
         // guard's shape fails here rather than silently re-conflating the two.
@@ -5400,6 +5417,8 @@ describe("scoped writable mounts (BLO-32734)", () => {
         expect(r.signal).toBeNull();
         expect(r.status).toBe(1);
         expect(r.stderr).toContain("is not under the volume root; refusing");
+        // Refused on step 1, on containment — not after walking onto the link.
+        expect(r.stderr).not.toContain("is a symlink");
       });
 
       it("terminates — the walk cannot spin on a path it never recognises", () => {
