@@ -15,6 +15,10 @@ import {
   readCatalogBackedSkillKeys,
 } from "./prompt-cache.js";
 import {
+  PROMPT_BUNDLE_SECRET_MAX_BYTES,
+  buildPromptBundleSecretProjection,
+} from "./prompt-bundle-projection.js";
+import {
   parseClaudeStreamJson,
   describeClaudeFailure,
   isClaudeMaxTurnsResult,
@@ -2705,6 +2709,70 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // not exported and is still unasserted.
       errorCode: err.catalogBacked ? "skill_materialization_pending" : "skill_not_found",
     };
+  }
+
+  // PEN-4932 stage 4b. The bundle `prepareClaudePromptBundle` just wrote reaches the
+  // pod only because the server and the pod are two mount points on ONE volume. Stage
+  // 4b gives each agent its own claim, at which point that write lands somewhere the
+  // pod cannot see and the agent silently loses its instructions. `prompt-bundle-projection.ts`
+  // is the channel that replaces the shared volume with a per-Job Secret.
+  //
+  // MEASUREMENT ONLY, DELIBERATELY. Nothing consumes this projection yet — the pod
+  // still reads the bundle off the shared volume, and will until `dataClaimName` is
+  // swapped. So this call is here to do the one thing §4.2 asks for ahead of the swap
+  // and cannot be done any other way: measure the projected per-run Secret size on real
+  // traffic. Finding 3 could size exactly ONE company (a `GET /companies` from an agent
+  // seat is `403 Board access required`), so the fleet distribution against the 50 %
+  // escalation trigger is unmeasured, and the trigger was chosen to fire against a
+  // measurement rather than under an outage.
+  //
+  // It therefore must not fail a run. `buildPromptBundleSecretProjection` refuses
+  // over-budget by design — that refusal is correct once the Secret IS the delivery
+  // path and a truncated projection would mean an agent missing skills, and it is
+  // tested as such. Today it would abort a run over a budget that buys that run
+  // nothing, which is a pure regression. The refusal becomes load-bearing in the same
+  // change that makes the pod read from the Secret; until then every outcome here is
+  // reported and stepped over.
+  try {
+    const projection = await buildPromptBundleSecretProjection({
+      companyId: ctx.agent.companyId,
+      runLabel: ctx.runId,
+      skills: desiredSkills,
+      instructionsContents,
+      serverDataMountPath: SELF_POD_DATA_MOUNT_PATH,
+    });
+    console.info(
+      JSON.stringify({
+        level: "info",
+        event: "claude_k8s.prompt_bundle_projection_sized",
+        msg: "measured the projected per-run prompt-bundle Secret size (PEN-4932 stage 4b; not yet the delivery path)",
+        companyId: ctx.agent.companyId,
+        runId: ctx.runId,
+        // Decoded UTF-8 bytes — the quantity `ValidateSecret` checks. See the
+        // module header: §4.2's sample figure was base64-inflated.
+        totalValueBytes: projection?.totalValueBytes ?? 0,
+        fileCount: projection?.fileCount ?? 0,
+        maxBytes: PROMPT_BUNDLE_SECRET_MAX_BYTES,
+        escalationThresholdCrossed: projection?.escalationThresholdCrossed ?? false,
+        bytesBySkillKey: projection?.bytesBySkillKey ?? {},
+      }),
+    );
+  } catch (err) {
+    // Includes the deliberate over-budget and too-many-files refusals, which are the
+    // signal this measurement exists to find. Logged at warn with the error's own
+    // named shape rather than swallowed, so a company that would not fit the channel
+    // is visible NOW rather than when the claim swap makes it fatal.
+    console.warn(
+      JSON.stringify({
+        level: "warn",
+        event: "claude_k8s.prompt_bundle_projection_failed",
+        msg: "could not size the projected prompt-bundle Secret; run is unaffected (measurement only)",
+        companyId: ctx.agent.companyId,
+        runId: ctx.runId,
+        errorName: err instanceof Error ? err.name : "unknown",
+        error: err instanceof Error ? err.message : String(err),
+      }),
+    );
   }
 
   // Build Job manifest
