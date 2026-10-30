@@ -741,18 +741,65 @@ PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verificati
         seeder script (`job-manifest.test.ts:5246-5257`) rather than pinning the set's emptiness,
         and an implementing PR should add that converse assertion.
 
+        **Done in #3165, and as a build-time refusal rather than an assertion.** Pinning the set's
+        emptiness would have pinned today's value; the thing actually worth enforcing is the
+        *consequence* of it. `resolveSeedShape` throws when the split shape meets a non-empty
+        `readOnlySubPaths`, because that container `mkdir -m 2775`s its targets as uid 1000 and
+        would hand a read-only bind back group-writable to the containers it exists to be
+        read-only for — silently, since the Job still starts and the mount is still present. It
+        throws rather than falling back to the uid-0 shape: that fallback reads as safer and is
+        not, for the rollback reason below. Re-adding a `ROOT_TOOLCHAIN_SUBPATHS` entry now fails
+        the manifest build instead of quietly inverting a boundary.
+
         **It also ends strictly tighter than today.** Phase B is PSS-**restricted** compliant
         (non-root, all capabilities dropped); the current seeder is the one container in the Pod
         that is merely baseline, and `job-manifest.test.ts:5399-5402` pins it as the only uid-0
         container in the Job. After the split, the uid-0 container does one `chown` and nothing
         else.
 
-        ⚠️ **This is 4b-only, and shipping it early would be a widening.** Chowning the volume
-        root to `1000:1000` is right for a per-agent volume and **wrong for the shared one** —
-        there it would let any agent pod create and delete entries at the root of the volume
-        every agent shares. Phase A must therefore be gated on the claim being per-agent, and
-        that gate does not exist yet: it arrives with the `dataClaimName` swap. Sequence it
-        *with* the swap, never ahead of it.
+        ⚠️ **WITHDRAWN 2026-10-30 — the paragraph this replaces was wrong, and it was wrong in
+        the expensive direction: it coupled this change to the swap for a whole stage.** It read:
+        *"This is 4b-only, and shipping it early would be a widening. Chowning the volume root to
+        `1000:1000` is right for a per-agent volume and wrong for the shared one — there it would
+        let any agent pod create and delete entries at the root of the volume every agent shares.
+        Phase A must therefore be gated on the claim being per-agent, and that gate does not exist
+        yet: it arrives with the `dataClaimName` swap. Sequence it with the swap, never ahead of
+        it."* Recorded as a hard sequencing constraint, it was never checked against
+        `rootMounts`. Two independent reasons it does not hold, either of which is sufficient:
+
+        1. **The gate already exists.** `serverCanPreCreate`
+           (`dataClaimName === selfPod.pvcClaimName`) is exactly the "is this claim the server's
+           own" test, and it predates this work. The shape is selected *per claim*, so the
+           server's own claim is never chowned at all and Phase A is unreachable on it. The
+           missing gate was not missing.
+        2. **The widening it feared is not reachable even without the gate.** Under
+           `narrowWritableSurface` — which is a *precondition of the seeder existing at all* —
+           the agent containers mount the `root-overlay` `emptyDir` at `dataMountPath`, not the
+           `data` volume, and `write-prompt` reuses that same list. The only container in the Pod
+           that mounts `data` at its root is the seeder itself. So "any agent pod could create
+           and delete entries at the shared root" describes a reachability the manifest does not
+           grant.
+
+        **What this cost, and the lesson worth keeping.** The two facts above were both readable
+        from the same function the recommendation was written against. Recording a *blocker* from
+        reasoning about a mount layout, without reading the layout, held a self-contained change
+        hostage to a much larger one. Where this plan says "must ship with", that claim needs a
+        citation of the same kind it demands for a measurement.
+
+        **What shipped instead:** #3165, on its own and ahead of the swap. Two shapes selected by
+        `serverCanPreCreate`; every Job on the fleet today keeps the byte-identical single uid-0
+        container, asserted by a negative-control test. The split shape is **inert in production**
+        — no per-agent claim exists, so it is unreachable — which is the point: the swap becomes a
+        claim change rather than a claim change plus a privilege-model change.
+
+        ⚠️ **A real constraint does survive, in the opposite direction, and it is sticky.** The
+        server's own claim must *keep* the uid-0 shape — not as caution but because that volume
+        carries root-owned intermediate directories from every past uid-0 run (`mkdir -p a/b/c`
+        chowns only `c`), and a uid-1000 `mkdir` of a new sibling inside one EACCESes under
+        `set -e`, failing the init container fleet-wide on the first roll. The corollary is a
+        **rollback hazard**: seeding a per-agent claim with the uid-0 shape even once leaves
+        root-owned intermediates the split shape can never create inside afterwards. Reverting
+        #3165 after the swap has begun is therefore not a clean revert.
 
         **Not measured.** Whether a freshly provisioned CephFS subvolume root accepts the chown
         from inside the pod mount (it should — the mount *is* the subvolume root, so this is an
@@ -1196,14 +1243,16 @@ would defeat this issue's own acceptance criterion.
 
 ## 5. Decisions taken, and what is still genuinely open
 
-**State of the four 4b invariants, 2026-10-30** (detail in §4):
+**State of the four 4b invariants, 2026-10-30** (detail in §4). "implemented" below means the
+code is written and merged-or-in-review; **none of it is observable on the fleet**, because all
+four are inert until the `dataClaimName` swap:
 
 | invariant | state |
 |---|---|
 | 1 — populate/relocate the server-materialized trees (incl. the prompt bundle) | **closed** — #3153 / #3157 / #3158, last merged 20:19:43Z. Inert until the swap, by design. |
 | 2 — symlinked-PARENT hole in the seeder | **closed** — #3161, merged 19:51:15Z |
-| 3 — directory MODE | **decided, not implemented** — `mkdir -m 2775 -p` (a separate `chmod` is unexecutable: the seeder has no `CAP_FOWNER`); converges only targets the seeder creates; the CephFS fresh-subvolume question is explicitly unmeasured. Subsumed if invariant 4's recommended split lands: as uid 1000 the seeder owns what it creates, so the mode needs no privilege at all |
-| 4 — guard is check-then-act under concurrent same-agent runs | **open, remedy recommended** — split the seeder: uid 0 chowns the volume ROOT only (one inode, no TOCTOU), everything else runs as uid 1000, which removes the privilege boundary instead of hardening the race across it. Available only because stage 3b-iii left `readOnlySubPaths` empty. Must ship WITH the `dataClaimName` swap, never before it. `fsGroup`, the post-`mkdir` re-check, and run serialisation all ruled out |
+| 3 — directory MODE | **implemented, in review** — #3165. `mkdir -m 2775 -p`, as recommended; a separate `chmod` stays unexecutable (no `CAP_FOWNER`), and busybox's `make_directory.c` `goto ret0`s on `EEXIST` at the final component *before* its `chmod`, so an existing 1000-owned target is never chmodded. Subsumed by invariant 4's split exactly as predicted: as uid 1000 the seeder owns what it creates, so the mode needs no privilege. ⚠️ Still converges only targets the seeder creates, and the CephFS fresh-subvolume question remains **unmeasured** — no per-agent claim exists to measure against |
+| 4 — guard is check-then-act under concurrent same-agent runs | **implemented, in review** — #3165, the recommended split: uid 0 chowns the volume ROOT only (one inode, no in-volume path components, so no TOCTOU), everything else runs as uid 1000, which *removes* the privilege boundary rather than hardening the race across it. Available only because stage 3b-iii left `readOnlySubPaths` empty — now enforced as a build-time throw, not a comment. `fsGroup`, the post-`mkdir` re-check and run serialisation remain ruled out. ⚠️ **"Must ship WITH the swap, never before it" is WITHDRAWN** — the premise was unchecked and false, twice over; see §4. It shipped ahead of the swap and inert. ⚠️ The root `chown` on a real CephFS subvolume is still **unexecuted**; fd-relative `openat` walk remains the fallback |
 
 **PEN-4932's four done-when items, measured from inside a live agent pod 2026-10-30T21:4xZ**
 (`findmnt`, this run's own pod on `k8s-paperclip-3`):
