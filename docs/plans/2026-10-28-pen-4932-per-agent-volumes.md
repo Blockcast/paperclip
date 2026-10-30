@@ -552,24 +552,76 @@ PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verificati
         `0022`, no setgid on the subvolume root to inherit) and then `chown`s: both bits lost
         relative to what the live tree carries.
 
-        **Decision: set the mode explicitly.** `chmod 2775` on the writable target set after
-        `mkdir -p`, rather than inheriting. That makes the result independent of umask, of
-        ancestor setgid, and of which process got there first — so a fresh per-agent volume and
-        the shared one converge, which is the property 4b actually needs. Idempotent like the
-        existing `mkdir -p`/`chown`, and it matches the most permissive mode the live tree
-        already carries on the paths the broker writes.
+        **Decision: `mkdir -m 2775 -p`, not a separate `chmod`.** Set the mode *at creation*,
+        on the targets the seeder itself creates.
+
+        ⚠️ **An earlier revision of this paragraph decided "`chmod 2775` on the writable target
+        set after `mkdir -p`". That is not executable by this seeder and would have failed the
+        Job closed.** Raised by review on #3164, verified here. `chmod(2)`'s owner-match check is
+        gated on `CAP_FOWNER` specifically — `CAP_DAC_OVERRIDE` does not cover it — and the
+        seeder holds `drop: ["ALL"], add: ["CHOWN", "DAC_OVERRIDE"]`
+        (`job-manifest.ts:4376-4382`), with FOWNER's absence argued *deliberately* in the comment
+        directly above it on the grounds that no syscall it makes needs one. A `chmod` is exactly
+        such a syscall. On a **persistent** per-agent volume the targets already exist
+        `1000`-owned from the previous run — which is this plan's own invariant-2/4 premise — so
+        uid 0 is not the owner, `chmod` returns `EPERM`, and the script is under `set -e`
+        (`job-manifest.ts:4279`): the init container fails and the Job never starts. Ordering the
+        `chmod` *before* the `chown` does not save it, because on every run after the first the
+        directory is already 1000-owned before the seeder runs at all.
+
+        **`mkdir -m` avoids both horns, and the reason is a behaviour worth stating because the
+        obvious local test gets it wrong.** Measured 2026-10-30:
+
+        | probe | result |
+        |---|---|
+        | `mkdir -m 2775 -p a/b/c` on a fresh chain | leaf `2775`; **intermediates `755`** — `-m` applies to the final component only |
+        | `mkdir -m 2775 -p x/y` where `x/y` exists at `0700` | **rc 0, mode left at `0700`** — no `chmod` issued |
+        | `chmod` of an inode owned by another uid, as an ordinary subject | `EPERM` (no-op `chmod`, so it is the owner-match check firing, not the mode) |
+        | `chown` a **directory** carrying `2775` | setgid **preserved** |
+        | `chown` a **file** carrying `2775` | setgid **cleared** |
+
+        The second row is the load-bearing one and it is *not* a coreutils convenience that
+        busybox might not share — the image is `busybox:1.36`, so it was read from that source
+        rather than assumed. `libbb/make_directory.c` tolerates `EEXIST` on the final component
+        and then takes `goto ret0` under the comment *"Since the directory exists, don't attempt
+        to change permissions if it was the full target. Note that this is not an error
+        condition."* The `chmod(path, mode)` at the end of that function — the one whose failure
+        the source explicitly calls an error — runs **only when `mkdir()` itself succeeded**, i.e.
+        only on a directory the seeder just created and therefore owns. So `mkdir -m` never
+        issues a `chmod` that can `EPERM`, on either implementation, and needs no `CAP_FOWNER`.
+        The fourth row is what makes the mode survive the `chown` that follows, and it is a
+        kernel guarantee rather than a filesystem accident: `chown_common()` puts the whole
+        bit-stripping clause — `ATTR_KILL_SUID | ATTR_KILL_PRIV |
+        setattr_should_drop_sgid(...)` — inside `if (!S_ISDIR(inode->i_mode))`
+        (`fs/open.c:779`, v6.8, which is this cluster's kernel line). Directories keep setgid
+        where files lose it, so the `mkdir -m`-then-`chown` order is safe in that direction.
+
+        **What this buys and what it does not.** It makes the mode independent of umask and of
+        ancestor setgid *for every target the seeder creates*. It does **not** deliver the
+        "a fresh per-agent volume and the shared one converge" property the superseded paragraph
+        claimed: a target that already exists keeps whatever mode it has, and nothing here
+        changes it. That is acceptable **only because a per-agent volume is fresh by
+        construction** — at cutover the seeder is the first creator of every target, so the mode
+        it sets is the mode the path keeps. The residual gap is a target whose parent some
+        uid-1000 agent process created first at `0755`; if that is ever observed to bite the
+        broker, the remedy is `CAP_FOWNER` plus an explicit `chmod`, which is PSS-baseline-allowed
+        and now a costed option rather than a surprise. Do not reach for it pre-emptively: it
+        widens the seeder's privilege for a case not yet seen, and it adds a third act to
+        invariant 4's window (below).
 
         ⚠️ **What is NOT measured, stated rather than glossed.** This seat has no `create` on
         `pvc`, `job` or `pod` in namespace `paperclip` (`kubectl auth can-i` → `no` for all
         three), so the model above is POSIX semantics in a scratch tree, **not** a CephFS fresh
         volume. The CephFS-specific question — whether a freshly provisioned subvolume root
         carries setgid, which would change what the seeder's children inherit — is **unmeasured**
-        and must be checked when 4b is applied. The explicit `chmod` is chosen partly because it
-        is the option whose correctness does not depend on that answer.
+        and must be checked when 4b is applied. Setting the mode explicitly at creation is
+        chosen partly because its correctness does not depend on that answer — `mkdir -m` states
+        the mode rather than inheriting one.
 
         One sub-question left to the implementation: `mkdir -p` also creates **intermediate
-        parents** that are not in the target list and so are neither chowned nor chmod'd; on a
-        fresh volume those land `root:root`. The live tree already shows that shape
+        parents** that are not in the target list, and `-m` does not reach them either (probe
+        row 1 above), so they are neither chowned nor given a mode; on a fresh volume those land
+        `root:root` at the seeder's umask. The live tree already shows that shape
         (`…/workspaces` is `755 root:root`). Whether it needs handling depends on whether any
         uid-1000 process creates siblings beneath them outside a seeder run.
      4. **The seeder guard is check-then-act, and concurrency makes that reachable at the swap.**
@@ -629,11 +681,22 @@ PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verificati
           volume, this becomes the best answer again, so it is a live question rather than a
           settled one.
 
+        **Three acts sit in the window, not two.** `mkdir -p` and `chown -h` as above, and —
+        once invariant 3 lands — the `chmod()` that `mkdir -m` performs on a directory it just
+        created. That third one is the narrowest of the three (it fires only on the
+        just-created path, so a writer must `rmdir` and replace it inside a very tight race) but
+        it is not absent, and `chmod` has **no** no-follow form: unlike `chown -h` it
+        dereferences the final component too. A separate post-hoc `chmod`, had FOWNER made one
+        possible, would have been the widest act of the three for exactly that reason — a second
+        count against it.
+
         **What is left.** Real closure needs either an fd-relative walk —
-        `openat(…, O_NOFOLLOW|O_DIRECTORY)` per component, then `fchown` on the final fd — which
-        `sh` cannot express and so means moving the seeder out of shell, or serialising
+        `openat(…, O_NOFOLLOW|O_DIRECTORY)` per component, then `fchown`/`fchmod` on the final fd
+        — which `sh` cannot express and so means moving the seeder out of shell, or serialising
         same-agent runs on the claim, which costs exactly the concurrency PEN-4902 is preserving.
-        The fd-relative walk does not fight concurrency and should be costed first.
+        The fd-relative walk does not fight concurrency and should be costed first; note it
+        subsumes invariant 3's act as well, since `fchmod` on the fd `openat` already returned
+        needs no second resolution.
 5. **Demonstrate and re-measure.** PEN-4932's acceptance criterion.
 
 ### 4.1 The blocker stage 4 has to clear
@@ -1076,7 +1139,7 @@ would defeat this issue's own acceptance criterion.
 |---|---|
 | 1 — populate/relocate the server-materialized trees (incl. the prompt bundle) | **closed** — #3153 / #3157 / #3158, last merged 20:19:43Z. Inert until the swap, by design. |
 | 2 — symlinked-PARENT hole in the seeder | **closed** — #3161, merged 19:51:15Z |
-| 3 — directory MODE | **decided, not implemented** — explicit `chmod 2775`; the CephFS fresh-subvolume question is explicitly unmeasured |
+| 3 — directory MODE | **decided, not implemented** — `mkdir -m 2775 -p` (a separate `chmod` is unexecutable: the seeder has no `CAP_FOWNER`); converges only targets the seeder creates; the CephFS fresh-subvolume question is explicitly unmeasured |
 | 4 — guard is check-then-act under concurrent same-agent runs | **open** — remedy space narrowed to one candidate; `fsGroup` and "re-check between `mkdir` and `chown`" both ruled out |
 
 ⚠️ **The acceptance criterion is UNMET and none of the above moves it.** Done-when 1 — *two agent
