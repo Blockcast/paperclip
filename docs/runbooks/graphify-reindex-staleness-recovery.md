@@ -129,14 +129,22 @@ window by 1.20× — 3h50m to ~4h36m — while deleting 29.4% of the graph's nod
 25.7% of its links, which are what test files contribute.
 
 **Would comparing graph *content* instead of commits help?** Partly, and not
-enough. Rebuilding the graph at consecutive invalidating commits (deterministic:
-a repeat build of the same tree reproduces the fingerprint exactly) shows that
-every such commit changes the graph *file*, because nodes carry `source_location`
-and any line shift moves it. About half leave the structural content — node ids
-plus `(source, target, relation)` edges — untouched. So the gate's commit-diff
-proxy has no false positives against the artifact it is protecting, and even an
-exact structural comparison would roughly halve 23.4/day, still two orders of
-magnitude short of closing a 168h cycle.
+enough. The graph was rebuilt at 21 consecutive invalidating commits — the most
+recent 20 steps of the window — giving 20 before/after pairs. The build is
+deterministic: a repeat build of the same tree reproduced the node/edge
+fingerprint exactly, so a difference here is signal, not noise.
+
+| what changed | | |
+|---|---|---|
+| the graph **file** | **20/20** | 100% — nodes carry `source_location`, so any line shift moves one |
+| its **structure** (node ids + `(source, target, relation)` edges) | **12/20** | 60% |
+
+So the gate's commit-diff proxy has **no false positives** against the artifact it
+protects: every commit it calls invalidating does change the committed file. And
+the strongest possible version of option 2 — an exact structural comparison, which
+would require CI to rebuild the graph in order to evaluate it — would cut 23.4/day
+to about 14, widening the median window from 3h50m to roughly 6h20m. Still two
+orders of magnitude short of a 168h cycle.
 
 ## The gate is not what held #1550 for 49 days
 
@@ -190,7 +198,7 @@ merge commit `474dd5ea` taken under PEN-5025.
 | Scope the comparison tighter than `server/src` | **rejected** | 100% of changed files are `.ts`; tests are only 16.4% of invalidating commits and 29% of the graph. Buys 1.20×. |
 | Compare against the PR's merge base, not the live tip | **rejected** | It is the regression this gate was built to fix — #1550 sat 98 commits behind with `staleness` green. Pinned by the workflow header and its test. |
 | Raise the CronJob cadence | **rejected** | The gate has never failed on-cadence (0 failures in 16 runs). Cadence is not the failure axis. |
-| Have the gate re-dispatch the builder | **narrowed and deferred** | The loop is worth closing, but not by giving an evaluating gate a write path — compare `review-gate-merge-group.yml`'s deliberate `permissions: {}`. Wants an operator-dispatched rebuild (`workflow_dispatch`) and owner sign-off on the push credential. |
+| Have the gate re-dispatch the builder | **narrowed and deferred** | The loop is worth closing, but not by giving the job that decides the verdict a credential that can push to the branch it is judging. This gate holds `permissions: contents: read` today and should keep it; the repo's own pattern for a job that does need a write is `dispatch-ally-verdict-ci.yml` — `permissions: {}` at the workflow, granted narrowly per job. Wants a separate operator-dispatched rebuild (`workflow_dispatch`) and owner sign-off on the push credential. |
 | **Make the printed remedy correct, and document the recovery** | **adopted** | The measured defect is not the comparison point; it is that the remedy the gate prints does not work on the branch it prints it on, and that path had no test. |
 
 What this does and does not close: the recovery is now bounded and self-service —
