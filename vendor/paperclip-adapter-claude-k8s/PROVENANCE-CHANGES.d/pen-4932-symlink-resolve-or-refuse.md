@@ -57,13 +57,31 @@ fixed in place.
     Not a rename: after this change a link is never merely skipped, so the old field
     would read zero forever and mean nothing. A non-zero `resolvedSymlinkCount` is now
     a normal fully-delivered outcome rather than the blocker it was.
-- `src/server/execute.ts` — the two new refusals join the **cached deterministic**
-  refusal set and `describeProjectionRefusal` gains their structured shapes
-  (`symlink_escapes_tree`, `symlink_cycle`). Deterministic in the same sense as the
-  existing two: the sizing key covers the tree contents and the sources, and
-  `hashPathContents` hashes a link's target, so a tree that refuses under one key
-  cannot resolve cleanly under the same one. The `prompt_bundle_projection_sized` log
-  line carries the two new counters in place of the old one.
+- `src/server/execute.ts` — the new refusals are **reported but NOT cached**, a third
+  path beside "cached deterministic refusal" and "rethrown transient fault".
+  ⚠️ The first draft of this change cached them, on the claim that `hashPathContents`
+  hashes a link's target. **That claim is false and Ally's review caught it.**
+  `prompt-cache.ts:190-204` hashes `symlink:<relPath>` plus the target's *contents*
+  under the link's own relPath — the resolved *path*, which is the only input the escape
+  and cycle tests read, never enters `bundleKey`. So re-pointing an escaping link at a
+  byte-identical in-tree file (exactly what the error message instructs) leaves the key
+  unchanged, and a cached refusal would replay against a tree that is now correct; the
+  reverse retarget would keep a cached `sized` and never report a real escape. The cycle
+  case collides the same way, because `hashPathContents` uses one *global*
+  `seenDirectories`, so a genuine cycle and a lawful sibling link hash alike.
+  `describeProjectionRefusal` gains `symlink_escapes_tree`, `symlink_cycle` and
+  `too_many_dirs`. The `prompt_bundle_projection_sized` log line carries the two new
+  counters in place of the old one.
+- `PROMPT_BUNDLE_MAX_DIRS` / `PromptBundleTooManyDirsError` — new. `maxFiles` counts
+  FILES, so a chain of link-only directories expands 2^depth directory visits while
+  adding none, slipping the cap entirely. Bounded explicitly and refused, because Job
+  creation is the critical path.
+- The `realpath` catch is narrowed to `ENOENT`/`ENOTDIR`/`ELOOP`. A blanket
+  `catch(() => null)` would call `EACCES`/`EIO`/a transient CephFS fault "dangling", and
+  a dangling count rides into a `sized` outcome that **is** cached — remembering one
+  blip for the life of the process.
+- `fs.stat`/`fs.readFile` take the **resolved** path rather than the link, so the bytes
+  read are the bytes whose location was containment-checked.
 - `src/server/prompt-bundle-projection.test.ts` — the two step-over tests are replaced
   by eleven covering each of the four outcomes plus the three ways to get the
   containment and cycle tests wrong. Every one was mutation-verified to fail against
@@ -84,8 +102,14 @@ cover it, and none passing silently:
 | `startsWith` without a path boundary | 1 |
 | seen-directory dedupe instead of the ancestor cycle test | 1 |
 | links stepped over entirely (the pre-change behaviour) | 10 |
+| blanket `realpath` catch (review fix reverted) | 1 |
+| directory-visit cap removed (review fix reverted) | 1 |
 
-Full adapter suite 1800 passed / 28 files (1789 before; +11 is exactly this change's
+The `stat`/`readFile`-the-resolved-path change is **not** separately covered, and
+deliberately not claimed to be: absent an actual race the two paths are identical, so a
+test would exercise the interposition rather than the code. It is TOCTOU hardening.
+
+Full adapter suite 1804 passed / 28 files (1789 before; +15 is exactly this change's
 additions). `tsc --noEmit` clean, verified non-vacuous by injecting a type error and
 confirming it was reported.
 

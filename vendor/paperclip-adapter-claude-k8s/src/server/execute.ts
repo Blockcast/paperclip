@@ -25,6 +25,7 @@ import type {
   PromptBundleSecretProjection,
   PromptBundleSymlinkCycleError,
   PromptBundleSymlinkEscapesTreeError,
+  PromptBundleTooManyDirsError,
 } from "./prompt-bundle-projection.js";
 import {
   parseClaudeStreamJson,
@@ -95,7 +96,8 @@ type PromptBundleRefusedOutcome = {
       }
     | { kind: "too_many_files"; skillKey: string; limit: number }
     | { kind: "symlink_escapes_tree"; skillKey: string; linkPath: string; resolvedTarget: string; treeRoot: string }
-    | { kind: "symlink_cycle"; skillKey: string; linkPath: string; resolvedTarget: string };
+    | { kind: "symlink_cycle"; skillKey: string; linkPath: string; resolvedTarget: string }
+    | { kind: "too_many_dirs"; skillKey: string; limit: number };
 };
 
 /** The cached refusal's run-independent fields, as a refusal this run can report. */
@@ -104,7 +106,8 @@ export function describeProjectionRefusal(
     | PromptBundleOverBudgetError
     | PromptBundleTooManyFilesError
     | PromptBundleSymlinkEscapesTreeError
-    | PromptBundleSymlinkCycleError,
+    | PromptBundleSymlinkCycleError
+    | PromptBundleTooManyDirsError,
 ): PromptBundleRefusedOutcome {
   // `name`, not `instanceof` — see `isDeterministicProjectionRefusal`. Getting this
   // wrong does not throw: it silently reports a too-many-files refusal as an
@@ -114,6 +117,13 @@ export function describeProjectionRefusal(
       outcome: "refused",
       errorName: err.name,
       detail: { kind: "too_many_files", skillKey: err.skillKey, limit: err.limit },
+    };
+  }
+  if (err.name === "PromptBundleTooManyDirsError") {
+    return {
+      outcome: "refused",
+      errorName: err.name,
+      detail: { kind: "too_many_dirs", skillKey: err.skillKey, limit: err.limit },
     };
   }
   if (err.name === "PromptBundleSymlinkEscapesTreeError") {
@@ -199,15 +209,51 @@ function summarizePromptBundleProjection(
 const DETERMINISTIC_PROJECTION_REFUSAL_NAMES = new Set([
   "PromptBundleOverBudgetError",
   "PromptBundleTooManyFilesError",
-  // Both symlink refusals are deterministic in the same sense: the sizing key covers
-  // the tree contents and the sources, and `hashPathContents` hashes a link's target,
-  // so a tree that refuses under one key cannot resolve cleanly under the same one.
+]);
+
+/**
+ * Refusals that are REPORTED but deliberately NOT cached.
+ *
+ * ⚠️ THE OBVIOUS REASONING HERE IS WRONG, AND IT WAS WRITTEN DOWN WRONG ONCE. The
+ * tempting claim is that the symlink refusals are deterministic for a sizing key
+ * "because `hashPathContents` hashes a link's target". It does not hash what these
+ * checks read. `prompt-cache.ts:190-204` hashes `symlink:<relPath>` and then the
+ * TARGET'S CONTENTS under the link's own relPath — the resolved **path** never enters
+ * the hash, and the resolved path is the only input the escape and cycle tests use.
+ *
+ * So the key cannot separate the cases these refusals distinguish:
+ *
+ *   * **Escape.** `link -> ../outside/a.md` refuses. The operator does exactly what the
+ *     error message tells them — re-points it at an in-tree `a.md` with identical bytes
+ *     — and the hash is unchanged, so a cached refusal would replay for the life of the
+ *     process against a tree that is now correct. The reverse retarget keeps a cached
+ *     `sized`, so a real escape would never be reported.
+ *   * **Cycle.** `hashPathContents` keeps ONE GLOBAL `seenDirectories`, so a revisited
+ *     directory hashes as `dir:<rel>` + `loop` for a genuine cycle (`x/self -> x`) and
+ *     for a lawful sibling link (`x/self -> y`, where `y` was hashed first) alike.
+ *     Retargeting between them leaves the hash identical.
+ *
+ * Folding every resolved target path into `promptBundleSizingKey` would also fix it,
+ * but these trees are rare and re-walking one costs little, so not caching is the
+ * cheaper correct answer. Changing `hashPathContents` is NOT an option: it would move
+ * `bundleKey` across the whole fleet.
+ */
+const UNCACHEABLE_PROJECTION_REFUSAL_NAMES = new Set([
   "PromptBundleSymlinkEscapesTreeError",
   "PromptBundleSymlinkCycleError",
+  // Same reason: directory-visit blow-up is a property of the LINK GRAPH, and the link
+  // graph is what the sizing key cannot see. A tree whose links are re-pointed to stop
+  // expanding would otherwise keep replaying this refusal.
+  "PromptBundleTooManyDirsError",
 ]);
 
 function isDeterministicProjectionRefusal(err: unknown): boolean {
   return err instanceof Error && DETERMINISTIC_PROJECTION_REFUSAL_NAMES.has(err.name);
+}
+
+/** A refusal worth reporting on this run, but not worth remembering for later ones. */
+function isUncacheableProjectionRefusal(err: unknown): boolean {
+  return err instanceof Error && UNCACHEABLE_PROJECTION_REFUSAL_NAMES.has(err.name);
 }
 
 /**
@@ -2984,6 +3030,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     });
     const cached = PROMPT_BUNDLE_SIZING_CACHE.get(sizingKey);
     let sized: PromptBundleSizing;
+    let uncacheableRefusal = false;
     if (cached) {
       sized = cached;
     } else {
@@ -3006,16 +3053,25 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         // that cannot fit the channel stop re-reading the whole skill farm every run.
         // Anything else is rethrown unremembered: a transient I/O fault must not
         // suppress the measurement for the life of the process.
-        if (!isDeterministicProjectionRefusal(err)) throw err;
+        //
+        // The symlink refusals take a THIRD path: reported, never remembered. The
+        // sizing key cannot tell their fixed trees from their broken ones — see
+        // `UNCACHEABLE_PROJECTION_REFUSAL_NAMES` — so caching one would keep refusing a
+        // tree the operator has already repaired exactly as the error told them to.
+        uncacheableRefusal = isUncacheableProjectionRefusal(err);
+        if (!uncacheableRefusal && !isDeterministicProjectionRefusal(err)) throw err;
         sized = describeProjectionRefusal(
           err as
             | PromptBundleOverBudgetError
             | PromptBundleTooManyFilesError
             | PromptBundleSymlinkEscapesTreeError
-            | PromptBundleSymlinkCycleError,
+            | PromptBundleSymlinkCycleError
+            | PromptBundleTooManyDirsError,
         );
       }
-      rememberPromptBundleSizing(sizingKey, sized);
+      // Skipped, not omitted by accident: the refusal is still reported below on THIS
+      // run, it is only not remembered for later ones.
+      if (!uncacheableRefusal) rememberPromptBundleSizing(sizingKey, sized);
     }
     if (sized.outcome === "refused") {
       // Same warn the catch below emits, reached without rebuilding the projection.

@@ -119,6 +119,13 @@ export const PROMPT_BUNDLE_SKILLS_DIR = ".claude/skills";
  */
 export const PROMPT_BUNDLE_MAX_FILES = 2000;
 
+/**
+ * Bound on DIRECTORY visits per skill tree, which `PROMPT_BUNDLE_MAX_FILES` does not
+ * provide — see `PromptBundleTooManyDirsError`. Generous relative to any real skill
+ * tree; it exists to stop a pathological link graph, not to shape a lawful one.
+ */
+export const PROMPT_BUNDLE_MAX_DIRS = 2_000;
+
 /** One projected file: where it goes in the bundle, and the bytes that go there. */
 export type PromptBundleFile = {
   /** Bundle-relative POSIX path, e.g. `.claude/skills/dataviz/SKILL.md`. */
@@ -256,6 +263,37 @@ export class PromptBundleOverBudgetError extends Error {
     this.maxBytes = input.maxBytes;
     this.fileCount = input.fileCount;
     this.bytesBySkillKey = input.bytesBySkillKey;
+  }
+}
+
+/**
+ * Raised when a skill tree's walk visits more directories than `PROMPT_BUNDLE_MAX_DIRS`.
+ *
+ * `PROMPT_BUNDLE_MAX_FILES` does not bound this walk, because it counts FILES. Keeping
+ * both copies of a lawfully duplicated directory (see `PromptBundleSymlinkCycleError`
+ * for why that is right) means a chain of directories containing only links —
+ * `d0/{l1,l2} -> d1`, `d1/{l1,l2} -> d2`, … — expands as 2^depth directory VISITS while
+ * never adding a file, so it slips under the file cap entirely. `hashPathContents`
+ * walks the same tree in linear time because its `seenDirectories` set is global; this
+ * walk cannot borrow that without reintroducing the silent drop the ancestor test
+ * exists to avoid. So the work is bounded explicitly instead, and bounded by refusing
+ * — Job creation is the critical path, and an unbounded walk there is the fault.
+ */
+export class PromptBundleTooManyDirsError extends Error {
+  /** A literal discriminant, for the reason given on `PromptBundleOverBudgetError`. */
+  declare readonly name: "PromptBundleTooManyDirsError";
+  readonly skillKey: string;
+  readonly limit: number;
+
+  constructor(skillKey: string, limit: number) {
+    super(
+      `skill "${skillKey}" expands to more than ${limit} directory visits in the prompt ` +
+        `bundle walk, which usually means symlinked directories multiplying the tree. ` +
+        `Refusing rather than walking an unbounded tree on the Job-creation path.`,
+    );
+    this.name = "PromptBundleTooManyDirsError";
+    this.skillKey = skillKey;
+    this.limit = limit;
   }
 }
 
@@ -474,8 +512,10 @@ function isWithinTree(root: string, candidate: string): boolean {
 async function collectSkillFiles(input: {
   entry: PaperclipSkillEntry;
   maxFiles: number;
+  maxDirs: number;
 }): Promise<CollectedSkillTree> {
-  const { entry, maxFiles } = input;
+  const { entry, maxFiles, maxDirs } = input;
+  let dirVisits = 0;
   const out: CollectedSkillFile[] = [];
   let resolvedSymlinkCount = 0;
   let danglingSymlinkCount = 0;
@@ -490,6 +530,8 @@ async function collectSkillFiles(input: {
 
   while (stack.length > 0) {
     const { relDir, realDir, ancestors } = stack.pop() as PendingDir;
+    dirVisits += 1;
+    if (dirVisits > maxDirs) throw new PromptBundleTooManyDirsError(entry.key, maxDirs);
     const absDir = relDir ? path.join(entry.source, relDir) : entry.source;
     const dirents = await fs.readdir(absDir, { withFileTypes: true });
     for (const dirent of dirents) {
@@ -503,7 +545,17 @@ async function collectSkillFiles(input: {
       }
       if (dirent.isSymbolicLink()) {
         const linkAbs = path.join(entry.source, relPath);
-        const resolvedTarget = await fs.realpath(linkAbs).catch(() => null);
+        // ⚠️ NARROW, NOT `catch(() => null)`. A blanket catch calls EACCES, EIO and a
+        // transient CephFS fault "dangling" — and a dangling count rides into a `sized`
+        // outcome, which IS cached, so one blip would be remembered for the life of the
+        // process. That is the exact thing `execute.ts` refuses to do with a transient
+        // fault. Only these three errnos actually mean "this link resolves nowhere";
+        // anything else is a fault and is rethrown so the measurement is skipped rather
+        // than recorded wrong.
+        const resolvedTarget = await fs.realpath(linkAbs).catch((err: NodeJS.ErrnoException) => {
+          if (err?.code === "ENOENT" || err?.code === "ENOTDIR" || err?.code === "ELOOP") return null;
+          throw err;
+        });
         if (resolvedTarget === null) {
           danglingSymlinkCount += 1;
           continue;
@@ -516,9 +568,11 @@ async function collectSkillFiles(input: {
             treeRoot: realRoot,
           });
         }
-        // `stat` follows the link, so this is the TARGET's type — which is the thing
-        // that decides what the pod reads, not the link's own.
-        const targetStat = await fs.stat(linkAbs);
+        // Stat the RESOLVED path, not the link. Both give the target's type, but this
+        // one is the path that was just containment-checked — so the bytes classified
+        // here, and read below, are provably the bytes whose location was approved,
+        // rather than whatever a second traversal of the link happens to reach.
+        const targetStat = await fs.stat(resolvedTarget);
         if (targetStat.isDirectory()) {
           if (ancestors.has(resolvedTarget)) {
             throw new PromptBundleSymlinkCycleError({ skillKey: entry.key, linkPath: relPath, resolvedTarget });
@@ -537,7 +591,8 @@ async function collectSkillFiles(input: {
         }
         resolvedSymlinkCount += 1;
         if (out.length >= maxFiles) throw new PromptBundleTooManyFilesError(entry.key, maxFiles);
-        const contents = await fs.readFile(linkAbs);
+        // Read the containment-checked path, for the reason given on `targetStat`.
+        const contents = await fs.readFile(resolvedTarget);
         out.push({ relPath, contents, byteLength: contents.length, utf8: decodeUtf8Strict(contents) });
         continue;
       }
@@ -592,9 +647,11 @@ export async function buildPromptBundleSecretProjection(input: {
   catalogBackedSkillKeys?: ReadonlySet<string>;
   maxBytes?: number;
   maxFilesPerSkill?: number;
+  maxDirsPerSkill?: number;
 }): Promise<PromptBundleSecretProjection | null> {
   const maxBytes = input.maxBytes ?? PROMPT_BUNDLE_SECRET_MAX_BYTES;
   const maxFiles = input.maxFilesPerSkill ?? PROMPT_BUNDLE_MAX_FILES;
+  const maxDirs = input.maxDirsPerSkill ?? PROMPT_BUNDLE_MAX_DIRS;
   const files: PromptBundleFile[] = [];
 
   if (input.instructionsContents) {
@@ -626,7 +683,7 @@ export async function buildPromptBundleSecretProjection(input: {
     .sort((left, right) => left.runtimeName.localeCompare(right.runtimeName));
 
   for (const entry of projected) {
-    const tree = await collectSkillFiles({ entry, maxFiles });
+    const tree = await collectSkillFiles({ entry, maxFiles, maxDirs });
     resolvedSymlinkCount += tree.resolvedSymlinkCount;
     danglingSymlinkCount += tree.danglingSymlinkCount;
     skippedNonRegularCount += tree.skippedNonRegularCount;
