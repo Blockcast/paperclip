@@ -72,7 +72,16 @@ const TERMINAL_RUN_STATES = new Set([
   "neutral",
 ]);
 
-/** Conclusion that means the gate was satisfied rather than lost. */
+/**
+ * Conclusion that means the gate ran to a green finish rather than dying undecided.
+ *
+ * ⚠️ This is a property of the RUN, never of the card's ask. Everything downstream that
+ * is named `satisfied` carries that narrower meaning: "the run this card named ended
+ * green". A card whose `payload.gate` points at a run that was never the ask — an
+ * ordinary CI run on the PR a card asks a human to *review*, say — reaches this branch
+ * and is closed, correctly, because the named gate is over. What must not follow is an
+ * announcement asserting the *ask* was met; see `announcementBody` (PEN-5103).
+ */
 const SUCCESS_CONCLUSION = "success";
 
 /**
@@ -223,7 +232,14 @@ function announcementBody(input: {
     ? "Approval card closed: the gate it pointed at has already completed"
     : "Approval card closed: the gate it pointed at died undecided";
   const consequence = input.disposition.satisfied
-    ? "The card was moot, so it was closed rather than left in the queue."
+    ? [
+        "**This does not say the card's ask was met.** The only thing read here is the named",
+        "run's own outcome: it finished green, so there is no longer a gate for anyone to click",
+        "and this card can no longer be approved. If the thing the card actually asked for has",
+        "not happened, it still has not happened. Re-file it — and attach `payload.gate` only",
+        "when the ask is literally a human clicking that Actions gate, never for a PR review, a",
+        "credential grant, or an operator action, because the card dies when that run ends.",
+      ].join(" ")
     : [
         "**Nobody approved or rejected it — the run ended first.** The card was closed as",
         "`cancelled` rather than left pointing at a dead gate. If this work still needs a",
@@ -291,7 +307,15 @@ function announcementMetadata(input: {
             label: "GitHub run",
             value: `${input.gate.repoFullName} run ${input.gate.runId}`,
           },
-          { type: "key_value", label: "Gate satisfied", value: input.satisfied ? "yes" : "no" },
+          // Labelled for what it measures — the run's outcome — not for whether the
+          // card got what it asked for. The old label read `Gate satisfied`, which a
+          // reader of a mis-attached gate reasonably took as "the escalation landed"
+          // (PEN-5103). Nothing outside this sweep's own tests reads the label.
+          {
+            type: "key_value",
+            label: "Named run finished green",
+            value: input.satisfied ? "yes" : "no",
+          },
         ],
       },
     ],
