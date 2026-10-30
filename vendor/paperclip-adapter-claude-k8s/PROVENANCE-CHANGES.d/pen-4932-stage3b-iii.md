@@ -3,7 +3,8 @@
 Tracking: [PEN-4932](https://paperclip.blockcast.net/PEN/issues/PEN-4932) · plan: `docs/plans/2026-10-28-pen-4932-per-agent-volumes.md` §3.6, §4 step 3
 
 **Files:** `src/server/job-manifest.ts`, `src/server/job-manifest.test.ts`,
-`src/server/job-manifest.git-hooks.test.ts`, `src/server/job-manifest.github-publish-broker.test.ts`
+`src/server/job-manifest.git-hooks.test.ts`, `src/server/job-manifest.github-publish-broker.test.ts`,
+`src/server/runtime-pin.ts`
 
 `ROOT_TOOLCHAIN_SUBPATHS` is now `[]`. Stage 3 (#3079, #3081, #3104) dropped the six fleet-wide
 toolchain dirs and left `.local/share/paperclip-git-hooks` as the last entry, deliberately, because
@@ -65,3 +66,36 @@ well as through deepest-mount resolution so a bind re-added at a different `moun
 **Verification:** `tsc --noEmit` clean; vendored claude suite **1751/1751** on the pinned
 `vitest ^4.1.4`. Positive control — restoring only the constant to `[GIT_HOOKS_SUBPATH]` turns
 exactly **4** tests red, and they are the four inverted assertions.
+
+
+## Review follow-up — the preflight verdicts had to be re-scoped, not just the mount removed
+
+Raised by Ally on `69a0198` and taken here rather than deferred, because the defect is one this very
+change introduces into operator-facing text. Comment and verdict strings only in
+`src/server/runtime-pin.ts`; no behaviour change, no control weakened.
+
+Emptying `ROOT_TOOLCHAIN_SUBPATHS` does not merely remove a mount — it **narrows which verdict
+`buildPrePushHookPreflightShell` can reach**. The `OFF-MOUNT` arm is guarded on the SEEDED copy being
+visible (`[ -e "$__pchookmnt/pre-push" ]`), and that visibility was exactly what the bind provided.
+So:
+
+- `OFF-MOUNT` now fires **only on the broad data mount**, the one place the seeded copy survives.
+  Its text claimed, unconditionally, that a pre-bake image "reads the seeded copy, which is still
+  mounted, and publishes normally". On a narrowed pod that is false, and the doc block generalised
+  the same way ("emits OFF-MOUNT for a pod that publishes perfectly well"). Both are now scoped to
+  the broad mount, and both say what happens instead on a narrowed pod.
+- A pre-bake image on a narrowed pod lands in **`MASKED`**, which is the correct report: with
+  neither copy reachable the pod genuinely refuses every push. But MASKED's doc block said the
+  verdict means "both planes are broken at once", and that inference no longer holds — on a narrowed
+  pod the seeded copy is unreachable **by design**, so one fault (a pre-bake image) is sufficient,
+  and is now the likeliest cause. An absent bind is the intended state, not the defect.
+
+The direction that matters is the one the original text got wrong: an operator reading the old doc
+block would carry the "healthy pod, false alarm" reading across to a pod that is in fact refusing
+every push. The runtime behaviour this describes is unchanged and was already pinned — the existing
+"reports MASKED when the directory itself does not exist" case *is* the narrowed-pod case — so no
+new test is added; the two phrases the OFF-MOUNT test asserts (`will refuse every push from this
+pod`, `publishes normally`) both survive deliberately.
+
+**Re-verified after this edit:** `tsc --noEmit` clean; vendored claude suite **1751/1751** on the
+pinned `vitest ^4.1.4` (`runtime-pin.test.ts` 44/44); provenance log ok against `origin/master`.
