@@ -33,11 +33,13 @@ export type RecoveryKeyPrefix = typeof RECOVERY_KEY_PREFIXES[keyof typeof RECOVE
 /**
  * `issues.originKind` for a row minted by the Alertmanager plugin's webhook.
  *
- * Duplicated as a literal in `issues.ts` (aggregate-fingerprint arbitration)
- * because the plugin package is not a server dependency: the plugin declares
- * the same string in its own `types.ts`, and the two are joined only by this
- * comment. Changing it is a data migration on `issues.origin_kind`, not a
- * rename.
+ * This is the single server-side definition: `issues.ts` imports it for both
+ * halves of aggregate-fingerprint arbitration rather than carrying its own
+ * literals. The remaining duplicate is OUTSIDE this package and cannot be
+ * imported away -- the plugin declares the same string in its own `types.ts`
+ * and is not a server dependency, so those two are joined only by this
+ * comment. Changing the value is a data migration on `issues.origin_kind`,
+ * not a rename.
  */
 export const ALERTMANAGER_ORIGIN_KIND = "plugin:paperclip-plugin-alertmanager";
 

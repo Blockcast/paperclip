@@ -166,6 +166,7 @@ import {
 import { buildGithubTruthProbe, type TruthProbe } from "./evidence-truth.js";
 import { loadConfig } from "../config.js";
 import {
+  ALERTMANAGER_ORIGIN_KIND,
   parseIssueGraphLivenessIncidentKey,
   RECOVERY_ORIGIN_KINDS,
 } from "./recovery/origins.js";
@@ -6179,7 +6180,7 @@ function alertmanagerAggregateCreationFingerprint(
 ): string | null {
   const fingerprint = issueData.originFingerprint;
   if (
-    issueData.originKind !== "plugin:paperclip-plugin-alertmanager" ||
+    issueData.originKind !== ALERTMANAGER_ORIGIN_KIND ||
     typeof fingerprint !== "string" ||
     fingerprint.trim() === "" ||
     fingerprint === "default"
@@ -10634,7 +10635,7 @@ export function issueService(db: Db) {
             .from(issues)
             .where(and(
               eq(issues.companyId, companyId),
-              eq(issues.originKind, "plugin:paperclip-plugin-alertmanager"),
+              eq(issues.originKind, ALERTMANAGER_ORIGIN_KIND),
               eq(issues.originFingerprint, alertmanagerAggregateFingerprint),
               isNull(issues.hiddenAt),
               notInArray(issues.status, ["done", "cancelled"]),

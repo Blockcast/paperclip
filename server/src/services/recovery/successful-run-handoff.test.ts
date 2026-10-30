@@ -12,7 +12,9 @@ import {
   isSuccessfulRunHandoffValidPathSkip,
   isSuccessfulRunHandoffRequiredNoticeBody,
   noticeMetadataReferencesRecoveryAction,
+  type IssueRow,
 } from "./successful-run-handoff.js";
+import { ALERTMANAGER_ORIGIN_KIND, isAlertEscalationLadderOriginKind } from "./origins.js";
 import { UNMANAGED_BACKGROUND_TASK_LIVENESS_REASON } from "@paperclipai/adapter-utils/server-utils";
 
 const run = {
@@ -23,7 +25,10 @@ const run = {
   contextSnapshot: { issueId: "issue-1" },
 } as any;
 
-const issue = {
+// Typed rather than `as any`: the PEN-2918 guard reads `originKind`, so the
+// spreads below have to be type-checked against `IssueRow` for the test to
+// prove anything about the shape the production caller actually passes.
+const issue: IssueRow = {
   id: "issue-1",
   companyId: "company-1",
   identifier: "PAP-1",
@@ -33,7 +38,10 @@ const issue = {
   assigneeAgentId: "agent-1",
   assigneeUserId: null,
   executionState: null,
-} as any;
+  // `issues.origin_kind` is NOT NULL with default `manual`, so this -- not
+  // `null` -- is what an ordinary hand-filed row carries in production.
+  originKind: "manual",
+};
 
 const agent = {
   id: "agent-1",
@@ -258,7 +266,7 @@ describe("successful run handoff decision", () => {
   });
 
   it("does not queue for an alert row — the escalation ladder owns its next action (PEN-2918)", () => {
-    const alertIssue = { ...issue, originKind: "plugin:paperclip-plugin-alertmanager" } as any;
+    const alertIssue: IssueRow = { ...issue, originKind: ALERTMANAGER_ORIGIN_KIND };
     const decision = decide({ issue: alertIssue });
 
     expect(decision).toEqual({
@@ -279,7 +287,7 @@ describe("successful run handoff decision", () => {
     // `queue`, and the wake it queues asks the owner for a disposition that
     // would stop or defer the ladder.
     expect(decide({
-      issue: { ...issue, originKind: "plugin:paperclip-plugin-alertmanager" } as any,
+      issue: { ...issue, originKind: ALERTMANAGER_ORIGIN_KIND },
       livenessState: "advanced",
       detectedProgressSummary: "Run produced concrete action evidence: 1 issue comment(s)",
     })).toEqual({
@@ -290,11 +298,19 @@ describe("successful run handoff decision", () => {
 
   it("still queues for a non-alert row with the same shape (PEN-2918 negative control)", () => {
     // Pins the guard to the origin kind rather than to anything the alert row
-    // happens to share with ordinary work. `null` is the ordinary case; the
-    // second assertion rejects a near-miss origin kind so a future rename
-    // cannot widen the skip silently.
-    expect(decide({ issue: { ...issue, originKind: null } as any }).kind).toBe("enqueue");
-    expect(decide({ issue: { ...issue, originKind: "plugin:paperclip-plugin-slack" } as any }).kind).toBe("enqueue");
+    // happens to share with ordinary work. `manual` is the ordinary case -- the
+    // NOT NULL column default -- and the second assertion rejects a near-miss
+    // origin kind so a future rename cannot widen the skip silently.
+    expect(decide({ issue: { ...issue, originKind: "manual" } }).kind).toBe("enqueue");
+    expect(decide({ issue: { ...issue, originKind: "plugin:paperclip-plugin-slack" } }).kind).toBe("enqueue");
+    // The helper's signature is deliberately wider than the column, so the
+    // nullish arms are exercised directly. They cannot be reached through
+    // `decide()`: `issues.origin_kind` is NOT NULL, so building a row with
+    // `originKind: null` only type-checks behind a cast, and casting it is what
+    // hid the missing `IssueRow` field in the first place.
+    expect(isAlertEscalationLadderOriginKind(null)).toBe(false);
+    expect(isAlertEscalationLadderOriginKind(undefined)).toBe(false);
+    expect(isAlertEscalationLadderOriginKind(ALERTMANAGER_ORIGIN_KIND)).toBe(true);
   });
 
   it("does not queue when the issue is the recurring parent of an active routine", () => {
