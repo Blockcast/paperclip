@@ -368,4 +368,41 @@ describe("a card may not be filed against an already-finished gate (PEN-5103)", 
     expect([200, 201], JSON.stringify(res.body)).toContain(res.status);
     expect(mockGetWorkflowRun).not.toHaveBeenCalled();
   });
+
+  it("answers a non-revision_requested card with the status error, not a gate complaint", async () => {
+    // Ordering, not behaviour: only a `revision_requested` card can reach `pending`,
+    // so a card in any other status is going to fail in `svc.resubmit()` on status no
+    // matter what its payload says. Checking the gate first would answer "your gate is
+    // dead" to a caller whose actual problem is that the card was never sent back for
+    // revision — pointing them at the wrong thing, and at a field they may not even
+    // have set deliberately. The budget guard directly above makes the same choice for
+    // the same reason. Raised by Ally reviewing `3105e66`.
+    mockGetWorkflowRun.mockResolvedValue(found("completed", "success"));
+    mockApprovalService.getById.mockResolvedValue({
+      ...revisionRequestedCard({ title: "Escalation nobody sent back" }),
+      status: "pending",
+    });
+    // Dynamic import, like the sibling budget suite does for the same assertion:
+    // the route graph is imported inside `createAgentApp()` after the mocks are
+    // registered, so a static top-level import here yields a DIFFERENT module
+    // instance and `err instanceof HttpError` fails in the error handler — the
+    // thrown status error would surface as a 500 and the test would pin nothing.
+    const { unprocessable } = await import("../errors.js");
+    mockApprovalService.resubmit.mockRejectedValue(
+      unprocessable("Only revision requested approvals can be resubmitted", {
+        approvalId: "approval-gate-1",
+        status: "pending",
+      }),
+    );
+
+    const res = await resubmit(await createAgentApp(), { payload: REVIEW_ASK_PAYLOAD });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.error).toBe("Only revision requested approvals can be resubmitted");
+    expect(JSON.stringify(res.body)).not.toContain("approval_gate_already_terminal");
+    expect(mockApprovalService.resubmit).toHaveBeenCalledTimes(1);
+    // The guard is skipped outright rather than merely losing a race, so the dead gate
+    // costs no GitHub round trip on a request that was always going to fail on status.
+    expect(mockGetWorkflowRun).not.toHaveBeenCalled();
+  });
 });
