@@ -117,6 +117,7 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     monitorAttemptCount?: number | null;
     executionPolicy?: unknown;
     parkedUntil?: Date | null;
+    lastActivityAt?: Date | null;
   }) {
     const id = input.id ?? randomUUID();
     await db.insert(issues).values({
@@ -135,6 +136,10 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       executionState: input.executionState ?? null,
       executionWorkspaceId: input.executionWorkspaceId ?? null,
       description: input.description ?? null,
+      // Migration 0076's BEFORE INSERT trigger mirrors `updated_at` into
+      // `last_activity_at` only when the caller passes nothing, which is exactly so
+      // fixtures can establish a historical activity baseline. PEN-5105 uses that.
+      ...(input.lastActivityAt != null ? { lastActivityAt: input.lastActivityAt } : {}),
       ...(input.parkedUntil != null ? { parkedUntil: input.parkedUntil } : {}),
       ...(input.monitorNextCheckAt != null ? { monitorNextCheckAt: input.monitorNextCheckAt } : {}),
       ...(input.monitorAttemptCount != null ? { monitorAttemptCount: input.monitorAttemptCount } : {}),
@@ -1661,6 +1666,221 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       attentionBlockerCount: 1,
       sampleBlockerIdentifier: "PPR-3",
     });
+  });
+
+  // ---------------------------------------------------------------------------------
+  // PEN-5105: the `assigneeUserId` arm covers unconditionally -- no staleness term, no
+  // upper bound. Measured as the SOLE generator of false `covered` on a complete n=50
+  // `blocked` sweep (6 of 6, no residue, idle 14h-230h).
+  //
+  // Taking the conjunct un-covers every human-assigned blocker company-wide at once, which
+  // is the flood shape the CEO flagged on PEN-5021. So this ships the MEASUREMENT only.
+  // Every test below therefore asserts the observation AND that `state` is untouched --
+  // the second half is the point, not boilerplate: the moment one of these flips a `state`
+  // the change has silently become the flood it exists to size.
+  // ---------------------------------------------------------------------------------
+  const HOUR_MS = 60 * 60 * 1000;
+
+  it("counts a human-assigned covered blocker and reports its idle span (PEN-5105)", async () => {
+    const { companyId } = await createCompany("PHA");
+    const parentId = await insertIssue({ companyId, identifier: "PHA-1", title: "Parent", status: "blocked" });
+    const blockerId = await insertIssue({
+      companyId,
+      identifier: "PHA-2",
+      title: "Human-assigned blocker",
+      status: "todo",
+      assigneeUserId: "user-pha",
+      lastActivityAt: new Date(Date.now() - 30 * HOUR_MS),
+    });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: parentId });
+
+    const parent = ((await svc.list(companyId, { status: "blocked" })) as IssueListItem[]).find((issue) => issue.id === parentId);
+
+    // Behaviour control: unchanged from before PEN-5105.
+    expect(parent?.blockerAttention).toMatchObject({
+      state: "covered",
+      coveredBlockerCount: 1,
+      stalledBlockerCount: 0,
+      attentionBlockerCount: 0,
+    });
+    // Observation.
+    expect(parent?.blockerAttention?.humanAssignedCoveredBlockerCount).toBe(1);
+    expect(parent?.blockerAttention?.oldestHumanAssignedCoveredIdleHours).toBeGreaterThanOrEqual(29.9);
+    expect(parent?.blockerAttention?.oldestHumanAssignedCoveredIdleHours).toBeLessThan(31);
+  });
+
+  // Negative control for "count every covered blocker". A live run covers through a
+  // DIFFERENT arm, which has its own liveness term and is not what PEN-5105 sizes. Mutating
+  // the root filter to `entry.result.covered` alone turns this 0 into a 1.
+  it("does not count a blocker covered by a live run as human-assigned (PEN-5105)", async () => {
+    const { companyId, agentId } = await createCompany("PHB");
+    const parentId = await insertIssue({ companyId, identifier: "PHB-1", title: "Parent", status: "blocked" });
+    const blockerId = await insertIssue({
+      companyId,
+      identifier: "PHB-2",
+      title: "Agent-run blocker",
+      status: "in_progress",
+      assigneeAgentId: agentId,
+      lastActivityAt: new Date(Date.now() - 300 * HOUR_MS),
+    });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: parentId });
+    await activeRun({ companyId, agentId, issueId: blockerId });
+
+    const parent = ((await svc.list(companyId, { status: "blocked" })) as IssueListItem[]).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({ state: "covered", coveredBlockerCount: 1 });
+    // Stale by 300h, yet not this arm's population: it must not be counted.
+    expect(parent?.blockerAttention?.humanAssignedCoveredBlockerCount).toBe(0);
+    expect(parent?.blockerAttention?.oldestHumanAssignedCoveredIdleHours).toBeNull();
+  });
+
+  // Negative control for the `status !== "cancelled"` half of the arm. A cancelled blocker
+  // has a human assignee but falls THROUGH the arm to the cancelled arm, which does not
+  // cover. Nothing to un-cover, so nothing to count. Mutating that half of the arm to
+  // `node.assigneeUserId` alone turns this 0 into a 1.
+  //
+  // ⚠ Measured, so it is not claimed falsely: this test does NOT discriminate the root
+  // filter's `entry.result.covered` conjunct. Dropping that conjunct leaves this test
+  // GREEN, because a cancelled blocker never sets `humanAssignedCovered` in the first
+  // place -- today `humanAssignedCovered: true` is only ever emitted beside
+  // `covered: true`, so the conjunct is currently implied. It is kept anyway, and the
+  // reason is specific rather than defensive: propagating the flag through the
+  // `hardAttention`/`stalled` branches is a plausible widening (to measure stale
+  // human-assigned blockers on attention paths too), and under it an unguarded filter
+  // would start counting edges that never covered -- silently inflating the very
+  // blast-radius number the PEN-5105 threshold decision rests on.
+  it("does not count a cancelled human-assigned blocker, which never covered (PEN-5105)", async () => {
+    const { companyId } = await createCompany("PHC");
+    const parentId = await insertIssue({ companyId, identifier: "PHC-1", title: "Parent", status: "blocked" });
+    const blockerId = await insertIssue({
+      companyId,
+      identifier: "PHC-2",
+      title: "Cancelled human-assigned blocker",
+      status: "cancelled",
+      assigneeUserId: "user-phc",
+      lastActivityAt: new Date(Date.now() - 200 * HOUR_MS),
+    });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: parentId });
+
+    const parent = ((await svc.list(companyId, { status: "blocked" })) as IssueListItem[]).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention?.humanAssignedCoveredBlockerCount).toBe(0);
+    expect(parent?.blockerAttention?.oldestHumanAssignedCoveredIdleHours).toBeNull();
+  });
+
+  // Propagation control, and the reason the path carries the flag at all. PEN-5021's sweep
+  // established the covering verdict can originate a level deeper and be carried up by the
+  // recursion -- attributing it from the root's own `blockedBy` misattributes it, which was
+  // the methodological error PEN-5105 had to correct mid-measurement. Deleting the
+  // `humanAssignedCovered` term from the recursion's all-covered branch turns this 1 into 0.
+  it("propagates human-assigned coverage up through the recursion (PEN-5105)", async () => {
+    const { companyId } = await createCompany("PHD");
+    const parentId = await insertIssue({ companyId, identifier: "PHD-1", title: "Parent", status: "blocked" });
+    const midId = await insertIssue({ companyId, identifier: "PHD-2", title: "Mid chain", status: "blocked" });
+    const leafId = await insertIssue({
+      companyId,
+      identifier: "PHD-3",
+      title: "Deep human-assigned leaf",
+      status: "todo",
+      assigneeUserId: "user-phd",
+      lastActivityAt: new Date(Date.now() - 48 * HOUR_MS),
+    });
+    await block({ companyId, blockerIssueId: midId, blockedIssueId: parentId });
+    await block({ companyId, blockerIssueId: leafId, blockedIssueId: midId });
+
+    const parent = ((await svc.list(companyId, { status: "blocked" })) as IssueListItem[]).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({ state: "covered", coveredBlockerCount: 1 });
+    expect(parent?.blockerAttention?.humanAssignedCoveredBlockerCount).toBe(1);
+    expect(parent?.blockerAttention?.oldestHumanAssignedCoveredIdleHours).toBeGreaterThanOrEqual(47.9);
+  });
+
+  // Reducer control: `max`, not `min` and not first-wins. A path's covered verdict collapses
+  // as soon as ANY node in it stops covering, so the STALEST node sets the lowest threshold
+  // at which the path flips. Swapping `Math.max` for `Math.min` at either the recursion or
+  // the root turns this ~120 into ~6, which would under-report the blast radius by 20x --
+  // and under-reporting it is what makes a threshold look safe when it is not.
+  it("reports the stalest human-assigned blocker, not the freshest (PEN-5105)", async () => {
+    const { companyId } = await createCompany("PHE");
+    const parentId = await insertIssue({ companyId, identifier: "PHE-1", title: "Parent", status: "blocked" });
+    const freshId = await insertIssue({
+      companyId,
+      identifier: "PHE-2",
+      title: "Fresh human-assigned blocker",
+      status: "todo",
+      assigneeUserId: "user-phe-a",
+      lastActivityAt: new Date(Date.now() - 6 * HOUR_MS),
+    });
+    const staleId = await insertIssue({
+      companyId,
+      identifier: "PHE-3",
+      title: "Stale human-assigned blocker",
+      status: "todo",
+      assigneeUserId: "user-phe-b",
+      lastActivityAt: new Date(Date.now() - 120 * HOUR_MS),
+    });
+    await block({ companyId, blockerIssueId: freshId, blockedIssueId: parentId });
+    await block({ companyId, blockerIssueId: staleId, blockedIssueId: parentId });
+
+    const parent = ((await svc.list(companyId, { status: "blocked" })) as IssueListItem[]).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({ state: "covered", coveredBlockerCount: 2 });
+    // Two TOP-LEVEL edges, so two -- the count is per edge, which is what "how many
+    // blockers would stop reading covered" actually asks.
+    expect(parent?.blockerAttention?.humanAssignedCoveredBlockerCount).toBe(2);
+    expect(parent?.blockerAttention?.oldestHumanAssignedCoveredIdleHours).toBeGreaterThanOrEqual(119.9);
+  });
+
+  // Per-edge, not per-node. A chain holding two stale human-assigned nodes still flips
+  // exactly once, because the single top-level edge is what un-covers. Summing nodes
+  // instead of counting edges turns this 1 into a 2 and inflates the blast radius.
+  it("counts top-level edges, not human-assigned nodes in the chain (PEN-5105)", async () => {
+    const { companyId } = await createCompany("PHF");
+    const parentId = await insertIssue({ companyId, identifier: "PHF-1", title: "Parent", status: "blocked" });
+    const midId = await insertIssue({
+      companyId,
+      identifier: "PHF-2",
+      title: "Human-assigned mid",
+      status: "blocked",
+      assigneeUserId: "user-phf-a",
+      lastActivityAt: new Date(Date.now() - 10 * HOUR_MS),
+    });
+    const leafId = await insertIssue({
+      companyId,
+      identifier: "PHF-3",
+      title: "Human-assigned leaf",
+      status: "todo",
+      assigneeUserId: "user-phf-b",
+      lastActivityAt: new Date(Date.now() - 90 * HOUR_MS),
+    });
+    await block({ companyId, blockerIssueId: midId, blockedIssueId: parentId });
+    await block({ companyId, blockerIssueId: leafId, blockedIssueId: midId });
+
+    const parent = ((await svc.list(companyId, { status: "blocked" })) as IssueListItem[]).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention?.humanAssignedCoveredBlockerCount).toBe(1);
+  });
+
+  // The whole-change control. A row with no blocker attention at all must still carry the
+  // fields, explicitly 0/null rather than absent. This codebase has repeatedly paid for
+  // optional observational fields whose ABSENCE reads as a legitimate value on an older
+  // deployment, always in the fail-open direction; `createIssueBlockerAttention` emits
+  // these unconditionally so a consumer can never confuse "none" with "not deployed".
+  it("always emits the observation fields, even on a non-root row (PEN-5105)", async () => {
+    const { companyId, agentId } = await createCompany("PHG");
+    const soloId = await insertIssue({
+      companyId,
+      identifier: "PHG-1",
+      title: "Unblocked row",
+      status: "todo",
+      assigneeAgentId: agentId,
+    });
+
+    const solo = ((await svc.list(companyId, {})) as IssueListItem[]).find((issue) => issue.id === soloId);
+
+    expect(solo?.blockerAttention).toMatchObject({ state: "none" });
+    expect(solo?.blockerAttention).toHaveProperty("humanAssignedCoveredBlockerCount", 0);
+    expect(solo?.blockerAttention).toHaveProperty("oldestHumanAssignedCoveredIdleHours", null);
   });
 
   it("applies assigneeAgentId='null' as an IS NULL filter on the blocked-inbox path", async () => {

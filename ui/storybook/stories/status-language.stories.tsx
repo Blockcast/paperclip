@@ -61,6 +61,8 @@ function attention(
     attentionBlockerCount: partial.attentionBlockerCount ?? 0,
     sampleBlockerIdentifier: partial.sampleBlockerIdentifier ?? null,
     sampleStalledBlockerIdentifier: partial.sampleStalledBlockerIdentifier ?? null,
+    humanAssignedCoveredBlockerCount: 0,
+    oldestHumanAssignedCoveredIdleHours: null,
   };
 }
 
@@ -132,6 +134,8 @@ const coveredBlockedMatrix: CoveredBlockedCell[] = [
       stalledBlockerCount: 1,
       sampleBlockerIdentifier: "PAP-2279",
       sampleStalledBlockerIdentifier: "PAP-2279",
+      humanAssignedCoveredBlockerCount: 0,
+      oldestHumanAssignedCoveredIdleHours: null,
     }),
     expectedVisual: "amber ring with dot",
     expectedCopy: "Blocked · review stalled on PAP-2279",
@@ -145,6 +149,8 @@ const coveredBlockedMatrix: CoveredBlockedCell[] = [
       unresolvedBlockerCount: 2,
       stalledBlockerCount: 2,
       sampleStalledBlockerIdentifier: "PAP-2279",
+      humanAssignedCoveredBlockerCount: 0,
+      oldestHumanAssignedCoveredIdleHours: null,
     }),
     expectedVisual: "amber ring with dot",
     expectedCopy: "Blocked · 2 reviews stalled with no clear next step",
@@ -289,6 +295,8 @@ const blockedNoticeFixtures: BlockedNoticeFixture[] = [
       stalledBlockerCount: 1,
       sampleBlockerIdentifier: "PAP-2279",
       sampleStalledBlockerIdentifier: "PAP-2279",
+      humanAssignedCoveredBlockerCount: 0,
+      oldestHumanAssignedCoveredIdleHours: null,
     }),
   },
   {
@@ -316,6 +324,8 @@ const blockedNoticeFixtures: BlockedNoticeFixture[] = [
       unresolvedBlockerCount: 2,
       stalledBlockerCount: 2,
       sampleStalledBlockerIdentifier: "PAP-2284",
+      humanAssignedCoveredBlockerCount: 0,
+      oldestHumanAssignedCoveredIdleHours: null,
     }),
   },
 ];

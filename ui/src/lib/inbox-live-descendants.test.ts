@@ -27,6 +27,8 @@ function makeBlockerAttention(
     attentionBlockerCount: 0,
     sampleBlockerIdentifier: null,
     sampleStalledBlockerIdentifier: null,
+    humanAssignedCoveredBlockerCount: 0,
+    oldestHumanAssignedCoveredIdleHours: null,
     ...overrides,
   };
 }

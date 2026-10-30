@@ -422,6 +422,43 @@ export interface IssueBlockerAttention {
   attentionBlockerCount: number;
   sampleBlockerIdentifier: string | null;
   sampleStalledBlockerIdentifier: string | null;
+  /**
+   * PEN-5105, OBSERVATION ONLY. How many of this row's top-level blockers reached
+   * `covered` through the human-assigned arm specifically -- `assigneeUserId` set and
+   * status not `cancelled`, which covers unconditionally with no staleness term.
+   *
+   * This is NOT a subset you can derive from `coveredBlockerCount`: a blocker also
+   * reaches `covered` by being `done`, by carrying a pending interaction, by holding a
+   * live run/monitor/park, or by the downstream recursion. Only this arm is unbounded in
+   * time, so only this count sizes the population a staleness conjunct would touch.
+   *
+   * It changes no `state`, no `reason` and no other count. It exists so the threshold in
+   * PEN-5105 can be chosen against a measured blast radius instead of a guess, and so the
+   * flood is measurable BEFORE it is taken.
+   */
+  humanAssignedCoveredBlockerCount: number;
+  /**
+   * PEN-5105, OBSERVATION ONLY. Idle hours of the stalest blocker counted in
+   * {@link humanAssignedCoveredBlockerCount}, or `null` when that count is 0.
+   *
+   * **The clock is `issues.last_activity_at`, and its error direction is the whole reason
+   * it is the right one.** Migration 0076 maintains that column as a UNION: a BEFORE
+   * UPDATE trigger mirrors every `updated_at` bump into it, and an AFTER INSERT trigger on
+   * `issue_comments` bumps it to each new comment. So it advances on any write by anyone --
+   * human, agent or system.
+   *
+   * That makes it useless for asserting attendance (`heartbeat.ts` rejects it for exactly
+   * this reason: the run-finalization write would make every summary look fresh) but
+   * correct for asserting its ABSENCE. Fresh does not prove a human attended; stale proves
+   * nothing touched the row at all, which is strictly stronger. A staleness conjunct only
+   * ever acts on the stale side, so this clock can only UNDER-report staleness -- and
+   * under-reporting leaves a blocker `covered`, preserving today's behaviour. The error
+   * direction is toward the status quo, never toward the flood.
+   *
+   * Consequence when reading the measurement: these spans are a LOWER BOUND on human
+   * idleness. A threshold chosen from them is conservative by construction.
+   */
+  oldestHumanAssignedCoveredIdleHours: number | null;
 }
 
 export type IssueInboxAttentionKind = "blocked";

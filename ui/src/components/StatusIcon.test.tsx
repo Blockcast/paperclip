@@ -35,6 +35,8 @@ describe("StatusIcon", () => {
           stalledBlockerCount: 0,
           sampleBlockerIdentifier: "PAP-9",
           sampleStalledBlockerIdentifier: null,
+          humanAssignedCoveredBlockerCount: 0,
+          oldestHumanAssignedCoveredIdleHours: null,
         }}
       />,
     );
@@ -58,6 +60,8 @@ describe("StatusIcon", () => {
           attentionBlockerCount: 3,
           sampleBlockerIdentifier: "PAP-3541",
           sampleStalledBlockerIdentifier: null,
+          humanAssignedCoveredBlockerCount: 0,
+          oldestHumanAssignedCoveredIdleHours: null,
         }}
       />,
     );
@@ -80,6 +84,8 @@ describe("StatusIcon", () => {
           attentionBlockerCount: 0,
           sampleBlockerIdentifier: "PAP-2279",
           sampleStalledBlockerIdentifier: "PAP-2279",
+          humanAssignedCoveredBlockerCount: 0,
+          oldestHumanAssignedCoveredIdleHours: null,
         }}
       />,
     );

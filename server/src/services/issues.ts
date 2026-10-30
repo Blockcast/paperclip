@@ -2938,13 +2938,14 @@ type IssueBlockerAttentionNode = {
   monitorNextCheckAt?: Date | null;
   monitorAttemptCount?: number | null;
   executionPolicy?: unknown;
+  lastActivityAt?: Date | string | null;
 };
 type IssueBlockerAttentionInputNode =
   Pick<
     IssueBlockerAttentionNode,
     "id" | "companyId" | "parentId" | "identifier" | "title" | "status" | "assigneeAgentId" | "assigneeUserId"
   >
-  & { executionRunId?: string | null; parkedUntil?: Date | string | null };
+  & { executionRunId?: string | null; parkedUntil?: Date | string | null; lastActivityAt?: Date | string | null };
 
 type IssueBlockerAttentionEdge = {
   issueId: string;
@@ -3265,6 +3266,12 @@ function createIssueBlockerAttention(input: Partial<IssueBlockerAttention> = {})
     attentionBlockerCount: input.attentionBlockerCount ?? 0,
     sampleBlockerIdentifier: input.sampleBlockerIdentifier ?? null,
     sampleStalledBlockerIdentifier: input.sampleStalledBlockerIdentifier ?? null,
+    // PEN-5105: always present, never omitted. This codebase has repeatedly paid for
+    // optional observational fields whose absence reads as a legitimate zero on an older
+    // deployment (`descriptionTruncated`, `scheduledRetryAt`, `writeContainment`), which
+    // is always the fail-open direction. Emit 0/null explicitly instead.
+    humanAssignedCoveredBlockerCount: input.humanAssignedCoveredBlockerCount ?? 0,
+    oldestHumanAssignedCoveredIdleHours: input.oldestHumanAssignedCoveredIdleHours ?? null,
   };
 }
 
@@ -3569,6 +3576,33 @@ function hasLiveDeliberateParkWakePath(
   return isDeliberateParkActive(node.parkedUntil, nowMs);
 }
 
+/**
+ * PEN-5105, OBSERVATION ONLY -- this reads a clock, it does not gate anything.
+ *
+ * Idle hours of a blocker against `issues.last_activity_at`, used to size (not to take)
+ * the staleness conjunct the `assigneeUserId` arm is missing. See
+ * `IssueBlockerAttention.oldestHumanAssignedCoveredIdleHours` for why this column is the
+ * right clock despite being the wrong one for `heartbeat.ts`: migration 0076 maintains it
+ * as a union over row writes and comments, so a FRESH value proves nothing about human
+ * attendance, while a STALE one proves nothing touched the row at all. Un-covering only
+ * ever acts on the stale side, so the only error direction is under-reporting staleness,
+ * which leaves the blocker `covered` -- toward today's behaviour, never toward the flood.
+ *
+ * Returns `null` for a missing or unparseable timestamp, and clamps negatives to 0 so a
+ * clock-skewed row reads "just touched" rather than negative-idle. Both are the
+ * conservative reading: `null` and 0 are the values least likely to argue for un-covering.
+ */
+function blockerIdleHours(
+  node: Pick<IssueBlockerAttentionNode, "lastActivityAt">,
+  nowMs: number,
+): number | null {
+  const raw = node.lastActivityAt;
+  if (!raw) return null;
+  const ms = raw instanceof Date ? raw.getTime() : new Date(raw).getTime();
+  if (Number.isNaN(ms)) return null;
+  return Math.max(0, (nowMs - ms) / 3_600_000);
+}
+
 function hasValidBlockerMonitor(node: Pick<IssueBlockerAttentionNode, "monitorNextCheckAt" | "monitorAttemptCount" | "executionPolicy">): boolean {
   const nextCheckAt = node.monitorNextCheckAt;
   if (!nextCheckAt) return false;
@@ -3654,6 +3688,7 @@ async function listIssueBlockerAttentionMap(
           monitorNextCheckAt: issues.monitorNextCheckAt,
           monitorAttemptCount: issues.monitorAttemptCount,
           executionPolicy: issues.executionPolicy,
+          lastActivityAt: issues.lastActivityAt,
         })
         .from(issueRelations)
         .innerJoin(issues, eq(issueRelations.issueId, issues.id))
@@ -3683,6 +3718,7 @@ async function listIssueBlockerAttentionMap(
           monitorNextCheckAt: issues.monitorNextCheckAt,
           monitorAttemptCount: issues.monitorAttemptCount,
           executionPolicy: issues.executionPolicy,
+          lastActivityAt: issues.lastActivityAt,
         })
         .from(issues)
         .where(
@@ -3723,6 +3759,7 @@ async function listIssueBlockerAttentionMap(
           monitorNextCheckAt: row.monitorNextCheckAt,
           monitorAttemptCount: row.monitorAttemptCount,
           executionPolicy: row.executionPolicy,
+          lastActivityAt: row.lastActivityAt,
         });
       }
     }
@@ -3901,6 +3938,27 @@ async function listIssueBlockerAttentionMap(
     stalled: boolean;
     sampleBlockerIdentifier: string | null;
     sampleStalledBlockerIdentifier: string | null;
+    /**
+     * PEN-5105, OBSERVATION ONLY. Does this path's `covered` verdict DEPEND on the
+     * unconditional human-assigned arm below -- here, or anywhere in the covered subtree
+     * the recursion walked to reach it?
+     *
+     * Propagated rather than read off the top-level blocker, because PEN-5021's sweep
+     * established the covering verdict can originate a level deeper and be carried up by
+     * the recursion; attributing it from the root's own `blockedBy` misattributes it. This
+     * mirrors how `sampleStalledBlockerIdentifier` already propagates.
+     *
+     * Optional because only two sites ever set it: the arm itself, and the recursion's
+     * all-covered branch. Every other return is a different arm and is legitimately absent.
+     */
+    humanAssignedCovered?: boolean;
+    /**
+     * PEN-5105, OBSERVATION ONLY. The STALEST idle span (hours) among the human-assigned
+     * covered nodes on this path -- `max`, not `min` or mean, because the path's covered
+     * verdict collapses as soon as ANY node in it stops covering. The stalest node is
+     * therefore the one that decides the lowest threshold at which this path would flip.
+     */
+    humanAssignedIdleHours?: number | null;
   };
   const classifyPath = (
     nodeId: string,
@@ -3924,7 +3982,24 @@ async function listIssueBlockerAttentionMap(
       return { covered: true, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
     }
     if (node.assigneeUserId && node.status !== "cancelled") {
-      return { covered: true, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
+      // PEN-5105: THE arm. Any human assignee on any non-cancelled status covers
+      // immediately and unconditionally -- ahead of the `in_review` arm, the downstream
+      // recursion and the leaf invokability check -- with no staleness term and no upper
+      // bound on how long it holds. Measured as the sole generator of false `covered` on a
+      // complete n=50 `blocked` sweep (6 of 6, no residue; idle 14h-230h).
+      //
+      // The verdict below is DELIBERATELY UNCHANGED. Adding the conjunct here un-covers
+      // every human-assigned blocker company-wide in one step, which is the flood shape the
+      // CEO flagged on PEN-5021 and the PEN-3345 shape. What is added is the measurement
+      // that lets the threshold be chosen against a real blast radius first.
+      return {
+        covered: true,
+        stalled: false,
+        sampleBlockerIdentifier: nodeSample,
+        sampleStalledBlockerIdentifier: null,
+        humanAssignedCovered: true,
+        humanAssignedIdleHours: blockerIdleHours(node, blockerAttentionNowMs),
+      };
     }
     if (node.status === "in_review") {
       // PEN-5021: a live deliberate park is a waiting path. See `hasLiveDeliberateParkWakePath`.
@@ -3974,11 +4049,23 @@ async function listIssueBlockerAttentionMap(
           sampleStalledBlockerIdentifier: sampleStalled,
         };
       }
+      // PEN-5105: carry the attribution up. This branch is reached only when EVERY child
+      // is covered, so the parent's covered verdict depends on each of them -- if any child
+      // stops covering, the `hardAttention` branch above claims this node instead. `some`
+      // and `max` are therefore both the right reducers: one stale descendant is enough to
+      // flip this path, and the stalest one sets the threshold at which that happens.
+      const humanAssignedIdleCandidates = classified
+        .map((result) => result.humanAssignedIdleHours)
+        .filter((hours): hours is number => typeof hours === "number");
       return {
         covered: true,
         stalled: false,
         sampleBlockerIdentifier: classified[0]?.sampleBlockerIdentifier ?? nodeSample,
         sampleStalledBlockerIdentifier: null,
+        humanAssignedCovered: classified.some((result) => result.humanAssignedCovered),
+        humanAssignedIdleHours: humanAssignedIdleCandidates.length > 0
+          ? Math.max(...humanAssignedIdleCandidates)
+          : null,
       };
     }
 
@@ -4040,6 +4127,21 @@ async function listIssueBlockerAttentionMap(
       .map((entry) => entry.result.sampleStalledBlockerIdentifier)
       .find((value) => value);
 
+    // PEN-5105, OBSERVATION ONLY -- nothing below this point reads these into `state`,
+    // `reason` or any existing count.
+    //
+    // Counted per TOP-LEVEL EDGE, not per node: the decision this sizes is "how many of
+    // this row's blockers would stop reading `covered` if the conjunct were added", and an
+    // edge whose chain holds three stale human-assigned nodes still flips exactly once.
+    // Only edges that actually reached `covered` are counted -- a `needs_attention` or
+    // `stalled` edge has nothing to un-cover.
+    const humanAssignedCoveredEntries = classified.filter(
+      (entry) => entry.result.covered && entry.result.humanAssignedCovered,
+    );
+    const humanAssignedIdleHours = humanAssignedCoveredEntries
+      .map((entry) => entry.result.humanAssignedIdleHours)
+      .filter((hours): hours is number => typeof hours === "number");
+
     let state: IssueBlockerAttention["state"];
     let reason: IssueBlockerAttention["reason"];
     if (attentionBlockerCount > 0) {
@@ -4066,6 +4168,10 @@ async function listIssueBlockerAttentionMap(
       sampleBlockerIdentifier: sampleEntry?.result.sampleBlockerIdentifier ?? blockerSampleIdentifier(sampleNode),
       sampleStalledBlockerIdentifier:
         stalledEntry?.result.sampleStalledBlockerIdentifier ?? sampleStalledFromChain ?? null,
+      humanAssignedCoveredBlockerCount: humanAssignedCoveredEntries.length,
+      oldestHumanAssignedCoveredIdleHours: humanAssignedIdleHours.length > 0
+        ? Math.max(...humanAssignedIdleHours)
+        : null,
     }));
   }
 
