@@ -561,24 +561,45 @@ under its own name (`serverCanPreCreate`), governing that list alone.
 Closes the question invariant 1 left open. Every figure below was read on 2026-10-30 from a live
 agent pod and from `origin/master`, not estimated.
 
-#### Finding 1 — the two trees are ONE delivery problem
+#### Finding 1 — the two trees are ONE delivery problem, but the unit to ship is the run's entries
 
 Invariant 1 treats `skills/<companyId>` and the prompt bundle as two problems with different
 remedies. Measured, they are one. The bundle is **`agent-instructions.md` plus a symlink farm**:
 
 ```
 prompt-cache/<bundleKey>/agent-instructions.md     3,491 bytes
-prompt-cache/<bundleKey>/.claude/skills/           symlinks -> skills/<companyId>/...
+prompt-cache/<bundleKey>/.claude/skills/           symlinks -> entry.source
 ```
 
 `prepareClaudePromptBundle` writes exactly that — `fs.mkdir(skillsHome)` then one `symlink` per
-entry, whose target is `entry.source` put through `toPodAddress`. For a catalog-backed skill
-`entry.source` is `resolveManagedSkillsRoot(companyId)/__versions__/...`, i.e. **inside the skills
-tree**. The bundle carries no skill bytes of its own.
+entry, whose target is `entry.source` put through `toPodAddress` (`prompt-cache.ts:499-508`). The
+bundle carries **no skill bytes of its own**, so it is not a third payload and one channel can
+cover both trees. That much holds, and it is what retires invariant 1's "they do not share a
+remedy" — which was read off the mount table and does not survive reading the writer.
 
-So the bundle is not a third payload to ship. Ship the skills bytes and build the links from them
-inside the pod, and one channel covers both. Invariant 1's claim that the two "do not share a
-remedy" was read off the mount table; it does not survive reading the writer.
+> **Correction (Ally, 2026-10-30).** An earlier draft said `entry.source` is
+> `resolveManagedSkillsRoot(companyId)/__versions__/…`, i.e. always inside the skills tree. That is
+> the **missing-version** branch (`company-skills.ts:5477`), not the normal path. Normally
+> `resolveRuntimeSkillSource` returns `resolveExistingSkillDirectory(normalizeSkillDirectory(skill))`
+> (`:5487`), and `normalizeSkillDirectory` resolves **`skill.sourceLocator`** for both `catalog` and
+> `local_path` (`:2238`). A `local_path` locator need not be under the managed root at all:
+> `:2588-2600` branches on exactly that distinction — `localSkillDir.startsWith(managedRoot)` versus
+> a project/workspace scan (`metadata.sourceKind === "project_scan"`). The live sample cannot settle
+> it either way, because that pod's `.claude/skills/` was **empty** and so had no links whose targets
+> could be inspected.
+
+So: **catalog and managed `local_path` skills live in the tree; project-scan `local_path` skills do
+not.** A Secret built from `skills/<companyId>` would carry the first set and silently omit the
+second — producing exactly the dangling link this design exists to prevent, and indistinguishable
+from the bug it is meant to fix.
+
+**What this changes.** The unit to project is not the company tree but the **run's resolved
+entries**: the `entry.source` directories `prepareClaudePromptBundle` is actually handed
+(`company-skills.ts:5565-5572`). That covers every `sourceType` by construction, rather than by
+enumerating the ones that happen to sit under the managed root, and it shrinks the payload to what
+the run uses instead of everything the company owns. Adapter-bundled **image** paths are the one
+exclusion, since those survive in the image — the same discriminator `prompt-cache.ts` already
+applies when it decides whether to report `prompt_bundle_off_volume`.
 
 #### Finding 2 — the skills tree is server-written and pod-READ-ONLY
 
@@ -592,6 +613,13 @@ single mention of the name is a comment (`prompt-cache.ts:409`), and a vendored 
 import from `server/src` anyway. The Job mounts the tree `readOnly: true` (`companySkillsMount`,
 `job-manifest.ts`). Agents create skills **through the server**, not by writing that mount. A delivery channel therefore needs no write-back path, and the tree can be
 re-materialized per run from the server's own copy without losing anything the pod produced.
+
+> **Scope gap, same as Finding 1's (Ally, 2026-10-30).** `readOnly: true` is verified on
+> `companySkillsMount`, which is the **managed tree**. A project-scan `local_path` skill's bytes do
+> not live there, so that mount establishes nothing about them. Projecting the run's entries
+> (Finding 1) brings those sources into the channel, and the channel reads them — but
+> "pod-read-only" must be re-established for the workspace tree rather than inherited from this
+> mount, since the pod does mount workspace paths writably elsewhere.
 
 #### Finding 3 — sizing, and the ceiling that is closer than it looks
 
@@ -612,19 +640,28 @@ count was not** — 44 is files *plus directories*. There are 22 files.
 anywhere in the skills path is `MAX_CATALOG_FILE_BYTES = 1024 * 1024`
 (`company-skills.ts:467`) — and it is
 
-- **per file**, not per tree, so it equals the entire Secret budget on its own; and
-- **not admission control**. Its one use is `pushFinding(findings, "oversized_file", …)` inside
-  `auditInstalledSkillBytes`, which audits skills that are *already installed*. It reports; it
-  refuses nothing.
+- **per file**, not per tree, so one lawful file equals the entire Secret budget on its own; and
+- a **hard stop, not a report**. `oversized_file` is pushed at severity `"error"`
+  (`company-skills.ts:2459`); any `error` finding makes the audit verdict `"fail"` (`:2500`); and a
+  `fail` verdict throws `unprocessable(…, { updateHoldReason: "audit_hard_stop" })` on update
+  (`:4281`), on catalog update (`:4367`) and on catalog install (`:5318`). A file over 1 MiB is
+  **refused**.
+
+> **Correction (Ally, 2026-10-30).** An earlier draft called this "not admission control — it
+> reports; it refuses nothing". That is wrong, and wrong in the direction that invites 4b's
+> implementer to treat the audit as decorative. The *conclusion* is unchanged: a hard stop at 1 MiB
+> **per file** is the whole Secret budget on its own, and it bounds neither the file count nor the
+> tree size.
 
 So a single lawful skill file can exhaust the whole channel, the file count is unbounded, and
-nothing upstream keeps a company below the cap. Today's 16.8 % is one sample of an unbounded
-quantity.
+nothing upstream keeps a company — or a run — below the cap. Today's 16.8 % is one sample of an
+unbounded quantity.
 
 #### Decision
 
-> **Adopt the Secret projection. Reject the init-container API fetch as the first implementation,
-> and keep it as the named escalation rather than a hypothesis.**
+> **Adopt the Secret projection, carrying the run's resolved skill entries. Reject the
+> init-container API fetch as the first implementation, and keep it as the named escalation rather
+> than a hypothesis.**
 
 The precedent is exact and in-tree. **PEN-3329** is the same failure in a different tree: the
 server materialized `docs/<name>.md` into the execution workspace, a run-isolated pod did not
@@ -642,9 +679,11 @@ with an event, not a partially-populated tree.
 Two properties the implementation must carry, both forced by Finding 3:
 
 1. **An enforced budget at projection time, with a named error.** The channel must measure its own
-   projected size and refuse over-budget with a verdict that names the company and the measured
-   bytes — never truncate. A dropped skill is exactly the silent dangling-link failure this whole
-   invariant exists to prevent, and it would be indistinguishable from the bug.
+   projected size and refuse over-budget with a verdict that names the company, the run, and the
+   measured bytes — never truncate. A dropped skill is exactly the silent dangling-link failure this
+   whole invariant exists to prevent, and it would be indistinguishable from the bug. The quantity
+   measured is the **projected per-run Secret size** — the sum over the run's resolved entries, not
+   the company tree — because that is what actually ships (Finding 1).
 2. **Symlinks do not survive a Secret projection**, so the bundle's `.claude/skills/<runtimeName>`
    farm must be built **in-pod** from the projected tree. That is the concrete form of invariant
    1's *"the write target has to move"*, and it is a small init-container step, not a redesign:
@@ -652,9 +691,12 @@ Two properties the implementation must carry, both forced by Finding 3:
 
 **The escalation, and its trigger.** The budget is reachable by lawful input, so the Secret channel
 is a first implementation and not a final answer. The init-container fetch becomes the design once
-any company's projected tree crosses **50 % of the cap** — chosen so the move is made against a
-measurement rather than under an outage. That requires the projected size to be *emitted*, which
-is why property 1 is instrumentation as much as it is a guard.
+any **run's projected Secret size** crosses **50 % of the cap** — chosen so the move is made against
+a measurement rather than under an outage. Trigger and metric are defined on the same per-run
+quantity property 1 enforces, so the guard and the escalation cannot disagree about what they are
+measuring; an earlier draft defined the trigger per *company tree*, which is neither what ships nor
+what the budget checks. That the projected size must be *emitted*, not merely checked, is why
+property 1 is instrumentation as much as it is a guard.
 
 ⛔ Unchanged and still refused: a shared read-only claim (§2). It is one volume ID on every agent
 pod on the node, taking the same ceph-csi lock through the same `NodeUnstageVolume` path, and it
@@ -678,11 +720,13 @@ call in the end — each turned out to have a measurable answer:
   bare `git` and false of this system).
 
 **The 4b delivery channel — resolved 2026-10-30 (§4.2).** A **Secret projection**, on PEN-3329's
-precedent, carrying `skills/<companyId>`; the prompt bundle's symlink farm is rebuilt in-pod from
-it rather than shipped. The init-container API fetch is the named escalation, triggered at 50 % of
-the Secret cap — today's single measurable company projects to 16.8 %, which is a sample of an
+precedent, carrying the **run's resolved skill entries** (not `skills/<companyId>`: project-scan
+`local_path` sources sit outside the managed tree and a company-tree projection would omit them);
+the prompt bundle's symlink farm is rebuilt in-pod from it rather than shipped. The init-container
+API fetch is the named escalation, triggered at 50 % of the Secret cap measured on the projected
+per-run size — today's single measurable company projects to 16.8 %, which is a sample of an
 unbounded quantity and not headroom, since the only size constant in the skills path is a per-file
-*audit finding* equal to the whole budget.
+hard stop equal to the whole budget that bounds neither file count nor tree size.
 
 **Company-scoped sharing — resolved 2026-10-29, and it is a constraint rather than a trade-off.**
 `/work/<companyId>`, `/wt/<companyId>`, the pnpm store and `skills/<companyId>` are namespaced by
