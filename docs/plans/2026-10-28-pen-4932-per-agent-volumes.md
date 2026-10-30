@@ -425,9 +425,9 @@ PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verificati
      is an `existingClaim` managed out of onprem-k8s, so per-agent claims cannot be templated into
      the chart.
 
-     **Three invariants 4a hands to 4b.** All three are inert on the self claim and become live
+     **Four invariants 4a hands to 4b.** All four are inert on the self claim and become live
      the moment the claim is per-agent, so none of them can be caught by the fleet exercise 4a
-     relies on:
+     relies on. Two are closed on `master`; two are not.
 
      1. **Populate the server-materialized trees, or relocate them.** One closed by 3b-iii,
         one newly found. `.local/share/paperclip-git-hooks` and `skills/<companyId>` were both
@@ -482,6 +482,13 @@ PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verificati
 
         **This, not the skills tree alone, was the open design question on 4b's critical
         path. §4.2 closes it.**
+
+        **CLOSED 2026-10-30.** Delivered across #3153 / #3157 / #3158, the last merging at
+        20:19:43Z (`3ac9c0b`, with `6840dfb` on top). The in-pod rebuild is **inert until the
+        swap** — it has no call site yet, because the Secret it reads is not mounted on the Job
+        until `dataClaimName` changes. That is deliberate: it means the delivery channel is on
+        `master` and reviewed *before* the swap makes it load-bearing, rather than both landing
+        together.
      2. **Close the symlinked-PARENT hole in the seeder.** **CLOSED 2026-10-30.** The seeder
         holds uid 0 + `DAC_OVERRIDE` + `CHOWN` over the volume root, and both `mkdir -p` and
         `chown` follow symlinks. 4a refused a target whose FINAL component is already a symlink
@@ -507,11 +514,252 @@ PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verificati
         the swap rather than when it bites: a per-agent volume PERSISTS across runs whose target
         sets differ, so one run's writable tree can become an ancestor of a later run's target,
         and the fleet exercise 4a relied on cannot surface it.
-     3. **Decide the directory MODE.** The seeder `chown`s but sets no mode, so its dirs inherit
-        its umask rather than the `2775` setgid the server-side path got from its parent. Moot
-        while the dirs already exist (the `mkdir` no-ops); on a genuinely fresh volume 4a's dirs
-        come up without setgid, which is a real question for group-write across the publish-broker
-        sidecar. Answer it against a fresh volume rather than by assertion.
+     3. **Decide the directory MODE.** **Measured 2026-10-30; decision below; not yet
+        implemented.**
+
+        **This item's own premise was wrong, and the correction shrinks it.** It previously read
+        "the seeder's dirs inherit its umask rather than the `2775` setgid the server-side path
+        got from its parent". The server-side path does not produce `2775` on its children.
+        `mkdir -p a/b/c` under an explicitly-`2775` setgid parent gives:
+
+        ```
+        2775  .
+        2755  ./a
+        2755  ./a/b
+        2755  ./a/b/c
+        ```
+
+        Setgid propagates; **the group-write bit does not** — that comes from the creating
+        process's umask. So the seeder/server gap is one bit (setgid), not the `0755`-vs-`2775`
+        gap this item implied.
+
+        **Nothing is choosing these modes today.** The live shared volume carries three different
+        modes in one chain — `755 root:root` down through `…/k8s-isolation/workspaces/<wsId>`,
+        `2755 node:node` on `…/<wsId>/session` (a seed target), `2775 node:node` on the checkout
+        root, `2775 1000:1000` inside `.git`. `core.sharedRepository` is unset in that repo and a
+        grep over `packages/*/src`, `vendor/*/src` and `server/src` finds no `chmod` or setgid
+        call producing any of it. Each directory's mode is an artefact of **which process created
+        it** (its umask) and **whether an ancestor carried setgid at that moment**. That is
+        exactly the property that stops holding per-agent, because then the seeder creates all of
+        them.
+
+        **Who the bit is load-bearing for.** The publish-broker sidecar runs `runAsUser: 1001`,
+        `runAsGroup: 1000`, `umask 0002` (`job-manifest.ts:2623`). Against a `1000:1000` directory
+        at `0755` it matches neither owner nor a writable group bit, falls through to `other` =
+        `r-x`, and cannot create entries. The live tree hides this because everything the broker
+        touches sits inside a `.git` that is `2775` — a mode the **clone** produced, not the
+        seeder. On a fresh per-agent volume the seeder creates those paths at `0755` (umask
+        `0022`, no setgid on the subvolume root to inherit) and then `chown`s: both bits lost
+        relative to what the live tree carries.
+
+        **Decision: `mkdir -m 2775 -p`, not a separate `chmod`.** Set the mode *at creation*,
+        on the targets the seeder itself creates.
+
+        ⚠️ **An earlier revision of this paragraph decided "`chmod 2775` on the writable target
+        set after `mkdir -p`". That is not executable by this seeder and would have failed the
+        Job closed.** Raised by review on #3164, verified here. `chmod(2)`'s owner-match check is
+        gated on `CAP_FOWNER` specifically — `CAP_DAC_OVERRIDE` does not cover it — and the
+        seeder holds `drop: ["ALL"], add: ["CHOWN", "DAC_OVERRIDE"]`
+        (`job-manifest.ts:4376-4382`), with FOWNER's absence argued *deliberately* in the comment
+        directly above it on the grounds that no syscall it makes needs one. A `chmod` is exactly
+        such a syscall. On a **persistent** per-agent volume the targets already exist
+        `1000`-owned from the previous run — which is this plan's own invariant-2/4 premise — so
+        uid 0 is not the owner, `chmod` returns `EPERM`, and the script is under `set -e`
+        (`job-manifest.ts:4279`): the init container fails and the Job never starts. Ordering the
+        `chmod` *before* the `chown` does not save it, because on every run after the first the
+        directory is already 1000-owned before the seeder runs at all.
+
+        **`mkdir -m` avoids both horns, and the reason is a behaviour worth stating because the
+        obvious local test gets it wrong.** Measured 2026-10-30:
+
+        | probe | result |
+        |---|---|
+        | `mkdir -m 2775 -p a/b/c` on a fresh chain | leaf `2775`; **intermediates `755`** — `-m` applies to the final component only |
+        | `mkdir -m 2775 -p x/y` where `x/y` exists at `0700` | **rc 0, mode left at `0700`** — no `chmod` issued |
+        | `chmod` of an inode owned by another uid, as an ordinary subject | `EPERM` (no-op `chmod`, so it is the owner-match check firing, not the mode) |
+        | `chown` a **directory** carrying `2775` | setgid **preserved** |
+        | `chown` a **file** carrying `2775` | setgid **cleared** |
+
+        The second row is the load-bearing one and it is *not* a coreutils convenience that
+        busybox might not share — the image is `busybox:1.36`, so it was read from that source
+        rather than assumed. `libbb/make_directory.c` tolerates `EEXIST` on the final component
+        and then takes `goto ret0` under the comment *"Since the directory exists, don't attempt
+        to change permissions if it was the full target. Note that this is not an error
+        condition."* The `chmod(path, mode)` at the end of that function — the one whose failure
+        the source explicitly calls an error — runs **only when `mkdir()` itself succeeded**, i.e.
+        only on a directory the seeder just created and therefore owns. So `mkdir -m` never
+        issues a `chmod` that can `EPERM`, on either implementation, and needs no `CAP_FOWNER`.
+        The fourth row is what makes the mode survive the `chown` that follows, and it is a
+        kernel guarantee rather than a filesystem accident: `chown_common()` puts the whole
+        bit-stripping clause — `ATTR_KILL_SUID | ATTR_KILL_PRIV |
+        setattr_should_drop_sgid(...)` — inside `if (!S_ISDIR(inode->i_mode))`
+        (`fs/open.c:779`, v6.8, which is this cluster's kernel line). Directories keep setgid
+        where files lose it, so the `mkdir -m`-then-`chown` order is safe in that direction.
+
+        **What this buys and what it does not.** It makes the mode independent of umask and of
+        ancestor setgid *for every target the seeder creates*. It does **not** deliver the
+        "a fresh per-agent volume and the shared one converge" property the superseded paragraph
+        claimed: a target that already exists keeps whatever mode it has, and nothing here
+        changes it. That is acceptable **only because a per-agent volume is fresh by
+        construction** — at cutover the seeder is the first creator of every target, so the mode
+        it sets is the mode the path keeps. The residual gap is a target whose parent some
+        uid-1000 agent process created first at `0755`; if that is ever observed to bite the
+        broker, the remedy is `CAP_FOWNER` plus an explicit `chmod`, which is PSS-baseline-allowed
+        and now a costed option rather than a surprise. Do not reach for it pre-emptively: it
+        widens the seeder's privilege for a case not yet seen, and it adds a third act to
+        invariant 4's window (below).
+
+        ⚠️ **What is NOT measured, stated rather than glossed.** This seat has no `create` on
+        `pvc`, `job` or `pod` in namespace `paperclip` (`kubectl auth can-i` → `no` for all
+        three), so the model above is POSIX semantics in a scratch tree, **not** a CephFS fresh
+        volume. The CephFS-specific question — whether a freshly provisioned subvolume root
+        carries setgid, which would change what the seeder's children inherit — is **unmeasured**
+        and must be checked when 4b is applied. Setting the mode explicitly at creation is
+        chosen partly because its correctness does not depend on that answer — `mkdir -m` states
+        the mode rather than inheriting one.
+
+        One sub-question left to the implementation: `mkdir -p` also creates **intermediate
+        parents** that are not in the target list, and `-m` does not reach them either (probe
+        row 1 above), so they are neither chowned nor given a mode; on a fresh volume those land
+        `root:root` at the seeder's umask. The live tree already shows that shape
+        (`…/workspaces` is `755 root:root`). Whether it needs handling depends on whether any
+        uid-1000 process creates siblings beneath them outside a seeder run.
+     4. **The seeder guard is check-then-act, and concurrency makes that reachable at the swap.**
+        **OPEN.** Raised by review on #3161, verified here, and narrowed twice since.
+
+        Invariant 2 closed the hole for links that **already exist when the guard runs**. This is
+        the hole for links that **appear after it runs** — between the guard and the
+        `mkdir -p` / `chown` it protects. Per-agent claims introduce both halves of what makes it reachable:
+        the **persistence** that lets a planted link survive a run, and the **concurrency** that
+        makes planting it ordinary.
+
+        **It is reachable because concurrent same-agent runs are the norm, not an edge case.**
+        The in-code justification is *"init containers are sequential, so nothing else in the Pod
+        is running"* — **Pod-scoped**, and Pod scope is precisely what a per-agent claim
+        dissolves: the concurrent writer is a uid-1000 agent container in a *different Pod, on a
+        different node*, sharing the claim. Read live 2026-10-30: two agents each held 2
+        concurrent run pods, one spanning two nodes; a seat measured at `maxConcurrentRuns: 5`.
+        PEN-4902's subject is that concurrency-1 is the *remnant* being retired. This is also why
+        a per-agent claim must stay `ReadWriteMany` — which is what keeps the window reachable and
+        rules out "just make it RWO".
+
+        **⚠️ Correction, 2026-10-30 — the window is guard → `chown`, and the `chown` half is the
+        worse one.** An earlier revision of this plan, and of the comment in `job-manifest.ts`,
+        put the window at guard → `mkdir -p` on the grounds that `chown -h` "never traverses".
+        **That is wrong.** `-h` maps to `lchown(2)`, which declines to follow only the **last**
+        component; every intermediate component is resolved the ordinary way, symlinks included.
+        Measured rather than read off the man page:
+
+        | probe | result |
+        |---|---|
+        | `elsewhere/leaf` real, `link -> elsewhere`; `chown -h link/leaf` | exits 0, lands on `elsewhere/leaf` |
+        | `chown -h link/nosuchthing` | exits 1 — so the 0 above really did locate the file *through* the link |
+        | `deadlink -> /nonexistent`; `chown -h deadlink/leaf` | ENOENT — reachable only by having resolved the intermediate |
+
+        So a uid-1000 writer that swaps a parent component inside the window gets, from uid 0,
+        **both** `mkdir -p` creating root-owned directories at a route it chose **and** `chown`
+        handing uid 1000 ownership of a directory it chose. The second is an **ownership
+        transfer**, not a misplaced mkdir.
+
+        **Two remedies are ruled out, and the reasons differ.**
+
+        - *"Re-check between `mkdir` and `chown`"* — **ruled out.** The re-check is itself
+          check-then-act, so it closes neither half; it only shortens the race.
+        - *`fsGroup`* — **ruled out on cost, not availability**, and this is a refutation of a
+          hypothesis this plan went looking for rather than a result. Owning the tree as 1000
+          would let the seeder drop uid 0 entirely, making the race uid-1000-on-uid-1000 and *not
+          a privilege boundary at all* — dissolving this invariant rather than mitigating it, and
+          plausibly invariant 3 with it (kubelet sets setgid when applying fsGroup).
+          `cephfs.csi.ceph.com` reports `fsGroupPolicy: File` on this cluster, so kubelet **would
+          honour it**. What blocks it is `values.blockcast.yaml`, which clears the chart's
+          `fsGroup: 1000` because cephfs does not reliably short-circuit
+          `fsGroupChangePolicy: OnRootMismatch` — kubelet re-walks the volume on *every* mount,
+          giving 30-45 min rollouts (onprem-k8s #225). A per-agent volume starts empty, but grows
+          to that agent's own checkout, so the walk is re-paid **per pod start** and scales with
+          the volume rather than being one-off. **Do not re-propose without re-measuring that
+          short-circuit against a real per-agent claim** — if it does short-circuit on a small
+          volume, this becomes the best answer again, so it is a live question rather than a
+          settled one.
+
+        **Three acts sit in the window, not two.** `mkdir -p` and `chown -h` as above, and —
+        once invariant 3 lands — the `chmod()` that `mkdir -m` performs on a directory it just
+        created. That third one is the narrowest of the three (it fires only on the
+        just-created path, so a writer must `rmdir` and replace it inside a very tight race) but
+        it is not absent, and `chmod` has **no** no-follow form: unlike `chown -h` it
+        dereferences the final component too. A separate post-hoc `chmod`, had FOWNER made one
+        possible, would have been the widest act of the three for exactly that reason — a second
+        count against it.
+
+        **Costed 2026-10-30, and the answer is neither of the two this plan last named.** The
+        two it named were an fd-relative walk — `openat(…, O_NOFOLLOW|O_DIRECTORY)` per
+        component, then `fchown`/`fchmod` on the final fd, which `sh` cannot express and so means
+        moving the seeder to a different image and a different language, carrying path-resolution
+        logic we would then own — and serialising same-agent runs on the claim, which costs
+        exactly the concurrency PEN-4902 is retiring concurrency-1 to preserve. Both harden or
+        avoid the race *across* the privilege boundary. There is a third option that **removes
+        the boundary**, and it costs about two lines of manifest.
+
+        **Recommendation: chown the volume ROOT once as uid 0, then do everything else as uid
+        1000.** Split the seeder in two:
+
+        | phase | uid | capabilities | does |
+        |---|---|---|---|
+        | A | 0 | `drop: ALL`, `add: [CHOWN]` | `chown 1000:1000 /mnt/paperclip-data-seed` — one inode, nothing else |
+        | B | 1000 (`runAsNonRoot`) | `drop: ALL`, none added | the component guard + `mkdir -m 2775 -p`; **no `chown` at all** |
+
+        **Phase A has no TOCTOU to speak of, and that is structural rather than lucky.** Its one
+        argument is the mount point itself — kubelet's own mount of the volume root. There are no
+        path components *inside* the volume between the process and the inode, so there is
+        nothing for a concurrent writer to swap; and the mount root cannot be replaced from
+        inside the volume (no pod can `rmdir` a mount root, and the parent directory is the
+        container's own rootfs, which no other pod shares). `DAC_OVERRIDE` is not needed —
+        phase A writes nothing — so the uid-0 surface shrinks from two capabilities over a whole
+        skeleton to one capability over one inode.
+
+        **Phase B dissolves the invariant rather than mitigating it.** Once the root is
+        `1000:1000`, every directory the seeder creates it creates *as* 1000, so no `chown` is
+        needed and `mkdir -m 2775` works because the creator is the owner (invariant 3 falls out
+        for free). The concurrent writer this invariant is about is a uid-1000 agent container —
+        now exactly as privileged as the seeder. A symlink planted inside the window redirects
+        phase B into doing something the planter could already do directly, so it stops being a
+        privilege boundary and therefore stops being a vulnerability. ⚠️ The component guard
+        should be **kept and re-labelled**: it remains worth having against accidents and against
+        a future re-privileged phase, but the comment must stop describing it as a security
+        control, or the next reader will take the boundary to still exist.
+
+        **Why this is available now and was not when the seeder was written.** The seeder needs
+        uid 0 only to create directories the agent must *not* own — the read-only toolchain
+        binds, of which the PEN-3156 pre-push hook dir was the sharp case. Stage 3b-iii emptied
+        `ROOT_TOOLCHAIN_SUBPATHS` (`job-manifest.ts:718`, now `[]`) and moved the hooks into the
+        image, and `readOnlySubPaths` derives to `[]` on **both** branches where the seeder can
+        exist: with `narrowWritableSurface` true the sole `rootMounts` entry carries no `subPath`
+        (`:3389-3398`), and with it false the seeder is `null` outright. So
+        `seedSubPaths === writableSubPaths` — **every path the seeder touches is one that ends
+        up 1000-owned anyway.** The uid-0 phase has nothing left to protect except the single
+        `chown` that makes 1000-ownership possible in the first place. This is read from source,
+        not executed; the nearest standing test asserts the hooks path's *absence* from the
+        seeder script (`job-manifest.test.ts:5246-5257`) rather than pinning the set's emptiness,
+        and an implementing PR should add that converse assertion.
+
+        **It also ends strictly tighter than today.** Phase B is PSS-**restricted** compliant
+        (non-root, all capabilities dropped); the current seeder is the one container in the Pod
+        that is merely baseline, and `job-manifest.test.ts:5399-5402` pins it as the only uid-0
+        container in the Job. After the split, the uid-0 container does one `chown` and nothing
+        else.
+
+        ⚠️ **This is 4b-only, and shipping it early would be a widening.** Chowning the volume
+        root to `1000:1000` is right for a per-agent volume and **wrong for the shared one** —
+        there it would let any agent pod create and delete entries at the root of the volume
+        every agent shares. Phase A must therefore be gated on the claim being per-agent, and
+        that gate does not exist yet: it arrives with the `dataClaimName` swap. Sequence it
+        *with* the swap, never ahead of it.
+
+        **Not measured.** Whether a freshly provisioned CephFS subvolume root accepts the chown
+        from inside the pod mount (it should — the mount *is* the subvolume root, so this is an
+        ordinary `setattr` — but it is the same unmeasured surface invariant 3 records, and this
+        seat has no `create` on `pvc`/`job`/`pod` to settle it). If it does not, the fd-relative
+        walk is still there as the fallback, and `fchmod` belongs beside `fchown` in it since it
+        subsumes invariant 3's act too — no second path resolution.
 5. **Demonstrate and re-measure.** PEN-4932's acceptance criterion.
 
 ### 4.1 The blocker stage 4 has to clear
@@ -947,6 +1195,58 @@ would defeat this issue's own acceptance criterion.
 
 
 ## 5. Decisions taken, and what is still genuinely open
+
+**State of the four 4b invariants, 2026-10-30** (detail in §4):
+
+| invariant | state |
+|---|---|
+| 1 — populate/relocate the server-materialized trees (incl. the prompt bundle) | **closed** — #3153 / #3157 / #3158, last merged 20:19:43Z. Inert until the swap, by design. |
+| 2 — symlinked-PARENT hole in the seeder | **closed** — #3161, merged 19:51:15Z |
+| 3 — directory MODE | **decided, not implemented** — `mkdir -m 2775 -p` (a separate `chmod` is unexecutable: the seeder has no `CAP_FOWNER`); converges only targets the seeder creates; the CephFS fresh-subvolume question is explicitly unmeasured. Subsumed if invariant 4's recommended split lands: as uid 1000 the seeder owns what it creates, so the mode needs no privilege at all |
+| 4 — guard is check-then-act under concurrent same-agent runs | **open, remedy recommended** — split the seeder: uid 0 chowns the volume ROOT only (one inode, no TOCTOU), everything else runs as uid 1000, which removes the privilege boundary instead of hardening the race across it. Available only because stage 3b-iii left `readOnlySubPaths` empty. Must ship WITH the `dataClaimName` swap, never before it. `fsGroup`, the post-`mkdir` re-check, and run serialisation all ruled out |
+
+**PEN-4932's four done-when items, measured from inside a live agent pod 2026-10-30T21:4xZ**
+(`findmnt`, this run's own pod on `k8s-paperclip-3`):
+
+| done-when | state |
+|---|---|
+| 1 — two agent pods on one node report **distinct** volume IDs | **UNMET.** One handle fleet-wide: `csi-vol-3bdd0e68-1704-4f81-b3d8-55920cabf82c`, every bind in this pod off it. This is the `dataClaimName` swap. |
+| 2 — the fleet-wide tooling row is a separate read-only claim **or** baked into the image, with the choice recorded | **MET on `master`, NOT YET OBSERVABLE in the fleet.** Choice: **baked into the image**, reasoned in §3.3-§3.6. |
+| 3 — recurrence re-measured against the 3-wedges-in-30h baseline, caveats stated | not started, and **it cannot be done before 1** — the measurement is of the swap's effect. |
+| 4 — this §5 acceptance table updated to reflect 1 being met | blocked on 1, by construction. |
+
+**Done-when 2, measured rather than asserted.** Six of the issue's seven fleet-wide paths are now
+**absent outright** — `/paperclip/bin`, `/tools`, `/jre`, `/paperclip/.local/bin`,
+`/paperclip/.bun/bin`, `/paperclip/.cache/puppeteer-browsers` do not exist in the pod, and the
+binaries behind the PATH entries resolve into the image (`/usr/local/libexec/paperclip/bin/git`,
+`/usr/local/libexec/paperclip/bin/gh`, `/usr/local/bin/node`). `/paperclip` itself is no longer a
+bind host for the PVC root at all: it is the `root-overlay` **emptyDir**.
+
+⚠️ **The bind COUNT is per-pod, not a fleet figure** — it varies with the agent and the run, since
+the set includes that agent's home, prompt-cache, run-logs and company skills. The count below is
+**this pod** (agent `29033747`, `isolation-mode=workspace`, on `k8s-paperclip-3`): **12**, against
+the ~18 this issue recorded on 2026-10-28. Review independently measured **8** in a different
+agent's pod on the same deployed commit, with the same single handle and the same `ro` git-hooks
+bind — so a future re-measure finding a different number is reading a different pod, not a
+regression or a gain. The invariant to re-measure is the **set** (which paths are bound, off how
+many handles), never the count.
+
+⚠️ **The seventh is still there, and the reason is deploy skew, not a second code path.**
+`/paperclip/.local/share/paperclip-git-hooks` is still mounted, `ro`, off the shared handle. That
+is exactly the `ROOT_TOOLCHAIN_SUBPATHS` shape, and `master` has that list empty — because the
+running server predates the change. The StatefulSet's `deployed-commit` annotation reads
+`86bfe2a2` (2026-10-30 06:46:35Z); #3139 landed as `56710069` (08:50:27Z, merged 09:07:31Z), and
+`git merge-base --is-ancestor` confirms the deployed commit is an ancestor. **So this bind drops
+out on the next server roll, with no further code change** — 12 → 11 in *this* pod, and one fewer
+in any pod. Do not read the live mount as evidence
+that #3139 did not land, and do not re-open the item on the strength of it; equally, do not record
+done-when 2 as delivered end-to-end until a post-roll pod is re-measured.
+
+⚠️ **The acceptance criterion is UNMET and none of the above moves it.** Done-when 1 — *two agent
+pods on one node reporting distinct volume IDs* — is the `dataClaimName` swap itself, which is
+still downstream of invariants 3 and 4. Every agent pod continues to mount `paperclip-data`, so
+ceph-csi lock exposure is unchanged from the day this issue opened. The work so far is
+prerequisite removal, and should not be read as partial delivery of the criterion.
 
 Both questions this document originally raised are **resolved**, and neither needed a preference
 call in the end — each turned out to have a measurable answer:
