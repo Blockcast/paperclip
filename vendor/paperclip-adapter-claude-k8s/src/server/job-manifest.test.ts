@@ -30,6 +30,7 @@ import {
   TOOL_RLIMIT_ZDOTDIR,
   ZSH_DOTFILES,
   resolveScopedWritableMounts,
+  resolveSeedShape,
 } from "./job-manifest.js";
 import type { JobIsolation } from "./job-manifest.js";
 import {
@@ -5687,6 +5688,54 @@ describe("scoped writable mounts (BLO-32734)", () => {
         );
         expect(root.map((c) => c.name)).toEqual(["own-volume-root"]);
         expect(spec?.securityContext?.runAsNonRoot).toBe(true);
+      });
+
+      // The split shape is safe only while `ROOT_TOOLCHAIN_SUBPATHS` is empty,
+      // so `readOnlySubPaths` derives to `[]`. That has been prose since the
+      // shape was written; these pin it as a build-time refusal instead.
+      //
+      // `resolveSeedShape` is called directly rather than through
+      // `buildJobManifest` BECAUSE the list is empty: no manifest built from
+      // real inputs can reach the refusal, which is exactly why it needed a
+      // test that does not depend on real inputs.
+      describe("resolveSeedShape", () => {
+        const split = {
+          narrowWritableSurface: true,
+          serverCanPreCreate: false,
+          seedSubPathCount: 3,
+          readOnlySubPaths: [] as readonly string[],
+        };
+
+        it("refuses the split shape when a read-only subPath is declared", () => {
+          // Without this, the uid-1000 container would `mkdir -m 2775` the
+          // read-only bind and hand it, group writable, to the agent uid it
+          // exists to be read-only for — and the Job would start normally.
+          expect(() => resolveSeedShape({ ...split, readOnlySubPaths: ["bin"] })).toThrow(/refusing to seed/);
+          expect(() => resolveSeedShape({ ...split, readOnlySubPaths: ["bin"] })).toThrow(/bin/);
+        });
+
+        it("does not downgrade to the server's shape, which would corrupt the claim", () => {
+          // Falling back looks like the safe option and is not: shape 1 leaves
+          // root-owned intermediates a uid-1000 `mkdir` can never create inside
+          // afterwards, so a silent downgrade would break every later run on
+          // that claim. Fail at build time instead.
+          expect(() => resolveSeedShape({ ...split, readOnlySubPaths: ["bin", "tools"] })).toThrow();
+        });
+
+        it("leaves the three reachable shapes alone", () => {
+          expect(resolveSeedShape(split)).toBe("split");
+          expect(resolveSeedShape({ ...split, serverCanPreCreate: true })).toBe("self-claim");
+          // Shape 1 creates read-only targets as uid 0 and chowns only the
+          // writable ones, so they stay root-owned — no contradiction to catch.
+          expect(resolveSeedShape({ ...split, serverCanPreCreate: true, readOnlySubPaths: ["bin"] })).toBe(
+            "self-claim",
+          );
+          expect(resolveSeedShape({ ...split, seedSubPathCount: 0 })).toBe("none");
+          expect(resolveSeedShape({ ...split, narrowWritableSurface: false })).toBe("none");
+          // `none` wins over the refusal: with nothing to seed there is no
+          // container to run, so there is no boundary to invert.
+          expect(resolveSeedShape({ ...split, seedSubPathCount: 0, readOnlySubPaths: ["bin"] })).toBe("none");
+        });
       });
     });
   });
