@@ -778,6 +778,23 @@ not cover). Without that, every run would pay a second full content read of the 
 Job-creation critical path — on the very CephFS mount whose stalls are this issue's subject —
 purely to produce a log line. Only the measurement is retained, never the projected bytes.
 
+**The two log shapes, for whoever writes the first query against them.** Both events are new in
+this change and nothing consumes them yet, so there is no migration to do — but they are
+deliberately not one shape, and a query that assumes otherwise will miss exactly the rows that
+matter:
+
+| event | fields |
+|---|---|
+| `claude_k8s.prompt_bundle_projection_sized` | `totalValueBytes`, `fileCount`, `binaryFileCount`, `skippedSymlinkCount`, `skippedNonRegularCount`, `maxBytes`, `escalationThresholdCrossed`, `bytesBySkillKey`, `sizingCacheHit` |
+| `claude_k8s.prompt_bundle_projection_failed`, **refusal** | `errorName`, `refusal` (`{kind: "over_budget", totalValueBytes, maxBytes, fileCount, bytesBySkillKey}` or `{kind: "too_many_files", skillKey, limit}`), `sizingCacheHit` |
+| `claude_k8s.prompt_bundle_projection_failed`, **transient fault** | `errorName`, `error` (message string), `sizingCacheHit: false` |
+
+Both `failed` shapes carry `companyId` and `runId` for the run **emitting** the line. The refusal
+carries structured fields rather than a message precisely because it is cached and replayed: the
+error's own message names the run that first hit it, so emitting that on a later run would put one
+run's id beside another's in the same line. A dashboard counting refusals should key on
+`refusal.kind`, not on `error`.
+
 The over-budget and too-many-files **refusals are cached under the same key** as a success. They
 are deterministic for a given key (which covers the content hash, the sources, the mount and the
 catalog set, against constant thresholds), and caching only successes would leave exactly the
