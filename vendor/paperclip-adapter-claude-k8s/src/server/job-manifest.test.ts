@@ -5134,7 +5134,7 @@ describe("scoped writable mounts (BLO-32734)", () => {
   // derived WRONG. An operator-set `promptCacheRoot` off the data volume has no
   // volume-relative address at all; emitting a slice of a non-matching prefix
   // would put a confident wrong path in the one field stage 4b reads. Omission
-  // is the honest answer, and the other two entries must survive it.
+  // is the honest answer, and the other entry must survive it.
   it("omits the bundle root from the foreign-claim warning when it is off-volume", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
@@ -5157,7 +5157,37 @@ describe("scoped writable mounts (BLO-32734)", () => {
     }
   });
 
-  it("stays silent on the server's own claim, where all three trees are already populated", () => {
+  // `config.promptCacheRoot` is the only input to this field that does not pass
+  // through `assertNormalizedPath`, so a non-canonical operator value is the one
+  // way a `..` or a trailing slash can reach the list. A subPath carrying either
+  // is one Kubernetes would reject, so the field must not emit one.
+  it("canonicalises a non-normalized promptCacheRoot before slicing the subPath", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const ctx = isolatedCtx();
+      ctx.config.workspaceVolumeClaim = "some-other-claim";
+      ctx.config.promptCacheRoot = "/paperclip/instances/default/data/a/../prompt-cache/";
+      buildJobManifest({ ctx, selfPod: makeSelfPod({ pvcClaimName: "paperclip-data" }) });
+      const entries = warn.mock.calls
+        .map(([line]) => (typeof line === "string" && line.startsWith("{") ? JSON.parse(line) : null))
+        .filter((entry) => entry?.event === "claude_k8s.data_claim_foreign");
+      expect(entries).toHaveLength(1);
+      const subPaths: string[] = entries[0]?.unpopulatedSubPaths ?? [];
+      expect(subPaths).toEqual([
+        "instances/default/skills/co1",
+        "instances/default/data/prompt-cache",
+      ]);
+      // Neither a traversal segment nor a trailing slash may survive into a subPath.
+      for (const subPath of subPaths) {
+        expect(subPath).not.toContain("..");
+        expect(subPath.endsWith("/")).toBe(false);
+      }
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("stays silent on the server's own claim, where both trees are already populated", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
       buildJobManifest({ ctx: isolatedCtx(), selfPod: makeSelfPod() });
