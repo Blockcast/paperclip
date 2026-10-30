@@ -4683,7 +4683,7 @@ describe("scoped writable mounts (BLO-32734)", () => {
   // `.cache/puppeteer-browsers`, and `.local/bin/bunx` into `.bun/bin` — a
   // regression that re-added one target without its `bin` entry would leave a
   // dangling symlink, and this test should fail on the unit, not on one path.
-  it("hides the PVC root behind the root overlay except the read-only git hooks", () => {
+  it("hides the PVC root behind the root overlay, with nothing re-exposed read-only", () => {
     const { job } = buildJobManifest({ ctx: isolatedCtx(), selfPod: makeSelfPod() });
     const spec = job.spec?.template?.spec;
     expect(spec?.volumes?.find((v) => v.name === "root-overlay")?.emptyDir).toBeTruthy();
@@ -4711,13 +4711,15 @@ describe("scoped writable mounts (BLO-32734)", () => {
       for (const target of [...credentialsAndForeignWork, ...droppedBinUnit, ...droppedLocalBinUnit]) {
         expect(deepestMount(mounts, target)?.name, target).toBe("root-overlay");
       }
-      // The PEN-3156 publish guard is the one survivor, and must stay a
-      // read-only bind off the shared volume until it is baked into the image
-      // (§3.6). A rw bind would let uid 1000 rewrite the hook the credential
-      // holder executes; no bind at all fails OPEN, pushing unscanned.
-      const hook = deepestMount(mounts, "/paperclip/.local/share/paperclip-git-hooks/pre-push");
-      expect(hook?.name).toBe("data");
-      expect(hook?.readOnly).toBe(true);
+      // Stage 3b-iii: the PEN-3156 publish guard was the last survivor and is
+      // now image-resident too, so NOTHING reaches the pod off the shared
+      // volume here. Pinned positively rather than deleted — a bind reappearing
+      // under the overlay is exactly the regression this file exists to catch,
+      // and the egress runtime no longer looks at this path, so a re-added bind
+      // would be dead weight on the shared handle rather than a working guard.
+      expect(deepestMount(mounts, "/paperclip/.local/share/paperclip-git-hooks/pre-push")?.name).toBe(
+        "root-overlay",
+      );
     }
   });
 
@@ -5082,8 +5084,9 @@ describe("scoped writable mounts (BLO-32734)", () => {
   // PEN-4932 stage 4a. The seeder makes a foreign claim START, which is the
   // point — but it cannot POPULATE the two trees only the server materializes,
   // and only ever into the server's own volume. Both then fail far from the
-  // cause: empty git-hooks fails every push closed (BLO-48361), empty
-  // `skills/<company>` dangles the prompt bundle's skill links silently.
+  // cause: an empty `skills/<company>` dangles the prompt bundle's skill links
+  // silently. The git-hooks dir is NOT named any more — stage 3b-iii stopped
+  // mounting it on every claim, so it is not a tree 4b has to populate.
   it("names the unpopulated trees when the Job's claim is not the server's own", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
@@ -5100,10 +5103,11 @@ describe("scoped writable mounts (BLO-32734)", () => {
         selfPvcClaimName: "paperclip-data",
         jobName: job.metadata?.name,
       });
-      // Named explicitly rather than described in prose: these are the paths
-      // stage 4b has to materialize or relocate.
-      expect(entries[0]?.unpopulatedSubPaths).toContain(".local/share/paperclip-git-hooks");
-      expect(entries[0]?.unpopulatedSubPaths).toContain("instances/default/skills/co1");
+      // Named explicitly rather than described in prose: this is the path stage
+      // 4b has to materialize or relocate. Asserted as the EXACT list, not with
+      // `toContain`: the git-hooks entry leaving is the point of stage 3b-iii,
+      // and a containment check would not notice it coming back.
+      expect(entries[0]?.unpopulatedSubPaths).toEqual(["instances/default/skills/co1"]);
     } finally {
       warn.mockRestore();
     }
@@ -5165,15 +5169,17 @@ describe("scoped writable mounts (BLO-32734)", () => {
         expect(mkdirPart).toContain(`'/mnt/paperclip-data-seed/${m.subPath}'`);
         expect(chownPart).toContain(`'/mnt/paperclip-data-seed/${m.subPath}'`);
       }
-      // The read-only git-hooks bind is created but NOT chowned: nothing writes
-      // it, and uid 1000 being unable to rewrite the pre-push hook is the
+      // Stage 3b-iii emptied `ROOT_TOOLCHAIN_SUBPATHS`, so there is no read-only
+      // root bind left for the seeder to pre-create. Asserted as absence rather
+      // than dropped: the seeder runs as uid 0 with CHOWN over the volume root,
+      // so a read-only bind silently reappearing in its chown set is the shape
+      // worth catching — uid 1000 able to rewrite the pre-push hook is the
       // PEN-3156 boundary the broker depends on.
       const hooks = (spec?.containers[0]?.volumeMounts ?? []).find(
         (m) => m.name === "data" && m.readOnly && m.subPath?.includes("paperclip-git-hooks"),
       );
-      expect(hooks).toBeDefined();
-      expect(mkdirPart).toContain(`'/mnt/paperclip-data-seed/${hooks!.subPath}'`);
-      expect(chownPart).not.toContain(`'/mnt/paperclip-data-seed/${hooks!.subPath}'`);
+      expect(hooks).toBeUndefined();
+      expect(script).not.toContain("paperclip-git-hooks");
     });
 
     it("refuses a target that is already a symlink, before anything follows it", () => {

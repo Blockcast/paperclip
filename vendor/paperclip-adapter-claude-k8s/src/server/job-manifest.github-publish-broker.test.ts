@@ -195,17 +195,26 @@ describe("GitHub publish broker boundary (PEN-4933 / PEN-3183 D1)", () => {
     expect(mountPaths(brokerContainer(spec))).toContain("/tmp");
   });
 
-  it("mounts the pre-push hook the broker executes read-only", () => {
+  it("binds the broker no hook off the shared volume — the one it runs is baked", () => {
     // The broker runs the PEN-3156 hook with the push credential in its
     // environment. If the agent can rewrite that file, the boundary buys
-    // nothing: uid 1000 chooses the code uid 1001 runs with the token. Pinned
-    // on the BROKER's mount list, because that is the one that decides it.
+    // nothing: uid 1000 chooses the code uid 1001 runs with the token.
+    //
+    // That boundary is unchanged; what changed is where it comes from. Until
+    // PEN-4932 stage 3b-iii the hook arrived as a read-only `subPath` bind off
+    // `paperclip-data`, and this test pinned the bind. It is now image-resident
+    // at `BAKED_HOOKS_DIR`, `root:root 0755`, so the agent uid cannot rewrite it
+    // by ownership — which holds in the broad-mount fallback too, where a
+    // read-only bind never existed.
+    //
+    // Pinned as absence on the BROKER's own mount list, because that is the one
+    // that decides it: a bind reappearing here would put the hook the credential
+    // holder executes back on a volume thirteen other subPaths write to, for no
+    // gain, since the runtime resolves `BAKED_HOOKS_DIR` and would not read it.
     const broker = brokerContainer(render(true));
-    const hooks = (broker?.volumeMounts ?? []).find((m) =>
-      m.mountPath.endsWith(".local/share/paperclip-git-hooks"),
-    );
-    expect(hooks).toBeDefined();
-    expect(hooks?.readOnly).toBe(true);
+    expect(
+      (broker?.volumeMounts ?? []).find((m) => m.mountPath.endsWith(".local/share/paperclip-git-hooks")),
+    ).toBeUndefined();
   });
 
   it("keeps the broker's own scratch out of the agent's mount namespace", () => {
