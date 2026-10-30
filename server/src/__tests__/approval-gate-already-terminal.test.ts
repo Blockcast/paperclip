@@ -297,15 +297,22 @@ describe("a card may not be filed against an already-finished gate (PEN-5103)", 
     expect(mockGetWorkflowRun).not.toHaveBeenCalled();
   });
 
-  it("ignores a malformed gate rather than refusing the card", async () => {
-    // `parseApprovalGate` is total by contract: a malformed gate is indistinguishable
-    // from no gate. Neither is reconcilable, so neither is this guard's business.
+  it("leaves a malformed gate to schema validation, and still never calls GitHub", async () => {
+    // `createApprovalSchema` validates `payload.gate` at the HTTP layer, so a
+    // malformed gate is a 400 before this guard is reached. Pinned because the guard
+    // reads as though it handles the case — `parseApprovalGate` is total and returns
+    // null on junk — and that path is in fact unreachable from this route. The part
+    // that matters either way is the second assertion: a gate the server cannot even
+    // parse must not cost a GitHub round trip.
     const res = await postApproval(await createAgentApp(), {
       type: "request_board_approval",
       payload: { title: "Card with a junk gate", gate: { kind: "something_else", runId: "not-a-number" } },
     });
 
-    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(res.status, JSON.stringify(res.body)).toBe(400);
+    expect(res.body.details.map((d: { path: string[] }) => d.path.join("."))).toEqual(
+      expect.arrayContaining(["payload.gate.kind", "payload.gate.repoFullName", "payload.gate.runId"]),
+    );
     expect(mockGetWorkflowRun).not.toHaveBeenCalled();
   });
 
