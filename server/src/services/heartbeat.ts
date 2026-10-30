@@ -19294,6 +19294,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         monitorNextCheckAt: issues.monitorNextCheckAt,
         projectId: issues.projectId,
         checkoutRestoreStatus: issues.checkoutRestoreStatus,
+        // PEN-2918: `decideSuccessfulRunHandoff` reads `originKind` to skip
+        // alert rows, whose next action belongs to the escalation ladder. This
+        // is a hand-enumerated projection, so dropping a column here disables
+        // the guard IN PRODUCTION ONLY -- the unit tests build the issue row
+        // themselves and would all still pass. `IssueRow` declares this field
+        // required for exactly that reason; the compiler is the backstop.
+        originKind: issues.originKind,
       })
       .from(issues)
       .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))

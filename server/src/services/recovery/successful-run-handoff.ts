@@ -44,9 +44,15 @@ export function isIdempotentFinishSuccessfulRunHandoffWakeStatus(status: string)
 }
 
 type HeartbeatRunRow = typeof heartbeatRuns.$inferSelect;
-type IssueRow = Pick<
+// `originKind` is REQUIRED, not `Partial`, and that is the whole point: the
+// PEN-2918 alert-row guard below reads it, and the only production caller
+// projects this row by hand. Declaring it optional would let that projection
+// omit the column, `originKind` would read `undefined`, the guard would
+// silently never fire, and every test in this file would still pass. Required
+// makes the compiler refuse the omission instead.
+export type IssueRow = Pick<
   typeof issues.$inferSelect,
-  "id" | "companyId" | "identifier" | "title" | "status" | "workMode" | "assigneeAgentId" | "assigneeUserId" | "executionState"
+  "id" | "companyId" | "identifier" | "title" | "status" | "workMode" | "assigneeAgentId" | "assigneeUserId" | "executionState" | "originKind"
 > & Partial<Pick<typeof issues.$inferSelect, "checkoutRestoreStatus">>;
 type AgentRow = Pick<typeof agents.$inferSelect, "id" | "companyId" | "status">;
 type NoticeIssue = Pick<typeof issues.$inferSelect, "id" | "identifier" | "title" | "status">;
