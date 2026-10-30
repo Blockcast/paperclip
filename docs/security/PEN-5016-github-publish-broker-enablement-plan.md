@@ -82,14 +82,15 @@ one. The gate's readiness in the fleet is unchanged since revision 1: no gate is
 
 ## 2. What the gate actually does
 
-Read at `vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts:2624`,
-`asBoolean(config.enableGitHubPublishBroker, false)`:
+Read at `vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts:2871`,
+`asBoolean(config.enableGitHubPublishBroker, false)`. All `:NNN` anchors in this section are in that
+file and were measured at `86bfe2a2b`:
 
 | | Gate off (today) | Gate on |
 |---|---|---|
-| GitHub Secret | mounted into the agent container | mounted into the `github-publish-broker` sidecar only (`:3086` drops it from the agent) |
+| GitHub Secret | mounted into the agent container | mounted into the `github-publish-broker` sidecar only (`:3388` drops it from the agent) |
 | Agent publish path | `git`/`gh`/MCP authenticate locally | agent asks the broker over a unix socket; `PAPERCLIP_GITHUB_BROKER_SOCKET` is set |
-| Broad data mount | renders, annotated `broad:<reason>` | **`buildJobManifest` throws** (`:3580`) — fail closed, not degrade |
+| Broad data mount | renders, annotated `broad:<reason>` | **`buildJobManifest` throws** (`:3927-3929`) — fail closed, not degrade |
 | Pod shape | one container | `+1` native sidecar (initContainer, `restartPolicy: Always`), uid 1001, gid 1000, same image |
 
 Two properties make staging possible, and both were verified in the source rather than assumed:
@@ -703,10 +704,12 @@ precondition as outstanding, which is the *conservative* direction but still wro
 | [#3120](https://github.com/Blockcast/paperclip/pull/3120) | §5 assertion recorded as satisfied | on `master` (`978ba0f6d`) | ✅ |
 | [#3123](https://github.com/Blockcast/paperclip/pull/3123) | PEN-5026 privilege-beside-broker refusal | **merged 2026-10-30T00:19:07Z**, content on `master` (`87db03fcc`, `7c53b431c`) | ✅ **new since revision 3** |
 | [#3098](https://github.com/Blockcast/paperclip/pull/3098) | §8 measurement, trigger-4 count 28 | **merged 2026-10-30T03:32:58Z**, content on `master` (`0fa107202`) | ✅ **landed in the same merge group as this section** |
-| [#3112](https://github.com/Blockcast/paperclip/pull/3112) | PEN-5017 provenance gate **+ the sole copy of the PEN-5027 `workspaceVolumeClaim` pin** (`7cea4d40b`) | **OPEN and `DIRTY`** — see §11.2 | ❌ |
+| [#3112](https://github.com/Blockcast/paperclip/pull/3112) | PEN-5017 provenance gate (`7cea4d40b`) — ⚠ **no longer the sole copy** of the PEN-5027 `workspaceVolumeClaim` pin, see §11.2 | **OPEN and `DIRTY`** — see §11.2 | ❌ |
 
-**Five of six discharged; one outstanding.** #3112 needs a **conflict resolution pushed by Security**
-and is the one carrying an unrecoverable hazard.
+**Five of six discharged; one outstanding.** #3112 needs a **conflict resolution pushed by Security**.
+⚠ It is **no longer** the one carrying an unrecoverable hazard — [#3133](https://github.com/Blockcast/paperclip/pull/3133)
+discharged that on `2026-10-30T04:26:24Z` (§11.2). It remains a stage-1 precondition in its own
+right, as the sole carrier of the PEN-5017 provenance gate.
 
 ⭐ **The #3098 row was falsified by the merge batch that published this section, and that is worth
 understanding rather than just reading past.** #3098 and #3132 — the PR that added §11 — merged in the
@@ -716,29 +719,58 @@ reviewable it was true, and it became false at the instant it landed. A ledger o
 open PRs cannot be verified once, at authoring time — which is exactly why §11.6 check 2 re-reads it
 mechanically at the gate instead of citing this table.
 
-### 11.2 ⛔ The carry-forward hazard is now LIVE — #3112 is `DIRTY` and is the only carrier of the pin
+### 11.2 The carry-forward hazard fired, and has since been DISCHARGED — but #3112 is still `DIRTY` and must still merge
 
-The hazard §1 warned about has fired. #3123 merged, carrying cherry-picks of #3112's **first four**
-commits but not its fifth. Measured on `master` this morning:
+The hazard §1 warned about fired — and has since been discharged, by a **different** PR. #3123
+merged, carrying cherry-picks of #3112's **first four** commits but not its fifth, which left the
+PEN-5027 `workspaceVolumeClaim` pin alive on exactly one `DIRTY` branch.
+[#3133](https://github.com/Blockcast/paperclip/pull/3133) then landed an equivalent pin **directly on
+`master`** at `2026-10-30T04:26:24Z` (`16fbb8ae`, PEN-5027). Re-measured on `master` (`86bfe2a2b`)
+2026-10-30T07:1xZ:
 
 ```
-BROKERED_POD_COMPOSITION_CONFIG_KEYS  (server/src/services/heartbeat.ts:2871)
-  on master      → { enableDocker, dockerImage }                         ← TWO
+BROKERED_POD_COMPOSITION_CONFIG_KEYS  (server/src/services/heartbeat.ts:2911)
+  on master      → { enableDocker, dockerImage, workspaceVolumeClaim }   ← THREE
   on #3112 head  → { enableDocker, dockerImage, workspaceVolumeClaim }   ← THREE
 ```
 
-**Two keys on `master` is the predicted signature of the pin having been dropped.** It has *not* been
-dropped — it is alive on `7cea4d40b` — but it now exists on exactly one branch, and that branch is
-`DIRTY`. **#3112 must be merged, never closed.** Four of its five commits are already on `master`,
-which is precisely what will make it look redundant to the next person who reads it.
+**The two-key signature of a dropped pin is gone — `master` carries all three.** Closing #3112 would
+no longer lose the pin.
+
+⚠ **#3112 must still be merged, and must still never be closed — the reason changed, the instruction
+did not.** It remains the sole carrier of the **PEN-5017 provenance gate**, which is a stage-1
+precondition in its own right (§11.1) and is *not* what #3133 landed. Four of its five commits are
+now on `master` and the fifth is duplicated there, which is precisely what will make it look
+redundant to the next person who reads it. It is not.
+
+⭐ **This section was falsified 2 h 43 m before it was published, and unlike the #3098 row in §11.1
+that was catchable — which is the more useful lesson of the two.** #3133 merged at `04:26:24Z`; the
+PR carrying this text was enqueued at `06:46:33Z` and merged at `07:09:09Z`. The "two keys on
+`master`" measurement was correct when taken, and was then *pinned as an invariant not to be
+touched* while the surrounding text was corrected — so it was never re-measured. **A fact pinned as
+"do not change" is still a fact with an expiry: invariants need re-measuring immediately before
+enqueue exactly as much as the edits do.** §11.6 check 1 exists so that this is re-read mechanically
+at the gate rather than cited from here.
 
 **The rebase is still safe, re-measured 2026-10-30 against the current `master` (not carried over
-from the 2026-10-29 measurement, which predates #3123 landing):** the four shared commits come back
-`skipped previously applied`, `server/src/services/heartbeat.ts` **auto-merges with all three keys
-intact**, and exactly **one** prose hunk conflicts, in
-`docs/security/PEN-3183-git-egress-enforcement-boundary-decision.md`.
+from the 2026-10-29 and pre-#3133 measurements, both of which are now superseded):** the four shared
+commits still come back `skipped previously applied`, and the
+`BROKERED_POD_COMPOSITION_CONFIG_KEYS` set itself still **auto-merges with all three keys intact**.
 
-⚠ **That one conflict changed character when #3123 landed, and this is the part worth reading before
+⚠ **But there are now TWO conflicts, not one — #3133 added a second.** Re-run 2026-10-30T07:2xZ
+against `86bfe2a2b`:
+
+1. `docs/security/PEN-3183-git-egress-enforcement-boundary-decision.md` — the prose hunk described
+   below. **Resolve as a union** (unchanged).
+2. `server/src/services/heartbeat.ts` — **new.** Not the key set, which merges cleanly: a single
+   **comment block** above it, which #3133 rewrote on `master` while #3112 still carries the
+   earlier wording. **Resolve by taking `master`/HEAD.** Its text covers *both* pinned keys and adds
+   the §7.6 rationale for `enableDocker` (*"agent scope buys back NOTHING"*) that the branch side
+   predates and does not contain; the branch side says strictly less. This is the one place in the
+   rebase where taking a side is correct rather than dangerous, and it is safe **only** because the
+   code beneath it is identical on both sides — confirm that before taking it.
+
+⚠ **Conflict 1 changed character when #3123 landed, and this is the part worth reading before
 resolving it.** It is no longer a side-pick. On 2026-10-29 the branch side was simply newer. Now
 **each side carries something the other lacks**:
 
@@ -833,16 +865,18 @@ it matter less. Recorded here so that discharging §7.1 is not read as closing i
 Run these in order immediately before starting stage 1. Each is a command, not a judgement, and each
 has a stated failing value, so "I checked" is falsifiable.
 
-| # | Check | Pass | Measured 2026-10-30 |
+| # | Check | Pass | Measured 2026-10-30T07:1xZ |
 |---|---|---|---|
-| 1 | `BROKERED_POD_COMPOSITION_CONFIG_KEYS` on `master` | **three** keys incl. `workspaceVolumeClaim` | ⛔ **two — FAILS** (§11.2) |
+| 1 | `BROKERED_POD_COMPOSITION_CONFIG_KEYS` on `master` | **three** keys incl. `workspaceVolumeClaim` | ✅ **three — passes** since #3133 (§11.2) |
 | 2 | §11.1 ledger | six of six on `master` | ⛔ **five of six — FAILS** |
 | 3 | §4 trigger-2 query, re-read over a window overlapping stage 0 | zero broad renders, with the liveness control | ✅ **pass** (§11.7) |
 | 4 | §3.5a privilege pre-flight across the stage-1 population | no privileged container beside the broker | ✅ **pass** (§11.7) |
 
-⛔ **Two of the four fail today. Stage 1 cannot start today, and that is the point of setting the
-date as a condition rather than as 2026-11-06.** Checks 3 and 4 are the perishable ones — re-run them
-at every widening, never cite this row.
+⛔ **One of the four fails today — check 2. Stage 1 cannot start today, and that is the point of
+setting the date as a condition rather than as 2026-11-06.** ⚠ **Every row here is perishable, and
+check 1 is the proof.** It read `⛔ two — FAILS` when this section was written and was a pass before
+the section reached `master` (§11.2). Re-run all four at the gate and at every widening; never cite
+this row.
 
 ### 11.7 The §4 pre-flight, actually run (2026-10-30T01:0xZ)
 
