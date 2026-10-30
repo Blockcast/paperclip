@@ -1205,6 +1205,34 @@ would defeat this issue's own acceptance criterion.
 | 3 — directory MODE | **decided, not implemented** — `mkdir -m 2775 -p` (a separate `chmod` is unexecutable: the seeder has no `CAP_FOWNER`); converges only targets the seeder creates; the CephFS fresh-subvolume question is explicitly unmeasured. Subsumed if invariant 4's recommended split lands: as uid 1000 the seeder owns what it creates, so the mode needs no privilege at all |
 | 4 — guard is check-then-act under concurrent same-agent runs | **open, remedy recommended** — split the seeder: uid 0 chowns the volume ROOT only (one inode, no TOCTOU), everything else runs as uid 1000, which removes the privilege boundary instead of hardening the race across it. Available only because stage 3b-iii left `readOnlySubPaths` empty. Must ship WITH the `dataClaimName` swap, never before it. `fsGroup`, the post-`mkdir` re-check, and run serialisation all ruled out |
 
+**PEN-4932's four done-when items, measured from inside a live agent pod 2026-10-30T21:4xZ**
+(`findmnt`, this run's own pod on `k8s-paperclip-3`):
+
+| done-when | state |
+|---|---|
+| 1 — two agent pods on one node report **distinct** volume IDs | **UNMET.** One handle fleet-wide: `csi-vol-3bdd0e68-1704-4f81-b3d8-55920cabf82c`, every bind in this pod off it. This is the `dataClaimName` swap. |
+| 2 — the fleet-wide tooling row is a separate read-only claim **or** baked into the image, with the choice recorded | **MET on `master`, NOT YET OBSERVABLE in the fleet.** Choice: **baked into the image**, reasoned in §3.3-§3.6. |
+| 3 — recurrence re-measured against the 3-wedges-in-30h baseline, caveats stated | not started, and **it cannot be done before 1** — the measurement is of the swap's effect. |
+| 4 — this §5 acceptance table updated to reflect 1 being met | blocked on 1, by construction. |
+
+**Done-when 2, measured rather than asserted.** Six of the issue's seven fleet-wide paths are now
+**absent outright** — `/paperclip/bin`, `/tools`, `/jre`, `/paperclip/.local/bin`,
+`/paperclip/.bun/bin`, `/paperclip/.cache/puppeteer-browsers` do not exist in the pod, and the
+binaries behind the PATH entries resolve into the image (`/usr/local/libexec/paperclip/bin/git`,
+`/usr/local/libexec/paperclip/bin/gh`, `/usr/local/bin/node`). `/paperclip` itself is no longer a
+bind host for the PVC root at all: it is the `root-overlay` **emptyDir**. Total CephFS binds in
+the pod: **12**, against the ~18 this issue recorded on 2026-10-28.
+
+⚠️ **The seventh is still there, and the reason is deploy skew, not a second code path.**
+`/paperclip/.local/share/paperclip-git-hooks` is still mounted, `ro`, off the shared handle. That
+is exactly the `ROOT_TOOLCHAIN_SUBPATHS` shape, and `master` has that list empty — because the
+running server predates the change. The StatefulSet's `deployed-commit` annotation reads
+`86bfe2a2` (2026-10-30 06:46:35Z); #3139 landed as `56710069` (08:50:27Z, merged 09:07:31Z), and
+`git merge-base --is-ancestor` confirms the deployed commit is an ancestor. **So the count becomes
+11 on the next server roll, with no further code change.** Do not read the live mount as evidence
+that #3139 did not land, and do not re-open the item on the strength of it; equally, do not record
+done-when 2 as delivered end-to-end until a post-roll pod is re-measured.
+
 ⚠️ **The acceptance criterion is UNMET and none of the above moves it.** Done-when 1 — *two agent
 pods on one node reporting distinct volume IDs* — is the `dataClaimName` swap itself, which is
 still downstream of invariants 3 and 4. Every agent pod continues to mount `paperclip-data`, so
