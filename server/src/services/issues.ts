@@ -3985,8 +3985,9 @@ async function listIssueBlockerAttentionMap(
       // PEN-5105: THE arm. Any human assignee on any non-cancelled status covers
       // immediately and unconditionally -- ahead of the `in_review` arm, the downstream
       // recursion and the leaf invokability check -- with no staleness term and no upper
-      // bound on how long it holds. Measured as the sole generator of false `covered` on a
-      // complete n=50 `blocked` sweep (6 of 6, no residue; idle 14h-230h).
+      // bound on how long it holds. PEN-5021 and PEN-5105 carry the sweeps that attribute
+      // the false-`covered` population to this arm; the figures live there, deliberately
+      // not here, because a snapshot inlined in source goes stale silently.
       //
       // The verdict below is DELIBERATELY UNCHANGED. Adding the conjunct here un-covers
       // every human-assigned blocker company-wide in one step, which is the flood shape the
