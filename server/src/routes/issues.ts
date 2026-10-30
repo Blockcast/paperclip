@@ -592,9 +592,13 @@ function scheduleDuplicateCandidateShownActivity(input: {
       undefined,
       "issue duplicate candidate consumption event",
     ).then(
-      // Two-arg then, not .then().catch(): a .catch() chained after a success
-      // handler would also swallow -- and miscount as a lookup failure -- a
-      // throw from the recording call itself.
+      // Two-arg then, not .then().catch(): a .catch() chained after a LONE
+      // success handler would also swallow -- and miscount as a lookup failure
+      // -- the lookup's own rejection. The trailing .catch() below is a
+      // different thing and is safe; see its comment.
+      //
+      // Same equal-budget ordering as the corpus scan above, so a `57014` from
+      // this stage also records `deadline_exceeded`.
       () => recordIssueDuplicateCandidateLookup("consumption_event", "ok"),
       (err: unknown) => {
         recordIssueDuplicateCandidateLookup(
@@ -606,7 +610,15 @@ function scheduleDuplicateCandidateShownActivity(input: {
           "issue duplicate candidate consumption event failed; continuing successful create",
         );
       },
-    );
+    ).catch((err: unknown) => {
+      // Safe to chain HERE, unlike after a lone success handler, precisely
+      // because the two-arg `then` above already consumed the lookup's own
+      // rejection: this can only ever see a throw from one of those two
+      // handlers. Without it such a throw -- realistically a counter `inc()`,
+      // so theoretical, but this promise is fire-and-forget -- would surface as
+      // an unhandled rejection rather than a miscount.
+      logger.warn({ err }, "issue duplicate candidate consumption event bookkeeping failed");
+    });
   });
 }
 
@@ -11963,6 +11975,18 @@ export function issueRoutes(
       const lookupAbortController = new AbortController();
       const lookupTimeoutMs = opts.createIssueDuplicateCandidateTimeoutMs
         ?? ISSUE_CREATE_DUPLICATE_CANDIDATE_TIMEOUT_MS;
+      // ONE budget bounds both the in-process race and the transaction-local
+      // `statement_timeout` set below, and the race is armed STRICTLY FIRST --
+      // before the connection reservation, the BEGIN, the set_config itself and
+      // the company-scope read, none of which Postgres' per-statement clock
+      // counts. So the race always wins: an overrunning scan is caught as
+      // `deadline_exceeded`, the abandoned statement keeps running, and the
+      // `57014` Postgres then logs has no observer left in this process. That
+      // is why ISSUE_DUPLICATE_CANDIDATE_LOOKUP_METRIC accounts for that log
+      // line against `deadline_exceeded` and documents `statement_timeout` as
+      // unreachable here. Giving the race a budget ABOVE lookupTimeoutMs is
+      // what would invert it -- at the cost of holding the create that much
+      // longer, which is why it is not done.
       duplicateCandidates = await raceCreateIssueDuplicateCandidateLookup(
         withReservedCreateIssueAdvisoryDb(db, lookupTimeoutMs, "issue duplicate candidate lookup", async (advisoryDb) => {
           await advisoryDb.execute(sql`select set_config('statement_timeout', ${String(lookupTimeoutMs)}, true)`);

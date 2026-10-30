@@ -1237,9 +1237,15 @@ export const DEFERRED_ISSUE_EXECUTION_WAKE_AGE_METRICS_REFRESH_SUCCESS_METRIC =
  * 500 ms guard here fired or a statement ran into the 30 s role-level bound. 19
  * of those lines over a 19 h window were read as 30 s stalls serving
  * user-facing `503`s (PEN-5019 as filed); they are the guard working, on a
- * request that answered `201`. `statement_timeout` on this counter accounts for
- * the log line at its source, so the two no longer have to be told apart by
- * reading SQL text out of a log tail.
+ * request that answered `201`. This counter accounts for that log line at its
+ * source, so the two no longer have to be told apart by reading SQL text out of
+ * a log tail.
+ *
+ * ⚠️ THE OUTCOME THAT ACCOUNTS FOR IT IS `deadline_exceeded`, NOT
+ * `statement_timeout`. Read the outcome-set note below before reasoning from
+ * either: `statement_timeout` is unreachable while the two budgets are equal,
+ * which is how both stages ship, so a `statement_timeout` of 0 says NOTHING
+ * about how many `57014` lines this feature produced.
  *
  * `stage` separates the two touches: they carry different budgets and
  * different consequences. A lost `corpus_scan` costs the caller its duplicate
@@ -1279,6 +1285,28 @@ export type IssueDuplicateCandidateLookupStage =
  * reaching Postgres at all. `connection_unavailable` is a third, earlier
  * failure: no pooled connection could even be reserved, so the scan never ran
  * and the database was never the constraint.
+ *
+ * ⚠️ `statement_timeout` IS UNREACHABLE AS BOTH STAGES SHIP, AND A 0 THERE
+ * IS NOT EVIDENCE OF NO TIMEOUTS. Each stage arms an in-process race and a
+ * transaction-local `set_config('statement_timeout', ...)` from the SAME
+ * millisecond budget, and the race is armed STRICTLY EARLIER -- before the
+ * connection reservation, the `BEGIN`, the `set_config` itself and the
+ * company-scope read, none of which Postgres' per-statement clock counts. So
+ * the race always rejects first: the caught error is `deadline_exceeded`, the
+ * abandoned statement keeps running, and Postgres cancels it a moment later
+ * into the log with nothing left in this process to observe it. A `57014` line
+ * from this feature therefore has a `deadline_exceeded` increment behind it,
+ * never a `statement_timeout` one.
+ *
+ * The label is KEPT rather than dropped because that is a property of the two
+ * budgets being equal, not of the code shape: give the race a grace over the
+ * statement budget -- or raise the race budget alone -- and the server-side
+ * cancel becomes the rejection that surfaces, at which point this outcome
+ * starts counting and means exactly what it says. The classifier already finds
+ * `57014` on the `cause` chain, so that flip needs no change here.
+ * `issue-create-deduplication-routes.test.ts` pins both halves: that equal
+ * budgets yield `deadline_exceeded`, and that a surfaced `57014` still
+ * classifies as `statement_timeout`.
  */
 export const ISSUE_DUPLICATE_CANDIDATE_LOOKUP_OUTCOMES = [
   "ok",
@@ -6377,10 +6405,14 @@ function ensureRegistry(): {
         + "(corpus_scan, consumption_event) and outcome (PEN-5019). Both touches run after the "
         + "issue is already committed, under their own short statement_timeout, and every failure "
         + "is swallowed so the create still answers 201 with no advisories -- so a blown budget "
-        + "and a genuinely empty result were indistinguishable. statement_timeout here is the same "
-        + "event as a 'canceling statement due to statement timeout' line in the Postgres log, "
-        + "which carries NO timeout value and so cannot by itself be told apart from a 30 s "
-        + "role-level stall; that ambiguity is what made 19 of these read as user-facing 503s. Do "
+        + "and a genuinely empty result were indistinguishable. A 'canceling statement due to "
+        + "statement timeout' line in the Postgres log carries NO timeout value, so it cannot by "
+        + "itself be told apart from a 30 s role-level stall; that ambiguity is what made 19 of "
+        + "these read as user-facing 503s. When such a line comes from this feature it surfaces "
+        + "HERE AS deadline_exceeded, NOT as statement_timeout: the in-process race is armed "
+        + "before the statement and carries the same budget, so it always rejects first. "
+        + "statement_timeout stays 0 unless those two budgets are made to differ -- do not read a "
+        + "0 there as 'no timeouts'. Do "
         + "NOT alert on raw non-zero -- some timeout volume is the intended cost of a tight "
         + "advisory budget. Alert on the non-ok/total ratio per stage -- per stage, because "
         + "the two do NOT share a denominator: corpus_scan counts once per issue create, while "
