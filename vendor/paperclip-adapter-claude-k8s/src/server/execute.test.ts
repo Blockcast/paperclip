@@ -4558,6 +4558,13 @@ describe("describeProjectionRefusal (PEN-4932 stage 4b)", () => {
     });
   });
 
+  it("carries the too-many-dirs refusal structurally", async () => {
+    const { PromptBundleTooManyDirsError } = await import("./prompt-bundle-projection.js");
+    const refusal = describeProjectionRefusal(new PromptBundleTooManyDirsError("expando", 2000));
+    expect(refusal.errorName).toBe("PromptBundleTooManyDirsError");
+    expect(refusal.detail).toEqual({ kind: "too_many_dirs", skillKey: "expando", limit: 2000 });
+  });
+
   it("carries the symlink-cycle refusal structurally", async () => {
     const { PromptBundleSymlinkCycleError } = await import("./prompt-bundle-projection.js");
     const refusal = describeProjectionRefusal(

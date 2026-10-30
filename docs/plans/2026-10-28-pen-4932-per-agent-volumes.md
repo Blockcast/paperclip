@@ -793,9 +793,40 @@ invariant exists to rule out:
   nothing to the pod today either, so stepping over it cannot be a delivery regression, while
   refusing would abort runs that currently work — a regression in the other direction.
 
-  Both symlink refusals join the over-budget and too-many-files refusals in the **cached**
-  deterministic set: the sizing key covers the tree contents and the sources, so a tree that
-  refuses under one key cannot resolve cleanly under the same one.
+  ⚠️ **The symlink refusals are reported but NOT cached, and the obvious reasoning for caching
+  them is wrong.** An earlier draft of this change put them in the deterministic set alongside
+  over-budget and too-many-files, on the claim that "`hashPathContents` hashes a link's target".
+  It does not hash what these checks read: `prompt-cache.ts:190-204` hashes `symlink:<relPath>`
+  and then the target's **contents** under the link's own relPath, so the resolved **path** —
+  the only input the escape and cycle tests use — never enters `bundleKey`. Two retargets the
+  key cannot see:
+
+  * **Escape.** `link -> ../outside/a.md` refuses. The operator does exactly what the error
+    message says and re-points it at an in-tree `a.md` with identical bytes. The hash is
+    unchanged, so a cached refusal would replay for the life of the process against a tree that
+    is now correct — and the reverse retarget would keep a cached `sized`, so a real escape
+    would never be reported.
+  * **Cycle.** `hashPathContents` keeps one **global** `seenDirectories`, so a revisited
+    directory hashes as `dir:<rel>` + `loop` for a genuine cycle (`x/self -> x`) and for a
+    lawful sibling link (`x/self -> y`, `y` hashed first) alike.
+
+  Folding every resolved target path into `promptBundleSizingKey` would also fix it, but these
+  trees are rare and re-walking one is cheap, so not caching is the cheaper correct answer.
+  Changing `hashPathContents` is **not** an option — it would move `bundleKey` fleet-wide.
+  `PromptBundleTooManyDirsError` is uncacheable for the same reason: directory blow-up is a
+  property of the link graph, which is precisely what the key cannot see.
+
+  **A directory-visit cap bounds the walk.** `PROMPT_BUNDLE_MAX_FILES` counts FILES, and keeping
+  both copies of a lawfully duplicated directory means a chain of link-only directories
+  (`d0/{l1,l2} -> d1`, …) expands as 2^depth directory visits while adding no files, slipping
+  under the file cap entirely. `hashPathContents` walks that in linear time only because its
+  seen-set is global, which this walk cannot borrow without reintroducing the silent drop the
+  ancestor test exists to avoid. So `PROMPT_BUNDLE_MAX_DIRS` bounds it explicitly and refuses.
+
+  **The `realpath` catch is narrow.** Only `ENOENT`/`ENOTDIR`/`ELOOP` count as dangling; any
+  other errno (`EACCES`, `EIO`, a transient CephFS fault) is rethrown. A dangling count rides
+  into a `sized` outcome, which **is** cached, so a blanket catch would remember one blip for
+  the life of the process — the exact thing the cache refuses to do with a transient fault.
 
 One further caveat on reading the cap as the ceiling: the Secret is one object among the Job's, and
 etcd's request limit (~1.5 MiB by default) applies to the whole serialized object — keys, base64
@@ -823,7 +854,7 @@ matter:
 | event | fields |
 |---|---|
 | `claude_k8s.prompt_bundle_projection_sized` | `totalValueBytes`, `fileCount`, `binaryFileCount`, `resolvedSymlinkCount`, `danglingSymlinkCount`, `skippedNonRegularCount`, `maxBytes`, `escalationThresholdCrossed`, `bytesBySkillKey`, `sizingCacheHit` |
-| `claude_k8s.prompt_bundle_projection_failed`, **refusal** | `errorName`, `refusal` (`{kind: "over_budget", totalValueBytes, maxBytes, fileCount, bytesBySkillKey}`, `{kind: "too_many_files", skillKey, limit}`, `{kind: "symlink_escapes_tree", skillKey, linkPath, resolvedTarget, treeRoot}` or `{kind: "symlink_cycle", skillKey, linkPath, resolvedTarget}`), `sizingCacheHit` |
+| `claude_k8s.prompt_bundle_projection_failed`, **refusal** | `errorName`, `refusal` (`{kind: "over_budget", totalValueBytes, maxBytes, fileCount, bytesBySkillKey}`, `{kind: "too_many_files", skillKey, limit}`, `{kind: "symlink_escapes_tree", skillKey, linkPath, resolvedTarget, treeRoot}` or `{kind: "symlink_cycle", skillKey, linkPath, resolvedTarget}` or `{kind: "too_many_dirs", skillKey, limit}`), `sizingCacheHit` |
 | `claude_k8s.prompt_bundle_projection_failed`, **transient fault** | `errorName`, `error` (message string), `sizingCacheHit: false` |
 
 Both `failed` shapes carry `companyId` and `runId` for the run **emitting** the line. The refusal

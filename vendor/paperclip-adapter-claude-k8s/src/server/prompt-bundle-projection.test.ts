@@ -2,7 +2,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { PaperclipSkillEntry } from "@paperclipai/adapter-utils/server-utils";
 
@@ -14,6 +14,7 @@ import {
   PromptBundleOverBudgetError,
   PromptBundleSymlinkCycleError,
   PromptBundleSymlinkEscapesTreeError,
+  PromptBundleTooManyDirsError,
   PromptBundleTooManyFilesError,
   buildPromptBundleSecretProjection,
   skillSourceNeedsProjection,
@@ -460,6 +461,73 @@ describe("buildPromptBundleSecretProjection", () => {
         instructionsContents: null,
       }),
     ).rejects.toBeInstanceOf(PromptBundleSymlinkEscapesTreeError);
+  });
+
+  it("rethrows a non-ENOENT realpath fault instead of counting it as dangling", async () => {
+    // A blanket `catch(() => null)` would call EACCES/EIO "dangling", and a dangling
+    // count rides into a `sized` outcome that IS cached — so one transient CephFS blip
+    // would be remembered for the life of the process. Only "resolves nowhere" errnos
+    // may be swallowed.
+    const source = await writeSkill("faulty", { "SKILL.md": "real" });
+    await fs.symlink(path.join(source, "whatever.md"), path.join(source, "link.md"));
+    const realpath = fs.realpath;
+    const spy = vi.spyOn(fs, "realpath").mockImplementation(async (p: never) => {
+      if (String(p).endsWith("link.md")) {
+        const err = new Error("permission denied") as NodeJS.ErrnoException;
+        err.code = "EACCES";
+        throw err;
+      }
+      return realpath(p);
+    });
+    try {
+      await expect(
+        buildPromptBundleSecretProjection({
+          ...base,
+          serverDataMountPath: tmpRoot,
+          skills: [entry({ key: "faulty", source })],
+          instructionsContents: null,
+        }),
+      ).rejects.toMatchObject({ code: "EACCES" });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("REFUSES a tree whose directory visits exceed the cap", async () => {
+    // `maxFiles` counts FILES, so a chain of link-only directories expands 2^depth
+    // directory visits while never tripping it. The walk must be bounded explicitly.
+    const source = await writeSkill("expando", { "SKILL.md": "real" });
+    const depth = 12;
+    for (let i = 0; i < depth; i += 1) await fs.mkdir(path.join(source, `d${i}`), { recursive: true });
+    for (let i = 0; i < depth - 1; i += 1) {
+      await fs.symlink(path.join(source, `d${i + 1}`), path.join(source, `d${i}`, "l1"));
+      await fs.symlink(path.join(source, `d${i + 1}`), path.join(source, `d${i}`, "l2"));
+    }
+    await expect(
+      buildPromptBundleSecretProjection({
+        ...base,
+        serverDataMountPath: tmpRoot,
+        skills: [entry({ key: "expando", source })],
+        instructionsContents: null,
+        maxDirsPerSkill: 200,
+      }),
+    ).rejects.toBeInstanceOf(PromptBundleTooManyDirsError);
+  });
+
+  it("does not trip the directory cap on an ordinary nested tree", async () => {
+    const source = await writeSkill("nested", {
+      "SKILL.md": "real",
+      "a/b/c/d/deep.md": "deep",
+      "a/b/other.md": "other",
+    });
+    const projection = await buildPromptBundleSecretProjection({
+      ...base,
+      serverDataMountPath: tmpRoot,
+      skills: [entry({ key: "nested", source })],
+      instructionsContents: null,
+      maxDirsPerSkill: 200,
+    });
+    expect(projection!.fileCount).toBe(3);
   });
 
   it("reports zero resolved and zero dangling links for a tree that has none", async () => {
