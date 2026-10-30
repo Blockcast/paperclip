@@ -190,6 +190,31 @@ export async function classifyGithubRefusal(
 }
 
 /**
+ * WHICH GitHub budget this refusal was drawn against, as GitHub reported it,
+ * or null when the response did not say (PEN-3852).
+ *
+ * Split from {@link classifyGithubRefusal} rather than folded into its return
+ * value. The two answer different questions and fail differently: the reason is
+ * DERIVED here, from several signals in a load-bearing order, and a wrong
+ * derivation sends an operator to the wrong remedy; the resource is simply
+ * REPORTED by GitHub, and the only way to get it wrong is to not read it.
+ * Keeping the derivation's signature narrow also keeps its unit tests — which
+ * pin the one piece of real GitHub protocol knowledge in this module — reading
+ * as assertions about classification rather than about a tuple.
+ *
+ * Read unconditionally for every refusal, not just `rate_limited`: a
+ * `forbidden` on `search` and a `forbidden` on `core` are different findings
+ * too, and the header costs nothing to carry.
+ *
+ * Returned RAW. The closed label set lives next to the counter that enforces
+ * it, in `metrics.ts`, so this module never has to be the place somebody looks
+ * to find out which values are allowed.
+ */
+export function classifyGithubRefusalResource(response: Response): string | null {
+  return refusalHeader(response, "x-ratelimit-resource");
+}
+
+/**
  * Count one attempt. Never throws.
  *
  * Guarded for the same reason the response side is, and deliberately NOT left
@@ -220,7 +245,7 @@ function countGithubApiAttempt(): void {
 async function countGithubRefusal(url: string, response: Response): Promise<void> {
   try {
     const reason = await classifyGithubRefusal(url, response);
-    if (reason) recordGithubApiRefusal(reason);
+    if (reason) recordGithubApiRefusal(reason, classifyGithubRefusalResource(response));
   } catch {
     // Observation is best-effort; the caller's response is not.
   }

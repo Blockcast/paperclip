@@ -25,9 +25,18 @@ import {
   GITHUB_API_REFUSALS_METRIC,
   GITHUB_API_REQUESTS_METRIC,
   KNOWN_GITHUB_API_REFUSAL_REASONS,
+  KNOWN_GITHUB_API_REFUSAL_RESOURCES,
+  OTHER_GITHUB_API_REFUSAL_RESOURCE,
+  UNKNOWN_GITHUB_API_REFUSAL_RESOURCE,
+  ZERO_INIT_GITHUB_API_REFUSAL_RESOURCE,
+  normalizeGithubApiRefusalResource,
   renderMetrics,
 } from "../services/metrics.js";
-import { classifyGithubRefusal, ghFetch } from "../services/github-fetch.js";
+import {
+  classifyGithubRefusal,
+  classifyGithubRefusalResource,
+  ghFetch,
+} from "../services/github-fetch.js";
 
 const URL_UNDER_TEST = "https://api.github.com/repos/o/r";
 
@@ -223,7 +232,28 @@ describe("the refusal instrument renders zero rather than nothing", () => {
     // are zero.
     const { body } = await renderMetrics();
     for (const reason of KNOWN_GITHUB_API_REFUSAL_REASONS) {
-      expect(counterValue(body, GITHUB_API_REFUSALS_METRIC, { reason })).not.toBeNull();
+      expect(
+        counterValue(body, GITHUB_API_REFUSALS_METRIC, {
+          reason,
+          resource: ZERO_INIT_GITHUB_API_REFUSAL_RESOURCE,
+        }),
+      ).not.toBeNull();
+    }
+  });
+
+  it("zero-initialises ONE resource child per reason, not the whole product", async () => {
+    // The guarantee is "sum(increase(...{reason=...})) renders 0, not empty",
+    // and one present child per reason delivers it. Materialising every
+    // reason x resource pair would publish constant-zero series for budgets
+    // this process never draws against. Pinned so the cost of the label stays
+    // the 3 series it is today if the resource list grows.
+    const { body } = await renderMetrics();
+    const zeroInit = body
+      .split("\n")
+      .filter((line) => line.startsWith(GITHUB_API_REFUSALS_METRIC + "{"))
+      .filter((line) => line.trim().split(/\s+/).pop() === "0");
+    for (const line of zeroInit) {
+      expect(line).toContain(`resource="${ZERO_INIT_GITHUB_API_REFUSAL_RESOURCE}"`);
     }
   });
 
@@ -265,12 +295,15 @@ describe("ghFetch counts what it sends and what it is refused", () => {
   });
 
   it("counts a refused call under the reason GitHub gave, and still returns the response", async () => {
-    const before = counterValue((await renderMetrics()).body, GITHUB_API_REFUSALS_METRIC, {
-      reason: "rate_limited",
-    }) ?? 0;
+    const labels = { reason: "rate_limited", resource: "core" };
+    const before = counterValue((await renderMetrics()).body, GITHUB_API_REFUSALS_METRIC, labels) ?? 0;
 
     vi.stubGlobal("fetch", async () =>
-      githubResponse(403, { "x-ratelimit-remaining": "0" }, RATE_LIMIT_BODY),
+      githubResponse(
+        403,
+        { "x-ratelimit-remaining": "0", "x-ratelimit-resource": "core" },
+        RATE_LIMIT_BODY,
+      ),
     );
     const response = await ghFetch(URL_UNDER_TEST);
 
@@ -278,10 +311,56 @@ describe("ghFetch counts what it sends and what it is refused", () => {
     expect(response.status).toBe(403);
     await expect(response.text()).resolves.toContain("installation ID 138085375");
 
-    const after = counterValue((await renderMetrics()).body, GITHUB_API_REFUSALS_METRIC, {
-      reason: "rate_limited",
-    }) ?? 0;
+    const after = counterValue((await renderMetrics()).body, GITHUB_API_REFUSALS_METRIC, labels) ?? 0;
     expect(after).toBe(before + 1);
+  });
+
+  it("files a search-budget refusal apart from a core one, which is the whole point", async () => {
+    // PEN-3852 asks an org owner for a second App on a comparably broad repo
+    // set, and sizes that ask off the core formula (5,000/h + 50/h per repo
+    // above 20). `search` is a flat 30/min for an App and does not move with
+    // repo count, so a split would not relieve it. Before this label both
+    // landed in reason="rate_limited" and the argument handed to the owner
+    // could not be checked against the budget that actually refused.
+    const read = async (resource: string) =>
+      counterValue((await renderMetrics()).body, GITHUB_API_REFUSALS_METRIC, {
+        reason: "rate_limited",
+        resource,
+      }) ?? 0;
+    const coreBefore = await read("core");
+    const searchBefore = await read("search");
+
+    vi.stubGlobal("fetch", async () =>
+      githubResponse(
+        403,
+        { "x-ratelimit-remaining": "0", "x-ratelimit-resource": "search" },
+        RATE_LIMIT_BODY,
+      ),
+    );
+    await ghFetch("https://api.github.com/search/issues?q=repo:o/r+is:pr");
+
+    expect(await read("search")).toBe(searchBefore + 1);
+    expect(await read("core")).toBe(coreBefore);
+  });
+
+  it("records a refusal with no resource header as unknown, never as core", async () => {
+    // Guessing the dominant budget when GitHub did not say would manufacture
+    // exactly the evidence this label was added to supply.
+    const read = async (resource: string) =>
+      counterValue((await renderMetrics()).body, GITHUB_API_REFUSALS_METRIC, {
+        reason: "rate_limited",
+        resource,
+      }) ?? 0;
+    const coreBefore = await read("core");
+    const unknownBefore = await read(UNKNOWN_GITHUB_API_REFUSAL_RESOURCE);
+
+    vi.stubGlobal("fetch", async () =>
+      githubResponse(429, { "x-ratelimit-remaining": "0" }, RATE_LIMIT_BODY),
+    );
+    await ghFetch(URL_UNDER_TEST);
+
+    expect(await read(UNKNOWN_GITHUB_API_REFUSAL_RESOURCE)).toBe(unknownBefore + 1);
+    expect(await read("core")).toBe(coreBefore);
   });
 
   it("leaves the refusal counter alone on a healthy response", async () => {
@@ -297,5 +376,71 @@ describe("ghFetch counts what it sends and what it is refused", () => {
     await ghFetch(URL_UNDER_TEST);
 
     expect(await read()).toEqual(before);
+  });
+});
+
+describe("classifyGithubRefusalResource — which budget refused, as GitHub said it", () => {
+  it("reports the header verbatim, leaving the closed set to the counter", () => {
+    // Raw on purpose: the allowlist lives next to the counter that enforces
+    // it, so this module is never the place somebody looks to find out which
+    // values are permitted.
+    expect(
+      classifyGithubRefusalResource(githubResponse(403, { "x-ratelimit-resource": "search" })),
+    ).toBe("search");
+  });
+
+  it("returns null rather than throwing on a response with no headers at all", () => {
+    // Same contract `refusalHeader` holds for every other header this module
+    // reads: test doubles across this repo cast object literals to Response,
+    // and an observation that throws converts an instrument into an outage.
+    expect(classifyGithubRefusalResource({} as Response)).toBeNull();
+  });
+
+  it("is read for every refusal class, not only the quota ones", () => {
+    // A `forbidden` on search and a `forbidden` on core are different
+    // findings, and the header costs nothing to carry.
+    expect(
+      classifyGithubRefusalResource(githubResponse(403, { "x-ratelimit-resource": "core" }, PERMISSION_BODY)),
+    ).toBe("core");
+  });
+});
+
+describe("normalizeGithubApiRefusalResource — the label is closed, the header is not", () => {
+  it("passes through every resource the closed set names", () => {
+    for (const resource of KNOWN_GITHUB_API_REFUSAL_RESOURCES) {
+      expect(normalizeGithubApiRefusalResource(resource)).toBe(resource);
+    }
+  });
+
+  it("collapses an unenumerated budget to `other` instead of minting a label child", () => {
+    // GitHub adds rate-limit resources over time, and the value arrives in a
+    // header this process does not control. `dependency_snapshots` is a real
+    // one this build does not list; it must not become a new series.
+    expect(normalizeGithubApiRefusalResource("dependency_snapshots")).toBe(
+      OTHER_GITHUB_API_REFUSAL_RESOURCE,
+    );
+  });
+
+  it("keeps `unknown` and `other` apart, because they imply different fixes", () => {
+    // `unknown` is a gap in this instrument (fix here); `other` is a budget
+    // GitHub named that the list does not know (extend the list). Merging them
+    // would make a stripped header indistinguishable from a new GitHub budget
+    // — the absent-reads-as-an-answer defect this row keeps rediscovering.
+    expect(normalizeGithubApiRefusalResource(null)).toBe(UNKNOWN_GITHUB_API_REFUSAL_RESOURCE);
+    expect(normalizeGithubApiRefusalResource(undefined)).toBe(UNKNOWN_GITHUB_API_REFUSAL_RESOURCE);
+    expect(normalizeGithubApiRefusalResource("   ")).toBe(UNKNOWN_GITHUB_API_REFUSAL_RESOURCE);
+    expect(UNKNOWN_GITHUB_API_REFUSAL_RESOURCE).not.toBe(OTHER_GITHUB_API_REFUSAL_RESOURCE);
+  });
+
+  it("trims header whitespace rather than dropping the value to `other`", () => {
+    expect(normalizeGithubApiRefusalResource(" core ")).toBe("core");
+  });
+
+  it("zero-initialises a resource the closed set actually names", () => {
+    // A typo here would publish a child outside the documented set and make
+    // the zero-init unfindable by the query that depends on it.
+    expect([...KNOWN_GITHUB_API_REFUSAL_RESOURCES]).toContain(
+      ZERO_INIT_GITHUB_API_REFUSAL_RESOURCE,
+    );
   });
 });
