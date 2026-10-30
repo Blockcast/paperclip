@@ -5,6 +5,17 @@ export type ConcurrentIndexSpec = {
   readonly name: string;
   readonly table: string;
   readonly requiredColumns: readonly string[];
+  /**
+   * Extensions the create statement needs before it can even parse, e.g.
+   * `btree_gin` for a GIN index whose leading key is a scalar. Treated exactly
+   * like a missing table or column: skipped under `skipUnavailable` (the
+   * pre-deploy CLI, which may run before the migration that creates the
+   * extension), fatal otherwise (the migration runner, which runs after it).
+   * Without this a missing extension surfaced as a raw
+   * `data type uuid has no default operator class for access method gin`
+   * from the build itself, which is not a skippable prerequisite failure.
+   */
+  readonly requiredExtensions?: readonly string[];
   readonly accessMethod: string;
   /** Values returned by pg_get_indexdef(index_oid, key_position, true). */
   readonly keyColumns: readonly string[];
@@ -169,6 +180,36 @@ export const PENDING_CONCURRENT_INDEXES: readonly ConcurrentIndexSpec[] = [
       + "ON cost_events USING btree (company_id, issue_id)",
     dropStatement: "DROP INDEX CONCURRENTLY IF EXISTS cost_events_company_issue_idx",
   },
+  {
+    // PEN-3596 / 0269. The first GIN entry here, and the reason
+    // `requiredExtensions` exists: `btree_gin` is what lets the scalar
+    // company_id lead a GIN index, and it is created by migration 0268 -- so
+    // on an existing database it is present when the pre-deploy CLI runs, and
+    // on a fresh one it is not. Skipping there is correct rather than a
+    // degradation: the migration runner calls this guard again immediately
+    // before 0269, by which point 0268 has committed, so the index is still
+    // built CONCURRENTLY and 0269's own DO block then only validates it.
+    // `issue_comments` is the largest table in the schema
+    // (~1.26M rows by table-size-estimates) and takes a write on every agent
+    // comment, so a blocking build is not an option: 55s against a
+    // 236,800-comment seed, and it scales with total body bytes.
+    // ⚠️ keyColumns carries no operator class: pg_get_indexdef(oid, n, TRUE)
+    // renders the GIN trigram key as a bare `body`, which is what
+    // `indexValidity` compares against. Do not add `gin_trgm_ops` here.
+    migration: "0269_issue_comments_company_scoped_trigram_search_index.sql",
+    name: "issue_comments_company_body_search_idx",
+    table: "issue_comments",
+    requiredColumns: ["company_id", "body"],
+    requiredExtensions: ["btree_gin", "pg_trgm"],
+    accessMethod: "gin",
+    keyColumns: ["company_id", "body"],
+    keyOptions: [0, 0],
+    predicate: "",
+    createStatement:
+      "CREATE INDEX CONCURRENTLY IF NOT EXISTS issue_comments_company_body_search_idx "
+      + "ON issue_comments USING gin (company_id, body gin_trgm_ops)",
+    dropStatement: "DROP INDEX CONCURRENTLY IF EXISTS issue_comments_company_body_search_idx",
+  },
 ];
 
 export const DEFAULT_STATEMENT_TIMEOUT_MS = 10 * 60 * 1000;
@@ -228,7 +269,17 @@ function arraysEqual<T>(left: readonly T[], right: readonly T[]): boolean {
 async function missingPrerequisites(
   sql: ReturnType<typeof postgres>,
   spec: ConcurrentIndexSpec,
-): Promise<{ tableMissing: boolean; columns: string[] }> {
+): Promise<{ tableMissing: boolean; columns: string[]; extensions: string[] }> {
+  const required = spec.requiredExtensions ?? [];
+  const installed = required.length === 0
+    ? new Set<string>()
+    : new Set(
+      (await sql<{ extname: string }[]>`
+        SELECT extname FROM pg_extension WHERE extname = ANY(${required as string[]})
+      `).map((row) => row.extname),
+    );
+  const extensions = required.filter((name) => !installed.has(name));
+
   const rows = await sql<{ table_name: string; column_name: string | null }[]>`
     SELECT tables.table_name, columns.column_name
     FROM information_schema.tables AS tables
@@ -239,12 +290,13 @@ async function missingPrerequisites(
       AND tables.table_type = 'BASE TABLE'
       AND tables.table_name = ${spec.table}
   `;
-  if (rows.length === 0) return { tableMissing: true, columns: [...spec.requiredColumns] };
+  if (rows.length === 0) return { tableMissing: true, columns: [...spec.requiredColumns], extensions };
 
   const available = new Set(rows.flatMap((row) => row.column_name ? [row.column_name] : []));
   return {
     tableMissing: false,
     columns: spec.requiredColumns.filter((column) => !available.has(column)),
+    extensions,
   };
 }
 
@@ -363,10 +415,12 @@ export async function ensurePendingConcurrentIndexes(
 
     for (const spec of specs) {
       const missing = await missingPrerequisites(sql, spec);
-      if (missing.tableMissing || missing.columns.length > 0) {
+      if (missing.tableMissing || missing.columns.length > 0 || missing.extensions.length > 0) {
         const detail = missing.tableMissing
           ? `table public.${spec.table} does not exist`
-          : `required columns are missing: ${missing.columns.join(", ")}`;
+          : missing.columns.length > 0
+            ? `required columns are missing: ${missing.columns.join(", ")}`
+            : `required extensions are missing: ${missing.extensions.join(", ")}`;
         if (options.skipUnavailable) {
           log(`${spec.migration}: skipping ${spec.name}; ${detail}`);
           continue;

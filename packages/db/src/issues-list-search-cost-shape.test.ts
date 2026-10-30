@@ -52,12 +52,43 @@
  *
  * NEITHER HALF WORKS ALONE. The indexes are worth literally nothing without
  * the restructure (the OR keeps them unreachable), and the restructure alone
- * is only ~1.6x; together they are ~4.3x. Attribution within the composite
- * set, same seed: description −212ms, title+identifier −27ms,
- * issue_comments.body −11ms — which is why `issue_comments` gets NO composite
- * index: that 11ms would have cost an 18MB index and a 13.6s build on the
- * largest table in the schema. (A four-index variant including it measured
- * 57-72ms; it is not what ships, so it is not the headline.)
+ * is only ~1.6x; together they are ~4.3x.
+ *
+ * ── THE COMMENT ARM, AND A SEED THAT COULD NOT SEE IT ───────────────────
+ *
+ * ⚠️ 0268 shipped composites for the three `issues` columns and DECLINED one
+ * for `issue_comments.body`, on an attribution that measured it at −11ms and
+ * priced it at an 18MB index on the largest table in the schema. Migration
+ * 0269 REVERSES that, and the reason is a lesson about this seed rather than
+ * about the index: every measurement behind the −11ms was taken on a corpus
+ * with ONE company in it (`populate()` below still is — a single COMPANY
+ * constant). Company-scoping an index cannot be worth anything when there is
+ * one company: the scoped and un-scoped bitmaps are the same rows by
+ * construction. The number was right; what it was read to mean was not.
+ *
+ * Production disagreed as soon as 0268 deployed. With the search path fixed
+ * (a no-match term fell from ~25s to 0.251s), a COMMON term still cost
+ * 16-22s against the 30s bound, while the no-`q` query — which makes the
+ * planner handle the whole company — cost 3.254s, bounding every PEN-scoped
+ * operation well below the residual. Re-measured on a seed that spreads
+ * 236,800 comments of production size over 20 companies (term matching
+ * 23,680 rows globally, 3,920 in the searched company — 6.0x amplification):
+ *
+ *   comment arm of the WHERE union, alone .... 571-629ms  ->   82-109ms  (~6x)
+ *   full list query, production shape ....... 1006-1045ms ->  243-295ms  (~3.8x)
+ *
+ * The speedup tracks the amplification, which is the mechanism: the un-scoped
+ * `issue_comments_body_search_idx` BitmapAnd'ed with
+ * `issue_comments_company_idx` built the term's bitmap across every company
+ * before intersecting. 0269 company-scopes it and DROPS the un-scoped index
+ * — all five body ILIKE/regex queries in the repo are company-scoped, so the
+ * GIN-index count on `body` stays at one and the write amplification 0268
+ * declined to pay is still not paid. See the 0269 header for the per-consumer
+ * table (every one same-or-faster; the `~*` regex form becomes indexable).
+ *
+ * ⭐ THE DURABLE LESSON: a single-company seed cannot measure a
+ * company-scoping change. `populateMultiCompany()` below exists so the next
+ * such question is asked against a corpus that can answer it.
  *
  * ⚠️ WHAT THIS SUITE DOES AND DOES NOT PROVE. `SHIPPED_SEARCH_WHERE` below is
  * a hand-written copy of the predicate `issueSearchMatchCondition()` builds,
@@ -117,6 +148,9 @@ import {
 } from "./test-embedded-postgres.js";
 
 const COMPANY = "33333333-3333-4333-8333-333333333333";
+/** PEN-3596/0269: cross-company neighbours, so company-scoping is measurable. */
+const OTHER_COMPANY_A = "33333333-3333-4333-8333-33333333aaaa";
+const OTHER_COMPANY_B = "33333333-3333-4333-8333-33333333bbbb";
 const TOTAL_ISSUES = 400;
 const COMMENTS_PER_ISSUE = 6;
 const TERM = "statement";
@@ -154,6 +188,44 @@ async function populate(sql: postgres.Sql) {
     ANALYZE issues;
     ANALYZE issue_comments;
   `);
+}
+
+/**
+ * PEN-3596 / migration 0269: a corpus with MORE THAN ONE company in it.
+ *
+ * `populate()` above is deliberately single-company and the existing tests
+ * depend on that (they assert inspected-row counts equal to TOTAL_ISSUES).
+ * This one is separate rather than a widening of it, so those assertions keep
+ * meaning what they say. Its whole job is to make cross-company fan-out exist:
+ * the search term matches comments in every company, so an index that is not
+ * company-scoped has other companies' matches to wade through and a
+ * company-scoped one does not.
+ */
+async function populateMultiCompany(sql: postgres.Sql) {
+  await populate(sql);
+  const others = [OTHER_COMPANY_A, OTHER_COMPANY_B];
+  for (const [offset, company] of others.entries()) {
+    const base = TOTAL_ISSUES * (offset + 1);
+    await sql.unsafe(`
+      SET session_replication_role = replica;
+      INSERT INTO companies (id, name) VALUES ('${company}', 'pen-3596-other-${offset}')
+        ON CONFLICT DO NOTHING;
+      INSERT INTO issues (id, company_id, title, description, status, priority, created_at, updated_at, last_activity_at)
+      SELECT ('00000000-0000-4000-8000-' || lpad((${base} + g)::text, 12, '0'))::uuid, '${company}'::uuid,
+             'other issue ' || g, 'other description ' || g,
+             'in_progress', 'medium', now(), now(), now()
+      FROM generate_series(1, ${TOTAL_ISSUES}) AS g;
+      INSERT INTO issue_comments (company_id, issue_id, body, created_at, updated_at)
+      SELECT '${company}'::uuid,
+             ('00000000-0000-4000-8000-' || lpad((${base} + g)::text, 12, '0'))::uuid,
+             'canceling ${TERM} due to ${TERM} timeout, other comment ' || g || '/' || c,
+             now(), now()
+      FROM generate_series(1, ${TOTAL_ISSUES}) AS g, generate_series(1, ${COMMENTS_PER_ISSUE}) AS c;
+      SET session_replication_role = origin;
+      ANALYZE issues;
+      ANALYZE issue_comments;
+    `);
+  }
 }
 
 const CORRELATED_COMMENT_MATCH = `
@@ -345,5 +417,68 @@ describeEmbeddedPostgres("issues-list search cost shape (PEN-3596)", () => {
       "issues_company_identifier_search_idx",
       "issues_company_title_search_idx",
     ]);
+  }, 180_000);
+
+  // Migration 0269. Structural, like the 0268 check above and for the same
+  // reason the file header gives: plan choice is not assertable at a
+  // CI-affordable seed size, so what is pinned is that the index the comment
+  // arm depends on exists -- and that the un-scoped one it replaced is gone.
+  // The second half is the part worth having: leaving both would quietly
+  // reinstate the second GIN index on `body` that 0268 declined to pay for.
+  it("replaces the un-scoped comment trigram index with the company-scoped one", async () => {
+    const { sql } = await startDatabase("paperclip-pen3596-comment-index-");
+
+    const present = (await sql.unsafe(`
+      SELECT indexname FROM pg_indexes
+      WHERE tablename = 'issue_comments' AND indexname IN (
+        'issue_comments_company_body_search_idx',
+        'issue_comments_body_search_idx'
+      ) ORDER BY indexname`)) as any[];
+
+    expect(present.map((row) => row.indexname)).toEqual([
+      "issue_comments_company_body_search_idx",
+    ]);
+  }, 180_000);
+
+  // The reason 0269 exists at all is that no seed here had a second company
+  // in it, so a company-scoping change could not be measured. This pins the
+  // corpus shape rather than a timing: if `populateMultiCompany` ever stops
+  // producing cross-company matches, the next person measuring an index on
+  // this table gets the same false negative 0268 got.
+  it("seeds cross-company comment matches the single-company seed cannot", async () => {
+    const { sql } = await startDatabase("paperclip-pen3596-crosscompany-");
+    await populateMultiCompany(sql);
+
+    const [counts] = (await sql.unsafe(`
+      SELECT
+        (SELECT count(*) FROM issue_comments WHERE body ILIKE '%${TERM}%') AS "global",
+        (SELECT count(*) FROM issue_comments
+          WHERE company_id = '${COMPANY}'::uuid AND body ILIKE '%${TERM}%') AS "searched",
+        (SELECT count(DISTINCT company_id) FROM issue_comments) AS "companies"`)) as any[];
+
+    expect(Number(counts.companies)).toBeGreaterThan(1);
+    // The amplification an un-scoped index would have to wade through. Asserted
+    // as "strictly more than the searched company's share", not as a ratio --
+    // the ratio is a property of the seed and would be a brittle thing to pin.
+    expect(Number(counts.global)).toBeGreaterThan(Number(counts.searched));
+    expect(Number(counts.searched)).toBeGreaterThan(0);
+  }, 180_000);
+
+  // Semantics, under the condition that actually makes the comment arm
+  // dangerous: other companies hold comments matching the same term. The arm
+  // filters company_id, so this must hold -- and it is cheap to prove, where
+  // the single-company seed could not state the question.
+  it("the comment arm never admits another company's issues", async () => {
+    const { sql } = await startDatabase("paperclip-pen3596-tenancy-");
+    await populateMultiCompany(sql);
+
+    const rows = (await sql.unsafe(searchQuery(SHIPPED_SEARCH_WHERE))) as any[];
+    expect(rows.length).toBeGreaterThan(0);
+
+    const [leaked] = (await sql.unsafe(`
+      SELECT count(*) AS "n" FROM issues
+      WHERE id = ANY(${`'{${rows.map((row) => row.id).join(",")}}'::uuid[]`})
+        AND company_id <> '${COMPANY}'::uuid`)) as any[];
+    expect(Number(leaked.n)).toBe(0);
   }, 180_000);
 });

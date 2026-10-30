@@ -271,4 +271,64 @@ describeEmbeddedPostgres("ensurePendingConcurrentIndexes", () => {
     }
     expect(locked).toBe(true);
   }, 60_000);
+
+  // PEN-3596 / 0269: the first GIN entry in the registry needs `btree_gin`
+  // before its create statement will even parse. Without `requiredExtensions`
+  // that surfaced from the build as
+  // `data type uuid has no default operator class for access method gin` --
+  // a hard failure, where a missing prerequisite on a multi-version upgrade
+  // is supposed to be skippable. These pin both branches.
+  it("skips a spec whose required extension is absent when skipUnavailable is set", async () => {
+    const { database, sql } = await seedPopulatedDatabaseWithoutIndex();
+    const logged: string[] = [];
+    const spec: ConcurrentIndexSpec = {
+      ...CRASH_RECOVERY_SPEC,
+      requiredExtensions: ["an_extension_that_does_not_exist"],
+    };
+
+    const results = await ensurePendingConcurrentIndexes(database.connectionString, {
+      specs: [spec],
+      skipUnavailable: true,
+      log: (message) => logged.push(message),
+    });
+
+    expect(results).toEqual([]);
+    expect(logged.join("\n")).toContain("required extensions are missing: an_extension_that_does_not_exist");
+    // Skipped, not built: the index must still be absent afterwards.
+    const [{ present }] = await sql<{ present: string | null }[]>`
+      select to_regclass(${`public.${INDEX_NAME}`})::text as present
+    `;
+    expect(present).toBeNull();
+  }, 60_000);
+
+  it("throws on a missing required extension when skipUnavailable is not set", async () => {
+    const { database } = await seedPopulatedDatabaseWithoutIndex();
+    const spec: ConcurrentIndexSpec = {
+      ...CRASH_RECOVERY_SPEC,
+      requiredExtensions: ["an_extension_that_does_not_exist"],
+    };
+
+    // This is the migration-runner path, which runs after the extension's own
+    // migration has committed -- so a miss there is a real defect, not a
+    // version skew, and must fail the deploy rather than quietly skip.
+    await expect(
+      ensurePendingConcurrentIndexes(database.connectionString, { specs: [spec] }),
+    ).rejects.toThrow(/required extensions are missing: an_extension_that_does_not_exist/);
+  }, 60_000);
+
+  it("builds normally when the required extensions are present", async () => {
+    const { database } = await seedPopulatedDatabaseWithoutIndex();
+    // btree_gin and pg_trgm are both created by migrations, so an up-to-date
+    // database has them; this is 0269's real configuration.
+    const spec: ConcurrentIndexSpec = {
+      ...CRASH_RECOVERY_SPEC,
+      requiredExtensions: ["btree_gin", "pg_trgm"],
+    };
+
+    const results = await ensurePendingConcurrentIndexes(database.connectionString, {
+      specs: [spec],
+    });
+
+    expect(results.map((result) => result.action)).toEqual(["created"]);
+  }, 60_000);
 });

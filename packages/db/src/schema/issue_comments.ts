@@ -82,6 +82,17 @@ export const issueComments = pgTable(
       table.issueId,
       table.createdAt,
     ),
-    bodySearchIdx: index("issue_comments_body_search_idx").using("gin", table.body.op("gin_trgm_ops")),
+    // PEN-3596: company-scoped, and it REPLACES the single-column
+    // `issue_comments_body_search_idx` rather than joining it (migration
+    // 0269). btree_gin lets company_id lead the GIN index, so the index cond
+    // answers the company filter and the trigram match together instead of
+    // BitmapAnd-ing a trigram bitmap built across every company. All five
+    // body ILIKE/regex queries in the repo are company-scoped, so nothing is
+    // left that wants the un-scoped form -- which is why the GIN-index count
+    // on `body` stays at one and 0268's write-amplification objection to a
+    // *second* one does not apply. Measured ~6x on the comment arm; see the
+    // migration header for the full table.
+    companyBodySearchIdx: index("issue_comments_company_body_search_idx")
+      .using("gin", table.companyId, table.body.op("gin_trgm_ops")),
   }),
 );
