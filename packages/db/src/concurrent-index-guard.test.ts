@@ -31,6 +31,10 @@ const INDEX_DEFINITION =
 const CRASH_RECOVERY_SPEC = PENDING_CONCURRENT_INDEXES.find(
   (spec) => spec.migration === "0226_heartbeat_runs_crash_recovery_index.sql",
 )!;
+const TRIGRAM_INDEX_NAME = "issue_comments_company_body_search_idx";
+const TRIGRAM_SPEC = PENDING_CONCURRENT_INDEXES.find(
+  (spec) => spec.migration === "0269_issue_comments_company_scoped_trigram_search_index.sql",
+)!;
 
 const cleanups: Array<() => Promise<void>> = [];
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -331,4 +335,86 @@ describeEmbeddedPostgres("ensurePendingConcurrentIndexes", () => {
 
     expect(results.map((result) => result.action)).toEqual(["created"]);
   }, 60_000);
+  // PEN-3596 / 0269 review: the operator class is the ONE axis on which a
+  // plausible hand-typed mistake -- `gin (company_id, body)`, btree_gin's
+  // default `text_ops`, instead of `gin (company_id, body gin_trgm_ops)` --
+  // differs from the right index. Everything else the structural check looks
+  // at is byte-identical between the two (verified in the first test below),
+  // because pg_get_indexdef(oid, n, TRUE) prints the bare attribute with no
+  // opclass and indoption is sort/NULL flags. A `text_ops` GIN index cannot
+  // serve `ILIKE '%...%'` at all, and 0269 DROPs the single-column trigram
+  // index immediately after this check passes -- so accepting one would leave
+  // the largest table in the schema with no usable index for comment search
+  // and no error anywhere.
+  async function seedTrigramDatabaseWithoutIndex() {
+    const database = await startEmbeddedPostgresTestDatabase("paperclip-trigram-opclass-guard-");
+    cleanups.push(database.cleanup);
+    // An empty `issue_comments` lets 0269 build the index inline, so drop it
+    // to reach the "populated deploy, index precreated by hand" state the
+    // guard actually runs against.
+    await applyPendingMigrations(database.connectionString);
+    const sql = postgres(database.connectionString, { max: 1, onnotice: () => {} });
+    cleanups.push(async () => sql.end());
+    await sql.unsafe(`DROP INDEX IF EXISTS ${TRIGRAM_INDEX_NAME}`);
+    return { database, sql };
+  }
+
+  it("rejects a default-opclass precreate that every other structural check accepts (PEN-3596 review)", async () => {
+    const { database, sql } = await seedTrigramDatabaseWithoutIndex();
+    await sql.unsafe(
+      `CREATE INDEX ${TRIGRAM_INDEX_NAME} ON issue_comments USING gin (company_id, body)`,
+    );
+
+    // The premise: this index is indistinguishable from the right one on every
+    // axis the guard checked before `keyOpclasses` existed. If this assertion
+    // ever fails, the opclass check has stopped being the thing standing
+    // between a mistyped precreate and a silent loss of comment search.
+    const [indistinguishable] = await sql.unsafe(`
+      SELECT
+        i.indnkeyatts, i.indnatts, i.indoption::text AS key_options,
+        ARRAY(
+          SELECT pg_get_indexdef(i.indexrelid, k, TRUE)
+          FROM generate_series(1, i.indnkeyatts) AS k ORDER BY k
+        ) AS key_columns,
+        am.amname AS access_method
+      FROM pg_index i
+      JOIN pg_class c ON c.oid = i.indexrelid
+      JOIN pg_am am ON am.oid = c.relam
+      WHERE i.indexrelid = to_regclass('public.${TRIGRAM_INDEX_NAME}')
+    `);
+    expect(indistinguishable).toMatchObject({
+      indnkeyatts: TRIGRAM_SPEC.keyColumns.length,
+      indnatts: TRIGRAM_SPEC.keyColumns.length,
+      key_options: TRIGRAM_SPEC.keyOptions.join(" "),
+      key_columns: [...TRIGRAM_SPEC.keyColumns],
+      access_method: TRIGRAM_SPEC.accessMethod,
+    });
+
+    await expect(
+      ensurePendingConcurrentIndexes(database.connectionString, { specs: [TRIGRAM_SPEC] }),
+    ).rejects.toThrow(
+      /does not match migration 0269_issue_comments_company_scoped_trigram_search_index\.sql's definition/,
+    );
+
+    // Fail closed, not fix up: the wrong index is left exactly as found for an
+    // operator to inspect, never silently dropped and rebuilt.
+    const [{ indexdef }] = await sql<{ indexdef: string }[]>`
+      select indexdef from pg_indexes where indexname = ${TRIGRAM_INDEX_NAME}
+    `;
+    expect(indexdef).toContain("gin (company_id, body)");
+    expect(indexdef).not.toContain("gin_trgm_ops");
+  }, 120_000);
+
+  it("accepts a correctly-opclassed precreate as already-valid (PEN-3596 review)", async () => {
+    const { database, sql } = await seedTrigramDatabaseWithoutIndex();
+    await sql.unsafe(
+      `CREATE INDEX ${TRIGRAM_INDEX_NAME} ON issue_comments USING gin (company_id, body gin_trgm_ops)`,
+    );
+
+    const results = await ensurePendingConcurrentIndexes(database.connectionString, {
+      specs: [TRIGRAM_SPEC],
+    });
+
+    expect(results.map((result) => result.action)).toEqual(["already-valid"]);
+  }, 120_000);
 });

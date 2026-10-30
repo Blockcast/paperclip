@@ -21,6 +21,25 @@ export type ConcurrentIndexSpec = {
   readonly keyColumns: readonly string[];
   /** pg_index.indoption values; 0 = ASC NULLS LAST, 3 = DESC NULLS FIRST. */
   readonly keyOptions: readonly number[];
+  /**
+   * Operator class name per key column (`pg_opclass.opcname`, resolved from
+   * `pg_index.indclass`), e.g. `["uuid_ops", "gin_trgm_ops"]`.
+   *
+   * Required for any index whose correctness depends on a NON-DEFAULT operator
+   * class, because nothing else here can see one: `keyColumns` comes from
+   * `pg_get_indexdef(oid, n, TRUE)`, whose non-zero column number selects
+   * attrsOnly mode and prints the bare attribute with no opclass, and
+   * `keyOptions` is `indoption` -- sort direction and NULL placement, not the
+   * opclass. Measured on PG: `gin (company_id, body gin_trgm_ops)` and
+   * `gin (company_id, body)` are byte-identical on indnkeyatts, indnatts,
+   * key_columns AND key_options, and differ ONLY here. Omitting this for a
+   * trigram index therefore accepts a default-`text_ops` precreate as valid,
+   * which cannot serve `ILIKE '%...%'` at all.
+   *
+   * Optional: the btree entries predate it and have only ever had one possible
+   * opclass per column, so leaving it unset preserves their behaviour exactly.
+   */
+  readonly keyOpclasses?: readonly string[];
   /** Value returned by pg_get_expr(indpred, indrelid, true). */
   readonly predicate: string;
   readonly createStatement: string;
@@ -193,9 +212,14 @@ export const PENDING_CONCURRENT_INDEXES: readonly ConcurrentIndexSpec[] = [
     // (~1.26M rows by table-size-estimates) and takes a write on every agent
     // comment, so a blocking build is not an option: 55s against a
     // 236,800-comment seed, and it scales with total body bytes.
-    // ⚠️ keyColumns carries no operator class: pg_get_indexdef(oid, n, TRUE)
-    // renders the GIN trigram key as a bare `body`, which is what
-    // `indexValidity` compares against. Do not add `gin_trgm_ops` here.
+    // ⚠️ keyColumns carries no operator class -- pg_get_indexdef(oid, n, TRUE)
+    // renders the GIN trigram key as a bare `body` -- so `gin_trgm_ops` must
+    // NOT be added there. It is asserted in `keyOpclasses` instead, which is
+    // the only field that can see it; without that, a precreate built as
+    // `gin (company_id, body)` (btree_gin's default `text_ops`) is
+    // indistinguishable from the right index on every other axis and would be
+    // accepted, after which the DROP below removes the only trigram index on
+    // `body` and every `ILIKE '%...%'` comment search reverts to a scan.
     migration: "0269_issue_comments_company_scoped_trigram_search_index.sql",
     name: "issue_comments_company_body_search_idx",
     table: "issue_comments",
@@ -204,6 +228,7 @@ export const PENDING_CONCURRENT_INDEXES: readonly ConcurrentIndexSpec[] = [
     accessMethod: "gin",
     keyColumns: ["company_id", "body"],
     keyOptions: [0, 0],
+    keyOpclasses: ["uuid_ops", "gin_trgm_ops"],
     predicate: "",
     createStatement:
       "CREATE INDEX CONCURRENTLY IF NOT EXISTS issue_comments_company_body_search_idx "
@@ -255,6 +280,7 @@ type IndexMetadata = {
   indnatts: number;
   key_columns: string[];
   key_options: string;
+  key_opclasses: string[];
   predicate: string | null;
 };
 
@@ -321,6 +347,13 @@ async function indexValidity(
         ORDER BY key_position
       ) AS key_columns,
       index_metadata.indoption::text AS key_options,
+      ARRAY(
+        SELECT operator_class.opcname
+        FROM unnest(index_metadata.indclass) WITH ORDINALITY AS index_class(oid, key_position)
+        JOIN pg_opclass AS operator_class ON operator_class.oid = index_class.oid
+        WHERE index_class.key_position <= index_metadata.indnkeyatts
+        ORDER BY index_class.key_position
+      ) AS key_opclasses,
       pg_get_expr(index_metadata.indpred, index_metadata.indrelid, TRUE) AS predicate
     FROM pg_index AS index_metadata
     JOIN pg_class AS index_relation ON index_relation.oid = index_metadata.indexrelid
@@ -347,6 +380,7 @@ async function indexValidity(
     && row.indnatts === spec.keyColumns.length
     && arraysEqual(row.key_columns.map(normalizeSql), spec.keyColumns.map(normalizeSql))
     && arraysEqual(keyOptions, spec.keyOptions)
+    && (spec.keyOpclasses === undefined || arraysEqual(row.key_opclasses, spec.keyOpclasses))
     && normalizeSql(row.predicate) === normalizeSql(spec.predicate);
   return structurallyValid ? "valid" : "wrong-definition";
 }
@@ -437,7 +471,7 @@ export async function ensurePendingConcurrentIndexes(
         throw new Error(
           `Index ${spec.name} exists and is complete, but does not match migration ${spec.migration}'s definition: `
           + `table, access method, `
-          + `key columns, sort options, or predicate. Inspect it before running: `
+          + `key columns, sort options, operator classes, or predicate. Inspect it before running: `
           + `${spec.dropStatement}; ${spec.createStatement}`,
         );
       }
