@@ -1220,16 +1220,25 @@ would defeat this issue's own acceptance criterion.
 `/paperclip/.bun/bin`, `/paperclip/.cache/puppeteer-browsers` do not exist in the pod, and the
 binaries behind the PATH entries resolve into the image (`/usr/local/libexec/paperclip/bin/git`,
 `/usr/local/libexec/paperclip/bin/gh`, `/usr/local/bin/node`). `/paperclip` itself is no longer a
-bind host for the PVC root at all: it is the `root-overlay` **emptyDir**. Total CephFS binds in
-the pod: **12**, against the ~18 this issue recorded on 2026-10-28.
+bind host for the PVC root at all: it is the `root-overlay` **emptyDir**.
+
+⚠️ **The bind COUNT is per-pod, not a fleet figure** — it varies with the agent and the run, since
+the set includes that agent's home, prompt-cache, run-logs and company skills. The count below is
+**this pod** (agent `29033747`, `isolation-mode=workspace`, on `k8s-paperclip-3`): **12**, against
+the ~18 this issue recorded on 2026-10-28. Review independently measured **8** in a different
+agent's pod on the same deployed commit, with the same single handle and the same `ro` git-hooks
+bind — so a future re-measure finding a different number is reading a different pod, not a
+regression or a gain. The invariant to re-measure is the **set** (which paths are bound, off how
+many handles), never the count.
 
 ⚠️ **The seventh is still there, and the reason is deploy skew, not a second code path.**
 `/paperclip/.local/share/paperclip-git-hooks` is still mounted, `ro`, off the shared handle. That
 is exactly the `ROOT_TOOLCHAIN_SUBPATHS` shape, and `master` has that list empty — because the
 running server predates the change. The StatefulSet's `deployed-commit` annotation reads
 `86bfe2a2` (2026-10-30 06:46:35Z); #3139 landed as `56710069` (08:50:27Z, merged 09:07:31Z), and
-`git merge-base --is-ancestor` confirms the deployed commit is an ancestor. **So the count becomes
-11 on the next server roll, with no further code change.** Do not read the live mount as evidence
+`git merge-base --is-ancestor` confirms the deployed commit is an ancestor. **So this bind drops
+out on the next server roll, with no further code change** — 12 → 11 in *this* pod, and one fewer
+in any pod. Do not read the live mount as evidence
 that #3139 did not land, and do not re-open the item on the strength of it; equally, do not record
 done-when 2 as delivered end-to-end until a post-roll pod is re-measured.
 
