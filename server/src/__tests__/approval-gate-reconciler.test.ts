@@ -233,7 +233,7 @@ describeEmbeddedPostgres("reconcileApprovalGates", () => {
       expect.arrayContaining([
         { type: "key_value", label: "Reconciled approval card", value: approvalId },
         { type: "key_value", label: "GitHub run", value: "Blockcast/paperclip run 32338832082" },
-        { type: "key_value", label: "Gate satisfied", value: "no" },
+        { type: "key_value", label: "Named run finished green", value: "no" },
       ]),
     );
     // The dedupe key is what the partial unique index enforces at-most-once on, so
@@ -326,8 +326,16 @@ describeEmbeddedPostgres("reconcileApprovalGates", () => {
     const comments = await commentsFor(issueId);
     expect(comments[0]?.body).toContain("has already completed");
     expect(comments[0]?.body).not.toContain("died undecided");
+    // PEN-5103: a green gate closes the card, but the announcement must not assert
+    // that the card's ASK was met. Two agents read the old "the card was moot"
+    // wording as "the escalation landed" when the gate named a run unrelated to the
+    // ask, so pin both halves: the disclaimer is present, and the claim is gone.
+    expect(comments[0]?.body).toContain("does not say the card's ask was met");
+    expect(comments[0]?.body).not.toContain("The card was moot");
     expect(issueCommentMetadataSchema.parse(comments[0]?.metadata).sections[0]?.rows).toEqual(
-      expect.arrayContaining([{ type: "key_value", label: "Gate satisfied", value: "yes" }]),
+      expect.arrayContaining([
+        { type: "key_value", label: "Named run finished green", value: "yes" },
+      ]),
     );
   });
 

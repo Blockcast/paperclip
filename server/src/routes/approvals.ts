@@ -6,6 +6,7 @@ import {
   createApprovalSchema,
   isUuidLike,
   listApprovalsQuerySchema,
+  parseApprovalGate,
   requestApprovalRevisionSchema,
   resolveApprovalSchema,
   resubmitApprovalSchema,
@@ -31,6 +32,8 @@ import {
 } from "../services/approval-enforcement-reconciler.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { resolveApprovalWithSideEffects } from "../services/approval-resolution.js";
+import { classifyGateLookup } from "../services/approval-gate-reconciler.js";
+import { githubGetWorkflowRun } from "../services/github-app-auth.js";
 import { applyApprovalEnforcement } from "../services/approval-enforcement-executor.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import {
@@ -170,6 +173,74 @@ function budgetAssertionRefusal(type: string, payload: unknown) {
         "you know a prior the policy row no longer shows — never invent one. On resubmit, send the " +
         "corrected assertions in the resubmit body: the check runs against the payload that will " +
         "end up pending, and a card filed before this guard existed has none stored.",
+    },
+  };
+}
+
+// PEN-5103: refuse a card whose `payload.gate` names a run that is ALREADY over.
+//
+// `payload.gate` means one specific thing: "the ask IS a human clicking this Actions
+// gate". The approval-gate reconciler then closes the card the moment that run
+// terminates — correct, and the whole point of BLO-29359. But it is only correct when
+// the gate IS the ask. Attach a gate to an ask it does not describe and the card is
+// retired by an event that has nothing to do with it.
+//
+// Measured twice in eight days, by two different agents, both on the same shape —
+// the ask was "a human must put an approving review on PR #N", the gate named an
+// ordinary CI run on that PR, and CI did what CI does:
+//
+//   c60dacd5 (devops, 2026-10-30)   filed 08:41:46Z, closed 08:48:23Z — 6m37s
+//   e0fba0c6 (security, 2026-10-23) filed 15:30:07Z, closed 15:37:38Z — 7m31s
+//
+// Both escalations were real and neither was ever seen by a human: one had already
+// sat three days on an unattended review gate, the other was unblocking a security
+// detector that was suppressed at the time.
+//
+// Why a guard rather than a documented rule. The sweep runs every 10 minutes, so both
+// cards were closed on the FIRST sweep after filing — meaning the run was already
+// terminal when the card was filed, and the card was dead on arrival. That also means
+// the author never saw it: the card outlived its own filing run by under eight
+// minutes. Caller discipline cannot be learned from a failure that is over before the
+// author stops running, which is why this refusal is synchronous — it is the only
+// point at which the rule reaches the agent that needs it.
+//
+// Deliberately narrow, and deliberately fails OPEN. It refuses exactly one thing: a
+// gate that is *already terminal*, which can never be clicked by anyone and so is
+// never a legitimate ask. It does NOT try to decide whether a live gate "relates to"
+// the ask — the ask is free text and that judgement is not mechanisable. A live gate,
+// an unreadable one, a rate-limited lookup, or any thrown error all pass: a throttled
+// GitHub must not be able to block escalations, the same fail-safe direction the
+// reconciler takes when it declines to retire gates it cannot read.
+async function gateAlreadyTerminalRefusal(payload: unknown) {
+  const gate = parseApprovalGate(payload);
+  if (!gate) return null;
+
+  let lookup;
+  try {
+    lookup = await githubGetWorkflowRun({ repoFullName: gate.repoFullName, runId: gate.runId });
+  } catch {
+    return null;
+  }
+  const disposition = classifyGateLookup(lookup);
+  if (disposition.kind !== "terminal") return null;
+
+  return {
+    error:
+      `payload.gate names ${gate.repoFullName} run ${gate.runId}, which is not a live gate ` +
+      `(${disposition.summary}). A card bound to a run that is already over is closed by the ` +
+      "approval-gate reconciler on its next sweep and can never be approved",
+    details: {
+      code: "approval_gate_already_terminal",
+      gate: { repoFullName: gate.repoFullName, runId: gate.runId },
+      remediation:
+        "If the ask is literally a human clicking an Actions deployment gate, name the run that " +
+        "is actually WAITING on that gate — not a CI run on the same PR, and not a run that has " +
+        "already finished. If the ask is anything else — a PR review, a merge click, a " +
+        "credential grant, an operator action — do not set `payload.gate` at all. It is not a " +
+        "general 'related link' field: it means the ask IS a human clicking that Actions gate, " +
+        "and the card is retired the moment that run ends, whether or not your ask was ever " +
+        "read. Put the PR or run URL in `payload.title` / `payload.ask` instead, where it " +
+        "informs a human without binding the card's lifetime to it.",
     },
   };
 }
@@ -639,6 +710,12 @@ export function approvalRoutes(
       res.status(422).json(budgetRefusal);
       return;
     }
+
+    const gateRefusal = await gateAlreadyTerminalRefusal(normalizedPayload);
+    if (gateRefusal) {
+      res.status(422).json(gateRefusal);
+      return;
+    }
     const persistedPayload = await stampPriors(companyId, approvalInput.type, normalizedPayload);
 
     const actor = getActorInfo(req);
@@ -897,6 +974,20 @@ export function approvalRoutes(
     if (budgetRefusal) {
       res.status(422).json(budgetRefusal);
       return;
+    }
+
+    // Guarded here as well as on create for the reason the budget guard states above:
+    // resubmit replaces the payload wholesale and returns the card to `pending`, so a
+    // create-only guard leaves the whole failure mode reachable in two calls. Scoped to
+    // a caller-SUPPLIED payload — re-checking a stored gate would refuse a resubmit for
+    // a run that has terminated since, which is a card the board asked to see again and
+    // is not the mistake this guard is about.
+    if (normalizedPayload !== undefined) {
+      const gateRefusal = await gateAlreadyTerminalRefusal(normalizedPayload);
+      if (gateRefusal) {
+        res.status(422).json(gateRefusal);
+        return;
+      }
     }
 
     // Stamp whichever payload will actually end up `pending`, for the same reason
