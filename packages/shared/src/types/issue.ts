@@ -432,6 +432,15 @@ export interface IssueBlockerAttention {
    * live run/monitor/park, or by the downstream recursion. Only this arm is unbounded in
    * time, so only this count sizes the population a staleness conjunct would touch.
    *
+   * **It is an UPPER BOUND on what a staleness conjunct would un-cover, not an exact
+   * count.** This arm returns BEFORE the `in_review` arm, the downstream recursion and the
+   * leaf monitor/run/park checks. A blocker that failed a new staleness conjunct here would
+   * fall through to those arms, and any of them may still cover it. So the true delta is
+   * `<=` this number. That is the safe direction for sizing a blast radius -- it can only
+   * overstate the flood -- but read it as "depends on this arm", never as "would be
+   * un-covered". The exact figure needs a second classification pass with the arm disabled,
+   * which the PR that takes the conjunct has to compute anyway.
+   *
    * It changes no `state`, no `reason` and no other count. It exists so the threshold in
    * PEN-5105 can be chosen against a measured blast radius instead of a guess, and so the
    * flood is measurable BEFORE it is taken.

@@ -1670,8 +1670,14 @@ describeEmbeddedPostgres("issue blocker attention", () => {
 
   // ---------------------------------------------------------------------------------
   // PEN-5105: the `assigneeUserId` arm covers unconditionally -- no staleness term, no
-  // upper bound. Measured as the SOLE generator of false `covered` on a complete n=50
-  // `blocked` sweep (6 of 6, no residue, idle 14h-230h).
+  // upper bound on how long it holds. PEN-5021 and PEN-5105 carry the sweeps attributing
+  // the false-`covered` population to this arm; the figures stay on those rows rather than
+  // being inlined here, where a snapshot would go stale silently.
+  //
+  // What the count below measures is an UPPER BOUND, not an exact delta: this arm returns
+  // ahead of the `in_review` arm, the downstream recursion and the leaf monitor/run/park
+  // checks, so a blocker failing a future staleness conjunct could still be covered by one
+  // of those. It can only overstate the flood, which is the safe direction for sizing it.
   //
   // Taking the conjunct un-covers every human-assigned blocker company-wide at once, which
   // is the flood shape the CEO flagged on PEN-5021. So this ships the MEASUREMENT only.
