@@ -650,8 +650,18 @@ const ROOT_OVERLAY_VOLUME_NAME = "root-overlay";
 const SEED_VOLUME_ROOT_MOUNT_PATH = "/mnt/paperclip-data-seed";
 /** uid:gid the agent, the `write-prompt` init container and the broker all run
  *  as (`podSecurityContext` below). The seeder runs as 0 precisely so it can
- *  hand the targets to this owner. */
+ *  hand the targets to this owner on the server's own claim; on a per-agent
+ *  claim only `own-volume-root` is uid 0 and the seeder itself IS this uid. */
 const AGENT_UID_GID = "1000:1000";
+/** Mode `seed-writable-dirs` creates a target with on a per-agent claim.
+ *
+ *  `2775`, matching what the server-side pre-creation path inherited from its
+ *  parent. `g+w` because the `github-publish-broker` sidecar runs as a
+ *  different uid with `runAsGroup: 1000` and reaches these trees by group;
+ *  setgid so everything created inside them keeps gid 1000. Passed to `mkdir
+ *  -m` rather than applied by `chmod` — see the shape-2 comment, which is where
+ *  the CAP_FOWNER constraint that forces this lives. */
+const SEED_DIR_MODE = "2775";
 // PEN-4932 stage 3. This list used to re-expose the whole fleet-wide toolchain
 // off the shared `paperclip-data` volume: `bin`, `tools`, `jre`, `.local/bin`,
 // `.bun/bin` and `.cache/puppeteer-browsers`. All six are gone — every binary
@@ -4266,190 +4276,223 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // `mkdir -p` and `chown` (non-recursive) are both idempotent, so a re-run, a
   // restarted pod and a second agent on the same volume all converge.
   const seedSubPaths = [...writableSubPaths, ...readOnlySubPaths];
-  const seedInitContainer: k8s.V1Container | null =
+  const seedTargets = seedSubPaths
+    .map((sp) => quoteShellArg(path.posix.join(SEED_VOLUME_ROOT_MOUNT_PATH, sp)))
+    .join(" ");
+  const seedWritableTargets = writableSubPaths
+    .map((sp) => quoteShellArg(path.posix.join(SEED_VOLUME_ROOT_MOUNT_PATH, sp)))
+    .join(" ");
+  // Refuse a target that is ALREADY a symlink, before anything follows it.
+  // `mkdir -p` and `chown` both follow symlinks, so a link planted at a target
+  // path by a uid 1000 writer would redirect whatever the seeder does next.
+  // On the self-claim shape below that next thing is a root `chown`; the
+  // sharpest version of it is a link aimed at the git-hooks dir, which would
+  // hand uid 1000 ownership of the PEN-3156 pre-push guard.
+  //
+  // SCOPE: every COMPONENT of every target, not just its final one. `mkdir -p`
+  // creates THROUGH a symlinked parent onto a real directory reached by an
+  // unintended route, so checking only the leaf leaves the redirect primitive
+  // intact one level up. The walk strips one component at a time back to the
+  // volume root and refuses at the first link it meets.
+  //
+  // `${d%/*}` rather than `dirname`: no subprocess per component, and no
+  // argument for a leading-dash path to be read as a flag. The `case`
+  // re-asserts containment on every step, so the walk also refuses a target
+  // that resolves outside the volume root at all, and it is what bounds the
+  // loop — `d` strictly shortens each pass, so it either reaches the root,
+  // meets a link, or leaves the root, and every one of those exits. A guard
+  // that can spin is worse than no guard: it hangs the init container and the
+  // Job never starts, which reads as an infrastructure fault, not a refusal.
+  const seedGuard = `for p in ${seedTargets}; do d="$p"; while [ "$d" != '${SEED_VOLUME_ROOT_MOUNT_PATH}' ]; do case "$d" in '${SEED_VOLUME_ROOT_MOUNT_PATH}/'*) ;; *) echo "seed-writable-dirs: $p is not under the volume root; refusing" >&2; exit 1 ;; esac; if [ -L "$d" ]; then echo "seed-writable-dirs: $d is a symlink; refusing" >&2; exit 1; fi; d=\${d%/*}; done; done`;
+  const seedVolumeMounts: k8s.V1VolumeMount[] = [
+    // The volume ROOT, no `subPath` — see SEED_VOLUME_ROOT_MOUNT_PATH.
+    { name: "data", mountPath: SEED_VOLUME_ROOT_MOUNT_PATH },
+  ];
+  const seedResources = {
+    requests: { cpu: "10m", memory: "16Mi" },
+    limits: { cpu: "100m", memory: "64Mi" },
+  };
+  // SHAPE 1 — the server's own claim. Unchanged, and deliberately so: this is
+  // every Job the fleet runs today.
+  //
+  // uid 0 is necessary here because the shared volume already carries
+  // root-owned INTERMEDIATE directories. `mkdir -p a/b/c` creates `a` and `b`
+  // as root under this container's umask (0755) and the chown below touches
+  // only the leaf `c`, so every past run left its intermediates root:root. A
+  // later run that needs a sibling inside one of them — a new
+  // `run-logs/<c>/<a>/isolated/<key>` under an existing agent log dir is the
+  // routine case — can only create it as root. That is also why shape 2 cannot
+  // simply be applied to this claim: see the note there.
+  //
+  // DAC_OVERRIDE is load-bearing, not belt-and-braces. uid 0 with
+  // CAP_DAC_OVERRIDE dropped is an ORDINARY DAC subject: against a parent
+  // owned by uid 1000 it matches neither owner nor group, so it falls to the
+  // `other` bits, and both modes in play here deny it — kubelet-created `0755`
+  // and the server's `2775` alike grant `other` only `r-x`. It also covers
+  // directory SEARCH, so a `0700` component stays traversable. DAC_OVERRIDE is
+  // in the PSS *baseline* allowed set (the default Docker capability set), so
+  // this stays baseline-clean; it is not in *restricted*, which the agent
+  // containers hold and this one deliberately does not.
+  //
+  // FOWNER is NOT here, and that is deliberate rather than an oversight: it
+  // bypasses the owner-match check on chmod/utimes, and neither syscall this
+  // container makes needs it. `chown` is covered by CAP_CHOWN, and this shape
+  // passes no `-m` to `mkdir`, so it issues no chmod at all.
+  const selfClaimSeedContainer: k8s.V1Container = {
+    name: "seed-writable-dirs",
+    image: "busybox:1.36",
+    imagePullPolicy: "IfNotPresent",
+    command: [
+      "sh",
+      "-c",
+      [
+        "set -e",
+        seedGuard,
+        // One `mkdir -p` for everything, then chown only the writable set.
+        `mkdir -p ${seedTargets}`,
+        // `-h` so a target whose FINAL component is a symlink is chowned as the
+        // link rather than as whatever it points at. That is the whole of what
+        // `-h` buys — `lchown(2)` declines to follow only the LAST component,
+        // and every intermediate is resolved the ordinary way. Measured on a
+        // runner rather than reasoned from the man page: with `elsewhere/leaf`
+        // real and `link -> elsewhere`, `chown -h link/leaf` exits 0 and lands
+        // on `elsewhere/leaf`.
+        //
+        // So guard → `mkdir -p` → `chown` is a check-then-act window, and both
+        // halves are exposed: a writer that swaps a parent component for a
+        // symlink inside it gets root `mkdir` at a route it chose and a root
+        // `chown` handing uid 1000 a directory it chose. NOTHING CAN TAKE THAT
+        // WINDOW ON THIS SHAPE: init containers are sequential, so while this
+        // one runs nothing else in the Pod is, and on the server's own claim
+        // `resolveScopedWritableMounts` drops nested targets while a narrowed
+        // pod has no path to another agent's subtree.
+        //
+        // That argument is POD-scoped, which is exactly what a per-agent claim
+        // dissolves — the concurrent writer there is a uid-1000 agent container
+        // in a DIFFERENT pod, on a different node, sharing the claim (read live
+        // 2026-10-30: two agents each held 2 concurrent run pods and one of them
+        // spanned two nodes, which is also why a per-agent claim has to stay
+        // ReadWriteMany). Shape 2 below closes it by REMOVING THE PRIVILEGE
+        // BOUNDARY rather than by hardening the race across it — a re-check
+        // between `mkdir` and `chown` is itself check-then-act and shortens the
+        // race without closing it.
+        ...(writableSubPaths.length > 0 ? [`chown -h ${AGENT_UID_GID} ${seedWritableTargets}`] : []),
+      ].join("; "),
+    ],
+    volumeMounts: seedVolumeMounts,
+    // The one container in this Pod that is root, and the narrowest root the
+    // job allows: no privilege escalation, every capability dropped but the two
+    // its `mkdir`/`chown` actually need. Overrides `podSecurityContext`'s
+    // `runAsNonRoot`, which the agent keeps.
+    securityContext: {
+      capabilities: { drop: ["ALL"], add: ["CHOWN", "DAC_OVERRIDE"] },
+      readOnlyRootFilesystem: true,
+      runAsNonRoot: false,
+      runAsUser: 0,
+      allowPrivilegeEscalation: false,
+    },
+    resources: seedResources,
+  };
+  // SHAPE 2 — a claim the server does not hold, i.e. stage 4b's per-agent
+  // volume. Two containers, and the split IS the fix for the check-then-act
+  // window described above.
+  //
+  // `own-volume-root` is the only uid 0 in the Pod and its entire job is one
+  // inode: `chown` of the MOUNT POINT. Its argument has no path components
+  // inside the volume, so there is nothing for a concurrent writer to swap, and
+  // a mount root cannot be replaced from inside the volume — there is no TOCTOU
+  // to win. It needs CHOWN and nothing else; DAC_OVERRIDE is dropped because
+  // uid 0 chowning a `root:root` fresh-volume root matches the owner.
+  //
+  // `seed-writable-dirs` then runs as uid 1000 — the SAME uid as the agent
+  // containers and as any concurrent run sharing this claim — so the guard →
+  // `mkdir` race is uid-1000-on-uid-1000 and not a privilege boundary at all.
+  // A symlink planted by that writer buys the planter nothing it could not do
+  // directly. The guard is kept anyway: it is free, and it still refuses a
+  // target that escapes the volume root.
+  //
+  // Available only because stage 3b-iii emptied `ROOT_TOOLCHAIN_SUBPATHS`, so
+  // `readOnlySubPaths` derives to `[]` and `seedSubPaths === writableSubPaths`
+  // — nothing this container touches needs to stay root-owned. Reintroducing a
+  // root-owned read-only subPath would have to re-open this question rather
+  // than ride this shape.
+  //
+  // ⛔ Do NOT apply this shape to the server's own claim. That claim carries
+  // root-owned intermediate directories left by every past uid-0 run (see shape
+  // 1), and a uid-1000 `mkdir` of a new sibling inside one of them EACCESes
+  // under `set -e`, which fails the init container and the Job never starts.
+  // A per-agent volume has no such residue: its root is handed to uid 1000 by
+  // `own-volume-root` and every component beneath it is then created by uid
+  // 1000, so the tree is 1000-owned by construction. The corollary is a
+  // rollback hazard worth naming — seeding a per-agent claim with shape 1 even
+  // once leaves root-owned intermediates on it that shape 2 cannot then create
+  // inside.
+  //
+  // `-m 2775` answers invariant 3 (`docs/plans/2026-10-28-pen-4932-per-agent-volumes.md`
+  // §4). The seeder previously set no mode, so its dirs inherited its umask
+  // (0755) where the server-side path got `2775` from its parent — moot while
+  // the dirs already existed, and a real regression on a genuinely fresh
+  // volume, which is what a per-agent claim is. `g+w` plus setgid is what the
+  // `github-publish-broker` sidecar needs: it runs as a DIFFERENT uid with
+  // `runAsGroup: 1000`, so it reaches these trees by group, and setgid is what
+  // keeps gid 1000 on everything created inside them afterwards.
+  //
+  // `chmod` is NOT reachable from this container and `-m` is what avoids
+  // needing it. `chmod(2)`'s owner-match check is gated on CAP_FOWNER, which
+  // CAP_DAC_OVERRIDE does not cover and which nothing here holds; on a
+  // PERSISTENT per-agent volume the targets already exist from a previous run,
+  // so an explicit `chmod` would be a non-owner chmod → EPERM → `set -e` → the
+  // Job never starts. busybox's `mkdir` does not have that problem: on EEXIST
+  // at the FINAL component it `goto ret0`s without attempting the chmod
+  // (`libbb/make_directory.c`), so the only chmod it ever issues is on a
+  // directory it just created and therefore owns. Intermediates are created
+  // under `umask & ~0300` and do NOT carry `-m` — they come up 0755, 1000-owned,
+  // which is traversable by the broker and writable by their creator.
+  // ⚠ coreutils `mkdir` agrees on both points, so an execution test on a
+  // developer machine or a CI runner is corroboration, not proof: the guarantee
+  // read here is busybox's, because busybox:1.36 is what runs.
+  const ownVolumeRootContainer: k8s.V1Container = {
+    name: "own-volume-root",
+    image: "busybox:1.36",
+    imagePullPolicy: "IfNotPresent",
+    command: ["sh", "-c", `set -e; chown ${AGENT_UID_GID} '${SEED_VOLUME_ROOT_MOUNT_PATH}'`],
+    volumeMounts: seedVolumeMounts,
+    securityContext: {
+      capabilities: { drop: ["ALL"], add: ["CHOWN"] },
+      readOnlyRootFilesystem: true,
+      runAsNonRoot: false,
+      runAsUser: 0,
+      allowPrivilegeEscalation: false,
+    },
+    resources: seedResources,
+  };
+  const agentSeedContainer: k8s.V1Container = {
+    name: "seed-writable-dirs",
+    image: "busybox:1.36",
+    imagePullPolicy: "IfNotPresent",
+    command: ["sh", "-c", ["set -e", seedGuard, `mkdir -m ${SEED_DIR_MODE} -p ${seedTargets}`].join("; ")],
+    volumeMounts: seedVolumeMounts,
+    // PSS *restricted*, which shape 1 cannot reach. No chown, so no CHOWN; no
+    // chmod on anything it does not own, so no FOWNER; it owns the root, so no
+    // DAC_OVERRIDE.
+    securityContext: {
+      capabilities: { drop: ["ALL"] },
+      readOnlyRootFilesystem: true,
+      runAsNonRoot: true,
+      runAsUser: 1000,
+      runAsGroup: 1000,
+      allowPrivilegeEscalation: false,
+    },
+    resources: seedResources,
+  };
+  // `mkdir` (with or without `-m`) and `chown` are all idempotent, so a re-run,
+  // a restarted pod and a second agent on the same volume all converge.
+  const seedInitContainers: k8s.V1Container[] =
     narrowWritableSurface && seedSubPaths.length > 0
-      ? {
-          name: "seed-writable-dirs",
-          image: "busybox:1.36",
-          imagePullPolicy: "IfNotPresent",
-          command: [
-            "sh",
-            "-c",
-            [
-              "set -e",
-              // Refuse a target that is ALREADY a symlink, before anything
-              // follows it. `mkdir -p` and `chown` both follow symlinks, and
-              // this container is the one process in the Pod holding uid 0 over
-              // the volume root — so a link planted at a target path by a uid
-              // 1000 writer would redirect a root `chown` onto its referent.
-              // The sharpest version: a link aimed at the git-hooks dir would
-              // hand uid 1000 ownership of the PEN-3156 pre-push guard, which
-              // is precisely the boundary the explicit no-chown below defends.
-              //
-              // Not reachable on this head — `resolveScopedWritableMounts`
-              // drops nested targets, so no agent-writable mount contains
-              // another target or its parents, and the narrowed mount gives a
-              // pod no path to another agent's subtree. It becomes reachable in
-              // 4b, where a per-agent volume PERSISTS across runs whose target
-              // sets differ, so one run's writable tree can be an ancestor of a
-              // later run's target. Fail closed rather than carry that into 4b
-              // as a thing to remember.
-              //
-              // SCOPE: every COMPONENT of every target, not just its final
-              // one. `mkdir -p` creates THROUGH a symlinked parent onto a real
-              // directory reached by an unintended route, so checking only the
-              // leaf leaves the redirect primitive intact one level up. The
-              // walk below strips one component at a time back to the volume
-              // root and refuses at the first link it meets, which is the
-              // invariant §4 of
-              // `docs/plans/2026-10-28-pen-4932-per-agent-volumes.md` hands
-              // from 4a to 4b.
-              //
-              // Still unreachable on THIS head, and that is why it is asserted
-              // rather than exercised: `resolveScopedWritableMounts` drops
-              // nested targets, and a narrowed pod has no path to another
-              // agent's subtree, so planting such a parent needs write access
-              // to ITS parent that no pod has. It becomes reachable the moment
-              // the claim is per-agent, because a per-agent volume PERSISTS
-              // across runs whose target sets differ — one run's writable tree
-              // can be an ancestor of a later run's target.
-              //
-              // `${d%/*}` rather than `dirname`: no subprocess per component,
-              // and no argument for a leading-dash path to be read as a flag.
-              // The `case` re-asserts containment on every step, so the walk
-              // also refuses a target that resolves outside the volume root at
-              // all, and it is what bounds the loop — `d` strictly shortens
-              // each pass, so it either reaches the root, meets a link, or
-              // leaves the root, and every one of those exits.
-              `for p in ${seedSubPaths
-                .map((sp) => quoteShellArg(path.posix.join(SEED_VOLUME_ROOT_MOUNT_PATH, sp)))
-                .join(" ")}; do d="$p"; while [ "$d" != '${SEED_VOLUME_ROOT_MOUNT_PATH}' ]; do case "$d" in '${SEED_VOLUME_ROOT_MOUNT_PATH}/'*) ;; *) echo "seed-writable-dirs: $p is not under the volume root; refusing" >&2; exit 1 ;; esac; if [ -L "$d" ]; then echo "seed-writable-dirs: $d is a symlink; refusing" >&2; exit 1; fi; d=\${d%/*}; done; done`,
-              // One `mkdir -p` for everything, then chown only the writable set.
-              `mkdir -p ${seedSubPaths
-                .map((sp) => quoteShellArg(path.posix.join(SEED_VOLUME_ROOT_MOUNT_PATH, sp)))
-                .join(" ")}`,
-              // `-h` so a target whose FINAL component is a symlink is chowned
-              // as the link rather than as whatever it points at. That is the
-              // whole of what `-h` buys, and it pairs with the guard's leaf
-              // check above. Free, so keep it — but see below for what it does
-              // NOT buy.
-              //
-              // ⚠ 4b RESIDUE — the open window is guard → `chown`, with the
-              // `mkdir -p` in the middle, and BOTH halves are exposed.
-              //
-              // `-h` is NOT symlink-safe as a path operation. It maps to
-              // `lchown(2)`, which declines to follow only the LAST component;
-              // every intermediate component is resolved the ordinary way,
-              // symlinks included. Measured on a runner rather than reasoned
-              // from the man page: with `elsewhere/leaf` real and `link ->
-              // elsewhere`, `chown -h link/leaf` exits 0 and lands on
-              // `elsewhere/leaf`; `chown -h link/nosuchthing` exits 1; and
-              // through a DANGLING intermediate (`deadlink -> /nonexistent`)
-              // `chown -h deadlink/leaf` returns ENOENT — which it could only
-              // do by having resolved that intermediate.
-              //
-              // So a uid-1000 writer that swaps a parent component for a
-              // symlink inside the window gets, from uid 0:
-              //   - `mkdir -p` to create root-owned directories at a route it
-              //     chose, and
-              //   - `chown` to hand uid 1000 ownership of a directory it chose.
-              // The second is the worse half: it is an ownership transfer, not
-              // just a misplaced mkdir. This corrects an earlier comment here
-              // (and PEN-4932's 19:49Z note) that called the chown step safe
-              // and put the window at guard → `mkdir -p`.
-              //
-              // A re-check between `mkdir` and `chown` does NOT close it, for a
-              // more basic reason than the one previously recorded: the
-              // re-check is itself check-then-act, so it closes neither half —
-              // it only shortens the race it is trying to win. Closing this
-              // needs one of:
-              //   - an fd-relative walk — `openat(…, O_NOFOLLOW|O_DIRECTORY)`
-              //     per component, then `fchown` on the final fd — which `sh`
-              //     cannot express, so it means moving the seeder out of shell;
-              //   - or removing the privilege boundary, so the race is
-              //     uid-1000-on-uid-1000 and not a boundary at all. See the
-              //     `fsGroup` note below, which is cost-blocked, not
-              //     unavailable.
-              //
-              // Nothing can take that window on THIS head: init containers
-              // are sequential, so while this one runs nothing else in the Pod
-              // is. But that argument is POD-scoped, and pod scope is
-              // precisely what a per-agent claim dissolves: the concurrent
-              // writer is a uid-1000 agent container in a DIFFERENT pod, on a
-              // different node, sharing the claim.
-              // That is the normal case, not an edge one — read live
-              // 2026-10-30, two agents each held 2 concurrent run pods and one
-              // of them spanned two nodes, which is also why a per-agent claim
-              // has to stay ReadWriteMany.
-              //
-              // ⛔ `fsGroup` is the obvious-looking escape — own the tree as
-              // 1000, the seeder stops needing uid 0, and the race becomes
-              // uid-1000-on-uid-1000, i.e. no longer a privilege boundary at
-              // all. AVAILABILITY is not what blocks it: `cephfs.csi.ceph.com`
-              // reports `fsGroupPolicy: File` on this cluster, so kubelet
-              // would honour it. COST is. See the rationale in
-              // `deploy/helm/paperclip/values.blockcast.yaml`, which clears the
-              // chart default `fsGroup: 1000` because cephfs does not reliably
-              // short-circuit `fsGroupChangePolicy: OnRootMismatch` — kubelet
-              // re-walks the volume on EVERY mount, giving 30-45 min rollouts
-              // (onprem-k8s #225). A per-agent volume starts empty, but grows
-              // to that agent’s own checkout, so the walk is re-paid per pod
-              // start and scales with the volume rather than being one-off.
-              // Do not re-propose it without re-measuring that short-circuit
-              // against a real per-agent claim.
-              ...(writableSubPaths.length > 0
-                ? [
-                    `chown -h ${AGENT_UID_GID} ${writableSubPaths
-                      .map((sp) => quoteShellArg(path.posix.join(SEED_VOLUME_ROOT_MOUNT_PATH, sp)))
-                      .join(" ")}`,
-                  ]
-                : []),
-            ].join("; "),
-          ],
-          // The volume ROOT, no `subPath` — see SEED_VOLUME_ROOT_MOUNT_PATH.
-          volumeMounts: [{ name: "data", mountPath: SEED_VOLUME_ROOT_MOUNT_PATH }],
-          // The one container in this Pod that is root, and the narrowest root
-          // the job allows: no privilege escalation, every capability dropped
-          // but the two its `mkdir`/`chown` actually need. Overrides
-          // `podSecurityContext`'s `runAsNonRoot`, which the agent keeps.
-          //
-          // DAC_OVERRIDE is load-bearing, not belt-and-braces. uid 0 with
-          // CAP_DAC_OVERRIDE dropped is an ORDINARY DAC subject: against a
-          // parent owned by uid 1000 it matches neither owner nor group, so it
-          // falls to the `other` bits. Both modes in play here deny it —
-          // kubelet-created `0755` and the server's `2775` alike grant `other`
-          // only `r-x`. `mkdir` of a new child under any 1000-owned parent
-          // would then EACCES, and under `set -e` that fails the init container
-          // and the Job never starts. It bites wherever a target's parent
-          // already exists 1000-owned and the target itself does not — a new
-          // `run-logs/<c>/<a>/isolated/<key>` under an existing agent log dir
-          // today, and in stage 4b any target nested under a tree a previous
-          // run left behind. It also covers directory SEARCH, so a `0700`
-          // component is traversable. DAC_OVERRIDE is in the PSS *baseline*
-          // allowed set (the default Docker capability set), so this stays
-          // baseline-clean; it is not in *restricted*, which the agent
-          // containers hold and this one deliberately does not.
-          //
-          // FOWNER is NOT here, and that is deliberate rather than an
-          // oversight: it bypasses the owner-match check on chmod/utimes, and
-          // neither syscall this container makes needs it. `chown` is covered
-          // by CAP_CHOWN. `mkdir -p` chmods only a directory it just created
-          // itself — and only when given `-m`, which it is not — so the one
-          // path FOWNER could matter on is one where the seeder is already the
-          // owner.
-          securityContext: {
-            capabilities: { drop: ["ALL"], add: ["CHOWN", "DAC_OVERRIDE"] },
-            readOnlyRootFilesystem: true,
-            runAsNonRoot: false,
-            runAsUser: 0,
-            allowPrivilegeEscalation: false,
-          },
-          resources: {
-            requests: { cpu: "10m", memory: "16Mi" },
-            limits: { cpu: "100m", memory: "64Mi" },
-          },
-        }
-      : null;
+      ? serverCanPreCreate
+        ? [selfClaimSeedContainer]
+        : [ownVolumeRootContainer, agentSeedContainer]
+      : [];
 
   const initContainer: k8s.V1Container = {
     name: "write-prompt",
@@ -4558,7 +4601,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
           ...(tolerations.length > 0 ? { tolerations: tolerations as k8s.V1Toleration[] } : {}),
           initContainers: [
             // FIRST: creates the `subPath` targets every later container mounts.
-            ...(seedInitContainer ? [seedInitContainer] : []),
+            ...seedInitContainers,
             initContainer,
             ...(enableDocker
               ? [buildDindSidecar({ image: dockerImage, cpuLimit: dockerCpuLimit, memoryLimit: dockerMemoryLimit })]
