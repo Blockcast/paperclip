@@ -68,7 +68,53 @@ type PromptBundleSizedOutcome = { outcome: "sized" } & Pick<
  * caching one would suppress the measurement for the life of the process on the
  * strength of a blip — so those are reported and NOT remembered.
  */
-type PromptBundleRefusedOutcome = { outcome: "refused"; errorName: string; error: string };
+type PromptBundleRefusedOutcome = {
+  outcome: "refused";
+  errorName: string;
+  /**
+   * The refusal's STRUCTURED fields, never its rendered message.
+   *
+   * `PromptBundleOverBudgetError`'s message embeds the company and run that first hit
+   * it. Caching that string would make a later run's warn line carry `runId: <this
+   * run>` beside an `error` naming a different one, so a reader joining on the run id
+   * in the message lands on the wrong run. Only run-independent facts are kept, and
+   * the line is rendered per emit against the run actually emitting it.
+   */
+  detail:
+    | {
+        kind: "over_budget";
+        totalValueBytes: number;
+        maxBytes: number;
+        fileCount: number;
+        bytesBySkillKey: Record<string, number>;
+      }
+    | { kind: "too_many_files"; skillKey: string; limit: number };
+};
+
+/** The cached refusal's run-independent fields, as a refusal this run can report. */
+export function describeProjectionRefusal(err: PromptBundleOverBudgetError | PromptBundleTooManyFilesError): PromptBundleRefusedOutcome {
+  // `name`, not `instanceof` — see `isDeterministicProjectionRefusal`. Getting this
+  // wrong does not throw: it silently reports a too-many-files refusal as an
+  // over-budget one with undefined byte fields.
+  if (err.name === "PromptBundleTooManyFilesError") {
+    return {
+      outcome: "refused",
+      errorName: err.name,
+      detail: { kind: "too_many_files", skillKey: err.skillKey, limit: err.limit },
+    };
+  }
+  return {
+    outcome: "refused",
+    errorName: err.name,
+    detail: {
+      kind: "over_budget",
+      totalValueBytes: err.totalValueBytes,
+      maxBytes: err.maxBytes,
+      fileCount: err.fileCount,
+      bytesBySkillKey: err.bytesBySkillKey,
+    },
+  };
+}
 
 type PromptBundleSizing = PromptBundleSizedOutcome | PromptBundleRefusedOutcome;
 
@@ -99,9 +145,24 @@ function summarizePromptBundleProjection(
   };
 }
 
-/** The two deterministic refusals, as opposed to a transient I/O fault. */
+/**
+ * The two deterministic refusals, as opposed to a transient I/O fault.
+ *
+ * Discriminated on the constructor-set `name`, NOT on `instanceof`. A prototype check
+ * compares class identity, which is per module instance — and this module's graph is
+ * partially mocked in tests, so the same class imported down two paths is two objects
+ * and the check silently reports false. Measured: `instanceof` misrouted a
+ * `PromptBundleTooManyFilesError` into the over-budget branch under the full suite
+ * while passing in isolation. `name` is a string both constructors set explicitly, so
+ * it cannot be duplicated apart from the value it carries.
+ */
+const DETERMINISTIC_PROJECTION_REFUSAL_NAMES = new Set([
+  "PromptBundleOverBudgetError",
+  "PromptBundleTooManyFilesError",
+]);
+
 function isDeterministicProjectionRefusal(err: unknown): boolean {
-  return err instanceof PromptBundleOverBudgetError || err instanceof PromptBundleTooManyFilesError;
+  return err instanceof Error && DETERMINISTIC_PROJECTION_REFUSAL_NAMES.has(err.name);
 }
 
 /**
@@ -2901,11 +2962,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         // Anything else is rethrown unremembered: a transient I/O fault must not
         // suppress the measurement for the life of the process.
         if (!isDeterministicProjectionRefusal(err)) throw err;
-        sized = {
-          outcome: "refused",
-          errorName: err instanceof Error ? err.name : "unknown",
-          error: err instanceof Error ? err.message : String(err),
-        };
+        sized = describeProjectionRefusal(err as PromptBundleOverBudgetError | PromptBundleTooManyFilesError);
       }
       rememberPromptBundleSizing(sizingKey, sized);
     }
@@ -2919,10 +2976,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           level: "warn",
           event: "claude_k8s.prompt_bundle_projection_failed",
           msg: "could not size the projected prompt-bundle Secret; run is unaffected (measurement only)",
+          // The company and run EMITTING this line. The refusal's own fields below are
+          // run-independent by construction, so these are never a prior run's.
           companyId: ctx.agent.companyId,
           runId: ctx.runId,
           errorName: sized.errorName,
-          error: sized.error,
+          refusal: sized.detail,
           sizingCacheHit: cached !== undefined,
         }),
       );
@@ -2956,10 +3015,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       );
     }
   } catch (err) {
-    // Includes the deliberate over-budget and too-many-files refusals, which are the
-    // signal this measurement exists to find. Logged at warn with the error's own
-    // named shape rather than swallowed, so a company that would not fit the channel
-    // is visible NOW rather than when the claim swap makes it fatal.
+    // The TRANSIENT faults only — an ENOENT mid-walk, an EIO off CephFS. The two
+    // deliberate refusals are handled above as a `refused` outcome, because they are
+    // deterministic and worth caching; anything reaching here is this run's own fresh
+    // fault, so `error` is its message and no cached string can be stale. A consumer
+    // tells the two apart by `errorName`, and by `refusal` versus `error`.
     console.warn(
       JSON.stringify({
         level: "warn",
@@ -2969,6 +3029,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         runId: ctx.runId,
         errorName: err instanceof Error ? err.name : "unknown",
         error: err instanceof Error ? err.message : String(err),
+        sizingCacheHit: false,
       }),
     );
   }

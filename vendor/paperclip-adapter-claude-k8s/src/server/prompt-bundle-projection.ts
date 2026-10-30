@@ -206,6 +206,15 @@ export type PromptBundleSecretProjection = {
  * that quietly came up missing half its instructions.
  */
 export class PromptBundleOverBudgetError extends Error {
+  /**
+   * Narrowed to a literal so `name` is a usable discriminant in the TYPE system as
+   * well as at runtime. Callers must key on it rather than on `instanceof`: a
+   * prototype check compares class identity, which is per module instance, and this
+   * module is imported down more than one path in a partially-mocked graph — where
+   * the same class is two objects and `instanceof` silently reports false.
+   * `declare` emits nothing; the constructor below still does the assigning.
+   */
+  declare readonly name: "PromptBundleOverBudgetError";
   readonly companyId: string;
   readonly runLabel: string;
   readonly totalValueBytes: number;
@@ -243,6 +252,8 @@ export class PromptBundleOverBudgetError extends Error {
 
 /** Raised when a skill's tree exceeds `PROMPT_BUNDLE_MAX_FILES`. Refuses, as above. */
 export class PromptBundleTooManyFilesError extends Error {
+  /** A literal discriminant, for the reason given on `PromptBundleOverBudgetError`. */
+  declare readonly name: "PromptBundleTooManyFilesError";
   readonly skillKey: string;
   readonly limit: number;
 
