@@ -131,6 +131,8 @@ function BlockedByParkedWorkPanel() {
           attentionBlockerCount: 1,
           sampleBlockerIdentifier: parkedBlocker.identifier,
           sampleStalledBlockerIdentifier: null,
+          humanAssignedCoveredBlockerCount: 0,
+          oldestHumanAssignedCoveredIdleHours: null,
         }}
       />
     </div>
@@ -170,6 +172,8 @@ function ListRowsPanel() {
               attentionBlockerCount: 1,
               sampleBlockerIdentifier: "PAP-3683",
               sampleStalledBlockerIdentifier: null,
+              humanAssignedCoveredBlockerCount: 0,
+              oldestHumanAssignedCoveredIdleHours: null,
             },
           })}
         />

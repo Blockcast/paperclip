@@ -225,6 +225,8 @@ describe("IssueBlockedNotice", () => {
           attentionBlockerCount: 0,
           sampleBlockerIdentifier: "TASK-1",
           sampleStalledBlockerIdentifier: null,
+          humanAssignedCoveredBlockerCount: 0,
+          oldestHumanAssignedCoveredIdleHours: null,
         }}
         blockers={[
           {
@@ -272,6 +274,8 @@ describe("IssueBlockedNotice", () => {
           attentionBlockerCount: 0,
           sampleBlockerIdentifier: "TASK-11",
           sampleStalledBlockerIdentifier: null,
+          humanAssignedCoveredBlockerCount: 0,
+          oldestHumanAssignedCoveredIdleHours: null,
         }}
         blockers={[
           {
@@ -449,6 +453,8 @@ describe("IssueBlockedNotice", () => {
           attentionBlockerCount: 0,
           sampleBlockerIdentifier: "TASK-99",
           sampleStalledBlockerIdentifier: null,
+          humanAssignedCoveredBlockerCount: 0,
+          oldestHumanAssignedCoveredIdleHours: null,
         }}
         blockers={[
           {

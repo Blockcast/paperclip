@@ -2138,6 +2138,8 @@ describe("IssueChatThread", () => {
               attentionBlockerCount: 0,
               sampleBlockerIdentifier: "PAP-2002",
               sampleStalledBlockerIdentifier: null,
+              humanAssignedCoveredBlockerCount: 0,
+              oldestHumanAssignedCoveredIdleHours: null,
             }}
             blockedBy={[
               {
@@ -2217,6 +2219,8 @@ describe("IssueChatThread", () => {
               attentionBlockerCount: 0,
               sampleBlockerIdentifier: "PAP-3001",
               sampleStalledBlockerIdentifier: null,
+              humanAssignedCoveredBlockerCount: 0,
+              oldestHumanAssignedCoveredIdleHours: null,
             }}
             blockedBy={[
               {
@@ -2280,6 +2284,8 @@ describe("IssueChatThread", () => {
               attentionBlockerCount: 0,
               sampleBlockerIdentifier: "PAP-4001",
               sampleStalledBlockerIdentifier: null,
+              humanAssignedCoveredBlockerCount: 0,
+              oldestHumanAssignedCoveredIdleHours: null,
             }}
             blockedBy={[
               {
@@ -2343,6 +2349,8 @@ describe("IssueChatThread", () => {
                 attentionBlockerCount: state === "needs_attention" ? 1 : 0,
                 sampleBlockerIdentifier: "PAP-5001",
                 sampleStalledBlockerIdentifier: state === "stalled" ? "PAP-5001" : null,
+                humanAssignedCoveredBlockerCount: 0,
+                oldestHumanAssignedCoveredIdleHours: null,
               }}
               blockedBy={[
                 {

@@ -51,5 +51,10 @@ export function resolveInboxIssueBlockerAttention(
     attentionBlockerCount: blockerAttention?.attentionBlockerCount ?? 0,
     sampleBlockerIdentifier: blockerAttention?.sampleBlockerIdentifier ?? null,
     sampleStalledBlockerIdentifier: blockerAttention?.sampleStalledBlockerIdentifier ?? null,
+    // PEN-5105 observation fields. This synthesises a `covered` verdict from live
+    // descendants rather than from a blocker classification, so no human-assigned blocker
+    // arm was consulted and 0/null is the accurate reading, not a placeholder.
+    humanAssignedCoveredBlockerCount: blockerAttention?.humanAssignedCoveredBlockerCount ?? 0,
+    oldestHumanAssignedCoveredIdleHours: blockerAttention?.oldestHumanAssignedCoveredIdleHours ?? null,
   };
 }
