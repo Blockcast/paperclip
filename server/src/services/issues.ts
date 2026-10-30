@@ -3499,17 +3499,37 @@ async function listIssueProductivityReviewMap(
 }
 
 /**
+ * Is this blocker's assignee an agent that can actually be invoked?
+ *
+ * `BLOCKER_ATTENTION_INVOKABLE_AGENT_STATUSES` exists so that a blocker owned by a
+ * `paused`/`terminated`/foreign-company agent is not read as attended: nothing will come
+ * back to it. Extracted from the leaf arm below so the park term and the leaf arm share one
+ * statement of "invokable" rather than two that can drift.
+ */
+function hasInvokableBlockerAssignee(
+  assigneeAgentId: string | null | undefined,
+  agentsById: Map<string, IssueBlockerAttentionAgentRow>,
+  companyId: string,
+): boolean {
+  if (!assigneeAgentId) return false;
+  const assignee = agentsById.get(assigneeAgentId);
+  if (!assignee || assignee.companyId !== companyId) return false;
+  return BLOCKER_ATTENTION_INVOKABLE_AGENT_STATUSES.has(assignee.status);
+}
+
+/**
  * Does a deliberate park on this blocker amount to an ATTENDED wait?
  *
- * PEN-5021. `blockerAttention` read a blocker's `status` and its monitor, but never its
- * park — so a blocker that had been deliberately stood down, with a release wake already
- * owed to it, was classified `stalled` exactly like one nobody had touched. Measured twice
- * in one sweep (PEN-4969 via PEN-4874, PEN-4931 via PEN-4656) and five times across three
- * sweeps, always with the same missing term. Each false `stalled` mints a `severity: "high"`
- * attention item asking a human to pick an owner for work that is already owned.
+ * PEN-5021. The `in_review` arm's `hasWaitingPath` read a blocker's run, its human assignee
+ * and its monitor, but never its park — so a blocker that had been deliberately stood down,
+ * with a release wake already owed to it, was classified `stalled` exactly like one nobody
+ * had touched. Measured twice in one sweep (PEN-4969 via PEN-4874, PEN-4931 via PEN-4656)
+ * and five times across three sweeps, always `in_review`, always with the same missing term.
+ * Each false `stalled` mints a `severity: "high"` attention item asking a human to pick an
+ * owner for work that is already owned.
  *
- * The conjuncts are exactly the ones that make the park produce a wake, because "attended"
- * here means "something will come back to it", not "someone wrote a date on it":
+ * The conjuncts are exactly the ones that make the park produce a wake that lands, because
+ * "attended" here means "something will come back to it", not "someone wrote a date on it":
  *
  *  - `isDeliberateParkActive` — the deadline is in the future. This is NOT restated here;
  *    `services/issue-park-expiry.ts` is the documented single owner of the live-park
@@ -3517,23 +3537,35 @@ async function listIssueProductivityReviewMap(
  *    BLO-22660). This is the fourth caller, not a fourth copy. A lapsed or unparseable
  *    deadline reads as not-parked, so suppression expires on its own.
  *  - `isIssueParkExpiryWakeStatus` — the sweep wakes `backlog`/`todo`/`in_progress`/
- *    `in_review` only. `blocked` is deliberately excluded there, so a parked `blocked`
- *    blocker keeps classifying as before.
+ *    `in_review` only. Redundant at the single call site below, which is already inside the
+ *    `in_review` arm, and kept anyway so the predicate states the whole condition under
+ *    which a park owes a wake rather than half of it.
  *  - an agent to wake, and no human assignee — `issueParkOwesReleaseWake` requires both,
  *    because `enqueueWakeup` takes an agent id and a park on a human-assigned row is a note
- *    to a person rather than a schedulable wake. Covering a park that owes no wake would
- *    open a quiet hole of exactly the kind PEN-5021's second half is about; human-assigned
- *    blockers already reach `covered` by their own arm below.
+ *    to a person rather than a schedulable wake. Human-assigned blockers already reach
+ *    `covered` by their own arm above.
+ *  - **and that agent must be invokable.** `issueParkOwesReleaseWake` does not check this,
+ *    because it decides whether to ENQUEUE a wake; this decides whether the wake will be
+ *    SERVED. A park whose assignee is paused, terminated or in another company is owed a
+ *    wake that no runnable agent can take, so it is not attendance.
  *
- * Consequently this can only move a blocker from `stalled` to `covered` — never from
- * `needs_attention`, and never in the direction of more feed volume.
+ * Call site is the `in_review` arm only, deliberately. A park is the same statement about
+ * attendance on every status the sweep wakes, but the earlier, status-agnostic placement of
+ * this check short-circuited ahead of the `backlog` arm, the downstream recursion and the
+ * leaf invokability check — which could turn `needs_attention` into `covered` and, worse,
+ * stop the walk before a hard-attention item deeper in the chain was ever reached. All five
+ * measured instances are `in_review`; widening past the evidence here buys nothing and risks
+ * the quiet direction, which PEN-5021 records as the more expensive of the two.
  */
 function hasLiveDeliberateParkWakePath(
   node: Pick<IssueBlockerAttentionNode, "status" | "assigneeAgentId" | "assigneeUserId" | "parkedUntil">,
   nowMs: number,
+  agentsById: Map<string, IssueBlockerAttentionAgentRow>,
+  companyId: string,
 ): boolean {
   if (!isIssueParkExpiryWakeStatus(node.status)) return false;
-  if (!node.assigneeAgentId || node.assigneeUserId) return false;
+  if (node.assigneeUserId) return false;
+  if (!hasInvokableBlockerAssignee(node.assigneeAgentId, agentsById, companyId)) return false;
   return isDeliberateParkActive(node.parkedUntil, nowMs);
 }
 
@@ -3891,18 +3923,15 @@ async function listIssueBlockerAttentionMap(
     if (explicitWaitingIssueIds.has(node.id)) {
       return { covered: true, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
     }
-    // PEN-5021. Status-agnostic on purpose, and placed beside the other attendance reads
-    // rather than inside the `in_review` arm below: `in_review` is where the false `stalled`
-    // was measured, but a park is the same statement about attendance on every status the
-    // park-expiry sweep wakes, and one site cannot drift from itself.
-    if (hasLiveDeliberateParkWakePath(node, blockerAttentionNowMs)) {
-      return { covered: true, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
-    }
     if (node.assigneeUserId && node.status !== "cancelled") {
       return { covered: true, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
     }
     if (node.status === "in_review") {
-      const hasWaitingPath = activeIssueIds.has(node.id) || Boolean(node.assigneeUserId) || hasValidBlockerMonitor(node);
+      // PEN-5021: a live deliberate park is a waiting path. See `hasLiveDeliberateParkWakePath`.
+      const hasWaitingPath = activeIssueIds.has(node.id)
+        || Boolean(node.assigneeUserId)
+        || hasValidBlockerMonitor(node)
+        || hasLiveDeliberateParkWakePath(node, blockerAttentionNowMs, agentsById, companyId);
       if (hasWaitingPath) {
         return { covered: true, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
       }
@@ -3953,11 +3982,8 @@ async function listIssueBlockerAttentionMap(
       };
     }
 
-    if (node.assigneeAgentId) {
-      const assignee = agentsById.get(node.assigneeAgentId);
-      if (!assignee || assignee.companyId !== companyId || !BLOCKER_ATTENTION_INVOKABLE_AGENT_STATUSES.has(assignee.status)) {
-        return { covered: false, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
-      }
+    if (node.assigneeAgentId && !hasInvokableBlockerAssignee(node.assigneeAgentId, agentsById, companyId)) {
+      return { covered: false, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
     }
 
     return { covered: false, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
