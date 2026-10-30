@@ -267,6 +267,30 @@ where it is now.
 
 ### 7.1 Statement
 
+**Predicate — what is being counted (settled 2026-10-29 by the CTO; D-1 on
+[PEN-4989](https://paperclip.blockcast.net/PEN/issues/PEN-4989), recorded in
+`PEN-4989-absolute-path-git-population-widening.md`, *lands in #3102*).** Throughout §7.1, §7.2
+trigger 4 and §8 the thing counted is an **unwrapped `git`**: an invocation that **reached a real
+`git` binary without transiting the wrapper**. That is §7.2 trigger 4's own inline wording — *"any
+invocation **reaching** `/usr/bin/git` that did not come through the wrapper"* — and **it governs**.
+Where this section says "absolute-path caller" it is drafting lag, and is **conformed to §7.2, not
+the reverse**.
+
+Two consequences, both load-bearing:
+
+- ⛔ The literal reading — `argv[0] == "/usr/bin/git"` — is **rejected as incoherent**, not merely
+  narrow. It scores as zero a bare `git` that a narrowed `PATH` resolves straight to the real
+  binary with no wrapper anywhere in its ancestry, which is precisely the event the trigger exists
+  to catch. A predicate that cannot see its own subject is not a narrower predicate; it is a
+  broken one.
+- **"A real `git`" is two binaries, not one.** The image ships `/usr/bin/git` **and**
+  `/usr/lib/git-core/git` as separate inodes holding byte-identical copies, and both count. This
+  is why the instrument discovers its targets by content identity rather than by path.
+
+⚠ **This predicate is not what makes the count of 28 stand** — 26 of the 28 reach `/usr/bin/git`
+itself with no wrapper in their ancestry, so trigger 4 fires on the literal text too (below). It is
+settled here so the *next* measurement is not re-litigated, not to justify this one.
+
 Between 2026-10-28 and the delivery of D1, an agent that deliberately sets out to publish material
 `scrubGitHubEgressText` would remove **can do so**, by invoking the real binary — which
 `/etc/gitconfig` then authenticates for it (§4). This is accepted, with eyes open, on these
@@ -358,8 +382,10 @@ score this finding **zero**. Read against trigger 4's own words — *"any invoca
 here**: 26 of the 28 resolve a bare `git` through a narrowed `PATH` to `/usr/bin/git` itself, with
 no wrapper anywhere in their ancestry. They reached `/usr/bin/git` and did not come through the
 wrapper, so **trigger 4 fires on its own literal text**. (The remaining 2 reach
-`/usr/lib/git-core/git` and are PEN-4998's separately-triaged class.) §7.1 should still be made to
-say which predicate it means — but that is a clarification, not a precondition for acting on this.
+`/usr/lib/git-core/git` and are PEN-4998's separately-triaged class.) ✅ §7.1 now **does** say
+which predicate it means — the predicate block at the head of this section, settled by D-1 on
+2026-10-29. That clarification was never a precondition for acting on the firing, and it has now
+been made.
 
 **Mechanism — a class, not a site.** The 26 come from first-party test code that spawns a child
 with `PATH` narrowed to `` `${bin}:/usr/bin:/bin` `` so that a stub binary is genuinely the only
@@ -1318,10 +1344,14 @@ Permitted without further security review:
   **PEN-5012**. See §7.1 and
   [`PEN-4986-absolute-path-git-runtime-measurement.md`](./PEN-4986-absolute-path-git-runtime-measurement.md),
   whose own headline records the *first* window and says so — do not cite that document's "zero"
-  as the answer. The tool is `scripts/measure-absolute-path-git.mjs`; re-take it on any agent-image
-  or PATH change. ⚠ Re-taking it is still permitted here and is still only an observation — but
-  note that the measurement has already discharged its purpose, so a further re-take neither
-  revives the acceptance nor is required to end it.
+  as the answer. The tool is `scripts/measure-absolute-path-git.mjs`; **re-take it on the
+  trigger §7.1 states** — a change to the *egress-relevant surface* (the wrapper, the runtime it
+  `exec`s, the credential helper, the set of real git binaries, the PATH ordering). ⚠ Not "on any
+  agent-image change", which this bullet said until 2026-10-30 and which §7.1 measured as
+  inoperable at ≈15 image changes a day; the two now agree, and §7.1 is the one to quote.
+  ⚠ Re-taking it is still permitted here and is still only an observation — but note that the
+  measurement has already discharged its purpose, so a further re-take neither revives the
+  acceptance nor is required to end it.
 
 Not permitted without returning here first:
 
