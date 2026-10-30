@@ -19,14 +19,30 @@ a merge moves it. Regenerate the branch instead:
 
 ```sh
 git fetch origin master
-TIP=$(git rev-parse --short origin/master)
 git worktree add --detach /tmp/graphify origin/master   # leave the shared checkout alone
 cd /tmp/graphify
 graphify update server/src --force                      # ~5-7 min, no LLM key needed
-git checkout -B bot/graphify-reindex                    # name the branch AT the tip it was built on
-git commit -am "chore: refresh knowledge graphs @ ${TIP}"
-git push --force-with-lease origin bot/graphify-reindex
+git checkout --no-track -B graphify-regen origin/master # local name, deliberately NOT the PR branch
+git commit -am "chore: refresh knowledge graphs @ $(git rev-parse --short origin/master)"
+
+EXPECTED=$(git rev-parse origin/bot/graphify-reindex)   # the head you are replacing
+git push --force-with-lease=refs/heads/bot/graphify-reindex:"$EXPECTED" \
+         origin graphify-regen:bot/graphify-reindex
 ```
+
+Two details in there are load-bearing, not style:
+
+- **`--no-track`, and a local branch name that is not the PR branch.** `git checkout
+  -B bot/graphify-reindex origin/master` sets the new branch's upstream to
+  `origin/master`, so a later bare `git push` refuses with *"The upstream branch of
+  your current branch does not match the name of your current branch"* and helpfully
+  suggests `git push origin HEAD:master` — which would land the graph commit on
+  `master`. Reusing the PR branch's own name also collides with the primary checkout
+  (`fatal: 'bot/graphify-reindex' is already used by worktree at …`) whenever it is
+  checked out there, which is the common case for whoever has the PR open.
+- **A lease with an explicit sha.** A bare `--force-with-lease` takes its expectation
+  from the remote-tracking ref, which any `fetch` in the same run can advance, so it
+  protects nothing; the fleet's egress wrapper refuses it outright for that reason.
 
 Measured cost: **5m04s** and **6m40s** on two runs (1350 files, 64 workers; the
 second had a competing build on the same box). No LLM key and no CronJob are
@@ -168,7 +184,7 @@ merge commit `474dd5ea` taken under PEN-5025.
 |---|---|---|
 | Scope the comparison tighter than `server/src` | **rejected** | 100% of changed files are `.ts`; tests are only 16.4% of invalidating commits and 29% of the graph. Buys 1.20×. |
 | Compare against the PR's merge base, not the live tip | **rejected** | It is the regression this gate was built to fix — #1550 sat 98 commits behind with `staleness` green. Pinned by the workflow header and its test. |
-| Raise the CronJob cadence | **rejected** | All 12 on-cadence runs already pass. Cadence is not the failure axis. |
+| Raise the CronJob cadence | **rejected** | The gate has never failed on-cadence (0 failures in 16 runs). Cadence is not the failure axis. |
 | Have the gate re-dispatch the builder | **narrowed and deferred** | The loop is worth closing, but not by giving an evaluating gate a write path — compare `review-gate-merge-group.yml`'s deliberate `permissions: {}`. Wants an operator-dispatched rebuild (`workflow_dispatch`) and owner sign-off on the push credential. |
 | **Make the printed remedy correct, and document the recovery** | **adopted** | The measured defect is not the comparison point; it is that the remedy the gate prints does not work on the branch it prints it on, and that path had no test. |
 

@@ -199,10 +199,18 @@ test("a failing verdict prints the regenerate-from-the-tip recovery", (t) => {
   const r = scenario(t, { path: "server/src/a.ts", content: "export const a = 2;\n" });
   assert.equal(r.status, 1, r.out);
   assert.match(r.out, /How to clear this gate/);
-  assert.match(r.out, /git checkout -B <branch> origin\/master/);
+  assert.match(r.out, /git checkout --no-track -B graphify-regen origin\/master/);
   // The literal `$(...)` has to survive the heredoc so it is runnable as printed.
   assert.match(r.out, /git rev-parse --short origin\/master/);
   assert.doesNotMatch(r.out, /Rebuild: graphify update/);
+  // The push must name its remote and refspec. A bare `git push` here resolves
+  // against the upstream `-B <branch> origin/master` would have set, which git
+  // answers by suggesting `git push origin HEAD:master` — i.e. the graph commit
+  // onto the base branch. A bare `--force-with-lease` leases against the
+  // tracking ref and protects nothing, so the printed lease must name a sha.
+  assert.match(r.out, /git push --force-with-lease=refs\/heads\/<pr-branch>:<expected> origin graphify-regen:<pr-branch>/);
+  assert.doesNotMatch(r.out, /git push --force-with-lease\s*$/m);
+  assert.doesNotMatch(r.out, /git checkout -B <branch>/);
 });
 
 test("regenerating the branch at the base tip clears the gate", (t) => {

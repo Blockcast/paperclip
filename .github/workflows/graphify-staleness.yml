@@ -91,10 +91,21 @@ jobs:
           sitting directly on a ${BASE_REF} commit.
 
             git fetch origin ${BASE_REF}
-            git checkout -B <branch> origin/${BASE_REF}
+            git worktree add --detach /tmp/graphify origin/${BASE_REF}
+            cd /tmp/graphify
             graphify update <scope> --force
+            git checkout --no-track -B graphify-regen origin/${BASE_REF}
             git commit -am "chore: refresh knowledge graphs @ \$(git rev-parse --short origin/${BASE_REF})"
-            git push --force-with-lease
+            git rev-parse origin/<pr-branch>   # the sha you are replacing: <expected>
+            git push --force-with-lease=refs/heads/<pr-branch>:<expected> origin graphify-regen:<pr-branch>
+
+          A neutral local name and an explicit refspec are both load-bearing.
+          \`-B <pr-branch> origin/${BASE_REF}\` sets the new branch's upstream to
+          origin/${BASE_REF}, so a bare \`git push\` then refuses and tells you to run
+          \`git push origin HEAD:${BASE_REF}\` -- which would put the graph commit on
+          ${BASE_REF}; and the name collides with the primary checkout if the PR
+          branch is checked out there. A bare \`--force-with-lease\` takes its
+          expectation from the tracking ref, so it protects nothing; name the sha.
 
           Do NOT merge or rebase ${BASE_REF} into the branch instead. Neither moves
           \`built_at_commit\` — it is a field inside graph.json, not a git relationship —
