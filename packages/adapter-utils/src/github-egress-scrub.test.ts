@@ -1162,6 +1162,8 @@ describe("scrubGitHubEgressText", () => {
     it("passes a networkID label matcher and its YAML exp_labels form byte-exact", () => {
       for (const text of [
         `gateway_checkin_status{${pair("networkID", `"${NETWORK_ID}"`)}}`,
+        // Pre-existing pass-through, not coverage for this fix: ASSIGNMENT_RE
+        // needs `=`, so the YAML form never reaches the networkID exemption.
         `networkID: ${NETWORK_ID}`,
       ]) {
         expect(scrubGitHubEgressText(text).text).toBe(text);
@@ -1174,6 +1176,10 @@ describe("scrubGitHubEgressText", () => {
       ["networkID", SYNTHETIC_OPAQUE_VALUE],
       ["networkID", "s7Kq2Vt9-Lm4X-b8Nd-3Wp6-Zc1Yr5Hj0Tg9"],
       ["networkID", NETWORK_ID.toUpperCase()],
+      // Lowercase 8-4-4-4-12 but not hex: pins the hex alphabet ([0-9a-z] would pass it).
+      ["networkID", "s7kq2vt9-lm4x-b8nd-3wp6-zc1yr5hj0tg9"],
+      // UUID plus a dashed suffix: pins the `$` anchor.
+      ["networkID", `${NETWORK_ID}-deadbeefcafe`],
       ["token", NETWORK_ID],
     ])("still refuses a credential-shaped value under %s", (name, value) => {
       const result = scrubGitHubEgressText(pair(name, value));
