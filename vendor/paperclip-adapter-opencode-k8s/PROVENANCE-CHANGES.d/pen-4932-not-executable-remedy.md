@@ -37,9 +37,20 @@ the image build specifically.
 
 The wording also stops short of naming the bake as the cause. `Dockerfile:695`
 lays the hook down with `COPY --chmod=0755`, so a file arriving without `+x` is
-more likely a bake from a different stage, or a non-executable mount, than a
-mode lost in this one. The remedy is the same under either, so the verdict
-states the observation and leaves the reader to tell them apart.
+more likely a bake from a different stage than a mode lost in this one. The
+remedy is the same under either, so the verdict states the observation and
+leaves the reader to tell them apart.
+
+A third origin — a non-executable mount over the hooks directory — was
+considered and is ruled out by measurement rather than by argument. Read from a
+live agent pod on 2026-10-30: `findmnt -T /usr/local/libexec/paperclip/hooks`
+resolves to `/` on `overlay`, and no mount target in the pod is at or under
+that path, so nothing is mounted over `BAKED_HOOKS_DIR`. The only
+hooks-related mount is the seeded `DEFAULT_HOOKS_DIR` copy at
+`/paperclip/.local/share/paperclip-git-hooks`, which this arm no longer reads;
+it is `ro`, and neither it nor the overlay root carries `noexec`. So "the image
+build" is not a guess that happens to exclude the mount — it is what is left
+once the mount is checked.
 
 The verdict NAME is unchanged, as in the repoint and for the same reason: fleet
 greps are written against the shapes, not the prose.
