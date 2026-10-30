@@ -514,7 +514,7 @@ describe("buildPrePushHookPreflightShell (PEN-4518)", () => {
     }
   });
 
-  it("reports NOT-EXECUTABLE for a present hook without +x, and names the +x remedy", () => {
+  it("reports NOT-EXECUTABLE for a present hook without +x, and names the image-roll remedy", () => {
     const f = fixture();
     try {
       mkdirSync(f.runtime, { recursive: true });
@@ -525,10 +525,17 @@ describe("buildPrePushHookPreflightShell (PEN-4518)", () => {
       // The consequence has to match what the runtime does. `prePushHookPresent`
       // checks with `accessSync(X_OK)`, so a non-executable hook is REFUSED, not
       // published unscanned — a verdict announcing an unscanned publish would
-      // route the reader to incident response instead of to `chmod +x`.
+      // route the reader to incident response rather than to the image build.
       expect(res.stderr).toContain("refuse every push from this pod");
-      expect(res.stderr).toContain("restore +x");
       expect(res.stderr).not.toContain("publishes unscanned");
+      // And the remedy has to be one the reader can actually carry out. This arm
+      // fires on BAKED_HOOKS_DIR, which PEN-4932 made the path the runtime reads:
+      // the image copy, `root:root 0755` from `COPY --chmod=0755`. No uid-1000
+      // process in the pod can chmod it, so the pre-PEN-4932 text — "restore +x
+      // on the seeded hook" — named both the wrong file and an action nobody in
+      // the pod could take. Pinned negatively so it cannot drift back.
+      expect(res.stderr).toContain("roll the image forward");
+      expect(res.stderr).not.toContain("restore +x");
     } finally {
       f.cleanup();
     }
