@@ -101,6 +101,57 @@ describe("duplicate candidate lookup outcome classification (PEN-5019)", () => {
     expect(classifyIssueDuplicateCandidateLookupOutcome(err)).toBe("deadline_exceeded");
   });
 
+  it("records deadline_exceeded, NOT statement_timeout, when both budgets are equal", async () => {
+    // THE SHIPPED CONFIGURATION, and the reason the metric documents the
+    // Postgres `57014` log line against `deadline_exceeded`. Both call sites
+    // derive the in-process race budget and the transaction-local
+    // `statement_timeout` from ONE value, and the race is armed strictly
+    // earlier -- before the reservation, the BEGIN, the set_config and the
+    // company-scope read. So even with a genuine server-side cancel already in
+    // flight, the race rejects first and the cancel is never observed here.
+    //
+    // Modelled with the cancel landing a tick after the shared budget, which is
+    // the best case for the statement: in production it also carries all the
+    // setup the race timer counted and Postgres did not.
+    const statementCancel = Object.assign(
+      new Error("canceling statement due to statement timeout"),
+      { code: "57014" },
+    );
+    const cancelledLate = new Promise<never>((_, reject) => {
+      setTimeout(() => reject(statementCancel), 20);
+    });
+    const err = await raceCreateIssueDuplicateCandidateLookup(cancelledLate, 5)
+      .catch((caught: unknown) => caught);
+
+    expect(classifyIssueDuplicateCandidateLookupOutcome(err)).toBe("deadline_exceeded");
+    expect(err).not.toBe(statementCancel);
+    // Keep the late rejection from surfacing as an unhandled rejection: the
+    // real abandoned statement has the same fate, which is the whole point.
+    await cancelledLate.catch(() => {});
+  });
+
+  it("records statement_timeout once the race is given grace over the statement budget", async () => {
+    // The other half of the same invariant: `statement_timeout` is unreachable
+    // because of the EQUAL BUDGETS, not because the classifier or the throw
+    // site cannot produce it. Widen the race past the statement budget and the
+    // server-side cancel becomes the rejection that surfaces, with no other
+    // change. This is what makes keeping the label honest rather than dead --
+    // and it fails loudly if someone ever changes the budgets without
+    // revisiting the metric documentation.
+    const statementCancel = Object.assign(
+      new Error("canceling statement due to statement timeout"),
+      { code: "57014" },
+    );
+    const cancelledEarly = new Promise<never>((_, reject) => {
+      setTimeout(() => reject(statementCancel), 5);
+    });
+    const err = await raceCreateIssueDuplicateCandidateLookup(cancelledEarly, 200)
+      .catch((caught: unknown) => caught);
+
+    expect(classifyIssueDuplicateCandidateLookupOutcome(err)).toBe("statement_timeout");
+    expect(err).toBe(statementCancel);
+  });
+
   it("tags a reservation that never lands as connection_unavailable", async () => {
     // A pool that can never hand out a connection: the scan never reaches
     // Postgres, so this is not a database-slowness signal and must not read as
