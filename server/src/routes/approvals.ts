@@ -239,8 +239,8 @@ async function gateAlreadyTerminalRefusal(payload: unknown) {
         "credential grant, an operator action — do not set `payload.gate` at all. It is not a " +
         "general 'related link' field: it means the ask IS a human clicking that Actions gate, " +
         "and the card is retired the moment that run ends, whether or not your ask was ever " +
-        "read. Put the PR or run URL in `payload.title` / `payload.ask` instead, where it " +
-        "informs a human without binding the card's lifetime to it.",
+        "read. Put the PR or run URL in `payload.title` instead, where it informs a human " +
+        "without binding the card's lifetime to it.",
     },
   };
 }
@@ -982,7 +982,12 @@ export function approvalRoutes(
     // a caller-SUPPLIED payload — re-checking a stored gate would refuse a resubmit for
     // a run that has terminated since, which is a card the board asked to see again and
     // is not the mistake this guard is about.
-    if (normalizedPayload !== undefined) {
+    //
+    // Status first, for the same reason the budget guard gives above: only a
+    // `revision_requested` card can reach `pending`, so anything else fails in
+    // `svc.resubmit()` on status, and answering that with a gate complaint points the
+    // caller at the wrong problem. Raised by Ally reviewing `3105e66`.
+    if (existing.status === "revision_requested" && normalizedPayload !== undefined) {
       const gateRefusal = await gateAlreadyTerminalRefusal(normalizedPayload);
       if (gateRefusal) {
         res.status(422).json(gateRefusal);
