@@ -12,6 +12,8 @@ import {
   PROMPT_BUNDLE_SECRET_MAX_BYTES,
   PROMPT_BUNDLE_SKILLS_DIR,
   PromptBundleOverBudgetError,
+  PromptBundleSymlinkCycleError,
+  PromptBundleSymlinkEscapesTreeError,
   PromptBundleTooManyFilesError,
   buildPromptBundleSecretProjection,
   skillSourceNeedsProjection,
@@ -290,25 +292,177 @@ describe("buildPromptBundleSecretProjection", () => {
     ).rejects.toBeInstanceOf(PromptBundleTooManyFilesError);
   });
 
-  it("steps over symlinks rather than following them out of the tree", async () => {
+  it("REFUSES a symlink whose target escapes the skill tree", async () => {
+    // The pod reads this target today by following the link across the shared volume.
+    // Projecting the link without its target would dangle on the swap; copying an
+    // out-of-tree target into the run's Secret would carry bytes the tree does not own.
+    // Neither is acceptable, so the projection refuses and names the link.
     const source = await writeSkill("linky", { "SKILL.md": "real" });
     const outside = path.join(tmpRoot, "outside.md");
     await fs.writeFile(outside, "escaped", "utf-8");
     await fs.symlink(outside, path.join(source, "link.md"));
+    await expect(
+      buildPromptBundleSecretProjection({
+        ...base,
+        serverDataMountPath: tmpRoot,
+        skills: [entry({ key: "linky", source })],
+        instructionsContents: null,
+      }),
+    ).rejects.toBeInstanceOf(PromptBundleSymlinkEscapesTreeError);
+  });
+
+  it("names the link, its target and the tree root on an escaping-symlink refusal", async () => {
+    const source = await writeSkill("linky", { "SKILL.md": "real" });
+    const outside = path.join(tmpRoot, "outside.md");
+    await fs.writeFile(outside, "escaped", "utf-8");
+    await fs.symlink(outside, path.join(source, "link.md"));
+    const err = await buildPromptBundleSecretProjection({
+      ...base,
+      serverDataMountPath: tmpRoot,
+      skills: [entry({ key: "linky", source })],
+      instructionsContents: null,
+    }).catch((e: unknown) => e as PromptBundleSymlinkEscapesTreeError);
+    expect(err.name).toBe("PromptBundleSymlinkEscapesTreeError");
+    expect(err.skillKey).toBe("linky");
+    expect(err.linkPath).toBe("link.md");
+    expect(err.resolvedTarget).toBe(await fs.realpath(outside));
+    expect(err.treeRoot).toBe(await fs.realpath(source));
+  });
+
+  it("resolves a within-tree file symlink, delivering the TARGET's bytes under the LINK's path", async () => {
+    // This is the behaviour the swap depends on: `hashPathContents` resolves a link and
+    // hashes its target, and the pod reads that target today. Stepping over the link
+    // would be a file the pod silently stops getting on the run that swaps the claim.
+    const source = await writeSkill("linky", { "SKILL.md": "real", "docs/target.md": "target bytes" });
+    await fs.symlink(path.join(source, "docs/target.md"), path.join(source, "alias.md"));
     const projection = await buildPromptBundleSecretProjection({
       ...base,
       serverDataMountPath: tmpRoot,
       skills: [entry({ key: "linky", source })],
       instructionsContents: null,
     });
-    expect(projection!.items.map((i) => i.path)).toEqual([`${PROMPT_BUNDLE_SKILLS_DIR}/linky/SKILL.md`]);
-    expect(Object.values(projection!.stringData)).not.toContain("escaped");
-    // Counted, not merely skipped: a skipped link is a file the pod will not get, and
-    // leaving it out of the report would under-count the measurement in silence.
-    expect(projection!.skippedSymlinkCount).toBe(1);
+    const aliasKey = projection!.items.find((i) => i.path.endsWith("/linky/alias.md"))!.key;
+    expect(valueBytes(projection!, aliasKey).toString("utf8")).toBe("target bytes");
+    expect(projection!.resolvedSymlinkCount).toBe(1);
+    expect(projection!.danglingSymlinkCount).toBe(0);
   });
 
-  it("reports zero skipped links for a tree that has none", async () => {
+  it("resolves a RELATIVE within-tree symlink", async () => {
+    // Relative links are the common form in a real skill tree, and `realpath` is what
+    // makes the containment test meaningful for them.
+    const source = await writeSkill("rel", { "SKILL.md": "real", "docs/target.md": "target bytes" });
+    await fs.symlink("docs/target.md", path.join(source, "alias.md"));
+    const projection = await buildPromptBundleSecretProjection({
+      ...base,
+      serverDataMountPath: tmpRoot,
+      skills: [entry({ key: "rel", source })],
+      instructionsContents: null,
+    });
+    const aliasKey = projection!.items.find((i) => i.path.endsWith("/rel/alias.md"))!.key;
+    expect(valueBytes(projection!, aliasKey).toString("utf8")).toBe("target bytes");
+    expect(projection!.resolvedSymlinkCount).toBe(1);
+  });
+
+  it("descends a within-tree DIRECTORY symlink, projecting its files under the link's path", async () => {
+    const source = await writeSkill("dirlink", { "SKILL.md": "real", "real/a.md": "alpha" });
+    await fs.symlink(path.join(source, "real"), path.join(source, "mirror"));
+    const projection = await buildPromptBundleSecretProjection({
+      ...base,
+      serverDataMountPath: tmpRoot,
+      skills: [entry({ key: "dirlink", source })],
+      instructionsContents: null,
+    });
+    const paths = projection!.items.map((i) => i.path).sort();
+    // Both names, because the pod really does see the content under both.
+    expect(paths).toContain(`${PROMPT_BUNDLE_SKILLS_DIR}/dirlink/real/a.md`);
+    expect(paths).toContain(`${PROMPT_BUNDLE_SKILLS_DIR}/dirlink/mirror/a.md`);
+  });
+
+  it("REFUSES a directory symlink that resolves onto its own ancestor", async () => {
+    // `self -> .` expands without bound. Truncating at some depth would silently pick
+    // which of those paths the pod gets, so the walk refuses instead.
+    const source = await writeSkill("loopy", { "SKILL.md": "real" });
+    await fs.symlink(source, path.join(source, "self"));
+    await expect(
+      buildPromptBundleSecretProjection({
+        ...base,
+        serverDataMountPath: tmpRoot,
+        skills: [entry({ key: "loopy", source })],
+        instructionsContents: null,
+      }),
+    ).rejects.toBeInstanceOf(PromptBundleSymlinkCycleError);
+  });
+
+  it("does NOT treat two sibling links onto one directory as a cycle", async () => {
+    // A seen-directory check (rather than a true ancestor check) would call this a loop
+    // and drop one of the two names the pod can read — the silent loss this whole
+    // change exists to remove.
+    const source = await writeSkill("diamond", { "SKILL.md": "real", "real/a.md": "alpha" });
+    await fs.symlink(path.join(source, "real"), path.join(source, "one"));
+    await fs.symlink(path.join(source, "real"), path.join(source, "two"));
+    const projection = await buildPromptBundleSecretProjection({
+      ...base,
+      serverDataMountPath: tmpRoot,
+      skills: [entry({ key: "diamond", source })],
+      instructionsContents: null,
+    });
+    const paths = projection!.items.map((i) => i.path);
+    expect(paths).toContain(`${PROMPT_BUNDLE_SKILLS_DIR}/diamond/one/a.md`);
+    expect(paths).toContain(`${PROMPT_BUNDLE_SKILLS_DIR}/diamond/two/a.md`);
+  });
+
+  it("counts a dangling symlink rather than refusing, because it is not a delivery regression", async () => {
+    // A dangling link gives the pod nothing today either, so refusing would abort runs
+    // that currently work — a regression in the opposite direction.
+    const source = await writeSkill("broken", { "SKILL.md": "real" });
+    await fs.symlink(path.join(source, "gone.md"), path.join(source, "dangling.md"));
+    const projection = await buildPromptBundleSecretProjection({
+      ...base,
+      serverDataMountPath: tmpRoot,
+      skills: [entry({ key: "broken", source })],
+      instructionsContents: null,
+    });
+    expect(projection!.items.map((i) => i.path)).toEqual([`${PROMPT_BUNDLE_SKILLS_DIR}/broken/SKILL.md`]);
+    expect(projection!.danglingSymlinkCount).toBe(1);
+    expect(projection!.resolvedSymlinkCount).toBe(0);
+  });
+
+  it("does not refuse a within-tree link when the tree root is itself reached through a symlink", async () => {
+    // The managed skill root routinely sits under a symlinked mount component. Testing
+    // containment against the UNRESOLVED source would make every within-tree link look
+    // like an escape, refusing every run on such a deployment.
+    const realSource = await writeSkill("viaLink", { "SKILL.md": "real", "docs/target.md": "target bytes" });
+    await fs.symlink(path.join(realSource, "docs/target.md"), path.join(realSource, "alias.md"));
+    const aliasedRoot = path.join(tmpRoot, "aliased-skill");
+    await fs.symlink(realSource, aliasedRoot);
+    const projection = await buildPromptBundleSecretProjection({
+      ...base,
+      serverDataMountPath: tmpRoot,
+      skills: [entry({ key: "viaLink", source: aliasedRoot })],
+      instructionsContents: null,
+    });
+    expect(projection!.resolvedSymlinkCount).toBe(1);
+  });
+
+  it("rejects a sibling tree whose path merely shares a prefix with the skill root", async () => {
+    // `startsWith` without a separator boundary would accept `<root>-evil` as inside
+    // `<root>` — the containment check failing open on exactly its adversarial input.
+    const source = await writeSkill("prefix", { "SKILL.md": "real" });
+    const sibling = `${source}-evil`;
+    await fs.mkdir(sibling, { recursive: true });
+    await fs.writeFile(path.join(sibling, "leak.md"), "leaked", "utf-8");
+    await fs.symlink(path.join(sibling, "leak.md"), path.join(source, "link.md"));
+    await expect(
+      buildPromptBundleSecretProjection({
+        ...base,
+        serverDataMountPath: tmpRoot,
+        skills: [entry({ key: "prefix", source })],
+        instructionsContents: null,
+      }),
+    ).rejects.toBeInstanceOf(PromptBundleSymlinkEscapesTreeError);
+  });
+
+  it("reports zero resolved and zero dangling links for a tree that has none", async () => {
     const source = await writeSkill("plain", { "SKILL.md": "real" });
     const projection = await buildPromptBundleSecretProjection({
       ...base,
@@ -316,7 +470,8 @@ describe("buildPromptBundleSecretProjection", () => {
       skills: [entry({ key: "plain", source })],
       instructionsContents: null,
     });
-    expect(projection!.skippedSymlinkCount).toBe(0);
+    expect(projection!.resolvedSymlinkCount).toBe(0);
+    expect(projection!.danglingSymlinkCount).toBe(0);
     expect(projection!.skippedNonRegularCount).toBe(0);
   });
 
