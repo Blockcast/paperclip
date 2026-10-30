@@ -342,10 +342,10 @@ export function classifyRunLiveness(input: RunLivenessClassificationInput): RunL
   //    `nonLiveExecutionHoldSince` / `runLiveInterval`, recovery/service.ts
   //    `scanSilentActiveRuns` / `runningLockStaleBasis`: max/greatest, same.
   //  - metrics.ts `computeExternalLifecycleSilenceGapSeconds` uses first-non-null
-  //    precedence and WOULD shift -- but all three of its call sites observe the
-  //    run row BEFORE this classification is persisted (heartbeat.ts, the
-  //    recordExternalLifecycleRunSilenceGap call above classifyAndPersistRun-
-  //    Liveness, and the two cancel paths), so the metric never reads a value
+  //    precedence and WOULD shift -- but all four of its call sites observe the
+  //    run row BEFORE this classification is persisted (heartbeat.ts: the
+  //    reconciler and owner-finalization calls, each above classifyAndPersist-
+  //    RunLiveness, and the two cancel paths), so the metric never reads a value
   //    written here. Structurally unaffected, not merely unchanged in practice.
   //  - issue-run-holding.ts `runLastSignalMs` also uses first-non-null, but
   //    `isRunHoldingIssue` is status-only (`status === "running"`) and a
