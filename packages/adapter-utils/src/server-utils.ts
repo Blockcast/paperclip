@@ -2300,10 +2300,22 @@ export function ensurePathInEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   //
   // This is `preserve, never add`: only directories already on the ambient
   // PATH are carried in, so wherever no wrapper is installed — CI runners,
-  // developer laptops, Windows — every call here is an identity on the
-  // value this function produced before, and the substituted default is
-  // unchanged. On the agent image the guard already leads the ambient PATH,
-  // so the PATH-present branch is a no-op there as well.
+  // developer laptops, Windows — every call here reproduces the value this
+  // function produced before, and the substituted default is unchanged. On
+  // the agent image the guard already leads the ambient PATH, so the
+  // PATH-present branch is a no-op there as well.
+  //
+  // PEN-5066: "reproduces", not "is an identity on". guardedChildEnv() splits
+  // and rejoins, which drops empty and whitespace-only segments, so `a::b`
+  // comes back `a:b`. It is a literal identity for every PATH whose segments
+  // are all non-empty — every PATH observed here — and the gap runs toward
+  // safety: an empty POSIX segment means the current working directory, so
+  // dropping it removes an implicit cwd-on-PATH, not a guard.
+  //
+  // Making the claim literal by returning the environment untouched wherever
+  // guardEntriesOn() is empty is the wrong trade: this function's older
+  // contract is to SUPPLY a PATH when none is set, so that early return would
+  // drop the substituted default along with it.
   return guardedChildEnv(env, { fallback: defaultPathForPlatform().split(path.delimiter) });
 }
 
