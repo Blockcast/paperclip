@@ -51,11 +51,37 @@
 --
 -- WHY THIS REPLACES THE SINGLE-COLUMN INDEX RATHER THAN JOINING IT -- which
 -- is what dissolves 0268's objection. 0268 priced a SECOND GIN index on
--- `body`, the hottest write column in the schema. It is not needed: all five
--- queries in the repo that ILIKE/regex a comment body are ALREADY company-
--- scoped, so the composite serves every one of them and the single-column
--- index has no remaining caller. Measured on the seed above, each shape under
--- the single-column index and then under the composite alone:
+-- `body`, the hottest write column in the schema. It is not needed: the
+-- single-column index has no remaining caller. Every site in the repo that
+-- ILIKE/LIKE/regex-matches a comment body is one of two kinds, and the
+-- composite serves both:
+--
+--   COMPANY-SCOPED (10 call sites) -- the composite's index cond answers
+--   both halves, so each is the same or faster (measured below):
+--     server/src/services/company-search.ts:633 (single-pattern CTE),
+--       :640 (multi-pattern unnest join), :1017-1021 (snippet LATERAL)
+--     server/src/services/company-search-extract.ts:172-173 (one EXISTS,
+--       `~*` for a url query and ILIKE otherwise)
+--     server/src/services/issues.ts:4890, :6001, :6092, :8359
+--     server/src/services/authorization.ts:1564 (`LIKE '%agent://…%'`)
+--     server/src/services/productivity-review.ts:4428 (`~*`)
+--
+--   ISSUE-SCOPED, NOT company-scoped (2 sites) -- recovery marker lookups,
+--   `issue_id = $1 AND author_type = 'system' AND body LIKE '%marker%' LIMIT 1`:
+--     server/src/services/recovery/service.ts:8950, :14232
+--   These never used a trigram index on `body` in the first place.
+--   EXPLAINed on a 60,000-comment / 3,000-issue seed, with the single-column
+--   index present and then dropped, the plan and the cost are IDENTICAL:
+--     Limit -> Index Scan using issue_comments_company_issue_created_at_idx
+--       Index Cond: (issue_id = $1)
+--       Filter: ((body ~~ '%...%') AND (author_type = 'system'))
+--       Total Cost 46.28 both ways
+--   The issue_id equality is selective enough to drive the scan and the body
+--   match is a recheck over one issue's comments, so dropping the
+--   single-column index costs them nothing.
+--
+-- Measured on the seed above, each company-scoped shape under the
+-- single-column index and then under the composite alone:
 --
 --   company-search single-pattern CTE ......... 583-641ms ->   94-123ms
 --   company-search multi-pattern unnest join . 2340-2777ms -> 1643-1786ms
@@ -109,7 +135,9 @@
 -- one. Only an empty table -- a fresh database, or CI -- builds inline, and it
 -- takes a SHARE lock first to close the gap between the emptiness check and
 -- the build. A precreated index whose definition does not match is rejected
--- rather than tolerated.
+-- rather than tolerated -- INCLUDING its operator class, which on a GIN index
+-- is the axis that matters and the only one not visible to the structural
+-- checks the btree entries use (see the indclass comparison below).
 --
 -- The DROP is NOT concurrent. It is a catalog update plus a file unlink rather
 -- than a scan, so it is fast; it does take a brief ACCESS EXCLUSIVE lock, which
@@ -147,6 +175,23 @@ BEGIN
           ORDER BY key_position
         ) = ARRAY['company_id', 'body']
         AND index_metadata.indoption = '0 0'::int2vector
+        -- The operator class is the ONLY axis on which a `gin (company_id,
+        -- body)` precreate -- btree_gin's default `text_ops`, which cannot
+        -- serve `ILIKE '%...%'` at all -- differs from the right index.
+        -- pg_get_indexdef(oid, n, TRUE) above prints the bare attribute with
+        -- no opclass (a non-zero column number selects attrsOnly mode) and
+        -- indoption is sort/NULL flags, so without this check that precreate
+        -- validates and the DROP below then removes the only trigram index on
+        -- `body`, silently restoring the scan this migration exists to remove.
+        AND ARRAY(
+          -- opcname is `name`; cast, or the comparison below is
+          -- `name[] = text[]` and Postgres has no such operator.
+          SELECT operator_class.opcname::text
+          FROM unnest(index_metadata.indclass) WITH ORDINALITY AS index_class(oid, key_position)
+          JOIN pg_opclass AS operator_class ON operator_class.oid = index_class.oid
+          WHERE index_class.key_position <= index_metadata.indnkeyatts
+          ORDER BY index_class.key_position
+        ) = ARRAY['uuid_ops', 'gin_trgm_ops']
         AND index_metadata.indpred IS NULL
     )
     THEN
