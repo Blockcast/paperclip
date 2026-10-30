@@ -760,6 +760,11 @@ describeEmbeddedPostgres("reconcileStrandedBlockedIssues", () => {
     // Name the escape hatch too, or the guidance reads as "always re-block",
     // which is wrong for a row that still has agent work on it.
     expect(posted[0].body).toContain("parkedUntil");
+    // ...and name it in its WRITABLE form. `parkedUntil` is a read-back column that
+    // `PATCH /api/issues/:id` rejects; an agent sends `parkedDisposition: {reason, until}`.
+    // Offering only the read column repeats this row's own defect one layer down —
+    // pointing a correctly-diagnosed human gate at a field that cannot be set.
+    expect(posted[0].body).toContain("parkedDisposition");
 
     // A sweep that flips nothing announces nothing.
     expect((await reconcileStrandedBlockedIssues(db)).reconciled).toBe(0);

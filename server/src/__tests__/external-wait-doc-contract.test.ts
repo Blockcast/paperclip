@@ -136,7 +136,20 @@ describe("external-wait declaration: doc and matcher agree", () => {
     for (const status of ["todo", "in_progress", "in_review", "backlog"]) {
       expect(section, `the section does not mention \`${status}\``).toContain(status);
     }
-    expect(section).toContain("parkedDisposition");
+    // Scanning the whole section for `parkedDisposition` is satisfied by the opening
+    // prose alone, before the table — so it pins that the word appears, not that the
+    // park is offered FOR these statuses. Pin the table row instead, the same way the
+    // `in_review` case below does: some row whose first cell names `todo` must name the
+    // park. (Not *every* such row: the trailing `| \`todo\` | you, right now |` row
+    // correctly offers no instrument, because that case is work rather than a wait.)
+    const parkRow = section
+      .split("\n")
+      .filter((line) => /^\|[^|]*`todo`/.test(line))
+      .find((line) => line.includes("parkedDisposition"));
+    expect(
+      parkRow,
+      "no per-status table row offering `todo` a park via `parkedDisposition`",
+    ).toBeTruthy();
   });
 
   it("does not offer a park as the `in_review` review path", () => {
