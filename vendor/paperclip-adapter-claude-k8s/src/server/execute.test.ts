@@ -136,6 +136,7 @@ const {
   buildTimeoutExecutionResult,
   execute,
   promptBundleSizingKey,
+  describeProjectionRefusal,
 } = await import("./execute.js");
 
 // Real class, not a stub: the prompt-cache mock above is a partial that passes
@@ -4491,5 +4492,46 @@ describe("promptBundleSizingKey (PEN-4932 stage 4b)", () => {
     // cannot forge a different entry's encoding.
     const sneaky = [{ key: "alpha", runtimeName: "alpha", source: "/paperclip/skills/co/alpha\u0000x" }, base.skills[1]!];
     expect(promptBundleSizingKey({ ...base, skills: sneaky })).not.toBe(promptBundleSizingKey(base));
+  });
+});
+
+describe("describeProjectionRefusal (PEN-4932 stage 4b)", () => {
+  // A refusal is cached and replayed on later runs, so anything it carries that names
+  // the run which FIRST hit it would appear beside a different `runId` on every
+  // subsequent emit — and a reader joining on that id lands on the wrong run. The
+  // fields kept here must therefore be run-independent, which is a property worth a
+  // test rather than a comment.
+  it("keeps no company or run identity from the refusing run", async () => {
+    const { PromptBundleOverBudgetError } = await import("./prompt-bundle-projection.js");
+    const err = new PromptBundleOverBudgetError({
+      companyId: "co-FIRST",
+      runLabel: "run-FIRST",
+      totalValueBytes: 99,
+      maxBytes: 10,
+      fileCount: 3,
+      bytesBySkillKey: { fat: 99 },
+    });
+    // Positive control: the message the previous implementation cached DID carry it,
+    // so this test would have been vacuous against a message that never named a run.
+    expect(err.message).toContain("run-FIRST");
+
+    const refusal = describeProjectionRefusal(err);
+    const serialized = JSON.stringify(refusal);
+    expect(serialized).not.toContain("co-FIRST");
+    expect(serialized).not.toContain("run-FIRST");
+    expect(refusal.detail).toEqual({
+      kind: "over_budget",
+      totalValueBytes: 99,
+      maxBytes: 10,
+      fileCount: 3,
+      bytesBySkillKey: { fat: 99 },
+    });
+  });
+
+  it("carries the too-many-files refusal structurally", async () => {
+    const { PromptBundleTooManyFilesError } = await import("./prompt-bundle-projection.js");
+    const refusal = describeProjectionRefusal(new PromptBundleTooManyFilesError("many", 5));
+    expect(refusal.errorName).toBe("PromptBundleTooManyFilesError");
+    expect(refusal.detail).toEqual({ kind: "too_many_files", skillKey: "many", limit: 5 });
   });
 });
