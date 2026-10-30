@@ -1,6 +1,6 @@
 # PEN-4932 — provision the per-agent workspace claim (stage 4b, provisioner only)
 
-Tracking: [PEN-4932](https://paperclip.blockcast.net/PEN/issues/PEN-4932) · PR: [#3169](https://github.com/Blockcast/paperclip/pull/3169)
+Tracking: [PEN-4932](https://paperclip.blockcast.net/PEN/issues/PEN-4932) · PR: [#3168](https://github.com/Blockcast/paperclip/pull/3168)
 
 ## 1. Initial change
 
