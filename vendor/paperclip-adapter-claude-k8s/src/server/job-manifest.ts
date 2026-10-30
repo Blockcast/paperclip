@@ -3316,9 +3316,9 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // rather than the symptom.
   if (narrowWritableSurface && !serverCanPreCreate) {
     // Pod address -> volume-relative subPath, for the bundle root only. The
-    // other two entries are volume-relative constants; this one is derived
-    // per-run, through the SAME function `execute.ts` uses to choose the write
-    // target, so the warning cannot name a directory no run reads.
+    // other entry is a volume-relative constant; this one is derived per-run,
+    // through the SAME function `execute.ts` uses to choose the write target,
+    // so the warning cannot name a directory no run reads.
     //
     // Emitted only when it is under `dataMountPath`. An operator-set
     // `promptCacheRoot` can point off-volume (at the `/runtime-cache` emptyDir,
@@ -3327,7 +3327,19 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     // field stage 4b reads. Omission is the honest answer — and an off-volume
     // bundle is a different fault, already reported as
     // `claude_k8s.prompt_bundle_off_volume` by `prepareClaudePromptBundle`.
-    const promptCacheRoot = resolvePromptCacheRoot(config, ctx, isolation);
+    //
+    // Canonicalised before the prefix test. `promptCacheRoot` is the one input
+    // here that reaches us unchecked: the isolation roots are built from
+    // sanitised components and `resolveScopedWritableMounts` puts them through
+    // `assertNormalizedPath`, but an operator-set `config.promptCacheRoot` is
+    // returned verbatim. Without this, `/paperclip/x/` or `/paperclip/a/../b`
+    // would be sliced into a subPath Kubernetes itself would reject. Diagnostic
+    // only — the write target keeps the operator's own spelling, and
+    // normalising cannot change WHICH directory is named, only how it is spelt.
+    const rawPromptCacheRoot = resolvePromptCacheRoot(config, ctx, isolation);
+    const promptCacheRoot = rawPromptCacheRoot
+      ? path.posix.normalize(rawPromptCacheRoot).replace(/\/+$/, "")
+      : null;
     const dataPrefix = dataMountPath.endsWith("/") ? dataMountPath : `${dataMountPath}/`;
     const promptCacheSubPath = promptCacheRoot?.startsWith(dataPrefix)
       ? promptCacheRoot.slice(dataPrefix.length)
