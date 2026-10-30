@@ -468,9 +468,11 @@ PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verificati
         chooses, so there is no tree to pre-populate. **The write target has to move onto a channel
         that does not assume a shared volume** — the same kind of channel the prompt text already
         rides (`prompt-secret`, a per-run Secret the `write-prompt` init container copies into an
-        emptyDir). A Secret caps at 1 MiB; the one live company skills tree measures 133 KB over 44
-        files (2026-10-30), which fits, but that is one company and not a ceiling — size it before
-        committing to that channel.
+        emptyDir).
+
+        **Sized and decided 2026-10-30 — see §4.2.** The channel is a Secret projection, and the
+        two trees turn out to be one delivery problem rather than two: the bundle carries no skill
+        bytes, only `agent-instructions.md` and a symlink farm pointing into the skills tree.
 
         ⛔ Do **not** reach for the other obvious option, a read-only mount of the server's claim
         beside the per-agent one. §2 already refuses it for the tooling row and the reasoning is
@@ -478,7 +480,8 @@ PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verificati
         on the node, taking the same ceph-csi lock through the same `NodeUnstageVolume` path.
         It would also defeat this issue's own acceptance criterion.
 
-        **This, not the skills tree alone, is the open design question on 4b's critical path.**
+        **This, not the skills tree alone, was the open design question on 4b's critical
+        path. §4.2 closes it.**
      2. **Close the symlinked-PARENT hole in the seeder.** The seeder holds uid 0 +
         `DAC_OVERRIDE` + `CHOWN` over the volume root, and both `mkdir -p` and `chown` follow
         symlinks. 4a refuses a target whose FINAL component is already a symlink and uses
@@ -553,9 +556,113 @@ a foreign claim would `mkdir` the Job's tree inside the **server's** volume: jun
 sees, while the targets that needed creating stayed uncreated. The old condition therefore survives
 under its own name (`serverCanPreCreate`), governing that list alone.
 
+### 4.2 The 4b delivery channel: sized, and decided
+
+Closes the question invariant 1 left open. Every figure below was read on 2026-10-30 from a live
+agent pod and from `origin/master`, not estimated.
+
+#### Finding 1 — the two trees are ONE delivery problem
+
+Invariant 1 treats `skills/<companyId>` and the prompt bundle as two problems with different
+remedies. Measured, they are one. The bundle is **`agent-instructions.md` plus a symlink farm**:
+
+```
+prompt-cache/<bundleKey>/agent-instructions.md     3,491 bytes
+prompt-cache/<bundleKey>/.claude/skills/           symlinks -> skills/<companyId>/...
+```
+
+`prepareClaudePromptBundle` writes exactly that — `fs.mkdir(skillsHome)` then one `symlink` per
+entry, whose target is `entry.source` put through `toPodAddress`. For a catalog-backed skill
+`entry.source` is `resolveManagedSkillsRoot(companyId)/__versions__/...`, i.e. **inside the skills
+tree**. The bundle carries no skill bytes of its own.
+
+So the bundle is not a third payload to ship. Ship the skills bytes and build the links from them
+inside the pod, and one channel covers both. Invariant 1's claim that the two "do not share a
+remedy" was read off the mount table; it does not survive reading the writer.
+
+#### Finding 2 — the skills tree is server-written and pod-READ-ONLY
+
+This is what makes a projected channel admissible at all, and it was worth confirming rather than
+assuming, because invariant 1 says *"agents create them at runtime"* — which is true, and
+misleading about the data path.
+
+`resolveManagedSkillsRoot` is defined in `server/src/services/company-skills.ts` and called only
+there — 12 call sites, all in that one service. No other module resolves the tree: the adapter's
+single mention of the name is a comment (`prompt-cache.ts:409`), and a vendored adapter cannot
+import from `server/src` anyway. The Job mounts the tree `readOnly: true` (`companySkillsMount`,
+`job-manifest.ts`). Agents create skills **through the server**, not by writing that mount. A delivery channel therefore needs no write-back path, and the tree can be
+re-materialized per run from the server's own copy without losing anything the pod produced.
+
+#### Finding 3 — sizing, and the ceiling that is closer than it looks
+
+One company is measurable from an agent seat (`GET /companies` → `403 Board access required`), so
+the fleet distribution is **unmeasured**. Stated as a sample, not a bound:
+
+| quantity | measured |
+|---|---|
+| skills tree, raw | **130,390 bytes over 22 files** (22 directories) |
+| per-file Secret projection, stored | ~176,397 bytes — **16.8 % of the 1 MiB Secret cap** |
+| `tar.gz` + base64, stored | 60,164 bytes — 5.7 % of the cap |
+| prompt bundle, real content | 3,491 bytes (1 file; 0 skill bytes) |
+
+Correction: invariant 1 recorded "133 KB over 44 files". The byte figure was close; **the file
+count was not** — 44 is files *plus directories*. There are 22 files.
+
+**16.8 % is not headroom, and this is the part that decides the design.** The only size constant
+anywhere in the skills path is `MAX_CATALOG_FILE_BYTES = 1024 * 1024`
+(`company-skills.ts:467`) — and it is
+
+- **per file**, not per tree, so it equals the entire Secret budget on its own; and
+- **not admission control**. Its one use is `pushFinding(findings, "oversized_file", …)` inside
+  `auditInstalledSkillBytes`, which audits skills that are *already installed*. It reports; it
+  refuses nothing.
+
+So a single lawful skill file can exhaust the whole channel, the file count is unbounded, and
+nothing upstream keeps a company below the cap. Today's 16.8 % is one sample of an unbounded
+quantity.
+
+#### Decision
+
+> **Adopt the Secret projection. Reject the init-container API fetch as the first implementation,
+> and keep it as the named escalation rather than a hypothesis.**
+
+The precedent is exact and in-tree. **PEN-3329** is the same failure in a different tree: the
+server materialized `docs/<name>.md` into the execution workspace, a run-isolated pod did not
+mount that workspace, and *"every one of the 14 declared docs was reported absent, measured on a
+live pod"*. Its resolution — `buildSharedDocSecretProjection`, positional keys, `items[].path`
+restoring the layout, `optional: false` so a failed Secret is a pod that cannot start rather than
+a run that silently reads nothing — is the machinery this needs, and its reasoning transfers
+verbatim: *"Staging a Secret makes delivery depend on the Job alone rather than on the pod's mount
+set."* Mount-shape independence is precisely the property 4b breaks and must restore.
+
+Three things it buys over an API fetch: no new endpoint and no new authenticated surface reachable
+from a pod; no network dependency inserted into pod start; and a failure that is a `Pending` pod
+with an event, not a partially-populated tree.
+
+Two properties the implementation must carry, both forced by Finding 3:
+
+1. **An enforced budget at projection time, with a named error.** The channel must measure its own
+   projected size and refuse over-budget with a verdict that names the company and the measured
+   bytes — never truncate. A dropped skill is exactly the silent dangling-link failure this whole
+   invariant exists to prevent, and it would be indistinguishable from the bug.
+2. **Symlinks do not survive a Secret projection**, so the bundle's `.claude/skills/<runtimeName>`
+   farm must be built **in-pod** from the projected tree. That is the concrete form of invariant
+   1's *"the write target has to move"*, and it is a small init-container step, not a redesign:
+   the link set is already derivable from the entries the server sends.
+
+**The escalation, and its trigger.** The budget is reachable by lawful input, so the Secret channel
+is a first implementation and not a final answer. The init-container fetch becomes the design once
+any company's projected tree crosses **50 % of the cap** — chosen so the move is made against a
+measurement rather than under an outage. That requires the projected size to be *emitted*, which
+is why property 1 is instrumentation as much as it is a guard.
+
+⛔ Unchanged and still refused: a shared read-only claim (§2). It is one volume ID on every agent
+pod on the node, taking the same ceph-csi lock through the same `NodeUnstageVolume` path, and it
+would defeat this issue's own acceptance criterion.
+
 ## 5. Decisions taken, and what is still genuinely open
 
-Both questions this document previously raised are **resolved**, and neither needed a preference
+Both questions this document originally raised are **resolved**, and neither needed a preference
 call in the end — each turned out to have a measurable answer:
 
 - **The ~640 MB set** → **drop all five** (§3.5). The fleet already defines these versions
@@ -569,6 +676,13 @@ call in the end — each turned out to have a measurable answer:
   change spans four consumers across two repositories and, if botched, refuses every push in the
   fleet (§3.6 — fails *closed*; an earlier draft of this line said "fails open", which is true of
   bare `git` and false of this system).
+
+**The 4b delivery channel — resolved 2026-10-30 (§4.2).** A **Secret projection**, on PEN-3329's
+precedent, carrying `skills/<companyId>`; the prompt bundle's symlink farm is rebuilt in-pod from
+it rather than shipped. The init-container API fetch is the named escalation, triggered at 50 % of
+the Secret cap — today's single measurable company projects to 16.8 %, which is a sample of an
+unbounded quantity and not headroom, since the only size constant in the skills path is a per-file
+*audit finding* equal to the whole budget.
 
 **Company-scoped sharing — resolved 2026-10-29, and it is a constraint rather than a trade-off.**
 `/work/<companyId>`, `/wt/<companyId>`, the pnpm store and `skills/<companyId>` are namespaced by
