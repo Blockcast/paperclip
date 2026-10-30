@@ -298,9 +298,12 @@ That scoping is deliberate and is not a gap to be widened — a non-`blocked` ro
 |---|---|---|
 | `blocked` | a person | **the declaration** — the only hold that names *who* and *what* |
 | `blocked` | another issue | a `blockedBy` edge |
-| `in_review` / `in_progress` | a person | a **park** (`parkedUntil`) — nothing sweeps those statuses, and a park is what reads as attended |
-| `in_review` / `in_progress` | CI, a queue, a machine | a **monitor** — polling can actually move it |
+| `in_progress` / `todo` / `backlog` | a person | a **park** (`parkedDisposition` → `parkedUntil` + `parkedReason`). Both strandedness sweeps count a live park **on any status**, which is what makes it the general answer where the declaration is not. |
+| `in_progress` | CI, a queue, a machine | a **monitor** — polling can actually move it. If you are ending your work on the wait, `monitor.kind: "external_service"` is what releases the execution slot. |
+| `in_review` | a reviewer | a pending interaction, a linked approval, a human reviewer via `assigneeUserId`, a typed `executionState.currentParticipant`, or a monitor on an external review service — **not a park.** See the note below. |
 | `todo` | you, right now | none; it is work, not a wait |
+
+**`in_review` is the exception, and getting it wrong fails on the write path rather than silently.** A live park does keep an `in_review` row out of both strandedness sweeps, so it looks like it should work — but `assertAgentInReviewReviewPath` (`server/src/routes/issues.ts`) deliberately excludes it from the accepted review paths (BLO-33572): a park records that nobody is acting on the row until a stated deadline, which is the opposite of what `in_review` asserts, and it expires on its own, so admitting it would reach `in_review` with no reviewer at all and merely defer the same refusal to the park's deadline. The gate's own remedy is the one to follow — **park the row on the status that is actually true (`todo`/`backlog`) instead of moving it to review.** Note this is a different sense of "park" from the `issue_continuation_waiting_on_review` continuation park in §9.2, which recovery converts into a waiting state; that one is not a `parkedDisposition`.
 
 A row that is genuinely waiting on a person and also carries agent-actionable work is the one case where a non-`blocked` status plus a declaration is reasonable — but then the *park or monitor* is what is holding it, and the declaration is documentation for the reader rather than a control-plane signal. Do not count it as the hold.
 
