@@ -503,11 +503,18 @@ describe("mergeModelProfileAdapterConfig agent-scope-only top-level config bound
   //
   // It wins because of WHERE the guard sits: the environment overlay is applied
   // DOWNSTREAM, by `mergeEnvironmentConfig` in the claude-k8s adapter's
-  // execute.ts, over the config this merge returns. Composing the two real
-  // functions in that order is what makes this a regression test — a future
-  // refactor that moves the pin below the environment overlay would silently
-  // break deployments whose data claim comes from their environment, and the
-  // unit tests on either function alone would both still pass.
+  // execute.ts, over the config this merge returns.
+  //
+  // This test documents that intended order; it does NOT cover the site order.
+  // The adapter holds its own copy of `mergeEnvironmentConfig` (execute.ts:543,
+  // called at :2320), and this test both imports a different copy
+  // (@paperclipai/adapter-utils) and chooses the call order itself, so a
+  // refactor moving the pin below the overlay inside execute.ts leaves it green.
+  // A real site-order test would have to go through execute().
+  //
+  // What IS pinned here is the semantics of the composition: the merge discards
+  // the issue-scope claim, an environment value applied after it wins, and a
+  // null environment value does not clobber the agent value.
   it("still lets an environment-scope data claim win over the agent-scope pin", () => {
     const merged = mergeModelProfileAdapterConfig({
       baseConfig: { enableGitHubPublishBroker: true, workspaceVolumeClaim: "agent-claim" },

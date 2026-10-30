@@ -1086,10 +1086,11 @@ agent/base value, and one the base lacks is absent. Three grounds.
    list.** The environment's `K8sRemoteSpec` is the only legitimate writer of this key, and the
    environment overlay is applied *downstream* of this merge — `mergeEnvironmentConfig` in the
    claude-k8s adapter's `execute.ts` runs over the config `mergeModelProfileAdapterConfig`
-   returns, and lets non-null environment fields win. Pinned by a test that composes the two real
-   functions in that order, because a refactor moving the guard below the overlay would break
-   every deployment whose data claim comes from its environment while the unit tests on either
-   function alone still passed.
+   returns, and lets non-null environment fields win. A test documents that intended order; it
+   does **not** cover the site order. The adapter holds its own copy of `mergeEnvironmentConfig`
+   (`execute.ts:543`, called at `:2320`) and that test both imports a different copy
+   (`@paperclipai/adapter-utils`) and chooses the call order itself. A real site-order test would
+   have to go through `execute()`.
 
    ⚠ **Not closed, and deliberately: `resolveJobIsolation`'s descriptor-absent fallback to
    `SHARED_JOB_ISOLATION` reaches the same throw by a route no provenance pin touches.** That is
