@@ -3218,6 +3218,103 @@ export const KNOWN_GITHUB_API_REFUSAL_REASONS = [
 export type GithubApiRefusalReason = (typeof KNOWN_GITHUB_API_REFUSAL_REASONS)[number];
 
 /**
+ * WHICH GitHub budget refused the call (PEN-3852).
+ *
+ * `reason` alone cannot answer the question an org owner will ask. GitHub
+ * enforces SEVERAL independent rate-limit budgets against one App
+ * installation, and a 403/429 carrying `x-ratelimit-remaining: 0` is
+ * byte-identical on every one of them — so until now every refusal landed in
+ * `reason="rate_limited"` with no record of WHICH budget was spent.
+ *
+ * That ambiguity is not academic, and it points at the remedy. PEN-3852 asks
+ * an organisation owner to register a second App installed on a comparably
+ * broad repository set, and that ask is sized off the PRIMARY (`core`)
+ * formula: 5,000/h plus 50/h per repository above 20. The `search` budget is a
+ * flat 30 requests per MINUTE for an App and does not move with repository
+ * count at all; `graphql` is a third budget again. A refusal drawn against
+ * `search` therefore argues for pacing the caller, and a split sized by
+ * repository count would not relieve it. Handing an owner a repo-count
+ * argument for a non-core refusal spends real goodwill on the wrong change.
+ *
+ * This process can reach at least two of these budgets: the `api.github.com/
+ * repos/...` call sites (`core`), and the merged-PR reconciler's paginated
+ * `/search/issues` enumeration (`search`), which runs once immediately on
+ * startup and then on interval.
+ *
+ * CARDINALITY, held to the same contract {@link KNOWN_GITHUB_API_REFUSAL_REASONS}
+ * is held to: the value arrives in a GitHub-supplied header and is NOT trusted
+ * into the label. Anything outside this closed set collapses to
+ * {@link OTHER_GITHUB_API_REFUSAL_RESOURCE}.
+ */
+export const KNOWN_GITHUB_API_REFUSAL_RESOURCES = [
+  "core",
+  "search",
+  "code_search",
+  "graphql",
+  "integration_manifest",
+] as const;
+
+/**
+ * The response carried no `x-ratelimit-resource` at all.
+ *
+ * Deliberately NOT merged with {@link OTHER_GITHUB_API_REFUSAL_RESOURCE}, for
+ * the same reason `forbidden` is not merged into `rate_limited`: the two mean
+ * different things and imply different actions. `unknown` is a gap in THIS
+ * instrument — a GitHub Enterprise host old enough to predate the header, a
+ * proxy that strips it, or a test double — and the fix is here. `other` is a
+ * statement about GitHub: a budget it named that
+ * {@link KNOWN_GITHUB_API_REFUSAL_RESOURCES} does not list, and the fix is to
+ * extend that list. Collapsing them would make a missing header
+ * indistinguishable from a newly-introduced budget, which is exactly the
+ * absent-reads-as-answer defect PEN-3852 keeps rediscovering.
+ */
+export const UNKNOWN_GITHUB_API_REFUSAL_RESOURCE = "unknown";
+
+/** GitHub named a budget {@link KNOWN_GITHUB_API_REFUSAL_RESOURCES} does not list. */
+export const OTHER_GITHUB_API_REFUSAL_RESOURCE = "other";
+
+/**
+ * The one resource child born at zero — see the zero-init block on the counter
+ * itself for why any child must be.
+ *
+ * `core` rather than all of them: the zero-init exists so that
+ * `sum(increase(...{reason="rate_limited"}[7d]))` renders 0 instead of an empty
+ * vector on a healthy fleet, and ONE present child per reason is sufficient for
+ * that — the sum is over whatever children exist. Materialising the full
+ * product would publish 15 constant-zero series to buy nothing, and most of
+ * them name budgets this process never draws against. `core` is the right
+ * single choice because it is the budget PEN-3852's done-when is about and the
+ * one essentially all of this process's egress draws on.
+ *
+ * The cost is explicit and bounded: a query pinned to a NON-core resource
+ * (`{resource="search"}`) is absent rather than zero until the first such
+ * refusal. Sum across resources, or match on `reason` alone, for any expression
+ * that has to distinguish "none" from "no instrument".
+ */
+export const ZERO_INIT_GITHUB_API_REFUSAL_RESOURCE = "core";
+
+const knownGithubApiRefusalResourceSet: ReadonlySet<string> = new Set(
+  KNOWN_GITHUB_API_REFUSAL_RESOURCES,
+);
+
+/**
+ * Map a raw `x-ratelimit-resource` header onto the closed label set.
+ *
+ * Absent, non-string and blank all land on
+ * {@link UNKNOWN_GITHUB_API_REFUSAL_RESOURCE} rather than on `core`: guessing
+ * the dominant budget when GitHub did not say would manufacture exactly the
+ * evidence this label was added to supply.
+ */
+export function normalizeGithubApiRefusalResource(resource: string | null | undefined): string {
+  if (typeof resource !== "string") return UNKNOWN_GITHUB_API_REFUSAL_RESOURCE;
+  const trimmed = resource.trim();
+  if (trimmed.length === 0) return UNKNOWN_GITHUB_API_REFUSAL_RESOURCE;
+  return knownGithubApiRefusalResourceSet.has(trimmed)
+    ? trimmed
+    : OTHER_GITHUB_API_REFUSAL_RESOURCE;
+}
+
+/**
  * Restart-safe gauge of `agent_wakeup_requests` rows sitting in the terminal
  * `status = 'failed'` state (BLO-20255).
  *
@@ -4933,7 +5030,7 @@ let githubReviewRequestSuppression: Counter<"cause" | "reason"> | null = null;
 let githubReviewRequestDeadLetterUnresolved: Gauge<"reason"> | null = null;
 let githubReviewPosted: Counter<"repo" | "surface"> | null = null;
 let githubReviewCompletion: Counter<"status"> | null = null;
-let githubApiRefusals: Counter<"reason"> | null = null;
+let githubApiRefusals: Counter<"reason" | "resource"> | null = null;
 let githubApiRequests: Counter | null = null;
 let agentWakeupTerminalFailedUnresolved: Gauge<"error_code" | "scope"> | null = null;
 let agentWakeupTerminalFailedOldestAge: Gauge<"scope"> | null = null;
@@ -5125,7 +5222,7 @@ function ensureRegistry(): {
   githubReviewRequestDeadLetterUnresolvedGauge: Gauge<"reason">;
   githubReviewPostedCounter: Counter<"repo" | "surface">;
   githubReviewCompletionCounter: Counter<"status">;
-  githubApiRefusalsCounter: Counter<"reason">;
+  githubApiRefusalsCounter: Counter<"reason" | "resource">;
   githubApiRequestsCounter: Counter;
   agentWakeupTerminalFailedUnresolvedGauge: Gauge<"error_code" | "scope">;
   agentWakeupTerminalFailedOldestAgeGauge: Gauge<"scope">;
@@ -6888,9 +6985,19 @@ function ensureRegistry(): {
         + "that makes a 403 rate uninterpretable. Read against the denominator "
         + GITHUB_API_REQUESTS_METRIC
         + ": zero refusals is only evidence while that counter is climbing, because an absent "
-        + "or dead instrument renders the same zero. All three children are present from "
-        + "process start for that reason.",
-      labelNames: ["reason"],
+        + "or dead instrument renders the same zero. One child per reason is present from "
+        + "process start for that reason. "
+        + "resource names WHICH of GitHub's several independent per-installation budgets "
+        + "refused the call, read from x-ratelimit-resource. Load-bearing for sizing a remedy: "
+        + "'core' follows 5,000/h + 50/h per repo above 20, so it is the budget a second App on "
+        + "a comparably broad repo set would relieve; 'search' is a flat 30 requests per MINUTE "
+        + "for an App and does not move with repo count, so a search refusal argues for pacing "
+        + "the caller instead; 'graphql' is a third budget again. 'unknown' means the response "
+        + "carried no such header (a gap in this instrument); 'other' means GitHub named a "
+        + "budget this build does not enumerate (extend the list). Only resource='core' is "
+        + "zero-initialised, so match on reason alone — or sum across resource — when the "
+        + "question is 'were there none'.",
+      labelNames: ["reason", "resource"],
       registers: [registry],
     });
     // Zero-initialize all three reasons. Load-bearing, not tidiness: PEN-3852's
@@ -6904,7 +7011,7 @@ function ensureRegistry(): {
     // must render zero when there are zero. Same reasoning as the review-posted
     // counter above. 3 constant-zero series.
     for (const reason of KNOWN_GITHUB_API_REFUSAL_REASONS) {
-      githubApiRefusals.inc({ reason }, 0);
+      githubApiRefusals.inc({ reason, resource: ZERO_INIT_GITHUB_API_REFUSAL_RESOURCE }, 0);
     }
     githubApiRequests = new Counter({
       name: GITHUB_API_REQUESTS_METRIC,
@@ -10121,9 +10228,21 @@ export function recordGithubApiRequest(): void {
  * label child appearing in production. The shared GitHub fetch wrapper is the
  * only caller; the classification itself lives there, next to the response it
  * reads.
+ *
+ * `resource` is the RAW `x-ratelimit-resource` header, normalised here rather
+ * than at the call site so the closed set and the thing that enforces it stay
+ * in one file. It is a required positional parameter precisely because it is a
+ * plain string and could not otherwise be type-narrowed: a caller that forgets
+ * it is a compile error rather than a silent slide into `unknown`.
  */
-export function recordGithubApiRefusal(reason: GithubApiRefusalReason): void {
-  ensureRegistry().githubApiRefusalsCounter.inc({ reason });
+export function recordGithubApiRefusal(
+  reason: GithubApiRefusalReason,
+  resource: string | null,
+): void {
+  ensureRegistry().githubApiRefusalsCounter.inc({
+    reason,
+    resource: normalizeGithubApiRefusalResource(resource),
+  });
 }
 
 /**
