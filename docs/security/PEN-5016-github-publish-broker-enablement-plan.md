@@ -15,8 +15,15 @@ bypass exercised. Measurements are Loki queries, `kubectl version`, a live-Job l
 makes §6, §7 and §8 defer to it. It does **not** revise §§0-5, §9 or §10 — revising the plan is
 PEN-5016's, and that row is closed. Two things moved overnight and §11.1 carries them rather than
 re-photographing §1 and §3.1: **#3123 merged** (2026-10-30T00:19:07Z, on `master` as `87db03fcc` /
-`7c53b431c`), and **#3112 went `DIRTY`** — so the §1 carry-forward hazard is live, not hypothetical.
-⛔ The three-key assertion on `BROKERED_POD_COMPOSITION_CONFIG_KEYS` reads **two** on `master` today.
+`7c53b431c`), and **#3112 went `DIRTY`**.
+
+⛔ **The rest of this revision note is SUPERSEDED — read §11.2 instead.** It recorded the §1
+carry-forward hazard as *live* and the three-key assertion on `BROKERED_POD_COMPOSITION_CONFIG_KEYS`
+as reading **two** on `master`. Both were true when written and are **false now**:
+[#3133](https://github.com/Blockcast/paperclip/pull/3133) landed the `workspaceVolumeClaim` pin on
+`master` independently at `2026-10-30T04:26:24Z` (`16fbb8ae`), the key set reads **three**, and the
+hazard is **discharged**. #3112 must still be merged and never closed — but as the sole carrier of
+the **PEN-5017 provenance gate**, not of the pin (§11.2).
 
 **Revision 2 — 2026-10-29, same day.** Three §3 preconditions moved while this PR was open and one
 new one appeared, so the first revision's §3 is already wrong in the permissive direction: it reads
