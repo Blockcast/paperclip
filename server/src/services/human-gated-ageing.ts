@@ -127,6 +127,10 @@ const PRIORITY_RANK = new Map<string, number>(
  *   chain at all; the other 2 (`PEN-1095`, `PEN-193`) do block work but are
  *   themselves blocked, so acting on them alone frees nothing either. Age admits
  *   all 30; payoff excludes them on merit.
+ * - **2 more are co-roots only** (`PEN-1871`, `PEN-1936`): they sit on an open
+ *   row's frontier, but never alone, so clearing either still leaves its chain
+ *   blocked. They are neither "frees something" nor "frees nothing", which is why
+ *   the partition is 16 + 2 + 30 and not 18 + 30.
  * - It removes `medium` and `low` wholesale — 0 of 10 are a sole gate — which is
  *   the job the 30d/45d weighting exists to do, done by measurement instead of by
  *   tier. On this queue the weighting is not what is keeping `low` out.
@@ -137,11 +141,15 @@ const PRIORITY_RANK = new Map<string, number>(
  * **The two orderings disagree almost completely, and that is the finding.** The 7
  * oldest human-gated rows — what the digest escalates today — are the sole gate for
  * **2 open rows between them**; six of the seven free nothing. The 7 highest-payoff
- * rows free 29. The clearest single case is `PEN-4079`: **16 days old**, so age
- * ranks it near the bottom and it would not escalate for another fortnight, while
- * it sits above **27 open rows, 23 of them `critical`/`high`** — the largest reach
- * in the graph. Age and payoff are not two views of one priority here; on this
- * queue they are close to orthogonal.
+ * rows free 29. The clearest single case is `PEN-4079`, and note that the threshold
+ * is not what sidelines it: it is `critical` at **15.8 days**, so it is already
+ * *past* its 14d bar and the filter admits it. Age is what buries it — it ranks
+ * **43rd of the 43 past-threshold rows**, the youngest of them, so an age-ordered
+ * list truncated at {@link DEFAULT_MAX_ESCALATED} drops it before it is reached.
+ * By payoff it ranks **3rd of 16**, sitting above **27 open rows, 23 of them
+ * `critical`/`high`** — the largest reach in the graph. Age and payoff are not two
+ * views of one priority here; on this queue they are close to orthogonal, and this
+ * row is the case where the cap, not the threshold, does the discarding.
  *
  * Validation, because a selector derived from a bad graph is worse than no selector:
  * all 77 blockers referenced from outside the open set are `done` (so zero phantom
