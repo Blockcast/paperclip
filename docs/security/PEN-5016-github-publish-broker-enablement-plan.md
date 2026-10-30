@@ -342,18 +342,26 @@ this run executes in. So the zero is "the warn site was evaluated and did not fi
 looked".
 
 **What changed on 2026-10-20 is named in the source, not inferred.** `BLO-47526` gave a `shared`
-runtime descriptor agent-scoped persistent roots so that `narrowWritableSurface` holds
-(`job-manifest.ts:758-767`); before it, a shared run returned `enabled:false` and kept the whole PVC
-mounted rw. `isolation_disabled` being the *only* leg that ever fired, and its stopping dead at that
-change, is consistent with that and with nothing else.
+runtime descriptor agent-scoped persistent roots so that `narrowWritableSurface` holds — the
+`mode === "shared"` branch and its rationale comment in
+`vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts` at **`:781-790`**, with
+`narrowWritableSurface` itself defined at **`:3200`**; before it, a shared run returned
+`enabled:false` and kept the whole PVC mounted rw. `isolation_disabled` being the *only* leg that
+ever fired, and its stopping dead at that change, is consistent with that and with nothing else.
 
 ⚠ **The surviving broad path, which the zero does not cover.** `resolveJobIsolation` falls through to
-`SHARED_JOB_ISOLATION` (`enabled: false`, `:709`) when a run arrives with **no runtime isolation
-descriptor** and `config.isolationMode` is not `isolated`/`isolate` (`:832-834`). The comment at
-`:2931` names it: *"only a config-only run with no descriptor and no `isolationMode` still reaches this
-fallback."* The measured zero is therefore a property of **the server supplying a descriptor on every
-render**, not of configuration. A run path that stops supplying one renders broad — and once the gate
-is on, that stops being a quiet annotation and becomes a hard build failure for that agent.
+`SHARED_JOB_ISOLATION` (`enabled: false`) when a run arrives with **no runtime isolation descriptor**
+and `config.isolationMode` is not `isolated`/`isolate` — in
+`vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts`, the constant declared at **`:732`**
+and returned at **`:855-857`**. The comment at **`:3177-3179`** names it: *"only a config-only run
+with no descriptor and no `isolationMode` still reaches this fallback."* The measured zero is
+therefore a property of **the server supplying a descriptor on every render**, not of configuration.
+A run path that stops supplying one renders broad — and once the gate is on, that stops being a
+quiet annotation and becomes a hard build failure for that agent.
+
+ℹ **Line anchors in this section were re-derived at `master` `16fbb8aef`, 2026-10-30 (PEN-5071).**
+They are the file's only moving part — re-measure before citing them, do not trust them by age. The
+four they replace were stale by 20-250 lines each, and §11.7 had copied two of them.
 
 **Stage gate:** trigger-2 clear (zero broad renders) over a window that overlaps the whole preceding
 stage, re-read immediately before each stage widens. Not "clear once".
