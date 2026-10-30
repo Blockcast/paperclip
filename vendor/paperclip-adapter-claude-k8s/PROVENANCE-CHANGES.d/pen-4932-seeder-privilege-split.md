@@ -42,8 +42,22 @@ could not do directly.
 
 This is available only because stage 3b-iii emptied `ROOT_TOOLCHAIN_SUBPATHS`:
 `readOnlySubPaths` derives to `[]`, so `seedSubPaths === writableSubPaths` and
-nothing the seeder touches needs to stay root-owned. Re-adding a root-owned
-read-only subPath would have to re-open this, not ride it.
+nothing the seeder touches needs to stay root-owned.
+
+Re-adding a root-owned read-only subPath has to re-open this, not ride it — and
+that is now **enforced rather than asserted in a comment**. `resolveSeedShape`
+picks the shape and throws when the split shape meets a non-empty
+`readOnlySubPaths`: that container `mkdir -m 2775`s its targets as uid 1000, so
+it would create a read-only bind as the agent uid and hand it back group-writable
+to the containers the bind exists to be read-only for — and nothing downstream
+would notice, because the Job starts and the mount is present, just writable.
+
+It throws rather than falling back to the server's shape. The fallback reads as
+the safer option and is not: seeding a per-agent claim with that shape even once
+leaves root-owned intermediates the split shape can never create inside
+afterwards (see the rollback hazard below), so a silent downgrade would corrupt
+the claim for every later run. A build-time failure puts the contradiction in
+front of whoever re-opened it.
 
 `DAC_OVERRIDE` is dropped from `own-volume-root` because uid 0 chowning a
 `root:root` fresh-volume root matches the owner. `seed-writable-dirs` reaches PSS
@@ -110,7 +124,18 @@ the only root container on a per-agent claim.
 The existing *"narrows a claim that is NOT the server's own"* case is updated from
 `runAsUser === 0` to the two-container shape.
 
-Full adapter suite 29 files / 1839 tests green; `tsc --noEmit` clean.
+Nested describe *"resolveSeedShape"* covers the refusal directly rather than
+through `buildJobManifest`, and deliberately so: `ROOT_TOOLCHAIN_SUBPATHS` is
+empty, so no manifest built from real inputs can reach that branch — which is
+precisely why the invariant needed a test that does not depend on real inputs.
+It pins the throw and its message, pins that it does **not** downgrade to the
+server's shape, and pins the three reachable shapes — including that the
+server's own shape is left alone with a non-empty `readOnlySubPaths` (it creates
+those targets as uid 0 and chowns only the writable ones, so they stay
+root-owned) and that "nothing to seed" wins over the refusal.
+
+Full adapter suite 29 files / 1842 tests green; `tsc --noEmit` clean. The two
+refusal tests were confirmed to fail with the check disabled.
 
 ## Not in this change
 

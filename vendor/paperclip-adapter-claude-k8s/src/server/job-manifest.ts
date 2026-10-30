@@ -728,6 +728,64 @@ const SEED_DIR_MODE = "2775";
 const ROOT_TOOLCHAIN_SUBPATHS: readonly string[] = [];
 
 /**
+ * Which shape seeds a Job's `subPath` targets.
+ *
+ *   `none`       — nothing to seed, so no init container at all.
+ *   `self-claim` — one uid-0 container on the SERVER'S OWN claim.
+ *   `split`      — uid-0 `own-volume-root` then uid-1000 `seed-writable-dirs`,
+ *                  on a claim the server does not hold.
+ */
+export type SeedShape = "none" | "self-claim" | "split";
+
+/**
+ * Picks the seeding shape, and refuses the one combination that would quietly
+ * invert a boundary: `split` alongside a read-only `subPath`.
+ *
+ * `split`'s path-walking container runs as uid 1000 and `mkdir -m 2775`s every
+ * target, which is safe only because `readOnlySubPaths` derives to `[]` from an
+ * empty `ROOT_TOOLCHAIN_SUBPATHS` above. Re-add an entry there and that
+ * container would create a read-only bind as the agent uid and hand it, group
+ * writable, to the very writers the bind exists to be protected from. Nothing
+ * downstream would notice: the Job starts, the mount is present, and it is
+ * simply writable.
+ *
+ * `self-claim` has no such problem and is deliberately left alone — it creates
+ * read-only targets as uid 0 and chowns only the writable ones, so they stay
+ * root-owned.
+ *
+ * Throwing rather than falling back to `self-claim` is the point. The fallback
+ * looks safer and is not: seeding a per-agent claim with `self-claim` even once
+ * leaves root-owned intermediates that `split` can never create inside
+ * afterwards, so a silent downgrade would corrupt the claim for every later
+ * run. A build-time failure puts the contradiction in front of whoever
+ * re-opened it.
+ *
+ * Exported and pure because `ROOT_TOOLCHAIN_SUBPATHS` is empty today: no
+ * manifest built from real inputs can reach the refusal, and an invariant that
+ * only exists in a comment is what this replaces.
+ */
+export function resolveSeedShape(input: {
+  narrowWritableSurface: boolean;
+  serverCanPreCreate: boolean;
+  seedSubPathCount: number;
+  readOnlySubPaths: readonly string[];
+}): SeedShape {
+  if (!input.narrowWritableSurface || input.seedSubPathCount === 0) return "none";
+  if (input.serverCanPreCreate) return "self-claim";
+  if (input.readOnlySubPaths.length > 0) {
+    throw new Error(
+      `seed-writable-dirs: refusing to seed a claim the server does not hold while ` +
+        `${input.readOnlySubPaths.length} read-only subPath(s) are declared ` +
+        `(${input.readOnlySubPaths.join(", ")}). That shape walks paths as uid 1000 and ` +
+        `would create these as the agent uid, making a read-only bind writable by the ` +
+        `containers it exists to be read-only for. Re-adding an entry to ` +
+        `ROOT_TOOLCHAIN_SUBPATHS has to answer this first — see the comment there.`,
+    );
+  }
+  return "split";
+}
+
+/**
  * POD address of the prompt-cache root — where `execute.ts` writes the prompt
  * bundle and where the agent container reads it back — or null to let the
  * bundle fall back to its managed server-side default.
@@ -4414,8 +4472,9 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // Available only because stage 3b-iii emptied `ROOT_TOOLCHAIN_SUBPATHS`, so
   // `readOnlySubPaths` derives to `[]` and `seedSubPaths === writableSubPaths`
   // — nothing this container touches needs to stay root-owned. Reintroducing a
-  // root-owned read-only subPath would have to re-open this question rather
-  // than ride this shape.
+  // root-owned read-only subPath has to re-open this question rather than ride
+  // this shape, and `resolveSeedShape` throws if it rides anyway: the condition
+  // is checked at build time, not left to whoever reads this comment.
   //
   // ⛔ Do NOT apply this shape to the server's own claim. That claim carries
   // root-owned intermediate directories left by every past uid-0 run (see shape
@@ -4487,12 +4546,18 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   };
   // `mkdir` (with or without `-m`) and `chown` are all idempotent, so a re-run,
   // a restarted pod and a second agent on the same volume all converge.
+  const seedShape = resolveSeedShape({
+    narrowWritableSurface,
+    serverCanPreCreate,
+    seedSubPathCount: seedSubPaths.length,
+    readOnlySubPaths,
+  });
   const seedInitContainers: k8s.V1Container[] =
-    narrowWritableSurface && seedSubPaths.length > 0
-      ? serverCanPreCreate
+    seedShape === "none"
+      ? []
+      : seedShape === "self-claim"
         ? [selfClaimSeedContainer]
-        : [ownVolumeRootContainer, agentSeedContainer]
-      : [];
+        : [ownVolumeRootContainer, agentSeedContainer];
 
   const initContainer: k8s.V1Container = {
     name: "write-prompt",
