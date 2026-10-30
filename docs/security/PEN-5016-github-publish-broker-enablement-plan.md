@@ -678,7 +678,7 @@ PEN-5016). PEN-4988 exists to encode the failure that a directive recorded only 
 owner — and I cited it at Devops while leaving my own deliverable in exactly that shape. The dates
 are therefore set **here**, in the merged document, where they outlive the thread.
 
-### 11.1 The stage-1 precondition ledger, discharged (state re-read 2026-10-30T01:0xZ)
+### 11.1 The stage-1 precondition ledger, discharged (state re-read 2026-10-30T03:4xZ, PEN-5069)
 
 ⚠ Read this table, not §1's or §3.1's — those are revision-3 photographs and §3.1 says so itself.
 Every row was decided by **asking whether the content is on `master`**, never by reading a `MERGED`
@@ -694,12 +694,19 @@ precondition as outstanding, which is the *conservative* direction but still wro
 | [#3089](https://github.com/Blockcast/paperclip/pull/3089) | env-credential refusal | on `master` (`99905d39b`) | ✅ |
 | [#3120](https://github.com/Blockcast/paperclip/pull/3120) | §5 assertion recorded as satisfied | on `master` (`978ba0f6d`) | ✅ |
 | [#3123](https://github.com/Blockcast/paperclip/pull/3123) | PEN-5026 privilege-beside-broker refusal | **merged 2026-10-30T00:19:07Z**, content on `master` (`87db03fcc`, `7c53b431c`) | ✅ **new since revision 3** |
-| [#3098](https://github.com/Blockcast/paperclip/pull/3098) | §8 measurement, trigger-4 count 28 | **OPEN** — but now `CLEAN`, no longer `BEHIND`/red | ❌ |
+| [#3098](https://github.com/Blockcast/paperclip/pull/3098) | §8 measurement, trigger-4 count 28 | **merged 2026-10-30T03:32:58Z**, content on `master` (`0fa107202`) | ✅ **landed in the same merge group as this section** |
 | [#3112](https://github.com/Blockcast/paperclip/pull/3112) | PEN-5017 provenance gate **+ the sole copy of the PEN-5027 `workspaceVolumeClaim` pin** (`7cea4d40b`) | **OPEN and `DIRTY`** — see §11.2 | ❌ |
 
-**Four of six discharged; two outstanding.** The two are not equivalent: #3098 needs a job re-run and
-an owner's attention, and #3112 needs a **conflict resolution pushed by Security** and is the one
-carrying an unrecoverable hazard.
+**Five of six discharged; one outstanding.** #3112 needs a **conflict resolution pushed by Security**
+and is the one carrying an unrecoverable hazard.
+
+⭐ **The #3098 row was falsified by the merge batch that published this section, and that is worth
+understanding rather than just reading past.** #3098 and #3132 — the PR that added §11 — merged in the
+**same merge group**, both at `2026-10-30T03:32:58Z`. So this ledger reached `master` already
+describing #3098 as open. No push and no review could have caught it: at every moment the text was
+reviewable it was true, and it became false at the instant it landed. A ledger of other people's
+open PRs cannot be verified once, at authoring time — which is exactly why §11.6 check 2 re-reads it
+mechanically at the gate instead of citing this table.
 
 ### 11.2 ⛔ The carry-forward hazard is now LIVE — #3112 is `DIRTY` and is the only carrier of the pin
 
@@ -782,10 +789,10 @@ PEN-5063 required the owner to be *named*, because otherwise the first bad night
 default. §6 names one. **What §6 does not say is what happens when that owner is unreachable**, and an
 owner who cannot be reached at 3am is operationally the same gap. Closing it:
 
-- On-call may always use the four non-§7.1 levers in §6's table — **narrow the stage, pause the
+- On-call may always use the three non-§7.1 levers in §6's table — **narrow the stage, pause the
   agent, restart a Job**. These restore service without re-opening §7.1 and need nobody's permission.
-  ⚠ Narrowing is very often the whole remedy (§6 row 4): if it restores service, the gate **stays on**
-  for the healthy stages and there is no rollback decision to make.
+  ⚠ Narrowing is very often the whole remedy (§6 table **row 1**): if it restores service, the gate
+  **stays on** for the healthy stages and there is no rollback decision to make.
 - Setting the gate `false` for an already-enabled population stays **Security's alone**.
 - **If Security is unreachable, it escalates to the CTO (`29033747`) — not to on-call, and not by
   default.** The CTO may make the call on §6's evidence standard and must record it on PEN-3183 §7.1
@@ -804,9 +811,10 @@ A date in a table is not yet a review. **Before stage 3 exits, the 2027-01-31 re
 carrier row**, owned by Security, referencing §8 and this section. Discharging §7.1 without that
 carrier is the failure mode, not the discharge.
 
-⚠ Two of the four do **not** wait for 2027-01-31: the `diff.<driver>.textconv` / `core.hooksPath` row
-is explicitly *"and on any change to those two files"*, and that trigger is live today. The carrier
-row owns that watch too.
+⚠ One of the four does **not** wait for 2027-01-31: the `diff.<driver>.textconv` / `core.hooksPath`
+row is explicitly *"and on any change to those two files"*, and that trigger is live today. It is
+**one** residual row naming **two files** — do not read it as two residuals. The carrier row owns that
+watch too.
 
 **The standing blind spot stays the CTO's**, unchanged and not re-granted: no cluster-wide exec
 telemetry, trigger 4 has a measurement and not a detector (PEN-4989). D1 does not close it; it makes
@@ -820,7 +828,7 @@ has a stated failing value, so "I checked" is falsifiable.
 | # | Check | Pass | Measured 2026-10-30 |
 |---|---|---|---|
 | 1 | `BROKERED_POD_COMPOSITION_CONFIG_KEYS` on `master` | **three** keys incl. `workspaceVolumeClaim` | ⛔ **two — FAILS** (§11.2) |
-| 2 | §11.1 ledger | six of six on `master` | ⛔ **four of six — FAILS** |
+| 2 | §11.1 ledger | six of six on `master` | ⛔ **five of six — FAILS** |
 | 3 | §4 trigger-2 query, re-read over a window overlapping stage 0 | zero broad renders, with the liveness control | ✅ **pass** (§11.7) |
 | 4 | §3.5a privilege pre-flight across the stage-1 population | no privileged container beside the broker | ✅ **pass** (§11.7) |
 
@@ -848,8 +856,9 @@ complete the configuration half of this pre-flight.**
 
 **(c) …and the render-time observation covers what the config read cannot. This is why (b) does not
 block.** The §4 warn is emitted from `resolveJobIsolation`, which reads `config.isolationMode` off
-the **merged** config (`job-manifest.ts:855`) — after every scope has been applied. So a broad render
-caused by an *environment*-scope setting fires exactly the same warn as an agent-scope one. The
+the **merged** config (`vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts:855`) — after
+every scope has been applied. So a broad render caused by an *environment*-scope setting fires
+exactly the same warn as an agent-scope one. The
 render observation is **scope-agnostic and strictly stronger than a config read**: it observes the
 assembled outcome rather than one layer of the input.
 
@@ -878,9 +887,11 @@ zero is evidence about the mechanism, not about the sample.
 ⚠ **Bounds, stated so a later reader does not inherit this as stronger than it is.** This is a 10-day
 negative over Loki's retained window, liveness-controlled — it is **not** a configuration proof, and
 §4's surviving broad path is untouched by it: a run arriving with no runtime isolation descriptor and
-no `isolationMode` still reaches the `SHARED_JOB_ISOLATION` fallback (`:709`, `:832-834`). The zero is
-a property of the server supplying a descriptor on every render. A run path that stops supplying one
-renders broad — and once the gate is on, that is a hard build failure, not a quiet annotation.
+no `isolationMode` still reaches the `SHARED_JOB_ISOLATION` fallback — in
+`vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts`, the constant declared at **`:732`**
+and returned at **`:855-857`**. The zero is a property of the server supplying a descriptor on every
+render. A run path that stops supplying one renders broad — and once the gate is on, that is a
+hard build failure, not a quiet annotation.
 ⇒ **Check 3 of §11.6 re-runs this at every widening. It is not cleared once.**
 
 **What remains owed to §3.4, and it is not this section's to close:** the board-level environment and
