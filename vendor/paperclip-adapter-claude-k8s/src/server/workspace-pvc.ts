@@ -151,7 +151,10 @@ export async function ensureAgentWorkspacePvc(
   const pvcName = agentWorkspaceClaimName(agentId);
 
   const existing = await getPvc(namespace, pvcName, kubeconfigPath);
-  if (existing) return pvcName;
+  if (existing) {
+    assertExistingClaimIsShareable(pvcName, namespace, existing);
+    return pvcName;
+  }
 
   const storageClassName =
     (input.storageClass ?? "").trim() || DEFAULT_AGENT_WORKSPACE_STORAGE_CLASS;
@@ -187,6 +190,50 @@ export async function ensureAgentWorkspacePvc(
   }
 
   return pvcName;
+}
+
+/**
+ * Refuse to adopt a pre-existing claim that is not `ReadWriteMany`.
+ *
+ * The create path pins RWX and a test holds it there, but the ADOPT path is
+ * where a wrong claim would actually arrive: a claim under this name created
+ * by an earlier or mistaken revision — or by hand, following the RWO
+ * `opencode-db-<agentId>` precedent — is adopted on every later run without
+ * anything re-checking its shape. The consequence is not cosmetic. RWO on a
+ * claim several concurrent pods mount is `Multi-Attach`, which wedges every
+ * concurrent run of that agent, and it would present as scheduling failures
+ * rather than as a mis-shaped volume.
+ *
+ * `accessModes` is IMMUTABLE on a bound PVC, so this is not repairable in
+ * place and the message says so — the remedy is to delete and reprovision,
+ * which is a data-bearing act and therefore a human's call, not something to
+ * do silently under a run.
+ *
+ * Deliberately checks ONLY the access mode. StorageClass and capacity are
+ * legitimately operator-tunable (capacity is expandable on `cephfs`), so
+ * refusing a claim for differing from today's defaults would reject
+ * deliberate configuration. The access mode is the one property that is a
+ * correctness invariant rather than a preference.
+ */
+function assertExistingClaimIsShareable(
+  pvcName: string,
+  namespace: string,
+  existing: { spec?: { accessModes?: string[] } },
+): void {
+  const modes = existing.spec?.accessModes;
+  // An absent list is not a violation to assert on: it means the read gave us
+  // no spec to judge (a partial object from a projected/mocked client), and
+  // inventing a refusal from missing data would fail runs over a reporting
+  // gap rather than a real misconfiguration.
+  if (!modes || modes.length === 0) return;
+  if (modes.includes("ReadWriteMany")) return;
+  throw new Error(
+    `PVC ${namespace}/${pvcName} exists with accessModes [${modes.join(", ")}] and is not ` +
+      `ReadWriteMany. An agent's concurrent run pods are scheduled to different nodes, so a ` +
+      `non-RWX workspace claim Multi-Attaches and wedges every concurrent run of this agent. ` +
+      `accessModes is immutable on a bound PVC: the claim has to be deleted and reprovisioned, ` +
+      `which is a data-bearing act and is left to an operator rather than done under a run.`,
+  );
 }
 
 /**
