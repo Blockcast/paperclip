@@ -255,6 +255,14 @@ const CAMEL_CASE_VALUE_NAMES = new Set(["alertname", "kind"]);
  *  name-anchored trade is the same one. */
 const SNAKE_CASE_VALUE_NAMES = new Set(["job"]);
 
+/** BLO-50225: an orc8r network id — a canonical lowercase UUID — spelled out
+ *  in a Prometheus label matcher (`networkID="…"`), which cannot derive it at
+ *  runtime. A UUID is opaque by design and stays refused under every other
+ *  name; this exempts exactly the 8-4-4-4-12 hex layout under exactly this
+ *  name, so a non-UUID token under `networkID` is still refused. */
+const UUID_VALUE_NAMES = new Set(["networkID"]);
+const CANONICAL_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
 /** Digit runs in a value, for the bound above. */
 function digitRunCount(value: string): number {
   return (value.match(/\d+/g) ?? []).length;
@@ -419,6 +427,7 @@ function isContentDigestAssignment(name: string, value: string): boolean {
   }
   if (K8S_OBJECT_NAME_VALUE_NAMES.has(name) && isKubernetesObjectName(value)) return true;
   if (name === "rev" && GIT_COMMIT_SHA_RE.test(value)) return true;
+  if (UUID_VALUE_NAMES.has(name) && CANONICAL_UUID_RE.test(value)) return true;
   return DIGEST_NAME_RE.test(name) && HEX_DIGEST_RE.test(value);
 }
 
