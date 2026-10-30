@@ -82,16 +82,16 @@ one. The gate's readiness in the fleet is unchanged since revision 1: no gate is
 
 ## 2. What the gate actually does
 
-Read at `vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts` **`:2871`**,
+Read at `vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts` **`:2901`**,
 `asBoolean(config.enableGitHubPublishBroker, false)`. Every anchor below is a line in that
 same vendored file — not the `opencode-k8s` adapter's same-named `job-manifest.ts` — and each
-was re-verified at source on `master` `c147daf85` (2026-10-30T07:5xZ):
+was re-verified at source on `master` `56710069f` (2026-10-30T09:5xZ):
 
 | | Gate off (today) | Gate on |
 |---|---|---|
-| GitHub Secret | mounted into the agent container | mounted into the `github-publish-broker` sidecar only (**`:3388`** drops it from the agent) |
+| GitHub Secret | mounted into the agent container | mounted into the `github-publish-broker` sidecar only (**`:3418`**, `enableGitHubPublishBroker && isGitHubCredentialSecretVolume(...)`, drops it from the agent) |
 | Agent publish path | `git`/`gh`/MCP authenticate locally | agent asks the broker over a unix socket; `PAPERCLIP_GITHUB_BROKER_SOCKET` is set |
-| Broad data mount | renders, annotated `broad:<reason>` | **`buildJobManifest` throws** (**`:3927-3929`**) — fail closed, not degrade |
+| Broad data mount | renders, annotated `broad:<reason>` | **`buildJobManifest` throws** (**`:3962-3964`**) — fail closed, not degrade |
 | Pod shape | one container | `+1` native sidecar (initContainer, `restartPolicy: Always`), uid 1001, gid 1000, same image |
 
 Two properties make staging possible, and both were verified in the source rather than assumed:
@@ -100,7 +100,7 @@ Two properties make staging possible, and both were verified in the source rathe
   they were rendered with. That bounds both rollout and rollback latency to the longest in-flight
   run, and it means no running agent is ever reconfigured underneath itself.
 - **It is gated on there being a credential to move** — `brokerEnabled = enableGitHubPublishBroker
-  && brokerSecretMounts.length > 0` (**`:3907`**). Enabling it where no GitHub Secret is
+  && brokerSecretMounts.length > 0` (**`:3938`**). Enabling it where no GitHub Secret is
   mounted is a no-op rather than an agent that has lost its doors.
 
 ## 3. Preconditions — all of these gate stage 1
@@ -346,16 +346,16 @@ looked".
 **What changed on 2026-10-20 is named in the source, not inferred.** `BLO-47526` gave a `shared`
 runtime descriptor agent-scoped persistent roots so that `narrowWritableSurface` holds — the
 `mode === "shared"` branch and its rationale comment in
-`vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts` at **`:781-790`**, with
-`narrowWritableSurface` itself defined at **`:3200`**; before it, a shared run returned
+`vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts` at **`:811-820`**, with
+`narrowWritableSurface` itself defined at **`:3230`**; before it, a shared run returned
 `enabled:false` and kept the whole PVC mounted rw. `isolation_disabled` being the *only* leg that
 ever fired, and its stopping dead at that change, is consistent with that and with nothing else.
 
 ⚠ **The surviving broad path, which the zero does not cover.** `resolveJobIsolation` falls through to
 `SHARED_JOB_ISOLATION` (`enabled: false`) when a run arrives with **no runtime isolation descriptor**
 and `config.isolationMode` is not `isolated`/`isolate` — in
-`vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts`, the constant declared at **`:732`**
-and returned at **`:855-857`**. The comment at **`:3177-3179`** names it: *"only a config-only run
+`vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts`, the constant declared at **`:762`**
+and returned at **`:885-887`**. The comment at **`:3207-3209`** names it: *"only a config-only run
 with no descriptor and no `isolationMode` still reaches this fallback."* The measured zero is
 therefore a property of **the server supplying a descriptor on every render**, not of configuration.
 A run path that stops supplying one renders broad — and once the gate is on, that stops being a
@@ -727,7 +727,7 @@ cherry-picks of #3112's **first four** commits but not its fifth, which briefly 
 `workspaceVolumeClaim` pin on #3112's branch alone.
 [#3133](https://github.com/Blockcast/paperclip/pull/3133) (PEN-5027) then landed that pin on
 `master` independently at **2026-10-30T04:26:24Z** (`16fbb8ae`). Re-measured at source on `master`
-`c147daf85`, 2026-10-30T07:5xZ:
+`56710069f`, 2026-10-30T09:5xZ:
 
 ```
 BROKERED_POD_COMPOSITION_CONFIG_KEYS  (server/src/services/heartbeat.ts:2911)
@@ -888,7 +888,7 @@ complete the configuration half of this pre-flight.**
 
 **(c) …and the render-time observation covers what the config read cannot. This is why (b) does not
 block.** The §4 warn is emitted from `resolveJobIsolation`, which reads `config.isolationMode` off
-the **merged** config (`vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts:855`) — after
+the **merged** config (`vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts:885`) — after
 every scope has been applied. So a broad render caused by an *environment*-scope setting fires
 exactly the same warn as an agent-scope one. The
 render observation is **scope-agnostic and strictly stronger than a config read**: it observes the
@@ -920,8 +920,8 @@ zero is evidence about the mechanism, not about the sample.
 negative over Loki's retained window, liveness-controlled — it is **not** a configuration proof, and
 §4's surviving broad path is untouched by it: a run arriving with no runtime isolation descriptor and
 no `isolationMode` still reaches the `SHARED_JOB_ISOLATION` fallback — in
-`vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts`, the constant declared at **`:732`**
-and returned at **`:855-857`**. The zero is a property of the server supplying a descriptor on every
+`vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts`, the constant declared at **`:762`**
+and returned at **`:885-887`**. The zero is a property of the server supplying a descriptor on every
 render. A run path that stops supplying one renders broad — and once the gate is on, that is a
 hard build failure, not a quiet annotation.
 ⇒ **Check 3 of §11.6 re-runs this at every widening. It is not cleared once.**
