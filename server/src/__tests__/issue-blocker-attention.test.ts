@@ -1549,8 +1549,8 @@ describeEmbeddedPostgres("issue blocker attention", () => {
   });
 
   // `blocked` is deliberately absent from ISSUE_PARK_EXPIRY_WAKE_STATUSES, so the park sweep
-  // never wakes a blocked row and a park on one must not cover. Pins the status conjunct
-  // independently of the agent conjunct above.
+  // never wakes a blocked row and a park on one must not cover -- on the status conjunct and,
+  // since the term is now scoped to the `in_review` arm, on the call site too.
   it("does not cover a parked blocker whose status the park sweep never wakes (PEN-5021)", async () => {
     const { companyId, agentId } = await createCompany("PPN");
     const parentId = await insertIssue({ companyId, identifier: "PPN-1", title: "Parent", status: "blocked" });
@@ -1571,6 +1571,95 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       reason: "attention_required",
       coveredBlockerCount: 0,
       attentionBlockerCount: 1,
+    });
+  });
+
+  // A park is owed a release wake only if some agent can take it. A paused assignee cannot,
+  // so the park is not attendance and the blocker must keep its `stalled` verdict. Pins the
+  // invokability conjunct, which `issueParkOwesReleaseWake` itself does not carry: that
+  // function decides whether to ENQUEUE a wake, this one whether the wake will be SERVED.
+  it("does not cover an in_review blocker parked to a paused assignee (PEN-5021)", async () => {
+    const { companyId, pausedAgentId } = await createCompany("PPP");
+    const parentId = await insertIssue({ companyId, identifier: "PPP-1", title: "Parent", status: "blocked" });
+    const blockerId = await insertIssue({
+      companyId,
+      identifier: "PPP-2",
+      title: "Parked review blocker owned by a paused agent",
+      status: "in_review",
+      assigneeAgentId: pausedAgentId,
+      parkedUntil: new Date(Date.now() + 6 * 60 * 60 * 1000),
+    });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: parentId });
+
+    const parent = ((await svc.list(companyId, { status: "blocked" })) as IssueListItem[]).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({
+      state: "stalled",
+      reason: "stalled_review",
+      coveredBlockerCount: 0,
+      stalledBlockerCount: 1,
+      sampleStalledBlockerIdentifier: "PPP-2",
+    });
+  });
+
+  // Scoping control. All five measured PEN-5021 instances are `in_review`; a `todo` blocker
+  // reaches the leaf arm instead and must keep reading `needs_attention`. A status-agnostic
+  // park check placed ahead of that arm would silently cover this row.
+  it("does not cover a parked todo blocker: the park term is scoped to in_review (PEN-5021)", async () => {
+    const { companyId, agentId } = await createCompany("PPQ");
+    const parentId = await insertIssue({ companyId, identifier: "PPQ-1", title: "Parent", status: "blocked" });
+    const blockerId = await insertIssue({
+      companyId,
+      identifier: "PPQ-2",
+      title: "Parked todo blocker",
+      status: "todo",
+      assigneeAgentId: agentId,
+      parkedUntil: new Date(Date.now() + 6 * 60 * 60 * 1000),
+    });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: parentId });
+
+    const parent = ((await svc.list(companyId, { status: "blocked" })) as IssueListItem[]).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({
+      state: "needs_attention",
+      reason: "attention_required",
+      coveredBlockerCount: 0,
+      attentionBlockerCount: 1,
+    });
+  });
+
+  // The expensive direction, pinned: a park must never stop the walk before the recursion
+  // runs, or a real attention item deeper in the chain goes quiet with nothing announcing it.
+  // The cancelled grandchild is hard attention and has to surface THROUGH the parked blocker.
+  it("surfaces a hard-attention descendant through a parked in_progress blocker (PEN-5021)", async () => {
+    const { companyId, agentId } = await createCompany("PPR");
+    const parentId = await insertIssue({ companyId, identifier: "PPR-1", title: "Parent", status: "blocked" });
+    const blockerId = await insertIssue({
+      companyId,
+      identifier: "PPR-2",
+      title: "Parked in_progress blocker",
+      status: "in_progress",
+      assigneeAgentId: agentId,
+      parkedUntil: new Date(Date.now() + 6 * 60 * 60 * 1000),
+    });
+    const cancelledLeafId = await insertIssue({
+      companyId,
+      identifier: "PPR-3",
+      title: "Cancelled grandchild blocker",
+      status: "cancelled",
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: parentId });
+    await block({ companyId, blockerIssueId: cancelledLeafId, blockedIssueId: blockerId });
+
+    const parent = ((await svc.list(companyId, { status: "blocked" })) as IssueListItem[]).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({
+      state: "needs_attention",
+      reason: "attention_required",
+      coveredBlockerCount: 0,
+      attentionBlockerCount: 1,
+      sampleBlockerIdentifier: "PPR-3",
     });
   });
 
