@@ -749,6 +749,20 @@ describeEmbeddedPostgres("reconcileStrandedBlockedIssues", () => {
     expect(posted[0].body).toContain("external action:");
     expect(posted[0].body).toContain("description");
     expect(posted[0].body).toContain("stranded-blocked-issue reconciler");
+    // PEN-5065: the remedy is incomplete without the status it is read on. All three
+    // consumers of the declaration are scoped to `status === "blocked"`, so a reader who
+    // takes this announcement's advice and adds the two lines to the row it has just
+    // flipped to `todo` buys nothing — and this comment fires at exactly that moment,
+    // which is what makes omitting the scope expensive here rather than merely incomplete.
+    // Measured 2026-10-29 across 756 open Penstock rows: 12 carried a well-formed
+    // declaration, 6 of them on a non-`blocked` status. Asserted beside the two lines
+    // above so the pair cannot drift apart silently.
+    expect(posted[0].body).toContain("read only while the issue is `blocked`");
+    expect(posted[0].body).toContain("inert");
+    // ...and names what to use instead on the status the row is actually on, rather than
+    // leaving "set it back to `blocked`" as the only exit from a row that may legitimately
+    // not belong there.
+    expect(posted[0].body).toContain("parkedDisposition");
 
     // A sweep that flips nothing announces nothing.
     expect((await reconcileStrandedBlockedIssues(db)).reconciled).toBe(0);

@@ -217,6 +217,17 @@ async function listLockedLivePathIssueIds(
  * made. The remedy belongs in the announcement because that is the moment the
  * mistake becomes visible.
  *
+ * PEN-5065: the announcement also has to name the STATUS the declaration is read
+ * on, and this is the surface where omitting it is most expensive. All three
+ * consumers of the declaration are scoped to `status === 'blocked'` — this
+ * sweep's suppression, `isDeadEndBlocked`, and the blocked-inbox `external_wait`
+ * attention — so on any other status the two lines are completely inert. This
+ * comment fires at the exact moment the row LEAVES `blocked`, so a reader who
+ * follows it and adds the lines to the now-`todo` row buys nothing and is told
+ * nothing. Measured 2026-10-29 across 756 open Penstock rows: 12 carried a
+ * well-formed declaration, 6 of them on a non-`blocked` status. The scoping is
+ * correct and stays (same BLO-27553 reasoning as below); only the silence goes.
+ *
  * Deliberately NOT a widening of `listBlockedIssueAutoResumeSuppressions` to
  * scan comments. Every past widening of that predicate has ended up making rows
  * permanently undrainable — BLO-27553 measured 19 of 23 estate-wide strands
@@ -256,6 +267,15 @@ function announcementBody(): string {
     "blocker-resolved wake, and the row is surfaced in the blocked inbox as `external_wait` with",
     "the declared owner and action instead of as a stalled row. Delete the two lines when the gate",
     "clears — a stale declaration parks the row just as effectively as a live one.",
+    "",
+    "**The declaration is read only while the issue is `blocked`.** This comment means the row",
+    "is now `todo`, so adding the two lines without also returning it to `blocked` buys nothing:",
+    "on `todo`, `in_progress`, `in_review` and `backlog` the declaration is inert — it suppresses",
+    "nothing, surfaces nothing, and is not read by anything. Set `status` back to `blocked` in the",
+    "same edit that adds the lines. If the row should stay on its current status, use a deliberate",
+    "park instead (`parkedDisposition` with `until` and `reason`), which is counted on every",
+    "status; for `in_review`, use a pending interaction, a linked approval, or a human reviewer,",
+    "because a park is deliberately not a review path there.",
     "",
     "See `doc/execution-semantics.md#declaring-an-external-wait`.",
   ].join("\n");

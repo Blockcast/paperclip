@@ -20,17 +20,22 @@ import { externalWaitFromDescription } from "../services/issues.js";
 
 const docPath = fileURLToPath(new URL("../../../doc/execution-semantics.md", import.meta.url));
 
-function documentedSnippet(): string {
+const HEADING = "#### Declaring an external wait";
+
+function documentedSection(): string {
   const doc = readFileSync(docPath, "utf8");
-  const heading = "#### Declaring an external wait";
-  const headingIndex = doc.indexOf(heading);
-  expect(headingIndex, `"${heading}" is missing from doc/execution-semantics.md`).toBeGreaterThan(-1);
+  const headingIndex = doc.indexOf(HEADING);
+  expect(headingIndex, `"${HEADING}" is missing from doc/execution-semantics.md`).toBeGreaterThan(-1);
 
   // Bound the search to this section: stop at the next heading of any level, so a fence
   // added further down the document can never be picked up by mistake.
-  const rest = doc.slice(headingIndex + heading.length);
+  const rest = doc.slice(headingIndex + HEADING.length);
   const nextHeading = rest.search(/\n#{1,6} /);
-  const section = nextHeading === -1 ? rest : rest.slice(0, nextHeading);
+  return nextHeading === -1 ? rest : rest.slice(0, nextHeading);
+}
+
+function documentedSnippet(): string {
+  const section = documentedSection();
 
   // Take the fenced block that actually declares an external wait, rather than whichever
   // fence happens to come first — an unrelated example added above it must not retarget
@@ -39,7 +44,7 @@ function documentedSnippet(): string {
   const snippet = fences.find((body) => /^\s*external owner\s*:/im.test(body));
   expect(
     snippet,
-    `no fenced example declaring "external owner:" under "${heading}"`,
+    `no fenced example declaring "external owner:" under "${HEADING}"`,
   ).toBeTruthy();
   return snippet!;
 }
@@ -100,6 +105,37 @@ describe("external-wait declaration: doc and matcher agree", () => {
     expect(
       externalWaitFromDescription("\t External Owner :  CTO\n  EXTERNAL ACTION:\tApprove it"),
     ).toEqual({ owner: "CTO", action: "Approve it" });
+  });
+
+  it("states that the declaration is read only on a `blocked` row", () => {
+    // PEN-5065: every mechanical sentence in this section happened to be scoped to
+    // `blocked` — all three consumers are (`isDeadEndBlocked`, the blocked-inbox
+    // `external_wait` attention, and the auto-resume suppression) — but the scope was
+    // never stated as a rule, so a reader writing the two lines onto a `todo` row had no
+    // way to learn they bought nothing. Measured 2026-10-29 across 756 open Penstock
+    // rows: 12 carried a well-formed declaration, 6 of them on a non-`blocked` status.
+    //
+    // This is a prose assertion rather than a parser one on purpose, and it is the same
+    // class of drift the rest of this file catches: there is no code path to test,
+    // because the defect IS the absence of feedback. The matcher accepts the two lines
+    // on any status and always will — it never sees `status` — so the only thing that
+    // can tell an author about the scope is this section.
+    const section = documentedSection();
+    expect(section).toMatch(/read only on a `blocked` row/i);
+    expect(section).toMatch(/\binert\b/i);
+  });
+
+  it("names an instrument for each status the declaration does not cover", () => {
+    // Stating the restriction without naming the alternative would convert a silent
+    // no-op into a dead end: an agent that has correctly diagnosed a human gate on a
+    // `todo` row still needs somewhere to put it. A deliberate park is the general
+    // answer (counted on every status, unlike the declaration); `in_review` is the
+    // exception, because a park is deliberately not a review path there (BLO-33572).
+    const section = documentedSection();
+    for (const status of ["todo", "in_progress", "in_review", "backlog"]) {
+      expect(section, `the section does not mention \`${status}\``).toContain(status);
+    }
+    expect(section).toContain("parkedDisposition");
   });
 
   it("truncates at the caps the doc documents", () => {
