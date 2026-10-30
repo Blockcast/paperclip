@@ -629,14 +629,35 @@ the fleet distribution is **unmeasured**. Stated as a sample, not a bound:
 | quantity | measured |
 |---|---|
 | skills tree, raw | **130,390 bytes over 22 files** (22 directories) |
-| per-file Secret projection, stored | ~176,397 bytes — **16.8 % of the 1 MiB Secret cap** |
+| per-file Secret projection, base64 (what was originally measured) | ~176,397 bytes — 16.8 % of the cap, but **this is not the enforced quantity**; see the correction below |
+| per-file Secret projection, **decoded** (what `ValidateSecret` budgets) | 130,390 bytes — **12.4 % of the 1 MiB Secret cap** |
 | `tar.gz` + base64, stored | 60,164 bytes — 5.7 % of the cap |
 | prompt bundle, real content | 3,491 bytes (1 file; 0 skill bytes) |
 
 Correction: invariant 1 recorded "133 KB over 44 files". The byte figure was close; **the file
 count was not** — 44 is files *plus directories*. There are 22 files.
 
-**16.8 % is not headroom, and this is the part that decides the design.** The only size constant
+> **Correction 2026-10-30 (implementation): the 16.8 % row measures the wrong quantity, and the
+> error matters for the trigger rather than the guard.** The cap is enforced on **decoded** bytes,
+> not base64. `ValidateSecret` computes `totalSize += len(value)` over `secret.Data`
+> (`map[string][]byte`) against `MaxSecretSize = 1 * 1024 * 1024`, and
+> `Convert_v1_Secret_To_core_Secret` merges `StringData` into `Data` as `[]byte(v)` **before**
+> validation runs — so a UTF-8 byte length is what the API server checks, and **keys are not
+> counted** (the loop validates each key but adds only the value's length). Read from the
+> Kubernetes source on 2026-10-30, not from memory: `pkg/apis/core/validation/validation.go`,
+> `pkg/apis/core/types.go`, `pkg/apis/core/v1/conversion.go`.
+>
+> 176,397 / 130,390 = 1.353 — base64 expansion (4/3 plus padding). So the sample is **12.4 %** of
+> the budget actually enforced, not 16.8 %. That is the safe direction for the *budget*, which
+> would merely refuse early. It is **not** safe for the **escalation trigger**: a 50 % threshold
+> evaluated on base64 bytes fires at an effective 37.5 % of real capacity, moving the design to the
+> init-container fetch a third of the way early. Both are now computed on the same decoded
+> `totalValueBytes`, which is what the decision's "the guard and the escalation cannot disagree
+> about what they are measuring" requires. The conclusion below is unchanged: a per-file hard stop
+> equal to the whole budget bounds neither file count nor tree size, so 12.4 % is a sample of an
+> unbounded quantity and not headroom.
+
+**12.4 % is not headroom, and this is the part that decides the design.** The only size constant
 anywhere in the skills path is `MAX_CATALOG_FILE_BYTES = 1024 * 1024`
 (`company-skills.ts:467`) — and it is
 
@@ -654,7 +675,7 @@ anywhere in the skills path is `MAX_CATALOG_FILE_BYTES = 1024 * 1024`
 > tree size.
 
 So a single lawful skill file can exhaust the whole channel, the file count is unbounded, and
-nothing upstream keeps a company — or a run — below the cap. Today's 16.8 % is one sample of an
+nothing upstream keeps a company — or a run — below the cap. Today's 12.4 % is one sample of an
 unbounded quantity.
 
 #### Decision
@@ -698,9 +719,30 @@ measuring; an earlier draft defined the trigger per *company tree*, which is nei
 what the budget checks. That the projected size must be *emitted*, not merely checked, is why
 property 1 is instrumentation as much as it is a guard.
 
+**Landed 2026-10-30 — the channel's builder, measuring but not yet delivering.**
+`vendor/paperclip-adapter-claude-k8s/src/server/prompt-bundle-projection.ts` implements property 1:
+it walks the run's resolved entries, projects them to positional Secret keys with `items[].path`
+restoring the bundle layout, and **refuses** — `PromptBundleOverBudgetError`, naming company, run
+and measured bytes — rather than truncating. Image-path entries are excluded by the same
+discriminator `prompt-cache.ts` already applies.
+
+It is wired into `execute.ts` as **measurement only**, and that restraint is deliberate rather than
+unfinished. Nothing reads the projection yet; the pod still gets the bundle off the shared volume
+and will until `dataClaimName` is swapped. Enforcing the refusal now would abort a run over a
+budget that buys that run nothing — a pure regression — so the call site logs
+`claude_k8s.prompt_bundle_projection_sized` and steps over every outcome, including the refusals.
+The refusal becomes load-bearing in the same change that makes the pod read from the Secret.
+
+What that buys ahead of the swap is the one thing Finding 3 could not get: this sizing is from a
+single company because an agent seat cannot enumerate them, so **the fleet distribution against the
+50 % trigger is unmeasured**. Emitting the projected per-run size on real traffic measures it,
+which is what the decision means by choosing a trigger that fires "against a measurement rather
+than under an outage". Property 2 — the in-pod link farm — is not in this change.
+
 ⛔ Unchanged and still refused: a shared read-only claim (§2). It is one volume ID on every agent
 pod on the node, taking the same ceph-csi lock through the same `NodeUnstageVolume` path, and it
 would defeat this issue's own acceptance criterion.
+
 
 ## 5. Decisions taken, and what is still genuinely open
 
@@ -724,7 +766,8 @@ precedent, carrying the **run's resolved skill entries** (not `skills/<companyId
 `local_path` sources sit outside the managed tree and a company-tree projection would omit them);
 the prompt bundle's symlink farm is rebuilt in-pod from it rather than shipped. The init-container
 API fetch is the named escalation, triggered at 50 % of the Secret cap measured on the projected
-per-run size — today's single measurable company projects to 16.8 %, which is a sample of an
+per-run size — today's single measurable company projects to 12.4 % (decoded bytes, the quantity
+the API server enforces; an earlier 16.8 % measured base64), which is a sample of an
 unbounded quantity and not headroom, since the only size constant in the skills path is a per-file
 hard stop equal to the whole budget that bounds neither file count nor tree size.
 
