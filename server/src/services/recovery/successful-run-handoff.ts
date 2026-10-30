@@ -3,6 +3,7 @@ import type { Db } from "@paperclipai/db";
 import { agentWakeupRequests, agents, heartbeatRuns, issues } from "@paperclipai/db";
 import type { IssueCommentMetadata, IssueCommentPresentation, RunLivenessState } from "@paperclipai/shared";
 import { withRecoveryModelProfileHint } from "./model-profile-hint.js";
+import { isAlertEscalationLadderOriginKind } from "./origins.js";
 
 export const FINISH_SUCCESSFUL_RUN_HANDOFF_REASON = "finish_successful_run_handoff";
 export const SUCCESSFUL_RUN_MISSING_STATE_REASON = "successful_run_missing_state";
@@ -91,6 +92,7 @@ export type SuccessfulRunHandoffDecision =
 const SUCCESSFUL_RUN_HANDOFF_VALID_PATH_SKIP_REASONS = new Set([
   "issue has execution policy state",
   "active routine continuation owns the next action",
+  "alert escalation ladder owns the next action",
   "issue already has an active execution path",
   "issue already has a queued or deferred wake",
   "pending interaction or approval owns the next action",
@@ -485,6 +487,14 @@ export function decideSuccessfulRunHandoff(input: {
   if (input.isRoutineReceiverParent) return { kind: "skip", reason: "issue is a routine receiver parent" };
   if (agent.status === "paused" || agent.status === "terminated" || agent.status === "pending_approval") {
     return { kind: "skip", reason: `agent status ${agent.status} is not invokable` };
+  }
+  // PEN-2918: an alert row's next action belongs to the alert-escalation
+  // ladder, not to disposition recovery. "Read it and do nothing" is the
+  // correct outcome for most alerts, and every disposition this recovery would
+  // ask for either stops the ladder (`done`/`cancelled`) or defers every rung
+  // (a blocker, an armed monitor). See `isAlertEscalationLadderOriginKind`.
+  if (isAlertEscalationLadderOriginKind(issue.originKind)) {
+    return { kind: "skip", reason: "alert escalation ladder owns the next action" };
   }
   if (input.hasActiveRoutineContinuation) {
     return { kind: "skip", reason: "active routine continuation owns the next action" };

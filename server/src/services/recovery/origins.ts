@@ -30,6 +30,66 @@ export type RecoveryOriginKind = typeof RECOVERY_ORIGIN_KINDS[keyof typeof RECOV
 export type RecoveryReasonKind = typeof RECOVERY_REASON_KINDS[keyof typeof RECOVERY_REASON_KINDS];
 export type RecoveryKeyPrefix = typeof RECOVERY_KEY_PREFIXES[keyof typeof RECOVERY_KEY_PREFIXES];
 
+/**
+ * `issues.originKind` for a row minted by the Alertmanager plugin's webhook.
+ *
+ * Duplicated as a literal in `issues.ts` (aggregate-fingerprint arbitration)
+ * because the plugin package is not a server dependency: the plugin declares
+ * the same string in its own `types.ts`, and the two are joined only by this
+ * comment. Changing it is a data migration on `issues.origin_kind`, not a
+ * rename.
+ */
+export const ALERTMANAGER_ORIGIN_KIND = "plugin:paperclip-plugin-alertmanager";
+
+/**
+ * True for an alert row whose next action belongs to the alert-escalation
+ * ladder rather than to disposition recovery (PEN-2918).
+ *
+ * An alert row is the one row class where "the run ended without recording a
+ * disposition" is the CORRECT outcome, not a defect. The right response to
+ * most alerts is to read them and do nothing: the alert's own lifecycle is the
+ * disposition mechanism — a resolve webhook closes the row, and an alert that
+ * stays unacknowledged is carried up the `reportsTo` chain by
+ * `advanceIssueLadder` and finally covered against a human. Both paths run
+ * without the assignee doing anything, which is exactly what makes them work
+ * when the assignee is unavailable.
+ *
+ * Disposition recovery assumed the opposite, and the two never learned about
+ * each other. Three of the six dispositions it accepts silently DISABLE
+ * escalation, and they are the ones an owner reaches for first:
+ *
+ * | disposition              | effect on the ladder                          |
+ * |--------------------------|-----------------------------------------------|
+ * | `done` / `cancelled`     | stops permanently (terminal-status guard)     |
+ * | `blocked` with blockers  | defers every rung (BLO-40673, `hasLiveBlocker`) |
+ * | continuation via monitor | defers every rung (PEN-4337, `hasArmedMonitor`) |
+ *
+ * So recovery fires on precisely the rows the ladder exists to escalate, and
+ * satisfying it is what breaks them. Nothing warns: a deferred rung writes
+ * only plugin state, and its sole external trace is the ABSENCE of a cover
+ * row, which is indistinguishable from a ladder that was already spent.
+ *
+ * Measured on PEN-5094 (2026-10-30, authorized synthetic drill): recovery
+ * moved a live, escalating alert row to `blocked` 7m31s after it was minted.
+ * It happened to be harmless only because it left `blockedBy` EMPTY, so
+ * `hasLiveBlocker` returned false and rung 1/3 still fired on time at
+ * +30m43.6s. An owner who had answered that `blocked` status the obvious way,
+ * by adding a blocker to justify it, would have deferred every rung
+ * indefinitely and the alert would never have escalated.
+ *
+ * ⚠️ Deliberately keyed on origin kind ALONE, not on whether the ladder is
+ * still live. Ladder state (`resolvedAt`, `escalationComplete`) lives in the
+ * plugin's own namespaced state, which this service cannot read without a
+ * layering violation. The cost is that an alert row whose ladder is already
+ * spent also gets no corrective wake — acceptable, because by then a
+ * `[user-cover]` row is open against a human and the resolve cascade still
+ * closes the row. The alternative failure, a silently un-escalated alert, is
+ * strictly worse.
+ */
+export function isAlertEscalationLadderOriginKind(originKind: string | null | undefined) {
+  return originKind === ALERTMANAGER_ORIGIN_KIND;
+}
+
 export function isStrandedIssueRecoveryOriginKind(originKind: string | null | undefined) {
   return originKind === RECOVERY_ORIGIN_KINDS.strandedIssueRecovery;
 }

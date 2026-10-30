@@ -257,6 +257,46 @@ describe("successful run handoff decision", () => {
     });
   });
 
+  it("does not queue for an alert row — the escalation ladder owns its next action (PEN-2918)", () => {
+    const alertIssue = { ...issue, originKind: "plugin:paperclip-plugin-alertmanager" } as any;
+    const decision = decide({ issue: alertIssue });
+
+    expect(decision).toEqual({
+      kind: "skip",
+      reason: "alert escalation ladder owns the next action",
+    });
+    // A valid-path skip, not a fault: the ladder IS the disposition mechanism,
+    // so this must not be reported as an unresolved recovery.
+    expect(isSuccessfulRunHandoffValidPathSkip(decision)).toBe(true);
+  });
+
+  it("skips the alert row even when it looks maximally like a stranded one (PEN-2918)", () => {
+    // Every signal disposition recovery keys on says "abandoned": the run
+    // produced progress, the row is in_progress, and no monitor, blocker,
+    // wake, interaction or execution path is attending it. That is exactly the
+    // shape of an unacknowledged alert mid-ladder — PEN-5094 at rung 0 — and
+    // it is the case the guard exists for. Without the skip this returns
+    // `queue`, and the wake it queues asks the owner for a disposition that
+    // would stop or defer the ladder.
+    expect(decide({
+      issue: { ...issue, originKind: "plugin:paperclip-plugin-alertmanager" } as any,
+      livenessState: "advanced",
+      detectedProgressSummary: "Run produced concrete action evidence: 1 issue comment(s)",
+    })).toEqual({
+      kind: "skip",
+      reason: "alert escalation ladder owns the next action",
+    });
+  });
+
+  it("still queues for a non-alert row with the same shape (PEN-2918 negative control)", () => {
+    // Pins the guard to the origin kind rather than to anything the alert row
+    // happens to share with ordinary work. `null` is the ordinary case; the
+    // second assertion rejects a near-miss origin kind so a future rename
+    // cannot widen the skip silently.
+    expect(decide({ issue: { ...issue, originKind: null } as any }).kind).toBe("enqueue");
+    expect(decide({ issue: { ...issue, originKind: "plugin:paperclip-plugin-slack" } as any }).kind).toBe("enqueue");
+  });
+
   it("does not queue when the issue is the recurring parent of an active routine", () => {
     expect(decide({ hasActiveRoutineContinuation: true })).toEqual({
       kind: "skip",
