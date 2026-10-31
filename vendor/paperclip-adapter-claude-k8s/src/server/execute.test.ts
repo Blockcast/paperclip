@@ -734,6 +734,46 @@ describe("execute: stdout accumulator regression", () => {
   });
 });
 
+describe("execute: pod log transport selection (PEN-5120)", () => {
+  // Source-level, in the same idiom as the accumulator regression above, and for
+  // the same reason: the choice between the two transports is made once, inside
+  // a function this suite cannot drive to the collection stage without standing
+  // up a whole live-pod harness. What matters is not reachable by behaviour here
+  // but IS reachable by structure — so pin the structure.
+
+  it("NEGATIVE CONTROL: the shared-claim path still goes through tailPodLogFile", async () => {
+    // Done-when #2 for PEN-5120: today's fleet behaviour is unchanged. The file
+    // tail must remain the ELSE branch, reached whenever the builder did not
+    // report the transcript as streamed — not merely "present somewhere".
+    const source = await readFile(new URL("./execute.ts", import.meta.url), "utf-8");
+    expect(source).toMatch(
+      /:\s*tailPodLogFile\(podLogPath,\s*\{\s*onLog:\s*wrappedOnLog,\s*stopSignal:\s*logStopSignal\s*\}\);/,
+    );
+  });
+
+  it("gates the stream collector on the builder's flag and a resolved pod name", async () => {
+    const source = await readFile(new URL("./execute.ts", import.meta.url), "utf-8");
+    expect(source).toMatch(/const collectStdout = podLogStreamed && podName\s*\n?\s*\?\s*collectPodLogFromContainerStdout\(/);
+  });
+
+  it("takes the flag from the builder rather than re-deriving the claim", async () => {
+    // A second derivation here could disagree with the one that shaped the pod
+    // command, and the permissive direction of that disagreement is a server
+    // tailing a file no pod writes.
+    const source = await readFile(new URL("./execute.ts", import.meta.url), "utf-8");
+    expect(source).toMatch(/podLogStreamed = built\.podLogStreamedToContainerStdout;/);
+    expect(source).not.toMatch(/podLogStreamed = !serverHoldsJobDataClaim/);
+  });
+
+  it("skips the on-disk re-read only on the streamed path", async () => {
+    // The re-read compares lengths against a file THIS process wrote from the
+    // same accumulator, so on the streamed path it can only ever differ by the
+    // trailing newline — and would print a misleading warning every run.
+    const source = await readFile(new URL("./execute.ts", import.meta.url), "utf-8");
+    expect(source).toMatch(/if \(podLogPath && !podLogStreamed\) \{/);
+  });
+});
+
 describe("execute: process signal handlers (BLO-49139)", () => {
   it("registers no process signal listener", async () => {
     // The host server owns shutdown. This adapter used to re-raise SIGTERM
