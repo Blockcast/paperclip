@@ -214,6 +214,110 @@ export const HTTP_EMPTY_LIST_RESPONSES_METRIC = "paperclip_http_empty_list_respo
  */
 export const HTTP_TRANSIENT_DB_RESPONSES_METRIC = "paperclip_http_transient_db_responses_total";
 /**
+ * Wall-clock duration of every served HTTP request, in seconds (PEN-5136).
+ *
+ * ## What it closes
+ *
+ * Before this, the four HTTP-route instruments in this process were all
+ * counters ({@link HTTP_REQUESTS_METRIC},
+ * {@link HTTP_EMPTY_LIST_RESPONSES_METRIC},
+ * {@link HTTP_TRANSIENT_DB_RESPONSES_METRIC}, and the Better-Auth-scoped
+ * `paperclip_auth_request_total`), so **no route had a latency signal at any
+ * percentile**. A route could only become visible once it crossed the
+ * inherited 30s `statement_timeout` and served a `57014` 503 — i.e. the
+ * cheapest instrument was a user-facing outage.
+ *
+ * That is not hypothetical. Migration 0098's header records
+ * *"Verified live: query went from 30s timeout -> 774ms"*, and that fix later
+ * regressed. Nothing observed the query walking 0.8s -> 5s -> 25s; PEN-3596
+ * was filed only when it crossed the bound. The same blindness covered the
+ * 0268/0269 replacement until this series existed.
+ *
+ * It also changes what a verification costs. "No timeout over a window" is a
+ * rare-event test on a counter — PEN-3596 measured P(zero | no change) ~ 0.43
+ * over its post-deploy window, and the *unfixed* system had produced a longer
+ * quiet run on the same day — so a clean window could not discriminate. A p99
+ * comparison needs no rare events and settles in minutes.
+ *
+ * ## ⚠️ Label set: `route` and `method` only — `status` is deliberately absent
+ *
+ * {@link PENSTOCK_AVAILABILITY_GATE_PROBE_DURATION_METRIC} records the rule
+ * this follows: *a histogram multiplies every label combination by the bucket
+ * count*. The parent counter's labels are route x method x status, bounded at
+ * {@link HTTP_ROUTE_LABEL_CAP} — multiplying that by a bucket ladder is not
+ * acceptable, so `status` is dropped here and the counter keeps that finer
+ * breakdown.
+ *
+ * `method` is kept because dropping it would make the percentile
+ * uninterpretable rather than merely coarser: a `GET` and a `PATCH` on one
+ * template are different queries with different cost, and pooling them yields
+ * a p99 that belongs to neither. It is bounded to the known-method set plus
+ * `OTHER` by {@link normalizeHttpMethod}, and on live traffic it is a ~1.4x
+ * multiplier, not a combinatorial one.
+ *
+ * Nothing is zero-initialized, so a route that serves no traffic costs no
+ * series at all — the live cardinality is the route/method pairs actually
+ * exercised, not the ~300 declared templates.
+ *
+ * ## ⚠️ How to read it: aborted requests are included, and that is deliberate
+ *
+ * The observation is taken on the same `finish`/`close` latch the parent
+ * counter uses, so a request the client abandoned or the ingress timed out —
+ * the one the counter reports on its `"0"` status sentinel — is observed here
+ * too, at the duration it actually consumed. The hung-request regime is
+ * exactly what a latency series exists to show, so it is not filtered out.
+ *
+ * Two consequences a reader must not get wrong:
+ *
+ * 1. Because `status` is not a label, an abort cannot be excluded at query
+ *    time from this series. To ask "how slow are the requests we actually
+ *    answered?", read the parent counter's `status` split alongside it; this
+ *    series answers "how long did the server hold the request", which is the
+ *    question that predicts a timeout.
+ * 2. An abandoned request is **censored at the client's patience**, not at the
+ *    server's completion. If an ingress times out at 60s, its observation
+ *    lands at ~60s however long the underlying query would have run. So the
+ *    top bucket is a floor on the true cost, never a measurement of it.
+ */
+export const HTTP_REQUEST_DURATION_METRIC = "paperclip_http_request_duration_seconds";
+/**
+ * Explicit bucket edges for {@link HTTP_REQUEST_DURATION_METRIC}, in seconds.
+ *
+ * A short hand-chosen ladder rather than a default exponential one, because
+ * the edges have to answer specific questions:
+ *
+ * - **30** is the inherited `statement_timeout`
+ *   (`ALTER ROLE paperclip SET statement_timeout = '30000'`, applied
+ *   2026-05-13). Having it as a literal edge is the point of the series:
+ *   `rate(..._count) - rate(..._bucket{le="30"})` is the rate at which a route
+ *   crosses the bound, read directly rather than inferred from 503s.
+ * - **20** is the warning edge below it. PEN-3596's regression walked
+ *   0.8s -> 5s -> 25s; an edge at 20 is what makes that walk visible *before*
+ *   it 503s, which is the whole reason this metric exists.
+ * - **60** is above the bound, for the abandoned/ingress-timed-out regime that
+ *   outlives the statement timeout (see the censoring note on the metric).
+ * - the **0.025 - 1** range covers the healthy regime: 0098's verified-good
+ *   figure was 774ms, so a regression off that baseline moves between edges
+ *   rather than sitting in one bucket.
+ *
+ * 11 edges plus `+Inf`, `_sum` and `_count` is 14 series per route/method
+ * pair — small enough that the pair count, not the ladder, is the cardinality
+ * term.
+ */
+export const HTTP_REQUEST_DURATION_BUCKETS_SECONDS = [
+  0.025,
+  0.1,
+  0.25,
+  0.5,
+  1,
+  2.5,
+  5,
+  10,
+  20,
+  30,
+  60,
+];
+/**
  * Project primary-workspace fallback counter (BLO-26184). Incremented once
  * per resolution of a project that has >=1 workspace but no row flagged
  * `isPrimary` — i.e. `pickPrimaryWorkspace` fell through to the
@@ -5275,6 +5379,7 @@ let prReviewQueueWait: Histogram | null = null;
 let runDispatchWait: Histogram | null = null;
 let authRequest: Counter<"operation" | "outcome"> | null = null;
 let httpRequests: Counter<"route" | "method" | "status"> | null = null;
+let httpRequestDuration: Histogram<"route" | "method"> | null = null;
 let httpEmptyListResponses: Counter<"route" | "method" | "status"> | null = null;
 let httpTransientDbResponses: Counter<"route" | "method" | "status" | "code" | "sqlstate"> | null = null;
 let gbrainRecallTotal: Counter<"status"> | null = null;
@@ -5436,6 +5541,7 @@ function ensureRegistry(): {
   runDispatchWaitHistogram: Histogram;
   authRequestCounter: Counter<"operation" | "outcome">;
   httpRequestsCounter: Counter<"route" | "method" | "status">;
+  httpRequestDurationHistogram: Histogram<"route" | "method">;
   httpEmptyListResponsesCounter: Counter<"route" | "method" | "status">;
   httpTransientDbResponsesCounter: Counter<"route" | "method" | "status" | "code" | "sqlstate">;
   gbrainRecallCounter: Counter<"status">;
@@ -5593,6 +5699,7 @@ function ensureRegistry(): {
     || !runDispatchWait
     || !authRequest
     || !httpRequests
+    || !httpRequestDuration
     || !httpEmptyListResponses
     || !httpTransientDbResponses
     || !gbrainRecallTotal
@@ -7713,6 +7820,23 @@ function ensureRegistry(): {
       labelNames: ["route", "method", "status"],
       registers: [registry],
     });
+    httpRequestDuration = new Histogram({
+      name: HTTP_REQUEST_DURATION_METRIC,
+      help:
+        "Wall-clock seconds from middleware entry to response finish/close for every HTTP "
+        + `request served by this process (PEN-5136). Labeled by the same route template as `
+        + `${HTTP_REQUESTS_METRIC} plus method -- status is deliberately NOT a label, `
+        + "because a histogram multiplies every label combination by the bucket count. "
+        + "Bucket edges are explicit and straddle the inherited 30s statement_timeout, so "
+        + `rate(_count) - rate(_bucket{le="30"}) is the rate at which a route crosses that `
+        + "bound. Requests the client abandoned or the ingress timed out ARE observed here, "
+        + "at the duration they consumed -- so an observation in the top bucket is a floor "
+        + "on the true cost, not a measurement of it. No user, company, agent, query string, "
+        + "or other unbounded label is exposed.",
+      labelNames: ["route", "method"],
+      buckets: HTTP_REQUEST_DURATION_BUCKETS_SECONDS,
+      registers: [registry],
+    });
     httpEmptyListResponses = new Counter({
       name: HTTP_EMPTY_LIST_RESPONSES_METRIC,
       help:
@@ -8409,6 +8533,7 @@ function ensureRegistry(): {
     runDispatchWaitHistogram: runDispatchWait,
     authRequestCounter: authRequest,
     httpRequestsCounter: httpRequests,
+    httpRequestDurationHistogram: httpRequestDuration,
     httpEmptyListResponsesCounter: httpEmptyListResponses,
     httpTransientDbResponsesCounter: httpTransientDbResponses,
     gbrainRecallCounter: gbrainRecallTotal,
@@ -10944,11 +11069,24 @@ export function recordHttpRequest(input: {
    * here reuses the captured label and keeps the subset relation exact.
    */
   transientDb?: { code: string | null | undefined; sqlstate: string | null | undefined } | null;
+  /**
+   * Wall-clock seconds the request was held, observed into
+   * {@link HTTP_REQUEST_DURATION_METRIC} (PEN-5136). Optional so that a caller
+   * that cannot time the request still records the counters.
+   *
+   * Only a finite, non-negative number is observed. A `NaN`/`Infinity` from a
+   * clock fault would otherwise poison the histogram's `_sum` for that
+   * route/method pair permanently -- the sum is monotonic and cannot be
+   * repaired without a process restart -- so it is dropped rather than
+   * recorded, and the counters are unaffected either way.
+   */
+  durationSeconds?: number | null;
 }): {
   route: string;
   method: string;
   status: string;
   transientDb: { code: string; sqlstate: string } | null;
+  durationSeconds: number | null;
 } {
   const labels = {
     route: normalizeHttpRoute(input.route),
@@ -10971,7 +11109,22 @@ export function recordHttpRequest(input: {
     // subset per status rather than only in aggregate.
     registered.httpTransientDbResponsesCounter.inc({ ...labels, ...transientDb });
   }
-  return { ...labels, transientDb };
+  // `status` is not a label on the histogram (see HTTP_REQUEST_DURATION_METRIC
+  // for why), so the observation carries only the two shared dimensions and
+  // the aborted-response regime lands in the same series as a completed one.
+  let durationSeconds: number | null = null;
+  if (
+    typeof input.durationSeconds === "number"
+    && Number.isFinite(input.durationSeconds)
+    && input.durationSeconds >= 0
+  ) {
+    durationSeconds = input.durationSeconds;
+    registered.httpRequestDurationHistogram.observe(
+      { route: labels.route, method: labels.method },
+      durationSeconds,
+    );
+  }
+  return { ...labels, transientDb, durationSeconds };
 }
 
 /**
@@ -11616,6 +11769,7 @@ export function __resetMetricsForTest(): void {
   runDispatchWait = null;
   authRequest = null;
   httpRequests = null;
+  httpRequestDuration = null;
   httpEmptyListResponses = null;
   httpTransientDbResponses = null;
   seenHttpRouteLabels.clear();

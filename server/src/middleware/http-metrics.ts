@@ -85,6 +85,21 @@ function isApiPath(path: string): boolean {
  * route is that route's share of the hung-request regime. That regime is the
  * one this counter exists to make visible, so a rising `0` rate is a signal in
  * its own right rather than noise to filter out.
+ *
+ * ## Request duration (PEN-5136)
+ *
+ * The same latch also observes the request's wall-clock duration into
+ * `paperclip_http_request_duration_seconds`. The clock starts here -- at
+ * middleware entry, which is as early as this process can see the request --
+ * and stops on the same `finish`/`close` event the counters are recorded on,
+ * so the two families describe the same population by construction.
+ *
+ * `process.hrtime.bigint()` rather than `Date.now()`: it is monotonic, so an
+ * NTP step mid-request cannot produce a negative or wildly inflated
+ * observation. The histogram's `_sum` is monotonic and cannot be repaired
+ * without a process restart, which makes a single poisoned observation
+ * permanent -- `recordHttpRequest` therefore drops any non-finite value
+ * rather than observing it.
  */
 
 /** Marks a response as already instrumented, so a double mount cannot
@@ -166,6 +181,10 @@ export function httpMetricsMiddleware(): RequestHandler {
     const apiRequest = isApiPath(req.path);
     if (apiRequest) noteApiRequestReceived();
 
+    // Monotonic, and started before the route is even bound: the duration
+    // this series reports is the time the process held the request, not the
+    // time one handler took.
+    const startedAtNs = process.hrtime.bigint();
     let capturedRoute: string | null = null;
     let emptyList = false;
 
@@ -222,6 +241,7 @@ export function httpMetricsMiddleware(): RequestHandler {
           ? null
           : composeRouteLabel(req.baseUrl, req.route?.path);
         recordHttpRequest({
+          durationSeconds: Number(process.hrtime.bigint() - startedAtNs) / 1e9,
           route: capturedRoute ?? fallbackRoute,
           method: req.method,
           // An aborted response still holds Node's default 200; report it on
