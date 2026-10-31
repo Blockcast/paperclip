@@ -810,6 +810,38 @@ describe("handleWebhook — delivery timing (BLO-37485)", () => {
     ).resolves.toBeDefined();
   });
 
+  it("delivers against a host client that has no `observe` at all", async () => {
+    // ABSENCE is a different failure mode from REJECTION and the test above
+    // does not cover it: `ctx.metrics.observe(...)` on a client without the
+    // method throws SYNCHRONOUSLY, so there is no promise for `.catch` to
+    // attach to and the throw escapes the alert loop. That would fail EVERY
+    // delivery on a host that predates PEN-5140 — the whole batch lost for a
+    // missing histogram sample. Deleting the method is the honest simulation
+    // of such a host; 10 of this plugin's own suites build exactly that shape.
+    const { ctx, mocks } = mkCtx();
+    delete (ctx.metrics as Partial<typeof ctx.metrics>).observe;
+
+    await expect(
+      handleWebhook(ctx, baseConfig(), true, baseInput({
+        parsedBody: baseEnvelope({
+          alerts: [baseAlert({ fingerprint: "fp-1" }), baseAlert({ fingerprint: "fp-2" })],
+        }),
+      })),
+    ).resolves.toBeDefined();
+
+    // The sample is lost, not the alerts: the delivery still reported both.
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.webhook.alerts_received",
+      2,
+    );
+    // And it is reported once for the delivery, on the same latch as a
+    // rejection — not once per alert.
+    expect(
+      mocks.logger.error.mock.calls
+        .filter((call) => String(call[0]).includes("alertmanager.webhook.alert_duration")),
+    ).toHaveLength(1);
+  });
+
   it("counts a delivery that outran the 120s proxy deadline", async () => {
     const { ctx, mocks } = mkCtx();
     const clock = stubClock(1_000_000);

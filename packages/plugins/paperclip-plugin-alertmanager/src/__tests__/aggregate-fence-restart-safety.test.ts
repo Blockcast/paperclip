@@ -206,7 +206,7 @@ function mkCtx() {
     events: { emit: vi.fn(async (..._args: unknown[]) => {}) },
     // Rest-typed for the same reason as `state.set` above: the BLO-32113
     // blocked-fence assertion reads the second argument off `.mock.calls`.
-    metrics: { write: vi.fn(async (..._args: unknown[]) => {}) },
+    metrics: { write: vi.fn(async (..._args: unknown[]) => {}), observe: vi.fn(async (..._args: unknown[]) => {}) },
     activity: { log: vi.fn(async () => {}) },
     actions: { register: vi.fn() },
     secrets: {

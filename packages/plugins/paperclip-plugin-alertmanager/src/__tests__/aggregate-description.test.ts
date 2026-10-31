@@ -283,7 +283,7 @@ function mkCtx() {
     issues: issues.api,
     db: realDb(db),
     events: { emit: vi.fn(async (..._args: unknown[]) => {}) },
-    metrics: { write: vi.fn(async (..._args: unknown[]) => {}) },
+    metrics: { write: vi.fn(async (..._args: unknown[]) => {}), observe: vi.fn(async (..._args: unknown[]) => {}) },
     activity: { log: vi.fn(async () => {}) },
     actions: { register: vi.fn() },
     secrets: {

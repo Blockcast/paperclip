@@ -4488,17 +4488,38 @@ export async function handleWebhook(
   // latency is the thing being measured. `void` + `.catch` rather than `await`
   // for that second reason specifically — awaiting here would make the
   // instrument a contributor to the quantity it reports.
+  const noteAlertCostMetricFailure = (metricErr: unknown): void => {
+    if (alertCostMetricFailed) return;
+    alertCostMetricFailed = true;
+    ctx.logger.error(
+      `paperclip-plugin-alertmanager: failed to record ${ALERT_DURATION_METRIC}`
+      + ` (further failures in this delivery suppressed): ${String(metricErr)}`,
+    );
+  };
+
   const reportAlertCost = (finished: NonNullable<typeof inFlight>): void => {
     if (finished.filtered) return;
     const seconds = (performance.now() - finished.startedAt) / 1000;
-    void ctx.metrics.observe(ALERT_DURATION_METRIC, seconds).catch((metricErr) => {
-      if (alertCostMetricFailed) return;
-      alertCostMetricFailed = true;
-      ctx.logger.error(
-        `paperclip-plugin-alertmanager: failed to record ${ALERT_DURATION_METRIC}`
-        + ` (further failures in this delivery suppressed): ${String(metricErr)}`,
-      );
-    });
+    // `observe` is newer than `write` (PEN-5140), so a host client may not
+    // carry it at all. ABSENCE and REJECTION are different failure modes and
+    // only the second is caught by `.catch`: calling a missing method throws
+    // SYNCHRONOUSLY, before there is a promise to attach a handler to, and
+    // that throw propagates out of the delivery loop and fails the delivery.
+    // Losing a histogram sample must never cost an alert (BLO-20467), so
+    // absence is handled on the same latch as a rejection.
+    const observe = (ctx.metrics as Partial<typeof ctx.metrics>).observe;
+    if (typeof observe !== "function") {
+      noteAlertCostMetricFailure(`host client does not implement metrics.observe`);
+      return;
+    }
+    try {
+      void observe
+        .call(ctx.metrics, ALERT_DURATION_METRIC, seconds)
+        .catch(noteAlertCostMetricFailure);
+    } catch (metricErr) {
+      // A present-but-throwing `observe` lands here for the same reason.
+      noteAlertCostMetricFailure(metricErr);
+    }
   };
 
   const reportIfSlow = (finished: NonNullable<typeof inFlight>): void => {

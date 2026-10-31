@@ -137,7 +137,7 @@ function ctxFor(
       }),
     },
     events: { emit: vi.fn() },
-    metrics: { write: vi.fn() },
+    metrics: { write: vi.fn(), observe: vi.fn(async () => {}) },
     logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
   } as unknown as PluginContext;
 }
