@@ -66,7 +66,7 @@ jobs:
       # it. Same posture as commitperclip-review.yml. The values file read for
       # the context name comes from master for the same reason.
       - name: Checkout base branch (never queue-candidate code)
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           ref: master
 

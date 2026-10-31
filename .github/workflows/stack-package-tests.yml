@@ -196,7 +196,7 @@ jobs:
     # on `select` keeps the two disjoint -- they never both run on one head.
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
 
       - name: Setup pnpm
         uses: ./.github/actions/setup-pnpm
@@ -278,7 +278,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           # Not depth 1: the allowlist guard resolves $PR_BASE_SHA. pr.yml puts
           # that guard in `policy` for this same reason.
