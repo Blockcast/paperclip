@@ -243,6 +243,72 @@ test("a manifest entry whose anchor now resolves is itself reported", () => {
   assert.equal(stale.length, 1);
 });
 
+// A file where the cited symbol also lives elsewhere -- the shape that let
+// `:811-820` (`narrowWritableSurface`, 19 sites) report `ok` while citing code
+// ~270 lines from the branch its prose described.
+const REPEATED = [
+  "if (narrowWritableSurface) {", // 1
+  "  const a = 1;", // 2
+  "}", // 3
+  "if (mode === \"shared\") {", // 4
+  "  // narrowWritableSurface holds here", // 5
+  "  const b = 2;", // 6
+  "}", // 7
+].join("\n");
+
+test("a range anchor on a construct with several sites is ambiguous, not ok", () => {
+  // The construct IS inside 4-7, so the old assertion passed. It is also at :1,
+  // so "somewhere in this range" cannot distinguish the cited branch from any
+  // other occurrence that drifts into the window.
+  const f = only("`narrowWritableSurface` (`src/a.ts:4-7`)", REPEATED);
+  assert.equal(f.status, "ambiguous");
+  assert.deepEqual(f.sites, [1, 5]);
+});
+
+test("a range anchor pinned to a unique construct resolves", () => {
+  const f = only("`if (mode === \"shared\") {` (`src/a.ts:4-7`)", REPEATED);
+  assert.equal(f.status, "ok");
+  assert.deepEqual(f.sites, [4]);
+});
+
+test("a single-line anchor on a repeated construct stays ok but is counted", () => {
+  // Deliberately not failed: a single line is the tightest assertion a line
+  // number can carry. `sites` is still reported so the weaker form is visible.
+  const f = only("`narrowWritableSurface` (`src/a.ts:5`)", REPEATED);
+  assert.equal(f.status, "ok");
+  assert.equal(f.sites.length, 2);
+});
+
+test("a drifted range anchor reports as drifted, not ambiguous", () => {
+  // Ambiguity is only ever asked about an anchor that otherwise resolves --
+  // a drifted one already names its current sites.
+  const f = only("`narrowWritableSurface` (`src/a.ts:2-3`)", REPEATED);
+  assert.equal(f.status, "drifted");
+  assert.deepEqual(f.actual, [1, 5]);
+});
+
+test("an ambiguous anchor can still be carried by the manifest", () => {
+  const doc = "`narrowWritableSurface` (`src/a.ts:4-7`)";
+  const findings = checkDocument({ docPath: "d.md", docText: doc, readSource: () => REPEATED });
+  const manifest = [{ doc: "d.md", anchor: "src/a.ts:4-7", construct: "narrowWritableSurface" }];
+  const { findings: out, stale } = applyUnverified(findings, manifest, ["d.md"]);
+  assert.equal(out[0].status, "unverified");
+  assert.equal(out[0].was, "ambiguous");
+  assert.deepEqual(stale, []);
+});
+
+test("a manifest entry matching an anchor that now resolves is reported stale", () => {
+  // The key MATCHES and the anchor is `ok`. Before PEN-5091's review fix the
+  // entry was marked matched regardless of status, so a corrected anchor left
+  // its manifest line behind as a permanent hole -- exempting it again the next
+  // time it drifted. Distinct from the test below, where the key differs.
+  const doc = "`parseThing` (`src/a.ts:2`)";
+  const manifest = [{ doc: "d.md", anchor: "src/a.ts:2", construct: "parseThing" }];
+  const { findings, stale } = applyUnverified(check(doc), manifest, ["d.md"]);
+  assert.equal(findings[0].status, "ok", "a resolving anchor must not be downgraded");
+  assert.deepEqual(stale, ["d.md\tsrc/a.ts:2\tparseThing"]);
+});
+
 test("manifest entries for documents outside this run are not judged", () => {
   // A narrowed --glob must not report every other document's entries as stale.
   const doc = "`parseThing` (`src/a.ts:5`)";
