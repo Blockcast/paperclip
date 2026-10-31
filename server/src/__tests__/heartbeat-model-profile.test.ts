@@ -533,9 +533,9 @@ describe("mergeModelProfileAdapterConfig agent-scope-only top-level config bound
   // execute.ts, over the config this merge returns.
   //
   // This test documents that intended order; it does NOT cover the site order.
-  // The adapter holds its own copy of `mergeEnvironmentConfig` — defined in,
-  // and called from within `execute()` in, the claude-k8s adapter's execute.ts
-  // — and this test both imports a different copy (@paperclipai/adapter-utils)
+  // The adapter holds its own copy of `mergeEnvironmentConfig` — defined in
+  // that same execute.ts, and called from within `execute()` — and this test
+  // both imports a different copy (@paperclipai/adapter-utils)
   // and chooses the call order itself, so a refactor moving the pin below the
   // overlay inside execute.ts leaves it green. A real site-order test would
   // have to go through execute().
@@ -549,9 +549,10 @@ describe("mergeModelProfileAdapterConfig agent-scope-only top-level config bound
       modelProfile: { ...noProfile },
       issueAdapterConfig: { workspaceVolumeClaim: "attacker-claim" },
     });
-    // Mirrors the adapter's own call, which is
-    // `mergeEnvironmentConfig(adapterConfigObj, target?.config ?? null)` — the
-    // `?? null` is what makes the null-skip branch below reachable in practice.
+    // Mirrors the adapter's own call:
+    // `mergeEnvironmentConfig(adapterConfigObj, target?.config ?? null)`. The
+    // `?? null` only normalises an absent config, which the function already
+    // ignores; the null case below exercises the separate per-key skip.
     const effective = mergeEnvironmentConfig(merged, { workspaceVolumeClaim: "paperclip-data" });
     // A partially-populated K8sRemoteSpec must not clobber the agent value.
     const partial = mergeEnvironmentConfig(merged, { workspaceVolumeClaim: null });
