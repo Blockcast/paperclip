@@ -42,7 +42,7 @@ vi.mock("../config-scope.js", async (importOriginal) => {
   };
 });
 
-type ReconcileResult = { skipped?: string; routed: number; backfilled: string[] };
+type ReconcileResult = { skipped?: string; routed: number; backfilled: string[]; resolved?: string[] };
 const reconcileActiveAlerts = vi.fn<(ctx: unknown, config: SweepConfig) => Promise<ReconcileResult>>();
 vi.mock("../reconcile.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../reconcile.js")>();
