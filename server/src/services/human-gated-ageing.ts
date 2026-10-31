@@ -145,6 +145,14 @@ const PRIORITY_RANK = new Map<string, number>(
  * past-threshold `critical` rows take 14 of the 15 slots, so what prints is those
  * 14 plus exactly **one** `high` row.
  *
+ * ⚠ Every age here is `createdAt`-based, while the shipped cut sorts on
+ * `humanClockAt` = `max(createdAt, lastHumanTouchAt)`. That makes these ages an
+ * upper bound, which is safe for the *counts* — a human touch can only move a row
+ * below its bar, never above — but **not for the identities**. "Those 14 plus one
+ * `high`" and "awards it to `PEN-705`" are the rows a `createdAt` clock selects; a
+ * recent human touch on any of them would reorder the cut. Re-derive the named
+ * rows against `humanClockAt` before acting on any one of them.
+ *
  * Those 15 escalated rows are the sole gate for **26** of the 43, and **6 of the
  * 15 free nothing at all**. The 28 withheld past-threshold rows hold **15** more
  * between them; the remaining 2 sit on `PEN-4392` (`high`, 9.9d), not yet past its
@@ -154,7 +162,9 @@ const PRIORITY_RANK = new Map<string, number>(
  * 21 past-threshold `high` rows compete for that one remaining slot.** Oldest-
  * within-tier awards it to `PEN-705` (138.9d), which is the sole gate for
  * **nothing**, while `PEN-2213` (81.5d, sole gate for **6**) is withheld. Of the
- * 15 payoff reachable in the `high` tier, the age pick captures **0** of it.
+ * **15 past-threshold `high` payoff**, the age pick captures **0** of it. (The
+ * tier holds 17 in total; the other 2 are `PEN-4392`, not yet past its bar and so
+ * not a candidate for the slot either way.)
  *
  * ⚠ `PEN-4079` is **not** an example of the cap discarding anything — an earlier
  * revision of this note claimed it was, and that was wrong. It is `critical` at
