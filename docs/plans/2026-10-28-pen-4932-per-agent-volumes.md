@@ -559,14 +559,24 @@ PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verificati
      than it supports. It conflates "the copy stops growing" with "the copy does
      not exist".
 
-     ⚠️ **Sequencing, because this correction is only true once the COLLECTOR
-     half lands.** On `master` as this was written the emit half (#3173) has
-     merged and the collector (#3174) has not, and until it does PEN-5124's
-     reading is the correct one: nothing writes a server-side copy, so the
-     reader genuinely returns `no_artifact` on a foreign claim and the
-     regression is the full one. That is not a live defect either way — the gate
-     is default-off — but do not read the paragraphs below as describing
-     `master` before #3174 is in it.
+     ⚠️ **Sequencing — CONDITION MET, retired 2026-10-31.** The correction
+     above holds only once the COLLECTOR half is on `master`, and when it was
+     written that was still open: the emit half (#3173) had merged and the
+     collector (#3174) had not, so until it did, PEN-5124's `no_artifact`
+     reading was the correct one and the regression was the full one. #3174
+     merged 10:27:27Z, ahead of this text's own PR (#3175, 11:02:50Z) — so the
+     condition was already satisfied when this landed, and **the paragraphs
+     below describe `master` as it now stands.** The caveat is retired rather
+     than deleted because the dependency it names is load-bearing: the
+     distinction between a TRUNCATED server-side copy and an ABSENT one is the
+     whole reason the residual is narrow, and it is only true while a collector
+     exists to write that copy — specifically
+     `collectPodLogFromContainerStdout`'s lazily-opened append handle on
+     `podLogPath`, not the `collectPodLogStream` read it drives. Remove that
+     write and PEN-5124's original reading becomes correct again. Note its
+     `persistFailed` path reaches the same place by design: a failed persist is
+     deliberately non-fatal to the run, so a run CAN still end with no
+     server-side copy and read `no_artifact` here.
 
      The collector persists every accepted line to the
      server's OWN `podLogPath`, and that path is rooted at
