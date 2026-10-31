@@ -238,6 +238,12 @@ rather than by name.
 unchanged until it lands. Stage 0 carries **no PR merges** and does not wait on this (§7);
 #3112 sits in stage 1's precondition set.
 
+> ⛔ **SUPERSEDED in its mechanism; its point stands.** **#3112 was CLOSED without merging on
+> 2026-10-30T10:23:55Z and must not be reopened** (§11.2). The gate was never really that PR — it is
+> the §3.2 remedy being **on `master`**, which it is: the content reached `master` by way of #3123 and
+> #3133. Read as written, this sentence makes stage 1 wait on an event that can no longer occur.
+> §9's table and §11.1 carry the measured set.
+
 ### 3.3 The gate has no operator surface
 
 `enableGitHubPublishBroker` is **absent from `getConfigSchema()`**
@@ -327,6 +333,11 @@ create, reached by a different key, and it becomes reachable at stage 1. #3121 p
 scope while the gate is on, the same conditional shape as `enableDocker`. ⚠ **#3121 has since merged
 into #3112's branch rather than into `master`** (§1), so this pin now ships as commit `7cea4d40b`
 inside #3112 and is not separately trackable.
+
+> ⛔ **SUPERSEDED.** The pin is on `master` in its own right as `16fbb8aef`, landed by
+> [#3133](https://github.com/Blockcast/paperclip/pull/3133) on 2026-10-30T04:26:24Z, and #3112 is
+> closed. It is separately trackable again, and §11.6's check 1 reads **three**
+> `BROKERED_POD_COMPOSITION_CONFIG_KEYS` on `master` precisely because of it.
 
 **What (a) and (b) together do to §6:** the set of "the agent cannot run, and that is a control
 working correctly" grows from two members to three. §6's rollback evidence item 3 is updated to
@@ -513,18 +524,38 @@ silent broker and a broker nobody asked to publish are the same observation (§5
 **Stage 1 — one agent, one company.** **Does not start on a date. It starts when every precondition
 below is on `master`**, target **2026-11-06**, which is an earliest-start and not a commitment (CTO,
 2026-10-29). Duration ≥ 3 working days. ✅ **Set in §11.3, with the mechanical entry gate in §11.6 —
-two of whose four checks fail as of 2026-10-30.**
+none of whose four checks fails as measured 2026-10-30, two of the four being perishable and owed a
+re-run at the gate (§11.6 is authoritative; a green there is not a go).**
 
-**Stage 1's precondition set — all must be on `master`, ancestor-confirmed, not label-read:**
+**Stage 1's precondition set — all must be on `master`. ⛔ Confirm each by its LANDED commit, or by
+content where there is no merge commit — NEVER by the PR's head commit:**
 
-| | Carrier | State 2026-10-29T21:45Z |
+| | Landed as | State, measured 2026-10-31 |
 |---|---|---|
-| #3097 §5 starvation assertion | — | **on `master`** |
-| #3089 env-credential refusal | — | **on `master`** |
-| #3098 §8 measurement | — | open, `BEHIND`, red on infrastructure — needs a **job re-run** |
-| #3112 PEN-5017 agent-provenance gate | — | open, `CLEAN` |
-| PEN-5027 `workspaceVolumeClaim` pin | **inside #3112** (`7cea4d40b`) | open — **not separately cleared**, see §1 |
-| #3123 PEN-5026 privilege refusal | — | open, `CLEAN` |
+| #3097 §5 starvation assertion | `c0d8b83eb` | ✅ **on `master`**, ancestor-confirmed |
+| #3089 env-credential refusal | `99905d39b` | ✅ **on `master`**, ancestor-confirmed |
+| #3098 §8 measurement | `0fa107202` | ✅ **on `master`** — merged 2026-10-30T03:32:58Z. Its red was infrastructure and was cleared by a **job re-run, not a push**, as this plan predicted |
+| #3123 PEN-5026 privilege refusal | `7c53b431c` | ✅ **on `master`** — merged 2026-10-30T00:19:07Z |
+| #3112 PEN-5017 agent-provenance gate | **none — CLOSED unmerged** | ✅ **discharged by content on `master`**, carried there by #3123 and #3133 rather than by this PR (§11.1, §11.2). It must **not** be reopened |
+| PEN-5027 `workspaceVolumeClaim` pin | `16fbb8aef` (#3133) | ✅ **on `master` in its own right** — no longer "inside #3112" |
+
+**Six of six; the precondition set is complete.** ⛔ That is not a stage-1 go and must not be cited as
+one: §11.3's date floor governs independently (stage 0 `2026-11-05`, stage 1 earliest `2026-11-06`),
+and §11.6's checks 3 and 4 are perishable point-in-time reads that must be re-run immediately before
+the start.
+
+⛔ **Why this table names landed commits — and why the obvious mechanical check is the wrong one.**
+This repo lands through a merge queue, which **rebases before it merges**. A PR's `headRefOid` is
+therefore never an ancestor of `master`, *even after that PR has merged*. Measured 2026-10-31: all
+six PRs above — **including the five that merged** — return `diverged` from
+`compare/master...<headRefOid>`, while all five merged ones return `behind` from
+`compare/master...<merge_commit_sha>`. So the rule this section used to carry — *"ancestor-confirmed,
+not label-read"* — names no object, and the natural object to reach for is the PR head, which fails
+**every row in this table**. It was written to defeat a stale label and instead defeats the reader
+who follows it most carefully, in the direction of a false *failure*: the safe direction, but it
+would have left the gate unenterable by anyone doing it properly. Use `merge_commit_sha` for a
+merged PR; use content on `master` for #3112, which has no merge commit at all. §11.6's check 2
+carries the same warning for the same reason.
 
 ⚠ **#3089 is the one that must never be reordered.** The CTO will not move stage 1 earlier than it
 under any circumstance: enabling the gate while an env-delivered credential is still in the agent
@@ -550,9 +581,11 @@ filed to stop:
 > Security decision that re-opens §7.1. **Stage 1's precondition set is therefore #3097, #3089,
 > #3098, #3112 and PEN-5027.**
 
-Two mechanical notes on that last sentence, which is accurate but has moved since it was written:
-PEN-5027 now ships **inside #3112** rather than as #3121, so the set is satisfied by four PRs rather
-than five; and **#3123 joined the set afterwards** (§3.5a), which the disposition predates.
+Two mechanical notes on that last sentence, which was accurate when written and has moved twice
+since. PEN-5027 briefly shipped **inside #3112** rather than as #3121 — it is now on `master` in its
+own right as `16fbb8aef` (#3133), and #3112 is closed unmerged; and **#3123 joined the set
+afterwards** (§3.5a), which the disposition predates. The disposition's *substance* is unchanged and
+is met — the set as measured today is the six rows in the table above, all six on `master`.
 
 Population: a single `claude_k8s` agent that publishes often enough to exercise all three doors
 within the window. **Devops (`11b9c48f`) volunteers as stage 1**: this seat opens PRs daily, uses
@@ -979,6 +1012,14 @@ but because it was **closed** and its content was already on `master` (§11.2). 
 PR *state* rather than content on `master` will get this row wrong in the direction of a false
 failure — which is the safe direction, but it is still wrong, and it will cost whoever re-runs it an
 hour. Test content.
+
+⛔ **The failure is wider than that paragraph says, and it is not confined to #3112.** Testing a PR's
+*head* ancestry — the natural reading of "ancestor-confirmed" — gets **every** precondition row wrong,
+not merely this one, because the merge queue **rebases before landing**: no PR's `headRefOid` is ever
+an ancestor of `master`, merged or not. Measured 2026-10-31, all six precondition PRs return
+`diverged` from `compare/master...<headRefOid>`, while all five merged ones return `behind` from
+`compare/master...<merge_commit_sha>`. Test `merge_commit_sha`, or test content; never the PR head.
+§9 carries the measurement and the corrected table.
 
 ### 11.7 The §4 pre-flight, actually run (2026-10-30T01:0xZ)
 
