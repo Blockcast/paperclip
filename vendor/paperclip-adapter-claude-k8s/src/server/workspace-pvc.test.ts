@@ -39,14 +39,26 @@ describe("agentWorkspaceClaimName", () => {
     expect(name.length).toBeLessThanOrEqual(253);
   });
 
-  it("sanitises rather than emitting a name the API server would reject", () => {
-    expect(agentWorkspaceClaimName("AB_cd/ef!")).toBe("agent-workspace-abcdef");
+  it("sanitises a label-safe id rather than emitting a name the API server would reject", () => {
+    expect(agentWorkspaceClaimName("AB_cd.ef")).toBe("agent-workspace-abcd.ef".replace(".", ""));
   });
 
-  it("refuses an id with no usable characters instead of returning a bare prefix", () => {
-    // A bare `agent-workspace-` prefix would be the same name for every such
-    // id, so two agents would silently share one claim.
-    expect(() => agentWorkspaceClaimName("___")).toThrow(/no DNS-1123 characters/);
+  // The claim name is sanitised but the `paperclip.io/agent-id` label carries
+  // the RAW id, so an id that is not a legal label value must be refused where
+  // the name is derived — otherwise the create fails a 422 naming the label
+  // rather than the id that caused it.
+  it("refuses an id that is not a legal label value", () => {
+    expect(() => agentWorkspaceClaimName("a".repeat(64))).toThrow(/label value/);
+    expect(() => agentWorkspaceClaimName("-leading")).toThrow(/label value/);
+    expect(() => agentWorkspaceClaimName("has space")).toThrow(/label value/);
+  });
+
+  // An all-punctuation id would slug to "" and yield a bare `agent-workspace-`
+  // prefix — the same name for every such id, handing two agents one claim.
+  // It is refused, though by the label guard rather than by the emptiness
+  // backstop, which the label rule subsumes (see the comment there).
+  it("refuses an id that would slug to a bare prefix", () => {
+    expect(() => agentWorkspaceClaimName("___")).toThrow(/label value/);
   });
 });
 
@@ -167,7 +179,32 @@ describe("ensureAgentWorkspacePvc", () => {
   // create. The loser must not fail its run: the winner created exactly the
   // object this call wanted, under a name that encodes the agent id.
   it("treats a 409 from a concurrent creator as success", async () => {
-    vi.mocked(getPvc).mockResolvedValue(null);
+    vi.mocked(getPvc)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ spec: { accessModes: ["ReadWriteMany"] } });
+    vi.mocked(createPvc).mockRejectedValue(apiException(409));
+
+    await expect(
+      ensureAgentWorkspacePvc({ agentId: AGENT_ID, namespace: NAMESPACE }),
+    ).resolves.toBe(`agent-workspace-${AGENT_ID}`);
+  });
+
+  // The 409 loser ADOPTS the winner's claim, so it meets the same invariant
+  // the get-then-adopt path does. An invariant holding on one of two adoption
+  // paths is the kind that quietly stops holding.
+  it("re-checks the winner's access mode after a 409", async () => {
+    vi.mocked(getPvc)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ spec: { accessModes: ["ReadWriteOnce"] } });
+    vi.mocked(createPvc).mockRejectedValue(apiException(409));
+
+    await expect(
+      ensureAgentWorkspacePvc({ agentId: AGENT_ID, namespace: NAMESPACE }),
+    ).rejects.toThrow(/not ReadWriteMany/);
+  });
+
+  it("tolerates a claim that vanished between the 409 and the re-read", async () => {
+    vi.mocked(getPvc).mockResolvedValueOnce(null).mockResolvedValueOnce(null);
     vi.mocked(createPvc).mockRejectedValue(apiException(409));
 
     await expect(
