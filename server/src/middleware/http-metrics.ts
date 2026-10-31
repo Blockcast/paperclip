@@ -85,6 +85,24 @@ function isApiPath(path: string): boolean {
  * route is that route's share of the hung-request regime. That regime is the
  * one this counter exists to make visible, so a rising `0` rate is a signal in
  * its own right rather than noise to filter out.
+ *
+ * ## Why the duration is only reported for completed responses (PEN-5136)
+ *
+ * The same `record()` latch feeds `paperclip_http_request_duration_seconds`,
+ * but it supplies an elapsed time only when `res.writableFinished` -- the
+ * identical discriminator the `status` label uses for its `0` sentinel.
+ *
+ * An abandoned request did not take the time it appears to: the clock stops
+ * when the client gave up or the ingress timed out, which is a fact about the
+ * caller's patience, not about the work. Those observations are truncated from
+ * above and concentrate in the slow tail, so admitting them would drag every
+ * percentile downward in precisely the regime the histogram exists to watch.
+ * They are not lost -- they remain fully visible as `status="0"` on the
+ * counter, which is the instrument that owns that regime.
+ *
+ * The elapsed clock starts here, at middleware entry, so it includes every
+ * middleware mounted below this one rather than handler time alone. That is
+ * the quantity a caller experiences, minus ingress and network.
  */
 
 /** Marks a response as already instrumented, so a double mount cannot
@@ -168,6 +186,9 @@ export function httpMetricsMiddleware(): RequestHandler {
 
     let capturedRoute: string | null = null;
     let emptyList = false;
+    // Monotonic: `Date.now()` would let an NTP step land a negative or absurd
+    // elapsed in a histogram `_sum`, which cannot be un-observed.
+    const startedAtNs = process.hrtime.bigint();
 
     // Capture the route template while `req.baseUrl` still holds the mounted
     // prefix. See the block comment above for why finish-time is too late.
@@ -229,6 +250,11 @@ export function httpMetricsMiddleware(): RequestHandler {
           status: res.writableFinished ? res.statusCode : null,
           emptyList,
           transientDb: instrumentable[TRANSIENT_DB] ?? null,
+          // Only a completed response carries an honest elapsed time; see the
+          // block comment above.
+          durationSeconds: res.writableFinished
+            ? Number(process.hrtime.bigint() - startedAtNs) / 1e9
+            : null,
         });
       } catch {
         // A metrics failure must never surface as a request failure. The
