@@ -441,11 +441,14 @@ PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verificati
      `adapter_config` pays that once per agent, at a time someone chose, and gives a rollback
      that needs no code roll. The fleet-wide default is a later deliberate change.
 
-     ⛔ **AND IT MUST NOT BE ENABLED YET. Invariant 5, found 2026-10-31 while
-     writing the swap, is open, and enabling the gate today breaks EVERY run of
-     the opted-in agent.** Invariant 1 inventoried the trees the SERVER WRITES
-     for the pod. The pod log is the same assumption in the other direction —
-     the pod WRITES and the server READS — and nothing covered it.
+     **AND IT COULD NOT BE ENABLED AT ALL UNTIL INVARIANT 5 CLOSED — found
+     2026-10-31 while writing the swap, it meant enabling the gate broke EVERY
+     run of the opted-in agent.** Both halves have since landed (Status, below),
+     so this is now the record of a closed blocker rather than a live one; what
+     it does NOT license is treating the gate as proven. Invariant 1 inventoried
+     the trees the SERVER WRITES for the pod. The pod log is the same assumption
+     in the other direction — the pod WRITES and the server READS — and nothing
+     covered it.
 
      `buildPodLogPath` (`job-manifest.ts`) deliberately returns **two addresses
      for one file**, under a comment that states it: *"ONE log file, TWO
@@ -1559,8 +1562,8 @@ would defeat this issue's own acceptance criterion.
 
 ## 5. Decisions taken, and what is still genuinely open
 
-**State of the four 4b invariants, updated 2026-10-31** (detail in §4). All four are now closed on
-`master`; **none of it is observable on the fleet**, because all four stay inert until an agent is
+**State of the five 4b invariants, updated 2026-10-31** (detail in §4). All five are now closed on
+`master`; **none of it is observable on the fleet**, because all five stay inert until an agent is
 opted in to the `dataClaimName` swap — which, as of 2026-10-31, is itself merged but default-off:
 
 | invariant | state |
@@ -1568,8 +1571,8 @@ opted in to the `dataClaimName` swap — which, as of 2026-10-31, is itself merg
 | 1 — populate/relocate the server-materialized trees (incl. the prompt bundle) | **closed** — #3153 / #3157 / #3158, last merged 20:19:43Z. Inert until the swap, by design. |
 | 2 — symlinked-PARENT hole in the seeder | **closed** — #3161, merged 19:51:15Z |
 | 3 — directory MODE | **closed** — #3165, merged. `mkdir -m 2775 -p`, as recommended; a separate `chmod` stays unexecutable (no `CAP_FOWNER`), and busybox's `make_directory.c` `goto ret0`s on `EEXIST` at the final component *before* its `chmod`, so an existing 1000-owned target is never chmodded. Subsumed by invariant 4's split exactly as predicted: as uid 1000 the seeder owns what it creates, so the mode needs no privilege. ⚠️ Still converges only targets the seeder creates, and the CephFS fresh-subvolume question remains **unmeasured** — no per-agent claim exists to measure against |
-| 5 — the POD LOG crosses the volume in the read direction | **OPEN, and it blocks enablement.** The container writes `containerLogPath`; `execute.ts` tails `podLogPath`; they are the same string and different volumes once the claim is per-agent, so `tailPodLogFile` throws and the run's stdout is empty. Found 2026-10-31 while writing the swap; the swap therefore lands gated and un-enablable rather than enabled. Candidate remedy: `tee` the NDJSON to container stdout and consume it via `readNamespacedPodLog`. See §4 stage 4b |
 | 4 — guard is check-then-act under concurrent same-agent runs | **closed** — #3165, merged, the recommended split: uid 0 chowns the volume ROOT only (one inode, no in-volume path components, so no TOCTOU), everything else runs as uid 1000, which *removes* the privilege boundary rather than hardening the race across it. Available only because stage 3b-iii left `readOnlySubPaths` empty — now enforced as a build-time throw, not a comment. `fsGroup`, the post-`mkdir` re-check and run serialisation remain ruled out. ⚠️ **"Must ship WITH the swap, never before it" is WITHDRAWN** — the premise was unchecked and false; the reachability argument in §4 carries that on its own, and the second reason first recorded beside it does not (it tests "is this the server's claim", not "is this claim one agent's"). See §4. It shipped ahead of the swap, and is inert on the fleet by measurement (every agent Job over 7d names the server's own claim), not by construction. ⚠️ The root `chown` on a real CephFS subvolume is still **unexecuted**; fd-relative `openat` walk remains the fallback |
+| 5 — the POD LOG crosses the volume in the read direction | **closed on `master`, UNVERIFIED on a real run** — #3173 (framing) merged 08:41:30Z, #3174 (collector) merged 10:27:27Z. The container wrote `containerLogPath` while `execute.ts` tailed `podLogPath`: one string on the default mount, two VOLUMES once the claim is per-agent, so `tailPodLogFile` threw and the run's stdout was empty. Found 2026-10-31 while writing the swap, which is why the swap landed gated rather than enabled. The obvious fix — keep `run-logs` as a `subPath` of the SERVER'S claim — was refused for §2's reason: one bind on the shared handle, the whole cost of the swap for zero blast-radius reduction. Taken instead: on a foreign claim the fail-fast `awk` keeps its stdout and stamps each line, and `collectPodLogStream` reads those frames back off the container log and persists them to the server's own `podLogPath`, so the belt-and-braces re-read and the reaper still find what they expect. The file tail remains the implementation on the server's own claim, held there by a negative control. ⚠️ **Closed is not verified** — PEN-5120's first done-when wants a real foreign-claim run producing parseable stdout, and none has happened; what changed is that the failure is no longer structural. Residuals recorded, not fixed: PEN-5124 (the orphan reader still resolves `run-logs` from the SERVER'S root) and PEN-5138 (three hardening items on the collector). See §4 stage 4b |
 
 **PEN-4932's four done-when items, measured from inside a live agent pod 2026-10-30T21:4xZ**
 (`findmnt`, this run's own pod on `k8s-paperclip-3`):
