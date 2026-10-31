@@ -136,7 +136,9 @@ export async function reconcileActiveAlerts(
     if (typeof entry.fingerprint === "string") held.add(entry.fingerprint);
   }
   for (const entry of body as ActiveApiAlert[]) {
-    if (entry.status?.state === "suppressed") continue;
+    // Fail closed: only alerts Alertmanager would notify (active/unprocessed)
+    // are backfilled; suppressed or status-less entries are skipped.
+    if (entry.status?.state !== "active" && entry.status?.state !== "unprocessed") continue;
     if (!routedTo(entry, receivers)) continue;
     routed += 1;
     const alert = toWebhookAlert(entry);
@@ -175,20 +177,24 @@ export async function reconcileActiveAlerts(
       ctx.logger.error(`paperclip-plugin-alertmanager: failed to record reconcile metric: ${String(err)}`);
     }
   }
-  const resolved = await reconcileLostResolves(ctx, config, companyId, held, now);
+  const resolved = await reconcileLostResolves(ctx, config, companyId, base, held, now);
   return { routed, backfilled: missing.map((a) => a.fingerprint), resolved };
 }
 
 /**
- * fingerprint -> first pass (ms) that found it tracked-unresolved but not held
- * by Alertmanager. In-memory on purpose: a worker restart only delays a resolve
- * by one grace window, never causes a wrong one.
+ * `${companyId}\n${alertmanagerApiUrl}` -> fingerprint -> first pass (ms) that
+ * found it tracked-unresolved but not held by that Alertmanager. Scoped per
+ * company and Alertmanager because the job runs once per configured company:
+ * one shared map would let each company's prune wipe the other's marks, and
+ * let one Alertmanager's empty read count as another's first observation.
+ * In-memory on purpose: a worker restart only delays a resolve by one grace
+ * window, never causes a wrong one.
  */
-const absentSince = new Map<string, number>();
+const absentSinceByScope = new Map<string, Map<string, number>>();
 
 /** Test hook: forget absence observations between cases. */
 export function __resetLostResolveObservationsForTests(): void {
-  absentSince.clear();
+  absentSinceByScope.clear();
 }
 
 /**
@@ -218,11 +224,19 @@ async function reconcileLostResolves(
   ctx: PluginContext,
   config: AlertmanagerPluginConfig,
   companyId: string,
+  base: string,
   held: Set<string>,
   now: Date,
 ): Promise<string[]> {
-  const rows = await ctx.db.query<{ fingerprint: string; alert_snapshot: Record<string, unknown> | string | null }>(
-    `SELECT fingerprint, alert_snapshot
+  const scope = `${companyId}\n${base}`;
+  let absentSince = absentSinceByScope.get(scope);
+  if (!absentSince) absentSinceByScope.set(scope, (absentSince = new Map()));
+  const rows = await ctx.db.query<{
+    fingerprint: string;
+    alert_snapshot: Record<string, unknown> | string | null;
+    updated_at: string;
+  }>(
+    `SELECT fingerprint, alert_snapshot, updated_at::text AS updated_at
        FROM ${ctx.db.namespace}.alertmanager_aggregate_members
       WHERE company_id = $1 AND resolved_at IS NULL AND NOT (fingerprint = ANY($2::text[]))
       ORDER BY updated_at ASC, fingerprint ASC`,
@@ -234,6 +248,7 @@ async function reconcileLostResolves(
 
   const lost: AlertmanagerAlert[] = [];
   const endsAt = now.toISOString();
+  const seenAt = new Map<string, string>();
   for (const row of rows) {
     const firstAbsent = absentSince.get(row.fingerprint);
     if (firstAbsent === undefined) {
@@ -241,6 +256,7 @@ async function reconcileLostResolves(
       continue;
     }
     if (nowMs - firstAbsent < RECONCILE_GRACE_MS) continue;
+    seenAt.set(row.fingerprint, row.updated_at);
     const snap = parseMemberSnapshot(row.fingerprint, row.alert_snapshot);
     lost.push({
       status: "resolved",
@@ -251,6 +267,26 @@ async function reconcileLostResolves(
       endsAt,
     });
     if (lost.length >= RECONCILE_MAX_PER_PASS) break;
+  }
+  if (lost.length === 0) return [];
+
+  // A firing delivery that landed after the Alertmanager read bumps the member
+  // row; replaying a resolve over it would cancel a live alert. Drop those.
+  // ponytail: narrows the race to the replay itself; the backfill re-opens
+  // anything still caught within RECONCILE_GRACE_MS.
+  const current = await ctx.db.query<{ fingerprint: string; updated_at: string; resolved_at: string | null }>(
+    `SELECT fingerprint, updated_at::text AS updated_at, resolved_at::text AS resolved_at
+       FROM ${ctx.db.namespace}.alertmanager_aggregate_members
+      WHERE company_id = $1 AND fingerprint = ANY($2::text[])`,
+    [companyId, lost.map((a) => a.fingerprint)],
+  );
+  const unchanged = new Set(
+    current.filter((r) => r.resolved_at === null && r.updated_at === seenAt.get(r.fingerprint)).map((r) => r.fingerprint),
+  );
+  for (let i = lost.length - 1; i >= 0; i--) {
+    if (unchanged.has(lost[i].fingerprint)) continue;
+    absentSince.delete(lost[i].fingerprint);
+    lost.splice(i, 1);
   }
   if (lost.length === 0) return [];
 
