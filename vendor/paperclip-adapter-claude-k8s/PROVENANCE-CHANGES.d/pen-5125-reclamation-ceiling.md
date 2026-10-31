@@ -23,8 +23,11 @@ runbook):
   `allowVolumeExpansion` is true, so the terminal state is an operator resizing a PVC rather than a
   run losing data — which is what makes this priceable instead of blocking.
 - **The cheapest remedy, which does not need the reclaimer**: opt the agent back out, which returns
-  its runs to the shared claim where the existing `{home, session}` + `lastUsedAt` predicate applies
-  unchanged. The comment names only this one — the second (expand the claim) and the cold-start cost
+  its *future* runs to the shared claim where the existing `{home, session}` + `lastUsedAt`
+  predicate applies unchanged — while explicitly NOT reclaiming what is already written. Ally caught
+  the earlier wording implying otherwise: the gauge counts opted-in agents, not bytes, so opting out
+  zeroes the count and leaves the stranded trees both unreclaimed and uncounted. Stopping the growth
+  and undoing it are different acts and the comment now says which one this is. The comment names only this one — the second (expand the claim) and the cold-start cost
   of opting back out live in `runbooks/isolation-workspace-reaper.md`, which is where an operator
   already in the alert will be, rather than in a comment aimed at whoever flips the toggle.
 
