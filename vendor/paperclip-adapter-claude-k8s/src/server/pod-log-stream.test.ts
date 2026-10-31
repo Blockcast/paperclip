@@ -3,7 +3,9 @@ import { POD_LOG_STREAM_MARKER } from "./job-manifest.js";
 import {
   collectPodLogStream,
   parseTimestampedLogLine,
+  pumpPodLogRequest,
   truncateTimestampToSecond,
+  type PodLogAbortHandle,
   type PodLogStreamOptions,
 } from "./pod-log-stream.js";
 
@@ -347,7 +349,7 @@ describe("collectPodLogStream", () => {
     expect(result.reconnects).toBe(3);
     expect(h.readCalls).toHaveLength(1);
     expect(result.stdout).toBe('{"type":"result"}');
-    expect(h.emitted.map(([, c]) => c).join("")).toContain("exhausted 2 reconnects");
+    expect(h.emitted.map(([, c]) => c).join("")).toContain("2 consecutive reconnects without output");
   });
 
   it("does not fail the run when the final read throws", async () => {
@@ -402,5 +404,221 @@ describe("collectPodLogStream", () => {
       read: async () => "",
     });
     expect(persist).not.toHaveBeenCalled();
+  });
+});
+
+describe("collectPodLogStream: dedup is a property of the REPLAY, not of the stream", () => {
+  it("keeps two genuinely identical lines stamped in the same second on the first connection", async () => {
+    // The first connection carries no `sinceTime`, so nothing is being
+    // replayed and nothing is owed. A set-based dedup dropped the second line
+    // here — real transcript, silently lost.
+    const stopSignal = { stopped: false };
+    const result = await collectPodLogStream({
+      stopSignal,
+      sleep: async () => {},
+      onLog: async () => {},
+      follow: async ({ onData }) => {
+        onData(
+          `${transcript("2026-10-31T07:00:05.100Z", '{"type":"tick"}')}\n`
+            + `${transcript("2026-10-31T07:00:05.700Z", '{"type":"tick"}')}\n`,
+        );
+        stopSignal.stopped = true;
+      },
+      read: async () => "",
+    });
+    expect(result.stdout).toBe('{"type":"tick"}\n{"type":"tick"}');
+    expect(result.lines).toBe(2);
+    expect(result.duplicates).toBe(0);
+  });
+
+  it("drops a replayed line only as many times as it was accepted, then keeps the rest", async () => {
+    // Two identical lines accepted in second :05, then a reconnect whose
+    // replay re-delivers those two AND carries a third occurrence that is new.
+    // A set drops all three; the multiset drops exactly the two it is owed.
+    const stopSignal = { stopped: false };
+    let attempt = 0;
+    const result = await collectPodLogStream({
+      stopSignal,
+      sleep: async () => {},
+      onLog: async () => {},
+      follow: async ({ sinceTime, onData }) => {
+        attempt++;
+        if (attempt === 1) {
+          expect(sinceTime).toBeUndefined();
+          onData(
+            `${transcript("2026-10-31T07:00:05.100Z", '{"type":"tick"}')}\n`
+              + `${transcript("2026-10-31T07:00:05.700Z", '{"type":"tick"}')}\n`,
+          );
+          return; // ends early; the Job is not terminal, so this reconnects
+        }
+        expect(sinceTime).toBe("2026-10-31T07:00:05Z");
+        onData(
+          `${transcript("2026-10-31T07:00:05.100Z", '{"type":"tick"}')}\n`
+            + `${transcript("2026-10-31T07:00:05.700Z", '{"type":"tick"}')}\n`
+            + `${transcript("2026-10-31T07:00:05.900Z", '{"type":"tick"}')}\n`,
+        );
+        stopSignal.stopped = true;
+      },
+      read: async () => "",
+    });
+    expect(result.lines).toBe(3);
+    expect(result.duplicates).toBe(2);
+    expect(result.stdout).toBe('{"type":"tick"}\n{"type":"tick"}\n{"type":"tick"}');
+  });
+});
+
+describe("collectPodLogStream: the reconnect budget bounds CONSECUTIVE barren reconnects", () => {
+  it("refunds the budget after a connection that delivered output", async () => {
+    // maxReconnects is 2, and this run reconnects 6 times — every other one
+    // productive. A total cap would have stopped following after the second.
+    const stopSignal = { stopped: false };
+    let attempt = 0;
+    const result = await collectPodLogStream({
+      stopSignal,
+      maxReconnects: 2,
+      sleep: async () => {},
+      onLog: async () => {},
+      follow: async ({ onData }) => {
+        attempt++;
+        if (attempt > 6) {
+          stopSignal.stopped = true;
+          return;
+        }
+        // Odd attempts deliver a line; even ones are barren. The budget
+        // therefore never reaches two in a row.
+        if (attempt % 2 === 1) {
+          onData(`${transcript(`2026-10-31T07:00:0${attempt}.100Z`, `{"n":${attempt}}`)}\n`);
+        }
+      },
+      read: async () => "",
+    });
+    expect(attempt).toBe(7);
+    expect(result.lines).toBe(3);
+    expect(result.stdout).toBe('{"n":1}\n{"n":3}\n{"n":5}');
+  });
+
+  it("still gives up after maxReconnects barren reconnects in a row", async () => {
+    // The negative control for the test above: the refund must not make the
+    // bound unreachable, or a log endpoint refusing in a tight loop spins for
+    // the whole completion timeout.
+    const stopSignal = { stopped: false };
+    let attempt = 0;
+    const stderr: string[] = [];
+    const result = await collectPodLogStream({
+      stopSignal,
+      maxReconnects: 2,
+      sleep: async () => {},
+      onLog: async (stream, chunk) => {
+        if (stream === "stderr") stderr.push(chunk);
+      },
+      follow: async ({ onData }) => {
+        attempt++;
+        // One productive connection first, so the budget has something to
+        // refund before the barren run begins.
+        if (attempt === 1) onData(`${transcript("2026-10-31T07:00:01.100Z", '{"n":1}')}\n`);
+      },
+      read: async () => "",
+    });
+    expect(attempt).toBe(4); // 1 productive + 3 barren (the 3rd trips the bound)
+    expect(result.stdout).toBe('{"n":1}');
+    expect(stderr.join("")).toContain("2 consecutive reconnects without output");
+  });
+});
+
+describe("pumpPodLogRequest: every wait is bounded without consulting stopSignal", () => {
+  const neverStops = { stopped: false };
+  /** `Log.log`'s shape, for a request that never answers. */
+  const neverResolves = (): Promise<PodLogAbortHandle | undefined> => new Promise(() => {});
+
+  it("returns when the request never produces response headers (follow)", async () => {
+    // The FAR-10 shape at its earliest point: node-fetch v2 has no default
+    // timeout, and the AbortController only comes back AFTER the headers, so
+    // until this resolves there is nothing to abort and no watchdog armed.
+    const chunks: string[] = [];
+    await expect(
+      pumpPodLogRequest({
+        follow: true,
+        onData: (c) => chunks.push(c),
+        stopSignal: neverStops,
+        openLog: neverResolves,
+        deadlines: { headerMs: 25 },
+      }),
+    ).rejects.toThrow(/produced no response headers after 25ms/);
+    expect(neverStops.stopped).toBe(false); // the bound did not come from the stop signal
+  });
+
+  it("returns when the request never produces response headers (one-shot read)", async () => {
+    await expect(
+      pumpPodLogRequest({
+        follow: false,
+        onData: () => {},
+        stopSignal: neverStops,
+        openLog: neverResolves,
+        deadlines: { headerMs: 25 },
+      }),
+    ).rejects.toThrow(/produced no response headers after 25ms/);
+  });
+
+  it("returns the bytes it got when a one-shot read's body never ends", async () => {
+    // `Log.log` pipes the body into the sink without forwarding source errors,
+    // so a reset mid-body leaves it un-ended. This read runs AFTER
+    // waitForJobCompletion resolved, so nothing else bounds it — an unbounded
+    // one hangs the run inside Promise.allSettled after its Job has finished.
+    //
+    // It resolves rather than rejecting on purpose: the bytes already handed to
+    // onData are real transcript, and the caller keeps them only on a normal
+    // return.
+    const chunks: string[] = [];
+    let aborted = false;
+    await pumpPodLogRequest({
+      follow: false,
+      onData: (c) => chunks.push(c),
+      stopSignal: neverStops,
+      openLog: async (sink) => {
+        sink.write("2026-10-31T07:00:05.100Z line-before-the-reset\n");
+        return { abort: () => { aborted = true; } }; // ...and then nothing, ever
+      },
+      deadlines: { finalReadBodyMs: 25 },
+    });
+    expect(chunks.join("")).toContain("line-before-the-reset");
+    expect(aborted).toBe(true);
+  });
+
+  it("escalates end() to destroy() when a stopped follow's sink will not finish", async () => {
+    // The watchdog's graceful path is sink.end(); this asserts the backstop for
+    // the case where it does not take, so the wait cannot outlive the grace.
+    const stopSignal = { stopped: true };
+    let aborted = false;
+    await pumpPodLogRequest({
+      follow: true,
+      onData: () => {},
+      stopSignal,
+      openLog: async (sink) => {
+        // A write whose callback never fires: `end()` cannot emit "finish"
+        // while it is outstanding, so only destroy() settles this.
+        sink.write(Buffer.from("x"), () => {});
+        sink.cork();
+        return { abort: () => { aborted = true; } };
+      },
+      deadlines: { stopGraceMs: 10 },
+    });
+    expect(aborted).toBe(true);
+  });
+
+  it("resolves normally when the body ends on its own", async () => {
+    // Negative control: the deadlines must not change the ordinary path.
+    const chunks: string[] = [];
+    await pumpPodLogRequest({
+      follow: false,
+      sinceTime: "2026-10-31T07:00:05Z",
+      onData: (c) => chunks.push(c),
+      stopSignal: neverStops,
+      openLog: async (sink, options) => {
+        expect(options).toMatchObject({ follow: false, timestamps: true, sinceTime: "2026-10-31T07:00:05Z" });
+        sink.end("done\n");
+        return undefined; // no handle at all — the optional-chaining is load-bearing
+      },
+    });
+    expect(chunks.join("")).toBe("done\n");
   });
 });

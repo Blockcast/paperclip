@@ -42,8 +42,7 @@ import {
 import { getSelfPodInfo, getBatchApi, getCoreApi, getLogApi, SELF_POD_DATA_MOUNT_PATH } from "./k8s-client.js";
 // PEN-5120: the collector half. Reads the marked transcript back off the
 // container log when `podLogPath` addresses a volume this process cannot open.
-import { collectPodLogStream } from "./pod-log-stream.js";
-import { Writable } from "node:stream";
+import { collectPodLogStream, pumpPodLogRequest } from "./pod-log-stream.js";
 
 /**
  * PEN-4932 stage 4b sizing cache — the MEASUREMENT only, never the payload.
@@ -864,8 +863,15 @@ async function tailPodLogFile(
  * is terminal, return the whole transcript. The difference is where the bytes
  * come from — the pod's container log rather than a file on a shared volume —
  * and that every accepted line is ALSO written to the server's own
- * `podLogPath`, so the belt-and-braces re-read, `reapPodLogFile` and
- * `orphaned-run-terminal-result.ts` keep finding the artifact they expect.
+ * `podLogPath`, so the belt-and-braces re-read and `reapPodLogFile` keep
+ * finding the artifact they expect.
+ *
+ * It does NOT stand in for the orphan reader, and the Risks section says so:
+ * `orphaned-run-terminal-result.ts` resolves `run-logs` from the server's root
+ * and reads the POD-written `<run>.pod.ndjson`, which on a foreign claim is on
+ * the agent's volume. That residual is PEN-5124, not something this copy
+ * closes — the orphan path fires exactly when the process that would have
+ * written this copy is the thing that died.
  *
  * Both halves of the transport go through `getLogApi().log`, not
  * `coreApi.readNamespacedPodLog`, and that is not a style choice: the generated
@@ -920,58 +926,22 @@ async function collectPodLogFromContainerStdout(input: {
     }
   };
 
-  /** Drive one `Log.log` request into `onData`, resolving when it ends. */
-  const pump = async (follow: boolean, sinceTime: string | undefined, onData: (chunk: string) => void): Promise<void> => {
-    const sink = new Writable({
-      write(chunk, _encoding, callback) {
-        try {
-          onData(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf-8"));
-          callback();
-        } catch (err) {
-          callback(err instanceof Error ? err : new Error(String(err)));
-        }
-      },
-    });
-    const ended = new Promise<void>((resolve, reject) => {
-      sink.on("finish", resolve);
-      // A write-after-end is the expected consequence of the watchdog's
-      // `sink.end()` racing an in-flight chunk; by then `ended` has already
-      // resolved, so this reject is a no-op and exists only to keep the error
-      // from going unhandled.
-      sink.on("error", reject);
-    });
-    const controller = await logApi.log(input.namespace, input.podName, container, sink, {
+  /**
+   * Drive one `Log.log` request into `onData`, resolving when it ends.
+   *
+   * The bounding lives in `pumpPodLogRequest` rather than here so that it is
+   * reachable from a test without a live apiserver: every wait `Log.log` hands
+   * back is unbounded, and a hang in either of them stalls the whole run inside
+   * `Promise.allSettled`.
+   */
+  const pump = async (follow: boolean, sinceTime: string | undefined, onData: (chunk: string) => void): Promise<void> =>
+    pumpPodLogRequest({
       follow,
-      timestamps: true,
-      ...(sinceTime ? { sinceTime } : {}),
+      sinceTime,
+      onData,
+      stopSignal: input.stopSignal,
+      openLog: (sink, options) => logApi.log(input.namespace, input.podName, container, sink, options),
     });
-    // FAR-10: the API can hold a follow connection open long after the pod is
-    // gone. `Log.log` pipes the response body into `sink` WITHOUT forwarding
-    // source errors, so an aborted request leaves `sink` un-ended — which is
-    // precisely the hang the test harness's never-resolving `mockLogFn` models.
-    // Ending the sink ourselves is what turns the abort into a resolution.
-    //
-    // `controller?.abort?.()` rather than `controller.abort()`: if the accessor
-    // ever hands back something without one, the throw would happen INSIDE the
-    // interval, `sink.end()` below it would never run, and `await ended` would
-    // hang for the whole completion timeout — reintroducing the exact FAR-10
-    // shape this watchdog exists to prevent. Failing to abort merely leaks a
-    // request the run no longer reads.
-    const watchdog = follow
-      ? setInterval(() => {
-          if (input.stopSignal.stopped) {
-            controller?.abort?.();
-            sink.end();
-          }
-        }, 500)
-      : null;
-    try {
-      await ended;
-    } finally {
-      if (watchdog) clearInterval(watchdog);
-      controller?.abort?.();
-    }
-  };
 
   const result = await collectPodLogStream({
     stopSignal: input.stopSignal,
