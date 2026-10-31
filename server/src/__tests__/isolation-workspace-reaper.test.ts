@@ -21,6 +21,8 @@ import {
 import {
   DEFAULT_MAX_DELETES_PER_TICK,
   PER_AGENT_WORKSPACE_VOLUME_CONFIG_KEY,
+  buildIsolationReclaimPlan,
+  classifyIsolationWorkspaceAge,
   createDbUnreachableAgentCount,
   REAPABLE_LAYOUT,
   UNREACHABLE_AGENTS_UNKNOWN,
@@ -1335,5 +1337,238 @@ describe("createDbUnreachableAgentCount (PEN-5125)", () => {
     // Trimmed, and an empty string collapses to null so a blank config value
     // cannot become a claim name nothing matches.
     expect(source).toContain("selfDataClaimName?.trim() || null");
+  });
+});
+
+/**
+ * The foreign-claim half (PEN-5151).
+ *
+ * `buildIsolationReclaimPlan` decides for a volume this process cannot walk, so
+ * every test here states the inventory an executor would have reported rather
+ * than materializing a tree.
+ */
+describe("buildIsolationReclaimPlan", () => {
+  const ID_A = "11111111-1111-4111-8111-111111111111";
+  const ID_B = "22222222-2222-4222-8222-222222222222";
+  const ID_C = "33333333-3333-4333-8333-333333333333";
+
+  const entry = (name: string, mtimeDaysAgo: number) => ({
+    name,
+    mtimeMs: NOW - mtimeDaysAgo * DAY,
+  });
+
+  it("plans the same directories the mounted sweep would delete", async () => {
+    const plan = await buildIsolationReclaimPlan({
+      // A: aged on both signals. B: aged on disk but its row says live. C: too
+      // young to have been idle for the window, whatever any row claims.
+      inventory: [entry(ID_A, 40), entry(ID_B, 40), entry(ID_C, 2)],
+      lookupWorkspaceUsage: usageLookup({
+        [ID_A]: { lastUsedDaysAgo: 40 },
+        [ID_B]: { lastUsedDaysAgo: 1 },
+        [ID_C]: { lastUsedDaysAgo: 90 },
+      }),
+      maxAgeDays: 30,
+      now,
+    });
+
+    expect(plan.eligibleIds).toEqual([ID_A]);
+    expect(plan.retainedInUse).toBe(1);
+    expect(plan.retainedFresh).toBe(1);
+    expect(plan.truncated).toBe(false);
+    expect(plan.inventorySize).toBe(3);
+  });
+
+  it("plans the orphan cohort, where filesystem age is the intended meaning", async () => {
+    // No owning row is the population this reaper was aimed at. `mtime` carries
+    // the decision there and only there — the same rule the mounted sweep uses.
+    const plan = await buildIsolationReclaimPlan({
+      inventory: [entry(ID_A, 40)],
+      lookupWorkspaceUsage: usageLookup({}),
+      maxAgeDays: 30,
+      now,
+    });
+    expect(plan.eligibleIds).toEqual([ID_A]);
+  });
+
+  it("refuses a name that is not a workspace id, rather than passing it to an unlink", async () => {
+    // The mounted sweep gets names from `readdir`, so they are single path
+    // components by construction. A plan crosses a process boundary and comes
+    // back as the argument to a recursive unlink, so a traversal or a separator
+    // has to be refused HERE. All three of these are old enough to be eligible
+    // on every other signal, which is the point.
+    const plan = await buildIsolationReclaimPlan({
+      inventory: [entry("..", 40), entry(`../${ID_A}`, 40), entry("not-a-uuid", 40)],
+      lookupWorkspaceUsage: usageLookup({}),
+      maxAgeDays: 30,
+      now,
+    });
+    expect(plan.eligibleIds).toEqual([]);
+    expect(plan.skippedUnsafeName).toBe(3);
+    expect(plan.inventorySize).toBe(3);
+  });
+
+  it("bounds the plan and offers the most overdue first", async () => {
+    // Property 4 on the executor's side: it is a second unlink source against
+    // the same MDS. Ordering is what makes successive ticks drain a backlog
+    // instead of re-offering the same head.
+    const plan = await buildIsolationReclaimPlan({
+      inventory: [entry(ID_A, 40), entry(ID_B, 90), entry(ID_C, 60)],
+      lookupWorkspaceUsage: usageLookup({}),
+      maxAgeDays: 30,
+      maxEntries: 2,
+      now,
+    });
+    expect(plan.eligibleIds).toEqual([ID_B, ID_C]);
+    expect(plan.truncated).toBe(true);
+  });
+
+  it("defaults its bound to the sweep's per-tick ceiling", async () => {
+    const inventory = Array.from({ length: DEFAULT_MAX_DELETES_PER_TICK + 5 }, (_, i) =>
+      entry(`${i.toString(16).padStart(8, "0")}-0000-4000-8000-000000000000`, 40 + i),
+    );
+    const plan = await buildIsolationReclaimPlan({
+      inventory,
+      lookupWorkspaceUsage: usageLookup({}),
+      maxAgeDays: 30,
+      now,
+    });
+    expect(plan.eligibleIds).toHaveLength(DEFAULT_MAX_DELETES_PER_TICK);
+    expect(plan.truncated).toBe(true);
+  });
+
+  it("asks the database once, and only about names it would act on", async () => {
+    // The unsafe names are filtered before the query: a plan must not turn an
+    // attacker-shaped directory name into a database predicate, and the round
+    // trip is the mounted sweep's single batched snapshot.
+    const calls: string[][] = [];
+    const plan = await buildIsolationReclaimPlan({
+      inventory: [entry(ID_A, 40), entry("../etc", 40)],
+      lookupWorkspaceUsage: async (ids) => {
+        calls.push([...ids]);
+        return new Map();
+      },
+      maxAgeDays: 30,
+      now,
+    });
+    expect(calls).toEqual([[ID_A]]);
+    expect(plan.eligibleIds).toEqual([ID_A]);
+  });
+
+  it("does not query at all when nothing survives name validation", async () => {
+    const lookup = vi.fn();
+    const plan = await buildIsolationReclaimPlan({
+      inventory: [entry("..", 40)],
+      lookupWorkspaceUsage: lookup as never,
+      maxAgeDays: 30,
+      now,
+    });
+    expect(lookup).not.toHaveBeenCalled();
+    expect(plan.eligibleIds).toEqual([]);
+  });
+
+  it("spends its budget once per directory, however often the inventory names it", async () => {
+    // `readdir` cannot return a name twice; an inventory crossing a process
+    // boundary can. A repeat would spend the bound on one directory and push a
+    // real candidate out of the plan, while the second unlink only finds ENOENT.
+    const plan = await buildIsolationReclaimPlan({
+      inventory: [entry(ID_A, 90), entry(ID_A, 90), entry(ID_B, 40)],
+      lookupWorkspaceUsage: usageLookup({}),
+      maxAgeDays: 30,
+      maxEntries: 2,
+      now,
+    });
+    expect(plan.eligibleIds).toEqual([ID_A, ID_B]);
+    expect(plan.truncated).toBe(false);
+  });
+
+  it("leaves layout and nested-checkout checks to the executor", async () => {
+    // Deliberate, not pending: both read the filesystem, and answering them
+    // here would mean trusting an executor's account of a tree it is asking
+    // permission to delete. A plan entry is permission to consider, never an
+    // instruction to remove.
+    const source = readFileSync(
+      fileURLToPath(new URL("../services/isolation-workspace-reaper.ts", import.meta.url)),
+      "utf8",
+    );
+    const start = source.indexOf("export async function buildIsolationReclaimPlan");
+    expect(start).toBeGreaterThan(-1);
+    // Bounded at the next top-level declaration: an unbounded slice would run
+    // through `reapIsolationWorkspaces`, which legitimately calls both, and the
+    // assertion would silently stop testing this function.
+    const end = source.indexOf("function isReapableLayout", start);
+    expect(end).toBeGreaterThan(start);
+    const body = source.slice(start, end);
+    expect(body).not.toContain("hasNestedCheckout");
+    expect(body).not.toContain("isReapableLayout");
+  });
+});
+
+describe("classifyIsolationWorkspaceAge", () => {
+  const row = (lastUsedDaysAgo: number): WorkspaceUsageRow => ({
+    lastUsedAt: new Date(NOW - lastUsedDaysAgo * DAY),
+    status: "active",
+    closedAt: null,
+  });
+  const cutoff = NOW - 30 * DAY;
+
+  it("lets a fresh mtime retain whatever the row says", () => {
+    // `mtime` is materialization time, so it is useless for deletion and valid
+    // for retention: a directory materialized yesterday cannot have been idle
+    // for a month. Requiring both signals can only ever retain more.
+    expect(
+      classifyIsolationWorkspaceAge({ mtimeMs: NOW - DAY, owner: row(900), cutoff }),
+    ).toEqual({ verdict: "fresh", idleSinceMs: NOW - DAY, ageSource: "mtime" });
+  });
+
+  it("lets a live row retain an aged directory", () => {
+    const verdict = classifyIsolationWorkspaceAge({ mtimeMs: NOW - 90 * DAY, owner: row(1), cutoff });
+    expect(verdict.verdict).toBe("in_use");
+    expect(verdict.ageSource).toBe("lastUsedAt");
+  });
+
+  it("reports the row's age, not the directory's, once a row exists", () => {
+    // The row wins outright when it is present: the filesystem no longer gets a
+    // vote, so an operator reading `ageDays` is reading idleness and not
+    // materialization age.
+    const verdict = classifyIsolationWorkspaceAge({ mtimeMs: NOW - 900 * DAY, owner: row(40), cutoff });
+    expect(verdict).toEqual({
+      verdict: "aged",
+      idleSinceMs: NOW - 40 * DAY,
+      ageSource: "lastUsedAt",
+    });
+  });
+
+  it("falls back to mtime only when there is no row", () => {
+    expect(classifyIsolationWorkspaceAge({ mtimeMs: NOW - 40 * DAY, owner: undefined, cutoff })).toEqual({
+      verdict: "aged",
+      idleSinceMs: NOW - 40 * DAY,
+      ageSource: "mtime",
+    });
+  });
+
+  it("is the only age rule in the module, so the two sweeps cannot drift", () => {
+    // The mounted sweep and the foreign-claim plan decide the same question in
+    // different processes. A second transcription of this rule is the likeliest
+    // way the plan ends up authorizing a deletion the mounted sweep would
+    // refuse, and `mtime` alone is the predicate BLO-31222 exists to stop
+    // using. So: exactly one comparison of `lastUsedAt` against the cutoff in
+    // the whole module, and it is in this function.
+    const source = readFileSync(
+      fileURLToPath(new URL("../services/isolation-workspace-reaper.ts", import.meta.url)),
+      "utf8",
+    );
+    const code = source
+      .split("\n")
+      .filter((line) => !line.trimStart().startsWith("*") && !line.trimStart().startsWith("//"))
+      .join("\n");
+    expect(code.match(/lastUsedAt\.getTime\(\)/g) ?? []).toHaveLength(2);
+    const classifier = code.slice(
+      code.indexOf("export function classifyIsolationWorkspaceAge"),
+      code.indexOf("export interface IsolationWorkspaceInventoryEntry"),
+    );
+    // One inside the classifier; the other is the pre-unlink re-read, which
+    // compares the re-read row and not the snapshot.
+    expect(classifier.match(/lastUsedAt\.getTime\(\)/g) ?? []).toHaveLength(1);
+    expect(code).toContain("current.lastUsedAt.getTime() >= cutoff");
   });
 });
