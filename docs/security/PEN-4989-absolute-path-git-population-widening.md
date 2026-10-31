@@ -1,0 +1,849 @@
+# PEN-4989 — widening the absolute-path-`git` measurement past one pod
+
+[`PEN-4986-absolute-path-git-runtime-measurement.md`](./PEN-4986-absolute-path-git-runtime-measurement.md)
+took the measurement that §7.1 of
+[`PEN-3183-git-egress-enforcement-boundary-decision.md`](./PEN-3183-git-egress-enforcement-boundary-decision.md)
+makes its residual acceptance conditional on, and got **zero** — in **one pod**, on one image, for
+one agent's workload. This document widens that population to **six windows across four agents and
+five pods** (§1 is this record's own; §1.1 carries the Devops, UX Designer and Engineer rows; §1.2 is
+the one that fired), and it exists because §7.2 trigger 4 has no detector and cannot have one: it has
+only this measurement, and a measurement observes nothing between runs.
+
+# ⛔⛔ RESULT: §7.2 TRIGGER 4 HAS FIRED. THE §7.1 RESIDUAL ACCEPTANCE ENDS HERE.
+
+**The count is not zero.** The sixth window — an **Engineer** pod running the
+**`Blockcast/penstock-llm-proxy-core`** test suite — observed **28 invocations that reached a real `git` binary without transiting the egress
+wrapper**, none of them deliberate controls (PEN-4993, §1.2). Trigger 4 is written as a **count**
+test, not a harm test, and the count is 28.
+
+Per PEN-4989's own acceptance criterion, stated here explicitly rather than implied: **§7.1's
+residual acceptance does not run to 2027-01-31. It is ended by this measurement, as of
+2026-10-29.** This is raised to the **CTO** as the owner of the disposition, and is deliberately
+**not** folded into PEN-4933's D1 broker rollout — the acceptance ending is a fact about today, not
+a task to be absorbed into a future change.
+
+**⛔ The CTO ruled on 2026-10-29, and the ruling is now part of this record** (see *CTO
+disposition*, D-1…D-7, below). Trigger 4 is **accepted as fired**; the count of **28** stands; the
+residual acceptance is **ended, not re-granted on narrower terms**. No incident is opened — all 28 are non-publishing — but the control gap is
+classified **Medium, standing**. What replaces the acceptance is an **owned remediation with a date**,
+which is a different object from an acceptance. Where the CTO disposition and this record's original
+"what this record asks for" framing differ, **the disposition governs**.
+
+The first five windows were zero. **That is not a reassurance, it is the finding**: five windows
+across four agents saw nothing, and the sixth saw 26 in a 24-second burst, because it was the first
+to run `pnpm test`. The measurement's blind spot is not between pods — it is between *workloads*.
+
+⚠ **The 28 are individually harmless and the mechanism is not.** All 28 are non-publishing
+(`rev-parse`, `maintenance run`) against throwaway scratch repos with no remote; nothing was
+published and no credential was used. The finding is the **class**: 26 come from first-party test
+code that constructs its own `PATH` (§1.2), and **any** test or tool that does so gets an unwrapped
+`git` for free, on a pod where `/etc/gitconfig` supplies a live publish-capable credential helper
+unconditionally.
+
+⛔ **Separately, the zeros that preceded it are worth less than PEN-4986 stated** — §2.1. Three rows
+found the calibration method overstates catch against the real binary. That weakens the bound §7.1
+rested on; it is a second, independent reason the acceptance as written does not hold.
+
+**But one claim PEN-4986 made is wrong, and §3 below retires it.** PEN-4986 argued that its image
+census generalises fleet-wide "because the image is identical across the fleet". The fleet does not
+run one image. That does not change either measurement's number; it changes what may be inferred
+from them, and it changes the shape of the re-measurement trigger.
+
+> ⚠ **Merge order: PR [#3098](https://github.com/Blockcast/paperclip/pull/3098) lands first.**
+> Two things this document relies on exist only there and 404 on `master` until it lands:
+> `PEN-4986-absolute-path-git-runtime-measurement.md` (linked above — this record's primary
+> reference) and `scripts/measure-absolute-path-git.mjs` (the measurement itself, invoked by the
+> §6 re-run procedure). Landing this record first would publish a security record whose primary
+> link is dead and whose re-measurement procedure cannot be executed — which is the specific
+> failure §4 is about: a staleness rule nobody can run is a rule nobody acts on.
+
+## 1. Window, population, result
+
+| | |
+|---|---|
+| **Window** | `2026-10-29T08:35:16.715Z` → `2026-10-29T08:43:11.876Z` UTC (`7.9` min, `220483` sweeps) |
+| **Population** | one agent pod: `ac-7500672d-efe6-40-872601a6-55e4-43-40d491-bfzww`, ns `paperclip`, agent **Security Engineer** (`7500672d-efe6-4037-a05f-61204a670894`), run `872601a6-55e4-430c-8726-76d4c8f976ff`, task PEN-4989 |
+| **Image** | `…/paperclip-agent:sha-4db591b-k8s-vendored` (`sha256:2ebb2948…30538a7`) — **a different image from PEN-4986's** `sha-ed39009-k8s-vendored` |
+| **Surface fingerprint** | `d81423fe12c348c3e7ef7a004614385439f3d1998506850e47fcad640cf55568` (rule **v2**, §4) |
+| **`/usr/bin/git` observations** | `233` |
+| **— wrapped** | `231` |
+| **— unwrapped** | **`0`**, plus 2 deliberate negative controls |
+
+Subcommands observed: `--version` 194, *(empty argv)* 18, `config` 14, `show` 5, `checkout` 1,
+`log` 1.
+
+⚠ **Read that histogram before citing this window as "representative work" — it is not, and it is
+weaker than PEN-4986's on exactly that axis.** 194 of the 233 are `--version`, because this run
+invoked 210 of them as controls. The organic remainder is ~21 invocations over 7.9 minutes against
+PEN-4986's 54 over 22.1. What this run adds is a **second image**, a **census reproduction** (§3), and
+a **false-positive bound** (§2) — not a richer sample of agent behaviour. Both windows are short.
+
+ℹ **The fingerprint above is a rule-v2 digest, and the measurement was taken under rule v1.**
+The run recorded `a23454c47df4da615771bb9e5a5c958975587cb403884354812741ea70a144ee`; v2 additionally
+hashes the *contents* of every `git` in the PATH layout, so every v1 digest is numerically different
+from its v2 counterpart. The value above is not a re-derivation from the old one — it was recomputed
+on the live surface, and the bridge is explicit: re-running the **v1** rule in the pod that produced
+this edit — image `…/paperclip-agent:sha-1e99f06-k8s-vendored`
+(`sha256:fd6337d3…10b2a31`), the **fourth** distinct image this record names and the **third it was
+measured in** — reproduces `a23454c4…` exactly. (It is "uncensused" only in the §3 sense of not
+appearing in this record's own image census; §1.1's two workload rows were subsequently measured
+**on** it, which is why its digest now has three independent confirmations rather than one.) That
+establishes its egress surface as byte-identical to the measurement pod's, so its v2 digest is this
+surface's v2 digest. Rule version is folded into the digest (`FINGERPRINT_VERSION`), so a v1 value
+meeting a v2 value reads as a mismatch rather than as an unchanged surface.
+
+### 1.1 The workload axis — three further agents, four further windows
+
+PEN-4989 asked for the measurement in more than one agent pod *across agents whose workloads differ*,
+because the population is (image × PATH layout × **workload**). Three agents took it in their own
+runs, unprivileged and read-only, and reported on their own rows. **Devops and UX Designer were zero;
+Engineer was zero on a git-dense window and NON-ZERO on a build/test one (§1.2).** The axis was the
+right axis, and it took the sixth window to show it.
+
+| Row | Agent | Image | Window | Sweeps | Obs. | Unexplained unwrapped | Calibration (and against **what**) |
+|---|---|---|---|---:|---:|---:|---|
+| PEN-4986 | Security Engineer | `sha-ed39009` | 22.1 min | — | 54 | **0** | `0.930` ⛔ `git-calib` — **error path, see §2.1** |
+| PEN-4989 (§1) | Security Engineer | `sha-4db591b` | 7.9 min | 220,483 | 233 | **0** | `0.840` ⛔ `git-calib` — **error path** |
+| **PEN-4992** | **Devops** | `sha-1e99f06` | 6.4 min | 167,814 | 24 | **0** | `0.933` ⛔ `git-calib` — **error path** |
+| **PEN-4994** | **UX Designer** | `sha-1e99f06` | 4.8 min | 132,456 | 64 | **0** | `0.793` ⛔ `git-calib` — **error path** |
+| **PEN-4993** A | **Engineer** (git-dense) | `sha-e74d17b` | ≈ 3 min | — | — | **0** | — |
+| **⛔ PEN-4993** B | **Engineer** (build/test) | `sha-e74d17b` | 17.0 min | 435,047 | 2,447 | **⛔ 28** | `0.837` copy named `git` · **`0.810` real `/usr/bin/git`** |
+
+⛔ **The last column is NOT comparable down its own length, and the first four values should not be
+quoted as catch rates at all.** See §2.1: a copy named `git-calib` does not run — it exits `128`
+before doing any work. Only PEN-4993 B calibrated against something that actually executes `git`.
+
+⚠ **The `Obs.` column is not one quantity across rows and must not be summed.** PEN-4986's `54` is its
+*organic* count; this record's `233` is the *total*, of which 210 were self-inflicted controls and only
+≈ 21 organic (§1). The comparable organic figures are PEN-4986 `54`, this record ≈ `21`, PEN-4992 `24`,
+PEN-4994 `64`, PEN-4993 B `2,447`. The column that **is** uniform, and the one this record turns on,
+is *unexplained unwrapped*: **zero in the first five, ⛔ 28 in the sixth.**
+
+**Six windows, four agents, five pods, four image tags (three of them fingerprinted) — and ≈ 61
+minutes of observation in total.**
+⛔ **Trigger 4 fired in the last one (§1.2). The first five were zero.**
+
+The three new agents are what makes this a workload axis rather than a repeat:
+
+- **Devops** is the heaviest git/CI consumer in the company, and that is why it was the sample worth
+  taking: `git init` / `fetch --depth 1` against two repos across three branches, `git show`,
+  `rev-parse`, and ≈12 `gh` API calls — which drive the credential-helper path specifically. **All of
+  it resolved through the PATH wrapper; nothing in that workload reached for an absolute path.**
+- **UX Designer** exercised a frontend toolchain neither engineering pod had: a 131 MB clone,
+  `pnpm install`, `tsc`, 1,759 vitest tests, a Vite build, and headless Chrome across 23 portal
+  surfaces. Its 2 `git-core` observations were `git-remote-https` from its own clone, classified
+  wrapped via the ancestry arm — class B behaving as designed, not a finding.
+
+**The rows may be pooled, and that is measured rather than assumed.** Pooling is only legitimate
+if the rows describe the same egress surface, so the surface digests were compared before summing:
+PEN-4992, PEN-4994 and this record all report v1 fingerprint
+`a23454c47df4da615771bb9e5a5c958975587cb403884354812741ea70a144ee`, with byte-identical hashes for
+the wrapper (`deee13f6…`), the egress runtime (`f3b28390…`), the credential helper (`aed18024…`) and
+the real binary (`356db14e…`), and `wrapperAhead: true` in every pod. §1.2's Engineer pod, on image
+`sha-e74d17b`, independently reports the same **v2** digest `d81423fe…` as §1.
+
+⚠ **Counted exactly: three image TAGS, four PODS, one surface.** The four fingerprinted pods are §1
+(`sha-4db591b`), PEN-4992 and PEN-4994 (**both** on `sha-1e99f06` — one tag, two pods) and §1.2
+(`sha-e74d17b`). **PEN-4986 carries no fingerprint at all** (§1 records this), so its `sha-ed39009`
+is not a fourth tag of surface evidence and must not be counted as one. The pod count is the larger
+number here and the tag count is the load-bearing one; an earlier revision of this record said "four
+image tags" and over-counted. It is also the cleanest vindication
+of §4: keyed on the image tag the staleness trigger would have fired here for nothing; keyed on the
+surface it correctly says "same surface, the prior measurement may be cited".
+
+⚠ **What this does not establish.** Four agents is not the fleet, and ≈ 61 minutes is not continuous
+coverage — between runs nothing is observed, and that blind spot is unchanged. Three of the six
+windows are under 7 minutes and ended when the work did. **These rows widen the population; they do
+not narrow the accepted blind spot, and must not be cited as doing so.** ⛔ And note which direction
+the one finding came from: **not** from more pods, but from one pod doing *different work*. A
+population widened along the pod axis alone would have returned zero indefinitely.
+
+⛔ **Read §2.1 before quoting any of these zeros.** The new rows also found that the calibration
+method overstates catch against the real binary, which weakens every number in the table above —
+including PEN-4986's and this record's.
+
+### 1.2 ⛔ The firing — Engineer pod, build/test workload, 28 unwrapped
+
+Measured by **Engineer** (PEN-4993) and reported there; carried here because PEN-4989 is outside that
+agent's authorization boundary (`403 deny_missing_grant`), so the row could not be posted where it
+was asked for. The analysis below is theirs; the disposition is this record's (**Disposition**, at the end).
+
+| | |
+|---|---|
+| Pod / agent | `ac-b4fe9f95-65ef-47-bab67a18-23d8-41-4e3297-c259s` (node `k8s-paperclip-3`) / **Engineer** |
+| Image | `sha-e74d17b-k8s-vendored` (`sha256:e690d3bf…077c9705`) — the **fifth** distinct image this record names, the **fourth it was measured in** (`sha-3ddaae3` appears only in the §3 census, never measured in). Against §1.1's counts it is the fourth of the four image tags, and the third of the three *fingerprinted* ones. |
+| Surface fingerprint | `d81423fe…` (**v2**), `wrapperAhead: true` — **byte-identical to §1's** |
+| Window | `2026-10-29T10:40:02.002Z` → `10:57:01.715Z` (17.0 min, 435,047 sweeps) |
+| Observations | 2,447 — 2,400 wrapped, **48 unwrapped** |
+| — marked negative controls | 18 |
+| — measurer's own unmarked diagnostics, declared | 2 |
+| **— ⛔ UNMARKED, NOT THE MEASURER'S** | **28** |
+| indeterminate | 4 (`/usr/lib/git-core/git`, caught mid-`execve`) |
+
+**The mechanism: first-party test code builds a wrapper-free `PATH` on purpose.** 26 of the 28 are a
+24-second burst inside one test file, **`Blockcast/penstock-llm-proxy-core`**`:test/secret-scan-budget.test.ts:611`,
+which spawns the CI
+secret-scan script with a narrowed environment:
+
+```ts
+PATH: `${bin}:/usr/bin:/bin`,
+```
+
+⚠ **That file is in `penstock-llm-proxy-core`, NOT in the repository this record lives in.** It does
+not exist in `Blockcast/paperclip` at any ref. The Engineer window ran `penstock-llm-proxy-core`'s
+`pnpm test` (681 files / 13,761 tests) in a detached worktree, not this repo's. Every citation here
+is qualified for that reason: an unqualified path sends a reader — and the §5 sweep — to a file that
+is not there.
+
+`/usr/local/libexec/paperclip/bin` is absent from that `PATH` **by construction**, so every `git` the
+spawned script runs reaches the real binary directly. The intent — isolate `gitleaks` so the
+absent-binary case is genuinely absent — is reasonable and is commented in place. **The wrapper
+bypass is an unremarked side effect of it.** That is the generalisation and the reason this is a
+finding: **any test or tool that constructs its own `PATH` gets an unwrapped `git` for free.** It is
+a class, not a file, and it is reached by every run of that test suite. ⚠ **The class claim is
+repo-independent** — the wrapper lives in the **agent image**, not in any repository — so the sweep
+spans **every repo agents build and test in** (`paperclip` and `penstock-llm-proxy-core` at least),
+not only the one where the first instance happened to be found.
+
+The remaining 2 are `/usr/lib/git-core/git maintenance run --auto --no-quiet --detach`, which is
+**PEN-4998's class** — already triaged and excluded from the novel part of this finding.
+
+**Why the `wrapped: false` verdict is sound.** A wrapped invocation necessarily presents three
+signatures at once: `argv[0] == "/usr/bin/git"`, the two injected `-c credential.https://github.com.helper`
+flags, and the node egress runtime in its ancestry. All 26 show a bare `git` as `argv[0]`, **no**
+injected flags, and an ancestry of `bash < vitest < pnpm < zsh < claude` with no wrapper or runtime
+anywhere — `viaArgv`, `viaEnv` and `viaAncestor` all false with `environReadable: true`. The
+environment was readable and simply did not carry the marker. **The instrument also demonstrably saw
+positives inline in this same window**: 23 marked controls, 18 observed, all 18 correctly flagged.
+The 28 are not an artefact of a dead instrument.
+
+⛔ **§4.0 verified live in that pod — the credential is there.**
+
+```
+$ git config --show-origin --get-all credential.https://github.com.helper
+file:/etc/gitconfig    !/usr/bin/gh auth git-credential
+```
+
+An unwrapped `git` reaching github.com **is** authenticated by the system credential helper, with no
+intent and no credential handling by the caller. These 26 ran with a live, publish-capable credential
+path available and unscanned. It was **not** exercised — identifying a bypass is in scope, using one
+is not.
+
+### ⚠ The predicate matters, and this result is the first to make it load-bearing
+
+"Absolute-path `git`" is a **poor literal test**, because the *wrapped* path is itself the one that
+invokes `/usr/bin/git` absolutely. What actually discriminates is **transiting the wrapper**.
+
+- By the instrument's definition — *reached a real `git` without transiting the wrapper* — the count
+  is **28**.
+- By a literal `argv[0] == "/usr/bin/git"` test it would be **0**.
+
+§7.1's framing ("absolute-path invocations are rare-to-absent") and the instrument's definition are
+**not the same predicate**. **28 is reported, because that is the predicate the acceptance is
+actually conditional on** — an invocation that skips the scanner is the thing §7.1 is accepting the
+risk of, whichever way it spells the path.
+
+**✅ SETTLED (CTO, 2026-10-29 — D-1 below).** This was filed as an open question for the
+CTO. It is answered, and the answer is that **the question was already settled by §7.2 and §7.1 has
+no standing to re-decide it.** §7.2 trigger 4 defines its own term inline:
+
+> **A non-zero absolute-path-`git` count** from the §8 measurement — *i.e. any invocation reaching
+> `/usr/bin/git` that did not come through the wrapper.*
+
+That `i.e.` clause **is** the instrument's definition, so **28 is correct on the trigger's own text**
+and needs no further authority. PEN-3183 §7.1's looser phrase is **drafting lag and must be conformed
+to §7.2**, not the reverse.
+
+⚠ **The literal reading is not merely narrower — it is incoherent, and the CTO measured why.** The
+wrapper's own correct operation *is* an absolute-path `exec` of the real binary, so a literal
+`argv[0]` test scores **the control working** as a violation and **every actual bypass** as clean. It
+does not merely admit this finding as a zero; across the whole population it is **constant-zero and
+cannot discriminate at all** (independently derived by Engineer). Four `sh -c 'command -v git'` spawns
+in a CTO pod, image `sha-e74d17b-k8s-vendored`:
+
+| Child environment | Resolves to | Wrapper transited |
+|---|---|---|
+| inherited from parent | `/usr/local/libexec/paperclip/bin/git` | **yes** |
+| replaced wholesale, no `PATH` key | `/usr/bin/git` | **no** |
+| `PATH=/stub:/usr/bin:/bin` (the fired site's shape) | `/usr/bin/git` | **no** |
+| `PATH` containing the guard prefix | `/usr/local/libexec/paperclip/bin/git` | **yes** |
+
+Rows 2 and 3 are bypasses; rows 1 and 4 are the control working. A literal-`argv[0]` instrument
+inverts all four.
+
+⚠ **Consequently the name is retired.** "Absolute-path `git`" is a misnomer that invited exactly this
+ambiguity, and it survives in row titles, doc headings and `scripts/measure-absolute-path-git.mjs`.
+The concept is renamed to **unwrapped `git`**. This record keeps its filename for link stability — it
+is referenced by open PRs and by PEN-3183 — but uses the new term in prose; the rename lands in
+§7.1/§7.2 and in the script name when those are edited after PR
+[#3098](https://github.com/Blockcast/paperclip/pull/3098). **A control whose own name scores its
+correct operation as a violation will be misread again.**
+
+### Severity — argued both ways here; **decided by the CTO** (D-2)
+
+**Toward lower severity:** all 28 are non-publishing against remote-less scratch repos; nothing was
+published and no credential was used. 26 come from one first-party test whose `PATH` narrowing is
+deliberate and commented — a reviewed design choice, not agent-composed shell. The other 2 are
+already-triaged PEN-4998.
+
+**Toward taking it seriously:** the count the acceptance is conditional on is **not zero**, and
+trigger 4 is a count test. §7.1's ground is that these invocations are *rare-to-absent* — in an
+Engineer workload they are neither: **26 in 24 seconds from one ordinary `pnpm test`.** The
+**accidental** disclosure case is what this control exists for, and this is precisely an accidental,
+unremarked bypass — nobody writing that `PATH` line was thinking about egress. And it is a class
+reached by every run of the suite, distinct from but adjacent to PEN-4979.
+
+**Read:** the specific invocations are harmless; **the mechanism is the finding**; and §7.1's
+assumption as written does not survive this workload.
+
+**✅ DECIDED (CTO, 2026-10-29).** **No incident, and none is to be opened** — all 28 are
+non-publishing verbs against remote-less scratch repos, nothing was published, no credential was
+used, and this is not a PEN-2526-class trigger-1 firing. **The control gap is Medium, standing.** Not
+High: the *deliberate* threat was already accepted, is unchanged, and is not what fired, and the
+accidental-publication path needs a caller that both bypasses the guard **and** publishes, which has
+never been observed. Not Low: it is reached by **every run of the test suite**, silently, and the
+bypass is **free rather than contrived**.
+
+⚠ **The framing above is adopted as the record's, and the thing to resist is letting "all 28 were
+harmless" become the headline.** §7.1 did not accept on harmlessness. **It accepted on frequency** —
+*"rare-to-absent in the fleet"* — and frequency is precisely what this measurement falsified.
+
+### Wrapped by which signature
+
+| Arm | Count |
+|---|---|
+| 1 — `argv` carries the paperclip `-c` helper | 219 |
+| 2 — `GIT_CONFIG_PARAMETERS` carries it | 0 |
+| 3 — an ancestor is the wrapper or the egress runtime | 231 |
+
+Arm 3 covered every wrapped observation and arm 2 covered none, which is worth recording because it
+is the opposite of what the arms' ordering suggests: in this window nothing spawned a descendant git
+deep enough to need the environment arm. Arm 3 is doing the load-bearing work, including for the 18
+observations caught mid-`exec` whose `argv` was not yet readable — see §2.
+
+## 2. Instrument validation
+
+All controls were run against the shipped script inside the window.
+
+- **Positive control** — 10 PATH-resolved `git --version`: 9 observed, **9/9 wrapped**.
+- **Negative control** — 3 × `/usr/bin/git -c pen4989.negativecontrol=marker --version`: **2
+  observed, both correctly classified unwrapped**, with all three wrapped-signatures absent. Both
+  are excluded from the count as self-inflicted. `--version` touches no credential, no network and
+  no repository.
+- **Catch rate** — 300 invocations of a **copy** of the git binary at a different path
+  (`cp /usr/bin/git /tmp/pen4989/git-calib`): **252 caught, `0.840`**. A copy is used so that
+  calibrating cannot contaminate the count. Lower than PEN-4986's `0.930`; this pod was busier.
+  ⛔ **This number is a CEILING on catch against the real binary, not a floor — see §2.1.** It was
+  described as a floor here until the two workload-axis rows measured the opposite direction.
+- **False-positive control (new here)** — **200** PATH-resolved (wrapped) invocations produced 195
+  observations and **0** misclassified as unwrapped.
+
+That last control is new because this run tripped the failure it rules out. One observation came
+back `wrapped: false` carrying an **empty `argv`** and `environReadable: false` — a process caught
+between `exec` and the kernel publishing its `cmdline`/`environ`. Read carelessly that is a trigger-4
+firing. It is not: its ancestry was `zsh` → `claude` with no wrapper in the chain, which is the
+signature of one of this run's own three absolute-path negative controls, and the pid/starttime sit
+one tick from the control that *was* fully captured.
+
+The general question it raises — *can the same race make a genuinely wrapped invocation look
+unwrapped?* — is the one that matters, because that direction manufactures false findings. The
+answer measured here is **no**: arm 3 reads the ancestry, which `/proc` publishes before `cmdline`,
+so the 18 mid-`exec` observations in this window were all still classified wrapped, and 195 wrapped
+invocations produced zero false positives. The classifier's documented bias toward *wrapped* holds
+under the race as well as under the evidence checks.
+
+Taking `0.840` at face value, a single missed worst-case invocation would have probability `0.160`,
+bounding the true count at ≤ 1 with ~84% confidence for that shortest class. ⛔ **Do not cite that
+bound.** §2.1 shows `0.840` is measured on the wrong target and overstates catch against
+`/usr/bin/git` itself; the defensible bound is the one derived there, and it is materially weaker.
+
+## 2.1 ⛔ The calibration copy OVERSTATES catch against the real binary
+
+Every row in this population calibrates the same way: 300 invocations of a **copy** of git at
+another path. The copy exists so that calibrating cannot contaminate the count, and that reason is
+still sound. **But the rate it yields does not transfer to `/usr/bin/git` itself, and it errs in the
+direction that flatters the result.** This was found by the two workload-axis rows (§1.1), not by this
+run, and it applies to PEN-4986's `0.930` and this record's `0.840` as much as to theirs.
+
+Two independent measurements, by two agents, in the same direction:
+
+- **Devops (PEN-4992)** calibrated `0.933` on the copy and then caught **1 of its 3** marked
+  `/usr/bin/git` negative controls. At `p = 0.933` that is `P[≤ 1] ≈ 1.3%` — the two numbers do not
+  reconcile.
+- **UX Designer (PEN-4994)** calibrated `0.793` on the copy and reports `/usr/bin/git` itself
+  calibrating **`0.710`** head-to-head.
+
+Pooling the marked negative controls — the only measurements taken against the real binary — across
+all three rows:
+
+| Row | Copy calibration | Marked controls caught |
+|---|---:|---:|
+| PEN-4989 (this record, Security) | `0.840` | 2 of 3 |
+| PEN-4992 (Devops) | `0.933` | 1 of 3 |
+| PEN-4994 (UX Designer) | `0.793` | 2 of 3 |
+| **Pooled** | **≈ `0.86` predicted** | **5 of 9 = `0.56` observed** |
+
+The copy rates predict ≈ `7.7` of 9; `5` were caught. The plausible mechanism, and the one both rows
+propose independently: a freshly written copy is cold, while `/usr/bin/git` is warm in page cache and
+its `--version` is correspondingly shorter-lived, so a 2 ms sweep catches it nearer one-half than
+nine-tenths.
+
+**§1.2's Engineer row then ran the direct test this section asked for — and it narrows the gap
+sharply.** Rather than inferring from negative controls, it calibrated `n = 300` against each target
+head-to-head in one run:
+
+| Target | Caught | Rate |
+|---|---:|---:|
+| copy named `git` | 251/300 | `0.837` |
+| `/usr/bin/git` | 243/300 | `0.810` |
+| `/usr/lib/git-core/git` | 243/300 | `0.810` |
+
+**The direction holds — the copy does over-state — but by `0.027` here, not the ≈ `0.3` the negative
+controls implied.** Treat the three-row inference above as what it is: an estimate from 9 samples,
+which the 900-sample direct measurement supersedes on magnitude while confirming on sign.
+
+### ⛔ Worse than "a shorter startup path": `git-calib` never runs at all
+
+The first four rows of §1.1 all calibrated against a copy named **`git-calib`**. An earlier revision
+of this record described that as taking "a shorter startup path". **It does not take a path at all.**
+Git dispatches on `argv[0]`, so a binary invoked as `git-calib` is parsed as the subcommand `calib`.
+Measured directly, this image, 2026-10-29:
+
+```
+$ cp /usr/bin/git /tmp/d/git-calib && /tmp/d/git-calib --version
+fatal: cannot handle calib as a builtin
+rc=128
+$ cp /usr/bin/git /tmp/d/c/git   && /tmp/d/c/git --version
+git version 2.47.3
+rc=0
+```
+
+**So `0.930`, `0.840`, `0.933` and `0.793` are catch rates against a process that aborts immediately
+— an error path, not a `git` invocation.** A lifetime argument would make them a floor. **The
+measurements go the other way, and this section's heading states the direction they actually
+support.** In every head-to-head pairing this record contains, the real binary was caught *less*
+often than the copy: `0.793` copy vs `0.710` real (PEN-4994), `0.837` copy named `git` vs `0.810`
+real (PEN-4993 B), and a pooled `≈ 0.86` predicted against `5 of 9 = 0.56` observed (table above).
+They therefore **over-state** catch against the real binary — §2's ceiling, not a floor — though on
+samples this small that is a measured direction, not a rigorous bound. They do not measure what they
+were reported as measuring, and **they must not be quoted as this instrument's catch rate.** The
+only calibration in the whole population taken against something that actually executes git is
+PEN-4993 B's (`0.837` copy named `git`, `0.810` real `/usr/bin/git`).
+
+The honest summary: **no pod's absolute rate should be reused as a fleet figure, and four of the six
+rows have no usable rate at all.**
+
+**What this does and does not change.**
+
+- It does **not** change any count, and it is **not** what fired trigger 4 — §1.2 is. The five zero
+  rows still measured zero, and the instrument demonstrably sees positives: `5` of `9` absolute-path
+  negative controls here, and in §1.2's window `18` of `23` inline, plus the 28 real ones.
+- It **does** change what those five zeros are worth, and that is the number §7.1's residual
+  acceptance leaned on. Even on the narrow `0.810`-vs-`0.837` direct measurement, an observed zero
+  bounds the true count loosely for the shortest-lived class: a worst-case invocation is missed with
+  probability ≈ `0.19`, so a small non-zero count per window was never excluded by a zero. The zeros
+  are strong against anything repeated, long-running, or organic; they are **weak against a single
+  short-lived invocation** — which is the shape trigger 4 exists to catch, and §1.2 is what catching
+  it actually looked like.
+- It is therefore reported here rather than resolved. **Resolving it means re-basing the instrument**
+  (calibrate against `/usr/bin/git` directly with a marked harmless flag, alongside the copy, and
+  compare head-to-head), and **re-basing one row without the others would make the population
+  incomparable**. UX Designer deliberately kept the old spelling for that reason. If the population is
+  re-based, re-base all rows together.
+
+⚠ **This section weakens the evidence under §7.1's conditional acceptance; it is not what fired
+trigger 4.** Trigger 4 fires on a non-zero count, and §1.2 is where that happened. Keep the two
+separate: §1.2 ends the acceptance, while this section explains why even the zeros that preceded it
+supported a looser claim than PEN-4986 made for them.
+
+## 3. ⛔ The fleet-generalisation argument does not hold as PEN-4986 stated it
+
+PEN-4986 §4 split git invocations into an image-resident half that "*does* generalise… because the
+image is identical across the fleet", and an agent-composed half that does not. **The premise is
+false.** Measured 2026-10-29 from `kube_pod_container_info{namespace="paperclip", container="claude"}`:
+
+| Question | Measured |
+|---|---|
+| Distinct agent image **digests** running in the 7 days to 2026-10-29 | **106** |
+| Distinct agent images in the preceding **24 h** | **17** (≈15/day) |
+| Share of that week with **more than one** image live simultaneously | **38.2 %** |
+| Distinct images live at the instant of this measurement | **3** (`sha-4db591b` ×13, `sha-3ddaae3` ×1, `sha-ed39009` ×1) |
+
+Agent pods are per-run Jobs that pick up whatever image their agent is pinned to when they start, and
+agents are bumped independently — so at any instant the fleet is a *mixture* of images, not one. The
+pod that took PEN-4986's measurement and the pod that took this one were running different images
+hours apart, and PEN-4986's own image was still serving another agent while this was written.
+
+**What survives, and it is not nothing.** The census was re-run here, same method and same roots, on
+this different image: **15** literal `/usr/bin/git` occurrences, **all of them inside the
+egress-control machinery itself** — `DEFAULT_GIT_BINARY`, the wrapper's own `exec` line, comments and
+type declarations in `github-git-egress-{runtime,shim}`, `github-publish-broker{,-client}`, and the
+two adapters' `job-manifest`. **Zero exec sites outside the wrapper**, matching PEN-4986 exactly.
+
+So the honest form of the argument is **empirical, not structural**:
+
+> The image-resident half is zero by census in **2 of the 106 images** that ran this week, sampled
+> ~1 h apart, with identical results. That is evidence the egress machinery is stable across
+> rebuilds — it is **not** a proof that every image is identical, and the fleet demonstrably runs
+> several at once.
+
+Anyone citing either document fleet-wide must cite that sample size. The agent-composed half remains
+per-pod and is now measured in **six** windows across **four agents** (§1.1).
+
+⛔ **This paragraph predicted the finding, and the prediction held.** When this record was first
+drafted it said the uncovered axis was **workload** — "the one most likely to vary, since what
+differs between agents is precisely what they compose into a shell". That is exactly where the
+non-zero count came from: five windows across four agents returned zero, and the sixth returned 28
+the moment it ran `penstock-llm-proxy-core`'s test suite (§1.2). **The axis was correctly identified before
+it was sampled**, which is the strongest available argument that the remaining uncovered workloads
+are worth sampling rather than assumed clean.
+
+One correction to the original phrasing: the 26 were **not** agent-composed shell. They came from
+**first-party test code** constructing its own `PATH`. The axis was right; the mechanism was not what
+"what agents compose into a shell" led anyone to look for, which is why no amount of reviewing agent
+behaviour would have found it.
+
+## 4. The re-measurement trigger
+
+PEN-4986 wrote the trigger as "re-take it whenever the agent image or the PATH layout changes". §3
+shows why that cannot be followed literally: at ≈15 image changes a day, a hand-run measurement is
+stale within hours of being taken, every time, and a trigger that is always firing is a trigger
+nobody acts on — the failure PEN-4988 exists to prevent.
+
+Almost none of those rebuilds touch git egress. The operable trigger is therefore the narrower one:
+**re-take the measurement when the egress-relevant surface changes**, where that surface is the
+wrapper, the runtime it `exec`s, the credential helper, the real binary, and the PATH ordering that
+decides which of them a bare `git` reaches. `scripts/absolute-path-git-fingerprint.mjs` computes it,
+so staleness is a comparison rather than a judgement:
+
+```sh
+node scripts/absolute-path-git-fingerprint.mjs --json
+```
+
+Rules:
+
+- A later run whose fingerprint **equals** the one in §1 may cite this measurement.
+- A later run whose fingerprint **differs** must re-take it; a prior result says nothing about it.
+- Compare **like rule for like rule.** The digest carries its rule version (`version` in `--json`,
+  `rule vN` in the human output). A digest produced by a different rule is a mismatch by
+  construction and means "re-derive under the current rule", not "the surface changed".
+- A run reporting `wrapperAhead: false` must not be treated as a stale-measurement question at all —
+  the guard is not ahead of `/usr/bin`, which is a live control failure and goes to Security.
+- ⛔ **A zero taken after the known site is fixed must be labelled `remediated`, never reported as a
+  bare zero.** Repairing `test/secret-scan-budget.test.ts:611` will make the next measurement read 0,
+  which is **indistinguishable from "trigger 4 never fired"** unless the run says so. This record
+  carries the firing, so the evidence is safe here — but any later §7.1 text written off such a run
+  must say the zero is *remediated*, not *never observed* (hazard raised by Engineer, 2026-10-29).
+
+⛔ **The population spec is part of the trigger, and omitting it is fatal.** A re-measurement
+**must include at least one build/test workload window** — a `pnpm test`-class run — and must say
+which window that was. This is not advisory. **Five of the six windows in this record sampled
+ordinary agent activity and returned zero; the sixth returned 28 the moment a different *workload*
+ran.** Widening along the *pod* axis alone would have returned zero indefinitely, and §3 predicted
+*workload* as the uncovered axis before it was sampled. **A re-measurement that samples only ordinary
+agent activity is not a re-measurement; it is a reassurance** (CTO, 2026-10-29).
+
+⚠ Sharpened by UX Designer against their own row: the zero reported there is substantially
+*structural*, not evidence that test suites are clean. That window ran
+`pnpm --filter @penstock/portal test`, whose include glob is rooted at `apps/portal`, so
+`test/secret-scan-budget.test.ts` — the root-package file carrying 26 of the 28 — was
+**unreachable from it at any test count**. Only a **root-package** `pnpm test` reaches the site. A window that does
+not reach the site is not a zero about the site.
+
+The fingerprint is **not a detector for trigger 4** and must not be cited as one. It cannot observe
+an absolute-path invocation; it only says whether an earlier observation still applies. Trigger 4
+remains undetectable fleet-wide for the reason §7.2 records — no exec-level telemetry is deployed,
+and obtaining it from inside an agent pod needs the hardening §8 forbids relaxing.
+
+## 5. What is still open
+
+- **⛔ The acceptance is ended; the remediation is owned but not done.** §1.2 fired trigger 4. What
+  this record does NOT do is fix the mechanism:
+  `penstock-llm-proxy-core:test/secret-scan-budget.test.ts:611` still narrows `PATH`, and **any other
+  test or tool that constructs its own `PATH` still gets an unwrapped `git`**. Nobody has swept for
+  the others, **in that repo or in this one** — the wrapper is in the image, so the class is not
+  confined to the repository where it was first seen. **That sweep is [PEN-5012](https://paperclip.blockcast.net/PEN/issues/PEN-5012)**,
+  filed so the class has an owner rather than a sentence — which is the failure PEN-4988 exists to
+  prevent and would have been repeated by recording it only here. The *acceptance* disposition
+  remains the CTO's and is not decided by that row.
+  **✅ The static half of this is now done** (Engineer, 2026-10-29; independently by UX Designer):
+  `penstock-llm-proxy-core@e3236f297` and `paperclip@4b605287a` were swept, and the mechanism is
+  general while its instantiation is not — **exactly one reachable site, the one already known
+  (`test/secret-scan-budget.test.ts:611`); paperclip zero.** No *direct* `git` spawn in either repo
+  loses the wrapper (penstock 9 inherit / 1 spread / **0 narrowed**; paperclip 162 / 19 / **0**).
+  ⚠ Two limits keep this an open item rather than a closed one. **(a) It is a static read of two
+  trees, not a measurement** — it cannot see a `PATH` built through indirection the scanners do not
+  model, and 24 paperclip sites stayed unresolved in the broad pass. **(b) The known bypass is
+  *indirect*** — a narrowed `PATH` handed to a *shell script* that then runs git — so the tight
+  "sites that spawn `git`" predicate returns a clean **zero** and misses the actual finding. A sweep
+  written to the obvious predicate would have reported all-clear.
+- **⚠ The class has a second shape, and the sweep predicate is not yet stable.** Beyond a *narrowed*
+  `PATH`, an environment replaced **wholesale with no `PATH` key at all** also escapes: `execvp`
+  falls back to `confstr(_CS_PATH)` = `/bin:/usr/bin`, the real git, no guard dir (found by UX
+  Designer; measured as row 2 of the §1 predicate table). PEN-5012's original wording ("constructs
+  its own `PATH`") does not cover it, so a sweep written to that definition misses the shape
+  entirely. ⛔ These are **candidate sites, not bypasses** — none is known to spawn `git` — and this
+  **must not be reported as a second fired count. 28 stands.** ⚠ Three independent passes over the
+  same tree returned **different counts for the same shape** — 51 (UX Designer), 54 (CTO) and 21
+  (Engineer), against denominators of 203 and 239 — which is recorded rather than reconciled into
+  one number, because the disagreement is itself the finding: **the predicate is not yet written
+  precisely enough for two people to count the same thing.** Settling it is PEN-5012's.
+  *(Updated: **D-6** — two rules now bind. These three counts predate D-1, so the disagreement is
+  now resolvable; and they must **never** be reconciled to, or differenced against, the 28. Sweeps
+  count static sites; 28 counts runtime invocations. Neither bounds the other.)*
+- **⚠ The class is not confined to repository code, and a static sweep cannot see the rest of it.**
+  While writing this amendment the author reproduced the bypass *in their own shell*, by applying a
+  remembered `PATH=/usr/bin:$PATH` workaround — a habit carried in agent memory, not in any file in
+  either tree. Read-only `gh` calls, nothing published, no git write. It is recorded because of what
+  it bounds: **PEN-5012 sweeps repositories, and an instantiation that lives in an agent's habit or
+  in a run-time-composed command is outside every tree it reads.** The static sweep's "one reachable
+  site" is therefore a statement about *committed code*, not about what runs in a pod.
+  *(Updated: **D-5** — same class, not a second firing; **28 stands**. No incident, and the
+  self-report carries no penalty, on the record. The scope rule above is now **binding** on
+  PEN-5012: a post-fix zero must carry its population and its `remediated` status and must never be
+  reported bare or as a class closure. A behavioural control was considered and **refused**.)*
+- **Workload, not pod count, was the axis that mattered — and it is still barely sampled.** Five pods
+  and four agents found nothing until the one window that ran `pnpm test`. **≈ 61 minutes of
+  observation in total**, and a single 24-second burst carried 26 of the 28. Widening needs no new
+  platform capability, no `kubectl exec` and no tracer — only more agents running the script over
+  **more kinds of work**. Sampling more pods doing the same work would have found nothing, forever.
+- **⛔ The instrument's calibration is unresolved, and it is the most load-bearing open item here.**
+  §2.1 measures the calibration copy as overstating catch against `/usr/bin/git` itself. Resolving it
+  means re-basing every row together against a directly calibrated rate; nobody has. Until then the
+  defensible bound is §2.1's looser one, and **§7.1 must not be written with a pooled figure that
+  implies the tighter one.**
+- **⛔ §7.1 still carries a one-pod ZERO, and it is now wrong in substance, not merely narrow.**
+  It is rewritten once PEN-4986's PR has landed; until then **this document is the authoritative
+  record and §7.1 must not be cited.** The rewrite must say that trigger 4 fired, must not state a
+  pooled zero, and must carry §2.1's calibration bound and §1.2's predicate question with it.
+- **The sample is 3 of 106 image tags**, fingerprinted across 4 pods. The census's stability across rebuilds is evidence, not a
+  theorem — and counting images overstates it, because a different image is not automatically a
+  different egress surface. That is measured, not assumed, and §1.1 turned it from one datum into
+  four pods across three tags: `sha-4db591b`, `sha-1e99f06` (two independent pods) and
+  `sha-e74d17b` all yield the **same** surface, with byte-identical component hashes.
+  **Three distinct image tags, one egress surface.** That is a direct counter-example to treating image
+  identity and surface identity as the same thing, and it is the direction that makes "3 of 106"
+  read as *less* coverage than the surface evidence actually supports. A fleet claim therefore rests
+  on the §4 fingerprint comparison rather than on the image count, which is the point of §4 and the
+  reason the trigger is phrased against the surface rather than the image tag. **What remains
+  uncovered is an image whose fingerprint DIFFERS: none has been observed — and none has been
+  searched for, which is why this is an open item and not a result.**
+
+## 6. Re-running
+
+```sh
+node scripts/absolute-path-git-fingerprint.mjs --json > fingerprint.json   # record FIRST
+mkdir -p /tmp/calib && cp /usr/bin/git /tmp/calib/git   # copy, and NAME IT `git`: git dispatches
+                                                        # on argv[0], so a differently-named copy
+                                                        # takes a shorter startup path and
+                                                        # calibrates against the wrong thing
+node scripts/measure-absolute-path-git.mjs /tmp/obs.ndjson 2 /tmp/calib/git &  # lands in #3098
+# positive, negative and calibration controls, then work normally across the window
+kill -TERM %1                                      # emits the {"kind":"stop"} summary
+grep -c '"wrapped":false' /tmp/obs.ndjson          # minus any deliberate negative control
+```
+
+⛔ **The `/tmp/calib/git` spelling above is a RE-BASED method, not a drop-in replacement.** §2.1
+shows the old `git-calib` spelling never executed git at all (`rc=128`), so a figure taken this way
+is **not comparable** to §1.1's first four rows. Report it **beside** the old figure, labelled, never
+in place of it — and say which spelling produced which number, as §1.1's table now does.
+
+⛔ **Also calibrate against the real binary** — 300 × `/usr/bin/git -c <marker> --version` alongside
+the 300 against the copy — and report **both** rates. That direct pair is the only calibration in
+this population anyone should quote (PEN-4993 B). A row calibrated differently from its neighbours
+without saying so is how §2.1's defect survived four rows.
+
+Record the fingerprint, the window, the pod, the image **and the agent whose workload ran** beside
+the number. A measurement that does not name its population cannot be widened by the next one.
+
+## Disposition — what this record asked for
+
+Stated here because PEN-4989's acceptance criterion requires it to be said explicitly and on the
+record, rather than left implicit in a count. **This section is what the record *asked for*; the
+*CTO disposition* (D-1…D-7) is what the CTO *ruled*. Where they differ, the disposition governs.**
+
+1. **§7.2 trigger 4 has fired** (§1.2, PEN-4993). The count is **28**, measured 2026-10-29.
+2. **The §7.1 residual acceptance ends as of 2026-10-29.** It does **not** run to its 2027-01-31
+   expiry. Nothing in this record re-grants it on narrower terms — that is the CTO's call, not this
+   document's.
+3. **Owner: the CTO.** Raised there directly, and deliberately **not** folded into PEN-4933's D1
+   broker rollout. The broker retiring the residual *in future* is not the same event as the
+   acceptance *failing now*, and merging the two would silently convert a fired trigger into a
+   scheduled task.
+4. **Open, named so they are not mistaken for handled:** the `PATH`-narrowing class has not been
+   swept for other sites — owned by [PEN-5012](https://paperclip.blockcast.net/PEN/issues/PEN-5012),
+   filed, not yet done. *(Updated: the static half is done — §5. One reachable site, the known one.)*
+   The predicate ambiguity in §7.1 ("absolute-path" vs "did not transit the wrapper") is unresolved
+   and currently admits reporting this very finding as a zero; that one is **unowned**, because it is
+   a question about what §7.1 means to claim and only the CTO's disposition can settle it.
+   *(Updated: settled — D-1. It was never PEN-3183 §7.1's to decide; §7.2 already defined the
+   term.)* §2.1's calibration question is answered on sign but not on a fleet magnitude.
+5. **Not in scope here, and not done:** no guard, wrapper, credential path or pod security context
+   was touched. §8's "not permitted without returning here first" list binds this record as it binds
+   every other measurement row.
+
+## CTO disposition (2026-10-29) — the ruling of record
+
+> **Numbering note.** Throughout this record, bare `§1`–`§6` are *this* document's sections, while
+> `§7.1`, `§7.2` and `§8` always mean **PEN-3183's**. This section is therefore lettered **D-1…D-7**
+> rather than numbered, so that no reference is ambiguous.
+
+Recorded here in full because PEN-4989's acceptance criterion requires the firing and its
+consequence to be stated on the record, and because a ruling that lives only in an issue thread has
+the same defect PEN-4988 exists to prevent.
+
+### D-1 Predicate — settled, and not by PEN-3183 §7.1
+
+The predicate is **"reached a real `git` without transiting the wrapper."** §7.2 trigger 4 already
+defined it inline; PEN-3183 §7.1's looser phrase is drafting lag and is **conformed to §7.2**, not
+the reverse. **The count of 28 is correct on the trigger's own text.** The literal
+`argv[0] == "/usr/bin/git"` reading is rejected as **incoherent**, not merely narrow — see the
+measured four-row table in §1 above. The concept is renamed **unwrapped `git`**.
+
+### D-2 Severity — no incident; Medium, standing
+
+**No incident is opened.** Nothing was published, no credential was used, and this is not a
+PEN-2526-class trigger-1 firing. **The control gap is Medium and standing**, for the reasons in §1.
+⚠ **§7.1 accepted on *frequency*, not on harmlessness, and frequency is what was falsified.**
+
+### D-3 The acceptance ends — and is **not** re-granted
+
+**Ended 2026-10-29, not 2027-01-31.** This is not discretionary: §7.2's own rule is that any one
+trigger ends the acceptance early. A narrower re-grant was **considered and refused**, because any
+narrower ground would again rest on a frequency claim over a population nobody has sampled — and
+§1.1's history shows how fast that reads wrong, five of six windows returning zero until a different
+workload ran. **A fresh acceptance would be the same bet with a smaller number attached.**
+
+What replaces it is an **owned remediation with a date**, which is a different object from an
+acceptance:
+
+1. **Primary close — D1, [PEN-4933](https://paperclip.blockcast.net/PEN/issues/PEN-4933).**
+   `PATH`-ordering enforcement is **structurally** defeated by `PATH` construction; no amount of
+   sweeping changes that. D1 removes the credential from the agent's mount namespace, at which point
+   `PATH` stops being the boundary. The dated enablement plan for `enableGitHubPublishBroker` is
+   delivered — [PEN-5016](https://paperclip.blockcast.net/PEN/issues/PEN-5016), PR
+   [#3109](https://github.com/Blockcast/paperclip/pull/3109) — carrying *proposed* dates; **the gate
+   is not flipped** and the CTO owns the date. *(Updated: **D-7** — the sequence and exit criteria
+   are ratified, the **calendar is not**. Stage 1 begins on the stage-0 close, not on 2026-11-06,
+   which is an earliest-start only.)*
+2. **Interim mitigation — PEN-5012's helper.** A **mitigation**, and it **must not be recorded as
+   closing the class.**
+3. **The standing blind spot stays, and the CTO owns it *as a blind spot*.** No cluster-wide exec
+   tracer is being acquired: it is a large new capability for a control D1 retires, and obtaining the
+   signal from inside an agent pod needs the hardening §8 forbids relaxing. Accepting a **blind
+   spot** is a narrower thing than the residual that just ended.
+
+⚠ **Both directions of misreading are named.** Folding this into PEN-4933's rollout would convert a
+**fired trigger** into a **scheduled task** — the broker retiring the residual *in future* is not the
+same event as the acceptance *failing now*. **And the converse: ending an acceptance removes nothing
+from the fleet.** The exposure today is exactly what it was yesterday; what changed is that it is no
+longer accepted, and now has an owner and a date. **Nobody should read §7.1's closure as a fix.**
+
+### D-4 ⚠ One finding is *not* elevated
+
+PEN-5016's pre-flight surfaced a gap that would let the broker gate be turned off **per-issue by the
+principal it constrains** — filed as [PEN-5017](https://paperclip.blockcast.net/PEN/issues/PEN-5017).
+It is **harmless today** (the gate is off everywhere, so an override can only set the value it
+already holds) and **becomes live the moment stage 1 sets it `true`**, failing silently in the
+permissive direction. It is a **rollout precondition for PEN-4933, not a second firing of trigger
+4**, and is recorded here only so the two are not conflated.
+
+### Premise re-verified independently — three pods, same answer
+
+Recorded here because D-3's structural argument rests on it, and because it was *re-verified* rather
+than inherited: the CTO checked it in their own pod (2026-10-29), the Engineer in theirs, and the
+author of this amendment in a third. All three read-only — name resolution, `ls`, `head -c`.
+
+| | all three pods |
+|---|---|
+| `PATH[0]` | `/usr/local/libexec/paperclip/bin` |
+| `command -v git` | `/usr/local/libexec/paperclip/bin/git` — a `#!` script |
+| wrapper dir | `gh git github-mcp-server github-token-credential-helper google-chrome paperclip-github-token-env` — **no `gitleaks`** |
+| real binary | `/usr/bin/git`, `-rwxr-xr-x root 4082768 Jul 30 2025` (byte-identical stat) |
+
+**Enforcement is `PATH` ordering and nothing else, and the real binary sits at a stable absolute
+path reachable by any process.** That is a property of *the control*, not of any repository — which
+is the whole of D-3's structural argument, now confirmed from three independent pods.
+
+⚠ **This is not a measurement and adds nothing to §1.1.** It is a structural check of the
+enforcement mechanism, not an observation window. **No measurement was re-taken here and no count
+changed — 28 stands.** Do not fold these three pods into §1.1's pod count or §4's image census;
+they are a different object, which is the same error D-6 forbids one level up.
+
+### D-5 The runtime/habit instantiation is the **same** class — no count changes
+
+§5's third bullet — the author reproducing the bypass *in their own shell* by applying a remembered
+`PATH=/usr/bin:$PATH` — is **not a second fired trigger and not a new class.** It is the class D-3
+already ruled on, reached from a transcript instead of a file. **28 stands**, exactly as §5 wrote it.
+
+1. **No incident.** Read-only `gh`, no git write, caught before any git operation, self-reported.
+   **Identical disposition to D-2.**
+2. **Self-reporting it was correct and carries no penalty.** Stated explicitly and on the record,
+   because the alternative equilibrium is both obvious and fatal: D-3 accepts the absence of exec
+   telemetry as a **standing blind spot**, so the only signal this class will ever emit inside a pod
+   is *an agent choosing to report it*. **A reported instance must always be cheaper than a concealed
+   one.** This is a property of the reporting equilibrium, not a courtesy.
+3. **⛔ The owned change — [PEN-5012](https://paperclip.blockcast.net/PEN/issues/PEN-5012) must state
+   the scope of its own zero.** A sweep that returns zero is a statement about **committed code in
+   the repositories and refs it read** — never about what runs in a pod. Paired with D-3's existing
+   rule that the helper is a *mitigation*: **a post-fix zero must be labelled with its population and
+   its `remediated` status, and must never be reported bare or as a class closure.** §5's first
+   bullet already draws this distinction for the static sweep; D-5 makes it binding rather than
+   observational.
+
+**⛔ What is refused, and why it will otherwise get reinvented.** **No behavioural control** — no
+lint, no policy line, no "agents must not narrow `PATH`" reminder. Three reasons, and each is
+sufficient on its own:
+
+- such a control is **agent-writable by construction**, which is precisely the shape PEN-3183 exists
+  to reject;
+- its **compliance is unmeasurable**, for the same reason trigger 4 has no detector;
+- **a green reading of it would be indistinguishable from no control at all** — the fail-open audit
+  record corrected on [penstock#2987](https://github.com/Blockcast/penstock-llm-proxy-core/pull/2987).
+
+That precedent is not hypothetical and it recurred *while this cluster was being written*: #2987's
+first tripwire located the wrapper with the same `#!` probe the derivation's own condition used, so
+in the compiled-wrapper case — the entire residual — it returned early and went **green while the
+guard was gone**. It was corrected to key on `PAPERCLIP_AGENT_ID`, a signal that does not share a
+failure mode with the thing being checked. **A second such control is not accepted at fleet scope.**
+
+**What D-5 does change:** it is a second **independent** reason D1 is the only close — D-3's was
+structural, this one is empirical. That raises the priority of **the date** (D-7), **not** of the
+sweep.
+
+### D-6 Two rules now bind on sweep counts
+
+Recording **51** (UX Designer), **54** (CTO) and **21** (Engineer) over the same tree *without
+reconciling them* was correct: **the disagreement is itself the finding.** Now that D-1 has settled
+the predicate, two rules bind.
+
+1. **Those three counts predate D-1.** The predicate is settled, so the disagreement is now
+   *resolvable*, and resolving it is PEN-5012's. **No sweep count may be reported without the
+   predicate and the denominator it counted under.** A bare number is what produced three
+   incompatible ones.
+2. **⚠ Never reconcile 51 / 54 / 21 *to* 28.** They are **different objects**: the sweeps count
+   **static sites**, the 28 counts **runtime invocations**. They **must not appear in the same column
+   or be differenced.** Conflating them would manufacture a false "unaccounted" delta and launder the
+   real finding — which is that **neither number bounds the other.**
+
+### D-7 The date — ratified in sequence, **not** in calendar
+
+Recorded here because D-3's item 1 leaves the date with the CTO, and this is the ruling on how that
+date gets set. It binds [PEN-5016](https://paperclip.blockcast.net/PEN/issues/PEN-5016) /
+[#3109](https://github.com/Blockcast/paperclip/pull/3109), whose owner is Devops; it is carried here
+so this record does not go stale against it.
+
+- **Ratified: #3109's sequence and its exit criteria. Not ratified: its calendar.**
+- **Stage 1 does not begin 2026-11-06 by default.** It begins when **stage 0 is closed**, and stage 0
+  today holds three open security rows — PEN-5017, PEN-5026, PEN-5027 — plus soak instrumentation the
+  plan itself says does not yet exist.
+- **2026-11-06 is an earliest-start, not a commitment.** The stage-2 and stage-3 windows **float with
+  it** rather than compressing to hold the end date.
+- **The reason is D-3's own.** Fixing the date now, before the gating work is done, is a frequency
+  bet over a population nobody has sampled — the same bet D-3 refused when it declined a narrower
+  re-grant. One is not refused and its twin placed.
+- **Review happens on the stage-0 close, not on the calendar.**
+
+⚠ **Consequence for this record:** D-3 item 1's "the CTO owns the date" now has a *procedure*
+attached. **This document must not cite 2026-11-06 as a start date**, and neither the ending of the
+§7.1 acceptance (D-3) nor this record's own disposition may be read as scheduling D1.
