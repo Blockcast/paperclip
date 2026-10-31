@@ -237,8 +237,36 @@ export const HTTP_TRANSIENT_DB_RESPONSES_METRIC = "paperclip_http_transient_db_r
  * {@link PENSTOCK_AVAILABILITY_GATE_PROBE_DURATION_METRIC} makes against its
  * own counter. Dropping `status` costs nothing here: a slow request is slow
  * whatever code it ends on, and the counter keeps the finer breakdown for the
- * questions that need it. Adding it back would multiply this family by the
- * ~3.5 status values a busy route realises, for no question it answers.
+ * questions that need it.
+ *
+ * ### The cost, measured rather than estimated
+ *
+ * Taken from the live registry on 2026-10-31, busiest replica:
+ *
+ * | quantity | value |
+ * |---|---|
+ * | `paperclip_http_requests_total` series | 183 |
+ * | distinct (route, method) pairs | 96 |
+ * | distinct routes | 89 |
+ * | whole `paperclip_*` family | 1,476 |
+ * | largest single `paperclip_*` metric | 224 |
+ *
+ * So `status` averages 1.9 values per pair (max 7, on
+ * `/api/companies/:companyId/issues`) -- roughly 1,150 extra series here, to
+ * answer nothing this family is asked. And this histogram, at 12 series per
+ * pair, lands near 1,150 on its own: it becomes the largest single metric in
+ * the process by a factor of about five, and raises the family by ~78%. That
+ * is the whole cardinality budget for a latency signal, which is why `status`
+ * is not in it and why the ladder below is short and explicit.
+ *
+ * `method` is kept despite the same pressure because it is nearly free and
+ * genuinely discriminating: 96 pairs over 89 routes is +8%, and a GET and a
+ * POST on one template are different work with different expected cost.
+ *
+ * ⚠️ These are counts of what has been *observed*, not of what is declared, so
+ * they are a floor: a route that has not been hit since process start mints no
+ * series yet. They are bounded above by {@link HTTP_ROUTE_LABEL_CAP} either
+ * way.
  *
  * ## Only completed responses are observed
  *
