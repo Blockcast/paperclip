@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -23,6 +23,9 @@ import {
   PER_AGENT_WORKSPACE_VOLUME_CONFIG_KEY,
   buildIsolationReclaimPlan,
   classifyIsolationWorkspaceAge,
+  collectIsolationWorkspaceInventory,
+  MAX_PLAN_CLOCK_SKEW_MS,
+  executeIsolationReclaimPlan,
   createDbUnreachableAgentCount,
   REAPABLE_LAYOUT,
   UNREACHABLE_AGENTS_UNKNOWN,
@@ -1567,10 +1570,19 @@ describe("buildIsolationReclaimPlan", () => {
     );
     const start = source.indexOf("export async function buildIsolationReclaimPlan");
     expect(start).toBeGreaterThan(-1);
-    // Bounded at the next top-level declaration: an unbounded slice would run
-    // through `reapIsolationWorkspaces`, which legitimately calls both, and the
-    // assertion would silently stop testing this function.
-    const end = source.indexOf("function isReapableLayout", start);
+    // Bounded at this function's own closing brace — the first `}` at column
+    // zero after it starts — because the body has no top-level brace of its own.
+    //
+    // It used to be bounded at `function isReapableLayout`, the declaration that
+    // happened to follow. That is an anchor on a NEIGHBOUR, and it broke the
+    // first time something landed between the two: `executeIsolationReclaimPlan`
+    // (PEN-5151) legitimately calls both helpers, so the slice swallowed it and
+    // the test failed on code it was never meant to read. It failed loudly,
+    // which is the good direction — but the same anchor would have widened just
+    // as silently had the insertion been something that does NOT mention them,
+    // and then this assertion would have been passing over a body it no longer
+    // covered. Anchor on the subject, not on whatever is next to it.
+    const end = source.indexOf("\n}\n", start);
     expect(end).toBeGreaterThan(start);
     const body = source.slice(start, end);
     expect(body).not.toContain("hasNestedCheckout");
@@ -1645,5 +1657,496 @@ describe("classifyIsolationWorkspaceAge", () => {
     // compares the re-read row and not the snapshot.
     expect(classifier.match(/lastUsedAt\.getTime\(\)/g) ?? []).toHaveLength(1);
     expect(code).toContain("current.lastUsedAt.getTime() >= cutoff");
+  });
+});
+
+describe("collectIsolationWorkspaceInventory", () => {
+  it("reports each directory with its own mtime, and nothing else", async () => {
+    await makeWorkspace("11111111-1111-4111-8111-111111111111", [...REAPABLE_LAYOUT], 40);
+    await makeWorkspace("22222222-2222-4222-8222-222222222222", ["home"], 5);
+    await fs.writeFile(path.join(root, "loose-file"), "not a workspace");
+
+    const inventory = await collectIsolationWorkspaceInventory(root);
+
+    expect(inventory.map((entry) => entry.name).sort()).toEqual([
+      "11111111-1111-4111-8111-111111111111",
+      "22222222-2222-4222-8222-222222222222",
+    ]);
+    const aged = inventory.find((entry) => entry.name.startsWith("1111"));
+    expect(Math.round((NOW - (aged?.mtimeMs ?? 0)) / DAY)).toBe(40);
+  });
+
+  it("reports a name that is not a workspace id rather than filtering it", async () => {
+    // The plan refuses these and counts them; that count is the only signal an
+    // operator gets that a foreign claim is accumulating unresolvable dirs.
+    await makeWorkspace("not-a-uuid", [...REAPABLE_LAYOUT], 40);
+
+    const inventory = await collectIsolationWorkspaceInventory(root);
+
+    expect(inventory.map((entry) => entry.name)).toEqual(["not-a-uuid"]);
+    const plan = await buildIsolationReclaimPlan({
+      inventory,
+      lookupWorkspaceUsage: usageLookup({}),
+      maxAgeDays: 30,
+      now,
+    });
+    expect(plan.skippedUnsafeName).toBe(1);
+    expect(plan.eligibleIds).toEqual([]);
+  });
+
+  it("returns an empty inventory for an absent root", async () => {
+    await expect(collectIsolationWorkspaceInventory(path.join(root, "nope"))).resolves.toEqual([]);
+  });
+});
+
+describe("executeIsolationReclaimPlan", () => {
+  const PLAN_AT = NOW - 1000;
+
+  it("removes a planned workspace whose layout and contents still qualify", async () => {
+    const dir = await makeWorkspace("11111111-1111-4111-8111-111111111111", [...REAPABLE_LAYOUT], 40, {
+      "home/.bashrc": "x",
+    });
+
+    const result = await executeIsolationReclaimPlan({
+      root,
+      eligibleIds: ["11111111-1111-4111-8111-111111111111"],
+      planBuiltAtMs: PLAN_AT,
+      now,
+      logger: silentLogger,
+    });
+
+    expect(result.deleted).toBe(1);
+    expect(result.stopReason).toBe("complete");
+    await expect(fs.stat(dir)).rejects.toThrow();
+  });
+
+  it("re-checks the layout allowlist at the executor rather than trusting the plan", async () => {
+    // The plan cannot see this: it decides on `lastUsedAt` and `mtime` only.
+    const dir = await makeWorkspace("11111111-1111-4111-8111-111111111111", ["home", "session", "wt"], 40);
+
+    const result = await executeIsolationReclaimPlan({
+      root,
+      eligibleIds: ["11111111-1111-4111-8111-111111111111"],
+      planBuiltAtMs: PLAN_AT,
+      now,
+      logger: silentLogger,
+    });
+
+    expect(result).toMatchObject({ deleted: 0, skippedLayout: 1 });
+    await expect(fs.stat(dir)).resolves.toBeTruthy();
+  });
+
+  it("retains a layout-compliant planned workspace holding a nested checkout", async () => {
+    const dir = await makeWorkspace("11111111-1111-4111-8111-111111111111", [...REAPABLE_LAYOUT], 40, {
+      "home/pim-multicast-gateway/.git": "gitdir: /elsewhere/.git/worktrees/wt",
+    });
+
+    const result = await executeIsolationReclaimPlan({
+      root,
+      eligibleIds: ["11111111-1111-4111-8111-111111111111"],
+      planBuiltAtMs: PLAN_AT,
+      now,
+      logger: silentLogger,
+    });
+
+    expect(result).toMatchObject({ deleted: 0, retainedNestedCheckout: 1 });
+    await expect(fs.stat(dir)).resolves.toBeTruthy();
+  });
+
+  it("retains on a non-empty worktree parent dir, the same way the mounted sweep does", async () => {
+    for (const parent of WORKTREE_PARENT_DIRS) {
+      const name = "11111111-1111-4111-8111-111111111111";
+      await fs.rm(path.join(root, name), { recursive: true, force: true });
+      await makeWorkspace(name, [...REAPABLE_LAYOUT], 40, { [`home/${parent}/wt/db`]: "x" });
+
+      const result = await executeIsolationReclaimPlan({
+        root,
+        eligibleIds: [name],
+        planBuiltAtMs: PLAN_AT,
+        now,
+        logger: silentLogger,
+      });
+      expect(result).toMatchObject({ deleted: 0, retainedNestedCheckout: 1 });
+    }
+  });
+
+  it("counts a workspace that vanished between the plan and the unlink", async () => {
+    const result = await executeIsolationReclaimPlan({
+      root,
+      eligibleIds: ["11111111-1111-4111-8111-111111111111"],
+      planBuiltAtMs: PLAN_AT,
+      now,
+      logger: silentLogger,
+    });
+
+    expect(result).toMatchObject({ deleted: 0, vanished: 1, stopReason: "complete" });
+  });
+
+  it("refuses a planned name that is not a workspace id, at the end that calls rm", async () => {
+    // Unreachable from a plan this repo built. Checked anyway: a name validated
+    // once at the producer is unvalidated at the point of damage.
+    const outside = path.join(root, "outside");
+    await fs.mkdir(path.join(outside, "home"), { recursive: true });
+    await fs.mkdir(path.join(outside, "session"), { recursive: true });
+
+    const result = await executeIsolationReclaimPlan({
+      root,
+      eligibleIds: ["../outside", "outside"],
+      planBuiltAtMs: PLAN_AT,
+      now,
+      logger: silentLogger,
+    });
+
+    expect(result).toMatchObject({ deleted: 0, skippedUnsafeName: 2 });
+    await expect(fs.stat(outside)).resolves.toBeTruthy();
+  });
+
+  it("stops when the plan goes stale mid-loop, handing the remainder back unexamined", async () => {
+    const names = [
+      "11111111-1111-4111-8111-111111111111",
+      "22222222-2222-4222-8222-222222222222",
+      "33333333-3333-4333-8333-333333333333",
+    ];
+    for (const name of names) await makeWorkspace(name, [...REAPABLE_LAYOUT], 40);
+
+    // Time jumps past the ceiling once the first unlink has actually happened.
+    //
+    // Keyed on the filesystem rather than on a call counter: a counter has to
+    // know how many times the function consults the clock, which made this test
+    // fail the moment a pre-loop guard added one more call — a brittleness that
+    // says nothing about the behaviour under test.
+    const movingNow = () => (existsSync(path.join(root, names[0] as string)) ? NOW : NOW + 20 * 60_000);
+
+    const result = await executeIsolationReclaimPlan({
+      root,
+      eligibleIds: names,
+      planBuiltAtMs: NOW,
+      maxPlanAgeMs: 10 * 60_000,
+      now: movingNow,
+      logger: silentLogger,
+    });
+
+    expect(result.stopReason).toBe("plan_stale");
+    expect(result.deleted).toBe(1);
+    expect(result.notAttempted).toBe(2);
+    // The ones it refused are still there, for the next tick to re-plan.
+    await expect(fs.stat(path.join(root, names[2] as string))).resolves.toBeTruthy();
+  });
+
+  it("refuses the whole plan when its staleness bound is not a finite number", async () => {
+    // The fail-open direction: `now() - undefined > ceiling` is FALSE, i.e.
+    // "fresh", which would disable the only margin this half has.
+    const name = "11111111-1111-4111-8111-111111111111";
+    await makeWorkspace(name, [...REAPABLE_LAYOUT], 40);
+
+    const result = await executeIsolationReclaimPlan({
+      root,
+      eligibleIds: [name],
+      planBuiltAtMs: undefined as unknown as number,
+      now,
+      logger: silentLogger,
+    });
+
+    // `plan_unusable`, not `plan_stale`: a plan that cannot be judged is a
+    // transport defect, where a stale one is a healthy system under load. Same
+    // separation `skippedMalformed` keeps from `skippedUnsafeName`.
+    expect(result).toMatchObject({ deleted: 0, notAttempted: 1, stopReason: "plan_unusable" });
+    await expect(fs.stat(path.join(root, name))).resolves.toBeTruthy();
+  });
+
+  it("refuses a plan dated into the future, where the age bound reads as fresh", async () => {
+    // The age bound is one-sided: any finite `planBuiltAtMs` ahead of `now()`
+    // makes the age negative, so `> maxPlanAgeMs` is false on every iteration
+    // and the plan is eternally fresh. A finiteness check cannot see it — a
+    // future timestamp is a perfectly good number. Realistic producers are a
+    // unit mismatch at the transport (µs/ns land decades out) and clock skew.
+    // (Ally, review of PR #3186.)
+    const name = "11111111-1111-4111-8111-111111111111";
+    await makeWorkspace(name, [...REAPABLE_LAYOUT], 40);
+
+    const result = await executeIsolationReclaimPlan({
+      root,
+      eligibleIds: [name],
+      planBuiltAtMs: NOW + 60 * 60_000,
+      now,
+      logger: silentLogger,
+    });
+
+    expect(result).toMatchObject({ deleted: 0, notAttempted: 1, stopReason: "plan_unusable" });
+    await expect(fs.stat(path.join(root, name))).resolves.toBeTruthy();
+  });
+
+  it("tolerates skew inside the allowance rather than refusing a healthy plan", async () => {
+    // The other side of the same bound: the allowance has to absorb ordinary
+    // control-plane/node clock skew, or a correct plan refuses itself — and a
+    // correct refusal looks identical to that failure, so nothing would say so.
+    //
+    // The 30s is a LITERAL, deliberately not `MAX_PLAN_CLOCK_SKEW_MS / 2`. The
+    // derived form was vacuous: shrinking the constant shrinks the input with
+    // it, so the assertion held at every value including zero and the test
+    // survived its own mutation. A test whose input is computed from the
+    // constant under test cannot constrain that constant.
+    const SKEW_WELL_INSIDE_ALLOWANCE_MS = 30_000;
+    expect(MAX_PLAN_CLOCK_SKEW_MS).toBeGreaterThanOrEqual(SKEW_WELL_INSIDE_ALLOWANCE_MS);
+
+    const name = "11111111-1111-4111-8111-111111111111";
+    await makeWorkspace(name, [...REAPABLE_LAYOUT], 40);
+
+    const result = await executeIsolationReclaimPlan({
+      root,
+      eligibleIds: [name],
+      planBuiltAtMs: NOW + SKEW_WELL_INSIDE_ALLOWANCE_MS,
+      now,
+      logger: silentLogger,
+    });
+
+    expect(result).toMatchObject({ deleted: 1, stopReason: "complete" });
+  });
+
+  it("refuses a plan whose per-tick bound is not a usable number", async () => {
+    // `unlinkAttempts >= NaN` is false forever, which silently removes the MDS
+    // bound that is property 4 of this module. Same fail-open family as the
+    // timestamp, on the ceiling rather than the measurement.
+    const names = [
+      "11111111-1111-4111-8111-111111111111",
+      "22222222-2222-4222-8222-222222222222",
+    ];
+    for (const name of names) await makeWorkspace(name, [...REAPABLE_LAYOUT], 40);
+
+    const result = await executeIsolationReclaimPlan({
+      root,
+      eligibleIds: names,
+      planBuiltAtMs: NOW - 1000,
+      maxDeletes: Number.NaN,
+      now,
+      logger: silentLogger,
+    });
+
+    expect(result).toMatchObject({ deleted: 0, notAttempted: 2, stopReason: "plan_unusable" });
+    for (const name of names) await expect(fs.stat(path.join(root, name))).resolves.toBeTruthy();
+  });
+
+  it("caps unlinks per tick and reports the remainder as offered-again", async () => {
+    const names = [
+      "11111111-1111-4111-8111-111111111111",
+      "22222222-2222-4222-8222-222222222222",
+      "33333333-3333-4333-8333-333333333333",
+    ];
+    for (const name of names) await makeWorkspace(name, [...REAPABLE_LAYOUT], 40);
+
+    const result = await executeIsolationReclaimPlan({
+      root,
+      eligibleIds: names,
+      planBuiltAtMs: PLAN_AT,
+      maxDeletes: 2,
+      now,
+      logger: silentLogger,
+    });
+
+    expect(result).toMatchObject({ deleted: 2, notAttempted: 1, capped: true, stopReason: "capped" });
+  });
+
+  it("deletes nothing under dryRun, and stops at the directory a live run would", async () => {
+    const names = [
+      "11111111-1111-4111-8111-111111111111",
+      "22222222-2222-4222-8222-222222222222",
+      "33333333-3333-4333-8333-333333333333",
+    ];
+    for (const name of names) await makeWorkspace(name, [...REAPABLE_LAYOUT], 40);
+
+    const result = await executeIsolationReclaimPlan({
+      root,
+      eligibleIds: names,
+      planBuiltAtMs: PLAN_AT,
+      maxDeletes: 2,
+      dryRun: true,
+      now,
+      logger: silentLogger,
+    });
+
+    expect(result).toMatchObject({ deleted: 0, wouldDelete: 2, notAttempted: 1, capped: true });
+    for (const name of names) await expect(fs.stat(path.join(root, name))).resolves.toBeTruthy();
+  });
+
+  it("lands every planned id in exactly one bucket", async () => {
+    const deletable = "11111111-1111-4111-8111-111111111111";
+    const wrongLayout = "22222222-2222-4222-8222-222222222222";
+    const nested = "33333333-3333-4333-8333-333333333333";
+    const gone = "44444444-4444-4444-8444-444444444444";
+    const unsafe = "../escape";
+    const past = "55555555-5555-4555-8555-555555555555";
+
+    await makeWorkspace(deletable, [...REAPABLE_LAYOUT], 40);
+    await makeWorkspace(wrongLayout, ["home"], 40);
+    await makeWorkspace(nested, [...REAPABLE_LAYOUT], 40, { "session/repo/.git": "gitdir: /x" });
+    await makeWorkspace(past, [...REAPABLE_LAYOUT], 40);
+
+    const ids = [unsafe, deletable, wrongLayout, nested, gone, past];
+    const result = await executeIsolationReclaimPlan({
+      root,
+      eligibleIds: ids,
+      planBuiltAtMs: PLAN_AT,
+      maxDeletes: 1,
+      now,
+      logger: silentLogger,
+    });
+
+    expect(result.requested).toBe(ids.length);
+    expect(
+      result.deleted +
+        result.wouldDelete +
+        result.skippedUnsafeName +
+        result.skippedLayout +
+        result.retainedNestedCheckout +
+        result.vanished +
+        result.failed +
+        result.notAttempted,
+    ).toBe(result.requested);
+  });
+
+  it("re-checks the layout with the same code the mounted sweep uses", async () => {
+    // Not a behavioural duplicate of the skip test above: this one pins that
+    // the two paths agree on a single borderline tree, which is what makes a
+    // second transcription of the allowlist visible rather than merely wrong.
+    const name = "11111111-1111-4111-8111-111111111111";
+    await makeWorkspace(name, ["home"], 40);
+
+    const swept = await reapIsolationWorkspaces({
+      root,
+      maxAgeDays: 30,
+      lookupWorkspaceUsage: usageLookup({}),
+      now,
+      logger: silentLogger,
+    });
+    const executed = await executeIsolationReclaimPlan({
+      root,
+      eligibleIds: [name],
+      planBuiltAtMs: PLAN_AT,
+      now,
+      logger: silentLogger,
+    });
+
+    expect(swept.skippedLayout).toBe(1);
+    expect(executed.skippedLayout).toBe(1);
+    expect(swept.deleted + executed.deleted).toBe(0);
+  });
+});
+
+/**
+ * The closest thing to an end-to-end proof available without a cluster: the
+ * three pieces run in order over one real tree, with only the transport —
+ * which does not exist yet — replaced by passing the values along.
+ *
+ * It is not a restatement of the per-function tests. Those exercise each half
+ * against inputs a test author chose; this one pins the CONTRACT between them,
+ * which is the thing a split across a process boundary actually puts at risk:
+ * that the names an inventory produces survive the plan's validator, that the
+ * ids a plan emits survive the executor's, and that a directory retained by one
+ * half is not quietly deleted by the other.
+ */
+describe("inventory -> plan -> execute, over one real tree", () => {
+  it("removes exactly the directory every half agrees on", async () => {
+    const idle = "11111111-1111-4111-8111-111111111111";
+    const inUse = "22222222-2222-4222-8222-222222222222";
+    const fresh = "33333333-3333-4333-8333-333333333333";
+    const nested = "44444444-4444-4444-8444-444444444444";
+    const oddLayout = "55555555-5555-4555-8555-555555555555";
+    const unresolvable = "not-a-workspace-id";
+
+    await makeWorkspace(idle, [...REAPABLE_LAYOUT], 90);
+    await makeWorkspace(inUse, [...REAPABLE_LAYOUT], 90);
+    await makeWorkspace(fresh, [...REAPABLE_LAYOUT], 2);
+    await makeWorkspace(nested, [...REAPABLE_LAYOUT], 90, { "home/repo/.git": "gitdir: /elsewhere" });
+    await makeWorkspace(oddLayout, ["home", "session", "cache"], 90);
+    await makeWorkspace(unresolvable, [...REAPABLE_LAYOUT], 90);
+
+    const inventory = await collectIsolationWorkspaceInventory(root);
+    expect(inventory).toHaveLength(6);
+
+    const plan = await buildIsolationReclaimPlan({
+      inventory,
+      // `inUse` is the only one the filesystem cannot speak to: its root is 90
+      // days old either way, so only the row keeps it alive. `fresh` is held by
+      // `mtime` alone, with no row at all.
+      lookupWorkspaceUsage: usageLookup({ [inUse]: { lastUsedDaysAgo: 1 } }),
+      maxAgeDays: 30,
+      now,
+    });
+
+    expect(plan.retainedInUse).toBe(1);
+    expect(plan.retainedFresh).toBe(1);
+    expect(plan.skippedUnsafeName).toBe(1);
+    // The plan cannot see layout or nested checkouts, so both are still offered.
+    expect([...plan.eligibleIds].sort()).toEqual([idle, nested, oddLayout].sort());
+
+    const executed = await executeIsolationReclaimPlan({
+      root,
+      eligibleIds: plan.eligibleIds,
+      planBuiltAtMs: NOW,
+      now,
+      logger: silentLogger,
+    });
+
+    expect(executed).toMatchObject({
+      requested: 3,
+      deleted: 1,
+      retainedNestedCheckout: 1,
+      skippedLayout: 1,
+      skippedUnsafeName: 0,
+      stopReason: "complete",
+    });
+
+    const left = (await fs.readdir(root)).sort();
+    expect(left).toEqual([inUse, fresh, nested, oddLayout, unresolvable].sort());
+  });
+
+  it("agrees with the mounted sweep on the same tree", async () => {
+    // Same fixture, swept the way the server does it when it DOES hold the
+    // claim. The two paths must reach the same survivors — if they ever stop
+    // agreeing, the foreign claim is running a different predicate, which is
+    // the entire failure this split has to avoid.
+    const idle = "11111111-1111-4111-8111-111111111111";
+    const inUse = "22222222-2222-4222-8222-222222222222";
+    const fresh = "33333333-3333-4333-8333-333333333333";
+    const nested = "44444444-4444-4444-8444-444444444444";
+
+    const build = async () => {
+      await makeWorkspace(idle, [...REAPABLE_LAYOUT], 90);
+      await makeWorkspace(inUse, [...REAPABLE_LAYOUT], 90);
+      await makeWorkspace(fresh, [...REAPABLE_LAYOUT], 2);
+      await makeWorkspace(nested, [...REAPABLE_LAYOUT], 90, { "session/repo/.git": "gitdir: /x" });
+    };
+    const lookup = () => usageLookup({ [inUse]: { lastUsedDaysAgo: 1 } });
+
+    await build();
+    await reapIsolationWorkspaces({
+      root,
+      maxAgeDays: 30,
+      lookupWorkspaceUsage: lookup(),
+      now,
+      logger: silentLogger,
+    });
+    const afterSweep = (await fs.readdir(root)).sort();
+
+    await fs.rm(root, { recursive: true, force: true });
+    await fs.mkdir(root, { recursive: true });
+    await build();
+    const plan = await buildIsolationReclaimPlan({
+      inventory: await collectIsolationWorkspaceInventory(root),
+      lookupWorkspaceUsage: lookup(),
+      maxAgeDays: 30,
+      now,
+    });
+    await executeIsolationReclaimPlan({
+      root,
+      eligibleIds: plan.eligibleIds,
+      planBuiltAtMs: NOW,
+      now,
+      logger: silentLogger,
+    });
+    const afterPlanPath = (await fs.readdir(root)).sort();
+
+    expect(afterPlanPath).toEqual(afterSweep);
+    expect(afterSweep).toEqual([inUse, fresh, nested].sort());
   });
 });

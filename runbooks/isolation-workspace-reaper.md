@@ -59,9 +59,14 @@ Read the two values differently:
 ### What you can actually do about it today
 
 **Nothing in this repo reclaims a foreign claim yet**, so the remedies below are the whole list.
-[PEN-5151](https://paperclip.blockcast.net/PEN/issues/PEN-5151) owns the reclaimer; its server half
-(`buildIsolationReclaimPlan`) is in the tree but has no caller, so do not go looking for a sweep that
-might have run.
+[PEN-5151](https://paperclip.blockcast.net/PEN/issues/PEN-5151) owns the reclaimer. Three of its
+pieces are now in the tree — `buildIsolationReclaimPlan` (decide),
+`collectIsolationWorkspaceInventory` (enumerate) and `executeIsolationReclaimPlan` (unlink) — and
+**none of them has a caller**: nothing creates the Job that would mount a foreign claim and carry an
+inventory one way and a plan the other. So do not go looking for a sweep that might have run, and do
+not read the presence of those functions as reclamation. If one ever does run, its record is a log
+line `isolation reclaim execution complete`; there is no metric for it yet, which is itself a sign
+nothing is calling it.
 
 - **Opt the agent back out.** Clearing `enablePerAgentWorkspaceVolume` (or the agent's
   `workspaceVolumeClaim`) returns its next run to the shared claim, where this reaper reaches its
