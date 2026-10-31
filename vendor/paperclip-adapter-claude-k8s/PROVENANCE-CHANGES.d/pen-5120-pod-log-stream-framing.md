@@ -72,15 +72,26 @@ the server cannot reach the Job's volume, which no agent does until PEN-4932's g
 The refusal message is interpolated into a single-quoted `echo`, so one apostrophe in it would end
 the string and leave the rest of the line to be re-parsed as shell — syntactically valid, silently
 mangled, on a branch that only runs when something else has already failed. The first draft carried
-exactly that apostrophe. A test now pins both the message and the fragment's overall quote parity.
+exactly that apostrophe. A test now pins the message, and pins quote parity over the redactor
+fragment rather than over the whole rendered command. Whole-command parity is not an invariant of a
+*valid* command: POSIX single-quote escaping renders an apostrophe as `'\''`, so a quoted argument
+containing one contributes an odd number of quote characters while staying well-formed, and the
+first such argument anywhere in the fixture would have failed the check on correct code.
 
 ## The failure diagnostic had to learn about the marker
 
 `extractContainerLogDiagnostic` keeps the last five non-empty lines of a 120-line tail. On this path
 those last lines are the transcript — long, and enough to push the actual error out of the window,
 so the diagnostic would report the run's *output* instead of its *error* precisely when the caller
-needs the error. Marked lines are dropped before the cut. For a container log carrying no marked
-line the predicate is a no-op, which is its own negative control.
+needs the error. Marked lines are dropped before the last-five cut. For a container log carrying no
+marked line the predicate is a no-op, which is its own negative control.
+
+That rescues the error from the last-five cut and **not** from the 120-line one above it: the
+`tailLines: 120` bound is applied by the Kubernetes log API, so the filter never sees anything
+older. On a foreign claim a long enough transcript can therefore fill the whole window and carry an
+early failure — a launcher preflight error followed by output — off the end before the filter runs.
+Raising `tailLines` on the stream path, or taking the diagnostic from the collector's de-framed
+stderr instead, belongs with the collector; the bound is stated here rather than left implicit.
 
 ## What this does NOT do
 
