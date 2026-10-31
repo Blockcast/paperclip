@@ -870,6 +870,12 @@ export function resolveSeedShape(input: {
  * back out: its runs return to the shared claim, where the existing reaper
  * reaches them with its predicate unchanged.
  *
+ * ⚠️ That alert is NOT deployed on Blockcast yet: `values.blockcast.yaml` sets
+ * `prometheusRule.enabled: false`, and the mirror that deploys it,
+ * Blockcast/onprem-k8s#7210, is still open. Until it lands the ceiling is
+ * priced against an alarm that cannot sound, so confirm the rule is loaded at
+ * `/api/v1/rules` before treating the first opt-in as self-announcing.
+ *
  * The gate exists so the swap can land reviewed and inert, exactly as
  * #3153/#3157/#3158 did for the delivery channel. It is deliberately NOT
  * surfaced in `config-schema.ts`: an operator-visible toggle for a path known

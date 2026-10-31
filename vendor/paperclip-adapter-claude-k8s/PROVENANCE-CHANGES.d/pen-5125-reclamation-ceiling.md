@@ -44,10 +44,19 @@ opt-in raises the alert within one daily sweep and it stays raised. The comment 
 says in those words not to read it as informational while PEN-5151 is open — silence is the state
 the whole gauge was added to end, so silencing it is the specific failure to avoid.
 
+⚠ **On Blockcast the rule is not deployed yet, and the comment now says so.** The chart ships it but
+`deploy/helm/paperclip/values.blockcast.yaml` sets `prometheusRule.enabled: false`, and the mirror
+that deploys it, Blockcast/onprem-k8s#7210, is still open. Until that lands the ceiling is priced
+against an alarm that cannot sound, so each of the four surfaces carries the qualifier and points at
+`/api/v1/rules` as the check. This is recorded here rather than left for a superseding entry because
+this directory is append-only, which makes the fragment's first version the cheapest place to get it
+right.
+
 ## Why it is in the vendored tree at all
 
 `resolveAgentWorkspaceClaimName` is vendored adapter source, and the gate it guards is vendored. The
 ceiling could have lived only in `docs/plans/2026-10-28-pen-4932-per-agent-volumes.md` §4 stage 4b —
 it is there too, along with `runbooks/isolation-workspace-reaper.md` — but a plan document is not on
-the path of the person flipping a default-off toggle in `config-schema.ts`. The three copies are
-intentional and the PR's review focus asks for them to be checked against each other.
+the path of the person flipping a default-off toggle in `config-schema.ts`. The copies — plan,
+runbook, code comment and this fragment — are intentional and the PR's review focus asks for them to
+be checked against each other.
