@@ -51,12 +51,14 @@ import {
   DEFAULT_ESCALATE_AFTER_DAYS_BY_PRIORITY,
   DEFAULT_MAX_ESCALATED,
   HUMAN_GATED_OPEN_STATUSES,
+  computeTransitivePayoff,
   formatHumanGatedAgeingSections,
   HUMAN_GATED_DIGEST_ORIGIN_KIND,
   orderByHumanSilenceDescending,
   rankableSilenceDays,
   sanitizeRenderedField,
   selectAgedHumanGatedIssues,
+  type BlockerGraphInput,
   type HumanGatedIssue,
 } from "./human-gated-ageing.js";
 import {
@@ -346,6 +348,63 @@ export async function loadHumanGatedIssues(
   });
 }
 
+/**
+ * Load the company's open blocker graph for the transitive-payoff selector
+ * (PEN-5114).
+ *
+ * Two unbatched company-scoped `SELECT`s per sweep rather than the chunked
+ * per-row shape the aggregates above use, because this is deliberately *not*
+ * keyed on the candidate rows. Payoff asks how many open rows a human-gated row
+ * is the sole remaining gate for, and almost all of those are agent-owned rows
+ * the digest never lists; restricting either query to the human-gated subset
+ * would measure a different quantity and would measure it as near-zero, which
+ * is the quiet failure direction — a selector that discriminates nothing looks
+ * exactly like a queue where nothing gates anything.
+ *
+ * The open-row predicate is `loadHumanGatedIssues`' predicate minus the
+ * `assigneeUserId IS NOT NULL` clause, digest-row exclusion included: the
+ * digest row is itself an open human-assigned row, so leaving it in would let
+ * the escalation report count itself as work it could free.
+ *
+ * Edges are transposed here, once. `issue_relations.issueId` is the *blocker*
+ * and `relatedIssueId` the *blocked* row — the same direction
+ * {@link loadGateEvidence} reads — while {@link BlockerGraphInput} is oriented
+ * from the blocked row's side, which is the direction the frontier walk runs.
+ * Resolving blockers are not filtered out in SQL: an edge pointing at a row
+ * outside the open set is a *phantom*, and `computeTransitivePayoff` counts
+ * phantoms as it drops them, which is evidence that a `WHERE` clause here would
+ * silently discard.
+ */
+export async function loadOpenBlockerGraph(
+  db: Db,
+  companyId: string,
+): Promise<BlockerGraphInput> {
+  const openRows = await db
+    .select({ id: issues.id })
+    .from(issues)
+    .where(
+      and(
+        eq(issues.companyId, companyId),
+        isNull(issues.hiddenAt),
+        inArray(issues.status, [...HUMAN_GATED_OPEN_STATUSES]),
+        EXCLUDE_DIGEST_ROWS,
+      ),
+    );
+
+  const edgeRows = await db
+    .select({
+      issueId: issueRelations.relatedIssueId,
+      blockerIssueId: issueRelations.issueId,
+    })
+    .from(issueRelations)
+    .where(and(eq(issueRelations.companyId, companyId), eq(issueRelations.type, "blocks")));
+
+  return {
+    openIssueIds: openRows.map((row) => row.id),
+    edges: edgeRows,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Gate evidence (BLO-30608)
 // ---------------------------------------------------------------------------
@@ -506,7 +565,7 @@ export async function loadGateEvidence(
  */
 export const humanGatedAgeingProducer: DigestProducer = {
   key: "human-gated-ageing",
-  collect: async ({ db, companyId, now }) => {
+  collect: async ({ db, companyId, now, logger }) => {
     // Collection runs inside the company delivery transaction. Keep the
     // candidate rows locked through the digest decision so a concurrent human
     // resolution cannot commit between the ageing snapshot and its delivery.
@@ -546,6 +605,31 @@ export const humanGatedAgeingProducer: DigestProducer = {
         .filter(([, days]) => Number.isFinite(days)) as [string, number][],
     );
 
+    // PEN-5114. The selector is transitive payoff; the threshold table is now
+    // only the eligibility floor in front of it. Read on the same transaction
+    // handle as the candidates, after their row locks are held — but it is not
+    // itself a locked read, so a blocker committing mid-collection can be
+    // observed here. That is the safe direction and is why no lock is taken: a
+    // blocker closing can only *lower* a payoff score (its dependants become
+    // free, or fall to another root), never invent one, so the worst case is a
+    // row ranked below where a stricter snapshot would have put it.
+    const payoff = computeTransitivePayoff(await loadOpenBlockerGraph(db, companyId));
+    logger.info(
+      {
+        companyId,
+        openRowCount: payoff.openRowCount,
+        blockedRowCount: payoff.blockedRowCount,
+        soleGatedRowCount: payoff.soleGatedRowCount,
+        phantomEdgeCount: payoff.phantomEdgeCount,
+        cyclicRowCount: payoff.cyclicRowCount,
+      },
+      // The two validations the recorded measurement had to perform by hand
+      // (zero cycles, every phantom blocker `done`) are the ones that decide
+      // whether the walk is exact, so the sweep emits them every run rather
+      // than leaving the next reader to re-derive them offline.
+      "human-gated ageing: transitive payoff computed",
+    );
+
     const report = selectAgedHumanGatedIssues(
       candidates.filter((candidate) => !withheld.has(candidate.id)),
       {
@@ -554,6 +638,7 @@ export const humanGatedAgeingProducer: DigestProducer = {
         // Explicit rather than defaulted: the cap is an acceptance criterion, so
         // it should be visible at the call site rather than inherited silently.
         maxEscalated: DEFAULT_MAX_ESCALATED,
+        payoffByIssueId: payoff.payoffByIssueId,
       },
     );
 

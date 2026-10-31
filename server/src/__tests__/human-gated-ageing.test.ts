@@ -13,6 +13,8 @@ import {
   orderByHumanSilenceDescending,
   rankableSilenceDays,
   selectAgedHumanGatedIssues,
+  computeTransitivePayoff,
+  type BlockerEdge,
   type HumanGatedIssue,
 } from "../services/human-gated-ageing.js";
 
@@ -1147,5 +1149,344 @@ describe("bounded probing ranks oldest-human-clock-first (BLO-30608)", () => {
     ];
     orderByHumanSilenceDescending(population, NOW);
     expect(population.map((row) => row.id)).toEqual(["a", "b"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Transitive payoff (PEN-5114)
+// ---------------------------------------------------------------------------
+
+/** `a` is blocked by `b`. */
+function edge(a: string, b: string): BlockerEdge {
+  return { issueId: a, blockerIssueId: b };
+}
+
+describe("transitive payoff", () => {
+  it("credits a root with every open row it is the sole remaining gate for", () => {
+    // c <- b <- a. Clearing `a` is the whole remaining gate for both b and c.
+    const result = computeTransitivePayoff({
+      openIssueIds: ["a", "b", "c"],
+      edges: [edge("b", "a"), edge("c", "b")],
+    });
+
+    expect(result.payoffByIssueId.get("a")).toBe(2);
+    expect(result.payoffByIssueId.get("b")).toBe(0);
+    expect(result.payoffByIssueId.get("c")).toBe(0);
+    expect(result.soleGatedRowCount).toBe(2);
+    expect(result.blockedRowCount).toBe(2);
+  });
+
+  it("never credits a row for itself, so an unblocked row with no dependants scores 0", () => {
+    // The distinction the filter exists to draw: "frees something" vs "frees
+    // nothing". Self-crediting would floor every root at 1 and erase it.
+    const result = computeTransitivePayoff({ openIssueIds: ["a", "b"], edges: [] });
+
+    expect(result.payoffByIssueId.get("a")).toBe(0);
+    expect(result.payoffByIssueId.get("b")).toBe(0);
+    expect(result.soleGatedRowCount).toBe(0);
+  });
+
+  it("credits neither co-root when a row has two remaining roots", () => {
+    // Clearing either one still leaves `c` blocked by the other, so neither is
+    // "one console action away" from freeing anything.
+    const result = computeTransitivePayoff({
+      openIssueIds: ["a", "b", "c"],
+      edges: [edge("c", "a"), edge("c", "b")],
+    });
+
+    expect(result.payoffByIssueId.get("a")).toBe(0);
+    expect(result.payoffByIssueId.get("b")).toBe(0);
+    expect(result.soleGatedRowCount).toBe(0);
+  });
+
+  it("credits the root of a chain, not the blocked row in the middle of it", () => {
+    // `mid` does block work, but is itself blocked: acting on it alone frees
+    // nothing. This is the `PEN-1095` / `PEN-193` shape from the measurement.
+    const result = computeTransitivePayoff({
+      openIssueIds: ["root", "mid", "leaf"],
+      edges: [edge("mid", "root"), edge("leaf", "mid")],
+    });
+
+    expect(result.payoffByIssueId.get("root")).toBe(2);
+    expect(result.payoffByIssueId.get("mid")).toBe(0);
+  });
+
+  it("treats a blocker outside the open set as resolved, and counts it as a phantom", () => {
+    // A `done` blocker still has an edge row. Scoring it as an open root would
+    // make everything under it look permanently gated by nobody.
+    const result = computeTransitivePayoff({
+      openIssueIds: ["a", "b"],
+      edges: [edge("b", "a"), edge("b", "closed-blocker")],
+    });
+
+    expect(result.payoffByIssueId.get("a")).toBe(1);
+    expect(result.payoffByIssueId.has("closed-blocker")).toBe(false);
+    expect(result.phantomEdgeCount).toBe(1);
+  });
+
+  it("scores a cycle as not-sole rather than dropping the back edge, and terminates", () => {
+    // Fail-closed: discarding the back edge and keeping the rest could promote
+    // `a` to sole gate on the strength of an edge the guard threw away.
+    const result = computeTransitivePayoff({
+      openIssueIds: ["a", "b", "c"],
+      edges: [edge("a", "b"), edge("b", "a"), edge("c", "a")],
+    });
+
+    expect(result.payoffByIssueId.get("a")).toBe(0);
+    expect(result.payoffByIssueId.get("b")).toBe(0);
+    expect(result.soleGatedRowCount).toBe(0);
+    expect(result.cyclicRowCount).toBeGreaterThan(0);
+  });
+
+  it("reaches the same verdict for a cycle whichever row the walk enters from", () => {
+    const edges = [edge("a", "b"), edge("b", "a"), edge("c", "a")];
+    const forward = computeTransitivePayoff({ openIssueIds: ["a", "b", "c"], edges });
+    const reversed = computeTransitivePayoff({ openIssueIds: ["c", "b", "a"], edges });
+
+    expect([...reversed.payoffByIssueId.entries()].sort()).toEqual(
+      [...forward.payoffByIssueId.entries()].sort(),
+    );
+    expect(reversed.cyclicRowCount).toBe(forward.cyclicRowCount);
+  });
+
+  it("ignores a self-edge rather than reading it as a one-node cycle", () => {
+    const result = computeTransitivePayoff({
+      openIssueIds: ["a", "b"],
+      edges: [edge("a", "a"), edge("b", "a")],
+    });
+
+    expect(result.payoffByIssueId.get("a")).toBe(1);
+    expect(result.cyclicRowCount).toBe(0);
+  });
+
+  it("pre-seeds every open row, so an absent key means 'not in the graph' and not 'scored 0'", () => {
+    const result = computeTransitivePayoff({ openIssueIds: ["a", "b"], edges: [] });
+
+    expect([...result.payoffByIssueId.keys()].sort()).toEqual(["a", "b"]);
+    expect(result.payoffByIssueId.has("never-loaded")).toBe(false);
+  });
+
+  it("walks a chain far deeper than the call stack", () => {
+    // Chain depth is attacker-adjacent: anyone can add a blocker edge. A
+    // recursive walk would throw here instead of scoring.
+    const depth = 50_000;
+    const ids = Array.from({ length: depth }, (_, index) => `n${index}`);
+    const edges = ids.slice(1).map((id, index) => edge(id, ids[index]!));
+
+    const result = computeTransitivePayoff({ openIssueIds: ids, edges });
+
+    expect(result.payoffByIssueId.get("n0")).toBe(depth - 1);
+  });
+});
+
+describe("payoff-ordered escalation cut (PEN-5114)", () => {
+  /** Rows in the same tier: an older row that gates nothing, a younger one that gates work. */
+  const olderGatesNothing = issue({
+    id: "older-gates-nothing",
+    priority: "high",
+    lastHumanTouchAt: daysAgo(138),
+  });
+  const youngerGatesSix = issue({
+    id: "younger-gates-six",
+    priority: "high",
+    lastHumanTouchAt: daysAgo(81),
+  });
+
+  it("promotes the row that frees work over the strictly older row that frees none", () => {
+    // The measured inversion: age alone awards the contested slot to the older
+    // row, which is the sole gate for nothing.
+    const payoffByIssueId = new Map([
+      ["older-gates-nothing", 0],
+      ["younger-gates-six", 6],
+    ]);
+
+    const report = selectAgedHumanGatedIssues([olderGatesNothing, youngerGatesSix], {
+      now: NOW,
+      escalateAfterDaysByPriority: flat(14),
+      maxEscalated: 1,
+      payoffByIssueId,
+    });
+
+    expect(report.escalated.map((row) => row.id)).toEqual(["younger-gates-six"]);
+    expect(report.payoffApplied).toBe(true);
+    expect(report.escalatedSoleGateReach).toBe(6);
+    expect(report.omittedPayoffPositiveCount).toBe(0);
+  });
+
+  it("keeps priority ahead of age inside a payoff tie, so PEN-4489's inversion stays closed", () => {
+    // Payoff ties are the common case. Breaking them on age alone would let a
+    // `low` row at 142d displace a `critical` row at 58d all over again.
+    const lowAndAncient = issue({ id: "low-ancient", priority: "low", lastHumanTouchAt: daysAgo(142) });
+    const criticalAndNewer = issue({
+      id: "critical-newer",
+      priority: "critical",
+      lastHumanTouchAt: daysAgo(58),
+    });
+
+    const report = selectAgedHumanGatedIssues([lowAndAncient, criticalAndNewer], {
+      now: NOW,
+      escalateAfterDaysByPriority: flat(14),
+      maxEscalated: 1,
+      payoffByIssueId: new Map([
+        ["low-ancient", 3],
+        ["critical-newer", 3],
+      ]),
+    });
+
+    expect(report.escalated.map((row) => row.id)).toEqual(["critical-newer"]);
+  });
+
+  it("ranks a zero-payoff row last but never drops it, and spends leftover slots on it", () => {
+    // Payoff scores what a row unblocks, not what it is worth. A row gating
+    // nothing can still be the most urgent thing in the queue.
+    const report = selectAgedHumanGatedIssues([olderGatesNothing, youngerGatesSix], {
+      now: NOW,
+      escalateAfterDaysByPriority: flat(14),
+      maxEscalated: 15,
+      payoffByIssueId: new Map([
+        ["older-gates-nothing", 0],
+        ["younger-gates-six", 6],
+      ]),
+    });
+
+    expect(report.escalated.map((row) => row.id)).toEqual([
+      "younger-gates-six",
+      "older-gates-nothing",
+    ]);
+    expect(report.escalatedOmitted).toBe(0);
+    expect(report.escalatedZeroPayoffCount).toBe(1);
+    expect(report.totalOverThreshold).toBe(2);
+    expect(report.scanned).toHaveLength(2);
+  });
+
+  it("is byte-for-byte the PEN-4489 cut when no payoff map is supplied", () => {
+    const rows = [olderGatesNothing, youngerGatesSix];
+    const options = { now: NOW, escalateAfterDaysByPriority: flat(14), maxEscalated: 15 };
+
+    const withoutPayoff = selectAgedHumanGatedIssues(rows, options);
+
+    expect(withoutPayoff.escalated.map((row) => row.id)).toEqual([
+      "older-gates-nothing",
+      "younger-gates-six",
+    ]);
+    expect(withoutPayoff.payoffApplied).toBe(false);
+    expect(withoutPayoff.payoffPositiveOverThreshold).toBe(0);
+    expect(formatHumanGatedAgeingSections(withoutPayoff)).not.toContain("payoff");
+  });
+
+  it("degrades to the PEN-4489 cut on a queue where payoff separates nothing", () => {
+    // This is what licenses shipping globally on one queue's evidence: a queue
+    // payoff cannot read gets exactly today's digest, not a scrambled one.
+    const rows = [olderGatesNothing, youngerGatesSix];
+    const options = { now: NOW, escalateAfterDaysByPriority: flat(14), maxEscalated: 15 };
+
+    const allZero = selectAgedHumanGatedIssues(rows, {
+      ...options,
+      payoffByIssueId: new Map([
+        ["older-gates-nothing", 0],
+        ["younger-gates-six", 0],
+      ]),
+    });
+
+    expect(allZero.escalated.map((row) => row.id)).toEqual(
+      selectAgedHumanGatedIssues(rows, options).escalated.map((row) => row.id),
+    );
+    expect(allZero.payoffApplied).toBe(true);
+    expect(allZero.payoffPositiveOverThreshold).toBe(0);
+    expect(formatHumanGatedAgeingSections(allZero)).toContain(
+      "No past-threshold row is the sole remaining gate for any open row on this queue",
+    );
+  });
+});
+
+describe("truncation notice under payoff ordering (PEN-5114)", () => {
+  function rowsWithPayoff(): { rows: HumanGatedIssue[]; payoffByIssueId: Map<string, number> } {
+    const rows = [
+      issue({ id: "gates-six", priority: "high", lastHumanTouchAt: daysAgo(81) }),
+      issue({ id: "gates-two", priority: "high", lastHumanTouchAt: daysAgo(70) }),
+      issue({ id: "critical-gates-none", priority: "critical", lastHumanTouchAt: daysAgo(120) }),
+    ];
+    return {
+      rows,
+      payoffByIssueId: new Map([
+        ["gates-six", 6],
+        ["gates-two", 2],
+        ["critical-gates-none", 0],
+      ]),
+    };
+  }
+
+  it("names the payoff rule and drops the priority guarantee the new order cannot make", () => {
+    const { rows, payoffByIssueId } = rowsWithPayoff();
+    const report = selectAgedHumanGatedIssues(rows, {
+      now: NOW,
+      escalateAfterDaysByPriority: flat(14),
+      maxEscalated: 1,
+      payoffByIssueId,
+    });
+    const rendered = formatHumanGatedAgeingSections(report);
+
+    expect(rendered).toContain("The cut is by payoff first, then priority, then age");
+    // The old notice's closing guarantee is false under payoff ordering: a
+    // withheld `critical` row now ranks below a shown `high` row.
+    expect(rendered).not.toContain("equal or lower priority");
+    expect(rendered).toContain("A withheld row can therefore outrank a listed one on priority");
+  });
+
+  it("says what the withheld rows still gate, under the new meaning of withheld", () => {
+    const { rows, payoffByIssueId } = rowsWithPayoff();
+    const report = selectAgedHumanGatedIssues(rows, {
+      now: NOW,
+      escalateAfterDaysByPriority: flat(14),
+      maxEscalated: 1,
+      payoffByIssueId,
+    });
+
+    expect(report.escalated.map((row) => row.id)).toEqual(["gates-six"]);
+    expect(report.omittedPayoffPositiveCount).toBe(1);
+    expect(report.omittedSoleGateReach).toBe(2);
+
+    const rendered = formatHumanGatedAgeingSections(report);
+    // Still names the count and the priority breakdown (PEN-4489), and now
+    // also names what staying withheld costs.
+    expect(rendered).toContain("2 rows are withheld by the cap and not listed below");
+    expect(rendered).toContain("including critical 1, high 1");
+    expect(rendered).toContain(
+      "Of the 2 withheld, 1 is itself the sole remaining gate for 2 open rows",
+    );
+  });
+
+  it("says plainly when the cap withheld nothing that gates open work", () => {
+    const rows = [
+      issue({ id: "gates-six", priority: "high", lastHumanTouchAt: daysAgo(81) }),
+      issue({ id: "gates-none", priority: "high", lastHumanTouchAt: daysAgo(70) }),
+    ];
+    const report = selectAgedHumanGatedIssues(rows, {
+      now: NOW,
+      escalateAfterDaysByPriority: flat(14),
+      maxEscalated: 1,
+      payoffByIssueId: new Map([
+        ["gates-six", 6],
+        ["gates-none", 0],
+      ]),
+    });
+
+    expect(formatHumanGatedAgeingSections(report)).toContain(
+      "No withheld row is the sole remaining gate for any open row",
+    );
+  });
+
+  it("reports the threshold table as an eligibility floor rather than the selector", () => {
+    const { rows, payoffByIssueId } = rowsWithPayoff();
+    const report = selectAgedHumanGatedIssues(rows, {
+      now: NOW,
+      escalateAfterDaysByPriority: flat(14),
+      maxEscalated: 15,
+      payoffByIssueId,
+    });
+
+    expect(formatHumanGatedAgeingSections(report)).toContain(
+      "the thresholds above only decide eligibility",
+    );
   });
 });
