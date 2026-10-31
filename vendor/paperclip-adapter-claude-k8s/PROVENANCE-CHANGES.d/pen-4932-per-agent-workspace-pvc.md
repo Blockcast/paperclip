@@ -34,4 +34,20 @@ Scope is deliberately only the access mode. StorageClass and capacity are legiti
 
 Three tests: the refusal, a claim listing RWX among several modes (adopted), and a read with no modes to judge (adopted). Mutation-checked — removing the guard call turns exactly the refusal test red.
 
-Suite: 31 files / 1853 tests green, `tsc --noEmit` clean.
+## 3. Ally review follow-ups — all three suggestions taken
+
+**Files:** `src/server/workspace-pvc.ts`, `src/server/workspace-pvc.test.ts`
+
+Ally's review of `1a84d46` was 0 critical / 0 important / 3 suggestions, none blocking. All three are taken, and the third turned up a structural consequence worth recording.
+
+**(a) A stale doc comment that was a real inconsistency, flagged twice.** `EnsureAgentWorkspacePvcInput.capacity`'s JSDoc still said *"Defaults to `200Gi`"* after the constant moved to `50Gi` — the `## Capacity` block was rewritten but this second mention was not, and it survived a prior review pass. It now names the constant rather than restating its value, so the two cannot drift again.
+
+**(b) The claim name is sanitised but the `paperclip.io/agent-id` label carries the RAW id.** A non-label-safe id would therefore fail a 422 naming the *label* rather than the id that caused it. Sanitising the label was rejected: a sanitised label no longer identifies the agent it exists to identify. Instead `assertLabelSafeAgentId` validates the raw id against Kubernetes' label-value rules, called from `agentWorkspaceClaimName` so the name and the label are validated at one point and no caller can obtain a usable name for an id that will be rejected later.
+
+**(c) The 409-race loser skipped the RWX check the adopt path had just gained.** Ally raised this "for symmetry, not asking for a change", and it is taken: the loser is *adopting the winner's claim*, so it meets the same invariant. It now re-reads and validates. The exposure closed is narrow — only another run of this code can realistically win the race, and it creates RWX — but an invariant that holds on one of two adoption paths is the kind that quietly stops holding, and the cost is one extra read on an already-rare path. A claim that vanished between the 409 and the re-read is not treated as a violation; there is nothing to judge and the next run re-creates it.
+
+**The consequence worth recording: (b) made the emptiness backstop UNREACHABLE, and its test was asserting a path no input can reach.** `assertLabelSafeAgentId` requires the id to start with an alphanumeric, and an alphanumeric always survives the slug filter, so a label-safe id cannot slug to `""`. The existing test passed only because it asserted on the *message*, and after (b) it failed — which is how the shadowing surfaced. The check is kept, because it guards the slug derivation directly rather than by implication, so a later relaxation of the label rule cannot silently reproduce the bare `agent-workspace-` prefix. But it is now labelled unreachable in-code, explicitly, rather than left looking like live cover, and the test asserts the behaviour that actually occurs.
+
+Both new guards mutation-checked: dropping `assertLabelSafeAgentId` turns 2 tests red, dropping the 409 re-check turns 1 red.
+
+Suite: 31 files / 1856 tests green, `tsc --noEmit` clean.

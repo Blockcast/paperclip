@@ -77,11 +77,21 @@ export const DEFAULT_AGENT_WORKSPACE_STORAGE_CLASS = "cephfs";
  * admission error rather than as the bad id that caused it.
  */
 export function agentWorkspaceClaimName(agentId: string): string {
+  assertLabelSafeAgentId(agentId);
   const slug = agentId
     .toLowerCase()
     .replace(/[^a-z0-9-]/g, "")
     .replace(/^-+|-+$/g, "")
     .slice(0, 200);
+  // Backstop on the slug derivation itself. Currently UNREACHABLE, and said
+  // plainly rather than left to look like live cover: `assertLabelSafeAgentId`
+  // already requires the id to start with an alphanumeric, and an alphanumeric
+  // always survives the filter above, so a label-safe id cannot slug to "".
+  // Kept because it guards this derivation directly rather than by implication
+  // — a later change that relaxes the label rule must not silently produce the
+  // bare `agent-workspace-` prefix, which would be the same name for every
+  // such id and would hand two agents one claim. No test exercises it, because
+  // no input can reach it.
   if (!slug) {
     throw new Error(
       `cannot derive a workspace claim name from agent id ${JSON.stringify(agentId)}: ` +
@@ -91,12 +101,37 @@ export function agentWorkspaceClaimName(agentId: string): string {
   return `agent-workspace-${slug}`;
 }
 
+/**
+ * Refuse an agent id that cannot be carried as a label VALUE.
+ *
+ * The claim name is sanitised, but `paperclip.io/agent-id` deliberately holds
+ * the RAW id — a sanitised label would no longer identify the agent it is
+ * there to identify, which defeats the point of the label. So the raw id has
+ * to satisfy Kubernetes' label-value rules (<=63 chars, alphanumeric at both
+ * ends, `-_.` within) or the create fails a 422 that names the label rather
+ * than the id that caused it.
+ *
+ * Checked here, where the name is derived, so both the name and the label are
+ * validated at one point and a caller cannot get a usable name for an id that
+ * will be rejected later. UUID agent ids satisfy this comfortably; this is a
+ * backstop that reports the real cause, not an expected path.
+ */
+function assertLabelSafeAgentId(agentId: string): void {
+  if (agentId.length > 63 || !/^[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?$/.test(agentId)) {
+    throw new Error(
+      `agent id ${JSON.stringify(agentId)} cannot be used as the \`paperclip.io/agent-id\` label ` +
+        `value on its workspace claim: Kubernetes label values must be at most 63 characters and ` +
+        `start and end with an alphanumeric, with only '-', '_' and '.' between.`,
+    );
+  }
+}
+
 export interface EnsureAgentWorkspacePvcInput {
   agentId: string;
   namespace: string;
   /** StorageClass name. Defaults to `cephfs`. */
   storageClass?: string;
-  /** Capacity request. Defaults to `200Gi`. */
+  /** Capacity request. Defaults to `DEFAULT_AGENT_WORKSPACE_CAPACITY` (`50Gi`). */
   capacity?: string;
   kubeconfigPath?: string;
 }
@@ -185,8 +220,19 @@ export async function ensureAgentWorkspacePvc(
     await createPvc(namespace, body, kubeconfigPath);
   } catch (err) {
     // A concurrent run of this same agent won the race. That is the object we
-    // wanted, under a name that encodes the agent id, so this is success.
+    // wanted, under a name that encodes the agent id, so this is success —
+    // but it is still an ADOPTION, so it meets the same invariant the
+    // get-then-adopt path above does. Only another run of this code can
+    // realistically win that race, and it creates RWX, so this re-read is
+    // closing a sub-second window rather than a likely case. It is here
+    // because an invariant that holds on one of two adoption paths is the
+    // kind that quietly stops holding: the cost is one extra read on a path
+    // that is already rare.
     if (!isAlreadyExists(err)) throw err;
+    const winner = await getPvc(namespace, pvcName, kubeconfigPath);
+    // A claim that vanished between the 409 and this read is not a violation
+    // to assert on — there is nothing to judge, and the next run re-creates it.
+    if (winner) assertExistingClaimIsShareable(pvcName, namespace, winner);
   }
 
   return pvcName;
