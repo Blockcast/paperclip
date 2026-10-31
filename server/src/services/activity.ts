@@ -383,6 +383,15 @@ export function activityService(db: Db) {
         .then((rows) => rows.map((r) => r.activityLog));
     },
 
+    /**
+     * Unlimited, newest-first activity for one issue.
+     *
+     * Comment coverage here is partial by construction — system-authored
+     * comments never produce an `issue.comment_added` row and unkeyed route
+     * comments can lose theirs. See the route docblock in
+     * `routes/activity.ts` and `docs/api/activity.md` (PEN-5158) before
+     * treating an absence as evidence.
+     */
     forIssue: (issueId: string) =>
       db
         .select()

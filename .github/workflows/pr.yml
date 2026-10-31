@@ -295,6 +295,17 @@ jobs:
         run: node --test ./scripts/check-db-transaction-alias.test.mjs
         timeout-minutes: 1
 
+      - name: Test issue-activity comment-coverage probe (PEN-5158)
+        # The probe reports how much of the comment stream the issue activity
+        # log actually records. Its load-bearing property is that it CANNOT
+        # answer "clean" when it had nothing to measure: the failure it tracks
+        # only ever presents as an absence, so an empty sample scored as a pass
+        # would be indistinguishable from the probe not running. These tests pin
+        # that, plus the two documented contract violations it must still catch.
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/check-issue-activity-comment-coverage.test.mjs
+        timeout-minutes: 1
+
       - name: Test heap-snapshot analysis redaction (PEN-3631)
         # tools/heap-analysis/ reads a file that holds the worker's secrets in
         # plaintext, and its summariser once wrote them straight back out: the

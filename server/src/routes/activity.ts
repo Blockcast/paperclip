@@ -180,6 +180,31 @@ export function activityRoutes(db: Db) {
     res.status(201).json(event);
   });
 
+  /**
+   * Every activity_log row for one issue, newest first, with no limit — so a
+   * missing row is a missing write, never a truncated read.
+   *
+   * ⚠ This is NOT a complete record of the issue's comments, and callers
+   * routinely misread it as one (PEN-5158). `issue.comment_added` is written by
+   * the HTTP comment handlers in `routes/issues.ts`, never by
+   * `issues.addComment()`, so coverage depends on how a comment was created:
+   *
+   *   - `authorType: "system"` comments (reconcilers, sweeps, watchdogs,
+   *     webhook handlers) call the service directly and never reach a route, so
+   *     they NEVER appear here. Measured 413/413 absent across 115 issues on
+   *     2026-10-31, including 280 that carried an idempotencyKey. This is
+   *     deliberate: the action is consumed as a wake trigger by
+   *     `issue-rewake-throttle.ts` and as a board toast by the UI, so emitting
+   *     it for routine system chatter would wake agents and toast operators.
+   *   - agent/user comments submitted WITHOUT an idempotencyKey write the
+   *     activity row as a non-atomic follow-up to an already-committed insert,
+   *     so an interrupted request loses it permanently (~2.4% background rate).
+   *     Keyed comments go through the durable effect ledger and cannot.
+   *
+   * The positive direction is reliable; the negative direction carries no
+   * information. To enumerate comments use `GET /api/issues/:id/comments`.
+   * `scripts/check-issue-activity-comment-coverage.mjs` measures the split.
+   */
   router.get("/issues/:id/activity", async (req, res) => {
     const rawId = req.params.id as string;
     const issue = await getAccessibleResource(req, res, resolveIssueByRef(rawId), "Issue not found");
