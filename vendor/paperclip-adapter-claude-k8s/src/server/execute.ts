@@ -2965,7 +2965,20 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // Returns "" for every agent not opted in, and then this whole block is a
   // single boolean test — no API call, no behaviour change.
   const agentWorkspaceClaim = resolveAgentWorkspaceClaimName({ config, agentId });
-  if (agentWorkspaceClaim) {
+  // The claim this Job will ACTUALLY mount, by the builder's own precedence.
+  // Resolved once here and reused by the prompt-bundle delivery decision below,
+  // which asks a different question about the same fact.
+  const resolvedDataClaim = resolveDataClaimName({
+    workspaceVolumeClaim: config.workspaceVolumeClaim,
+    agentWorkspaceClaimName: agentWorkspaceClaim,
+    selfPodPvcClaimName: selfPod.pvcClaimName,
+  });
+  // Gated on the per-agent claim being the one that WINS, not merely on the
+  // agent being opted in. An operator `workspaceVolumeClaim` outranks it, and
+  // for an agent carrying both, provisioning anyway would create and re-read a
+  // PVC no Job ever mounts — and, worse, a transient API error on that unused
+  // claim would fail the run. (Ally, #3172.)
+  if (agentWorkspaceClaim && resolvedDataClaim === agentWorkspaceClaim) {
     try {
       // Storage class and capacity are deliberately NOT exposed as config
       // keys. `ensureAgentWorkspacePvc` accepts both, and the defaults it
@@ -3166,11 +3179,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const promptBundleNeedsSecretDelivery =
     promptBundle !== null &&
     !serverHoldsJobDataClaim({
-      dataClaimName: resolveDataClaimName({
-        workspaceVolumeClaim: config.workspaceVolumeClaim,
-        agentWorkspaceClaimName: agentWorkspaceClaim,
-        selfPodPvcClaimName: selfPod.pvcClaimName,
-      }),
+      dataClaimName: resolvedDataClaim,
       selfPodPvcClaimName: selfPod.pvcClaimName,
     });
   if (promptBundleNeedsSecretDelivery) {

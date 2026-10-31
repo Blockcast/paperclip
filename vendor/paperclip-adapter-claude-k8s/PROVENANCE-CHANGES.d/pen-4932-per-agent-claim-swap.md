@@ -61,6 +61,17 @@ Agent scope — where the rollout happens — is unaffected. No `config-schema.t
 see the blocker below. An operator-visible switch for a path known to fail every run is a trap, and
 it goes in when that blocker closes.
 
+## Provisioning is gated on the per-agent claim WINNING, not on the opt-in
+
+Raised by Ally on #3172. `resolveDataClaimName` puts an operator
+`workspaceVolumeClaim` above the per-agent claim, so an agent carrying both is
+opted in to a claim its Job never mounts. Provisioning on the opt-in alone would
+create and re-read that PVC on every run, and a transient API error on it would
+fail the run for a volume nothing uses. The guard is
+`agentWorkspaceClaim && resolvedDataClaim === agentWorkspaceClaim`, and
+`resolvedDataClaim` is then reused by the prompt-bundle delivery decision below
+rather than resolved a second time.
+
 ## Fail closed, never fall back
 
 A provisioning failure fails the run with `k8s_agent_workspace_pvc_failed` and creates no Job.

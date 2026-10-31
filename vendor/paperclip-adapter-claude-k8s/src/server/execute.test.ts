@@ -815,6 +815,23 @@ describe("execute: per-agent workspace claim", () => {
     expect(createdDataClaim()).toBe("agent-workspace-agent-abc");
   });
 
+  it("provisions NOTHING when an operator claim outranks the per-agent one", async () => {
+    // `resolveDataClaimName` puts `workspaceVolumeClaim` above the per-agent
+    // claim, so for an agent carrying both, the per-agent PVC is never mounted.
+    // Creating and re-reading it every run would be waste — and a transient API
+    // error on that unused claim would fail the run for a volume the Job does
+    // not use. (Ally, #3172.)
+    await execute(
+      makeCtx({
+        config: { enablePerAgentWorkspaceVolume: true, workspaceVolumeClaim: "operator-claim" },
+      } as Partial<AdapterExecutionContext>),
+    );
+
+    expect(mockGetPvc).not.toHaveBeenCalled();
+    expect(mockCreatePvc).not.toHaveBeenCalled();
+    expect(createdDataClaim()).toBe("operator-claim");
+  });
+
   it("fails the run and creates NO Job when the claim cannot be provisioned", async () => {
     // Fail closed. The alternative — falling back to the shared claim — would
     // quietly restore the node-wide blast radius on exactly the runs where
