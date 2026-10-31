@@ -112,10 +112,21 @@ to. It was accepted deliberately, with a ceiling:
 
 So the question this alert asks you is *"does that claim have an owner?"*, not *"what broke?"*.
 The two remedies are in § "What you can actually do about it today" above and neither needs the
-reclaimer; what that section does not say is what each one does to **this gauge**. Opting the agent
-back out returns it to `0` on the next sweep, because the trees are reachable again. Expanding the
-claim leaves it `> 0` forever — the growth rate is unchanged and the population is unchanged, so
-expansion buys months, not a clear.
+reclaimer; what that section does not say is what each one does to **this gauge**, and the answer is
+not what it looks like.
+
+⚠ **Opting the agent back out returns the gauge to `0` on the next sweep, and that is NOT the
+problem being solved.** The count is derived from configuration — the arm counts agents whose
+`workspaceVolumeClaim` resolves away from this volume — so it drops because the agent stops counting
+as opted in, **not** because anything became reachable. The bytes it already wrote to its own claim
+stay exactly where they were (`:82` above says so), still unreclaimed, and now **uncounted as
+well**. Opting out therefore silences the standing record while making the stranded bytes harder to
+find, not smaller. If you opt an agent out to clear this alert, write down the claim you left
+behind.
+
+**Expanding the claim** leaves the gauge `> 0` forever — the growth rate is unchanged and the
+population is unchanged — so expansion buys months, not a clear. Between the two, it is the honest
+one: the alert keeps pointing at a real unreclaimed tree.
 
 **Do not silence it to make the page quiet.** The reason this gauge exists is that the previous
 state of the world was silence: the tree grew 0 → 406.7 GiB with nothing reporting it, and a sweep

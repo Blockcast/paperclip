@@ -868,8 +868,12 @@ export function resolveSeedShape(input: {
  * that alert as informational while PEN-5151 is open** — it is the standing
  * record that an unreclaimed tree exists, so opt an agent in only together with
  * an owner for its claim's capacity. The cheapest remedy is to opt the agent
- * back out: its runs return to the shared claim, where the existing reaper
- * reaches them with its predicate unchanged.
+ * back out: its FUTURE runs return to the shared claim, where the existing
+ * reaper reaches them with its predicate unchanged. ⚠️ It does NOT reclaim
+ * anything already written — those bytes stay on the agent's claim, and because
+ * the gauge counts opted-in agents rather than bytes, opting out drops the
+ * count to zero and leaves them stranded AND uncounted. Opting out is a way to
+ * stop the growth, never a way to undo it.
  *
  * ⚠️ That alert is NOT deployed on Blockcast yet: `values.blockcast.yaml` sets
  * `prometheusRule.enabled: false`, and the mirror that deploys it,
