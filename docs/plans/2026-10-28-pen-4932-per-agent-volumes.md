@@ -431,7 +431,7 @@ PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verificati
      calls `ensureAgentWorkspacePvc` (#3168) from the same derivation before building the Job,
      and fails the run `k8s_agent_workspace_pvc_failed` rather than falling back to the shared
      claim. The four invariants 4a enumerated are all closed, which is what makes this a claim
-     change and nothing else — but see the ⛔ below for the fifth.
+     change and nothing else — as is the fifth, found while writing this swap; see below.
 
      **Why a gate rather than a flip, stated as the trade it is.** A per-agent claim is a FRESH,
      EMPTY volume. §5 already accepts the standing cost — a first-run cold `pnpm` install per
@@ -483,7 +483,7 @@ PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verificati
      through `readNamespacedPodLog` (follow) instead of by tailing a path. That
      is its own change — it replaces the offset-tracking tail with a stream that
      has its own failure modes (the kubelet's 10 Mi rotation, API disconnects,
-     the FAR-10 hang the adapter's own mocks were built for) — and it is the
+     the FAR-10 hang the adapter's own mocks were built for) — and it was the
      remaining blocker on enablement, not something to bolt onto the swap.
 
      **Status 2026-10-31 — BOTH HALVES HAVE LANDED. The code path is complete;
@@ -673,8 +673,9 @@ PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verificati
 
      **The invariants 4a hands to 4b.** All of them are inert on the self claim and become live
      the moment the claim is per-agent, so none of them can be caught by the fleet exercise 4a
-     relies on. Four were enumerated here and all four are now closed; a **fifth** was found
-     2026-10-31 while writing the swap and is OPEN — see the ⛔ above. That it was found this
+     relies on. Four were enumerated here; a **fifth** was found 2026-10-31 while writing the
+     swap, and all five are now closed on `master` — the fifth by #3173 / #3174, recorded
+     above and in §5's table, and closed is not verified. That the fifth was found this
      late is the point worth keeping: the four were derived from the `subPath` mount list and
      from what the server WRITES, and the fifth is a path the pod writes and the server READS,
      which that inventory had no way of surfacing. Anything else crossing the volume in the
