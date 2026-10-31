@@ -395,6 +395,33 @@ describe("mergeModelProfileAdapterConfig agent-scope-only top-level config bound
     expect(absent).not.toHaveProperty("enableGitHubPublishBroker");
   });
 
+  // PEN-4932 stage 4b. Same boundary, different key and a different hazard: the
+  // per-agent workspace volume gate decides which VOLUME the Job mounts, and
+  // turning it on is destructive to a run that was not expecting it — a fresh,
+  // empty claim with no checkout, no worktrees and no pnpm store, which an
+  // agent would then work in as though nothing had happened.
+  it("does not let an issue adapter override move a run onto a per-agent workspace volume", () => {
+    const merged = mergeModelProfileAdapterConfig({
+      baseConfig: { model: "primary" },
+      modelProfile: { ...noProfile },
+      issueAdapterConfig: { enablePerAgentWorkspaceVolume: true },
+    });
+
+    expect(merged).not.toHaveProperty("enablePerAgentWorkspaceVolume");
+  });
+
+  // ...and the other direction, which is the one that puts the broader-
+  // privileged uid-0 seeder shape back into an opted-in agent's pod.
+  it("does not let an issue adapter override opt a run back onto the shared claim", () => {
+    const merged = mergeModelProfileAdapterConfig({
+      baseConfig: { enablePerAgentWorkspaceVolume: true },
+      modelProfile: { ...noProfile },
+      issueAdapterConfig: { enablePerAgentWorkspaceVolume: false },
+    });
+
+    expect(merged.enablePerAgentWorkspaceVolume).toBe(true);
+  });
+
   // Scoped, not blanket. `assigneeAdapterOverrides.adapterConfig` is
   // load-bearing for model selection and workspace strategy, and this row is
   // not a refactor of that surface.

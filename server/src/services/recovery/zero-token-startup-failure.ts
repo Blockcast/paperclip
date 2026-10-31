@@ -200,6 +200,21 @@ export const ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES = new Set([
   "skill_materialization_pending",
   "external_lifecycle_stale_killed",
   "k8s_concurrency_guard_unreachable",
+  // PEN-4932 stage 4b. The per-agent workspace claim could not be read or
+  // created. Enrolled by MIRRORING the sibling directly above rather than by
+  // re-deriving a class, because it is raised from the same position by the
+  // same argument: a fail-closed refusal BEFORE `buildJobManifest`, so no Job,
+  // no Secret, no CLI spawn, and the assignee had no part in it. Both of the
+  // sibling's two enrolment sites get it (here, and the retry-arm literal in
+  // heartbeat.ts); the sibling is NOT in
+  // TRANSIENT_INFRA_CONTINUATION_ERROR_CODES, so neither is this.
+  //
+  // Unreachable in production today — the gate that produces it defaults off
+  // and nothing has opted in — which is exactly why it is enrolled NOW. An
+  // un-enrolled code that only becomes reachable later is the #1669 shape: the
+  // gates stay mutually consistent and green while production emits a code none
+  // of them admits.
+  "k8s_agent_workspace_pvc_failed",
   // BLO-27463: provider capacity throttling. Both codes carry errorFamily
   // `rate_limit_exhausted` (see heartbeat.ts `readHeartbeatRunErrorFamily`) — the
   // provider refused to serve, which is infra-class by exactly the BLO-20933

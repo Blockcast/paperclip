@@ -55,6 +55,18 @@ function ownerRefPatchCalls(): [{ name: string; body: unknown[] }, { middleware:
 }
 const mockCoreDeleteSecret = vi.fn();
 const mockCoreListSecrets = vi.fn();
+// PEN-4932 stage 4b — the per-agent workspace claim. Only reached when a run is
+// opted in; every other test here leaves them untouched, which is itself the
+// assertion that the gate is off by default.
+//
+// Replaced at the `getPvc`/`createPvc` level rather than at `getCoreApi`.
+// `workspace-pvc.ts` imports those two from this module, and they close over
+// k8s-client's own module-scope `getCoreApi` — so overriding the EXPORTED
+// `getCoreApi` leaves them talking to the real cluster. Measured: the first
+// draft of these tests issued a live `readNamespacedPersistentVolumeClaim` and
+// failed on the cluster's 403.
+const mockGetPvc = vi.fn();
+const mockCreatePvc = vi.fn();
 // vi.hoisted ensures a single vi.fn() instance shared between the mock factory
 // (which runs at hoist time) and the test body (which calls mockResolvedValue).
 // A plain const would be re-assigned at its original position, leaving the
@@ -93,6 +105,8 @@ vi.mock("./k8s-client.js", async (importOriginal) => {
     }),
     getAuthzApi: () => ({}),
     getSelfPodInfo: mockGetSelfPodInfo,
+    getPvc: mockGetPvc,
+    createPvc: mockCreatePvc,
     resetCache: vi.fn(),
   });
 });
@@ -727,6 +741,106 @@ describe("execute: process signal handlers (BLO-49139)", () => {
     const source = await readFile(new URL("./execute.ts", import.meta.url), "utf-8");
     expect(source).not.toMatch(/process\.(on|once|addListener|prependListener|prependOnceListener)\(\s*["'`]SIG/);
     expect(source).not.toMatch(/process\.kill\(\s*process\.pid/);
+  });
+});
+
+// ─── execute: per-agent workspace claim (PEN-4932 stage 4b) ──────────────────
+
+describe("execute: per-agent workspace claim", () => {
+  let mkdirSpy: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => {
+    mkdirSpy = vi.spyOn(fsPromises, "mkdir").mockResolvedValue(undefined);
+    vi.clearAllMocks();
+    vi.unstubAllGlobals();
+    process.env.PAPERCLIP_API_URL = "https://paperclip.test";
+    mockReadSkillEntries.mockResolvedValue([]);
+    mockGetSelfPodInfo.mockResolvedValue(makeSelfPodResult());
+    mockPrepareBundle.mockResolvedValue(makeBundle());
+    mockBatchListJobs.mockResolvedValue({ items: [] });
+    // Stop the run at Job creation: everything this suite asserts has already
+    // happened by then, and the manifest is readable off the rejected call.
+    mockBatchCreateJob.mockRejectedValue(new Error("create reached"));
+  });
+
+  afterEach(() => {
+    mkdirSpy.mockRestore();
+    vi.unstubAllGlobals();
+    delete process.env.PAPERCLIP_API_URL;
+  });
+
+  /** The `data` volume of the Job this run tried to create. */
+  function createdDataClaim(): string | undefined {
+    const body = mockBatchCreateJob.mock.calls[0]?.[0]?.body;
+    return body?.spec?.template?.spec?.volumes?.find((v: { name: string }) => v.name === "data")
+      ?.persistentVolumeClaim?.claimName;
+  }
+
+  it("NEGATIVE CONTROL: touches no PVC API and mounts the shared claim when not opted in", async () => {
+    // This is the whole fleet today. The gate defaults off, so the PVC calls are
+    // not merely unused — they are never reached.
+    const result = await execute(makeCtx());
+    expect(result.errorCode).toBe("k8s_job_create_failed");
+    expect(mockGetPvc).not.toHaveBeenCalled();
+    expect(mockCreatePvc).not.toHaveBeenCalled();
+    expect(createdDataClaim()).toBe("paperclip-data");
+  });
+
+  it("provisions this agent's claim and mounts THAT claim on the Job", async () => {
+    // The join the swap is: the claim the server creates and the claim the Job
+    // mounts have to be one object. Asserted as an equality between the two
+    // observed names rather than against a literal, so a drift between the
+    // provisioner's derivation and the builder's cannot pass.
+    mockGetPvc.mockResolvedValue(null);
+    mockCreatePvc.mockResolvedValue({});
+
+    const result = await execute(makeCtx({ config: { enablePerAgentWorkspaceVolume: true } } as Partial<AdapterExecutionContext>));
+
+    expect(result.errorCode).toBe("k8s_job_create_failed");
+    const [createdNamespace, createdBody] = mockCreatePvc.mock.calls[0] ?? [];
+    expect(createdNamespace).toBe("paperclip");
+    expect(createdBody?.metadata?.name).toBe("agent-workspace-agent-abc");
+    // RWX, not RWO — an agent's concurrent run pods land on different nodes.
+    expect(createdBody?.spec?.accessModes).toEqual(["ReadWriteMany"]);
+    expect(createdBody?.metadata?.labels?.["paperclip.io/agent-id"]).toBe("agent-abc");
+    expect(createdDataClaim()).toBe(createdBody?.metadata?.name);
+    expect(createdDataClaim()).not.toBe("paperclip-data");
+  });
+
+  it("adopts an existing claim without creating a second one", async () => {
+    mockGetPvc.mockResolvedValue({ spec: { accessModes: ["ReadWriteMany"] } });
+
+    await execute(makeCtx({ config: { enablePerAgentWorkspaceVolume: true } } as Partial<AdapterExecutionContext>));
+
+    expect(mockCreatePvc).not.toHaveBeenCalled();
+    expect(createdDataClaim()).toBe("agent-workspace-agent-abc");
+  });
+
+  it("fails the run and creates NO Job when the claim cannot be provisioned", async () => {
+    // Fail closed. The alternative — falling back to the shared claim — would
+    // quietly restore the node-wide blast radius on exactly the runs where
+    // something is already wrong, and would deliver the prompt bundle for the
+    // wrong claim shape.
+    mockGetPvc.mockRejectedValue(new Error("HTTP-Code: 500 Message: Internal Server Error"));
+
+    const result = await execute(makeCtx({ config: { enablePerAgentWorkspaceVolume: true } } as Partial<AdapterExecutionContext>));
+
+    expect(result.errorCode).toBe("k8s_agent_workspace_pvc_failed");
+    expect(result.errorMessage).toContain("agent-workspace-agent-abc");
+    expect(mockBatchCreateJob).not.toHaveBeenCalled();
+  });
+
+  it("refuses to adopt a claim that is not ReadWriteMany", async () => {
+    // RWO on a claim several concurrent pods mount is `Multi-Attach`, which
+    // wedges every concurrent run of this agent — worse than the blast radius
+    // being fixed. `accessModes` is immutable on a bound PVC, so this is not
+    // repairable under a run.
+    mockGetPvc.mockResolvedValue({ spec: { accessModes: ["ReadWriteOnce"] } });
+
+    const result = await execute(makeCtx({ config: { enablePerAgentWorkspaceVolume: true } } as Partial<AdapterExecutionContext>));
+
+    expect(result.errorCode).toBe("k8s_agent_workspace_pvc_failed");
+    expect(result.errorMessage).toContain("ReadWriteMany");
+    expect(mockBatchCreateJob).not.toHaveBeenCalled();
   });
 });
 

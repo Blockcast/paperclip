@@ -25,6 +25,7 @@ import {
   SHARED_DOC_SECRET_VOLUME_NAME,
 } from "./shared-doc-overlay.js";
 import { SELF_POD_DATA_MOUNT_PATH } from "./k8s-client.js";
+import { agentWorkspaceClaimName } from "./workspace-pvc.js";
 import type { PromptBundleSecretProjection } from "./prompt-bundle-projection.js";
 import {
   PROMPT_BUNDLE_SECRET_MOUNT_PATH,
@@ -796,9 +797,92 @@ export function resolveSeedShape(input: {
 }
 
 /**
+ * Is this run opted in to a per-agent workspace volume, and if so, what is its
+ * claim called?
+ *
+ * PEN-4932 stage 4b's gate. Returns `""` when the flag is off, which is what
+ * keeps the whole feature a no-op for every agent that has not opted in —
+ * `resolveDataClaimName` then falls through to the server's claim exactly as
+ * before.
+ *
+ * ⛔ **DO NOT ENABLE THIS YET — invariant 5 is open and enabling it today
+ * breaks every run of the opted-in agent.** The pod log is the pod→server half
+ * of the same "one volume, TWO mount points" assumption invariant 1 closed in
+ * the server→pod direction, and nothing has closed it. `buildPodLogPath`
+ * returns TWO addresses for one file: the container writes `containerLogPath`
+ * (rooted at `dataMountPath`), and `execute.ts` TAILS `podLogPath` (rooted at
+ * `SELF_POD_DATA_MOUNT_PATH`) to collect the run's entire stdout. On a
+ * per-agent claim those are different VOLUMES, so `tailPodLogFile` waits 30 s,
+ * throws *"Pod log file never appeared"*, and `stdout` is `""` — the run has no
+ * output to parse. The on-disk re-read immediately below it reads the same
+ * unreachable path, and `readPodContainerLogTail` is not a fallback: it is a
+ * 120-line diagnostic, and the container's own stdout carries no NDJSON anyway
+ * (the pipeline ends `| tee <file> | <failFastFilter> > /dev/null`).
+ *
+ * The gate exists so the swap can land reviewed and inert, exactly as
+ * #3153/#3157/#3158 did for the delivery channel. It is deliberately NOT
+ * surfaced in `config-schema.ts`: an operator-visible toggle for a path known
+ * to fail every run is a trap, and it goes in when invariant 5 closes. See
+ * `docs/plans/2026-10-28-pen-4932-per-agent-volumes.md` §4 stage 4b.
+ *
+ * **Default OFF, and it is a ROLLOUT gate rather than a kill switch**, on the
+ * `enableGitHubPublishBroker` precedent above. A per-agent claim is a FRESH,
+ * EMPTY volume: the agent's project checkout, worktrees, pnpm store and
+ * session state all live on the shared claim and do not travel. The plan
+ * accepts that cost (§5 — "a first-run cold `pnpm` install per agent, and
+ * worktrees created by one agent no longer visible to another of the same
+ * company"), but accepting it one agent at a time is not the same act as
+ * accepting it for the whole fleet in one roll, where it would also strand
+ * whatever uncommitted work sits in `wt/<companyId>` at that moment. So the
+ * flip is per agent, through `adapter_config`, and the fleet-wide default is a
+ * later deliberate change rather than a side effect of this one.
+ *
+ * Read from the MERGED run config, but the key is **pinned to agent
+ * provenance** by `AGENT_SCOPE_ONLY_CONFIG_KEYS` in the Paperclip server's
+ * heartbeat merge, so an issue-scope `assigneeAdapterOverrides.adapterConfig`
+ * carrying it is discarded and logged rather than honoured. Both directions
+ * matter and neither is theoretical: turning it ON for an agent that does not
+ * run it moves that run onto a fresh, EMPTY volume — a destructive act anyone
+ * able to assign an issue could perform once per issue, after which the run
+ * completes "successfully" having thrown away its workspace — and turning it
+ * OFF for an agent that does puts the broader-privileged single uid-0 seeder
+ * shape back into the pod (`selectSeedShape`).
+ *
+ * That pin is the enforcement point and it does not live here. This function
+ * reads whatever the merge produced; do not read the absence of a check here
+ * as the absence of the boundary, and do not add a second one — a refusal in
+ * the builder would convert a discarded overlay into a per-issue denial of
+ * service, which is the trade PEN-5017 explicitly declines.
+ */
+export function resolveAgentWorkspaceClaimName(input: {
+  config: unknown;
+  agentId: string | null | undefined;
+}): string {
+  const config = parseObject(input.config);
+  if (!asBoolean(config.enablePerAgentWorkspaceVolume, false)) return "";
+  const agentId = (input.agentId ?? "").trim();
+  // No id, no per-agent claim. Falling back to the shared claim is the right
+  // failure here: the gate asks for "this agent's volume" and there is no
+  // agent to key one to, so there is nothing to provision and nothing to name.
+  if (!agentId) return "";
+  // Throws on an id that cannot be carried as the `paperclip.io/agent-id` label
+  // value. Deliberately NOT caught: this is only reachable once an operator has
+  // opted the agent in, and silently serving the shared claim instead would
+  // make the opt-in look applied while the Job mounted the very volume the
+  // opt-in exists to leave.
+  return agentWorkspaceClaimName(agentId);
+}
+
+/**
  * The claim the Job's `data` volume will mount, by the same precedence
  * `buildJobManifest` applies: an operator/environment-supplied
- * `workspaceVolumeClaim` wins, else the server's own PVC, else none.
+ * `workspaceVolumeClaim` wins, else this agent's own per-agent claim (PEN-4932
+ * stage 4b, absent unless opted in), else the server's own PVC, else none.
+ *
+ * `workspaceVolumeClaim` stays on top because it is an explicit instruction
+ * about *which volume this Job mounts*, and the per-agent claim is a default.
+ * An operator who names a claim has already answered the question this gate
+ * asks.
  *
  * Exported because `execute.ts` has to answer one question BEFORE it can call
  * `buildJobManifest` — whether the prompt bundle has to travel by Secret — and
@@ -806,12 +890,21 @@ export function resolveSeedShape(input: {
  * second copy of a rule that is load-bearing for the agent's instructions
  * arriving at all, and the two could drift silently in the permissive
  * direction (execute.ts deciding the server's write is visible when it is not).
+ * That now covers the per-agent slot too: `execute.ts` must PROVISION the very
+ * claim this resolves, so a third derivation of the name would be a Job
+ * mounting a claim nothing created.
  */
 export function resolveDataClaimName(input: {
   workspaceVolumeClaim: unknown;
+  agentWorkspaceClaimName?: string | null;
   selfPodPvcClaimName: string | null | undefined;
 }): string {
-  return asString(input.workspaceVolumeClaim, "").trim() || (input.selfPodPvcClaimName ?? "") || "";
+  return (
+    asString(input.workspaceVolumeClaim, "").trim() ||
+    (input.agentWorkspaceClaimName ?? "").trim() ||
+    (input.selfPodPvcClaimName ?? "") ||
+    ""
+  );
 }
 
 /**
@@ -3348,8 +3441,18 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // selfPod-derived PVC and the conventional /paperclip mount path.
   // `effectiveConfig` (built in execute.ts) lands these env-supplied
   // values into `config.workspaceVolumeClaim` / `config.workspaceMountPath`.
+  //
+  // PEN-4932 stage 4b adds one slot between those two: this agent's own claim,
+  // when the agent is opted in. `execute.ts` provisions it from the SAME pure
+  // derivation before calling this builder, which is the only thing keeping the
+  // Job from mounting a claim nothing created.
+  const agentWorkspaceClaim = resolveAgentWorkspaceClaimName({
+    config: rawConfig,
+    agentId: agent?.id,
+  });
   const dataClaimName = resolveDataClaimName({
     workspaceVolumeClaim: config.workspaceVolumeClaim,
+    agentWorkspaceClaimName: agentWorkspaceClaim,
     selfPodPvcClaimName: selfPod.pvcClaimName,
   });
   const dataMountPath = resolveDataMountPath(config);

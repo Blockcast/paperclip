@@ -425,9 +425,85 @@ PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verificati
      is an `existingClaim` managed out of onprem-k8s, so per-agent claims cannot be templated into
      the chart.
 
-     **Four invariants 4a hands to 4b.** All four are inert on the self claim and become live
+     **Status 2026-10-31: the swap is WRITTEN and lands behind a default-off per-agent gate.**
+     `resolveAgentWorkspaceClaimName` (gate + name in one function) sits between the operator
+     `workspaceVolumeClaim` and the server's own PVC in `resolveDataClaimName`; `execute.ts`
+     calls `ensureAgentWorkspacePvc` (#3168) from the same derivation before building the Job,
+     and fails the run `k8s_agent_workspace_pvc_failed` rather than falling back to the shared
+     claim. The four invariants 4a enumerated are all closed, which is what makes this a claim
+     change and nothing else — but see the ⛔ below for the fifth.
+
+     **Why a gate rather than a flip, stated as the trade it is.** A per-agent claim is a FRESH,
+     EMPTY volume. §5 already accepts the standing cost — a first-run cold `pnpm` install per
+     agent, worktrees no longer shared within a company — but a fleet-wide flip pays a cost §5
+     does not name: whatever **uncommitted work** sits in `wt/<companyId>` at the moment of the
+     roll stops being visible to the agent that wrote it. Per-agent opt-in through
+     `adapter_config` pays that once per agent, at a time someone chose, and gives a rollback
+     that needs no code roll. The fleet-wide default is a later deliberate change.
+
+     ⛔ **AND IT MUST NOT BE ENABLED YET. Invariant 5, found 2026-10-31 while
+     writing the swap, is open, and enabling the gate today breaks EVERY run of
+     the opted-in agent.** Invariant 1 inventoried the trees the SERVER WRITES
+     for the pod. The pod log is the same assumption in the other direction —
+     the pod WRITES and the server READS — and nothing covered it.
+
+     `buildPodLogPath` (`job-manifest.ts`) deliberately returns **two addresses
+     for one file**, under a comment that states it: *"ONE log file, TWO
+     absolute paths, because the server and the agent pod mount the same volume
+     at different roots."* The container writes `containerLogPath`, rooted at
+     `dataMountPath`; `execute.ts` **tails `podLogPath`**, rooted at
+     `SELF_POD_DATA_MOUNT_PATH`, and that tail is how the run's ENTIRE stdout is
+     collected. The two are byte-identical strings on the default mount and
+     different VOLUMES the moment the claim is per-agent. `tailPodLogFile` then
+     waits 30 s, throws *"Pod log file never appeared at …"*, `Promise.allSettled`
+     turns that into `stdout = ""`, and the result parser has nothing to read.
+
+     Three things that look like fallbacks and are not, each checked in source:
+
+     - the belt-and-braces on-disk re-read immediately after the tail reads the
+       **same** `podLogPath`;
+     - `readPodContainerLogTail` is a 120-line **diagnostic** for error
+       messages, not a stdout source;
+     - the container's own stdout carries no NDJSON to read through the
+       Kubernetes log API anyway — the pipeline ends
+       `| tee <containerLogPath> | <failFastFilter> > /dev/null`.
+
+     **The obvious fix is refused for the same reason §2 refuses the tooling
+     row.** Keeping `run-logs` as a `subPath` of the SERVER'S claim beside the
+     per-agent one leaves one bind on the shared handle, and the ceph-csi lock
+     keys on the handle — so it would pay the whole cost of the swap and buy
+     zero blast-radius reduction. The candidate that does not do that is to stop
+     making the log a *shared-volume* artifact: `tee` the redacted NDJSON to the
+     container's stdout as well as to the file, and have the server consume it
+     through `readNamespacedPodLog` (follow) instead of by tailing a path. That
+     is its own change — it replaces the offset-tracking tail with a stream that
+     has its own failure modes (the kubelet's 10 Mi rotation, API disconnects,
+     the FAR-10 hang the adapter's own mocks were built for) — and it is the
+     remaining blocker on enablement, not something to bolt onto the swap.
+
+     Noted but NOT invariant 5: the isolation-workspace reaper
+     (`server/src/services/isolation-workspace-reaper.ts`) walks
+     `k8s-isolation/workspaces/*` through the SERVER's mount, so it goes blind
+     to an opted-in agent's tree. That tree grew 0 → 406.7 GiB fleet-wide
+     between July and 2026-09-02 with no reaper at all, so ≈10 GiB/agent/month
+     against a 50 Gi claim already carrying ≈13.2 G of duplicated company trees
+     is roughly a quarter's runway, and `allowVolumeExpansion` is true. Real,
+     bounded, and not a correctness failure — unlike the log, which fails on run
+     one.
+
+     ⚠️ **The gate does NOT make done-when 1 met.** The criterion is two agent pods on one node
+     reporting distinct volume IDs, which needs invariant 5 closed, the server rolled onto this
+     code, at least two agents opted in, and a `findmnt` read from inside two **co-located** live
+     pods. Landing this is the precondition for that measurement, not the measurement.
+
+     **The invariants 4a hands to 4b.** All of them are inert on the self claim and become live
      the moment the claim is per-agent, so none of them can be caught by the fleet exercise 4a
-     relies on. Two are closed on `master`; two are not.
+     relies on. Four were enumerated here and all four are now closed; a **fifth** was found
+     2026-10-31 while writing the swap and is OPEN — see the ⛔ above. That it was found this
+     late is the point worth keeping: the four were derived from the `subPath` mount list and
+     from what the server WRITES, and the fifth is a path the pod writes and the server READS,
+     which that inventory had no way of surfacing. Anything else crossing the volume in the
+     read direction belongs on this list too.
 
      1. **Populate the server-materialized trees, or relocate them.** One closed by 3b-iii,
         one newly found. `.local/share/paperclip-git-hooks` and `skills/<companyId>` were both
@@ -1311,26 +1387,27 @@ would defeat this issue's own acceptance criterion.
 
 ## 5. Decisions taken, and what is still genuinely open
 
-**State of the four 4b invariants, 2026-10-30** (detail in §4). "implemented" below means the
-code is written and merged-or-in-review; **none of it is observable on the fleet**, because all
-four are inert until the `dataClaimName` swap:
+**State of the four 4b invariants, updated 2026-10-31** (detail in §4). All four are now closed on
+`master`; **none of it is observable on the fleet**, because all four stay inert until an agent is
+opted in to the `dataClaimName` swap — which, as of 2026-10-31, is itself merged but default-off:
 
 | invariant | state |
 |---|---|
 | 1 — populate/relocate the server-materialized trees (incl. the prompt bundle) | **closed** — #3153 / #3157 / #3158, last merged 20:19:43Z. Inert until the swap, by design. |
 | 2 — symlinked-PARENT hole in the seeder | **closed** — #3161, merged 19:51:15Z |
-| 3 — directory MODE | **implemented, in review** — #3165. `mkdir -m 2775 -p`, as recommended; a separate `chmod` stays unexecutable (no `CAP_FOWNER`), and busybox's `make_directory.c` `goto ret0`s on `EEXIST` at the final component *before* its `chmod`, so an existing 1000-owned target is never chmodded. Subsumed by invariant 4's split exactly as predicted: as uid 1000 the seeder owns what it creates, so the mode needs no privilege. ⚠️ Still converges only targets the seeder creates, and the CephFS fresh-subvolume question remains **unmeasured** — no per-agent claim exists to measure against |
-| 4 — guard is check-then-act under concurrent same-agent runs | **implemented, in review** — #3165, the recommended split: uid 0 chowns the volume ROOT only (one inode, no in-volume path components, so no TOCTOU), everything else runs as uid 1000, which *removes* the privilege boundary rather than hardening the race across it. Available only because stage 3b-iii left `readOnlySubPaths` empty — now enforced as a build-time throw, not a comment. `fsGroup`, the post-`mkdir` re-check and run serialisation remain ruled out. ⚠️ **"Must ship WITH the swap, never before it" is WITHDRAWN** — the premise was unchecked and false; the reachability argument in §4 carries that on its own, and the second reason first recorded beside it does not (it tests "is this the server's claim", not "is this claim one agent's"). See §4. It shipped ahead of the swap, and is inert on the fleet by measurement (every agent Job over 7d names the server's own claim), not by construction. ⚠️ The root `chown` on a real CephFS subvolume is still **unexecuted**; fd-relative `openat` walk remains the fallback |
+| 3 — directory MODE | **closed** — #3165, merged. `mkdir -m 2775 -p`, as recommended; a separate `chmod` stays unexecutable (no `CAP_FOWNER`), and busybox's `make_directory.c` `goto ret0`s on `EEXIST` at the final component *before* its `chmod`, so an existing 1000-owned target is never chmodded. Subsumed by invariant 4's split exactly as predicted: as uid 1000 the seeder owns what it creates, so the mode needs no privilege. ⚠️ Still converges only targets the seeder creates, and the CephFS fresh-subvolume question remains **unmeasured** — no per-agent claim exists to measure against |
+| 5 — the POD LOG crosses the volume in the read direction | **OPEN, and it blocks enablement.** The container writes `containerLogPath`; `execute.ts` tails `podLogPath`; they are the same string and different volumes once the claim is per-agent, so `tailPodLogFile` throws and the run's stdout is empty. Found 2026-10-31 while writing the swap; the swap therefore lands gated and un-enablable rather than enabled. Candidate remedy: `tee` the NDJSON to container stdout and consume it via `readNamespacedPodLog`. See §4 stage 4b |
+| 4 — guard is check-then-act under concurrent same-agent runs | **closed** — #3165, merged, the recommended split: uid 0 chowns the volume ROOT only (one inode, no in-volume path components, so no TOCTOU), everything else runs as uid 1000, which *removes* the privilege boundary rather than hardening the race across it. Available only because stage 3b-iii left `readOnlySubPaths` empty — now enforced as a build-time throw, not a comment. `fsGroup`, the post-`mkdir` re-check and run serialisation remain ruled out. ⚠️ **"Must ship WITH the swap, never before it" is WITHDRAWN** — the premise was unchecked and false; the reachability argument in §4 carries that on its own, and the second reason first recorded beside it does not (it tests "is this the server's claim", not "is this claim one agent's"). See §4. It shipped ahead of the swap, and is inert on the fleet by measurement (every agent Job over 7d names the server's own claim), not by construction. ⚠️ The root `chown` on a real CephFS subvolume is still **unexecuted**; fd-relative `openat` walk remains the fallback |
 
 **PEN-4932's four done-when items, measured from inside a live agent pod 2026-10-30T21:4xZ**
 (`findmnt`, this run's own pod on `k8s-paperclip-3`):
 
 | done-when | state |
 |---|---|
-| 1 — two agent pods on one node report **distinct** volume IDs | **UNMET.** One handle fleet-wide: `csi-vol-3bdd0e68-1704-4f81-b3d8-55920cabf82c`, every bind in this pod off it. This is the `dataClaimName` swap. |
+| 1 — two agent pods on one node report **distinct** volume IDs | **UNMET, and now blocked on invariant 5 rather than on the swap.** The swap LANDED 2026-10-31 behind the default-off `enablePerAgentWorkspaceVolume` gate (§4 stage 4b), but the gate cannot be turned on until invariant 5 closes — enabling it today empties every opted-in run's stdout. The last fleet read still shows one handle, `csi-vol-3bdd0e68-1704-4f81-b3d8-55920cabf82c`, which is the correct reading of a gate nothing has opted into. After invariant 5: the server rolled onto that commit, ≥2 agents opted in through `adapter_config`, and a `findmnt` read from inside two live pods **co-located on one node**. Do not record this as met off a merge. |
 | 2 — the fleet-wide tooling row is a separate read-only claim **or** baked into the image, with the choice recorded | **MET on `master`, NOT YET OBSERVABLE in the fleet.** Choice: **baked into the image**, reasoned in §3.3-§3.6. |
-| 3 — recurrence re-measured against the 3-wedges-in-30h baseline, caveats stated | not started, and **it cannot be done before 1** — the measurement is of the swap's effect. |
-| 4 — this §5 acceptance table updated to reflect 1 being met | blocked on 1, by construction. |
+| 3 — recurrence re-measured against the 3-wedges-in-30h baseline, caveats stated | not started, and **it cannot be done before 1** — the measurement is of the swap's effect, and a gate nobody has opted into produces no effect to measure. Note the two caveats §4.1 attaches to the baseline survive into the re-measure and must be stated rather than glossed: Prometheus retains ~7 days, not 30, and counter resets on the agent-heavy nodes hide history. |
+| 4 — this §5 acceptance table updated to reflect 1 being met | blocked on 1, by construction. This row is the one that must NOT be ticked on the strength of the swap landing. |
 
 **Done-when 2, measured rather than asserted.** Six of the issue's seven fleet-wide paths are now
 **absent outright** — `/paperclip/bin`, `/tools`, `/jre`, `/paperclip/.local/bin`,
