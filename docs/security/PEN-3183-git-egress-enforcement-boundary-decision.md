@@ -1122,9 +1122,9 @@ agent/base value, and one the base lacks is absent. Three grounds.
    claude-k8s adapter's `execute.ts` runs over the config `mergeModelProfileAdapterConfig`
    returns, and lets non-null environment fields win. A test documents that intended order; it
    does **not** cover the site order. The adapter holds its own copy of `mergeEnvironmentConfig`
-   (`vendor/paperclip-adapter-claude-k8s/src/server/execute.ts:855`
+   (`vendor/paperclip-adapter-claude-k8s/src/server/execute.ts:971`
    (`export function mergeEnvironmentConfig(`), called at
-   `vendor/paperclip-adapter-claude-k8s/src/server/execute.ts:2659`
+   `vendor/paperclip-adapter-claude-k8s/src/server/execute.ts:2775`
    (`mergeEnvironmentConfig(adapterConfigObj, target?.config ?? null)`)) and that test both
    imports a different copy
    (`@paperclipai/adapter-utils`) and chooses the call order itself. A real site-order test would

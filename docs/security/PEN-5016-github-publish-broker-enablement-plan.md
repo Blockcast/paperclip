@@ -139,7 +139,7 @@ anchor whose construct it can place unambiguously, and reports the rest rather t
 
 <!-- anchor-file: vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts -->
 
-Read at `vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts` **`:3229`**
+Read at `vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts` **`:3240`**
 (`asBoolean(config.enableGitHubPublishBroker, false)`). Every anchor below is a line in that
 same vendored file — not the `opencode-k8s` adapter's same-named `job-manifest.ts` — and each
 is re-resolved against the tree by `scripts/check-doc-line-anchors.mjs` on every PR, so these
@@ -147,9 +147,9 @@ numbers are checked continuously rather than as of any one reading:
 
 | | Gate off (today) | Gate on |
 |---|---|---|
-| GitHub Secret | mounted into the agent container | mounted into the `github-publish-broker` sidecar only (**`:3944`** (`isGitHubCredentialSecretVolume(sv.mountPath)`), drops it from the agent) |
+| GitHub Secret | mounted into the agent container | mounted into the `github-publish-broker` sidecar only (**`:3955`** (`isGitHubCredentialSecretVolume(sv.mountPath)`), drops it from the agent) |
 | Agent publish path | `git`/`gh`/MCP authenticate locally | agent asks the broker over a unix socket; `PAPERCLIP_GITHUB_BROKER_SOCKET` is set |
-| Broad data mount | renders, annotated `broad:<reason>` | **`buildJobManifest` throws** (**`:4502`** (`!narrowWritableSurface`)) — fail closed, not degrade |
+| Broad data mount | renders, annotated `broad:<reason>` | **`buildJobManifest` throws** (**`:4513`** (`!narrowWritableSurface`)) — fail closed, not degrade |
 | Pod shape | one container | `+1` native sidecar (initContainer, `restartPolicy: Always`), uid 1001, gid 1000, same image |
 
 Two properties make staging possible, and both were verified in the source rather than assumed:
@@ -418,7 +418,7 @@ runtime descriptor agent-scoped persistent roots so that `narrowWritableSurface`
 `mode === "shared"` branch and its rationale comment in
 `vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts` at **`:1087-1100`**
 (`if (mode === "shared") {`), with
-`narrowWritableSurface` itself defined at **`:3570`**
+`narrowWritableSurface` itself defined at **`:3581`**
 (`const narrowWritableSurface = isolation.enabled && dataClaimName !== "";`); before it, a shared run returned
 `enabled:false` and kept the whole PVC mounted rw. `isolation_disabled` being the *only* leg that
 ever fired, and its stopping dead at that change, is consistent with that and with nothing else.
@@ -429,7 +429,7 @@ and `config.isolationMode` is not `isolated`/`isolate` — in
 `vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts`, the constant declared at **`:1042`**
 (`const SHARED_JOB_ISOLATION: JobIsolation = {`)
 and returned at **`:1167`** (`return SHARED_JOB_ISOLATION`). The comment at
-**`:3548`** (`only a config-only run`) names it: *"only a config-only run
+**`:3559`** (`only a config-only run`) names it: *"only a config-only run
 with no descriptor and no `isolationMode` still reaches this fallback."* The measured zero is
 therefore a property of **the server supplying a descriptor on every render**, not of configuration.
 A run path that stops supplying one renders broad — and once the gate is on, that stops being a
