@@ -40,7 +40,9 @@ pod log still crosses the volume in the read direction.
 
 `paperclip_isolation_workspace_reaper_unreachable_agents` (landed in #3180) counts exactly this
 population, and `PaperclipIsolationWorkspaceReaperCoverageGap` fires on `!= 0`. So the **first**
-opt-in raises the alert within one daily sweep and it stays raised. The comment names that alert and
+opt-in raises the alert within one sweep and it stays raised — 12-hourly as Blockcast deploys it
+(`PAPERCLIP_ISOLATION_WORKSPACE_REAPER_INTERVAL_MINUTES=720`), 24 h on the code fallback, so the
+worst case is a day. The comment names that alert and
 says in those words not to read it as informational while PEN-5151 is open — silence is the state
 the whole gauge was added to end, so silencing it is the specific failure to avoid.
 

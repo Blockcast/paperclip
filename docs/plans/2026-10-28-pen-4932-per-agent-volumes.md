@@ -737,7 +737,10 @@ PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verificati
      **What enforces the ceiling is the probe that just landed, at N = 1.** Arm
      A counts exactly the opted-in population, and
      `PaperclipIsolationWorkspaceReaperCoverageGap` fires on `!= 0` — so the
-     *first* opt-in raises it, within one daily sweep, and it stays raised. The
+     *first* opt-in raises it, within one sweep, and it stays raised. Blockcast
+     runs that sweep **12-hourly** (`PAPERCLIP_ISOLATION_WORKSPACE_REAPER_INTERVAL_MINUTES=720`
+     in `values.blockcast.yaml`); the code fallback is daily, so take 24 h as
+     the worst case and 12 h as the deployed one. The
      alert is therefore **not informational while reclamation is open**: it is
      the standing record that an unreclaimed tree exists and has an owner. Do
      not silence it; opting an agent in is accepted only together with an owner
