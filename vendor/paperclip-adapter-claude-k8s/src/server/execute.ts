@@ -364,6 +364,10 @@ import {
 import {
   buildJobManifest,
   buildPodLogPath,
+  // PEN-5120: the prefix the container stamps on each transcript line it writes
+  // to stdout when the server cannot reach the Job volume. Read here so the
+  // failure diagnostic can tell the run output apart from the run error.
+  POD_LOG_STREAM_MARKER,
   resolveDataMountPath,
   resolveJobIsolation,
   sanitizeLabelValue,
@@ -1309,6 +1313,12 @@ function redactDiagnosticLogLine(value: string): string {
 export function extractContainerLogDiagnostic(raw: string): string | null {
   const lines = raw
     .split(/\r?\n/)
+    // PEN-5120: on a claim the server does not hold, the container also writes
+    // the run's own transcript to stdout, marked, because the file it tees to is
+    // unreachable. Those lines are the run's OUTPUT, not a diagnostic about why
+    // it failed — and a stream-json line is long, so leaving them in would push
+    // the actual error out of the last five every time.
+    .filter((line) => !line.trimStart().startsWith(POD_LOG_STREAM_MARKER))
     .map((line) => redactDiagnosticLogLine(line.trim()))
     .filter((line) => line.length > 0);
   if (lines.length === 0) return null;

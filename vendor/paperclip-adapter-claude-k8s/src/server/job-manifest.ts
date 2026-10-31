@@ -458,6 +458,33 @@ export function buildPodLogPath(
   return `${dir}/${runId}.pod.ndjson`;
 }
 
+/** Prefix stamped on every pod-log line the container writes to its own
+ *  **stdout**, used only when the server cannot reach the Job's volume.
+ *
+ *  PEN-5120. `buildPodLogPath` returns two addresses for one file on the
+ *  premise that the server and the pod mount the SAME volume. Once the Job's
+ *  claim is per-agent that premise is gone, and the file the pod writes is
+ *  unreachable from the server — so the run's stdout has to leave the pod on a
+ *  channel that does not assume a shared volume. The container log is that
+ *  channel.
+ *
+ *  It needs framing because the Kubernetes log API has **no stream selector**:
+ *  `readNamespacedPodLog` serves one interleaved view of fd 1 and fd 2, so the
+ *  agent's own stderr, the launcher preflight and the wrapper's diagnostics all
+ *  arrive mixed into the NDJSON. `parse.ts` already records that interleaving as
+ *  the reason `readPodContainerLogTail` must stay confined to diagnostics. A
+ *  per-line prefix is what makes the transcript separable again; redirecting the
+ *  other writers to stderr would not, because stderr is in the same view.
+ *
+ *  Prefix, not a wrapper: the line is emitted by `awk` downstream of `tee`, so
+ *  the FILE keeps today's bytes exactly and only the stdout copy is marked.
+ *
+ *  Short on purpose. The kubelet rotates a container log at 10 Mi by default,
+ *  so every byte per line is spent against that bound; 9 bytes on a 50k-line
+ *  transcript is ~450 KiB. It is also not JSON-leading, so it cannot be
+ *  confused with a stream-json line that lost its prefix. */
+export const POD_LOG_STREAM_MARKER = "@@PCLOG@@";
+
 /** Env var carrying the prompt on the small-prompt path. Shared with
  *  LARGE_PROMPT_THRESHOLD_BYTES below, which depends on its length. */
 const PROMPT_ENV_NAME = "PROMPT_CONTENT";
@@ -4168,8 +4195,23 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // persisted to the pod log before we exit. `fflush()` keeps the awk
   // pipeline line-buffered (default `gawk`/`mawk` would buffer otherwise
   // and stream-json events would batch to ~4 KiB before flushing).
+  //
+  // PEN-5120: on a claim the server does not hold, this awk is also the thing
+  // that puts the transcript on container stdout, because the file it was
+  // teed to is on a volume the server cannot read. `print` becomes
+  // `print MARKER $0` and the trailing `> /dev/null` goes away. Both halves are
+  // conditional, so the command on today's fleet is byte-identical — asserted
+  // by a negative control rather than left to inspection.
+  const streamPodLogToStdout = !serverHoldsDataClaim;
+  const podLogLinePrint = streamPodLogToStdout
+    ? `print \"${POD_LOG_STREAM_MARKER}\" $0`
+    : "print";
   const failFastFilter =
-    `awk '{ print; fflush() } /\"overageStatus\":\"rejected\"/ && /\"overageDisabledReason\":\"out_of_credits\"/ { print \"[wrapper] terminal rate-limit: out_of_credits overage rejected; exiting non-zero so harness can retry on quota reset\" > \"/dev/stderr\"; exit 1 }'`;
+    `awk '{ ${podLogLinePrint}; fflush() } /\"overageStatus\":\"rejected\"/ && /\"overageDisabledReason\":\"out_of_credits\"/ { print \"[wrapper] terminal rate-limit: out_of_credits overage rejected; exiting non-zero so harness can retry on quota reset\" > \"/dev/stderr\"; exit 1 }'`;
+  // Discarding the filter's stdout is what keeps a 10 Mi transcript out of the
+  // node's container log on every run in the fleet. Kept, except on the one
+  // path where that stdout IS the delivery channel.
+  const podLogFilterSink = streamPodLogToStdout ? "" : " > /dev/null";
   // `set -o pipefail` so a claude binary crash (OOM, segfault, missing-bin)
   // OR the fail-fast awk surfaces as a non-zero shell exit code instead
   // of being masked by the trailing `cat`'s exit code. Without pipefail
@@ -4408,7 +4450,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // so a verdict after it would describe a pod that had already reached GitHub.
   // Advisory — the push path already fails closed; this buys time-to-diagnosis.
   const prePushHookPreflight = buildPrePushHookPreflightShell({ dataMountPath });
-  const claudeInvocation = `set -o pipefail; ${imageWrapperPreflight}; ${prePushHookPreflight}; ${workspaceSetup ? `${workspaceSetup} || exit $?; ` : ""}${promptBundleMaterialization ? `${promptBundleMaterialization} || exit $?; ` : ""}${promptBundleSkillLinkStep ? `${promptBundleSkillLinkStep} ` : ""}${sharedDocOverlaySetup ? `${sharedDocOverlaySetup}; ` : ""}${buildEnvGuardSetupShell()}; ${claudeRuntime}${ccrotateRefresh ? `${ccrotateRefresh}; ` : ""}${preparePodLog}; ${buildPodLogRedactorSetupShell(containerLogPath)}; cat /tmp/prompt/prompt.txt | ${launcherCommand} ${claudeArgsEscaped} | "$${POD_LOG_FILTER_VAR}" \${${POD_LOG_FILTER_ARG_VAR}:+"$${POD_LOG_FILTER_ARG_VAR}"} | tee ${quoteShellArg(containerLogPath)} | ${failFastFilter} > /dev/null`;
+  const claudeInvocation = `set -o pipefail; ${imageWrapperPreflight}; ${prePushHookPreflight}; ${workspaceSetup ? `${workspaceSetup} || exit $?; ` : ""}${promptBundleMaterialization ? `${promptBundleMaterialization} || exit $?; ` : ""}${promptBundleSkillLinkStep ? `${promptBundleSkillLinkStep} ` : ""}${sharedDocOverlaySetup ? `${sharedDocOverlaySetup}; ` : ""}${buildEnvGuardSetupShell()}; ${claudeRuntime}${ccrotateRefresh ? `${ccrotateRefresh}; ` : ""}${preparePodLog}; ${buildPodLogRedactorSetupShell(containerLogPath, { failClosedOnFallOpen: streamPodLogToStdout })}; cat /tmp/prompt/prompt.txt | ${launcherCommand} ${claudeArgsEscaped} | "$${POD_LOG_FILTER_VAR}" \${${POD_LOG_FILTER_ARG_VAR}:+"$${POD_LOG_FILTER_ARG_VAR}"} | tee ${quoteShellArg(containerLogPath)} | ${failFastFilter}${podLogFilterSink}`;
   // When the DinD sidecar is wired in, prepend the wait-for-socket loop
   // so the agent never starts before dockerd is listening on the shared
   // unix socket. Mirrors the opencode_k8s adapter.

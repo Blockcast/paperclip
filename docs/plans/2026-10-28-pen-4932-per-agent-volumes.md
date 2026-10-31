@@ -464,9 +464,11 @@ PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verificati
        **same** `podLogPath`;
      - `readPodContainerLogTail` is a 120-line **diagnostic** for error
        messages, not a stdout source;
-     - the container's own stdout carries no NDJSON to read through the
-       Kubernetes log API anyway — the pipeline ends
-       `| tee <containerLogPath> | <failFastFilter> > /dev/null`.
+     - the container's own stdout carried no NDJSON to read through the
+       Kubernetes log API anyway — the pipeline ended
+       `| tee <containerLogPath> | <failFastFilter> > /dev/null`. **That third
+       one is now conditional** (PEN-5120, below): on a claim the server does
+       not hold, the filter keeps its stdout and marks each line.
 
      **The obvious fix is refused for the same reason §2 refuses the tooling
      row.** Keeping `run-logs` as a `subPath` of the SERVER'S claim beside the
@@ -480,6 +482,42 @@ PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verificati
      has its own failure modes (the kubelet's 10 Mi rotation, API disconnects,
      the FAR-10 hang the adapter's own mocks were built for) — and it is the
      remaining blocker on enablement, not something to bolt onto the swap.
+
+     **Status 2026-10-31 — the EMIT half has landed, the COLLECTOR has not.**
+     Tracked as PEN-5120. The fail-fast `awk` now keeps its stdout and stamps
+     each line with `POD_LOG_STREAM_MARKER`, gated on `serverHoldsJobDataClaim`
+     so the fleet command is byte-identical. Three points worth carrying
+     forward, because each was a decision rather than a detail:
+
+     - **Framing is forced, not chosen.** `readNamespacedPodLog` has no stream
+       selector — it serves one interleaved view of fd 1 and fd 2 — so the
+       agent's stderr and the launcher preflight arrive mixed into the NDJSON.
+       Redirecting the other writers to stderr would not separate them. The
+       marker is added DOWNSTREAM of `tee`, so the file keeps today's bytes and
+       every existing parser of it is untouched.
+     - **The redactor fails CLOSED on that path.** Its fail-open is right while
+       the log's only home is a file on a volume the control plane owns; it is
+       not right when degrading to `cat` would publish the transcript to the
+       node's container log. The stderr line and the `.unredacted` sentinel are
+       still written first.
+     - **Still unsolved, and owned by the collector:** the 10 Mi rotation bound,
+       reconnect/resume across an API disconnect, and persisting the stream back
+       to the server's own `podLogPath` so the belt-and-braces re-read, the
+       reaper's `unlink`, and the orphan reader below all keep working.
+
+     **A SECOND pod→server read-direction consumer, found 2026-10-31 and not
+     fixed by the collector.** `server/src/services/orphaned-run-terminal-result.ts`
+     reads the pod-written `<run>.pod.ndjson` out of the server's `run-logs`
+     tree to recover a vanished Job's own terminal verdict — the PEN-2421 fix
+     that stops the reconciler recording successful runs as `job_missing`. On a
+     per-agent claim that artifact is on the agent's volume and the reconciler
+     reads `no_artifact`. A server-persisted copy of the stream cannot replace
+     it either: the orphan case is exactly the one where the process that would
+     have written that copy died. So for an opted-in agent this recovery is
+     structurally unavailable and the pre-PEN-2421 behaviour returns. Bounded —
+     it only fires when the adapter owner dies mid-run — but it is a real
+     regression to decide on, not a detail, and it is the third thing the
+     subPath inventory could not surface.
 
      Noted but NOT invariant 5: the isolation-workspace reaper
      (`server/src/services/isolation-workspace-reaper.ts`) walks

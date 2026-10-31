@@ -264,6 +264,10 @@ export const POD_LOG_UNREDACTED_SUFFIX = ".unredacted";
  * volume is unwritable, or node is missing, the pipeline degrades to today's
  * behaviour instead of `set -o pipefail` failing every run in the fleet.
  *
+ * `opts.failClosedOnFallOpen` inverts exactly that one branch, for the one
+ * caller whose pod log leaves the pod on the container's stdout rather than on
+ * a volume. See the `failClosed` local for why that is not a contradiction.
+ *
  * That degradation is announced on stderr. Silently, "redacted" and "degraded
  * to `cat`" are indistinguishable after the fact — on the one control whose
  * whole purpose is that it held — so a pod log could be read as scrubbed when
@@ -279,16 +283,38 @@ export const POD_LOG_UNREDACTED_SUFFIX = ".unredacted";
  * `true >`, not `: >`: `:` is a special builtin, and under dash a redirection
  * error on one exits the shell, taking the run down with it.
  */
-export function buildPodLogRedactorSetupShell(podLogPath: string): string {
+export function buildPodLogRedactorSetupShell(
+  podLogPath: string,
+  opts: { failClosedOnFallOpen?: boolean } = {},
+): string {
   const b64 = Buffer.from(POD_LOG_REDACTOR_SCRIPT, "utf8").toString("base64");
   const target = `$GUARD_DIR/${POD_LOG_REDACTOR_FILENAME}`;
   const tmp = `$GUARD_DIR/.${POD_LOG_REDACTOR_FILENAME}.$$.tmp`;
   const sentinel = `'${`${podLogPath}${POD_LOG_UNREDACTED_SUFFIX}`.replace(/'/g, "'\\''")}'`;
+  // PEN-5120. The fail-open above is right while the pod log's only home is a
+  // file on a volume: a degraded filter writes unredacted bytes to a path the
+  // control plane already owns, which is strictly better than failing every run
+  // in the fleet.
+  //
+  // It is NOT right once that same stream is also going to the container's
+  // stdout, because the container log is read by the node and by anything
+  // scraping the cluster. Falling open there does not degrade to "today's
+  // behaviour" — it publishes the transcript somewhere it has never been. So on
+  // that path the run fails instead, loudly and by name.
+  //
+  // This does not weaken the fleet guarantee it appears to contradict: the
+  // caller passes `true` only when the server cannot reach the Job's volume,
+  // which no agent does until PEN-4932's gate is enabled for it. The sentinel
+  // and the original stderr line are both still written first, so the forensic
+  // record of WHY is identical in both modes.
+  const failClosed = opts.failClosedOnFallOpen
+    ? ` echo '[paperclip-pod-log-redactor] the pod log stream is the only delivery channel for this run (foreign data claim); refusing to emit an UNREDACTED transcript to the node container log' >&2; exit 1;`
+    : "";
   return [
     `[ -f "${target}" ] || { printf %s '${b64}' | base64 -d > "${tmp}" && mv -f "${tmp}" "${target}"; }`,
     `${POD_LOG_FILTER_VAR}=cat`,
     `${POD_LOG_FILTER_ARG_VAR}=`,
-    `command -v node >/dev/null 2>&1 && [ -f "${target}" ] && { ${POD_LOG_FILTER_VAR}=node; ${POD_LOG_FILTER_ARG_VAR}="${target}"; } || { echo '[paperclip-pod-log-redactor] not installed; pod log is UNREDACTED' >&2; { true > ${sentinel}; } 2>/dev/null || :; }`,
+    `command -v node >/dev/null 2>&1 && [ -f "${target}" ] && { ${POD_LOG_FILTER_VAR}=node; ${POD_LOG_FILTER_ARG_VAR}="${target}"; } || { echo '[paperclip-pod-log-redactor] not installed; pod log is UNREDACTED' >&2; { true > ${sentinel}; } 2>/dev/null || :;${failClosed} }`,
     `export ${POD_LOG_FILTER_VAR} ${POD_LOG_FILTER_ARG_VAR}`,
   ].join("; ");
 }
