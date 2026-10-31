@@ -378,6 +378,122 @@ describe("prompt-bundle Secret delivery (PEN-4932 stage 4b, invariant 1)", () =>
     }
   });
 
+  it("relinks image-path skills, which the Secret deliberately does not carry", () => {
+    // Found by review on #3170, and it is the failure this whole channel exists
+    // to prevent reached from the other side. `skillSourceNeedsProjection`
+    // leaves image-path skills out on the correct grounds that the pod already
+    // has their bytes — but the agent reaches a skill through its
+    // `.claude/skills/<runtimeName>` farm link, and `prepareClaudePromptBundle`
+    // writes that link into the SERVER'S volume. On a foreign claim the pod
+    // never sees it, so every adapter-bundled skill would be absent from
+    // `--add-dir` with nothing reporting it.
+    const built = buildJobManifest({
+      ctx: makeCtx("agent-workspace-abc"),
+      selfPod,
+      promptBundle,
+      promptBundleProjection: projection,
+      promptBundleSkillLinks: [{ runtimeName: "dataviz-image", target: "/app/skills/dataviz" }],
+    });
+    const command = agentCommand(built.job);
+    expect(command).toContain("ln -s '/app/skills/dataviz'");
+    expect(command).toContain(`${promptBundle.rootDir}/.claude/skills`);
+    // Replaced, not merged into: a bare `ln -s`/`ln -sfn` would create the link
+    // INSIDE a real directory parked at the destination, silently leaving the
+    // skill unreachable. Asserted against the exact destination expression, not
+    // a bare "rm -rf" — that substring occurs elsewhere in the command and a
+    // loose match passes with this guard removed.
+    expect(command).toContain(`rm -rf "$__pcpl_dst"/'dataviz-image' || exit $?;`);
+    // A link that cannot be created is a skill the agent will not have, and
+    // nothing else in the run would say so.
+    expect(command).toContain(`ln -s '/app/skills/dataviz' "$__pcpl_dst"/'dataviz-image' || exit $?;`);
+  });
+
+  it("relinks even when the projection is empty — an all-image-path run", () => {
+    // The gate that would have been easy to get wrong: tying the link step to
+    // the projection would leave a run whose skills are ALL image-path with an
+    // empty bundle root and no signal, since such a run projects nothing.
+    const built = buildJobManifest({
+      ctx: makeCtx("agent-workspace-abc"),
+      selfPod,
+      promptBundle,
+      promptBundleProjection: null,
+      promptBundleSkillLinks: [{ runtimeName: "dataviz-image", target: "/app/skills/dataviz" }],
+    });
+    expect(built.promptBundleSecret).toBeNull();
+    expect(agentCommand(built.job)).toContain("ln -s '/app/skills/dataviz'");
+  });
+
+  it("emits no link step on the server's own claim", () => {
+    const built = buildJobManifest({
+      ctx: makeCtx(),
+      selfPod,
+      promptBundle,
+      promptBundleProjection: projection,
+      promptBundleSkillLinks: [{ runtimeName: "dataviz-image", target: "/app/skills/dataviz" }],
+    });
+    expect(agentCommand(built.job)).not.toContain("__pcpl_dst=");
+  });
+
+  it("refuses a runtimeName that is not a single safe path segment", () => {
+    // `rm -rf` is written against a destination bounded to one segment under the
+    // bundle root. That bound IS this check, so it refuses rather than quotes.
+    for (const runtimeName of ["../escape", "a/b", "..", ""]) {
+      expect(() =>
+        buildJobManifest({
+          ctx: makeCtx("agent-workspace-abc"),
+          selfPod,
+          promptBundle,
+          promptBundleProjection: projection,
+          promptBundleSkillLinks: [{ runtimeName, target: "/app/skills/x" }],
+        }),
+      ).toThrow(/not a safe path segment/);
+    }
+  });
+
+  it("refuses a link target that is not an absolute pod path", () => {
+    expect(() =>
+      buildJobManifest({
+        ctx: makeCtx("agent-workspace-abc"),
+        selfPod,
+        promptBundle,
+        promptBundleProjection: projection,
+        promptBundleSkillLinks: [{ runtimeName: "x", target: "relative/path" }],
+      }),
+    ).toThrow(/not absolute pod paths/);
+  });
+
+  it("names the right empty tree in the warning — skills arrive, the TREE does not", () => {
+    // An earlier revision said "company skills will be empty" on the delivered
+    // branch. That was backwards: the projection carries the run's RESOLVED
+    // skill entries, so company skills are exactly what does arrive. Naming the
+    // wrong half is worse than naming neither, because it sends the reader to
+    // the tree that is working.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      buildJobManifest({
+        ctx: makeCtx("agent-workspace-abc"),
+        selfPod,
+        promptBundle,
+        promptBundleProjection: projection,
+        promptBundleSkillLinks: [{ runtimeName: "dataviz-image", target: "/app/skills/dataviz" }],
+      });
+      const line = warn.mock.calls
+        .map((call) => String(call[0]))
+        .find((text) => text.includes("claude_k8s.data_claim_foreign"))!;
+      const parsed = JSON.parse(line) as {
+        msg: string;
+        promptBundleProjectedFiles: number;
+        promptBundleRelinkedSkills: number;
+      };
+      expect(parsed.msg).not.toContain("company skills will be empty");
+      expect(parsed.msg).toContain("image-path skills are relinked in-pod");
+      expect(parsed.promptBundleProjectedFiles).toBe(projection.fileCount);
+      expect(parsed.promptBundleRelinkedSkills).toBe(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it("refuses to build a step for a path that is not bundle-relative", () => {
     // Deliberately a throw, not a filter. A projection carrying such a path is a
     // bug in the projection, and emitting a step that silently dropped the file

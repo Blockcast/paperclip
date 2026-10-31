@@ -427,7 +427,15 @@ function mountPrefix(mount: string): string {
  * With `podMount === serverMount` (every deployment today) the arithmetic is the
  * identity, so every emitted target is byte-identical to the pre-BLO-37961 value.
  */
-function toPodAddress(serverPath: string, podMount?: string, serverMount?: string): string {
+/**
+ * PEN-4932 stage 4b: exported so the Job manifest can rebuild the skill farm
+ * links for entries the Secret projection deliberately leaves out (image-path
+ * skills, whose bytes the pod already has). The link's CONTENT is resolved by
+ * the POD, so it must be built by the same translation that writes it here —
+ * a second copy could translate an image path that is identical on both sides
+ * today and diverge the moment the two mounts differ.
+ */
+export function toPodAddress(serverPath: string, podMount?: string, serverMount?: string): string {
   if (!podMount || !serverMount) return serverPath;
   const prefix = mountPrefix(serverMount);
   if (!serverPath.startsWith(prefix)) return serverPath;

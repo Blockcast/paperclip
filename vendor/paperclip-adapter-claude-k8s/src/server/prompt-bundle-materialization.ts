@@ -155,3 +155,105 @@ export function buildPromptBundleMaterializationShell(input: {
     `true`,
   ].join(" ");
 }
+
+/**
+ * A skill-farm link the pod has to rebuild for itself.
+ *
+ * `runtimeName` is the directory under `.claude/skills/` the agent looks for;
+ * `target` is the link's CONTENT, already translated to a POD address by
+ * `toPodAddress`.
+ */
+export type PromptBundleSkillLink = {
+  runtimeName: string;
+  target: string;
+};
+
+/**
+ * A `runtimeName` safe to use as the single path segment under `.claude/skills/`.
+ *
+ * Decided here rather than defended against in shell, for the same reason
+ * `isSafeBundlePath` is: every value reaching this step comes from
+ * `readPaperclipRuntimeSkillEntries`, so an unsafe one is a bug upstream and the
+ * right response is to refuse to emit a step rather than to emit one carrying a
+ * guard. It is also what BOUNDS the destination — with this check the target is
+ * always exactly `<bundleRoot>/.claude/skills/<one-segment>`, which is what makes
+ * the `rm -rf` below safe to write.
+ */
+export function isSafeSkillRuntimeName(value: string): boolean {
+  if (value.length === 0) return false;
+  if (value === "." || value === "..") return false;
+  if (value.includes("/")) return false;
+  // eslint-disable-next-line no-control-regex
+  if (/[\u0000-\u001f\u007f]/.test(value)) return false;
+  return true;
+}
+
+/**
+ * Builds the in-pod step that rebuilds the skill-farm links the Secret does NOT carry.
+ *
+ * PEN-4932 stage 4b, the gap review found on #3170. `skillSourceNeedsProjection` leaves
+ * IMAGE-PATH skills out of the projection on the correct grounds that the pod already
+ * has their bytes — but the bytes are only half of it. The agent reaches a skill through
+ * the farm link `.claude/skills/<runtimeName> -> <source>`, and `prepareClaudePromptBundle`
+ * writes that link into `serverRootDir`, i.e. into the SERVER'S volume. On a foreign
+ * claim the pod never sees it, and the materialization step above copies only the paths
+ * the projection declared — so every adapter-bundled skill would vanish from `--add-dir`
+ * with nothing reporting it. That is precisely the silent dangling-skill outcome this
+ * whole channel exists to prevent, reached from the other side.
+ *
+ * Two properties carried over from the copy step, for the same reasons:
+ *
+ *   * **Fails the pod rather than under-delivering.** A link that cannot be created is a
+ *     skill the agent will not have, and nothing else in the run would say so.
+ *   * **Replaces rather than preserving.** Anything already at the destination is either
+ *     this run's own earlier attempt or a pre-swap farm entry pointing at a volume this
+ *     pod does not mount. `ln -sfn` alone is not enough: with a real DIRECTORY parked at
+ *     the destination it creates the link INSIDE it rather than replacing it, which is
+ *     silent and leaves the skill unreachable. `rm -rf` first, bounded by
+ *     `isSafeSkillRuntimeName` to a single segment under the bundle root.
+ *
+ * Returns `""` when there is nothing to link, so a caller can splice it unconditionally.
+ * Throws when a `runtimeName` is unsafe or a target is not absolute.
+ */
+export function buildPromptBundleSkillLinkShell(input: {
+  /** POD path of the bundle root — the directory handed to the CLI as `--add-dir`. */
+  bundleRoot: string;
+  links: readonly PromptBundleSkillLink[];
+  quote: (value: string) => string;
+}): string {
+  const { bundleRoot, quote } = input;
+  if (!bundleRoot.startsWith("/")) return "";
+  // Sorted and de-duplicated by `runtimeName` so the emitted command is a function of
+  // the link SET, not of discovery order — the command string feeds the prompt cache
+  // key, and an unstable order would miss the cache on every run.
+  const byName = new Map<string, string>();
+  for (const link of input.links) byName.set(link.runtimeName, link.target);
+  const names = [...byName.keys()].sort((left, right) => left.localeCompare(right));
+  if (names.length === 0) return "";
+  const unsafe = names.filter((name) => !isSafeSkillRuntimeName(name));
+  if (unsafe.length > 0) {
+    throw new Error(
+      `refusing to build the prompt-bundle skill-link step: ${unsafe.length} runtimeName(s) are not a safe path segment (${unsafe
+        .slice(0, 3)
+        .map((value) => JSON.stringify(value))
+        .join(", ")})`,
+    );
+  }
+  const badTargets = names.filter((name) => !(byName.get(name) ?? "").startsWith("/"));
+  if (badTargets.length > 0) {
+    throw new Error(
+      `refusing to build the prompt-bundle skill-link step: ${badTargets.length} link target(s) are not absolute pod paths (${badTargets
+        .slice(0, 3)
+        .map((value) => JSON.stringify(value))
+        .join(", ")})`,
+    );
+  }
+  const skillsDir = `${bundleRoot.replace(/\/+$/, "")}/.claude/skills`;
+  const parts = [`__pcpl_dst=${quote(skillsDir)};`, `mkdir -p "$__pcpl_dst" || exit $?;`];
+  for (const name of names) {
+    const dst = `"$__pcpl_dst"/${quote(name)}`;
+    parts.push(`rm -rf ${dst} || exit $?;`);
+    parts.push(`ln -s ${quote(byName.get(name) as string)} ${dst} || exit $?;`);
+  }
+  return parts.join(" ");
+}
