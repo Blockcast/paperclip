@@ -109,7 +109,7 @@ export const plugin = definePlugin({
         ctx.logger.info(`paperclip-plugin-alertmanager: alert reconcile company ${job.companyId} skipped: ${result.skipped}`);
       } else {
         ctx.logger.info(
-          `paperclip-plugin-alertmanager: alert reconcile company ${job.companyId} routed=${result.routed} backfilled=${result.backfilled.length}`,
+          `paperclip-plugin-alertmanager: alert reconcile company ${job.companyId} routed=${result.routed} backfilled=${result.backfilled.length} resolved=${result.resolved?.length ?? 0}`,
         );
       }
     });

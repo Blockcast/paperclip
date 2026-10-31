@@ -178,9 +178,9 @@ describe("alertmanager reconcile-active-alerts outcome is visible at info (BLO-4
     expect(lines).toContain("paperclip-plugin-alertmanager: alert reconcile company company-a skipped: no reconcileReceivers configured");
   });
 
-  it("logs routed/backfilled counts at info on a real pass", async () => {
-    const lines = await runReconcile({ routed: 3, backfilled: ["fp1"] });
-    expect(lines).toContain("paperclip-plugin-alertmanager: alert reconcile company company-a routed=3 backfilled=1");
+  it("logs routed/backfilled/resolved counts at info on a real pass", async () => {
+    const lines = await runReconcile({ routed: 3, backfilled: ["fp1"], resolved: ["fp2", "fp3"] });
+    expect(lines).toContain("paperclip-plugin-alertmanager: alert reconcile company company-a routed=3 backfilled=1 resolved=2");
   });
 });
 
