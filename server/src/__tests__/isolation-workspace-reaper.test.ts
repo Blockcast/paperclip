@@ -1466,6 +1466,38 @@ describe("buildIsolationReclaimPlan", () => {
     expect(plan.eligibleIds).toEqual([]);
   });
 
+  it("refuses an entry with no usable mtime, rather than ranking it first", async () => {
+    // `mtimeMs` is typed `number` but crosses a serialization boundary. Each of
+    // these makes `mtimeMs >= cutoff` false, which would route the entry to
+    // `aged`; `null` additionally sorts ahead of every real candidate, so a
+    // malformed entry would become the most eligible directory in the plan.
+    const plan = await buildIsolationReclaimPlan({
+      inventory: [
+        { name: ID_A, mtimeMs: Number.NaN },
+        { name: ID_B, mtimeMs: null as unknown as number },
+        { name: ID_C, mtimeMs: undefined as unknown as number },
+      ],
+      lookupWorkspaceUsage: usageLookup({}),
+      maxAgeDays: 30,
+      now,
+    });
+    expect(plan.eligibleIds).toEqual([]);
+    expect(plan.skippedMalformed).toBe(3);
+    expect(plan.skippedUnsafeName).toBe(0);
+  });
+
+  it("keeps a malformed entry from displacing a real candidate in the ordering", async () => {
+    const plan = await buildIsolationReclaimPlan({
+      inventory: [{ name: ID_A, mtimeMs: null as unknown as number }, entry(ID_B, 40)],
+      lookupWorkspaceUsage: usageLookup({}),
+      maxAgeDays: 30,
+      maxEntries: 1,
+      now,
+    });
+    expect(plan.eligibleIds).toEqual([ID_B]);
+    expect(plan.truncated).toBe(false);
+  });
+
   it("spends its budget once per directory, however often the inventory names it", async () => {
     // `readdir` cannot return a name twice; an inventory crossing a process
     // boundary can. A repeat would spend the bound on one directory and push a
@@ -1478,7 +1510,50 @@ describe("buildIsolationReclaimPlan", () => {
       now,
     });
     expect(plan.eligibleIds).toEqual([ID_A, ID_B]);
+    expect(plan.skippedDuplicate).toBe(1);
     expect(plan.truncated).toBe(false);
+  });
+
+  it("lands every inventory entry in exactly one bucket", async () => {
+    // The identity the result documents. This is the only surface an operator
+    // has for a volume they cannot walk, so a silently absorbed entry is the
+    // same failure the mounted sweep's `scanned` identity exists to prevent.
+    const plan = await buildIsolationReclaimPlan({
+      inventory: [
+        entry(ID_A, 90), // eligible
+        entry(ID_B, 60), // eligible, past the bound
+        entry(ID_C, 2), // fresh
+        entry("44444444-4444-4444-8444-444444444444", 40), // row says live
+        entry(ID_A, 90), // duplicate
+        entry("not-a-uuid", 40), // unsafe name
+        { name: "55555555-5555-4555-8555-555555555555", mtimeMs: Number.NaN }, // malformed
+      ],
+      lookupWorkspaceUsage: usageLookup({
+        "44444444-4444-4444-8444-444444444444": { lastUsedDaysAgo: 1 },
+      }),
+      maxAgeDays: 30,
+      maxEntries: 1,
+      now,
+    });
+
+    expect(plan.eligibleIds).toEqual([ID_A]);
+    expect(plan.droppedByBound).toBe(1);
+    expect(plan.retainedFresh).toBe(1);
+    expect(plan.retainedInUse).toBe(1);
+    expect(plan.skippedDuplicate).toBe(1);
+    expect(plan.skippedUnsafeName).toBe(1);
+    expect(plan.skippedMalformed).toBe(1);
+    expect(plan.truncated).toBe(true);
+
+    const accounted =
+      plan.eligibleIds.length +
+      plan.droppedByBound +
+      plan.retainedFresh +
+      plan.retainedInUse +
+      plan.skippedUnsafeName +
+      plan.skippedMalformed +
+      plan.skippedDuplicate;
+    expect(accounted).toBe(plan.inventorySize);
   });
 
   it("leaves layout and nested-checkout checks to the executor", async () => {
