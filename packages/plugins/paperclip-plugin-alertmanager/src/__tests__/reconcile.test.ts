@@ -42,7 +42,7 @@ function amAlert(fp: string, over: Record<string, unknown> = {}) {
 
 const ctx = {
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
-  metrics: { write: vi.fn(async () => {}) },
+  metrics: { write: vi.fn(async () => {}), observe: vi.fn(async () => {}) },
 } as unknown as PluginContext;
 
 let served: unknown[] = [];

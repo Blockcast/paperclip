@@ -194,7 +194,7 @@ function mkCtx(
     },
     db: realDb(db, { beforeExecute: overrides.beforeExecute }),
     events: { emit: vi.fn(async (..._args: unknown[]) => {}) },
-    metrics: { write: vi.fn(async () => {}) },
+    metrics: { write: vi.fn(async () => {}), observe: vi.fn(async () => {}) },
     activity: { log: vi.fn(async () => {}) },
     actions: { register: vi.fn() },
     secrets: {

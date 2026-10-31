@@ -196,7 +196,7 @@ function mkCtx(brokenFingerprints: Set<string> = new Set()) {
     },
     db: realDb(db, seenSql),
     events: { emit: vi.fn(async () => {}) },
-    metrics: { write: vi.fn(async () => {}) },
+    metrics: { write: vi.fn(async () => {}), observe: vi.fn(async () => {}) },
     activity: { log: vi.fn(async () => {}) },
     actions: { register: vi.fn() },
     secrets: {
