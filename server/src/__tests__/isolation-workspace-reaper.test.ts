@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -24,6 +24,7 @@ import {
   buildIsolationReclaimPlan,
   classifyIsolationWorkspaceAge,
   collectIsolationWorkspaceInventory,
+  MAX_PLAN_CLOCK_SKEW_MS,
   executeIsolationReclaimPlan,
   createDbUnreachableAgentCount,
   REAPABLE_LAYOUT,
@@ -1808,9 +1809,13 @@ describe("executeIsolationReclaimPlan", () => {
     ];
     for (const name of names) await makeWorkspace(name, [...REAPABLE_LAYOUT], 40);
 
-    // Clock advances past the ceiling once the first unlink is done.
-    let tick = 0;
-    const movingNow = () => NOW + (tick++ >= 1 ? 20 * 60_000 : 0);
+    // Time jumps past the ceiling once the first unlink has actually happened.
+    //
+    // Keyed on the filesystem rather than on a call counter: a counter has to
+    // know how many times the function consults the clock, which made this test
+    // fail the moment a pre-loop guard added one more call — a brittleness that
+    // says nothing about the behaviour under test.
+    const movingNow = () => (existsSync(path.join(root, names[0] as string)) ? NOW : NOW + 20 * 60_000);
 
     const result = await executeIsolationReclaimPlan({
       root,
@@ -1847,6 +1852,78 @@ describe("executeIsolationReclaimPlan", () => {
     // separation `skippedMalformed` keeps from `skippedUnsafeName`.
     expect(result).toMatchObject({ deleted: 0, notAttempted: 1, stopReason: "plan_unusable" });
     await expect(fs.stat(path.join(root, name))).resolves.toBeTruthy();
+  });
+
+  it("refuses a plan dated into the future, where the age bound reads as fresh", async () => {
+    // The age bound is one-sided: any finite `planBuiltAtMs` ahead of `now()`
+    // makes the age negative, so `> maxPlanAgeMs` is false on every iteration
+    // and the plan is eternally fresh. A finiteness check cannot see it — a
+    // future timestamp is a perfectly good number. Realistic producers are a
+    // unit mismatch at the transport (µs/ns land decades out) and clock skew.
+    // (Ally, review of PR #3186.)
+    const name = "11111111-1111-4111-8111-111111111111";
+    await makeWorkspace(name, [...REAPABLE_LAYOUT], 40);
+
+    const result = await executeIsolationReclaimPlan({
+      root,
+      eligibleIds: [name],
+      planBuiltAtMs: NOW + 60 * 60_000,
+      now,
+      logger: silentLogger,
+    });
+
+    expect(result).toMatchObject({ deleted: 0, notAttempted: 1, stopReason: "plan_unusable" });
+    await expect(fs.stat(path.join(root, name))).resolves.toBeTruthy();
+  });
+
+  it("tolerates skew inside the allowance rather than refusing a healthy plan", async () => {
+    // The other side of the same bound: the allowance has to absorb ordinary
+    // control-plane/node clock skew, or a correct plan refuses itself — and a
+    // correct refusal looks identical to that failure, so nothing would say so.
+    //
+    // The 30s is a LITERAL, deliberately not `MAX_PLAN_CLOCK_SKEW_MS / 2`. The
+    // derived form was vacuous: shrinking the constant shrinks the input with
+    // it, so the assertion held at every value including zero and the test
+    // survived its own mutation. A test whose input is computed from the
+    // constant under test cannot constrain that constant.
+    const SKEW_WELL_INSIDE_ALLOWANCE_MS = 30_000;
+    expect(MAX_PLAN_CLOCK_SKEW_MS).toBeGreaterThanOrEqual(SKEW_WELL_INSIDE_ALLOWANCE_MS);
+
+    const name = "11111111-1111-4111-8111-111111111111";
+    await makeWorkspace(name, [...REAPABLE_LAYOUT], 40);
+
+    const result = await executeIsolationReclaimPlan({
+      root,
+      eligibleIds: [name],
+      planBuiltAtMs: NOW + SKEW_WELL_INSIDE_ALLOWANCE_MS,
+      now,
+      logger: silentLogger,
+    });
+
+    expect(result).toMatchObject({ deleted: 1, stopReason: "complete" });
+  });
+
+  it("refuses a plan whose per-tick bound is not a usable number", async () => {
+    // `unlinkAttempts >= NaN` is false forever, which silently removes the MDS
+    // bound that is property 4 of this module. Same fail-open family as the
+    // timestamp, on the ceiling rather than the measurement.
+    const names = [
+      "11111111-1111-4111-8111-111111111111",
+      "22222222-2222-4222-8222-222222222222",
+    ];
+    for (const name of names) await makeWorkspace(name, [...REAPABLE_LAYOUT], 40);
+
+    const result = await executeIsolationReclaimPlan({
+      root,
+      eligibleIds: names,
+      planBuiltAtMs: NOW - 1000,
+      maxDeletes: Number.NaN,
+      now,
+      logger: silentLogger,
+    });
+
+    expect(result).toMatchObject({ deleted: 0, notAttempted: 2, stopReason: "plan_unusable" });
+    for (const name of names) await expect(fs.stat(path.join(root, name))).resolves.toBeTruthy();
   });
 
   it("caps unlinks per tick and reports the remainder as offered-again", async () => {

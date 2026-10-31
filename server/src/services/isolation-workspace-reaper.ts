@@ -828,6 +828,30 @@ export async function buildIsolationReclaimPlan(input: {
 export const DEFAULT_MAX_PLAN_AGE_MS = 10 * 60_000;
 
 /**
+ * How far in the FUTURE a plan's timestamp may sit before it is refused.
+ *
+ * The age bound above is one-sided, and one-sided is not enough. Any finite
+ * `planBuiltAtMs` greater than `now()` makes `now() - planBuiltAtMs` negative,
+ * so `> maxPlanAgeMs` is false on every iteration and the plan reads as
+ * eternally fresh — the same "comparison whose false branch is the permissive
+ * one" this module refuses everywhere else, landing on the one value that IS
+ * the executor's safety margin. The finiteness guard does not reach it: a
+ * future timestamp is a perfectly good number.
+ *
+ * Two realistic producers, neither exotic. A unit mismatch at the transport —
+ * microseconds or nanoseconds where milliseconds were meant — lands decades
+ * ahead. And a control-plane/executor clock skew beyond a few minutes does it
+ * directly, which is worth taking seriously on a path whose entire guarantee is
+ * a comparison of two clocks.
+ *
+ * A minute, because the bound has to absorb ordinary NTP-level skew between the
+ * control plane and a node without absorbing either of the above: a unit
+ * mismatch overshoots by decades, and a skew large enough to matter to a
+ * ten-minute window is larger than this. (Ally, review of PR #3186.)
+ */
+export const MAX_PLAN_CLOCK_SKEW_MS = 60_000;
+
+/**
  * Enumerate a claim the control plane cannot walk, as an executor can (PEN-5151).
  *
  * The inventory half of the handoff: this is everything the decision in
@@ -930,10 +954,12 @@ export interface IsolationReclaimExecutionResult {
    *   so the executor refused the remainder rather than act on a verdict old
    *   enough for a workspace to have been resurrected under it. A real
    *   condition on a healthy system under load; the remedy is scheduling.
-   * - `plan_unusable` — the plan carried no usable staleness bound at all, so
-   *   NOTHING was examined. That is a transport or serialization defect, not a
-   *   slow pipeline, and reporting it as `plan_stale` would hide a permanent
-   *   bug inside a counter that is expected to move.
+   * - `plan_unusable` — the plan could not be judged at all, so NOTHING was
+   *   examined: a non-finite timestamp or ceiling, a non-finite `maxDeletes`,
+   *   or a timestamp dated into the future past the allowed clock skew. Every
+   *   one of those is a transport, unit or clock defect rather than a slow
+   *   pipeline, and reporting it as `plan_stale` would hide a permanent bug
+   *   inside a counter that is expected to move.
    */
   stopReason: IsolationReclaimStopReason;
 }
@@ -1004,20 +1030,50 @@ export async function executeIsolationReclaimPlan(options: {
     stopReason: "complete",
   };
 
-  // Same fail-open shape the plan's `mtimeMs` guard refuses, in the one place
-  // it would be worst: `planBuiltAtMs` crosses the same serialization boundary,
-  // and a missing, null, NaN or string value makes `now() - planBuiltAtMs >
-  // maxPlanAgeMs` FALSE — which is the PERMISSIVE branch. An executor handed a
-  // plan with no timestamp would therefore treat it as eternally fresh and
-  // unlink the lot, having disabled the only safety margin this half has. Both
-  // operands are checked, since a non-finite ceiling fails the same way.
-  if (!Number.isFinite(options.planBuiltAtMs) || !Number.isFinite(maxPlanAgeMs)) {
+  // Everything the loop's two bounds rest on, checked once before any of it
+  // runs. All three values cross the same serialization boundary `mtimeMs`
+  // does, and all three fail the same way — into the PERMISSIVE branch, because
+  // every bound below is a comparison whose false arm is "keep going":
+  //
+  // - `planBuiltAtMs` missing / null / NaN / a string: `now() - x >
+  //   maxPlanAgeMs` is false forever, so the plan reads as eternally fresh and
+  //   the executor unlinks the lot with its only safety margin disabled.
+  // - `planBuiltAtMs` in the FUTURE: a perfectly finite number that produces a
+  //   negative age, with exactly the same effect. See `MAX_PLAN_CLOCK_SKEW_MS`
+  //   — the age bound is one-sided, and one-sided is not enough.
+  // - `maxPlanAgeMs` or `maxDeletes` non-finite: same shape, on the ceiling
+  //   rather than the measurement. A NaN `maxDeletes` makes
+  //   `unlinkAttempts >= maxDeletes` false forever, silently removing the
+  //   per-tick MDS bound that is property 4 of this module.
+  //
+  // Refusing the whole plan rather than clamping, because a value this wrong is
+  // evidence about the transport, and continuing under a repaired guess would
+  // make the next operator debug a sweep that half worked.
+  const planAgeMs = now() - options.planBuiltAtMs;
+  const unusable =
+    !Number.isFinite(options.planBuiltAtMs)
+      ? "planBuiltAtMs is not a finite number"
+      : !Number.isFinite(maxPlanAgeMs)
+        ? "maxPlanAgeMs is not a finite number"
+        : !Number.isFinite(maxDeletes) || maxDeletes < 0
+          ? "maxDeletes is not a finite, non-negative number"
+          : planAgeMs < -MAX_PLAN_CLOCK_SKEW_MS
+            ? "planBuiltAtMs is in the future beyond the allowed clock skew"
+            : null;
+  if (unusable) {
     result.notAttempted = options.eligibleIds.length;
     result.stopReason = "plan_unusable";
     log.error(
-      { root: options.root, planBuiltAtMs: options.planBuiltAtMs, maxPlanAgeMs },
-      "isolation reclaim executor refused a plan carrying no usable staleness bound; " +
-        "nothing was examined",
+      {
+        root: options.root,
+        reason: unusable,
+        planBuiltAtMs: options.planBuiltAtMs,
+        planAgeMs,
+        maxPlanAgeMs,
+        maxDeletes,
+        maxClockSkewMs: MAX_PLAN_CLOCK_SKEW_MS,
+      },
+      "isolation reclaim executor refused a plan it cannot judge; nothing was examined",
     );
     return result;
   }
