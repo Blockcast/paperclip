@@ -14,11 +14,15 @@ import {
   ISOLATION_WORKSPACE_REAPER_SKIPPED_LAYOUT_METRIC,
   ISOLATION_WORKSPACE_REAPER_STOP_REASONS,
   ISOLATION_WORKSPACE_REAPER_SWEEPS_METRIC,
+  ISOLATION_WORKSPACE_REAPER_UNREACHABLE_AGENTS_METRIC,
   getMetricsRegistry,
 } from "../services/metrics.js";
 import {
   DEFAULT_MAX_DELETES_PER_TICK,
+  PER_AGENT_WORKSPACE_VOLUME_CONFIG_KEY,
   REAPABLE_LAYOUT,
+  UNREACHABLE_AGENTS_UNKNOWN,
+  WORKSPACE_VOLUME_CLAIM_CONFIG_KEY,
   WORKTREE_PARENT_DIRS,
   type WorkspaceUsageLookup,
   type WorkspaceUsageRow,
@@ -1045,5 +1049,207 @@ describe("isolation-workspace reaper runbook", () => {
     }
     expect(block).toMatch(/\bfloor\b/);
     expect(block).not.toMatch(/\d+\s+per sweep/i);
+  });
+});
+
+/**
+ * PEN-5125. These do not test a deletion predicate — they test that the sweep
+ * can say what it did NOT look at. The gap they describe is invisible to every
+ * other assertion in this file by construction: an agent on a foreign claim
+ * materializes no directory under this root, so there is nothing to `mkdir` in
+ * a fixture and nothing for the outcome buckets to count.
+ */
+describe("reapIsolationWorkspaces coverage (PEN-5125)", () => {
+  it("reports UNKNOWN rather than zero when no coverage probe is supplied", async () => {
+    await makeWorkspace("ws-old", [...REAPABLE_LAYOUT], 45);
+
+    const res = await reapIsolationWorkspaces({
+      root,
+      maxAgeDays: 30,
+      now,
+      logger: silentLogger,
+      lookupWorkspaceUsage: usageLookup({}),
+    });
+
+    // The sentinel, not 0. A sweep that was never told how to measure its own
+    // coverage must not publish full coverage.
+    expect(res.unreachableAgents).toBe(UNREACHABLE_AGENTS_UNKNOWN);
+    expect(res.deleted).toBe(1);
+  });
+
+  it("carries the probe's count without disturbing any outcome bucket", async () => {
+    await makeWorkspace("ws-old", [...REAPABLE_LAYOUT], 45);
+    await makeWorkspace("ws-live", [...REAPABLE_LAYOUT], 45);
+
+    const res = await reapIsolationWorkspaces({
+      root,
+      maxAgeDays: 30,
+      now,
+      logger: silentLogger,
+      lookupWorkspaceUsage: usageLookup({ "ws-live": { lastUsedDaysAgo: 0 } }),
+      countUnreachableAgents: async () => 4,
+    });
+
+    expect(res.unreachableAgents).toBe(4);
+    // The point of the row: unreachable directories are in NO bucket, so the
+    // documented identity still holds exactly — over a population that is four
+    // agents short. `scanned` counts what was enumerated, and nothing the probe
+    // reports was.
+    expect(res.scanned).toBe(2);
+    expect(
+      res.retainedFresh +
+        res.retainedInUse +
+        res.retainedResurrected +
+        res.skippedLayout +
+        res.retainedNestedCheckout +
+        res.failed +
+        res.eligible,
+    ).toBe(res.scanned);
+    expect(res.capped).toBe(false);
+    expect(res.lookupFaulted).toBe(false);
+  });
+
+  it("warns, and still completes the sweep, when agents are unreachable", async () => {
+    await makeWorkspace("ws-old", [...REAPABLE_LAYOUT], 45);
+    const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
+
+    const res = await reapIsolationWorkspaces({
+      root,
+      maxAgeDays: 30,
+      now,
+      logger: log as unknown as Parameters<typeof reapIsolationWorkspaces>[0]["logger"],
+      lookupWorkspaceUsage: usageLookup({}),
+      countUnreachableAgents: async () => 1,
+    });
+
+    expect(res.deleted).toBe(1);
+    expect(
+      log.warn.mock.calls.some(([fields]) => (fields as { unreachableAgents?: number }).unreachableAgents === 1),
+    ).toBe(true);
+  });
+
+  it("keeps the sentinel and reclaims anyway when the probe throws", async () => {
+    await makeWorkspace("ws-old", [...REAPABLE_LAYOUT], 45);
+    const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
+
+    const res = await reapIsolationWorkspaces({
+      root,
+      maxAgeDays: 30,
+      now,
+      logger: log as unknown as Parameters<typeof reapIsolationWorkspaces>[0]["logger"],
+      lookupWorkspaceUsage: usageLookup({}),
+      countUnreachableAgents: async () => {
+        throw new Error("control plane unreachable");
+      },
+    });
+
+    // Fails toward "cannot tell", never toward "fully covered"…
+    expect(res.unreachableAgents).toBe(UNREACHABLE_AGENTS_UNKNOWN);
+    expect(log.error).toHaveBeenCalled();
+    // …and the probe is an observation about the pass, not an input to it, so a
+    // fault must not cost the fleet its reclamation.
+    expect(res.deleted).toBe(1);
+    await expect(fs.stat(path.join(root, "ws-old"))).rejects.toThrow();
+  });
+
+  it("probes on the root-absent path too", async () => {
+    const res = await reapIsolationWorkspaces({
+      root: path.join(root, "definitely-not-here"),
+      maxAgeDays: 30,
+      now,
+      logger: silentLogger,
+      lookupWorkspaceUsage: usageLookup({}),
+      countUnreachableAgents: async () => 2,
+    });
+
+    // `root_absent` plus a non-zero coverage gap is the sharpest reading there
+    // is — the trees exist, they are simply not here. Collapsing the probe into
+    // the enumerated path would lose exactly that.
+    expect(res.scanned).toBe(0);
+    expect(res.unreachableAgents).toBe(2);
+    expect(
+      await valueOf(ISOLATION_WORKSPACE_REAPER_UNREACHABLE_AGENTS_METRIC, { dry_run: "false" }),
+    ).toBe(2);
+  });
+
+  it("publishes the count on every sweep, so a later probe failure overwrites it", async () => {
+    const base = {
+      root,
+      maxAgeDays: 30,
+      now,
+      logger: silentLogger,
+      lookupWorkspaceUsage: usageLookup({}),
+    };
+
+    await reapIsolationWorkspaces({ ...base, countUnreachableAgents: async () => 3 });
+    expect(
+      await valueOf(ISOLATION_WORKSPACE_REAPER_UNREACHABLE_AGENTS_METRIC, { dry_run: "false" }),
+    ).toBe(3);
+
+    // A gauge left unwritten keeps its last value, so a probe that starts
+    // failing would otherwise go on publishing a stale, reassuring number.
+    await reapIsolationWorkspaces({
+      ...base,
+      countUnreachableAgents: async () => {
+        throw new Error("nope");
+      },
+    });
+    expect(
+      await valueOf(ISOLATION_WORKSPACE_REAPER_UNREACHABLE_AGENTS_METRIC, { dry_run: "false" }),
+    ).toBe(UNREACHABLE_AGENTS_UNKNOWN);
+  });
+
+  it("startIsolationWorkspaceReaper supplies a probe when the caller omits one", async () => {
+    // Guards the one production wiring (`server/src/index.ts`) against going
+    // coverage-blind by omission: it passes neither lookup, so both defaults
+    // have to come from here.
+    let probed = false;
+    const db = {
+      select: () => ({
+        from: () => ({
+          where: async () => {
+            probed = true;
+            return [{ count: 7 }];
+          },
+        }),
+      }),
+    };
+    const scheduler = {
+      setInterval: () => 1 as unknown as ReturnType<typeof setInterval>,
+      clearInterval: vi.fn(),
+    };
+
+    const stop = startIsolationWorkspaceReaper(
+      db as never,
+      1000,
+      { root, maxAgeDays: 30, now, logger: silentLogger, lookupWorkspaceUsage: usageLookup({}) },
+      scheduler as never,
+    );
+    await vi.waitFor(async () => {
+      expect(
+        await valueOf(ISOLATION_WORKSPACE_REAPER_UNREACHABLE_AGENTS_METRIC, { dry_run: "false" }),
+      ).toBe(7);
+    });
+    expect(probed).toBe(true);
+    stop();
+  });
+});
+
+describe("createDbUnreachableAgentCount (PEN-5125)", () => {
+  it("counts the per-agent-claim opt-in and the operator claim, and nothing else", async () => {
+    // Read as text rather than executed: the predicate is SQL, and what has to
+    // hold is that it mirrors `asBoolean` — only a JSON boolean `true` opts an
+    // agent in, so a string "true" must NOT match. A `->>` text comparison
+    // would over-report and name agents whose Job does mount this claim.
+    const source = readFileSync(
+      fileURLToPath(new URL("../services/isolation-workspace-reaper.ts", import.meta.url)),
+      "utf8",
+    );
+    expect(source).toContain("'true'::jsonb");
+    expect(source).not.toMatch(/->>\s*PER_AGENT_WORKSPACE_VOLUME_CONFIG_KEY/);
+    // Both slots of `resolveDataClaimName` that leave this process's volume.
+    expect(source).toContain("WORKSPACE_VOLUME_CLAIM_CONFIG_KEY");
+    expect(PER_AGENT_WORKSPACE_VOLUME_CONFIG_KEY).toBe("enablePerAgentWorkspaceVolume");
+    expect(WORKSPACE_VOLUME_CLAIM_CONFIG_KEY).toBe("workspaceVolumeClaim");
   });
 });

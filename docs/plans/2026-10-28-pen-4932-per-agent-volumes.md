@@ -676,6 +676,46 @@ PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verificati
      per-agent one, which is refused on exactly the ground PEN-5120 refuses it
      for `run-logs`.
 
+     **PEN-5125 decided, 2026-10-31. Detection landed; reclamation deliberately
+     did not.** Two things changed in the reading on a source pass:
+
+     - The gap is **not** stage-4b-only. The reaper's reach is exactly
+       `serverHoldsJobDataClaim`, and `resolveDataClaimName` has *two* slots
+       above the server's own PVC: the operator `workspaceVolumeClaim` and the
+       per-agent claim. The first has no `config-schema.ts` toggle but is read
+       from agent and environment config **today**, so the blind spot is
+       reachable on the current deployment, not only after the gate flips.
+     - The cost is sharper than "the reaper reports nothing": it reports
+       **success**. The enumeration is directory-driven, so an unreachable
+       workspace is never queried and lands in no outcome bucket; the documented
+       `scanned` identity stays exactly true over a shrunken population and
+       `stop_reason` reads `complete`. BLO-36814's `root_absent` cannot catch
+       this — it fires on `ENOENT` of the root, and a per-agent claim leaves this
+       root present and populated by every agent still on the shared claim.
+
+     Landed: `paperclip_isolation_workspace_reaper_unreachable_agents`
+     (`-1` = probe absent or faulted; alert on `!= 0`), probed before the root
+     `readdir` so the root-absent path carries it too, and deliberately kept off
+     the `entries_total` label set because it describes directories the sweep
+     never enumerated. Also refused, with reasons, in the module header: a
+     per-claim enumeration from the server (reintroduces the cross-mount coupling
+     PEN-4932 exists to remove), and unlinking from the pod's own
+     `seed-writable-dirs` init container — that container's design note turns on
+     its operations being idempotent so "a re-run, a restarted pod and a second
+     agent on the same volume all converge", and `rm -rf` is the one operation
+     that does not converge against a concurrent sibling pod on a `ReadWriteMany`
+     claim.
+
+     ⚠️ **Reclamation is still open.** PEN-5125's done-when 2 — an opted-in
+     agent's tree swept by *something* — is NOT closed by this. What closed is
+     the silence: the gap is now measurable and alertable before the opt-in count
+     grows, which is the half whose absence was dangerous. The chosen shape for
+     the reclaimer is a dedicated executor holding the agent's claim, off the run
+     hot path, with the eligible set computed server-side from `lastUsedAt` so
+     the DB-authoritative idleness predicate survives — an in-pod sweep has no
+     database, and `mtime` on these roots is materialization time, which is the
+     predicate BLO-31222 exists to stop using.
+
      ⚠️ **The gate does NOT make done-when 1 met.** The criterion is two agent pods on one node
      reporting distinct volume IDs, which needs invariant 5 closed, the server rolled onto this
      code, at least two agents opted in, and a `findmnt` read from inside two **co-located** live

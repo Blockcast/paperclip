@@ -458,6 +458,27 @@ export const ISOLATION_WORKSPACE_REAPER_ENTRIES_METRIC =
 export const ISOLATION_WORKSPACE_REAPER_SWEEPS_METRIC = "paperclip_isolation_workspace_reaper_sweeps_total";
 export const ISOLATION_WORKSPACE_REAPER_LAST_SWEEP_METRIC =
   "paperclip_isolation_workspace_reaper_last_sweep_timestamp_seconds";
+/**
+ * How many agents' isolation trees the last sweep structurally could not reach
+ * (PEN-5125), or `-1` when it could not tell.
+ *
+ * This one is NOT an outcome of the pass, and keeping it off the `entries_total`
+ * label set is the point. Every other series here describes directories the
+ * sweep *enumerated*; this describes directories it never saw, because the
+ * agent's Job mounts a claim this process has no mount on. Those land in no
+ * bucket, so the documented `scanned` identity stays exactly true over a
+ * silently shrunken population and `stop_reason` reads `complete`.
+ *
+ * `root_absent` cannot stand in for it. That fires on `ENOENT` of the root, and
+ * the gap this measures leaves the root present and populated by every agent
+ * that is still on the shared claim.
+ *
+ * Alert on `!= 0`, not `> 0`: `-1` means the probe was absent or faulted, and a
+ * sweep that cannot describe its own coverage is the same operational state as
+ * one whose coverage is known to be partial.
+ */
+export const ISOLATION_WORKSPACE_REAPER_UNREACHABLE_AGENTS_METRIC =
+  "paperclip_isolation_workspace_reaper_unreachable_agents";
 /** Routine per-entry outcomes. The two *findings* fields are NOT in here. */
 export const ISOLATION_WORKSPACE_REAPER_ENTRY_OUTCOMES = [
   "eligible",
@@ -5393,6 +5414,7 @@ let isolationReaperRetainedResurrected: Counter<"dry_run"> | null = null;
 let isolationReaperEntries: Counter<"dry_run" | "outcome"> | null = null;
 let isolationReaperSweeps: Counter<"dry_run" | "stop_reason"> | null = null;
 let isolationReaperLastSweep: Gauge<"dry_run"> | null = null;
+let isolationReaperUnreachableAgents: Gauge<"dry_run"> | null = null;
 let executionWorkspaceTeardown: Counter<"trigger" | "method" | "outcome" | "cleanup_reason"> | null = null;
 let executionWorkspaceTeardownDuration: Histogram<"trigger" | "method" | "cleanup_reason"> | null = null;
 let executionWorkspaceCollectorScanned: Counter<string> | null = null;
@@ -5553,6 +5575,7 @@ function ensureRegistry(): {
   isolationReaperEntriesCounter: Counter<"dry_run" | "outcome">;
   isolationReaperSweepsCounter: Counter<"dry_run" | "stop_reason">;
   isolationReaperLastSweepGauge: Gauge<"dry_run">;
+  isolationReaperUnreachableAgentsGauge: Gauge<"dry_run">;
   executionWorkspaceTeardownCounter: Counter<"trigger" | "method" | "outcome" | "cleanup_reason">;
   executionWorkspaceTeardownDurationHistogram: Histogram<"trigger" | "method" | "cleanup_reason">;
   executionWorkspaceCollectorScannedCounter: Counter<string>;
@@ -5711,6 +5734,7 @@ function ensureRegistry(): {
     || !isolationReaperEntries
     || !isolationReaperSweeps
     || !isolationReaperLastSweep
+    || !isolationReaperUnreachableAgents
     || !executionWorkspaceTeardown
     || !executionWorkspaceTeardownDuration
     || !executionWorkspaceCollectorScanned
@@ -8220,6 +8244,18 @@ function ensureRegistry(): {
       labelNames: ["dry_run"],
       registers: [registry],
     });
+    isolationReaperUnreachableAgents = new Gauge({
+      name: ISOLATION_WORKSPACE_REAPER_UNREACHABLE_AGENTS_METRIC,
+      help:
+        "Agents whose isolation-workspace tree the last sweep could not reach "
+        + "because their Job mounts a claim this process does not (PEN-5125): an "
+        + "operator `workspaceVolumeClaim`, or PEN-4932 stage 4b's per-agent "
+        + "claim. Those directories are enumerated by nothing, so they appear in "
+        + "no outcome bucket and the sweep still reports stop_reason=complete. "
+        + "-1 means the probe was absent or faulted; alert on != 0.",
+      labelNames: ["dry_run"],
+      registers: [registry],
+    });
     executionWorkspaceTeardown = new Counter({
       name: EXECUTION_WORKSPACE_TEARDOWN_METRIC,
       help:
@@ -8550,6 +8586,7 @@ function ensureRegistry(): {
     isolationReaperEntriesCounter: isolationReaperEntries,
     isolationReaperSweepsCounter: isolationReaperSweeps,
     isolationReaperLastSweepGauge: isolationReaperLastSweep,
+    isolationReaperUnreachableAgentsGauge: isolationReaperUnreachableAgents,
     executionWorkspaceTeardownCounter: executionWorkspaceTeardown,
     executionWorkspaceTeardownDurationHistogram: executionWorkspaceTeardownDuration,
     executionWorkspaceCollectorScannedCounter: executionWorkspaceCollectorScanned,
@@ -11446,6 +11483,11 @@ export function recordIsolationWorkspaceReapSweep(
     }
 
     m.isolationReaperLastSweepGauge.set({ dry_run }, Math.floor(options.now() / 1000));
+    // Set on EVERY sweep including the root-absent one, and set unconditionally
+    // rather than only when non-zero: a gauge left unwritten keeps its last
+    // value, so a probe that starts failing would otherwise go on publishing a
+    // stale, reassuring 0.
+    m.isolationReaperUnreachableAgentsGauge.set({ dry_run }, result.unreachableAgents);
   } catch (error) {
     logger.error({ err: error }, "failed to record isolation-workspace reaper sweep metrics");
   }

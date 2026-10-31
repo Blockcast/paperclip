@@ -27,6 +27,34 @@ sum by (stop_reason) (increase(paperclip_isolation_workspace_reaper_sweeps_total
 4. **Is it failing per-tick?** `grep 'isolation-workspace reaper sweep failed'` in worker logs. A throwing sweep never reaches the gauge, so repeated failures present exactly as a stall.
 5. **Is it wedged mid-sweep?** Ticks are serialized — a sweep that outruns its interval against a slow MDS blocks the next one. `stop_reason="lookup_faulted"` means the pre-unlink re-read faulted and the remaining directories were never assessed at all.
 
+## ⛔ Before reading anything below: check what the sweep could reach
+
+```promql
+max by (dry_run) (paperclip_isolation_workspace_reaper_unreachable_agents)
+```
+
+**`!= 0` means every other series on this page describes a subset of the population.** The reaper
+walks one volume — the claim this process mounts — and an agent whose Job mounts a different one
+(an operator `workspaceVolumeClaim`, or [PEN-4932](https://paperclip.blockcast.net/PEN/issues/PEN-4932)
+stage 4b's per-agent claim) materializes its trees where no amount of walking this root will find
+them. ([PEN-5125](https://paperclip.blockcast.net/PEN/issues/PEN-5125).)
+
+Read the two values differently:
+
+- **`> 0`** — that many agents' trees are outside this sweep's reach, and **nothing reclaims them**.
+  They grow at the rate this reaper exists to contain (≈10 GiB/agent/month measured over the
+  July → 2026-09-02 fill). This is a capacity finding, not an outage: `allowVolumeExpansion` is
+  `true`, so it surfaces as an operator resizing a PVC rather than a run losing data.
+- **`-1`** — the coverage probe was absent or threw, so this sweep cannot describe its own coverage.
+  Operationally the same state as a known-partial sweep, which is why the alert expression is `!= 0`
+  and not `> 0`.
+
+**Do not reach for `stop_reason` to rule this out.** An unreachable workspace is never enumerated,
+so it lands in no outcome bucket, the `scanned` identity still holds exactly, and the pass reports
+`stop_reason="complete"`. `root_absent` does not catch it either — that fires on `ENOENT` of the
+root, and the root stays present and populated by every agent still on the shared claim. A
+`complete` sweep means *"finished sweeping the tree it could see"*, never *"swept the population"*.
+
 ## Two findings signals worth reading while you are here
 
 Neither is part of this alert; both are non-routine when non-zero.
