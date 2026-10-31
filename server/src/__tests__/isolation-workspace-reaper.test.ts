@@ -1842,7 +1842,10 @@ describe("executeIsolationReclaimPlan", () => {
       logger: silentLogger,
     });
 
-    expect(result).toMatchObject({ deleted: 0, notAttempted: 1, stopReason: "plan_stale" });
+    // `plan_unusable`, not `plan_stale`: a plan that cannot be judged is a
+    // transport defect, where a stale one is a healthy system under load. Same
+    // separation `skippedMalformed` keeps from `skippedUnsafeName`.
+    expect(result).toMatchObject({ deleted: 0, notAttempted: 1, stopReason: "plan_unusable" });
     await expect(fs.stat(path.join(root, name))).resolves.toBeTruthy();
   });
 
