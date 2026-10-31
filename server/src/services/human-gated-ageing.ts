@@ -101,11 +101,15 @@ const PRIORITY_RANK = new Map<string, number>(
  * this table. It rejected per-company, re-derived-global and distribution-derived
  * thresholds alike — not as mis-calibrations, but because all three tune the same
  * quantity and that quantity is not connected to the outcome. Each moves where the
- * admission boundary on *age* sits; none changes the order *inside* the admitted
- * set, which since PEN-4489 is `byPriorityThenAge`. In the sharpest measured case
- * below, the withheld high-payoff row (`PEN-2213`, sole gate for 6) never takes the
- * contested slot under *any* age threshold, because the row that beats it to that
- * slot is strictly older. The lever is not attached to the result.
+ * admission boundary on *age* sits; **no threshold choice reorders the admitted
+ * set toward payoff**, because the order inside it is `byPriorityThenAge` and age
+ * is not a proxy for what a row gates. In the sharpest measured case below, the
+ * withheld high-payoff row (`PEN-2213`, sole gate for 6) loses the contested slot
+ * to a strictly older row that gates nothing (`createdAt` ages; see the caveat
+ * below). Raising the `critical` bar *can* free `high` slots and admit `PEN-2213`
+ * — but it admits it by age, on a queue where age and payoff are the measured
+ * disagreement, so even that route is not the lever being reached for. The lever
+ * is not attached to the result.
  *
  * Raising the bar is also the wrong direction on a top-heavy queue: it drops the
  * *youngest* rows first, and the measurement below shows those are the ones worth
@@ -122,18 +126,27 @@ const PRIORITY_RANK = new Map<string, number>(
  * not as a triage verdict.
  *
  * Discrimination moves instead to the transitive-payoff filter measured below,
- * applied *before* the cap, with age as the tiebreak inside the payoff-positive
- * set. Payoff is computed from each company's own blocker graph, so it is
- * per-company **by construction** — which is how the per-company correctness that
- * motivated PEN-4500 is met without a config surface to calibrate, drift, or
- * forget. Wiring it in is **PEN-5114**; nothing below is live yet.
+ * applied *before* the cap. Payoff is computed from each company's own blocker
+ * graph, so it is per-company **by construction** — which is how the per-company
+ * correctness that motivated PEN-4500 is met without a config surface to
+ * calibrate, drift, or forget.
+ *
+ * **That filter is live as of PEN-5114** ({@link computeTransitivePayoff}, applied
+ * in {@link selectAgedHumanGatedIssues} whenever a caller supplies the graph).
+ * One departure from PEN-5114's own wording, recorded here because this docblock
+ * is where the rule is stated: priority stays *ahead of* age as the tiebreak
+ * inside the payoff-positive set, rather than age alone. Payoff ties are the
+ * common case, and breaking them on age alone reinstates the PEN-4489 inversion
+ * one level down.
  *
  * ## A candidate selector that does discriminate — measured 2026-10-30 (PEN-4500)
  *
- * The paragraph above says what the threshold has stopped doing. This says what
- * could replace it, with the measurement that priced it. **Nothing here changes
- * behaviour** — this is the evidence the decision above rests on, recorded where
- * the next reader of the constant will find it. Wiring it in is **PEN-5114**.
+ * The paragraph above says what the threshold has stopped doing. This is the
+ * measurement that priced what replaced it, kept in full because it is the only
+ * record of *why* the selector is payoff rather than a re-derived number — and
+ * because PEN-5114 ships it on the strength of this one queue. The figures below
+ * are a 2026-10-30 snapshot, not an invariant: they are what the selector was
+ * chosen against, never what it asserts about any later queue.
  *
  * Re-measured on the Penstock queue 2026-10-30, same method as the 2026-10-22 pass
  * (all five open statuses, `assigneeUserId IS NOT NULL`, complete pages). The queue
@@ -211,12 +224,30 @@ const PRIORITY_RANK = new Map<string, number>(
  * its cycle guard never fired), and `PEN-4079`'s reach of 27 was reproduced by an
  * independent forward BFS over inbound edges rather than read off the same walk.
  *
- * ⚠ Two limits this measurement does not clear. It is **one company's queue** —
- * the same mistake the table above is charged with, so payoff must be re-measured
- * per queue before it is believed anywhere else. And payoff scores *what a row
- * unblocks*, which is not the same as *what it is worth*: a row gating nothing can
- * still be urgent on its own merits (a security exposure, a legal deadline), so
- * payoff is a candidate for the escalation **filter**, never for dropping a row.
+ * ⚠ Two limits this measurement does not clear, both of which the shipped
+ * selector had to be built around rather than argued past.
+ *
+ * **It is one company's queue** — the same charge laid against the table above. It
+ * is a weaker charge here, because payoff is re-derived from each company's own
+ * graph at render time rather than calibrated once and copied, so there is no
+ * number to transfer. What is unverified is narrower and still real: that payoff
+ * *discriminates* anywhere other than Penstock. That is why the cut degrades
+ * rather than misfires. A queue where no row is a sole gate scores every row 0,
+ * and a descending sort on a constant is a no-op, so the order falls back exactly
+ * to PEN-4489's `byPriorityThenAge`; a queue where payoff ties everywhere does the
+ * same. **On a queue payoff cannot read, the digest is byte-for-byte what it was**
+ * — which is what licenses shipping it globally on one queue's evidence, and is
+ * asserted as a test rather than left as an argument. The rendered notice says so
+ * in as many words when it happens, so an unmeasured queue reports its own
+ * non-discrimination instead of implying a verdict it did not reach.
+ *
+ * **Payoff scores what a row unblocks, not what it is worth.** A row gating
+ * nothing can still be the most urgent thing in the queue — a security exposure, a
+ * legal deadline — so payoff is the escalation **filter** and never a reason to
+ * drop a row. The implementation keeps that distinction structurally: it is a sort
+ * key, not a predicate, so a zero-payoff row ranks last and still takes a slot
+ * when the budget outlasts the payoff-positive set. Nothing leaves the population,
+ * the counts, or the histogram.
  */
 export const DEFAULT_ESCALATE_AFTER_DAYS_BY_PRIORITY: Readonly<Record<string, number>> =
   Object.freeze({
@@ -438,6 +469,230 @@ export function isHumanGatedOpenIssue(issue: HumanGatedIssue): boolean {
   return Boolean(issue.assigneeUserId) && HUMAN_GATED_OPEN_STATUS_SET.has(issue.status);
 }
 
+// ---------------------------------------------------------------------------
+// Transitive payoff (PEN-5114)
+// ---------------------------------------------------------------------------
+
+/**
+ * One unresolved dependency edge: `issueId` is blocked by `blockerIssueId`.
+ *
+ * Named from the blocked row's side because that is the direction the walk
+ * runs. `issue_relations` stores the opposite orientation (`issueId` is the
+ * blocker, `relatedIssueId` the blocked row), so the loader that reads it has
+ * to transpose — and does so in one place, beside the comment that already
+ * pins the column meaning, rather than leaving each reader to re-derive it.
+ */
+export type BlockerEdge = {
+  issueId: string;
+  blockerIssueId: string;
+};
+
+/**
+ * The company's open blocker graph, as of one render.
+ *
+ * `openIssueIds` is the whole open population, not the human-gated subset: a
+ * human-gated row's payoff is the number of *other* open rows it alone gates,
+ * and most of those are agent-owned. Scoping this to human-gated rows would
+ * measure the wrong thing and would silently measure it as near-zero.
+ */
+export type BlockerGraphInput = {
+  openIssueIds: Iterable<string>;
+  edges: Iterable<BlockerEdge>;
+};
+
+export type TransitivePayoffResult = {
+  /**
+   * Sole-gate payoff per open row, pre-seeded to 0 for every open row.
+   *
+   * Complete over `openIssueIds` on purpose: an *absent* key means "this row
+   * was not in the open graph I was given", which is a wiring fault, while a
+   * present 0 means "scored, and it gates nothing". Collapsing those two into
+   * a `?? 0` read is how a graph that failed to load becomes a queue where
+   * nothing has payoff — which is this module's house failure mode (a
+   * confident all-clear computed from input it could not read) one field over.
+   */
+  payoffByIssueId: ReadonlyMap<string, number>;
+  /** Open rows considered. */
+  openRowCount: number;
+  /** Open rows holding at least one *open* blocker. */
+  blockedRowCount: number;
+  /**
+   * Open rows gated by exactly one remaining root, which is some other row.
+   * Equal to the sum of every payoff value, and the denominator the measured
+   * "sole gate for 43 open rows" figure is quoted against.
+   */
+  soleGatedRowCount: number;
+  /**
+   * Edges dropped because the blocker is not an open row — a `done` or
+   * `cancelled` blocker that the edge still records.
+   *
+   * These are the phantom roots: counted as resolved (so they gate nothing)
+   * rather than as unknown. The recorded 2026-10-30 measurement checked all 77
+   * of them were `done` before relying on that treatment.
+   */
+  phantomEdgeCount: number;
+  /**
+   * Open rows whose blocker closure contains a cycle.
+   *
+   * Zero on every measurement taken so far. Non-zero is not an error — a cycle
+   * is a real (deadlocked) state — but every row in one is scored as *not*
+   * sole-gated, so this is the number that says how much of the queue the
+   * cycle guard is suppressing rather than scoring.
+   */
+  cyclicRowCount: number;
+};
+
+/** Frontier of a row: the id of its single remaining root, or `null` for "not exactly one". */
+type Frontier = string | null;
+
+const DFS_WHITE = 0;
+const DFS_GRAY = 1;
+const DFS_BLACK = 2;
+
+const NO_BLOCKERS: readonly string[] = Object.freeze([]);
+
+/**
+ * Score every open row by **transitive payoff**: how many other open rows it is
+ * the *sole* remaining root of (PEN-5114, decided on PEN-4500).
+ *
+ * Walk `blockedBy` from each open row to its root frontier — the open rows in
+ * its closure that have no open blockers of their own. A row whose frontier is
+ * exactly `{X}` is one console action away from moving, and that action is on
+ * `X`. Payoff of `X` is how many such rows there are.
+ *
+ * Three properties the measurement depends on, each a deliberate choice rather
+ * than an implementation detail:
+ *
+ * - **A blocker outside the open set is resolved, not unknown.** It is dropped
+ *   from the graph and tallied as a phantom edge. Treating a `done` blocker as
+ *   an open root would make every row below it look permanently gated by
+ *   something nobody can act on, which is the opposite of what payoff is for.
+ * - **A row never counts itself.** An unblocked row is trivially its own sole
+ *   root; crediting that would give every root a floor of 1 and erase the
+ *   distinction the filter exists to draw — "frees something" from "frees
+ *   nothing". It is what makes a measured 0 meaningful.
+ * - **A cycle scores as not-sole, which is fail-closed.** A back edge
+ *   contributes `null`, and `null` wins every union, so every row whose closure
+ *   touches a cycle is excluded from being a sole gate rather than credited
+ *   with whatever roots survive the guard. The other direction — dropping the
+ *   back edge and keeping the rest — could *promote* a row to sole gate on the
+ *   strength of an edge the guard discarded, inventing payoff out of a
+ *   deadlock. The outcome does not depend on traversal order: "this row's
+ *   closure contains a cycle" is a property of the graph, and a cycle poisons
+ *   everything reachable through it whichever node the walk enters from.
+ *
+ * Iterative rather than recursive: the walk is over a company's whole open
+ * graph, and chain depth is attacker-adjacent input (anyone can add a blocker
+ * edge), so the depth bound should be the heap rather than the call stack.
+ */
+export function computeTransitivePayoff(graph: BlockerGraphInput): TransitivePayoffResult {
+  const openIds = [...graph.openIssueIds];
+  const openIdSet = new Set(openIds);
+
+  const blockedBy = new Map<string, string[]>();
+  let phantomEdgeCount = 0;
+  for (const edge of graph.edges) {
+    // An edge whose *blocked* end is closed is out of scope rather than
+    // phantom: there is no open row to free, so it is neither a resolved
+    // blocker nor a missing one. Only an unresolvable *blocker* is a phantom.
+    if (!openIdSet.has(edge.issueId)) continue;
+    if (!openIdSet.has(edge.blockerIssueId)) {
+      phantomEdgeCount += 1;
+      continue;
+    }
+    // A row cannot gate itself, and a self-edge would otherwise read as a
+    // one-node cycle and poison the row's whole subtree.
+    if (edge.blockerIssueId === edge.issueId) continue;
+    const existing = blockedBy.get(edge.issueId);
+    if (existing) existing.push(edge.blockerIssueId);
+    else blockedBy.set(edge.issueId, [edge.blockerIssueId]);
+  }
+
+  const color = new Map<string, number>();
+  const frontier = new Map<string, Frontier>();
+  const touchedCycle = new Set<string>();
+
+  for (const root of openIds) {
+    if ((color.get(root) ?? DFS_WHITE) !== DFS_WHITE) continue;
+    const stack: Array<{ id: string; next: number }> = [{ id: root, next: 0 }];
+    color.set(root, DFS_GRAY);
+    while (stack.length > 0) {
+      const top = stack[stack.length - 1]!;
+      const blockers = blockedBy.get(top.id) ?? NO_BLOCKERS;
+      if (top.next < blockers.length) {
+        const child = blockers[top.next++]!;
+        if ((color.get(child) ?? DFS_WHITE) === DFS_WHITE) {
+          color.set(child, DFS_GRAY);
+          stack.push({ id: child, next: 0 });
+        }
+        // GRAY (an ancestor, so a back edge) and BLACK (already scored) are
+        // both read at combine time below, where the whole blocker list is in
+        // hand and the union can be taken in one pass.
+        continue;
+      }
+
+      stack.pop();
+      color.set(top.id, DFS_BLACK);
+
+      if (blockers.length === 0) {
+        // No open blocker: this row is its own root.
+        frontier.set(top.id, top.id);
+        continue;
+      }
+
+      let union: Frontier | undefined;
+      let sawCycle = false;
+      for (const child of blockers) {
+        if (color.get(child) === DFS_GRAY) {
+          // Still on the stack, so it is an ancestor of this node: a back edge,
+          // i.e. a cycle. Contributes `null` — see the fail-closed note above.
+          sawCycle = true;
+          union = null;
+          continue;
+        }
+        if (touchedCycle.has(child)) sawCycle = true;
+        const childFrontier = frontier.get(child) ?? null;
+        if (union === null) continue; // already not-sole; keep scanning for cycles
+        if (childFrontier === null) {
+          union = null;
+          continue;
+        }
+        if (union === undefined) union = childFrontier;
+        else if (union !== childFrontier) union = null;
+      }
+      frontier.set(top.id, union ?? null);
+      if (sawCycle) touchedCycle.add(top.id);
+    }
+  }
+
+  const payoffByIssueId = new Map<string, number>();
+  // Pre-seed, so a present 0 ("scored, gates nothing") is distinguishable from
+  // an absent key ("not in the graph") — see the field's doc.
+  for (const id of openIds) payoffByIssueId.set(id, 0);
+
+  let soleGatedRowCount = 0;
+  for (const id of openIds) {
+    const root = frontier.get(id) ?? null;
+    if (root === null || root === id) continue;
+    payoffByIssueId.set(root, (payoffByIssueId.get(root) ?? 0) + 1);
+    soleGatedRowCount += 1;
+  }
+
+  let blockedRowCount = 0;
+  for (const id of openIds) {
+    if ((blockedBy.get(id) ?? NO_BLOCKERS).length > 0) blockedRowCount += 1;
+  }
+
+  return {
+    payoffByIssueId,
+    openRowCount: openIds.length,
+    blockedRowCount,
+    soleGatedRowCount,
+    phantomEdgeCount,
+    cyclicRowCount: touchedCycle.size,
+  };
+}
+
 export type SelectAgedHumanGatedOptions = {
   now: Date;
   /**
@@ -464,6 +719,21 @@ export type SelectAgedHumanGatedOptions = {
    * explicitly, so an unbounded list is always something a caller chose.
    */
   maxEscalated?: number | null;
+  /**
+   * Sole-gate payoff per issue id, from {@link computeTransitivePayoff} over
+   * the company's own open blocker graph (PEN-5114).
+   *
+   * Supplying it makes payoff the *first* term of the cut, ahead of the cap:
+   * rows that are the sole remaining gate for open work take slots before rows
+   * that free nothing. Omitting it — or passing `null` — leaves the PEN-4489
+   * `byPriorityThenAge` cut byte-for-byte unchanged, which is what keeps the
+   * graph load optional for a caller that has no graph to give.
+   *
+   * It never removes a row from the pool. See
+   * {@link selectAgedHumanGatedIssues} for why that distinction is the whole
+   * design, and not a softening of it.
+   */
+  payoffByIssueId?: ReadonlyMap<string, number> | null;
 };
 
 export type HumanGatedAgeingReport = {
@@ -472,8 +742,12 @@ export type HumanGatedAgeingReport = {
   /** Open human-gated rows skipped because the prompt/input shape is not trustworthy. */
   malformed: MalformedHumanGatedIssue[];
   /**
-   * Issues past their priority's threshold, ordered priority first and then
-   * oldest first within each tier, truncated to `maxEscalated` (PEN-4489).
+   * Issues past their priority's threshold, truncated to `maxEscalated`.
+   *
+   * Ordered by sole-gate payoff first when `payoffByIssueId` was supplied
+   * (PEN-5114), then priority, then oldest-first within the tie — so without a
+   * payoff map this is exactly PEN-4489's priority-then-age cut, and with an
+   * all-zero one it is too.
    */
   escalated: AgedHumanGatedIssue[];
   /** How many issues were past threshold but dropped by `maxEscalated`. */
@@ -499,6 +773,25 @@ export type HumanGatedAgeingReport = {
    * is the only place the digest can say which tier that was.
    */
   omittedCountsByPriority: Record<string, number>;
+  /**
+   * Whether a payoff map was supplied and therefore drove the cut (PEN-5114).
+   *
+   * False means the cut was the unchanged PEN-4489 `byPriorityThenAge`, and
+   * every payoff counter below is 0 because nothing was scored — *not* because
+   * the queue scored zero. The renderer must be able to tell those apart
+   * before it describes the rule it rationed by.
+   */
+  payoffApplied: boolean;
+  /** Past-threshold rows that are the sole remaining gate for at least one open row. */
+  payoffPositiveOverThreshold: number;
+  /** Escalated rows that gate nothing — slots the budget had left over. */
+  escalatedZeroPayoffCount: number;
+  /** Past-threshold rows withheld by the cap despite gating open work. */
+  omittedPayoffPositiveCount: number;
+  /** Open rows the escalated list is, between its members, the sole gate for. */
+  escalatedSoleGateReach: number;
+  /** Open rows the withheld rows are the sole gate for, and which therefore stay gated. */
+  omittedSoleGateReach: number;
 };
 
 function comparePriority(a: string | null | undefined, b: string | null | undefined): number {
@@ -620,6 +913,25 @@ function validateHumanGatedIssueClockInput(issue: HumanGatedIssue): string | nul
  * Every row is key-shape checked *before* selection, so a mis-mapped batch is
  * reported as `malformed` rather than filtered away into a false all-clear.
  *
+ * ## What rations the escalated list (PEN-5114)
+ *
+ * Three separate decisions, in order, and conflating them is what produced both
+ * PEN-4489 and PEN-4500:
+ *
+ * 1. **Eligibility** — `escalateAfterDaysByPriority` decides what is old enough
+ *    to be worth a human's attention at all. It is a floor, not a selector; on a
+ *    top-heavy queue it admits ~90% of the population.
+ * 2. **Order** — sole-gate payoff first when `payoffByIssueId` is supplied, then
+ *    priority, then oldest-first. Payoff is the only term that distinguishes
+ *    rows *inside* the eligible set on something other than how long they have
+ *    been ignored.
+ * 3. **Budget** — `maxEscalated` truncates the ordered list, and the remainder
+ *    is reported as counts rather than dropped.
+ *
+ * Payoff is a sort key and never a predicate. A row that gates nothing ranks
+ * last and still takes a slot when the budget outlasts the payoff-positive set,
+ * because payoff measures what a row unblocks and not what it is worth.
+ *
  * ## Why there is no batch-level "input mapping is broken" heuristic
  *
  * The obvious cheap signal — `issues.length > 0 && scanned.length === 0 &&
@@ -717,7 +1029,44 @@ export function selectAgedHumanGatedIssues(
   // `scanned` keeps its clock ordering: it is the whole population, reported
   // for the histogram and the never-touched tally, and nothing about it is a
   // rationing decision. Only the cut is reordered, on a copy.
-  const byPriorityThenAge = [...overThreshold].sort((a, b) => {
+  //
+  // PEN-5114 puts one term in front of that rule when a payoff map is
+  // supplied: how many open rows this one is the *sole* remaining gate for.
+  // Age decides who waited longest; payoff decides who is actually holding
+  // something up, and on the measured queue those disagree sharply — 30 of 48
+  // past-threshold rows could not free anything, and age admitted all 30.
+  //
+  // A descending sort on payoff *is* the filter the decision calls for: every
+  // payoff-positive row necessarily precedes every zero-payoff row, so the cap
+  // can only reach a row that frees nothing once every row that frees
+  // something already has a slot. Stated as a sort rather than as a `filter`
+  // deliberately — a true filter would make a zero-payoff row disappear, and
+  // payoff scores what a row *unblocks*, never what it is *worth*. A row
+  // gating nothing can still be the most urgent thing in the queue (a security
+  // exposure, a legal deadline), so it ranks last and keeps its slot when the
+  // budget outlasts the payoff-positive set. Spending leftover slots on it is
+  // strictly better than printing a shorter list.
+  //
+  // Priority stays ahead of age *within* a payoff tie, which is a deliberate
+  // departure from PEN-5114's "age as the tiebreak" wording. Payoff ties are
+  // the common case (most positive rows score 1), so ordering those by age
+  // alone would reinstate exactly the inversion PEN-4489 removed: a `low` row
+  // at 142d displacing a `critical` row at 58d, priority honoured at the
+  // threshold and discarded at the cut. Payoff is new evidence that outranks
+  // priority; the absence of it is not.
+  const payoffByIssueId = options.payoffByIssueId ?? null;
+  const payoffApplied = payoffByIssueId !== null;
+  // Absent key reads 0 here, where the fallback is a *ranking* and the worst
+  // case is a row placed last. `computeTransitivePayoff` pre-seeds every open
+  // row precisely so a caller that needs to tell "scored 0" from "never
+  // scored" still can — see TransitivePayoffResult.payoffByIssueId.
+  const payoffOf = (issue: AgedHumanGatedIssue): number =>
+    payoffByIssueId?.get(issue.id) ?? 0;
+  const escalationOrder = [...overThreshold].sort((a, b) => {
+    if (payoffApplied) {
+      const byPayoff = payoffOf(b) - payoffOf(a);
+      if (byPayoff !== 0) return byPayoff;
+    }
     const byPriority = comparePriority(a.priority, b.priority);
     if (byPriority !== 0) return byPriority;
     const byClock = a.humanClockAt.getTime() - b.humanClockAt.getTime();
@@ -725,7 +1074,7 @@ export function selectAgedHumanGatedIssues(
     return (a.identifier ?? a.id).localeCompare(b.identifier ?? b.id);
   });
   const escalated =
-    maxEscalated === null ? byPriorityThenAge : byPriorityThenAge.slice(0, maxEscalated);
+    maxEscalated === null ? escalationOrder : escalationOrder.slice(0, maxEscalated);
 
   const countsByWaitKind: Record<HumanGatedWaitKind, number> = {
     waiting_on_review: 0,
@@ -756,12 +1105,33 @@ export function selectAgedHumanGatedIssues(
   // exists to close. Keyed on object identity rather than `id` so that a
   // duplicated identifier cannot make a withheld row read as a shown one.
   const escalatedRows = new Set<AgedHumanGatedIssue>(escalated);
+  // PEN-5114. The cap now withholds against a rule the old notice cannot
+  // describe, so the renderer needs the payoff shape of both sides of the cut,
+  // not just its priority shape. "6 of the 15 free nothing" and "the withheld
+  // rows still gate 15 open rows" are the two facts that make a payoff-ordered
+  // truncation honest rather than merely shorter.
+  let payoffPositiveOverThreshold = 0;
+  let escalatedZeroPayoffCount = 0;
+  let omittedPayoffPositiveCount = 0;
+  let escalatedSoleGateReach = 0;
+  let omittedSoleGateReach = 0;
   for (const issue of overThreshold) {
     countsByWaitKind[issue.waitKind] += 1;
     const priority = issue.priority ?? "unset";
     countsByPriority[priority] = (countsByPriority[priority] ?? 0) + 1;
-    if (!escalatedRows.has(issue)) {
+    const shown = escalatedRows.has(issue);
+    if (!shown) {
       omittedCountsByPriority[priority] = (omittedCountsByPriority[priority] ?? 0) + 1;
+    }
+    if (!payoffApplied) continue;
+    const payoff = payoffOf(issue);
+    if (payoff > 0) payoffPositiveOverThreshold += 1;
+    if (shown) {
+      escalatedSoleGateReach += payoff;
+      if (payoff === 0) escalatedZeroPayoffCount += 1;
+    } else {
+      omittedSoleGateReach += payoff;
+      if (payoff > 0) omittedPayoffPositiveCount += 1;
     }
   }
 
@@ -776,6 +1146,12 @@ export function selectAgedHumanGatedIssues(
     countsByWaitKind,
     countsByPriority,
     omittedCountsByPriority,
+    payoffApplied,
+    payoffPositiveOverThreshold,
+    escalatedZeroPayoffCount,
+    omittedPayoffPositiveCount,
+    escalatedSoleGateReach,
+    omittedSoleGateReach,
   };
 }
 
@@ -958,6 +1334,17 @@ export function formatHumanGatedAgeingSections(report: HumanGatedAgeingReport): 
     `Human-touch fallback: ${report.neverTouchedByHumanCount} of ${report.scanned.length} scanned issues have no human touch timestamp.`,
   ];
 
+  // PEN-5114. Name the rule that ordered the list, not only the rule that
+  // admitted rows to it. The thresholds line above is now an eligibility
+  // floor, and left alone it reads as the selector it used to be.
+  if (report.payoffApplied) {
+    head.push(
+      report.payoffPositiveOverThreshold > 0
+        ? `Selector: transitive payoff first (how many open rows each is the sole remaining gate for), then priority, then age. ${report.payoffPositiveOverThreshold} of ${report.totalOverThreshold} past-threshold rows gate open work; the thresholds above only decide eligibility.`
+        : `Selector: transitive payoff first, then priority, then age. No past-threshold row is the sole remaining gate for any open row on this queue, so payoff separates nothing here and the order below is priority then age, unchanged.`,
+    );
+  }
+
   // Everything below carries issue-controlled strings and is delimited as such.
   const body: string[] = [];
 
@@ -1015,11 +1402,36 @@ export function formatHumanGatedAgeingSections(report: HumanGatedAgeingReport): 
       `Showing ${report.escalated.length} of ${report.totalOverThreshold} past threshold; ${report.escalatedOmitted} ${report.escalatedOmitted === 1 ? "row is" : "rows are"} withheld by the cap and not listed below${formatPriorityBreakdown(report.omittedCountsByPriority)}.`,
     );
     const cutRow = report.escalated[report.escalated.length - 1];
-    body.push(
-      cutRow
-        ? `The cut is by priority first, then age: slots go to \`critical\` before \`high\` before \`medium\` before \`low\`, and to the longest-quiet row within each tier. Every withheld row is therefore of equal or lower priority than every row listed below, the last of which is ${sanitizeRenderedField(cutRow.priority, "unset")} at ${formatAge(cutRow.humanSilenceDays)}.`
-        : "The cut is by priority first, then age. The cap is 0, so no past-threshold row appears whatever its priority or what it blocks.",
-    );
+    if (!report.payoffApplied) {
+      body.push(
+        cutRow
+          ? `The cut is by priority first, then age: slots go to \`critical\` before \`high\` before \`medium\` before \`low\`, and to the longest-quiet row within each tier. Every withheld row is therefore of equal or lower priority than every row listed below, the last of which is ${sanitizeRenderedField(cutRow.priority, "unset")} at ${formatAge(cutRow.humanSilenceDays)}.`
+          : "The cut is by priority first, then age. The cap is 0, so no past-threshold row appears whatever its priority or what it blocks.",
+      );
+    } else if (!cutRow) {
+      body.push(
+        "The cut is by payoff first, then priority, then age. The cap is 0, so no past-threshold row appears whatever its priority or what it gates.",
+      );
+    } else {
+      // PEN-5114 changed what "withheld" means, so this had to change with it.
+      // The priority-ordered notice closed with "every withheld row is of
+      // equal or lower priority than every row listed below" — a guarantee the
+      // old order really did make and the new one does not: a `critical` row
+      // that gates nothing now ranks below a `high` row that gates six, so a
+      // withheld row can outrank a shown one. Carrying that sentence forward
+      // would have been a false reassurance generated by the change meant to
+      // improve the list, which is worse than the silence PEN-4489 replaced.
+      const listedRows = report.escalated.length === 1 ? "row" : "rows";
+      const listedAre = report.escalated.length === 1 ? "is" : "are";
+      body.push(
+        `The cut is by payoff first, then priority, then age: slots go to the rows that are the sole remaining gate for the most open work, and a row that gates nothing takes a slot only once every row that gates something has one. A withheld row can therefore outrank a listed one on priority — of the ${report.escalated.length} listed ${listedRows}, ${report.escalatedZeroPayoffCount} gate nothing ${report.escalatedZeroPayoffCount === 1 ? "itself" : "themselves"}.`,
+      );
+      body.push(
+        report.omittedPayoffPositiveCount > 0
+          ? `Of the ${report.escalatedOmitted} withheld, ${report.omittedPayoffPositiveCount} ${report.omittedPayoffPositiveCount === 1 ? "is itself the sole remaining gate" : "are themselves the sole remaining gate"} for ${report.omittedSoleGateReach} open ${report.omittedSoleGateReach === 1 ? "row" : "rows"}, which stay gated this period. The ${report.escalated.length} listed ${listedRows} ${listedAre} the sole gate for ${report.escalatedSoleGateReach}.`
+          : `No withheld row is the sole remaining gate for any open row, so the cap removed nothing that is holding other work up. The ${report.escalated.length} listed ${listedRows} ${listedAre} the sole gate for ${report.escalatedSoleGateReach} open ${report.escalatedSoleGateReach === 1 ? "row" : "rows"}.`,
+      );
+    }
   }
 
   for (const waitKind of [
