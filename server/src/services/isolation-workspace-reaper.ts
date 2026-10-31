@@ -105,17 +105,20 @@
  * ## What this module does NOT reap, and why that is recorded here (PEN-5125)
  *
  * Everything above is scoped to one volume: the claim THIS process mounts. An
- * agent whose Job mounts a different claim — an operator `workspaceVolumeClaim`,
- * or PEN-4932 stage 4b's per-agent claim — materializes its isolation trees on
- * that volume, at this same relative path, where no amount of walking this root
- * will find them. The enumeration here is directory-driven (`readdir` -> `id IN
+ * agent whose Job mounts a different claim — a `workspaceVolumeClaim` from
+ * either its own config or its k8s ENVIRONMENT's, or PEN-4932 stage 4b's
+ * per-agent claim — materializes its isolation trees on that volume, at this
+ * same relative path, where no amount of walking this root will find them. The enumeration here is directory-driven (`readdir` -> `id IN
  * (...)`), so such a workspace is never even asked about: it lands in no outcome
  * bucket, the `scanned` identity below stays exactly true over a shrunken
  * population, and the pass reports `stop_reason=complete`. The failure is not
  * that the reaper reports nothing — it is that it reports success.
  *
  * `unreachableAgents` makes that sayable, and is the only part of PEN-5125 this
- * module can own. **Reclamation is deliberately NOT here**, and three shapes
+ * module can own. It is a count when one can be stated soundly and
+ * `UNREACHABLE_AGENTS_UNKNOWN` when it cannot — the environment arm of the
+ * probe cannot attribute a claim to particular agents, so it degrades to the
+ * sentinel rather than publishing a number it cannot stand behind. **Reclamation is deliberately NOT here**, and three shapes
  * were refused rather than left open:
  *
  * - *Give this reaper a per-claim enumeration.* It would have to mount every
@@ -141,7 +144,7 @@ import { inArray, sql } from "drizzle-orm";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { Db } from "@paperclipai/db";
-import { agents, executionWorkspaces } from "@paperclipai/db";
+import { agents, environments, executionWorkspaces } from "@paperclipai/db";
 import { logger as defaultLogger } from "../middleware/logger.js";
 import { DEFAULT_WORKTREE_INSTANCE_HOME_DIRNAME, REPO_MANAGED_WORKTREES_SUBPATH } from "../worktree-config.js";
 import { recordIsolationWorkspaceReapSweep } from "./metrics.js";
@@ -243,11 +246,20 @@ export function createDbWorkspaceUsageLookup(db: Db): WorkspaceUsageLookup {
  * and the first two both resolve to a volume this process has no mount on.
  *
  * ⚠ `workspaceVolumeClaim` is NOT a stage-4b key. It has no `config-schema.ts`
- * toggle, but it is read from agent and environment config today, which makes
- * the blind spot below reachable on the CURRENT deployment rather than only
- * after `enablePerAgentWorkspaceVolume` is flipped. PEN-5125 was filed against
- * the per-agent claim alone; this is the same defect one slot higher, and it is
- * why the probe keys on the claim-resolution rule rather than on the gate.
+ * toggle, but it is read today, which makes the blind spot below reachable on
+ * the CURRENT deployment rather than only after `enablePerAgentWorkspaceVolume`
+ * is flipped. PEN-5125 was filed against the per-agent claim alone; this is the
+ * same defect one slot higher, and it is why the probe keys on the
+ * claim-resolution rule rather than on the gate.
+ *
+ * ⚠⚠ And it has TWO sources, not one. `execute.ts` merges a k8s-remote
+ * execution target's `K8sRemoteSpec` over the agent's config with the
+ * ENVIRONMENT winning (`mergeEnvironmentConfig`, the Phase E.1 path named at
+ * `job-manifest.ts`), so an agent whose environment supplies a claim is on a
+ * foreign volume while its own `adapter_config` says nothing at all. Reading
+ * only `agents` therefore returns a confident `0` — a full-coverage reading,
+ * which is precisely the silence this probe exists to remove. Found in review
+ * of PR #3180.
  *
  * The fourth case — `dataClaimName === ""`, an `emptyDir` — is deliberately
  * absent. That tree is unreachable too, but it dies with the pod, so it
@@ -266,23 +278,73 @@ export const WORKSPACE_VOLUME_CLAIM_CONFIG_KEY = "workspaceVolumeClaim";
 export type UnreachableAgentCount = () => Promise<number>;
 
 /**
- * The production probe. Mirrors `asBoolean`
- * (`packages/adapter-utils/src/server-utils.ts:411`) **exactly**: only a JSON
+ * The production probe, in two arms that answer different questions.
+ *
+ * **Arm A — `agents`, a COUNT.** How many agents are moved off this volume by
+ * their own config: the per-agent opt-in, or an agent-level
+ * `workspaceVolumeClaim`. Mirrors `asBoolean`
+ * (`packages/adapter-utils/src/server-utils.ts`) **exactly**: only a JSON
  * boolean `true` opts an agent in, so the predicate is `= 'true'::jsonb` and
- * not a string comparison. A looser match would over-report — an agent carrying
+ * not a text comparison. A looser match would over-report — an agent carrying
  * the string `"true"` is NOT opted in, and its Job does mount this claim.
  *
- * Deliberately NOT filtered by `agents.status`. A paused or errored agent's
- * tree is exactly as unreachable as a running one's, and it is the one least
- * likely to be noticed; filtering would make the gap shrink when the fleet goes
- * quiet, which is the wrong direction for a capacity signal.
+ * **Arm B — `environments`, a TRUST CHECK.** A k8s-driver environment's
+ * `config.workspaceVolumeClaim` is merged over the agent's and WINS, so an
+ * agent whose environment names a claim is on a foreign volume with nothing in
+ * its own row to say so. Which agents those are is not derivable here: the
+ * environment is chosen per run (`executionWorkspaceSettings.environmentId`
+ * overrides `agents.defaultEnvironmentId`), so arm A cannot be corrected into a
+ * true count. What CAN be said soundly is that arm A is no longer trustworthy —
+ * so arm B returns `UNREACHABLE_AGENTS_UNKNOWN` rather than a number. That is
+ * the whole reason the sentinel is alertable: `!= 0` fires either way, and the
+ * failure direction is "cannot tell", never a false `0`.
  *
- * One aggregate over `agents` per sweep (daily), with no index on a jsonb key —
- * a sequential scan over a table measured in hundreds of rows, against a pass
- * whose next act is an unbounded recursive unlink.
+ * **`selfDataClaimName` exists because a named claim is not necessarily a
+ * foreign one.** `serverHoldsJobDataClaim` is true when `workspaceVolumeClaim`
+ * EQUALS the server's own PVC, and naming it explicitly is a realistic operator
+ * choice — the adapter's own fixtures use `paperclip-data`, which is this
+ * deployment's server claim. Supplying the name here excludes that case from
+ * both arms. It is injected rather than read here because the server has no
+ * config for it: the adapter resolves it from a live pod read
+ * (`k8s-client.ts`), and making a filesystem sweep depend on the Kubernetes API
+ * is a worse trade than the over-report. ⚠ Nothing supplies it today, so a
+ * claim equal to the server's own reads as foreign: arm A over-counts it and
+ * arm B returns UNKNOWN. Both err toward `!= 0`, which is the safe direction
+ * for this gauge, and the `IS DISTINCT FROM` comparisons below are already
+ * written so that passing the name is the only change needed.
+ *
+ * Deliberately NOT filtered by `agents.status` or `environments.status`. A
+ * paused agent's tree is exactly as unreachable as a running one's and is the
+ * one least likely to be noticed; filtering would make the gap shrink when the
+ * fleet goes quiet, which is the wrong direction for a capacity signal.
+ *
+ * Two aggregates per sweep (daily), unindexed on a jsonb key — sequential scans
+ * over tables measured in hundreds of rows, against a pass whose next act is an
+ * unbounded recursive unlink.
  */
-export function createDbUnreachableAgentCount(db: Db): UnreachableAgentCount {
+export function createDbUnreachableAgentCount(
+  db: Db,
+  selfDataClaimName?: string | null,
+): UnreachableAgentCount {
+  // `IS DISTINCT FROM` rather than `<>` so a NULL self-claim (the state today)
+  // excludes nothing instead of making every comparison NULL and silently
+  // emptying both arms. The fail-open reading of "I do not know my own claim"
+  // has to be "treat every named claim as foreign", not "treat none as".
+  const self = selfDataClaimName?.trim() || null;
   return async () => {
+    // Arm B first: if it fires, arm A's number is not worth computing, and
+    // reporting a count beside a known-untrustworthy basis is what this
+    // sentinel exists to avoid.
+    const envRows = await db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(environments)
+      .where(
+        sql`${environments.driver} = 'k8s'
+            AND btrim(coalesce(${environments.config} ->> ${WORKSPACE_VOLUME_CLAIM_CONFIG_KEY}::text, '')) <> ''
+            AND btrim(${environments.config} ->> ${WORKSPACE_VOLUME_CLAIM_CONFIG_KEY}::text) IS DISTINCT FROM ${self}`,
+      );
+    if ((envRows[0]?.count ?? 0) > 0) return UNREACHABLE_AGENTS_UNKNOWN;
+
     const rows = await db
       .select({ count: sql<number>`count(*)::int` })
       .from(agents)
@@ -294,7 +356,8 @@ export function createDbUnreachableAgentCount(db: Db): UnreachableAgentCount {
         // and which is why the bare `jsonb -> 'key'` idiom works everywhere.
         // Stating it is cheap and removes the question; it is not a bug fix.
         sql`${agents.adapterConfig} -> ${PER_AGENT_WORKSPACE_VOLUME_CONFIG_KEY}::text = 'true'::jsonb
-            OR btrim(coalesce(${agents.adapterConfig} ->> ${WORKSPACE_VOLUME_CLAIM_CONFIG_KEY}::text, '')) <> ''`,
+            OR (btrim(coalesce(${agents.adapterConfig} ->> ${WORKSPACE_VOLUME_CLAIM_CONFIG_KEY}::text, '')) <> ''
+                AND btrim(${agents.adapterConfig} ->> ${WORKSPACE_VOLUME_CLAIM_CONFIG_KEY}::text) IS DISTINCT FROM ${self})`,
       );
     return rows[0]?.count ?? 0;
   };
@@ -324,6 +387,14 @@ export interface IsolationWorkspaceReapOptions {
    * constructor always supplies it; see `startIsolationWorkspaceReaper`.
    */
   countUnreachableAgents?: UnreachableAgentCount;
+  /**
+   * This process's own `data` PVC claim name, when the deployment knows it.
+   * Used only to stop a `workspaceVolumeClaim` that NAMES the server's own
+   * claim from reading as foreign — `serverHoldsJobDataClaim` is true in that
+   * case. Unset today; see `createDbUnreachableAgentCount` for why it is
+   * injected rather than resolved here, and for the over-report that leaves.
+   */
+  selfDataClaimName?: string | null;
 }
 
 export interface IsolationWorkspaceReapResult {
@@ -832,7 +903,8 @@ export function startIsolationWorkspaceReaper(
     lookupWorkspaceUsage: options.lookupWorkspaceUsage ?? createDbWorkspaceUsageLookup(db),
     // Defaulted here rather than left to `index.ts`, so the single production
     // entry point cannot be wired up coverage-blind by omission (PEN-5125).
-    countUnreachableAgents: options.countUnreachableAgents ?? createDbUnreachableAgentCount(db),
+    countUnreachableAgents:
+      options.countUnreachableAgents ?? createDbUnreachableAgentCount(db, options.selfDataClaimName),
   };
   let inFlight: Promise<void> | null = null;
   const runTick = () => {

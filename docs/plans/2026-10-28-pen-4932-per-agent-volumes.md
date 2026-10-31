@@ -683,8 +683,13 @@ PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verificati
        `serverHoldsJobDataClaim`, and `resolveDataClaimName` has *two* slots
        above the server's own PVC: the operator `workspaceVolumeClaim` and the
        per-agent claim. The first has no `config-schema.ts` toggle but is read
-       from agent and environment config **today**, so the blind spot is
-       reachable on the current deployment, not only after the gate flips.
+       **today**, so the blind spot is reachable on the current deployment, not
+       only after the gate flips. ⚠ And it has **two sources**: `execute.ts`
+       merges a k8s-remote target's `K8sRemoteSpec` over the agent's config with
+       the ENVIRONMENT winning, so an agent can be on a foreign volume with
+       nothing in its own `adapter_config` to say so. Found in review of #3180;
+       an agent-only probe returns a confident `0` there, which is the exact
+       silence the gauge exists to remove.
      - The cost is sharper than "the reaper reports nothing": it reports
        **success**. The enumeration is directory-driven, so an unreachable
        workspace is never queried and lands in no outcome bucket; the documented
@@ -694,10 +699,13 @@ PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verificati
        root present and populated by every agent still on the shared claim.
 
      Landed: `paperclip_isolation_workspace_reaper_unreachable_agents`
-     (`-1` = probe absent or faulted; alert on `!= 0`), probed before the root
-     `readdir` so the root-absent path carries it too, and deliberately kept off
-     the `entries_total` label set because it describes directories the sweep
-     never enumerated. Also refused, with reasons, in the module header: a
+     (`-1` = probe absent, faulted, **or** a k8s environment supplies a claim;
+     alert on `!= 0`), probed before the root `readdir` so the root-absent path
+     carries it too, and deliberately kept off the `entries_total` label set
+     because it describes directories the sweep never enumerated. The probe has
+     two arms: `agents` yields a COUNT, `environments` is a TRUST CHECK that
+     degrades to the sentinel — the environment is chosen per run, so which
+     agents it moves is not derivable server-side and no sound count exists. Also refused, with reasons, in the module header: a
      per-claim enumeration from the server (reintroduces the cross-mount coupling
      PEN-4932 exists to remove), and unlinking from the pod's own
      `seed-writable-dirs` init container — that container's design note turns on
