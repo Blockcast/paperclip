@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import { buildJobManifest, POD_LOG_STREAM_MARKER } from "./job-manifest.js";
 import { extractContainerLogDiagnostic } from "./execute.js";
-import { POD_LOG_UNREDACTED_SUFFIX } from "./pod-log-redactor.js";
+import { POD_LOG_UNREDACTED_SUFFIX, buildPodLogRedactorSetupShell } from "./pod-log-redactor.js";
 import type { SelfPodInfo } from "./k8s-client.js";
 
 // PEN-5120 — the pod log crosses the agent volume in the READ direction.
@@ -177,9 +177,21 @@ describe("pod log stream framing (PEN-5120)", () => {
     const close = command.indexOf("'", refuse);
     expect(close).toBeGreaterThan(refuse);
     expect(command.slice(refuse, close)).not.toContain("'");
-    // Balanced overall: an odd count means some literal opened a quote it never
-    // closed, which is the same defect one level out.
-    expect(command.split("'").length % 2).toBe(1);
+    // Balance the FRAGMENT this suite owns, not the whole rendered command.
+    // Whole-command parity is NOT an invariant of a valid command: POSIX
+    // single-quote escaping renders an apostrophe as `'\''`, so a quoted
+    // argument containing one contributes an ODD number of quote characters
+    // (2 + 3k) while staying perfectly well-formed. The first `quoteShellArg`
+    // output with an apostrophe anywhere in this fixture would therefore have
+    // failed the global check on correct code. The local assertion above is
+    // what actually guards the defect; this one keeps the balance claim where
+    // it holds. The path below carries no apostrophe, so the fragment's own
+    // sentinel escaping cannot flip it either.
+    const fragment = buildPodLogRedactorSetupShell("/paperclip/run-abc.pod.ndjson", {
+      failClosedOnFallOpen: true,
+    });
+    expect(fragment).toContain("refusing to emit an UNREDACTED transcript");
+    expect(fragment.split("'").length % 2).toBe(1);
   });
 });
 
