@@ -94,17 +94,46 @@ const PRIORITY_RANK = new Map<string, number>(
  * weighting admits nearly everything. The weighting is not wrong; it is
  * answering a question about a different queue.
  *
- * Re-deriving these values changes what "overdue" means, so it is a decision in
- * its own right rather than a tuning pass, and it is tracked on **PEN-4500**
- * rather than folded in here. Until then, read a past-threshold count from this
- * digest as "open and older than two weeks", not as a triage verdict.
+ * ## Decision (PEN-4500, 2026-10-31): these values stay global and unchanged
+ *
+ * Re-deriving them changes what "overdue" means, so it was taken as a decision in
+ * its own right rather than a tuning pass. The outcome was to change nothing in
+ * this table. It rejected per-company, re-derived-global and distribution-derived
+ * thresholds alike — not as mis-calibrations, but because all three tune the same
+ * quantity and that quantity is not connected to the outcome. Each moves where the
+ * admission boundary on *age* sits; none changes the order *inside* the admitted
+ * set, which since PEN-4489 is `byPriorityThenAge`. In the sharpest measured case
+ * below, the withheld high-payoff row (`PEN-2213`, sole gate for 6) never takes the
+ * contested slot under *any* age threshold, because the row that beats it to that
+ * slot is strictly older. The lever is not attached to the result.
+ *
+ * Raising the bar is also the wrong direction on a top-heavy queue: it drops the
+ * *youngest* rows first, and the measurement below shows those are the ones worth
+ * keeping (`PEN-4079` is `critical` at 15.8d with the largest reach in the graph),
+ * while the oldest row in the contested tier gates nothing. So the action with the
+ * best measured return on this table is no action — which is also the maximally
+ * reversible one.
+ *
+ * The table's *job* changes even though its values do not: it is demoted from
+ * selector to **eligibility floor** — "silent long enough to be worth a human's
+ * attention at all". In that reduced role its exact value is no longer
+ * load-bearing, which is also why it does not earn a per-company config surface.
+ * Read a past-threshold count from this digest as "open and older than two weeks",
+ * not as a triage verdict.
+ *
+ * Discrimination moves instead to the transitive-payoff filter measured below,
+ * applied *before* the cap, with age as the tiebreak inside the payoff-positive
+ * set. Payoff is computed from each company's own blocker graph, so it is
+ * per-company **by construction** — which is how the per-company correctness that
+ * motivated PEN-4500 is met without a config surface to calibrate, drift, or
+ * forget. Wiring it in is **PEN-5114**; nothing below is live yet.
  *
  * ## A candidate selector that does discriminate — measured 2026-10-30 (PEN-4500)
  *
  * The paragraph above says what the threshold has stopped doing. This says what
  * could replace it, with the measurement that priced it. **Nothing here changes
- * behaviour** — PEN-4500 still owns the decision, and this is the evidence it was
- * missing, recorded where the next reader of the constant will find it.
+ * behaviour** — this is the evidence the decision above rests on, recorded where
+ * the next reader of the constant will find it. Wiring it in is **PEN-5114**.
  *
  * Re-measured on the Penstock queue 2026-10-30, same method as the 2026-10-22 pass
  * (all five open statuses, `assigneeUserId IS NOT NULL`, complete pages). The queue
