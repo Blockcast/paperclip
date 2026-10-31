@@ -43,6 +43,9 @@ function amAlert(fp: string, over: Record<string, unknown> = {}) {
 const ctx = {
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
   metrics: { write: vi.fn(async () => {}), observe: vi.fn(async () => {}) },
+  // No tracked member rows: these cases cover the firing backfill only. The
+  // lost-resolve pass is exercised end to end in reconcile-lost-resolve.test.ts.
+  db: { namespace: "ns", query: vi.fn(async () => []) },
 } as unknown as PluginContext;
 
 let served: unknown[] = [];
@@ -107,6 +110,11 @@ describe("reconcileActiveAlerts (BLO-44820)", () => {
     expect(result.routed).toBe(5);
     await reconcileActiveAlerts(ctx, config, NOW);
     expect(submitted()).toEqual(["filtered", "keep"]);
+  });
+
+  it("does not backfill a silenced or inhibited alert, which Alertmanager never notifies", async () => {
+    served = [amAlert("silenced", { status: { state: "suppressed", silencedBy: ["s1"], inhibitedBy: [] } })];
+    expect((await reconcileActiveAlerts(ctx, config, NOW)).backfilled).toEqual([]);
   });
 
   it("caps a backlog per pass so recovery is not a burst", async () => {

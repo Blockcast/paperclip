@@ -18,7 +18,7 @@ import type { PluginContext, PluginWebhookInput } from "@paperclipai/plugin-sdk"
 import { WEBHOOK_KEYS } from "./constants.js";
 import { ALERTMANAGER_READ_TIMEOUT_MS, resolveAlertmanagerApiUrl } from "./escalation.js";
 import { alertMatchesLabelFilter } from "./issue-mapping.js";
-import { handleWebhook, readAlertState } from "./webhook-handler.js";
+import { handleWebhook, parseMemberSnapshot, readAlertState } from "./webhook-handler.js";
 import type {
   AlertmanagerAlert,
   AlertmanagerPluginConfig,
@@ -49,6 +49,7 @@ interface ActiveApiAlert {
   endsAt?: unknown;
   generatorURL?: unknown;
   receivers?: unknown;
+  status?: { state?: unknown };
 }
 
 export interface ReconcileResult {
@@ -58,6 +59,8 @@ export interface ReconcileResult {
   routed: number;
   /** Alerts handed to the push path this pass. */
   backfilled: string[];
+  /** BLO-51097: tracked fingerprints Alertmanager no longer holds, resolved this pass. */
+  resolved?: string[];
 }
 
 export function toWebhookAlert(entry: ActiveApiAlert): AlertmanagerAlert | null {
@@ -113,9 +116,11 @@ export async function reconcileActiveAlerts(
   }
   if (!companyId) return { skipped: "no defaultCompanyId", routed: 0, backfilled: [] };
 
-  // Silenced and inhibited alerts are excluded: Alertmanager never notifies
-  // them, so the push path would not have filed them either.
-  const res = await fetch(`${base}/api/v2/alerts?active=true&silenced=false&inhibited=false`, {
+  // Read EVERYTHING Alertmanager holds, silenced and inhibited included: the
+  // resolve pass below must treat a suppressed alert as still held, since it is
+  // still firing. The backfill skips suppressed alerts itself, because
+  // Alertmanager never notifies them and the push path would not have filed them.
+  const res = await fetch(`${base}/api/v2/alerts?active=true&silenced=true&inhibited=true`, {
     headers: { accept: "application/json" },
     signal: AbortSignal.timeout(ALERTMANAGER_READ_TIMEOUT_MS),
   });
@@ -126,7 +131,12 @@ export async function reconcileActiveAlerts(
   const cutoff = now.getTime() - RECONCILE_GRACE_MS;
   let routed = 0;
   const missing: AlertmanagerAlert[] = [];
+  const held = new Set<string>();
   for (const entry of body as ActiveApiAlert[]) {
+    if (typeof entry.fingerprint === "string") held.add(entry.fingerprint);
+  }
+  for (const entry of body as ActiveApiAlert[]) {
+    if (entry.status?.state === "suppressed") continue;
     if (!routedTo(entry, receivers)) continue;
     routed += 1;
     const alert = toWebhookAlert(entry);
@@ -165,5 +175,107 @@ export async function reconcileActiveAlerts(
       ctx.logger.error(`paperclip-plugin-alertmanager: failed to record reconcile metric: ${String(err)}`);
     }
   }
-  return { routed, backfilled: missing.map((a) => a.fingerprint) };
+  const resolved = await reconcileLostResolves(ctx, config, companyId, held, now);
+  return { routed, backfilled: missing.map((a) => a.fingerprint), resolved };
+}
+
+/**
+ * fingerprint -> first pass (ms) that found it tracked-unresolved but not held
+ * by Alertmanager. In-memory on purpose: a worker restart only delays a resolve
+ * by one grace window, never causes a wrong one.
+ */
+const absentSince = new Map<string, number>();
+
+/** Test hook: forget absence observations between cases. */
+export function __resetLostResolveObservationsForTests(): void {
+  absentSince.clear();
+}
+
+/**
+ * BLO-51097 — the reverse of the backfill: an alert that RESOLVED while its
+ * resolve delivery was lost (control-plane restart, Alertmanager gave up
+ * retrying). Its member row still reads unresolved, its issue stays open, and
+ * no later delivery will ever arrive. On 2026-10-31 that stranded ~220 rows.
+ *
+ * Candidates are the aggregate member rows still marked unresolved; one is
+ * resolved only when Alertmanager holds no alert with its fingerprint on two
+ * passes at least RECONCILE_GRACE_MS apart. A single empty read is not enough:
+ * an Alertmanager restart briefly holds nothing, and acting on that would
+ * cancel every open alert row at once. Prometheus re-sends live alerts within
+ * a minute or two, far inside the grace window.
+ *
+ * The resolve goes through `handleWebhook` exactly as a delivery would, so
+ * aggregate fences, sibling deferral, the execution-lock guard and the
+ * `pluginClosedAt` stamp all apply unchanged.
+ *
+ * ponytail: assumes the queried Alertmanager is the only one delivering to this
+ * plugin (true today: the tools-cluster Alertmanager routes to null receivers).
+ * A second delivering Alertmanager would need its own read here first, or its
+ * alerts would be resolved as "not held". Legacy state rows with no member row
+ * are not enumerated; they still resolve on a real delivery.
+ */
+async function reconcileLostResolves(
+  ctx: PluginContext,
+  config: AlertmanagerPluginConfig,
+  companyId: string,
+  held: Set<string>,
+  now: Date,
+): Promise<string[]> {
+  const rows = await ctx.db.query<{ fingerprint: string; alert_snapshot: Record<string, unknown> | string | null }>(
+    `SELECT fingerprint, alert_snapshot
+       FROM ${ctx.db.namespace}.alertmanager_aggregate_members
+      WHERE company_id = $1 AND resolved_at IS NULL AND NOT (fingerprint = ANY($2::text[]))
+      ORDER BY updated_at ASC, fingerprint ASC`,
+    [companyId, [...held]],
+  );
+  const nowMs = now.getTime();
+  const candidates = new Set(rows.map((r) => r.fingerprint));
+  for (const fp of absentSince.keys()) if (!candidates.has(fp)) absentSince.delete(fp);
+
+  const lost: AlertmanagerAlert[] = [];
+  const endsAt = now.toISOString();
+  for (const row of rows) {
+    const firstAbsent = absentSince.get(row.fingerprint);
+    if (firstAbsent === undefined) {
+      absentSince.set(row.fingerprint, nowMs);
+      continue;
+    }
+    if (nowMs - firstAbsent < RECONCILE_GRACE_MS) continue;
+    const snap = parseMemberSnapshot(row.fingerprint, row.alert_snapshot);
+    lost.push({
+      status: "resolved",
+      fingerprint: row.fingerprint,
+      labels: snap?.labels ?? { alertname: "UnnamedAlert" },
+      annotations: snap?.annotations ?? {},
+      startsAt: snap?.startsAt || endsAt,
+      endsAt,
+    });
+    if (lost.length >= RECONCILE_MAX_PER_PASS) break;
+  }
+  if (lost.length === 0) return [];
+
+  ctx.logger.warn(
+    `paperclip-plugin-alertmanager: reconciler resolving ${lost.length} tracked alert(s) Alertmanager no longer holds (resolve delivery lost): ${lost
+      .map((a) => `${a.labels.alertname ?? "unknown"} (${a.fingerprint})`)
+      .join(", ")}`,
+  );
+  // Throws AlertDeliveryIncompleteError if any resolve failed (e.g. a held
+  // aggregate fence); those keep their absence mark and retry next pass.
+  await handleWebhook(ctx, config, true, {
+    endpointKey: WEBHOOK_KEYS.alertmanager,
+    companyId,
+    parsedBody: {
+      version: "4",
+      status: "resolved",
+      receiver: "paperclip-plugin-alertmanager/reconcile",
+      alerts: lost,
+    } satisfies AlertmanagerWebhookPayload,
+  } as unknown as PluginWebhookInput);
+  for (const a of lost) absentSince.delete(a.fingerprint);
+  try {
+    await ctx.metrics.write("alertmanager.reconcile.resolved", lost.length);
+  } catch (err) {
+    ctx.logger.error(`paperclip-plugin-alertmanager: failed to record reconcile metric: ${String(err)}`);
+  }
+  return lost.map((a) => a.fingerprint);
 }

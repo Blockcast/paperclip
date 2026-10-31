@@ -660,7 +660,7 @@ async function describeAggregate(
  * dropped: it is a genuinely firing member, and hiding it would reintroduce the
  * invisibility this change removes.
  */
-function parseMemberSnapshot(
+export function parseMemberSnapshot(
   fingerprint: string,
   raw: Record<string, unknown> | string | null,
 ): AlertmanagerAlert | null {
