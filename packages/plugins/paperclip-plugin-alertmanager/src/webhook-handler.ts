@@ -4346,6 +4346,16 @@ const SLOW_DELIVERY_MARKS_MS = [SLOW_DELIVERY_WARN_MS, WORKER_PROXY_DEADLINE_MS]
  * `_count + filtered` reconstructs `alerts_received`, and that identity is
  * what keeps this comparable with the aggregate counters rather than
  * silently diverging from them.
+ *
+ * ⚠ That identity holds **for deliveries that COMPLETE**, and the exception
+ * is not a defect in either counter. On the `DELIVERY_BUDGET_MS` break the
+ * remaining alerts are counted in `alerts_received` (it reports
+ * `body.alerts.length`) but are neither observed nor filtered, because they
+ * were never started — so `_count + filtered < alerts_received` by exactly
+ * the number handed back to Alertmanager, which then re-counts them on the
+ * retry. Read a divergence as budget exhaustion, cross-check it against
+ * `alertmanager.webhook.budget_exhausted`, and do not alert on the identity
+ * itself.
  */
 const ALERT_DURATION_METRIC = "alertmanager.webhook.alert_duration";
 

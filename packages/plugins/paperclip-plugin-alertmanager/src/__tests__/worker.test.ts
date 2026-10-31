@@ -737,6 +737,10 @@ describe("handleWebhook — delivery timing (BLO-37485)", () => {
         .filter((call) => call[0] === "alertmanager.webhook.alert_duration"),
     ).toHaveLength(1);
     // The identity that keeps the histogram comparable with the counters.
+    // Asserted on a COMPLETING delivery, which is where it holds: a delivery
+    // that exhausts its budget counts the alerts it never started in
+    // `alerts_received` and in neither of the other two. See
+    // ALERT_DURATION_METRIC.
     expect(mocks.metrics.write).toHaveBeenCalledWith(
       "alertmanager.webhook.filtered",
       1,
