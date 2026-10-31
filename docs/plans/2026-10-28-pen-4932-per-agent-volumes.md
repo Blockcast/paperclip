@@ -714,15 +714,61 @@ PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verificati
      that does not converge against a concurrent sibling pod on a `ReadWriteMany`
      claim.
 
+     ⚠️ **PEN-5125 done-when 2, decided 2026-10-31 — met through its SECOND
+     clause, not its first.** The criterion offered two ways to close: sweep the
+     tree, or bound the growth another way and write the accepted ceiling down.
+     Nothing in this stage sweeps an unreachable tree, so what closes it is the
+     ceiling stated next. The paragraphs after that are what became of the sweep.
+
+     **The ceiling, stated so it can be checked rather than remembered.** An
+     opted-in agent's isolation tree grows at ≈**10 GiB/agent/month** (the
+     measured July → 2026-09-02 fleet rate) against a **50 Gi** claim already
+     carrying ≈**13.2 G** of duplicated company trees. That is ≈36.8 GiB of
+     headroom, so **one opted-in agent fills its own claim in ≈3.7 months** — a
+     quarter — and does so without touching any other agent, which is the whole
+     point of the per-agent claim. `allowVolumeExpansion` is `true` on
+     `cephfs`, the StorageClass the per-agent claim is provisioned on
+     (`DEFAULT_AGENT_WORKSPACE_STORAGE_CLASS`; `ssd-fast` is the pool beneath
+     it, not the class), so the terminal state is an operator resizing a PVC,
+     not a run losing data. **That is why this is accepted and not a blocker**,
+     and it is also why it must not be accepted silently: the cost accrues for a
+     month before anything shows it.
+
+     **What enforces the ceiling is the probe that just landed, at N = 1.** Arm
+     A counts exactly the opted-in population, and
+     `PaperclipIsolationWorkspaceReaperCoverageGap` fires on `!= 0` — so the
+     *first* opt-in raises it, within one sweep, and it stays raised. Blockcast
+     runs that sweep **12-hourly** (`PAPERCLIP_ISOLATION_WORKSPACE_REAPER_INTERVAL_MINUTES=720`
+     in `values.blockcast.yaml`); the code fallback is daily, so take 24 h as
+     the worst case and 12 h as the deployed one. The
+     alert is therefore **not informational while reclamation is open**: it is
+     the standing record that an unreclaimed tree exists and has an owner. Do
+     not silence it; opting an agent in is accepted only together with an owner
+     for that claim's capacity.
+
+     ⚠️ **On Blockcast that enforcement is not live yet.**
+     `deploy/helm/paperclip/values.blockcast.yaml` sets `prometheusRule.enabled:
+     false`, and the mirror that actually deploys this rule,
+     Blockcast/onprem-k8s#7210, is still open. Until it lands, the ceiling is
+     accepted against an alarm that cannot sound — so verify the rule is loaded
+     at `/api/v1/rules` before treating the ceiling as enforced, and do not opt
+     an agent in on the strength of this paragraph alone.
+
+     **Operator remedy while it is open**: opt the agent back out, or expand the
+     claim. `runbooks/isolation-workspace-reaper.md` § "What you can actually do
+     about it today" carries both, with the cold-start cost of opting back out —
+     neither needs a reclaimer.
+
      ⚠️ **Reclamation is still open, and the ≈3.7-month ceiling above still
-     stands.** PEN-5125's done-when 2 — an opted-in agent's tree swept by
-     *something* — is NOT closed by this. What closed is the silence: the gap is
-     now measurable and alertable before the opt-in count grows, which is the
-     half whose absence was dangerous. The chosen shape for the reclaimer is a
-     dedicated executor holding the agent's claim, off the run hot path, with the
-     eligible set computed server-side from `lastUsedAt` so the DB-authoritative
-     idleness predicate survives — an in-pod sweep has no database, and `mtime`
-     on these roots is materialization time, which is the predicate BLO-31222
+     stands.** The *first* clause of PEN-5125's done-when 2 — an opted-in agent's
+     tree swept by *something* — is NOT closed by the detection described above.
+     What closed is the silence: the gap is now measurable and alertable
+     before the opt-in count grows, which is the half whose absence was
+     dangerous. The chosen shape for the reclaimer is a dedicated executor
+     holding the agent's claim, off the run hot path, with the eligible set
+     computed server-side from `lastUsedAt` so the DB-authoritative idleness
+     predicate survives — an in-pod sweep has no database, and `mtime` on
+     these roots is materialization time, which is the predicate BLO-31222
      exists to stop using.
 
      **Re-pointed to PEN-5151 (2026-10-31), which owns that executor.** Its
