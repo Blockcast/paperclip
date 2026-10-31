@@ -35,6 +35,10 @@
  * activity row on the issue. That window matters: an issue whose log predates
  * none of its comments would otherwise score its whole early history as lost.
  *
+ * The comment side is PAGED with the `after` cursor. One `?limit=500` request
+ * returns the oldest 500 and does not say so, which would bias the sample
+ * toward old comments on exactly the long-lived rows most worth measuring.
+ *
  * Exit codes:
  *   0  measured, documented contract held
  *   1  measured, contract VIOLATED (see below)
@@ -65,6 +69,53 @@ export const EXIT_NO_SAMPLE = 2;
 
 /** Below this many joined comments the sample cannot support a verdict. */
 export const DEFAULT_MIN_SAMPLE = 20;
+
+/**
+ * Page size for the comment walk. The route clamps `limit` to
+ * `MAX_ISSUE_COMMENT_LIMIT` (500, `server/src/routes/issues.ts`), so asking for
+ * more silently returns this many and the walk must notice.
+ */
+export const COMMENTS_PAGE_SIZE = 500;
+
+/** Safety stop for the comment walk. 20 x 500 = 10,000 comments on one issue. */
+export const MAX_COMMENT_PAGES = 20;
+
+/**
+ * Decide how to continue a keyset walk of `GET /issues/:id/comments?order=asc`.
+ *
+ * Paging at all is the point: a single `?limit=500` request on an issue with
+ * more than 500 comments returns the OLDEST 500 and says nothing about it. That
+ * cannot produce a false violation here (the logged-id set is drawn from the
+ * unlimited activity endpoint, so it stays a superset), but it silently biases
+ * the sample toward old comments — and a silent prefix presented as a whole
+ * reading is the exact failure mode this probe was written to expose. A probe
+ * that commits that error while measuring it is not worth much.
+ *
+ * Termination is decided on BOTH a short page and a page that contributes no
+ * new ids, rather than on the cursor contract alone. `after` is documented as
+ * strictly exclusive in both orders (PEN-4458), but a deployment predating that
+ * fix returns the anchor again at the head of every ascending page, which turns
+ * a cursor walk into an infinite loop that never adds a row. Deduping on `id`
+ * makes the walk correct under both behaviours instead of trusting the one.
+ *
+ * Pure so the walk's stopping rules are testable without a live deployment.
+ *
+ * @param {Array<{id?: string}>} page    rows from the latest request
+ * @param {Set<string>} seenIds          ids already collected by this walk
+ * @param {number} pageSize              the limit that was requested
+ * @returns {{fresh: Array, done: boolean, reason: string|null, cursor: string|null}}
+ */
+export function planNextCommentsPage(page, seenIds, pageSize = COMMENTS_PAGE_SIZE) {
+  const fresh = page.filter((row) => row?.id && !seenIds.has(row.id));
+  // A short page means the server had nothing more to give.
+  if (page.length < pageSize) return { fresh, done: true, reason: "short_page", cursor: null };
+  // A full page of rows we already hold = an inclusive-cursor server. Stop.
+  if (fresh.length === 0) return { fresh, done: true, reason: "no_new_rows", cursor: null };
+  const cursor = page[page.length - 1]?.id ?? null;
+  // No id to anchor on: continuing would re-request the same page forever.
+  if (!cursor) return { fresh, done: true, reason: "no_cursor", cursor: null };
+  return { fresh, done: false, reason: null, cursor };
+}
 
 /**
  * Classify one comment against the set of commentIds the activity log covers.
@@ -233,14 +284,37 @@ async function main() {
     targets = asArray(await get(`/api/companies/${companyId}/issues?limit=500`)).slice(0, args.limit);
   }
 
+  // Walks every page rather than taking the first 500, and reports it when the
+  // page cap stops it short -- a truncated read is unproven, never clean.
+  const fetchAllComments = async (issueId) => {
+    const seen = new Set();
+    const all = [];
+    let cursor = null;
+    for (let pages = 0; pages < MAX_COMMENT_PAGES; pages++) {
+      const query = `limit=${COMMENTS_PAGE_SIZE}&order=asc${cursor ? `&after=${encodeURIComponent(cursor)}` : ""}`;
+      const page = asArray(await get(`/api/issues/${issueId}/comments?${query}`));
+      const step = planNextCommentsPage(page, seen, COMMENTS_PAGE_SIZE);
+      for (const comment of step.fresh) {
+        seen.add(comment.id);
+        all.push(comment);
+      }
+      if (step.done) return { comments: all, truncated: false };
+      cursor = step.cursor;
+    }
+    return { comments: all, truncated: true };
+  };
+
   const sampledComments = [];
   const loggedCommentIds = new Set();
+  const truncatedIssues = [];
   let reachable = 0;
   for (const target of targets) {
     let comments;
     let activity;
     try {
-      comments = asArray(await get(`/api/issues/${target.id}/comments?limit=500&order=asc`));
+      const walked = await fetchAllComments(target.id);
+      comments = walked.comments;
+      if (walked.truncated) truncatedIssues.push(target.identifier ?? target.id);
       activity = asArray(await get(`/api/issues/${target.id}/activity`));
     } catch (err) {
       console.error(`skipped ${target.identifier ?? target.id}: ${err.message}`);
@@ -264,6 +338,7 @@ async function main() {
   const loss = unkeyedLossPct(summary);
   const report = {
     issuesReachable: reachable,
+    truncatedIssues,
     sample: sampleSize(summary),
     unkeyedLossPct: loss === null ? null : Number(loss.toFixed(3)),
     cells: summary,
@@ -284,6 +359,9 @@ async function main() {
       coverage: `${((100 * c.logged) / (c.logged + c.unlogged)).toFixed(1)}%`,
     })));
     console.log(`unkeyed agent/user loss: ${loss === null ? "n/a" : `${loss.toFixed(2)}%`}`);
+    if (truncatedIssues.length > 0) {
+      console.log(`  ! sample TRUNCATED on ${truncatedIssues.length} issue(s) at the ${MAX_COMMENT_PAGES}-page cap: ${truncatedIssues.join(", ")}`);
+    }
     console.log(`verdict: ${decision.verdict}${decision.reason ? ` (${decision.reason})` : ""}`);
     for (const v of decision.violations) console.log(`  ! ${v.kind}: ${v.detail}`);
   }
