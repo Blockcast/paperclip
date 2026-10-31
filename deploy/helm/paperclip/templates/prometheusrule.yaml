@@ -1978,6 +1978,12 @@ spec:
           # documented `scanned` identity exactly true over a shrunken
           # population. Every counter stays internally consistent and wrong.
           #
+          # The `-1` arm covers one case that is not a malfunction: a k8s
+          # ENVIRONMENT supplying `workspaceVolumeClaim`. That config is merged
+          # over the agent's and WINS, and the environment is chosen per run, so
+          # no sound per-agent count exists -- the probe degrades to the
+          # sentinel rather than publishing a number it cannot stand behind.
+          #
           # BLO-36814's `root_absent` stop reason does not cover this, despite
           # being written for "an enabled reaper pointed at a WRONG path". It
           # fires on ENOENT of the root, and the gap here leaves the root
@@ -2016,7 +2022,7 @@ spec:
             signal: isolation_workspace_reaper
           annotations:
             summary: "Paperclip isolation-workspace reaper (dry_run={{`{{ $labels.dry_run }}`}}) cannot reach every agent's tree"
-            description: "paperclip_isolation_workspace_reaper_unreachable_agents is {{`{{ $value | printf \"%.0f\" }}`}} (PEN-5125). A positive value is that many agents whose Job mounts a claim this process does not -- an operator workspaceVolumeClaim, or PEN-4932 stage 4b's per-agent claim -- so their data/k8s-isolation/workspaces/ trees are reclaimed by NOTHING and grow at the rate this reaper exists to contain (0 -> 406.7 GiB fleet-wide in ~2 months, ~10 GiB/agent/month). -1 means the coverage probe was absent or threw, so this sweep cannot describe its own coverage at all. Either way, every other reaper series describes a SUBSET of the population and stop_reason=complete does not contradict that. This is capacity, not an outage: allowVolumeExpansion is true, so it surfaces as a PVC resize rather than a run losing data."
+            description: "paperclip_isolation_workspace_reaper_unreachable_agents is {{`{{ $value | printf \"%.0f\" }}`}} (PEN-5125). A positive value is that many agents whose Job mounts a claim this process does not -- a workspaceVolumeClaim, or PEN-4932 stage 4b's per-agent claim -- so their data/k8s-isolation/workspaces/ trees are reclaimed by NOTHING and grow at the rate this reaper exists to contain (0 -> 406.7 GiB fleet-wide in ~2 months, ~10 GiB/agent/month). -1 means the probe was absent, threw, or found a k8s-driver ENVIRONMENT supplying a workspaceVolumeClaim -- that config is merged over the agent's and wins, so the agent-level count is untrustworthy and which agents it moves is not derivable server-side. Either way, every other reaper series describes a SUBSET of the population and stop_reason=complete does not contradict that. This is capacity, not an outage: allowVolumeExpansion is true, so it surfaces as a PVC resize rather than a run losing data."
             runbook_url: {{ .Values.prometheusRule.isolationWorkspaceReaperRunbookUrl | quote }}
     - name: paperclip-orphan-reap-wait-bound
       rules:

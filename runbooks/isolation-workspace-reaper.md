@@ -35,9 +35,14 @@ max by (dry_run) (paperclip_isolation_workspace_reaper_unreachable_agents)
 
 **`!= 0` means every other series on this page describes a subset of the population.** The reaper
 walks one volume — the claim this process mounts — and an agent whose Job mounts a different one
-(an operator `workspaceVolumeClaim`, or [PEN-4932](https://paperclip.blockcast.net/PEN/issues/PEN-4932)
+(a `workspaceVolumeClaim`, or [PEN-4932](https://paperclip.blockcast.net/PEN/issues/PEN-4932)
 stage 4b's per-agent claim) materializes its trees where no amount of walking this root will find
 them. ([PEN-5125](https://paperclip.blockcast.net/PEN/issues/PEN-5125).)
+
+⚠ `workspaceVolumeClaim` has **two** sources and the second is easy to miss: a k8s-driver
+environment's config is merged over the agent's and **wins**, so an agent can be on a foreign volume
+with nothing in its own `adapter_config` to say so. When any k8s environment names a claim the gauge
+reports `-1` rather than a count, because which agents that moves is not derivable server-side.
 
 Read the two values differently:
 
@@ -45,7 +50,9 @@ Read the two values differently:
   They grow at the rate this reaper exists to contain (≈10 GiB/agent/month measured over the
   July → 2026-09-02 fill). This is a capacity finding, not an outage: `allowVolumeExpansion` is
   `true`, so it surfaces as an operator resizing a PVC rather than a run losing data.
-- **`-1`** — the coverage probe was absent or threw, so this sweep cannot describe its own coverage.
+- **`-1`** — the probe was absent, threw, **or** found a k8s environment supplying a
+  `workspaceVolumeClaim`, which makes the agent-level count untrustworthy. Either way this sweep
+  cannot describe its own coverage.
   Operationally the same state as a known-partial sweep, which is why the alert expression is `!= 0`
   and not `> 0`.
 

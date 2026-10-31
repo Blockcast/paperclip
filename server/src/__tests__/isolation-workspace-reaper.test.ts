@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { environments } from "@paperclipai/db";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   ISOLATION_WORKSPACE_REAPER_DELETED_METRIC,
@@ -20,6 +21,7 @@ import {
 import {
   DEFAULT_MAX_DELETES_PER_TICK,
   PER_AGENT_WORKSPACE_VOLUME_CONFIG_KEY,
+  createDbUnreachableAgentCount,
   REAPABLE_LAYOUT,
   UNREACHABLE_AGENTS_UNKNOWN,
   WORKSPACE_VOLUME_CLAIM_CONFIG_KEY,
@@ -1204,12 +1206,14 @@ describe("reapIsolationWorkspaces coverage (PEN-5125)", () => {
     // coverage-blind by omission: it passes neither lookup, so both defaults
     // have to come from here.
     let probed = false;
+    // Answers both arms: no k8s environment names a claim, then seven agents
+    // are moved off this volume by their own config.
     const db = {
       select: () => ({
-        from: () => ({
+        from: (table: unknown) => ({
           where: async () => {
             probed = true;
-            return [{ count: 7 }];
+            return [{ count: table === environments ? 0 : 7 }];
           },
         }),
       }),
@@ -1236,20 +1240,100 @@ describe("reapIsolationWorkspaces coverage (PEN-5125)", () => {
 });
 
 describe("createDbUnreachableAgentCount (PEN-5125)", () => {
-  it("counts the per-agent-claim opt-in and the operator claim, and nothing else", async () => {
-    // Read as text rather than executed: the predicate is SQL, and what has to
-    // hold is that it mirrors `asBoolean` — only a JSON boolean `true` opts an
-    // agent in, so a string "true" must NOT match. A `->>` text comparison
-    // would over-report and name agents whose Job does mount this claim.
+  /**
+   * Captures the two aggregates in order. Arm B (`environments`) runs first and
+   * short-circuits, so a stub that answers only one query is enough to pin the
+   * short-circuit — which is the property under test.
+   */
+  function stubDb(answers: number[]) {
+    const queries: string[] = [];
+    let i = 0;
+    return {
+      queries,
+      db: {
+        select: () => ({
+          from: (table: unknown) => ({
+            where: async () => {
+              // Identity, not serialization: a drizzle table object is
+              // circular (`column.table` points back), so `JSON.stringify`
+              // throws here.
+              queries.push(table === environments ? "environments" : "agents");
+              return [{ count: answers[i++] ?? 0 }];
+            },
+          }),
+        }),
+      },
+    };
+  }
+
+  it("returns UNKNOWN, not a count, when a k8s environment supplies a claim", async () => {
+    // The review finding on #3180. `execute.ts` merges a k8s-remote target's
+    // config over the agent's with the ENVIRONMENT winning, so such an agent is
+    // on a foreign volume with nothing in its own row to say so. Which agents
+    // those are is not derivable here — the environment is chosen per run — so
+    // the only sound statement is that the agent count is untrustworthy.
+    const { db, queries } = stubDb([1, 99]);
+    const probe = createDbUnreachableAgentCount(db as never);
+
+    expect(await probe()).toBe(UNREACHABLE_AGENTS_UNKNOWN);
+    // …and it short-circuits: reporting a number beside a known-untrustworthy
+    // basis is exactly what the sentinel exists to avoid.
+    expect(queries).toEqual(["environments"]);
+  });
+
+  it("falls through to the agent count when no environment supplies a claim", async () => {
+    const { db, queries } = stubDb([0, 3]);
+    const probe = createDbUnreachableAgentCount(db as never);
+
+    expect(await probe()).toBe(3);
+    expect(queries).toEqual(["environments", "agents"]);
+  });
+
+  it("pins the SQL that cannot be exercised without a live Postgres", () => {
+    // Read as text rather than executed: `embedded-postgres` does not start in
+    // this sandbox. What has to hold is checkable from source, and each of
+    // these has a failure mode that would make the gauge lie.
     const source = readFileSync(
       fileURLToPath(new URL("../services/isolation-workspace-reaper.ts", import.meta.url)),
       "utf8",
     );
+
+    // Mirrors `asBoolean`: only a JSON boolean `true` opts an agent in. A `->>`
+    // text comparison would also match the string "true", naming agents whose
+    // Job DOES mount this claim.
     expect(source).toContain("'true'::jsonb");
-    expect(source).not.toMatch(/->>\s*PER_AGENT_WORKSPACE_VOLUME_CONFIG_KEY/);
-    // Both slots of `resolveDataClaimName` that leave this process's volume.
-    expect(source).toContain("WORKSPACE_VOLUME_CLAIM_CONFIG_KEY");
+    expect(source).not.toMatch(/->>\s*\$\{?PER_AGENT_WORKSPACE_VOLUME_CONFIG_KEY/);
+
+    // Arm B must be scoped to the driver that actually merges its config over
+    // the agent's; widening it would return UNKNOWN on environments that cannot
+    // move a Job at all.
+    expect(source).toMatch(/environments\.driver\} = 'k8s'/);
+
+    // `IS DISTINCT FROM`, never `<>`: with no self-claim supplied (the state
+    // today) a `<>` comparison against NULL is NULL, which would silently empty
+    // BOTH arms and restore the confident, false zero.
+    expect(source).toContain("IS DISTINCT FROM");
+    expect(source).not.toMatch(/btrim\([^)]*\) <> \$\{self\}/);
+
     expect(PER_AGENT_WORKSPACE_VOLUME_CONFIG_KEY).toBe("enablePerAgentWorkspaceVolume");
     expect(WORKSPACE_VOLUME_CLAIM_CONFIG_KEY).toBe("workspaceVolumeClaim");
+  });
+
+  it("passes the self-claim name through, so naming the server's own claim can be excluded", async () => {
+    // `serverHoldsJobDataClaim` is TRUE when `workspaceVolumeClaim` equals the
+    // server's own PVC, and naming it explicitly is a realistic operator choice
+    // — the adapter's fixtures use `paperclip-data`. Nothing supplies the name
+    // today, so this pins the seam rather than the exclusion.
+    const { db } = stubDb([0, 0]);
+    const probe = createDbUnreachableAgentCount(db as never, "  paperclip-data  ");
+    expect(await probe()).toBe(0);
+
+    const source = readFileSync(
+      fileURLToPath(new URL("../services/isolation-workspace-reaper.ts", import.meta.url)),
+      "utf8",
+    );
+    // Trimmed, and an empty string collapses to null so a blank config value
+    // cannot become a claim name nothing matches.
+    expect(source).toContain("selfDataClaimName?.trim() || null");
   });
 });
