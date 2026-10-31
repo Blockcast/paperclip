@@ -863,7 +863,8 @@ export function resolveSeedShape(input: {
  * `paperclip_isolation_workspace_reaper_unreachable_agents`, whose agent arm
  * counts exactly this population:
  * `PaperclipIsolationWorkspaceReaperCoverageGap` fires on `!= 0`, so the FIRST
- * opt-in raises it within one daily sweep and it stays raised. **Do not read
+ * opt-in raises it within one sweep and it stays raised — 12-hourly as
+ * Blockcast deploys it, 24 h on the code fallback. **Do not read
  * that alert as informational while PEN-5151 is open** — it is the standing
  * record that an unreclaimed tree exists, so opt an agent in only together with
  * an owner for its claim's capacity. The cheapest remedy is to opt the agent
