@@ -714,15 +714,48 @@ PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verificati
      that does not converge against a concurrent sibling pod on a `ReadWriteMany`
      claim.
 
-     ⚠️ **Reclamation is still open.** PEN-5125's done-when 2 — an opted-in
-     agent's tree swept by *something* — is NOT closed by this. What closed is
-     the silence: the gap is now measurable and alertable before the opt-in count
-     grows, which is the half whose absence was dangerous. The chosen shape for
-     the reclaimer is a dedicated executor holding the agent's claim, off the run
-     hot path, with the eligible set computed server-side from `lastUsedAt` so
-     the DB-authoritative idleness predicate survives — an in-pod sweep has no
-     database, and `mtime` on these roots is materialization time, which is the
-     predicate BLO-31222 exists to stop using.
+     ⚠️ **Reclamation is still open, and the ≈3.7-month ceiling above still
+     stands.** PEN-5125's done-when 2 — an opted-in agent's tree swept by
+     *something* — is NOT closed by this. What closed is the silence: the gap is
+     now measurable and alertable before the opt-in count grows, which is the
+     half whose absence was dangerous. The chosen shape for the reclaimer is a
+     dedicated executor holding the agent's claim, off the run hot path, with the
+     eligible set computed server-side from `lastUsedAt` so the DB-authoritative
+     idleness predicate survives — an in-pod sweep has no database, and `mtime`
+     on these roots is materialization time, which is the predicate BLO-31222
+     exists to stop using.
+
+     **Re-pointed to PEN-5151 (2026-10-31), which owns that executor.** Its
+     server half has since landed, inert: `buildIsolationReclaimPlan`
+     (`isolation-workspace-reaper.ts`) performs the inversion the shape asks for
+     — rows → directories, so the eligible set for a claim this process cannot
+     walk is still decided against `execution_workspaces`, by the same
+     `classifyIsolationWorkspaceAge` the mounted sweep uses. That shared
+     classifier is the point of the extraction: the two sweeps now run in
+     different processes, and a second transcription of the age rule is the
+     likeliest way the foreign-claim path ends up deleting on `mtime` alone.
+
+     ⚠️ **Nothing calls it yet, so no foreign claim is reclaimed and the capacity
+     clause on `resolveAgentWorkspaceClaimName` stays.** What remains in PEN-5151
+     is the executor: a Job mounting the foreign claim that reports an inventory,
+     receives a plan, and unlinks — re-checking `REAPABLE_LAYOUT` and
+     `hasNestedCheckout` against the bytes first, because both exist to retain
+     and neither can be answered from a report by the party asking permission to
+     delete. Two consequences of the split are already known and are design
+     constraints on that executor, not surprises to discover in it:
+
+     - **`execution_workspaces` has no agent column**, so a plan cannot be scoped
+       to one agent's claim from the rows alone. The intersection has to happen
+       where the filesystem is, which is why the executor reports an inventory
+       rather than being handed a fleet-wide idle list to match against.
+     - **There is no pre-unlink re-read available across the boundary.** The
+       mounted sweep re-reads `lastUsedAt` immediately before `fs.rm` because
+       restoring a workspace changes neither the root's existence, nor its
+       layout, nor its `mtime`. A plan crossing into another process cannot do
+       that, so the executor has to bound its own staleness instead — a short
+       `activeDeadlineSeconds` and a plan built immediately before the Job, or a
+       re-confirmation channel. Whichever is chosen must be stated, because the
+       window is the one property this split genuinely weakens.
 
      ⚠️ **The gate does NOT make done-when 1 met.** The criterion is two agent pods on one node
      reporting distinct volume IDs, which needs invariant 5 closed, the server rolled onto this

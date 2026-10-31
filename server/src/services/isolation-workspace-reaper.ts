@@ -138,6 +138,23 @@
  *   already documented as a check-then-act window. Reclamation wants a dedicated
  *   executor off the run hot path, not this one.
  *
+ * ## The server half of that executor is here (PEN-5151)
+ *
+ * `buildIsolationReclaimPlan` is the inversion the chosen shape asks for: rows
+ * -> directories, so the eligible set for a claim this process cannot walk is
+ * still decided HERE, against `execution_workspaces`, by the same
+ * `classifyIsolationWorkspaceAge` the mounted sweep uses. The executor holding
+ * the claim contributes the two things only it can — an inventory of what is
+ * actually there, and the unlink — and re-checks layout and nested checkouts
+ * against the bytes before removing anything.
+ *
+ * ⛔ It is NOT wired to an executor yet, and nothing calls it on the reap path.
+ * Landing the decision half reviewed and inert ahead of the Job that consumes
+ * it is the posture `workspace-pvc.ts` took for the claim itself, and for the
+ * same reason: the half that decides what gets deleted is the half worth
+ * reviewing on its own. Until that executor exists a foreign claim is still
+ * unreclaimed, and `unreachableAgents` is still the standing record of it.
+ *
  * See `docs/plans/2026-10-28-pen-4932-per-agent-volumes.md` §4 stage 4b.
  */
 import { inArray, sql } from "drizzle-orm";
@@ -291,7 +308,20 @@ export type UnreachableAgentCount = () => Promise<number>;
  * **Arm B — `environments`, a TRUST CHECK.** A k8s-driver environment's
  * `config.workspaceVolumeClaim` is merged over the agent's and WINS, so an
  * agent whose environment names a claim is on a foreign volume with nothing in
- * its own row to say so. Which agents those are is not derivable here: the
+ * its own row to say so.
+ *
+ * ⚠ `driver = 'k8s'` is necessary but not sufficient, so this arm can fire for
+ * an environment that moves no Job at all: `resolveEnvironmentExecutionTarget`
+ * returns `null` for a k8s environment unless the adapter is `claude_k8s` or
+ * `opencode_k8s` (`environment-execution-target.ts:126-128`), and the claim is
+ * read off that target. An environment only ever bound to non-k8s adapters
+ * therefore yields a false UNKNOWN. Left uncorrected deliberately: the fix
+ * would have to know which adapters an environment is bound to over its
+ * lifetime, which is per-run state — the same reason arm A cannot be corrected
+ * into a true count — and the error is in the safe direction, over-reporting
+ * doubt about coverage rather than under-reporting it. Named here so the next
+ * reader does not re-derive it from a `-1` with no unreachable tree behind it.
+ * (Ally, review of PR #3180.) Which agents those are is not derivable here: the
  * environment is chosen per run (`executionWorkspaceSettings.environmentId`
  * overrides `agents.defaultEnvironmentId`), so arm A cannot be corrected into a
  * true count. What CAN be said soundly is that arm A is no longer trustworthy —
@@ -491,6 +521,202 @@ export interface IsolationWorkspaceReapResult {
  */
 export const UNREACHABLE_AGENTS_UNKNOWN = -1;
 
+/**
+ * The age test, as a pure verdict over the two signals that can speak to it.
+ *
+ * Delete only when EVERY available signal says idle. `lastUsedAt` is the
+ * authoritative one and the only one that can keep a live workspace alive — see
+ * the module doc comment. Filesystem `mtime` is materialization time, so it is a
+ * valid *retention* signal even though it is a useless deletion signal: a
+ * directory materialized yesterday cannot have been idle for a month, whatever a
+ * stale row claims. Requiring both can only ever retain more, which is the
+ * correct bias for an irreversible operation, and it costs one `stat`.
+ *
+ * Extracted because it now has TWO callers that must agree exactly — the
+ * in-process sweep, and `buildIsolationReclaimPlan`, which decides the same
+ * question for a volume this process cannot walk (PEN-5151). Those two run in
+ * different processes and, for the plan, minutes apart from the unlink they
+ * authorize. A second transcription of this rule is the most likely way the
+ * foreign-claim sweep ends up deleting on a predicate the mounted one rejects,
+ * and the direction of that drift is unbounded: `mtime` alone is precisely the
+ * predicate BLO-31222 exists to stop using. One function, two callers.
+ *
+ * `idleSinceMs` is returned on every arm, not just the deletable one, because
+ * the caller logs it for retained directories too — an operator reading a sweep
+ * needs the age of what was KEPT as much as of what was removed.
+ */
+export type IsolationWorkspaceAgeVerdict =
+  | { verdict: "fresh"; idleSinceMs: number; ageSource: "mtime" }
+  | { verdict: "in_use"; idleSinceMs: number; ageSource: "lastUsedAt" }
+  | { verdict: "aged"; idleSinceMs: number; ageSource: "lastUsedAt" | "mtime" };
+
+export function classifyIsolationWorkspaceAge(input: {
+  mtimeMs: number;
+  owner: WorkspaceUsageRow | undefined;
+  cutoff: number;
+}): IsolationWorkspaceAgeVerdict {
+  const { mtimeMs, owner, cutoff } = input;
+  if (mtimeMs >= cutoff) return { verdict: "fresh", idleSinceMs: mtimeMs, ageSource: "mtime" };
+  if (!owner) return { verdict: "aged", idleSinceMs: mtimeMs, ageSource: "mtime" };
+  // A row exists, so the filesystem no longer gets a vote on deletion.
+  const lastUsedMs = owner.lastUsedAt.getTime();
+  if (lastUsedMs >= cutoff) {
+    return { verdict: "in_use", idleSinceMs: lastUsedMs, ageSource: "lastUsedAt" };
+  }
+  return { verdict: "aged", idleSinceMs: lastUsedMs, ageSource: "lastUsedAt" };
+}
+
+/**
+ * One directory as an executor holding a foreign claim can describe it, without
+ * a database (PEN-5151).
+ *
+ * `mtimeMs` is the root's own `mtime` — the same `stat` the mounted sweep takes,
+ * and carrying the same meaning: materialization time, useful only to retain.
+ */
+export interface IsolationWorkspaceInventoryEntry {
+  name: string;
+  mtimeMs: number;
+}
+
+/** What a reclaim executor is authorized to unlink, and why the rest was spared. */
+export interface IsolationReclaimPlan {
+  /**
+   * Directory names the executor may remove, oldest-idle first, after it
+   * re-checks layout and nested checkouts on its own volume. Ordering is part of
+   * the contract: `maxEntries` truncates, so the entries dropped must be the
+   * least overdue rather than whichever the inventory happened to list last.
+   */
+  eligibleIds: string[];
+  /** Materialized inside the window; cannot have been idle longer than it has existed. */
+  retainedFresh: number;
+  /** Resolved to a workspace row used inside the window — the live cohort. */
+  retainedInUse: number;
+  /**
+   * Refused because the name is not a workspace id. See the module header: this
+   * bucket exists only on the plan path, and it is a deliberate narrowing.
+   */
+  skippedUnsafeName: number;
+  /** True when `maxEntries` dropped eligible entries from the tail. */
+  truncated: boolean;
+  /** Entries considered, so a reader can check the buckets against the input. */
+  inventorySize: number;
+}
+
+/**
+ * The inversion: rows -> directories, for a claim this process cannot walk.
+ *
+ * The mounted sweep enumerates the filesystem and asks the database about what
+ * it found (`readdir` -> `id IN (...)`). A per-agent or operator claim has no
+ * such mount here, so the two halves are split across a process boundary: an
+ * executor holding the claim reports what it has, this function decides, and the
+ * executor unlinks what it is given. **Every deletion decision stays here**,
+ * against `execution_workspaces`, which is the whole point — an executor with no
+ * database could only fall back to `mtime`, and that is the predicate BLO-31222
+ * exists to stop using.
+ *
+ * The age rule is `classifyIsolationWorkspaceAge`, shared verbatim with the
+ * mounted sweep, so a directory is eligible here exactly when it would be there.
+ *
+ * ## What this does NOT decide, and must not be made to
+ *
+ * Layout (`REAPABLE_LAYOUT`) and `hasNestedCheckout` are **not** evaluated here,
+ * and the omission is deliberate rather than pending. Both read the filesystem,
+ * so answering them here would mean trusting an executor's report of its own
+ * contents about a tree it is asking permission to delete — and both exist to
+ * retain. They belong where the bytes are, re-checked immediately before the
+ * unlink, exactly as the mounted sweep does it. A plan entry is therefore
+ * permission to *consider* a directory, never an instruction to remove it, and
+ * an executor that skips those checks is not a faster executor but a wrong one.
+ *
+ * ## Why the name is validated, when the mounted sweep does not bother
+ *
+ * There, names come from `readdir` and are single path components by
+ * construction. Here a name crosses a process boundary and comes back as the
+ * argument to a recursive unlink, so a name like `..` or one carrying a
+ * separator would escape the root it was scoped to. `UUID_PATTERN` is both the
+ * natural rule — these directories ARE `execution_workspaces.id` — and the
+ * strictest one available, so it is used rather than a bespoke
+ * "no separators, not dot-dot" check that would have to be argued complete.
+ *
+ * The cost is real and bounded: a foreign-claim directory whose name is not a
+ * uuid is never planned, so it is never reclaimed by this path. On the mounted
+ * sweep such a name resolves to no row and falls to the `mtime` fallback. Here
+ * it is counted as `skippedUnsafeName` and left, which is the safe direction —
+ * an unreclaimed directory costs capacity, a mis-scoped `rm -rf` costs data.
+ *
+ * ## Bounded, like the sweep it mirrors
+ *
+ * `maxEntries` defaults to `DEFAULT_MAX_DELETES_PER_TICK` for property 4's
+ * reason: deletion on this filesystem is MDS-metadata-bound, and the executor is
+ * a second unlink source against the same MDS. Truncation is reported rather
+ * than silent, and the plan is sorted oldest-idle first so successive ticks make
+ * progress through a backlog instead of re-offering the same head.
+ */
+export async function buildIsolationReclaimPlan(input: {
+  inventory: ReadonlyArray<IsolationWorkspaceInventoryEntry>;
+  lookupWorkspaceUsage: WorkspaceUsageLookup;
+  maxAgeDays: number;
+  maxEntries?: number;
+  now?: () => number;
+}): Promise<IsolationReclaimPlan> {
+  const now = input.now ?? Date.now;
+  const maxEntries = input.maxEntries ?? DEFAULT_MAX_DELETES_PER_TICK;
+  const cutoff = now() - input.maxAgeDays * 86_400_000;
+
+  const plan: IsolationReclaimPlan = {
+    eligibleIds: [],
+    retainedFresh: 0,
+    retainedInUse: 0,
+    skippedUnsafeName: 0,
+    truncated: false,
+    inventorySize: input.inventory.length,
+  };
+
+  // Deduplicated as well as validated, for the same boundary reason: `readdir`
+  // cannot return a name twice, but an inventory can, and a repeated name would
+  // spend the `maxEntries` budget twice on one directory — pushing a real
+  // candidate out of the plan while the second unlink only ever finds ENOENT.
+  // First occurrence wins; a repeat carrying a different `mtimeMs` is incoherent
+  // input, not a second directory to judge.
+  const named: IsolationWorkspaceInventoryEntry[] = [];
+  const seen = new Set<string>();
+  for (const entry of input.inventory) {
+    if (!UUID_PATTERN.test(entry.name)) {
+      plan.skippedUnsafeName += 1;
+      continue;
+    }
+    if (seen.has(entry.name)) continue;
+    seen.add(entry.name);
+    named.push(entry);
+  }
+  if (named.length === 0) return plan;
+
+  // One batched query for the whole plan, matching the mounted sweep's opening
+  // snapshot. Unlike that sweep there is no pre-unlink re-read available from
+  // here — the unlink happens in another process — so this snapshot is the only
+  // database read the decision gets, and the executor's own staleness bound is
+  // what has to close the window. That bound is the executor's to state; this
+  // function's contract is only that the verdicts were true when taken.
+  const usage = await input.lookupWorkspaceUsage(named.map((entry) => entry.name));
+
+  const aged: Array<{ name: string; idleSinceMs: number }> = [];
+  for (const entry of named) {
+    const age = classifyIsolationWorkspaceAge({
+      mtimeMs: entry.mtimeMs,
+      owner: usage.get(entry.name),
+      cutoff,
+    });
+    if (age.verdict === "fresh") plan.retainedFresh += 1;
+    else if (age.verdict === "in_use") plan.retainedInUse += 1;
+    else aged.push({ name: entry.name, idleSinceMs: age.idleSinceMs });
+  }
+
+  aged.sort((a, b) => a.idleSinceMs - b.idleSinceMs);
+  plan.truncated = aged.length > maxEntries;
+  plan.eligibleIds = aged.slice(0, maxEntries).map((entry) => entry.name);
+  return plan;
+}
+
 function isReapableLayout(entries: string[]): boolean {
   if (entries.length !== REAPABLE_LAYOUT.length) return false;
   const sorted = [...entries].sort();
@@ -660,35 +886,27 @@ export async function reapIsolationWorkspaces(
     const dir = path.join(root, entry.name);
     const owner = usage.get(entry.name);
 
-    // The age test: delete only when EVERY available signal says idle.
-    //
-    // `lastUsedAt` is the authoritative one and the only one that can keep a
-    // live workspace alive — see the module doc comment. Filesystem `mtime` is
-    // materialization time, so it is a valid *retention* signal even though it
-    // is a useless deletion signal: a directory materialized yesterday cannot
-    // have been idle for a month, whatever a stale row claims. Requiring both
-    // can only ever retain more, which is the correct bias for an irreversible
-    // operation, and it costs one `stat`.
-    let idleSinceMs: number;
+    // The age test. One `stat`, then `classifyIsolationWorkspaceAge` — which
+    // is shared with `buildIsolationReclaimPlan` so the two sweeps cannot
+    // drift. See that function for why both signals are required.
+    let mtimeMs: number;
     try {
-      idleSinceMs = (await fs.stat(dir)).mtimeMs;
+      mtimeMs = (await fs.stat(dir)).mtimeMs;
     } catch {
       result.vanished += 1;
       continue;
     }
-    if (idleSinceMs >= cutoff) {
+
+    const age = classifyIsolationWorkspaceAge({ mtimeMs, owner, cutoff });
+    if (age.verdict === "fresh") {
       result.retainedFresh += 1;
       continue;
     }
-
-    if (owner) {
-      // A row exists, so the filesystem no longer gets a vote on deletion.
-      idleSinceMs = owner.lastUsedAt.getTime();
-      if (idleSinceMs >= cutoff) {
-        result.retainedInUse += 1;
-        continue;
-      }
+    if (age.verdict === "in_use") {
+      result.retainedInUse += 1;
+      continue;
     }
+    const idleSinceMs = age.idleSinceMs;
 
     let children: string[];
     try {
