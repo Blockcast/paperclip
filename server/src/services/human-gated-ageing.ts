@@ -497,6 +497,23 @@ export type BlockerEdge = {
  */
 export type BlockerGraphInput = {
   openIssueIds: Iterable<string>;
+  /**
+   * Blocker ids the platform considers *resolved* — `done`, and nothing else.
+   *
+   * Required rather than optional, and required even when empty: "absent means
+   * resolved" is the fail-open reading, so a caller that has not thought about
+   * this should fail to compile rather than quietly credit payoff for rows
+   * nothing can free.
+   *
+   * `cancelled` is **not** resolved. `listIssueDependencyReadinessMap`
+   * (`issues.ts`) keys readiness on `ne(status, "done")` — "Cancelled blockers
+   * intentionally remain unresolved until the relation changes" — and checkout
+   * refuses the row until the edge is cut. The same holds for an open row the
+   * caller's open-set query excluded for its own reasons (`hiddenAt`, digest
+   * rows): "outside the set I loaded" is a different question from "off the
+   * critical path".
+   */
+  resolvedBlockerIds: Iterable<string>;
   edges: Iterable<BlockerEdge>;
 };
 
@@ -514,7 +531,13 @@ export type TransitivePayoffResult = {
   payoffByIssueId: ReadonlyMap<string, number>;
   /** Open rows considered. */
   openRowCount: number;
-  /** Open rows holding at least one *open* blocker. */
+  /**
+   * Open rows holding at least one *open* blocker.
+   *
+   * A row held only by an unresolvable blocker is genuinely stuck but has no
+   * *open* blocker, so it is counted by {@link unresolvableRowCount} and not
+   * here.
+   */
   blockedRowCount: number;
   /**
    * Open rows gated by exactly one remaining root, which is some other row.
@@ -523,14 +546,42 @@ export type TransitivePayoffResult = {
    */
   soleGatedRowCount: number;
   /**
-   * Edges dropped because the blocker is not an open row — a `done` or
-   * `cancelled` blocker that the edge still records.
+   * Edges dropped because the blocker is `done` — the only status the platform
+   * treats as resolved.
    *
    * These are the phantom roots: counted as resolved (so they gate nothing)
    * rather than as unknown. The recorded 2026-10-30 measurement checked all 77
-   * of them were `done` before relying on that treatment.
+   * of them were `done` before relying on that treatment; the check is now made
+   * per edge rather than assumed of the whole out-of-set population, which is
+   * what that measurement actually licensed (PEN-5114 review).
    */
   phantomEdgeCount: number;
+  /**
+   * Edges to a blocker that is neither open nor `done`: a `cancelled` row, a
+   * row the caller's open-set query excluded (`hiddenAt`, digest rows), or a
+   * dangling / cross-company reference.
+   *
+   * Tallied apart from {@link phantomEdgeCount} precisely because the two pull
+   * opposite ways, and one log line that merged them would hide it: a phantom
+   * is resolved and gates nothing, while one of these still gates its row and
+   * nothing in this graph can say when it stops.
+   */
+  unresolvableEdgeCount: number;
+  /**
+   * Open rows carrying at least one unresolvable edge. Each is scored as *not*
+   * sole-gated, and so is everything reachable through it.
+   *
+   * Fail-closed, in the same direction as the cycle guard and for the same
+   * reason. The other direction — drop the edge and keep the rest — lets the
+   * row's frontier collapse onto whatever blocker remains, crediting that
+   * blocker with payoff for a row that acting on it will not free, and feeding
+   * that number straight into the cut order and the notice's "sole remaining
+   * gate for N" figures.
+   *
+   * Zero on a queue whose closed blockers are all `done`, which is what the
+   * 2026-10-30 measurement happened to be looking at.
+   */
+  unresolvableRowCount: number;
   /**
    * Open rows whose blocker closure contains a cycle.
    *
@@ -563,10 +614,18 @@ const NO_BLOCKERS: readonly string[] = Object.freeze([]);
  * Three properties the measurement depends on, each a deliberate choice rather
  * than an implementation detail:
  *
- * - **A blocker outside the open set is resolved, not unknown.** It is dropped
- *   from the graph and tallied as a phantom edge. Treating a `done` blocker as
- *   an open root would make every row below it look permanently gated by
- *   something nobody can act on, which is the opposite of what payoff is for.
+ * - **Only a `done` blocker is resolved. Every other out-of-set blocker is
+ *   unresolvable and fails closed.** A `done` blocker is dropped from the graph
+ *   and tallied as a phantom edge: treating it as an open root would make every
+ *   row below it look permanently gated by something nobody can act on, which
+ *   is the opposite of what payoff is for. Anything else outside the open set
+ *   contributes `null` instead — `cancelled` above all, but also a row the
+ *   caller's open-set query excluded (`hiddenAt`, digest rows) and a dangling
+ *   reference. The platform does not treat those as resolved either:
+ *   `listIssueDependencyReadinessMap` keys readiness on `ne(status, "done")`
+ *   and checkout refuses the row until the edge is cut. Dropping them would
+ *   collapse the row's frontier onto whatever blocker remains and credit that
+ *   blocker with freeing a row it cannot free (PEN-5114 review).
  * - **A row never counts itself.** An unblocked row is trivially its own sole
  *   root; crediting that would give every root a floor of 1 and erase the
  *   distinction the filter exists to draw — "frees something" from "frees
@@ -588,16 +647,27 @@ const NO_BLOCKERS: readonly string[] = Object.freeze([]);
 export function computeTransitivePayoff(graph: BlockerGraphInput): TransitivePayoffResult {
   const openIds = [...graph.openIssueIds];
   const openIdSet = new Set(openIds);
+  const resolvedBlockerIdSet = new Set(graph.resolvedBlockerIds);
 
   const blockedBy = new Map<string, string[]>();
+  /** Open rows with an edge to a blocker that is neither open nor `done`. */
+  const unresolvableRows = new Set<string>();
   let phantomEdgeCount = 0;
+  let unresolvableEdgeCount = 0;
   for (const edge of graph.edges) {
-    // An edge whose *blocked* end is closed is out of scope rather than
-    // phantom: there is no open row to free, so it is neither a resolved
-    // blocker nor a missing one. Only an unresolvable *blocker* is a phantom.
+    // An edge whose *blocked* end is closed is out of scope entirely: there is
+    // no open row to free, so the blocker's own status does not matter.
     if (!openIdSet.has(edge.issueId)) continue;
     if (!openIdSet.has(edge.blockerIssueId)) {
-      phantomEdgeCount += 1;
+      if (resolvedBlockerIdSet.has(edge.blockerIssueId)) {
+        phantomEdgeCount += 1;
+        continue;
+      }
+      // Neither open nor `done`, so the platform still holds this row. There is
+      // no open node to walk to, so it stays out of `blockedBy` — but the row
+      // is recorded here so it can never be scored sole-gated below.
+      unresolvableEdgeCount += 1;
+      unresolvableRows.add(edge.issueId);
       continue;
     }
     // A row cannot gate itself, and a self-edge would otherwise read as a
@@ -634,7 +704,9 @@ export function computeTransitivePayoff(graph: BlockerGraphInput): TransitivePay
       stack.pop();
       color.set(top.id, DFS_BLACK);
 
-      if (blockers.length === 0) {
+      const unresolvable = unresolvableRows.has(top.id);
+
+      if (blockers.length === 0 && !unresolvable) {
         // No open blocker: this row is its own root.
         frontier.set(top.id, top.id);
         continue;
@@ -660,7 +732,14 @@ export function computeTransitivePayoff(graph: BlockerGraphInput): TransitivePay
         if (union === undefined) union = childFrontier;
         else if (union !== childFrontier) union = null;
       }
-      frontier.set(top.id, union ?? null);
+      // An unresolvable blocker forces `null` the same way a back edge does, and
+      // is applied here rather than as an early return so a row that is both
+      // unresolvable and cyclic still lands in `touchedCycle`. Without the
+      // override a row whose only blocker is `cancelled` would reach the
+      // no-blockers branch above and be called its own root — becoming a
+      // frontier other rows collapse onto, and taking credit for freeing work
+      // that cannot start until a human cuts the edge.
+      frontier.set(top.id, unresolvable ? null : (union ?? null));
       if (sawCycle) touchedCycle.add(top.id);
     }
   }
@@ -689,6 +768,8 @@ export function computeTransitivePayoff(graph: BlockerGraphInput): TransitivePay
     blockedRowCount,
     soleGatedRowCount,
     phantomEdgeCount,
+    unresolvableEdgeCount,
+    unresolvableRowCount: unresolvableRows.size,
     cyclicRowCount: touchedCycle.size,
   };
 }

@@ -569,6 +569,71 @@ describeEmbeddedPostgres("humanGatedDigestTick (wired)", () => {
     expect(body).toContain("HGD-PAYOFF-OLD");
   });
 
+  it("gives a row no payoff for dependants a `cancelled` blocker still holds", async () => {
+    // PEN-5114 review, the fail-open direction. Same shape as the test above
+    // with one byte changed: the co-blocker is `cancelled` rather than `done`.
+    // The platform keeps a `cancelled` blocker *unresolved*
+    // (`listIssueDependencyReadinessMap` keys readiness on `ne(status,
+    // "done")`), so clearing the gate frees none of these three rows. Reading
+    // "absent from the open set" as "resolved" would score the gate at 3 and
+    // promote it over a strictly older row — crediting a console action that
+    // changes nothing. Only the wired path can catch this: the loader's
+    // `done`-only query is what the pure walk is handed.
+    const { companyId } = await createCompany();
+
+    // Strictly older, same tier, gates nothing. Must keep the slot.
+    await insertHumanGatedIssue({
+      companyId,
+      identifier: "HGD-CANCEL-OLD",
+      createdAt: daysAgo(140),
+    });
+    const gate = await insertHumanGatedIssue({
+      companyId,
+      identifier: "HGD-CANCEL-GATE",
+      createdAt: daysAgo(80),
+    });
+    const cancelledBlocker = await insertHumanGatedIssue({
+      companyId,
+      identifier: "HGD-CANCEL-BLOCKER",
+      status: "cancelled",
+      createdAt: daysAgo(200),
+    });
+
+    for (let index = 0; index < 3; index += 1) {
+      const dependant = await insertHumanGatedIssue({
+        companyId,
+        identifier: `HGD-CANCEL-DEP${index}`,
+        status: "todo",
+        assigneeUserId: null,
+        createdAt: daysAgo(10),
+      });
+      for (const blocker of [gate, cancelledBlocker]) {
+        await db.insert(issueRelations).values({
+          companyId,
+          // `issueId` is the blocker, `relatedIssueId` the blocked row.
+          issueId: blocker,
+          relatedIssueId: dependant,
+          type: "blocks",
+        });
+      }
+    }
+
+    await humanGatedDigestTick(db, { now: NOW, companyId });
+    const body = (await digestRow(companyId))[0]?.description ?? "";
+
+    const gatePosition = body.indexOf("HGD-CANCEL-GATE");
+    const oldPosition = body.indexOf("HGD-CANCEL-OLD");
+    expect(gatePosition).toBeGreaterThan(-1);
+    expect(oldPosition).toBeGreaterThan(-1);
+    // Payoff is 0 on both, so the sort collapses to priority-then-age and the
+    // older row keeps the slot. Scoring the gate at 3 would invert this.
+    expect(oldPosition).toBeLessThan(gatePosition);
+    // And the notice says so, rather than advertising a gate that is not one.
+    expect(body).toContain(
+      "No past-threshold row is the sole remaining gate for any open row on this queue",
+    );
+  });
+
   // -- A failing producer must not read as an all-clear -----------------------
 
   it("delivers and reopens a failure-only digest", async () => {

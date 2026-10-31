@@ -370,10 +370,19 @@ export async function loadHumanGatedIssues(
  * and `relatedIssueId` the *blocked* row — the same direction
  * {@link loadGateEvidence} reads — while {@link BlockerGraphInput} is oriented
  * from the blocked row's side, which is the direction the frontier walk runs.
- * Resolving blockers are not filtered out in SQL: an edge pointing at a row
- * outside the open set is a *phantom*, and `computeTransitivePayoff` counts
- * phantoms as it drops them, which is evidence that a `WHERE` clause here would
- * silently discard.
+ * Closed blockers are not filtered out in SQL: `computeTransitivePayoff` counts
+ * the out-of-set edges as it classifies them, which is evidence a `WHERE`
+ * clause here would silently discard.
+ *
+ * That classification needs one more read. Only a `done` blocker is resolved
+ * (PEN-5114 review) — `listIssueDependencyReadinessMap` keys readiness on
+ * `ne(status, "done")` and checkout refuses a row held by a `cancelled`
+ * blocker — so absence from `openRows` cannot stand in for it: `cancelled`
+ * rows, `hiddenAt` rows and digest rows are all absent here too. The third
+ * query below asks which of the out-of-set blockers are actually `done`;
+ * everything else fails closed inside the walk. It is company-scoped, so a
+ * cross-company or dangling reference resolves to nothing and fails closed with
+ * them, which is the direction we want for an id this graph cannot see.
  */
 export async function loadOpenBlockerGraph(
   db: Db,
@@ -399,8 +408,30 @@ export async function loadOpenBlockerGraph(
     .from(issueRelations)
     .where(and(eq(issueRelations.companyId, companyId), eq(issueRelations.type, "blocks")));
 
+  const openIssueIds = openRows.map((row) => row.id);
+  const openIdSet = new Set(openIssueIds);
+  const outOfSetBlockerIds = [
+    ...new Set(
+      edgeRows
+        .filter((row) => openIdSet.has(row.issueId) && !openIdSet.has(row.blockerIssueId))
+        .map((row) => row.blockerIssueId),
+    ),
+  ];
+
+  const resolvedBlockerIds: string[] = [];
+  for (const ids of chunk(outOfSetBlockerIds, AGGREGATE_CHUNK_SIZE)) {
+    const rows = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(
+        and(eq(issues.companyId, companyId), inArray(issues.id, ids), eq(issues.status, "done")),
+      );
+    for (const row of rows) resolvedBlockerIds.push(row.id);
+  }
+
   return {
-    openIssueIds: openRows.map((row) => row.id),
+    openIssueIds,
+    resolvedBlockerIds,
     edges: edgeRows,
   };
 }
@@ -609,10 +640,13 @@ export const humanGatedAgeingProducer: DigestProducer = {
     // only the eligibility floor in front of it. Read on the same transaction
     // handle as the candidates, after their row locks are held — but it is not
     // itself a locked read, so a blocker committing mid-collection can be
-    // observed here. That is the safe direction and is why no lock is taken: a
-    // blocker closing can only *lower* a payoff score (its dependants become
-    // free, or fall to another root), never invent one, so the worst case is a
-    // row ranked below where a stricter snapshot would have put it.
+    // observed here. No lock is taken because a payoff score is a ranking
+    // input, not a gate: a concurrent commit can move a score in *either*
+    // direction by one snapshot's worth — a blocker closing frees its
+    // dependants (lowering its own score) but can equally collapse a sibling
+    // row's frontier onto another root and *raise* that one, and an edge insert
+    // moves scores either way too — so the worst case is a row ranked off a
+    // snapshot one commit stale, which the next render corrects.
     const payoff = computeTransitivePayoff(await loadOpenBlockerGraph(db, companyId));
     logger.info(
       {
@@ -621,6 +655,8 @@ export const humanGatedAgeingProducer: DigestProducer = {
         blockedRowCount: payoff.blockedRowCount,
         soleGatedRowCount: payoff.soleGatedRowCount,
         phantomEdgeCount: payoff.phantomEdgeCount,
+        unresolvableEdgeCount: payoff.unresolvableEdgeCount,
+        unresolvableRowCount: payoff.unresolvableRowCount,
         cyclicRowCount: payoff.cyclicRowCount,
       },
       // The two validations the recorded measurement had to perform by hand

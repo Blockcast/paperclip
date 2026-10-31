@@ -1166,6 +1166,7 @@ describe("transitive payoff", () => {
     // c <- b <- a. Clearing `a` is the whole remaining gate for both b and c.
     const result = computeTransitivePayoff({
       openIssueIds: ["a", "b", "c"],
+      resolvedBlockerIds: [],
       edges: [edge("b", "a"), edge("c", "b")],
     });
 
@@ -1179,7 +1180,7 @@ describe("transitive payoff", () => {
   it("never credits a row for itself, so an unblocked row with no dependants scores 0", () => {
     // The distinction the filter exists to draw: "frees something" vs "frees
     // nothing". Self-crediting would floor every root at 1 and erase it.
-    const result = computeTransitivePayoff({ openIssueIds: ["a", "b"], edges: [] });
+    const result = computeTransitivePayoff({ openIssueIds: ["a", "b"], resolvedBlockerIds: [], edges: [] });
 
     expect(result.payoffByIssueId.get("a")).toBe(0);
     expect(result.payoffByIssueId.get("b")).toBe(0);
@@ -1191,6 +1192,7 @@ describe("transitive payoff", () => {
     // "one console action away" from freeing anything.
     const result = computeTransitivePayoff({
       openIssueIds: ["a", "b", "c"],
+      resolvedBlockerIds: [],
       edges: [edge("c", "a"), edge("c", "b")],
     });
 
@@ -1204,6 +1206,7 @@ describe("transitive payoff", () => {
     // nothing. This is the `PEN-1095` / `PEN-193` shape from the measurement.
     const result = computeTransitivePayoff({
       openIssueIds: ["root", "mid", "leaf"],
+      resolvedBlockerIds: [],
       edges: [edge("mid", "root"), edge("leaf", "mid")],
     });
 
@@ -1211,17 +1214,88 @@ describe("transitive payoff", () => {
     expect(result.payoffByIssueId.get("mid")).toBe(0);
   });
 
-  it("treats a blocker outside the open set as resolved, and counts it as a phantom", () => {
+  it("treats a `done` blocker outside the open set as resolved, and counts it as a phantom", () => {
     // A `done` blocker still has an edge row. Scoring it as an open root would
     // make everything under it look permanently gated by nobody.
     const result = computeTransitivePayoff({
       openIssueIds: ["a", "b"],
-      edges: [edge("b", "a"), edge("b", "closed-blocker")],
+      resolvedBlockerIds: ["done-blocker"],
+      edges: [edge("b", "a"), edge("b", "done-blocker")],
     });
 
     expect(result.payoffByIssueId.get("a")).toBe(1);
-    expect(result.payoffByIssueId.has("closed-blocker")).toBe(false);
+    expect(result.payoffByIssueId.has("done-blocker")).toBe(false);
     expect(result.phantomEdgeCount).toBe(1);
+    expect(result.unresolvableEdgeCount).toBe(0);
+    expect(result.unresolvableRowCount).toBe(0);
+  });
+
+  it("credits no payoff for a row that a `cancelled` blocker still holds", () => {
+    // PEN-5114 review. `listIssueDependencyReadinessMap` keys readiness on
+    // `ne(status, "done")`, so `cancelled` leaves `c` blocked and checkout
+    // refuses it until the edge is cut. Dropping the edge as a phantom would
+    // collapse c's frontier onto `a` and credit `a` with freeing a row that
+    // clearing `a` does not free — the fail-open direction.
+    const result = computeTransitivePayoff({
+      openIssueIds: ["a", "c"],
+      resolvedBlockerIds: [],
+      edges: [edge("c", "a"), edge("c", "cancelled-blocker")],
+    });
+
+    expect(result.payoffByIssueId.get("a")).toBe(0);
+    expect(result.soleGatedRowCount).toBe(0);
+    expect(result.phantomEdgeCount).toBe(0);
+    expect(result.unresolvableEdgeCount).toBe(1);
+    expect(result.unresolvableRowCount).toBe(1);
+  });
+
+  it("does not make a row held only by an unresolvable blocker its own root", () => {
+    // `c` has no *open* blocker, so the no-blockers branch would call it a root
+    // and hand it `d`'s payoff — for a row that cannot start until a human cuts
+    // the edge. Fail-closed has to be checked ahead of that branch.
+    const result = computeTransitivePayoff({
+      openIssueIds: ["c", "d"],
+      resolvedBlockerIds: [],
+      edges: [edge("c", "cancelled-blocker"), edge("d", "c")],
+    });
+
+    expect(result.payoffByIssueId.get("c")).toBe(0);
+    expect(result.soleGatedRowCount).toBe(0);
+    expect(result.unresolvableRowCount).toBe(1);
+  });
+
+  it("propagates an unresolvable blocker through everything reachable from it", () => {
+    // Same poisoning rule the cycle guard uses: `e` is gated by `d`, which is
+    // gated by `c`, which nothing here can free.
+    const result = computeTransitivePayoff({
+      openIssueIds: ["c", "d", "e"],
+      resolvedBlockerIds: [],
+      edges: [edge("c", "cancelled-blocker"), edge("d", "c"), edge("e", "d")],
+    });
+
+    expect(result.payoffByIssueId.get("c")).toBe(0);
+    expect(result.payoffByIssueId.get("d")).toBe(0);
+    expect(result.soleGatedRowCount).toBe(0);
+  });
+
+  it("separates a resolved blocker from an unresolvable one in the same walk", () => {
+    // The log line has to be able to tell these apart: `b` is freed by clearing
+    // `a`, `c` is not freed by anything in this graph.
+    const result = computeTransitivePayoff({
+      openIssueIds: ["a", "b", "c"],
+      resolvedBlockerIds: ["done-blocker"],
+      edges: [
+        edge("b", "a"),
+        edge("b", "done-blocker"),
+        edge("c", "a"),
+        edge("c", "cancelled-blocker"),
+      ],
+    });
+
+    expect(result.payoffByIssueId.get("a")).toBe(1);
+    expect(result.phantomEdgeCount).toBe(1);
+    expect(result.unresolvableEdgeCount).toBe(1);
+    expect(result.unresolvableRowCount).toBe(1);
   });
 
   it("scores a cycle as not-sole rather than dropping the back edge, and terminates", () => {
@@ -1229,6 +1303,7 @@ describe("transitive payoff", () => {
     // `a` to sole gate on the strength of an edge the guard threw away.
     const result = computeTransitivePayoff({
       openIssueIds: ["a", "b", "c"],
+      resolvedBlockerIds: [],
       edges: [edge("a", "b"), edge("b", "a"), edge("c", "a")],
     });
 
@@ -1240,8 +1315,8 @@ describe("transitive payoff", () => {
 
   it("reaches the same verdict for a cycle whichever row the walk enters from", () => {
     const edges = [edge("a", "b"), edge("b", "a"), edge("c", "a")];
-    const forward = computeTransitivePayoff({ openIssueIds: ["a", "b", "c"], edges });
-    const reversed = computeTransitivePayoff({ openIssueIds: ["c", "b", "a"], edges });
+    const forward = computeTransitivePayoff({ openIssueIds: ["a", "b", "c"], resolvedBlockerIds: [], edges });
+    const reversed = computeTransitivePayoff({ openIssueIds: ["c", "b", "a"], resolvedBlockerIds: [], edges });
 
     expect([...reversed.payoffByIssueId.entries()].sort()).toEqual(
       [...forward.payoffByIssueId.entries()].sort(),
@@ -1252,6 +1327,7 @@ describe("transitive payoff", () => {
   it("ignores a self-edge rather than reading it as a one-node cycle", () => {
     const result = computeTransitivePayoff({
       openIssueIds: ["a", "b"],
+      resolvedBlockerIds: [],
       edges: [edge("a", "a"), edge("b", "a")],
     });
 
@@ -1260,7 +1336,7 @@ describe("transitive payoff", () => {
   });
 
   it("pre-seeds every open row, so an absent key means 'not in the graph' and not 'scored 0'", () => {
-    const result = computeTransitivePayoff({ openIssueIds: ["a", "b"], edges: [] });
+    const result = computeTransitivePayoff({ openIssueIds: ["a", "b"], resolvedBlockerIds: [], edges: [] });
 
     expect([...result.payoffByIssueId.keys()].sort()).toEqual(["a", "b"]);
     expect(result.payoffByIssueId.has("never-loaded")).toBe(false);
@@ -1273,7 +1349,7 @@ describe("transitive payoff", () => {
     const ids = Array.from({ length: depth }, (_, index) => `n${index}`);
     const edges = ids.slice(1).map((id, index) => edge(id, ids[index]!));
 
-    const result = computeTransitivePayoff({ openIssueIds: ids, edges });
+    const result = computeTransitivePayoff({ openIssueIds: ids, resolvedBlockerIds: [], edges });
 
     expect(result.payoffByIssueId.get("n0")).toBe(depth - 1);
   });
