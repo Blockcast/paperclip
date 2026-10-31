@@ -44,17 +44,15 @@ test("release verify workflow covers the same split test surface as stable PR ve
     assert.match(verifyWorkflow, new RegExp(`group: ${group}`));
   }
 
-  for (const shardIndex of [0, 1, 2]) {
+  for (const shardIndex of [0, 1, 2, 3, 4, 5]) {
     assert.match(
       verifyWorkflow,
-      new RegExp(`group: general-server[\\s\\S]*?shard_index: ${shardIndex}[\\s\\S]*?shard_count: 3`),
+      new RegExp(`group: general-server[\\s\\S]*?shard_index: ${shardIndex}[\\s\\S]*?shard_count: 6`),
     );
-  }
-
-  for (const shardIndex of [0, 1, 2, 3]) {
-    assert.match(verifyWorkflow, new RegExp(`shard_index: ${shardIndex}[\\s\\S]*?shard_count: 4`));
   }
 
   assert.match(verifyWorkflow, /pnpm test:run:general -- --group/);
   assert.match(verifyWorkflow, /pnpm test:run:serialized -- --shard-index/);
+  assert.doesNotMatch(verifyWorkflow, /\n  serialized_tests:/);
+
 });

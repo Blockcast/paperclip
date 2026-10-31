@@ -52,9 +52,9 @@ jobs:
   general_tests:
     name: General tests (${{ matrix.group_label }})
     runs-on: arc-paperclip-general
-    # Keep release verification on ARC while tolerating embedded-Postgres I/O
-    # contention observed on the shared on-prem runner nodes.
-    timeout-minutes: 90
+    # Match the PR server/workspace caps so release verification exercises the
+    # same duration-balanced matrix without a stale shared ceiling.
+    timeout-minutes: ${{ matrix.timeout_minutes }}
     permissions:
       contents: read
     strategy:
@@ -62,21 +62,41 @@ jobs:
       matrix:
         include:
           - group: general-server
-            group_label: server (1/3)
+            group_label: server 1/6
             shard_index: 0
-            shard_count: 3
+            shard_count: 6
+            timeout_minutes: 110
           - group: general-server
-            group_label: server (2/3)
+            group_label: server 2/6
             shard_index: 1
-            shard_count: 3
+            shard_count: 6
+            timeout_minutes: 110
           - group: general-server
-            group_label: server (3/3)
+            group_label: server 3/6
             shard_index: 2
-            shard_count: 3
+            shard_count: 6
+            timeout_minutes: 110
+          - group: general-server
+            group_label: server 4/6
+            shard_index: 3
+            shard_count: 6
+            timeout_minutes: 110
+          - group: general-server
+            group_label: server 5/6
+            shard_index: 4
+            shard_count: 6
+            timeout_minutes: 110
+          - group: general-server
+            group_label: server 6/6
+            shard_index: 5
+            shard_count: 6
+            timeout_minutes: 110
           - group: general-workspaces-a
             group_label: workspaces-a
+            timeout_minutes: 75
           - group: general-workspaces-b
             group_label: workspaces-b
+            timeout_minutes: 45
 
     steps:
       - name: Checkout repository
@@ -108,51 +128,10 @@ jobs:
             pnpm test:run:general -- --group '${{ matrix.group }}'
           fi
 
-  serialized_tests:
-    name: Serialized tests (${{ matrix.shard_label }})
-    runs-on: arc-paperclip-general
-    timeout-minutes: 90
-    permissions:
-      contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - shard_index: 0
-            shard_count: 4
-            shard_label: 1/4
-          - shard_index: 1
-            shard_count: 4
-            shard_label: 2/4
-          - shard_index: 2
-            shard_count: 4
-            shard_label: 3/4
-          - shard_index: 3
-            shard_count: 4
-            shard_label: 4/4
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ inputs.ref }}
-
-      - name: Setup pnpm
-        uses: ./.github/actions/setup-pnpm
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: 24
-          cache: pnpm
-
-      - name: Set up GHA-backed sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
-
-      - name: Install dependencies
-        run: pnpm install --no-frozen-lockfile
-
+      # Reuse the checkout, dependency install, and embedded Postgres setup paid
+      # for by each server shard instead of starting a second four-job matrix.
       - name: Run serialized server test shard
+        if: matrix.group == 'general-server'
         run: pnpm test:run:serialized -- --shard-index ${{ matrix.shard_index }} --shard-count ${{ matrix.shard_count }}
 
   build:
