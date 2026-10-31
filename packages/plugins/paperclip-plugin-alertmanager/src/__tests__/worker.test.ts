@@ -691,9 +691,84 @@ describe("handleWebhook — delivery timing (BLO-37485)", () => {
     // log-line observable saw nothing. That contrast IS the regression this
     // metric fixes.
     expect(
-      mocks.logger.warn.mock.calls.some(([line]: [string]) =>
-        String(line).includes("slow delivery")),
+      mocks.logger.warn.mock.calls.some((call) =>
+        String(call[0]).includes("slow delivery")),
     ).toBe(false);
+  });
+
+  it("does NOT observe an alert the label filter dropped", async () => {
+    // A filtered alert costs microseconds. Observing it would drag the median
+    // toward zero in proportion to the filtered share, so the headline number
+    // would stop being "what an alert costs to process" — the only question
+    // this metric exists to answer. The filtered ones stay counted on
+    // `alertmanager.webhook.filtered`, so `_count + filtered` still
+    // reconstructs `alerts_received`.
+    const { ctx, mocks } = mkCtx();
+    const clock = stubClock(1_000_000);
+    mocks.issues.create.mockImplementation(async () => {
+      clock.advance(250);
+      return { id: "issue-1" };
+    });
+
+    try {
+      await handleWebhook(
+        ctx,
+        baseConfig({ acceptOnlyLabels: { team: "platform" } }),
+        true,
+        baseInput({
+          parsedBody: baseEnvelope({
+            alerts: [
+              baseAlert({ fingerprint: "fp-keep" }),
+              baseAlert({
+                fingerprint: "fp-drop",
+                labels: { alertname: "Other", severity: "warning", team: "storage" },
+              }),
+            ],
+          }),
+        }),
+      );
+    } finally {
+      clock.restore();
+    }
+
+    // One processed alert observed, one filtered alert not observed.
+    expect(
+      mocks.metrics.observe.mock.calls
+        .filter((call) => call[0] === "alertmanager.webhook.alert_duration"),
+    ).toHaveLength(1);
+    // The identity that keeps the histogram comparable with the counters.
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.webhook.filtered",
+      1,
+      { alertname: "Other" },
+    );
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.webhook.alerts_received",
+      2,
+    );
+  });
+
+  it("logs a failing observation ONCE per delivery, not once per alert", async () => {
+    // Host/plugin version skew (a host without `metrics.observe`) would
+    // otherwise emit one identical error per alert — 284 of them on the
+    // largest batch this handler has seen, during a rolling deploy.
+    const { ctx, mocks } = mkCtx();
+    mocks.metrics.observe.mockRejectedValue(new Error("metrics.observe: unknown method"));
+
+    await handleWebhook(ctx, baseConfig(), true, baseInput({
+      parsedBody: baseEnvelope({
+        alerts: [
+          baseAlert({ fingerprint: "fp-1" }),
+          baseAlert({ fingerprint: "fp-2" }),
+          baseAlert({ fingerprint: "fp-3" }),
+        ],
+      }),
+    }));
+
+    expect(
+      mocks.logger.error.mock.calls
+        .filter((call) => String(call[0]).includes("alertmanager.webhook.alert_duration")),
+    ).toHaveLength(1);
   });
 
   it("NEGATIVE CONTROL — observes nothing when the batch carries no alerts", async () => {

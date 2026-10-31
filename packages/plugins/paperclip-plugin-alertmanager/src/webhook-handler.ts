@@ -4336,6 +4336,16 @@ const SLOW_DELIVERY_MARKS_MS = [SLOW_DELIVERY_WARN_MS, WORKER_PROXY_DEADLINE_MS]
  * promoted tag keys share a per-name label budget, and this is read summed.
  * Per-alert attribution stays on the `slow delivery` log line, where
  * cardinality is free.
+ *
+ * ⚠ PROCESSED alerts only — an alert dropped by `acceptOnlyLabels` is NOT
+ * observed. It costs microseconds, so including it would drag the median
+ * toward zero in proportion to the filtered share and the headline number
+ * would stop being "what an alert costs to process", which is the only
+ * question this metric exists to answer. The filtered ones are already
+ * counted by `alertmanager.webhook.filtered`, so nothing is lost:
+ * `_count + filtered` reconstructs `alerts_received`, and that identity is
+ * what keeps this comparable with the aggregate counters rather than
+ * silently diverging from them.
  */
 const ALERT_DURATION_METRIC = "alertmanager.webhook.alert_duration";
 
@@ -4446,8 +4456,18 @@ export async function handleWebhook(
   const deliveryStartedAt = performance.now();
   let slowMarksReported = 0;
   let inFlight:
-    | { alertIndex: number; alert: AlertmanagerAlert; startedAt: number }
+    | {
+      alertIndex: number;
+      alert: AlertmanagerAlert;
+      startedAt: number;
+      /** Set when the label filter dropped this alert — see ALERT_DURATION_METRIC. */
+      filtered?: boolean;
+    }
     | undefined;
+  // Latched so host/plugin version skew (a host without `metrics.observe`)
+  // costs ONE log line per delivery rather than one per alert. A 284-alert
+  // batch during a rolling deploy would otherwise emit 284 identical errors.
+  let alertCostMetricFailed = false;
 
   // Evaluated after each alert's work, naming the alert just finished: the
   // first alert whose completion crosses a mark is the one in flight when the
@@ -4459,10 +4479,14 @@ export async function handleWebhook(
   // for that second reason specifically — awaiting here would make the
   // instrument a contributor to the quantity it reports.
   const reportAlertCost = (finished: NonNullable<typeof inFlight>): void => {
+    if (finished.filtered) return;
     const seconds = (performance.now() - finished.startedAt) / 1000;
     void ctx.metrics.observe(ALERT_DURATION_METRIC, seconds).catch((metricErr) => {
+      if (alertCostMetricFailed) return;
+      alertCostMetricFailed = true;
       ctx.logger.error(
-        `paperclip-plugin-alertmanager: failed to record ${ALERT_DURATION_METRIC}: ${String(metricErr)}`,
+        `paperclip-plugin-alertmanager: failed to record ${ALERT_DURATION_METRIC}`
+        + ` (further failures in this delivery suppressed): ${String(metricErr)}`,
       );
     });
   };
@@ -4519,6 +4543,11 @@ export async function handleWebhook(
     inFlight = { alertIndex, alert, startedAt: performance.now() };
 
     if (!alertMatchesLabelFilter(alert, config.acceptOnlyLabels)) {
+      // Marked, not cleared: the slow-delivery WARN line still needs to be
+      // able to name this alert as the one in flight at a mark, because a
+      // batch can spend its last seconds on filtered alerts and still be the
+      // delivery that gets abandoned.
+      inFlight.filtered = true;
       await ctx.metrics.write("alertmanager.webhook.filtered", 1, {
         alertname: alert.labels.alertname ?? "unknown",
       });
