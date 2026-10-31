@@ -18,6 +18,11 @@
 //   `:7050`                                   bare -- resolves against the file context
 //   `:3962-3964`                              a range; the construct may be anywhere in it
 //
+// A RANGE must additionally name a construct that occurs exactly ONCE in the file.
+// "Somewhere in these N lines" is a weak assertion that an unrelated occurrence can
+// satisfy by drifting into the window, so a range on a repeated symbol can report
+// `ok` while citing the wrong code. Pin it with the explicit form below.
+//
 // File context for bare anchors is declared by an HTML comment, invisible when
 // rendered, and holds until the next one:
 //
@@ -212,7 +217,22 @@ export function checkDocument({ docPath, docText, readSource }) {
     const sourceLines = source.split("\n");
     const cited = collapse(sourceLines.slice(anchor.lo - 1, anchor.hi).join("\n"));
     if (cited.includes(collapse(construct))) {
-      findings.push({ ...base, status: "ok", file, construct });
+      // A hit inside the range is not proof the range is the right one. When the
+      // construct also occurs elsewhere in the file, "somewhere in these N lines"
+      // can be satisfied by an unrelated occurrence that drifted into the window.
+      // Measured on this corpus: `:811-820` (`narrowWritableSurface`, 19 sites in
+      // the file) reported `ok` while citing a refusal clause ~270 lines away from
+      // the branch its prose describes. The check cannot tell those apart, so a
+      // RANGE must name a construct that is unique to the file.
+      //
+      // A single-line anchor is deliberately not failed on the same ground: its
+      // assertion is already as tight as a line number can make it, and all four
+      // of the corpus's ambiguous single-line anchors land on what their prose
+      // describes. They are counted in the summary so the weaker form stays
+      // visible instead of being reported as unqualified `ok`.
+      const sites = locateConstruct(sourceLines, construct);
+      const ambiguous = anchor.hi > anchor.lo && sites.length > 1;
+      findings.push({ ...base, status: ambiguous ? "ambiguous" : "ok", file, construct, sites });
       return;
     }
     findings.push({
@@ -244,7 +264,7 @@ export function applyFixes(docText, findings) {
   return { text, fixed: fixable.map((f) => ({ ...f, to: f.actual[0] })) };
 }
 
-const FAILING = new Set(["drifted", "no-construct", "no-file-context", "missing-file"]);
+const FAILING = new Set(["drifted", "ambiguous", "no-construct", "no-file-context", "missing-file"]);
 
 // An anchor's identity for the unverified manifest is (document, anchor, construct) --
 // never the line it sits on in the document, which moves whenever the document is
@@ -273,8 +293,14 @@ export function applyUnverified(findings, manifest, scannedDocs) {
   const out = findings.map((f) => {
     const key = unverifiedKey(f);
     if (!keys.has(key)) return f;
+    // Only a STILL-FAILING anchor discharges its entry. One that now resolves
+    // leaves its key unmatched and is reported stale -- which is what makes a
+    // corrected anchor force its own line out of the manifest, rather than
+    // leaving a hole that silently exempts the anchor again the next time it
+    // drifts.
+    if (!FAILING.has(f.status)) return f;
     matched.add(key);
-    return FAILING.has(f.status) ? { ...f, status: "unverified", was: f.status } : f;
+    return { ...f, status: "unverified", was: f.status };
   });
   const stale = [...keys].filter((k) => !matched.has(k));
   return { findings: out, stale };
@@ -298,6 +324,13 @@ function report(findings, { quiet, stale = [] }) {
         : `now at ${f.actual.map((n) => `:${n}`).join(", ")}`;
       console.error(`DRIFTED  ${where}  \`${f.anchor}\` -> ${f.file}`);
       console.error(`         construct \`${f.construct}\` is not in lines ${f.lo}-${f.hi}; ${actual}`);
+    } else if (f.status === "ambiguous") {
+      console.error(`AMBIGUOUS  ${where}  \`${f.anchor}\` -> ${f.file}`);
+      console.error(
+        `         construct \`${f.construct}\` is in lines ${f.lo}-${f.hi}, but occurs at ` +
+          `${f.sites.length} sites (${f.sites.map((n) => `:${n}`).join(", ")}); a range must ` +
+          `name a construct unique to the file. Pin it: \`${f.anchor}\` (\`<unique construct>\`)`,
+      );
     } else if (f.status === "no-construct") {
       console.error(`NO CONSTRUCT  ${where}  \`${f.anchor}\``);
       console.error(`         nothing to assert. Annotate it: \`${f.anchor}\` (\`<symbol>\`)`);
@@ -314,9 +347,14 @@ function report(findings, { quiet, stale = [] }) {
     for (const f of externals) {
       console.log(`skipped (${f.repo}) ${f.docPath}:${f.docLine} \`${f.anchor}\``);
     }
+    // Single-line anchors resting on a non-unique construct are the weaker form
+    // of the hazard AMBIGUOUS fails on. Not enforced, but counted, so the number
+    // cannot quietly grow behind an unqualified `resolved`.
+    const loose = findings.filter((f) => f.status === "ok" && f.sites?.length > 1).length;
     console.log(
-      `anchors: ${findings.length} total, ${count("ok")} resolved, ` +
-        `${failures.length} need attention, ${count("unverified")} unverified, ` +
+      `anchors: ${findings.length} total, ${count("ok")} resolved` +
+        (loose > 0 ? ` (${loose} on a construct with several sites)` : "") +
+        `, ${failures.length} need attention, ${count("unverified")} unverified, ` +
         `${externals.length} external`,
     );
   }

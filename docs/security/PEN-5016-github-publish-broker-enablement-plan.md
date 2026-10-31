@@ -124,6 +124,14 @@ Prefer a construct that occurs **once** in its file. A distinctive one makes the
 sharp and lets `--fix` relocate the number for you; `null` is technically present at the
 cited line and asserts almost nothing.
 
+For a **range** (`` `:1087-1100` ``) a unique construct is required, not preferred, and the
+check enforces it. A range only asserts "somewhere in these N lines", which an unrelated
+occurrence can satisfy by drifting into the window: `` `:811-820` `` (`narrowWritableSurface`,
+19 sites in that file) reported clean here while citing a refusal clause ~270 lines from the
+branch this record describes. `--fix` never relocates a range either — re-deriving its extent
+is a judgement about what the citation covers — so the unique construct is the only thing that
+will catch the next drift.
+
 When a number drifts, run `node scripts/check-doc-line-anchors.mjs --fix` — it rewrites any
 anchor whose construct it can place unambiguously, and reports the rest rather than guessing.
 
@@ -134,7 +142,8 @@ anchor whose construct it can place unambiguously, and reports the rest rather t
 Read at `vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts` **`:3229`**
 (`asBoolean(config.enableGitHubPublishBroker, false)`). Every anchor below is a line in that
 same vendored file — not the `opencode-k8s` adapter's same-named `job-manifest.ts` — and each
-was re-verified at source on `master` `47d01a4bf` (2026-10-31T09:5xZ):
+is re-resolved against the tree by `scripts/check-doc-line-anchors.mjs` on every PR, so these
+numbers are checked continuously rather than as of any one reading:
 
 | | Gate off (today) | Gate on |
 |---|---|---|
@@ -407,8 +416,8 @@ looked".
 **What changed on 2026-10-20 is named in the source, not inferred.** `BLO-47526` gave a `shared`
 runtime descriptor agent-scoped persistent roots so that `narrowWritableSurface` holds — the
 `mode === "shared"` branch and its rationale comment in
-`vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts` at **`:811-820`**
-(`narrowWritableSurface`), with
+`vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts` at **`:1087-1100`**
+(`if (mode === "shared") {`), with
 `narrowWritableSurface` itself defined at **`:3570`**
 (`const narrowWritableSurface = isolation.enabled && dataClaimName !== "";`); before it, a shared run returned
 `enabled:false` and kept the whole PVC mounted rw. `isolation_disabled` being the *only* leg that
