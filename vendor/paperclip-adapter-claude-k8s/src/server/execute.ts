@@ -354,7 +354,14 @@ import {
   // `data_claim_foreign` warning has to name the very directory this resolves.
   // Two copies would drift, and the warning would then name a path no run reads.
   resolvePromptCacheRoot,
+  // PEN-4932 stage 4b, same reason as `resolvePromptCacheRoot` above: this
+  // process has to answer "can the pod see what I am about to write" BEFORE it
+  // calls `buildJobManifest`, and the answer is the builder's own claim
+  // precedence. Imported rather than re-derived so the two cannot drift.
+  resolveDataClaimName,
+  serverHoldsJobDataClaim,
   type JobIsolation,
+  type PromptBundleSecret,
 } from "./job-manifest.js";
 import type * as k8s from "@kubernetes/client-node";
 import { PatchStrategy, setHeaderOptions } from "@kubernetes/client-node";
@@ -926,7 +933,23 @@ const SECRET_DISPOSITION_VERB = {
  */
 export async function createOrAdoptRunSecret(
   coreApi: k8s.CoreV1Api,
-  input: { name: string; namespace: string; runId: string; data: Record<string, string> },
+  input: {
+    name: string;
+    namespace: string;
+    runId: string;
+    data: Record<string, string>;
+    /**
+     * Already-base64 values for the Secret's `data` field, i.e. bytes that are
+     * not valid UTF-8 and so cannot ride `stringData` (PEN-4932: a skill tree
+     * may ship a PNG or a font). Omitted by every other caller, all of which
+     * carry text.
+     *
+     * Kubernetes base64-decodes these before `ValidateSecret` sums them, so the
+     * two halves count the same decoded bytes against `MaxSecretSize` — the
+     * projection's `totalValueBytes` already budgets both.
+     */
+    base64Data?: Record<string, string>;
+  },
 ): Promise<SecretDisposition> {
   const body: k8s.V1Secret = {
     apiVersion: "v1",
@@ -946,6 +969,11 @@ export async function createOrAdoptRunSecret(
       annotations: { [LAUNCH_AT_ANNOTATION]: new Date().toISOString() },
     },
     stringData: input.data,
+    // Omitted entirely when empty: an explicit `data: {}` is harmless but shows
+    // up in every adopt PATCH body, and the other callers never set it.
+    ...(input.base64Data && Object.keys(input.base64Data).length > 0
+      ? { data: input.base64Data }
+      : {}),
   };
 
   // At most two passes.  The second exists only for the read-404 case below,
@@ -2696,6 +2724,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   let envSecret: { name: string; namespace: string; data: Record<string, string> } | null = null;
   let mcpConfigSecret: { name: string; namespace: string; data: Record<string, string> } | null = null;
   let sharedDocsSecret: { name: string; namespace: string; data: Record<string, string> } | null = null;
+  let promptBundleSecret: PromptBundleSecret | null = null;
   // runtimeSessionParams and currentSessionIdRaw are also used after the
   // try block (in the result-parsing section) so hoist them here.
   const runtimeSessionParams = parseObject(runtime.sessionParams);
@@ -3036,142 +3065,230 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // nothing, which is a pure regression. The refusal becomes load-bearing in the same
   // change that makes the pod read from the Secret; until then every outcome here is
   // reported and stepped over.
-  try {
-    // Sized at most once per distinct bundle, not once per run. `buildPromptBundleSecretProjection`
-    // re-reads every desired skill file, and `prepareClaudePromptBundle` has already
-    // hashed those same trees a few lines above — so without this, every run pays a
-    // second full content read of the skill farm on the Job-creation critical path, on
-    // the CephFS mount whose stalls are this issue's entire subject, purely to produce
-    // a log line.
+  //
+  // ⚠️ MEASUREMENT IS THE `else` BRANCH NOW. When the server does NOT hold the
+  // Job's claim the projection is the DELIVERY path, and every sentence above
+  // about stepping over outcomes stops applying: a refusal there means the pod
+  // would come up without its instructions, so it must fail the run. The two
+  // branches are kept apart rather than flagged inside one because they differ
+  // in all three of what they do with a refusal, whether they may use the sizing
+  // cache, and whether they may skip a run.
+  let promptBundleProjection: PromptBundleSecretProjection | null = null;
+  // Gated on claim IDENTITY, through the same resolver `buildJobManifest` uses,
+  // so the two cannot drift into the permissive direction — this process
+  // deciding its own write is visible to a pod that cannot see it.
+  const promptBundleNeedsSecretDelivery =
+    promptBundle !== null &&
+    !serverHoldsJobDataClaim({
+      dataClaimName: resolveDataClaimName({
+        workspaceVolumeClaim: config.workspaceVolumeClaim,
+        selfPodPvcClaimName: selfPod.pvcClaimName,
+      }),
+      selfPodPvcClaimName: selfPod.pvcClaimName,
+    });
+  if (promptBundleNeedsSecretDelivery) {
+    // NOT cached, and that is not an oversight. The sizing cache holds a summary,
+    // not the bytes, so a hit would leave this path with nothing to deliver; and
+    // the delivery path needs the real contents every run regardless, because the
+    // Secret is per-run.
     //
-    // `bundleKey` is a sha256 over the instructions plus every skill's key, runtimeName
-    // and full tree contents, so an equal key means the projected BYTES are equal. It
-    // does not cover what the filter in `skillSourceNeedsProjection` reads — the source
-    // paths, the server mount and the catalog set — so those are folded in here; two
-    // runs agreeing on all of it cannot disagree about the measurement.
-    const sizingKey = promptBundleSizingKey({
-      bundleKey: promptBundle.bundleKey,
-      serverDataMountPath: SELF_POD_DATA_MOUNT_PATH,
+    // NOT wrapped in a try/catch either. `buildPromptBundleSecretProjection`
+    // refuses rather than truncates — over budget, too many files, too many dirs,
+    // a symlink escaping the tree, a symlink cycle — and each of those refusals
+    // is exactly the "agent silently came up missing half its instructions"
+    // outcome this invariant exists to prevent. Letting it propagate fails the
+    // run with a verdict that names the company, the run and the measured bytes,
+    // which is §4.2's escalation path. Stepping over it here would ship the
+    // silent failure instead.
+    // Bound to a const first: `promptBundleProjection` is a `let` that has to
+    // outlive this block to reach `buildJobManifest`, and TypeScript drops the
+    // non-null narrowing across the `await` boundary below.
+    const projection = await buildPromptBundleSecretProjection({
+      companyId: ctx.agent.companyId,
+      runLabel: ctx.runId,
       skills: desiredSkills,
+      instructionsContents,
+      serverDataMountPath: SELF_POD_DATA_MOUNT_PATH,
       catalogBackedSkillKeys,
     });
-    const cached = PROMPT_BUNDLE_SIZING_CACHE.get(sizingKey);
-    let sized: PromptBundleSizing;
-    if (cached) {
-      sized = cached;
-    } else {
-      try {
-        sized = summarizePromptBundleProjection(
-          await buildPromptBundleSecretProjection({
-            companyId: ctx.agent.companyId,
-            runLabel: ctx.runId,
-            skills: desiredSkills,
-            instructionsContents,
-            serverDataMountPath: SELF_POD_DATA_MOUNT_PATH,
-            // The discriminator `prompt-cache.ts` keys on. Without it the prefix test
-            // alone would call every catalog skill an image path and drop it from the
-            // projection wherever PAPERCLIP_HOME is not under the server mount.
-            catalogBackedSkillKeys,
-          }),
-        );
-      } catch (err) {
-        // A deterministic refusal is remembered under the same key, so the bundles
-        // that cannot fit the channel stop re-reading the whole skill farm every run.
-        // Anything else is rethrown unremembered: a transient I/O fault must not
-        // suppress the measurement for the life of the process.
-        //
-        // The symlink refusals take a THIRD path: reported, never remembered. The
-        // sizing key cannot tell their fixed trees from their broken ones — see
-        // `UNCACHEABLE_PROJECTION_REFUSAL_NAMES` — so caching one would keep refusing a
-        // tree the operator has already repaired exactly as the error told them to.
-        if (!isUncacheableProjectionRefusal(err) && !isDeterministicProjectionRefusal(err)) throw err;
-        sized = describeProjectionRefusal(
-          err as
-            | PromptBundleOverBudgetError
-            | PromptBundleTooManyFilesError
-            | PromptBundleSymlinkEscapesTreeError
-            | PromptBundleSymlinkCycleError
-            | PromptBundleTooManyDirsError,
-        );
-      }
-      // Skips the uncacheable refusals: still reported below on THIS run, just not
-      // remembered for later ones.
-      rememberProjectionSizingUnlessUncacheable(sizingKey, sized);
-    }
-    if (sized.outcome === "refused") {
-      // Same warn the catch below emits, reached without rebuilding the projection.
-      // The refusals ARE the signal this measurement exists to find, so a company
-      // that would not fit the channel stays visible on every run rather than only
-      // on the first one that happened to compute it.
-      console.warn(
+    promptBundleProjection = projection;
+    if (!projection) {
+      // "Nothing to carry" — no instructions and no projectable skills — which is
+      // a complete delivery of an empty bundle, not a failure. `buildJobManifest`
+      // stages no Secret and emits no materialization step, and nothing is lost:
+      // a null projection means there were no bytes for the shared volume to have
+      // carried either.
+      console.info(
         JSON.stringify({
-          level: "warn",
-          event: "claude_k8s.prompt_bundle_projection_failed",
-          msg: "could not size the projected prompt-bundle Secret; run is unaffected (measurement only)",
-          // The company and run EMITTING this line. The refusal's own fields below are
-          // run-independent by construction, so these are never a prior run's.
+          level: "info",
+          event: "claude_k8s.prompt_bundle_projection_empty",
+          msg: "prompt bundle has nothing to project; no Secret staged (PEN-4932 stage 4b)",
           companyId: ctx.agent.companyId,
           runId: ctx.runId,
-          errorName: sized.errorName,
-          refusal: sized.detail,
-          sizingCacheHit: cached !== undefined,
         }),
       );
     } else {
       console.info(
         JSON.stringify({
           level: "info",
-          event: "claude_k8s.prompt_bundle_projection_sized",
-          msg: "measured the projected per-run prompt-bundle Secret size (PEN-4932 stage 4b; not yet the delivery path)",
+          event: "claude_k8s.prompt_bundle_projection_delivered",
+          msg: "prompt bundle is travelling by Secret; the Job's claim is not this server's own (PEN-4932 stage 4b)",
           companyId: ctx.agent.companyId,
           runId: ctx.runId,
-          // Raw value bytes — the quantity `ValidateSecret` checks, across `stringData`
-          // and base64 `data` alike. See the module header: §4.2's sample figure was
-          // base64-inflated.
-          totalValueBytes: sized.totalValueBytes,
-          fileCount: sized.fileCount,
-          // Non-UTF-8 files, which have to travel base64. Zero today is the expected
-          // reading; a non-zero one says some skill tree ships an asset, which is worth
-          // knowing before the Secret becomes the delivery path.
-          binaryFileCount: sized.binaryFileCount,
-          // Files the walk stepped over and the pod will therefore not get. Emitted so
-          // that "visible rather than silent" is a property of this channel rather than
-          // a claim about it, and so the byte total is read with its own omissions.
-          resolvedSymlinkCount: sized.resolvedSymlinkCount,
-          danglingSymlinkCount: sized.danglingSymlinkCount,
-          skippedNonRegularCount: sized.skippedNonRegularCount,
+          totalValueBytes: projection.totalValueBytes,
+          fileCount: projection.fileCount,
+          binaryFileCount: projection.binaryFileCount,
+          resolvedSymlinkCount: projection.resolvedSymlinkCount,
+          // Files the walk stepped over, so the byte total is read with its own
+          // omissions. A dangling link gives the pod nothing on either channel, so
+          // it is counted rather than refused — but on THIS path it is the last
+          // place anyone will see it.
+          danglingSymlinkCount: projection.danglingSymlinkCount,
+          skippedNonRegularCount: projection.skippedNonRegularCount,
           maxBytes: PROMPT_BUNDLE_SECRET_MAX_BYTES,
-          escalationThresholdCrossed: sized.escalationThresholdCrossed,
-          bytesBySkillKey: sized.bytesBySkillKey,
-          sizingCacheHit: cached !== undefined,
+          escalationThresholdCrossed: projection.escalationThresholdCrossed,
+          bytesBySkillKey: projection.bytesBySkillKey,
         }),
       );
     }
-  } catch (err) {
-    // The TRANSIENT faults only — an ENOENT mid-walk, an EIO off CephFS. All FIVE
-    // deliberate refusals are handled above as a `refused` outcome; two of them are
-    // cached and three are deliberately not (see
-    // `UNCACHEABLE_PROJECTION_REFUSAL_NAMES` — do NOT "fix" those back into the cache,
-    // the sizing key cannot tell a fixed tree from a broken one). Anything reaching
-    // HERE is this run's own fresh fault, so `error` is its message and no cached
-    // string can be stale. A consumer tells the two apart by `errorName`, and by
-    // `refusal` versus `error`.
-    console.warn(
-      JSON.stringify({
-        level: "warn",
-        event: "claude_k8s.prompt_bundle_projection_failed",
-        msg: "could not size the projected prompt-bundle Secret; run is unaffected (measurement only)",
-        companyId: ctx.agent.companyId,
-        runId: ctx.runId,
-        errorName: err instanceof Error ? err.name : "unknown",
-        error: err instanceof Error ? err.message : String(err),
-        sizingCacheHit: false,
-      }),
-    );
+  } else {
+    try {
+      // Sized at most once per distinct bundle, not once per run. `buildPromptBundleSecretProjection`
+      // re-reads every desired skill file, and `prepareClaudePromptBundle` has already
+      // hashed those same trees a few lines above — so without this, every run pays a
+      // second full content read of the skill farm on the Job-creation critical path, on
+      // the CephFS mount whose stalls are this issue's entire subject, purely to produce
+      // a log line.
+      //
+      // `bundleKey` is a sha256 over the instructions plus every skill's key, runtimeName
+      // and full tree contents, so an equal key means the projected BYTES are equal. It
+      // does not cover what the filter in `skillSourceNeedsProjection` reads — the source
+      // paths, the server mount and the catalog set — so those are folded in here; two
+      // runs agreeing on all of it cannot disagree about the measurement.
+      const sizingKey = promptBundleSizingKey({
+        bundleKey: promptBundle.bundleKey,
+        serverDataMountPath: SELF_POD_DATA_MOUNT_PATH,
+        skills: desiredSkills,
+        catalogBackedSkillKeys,
+      });
+      const cached = PROMPT_BUNDLE_SIZING_CACHE.get(sizingKey);
+      let sized: PromptBundleSizing;
+      if (cached) {
+        sized = cached;
+      } else {
+        try {
+          sized = summarizePromptBundleProjection(
+            await buildPromptBundleSecretProjection({
+              companyId: ctx.agent.companyId,
+              runLabel: ctx.runId,
+              skills: desiredSkills,
+              instructionsContents,
+              serverDataMountPath: SELF_POD_DATA_MOUNT_PATH,
+              // The discriminator `prompt-cache.ts` keys on. Without it the prefix test
+              // alone would call every catalog skill an image path and drop it from the
+              // projection wherever PAPERCLIP_HOME is not under the server mount.
+              catalogBackedSkillKeys,
+            }),
+          );
+        } catch (err) {
+          // A deterministic refusal is remembered under the same key, so the bundles
+          // that cannot fit the channel stop re-reading the whole skill farm every run.
+          // Anything else is rethrown unremembered: a transient I/O fault must not
+          // suppress the measurement for the life of the process.
+          //
+          // The symlink refusals take a THIRD path: reported, never remembered. The
+          // sizing key cannot tell their fixed trees from their broken ones — see
+          // `UNCACHEABLE_PROJECTION_REFUSAL_NAMES` — so caching one would keep refusing a
+          // tree the operator has already repaired exactly as the error told them to.
+          if (!isUncacheableProjectionRefusal(err) && !isDeterministicProjectionRefusal(err)) throw err;
+          sized = describeProjectionRefusal(
+            err as
+              | PromptBundleOverBudgetError
+              | PromptBundleTooManyFilesError
+              | PromptBundleSymlinkEscapesTreeError
+              | PromptBundleSymlinkCycleError
+              | PromptBundleTooManyDirsError,
+          );
+        }
+        // Skips the uncacheable refusals: still reported below on THIS run, just not
+        // remembered for later ones.
+        rememberProjectionSizingUnlessUncacheable(sizingKey, sized);
+      }
+      if (sized.outcome === "refused") {
+        // Same warn the catch below emits, reached without rebuilding the projection.
+        // The refusals ARE the signal this measurement exists to find, so a company
+        // that would not fit the channel stays visible on every run rather than only
+        // on the first one that happened to compute it.
+        console.warn(
+          JSON.stringify({
+            level: "warn",
+            event: "claude_k8s.prompt_bundle_projection_failed",
+            msg: "could not size the projected prompt-bundle Secret; run is unaffected (measurement only)",
+            // The company and run EMITTING this line. The refusal's own fields below are
+            // run-independent by construction, so these are never a prior run's.
+            companyId: ctx.agent.companyId,
+            runId: ctx.runId,
+            errorName: sized.errorName,
+            refusal: sized.detail,
+            sizingCacheHit: cached !== undefined,
+          }),
+        );
+      } else {
+        console.info(
+          JSON.stringify({
+            level: "info",
+            event: "claude_k8s.prompt_bundle_projection_sized",
+            msg: "measured the projected per-run prompt-bundle Secret size (PEN-4932 stage 4b; not yet the delivery path)",
+            companyId: ctx.agent.companyId,
+            runId: ctx.runId,
+            // Raw value bytes — the quantity `ValidateSecret` checks, across `stringData`
+            // and base64 `data` alike. See the module header: §4.2's sample figure was
+            // base64-inflated.
+            totalValueBytes: sized.totalValueBytes,
+            fileCount: sized.fileCount,
+            // Non-UTF-8 files, which have to travel base64. Zero today is the expected
+            // reading; a non-zero one says some skill tree ships an asset, which is worth
+            // knowing before the Secret becomes the delivery path.
+            binaryFileCount: sized.binaryFileCount,
+            // Files the walk stepped over and the pod will therefore not get. Emitted so
+            // that "visible rather than silent" is a property of this channel rather than
+            // a claim about it, and so the byte total is read with its own omissions.
+            resolvedSymlinkCount: sized.resolvedSymlinkCount,
+            danglingSymlinkCount: sized.danglingSymlinkCount,
+            skippedNonRegularCount: sized.skippedNonRegularCount,
+            maxBytes: PROMPT_BUNDLE_SECRET_MAX_BYTES,
+            escalationThresholdCrossed: sized.escalationThresholdCrossed,
+            bytesBySkillKey: sized.bytesBySkillKey,
+            sizingCacheHit: cached !== undefined,
+          }),
+        );
+      }
+    } catch (err) {
+      // The TRANSIENT faults only — an ENOENT mid-walk, an EIO off CephFS. All FIVE
+      // deliberate refusals are handled above as a `refused` outcome; two of them are
+      // cached and three are deliberately not (see
+      // `UNCACHEABLE_PROJECTION_REFUSAL_NAMES` — do NOT "fix" those back into the cache,
+      // the sizing key cannot tell a fixed tree from a broken one). Anything reaching
+      // HERE is this run's own fresh fault, so `error` is its message and no cached
+      // string can be stale. A consumer tells the two apart by `errorName`, and by
+      // `refusal` versus `error`.
+      console.warn(
+        JSON.stringify({
+          level: "warn",
+          event: "claude_k8s.prompt_bundle_projection_failed",
+          msg: "could not size the projected prompt-bundle Secret; run is unaffected (measurement only)",
+          companyId: ctx.agent.companyId,
+          runId: ctx.runId,
+          errorName: err instanceof Error ? err.name : "unknown",
+          error: err instanceof Error ? err.message : String(err),
+          sizingCacheHit: false,
+        }),
+      );
+    }
   }
 
   // Build Job manifest
-    const built = buildJobManifest({ ctx: effectiveCtx, selfPod, promptBundle });
+    const built = buildJobManifest({ ctx: effectiveCtx, selfPod, promptBundle, promptBundleProjection });
     const job = built.job;
     jobName = built.jobName;
     namespace = built.namespace;
@@ -3182,6 +3299,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     envSecret = built.envSecret;
     mcpConfigSecret = built.mcpConfigSecret;
     sharedDocsSecret = built.sharedDocsSecret;
+    promptBundleSecret = built.promptBundleSecret;
     podLogPath = built.podLogPath;
     // Create the `subPath` targets before the Job exists (BLO-32734). Without
     // fsGroup, the kubelet creates a missing subPath dir as root:root 0755,
@@ -3357,6 +3475,52 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
     }
 
+    // PEN-4932 stage 4b, invariant 1. The prompt bundle, when the Job's claim is
+    // not this server's own and the bundle therefore cannot reach the pod over
+    // the data volume. `buildJobManifest` produces this Secret only in that case,
+    // so on today's fleet it is null and this block is skipped.
+    //
+    // Fails the run when it fails, for the same reason as the shared-docs Secret
+    // above and more sharply: the Job references it `optional: false`, and the
+    // thing it carries is the agent's INSTRUCTIONS. A pod that started without
+    // them would be indistinguishable from an agent that read them and chose
+    // otherwise.
+    if (promptBundleSecret) {
+      try {
+        const disposition = await createOrAdoptRunSecret(coreApi, {
+          name: promptBundleSecret.name,
+          namespace: promptBundleSecret.namespace,
+          runId,
+          data: promptBundleSecret.stringData,
+          // BOTH halves. Passing only `stringData` here would drop every
+          // non-UTF-8 file while the volume's `items[]` still projected its key,
+          // which Kubernetes reports as a Secret whose key is missing — the pod
+          // never starts. See `PromptBundleSecret`.
+          base64Data: promptBundleSecret.base64Data,
+        });
+        await onLog(
+          "stdout",
+          `[paperclip] ${SECRET_DISPOSITION_VERB[disposition]} prompt-bundle Secret: ${promptBundleSecret.name} (${
+            Object.keys(promptBundleSecret.stringData).length + Object.keys(promptBundleSecret.base64Data).length
+          } files)\n`,
+        );
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        await onLog("stderr", `[paperclip] Failed to create prompt-bundle Secret: ${msg}\n`);
+        for (const staged of [promptSecret, envSecret, mcpConfigSecret, sharedDocsSecret]) {
+          if (!staged) continue;
+          await coreApi.deleteNamespacedSecret({ name: staged.name, namespace: staged.namespace }).catch(() => undefined);
+        }
+        return {
+          exitCode: null,
+          signal: null,
+          timedOut: false,
+          errorMessage: `Failed to create prompt-bundle Secret: ${msg}`,
+          errorCode: "k8s_prompt_bundle_secret_create_failed",
+        };
+      }
+    }
+
     // Create the Job
     let createdJobUid: string | undefined;
     // Set when the Job below already existed and is provably this run's own
@@ -3413,6 +3577,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             await coreApi.deleteNamespacedSecret({ name: sharedDocsSecret.name, namespace: sharedDocsSecret.namespace });
           } catch { /* best-effort */ }
         }
+        if (promptBundleSecret) {
+          try {
+            await coreApi.deleteNamespacedSecret({ name: promptBundleSecret.name, namespace: promptBundleSecret.namespace });
+          } catch { /* best-effort */ }
+        }
         return {
           exitCode: null,
           signal: null,
@@ -3446,6 +3615,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ["env", envSecret],
       ["mcp-config", mcpConfigSecret],
       ["shared-docs", sharedDocsSecret],
+      ["prompt-bundle", promptBundleSecret],
     ] as const) {
       if (!secret) continue;
       if (!createdJobUid) {
@@ -3491,7 +3661,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // adoption assigns createdJobUid, so an adopted run reaches the patch loop
       // above and can retain unowned Secrets just as a created one can.
       if (!adoptedExistingJob && (await cleanupJob(namespace, jobName, onLog, kubeconfigPath, podLogPath))) {
-        await deleteRunSecrets(coreApi, [promptSecret, envSecret, mcpConfigSecret, sharedDocsSecret]);
+        await deleteRunSecrets(coreApi, [promptSecret, envSecret, mcpConfigSecret, sharedDocsSecret, promptBundleSecret]);
       } else {
         await warnUnownedSecrets();
       }
@@ -3517,7 +3687,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // live in-cluster object, not the most.  The adopted path still reaches
       // the warning, for the reason given at the first abort.
       if (!adoptedExistingJob && (await cleanupJob(namespace, jobName, onLog, kubeconfigPath, podLogPath))) {
-        await deleteRunSecrets(coreApi, [promptSecret, envSecret, mcpConfigSecret, sharedDocsSecret]);
+        await deleteRunSecrets(coreApi, [promptSecret, envSecret, mcpConfigSecret, sharedDocsSecret, promptBundleSecret]);
       } else {
         await warnUnownedSecrets();
       }
@@ -3843,7 +4013,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // a pod outlived teardown, the Secrets stay too: the ownerReference-driven
     // Job GC collects them, and a retained Job's pod must keep its mounts.
     if (podsGone) {
-      await deleteRunSecrets(coreApi, [promptSecret, envSecret, mcpConfigSecret, sharedDocsSecret]);
+      await deleteRunSecrets(coreApi, [promptSecret, envSecret, mcpConfigSecret, sharedDocsSecret, promptBundleSecret]);
     } else {
       // If any Secret's ownerReference patch did not land, that Secret carries
       // no ownerReference, so the Job GC that eventually collects the rest will

@@ -25,6 +25,12 @@ import {
   SHARED_DOC_SECRET_VOLUME_NAME,
 } from "./shared-doc-overlay.js";
 import { SELF_POD_DATA_MOUNT_PATH } from "./k8s-client.js";
+import type { PromptBundleSecretProjection } from "./prompt-bundle-projection.js";
+import {
+  PROMPT_BUNDLE_SECRET_MOUNT_PATH,
+  PROMPT_BUNDLE_SECRET_VOLUME_NAME,
+} from "./prompt-bundle-projection.js";
+import { buildPromptBundleMaterializationShell } from "./prompt-bundle-materialization.js";
 
 /**
  * Default path to the project-scope .mcp.json that paperclip's helm-chart seed-init
@@ -786,6 +792,53 @@ export function resolveSeedShape(input: {
 }
 
 /**
+ * The claim the Job's `data` volume will mount, by the same precedence
+ * `buildJobManifest` applies: an operator/environment-supplied
+ * `workspaceVolumeClaim` wins, else the server's own PVC, else none.
+ *
+ * Exported because `execute.ts` has to answer one question BEFORE it can call
+ * `buildJobManifest` — whether the prompt bundle has to travel by Secret — and
+ * the answer is a property of this precedence. Re-deriving it there would be a
+ * second copy of a rule that is load-bearing for the agent's instructions
+ * arriving at all, and the two could drift silently in the permissive
+ * direction (execute.ts deciding the server's write is visible when it is not).
+ */
+export function resolveDataClaimName(input: {
+  workspaceVolumeClaim: unknown;
+  selfPodPvcClaimName: string | null | undefined;
+}): string {
+  return asString(input.workspaceVolumeClaim, "").trim() || (input.selfPodPvcClaimName ?? "") || "";
+}
+
+/**
+ * Does the SERVER hold the very volume this Job will mount?
+ *
+ * This is the identity that `execute.ts`'s *"One volume, TWO mount points"*
+ * assumption rests on: the server writes the prompt bundle at
+ * `SELF_POD_DATA_MOUNT_PATH` and the pod reads the same relative path at
+ * `resolveDataMountPath(config)`. Those are the same BYTES only while they are
+ * the same VOLUME, which is exactly this predicate.
+ *
+ * PEN-4932 names it rather than leaving it inline because it now has two
+ * consumers with different jobs: `serverCanPreCreate` (can the server create
+ * this Job's `subPath` targets through its own mount) and the prompt-bundle
+ * delivery channel (must the bundle travel by Secret instead of by volume).
+ * Those are different questions about the same fact, and folding either into
+ * the other has already been a defect once — see `serverCanPreCreate`'s own
+ * comment on why it is kept apart from `narrowWritableSurface`.
+ *
+ * The empty case is FALSE by construction: `dataClaimName === ""` means the
+ * Job gets an `emptyDir`, which is not the server's volume either, so no
+ * server-materialized tree reaches it.
+ */
+export function serverHoldsJobDataClaim(input: {
+  dataClaimName: string;
+  selfPodPvcClaimName: string | null | undefined;
+}): boolean {
+  return input.dataClaimName !== "" && input.dataClaimName === (input.selfPodPvcClaimName ?? "");
+}
+
+/**
  * POD address of the prompt-cache root — where `execute.ts` writes the prompt
  * bundle and where the agent container reads it back — or null to let the
  * bundle fall back to its managed server-side default.
@@ -1339,6 +1392,16 @@ export interface JobBuildInput {
   selfPod: SelfPodInfo;
   /** Prepared prompt bundle (skills + instructions). When provided, --add-dir and --append-system-prompt-file use bundle paths. */
   promptBundle?: ClaudePromptBundle | null;
+  /**
+   * The bundle projected for Secret delivery, or null/absent to leave the
+   * bundle travelling over the data volume.
+   *
+   * `execute.ts` builds this — it is async I/O over the skill trees and this
+   * builder is synchronous — and supplies it exactly when
+   * `serverHoldsJobDataClaim` is false. Supplying it when the server DOES hold
+   * the claim is harmless but pointless: the pod can already read the bytes.
+   */
+  promptBundleProjection?: PromptBundleSecretProjection | null;
 }
 
 /** When the prompt exceeds the env-var size limit, the manifest uses a
@@ -1391,6 +1454,32 @@ export interface SharedDocsSecret {
   name: string;
   namespace: string;
   data: Record<string, string>;
+}
+
+/**
+ * The per-run Secret carrying the prompt bundle (PEN-4932 stage 4b, invariant 1).
+ *
+ * Same lifecycle as `promptSecret` and `sharedDocsSecret`: the caller creates it
+ * before the Job and deletes it on every terminal path. Non-null only when the
+ * bundle cannot reach the pod through the data volume — see
+ * `serverHoldsJobDataClaim`.
+ *
+ * ⚠️ TWO maps, and BOTH must be written. `stringData` carries the files whose
+ * bytes are valid UTF-8; `data` carries base64 for the ones that are not (a
+ * skill tree may ship a PNG or a font). `createOrAdoptRunSecret` takes a single
+ * record and writes it to `stringData` alone — reaching for that signature here
+ * by analogy with `sharedDocsSecret`, which is text-only, would silently drop
+ * every binary file while `items[]` still projected its key, giving the pod a
+ * Secret volume that cannot mount. The split is deliberate so that omission is
+ * a type error rather than a quiet one.
+ */
+export interface PromptBundleSecret {
+  name: string;
+  namespace: string;
+  /** Valid-UTF-8 files, written to the Secret's `stringData`. */
+  stringData: Record<string, string>;
+  /** Non-UTF-8 files, already base64-encoded, written to the Secret's `data`. */
+  base64Data: Record<string, string>;
 }
 
 /**
@@ -1946,6 +2035,7 @@ export interface JobBuildResult {
   mcpConfigSecret: McpConfigSecret | null;
   /** Shared-doc bodies staged as a Secret volume; same lifecycle as the others. */
   sharedDocsSecret: SharedDocsSecret | null;
+  promptBundleSecret: PromptBundleSecret | null;
   /** User-supplied extra labels that were dropped because they used a reserved prefix. */
   skippedLabels: string[];
   /** Path to the pod log file on the shared PVC. */
@@ -2953,7 +3043,7 @@ export function resolveServiceAccountName(config: Record<string, unknown>): stri
 }
 
 export function buildJobManifest(input: JobBuildInput): JobBuildResult {
-  const { ctx, selfPod, promptBundle } = input;
+  const { ctx, selfPod, promptBundle, promptBundleProjection } = input;
   const { runId, agent, runtime, config: rawConfig, context } = ctx;
   const config = parseObject(rawConfig);
 
@@ -3243,8 +3333,10 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // selfPod-derived PVC and the conventional /paperclip mount path.
   // `effectiveConfig` (built in execute.ts) lands these env-supplied
   // values into `config.workspaceVolumeClaim` / `config.workspaceMountPath`.
-  const envWorkspaceClaim = asString(config.workspaceVolumeClaim, "").trim();
-  const dataClaimName = envWorkspaceClaim || selfPod.pvcClaimName || "";
+  const dataClaimName = resolveDataClaimName({
+    workspaceVolumeClaim: config.workspaceVolumeClaim,
+    selfPodPvcClaimName: selfPod.pvcClaimName,
+  });
   const dataMountPath = resolveDataMountPath(config);
   // Kubernetes rejects a Pod outright when one container declares two
   // volumeMounts at the same `mountPath`, so an operator-supplied
@@ -3337,7 +3429,104 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // `SELF_POD_DATA_MOUNT_PATH`. Folding the two together would make the server
   // `mkdir` a foreign Job's tree inside its OWN volume — creating junk the Job
   // never sees while leaving the real targets uncreated.
-  const serverCanPreCreate = narrowWritableSurface && dataClaimName === selfPod.pvcClaimName;
+  //
+  // Re-expressed through `serverHoldsJobDataClaim` in PEN-4932 stage 4b. Same
+  // value — the predicate's empty case is false, and `narrowWritableSurface`
+  // already required a non-empty claim — but the claim-identity half now has a
+  // name, because the prompt-bundle delivery channel below asks the SAME
+  // question for a different reason and the two must not drift apart.
+  const serverHoldsDataClaim = serverHoldsJobDataClaim({
+    dataClaimName,
+    selfPodPvcClaimName: selfPod.pvcClaimName,
+  });
+  const serverCanPreCreate = narrowWritableSurface && serverHoldsDataClaim;
+  // Hoisted above its historical position so the prompt-bundle block below can
+  // use it: that block has to run before the `data_claim_foreign` warning, which
+  // reports whether the bundle is being delivered. Pure, and used unchanged by
+  // every later caller.
+  const quoteShellArg = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
+
+  // PEN-4932 stage 4b, invariant 1 — the prompt bundle's delivery channel.
+  //
+  // `execute.ts` writes the bundle at `SELF_POD_DATA_MOUNT_PATH` and the pod
+  // reads it at `dataMountPath`, under a comment stating the assumption exactly:
+  // *"One volume, TWO mount points"*. That is true only while the two mounts are
+  // the same VOLUME. The moment the Job's claim is not the server's own, the
+  // server writes a complete bundle into its own volume and the pod gets the
+  // seeded, empty directory — `--add-dir` names an empty tree and
+  // `--append-system-prompt-file` names a file that does not exist.
+  //
+  // That is the agent losing its INSTRUCTIONS, and it is silent: nothing on the
+  // write side errors, and a run with no instructions looks like a run that
+  // chose not to use them. So the bytes move onto a channel that does not assume
+  // a shared volume, which is the same thing the prompt text already does.
+  //
+  // GATED ON THE CLAIM, NOT ON THE NARROWING. `serverHoldsDataClaim` is the
+  // identity the assumption rests on; `narrowWritableSurface` is a different
+  // question (does the Job get scoped rw mounts) and gating on it would turn
+  // this channel ON for today's fleet's non-isolated runs, where the server's
+  // write IS visible and the Secret buys nothing.
+  //
+  // INERT TODAY. Every agent resolves `dataClaimName` to the server's own PVC,
+  // so `serverHoldsDataClaim` is true and no Secret is produced. It becomes live
+  // in the same change that swaps `dataClaimName` — deliberately, so the channel
+  // is on `master` and reviewed before it is load-bearing, which is the posture
+  // #3153/#3157/#3158 took for the projection itself and #3164/#3165 for the
+  // seeder split.
+  //
+  // ⚠️ The `emptyDir` case (`dataClaimName === ""`) is ALSO not the server's
+  // volume, and `serverHoldsJobDataClaim` reports false for it — so a deployment
+  // whose server has no PVC gets the Secret too. That is a fix, not a widening:
+  // such a pod cannot see the server's bundle today either. It is called out
+  // because it is the one branch here that is reachable WITHOUT the 4b swap.
+  let promptBundleSecret: PromptBundleSecret | null = null;
+  let promptBundleMaterialization = "";
+  if (!serverHoldsDataClaim && promptBundle && promptBundleProjection) {
+    // Throws on a path that is not bundle-relative. Deliberate, and deliberately
+    // NOT caught: a projection carrying such a path is a bug in the projection,
+    // and emitting a step that silently dropped the file would reintroduce the
+    // exact silent loss this channel exists to remove. Failing the build puts it
+    // in front of whoever changed the projection.
+    promptBundleMaterialization = buildPromptBundleMaterializationShell({
+      // POD address. `serverRootDir` is the server's own view of the same bytes
+      // and is the wrong one here by construction — on a foreign claim the two
+      // name different volumes, which is the whole reason this block exists.
+      bundleRoot: promptBundle.rootDir,
+      paths: promptBundleProjection.items.map((item) => item.path),
+      sourceDir: PROMPT_BUNDLE_SECRET_MOUNT_PATH,
+      quote: quoteShellArg,
+    });
+    if (promptBundleMaterialization) {
+      const promptBundleSecretName = `${jobName}-prompt-bundle`;
+      promptBundleSecret = {
+        name: promptBundleSecretName,
+        namespace,
+        stringData: promptBundleProjection.stringData,
+        base64Data: promptBundleProjection.base64Data,
+      };
+      volumes.push({
+        name: PROMPT_BUNDLE_SECRET_VOLUME_NAME,
+        secret: {
+          secretName: promptBundleSecretName,
+          // `optional: false` — a Secret that failed to create must surface as a
+          // pod that cannot start, with an event naming it. The alternative is a
+          // pod that starts and runs an agent with no instructions, which is the
+          // failure this invariant is about and is indistinguishable from an
+          // agent that simply ignored them.
+          optional: false,
+          // Projects each key back to its bundle-relative path, so the copy loop
+          // needs no knowledge of the staging scheme.
+          items: promptBundleProjection.items,
+        },
+      });
+      volumeMounts.push({
+        name: PROMPT_BUNDLE_SECRET_VOLUME_NAME,
+        mountPath: PROMPT_BUNDLE_SECRET_MOUNT_PATH,
+        readOnly: true,
+      });
+    }
+  }
+
   // Reachable TODAY, not only in stage 4b: `dataClaimName` falls back to the
   // server's claim but is overridden by `config.workspaceVolumeClaim`, so an
   // operator can already point a Job at a foreign claim. Before this stage such
@@ -3416,11 +3605,24 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
       JSON.stringify({
         level: "warn",
         event: "claude_k8s.data_claim_foreign",
-        msg: "Job volume is not the server's own claim; server-materialized trees will be empty (company skills missing, prompt bundle absent so the agent loses its instructions)",
+        // PEN-4932 stage 4b wired invariant 1, so the bundle half of this
+        // warning is conditional now. Saying "prompt bundle absent" while the
+        // Secret is mounted would report, on every per-agent run forever, the
+        // exact fault this change fixes — and the next reader would chase it.
+        msg: promptBundleSecret
+          ? "Job volume is not the server's own claim; company skills will be empty (the prompt bundle is delivered by Secret, so instructions are not affected)"
+          : "Job volume is not the server's own claim; server-materialized trees will be empty (company skills missing, prompt bundle absent so the agent loses its instructions)",
+        // The bundle root drops out of this list when the Secret carries it: the
+        // directory is no longer unpopulated, it is populated from the Secret by
+        // the materialization step. The skills tree stays — it is still a
+        // server-materialized tree that nothing populates on a foreign claim,
+        // and the projection carries the run's RESOLVED skill entries rather
+        // than that tree.
         unpopulatedSubPaths: [
           path.posix.join(INSTANCE_ROOT_SUBPATH, "skills", sanitizeForK8sPath(agent.companyId)),
-          ...(promptCacheSubPath ? [promptCacheSubPath] : []),
+          ...(promptCacheSubPath && !promptBundleSecret ? [promptCacheSubPath] : []),
         ],
+        promptBundleDelivery: promptBundleSecret ? "secret" : "none",
         runId,
         jobName,
         dataClaimName,
@@ -3763,7 +3965,6 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   //
   // Diagnostics report the offending TYPE only, never the value: this config is
   // adjacent to credential material and the message lands in the pod log.
-  const quoteShellArg = (value: string) => `'${value.replace(/'/g, "'\\''")}'`;
   const ACCOUNT_ID_RE = /^[A-Za-z0-9._%+-]+(?:@[A-Za-z0-9.-]+)?$/;
   const isConfigured = (value: unknown): boolean => value !== undefined && value !== null;
   const isPlainObject = (value: unknown): boolean =>
@@ -4063,7 +4264,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // so a verdict after it would describe a pod that had already reached GitHub.
   // Advisory — the push path already fails closed; this buys time-to-diagnosis.
   const prePushHookPreflight = buildPrePushHookPreflightShell({ dataMountPath });
-  const claudeInvocation = `set -o pipefail; ${imageWrapperPreflight}; ${prePushHookPreflight}; ${workspaceSetup ? `${workspaceSetup} || exit $?; ` : ""}${sharedDocOverlaySetup ? `${sharedDocOverlaySetup}; ` : ""}${buildEnvGuardSetupShell()}; ${claudeRuntime}${ccrotateRefresh ? `${ccrotateRefresh}; ` : ""}${preparePodLog}; ${buildPodLogRedactorSetupShell(containerLogPath)}; cat /tmp/prompt/prompt.txt | ${launcherCommand} ${claudeArgsEscaped} | "$${POD_LOG_FILTER_VAR}" \${${POD_LOG_FILTER_ARG_VAR}:+"$${POD_LOG_FILTER_ARG_VAR}"} | tee ${quoteShellArg(containerLogPath)} | ${failFastFilter} > /dev/null`;
+  const claudeInvocation = `set -o pipefail; ${imageWrapperPreflight}; ${prePushHookPreflight}; ${workspaceSetup ? `${workspaceSetup} || exit $?; ` : ""}${promptBundleMaterialization ? `${promptBundleMaterialization} || exit $?; ` : ""}${sharedDocOverlaySetup ? `${sharedDocOverlaySetup}; ` : ""}${buildEnvGuardSetupShell()}; ${claudeRuntime}${ccrotateRefresh ? `${ccrotateRefresh}; ` : ""}${preparePodLog}; ${buildPodLogRedactorSetupShell(containerLogPath)}; cat /tmp/prompt/prompt.txt | ${launcherCommand} ${claudeArgsEscaped} | "$${POD_LOG_FILTER_VAR}" \${${POD_LOG_FILTER_ARG_VAR}:+"$${POD_LOG_FILTER_ARG_VAR}"} | tee ${quoteShellArg(containerLogPath)} | ${failFastFilter} > /dev/null`;
   // When the DinD sidecar is wired in, prepend the wait-for-socket loop
   // so the agent never starts before dockerd is listening on the shared
   // unix socket. Mirrors the opencode_k8s adapter.
@@ -4808,5 +5009,5 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     }
   }
 
-  return { job, jobName, namespace, prompt, claudeArgs, promptMetrics, promptSecret, envSecret, mcpConfigSecret, sharedDocsSecret, skippedLabels, podLogPath, serviceAccountName, claudeCodeVersion, scopedWritableDirs };
+  return { job, jobName, namespace, prompt, claudeArgs, promptMetrics, promptSecret, envSecret, mcpConfigSecret, sharedDocsSecret, promptBundleSecret, skippedLabels, podLogPath, serviceAccountName, claudeCodeVersion, scopedWritableDirs };
 }
