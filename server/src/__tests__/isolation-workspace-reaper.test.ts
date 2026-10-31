@@ -1954,3 +1954,122 @@ describe("executeIsolationReclaimPlan", () => {
     expect(swept.deleted + executed.deleted).toBe(0);
   });
 });
+
+/**
+ * The closest thing to an end-to-end proof available without a cluster: the
+ * three pieces run in order over one real tree, with only the transport —
+ * which does not exist yet — replaced by passing the values along.
+ *
+ * It is not a restatement of the per-function tests. Those exercise each half
+ * against inputs a test author chose; this one pins the CONTRACT between them,
+ * which is the thing a split across a process boundary actually puts at risk:
+ * that the names an inventory produces survive the plan's validator, that the
+ * ids a plan emits survive the executor's, and that a directory retained by one
+ * half is not quietly deleted by the other.
+ */
+describe("inventory -> plan -> execute, over one real tree", () => {
+  it("removes exactly the directory every half agrees on", async () => {
+    const idle = "11111111-1111-4111-8111-111111111111";
+    const inUse = "22222222-2222-4222-8222-222222222222";
+    const fresh = "33333333-3333-4333-8333-333333333333";
+    const nested = "44444444-4444-4444-8444-444444444444";
+    const oddLayout = "55555555-5555-4555-8555-555555555555";
+    const unresolvable = "not-a-workspace-id";
+
+    await makeWorkspace(idle, [...REAPABLE_LAYOUT], 90);
+    await makeWorkspace(inUse, [...REAPABLE_LAYOUT], 90);
+    await makeWorkspace(fresh, [...REAPABLE_LAYOUT], 2);
+    await makeWorkspace(nested, [...REAPABLE_LAYOUT], 90, { "home/repo/.git": "gitdir: /elsewhere" });
+    await makeWorkspace(oddLayout, ["home", "session", "cache"], 90);
+    await makeWorkspace(unresolvable, [...REAPABLE_LAYOUT], 90);
+
+    const inventory = await collectIsolationWorkspaceInventory(root);
+    expect(inventory).toHaveLength(6);
+
+    const plan = await buildIsolationReclaimPlan({
+      inventory,
+      // `inUse` is the only one the filesystem cannot speak to: its root is 90
+      // days old either way, so only the row keeps it alive. `fresh` is held by
+      // `mtime` alone, with no row at all.
+      lookupWorkspaceUsage: usageLookup({ [inUse]: { lastUsedDaysAgo: 1 } }),
+      maxAgeDays: 30,
+      now,
+    });
+
+    expect(plan.retainedInUse).toBe(1);
+    expect(plan.retainedFresh).toBe(1);
+    expect(plan.skippedUnsafeName).toBe(1);
+    // The plan cannot see layout or nested checkouts, so both are still offered.
+    expect([...plan.eligibleIds].sort()).toEqual([idle, nested, oddLayout].sort());
+
+    const executed = await executeIsolationReclaimPlan({
+      root,
+      eligibleIds: plan.eligibleIds,
+      planBuiltAtMs: NOW,
+      now,
+      logger: silentLogger,
+    });
+
+    expect(executed).toMatchObject({
+      requested: 3,
+      deleted: 1,
+      retainedNestedCheckout: 1,
+      skippedLayout: 1,
+      skippedUnsafeName: 0,
+      stopReason: "complete",
+    });
+
+    const left = (await fs.readdir(root)).sort();
+    expect(left).toEqual([inUse, fresh, nested, oddLayout, unresolvable].sort());
+  });
+
+  it("agrees with the mounted sweep on the same tree", async () => {
+    // Same fixture, swept the way the server does it when it DOES hold the
+    // claim. The two paths must reach the same survivors — if they ever stop
+    // agreeing, the foreign claim is running a different predicate, which is
+    // the entire failure this split has to avoid.
+    const idle = "11111111-1111-4111-8111-111111111111";
+    const inUse = "22222222-2222-4222-8222-222222222222";
+    const fresh = "33333333-3333-4333-8333-333333333333";
+    const nested = "44444444-4444-4444-8444-444444444444";
+
+    const build = async () => {
+      await makeWorkspace(idle, [...REAPABLE_LAYOUT], 90);
+      await makeWorkspace(inUse, [...REAPABLE_LAYOUT], 90);
+      await makeWorkspace(fresh, [...REAPABLE_LAYOUT], 2);
+      await makeWorkspace(nested, [...REAPABLE_LAYOUT], 90, { "session/repo/.git": "gitdir: /x" });
+    };
+    const lookup = () => usageLookup({ [inUse]: { lastUsedDaysAgo: 1 } });
+
+    await build();
+    await reapIsolationWorkspaces({
+      root,
+      maxAgeDays: 30,
+      lookupWorkspaceUsage: lookup(),
+      now,
+      logger: silentLogger,
+    });
+    const afterSweep = (await fs.readdir(root)).sort();
+
+    await fs.rm(root, { recursive: true, force: true });
+    await fs.mkdir(root, { recursive: true });
+    await build();
+    const plan = await buildIsolationReclaimPlan({
+      inventory: await collectIsolationWorkspaceInventory(root),
+      lookupWorkspaceUsage: lookup(),
+      maxAgeDays: 30,
+      now,
+    });
+    await executeIsolationReclaimPlan({
+      root,
+      eligibleIds: plan.eligibleIds,
+      planBuiltAtMs: NOW,
+      now,
+      logger: silentLogger,
+    });
+    const afterPlanPath = (await fs.readdir(root)).sort();
+
+    expect(afterPlanPath).toEqual(afterSweep);
+    expect(afterSweep).toEqual([inUse, fresh, nested].sort());
+  });
+});
