@@ -36,7 +36,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
 
       # Use setup-node@v4 to match the sibling workflows (pr.yml, release.yml).
       # @v5 auto-detects the package manager from any lockfile it can find by
@@ -75,7 +75,7 @@ jobs:
       cancel-in-progress: true
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
 
       - name: Clean stale node_modules from runner workspace
         run: |

@@ -47,7 +47,7 @@ jobs:
     runs-on: arc-paperclip-light
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           ref: master
           sparse-checkout: .github/scripts/report-merge-queue-ejection.mjs

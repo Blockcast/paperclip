@@ -29,7 +29,7 @@ jobs:
   build-and-sign:
     runs-on: arc-paperclip-buildkit
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
 
       # BLO-48930: daemonless (arc-paperclip-buildkit has no Docker daemon), so
       # build on the shared remote BuildKit like docker-designer.yml. Side images

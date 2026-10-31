@@ -254,7 +254,7 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
 
       - name: Unit tests for the sweep's pure decision logic
         run: python3 -m unittest discover -s .github/scripts -p 'test_sweep_*.py' -v

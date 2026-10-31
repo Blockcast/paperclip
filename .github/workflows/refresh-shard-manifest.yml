@@ -68,7 +68,7 @@ jobs:
         shard_index: [0, 1, 2, 3]
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
 
       # Via the wrapper, not pnpm/action-setup directly: it adds the one
       # jittered retry around the registry fetch that v6's self-update needs
@@ -135,7 +135,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
 
       - name: Require commitperclip App credential
         if: env.COMMITPERCLIP_ENABLED != 'true'

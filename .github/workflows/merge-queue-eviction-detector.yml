@@ -81,7 +81,7 @@ jobs:
       # trigger, so executing PR-controlled script content here would let a PR
       # author script their own eviction notification.
       - name: Checkout repository (base branch, not PR head)
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
           ref: ${{ github.event.pull_request.base.ref || github.event.repository.default_branch }}
 

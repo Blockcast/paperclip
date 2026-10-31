@@ -31,7 +31,7 @@ jobs:
     # BLO-46675: off org group 1 (`default`) onto the paperclip-only pool.
     runs-on: arc-paperclip-general
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           fetch-depth: 0
       - name: Verify committed graphs are fresh vs base
