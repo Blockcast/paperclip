@@ -141,7 +141,8 @@ the caller at all. Measured today:
   injected only as `-c` flags on the wrapper's exec line. Skipping the wrapper therefore drops the
   paperclip helper and keeps the gh one.
 - That helper deliberately points at `/usr/bin/gh`, the wrapper — not `gh.real` — precisely
-  *because* the wrapper reads the token file (`Dockerfile.runtime:65-70`, BLO-25702). So the helper
+  *because* the wrapper reads the token file (`Dockerfile.runtime:65-70`
+  (`Must point at /usr/bin/gh`), BLO-25702). So the helper
   resolves the credential on git's behalf.
 - The push credential is a Secret mounted at `/etc/paperclip/secrets/github-token/` with
   `defaultMode: 292` — octal **0444**, world-readable within the pod.
@@ -230,7 +231,8 @@ The boundary must therefore hold the credential and **perform the publish itself
   `~/.config/gh/hosts.yml` — the unmaintained state BLO-13241 wrapped `gh` to stop using in the
   first place. Either one re-authenticates the unguarded binary with the mount already gone.
   Prefer removing the helper from the image's system scope outright; if it stays (the wrapped
-  doors still need it), D1 must assert it yields no credential. Note `Dockerfile.runtime:82` is
+  doors still need it), D1 must assert it yields no credential. Note `Dockerfile.runtime:82`
+  (`credential.https://github.com.helper`) is
   guarded by two equality checks (`scripts/check-agent-image-git-config.mjs` and assertion (a) in
   `agent-egress-path.test.mjs`) whose expectations live in `scripts/git-config-surface.mjs` —
   changing that line means changing those in the same commit, by construction.
@@ -905,21 +907,27 @@ Four things a reader should not infer from that paragraph:
    `paperclip-github-token-env` as the binary that starves, and routed the
    answer through the broker's refusal of the `auth` verb. **Neither is on
    this path.** That wrapper installs to `/usr/local/libexec/paperclip/bin/`
-   (`Dockerfile:674`) and is reached through `PATH` — which is precisely what
+   (`Dockerfile:674` (`/usr/local/libexec/paperclip/bin/`)) and is reached through `PATH`
+   — which is precisely what
    bypass 4 sidesteps. The system helper is `!/usr/bin/gh auth git-credential`
-   (`Dockerfile.runtime:83`), an **absolute** path, so `PATH` is not consulted
+   (`Dockerfile.runtime:83` (`!/usr/bin/gh auth git-credential`)), an **absolute** path,
+   so `PATH` is not consulted
    and no egress wrapper is involved; and the broker is never asked, because
    nothing on this path speaks to it. Pointing an assertion at the documented
    mechanism would have pinned a file the chain does not execute, and stayed
    green while the real chain broke. Security traced this independently on
    master `8055be2a6`.
 
+<!-- anchor-file: scripts/gh-token-wrapper.sh -->
+
    The real mechanism, which is what the assertion confirms: `/usr/bin/gh` is
-   a symlink to `scripts/gh-token-wrapper.sh` (`Dockerfile.runtime:53-55`), and
+   a symlink to `scripts/gh-token-wrapper.sh` (`Dockerfile.runtime:53-55`
+   (`ln -s /usr/bin/gh-token-wrapper.sh /usr/bin/gh`)), and
    the decisive conjunct is its `TOKEN_FILE_REQUIRED`, set to `yes` **iff
-   `PAPERCLIP_GITHUB_TOKEN_FILE` is present in the environment** (`:404-406`,
-   tested with `${VAR+x}`, so set-empty counts). `auth git-credential` is not
-   in the exempt list that follows (`:412`), so with the variable set and the
+   `PAPERCLIP_GITHUB_TOKEN_FILE` is present in the environment** (`:404-406`
+   (`if [ "${PAPERCLIP_GITHUB_TOKEN_FILE+x}" = x ]; then`), tested with
+   `${VAR+x}`, so set-empty counts). `auth git-credential` is not
+   in the exempt list that follows (`:412` (`TOKEN_FILE_REQUIRED=no`)), so with the variable set and the
    file absent the wrapper reaches `reject_token_file "is absent"` (`:525`) and
    exits non-zero. With the variable **unset** it falls through to
    `exec_real_gh` (`:528`) under whatever ambient auth exists.
@@ -1114,7 +1122,11 @@ agent/base value, and one the base lacks is absent. Three grounds.
    claude-k8s adapter's `execute.ts` runs over the config `mergeModelProfileAdapterConfig`
    returns, and lets non-null environment fields win. A test documents that intended order; it
    does **not** cover the site order. The adapter holds its own copy of `mergeEnvironmentConfig`
-   (`execute.ts:543`, called at `:2320`) and that test both imports a different copy
+   (`vendor/paperclip-adapter-claude-k8s/src/server/execute.ts:971`
+   (`export function mergeEnvironmentConfig(`), called at
+   `vendor/paperclip-adapter-claude-k8s/src/server/execute.ts:2775`
+   (`mergeEnvironmentConfig(adapterConfigObj, target?.config ?? null)`)) and that test both
+   imports a different copy
    (`@paperclipai/adapter-utils`) and chooses the call order itself. A real site-order test would
    have to go through `execute()`.
 

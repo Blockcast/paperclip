@@ -1,0 +1,205 @@
+[
+  {
+    "doc": "docs/security/PEN-1650-mcp-tenant-node-custody-review.md",
+    "anchor": "packages/mcp-gateway/src/server.ts:395-458",
+    "construct": "",
+    "was": "no-construct",
+    "why": "PEN-5091: bare `Location:` range, no construct named in the document. Establishing one means re-reading the 2026-06 mcp-gateway review against today's source."
+  },
+  {
+    "doc": "docs/security/PEN-1650-mcp-tenant-node-custody-review.md",
+    "anchor": "packages/mcp-gateway/src/upstreams.ts:156-180",
+    "construct": "",
+    "was": "no-construct",
+    "why": "PEN-5091: bare `Location:` range, no construct named in the document. Establishing one means re-reading the 2026-06 mcp-gateway review against today's source."
+  },
+  {
+    "doc": "docs/security/PEN-1650-mcp-tenant-node-custody-review.md",
+    "anchor": ":233-245",
+    "construct": "",
+    "was": "no-construct",
+    "why": "PEN-5091: bare `Location:` range, no construct named in the document. Establishing one means re-reading the 2026-06 mcp-gateway review against today's source."
+  },
+  {
+    "doc": "docs/security/PEN-1650-mcp-tenant-node-custody-review.md",
+    "anchor": "packages/mcp-gateway/src/upstreams.ts:58-100",
+    "construct": "",
+    "was": "no-construct",
+    "why": "PEN-5091: bare `Location:` range, no construct named in the document. Establishing one means re-reading the 2026-06 mcp-gateway review against today's source."
+  },
+  {
+    "doc": "docs/security/PEN-1650-mcp-tenant-node-custody-review.md",
+    "anchor": ":115-127",
+    "construct": "",
+    "was": "no-construct",
+    "why": "PEN-5091: bare `Location:` range, no construct named in the document. Establishing one means re-reading the 2026-06 mcp-gateway review against today's source."
+  },
+  {
+    "doc": "docs/security/PEN-1650-mcp-tenant-node-custody-review.md",
+    "anchor": "packages/mcp-gateway/src/server.ts:395-428",
+    "construct": "",
+    "was": "no-construct",
+    "why": "PEN-5091: bare `Location:` range, no construct named in the document. Establishing one means re-reading the 2026-06 mcp-gateway review against today's source."
+  },
+  {
+    "doc": "docs/security/issue-authorization-model.md",
+    "anchor": "server/src/routes/issues.ts:560",
+    "construct": "COORDINATION_METADATA_FIELDS",
+    "was": "drifted",
+    "why": "PEN-5091: the reason string occurs at several sites in a 3000-line file, so choosing one is a judgement about which branch the row describes, not a line refresh."
+  },
+  {
+    "doc": "docs/security/issue-authorization-model.md",
+    "anchor": "server/src/routes/issues.ts:6105",
+    "construct": "issue:mutate",
+    "was": "drifted",
+    "why": "PEN-5091: the reason string occurs at several sites in a 3000-line file, so choosing one is a judgement about which branch the row describes, not a line refresh."
+  },
+  {
+    "doc": "docs/security/issue-authorization-model.md",
+    "anchor": ":1872",
+    "construct": "allow_local_board",
+    "was": "drifted",
+    "why": "PEN-5091: the reason string occurs at several sites in a 3000-line file, so choosing one is a judgement about which branch the row describes, not a line refresh."
+  },
+  {
+    "doc": "docs/security/issue-authorization-model.md",
+    "anchor": ":1886",
+    "construct": "allow_instance_admin",
+    "was": "drifted",
+    "why": "PEN-5091: the reason string occurs at several sites in a 3000-line file, so choosing one is a judgement about which branch the row describes, not a line refresh."
+  },
+  {
+    "doc": "docs/security/issue-authorization-model.md",
+    "anchor": ":1916",
+    "construct": "allow_company_member",
+    "was": "drifted",
+    "why": "PEN-5091: the reason string occurs at several sites in a 3000-line file, so choosing one is a judgement about which branch the row describes, not a line refresh."
+  },
+  {
+    "doc": "docs/security/issue-authorization-model.md",
+    "anchor": ":1895",
+    "construct": "actor.source === \"cloud_tenant\" && actor.userId",
+    "was": "drifted",
+    "why": "PEN-5091: the reason string occurs at several sites in a 3000-line file, so choosing one is a judgement about which branch the row describes, not a line refresh."
+  },
+  {
+    "doc": "docs/security/issue-authorization-model.md",
+    "anchor": ":2420",
+    "construct": "allow_self",
+    "was": "drifted",
+    "why": "PEN-5091: the reason string occurs at several sites in a 3000-line file, so choosing one is a judgement about which branch the row describes, not a line refresh."
+  },
+  {
+    "doc": "docs/security/issue-authorization-model.md",
+    "anchor": ":2438",
+    "construct": "allow_company_agent",
+    "was": "drifted",
+    "why": "PEN-5091: the reason string occurs at several sites in a 3000-line file, so choosing one is a judgement about which branch the row describes, not a line refresh."
+  },
+  {
+    "doc": "docs/security/issue-authorization-model.md",
+    "anchor": ":2449",
+    "construct": "allow_issue_creator",
+    "was": "drifted",
+    "why": "PEN-5091: the reason string occurs at several sites in a 3000-line file, so choosing one is a judgement about which branch the row describes, not a line refresh."
+  },
+  {
+    "doc": "docs/security/issue-authorization-model.md",
+    "anchor": ":2466",
+    "construct": "allow_manager_chain",
+    "was": "drifted",
+    "why": "PEN-5091: the reason string occurs at several sites in a 3000-line file, so choosing one is a judgement about which branch the row describes, not a line refresh."
+  },
+  {
+    "doc": "docs/security/issue-authorization-model.md",
+    "anchor": ":2481",
+    "construct": "allow_issue_mention_grant",
+    "was": "drifted",
+    "why": "PEN-5091: the reason string occurs at several sites in a 3000-line file, so choosing one is a judgement about which branch the row describes, not a line refresh."
+  },
+  {
+    "doc": "docs/security/issue-authorization-model.md",
+    "anchor": ":2493",
+    "construct": "allow_recovery_handoff_grant",
+    "was": "drifted",
+    "why": "PEN-5091: the reason string occurs at several sites in a 3000-line file, so choosing one is a judgement about which branch the row describes, not a line refresh."
+  },
+  {
+    "doc": "docs/security/issue-authorization-model.md",
+    "anchor": ":2518",
+    "construct": "allow_productivity_review_grant",
+    "was": "drifted",
+    "why": "PEN-5091: the reason string occurs at several sites in a 3000-line file, so choosing one is a judgement about which branch the row describes, not a line refresh."
+  },
+  {
+    "doc": "docs/security/issue-authorization-model.md",
+    "anchor": ":857",
+    "construct": "allow_explicit_grant",
+    "was": "drifted",
+    "why": "PEN-5091: the reason string occurs at several sites in a 3000-line file, so choosing one is a judgement about which branch the row describes, not a line refresh."
+  },
+  {
+    "doc": "docs/security/issue-authorization-model.md",
+    "anchor": ":2411",
+    "construct": "allow_explicit_grant",
+    "was": "drifted",
+    "why": "PEN-5091: the reason string occurs at several sites in a 3000-line file, so choosing one is a judgement about which branch the row describes, not a line refresh."
+  },
+  {
+    "doc": "docs/security/issue-authorization-model.md",
+    "anchor": ":2004",
+    "construct": "deny_unsupported_action",
+    "was": "drifted",
+    "why": "PEN-5091: the reason string occurs at several sites in a 3000-line file, so choosing one is a judgement about which branch the row describes, not a line refresh."
+  },
+  {
+    "doc": "docs/security/issue-authorization-model.md",
+    "anchor": ":1965",
+    "construct": "deny_unsupported_action",
+    "was": "drifted",
+    "why": "PEN-5091: the reason string occurs at several sites in a 3000-line file, so choosing one is a judgement about which branch the row describes, not a line refresh."
+  },
+  {
+    "doc": "docs/security/issue-authorization-model.md",
+    "anchor": "server/src/routes/issues.ts:6168",
+    "construct": "",
+    "was": "no-construct",
+    "why": "PEN-5091: the reason string occurs at several sites in a 3000-line file, so choosing one is a judgement about which branch the row describes, not a line refresh."
+  },
+  {
+    "doc": "docs/security/issue-authorization-model.md",
+    "anchor": ":2398",
+    "construct": "deny_scope",
+    "was": "drifted",
+    "why": "PEN-5091: the reason string occurs at several sites in a 3000-line file, so choosing one is a judgement about which branch the row describes, not a line refresh."
+  },
+  {
+    "doc": "docs/security/issue-authorization-model.md",
+    "anchor": ":2404",
+    "construct": "deny_scope",
+    "was": "drifted",
+    "why": "PEN-5091: the reason string occurs at several sites in a 3000-line file, so choosing one is a judgement about which branch the row describes, not a line refresh."
+  },
+  {
+    "doc": "docs/security/issue-authorization-model.md",
+    "anchor": ":186",
+    "construct": "null",
+    "was": "drifted",
+    "why": "PEN-5091: the reason string occurs at several sites in a 3000-line file, so choosing one is a judgement about which branch the row describes, not a line refresh."
+  },
+  {
+    "doc": "docs/security/issue-authorization-model.md",
+    "anchor": ":192",
+    "construct": "null",
+    "was": "drifted",
+    "why": "PEN-5091: the reason string occurs at several sites in a 3000-line file, so choosing one is a judgement about which branch the row describes, not a line refresh."
+  },
+  {
+    "doc": "docs/security/issue-authorization-model.md",
+    "anchor": ":1916",
+    "construct": "issue:mutate",
+    "was": "drifted",
+    "why": "PEN-5091: the reason string occurs at several sites in a 3000-line file, so choosing one is a judgement about which branch the row describes, not a line refresh."
+  }
+]
