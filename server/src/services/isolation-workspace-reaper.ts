@@ -876,7 +876,7 @@ export async function collectIsolationWorkspaceInventory(
 }
 
 /** Why an execution stopped before it had considered every planned id. */
-export type IsolationReclaimStopReason = "complete" | "capped" | "plan_stale";
+export type IsolationReclaimStopReason = "complete" | "capped" | "plan_stale" | "plan_unusable";
 
 /** What an executor did with the plan it was given, and what it refused. */
 export interface IsolationReclaimExecutionResult {
@@ -922,10 +922,18 @@ export interface IsolationReclaimExecutionResult {
   /** `notAttempted` was produced by the bound. */
   capped: boolean;
   /**
-   * Why the loop ended. `plan_stale` is the one that wants an operator: it means
-   * the distance from plan to unlink exceeded `maxPlanAgeMs`, so the executor
-   * refused the remainder rather than act on a verdict old enough for a
-   * workspace to have been resurrected under it.
+   * Why the loop ended. Two of these want an operator, and they are kept apart
+   * because the causes and the remedies are different — the same reason
+   * `skippedMalformed` is not folded into `skippedUnsafeName`:
+   *
+   * - `plan_stale` — the distance from plan to unlink exceeded `maxPlanAgeMs`,
+   *   so the executor refused the remainder rather than act on a verdict old
+   *   enough for a workspace to have been resurrected under it. A real
+   *   condition on a healthy system under load; the remedy is scheduling.
+   * - `plan_unusable` — the plan carried no usable staleness bound at all, so
+   *   NOTHING was examined. That is a transport or serialization defect, not a
+   *   slow pipeline, and reporting it as `plan_stale` would hide a permanent
+   *   bug inside a counter that is expected to move.
    */
   stopReason: IsolationReclaimStopReason;
 }
@@ -1005,7 +1013,7 @@ export async function executeIsolationReclaimPlan(options: {
   // operands are checked, since a non-finite ceiling fails the same way.
   if (!Number.isFinite(options.planBuiltAtMs) || !Number.isFinite(maxPlanAgeMs)) {
     result.notAttempted = options.eligibleIds.length;
-    result.stopReason = "plan_stale";
+    result.stopReason = "plan_unusable";
     log.error(
       { root: options.root, planBuiltAtMs: options.planBuiltAtMs, maxPlanAgeMs },
       "isolation reclaim executor refused a plan carrying no usable staleness bound; " +
@@ -1046,9 +1054,17 @@ export async function executeIsolationReclaimPlan(options: {
       // Unreachable from a plan this repo built, and checked anyway — see
       // `skippedUnsafeName`. Logged at error because it means the transport, not
       // the volume, is wrong.
+      //
+      // The name goes in the record, truncated. Without it the line says only
+      // that something was refused, which cannot distinguish a serialization
+      // bug from a tampered payload — and this counter is expected to sit at
+      // zero forever, so the one time it moves is the one time the value
+      // matters. Truncated because it is the only field here that is neither
+      // generated nor validated by this process, and an unbounded one would let
+      // a single malformed entry dominate the log.
       result.skippedUnsafeName += 1;
       log.error(
-        { root: options.root },
+        { root: options.root, refusedName: String(name).slice(0, 128) },
         "isolation reclaim executor refused a planned entry whose name is not a workspace id",
       );
       continue;
