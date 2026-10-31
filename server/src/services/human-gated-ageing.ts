@@ -136,20 +136,35 @@ const PRIORITY_RANK = new Map<string, number>(
  *   tier. On this queue the weighting is not what is keeping `low` out.
  * - The remaining 16 rows are the sole gate for **43 open rows**, and the **top 7
  *   cover 29 of those 43**. That is a cut that lands inside the population, which
- *   per {@link DEFAULT_MAX_ESCALATED} no cap on an age-ordered list can do.
+ *   no cap on the shipped order can reproduce — see the slot arithmetic below.
  *
- * **The two orderings disagree almost completely, and that is the finding.** The 7
- * oldest human-gated rows — what the digest escalates today — are the sole gate for
- * **2 open rows between them**; six of the seven free nothing. The 7 highest-payoff
- * rows free 29. The clearest single case is `PEN-4079`, and note that the threshold
- * is not what sidelines it: it is `critical` at **15.8 days**, so it is already
- * *past* its 14d bar and the filter admits it. Age is what buries it — it ranks
- * **43rd of the 43 past-threshold rows**, the youngest of them, so an age-ordered
- * list truncated at {@link DEFAULT_MAX_ESCALATED} drops it before it is reached.
- * By payoff it ranks **3rd of 16**, sitting above **27 open rows, 23 of them
- * `critical`/`high`** — the largest reach in the graph. Age and payoff are not two
- * views of one priority here; on this queue they are close to orthogonal, and this
- * row is the case where the cap, not the threshold, does the discarding.
+ * **The shipped order and payoff disagree, and that is the finding.** Compare
+ * against what the digest actually escalates, which since PEN-4489 is **not** flat
+ * age order: the cut is `byPriorityThenAge` — `critical` first, then oldest within
+ * each tier — truncated at {@link DEFAULT_MAX_ESCALATED}. On this queue the 14
+ * past-threshold `critical` rows take 14 of the 15 slots, so what prints is those
+ * 14 plus exactly **one** `high` row.
+ *
+ * Those 15 escalated rows are the sole gate for **26** of the 43, and **6 of the
+ * 15 free nothing at all**. The 28 withheld past-threshold rows hold **15** more
+ * between them; the remaining 2 sit on `PEN-4392` (`high`, 9.9d), not yet past its
+ * bar. 26 + 15 + 2 = 43.
+ *
+ * **The `high` tier is where the cap actually binds, and it is the sharpest case:
+ * 21 past-threshold `high` rows compete for that one remaining slot.** Oldest-
+ * within-tier awards it to `PEN-705` (138.9d), which is the sole gate for
+ * **nothing**, while `PEN-2213` (81.5d, sole gate for **6**) is withheld. Of the
+ * 15 payoff reachable in the `high` tier, the age pick captures **0** of it.
+ *
+ * ⚠ `PEN-4079` is **not** an example of the cap discarding anything — an earlier
+ * revision of this note claimed it was, and that was wrong. It is `critical` at
+ * 15.8d, past its 14d bar, and lands 14th of the 15 escalated, so the digest
+ * prints it today. It is still worth naming, for a different reason: it has the
+ * largest **reach** in the graph (**27** open rows, 23 of them `critical`/`high`)
+ * but a sole-root payoff of only **5**, which is 3rd of 16. Reach and payoff are
+ * different measures — reach counts every row above it, payoff only the rows it
+ * alone gates — and this is where they diverge most. The selector proposed here
+ * is the payoff one.
  *
  * Validation, because a selector derived from a bad graph is worse than no selector:
  * all 77 blockers referenced from outside the open set are `done` (so zero phantom
