@@ -1369,6 +1369,28 @@ export interface WorkerToHostMethods {
     result: void,
   ];
 
+  /**
+   * Record a DURATION observation into a real Prometheus histogram (PEN-5140).
+   *
+   * Distinct from `metrics.write`, which is a counter increment. A counter
+   * pair can only yield a mean, and a mean is what hides a heavy tail; this
+   * carries bucket boundaries so `histogram_quantile` works. `seconds`, per
+   * Prometheus convention, whatever unit the plugin measured in.
+   *
+   * Gated by the existing `metrics.write` capability on purpose: it publishes
+   * the same class of plugin-authored telemetry to the same registry, so a
+   * separate capability would force a manifest migration on every installed
+   * plugin to buy no additional containment.
+   */
+  "metrics.observe": [
+    params: {
+      name: string;
+      /** Duration in SECONDS. Must be finite and >= 0. */
+      seconds: number;
+    },
+    result: void,
+  ];
+
   // Telemetry
   "telemetry.track": [
     params: { eventName: string; dimensions?: Record<string, string | number | boolean> },

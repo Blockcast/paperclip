@@ -27,6 +27,7 @@ import { assertBoardOrgAccess } from "./authz.js";
 import {
   initWorkerTierProxyRouteSeries,
   recordWorkerTierProxyFailure,
+  type WorkerTierProxyHop,
 } from "../services/metrics.js";
 
 /**
@@ -253,6 +254,7 @@ function createWorkerProxyHandler(
   requestTimeoutMs: number,
   {
     route,
+    hop,
     extraHeaders = {},
     serveLocallyIfUnreachable = false,
   }: {
@@ -264,6 +266,14 @@ function createWorkerProxyHandler(
      * from an unauthenticated webhook route (PEN-4100).
      */
     route: string;
+    /**
+     * Which proxy hop this handler implements, for the `hop` label on the
+     * failure counter. Fixed at registration, never derived from the request:
+     * the two hops are two different registrations of the same route table,
+     * and only the registering call site knows which one it is building
+     * (PEN-5140).
+     */
+    hop: WorkerTierProxyHop;
     extraHeaders?: Record<string, string>;
     /**
      * BLO-47803: when the target cannot be connected to, hand the request to
@@ -422,7 +432,7 @@ function createWorkerProxyHandler(
         : res.headersSent
         ? "mid_stream"
         : "unreachable";
-      recordWorkerTierProxyFailure(failureReason, route);
+      recordWorkerTierProxyFailure(failureReason, route, hop);
       logger.error(
         // `targetUrlForLog`, not `targetUrl`: the raw URL carries the
         // caller-supplied query string (PEN-2996). The failure split and the
@@ -434,6 +444,7 @@ function createWorkerProxyHandler(
           targetUrl: targetUrlForLog,
           method: req.method,
           route,
+          hop,
           reason: failureReason,
           requestTimeoutMs,
         },
@@ -489,7 +500,7 @@ export function registerWorkerTierProxyRoutes(
       workersInternalUrl,
       route.streaming ?? false,
       timeoutMs,
-      { route: route.path },
+      { route: route.path, hop: "worker" },
     ));
     router[route.method](
       route.path,
@@ -498,7 +509,7 @@ export function registerWorkerTierProxyRoutes(
   }
   // Materialize {reason, route} at zero for every proxied route, so a quiet
   // route reads as 0 rather than as an absent series (PEN-4100).
-  initWorkerTierProxyRouteSeries(WORKER_DEPENDENT_PLUGIN_ROUTES.map((r) => r.path));
+  initWorkerTierProxyRouteSeries(WORKER_DEPENDENT_PLUGIN_ROUTES.map((r) => r.path), "worker");
   logger.info(
     {
       workersInternalUrl,
@@ -563,6 +574,7 @@ export function registerPluginHolderForwardRoutes(
       timeoutMs,
       {
         route: route.path,
+        hop: "holder",
         extraHeaders: { [PLUGIN_HOLDER_FORWARDED_HEADER]: "1" },
         // A holder that crashed keeps its lease row until the TTL lapses
         // (~45 s); serve locally rather than fail every call in that window.
@@ -574,5 +586,5 @@ export function registerPluginHolderForwardRoutes(
     ));
     router[route.method](route.path, ...handlers);
   }
-  initWorkerTierProxyRouteSeries(WORKER_DEPENDENT_PLUGIN_ROUTES.map((r) => r.path));
+  initWorkerTierProxyRouteSeries(WORKER_DEPENDENT_PLUGIN_ROUTES.map((r) => r.path), "holder");
 }

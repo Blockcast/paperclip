@@ -100,6 +100,11 @@ const OPERATION_CAPABILITIES: Record<string, readonly PluginCapability[]> = {
   "activity.log": ["activity.log.write"],
   "costs.finance.create": ["costs.write"],
   "metrics.write": ["metrics.write"],
+  // Same capability as `metrics.write`, deliberately: `observe` publishes the
+  // same class of plugin telemetry to the same registry, differing only in
+  // aggregation shape. A distinct capability would force a manifest migration
+  // on every installed plugin and contain nothing new (PEN-5140).
+  "metrics.observe": ["metrics.write"],
   "telemetry.track": ["telemetry.track"],
   "db.migrate": ["database.namespace.migrate"],
   "db.execute": ["database.namespace.write"],

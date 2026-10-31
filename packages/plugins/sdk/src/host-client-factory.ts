@@ -207,6 +207,7 @@ export interface HostServices {
   /** Provides `metrics.write`. */
   metrics: {
     write(params: WorkerToHostMethods["metrics.write"][0]): Promise<void>;
+    observe(params: WorkerToHostMethods["metrics.observe"][0]): Promise<void>;
   };
 
   /** Provides `telemetry.track`. */
@@ -484,6 +485,10 @@ const METHOD_CAPABILITY_MAP: Record<WorkerToHostMethodName, PluginCapability | n
 
   // Metrics
   "metrics.write": "metrics.write",
+  // Reuses the `metrics.write` capability deliberately (PEN-5140): same class
+  // of telemetry, same registry, so a distinct capability would force a
+  // manifest migration on every installed plugin and contain nothing new.
+  "metrics.observe": "metrics.write",
 
   // Telemetry
   "telemetry.track": "telemetry.track",
@@ -901,6 +906,9 @@ export function createHostClientHandlers(
     // Metrics
     "metrics.write": gated("metrics.write", async (params) => {
       return services.metrics.write(params);
+    }),
+    "metrics.observe": gated("metrics.observe", async (params) => {
+      return services.metrics.observe(params);
     }),
 
     // Telemetry

@@ -4312,6 +4312,34 @@ const SLOW_DELIVERY_WARN_MS = WORKER_PROXY_DEADLINE_MS / 2;
 const SLOW_DELIVERY_MARKS_MS = [SLOW_DELIVERY_WARN_MS, WORKER_PROXY_DEADLINE_MS];
 
 /**
+ * Histogram of per-alert processing cost, in seconds (PEN-5140).
+ *
+ * The instrument that makes per-alert cost readable WITHOUT reconstruction.
+ * Before it, the only per-alert duration this handler emitted was the `took
+ * Xms` field of the `slow delivery` WARN line below — and that line fires only
+ * once a delivery has already crossed {@link SLOW_DELIVERY_WARN_MS}. Every
+ * per-alert number available to an operator was therefore conditioned on the
+ * delivery being slow already, so a median computed over them is a median
+ * among slow deliveries, not a median per-alert cost. PEN-4100 read ~8.0 s
+ * p50 off that sample against a 1.65–1.88 s "baseline" taken from the
+ * population, and concluded a 4–6× regression; the two numbers are not drawn
+ * from the same population and are not comparable.
+ *
+ * The aggregate counters cannot close that gap either. `duration_ms` /
+ * `alerts_received` is a MEAN, and the distinction between "uniformly slower"
+ * and "same median, heavier tail" is exactly what a mean destroys — which
+ * matters here because the delivery budget is spent by the tail, not by the
+ * median.
+ *
+ * `observe`, not `write`: `write` is a counter increment, and quantiles need
+ * bucket boundaries. Untagged for the same reason the timing counters are —
+ * promoted tag keys share a per-name label budget, and this is read summed.
+ * Per-alert attribution stays on the `slow delivery` log line, where
+ * cardinality is free.
+ */
+const ALERT_DURATION_METRIC = "alertmanager.webhook.alert_duration";
+
+/**
  * Top-level webhook handler. Pure-ish: takes ctx + config + an authentication
  * verdict + input, returns the delivery's disposition. Throws
  * `WebhookUnauthorizedError` when that verdict is `false` — the worker's
@@ -4425,6 +4453,20 @@ export async function handleWebhook(
   // first alert whose completion crosses a mark is the one in flight when the
   // mark passed. Sampling before an alert instead names whichever alert starts
   // next, and never sees the last alert's work at all.
+  // Fire-and-forget: a metrics write must not be able to fail the delivery
+  // carrying it, and must not add a round-trip to every alert on a path whose
+  // latency is the thing being measured. `void` + `.catch` rather than `await`
+  // for that second reason specifically — awaiting here would make the
+  // instrument a contributor to the quantity it reports.
+  const reportAlertCost = (finished: NonNullable<typeof inFlight>): void => {
+    const seconds = (performance.now() - finished.startedAt) / 1000;
+    void ctx.metrics.observe(ALERT_DURATION_METRIC, seconds).catch((metricErr) => {
+      ctx.logger.error(
+        `paperclip-plugin-alertmanager: failed to record ${ALERT_DURATION_METRIC}: ${String(metricErr)}`,
+      );
+    });
+  };
+
   const reportIfSlow = (finished: NonNullable<typeof inFlight>): void => {
     const finishedAt = performance.now();
     // Rounded once here: `performance.now()` is fractional, and both values
@@ -4450,7 +4492,14 @@ export async function handleWebhook(
     // the warning fires on elapsed time rather than on reaching a billable
     // alert: a batch can be slow and then spend its last seconds on filtered
     // alerts, and that is still the delivery that gets abandoned.
-    if (inFlight) reportIfSlow(inFlight);
+    if (inFlight) {
+      // Cost first, then the slow-mark check: every alert that finishes is
+      // observed, where the WARN line is deliberately rate-limited to the
+      // marks. That difference is the point of the histogram — see
+      // ALERT_DURATION_METRIC.
+      reportAlertCost(inFlight);
+      reportIfSlow(inFlight);
+    }
     if (performance.now() - deliveryStartedAt >= DELIVERY_BUDGET_MS) {
       const remaining = body.alerts.slice(alertIndex);
       ctx.logger.warn(
@@ -4642,7 +4691,16 @@ export async function handleWebhook(
 
   // The last alert's work ends here; without this a one-alert delivery that
   // wedges past the deadline would never be attributed.
-  if (inFlight) reportIfSlow(inFlight);
+  // The last alert of the batch ends here, not at the top of a next iteration
+  // that never runs. Load-bearing for the histogram in a way it is not for the
+  // WARN line: batches are frequently size 1, so skipping this would leave the
+  // single-alert case — the common one — entirely unobserved while still
+  // counting in `alerts_received`, which would bias `_count` low against the
+  // very denominator the histogram is meant to be comparable with.
+  if (inFlight) {
+    reportAlertCost(inFlight);
+    reportIfSlow(inFlight);
+  }
 
   // Per-delivery timing (BLO-37485).
   //

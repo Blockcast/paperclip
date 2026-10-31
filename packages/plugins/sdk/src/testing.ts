@@ -151,6 +151,8 @@ export interface TestHarness {
   logs: TestHarnessLogEntry[];
   activity: Array<{ message: string; entityType?: string; entityId?: string; metadata?: Record<string, unknown> }>;
   metrics: Array<{ name: string; value: number; tags?: Record<string, string> }>;
+  /** Duration observations from `ctx.metrics.observe`, in seconds (PEN-5140). */
+  metricObservations: Array<{ name: string; seconds: number }>;
   /** Finance events recorded via `ctx.costs.recordFinanceEvent`, in call order. */
   financeEvents: Array<
     WorkerToHostMethods["costs.finance.create"][0] & { id: string }
@@ -495,6 +497,7 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
   const logs: TestHarnessLogEntry[] = [];
   const activity: TestHarness["activity"] = [];
   const metrics: TestHarness["metrics"] = [];
+  const metricObservations: TestHarness["metricObservations"] = [];
   const financeEvents: TestHarness["financeEvents"] = [];
   /** `${companyId}::${externalInvoiceId}` -> id, mirroring the host's idempotency guard. */
   const financeEventKeys = new Map<string, string>();
@@ -2730,6 +2733,11 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         requireCapability(manifest, capabilitySet, "metrics.write");
         metrics.push({ name, value, tags });
       },
+      async observe(name, seconds) {
+        // Same capability as `write` — see PluginMetricsClient.observe.
+        requireCapability(manifest, capabilitySet, "metrics.write");
+        metricObservations.push({ name, seconds });
+      },
     },
     telemetry: {
       async track(eventName, dimensions) {
@@ -2876,6 +2884,7 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
     logs,
     activity,
     metrics,
+    metricObservations,
     financeEvents,
     telemetry,
     dbQueries,
