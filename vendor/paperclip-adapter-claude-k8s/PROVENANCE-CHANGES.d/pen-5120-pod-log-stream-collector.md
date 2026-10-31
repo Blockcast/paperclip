@@ -43,9 +43,14 @@ ourselves is what turns an abort into a resolution instead of a hang.
 **Resume is anchored, so a reconnect cannot silently skip.** `timestamps: true` plus `sinceTime` at
 the last accepted line's second. `sinceTime` is second-granular and inclusive, so the replay is a
 known SUPERSET of what is already held — and the re-delivered lines are de-duplicated within that
-second. The dedup set is cleared when the second advances, so it is bounded by lines-per-second
-rather than by run length; a 10 Mi transcript does not grow it. Truncation is downwards for the
-same reason: rounding up would convert a guaranteed overlap into a possible gap.
+second. Dedup is a MULTISET keyed on that second, armed immediately before each request that
+carries `sinceTime` and consumed only by the replay it anticipates: a line is dropped at most as
+many times as it was already accepted. A plain set would instead drop every repeat for the whole
+second — including two genuinely identical transcript lines stamped in the same second on the FIRST
+connection, where no replay is happening at all, which is real output silently lost. Both tallies
+are cleared when the second advances, so they are bounded by lines-per-second rather than by run
+length; a 10 Mi transcript does not grow them. Truncation is downwards for the same reason:
+rounding up would convert a guaranteed overlap into a possible gap.
 
 Both reads go through `getLogApi().log`, not `coreApi.readNamespacedPodLog`, and that is forced
 rather than stylistic: the generated `CoreV1ApiReadNamespacedPodLogRequest` exposes `sinceSeconds`
@@ -54,10 +59,53 @@ by however long the reconnect took.
 
 **Every accepted line is persisted to the server's own `podLogPath`.** That path is rooted at
 `SELF_POD_DATA_MOUNT_PATH` — this process's OWN claim — so it is writable whichever claim the Job
-mounted. Keeping it populated is what leaves `reapPodLogFile`'s `unlink`, `isReapablePodLogPath`
-and `orphaned-run-terminal-result.ts` working unchanged rather than each needing a foreign-claim
-branch. A persist failure is reported and non-fatal: the stream is this run's delivery path, the
-file is for later readers, and losing the file must not lose the run.
+mounted. Keeping it populated is what leaves `reapPodLogFile`'s `unlink` and
+`isReapablePodLogPath` working unchanged rather than each needing a foreign-claim branch. It does
+NOT cover `orphaned-run-terminal-result.ts`, which resolves `run-logs` from the server's root and
+reads the POD-written `<run>.pod.ndjson`; on a foreign claim that file is on the agent's volume.
+That residual is PEN-5124, and this copy cannot close it — the orphan path fires exactly when the
+process that would have written this copy is the thing that died. A persist failure is reported and
+non-fatal: the stream is this run's delivery path, the file is for later readers, and losing the
+file must not lose the run.
+
+## Every wait is bounded, and not by `stopSignal`
+
+`@kubernetes/client-node`'s `Log.log` has no timeout of its own: it awaits `node-fetch` v2, whose
+default timeout is none, and it pipes the response body into the sink without forwarding source
+errors. So both waits it hands back are unbounded in both directions. `pumpPodLogRequest` bounds
+them, and lives in `pod-log-stream.ts` rather than inline in `execute.ts` so the bounds are
+reachable from a test without a live apiserver.
+
+- **Before the headers.** The `AbortController` only comes back *after* them, so until that
+  resolves there is nothing to abort and no watchdog can have been armed. An apiserver or kubelet
+  proxy that accepts the connection and then says nothing hangs there, on a follow and a one-shot
+  read alike. Bounded at 60 s for both; the sink is destroyed so a late body is harmless, and the
+  reconnect loop treats the rejection as a failed open.
+- **The one-shot read's body.** It had no watchdog at all, and the watchdog could not simply be
+  extended to cover it: that read runs *after* `stopSignal` is already stopped, so a stop-driven
+  watchdog would end the sink before the read delivered anything. It gets its own 60 s bound, which
+  resolves the wait rather than rejecting it — bytes already handed to `onData` are real transcript
+  and the caller keeps them only on a normal return. This matters because the read sits in the same
+  `Promise.allSettled` as `waitForJobCompletion`, so an unbounded one hangs the run *after* its Job
+  has finished. That is FAR-10 on the last read.
+- **The follow's body.** Still stop-driven, but the watchdog now escalates `sink.end()` to
+  `sink.destroy()` after a 5 s grace, and `ended` resolves on `"close"` as well as `"finish"`, so a
+  sink that will not finish gracefully cannot outlive the grace.
+
+The deadlines are injectable, which is what lets the tests assert each of these in milliseconds
+instead of minutes. They hold independently of `stopSignal` on purpose: `stopSignal` is set from
+`waitForJobCompletion`, so trusting it alone would make this collector's liveness a function of
+another leg of the same `Promise.allSettled`.
+
+## The reconnect budget counts CONSECUTIVE barren reconnects
+
+`maxReconnects` bounds reconnects that deliver nothing, in a row, and a connection that accepted at
+least one line refunds it. A total cap was wrong in a way that only shows up on long runs: a run
+lasting hours behind a proxy with a few-minute idle timeout legitimately reconnects far more than
+50 times while delivering output on every one, and a total cap would stop following it part-way and
+lose the rest in silence. What the cap is actually for is a log endpoint refusing in a tight loop —
+a *run* of barren reconnects. Both directions are tested, the second as the negative control that
+the refund does not make the bound unreachable.
 
 ## The 10 Mi rotation bound
 

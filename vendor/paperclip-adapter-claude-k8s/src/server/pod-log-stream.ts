@@ -1,3 +1,5 @@
+import { Writable } from "node:stream";
+
 import { POD_LOG_STREAM_MARKER } from "./job-manifest.js";
 
 /**
@@ -108,9 +110,11 @@ export interface PodLogStreamOptions extends PodLogStreamDeps {
   /** Set by `waitForJobCompletion`; the one authority on "the run is over". */
   stopSignal: { stopped: boolean };
   /**
-   * Hard bound on reconnects, so a pod whose log endpoint refuses in a tight
-   * loop cannot spin for the whole completion timeout. Exceeding it stops the
-   * follow; the final non-follow pass still runs, so the run degrades to a
+   * Hard bound on CONSECUTIVE reconnects that deliver no output, so a pod whose
+   * log endpoint refuses in a tight loop cannot spin for the whole completion
+   * timeout. A connection that accepted at least one line refunds it, so a long
+   * run behind a short idle timeout is not cut off part-way. Exceeding it stops
+   * the follow; the final non-follow pass still runs, so the run degrades to a
    * single read rather than to nothing.
    */
   maxReconnects?: number;
@@ -144,15 +148,44 @@ export async function collectPodLogStream(opts: PodLogStreamOptions): Promise<Po
   const maxReconnects = opts.maxReconnects ?? DEFAULT_MAX_RECONNECTS;
 
   const accumulator: string[] = [];
+  /** Follow connections opened beyond the first. Reporting only. */
   let reconnects = 0;
+  /**
+   * The budget, and deliberately NOT `reconnects`: a run lasting hours behind a
+   * proxy with a few-minute idle timeout legitimately reconnects far more than
+   * `maxReconnects` times while delivering output on every one of them, and a
+   * total cap would stop following it part-way and silently lose the rest. What
+   * the cap is actually for is a log endpoint refusing in a tight loop, which
+   * is a run of reconnects that deliver NOTHING — so a connection that accepted
+   * at least one line refunds it. The spin that bound is protecting against
+   * stays bounded by the backoff below either way.
+   */
+  let unproductiveReconnects = 0;
   let duplicates = 0;
 
-  // Resume state. `seenInSecond` holds only the payloads already accepted at
-  // `resumeSecond`, which is the exact window `sinceTime` will replay — so it
-  // is bounded by lines-per-second, not by run length. A 10 Mi transcript does
-  // not grow it.
+  // Resume state, bounded by lines-per-second rather than by run length: a
+  // 10 Mi transcript does not grow it.
+  //
+  // A MULTISET, not a set, and that is the whole point. `sinceTime` is
+  // second-granular and inclusive, so a reconnect necessarily re-delivers the
+  // lines already accepted at `resumeSecond` — but only THOSE, and only as many
+  // times as they were accepted. A set would instead drop every repeat for the
+  // whole second, including two genuinely identical transcript lines stamped in
+  // the same second on the FIRST connection, where no replay is happening at
+  // all. Counting what the replay is owed makes the resume exactly lossless
+  // instead of "lossless unless the run repeats a line".
   let resumeSecond: string | undefined;
-  let seenInSecond = new Set<string>();
+  /** Payload -> times accepted within `resumeSecond`. */
+  let acceptedInSecond = new Map<string, number>();
+  /** Payload -> times the CURRENT connection's replay may still re-deliver it. */
+  let replayBudget = new Map<string, number>();
+
+  // Armed immediately before every request that carries `sinceTime`, which is
+  // what makes dedup a property of the replay rather than of the stream. The
+  // first connection has no `sinceTime`, so its budget is empty.
+  const armReplayBudget = (): void => {
+    replayBudget = resumeSecond === undefined ? new Map() : new Map(acceptedInSecond);
+  };
 
   const accept = async (rawLine: string): Promise<void> => {
     const { timestamp, payload } = parseTimestampedLogLine(rawLine);
@@ -162,14 +195,19 @@ export async function collectPodLogStream(opts: PodLogStreamOptions): Promise<Po
     const second = truncateTimestampToSecond(timestamp);
     if (second !== undefined) {
       if (second !== resumeSecond) {
+        // A new second is past the replayed window by construction, so both
+        // the accepted tally and whatever the replay still owed are spent.
         resumeSecond = second;
-        seenInSecond = new Set();
+        acceptedInSecond = new Map();
+        replayBudget = new Map();
       }
-      if (seenInSecond.has(text)) {
+      const owed = replayBudget.get(text) ?? 0;
+      if (owed > 0) {
+        replayBudget.set(text, owed - 1);
         duplicates++;
         return;
       }
-      seenInSecond.add(text);
+      acceptedInSecond.set(text, (acceptedInSecond.get(text) ?? 0) + 1);
     }
 
     accumulator.push(text);
@@ -201,9 +239,11 @@ export async function collectPodLogStream(opts: PodLogStreamOptions): Promise<Po
     };
   };
 
-  while (!stopSignal.stopped && reconnects <= maxReconnects) {
+  while (!stopSignal.stopped && unproductiveReconnects <= maxReconnects) {
     const reader = makeLineReader();
     let opened = true;
+    const acceptedBefore = accumulator.length;
+    armReplayBudget();
     try {
       await opts.follow({
         sinceTime: resumeSecond,
@@ -218,11 +258,12 @@ export async function collectPodLogStream(opts: PodLogStreamOptions): Promise<Po
 
     if (stopSignal.stopped) break;
     reconnects++;
-    if (reconnects > maxReconnects) {
+    unproductiveReconnects = accumulator.length > acceptedBefore ? 0 : unproductiveReconnects + 1;
+    if (unproductiveReconnects > maxReconnects) {
       await onLog(
         "stderr",
-        `[paperclip] pod log stream exhausted ${maxReconnects} reconnects before the Job went terminal; `
-          + "falling back to a single non-follow read. Output may be incomplete.\n",
+        `[paperclip] pod log stream made ${maxReconnects} consecutive reconnects without output before the Job `
+          + "went terminal; falling back to a single non-follow read. Output may be incomplete.\n",
       );
       break;
     }
@@ -237,7 +278,7 @@ export async function collectPodLogStream(opts: PodLogStreamOptions): Promise<Po
       `[paperclip] pod log stream ${opened ? "ended" : "failed"} before the Job went terminal; `
         + `reconnecting (#${reconnects})${resumeSecond ? ` from ${resumeSecond}` : " from the start"}.\n`,
     );
-    await sleep(RECONNECT_BACKOFF_MS[Math.min(reconnects - 1, RECONNECT_BACKOFF_MS.length - 1)]);
+    await sleep(RECONNECT_BACKOFF_MS[Math.min(Math.max(0, unproductiveReconnects - 1), RECONNECT_BACKOFF_MS.length - 1)]);
   }
 
   // Final non-follow pass. The analogue of `tailPodLogFile`'s belt-and-braces
@@ -248,6 +289,9 @@ export async function collectPodLogStream(opts: PodLogStreamOptions): Promise<Po
   // whose tail dies with the container exactly when that line matters.
   const finalReader = makeLineReader();
   try {
+    // Carries `sinceTime`, so it replays the last second exactly like a
+    // reconnect does and needs the same budget armed.
+    armReplayBudget();
     finalReader.push(await opts.read({ sinceTime: resumeSecond }));
     for (const line of finalReader.take()) await accept(line);
     const trailing = finalReader.pending();
@@ -258,4 +302,195 @@ export async function collectPodLogStream(opts: PodLogStreamOptions): Promise<Po
   }
 
   return { stdout: accumulator.join("\n"), lines: accumulator.length, reconnects, duplicates };
+}
+
+/* ------------------------------------------------------------------------- *
+ * The transport: one `Log.log` request, driven to a bounded end.
+ * ------------------------------------------------------------------------- */
+
+/**
+ * Hard bounds on one `pumpPodLogRequest`, in milliseconds.
+ *
+ * These exist because `@kubernetes/client-node`'s `Log.log` has NO timeout of
+ * its own: it awaits `node-fetch` (v2), whose default timeout is none, and it
+ * pipes the response body into the sink WITHOUT forwarding source errors. So
+ * every wait it hands back is unbounded in both directions — a request that
+ * never answers, and a body that never ends.
+ */
+export interface PodLogPumpDeadlines {
+  /**
+   * Wait for the response HEADERS. The `AbortController` only comes back after
+   * them, so until this resolves there is nothing to abort and no watchdog can
+   * have been armed — an apiserver or kubelet proxy that accepts the connection
+   * and then says nothing hangs here, on a follow and a one-shot read alike.
+   */
+  headerMs: number;
+  /**
+   * Wait for the BODY of a one-shot (non-follow) read. The follow's body is
+   * bounded by the stop-signal watchdog instead; a one-shot read has no such
+   * signal — worse, it runs AFTER `stopSignal` is already stopped, which is
+   * exactly why the watchdog cannot be reused there (it would end the sink
+   * before the read delivered anything). A reset mid-body leaves the sink
+   * un-ended, and this read sits inside the same `Promise.allSettled` as
+   * `waitForJobCompletion`, so an unbounded one hangs the run after its Job
+   * has already finished. That is the FAR-10 shape on the last read.
+   */
+  finalReadBodyMs: number;
+  /**
+   * Grace between the watchdog's `sink.end()` and its escalation to
+   * `sink.destroy()`. `end()` is the graceful stop and is what normally
+   * resolves the wait; `destroy()` is for the case where it does not take.
+   */
+  stopGraceMs: number;
+}
+
+export const DEFAULT_POD_LOG_PUMP_DEADLINES: PodLogPumpDeadlines = {
+  headerMs: 60_000,
+  finalReadBodyMs: 60_000,
+  stopGraceMs: 5_000,
+};
+
+/** How often the follow watchdog re-reads `stopSignal`. */
+const POD_LOG_PUMP_WATCHDOG_INTERVAL_MS = 500;
+
+/** The subset of `AbortController` this module needs, defensively optional. */
+export interface PodLogAbortHandle {
+  abort?: () => void;
+}
+
+export interface PodLogPumpInput {
+  /** `follow: true` streams until the Job is terminal; `false` is one-shot. */
+  follow: boolean;
+  sinceTime?: string;
+  onData: (chunk: string) => void;
+  stopSignal: { stopped: boolean };
+  /**
+   * Issue the request, writing the body into `sink`. Resolves with the
+   * request's abort handle once the response headers are in.
+   */
+  openLog: (
+    sink: Writable,
+    options: { follow: boolean; timestamps: boolean; sinceTime?: string },
+  ) => Promise<PodLogAbortHandle | undefined>;
+  deadlines?: Partial<PodLogPumpDeadlines>;
+}
+
+/** Reject `promise` if it has not settled within `ms`, running `onExpiry` first. */
+async function withDeadline<T>(promise: Promise<T>, ms: number, label: string, onExpiry: () => void): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          try {
+            onExpiry();
+          } catch {
+            // Best effort: the rejection below is what unblocks the caller, and
+            // it must happen whether or not the cleanup did.
+          }
+          reject(new Error(`${label} after ${ms}ms`));
+        }, ms);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
+ * Drive one `Log.log` request into `onData` and resolve when it ends.
+ *
+ * Every wait in here is bounded, and deliberately NOT only by `stopSignal`:
+ * `stopSignal` is set from `waitForJobCompletion`, so trusting it alone makes
+ * this collector's liveness a function of another leg of the same
+ * `Promise.allSettled`. The deadlines above hold independently of it.
+ */
+export async function pumpPodLogRequest(input: PodLogPumpInput): Promise<void> {
+  const deadlines = { ...DEFAULT_POD_LOG_PUMP_DEADLINES, ...(input.deadlines ?? {}) };
+
+  const sink = new Writable({
+    write(chunk, _encoding, callback) {
+      try {
+        input.onData(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf-8"));
+        callback();
+      } catch (err) {
+        callback(err instanceof Error ? err : new Error(String(err)));
+      }
+    },
+  });
+
+  const ended = new Promise<void>((resolve, reject) => {
+    sink.on("finish", resolve);
+    // `destroy()` emits "close" and never "finish". Without this listener every
+    // escalation path below would leave `ended` pending for good — the exact
+    // hang they exist to break.
+    sink.on("close", resolve);
+    // A write-after-end is the expected consequence of the watchdog racing an
+    // in-flight chunk; by then `ended` has already settled, so this is a no-op
+    // that exists to keep the error from going unhandled.
+    sink.on("error", reject);
+  });
+  // `ended` is not always awaited — a header-deadline expiry returns before the
+  // body wait is reached — so keep its rejection handled either way.
+  void ended.catch(() => {});
+
+  let controller: PodLogAbortHandle | undefined;
+  try {
+    controller = await withDeadline(
+      input.openLog(sink, {
+        follow: input.follow,
+        timestamps: true,
+        ...(input.sinceTime ? { sinceTime: input.sinceTime } : {}),
+      }),
+      deadlines.headerMs,
+      `pod log ${input.follow ? "follow" : "read"} request produced no response headers`,
+      // There is no controller yet by definition, so the request itself cannot
+      // be cancelled; destroying the sink is what makes a late body harmless.
+      () => sink.destroy(),
+    );
+  } catch (err) {
+    sink.destroy();
+    throw err;
+  }
+
+  // FAR-10: the API can hold a follow connection open long after the pod is
+  // gone, and `Log.log` does not forward source errors, so an aborted request
+  // leaves `sink` un-ended. Ending it ourselves is what turns the abort into a
+  // resolution.
+  //
+  // `controller?.abort?.()` rather than `controller.abort()`: if the accessor
+  // ever hands back something without one, the throw would happen INSIDE the
+  // interval, the `end()` below it would never run, and the wait would hang for
+  // the whole completion timeout — reintroducing the shape this prevents.
+  // Failing to abort merely leaks a request the run no longer reads.
+  let stoppedAt = 0;
+  const watchdog = input.follow
+    ? setInterval(() => {
+        if (!input.stopSignal.stopped) return;
+        if (stoppedAt === 0) stoppedAt = Date.now();
+        controller?.abort?.();
+        sink.end();
+        if (Date.now() - stoppedAt >= deadlines.stopGraceMs) sink.destroy();
+      }, POD_LOG_PUMP_WATCHDOG_INTERVAL_MS)
+    : null;
+
+  // The one-shot read's bound. It resolves the wait rather than rejecting it,
+  // on purpose: bytes already handed to `onData` are real transcript, and the
+  // caller keeps them only if this pump returns normally. A deadline here means
+  // "the stream stopped producing", not "the read failed".
+  const bodyDeadline = input.follow
+    ? null
+    : setTimeout(() => {
+        controller?.abort?.();
+        sink.destroy();
+      }, deadlines.finalReadBodyMs);
+
+  try {
+    await ended;
+  } finally {
+    if (watchdog) clearInterval(watchdog);
+    if (bodyDeadline) clearTimeout(bodyDeadline);
+    controller?.abort?.();
+  }
 }
