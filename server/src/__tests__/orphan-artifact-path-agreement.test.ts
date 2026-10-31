@@ -79,8 +79,12 @@ function readAdapterSource(file: string): string {
 function deploymentMountPath(): string {
   const values = readFileSync(path.join(repoRoot, "deploy/helm/paperclip/values.yaml"), "utf-8");
 
-  // From `persistence:` to the next top-level key, so sibling blocks are out of range.
-  const block = /^persistence:[^\n]*\n([\s\S]*?)^(?=\S)/m.exec(values);
+  // From `persistence:` to the next top-level KEY, so sibling blocks are out of
+  // range. Terminating on `[A-Za-z_]` rather than any column-0 character so a
+  // column-0 comment written inside the block does not end it early: that would
+  // still fail safe (no `mountPath` in range), but it would fail reporting
+  // "no longer a scalar", which names the wrong cause.
+  const block = /^persistence:[^\n]*\n([\s\S]*?)^(?=[A-Za-z_])/m.exec(values);
   expect(block, "values.yaml no longer has a top-level `persistence:` block").not.toBeNull();
 
   const mount = /^\s{2}mountPath:\s*(\S+)\s*$/m.exec(block![1]!);
