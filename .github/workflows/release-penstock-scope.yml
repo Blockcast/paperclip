@@ -98,6 +98,8 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 24
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
           registry-url: "https://registry.npmjs.org"
 
       - name: Set up GHA-backed sccache
