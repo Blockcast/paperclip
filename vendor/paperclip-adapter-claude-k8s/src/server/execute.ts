@@ -3110,14 +3110,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // the delivery path needs the real contents every run regardless, because the
     // Secret is per-run.
     //
-    // NOT wrapped in a try/catch either. `buildPromptBundleSecretProjection`
-    // refuses rather than truncates — over budget, too many files, too many dirs,
-    // a symlink escaping the tree, a symlink cycle — and each of those refusals
-    // is exactly the "agent silently came up missing half its instructions"
-    // outcome this invariant exists to prevent. Letting it propagate fails the
-    // run with a verdict that names the company, the run and the measured bytes,
-    // which is §4.2's escalation path. Stepping over it here would ship the
-    // silent failure instead.
+    // Caught only to NAME the refusal, never to step over it — the opposite of
+    // the measurement branch below. `buildPromptBundleSecretProjection` refuses
+    // rather than truncates (over budget, too many files, too many dirs, a
+    // symlink escaping the tree, a symlink cycle), and each of those refusals is
+    // exactly the "agent silently came up missing half its instructions" outcome
+    // this invariant exists to prevent. Every one still fails the run; the catch
+    // exists so it fails with a typed `errorCode` and the measured detail, which
+    // is what §4.2's escalation and the skill-health sweeps can actually read.
+    // See the catch itself for why only the five deliberate refusals are claimed.
     // Bound to a const first: `promptBundleProjection` is a `let` that has to
     // outlive this block to reach `buildJobManifest`, and TypeScript drops the
     // non-null narrowing across the `await` boundary below.
