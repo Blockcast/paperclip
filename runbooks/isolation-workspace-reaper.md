@@ -56,6 +56,28 @@ Read the two values differently:
   Operationally the same state as a known-partial sweep, which is why the alert expression is `!= 0`
   and not `> 0`.
 
+### What you can actually do about it today
+
+**Nothing in this repo reclaims a foreign claim yet**, so the remedies below are the whole list.
+[PEN-5151](https://paperclip.blockcast.net/PEN/issues/PEN-5151) owns the reclaimer; its server half
+(`buildIsolationReclaimPlan`) is in the tree but has no caller, so do not go looking for a sweep that
+might have run.
+
+- **Opt the agent back out.** Clearing `enablePerAgentWorkspaceVolume` (or the agent's
+  `workspaceVolumeClaim`) returns its next run to the shared claim, where this reaper reaches its
+  trees unchanged. ⚠ The run also moves to a **different volume**: the per-agent claim's checkout,
+  worktrees and pnpm store are left behind, so the next run is a cold start and anything uncommitted
+  under them is unreachable until the agent is opted back in. The bytes are not deleted by opting
+  out — they stay on the claim, unreclaimed, which is the finding you started from.
+- **Expand the claim.** `cephfs` sets `allowVolumeExpansion: true`, so a claim that outgrows its
+  request can be grown in place. This is the terminal state the ≈3.7-month ceiling was accepted
+  against, not a workaround.
+
+Neither is urgent on the first alert. The useful question is *how many* agents are in this state and
+for how long: one agent a month into its own claim has used roughly a quarter of its headroom, and
+the gauge is deliberately loud from the first opt-in so that this is a scheduling decision rather
+than a capacity incident.
+
 **Do not reach for `stop_reason` to rule this out.** An unreachable workspace is never enumerated,
 so it lands in no outcome bucket, the `scanned` identity still holds exactly, and the pass reports
 `stop_reason="complete"`. `root_absent` does not catch it either — that fires on `ENOENT` of the

@@ -596,9 +596,46 @@ export interface IsolationReclaimPlan {
    * bucket exists only on the plan path, and it is a deliberate narrowing.
    */
   skippedUnsafeName: number;
-  /** True when `maxEntries` dropped eligible entries from the tail. */
+  /**
+   * Refused because the entry carried no usable `mtimeMs`.
+   *
+   * Kept apart from `skippedUnsafeName` because the causes are different and so
+   * are the remedies: an unexpected name is a directory nobody should have
+   * created, whereas this is an executor reporting badly — a serialization bug
+   * on the inventory path, not something on the volume. Folding them together
+   * would hide one steady population under the other, which is the mistake
+   * `retainedNestedCheckout` was split out of `skippedLayout` to avoid.
+   */
+  skippedMalformed: number;
+  /**
+   * Named twice in the inventory. `readdir` cannot do that; a report crossing a
+   * process boundary can, and a repeat would spend the bound twice on one
+   * directory.
+   */
+  skippedDuplicate: number;
+  /**
+   * Eligible on every signal, but past `maxEntries`. These are offered again on
+   * the next tick — the plan is ordered oldest-idle first precisely so that
+   * what gets dropped here is the least overdue.
+   */
+  droppedByBound: number;
+  /**
+   * True when `droppedByBound` is non-zero. Redundant with it by construction,
+   * and kept anyway for the same reason `capped` is kept beside the sweep's
+   * counters: one boolean an operator can alert on without arithmetic.
+   */
   truncated: boolean;
-  /** Entries considered, so a reader can check the buckets against the input. */
+  /**
+   * Entries considered. Every one lands in exactly one bucket, so with nothing
+   * else changing, `inventorySize` is exactly
+   * `eligibleIds.length + droppedByBound + retainedFresh + retainedInUse +
+   * skippedUnsafeName + skippedMalformed + skippedDuplicate`.
+   *
+   * Stated and held by a test rather than left to be assumed: this is the one
+   * surface an operator has for a volume they cannot walk, so a silent bucket
+   * here is the same failure the mounted sweep's `scanned` identity exists to
+   * prevent — a count that looks complete over a population it is not.
+   */
   inventorySize: number;
 }
 
@@ -668,6 +705,9 @@ export async function buildIsolationReclaimPlan(input: {
     retainedFresh: 0,
     retainedInUse: 0,
     skippedUnsafeName: 0,
+    skippedMalformed: 0,
+    skippedDuplicate: 0,
+    droppedByBound: 0,
     truncated: false,
     inventorySize: input.inventory.length,
   };
@@ -685,7 +725,22 @@ export async function buildIsolationReclaimPlan(input: {
       plan.skippedUnsafeName += 1;
       continue;
     }
-    if (seen.has(entry.name)) continue;
+    // `mtimeMs` is typed `number`, but it arrives over a serialization boundary
+    // and the type is not enforcement. A missing, null, NaN or string value
+    // makes `mtimeMs >= cutoff` FALSE, which routes the entry to `aged` — and a
+    // `null` additionally sorts to the FRONT of the plan, so a malformed entry
+    // would become the highest-priority deletion candidate. That is the
+    // fail-open direction this module refuses everywhere else, so it is checked
+    // here rather than left to the executor's own re-checks to catch.
+    // (Ally, review of PR #3184.)
+    if (!Number.isFinite(entry.mtimeMs)) {
+      plan.skippedMalformed += 1;
+      continue;
+    }
+    if (seen.has(entry.name)) {
+      plan.skippedDuplicate += 1;
+      continue;
+    }
     seen.add(entry.name);
     named.push(entry);
   }
@@ -712,7 +767,8 @@ export async function buildIsolationReclaimPlan(input: {
   }
 
   aged.sort((a, b) => a.idleSinceMs - b.idleSinceMs);
-  plan.truncated = aged.length > maxEntries;
+  plan.droppedByBound = Math.max(0, aged.length - maxEntries);
+  plan.truncated = plan.droppedByBound > 0;
   plan.eligibleIds = aged.slice(0, maxEntries).map((entry) => entry.name);
   return plan;
 }
