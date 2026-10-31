@@ -56,6 +56,18 @@ Read the two values differently:
   Operationally the same state as a known-partial sweep, which is why the alert expression is `!= 0`
   and not `> 0`.
 
+**Two pages here are one finding.** The query aggregates `by (dry_run)`, so the live and dry-run
+sweeps publish separate series and a single unreachable tree raises the alert once per mode that is
+running. The modes are deliberately not collapsed — a dry-run sweep reaching nothing must not be
+able to mask a live one — but the count is a property of the *population*, not of the sweep that
+observed it. Reconcile the two labels before you treat them as two problems.
+
+⚠ **On Blockcast this alert is not deployed yet.** The chart ships the rule but
+`deploy/helm/paperclip/values.blockcast.yaml` sets `prometheusRule.enabled: false`, and the mirror
+that deploys it, [Blockcast/onprem-k8s#7210](https://github.com/Blockcast/onprem-k8s/pull/7210), is
+still open. Confirm the rule is loaded at `/api/v1/rules` before relying on it to tell you an agent
+has been opted in — until then the coverage gap is visible only by running the query above by hand.
+
 ### What you can actually do about it today
 
 **Nothing in this repo reclaims a foreign claim yet**, so the remedies below are the whole list.
@@ -88,6 +100,26 @@ so it lands in no outcome bucket, the `scanned` identity still holds exactly, an
 `stop_reason="complete"`. `root_absent` does not catch it either — that fires on `ENOENT` of the
 root, and the root stays present and populated by every agent still on the shared claim. A
 `complete` sweep means *"finished sweeping the tree it could see"*, never *"swept the population"*.
+
+### This alert is a standing record, not a transient (PEN-5125 / PEN-5151)
+
+While [PEN-5151](https://paperclip.blockcast.net/PEN/issues/PEN-5151) is open there is **no
+reclaimer for an unreachable tree**, so a `> 0` here does not clear on its own and is not expected
+to. It was accepted deliberately, with a ceiling:
+
+> ≈10 GiB/agent/month against a **50 Gi** claim already carrying ≈13.2 G of duplicated company
+> trees ⇒ ≈36.8 GiB headroom ⇒ **one opted-in agent fills its own claim in ≈3.7 months.**
+
+So the question this alert asks you is *"does that claim have an owner?"*, not *"what broke?"*.
+The two remedies are in § "What you can actually do about it today" above and neither needs the
+reclaimer; what that section does not say is what each one does to **this gauge**. Opting the agent
+back out returns it to `0` on the next sweep, because the trees are reachable again. Expanding the
+claim leaves it `> 0` forever — the growth rate is unchanged and the population is unchanged, so
+expansion buys months, not a clear.
+
+**Do not silence it to make the page quiet.** The reason this gauge exists is that the previous
+state of the world was silence: the tree grew 0 → 406.7 GiB with nothing reporting it, and a sweep
+over a shrunken population reports `complete` either way.
 
 ## Two findings signals worth reading while you are here
 
