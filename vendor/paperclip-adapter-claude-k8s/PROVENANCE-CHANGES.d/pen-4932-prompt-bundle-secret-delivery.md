@@ -51,12 +51,13 @@ projection being non-empty: an all-image-path run has an empty projection and st
 ## Refusals fail the run here — the opposite of the measurement path, deliberately
 
 `buildPromptBundleSecretProjection` refuses rather than truncates (over budget, too many
-files/dirs, symlink escaping the tree, symlink cycle). On the delivery path those refusals
-propagate: no sizing cache, no `catch`. Each one is precisely the "agent came up missing half its
-instructions" outcome, so stepping over it while the Secret **is** the delivery path would ship the
-silent failure this channel exists to prevent. The escalation threshold was chosen against a
-one-company sample; the first per-agent runs are where the fleet distribution actually gets
-measured.
+files/dirs, symlink escaping the tree, symlink cycle). On the delivery path those refusals fail the
+run: no sizing cache, and the one `catch` is there only to name them under a typed `errorCode`
+(`k8s_prompt_bundle_projection_refused`), never to step over them. Each one is precisely the "agent
+came up missing half its instructions" outcome, so stepping over it while the Secret **is** the
+delivery path would ship the silent failure this channel exists to prevent. The escalation
+threshold was chosen against a one-company sample; the first per-agent runs are where the fleet
+distribution actually gets measured.
 
 `createOrAdoptRunSecret` gains an optional `base64Data` half so the projection's non-UTF-8 files
 reach the pod intact — a PNG or a font in a skill tree would otherwise be delivered corrupted.
