@@ -26,6 +26,16 @@ query. Rows come back newest-first and capped, so an older event can fall
 outside the window — this endpoint is a feed, not an exhaustive export. For
 everything recorded against one issue, use the issue-scoped endpoint below.
 
+⚠ An **unnarrowed** page — one that sets none of `action`, `agentId`,
+`entityType` or `entityId` (`limit` does not count as narrowing) — additionally
+omits `heartbeat.run_events_streamed` altogether. That action is written once
+per live-events socket × owning agent per 30s window, so leaving it in would
+make it most of every recency-ordered page. **Any** narrowing filter returns it
+like any other row. The response carries an `X-Applied-Filters` header
+(percent-encoded JSON) echoing the filter actually applied, with the omission
+listed under `excludeActions` — so "filter applied, zero matches" stays
+distinguishable from "filter never applied", and this exclusion is never silent.
+
 ## Issue Activity
 
 ```
@@ -153,3 +163,12 @@ report a clean result as well as a lossy one:
 node scripts/check-issue-activity-comment-coverage.mjs --issue PEN-1593
 node scripts/check-issue-activity-comment-coverage.mjs --limit 120
 ```
+
+Which rows it reads, so the table above reproduces: `--issue` pins one issue.
+Without it the probe takes the first N issues from
+`GET /api/companies/{companyId}/issues`, which returns them in that endpoint's
+priority-then-recency order — a deterministic slice of the backlog, not a
+uniform random sample of it. Per issue it **pages** the comment list with the
+`after` cursor, so an issue with more than 500 comments is measured whole
+instead of from its oldest 500; if the page cap stops a walk short, the issue is
+named in the output rather than folded silently into the result.

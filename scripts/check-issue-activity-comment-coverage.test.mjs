@@ -2,13 +2,16 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
+  COMMENTS_PAGE_SIZE,
   DEFAULT_MIN_SAMPLE,
   EXIT_NO_SAMPLE,
   EXIT_OK,
   EXIT_VIOLATION,
+  MAX_COMMENT_PAGES,
   classifyComment,
   decide,
   findViolations,
+  planNextCommentsPage,
   sampleSize,
   summarize,
   unkeyedLossPct,
@@ -152,4 +155,109 @@ test("decide refuses the run when a loss ceiling arrived malformed", () => {
 
 test("the three outcomes stay distinct, so clean never collides with unmeasured", () => {
   assert.equal(new Set([EXIT_OK, EXIT_VIOLATION, EXIT_NO_SAMPLE]).size, 3);
+});
+
+/* -------------------------------------------------------------------------- */
+/* planNextCommentsPage -- the comment walk's stopping rules.                  */
+/* A single ?limit=500 request returns the OLDEST 500 and does not say so, so  */
+/* the walk is what keeps the sample from being a silent prefix of the very    */
+/* long-lived issues most worth measuring.                                     */
+/* -------------------------------------------------------------------------- */
+
+/** `n` page rows with ids offset by `from`, shaped like the comments endpoint. */
+function page(n, from = 0) {
+  return Array.from({ length: n }, (_, i) => ({ id: `c-${from + i}` }));
+}
+
+test("a short page ends the walk and keeps every row", () => {
+  const step = planNextCommentsPage(page(3), new Set(), 500);
+  assert.equal(step.done, true);
+  assert.equal(step.reason, "short_page");
+  assert.equal(step.cursor, null);
+  assert.equal(step.fresh.length, 3);
+});
+
+test("an empty page ends the walk without inventing a cursor", () => {
+  const step = planNextCommentsPage([], new Set(), 500);
+  assert.equal(step.done, true);
+  assert.equal(step.reason, "short_page");
+  assert.equal(step.cursor, null);
+  assert.deepEqual(step.fresh, []);
+});
+
+test("a full page continues, anchored on its last id", () => {
+  const step = planNextCommentsPage(page(500), new Set(), 500);
+  assert.equal(step.done, false);
+  assert.equal(step.reason, null);
+  assert.equal(step.cursor, "c-499");
+  assert.equal(step.fresh.length, 500);
+});
+
+test("a page of exactly the limit is 'full', not 'short'", () => {
+  // The boundary that decides whether a 500-comment issue is walked further.
+  // Reading `length === limit` as short would stop one page early and silently
+  // drop every comment after the 500th -- the prefix this probe exists to flag.
+  assert.equal(planNextCommentsPage(page(COMMENTS_PAGE_SIZE), new Set(), COMMENTS_PAGE_SIZE).done, false);
+  assert.equal(planNextCommentsPage(page(COMMENTS_PAGE_SIZE - 1), new Set(), COMMENTS_PAGE_SIZE).done, true);
+});
+
+test("rows already seen are not re-collected", () => {
+  const rows = page(500);
+  const seen = new Set(rows.slice(0, 200).map((r) => r.id));
+  const step = planNextCommentsPage(rows, seen, 500);
+  assert.equal(step.fresh.length, 300);
+  assert.equal(step.done, false);
+});
+
+test("a full page of nothing new ends the walk instead of looping forever", () => {
+  // An `after` cursor is documented as strictly exclusive (PEN-4458), but a
+  // deployment predating that fix re-returns the anchor at the head of every
+  // ascending page. Trusting the contract alone would spin here.
+  const rows = page(500);
+  const seen = new Set(rows.map((r) => r.id));
+  const step = planNextCommentsPage(rows, seen, 500);
+  assert.equal(step.done, true);
+  assert.equal(step.reason, "no_new_rows");
+  assert.equal(step.cursor, null);
+  assert.deepEqual(step.fresh, []);
+});
+
+test("a full page whose last row has no id stops rather than re-requesting it", () => {
+  const rows = [...page(499), { id: undefined }];
+  const step = planNextCommentsPage(rows, new Set(), 500);
+  assert.equal(step.done, true);
+  assert.equal(step.reason, "no_cursor");
+  assert.equal(step.fresh.length, 499);
+});
+
+test("walking consecutive pages collects every row exactly once", () => {
+  // Drives the planner the way main() does, against an inclusive-cursor server
+  // that repeats the anchor on every page -- the worst case for the walk.
+  const all = page(1250);
+  const seen = new Set();
+  const collected = [];
+  let cursor = null;
+  let requests = 0;
+  for (let i = 0; i < MAX_COMMENT_PAGES; i++) {
+    const start = cursor === null ? 0 : Number(cursor.split("-")[1]);
+    const rows = all.slice(start, start + 500);
+    requests += 1;
+    const step = planNextCommentsPage(rows, seen, 500);
+    for (const row of step.fresh) {
+      seen.add(row.id);
+      collected.push(row.id);
+    }
+    if (step.done) break;
+    cursor = step.cursor;
+  }
+  assert.equal(collected.length, 1250);
+  assert.equal(new Set(collected).size, 1250);
+  assert.deepEqual(collected.slice(0, 2), ["c-0", "c-1"]);
+  assert.equal(collected.at(-1), "c-1249");
+  assert.ok(requests <= MAX_COMMENT_PAGES);
+});
+
+test("the page cap is high enough not to bite a realistic issue", () => {
+  // 20 x 500. The busiest row measured for PEN-5158 held 315 comments.
+  assert.ok(MAX_COMMENT_PAGES * COMMENTS_PAGE_SIZE >= 10000);
 });
