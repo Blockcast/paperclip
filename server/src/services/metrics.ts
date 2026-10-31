@@ -812,6 +812,30 @@ export const KNOWN_WORKER_TIER_PROXY_FAILURE_REASONS = [
   "mid_stream",
   "unreachable",
 ] as const;
+
+/**
+ * Which of the two proxy hops failed (PEN-5140).
+ *
+ * `worker` is the API tier forwarding a worker-dependent plugin route to the
+ * `-workers` Service (`registerWorkerTierProxyRoutes`). `holder` is a follower
+ * worker pod forwarding the SAME route on to the scheduler lease holder
+ * (`registerPluginHolderForwardRoutes`, BLO-47803).
+ *
+ * They pooled on one series before this label, and the `timeout` arm is where
+ * that hurt: both hops carry the same `PROXY_REQUEST_TIMEOUT_MS`, both label
+ * their failure `timeout`, and both run on the same `route` — so a timed-out
+ * webhook delivery was indistinguishable between "the worker tier is slow" and
+ * "the lease holder is slow", which are different faults with different
+ * owners. That ambiguity was the stated obstacle to diagnosing the per-alert
+ * cost question this label was added for.
+ *
+ * A closed set fixed at registration, never caller input. Cardinality stays
+ * bounded at |routes| x |reasons| x |hops|, and the two hops are seeded
+ * independently (see {@link initWorkerTierProxyRouteSeries}) so a process that
+ * registers only one hop does not advertise zeroed series for the other.
+ */
+export const KNOWN_WORKER_TIER_PROXY_HOPS = ["worker", "holder"] as const;
+export type WorkerTierProxyHop = (typeof KNOWN_WORKER_TIER_PROXY_HOPS)[number];
 export type WorkerTierProxyFailureReason =
   (typeof KNOWN_WORKER_TIER_PROXY_FAILURE_REASONS)[number];
 
@@ -834,7 +858,7 @@ export type WorkerTierProxyFailureReason =
  * re-seeds from this set, and a registration that lands before the registry
  * exists is picked up when it is built.
  */
-const workerTierProxyRoutes = new Set<string>();
+const workerTierProxyRoutes = new Map<WorkerTierProxyHop, Set<string>>();
 
 /**
  * Seed the zero-valued `{reason, route}` series for every proxied route.
@@ -848,11 +872,19 @@ const workerTierProxyRoutes = new Set<string>();
  *
  * Idempotent, and safe to call before the registry is built.
  */
-export function initWorkerTierProxyRouteSeries(routes: readonly string[]): void {
+export function initWorkerTierProxyRouteSeries(
+  routes: readonly string[],
+  hop: WorkerTierProxyHop,
+): void {
+  let seen = workerTierProxyRoutes.get(hop);
+  if (!seen) {
+    seen = new Set<string>();
+    workerTierProxyRoutes.set(hop, seen);
+  }
   let added = false;
   for (const route of routes) {
-    if (!workerTierProxyRoutes.has(route)) {
-      workerTierProxyRoutes.add(route);
+    if (!seen.has(route)) {
+      seen.add(route);
       added = true;
     }
   }
@@ -864,9 +896,18 @@ export function initWorkerTierProxyRouteSeries(routes: readonly string[]): void 
  * Zero every `{reason, route}` pair currently known. Called at counter
  * construction and again whenever a new route registers afterwards.
  */
-function zeroInitWorkerTierProxyFailureSeries(counter: Counter<"reason" | "route">): void {
-  for (const reason of KNOWN_WORKER_TIER_PROXY_FAILURE_REASONS) {
-    for (const route of workerTierProxyRoutes) counter.inc({ reason, route }, 0);
+function zeroInitWorkerTierProxyFailureSeries(
+  counter: Counter<"reason" | "route" | "hop">,
+): void {
+  // Seeded per hop, from the routes that hop actually registered. Seeding the
+  // cross product instead would advertise zeroed `hop="holder"` series on a
+  // single-replica worker tier that never registers the holder-forward hop,
+  // and a permanently-zero series reads as "measured healthy" rather than as
+  // "not applicable here" — the precise confusion zero-init exists to remove.
+  for (const [hop, routes] of workerTierProxyRoutes) {
+    for (const reason of KNOWN_WORKER_TIER_PROXY_FAILURE_REASONS) {
+      for (const route of routes) counter.inc({ reason, route, hop }, 0);
+    }
   }
 }
 
@@ -3600,6 +3641,50 @@ export const PLUGIN_METRIC_TOTAL_METRIC = "paperclip_plugin_metric_total";
 export const PLUGIN_METRIC_DROPPED_METRIC = "paperclip_plugin_metric_dropped_total";
 
 /**
+ * Plugin-contributed DURATION observations from `ctx.metrics.observe`
+ * (PEN-5140). A real Prometheus histogram, so `histogram_quantile` works
+ * directly on it.
+ *
+ * Separate from {@link PLUGIN_METRIC_TOTAL_METRIC} because the two answer
+ * different questions and a counter cannot be made to answer this one. A
+ * counter pair gives a MEAN (`increase(sum) / increase(count)`), and a mean is
+ * exactly what hid the fault PEN-5140 was filed about: a heavy per-alert tail
+ * sitting under an in-band mean. Quantiles need bucket boundaries, which the
+ * `write` channel cannot express — `le` is not a promotable tag key, and
+ * promoting it would publish as `tag_le`, which `histogram_quantile` does not
+ * read.
+ *
+ * Unit is SECONDS, per Prometheus convention, regardless of what the plugin
+ * measured in. The SDK takes seconds and says so.
+ *
+ * Cardinality is bounded the same way the counter is: `metric` is drawn from
+ * the same per-plugin {@link PLUGIN_METRIC_NAME_BUDGET} ledger, so a plugin
+ * cannot mint unbounded histogram families. No promoted tags at all here —
+ * buckets already multiply the series count by |buckets| + 2, and a tag axis
+ * on top of that is how a histogram becomes a cardinality incident.
+ */
+export const PLUGIN_METRIC_DURATION_METRIC = "paperclip_plugin_metric_duration_seconds";
+
+/**
+ * Bucket bounds for {@link PLUGIN_METRIC_DURATION_METRIC}, in seconds.
+ *
+ * Chosen for the question PEN-5140 has to settle, not as a generic spread:
+ * per-alert webhook cost was claimed to have regressed from a 1.65-1.88 s
+ * baseline to an ~8.0 s median with an 81.2 s tail. `1.8` and `8` are
+ * therefore explicit boundaries — with those two edges present, "has the
+ * median crossed the baseline band" and "has it reached the claimed figure"
+ * are each a single bucket comparison rather than an interpolation artifact.
+ * `120` is the API tier's `PROXY_REQUEST_TIMEOUT_MS`, so the final finite
+ * bucket is the deadline that actually destroys a delivery.
+ *
+ * 13 bounds => 15 series per (plugin, metric) including `+Inf`, `_sum` and
+ * `_count`.
+ */
+export const PLUGIN_METRIC_DURATION_BUCKETS_SECONDS = [
+  0.05, 0.1, 0.25, 0.5, 1, 1.8, 2.5, 5, 8, 15, 30, 60, 120,
+] as const;
+
+/**
  * Tag keys any plugin may ever promote to a Prometheus label.
  *
  * This is the platform half of a two-sided gate: a tag key becomes a label
@@ -5213,6 +5298,7 @@ let pluginMetric: Counter<
   "plugin_id" | "plugin_key" | "metric" | PluginMetricPromotableTagKey
 > | null = null;
 let pluginMetricDropped: Counter<"plugin_id" | "plugin_key" | "reason" | "metric"> | null = null;
+let pluginMetricDuration: Histogram<"plugin_id" | "plugin_key" | "metric"> | null = null;
 
 /**
  * Per-plugin ledger of `(metric, promoted-label-values)` combinations already
@@ -5299,7 +5385,7 @@ let pluginWebhookDeliveryRejected:
   | null = null;
 let recoveryHorizonExpired: Counter<"delivery"> | null = null;
 let recoveryActionAutoDischarged: Counter<"kind"> | null = null;
-let workerTierProxyFailures: Counter<"reason" | "route"> | null = null;
+let workerTierProxyFailures: Counter<"reason" | "route" | "hop"> | null = null;
 let isolationReaperScanned: Counter<"dry_run"> | null = null;
 let isolationReaperDeleted: Counter<"dry_run"> | null = null;
 let isolationReaperSkippedLayout: Counter<"dry_run"> | null = null;
@@ -5410,6 +5496,7 @@ function ensureRegistry(): {
     "plugin_id" | "plugin_key" | "metric" | PluginMetricPromotableTagKey
   >;
   pluginMetricDroppedCounter: Counter<"plugin_id" | "plugin_key" | "reason" | "metric">;
+  pluginMetricDurationHistogram: Histogram<"plugin_id" | "plugin_key" | "metric">;
   pluginStatusCollectorLastSuccessGauge: Gauge<"role">;
   externalRuntimeReservationStrandedOldestAgeGauge: Gauge<"agent_id">;
   externalRuntimeReservationStrandMetricsRefreshSuccessGauge: Gauge;
@@ -5458,7 +5545,7 @@ function ensureRegistry(): {
   pluginWebhookDeliveryRejectedCounter: Counter<"plugin_key" | "response_class" | "plugin_status">;
   recoveryHorizonExpiredCounter: Counter<"delivery">;
   recoveryActionAutoDischargedCounter: Counter<"kind">;
-  workerTierProxyFailuresCounter: Counter<"reason" | "route">;
+  workerTierProxyFailuresCounter: Counter<"reason" | "route" | "hop">;
   isolationReaperScannedCounter: Counter<"dry_run">;
   isolationReaperDeletedCounter: Counter<"dry_run">;
   isolationReaperSkippedLayoutCounter: Counter<"dry_run">;
@@ -5588,6 +5675,7 @@ function ensureRegistry(): {
     || !crashRecoveryCandidateIndexPresent
     || !pluginMetric
     || !pluginMetricDropped
+    || !pluginMetricDuration
     || !pluginStatusCollectorLastSuccess
     || !prReviewQueueWait
     || !runDispatchWait
@@ -7616,6 +7704,25 @@ function ensureRegistry(): {
       ],
       registers: [registry],
     });
+    pluginMetricDuration = new Histogram({
+      name: PLUGIN_METRIC_DURATION_METRIC,
+      help:
+        "Plugin-contributed duration observations from ctx.metrics.observe, in "
+        + "seconds (PEN-5140). A real histogram, so histogram_quantile() reads "
+        + "it directly. Distinct from " + PLUGIN_METRIC_TOTAL_METRIC + ", which "
+        + "is a counter and can only yield a MEAN -- the statistic that hid the "
+        + "per-alert webhook tail this metric was added to expose. The plugin's "
+        + "own metric name is the 'metric' LABEL for the same reason as on the "
+        + "counter: plugins build names by interpolation, so name-mapping would "
+        + "let any installed plugin mint arbitrary paperclip_* series. Drawn "
+        + "from the same per-plugin metric-NAME budget as the counter. "
+        + "Deliberately carries NO promoted tag labels: buckets already "
+        + "multiply series by |buckets| + 2, and a tag axis on top of that is "
+        + "how a histogram becomes a cardinality incident.",
+      labelNames: ["plugin_id", "plugin_key", "metric"],
+      buckets: [...PLUGIN_METRIC_DURATION_BUCKETS_SECONDS],
+      registers: [registry],
+    });
     pluginMetricDropped = new Counter({
       name: PLUGIN_METRIC_DROPPED_METRIC,
       help:
@@ -8268,10 +8375,13 @@ function ensureRegistry(): {
         + "(connection succeeded, the worker was still silent at the proxy deadline), "
         + "'mid_stream' (the worker answered and the response broke after headers "
         + "were flushed) or 'unreachable' (the request never reached a worker), and "
-        + "by route (the proxied Express path pattern that failed). "
+        + "by route (the proxied Express path pattern that failed) and by hop "
+        + "('worker' = API tier -> workers Service; 'holder' = follower worker "
+        + "-> scheduler lease holder), which share a deadline and a route and "
+        + "so were indistinguishable on the timeout arm before PEN-5140. "
         + "Replaces a log grep that could not answer a 24h question, because the api "
         + "pod's log does not survive its own recreation (BLO-31945).",
-      labelNames: ["reason", "route"],
+      labelNames: ["reason", "route", "hop"],
       registers: [registry],
     });
     // Zero-init every series. An un-incremented counter is absent from the
@@ -8404,6 +8514,7 @@ function ensureRegistry(): {
     crashRecoveryCandidateIndexPresentGauge: crashRecoveryCandidateIndexPresent,
     pluginMetricCounter: pluginMetric,
     pluginMetricDroppedCounter: pluginMetricDropped,
+    pluginMetricDurationHistogram: pluginMetricDuration,
     pluginStatusCollectorLastSuccessGauge: pluginStatusCollectorLastSuccess,
     prReviewQueueWaitHistogram: prReviewQueueWait,
     runDispatchWaitHistogram: runDispatchWait,
@@ -10893,6 +11004,100 @@ export function recordPluginMetric(input: RecordPluginMetricInput): void {
 }
 
 /**
+ * Publish one plugin-contributed DURATION observation to Prometheus
+ * (PEN-5140).
+ *
+ * **Never throws**, for the same reason as {@link recordPluginMetric}: this
+ * runs inside `ctx.metrics.observe`, which plugins call from inside webhook
+ * and alert processing. An exception escaping here would escalate "a plugin
+ * submitted a mis-shaped duration" into "the delivery that carried it
+ * failed" — converting an instrumentation defect into the dropped-alert class
+ * this metric exists to make visible. Every rejection is a counted drop on
+ * {@link PLUGIN_METRIC_DROPPED_METRIC}, reusing that counter's existing
+ * reasons so a plugin author debugging a missing series reads ONE drop metric,
+ * not two.
+ *
+ * Shares the per-plugin metric-NAME ledger with the counter deliberately. The
+ * budget bounds how many distinct names one plugin can mint, and a name minted
+ * through `observe` costs the same series pressure as one minted through
+ * `write` — more, in fact, since each carries |buckets| + 2 series. Letting
+ * `observe` carry its own ledger would hand every plugin a second budget and
+ * silently double the bound this one exists to enforce.
+ *
+ * Unlike the counter there is no overflow-series fallback: a histogram's
+ * `_sum` is only meaningful over a homogeneous population, so folding
+ * unrelated durations into one `_overflow` family would publish a quantile
+ * that describes nothing. Past budget the observation is dropped and counted.
+ *
+ * @param seconds - Duration in SECONDS. Callers measuring in milliseconds must
+ *   divide; the metric name carries the unit and the SDK says so.
+ */
+export function recordPluginMetricObservation(input: {
+  pluginId: string;
+  pluginKey: string;
+  /** The plugin-supplied metric name. Becomes the `metric` label. */
+  name: string;
+  /** Observed duration in seconds. Must be finite and `>= 0`. */
+  seconds: number;
+}): void {
+  try {
+    const metrics = ensureRegistry();
+    const pluginId = String(input.pluginId ?? "");
+    const pluginKey = String(input.pluginKey ?? "");
+    const identity = { plugin_id: pluginId, plugin_key: pluginKey };
+
+    const name = String(input.name ?? "").trim();
+    if (
+      name.length === 0
+      || name.length > PLUGIN_METRIC_NAME_MAX_LENGTH
+      || !PLUGIN_METRIC_NAME_REGEX.test(name)
+    ) {
+      metrics.pluginMetricDroppedCounter.inc({ ...identity, reason: "bad_name" });
+      return;
+    }
+
+    // A duration, so negative is meaningless and non-finite cannot be bucketed.
+    // Rejected rather than clamped for the same reason as on the counter: a
+    // silently-altered observation corrupts `_sum` and every quantile derived
+    // from it, which is strictly worse than a counted drop.
+    const seconds = typeof input.seconds === "number"
+      ? input.seconds
+      : Number(input.seconds);
+    if (!Number.isFinite(seconds) || seconds < 0) {
+      metrics.pluginMetricDroppedCounter.inc({ ...identity, reason: "bad_value" });
+      return;
+    }
+
+    // Shared name ledger — see the doc comment above for why this is not a
+    // second budget.
+    let seenNames = pluginMetricNames.get(pluginId);
+    if (!seenNames) {
+      seenNames = new Set<string>();
+      pluginMetricNames.set(pluginId, seenNames);
+    }
+    if (!seenNames.has(name)) {
+      if (seenNames.size >= PLUGIN_METRIC_NAME_BUDGET) {
+        metrics.pluginMetricDroppedCounter.inc({
+          ...identity,
+          reason: "name_budget",
+          metric: PLUGIN_METRIC_OVERFLOW_NAME,
+        });
+        return;
+      }
+      seenNames.add(name);
+    }
+
+    metrics.pluginMetricDurationHistogram.observe(
+      { ...identity, metric: name },
+      seconds,
+    );
+  } catch (err) {
+    // Deliberately swallowed — see the "never throws" contract above.
+    console.debug("[metrics] recordPluginMetricObservation failed:", err);
+  }
+}
+
+/**
  * Record a successful plugin-status collector tick (BLO-21092 review
  * follow-up). Callers pass unix seconds, not milliseconds -- the collector
  * owns the clock so this stays a pure setter and unit-tests deterministically.
@@ -11393,12 +11598,13 @@ export function recordExecutionWorkspaceCollectorPass(
 export function recordWorkerTierProxyFailure(
   reason: WorkerTierProxyFailureReason,
   route: string,
+  hop: WorkerTierProxyHop,
 ): void {
   try {
-    ensureRegistry().workerTierProxyFailuresCounter.inc({ reason, route });
+    ensureRegistry().workerTierProxyFailuresCounter.inc({ reason, route, hop });
   } catch (error) {
     logger.error(
-      { err: error, reason, route },
+      { err: error, reason, route, hop },
       "failed to record worker-tier proxy failure metric",
     );
   }

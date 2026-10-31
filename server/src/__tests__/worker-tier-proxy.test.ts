@@ -45,18 +45,19 @@ async function proxyFailureSeries(): Promise<Record<string, number>> {
  * attribution tests use when the route itself is the claim.
  */
 async function proxyFailureRows(): Promise<
-  Array<{ reason: string; route: string; value: number }>
+  Array<{ reason: string; route: string; hop: string; value: number }>
 > {
   const { body } = await renderMetrics();
-  const rows: Array<{ reason: string; route: string; value: number }> = [];
+  const rows: Array<{ reason: string; route: string; hop: string; value: number }> = [];
   for (const line of body.split("\n")) {
     if (!line.startsWith(`${WORKER_TIER_PROXY_FAILURES_METRIC}{`)) continue;
     const [, labels, rawValue] = /\{(.*)\}\s+(\S+)$/.exec(line) ?? [];
     if (labels === undefined) continue;
     const reason = /reason="([^"]*)"/.exec(labels)?.[1];
     const route = /route="([^"]*)"/.exec(labels)?.[1];
-    if (reason === undefined || route === undefined) continue;
-    rows.push({ reason, route, value: Number(rawValue) });
+    const hop = /hop="([^"]*)"/.exec(labels)?.[1];
+    if (reason === undefined || route === undefined || hop === undefined) continue;
+    rows.push({ reason, route, hop, value: Number(rawValue) });
   }
   return rows;
 }
@@ -448,9 +449,37 @@ describe("registerWorkerTierProxyRoutes", () => {
         // and `alertmanager` are caller-supplied and must never become label
         // values on an unauthenticated route.
         route: "/plugins/:pluginId/webhooks/:endpointKey",
+        // PEN-5140: this is the API-tier -> workers hop. The follower-worker
+        // -> lease-holder hop carries the same reason on the same route, and
+        // before this label the two were one series.
+        hop: "worker",
         value: 1,
       },
     ]);
+  });
+
+  it("separates the two proxy hops, and seeds only the hop that registered", async () => {
+    // PEN-5140. Both hops forward the SAME route table with the SAME deadline
+    // and both label a slow upstream `timeout`, so a timed-out webhook was
+    // indistinguishable between "the worker tier is slow" and "the lease
+    // holder is slow" — different faults, different owners. That ambiguity was
+    // the stated obstacle to diagnosing per-alert webhook cost.
+    __resetMetricsForTest();
+    buildAppWithProxyOptions("http://127.0.0.1:1", {});
+
+    const rows = await proxyFailureRows();
+    expect(rows.length).toBeGreaterThan(0);
+
+    // Positive: the worker hop is materialised at zero for every route/reason,
+    // so a quiet hop reads as 0 rather than as an absent series.
+    expect(rows.every((row) => row.value === 0)).toBe(true);
+    expect(new Set(rows.map((row) => row.hop))).toEqual(new Set(["worker"]));
+
+    // Negative control, and the reason the seed is per-hop rather than a cross
+    // product: this process registered only the worker hop, so advertising
+    // zeroed `hop="holder"` series would claim a measured-healthy reading for
+    // a hop that cannot fire here.
+    expect(rows.some((row) => row.hop === "holder")).toBe(false);
   });
 
   it("leaves the webhook route's timeout series at zero on a healthy delivery", async () => {
@@ -477,7 +506,12 @@ describe("registerWorkerTierProxyRoutes", () => {
           row.reason === "timeout"
           && row.route === "/plugins/:pluginId/webhooks/:endpointKey",
       ),
-    ).toEqual({ reason: "timeout", route: "/plugins/:pluginId/webhooks/:endpointKey", value: 0 });
+    ).toEqual({
+      reason: "timeout",
+      route: "/plugins/:pluginId/webhooks/:endpointKey",
+      hop: "worker",
+      value: 0,
+    });
     expect((await proxyFailureRows()).every((row) => row.value === 0)).toBe(true);
   });
 

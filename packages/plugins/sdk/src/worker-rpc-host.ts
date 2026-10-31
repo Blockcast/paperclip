@@ -1459,6 +1459,9 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
         async write(name: string, value: number, tags?: Record<string, string>): Promise<void> {
           await callHost("metrics.write", { name, value, tags });
         },
+        async observe(name: string, seconds: number): Promise<void> {
+          await callHost("metrics.observe", { name, seconds });
+        },
       },
 
       telemetry: {

@@ -1387,6 +1387,27 @@ export interface PluginMetricsClient {
    * @param tags - Optional key-value tags for filtering
    */
   write(name: string, value: number, tags?: Record<string, string>): Promise<void>;
+
+  /**
+   * Record a duration observation into a real Prometheus histogram
+   * (PEN-5140), so `histogram_quantile` can read quantiles off it.
+   *
+   * Use this, not {@link write}, whenever the question is "how long did this
+   * take" and the answer's SHAPE matters. `write` is a counter increment: a
+   * pair of counters yields a mean, and a mean cannot distinguish a uniformly
+   * slow population from a fast one with a heavy tail. That distinction is
+   * the whole content of a latency regression.
+   *
+   * Requires the `metrics.write` capability — the same one {@link write}
+   * needs, so no manifest change is required to start calling this.
+   *
+   * @param name - Metric name, same shape rules and same per-plugin name
+   *   budget as {@link write}. A name used here and on {@link write} spends
+   *   one budget slot, not two.
+   * @param seconds - Duration in SECONDS, not milliseconds. Divide first if
+   *   you measured with `performance.now()`.
+   */
+  observe(name: string, seconds: number): Promise<void>;
 }
 
 /**

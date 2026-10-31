@@ -40,7 +40,7 @@ import {
   resolveCreateIssueStatusDefault,
 } from "@paperclipai/shared";
 import { companyService } from "./companies.js";
-import { recordPluginMetric } from "./metrics.js";
+import { recordPluginMetric, recordPluginMetricObservation } from "./metrics.js";
 import { agentService } from "./agents.js";
 import { projectService } from "./projects.js";
 import { executionWorkspaceService } from "./execution-workspaces.js";
@@ -1678,6 +1678,35 @@ export function buildHostServices(
             console.error("[plugin-host-services] Triggered metric flush failed:", err);
           });
         }
+      },
+
+      async observe(params) {
+        const safeName = truncStr(String(params.name ?? ""), MAX_METRIC_NAME_LENGTH);
+        logger.debug(
+          { pluginId, name: safeName, seconds: params.seconds },
+          "Plugin metric observe",
+        );
+
+        // Prometheus only. Deliberately NOT mirrored into `plugin_logs`, unlike
+        // `write`: that table is a per-call row, and a histogram's value comes
+        // from observing EVERY call on a hot path — one row per alert per
+        // delivery would be the dominant writer in the table and would answer
+        // nothing that the histogram does not answer better. The buffer also
+        // bounds `write`'s cost only because `write` is called a handful of
+        // times per delivery; `observe` is called once per alert by design.
+        //
+        // Untruncated name for the same reason as `write`: the recorder applies
+        // its own length bound and counts an over-long name as an explicit
+        // `bad_name` drop, where a pre-truncated one would masquerade as a
+        // valid shorter name and occupy a real series.
+        recordPluginMetricObservation({
+          pluginId,
+          pluginKey,
+          name: String(params.name ?? ""),
+          seconds: typeof params.seconds === "number"
+            ? params.seconds
+            : Number(params.seconds),
+        });
       },
     },
 

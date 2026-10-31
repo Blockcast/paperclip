@@ -3,6 +3,8 @@ import {
   PLUGIN_METRIC_CARDINALITY_BUDGET,
   PLUGIN_METRIC_CARDINALITY_BUDGET_OVERRIDES,
   PLUGIN_METRIC_DROPPED_METRIC,
+  PLUGIN_METRIC_DURATION_BUCKETS_SECONDS,
+  PLUGIN_METRIC_DURATION_METRIC,
   PLUGIN_METRIC_LABEL_VALUE_MAX_LENGTH,
   PLUGIN_METRIC_NAME_BUDGET,
   PLUGIN_METRIC_OVERFLOW_NAME,
@@ -11,6 +13,7 @@ import {
   PLUGIN_METRIC_TOTAL_METRIC,
   __resetMetricsForTest,
   recordPluginMetric,
+  recordPluginMetricObservation,
   renderMetrics,
 } from "../services/metrics.js";
 import alertmanagerManifest from "../../../packages/plugins/paperclip-plugin-alertmanager/src/manifest.js";
@@ -39,6 +42,18 @@ async function lines(): Promise<string[]> {
 async function seriesFor(metricName: string): Promise<string[]> {
   return (await lines()).filter(
     (line) => line.startsWith(`${metricName}{`) || line === metricName,
+  );
+}
+
+/**
+ * Sample lines for a HISTOGRAM family. Distinct from {@link seriesFor}, which
+ * matches `name{` exactly: a histogram publishes under `_bucket` / `_sum` /
+ * `_count` suffixes and never under the bare name, so the exact matcher
+ * returns nothing for one and would read as "not published".
+ */
+async function histogramSeriesFor(metricName: string): Promise<string[]> {
+  return (await lines()).filter(
+    (line) => line.startsWith(`${metricName}_`) && !line.startsWith("#"),
   );
 }
 
@@ -782,5 +797,118 @@ describe("BLO-32163 — fence-blocked labels survive the two-sided promotion gat
     const dropped = await seriesFor(PLUGIN_METRIC_DROPPED_METRIC);
     expect(dropped.some((line) => line.includes(`metric="${FENCE_METRIC}"`))).toBe(false);
     expect(PLUGIN_METRIC_CARDINALITY_BUDGET_OVERRIDES.get(FENCE_METRIC)).toBeGreaterThan(N);
+  });
+});
+
+/**
+ * PEN-5140 — per-alert webhook cost must be readable as a DISTRIBUTION.
+ *
+ * The counter channel above can only ever yield a mean
+ * (`increase(_sum) / increase(_count)`), and a mean is exactly what hid the
+ * fault this metric was added for: the alertmanager plugin's population mean
+ * per-alert cost sat inside its stated baseline band while a heavy tail was
+ * spending the 90s delivery budget. Quantiles need bucket boundaries, which
+ * `ctx.metrics.write` cannot express — `le` is not a promotable tag key, and
+ * promoting it would publish as `tag_le`, which `histogram_quantile` does not
+ * read.
+ *
+ * Asserted against rendered exposition text for the same reason as PEN-2799
+ * above: the failure being guarded against is a write that "succeeds" while
+ * producing no usable series.
+ */
+describe("recordPluginMetricObservation — duration histogram", () => {
+  it("publishes a real histogram with le buckets, _sum and _count", async () => {
+    recordPluginMetricObservation({
+      ...PLUGIN,
+      name: "alertmanager.webhook.alert_duration",
+      seconds: 8,
+    });
+
+    const series = await histogramSeriesFor(PLUGIN_METRIC_DURATION_METRIC);
+    // A bare `le` label, not `tag_le`: this is what makes the series directly
+    // readable by histogram_quantile() with no label_replace() in the rule.
+    const buckets = series.filter((line) => line.includes("_bucket{"));
+    expect(buckets).toHaveLength(PLUGIN_METRIC_DURATION_BUCKETS_SECONDS.length + 1);
+    expect(buckets.every((line) => /\ble="/.test(line))).toBe(true);
+    expect(buckets.some((line) => line.includes('tag_le="'))).toBe(false);
+
+    expect(series.some((line) => line.includes(`${PLUGIN_METRIC_DURATION_METRIC}_sum{`))).toBe(true);
+    expect(series.some((line) => line.includes(`${PLUGIN_METRIC_DURATION_METRIC}_count{`))).toBe(true);
+    expect(series.every((line) => line.includes('metric="alertmanager.webhook.alert_duration"'))).toBe(true);
+
+    // An 8s observation lands above the 5s bound and at-or-below the 8s one.
+    // Those two bounds exist precisely so the PEN-4100 claim ("~8.0s median
+    // against a 1.65-1.88s baseline") is a bucket comparison rather than an
+    // interpolation artifact.
+    const atFive = series.find((line) => line.includes('le="5"'));
+    const atEight = series.find((line) => line.includes('le="8"'));
+    expect(atFive?.trim().endsWith(" 0")).toBe(true);
+    expect(atEight?.trim().endsWith(" 1")).toBe(true);
+  });
+
+  it("carries no promoted tag labels, so buckets cannot multiply a tag axis", async () => {
+    recordPluginMetricObservation({
+      ...PLUGIN,
+      name: "alertmanager.webhook.alert_duration",
+      seconds: 0.2,
+    });
+    const series = await histogramSeriesFor(PLUGIN_METRIC_DURATION_METRIC);
+    expect(series.length).toBeGreaterThan(0);
+    for (const key of PLUGIN_METRIC_PROMOTABLE_TAG_KEYS) {
+      expect(series.some((line) => line.includes(`${PLUGIN_METRIC_TAG_LABEL_PREFIX}${key}="`))).toBe(false);
+    }
+  });
+
+  it("NEGATIVE CONTROL — publishes nothing for a negative or non-finite duration", async () => {
+    // The control the filing asks for. Without it, a histogram that observed
+    // unconditionally would pass the positive test above and still be unable
+    // to distinguish a real measurement from a mis-shaped one. Rejected rather
+    // than clamped: a clamped observation corrupts `_sum` and every quantile
+    // derived from it.
+    for (const seconds of [-1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      recordPluginMetricObservation({
+        ...PLUGIN,
+        name: "alertmanager.webhook.alert_duration",
+        seconds,
+      });
+    }
+
+    expect(await histogramSeriesFor(PLUGIN_METRIC_DURATION_METRIC)).toHaveLength(0);
+
+    // And the rejection is COUNTED, on the same drop metric the counter uses,
+    // so "why is my series missing" stays a one-metric question.
+    const dropped = (await seriesFor(PLUGIN_METRIC_DROPPED_METRIC))
+      .filter((line) => line.includes('reason="bad_value"'));
+    expect(dropped).toHaveLength(1);
+    expect(dropped[0]?.trim().endsWith(" 3")).toBe(true);
+  });
+
+  it("NEGATIVE CONTROL — publishes nothing for a mis-shaped metric name", async () => {
+    recordPluginMetricObservation({ ...PLUGIN, name: "Not A Metric Name", seconds: 1 });
+    expect(await histogramSeriesFor(PLUGIN_METRIC_DURATION_METRIC)).toHaveLength(0);
+    expect(
+      (await seriesFor(PLUGIN_METRIC_DROPPED_METRIC))
+        .some((line) => line.includes('reason="bad_name"')),
+    ).toBe(true);
+  });
+
+  it("shares the metric-NAME budget with the counter rather than opening a second one", async () => {
+    // A name minted through `observe` costs MORE series pressure than one
+    // minted through `write` (|buckets| + 2 against 1), so giving `observe` its
+    // own ledger would silently double the bound the budget exists to enforce.
+    for (let i = 0; i < PLUGIN_METRIC_NAME_BUDGET; i += 1) {
+      recordPluginMetric({ ...PLUGIN, name: `alertmanager.counter.n${i}`, value: 1 });
+    }
+    recordPluginMetricObservation({ ...PLUGIN, name: "alertmanager.observe.overflow", seconds: 1 });
+
+    // Budget already spent by the counter names, so the observation is refused.
+    // No `_overflow` fallback either: a histogram `_sum` is only meaningful
+    // over a homogeneous population, so folding unrelated durations together
+    // would publish a quantile describing nothing.
+    expect(await histogramSeriesFor(PLUGIN_METRIC_DURATION_METRIC)).toHaveLength(0);
+    expect(
+      (await seriesFor(PLUGIN_METRIC_DROPPED_METRIC))
+        .some((line) => line.includes('reason="name_budget"')),
+    ).toBe(true);
   });
 });

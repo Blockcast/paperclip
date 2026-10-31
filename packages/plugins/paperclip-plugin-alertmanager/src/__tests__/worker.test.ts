@@ -198,7 +198,7 @@ interface MockClients {
     query: ReturnType<typeof vi.fn>;
   };
   events: { emit: ReturnType<typeof vi.fn> };
-  metrics: { write: ReturnType<typeof vi.fn> };
+  metrics: { write: ReturnType<typeof vi.fn>; observe: ReturnType<typeof vi.fn> };
   activity: { log: ReturnType<typeof vi.fn> };
   actions: { register: ReturnType<typeof vi.fn> };
   secrets: { resolve: ReturnType<typeof vi.fn>; verify: ReturnType<typeof vi.fn> };
@@ -263,7 +263,7 @@ const mkCtx = (): { ctx: PluginContext; mocks: MockClients } => {
       }),
     },
     events: { emit: vi.fn(async () => {}) },
-    metrics: { write: vi.fn(async () => {}) },
+    metrics: { write: vi.fn(async () => {}), observe: vi.fn(async () => {}) },
     activity: { log: vi.fn(async () => {}) },
     actions: { register: vi.fn() },
     secrets: {
@@ -640,6 +640,95 @@ describe("handleWebhook — delivery timing (BLO-37485)", () => {
       "alertmanager.webhook.deadline_exceeded",
       1,
     );
+  });
+
+  // -------------------------------------------------------------------------
+  // PEN-5140 — per-alert cost as a distribution
+  // -------------------------------------------------------------------------
+  //
+  // Before this instrument the ONLY per-alert duration the handler emitted was
+  // the `took Xms` field of the `slow delivery` WARN line, which fires only
+  // once a delivery has already crossed SLOW_DELIVERY_WARN_MS (60s). Every
+  // per-alert number available to an operator was therefore CONDITIONED on the
+  // delivery being slow, so a median taken over them is a median among slow
+  // deliveries — not a per-alert median, and not comparable to a population
+  // baseline. These tests pin the property that closes that gap: an
+  // observation per alert, unconditionally.
+
+  it("observes per-alert cost for EVERY alert, not only slow ones", async () => {
+    const { ctx, mocks } = mkCtx();
+    const clock = stubClock(1_000_000);
+    mocks.issues.create.mockImplementation(async () => {
+      clock.advance(250);
+      return { id: "issue-1" };
+    });
+
+    try {
+      await handleWebhook(ctx, baseConfig(), true, baseInput({
+        parsedBody: baseEnvelope({
+          alerts: [
+            baseAlert({ fingerprint: "fp-1" }),
+            baseAlert({ fingerprint: "fp-2" }),
+          ],
+        }),
+      }));
+    } finally {
+      clock.restore();
+    }
+
+    const observations = mocks.metrics.observe.mock.calls
+      .filter((call) => call[0] === "alertmanager.webhook.alert_duration");
+    // Two alerts, two observations. The second is the load-bearing one: it is
+    // emitted after the loop ends, not at the top of a next iteration that
+    // never runs. Batches of size 1 are common, so dropping the final alert
+    // would leave the commonest case entirely unobserved while still counting
+    // in `alerts_received`.
+    expect(observations).toHaveLength(2);
+    // SECONDS, not milliseconds — the host metric carries the unit.
+    expect(observations.every(([, seconds]) => seconds === 0.25)).toBe(true);
+
+    // The delivery never came near the 60s slow mark, so the pre-existing
+    // log-line observable saw nothing. That contrast IS the regression this
+    // metric fixes.
+    expect(
+      mocks.logger.warn.mock.calls.some(([line]: [string]) =>
+        String(line).includes("slow delivery")),
+    ).toBe(false);
+  });
+
+  it("NEGATIVE CONTROL — observes nothing when the batch carries no alerts", async () => {
+    // Without this, an instrument that fired unconditionally per DELIVERY
+    // would pass the test above and silently inflate `_count` against
+    // `alerts_received`, which is the denominator the histogram has to stay
+    // comparable with.
+    const { ctx, mocks } = mkCtx();
+    await handleWebhook(ctx, baseConfig(), true, baseInput({
+      parsedBody: baseEnvelope({ alerts: [] }),
+    }));
+
+    expect(
+      mocks.metrics.observe.mock.calls
+        .filter((call) => call[0] === "alertmanager.webhook.alert_duration"),
+    ).toHaveLength(0);
+    // Control on the control: the delivery itself still reported, so the
+    // absence above is the alert loop not running, not the whole metrics path
+    // being dead.
+    expect(mocks.metrics.write).toHaveBeenCalledWith(
+      "alertmanager.webhook.alerts_received",
+      0,
+    );
+  });
+
+  it("does not let a failing observation fail the delivery carrying it", async () => {
+    // The instrument sits on the hot path of alert processing. A telemetry
+    // outage must not convert into a dropped alert batch — which is the exact
+    // failure class this metric exists to make visible.
+    const { ctx, mocks } = mkCtx();
+    mocks.metrics.observe.mockRejectedValue(new Error("metrics backend down"));
+
+    await expect(
+      handleWebhook(ctx, baseConfig(), true, baseInput()),
+    ).resolves.toBeDefined();
   });
 
   it("counts a delivery that outran the 120s proxy deadline", async () => {
