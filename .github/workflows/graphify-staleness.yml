@@ -17,6 +17,14 @@ name: graphify staleness gate
 # re-run reports the drift that would actually land.
 #
 # Drop this same file into any repo that commits graphify-out/ to get the gate.
+#
+# PEN-5042: clearing a STALE verdict is NOT a git operation. `built_at_commit` is
+# a field inside graph.json, so a rebase does not move it and the graph stays
+# stale; merging the base in moves HEAD off the base line, so a rebuild in place
+# then fails the ancestry check instead. The only remedy is to regenerate the
+# branch on the base tip -- docs/runbooks/graphify-reindex-staleness-recovery.md,
+# which also records why re-scoping, merge-base comparison and a faster CronJob
+# were each measured and rejected.
 
 on:
   pull_request:
@@ -63,14 +71,51 @@ jobs:
               echo "::error file=$g::built_at_commit ${bac} is not a known commit"; rc=1; continue
             fi
             if ! git merge-base --is-ancestor "$bac" "$BASE_SHA"; then
-              echo "::error file=$g::built_at_commit ${bac:0:12} is not an ancestor of base ${BASE_SHA:0:12} (graph built off an unknown line)"; rc=1; continue
+              echo "::error file=$g::built_at_commit ${bac:0:12} is not an ancestor of base ${BASE_SHA:0:12} — the graph was built on this branch, not on ${BASE_REF}. Regenerate it (see the recovery block below); do not rebuild in place."; rc=1; continue
             fi
             # Stale if base has source changes (outside graphify-out) since the graph was built.
             if ! git diff --quiet "$bac" "$BASE_SHA" -- "$scope" ":(exclude)**/graphify-out/**" ":(exclude)graphify-out/**"; then
-              echo "::error file=$g::STALE graph — base changed '${scope}' since built_at_commit ${bac:0:12}. Rebuild: graphify update ${scope} --force"
+              echo "::error file=$g::STALE graph — base changed '${scope}' since built_at_commit ${bac:0:12}. Regenerate the branch from the ${BASE_REF} tip (see the recovery block below)."
               rc=1
             else
               echo "OK: $g is fresh (built_at ${bac:0:12})"
             fi
           done <<< "$changed"
+          if [ "$rc" -ne 0 ]; then
+            cat <<EOF
+
+          How to clear this gate
+          ----------------------
+          \`graphify\` stamps \`built_at_commit\` with HEAD at build time, so WHERE you
+          build decides the verdict. A graphify PR has to be a single graph commit
+          sitting directly on a ${BASE_REF} commit.
+
+            git fetch origin ${BASE_REF}
+            git worktree add --detach /tmp/graphify origin/${BASE_REF}
+            cd /tmp/graphify
+            graphify update <scope> --force
+            git checkout --no-track -B graphify-regen origin/${BASE_REF}
+            git commit -am "chore: refresh knowledge graphs @ \$(git rev-parse --short origin/${BASE_REF})"
+            git ls-remote origin refs/heads/<pr-branch>   # the sha you are replacing: <expected>
+            git push --force-with-lease=refs/heads/<pr-branch>:<expected> origin graphify-regen:<pr-branch>
+
+          A neutral local name and an explicit refspec are both load-bearing.
+          \`-B <pr-branch> origin/${BASE_REF}\` sets the new branch's upstream to
+          origin/${BASE_REF}, so a bare \`git push\` then refuses and tells you to run
+          \`git push origin HEAD:${BASE_REF}\` -- which would put the graph commit on
+          ${BASE_REF}; and the name collides with the primary checkout if the PR
+          branch is checked out there. A bare \`--force-with-lease\` takes its
+          expectation from the tracking ref, so it protects nothing; name the sha.
+          \`ls-remote\` rather than \`rev-parse origin/<pr-branch>\` because only
+          ${BASE_REF} was fetched above: the tracking ref is stale or, in a fresh
+          clone, absent. A stale sha fails the lease closed, but confusingly.
+
+          Do NOT merge or rebase ${BASE_REF} into the branch instead. Neither moves
+          \`built_at_commit\` — it is a field inside graph.json, not a git relationship —
+          so a rebase leaves the graph just as STALE, and a merge additionally makes
+          HEAD a commit that is not on ${BASE_REF}, which fails the ancestry check above.
+
+          docs/runbooks/graphify-reindex-staleness-recovery.md
+          EOF
+          fi
           exit $rc
