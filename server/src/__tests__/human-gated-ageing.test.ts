@@ -1397,6 +1397,31 @@ describe("payoff-ordered escalation cut (PEN-5114)", () => {
       "No past-threshold row is the sole remaining gate for any open row on this queue",
     );
   });
+
+  it("keeps PEN-4489's truncation wording when payoff scored nothing above zero", () => {
+    // With every row at zero the sort collapses to priority-then-age, so that
+    // notice's guarantee is still exactly true. Naming a term that separated
+    // nothing — and dropping a true guarantee to do it — would be a worse
+    // notice, not a more accurate one.
+    const rows = [
+      issue({ id: "a", priority: "critical", lastHumanTouchAt: daysAgo(120) }),
+      issue({ id: "b", priority: "low", lastHumanTouchAt: daysAgo(140) }),
+    ];
+    const rendered = formatHumanGatedAgeingSections(
+      selectAgedHumanGatedIssues(rows, {
+        now: NOW,
+        escalateAfterDaysByPriority: flat(14),
+        maxEscalated: 1,
+        payoffByIssueId: new Map([
+          ["a", 0],
+          ["b", 0],
+        ]),
+      }),
+    );
+
+    expect(rendered).toContain("The cut is by priority first, then age");
+    expect(rendered).toContain("equal or lower priority");
+  });
 });
 
 describe("truncation notice under payoff ordering (PEN-5114)", () => {

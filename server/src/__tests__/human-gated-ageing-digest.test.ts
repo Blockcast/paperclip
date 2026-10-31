@@ -18,6 +18,7 @@ import {
   companyMemberships,
   createDb,
   issueComments,
+  issueRelations,
   issues,
 } from "@paperclipai/db";
 import {
@@ -489,6 +490,83 @@ describeEmbeddedPostgres("humanGatedDigestTick (wired)", () => {
     // was withheld would fail here rather than read as a pass.
     expect(body).toContain("5 rows are withheld by the cap and not listed below");
     expect(body).toContain("The cut is by priority first, then age");
+  });
+
+  // -- PEN-5114: the payoff selector, wired ----------------------------------
+
+  it("orders the delivered digest by what each row gates, not by how long it waited", async () => {
+    // The whole point of testing this here rather than against the pure
+    // selector: the pure tests are handed a payoff map, so they cannot tell
+    // whether anything builds one. This asserts the wired path — graph query,
+    // edge transposition, phantom handling, ordering — through the delivered
+    // body.
+    const { companyId } = await createCompany();
+
+    // Strictly older, same tier, gates nothing. Wins the slot under age order.
+    await insertHumanGatedIssue({
+      companyId,
+      identifier: "HGD-PAYOFF-OLD",
+      createdAt: daysAgo(140),
+    });
+    // Younger, and the sole remaining gate for three open rows.
+    const gate = await insertHumanGatedIssue({
+      companyId,
+      identifier: "HGD-PAYOFF-GATE",
+      createdAt: daysAgo(80),
+    });
+    // A closed row that still carries a blocker edge. It must read as resolved:
+    // scored as an open root it would give `dependant-0` two roots, dropping
+    // the gate's payoff to 2 — so this edge is load-bearing for the assertion
+    // below, not decoration.
+    const resolvedBlocker = await insertHumanGatedIssue({
+      companyId,
+      identifier: "HGD-PAYOFF-DONE",
+      status: "done",
+      createdAt: daysAgo(200),
+    });
+
+    for (let index = 0; index < 3; index += 1) {
+      // Agent-owned, so never candidates for the digest themselves — which is
+      // the population payoff is supposed to count and a human-gated-only graph
+      // query would miss entirely.
+      const dependant = await insertHumanGatedIssue({
+        companyId,
+        identifier: `HGD-PAYOFF-DEP${index}`,
+        status: "todo",
+        assigneeUserId: null,
+        createdAt: daysAgo(10),
+      });
+      await db.insert(issueRelations).values({
+        companyId,
+        // `issueId` is the blocker, `relatedIssueId` the blocked row.
+        issueId: gate,
+        relatedIssueId: dependant,
+        type: "blocks",
+      });
+      if (index === 0) {
+        await db.insert(issueRelations).values({
+          companyId,
+          issueId: resolvedBlocker,
+          relatedIssueId: dependant,
+          type: "blocks",
+        });
+      }
+    }
+
+    await humanGatedDigestTick(db, { now: NOW, companyId });
+    const body = (await digestRow(companyId))[0]?.description ?? "";
+
+    const gatePosition = body.indexOf("HGD-PAYOFF-GATE");
+    const oldPosition = body.indexOf("HGD-PAYOFF-OLD");
+    expect(gatePosition).toBeGreaterThan(-1);
+    expect(oldPosition).toBeGreaterThan(-1);
+    // Age alone lists the 140d row first. Payoff inverts it.
+    expect(gatePosition).toBeLessThan(oldPosition);
+    expect(body).toContain(
+      "1 of 2 past-threshold rows gate open work; the thresholds above only decide eligibility",
+    );
+    // Neither row is dropped: payoff ranks, it does not filter.
+    expect(body).toContain("HGD-PAYOFF-OLD");
   });
 
   // -- A failing producer must not read as an all-clear -----------------------

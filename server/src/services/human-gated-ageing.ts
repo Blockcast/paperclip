@@ -1402,7 +1402,15 @@ export function formatHumanGatedAgeingSections(report: HumanGatedAgeingReport): 
       `Showing ${report.escalated.length} of ${report.totalOverThreshold} past threshold; ${report.escalatedOmitted} ${report.escalatedOmitted === 1 ? "row is" : "rows are"} withheld by the cap and not listed below${formatPriorityBreakdown(report.omittedCountsByPriority)}.`,
     );
     const cutRow = report.escalated[report.escalated.length - 1];
-    if (!report.payoffApplied) {
+    // Describe the rule that actually decided *this* cut, not the rule that was
+    // configured. With a payoff map supplied but nothing scoring above zero the
+    // sort collapses to PEN-4489's priority-then-age — so its guarantee ("every
+    // withheld row is of equal or lower priority") is still exactly true, and
+    // dropping it would discard a true, useful statement in favour of naming a
+    // term that separated nothing. The preamble has already said payoff found
+    // no purchase on this queue.
+    const payoffDecidedTheCut = report.payoffApplied && report.payoffPositiveOverThreshold > 0;
+    if (!payoffDecidedTheCut) {
       body.push(
         cutRow
           ? `The cut is by priority first, then age: slots go to \`critical\` before \`high\` before \`medium\` before \`low\`, and to the longest-quiet row within each tier. Every withheld row is therefore of equal or lower priority than every row listed below, the last of which is ${sanitizeRenderedField(cutRow.priority, "unset")} at ${formatAge(cutRow.humanSilenceDays)}.`
