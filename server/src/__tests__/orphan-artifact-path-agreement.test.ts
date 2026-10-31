@@ -68,10 +68,22 @@ function readAdapterSource(file: string): string {
  * itself and pass for any value. `values.yaml` states the binding in as many
  * words — *"Paperclip's `PAPERCLIP_HOME` defaults to `/paperclip`; keep these
  * aligned"* — so it is the right third party to hold both sides to.
+ *
+ * Scoped to the `persistence:` block rather than matched file-wide: `mountPath`
+ * is a two-space key under `runtimeCache` and `runtimeConfig` too, so a
+ * file-wide match reads the right value today only because `persistence`
+ * happens to come first. Reorder the file and it would either fail with a
+ * misleading mismatch or -- worse -- silently bind to a different volume's
+ * mount.
  */
 function deploymentMountPath(): string {
   const values = readFileSync(path.join(repoRoot, "deploy/helm/paperclip/values.yaml"), "utf-8");
-  const mount = /^\s{2}mountPath:\s*(\S+)\s*$/m.exec(values);
+
+  // From `persistence:` to the next top-level key, so sibling blocks are out of range.
+  const block = /^persistence:[^\n]*\n([\s\S]*?)^(?=\S)/m.exec(values);
+  expect(block, "values.yaml no longer has a top-level `persistence:` block").not.toBeNull();
+
+  const mount = /^\s{2}mountPath:\s*(\S+)\s*$/m.exec(block![1]!);
   expect(mount, "persistence.mountPath is no longer a scalar in values.yaml").not.toBeNull();
   return mount![1]!;
 }
@@ -99,8 +111,12 @@ describe("orphan artifact path agreement (adapter ↔ server)", () => {
     home: process.env.PAPERCLIP_HOME,
     instance: process.env.PAPERCLIP_INSTANCE_ID,
   };
+  const tmpDirs: string[] = [];
 
-  afterEach(() => {
+  afterEach(async () => {
+    while (tmpDirs.length > 0) {
+      await fs.rm(tmpDirs.pop()!, { recursive: true, force: true });
+    }
     for (const [key, value] of [
       ["RUN_LOG_BASE_PATH", saved.base],
       ["PAPERCLIP_HOME", saved.home],
@@ -130,13 +146,16 @@ describe("orphan artifact path agreement (adapter ↔ server)", () => {
     expect(runLogBasePath()).toBe(adapterServerViewBase());
   });
 
-  it("finds a collector-persisted artifact written at the adapter's layout", async () => {
-    // Same derivation as above, re-rooted into a temp dir so the round trip is
-    // real I/O rather than a string comparison: if the `<co>/<agent>/<run>` tail
-    // or the `.pod.ndjson` suffix diverged, this fails where the first test
-    // (which only covers the base) would still pass.
+  /**
+   * Write an artifact exactly where `buildPodLogPath` would put it under a temp
+   * root, and hand the reader the matching base. Real I/O rather than a string
+   * comparison: if the `<co>/<agent>/<run>` tail or the filename suffix
+   * diverged, this fails where the base-only assertion above would still pass.
+   */
+  async function seedAtAdapterLayout(isolationKey?: string) {
     const adapterBase = adapterServerViewBase();
     const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "pen5124-path-agreement-"));
+    tmpDirs.push(tmp);
     const base = path.join(tmp, adapterBase);
 
     delete process.env.PAPERCLIP_HOME;
@@ -152,7 +171,17 @@ describe("orphan artifact path agreement (adapter ↔ server)", () => {
     const suffix = /return `\$\{dir\}\/\$\{runId\}([^`]+)`/.exec(readAdapterSource("job-manifest.ts"));
     expect(suffix, "buildPodLogPath's filename template has changed shape").not.toBeNull();
 
-    const dir = path.join(base, input.companyId, input.agentId);
+    // The nesting segment comes from the WRITER's own `isolationKey ? ... : base`
+    // branch too. Hardcoding `"isolated"` here would be a third copy of a name
+    // that already exists in both `buildPodLogPath` and `locatePodLogArtifact`,
+    // and a third copy cannot witness the two agreeing.
+    const nest = /const dir = isolationKey \? `\$\{base\}\/([^/]+)\/\$\{isolationKey\}`/
+      .exec(readAdapterSource("job-manifest.ts"));
+    expect(nest, "buildPodLogPath's isolated-layout branch has changed shape").not.toBeNull();
+
+    const dir = isolationKey
+      ? path.join(base, input.companyId, input.agentId, nest![1]!, isolationKey)
+      : path.join(base, input.companyId, input.agentId);
     await fs.mkdir(dir, { recursive: true });
     await fs.writeFile(
       path.join(dir, `${input.runId}${suffix![1]!}`),
@@ -162,8 +191,22 @@ describe("orphan artifact path agreement (adapter ↔ server)", () => {
         + `${JSON.stringify({ type: "result", subtype: "success", is_error: false })}\n`,
       "utf-8",
     );
+    return input;
+  }
 
-    expect(await readOrphanedRunTerminalResult(input)).toMatchObject({
+  it("finds a collector-persisted artifact written at the adapter's layout", async () => {
+    expect(await readOrphanedRunTerminalResult(await seedAtAdapterLayout())).toMatchObject({
+      outcome: "found",
+      succeeded: true,
+      subtype: "success",
+    });
+  });
+
+  // `buildPodLogPath` nests an isolated run under `isolated/<key>/`, and
+  // `locatePodLogArtifact` has a separate scan for that layout. The two agree
+  // on the flat case without agreeing here, so it needs its own assertion.
+  it("finds one written at the adapter's isolated layout", async () => {
+    expect(await readOrphanedRunTerminalResult(await seedAtAdapterLayout("issue-4242"))).toMatchObject({
       outcome: "found",
       succeeded: true,
       subtype: "success",
