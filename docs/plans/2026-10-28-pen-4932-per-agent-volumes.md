@@ -542,29 +542,129 @@ PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verificati
        has `sinceSeconds` but **no `sinceTime`**, so a resume through it could
        only ever be approximate.
 
-     **A SECOND pod→server read-direction consumer, found 2026-10-31 and not
-     fixed by the collector.** `server/src/services/orphaned-run-terminal-result.ts`
-     reads the pod-written `<run>.pod.ndjson` out of the server's `run-logs`
-     tree to recover a vanished Job's own terminal verdict — the PEN-2421 fix
-     that stops the reconciler recording successful runs as `job_missing`. On a
-     per-agent claim that artifact is on the agent's volume and the reconciler
-     reads `no_artifact`. A server-persisted copy of the stream cannot replace
-     it either: the orphan case is exactly the one where the process that would
-     have written that copy died. So for an opted-in agent this recovery is
-     structurally unavailable and the pre-PEN-2421 behaviour returns. Bounded —
-     it only fires when the adapter owner dies mid-run — but it is a real
-     regression to decide on, not a detail, and it is the third thing the
-     subPath inventory could not surface.
+     **A SECOND pod→server read-direction consumer, found 2026-10-31. DECIDED
+     2026-10-31 (PEN-5124): the residual is ACCEPTED and bounded; the premise it
+     was filed on is corrected below.**
+     `server/src/services/orphaned-run-terminal-result.ts` reads the pod-written
+     `<run>.pod.ndjson` out of the server's `run-logs` tree to recover a vanished
+     Job's own terminal verdict — the PEN-2421 fix that stops the reconciler
+     recording successful runs as `job_missing`.
 
-     Noted but NOT invariant 5: the isolation-workspace reaper
+     **Correction of record: it is not `no_artifact`, and PEN-2421 is not
+     wholesale reverted.** PEN-5124 did consider the collector and argued it
+     could not help, on the ground that *the orphan path fires exactly when the
+     process that would have written the copy is the thing that died*. That
+     sentence is true, and the conclusion drawn from it — that the recovery is
+     *structurally unavailable* and the reader reads `no_artifact` — is wider
+     than it supports. It conflates "the copy stops growing" with "the copy does
+     not exist".
+
+     ⚠️ **Sequencing, because this correction is only true once the COLLECTOR
+     half lands.** On `master` as this was written the emit half (#3173) has
+     merged and the collector (#3174) has not, and until it does PEN-5124's
+     reading is the correct one: nothing writes a server-side copy, so the
+     reader genuinely returns `no_artifact` on a foreign claim and the
+     regression is the full one. That is not a live defect either way — the gate
+     is default-off — but do not read the paragraphs below as describing
+     `master` before #3174 is in it.
+
+     The collector persists every accepted line to the
+     server's OWN `podLogPath`, and that path is rooted at
+     `SELF_POD_DATA_MOUNT_PATH` — this process's own claim — so for an opted-in
+     agent the artifact IS created, at exactly the layout `locatePodLogArtifact`
+     scans. Verified by construction, not inferred: `buildPodLogPath(…, root =
+     SELF_POD_DATA_MOUNT_PATH)` yields
+     `/paperclip/instances/default/data/run-logs/<co>/<agent>/<run>.pod.ndjson`,
+     and `runLogBasePath()` yields `/paperclip/instances/default/data/run-logs`.
+     That agreement is now pinned by
+     `server/src/__tests__/orphan-artifact-path-agreement.test.ts`, because it is
+     the single fact this whole decision rests on and nothing was asserting it —
+     either root could have been changed without a failing test.
+
+     **What the residual actually is.** The server's copy is *owner-written*,
+     where the shared-claim file is *pod-written*. On the shared claim the pod
+     keeps appending after the adapter owner dies, so the terminal `result`
+     lands regardless. On a per-agent claim the copy stops at owner death. So
+     the rescue fails in exactly one case: **the agent emits its terminal
+     `result` after the last owner stopped collecting.** The reader then reports
+     `no_result_event` (or `no_artifact`, if the owner died before the first
+     accepted line — the append handle is opened lazily), and the run stays
+     `job_missing`. Both reasons are recorded in the run event's payload, so the
+     residual is attributable after the fact rather than silent.
+
+     **Why that is narrow: BLO-27155 re-adoption covers the dominant cause.**
+     Owner death is overwhelmingly a worker/server restart, and a restart does
+     not leave the run to the orphan path — in-flight runs are re-executed from
+     their persisted reservation, `jobAdoptionVerdict` adopts the run's own
+     still-live Job on the 409, and execution falls through to the normal
+     collection path. On a foreign claim that re-opens the container log from
+     the beginning (no `sinceTime`) and re-persists the transcript in append
+     mode. So the residual is the narrower conjunction: the owner died, the run
+     was **not** re-executed, **and** the terminal result landed after
+     collection stopped. (One cosmetic consequence of the replay: the re-adopted
+     run appends lines the dead owner already wrote, so the file can carry a
+     duplicated prefix. The reader scans backwards for the LAST `result` event,
+     so this costs disk, not correctness.)
+
+     **The alternatives, and why each is refused.**
+
+     - *Keep `run-logs` as a `subPath` of the server's claim beside the
+       per-agent one.* Refused for the same reason §2 refuses the tooling row
+       and PEN-5120 refuses it explicitly: one bind on the shared CephFS handle,
+       the ceph-csi lock keys on the handle, so it pays the whole cost of the
+       swap and buys zero blast-radius reduction.
+     - *Recover at sweep time from the Job or pod.* **Impossible by
+       construction, and the original framing of this candidate was backwards.**
+       The orphan path runs only when `!input.jobStatus` — the Job is already
+       gone — and Job GC cascades to its pods, so the container log died with
+       the pod. `ttlSecondsAfterFinished` does not make the Job outlive the pod;
+       it is what deletes both.
+     - *Query a cluster log aggregator.* Not available. Measured 2026-10-31: the
+       `logging` namespace runs only `fluent-bit-audit`, a DaemonSet on the three
+       control-plane nodes with no Service — Kubernetes API audit, not worker
+       pod logs. There is nothing to query.
+     - *Have the pod report its terminal verdict to the server directly.* This
+       is the one remedy that is genuinely owner-independent, and it is
+       deliberately NOT taken here. It converts the trusted signal from *an
+       artifact the agent wrote* into *an HTTP claim the pod makes*, which is a
+       new trust surface and needs its own BLO-18106-grade reasoning — the
+       reader's own docstring is explicit that what it trusts is the agent
+       process's structured self-report, not a proxy for progress. This is the
+       recorded escalation if the residual is ever measured to bite; it is not
+       something to bolt onto a volume change.
+
+     **Accepted consequence, stated so it is not a surprise later.** For an
+     opted-in agent, a run whose adapter owner dies, which is not re-executed,
+     and whose terminal result lands after collection stopped, is recorded
+     `job_missing` although it succeeded — run statistics count it as a failure
+     and the work is re-queued. That is strictly narrower than the pre-PEN-2421
+     behaviour and strictly narrower than this item was filed as, it is bounded
+     to agents someone has explicitly opted in, and it is attributable through
+     the run event's `reason`. It does not block enablement.
+
+     *Latent, pre-existing, and out of scope here:* the adapter hardcodes
+     `INSTANCE_ROOT_SUBPATH = "instances/default"` while `runLogBasePath()`
+     resolves `PAPERCLIP_INSTANCE_ID`. These agree only while the instance id is
+     `default`, which it is fleet-wide. The divergence affects the shared claim
+     identically, so it is not a per-agent-claim defect — but it is a second way
+     these two roots can silently drift, which is the other reason the agreement
+     test above exists.
+
+     Noted but NOT invariant 5, and **split out as PEN-5125** (2026-10-31, per
+     PEN-5124's done-when 3 — own owner, because it is capacity rather than
+     correctness and wants a different remedy): the isolation-workspace reaper
      (`server/src/services/isolation-workspace-reaper.ts`) walks
      `k8s-isolation/workspaces/*` through the SERVER's mount, so it goes blind
      to an opted-in agent's tree. That tree grew 0 → 406.7 GiB fleet-wide
      between July and 2026-09-02 with no reaper at all, so ≈10 GiB/agent/month
      against a 50 Gi claim already carrying ≈13.2 G of duplicated company trees
-     is roughly a quarter's runway, and `allowVolumeExpansion` is true. Real,
-     bounded, and not a correctness failure — unlike the log, which fails on run
-     one.
+     is roughly a quarter's runway. Real, bounded, and not a correctness failure
+     — unlike the log, which fails on run one. It does **not** gate done-when 1:
+     `allowVolumeExpansion` is true, so the failure mode is an operator resizing
+     a PVC rather than a run losing data. PEN-5125 carries the remedy options,
+     including the ⛔ on keeping `k8s-isolation` on the server's claim beside the
+     per-agent one, which is refused on exactly the ground PEN-5120 refuses it
+     for `run-logs`.
 
      ⚠️ **The gate does NOT make done-when 1 met.** The criterion is two agent pods on one node
      reporting distinct volume IDs, which needs invariant 5 closed, the server rolled onto this

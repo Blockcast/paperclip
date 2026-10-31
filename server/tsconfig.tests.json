@@ -36,6 +36,7 @@
     "src/__tests__/stranded-sweep-park-suppression.test.ts",
     "src/__tests__/issue-tree-hold-metrics.test.ts",
     "src/__tests__/metrics-help-cross-reference.test.ts",
+    "src/__tests__/orphan-artifact-path-agreement.test.ts",
     "src/__tests__/orphan-reap-adapter-invoke-probe-batching.test.ts",
     "src/__tests__/orphan-reap-per-run-sub-stage-audit.test.ts",
     "src/__tests__/metrics-model-profile-unapplied.test.ts",
