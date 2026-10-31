@@ -220,3 +220,31 @@ describe("container-log diagnostic vs. the marked transcript (PEN-5120)", () => 
     expect(extractContainerLogDiagnostic(raw)).toBe("one | two | three");
   });
 });
+
+describe("podLogStreamedToContainerStdout (PEN-5120 collector hand-off)", () => {
+  // The collector in `execute.ts` chooses its transport from this flag. It is
+  // returned by the builder rather than re-derived by the caller precisely so
+  // that a drift between "what the pod command does" and "what the server reads"
+  // is impossible — these two tests are that guarantee, not decoration.
+  it("is false on the server's own claim, where the file tail still applies", () => {
+    const built = buildJobManifest({ ctx: makeCtx(), selfPod });
+    expect(built.podLogStreamedToContainerStdout).toBe(false);
+  });
+
+  it("is true on a claim the server does not hold", () => {
+    const built = buildJobManifest({ ctx: makeCtx("agent-workspace-abc"), selfPod });
+    expect(built.podLogStreamedToContainerStdout).toBe(true);
+  });
+
+  it("agrees with the command it shipped, on both claims", () => {
+    // The drift guard stated as one assertion: the flag is true exactly when the
+    // command carries the marker. A change that marked the fleet's command but
+    // left the flag false would leave the server tailing a file nobody writes;
+    // the reverse would have it stream from a container log carrying no frames.
+    for (const claim of [undefined, "agent-workspace-abc"]) {
+      const built = buildJobManifest({ ctx: makeCtx(claim), selfPod });
+      const command = built.job.spec?.template?.spec?.containers?.[0]?.command?.[2] ?? "";
+      expect(built.podLogStreamedToContainerStdout).toBe(command.includes(POD_LOG_STREAM_MARKER));
+    }
+  });
+});

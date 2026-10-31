@@ -39,7 +39,11 @@ import {
   isClaudeSkillNotFoundStartupFailure,
   extractClaudeRetryNotBefore,
 } from "./parse.js";
-import { getSelfPodInfo, getBatchApi, getCoreApi, SELF_POD_DATA_MOUNT_PATH } from "./k8s-client.js";
+import { getSelfPodInfo, getBatchApi, getCoreApi, getLogApi, SELF_POD_DATA_MOUNT_PATH } from "./k8s-client.js";
+// PEN-5120: the collector half. Reads the marked transcript back off the
+// container log when `podLogPath` addresses a volume this process cannot open.
+import { collectPodLogStream } from "./pod-log-stream.js";
+import { Writable } from "node:stream";
 
 /**
  * PEN-4932 stage 4b sizing cache — the MEASUREMENT only, never the payload.
@@ -850,6 +854,148 @@ async function tailPodLogFile(
   }
 
   return accumulator.join("\n");
+}
+
+/**
+ * PEN-5120 — `tailPodLogFile`'s counterpart for a Job whose claim this process
+ * does not hold.
+ *
+ * Same contract: emit live through `onLog`, stop when `stopSignal` says the Job
+ * is terminal, return the whole transcript. The difference is where the bytes
+ * come from — the pod's container log rather than a file on a shared volume —
+ * and that every accepted line is ALSO written to the server's own
+ * `podLogPath`, so the belt-and-braces re-read, `reapPodLogFile` and
+ * `orphaned-run-terminal-result.ts` keep finding the artifact they expect.
+ *
+ * Both halves of the transport go through `getLogApi().log`, not
+ * `coreApi.readNamespacedPodLog`, and that is not a style choice: the generated
+ * `CoreV1ApiReadNamespacedPodLogRequest` exposes `sinceSeconds` but **no
+ * `sinceTime`**, so a resume through it could only say "the last N seconds" —
+ * a window that is wrong by however long the reconnect took. `LogOptions` has
+ * `sinceTime`, which is what makes the resume anchored rather than approximate.
+ */
+async function collectPodLogFromContainerStdout(input: {
+  namespace: string;
+  podName: string;
+  podLogPath: string;
+  kubeconfigPath?: string;
+  onLog: AdapterExecutionContext["onLog"];
+  stopSignal: { stopped: boolean };
+}): Promise<string> {
+  const logApi = getLogApi(input.kubeconfigPath);
+  const container = "claude";
+
+  // One append handle for the run, opened lazily so a run that produces no
+  // transcript does not create an empty file where `reapPodLogFile` would then
+  // report a reap of nothing.
+  let handle: import("node:fs/promises").FileHandle | null = null;
+  let persistFailed = false;
+  const persist = async (line: string): Promise<void> => {
+    if (persistFailed) return;
+    try {
+      if (!handle) {
+        await fs.mkdir(path.dirname(input.podLogPath), { recursive: true });
+        handle = await fs.open(input.podLogPath, "a");
+      }
+      await handle.write(`${line}\n`);
+    } catch (err) {
+      // Non-fatal by design. The stream is the delivery path for THIS run; the
+      // file is what later readers want. Losing the file must not lose the run.
+      persistFailed = true;
+      const msg = err instanceof Error ? err.message : String(err);
+      await input.onLog("stderr", `[paperclip] could not persist pod log to ${input.podLogPath}: ${msg} — the run's own output is unaffected.\n`);
+    }
+  };
+
+  // Declared as a closure rather than inlined at the end: `handle` is only ever
+  // assigned from inside `persist`, so at the outer call site TypeScript's flow
+  // analysis still reads it as the `null` it was initialised to. A closure body
+  // reads the declared type instead.
+  const closeHandle = async (): Promise<void> => {
+    try {
+      await handle?.close();
+    } catch {
+      // The bytes are already in the returned transcript; a close failure
+      // changes nothing this run depends on.
+    }
+  };
+
+  /** Drive one `Log.log` request into `onData`, resolving when it ends. */
+  const pump = async (follow: boolean, sinceTime: string | undefined, onData: (chunk: string) => void): Promise<void> => {
+    const sink = new Writable({
+      write(chunk, _encoding, callback) {
+        try {
+          onData(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf-8"));
+          callback();
+        } catch (err) {
+          callback(err instanceof Error ? err : new Error(String(err)));
+        }
+      },
+    });
+    const ended = new Promise<void>((resolve, reject) => {
+      sink.on("finish", resolve);
+      // A write-after-end is the expected consequence of the watchdog's
+      // `sink.end()` racing an in-flight chunk; by then `ended` has already
+      // resolved, so this reject is a no-op and exists only to keep the error
+      // from going unhandled.
+      sink.on("error", reject);
+    });
+    const controller = await logApi.log(input.namespace, input.podName, container, sink, {
+      follow,
+      timestamps: true,
+      ...(sinceTime ? { sinceTime } : {}),
+    });
+    // FAR-10: the API can hold a follow connection open long after the pod is
+    // gone. `Log.log` pipes the response body into `sink` WITHOUT forwarding
+    // source errors, so an aborted request leaves `sink` un-ended — which is
+    // precisely the hang the test harness's never-resolving `mockLogFn` models.
+    // Ending the sink ourselves is what turns the abort into a resolution.
+    //
+    // `controller?.abort?.()` rather than `controller.abort()`: if the accessor
+    // ever hands back something without one, the throw would happen INSIDE the
+    // interval, `sink.end()` below it would never run, and `await ended` would
+    // hang for the whole completion timeout — reintroducing the exact FAR-10
+    // shape this watchdog exists to prevent. Failing to abort merely leaks a
+    // request the run no longer reads.
+    const watchdog = follow
+      ? setInterval(() => {
+          if (input.stopSignal.stopped) {
+            controller?.abort?.();
+            sink.end();
+          }
+        }, 500)
+      : null;
+    try {
+      await ended;
+    } finally {
+      if (watchdog) clearInterval(watchdog);
+      controller?.abort?.();
+    }
+  };
+
+  const result = await collectPodLogStream({
+    stopSignal: input.stopSignal,
+    onLog: input.onLog,
+    persist,
+    follow: ({ sinceTime, onData }) => pump(true, sinceTime, onData),
+    read: async ({ sinceTime }) => {
+      let buffered = "";
+      await pump(false, sinceTime, (chunk) => {
+        buffered += chunk;
+      });
+      return buffered;
+    },
+  });
+
+  await closeHandle();
+
+  await input.onLog(
+    "stdout",
+    `[paperclip] Collected ${result.lines} transcript line(s) from the container log`
+      + `${result.reconnects > 0 ? `, across ${result.reconnects + 1} connection(s)` : ""}`
+      + `${result.duplicates > 0 ? `, ${result.duplicates} replayed line(s) de-duplicated` : ""}.\n`,
+  );
+  return result.stdout;
 }
 
 export function mergeEnvironmentConfig(
@@ -2737,6 +2883,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   let namespace!: string;
   // eslint-disable-next-line prefer-const
   let podLogPath!: string;
+  // PEN-5120: taken from the builder rather than re-derived — see
+  // `podLogStreamedToContainerStdout` on JobBuildResult.
+  let podLogStreamed = false;
   // Run Secrets whose ownerReference patch did not land, so the Job GC that
   // collects the rest can never reach them.  Named on every retain path below.
   const unownedSecrets: { name: string; namespace: string }[] = [];
@@ -3472,6 +3621,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     sharedDocsSecret = built.sharedDocsSecret;
     promptBundleSecret = built.promptBundleSecret;
     podLogPath = built.podLogPath;
+    podLogStreamed = built.podLogStreamedToContainerStdout;
     // Create the `subPath` targets before the Job exists (BLO-32734). Without
     // fsGroup, the kubelet creates a missing subPath dir as root:root 0755,
     // which is EACCES for the pod's uid 1000 — so a first run for a new company
@@ -4076,8 +4226,33 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       return onLog(stream, chunk);
     };
 
+    // PEN-5120. Two transports, one contract. `podLogStreamed` comes from the
+    // builder (`podLogStreamedToContainerStdout`), so the collector and the pod
+    // command cannot disagree about which one is in use.
+    //
+    // The file tail stays the implementation for every run on the server's own
+    // claim — byte-identical behaviour for today's fleet, which is the point.
+    // It is selected here rather than inside one merged function so that the
+    // shared-claim path keeps its exact code, not a generalisation of it.
+    const collectStdout = podLogStreamed && podName
+      ? collectPodLogFromContainerStdout({
+          namespace,
+          podName,
+          podLogPath,
+          kubeconfigPath,
+          onLog: wrappedOnLog,
+          stopSignal: logStopSignal,
+        })
+      : tailPodLogFile(podLogPath, { onLog: wrappedOnLog, stopSignal: logStopSignal });
+    if (podLogStreamed && !podName) {
+      // `waitForPod` throws rather than returning null, so reaching the tail
+      // with no pod name means the Job was adopted after its pod was already
+      // gone. Tailing an unreachable file is the honest failure there; say so
+      // instead of letting "Pod log file never appeared" read as a bug.
+      await onLog("stderr", "[paperclip] Pod log is streamed for this Job's claim, but no pod name was resolved — falling back to the file tail, which this process cannot read.\n");
+    }
     const [tailResult, completionResult] = await Promise.allSettled([
-      tailPodLogFile(podLogPath, { onLog: wrappedOnLog, stopSignal: logStopSignal }),
+      collectStdout,
       waitForJobCompletion(namespace, jobName, completionTimeoutMs, kubeconfigPath, jobObserver).then(r => { logStopSignal.stopped = true; return r; }),
     ]);
 
@@ -4088,7 +4263,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // completion.  Read the full file from disk while it still exists —
     // the cleanupJob path in `finally` will delete it before the parser
     // runs further down.  Prefer the longer of (tail, file).
-    if (podLogPath) {
+    //
+    // Skipped on the streamed path, and not as an optimisation: there the file
+    // at `podLogPath` is written by THIS process from the very accumulator
+    // `stdout` came from, so re-reading it cannot add a line. It can only differ
+    // by the trailing newline the file carries and the join() does not — which
+    // would satisfy `onDisk.length > stdout.length` on every single run and
+    // print a "tail accumulator < on-disk pod log" warning that means nothing.
+    // The streamed path's own analogue of this re-read is the final non-follow
+    // pass inside `collectPodLogStream`.
+    if (podLogPath && !podLogStreamed) {
       try {
         const fsp = await import("node:fs/promises");
         const onDisk = await fsp.readFile(podLogPath, "utf-8");

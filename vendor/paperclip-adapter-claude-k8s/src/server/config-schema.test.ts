@@ -47,6 +47,19 @@ describe("getConfigSchema", () => {
   // agent container or in a sidecar at another uid. Before this it was settable
   // but invisible, so a reviewer could not tell a brokered agent from an
   // unbrokered one without reading the database.
+  it("exposes enablePerAgentWorkspaceVolume, defaulting off (PEN-4932/PEN-5120)", () => {
+    // The gate reads `config.enablePerAgentWorkspaceVolume` whether or not it is
+    // in this schema, so the schema entry is what makes the state of a blast-radius
+    // boundary legible to someone looking at the agent rather than at the database.
+    // Default MUST stay false: on is a per-agent decision somebody makes, never a
+    // fleet-wide one that arrives with a deploy.
+    const schema = getConfigSchema();
+    const field = schema.fields.find((f: ConfigFieldSchema) => f.key === "enablePerAgentWorkspaceVolume");
+    expect(field).toBeDefined();
+    expect(field!.type).toBe("toggle");
+    expect(field!.default).toBe(false);
+  });
+
   it("exposes enableGitHubPublishBroker, defaulting off", () => {
     const schema = getConfigSchema();
     const field = schema.fields.find((f: ConfigFieldSchema) => f.key === "enableGitHubPublishBroker");

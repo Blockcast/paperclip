@@ -2175,6 +2175,17 @@ export interface JobBuildResult {
   skippedLabels: string[];
   /** Path to the pod log file on the shared PVC. */
   podLogPath: string;
+  /** True when the container ALSO frames this run's transcript onto its own
+   *  stdout, because `podLogPath` addresses a volume this process cannot read.
+   *
+   *  PEN-5120. Returned rather than re-derived by the caller on purpose. The
+   *  prompt-bundle channel has to answer the same question BEFORE calling this
+   *  builder, so it re-runs `serverHoldsJobDataClaim` and carries a comment about
+   *  the two not drifting. The log collector asks AFTER the manifest exists, so
+   *  it can simply be told — and a value that came out of the very expression
+   *  that shaped the pod command cannot disagree with it. Read this; do not
+   *  re-derive it. */
+  podLogStreamedToContainerStdout: boolean;
   /** Resolved ServiceAccount for the Job's pod template — echoed here so
    *  callers can log/report it without a cluster read (BLO-21812). */
   serviceAccountName: string;
@@ -5195,5 +5206,5 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     }
   }
 
-  return { job, jobName, namespace, prompt, claudeArgs, promptMetrics, promptSecret, envSecret, mcpConfigSecret, sharedDocsSecret, promptBundleSecret, skippedLabels, podLogPath, serviceAccountName, claudeCodeVersion, scopedWritableDirs };
+  return { job, jobName, namespace, prompt, claudeArgs, promptMetrics, promptSecret, envSecret, mcpConfigSecret, sharedDocsSecret, promptBundleSecret, skippedLabels, podLogPath, podLogStreamedToContainerStdout: streamPodLogToStdout, serviceAccountName, claudeCodeVersion, scopedWritableDirs };
 }

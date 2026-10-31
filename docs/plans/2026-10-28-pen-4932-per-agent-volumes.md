@@ -483,11 +483,30 @@ PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verificati
      the FAR-10 hang the adapter's own mocks were built for) — and it is the
      remaining blocker on enablement, not something to bolt onto the swap.
 
-     **Status 2026-10-31 — the EMIT half has landed, the COLLECTOR has not.**
-     Tracked as PEN-5120. The fail-fast `awk` now keeps its stdout and stamps
-     each line with `POD_LOG_STREAM_MARKER`, gated on `serverHoldsJobDataClaim`
-     so the fleet command is byte-identical. Three points worth carrying
-     forward, because each was a decision rather than a detail:
+     **Status 2026-10-31 — BOTH HALVES HAVE LANDED. The code path is complete;
+     no run has used it.** Tracked as PEN-5120. The fail-fast `awk` keeps its
+     stdout and stamps each line with `POD_LOG_STREAM_MARKER`, and
+     `collectPodLogStream` (`src/server/pod-log-stream.ts`) reads those frames
+     back off the container log, emits them live, and persists them to the
+     server's own `podLogPath` so the belt-and-braces re-read, the reaper's
+     `unlink` and the orphan reader keep finding what they expect. The transport
+     is chosen from `JobBuildResult.podLogStreamedToContainerStdout` — returned
+     by the builder rather than re-derived, so the server cannot disagree with
+     the command it shipped — and the file tail remains the implementation for
+     every run on the server's own claim.
+
+     ⚠ **That is not the same as invariant 5 being verified.** PEN-5120's first
+     done-when asks for a real run on a foreign claim producing parseable
+     stdout, and nothing has produced one. What changed is that the failure is
+     no longer structural: before, enabling the gate emptied every opted-in
+     run's stdout by construction. The `enablePerAgentWorkspaceVolume` toggle is
+     surfaced in `config-schema.ts` for the first time alongside this, for
+     exactly that reason — the acceptance is unreachable without a way to opt
+     one agent in — and its hint says in as many words that nothing has proven
+     it in production yet.
+
+     Four points worth carrying forward, because each was a decision rather than
+     a detail:
 
      - **Framing is forced, not chosen.** `readNamespacedPodLog` has no stream
        selector — it serves one interleaved view of fd 1 and fd 2 — so the
@@ -500,10 +519,25 @@ PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verificati
        not right when degrading to `cat` would publish the transcript to the
        node's container log. The stderr line and the `.unredacted` sentinel are
        still written first.
-     - **Still unsolved, and owned by the collector:** the 10 Mi rotation bound,
-       reconnect/resume across an API disconnect, and persisting the stream back
-       to the server's own `podLogPath` so the belt-and-braces re-read, the
-       reaper's `unlink`, and the orphan reader below all keep working.
+     - **A stream end is not evidence the run ended.**
+       `@kubernetes/client-node`'s own `Log.log` carries the comment *"the
+       follow search param still has the stream close prematurely based on my
+       testing"*, and FAR-10 is the opposite failure — the API holding a
+       connection open indefinitely. So the follow is a loop that reconnects
+       until `waitForJobCompletion` reports the Job terminal, and a watchdog
+       ends the sink on that signal rather than waiting for the socket.
+     - **The 10 Mi rotation bound is handled, not merely noted.** While the
+       follow is CONNECTED, rotation is transparent — the kubelet's reader rolls
+       over with the file. The only window in which bytes can be lost is between
+       connections, so a reconnect resumes at `sinceTime` anchored to the last
+       line's second and prints that resume point, which makes a gap
+       attributable instead of silent. `sinceTime` is second-granular and
+       inclusive, so the replay is a known SUPERSET of what is already held and
+       the re-delivered lines are de-duplicated within that second. Note this is
+       why the collector drives both reads through `getLogApi().log` and not
+       `coreApi.readNamespacedPodLog`: the generated request type for the latter
+       has `sinceSeconds` but **no `sinceTime`**, so a resume through it could
+       only ever be approximate.
 
      **A SECOND pod→server read-direction consumer, found 2026-10-31 and not
      fixed by the collector.** `server/src/services/orphaned-run-terminal-result.ts`
@@ -1442,7 +1476,7 @@ opted in to the `dataClaimName` swap — which, as of 2026-10-31, is itself merg
 
 | done-when | state |
 |---|---|
-| 1 — two agent pods on one node report **distinct** volume IDs | **UNMET, and now blocked on invariant 5 rather than on the swap.** The swap LANDED 2026-10-31 behind the default-off `enablePerAgentWorkspaceVolume` gate (§4 stage 4b), but the gate cannot be turned on until invariant 5 closes — enabling it today empties every opted-in run's stdout. The last fleet read still shows one handle, `csi-vol-3bdd0e68-1704-4f81-b3d8-55920cabf82c`, which is the correct reading of a gate nothing has opted into. After invariant 5: the server rolled onto that commit, ≥2 agents opted in through `adapter_config`, and a `findmnt` read from inside two live pods **co-located on one node**. Do not record this as met off a merge. |
+| 1 — two agent pods on one node report **distinct** volume IDs | **UNMET, and no longer blocked — the gate is now turnable-on and unproven, which is a different state from blocked.** The swap LANDED 2026-10-31 behind the default-off `enablePerAgentWorkspaceVolume` gate (§4 stage 4b), and invariant 5's collector landed the same day, so enabling it no longer empties the run's stdout by construction. Nothing has yet run on it, and the toggle's own hint says so. The last fleet read still shows one handle, `csi-vol-3bdd0e68-1704-4f81-b3d8-55920cabf82c`, which is the correct reading of a gate nothing has opted into. After invariant 5: the server rolled onto that commit, ≥2 agents opted in through `adapter_config`, and a `findmnt` read from inside two live pods **co-located on one node**. Do not record this as met off a merge. |
 | 2 — the fleet-wide tooling row is a separate read-only claim **or** baked into the image, with the choice recorded | **MET on `master`, NOT YET OBSERVABLE in the fleet.** Choice: **baked into the image**, reasoned in §3.3-§3.6. |
 | 3 — recurrence re-measured against the 3-wedges-in-30h baseline, caveats stated | not started, and **it cannot be done before 1** — the measurement is of the swap's effect, and a gate nobody has opted into produces no effect to measure. Note the two caveats §4.1 attaches to the baseline survive into the re-measure and must be stated rather than glossed: Prometheus retains ~7 days, not 30, and counter resets on the agent-heavy nodes hide history. |
 | 4 — this §5 acceptance table updated to reflect 1 being met | blocked on 1, by construction. This row is the one that must NOT be ticked on the strength of the swap landing. |

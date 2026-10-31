@@ -227,6 +227,37 @@ export function getConfigSchema(): AdapterConfigSchema {
         + "This is a rollout gate, not a kill switch: switching it back off after enablement re-opens the \u00a77 "
         + "acceptance and needs Security.",
     },
+    // PEN-4932 stage 4b / PEN-5120. Deliberately withheld when the swap landed:
+    // until the pod log had a transport that does not assume a shared volume,
+    // this toggle was a switch that emptied every opted-in run's stdout, and an
+    // operator-visible switch for a path that fails every run is a trap.
+    //
+    // Surfaced now that PEN-5120's collector exists, because the remaining
+    // acceptance — a real run on a foreign claim producing parseable stdout —
+    // is not reachable without a way to opt one agent in. The hint says plainly
+    // that nothing has yet proven it in production; do not soften that wording
+    // before a run has.
+    {
+      type: "toggle",
+      key: "enablePerAgentWorkspaceVolume",
+      label: "Per-agent workspace volume (PEN-4932)",
+      default: false,
+      hint:
+        "Give this agent its own PersistentVolumeClaim instead of the shared CephFS RWX claim every agent "
+        + "pod mounts today. The shared claim is why one hung NodeUnstageVolume bricks every agent pod on a "
+        + "node (PEN-3199: three wedges in 30h, one of them 30h26m).\n\n"
+        + "\u26a0 NOT YET PROVEN IN PRODUCTION. The code path is complete \u2014 the Job mounts the agent's own "
+        + "claim, the prompt bundle is delivered by Secret, the writable dirs are seeded from inside the pod, "
+        + "and the run transcript is collected from the container log rather than from a file the server "
+        + "cannot read \u2014 but no agent has completed a run on it. Turn it on for ONE agent first and read "
+        + "that run's output before turning it on for a second.\n\n"
+        + "Per-agent opt-in, not fleet-wide: the agent's existing workspace tree stays on the shared claim and "
+        + "is not visible from the new one, so the first run after enabling starts from an empty workspace. "
+        + "Turning it back off restores the old tree; it does not migrate anything either way.\n\n"
+        + "Known residual while on: `orphaned-run-terminal-result.ts` cannot recover a vanished Job's verdict "
+        + "for this agent, because that recovery reads an artifact on the agent's own volume (PEN-2421). It "
+        + "only fires when the adapter owner dies mid-run.",
+    },
   ];
 
   return { fields };
