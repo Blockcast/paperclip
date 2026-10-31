@@ -846,6 +846,30 @@ export function resolveSeedShape(input: {
  * 120-line diagnostic, and the container's own stdout carries no NDJSON anyway
  * (the pipeline ends `| tee <file> | <failFastFilter> > /dev/null`).
  *
+ * ⛔ **Second precondition, and it is a CAPACITY one — it does not block the
+ * flip, it prices it (PEN-5125, decided 2026-10-31).** Nothing reclaims an
+ * opted-in agent's `k8s-isolation/workspaces/*` tree. The isolation-workspace
+ * reaper walks that path through the SERVER's mount, so moving the tree to this
+ * claim moves it out of the only sweep there is — and the miss is silent by
+ * construction: the enumeration is directory-driven, so an unreachable
+ * workspace lands in no outcome bucket and the pass still reports
+ * `stop_reason="complete"`. **The accepted ceiling is ≈10 GiB/agent/month
+ * against a 50 Gi claim already carrying ≈13.2 G, i.e. one opted-in agent fills
+ * its own claim in ≈3.7 months.** `allowVolumeExpansion` is `true`, so the
+ * terminal state is an operator resizing a PVC rather than a run losing data,
+ * which is why this is priced rather than refused.
+ *
+ * What makes that ceiling checkable instead of remembered is
+ * `paperclip_isolation_workspace_reaper_unreachable_agents`, whose agent arm
+ * counts exactly this population:
+ * `PaperclipIsolationWorkspaceReaperCoverageGap` fires on `!= 0`, so the FIRST
+ * opt-in raises it within one daily sweep and it stays raised. **Do not read
+ * that alert as informational while PEN-5151 is open** — it is the standing
+ * record that an unreclaimed tree exists, so opt an agent in only together with
+ * an owner for its claim's capacity. The cheapest remedy is to opt the agent
+ * back out: its runs return to the shared claim, where the existing reaper
+ * reaches them with its predicate unchanged.
+ *
  * The gate exists so the swap can land reviewed and inert, exactly as
  * #3153/#3157/#3158 did for the delivery channel. It is deliberately NOT
  * surfaced in `config-schema.ts`: an operator-visible toggle for a path known
