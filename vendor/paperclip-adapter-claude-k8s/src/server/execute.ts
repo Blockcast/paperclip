@@ -14,12 +14,14 @@ import {
   ClaudeSkillSourceUnavailableError,
   prepareClaudePromptBundle,
   readCatalogBackedSkillKeys,
+  toPodAddress,
 } from "./prompt-cache.js";
 import {
   PROMPT_BUNDLE_SECRET_MAX_BYTES,
   PromptBundleOverBudgetError,
   PromptBundleTooManyFilesError,
   buildPromptBundleSecretProjection,
+  skillSourceNeedsProjection,
 } from "./prompt-bundle-projection.js";
 import type {
   PromptBundleSecretProjection,
@@ -254,6 +256,21 @@ function isDeterministicProjectionRefusal(err: unknown): boolean {
 /** A refusal worth reporting on this run, but not worth remembering for later ones. */
 function isUncacheableProjectionRefusal(err: unknown): boolean {
   return err instanceof Error && UNCACHEABLE_PROJECTION_REFUSAL_NAMES.has(err.name);
+}
+
+/**
+ * Every DELIBERATE refusal `buildPromptBundleSecretProjection` can raise.
+ *
+ * The union of the two sets above — they partition the same five by whether a
+ * sizing key may remember them, which is a question about the measurement path
+ * and says nothing about how the DELIVERY path should report one.
+ *
+ * Keyed on `name` for the reason given above: this module is imported down more
+ * than one path in a partially-mocked graph, where `instanceof` compares class
+ * identity per module instance and silently reports false.
+ */
+function isProjectionRefusal(err: unknown): boolean {
+  return isDeterministicProjectionRefusal(err) || isUncacheableProjectionRefusal(err);
 }
 
 /**
@@ -3074,6 +3091,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // in all three of what they do with a refusal, whether they may use the sizing
   // cache, and whether they may skip a run.
   let promptBundleProjection: PromptBundleSecretProjection | null = null;
+  let promptBundleSkillLinks: Array<{ runtimeName: string; target: string }> = [];
   // Gated on claim IDENTITY, through the same resolver `buildJobManifest` uses,
   // so the two cannot drift into the permissive direction — this process
   // deciding its own write is visible to a pod that cannot see it.
@@ -3103,15 +3121,75 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // Bound to a const first: `promptBundleProjection` is a `let` that has to
     // outlive this block to reach `buildJobManifest`, and TypeScript drops the
     // non-null narrowing across the `await` boundary below.
-    const projection = await buildPromptBundleSecretProjection({
-      companyId: ctx.agent.companyId,
-      runLabel: ctx.runId,
-      skills: desiredSkills,
-      instructionsContents,
-      serverDataMountPath: SELF_POD_DATA_MOUNT_PATH,
-      catalogBackedSkillKeys,
-    });
+    let projection: PromptBundleSecretProjection | null;
+    try {
+      projection = await buildPromptBundleSecretProjection({
+        companyId: ctx.agent.companyId,
+        runLabel: ctx.runId,
+        skills: desiredSkills,
+        instructionsContents,
+        serverDataMountPath: SELF_POD_DATA_MOUNT_PATH,
+        catalogBackedSkillKeys,
+      });
+    } catch (err) {
+      // Still fails the run — that posture is the point, and a truncated bundle
+      // would be the silent missing-instructions outcome. What this adds is a
+      // NAME. Untyped, a refusal escapes `execute()` and is reported as the
+      // anonymous `adapter_failed`, which is the BLO-32055 problem the
+      // `ClaudeSkillSourceUnavailableError` catch above exists to avoid: an
+      // agent-pool/adapter fault reported for what is a skill CONFIGURATION
+      // fault, invisible to skill-health sweeps and to §4.2's escalation —
+      // which is the one consumer this whole budget was sized for.
+      //
+      // Only the five deliberate refusals are claimed. A transient ENOENT
+      // mid-walk or an EIO off CephFS is not a configuration fault and is
+      // rethrown to whatever already classifies it.
+      if (!isProjectionRefusal(err)) throw err;
+      const detail = err instanceof Error ? err.message : String(err);
+      const errorName = err instanceof Error ? err.name : "unknown";
+      console.warn(
+        JSON.stringify({
+          level: "warn",
+          event: "claude_k8s.prompt_bundle_projection_refused",
+          msg: "the prompt bundle cannot be projected into a Secret and this Job's claim is not the server's own, so there is no other channel; failing the run rather than starting an agent without its instructions",
+          companyId: ctx.agent.companyId,
+          runId: ctx.runId,
+          errorName,
+          refusal: detail,
+        }),
+      );
+      await onLog("stderr", `[paperclip] prompt bundle cannot be delivered: ${detail}\n`);
+      return {
+        exitCode: null,
+        signal: null,
+        timedOut: false,
+        errorMessage: `Prompt bundle projection refused (${errorName}): ${detail}`,
+        errorCode: "k8s_prompt_bundle_projection_refused",
+      };
+    }
     promptBundleProjection = projection;
+    // The EXACT COMPLEMENT of the projection, both sides keyed off the same
+    // predicate so they cannot drift into overlapping or into a gap.
+    //
+    // `skillSourceNeedsProjection` leaves image-path skills out on the correct
+    // grounds that the pod already has their bytes — but the agent reaches a
+    // skill through its `.claude/skills/<runtimeName>` farm link, and
+    // `prepareClaudePromptBundle` writes that link into the SERVER'S volume. On
+    // a foreign claim the pod never sees it, so the skill is unreachable even
+    // though every byte of it is present in the image. Review found this on
+    // #3170; it would have silently dropped every adapter-bundled skill on
+    // every run once the claim is per-agent.
+    //
+    // `toPodAddress` rather than `entry.source` verbatim: the two coincide for
+    // a true image path today, and a second translation here could diverge from
+    // the one `prompt-cache.ts` writes the moment the mounts differ.
+    const podDataMountPath = resolveDataMountPath(config);
+    promptBundleSkillLinks = desiredSkills
+      .filter((entry) => !skillSourceNeedsProjection(entry, SELF_POD_DATA_MOUNT_PATH, catalogBackedSkillKeys))
+      .map((entry) => ({
+        runtimeName: entry.runtimeName,
+        target: toPodAddress(entry.source, podDataMountPath, SELF_POD_DATA_MOUNT_PATH),
+      }));
     if (!projection) {
       // "Nothing to carry" — no instructions and no projectable skills — which is
       // a complete delivery of an empty bundle, not a failure. `buildJobManifest`
@@ -3125,6 +3203,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           msg: "prompt bundle has nothing to project; no Secret staged (PEN-4932 stage 4b)",
           companyId: ctx.agent.companyId,
           runId: ctx.runId,
+          // Not necessarily an empty bundle: a run whose skills are ALL
+          // image-path projects nothing and is still fully delivered, by links
+          // alone. That is why the link step is not gated on the projection.
+          relinkedSkillCount: promptBundleSkillLinks.length,
         }),
       );
     } else {
@@ -3288,7 +3370,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   }
 
   // Build Job manifest
-    const built = buildJobManifest({ ctx: effectiveCtx, selfPod, promptBundle, promptBundleProjection });
+    const built = buildJobManifest({ ctx: effectiveCtx, selfPod, promptBundle, promptBundleProjection, promptBundleSkillLinks });
     const job = built.job;
     jobName = built.jobName;
     namespace = built.namespace;

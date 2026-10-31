@@ -30,7 +30,11 @@ import {
   PROMPT_BUNDLE_SECRET_MOUNT_PATH,
   PROMPT_BUNDLE_SECRET_VOLUME_NAME,
 } from "./prompt-bundle-projection.js";
-import { buildPromptBundleMaterializationShell } from "./prompt-bundle-materialization.js";
+import {
+  buildPromptBundleMaterializationShell,
+  buildPromptBundleSkillLinkShell,
+} from "./prompt-bundle-materialization.js";
+import type { PromptBundleSkillLink } from "./prompt-bundle-materialization.js";
 
 /**
  * Default path to the project-scope .mcp.json that paperclip's helm-chart seed-init
@@ -1402,6 +1406,17 @@ export interface JobBuildInput {
    * the claim is harmless but pointless: the pod can already read the bytes.
    */
   promptBundleProjection?: PromptBundleSecretProjection | null;
+  /**
+   * Skill-farm links the projection deliberately does NOT carry — image-path
+   * skills, whose bytes the pod already has from its own image.
+   *
+   * They still need their `.claude/skills/<runtimeName>` link rebuilt in-pod:
+   * `prepareClaudePromptBundle` writes that link into the SERVER'S volume, so on
+   * a foreign claim the pod never sees it and the skill is unreachable even
+   * though the bytes are present. Supplied by `execute.ts` as the exact
+   * complement of the projection, both sides keyed off `skillSourceNeedsProjection`.
+   */
+  promptBundleSkillLinks?: readonly PromptBundleSkillLink[] | null;
 }
 
 /** When the prompt exceeds the env-var size limit, the manifest uses a
@@ -3043,7 +3058,7 @@ export function resolveServiceAccountName(config: Record<string, unknown>): stri
 }
 
 export function buildJobManifest(input: JobBuildInput): JobBuildResult {
-  const { ctx, selfPod, promptBundle, promptBundleProjection } = input;
+  const { ctx, selfPod, promptBundle, promptBundleProjection, promptBundleSkillLinks } = input;
   const { runId, agent, runtime, config: rawConfig, context } = ctx;
   const config = parseObject(rawConfig);
 
@@ -3481,6 +3496,18 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // because it is the one branch here that is reachable WITHOUT the 4b swap.
   let promptBundleSecret: PromptBundleSecret | null = null;
   let promptBundleMaterialization = "";
+  // The link step is NOT conditional on there being a projection: a run whose
+  // skills are ALL image-path projects nothing, and those are exactly the
+  // entries that need a link. Tying the two together would have left such a run
+  // with an empty bundle root and no signal.
+  let promptBundleSkillLinkStep = "";
+  if (!serverHoldsDataClaim && promptBundle && promptBundleSkillLinks?.length) {
+    promptBundleSkillLinkStep = buildPromptBundleSkillLinkShell({
+      bundleRoot: promptBundle.rootDir,
+      links: promptBundleSkillLinks,
+      quote: quoteShellArg,
+    });
+  }
   if (!serverHoldsDataClaim && promptBundle && promptBundleProjection) {
     // Throws on a path that is not bundle-relative. Deliberate, and deliberately
     // NOT caught: a projection carrying such a path is a bug in the projection,
@@ -3609,8 +3636,17 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
         // warning is conditional now. Saying "prompt bundle absent" while the
         // Secret is mounted would report, on every per-agent run forever, the
         // exact fault this change fixes — and the next reader would chase it.
+        //
+        // ⚠️ An earlier revision of this line said "company skills will be
+        // empty" on the delivered branch. That was BACKWARDS, and review caught
+        // it: the projection carries the run's RESOLVED skill entries, so
+        // company skills are exactly what does arrive. What the Secret does not
+        // carry is the image-path set — deliberately, since the pod already has
+        // those bytes — and those are delivered as rebuilt farm LINKS instead.
+        // Naming the wrong half is worse than naming neither, because it sends
+        // the reader to the tree that is working.
         msg: promptBundleSecret
-          ? "Job volume is not the server's own claim; company skills will be empty (the prompt bundle is delivered by Secret, so instructions are not affected)"
+          ? "Job volume is not the server's own claim; the prompt bundle is delivered by Secret (projected skills and instructions arrive; image-path skills are relinked in-pod), so the company skills TREE is unpopulated but unread"
           : "Job volume is not the server's own claim; server-materialized trees will be empty (company skills missing, prompt bundle absent so the agent loses its instructions)",
         // The bundle root drops out of this list when the Secret carries it: the
         // directory is no longer unpopulated, it is populated from the Secret by
@@ -3623,6 +3659,11 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
           ...(promptCacheSubPath && !promptBundleSecret ? [promptCacheSubPath] : []),
         ],
         promptBundleDelivery: promptBundleSecret ? "secret" : "none",
+        // The two halves of the bundle, reported separately: bytes that
+        // travelled in the Secret, and image-path skills relinked in-pod. A
+        // run with skills but zero of both is the shape to go looking at.
+        promptBundleProjectedFiles: promptBundleProjection?.fileCount ?? 0,
+        promptBundleRelinkedSkills: promptBundleSkillLinkStep ? (promptBundleSkillLinks?.length ?? 0) : 0,
         runId,
         jobName,
         dataClaimName,
@@ -4264,7 +4305,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // so a verdict after it would describe a pod that had already reached GitHub.
   // Advisory — the push path already fails closed; this buys time-to-diagnosis.
   const prePushHookPreflight = buildPrePushHookPreflightShell({ dataMountPath });
-  const claudeInvocation = `set -o pipefail; ${imageWrapperPreflight}; ${prePushHookPreflight}; ${workspaceSetup ? `${workspaceSetup} || exit $?; ` : ""}${promptBundleMaterialization ? `${promptBundleMaterialization} || exit $?; ` : ""}${sharedDocOverlaySetup ? `${sharedDocOverlaySetup}; ` : ""}${buildEnvGuardSetupShell()}; ${claudeRuntime}${ccrotateRefresh ? `${ccrotateRefresh}; ` : ""}${preparePodLog}; ${buildPodLogRedactorSetupShell(containerLogPath)}; cat /tmp/prompt/prompt.txt | ${launcherCommand} ${claudeArgsEscaped} | "$${POD_LOG_FILTER_VAR}" \${${POD_LOG_FILTER_ARG_VAR}:+"$${POD_LOG_FILTER_ARG_VAR}"} | tee ${quoteShellArg(containerLogPath)} | ${failFastFilter} > /dev/null`;
+  const claudeInvocation = `set -o pipefail; ${imageWrapperPreflight}; ${prePushHookPreflight}; ${workspaceSetup ? `${workspaceSetup} || exit $?; ` : ""}${promptBundleMaterialization ? `${promptBundleMaterialization} || exit $?; ` : ""}${promptBundleSkillLinkStep ? `${promptBundleSkillLinkStep} ` : ""}${sharedDocOverlaySetup ? `${sharedDocOverlaySetup}; ` : ""}${buildEnvGuardSetupShell()}; ${claudeRuntime}${ccrotateRefresh ? `${ccrotateRefresh}; ` : ""}${preparePodLog}; ${buildPodLogRedactorSetupShell(containerLogPath)}; cat /tmp/prompt/prompt.txt | ${launcherCommand} ${claudeArgsEscaped} | "$${POD_LOG_FILTER_VAR}" \${${POD_LOG_FILTER_ARG_VAR}:+"$${POD_LOG_FILTER_ARG_VAR}"} | tee ${quoteShellArg(containerLogPath)} | ${failFastFilter} > /dev/null`;
   // When the DinD sidecar is wired in, prepend the wait-for-socket loop
   // so the agent never starts before dockerd is listening on the shared
   // unix socket. Mirrors the opencode_k8s adapter.
