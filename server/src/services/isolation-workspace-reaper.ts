@@ -101,12 +101,47 @@
  *
  * Deleting a genuinely idle workspace costs a cold start, not source: durable
  * transcripts live separately under `data/run-logs/`.
+ *
+ * ## What this module does NOT reap, and why that is recorded here (PEN-5125)
+ *
+ * Everything above is scoped to one volume: the claim THIS process mounts. An
+ * agent whose Job mounts a different claim — an operator `workspaceVolumeClaim`,
+ * or PEN-4932 stage 4b's per-agent claim — materializes its isolation trees on
+ * that volume, at this same relative path, where no amount of walking this root
+ * will find them. The enumeration here is directory-driven (`readdir` -> `id IN
+ * (...)`), so such a workspace is never even asked about: it lands in no outcome
+ * bucket, the `scanned` identity below stays exactly true over a shrunken
+ * population, and the pass reports `stop_reason=complete`. The failure is not
+ * that the reaper reports nothing — it is that it reports success.
+ *
+ * `unreachableAgents` makes that sayable, and is the only part of PEN-5125 this
+ * module can own. **Reclamation is deliberately NOT here**, and three shapes
+ * were refused rather than left open:
+ *
+ * - *Give this reaper a per-claim enumeration.* It would have to mount every
+ *   agent PVC, which is precisely the cross-mount coupling PEN-4932 exists to
+ *   remove.
+ * - *Keep `k8s-isolation` on the server's claim beside the per-agent one.*
+ *   Refused on PEN-5120's ground: one surviving bind on the shared CephFS
+ *   handle, and ceph-csi's lock keys on the handle, so it pays the whole cost of
+ *   the swap for zero blast-radius reduction.
+ * - *Unlink from the pod's own `seed-writable-dirs` init container.* The pod
+ *   does mount the right volume, but that container's design note turns on its
+ *   operations being idempotent, so that "a re-run, a restarted pod and a second
+ *   agent on the same volume all converge" — and a per-agent claim is
+ *   `ReadWriteMany` precisely because one agent holds concurrent run pods across
+ *   nodes. `rm -rf` is the one operation that does not converge against a
+ *   concurrent sibling, and it would sit in the container whose symlink guard is
+ *   already documented as a check-then-act window. Reclamation wants a dedicated
+ *   executor off the run hot path, not this one.
+ *
+ * See `docs/plans/2026-10-28-pen-4932-per-agent-volumes.md` §4 stage 4b.
  */
-import { inArray } from "drizzle-orm";
+import { inArray, sql } from "drizzle-orm";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { Db } from "@paperclipai/db";
-import { executionWorkspaces } from "@paperclipai/db";
+import { agents, executionWorkspaces } from "@paperclipai/db";
 import { logger as defaultLogger } from "../middleware/logger.js";
 import { DEFAULT_WORKTREE_INSTANCE_HOME_DIRNAME, REPO_MANAGED_WORKTREES_SUBPATH } from "../worktree-config.js";
 import { recordIsolationWorkspaceReapSweep } from "./metrics.js";
@@ -197,6 +232,74 @@ export function createDbWorkspaceUsageLookup(db: Db): WorkspaceUsageLookup {
   };
 }
 
+/**
+ * Config keys that move an agent's Job off the volume this process mounts.
+ *
+ * The reaper's reach is exactly `serverHoldsJobDataClaim`
+ * (`vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts`): it can
+ * see a run's isolation tree if and only if the Job mounted the server's own
+ * claim. `resolveDataClaimName` there has three slots in precedence order —
+ * operator `workspaceVolumeClaim`, the per-agent claim, the server's own PVC —
+ * and the first two both resolve to a volume this process has no mount on.
+ *
+ * ⚠ `workspaceVolumeClaim` is NOT a stage-4b key. It has no `config-schema.ts`
+ * toggle, but it is read from agent and environment config today, which makes
+ * the blind spot below reachable on the CURRENT deployment rather than only
+ * after `enablePerAgentWorkspaceVolume` is flipped. PEN-5125 was filed against
+ * the per-agent claim alone; this is the same defect one slot higher, and it is
+ * why the probe keys on the claim-resolution rule rather than on the gate.
+ *
+ * The fourth case — `dataClaimName === ""`, an `emptyDir` — is deliberately
+ * absent. That tree is unreachable too, but it dies with the pod, so it
+ * accumulates nothing and is not a capacity gap.
+ */
+export const PER_AGENT_WORKSPACE_VOLUME_CONFIG_KEY = "enablePerAgentWorkspaceVolume";
+export const WORKSPACE_VOLUME_CLAIM_CONFIG_KEY = "workspaceVolumeClaim";
+
+/**
+ * How many agents' isolation trees this sweep structurally cannot reach.
+ *
+ * Separate from `WorkspaceUsageLookup` and injected for the same reason: the
+ * answer comes from the control plane, and a test must be able to state it
+ * without an embedded Postgres.
+ */
+export type UnreachableAgentCount = () => Promise<number>;
+
+/**
+ * The production probe. Mirrors `asBoolean`
+ * (`packages/adapter-utils/src/server-utils.ts:411`) **exactly**: only a JSON
+ * boolean `true` opts an agent in, so the predicate is `= 'true'::jsonb` and
+ * not a string comparison. A looser match would over-report — an agent carrying
+ * the string `"true"` is NOT opted in, and its Job does mount this claim.
+ *
+ * Deliberately NOT filtered by `agents.status`. A paused or errored agent's
+ * tree is exactly as unreachable as a running one's, and it is the one least
+ * likely to be noticed; filtering would make the gap shrink when the fleet goes
+ * quiet, which is the wrong direction for a capacity signal.
+ *
+ * One aggregate over `agents` per sweep (daily), with no index on a jsonb key —
+ * a sequential scan over a table measured in hundreds of rows, against a pass
+ * whose next act is an unbounded recursive unlink.
+ */
+export function createDbUnreachableAgentCount(db: Db): UnreachableAgentCount {
+  return async () => {
+    const rows = await db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(agents)
+      .where(
+        // The `::text` casts pin the operator overload explicitly. Both `->`
+        // and `->>` are overloaded on `(jsonb, text)` and `(jsonb, integer)`,
+        // and a bound parameter arrives as `unknown`, so the bare form leans on
+        // Postgres resolving `unknown` to the preferred type — which it does,
+        // and which is why the bare `jsonb -> 'key'` idiom works everywhere.
+        // Stating it is cheap and removes the question; it is not a bug fix.
+        sql`${agents.adapterConfig} -> ${PER_AGENT_WORKSPACE_VOLUME_CONFIG_KEY}::text = 'true'::jsonb
+            OR btrim(coalesce(${agents.adapterConfig} ->> ${WORKSPACE_VOLUME_CLAIM_CONFIG_KEY}::text, '')) <> ''`,
+      );
+    return rows[0]?.count ?? 0;
+  };
+}
+
 export interface IsolationWorkspaceReapOptions {
   root?: string;
   maxAgeDays: number;
@@ -212,6 +315,15 @@ export interface IsolationWorkspaceReapOptions {
    * idleness comes from.
    */
   lookupWorkspaceUsage: WorkspaceUsageLookup;
+  /**
+   * Optional, unlike `lookupWorkspaceUsage` above, and the asymmetry is
+   * deliberate: omitting this changes nothing about what gets deleted, so it
+   * cannot be fail-open in that sense. What it does change is whether the sweep
+   * can say how much of the population it covered — so omitting it is recorded
+   * as `UNREACHABLE_AGENTS_UNKNOWN` rather than as zero. The production
+   * constructor always supplies it; see `startIsolationWorkspaceReaper`.
+   */
+  countUnreachableAgents?: UnreachableAgentCount;
 }
 
 export interface IsolationWorkspaceReapResult {
@@ -273,7 +385,40 @@ export interface IsolationWorkspaceReapResult {
    * were never assessed at all.
    */
   lookupFaulted: boolean;
+  /**
+   * How many agents' isolation trees this sweep structurally could not reach,
+   * or `UNREACHABLE_AGENTS_UNKNOWN` when the probe was absent or faulted
+   * (PEN-5125).
+   *
+   * ⛔ This is NOT another outcome bucket, and it is not part of the `scanned`
+   * identity above — the directories it describes were never enumerated, so
+   * they are in no bucket at all. That is the whole finding. `root_absent`
+   * (BLO-36814) was added to stop an enabled-but-misaimed reaper from looking
+   * like a disabled one, but it fires only on `ENOENT` of the root, and a
+   * per-agent claim leaves this root **present and populated** by every agent
+   * that did not opt in. So `readdir` succeeds, the sweep runs, the identity
+   * holds exactly, every `entries_total{outcome=…}` child is internally
+   * consistent — over a silently shrunken population — and `stop_reason` reads
+   * `complete`.
+   *
+   * The cost of the gap is therefore not that the reaper reports nothing. It is
+   * that it reports **success**: `complete` means "finished sweeping the tree it
+   * could see", never "swept the population", and before this field nothing
+   * published could tell those apart.
+   */
+  unreachableAgents: number;
 }
+
+/**
+ * `unreachableAgents` when the probe was not supplied or threw.
+ *
+ * Negative because a count cannot be, so it is unambiguous in a time series and
+ * an operator alerts on `!= 0` — one expression covering both "agents are
+ * unreachable" and "this sweep cannot tell". A sentinel of `0` would make a
+ * persistently failing probe read as full coverage, which is the silence this
+ * field exists to remove.
+ */
+export const UNREACHABLE_AGENTS_UNKNOWN = -1;
 
 function isReapableLayout(entries: string[]): boolean {
   if (entries.length !== REAPABLE_LAYOUT.length) return false;
@@ -376,7 +521,37 @@ export async function reapIsolationWorkspaces(
     failed: 0,
     capped: false,
     lookupFaulted: false,
+    unreachableAgents: UNREACHABLE_AGENTS_UNKNOWN,
   };
+
+  // Probed BEFORE the root `readdir`, so the root-absent return below carries
+  // it too. That path is the one where coverage matters most: a reaper aimed at
+  // a path that does not exist on a fleet that has moved its trees elsewhere is
+  // the exact BLO-31222 shape, and `root_absent` alone cannot say whether the
+  // bytes went somewhere or were never there.
+  //
+  // Never fatal. This is an observation about the sweep, not an input to it —
+  // nothing here decides what gets deleted — so a fault leaves the sentinel in
+  // place and the pass proceeds. Failing the sweep on it would trade a capacity
+  // blind spot for a reclamation outage.
+  if (options.countUnreachableAgents) {
+    try {
+      result.unreachableAgents = await options.countUnreachableAgents();
+    } catch (err) {
+      log.error(
+        { err },
+        "isolation-workspace reaper could not determine how many agents' trees it cannot reach; " +
+          "sweep coverage is unknown for this tick",
+      );
+    }
+  }
+  if (result.unreachableAgents > 0) {
+    log.warn(
+      { root, unreachableAgents: result.unreachableAgents },
+      "isolation-workspace reaper cannot reach every agent's isolation tree; " +
+        "this sweep's outcome counters describe a subset of the population (PEN-5125)",
+    );
+  }
 
   let entries;
   try {
@@ -655,6 +830,9 @@ export function startIsolationWorkspaceReaper(
   const sweepOptions: IsolationWorkspaceReapOptions = {
     ...options,
     lookupWorkspaceUsage: options.lookupWorkspaceUsage ?? createDbWorkspaceUsageLookup(db),
+    // Defaulted here rather than left to `index.ts`, so the single production
+    // entry point cannot be wired up coverage-blind by omission (PEN-5125).
+    countUnreachableAgents: options.countUnreachableAgents ?? createDbUnreachableAgentCount(db),
   };
   let inFlight: Promise<void> | null = null;
   const runTick = () => {

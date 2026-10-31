@@ -2432,6 +2432,49 @@ test("PaperclipCrashRecoveryCandidateIndex{Missing,Unobservable} distinguish a m
   );
 });
 
+test("PaperclipIsolationWorkspaceReaperCoverageGap fires on != 0, not > 0 (PEN-5125)", () => {
+  const rendered = renderChart(["--set", "prometheusRule.enabled=true"]);
+
+  const [, block] = rendered.match(
+    /(alert: PaperclipIsolationWorkspaceReaperCoverageGap[\s\S]*?)(?=\n\s+- alert:|\n\s+- name:|$)/,
+  ) ?? [];
+  assert.ok(block, "the coverage-gap alert must render a block");
+
+  const [, expr] = block.match(/\n\s+expr: (.+)\n/) ?? [];
+  assert.ok(expr, "the coverage-gap alert must render an expr");
+  assert.match(
+    expr,
+    /paperclip_isolation_workspace_reaper_unreachable_agents/,
+    "the alert must read the coverage gauge",
+  );
+
+  // THE assertion on this rule. `-1` is the sentinel for "the probe was absent
+  // or threw", i.e. a sweep that cannot describe its own coverage -- which is
+  // operationally the same state as a known-partial sweep. A `> 0` comparison
+  // reads that as healthy and goes silent at exactly the moment the probe
+  // breaks, which is the failure mode the gauge exists to remove.
+  assert.match(expr, /!=\s*0/, "the expr must compare != 0 so the -1 sentinel fires");
+  assert.doesNotMatch(
+    expr,
+    />\s*0/,
+    "the expr must not use `> 0`: that treats the -1 probe-failed sentinel as full coverage",
+  );
+
+  // Independent of the liveness alert. This one must not key on the
+  // last-sweep gauge: a reaper ticking perfectly on schedule over a subset of
+  // the population is precisely the case being caught.
+  assert.doesNotMatch(
+    expr,
+    /last_sweep_timestamp_seconds/,
+    "coverage and liveness are independent; this alert must not read the liveness gauge",
+  );
+
+  // Capacity, not an outage: allowVolumeExpansion is true on the storage
+  // class, so the terminal form is an operator resizing a PVC.
+  assert.match(block, /severity: warning/, "the coverage gap is a capacity warning, not a page");
+  assert.match(block, /runbook_url:/, "the alert must link its runbook");
+});
+
 test("PaperclipIsolationWorkspaceReaperStopped is gauge-keyed, dry_run-collapsed, and links its runbook (BLO-36814)", () => {
   const rendered = renderChart(["--set", "prometheusRule.enabled=true"]);
 

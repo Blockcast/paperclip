@@ -1964,6 +1964,60 @@ spec:
             summary: "Paperclip isolation-workspace reaper (dry_run={{`{{ $labels.dry_run }}`}}) has not completed a sweep in over {{ .Values.prometheusRule.isolationWorkspaceReaperStaleSeconds }}s"
             description: "paperclip_isolation_workspace_reaper_last_sweep_timestamp_seconds has not advanced in {{`{{ $value | printf \"%.0f\" }}`}}s (BLO-36814). This gauge advances at the END of every sweep including one that deletes nothing, so a stall means the sweep is not running -- not that the tree is clean. While it is stalled, data/k8s-isolation/workspaces/ grows unreclaimed on the CephFS ssd-fast pool that produced BLO-31222's write-block incident (0 -> 406.7 GiB in ~2 months with no reaper). Check the worker StatefulSet still has PAPERCLIP_ISOLATION_WORKSPACE_REAPER_ENABLED=true, then grep worker logs for 'isolation-workspace reaper sweep failed'. If the reaper was deliberately disabled, this series stops being scraped and the alert resolves on its own -- it does not need silencing."
             runbook_url: {{ .Values.prometheusRule.isolationWorkspaceReaperRunbookUrl | quote }}
+        - alert: PaperclipIsolationWorkspaceReaperCoverageGap
+          # PEN-5125. The sibling alert above asks whether the sweep RAN. This
+          # one asks what it could REACH, and the two are independent: a sweep
+          # can tick on schedule, delete, and report stop_reason="complete"
+          # while an unbounded share of the population is on a volume this
+          # process has no mount on.
+          #
+          # That is not a hypothetical shape of failure, it is the enumeration
+          # order. The reaper lists directories and then asks the database about
+          # the names it found, so a workspace whose bytes live on another claim
+          # is never queried, lands in NO outcome bucket, and leaves the
+          # documented `scanned` identity exactly true over a shrunken
+          # population. Every counter stays internally consistent and wrong.
+          #
+          # BLO-36814's `root_absent` stop reason does not cover this, despite
+          # being written for "an enabled reaper pointed at a WRONG path". It
+          # fires on ENOENT of the root, and the gap here leaves the root
+          # PRESENT and populated by every agent still on the shared claim.
+          #
+          # != 0, not > 0, and the asymmetry is the point: -1 is the probe
+          # being absent or faulting, i.e. a sweep that cannot describe its own
+          # coverage. Operationally that is the same state as a known-partial
+          # sweep -- both mean the other series on the dashboard describe a
+          # subset of unknown size -- so folding them into one condition is
+          # correct rather than lazy. A `> 0` rule would go quiet exactly when
+          # the probe broke.
+          #
+          # No `for:` beyond a short debounce and no absence companion. The
+          # gauge is written on EVERY sweep including the root-absent one, so
+          # it cannot flap between ticks; and like its sibling, absence here is
+          # the ordinary state of a deployment with the reaper turned off.
+          #
+          # ⚠️ Severity is `warning` and the summary says capacity, not outage.
+          # `allowVolumeExpansion` is true on the storage class, so the terminal
+          # form of this is an operator resizing a PVC -- NOT a run losing data.
+          # Do not escalate it on the strength of the GiB figure alone.
+          #
+          # ⚠️ This rule does NOT deploy on Blockcast: `prometheusRule.enabled`
+          # is false in values.blockcast.yaml (verified 2026-10-31). Landing it
+          # here is necessary and NOT sufficient -- it must also be ported to
+          # Blockcast/onprem-k8s, the same obligation this file's header records
+          # for PaperclipIsolationWorkspaceReaperStopped, which landed here
+          # first and nowhere else. Do not report "the alert exists" off this
+          # file; verify at /api/v1/rules.
+          expr: max by (dry_run) (paperclip_isolation_workspace_reaper_unreachable_agents) != 0
+          for: {{ .Values.prometheusRule.isolationWorkspaceReaperCoverageGapFor }}
+          labels:
+            severity: warning
+            service: paperclip
+            signal: isolation_workspace_reaper
+          annotations:
+            summary: "Paperclip isolation-workspace reaper (dry_run={{`{{ $labels.dry_run }}`}}) cannot reach every agent's tree"
+            description: "paperclip_isolation_workspace_reaper_unreachable_agents is {{`{{ $value | printf \"%.0f\" }}`}} (PEN-5125). A positive value is that many agents whose Job mounts a claim this process does not -- an operator workspaceVolumeClaim, or PEN-4932 stage 4b's per-agent claim -- so their data/k8s-isolation/workspaces/ trees are reclaimed by NOTHING and grow at the rate this reaper exists to contain (0 -> 406.7 GiB fleet-wide in ~2 months, ~10 GiB/agent/month). -1 means the coverage probe was absent or threw, so this sweep cannot describe its own coverage at all. Either way, every other reaper series describes a SUBSET of the population and stop_reason=complete does not contradict that. This is capacity, not an outage: allowVolumeExpansion is true, so it surfaces as a PVC resize rather than a run losing data."
+            runbook_url: {{ .Values.prometheusRule.isolationWorkspaceReaperRunbookUrl | quote }}
     - name: paperclip-orphan-reap-wait-bound
       rules:
         - alert: PaperclipOrphanReapWaitBoundExceeded
