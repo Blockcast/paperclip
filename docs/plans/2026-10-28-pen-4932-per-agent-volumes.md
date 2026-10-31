@@ -735,14 +735,21 @@ PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verificati
      different processes, and a second transcription of the age rule is the
      likeliest way the foreign-claim path ends up deleting on `mtime` alone.
 
-     ⚠️ **Nothing calls it yet, so no foreign claim is reclaimed and the capacity
-     clause on `resolveAgentWorkspaceClaimName` stays.** What remains in PEN-5151
-     is the executor: a Job mounting the foreign claim that reports an inventory,
-     receives a plan, and unlinks — re-checking `REAPABLE_LAYOUT` and
-     `hasNestedCheckout` against the bytes first, because both exist to retain
-     and neither can be answered from a report by the party asking permission to
-     delete. Two consequences of the split are already known and are design
-     constraints on that executor, not surprises to discover in it:
+     **The executor's two ends have since landed too**, in the same module and
+     for the same reason the age rule is shared: `collectIsolationWorkspaceInventory`
+     (readdir + stat, no judgement) and `executeIsolationReclaimPlan`, which
+     re-asks `REAPABLE_LAYOUT` and `hasNestedCheckout` against the bytes
+     immediately before each unlink. Those two are the SAME functions the mounted
+     sweep runs, not a second implementation — the foreign path's characteristic
+     failure is a weaker transcription of a rule that exists to keep files, and
+     co-locating them is what makes that impossible rather than merely discouraged.
+
+     ⚠️ **What is still missing is the TRANSPORT, so no foreign claim is reclaimed
+     and the capacity clause on `resolveAgentWorkspaceClaimName` stays.** Nothing
+     creates a Job, nothing carries an inventory back, nothing carries a plan out.
+     What a foreign claim lacks now is a pod that mounts it, not a decision about
+     what to do once mounted. Two consequences of the split were design
+     constraints on those two ends, and are recorded as answered rather than open:
 
      - **`execution_workspaces` has no agent column**, so a plan cannot be scoped
        to one agent's claim from the rows alone. The intersection has to happen
@@ -752,10 +759,28 @@ PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verificati
        mounted sweep re-reads `lastUsedAt` immediately before `fs.rm` because
        restoring a workspace changes neither the root's existence, nor its
        layout, nor its `mtime`. A plan crossing into another process cannot do
-       that, so the executor has to bound its own staleness instead — a short
-       `activeDeadlineSeconds` and a plan built immediately before the Job, or a
-       re-confirmation channel. Whichever is chosen must be stated, because the
-       window is the one property this split genuinely weakens.
+       that, so the executor has to bound its own staleness instead. **Chosen and
+       enforced: `DEFAULT_MAX_PLAN_AGE_MS`, 10 minutes, re-checked PER ENTRY**,
+       with the remainder handed back as `notAttempted` /
+       `stopReason: "plan_stale"`. Per entry rather than once at start-up because
+       the unlink loop is the slow part — `maxDeletes` removals against an MDS
+       measured at 145 files/s can run for minutes, which is exactly the window
+       the mounted sweep's per-entry re-read closes. A Job's
+       `activeDeadlineSeconds` does **not** cover this and must not be read as if
+       it did: it starts counting at pod start, leaving admission, scheduling and
+       image pull — the unbounded part — outside the measurement. This remains
+       strictly weaker than a re-read, and is recorded as such: it bounds the
+       window in which a resurrection could go unseen, where the mounted sweep
+       observes the resurrection itself.
+
+     A **fourth** reclaimer shape was weighed while building these ends and is
+     refused, recorded beside the three in PEN-5151: *hand the executor a
+     fleet-wide list of every idle workspace id and let it intersect against its
+     own `readdir`.* It collapses the round trip, and the per-tick bound survives
+     if applied at the unlink site. It is refused on disclosure, not mechanism —
+     that list is every idle workspace id in the fleet, across every company,
+     handed to a pod that exists to hold ONE agent's volume, which widens blast
+     radius in the direction this whole stage exists to narrow.
 
      ⚠️ **The gate does NOT make done-when 1 met.** The criterion is two agent pods on one node
      reporting distinct volume IDs, which needs invariant 5 closed, the server rolled onto this

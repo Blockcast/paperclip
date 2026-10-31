@@ -148,12 +148,32 @@
  * actually there, and the unlink — and re-checks layout and nested checkouts
  * against the bytes before removing anything.
  *
- * ⛔ It is NOT wired to an executor yet, and nothing calls it on the reap path.
- * Landing the decision half reviewed and inert ahead of the Job that consumes
- * it is the posture `workspace-pvc.ts` took for the claim itself, and for the
- * same reason: the half that decides what gets deleted is the half worth
- * reviewing on its own. Until that executor exists a foreign claim is still
- * unreclaimed, and `unreachableAgents` is still the standing record of it.
+ * `collectIsolationWorkspaceInventory` and `executeIsolationReclaimPlan` are
+ * the executor's two ends, and they live here rather than in the executor so
+ * that `isReapableLayout` and `hasNestedCheckout` are the SAME code the mounted
+ * sweep runs. That is the same argument `classifyIsolationWorkspaceAge` is
+ * extracted on, applied to the retention checks: the foreign path's failure
+ * mode is a second, weaker transcription of a rule that exists to keep files.
+ *
+ * ⛔ The TRANSPORT between them is still missing — nothing creates a Job, and
+ * nothing calls either end on the reap path. What a foreign claim still lacks
+ * is a pod that mounts it, not a decision about what to do once mounted. Until
+ * that exists a foreign claim is unreclaimed and `unreachableAgents` is still
+ * the standing record of it.
+ *
+ * A fourth shape was weighed while building these two ends and is refused, so
+ * it is recorded beside the other three: *hand the executor a fleet-wide list
+ * of every idle workspace id and let it intersect against its own `readdir`.*
+ * It is tempting because it collapses the round trip — one Job, no inventory
+ * report — and the per-tick bound survives if it is applied at the unlink site,
+ * which is where MDS pressure is actually produced. It is refused on disclosure,
+ * not on mechanism: that list is every idle workspace id in the fleet, across
+ * every company, handed to a pod that exists to hold ONE agent's volume. A
+ * per-agent claim is a blast-radius reduction, and this would widen in the
+ * opposite direction for a round trip's worth of latency on a daily sweep. The
+ * inventory also keeps the operator surface honest — `inventorySize` and its
+ * buckets describe THAT volume, where a fleet-wide list would report mostly
+ * about volumes the executor never saw.
  *
  * See `docs/plans/2026-10-28-pen-4932-per-agent-volumes.md` §4 stage 4b.
  */
@@ -771,6 +791,335 @@ export async function buildIsolationReclaimPlan(input: {
   plan.truncated = plan.droppedByBound > 0;
   plan.eligibleIds = aged.slice(0, maxEntries).map((entry) => entry.name);
   return plan;
+}
+
+/**
+ * Default ceiling on how stale a plan may be at the moment of an unlink.
+ *
+ * The mounted sweep protects a live workspace by re-reading `lastUsedAt`
+ * immediately before each `fs.rm`. **No analogue of that read exists here**, and
+ * no other check substitutes for it: a run resuming a long-idle workspace
+ * refreshes the row and writes *under* `home`/`session`, which changes the
+ * root's existence not at all, its top-level layout not at all, and its `mtime`
+ * not at all. So the executor cannot detect a resurrection — it can only refuse
+ * to act on a verdict old enough for one to have happened.
+ *
+ * That makes plan age the executor's whole safety margin, and it is why this is
+ * checked per entry rather than once at start-up. The unlink loop is the slow
+ * part: `maxDeletes` removals against an MDS measured at 145 files/s serial can
+ * run for minutes, which is exactly the window the mounted sweep's per-entry
+ * re-read exists to close. A single check at the top would bound the moment the
+ * executor *started* and leave that window wide open, which is the shape of
+ * bound that reads as protection and is not.
+ *
+ * Ten minutes is chosen against both ends. It must exceed the ordinary distance
+ * between "plan built" and "pod running" — Job admission, scheduling, image
+ * pull — or a healthy sweep refuses itself and the tree is never reclaimed;
+ * that failure is quiet, because refusing is also what a correct stale-plan
+ * refusal looks like. It must stay comparable to the mounted sweep's own
+ * snapshot-to-unlink window, which is minutes, or the foreign path is running a
+ * materially weaker predicate than the one it claims to share.
+ *
+ * A Job's `activeDeadlineSeconds` does NOT cover this and must not be mistaken
+ * for it: it starts counting when the pod starts, so it bounds execution time
+ * while leaving queueing and image pull — the unbounded part — outside the
+ * measurement entirely.
+ */
+export const DEFAULT_MAX_PLAN_AGE_MS = 10 * 60_000;
+
+/**
+ * Enumerate a claim the control plane cannot walk, as an executor can (PEN-5151).
+ *
+ * The inventory half of the handoff: this is everything the decision in
+ * `buildIsolationReclaimPlan` needs that only a process holding the volume can
+ * supply. It is deliberately dumb — one `readdir`, one `stat` each, no
+ * judgement — because every judgement that can be made from the database
+ * belongs on the other side of the boundary.
+ *
+ * Names are reported as found, including names that are not workspace ids. The
+ * plan refuses those (`skippedUnsafeName`) and counts them, and that count is
+ * the only way an operator learns a foreign claim is accumulating directories
+ * nothing can resolve. Filtering here would delete the evidence rather than the
+ * directory.
+ *
+ * Faults are per entry and never fatal, matching the mounted sweep: a directory
+ * that vanishes between the `readdir` and its `stat` is simply absent from the
+ * inventory, where it reads as a directory that no longer needs reclaiming —
+ * which is true. An absent root yields an empty inventory for the same reason
+ * the sweep treats it as the normal case on a deployment with no isolation tree.
+ */
+export async function collectIsolationWorkspaceInventory(
+  root: string,
+): Promise<IsolationWorkspaceInventoryEntry[]> {
+  let entries;
+  try {
+    entries = await fs.readdir(root, { withFileTypes: true });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw err;
+  }
+
+  const inventory: IsolationWorkspaceInventoryEntry[] = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    try {
+      const stat = await fs.stat(path.join(root, entry.name));
+      inventory.push({ name: entry.name, mtimeMs: stat.mtimeMs });
+    } catch {
+      // Vanished or unreadable between the listing and the stat. Omitted rather
+      // than reported with a sentinel `mtimeMs`: the plan's finiteness guard
+      // would refuse it anyway, and a missing entry is the honest description.
+      continue;
+    }
+  }
+  return inventory;
+}
+
+/** Why an execution stopped before it had considered every planned id. */
+export type IsolationReclaimStopReason = "complete" | "capped" | "plan_stale";
+
+/** What an executor did with the plan it was given, and what it refused. */
+export interface IsolationReclaimExecutionResult {
+  /** Plan entries received. The denominator for every counter below. */
+  requested: number;
+  /** Directories unlinked. Always 0 under `dryRun`. */
+  deleted: number;
+  /**
+   * Passed every check and reached the unlink, under `dryRun`. Always 0 on a
+   * live pass.
+   *
+   * Kept apart from both `deleted` and `notAttempted` so the identity below is a
+   * real partition in either mode. Folding a dry run's outcome into
+   * `notAttempted` would make a successful preview indistinguishable from a
+   * plan the executor refused — and refusal is the one outcome on this path an
+   * operator has to be able to see.
+   */
+  wouldDelete: number;
+  /**
+   * Refused at this end because the name is not a workspace id.
+   *
+   * The plan already refused these, so in a healthy pipeline this is always 0 —
+   * and it is checked again anyway, because this is the process that calls
+   * `fs.rm`. A name validated once at the producer is an unvalidated name at the
+   * point of damage; the two checks are not redundant, they bracket a transport.
+   */
+  skippedUnsafeName: number;
+  /** Top level was not exactly `REAPABLE_LAYOUT`. Property 1, re-asked here. */
+  skippedLayout: number;
+  /** Layout-compliant but holding a checkout one level down. */
+  retainedNestedCheckout: number;
+  /** Gone before this executor reached it — the concurrency-tolerant case. */
+  vanished: number;
+  /** A fault that was neither absence nor a refusal. */
+  failed: number;
+  /**
+   * Planned entries never examined, because the per-tick bound was reached or
+   * the plan went stale mid-loop. Not a refusal of those directories — they are
+   * offered again on the next tick, and the plan's ordering is what makes that
+   * progress rather than a loop over the same head.
+   */
+  notAttempted: number;
+  /** `notAttempted` was produced by the bound. */
+  capped: boolean;
+  /**
+   * Why the loop ended. `plan_stale` is the one that wants an operator: it means
+   * the distance from plan to unlink exceeded `maxPlanAgeMs`, so the executor
+   * refused the remainder rather than act on a verdict old enough for a
+   * workspace to have been resurrected under it.
+   */
+  stopReason: IsolationReclaimStopReason;
+}
+
+/**
+ * The unlink half of the handoff — the executor's end (PEN-5151).
+ *
+ * Runs where the bytes are, against a claim the control plane does not mount.
+ * It receives `eligibleIds` from `buildIsolationReclaimPlan` and treats each as
+ * **permission to consider a directory, never an instruction to remove one**:
+ * the two retention checks that can only be answered from the filesystem —
+ * `isReapableLayout` and `hasNestedCheckout` — are asked here, immediately
+ * before the unlink, exactly as the mounted sweep asks them. They are the same
+ * functions, not a second implementation, which is the point of this living in
+ * this module.
+ *
+ * ## The property this half does NOT have
+ *
+ * The mounted sweep re-reads `lastUsedAt` per directory immediately before
+ * `fs.rm`, and that read is the only thing standing between a resurrected
+ * workspace and deletion underneath a live run. An executor with no database
+ * cannot take it, and giving it one would move every deletion decision onto the
+ * volume being deleted — the thing the split exists to avoid.
+ *
+ * So the margin is time, and it is enforced rather than assumed: every entry is
+ * attempted only while the plan is younger than `maxPlanAgeMs`, and the
+ * remainder is handed back as `notAttempted` with `stopReason: "plan_stale"`.
+ * This is strictly weaker than a re-read and is recorded as such — it bounds the
+ * window in which a resurrection could go unseen, where the mounted sweep
+ * observes the resurrection itself. See `DEFAULT_MAX_PLAN_AGE_MS`.
+ *
+ * ## Accounting
+ *
+ * Every planned id lands in exactly one bucket, so
+ * `requested === deleted + wouldDelete + skippedUnsafeName + skippedLayout +
+ * retainedNestedCheckout + vanished + failed + notAttempted`. Held by a test,
+ * for the reason the plan's own identity is: this result and the plan are the
+ * entire operator surface for a volume nobody can walk, and a count that looks
+ * complete over a population it is not is the exact failure PEN-5125 filed.
+ */
+export async function executeIsolationReclaimPlan(options: {
+  root: string;
+  eligibleIds: ReadonlyArray<string>;
+  /** When the plan's database snapshot was taken, as epoch ms. */
+  planBuiltAtMs: number;
+  maxPlanAgeMs?: number;
+  maxDeletes?: number;
+  dryRun?: boolean;
+  now?: () => number;
+  logger?: typeof defaultLogger;
+}): Promise<IsolationReclaimExecutionResult> {
+  const now = options.now ?? Date.now;
+  const log = options.logger ?? defaultLogger;
+  const maxDeletes = options.maxDeletes ?? DEFAULT_MAX_DELETES_PER_TICK;
+  const maxPlanAgeMs = options.maxPlanAgeMs ?? DEFAULT_MAX_PLAN_AGE_MS;
+
+  const result: IsolationReclaimExecutionResult = {
+    requested: options.eligibleIds.length,
+    deleted: 0,
+    wouldDelete: 0,
+    skippedUnsafeName: 0,
+    skippedLayout: 0,
+    retainedNestedCheckout: 0,
+    vanished: 0,
+    failed: 0,
+    notAttempted: 0,
+    capped: false,
+    stopReason: "complete",
+  };
+
+  // Same fail-open shape the plan's `mtimeMs` guard refuses, in the one place
+  // it would be worst: `planBuiltAtMs` crosses the same serialization boundary,
+  // and a missing, null, NaN or string value makes `now() - planBuiltAtMs >
+  // maxPlanAgeMs` FALSE — which is the PERMISSIVE branch. An executor handed a
+  // plan with no timestamp would therefore treat it as eternally fresh and
+  // unlink the lot, having disabled the only safety margin this half has. Both
+  // operands are checked, since a non-finite ceiling fails the same way.
+  if (!Number.isFinite(options.planBuiltAtMs) || !Number.isFinite(maxPlanAgeMs)) {
+    result.notAttempted = options.eligibleIds.length;
+    result.stopReason = "plan_stale";
+    log.error(
+      { root: options.root, planBuiltAtMs: options.planBuiltAtMs, maxPlanAgeMs },
+      "isolation reclaim executor refused a plan carrying no usable staleness bound; " +
+        "nothing was examined",
+    );
+    return result;
+  }
+
+  // Counts entries that reached the unlink point, whatever happened there, so
+  // the bound caps work a live pass would perform rather than unlinks that
+  // succeeded — the mounted sweep caps on `eligible` for the same reason, and it
+  // is what makes a dry run stop at the directory a live run would.
+  let unlinkAttempts = 0;
+  for (let i = 0; i < options.eligibleIds.length; i += 1) {
+    const name = options.eligibleIds[i] as string;
+
+    // Re-checked per entry, not once at the top: the loop below is the slow
+    // part, so a single check would bound the wrong interval. See
+    // `DEFAULT_MAX_PLAN_AGE_MS`.
+    if (now() - options.planBuiltAtMs > maxPlanAgeMs) {
+      result.notAttempted = options.eligibleIds.length - i;
+      result.stopReason = "plan_stale";
+      log.warn(
+        {
+          root: options.root,
+          planAgeMs: now() - options.planBuiltAtMs,
+          maxPlanAgeMs,
+          deleted: result.deleted,
+          notAttempted: result.notAttempted,
+        },
+        "isolation reclaim executor stopped on a stale plan; the remaining ids were not examined " +
+          "because their idle verdict is old enough that a workspace could have been resumed under it",
+      );
+      break;
+    }
+
+    if (!UUID_PATTERN.test(name)) {
+      // Unreachable from a plan this repo built, and checked anyway — see
+      // `skippedUnsafeName`. Logged at error because it means the transport, not
+      // the volume, is wrong.
+      result.skippedUnsafeName += 1;
+      log.error(
+        { root: options.root },
+        "isolation reclaim executor refused a planned entry whose name is not a workspace id",
+      );
+      continue;
+    }
+
+    if (unlinkAttempts >= maxDeletes) {
+      result.notAttempted = options.eligibleIds.length - i;
+      result.capped = true;
+      result.stopReason = "capped";
+      break;
+    }
+
+    const dir = path.join(options.root, name);
+
+    let children: string[];
+    try {
+      children = await fs.readdir(dir);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") result.vanished += 1;
+      else {
+        result.failed += 1;
+        log.error({ err, dir }, "isolation reclaim executor could not read a planned workspace");
+      }
+      continue;
+    }
+
+    if (!isReapableLayout(children)) {
+      result.skippedLayout += 1;
+      log.warn(
+        { dir, layout: [...children].sort() },
+        "isolation reclaim executor skipped a planned directory outside the layout allowlist",
+      );
+      continue;
+    }
+
+    if (await hasNestedCheckout(dir)) {
+      result.retainedNestedCheckout += 1;
+      log.warn(
+        { dir },
+        "isolation reclaim executor retained a layout-compliant directory holding a nested git checkout",
+      );
+      continue;
+    }
+
+    unlinkAttempts += 1;
+
+    if (options.dryRun) {
+      log.info({ dir }, "isolation reclaim executor would remove a planned workspace (dry run)");
+      result.wouldDelete += 1;
+      continue;
+    }
+
+    try {
+      // No `force`, for the sweep's reason: a directory that vanished must raise
+      // ENOENT and be counted, not be reported as a deletion that happened.
+      await fs.rm(dir, { recursive: true });
+      result.deleted += 1;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") result.vanished += 1;
+      else {
+        result.failed += 1;
+        log.error({ err, dir }, "isolation reclaim executor failed to remove a planned workspace");
+      }
+    }
+  }
+
+  log.info(
+    { root: options.root, dryRun: options.dryRun === true, maxPlanAgeMs, ...result },
+    "isolation reclaim execution complete",
+  );
+  return result;
 }
 
 function isReapableLayout(entries: string[]): boolean {
