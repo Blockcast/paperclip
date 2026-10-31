@@ -376,10 +376,15 @@ import {
   // calls `buildJobManifest`, and the answer is the builder's own claim
   // precedence. Imported rather than re-derived so the two cannot drift.
   resolveDataClaimName,
+  // PEN-4932 stage 4b: the per-agent claim's GATE and NAME. Same reason again —
+  // this process provisions the claim the builder will mount, so the two must
+  // read the same derivation or the Job mounts a claim nothing created.
+  resolveAgentWorkspaceClaimName,
   serverHoldsJobDataClaim,
   type JobIsolation,
   type PromptBundleSecret,
 } from "./job-manifest.js";
+import { ensureAgentWorkspacePvc } from "./workspace-pvc.js";
 import type * as k8s from "@kubernetes/client-node";
 import { PatchStrategy, setHeaderOptions } from "@kubernetes/client-node";
 
@@ -2942,6 +2947,69 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     };
   }
 
+  // PEN-4932 stage 4b — the per-agent workspace claim.
+  //
+  // Every agent Job today mounts ONE RWX CephFS claim, so every agent pod on a
+  // node shares a single ceph-csi volume handle; ceph-csi serialises per volume
+  // ID and its `NodeUnstageVolume` hold is an uninterruptible kernel `umount`
+  // with no timeout, so one wedged unstage strands every agent pod on that node
+  // (3 independent wedges in 30h at the measured baseline). Distinct claims get
+  // distinct CephFS subvolumes and therefore distinct handles, which confines a
+  // wedge to one agent.
+  //
+  // Provisioned HERE rather than in the manifest builder because the builder is
+  // pure and this is two Core API calls. The NAME comes from the same pure
+  // derivation the builder uses (`resolveAgentWorkspaceClaimName`), so the claim
+  // this creates and the claim the Job mounts cannot be different objects.
+  //
+  // Returns "" for every agent not opted in, and then this whole block is a
+  // single boolean test — no API call, no behaviour change.
+  const agentWorkspaceClaim = resolveAgentWorkspaceClaimName({ config, agentId });
+  if (agentWorkspaceClaim) {
+    try {
+      // Storage class and capacity are deliberately NOT exposed as config
+      // keys. `ensureAgentWorkspacePvc` accepts both, and the defaults it
+      // applies are measured (`cephfs`, `50Gi` ≈ 4x the ≈13.2 G per-company
+      // steady state) rather than picked — but a key read from the MERGED run
+      // config is reachable from an issue-scope overlay, and these two are read
+      // only on the CREATE path, so the first opted-in run would fix whatever
+      // an overlay happened to say. `allowVolumeExpansion` is true on the class,
+      // so an operator who needs a different size can expand the claim without
+      // a config key existing for anyone else to set.
+      await ensureAgentWorkspacePvc({
+        agentId,
+        namespace: guardNamespace,
+        kubeconfigPath,
+      });
+    } catch (err) {
+      // Fail the run, and do NOT fall back to the shared claim. Two reasons,
+      // and the second is the one that matters: a silent fallback would mount
+      // the very volume the opt-in exists to leave, so the blast radius this
+      // change exists to cut would be quietly restored on exactly the runs
+      // where something was already wrong; and the pod would come up with a
+      // prompt bundle delivered for the OTHER claim shape, since
+      // `promptBundleNeedsSecretDelivery` below is resolved from the claim we
+      // are refusing to abandon. Mounting a claim that does not exist is not an
+      // option either — the pod would sit `Pending` on an unbound PVC with no
+      // run-level error to read.
+      const msg = err instanceof Error ? err.message : String(err);
+      await onLog(
+        "stderr",
+        `[paperclip] Cannot provision the per-agent workspace claim ${agentWorkspaceClaim} in ${guardNamespace}: ${msg}\n`,
+      );
+      // No explicit mutex release: this return is inside the guard+create `try`
+      // whose `finally` releases it, exactly like the two concurrency-guard
+      // returns above.
+      return {
+        exitCode: null,
+        signal: null,
+        timedOut: false,
+        errorMessage: `Per-agent workspace claim ${agentWorkspaceClaim} unavailable: ${msg}`,
+        errorCode: "k8s_agent_workspace_pvc_failed",
+      };
+    }
+  }
+
   // Prepare the prompt bundle (skills + instructions) on the server filesystem.
   // One volume, TWO mount points: this process writes at
   // `SELF_POD_DATA_MOUNT_PATH` and the K8s Job pod reaches the same bytes at
@@ -3100,6 +3168,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     !serverHoldsJobDataClaim({
       dataClaimName: resolveDataClaimName({
         workspaceVolumeClaim: config.workspaceVolumeClaim,
+        agentWorkspaceClaimName: agentWorkspaceClaim,
         selfPodPvcClaimName: selfPod.pvcClaimName,
       }),
       selfPodPvcClaimName: selfPod.pvcClaimName,
@@ -3119,7 +3188,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // exists so it fails with a typed `errorCode` and the measured detail, which
     // is what §4.2's escalation and the skill-health sweeps can actually read.
     // See the catch itself for why only the five deliberate refusals are claimed.
-    // Bound to a const first: `promptBundleProjection` is a `let` that has to
+    // Bound to a local first: `promptBundleProjection` is a `let` that has to
     // outlive this block to reach `buildJobManifest`, and TypeScript drops the
     // non-null narrowing across the `await` boundary below.
     let projection: PromptBundleSecretProjection | null;

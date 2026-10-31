@@ -1936,9 +1936,19 @@ export function shouldScheduleAutomaticRunRetry(
   // treated it as a recoverable infra fault everywhere except the one place that
   // could recover it. Same issue/PR-review scoping as its sibling; it takes the
   // default bounded transient backoff from resolveAutomaticRunRetryOpts.
+  //
+  // PEN-4932 stage 4b adds a third literal by the same argument.
+  // `k8s_agent_workspace_pvc_failed` is the adapter refusing to build a Job
+  // whose per-agent workspace claim it could not establish — also fail-closed,
+  // also before the prompt bundle and before any Job exists, so also zero work
+  // done and safe to re-dispatch. A transient K8s API failure on the claim read
+  // is the expected cause. Enrolled at the sibling's OTHER site too
+  // (ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES); see the comment there for why
+  // mirroring, rather than re-deriving a class, is the rule applied.
   if (
     run.errorCode === "k8s_concurrent_run_blocked" ||
-    run.errorCode === "k8s_concurrency_guard_unreachable"
+    run.errorCode === "k8s_concurrency_guard_unreachable" ||
+    run.errorCode === "k8s_agent_workspace_pvc_failed"
   ) {
     return isIssueRun || isPrReviewRetryContext(contextSnapshot);
   }
@@ -2831,6 +2841,30 @@ function withAgentScopedEnvProvenance(
 // attempt at the call site (see agentScopeOnlyConfigKeyOverrides).
 const AGENT_SCOPE_ONLY_CONFIG_KEYS = new Set([
   "enableGitHubPublishBroker",
+  // PEN-4932 stage 4b. Decides WHICH VOLUME the Job mounts: the shared
+  // `paperclip-data` claim, or `agent-workspace-<agentId>`. It qualifies on two
+  // of the three tests above, and the second is the one that settles it.
+  //
+  // `what uid runs it` — the claim's identity selects the seeder SHAPE
+  // (`selectSeedShape`, job-manifest.ts). On the server's own claim the pod
+  // gets one uid-0 `seed-writable-dirs` container; on any other claim it gets
+  // the PEN-4932 invariant-4 split, where uid 0 holds `CHOWN` over a single
+  // inode and everything else runs at uid 1000 under `drop: ALL`. So declining
+  // the key per-issue puts the broader-privileged shape back into the pod.
+  //
+  // `whether a refusal fires` — and here the DoS runs the OTHER way, which is
+  // why this is pinned rather than merely documented. Turning the key ON for an
+  // agent that does not run it moves that run onto a FRESH, EMPTY volume: no
+  // checkout, no worktrees, no pnpm store, and any uncommitted work in
+  // `wt/<companyId>` out of reach for the run. Anyone able to assign an issue
+  // could do that to any agent, once per issue, and the run would complete
+  // "successfully" having thrown away its workspace. It can also brick a
+  // dispatch outright: `selectSeedShape` THROWS on a non-server claim while any
+  // read-only subPath is declared.
+  //
+  // Agent scope is unaffected, which is where the rollout actually happens —
+  // this pin stops a LOWER scope reaching the key, in either direction.
+  "enablePerAgentWorkspaceVolume",
 ]);
 
 // PEN-5017, added in review. Keys pinned to agent scope ONLY WHEN the broker
