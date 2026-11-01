@@ -110,7 +110,7 @@ env:
     # Dex OIDC for Google Workspace SSO. Dex fronts Google so the ID token
     # includes Workspace `groups`; Paperclip uses those claims for company
     # membership grants. Register the Dex static client `paperclip` with:
-    #   redirectURI: https://paperclip.blockcast.net/api/auth/oauth2/callback/dex
+    #   redirectURI: https://paperclip.blockcast.net/api/auth/callback/dex
     # and create this namespace Secret out-of-band:
     #   kubectl -n paperclip create secret generic paperclip-dex-oidc \
     #     --from-literal=PAPERCLIP_DEX_OIDC_CLIENT_SECRET='<dex static client secret>'
