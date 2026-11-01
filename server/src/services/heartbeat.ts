@@ -11472,6 +11472,16 @@ function isHeartbeatRunTerminalStatus(
   );
 }
 
+/**
+ * BLO-51129: `pr_review:<owner>/<repo>:<n>` (buildPrReviewerTaskKey) → PR
+ * coordinates. Null for anything else, including the webhook's `unknown` repo
+ * placeholder, so callers never probe GitHub with a guessed repo.
+ */
+export function parsePrReviewTaskKey(taskKey: string | null | undefined) {
+  const match = /^pr_review:([^/:\s]+\/[^/:\s]+):(\d+)$/i.exec(taskKey ?? "");
+  return match ? { repoFullName: match[1], prNumber: Number(match[2]) } : null;
+}
+
 export function derivePaperclipPrReview(contextSnapshot: Record<string, unknown> | null | undefined) {
   if (!contextSnapshot) return null;
   const wakeReason = readNonEmptyString(contextSnapshot.wakeReason);
@@ -14990,7 +15000,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * `Reviewed head:` marker, never `reviews[].commit_id` (BLO-34666).
    */
   async function prReviewGateNoticeSuppression(
-    target: NonNullable<ReturnType<typeof resolvePrReviewGateStatusTarget>>,
+    // `sha: null` probes the PR's CURRENT head (githubHasReviewerEvidenceForPr
+    // fetches it), which is what the terminal-failed gauge asks (BLO-51129).
+    target: { repoFullName: string; prNumber: number; sha: string | null },
   ): Promise<"pull_request_closed" | "reviewer_evidence_found" | null> {
     try {
       const pr = await githubGetPullRequestGate({
@@ -23104,6 +23116,44 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : null;
     const contextSnapshot = parseObject(run.contextSnapshot);
     const issueId = readNonEmptyString(contextSnapshot.issueId);
+
+    // BLO-51129: a review of a closed PR can never produce output, so every
+    // retry ends `pr_review_output_missing` again. Measured on onprem-k8s#7132:
+    // a synchronize wake raced the human close by 22s and the chain re-drove
+    // four more paid runs. Checked before the exhaustion arm too, so a closed
+    // PR also gets no failed-gate status. A probe error falls through to the
+    // ordinary retry (the pre-BLO-51129 behaviour).
+    const prReviewCoordinates = (() => {
+      // Reviewer runs only: an author-side issue run on a closed PR may still
+      // have work (open a replacement), and the issue sweeps own its recovery.
+      if (!isPrReviewRetryContext(contextSnapshot)) return null;
+      const derived = derivePaperclipPrReview(contextSnapshot);
+      if (derived?.repoFullName) return { repoFullName: derived.repoFullName, prNumber: derived.prNumber };
+      return parsePrReviewTaskKey(run.contextTaskKey);
+    })();
+    if (prReviewCoordinates) {
+      const gate = await githubGetPullRequestGate(prReviewCoordinates).catch(() => null);
+      if (gate && !("error" in gate) && gate.state === "closed") {
+        await appendRunEvent(run, await nextRunEventSeq(run.id), {
+          eventType: "lifecycle",
+          stream: "system",
+          level: "info",
+          message: `Scheduled retry suppressed because ${prReviewCoordinates.repoFullName}#${prReviewCoordinates.prNumber} is closed`,
+          payload: {
+            retryReason,
+            ...(run.errorCode ? { errorCode: run.errorCode } : {}),
+            scheduledRetryAttempt: nextAttempt,
+            merged: gate.merged,
+          },
+        });
+        return {
+          outcome: "not_scheduled" as const,
+          reason: "Scheduled retry suppressed because the pull request is closed",
+          errorCode: "pr_review_pull_request_closed" as const,
+          issueId,
+        };
+      }
+    }
 
     if (!baseSchedule) {
       await appendRunEvent(run, await nextRunEventSeq(run.id), {
@@ -43255,6 +43305,55 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   ] as const;
 
   /**
+   * BLO-51129: GitHub-side resolution for unresolved `pr_review` rows. Measured
+   * 2026-11-01, every row behind the page needed no action: its PR was closed,
+   * or a trusted review already sat at the current head. Neither fact is in the
+   * DB, so the publisher asks GitHub, with the same predicate the failed-gate
+   * notice uses (`prReviewGateNoticeSuppression`, `sha: null` = current head).
+   *
+   * Bounded so a tick cannot fan out: oldest keys first (they set the paged
+   * age), at most PROBES_PER_TICK uncached probes, results cached for TTL. A
+   * probe error resolves nothing, so the failure direction is still "page".
+   */
+  const PR_REVIEW_NO_ACTION_PROBE_TTL_MS = 10 * 60 * 1000;
+  const PR_REVIEW_NO_ACTION_PROBES_PER_TICK = 10;
+  const prReviewNoActionProbeCache = new Map<string, { checkedAt: number; noAction: boolean }>();
+
+  async function selectNoActionPrReviewTaskKeys(cutoff: Date, now: Date): Promise<Set<string>> {
+    for (const [key, entry] of prReviewNoActionProbeCache) {
+      if (now.getTime() - entry.checkedAt >= PR_REVIEW_NO_ACTION_PROBE_TTL_MS) prReviewNoActionProbeCache.delete(key);
+    }
+    const taskKeyLower = sql<string | null>`lower(${agentWakeupRequests.payload} ->> 'taskKey')`;
+    const keys = await db
+      .select({ taskKey: taskKeyLower })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.status, "failed"),
+          gte(agentWakeupRequests.finishedAt, cutoff),
+          sql`coalesce(${agentWakeupRequests.payload} ->> 'taskKey' like 'pr\\_review:%', false)`,
+        ),
+      )
+      .groupBy(taskKeyLower)
+      .orderBy(sql`min(${agentWakeupRequests.finishedAt}) asc`);
+    const noAction = new Set<string>();
+    let probes = 0;
+    for (const { taskKey } of keys) {
+      if (!taskKey) continue;
+      const cached = prReviewNoActionProbeCache.get(taskKey);
+      if (!cached) {
+        const pr = parsePrReviewTaskKey(taskKey);
+        if (!pr || probes >= PR_REVIEW_NO_ACTION_PROBES_PER_TICK) continue;
+        probes += 1;
+        const verdict = await prReviewGateNoticeSuppression({ ...pr, sha: null });
+        prReviewNoActionProbeCache.set(taskKey, { checkedAt: now.getTime(), noAction: verdict !== null });
+      }
+      if (prReviewNoActionProbeCache.get(taskKey)?.noAction) noAction.add(taskKey);
+    }
+    return noAction;
+  }
+
+  /**
    * Re-derive the unresolved terminal-`failed` wake gauge from committed
    * `agent_wakeup_requests` rows (BLO-20255).
    *
@@ -43295,6 +43394,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   async function publishAgentWakeupTerminalFailedGauge(now: Date) {
     try {
       const cutoff = new Date(now.getTime() - TERMINAL_FAILED_WAKE_GAUGE_WINDOW_MS);
+      const noActionPrReviewTaskKeys = await selectNoActionPrReviewTaskKeys(cutoff, now);
+      // `coalesce(..., true)`: a null taskKey makes `not in` null, which would
+      // silently drop exactly the unmatchable rows this gauge must count.
+      const notNoActionPrReview = noActionPrReviewTaskKeys.size === 0
+        ? undefined
+        : sql`coalesce(lower(${agentWakeupRequests.payload} ->> 'taskKey') not in (${sql.join(
+          [...noActionPrReviewTaskKeys].map((key) => sql`${key}`),
+          sql`, `,
+        )}), true)`;
       const wakeTaskKey = sql<string | null>`${agentWakeupRequests.payload} ->> 'taskKey'`;
       // Scope must be decided in SQL, not in JS, so that the per-scope `limit`
       // discards rows from the scope it is budgeting rather than from whichever
@@ -43328,6 +43436,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               eq(agentWakeupRequests.status, "failed"),
               gte(agentWakeupRequests.finishedAt, cutoff),
               scope === "pr_review" ? isPrReviewTaskKey : not(isPrReviewTaskKey),
+              notNoActionPrReview,
             ),
           )
           .orderBy(desc(agentWakeupRequests.finishedAt))
@@ -43394,6 +43503,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             and(
               eq(agentWakeupRequests.status, "failed"),
               gte(agentWakeupRequests.finishedAt, cutoff),
+              notNoActionPrReview,
               sql`not exists (
                 select 1
                 from agent_wakeup_requests successor_wake

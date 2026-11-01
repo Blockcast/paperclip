@@ -2353,6 +2353,8 @@ export const KNOWN_RETRY_SCHEDULE_OUTCOMES = [
   "issue_review_participant_changed",
   "issue_cancelled",
   "issue_terminal_status",
+  // BLO-51129: a pr_review retry declined because the PR is closed/merged.
+  "pr_review_pull_request_closed",
   "other",
 ] as const;
 export type RetryScheduleOutcomeLabel = (typeof KNOWN_RETRY_SCHEDULE_OUTCOMES)[number];
@@ -4156,6 +4158,13 @@ export const KNOWN_TERMINAL_FAILED_WAKE_ERROR_CODES = [
   // its budget on a node whose container runtime stalled). Infra fault below
   // the agent, same disposition as `adapter_failed` / `process_lost`.
   "k8s_pod_schedule_failed",
+  // BLO-51129: the two PR-review completion-evidence codes. The reviewer ran
+  // but no review/skip evidence was found (`pr_review_output_missing`) or the
+  // evidence read itself failed (`pr_review_verification_unavailable`). Both
+  // were landing in `other`; measured 2026-11-01, every instance either had a
+  // review at the current head or was on a closed PR.
+  "pr_review_output_missing",
+  "pr_review_verification_unavailable",
 ] as const;
 
 export const UNKNOWN_TERMINAL_FAILED_WAKE_ERROR_CODE = "other";
