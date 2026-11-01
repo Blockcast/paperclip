@@ -61,10 +61,17 @@
  *      production post-deploy, and the one 0269 is structurally incapable of
  *      touching (no `body` predicate ⇒ no trigram index is reachable).
  *   D. shape C with the ORDER BY served from `issues.last_activity_at`
- *      instead of the `GREATEST(...)`. Quantifies the option the CTO has not
- *      yet picked; see the comment on PEN-3596 2026-10-30T14:04Z. ⛔ NOT a
- *      proposal to ship — one arm of that column (activity_log) is
- *      unmaintained, so D is NOT semantically equal to C.
+ *      instead of the `GREATEST(...)`. ⭐ UPDATED 2026-11-01 (PEN-5213): the
+ *      CTO picked this option and it is now the SHIPPED default ordering. The
+ *      "D is not semantically equal to C" caveat recorded below was true when
+ *      D was measured and is now closed: migration 0270 adds the missing
+ *      `activity_log` maintenance arm and repairs the accumulated drift, and
+ *      `issues-last-activity-at-activity-log-maintenance.test.ts` asserts the
+ *      column equals the (now deleted) expression on every maintenance path.
+ *   E. the `sortField=updated` ordering, before (E1) and after (E2) the same
+ *      repoint. This is the ONLY no-search ordering that
+ *      `issues_company_last_activity_idx` can serve: the default ordering
+ *      leads with the priority CASE, which that index does not carry.
  *
  * ── MEASURED 2026-10-30, at the seed counts this file's defaults produce ───
  *
@@ -179,6 +186,89 @@
  * path. A change that buys 18% on the read side while adding write
  * amplification on the write side needs a better argument than this number
  * supplies. ⛔ Nothing here has been shipped; the decision is still open.
+ *
+ * ⭐ BOTH of those caveats were CLOSED by PEN-5213 and are kept above as the
+ * state of knowledge on 2026-10-30, not as current advice. The decision was
+ * taken (D is now the shipped default ordering); migration 0270 adds the
+ * missing `activity_log` maintenance arm, so D IS semantically equal to C; and
+ * the write-amplification worry turned out to be smaller than stated — the bump
+ * is guarded by `last_activity_at < latest_at` and the dominant producer writes
+ * the activity row in the same transaction as the `issues` UPDATE it describes,
+ * where `now()` is fixed and the guard is therefore false. See the re-measure
+ * below, which also answers the question D could not: what the index buys when
+ * it is allowed to lead.
+ *
+ * ── RE-MEASURED 2026-11-01, PEN-5213, with D's ORDER BY SHIPPED ───────────
+ *
+ * Full `EXPLAIN (ANALYZE, BUFFERS)` output for every shape below is posted as
+ * the plan-shape artifact on PR #3229 (and on PEN-5213); only the readings are
+ * reproduced here. Re-run this file to regenerate it.
+ *
+ * Same defaults, same host class, same embedded Postgres 18.1. Actual counts
+ * were identical to the 10-30 run apart from noise (54,600 issues / 4,900 in
+ * the searched company; 1,255,800 comments, 125,580 matching globally and
+ * 11,270 in-company; 982,800 activity_log). A1 264 ms / A2 13,556 ms / B 913 ms
+ * — A2 is 1.6x the 10-30 figure and A1 1.2x, i.e. the host was slower this run,
+ * which matters for reading C and D against their 10-30 values but not for
+ * reading C against D or E1 against E2, which were taken minutes apart.
+ *
+ *   C  · default sort, GREATEST(...) ............. 628.6 ms   39,860 buffers
+ *   D  · default sort, last_activity_at .......... 341.2 ms      206 buffers
+ *   E1 · sortField=updated, GREATEST(...) ........ 375.5 ms   39,860 buffers
+ *   E2 · sortField=updated, last_activity_at ......  0.709 ms      4 buffers
+ *
+ * ⭐ THE ANSWER IS DIFFERENT ON THE TWO ORDERINGS, AND THAT IS THE RESULT.
+ *
+ * C -> D, the DEFAULT ordering: 1.84x, buffers 193x. The index is NOT chosen
+ * and the candidate-set scan is NOT gone — both plans are
+ * `Bitmap Index Scan on issues_company_identifier_search_idx` -> Bitmap Heap
+ * Scan materialising all 4,900 candidates -> `top-N heapsort`. It cannot be
+ * otherwise: the sort key leads with the priority CASE, and
+ * `issues_company_last_activity_idx` is `(company_id, last_activity_at DESC)`,
+ * which does not carry it. What D removes is the two correlated subqueries
+ * (SubPlan 2: 4,900 loops, 19,601 buffers; SubPlan 3: 4,900 loops, 20,053
+ * buffers). The ~335 ms residual is the Bitmap Heap Scan node itself (334.7 ms
+ * actual in D), and it is NOT I/O — `Heap Blocks: exact=203` in both, 206
+ * buffers in D, all hits. ⚠️ Say only that much. The plan does not break that
+ * node down, so it is *consistent with* CPU in the
+ * `substring(description, 1, 1200)` detoast over ~6KB of text per row, but it
+ * does not separate that from the two `origin_kind !~~` filter evaluations or
+ * from forming 4,900 tuples. The 2026-10-30 block above states the detoast
+ * attribution flatly; read that as the same inference, not as a measurement
+ * either. This reproduces the 10-30 reading that D is worth well under an
+ * order of magnitude on this ordering.
+ *
+ * E1 -> E2, `sortField=updated`: **530x, and a different plan**. Here
+ * last_activity_at leads, so the planner takes
+ * `Index Scan using issues_company_last_activity_idx` + `Incremental Sort`
+ * (`Presorted Key: last_activity_at`) and reads **16 rows, not 4,900** —
+ * buffers 39,860 -> 4. That is the top-N the row was asking about, and it is
+ * what "cost proportional to page size rather than candidate-set size" looks
+ * like when the index can lead.
+ *
+ * ⭐ SO THE INDEX DOES WANT EXTENDING, and E2 is the measurement that says what
+ * it would buy. To serve the DEFAULT ordering the index would have to lead with
+ * the priority expression —
+ * `(company_id, (CASE priority …), last_activity_at DESC, updated_at DESC, id DESC)`
+ * — a functional index, with `hidden_at` / `harness_kind` / `origin_kind` either
+ * as a partial predicate or left as a heap filter. The prize is not the sort —
+ * the top-N heapsort is already cheap. It is that an ordered index scan lets
+ * `LIMIT` stop before materialising 4,900 candidate rows at all, and that
+ * materialisation is where the whole 335 ms sits, whichever part of it
+ * dominates. E2 demonstrates exactly that collapse on the same rows, the same
+ * filters and the same `substring`: 16 rows read, 4 buffers, 0.709 ms. ⛔ NOT shipped here and NOT costed
+ * here: a functional index on `priority` adds write amplification to every
+ * priority change, the `origin_kind NOT LIKE` filters are not sargable so the
+ * scan must skip non-matching rows before it can stop, and neither of those was
+ * measured. File it with this plan attached rather than guessing the number.
+ *
+ * ⛔ Everything in the 2026-10-30 "what this does NOT license" paragraph still
+ * holds, unchanged: bloat, production cache occupancy, concurrency, a company
+ * larger than 4,900 issues and the unmeasured real `activity_log` size are all
+ * still untested, and C still does not reproduce the 30 s production timeout.
+ * PEN-5213 ships D because it removes the DEPENDENCE on that unexplained
+ * constant factor, not because this file reproduced it.
+ *
  */
 import postgres from "postgres";
 import { startEmbeddedPostgresTestDatabase, getEmbeddedPostgresTestSupport } from "./test-embedded-postgres.js";
@@ -514,7 +604,35 @@ async function main() {
                  OR issues.origin_kind LIKE 'plugin:%:operation:%')
       ORDER BY ${PRIORITY_ORDER} ASC, issues.last_activity_at DESC, issues.updated_at DESC, issues.id DESC
       LIMIT ${LIMIT}`;
-    results.push(await explain(sql, "D · NO-SEARCH ordered by issues.last_activity_at (NOT semantically equal to C)", noSearchMaterialized, [COMPANY]));
+    results.push(await explain(sql, "D · NO-SEARCH ordered by issues.last_activity_at (SHIPPED by PEN-5213)", noSearchMaterialized, [COMPANY]));
+
+    // ── E. the `sortField=updated` path, where last_activity_at LEADS ─────
+    // This is the only no-search ordering `issues_company_last_activity_idx`
+    // can serve, because the default ordering leads with priority and the
+    // index does not carry it. E1/E2 are the before/after of the same repoint
+    // on that path; if the index is ever extended, this is the pair that moves.
+    const sortedByActivity = (order: string) => `
+      SELECT issues.id, substring(issues.description, 1, 1200), issues.title, issues.status, issues.priority,
+             issues.updated_at, issues.last_activity_at
+      FROM issues
+      WHERE issues.company_id = $1
+        AND issues.hidden_at IS NULL AND issues.harness_kind IS NULL
+        AND NOT (issues.origin_kind LIKE 'plugin:%:operation'
+                 OR issues.origin_kind LIKE 'plugin:%:operation:%')
+      ORDER BY ${order} DESC, issues.updated_at DESC, issues.id DESC
+      LIMIT ${LIMIT}`;
+    results.push(await explain(
+      sql,
+      "E1 · NO-SEARCH sortField=updated · pre-PEN-5213 GREATEST(...) ORDER BY",
+      sortedByActivity(CANONICAL_LAST_ACTIVITY),
+      [COMPANY],
+    ));
+    results.push(await explain(
+      sql,
+      "E2 · NO-SEARCH sortField=updated · PEN-5213 issues.last_activity_at ORDER BY",
+      sortedByActivity("issues.last_activity_at"),
+      [COMPANY],
+    ));
 
     console.log(`\n${"=".repeat(78)}\nSUMMARY — execution ms (last of 3 runs)\n${"=".repeat(78)}`);
     for (const r of results) console.log(`  ${r.label.padEnd(72)} ${r.execution} ms`);

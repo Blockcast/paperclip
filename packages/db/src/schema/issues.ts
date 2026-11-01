@@ -115,11 +115,18 @@ export const issues = pgTable(
     hiddenAt: timestamp("hidden_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
-    // Materialized "last activity on this issue" timestamp. Maintained by DB
-    // triggers (see migration 0072_issues_last_activity_at.sql): mirrors
-    // updated_at on UPDATE, and bumps to comment.created_at on
-    // issue_comments insert. Used by inboxVisibleForUserCondition to make the
-    // archive predicate sargable.
+    // Materialized "last activity on this issue" timestamp, and the ONE
+    // definition of it (PEN-5213). Maintained by DB triggers: 0076 mirrors
+    // updated_at on insert/update and bumps to comment.created_at on
+    // issue_comments insert (rewritten statement-level by 0229); 0270 adds the
+    // activity_log arm, excluding the four local-inbox actions, and repairs the
+    // drift that accumulated while it was missing.
+    //
+    // Monotone non-decreasing by construction — every maintenance path is a
+    // `<`-guarded bump, and no path lowers it. Read by
+    // inboxVisibleForUserCondition (archive predicate, sargable) and by
+    // issueListOrderBy (issues-list ORDER BY). Do not reintroduce an inline
+    // GREATEST(...) second definition beside it.
     lastActivityAt: timestamp("last_activity_at", { withTimezone: true }).notNull().defaultNow(),
     // Last verdict from the artifact-evidence gate (BLO-4461). Written by
     // services/issues.ts on transitions to in_review. Phase 1 is warn-only:

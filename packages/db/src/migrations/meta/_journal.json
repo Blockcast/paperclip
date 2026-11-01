@@ -1828,6 +1828,13 @@
       "when": 1792003601477,
       "tag": "0269_issue_comments_company_scoped_trigram_search_index",
       "breakpoints": true
+    },
+    {
+      "idx": 270,
+      "version": "7",
+      "when": 1792003701477,
+      "tag": "0270_issues_last_activity_at_from_activity_log",
+      "breakpoints": true
     }
   ]
 }
