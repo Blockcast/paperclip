@@ -53,6 +53,15 @@ A declared outcome has not been observed, and the oldest such card is past
    "nobody is waiting any more" about a decision somebody *is* waiting on,
    which is the precise failure this feature exists to make visible.
 
+   "Leave it alone" is about the **card**, not about the row. Check whether
+   anyone is actually due to look: a target that is `blocked`, or `parked`
+   with a far-out `parkedUntil`, has no one scheduled to act, so the card
+   sits unobserved for the length of the park and the alert reports an age
+   nobody is working off. Observed on PEN-2145 (parked 3 weeks out, its
+   acceptance the last activity row on the issue 24 h later, despite
+   `continuationPolicy: wake_assignee_on_accept`). Leave the card alone and
+   go wake the row's owner — on a parked row a comment is usually enough.
+
 ### Finding the card without log access
 
 Step 1's log line is frequently unreachable, and not only for agents. It is
@@ -73,7 +82,28 @@ reads, no log access, no database access:
    ⚠ Subtract from the refresh time, **not** the scrape timestamp. This
    refresh runs on its own `minIntervalMs` (5 min) cadence, so the value is
    up to five minutes stale and the timestamp you derive lands a few minutes
-   late. Match approximately; do not expect it to be exact.
+   late.
+
+   Nothing exports that refresh time, so **bound it instead of guessing**.
+   Each replica refreshes on its own stagger, so query the series *without*
+   collapsing the replicas and use the spread:
+
+   - The replica reporting the **largest** age refreshed most recently, so
+     `scrape_ts − max(age)` is the tightest **upper** bound on the acceptance
+     instant, and one refresh period (300 s) earlier is the lower bound.
+   - Then *confirm* a candidate rather than eyeballing it: for a candidate
+     acceptance `t`, every replica's implied refresh `t + age_i` must fall in
+     `[scrape_ts − 300 s, scrape_ts]`. A wrong candidate pushes at least one
+     replica outside that window, so this is a check and not just an estimate.
+
+   Worked example (PEN-4645): ages `87619.094 / 87599.888 / 87452.287 /
+   87381.852` at scrape `2026-11-01T15:32:31Z` bound the acceptance to
+   `2026-10-31T15:07:12–15:12:12Z`; the candidate `15:11:45.590Z` implies
+   stalenesses of `26 / 46 / 193 / 264 s`, all inside the cadence.
+
+   Do this rather than matching by eye. Acceptances are not evenly spaced —
+   this same log holds two **2 s** apart — so "close enough" does not always
+   identify one card.
 
 2. **Look the acceptance up in the activity log** and find the entry at that
    timestamp:
@@ -150,6 +180,15 @@ What it does and does not do:
 |---|---|---|
 | `github_pr_merged` | `issue_pull_requests.mergedAt`, scoped to the interaction's company | The table is webhook-fed on merge and backfilled only for repos that already have at least one forward-captured PR. A merge this installation never recorded reads `unobserved`. |
 | `issue_status` | `issues.status` in the same company, compared as "reached at least this far" along `backlog < todo < in_progress < in_review < done` | Fully in-DB; absence really does mean the status was not reached. A target that moved PAST the declared status still counts as observed, so a declared `in_review` that later reached `done` does not revert to unobserved. `blocked` and `cancelled` are off that ladder and never satisfy a declaration — a cancelled target is a moot card, which is a human judgement for the acknowledgement path above, not an inference the sweep may make. |
+
+⚠ **A bare `#N` does not identify a PR in this installation.** The card's
+`ref` carries `repoFullName`, so the declaration itself is unambiguous — the
+trap is cross-checking it against the issue's prose, which abbreviates. PEN-2145
+is the worked example: `#2868` exists in **both** `Blockcast/paperclip` (a docs
+PR, merged 10-20) and `Blockcast/penstock-llm-proxy-core` (the actual carrier,
+merged 10-28), and fetching the wrong one returns a plausible merge with the
+wrong date. Resolve `#N` against the `ref`'s `repoFullName`, or against a head
+sha, never against the number alone.
 
 An outcome `kind` this build has no observer for also reads `unobserved`. That
 is deliberate: adding a kind without adding its observer fails toward the alarm,
