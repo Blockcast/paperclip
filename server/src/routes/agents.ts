@@ -155,6 +155,49 @@ const RUN_LOG_DEFAULT_LIMIT_BYTES = 256_000;
 const RUN_LOG_MAX_LIMIT_BYTES = 1024 * 1024;
 const EXTERNAL_LIFECYCLE_ADAPTER_TYPE_SET = new Set<string>(EXTERNAL_LIFECYCLE_ADAPTER_TYPES);
 
+/**
+ * The withheld-is-not-absent markers on the restricted PEER projection
+ * (PEN-5230, implementing the PEN-5228 ruling).
+ *
+ * `redactForRestrictedAgentView` answers a peer read with `adapterConfig: {}`
+ * / `runtimeConfig: {}`, and `{}` is a LEGAL STORED VALUE for both columns. So
+ * the response could not distinguish "this agent has no runtime config" from
+ * "you are not entitled to see this agent's runtime config", and nothing on it
+ * said a projection had run at all. That ambiguity was misread at least twice
+ * in the issue record, once by the `Ceo`, and PEN-5228 had to carry a warning
+ * telling the next reader to run an own-id read as a positive control. A
+ * withhold that costs every reader a control experiment has a recurring bill.
+ *
+ * This is the invariant `redaction.ts` already states for itself — "key NAMES
+ * survive so a reader can tell 'withheld' from 'never set', values elide"
+ * (PEN-2370 ask-1) — and which the sibling paths already honour:
+ * `withholdAgentConfigKeys` reports these same two columns in `withheldFields`
+ * on the approval card, and `publicProjectWorkspace` keeps
+ * `hasWorkspaceRuntimeConfig` beside the withheld blob for the strictly more
+ * sensitive `workspace_runtime:read` (PEN-3206 §2). The agents route was the
+ * weaker-signalling projection guarding the lesser secret.
+ *
+ * ## Both markers are CONSTANTS, and that is the security property
+ *
+ * Neither is computed from the stored value. `WITHHELD_AGENT_CONFIG_FIELDS`
+ * lists both columns unconditionally — NOT only the ones that happened to be
+ * non-empty — and `WITHHELD_AGENT_CONFIG_ACTION` names the gate the reader
+ * lacks, which is a fact about the READER, not about the subject. So the pair
+ * discloses exactly ZERO bits about the agent being read, which is what makes
+ * this change disclosure-neutral rather than a one-bit widening.
+ *
+ * Do NOT "improve" this by filtering the list to the columns that are actually
+ * populated, and do not add a `hasAdapterConfig` / `hasRuntimeConfig` presence
+ * bit beside it. Either turns a constant into a per-subject oracle: the list
+ * route returns one row per seat, so a single call would hand back a
+ * company-wide map of which seats carry a heartbeat override. That is the same
+ * shape as the `access.grants` disclosure tracked on PEN-5232, in the same
+ * projection, and shipping it here would widen the peer read that PEN-5228
+ * ruled should stay closed.
+ */
+const WITHHELD_AGENT_CONFIG_FIELDS = ["adapterConfig", "runtimeConfig"] as const;
+const WITHHELD_AGENT_CONFIG_ACTION = "agent_config:read";
+
 // Defined in `../agent-redaction.js` alongside the redactors they must stay in
 // lockstep with; re-exported here because this module is their established
 // import path. The write-side restore pair moved there in PEN-3757 so
@@ -2259,8 +2302,16 @@ export function agentRoutes(
    * PEN-2839 (under-redaction) and PEN-4775 (over-strip) came to sit on the
    * same two fields pointing opposite ways.
    *
-   * Whether the peer rule should exist at all is an open policy question owned
-   * by PEN-3206, not settled here. See docs/security/agent-config-read-model.md.
+   * Whether the peer rule should exist at all is SETTLED: PEN-5228 ruled KEEP
+   * THE WITHHOLD, on the ground that `agent_config:read` and
+   * `agent_config:update` are governed by the identical grant pair
+   * (`agents:configure` or `agents:suggest-changes`), so a non-holder's `{}` is
+   * the read side matching the write side rather than an over-correction.
+   *
+   * That row is NOT PEN-3206, and the difference has cost readers twice. PEN-3206
+   * ruled on `project_workspaces.metadata.runtimeConfig` behind
+   * `workspace_runtime:read` — a different column, gate and projection that
+   * merely shares a name. See docs/security/agent-config-read-model.md.
    */
   function redactForRestrictedAgentView(agent: Awaited<ReturnType<typeof svc.getById>>) {
     if (!agent) return null;
@@ -2280,6 +2331,12 @@ export function agentRoutes(
       // only for an absent/`undefined` metadata, which becomes `null` here —
       // unreachable from `svc.getById`, and the fail-closed direction anyway.
       metadata: containAgentMetadata(agent.metadata),
+      // Withheld-is-not-absent (PEN-5230). Emitted ONLY on this arm, so their
+      // absence on a `redactAgentSecrets` response is itself the signal that
+      // nothing was withheld. Both are module constants — see the block on
+      // `WITHHELD_AGENT_CONFIG_FIELDS` for why they must not become computed.
+      withheldFields: [...WITHHELD_AGENT_CONFIG_FIELDS],
+      withheldByAction: WITHHELD_AGENT_CONFIG_ACTION,
     };
   }
 
@@ -2687,12 +2744,24 @@ export function agentRoutes(
     // one call earlier (`canReadSensitiveDetail = isSelf ? true : ...`), so the
     // same viewer read its own `adapterConfig`/`runtimeConfig` from the detail
     // route and `{}` for that same row from this one. That is a contradiction
-    // within a single (viewer, subject) pair, and no answer to the open peer-
-    // read policy question (PEN-3206) can make both sides right — which is why
-    // this is fixed here and the peer rule is left exactly as it was. The
-    // operational cost was concrete: a seat holding `tools:manage_runtime` can
-    // WRITE a peer's `runtimeConfig` but could not read back its own row from
-    // the roster to confirm the shape it had just written.
+    // within a single (viewer, subject) pair, and no answer to the peer-read
+    // policy question (ruled on PEN-5228) can make both sides right — which is why
+    // this is fixed here and the peer rule is left exactly as it was.
+    //
+    // An earlier revision justified this with "a seat holding
+    // `tools:manage_runtime` can WRITE a peer's `runtimeConfig` but could not
+    // read back its own row". That is FALSE on both limbs and is struck rather
+    // than repointed (PEN-5228 §4). `tools:manage_runtime` has four non-test
+    // call sites — `routes/tool-access.ts` and three in `routes/tool-gateway.ts`
+    // — all of which go through `assertBoardToolPermission` /
+    // `assertBoardPermission`, both of which call `assertBoard(req)` FIRST and
+    // then check the key against a `"user"` principal, so no agent actor can
+    // exercise it anywhere. And it guards the tool-gateway runtime-SLOT
+    // lifecycle, never the `agents.runtime_config` column; the string does not
+    // appear in `services/authorization.ts` at all. It is the fourth distinct
+    // thing named `runtime*` in this family. The real cost stands without it:
+    // one viewer read its own config from the detail route and `{}` for the
+    // same row here.
     //
     // Gated on the STANDARD trust preset so the exemption cannot widen the
     // low-trust self view. `agent_config:read` is an unconditional

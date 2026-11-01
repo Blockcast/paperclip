@@ -2,7 +2,7 @@ import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_OPENCODE_LOCAL_MODEL } from "@paperclipai/adapter-opencode-local";
-import { INBOX_MINE_ISSUE_STATUS_FILTER, LOW_TRUST_REVIEW_PRESET } from "@paperclipai/shared";
+import { INBOX_MINE_ISSUE_STATUS_FILTER, LOW_TRUST_REVIEW_PRESET, updateAgentSchema } from "@paperclipai/shared";
 
 vi.mock("acpx/runtime", () => ({
   createAcpRuntime: vi.fn(),
@@ -664,6 +664,180 @@ describe.sequential("agent permission routes", () => {
       expect(rows.find((row) => row.id === agentId)?.runtimeConfig).toEqual(selfRuntimeConfig);
       expect(rows.find((row) => row.id === peerAgentId)?.runtimeConfig).toEqual(peerRuntimeConfig);
     }, 60_000);
+  });
+
+  describe("the peer `{}` says it was withheld (PEN-5230)", () => {
+    // PEN-5228 ruled KEEP THE WITHHOLD, and these tests pin the one change it
+    // called for: `{}` is a legal stored value for both columns, so the peer
+    // response could not distinguish "no config" from "not entitled". The
+    // markers resolve that WITHOUT returning a config byte.
+    //
+    // Every assertion below pairs a marker check with a withhold check, because
+    // the failure that matters is not "the marker is missing" — it is "the
+    // marker shipped and something widened beside it".
+    const peerAgentId = "77777777-7777-4777-8777-777777777777";
+    const PEER_ADAPTER_SECRET = "peer-adapter-secret-pen5230";
+    const peerAdapterConfig = {
+      command: "pnpm peer:run",
+      env: { PAPERCLIP_API_KEY: PEER_ADAPTER_SECRET },
+      workspaceStrategy: { provisionCommand: "./provision.sh --peer" },
+    };
+    const peerRuntimeConfig = { heartbeat: { enabled: true, maxConcurrentRuns: 7 } };
+
+    function denyAgentConfigRead() {
+      mockAccessService.decide.mockImplementation(async (input: { action?: string }) => ({
+        allowed: input.action === "agent:read",
+        reason: input.action === "agent:read" ? "allow_test_read" : "deny_missing_grant",
+        explanation: input.action === "agent:read"
+          ? "Allowed by test read grant."
+          : "Missing permission: agents:configure.",
+      }));
+    }
+
+    function peerRow(overrides: Record<string, unknown> = {}) {
+      return {
+        ...baseAgent,
+        id: peerAgentId,
+        name: "Peer",
+        urlKey: "peer",
+        adapterConfig: peerAdapterConfig,
+        runtimeConfig: peerRuntimeConfig,
+        ...overrides,
+      };
+    }
+
+    function agentActorApp() {
+      return createApp({
+        type: "agent",
+        agentId,
+        companyId,
+        runId: "run-1",
+        source: "agent_key",
+      });
+    }
+
+    it("marks the withhold on GET /agents/:id for a peer", async () => {
+      denyAgentConfigRead();
+      mockAgentService.getById.mockResolvedValue(peerRow());
+
+      const app = await agentActorApp();
+      const res = await requestApp(app, (baseUrl) => request(baseUrl).get(`/api/agents/${peerAgentId}`));
+
+      expect(res.status).toBe(200);
+      // The signal.
+      expect(res.body.withheldFields).toEqual(["adapterConfig", "runtimeConfig"]);
+      expect(res.body.withheldByAction).toBe("agent_config:read");
+      // Nothing widened: both columns are still withheld outright, and no
+      // config byte reached the response anywhere in it.
+      expect(res.body.adapterConfig).toEqual({});
+      expect(res.body.runtimeConfig).toEqual({});
+      expect(JSON.stringify(res.body)).not.toContain(PEER_ADAPTER_SECRET);
+      expect(JSON.stringify(res.body)).not.toContain("provision.sh");
+      expect(JSON.stringify(res.body)).not.toContain("maxConcurrentRuns");
+    }, 60_000);
+
+    it("marks the withhold on the company list, and only on the withheld rows", async () => {
+      denyAgentConfigRead();
+      mockAgentService.list.mockResolvedValue([
+        { ...baseAgent, runtimeConfig: { heartbeat: { enabled: true, maxConcurrentRuns: 5 } } },
+        peerRow(),
+      ]);
+
+      const app = await agentActorApp();
+      const res = await requestApp(app, (baseUrl) => request(baseUrl).get(`/api/companies/${companyId}/agents`));
+
+      expect(res.status).toBe(200);
+      const rows = res.body as Array<Record<string, any>>;
+      const self = rows.find((row) => row.id === agentId);
+      const peer = rows.find((row) => row.id === peerAgentId);
+
+      expect(peer?.withheldFields).toEqual(["adapterConfig", "runtimeConfig"]);
+      expect(peer?.withheldByAction).toBe("agent_config:read");
+      expect(peer?.adapterConfig).toEqual({});
+      expect(peer?.runtimeConfig).toEqual({});
+
+      // The viewer's own row took the secrets arm (PEN-4775), so it was not
+      // withheld and must carry NO marker. Absence of the marker is what tells
+      // a reader the config it is holding is real.
+      expect(self).not.toHaveProperty("withheldFields");
+      expect(self).not.toHaveProperty("withheldByAction");
+      expect(self?.runtimeConfig).toEqual({ heartbeat: { enabled: true, maxConcurrentRuns: 5 } });
+    }, 60_000);
+
+    it("emits NO marker to a viewer that holds the grant", async () => {
+      // The other direction: a real read must stay distinguishable from a
+      // withheld one, which is the whole point of the signal.
+      mockAccessService.decide.mockResolvedValue({
+        allowed: true,
+        reason: "allow_explicit_grant",
+        explanation: "Allowed by explicit grant agents:configure.",
+      });
+      mockAgentService.getById.mockResolvedValue(peerRow());
+
+      const app = await agentActorApp();
+      const res = await requestApp(app, (baseUrl) => request(baseUrl).get(`/api/agents/${peerAgentId}`));
+
+      expect(res.status).toBe(200);
+      expect(res.body).not.toHaveProperty("withheldFields");
+      expect(res.body).not.toHaveProperty("withheldByAction");
+      expect(res.body.runtimeConfig).toEqual(peerRuntimeConfig);
+    }, 60_000);
+
+    // THE DISCLOSURE-BUDGET TEST. This is the assertion that makes the change
+    // disclosure-NEUTRAL rather than a one-bit widening, and it is the one to
+    // keep if any of the others are ever trimmed.
+    //
+    // A subject with fully populated config and a subject with genuinely EMPTY
+    // config must produce byte-identical markers. If a later edit "improves"
+    // the list to name only the populated columns, or adds a
+    // `hasAdapterConfig` presence bit, this fails — which is the point: the
+    // company list returns one row per seat, so a per-subject bit here is a
+    // company-wide oracle on every seat's config posture.
+    it("emits IDENTICAL markers for a populated and a genuinely empty subject", async () => {
+      denyAgentConfigRead();
+
+      mockAgentService.getById.mockResolvedValue(peerRow());
+      const populated = await requestApp(await agentActorApp(), (baseUrl) =>
+        request(baseUrl).get(`/api/agents/${peerAgentId}`));
+
+      mockAgentService.getById.mockResolvedValue(peerRow({ adapterConfig: {}, runtimeConfig: {} }));
+      const empty = await requestApp(await agentActorApp(), (baseUrl) =>
+        request(baseUrl).get(`/api/agents/${peerAgentId}`));
+
+      expect(populated.status).toBe(200);
+      expect(empty.status).toBe(200);
+      // Positive control FIRST. Without it this test passes vacuously when the
+      // markers are absent on both responses (`undefined === undefined`) —
+      // which is exactly how it behaved against a build with the markers
+      // stripped out, so it would have gone on passing if the signal regressed.
+      expect(populated.body.withheldFields).toBeDefined();
+      expect(populated.body.withheldByAction).toBeDefined();
+      expect(empty.body.withheldFields).toBeDefined();
+      expect(empty.body.withheldByAction).toBeDefined();
+      expect(populated.body.withheldFields).toEqual(empty.body.withheldFields);
+      expect(populated.body.withheldByAction).toBe(empty.body.withheldByAction);
+      // And the withheld objects are indistinguishable too, as they were
+      // before this change — the markers added a statement about the READER,
+      // not about the subject.
+      expect(populated.body.adapterConfig).toEqual(empty.body.adapterConfig);
+      expect(populated.body.runtimeConfig).toEqual(empty.body.runtimeConfig);
+    }, 60_000);
+
+    it("cannot be PATCHed back onto the agent row", async () => {
+      // The read-modify-write hazard this codebase already guards for
+      // `adapterConfig` (`stripRedactedEnvBindingsFromAdapterConfig`) and
+      // `metadata` (`restoreRedactedAgentMetadata`): a client that reads the
+      // restricted view, edits one field and PATCHes the object back must not
+      // persist the markers as agent columns. `updateAgentSchema` is a plain
+      // zod object, so unknown keys are stripped rather than stored.
+      const parsed = updateAgentSchema.parse({
+        name: "Renamed",
+        withheldFields: ["adapterConfig", "runtimeConfig"],
+        withheldByAction: "agent_config:read",
+      });
+
+      expect(parsed).toEqual({ name: "Renamed" });
+    });
   });
 
   it("blocks agent updates for authenticated company members without agent admin permission", async () => {
