@@ -1218,4 +1218,164 @@ describe("issue update comment wakeups", () => {
       expect.objectContaining({ reason: "issue_comment_mentioned" }),
     ));
   });
+
+  // PEN-5180. The defect of record: a body containing a plain `@Ceo` matches no
+  // mention extractor, binds to nobody and raises no wake, yet the write
+  // returned a bare 200 with nothing the author could read saying so. The
+  // author's only evidence of failure was the absence of a reply, which is
+  // indistinguishable from a busy recipient. These assert the create response
+  // now carries that signal — and the POSITIVE CONTROL asserts a correctly
+  // formed `agent://` mention does NOT, which is what keeps the field a signal
+  // rather than constant noise an author learns to skip.
+  describe("unbound @-mention reporting on the create response (PEN-5180)", () => {
+    it("reports a plain @Name that bound to nobody", async () => {
+      const existing = makeIssue({ status: "in_progress" });
+      const body = "@Ceo please rule on the scope question above";
+      mockIssueService.getById.mockResolvedValue(existing);
+      mockIssueService.addComment.mockResolvedValue({
+        id: "comment-unbound-plain-name",
+        issueId: existing.id,
+        companyId: existing.companyId,
+        body,
+      });
+      mockIssueService.findMentionedAgents.mockResolvedValue([]);
+
+      const res = await request(await createApp())
+        .post(`/api/issues/${existing.id}/comments`)
+        .send({ body });
+
+      expect(res.status).toBe(201);
+      expect(res.body.unboundMentions).toEqual(["Ceo"]);
+      // The drop itself is unchanged and intentional: the remedy is the signal,
+      // not name matching in the extractor.
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ reason: "issue_comment_mentioned" }),
+      );
+    });
+
+    it("POSITIVE CONTROL: a correctly-formed agent:// mention reports nothing", async () => {
+      const existing = makeIssue({ assigneeUserId: "active-user", status: "in_progress" });
+      const body = `[@QA](agent://${MENTIONED_AGENT_ID}) please inspect this`;
+      mockIssueService.getById.mockResolvedValue(existing);
+      mockIssueService.addComment.mockResolvedValue({
+        id: "comment-bound-mention",
+        issueId: existing.id,
+        companyId: existing.companyId,
+        body,
+      });
+      mockIssueService.findMentionedAgents.mockResolvedValue([MENTIONED_AGENT_ID]);
+
+      const res = await request(await createApp({
+        type: "board",
+        userId: "active-user",
+        companyIds: [existing.companyId],
+        source: "session",
+        isInstanceAdmin: false,
+      }))
+        .post(`/api/issues/${existing.id}/comments`)
+        .send({ body });
+
+      expect(res.status).toBe(201);
+      // Present and empty, never absent: an absent key cannot be told apart
+      // from a server that predates this report.
+      expect(res.body).toHaveProperty("unboundMentions");
+      expect(res.body.unboundMentions).toEqual([]);
+      await vi.waitFor(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        MENTIONED_AGENT_ID,
+        expect.objectContaining({ reason: "issue_comment_mentioned" }),
+      ));
+    });
+
+    it("reports only the unbound token when a body carries both forms", async () => {
+      const existing = makeIssue({ assigneeUserId: "active-user", status: "in_progress" });
+      const body = `[@QA](agent://${MENTIONED_AGENT_ID}) please inspect, and @Ceo should rule`;
+      mockIssueService.getById.mockResolvedValue(existing);
+      mockIssueService.addComment.mockResolvedValue({
+        id: "comment-mixed-mentions",
+        issueId: existing.id,
+        companyId: existing.companyId,
+        body,
+      });
+      mockIssueService.findMentionedAgents.mockResolvedValue([MENTIONED_AGENT_ID]);
+
+      const res = await request(await createApp({
+        type: "board",
+        userId: "active-user",
+        companyIds: [existing.companyId],
+        source: "session",
+        isInstanceAdmin: false,
+      }))
+        .post(`/api/issues/${existing.id}/comments`)
+        .send({ body });
+
+      expect(res.status).toBe(201);
+      expect(res.body.unboundMentions).toEqual(["Ceo"]);
+    });
+
+    it("reports a well-formed agent link whose target resolved to nobody", async () => {
+      // Same silent drop as a plain name: the href parses, the wake still
+      // reaches no one, so the author needs the same signal.
+      const existing = makeIssue({ status: "in_progress" });
+      const body = "[@Ghost](agent://99999999-9999-4999-8999-999999999999) are you there";
+      mockIssueService.getById.mockResolvedValue(existing);
+      mockIssueService.addComment.mockResolvedValue({
+        id: "comment-unresolved-href",
+        issueId: existing.id,
+        companyId: existing.companyId,
+        body,
+      });
+      mockIssueService.findMentionedAgents.mockResolvedValue([]);
+
+      const res = await request(await createApp())
+        .post(`/api/issues/${existing.id}/comments`)
+        .send({ body });
+
+      expect(res.status).toBe(201);
+      expect(res.body.unboundMentions).toEqual(["Ghost"]);
+    });
+
+    it("reports nothing for a body with no @ tokens at all", async () => {
+      const existing = makeIssue({ status: "in_progress" });
+      const body = "Recording the measurement here for the next reader.";
+      mockIssueService.getById.mockResolvedValue(existing);
+      mockIssueService.addComment.mockResolvedValue({
+        id: "comment-no-mentions",
+        issueId: existing.id,
+        companyId: existing.companyId,
+        body,
+      });
+      mockIssueService.findMentionedAgents.mockResolvedValue([]);
+
+      const res = await request(await createApp())
+        .post(`/api/issues/${existing.id}/comments`)
+        .send({ body });
+
+      expect(res.status).toBe(201);
+      expect(res.body).toHaveProperty("unboundMentions");
+      expect(res.body.unboundMentions).toEqual([]);
+    });
+
+    it("still reports the signal when mention resolution throws", async () => {
+      // Fail toward reporting: a false "this may not have reached anyone" costs
+      // a re-send, a false silence costs a day.
+      const existing = makeIssue({ status: "in_progress" });
+      const body = "@Ceo please rule on this";
+      mockIssueService.getById.mockResolvedValue(existing);
+      mockIssueService.addComment.mockResolvedValue({
+        id: "comment-resolution-failure",
+        issueId: existing.id,
+        companyId: existing.companyId,
+        body,
+      });
+      mockIssueService.findMentionedAgents.mockRejectedValue(new Error("resolution exploded"));
+
+      const res = await request(await createApp())
+        .post(`/api/issues/${existing.id}/comments`)
+        .send({ body });
+
+      expect(res.status).toBe(201);
+      expect(res.body.unboundMentions).toEqual(["Ceo"]);
+    });
+  });
 });
