@@ -93,6 +93,23 @@ export interface Agent {
   adapterType: AgentAdapterType;
   adapterConfig: Record<string, unknown>;
   runtimeConfig: AgentRuntimeConfig;
+  /**
+   * Withheld-is-not-absent markers (PEN-5230, implementing the PEN-5228
+   * ruling). Present ONLY on the restricted peer projection, where
+   * `adapterConfig` / `runtimeConfig` are served as `{}` because the reader
+   * lacks the entitlement — never on a response that carries the real config.
+   * So their ABSENCE is itself the signal that nothing was withheld, and a
+   * client must treat `{}`-with-no-marker as "genuinely empty" rather than
+   * "withheld".
+   *
+   * Both are constants on the server. `withheldFields` always names both
+   * columns, not only the populated ones, and `withheldByAction` names the
+   * gate the READER lacks — a fact about the reader, not the subject — so the
+   * pair discloses zero bits about the agent being read. Do not infer config
+   * presence from either.
+   */
+  withheldFields?: string[];
+  withheldByAction?: string;
   defaultEnvironmentId?: string | null;
   /**
    * Display mirror of the monthly cap. Kept equal to the enforcing policy by
