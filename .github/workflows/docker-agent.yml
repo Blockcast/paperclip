@@ -674,7 +674,13 @@ jobs:
             response=$(mktemp)
             http=$(post_bump "$cid" "$response")
             echo "HTTP $http"
-            if jq -e . "$response" >/dev/null 2>&1; then jq '.' "$response"; else cat "$response"; echo; fi
+            if jq -e . "$response" >/dev/null 2>&1; then
+              jq '.' "$response"
+            else
+              echo "non-JSON response body:"
+              cat "$response"
+              echo
+            fi
             if [ "$http" != "200" ]; then
               echo "::error::bump-agent-image returned HTTP $http for company ${cid}: $(head -c 500 "$response")"
               failed=$((failed + 1))
