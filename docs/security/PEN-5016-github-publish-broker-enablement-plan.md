@@ -551,7 +551,9 @@ Stage 0 carries **no PR merges** — it is preparation only, and it can complete
 precondition PR is still open. Exit: the §5.3 broker log queries saved; §4's trigger-2 query re-run
 and clean, **asserted for the stage-1 agent's environment and not only its agent config** (§4); the
 §3.5a privilege pre-flight run across the stage-1 population; the board-level env-scope read of §3.4
-returned clean; the §5.1 node-capacity baseline recorded. **No gate is set in stage 0.**
+returned clean — ⚠ **or recorded as *carried*, not discharged, per §11.3's 2026-11-01 ruling
+(PEN-5184), which re-classifies it as operational and re-dates it to gate stage 2**; the §5.1
+node-capacity baseline recorded. **No gate is set in stage 0.**
 
 ⚠ **The saved queries are the load-bearing item.** Without them stage 1 is unfalsifiable, because a
 silent broker and a broker nobody asked to publish are the same observation (§5.3).
@@ -755,7 +757,8 @@ Stated so a later reader does not inherit them as stronger than they are:
   one and is the least likely to be an artefact of the instant.
 - The env-credential reading covers **one pod of one agent** at agent scope, and agrees with §7.4's
   reading in a different agent's pod. Project and environment scope are unreadable from any agent
-  seat (§3.4) — which is why §3.4 is a gate item and not a conclusion.
+  seat (§3.4) — which is why §3.4 is a gate item and not a conclusion. ⚠ It is a **stage-2** gate
+  item, not a stage-1 barrier (re-dated 2026-11-01, PEN-5184; see §11.3).
 - §3.5a's "0 of 11 set `enableDocker`" is **agent scope, one company, one instant**
   (2026-10-29T19:20Z). It is a sound negative at that scope — the agent list returns `adapterConfig`
   with keys visible and only values redacted, so an absent key is absent and not hidden. It says
@@ -1148,4 +1151,8 @@ hard build failure, not a quiet annotation.
 
 **What remains owed to §3.4, and it is not this section's to close:** the board-level environment and
 project-scope read is still a stage-0 exit item with a **board/operator** owner, because no agent seat
-can perform it. (a)-(c) discharge PEN-5063's pre-flight requirement; they do not discharge §3.4.
+can perform it. ⚠ **Re-classified and re-dated 2026-11-01 (PEN-5184): it is operational rather
+than a security barrier, and it gates stage 2, not stage 1 — so stage 0 may exit `2026-11-05` with it
+recorded as *carried*, not discharged. See §11.3 for the ruling, and §3.4 for why #3089 already
+enforces, fail-closed and scope-agnostically, the property this read was asking a human to supply.**
+(a)-(c) discharge PEN-5063's pre-flight requirement; they do not discharge §3.4.
