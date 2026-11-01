@@ -7,6 +7,7 @@ import {
   driveIsolationReclaim,
 } from "./isolation-reclaim-driver.js";
 import type { ReclaimJobPort } from "./isolation-reclaim-runner.js";
+import { recordIsolationReclaimSweep } from "./metrics.js";
 import {
   type ReclaimableClaim,
   type WorkspaceUsageLookup,
@@ -281,6 +282,19 @@ export async function sweepIsolationReclaim(
     },
     "isolation reclaim sweep complete",
   );
+
+  // After the log line and before the return, so a metrics fault cannot cost
+  // the log line -- the recorder swallows its own errors, but the ordering
+  // makes that belt-and-braces rather than load-bearing.
+  //
+  // Reached only on the completion path. The claim-list failure above throws
+  // past this deliberately: it records no sweep, which is correct, because no
+  // claim was assessed. That shows up as the liveness gauge going stale rather
+  // than as a sweep with an unhappy label, and those are the same fact.
+  recordIsolationReclaimSweep(result, {
+    dryRun: options.dryRun === true,
+    now: options.now ?? Date.now,
+  });
 
   return result;
 }

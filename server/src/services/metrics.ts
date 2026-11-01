@@ -50,6 +50,7 @@ import { logger } from "../middleware/logger.js";
 // reaper (which imports the recorder below). Structurally restating the result
 // shape here would let a NEW result field be added and silently go unrecorded.
 import type { IsolationWorkspaceReapResult } from "./isolation-workspace-reaper.js";
+import type { IsolationReclaimSweepResult } from "./isolation-reclaim-sweep.js";
 // Type-only for the same reason as the reaper result above: erased at runtime,
 // so it creates no import cycle with the collector (which imports the recorder
 // below), while still making a NEW result field a compile error here rather
@@ -615,6 +616,56 @@ export const ISOLATION_WORKSPACE_REAPER_STOP_REASONS = [
   "lookup_faulted",
   "root_absent",
 ] as const;
+
+/**
+ * Foreign-claim isolation reclaim (PEN-5151).
+ *
+ * The reaper series above describe the sweep over the claim THIS process
+ * mounts. These describe the sweep over the claims it does not — an operator
+ * `workspaceVolumeClaim`, or PEN-4932 stage 4b's per-agent claim — which is
+ * driven by launching a Job that mounts the claim rather than by walking a
+ * directory.
+ *
+ * They are a separate family rather than a `scope` label on the reaper's,
+ * because the two sweeps do not share a denominator: the reaper counts
+ * DIRECTORIES it enumerated itself, and this one counts CLAIMS it delegated to
+ * a Job. Folding them together would let a `sum by (scope)` add an entry count
+ * to a claim count and get a number that means nothing.
+ *
+ * `paperclip_isolation_reclaim_last_sweep_timestamp_seconds` is the one that
+ * closes PEN-5125's open finding. `..._reaper_unreachable_agents` goes non-zero
+ * the moment an agent opts in and STAYS there by design — the mounted sweep
+ * genuinely cannot reach that tree, and nothing this row builds changes that.
+ * So the finding is retired not by driving that gauge to 0 but by pairing it
+ * with evidence that something else is reclaiming those trees.
+ */
+export const ISOLATION_RECLAIM_SWEEPS_METRIC = "paperclip_isolation_reclaim_sweeps_total";
+export const ISOLATION_RECLAIM_CLAIMS_METRIC = "paperclip_isolation_reclaim_claims_total";
+export const ISOLATION_RECLAIM_RECLAIMED_METRIC = "paperclip_isolation_reclaim_reclaimed_total";
+export const ISOLATION_RECLAIM_UNKNOWN_OUTCOME_METRIC =
+  "paperclip_isolation_reclaim_unknown_outcome_claims_total";
+export const ISOLATION_RECLAIM_LAST_SWEEP_METRIC =
+  "paperclip_isolation_reclaim_last_sweep_timestamp_seconds";
+/**
+ * Per-claim outcomes. Disjoint, and they sum to the claims the list named:
+ * `ok` and `failed` partition the driven claims (a drive that returns `ok`
+ * always reports a known deletion count), and `deferred` is the remainder the
+ * per-tick bound did not reach.
+ */
+export const ISOLATION_RECLAIM_CLAIM_OUTCOMES = ["ok", "failed", "deferred"] as const;
+/**
+ * How the pass ended.
+ *
+ * There is deliberately no `list_failed` value. A sweep whose claim list could
+ * not be read throws before it records anything — the sweep does not catch
+ * that, on the ground that a partial list is indistinguishable from a shorter
+ * fleet — so no stop_reason could be emitted for it without first inventing a
+ * result it never had. That failure is visible as
+ * `paperclip_isolation_reclaim_last_sweep_timestamp_seconds` going stale, which
+ * is the same signal a sweep that stopped ticking produces, and is the correct
+ * one: in both cases no claim was assessed.
+ */
+export const ISOLATION_RECLAIM_STOP_REASONS = ["complete", "claims_capped"] as const;
 /**
  * Execution-workspace teardown work (PEN-3692).
  *
@@ -5532,6 +5583,11 @@ let isolationReaperEntries: Counter<"dry_run" | "outcome"> | null = null;
 let isolationReaperSweeps: Counter<"dry_run" | "stop_reason"> | null = null;
 let isolationReaperLastSweep: Gauge<"dry_run"> | null = null;
 let isolationReaperUnreachableAgents: Gauge<"dry_run"> | null = null;
+let isolationReclaimSweeps: Counter<"dry_run" | "stop_reason"> | null = null;
+let isolationReclaimClaims: Counter<"dry_run" | "outcome"> | null = null;
+let isolationReclaimReclaimed: Counter<"dry_run"> | null = null;
+let isolationReclaimUnknownOutcome: Counter<"dry_run"> | null = null;
+let isolationReclaimLastSweep: Gauge<"dry_run"> | null = null;
 let executionWorkspaceTeardown: Counter<"trigger" | "method" | "outcome" | "cleanup_reason"> | null = null;
 let executionWorkspaceTeardownDuration: Histogram<"trigger" | "method" | "cleanup_reason"> | null = null;
 let executionWorkspaceCollectorScanned: Counter<string> | null = null;
@@ -5694,6 +5750,11 @@ function ensureRegistry(): {
   isolationReaperSweepsCounter: Counter<"dry_run" | "stop_reason">;
   isolationReaperLastSweepGauge: Gauge<"dry_run">;
   isolationReaperUnreachableAgentsGauge: Gauge<"dry_run">;
+  isolationReclaimSweepsCounter: Counter<"dry_run" | "stop_reason">;
+  isolationReclaimClaimsCounter: Counter<"dry_run" | "outcome">;
+  isolationReclaimReclaimedCounter: Counter<"dry_run">;
+  isolationReclaimUnknownOutcomeCounter: Counter<"dry_run">;
+  isolationReclaimLastSweepGauge: Gauge<"dry_run">;
   executionWorkspaceTeardownCounter: Counter<"trigger" | "method" | "outcome" | "cleanup_reason">;
   executionWorkspaceTeardownDurationHistogram: Histogram<"trigger" | "method" | "cleanup_reason">;
   executionWorkspaceCollectorScannedCounter: Counter<string>;
@@ -5854,6 +5915,11 @@ function ensureRegistry(): {
     || !isolationReaperSweeps
     || !isolationReaperLastSweep
     || !isolationReaperUnreachableAgents
+    || !isolationReclaimSweeps
+    || !isolationReclaimClaims
+    || !isolationReclaimReclaimed
+    || !isolationReclaimUnknownOutcome
+    || !isolationReclaimLastSweep
     || !executionWorkspaceTeardown
     || !executionWorkspaceTeardownDuration
     || !executionWorkspaceCollectorScanned
@@ -8398,6 +8464,76 @@ function ensureRegistry(): {
       labelNames: ["dry_run"],
       registers: [registry],
     });
+    isolationReclaimSweeps = new Counter({
+      name: ISOLATION_RECLAIM_SWEEPS_METRIC,
+      help:
+        "Completed foreign-claim isolation-reclaim sweeps, labeled by how the "
+        + "pass ended (PEN-5151). claims_capped = maxClaimsPerTick left claims "
+        + "undriven; they are picked up by a later tick through the rotation "
+        + "cursor, so this is slow coverage rather than lost coverage. A sweep "
+        + "whose CLAIM LIST could not be read records nothing here at all -- it "
+        + "throws first, by design -- so the signal for that failure is "
+        + "paperclip_isolation_reclaim_last_sweep_timestamp_seconds going stale.",
+      labelNames: ["dry_run", "stop_reason"],
+      registers: [registry],
+    });
+    isolationReclaimClaims = new Counter({
+      name: ISOLATION_RECLAIM_CLAIMS_METRIC,
+      help:
+        "Claims the foreign-claim reclaim sweep accounted for, by outcome "
+        + "(PEN-5151). ok = the drive completed, including the quiet tick that "
+        + "found nothing eligible; failed = the drive returned a failure; "
+        + "deferred = named by the claim list but past the per-tick bound. "
+        + "Disjoint, and they sum to the claims the list named. Sustained "
+        + "non-zero deferred means the fleet is outrunning the per-tick bound.",
+      labelNames: ["dry_run", "outcome"],
+      registers: [registry],
+    });
+    isolationReclaimReclaimed = new Counter({
+      name: ISOLATION_RECLAIM_RECLAIMED_METRIC,
+      help:
+        "Isolation-workspace directories unlinked from foreign claims "
+        + "(PEN-5151), summed across claims. A LOWER BOUND for any sweep where "
+        + "paperclip_isolation_reclaim_unknown_outcome_claims_total is non-zero: "
+        + "an execute Job that was launched and then could not be read to "
+        + "completion unlinked an unknown amount, never a known zero. Under "
+        + "dry_run=true this carries what the pass WOULD have removed.",
+      labelNames: ["dry_run"],
+      registers: [registry],
+    });
+    isolationReclaimUnknownOutcome = new Counter({
+      name: ISOLATION_RECLAIM_UNKNOWN_OUTCOME_METRIC,
+      help:
+        "Claims whose drive may have deleted an unknown number of directories "
+        + "(PEN-5151) -- an execute Job that could have started and then could "
+        + "not be read to completion. First-class rather than an outcome label "
+        + "value for the reason the reaper's skipped_layout is: non-zero means "
+        + "paperclip_isolation_reclaim_reclaimed_total stopped being a total for "
+        + "that sweep, and a sum-by over a generic label would aggregate exactly "
+        + "that away.",
+      labelNames: ["dry_run"],
+      registers: [registry],
+    });
+    isolationReclaimLastSweep = new Gauge({
+      name: ISOLATION_RECLAIM_LAST_SWEEP_METRIC,
+      help:
+        "Unix timestamp of the last completed foreign-claim isolation-reclaim "
+        + "sweep (PEN-5151). This is the companion to "
+        + "paperclip_isolation_workspace_reaper_unreachable_agents, which goes "
+        + "non-zero the moment an agent opts in and STAYS there by design -- the "
+        + "mounted sweep really cannot reach that tree. Alert on the PAIR: "
+        + "unreachable_agents != 0 AND time() - max(this{dry_run=\"false\"}) > "
+        + "2x the interval separates 'unreachable and nothing is reclaiming it' "
+        + "from 'unreachable but reclaimed'. SCOPE THAT SELECTOR rather than "
+        + "unioning both children: a dry-run sweep stamps this gauge fresh while "
+        + "unlinking nothing, so a bare max() would report an instance that only "
+        + "ever previews as one that is reclaiming -- the exact false "
+        + "reassurance the pairing exists to prevent. The two cannot be joined "
+        + "per agent: that gauge counts AGENTS, this sweep counts CLAIMS, and a "
+        + "claim does not name the agents whose runs land on it.",
+      labelNames: ["dry_run"],
+      registers: [registry],
+    });
     executionWorkspaceTeardown = new Counter({
       name: EXECUTION_WORKSPACE_TEARDOWN_METRIC,
       help:
@@ -8730,6 +8866,11 @@ function ensureRegistry(): {
     isolationReaperSweepsCounter: isolationReaperSweeps,
     isolationReaperLastSweepGauge: isolationReaperLastSweep,
     isolationReaperUnreachableAgentsGauge: isolationReaperUnreachableAgents,
+    isolationReclaimSweepsCounter: isolationReclaimSweeps,
+    isolationReclaimClaimsCounter: isolationReclaimClaims,
+    isolationReclaimReclaimedCounter: isolationReclaimReclaimed,
+    isolationReclaimUnknownOutcomeCounter: isolationReclaimUnknownOutcome,
+    isolationReclaimLastSweepGauge: isolationReclaimLastSweep,
     executionWorkspaceTeardownCounter: executionWorkspaceTeardown,
     executionWorkspaceTeardownDurationHistogram: executionWorkspaceTeardownDuration,
     executionWorkspaceCollectorScannedCounter: executionWorkspaceCollectorScanned,
@@ -11661,6 +11802,80 @@ export function recordIsolationWorkspaceReapSweep(
     m.isolationReaperUnreachableAgentsGauge.set({ dry_run }, result.unreachableAgents);
   } catch (error) {
     logger.error({ err: error }, "failed to record isolation-workspace reaper sweep metrics");
+  }
+}
+
+/**
+ * Record one completed foreign-claim isolation-reclaim sweep (PEN-5151).
+ *
+ * Mirrors `recordIsolationWorkspaceReapSweep` above, and deliberately: this is
+ * the same irreversible pass over a tree the server cannot walk, so it is
+ * observed the same way. Two of those properties are load-bearing and easy to
+ * drop as redundant.
+ *
+ * **Every label child is materialized on every sweep, including the
+ * zero-valued ones.** A tick that drives one claim and defers none must still
+ * produce a readable `claims_total{outcome="deferred"} 0`, so "swept, nothing
+ * deferred" is distinguishable from "this series has never been written" --
+ * the latter being the absence of the series entirely, which is how a sweep
+ * that was never switched on reads.
+ *
+ * **The gauge is set unconditionally, not only when the sweep did work.** A
+ * gauge left unwritten keeps its last value, so a sweep that silently stopped
+ * finding claims would otherwise go on publishing a reassuring recent
+ * timestamp. Since this gauge is the liveness half of the PEN-5125 pair, a
+ * stale value there is the specific failure the pairing exists to catch.
+ *
+ * Called on the completion path of a sweep that has already done its
+ * irreversible work, so it must not throw -- a metrics fault has no business
+ * turning a completed delete pass into an error the scheduler logs as a failed
+ * one. Hence the catch, which matches the reaper's.
+ */
+export function recordIsolationReclaimSweep(
+  result: IsolationReclaimSweepResult,
+  options: { dryRun: boolean; now: () => number },
+): void {
+  try {
+    const m = ensureRegistry();
+    const dry_run = options.dryRun ? "true" : "false";
+
+    const byOutcome: Record<(typeof ISOLATION_RECLAIM_CLAIM_OUTCOMES)[number], number> = {
+      ok: result.claimsOk,
+      failed: result.claimsFailed,
+      deferred: result.claimsDeferred,
+    };
+    for (const outcome of ISOLATION_RECLAIM_CLAIM_OUTCOMES) {
+      m.isolationReclaimClaimsCounter.inc({ dry_run, outcome }, byOutcome[outcome]);
+    }
+
+    // Derived from `claimsDeferred` rather than from a flag on the result,
+    // because the sweep has no equivalent of the reaper's `capped`: deferral is
+    // the whole mechanism by which the rotation covers a fleet larger than one
+    // tick, so it is ordinary rather than exceptional. It is still worth a
+    // stop_reason, because SUSTAINED capping is the shape of a fleet the daily
+    // cadence no longer covers.
+    const stopReason = result.claimsDeferred > 0 ? "claims_capped" : "complete";
+    for (const reason of ISOLATION_RECLAIM_STOP_REASONS) {
+      m.isolationReclaimSweepsCounter.inc({ dry_run, stop_reason: reason }, reason === stopReason ? 1 : 0);
+    }
+
+    // `wouldReclaim` under dry_run and `reclaimed` otherwise, on the one
+    // counter, as the reaper does with `deleted`. The two cannot both be
+    // non-zero for one sweep -- dryRun is a sweep-level option, so every
+    // outcome in a given result was produced under the same setting -- and the
+    // label says which of the two this is.
+    m.isolationReclaimReclaimedCounter.inc(
+      { dry_run },
+      options.dryRun ? result.wouldReclaim : result.reclaimed,
+    );
+    // Not gated on being non-zero: a zero here is the statement that
+    // `reclaimed` above IS a total for this sweep, which is the thing an
+    // operator reading a reclaim figure needs to know.
+    m.isolationReclaimUnknownOutcomeCounter.inc({ dry_run }, result.unknownOutcomeClaims);
+
+    m.isolationReclaimLastSweepGauge.set({ dry_run }, Math.floor(options.now() / 1000));
+  } catch (error) {
+    logger.error({ err: error }, "failed to record isolation reclaim sweep metrics");
   }
 }
 
