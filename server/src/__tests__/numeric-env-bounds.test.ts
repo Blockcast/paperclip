@@ -97,6 +97,14 @@ const SETTINGS = {
   heapSnapshotSentinelMinIntervalMinutes: "PAPERCLIP_HEAP_SNAPSHOT_SENTINEL_MIN_INTERVAL_MINUTES",
   heapSnapshotMaxAgeMinutes: "PAPERCLIP_HEAP_SNAPSHOT_MAX_AGE_MINUTES",
   heapSnapshotPollIntervalSeconds: "PAPERCLIP_HEAP_SNAPSHOT_POLL_SECONDS",
+  // PEN-5151. Registered rather than added to the exemption list below, which
+  // the comment there asks for in so many words. Both matter for the same
+  // reason the stranded-drain ceiling above does: this sweep's work is Jobs
+  // that hold a foreign claim and run recursive unlinks, so an `Infinity`
+  // typed into either while tuning removes the bound on how many of them one
+  // tick starts.
+  isolationReclaimSweepIntervalMinutes: "PAPERCLIP_ISOLATION_RECLAIM_SWEEP_INTERVAL_MINUTES",
+  isolationReclaimSweepMaxClaimsPerTick: "PAPERCLIP_ISOLATION_RECLAIM_SWEEP_MAX_CLAIMS_PER_TICK",
 } as const satisfies Partial<Record<keyof typeof NUMERIC_SETTING_BOUNDS, string>>;
 
 type SettingKey = keyof typeof SETTINGS;

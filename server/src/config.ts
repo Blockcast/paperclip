@@ -121,6 +121,10 @@ export interface Config {
   isolationWorkspaceReaperMaxAgeDays: number;
   isolationWorkspaceReaperMaxDeletesPerTick: number;
   isolationWorkspaceReaperDryRun: boolean;
+  isolationReclaimSweepEnabled: boolean;
+  isolationReclaimSweepIntervalMinutes: number;
+  isolationReclaimSweepMaxClaimsPerTick: number;
+  isolationReclaimSweepDryRun: boolean;
   // Human-gated ageing digest (BLO-29420): delivers the BLO-19130 ageing report
   // to a durable, human-assigned issue refreshed in place each period. Worker-tier
   // only, same rationale as the reconcilers above.
@@ -408,6 +412,17 @@ export const NUMERIC_SETTING_BOUNDS = {
   },
   isolationWorkspaceReaperMaxAgeDays: { fallback: 30, min: 7, max: 3650 },
   isolationWorkspaceReaperMaxDeletesPerTick: { fallback: 200, min: 1, max: 10_000 },
+  // PEN-5151. Daily for the same reason as the reaper above: the cohort is
+  // defined in days. The claim bound is low because one claim is one or two
+  // Jobs driven to completion, each waiting out its own `activeDeadlineSeconds`
+  // -- a tick of 8 is already most of an hour, and claims rotate across ticks
+  // rather than being crammed into one.
+  isolationReclaimSweepIntervalMinutes: {
+    fallback: 1440,
+    min: 1,
+    max: TIMER_PERIOD_MINUTES_MAX,
+  },
+  isolationReclaimSweepMaxClaimsPerTick: { fallback: 8, min: 1, max: 200 },
   // BLO-19123. Per-tick ceiling on how many *distinct* rows the hand-back drain returns.
   //
   // The pass already had two per-issue guards — max 2 hand-backs per source issue and a 6h
@@ -646,6 +661,7 @@ export const TIMER_SETTING_MS_FACTOR = {
   prReconcilerIntervalMinutes: 60_000,
   strandedBlockedIssueReconcilerIntervalMinutes: 60_000,
   isolationWorkspaceReaperIntervalMinutes: 60_000,
+  isolationReclaimSweepIntervalMinutes: 60_000,
   // Minute-denominated like its neighbours, though it gates an elapsed-time comparison rather
   // than a `setInterval` delay. Registered anyway: the guard that requires this entry keys off
   // the name, and an unregistered minute setting is exactly the omission that guard exists to
@@ -989,6 +1005,20 @@ export function loadConfig(): Config {
     NUMERIC_SETTING_BOUNDS.isolationWorkspaceReaperMaxAgeDays,
     "isolationWorkspaceReaperMaxAgeDays",
   );
+  const isolationReclaimSweepEnabled =
+    process.env.PAPERCLIP_ISOLATION_RECLAIM_SWEEP_ENABLED === "true";
+  const isolationReclaimSweepDryRun =
+    process.env.PAPERCLIP_ISOLATION_RECLAIM_SWEEP_DRY_RUN === "true";
+  const isolationReclaimSweepIntervalMinutes = resolveNumericSetting(
+    [process.env.PAPERCLIP_ISOLATION_RECLAIM_SWEEP_INTERVAL_MINUTES],
+    NUMERIC_SETTING_BOUNDS.isolationReclaimSweepIntervalMinutes,
+    "isolationReclaimSweepIntervalMinutes",
+  );
+  const isolationReclaimSweepMaxClaimsPerTick = resolveNumericSetting(
+    [process.env.PAPERCLIP_ISOLATION_RECLAIM_SWEEP_MAX_CLAIMS_PER_TICK],
+    NUMERIC_SETTING_BOUNDS.isolationReclaimSweepMaxClaimsPerTick,
+    "isolationReclaimSweepMaxClaimsPerTick",
+  );
   const isolationWorkspaceReaperMaxDeletesPerTick = resolveNumericSetting(
     [process.env.PAPERCLIP_ISOLATION_WORKSPACE_REAPER_MAX_DELETES_PER_TICK],
     NUMERIC_SETTING_BOUNDS.isolationWorkspaceReaperMaxDeletesPerTick,
@@ -1292,6 +1322,10 @@ export function loadConfig(): Config {
     isolationWorkspaceReaperMaxAgeDays,
     isolationWorkspaceReaperMaxDeletesPerTick,
     isolationWorkspaceReaperDryRun,
+    isolationReclaimSweepEnabled,
+    isolationReclaimSweepIntervalMinutes,
+    isolationReclaimSweepMaxClaimsPerTick,
+    isolationReclaimSweepDryRun,
     humanGatedDigestEnabled,
     humanGatedDigestIntervalMinutes,
     humanGatedDigestPeriodDays,
