@@ -10,9 +10,12 @@ import {
   brokerChildEnv,
   createPublishBrokerServer,
   formatBrokerOutcomeLine,
+  MAX_OUTCOME_DETAIL_CHARS,
+  OUTCOME_DETAIL_TRUNCATION_MARKER,
   prepareBrokeredInvocation,
   type PublishBrokerServer,
 } from "./github-publish-broker.js";
+import { redactionMarker } from "./github-egress-scrub.js";
 import { runPublishBrokerClient } from "./github-publish-broker-client.js";
 import {
   ClientFrameKind,
@@ -73,7 +76,7 @@ afterEach(async () => {
   rmSync(workdir, { recursive: true, force: true });
 });
 
-async function start(): Promise<string> {
+async function start(log?: (message: string) => void): Promise<string> {
   const socketPath = path.join(workdir, "broker.sock");
   server = await createPublishBrokerServer({
     socketPath,
@@ -83,7 +86,7 @@ async function start(): Promise<string> {
     // of the setting is only that it is NOT the shared /tmp; see the constant.
     privateDir: path.join(workdir, "private"),
     env: { PATH: process.env.PATH, HOME: workdir, GH_TOKEN: TOKEN, GITHUB_TOKEN: TOKEN },
-    log: (message: string) => logged.push(message),
+    log: log ?? ((message: string) => logged.push(message)),
   });
   return socketPath;
 }
@@ -444,5 +447,94 @@ describe("the broker's own stderr records how every connection ended", () => {
     ]);
     // Two accepts, two outcomes: the partition balances.
     expect(logged.filter((l) => /: gh in \//.test(l))).toHaveLength(2);
+  });
+
+  describe("a log that throws costs the connection nothing and the sidecar nothing", () => {
+    /** `process.stderr.write` — the default `log` — throws on a broken pipe. */
+    const EPIPE = () => {
+      throw Object.assign(new Error("write EPIPE"), { code: "EPIPE" });
+    };
+
+    it("still delivers EXIT when the outcome log throws", async () => {
+      writeFakeTool("gh", "exit 7");
+      const socketPath = await start((message) => {
+        logged.push(message);
+        // Only the outcome line throws, so the connection reaches `sendExit`
+        // normally and the throw lands exactly on the new chokepoint.
+        if (/: (exit|spawn-failed|refused) /.test(message)) EPIPE();
+      });
+      // Unguarded, this throw escapes `child.on("close")` — an EventEmitter
+      // callback with no `try` above it — and becomes an `uncaughtException`.
+      expect((await call(socketPath, "gh", ["pr", "list"])).code).toBe(7);
+      expect(outcomes()).toEqual(["paperclip-github-broker: exit gh code=7"]);
+    });
+
+    it("keeps serving the NEXT publish — an uncaught throw here kills the sidecar, not the connection", async () => {
+      writeFakeTool("gh", "exit 7");
+      // Throws on every line, including the accept line inside `startChild`:
+      // that one is already inside the handler's `try`, so it becomes a
+      // refusal, which routes straight back into `sendExit` from within a
+      // `catch` block — where a second throw has nothing above it at all.
+      const socketPath = await start(EPIPE);
+      expect((await call(socketPath, "gh", ["pr", "list"])).code).toBe(64);
+      // The point of the row: §6's rollback standard says "a Job that never
+      // renders is indistinguishable from 'the broker broke dispatch'". A
+      // sidecar that died on connection one is exactly that shape.
+      expect((await call(socketPath, "gh", ["pr", "list"])).code).toBe(64);
+    });
+  });
+
+  describe("the refusal reason is bounded", () => {
+    it("caps a detail the caller can make a megabyte long", () => {
+      // `unknown tool ${JSON.stringify(candidate.tool)}` echoes whatever JSON
+      // arrived, and the request cap is 1 MiB.
+      const line = formatBrokerOutcomeLine({
+        outcome: "refused",
+        tool: null,
+        code: 64,
+        detail: `unknown tool ${"A".repeat(200_000)}`,
+      });
+      expect(line.length).toBeLessThan(MAX_OUTCOME_DETAIL_CHARS + 200);
+      expect(line).toContain(OUTCOME_DETAIL_TRUNCATION_MARKER);
+    });
+
+    it("leaves a real refusal whole — the reason is the security-relevant half of the line", () => {
+      // The longest refusal the policy module can author is 341 characters of
+      // static prose; the interpolating ones add a `cwd`, a resolved path and a
+      // roots list. A cap that cut those would turn "an attempted policy
+      // bypass" back into something a bare count cannot separate from a client
+      // stutter, which is the whole reason the detail is kept at all.
+      const realistic = `refusing a working directory outside the shared workspace: \`${"/deep/path".repeat(
+        60,
+      )}\` resolves elsewhere.`;
+      expect(realistic.length).toBeGreaterThan(600);
+      const line = formatBrokerOutcomeLine({ outcome: "refused", tool: "git", code: 64, detail: realistic });
+      expect(line).not.toContain(OUTCOME_DETAIL_TRUNCATION_MARKER);
+      expect(line).toContain(realistic);
+    });
+
+    it("marks a truncation distinctly from a scrub", () => {
+      // A reader has to be able to tell "the rest was too long" from "the rest
+      // was a credential". One marker for both would make a redaction look like
+      // a length accident.
+      expect(OUTCOME_DETAIL_TRUNCATION_MARKER).not.toBe(redactionMarker("vendor-key"));
+      expect(redactionMarker("vendor-key")).not.toContain(OUTCOME_DETAIL_TRUNCATION_MARKER);
+      expect(OUTCOME_DETAIL_TRUNCATION_MARKER).not.toContain(redactionMarker("vendor-key"));
+    });
+
+    it("⛔ scrubs BEFORE it truncates, so a credential straddling the cap cannot leak its prefix", () => {
+      // Order is the security property here. Derived, not a literal, for the
+      // same reason as TOKEN above.
+      const secret = ["gh", "p"].join("") + "_" + "A".repeat(36);
+      // Lands the cap boundary 15 characters INTO the token.
+      const detail = "x".repeat(MAX_OUTCOME_DETAIL_CHARS - 16) + " " + secret;
+      const line = formatBrokerOutcomeLine({ outcome: "refused", tool: null, code: 64, detail });
+      // Truncate-first severs the token below the length its detector matches
+      // on, the scrubber then finds nothing, and the surviving prefix is
+      // emitted verbatim into a log that outlives the pod.
+      expect(line).not.toContain(secret.slice(0, 12));
+      expect(line).not.toContain(secret);
+      expect(line).toContain(OUTCOME_DETAIL_TRUNCATION_MARKER);
+    });
   });
 });
