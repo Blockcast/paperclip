@@ -410,6 +410,36 @@ jobs:
           node --test ./.github/scripts/tests/post-git-egress-residual-trigger-alert.test.mjs
         timeout-minutes: 2
 
+      # PEN-5186. Residual 4 of §8 of the D1 broker enablement plan: two git
+      # config keys the agent owns in its own `.git/config` would reach an exec
+      # inside the container that holds the publish credential, and both are
+      # closed OUTSIDE the broker's own policy list -- `--no-textconv` in
+      # github-git-egress-shim.ts, the injected `core.hooksPath` in
+      # github-git-egress-runtime.ts. §8's review trigger is "2027-01-31, AND on
+      # any change to those two files", and that second clause has been live
+      # since the plan merged with nothing watching it.
+      #
+      # Two arms, and the second is why this runs on EVERY pr rather than only
+      # when those paths are touched: the calendar arm reports the 2027-01-31
+      # review as due and would otherwise be a date in a table with no owner,
+      # which is the PEN-4988 defect this row exists to avoid repeating. Running
+      # it here rather than on a cron is deliberate -- a cron's failure mode is
+      # silence, and silence is byte-identical to clear.
+      #
+      # ⚠ FROM 2027-01-31 THIS STEP GOES RED UNTIL SECURITY RECORDS THE REVIEW.
+      # That is the point of a bound date, and the discharge is two lines in the
+      # script. It is NOT a reason to delete the step.
+      #
+      # Needs the full history and the base/head SHAs; this job already has
+      # `fetch-depth: 0` and exports both, and PR_BASE_SHA falls back to the
+      # merge_group base so the queue sees the same verdict.
+      - name: Check git-egress exec-closure re-read (PEN-5186)
+        if: ${{ !cancelled() }}
+        run: |
+          node --test ./scripts/check-git-egress-exec-closure-reread.test.mjs
+          node ./scripts/check-git-egress-exec-closure-reread.mjs
+        timeout-minutes: 2
+
       - name: Validate Dockerfile deps stage
         if: ${{ !cancelled() }}
         run: |
