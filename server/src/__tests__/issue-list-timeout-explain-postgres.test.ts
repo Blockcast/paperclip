@@ -13,6 +13,7 @@ import {
   ISSUE_LIST_EXPLAIN_FLAG,
   ISSUE_LIST_EXPLAIN_TIMEOUT_MS,
   isStatementTimeoutError,
+  redactBoundValues,
   resetIssueListExplainCaptureBudget,
 } from "../lib/issue-list-timeout-explain.js";
 
@@ -237,6 +238,31 @@ describeEmbeddedPostgres("captureTimedOutIssueListPlan against real PostgreSQL (
       // real assertion below for entirely the wrong reason.
       expect(prepared.some((row) => /pg_catalog\.pg_type/.test(row.statement))).toBe(true);
       expect(prepared.every((row) => !/\bfrom "issues"/.test(row.statement))).toBe(true);
+    } finally {
+      await pinned.$client?.end?.({ timeout: 0 });
+    }
+  });
+
+  it("keeps real EXPLAIN (SETTINGS) values through redaction", async () => {
+    // The format of that line is a server behaviour, so it is asserted against
+    // a real server rather than against a hand-written sample: PG prints
+    // `Settings: work_mem = '64MB', ...` only for GUCs that differ from their
+    // built-in default, which is why they are SET here first.
+    const pinned = createDb(tempDb!.connectionString, 1);
+    try {
+      await pinned.execute(sql.raw("SET work_mem = '64MB'"));
+      await pinned.execute(sql.raw("SET random_page_cost = 1.1"));
+      const rows = (await pinned.execute(buildIssueListExplainQuery(
+        pinned.select({ id: issues.id }).from(issues).where(sql`${issues.title} ILIKE ${"%t%"} ESCAPE '\\'`),
+      ))) as unknown as Record<string, unknown>[];
+      const raw = rows.map((row) => row["QUERY PLAN"]).join("\n");
+      // Positive control: the option must actually have emitted the line, or
+      // the assertion below passes against a plan that never had one.
+      expect(raw).toContain("Settings:");
+      const redacted = redactBoundValues(raw, ["%t%"]);
+      expect(redacted).toContain("work_mem = '64MB'");
+      expect(redacted).toContain("random_page_cost = '1.1'");
+      expect(redacted).not.toContain("'%t%'");
     } finally {
       await pinned.$client?.end?.({ timeout: 0 });
     }

@@ -273,6 +273,20 @@ describe("redactBoundValues", () => {
     expect(redacted).toBe("Filter: ((issues.title ~~* '$2'::text))");
   });
 
+  it("keeps the EXPLAIN (SETTINGS) line, whose quoted values are server GUCs", () => {
+    // Ally review on #3237: SETTINGS is requested precisely because a
+    // non-default planning GUC is often WHY the planner chose what it chose,
+    // and PostgreSQL prints it with quoted values — so a blanket pass 2 reduced
+    // the one option asked for to a list of names. GUCs carry no user data.
+    const plan = "Index Only Scan using pg_class_relname_nsp_index on pg_class  (cost=0.28..2.50 rows=1)\n"
+      + "  Index Cond: (pg_class.relname = 'x'::name)\n"
+      + "Settings: work_mem = '64MB', random_page_cost = '1.1'";
+    const redacted = redactBoundValues(plan, []);
+    expect(redacted).toContain("Settings: work_mem = '64MB', random_page_cost = '1.1'");
+    // ...and every other line is still blanked.
+    expect(redacted).toContain("Index Cond: (pg_class.relname = '?'::name)");
+  });
+
   it("blanks a literal it cannot attribute to any parameter", () => {
     // Pass 2 does not depend on knowing the parameters, so a fragment left by
     // ANY mechanism — a future change to pass 1, or a constant the planner
