@@ -108,9 +108,13 @@ When a human resolves a card whose `continuationPolicy` is `wake_assignee` or
 `wake_assignee_on_accept`, the resolution is consumed into exactly one wake. If
 the issue is `blocked`, that wake is parked `dependency_blocked` rather than
 dispatched, and the parked run is then the **sole carrier** of the decision. The
-park has two terminal bounds — a 12-attempt retry budget (~10h) and a 12h age
-ceiling — and until PEN-5206 either one cancelled the run without writing
-anything anywhere. The card still read `accepted`, so nothing could tell a
+park has two terminal bounds, and they are different *kinds* of bound: a
+12-attempt retry budget and a 12h age ceiling. The retry budget is a count, not
+a duration — the ~10h it takes to reach attempt 12 is the measured elapsed time
+under the current backoff schedule (the two instances below landed at 10h20m and
+10h17m), so it moves if that backoff changes. The 12h ceiling is wall-clock and
+fixed. Until PEN-5206 either one cancelled the run without writing anything
+anywhere. The card still read `accepted`, so nothing could tell a
 delivered decision from a destroyed one.
 
 **Measured instances.** A sweep of all 4,656 issues (2026-11-01) found 494
@@ -161,9 +165,26 @@ not have caught half the measured instances.** Two independent limits:
   not because the sweep missed it, but because that kind is out of population by
   construction.
 
-The thread notice is the signal that covers the whole population: it fires on
-any resolved card of any kind whose carrier is terminated, declared outcome or
-not.
+The thread notice is the signal that covers the whole population of *those two
+bounds*: it fires on any resolved card of any kind whose carrier is terminated
+by the retry budget or the age ceiling, declared outcome or not.
+
+⚠ **Two other paths can also destroy a carrier, and neither writes a notice —
+so "no notice" does not prove "no loss".** Both are judged lower harm, because
+in each the assignee *is* woken and lands on a thread where the card is still
+visible, but neither is covered:
+
+- `cancelQueuedRunForBlockedDependencies` (the PEN-4385 reaper) cancels a queued
+  carrier and promises a wake once the blockers resolve — a promise it keeps.
+- The `blockedInteractionWake` branch
+  (`DEP_BLOCKED_INTERACTION_WAKE_CANCEL_CODE`) cancels a dep-blocked carrier in
+  favour of a replacement run built from the incoming comment wake. That
+  replacement's snapshot comes from the comment, and
+  `normalizeInteractionContinuationWakeContext` has already stripped the
+  interaction keys out of it, so the carried decision is dropped there too.
+
+If you are chasing a decision that went missing on a `blocked` row and find no
+notice, rule those two out before concluding the decision was delivered.
 
 ### Clearing a moot card: acknowledge it, you cannot withdraw it
 

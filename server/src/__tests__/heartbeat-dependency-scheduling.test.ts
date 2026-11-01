@@ -2852,4 +2852,51 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     expect(await readStrandedDecisionNotices(seeded.blockedIssueId)).toHaveLength(0);
     expect(getDepBlockedMetric("dep_blocked_terminated_carrying_decision")).toBe(0);
   });
+
+  it("stays silent when the carried interaction is not in a resolved state", async () => {
+    // The notice claims a human DECIDED something and it was thrown away. That claim
+    // is only true for a terminal status, so the read gates on the same resolved set
+    // `isResolvedInteractionContinuationWakeContext` uses rather than on "a status is
+    // present". This is forward-looking rather than a fix: today's route cannot park a
+    // non-terminal card. If a future snapshot writer ever could, the failure mode is
+    // worse than silence -- a notice reading "was resolved pending" would send a human
+    // to re-issue a decision nobody ever made.
+    const interactionId = randomUUID();
+    const unresolved = (issueId: string) => ({
+      ...carriedDecisionSnapshot(issueId, interactionId),
+      interactionStatus: "pending",
+    });
+    const unresolvedPayload = (issueId: string) => ({
+      ...carriedDecisionPayload(issueId, interactionId),
+      interactionStatus: "pending",
+    });
+    const seeded = await seedBlockedIssueWithPark(unresolved, unresolvedPayload);
+    // The park really is carrying the interaction -- this is a status gate, not the
+    // snapshot-stripping trap the positive tests guard against.
+    expect(seeded.park.contextSnapshot).toMatchObject({
+      interactionId,
+      interactionStatus: "pending",
+    });
+
+    await db
+      .update(heartbeatRuns)
+      .set({
+        scheduledRetryAttempt: DEP_BLOCKED_MAX_RETRY_ATTEMPTS,
+        scheduledRetryAt: new Date(Date.now() - 60_000),
+        updatedAt: new Date(),
+      })
+      .where(eq(heartbeatRuns.id, seeded.park.id));
+
+    await heartbeat.promoteDueScheduledRetries(new Date());
+
+    const terminated = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, seeded.park.id))
+      .then((rows) => rows[0] ?? null);
+    expect(terminated?.status).toBe("cancelled");
+
+    expect(await readStrandedDecisionNotices(seeded.blockedIssueId)).toHaveLength(0);
+    expect(getDepBlockedMetric("dep_blocked_terminated_carrying_decision")).toBe(0);
+  });
 });
