@@ -838,6 +838,15 @@ function headsWithUndispositionedFinding(
     // bucket — it passed the lane and surface checks and was refused later, at
     // comparison time — so `namesFinding` alone would report it as silence and
     // tell Ally to write an entry it has already written, verbatim, on this PR.
+    //
+    // That exclusion has a routing cost in the mixed case — one order-refused
+    // entry alongside one genuinely open finding. Ally is prompted toward the
+    // open one alone, adds it, and the head re-reds with the ordering tail:
+    // two rounds where one would have done. The remedy belongs in the ask
+    // rather than here, because widening this list would re-open the loop
+    // above: a re-submitted review should re-disposition EVERY active finding
+    // at this head against the current head, not only the ones named here as
+    // unnamed. `AGENTS.md` states it that way for authors (PEN-5207).
     const named = (finding: AllyFindingRef) =>
       [...ledger, ...refusedByAuthorLane, ...refusedOffReviewSurface].some(
         (prior) =>
