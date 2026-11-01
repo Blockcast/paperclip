@@ -163,7 +163,21 @@ export function createIsolationReclaimJobPort(
         { name: podName, namespace, container },
         requestOptions(RECLAIM_PORT_LOG_TIMEOUT_MS),
       );
-      return typeof raw === "string" ? raw : "";
+      // Unreachable against client-node v1, which types this `Promise<string>`.
+      // It throws rather than coercing to `""` because a coercion here would
+      // break this module's own rule: the runner reads an empty log as
+      // `report_absent` — "go and look at the pod" — for what would really be
+      // the client changing shape under us, and the pod would have nothing to
+      // say. Throwing reaches the runner as `log_unreadable`, which names
+      // `pods/log` and is where the fault would actually be. (Ally, #3201.)
+      if (typeof raw !== "string") {
+        throw new TypeError(
+          `pods/log for ${podName}/${container} returned ${
+            raw === null ? "null" : typeof raw
+          }, not a string; the Kubernetes client's log return type has changed`,
+        );
+      }
+      return raw;
     },
   };
 }
