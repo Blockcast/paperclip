@@ -2382,6 +2382,13 @@ function issueListOrderBy(
       : [activityOrder, updatedOrder, idOrder];
   }
 
+  // PEN-5213: `priorityOrder` leads here, and `issues_company_last_activity_idx`
+  // is `(company_id, last_activity_at DESC)` -- it does not carry the priority
+  // CASE, so it cannot serve THIS ordering and the planner still sorts the
+  // candidate set. The win on this branch is the removal of the two per-row
+  // correlated subqueries, not an index scan. `sortField === "updated"` above
+  // is the only no-search ordering the index can serve; see shapes E1/E2 in
+  // `packages/db/src/issues-list-production-scale-plan-shape.bench.ts`.
   return [
     hasSearch ? asc(searchOrder) : asc(priorityOrder),
     asc(priorityOrder),

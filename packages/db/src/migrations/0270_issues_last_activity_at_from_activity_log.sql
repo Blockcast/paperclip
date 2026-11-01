@@ -62,6 +62,16 @@
 -- NO KEY UPDATE on its issue where it previously took FOR SHARE, so two
 -- concurrent read-marks of the SAME issue serialise. That is a per-user action
 -- on a single row; the deadlock it buys out is not.
+--
+-- The lock pass also runs BEFORE the `last_activity_at < latest_at` guard is
+-- evaluated, so a non-excluded AGENT-actor insert now holds NO KEY UPDATE on
+-- its issue until commit even when no write follows -- where before this
+-- migration it took no issue lock at all. Sharing a transaction with the
+-- `issues` UPDATE (the dominant case) that costs nothing, because the lock is
+-- already held. Written in its OWN transaction it is a new conflict with the
+-- digest's reader. Accepted deliberately: the alternative is to guard first and
+-- lock second, which re-opens the two-pass cycle above, and the hold is one
+-- row for the length of one short write transaction.
 CREATE OR REPLACE FUNCTION "activity_log_bump_issue_last_activity_at"()
 RETURNS trigger
 LANGUAGE plpgsql
