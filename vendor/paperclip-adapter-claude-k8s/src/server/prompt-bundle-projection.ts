@@ -483,11 +483,36 @@ export const PROMPT_BUNDLE_MAX_INSTRUCTION_SIBLINGS = 32;
  * reports what it resolved and never invents a path, because an `items[]` entry whose key
  * has no Secret value is a pod that cannot start.
  *
+ * ⛔ THE ROOT IS AGENT-WRITABLE, so containment is checked on REALPATHS and an escaping
+ * symlink is a `PromptBundleSymlinkEscapesTreeError`, not a skip. A lexical check alone
+ * fails open on exactly the input it exists to reject, because the stat and the read both
+ * follow links; the agent could then name a file, point it anywhere the SERVER process can
+ * read, and have those bytes delivered into a Secret mounted in its own pod. Callers must
+ * read `realPath` — the path this function approved — and never re-join root + `relPath`.
+ *
  * ONE LEVEL, deliberately. Transitive references are not followed: `HEARTBEAT.md` names
  * `HEARTBEAT-CASELAW.md`, and following that edge re-admits the 674 KB the first table
  * rules out. "What the charter itself names" is the line, and it is the line the
  * done-when is written against.
  */
+export interface ResolvedInstructionSibling {
+  /**
+   * Path relative to the instructions root, exactly as the charter named it, POSIX
+   * separators. This is the LINK's path when the name is a symlink — matching
+   * `collectSkillFiles`, and matching what the pod reads on today's shared claim.
+   */
+  relPath: string;
+  /**
+   * The REALPATH whose containment this function approved.
+   *
+   * Read THIS, never a re-join of `root + relPath`. A second traversal of the same name
+   * can follow a link swapped since the check, so re-joining would deliver bytes from a
+   * path that was never approved — the TOCTOU `collectSkillFiles` closes the same way,
+   * by reading the realpath it checked.
+   */
+  realPath: string;
+}
+
 export async function resolveNamedInstructionSiblings(input: {
   /** The entry file's raw bytes as text, BEFORE the generated path directive is appended. */
   entryContents: string;
@@ -496,7 +521,7 @@ export async function resolveNamedInstructionSiblings(input: {
   /** Absolute path of the entry file itself, which is carried separately and excluded here. */
   instructionsFilePath: string;
   maxSiblings?: number;
-}): Promise<string[]> {
+}): Promise<ResolvedInstructionSibling[]> {
   const root = input.instructionsRootPath.trim();
   if (!root || !input.entryContents) return [];
   const maxSiblings = input.maxSiblings ?? PROMPT_BUNDLE_MAX_INSTRUCTION_SIBLINGS;
@@ -506,32 +531,75 @@ export async function resolveNamedInstructionSiblings(input: {
   // because the existence test below is the real filter, and a permissive pattern that
   // then fails to resolve is cheap, while a strict one silently misses a named file.
   const NAMED = /(?:\$AGENT_HOME\/|\.\/)?((?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_-]+\.[A-Za-z0-9]+)/g;
-  const entryRealPath = path.resolve(input.instructionsFilePath);
-  const rootResolved = path.resolve(root);
-  const prefix = rootResolved.endsWith(path.sep) ? rootResolved : `${rootResolved}${path.sep}`;
+  // Resolved ONCE, and every containment test below is made against THIS rather than
+  // against the configured string — the same reason `collectSkillFiles` realpaths its
+  // root. The instructions root routinely sits under a mount reached through a
+  // symlinked component, and a perfectly within-tree target would then not share the
+  // unresolved prefix and would be refused as an escape.
+  const realRoot = await realpathOrNull(path.resolve(root));
+  // A root that resolves nowhere carries no siblings. Same disposition as a named file
+  // that is absent, and the same as today's shared-claim path, which simply ENOENTs.
+  if (realRoot === null) return [];
+  // Best-effort: this is only used to exclude the entry file from its own sibling set,
+  // and a lexical fallback still excludes it on the overwhelmingly common path where no
+  // link is involved.
+  const entryRealPath =
+    (await realpathOrNull(path.resolve(input.instructionsFilePath))) ?? path.resolve(input.instructionsFilePath);
 
   const seen = new Set<string>();
-  const resolved: string[] = [];
+  const resolved: ResolvedInstructionSibling[] = [];
   for (const match of input.entryContents.matchAll(NAMED)) {
     const candidate = match[1];
     if (!candidate || seen.has(candidate)) continue;
     seen.add(candidate);
-    const abs = path.resolve(rootResolved, candidate);
-    // Containment, checked on the RESOLVED path so a `../` inside the reference cannot
-    // walk out of the tree and project something the agent never had access to.
-    if (!abs.startsWith(prefix)) continue;
-    // The entry file travels as `agent-instructions.md`; projecting it again here would
-    // deliver the same bytes twice and charge the budget for both.
-    if (abs === entryRealPath) continue;
-    try {
-      const st = await fs.stat(abs);
-      if (!st.isFile()) continue;
-    } catch {
-      // Named but absent, or unreadable. Not an error: a charter may name a file the
-      // agent has not written yet, and today's shared-claim path shows the same ENOENT.
-      continue;
+    const abs = path.resolve(realRoot, candidate);
+    // Cheap LEXICAL pre-filter, on path boundaries, so a `../` inside the reference
+    // cannot walk out of the tree. It is DROPPED rather than refused: the regex above is
+    // deliberately permissive, so a `../notes.md` token is ordinary charter prose quoting
+    // a path in another tree, it names a file the agent never claimed to hold, and
+    // refusing would abort runs that work today. The symlink check below is the one that
+    // refuses; the asymmetry is argued there.
+    if (!isWithinTree(realRoot, abs)) continue;
+    // ⛔ THE CHECK THAT ACTUALLY CONTAINS THIS. The lexical test above proves nothing on
+    // its own, because `stat` and `readFile` both FOLLOW symlinks and THE INSTRUCTIONS
+    // ROOT IS AGENT-WRITABLE (it is the agent's own durable register — see the docstring).
+    // So an agent can replace any name its charter mentions with a link: write
+    // `HEARTBEAT.md -> ` another company's tree, or a path only the SERVER process has,
+    // and the server would copy those bytes into a Secret mounted in the agent's own pod.
+    // That crosses the server->pod boundary in the agent's favour, which is the exact
+    // reverse of what this channel exists to do.
+    const realPath = await realpathOrNull(abs);
+    // Named but absent, or a dangling link. Not an error: a charter may name a file the
+    // agent has not written yet, and today's shared-claim path shows the same ENOENT.
+    if (realPath === null) continue;
+    if (!isWithinTree(realRoot, realPath)) {
+      // REFUSED, where the `../` case above is dropped, and the difference is not
+      // squeamishness. A `../` token is free to produce by accident; a symlink sitting at
+      // a named sibling's own path is not prose and has no innocent reading. It also
+      // DELIVERS its target's bytes on today's shared claim, exactly as a skill-tree link
+      // does — so silently stepping over it would be a silent delivery regression on top
+      // of hiding an escape attempt. Identical posture, and identical error type, to
+      // `collectSkillFiles`.
+      throw new PromptBundleSymlinkEscapesTreeError({
+        // `skillKey` names the tree, and the bundle directory names it precisely enough —
+        // the same reuse, for the same reason, as the over-count refusal below.
+        skillKey: PROMPT_BUNDLE_INSTRUCTIONS_DIR,
+        linkPath: candidate,
+        resolvedTarget: realPath,
+        treeRoot: realRoot,
+      });
     }
-    resolved.push(path.relative(rootResolved, abs).split(path.sep).join("/"));
+    // The entry file travels as `agent-instructions.md`; projecting it again here would
+    // deliver the same bytes twice and charge the budget for both. Compared on realpaths,
+    // so a link pointing back at the entry file is excluded too.
+    if (realPath === entryRealPath) continue;
+    // Stat the RESOLVED path, not the name. Both give the target's type, but this is the
+    // path that was just containment-checked, so the bytes classified here — and read by
+    // the caller, which is handed this same string — are provably the bytes whose
+    // location was approved.
+    const st = await statOrNull(realPath);
+    if (st === null || !st.isFile()) continue;
+    resolved.push({ relPath: path.relative(realRoot, abs).split(path.sep).join("/"), realPath });
     if (resolved.length > maxSiblings) {
       // Reuses the skill-tree refusal rather than minting a new one: the message already
       // says "refusing rather than truncating", which is the posture, and `skillKey` is
@@ -541,7 +609,7 @@ export async function resolveNamedInstructionSiblings(input: {
   }
   // Sorted so the projection — and therefore the content-addressed bundle key — is stable
   // across runs with the same charter, for the same prompt-cache reason the skill walk sorts.
-  return resolved.sort((left, right) => left.localeCompare(right));
+  return resolved.sort((left, right) => left.relPath.localeCompare(right.relPath));
 }
 
 /**
@@ -600,6 +668,30 @@ type PendingDir = {
  */
 function isWithinTree(root: string, candidate: string): boolean {
   return candidate === root || candidate.startsWith(root.endsWith(path.sep) ? root : `${root}${path.sep}`);
+}
+
+/**
+ * `realpath`, with "resolves nowhere" reported as null and every other errno rethrown.
+ *
+ * ⚠️ NARROW, NOT `catch(() => null)` — the same argument `collectSkillFiles` makes
+ * inline. A blanket catch calls EACCES, EIO and a transient CephFS fault "absent", and
+ * absent is a SILENT disposition here: the file is simply not projected, the Job still
+ * starts, and the agent comes up missing an instruction file for a reason nothing
+ * recorded. Only these three errnos actually mean the path resolves nowhere.
+ */
+async function realpathOrNull(target: string): Promise<string | null> {
+  return await fs.realpath(target).catch((err: NodeJS.ErrnoException) => {
+    if (err?.code === "ENOENT" || err?.code === "ENOTDIR" || err?.code === "ELOOP") return null;
+    throw err;
+  });
+}
+
+/** `stat`, narrowed the same way and for the same reason as `realpathOrNull`. */
+async function statOrNull(target: string): Promise<Awaited<ReturnType<typeof fs.stat>> | null> {
+  return await fs.stat(target).catch((err: NodeJS.ErrnoException) => {
+    if (err?.code === "ENOENT" || err?.code === "ENOTDIR" || err?.code === "ELOOP") return null;
+    throw err;
+  });
 }
 
 /**
@@ -770,6 +862,21 @@ export async function buildPromptBundleSecretProjection(input: {
   instructionsRootPath?: string;
   /** Absolute path of the entry file, needed to exclude it from its own sibling set. */
   instructionsFilePath?: string;
+  /**
+   * The entry file's RAW bytes as text, BEFORE the generated path directive is appended —
+   * and the only thing the sibling set is derived from.
+   *
+   * ⚠️ NOT a convenience duplicate of `instructionsContents`, and passing that instead is
+   * the bug this parameter exists to prevent. `instructionsContents` is `raw + directive`,
+   * and the foreign-claim directive itself names `./HEARTBEAT.md`, `./SOUL.md` and
+   * `./TOOLS.md`. Deriving from it would therefore project those three whenever they
+   * happen to exist, whether or not the charter ever named one — the directive would be
+   * selecting its own payload, the budget measurement would be of a different set than the
+   * one that ships, and "the set is derived from the charter" would quietly stop being true.
+   *
+   * Omitting it projects the entry file alone, which is the pre-PEN-5183 behaviour.
+   */
+  instructionsEntryContents?: string;
   /** Where THIS process reaches the data volume (`SELF_POD_DATA_MOUNT_PATH`). */
   serverDataMountPath?: string;
   /**
@@ -810,17 +917,23 @@ export async function buildPromptBundleSecretProjection(input: {
     //
     // Gated on `instructionsRootPath` being supplied rather than on the claim, because
     // this module does not know about claims — the caller already made that decision by
-    // reaching the delivery path at all.
-    if (input.instructionsRootPath && input.instructionsFilePath) {
+    // reaching the delivery path at all. `instructionsEntryContents` is required too:
+    // without the raw bytes there is nothing to derive a charter-named set FROM, and
+    // falling back to `instructionsContents` would silently re-admit the directive's own
+    // three names (see that parameter's doc).
+    if (input.instructionsRootPath && input.instructionsFilePath && input.instructionsEntryContents) {
       const siblings = await resolveNamedInstructionSiblings({
-        entryContents: input.instructionsContents,
+        entryContents: input.instructionsEntryContents,
         instructionsRootPath: input.instructionsRootPath,
         instructionsFilePath: input.instructionsFilePath,
       });
-      for (const relPath of siblings) {
-        const contents = await fs.readFile(path.resolve(input.instructionsRootPath, relPath));
+      for (const sibling of siblings) {
+        // The REALPATH that was containment-checked, never a re-join of root + relPath:
+        // re-joining traverses the name a second time and can follow a link swapped since
+        // the check, delivering bytes from a path nothing approved.
+        const contents = await fs.readFile(sibling.realPath);
         files.push({
-          bundlePath: path.posix.join(PROMPT_BUNDLE_INSTRUCTIONS_DIR, relPath),
+          bundlePath: path.posix.join(PROMPT_BUNDLE_INSTRUCTIONS_DIR, sibling.relPath),
           contents,
           byteLength: contents.length,
           utf8: decodeUtf8Strict(contents),
