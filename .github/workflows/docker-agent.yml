@@ -608,9 +608,22 @@ jobs:
   bump-agent-image:
     needs: build-and-push
     if: ${{ github.event_name != 'workflow_dispatch' && needs.build-and-push.result == 'success' }}
+    # BLO-51304: a ~15 s curl needs no Docker daemon, so it must not queue on
+    # the one-runner dind lane. There it waited behind the NEXT run's whole
+    # build-and-push (released from its concurrency group at the same instant),
+    # ~40-60 min. arc-paperclip-general admits this file already (it runs
+    # resolve-on-success) and uses the same arc-runner image (curl, jq).
     runs-on:
-      group: arc-paperclip-dind
-      labels: arc-paperclip-dind
+      group: arc-paperclip-general
+      labels: arc-paperclip-light
+    # BLO-51304: serialize bumps in build order. Builds already run one at a
+    # time in order (docker-agent-<ref>), so bumps queue in the same order; a
+    # newer pending bump replaces an older pending one. Without this, two
+    # queued bumps could run newest-first and roll agents BACK to the older
+    # image (agent-image-bump.ts has no newer-than check).
+    concurrency:
+      group: docker-agent-bump-${{ github.ref }}
+      cancel-in-progress: false
     environment: paperclip-production
     timeout-minutes: 10
     env:

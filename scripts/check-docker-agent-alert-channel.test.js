@@ -509,3 +509,13 @@ test("the step-block extractor cannot bleed into a later step", () => {
   );
   assert.match(control, /control \(b\): wrapper directory absent/, "fixture check: it kept its own body");
 });
+
+// BLO-51304: the bump queued on the one-runner dind lane behind the next run's
+// whole build, and two queued bumps could run newest-first and roll production
+// agents back to the older image.
+test("the agent image bump runs off the dind lane, serialized in build order", () => {
+  const bumpJob = executableLines(getJobBlock("bump-agent-image"));
+  assert.doesNotMatch(bumpJob, /arc-paperclip-dind/, "the bump is a curl; it must not wait for the one dind runner");
+  assert.match(bumpJob, /^\s*group: docker-agent-bump-\$\{\{ github\.ref \}\}$/m);
+  assert.match(bumpJob, /^\s*cancel-in-progress: false$/m);
+});
