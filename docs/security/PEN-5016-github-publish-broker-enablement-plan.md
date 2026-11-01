@@ -277,10 +277,45 @@ Two readings, reproduced in this run's own pod (`safe-env-inspect.mjs`, image
 
 `Devops.adapterConfig.env` carries no GitHub credential name either.
 
-**Gate item:** a board/human read of project- and environment-scope `env` for the stage population,
-confirming no GitHub credential name is bound at any scope. Until #3089 lands this is the only thing
-standing between "broker enabled" and "broker enabled while the agent still holds a token", and no
-agent can perform it.
+**Gate item — ⚠ RE-CLASSIFIED 2026-11-01 (CTO, PEN-5184). Read the correction below before acting on
+it.** A board/human read of project- and environment-scope `env` for the stage population, confirming
+no GitHub credential name is bound at any scope. No agent seat can perform it: `GET
+/api/environments/:id` returns `403 Board access required`, reproduced independently from the Devops
+and CTO seats on 2026-11-01.
+
+⛔ **The sentence that used to stand here — "until #3089 lands this is the only thing standing between
+'broker enabled' and 'broker enabled while the agent still holds a token'" — has expired, and it
+expired in the direction that misleads.** #3089 landed: `99905d39b`, on `master`, carried as
+discharged by both §11.1 and §7. The conditional lapsed and the claim did not move with it, so this
+section went on asking a human for a barrier that code already provides — and a board card was filed
+quoting it.
+
+**What #3089 actually does**, read at source on `master` 2026-11-01 — grep the symbol, never the line
+(PEN-5091). `findAgentGitHubCredentialEnvNames`
+(`vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts`) matches `GH_TOKEN`,
+`GITHUB_TOKEN`, `GITHUB_PERSONAL_ACCESS_TOKEN` and `GH_SEAT_TOKEN_VALUE`. Its sole call site runs
+under `if (brokerEnabled)` against `envVars` — **the assembled agent-container env, after every scope
+has merged** — so it is **scope-agnostic by construction**, which is precisely the property this gate
+item was asking a human to supply. It matches on NAME, and a `valueFrom` / `secretKeyRef` counts
+exactly as much as a literal. On a hit `buildJobManifest` **throws and the pod does not render**,
+naming the remedy in its own message. `job-manifest.github-publish-broker.test.ts` asserts the throw
+for all four names and carries a **positive control** (broker off ⇒ the seat credential does render).
+§11.6 check 5 re-asserts this mechanically at the gate.
+
+**So this item is no longer a security barrier. It is operational — and it is still worth doing.** The
+failure mode it now catches is loud rather than silent: if a GitHub credential name *is* bound at a
+scope nobody can read, the first consequence of flipping the gate is that **every brokered agent
+fails to render**, an outage discovered during the soak rather than a credential quietly left in
+place. The read is how that is found beforehand. ✅ **Re-dated accordingly — it gates stage 2, not
+stage 1 (§11.3).**
+
+⚠ **One residual it does not reach, and must not be credited with.**
+`findAgentGitHubCredentialEnvNames` reads the container's `env` LIST only; it cannot cover `envFrom`,
+whose `secretRef` keys live in the Secret rather than the PodSpec. That route is
+`selfPod.inheritedEnvFrom` (server-pod inheritance), **not** scope-level config, which is an `env`
+map — so the board read does not close it either, and neither item should be cited as covering it. It
+stays where it already is, §7.3 of the decision doc. Do not read a green render as "no credential in
+this container".
 
 ### 3.5 Two fail-closed refusals that did not exist when this plan was written
 
@@ -524,7 +559,8 @@ silent broker and a broker nobody asked to publish are the same observation (§5
 **Stage 1 — one agent, one company.** **Does not start on a date. It starts when every precondition
 below is on `master`**, target **2026-11-06**, which is an earliest-start and not a commitment (CTO,
 2026-10-29). Duration ≥ 3 working days. ✅ **Set in §11.3, with the mechanical entry gate in §11.6 —
-none of whose four checks fails as measured 2026-10-30, two of the four being perishable and owed a
+none of whose five checks fails as measured (1-4 on 2026-10-30, 5 on 2026-11-01), three of the five
+being perishable and owed a
 re-run at the gate (§11.6 is authoritative; a green there is not a go).**
 
 **Stage 1's precondition set — all must be on `master`. ⛔ Confirm each by its LANDED commit, or by
@@ -769,7 +805,7 @@ applied `:7060`), `BROKERED_POD_COMPOSITION_CONFIG_KEYS` (`:2911`, three keys),
 comment's word.
 
 ⛔ **Six of six is not a stage-1 start.** It satisfies §11.3's condition 1 only. §11.3's date floor
-(stage 1 earliest `2026-11-06`) and §11.6's four checks both still govern, and §11.6's checks 3 and 4
+(stage 1 earliest `2026-11-06`) and §11.6's five checks both still govern, and §11.6's checks 3, 4 and 5
 are perishable measurements that must be re-run at the gate. See §11.6.
 
 ⭐ **The #3098 row was falsified by the merge batch that published this section, and that is worth
@@ -914,6 +950,27 @@ re-affirmed here. Stage 0 carries **no PR merges**, sets no gate, and does **not
 #3112; it can complete with both still open. Its exit is the §7 list — saved §5.3 broker queries, §4
 re-read, §3.5a pre-flight, the §3.4 board-level env read, the §5.1 node baseline.
 
+⚠ **Stage-0 exit does not gate stage 1, and never did — stated here because the opposite was being
+assumed.** Stage 1's start is conditioned on exactly the two items below: §11.1 six-of-six, and
+§11.6. Of stage 0's five exit items, only two appear there (§4 trigger-2 and §3.5a, as §11.6 checks 3
+and 4). The §5.3 saved queries, the §3.4 env read and the §5.1 baseline appear in neither, so **as
+written, an unanswered §3.4 read does not move stage 1's earliest start by a day.** Anyone reasoning
+"stage 0 slipped, therefore stage 1 slips" is reasoning from a dependency this plan does not contain.
+
+✅ **CTO ruling, 2026-11-01 (PEN-5184), on the one item that can realistically slip.** The §3.4
+board-level env read is **re-classified as operational rather than a security barrier** — #3089
+enforces its property fail-closed at render time and scope-agnostically (§3.4) — and it is
+**re-dated to gate stage 2, not stage 1.** Three consequences, each deliberate:
+
+- **Stage 0 still exits `2026-11-05`, and stage 1's earliest start stays `2026-11-06`.** Neither
+  moves for this item. A dependency is not invented to make an exit list come true.
+- **If §3.4 is still unanswered on `2026-11-05`, stage 0 exits with it recorded as *carried*, not
+  discharged**, on its own row so that it does not die with the stage that raised it.
+- **It must be in hand before stage 2.** Stage 1 is one agent, and a successful stage-1 render is
+  *stronger* evidence than the read for that agent's scope chain — #3089 would have thrown — but it
+  proves one pod. Stage 2 is the first point at which a scope-wide binding could refuse a whole
+  company's fleet at once, which is where a census earns its keep.
+
 **Stage 1 — one agent, one company. No calendar start date, by design. Earliest start `2026-11-06`.
 SET as a conditional start.** A date that fires before its preconditions is not a date, it is an
 instruction to skip them. Stage 1 starts on the first working day after **both** of these hold:
@@ -981,7 +1038,7 @@ watch too.
 telemetry, trigger 4 has a measurement and not a detector (PEN-4989). D1 does not close it; it makes
 it matter less. Recorded here so that discharging §7.1 is not read as closing it.
 
-### 11.6 Stage-1 entry gate — four checks, all mechanical
+### 11.6 Stage-1 entry gate — five checks, all mechanical
 
 Run these in order immediately before starting stage 1. Each is a command, not a judgement, and each
 has a stated failing value, so "I checked" is falsifiable.
@@ -992,16 +1049,26 @@ has a stated failing value, so "I checked" is falsifiable.
 | 2 | §11.1 ledger | six of six on `master` | ✅ **six of six — PASSES** as measured 2026-10-30T11:1xZ on `584068888`. ⚠ The sixth is discharged by **content on `master`**, #3112 having been closed unmerged — a check that reads `merged` fails this row wrongly (§11.1, §11.2) |
 | 3 | §4 trigger-2 query, re-read over a window overlapping stage 0 | zero broad renders, with the liveness control | ✅ **pass** (§11.7) |
 | 4 | §3.5a privilege pre-flight across the stage-1 population | no privileged container beside the broker | ✅ **pass** (§11.7) |
+| 5 | #3089's env-credential refusal is live on `master` | `findAgentGitHubCredentialEnvNames` is called under `brokerEnabled` in `job-manifest.ts`, **and** its test asserts the throw for all four credential names with the positive control intact | ✅ **pass** — read at source 2026-11-01 (§3.4, PEN-5184) |
 
-**None of the four fails as measured on 2026-10-30. ⛔ That is NOT a stage-1 go, and this row must
-not be read or cited as one.** Three things still stand between this table and a start, and the
-first of them is unconditional:
+⭐ **Check 5 is new (2026-11-01, PEN-5184), and it is a tightening rather than an addition for its own
+sake.** §3.4's board-level env read was the gate standing in this position, and no agent seat can
+satisfy it — so the gate it named could never be mechanically evaluated at all. #3089 now enforces
+the same property fail-closed at render time, scope-agnostically (§3.4). Check 5 tests **that
+control**, which is testable, instead of a human read that is not. It is also the check that would
+notice the control being removed: the refusal is one `if` block and one call site, and §7.5's lesson
+is that a list is only as complete as its last edit.
+
+**None of the five fails as measured — checks 1-4 on 2026-10-30, check 5 on 2026-11-01. ⛔ That is NOT
+a stage-1 go, and this row must not be read or cited as one.** Three things still stand between this
+table and a start, and the first of them is unconditional:
 
 1. **§11.3's date floor governs and is not satisfied.** Stage 0 is `2026-11-05`; stage 1 is earliest
-   `2026-11-06`. Four green checks on 2026-10-30 do not move that by a day. The checks are a
+   `2026-11-06`. Five green checks do not move that by a day. The checks are a
    *necessary* condition that §11.3's condition 2 names — never a sufficient one.
-2. **Checks 3 and 4 are perishable, and this row is the measurement that proves it.** Both are
-   point-in-time reads of a live fleet. Re-run them in order immediately before starting stage 1 and
+2. **Checks 3, 4 and 5 are perishable, and this row is the measurement that proves it.** Checks 3
+   and 4 are point-in-time reads of a live fleet; check 5 is a point-in-time read of `master`, which
+   moves just as freely. Re-run them in order immediately before starting stage 1 and
    again at every widening — **never cite this row for them.** A green recorded on 2026-10-30 says
    nothing about the population on 2026-11-06.
 3. **The go/no-go is the plan owners' (PEN-5016 / Security), not a document's.** This section is a
