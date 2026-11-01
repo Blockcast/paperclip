@@ -239,10 +239,24 @@ function renderExplain(query: SQL): { sql: string; params: unknown[] } | null {
  * a future change to pass 1, a constant the planner inlined from somewhere else
  * — is removed regardless.
  *
- * Nothing load-bearing is lost. PostgreSQL double-quotes identifiers, so table,
- * column, index and function names survive, and costs, row estimates, widths,
- * node types and operators are never quoted. The plan SHAPE, which is the whole
- * artifact, is untouched.
+ * The plan SHAPE survives: PostgreSQL double-quotes identifiers, so table,
+ * column, index and function names are untouched, and costs, row estimates,
+ * widths, node types and operators are never quoted.
+ *
+ * The `Settings:` line is the ONE exception, and it is excluded by name.
+ * `ISSUE_LIST_EXPLAIN_OPTIONS` asks for `SETTINGS` precisely because a non-default
+ * planning GUC is often WHY the planner chose what it chose — and PostgreSQL
+ * prints that line with quoted values:
+ *
+ * ```
+ * Settings: work_mem = '64MB', random_page_cost = '1.1'
+ * ```
+ *
+ * so a blanket pass 2 would reduce the one option asked for to a list of names
+ * and silently make it useless. Those values are server configuration and can
+ * carry no user data, so skipping them widens nothing — and `containsBoundValue`
+ * still scans the whole text including this line, so the fail-closed guarantee is
+ * unchanged even there.
  */
 export function redactBoundValues(text: string, params: readonly unknown[]): string {
   const stringParams = params
@@ -271,7 +285,22 @@ export function redactBoundValues(text: string, params: readonly unknown[]): str
  * quote is matched whole rather than ending early and leaving its tail behind.
  */
 function stripNonPlaceholderLiterals(text: string): string {
-  return text.replace(/'((?:[^']|'')*)'/g, (literal, inner: string) =>
+  return text
+    .split("\n")
+    // `Settings:` carries server GUCs, never bound values — see pass 2 above.
+    .map((line) => (SETTINGS_LINE_PATTERN.test(line) ? line : stripLiteralsInLine(line)))
+    .join("\n");
+}
+
+/**
+ * The `EXPLAIN (SETTINGS)` line. In `FORMAT TEXT` it is a single line listing
+ * every planning GUC that differs from its built-in default. Verified against a
+ * real server: `Settings: work_mem = '64MB', random_page_cost = '1.1'`.
+ */
+const SETTINGS_LINE_PATTERN = /^\s*Settings:\s/;
+
+function stripLiteralsInLine(line: string): string {
+  return line.replace(/'((?:[^']|'')*)'/g, (literal, inner: string) =>
     /^\$\d+$/.test(inner) ? literal : "'?'");
 }
 
