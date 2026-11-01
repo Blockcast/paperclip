@@ -16611,21 +16611,66 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const nextAttemptCount = priorAttemptCount + 1;
     const policy = normalizeIssueExecutionPolicy(claimed.executionPolicy ?? null);
     const monitor = policy?.monitor ?? null;
+    const parsedExecutionState = parseIssueExecutionState(claimed.executionState);
+    // PEN-5170: resolve the monitor's BOUNDS through `derivePersistedMonitorState`
+    // rather than off `policy.monitor` alone, so this site asks the question the
+    // other two persisted-row consumers already ask.
+    //
+    // `buildIssueMonitorTriggeredPatch` runs every fired monitor through
+    // `stripMonitorFromExecutionPolicy`, which rest-spreads the monitor out and —
+    // by its own emptiness rule — returns null outright for the monitor-only
+    // policy that is the common arming shape. The budget is not lost: the fire
+    // copies it into `executionState.monitor` via `monitorMetadataFromState`, and
+    // that is where it then lives. Both sibling consumers read it there —
+    // `tickExpiredIssueMonitors` below builds its monitor from
+    // `derivePersistedMonitorState`, and `readIssueMonitorBounds`
+    // (terminal-gate-reconciler.ts) reads `executionState.monitor` with its own
+    // documented rationale. This site read the stripped side, so a row carrying an
+    // explicit `maxAttempts: 40` was judged at dispatch against
+    // DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS (24) while the expiry sweep judged the
+    // same row against 40 — PEN-3803's defect (two call sites, one bound, two
+    // answers) at a site PEN-3803 did not touch. The state it bites in is already
+    // named twice below as the "executionPolicy/monitor_* column drift the claim
+    // query does not exclude".
+    //
+    // `derivePersistedMonitorState` prefers the policy monitor whenever one is
+    // present and falls back to `executionState.monitor` only when it is absent,
+    // so an armed row resolves exactly as before; this changes only the drifted
+    // row, and only toward the bound the operator actually declared. Deliberately
+    // all-or-nothing per side rather than field-by-field — that is the same rule
+    // the helper already applies to its own metadata, and mixing the two sides
+    // would invent a monitor neither write ever recorded.
+    //
+    // Scope is the bound and what reports it: `monitorMetadata` now describes the
+    // monitor the decision was actually made against (reporting null beside a
+    // clear made at 40 was the contradiction this row objects to), and
+    // `recoveryPolicy` matches the sweep so exhaustion retires a drifted row
+    // through its configured policy rather than the `wake_owner` default. Wake
+    // ROUTING below is deliberately left on `policy.monitor`: the watchdog and
+    // provider-quota branches describe the wake currently armed, they consume
+    // fields (`gateSignals`) and rebuilds (`{...monitor, nextCheckAt}`) that only
+    // a live policy monitor can supply, and both already guard the drifted row
+    // explicitly.
+    const persistedMonitor = derivePersistedMonitorState({
+      issue: claimed,
+      state: parsedExecutionState,
+      policy,
+    });
+    const monitorMetadata: IssueExecutionMonitorPolicyLike = {
+      serviceName: persistedMonitor?.serviceName ?? null,
+      timeoutAt: persistedMonitor?.timeoutAt ?? null,
+      maxAttempts: persistedMonitor?.maxAttempts ?? null,
+      recoveryPolicy: persistedMonitor?.recoveryPolicy ?? null,
+    };
     const clearReason = exhaustedMonitorClearReason({
-      monitor,
+      monitor: monitorMetadata,
       attemptCount: priorAttemptCount,
       now: input.now,
       defaultMaxAttempts: DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
     });
-    const recoveryPolicy = monitorRecoveryPolicy(monitor);
-    const monitorMetadata = {
-      serviceName: monitor?.serviceName ?? null,
-      timeoutAt: monitor?.timeoutAt ?? null,
-      maxAttempts: monitor?.maxAttempts ?? null,
-      recoveryPolicy: monitor?.recoveryPolicy ?? null,
-    };
+    const recoveryPolicy = monitorRecoveryPolicy(monitorMetadata);
     const executionState = claimed.status === "in_review"
-      ? parseIssueExecutionState(claimed.executionState)
+      ? parsedExecutionState
       : null;
     const currentParticipant = executionState?.status === "pending"
       ? executionState.currentParticipant
