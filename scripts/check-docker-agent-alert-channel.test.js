@@ -227,7 +227,7 @@ test("alert delivery failure is fatal, not swallowed", () => {
 // image bump for three consecutive commits — images promoted to Harbor, cluster
 // refs never advanced, and `pending_image_bump` null so nothing retried either.
 test("the cluster image bump retries a transient 5xx before failing the job", () => {
-  const buildJob = getJobBlock("build-and-push");
+  const buildJob = getJobBlock("bump-agent-image");
   const bumpStep = buildJob.slice(buildJob.indexOf("name: Bump agent image refs in cluster"));
 
   assert.match(bumpStep, /max_attempts=(\d+)/, "the bump must bound its retries");
@@ -245,7 +245,7 @@ test("the cluster image bump retries a transient 5xx before failing the job", ()
 });
 
 test("a 4xx is not retried, because retrying a deterministic rejection only delays the failure", () => {
-  const buildJob = getJobBlock("build-and-push");
+  const buildJob = getJobBlock("bump-agent-image");
   const bumpStep = buildJob.slice(buildJob.indexOf("name: Bump agent image refs in cluster"));
   const retryCase = bumpStep.indexOf("000|5*)");
   const catchAll = bumpStep.indexOf("*) echo \"$http\"; return 0 ;;");
@@ -261,7 +261,7 @@ test("a 4xx is not retried, because retrying a deterministic rejection only dela
 // prominent line in the failing log — the proxy's PLAIN-TEXT error body fed to
 // `jq`. The parser's complaint buried the actual cause.
 test("a non-JSON error body is printed legibly rather than fed to jq as the primary surface", () => {
-  const buildJob = getJobBlock("build-and-push");
+  const buildJob = getJobBlock("bump-agent-image");
   const bumpStep = buildJob.slice(buildJob.indexOf("name: Bump agent image refs in cluster"));
 
   assert.match(
