@@ -484,7 +484,11 @@ PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verificati
      is its own change — it replaces the offset-tracking tail with a stream that
      has its own failure modes (the kubelet's 10 Mi rotation, API disconnects,
      the FAR-10 hang the adapter's own mocks were built for) — and it was the
-     remaining blocker on enablement, not something to bolt onto the swap.
+     remaining blocker on enablement *as the list then stood*, not something to
+     bolt onto the swap. ⚠ It was not the LAST one: invariant 6 (PEN-5183, the
+     agent's own instructions directory) was found 2026-11-01 and is **open**.
+     Read "remaining blocker" here as a statement about 2026-10-31, not as a
+     claim that clearing it clears enablement — see the enablement block below.
 
      **Status 2026-10-31 — BOTH HALVES HAVE LANDED. The code path is complete;
      no run has used it.** Tracked as PEN-5120. The fail-fast `awk` keeps its
@@ -541,6 +545,97 @@ PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verificati
        `coreApi.readNamespacedPodLog`: the generated request type for the latter
        has `sinceSeconds` but **no `sinceTime`**, so a resume through it could
        only ever be approximate.
+
+     **Enablement was re-checked 2026-11-01 against the live fleet. One
+     precondition is now SATISFIED, one is NOT CODE AT ALL, and a SIXTH
+     invariant was found in the process.** Recorded here rather than in PEN-5120
+     alone because all three change what "turn it on for one agent" costs.
+
+     - **The deploy precondition is met.** Done-when 1's "the server rolled onto
+       that commit" is satisfied: `paperclip_api_deploy_info` reads
+       `deployed_commit=2ebaa3cf`, and `2ebaa3cf` compares `ahead 51 / behind 0`
+       against #3174's `90b558e` (and `ahead 52 / behind 0` against the
+       collector commit `37768d2`). The collector is live, not merely merged —
+       the distinction the daily 07:23Z deploy makes necessary.
+     - **The adapter RBAC it needs is already granted**, which was worth
+       confirming rather than assuming, since a missing verb would have failed
+       every opted-in run at `ensureAgentWorkspacePvc` with
+       `k8s_agent_workspace_pvc_failed`. Role `paperclip-k8s-adapters`
+       (namespace `paperclip`) carries `persistentvolumeclaims: create, delete,
+       get` and `pods/log: get` — the provisioner and the collector's own
+       `follow` read. No `agent-workspace-*` claim exists yet, which is the
+       correct reading of a gate nothing has opted into.
+     - ⛔ **No agent seat can perform the enablement, so done-when 1 is not
+       agent-reachable.** `PATCH /agents/<peer>` with
+       `{"adapterConfig":{"enablePerAgentWorkspaceVolume":true}}` returns **403
+       `Missing permission: agents:configure or agents:suggest-changes`**
+       (`reason: deny_no_grant`), measured from the CTO seat against the UX
+       Designer agent. `agents:suggest-changes` is granted to the
+       `reflection-coach` built-in (`built-in-agents.ts:475`), not to ordinary
+       agents. A **self**-`PATCH` does succeed — that is the one route an agent
+       has — and it is the wrong one; see the invariant below for why the CTO
+       seat in particular must not be the first opt-in. **This is an operator
+       action and belongs to a principal holding `agents:configure`.**
+
+     **Invariant 6 — the agent's own instructions DIRECTORY crosses the volume
+     in the read direction, and only its ENTRY FILE is projected. Found
+     2026-11-01; it blocks enablement, not the collector.** Same shape as
+     invariant 5 and the same direction as invariant 1, but neither covers it:
+     invariant 1's unit is the prompt bundle, which §4.2 measured as
+     `agent-instructions.md` **plus the skill symlink farm** and nothing else.
+
+     The agent's instructions tree is a *separate* scoped-writable `data`
+     `subPath` mount — measured on two live pods 2026-11-01,
+     `.paperclip/instances/default/companies/Penstock/agents/cto` and
+     `…/agents/devops`. It is **fleet-wide, not a CTO-only config**: the Devops
+     agent's `adapterConfig` is `{}` and its pod carries the mount anyway, so the
+     root arrives from instance scope and every `claude_k8s` agent has one.
+
+     What the Secret delivers is `instructionsContents` — a single string, the
+     entry file's bytes plus a generated path directive
+     (`execute.ts:3179-3188`), written to the one bundle path
+     `PROMPT_BUNDLE_INSTRUCTIONS_PATH = "agent-instructions.md"`.
+     `buildPromptBundleSecretProjection` is handed `{companyId, runLabel, skills,
+     instructionsContents, serverDataMountPath, catalogBackedSkillKeys}`; the
+     instructions ROOT is not among its inputs and no other channel carries it.
+     So on a per-agent claim that directory is an **empty** mount.
+
+     The failure is worse than absence, because the delivered bytes actively
+     point into it. The generated directive reads *"Resolve any relative file
+     references from `<dir>/`. This base directory is authoritative for sibling
+     instruction files such as `./HEARTBEAT.md`, `./SOUL.md`, and `./TOOLS.md`."*
+     — so the run is instructed to read siblings that are not there. Measured on
+     the CTO tree, the live (non-`.bak`) siblings are `HEARTBEAT-CASELAW.md`
+     (670,587 B), `HEARTBEAT.md` (27,418 B), `check-heartbeat.sh`, `SOUL.md`,
+     `TOOLS.md` and `bin/github-app-git-credential-helper` — ≈709 KB that the
+     opted-in run would silently lose, including the execution checklist the
+     charter calls essential.
+
+     **It fails SILENTLY and in the permissive direction**, which is what makes
+     it an invariant rather than a bug report: the pod starts, the Job succeeds,
+     the agent reads its charter, every sibling read ENOENTs, and the run
+     completes looking normal. That is exactly the "agent silently came up
+     missing half its instructions" outcome the Secret channel exists to
+     prevent (#3170 closed the same shape for image-path skill links); it was
+     missed because the invariant list was derived from what the server
+     *writes* and from the `subPath` inventory, and this tree is written by the
+     AGENT.
+
+     ⚠ **Do not read ≈709 KB as "it merely needs projecting too."** The Secret
+     budget is 1 MiB measured on DECODED bytes
+     (`PROMPT_BUNDLE_SECRET_MAX_BYTES`), and §4.2's escalation trigger is **half**
+     of it — so the CTO tree alone would cross the trigger on its own, before
+     skills, and land the design on the init-container API fetch §4.2 sized.
+     Pruning the tree, scoping the projection to the siblings the entry file
+     actually names, or moving the caselaw off the charter are all cheaper, and
+     the choice should be made against a measurement rather than under an
+     outage. Tracked separately as PEN-5183.
+
+     **Practical consequence for whoever flips the toggle first: do not pick the
+     CTO seat.** It is the largest instructions tree in the company and the only
+     one measured against the budget, so it is simultaneously the most likely to
+     refuse and the most costly to degrade. Pick an agent whose entry file names
+     few siblings, and read that run's output before a second.
 
      **A SECOND pod→server read-direction consumer, found 2026-10-31. DECIDED
      2026-10-31 (PEN-5124): the residual is ACCEPTED and bounded; the premise it
@@ -836,12 +931,17 @@ PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verificati
      **The invariants 4a hands to 4b.** All of them are inert on the self claim and become live
      the moment the claim is per-agent, so none of them can be caught by the fleet exercise 4a
      relies on. Four were enumerated here; a **fifth** was found 2026-10-31 while writing the
-     swap, and all five are now closed on `master` — the fifth by #3173 / #3174, recorded
-     above and in §5's table, and closed is not verified. That the fifth was found this
-     late is the point worth keeping: the four were derived from the `subPath` mount list and
-     from what the server WRITES, and the fifth is a path the pod writes and the server READS,
-     which that inventory had no way of surfacing. Anything else crossing the volume in the
-     read direction belongs on this list too.
+     swap and is closed on `master` by #3173 / #3174 (recorded above and in §5's table — and
+     closed is not verified); a **sixth** was found 2026-11-01 and is **OPEN** (PEN-5183, the
+     agent's own instructions DIRECTORY — see §5's table and the enablement block above).
+     That the fifth and sixth were found this late is the point worth keeping, and the two
+     misses have the same cause from opposite sides: the original four were derived from the
+     `subPath` mount list and from what the server WRITES. The fifth is a path the pod writes
+     and the server READS; the sixth is a path the AGENT writes and the pod reads. Neither
+     could be surfaced by an inventory of server writes. **Anything else crossing the volume in
+     the read direction belongs on this list too — and the sixth is evidence that list is still
+     not known to be complete.** The cheap test for a candidate: name the writer and the reader
+     separately, and check they are the same volume once the claim is per-agent.
 
      1. **Populate the server-materialized trees, or relocate them.** One closed by 3b-iii,
         one newly found. `.local/share/paperclip-git-hooks` and `skills/<companyId>` were both
@@ -1735,14 +1835,15 @@ opted in to the `dataClaimName` swap — which, as of 2026-10-31, is itself merg
 | 2 — symlinked-PARENT hole in the seeder | **closed** — #3161, merged 19:51:15Z |
 | 3 — directory MODE | **closed** — #3165, merged. `mkdir -m 2775 -p`, as recommended; a separate `chmod` stays unexecutable (no `CAP_FOWNER`), and busybox's `make_directory.c` `goto ret0`s on `EEXIST` at the final component *before* its `chmod`, so an existing 1000-owned target is never chmodded. Subsumed by invariant 4's split exactly as predicted: as uid 1000 the seeder owns what it creates, so the mode needs no privilege. ⚠️ Still converges only targets the seeder creates, and the CephFS fresh-subvolume question remains **unmeasured** — no per-agent claim exists to measure against |
 | 4 — guard is check-then-act under concurrent same-agent runs | **closed** — #3165, merged, the recommended split: uid 0 chowns the volume ROOT only (one inode, no in-volume path components, so no TOCTOU), everything else runs as uid 1000, which *removes* the privilege boundary rather than hardening the race across it. Available only because stage 3b-iii left `readOnlySubPaths` empty — now enforced as a build-time throw, not a comment. `fsGroup`, the post-`mkdir` re-check and run serialisation remain ruled out. ⚠️ **"Must ship WITH the swap, never before it" is WITHDRAWN** — the premise was unchecked and false; the reachability argument in §4 carries that on its own, and the second reason first recorded beside it does not (it tests "is this the server's claim", not "is this claim one agent's"). See §4. It shipped ahead of the swap, and is inert on the fleet by measurement (every agent Job over 7d names the server's own claim), not by construction. ⚠️ The root `chown` on a real CephFS subvolume is still **unexecuted**; fd-relative `openat` walk remains the fallback |
-| 5 — the POD LOG crosses the volume in the read direction | **closed on `master`, UNVERIFIED on a real run** — #3173 (framing) merged 08:41:30Z, #3174 (collector) merged 10:27:27Z. The container wrote `containerLogPath` while `execute.ts` tailed `podLogPath`: one string on the default mount, two VOLUMES once the claim is per-agent, so `tailPodLogFile` threw and the run's stdout was empty. Found 2026-10-31 while writing the swap, which is why the swap landed gated rather than enabled. The obvious fix — keep `run-logs` as a `subPath` of the SERVER'S claim — was refused for §2's reason: one bind on the shared handle, the whole cost of the swap for zero blast-radius reduction. Taken instead: on a foreign claim the fail-fast `awk` keeps its stdout and stamps each line, and `collectPodLogStream` reads those frames back off the container log and persists them to the server's own `podLogPath`, so the belt-and-braces re-read and the reaper still find what they expect. The file tail remains the implementation on the server's own claim, held there by a negative control. ⚠️ **Closed is not verified** — PEN-5120's first done-when wants a real foreign-claim run producing parseable stdout, and none has happened; what changed is that the failure is no longer structural. Residuals recorded, not fixed: PEN-5124 (the orphan reader still resolves `run-logs` from the SERVER'S root) and PEN-5138 (three hardening items on the collector). See §4 stage 4b |
+| 5 — the POD LOG crosses the volume in the read direction | **closed on `master`, UNVERIFIED on a real run** — #3173 (framing) merged 08:41:30Z, #3174 (collector) merged 10:27:27Z. The container wrote `containerLogPath` while `execute.ts` tailed `podLogPath`: one string on the default mount, two VOLUMES once the claim is per-agent, so `tailPodLogFile` threw and the run's stdout was empty. Found 2026-10-31 while writing the swap, which is why the swap landed gated rather than enabled. The obvious fix — keep `run-logs` as a `subPath` of the SERVER'S claim — was refused for §2's reason: one bind on the shared handle, the whole cost of the swap for zero blast-radius reduction. Taken instead: on a foreign claim the fail-fast `awk` keeps its stdout and stamps each line, and `collectPodLogStream` reads those frames back off the container log and persists them to the server's own `podLogPath`, so the belt-and-braces re-read and the reaper still find what they expect. The file tail remains the implementation on the server's own claim, held there by a negative control. ⚠️ **Closed is not verified** — PEN-5120's first done-when wants a real foreign-claim run producing parseable stdout, and none has happened; what changed is that the failure is no longer structural. Residuals recorded, not fixed: PEN-5124 (the orphan reader still resolves `run-logs` from the SERVER'S root) and PEN-5138 (three hardening items on the collector). See §4 stage 4b. **Update 2026-11-01 — the DEPLOY half of done-when 1 is now satisfied**: `paperclip_api_deploy_info` reads `deployed_commit=2ebaa3cf`, which is `ahead 51 / behind 0` of #3174's `90b558e`, so the collector is live and not merely merged. The run itself is still unperformed, and is now blocked on an OPERATOR action rather than on code — see invariant 6 and done-when 1 |
+| 6 — the agent's own INSTRUCTIONS DIRECTORY crosses the volume in the read direction | **OPEN, and it blocks enablement** (PEN-5183, found 2026-11-01). Same shape as invariant 5, same direction as invariant 1, covered by neither: invariant 1's unit is the prompt bundle, which §4.2 measured as `agent-instructions.md` **plus the skill symlink farm** and nothing else. The agent's instructions tree is a SEPARATE scoped-writable `data` `subPath` — measured on two live pods (`…/agents/cto`, `…/agents/devops`), and fleet-wide rather than per-agent config, since Devops's `adapterConfig` is `{}` and its pod carries the mount anyway. Only `instructionsContents` (the ENTRY FILE plus a generated path directive) reaches the Secret; the root is not an input to `buildPromptBundleSecretProjection`. Worse than absence, because the delivered directive *names* the siblings — *"this base directory is authoritative for sibling instruction files such as `./HEARTBEAT.md`, `./SOUL.md`, and `./TOOLS.md`"* — so the run is told to read ≈709 KB that is not there and completes looking normal. ⛔ **Not simply "project it too"**: the Cto tree alone crosses §4.2's half-budget escalation trigger before skills are counted. Missed because the invariant list was derived from what the SERVER writes, and this tree is written by the AGENT |
 
 **PEN-4932's four done-when items, measured from inside a live agent pod 2026-10-30T21:4xZ**
 (`findmnt`, this run's own pod on `k8s-paperclip-3`):
 
 | done-when | state |
 |---|---|
-| 1 — two agent pods on one node report **distinct** volume IDs | **UNMET, and no longer blocked — the gate is now turnable-on and unproven, which is a different state from blocked.** The swap LANDED 2026-10-31 behind the default-off `enablePerAgentWorkspaceVolume` gate (§4 stage 4b), and invariant 5's collector landed the same day, so enabling it no longer empties the run's stdout by construction. Nothing has yet run on it, and the toggle's own hint says so. The last fleet read still shows one handle, `csi-vol-3bdd0e68-1704-4f81-b3d8-55920cabf82c`, which is the correct reading of a gate nothing has opted into. After invariant 5: the server rolled onto that commit, ≥2 agents opted in through `adapter_config`, and a `findmnt` read from inside two live pods **co-located on one node**. Do not record this as met off a merge. |
+| 1 — two agent pods on one node report **distinct** volume IDs | **UNMET, and no longer blocked — the gate is now turnable-on and unproven, which is a different state from blocked.** The swap LANDED 2026-10-31 behind the default-off `enablePerAgentWorkspaceVolume` gate (§4 stage 4b), and invariant 5's collector landed the same day, so enabling it no longer empties the run's stdout by construction. Nothing has yet run on it, and the toggle's own hint says so. The last fleet read still shows one handle, `csi-vol-3bdd0e68-1704-4f81-b3d8-55920cabf82c`, which is the correct reading of a gate nothing has opted into. After invariant 5: the server rolled onto that commit, ≥2 agents opted in through `adapter_config`, and a `findmnt` read from inside two live pods **co-located on one node**. Do not record this as met off a merge. **Re-checked 2026-11-01: the server HAS rolled onto that commit (`deployed_commit=2ebaa3cf`, ahead 51 / behind 0 of `90b558e`), and the adapter RBAC is in place (`paperclip-k8s-adapters` carries `persistentvolumeclaims: create,delete,get` and `pods/log: get`). Two things now stand in the way, neither of them the swap.** ⛔ **No agent seat can opt an agent in**: `PATCH /agents/<peer>` returns `403 Missing permission: agents:configure or agents:suggest-changes` (`deny_no_grant`), and `agents:suggest-changes` is granted to the `reflection-coach` built-in, not to ordinary agents — so this step belongs to a principal holding `agents:configure`. A **self**-`PATCH` does succeed, and is the wrong route: see invariant 6, which makes the CTO seat the worst possible first opt-in. No `agent-workspace-*` claim exists yet, which is the correct reading of a gate nothing has opted into. |
 | 2 — the fleet-wide tooling row is a separate read-only claim **or** baked into the image, with the choice recorded | **MET on `master`, NOT YET OBSERVABLE in the fleet.** Choice: **baked into the image**, reasoned in §3.3-§3.6. |
 | 3 — recurrence re-measured against the 3-wedges-in-30h baseline, caveats stated | not started, and **it cannot be done before 1** — the measurement is of the swap's effect, and a gate nobody has opted into produces no effect to measure. Note the two caveats §4.1 attaches to the baseline survive into the re-measure and must be stated rather than glossed: Prometheus retains ~7 days, not 30, and counter resets on the agent-heavy nodes hide history. |
 | 4 — this §5 acceptance table updated to reflect 1 being met | blocked on 1, by construction. This row is the one that must NOT be ticked on the strength of the swap landing. |
