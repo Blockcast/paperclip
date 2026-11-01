@@ -418,6 +418,17 @@ interface CarriedFinding extends AttestingComment {
    * the author into the loop the conditional tail exists to avoid.
    */
   retirementRefusedOffReviewSurface: boolean;
+  /**
+   * True when this head would have been retired but for a ledger entry refused
+   * for predating the attestation it names (PEN-5188). Distinct from the two
+   * refusals above rather than folded into them because the remedy is
+   * different again: the entry is on the right surface and the right lane and
+   * needs neither re-posting nor a different author — the reviewer re-submits
+   * the same verdict so it carries a current timestamp. A tail naming either
+   * of the others here sends the reader at a surface or an identity, and the
+   * author at a push, none of which move it.
+   */
+  retirementPredatesAttestation: boolean;
 }
 
 /**
@@ -671,17 +682,53 @@ function headsWithUndispositionedFinding(
   // Shared by the retirement check and the unrecognized-verb diagnostic so the
   // explanation can only ever name an entry that would otherwise have retired
   // the finding.
+  //
+  // Split in two so the ordering conjunct can be reported on as well as acted
+  // on (PEN-5188). `identifies` is every axis of the match EXCEPT time: it
+  // answers "does this entry speak about that finding at all?", which is the
+  // question the diagnostics below need and the one `namesFinding` cannot
+  // answer once it has folded the refusal in.
+  const identifies = (
+    prior: { entry: AllyPriorFindingDisposition; attestedHeadSha: string },
+    headSha: string,
+    finding: AllyFindingRef,
+  ): boolean =>
+    prior.attestedHeadSha !== headSha &&
+    headSha.startsWith(prior.entry.shortSha) &&
+    prior.entry.severity === finding.severity &&
+    prior.entry.index === finding.index;
+
   const namesFinding = (
     prior: { entry: AllyPriorFindingDisposition; timeMs: number; attestedHeadSha: string },
     headSha: string,
     attestedAtMs: number,
     finding: AllyFindingRef,
-  ): boolean =>
-    prior.attestedHeadSha !== headSha &&
-    prior.timeMs >= attestedAtMs &&
-    headSha.startsWith(prior.entry.shortSha) &&
-    prior.entry.severity === finding.severity &&
-    prior.entry.index === finding.index;
+  ): boolean => identifies(prior, headSha, finding) && prior.timeMs >= attestedAtMs;
+
+  // An entry that identifies the finding on every axis and is refused ONLY for
+  // predating the attestation it names — the fourth way a retirement that
+  // exists fails to land (PEN-5188).
+  //
+  // `timeMs` for a review is GitHub's `submitted_at`, and GitHub does not
+  // guarantee that orders the same way reviews were created: a review drafted
+  // earlier and submitted later lands with a timestamp AFTER one that already
+  // retired its finding. Observed live on #3199, where review `5727086521`
+  // (created first) carries `submitted_at` 09:09:40Z against `5727314727`
+  // (created second) at 09:06:16Z.
+  //
+  // The `>=` itself is deliberately NOT relaxed here. It is load-bearing: a
+  // head can be reviewed more than once, so "important 1" of head X is not one
+  // identity over time, and an entry written before a later review of X would
+  // otherwise retire a finding that did not exist when it was written. That is
+  // the fail-open the conjunct exists to close, and it is a worse failure than
+  // the stall. What is wrong is not the refusal but its silence — so this is
+  // reported, not credited.
+  const refusedOnSubmissionOrder = (
+    prior: { entry: AllyPriorFindingDisposition; timeMs: number; attestedHeadSha: string },
+    headSha: string,
+    attestedAtMs: number,
+    finding: AllyFindingRef,
+  ): boolean => identifies(prior, headSha, finding) && prior.timeMs < attestedAtMs;
 
   // A finding stops holding its head red when the ledger either retires it
   // (`fixed`/`no-longer-applicable` — the defect is gone) or defers it
@@ -785,9 +832,17 @@ function headsWithUndispositionedFinding(
     // Listing it here would tell the author to add an entry that already
     // exists while `carriedTail` says it was refused, which is the routing
     // loop that tail exists to close.
+    //
+    // An entry refused on submission order is the same case and is excluded on
+    // the same grounds (PEN-5188). It sits in `ledger` rather than a refusal
+    // bucket — it passed the lane and surface checks and was refused later, at
+    // comparison time — so `namesFinding` alone would report it as silence and
+    // tell Ally to write an entry it has already written, verbatim, on this PR.
     const named = (finding: AllyFindingRef) =>
-      [...ledger, ...refusedByAuthorLane, ...refusedOffReviewSurface].some((prior) =>
-        namesFinding(prior, headSha, entry.timeMs, finding),
+      [...ledger, ...refusedByAuthorLane, ...refusedOffReviewSurface].some(
+        (prior) =>
+          namesFinding(prior, headSha, entry.timeMs, finding) ||
+          refusedOnSubmissionOrder(prior, headSha, entry.timeMs, finding),
       );
     return reported.filter((finding) => !named(finding)).map((finding) => `${finding.severity} ${finding.index}`);
   };
@@ -839,6 +894,28 @@ function headsWithUndispositionedFinding(
           (prior) =>
             (prior.entry.kind === "retires" || prior.entry.kind === "defers") &&
             namesFinding(prior, headSha, entry.timeMs, finding),
+        ),
+    );
+  };
+
+  // The ordering twin of the two refusals above, same shape and same "every
+  // finding, not any" discipline (PEN-5188). Unlike them it reads `ledger`
+  // rather than a refusal bucket, because this refusal happens at comparison
+  // time: the entry is on the right surface and the right lane, and is turned
+  // away only for predating the attestation it names. Explains the red;
+  // changes no verdict.
+  const retiredOnlyOutOfOrder = (entry: { attesting: AttestingComment; timeMs: number }): boolean => {
+    if (ledger.length === 0) return false;
+    const headSha = entry.attesting.attestedHeadSha;
+    const reported = extractAllyReportedFindingRefs(entry.attesting.comment.body);
+    if (!reported || reported.length === 0) return false;
+    return reported.every(
+      (finding) =>
+        isDisposed(headSha, entry.timeMs, finding) ||
+        ledger.some(
+          (prior) =>
+            (prior.entry.kind === "retires" || prior.entry.kind === "defers") &&
+            refusedOnSubmissionOrder(prior, headSha, entry.timeMs, finding),
         ),
     );
   };
@@ -958,6 +1035,7 @@ function headsWithUndispositionedFinding(
       unnamedFindings: unnamedFindingsBlocking(entry),
       selfRetiredByAuthorLane: retiredOnlyByAuthorLane(entry),
       retirementRefusedOffReviewSurface: retiredOnlyOffReviewSurface(entry),
+      retirementPredatesAttestation: retiredOnlyOutOfOrder(entry),
     }));
 }
 
@@ -1385,10 +1463,27 @@ export function evaluateCommentReviewGate(input: {
     // of the head and false about the cause. At 49 characters it is inside the
     // 55 the budget arithmetic below is written against, so it does not move
     // the 131-character ceiling.
+    // The ordering refusal joins the group on the same grounds (PEN-5188) and
+    // sits last within it. No single ENTRY can reach two of these three — the
+    // lane and surface refusals divert an entry out of `ledger` at collection
+    // time and this one can only refuse an entry still in it — but a head
+    // carrying several findings can reach two causes by different entries, and
+    // there the existing order decides. Last is the right slot for it: the
+    // other two name a refusal that stands until someone else acts, whereas
+    // this one clears on a re-submission, so reporting either of those first
+    // never understates what the reader has to do. It is checked ahead of the
+    // "missing attestation" tails because its remedy is neither a comment nor
+    // a push — the reviewer re-submits the same verdict with a current
+    // timestamp — and on the measured instance (#3199) two readers concluded
+    // from the inherited author-identity tail that no action was needed and
+    // the red would clear itself, which it does not. At 46 characters it is
+    // inside the same 55.
     const carriedTail = carried.selfRetiredByAuthorLane
       ? "; its retirement came from the PR author's own lane."
       : carried.retirementRefusedOffReviewSurface
         ? "; its retirement was a comment, not a review."
+      : carried.retirementPredatesAttestation
+        ? "; its retirement predates the review it names."
       : !withheldPositive
         ? "; no comment attests the current head."
         : withheldPositive.authorUnknown

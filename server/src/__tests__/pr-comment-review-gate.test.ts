@@ -4081,6 +4081,90 @@ describe("PEN-4431 — what may CREDIT a head", () => {
     expect(credited.outcome).not.toBe("carried_finding");
   });
 
+  it("names submission order as the cause when a retirement predates the review it retires", () => {
+    // PEN-5188. `timeMs` for a review is GitHub's `submitted_at`, which does
+    // not order the same way reviews were created: a review drafted earlier
+    // and submitted later lands with a timestamp AFTER one that already
+    // retired its finding. Observed live on #3199 (`5727086521` created first,
+    // submitted 09:09:40Z; `5727314727` created second, submitted 09:06:16Z).
+    //
+    // Same fixture shape as "does not let a ledger entry disposition a finding
+    // raised after it" above, which pins the refusal itself; this pins what the
+    // refusal SAYS. Only the two timestamps differ from the control below.
+    const refused = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLane: null,
+      prAuthorLogin: DISTINCT_PR_AUTHOR,
+      comments: [
+        allyComment(dispositioningReview(INTERMEDIATE_HEAD, OLD_HEAD, "fixed"), "2026-10-20T09:00:00Z"),
+        allyComment(blockingReview(OLD_HEAD), "2026-10-20T10:00:00Z"),
+      ],
+    });
+
+    // The refusal itself stands: the `>=` is load-bearing. A head can be
+    // reviewed more than once, so "important 1" of a head is not one identity
+    // over time, and crediting an entry written before the review it names
+    // would retire a finding that did not exist when it was written.
+    expect(refused).toMatchObject({ state: "failure", outcome: "carried_finding" });
+
+    // What changes is the explanation. Before this tail the same input read
+    // `No ledger entry names prior:aaaaaaa "important 1"; no comment attests
+    // the current head.` — both halves true of the head and false about the
+    // cause, which routes the author at a push and the reviewer at nothing.
+    expect(refused.reason).toContain("its retirement predates the review it names.");
+    expect(refused.reason).not.toContain("no comment attests the current head");
+    expect(refused.reason).not.toContain("the only comment attesting it is the PR author's own");
+    // And it must not tell Ally to write an entry it has already written: the
+    // entry names this finding, it was refused on time alone.
+    expect(refused.reason).not.toContain("No ledger entry names");
+    expect(refused.reason.length).toBeLessThanOrEqual(140);
+  });
+
+  it("still credits the same retirement when it is submitted after the review it retires", () => {
+    // The anti-deadlock control for the case above: identical bodies, the two
+    // timestamps swapped and nothing else. Without this the test above would
+    // pass just as well against a gate that refused the retirement always.
+    const credited = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLane: null,
+      prAuthorLogin: DISTINCT_PR_AUTHOR,
+      comments: [
+        allyComment(blockingReview(OLD_HEAD), "2026-10-20T10:00:00Z"),
+        allyComment(dispositioningReview(INTERMEDIATE_HEAD, OLD_HEAD, "fixed"), "2026-10-20T11:00:00Z"),
+      ],
+    });
+
+    expect(credited.state).toBe("success");
+    expect(credited.outcome).not.toBe("carried_finding");
+  });
+
+  it("prefers a genuinely open finding over the ordering tail", () => {
+    // The "every finding, not any" discipline the two sibling refusals already
+    // follow. Head OLD raises two findings and the out-of-order ledger names
+    // only the first, so the honest cause is the second, still-open one.
+    // Naming the ordering refusal here would route the reader at a timestamp
+    // when what is actually missing is an entry.
+    const verdict = evaluateCommentReviewGate({
+      headSha: CURRENT_HEAD,
+      prAuthorLane: null,
+      prAuthorLogin: DISTINCT_PR_AUTHOR,
+      comments: [
+        allyComment(dispositioningReview(INTERMEDIATE_HEAD, OLD_HEAD, "fixed"), "2026-10-20T09:00:00Z"),
+        allyComment(blockingReviewWithFindings(OLD_HEAD, 2), "2026-10-20T10:00:00Z"),
+      ],
+    });
+
+    expect(verdict).toMatchObject({ state: "failure", outcome: "carried_finding" });
+    expect(verdict.reason).not.toContain("its retirement predates the review it names");
+    // Finding 2 is the one nobody named and is still reported as such, while
+    // finding 1 — which the out-of-order entry DOES name — is no longer listed
+    // beside it. Before this change the list read `"important 1", "important
+    // 2"`, telling Ally to rewrite an entry it had already written.
+    expect(verdict.reason).toContain("important 2");
+    expect(verdict.reason).not.toContain("important 1");
+    expect(verdict.reason.length).toBeLessThanOrEqual(140);
+  });
+
   it("keeps the RED direction surface-blind: an issue comment still raises and still carries", () => {
     // The fail-closed half, and the reason the issue-comment reader stays. A
     // finding is a finding wherever it is written. Narrowing this direction
