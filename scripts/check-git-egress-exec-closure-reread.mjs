@@ -185,18 +185,31 @@ export function evaluate({ changedPaths, commitMessages, today, headPaths }) {
   };
 }
 
+/**
+ * Render a list-valued arm: `null` = the arm did not run, `[]` = it ran and
+ * found nothing. Collapsing those two is how a report lies about a check that
+ * never happened, so they get different words.
+ */
+function fieldOrUnmeasured(value) {
+  if (value == null) return "(not measured)";
+  return value.length ? value.join(", ") : "(none)";
+}
+
 export function renderReport(result, { base, head, today } = {}) {
   const lines = [
     "PEN-5186 — §8 residual 4 (exec routes closed outside the broker's own policy list)",
     `range          = ${base ?? "(unset)"}...${head ?? "(unset)"}`,
     `today          = ${today ?? "(unset)"}`,
     `watched        = ${WATCHED_PATHS.join(", ")}`,
-    `touched        = ${result.touched.length ? result.touched.join(", ") : "(none)"}`,
-    `attestations   = ${result.attestations.length}`,
-    // "(none)" is a MEASUREMENT; the unreadable-range path renders a result whose
-    // staleness arm never ran, and printing "(none)" there would assert a clean
-    // watch that nothing checked.
-    `missing_at_head= ${result.missing == null ? "(not measured)" : result.missing.length ? result.missing.join(", ") : "(none)"}`,
+    // EVERY measured field distinguishes "(not measured)" from "(none)"/0. The
+    // unreadable-range path renders a result whose per-change and staleness arms
+    // never ran, and a report that prints "(none)" there asserts a clean read
+    // that nothing performed — the false-clear shape this whole file exists to
+    // avoid. `null` means the arm did not run; `[]` means it ran and found
+    // nothing. The two must never render the same.
+    `touched        = ${fieldOrUnmeasured(result.touched)}`,
+    `attestations   = ${result.attestations == null ? "(not measured)" : result.attestations.length}`,
+    `missing_at_head= ${fieldOrUnmeasured(result.missing)}`,
     `review_due     = ${REVIEW_DUE}  last_completed = ${REVIEW_LAST_COMPLETED ?? "(never)"}`,
     `verdict        = ${result.verdict}`,
   ];
@@ -337,7 +350,7 @@ async function main() {
     }
     console.error(`::error::cannot read the commit range, so the per-change arm could not run: ${rangeError}`);
     if (calendarOwed) {
-      console.log(renderReport({ touched: [], attestations: [], trailerOwed: false, calendarOwed, missing: null, watchStale: false, verdict: "owed" }, { base, head, today }));
+      console.log(renderReport({ touched: null, attestations: null, trailerOwed: false, calendarOwed, missing: null, watchStale: false, verdict: "owed" }, { base, head, today }));
     }
     process.exit(UNREADABLE);
   }
