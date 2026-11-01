@@ -140,6 +140,72 @@ describe("extractUnboundMentionTokens", () => {
     expect(extractUnboundMentionTokens(body)).toHaveLength(MAX_UNBOUND_MENTION_TOKENS);
   });
 
+  // PEN-5187: `AT_TOKEN_RE` treated any `@`-shaped token as a candidate, so a
+  // scoped package written in unquoted prose reported a name nobody wrote.
+  // Engineering comments here name scoped packages and GitHub org paths
+  // constantly, which made that a SYSTEMATIC false entry rather than an
+  // occasional one — and a field that is usually wrong is a field people learn
+  // to skip, which is the silent drop PEN-5180 exists to end, wearing a better
+  // outfit.
+  describe("scoped packages and org paths written in prose (PEN-5187)", () => {
+    it("does not report an npm scope written in unquoted prose", () => {
+      expect(extractUnboundMentionTokens("we should pin @types/node to match CI")).toEqual([]);
+    });
+
+    it("does not report a first-party scope written in unquoted prose", () => {
+      expect(extractUnboundMentionTokens("the helper lives in @paperclipai/shared now")).toEqual([]);
+    });
+
+    it("does not report a GitHub org path written in unquoted prose", () => {
+      expect(
+        extractUnboundMentionTokens("review is owned by @Blockcast/onprem-k8s-ally-reviewer"),
+      ).toEqual([]);
+    });
+
+    // The load-bearing half of the rule. Skipping on a bare `/` would also drop
+    // this, and dropping a REAL unbound mention is the expensive failure.
+    it("POSITIVE CONTROL: still reports a slash-separated mention pair", () => {
+      expect(extractUnboundMentionTokens("cc @Ceo/@Cto for a ruling")).toEqual(["Ceo", "Cto"]);
+    });
+
+    // Done-when: the suppression must not have cost the signal it protects.
+    it("POSITIVE CONTROL: a genuine unbound @Name beside a scope is still reported", () => {
+      expect(
+        extractUnboundMentionTokens("@Ceo please rule on pinning @types/node in CI"),
+      ).toEqual(["Ceo"]);
+    });
+
+    it("POSITIVE CONTROL: a resolved agent:// mention beside a scope still reports nothing", () => {
+      expect(
+        extractUnboundMentionTokens(`[@Ceo](${boundHref}) owns the @types/node pin`, {
+          boundAgentIds: [BOUND_AGENT_ID],
+        }),
+      ).toEqual([]);
+    });
+
+    // ACCEPTED, NOT FIXED — asserted so the decision is executable rather than
+    // merely written down. A bare decorator is lexically identical to a bare
+    // name mention, and agent names here are capitalized too, so every
+    // candidate discriminator would also drop real mentions. Reporting it costs
+    // one glance; suppressing it would cost a class of real mention. If this
+    // test ever fails, the suppression that broke it is the regression.
+    it("ACCEPTED: a bare decorator in prose is still reported, by decision", () => {
+      expect(extractUnboundMentionTokens("mark the provider @Injectable first")).toEqual([
+        "Injectable",
+      ]);
+    });
+
+    it("masks the common backticked decorator form, as before", () => {
+      expect(extractUnboundMentionTokens("mark the provider `@Injectable` first")).toEqual([]);
+    });
+
+    // A trailing slash with nothing after it is not a scope, so the scanner
+    // keeps reporting — unchanged fail-toward-reporting posture.
+    it("still reports a token whose slash opens nothing", () => {
+      expect(extractUnboundMentionTokens("ask @Ceo/ about this")).toEqual(["Ceo"]);
+    });
+  });
+
   it("returns nothing for an empty or mention-free body", () => {
     expect(extractUnboundMentionTokens("")).toEqual([]);
     expect(extractUnboundMentionTokens("a comment with no mentions at all")).toEqual([]);

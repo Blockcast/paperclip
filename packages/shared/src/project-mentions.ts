@@ -342,6 +342,34 @@ function normalizeSkillSlug(input: string | null | undefined): string | null {
 // Fail toward reporting: a false "this may not have reached anyone" costs a
 // re-send, a false silence costs a day. Where this scanner is unsure it
 // reports.
+//
+// PEN-5187 refines that in one place and declines to refine it in another.
+//
+// REFINED: a token directly followed by `/<name-char>` is skipped. `@types/node`
+// and `@paperclipai/shared` in prose used to report `["types"]` / `["paperclipai"]`,
+// and engineering comments here name scoped packages and GitHub org paths
+// constantly, so that was a systematic false entry rather than an occasional
+// one. A field that is usually wrong is a field people learn to skip, which
+// returns us to the silent drop above while looking like it works. The rule is
+// safe because an agent name is never followed by a slash, and it is narrowed
+// to `/<name-char>` so the mention-pair form `@Ceo/@Cto` keeps reporting.
+//
+// Residual, stated rather than hidden: `@Ceo/Cto` — a slash-separated pair
+// written without the second `@` — is lexically a scope and is now dropped. No
+// rule can separate the two, and the scope form is far commoner in this corpus.
+//
+// ACCEPTED, NOT FIXED: a bare decorator, `@Injectable`. It is lexically
+// IDENTICAL to a bare name mention, and agent names here are capitalized too
+// (`@Ceo`), so every candidate discriminator — capitalization, a known-decorator
+// list — would also drop real mentions. The common `` `@Injectable` `` form is
+// already masked as inline code. Reporting it costs its author one glance;
+// suppressing it would cost a class of real mention. Per the cost asymmetry
+// above, the false positive is the correct failure, so this one is kept.
+//
+// ⛔ NOT an option for either half: narrowing to a known-agent-name allowlist.
+// That reintroduces exactly the name-matching ambiguity ruled out above, and it
+// would make an unbound mention of a DEPARTED agent invisible — the single case
+// most worth reporting.
 // ---------------------------------------------------------------------------
 
 /** Cap on reported tokens, so a pathological body cannot inflate a response. */
@@ -355,6 +383,13 @@ const MAX_UNBOUND_MENTION_TOKEN_LENGTH = 64;
  * `@` in `a@b` are not plausible names, and reporting them would be noise.
  */
 const AT_TOKEN_RE = /@([A-Za-z][A-Za-z0-9._-]*)/g;
+
+/**
+ * The character class that can open the second half of a scoped package or org
+ * path — `@types/node`, `@Blockcast/onprem-k8s-ally-reviewer`. Deliberately
+ * excludes `@`, which is what keeps the mention-pair form `@Ceo/@Cto` reported.
+ */
+const SCOPE_PATH_CHAR_RE = /[A-Za-z0-9._-]/;
 
 /** Any mention link, whatever its scheme. Used to locate well-formed mentions. */
 const ANY_MENTION_LINK_RE =
@@ -419,6 +454,8 @@ export interface UnboundMentionScanOptions {
  * Code spans, fenced blocks, blockquotes, URLs and email addresses are masked
  * first: a name inside a quoted prior comment or a `user@host` is not somebody
  * asking for a wake, and reporting it would train readers to ignore the field.
+ * A token directly followed by `/<name-char>` is skipped for the same reason —
+ * `@types/node` is a package, not a person (PEN-5187).
  */
 export function extractUnboundMentionTokens(
   markdown: string,
@@ -465,6 +502,19 @@ export function extractUnboundMentionTokens(
     // `foo@bar` is not a mention; require the `@` to open a word.
     const prev = match.index > 0 ? scanned[match.index - 1] : "";
     if (prev && /[A-Za-z0-9]/.test(prev)) continue;
+
+    // PEN-5187: a token directly followed by `/<name-char>` is a scoped
+    // package or an org path, not a name — `@types/node`, `@paperclipai/shared`,
+    // `@Blockcast/onprem-k8s-ally-reviewer`. An agent name is never followed by
+    // a slash, so this costs no real mention.
+    //
+    // The `<name-char>` half is load-bearing, not decoration. Skipping on a
+    // bare `/` would also drop `@Ceo/@Cto`, which is ordinary prose for
+    // addressing two people — and dropping a real unbound mention is the
+    // expensive failure here, where a spurious token costs one glance. `/` then
+    // `@` is therefore kept.
+    const after = scanned.slice(match.index + match[0].length, match.index + match[0].length + 2);
+    if (after[0] === "/" && after[1] !== undefined && SCOPE_PATH_CHAR_RE.test(after[1])) continue;
 
     // Trim trailing punctuation that markdown prose attaches to a name:
     // "@Ceo." and "@Ceo-" both mean `Ceo`.
