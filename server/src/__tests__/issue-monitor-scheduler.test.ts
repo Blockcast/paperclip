@@ -1700,11 +1700,6 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     expect(wakeup?.reason).toBe("issue_monitor_recovery");
   });
 
-  // Characterization test pinning the exact exhaustion boundary, so the shared
-  // limit helper cannot silently shift it by one. The scheduler compares
-  // `nextAttemptCount > maxAttempts` where `nextAttemptCount = prior + 1`, which
-  // is equivalent to `prior >= maxAttempts`. One attempt below the ceiling must
-  // still dispatch normally.
   // PEN-5170: an explicit `maxAttempts` must survive the monitor FIRING.
   //
   // `buildIssueMonitorTriggeredPatch` runs the fired policy through
@@ -1825,6 +1820,11 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     expect(actions).toContain("issue.monitor_escalated_to_board");
   });
 
+  // Characterization test pinning the exact exhaustion boundary, so the shared
+  // limit helper cannot silently shift it by one. The scheduler compares
+  // `nextAttemptCount > maxAttempts` where `nextAttemptCount = prior + 1`, which
+  // is equivalent to `prior >= maxAttempts`. One attempt below the ceiling must
+  // still dispatch normally.
   it("still dispatches one attempt below the default monitor ceiling", async () => {
     const { issueId } = await seedFixture({
       monitorAttemptCount: DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS - 1,
