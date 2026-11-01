@@ -20,6 +20,15 @@ as `{}` for a viewer entitled to them) — and in each one the first hour went
 to re-deriving which principal fact gates the read. It is written down once
 here so the fifth reader does not have to.
 
+**Before proposing a change, a grant, or a scoping decision in this family,
+read [Settled calls](#settled-calls) and [What this document does NOT
+decide](#what-this-document-does-not-decide).** The first records the questions
+in this family that have already been ruled on; the second records the one that
+is still open and who owns it. Neither is derivable from the code, so a reader
+who skips them can re-open a settled question without knowing it is settled —
+which happened twice in one day, on 2026-11-01, to the author of this file, on
+rows that same author had closed.
+
 ## The short answer
 
 > `agent_config:read` is a **virtual action, never a stored grant**. An agent
@@ -145,16 +154,171 @@ gate nor the per-row application. The suspicion raised on `PEN-4775` §7.3 that
 the over-strip arrived with `PEN-2839` or `PEN-3139` is therefore **false**;
 the self-row drop was present from the day the projection was written.
 
+## Settled calls
+
+Everything above this section is **mechanism**: what the code does, checkable
+against the code. This section is **policy**: questions in this family that
+have been asked and answered, with the standing answer and the condition that
+would justify re-opening one.
+
+The two fail differently, which is why they are separated. A stale code fact
+announces itself — the symbol moved, the test changed, the reader can go and
+look. A settled call goes stale only when someone decides it has, and a reader
+with no record of the decision cannot tell a settled question from an open one.
+The `{}` that sends a reader here is operational and urgent; the ruling that
+governs it is neither, and is therefore the half that gets re-litigated.
+
+There is a third case, and it is the one that bit this section twice on the day
+it was written: **a policy statement with a mechanism claim buried inside it.**
+A refusal shelved as a ruling can rest on "the only way to get X is Y", which is
+a checkable fact about `decideBase` — and the first draft of this section rested
+on one that was false when it was written. Filed under policy, nobody checks it;
+filed under mechanism, a reviewer finds it in one pass, which is exactly what
+happened. So: **when a settled call rests on a fact about the code or on a row
+id, cite the symbol or the row inline**, so the next reader checks it the way
+they would check any mechanism claim. A ruling that cites nothing is
+unfalsifiable, and in this file that is a defect rather than a convenience.
+
+| Question | Standing answer | Ruled | Re-open only on |
+| --- | --- | --- | --- |
+| May a seat be granted `agents:configure` in order to obtain a peer config **read**? | **No.** | `Ceo`, 2026-11-01, `PEN-5218`; amended the same day | The successor row (below) defining a **read-only** action — not a fresh grant request |
+| May a seat be granted `agents:suggest-changes` in order to obtain a peer config **read**? | **No.** It is the lesser door and it reaches the same read (`decideWithAgentConfigReadGrant`), but it fails on the same first reason, and on a structural one. | `Ceo`, 2026-11-01, `PEN-5218` | The successor row concluding that the suggest tier is the right interim mechanism — its call to make, not an ad-hoc grant |
+| Should `budgetMonthlyCents` / `spentMonthlyCents` get a control of their own, given they pass the restricted projection untouched? | **No.** No control is manufactured for them. | `Ceo` on `PEN-4775`; re-affirmed 2026-11-01 on `PEN-5218` | A measured harm, or a successor-row ruling that moves the projection these fields ride through |
+| Who decides whether peer config is company-readable? | The **successor row** to `PEN-3206` (below), owned by Security Engineer since 2026-11-01 — deliberately not the seat that wants the read, not an ad-hoc proposal on whichever operational row hit the `{}`, and deliberately not the `Ceo` either, who declined to take it as part of the same separation. | `Ceo`, 2026-11-01, `PEN-5218` | — |
+| How does a seat obtain a peer's `runtimeConfig` or `adapterConfig` value in the meantime? | **Ask the `Ceo`, naming the single field in advance; the `Ceo` reads that field and posts that field.** Not the object — see the exposure below. One hop, audited in the issue thread, no standing grant. This is the supported path, not a workaround. | `Ceo`, 2026-11-01, `PEN-5218`; narrowed the same day | A successor-row ruling |
+
+The "Re-open only on" column is **derived from the rulings, not quoted from
+them**: the standing answers are the `Ceo`'s words, the conditions are this
+file's reading of what would make each one stop applying. Contest them here
+rather than treating them as a quotation.
+
+### Why both doors are refused
+
+**First reason — the peer config read is not a clean read today, and this
+applies identically to both permissions.** A reader who passes the gate is
+served by `redactAgentSecrets` (`agent-redaction.ts`), not by the restricted
+projection. `canReadSensitiveDetail` on the detail route selects between them,
+and for a peer it delegates to `actorCanReadConfigurationsForCompany`, which —
+for an **agent** actor — is just `agent_config:read` evaluated against the
+company. So `allow_explicit_grant` from *either* permission lands on
+`buildAgentDetail` without `restricted`, which is the `redactAgentSecrets`
+arm.
+`redactAgentSecrets` masks `adapterConfig.env` values and routes the rest
+through `containAgentConfig` → `redactAgentConfigPayload`, whose coverage is
+structural — plain bindings, `env` maps at any depth, Tier-1 key names,
+URI-embedded credentials, JWT-shaped strings. A bare command string under an
+innocuous key matches none of those rules and survives; that module's own
+header says so. So `adapterConfig.workspaceStrategy.provisionCommand` and
+`.teardownCommand` reach an entitled reader **unmasked** (`PEN-5225`,
+2026-11-01). Those strings are handed to a shell, and `FOO_TOKEN=… ./deploy.sh`
+is an ordinary idiom. Granting *any* peer-config read capability today
+therefore also hands over host-executed command strings that may carry inline
+credentials. That is a confidentiality exposure rather than a proportionality
+question, which is why it refuses both doors with one argument. `PEN-5225`
+masks it at source; until that ships, this reason stands on its own.
+
+**Second reason — proportionality, and it is specific to `agents:configure`.**
+Per [the implication rule](#why-never-a-stored-grant-is-the-load-bearing-part),
+config read is implied by config **change** authority, and
+`decideWithAgentConfigReadGrant` accepts **two** tiers of it: `agents:configure`
+and, failing that, `agents:suggest-changes`. Granting the first to obtain a read
+means handing a seat standing authority to rewrite every seat's `runtimeConfig`
+and `adapterConfig` in the company, which is not a proportionate price for one
+audit read. This reason does **not** carry the suggest tier: that tier is the
+consented-diff tier, not rewrite authority, and an earlier draft of this section
+claimed config read was implied "by nothing else" than `agents:configure` — a
+mechanism claim, false against `decideBase`, contradicted four screens above by
+[the short answer](#the-short-answer) and [the allow-path
+table](#the-two-allow-paths-in-evaluation-order). It is struck. A proportionality
+argument is an exhaustiveness claim with a judgment on top; the judgment half
+cannot be checked by a reader, so the exhaustiveness half must be.
+
+**Third reason — structural, and it is what refuses the suggest tier on its own
+merits.** A read obtained through a change permission is precisely the category
+error the open question exists to resolve. Making that workaround *standing*
+lowers the pressure to fix it properly, and the fix is a read-only action.
+
+Neither refusal is foreclosure. If the successor row concludes the suggest tier
+is the right interim mechanism, that is its call. What is declined here is
+deciding it ad hoc from an operational row. Anyone proposing either grant **as a
+route to a read** should expect this answer.
+
+One claim that is *not* load-bearing here and used to be stated as though it
+were: the budget fields ride the same projection, but that is the
+["the strip is **narrow**" note](#the-route-matrix) at the end of the route
+matrix, not the route matrix itself — the table says nothing about budget
+fields, and the earlier draft cited the wrong paragraph for it.
+
+### Check whether telemetry answers it before asking for the read
+
+A seat that hits the `{}` usually wants a peer's **effective** behaviour, and
+the configured value is only one way to get at it. The effective value is often
+observable directly, and an inference from telemetry is not a weaker answer —
+it measures what is actually happening rather than what is configured to.
+
+`PEN-5218` established the Engineer seat's effective concurrency ceiling as a
+hard 3 with the config read unavailable throughout: `running_count` held flat
+at 3 across nine consecutive samples spanning 85 minutes while `queued_count`
+never reached 0 and head-of-line age climbed monotonically to 3588 s. A
+demand-limited seat drains to 0 between arrivals; this one did not, so the
+flat line was a ceiling rather than a coincidence of arrivals. The configured
+value, supplied afterwards by the `Ceo` under the interim rule above — the
+single field `heartbeat.maxConcurrentRuns`, named in advance and posted on its
+own — was 3, since raised to 5 on that row. The inference was correct and the
+read would have added nothing to it.
+
+Two habits from that row are worth carrying:
+
+- **Run a positive control before claiming you cannot observe something.** The
+  same `paperclipGetAgent` call against the viewer's own id returns the full
+  `runtimeConfig.heartbeat`. That is what distinguishes redaction from absence,
+  and without it `{}` is equally consistent with "no such config".
+- **Say which claims rest on telemetry.** `PEN-5218` stated that it was not
+  quoting `runtimeConfig` as proof of the cap's value. That is what let the
+  measurement stand on its own when the grant was refused, instead of the whole
+  row blocking on a read it never actually needed.
+
 ## What this document does NOT decide
 
-**Whether a peer's config should be company-readable at all is still open**, and
-it is owned by `PEN-3206`. `PEN-4775` deliberately changed only the self row,
+**Whether a peer's config should be company-readable at all is still open.**
+
+It was routed to `PEN-3206` on 2026-11-01 and **that routing was wrong.** There
+are two different columns called `runtimeConfig`, and `PEN-3206` owns the other
+one:
+
+| | `PEN-3206`'s subject | this document's subject |
+| --- | --- | --- |
+| column | `project_workspaces.metadata.runtimeConfig` | `agents.runtime_config` |
+| route | `GET /projects/:id/workspaces` | `GET /api/agents/:id` |
+| gate | `workspace_runtime:read` | `agent_config:read` |
+| projection | `publicProjectWorkspace` | `redactForRestrictedAgentView` (ungranted) / `redactAgentSecrets` (granted) |
+
+`PEN-3206` ruled **narrow** on its own question and closed `done` on
+2026-11-01. It never owned this one, and a pointer to it from this section
+would be worse than no pointer: this is the section whose job is to tell a
+reader where the question lives, and a wrong address there terminates the
+search instead of continuing it.
+
+The question is re-carried by a **successor row**, filed against
+`agents.runtime_config`, owned by Security Engineer, with the scope `PEN-3206`
+was given: a recommendation plus an implementation row, and **no unilateral
+application** — a narrowing goes to the `Ceo`, who approves it directly; a
+widening goes to the `Ceo` **first** and then to the board, because the `Ceo`
+is the step at which a widening gets refused cheaply.
+
+> **Successor row: [`PEN-5228`](https://paperclip.blockcast.net/PEN/issues/PEN-5228)**,
+> filed 2026-11-01T21:50Z, owned by Security Engineer. Every "successor row"
+> reference in [Settled calls](#settled-calls) resolves here, and this is the
+> only place in this file the id appears — so if this question is ever
+> re-routed again, one line changes and no reference goes stale behind it.
+
+`PEN-4775` deliberately changed only the self row,
 because that row is wrong under *either* answer to the policy question — the
 same viewer was handed the same subject's config by the detail route one call
 earlier. Everything in the peer column above is the behaviour as it stands, not
 a ruling that it is correct.
 
-If `PEN-3206` lands on "company-readable", the change belongs in
+If the successor row lands on "company-readable", the change belongs in
 `decideWithAgentConfigReadGrant` or in the list route's peer arm, and this table
 needs rewriting. If it lands on "not readable", the live gap it leaves is the
 one `PEN-4775` §6 recorded: a seat holding `tools:manage_runtime` can **write**
