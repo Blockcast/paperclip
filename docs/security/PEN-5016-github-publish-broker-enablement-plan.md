@@ -561,9 +561,10 @@ silent broker and a broker nobody asked to publish are the same observation (§5
 **Stage 1 — one agent, one company.** **Does not start on a date. It starts when every precondition
 below is on `master`**, target **2026-11-06**, which is an earliest-start and not a commitment (CTO,
 2026-10-29). Duration ≥ 3 working days. ✅ **Set in §11.3, with the mechanical entry gate in §11.6 —
-none of whose five checks fails as measured (1-4 on 2026-10-30, 5 on 2026-11-01), three of the five
-being perishable and owed a
-re-run at the gate (§11.6 is authoritative; a green there is not a go).**
+none of whose five stage-1 checks fails as measured (1-4 on 2026-10-30, 5 on 2026-11-01), three
+of the five being perishable and owed a
+re-run at the gate (§11.6 is authoritative; a green there is not a go).** §11.6 check 6 is
+**stage-2-and-later and is not one of these five** (PEN-5195).
 
 **Stage 1's precondition set — all must be on `master`. ⛔ Confirm each by its LANDED commit, or by
 content where there is no merge commit — NEVER by the PR's head commit:**
@@ -654,6 +655,9 @@ not read them as the same 8; the reason to start here is that it is this plan au
 and the §3.5a pre-flight is clean across it, not a company attribution §4 does not make.
 Pre-flight (§3.5a): re-run the privilege check across all 9 — clean at 2026-10-29T19:20Z, and stale
 by stage 2.
+⚠ **The §3.5a re-run is not the whole stage-2 pre-flight.** The entry gate for this stage is §11.6
+checks **1-6** — six, not five: the §3.4 board-level scope read is re-dated to gate stage 2 (§11.3)
+and is enumerated there as check 6 (PEN-5195).
 Observe: stage 1's list, plus node capacity against the `+50m/+128Mi` per pod of §5.1, plus any agent
 whose runs stopped completing.
 Exit: as stage 1, plus no scheduling regression attributable to the sidecar.
@@ -808,8 +812,9 @@ applied `:7060`), `BROKERED_POD_COMPOSITION_CONFIG_KEYS` (`:2911`, three keys),
 comment's word.
 
 ⛔ **Six of six is not a stage-1 start.** It satisfies §11.3's condition 1 only. §11.3's date floor
-(stage 1 earliest `2026-11-06`) and §11.6's five checks both still govern, and §11.6's checks 3, 4 and 5
-are perishable measurements that must be re-run at the gate. See §11.6.
+(stage 1 earliest `2026-11-06`) and §11.6's five **stage-1** checks both still govern, and §11.6's
+checks 3, 4 and 5 are perishable measurements that must be re-run at the gate. (§11.6 check 6 is
+stage-2-and-later and is deliberately not a stage-1 condition — PEN-5195.) See §11.6.
 
 ⭐ **The #3098 row was falsified by the merge batch that published this section, and that is worth
 understanding rather than just reading past.** #3098 and #3132 — the PR that added §11 — merged in the
@@ -955,9 +960,11 @@ re-read, §3.5a pre-flight, the §3.4 board-level env read, the §5.1 node basel
 
 ⚠ **Stage-0 exit does not gate stage 1, and never did — stated here because the opposite was being
 assumed.** Stage 1's start is conditioned on exactly the two items below: §11.1 six-of-six, and
-§11.6. Of stage 0's five exit items, only two appear there (§4 trigger-2 and §3.5a, as §11.6 checks 3
-and 4). The §5.3 saved queries, the §3.4 env read and the §5.1 baseline appear in neither, so **as
-written, an unanswered §3.4 read does not move stage 1's earliest start by a day.** Anyone reasoning
+§11.6. Of stage 0's five exit items, only two appear there **as stage-1 checks** (§4 trigger-2 and
+§3.5a, as §11.6 checks 3 and 4). The §5.3 saved queries and the §5.1 baseline appear in neither.
+The §3.4 env read appears in §11.6 **only as check 6, which is marked stage-2-and-later and is
+explicitly not a stage-1 condition** (PEN-5195). So **as written, an unanswered §3.4 read does not
+move stage 1's earliest start by a day.** Anyone reasoning
 "stage 0 slipped, therefore stage 1 slips" is reasoning from a dependency this plan does not contain.
 
 ✅ **CTO ruling, 2026-11-01 (PEN-5184), on the one item that can realistically slip.** The §3.4
@@ -968,11 +975,20 @@ enforces its property fail-closed at render time and scope-agnostically (§3.4) 
 - **Stage 0 still exits `2026-11-05`, and stage 1's earliest start stays `2026-11-06`.** Neither
   moves for this item. A dependency is not invented to make an exit list come true.
 - **If §3.4 is still unanswered on `2026-11-05`, stage 0 exits with it recorded as *carried*, not
-  discharged**, on its own row so that it does not die with the stage that raised it.
+  discharged**, on its own row so that it does not die with the stage that raised it. ✅ **That row
+  is named, and it is [PEN-5195](https://paperclip.blockcast.net/PEN/issues/PEN-5195)** (Security,
+  `7500672d`), which accepted the carry on 2026-11-01 and stays open until the item is discharged —
+  so the carry has an owner *before* the date rather than being improvised after it. It deliberately
+  does **not** live on [PEN-5181](https://paperclip.blockcast.net/PEN/issues/PEN-5181): PEN-5181 is
+  the stage-0 carrier and may legitimately close on `2026-11-05`, which is the whole failure mode
+  this bullet exists to avoid.
 - **It must be in hand before stage 2.** Stage 1 is one agent, and a successful stage-1 render is
   *stronger* evidence than the read for that agent's scope chain — #3089 would have thrown — but it
   proves one pod. Stage 2 is the first point at which a scope-wide binding could refuse a whole
-  company's fleet at once, which is where a census earns its keep.
+  company's fleet at once, which is where a census earns its keep. ✅ **§11.6 check 6 enumerates it
+  at that gate** — marked stage-2-and-later, so the item is read by the same mechanical list that is
+  re-run at every widening, rather than living only in this paragraph. A re-dated item that no check
+  names is the defect PEN-5184 fixed at stage 1 (PEN-5195); it is not re-introduced one stage later.
 
 **Stage 1 — one agent, one company. No calendar start date, by design. Earliest start `2026-11-06`.
 SET as a conditional start.** A date that fires before its preconditions is not a date, it is an
@@ -1041,10 +1057,11 @@ watch too.
 telemetry, trigger 4 has a measurement and not a detector (PEN-4989). D1 does not close it; it makes
 it matter less. Recorded here so that discharging §7.1 is not read as closing it.
 
-### 11.6 Stage-1 entry gate — five checks, all mechanical
+### 11.6 Stage-1 entry gate — five checks, all mechanical (six from stage 2)
 
 Run these in order immediately before starting stage 1. Each is a command, not a judgement, and each
-has a stated failing value, so "I checked" is falsifiable.
+has a stated failing value, so "I checked" is falsifiable. **Checks 1-5 are the stage-1 gate. Check
+6 is added from stage 2 onward** and is not a stage-1 condition — see §11.3.
 
 | # | Check | Pass | Measured 2026-10-30 |
 |---|---|---|---|
@@ -1053,6 +1070,7 @@ has a stated failing value, so "I checked" is falsifiable.
 | 3 | §4 trigger-2 query, re-read over a window overlapping stage 0 | zero broad renders, with the liveness control | ✅ **pass** (§11.7) |
 | 4 | §3.5a privilege pre-flight across the stage-1 population | no privileged container beside the broker | ✅ **pass** (§11.7) |
 | 5 | #3089's env-credential refusal is live on `master` | `findAgentGitHubCredentialEnvNames` is called under `brokerEnabled` in `job-manifest.ts`, **and** its test asserts the throw for all four credential names with the positive control intact | ✅ **pass** — read at source 2026-11-01 (§3.4, PEN-5184) |
+| 6 | ⚠ **STAGE 2 AND LATER ONLY — not a stage-1 check.** The §3.4 board-level scope read is answered (§11.3) | Board card `800bc387-eac5-4f19-93e5-7eaf89387a04` reads a decision (`status` ≠ `pending`, `decidedAt` non-null) **and** its answer — "clean", or a credential name at a named scope — is recorded in §3.4 and on carrier row [PEN-5195](https://paperclip.blockcast.net/PEN/issues/PEN-5195). ⚠ **Evaluate the CARD, not the read.** The card's decision is readable from any agent seat; the underlying `GET /api/environments/:id` is **`403 Board access required` from every agent seat** (reproduced independently from Devops, CTO and Security, 2026-11-01), so a re-runner who evaluates this by attempting the read will wrongly score it unevaluable. **Failing value:** card still `pending` at a stage-2 widening, or decided with its answer recorded nowhere | ❓ **pending** — card filed 2026-11-01T09:20:53Z; `status: pending`, `decidedAt: null`, re-read 2026-11-01T17:49Z. ⛔ **Not a stage-1 blocker**: §11.3 re-dates this item to stage 2 and **stage 1's earliest start does not move for it** |
 
 ⭐ **Check 5 is new (2026-11-01, PEN-5184), and it is a tightening rather than an addition for its own
 sake.** §3.4's board-level env read was the gate standing in this position, and no agent seat can
@@ -1062,9 +1080,23 @@ control**, which is testable, instead of a human read that is not. It is also th
 notice the control being removed: the refusal is one `if` block and one call site, and §7.5's lesson
 is that a list is only as complete as its last edit.
 
-**None of the five fails as measured — checks 1-4 on 2026-10-30, check 5 on 2026-11-01. ⛔ That is NOT
-a stage-1 go, and this row must not be read or cited as one.** Three things still stand between this
-table and a start, and the first of them is unconditional:
+⭐ **Check 6 is new (2026-11-01, PEN-5195), and it exists because re-dating an item is not the same
+as gating it.** PEN-5184 moved the §3.4 read off stage 1 and onto stage 2 (§11.3) — correctly — but
+recorded that only in §11.3 prose, and until this row was added **checks 1-5 were the only thing
+mechanically re-run at a widening** (item 2 below), none of which is the board read. An item named
+in a paragraph and absent from the list is exactly the "nothing downstream reads it" shape PEN-5184
+was filed to fix, displaced one stage later. Check 6 puts it in the list.
+
+⚠ **Check 6 is deliberately keyed to the board card rather than to the read.** The read itself is
+board-only and will stay that way, so a check written as "perform the read" is unevaluable by the
+seat that has to run it — which is how the original item came to gate nothing. The card is the
+durable artifact of the read, it carries the answer, and it is readable by anyone. If the card is
+ever withdrawn and re-filed, this check follows the **live** card for the §3.4 item, not the
+identifier above; update the identifier here when that happens.
+
+**None of the five stage-1 checks fails as measured — checks 1-4 on 2026-10-30, check 5 on
+2026-11-01. ⛔ That is NOT a stage-1 go, and this row must not be read or cited as one.** Three
+things still stand between this table and a start, and the first of them is unconditional:
 
 1. **§11.3's date floor governs and is not satisfied.** Stage 0 is `2026-11-05`; stage 1 is earliest
    `2026-11-06`. Five green checks do not move that by a day. The checks are a
@@ -1073,7 +1105,8 @@ table and a start, and the first of them is unconditional:
    and 4 are point-in-time reads of a live fleet; check 5 is a point-in-time read of `master`, which
    moves just as freely. Re-run them in order immediately before starting stage 1 and
    again at every widening — **never cite this row for them.** A green recorded on 2026-10-30 says
-   nothing about the population on 2026-11-06.
+   nothing about the population on 2026-11-06. ⚠ **From stage 2 the re-run set is checks 1-6, not
+   1-5** — check 6 joins at the first widening and is re-evaluated at every widening after it.
 3. **The go/no-go is the plan owners' (PEN-5016 / Security), not a document's.** This section is a
    gate, not an authorisation; recording that the gate passes is not the act of opening it.
 
