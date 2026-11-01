@@ -94,6 +94,13 @@ export const VIOLATION_KINDS = {
 export const OPEN_PRS_PAGE_SIZE = 100;
 
 /**
+ * Pages the probe follows before giving up. Measured 2026-11-01 (BLO-51179):
+ * core reached 103 open pull requests on `main`, past one page, so the probe
+ * now paginates. Hitting this ceiling still reports `unreadable`, never a pass.
+ */
+export const MAX_OPEN_PR_PAGES = 10;
+
+/**
  * Evaluate one consumer from already-fetched data. Pure, so the whole decision
  * table is testable without the network.
  *
@@ -217,7 +224,7 @@ export function evaluateConsumer({ repo, branch, rules, openPullRequests, openPu
       ...base,
       status: 'unreadable',
       reason: `no pull_request rule, and the open-pull-request window came back full ` +
-        `(${openPullRequests.length} = the ${OPEN_PRS_PAGE_SIZE} cap) — least-recently-updated pull ` +
+        `(${openPullRequests.length} read, more remain) — least-recently-updated pull ` +
         `requests were dropped unseen, so this sample cannot refute the control`,
       observed: { probed: eligible.length, truncated: true },
       violationKinds: [],
@@ -266,10 +273,10 @@ export function summarize(results) {
   };
 }
 
-const OPEN_PRS_QUERY = `query($o:String!,$r:String!,$b:String!){
+const OPEN_PRS_QUERY = `query($o:String!,$r:String!,$b:String!,$after:String){
   repository(owner:$o,name:$r){
-    pullRequests(states:OPEN,baseRefName:$b,first:${OPEN_PRS_PAGE_SIZE},orderBy:{field:UPDATED_AT,direction:DESC}){
-      pageInfo{ hasNextPage }
+    pullRequests(states:OPEN,baseRefName:$b,first:${OPEN_PRS_PAGE_SIZE},after:$after,orderBy:{field:UPDATED_AT,direction:DESC}){
+      pageInfo{ hasNextPage endCursor }
       nodes{ number reviewDecision latestOpinionatedReviews(first:100,writersOnly:false){nodes{state}} }
     }
   }
@@ -287,23 +294,33 @@ async function fetchRules(owner, repo, branch, token, fetchImpl = ghFetch) {
 
 async function fetchOpenPullRequests(owner, repo, branch, token, fetchImpl = ghFetch) {
   try {
-    const body = await fetchImpl('/graphql', token, {
-      method: 'POST',
-      body: JSON.stringify({ query: OPEN_PRS_QUERY, variables: { o: owner, r: repo, b: branch } }),
-    });
-    // GraphQL answers 200 with an `errors` array, so an unchecked read here
-    // would turn a permission failure into "zero open pull requests" — which
-    // the caller cannot distinguish from a genuinely quiet repo.
-    if (body?.errors?.length) throw new Error(body.errors.map((e) => e.message).join('; '));
-    const { nodes, pageInfo } = body.data.repository.pullRequests;
+    const all = [];
+    let after = null;
+    let truncated;
+    for (let page = 0; page < MAX_OPEN_PR_PAGES; page++) {
+      const body = await fetchImpl('/graphql', token, {
+        method: 'POST',
+        body: JSON.stringify({ query: OPEN_PRS_QUERY, variables: { o: owner, r: repo, b: branch, after } }),
+      });
+      // GraphQL answers 200 with an `errors` array, so an unchecked read here
+      // would turn a permission failure into "zero open pull requests" — which
+      // the caller cannot distinguish from a genuinely quiet repo.
+      if (body?.errors?.length) throw new Error(body.errors.map((e) => e.message).join('; '));
+      const { nodes, pageInfo } = body.data.repository.pullRequests;
+      all.push(...nodes);
+      // undefined when absent, so evaluateConsumer falls back to the length tell.
+      truncated = pageInfo?.hasNextPage;
+      // A next page with no cursor cannot be followed: stop, still truncated.
+      if (!truncated || !pageInfo.endCursor) break;
+      after = pageInfo.endCursor;
+    }
     return {
-      nodes: nodes.map((pr) => ({
+      nodes: all.map((pr) => ({
         number: pr.number,
         reviewDecision: pr.reviewDecision,
         approvals: pr.latestOpinionatedReviews.nodes.filter((r) => r.state === 'APPROVED').length,
       })),
-      // undefined when absent, so evaluateConsumer falls back to the length tell.
-      truncated: pageInfo?.hasNextPage,
+      truncated,
     };
   } catch (err) {
     console.warn(`::warning::could not read open pull requests for ${owner}/${repo}@${branch}: ${err.message}`);

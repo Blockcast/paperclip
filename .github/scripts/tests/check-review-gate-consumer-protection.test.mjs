@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import {
   CONSUMERS,
   OPEN_PRS_PAGE_SIZE,
+  MAX_OPEN_PR_PAGES,
   VIOLATION_KINDS,
   evaluateConsumer,
   summarize,
@@ -402,4 +403,49 @@ test('a GraphQL errors array is unreadable, even when partial data came back wit
   }).then((results) => {
     assert.equal(results[0].status, 'unreadable');
   });
+});
+
+// ── the probe paginates past one page (BLO-51179) ─────────────────────────────
+
+const prNodes = (n, from = 1) =>
+  Array.from({ length: n }, (_, i) => ({
+    number: from + i,
+    reviewDecision: 'REVIEW_REQUIRED',
+    latestOpinionatedReviews: { nodes: [] },
+  }));
+
+test('the probe follows endCursor, so a branch past one page is read whole', () => {
+  // Measured 2026-11-01: core had 103 open pull requests on main, and the
+  // single-page probe paged critical `unreadable` on it.
+  const afters = [];
+  const fetchImpl = async (path, _t, init) => {
+    if (path !== '/graphql') return [];
+    const { after } = JSON.parse(init.body).variables;
+    afters.push(after);
+    return after == null
+      ? { data: { repository: { pullRequests: { pageInfo: { hasNextPage: true, endCursor: 'c1' }, nodes: prNodes(OPEN_PRS_PAGE_SIZE) } } } }
+      : { data: { repository: { pullRequests: { pageInfo: { hasNextPage: false, endCursor: 'c2' }, nodes: [...prNodes(2, 101), { number: 103, reviewDecision: null, latestOpinionatedReviews: { nodes: [] } }] } } } };
+  };
+  return checkConsumers({ owner: 'Blockcast', token: 't', consumers: [{ repo: 'without-rule', branch: 'main' }], fetchImpl })
+    .then((results) => {
+      assert.deepEqual(afters, [null, 'c1']);
+      // The ungated PR sits on page 2 — only visible if page 2 was actually read.
+      assert.equal(results[0].status, 'drift');
+      assert.deepEqual(results[0].observed.ungated, [103]);
+    });
+});
+
+test('hitting the page ceiling with more remaining is unreadable, never compliant', () => {
+  let calls = 0;
+  const fetchImpl = async (path) => {
+    if (path !== '/graphql') return [];
+    calls++;
+    return { data: { repository: { pullRequests: { pageInfo: { hasNextPage: true, endCursor: `c${calls}` }, nodes: prNodes(OPEN_PRS_PAGE_SIZE, calls * 1000) } } } };
+  };
+  return checkConsumers({ owner: 'Blockcast', token: 't', consumers: [{ repo: 'without-rule', branch: 'main' }], fetchImpl })
+    .then((results) => {
+      assert.equal(calls, MAX_OPEN_PR_PAGES);
+      assert.equal(results[0].status, 'unreadable');
+      assert.equal(results[0].observed.truncated, true);
+    });
 });
