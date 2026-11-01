@@ -84,26 +84,49 @@ reads, no log access, no database access:
    up to five minutes stale and the timestamp you derive lands a few minutes
    late.
 
-   Nothing exports that refresh time, so **bound it instead of guessing**.
-   Each replica refreshes on its own stagger, so query the series *without*
-   collapsing the replicas and use the spread:
+   ⚠ And take `scrape_ts` from the sample's **own timestamp**, not from the
+   instant query's evaluation time. An instant query returns the last sample
+   within the lookback window but reports the *evaluation* time, which can be
+   up to a scrape interval later than the ingest. Using it shifts the window
+   late and can wrongly exclude the true acceptance. Read it explicitly:
 
-   - The replica reporting the **largest** age refreshed most recently, so
-     `scrape_ts − max(age)` is the tightest **upper** bound on the acceptance
-     instant, and one refresh period (300 s) earlier is the lower bound.
-   - Then *confirm* a candidate rather than eyeballing it: for a candidate
-     acceptance `t`, every replica's implied refresh `t + age_i` must fall in
-     `[scrape_ts − 300 s, scrape_ts]`. A wrong candidate pushes at least one
-     replica outside that window, so this is a check and not just an estimate.
+   ```
+   timestamp(paperclip_accepted_interaction_outcome_oldest_age_seconds{bucket="unobserved", company_id="<id>"})
+   ```
+
+   Nothing exports the refresh time, so **bound it instead of guessing**.
+   Each replica refreshes on its own stagger, so query the series *without*
+   collapsing the replicas. Each replica `i` constrains the acceptance `t` to
+   `[scrape_ts − 300 s − age_i, scrape_ts − age_i]`; intersecting over all
+   replicas leaves
+
+   ```
+   scrape_ts − min(age) − 300 s   ≤   t   ≤   scrape_ts − max(age)
+   ```
+
+   — lower bound off the **smallest** age, upper off the **largest**. With
+   several replicas that is much tighter than one refresh period: in the
+   worked example below it is ~63 s rather than 5 min.
+
+   ⚠ **The window narrows the candidates; it does not by itself pick one.**
+   Every acceptance inside it satisfies every replica, so separately checking
+   that a candidate's implied refreshes `t + age_i` all land in
+   `[scrape_ts − 300 s, scrape_ts]` is the same test as membership and adds
+   no discrimination. It rules out a candidate *outside* the window; two or
+   more inside stay ambiguous. Acceptances are not evenly spaced — this same
+   log holds two **2 s** apart, and no timing method separates those. When
+   more than one candidate lands in the window, carry them all to step 3 and
+   separate them there: the card the gauge is reporting is the one whose
+   `payload.expectedOutcome` is still unmet against its target's current
+   state.
 
    Worked example (PEN-4645): ages `87619.094 / 87599.888 / 87452.287 /
    87381.852` at scrape `2026-11-01T15:32:31Z` bound the acceptance to
-   `2026-10-31T15:07:12–15:12:12Z`; the candidate `15:11:45.590Z` implies
-   stalenesses of `26 / 46 / 193 / 264 s`, all inside the cadence.
-
-   Do this rather than matching by eye. Acceptances are not evenly spaced —
-   this same log holds two **2 s** apart — so "close enough" does not always
-   identify one card.
+   `2026-10-31T15:11:09–15:12:12Z`, a ~63 s window. Exactly one acceptance in
+   the activity log lands inside it — `15:11:45.590Z` — and the next-nearest
+   is two days away, so here the window identifies the card on its own. Had a
+   second landed inside, step 3 would have been required to choose between
+   them.
 
 2. **Look the acceptance up in the activity log** and find the entry at that
    timestamp:
@@ -120,13 +143,21 @@ reads, no log access, no database access:
    contention, and used to be reported as "Database contention".)
 
 3. **Read the card** with `GET /api/issues/:issueId/interactions` and confirm
-   it: `status: "accepted"`, a `resolvedAt` matching step 1, and a
+   it: `status: "accepted"`, a `resolvedAt` inside the step 1 window, and a
    `payload.expectedOutcome`. That last field is the declared outcome the
    sweep is checking.
 
-The derived timestamp is the identifying evidence, so state it when you report
-the card — the acceptance it lands on should be unique, and the acceptances
-on either side of it should be visibly the wrong age.
+   If step 1 left you **more than one** candidate, this is where you choose:
+   read each one's `payload.expectedOutcome` and evaluate it against its
+   target's current state. The gauge reports a card whose outcome is *not yet
+   observed*, so a candidate whose declared outcome is already satisfied is
+   not the card. If more than one is still unmet, say so and report them all
+   — do not pick by proximity.
+
+State the derived window and the `resolvedAt` when you report the card, so the
+next responder can check your identification rather than take it on trust. A
+single acceptance inside the window identifies the card; several inside it are
+separated by step 3 and by nothing else.
 
 ### Clearing a moot card: acknowledge it, you cannot withdraw it
 
