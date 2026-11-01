@@ -287,7 +287,8 @@ jobs:
             type=raw,value=sha-${{ steps.sha.outputs.short }}-k8s-vendored
 
       - name: Build and push
-        id: build
+        id: build-first
+        continue-on-error: true
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -321,6 +322,63 @@ jobs:
           cache-to: ${{ ((github.event_name == 'workflow_run' && github.event.workflow_run.head_branch == 'master') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master')) && 'type=registry,ref=harbor.blockcast.net/paperclip-agent/paperclip-agent:buildcache-v7,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true' || '' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+      # A liveness-killed buildkitd keeps serving through its 30-min preStop
+      # drain and the build dies at SIGKILL with `graceful_stop` (BLO-49674,
+      # runs 40583947177 and 40992166147). Retry once on the ClusterIP
+      # service, which only routes to Ready daemons. ponytail: retries any
+      # failure, so a deterministic Dockerfile error costs one extra build.
+      - name: Retarget BuildKit after failed build
+        if: steps.build-first.outcome == 'failure'
+        uses: docker/setup-buildx-action@v4
+        with:
+          driver: remote
+          endpoint: tcp://buildkit-amd64.ci.svc.cluster.local:1234
+
+      - name: Build and push (retry)
+        id: build-retry
+        if: steps.build-first.outcome == 'failure'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.agent
+          platforms: linux/amd64
+          push: true
+          # Copy /app from the just-built server image at this exact sha while
+          # reusing the content-addressed toolchain beneath the final image.
+          # Falling back to `latest` here would race with concurrent server
+          # builds and produce drifted layers.
+          #
+          # Pulled from harbor (not zot) — the zot/Ceph RGW backend
+          # truncates some small blobs (e.g. 32B FROM-layer descriptors)
+          # to 0 bytes on GET, producing `short read: expected N bytes
+          # but got 0: unexpected EOF` at FROM resolution. Harbor serves
+          # the same blobs correctly. Phase B cutover (BLO-5717) already
+          # parallel-pushes the server image to both registries, so the
+          # sha tag exists on harbor when this workflow runs.
+          build-args: |
+            SERVER_IMAGE=harbor.blockcast.net/paperclip/paperclip:sha-${{ steps.sha.outputs.short }}-k8s-vendored
+            TOOLCHAIN_IMAGE=${{ steps.bases.outputs.toolchain_image }}
+          # Same containerd-EOF-on-attestation-manifest reasoning as the
+          # server image's Docker workflow.
+          provenance: false
+          sbom: false
+          # Registry-backed cache on harbor (was zot pre-2026-05-17;
+          # moved alongside the server image so any small cache blob can't
+          # trip the same Ceph RGW zero-byte truncation that the FROM
+          # blob hit).
+          cache-from: type=registry,ref=harbor.blockcast.net/paperclip-agent/paperclip-agent:buildcache-v7
+          cache-to: ${{ ((github.event_name == 'workflow_run' && github.event.workflow_run.head_branch == 'master') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master')) && 'type=registry,ref=harbor.blockcast.net/paperclip-agent/paperclip-agent:buildcache-v7,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true' || '' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+      - name: Record agent image digest
+        id: build
+        env:
+          DIGEST: ${{ steps.build-retry.outputs.digest || steps.build-first.outputs.digest }}
+        run: |
+          test -n "$DIGEST"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
 
       - name: Smoke test restricted headless screenshot
         env:
