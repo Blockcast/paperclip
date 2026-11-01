@@ -17,10 +17,13 @@ import { DEFAULT_ISOLATION_WORKSPACE_ROOT } from "./isolation-workspace-reaper.j
  *   recursive unlinks against the volume the mounted reaper is already
  *   walking.
  * - **`image`** — the executor ships INSIDE the server image, so reading it
- *   off this pod means the Job always runs the executor from the same build as
- *   the server that planned it. That is exactly the skew
+ *   off this pod means the Job runs the executor from the same build as the
+ *   server that planned it. That is exactly the skew
  *   `report_unsupported_version` exists to catch, closed here by construction
  *   instead. An env var would let the two drift and call it configuration.
+ *   Read from `status.containerStatuses[].imageID` in preference to
+ *   `spec.containers[].image` — see below, because the two are NOT always the
+ *   same build.
  *
  * The scheduling fields come along for a duller reason: the Job has to be
  * ABLE to run. This deployment's nodes carry a `workload` selector and a
@@ -43,6 +46,27 @@ import { DEFAULT_ISOLATION_WORKSPACE_ROOT } from "./isolation-workspace-reaper.j
  * ambiguous one. A single-container pod is unambiguous whatever its container
  * is called, so it is accepted by count; refusing it would strand a dev
  * deployment that has nothing wrong with it.
+ *
+ * ## The image is resolved to a DIGEST when the kubelet has one
+ *
+ * `spec.containers[].image` is what the operator WROTE; it is only a build
+ * identity when it carries a digest. A deployment on a mutable tag with
+ * `imagePullPolicy: IfNotPresent` can have the tag moved under it, and the
+ * Job would then pull a DIFFERENT build from the one the server is running —
+ * silently, and in exactly the direction "same build by construction" claims
+ * to rule out. `status.containerStatuses[].imageID` is what the kubelet
+ * actually resolved and pulled, so it is preferred whenever it is usable as a
+ * reference. Production is digest-pinned already and the two agree there;
+ * this closes the case where they do not.
+ *
+ * "Usable" is checked rather than assumed, because `imageID` is not specified
+ * to be a pullable reference. Container runtimes have reported it with a
+ * `docker-pullable://` scheme prefix (stripped), and some report a BARE
+ * `sha256:<hex>` with no repository at all, which names a build but cannot be
+ * pulled. Anything that is not `<repository>@sha256:<hex>` after stripping is
+ * discarded and the spec image stands — a wrong image is a Job that cannot
+ * start, which the runner reports as a deadline rather than as the manifest
+ * problem it is.
  *
  * ## The claim is found by MOUNT PATH, not by volume name or position
  *
@@ -191,6 +215,27 @@ export interface ReadReclaimSelfPodIdentityOptions {
   isolationRoot?: string;
 }
 
+/**
+ * The image reference the executor Job should run.
+ *
+ * Prefers the digest the kubelet actually resolved over the reference the
+ * operator wrote, and falls back silently when the runtime's `imageID` is not
+ * a pullable reference. Exported for its own test: the fallback is the branch
+ * that matters, because an unusable value used verbatim produces a Job that
+ * never starts and reports as a deadline.
+ */
+export function resolveSelfImage(
+  specImage: string,
+  imageID: string | undefined,
+): string {
+  const resolved = (imageID ?? "").trim().replace(/^docker-pullable:\/\//, "");
+  // `<repository>@sha256:<64 hex>`. A bare `sha256:...` has no repository and
+  // is deliberately rejected by the leading `.+@`: it identifies a build but
+  // cannot be pulled.
+  if (/^.+@sha256:[0-9a-f]{64}$/.test(resolved)) return resolved;
+  return specImage;
+}
+
 /** Read this pod and derive everything the sweep needs from it. */
 export async function readReclaimSelfPodIdentity(
   coreApi: Pick<k8s.CoreV1Api, "readNamespacedPod">,
@@ -217,10 +262,16 @@ export async function readReclaimSelfPodIdentity(
 
   const selected = selectSelfContainer(spec.containers);
   if (!selected.ok) return selected;
-  const image = selected.container.image?.trim();
-  if (!image) {
+  const specImage = selected.container.image?.trim();
+  if (!specImage) {
     return { ok: false, reason: `container "${selected.container.name}" has no image` };
   }
+  // Matched by NAME, the same way the container was. `containerStatuses` is
+  // not ordered to match `spec.containers`, so a positional read here would
+  // hand the Job a sidecar's digest on exactly the multi-container pod the
+  // name match exists to survive.
+  const status = pod.status?.containerStatuses?.find((c) => c.name === selected.container.name);
+  const image = resolveSelfImage(specImage, status?.imageID);
 
   const claim = resolveSelfDataClaimName(spec, selected.container, isolationRoot);
   if (!claim.ok) return claim;
